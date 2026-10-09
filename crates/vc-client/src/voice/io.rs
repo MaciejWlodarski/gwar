@@ -10,6 +10,8 @@ use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rtrb::{Consumer, Producer, RingBuffer};
 
+use super::permission::{self, MicPermission, MicPermissionDenied};
+
 pub const RATE: u32 = 48_000;
 
 /// Ring ends handed to the engine. Dropping `_guard` stops the devices.
@@ -39,6 +41,9 @@ pub fn devices() -> (Vec<String>, Vec<String>) {
 pub enum DeviceIssue {
     /// The microphone could not be opened or stopped working.
     Input(String),
+    /// The operating system denies microphone access (privacy settings). Not retryable
+    /// until the user changes the setting.
+    InputDenied(String),
     /// The speakers could not be opened or stopped working.
     Output(String),
 }
@@ -116,6 +121,9 @@ fn open_input(
     mut mic_tx: Producer<f32>,
     on_issue: Option<IssueSink>,
 ) -> Result<cpal::Stream> {
+    if permission::ensure_microphone_access() == MicPermission::Denied {
+        return Err(MicPermissionDenied.into());
+    }
     let device = match name.and_then(|n| find(host.input_devices(), n)) {
         Some(device) => device,
         None => host.default_input_device().context("no microphone found")?,
@@ -136,7 +144,8 @@ fn open_input(
         move |e| {
             tracing::warn!("microphone stream error: {e}");
             if let Some(sink) = &on_issue {
-                sink(DeviceIssue::Input(e.to_string()));
+                let denied = e.kind() == cpal::ErrorKind::PermissionDenied;
+                sink(if denied { DeviceIssue::InputDenied(e.to_string()) } else { DeviceIssue::Input(e.to_string()) });
             }
         },
         None,
@@ -202,12 +211,22 @@ impl AudioIo for DeviceIo {
             let input = open_input(&host, self.input.as_deref(), mic_tx, self.on_issue.clone());
             let output = open_output(&host, self.output.as_deref(), speaker_rx, self.on_issue.clone());
             if let (Err(i), Err(o)) = (&input, &output) {
-                let _ = ready_tx.send(Err(anyhow!("no audio devices: {i:#}; {o:#}")));
+                // A denied microphone stays recognisable for the caller (see `permission::is_denied`).
+                let error = if permission::is_denied(i) {
+                    anyhow!(MicPermissionDenied)
+                } else {
+                    anyhow!("no audio devices: {i:#}; {o:#}")
+                };
+                let _ = ready_tx.send(Err(error));
                 return;
             }
             if let Err(e) = &input {
                 tracing::warn!("microphone unavailable: {e:#}");
-                report(DeviceIssue::Input(format!("{e:#}")));
+                report(if permission::is_denied(e) {
+                    DeviceIssue::InputDenied(format!("{e:#}"))
+                } else {
+                    DeviceIssue::Input(format!("{e:#}"))
+                });
             }
             if let Err(e) = &output {
                 tracing::warn!("output unavailable: {e:#}");

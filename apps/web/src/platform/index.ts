@@ -26,3 +26,13 @@ export function tauri(): Promise<TauriBridge> {
   }));
   return bridge;
 }
+
+/** True where the OS has a microphone privacy page we can open (desktop app on macOS or Windows). */
+export function canOpenMicrophoneSettings(): boolean {
+  return isDesktop() && /Mac|Windows/i.test(navigator.userAgent);
+}
+
+/** Opens the OS microphone privacy settings (desktop app only). */
+export async function openMicrophoneSettings(): Promise<void> {
+  await (await tauri()).invoke("open_mic_privacy_settings");
+}

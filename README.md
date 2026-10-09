@@ -59,6 +59,14 @@ with `cargo run -p vc-server -- --data-dir data admin-token`.
 
 Desktop app: `pnpm --filter desktop dev`.
 
+Microphone permission on the desktop app: macOS asks on first use (the bundled
+app carries `NSMicrophoneUsageDescription` and the audio-input entitlement), and
+Windows or macOS users who blocked it get an "Open privacy settings" button.
+`tauri dev` runs an unbundled binary, so macOS attributes the prompt (and the
+System Settings entry) to the terminal you started it from; test the real flow
+with `pnpm --filter desktop build`. To reset a decision while testing:
+`tccutil reset Microphone app.gwar.desktop`.
+
 ## Self-hosting
 
 Open **TCP 8790** (or 443 behind a reverse proxy with HTTPS, which browsers

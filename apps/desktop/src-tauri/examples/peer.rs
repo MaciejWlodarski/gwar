@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
     // PEER_SAY="text": say it in the channel shortly after joining (chat checks).
     if let Ok(text) = std::env::var("PEER_SAY") {
         let me = connected.welcome.session;
-        if let Some(channel) = connected.welcome.clients.iter().find(|c| c.id == me).map(|c| c.channel) {
+        if let Some(channel) = connected.welcome.clients.iter().find(|c| c.id == me).and_then(|c| c.channel) {
             let connection = connected.connection.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(4)).await;

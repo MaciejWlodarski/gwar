@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { acceleratorFromEvent, acceleratorParts } from "../platform/desktop";
 import { isDesktop } from "../platform";
-import { dbToLevel } from "./native-engine";
+import { dbToLevel, micErrorKind } from "./native-engine";
 
 describe("dbToLevel", () => {
   it("maps -60 dB to 0 and 0 dB to 1", () => {
@@ -10,6 +10,14 @@ describe("dbToLevel", () => {
     expect(dbToLevel(-30)).toBeCloseTo(0.5);
     expect(dbToLevel(0)).toBe(1);
     expect(dbToLevel(6)).toBe(1);
+  });
+});
+
+describe("micErrorKind", () => {
+  it("maps engine issues to voice errors", () => {
+    expect(micErrorKind("permission_denied")).toBe("mic_denied");
+    expect(micErrorKind("no_device")).toBe("no_mic");
+    expect(micErrorKind("failed")).toBe("mic_failed");
   });
 });
 

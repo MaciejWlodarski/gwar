@@ -205,6 +205,7 @@ export const en = {
   "voice.failed": "Voice unavailable",
   "voice.retry": "Retry",
   "voice.retryMic": "Try again",
+  "voice.openPrivacySettings": "Open privacy settings",
   "voice.leave": "Leave voice",
   "voice.notIn": "Not in voice",
   "voice.notInHint": "Double-click a channel to talk",
@@ -295,7 +296,7 @@ export const en = {
   "err.req.lost": "You are offline. Reconnecting…",
 
   "err.voice.mic_denied": "Microphone access is blocked. You can still chat and listen. Allow the microphone in your browser's site settings to talk.",
-  "err.voice.mic_denied_desktop": "Microphone access is blocked. You can still chat and listen. Allow Voice to use the microphone in your system's privacy settings.",
+  "err.voice.mic_denied_desktop": "Microphone access is blocked. You can still chat and listen. Allow Gwar to use the microphone in your system's privacy settings.",
   "err.voice.output_failed": "The speakers couldn't be opened. Check the output device in Settings.",
   "err.voice.no_mic": "No microphone found. You can still chat and listen.",
   "err.voice.mic_failed": "The microphone couldn't be opened (is another app using it?). You can still chat and listen.",
