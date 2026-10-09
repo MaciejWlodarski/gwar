@@ -1,5 +1,5 @@
 import * as Dropdown from "@radix-ui/react-dropdown-menu";
-import { ChevronDown, Copy, KeyRound, LogOut, Plus, Settings2, Ticket } from "lucide-react";
+import { ChevronDown, Copy, KeyRound, LogOut, Plus, Settings2, Ticket, UserPlus } from "lucide-react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { controller } from "../state/controller";
@@ -18,7 +18,11 @@ function ServerHeader() {
   const kind = useSession((s) => s.kind);
   const openDialog = useUi((s) => s.openDialog);
   const toast = useUi((s) => s.toast);
-  const canManage = usePermission("server_manage");
+  const manageServer = usePermission("server_manage");
+  const manageGroups = usePermission("group_manage");
+  const banClients = usePermission("client_ban");
+  const canManage = manageServer || (kind === "vc" && (manageGroups || banClients));
+  const canInvite = usePermission("invite_create") && kind === "vc";
   const canCreate = usePermission("channel_create");
   const canToken = usePermission("token_create") && kind === "vc"; // TeamSpeak has no vc tokens
 
@@ -59,12 +63,17 @@ function ServerHeader() {
               <Settings2 className="size-4" /> {t("server.settings")}
             </Dropdown.Item>
           )}
+          {canInvite && (
+            <Dropdown.Item className={menuItem} onSelect={() => openDialog({ kind: "invites" })}>
+              <UserPlus className="size-4" /> {t("server.invite")}
+            </Dropdown.Item>
+          )}
           {canCreate && (
             <Dropdown.Item className={menuItem} onSelect={() => openDialog({ kind: "channelEdit", mode: "create", parent: null })}>
               <Plus className="size-4" /> {t("server.createChannel")}
             </Dropdown.Item>
           )}
-          {(canManage || canCreate) && <Dropdown.Separator className={menuSeparator} />}
+          {(canManage || canCreate || canInvite) && <Dropdown.Separator className={menuSeparator} />}
           {canToken && (
             <Dropdown.Item className={menuItem} onSelect={() => openDialog({ kind: "createToken" })}>
               <Ticket className="size-4" /> {t("server.createToken")}

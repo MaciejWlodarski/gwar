@@ -3,6 +3,7 @@
 //! (`vc-client`), global shortcuts and the system tray.
 
 pub mod fake_audio;
+mod files;
 mod shortcuts;
 mod tray;
 mod ts;
@@ -78,6 +79,7 @@ pub fn run() {
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         // TODO: tauri-plugin-autostart (launch at login) once there is a setting for it.
         .manage(voice::Voice::default())
         .manage(shortcuts::Shortcuts::default())
@@ -112,6 +114,8 @@ pub fn run() {
             voice::mic_test_start,
             voice::mic_test_stop,
             voice::open_mic_privacy_settings,
+            files::save_url_as,
+            files::upload_put,
             shortcuts::set_global_shortcut,
             ts::ts_connect,
             ts::ts_request,

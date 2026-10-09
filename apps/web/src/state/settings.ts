@@ -43,6 +43,13 @@ export interface DesktopSettings {
   closeToTray: boolean;
 }
 
+/** When to show a system notification (only while the window is in the background). */
+export interface NotificationSettings {
+  mentions: boolean;
+  privateMessages: boolean;
+  allMessages: boolean;
+}
+
 export interface SettingsState {
   theme: Theme;
   language: Language;
@@ -51,6 +58,7 @@ export interface SettingsState {
   membersOpen: boolean | null;
   audio: AudioSettings;
   desktop: DesktopSettings;
+  notifications: NotificationSettings;
   /** Per-user playback volume 0..2 keyed by uid. */
   userVolumes: Record<string, number>;
   bookmarks: Bookmark[];
@@ -64,6 +72,7 @@ export interface SettingsState {
   setMembersOpen(open: boolean): void;
   setAudio(patch: Partial<AudioSettings>): void;
   setDesktop(patch: Partial<DesktopSettings>): void;
+  setNotifications(patch: Partial<NotificationSettings>): void;
   setUserVolume(uid: string, volume: number): void;
   saveBookmark(bookmark: Bookmark): void;
   removeBookmark(id: string): void;
@@ -86,6 +95,8 @@ export const defaultAudio: AudioSettings = {
   masterVolume: 1,
 };
 
+export const defaultNotifications: NotificationSettings = { mentions: true, privateMessages: true, allMessages: false };
+
 export const defaultDesktop: DesktopSettings = { muteShortcut: null, deafenShortcut: null, closeToTray: true };
 
 export const useSettings = create<SettingsState>()(
@@ -97,6 +108,7 @@ export const useSettings = create<SettingsState>()(
       membersOpen: null,
       audio: defaultAudio,
       desktop: defaultDesktop,
+      notifications: defaultNotifications,
       userVolumes: {},
       bookmarks: [],
       lastNickname: "",
@@ -109,6 +121,7 @@ export const useSettings = create<SettingsState>()(
       setMembersOpen: (membersOpen) => set({ membersOpen }),
       setAudio: (patch) => set((s) => ({ audio: { ...s.audio, ...patch } })),
       setDesktop: (patch) => set((s) => ({ desktop: { ...s.desktop, ...patch } })),
+      setNotifications: (patch) => set((s) => ({ notifications: { ...s.notifications, ...patch } })),
       setUserVolume: (uid, volume) =>
         set((s) => {
           const userVolumes = { ...s.userVolumes };
@@ -129,7 +142,9 @@ export const useSettings = create<SettingsState>()(
       version: 1,
       merge: (persisted, current) => {
         const p = (persisted ?? {}) as Partial<SettingsState>;
-        return { ...current, ...p, audio: { ...current.audio, ...(p.audio ?? {}) }, desktop: { ...current.desktop, ...(p.desktop ?? {}) } };
+        return { ...current, ...p, audio: { ...current.audio, ...(p.audio ?? {}) }, desktop: { ...current.desktop, ...(p.desktop ?? {}) },
+          notifications: { ...current.notifications, ...(p.notifications ?? {}) },
+        };
       },
     },
   ),

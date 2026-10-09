@@ -31,6 +31,7 @@ export type ConnectErrorKind =
   | "password_required" // challenge says a server password is needed and none was given
   | "wrong_password"
   | "server_full"
+  | "banned" // the server refuses this user or address; the message says why and until when
   | "rejected" // any other error reply to hello (bad nickname, ...)
   | "protocol"; // protocol version mismatch or malformed handshake
 
@@ -92,6 +93,8 @@ export interface ConnectionOptions {
   identity: Identity;
   nickname: string;
   serverPassword?: string;
+  /** Invite code: admits without the server password. Used for the first connect only. */
+  invite?: string;
   client: ClientInfo;
   /** Test seams. */
   createSocket?: (url: string) => WebSocketLike;
@@ -113,7 +116,7 @@ export function backoffDelay(attempt: number, random: () => number = Math.random
 
 /** Whether a server-announced departure should be followed by a reconnect. */
 export function shouldReconnectAfter(reason: LeaveReason): boolean {
-  return reason.kind !== "kicked" && reason.kind !== "replaced";
+  return reason.kind !== "kicked" && reason.kind !== "banned" && reason.kind !== "replaced";
 }
 
 function mapHelloError(code: ErrorCode, message: string, serverName?: string): ConnectError {
@@ -122,6 +125,8 @@ function mapHelloError(code: ErrorCode, message: string, serverName?: string): C
       return new ConnectError("wrong_password", message, serverName);
     case "unavailable":
       return new ConnectError("server_full", message, serverName);
+    case "banned":
+      return new ConnectError("banned", message, serverName);
     default:
       return new ConnectError("rejected", message, serverName);
   }
@@ -129,7 +134,9 @@ function mapHelloError(code: ErrorCode, message: string, serverName?: string): C
 
 /** Errors after which retrying cannot help. */
 function isFatal(e: ConnectError): boolean {
-  return e.kind === "wrong_password" || e.kind === "password_required" || e.kind === "protocol" || e.kind === "rejected";
+  return (
+    e.kind === "wrong_password" || e.kind === "password_required" || e.kind === "protocol" || e.kind === "rejected" || e.kind === "banned"
+  );
 }
 
 /**
@@ -181,8 +188,12 @@ export class Connection implements Link {
   private hasBeenOnline = false;
   private generation = 0;
   private abortHandshake: (() => void) | null = null;
+  /** Spent after the first welcome: a reconnect is the same member, and the invite may be used up. */
+  private invite: string | undefined;
 
-  constructor(private readonly options: ConnectionOptions) {}
+  constructor(private readonly options: ConnectionOptions) {
+    this.invite = options.invite;
+  }
 
   get status(): ConnectionStatus {
     return this.status_;
@@ -221,6 +232,7 @@ export class Connection implements Link {
     this.setStatus({ state: "connecting" });
     try {
       const welcome = await this.openAndHandshake();
+      this.invite = undefined;
       this.hasBeenOnline = true;
       this.setStatus({ state: "online" });
       this.emitWelcome(welcome, false);
@@ -373,7 +385,7 @@ export class Connection implements Link {
             fail(new ConnectError("protocol", `server speaks protocol ${challenge.protocol}`, serverName));
             return;
           }
-          if (challenge.password_required && !serverPassword) {
+          if (challenge.password_required && !serverPassword && !this.invite) {
             fail(new ConnectError("password_required", "server password required", serverName));
             return;
           }
@@ -416,6 +428,7 @@ export class Connection implements Link {
       client,
     };
     if (serverPassword) hello.server_password = serverPassword;
+    if (this.invite) hello.invite = this.invite;
     return this.send(socket, "hello", hello, timeoutMs, 1);
   }
 

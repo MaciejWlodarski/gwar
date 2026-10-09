@@ -13,7 +13,6 @@ import {
   Pencil,
   Plus,
   Trash2,
-  UserX,
   Volume2,
 } from "lucide-react";
 import { memo, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
@@ -22,12 +21,13 @@ import { PLATFORM_LABEL } from "../lib/platform";
 import { cn } from "../lib/cn";
 import type { Client } from "../proto/Client";
 import { controller } from "../state/controller";
-import { channelUnread, myChannelId } from "../state/reducer";
+import { channelMentions, channelUnread, myChannelId } from "../state/reducer";
 import { useSettings } from "../state/settings";
 import { useSession, useUi } from "../state/stores";
 import { buildTree, descendantsCount, type ChannelNode } from "../state/tree";
-import { UnreadBadge } from "./badges";
-import { usePermission } from "./hooks";
+import { MentionBadge, UnreadBadge } from "./badges";
+import { useGroupsColor, usePermission } from "./hooks";
+import { ModerationItems } from "./ModerationMenu";
 import { Avatar, EmptyState, Slider, menuContent, menuItem, menuItemDanger, menuLabel, menuSeparator } from "./kit";
 
 const CLIENT_MIME = "application/x-vc-client";
@@ -91,6 +91,7 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
   const current = useSession((s) => myChannelId(s) === channel.id);
   const selected = useSession((s) => s.activeThread === "channel" && s.viewChannel === channel.id);
   const unread = useSession((s) => channelUnread(s, channel.id));
+  const mentions = useSession((s) => channelMentions(s, channel.id));
   const isDefault = useSession((s) => s.server?.default_channel === channel.id);
   const canMove = usePermission("client_move");
   const canCreate = usePermission("channel_create");
@@ -187,6 +188,7 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
             </span>
           )}
           {collapsed && total > 0 && <span className="shrink-0 rounded-full bg-hover px-1.5 text-xs tabular-nums text-muted">{total}</span>}
+          <MentionBadge count={mentions} />
           <UnreadBadge count={unread} />
           {!current && !joining && (
             <button
@@ -255,7 +257,7 @@ function UserRow({ client, depth, compact }: { client: Client; depth: number; co
   const isMe = useSession((s) => s.me?.session === client.id);
   const myChannel = useSession(myChannelId);
   const canMove = usePermission("client_move");
-  const canKick = usePermission("client_kick");
+  const color = useGroupsColor(client.groups);
   const openDm = () => {
     if (isMe) return;
     useSession.getState().dispatch({ type: "openDm", uid: client.uid, name: client.nickname });
@@ -294,7 +296,9 @@ function UserRow({ client, depth, compact }: { client: Client; depth: number; co
           <span className={cn("relative rounded-full", client.talking && "talking-ring")}>
             <Avatar name={client.nickname} seed={client.uid} size={avatarSize} />
           </span>
-          <span className={cn("min-w-0 truncate", silenced && "text-muted", isMe && "font-medium")}>{client.nickname}</span>
+          <span className={cn("min-w-0 truncate", silenced && "text-muted", isMe && "font-medium")} style={color ? { color } : undefined}>
+            {client.nickname}
+          </span>
           {client.away !== null && (
             <span className="min-w-0 max-w-[40%] truncate text-xs text-subtle" title={client.away}>
               {client.away || t("tree.away")}
@@ -328,23 +332,7 @@ function UserRow({ client, depth, compact }: { client: Client; depth: number; co
               <MoveRight className="size-4" /> {t("tree.moveHere")}
             </ContextMenu.Item>
           )}
-          {canKick && !isMe && (
-            <ContextMenu.Item
-              className={cn(menuItem, menuItemDanger)}
-              onSelect={() =>
-                useUi.getState().openDialog({
-                  kind: "confirm",
-                  title: t("tree.kickTitle", { name: client.nickname }),
-                  body: t("tree.kickBody"),
-                  confirmLabel: t("tree.kick"),
-                  danger: true,
-                  onConfirm: () => void controller.kickClient(client.id),
-                })
-              }
-            >
-              <UserX className="size-4" /> {t("tree.kick")}
-            </ContextMenu.Item>
-          )}
+          <ModerationItems person={{ uid: client.uid, nickname: client.nickname, session: client.id }} groups={client.groups} />
           {isMe && <div className="px-2 py-1.5 text-xs text-subtle">{t("tree.you")}</div>}
         </ContextMenu.Content>
       </ContextMenu.Portal>

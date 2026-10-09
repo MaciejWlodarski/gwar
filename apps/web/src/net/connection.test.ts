@@ -225,6 +225,7 @@ describe("reconnect", () => {
   it("does not reconnect after kick or replacement", () => {
     expect(shouldReconnectAfter({ kind: "kicked", by: "a", reason: null })).toBe(false);
     expect(shouldReconnectAfter({ kind: "replaced" })).toBe(false);
+    expect(shouldReconnectAfter({ kind: "banned", by: "a", reason: null, until: null })).toBe(false);
     expect(shouldReconnectAfter({ kind: "server_shutdown" })).toBe(true);
     expect(shouldReconnectAfter({ kind: "timeout" })).toBe(true);
   });
@@ -334,5 +335,59 @@ describe("identity helpers", () => {
     expect(b.publicKey).toBe(a.publicKey);
     expect(saved).toBeDefined();
     await expect(importIdentity("{}", { load: async () => undefined, save: async () => {} })).rejects.toThrow();
+  });
+});
+
+describe("invites and bans", () => {
+  it("sends the invite in hello, and only the first time", async () => {
+    const conn = make({ invite: "CODE123" });
+    const s1 = await handshake(conn);
+    expect(s1.sent[0]).toMatchObject({ op: "hello", d: { invite: "CODE123" } });
+    s1.drop();
+    await vi.advanceTimersByTimeAsync(600);
+    const s2 = FakeSocket.last();
+    s2.open();
+    s2.push(challenge());
+    await vi.waitFor(() => expect(s2.sent.length).toBe(1));
+    expect((s2.sent[0]?.d as Record<string, unknown>).invite).toBeUndefined();
+    s2.push({ re: 1, ok: welcome() });
+    conn.close();
+  });
+
+  it("omits the invite when there is none", async () => {
+    const s = await handshake(make());
+    expect((s.sent[0]?.d as Record<string, unknown>).invite).toBeUndefined();
+  });
+
+  it("an invite stands in for a required server password", async () => {
+    const conn = make({ invite: "CODE123" });
+    const p = conn.connect();
+    const s = FakeSocket.last();
+    s.open();
+    s.push(challenge(true));
+    await vi.waitFor(() => expect(s.sent.length).toBe(1));
+    s.push({ re: 1, ok: welcome() });
+    await p;
+    expect(conn.isOnline).toBe(true);
+    conn.close();
+  });
+
+  it("reports a ban as such, with the server's explanation", async () => {
+    const conn = make();
+    const p = conn.connect();
+    const s = FakeSocket.last();
+    s.open();
+    s.push(challenge());
+    await vi.waitFor(() => expect(s.sent.length).toBe(1));
+    s.push({ re: 1, err: { code: "banned", message: "you are banned from this server: rude" } });
+    await expect(p).rejects.toMatchObject({ kind: "banned", message: "you are banned from this server: rude" });
+  });
+
+  it("does not reconnect after a ban announced by the server", async () => {
+    const conn = make();
+    const s = await handshake(conn);
+    s.push({ ev: "disconnected", d: { reason: { kind: "banned", by: "Admin", reason: "rude", until: null } } });
+    s.drop();
+    expect(conn.status).toMatchObject({ state: "closed", reason: { kind: "server", reason: { kind: "banned", reason: "rude" } } });
   });
 });

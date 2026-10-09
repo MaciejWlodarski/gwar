@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type { ChatTarget } from "../proto/ChatTarget";
 import type { CloseReason } from "../net/connection";
+import type { InviteTarget } from "../net/invite";
 import type { DeviceList, VoiceError, VoiceState } from "../voice/engine";
 import type { ServerKind } from "./settings";
 import { initialState, reduce, type Action } from "./reducer";
@@ -15,9 +16,11 @@ interface SessionStore extends SessionState {
   address: string;
   /** What kind of server we are on (TeamSpeak servers lack history, tokens ...). */
   kind: ServerKind;
+  /** HTTP origin of the vc server (uploads, attachments); null on TeamSpeak. */
+  httpOrigin: string | null;
   dispatch(action: Action): void;
   setClose(reason: CloseReason | null): void;
-  setAddress(address: string, kind?: ServerKind): void;
+  setAddress(address: string, kind?: ServerKind, httpOrigin?: string | null): void;
 }
 
 export const useSession = create<SessionStore>()((set) => ({
@@ -25,9 +28,10 @@ export const useSession = create<SessionStore>()((set) => ({
   closeReason: null,
   address: "",
   kind: "vc",
+  httpOrigin: null,
   dispatch: (action) => set((s) => reduce(s, action)),
   setClose: (closeReason) => set({ closeReason }),
-  setAddress: (address, kind = "vc") => set({ address, kind }),
+  setAddress: (address, kind = "vc", httpOrigin = null) => set({ address, kind, httpOrigin }),
 }));
 
 // -------------------------------------------------------------------- voice
@@ -63,7 +67,16 @@ export interface Toast {
   text: string;
 }
 
-export type SettingsTab = "audio" | "appearance" | "identity" | "language";
+export type SettingsTab = "audio" | "notifications" | "appearance" | "identity" | "language";
+export type ServerSettingsTab = "overview" | "roles" | "members" | "bans" | "invites";
+
+/** Whom a moderation dialog is about: an online session and/or a known member. */
+export interface PersonRef {
+  uid: string;
+  nickname: string;
+  /** Present while the person is online. */
+  session?: number;
+}
 
 export type DialogState =
   | { kind: "none" }
@@ -72,7 +85,10 @@ export type DialogState =
   | { kind: "channelEdit"; mode: "create"; parent: number | null }
   | { kind: "channelEdit"; mode: "edit"; channel: number }
   | { kind: "channelPassword"; channel: number }
-  | { kind: "serverSettings" }
+  | { kind: "serverSettings"; tab?: ServerSettingsTab }
+  | { kind: "invites" }
+  | { kind: "ban"; person: PersonRef; back?: ServerSettingsTab }
+  | { kind: "lightbox"; url: string; name: string }
   | { kind: "redeem" }
   | { kind: "createToken" }
   | { kind: "confirm"; title: string; body: string; confirmLabel: string; danger?: boolean; onConfirm: () => void };
@@ -87,6 +103,9 @@ interface UiStore {
   collapsed: Record<number, boolean>;
   /** Channel I asked to join and the server has not confirmed yet. */
   joining: number | null;
+  /** The message being edited in place (channel messages only). */
+  editing: number | null;
+  setEditing(message: number | null): void;
   toast(kind: ToastKind, text: string): void;
   dismissToast(id: number): void;
   openDialog(dialog: DialogState): void;
@@ -106,6 +125,8 @@ export const useUi = create<UiStore>()((set) => ({
   membersDrawerOpen: false,
   collapsed: {},
   joining: null,
+  editing: null,
+  setEditing: (editing) => set({ editing }),
   toast: (kind, text) => {
     const id = toastId++;
     set((s) => (s.toasts.some((t) => t.text === text) ? s : { toasts: [...s.toasts.slice(-3), { id, kind, text }] }));
@@ -131,6 +152,8 @@ export interface FailedSend {
   /** For private messages: re-resolved on retry because session ids change. */
   dmUid?: string;
   text: string;
+  mentions?: string[];
+  attachments?: string[];
   error: string;
 }
 
@@ -162,6 +185,8 @@ interface ConnectUi {
   /** The server asked for a password we do not have (or got wrong). */
   needPassword: boolean;
   serverName: string | null;
+  /** An invite link was opened or pasted: connecting uses it. */
+  invite: InviteTarget | null;
   set(patch: Partial<Omit<ConnectUi, "set">>): void;
 }
 
@@ -170,5 +195,6 @@ export const useConnectUi = create<ConnectUi>()((set) => ({
   error: null,
   needPassword: false,
   serverName: null,
+  invite: null,
   set: (patch) => set(patch),
 }));

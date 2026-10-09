@@ -1,11 +1,13 @@
-import { Shield } from "lucide-react";
+import * as ContextMenu from "@radix-ui/react-context-menu";
+import { MessageSquare, Shield } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useLanguage, useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { isTeamSpeak, PLATFORM_LABEL } from "../lib/platform";
 import { formatRelative } from "../lib/time";
 import { useSession, useUi } from "../state/stores";
-import { Avatar } from "./kit";
+import { Avatar, menuContent, menuItem, menuLabel } from "./kit";
+import { ModerationItems } from "./ModerationMenu";
 import { groupMembers, type MemberEntry } from "./members";
 
 function MemberRow({ entry, mine, now }: { entry: MemberEntry; mine: boolean; now: number }) {
@@ -24,6 +26,8 @@ function MemberRow({ entry, mine, now }: { entry: MemberEntry; mine: boolean; no
   };
   return (
     <li>
+      <ContextMenu.Root>
+        <ContextMenu.Trigger asChild>
       <button
         type="button"
         onClick={open}
@@ -38,7 +42,12 @@ function MemberRow({ entry, mine, now }: { entry: MemberEntry; mine: boolean; no
           <Avatar name={entry.nickname} seed={entry.uid} size={24} />
         </span>
         <span className="min-w-0 flex-1 leading-tight">
-          <span className={cn("block truncate", offline ? "text-subtle" : "text-fg", mine && "font-medium")}>{entry.nickname}</span>
+          <span
+            className={cn("block truncate", offline ? "text-subtle" : "text-fg", mine && "font-medium")}
+            style={entry.color ? { color: entry.color } : undefined}
+          >
+            {entry.nickname}
+          </span>
           {entry.channel && <span className="block truncate text-[11px] text-subtle">{entry.channel}</span>}
         </span>
         {entry.admin && <Shield aria-label={t("members.admin")} className="size-3.5 shrink-0 text-accent" />}
@@ -46,6 +55,20 @@ function MemberRow({ entry, mine, now }: { entry: MemberEntry; mine: boolean; no
           <span className="shrink-0 rounded bg-hover px-1 text-[10px] leading-4 font-medium text-subtle">{PLATFORM_LABEL[entry.platform]}</span>
         )}
       </button>
+        </ContextMenu.Trigger>
+        <ContextMenu.Portal>
+          <ContextMenu.Content className={cn(menuContent, "w-56")}>
+            <ContextMenu.Label className={menuLabel}>{entry.nickname}</ContextMenu.Label>
+            {!mine && (
+              <ContextMenu.Item className={menuItem} onSelect={open}>
+                <MessageSquare className="size-4" /> {t("tree.pm")}
+              </ContextMenu.Item>
+            )}
+            <ModerationItems person={{ uid: entry.uid, nickname: entry.nickname, session: entry.session ?? undefined }} groups={entry.groups} />
+            {mine && <div className="px-2 py-1.5 text-xs text-subtle">{t("tree.you")}</div>}
+          </ContextMenu.Content>
+        </ContextMenu.Portal>
+      </ContextMenu.Root>
     </li>
   );
 }

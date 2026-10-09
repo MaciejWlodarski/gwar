@@ -1,8 +1,9 @@
-import { AlertTriangle, Menu, Mic, ShieldAlert } from "lucide-react";
+import { AlertTriangle, Menu, Mic, ShieldAlert, Ticket } from "lucide-react";
 import { useEffect, useState, type FormEvent } from "react";
 import { useT } from "../i18n";
 import { pageContextFromLocation, sameOriginUrl } from "../net/address";
-import { controller } from "../state/controller";
+import { parseInviteLink } from "../net/invite";
+import { controller, describeBan } from "../state/controller";
 import { isDesktop } from "../platform";
 import { useSettings, type ServerKind } from "../state/settings";
 import { useConnectUi, useSession, useUi } from "../state/stores";
@@ -33,30 +34,53 @@ export function ConnectScreen() {
   const lastKind = useSettings((s) => s.lastKind);
   const desktop = isDesktop();
   const bookmarks = useSettings((s) => s.bookmarks);
-  const { busy, error, needPassword, serverName } = useConnectUi();
+  const { busy, error, needPassword, serverName, invite } = useConnectUi();
   const closeReason = useSession((s) => s.closeReason);
   const setDrawer = useUi((s) => s.setDrawer);
-  const [kind, setKind] = useState<ServerKind>(desktop ? lastKind : "vc");
-  const [address, setAddress] = useState(lastAddress);
+  const [kind, setKind] = useState<ServerKind>(desktop && !invite?.server ? lastKind : "vc");
+  const [address, setAddress] = useState(invite?.server ?? lastAddress);
   const [nickname, setNickname] = useState(lastNickname);
   const [password, setPassword] = useState("");
   const [remember, setRemember] = useState(true);
 
+  // An invite link without a server means "the server that served this page".
+  const inviteWithoutServer = !!invite && !invite.server;
   useEffect(() => {
-    if (lastAddress || kind !== "vc") return;
+    if (kind !== "vc" || (lastAddress && !inviteWithoutServer)) return;
     let alive = true;
     void probeSameOriginServer().then((found) => {
-      if (alive && found) setAddress((current) => current || found);
+      if (alive && found) setAddress((current) => (inviteWithoutServer ? found : current || found));
     });
     return () => {
       alive = false;
     };
-  }, [lastAddress, kind]);
+  }, [lastAddress, kind, inviteWithoutServer]);
+
+  // Opened from an invite link: the server it names replaces whatever was remembered.
+  const [seenInvite, setSeenInvite] = useState(invite);
+  if (invite !== seenInvite) {
+    setSeenInvite(invite);
+    if (invite?.server) {
+      setKind("vc");
+      setAddress(invite.server);
+    }
+  }
+
+  // A pasted invite link becomes the server address plus the invite.
+  const onAddressChange = (value: string) => {
+    const pasted = kind === "vc" ? parseInviteLink(value) : null;
+    if (pasted) {
+      useConnectUi.getState().set({ invite: pasted });
+      setAddress(pasted.server ?? "");
+      return;
+    }
+    setAddress(value);
+  };
 
   const submit = (e: FormEvent) => {
     e.preventDefault();
     if (busy) return;
-    void controller.connectInteractive({ kind, address, nickname, password }, { remember });
+    void controller.connectInteractive({ kind, address, nickname, password, invite: kind === "vc" ? invite?.code : undefined }, { remember });
   };
 
   const notice = closeNotice(closeReason, t);
@@ -83,6 +107,22 @@ export function ConnectScreen() {
             <p className="text-sm text-muted">{t("connect.subtitle")}</p>
           </div>
 
+          {invite && kind === "vc" && (
+            <div className="flex items-start gap-2 rounded-lg bg-accent-soft px-3 py-2 text-sm text-fg">
+              <Ticket className="mt-0.5 size-4 shrink-0 text-accent" />
+              <span className="min-w-0 flex-1">
+                {t("connect.invited")}
+                <button
+                  type="button"
+                  onClick={() => useConnectUi.getState().set({ invite: null })}
+                  className="ml-2 cursor-pointer text-xs text-muted underline hover:text-fg"
+                >
+                  {t("connect.inviteForget")}
+                </button>
+              </span>
+            </div>
+          )}
+
           {notice && (
             <div role="alert" className="flex gap-2 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">
               <ShieldAlert className="mt-0.5 size-4 shrink-0" />
@@ -108,7 +148,7 @@ export function ConnectScreen() {
               <Input
                 id={id}
                 value={address}
-                onChange={(e) => setAddress(e.target.value)}
+                onChange={(e) => onAddressChange(e.target.value)}
                 placeholder={kind === "teamspeak" ? "ts.example.com" : "voice.example.com"}
                 autoCapitalize="none"
                 autoCorrect="off"
@@ -205,6 +245,7 @@ function closeNotice(reason: ReturnType<typeof useSession.getState>["closeReason
     const r = reason.reason;
     if (r.kind === "kicked") return r.reason ? t("close.kickedReason", { by: r.by, reason: r.reason }) : t("close.kicked", { by: r.by });
     if (r.kind === "replaced") return t("close.replaced");
+    if (r.kind === "banned") return describeBan({ until: r.until, reason: r.reason }, r.by);
     return null;
   }
   if (reason.kind === "error") return t("close.lost");

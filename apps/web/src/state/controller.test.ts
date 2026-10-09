@@ -8,11 +8,15 @@ import type { EventName, Op } from "../net/protocol";
 import { welcome } from "../net/testing";
 import type { VoiceEngine } from "../voice/engine";
 
+const notifyMock = vi.hoisted(() => vi.fn());
+vi.mock("../platform/notify", () => ({ notify: notifyMock }));
+
 // The controller is the browser glue; give it just enough of a browser.
 type Ctl = typeof import("./controller").controller;
 type Stores = typeof import("./stores");
 let controller: Ctl;
 let stores: Stores;
+let settings: typeof import("./settings");
 
 class FakeLink implements Link {
   status: ConnectionStatus = { state: "online" };
@@ -147,6 +151,9 @@ beforeAll(async () => {
   vi.stubGlobal("window", { ...listeners(), location: { protocol: "http:", hostname: "localhost", port: "5173" } });
   vi.stubGlobal("document", { ...listeners(), visibilityState: "visible", hasFocus: () => true });
   stores = await import("./stores");
+  settings = await import("./settings");
+  // No real storage in this environment: keep the settings in memory only.
+  settings.useSettings.persist.setOptions({ storage: { getItem: () => null, setItem: () => {}, removeItem: () => {} } });
   controller = (await import("./controller")).controller;
   engine = fakeEngine();
   controller.useEngine(engine);
@@ -158,7 +165,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   link = new FakeLink();
   session().dispatch({ type: "reset" });
-  stores.useUi.setState({ dialog: { kind: "none" }, joining: null });
+  stores.useUi.setState({ dialog: { kind: "none" }, joining: null, toasts: [] });
   stores.useVoice.setState({ muted: false, deafened: false, micError: null, state: "idle" });
 });
 
@@ -341,5 +348,139 @@ describe("telling the server what I have read", () => {
     await vi.advanceTimersByTimeAsync(5000);
     expect(link.sent("chat.read")).toHaveLength(0);
     expect(session().threads["ch:2"]?.unread).toBe(1);
+  });
+});
+
+describe("sending, editing and deleting", () => {
+  it("sends mentions and attachments along with the text", async () => {
+    connectFake();
+    await controller.sendChat("channel", "hi @n2", { mentions: ["u2"], attachments: ["f1"] });
+    expect(link.sent("chat.send").at(-1)?.d).toEqual({ target: { channel: 1 }, text: "hi @n2", mentions: ["u2"], attachments: ["f1"] });
+    await controller.sendChat("channel", "plain");
+    expect(link.sent("chat.send").at(-1)?.d).toEqual({ target: { channel: 1 }, text: "plain" });
+  });
+
+  it("keeps mentions and attachments of a failed send for the retry", async () => {
+    connectFake();
+    link.failing.add("chat.send");
+    await controller.sendChat("channel", "hi", { mentions: ["u2"], attachments: ["f1"] });
+    expect(stores.useOutbox.getState().failed[0]).toMatchObject({ text: "hi", mentions: ["u2"], attachments: ["f1"] });
+    link.failing.clear();
+    await controller.retrySend(stores.useOutbox.getState().failed[0]!.id);
+    expect(link.sent("chat.send").at(-1)?.d).toMatchObject({ mentions: ["u2"], attachments: ["f1"] });
+  });
+
+  it("edits and deletes through the server", async () => {
+    connectFake();
+    expect(await controller.editMessage(5, "new", ["u2"])).toBe(true);
+    expect(link.sent("chat.edit")).toEqual([{ op: "chat.edit", d: { message: 5, text: "new", mentions: ["u2"] } }]);
+    expect(await controller.deleteMessage(5)).toBe(true);
+    expect(link.sent("chat.delete")).toEqual([{ op: "chat.delete", d: { message: 5 } }]);
+    link.failing.add("chat.delete");
+    expect(await controller.deleteMessage(6)).toBe(false);
+    expect(stores.useUi.getState().toasts).toHaveLength(1);
+  });
+
+  it("applies edit and delete events to the thread", async () => {
+    connectFake();
+    link.emit({ ev: "chat.message", d: message(10, 1) });
+    link.emit({ ev: "chat.edited", d: message(10, 1, { text: "changed", edited_at: 99 }) });
+    expect(session().threads["ch:1"]?.items.some((i) => i.kind === "msg" && i.msg.text === "changed")).toBe(true);
+    link.emit({ ev: "chat.deleted", d: { channel: 1, message: 10 } });
+    expect(session().threads["ch:1"]?.items.some((i) => i.key === "m10")).toBe(false);
+  });
+});
+
+describe("moderation requests", () => {
+  it("sends role, ban and invite requests as the protocol defines them", async () => {
+    connectFake();
+    await controller.createGroup({ name: "Mods", permissions: ["client_kick"], color: "#ff0000" });
+    await controller.updateGroup({ group: 3, color: "" });
+    await controller.setMemberGroups("u2", [2, 3]);
+    await controller.createBan({ client: 2, ip: true, duration: 3600, reason: "spam" });
+    await controller.createInvite({ max_uses: 5, expires_in: 1800, group: 3 });
+    await controller.deleteInvite("code");
+    await controller.deleteBan(4);
+    await controller.deleteGroup(3);
+    expect(link.requests.map((r) => r.op).filter((op) => op !== "chat.history")).toEqual([
+      "group.create",
+      "group.update",
+      "member.groups",
+      "ban.create",
+      "invite.create",
+      "invite.delete",
+      "ban.delete",
+      "group.delete",
+    ]);
+    expect(link.sent("ban.create")[0]?.d).toEqual({ client: 2, ip: true, duration: 3600, reason: "spam" });
+  });
+});
+
+describe("notifications", () => {
+  const prefs = (patch: object = {}) =>
+    settings.useSettings.getState().setNotifications({ mentions: true, privateMessages: true, allMessages: false, ...patch });
+
+  beforeEach(() => {
+    notifyMock.mockClear();
+    prefs();
+  });
+
+  it("notifies about a mention while the window is in the background, and clicking opens that chat", async () => {
+    connectFake();
+    session().dispatch({ type: "focus", focused: false });
+    link.emit({ ev: "chat.message", d: message(50, 2, { mentions: ["u1"], text: "hey you" }) });
+    expect(notifyMock).toHaveBeenCalledTimes(1);
+    const call = notifyMock.mock.calls[0]![0] as { title: string; body: string; onClick: () => void };
+    expect(call.title).toContain("n2");
+    expect(call.body).toBe("hey you");
+    call.onClick();
+    expect(session().viewChannel).toBe(2);
+    expect(session().activeThread).toBe("channel");
+  });
+
+  it("is quiet while the window is in front, for plain channel messages, and for my own", async () => {
+    connectFake();
+    session().dispatch({ type: "focus", focused: true });
+    link.emit({ ev: "chat.message", d: message(51, 2, { mentions: ["u1"] }) });
+    session().dispatch({ type: "focus", focused: false });
+    link.emit({ ev: "chat.message", d: message(52, 2) });
+    link.emit({ ev: "chat.message", d: message(53, 2, { author: 1, author_uid: "u1", mentions: ["u1"] }) });
+    expect(notifyMock).not.toHaveBeenCalled();
+  });
+
+  it("notifies about private messages and opens the conversation", async () => {
+    connectFake();
+    session().dispatch({ type: "focus", focused: false });
+    link.emit({ ev: "chat.message", d: message(54, 1, { target: { client: 1 }, text: "psst" }) });
+    expect(notifyMock).toHaveBeenCalledTimes(1);
+    (notifyMock.mock.calls[0]![0] as { onClick: () => void }).onClick();
+    expect(session().activeThread).toBe("dm:u2");
+  });
+
+  it("can notify about everything", async () => {
+    prefs({ allMessages: true });
+    connectFake();
+    session().dispatch({ type: "focus", focused: false });
+    link.emit({ ev: "chat.message", d: message(55, 2) });
+    expect(notifyMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("uploads", () => {
+  it("refuses files over the server limit before asking the server", async () => {
+    connectFake();
+    stores.useSession.setState({ server: { ...session().server!, upload_limit: 100 } });
+    await expect(controller.uploadFile({ name: "big.bin", size: 101, type: "" } as File)).rejects.toMatchObject({ kind: "too_large" });
+    await expect(controller.uploadFile({ name: "e.bin", size: 0, type: "" } as File)).rejects.toMatchObject({ kind: "empty" });
+    expect(link.sent("file.upload")).toHaveLength(0);
+  });
+
+  it("is off when the server takes no uploads, and on TeamSpeak", async () => {
+    connectFake();
+    expect(controller.canUpload).toBe(false);
+    stores.useSession.setState({ server: { ...session().server!, upload_limit: 100 }, permissions: ["file_upload"] });
+    expect(controller.canUpload).toBe(true);
+    session().setAddress("ts", "teamspeak");
+    expect(controller.canUpload).toBe(false);
   });
 });

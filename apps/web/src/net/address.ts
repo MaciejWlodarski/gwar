@@ -143,3 +143,26 @@ export function parseTeamSpeakAddress(input: string): TsParseResult {
   const label = port === TS_DEFAULT_PORT ? host : `${host}:${port}`;
   return { ok: true, value: { address: `${bracketed}:${port}`, host, label } };
 }
+
+// ------------------------------------------------------------------ HTTP side
+
+/**
+ * The HTTP(S) origin of the server behind a `ws(s)://host[:port]/ws` URL: where
+ * uploads are `PUT` and attachments are fetched from.
+ */
+export function httpOriginFromWsUrl(wsUrl: string): string | null {
+  try {
+    const u = new URL(wsUrl);
+    if (u.protocol !== "ws:" && u.protocol !== "wss:") return null;
+    return `${u.protocol === "wss:" ? "https" : "http"}://${u.host}`;
+  } catch {
+    return null;
+  }
+}
+
+/** Joins a server-relative path (`/files/...`) to the server's HTTP origin. */
+export function absoluteUrl(origin: string | null, path: string): string {
+  if (/^https?:\/\//i.test(path)) return path;
+  if (!origin) return path;
+  return origin.replace(/\/+$/, "") + (path.startsWith("/") ? path : `/${path}`);
+}

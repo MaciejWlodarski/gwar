@@ -4,6 +4,7 @@ import { controller } from "../state/controller";
 import { hasGlobalShortcut, isGlobalShortcutEvent } from "../platform/desktop";
 import { useSettings } from "../state/settings";
 import { useSession, useVoice } from "../state/stores";
+import { nameColor } from "../lib/permissions";
 
 export function useMe() {
   return useSession((s) => (s.me ? s.clients[s.me.session] : undefined));
@@ -11,6 +12,16 @@ export function useMe() {
 
 export function usePermission(p: Permission): boolean {
   return useSession((s) => s.permissions.includes(p));
+}
+
+/** Name colour from the highest role with a colour (undefined: default text). */
+export function useGroupsColor(groupIds: readonly number[]): string | undefined {
+  return useSession((s) => nameColor(groupIds, s.groups));
+}
+
+/** Name colour of a person by uid, from what the server knows of their roles. */
+export function useUidColor(uid: string): string | undefined {
+  return useSession((s) => nameColor(s.members[uid]?.groups ?? [], s.groups));
 }
 
 /** Applies data-theme and follows the OS when theme is "system". */

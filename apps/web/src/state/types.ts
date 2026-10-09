@@ -24,6 +24,8 @@ export type ChatItem =
 export interface Thread {
   items: ChatItem[];
   unread: number;
+  /** Of the unread messages, how many mention me. */
+  mentions: number;
   /** More (older) history may exist on the server. Only meaningful for channel threads. */
   hasMore: boolean;
   /** Initial history for this channel has been merged. */

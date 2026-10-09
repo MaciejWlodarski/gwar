@@ -15,3 +15,14 @@ export function formatRelative(at: number, now: number, lang: string): string {
   }
   return rtf.format(0, "second");
 }
+
+/** "in 3 hours", "in 2 days" ... for a future timestamp (ms); "now" once it has passed. */
+export function formatUntil(at: number, now: number, lang: string): string {
+  const rtf = new Intl.RelativeTimeFormat(lang, { numeric: "auto" });
+  const seconds = Math.floor((at - now) / 1000);
+  if (seconds <= 0) return rtf.format(0, "second");
+  for (const [unit, size] of UNITS) {
+    if (seconds >= size) return rtf.format(Math.floor(seconds / size), unit);
+  }
+  return rtf.format(Math.max(1, Math.ceil(seconds / 60)), "minute");
+}

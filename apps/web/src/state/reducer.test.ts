@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
+import { ALL_PERMISSIONS } from "../lib/permissions";
 import type { Channel } from "../proto/Channel";
 import type { ChatMessage } from "../proto/ChatMessage";
 import type { Client } from "../proto/Client";
 import { welcome } from "../net/testing";
-import { type Action, channelUnread, computePermissions, initialState, latestMessageId, mergeItems, myChannelId, reduce, storedKey } from "./reducer";
+import { type Action, channelMentions, channelUnread, computePermissions, initialState, latestMessageId, mergeItems, myChannelId, reduce, storedKey } from "./reducer";
 import type { SessionState } from "./types";
 import { buildTree } from "./tree";
 
@@ -190,7 +191,8 @@ describe("permissions", () => {
     let s = online();
     expect(s.permissions).toEqual([]);
     s = ev(s, { ev: "client.updated", d: cl(1, 1, { groups: [1, 2] }) });
-    expect(s.permissions.sort()).toEqual(["channel_create", "client_kick"]);
+    // The Admin group (1) always means everything, whatever its list says.
+    expect(s.permissions).toHaveLength(ALL_PERMISSIONS.length);
     expect(computePermissions(s)).toEqual(expect.arrayContaining(["client_kick"]));
   });
 });
@@ -402,5 +404,119 @@ describe("buildTree", () => {
   it("leaves people who are not in voice out of the tree", () => {
     const tree = buildTree([ch(1)], [cl(1, null), cl(2, 1)]);
     expect(tree[0]?.clients.map((c) => c.id)).toEqual([2]);
+  });
+});
+
+describe("editing and deleting messages", () => {
+  it("replaces an edited message in place, keeping the order and the unread count", () => {
+    let s = online();
+    s = ev(s, { ev: "chat.message", d: msg(10) });
+    s = ev(s, { ev: "chat.message", d: msg(11) });
+    const before = s.threads["ch:1"]!.unread;
+    s = ev(s, { ev: "chat.edited", d: msg(10, { text: "fixed", edited_at: 9000 }) });
+    const items = s.threads["ch:1"]!.items.filter((i) => i.kind === "msg");
+    expect(items.map((i) => (i.kind === "msg" ? i.msg.text : ""))).toEqual(["fixed", "t11"]);
+    expect(items[0]?.kind === "msg" && items[0].msg.edited_at).toBe(9000);
+    expect(s.threads["ch:1"]!.unread).toBe(before);
+  });
+
+  it("ignores edits of messages that are not loaded", () => {
+    const s = online();
+    expect(ev(s, { ev: "chat.edited", d: msg(99, { text: "x" }) })).toBe(s);
+  });
+
+  it("removes a deleted message and the unread it counted", () => {
+    let s = online();
+    s = reduce(s, { type: "setActive", key: "server" });
+    s = ev(s, { ev: "chat.message", d: msg(10) });
+    s = ev(s, { ev: "chat.message", d: msg(11) });
+    expect(s.threads["ch:1"]!.unread).toBe(2);
+    s = ev(s, { ev: "chat.deleted", d: { channel: 1, message: 10 } });
+    expect(s.threads["ch:1"]!.items.some((i) => i.key === "m10")).toBe(false);
+    expect(s.threads["ch:1"]!.unread).toBe(1);
+    // Deleting something already read does not eat into the count.
+    s = ev(s, { ev: "chat.read", d: { channel: 1, message: 11 } });
+    s = ev(s, { ev: "chat.deleted", d: { channel: 1, message: 11 } });
+    expect(s.threads["ch:1"]!.unread).toBe(0);
+  });
+});
+
+describe("mentions", () => {
+  const away = (s: SessionState) => reduce(s, { type: "setActive", key: "server" });
+
+  it("counts unread messages that mention me", () => {
+    let s = away(online());
+    s = ev(s, { ev: "chat.message", d: msg(10, { mentions: ["u1"] }) });
+    s = ev(s, { ev: "chat.message", d: msg(11) });
+    s = ev(s, { ev: "chat.message", d: msg(12, { mentions: ["u3"] }) });
+    expect(s.threads["ch:1"]).toMatchObject({ unread: 3, mentions: 1 });
+    expect(channelMentions(s, 1)).toBe(1);
+  });
+
+  it("does not count my own messages or the chat I am looking at", () => {
+    let s = online();
+    s = ev(s, { ev: "chat.message", d: msg(10, { mentions: ["u1"] }) });
+    expect(s.threads["ch:1"]?.mentions).toBe(0);
+    s = away(s);
+    s = ev(s, { ev: "chat.message", d: msg(11, { author: 1, author_uid: "u1", mentions: ["u1"] }) });
+    expect(s.threads["ch:1"]?.mentions).toBe(0);
+  });
+
+  it("starts from the server's count and clears when the channel is read or opened", () => {
+    let s = reduce(initialState, {
+      type: "welcome",
+      resync: false,
+      now: 1,
+      welcome: welcome({
+        session: 1,
+        uid: "u1",
+        channels: [ch(1), ch(2)],
+        clients: [cl(1, 1)],
+        unread: [{ channel: 2, last_read: 4, count: 3, mentions: 2 }],
+      }),
+    });
+    expect(s.threads["ch:2"]).toMatchObject({ unread: 3, mentions: 2 });
+    s = ev(s, { ev: "chat.message", d: msg(20, { target: { channel: 2 }, mentions: ["u1"] }) });
+    expect(s.threads["ch:2"]).toMatchObject({ unread: 4, mentions: 3 });
+    s = reduce(s, { type: "selectChannel", channel: 2 });
+    expect(s.threads["ch:2"]).toMatchObject({ unread: 0, mentions: 0 });
+  });
+
+  it("a deleted unread mention is no longer counted", () => {
+    let s = away(online());
+    s = ev(s, { ev: "chat.message", d: msg(10, { mentions: ["u1"] }) });
+    s = ev(s, { ev: "chat.deleted", d: { channel: 1, message: 10 } });
+    expect(s.threads["ch:1"]).toMatchObject({ unread: 0, mentions: 0 });
+  });
+});
+
+describe("roles", () => {
+  it("recomputes my permissions when a group I am in changes", () => {
+    let s = online();
+    s = ev(s, { ev: "group.created", d: { id: 5, name: "Mods", permissions: ["client_kick"], color: "#ff0000" } });
+    s = ev(s, { ev: "client.updated", d: cl(1, 1, { groups: [2, 5] }) });
+    expect(s.permissions).toEqual(["client_kick"]);
+    s = ev(s, { ev: "group.updated", d: { id: 5, name: "Mods", permissions: ["client_kick", "client_ban"], color: null } });
+    expect(s.permissions).toEqual(["client_kick", "client_ban"]);
+    expect(s.groups[5]?.color).toBeNull();
+    s = ev(s, { ev: "group.deleted", d: { group: 5 } });
+    expect(s.permissions).toEqual([]);
+    expect(s.groups[5]).toBeUndefined();
+    expect(s.clients[1]?.groups).toEqual([2]);
+  });
+
+  it("member.updated changes the roles of a member and of their online sessions", () => {
+    let s = online();
+    s = ev(s, { ev: "member.updated", d: { uid: "u2", nickname: "n2", groups: [2, 7], last_seen: 3 } });
+    expect(s.members["u2"]?.groups).toEqual([2, 7]);
+    expect(s.clients[2]?.groups).toEqual([2, 7]);
+  });
+
+  it("member.updated on me recomputes what I may do", () => {
+    let s = online();
+    s = ev(s, { ev: "group.created", d: { id: 6, name: "Inviters", permissions: ["invite_create"] } });
+    expect(s.permissions).toEqual([]);
+    s = ev(s, { ev: "member.updated", d: { uid: "u1", nickname: "n1", groups: [2, 6], last_seen: 3 } });
+    expect(s.permissions).toEqual(["invite_create"]);
   });
 });

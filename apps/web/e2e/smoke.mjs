@@ -26,6 +26,7 @@ import net from "node:net";
 import { existsSync, mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 
@@ -131,6 +132,44 @@ async function ensureWeb() {
 }
 
 const debugPages = [];
+
+/** A solid-colour PNG, built by hand so the test needs no image files. */
+function makePng(width, height, [r, g, b]) {
+  const crcTable = Array.from({ length: 256 }, (_, n) => {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    return c >>> 0;
+  });
+  const crc = (buf) => {
+    let c = 0xffffffff;
+    for (const byte of buf) c = crcTable[(c ^ byte) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const chunk = (type, data) => {
+    const body = Buffer.concat([Buffer.from(type), data]);
+    const out = Buffer.alloc(body.length + 8);
+    out.writeUInt32BE(data.length, 0);
+    body.copy(out, 4);
+    out.writeUInt32BE(crc(body), body.length + 4);
+    return out;
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 2; // RGB
+  const row = Buffer.concat([Buffer.from([0]), Buffer.from(Array.from({ length: width }, () => [r, g, b]).flat())]);
+  const raw = Buffer.concat(Array.from({ length: height }, () => row));
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr),
+    chunk("IDAT", zlib.deflateSync(raw)),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+const ROLE = `Mods-${rid}`;
+const ROLE_RGB = "rgb(231, 76, 60)"; // #e74c3c, the first colour preset
 
 async function check(name, fn) {
   try {
@@ -715,6 +754,253 @@ async function main() {
     await shot(e, "16-mic-denied-dark");
   });
 
+  console.log("roles, mentions, edits, files, invites, bans");
+  const nameColor = (page, locator) => locator.evaluate((el) => getComputedStyle(el).color);
+  const openSettings = async (page, tabName) => {
+    await page.getByRole("button", { name: "Server menu" }).click();
+    await page.getByRole("menuitem", { name: "Server settings" }).click();
+    await page.getByRole("tab", { name: tabName }).click();
+  };
+
+  await check("admin creates a role with the kick permission and gives it to Bob; his name gets the colour", async () => {
+    await openSettings(a, "Roles");
+    await a.getByRole("button", { name: "Create role" }).click();
+    await a.getByLabel("Role name").fill(ROLE);
+    await a.getByRole("button", { name: "#e74c3c" }).click();
+    await a.getByRole("checkbox", { name: /Kick people/ }).check();
+    await shot(a, "19-settings-roles-dark");
+    await a.getByRole("button", { name: "Create", exact: true }).click();
+    await a.getByRole("button", { name: ROLE }).waitFor();
+    await a.getByRole("tab", { name: "Members" }).click();
+    await a.getByLabel("Search members").fill("Bob");
+    await a.getByRole("button", { name: "Change roles of Bob" }).click();
+    await a.getByRole("menuitemcheckbox", { name: ROLE }).click();
+    await a.getByRole("menuitemcheckbox", { name: ROLE, checked: true }).waitFor();
+    await a.keyboard.press("Escape");
+    await a.locator('[data-member="Bob"]').getByText(ROLE).waitFor();
+    await shot(a, "20-settings-members-dark");
+    await a.keyboard.press("Escape");
+    // Everyone sees the colour, in the tree and in the member list.
+    for (const p of [a, b]) {
+      await waitFor(async () => (await nameColor(p, treeItem(p, /Bob/).getByText("Bob", { exact: true }))) === ROLE_RGB, "Bob's name colour in the tree");
+      await waitFor(
+        async () => (await nameColor(p, memberSection(p, "In voice").getByText("Bob", { exact: true }))) === ROLE_RGB,
+        "Bob's name colour in the member list",
+      );
+    }
+    // The tree's context menu shows (and can change) the same roles.
+    await treeItem(a, /Bob/).click({ button: "right" });
+    await a.getByRole("menuitem", { name: "Roles" }).click();
+    await a.getByRole("menuitemcheckbox", { name: ROLE, checked: true }).waitFor();
+    await a.keyboard.press("Escape");
+    await a.keyboard.press("Escape");
+    // The permission arrived without reconnecting: Bob can now kick (but not Alice, who is stronger).
+    await treeItem(b, /Eve/).click({ button: "right" });
+    await b.getByRole("menuitem", { name: "Kick from server" }).waitFor();
+    await b.keyboard.press("Escape");
+    await treeItem(b, /Alice/).click({ button: "right" });
+    if (!(await b.getByRole("menuitem", { name: "Kick from server" }).isDisabled())) throw new Error("Bob can kick the admin");
+    await b.keyboard.press("Escape");
+  });
+
+  const hello = `hey @Bob mention ${rid}`;
+  await check("mention: autocomplete in the composer, a badge and a highlight for the mentioned user", async () => {
+    await treeItem(b, GAMES).click(); // Bob looks at another chat, so General counts as unread
+    await treeItem(a, /General/).click();
+    await composer(a).click();
+    await composer(a).pressSequentially("hey @Bo");
+    await a.getByRole("option", { name: /Bob/ }).waitFor();
+    await shot(a, "21-mention-autocomplete-dark");
+    await composer(a).press("Enter"); // takes the suggestion instead of sending
+    if ((await composer(a).inputValue()) !== "hey @Bob ") throw new Error(`unexpected composer text: ${await composer(a).inputValue()}`);
+    await composer(a).pressSequentially(`mention ${rid}`);
+    await composer(a).press("Enter");
+    await treeItem(b, /General/).getByTitle("Mentions of you: 1").waitFor({ timeout: 8000 });
+    await treeItem(b, /General/).click();
+    const msg = b.locator("[data-mentions-me]").filter({ hasText: hello });
+    await msg.waitFor();
+    await msg.locator('[data-mention]').getByText("@Bob").waitFor();
+    // Only the mentioned user gets the highlight.
+    if ((await a.locator("[data-mentions-me]").count()) !== 0) throw new Error("the author sees a mention highlight");
+    await shot(b, "22-mention-highlight-dark");
+    // The mention badge is gone once read.
+    await treeItem(b, /General/).getByTitle(/Mentions of you/).waitFor({ state: "detached" });
+  });
+
+  await check("a message can be edited (Up arrow) and deleted; the other user sees both", async () => {
+    await composer(a).press("ArrowUp");
+    const editor = a.getByRole("textbox", { name: "Edit message" });
+    await editor.waitFor();
+    await editor.fill(`hey @Bob edited ${rid}`);
+    await editor.press("Enter");
+    await b.getByText(`hey @Bob edited ${rid}`).waitFor();
+    const row = b.locator("[data-message]").filter({ hasText: `edited ${rid}` });
+    await row.locator("[data-edited]").waitFor();
+    await a.locator("[data-message]").filter({ hasText: `edited ${rid}` }).locator("[data-edited]").waitFor();
+    // Escape leaves the editor without saving.
+    await composer(a).press("ArrowUp");
+    await a.getByRole("textbox", { name: "Edit message" }).fill("never saved");
+    await a.keyboard.press("Escape");
+    await a.getByRole("textbox", { name: "Edit message" }).waitFor({ state: "detached" });
+    // Bob cannot edit or delete Alice's message.
+    await row.hover();
+    if ((await row.getByRole("button", { name: "Delete message" }).count()) !== 0) throw new Error("Bob may delete Alice's message");
+    // Delete with a confirmation.
+    const mine = a.locator("[data-message]").filter({ hasText: `edited ${rid}` });
+    await mine.hover();
+    await mine.getByRole("button", { name: "Delete message" }).click();
+    await a.getByRole("dialog").getByRole("button", { name: "Delete" }).click();
+    await b.getByText(`hey @Bob edited ${rid}`).waitFor({ state: "detached" });
+    // Shift+click skips the question.
+    await composer(a).fill(`quick ${rid}`);
+    await composer(a).press("Enter");
+    const quick = a.locator("[data-message]").filter({ hasText: `quick ${rid}` });
+    await quick.hover();
+    await quick.getByRole("button", { name: "Delete message" }).click({ modifiers: ["Shift"] });
+    await quick.waitFor({ state: "detached" });
+    await b.getByText(`quick ${rid}`).waitFor({ state: "detached" });
+  });
+
+  // The page is served by Vite, not by the server, so the browser needs CORS to PUT to the server.
+  // Real deployments serve the client from the server (checked with the production build below).
+  await ctxA.route("**/api/files/**", async (route) => {
+    const cors = { "access-control-allow-origin": "*", "access-control-allow-methods": "PUT, OPTIONS", "access-control-allow-headers": "*" };
+    if (route.request().method() === "OPTIONS") return route.fulfill({ status: 204, headers: cors });
+    const response = await route.fetch();
+    return route.fulfill({ response, headers: { ...response.headers(), ...cors } });
+  });
+  const png = makePng(64, 48, [200, 80, 60]);
+
+  await check("an image is uploaded with progress, shown inline to both, opens in a lightbox", async () => {
+    await a.locator("input[type=file]").setInputFiles({ name: "pixel.png", mimeType: "image/png", buffer: png });
+    const pending = a.getByRole("list", { name: "Files to send" });
+    await pending.getByText("pixel.png").waitFor();
+    await pending.getByText(/\d+ B$/).waitFor({ timeout: 10000 }); // finished: shows the size instead of a percentage
+    await composer(a).fill(`look at this ${rid}`);
+    await composer(a).press("Enter");
+    await pending.waitFor({ state: "detached" });
+    for (const p of [a, b]) {
+      const img = p.getByRole("button", { name: "Open pixel.png" }).locator("img");
+      await img.waitFor({ timeout: 10000 });
+      await waitFor(() => img.evaluate((i) => i.complete && i.naturalWidth === 64), "image loaded");
+      const box = await img.boundingBox();
+      if (Math.round(box.width) !== 64 || Math.round(box.height) !== 48) throw new Error(`image shown at ${box.width}x${box.height}`);
+      await p.getByText(`look at this ${rid}`).waitFor();
+    }
+    await shot(b, "23-chat-image-dark");
+    await b.getByRole("button", { name: "Open pixel.png" }).click();
+    await b.getByRole("dialog").getByRole("img", { name: "pixel.png" }).waitFor();
+    await b.getByRole("button", { name: "Save image" }).waitFor();
+    await b.keyboard.press("Escape");
+    await b.getByRole("dialog").waitFor({ state: "detached" });
+    // The server serves it as an image, from its own origin.
+    const sent = fa.events("chat.message").find((m) => m.attachments?.some((x) => x.name === "pixel.png"));
+    const att = sent.attachments[0];
+    if (att.width !== 64 || att.height !== 48) throw new Error(`dimensions ${att.width}x${att.height}`);
+    const r = await fetch(`http://${SERVER}${att.url}`);
+    if (r.headers.get("content-type") !== "image/png") throw new Error(`content type ${r.headers.get("content-type")}`);
+  });
+
+  await check("a text file is shown as a file card, an oversized file is refused up front", async () => {
+    await a.locator("input[type=file]").setInputFiles({ name: "notes.txt", mimeType: "text/plain", buffer: Buffer.from(`notes ${rid}\n`) });
+    await a.getByRole("list", { name: "Files to send" }).getByText(/\d+ B$/).waitFor({ timeout: 10000 });
+    await composer(a).press("Enter"); // attachments only, no text
+    for (const p of [a, b]) {
+      const card = p.locator('[data-attachment="file"]').filter({ hasText: "notes.txt" });
+      await card.waitFor({ timeout: 10000 });
+      await card.getByRole("button", { name: "Download notes.txt" }).waitFor();
+    }
+    await shot(b, "24-chat-file-card-dark");
+    const att = fa.events("chat.message").find((m) => m.attachments?.some((x) => x.name === "notes.txt")).attachments[0];
+    const r = await fetch(`http://${SERVER}${att.url}`);
+    if (!/^attachment/.test(r.headers.get("content-disposition") ?? "")) throw new Error("text file is not an attachment");
+    if ((await r.text()) !== `notes ${rid}\n`) throw new Error("file content differs");
+    // Over the limit: refused before anything is sent to the server.
+    await a.locator("input[type=file]").setInputFiles({ name: "huge.bin", mimeType: "application/octet-stream", buffer: Buffer.alloc(26 * 1024 * 1024) });
+    await a.getByText(/huge\.bin: That file is too large\. The limit is 25 MB\./).waitFor();
+    if ((await a.getByRole("list", { name: "Files to send" }).count()) !== 0) throw new Error("oversized file was queued");
+  });
+
+  let inviteLink = "";
+  await check("an invite link admits a new user, who gets the invite's role", async () => {
+    await ctxA.grantPermissions(["clipboard-read", "clipboard-write"], { origin: new URL(WEB_URL).origin });
+    await a.getByRole("button", { name: "Server menu" }).click();
+    await a.getByRole("menuitem", { name: "Invite people" }).click();
+    await a.getByRole("combobox", { name: "Uses" }).click();
+    await a.getByRole("option", { name: "1", exact: true }).click();
+    await a.getByRole("combobox", { name: "Role for new people" }).click();
+    await a.getByRole("option", { name: ROLE }).click();
+    await a.getByRole("button", { name: "Create invite" }).click();
+    const item = a.locator("[data-invite]").first();
+    await item.waitFor();
+    await item.getByText("0 of 1 uses").waitFor();
+    await item.getByRole("button", { name: "Copy link" }).click();
+    inviteLink = await a.evaluate(() => navigator.clipboard.readText());
+    const expected = new RegExp(`^${escapeRe(new URL(WEB_URL).origin)}/\\?invite=[\\w-]+&server=${escapeRe(encodeURIComponent(CLIENT_ADDR))}$`);
+    if (!expected.test(inviteLink)) throw new Error(`unexpected invite link ${inviteLink}`);
+    await shot(a, "25-invites-dark");
+    await a.keyboard.press("Escape");
+
+    const ctx = await newCtx();
+    const ivy = await ctx.newPage();
+    debugPages.push(ivy);
+    await ivy.goto(inviteLink);
+    await ivy.getByText(/You were invited to this server/).waitFor();
+    if (/invite=/.test(ivy.url())) throw new Error(`the invite stays in the address bar: ${ivy.url()}`);
+    await waitFor(async () => (await ivy.getByLabel("Server address").inputValue()) === CLIENT_ADDR, "prefilled server address");
+    await shot(ivy, "26-invite-join-dark");
+    await ivy.getByLabel("Nickname").fill("Ivy");
+    await ivy.getByRole("button", { name: "Connect" }).click();
+    await ivy.getByText("Not in voice").waitFor({ timeout: 20000 });
+    await waitFor(async () => (await nameColor(a, memberSection(a, "Online").getByText("Ivy", { exact: true }))) === ROLE_RGB, "Ivy has the invite's role colour");
+
+    // A link pasted into the address field (what the desktop app does) is understood too.
+    const ctx2 = await newCtx();
+    const paste = await ctx2.newPage();
+    await paste.goto(WEB_URL);
+    await paste.getByLabel("Server address").fill(inviteLink);
+    await waitFor(async () => (await paste.getByLabel("Server address").inputValue()) === CLIENT_ADDR, "address extracted from the pasted link");
+    await paste.getByText(/You were invited to this server/).waitFor();
+    await ctx2.close();
+
+    // The used-up invite shows its use.
+    await a.getByRole("button", { name: "Server menu" }).click();
+    await a.getByRole("menuitem", { name: "Invite people" }).click();
+    await a.locator("[data-invite]").first().getByText("1 of 1 uses").waitFor();
+    await a.keyboard.press("Escape");
+  });
+
+  await check("a banned user sees why, cannot get back in, and can after the unban", async () => {
+    await treeItem(a, /Bob/).click({ button: "right" });
+    await a.getByRole("menuitem", { name: "Ban…" }).click();
+    await a.getByLabel("Reason").fill("e2e spam");
+    await a.getByRole("radio", { name: "1 hour" }).click();
+    await shot(a, "27-ban-dialog-dark");
+    await a.getByRole("dialog").getByRole("button", { name: "Ban…" }).click();
+    await b.getByText(/You were banned from the server by Alice/).waitFor({ timeout: 6000 });
+    await b.getByText(/Reason: e2e spam/).waitFor();
+    await shot(b, "28-banned-dark");
+    await sleep(2500);
+    if ((await b.getByRole("button", { name: "Connect" }).count()) === 0) throw new Error("banned client reconnected");
+    // Connecting again is refused with the reason.
+    await b.getByRole("button", { name: "Connect" }).click();
+    await b.getByRole("alert").filter({ hasText: /banned/ }).filter({ hasText: "e2e spam" }).first().waitFor({ timeout: 8000 });
+    // The ban is listed with its reason; lifting it lets Bob in.
+    await openSettings(a, "Bans");
+    const ban = a.locator('[data-ban="Bob"]');
+    await ban.getByText("e2e spam").waitFor();
+    await ban.getByText(/ends in/).waitFor();
+    await shot(a, "29-settings-bans-dark");
+    await ban.getByRole("button", { name: "Unban" }).click();
+    await ban.waitFor({ state: "detached" });
+    await a.keyboard.press("Escape");
+    await b.getByRole("button", { name: "Connect" }).click();
+    await b.getByText("Not in voice").waitFor({ timeout: 20000 });
+    await treeItem(b, /General/).dblclick();
+    await b.getByText("Voice connected").waitFor({ timeout: 20000 });
+    await treeItem(a, /Bob/).waitFor();
+  });
+
   await check("a kicked user is told why and does not reconnect", async () => {
     await treeItem(a, /Bob/).click({ button: "right" });
     await a.getByRole("menuitem", { name: "Kick from server" }).click();
@@ -789,6 +1075,11 @@ async function main() {
         await w.getByText("Not in voice").waitFor({ timeout: 20000 });
         await w.getByRole("treeitem", { name: /Lobby/ }).dblclick();
         await w.getByText("Voice connected").waitFor({ timeout: 20000 });
+        // Served by the server itself, the client uploads to its own origin (no CORS involved).
+        await w.locator("input[type=file]").setInputFiles({ name: "tiny.png", mimeType: "image/png", buffer: makePng(8, 8, [10, 120, 200]) });
+        await w.getByRole("list", { name: "Files to send" }).getByText(/\d+ B$/).waitFor({ timeout: 10000 });
+        await w.getByRole("textbox", { name: "Message", exact: true }).press("Enter");
+        await w.getByRole("button", { name: "Open tiny.png" }).locator("img").waitFor({ timeout: 10000 });
       } finally {
         child.kill();
       }
