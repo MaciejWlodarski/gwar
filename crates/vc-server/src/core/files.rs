@@ -41,8 +41,8 @@ pub struct UploadSlot {
 pub struct Uploaded {
     pub id: String,
     pub size: u64,
-    /// Image type sniffed from the bytes, if any.
-    pub image: Option<&'static str>,
+    /// Image, audio or video type sniffed from the bytes, if any.
+    pub media: Option<&'static str>,
     pub dimensions: Option<(u32, u32)>,
 }
 
@@ -144,8 +144,8 @@ impl Core {
                     let _ = reply.send(false);
                     return;
                 };
-                // Only sniffed image types are ever served as themselves.
-                let mime = upload.image.map(str::to_owned).unwrap_or(pending.mime);
+                // Only sniffed media types are ever served as themselves.
+                let mime = upload.media.map(str::to_owned).unwrap_or(pending.mime);
                 let stored = self.store.insert_file(
                     &upload.id,
                     &pending.uploader,
