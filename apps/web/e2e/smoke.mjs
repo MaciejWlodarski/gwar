@@ -1205,16 +1205,18 @@ async function main() {
     const written = await c.evaluate(async () => {
       const { loadConnectRecord } = await import("/src/net/identity.ts");
       const { connectApi } = await import("/src/connect/api.ts");
-      const { loadVault, updateVault, withTeamspeak } = await import("/src/connect/vault.ts");
+      const { loadVault, updateVault, withTeamspeakList } = await import("/src/connect/vault.ts");
       const record = await loadConnectRecord();
-      await updateVault(connectApi, record, (v) => ({ ...withTeamspeak(v, "1Vfake", "E2E-TS-UID", 1), future: { kept: true } }));
+      const list = { default: "E2E-TS-UID", identities: [{ uid: "E2E-TS-UID", name: "E2E TeamSpeak", identity: "1Vfake" }] };
+      await updateVault(connectApi, record, (v) => ({ ...withTeamspeakList(v, list, 1), future: { kept: true } }));
       return (await loadVault(connectApi, record)).contents;
     });
     if (written.future?.kept !== true) throw new Error("vault lost a field");
     await d.getByRole("button", { name: "Settings" }).first().click();
     await d.getByRole("tab", { name: "Account" }).click();
-    const field = d.getByLabel("Your TeamSpeak identity (used by the desktop app)");
-    await waitFor(async () => (await field.inputValue().catch(() => "")) === "E2E-TS-UID", "the TeamSpeak uid from the vault", 10000);
+    const identities = d.getByRole("list", { name: "TeamSpeak identities" });
+    await identities.getByText("E2E TeamSpeak").waitFor({ timeout: 10000 });
+    await identities.getByText("E2E-TS-UID").waitFor({ timeout: 10000 });
     await d.keyboard.press("Escape");
   });
 

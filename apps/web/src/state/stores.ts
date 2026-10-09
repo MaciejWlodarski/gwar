@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import type { TsFound } from "../connect/teamspeak";
 import type { ChatTarget } from "../proto/ChatTarget";
 import type { CloseReason } from "../net/connection";
 import type { InviteTarget } from "../net/invite";
@@ -91,7 +92,9 @@ export type DialogState =
   | { kind: "lightbox"; url: string; name: string }
   | { kind: "redeem" }
   | { kind: "createToken" }
-  | { kind: "confirm"; title: string; body: string; confirmLabel: string; danger?: boolean; onConfirm: () => void };
+  | { kind: "confirm"; title: string; body: string; confirmLabel: string; danger?: boolean; onConfirm: () => void }
+  /** First TeamSpeak connection on a device: offers the official client's identities. Resolves with the chosen ones, or null. */
+  | { kind: "tsFirstRun"; found: TsFound[]; resolve: (chosen: TsFound[] | null) => void };
 
 interface UiStore {
   toasts: Toast[];
@@ -133,8 +136,17 @@ export const useUi = create<UiStore>()((set) => ({
     setTimeout(() => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })), kind === "error" ? 6000 : 3500);
   },
   dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
-  openDialog: (dialog) => set({ dialog }),
-  closeDialog: () => set({ dialog: { kind: "none" } }),
+  openDialog: (dialog) =>
+    set((s) => {
+      if (s.dialog.kind === "tsFirstRun") s.dialog.resolve(null);
+      return { dialog };
+    }),
+  closeDialog: () =>
+    set((s) => {
+      // Whoever waits for the first-run answer must not wait forever: leaving it unanswered means "no".
+      if (s.dialog.kind === "tsFirstRun") s.dialog.resolve(null);
+      return { dialog: { kind: "none" } };
+    }),
   setDrawer: (drawerOpen) => set({ drawerOpen }),
   setMembersDrawer: (membersDrawerOpen) => set({ membersDrawerOpen }),
   toggleCollapsed: (channel) => set((s) => ({ collapsed: { ...s.collapsed, [channel]: !s.collapsed[channel] } })),

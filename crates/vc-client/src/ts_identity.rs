@@ -13,6 +13,19 @@ pub use tsclientlib::Identity;
 /// Most servers require a security level of at least 8 to connect.
 pub const MIN_LEVEL: u8 = 8;
 
+/// A new identity at level [`MIN_LEVEL`]. tsproto cannot read back a key whose private scalar starts with
+/// a zero byte (one in 256: its DER form is a byte short), so such a key would be lost the first time it is
+/// stored; this makes another one instead.
+pub fn generate() -> Identity {
+    loop {
+        let identity = Identity::create();
+        let stored = serde_json::to_vec(&identity).ok().and_then(|json| serde_json::from_slice::<Identity>(&json).ok());
+        if stored.is_some() && parse_any(&export(&identity)).is_ok() {
+            return identity;
+        }
+    }
+}
+
 /// `<counter>V<obfuscated key>`, as the TeamSpeak client exports it.
 pub fn export(identity: &Identity) -> String {
     format!("{}V{}", identity.counter(), identity.key().to_ts_obfuscated())
@@ -32,9 +45,8 @@ fn ini_value(text: &str) -> Option<&str> {
 }
 
 /// Reads an identity from a bare `<counter>V<key>` string or from the whole
-/// contents of an identity `.ini`. Fails on anything else and on identities
-/// below [`MIN_LEVEL`], which most servers would refuse.
-pub fn parse(text: &str) -> Result<Identity> {
+/// contents of an identity `.ini`, whatever its security level. Fails on anything else.
+pub fn parse_any(text: &str) -> Result<Identity> {
     let text = text.trim();
     // The key itself ends in `=` padding, so only a line named `identity` counts as an .ini.
     let candidate = match ini_value(text) {
@@ -47,8 +59,13 @@ pub fn parse(text: &str) -> Result<Identity> {
     if candidate.is_empty() {
         bail!("the identity is empty");
     }
-    let identity = Identity::new_from_ts_str(candidate)
-        .map_err(|_| anyhow!("this is not a TeamSpeak identity (expected <number>V<key>)"))?;
+    Identity::new_from_ts_str(candidate)
+        .map_err(|_| anyhow!("this is not a TeamSpeak identity (expected <number>V<key>)"))
+}
+
+/// Like [`parse_any`], but also fails on identities below [`MIN_LEVEL`], which most servers would refuse.
+pub fn parse(text: &str) -> Result<Identity> {
+    let identity = parse_any(text)?;
     let level = identity.level();
     if level < MIN_LEVEL {
         bail!(
@@ -68,8 +85,13 @@ pub fn read(path: &Path) -> Result<Option<Identity>> {
 }
 
 /// Writes `identity` to `path` (private to the user), replacing what is there.
-/// It goes through a temporary file, so a crash never leaves half an identity.
 pub fn write(path: &Path, identity: &Identity) -> Result<()> {
+    write_private(path, &serde_json::to_vec(identity)?)
+}
+
+/// Writes `data` to `path` readable by the user only, replacing what is there.
+/// It goes through a temporary file, so a crash never leaves half a file.
+pub(crate) fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -84,10 +106,54 @@ pub fn write(path: &Path, identity: &Identity) -> Result<()> {
         options.mode(0o600);
     }
     let mut file = options.open(temp)?;
-    file.write_all(&serde_json::to_vec(identity)?)?;
+    file.write_all(data)?;
     file.sync_all()?;
     std::fs::rename(temp, path)?;
     Ok(())
+}
+
+/// A fresh key with a counter that gives it a level below [`MIN_LEVEL`] (a key reaches 8 at counter 0 once in 256).
+#[cfg(test)]
+pub(crate) fn low_level() -> Identity {
+    let mut identity = generate();
+    let mut low = 0;
+    while {
+        identity.set_counter(low);
+        identity.level() >= MIN_LEVEL
+    } {
+        low += 1;
+    }
+    identity
+}
+
+/// A directory under the system temp dir that is removed when dropped.
+#[cfg(test)]
+pub(crate) struct TempDir(pub std::path::PathBuf);
+
+#[cfg(test)]
+impl TempDir {
+    pub fn new(label: &str) -> Self {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "gwar-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+
+    pub fn join(&self, name: &str) -> std::path::PathBuf {
+        self.0.join(name)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 #[cfg(test)]
@@ -95,9 +161,16 @@ mod tests {
     use super::*;
 
     fn fresh() -> Identity {
-        let mut identity = Identity::create();
-        identity.upgrade_level(MIN_LEVEL);
-        identity
+        generate()
+    }
+
+    #[test]
+    fn generated_identities_survive_storing() {
+        for _ in 0..400 {
+            let identity = generate();
+            assert!(identity.level() >= MIN_LEVEL);
+            assert_eq!(uid(&parse(&export(&identity)).unwrap()), uid(&identity));
+        }
     }
 
     #[test]
@@ -135,16 +208,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_any_accepts_a_low_level_identity() {
+        let identity = low_level();
+        let text = export(&identity);
+        assert!(parse(&text).is_err());
+        let back = parse_any(&text).unwrap();
+        assert_eq!(uid(&back), uid(&identity));
+        assert!(back.level() < MIN_LEVEL);
+    }
+
+    #[test]
     fn rejects_a_low_level_identity() {
-        // The same key with counter 0 has level 0 (a key at level 8 or more at counter 0 is a one in 256 chance).
-        let mut identity = fresh();
-        let mut low = 0;
-        while {
-            identity.set_counter(low);
-            identity.level() >= MIN_LEVEL
-        } {
-            low += 1;
-        }
+        let identity = low_level();
         let message = parse(&export(&identity)).unwrap_err().to_string();
         assert!(message.contains("security level"), "{message}");
     }

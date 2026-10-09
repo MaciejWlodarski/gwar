@@ -7,15 +7,9 @@ import { create } from "zustand";
 import { ConnectApiError, connectApi, type DeviceInfo } from "../connect/api";
 import * as flows from "../connect/account";
 import { deviceName } from "../connect/device-name";
-import {
-  refreshFromVault,
-  replaceIdentity,
-  syncAfterUnlock,
-  tsBridge,
-  vaultIdentity,
-  type TsExported,
-} from "../connect/teamspeak";
-import { loadVault, VaultLockedError } from "../connect/vault";
+import { changeIdentities, refreshFromVault, syncAfterUnlock, tsBridge } from "../connect/teamspeak";
+import { addEntry, cleanName, DEFAULT_NAME, type TsEntry, type TsList } from "../connect/ts-list";
+import { loadVault, VaultLockedError, vaultList } from "../connect/vault";
 import {
   identityFromConnect,
   indexedDbConnectStore,
@@ -160,21 +154,49 @@ export const accountActions = {
   },
 
   /** What the vault says about TeamSpeak: `locked` until this device has the vault key. */
-  async teamspeakInVault(): Promise<{ locked: true } | { locked: false; identity: { identity: string; uid: string } | null }> {
+  async teamspeakInVault(): Promise<{ locked: true } | { locked: false; list: TsList }> {
     try {
-      return { locked: false, identity: vaultIdentity((await loadVault(connectApi, await current())).contents) };
+      return { locked: false, list: vaultList((await loadVault(connectApi, await current())).contents) };
     } catch (e) {
       if (e instanceof VaultLockedError) return { locked: true };
       throw e;
     }
   },
 
-  /** Imported identity: the account's (every device follows) when signed in, otherwise this device's own. */
-  async replaceTeamspeak(next: TsExported): Promise<void> {
+  /**
+   * Changes the TeamSpeak identities: the account's (every device follows) when signed in, otherwise
+   * this device's own. `change` is pure; see `changeIdentities`.
+   */
+  async changeTeamspeak(change: (list: TsList) => TsList): Promise<TsList> {
     const ts = tsBridge();
     if (!ts) throw new Error("TeamSpeak is only available in the desktop app");
-    await replaceIdentity(connectApi, await loadConnectRecord(), ts, next);
-    bumpTs();
+    try {
+      return await changeIdentities(connectApi, await loadConnectRecord(), ts, change);
+    } finally {
+      bumpTs();
+    }
+  },
+
+  /** Adds identities (those already in the list are skipped). Returns how many were new. */
+  async addTeamspeak(entries: TsEntry[]): Promise<number> {
+    let added = 0;
+    await accountActions.changeTeamspeak((list) => {
+      added = 0;
+      return entries.reduce((l, e) => {
+        const r = addEntry(l, e);
+        if (r.added) added++;
+        return r.list;
+      }, list);
+    });
+    return added;
+  },
+
+  /** Makes a new identity and adds it. */
+  async generateTeamspeak(name: string): Promise<void> {
+    const ts = tsBridge();
+    if (!ts) throw new Error("TeamSpeak is only available in the desktop app");
+    const made = await ts.generate();
+    await accountActions.addTeamspeak([{ uid: made.uid, identity: made.identity, name: cleanName(name, DEFAULT_NAME) }]);
   },
 
   async devices(): Promise<DeviceInfo[]> {
@@ -185,8 +207,8 @@ export const accountActions = {
   async signOut(): Promise<void> {
     const record = await loadConnectRecord();
     if (record) await flows.signOut(record, deps());
-    // TeamSpeak goes back to this device's own identity.
-    await tsBridge()?.setAccount(null).catch((e: unknown) => console.warn("could not drop the account's TeamSpeak identity", e));
+    // TeamSpeak goes back to this device's own identities.
+    await tsBridge()?.setList("account", null).catch((e: unknown) => console.warn("could not drop the account's TeamSpeak identities", e));
     bumpTs();
     await controller.switchIdentity(null);
     useAccount.setState({ account: null });

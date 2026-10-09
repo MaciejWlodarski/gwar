@@ -46,7 +46,7 @@ pub fn load_identity(path: &Path) -> Result<TsIdentity> {
     match std::fs::read(path) {
         Ok(data) => serde_json::from_slice(&data).context("invalid TeamSpeak identity file"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let identity = TsIdentity::create();
+            let identity = crate::ts_identity::generate();
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }

@@ -19,6 +19,8 @@ export interface Bookmark {
   nickname: string;
   /** Stored in plain text in localStorage (needed to reconnect). */
   password?: string;
+  /** TeamSpeak only: the uid of the identity to connect with. Missing, or no longer in the list: the default one. */
+  identity?: string;
 }
 
 export interface AudioSettings {
@@ -65,6 +67,8 @@ export interface SettingsState {
   lastNickname: string;
   lastAddress: string;
   lastKind: ServerKind;
+  /** This device was already offered the identities of the official TeamSpeak client (asked only once). */
+  tsDetectAsked: boolean;
 
   setTheme(theme: Theme): void;
   setLanguage(language: Language): void;
@@ -77,6 +81,7 @@ export interface SettingsState {
   saveBookmark(bookmark: Bookmark): void;
   removeBookmark(id: string): void;
   setLast(address: string, nickname: string, kind?: ServerKind): void;
+  setTsDetectAsked(asked: boolean): void;
 }
 
 export function detectLanguage(): Language {
@@ -114,6 +119,7 @@ export const useSettings = create<SettingsState>()(
       lastNickname: "",
       lastAddress: "",
       lastKind: "vc",
+      tsDetectAsked: false,
 
       setTheme: (theme) => set({ theme }),
       setLanguage: (language) => set({ language }),
@@ -136,6 +142,7 @@ export const useSettings = create<SettingsState>()(
         }),
       removeBookmark: (id) => set((s) => ({ bookmarks: s.bookmarks.filter((b) => b.id !== id) })),
       setLast: (lastAddress, lastNickname, lastKind = "vc") => set({ lastAddress, lastNickname, lastKind }),
+      setTsDetectAsked: (tsDetectAsked) => set({ tsDetectAsked }),
     }),
     {
       name: "vc.settings",

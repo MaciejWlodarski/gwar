@@ -6890,6 +6890,7 @@ dependencies = [
  "rand 0.9.5",
  "reqwest",
  "rtrb",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha1",

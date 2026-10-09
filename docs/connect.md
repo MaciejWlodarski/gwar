@@ -48,23 +48,34 @@ There is one blob for the password and one for the recovery code.
 
 Each account has one encrypted **vault**: a JSON object for secrets that have
 to be the same on every device but are not Gwar keys. Today it holds the
-TeamSpeak identity:
+TeamSpeak identities:
 
 ```json
-{"teamspeak": {"identity": "<counter>V<obfuscated key>", "uid": "<TeamSpeak uid>", "updated_at": 1760000000000}}
+{"teamspeak": {"identities": [{"uid": "<TeamSpeak uid>", "name": "Main", "identity": "<counter>V<obfuscated key>", "updated_at": 1760000000000}], "default": "<TeamSpeak uid>"}}
 ```
 
 - `identity` is in the format of the official TeamSpeak client's identity
   export (the `identity="…"` value), so it can be imported from and exported to
   it; `uid` is its TeamSpeak unique id, stored so clients that cannot parse the
-  key (the web app) can show it.
+  key (the web app) can show it. `name` is a label the person chose.
+  `updated_at` is when the entry was added or last changed.
+- There is one entry per `uid`, and `default` is the `uid` used when nothing
+  else is chosen. A reader repairs what it finds: it skips entries without a
+  `uid` or `identity` and repeated `uid`s (the first stays), and a `default`
+  that is not in the list means the first entry.
+- **Older form.** Earlier clients wrote one identity,
+  `{"teamspeak": {"identity": "…", "uid": "…", "updated_at": …}}`. Readers
+  accept it as a list of one entry named "TeamSpeak" (also the name for an
+  entry that has none), but only when `identities` is missing or has no usable
+  entry. Writers write only the list form and drop the three older fields.
 - **Encrypted with the vault key:** `b64url(nonce ‖ AES-256-GCM(vault_key, nonce, UTF-8 JSON, aad))`,
   random 12-byte nonce, `aad = "gwar vault v1\n" + account public key (b64url)`.
   The key comes from the account key, so changing the password or recovering
   the account changes nothing here, and Connect only ever sees ciphertext.
 - Signed-in devices keep the vault key (it cannot sign anything), so they read
   and update the vault without asking for the password.
-- Clients keep fields they do not know when they write the vault back.
+- Clients keep fields they do not know when they write the vault back,
+  including unknown fields of `teamspeak` and of the entries that stay.
   Writes name the version they started from; on `409 conflict` fetch, merge and
   retry.
 
@@ -136,14 +147,32 @@ verify each entry with its account key and refuse revoked devices.
   the account key for the signature or re-encrypt it).
 - **Lost password:** the recovery code decrypts the recovery blob; then set a
   new password.
-- **TeamSpeak identity (desktop):** while signed in, TeamSpeak connections use
-  the account's TeamSpeak identity from the vault; signing out returns to the
-  device's own one. The first desktop to sign in to an account without one
-  stores its own (keeping its TeamSpeak groups); the user can also import one
-  exported from the official TeamSpeak client. Desktops refresh it from the
-  vault when they start.
-  The account's identity is kept next to the device's own
-  (`teamspeak-identity.account.json` beside `teamspeak-identity.json`) and removed on sign-out.
+- **TeamSpeak identities (desktop):** while signed in, TeamSpeak connections
+  use the account's identities from the vault (the default one, or the one
+  chosen for a connection); signing out returns to the device's own list. After
+  a flow that has the vault key: if the vault has identities, the desktop adopts
+  them as its account list; otherwise the first desktop seeds the vault with its
+  whole device list (making one identity named "Default" first if it has none),
+  keeping its TeamSpeak groups. Desktops refresh from the vault when they start,
+  quietly. Every change (add, import, rename, delete, set default, generate) is
+  written to the vault first and then to the desktop; signed out it only changes
+  the device's list. Deleting the default makes the first remaining one the
+  default. The browser shows the list read-only.
+  The desktop keeps the lists as `teamspeak-identities.json` (device) and
+  `teamspeak-identities.account.json` (account, removed on sign-out), each
+  `{"default": "<uid>", "identities": [{"uid", "name", "identity"}]}`. A single
+  identity file of older versions (`teamspeak-identity.json`, and
+  `teamspeak-identity.account.json`) becomes a list of one named "Default" the
+  first time it is read; the old file is left in place.
+- **Finding identities from the official TeamSpeak client (desktop):** only when
+  the user asks (a button, or accepting the prompt before the first TeamSpeak
+  connection on a device, asked once), the desktop reads the client's
+  `settings.db` on this computer, read-only (or, if that fails, from a copy
+  made in a private temporary directory and deleted right after). It
+  understands TeamSpeak 3.6+ (table `ProtobufItems`; the last used identity is
+  in `Connecting`) and the older INI-like format; TeamSpeak 6 is tried with the
+  same parsers. The user chooses which identities to add. Those below security
+  level 8 are listed but cannot be chosen.
 
 ## Test vectors
 

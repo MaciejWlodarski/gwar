@@ -65,6 +65,8 @@ export interface ConnectParams {
   password?: string;
   /** Invite code from a link: admits without the server password. */
   invite?: string;
+  /** TeamSpeak only: the uid of the identity to connect with (default: the default one). */
+  identity?: string;
 }
 
 export type UploadErrorKind = "disabled" | "too_large" | "empty" | "forbidden" | "network" | "aborted" | "unsupported";
@@ -272,6 +274,9 @@ class Controller {
       if (!isDesktop()) throw new ConnectFailure("address", tNow("err.ts.desktopOnly"));
       const parsed = parseTeamSpeakAddress(params.address);
       if (!parsed.ok) throw new ConnectFailure("address", tNow(`err.addr.${parsed.error}` as Key));
+      // Offers the official client's identities the first time; never fails or blocks the connection.
+      // Imported on demand because it reaches back into the account state, which imports this module.
+      await (await import("./ts-setup")).prepareTeamspeak();
       session.dispatch({ type: "reset" });
       session.dispatch({ type: "phase", phase: "connecting" });
       session.setClose(null);
@@ -280,6 +285,7 @@ class Controller {
         address: parsed.value.address,
         nickname: params.nickname.trim(),
         serverPassword: params.password || undefined,
+        identity: params.identity,
       });
     } else {
       const parsed = parseServerAddress(params.address, pageContextFromLocation());
@@ -354,10 +360,12 @@ class Controller {
         b.nickname === params.nickname &&
         (b.kind ?? "vc") === kind,
     );
+    // A TeamSpeak server remembers which identity was used to get in.
+    const identity = kind === "teamspeak" && params.identity ? { identity: params.identity } : {};
     if (existing) {
-      settings.saveBookmark({ ...existing, kind, name, password: params.password || existing.password });
+      settings.saveBookmark({ ...existing, kind, name, password: params.password || existing.password, ...identity });
     } else if (opts.remember) {
-      settings.saveBookmark({ id: newId(), kind, name, address: params.address.trim(), nickname: params.nickname.trim(), password: params.password || undefined });
+      settings.saveBookmark({ id: newId(), kind, name, address: params.address.trim(), nickname: params.nickname.trim(), password: params.password || undefined, ...identity });
     }
     return true;
   }

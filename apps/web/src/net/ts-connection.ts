@@ -27,6 +27,8 @@ export interface TsConnectionOptions {
   address: string;
   nickname: string;
   serverPassword?: string;
+  /** The uid of the TeamSpeak identity to use; the desktop falls back to its default one. */
+  identity?: string;
   requestTimeoutMs?: number;
   /** Test seams. */
   bridge?: () => Promise<TauriBridge>;
@@ -204,6 +206,7 @@ export class TsConnection implements Link {
         address: this.options.address,
         nickname: this.options.nickname,
         password: this.options.serverPassword ?? null,
+        identity: this.options.identity ?? null,
       });
     } catch (e) {
       this.held = null;

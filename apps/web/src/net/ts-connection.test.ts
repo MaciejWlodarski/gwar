@@ -60,7 +60,7 @@ function fakeBridge() {
 describe("TsConnection", () => {
   it("delivers the welcome before events that raced it, and maps request errors", async () => {
     const { bridge, calls } = fakeBridge();
-    const conn = new TsConnection({ address: "h:9987", nickname: "n", bridge: async () => bridge });
+    const conn = new TsConnection({ address: "h:9987", nickname: "n", identity: "uid-1", bridge: async () => bridge });
     const seen: string[] = [];
     conn.onWelcome(() => seen.push("welcome"));
     conn.onEvent((e) => seen.push(e.ev));
@@ -68,7 +68,7 @@ describe("TsConnection", () => {
     expect(seen).toEqual(["welcome", "voice.talking"]);
     expect(conn.isOnline).toBe(true);
     await expect(conn.request("ping", {})).rejects.toBeInstanceOf(RequestError);
-    expect(calls.find((c) => c.command === "ts_connect")?.args).toMatchObject({ address: "h:9987", nickname: "n", password: null });
+    expect(calls.find((c) => c.command === "ts_connect")?.args).toMatchObject({ address: "h:9987", nickname: "n", password: null, identity: "uid-1" });
     conn.close();
     expect(calls.at(-1)?.command).toBe("ts_disconnect");
   });

@@ -3,7 +3,8 @@
 //! `vc_client::teamspeak` presents a TS server as `vc/1`: a `Welcome`, a stream
 //! of events and request handling. This module forwards them to the web UI:
 //!
-//! - `ts_connect {session, address, nickname, password?}` -> `Welcome` JSON
+//! - `ts_connect {session, address, nickname, password?, identity?}` -> `Welcome` JSON; `identity`
+//!   is the uid of the TeamSpeak identity to use (see `ts_identity`), default the list's default
 //! - `ts_request {session, op, d}` -> reply value, or rejects with an `ErrorBody`
 //! - `ts_disconnect {session}`
 //! - event `ts://event {session, frame}` where `frame` is the JSON text of a
@@ -100,12 +101,15 @@ pub async fn ts_connect(
     address: String,
     nickname: String,
     password: Option<String>,
+    identity: Option<String>,
 ) -> Result<Value, String> {
     ts.close();
-    // The account's TeamSpeak identity if signed in to Gwar Connect, else this device's own.
+    // From the account's identities if signed in to Gwar Connect, else this device's own.
     let identity = {
         let app = app.clone();
-        tokio::task::spawn_blocking(move || ts_identity::load_active(&app)).await.map_err(|e| e.to_string())??
+        tokio::task::spawn_blocking(move || ts_identity::load_for_connect(&app, identity.as_deref()))
+            .await
+            .map_err(|e| e.to_string())??
     };
     tracing::info!("ts_connect session={session} address={address}");
     let connected = teamspeak::connect(TsOptions {

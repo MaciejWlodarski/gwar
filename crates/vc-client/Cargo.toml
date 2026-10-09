@@ -25,6 +25,7 @@ rtrb = "0.4"
 str0m = { version = "0.24", default-features = false, features = ["aws-lc-rs"] }
 
 sha1 = "0.10"
+rusqlite = { version = "0.37", features = ["bundled"] }
 tsclientlib = { git = "https://github.com/ReSpeak/tsclientlib", rev = "ee3bc6f45a7137db7793ba5593a321df400d53e5", default-features = false, features = ["audio"] }
 tsproto-packets = { git = "https://github.com/ReSpeak/tsclientlib", rev = "ee3bc6f45a7137db7793ba5593a321df400d53e5" }
 

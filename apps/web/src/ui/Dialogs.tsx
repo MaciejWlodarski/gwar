@@ -13,6 +13,10 @@ import { SettingsDialog } from "./Settings";
 import { BanDialog } from "./BanDialog";
 import { Lightbox } from "./Attachments";
 import { InvitesDialog, ServerSettingsDialog } from "./ServerSettings";
+import { FirstRunDialog } from "./TeamspeakFound";
+import { IdentityPicker } from "./IdentityPicker";
+import { useTsIdentities } from "./hooks";
+import { resolveIdentity } from "../connect/ts-list";
 
 export function Dialogs() {
   const dialog = useUi((s) => s.dialog);
@@ -41,6 +45,8 @@ export function Dialogs() {
       return <CreateTokenDialog />;
     case "confirm":
       return <ConfirmDialog {...dialog} />;
+    case "tsFirstRun":
+      return <FirstRunDialog found={dialog.found} resolve={dialog.resolve} />;
   }
 }
 
@@ -94,6 +100,9 @@ function AddServerDialog({ editId }: { editId?: string }) {
   const [address, setAddress] = useState(existing?.address ?? "");
   const [nickname, setNickname] = useState(existing?.nickname ?? lastNickname);
   const [password, setPassword] = useState(existing?.password ?? "");
+  const tsList = useTsIdentities();
+  const [identity, setIdentity] = useState<string | null>(existing?.identity ?? null);
+  const pickIdentity = kind === "teamspeak" && !!tsList && tsList.identities.length >= 2;
 
   const save = (connect: boolean) => (e?: FormEvent) => {
     e?.preventDefault();
@@ -105,10 +114,17 @@ function AddServerDialog({ editId }: { editId?: string }) {
       address: address.trim(),
       nickname: nickname.trim(),
       password: password || undefined,
+      // Without a choice to make, a remembered identity stays as it was.
+      identity: kind === "teamspeak" ? (pickIdentity ? (resolveIdentity(tsList, identity) ?? undefined) : existing?.identity) : undefined,
     };
     useSettings.getState().saveBookmark(bookmark);
     close();
-    if (connect) void controller.connectInteractive({ kind, address: bookmark.address, nickname: bookmark.nickname, password: bookmark.password }, { remember: false });
+    if (connect) {
+      void controller.connectInteractive(
+        { kind, address: bookmark.address, nickname: bookmark.nickname, password: bookmark.password, identity: bookmark.identity },
+        { remember: false },
+      );
+    }
   };
 
   return (
@@ -154,6 +170,7 @@ function AddServerDialog({ editId }: { editId?: string }) {
         <Field label={t("addServer.password")} hint={kind === "teamspeak" ? t("addServer.tsPasswordHint") : t("addServer.passwordHint")}>
           {(id) => <Input id={id} type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="off" />}
         </Field>
+        {pickIdentity && <IdentityPicker list={tsList} value={identity} onChange={setIdentity} />}
         <button type="submit" className="hidden" />
       </form>
     </Dialog>

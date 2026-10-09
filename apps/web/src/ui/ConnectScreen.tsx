@@ -11,6 +11,9 @@ import { useConnectUi, useSession, useUi } from "../state/stores";
 import { Avatar, Button, Field, IconButton, Input, Segmented, Switch } from "./kit";
 import { TeamSpeakBadge } from "./badges";
 import { useIsMobile } from "../lib/media";
+import { resolveIdentity } from "../connect/ts-list";
+import { useTsIdentities } from "./hooks";
+import { IdentityPicker } from "./IdentityPicker";
 
 /**
  * The web app is not a server by default: it is hosted separately and connects
@@ -47,6 +50,10 @@ export function ConnectScreen() {
   const [nickname, setNickname] = useState(lastNickname);
   const [password, setPassword] = useState("");
   const [remember, setRemember] = useState(true);
+  // TeamSpeak: with more than one identity the person chooses; null means the default one.
+  const tsList = useTsIdentities();
+  const [identity, setIdentity] = useState<string | null>(null);
+  const pickIdentity = kind === "teamspeak" && !!tsList && tsList.identities.length >= 2;
 
   // An invite link without a server means "the server on this page's own origin".
   const inviteWithoutServer = !!invite && !invite.server;
@@ -85,7 +92,17 @@ export function ConnectScreen() {
   const submit = (e: FormEvent) => {
     e.preventDefault();
     if (busy) return;
-    void controller.connectInteractive({ kind, address, nickname, password, invite: kind === "vc" ? invite?.code : undefined }, { remember });
+    void controller.connectInteractive(
+      {
+        kind,
+        address,
+        nickname,
+        password,
+        invite: kind === "vc" ? invite?.code : undefined,
+        identity: pickIdentity ? (resolveIdentity(tsList, identity) ?? undefined) : undefined,
+      },
+      { remember },
+    );
   };
 
   const notice = closeNotice(closeReason, t);
@@ -196,6 +213,8 @@ export function ConnectScreen() {
             </Field>
           )}
 
+          {pickIdentity && <IdentityPicker list={tsList} value={identity} onChange={setIdentity} />}
+
           <Switch checked={remember} onCheckedChange={setRemember} label={t("connect.remember")} />
 
           {error && (
@@ -232,7 +251,10 @@ export function ConnectScreen() {
                 <li key={b.id}>
                   <button
                     onClick={() =>
-                      void controller.connectInteractive({ kind: b.kind, address: b.address, nickname: b.nickname, password: b.password }, { remember: false })
+                      void controller.connectInteractive(
+                        { kind: b.kind, address: b.address, nickname: b.nickname, password: b.password, identity: b.identity },
+                        { remember: false },
+                      )
                     }
                     disabled={busy}
                     className="t flex w-full cursor-pointer items-center gap-3 rounded-lg border border-line px-3 py-2 text-left hover:bg-hover disabled:opacity-50"

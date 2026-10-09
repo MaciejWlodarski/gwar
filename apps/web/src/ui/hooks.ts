@@ -1,4 +1,6 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
+import { tsBridge, type TsListInfo } from "../connect/teamspeak";
+import { useAccount } from "../state/account";
 import type { Permission } from "../proto/Permission";
 import { controller } from "../state/controller";
 import { hasGlobalShortcut, isGlobalShortcutEvent } from "../platform/desktop";
@@ -116,3 +118,20 @@ export function keyLabel(code: string): string {
 
 export const isMac = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
 export const modKey = isMac ? "⌘" : "Ctrl";
+
+/** The TeamSpeak identities this desktop would connect with (null in the browser and until loaded). */
+export function useTsIdentities(): TsListInfo | null {
+  const revision = useAccount((s) => s.tsRevision);
+  const [list, setList] = useState<TsListInfo | null>(null);
+  useEffect(() => {
+    let alive = true;
+    tsBridge()
+      ?.list("active")
+      .then((l) => alive && setList(l))
+      .catch((e: unknown) => console.warn("could not list TeamSpeak identities", e));
+    return () => {
+      alive = false;
+    };
+  }, [revision]);
+  return list;
+}
