@@ -30,7 +30,13 @@ use.
   channel history, private and server-wide messages, a member list with online
   and offline users.
 - **Your identity is a key, not an account.** Every client holds an Ed25519
-  key; there is no central sign-up and it works on any Gwar server.
+  key; it works on any Gwar server without signing up anywhere.
+- **Optional Gwar Connect account** to be the same person on the web, the
+  desktop and (later) the phone. Connect never sees your password or your
+  key: it stores your identity encrypted, each device gets its own key
+  certified by your identity, and a lost device is revoked without changing who
+  you are. Servers verify devices themselves and keep working if Connect is
+  down. See [docs/connect.md](docs/connect.md).
 - **Moderation.** Roles with any permissions and colors, bans (timed or
   permanent, by identity or IP), invite links that can grant a role, server
   settings. Nobody can hand out more than they hold.
@@ -74,6 +80,11 @@ connect to `voice.example.com` and redeem it from the server menu ("Use
 token"). Get another one with `vc-server --data-dir data admin-token`.
 
 The desktop app also connects to servers without HTTPS (e.g. on a LAN).
+
+Servers accept Gwar Connect devices out of the box and fetch the list of
+revoked devices from the official Connect service every five minutes
+(`--connect-url` points elsewhere, `--no-connect` turns it off). Back up the
+database while running with `vc-server --data-dir data backup copy.sqlite3`.
 
 ## Develop
 
@@ -136,11 +147,13 @@ build without it with `--no-default-features`.
 | `crates/vc-server` | Server: core (state, permissions, SQLite), WebSocket gateway, WebRTC SFU, TeamSpeak bridge |
 | `crates/vc-proto` | The `vc/1` protocol (Rust types, generated TypeScript types) |
 | `crates/vc-client` | Native client: protocol, voice engine, TeamSpeak mode |
+| `crates/gwar-connect` | Gwar Connect, the optional account service |
 | `apps/web` | The shared UI (React): the hosted web app and the desktop app's UI |
 | `apps/desktop` | Tauri 2 desktop app: native voice, global push-to-talk, tray |
-| `scripts/deploy-vm.sh` | Deploys a server to a Linux host over SSH |
+| `scripts/deploy-vm.sh` | Deploys the server and Connect to a Linux host over SSH |
 
-More in [docs/architecture.md](docs/architecture.md).
+More in [docs/architecture.md](docs/architecture.md), [docs/connect.md](docs/connect.md)
+and [docs/deploy.md](docs/deploy.md).
 
 ## Tests
 
@@ -158,6 +171,8 @@ VC_TS3_DIR=/tmp/ts3 cargo test -p vc-client --test teamspeak_mode --test teamspe
 - **Streaming**: screen sharing and video, peer to peer and through the server.
 - **Better audio on desktop**: noise suppression and echo cancellation.
 - **Fully native clients** later, keeping the same protocol.
+- **Direct messages between Connect accounts**, end-to-end encrypted per
+  device and relayed when the other side is offline.
 - **More TeamSpeak options**: bring your own TeamSpeak license for more slots,
   and a mixed stand-in so Gwar users can still talk when the free slots run out.
 
