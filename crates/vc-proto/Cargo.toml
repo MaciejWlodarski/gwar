@@ -1,0 +1,16 @@
+[package]
+name = "vc-proto"
+version = "0.1.0"
+description = "Wire protocol (vc/1) shared by the server and all clients"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+ts-rs = { version = "12", optional = true }
+
+[features]
+# Generates TypeScript bindings into apps/web/src/proto (run `cargo test -p vc-proto --features ts`).
+ts = ["dep:ts-rs"]

@@ -1,0 +1,71 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: System libraries (Opus, ALSA)
+        run: sudo apt-get update && sudo apt-get install -y libopus-dev libasound2-dev pkg-config
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --exclude vc-desktop --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --exclude vc-desktop
+      - name: Server without TeamSpeak support
+        run: cargo build -p vc-server --no-default-features
+      # Runs the official TeamSpeak server (downloaded and checksum-verified),
+      # one at a time: its free license allows a single instance per host.
+      - name: TeamSpeak bridge end-to-end
+        env:
+          VC_TS3_DIR: ${{ runner.temp }}/ts3
+        run: cargo test -p vc-client --test teamspeak_mode --test teamspeak_interop -- --test-threads=1
+
+  web:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter web lint
+      - run: pnpm --filter web test
+      - run: pnpm --filter web build
+
+  desktop:
+    strategy:
+      matrix:
+        os: [macos-14, windows-2022, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Linux libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libopus-dev libasound2-dev patchelf
+      - name: macOS libraries
+        if: runner.os == 'macOS'
+        run: brew install opus
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter web build
+      - name: Build desktop
+        run: cargo build -p vc-desktop

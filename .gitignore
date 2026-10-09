@@ -1,0 +1,29 @@
+# Build output
+**/target/
+node_modules/
+apps/web/dist/
+apps/desktop/src-tauri/gen/
+
+# Server data (database, TeamSpeak install) and local settings
+/data/
+scripts/deploy.env
+.env
+.env.*
+!.env.example
+
+# Secrets and captured media must stay local
+*.pem
+*.key
+*.p12
+*.pfx
+*.sqlite*
+*.db
+*.log
+*.wav
+*.ogg
+*.opus
+secrets/
+
+# Test output and OS clutter
+apps/web/e2e/screenshots/fail-*.png
+.DS_Store
