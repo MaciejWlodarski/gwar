@@ -154,7 +154,23 @@ wire! {
         /// Invite code: admits without the server password and may grant a group.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub invite: Option<String>,
+        /// A Gwar Connect device certificate: `public_key` is then a device key
+        /// and the identity (uid) comes from the certificate's account key.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub device: Option<DeviceCertificate>,
         pub client: ClientSoftware,
+    }
+
+    /// Signed by the account key over
+    /// `gwar device v1\n{account_key}\n{device_key}\n{issued_at}\n{expires_at}` (docs/connect.md).
+    pub struct DeviceCertificate {
+        pub account_key: String,
+        pub device_key: String,
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        pub issued_at: i64,
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        pub expires_at: i64,
+        pub signature: String,
     }
 
     pub struct ClientSoftware {

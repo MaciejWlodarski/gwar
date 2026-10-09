@@ -95,6 +95,7 @@ pub async fn connect(options: ConnectOptions) -> Result<Connected, ClientError> 
             public_key,
             server_password: options.server_password,
             invite: None,
+            device: None,
             client: options.software,
         }),
     };
