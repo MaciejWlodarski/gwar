@@ -49,6 +49,7 @@ pub fn base_config() -> Config {
         web_origins: Vec::new(),
         tls: None,
         redirect_http: None,
+        connect_url: None,
     }
 }
 

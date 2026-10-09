@@ -85,6 +85,7 @@ async fn tone_travels_between_native_clients() {
         web_origins: Vec::new(),
         tls: None,
         redirect_http: None,
+        connect_url: None,
     })
     .await
     .unwrap();

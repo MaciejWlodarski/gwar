@@ -30,6 +30,7 @@ async fn connects_chats_and_reports_errors() {
         web_origins: Vec::new(),
         tls: None,
         redirect_http: None,
+        connect_url: None,
     })
     .await
     .unwrap();

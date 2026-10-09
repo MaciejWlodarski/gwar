@@ -129,6 +129,13 @@ const MIGRATIONS: &[&str] = &[
         created_at INTEGER NOT NULL
     );
 "#,
+    r#"
+    CREATE TABLE revoked_devices (
+        device_key TEXT PRIMARY KEY,
+        account_key TEXT NOT NULL,
+        revoked_at INTEGER NOT NULL
+    );
+"#,
 ];
 
 const HISTORY_KEEP: i64 = 1000;
@@ -637,6 +644,24 @@ impl Store {
         let ban = self.bans(now)?.into_iter().find(|b| b.id == id);
         self.db.execute("DELETE FROM bans WHERE id=?1", [id])?;
         Ok(ban)
+    }
+
+    // -------------------------------------------------- Gwar Connect devices
+
+    pub fn revoke_device(&self, device_key: &str, account_key: &str, revoked_at: i64) -> Result<()> {
+        self.db.execute(
+            "INSERT OR IGNORE INTO revoked_devices(device_key,account_key,revoked_at) VALUES(?1,?2,?3)",
+            params![device_key, account_key, revoked_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn device_revoked(&self, device_key: &str) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM revoked_devices WHERE device_key=?1)",
+            [device_key],
+            |r| r.get(0),
+        )?)
     }
 
     // -------------------------------------------------------------- invites

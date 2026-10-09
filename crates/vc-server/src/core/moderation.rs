@@ -406,4 +406,27 @@ impl Core {
             }
         }
     }
+
+    /// Stores revocations from Gwar Connect and signs those devices out.
+    pub(super) fn revoked(&mut self, devices: Vec<super::RevokedDevice>, seq: i64) {
+        for d in &devices {
+            if let Err(e) = self.store.revoke_device(&d.device_key, &d.account_key, d.revoked_at) {
+                tracing::warn!("store: {e:#}");
+            }
+        }
+        if let Err(e) = self.store.set_meta("connect_seq", &seq.to_string()) {
+            tracing::warn!("store: {e:#}");
+        }
+        let gone: Vec<_> = self
+            .sessions
+            .values()
+            .filter(|s| s.device.as_ref().is_some_and(|d| devices.iter().any(|r| &r.device_key == d)))
+            .map(|s| s.id)
+            .collect();
+        let reason =
+            LeaveReason::Kicked { by: "Gwar Connect".into(), reason: Some("this device was signed out".into()) };
+        for session in gone {
+            self.remove(session, reason.clone());
+        }
+    }
 }

@@ -6952,6 +6952,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "futures",
+ "gwar-connect",
  "imagesize",
  "libc",
  "rand 0.9.5",

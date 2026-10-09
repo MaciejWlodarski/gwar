@@ -8,7 +8,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use vc_proto::{Uid, challenge_message};
+use vc_proto::{DeviceCertificate, Uid, challenge_message};
 
 pub fn new_nonce() -> String {
     let mut bytes = [0u8; 32];
@@ -28,6 +28,46 @@ pub fn verify_hello(nonce: &str, public_key: &str, signature: &str) -> Option<Ui
     let verifying = VerifyingKey::from_bytes(&key).ok()?;
     verifying.verify(&challenge_message(nonce, public_key), &Signature::from_bytes(&signature)).ok()?;
     Some(uid_for_key(&key))
+}
+
+/// Device certificates last at most this long (docs/connect.md).
+const MAX_CERT_MS: i64 = 400 * 24 * 3600 * 1000;
+const SKEW_MS: i64 = 5 * 60 * 1000;
+
+pub fn device_statement(c: &DeviceCertificate) -> String {
+    format!("gwar device v1\n{}\n{}\n{}\n{}", c.account_key, c.device_key, c.issued_at, c.expires_at)
+}
+
+pub fn revoke_statement(account_key: &str, device_key: &str, revoked_at: i64) -> String {
+    format!("gwar revoke v1\n{account_key}\n{device_key}\n{revoked_at}")
+}
+
+/// Whether `signature` is `public`'s Ed25519 signature of `message`.
+pub fn signed_by(public: &str, message: &str, signature: &str) -> bool {
+    let Some(key) = URL_SAFE_NO_PAD.decode(public).ok().and_then(|k| <[u8; 32]>::try_from(k).ok()) else {
+        return false;
+    };
+    let Some(signature) = URL_SAFE_NO_PAD.decode(signature).ok().and_then(|s| <[u8; 64]>::try_from(s).ok()) else {
+        return false;
+    };
+    VerifyingKey::from_bytes(&key)
+        .is_ok_and(|k| k.verify_strict(message.as_bytes(), &Signature::from_bytes(&signature)).is_ok())
+}
+
+/// Checks a Gwar Connect device certificate for the device key that signed
+/// `hello`; the identity is then the account's: returns its uid.
+pub fn verify_device(c: &DeviceCertificate, public_key: &str, now: i64) -> Result<Uid, &'static str> {
+    if c.device_key != public_key {
+        return Err("the certificate is for another device");
+    }
+    if c.issued_at > now + SKEW_MS || c.expires_at <= now || c.expires_at - c.issued_at > MAX_CERT_MS {
+        return Err("the device certificate has expired; sign in again");
+    }
+    if !signed_by(&c.account_key, &device_statement(c), &c.signature) {
+        return Err("the device certificate is not signed by the account");
+    }
+    let key: [u8; 32] = URL_SAFE_NO_PAD.decode(&c.account_key).ok().and_then(|k| k.try_into().ok()).ok_or("bad key")?;
+    Ok(uid_for_key(&key))
 }
 
 #[cfg(test)]

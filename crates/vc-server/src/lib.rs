@@ -7,6 +7,7 @@
 //!  official TeamSpeak server ◀─query + puppets─▶ teamspeak bridge (optional)
 //! ```
 
+pub mod connect;
 pub mod core;
 pub mod files;
 pub mod gateway;
@@ -70,7 +71,12 @@ pub struct Config {
     pub tls: Option<tls::Tls>,
     /// Also answer plain HTTP here with a redirect to HTTPS.
     pub redirect_http: Option<SocketAddr>,
+    /// Gwar Connect, whose revoked devices this server refuses (see [`connect`]).
+    pub connect_url: Option<String>,
 }
+
+/// The project's Gwar Connect service.
+pub const OFFICIAL_CONNECT_URL: &str = "https://voice.maciejwlodarski.com/connect";
 
 /// Where the project hosts the web app that connects to every Gwar server.
 /// (Moves to the Gwar domain later.)
@@ -109,6 +115,7 @@ pub async fn start(config: Config) -> Result<Running> {
         None => Store::in_memory()?,
     };
     let admin_token = core::ensure_first_admin_token(&store)?;
+    let connect_seq: i64 = store.meta("connect_seq")?.and_then(|s| s.parse().ok()).unwrap_or(0);
     // A password set in the server settings (even "none") wins over the command line.
     let hash = match store.meta("password_hash")? {
         Some(stored) => Some(stored).filter(|h| !h.is_empty()),
@@ -196,6 +203,9 @@ pub async fn start(config: Config) -> Result<Running> {
     if let Some(root) = config.web_root {
         let index = root.join("index.html");
         app = app.fallback_service(ServeDir::new(root).fallback(ServeFile::new(index)));
+    }
+    if let Some(url) = config.connect_url {
+        tasks.push(tokio::spawn(connect::follow(url, core.clone(), connect_seq)));
     }
     let listener = TcpListener::bind(config.http_bind).await.context("bind HTTP listener")?;
     let http = listener.local_addr()?;

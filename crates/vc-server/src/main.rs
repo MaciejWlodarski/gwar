@@ -42,6 +42,12 @@ struct Cli {
     /// With HTTPS, don't redirect plain HTTP on port 80.
     #[arg(long, env = "VC_NO_HTTP_REDIRECT", value_parser = clap::builder::BoolishValueParser::new())]
     no_http_redirect: bool,
+    /// Gwar Connect service whose revoked devices are refused.
+    #[arg(long, env = "VC_CONNECT_URL", default_value = vc_server::OFFICIAL_CONNECT_URL)]
+    connect_url: String,
+    /// Don't follow Gwar Connect (devices revoked there keep working here).
+    #[arg(long, env = "VC_NO_CONNECT", value_parser = clap::builder::BoolishValueParser::new())]
+    no_connect: bool,
     /// Extra web app origins allowed to upload files (the official one always is).
     #[arg(long = "web-origin", env = "VC_WEB_ORIGINS", value_delimiter = ',')]
     web_origins: Vec<String>,
@@ -176,6 +182,7 @@ async fn main() -> Result<()> {
         web_origins,
         tls,
         redirect_http,
+        connect_url: (!cli.no_connect).then(|| cli.connect_url.clone()),
     })
     .await?;
     tracing::info!(http = %running.http, media = %running.media, teamspeak = ?running.teamspeak, "server ready");

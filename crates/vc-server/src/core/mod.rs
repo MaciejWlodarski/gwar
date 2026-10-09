@@ -68,9 +68,23 @@ pub struct ConnectRequest {
     pub platform: Platform,
     pub out: OutboundTx,
     pub ip: Option<IpAddr>,
+    /// The Gwar Connect device key, when signing in through an account.
+    pub device: Option<String>,
     pub invite: Option<String>,
     /// Whether the gateway already verified the server password (or none is set).
     pub password_ok: bool,
+}
+
+pub struct RevokedDevice {
+    pub device_key: String,
+    pub account_key: String,
+    pub revoked_at: i64,
+}
+
+impl CoreHandle {
+    pub async fn revoked(&self, devices: Vec<RevokedDevice>, seq: i64) {
+        let _ = self.tx.send(CoreMsg::Revoked(devices, seq)).await;
+    }
 }
 
 /// Argon2 hash of the server password, shared with the gateway; changed from settings.
@@ -100,6 +114,8 @@ pub enum CoreMsg {
     Info(oneshot::Sender<ServerInfo>),
     Bridge(BridgeMsg),
     Files(files::FileMsg),
+    /// Devices revoked on Gwar Connect, and the feed position after them.
+    Revoked(Vec<RevokedDevice>, i64),
     /// Periodic housekeeping (expired uploads).
     Tick,
     Resume(Resume),
@@ -174,6 +190,7 @@ struct Session {
     groups: Vec<GroupId>,
     platform: Platform,
     ip: Option<IpAddr>,
+    device: Option<String>,
     muted: bool,
     deafened: bool,
     away: Option<String>,
@@ -386,6 +403,7 @@ impl Core {
             }
             CoreMsg::Files(msg) => self.file_msg(msg),
             CoreMsg::Tick => self.tick(),
+            CoreMsg::Revoked(devices, seq) => self.revoked(devices, seq),
             CoreMsg::Resume(resume) => resume(self),
         }
         while let Some(session) = self.stalled.pop_first() {
@@ -491,6 +509,9 @@ impl Core {
             Ok(n) => n,
             Err(e) => return fail(e.code, &e.message),
         };
+        if r.device.as_deref().is_some_and(|d| self.store.device_revoked(d).unwrap_or(false)) {
+            return fail(ErrorCode::NotAuthenticated, "this device was signed out of its Gwar account");
+        }
         if let Some(ban) = self.ban_for(Some(&r.uid), r.ip) {
             let mut body = err(ErrorCode::Banned, &ban_message(&ban));
             body.ban = Some(BanNotice { by: ban.by, reason: ban.reason, until: ban.expires_at });
@@ -552,6 +573,7 @@ impl Core {
             groups,
             platform: r.platform,
             ip: r.ip,
+            device: r.device,
             muted: false,
             deafened: false,
             away: None,
@@ -647,6 +669,7 @@ impl Core {
                     groups: Vec::new(),
                     platform: client.platform,
                     ip: None,
+                    device: None,
                     muted: client.muted,
                     deafened: client.deafened,
                     away: client.away,

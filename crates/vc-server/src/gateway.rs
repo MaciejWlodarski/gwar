@@ -112,10 +112,26 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
         let _ = sink.send(error(id, ErrorCode::BadRequest, "unsupported protocol version")).await;
         return;
     }
-    let Some(uid) = identity::verify_hello(&nonce, &hello.public_key, &hello.signature) else {
+    let Some(mut uid) = identity::verify_hello(&nonce, &hello.public_key, &hello.signature) else {
         let _ = sink.send(error(id, ErrorCode::NotAuthenticated, "invalid identity signature")).await;
         return;
     };
+    // A Gwar Connect device speaks for its account: the identity is the account key.
+    let mut identity_key = hello.public_key.clone();
+    let mut device = None;
+    if let Some(certificate) = &hello.device {
+        match identity::verify_device(certificate, &hello.public_key, crate::core::now_ms()) {
+            Ok(account_uid) => {
+                uid = account_uid;
+                identity_key = certificate.account_key.clone();
+                device = Some(certificate.device_key.clone());
+            }
+            Err(problem) => {
+                let _ = sink.send(error(id, ErrorCode::NotAuthenticated, problem)).await;
+                return;
+            }
+        }
+    }
     // Whether the password matched; the core decides what that means (members
     // come back without it, an invite admits newcomers).
     let current = gateway.password.load_full();
@@ -134,7 +150,8 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
     let request = ConnectRequest {
         request_id: id,
         uid,
-        public_key: hello.public_key,
+        public_key: identity_key,
+        device,
         nickname: hello.nickname,
         platform: hello.client.platform,
         out: out.clone(),

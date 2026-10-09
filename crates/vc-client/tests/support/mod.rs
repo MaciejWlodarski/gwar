@@ -77,6 +77,7 @@ pub async fn start() -> Option<Bridged> {
         web_origins: Vec::new(),
         tls: None,
         redirect_http: None,
+        connect_url: None,
     })
     .await
     .unwrap();

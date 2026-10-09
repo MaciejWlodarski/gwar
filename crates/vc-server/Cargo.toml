@@ -9,7 +9,7 @@ publish.workspace = true
 [features]
 default = ["teamspeak"]
 # Bridge to the official TeamSpeak server (see src/teamspeak/).
-teamspeak = ["dep:tsclientlib", "dep:tsproto-packets", "dep:reqwest", "dep:bzip2", "dep:tar", "dep:zip", "dep:libc"]
+teamspeak = ["dep:tsclientlib", "dep:tsproto-packets", "dep:bzip2", "dep:tar", "dep:zip", "dep:libc"]
 
 [[bin]]
 name = "vc-server"
@@ -28,7 +28,7 @@ ed25519-dalek = "2"
 imagesize = "0.13"
 futures = "0.3"
 rand = "0.9"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -53,6 +53,7 @@ zip = { version = "9", default-features = false, features = ["deflate"], optiona
 libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
+gwar-connect = { path = "../gwar-connect" }
 reqwest = { version = "0.13", default-features = false }
 rcgen = "0.13"
 tempfile = "3"
