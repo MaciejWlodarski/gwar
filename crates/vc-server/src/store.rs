@@ -675,6 +675,19 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Whether an invite is valid now, without using it; returns the group it grants.
+    pub fn peek_invite(&self, code: &str, now: i64) -> Result<Option<Option<GroupId>>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT group_id FROM invites
+                 WHERE code=?1 AND (expires_at IS NULL OR expires_at > ?2) AND (max_uses IS NULL OR uses < max_uses)",
+                params![code, now],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     /// Uses an invite if it is still valid; returns the group it grants (`Some(None)` for none).
     pub fn use_invite(&self, code: &str, now: i64) -> Result<Option<Option<GroupId>>> {
         Ok(self

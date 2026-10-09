@@ -14,6 +14,7 @@ mod moderation;
 mod passwords;
 
 use moderation::ban_message;
+use vc_proto::BanNotice;
 
 pub use passwords::{hash_secret, ts_wire_form, verify_secret};
 
@@ -491,10 +492,21 @@ impl Core {
             Err(e) => return fail(e.code, &e.message),
         };
         if let Some(ban) = self.ban_for(Some(&r.uid), r.ip) {
-            return fail(ErrorCode::Banned, &ban_message(&ban));
+            let mut body = err(ErrorCode::Banned, &ban_message(&ban));
+            body.ban = Some(BanNotice { by: ban.by, reason: ban.reason, until: ban.expires_at });
+            let _ = r.out.try_send(Outbound::Frame(encode(&ServerFrame::Err { re: r.request_id, err: body })));
+            return None;
         }
+        // Members come back without the server password; newcomers need it or an invite.
+        let known = match self.store.user_by_uid(&r.uid) {
+            Ok(known) => known.map(|(_, member)| member),
+            Err(e) => {
+                warn!("store: {e:#}");
+                return fail(ErrorCode::Internal, "storage error");
+            }
+        };
         let invited = match r.invite.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
-            Some(code) => match self.store.use_invite(code, now_ms()) {
+            Some(code) => match self.admit_by_invite(code, known.as_ref()) {
                 Ok(found) => found,
                 Err(e) => {
                     warn!("store: {e:#}");
@@ -503,7 +515,7 @@ impl Core {
             },
             None => None,
         };
-        if !r.password_ok && invited.is_none() {
+        if !r.password_ok && invited.is_none() && known.is_none() {
             return fail(ErrorCode::WrongPassword, "wrong server password or invalid invite");
         }
         let user = match self.store.touch_user(&r.uid, &r.public_key, &nickname, now_ms()) {

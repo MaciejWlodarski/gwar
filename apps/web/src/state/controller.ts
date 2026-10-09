@@ -1,3 +1,4 @@
+import type { BanNotice } from "../proto/BanNotice";
 /**
  * Glue between the network client, the voice engine and the stores. UI
  * components call methods on `controller` and read state from the stores;
@@ -50,6 +51,7 @@ export class ConnectFailure extends Error {
     readonly kind: ConnectError["kind"] | "address" | "identity",
     message: string,
     readonly serverName?: string,
+    readonly ban?: BanNotice,
   ) {
     super(message);
   }
@@ -98,7 +100,10 @@ export function describeRequestError(e: unknown): string {
 
 export function describeConnectFailure(f: ConnectFailure): string {
   if (f.kind === "address") return f.message;
-  if (f.kind === "banned") return describeBan(parseBanMessage(f.message));
+  if (f.kind === "banned") {
+    // Older servers only describe the ban in the message.
+    return f.ban ? describeBan({ until: f.ban.until ?? null, reason: f.ban.reason ?? null }, f.ban.by) : describeBan(parseBanMessage(f.message));
+  }
   return tNow(`err.connect.${f.kind}` as Key, { server: f.serverName ?? "" });
 }
 
@@ -308,7 +313,7 @@ class Controller {
       this.conn = null;
       session.dispatch({ type: "reset" });
       const err = e instanceof ConnectError ? e : new ConnectError("unreachable", String(e));
-      throw new ConnectFailure(err.kind, err.message, err.serverName);
+      throw new ConnectFailure(err.kind, err.message, err.serverName, err.ban);
     }
   }
 

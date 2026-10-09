@@ -116,8 +116,8 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
         let _ = sink.send(error(id, ErrorCode::NotAuthenticated, "invalid identity signature")).await;
         return;
     };
-    // With an invite the core decides; otherwise the password must match.
-    let has_invite = hello.invite.as_deref().is_some_and(|c| !c.trim().is_empty());
+    // Whether the password matched; the core decides what that means (members
+    // come back without it, an invite admits newcomers).
     let current = gateway.password.load_full();
     let password_ok = match current.as_ref().clone() {
         None => true,
@@ -129,10 +129,6 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
                     .unwrap_or(false)
         }
     };
-    if !password_ok && !has_invite {
-        let _ = sink.send(error(id, ErrorCode::WrongPassword, "wrong server password")).await;
-        return;
-    }
 
     let (out, mut outbound) = mpsc::channel(OUTBOUND_QUEUE);
     let request = ConnectRequest {

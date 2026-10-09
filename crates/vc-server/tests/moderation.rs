@@ -76,7 +76,9 @@ async fn bans_disconnect_and_keep_out_until_lifted() {
 
     let refused = Client::connect_as(&server, key.clone(), "eve", None).await.err().expect("banned");
     assert_eq!(refused.code, vc_proto::ErrorCode::Banned);
-    assert!(refused.message.contains("spam"));
+    let notice = refused.ban.expect("structured ban details");
+    assert_eq!((notice.by.as_str(), notice.reason.as_deref()), ("root", Some("spam")));
+    assert!(notice.until.is_some());
 
     let list = root.ok("ban.list", json!({})).await;
     assert_eq!(list["bans"].as_array().unwrap().len(), 1);
@@ -130,6 +132,30 @@ async fn invites_admit_without_password_grant_groups_and_run_out() {
     assert_eq!(err.code, vc_proto::ErrorCode::WrongPassword);
     let listed = root.ok("invite.list", json!({})).await;
     assert_eq!(listed["invites"][0]["uses"], 1);
+}
+
+#[tokio::test]
+async fn members_return_without_the_password_and_keep_invites_unspent() {
+    let server = TestServer::start_with(|c| c.server_password = Some("secret".into())).await;
+    let mut root = Client::connect_as(&server, new_key(), "root", Some("secret")).await.unwrap();
+    let invite = root.ok("invite.create", json!({"max_uses": 2})).await;
+    let code = invite["invite"]["code"].as_str().unwrap().to_owned();
+    let hello = |code: String| {
+        move |raw: &RawConn, key: &_| {
+            let mut hello = raw.hello(key, "guest", None);
+            hello["invite"] = json!(code);
+            hello
+        }
+    };
+    let key = new_key();
+    Client::connect_with(&server, key.clone(), hello(code.clone())).await.unwrap().close().await;
+    // Back again, with the link or without it: no password, no extra use.
+    Client::connect_with(&server, key.clone(), hello(code.clone())).await.unwrap().close().await;
+    Client::connect_as(&server, key, "guest", None).await.expect("members come back").close().await;
+    let listed = root.ok("invite.list", json!({})).await;
+    assert_eq!(listed["invites"][0]["uses"], 1);
+    // Strangers still need the password.
+    assert!(Client::connect_as(&server, new_key(), "stranger", None).await.is_err());
 }
 
 #[tokio::test]

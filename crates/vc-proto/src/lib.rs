@@ -321,6 +321,19 @@ wire! {
     pub struct ErrorBody {
         pub code: ErrorCode,
         pub message: String,
+        /// Set with [`ErrorCode::Banned`]: who, why and until when.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub ban: Option<BanNotice>,
+    }
+
+    pub struct BanNotice {
+        pub by: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reason: Option<String>,
+        /// Unix ms; absent for a permanent ban.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(type = "number | null"))]
+        pub until: Option<i64>,
     }
 
     #[derive(Copy, Eq)]
@@ -612,7 +625,7 @@ impl Permission {
 
 impl ErrorBody {
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
-        Self { code, message: message.into() }
+        Self { code, message: message.into(), ban: None }
     }
 }
 

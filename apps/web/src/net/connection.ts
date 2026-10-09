@@ -1,3 +1,4 @@
+import type { BanNotice } from "../proto/BanNotice";
 import type { ErrorCode } from "../proto/ErrorCode";
 import type { LeaveReason } from "../proto/LeaveReason";
 import type { Welcome } from "../proto/Welcome";
@@ -40,6 +41,8 @@ export class ConnectError extends Error {
     readonly kind: ConnectErrorKind,
     message: string,
     readonly serverName?: string,
+    /** Who banned us, why and until when (with `banned`). */
+    readonly ban?: BanNotice,
   ) {
     super(message);
     this.name = "ConnectError";
@@ -50,6 +53,7 @@ export class RequestError extends Error {
   constructor(
     readonly code: ErrorCode,
     message: string,
+    readonly ban?: BanNotice,
   ) {
     super(message);
     this.name = "RequestError";
@@ -119,14 +123,14 @@ export function shouldReconnectAfter(reason: LeaveReason): boolean {
   return reason.kind !== "kicked" && reason.kind !== "banned" && reason.kind !== "replaced";
 }
 
-function mapHelloError(code: ErrorCode, message: string, serverName?: string): ConnectError {
+function mapHelloError(code: ErrorCode, message: string, serverName?: string, ban?: BanNotice): ConnectError {
   switch (code) {
     case "wrong_password":
       return new ConnectError("wrong_password", message, serverName);
     case "unavailable":
       return new ConnectError("server_full", message, serverName);
     case "banned":
-      return new ConnectError("banned", message, serverName);
+      return new ConnectError("banned", message, serverName, ban);
     default:
       return new ConnectError("rejected", message, serverName);
   }
@@ -399,7 +403,7 @@ export class Connection implements Link {
               resolve(welcome);
             })
             .catch((e: unknown) => {
-              if (e instanceof RequestError) fail(mapHelloError(e.code, e.message, serverName));
+              if (e instanceof RequestError) fail(mapHelloError(e.code, e.message, serverName, e.ban));
               else if (e instanceof RequestTimeoutError) fail(new ConnectError("timeout", e.message, serverName));
               else fail(new ConnectError("protocol", e instanceof Error ? e.message : String(e), serverName));
             });
@@ -454,7 +458,7 @@ export class Connection implements Link {
       this.pending.delete(frame.re);
       clearTimeout(p.timer);
       if (frame.kind === "ok") p.resolve(frame.ok as never);
-      else p.reject(new RequestError(frame.err.code, frame.err.message));
+      else p.reject(new RequestError(frame.err.code, frame.err.message, frame.err.ban ?? undefined));
       return;
     }
     const { event } = frame;

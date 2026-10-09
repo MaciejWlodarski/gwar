@@ -176,6 +176,25 @@ impl Core {
         Ok(Response::Groups { groups: wanted })
     }
 
+    /// Checks an invite at connect: `Some(group)` if valid. It is only used
+    /// up when it does something: admits a newcomer or grants a new group.
+    pub(super) fn admit_by_invite(
+        &self,
+        code: &str,
+        known: Option<&vc_proto::Member>,
+    ) -> anyhow::Result<Option<Option<GroupId>>> {
+        let now = now_ms();
+        let Some(group) = self.store.peek_invite(code, now)? else { return Ok(None) };
+        let useful = match known {
+            None => true,
+            Some(member) => group.is_some_and(|g| !member.groups.contains(&g)),
+        };
+        if !useful {
+            return Ok(Some(None));
+        }
+        self.store.use_invite(code, now)
+    }
+
     // ------------------------------------------------------------------ bans
 
     /// The ban in force for this identity or address, if any.
