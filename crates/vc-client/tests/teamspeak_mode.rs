@@ -16,7 +16,10 @@ use vc_client::voice::{
 };
 
 use tokio::time::timeout;
-use vc_client::{ConnectOptions, Identity, connect};
+use vc_client::{
+    ConnectOptions, Identity, connect,
+    teamspeak::{self},
+};
 use vc_proto::{Channel, ChannelId, ChatTarget, ClientSoftware, Event, Platform, Request};
 
 async fn until(events: &mut tokio::sync::mpsc::Receiver<Event>, pred: impl Fn(&Event) -> bool) -> Event {
@@ -153,6 +156,81 @@ async fn puppets_only_join_channels_with_teamspeak_users() {
         |e| matches!(e, Event::ClientJoined(c) if c.nickname == "alice" && c.channel == Some(afk_ts)),
     )
     .await;
+}
+
+/// Our admin bans a TeamSpeak user, and attachments reach TeamSpeak as links.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn teamspeak_users_get_attachment_links_and_can_be_banned() {
+    let Some(bridged) = support::start().await else { return };
+    let token = bridged.server.admin_token.clone().expect("fresh server");
+    let mut alice = connect(ConnectOptions {
+        url: format!("ws://{}/ws", bridged.server.http),
+        nickname: "alice".into(),
+        server_password: None,
+        identity: Identity::generate(),
+        software: ClientSoftware { name: "t".into(), version: "0".into(), platform: Platform::Web },
+    })
+    .await
+    .unwrap();
+    alice.connection.request(Request::TokenRedeem { token }).await.unwrap();
+    let lobby = alice.welcome.server.default_channel;
+    alice.connection.join(lobby, None).await.unwrap();
+
+    let identity = tsclientlib::Identity::create();
+    let mut ts = support::ts_client_as(bridged.ts_voice, "bob", identity.clone()).await;
+    let joined = until(&mut alice.events, |e| matches!(e, Event::ClientJoined(c) if c.nickname == "bob")).await;
+    let Event::ClientJoined(bob) = joined else { unreachable!() };
+    // Alice's puppet is in the lobby once bob is there.
+    if !ts.welcome.clients.iter().any(|c| c.nickname == "alice") {
+        until(&mut ts.events, |e| matches!(e, Event::ClientJoined(c) if c.nickname == "alice")).await;
+    }
+
+    // An attachment arrives on TeamSpeak as a link.
+    let reserved = alice
+        .connection
+        .request(Request::FileUpload { name: "notes.txt".into(), size: 5, mime: "text/plain".into() })
+        .await
+        .unwrap();
+    let url = format!("http://{}{}", bridged.server.http, reserved["upload_url"].as_str().unwrap());
+    let put = reqwest::Client::new().put(url).body("hello").send().await.unwrap();
+    assert_eq!(put.status(), 204);
+    let file = reserved["file"].as_str().unwrap().to_owned();
+    alice
+        .connection
+        .request(Request::ChatSend {
+            target: ChatTarget::Channel(lobby),
+            text: "see this".into(),
+            mentions: Vec::new(),
+            attachments: vec![file.clone()],
+        })
+        .await
+        .unwrap();
+    let link = format!("{}/files/{file}/notes.txt", support::PUBLIC_URL);
+    until(
+        &mut ts.events,
+        |e| matches!(e, Event::ChatMessage(m) if m.text.contains("see this") && m.text.contains(&link)),
+    )
+    .await;
+
+    // A ban takes the TeamSpeak user off the TeamSpeak server, and keeps them off.
+    alice
+        .connection
+        .request(Request::BanCreate(vc_proto::BanCreate {
+            client: Some(bob.id),
+            reason: Some("test".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+    until(&mut ts.events, |e| matches!(e, Event::Disconnected { .. })).await;
+    let again = teamspeak::connect(teamspeak::TsOptions {
+        address: bridged.ts_voice.to_string(),
+        nickname: "bob".into(),
+        server_password: None,
+        identity,
+    })
+    .await;
+    assert!(again.is_err(), "banned TeamSpeak users can't come back");
 }
 
 struct FakeIo {

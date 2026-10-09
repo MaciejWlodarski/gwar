@@ -30,6 +30,7 @@ tsproto-packets = { git = "https://github.com/ReSpeak/tsclientlib", rev = "ee3bc
 
 [dev-dependencies]
 vc-server = { path = "../vc-server" }
+reqwest = { version = "0.13", default-features = false }
 tracing-subscriber.workspace = true
 
 # Microphone permission (TCC) on macOS.

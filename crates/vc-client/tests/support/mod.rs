@@ -17,6 +17,9 @@ fn free_port(udp: bool) -> u16 {
     }
 }
 
+/// The public URL the test server pretends to have (links to uploads use it).
+pub const PUBLIC_URL: &str = "https://gwar.test";
+
 pub struct Bridged {
     pub server: Running,
     pub ts_voice: SocketAddr,
@@ -66,9 +69,9 @@ pub async fn start() -> Option<Bridged> {
             voice: ts_voice,
             query_port: free_port(false),
             filetransfer: format!("127.0.0.1:{}", free_port(false)).parse().unwrap(),
-            public_url: None,
+            public_url: Some(PUBLIC_URL.into()),
         }),
-        public_url: None,
+        public_url: Some(PUBLIC_URL.into()),
         upload_limit: 10 * 1024 * 1024,
         files_dir: None,
     })
@@ -84,13 +87,18 @@ pub async fn start() -> Option<Bridged> {
 
 /// Connects a TeamSpeak client once the TeamSpeak server is up (it starts in the background).
 pub async fn ts_client(address: SocketAddr, nickname: &str) -> TsConnected {
+    ts_client_as(address, nickname, tsclientlib::Identity::create()).await
+}
+
+/// Like [`ts_client`], with a given identity.
+pub async fn ts_client_as(address: SocketAddr, nickname: &str, identity: tsclientlib::Identity) -> TsConnected {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     loop {
         let options = TsOptions {
             address: address.to_string(),
             nickname: nickname.into(),
             server_password: None,
-            identity: tsclientlib::Identity::create(),
+            identity: identity.clone(),
         };
         match teamspeak::connect(options).await {
             Ok(connected) => return connected,
