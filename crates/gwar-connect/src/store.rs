@@ -97,6 +97,30 @@ const SCHEMA: &str = r#"
     );
 "#;
 
+/// Changes after the first schema, applied in order and recorded in `PRAGMA user_version`.
+const MIGRATIONS: &[&str] = &[
+    // 1: sessions know the device they were used to register, so revoking a
+    // device ends them; the encrypted vault.
+    r#"
+    ALTER TABLE sessions ADD COLUMN device_key TEXT;
+    CREATE INDEX sessions_device ON sessions(device_key);
+    CREATE TABLE vaults (
+        account_id INTEGER PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+        blob TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    "#,
+];
+
+/// An account's encrypted vault (see docs/connect.md).
+#[derive(Debug, Clone, Serialize)]
+pub struct Vault {
+    pub vault: Option<String>,
+    pub version: i64,
+    pub updated_at: Option<i64>,
+}
+
 fn account_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
     let kdf: String = r.get(3)?;
     Ok(Account {
@@ -126,6 +150,13 @@ impl Store {
     fn init(db: Connection) -> Result<Self> {
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;")?;
         db.execute_batch(SCHEMA)?;
+        let applied: usize = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        for (i, migration) in MIGRATIONS.iter().enumerate().skip(applied) {
+            let tx = db.unchecked_transaction()?;
+            tx.execute_batch(migration).with_context(|| format!("migration {}", i + 1))?;
+            tx.pragma_update(None, "user_version", i + 1)?;
+            tx.commit()?;
+        }
         Ok(Self { db })
     }
 
@@ -217,6 +248,7 @@ impl Store {
     pub fn revoke(&self, account_key: &str, device_key: &str, revoked_at: i64, signature: &str) -> Result<()> {
         let tx = self.db.unchecked_transaction()?;
         tx.execute("UPDATE devices SET revoked_at=?2 WHERE device_key=?1", params![device_key, revoked_at])?;
+        tx.execute("DELETE FROM sessions WHERE device_key=?1", [device_key])?;
         tx.execute(
             "INSERT INTO revocations(account_key,device_key,revoked_at,signature) VALUES(?1,?2,?3,?4)",
             params![account_key, device_key, revoked_at, signature],
@@ -263,6 +295,12 @@ impl Store {
             .optional()?)
     }
 
+    /// Records that the session was used to register `device_key`.
+    pub fn bind_session(&self, token_hash: &str, device_key: &str) -> Result<()> {
+        self.db.execute("UPDATE sessions SET device_key=?2 WHERE token_hash=?1", [token_hash, device_key])?;
+        Ok(())
+    }
+
     pub fn delete_session(&self, token_hash: &str) -> Result<()> {
         self.db.execute("DELETE FROM sessions WHERE token_hash=?1", [token_hash])?;
         Ok(())
@@ -274,9 +312,58 @@ impl Store {
         Ok(())
     }
 
+    // ---------------------------------------------------------------- vault
+
+    pub fn vault(&self, account: i64) -> Result<Vault> {
+        let row = self
+            .db
+            .query_row("SELECT blob,version,updated_at FROM vaults WHERE account_id=?1", [account], |r| {
+                Ok(Vault { vault: Some(r.get(0)?), version: r.get(1)?, updated_at: Some(r.get(2)?) })
+            })
+            .optional()?;
+        Ok(row.unwrap_or(Vault { vault: None, version: 0, updated_at: None }))
+    }
+
+    /// Replaces the vault if it is still at `version`; the new version, or `None` on a conflict.
+    pub fn put_vault(&self, account: i64, blob: &str, version: i64, now: i64) -> Result<Option<i64>> {
+        let changed = if version == 0 {
+            self.db.execute(
+                "INSERT OR IGNORE INTO vaults(account_id,blob,version,updated_at) VALUES(?1,?2,1,?3)",
+                params![account, blob, now],
+            )?
+        } else {
+            self.db.execute(
+                "UPDATE vaults SET blob=?2, version=version+1, updated_at=?4 WHERE account_id=?1 AND version=?3",
+                params![account, blob, version, now],
+            )?
+        };
+        Ok((changed == 1).then_some(version + 1))
+    }
+
     /// A consistent copy of the database (for backups).
     pub fn backup_to(&self, path: &Path) -> Result<()> {
         self.db.execute("VACUUM INTO ?1", [path.to_string_lossy()])?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_database_from_before_the_migrations_is_upgraded() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(SCHEMA).unwrap();
+        db.execute_batch(
+            "INSERT INTO accounts VALUES(1,'a','k','{}','h','b','r','rb',0);
+             INSERT INTO sessions(token_hash,account_id,created_at,expires_at) VALUES('t',1,0,9);",
+        )
+        .unwrap();
+        let store = Store::init(db).unwrap();
+        store.bind_session("t", "device").unwrap();
+        assert_eq!(store.vault(1).unwrap().version, 0);
+        let version: usize = store.db.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, MIGRATIONS.len());
     }
 }

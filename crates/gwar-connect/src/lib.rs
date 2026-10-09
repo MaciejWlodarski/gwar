@@ -47,6 +47,7 @@ pub fn router(state: Arc<Connect>, origins: &[String]) -> Router {
         .route("/v1/account/password", put(api::password))
         .route("/v1/devices", get(api::devices).post(api::add_device))
         .route("/v1/devices/revoke", post(api::revoke_device))
+        .route("/v1/vault", get(api::vault).put(api::put_vault))
         .route("/v1/logout", post(api::logout))
         .route("/v1/revocations", get(api::revocations))
         .route("/v1/accounts/{handle}", get(api::lookup))

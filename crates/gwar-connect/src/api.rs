@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::{
-    crypto::{self, KEY_BLOB_LEN, SKEW_MS, b64, unb64_len},
+    crypto::{self, KEY_BLOB_LEN, MAX_VAULT_LEN, SKEW_MS, b64, unb64_len},
     store::{Account, Kdf, NewAccount, Store},
 };
 
@@ -247,6 +247,7 @@ pub async fn register(
     };
     store.upsert_device(id, &d.device_key, &device_name(&d.name), now)?;
     let token = new_session(&store, id)?;
+    store.bind_session(&token_hash(&token), &d.device_key)?;
     Ok(Json(json!({"token": token})))
 }
 
@@ -373,6 +374,9 @@ pub async fn add_device(State(state): State<AppState>, headers: HeaderMap, Json(
         _ => {}
     }
     store.upsert_device(account.id, &d.device_key, &device_name(&d.name), now)?;
+    if let Some(token) = bearer(&headers) {
+        store.bind_session(&token_hash(token), &d.device_key)?;
+    }
     Ok(Json(json!({})))
 }
 
@@ -401,6 +405,32 @@ pub async fn revoke_device(State(state): State<AppState>, headers: HeaderMap, Js
     }
     store.revoke(&account.account_key, &r.device_key, r.revoked_at, &r.signature)?;
     Ok(Json(json!({})))
+}
+
+pub async fn vault(State(state): State<AppState>, headers: HeaderMap) -> Reply {
+    let account = authenticated(&state, &headers)?;
+    let vault = state.store.lock().expect("store lock").vault(account.id)?;
+    Ok(Json(json!(vault)))
+}
+
+#[derive(Deserialize)]
+pub struct PutVault {
+    vault: String,
+    /// The version the change was made on (0 when there was no vault).
+    version: i64,
+}
+
+pub async fn put_vault(State(state): State<AppState>, headers: HeaderMap, Json(r): Json<PutVault>) -> Reply {
+    let account = authenticated(&state, &headers)?;
+    let len = crypto::unb64(&r.vault).map(|b| b.len()).unwrap_or(0);
+    if !(12 + 16..=MAX_VAULT_LEN).contains(&len) {
+        return Err(ApiError::bad("invalid vault"));
+    }
+    let store = state.store.lock().expect("store lock");
+    match store.put_vault(account.id, &r.vault, r.version, now_ms())? {
+        Some(version) => Ok(Json(json!({"version": version}))),
+        None => Err(ApiError(StatusCode::CONFLICT, "conflict", "the vault changed; fetch it and try again".into())),
+    }
 }
 
 pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Reply {

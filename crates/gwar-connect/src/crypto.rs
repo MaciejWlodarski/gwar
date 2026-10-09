@@ -9,6 +9,8 @@ pub const MAX_CERT_MS: i64 = 400 * 24 * 3600 * 1000;
 pub const SKEW_MS: i64 = 5 * 60 * 1000;
 /// AES-GCM nonce + 32-byte seed + tag.
 pub const KEY_BLOB_LEN: usize = 12 + 32 + 16;
+/// Largest vault (nonce, ciphertext and tag).
+pub const MAX_VAULT_LEN: usize = 64 * 1024;
 
 pub fn b64(bytes: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(bytes)

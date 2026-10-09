@@ -48,6 +48,40 @@ fn open(enc_key: &[u8; 32], blob: &str, account_key: &str) -> [u8; 32] {
     seed.try_into().unwrap()
 }
 
+/// The vault key: only holders of the account key (and the devices they give it to) have it.
+fn vault_key(account: &SigningKey) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    Hkdf::<Sha256>::new(Some(account.verifying_key().as_bytes()), &account.to_bytes())
+        .expand(b"gwar vault v1", &mut out)
+        .unwrap();
+    out
+}
+
+fn seal_vault(key: &[u8; 32], nonce: [u8; 12], contents: &Value, account_key: &str) -> String {
+    let aad = format!("gwar vault v1\n{account_key}");
+    let plain = serde_json::to_vec(contents).unwrap();
+    let sealed = Aes256Gcm::new(key.into())
+        .encrypt(&nonce.into(), aes_gcm::aead::Payload { msg: &plain, aad: aad.as_bytes() })
+        .unwrap();
+    b64(&[nonce.as_slice(), &sealed].concat())
+}
+
+fn open_vault(key: &[u8; 32], blob: &str, account_key: &str) -> Value {
+    let bytes = B64.decode(blob).unwrap();
+    let aad = format!("gwar vault v1\n{account_key}");
+    let plain = Aes256Gcm::new(key.into())
+        .decrypt(bytes[..12].into(), aes_gcm::aead::Payload { msg: &bytes[12..], aad: aad.as_bytes() })
+        .unwrap();
+    serde_json::from_slice(&plain).unwrap()
+}
+
+fn revocation(account: &SigningKey, device: &SigningKey) -> Value {
+    let (account_key, device_key) = (b64(account.verifying_key().as_bytes()), b64(device.verifying_key().as_bytes()));
+    let at = gwar_connect::api::now_ms();
+    let statement = crypto::revoke_statement(&account_key, &device_key, at);
+    json!({"device_key": device_key, "revoked_at": at, "signature": b64(&account.sign(statement.as_bytes()).to_bytes())})
+}
+
 fn certificate(account: &SigningKey, device: &SigningKey, name: &str) -> Value {
     let (account_key, device_key) = (b64(account.verifying_key().as_bytes()), b64(device.verifying_key().as_bytes()));
     let issued_at = gwar_connect::api::now_ms();
@@ -99,6 +133,10 @@ impl Api {
 
     async fn get(&self, path: &str, token: Option<&str>) -> (u16, Value) {
         self.call(reqwest::Method::GET, path, token, None).await
+    }
+
+    async fn put(&self, path: &str, token: Option<&str>, body: Value) -> (u16, Value) {
+        self.call(reqwest::Method::PUT, path, token, Some(body)).await
     }
 }
 
@@ -179,7 +217,8 @@ async fn one_identity_on_every_device() {
     let entry = &published["revocations"][0];
     assert_eq!(entry["device_key"], phone_key);
     assert!(crypto::verify(&account_key, &statement, entry["signature"].as_str().unwrap()));
-    let (status, _) = api.post("/devices", Some(&phone_token), certificate(&account, &phone, "phone")).await;
+    assert_eq!(api.get("/devices", Some(&phone_token)).await.0, 401, "its session ended");
+    let (status, _) = api.post("/devices", Some(&token), certificate(&account, &phone, "phone")).await;
     assert_eq!(status, 410, "a revoked device stays revoked");
 }
 
@@ -229,6 +268,67 @@ async fn the_recovery_code_restores_access_and_a_new_password() {
 }
 
 #[tokio::test]
+async fn the_vault_follows_the_account_and_survives_a_password_change() {
+    let api = Api::start().await;
+    let account = SigningKey::from_bytes(&rand::random());
+    let account_key = b64(account.verifying_key().as_bytes());
+    let (_, reply) = api
+        .post(
+            "/register",
+            None,
+            sign_up("dana", "pw", &account, &SigningKey::from_bytes(&rand::random()), &rand::random()),
+        )
+        .await;
+    let laptop_token = reply["token"].as_str().unwrap().to_owned();
+    let (status, empty) = api.get("/vault", Some(&laptop_token)).await;
+    assert_eq!((status, &empty["vault"], &empty["version"]), (200, &Value::Null, &json!(0)));
+
+    // The laptop stores its TeamSpeak identity.
+    let key = vault_key(&account);
+    let contents = json!({"teamspeak": {"identity": "123VAAAA", "uid": "x", "updated_at": 1}});
+    let blob = seal_vault(&key, rand::random(), &contents, &account_key);
+    let (status, put) = api.put("/vault", Some(&laptop_token), json!({"vault": blob, "version": 0})).await;
+    assert_eq!((status, &put["version"]), (200, &json!(1)));
+    // A stale write is refused instead of overwriting.
+    let (status, _) = api.put("/vault", Some(&laptop_token), json!({"vault": blob, "version": 0})).await;
+    assert_eq!(status, 409);
+    assert_eq!(api.put("/vault", None, json!({"vault": blob, "version": 1})).await.0, 401);
+    assert_eq!(api.put("/vault", Some(&laptop_token), json!({"vault": "AAAA", "version": 1})).await.0, 400);
+
+    // A new device logs in and reads it with the key it derives from the account key.
+    let (phone_token, decrypted) = log_in(&api, "dana", "pw").await.unwrap();
+    let (_, got) = api.get("/vault", Some(&phone_token)).await;
+    assert_eq!(open_vault(&vault_key(&decrypted), got["vault"].as_str().unwrap(), &account_key), contents);
+
+    // The vault key does not depend on the password.
+    let salt: [u8; 16] = rand::random();
+    let (enc, auth) = password_secrets("pw2", &salt, M, T);
+    let body = json!({"kdf": {"salt": b64(&salt), "m": M, "t": T, "p": 1}, "auth_key": b64(&auth),
+                      "key_blob": seal(&enc, rand::random(), &account.to_bytes(), &account_key)});
+    assert_eq!(api.put("/account/password", Some(&phone_token), body).await.0, 200);
+    let (token, decrypted) = log_in(&api, "dana", "pw2").await.unwrap();
+    let (_, got) = api.get("/vault", Some(&token)).await;
+    assert_eq!(open_vault(&vault_key(&decrypted), got["vault"].as_str().unwrap(), &account_key), contents);
+}
+
+#[tokio::test]
+async fn revoking_a_device_ends_its_sessions() {
+    let api = Api::start().await;
+    let account = SigningKey::from_bytes(&rand::random());
+    let laptop = SigningKey::from_bytes(&rand::random());
+    let (_, reply) = api.post("/register", None, sign_up("erin", "pw", &account, &laptop, &rand::random())).await;
+    let laptop_token = reply["token"].as_str().unwrap().to_owned();
+    let (phone_token, _) = log_in(&api, "erin", "pw").await.unwrap();
+    let phone = SigningKey::from_bytes(&rand::random());
+    assert_eq!(api.post("/devices", Some(&phone_token), certificate(&account, &phone, "phone")).await.0, 200);
+    assert_eq!(api.get("/vault", Some(&phone_token)).await.0, 200);
+
+    assert_eq!(api.post("/devices/revoke", Some(&laptop_token), revocation(&account, &phone)).await.0, 200);
+    assert_eq!(api.get("/vault", Some(&phone_token)).await.0, 401, "the phone's session is gone");
+    assert_eq!(api.get("/vault", Some(&laptop_token)).await.0, 200, "the laptop's is not");
+}
+
+#[tokio::test]
 async fn logins_are_rate_limited() {
     let api = Api::start().await;
     let mut limited = false;
@@ -254,6 +354,11 @@ fn client_crypto_vectors() {
     let device = SigningKey::from_bytes(&[2u8; 32]);
     let statement = crypto::device_statement(&account_key, &b64(device.verifying_key().as_bytes()), 1, 2);
     assert_eq!(b64(&account.sign(statement.as_bytes()).to_bytes()), CERT_SIGNATURE);
+    let key = vault_key(&account);
+    assert_eq!(b64(&key), VAULT_KEY);
+    let contents = json!({"teamspeak": {"identity": "1V", "uid": "u", "updated_at": 1}});
+    assert_eq!(serde_json::to_string(&contents).unwrap(), VAULT_JSON);
+    assert_eq!(seal_vault(&key, [3u8; 12], &contents, &account_key), VAULT_BLOB);
 }
 
 const ENC_KEY: &str = "qXcjpHbTOr46vWBB7wO-b3l-lYMp7lsl8sa_SekxVr0";
@@ -262,4 +367,8 @@ const ACCOUNT_KEY: &str = "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w";
 const RECOVERY_ENC: &str = "WA19s_g5IcLVVJ_xQ3KHzTpUn7mkdbLdTKOA3GCok10";
 const RECOVERY_AUTH: &str = "42kqZaRu_Jtg8r8S7P-39L9-QR5IQM8eSwza09oTy3M";
 const KEY_BLOB: &str = "AwMDAwMDAwMDAwMDEz57zhVdpeE9DuPc-Z8DMvCEty7oHW-BIq7g3-5P-1LKErFt1chgOHB2VhOzkcXy";
+const VAULT_KEY: &str = "_LvSNss8p0PDJFYkx77Gv9dldHZztz1NPse-h8ZV6bQ";
+const VAULT_JSON: &str = r#"{"teamspeak":{"identity":"1V","uid":"u","updated_at":1}}"#;
+const VAULT_BLOB: &str =
+    "AwMDAwMDAwMDAwMDZgbHGQNI33i1QJYlr7AP1RbMIJv2WqEwRVph4x0WE_aS19RAscHc07sG1nH6et8NwocuVgdgFXyTeXCsQHpTYOstEa3cT7_Q";
 const CERT_SIGNATURE: &str = "hrl_m1SlEOKgUYV7RMz4dnlZ5wa5OY_m5-ZS9qWcZU82oGdpwkQdm5wVyUgxplRzxEiMoJnAs-BN6ktG0ufaDA";
