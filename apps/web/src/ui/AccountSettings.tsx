@@ -11,6 +11,8 @@ import { accountActions, useAccount } from "../state/account";
 import { useSettings } from "../state/settings";
 import { useUi } from "../state/stores";
 import { Button, Dialog, Field, Input, Segmented } from "./kit";
+import { TeamspeakIdentity } from "./TeamspeakIdentity";
+import { tsBridge } from "../connect/teamspeak";
 
 function Banner({ children }: { children: ReactNode }) {
   return (
@@ -114,7 +116,22 @@ export function AccountTab() {
       {mode === "signin" && <SignInForm onMode={setMode} />}
       {mode === "create" && <CreateForm onMode={setMode} />}
       {mode === "recover" && <RecoverForm onMode={setMode} />}
+      {tsBridge() && (
+        <div className="mt-8">
+          <TeamspeakSection />
+        </div>
+      )}
     </div>
+  );
+}
+
+/** The desktop app's TeamSpeak identity; in the browser only for a signed-in account. */
+function TeamspeakSection({ onUnlock }: { onUnlock?: () => void }) {
+  const t = useT();
+  return (
+    <Section title={t("ts.title")}>
+      <TeamspeakIdentity onUnlock={onUnlock} />
+    </Section>
   );
 }
 
@@ -386,6 +403,7 @@ function AccountView() {
   const [devicesError, setDevicesError] = useState<string | null>(null);
   const [revoking, setRevoking] = useState<DeviceInfo | null>(null);
   const [renewing, setRenewing] = useState(false);
+  const [unlocking, setUnlocking] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -476,6 +494,8 @@ function AccountView() {
         </div>
       </Section>
 
+      <TeamspeakSection onUnlock={() => setUnlocking(true)} />
+
       <ChangePassword />
 
       <Section title={t("account.signOut")}>
@@ -501,6 +521,18 @@ function AccountView() {
             await accountActions.revoke(revoking.device_key, password);
             toast("success", t("account.deviceRevoked"));
             load();
+          }}
+        />
+      )}
+      {unlocking && (
+        <PasswordDialog
+          title={t("ts.unlockTitle")}
+          body={t("ts.unlockBody")}
+          confirmLabel={t("ts.unlock")}
+          onClose={() => setUnlocking(false)}
+          onSubmit={async (password) => {
+            await accountActions.unlockVault(password);
+            toast("success", t("ts.unlocked"));
           }}
         />
       )}

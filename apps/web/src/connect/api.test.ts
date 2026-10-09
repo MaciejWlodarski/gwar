@@ -38,6 +38,8 @@ describe("ConnectApi", () => {
     await api.addDevice("t", { device_key: "d", name: "n", issued_at: 1, expires_at: 2, signature: "s" });
     await api.revokeDevice("t", { device_key: "d", revoked_at: 1, signature: "s" });
     await api.logout("t");
+    await api.getVault("t");
+    await api.putVault("t", "blob", 3);
     await api.publicAccount("@a b");
     const seen = (fetchFn.mock.calls as unknown as Array<[string, RequestInit]>).map(([u, i]) => `${i.method} ${u.replace("https://c.example/connect", "")}`);
     expect(seen).toEqual([
@@ -45,8 +47,21 @@ describe("ConnectApi", () => {
       "POST /v1/devices",
       "POST /v1/devices/revoke",
       "POST /v1/logout",
+      "GET /v1/vault",
+      "PUT /v1/vault",
       "GET /v1/accounts/%40a%20b",
     ]);
+  });
+
+  it("reads and writes the vault with the version it was based on", async () => {
+    const { api, fetchFn } = make((_url, init) =>
+      init.method === "GET" ? reply(200, { vault: null, version: 0, updated_at: 0 }) : reply(200, { version: 4 }),
+    );
+    expect(await api.getVault("tok")).toEqual({ vault: null, version: 0, updated_at: 0 });
+    expect(await api.putVault("tok", "blob", 3)).toBe(4);
+    const [, put] = fetchFn.mock.calls[1] as unknown as [string, RequestInit];
+    expect(JSON.parse(put.body as string)).toEqual({ vault: "blob", version: 3 });
+    expect((put.headers as Record<string, string>).Authorization).toBe("Bearer tok");
   });
 
   it("maps service errors to kinds", async () => {
@@ -54,6 +69,7 @@ describe("ConnectApi", () => {
       [401, "unauthorized", "unauthorized"],
       [429, "rate_limited", "rate_limited"],
       [409, "taken", "taken"],
+      [409, "conflict", "conflict"],
       [410, "revoked", "revoked"],
       [404, "not_found", "not_found"],
       [400, "bad_request", "bad_request"],

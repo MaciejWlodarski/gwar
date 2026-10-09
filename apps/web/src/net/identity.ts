@@ -66,8 +66,14 @@ export interface ConnectRecord {
   deviceName: string;
   deviceJwk: JsonWebKey;
   certificate: DeviceCertificate;
-  /** Connect session token (90 days); only used to list devices. */
+  /** Connect session token (90 days); lists devices and reads and writes the vault. */
   token: string;
+  /**
+   * Opens the account's vault (base64url, docs/connect.md): derived from the
+   * account key, so it can only be set by a flow that decrypts that key. Records
+   * saved before the vault existed lack it until the next such flow.
+   */
+  vaultKey?: string;
 }
 
 export interface ConnectStore {

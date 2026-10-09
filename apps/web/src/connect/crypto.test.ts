@@ -16,6 +16,9 @@ import {
   newKdf,
   revokeStatement,
   deviceStatement,
+  openVault,
+  sealVault,
+  vaultKey,
 } from "./crypto";
 
 // The test vectors of docs/connect.md (the same as `client_crypto_vectors` in the service's tests).
@@ -27,6 +30,10 @@ const RECOVERY_AUTH = "42kqZaRu_Jtg8r8S7P-39L9-QR5IQM8eSwza09oTy3M";
 const KEY_BLOB = "AwMDAwMDAwMDAwMDEz57zhVdpeE9DuPc-Z8DMvCEty7oHW-BIq7g3-5P-1LKErFt1chgOHB2VhOzkcXy";
 const DEVICE_KEY = "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q";
 const CERT_SIGNATURE = "hrl_m1SlEOKgUYV7RMz4dnlZ5wa5OY_m5-ZS9qWcZU82oGdpwkQdm5wVyUgxplRzxEiMoJnAs-BN6ktG0ufaDA";
+
+const VAULT_KEY = "_LvSNss8p0PDJFYkx77Gv9dldHZztz1NPse-h8ZV6bQ";
+const VAULT_JSON = '{"teamspeak":{"identity":"1V","uid":"u","updated_at":1}}';
+const VAULT_BLOB = "AwMDAwMDAwMDAwMDZgbHGQNI33i1QJYlr7AP1RbMIJv2WqEwRVph4x0WE_aS19RAscHc07sG1nH6et8NwocuVgdgFXyTeXCsQHpTYOstEa3cT7_Q";
 
 const fill = (n: number, byte: number) => new Uint8Array(n).fill(byte);
 const b64 = encodeBase64Url;
@@ -57,6 +64,20 @@ describe("test vectors", () => {
     expect(await openKey(decodeBase64Url(ENC_KEY), KEY_BLOB, ACCOUNT_KEY)).toEqual(fill(32, 1));
     await expect(openKey(decodeBase64Url(AUTH_KEY), KEY_BLOB, ACCOUNT_KEY)).rejects.toThrow();
     await expect(openKey(decodeBase64Url(ENC_KEY), KEY_BLOB, DEVICE_KEY)).rejects.toThrow();
+  });
+
+  it("derives the vault key with HKDF", async () => {
+    expect(b64(await vaultKey(fill(32, 1), decodeBase64Url(ACCOUNT_KEY)))).toBe(VAULT_KEY);
+  });
+
+  it("seals the vault exactly", async () => {
+    expect(await sealVault(decodeBase64Url(VAULT_KEY), VAULT_JSON, ACCOUNT_KEY, fill(12, 3))).toBe(VAULT_BLOB);
+  });
+
+  it("opens the vault and refuses a wrong key or account", async () => {
+    expect(await openVault(decodeBase64Url(VAULT_KEY), VAULT_BLOB, ACCOUNT_KEY)).toBe(VAULT_JSON);
+    await expect(openVault(decodeBase64Url(ENC_KEY), VAULT_BLOB, ACCOUNT_KEY)).rejects.toThrow();
+    await expect(openVault(decodeBase64Url(VAULT_KEY), VAULT_BLOB, DEVICE_KEY)).rejects.toThrow();
   });
 
   it("signs the device certificate exactly", async () => {

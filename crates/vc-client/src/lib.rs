@@ -3,6 +3,7 @@
 
 pub mod identity;
 pub mod teamspeak;
+pub mod ts_identity;
 pub mod voice;
 
 use std::{collections::HashMap, time::Duration};

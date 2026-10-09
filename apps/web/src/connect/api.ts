@@ -9,6 +9,7 @@ export type ConnectErrorKind =
   | "taken" // handle or identity already has an account, or the device key is used
   | "revoked"
   | "not_found"
+  | "conflict" // the vault changed since it was read
   | "bad_request"
   | "server"; // anything else
 
@@ -29,6 +30,7 @@ const KIND_BY_CODE: Record<string, ConnectErrorKind> = {
   taken: "taken",
   revoked: "revoked",
   not_found: "not_found",
+  conflict: "conflict",
   bad_request: "bad_request",
 };
 
@@ -79,6 +81,14 @@ export interface Revocation {
   device_key: string;
   revoked_at: number;
   signature: string;
+}
+
+export interface VaultReply {
+  /** The sealed vault, or null before the first write. */
+  vault: string | null;
+  /** 0 before the first write; the next write names the version it was based on. */
+  version: number;
+  updated_at?: number;
 }
 
 export class ConnectApi {
@@ -149,6 +159,15 @@ export class ConnectApi {
 
   async revokeDevice(token: string, revocation: { device_key: string; revoked_at: number; signature: string }): Promise<void> {
     await this.call("POST", "/devices/revoke", revocation, token);
+  }
+
+  getVault(token: string): Promise<VaultReply> {
+    return this.call("GET", "/vault", undefined, token);
+  }
+
+  /** Writes the vault on top of `version`; rejects with kind "conflict" if it changed meanwhile. Returns the new version. */
+  async putVault(token: string, vault: string, version: number): Promise<number> {
+    return (await this.call<{ version: number }>("PUT", "/vault", { vault, version }, token)).version;
   }
 
   async logout(token: string): Promise<void> {

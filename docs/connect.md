@@ -142,6 +142,8 @@ verify each entry with its account key and refuse revoked devices.
   stores its own (keeping its TeamSpeak groups); the user can also import one
   exported from the official TeamSpeak client. Desktops refresh it from the
   vault when they start.
+  The account's identity is kept next to the device's own
+  (`teamspeak-identity.account.json` beside `teamspeak-identity.json`) and removed on sign-out.
 
 ## Test vectors
 

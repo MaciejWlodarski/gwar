@@ -101,6 +101,40 @@ export async function openKey(encKey: Uint8Array, blob: string, accountKey: stri
   return seed;
 }
 
+// -------------------------------------------------------------------- vault
+
+/** `HKDF-SHA256(ikm = account seed, salt = account public key, info = "gwar vault v1", 32 bytes)`. */
+export async function vaultKey(seed: Uint8Array, accountPublicKey: Uint8Array): Promise<Uint8Array> {
+  const key = await subtle().importKey("raw", buf(seed), "HKDF", false, ["deriveBits"]);
+  const bits = await subtle().deriveBits(
+    { name: "HKDF", hash: "SHA-256", salt: buf(accountPublicKey), info: buf(enc.encode("gwar vault v1")) },
+    key,
+    256,
+  );
+  return new Uint8Array(bits);
+}
+
+const vaultAad = (accountKey: string) => buf(enc.encode(`gwar vault v1\n${accountKey}`));
+
+/** `b64url(nonce ‖ AES-256-GCM(vault_key, nonce, UTF-8 json, aad))`. The nonce is random unless a test fixes it. */
+export async function sealVault(key: Uint8Array, json: string, accountKey: string, nonce: Uint8Array = randomBytes(12)): Promise<string> {
+  const k = await subtle().importKey("raw", buf(key), "AES-GCM", false, ["encrypt"]);
+  const sealed = new Uint8Array(await subtle().encrypt({ name: "AES-GCM", iv: buf(nonce), additionalData: vaultAad(accountKey) }, k, buf(enc.encode(json))));
+  const out = new Uint8Array(nonce.length + sealed.length);
+  out.set(nonce);
+  out.set(sealed, nonce.length);
+  return encodeBase64Url(out);
+}
+
+/** Decrypts a vault to its JSON text; throws if the key (or the blob) is wrong. */
+export async function openVault(key: Uint8Array, blob: string, accountKey: string): Promise<string> {
+  const bytes = decodeBase64Url(blob);
+  if (bytes.length < 12 + 16) throw new Error("invalid vault");
+  const k = await subtle().importKey("raw", buf(key), "AES-GCM", false, ["decrypt"]);
+  const plain = await subtle().decrypt({ name: "AES-GCM", iv: buf(bytes.slice(0, 12)), additionalData: vaultAad(accountKey) }, k, buf(bytes.slice(12)));
+  return new TextDecoder().decode(plain);
+}
+
 // ------------------------------------------------------------------ Ed25519
 
 const ED25519 = { name: "Ed25519" } as const;

@@ -14,12 +14,9 @@
 //! nothing is lost between connecting and the first event. Voice uses the same
 //! `voice_start` command as vc servers; see [`Ts::voice_link`].
 
-use std::{
-    path::PathBuf,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
 };
 
 use serde::Serialize;
@@ -31,6 +28,8 @@ use vc_client::{
     teamspeak::{self, TsAudio, TsHandle, TsOptions},
 };
 use vc_proto::{ErrorBody, ErrorCode, Request};
+
+use crate::ts_identity;
 
 /// What voice needs from the active TS connection.
 pub struct VoiceLink {
@@ -93,11 +92,6 @@ struct ClosedPayload {
     session: u64,
 }
 
-fn identity_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    Ok(dir.join("teamspeak-identity.json"))
-}
-
 #[tauri::command]
 pub async fn ts_connect(
     app: AppHandle,
@@ -108,11 +102,11 @@ pub async fn ts_connect(
     password: Option<String>,
 ) -> Result<Value, String> {
     ts.close();
-    let path = identity_path(&app)?;
-    let identity = tokio::task::spawn_blocking(move || teamspeak::load_identity(&path))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| format!("{e:#}"))?;
+    // The account's TeamSpeak identity if signed in to Gwar Connect, else this device's own.
+    let identity = {
+        let app = app.clone();
+        tokio::task::spawn_blocking(move || ts_identity::load_active(&app)).await.map_err(|e| e.to_string())??
+    };
     tracing::info!("ts_connect session={session} address={address}");
     let connected = teamspeak::connect(TsOptions {
         address,

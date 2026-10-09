@@ -7,6 +7,7 @@ mod files;
 mod shortcuts;
 mod tray;
 mod ts;
+mod ts_identity;
 mod voice;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -120,6 +121,11 @@ pub fn run() {
             ts::ts_connect,
             ts::ts_request,
             ts::ts_disconnect,
+            ts_identity::ts_identity_info,
+            ts_identity::ts_identity_export,
+            ts_identity::ts_identity_parse,
+            ts_identity::ts_identity_set_account,
+            ts_identity::ts_identity_set_device,
             tray::tray_set_state,
             tray::set_close_to_tray,
             debug::debug_autoconnect,

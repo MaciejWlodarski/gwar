@@ -554,4 +554,41 @@ export const pl: Record<Key, string> = {
   "identity.connectNote":
     "Jesteś zalogowany przez Gwar Connect jako @{handle}. Tożsamość należy do konta i jest taka sama na każdym urządzeniu. Zarządzasz nią w zakładce Konto.",
   "identity.accountKey": "Klucz konta",
+  "ts.title": "Tożsamość TeamSpeak",
+  "ts.introAccount":
+    "Dopóki jesteś zalogowany, serwery TeamSpeak rozpoznają cię po tożsamości TeamSpeak twojego konta, takiej samej we wszystkich twoich aplikacjach desktopowych. Jest zapisana w Gwar Connect w postaci zaszyfrowanej.",
+  "ts.introDevice":
+    "Serwery TeamSpeak rozpoznają cię po tej tożsamości. Zaloguj się przez Gwar Connect, aby mieć tę samą we wszystkich aplikacjach desktopowych.",
+  "ts.uid": "Unikalny identyfikator TeamSpeak",
+  "ts.level": "Poziom bezpieczeństwa {level}",
+  "ts.sourceAccount": "z twojego konta",
+  "ts.sourceDevice": "z tego urządzenia",
+  "ts.import": "Importuj z klienta TeamSpeak…",
+  "ts.export": "Eksportuj do klienta TeamSpeak",
+  "ts.importTitle": "Importuj tożsamość TeamSpeak",
+  "ts.importBody":
+    "Wklej ciąg tożsamości albo zawartość pliku .ini z tożsamością wyeksportowaną z klienta TeamSpeak (Narzędzia, Tożsamości, Eksportuj).",
+  "ts.importField": "Tożsamość",
+  "ts.importFile": "Wybierz plik…",
+  "ts.importContinue": "Dalej",
+  "ts.confirmTitle": "Zastąpić tożsamość TeamSpeak?",
+  "ts.confirmAccount":
+    "To zmieni sposób, w jaki serwery TeamSpeak cię rozpoznają, na każdym urządzeniu zalogowanym na twoje konto: z {current} na {uid} (poziom bezpieczeństwa {level}). Grupy serwerowe i uprawnienia przypisane do starej tożsamości przestaną obowiązywać.",
+  "ts.confirmDevice":
+    "To zmieni sposób, w jaki serwery TeamSpeak cię rozpoznają: z {current} na {uid} (poziom bezpieczeństwa {level}). Grupy serwerowe i uprawnienia przypisane do starej tożsamości przestaną obowiązywać. Stara tożsamość zostanie zachowana jako kopia zapasowa w folderze danych aplikacji.",
+  "ts.newUid": "Nowy unikalny identyfikator TeamSpeak",
+  "ts.replace": "Zastąp tożsamość",
+  "ts.imported": "Tożsamość TeamSpeak zastąpiona. Połącz się ponownie z serwerami TeamSpeak, aby jej użyć.",
+  "ts.importFailed": "Nie udało się zastąpić tożsamości: {message}",
+  "ts.exportTitle": "Eksport do klienta TeamSpeak",
+  "ts.exportBody": "W kliencie TeamSpeak zaimportuj ten ciąg (Narzędzia, Tożsamości, Importuj), aby używać tam tej samej tożsamości.",
+  "ts.exportWarning": "To tajny klucz. Kto go ma, może podszyć się pod ciebie na serwerach TeamSpeak. Nie udostępniaj go.",
+  "ts.webLabel": "Twoja tożsamość TeamSpeak (używa jej aplikacja desktopowa)",
+  "ts.webNone": "Nie ma jeszcze tożsamości TeamSpeak. Pierwsza aplikacja desktopowa, w której się zalogujesz, zapisze tu swoją.",
+  "ts.locked": "To urządzenie nie może jeszcze odczytać tożsamości TeamSpeak twojego konta. Podaj raz hasło, aby to umożliwić.",
+  "ts.unlock": "Podaj hasło",
+  "ts.unlockTitle": "Odblokuj tożsamość TeamSpeak",
+  "ts.unlockBody": "Hasło pozwala temu urządzeniu odczytywać i aktualizować zaszyfrowane dane twojego konta. Hasło nie jest zapisywane.",
+  "ts.unlocked": "Odblokowano.",
+  "ts.loadFailed": "Nie udało się wczytać tożsamości TeamSpeak: {message}",
 };

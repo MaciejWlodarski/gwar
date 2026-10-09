@@ -8,6 +8,15 @@ import { ConnectApiError, connectApi, type DeviceInfo } from "../connect/api";
 import * as flows from "../connect/account";
 import { deviceName } from "../connect/device-name";
 import {
+  refreshFromVault,
+  replaceIdentity,
+  syncAfterUnlock,
+  tsBridge,
+  vaultIdentity,
+  type TsExported,
+} from "../connect/teamspeak";
+import { loadVault, VaultLockedError } from "../connect/vault";
+import {
   identityFromConnect,
   indexedDbConnectStore,
   indexedDbIdentityStore,
@@ -25,6 +34,8 @@ export interface AccountSummary {
   deviceName: string;
   /** Certificate expiry, Unix ms. */
   expiresAt: number;
+  /** False for sign-ins saved before vaults existed: a flow with the password adds the key. */
+  hasVaultKey: boolean;
 }
 
 interface AccountStore {
@@ -33,9 +44,11 @@ interface AccountStore {
   account: AccountSummary | null;
   /** Created but not yet confirmed: holds the recovery code so it survives closing the dialog. */
   pending: { record: ConnectRecord; recoveryCode: string } | null;
+  /** Bumped when the TeamSpeak identity may have changed behind the UI's back (a sync finished). */
+  tsRevision: number;
 }
 
-export const useAccount = create<AccountStore>()(() => ({ loaded: false, account: null, pending: null }));
+export const useAccount = create<AccountStore>()(() => ({ loaded: false, account: null, pending: null, tsRevision: 0 }));
 
 const summarize = (r: ConnectRecord): AccountSummary => ({
   handle: r.handle,
@@ -43,6 +56,7 @@ const summarize = (r: ConnectRecord): AccountSummary => ({
   deviceKey: r.certificate.device_key,
   deviceName: r.deviceName,
   expiresAt: r.certificate.expires_at,
+  hasVaultKey: !!r.vaultKey,
 });
 
 const deps = () => ({
@@ -57,17 +71,35 @@ async function current(): Promise<ConnectRecord> {
   return record;
 }
 
+const bumpTs = () => useAccount.setState((s) => ({ tsRevision: s.tsRevision + 1 }));
+
+/**
+ * Desktop: lines the TeamSpeak identity up with the vault after a flow that
+ * stored the vault key. Runs in the background and only logs failures; being
+ * signed in does not depend on it.
+ */
+function syncTeamspeak(record: ConnectRecord): void {
+  const ts = tsBridge();
+  if (!ts || !record.vaultKey) return;
+  syncAfterUnlock(connectApi, record, ts)
+    .then((outcome) => console.info(`TeamSpeak identity: ${outcome}`))
+    .catch((e: unknown) => console.warn("TeamSpeak identity sync failed", e))
+    .finally(bumpTs);
+}
+
 /** Signs this device in with a finished record: stores it and makes it the identity. */
 async function activate(record: ConnectRecord): Promise<void> {
   await indexedDbConnectStore.save(record);
   await controller.switchIdentity(await identityFromConnect(record));
   useAccount.setState({ account: summarize(record), pending: null, loaded: true });
+  syncTeamspeak(record);
 }
 
 async function refresh(record: ConnectRecord): Promise<void> {
   await indexedDbConnectStore.save(record);
   // Same device key: no reconnect needed, but the next hello carries the new certificate.
   useAccount.setState({ account: summarize(record) });
+  syncTeamspeak(record);
   if (record.certificate.device_key === (await controller.getIdentity()).publicKey) {
     const identity = await identityFromConnect(record);
     await controller.replaceIdentityQuietly(identity);
@@ -79,6 +111,13 @@ export const accountActions = {
   async load(): Promise<void> {
     const record = await loadConnectRecord();
     useAccount.setState({ account: record ? summarize(record) : null, loaded: true });
+    // Pick up an identity another desktop put in the vault. Never waited for: starting must not depend on the network.
+    const ts = tsBridge();
+    if (record?.vaultKey && ts) {
+      refreshFromVault(connectApi, record, ts)
+        .then((outcome) => outcome === "applied" && bumpTs())
+        .catch((e: unknown) => console.warn("TeamSpeak identity refresh skipped", e));
+    }
   },
 
   /** Registers an account. The recovery code is returned once; {@link confirmCreated} finishes it. */
@@ -115,6 +154,29 @@ export const accountActions = {
     await refresh(await flows.renewCertificate(await current(), password, deps()));
   },
 
+  /** For a sign-in without a vault key: the password derives it (see `unlockVault`). */
+  async unlockVault(password: string): Promise<void> {
+    await refresh(await flows.unlockVault(await current(), password, deps()));
+  },
+
+  /** What the vault says about TeamSpeak: `locked` until this device has the vault key. */
+  async teamspeakInVault(): Promise<{ locked: true } | { locked: false; identity: { identity: string; uid: string } | null }> {
+    try {
+      return { locked: false, identity: vaultIdentity((await loadVault(connectApi, await current())).contents) };
+    } catch (e) {
+      if (e instanceof VaultLockedError) return { locked: true };
+      throw e;
+    }
+  },
+
+  /** Imported identity: the account's (every device follows) when signed in, otherwise this device's own. */
+  async replaceTeamspeak(next: TsExported): Promise<void> {
+    const ts = tsBridge();
+    if (!ts) throw new Error("TeamSpeak is only available in the desktop app");
+    await replaceIdentity(connectApi, await loadConnectRecord(), ts, next);
+    bumpTs();
+  },
+
   async devices(): Promise<DeviceInfo[]> {
     return connectApi.devices((await current()).token);
   },
@@ -123,6 +185,9 @@ export const accountActions = {
   async signOut(): Promise<void> {
     const record = await loadConnectRecord();
     if (record) await flows.signOut(record, deps());
+    // TeamSpeak goes back to this device's own identity.
+    await tsBridge()?.setAccount(null).catch((e: unknown) => console.warn("could not drop the account's TeamSpeak identity", e));
+    bumpTs();
     await controller.switchIdentity(null);
     useAccount.setState({ account: null });
   },

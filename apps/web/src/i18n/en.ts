@@ -552,6 +552,43 @@ export const en = {
   "identity.connectNote":
     "You are signed in with Gwar Connect as @{handle}. Your identity belongs to the account and is the same on every device. Manage it in the Account tab.",
   "identity.accountKey": "Account key",
+  "ts.title": "TeamSpeak identity",
+  "ts.introAccount":
+    "While you are signed in, TeamSpeak servers know you by your account's TeamSpeak identity, the same on all your desktop apps. It is stored encrypted in Gwar Connect.",
+  "ts.introDevice":
+    "TeamSpeak servers know you by this identity. Sign in with Gwar Connect to use the same one on all your desktop apps.",
+  "ts.uid": "TeamSpeak unique ID",
+  "ts.level": "Security level {level}",
+  "ts.sourceAccount": "from your account",
+  "ts.sourceDevice": "from this device",
+  "ts.import": "Import from TeamSpeak client…",
+  "ts.export": "Export for TeamSpeak client",
+  "ts.importTitle": "Import a TeamSpeak identity",
+  "ts.importBody":
+    "Paste the identity string, or the contents of an identity .ini file exported by the TeamSpeak client (Tools, Identities, Export).",
+  "ts.importField": "Identity",
+  "ts.importFile": "Choose a file…",
+  "ts.importContinue": "Continue",
+  "ts.confirmTitle": "Replace your TeamSpeak identity?",
+  "ts.confirmAccount":
+    "This changes how TeamSpeak servers recognize you on every device signed in to your account: from {current} to {uid} (security level {level}). Server groups and permissions you have under the old identity won't apply anymore.",
+  "ts.confirmDevice":
+    "This changes how TeamSpeak servers recognize you: from {current} to {uid} (security level {level}). Server groups and permissions you have under the old identity won't apply anymore. The old identity is kept as a backup file in the app's data folder.",
+  "ts.newUid": "New TeamSpeak unique ID",
+  "ts.replace": "Replace identity",
+  "ts.imported": "TeamSpeak identity replaced. Reconnect to your TeamSpeak servers to use it.",
+  "ts.importFailed": "Could not replace the identity: {message}",
+  "ts.exportTitle": "Export for the TeamSpeak client",
+  "ts.exportBody": "In the TeamSpeak client, import this string (Tools, Identities, Import) to use the same identity there.",
+  "ts.exportWarning": "This is a secret key. Whoever has it can pretend to be you on TeamSpeak servers. Don't share it.",
+  "ts.webLabel": "Your TeamSpeak identity (used by the desktop app)",
+  "ts.webNone": "No TeamSpeak identity yet. The first desktop app you sign in on stores its own here.",
+  "ts.locked": "This device can't read your account's TeamSpeak identity yet. Enter your password once to allow it.",
+  "ts.unlock": "Enter password",
+  "ts.unlockTitle": "Unlock the TeamSpeak identity",
+  "ts.unlockBody": "Your password lets this device read and update the encrypted data of your account. The password is not stored.",
+  "ts.unlocked": "Unlocked.",
+  "ts.loadFailed": "Could not load the TeamSpeak identity: {message}",
 } as const;
 
 export type Key = keyof typeof en;
