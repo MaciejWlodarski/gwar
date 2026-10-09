@@ -3,9 +3,9 @@
  * any self-hosted Gwar server from there. Invite links point at it (the desktop
  * app has no web address of its own, `location.origin` is `tauri://...` there).
  *
- * Moves to the Gwar domain later; change it here only.
+ * Change it here only (and `OFFICIAL_WEB_ORIGIN` in vc-server).
  */
-export const OFFICIAL_WEB_ORIGIN = "https://voice.maciejwlodarski.com";
+export const OFFICIAL_WEB_ORIGIN = "https://gwar.maciejwlodarski.com";
 
 /**
  * Gwar Connect, the optional account service (docs/connect.md). nginx serves it

@@ -9,6 +9,7 @@
 #   Connect   : 127.0.0.1:8900, Gwar Connect (VC_CONNECT=0 skips it); nginx publishes it
 #               under /connect/ (see docs/deploy.md)
 #   Backups   : daily copies of both databases in ~/gwar-backups, kept 14 days
+#   Web app   : with --web, dist is also published to VC_WEB_DIR (a static nginx root)
 #
 # Usage: scripts/deploy-vm.sh [--web]   (--web also builds apps/web locally and uploads dist)
 set -euo pipefail
@@ -36,9 +37,12 @@ PUBLIC_IP=${VC_PUBLIC_IP:?set VC_PUBLIC_IP (address clients reach) in scripts/de
 EXTRA_ARGS="$TS_ARGS ${VC_EXTRA_ARGS:-}"
 CONNECT=${VC_CONNECT:-1}
 CONNECT_ARGS=${VC_CONNECT_ARGS:-}
+WEB_DIR=${VC_WEB_DIR:-}
+PUBLISH_WEB=0
 
 if [[ "${1:-}" == "--web" ]]; then
   pnpm --filter web build
+  PUBLISH_WEB=1
 fi
 
 rsync -az -e "ssh $SSH_OPTS" --delete --exclude target --exclude node_modules --exclude .git --exclude .claude \
@@ -46,11 +50,15 @@ rsync -az -e "ssh $SSH_OPTS" --delete --exclude target --exclude node_modules --
 
 # The remote shell re-parses the command line, so quote the values for it.
 ssh $SSH_OPTS -T "$HOST" MEDIA_BIND="$MEDIA_BIND" PUBLIC_IP="$PUBLIC_IP" EXTRA_ARGS="$(printf %q "$EXTRA_ARGS")" \
-  CONNECT="$CONNECT" CONNECT_ARGS="$(printf %q "$CONNECT_ARGS")" \
+  CONNECT="$CONNECT" CONNECT_ARGS="$(printf %q "$CONNECT_ARGS")" WEB_DIR="$WEB_DIR" PUBLISH_WEB="$PUBLISH_WEB" \
   timeout 1500 bash -s <<'REMOTE'
 set -euo pipefail
 export PATH=$HOME/.cargo/bin:$PATH
 cd ~/vc/src
+if [[ "$PUBLISH_WEB" == 1 && -n "$WEB_DIR" ]]; then
+  rsync -a --delete apps/web/dist/ "$WEB_DIR/"
+  echo "web app published to $WEB_DIR"
+fi
 PACKAGES="-p vc-server"
 [[ "$CONNECT" == 1 ]] && PACKAGES="$PACKAGES -p gwar-connect"
 CARGO_TARGET_DIR=$HOME/vc/target nice cargo build --release $PACKAGES

@@ -23,7 +23,7 @@ flowchart LR
 ## Deployment model
 
 People run **servers**; the project runs the **web app** (one origin, today
-`https://voice.maciejwlodarski.com`, see `OFFICIAL_WEB_ORIGIN`), which connects
+`https://gwar.maciejwlodarski.com`, see `OFFICIAL_WEB_ORIGIN`), which connects
 to any server over `wss://`. Hence servers need HTTPS: `--domain` gets and
 renews a Let's Encrypt certificate inside the server (`src/tls.rs`), and
 uploads accept cross-origin requests from the web app's origin only (CORS on

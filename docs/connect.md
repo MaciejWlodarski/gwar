@@ -18,8 +18,8 @@ layer over Gwar's key-based identity, not a replacement:
   themselves and only fetch the list of revoked devices (each entry signed by
   the account key) every few minutes. If Connect is down, servers keep working.
 
-The official service runs at `https://voice.maciejwlodarski.com/connect` (it
-moves to the Gwar domain later). The service is `crates/gwar-connect`.
+The official service runs at `https://gwar.maciejwlodarski.com/connect`. The
+service is `crates/gwar-connect`.
 
 ## Encoding
 

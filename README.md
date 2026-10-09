@@ -4,8 +4,9 @@
 talk from the browser or the desktop app, and keep your friends who still use
 TeamSpeak in the same conversation.
 
-**Use it:** the web app at <https://voice.maciejwlodarski.com> (it will move to
-a Gwar domain) connects to any Gwar server; so does the desktop app.
+**Use it:** the web app at <https://gwar.maciejwlodarski.com> connects to any
+Gwar server (the project's own is `voice.maciejwlodarski.com`); so does the
+desktop app.
 
 *Gwar* is Polish for the buzz of many voices talking at once.
 

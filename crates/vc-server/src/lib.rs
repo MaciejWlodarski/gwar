@@ -76,11 +76,10 @@ pub struct Config {
 }
 
 /// The project's Gwar Connect service.
-pub const OFFICIAL_CONNECT_URL: &str = "https://voice.maciejwlodarski.com/connect";
+pub const OFFICIAL_CONNECT_URL: &str = "https://gwar.maciejwlodarski.com/connect";
 
 /// Where the project hosts the web app that connects to every Gwar server.
-/// (Moves to the Gwar domain later.)
-pub const OFFICIAL_WEB_ORIGIN: &str = "https://voice.maciejwlodarski.com";
+pub const OFFICIAL_WEB_ORIGIN: &str = "https://gwar.maciejwlodarski.com";
 
 /// The official TeamSpeak server to run and bridge (needs the `teamspeak` feature).
 pub struct TeamSpeakConfig {

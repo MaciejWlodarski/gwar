@@ -19,7 +19,7 @@ struct Cli {
         long = "origin",
         env = "GWAR_CONNECT_ORIGINS",
         value_delimiter = ',',
-        default_value = "https://voice.maciejwlodarski.com"
+        default_value = "https://gwar.maciejwlodarski.com"
     )]
     origins: Vec<String>,
     #[command(subcommand)]

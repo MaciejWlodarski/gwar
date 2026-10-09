@@ -43,8 +43,8 @@ describe("buildInviteLink", () => {
     );
   });
   it("names the server when it is on another origin", () => {
-    expect(buildInviteLink({ webOrigin: "https://voice.maciejwlodarski.com", serverOrigin: "https://play.example.org", code: "abc" })).toBe(
-      "https://voice.maciejwlodarski.com/?server=play.example.org&invite=abc",
+    expect(buildInviteLink({ webOrigin: "https://gwar.maciejwlodarski.com", serverOrigin: "https://play.example.org", code: "abc" })).toBe(
+      "https://gwar.maciejwlodarski.com/?server=play.example.org&invite=abc",
     );
     expect(buildInviteLink({ webOrigin: "http://127.0.0.1:5173", serverOrigin: "http://127.0.0.1:8799", code: "abc" })).toBe(
       "http://127.0.0.1:5173/?server=127.0.0.1%3A8799&invite=abc",
