@@ -12,11 +12,13 @@ import { TeamSpeakBadge } from "./badges";
 import { useIsMobile } from "../lib/media";
 
 /**
- * When this page is served by vc-server itself, `/health` answers "ok" (the
- * Vite dev server answers with index.html instead). Then the natural default
- * is "the server I came from".
+ * The web app is not a server by default: it is hosted separately and connects
+ * to any server. Only when the page's own origin also runs a Gwar server
+ * (`/health` answers "ok"; a static host or the Vite dev server answers with
+ * something else) is "the server I came from" a natural default.
  */
 async function probeSameOriginServer(): Promise<string | null> {
+  if (!/^https?:$/.test(window.location.protocol)) return null;
   try {
     const r = await fetch("/health", { signal: AbortSignal.timeout(2000) });
     if (!r.ok || (await r.text()).trim() !== "ok") return null;
@@ -43,7 +45,7 @@ export function ConnectScreen() {
   const [password, setPassword] = useState("");
   const [remember, setRemember] = useState(true);
 
-  // An invite link without a server means "the server that served this page".
+  // An invite link without a server means "the server on this page's own origin".
   const inviteWithoutServer = !!invite && !invite.server;
   useEffect(() => {
     if (kind !== "vc" || (lastAddress && !inviteWithoutServer)) return;

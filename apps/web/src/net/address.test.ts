@@ -25,6 +25,22 @@ describe("parseServerAddress", () => {
     expect(url("other.example.org", https)).toBe("wss://other.example.org/ws");
   });
 
+  it("a hosted https page connects to hostnames over wss and refuses plain ws", () => {
+    expect(url("play.example.org", https)).toBe("wss://play.example.org/ws");
+    expect(url("play.example.org:8443", https)).toBe("wss://play.example.org:8443/ws");
+    expect(url("https://play.example.org", https)).toBe("wss://play.example.org/ws");
+    expect(url("ws://play.example.org", https)).toBe("mixed_content");
+    expect(url("http://play.example.org:8790", https)).toBe("mixed_content");
+    expect(url("ws://192.168.1.10:8790", https)).toBe("mixed_content");
+  });
+
+  it("an https page may reach a server on this machine over plain ws", () => {
+    expect(url("localhost", https)).toBe("ws://localhost:8790/ws");
+    expect(url("127.0.0.1:9000", https)).toBe("ws://127.0.0.1:9000/ws");
+    expect(url("http://localhost:8790", https)).toBe("ws://localhost:8790/ws");
+    expect(url("wss://localhost", https)).toBe("wss://localhost/ws");
+  });
+
   it("the page's own host reuses the page port", () => {
     expect(url("localhost", http)).toBe("ws://localhost:5173/ws");
     expect(url("voice.example.com", https)).toBe("wss://voice.example.com/ws");

@@ -1,14 +1,14 @@
 /**
- * Invite links: `https://chat.example.com/?invite=CODE` (hosted web client: the
- * page's own origin is the server) or, when the page is not the server,
- * `...?invite=CODE&server=voice.example.com:8790`.
+ * Invite links: `https://app.example.org/?server=voice.example.com&invite=CODE`
+ * (the web app names the server to join). Without `server` the web app's own
+ * origin is the server, which is only the case when one host serves both.
  */
 
 const CODE_RE = /^[A-Za-z0-9_-]{3,128}$/;
 
 export interface InviteTarget {
   code: string;
-  /** Address of the server as a person would type it; absent means "the server that served this page". */
+  /** Address of the server as a person would type it; absent means "the server on the web app's own origin". */
   server?: string;
 }
 
@@ -53,28 +53,26 @@ export function parseInviteLink(input: string): InviteTarget | null {
 }
 
 export interface BuildInviteOptions {
-  /** `location.origin` of the page (`tauri://localhost` and the like in the desktop app). */
-  pageOrigin: string;
+  /** Public address of the web app (see `webOrigin`): the official one in the desktop app. */
+  webOrigin: string;
   /** HTTP origin of the connected server, e.g. `https://voice.example.com`. */
   serverOrigin: string;
   code: string;
 }
 
 /**
- * The shareable link for a code. A web page that is not the server itself names
- * the server in the link; in the desktop app the link points at the server's own
- * origin (which serves the web client when it hosts one).
+ * The shareable link for a code: `<web app>/?server=<host[:port]>&invite=<code>`.
+ * `server` is left out only when the web app and the server share an origin; a
+ * server on another scheme than the web app is written as a full origin so the
+ * scheme survives.
  */
-export function buildInviteLink({ pageOrigin, serverOrigin, code }: BuildInviteOptions): string {
-  const params = new URLSearchParams({ invite: code });
-  let base = serverOrigin;
-  if (/^https?:\/\//i.test(pageOrigin)) {
-    base = new URL(pageOrigin).origin;
-    const server = new URL(serverOrigin);
-    const page = new URL(pageOrigin);
-    if (page.host.toLowerCase() !== server.host.toLowerCase() || page.protocol !== server.protocol) {
-      params.set("server", page.protocol === server.protocol ? server.host : server.origin);
-    }
+export function buildInviteLink({ webOrigin, serverOrigin, code }: BuildInviteOptions): string {
+  const web = new URL(webOrigin);
+  const server = new URL(serverOrigin);
+  const params = new URLSearchParams();
+  if (web.host.toLowerCase() !== server.host.toLowerCase() || web.protocol !== server.protocol) {
+    params.set("server", web.protocol === server.protocol ? server.host : server.origin);
   }
-  return `${base.replace(/\/+$/, "")}/?${params.toString()}`;
+  params.set("invite", code);
+  return `${web.origin}/?${params.toString()}`;
 }

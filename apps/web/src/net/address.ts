@@ -7,7 +7,9 @@
  *  2. No scheme: the connection is `wss` when the page itself is served over
  *     https (browsers block `ws://` from secure pages, "mixed content"),
  *     otherwise `ws`. Pages that are not http(s) at all (Tauri, file:) count
- *     as plain http.
+ *     as plain http. The exception is a loopback host (localhost, 127.0.0.1)
+ *     on an https page: browsers allow plain `ws://` there, so a server run
+ *     on the same machine stays reachable from the hosted web app.
  *  3. Port: an explicit port always wins. A bare host without a port gets the
  *     server default 8790 when the page is plain http (dev / LAN use, where
  *     the server is run directly), and no port (=> 443) when the page is
@@ -18,7 +20,8 @@
  *  5. IPv6: `[::1]:8790` or a bare `::1` / `fe80::1` (several colons, no
  *     brackets) is accepted and bracketed in the URL.
  *  6. `ws://` to a non-loopback host from an https page is rejected as mixed
- *     content, with a dedicated error so the UI can explain it.
+ *     content, with a dedicated error so the UI can explain that the server
+ *     needs HTTPS (or that the desktop app can be used instead).
  */
 export const DEFAULT_PORT = 8790;
 export const DEFAULT_PATH = "/ws";
@@ -94,14 +97,16 @@ export function parseServerAddress(input: string, page: PageContext): ParseResul
   if (!host || host.startsWith(".") || host.endsWith(".") || host.includes("..")) return { ok: false, error: "invalid" };
 
   const explicitScheme = scheme !== null;
-  const secure = (scheme ?? (pageSecure ? "wss" : "ws")) === "wss";
+  const pageHost = page.hostname.includes(":") ? `[${page.hostname}]` : page.hostname;
+  const isPageHost = host === pageHost.toLowerCase();
+  const plainLoopback = pageSecure && LOOPBACK.has(host) && !isPageHost;
+  const secure = (scheme ?? (pageSecure && !plainLoopback ? "wss" : "ws")) === "wss";
 
   if (!secure && pageSecure && !LOOPBACK.has(host)) return { ok: false, error: "mixed_content" };
 
   if (!port && !explicitScheme) {
-    const pageHost = page.hostname.includes(":") ? `[${page.hostname}]` : page.hostname;
-    if (host === pageHost.toLowerCase() && page.port) port = page.port;
-    else if (!pageSecure) port = String(DEFAULT_PORT);
+    if (isPageHost && page.port) port = page.port;
+    else if (!pageSecure || plainLoopback) port = String(DEFAULT_PORT);
   }
 
   if (path === "" || path === "/") path = DEFAULT_PATH;

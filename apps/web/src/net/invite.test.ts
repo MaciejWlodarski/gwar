@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { absoluteUrl, httpOriginFromWsUrl } from "./address";
+import { OFFICIAL_WEB_ORIGIN } from "../lib/official";
 import { buildInviteLink, parseInviteLink, readInviteFromSearch } from "./invite";
 
 describe("readInviteFromSearch", () => {
@@ -36,23 +37,35 @@ describe("parseInviteLink", () => {
 });
 
 describe("buildInviteLink", () => {
-  it("is just the page's origin when the page is the server", () => {
-    expect(buildInviteLink({ pageOrigin: "https://chat.example.com", serverOrigin: "https://chat.example.com", code: "abc" })).toBe(
+  it("is just the web app's origin when it is the server too", () => {
+    expect(buildInviteLink({ webOrigin: "https://chat.example.com", serverOrigin: "https://chat.example.com", code: "abc" })).toBe(
       "https://chat.example.com/?invite=abc",
     );
   });
-  it("names the server when the page is elsewhere", () => {
-    expect(buildInviteLink({ pageOrigin: "http://127.0.0.1:5173", serverOrigin: "http://127.0.0.1:8799", code: "abc" })).toBe(
-      "http://127.0.0.1:5173/?invite=abc&server=127.0.0.1%3A8799",
+  it("names the server when it is on another origin", () => {
+    expect(buildInviteLink({ webOrigin: "https://voice.maciejwlodarski.com", serverOrigin: "https://play.example.org", code: "abc" })).toBe(
+      "https://voice.maciejwlodarski.com/?server=play.example.org&invite=abc",
+    );
+    expect(buildInviteLink({ webOrigin: "http://127.0.0.1:5173", serverOrigin: "http://127.0.0.1:8799", code: "abc" })).toBe(
+      "http://127.0.0.1:5173/?server=127.0.0.1%3A8799&invite=abc",
+    );
+    expect(buildInviteLink({ webOrigin: "https://web.example.com", serverOrigin: "https://srv.example.com:8443", code: "abc" })).toBe(
+      "https://web.example.com/?server=srv.example.com%3A8443&invite=abc",
     );
   });
-  it("points at the server in the desktop app", () => {
-    expect(buildInviteLink({ pageOrigin: "tauri://localhost", serverOrigin: "https://chat.example.com", code: "abc" })).toBe(
-      "https://chat.example.com/?invite=abc",
+  it("keeps the scheme when the server's differs from the web app's", () => {
+    expect(buildInviteLink({ webOrigin: "http://localhost:5173", serverOrigin: "https://srv.example.com", code: "abc" })).toBe(
+      "http://localhost:5173/?server=https%3A%2F%2Fsrv.example.com&invite=abc",
     );
   });
-  it("round-trips through the parser", () => {
-    const link = buildInviteLink({ pageOrigin: "http://web.test", serverOrigin: "http://srv.test:8790", code: "zz9" });
+  it("always points at the web app, never at the server (desktop app)", () => {
+    expect(buildInviteLink({ webOrigin: OFFICIAL_WEB_ORIGIN, serverOrigin: "https://chat.example.com", code: "abc" })).toBe(
+      `${OFFICIAL_WEB_ORIGIN}/?server=chat.example.com&invite=abc`,
+    );
+  });
+  it("round-trips through the reader", () => {
+    const link = buildInviteLink({ webOrigin: "http://web.test", serverOrigin: "http://srv.test:8790", code: "zz9" });
+    expect(readInviteFromSearch(new URL(link).search).target).toEqual({ code: "zz9", server: "srv.test:8790" });
     expect(parseInviteLink(link)).toEqual({ code: "zz9", server: "srv.test:8790" });
   });
 });
