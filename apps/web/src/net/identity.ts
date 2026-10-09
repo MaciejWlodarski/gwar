@@ -12,12 +12,21 @@
  * script running on our origin can read the JWK from IndexedDB; that is the
  * same trust boundary as the page itself.
  */
+import type { DeviceCertificate } from "../proto/DeviceCertificate";
 import { decodeBase64Url, encodeBase64Url } from "./base64url";
-import { kvGet, kvSet } from "./kv";
+import { kvDelete, kvGet, kvSet } from "./kv";
 
 export interface Identity {
-  /** Base64url (no padding) raw 32-byte Ed25519 public key. */
+  /**
+   * Base64url (no padding) raw 32-byte Ed25519 public key: the one that signs
+   * the challenge. For a Gwar Connect identity this is the *device* key.
+   */
   readonly publicKey: string;
+  /**
+   * Gwar Connect: the account key's certificate for `publicKey`. Sent in
+   * `hello`; the server then takes the uid from the certificate's account key.
+   */
+  readonly device?: DeviceCertificate;
   /** Signs UTF-8 bytes; returns base64url signature. */
   sign(message: Uint8Array): Promise<string>;
   /** Portable representation for backup. */
@@ -36,10 +45,41 @@ export interface IdentityStore {
 }
 
 const KEY = "identity";
+const CONNECT_KEY = "connect";
 
 export const indexedDbIdentityStore: IdentityStore = {
   load: () => kvGet<IdentityBackup>(KEY),
   save: (backup) => kvSet(KEY, backup),
+};
+
+/**
+ * What a device keeps of a Gwar Connect account: its own key and certificate,
+ * never the account key (that only exists in memory while signing in).
+ * The device private key is stored as a JWK like the local identity's.
+ * The local identity stays in its own record, so signing out restores it.
+ */
+export interface ConnectRecord {
+  version: 1;
+  handle: string;
+  /** Account public key (the uid is derived from it). */
+  accountKey: string;
+  deviceName: string;
+  deviceJwk: JsonWebKey;
+  certificate: DeviceCertificate;
+  /** Connect session token (90 days); only used to list devices. */
+  token: string;
+}
+
+export interface ConnectStore {
+  load(): Promise<ConnectRecord | undefined>;
+  save(record: ConnectRecord): Promise<void>;
+  clear(): Promise<void>;
+}
+
+export const indexedDbConnectStore: ConnectStore = {
+  load: () => kvGet<ConnectRecord>(CONNECT_KEY),
+  save: (record) => kvSet(CONNECT_KEY, record),
+  clear: () => kvDelete(CONNECT_KEY),
 };
 
 export class IdentityUnsupportedError extends Error {
@@ -71,7 +111,28 @@ function isValidBackup(value: unknown): value is IdentityBackup {
   );
 }
 
-async function fromBackup(backup: IdentityBackup): Promise<Identity> {
+function isValidConnectRecord(value: unknown): value is ConnectRecord {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Partial<ConnectRecord>;
+  const jwk = v.deviceJwk;
+  const c = v.certificate;
+  return (
+    v.version === 1 &&
+    typeof v.handle === "string" &&
+    typeof v.accountKey === "string" &&
+    typeof v.token === "string" &&
+    !!jwk &&
+    jwk.kty === "OKP" &&
+    jwk.crv === "Ed25519" &&
+    typeof jwk.x === "string" &&
+    typeof jwk.d === "string" &&
+    !!c &&
+    c.account_key === v.accountKey &&
+    c.device_key === jwk.x
+  );
+}
+
+async function fromBackup(backup: IdentityBackup, device?: DeviceCertificate): Promise<Identity> {
   const subtle = globalThis.crypto?.subtle;
   if (!subtle) throw new IdentityUnsupportedError();
   let key: CryptoKey;
@@ -83,12 +144,28 @@ async function fromBackup(backup: IdentityBackup): Promise<Identity> {
   const publicKey = backup.jwk.x as string;
   return {
     publicKey,
+    device,
     async sign(message) {
       const sig = await subtle.sign(ALGORITHM, key, message as BufferSource);
       return encodeBase64Url(new Uint8Array(sig));
     },
-    exportBackup: () => ({ ...backup, jwk: { ...backup.jwk } }),
+    exportBackup() {
+      // A device key is not the identity; exporting it would hand out a different uid.
+      if (device) throw new Error("a Gwar Connect device has no portable identity backup");
+      return { ...backup, jwk: { ...backup.jwk } };
+    },
   };
+}
+
+/** The identity of a device signed in to Gwar Connect. */
+export function identityFromConnect(record: ConnectRecord): Promise<Identity> {
+  const { kty, crv, x, d } = record.deviceJwk;
+  return fromBackup({ format: "vc-identity", version: 1, jwk: { kty, crv, x, d } }, record.certificate);
+}
+
+/** The key the uid comes from: the account key when signed in to Connect, otherwise the identity key itself. */
+export function accountKeyOf(identity: Identity): string {
+  return identity.device?.account_key ?? identity.publicKey;
 }
 
 export async function generateIdentity(): Promise<Identity> {
@@ -110,6 +187,25 @@ export async function loadOrCreateIdentity(store: IdentityStore = indexedDbIdent
   const identity = await generateIdentity();
   await store.save(identity.exportBackup());
   return identity;
+}
+
+/**
+ * The identity this device is using: the Gwar Connect one when signed in,
+ * otherwise the local one (created on first use).
+ */
+export async function loadActiveIdentity(
+  store: IdentityStore = indexedDbIdentityStore,
+  connect: ConnectStore = indexedDbConnectStore,
+): Promise<Identity> {
+  const record = await connect.load().catch(() => undefined);
+  if (record && isValidConnectRecord(record)) return identityFromConnect(record);
+  return loadOrCreateIdentity(store);
+}
+
+/** The stored Connect sign-in, if any (and valid). */
+export async function loadConnectRecord(connect: ConnectStore = indexedDbConnectStore): Promise<ConnectRecord | undefined> {
+  const record = await connect.load().catch(() => undefined);
+  return record && isValidConnectRecord(record) ? record : undefined;
 }
 
 /** Parses and installs an identity from a backup file's text. */

@@ -67,7 +67,7 @@ export interface Toast {
   text: string;
 }
 
-export type SettingsTab = "audio" | "notifications" | "appearance" | "identity" | "language";
+export type SettingsTab = "audio" | "notifications" | "appearance" | "identity" | "account" | "language";
 export type ServerSettingsTab = "overview" | "roles" | "members" | "bans" | "invites";
 
 /** Whom a moderation dialog is about: an online session and/or a known member. */

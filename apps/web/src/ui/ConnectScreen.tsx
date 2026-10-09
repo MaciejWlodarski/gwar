@@ -1,4 +1,4 @@
-import { AlertTriangle, Menu, Mic, ShieldAlert, Ticket } from "lucide-react";
+import { AlertTriangle, CloudCog, Menu, Mic, ShieldAlert, Ticket } from "lucide-react";
 import { useEffect, useState, type FormEvent } from "react";
 import { useT } from "../i18n";
 import { pageContextFromLocation, sameOriginUrl } from "../net/address";
@@ -6,6 +6,7 @@ import { parseInviteLink } from "../net/invite";
 import { controller, describeBan } from "../state/controller";
 import { isDesktop } from "../platform";
 import { useSettings, type ServerKind } from "../state/settings";
+import { useAccount } from "../state/account";
 import { useConnectUi, useSession, useUi } from "../state/stores";
 import { Avatar, Button, Field, IconButton, Input, Segmented, Switch } from "./kit";
 import { TeamSpeakBadge } from "./badges";
@@ -39,6 +40,8 @@ export function ConnectScreen() {
   const { busy, error, needPassword, serverName, invite } = useConnectUi();
   const closeReason = useSession((s) => s.closeReason);
   const setDrawer = useUi((s) => s.setDrawer);
+  const openDialog = useUi((s) => s.openDialog);
+  const account = useAccount((s) => s.account);
   const [kind, setKind] = useState<ServerKind>(desktop && !invite?.server ? lastKind : "vc");
   const [address, setAddress] = useState(invite?.server ?? lastAddress);
   const [nickname, setNickname] = useState(lastNickname);
@@ -206,6 +209,20 @@ export function ConnectScreen() {
             {busy ? t("connect.connecting") : t("connect.submit")}
           </Button>
         </form>
+
+        <button
+          type="button"
+          onClick={() => openDialog({ kind: "settings", tab: "account" })}
+          className="t -mt-2 flex w-full max-w-sm cursor-pointer items-center gap-3 rounded-lg border border-line px-3 py-2 text-left hover:bg-hover"
+        >
+          <CloudCog className="size-4 shrink-0 text-muted" />
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-sm font-medium">
+              {account ? t("account.signedInAs", { handle: account.handle }) : t("account.connectEntry")}
+            </span>
+            {!account && <span className="block truncate text-xs text-muted">{t("account.connectEntryHint")}</span>}
+          </span>
+        </button>
 
         {bookmarks.length > 0 && (
           <section aria-label={t("connect.saved")} className="w-full max-w-sm">

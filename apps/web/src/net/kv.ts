@@ -37,3 +37,17 @@ export async function kvSet(key: string, value: unknown): Promise<void> {
     db.close();
   }
 }
+
+export async function kvDelete(key: string): Promise<void> {
+  const db = await open();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE, "readwrite");
+      tx.objectStore(STORE).delete(key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error ?? new Error("indexedDB delete failed"));
+    });
+  } finally {
+    db.close();
+  }
+}

@@ -1,5 +1,6 @@
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { useEffect } from "react";
+import { accountActions } from "./state/account";
 import { useT } from "./i18n";
 import { useIsMobile } from "./lib/media";
 import { initDesktop } from "./platform/desktop";
@@ -37,6 +38,7 @@ export function App() {
   useTheme();
   useShortcuts();
   useEffect(() => controller.init(), []);
+  useEffect(() => void accountActions.load(), []);
   useEffect(() => initDesktop(), []);
 
   useEffect(() => {

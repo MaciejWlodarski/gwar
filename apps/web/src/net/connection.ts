@@ -431,6 +431,7 @@ export class Connection implements Link {
       signature,
       client,
     };
+    if (identity.device) hello.device = identity.device;
     if (serverPassword) hello.server_password = serverPassword;
     if (this.invite) hello.invite = this.invite;
     return this.send(socket, "hello", hello, timeoutMs, 1);
