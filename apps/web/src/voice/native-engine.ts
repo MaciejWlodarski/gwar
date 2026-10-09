@@ -18,6 +18,17 @@ type Handler = (value: never) => void;
 const CONNECT_TIMEOUT_MS = 15_000;
 const DEVICE_POLL_MS = 4_000;
 
+/** `voice://issue`: a device problem reported by the Rust engine. */
+interface IssuePayload {
+  side: "input" | "output";
+  kind: "no_device" | "permission_denied" | "failed";
+  message: string;
+}
+
+export function micErrorKind(kind: IssuePayload["kind"]): "no_mic" | "mic_denied" | "mic_failed" {
+  return kind === "no_device" ? "no_mic" : kind === "permission_denied" ? "mic_denied" : "mic_failed";
+}
+
 /** Run ids make stale events from a superseded session harmless. */
 let runCounter = 0;
 
@@ -109,9 +120,9 @@ export class NativeVoiceEngine implements VoiceEngine {
           if (this.state === "idle") return;
           this.emit("level", this.shape(dbToLevel(p.db)));
         }),
-        await api.listen<{ side: "input" | "output"; kind: "no_device" | "failed"; message: string }>("voice://issue", (p) => {
+        await api.listen<IssuePayload>("voice://issue", (p) => {
           if (p.side === "input") {
-            this.emit("micError", new VoiceError(p.kind === "no_device" ? "no_mic" : "mic_failed", p.message));
+            this.emit("micError", new VoiceError(micErrorKind(p.kind), p.message));
           } else {
             this.emit("outputError", new VoiceError("output_failed", p.message));
           }

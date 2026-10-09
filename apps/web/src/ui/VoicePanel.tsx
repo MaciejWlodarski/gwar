@@ -2,6 +2,7 @@ import { Headphones, HeadphoneOff, Mic, MicOff, PhoneOff, Settings, Wifi } from 
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { controller, describeVoiceError } from "../state/controller";
+import { canOpenMicrophoneSettings, openMicrophoneSettings } from "../platform";
 import { useSettings } from "../state/settings";
 import { useSession, useUi, useVoice } from "../state/stores";
 import { useMe, keyLabel, modKey } from "./hooks";
@@ -141,6 +142,14 @@ export function VoicePanel() {
       {micError && (
         <div role="alert" className="mx-3 mt-2 rounded-md bg-danger-soft px-2 py-1.5 text-xs text-danger">
           {describeVoiceError(micError)}
+          {micError.kind === "mic_denied" && canOpenMicrophoneSettings() && (
+            <button
+              className="ml-1 cursor-pointer font-medium underline underline-offset-2"
+              onClick={() => void openMicrophoneSettings().catch((e: unknown) => console.warn("[desktop] privacy settings:", e))}
+            >
+              {t("voice.openPrivacySettings")}
+            </button>
+          )}
           <button className="ml-1 cursor-pointer font-medium underline underline-offset-2" onClick={() => void controller.retryMic()}>
             {t("voice.retryMic")}
           </button>

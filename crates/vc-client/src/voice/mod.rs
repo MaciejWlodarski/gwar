@@ -7,6 +7,7 @@
 
 pub mod io;
 pub mod jitter;
+pub mod permission;
 mod rtc;
 
 use std::{

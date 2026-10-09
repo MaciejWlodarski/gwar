@@ -207,6 +207,7 @@ export const pl: Record<Key, string> = {
   "voice.failed": "Głos niedostępny",
   "voice.retry": "Ponów",
   "voice.retryMic": "Spróbuj ponownie",
+  "voice.openPrivacySettings": "Otwórz ustawienia prywatności",
   "voice.leave": "Opuść kanał głosowy",
   "voice.notIn": "Poza kanałem głosowym",
   "voice.notInHint": "Kliknij kanał dwukrotnie, aby rozmawiać",
@@ -297,7 +298,7 @@ export const pl: Record<Key, string> = {
   "err.req.lost": "Jesteś offline. Łączenie ponownie…",
 
   "err.voice.mic_denied": "Dostęp do mikrofonu jest zablokowany. Nadal możesz pisać i słuchać. Zezwól na mikrofon w ustawieniach witryny w przeglądarce, aby mówić.",
-  "err.voice.mic_denied_desktop": "Dostęp do mikrofonu jest zablokowany. Nadal możesz pisać i słuchać. Zezwól aplikacji Voice na mikrofon w ustawieniach prywatności systemu.",
+  "err.voice.mic_denied_desktop": "Dostęp do mikrofonu jest zablokowany. Nadal możesz pisać i słuchać. Zezwól aplikacji Gwar na mikrofon w ustawieniach prywatności systemu.",
   "err.voice.output_failed": "Nie udało się otworzyć głośników. Sprawdź urządzenie wyjściowe w ustawieniach.",
   "err.voice.no_mic": "Nie znaleziono mikrofonu. Nadal możesz pisać i słuchać.",
   "err.voice.mic_failed": "Nie udało się otworzyć mikrofonu (czy używa go inna aplikacja?). Nadal możesz pisać i słuchać.",

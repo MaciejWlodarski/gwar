@@ -77,6 +77,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| tray::show_main(app)))
         .plugin(tauri_plugin_window_state::Builder::default().build())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_notification::init())
         // TODO: tauri-plugin-autostart (launch at login) once there is a setting for it.
         .manage(voice::Voice::default())
         .manage(shortcuts::Shortcuts::default())
@@ -110,6 +111,7 @@ pub fn run() {
             voice::audio_devices,
             voice::mic_test_start,
             voice::mic_test_stop,
+            voice::open_mic_privacy_settings,
             shortcuts::set_global_shortcut,
             ts::ts_connect,
             ts::ts_request,

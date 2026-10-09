@@ -20,7 +20,7 @@ async fn main() -> anyhow::Result<()> {
     })
     .await?;
     let me = ts.welcome.session;
-    let channel = ts.welcome.clients.iter().find(|c| c.id == me).map(|c| c.channel).unwrap_or(1);
+    let channel = ts.welcome.clients.iter().find(|c| c.id == me).and_then(|c| c.channel).unwrap_or(1);
     println!("connected as {me} in channel {channel}");
     let t = Instant::now();
 

@@ -3,6 +3,6 @@
 <plist version="1.0">
 <dict>
   <key>NSMicrophoneUsageDescription</key>
-  <string>Voice needs the microphone so other people in your channel can hear you.</string>
+  <string>Gwar needs the microphone so others can hear you.</string>
 </dict>
 </plist>

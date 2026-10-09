@@ -9,6 +9,7 @@
 //! - `voice://state`   `{run, state}`          `connected` | `failed`
 //! - `voice://level`   `{db, transmitting}`    ~20 Hz while the window is visible
 //! - `voice://issue`   `{side, kind, message}` device problems (`input`/`output`)
+//!   with `kind` = `no_device` | `permission_denied` (input only) | `failed`
 //! - `voice://test-level {db}`                 microphone test in settings
 
 use std::{
@@ -27,7 +28,7 @@ use tokio::sync::oneshot;
 use vc_client::voice::{
     InputMode, LinkState, VoiceHandle,
     io::{AudioIo, DeviceIo, DeviceIssue, IssueSink},
-    start_teamspeak, start_with,
+    permission, start_teamspeak, start_with,
 };
 use vc_proto::AUDIO_SLOTS;
 
@@ -182,11 +183,14 @@ struct IssuePayload {
 fn issue_sink(app: &AppHandle) -> IssueSink {
     let app = app.clone();
     Arc::new(move |issue| {
+        let denied = matches!(issue, DeviceIssue::InputDenied(_));
         let (side, message) = match issue {
-            DeviceIssue::Input(m) => ("input", m),
+            DeviceIssue::Input(m) | DeviceIssue::InputDenied(m) => ("input", m),
             DeviceIssue::Output(m) => ("output", m),
         };
-        let kind = if message.contains("no microphone found") || message.contains("no output device found") {
+        let kind = if denied {
+            "permission_denied"
+        } else if message.contains("no microphone found") || message.contains("no output device found") {
             "no_device"
         } else {
             "failed"
@@ -209,7 +213,11 @@ impl AudioIo for FallbackIo {
             Ok(ports) => Ok(ports),
             Err(e) => {
                 tracing::warn!("no usable audio devices: {e:#}");
-                sink(DeviceIssue::Input(format!("no microphone found: {e:#}")));
+                if permission::is_denied(&e) {
+                    sink(DeviceIssue::InputDenied(format!("{e:#}")));
+                } else {
+                    sink(DeviceIssue::Input(format!("no microphone found: {e:#}")));
+                }
                 sink(DeviceIssue::Output(format!("no output device found: {e:#}")));
                 Box::new(NullIo).open()
             }
@@ -533,4 +541,20 @@ pub fn mic_test_stop(voice: State<'_, Voice>) {
     if let Some(stop) = voice.mic_test.lock().unwrap_or_else(|e| e.into_inner()).take() {
         stop.store(true, Ordering::Relaxed);
     }
+}
+
+// ------------------------------------------------------------ privacy settings
+
+/// Opens the operating system's microphone privacy page, so the user can allow
+/// Gwar after refusing the prompt. Errors on platforms without such a page.
+#[tauri::command]
+pub fn open_mic_privacy_settings() -> Result<(), String> {
+    let url = if cfg!(target_os = "macos") {
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+    } else if cfg!(target_os = "windows") {
+        "ms-settings:privacy-microphone"
+    } else {
+        return Err("this system has no microphone privacy settings".into());
+    };
+    open::that(url).map_err(|e| format!("cannot open {url}: {e}"))
 }
