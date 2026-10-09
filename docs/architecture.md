@@ -20,6 +20,16 @@ flowchart LR
   Desk -. TeamSpeak mode: TS UDP .-> EXT[Any TS3/TS6 server]
 ```
 
+## Deployment model
+
+People run **servers**; the project runs the **web app** (one origin, today
+`https://voice.maciejwlodarski.com`, see `OFFICIAL_WEB_ORIGIN`), which connects
+to any server over `wss://`. Hence servers need HTTPS: `--domain` gets and
+renews a Let's Encrypt certificate inside the server (`src/tls.rs`), and
+uploads accept cross-origin requests from the web app's origin only (CORS on
+the file routes; uploads are authorized by one-time tokens, not cookies). The
+desktop app connects anywhere, including plain `ws://` on a LAN.
+
 ## Principles
 
 - **One owner of state.** `core` is an actor (a single tokio task): every

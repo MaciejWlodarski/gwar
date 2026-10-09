@@ -44,6 +44,9 @@ async fn server() -> Running {
         public_url: None,
         upload_limit: 10 * 1024 * 1024,
         files_dir: None,
+        web_origins: Vec::new(),
+        tls: None,
+        redirect_http: None,
     })
     .await
     .unwrap()

@@ -4,6 +4,9 @@
 talk from the browser or the desktop app, and keep your friends who still use
 TeamSpeak in the same conversation.
 
+**Use it:** the web app at <https://voice.maciejwlodarski.com> (it will move to
+a Gwar domain) connects to any Gwar server; so does the desktop app.
+
 *Gwar* is Polish for the buzz of many voices talking at once.
 
 ![Gwar desktop app](docs/screenshot.png)
@@ -27,11 +30,16 @@ use.
   channel history, private and server-wide messages, a member list with online
   and offline users.
 - **Your identity is a key, not an account.** Every client holds an Ed25519
-  key; there is no central sign-up and it works on any Gwar server. Admin
-  rights are handed out with one-time tokens.
-- **Web and desktop clients with one UI.** A React web app, and a Tauri 2
-  desktop app with a native audio engine (Opus with FEC, jitter buffer with
-  loss concealment), global push-to-talk and a tray icon. English and Polish.
+  key; there is no central sign-up and it works on any Gwar server.
+- **Moderation.** Roles with any permissions and colors, bans (timed or
+  permanent, by identity or IP), invite links that can grant a role, server
+  settings. Nobody can hand out more than they hold.
+- **Chat like you expect.** Mentions with notifications, editing and deleting,
+  images, video, audio and files (drag and drop or paste).
+- **One web app, plus a desktop app, with one UI.** The project hosts the web
+  app; it connects to any server. The Tauri 2 desktop app has a native audio
+  engine (Opus with FEC, jitter buffer with loss concealment), global
+  push-to-talk and a tray icon. English and Polish.
 - **TeamSpeak in both directions.**
   - Official TeamSpeak 3 and 6 clients can join a Gwar server (optional, see
     below). They see the same channels and people, and talk and chat with
@@ -42,22 +50,46 @@ use.
 Gwar is early software: it works and is tested end to end, but expect rough
 edges and breaking changes.
 
-## Quick start
+## Run a server
+
+You run only the server; people connect with the official web app or the
+desktop app. The web app is served over HTTPS, so browsers can only reach
+servers that have HTTPS too, which the server can do on its own:
+
+```bash
+cargo build --release -p vc-server
+./target/release/vc-server --data-dir data --domain voice.example.com --acme-email you@example.com
+```
+
+With `--domain` the server gets a certificate from Let's Encrypt and renews it
+by itself (it answers the challenge on port 443, so nothing else is needed),
+listens for HTTPS on 443 and redirects plain HTTP from port 80. Open
+**TCP 443** (and 80 for the redirect) and **UDP 9987** for voice. Already have a
+certificate or a reverse proxy? Use `--tls-cert`/`--tls-key`, or plain HTTP on
+`--http` behind your proxy. `--public-ip` sets the address announced for voice
+when the server is behind NAT; `vc-server --help` lists every option.
+
+On first start the server prints a one-time **admin token**; open the web app,
+connect to `voice.example.com` and redeem it from the server menu ("Use
+token"). Get another one with `vc-server --data-dir data admin-token`.
+
+The desktop app also connects to servers without HTTPS (e.g. on a LAN).
+
+## Develop
 
 Requirements: Rust (stable), Node 22+, pnpm, and libopus for the native clients
 (`brew install opus` or `apt install libopus-dev libasound2-dev`).
 
 ```bash
 pnpm install
-pnpm --filter web build
-cargo run -p vc-server -- --data-dir data --web-root apps/web/dist
+cargo run -p vc-server -- --data-dir data        # server on http://localhost:8790
+pnpm --filter web dev                            # web app on http://localhost:5173
+pnpm --filter desktop dev                        # desktop app
 ```
 
-Open <http://localhost:8790>. On first start the server prints a one-time
-**admin token**; redeem it from the server menu ("Use token"). Get another one
-with `cargo run -p vc-server -- --data-dir data admin-token`.
-
-Desktop app: `pnpm --filter desktop dev`.
+`--web-root apps/web/dist` makes the server serve a built web app itself (handy
+for development or a private network). Uploads from a web app on another
+origin are allowed for the official web app and for `--web-origin` entries.
 
 Microphone permission on the desktop app: macOS asks on first use (the bundled
 app carries `NSMicrophoneUsageDescription` and the audio-input entitlement), and
@@ -66,13 +98,6 @@ Windows or macOS users who blocked it get an "Open privacy settings" button.
 System Settings entry) to the terminal you started it from; test the real flow
 with `pnpm --filter desktop build`. To reset a decision while testing:
 `tccutil reset Microphone app.gwar.desktop`.
-
-## Self-hosting
-
-Open **TCP 8790** (or 443 behind a reverse proxy with HTTPS, which browsers
-require for microphone access) and **UDP 9987** for WebRTC voice.
-`--public-ip` sets the address announced to clients when the server is behind
-NAT. `vc-server --help` lists every option.
 
 ## TeamSpeak compatibility
 
@@ -111,7 +136,7 @@ build without it with `--no-default-features`.
 | `crates/vc-server` | Server: core (state, permissions, SQLite), WebSocket gateway, WebRTC SFU, TeamSpeak bridge |
 | `crates/vc-proto` | The `vc/1` protocol (Rust types, generated TypeScript types) |
 | `crates/vc-client` | Native client: protocol, voice engine, TeamSpeak mode |
-| `apps/web` | The shared UI (React), in the browser and the desktop app |
+| `apps/web` | The shared UI (React): the hosted web app and the desktop app's UI |
 | `apps/desktop` | Tauri 2 desktop app: native voice, global push-to-talk, tray |
 | `scripts/deploy-vm.sh` | Deploys a server to a Linux host over SSH |
 
@@ -133,7 +158,6 @@ VC_TS3_DIR=/tmp/ts3 cargo test -p vc-client --test teamspeak_mode --test teamspe
 - **Streaming**: screen sharing and video, peer to peer and through the server.
 - **Better audio on desktop**: noise suppression and echo cancellation.
 - **Fully native clients** later, keeping the same protocol.
-- **Roles and permissions UI**, notifications and mentions.
 - **More TeamSpeak options**: bring your own TeamSpeak license for more slots,
   and a mixed stand-in so Gwar users can still talk when the free slots run out.
 

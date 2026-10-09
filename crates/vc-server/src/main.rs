@@ -11,6 +11,7 @@ use vc_server::{
     Config, TeamSpeakConfig,
     core::issue_token,
     store::{ADMIN_GROUP, Store},
+    tls::Tls,
 };
 
 #[derive(Parser)]
@@ -19,9 +20,31 @@ struct Cli {
     /// Directory for the database and server state.
     #[arg(long, env = "VC_DATA_DIR", default_value = "data")]
     data_dir: PathBuf,
-    /// HTTP/WebSocket listen address.
-    #[arg(long, env = "VC_HTTP", default_value = "0.0.0.0:8790")]
-    http: SocketAddr,
+    /// HTTP(S)/WebSocket listen address [default: 0.0.0.0:443 with HTTPS, else 0.0.0.0:8790].
+    #[arg(long, env = "VC_HTTP")]
+    http: Option<SocketAddr>,
+    /// Serve HTTPS for this domain with a certificate from Let's Encrypt,
+    /// obtained and renewed automatically (repeat for more names).
+    #[arg(long = "domain", env = "VC_DOMAIN", value_delimiter = ',')]
+    domains: Vec<String>,
+    /// Contact address for Let's Encrypt (expiry notices).
+    #[arg(long, env = "VC_ACME_EMAIL")]
+    acme_email: Option<String>,
+    /// Use Let's Encrypt's staging environment (for testing; untrusted certificates).
+    #[arg(long, env = "VC_ACME_STAGING", value_parser = clap::builder::BoolishValueParser::new())]
+    acme_staging: bool,
+    /// Serve HTTPS with this PEM certificate chain (instead of --domain).
+    #[arg(long, env = "VC_TLS_CERT", requires = "tls_key", conflicts_with = "domains")]
+    tls_cert: Option<PathBuf>,
+    /// Private key for --tls-cert (PEM).
+    #[arg(long, env = "VC_TLS_KEY", requires = "tls_cert")]
+    tls_key: Option<PathBuf>,
+    /// With HTTPS, don't redirect plain HTTP on port 80.
+    #[arg(long, env = "VC_NO_HTTP_REDIRECT", value_parser = clap::builder::BoolishValueParser::new())]
+    no_http_redirect: bool,
+    /// Extra web app origins allowed to upload files (the official one always is).
+    #[arg(long = "web-origin", env = "VC_WEB_ORIGINS", value_delimiter = ',')]
+    web_origins: Vec<String>,
     /// UDP address for WebRTC voice [default: 0.0.0.0:9987, or 0.0.0.0:9988 with --teamspeak,
     /// which leaves 9987 to TeamSpeak clients].
     #[arg(long, env = "VC_MEDIA")]
@@ -33,7 +56,8 @@ struct Cli {
     max_clients: u32,
     #[arg(long, env = "VC_SERVER_PASSWORD")]
     server_password: Option<String>,
-    /// Directory with the built web client to serve at `/`.
+    /// Also serve a built web client at `/` (development or private networks;
+    /// people normally use the official web app or the desktop app).
     #[arg(long, env = "VC_WEB_ROOT")]
     web_root: Option<PathBuf>,
     /// JSON file with additional ICE (TURN) servers handed to clients.
@@ -108,6 +132,23 @@ async fn main() -> Result<()> {
     if cli.teamspeak && media.port() == cli.teamspeak_voice.port() {
         anyhow::bail!("--media and --teamspeak-voice need different UDP ports");
     }
+    let tls = match (&cli.tls_cert, &cli.tls_key, cli.domains.is_empty()) {
+        (Some(cert), Some(key), _) => Some(Tls::Files { cert: cert.clone(), key: key.clone() }),
+        (_, _, false) => Some(Tls::Acme {
+            domains: cli.domains.clone(),
+            email: cli.acme_email.clone(),
+            cache: cli.data_dir.join("acme"),
+            staging: cli.acme_staging,
+        }),
+        _ => None,
+    };
+    let http_bind = cli.http.unwrap_or_else(|| ([0, 0, 0, 0], if tls.is_some() { 443 } else { 8790 }).into());
+    let redirect_http = (tls.is_some() && !cli.no_http_redirect).then(|| SocketAddr::from(([0, 0, 0, 0], 80)));
+    // Links to uploads (posted to TeamSpeak) need the public origin.
+    let public_url = cli.public_url.clone().or_else(|| cli.domains.first().map(|d| format!("https://{d}")));
+    let mut web_origins = vec![vc_server::OFFICIAL_WEB_ORIGIN.to_owned()];
+    web_origins.extend(public_url.clone());
+    web_origins.extend(cli.web_origins.iter().map(|o| o.trim_end_matches('/').to_owned()));
     let ip = cli
         .public_ip
         .or_else(|| (!media.ip().is_unspecified()).then(|| media.ip()))
@@ -115,7 +156,7 @@ async fn main() -> Result<()> {
         .context("cannot determine media IP; pass --public-ip")?;
     let running = vc_server::start(Config {
         database: Some(database),
-        http_bind: cli.http,
+        http_bind,
         media_bind: media,
         media_advertise: SocketAddr::new(ip, media.port()),
         max_clients: cli.max_clients,
@@ -127,11 +168,14 @@ async fn main() -> Result<()> {
             voice: cli.teamspeak_voice,
             query_port: cli.teamspeak_query_port,
             filetransfer: ([127, 0, 0, 1], 30033).into(),
-            public_url: cli.public_url.clone(),
+            public_url: public_url.clone(),
         }),
-        public_url: cli.public_url.clone(),
+        public_url: public_url.clone(),
         upload_limit: cli.upload_limit_mb * 1024 * 1024,
         files_dir: Some(cli.data_dir.join("files")),
+        web_origins,
+        tls,
+        redirect_http,
     })
     .await?;
     tracing::info!(http = %running.http, media = %running.media, teamspeak = ?running.teamspeak, "server ready");

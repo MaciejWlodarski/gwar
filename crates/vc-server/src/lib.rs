@@ -15,11 +15,13 @@ pub mod media;
 pub mod store;
 #[cfg(feature = "teamspeak")]
 pub mod teamspeak;
+pub mod tls;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
+use axum::http::{HeaderValue, Method, header};
 use axum::{
     Router,
     extract::DefaultBodyLimit,
@@ -29,7 +31,10 @@ use tokio::{
     net::{TcpListener, UdpSocket},
     sync::mpsc,
 };
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    services::{ServeDir, ServeFile},
+};
 use vc_proto::IceServer;
 
 use crate::{
@@ -59,7 +64,17 @@ pub struct Config {
     pub upload_limit: u64,
     /// Where uploads are stored; `None` uses a temporary directory (tests).
     pub files_dir: Option<PathBuf>,
+    /// Web app origins allowed to upload cross-origin (see [`OFFICIAL_WEB_ORIGIN`]).
+    pub web_origins: Vec<String>,
+    /// HTTPS for the HTTP listener; `None` serves plain HTTP (behind a proxy, or tests).
+    pub tls: Option<tls::Tls>,
+    /// Also answer plain HTTP here with a redirect to HTTPS.
+    pub redirect_http: Option<SocketAddr>,
 }
+
+/// Where the project hosts the web app that connects to every Gwar server.
+/// (Moves to the Gwar domain later.)
+pub const OFFICIAL_WEB_ORIGIN: &str = "https://voice.maciejwlodarski.com";
 
 /// The official TeamSpeak server to run and bridge (needs the `teamspeak` feature).
 pub struct TeamSpeakConfig {
@@ -160,12 +175,23 @@ pub async fn start(config: Config) -> Result<Running> {
         None => (None, None),
     };
     let gateway = Gateway { core: core.clone(), password };
-    let mut app = Router::new()
-        .route("/ws", get(gateway::upgrade))
-        .route("/health", get(|| async { "ok" }))
+    // The web app runs on another origin than this server: let it upload and
+    // fetch files. Uploads are authorized by one-time tokens, not cookies.
+    let origins: Vec<HeaderValue> = config.web_origins.iter().filter_map(|o| o.parse().ok()).collect();
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([Method::GET, Method::PUT])
+        .allow_headers([header::CONTENT_TYPE, header::RANGE])
+        .max_age(std::time::Duration::from_secs(3600));
+    let files_routes = Router::new()
         // Uploads enforce their own reserved size.
         .route("/api/files/{id}", put(files::upload).layer(DefaultBodyLimit::disable()))
         .route("/files/{id}/{name}", get(files::download))
+        .layer(cors);
+    let mut app = Router::new()
+        .route("/ws", get(gateway::upgrade))
+        .route("/health", get(|| async { "ok" }))
+        .merge(files_routes)
         .with_state(gateway);
     if let Some(root) = config.web_root {
         let index = root.join("index.html");
@@ -173,11 +199,13 @@ pub async fn start(config: Config) -> Result<Running> {
     }
     let listener = TcpListener::bind(config.http_bind).await.context("bind HTTP listener")?;
     let http = listener.local_addr()?;
-    tasks.push(tokio::spawn(async move {
-        let app = app.into_make_service_with_connect_info::<SocketAddr>();
-        if let Err(e) = axum::serve(listener, app).await {
-            tracing::error!("http server: {e}");
+    tasks.extend(tls::serve(listener, app, config.tls).await?);
+    if let Some(bind) = config.redirect_http {
+        match tls::redirect_to_https(bind).await {
+            Ok(task) => tasks.push(task),
+            // Port 80 is optional (certificates come over 443).
+            Err(e) => tracing::warn!("{e:#}"),
         }
-    }));
+    }
     Ok(Running { http, media: advertise, core, plane, teamspeak, teamspeak_ready, admin_token, tasks })
 }
