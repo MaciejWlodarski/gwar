@@ -280,7 +280,8 @@ export const en = {
   "err.addr.empty": "Enter a server address.",
   "err.addr.invalid": "That server address doesn't look right.",
   "err.addr.scheme": "Only ws://, wss://, http:// and https:// addresses are supported.",
-  "err.addr.mixed_content": "This page is secure (https), so the server must be too. Use wss:// or https://.",
+  "err.addr.mixed_content": "This server doesn't use HTTPS, so the web app can't connect to it. Ask its owner to enable HTTPS, or use the desktop app.",
+  "err.connect.unreachableHttps": "Can't reach the server. Check the address and that the server is running. The web app can only connect to servers that use HTTPS; if this one doesn't, ask its owner to enable it, or use the desktop app.",
 
   "err.req.bad_request": "The server didn't accept that",
   "err.req.not_authenticated": "You are not signed in.",

@@ -11,7 +11,8 @@ export async function saveFile(url: string, name: string): Promise<boolean> {
   const a = document.createElement("a");
   a.href = url;
   a.download = name;
-  // Cross-origin links ignore `download`; keep the app's page in place if the browser shows the file instead.
+  // The server is usually another origin, where browsers ignore `download` (the server's `Content-Disposition: attachment`
+  // still makes non-images download). Keep the app's page in place if the browser shows the file instead.
   a.target = "_blank";
   a.rel = "noopener noreferrer";
   document.body.appendChild(a);

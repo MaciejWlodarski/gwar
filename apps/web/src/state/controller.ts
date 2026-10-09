@@ -104,6 +104,8 @@ export function describeConnectFailure(f: ConnectFailure): string {
     // Older servers only describe the ban in the message.
     return f.ban ? describeBan({ until: f.ban.until ?? null, reason: f.ban.reason ?? null }, f.ban.by) : describeBan(parseBanMessage(f.message));
   }
+  // From an https page only wss:// servers are reachable; a bare address that fails is most often one without HTTPS.
+  if (f.kind === "unreachable" && !isDesktop() && window.location.protocol === "https:") return tNow("err.connect.unreachableHttps");
   return tNow(`err.connect.${f.kind}` as Key, { server: f.serverName ?? "" });
 }
 

@@ -19,6 +19,7 @@ import {
   toggleGroup,
 } from "../lib/permissions";
 import { formatRelative, formatUntil } from "../lib/time";
+import { webOrigin } from "../lib/official";
 import { buildInviteLink } from "../net/invite";
 import type { Ban as BanEntry } from "../proto/Ban";
 import type { Group } from "../proto/Group";
@@ -711,7 +712,7 @@ export function InvitesPanel() {
   }, []);
 
   const link = (code: string) =>
-    buildInviteLink({ pageOrigin: window.location.origin, serverOrigin: httpOrigin ?? window.location.origin, code });
+    buildInviteLink({ webOrigin: webOrigin(), serverOrigin: httpOrigin ?? webOrigin(), code });
 
   const create = async (e?: FormEvent) => {
     e?.preventDefault();

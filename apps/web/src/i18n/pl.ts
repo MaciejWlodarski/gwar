@@ -282,7 +282,8 @@ export const pl: Record<Key, string> = {
   "err.addr.empty": "Wpisz adres serwera.",
   "err.addr.invalid": "Ten adres serwera wygląda niepoprawnie.",
   "err.addr.scheme": "Obsługiwane są tylko adresy ws://, wss://, http:// i https://.",
-  "err.addr.mixed_content": "Ta strona jest bezpieczna (https), więc serwer też musi taki być. Użyj wss:// lub https://.",
+  "err.addr.mixed_content": "Ten serwer nie używa HTTPS, więc aplikacja webowa nie może się z nim połączyć. Poproś jego właściciela o włączenie HTTPS albo użyj aplikacji desktopowej.",
+  "err.connect.unreachableHttps": "Nie można połączyć się z serwerem. Sprawdź adres i czy serwer działa. Aplikacja webowa łączy się tylko z serwerami z HTTPS; jeśli ten go nie ma, poproś właściciela o włączenie go albo użyj aplikacji desktopowej.",
 
   "err.req.bad_request": "Serwer nie przyjął tego żądania",
   "err.req.not_authenticated": "Nie jesteś zalogowany.",
