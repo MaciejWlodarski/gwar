@@ -44,6 +44,8 @@ const LATENCY_PORT = 8797;
 const CLIENT_ADDR = LATENCY_MS > 0 ? `127.0.0.1:${LATENCY_PORT}` : SERVER;
 const rid = Math.random().toString(16).slice(2, 6);
 const GAMES = `Games-${rid}`;
+// A second channel of the run (the server may be shared, so no seed names).
+const TALK = `Talk-${rid}`;
 const CHESS = `Chess-${rid}`;
 const CLUB = `Club-${rid}`;
 const SECRET = `Secret-${rid}`;
@@ -384,6 +386,11 @@ async function main() {
     await a.getByRole("button", { name: "Create" }).click();
     await treeItem(a, GAMES).waitFor();
     await treeItem(b, GAMES).waitFor();
+    await a.getByRole("button", { name: "Server menu" }).click();
+    await a.getByRole("menuitem", { name: "Create channel" }).click();
+    await a.getByLabel("Name").fill(TALK);
+    await a.getByRole("button", { name: "Create" }).click();
+    await treeItem(b, TALK).waitFor();
 
     await treeItem(a, GAMES).click({ button: "right" });
     await a.getByRole("menuitem", { name: "Create subchannel" }).click();
@@ -500,25 +507,25 @@ async function main() {
 
   console.log("chat without voice");
   await check("chatting in a channel without being in its voice works for both users", async () => {
-    // Both stay in Games voice and talk in General's chat.
-    await treeItem(a, /General/).click();
-    await composer(a).fill(`Alice writes in General ${rid}`);
+    // Both stay in Games voice and talk in Talk's chat.
+    await treeItem(a, TALK).click();
+    await composer(a).fill(`Alice writes in Talk ${rid}`);
     await composer(a).press("Enter");
-    await treeItem(b, /General/).click();
-    await b.getByText(`Alice writes in General ${rid}`).waitFor();
-    await composer(b).fill(`Bob answers in General ${rid}`);
+    await treeItem(b, TALK).click();
+    await b.getByText(`Alice writes in Talk ${rid}`).waitFor();
+    await composer(b).fill(`Bob answers in Talk ${rid}`);
     await composer(b).press("Enter");
-    await a.getByText(`Bob answers in General ${rid}`).waitFor();
-    // Nobody moved: both are still listed under Games, nobody under General.
+    await a.getByText(`Bob answers in Talk ${rid}`).waitFor();
+    // Nobody moved: both are still listed under Games, nobody under Talk.
     for (const p of [a, b]) {
       await treeItem(p, GAMES).locator("xpath=..").getByText("Bob").waitFor();
       await treeItem(p, GAMES).locator("xpath=..").getByText("Alice").waitFor();
-      if ((await treeItem(p, /General/).locator("xpath=..").getByText(/Alice|Bob/).count()) !== 0) throw new Error("someone joined General voice");
+      if ((await treeItem(p, TALK).locator("xpath=..").getByText(/Alice|Bob/).count()) !== 0) throw new Error("someone joined Talk voice");
     }
     // Bob's own chat history survives going to another chat and coming back.
     await treeItem(b, GAMES).click();
-    await treeItem(b, /General/).click();
-    await b.getByText(`Alice writes in General ${rid}`).waitFor();
+    await treeItem(b, TALK).click();
+    await b.getByText(`Alice writes in Talk ${rid}`).waitFor();
   });
 
   await check("unread badge appears for the other user and clears when they open the channel", async () => {
@@ -527,13 +534,13 @@ async function main() {
     await composer(a).press("Enter");
     await composer(a).fill(`unread two ${rid}`);
     await composer(a).press("Enter");
-    const badge = treeItem(b, /General/).getByTitle("2 unread");
+    const badge = treeItem(b, TALK).getByTitle("2 unread");
     await badge.waitFor({ timeout: 8000 });
     // The sender has nothing unread in the channel she is looking at.
-    if ((await treeItem(a, /General/).getByTitle(/unread/).count()) !== 0) throw new Error("sender sees an unread badge");
+    if ((await treeItem(a, TALK).getByTitle(/unread/).count()) !== 0) throw new Error("sender sees an unread badge");
     await shot(b, "03b-unread-badge-dark");
     const seen = fb.events("chat.read").length;
-    await treeItem(b, /General/).click();
+    await treeItem(b, TALK).click();
     await badge.waitFor({ state: "detached" });
     await b.getByText(`unread two ${rid}`).waitFor();
     // The read position is reported to the server (and echoed back to this user's devices).
@@ -726,8 +733,8 @@ async function main() {
   });
 
   await check("dragging a user onto a channel moves them (admin)", async () => {
-    await treeItem(a, /Bob/).dragTo(treeItem(a, /General/));
-    await b.getByRole("tab", { name: /General/ }).waitFor({ timeout: 5000 });
+    await treeItem(a, /Bob/).dragTo(treeItem(a, TALK));
+    await b.getByRole("tab", { name: TALK }).waitFor({ timeout: 5000 });
   });
 
   await check("microphone denied: friendly message, chat still works", async () => {
@@ -805,8 +812,8 @@ async function main() {
 
   const hello = `hey @Bob mention ${rid}`;
   await check("mention: autocomplete in the composer, a badge and a highlight for the mentioned user", async () => {
-    await treeItem(b, GAMES).click(); // Bob looks at another chat, so General counts as unread
-    await treeItem(a, /General/).click();
+    await treeItem(b, GAMES).click(); // Bob looks at another chat, so Talk counts as unread
+    await treeItem(a, TALK).click();
     await composer(a).click();
     await composer(a).pressSequentially("hey @Bo");
     await a.getByRole("option", { name: /Bob/ }).waitFor();
@@ -815,8 +822,8 @@ async function main() {
     if ((await composer(a).inputValue()) !== "hey @Bob ") throw new Error(`unexpected composer text: ${await composer(a).inputValue()}`);
     await composer(a).pressSequentially(`mention ${rid}`);
     await composer(a).press("Enter");
-    await treeItem(b, /General/).getByTitle("Mentions of you: 1").waitFor({ timeout: 8000 });
-    await treeItem(b, /General/).click();
+    await treeItem(b, TALK).getByTitle("Mentions of you: 1").waitFor({ timeout: 8000 });
+    await treeItem(b, TALK).click();
     const msg = b.locator("[data-mentions-me]").filter({ hasText: hello });
     await msg.waitFor();
     await msg.locator('[data-mention]').getByText("@Bob").waitFor();
@@ -824,7 +831,7 @@ async function main() {
     if ((await a.locator("[data-mentions-me]").count()) !== 0) throw new Error("the author sees a mention highlight");
     await shot(b, "22-mention-highlight-dark");
     // The mention badge is gone once read.
-    await treeItem(b, /General/).getByTitle(/Mentions of you/).waitFor({ state: "detached" });
+    await treeItem(b, TALK).getByTitle(/Mentions of you/).waitFor({ state: "detached" });
   });
 
   await check("a message can be edited (Up arrow) and deleted; the other user sees both", async () => {
@@ -996,7 +1003,7 @@ async function main() {
     await a.keyboard.press("Escape");
     await b.getByRole("button", { name: "Connect" }).click();
     await b.getByText("Not in voice").waitFor({ timeout: 20000 });
-    await treeItem(b, /General/).dblclick();
+    await treeItem(b, TALK).dblclick();
     await b.getByText("Voice connected").waitFor({ timeout: 20000 });
     await treeItem(a, /Bob/).waitFor();
   });
@@ -1087,7 +1094,7 @@ async function main() {
   }
 
   await check("test channels are cleaned up", async () => {
-    for (const name of [GAMES, SECRET, BULK]) {
+    for (const name of [GAMES, TALK, SECRET, BULK]) {
       await treeItem(a, name).click({ button: "right" });
       await a.getByRole("menuitem", { name: "Delete" }).click();
       await a.getByRole("dialog").getByRole("button", { name: "Delete" }).click();
