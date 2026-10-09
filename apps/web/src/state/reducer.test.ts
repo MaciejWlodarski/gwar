@@ -294,9 +294,9 @@ describe("unread", () => {
         channels: [ch(1), ch(2), ch(3)],
         clients: [cl(1, null)],
         unread: [
-          { channel: 1, last_read: 4, count: 3 },
-          { channel: 2, last_read: 0, count: 100 },
-          { channel: 77, last_read: 0, count: 5 },
+          { channel: 1, last_read: 4, count: 3, mentions: 0 },
+          { channel: 2, last_read: 0, count: 100, mentions: 0 },
+          { channel: 77, last_read: 0, count: 5, mentions: 0 },
         ],
       }),
     });

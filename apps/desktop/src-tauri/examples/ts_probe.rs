@@ -24,7 +24,15 @@ async fn main() -> anyhow::Result<()> {
     println!("connected as {me} in channel {channel}");
     let t = Instant::now();
 
-    let r = ts.handle.request(Request::ChatSend { target: ChatTarget::Channel(channel), text }).await;
+    let r = ts
+        .handle
+        .request(Request::ChatSend {
+            target: ChatTarget::Channel(channel),
+            text,
+            mentions: Vec::new(),
+            attachments: Vec::new(),
+        })
+        .await;
     println!("chat reply after {:?}: {r:?}", t.elapsed());
     Ok(())
 }

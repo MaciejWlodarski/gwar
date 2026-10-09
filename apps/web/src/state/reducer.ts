@@ -209,6 +209,14 @@ function channelNotices(prev: SessionState, next: SessionState, at: number, id: 
 
 function reduceEvent(state: SessionState, event: Event, now: number): SessionState {
   switch (event.ev) {
+    // Not shown yet.
+    case "chat.edited":
+    case "chat.deleted":
+    case "group.created":
+    case "group.updated":
+    case "group.deleted":
+    case "member.updated":
+      return state;
     case "server.updated":
       return { ...state, server: event.d };
     case "channel.created":
