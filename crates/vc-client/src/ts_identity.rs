@@ -8,14 +8,17 @@
 use std::{io::Write, path::Path};
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use sha1::{Digest, Sha1};
 pub use tsclientlib::Identity;
+use tsproto_types::crypto::EccKeyPrivP256;
 
 /// Most servers require a security level of at least 8 to connect.
 pub const MIN_LEVEL: u8 = 8;
 
 /// A new identity at level [`MIN_LEVEL`]. tsproto cannot read back a key whose private scalar starts with
-/// a zero byte (one in 256: its DER form is a byte short), so such a key would be lost the first time it is
-/// stored; this makes another one instead.
+/// a zero byte (one in 256: its DER form is a byte short). The text form is read by [`parse_any`] anyway,
+/// but the JSON files of older versions go through tsproto, so this makes another key instead.
 pub fn generate() -> Identity {
     loop {
         let identity = Identity::create();
@@ -60,7 +63,90 @@ pub fn parse_any(text: &str) -> Result<Identity> {
         bail!("the identity is empty");
     }
     Identity::new_from_ts_str(candidate)
-        .map_err(|_| anyhow!("this is not a TeamSpeak identity (expected <number>V<key>)"))
+        .ok()
+        .or_else(|| decode_short_scalar(candidate))
+        .ok_or_else(|| anyhow!("this is not a TeamSpeak identity (expected <number>V<key>)"))
+}
+
+/// The key TeamSpeak XORs into the first 100 bytes of an exported identity
+/// (the same constant as in tsproto; it is not public there).
+const OBFUSCATION: &[u8; 100] =
+    b"b9dfaa7bee6ac57ac7b65f1094a1c155e747327bc2fe5d51c512023fe54a280201004e90ad1daaae1075d53b7d571c30e063";
+
+/// Decodes `<counter>V<obfuscated key>` like tsproto, except that a private
+/// scalar shorter than 32 bytes is padded. DER drops leading zero bytes, so one
+/// identity in 256, including ones the official client made, has such a
+/// scalar, and tsproto refuses it.
+fn decode_short_scalar(text: &str) -> Option<Identity> {
+    let (counter, key) = text.split_once('V')?;
+    let counter = counter.parse().ok()?;
+    let mut data = BASE64.decode(key).ok()?;
+    if data.len() < 20 {
+        return None;
+    }
+    // XOR the first 20 bytes with the SHA-1 of what follows them up to the first zero byte.
+    let end = data[20..].iter().position(|b| *b == 0).map_or(data.len(), |p| 20 + p);
+    let hash = Sha1::digest(&data[20..end]);
+    data.iter_mut().zip(hash.iter()).for_each(|(b, h)| *b ^= h);
+    data.iter_mut().zip(OBFUSCATION.iter()).for_each(|(b, o)| *b ^= o);
+    let der = BASE64.decode(std::str::from_utf8(&data).ok()?).ok()?;
+    let scalar = tomcrypt_private_scalar(&der)?;
+    if scalar.len() > 32 {
+        return None;
+    }
+    let mut padded = [0u8; 32];
+    padded[32 - scalar.len()..].copy_from_slice(scalar);
+    Some(Identity::new(EccKeyPrivP256::from_short(&padded).ok()?, counter))
+}
+
+/// The private scalar of a libtomcrypt key: `SEQUENCE { BIT STRING flags,
+/// INTEGER size, INTEGER x, INTEGER y, INTEGER private }`, or, with two flag
+/// bits (TS3AudioBot), `SEQUENCE { BIT STRING, INTEGER size, INTEGER private }`.
+fn tomcrypt_private_scalar(der: &[u8]) -> Option<&[u8]> {
+    let (tag, sequence, rest) = der_element(der)?;
+    if tag != 0x30 || !rest.is_empty() {
+        return None;
+    }
+    let (tag, flags, mut rest) = der_element(sequence)?;
+    let (&unused, bits) = flags.split_first()?;
+    if tag != 0x03 || bits.first()? & 0x80 == 0 {
+        return None;
+    }
+    let private_index = match bits.len() * 8 - unused as usize {
+        1 => 3,
+        2 => 1,
+        _ => return None,
+    };
+    let mut integers = Vec::new();
+    while !rest.is_empty() {
+        let (tag, content, next) = der_element(rest)?;
+        if tag != 0x02 {
+            return None;
+        }
+        integers.push(content);
+        rest = next;
+    }
+    let scalar = *integers.get(private_index)?;
+    // A positive DER integer may carry a leading zero byte for its sign.
+    Some(scalar.iter().position(|b| *b != 0).map_or(&scalar[scalar.len()..], |start| &scalar[start..]))
+}
+
+/// One DER element: its tag, its content and what follows it.
+fn der_element(data: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&tag, data) = data.split_first()?;
+    let (&first, mut data) = data.split_first()?;
+    let len = if first < 0x80 {
+        first as usize
+    } else {
+        let count = (first & 0x7f) as usize;
+        if count == 0 || count > 4 || data.len() < count {
+            return None;
+        }
+        let (bytes, rest) = data.split_at(count);
+        data = rest;
+        bytes.iter().fold(0usize, |len, b| (len << 8) | *b as usize)
+    };
+    (data.len() >= len).then(|| (tag, &data[..len], &data[len..]))
 }
 
 /// Like [`parse_any`], but also fails on identities below [`MIN_LEVEL`], which most servers would refuse.
@@ -171,6 +257,18 @@ mod tests {
             assert!(identity.level() >= MIN_LEVEL);
             assert_eq!(uid(&parse(&export(&identity)).unwrap()), uid(&identity));
         }
+    }
+
+    #[test]
+    fn keys_whose_scalar_starts_with_zero_survive_the_text_form() {
+        let identity = std::iter::repeat_with(Identity::create).find(|i| i.key().to_short()[0] == 0).unwrap();
+        assert!(Identity::new_from_ts_str(&export(&identity)).is_err(), "tsproto alone refuses it");
+        let back = parse(&export(&identity)).unwrap();
+        assert_eq!(uid(&back), uid(&identity));
+        assert_eq!(back.counter(), identity.counter());
+        // The regular path and the fallback agree on ordinary keys too.
+        let ordinary = fresh();
+        assert_eq!(uid(&decode_short_scalar(&export(&ordinary)).unwrap()), uid(&ordinary));
     }
 
     #[test]
