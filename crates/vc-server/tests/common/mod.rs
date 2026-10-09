@@ -43,6 +43,9 @@ pub fn base_config() -> Config {
         web_root: None,
         ice_servers: Vec::new(),
         teamspeak: None,
+        public_url: None,
+        upload_limit: 10 * 1024 * 1024,
+        files_dir: None,
     }
 }
 
@@ -61,6 +64,11 @@ impl TestServer {
 
     pub fn url(&self) -> String {
         format!("ws://{}/ws", self.running.http)
+    }
+
+    /// `http://host:port` of the server, for uploads and downloads.
+    pub fn http(&self) -> String {
+        format!("http://{}", self.running.http)
     }
 }
 
@@ -192,8 +200,18 @@ impl Client {
         nickname: &str,
         password: Option<&str>,
     ) -> Result<Self, ErrorBody> {
+        let hello = |raw: &RawConn, key: &SigningKey| raw.hello(key, nickname, password);
+        Self::connect_with(server, key, hello).await
+    }
+
+    /// Connects with a hello body built by `hello` (e.g. to add an invite).
+    pub async fn connect_with(
+        server: &TestServer,
+        key: SigningKey,
+        hello: impl FnOnce(&RawConn, &SigningKey) -> Value,
+    ) -> Result<Self, ErrorBody> {
         let mut raw = open(server).await;
-        let hello = raw.hello(&key, nickname, password);
+        let hello = hello(&raw, &key);
         raw.send_hello(hello).await;
         let frame = raw.recv().await.expect("reply to hello");
         assert_eq!(frame["re"], 1, "{frame}");

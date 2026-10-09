@@ -94,6 +94,7 @@ pub async fn connect(options: ConnectOptions) -> Result<Connected, ClientError> 
             signature: options.identity.sign_challenge(&challenge.nonce),
             public_key,
             server_password: options.server_password,
+            invite: None,
             client: options.software,
         }),
     };
@@ -200,7 +201,8 @@ impl Connection {
     }
 
     pub async fn chat(&self, target: ChatTarget, text: impl Into<String>) -> Result<ChatMessage, ClientError> {
-        self.request_as(Request::ChatSend { target, text: text.into() }).await
+        self.request_as(Request::ChatSend { target, text: text.into(), mentions: Vec::new(), attachments: Vec::new() })
+            .await
     }
 
     /// Exchanges a WebRTC offer for the server's answer SDP.

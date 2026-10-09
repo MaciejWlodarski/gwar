@@ -2,15 +2,16 @@
 //! rate limiting and the per-connection write queue.
 
 use std::{
-    sync::Arc,
+    net::{IpAddr, SocketAddr},
     time::{Duration, Instant},
 };
 
 use axum::{
     extract::{
-        State, WebSocketUpgrade,
+        ConnectInfo, State, WebSocketUpgrade,
         ws::{Message, Utf8Bytes, WebSocket},
     },
+    http::HeaderMap,
     response::Response,
 };
 use futures::{SinkExt, StreamExt, stream::SplitStream};
@@ -21,15 +22,15 @@ use vc_proto::{
 };
 
 use crate::{
-    core::{ConnectRequest, CoreHandle, OUTBOUND_QUEUE, Outbound, encode},
+    core::{ConnectRequest, CoreHandle, OUTBOUND_QUEUE, Outbound, ServerPassword, encode},
     identity,
 };
 
 #[derive(Clone)]
 pub struct Gateway {
     pub core: CoreHandle,
-    /// Argon2 hash of the server password, if one is set.
-    pub password_hash: Option<Arc<str>>,
+    /// Argon2 hash of the server password, if one is set (changes with settings).
+    pub password: ServerPassword,
 }
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
@@ -39,8 +40,28 @@ const MAX_FRAME: usize = 96 * 1024;
 const RATE_BURST: f64 = 40.0;
 const RATE_PER_SEC: f64 = 20.0;
 
-pub async fn upgrade(ws: WebSocketUpgrade, State(gateway): State<Gateway>) -> Response {
-    ws.max_message_size(MAX_FRAME).on_upgrade(move |socket| connection(socket, gateway))
+pub async fn upgrade(
+    ws: WebSocketUpgrade,
+    State(gateway): State<Gateway>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let ip = client_ip(peer, &headers);
+    ws.max_message_size(MAX_FRAME).on_upgrade(move |socket| connection(socket, gateway, ip))
+}
+
+/// The client's address. Behind a reverse proxy on the same host the TCP peer
+/// is loopback, so the proxy's `X-Real-IP` / `X-Forwarded-For` is trusted then
+/// (and only then: anyone could send those headers directly).
+pub fn client_ip(peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
+    if !peer.ip().is_loopback() {
+        return peer.ip();
+    }
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    header("x-real-ip")
+        .or_else(|| header("x-forwarded-for").and_then(|v| v.rsplit(',').next()))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(peer.ip())
 }
 
 fn text(frame: &ServerFrame) -> Message {
@@ -61,7 +82,7 @@ async fn next_text(stream: &mut SplitStream<WebSocket>, wait: Duration) -> Optio
     }
 }
 
-async fn connection(socket: WebSocket, gateway: Gateway) {
+async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
     let (mut sink, mut stream) = socket.split();
     let Some(server) = gateway.core.info().await else { return };
     let nonce = identity::new_nonce();
@@ -69,7 +90,7 @@ async fn connection(socket: WebSocket, gateway: Gateway) {
         protocol: PROTOCOL_VERSION,
         nonce: nonce.clone(),
         server,
-        password_required: gateway.password_hash.is_some(),
+        password_required: gateway.password.load().is_some(),
     };
     if sink.send(text(&ServerFrame::Event(Event::Challenge(challenge)))).await.is_err() {
         return;
@@ -95,16 +116,22 @@ async fn connection(socket: WebSocket, gateway: Gateway) {
         let _ = sink.send(error(id, ErrorCode::NotAuthenticated, "invalid identity signature")).await;
         return;
     };
-    if let Some(hash) = gateway.password_hash.clone() {
-        let password = hello.server_password.clone().unwrap_or_default();
-        let ok = password.len() <= 128
-            && tokio::task::spawn_blocking(move || crate::core::verify_secret(&password, &hash, false))
-                .await
-                .unwrap_or(false);
-        if !ok {
-            let _ = sink.send(error(id, ErrorCode::WrongPassword, "wrong server password")).await;
-            return;
+    // With an invite the core decides; otherwise the password must match.
+    let has_invite = hello.invite.as_deref().is_some_and(|c| !c.trim().is_empty());
+    let current = gateway.password.load_full();
+    let password_ok = match current.as_ref().clone() {
+        None => true,
+        Some(hash) => {
+            let password = hello.server_password.clone().unwrap_or_default();
+            password.len() <= 128
+                && tokio::task::spawn_blocking(move || crate::core::verify_secret(&password, &hash, false))
+                    .await
+                    .unwrap_or(false)
         }
+    };
+    if !password_ok && !has_invite {
+        let _ = sink.send(error(id, ErrorCode::WrongPassword, "wrong server password")).await;
+        return;
     }
 
     let (out, mut outbound) = mpsc::channel(OUTBOUND_QUEUE);
@@ -115,6 +142,9 @@ async fn connection(socket: WebSocket, gateway: Gateway) {
         nickname: hello.nickname,
         platform: hello.client.platform,
         out: out.clone(),
+        ip: Some(ip),
+        invite: hello.invite,
+        password_ok,
     };
     let session = gateway.core.connect(request).await;
 

@@ -76,7 +76,12 @@ async fn teamspeak_mode_maps_state_chat_and_moves() {
 
     // Chat both ways.
     ts.handle
-        .request(Request::ChatSend { target: ChatTarget::Channel(lobby_ts), text: "from TeamSpeak mode".into() })
+        .request(Request::ChatSend {
+            target: ChatTarget::Channel(lobby_ts),
+            text: "from TeamSpeak mode".into(),
+            mentions: Vec::new(),
+            attachments: Vec::new(),
+        })
         .await
         .unwrap();
     until(

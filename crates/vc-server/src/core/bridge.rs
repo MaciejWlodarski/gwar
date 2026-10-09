@@ -23,6 +23,8 @@ pub enum BridgeNote {
     /// Any other event caused on our side, e.g. our user joined, an admin
     /// moved or kicked a remote session, someone wrote in a channel.
     Event(Event),
+    /// A ban on a remote user was lifted on our side.
+    Unban { uid: Uid },
 }
 
 /// Bridge → core.

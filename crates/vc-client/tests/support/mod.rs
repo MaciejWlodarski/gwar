@@ -66,7 +66,11 @@ pub async fn start() -> Option<Bridged> {
             voice: ts_voice,
             query_port: free_port(false),
             filetransfer: format!("127.0.0.1:{}", free_port(false)).parse().unwrap(),
+            public_url: None,
         }),
+        public_url: None,
+        upload_limit: 10 * 1024 * 1024,
+        files_dir: None,
     })
     .await
     .unwrap();

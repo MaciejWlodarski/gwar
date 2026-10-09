@@ -256,6 +256,8 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>) -> Option<View> 
         version: state.server.version.clone(),
         default_channel,
         max_clients: u32::from(state.server.max_clients),
+        // TeamSpeak chats carry text only.
+        upload_limit: 0,
     };
     Some(View { server: Some(server), channels, clients })
 }
@@ -336,7 +338,11 @@ fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Option<Out
                 ("reasonmsg", reason.clone().unwrap_or_default()),
             ],
         ),
-        Request::ChatSend { target, text } => match target {
+        Request::ChatSend { attachments, .. } if !attachments.is_empty() => {
+            return Err(refused("TeamSpeak servers can't take attachments"));
+        }
+        // Mentions stay readable in the text as `@nickname`.
+        Request::ChatSend { target, text, .. } => match target {
             ChatTarget::Channel(channel) if u64::from(*channel) == own_channel => {
                 command("sendtextmessage", &[("targetmode", "2".into()), ("msg", text.clone())])
             }
@@ -439,6 +445,20 @@ fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Option<Out
         // Read state lives in this client only.
         Request::ChatRead { .. } => return Ok(None),
         Request::TokenCreate { .. } => return Err(refused("create privilege keys in the TeamSpeak client")),
+        Request::ChatEdit { .. } | Request::ChatDelete { .. } => {
+            return Err(refused("TeamSpeak messages can't be edited or deleted"));
+        }
+        Request::FileUpload { .. } => return Err(refused("TeamSpeak servers can't take attachments")),
+        Request::GroupCreate(_)
+        | Request::GroupUpdate(_)
+        | Request::GroupDelete { .. }
+        | Request::MemberGroups { .. }
+        | Request::BanCreate(_)
+        | Request::BanList {}
+        | Request::BanDelete { .. }
+        | Request::InviteCreate(_)
+        | Request::InviteList {}
+        | Request::InviteDelete { .. } => return Err(refused("manage this server in the TeamSpeak client")),
         Request::VoiceOffer { .. } => return Err(refused("voice on TeamSpeak servers is native")),
         Request::Hello(_) => return Err(refused("already connected")),
     };
@@ -572,6 +592,9 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                                 author_name: invoker.name.clone(),
                                 text: message,
                                 sent_at: now_ms(),
+                                mentions: Vec::new(),
+                                attachments: Vec::new(),
+                                edited_at: None,
                             }));
                         }
                     }
@@ -704,7 +727,12 @@ mod tests {
 
     #[test]
     fn chat_outside_own_channel_is_refused_locally() {
-        let request = Request::ChatSend { target: ChatTarget::Channel(5), text: "x".into() };
+        let request = Request::ChatSend {
+            target: ChatTarget::Channel(5),
+            text: "x".into(),
+            mentions: Vec::new(),
+            attachments: Vec::new(),
+        };
         assert!(matches!(translate(&request, 1, 4), Err(e) if e.code == ErrorCode::Forbidden));
         assert!(matches!(translate(&Request::Ping {}, 1, 4), Ok(None)));
     }

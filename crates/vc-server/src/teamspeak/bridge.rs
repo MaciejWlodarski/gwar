@@ -36,6 +36,7 @@ use crate::{
     core::{
         CoreHandle,
         bridge::{BridgeMsg, BridgeNote, RemoteClient, RemoteUpdate},
+        now_ms,
     },
     media::MediaPlane,
 };
@@ -89,6 +90,7 @@ async fn supervise(
         password,
         voice: SocketAddr::new(voice_ip, config.voice.port()),
         map: config.dir.join("channels.json"),
+        public_url: config.public_url.clone(),
     };
     loop {
         generation.borrow_and_update();
@@ -106,6 +108,7 @@ async fn supervise(
 }
 
 struct Link {
+    public_url: Option<String>,
     query: SocketAddr,
     password: String,
     voice: SocketAddr,
@@ -222,6 +225,7 @@ struct Bridge<'a> {
     core: CoreHandle,
     shared: Arc<Shared>,
     voice: SocketAddr,
+    public_url: Option<String>,
     identities: &'a mut Identities,
     puppet_uids: HashSet<String>,
     map: ChannelMap,
@@ -257,6 +261,7 @@ impl<'a> Bridge<'a> {
             core: core.clone(),
             shared,
             voice: link.voice,
+            public_url: link.public_url.clone(),
             puppet_uids: identities.ts_uids(),
             identities,
             map: ChannelMap::load(&link.map)?,
@@ -566,7 +571,12 @@ impl<'a> Bridge<'a> {
             deafened: remote.deafened,
             away: remote.away.clone(),
         };
-        let Some(session) = self.core.remote_join(client).await else { return };
+        let Some(session) = self.core.remote_join(client).await else {
+            // Banned on our side.
+            let cmd = Cmd::new("clientkick").arg("clid", clid).arg("reasonid", 5).arg("reasonmsg", "banned");
+            let _ = self.query.call(cmd).await;
+            return;
+        };
         self.shared.mirrors.write().expect("mirrors lock").insert(clid, session);
         self.remotes.insert(clid, Remote { session, ..remote });
         self.reconcile(Duration::ZERO);
@@ -795,6 +805,7 @@ impl<'a> Bridge<'a> {
                 }
             }
             BridgeNote::Event(event) => self.on_event(event).await,
+            BridgeNote::Unban { uid } => self.unban(&uid).await,
         }
     }
 
@@ -832,13 +843,23 @@ impl<'a> Bridge<'a> {
                     // Our side already removed the session; make TeamSpeak follow.
                     self.remotes.remove(&clid);
                     self.shared.forget(clid);
-                    let message = match &reason {
-                        LeaveReason::Kicked { reason: Some(r), .. } => r.clone(),
-                        _ => String::new(),
+                    let cmd = match &reason {
+                        LeaveReason::Banned { reason, until, .. } => {
+                            // TeamSpeak keeps the ban itself (0 = permanent).
+                            let secs = until.map(|t| ((t - now_ms()) / 1000).max(1)).unwrap_or(0);
+                            Cmd::new("banclient")
+                                .arg("clid", clid)
+                                .arg("time", secs)
+                                .arg("banreason", reason.clone().unwrap_or_default())
+                        }
+                        LeaveReason::Kicked { reason, .. } => Cmd::new("clientkick")
+                            .arg("clid", clid)
+                            .arg("reasonid", 5)
+                            .arg("reasonmsg", reason.clone().unwrap_or_default()),
+                        _ => Cmd::new("clientkick").arg("clid", clid).arg("reasonid", 5).arg("reasonmsg", ""),
                     };
-                    let cmd = Cmd::new("clientkick").arg("clid", clid).arg("reasonid", 5).arg("reasonmsg", message);
                     if let Err(e) = ignore_missing(self.query.call(cmd).await) {
-                        warn!(clid, "TeamSpeak kick: {e:#}");
+                        warn!(clid, "TeamSpeak kick/ban: {e:#}");
                     }
                 }
             }
@@ -871,30 +892,46 @@ impl<'a> Bridge<'a> {
             ChatTarget::Channel(channel) => author.is_some_and(|l| l.client.channel == Some(channel)),
             _ => true,
         });
+        let body = ts_text(&m, self.public_url.as_deref());
         if let Some(puppet) = puppet {
-            puppet.send(PuppetCmd::Text { mode, target, text: m.text });
+            for text in split_for_teamspeak(&body) {
+                puppet.send(PuppetCmd::Text { mode, target, text });
+            }
             return;
         }
         // Otherwise ServerQuery (invisible to TeamSpeak users) posts it, signed.
-        let text = format!("[{}] {}", m.author_name, m.text);
-        let result = match m.target {
-            ChatTarget::Server => {
-                self.query
-                    .call(Cmd::new("sendtextmessage").arg("targetmode", 3).arg("target", 1).arg("msg", text))
-                    .await
-            }
-            ChatTarget::Channel(channel) => {
-                let Some(cid) = self.map.ts(channel) else { return };
-                // Nobody on TeamSpeak would read it.
-                if !self.remotes.values().any(|r| r.cid == cid) {
-                    return;
+        let signed = format!("[{}] {body}", m.author_name);
+        for text in split_for_teamspeak(&signed) {
+            let result = match m.target {
+                ChatTarget::Server => {
+                    self.query
+                        .call(Cmd::new("sendtextmessage").arg("targetmode", 3).arg("target", 1).arg("msg", text))
+                        .await
                 }
-                self.query_channel_message(cid, text).await
+                ChatTarget::Channel(channel) => {
+                    let Some(cid) = self.map.ts(channel) else { return };
+                    // Nobody on TeamSpeak would read it.
+                    if !self.remotes.values().any(|r| r.cid == cid) {
+                        return;
+                    }
+                    self.query_channel_message(cid, text).await
+                }
+                ChatTarget::Client(_) => return,
+            };
+            if let Err(e) = result {
+                debug!("relayed message: {e:#}");
             }
-            ChatTarget::Client(_) => return,
-        };
-        if let Err(e) = result {
-            debug!("relayed message: {e:#}");
+        }
+    }
+
+    /// Lifts TeamSpeak's own ban on a user whose ban was removed on our side.
+    async fn unban(&mut self, uid: &str) {
+        let Some(ts_uid) = uid.strip_prefix("ts:") else { return };
+        let Ok(bans) = self.query.call(Cmd::new("banlist")).await else { return };
+        for ban in bans.iter().filter(|b| b.get("uid").map(String::as_str) == Some(ts_uid)) {
+            if let Some(id) = ban.get("banid") {
+                let _ = self.query.call(Cmd::new("bandel").arg("banid", id)).await;
+            }
         }
     }
 
@@ -1065,6 +1102,42 @@ impl<'a> Bridge<'a> {
     }
 }
 
+/// How a message of ours reads on TeamSpeak: the text, then a link per
+/// attachment (TeamSpeak chats show plain text only; both TS3 and TS6 make
+/// URLs clickable). Mentions are already readable as `@nickname`.
+fn ts_text(m: &ChatMessage, public_url: Option<&str>) -> String {
+    let mut text = m.text.clone();
+    for file in &m.attachments {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        match public_url {
+            Some(base) => text.push_str(&format!("📎 {} — {}{}", file.name, base.trim_end_matches('/'), file.url)),
+            None => text.push_str(&format!("📎 {}", file.name)),
+        }
+    }
+    text
+}
+
+/// TeamSpeak caps a text message at 1024 characters; long ones go in parts.
+fn split_for_teamspeak(text: &str) -> Vec<String> {
+    const LIMIT: usize = 1000;
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    for line in text.split_inclusive('\n') {
+        for c in line.chars() {
+            if current.chars().count() >= LIMIT {
+                parts.push(std::mem::take(&mut current));
+            }
+            current.push(c);
+        }
+    }
+    if !current.trim().is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
 /// Channel description listing our users who have no puppet there.
 fn describe(names: &[String]) -> String {
     if names.is_empty() {
@@ -1134,6 +1207,38 @@ fn ignore_duplicate<T>(result: Result<T>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_messages_are_split_and_attachments_become_links() {
+        let mut m = ChatMessage {
+            id: 1,
+            target: ChatTarget::Server,
+            author: 1,
+            author_uid: "u".into(),
+            author_name: "Ann".into(),
+            text: "look".into(),
+            sent_at: 0,
+            mentions: vec![],
+            attachments: vec![vc_proto::Attachment {
+                id: "f1".into(),
+                name: "cat.png".into(),
+                mime: "image/png".into(),
+                size: 10,
+                url: "/files/f1/cat.png".into(),
+                width: None,
+                height: None,
+            }],
+            edited_at: None,
+        };
+        assert_eq!(
+            ts_text(&m, Some("https://gwar.example/")),
+            "look\n📎 cat.png — https://gwar.example/files/f1/cat.png"
+        );
+        m.text = "x".repeat(2500);
+        let parts = split_for_teamspeak(&m.text);
+        assert_eq!(parts.len(), 3);
+        assert!(parts.iter().all(|p| p.chars().count() <= 1000));
+    }
 
     #[test]
     fn description_lists_users_without_puppets() {

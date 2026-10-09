@@ -8,4 +8,8 @@ last_read: number,
 /**
  * Messages after `last_read`, capped at [`UNREAD_CAP`].
  */
-count: number, };
+count: number, 
+/**
+ * Of those, messages mentioning this user.
+ */
+mentions: number, };

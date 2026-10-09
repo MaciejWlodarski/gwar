@@ -5,7 +5,10 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
-use vc_proto::{ChannelId, ChatMessage, ChatTarget, Group, GroupId, Member, MessageId, Permission, UNREAD_CAP};
+use vc_proto::{
+    Attachment, Ban, BanId, ChannelId, ChatMessage, ChatTarget, FileId, Group, GroupId, Invite, Member, MessageId,
+    Permission, UNREAD_CAP, Uid,
+};
 
 pub const ADMIN_GROUP: GroupId = 1;
 pub const MEMBER_GROUP: GroupId = 2;
@@ -85,6 +88,47 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (user_id, channel)
     );
 "#,
+    r#"
+    ALTER TABLE groups ADD COLUMN color TEXT;
+    ALTER TABLE messages ADD COLUMN edited_at INTEGER;
+    CREATE TABLE message_mentions (
+        message INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        uid TEXT NOT NULL,
+        PRIMARY KEY (message, uid)
+    );
+    CREATE INDEX mentions_by_uid ON message_mentions(uid, message);
+    CREATE TABLE files (
+        id TEXT PRIMARY KEY,
+        uploader TEXT NOT NULL,
+        name TEXT NOT NULL,
+        mime TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        width INTEGER,
+        height INTEGER,
+        created_at INTEGER NOT NULL,
+        message INTEGER REFERENCES messages(id) ON DELETE SET NULL
+    );
+    CREATE INDEX files_by_message ON files(message);
+    CREATE TABLE bans (
+        id INTEGER PRIMARY KEY,
+        uid TEXT,
+        ip TEXT,
+        nickname TEXT NOT NULL,
+        reason TEXT,
+        by TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER
+    );
+    CREATE TABLE invites (
+        code TEXT PRIMARY KEY,
+        group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL,
+        max_uses INTEGER,
+        uses INTEGER NOT NULL DEFAULT 0,
+        expires_at INTEGER,
+        created_by TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+"#,
 ];
 
 const HISTORY_KEEP: i64 = 1000;
@@ -121,6 +165,27 @@ impl Store {
                 .execute("INSERT INTO groups(id,name,permissions) VALUES(?1,'Admin',?2)", params![ADMIN_GROUP, all])?;
             self.db
                 .execute("INSERT INTO groups(id,name,permissions) VALUES(?1,'Member','[]')", params![MEMBER_GROUP])?;
+        }
+        // Admin always holds every permission, including ones added in later versions.
+        self.db.execute(
+            "UPDATE groups SET permissions=?2 WHERE id=?1",
+            params![ADMIN_GROUP, serde_json::to_string(&Permission::ALL)?],
+        )?;
+        if self.meta("member_defaults")?.is_none() {
+            // Members may invite and upload unless an admin takes it away.
+            let mut member = self.groups()?.into_iter().find(|g| g.id == MEMBER_GROUP).map(|g| g.permissions);
+            if let Some(permissions) = member.as_mut() {
+                for p in Permission::MEMBER_DEFAULT {
+                    if !permissions.contains(&p) {
+                        permissions.push(p);
+                    }
+                }
+                self.db.execute(
+                    "UPDATE groups SET permissions=?2 WHERE id=?1",
+                    params![MEMBER_GROUP, serde_json::to_string(permissions)?],
+                )?;
+            }
+            self.set_meta("member_defaults", "1")?;
         }
         let has_channels: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM channels)", [], |r| r.get(0))?;
         if !has_channels {
@@ -193,14 +258,57 @@ impl Store {
     }
 
     pub fn groups(&self) -> Result<Vec<Group>> {
-        let mut stmt = self.db.prepare("SELECT id,name,permissions FROM groups ORDER BY id")?;
-        let rows =
-            stmt.query_map([], |r| Ok((r.get::<_, GroupId>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+        let mut stmt = self.db.prepare("SELECT id,name,permissions,color FROM groups ORDER BY id")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, GroupId>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get(3)?))
+        })?;
         rows.map(|row| {
-            let (id, name, permissions) = row?;
-            Ok(Group { id, name, permissions: serde_json::from_str(&permissions).unwrap_or_default() })
+            let (id, name, permissions, color) = row?;
+            Ok(Group { id, name, permissions: serde_json::from_str(&permissions).unwrap_or_default(), color })
         })
         .collect()
+    }
+
+    pub fn insert_group(&self, name: &str, permissions: &[Permission], color: Option<&str>) -> Result<GroupId> {
+        self.db.execute(
+            "INSERT INTO groups(name,permissions,color) VALUES(?1,?2,?3)",
+            params![name, serde_json::to_string(permissions)?, color],
+        )?;
+        Ok(self.db.last_insert_rowid() as GroupId)
+    }
+
+    pub fn update_group(&self, group: &Group) -> Result<()> {
+        self.db.execute(
+            "UPDATE groups SET name=?2,permissions=?3,color=?4 WHERE id=?1",
+            params![group.id, group.name, serde_json::to_string(&group.permissions)?, group.color],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_group(&self, id: GroupId) -> Result<()> {
+        self.db.execute("DELETE FROM groups WHERE id=?1", [id])?;
+        Ok(())
+    }
+
+    pub fn user_by_uid(&self, uid: &str) -> Result<Option<(i64, Member)>> {
+        let row = self
+            .db
+            .query_row("SELECT id,nickname,last_seen FROM users WHERE uid=?1", [uid], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            })
+            .optional()?;
+        let Some((id, nickname, last_seen)) = row else { return Ok(None) };
+        Ok(Some((id, Member { uid: uid.to_owned(), nickname, groups: self.user_groups(id)?, last_seen })))
+    }
+
+    pub fn set_user_groups(&self, user_id: i64, groups: &[GroupId]) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute("DELETE FROM user_groups WHERE user_id=?1", [user_id])?;
+        for group in groups {
+            tx.execute("INSERT INTO user_groups(user_id,group_id) VALUES(?1,?2)", params![user_id, group])?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Records a connecting identity and returns its stored groups.
@@ -331,7 +439,7 @@ impl Store {
     /// Newest `limit` channel messages older than `before`, returned oldest first.
     pub fn history(&self, channel: ChannelId, before: Option<MessageId>, limit: u32) -> Result<Vec<ChatMessage>> {
         let mut stmt = self.db.prepare(
-            "SELECT id,author_uid,author_name,text,sent_at FROM messages
+            "SELECT id,author_uid,author_name,text,sent_at,edited_at FROM messages
              WHERE channel=?1 AND id < ?2 ORDER BY id DESC LIMIT ?3",
         )?;
         let rows = stmt.query_map(params![channel, before.unwrap_or(MessageId::MAX), limit], |r| {
@@ -343,12 +451,271 @@ impl Store {
                 author_name: r.get(2)?,
                 text: r.get(3)?,
                 sent_at: r.get(4)?,
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+                edited_at: r.get(5)?,
             })
         })?;
         let mut messages: Vec<_> = rows.collect::<rusqlite::Result<_>>()?;
         messages.reverse();
+        for m in &mut messages {
+            m.mentions = self.mentions(m.id)?;
+            m.attachments = self.attachments(m.id)?;
+        }
         Ok(messages)
     }
+
+    /// One stored channel message with its mentions and attachments.
+    pub fn message(&self, id: MessageId) -> Result<Option<ChatMessage>> {
+        let row = self
+            .db
+            .query_row(
+                "SELECT channel,author_uid,author_name,text,sent_at,edited_at FROM messages WHERE id=?1",
+                [id],
+                |r| {
+                    Ok(ChatMessage {
+                        id,
+                        target: ChatTarget::Channel(r.get(0)?),
+                        author: 0,
+                        author_uid: r.get(1)?,
+                        author_name: r.get(2)?,
+                        text: r.get(3)?,
+                        sent_at: r.get(4)?,
+                        mentions: Vec::new(),
+                        attachments: Vec::new(),
+                        edited_at: r.get(5)?,
+                    })
+                },
+            )
+            .optional()?;
+        let Some(mut message) = row else { return Ok(None) };
+        message.mentions = self.mentions(id)?;
+        message.attachments = self.attachments(id)?;
+        Ok(Some(message))
+    }
+
+    pub fn set_mentions(&self, message: MessageId, uids: &[Uid]) -> Result<()> {
+        self.db.execute("DELETE FROM message_mentions WHERE message=?1", [message])?;
+        for uid in uids {
+            self.db
+                .execute("INSERT OR IGNORE INTO message_mentions(message,uid) VALUES(?1,?2)", params![message, uid])?;
+        }
+        Ok(())
+    }
+
+    fn mentions(&self, message: MessageId) -> Result<Vec<Uid>> {
+        let mut stmt = self.db.prepare("SELECT uid FROM message_mentions WHERE message=?1 ORDER BY uid")?;
+        let rows = stmt.query_map([message], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn edit_message(&self, message: MessageId, text: &str, edited_at: i64) -> Result<()> {
+        self.db.execute("UPDATE messages SET text=?2, edited_at=?3 WHERE id=?1", params![message, text, edited_at])?;
+        Ok(())
+    }
+
+    /// Deletes a message; returns the ids of its attached files (to remove from disk).
+    pub fn delete_message(&self, message: MessageId) -> Result<Vec<FileId>> {
+        let files = self.attachments(message)?.into_iter().map(|a| a.id).collect::<Vec<_>>();
+        for id in &files {
+            self.db.execute("DELETE FROM files WHERE id=?1", [id])?;
+        }
+        self.db.execute("DELETE FROM messages WHERE id=?1", [message])?;
+        Ok(files)
+    }
+
+    /// Messages in `channel` after `after` that mention `uid`, up to [`UNREAD_CAP`].
+    pub fn unread_mentions(&self, channel: ChannelId, after: MessageId, uid: &str) -> Result<u32> {
+        Ok(self.db.query_row(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM message_mentions mm JOIN messages m ON m.id = mm.message
+             WHERE mm.uid=?3 AND m.channel=?1 AND m.id>?2 LIMIT ?4)",
+            params![channel, after, uid, UNREAD_CAP],
+            |r| r.get(0),
+        )?)
+    }
+
+    // ---------------------------------------------------------------- files
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_file(
+        &self,
+        id: &str,
+        uploader: &str,
+        name: &str,
+        mime: &str,
+        size: u64,
+        dimensions: Option<(u32, u32)>,
+        now: i64,
+    ) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO files(id,uploader,name,mime,size,width,height,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![id, uploader, name, mime, size as i64, dimensions.map(|d| d.0), dimensions.map(|d| d.1), now],
+        )?;
+        Ok(())
+    }
+
+    /// An uploaded file not yet attached to a message, if `uploader` owns it.
+    pub fn pending_file(&self, id: &str, uploader: &str) -> Result<Option<Attachment>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT id,name,mime,size,width,height FROM files WHERE id=?1 AND uploader=?2 AND message IS NULL",
+                params![id, uploader],
+                attachment_row,
+            )
+            .optional()?)
+    }
+
+    pub fn attach_file(&self, id: &str, message: MessageId) -> Result<()> {
+        self.db.execute("UPDATE files SET message=?2 WHERE id=?1", params![id, message])?;
+        Ok(())
+    }
+
+    pub fn file(&self, id: &str) -> Result<Option<Attachment>> {
+        Ok(self
+            .db
+            .query_row("SELECT id,name,mime,size,width,height FROM files WHERE id=?1", [id], attachment_row)
+            .optional()?)
+    }
+
+    fn attachments(&self, message: MessageId) -> Result<Vec<Attachment>> {
+        let mut stmt =
+            self.db.prepare("SELECT id,name,mime,size,width,height FROM files WHERE message=?1 ORDER BY rowid")?;
+        let rows = stmt.query_map([message], attachment_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Uploads never attached to a message within `before` (ms); returns their ids.
+    pub fn expire_unattached(&self, before: i64) -> Result<Vec<FileId>> {
+        let mut stmt = self.db.prepare("DELETE FROM files WHERE message IS NULL AND created_at < ?1 RETURNING id")?;
+        let rows = stmt.query_map([before], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Files whose message is gone (history trimming); returns their ids.
+    pub fn expire_orphans(&self) -> Result<Vec<FileId>> {
+        let mut stmt = self.db.prepare(
+            "DELETE FROM files WHERE message IS NOT NULL AND message NOT IN (SELECT id FROM messages) RETURNING id",
+        )?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    // ----------------------------------------------------------------- bans
+
+    pub fn insert_ban(&self, ban: &Ban) -> Result<BanId> {
+        self.db.execute(
+            "INSERT INTO bans(uid,ip,nickname,reason,by,created_at,expires_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![ban.uid, ban.ip, ban.nickname, ban.reason, ban.by, ban.created_at, ban.expires_at],
+        )?;
+        Ok(self.db.last_insert_rowid() as BanId)
+    }
+
+    /// Bans in force at `now`.
+    pub fn bans(&self, now: i64) -> Result<Vec<Ban>> {
+        let mut stmt = self.db.prepare(
+            "SELECT id,uid,ip,nickname,reason,by,created_at,expires_at FROM bans
+             WHERE expires_at IS NULL OR expires_at > ?1 ORDER BY id DESC",
+        )?;
+        let rows = stmt.query_map([now], |r| {
+            Ok(Ban {
+                id: r.get(0)?,
+                uid: r.get(1)?,
+                ip: r.get(2)?,
+                nickname: r.get(3)?,
+                reason: r.get(4)?,
+                by: r.get(5)?,
+                created_at: r.get(6)?,
+                expires_at: r.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Removes a ban; returns it if it existed.
+    pub fn delete_ban(&self, id: BanId, now: i64) -> Result<Option<Ban>> {
+        let ban = self.bans(now)?.into_iter().find(|b| b.id == id);
+        self.db.execute("DELETE FROM bans WHERE id=?1", [id])?;
+        Ok(ban)
+    }
+
+    // -------------------------------------------------------------- invites
+
+    pub fn insert_invite(&self, invite: &Invite) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO invites(code,group_id,max_uses,uses,expires_at,created_by,created_at)
+             VALUES(?1,?2,?3,0,?4,?5,?6)",
+            params![
+                invite.code,
+                invite.group,
+                invite.max_uses,
+                invite.expires_at,
+                invite.created_by,
+                invite.created_at
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn invites(&self) -> Result<Vec<Invite>> {
+        let mut stmt = self.db.prepare(
+            "SELECT code,uses,max_uses,expires_at,group_id,created_by,created_at FROM invites ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Invite {
+                code: r.get(0)?,
+                uses: r.get(1)?,
+                max_uses: r.get(2)?,
+                expires_at: r.get(3)?,
+                group: r.get(4)?,
+                created_by: r.get(5)?,
+                created_at: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Uses an invite if it is still valid; returns the group it grants (`Some(None)` for none).
+    pub fn use_invite(&self, code: &str, now: i64) -> Result<Option<Option<GroupId>>> {
+        Ok(self
+            .db
+            .query_row(
+                "UPDATE invites SET uses = uses + 1
+                 WHERE code=?1 AND (expires_at IS NULL OR expires_at > ?2) AND (max_uses IS NULL OR uses < max_uses)
+                 RETURNING group_id",
+                params![code, now],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn delete_invite(&self, code: &str) -> Result<bool> {
+        Ok(self.db.execute("DELETE FROM invites WHERE code=?1", [code])? > 0)
+    }
+}
+
+fn attachment_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attachment> {
+    let id: String = r.get(0)?;
+    let name: String = r.get(1)?;
+    Ok(Attachment {
+        url: format!("/files/{id}/{}", urlencode(&name)),
+        id,
+        name,
+        mime: r.get(2)?,
+        size: r.get::<_, i64>(3)? as u64,
+        width: r.get(4)?,
+        height: r.get(5)?,
+    })
+}
+
+/// Percent-encodes a file name for a URL path segment.
+fn urlencode(name: &str) -> String {
+    name.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 #[cfg(test)]

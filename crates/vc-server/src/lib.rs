@@ -8,6 +8,7 @@
 //! ```
 
 pub mod core;
+pub mod files;
 pub mod gateway;
 pub mod identity;
 pub mod media;
@@ -19,7 +20,11 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
-use axum::{Router, routing::get};
+use axum::{
+    Router,
+    extract::DefaultBodyLimit,
+    routing::{get, put},
+};
 use tokio::{
     net::{TcpListener, UdpSocket},
     sync::mpsc,
@@ -47,6 +52,13 @@ pub struct Config {
     pub ice_servers: Vec<IceServer>,
     /// Official TeamSpeak server to run and bridge; `None` disables TS compatibility.
     pub teamspeak: Option<TeamSpeakConfig>,
+    /// Public base URL of the web origin (e.g. `https://voice.example.com`),
+    /// used in links to uploads posted to TeamSpeak.
+    pub public_url: Option<String>,
+    /// Largest upload in bytes; 0 disables uploads.
+    pub upload_limit: u64,
+    /// Where uploads are stored; `None` uses a temporary directory (tests).
+    pub files_dir: Option<PathBuf>,
 }
 
 /// The official TeamSpeak server to run and bridge (needs the `teamspeak` feature).
@@ -58,6 +70,8 @@ pub struct TeamSpeakConfig {
     /// Loopback port for ServerQuery.
     pub query_port: u16,
     pub filetransfer: SocketAddr,
+    /// See [`Config::public_url`].
+    pub public_url: Option<String>,
 }
 
 pub struct Running {
@@ -80,6 +94,19 @@ pub async fn start(config: Config) -> Result<Running> {
         None => Store::in_memory()?,
     };
     let admin_token = core::ensure_first_admin_token(&store)?;
+    // A password set in the server settings (even "none") wins over the command line.
+    let hash = match store.meta("password_hash")? {
+        Some(stored) => Some(stored).filter(|h| !h.is_empty()),
+        None => match config.server_password.clone().filter(|p| !p.is_empty()) {
+            Some(p) => Some(tokio::task::spawn_blocking(move || core::hash_secret(&p, false)).await?),
+            None => None,
+        },
+    };
+    let password: core::ServerPassword = Arc::new(ArcSwap::from_pointee(hash.map(Arc::<str>::from)));
+    let files_dir = config.files_dir.clone().unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("gwar-files-{}-{}", std::process::id(), rand::random::<u32>()))
+    });
+    std::fs::create_dir_all(&files_dir).with_context(|| format!("create {}", files_dir.display()))?;
     let routing = Arc::new(ArcSwap::from_pointee(media::Routing::default()));
     let (media_tx, media_rx) = mpsc::channel(256);
     let core = core::spawn(
@@ -88,6 +115,9 @@ pub async fn start(config: Config) -> Result<Running> {
             max_clients: config.max_clients,
             ice_servers: config.ice_servers,
             version: env!("CARGO_PKG_VERSION").into(),
+            password: password.clone(),
+            upload_limit: config.upload_limit,
+            files_dir,
         },
         routing.clone(),
         media_tx.clone(),
@@ -116,10 +146,6 @@ pub async fn start(config: Config) -> Result<Running> {
         media_rx,
     ))];
 
-    let password_hash = match config.server_password.filter(|p| !p.is_empty()) {
-        Some(p) => Some(Arc::from(tokio::task::spawn_blocking(move || core::hash_secret(&p, false)).await?)),
-        None => None,
-    };
     // Installing and starting TeamSpeak can take a while; serve our clients meanwhile.
     let (teamspeak, teamspeak_ready) = match config.teamspeak {
         #[cfg(not(feature = "teamspeak"))]
@@ -133,9 +159,14 @@ pub async fn start(config: Config) -> Result<Running> {
         }
         None => (None, None),
     };
-    let gateway = Gateway { core: core.clone(), password_hash };
-    let mut app =
-        Router::new().route("/ws", get(gateway::upgrade)).route("/health", get(|| async { "ok" })).with_state(gateway);
+    let gateway = Gateway { core: core.clone(), password };
+    let mut app = Router::new()
+        .route("/ws", get(gateway::upgrade))
+        .route("/health", get(|| async { "ok" }))
+        // Uploads enforce their own reserved size.
+        .route("/api/files/{id}", put(files::upload).layer(DefaultBodyLimit::disable()))
+        .route("/files/{id}/{name}", get(files::download))
+        .with_state(gateway);
     if let Some(root) = config.web_root {
         let index = root.join("index.html");
         app = app.fallback_service(ServeDir::new(root).fallback(ServeFile::new(index)));
@@ -143,6 +174,7 @@ pub async fn start(config: Config) -> Result<Running> {
     let listener = TcpListener::bind(config.http_bind).await.context("bind HTTP listener")?;
     let http = listener.local_addr()?;
     tasks.push(tokio::spawn(async move {
+        let app = app.into_make_service_with_connect_info::<SocketAddr>();
         if let Err(e) = axum::serve(listener, app).await {
             tracing::error!("http server: {e}");
         }

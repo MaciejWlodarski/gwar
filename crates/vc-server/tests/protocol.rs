@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use common::*;
 use serde_json::{Value, json};
+use vc_proto::Permission;
 
 const MEMBER: u64 = 2;
 const ADMIN: u64 = 1;
@@ -191,12 +192,14 @@ async fn welcome_describes_server_and_own_client() {
     assert_eq!(w.uid, uid_of(&c.key));
     assert!(!me.muted && !me.deafened && me.away.is_none() && !me.talking && !me.voice);
 
-    // Member has no permissions; both seeded groups are listed.
-    assert!(w.permissions.is_empty());
+    // Members may only invite and upload; both seeded groups are listed.
+    let mut permissions = w.permissions.clone();
+    permissions.sort();
+    assert_eq!(permissions, [Permission::InviteCreate, Permission::FileUpload]);
     let groups: Vec<_> = w.groups.iter().map(|g| (g.id, g.name.as_str())).collect();
     assert_eq!(groups, [(1, "Admin"), (2, "Member")]);
     assert_eq!(w.groups[0].permissions.len(), vc_proto::Permission::ALL.len());
-    assert!(w.groups[1].permissions.is_empty());
+    assert_eq!(w.groups[1].permissions, vc_proto::Permission::MEMBER_DEFAULT);
 }
 
 #[tokio::test]

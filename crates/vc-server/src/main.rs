@@ -51,6 +51,13 @@ struct Cli {
     /// UDP address TeamSpeak clients connect to.
     #[arg(long, env = "VC_TEAMSPEAK_VOICE", default_value = "0.0.0.0:9987")]
     teamspeak_voice: SocketAddr,
+    /// Public base URL of the web origin, e.g. https://voice.example.com
+    /// (used in links to uploads posted to TeamSpeak).
+    #[arg(long, env = "VC_PUBLIC_URL")]
+    public_url: Option<String>,
+    /// Largest upload in MiB (0 disables uploads).
+    #[arg(long, env = "VC_UPLOAD_LIMIT_MB", default_value_t = 25)]
+    upload_limit_mb: u64,
     /// Loopback port of the TeamSpeak server's ServerQuery.
     #[arg(long, env = "VC_TEAMSPEAK_QUERY_PORT", default_value_t = 10011)]
     teamspeak_query_port: u16,
@@ -120,7 +127,11 @@ async fn main() -> Result<()> {
             voice: cli.teamspeak_voice,
             query_port: cli.teamspeak_query_port,
             filetransfer: ([127, 0, 0, 1], 30033).into(),
+            public_url: cli.public_url.clone(),
         }),
+        public_url: cli.public_url.clone(),
+        upload_limit: cli.upload_limit_mb * 1024 * 1024,
+        files_dir: Some(cli.data_dir.join("files")),
     })
     .await?;
     tracing::info!(http = %running.http, media = %running.media, teamspeak = ?running.teamspeak, "server ready");

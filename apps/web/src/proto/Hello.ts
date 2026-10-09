@@ -9,4 +9,8 @@ public_key: string,
 /**
  * Base64url signature over `challenge_message(nonce, public_key)`.
  */
-signature: string, server_password: string | null, client: ClientSoftware, };
+signature: string, server_password: string | null, 
+/**
+ * Invite code: admits without the server password and may grant a group.
+ */
+invite?: string | null, client: ClientSoftware, };

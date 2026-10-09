@@ -28,6 +28,9 @@ pub type ChannelId = u32;
 pub type SessionId = u32;
 pub type GroupId = u32;
 pub type MessageId = u32;
+pub type BanId = u32;
+/// Random id of an uploaded file.
+pub type FileId = String;
 
 /// Stable user identifier derived from the user's public key (see `docs/protocol.md`).
 pub type Uid = String;
@@ -73,7 +76,27 @@ wire! {
         #[serde(rename = "channel.delete")]
         ChannelDelete { channel: ChannelId },
         #[serde(rename = "chat.send")]
-        ChatSend { target: ChatTarget, text: String },
+        ChatSend {
+            target: ChatTarget,
+            text: String,
+            /// Users mentioned as `@nickname` in `text` (the text stays readable as is).
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            mentions: Vec<Uid>,
+            /// Ids of finished uploads (see `file.upload`) to attach.
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            attachments: Vec<FileId>,
+        },
+        /// Changes the text of your own channel message.
+        #[serde(rename = "chat.edit")]
+        ChatEdit {
+            message: MessageId,
+            text: String,
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            mentions: Vec<Uid>,
+        },
+        /// Deletes a channel message: your own, or anyone's with `message_manage`.
+        #[serde(rename = "chat.delete")]
+        ChatDelete { message: MessageId },
         /// Marks the channel read up to `message` (for this user on every device).
         #[serde(rename = "chat.read")]
         ChatRead { channel: ChannelId, message: MessageId },
@@ -89,6 +112,30 @@ wire! {
         ServerUpdate(ServerUpdate),
         #[serde(rename = "token.create")]
         TokenCreate { group: GroupId },
+        /// Reserves an upload; the reply says where to `PUT` the bytes.
+        #[serde(rename = "file.upload")]
+        FileUpload { name: String, size: u64, mime: String },
+        #[serde(rename = "group.create")]
+        GroupCreate(GroupCreate),
+        #[serde(rename = "group.update")]
+        GroupUpdate(GroupUpdate),
+        #[serde(rename = "group.delete")]
+        GroupDelete { group: GroupId },
+        /// Sets a member's groups (online or not).
+        #[serde(rename = "member.groups")]
+        MemberGroups { uid: Uid, groups: Vec<GroupId> },
+        #[serde(rename = "ban.create")]
+        BanCreate(BanCreate),
+        #[serde(rename = "ban.list")]
+        BanList {},
+        #[serde(rename = "ban.delete")]
+        BanDelete { ban: BanId },
+        #[serde(rename = "invite.create")]
+        InviteCreate(InviteCreate),
+        #[serde(rename = "invite.list")]
+        InviteList {},
+        #[serde(rename = "invite.delete")]
+        InviteDelete { code: String },
         #[serde(rename = "token.redeem")]
         TokenRedeem { token: String },
         #[serde(rename = "voice.offer")]
@@ -104,6 +151,9 @@ wire! {
         pub signature: String,
         #[serde(default)]
         pub server_password: Option<String>,
+        /// Invite code: admits without the server password and may grant a group.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub invite: Option<String>,
         pub client: ClientSoftware,
     }
 
@@ -166,12 +216,72 @@ wire! {
         pub position: Option<i32>,
     }
 
+    /// Absent fields stay unchanged; `password: ""` removes the server password.
     #[derive(Default)]
     pub struct ServerUpdate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub welcome: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub default_channel: Option<ChannelId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub password: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_clients: Option<u32>,
+    }
+
+    #[derive(Default)]
+    pub struct GroupCreate {
+        pub name: String,
+        #[serde(default)]
+        pub permissions: Vec<Permission>,
+        /// `#rrggbb`
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub color: Option<String>,
+    }
+
+    /// Absent fields stay unchanged; `color: ""` removes the color.
+    #[derive(Default)]
+    pub struct GroupUpdate {
+        pub group: GroupId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub permissions: Option<Vec<Permission>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub color: Option<String>,
+    }
+
+    /// Bans an online client (by session) or a known member (by uid).
+    #[derive(Default)]
+    pub struct BanCreate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub client: Option<SessionId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub uid: Option<Uid>,
+        /// Also ban the client's IP address (online clients only).
+        #[serde(default)]
+        pub ip: bool,
+        /// Seconds; absent means permanent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(type = "number | null"))]
+        pub duration: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reason: Option<String>,
+    }
+
+    #[derive(Default)]
+    pub struct InviteCreate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_uses: Option<u32>,
+        /// Seconds until it expires; absent means never.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(type = "number | null"))]
+        pub expires_in: Option<u64>,
+        /// Group granted to whoever joins with it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub group: Option<GroupId>,
     }
 
     #[serde(rename_all = "lowercase")]
@@ -198,6 +308,13 @@ wire! {
         Token { token: String },
         Groups { groups: Vec<GroupId> },
         Answer { sdp: String },
+        Group { group: Group },
+        Ban { ban: Ban },
+        Bans { bans: Vec<Ban> },
+        Invite { invite: Invite },
+        Invites { invites: Vec<Invite> },
+        /// `PUT` the file's bytes to `upload_url` (relative to the server's HTTP origin).
+        Upload { file: FileId, upload_url: String },
         Empty {},
     }
 
@@ -219,6 +336,8 @@ wire! {
         Conflict,
         Unavailable,
         Internal,
+        Banned,
+        TooLarge,
     }
 
     #[serde(tag = "ev", content = "d")]
@@ -241,6 +360,19 @@ wire! {
         ClientLeft { client: SessionId, reason: LeaveReason },
         #[serde(rename = "chat.message")]
         ChatMessage(ChatMessage),
+        #[serde(rename = "chat.edited")]
+        ChatEdited(ChatMessage),
+        #[serde(rename = "chat.deleted")]
+        ChatDeleted { channel: ChannelId, message: MessageId },
+        #[serde(rename = "group.created")]
+        GroupCreated(Group),
+        #[serde(rename = "group.updated")]
+        GroupUpdated(Group),
+        #[serde(rename = "group.deleted")]
+        GroupDeleted { group: GroupId },
+        /// A member's groups or nickname changed (online or not).
+        #[serde(rename = "member.updated")]
+        MemberUpdated(Member),
         #[serde(rename = "voice.talking")]
         VoiceTalking { client: SessionId, talking: bool },
         /// The given receive slot now carries audio of `client` (or nothing).
@@ -296,6 +428,9 @@ wire! {
         pub last_read: MessageId,
         /// Messages after `last_read`, capped at [`UNREAD_CAP`].
         pub count: u32,
+        /// Of those, messages mentioning this user.
+        #[serde(default)]
+        pub mentions: u32,
     }
 
     pub struct ServerInfo {
@@ -304,6 +439,10 @@ wire! {
         pub version: String,
         pub default_channel: ChannelId,
         pub max_clients: u32,
+        /// Largest accepted upload in bytes (0: uploads disabled).
+        #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        pub upload_limit: u64,
     }
 
     pub struct Channel {
@@ -336,6 +475,57 @@ wire! {
         pub id: GroupId,
         pub name: String,
         pub permissions: Vec<Permission>,
+        /// `#rrggbb`, shown on members' names.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub color: Option<String>,
+    }
+
+    pub struct Ban {
+        pub id: BanId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub uid: Option<Uid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub ip: Option<String>,
+        /// Nickname at the time of the ban.
+        pub nickname: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reason: Option<String>,
+        pub by: String,
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        pub created_at: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(type = "number | null"))]
+        pub expires_at: Option<i64>,
+    }
+
+    pub struct Invite {
+        pub code: String,
+        pub uses: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_uses: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(type = "number | null"))]
+        pub expires_at: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub group: Option<GroupId>,
+        pub created_by: String,
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        pub created_at: i64,
+    }
+
+    pub struct Attachment {
+        pub id: FileId,
+        pub name: String,
+        pub mime: String,
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        pub size: u64,
+        /// Download path, relative to the server's HTTP origin.
+        pub url: String,
+        /// Pixel size, for images.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub width: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub height: Option<u32>,
     }
 
     #[derive(Copy, Eq, Hash, PartialOrd, Ord)]
@@ -349,6 +539,11 @@ wire! {
         ClientMove,
         ClientKick,
         TokenCreate,
+        ClientBan,
+        GroupManage,
+        MessageManage,
+        InviteCreate,
+        FileUpload,
     }
 
     pub struct ChatMessage {
@@ -361,6 +556,13 @@ wire! {
         /// Unix time in milliseconds.
         #[cfg_attr(feature = "ts", ts(type = "number"))]
         pub sent_at: i64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub mentions: Vec<Uid>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub attachments: Vec<Attachment>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(type = "number | null"))]
+        pub edited_at: Option<i64>,
     }
 
     #[serde(tag = "kind", rename_all = "snake_case")]
@@ -368,6 +570,12 @@ wire! {
         Quit,
         Timeout,
         Kicked { by: String, reason: Option<String> },
+        Banned {
+            by: String,
+            reason: Option<String>,
+            #[cfg_attr(feature = "ts", ts(type = "number | null"))]
+            until: Option<i64>,
+        },
         ServerShutdown,
         Replaced,
     }
@@ -382,7 +590,7 @@ wire! {
 }
 
 impl Permission {
-    pub const ALL: [Permission; 8] = [
+    pub const ALL: [Permission; 13] = [
         Permission::ServerManage,
         Permission::ChannelCreate,
         Permission::ChannelEdit,
@@ -391,7 +599,15 @@ impl Permission {
         Permission::ClientMove,
         Permission::ClientKick,
         Permission::TokenCreate,
+        Permission::ClientBan,
+        Permission::GroupManage,
+        Permission::MessageManage,
+        Permission::InviteCreate,
+        Permission::FileUpload,
     ];
+
+    /// What every new member may do.
+    pub const MEMBER_DEFAULT: [Permission; 2] = [Permission::InviteCreate, Permission::FileUpload];
 }
 
 impl ErrorBody {

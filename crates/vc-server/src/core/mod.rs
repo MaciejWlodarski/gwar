@@ -8,15 +8,24 @@
 //! whatever may have changed meanwhile.
 
 pub mod bridge;
+pub mod files;
+mod messages;
+mod moderation;
 mod passwords;
+
+use moderation::ban_message;
 
 pub use passwords::{hash_secret, ts_wire_form, verify_secret};
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
+    net::IpAddr,
+    path::PathBuf,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
+
+use arc_swap::ArcSwap;
 
 use anyhow::Result;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -27,7 +36,7 @@ use tracing::{debug, info, warn};
 use vc_proto::{
     Channel, ChannelCreate, ChannelId, ChannelUpdate, ChatMessage, ChatTarget, Client, ClientUpdate, ErrorBody,
     ErrorCode, Event, Group, GroupId, IceServer, LeaveReason, MessageId, Permission, Platform, Request, Response,
-    ServerFrame, ServerInfo, ServerUpdate, SessionId, Uid, Unread, Welcome,
+    ServerFrame, ServerInfo, SessionId, Uid, Unread, Welcome,
 };
 
 use self::bridge::{BridgeMsg, BridgeNote, RemoteClient};
@@ -57,18 +66,41 @@ pub struct ConnectRequest {
     pub nickname: String,
     pub platform: Platform,
     pub out: OutboundTx,
+    pub ip: Option<IpAddr>,
+    pub invite: Option<String>,
+    /// Whether the gateway already verified the server password (or none is set).
+    pub password_ok: bool,
 }
+
+/// Argon2 hash of the server password, shared with the gateway; changed from settings.
+pub type ServerPassword = Arc<ArcSwap<Option<Arc<str>>>>;
 
 type Resume = Box<dyn FnOnce(&mut Core) + Send>;
 
 pub enum CoreMsg {
     Connect(ConnectRequest, oneshot::Sender<Option<SessionId>>),
-    Request { session: SessionId, id: u32, request: Request },
-    Disconnect { session: SessionId, reason: LeaveReason },
-    Talking { session: SessionId, talking: bool },
-    Voice { session: SessionId, connected: bool },
+    Request {
+        session: SessionId,
+        id: u32,
+        request: Request,
+    },
+    Disconnect {
+        session: SessionId,
+        reason: LeaveReason,
+    },
+    Talking {
+        session: SessionId,
+        talking: bool,
+    },
+    Voice {
+        session: SessionId,
+        connected: bool,
+    },
     Info(oneshot::Sender<ServerInfo>),
     Bridge(BridgeMsg),
+    Files(files::FileMsg),
+    /// Periodic housekeeping (expired uploads).
+    Tick,
     Resume(Resume),
 }
 
@@ -123,6 +155,10 @@ pub struct CoreConfig {
     pub max_clients: u32,
     pub ice_servers: Vec<IceServer>,
     pub version: String,
+    pub password: ServerPassword,
+    /// Largest upload in bytes; 0 disables uploads.
+    pub upload_limit: u64,
+    pub files_dir: PathBuf,
 }
 
 struct Session {
@@ -136,6 +172,7 @@ struct Session {
     unlocked: BTreeSet<ChannelId>,
     groups: Vec<GroupId>,
     platform: Platform,
+    ip: Option<IpAddr>,
     muted: bool,
     deafened: bool,
     away: Option<String>,
@@ -162,6 +199,9 @@ pub struct Core {
     bridge: Option<mpsc::UnboundedSender<BridgeNote>>,
     /// Set while applying a bridge message, so its effects are not echoed back.
     applying_remote: bool,
+    password: ServerPassword,
+    files_dir: PathBuf,
+    uploads: HashMap<String, files::PendingUpload>,
 }
 
 /// Messages with ids at or above this value are delivered live and not stored.
@@ -173,6 +213,7 @@ const MAX_TOPIC: usize = 255;
 const MAX_MESSAGE: usize = 4000;
 const MAX_PASSWORD: usize = 128;
 const MAX_AWAY: usize = 80;
+const MAX_ATTACHMENTS: usize = 10;
 /// Members listed in `Welcome`: seen within this window, at most this many.
 const MEMBER_HORIZON_MS: i64 = 180 * 24 * 3600 * 1000;
 const MAX_MEMBERS: u32 = 1000;
@@ -183,7 +224,7 @@ fn err(code: ErrorCode, message: &str) -> ErrorBody {
     ErrorBody::new(code, message)
 }
 
-fn now_ms() -> i64 {
+pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
@@ -240,6 +281,15 @@ pub fn spawn(
 ) -> Result<CoreHandle> {
     let (tx, mut rx) = mpsc::channel(4096);
     let mut core = Core::new(store, config, routing, media, tx.downgrade())?;
+    let ticker = tx.downgrade();
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(Duration::from_secs(600));
+        loop {
+            every.tick().await;
+            let Some(tx) = ticker.upgrade() else { break };
+            let _ = tx.send(CoreMsg::Tick).await;
+        }
+    });
     tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             core.handle(msg);
@@ -269,7 +319,8 @@ impl Core {
             welcome: store.meta("welcome")?.unwrap_or_default(),
             version: config.version,
             default_channel,
-            max_clients: config.max_clients,
+            max_clients: store.meta("max_clients")?.and_then(|v| v.parse().ok()).unwrap_or(config.max_clients),
+            upload_limit: config.upload_limit,
         };
         let groups = store.groups()?.into_iter().map(|g| (g.id, g)).collect();
         Ok(Self {
@@ -287,6 +338,9 @@ impl Core {
             stalled: BTreeSet::new(),
             bridge: None,
             applying_remote: false,
+            password: config.password,
+            files_dir: config.files_dir,
+            uploads: HashMap::new(),
         })
     }
 
@@ -329,6 +383,8 @@ impl Core {
                 self.bridge_msg(msg);
                 self.applying_remote = false;
             }
+            CoreMsg::Files(msg) => self.file_msg(msg),
+            CoreMsg::Tick => self.tick(),
             CoreMsg::Resume(resume) => resume(self),
         }
         while let Some(session) = self.stalled.pop_first() {
@@ -434,6 +490,22 @@ impl Core {
             Ok(n) => n,
             Err(e) => return fail(e.code, &e.message),
         };
+        if let Some(ban) = self.ban_for(Some(&r.uid), r.ip) {
+            return fail(ErrorCode::Banned, &ban_message(&ban));
+        }
+        let invited = match r.invite.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+            Some(code) => match self.store.use_invite(code, now_ms()) {
+                Ok(found) => found,
+                Err(e) => {
+                    warn!("store: {e:#}");
+                    return fail(ErrorCode::Internal, "storage error");
+                }
+            },
+            None => None,
+        };
+        if !r.password_ok && invited.is_none() {
+            return fail(ErrorCode::WrongPassword, "wrong server password or invalid invite");
+        }
         let user = match self.store.touch_user(&r.uid, &r.public_key, &nickname, now_ms()) {
             Ok(user) => user,
             Err(e) => {
@@ -442,6 +514,15 @@ impl Core {
             }
         };
         let mut groups = user.groups;
+        if let Some(Some(group)) = invited
+            && self.groups.contains_key(&group)
+            && !groups.contains(&group)
+        {
+            if let Err(e) = self.store.add_user_group(user.id, group) {
+                warn!("store: {e:#}");
+            }
+            groups.push(group);
+        }
         if groups.is_empty() {
             if let Err(e) = self.store.add_user_group(user.id, MEMBER_GROUP) {
                 warn!("store: {e:#}");
@@ -458,6 +539,7 @@ impl Core {
             unlocked: BTreeSet::new(),
             groups,
             platform: r.platform,
+            ip: r.ip,
             muted: false,
             deafened: false,
             away: None,
@@ -535,6 +617,10 @@ impl Core {
                 self.bridge = Some(bridge);
             }
             BridgeMsg::Join(client, reply) => {
+                if self.ban_for(Some(&client.uid), None).is_some() {
+                    let _ = reply.send(None);
+                    return;
+                }
                 let id = self.allocate_session();
                 // TeamSpeak users are always in some channel.
                 let channel =
@@ -548,6 +634,7 @@ impl Core {
                     unlocked: BTreeSet::new(),
                     groups: Vec::new(),
                     platform: client.platform,
+                    ip: None,
                     muted: client.muted,
                     deafened: client.deafened,
                     away: client.away,
@@ -592,8 +679,9 @@ impl Core {
                 }
             }
             BridgeMsg::Chat(session, target, text) => {
+                let mentions = self.detect_mentions(&text);
                 if self.sessions.get(&session).is_some_and(|s| s.out.is_none())
-                    && let Err(e) = self.chat_send(session, target, text)
+                    && let Err(e) = self.chat_send(session, target, text, mentions, Vec::new())
                 {
                     debug!(session, "remote chat rejected: {}", e.message);
                 }
@@ -640,9 +728,24 @@ impl Core {
             Request::ChannelCreate(create) => return self.channel_create(session, id, create),
             Request::ChannelUpdate(update) => return self.channel_update(session, id, update),
             Request::ChannelDelete { channel } => self.channel_delete(session, channel),
-            Request::ChatSend { target, text } => self.chat_send(session, target, text),
+            Request::ChatSend { target, text, mentions, attachments } => {
+                self.chat_send(session, target, text, mentions, attachments)
+            }
+            Request::ChatEdit { message, text, mentions } => self.chat_edit(session, message, text, mentions),
+            Request::ChatDelete { message } => self.chat_delete(session, message),
+            Request::FileUpload { name, size, mime } => self.file_upload(session, name, size, mime),
+            Request::GroupCreate(create) => self.group_create(session, create),
+            Request::GroupUpdate(update) => self.group_update(session, update),
+            Request::GroupDelete { group } => self.group_delete(session, group),
+            Request::MemberGroups { uid, groups } => self.member_groups(session, uid, groups),
+            Request::BanCreate(ban) => self.ban_create(session, ban),
+            Request::BanList {} => self.ban_list(session),
+            Request::BanDelete { ban } => self.ban_delete(session, ban),
+            Request::InviteCreate(invite) => self.invite_create(session, invite),
+            Request::InviteList {} => self.invite_list(session),
+            Request::InviteDelete { code } => self.invite_delete(session, &code),
             Request::ChatHistory { channel, before, limit } => self.chat_history(session, channel, before, limit),
-            Request::ServerUpdate(update) => self.server_update(session, update),
+            Request::ServerUpdate(update) => return self.server_update(session, id, update),
             Request::TokenCreate { group } => self.token_create(session, group),
             Request::TokenRedeem { token } => self.token_redeem(session, &token),
             Request::VoiceOffer { sdp } => return self.voice_offer(session, id, sdp),
@@ -755,7 +858,12 @@ impl Core {
     fn unread_for(&self, s: &Session) -> Vec<Unread> {
         let unread = |channel: ChannelId| -> Result<Unread> {
             let last_read = self.store.read_mark(s.user_id, channel)?;
-            Ok(Unread { channel, last_read, count: self.store.unread_count(channel, last_read)? })
+            Ok(Unread {
+                channel,
+                last_read,
+                count: self.store.unread_count(channel, last_read)?,
+                mentions: self.store.unread_mentions(channel, last_read, &s.uid)?,
+            })
         };
         self.channels
             .keys()
@@ -1044,11 +1152,23 @@ impl Core {
         depth
     }
 
-    fn chat_send(&mut self, session: SessionId, target: ChatTarget, text: String) -> Reply {
+    fn chat_send(
+        &mut self,
+        session: SessionId,
+        target: ChatTarget,
+        text: String,
+        mentions: Vec<Uid>,
+        attachments: Vec<String>,
+    ) -> Reply {
         let text = text.trim();
-        if text.is_empty() || text.chars().count() > MAX_MESSAGE {
+        // A message may be just attachments.
+        if (text.is_empty() && attachments.is_empty()) || text.chars().count() > MAX_MESSAGE {
             return Err(err(ErrorCode::BadRequest, "message must be 1–4000 characters"));
         }
+        if attachments.len() > MAX_ATTACHMENTS {
+            return Err(err(ErrorCode::BadRequest, "too many attachments"));
+        }
+        let mentions = self.valid_mentions(mentions);
         let author = &self.sessions[&session];
         let mut message = ChatMessage {
             id: 0,
@@ -1058,20 +1178,38 @@ impl Core {
             author_name: author.nickname.clone(),
             text: text.to_owned(),
             sent_at: now_ms(),
+            mentions,
+            attachments: Vec::new(),
+            edited_at: None,
         };
         match target {
             ChatTarget::Channel(channel) => {
                 if !self.can_read(author, channel) {
                     return Err(err(ErrorCode::Forbidden, "no access to this channel"));
                 }
+                let mut files = Vec::with_capacity(attachments.len());
+                for id in &attachments {
+                    match self.store.pending_file(id, &message.author_uid).map_err(storage_error)? {
+                        Some(file) => files.push(file),
+                        None => return Err(err(ErrorCode::NotFound, "no such upload")),
+                    }
+                }
                 message.id = self
                     .store
                     .add_message(channel, &message.author_uid, &message.author_name, &message.text, message.sent_at)
                     .map_err(storage_error)?;
+                self.store.set_mentions(message.id, &message.mentions).map_err(storage_error)?;
+                for file in &files {
+                    self.store.attach_file(&file.id, message.id).map_err(storage_error)?;
+                }
+                message.attachments = files;
                 // Everyone who can read the channel, in voice there or not (for unread counts).
                 let readers: BTreeSet<_> =
                     self.sessions.values().filter(|s| self.can_read(s, channel)).map(|s| s.id).collect();
                 self.broadcast(Event::ChatMessage(message.clone()), |s| readers.contains(&s.id));
+            }
+            ChatTarget::Client(_) | ChatTarget::Server if !attachments.is_empty() => {
+                return Err(err(ErrorCode::BadRequest, "attachments can only be posted in channels"));
             }
             ChatTarget::Client(to) => {
                 if !self.sessions.contains_key(&to) {
@@ -1109,25 +1247,6 @@ impl Core {
         }
         let messages = self.store.history(channel, before, limit.unwrap_or(50).clamp(1, 100)).map_err(storage_error)?;
         Ok(Response::History { messages })
-    }
-
-    fn server_update(&mut self, session: SessionId, u: ServerUpdate) -> Reply {
-        self.require(session, Permission::ServerManage)?;
-        let name = u.name.as_deref().map(|n| clean(n, 64, "server name")).transpose()?;
-        if u.welcome.as_ref().is_some_and(|w| w.chars().count() > 1000) {
-            return Err(err(ErrorCode::BadRequest, "welcome message too long"));
-        }
-        if let Some(name) = name {
-            self.store.set_meta("name", &name).map_err(storage_error)?;
-            self.info.name = name;
-        }
-        if let Some(welcome) = u.welcome {
-            let welcome = welcome.trim().to_owned();
-            self.store.set_meta("welcome", &welcome).map_err(storage_error)?;
-            self.info.welcome = welcome;
-        }
-        self.broadcast(Event::ServerUpdated(self.info.clone()), |_| true);
-        Ok(Response::Empty {})
     }
 
     fn token_create(&mut self, session: SessionId, group: GroupId) -> Reply {

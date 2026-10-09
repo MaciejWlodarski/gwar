@@ -24,6 +24,9 @@ async fn connects_chats_and_reports_errors() {
         web_root: None,
         ice_servers: vec![],
         teamspeak: None,
+        public_url: None,
+        upload_limit: 10 * 1024 * 1024,
+        files_dir: None,
     })
     .await
     .unwrap();
