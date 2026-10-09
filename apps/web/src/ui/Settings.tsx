@@ -1,10 +1,11 @@
 import * as Tabs from "@radix-ui/react-tabs";
-import { Check, Copy, Download, Languages, Monitor, Moon, Palette, SlidersHorizontal, Sun, Upload, UserRound } from "lucide-react";
+import { Bell, Check, Copy, Download, Languages, Monitor, Moon, Palette, SlidersHorizontal, Sun, Upload, UserRound } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { tNow, useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { uidForPublicKey } from "../net/identity";
 import { isDesktop } from "../platform";
+import { notificationsPermission, requestNotifications, type NotificationsPermission } from "../platform/notify";
 import { acceleratorFromEvent, acceleratorParts } from "../platform/desktop";
 import { controller, describeVoiceError } from "../state/controller";
 import { useSettings, type Language, type Theme } from "../state/settings";
@@ -21,6 +22,7 @@ export function SettingsDialog({ tab }: { tab: SettingsTab }) {
   const [current, setCurrent] = useState<SettingsTab>(tab);
   const tabs: Array<{ id: SettingsTab; label: string; icon: ReactNode }> = [
     { id: "audio", label: t("settings.audio"), icon: <SlidersHorizontal className="size-4" /> },
+    { id: "notifications", label: t("settings.notifications"), icon: <Bell className="size-4" /> },
     { id: "appearance", label: t("settings.appearance"), icon: <Palette className="size-4" /> },
     { id: "identity", label: t("settings.identity"), icon: <UserRound className="size-4" /> },
     { id: "language", label: t("settings.language"), icon: <Languages className="size-4" /> },
@@ -42,6 +44,9 @@ export function SettingsDialog({ tab }: { tab: SettingsTab }) {
         </Tabs.List>
         <Tabs.Content value="audio" className="outline-none">
           <AudioTab />
+        </Tabs.Content>
+        <Tabs.Content value="notifications" className="outline-none">
+          <NotificationsTab />
         </Tabs.Content>
         <Tabs.Content value="appearance" className="outline-none">
           <AppearanceTab />
@@ -312,6 +317,62 @@ function AudioTab() {
 }
 
 // --------------------------------------------------------------- appearance
+
+function NotificationsTab() {
+  const t = useT();
+  const prefs = useSettings((s) => s.notifications);
+  const setPrefs = useSettings((s) => s.setNotifications);
+  const [permission, setPermission] = useState<NotificationsPermission | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    void notificationsPermission().then((p) => alive && setPermission(p));
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  // The first time something is switched on the system is asked, from this click.
+  const ask = async () => {
+    const granted = await requestNotifications();
+    setPermission(granted ? "granted" : await notificationsPermission());
+    return granted;
+  };
+  const toggle = (key: keyof typeof prefs) => async (on: boolean) => {
+    setPrefs({ [key]: on });
+    if (on && permission !== "granted") await ask();
+  };
+
+  return (
+    <div>
+      <Section title={t("notify.when")}>
+        <Switch checked={prefs.mentions} onCheckedChange={(v) => void toggle("mentions")(v)} label={t("notify.mentions")} description={t("notify.mentionsHint")} />
+        <Switch
+          checked={prefs.privateMessages}
+          onCheckedChange={(v) => void toggle("privateMessages")(v)}
+          label={t("notify.dms")}
+          description={t("notify.dmsHint")}
+        />
+        <Switch checked={prefs.allMessages} onCheckedChange={(v) => void toggle("allMessages")(v)} label={t("notify.all")} description={t("notify.allHint")} />
+        <p className="text-xs text-subtle">{t("notify.backgroundOnly")}</p>
+      </Section>
+      <Section title={t("notify.permission")}>
+        {permission === "granted" ? (
+          <p className="flex items-center gap-2 text-sm text-ok">
+            <Check className="size-4" /> {t("notify.granted")}
+          </p>
+        ) : permission === "denied" ? (
+          <p className="text-sm text-muted">{isDesktop() ? t("notify.deniedDesktop") : t("notify.denied")}</p>
+        ) : (
+          <div className="flex items-center gap-3">
+            <Button onClick={() => void ask()}>{t("notify.allow")}</Button>
+            <span className="text-xs text-subtle">{t("notify.allowHint")}</span>
+          </div>
+        )}
+      </Section>
+    </div>
+  );
+}
 
 function AppearanceTab() {
   const t = useT();

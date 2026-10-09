@@ -7,7 +7,17 @@ import type { ChannelCreate } from "../proto/ChannelCreate";
 import type { ChannelUpdate } from "../proto/ChannelUpdate";
 import type { ChatTarget } from "../proto/ChatTarget";
 import { tNow, type Key } from "../i18n";
-import { parseServerAddress, parseTeamSpeakAddress, pageContextFromLocation } from "../net/address";
+import { absoluteUrl, httpOriginFromWsUrl, parseServerAddress, parseTeamSpeakAddress, pageContextFromLocation } from "../net/address";
+import { checkUpload } from "../lib/files";
+import { notificationBody, notifyReason } from "../lib/notify-rules";
+import { uploadFromApp } from "../platform/download";
+import { notify } from "../platform/notify";
+import type { BanCreate } from "../proto/BanCreate";
+import type { ChatMessage } from "../proto/ChatMessage";
+import type { GroupCreate } from "../proto/GroupCreate";
+import type { GroupUpdate } from "../proto/GroupUpdate";
+import type { InviteCreate } from "../proto/InviteCreate";
+import type { ServerUpdate } from "../proto/ServerUpdate";
 import {
   ConnectError,
   Connection,
@@ -18,6 +28,7 @@ import {
   type ConnectionStatus,
 } from "../net/connection";
 import { TsConnection } from "../net/ts-connection";
+import { parseBanMessage } from "../lib/ban";
 import { importIdentity, loadOrCreateIdentity, IdentityUnsupportedError, type Identity } from "../net/identity";
 import { isDesktop } from "../platform";
 import { createVoiceEngine } from "../voice";
@@ -50,6 +61,23 @@ export interface ConnectParams {
   address: string;
   nickname: string;
   password?: string;
+  /** Invite code from a link: admits without the server password. */
+  invite?: string;
+}
+
+export type UploadErrorKind = "disabled" | "too_large" | "empty" | "forbidden" | "network" | "aborted" | "unsupported";
+
+export class UploadError extends Error {
+  constructor(readonly kind: UploadErrorKind) {
+    super(`upload failed: ${kind}`);
+    this.name = "UploadError";
+  }
+}
+
+export interface SendOptions {
+  mentions?: string[];
+  /** Ids of finished uploads (channel messages only). */
+  attachments?: string[];
 }
 
 function platform(): "web" | "desktop" {
@@ -70,7 +98,17 @@ export function describeRequestError(e: unknown): string {
 
 export function describeConnectFailure(f: ConnectFailure): string {
   if (f.kind === "address") return f.message;
+  if (f.kind === "banned") return describeBan(parseBanMessage(f.message));
   return tNow(`err.connect.${f.kind}` as Key, { server: f.serverName ?? "" });
+}
+
+/** "You are banned from this server until … Reason: …" */
+export function describeBan({ until, reason }: { until: number | null; reason: string | null }, by?: string): string {
+  const lang = useSettings.getState().language;
+  const parts = [by ? tNow("close.banned", { by }) : tNow("err.connect.banned")];
+  if (until !== null) parts.push(tNow("close.bannedUntil", { when: new Date(until).toLocaleString(lang) }));
+  if (reason) parts.push(tNow("close.bannedReason", { reason }));
+  return parts.join(" ");
 }
 
 export function describeVoiceError(e: VoiceError): string {
@@ -230,7 +268,7 @@ class Controller {
       session.dispatch({ type: "reset" });
       session.dispatch({ type: "phase", phase: "connecting" });
       session.setClose(null);
-      session.setAddress(params.address, kind);
+      session.setAddress(params.address, kind, null);
       conn = new TsConnection({
         address: parsed.value.address,
         nickname: params.nickname.trim(),
@@ -244,7 +282,7 @@ class Controller {
       session.dispatch({ type: "reset" });
       session.dispatch({ type: "phase", phase: "connecting" });
       session.setClose(null);
-      session.setAddress(params.address, kind);
+      session.setAddress(params.address, kind, httpOriginFromWsUrl(parsed.value.url));
 
       try {
         this.identity ??= await loadOrCreateIdentity();
@@ -258,6 +296,7 @@ class Controller {
         identity: this.identity,
         nickname: params.nickname.trim(),
         serverPassword: params.password || undefined,
+        invite: params.invite || undefined,
         client: { name: "vc-web", version: CLIENT_VERSION, platform: platform() },
       });
     }
@@ -284,9 +323,11 @@ class Controller {
       await this.connect(params);
     } catch (e) {
       if (e instanceof ConnectFailure) {
+        // With an invite the server says "wrong password" when the invite is no good (and there is a password).
+        const badInvite = !!params.invite && e.kind === "wrong_password";
         ui.set({
           busy: false,
-          error: describeConnectFailure(e),
+          error: badInvite ? tNow("err.connect.invite") : describeConnectFailure(e),
           needPassword: e.kind === "password_required" || e.kind === "wrong_password" ? true : ui.needPassword,
           serverName: e.serverName ?? null,
         });
@@ -295,7 +336,7 @@ class Controller {
       }
       return false;
     }
-    ui.set({ busy: false, error: null, needPassword: false, serverName: null });
+    ui.set({ busy: false, error: null, needPassword: false, serverName: null, invite: null });
     const settings = useSettings.getState();
     const kind: ServerKind = params.kind ?? "vc";
     settings.setLast(params.address, params.nickname, kind);
@@ -336,7 +377,9 @@ class Controller {
       this.rejoin = null;
     });
     conn.onEvent((event) => {
+      const alert = event.ev === "chat.message" ? this.notificationFor(event.d) : null;
       session.dispatch({ type: "event", event, now: Date.now() });
+      alert?.();
       if (event.ev === "voice.closed") {
         useUi.getState().toast("info", tNow("voice.closed"));
         this.scheduleVoiceRetry(1000);
@@ -393,6 +436,10 @@ class Controller {
     await this.engine.stop();
     this.conn = null;
     useUi.getState().setJoining(null);
+    useUi.getState().setEditing(null);
+    // Dialogs about the session that just ended (server settings, a ban, a picture ...) would sit over the connect screen.
+    const dialog = useUi.getState().dialog.kind;
+    if (dialog !== "none" && dialog !== "settings" && dialog !== "addServer") useUi.getState().closeDialog();
     useOutbox.getState().clear();
     useSession.getState().dispatch({ type: "reset" });
     useVoice.getState().set({ state: "idle", level: 0, pttActive: false, micError: null });
@@ -617,7 +664,49 @@ class Controller {
     return this.attempt(this.connection.request("client.kick", { client, reason: reason ?? null }));
   }
 
-  updateServer(update: { name?: string; welcome?: string }) {
+  // ------------------------------------------------------------- moderation
+
+  createGroup(g: GroupCreate) {
+    return this.connection.request("group.create", g);
+  }
+
+  updateGroup(g: GroupUpdate) {
+    return this.connection.request("group.update", g);
+  }
+
+  deleteGroup(group: number) {
+    return this.connection.request("group.delete", { group });
+  }
+
+  setMemberGroups(uid: string, groups: number[]) {
+    return this.connection.request("member.groups", { uid, groups });
+  }
+
+  createBan(ban: Partial<BanCreate>) {
+    return this.connection.request("ban.create", ban);
+  }
+
+  async listBans() {
+    return (await this.connection.request("ban.list", {})).bans;
+  }
+
+  deleteBan(ban: number) {
+    return this.connection.request("ban.delete", { ban });
+  }
+
+  createInvite(invite: InviteCreate) {
+    return this.connection.request("invite.create", invite);
+  }
+
+  async listInvites() {
+    return (await this.connection.request("invite.list", {})).invites;
+  }
+
+  deleteInvite(code: string) {
+    return this.connection.request("invite.delete", { code });
+  }
+
+  updateServer(update: ServerUpdate) {
     return this.connection.request("server.update", update);
   }
 
@@ -648,7 +737,7 @@ class Controller {
     return peer ? { client: peer.id } : null;
   }
 
-  async sendChat(key: ThreadKey, text: string): Promise<boolean> {
+  async sendChat(key: ThreadKey, text: string, options: SendOptions = {}): Promise<boolean> {
     const state = useSession.getState();
     const target = this.resolveTarget(key);
     const thread = storedKey(state, key);
@@ -656,12 +745,24 @@ class Controller {
       useUi.getState().toast("error", tNow("chat.peerOffline"));
       return false;
     }
-    return this.deliver({ thread, target, text, dmUid: key.startsWith("dm:") ? key.slice(3) : undefined });
+    return this.deliver({
+      thread,
+      target,
+      text,
+      mentions: options.mentions?.length ? options.mentions : undefined,
+      attachments: options.attachments?.length ? options.attachments : undefined,
+      dmUid: key.startsWith("dm:") ? key.slice(3) : undefined,
+    });
   }
 
   private async deliver(m: Omit<FailedSend, "id" | "error">): Promise<boolean> {
     try {
-      await this.connection.request("chat.send", { target: m.target, text: m.text });
+      await this.connection.request("chat.send", {
+        target: m.target,
+        text: m.text,
+        ...(m.mentions ? { mentions: m.mentions } : {}),
+        ...(m.attachments ? { attachments: m.attachments } : {}),
+      });
       return true;
     } catch (e) {
       const locked = e instanceof RequestError && e.code === "forbidden" && typeof m.target === "object" && "channel" in m.target;
@@ -682,7 +783,117 @@ class Controller {
       }
       target = { client: peer.id };
     }
-    await this.deliver({ thread: item.thread, target, text: item.text, dmUid: item.dmUid });
+    await this.deliver({ thread: item.thread, target, text: item.text, mentions: item.mentions, attachments: item.attachments, dmUid: item.dmUid });
+  }
+
+  /** Changes the text of one of my channel messages; shows a toast and returns false on failure. */
+  async editMessage(message: number, text: string, mentions: string[]): Promise<boolean> {
+    return (await this.attempt(this.connection.request("chat.edit", { message, text, ...(mentions.length ? { mentions } : {}) }))) !== undefined;
+  }
+
+  async deleteMessage(message: number): Promise<boolean> {
+    return (await this.attempt(this.connection.request("chat.delete", { message }))) !== undefined;
+  }
+
+  // ----------------------------------------------------------- attachments
+
+  /** Whether this session can attach files (a vc server with uploads on, and the permission). */
+  get canUpload(): boolean {
+    const s = useSession.getState();
+    return s.kind === "vc" && (s.server?.upload_limit ?? 0) > 0 && s.permissions.includes("file_upload");
+  }
+
+  /**
+   * Reserves an upload, sends the bytes with progress and resolves to the file
+   * id to attach to a message. Rejects with {@link UploadError}.
+   */
+  async uploadFile(file: File, opts: { onProgress?: (fraction: number) => void; signal?: AbortSignal } = {}): Promise<string> {
+    const s = useSession.getState();
+    if (s.kind !== "vc") throw new UploadError("unsupported");
+    const check = checkUpload(file.size, s.server?.upload_limit ?? 0);
+    if (!check.ok) throw new UploadError(check.reason);
+    let reserved: { file: string; upload_url: string };
+    try {
+      reserved = await this.connection.request("file.upload", { name: file.name, size: file.size, mime: file.type || "application/octet-stream" });
+    } catch (e) {
+      if (e instanceof RequestError && (e.code === "too_large" || e.code === "forbidden")) throw new UploadError(e.code === "too_large" ? "too_large" : "forbidden");
+      throw new UploadError("network");
+    }
+    const url = absoluteUrl(s.httpOrigin, reserved.upload_url);
+    if (isDesktop()) {
+      // The desktop app sends it itself (no CORS from the app's origin); no byte-level progress there.
+      if (opts.signal?.aborted) throw new UploadError("aborted");
+      opts.onProgress?.(0.5);
+      let status: number;
+      try {
+        status = await uploadFromApp(url, file);
+      } catch {
+        throw new UploadError("network");
+      }
+      if (opts.signal?.aborted) throw new UploadError("aborted");
+      if (status < 200 || status >= 300) throw new UploadError(status === 413 ? "too_large" : status === 403 ? "forbidden" : "network");
+      opts.onProgress?.(1);
+      return reserved.file;
+    }
+    await new Promise<void>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      const abort = () => xhr.abort();
+      opts.signal?.addEventListener("abort", abort, { once: true });
+      xhr.open("PUT", url);
+      xhr.upload.onprogress = (e) => e.lengthComputable && opts.onProgress?.(e.loaded / e.total);
+      xhr.onload = () => {
+        opts.signal?.removeEventListener("abort", abort);
+        if (xhr.status >= 200 && xhr.status < 300) resolve();
+        else reject(new UploadError(xhr.status === 413 ? "too_large" : xhr.status === 403 ? "forbidden" : "network"));
+      };
+      xhr.onerror = () => reject(new UploadError("network"));
+      xhr.onabort = () => reject(new UploadError("aborted"));
+      xhr.send(file);
+    });
+    opts.onProgress?.(1);
+    return reserved.file;
+  }
+
+  /** Absolute URL of an attachment or other server-relative path. */
+  attachmentUrl(path: string): string {
+    return absoluteUrl(useSession.getState().httpOrigin, path);
+  }
+
+  // ----------------------------------------------------------- notifications
+
+  /**
+   * Decides (before the message is applied, while the focus state is still
+   * current) whether a message raises a system notification; returns the thing
+   * to run afterwards.
+   */
+  private notificationFor(msg: ChatMessage): (() => void) | null {
+    const s = useSession.getState();
+    const reason = notifyReason(msg, { meUid: s.me?.uid, focused: s.focused, settings: useSettings.getState().notifications });
+    if (!reason) return null;
+    const channel = typeof msg.target === "object" && "channel" in msg.target ? s.channels[msg.target.channel]?.name : undefined;
+    const title =
+      reason === "dm"
+        ? tNow("notify.dm", { name: msg.author_name })
+        : channel
+          ? tNow("notify.channel", { name: msg.author_name, channel })
+          : tNow("notify.server", { name: msg.author_name, server: s.server?.name ?? "" });
+    return () => {
+      notify({
+        title,
+        body: notificationBody(msg),
+        tag: `msg-${msg.id}-${typeof msg.target === "string" ? "server" : Object.keys(msg.target)[0]}`,
+        onClick: () => this.openMessage(msg),
+      });
+    };
+  }
+
+  /** Brings up the conversation a message belongs to (clicking a notification). */
+  openMessage(msg: ChatMessage): void {
+    const s = useSession.getState();
+    const t = msg.target;
+    if (t === "server") s.dispatch({ type: "setActive", key: "server" });
+    else if ("channel" in t) this.selectChannel(t.channel);
+    else s.dispatch({ type: "openDm", uid: msg.author_uid, name: msg.author_name });
   }
 
   async loadHistory(channel: number): Promise<void> {

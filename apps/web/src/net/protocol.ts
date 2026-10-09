@@ -3,8 +3,11 @@
  * produces and the payload type of each event. The generated unions describe
  * the wire; this file describes the conversation.
  */
+import type { Ban } from "../proto/Ban";
 import type { Channel } from "../proto/Channel";
 import type { ChatMessage } from "../proto/ChatMessage";
+import type { Group } from "../proto/Group";
+import type { Invite } from "../proto/Invite";
 import type { Event } from "../proto/Event";
 import type { Request } from "../proto/Request";
 import type { Welcome } from "../proto/Welcome";
@@ -32,11 +35,24 @@ export interface ResponseMap {
   "channel.update": Channel;
   "channel.delete": Empty;
   "chat.send": ChatMessage;
+  "chat.edit": ChatMessage;
+  "chat.delete": Empty;
   "chat.read": Empty;
   "chat.history": { messages: ChatMessage[] };
   "server.update": Empty;
   "token.create": { token: string };
   "token.redeem": { groups: number[] };
+  "file.upload": { file: string; upload_url: string };
+  "group.create": { group: Group };
+  "group.update": { group: Group };
+  "group.delete": Empty;
+  "member.groups": { groups: number[] };
+  "ban.create": { ban: Ban };
+  "ban.list": { bans: Ban[] };
+  "ban.delete": Empty;
+  "invite.create": { invite: Invite };
+  "invite.list": { invites: Invite[] };
+  "invite.delete": Empty;
   "voice.offer": { sdp: string };
 }
 
@@ -58,4 +74,8 @@ export type RequestInput<O extends Op> = O extends "channel.create"
         ? Partial<RequestData<O>> & { client: number }
         : O extends "channel.update"
           ? Partial<RequestData<O>> & { channel: number }
-          : RequestData<O>;
+          : O extends "ban.create"
+            ? Partial<RequestData<O>>
+            : O extends "file.upload"
+              ? { name: string; size: number; mime: string } // generated as bigint, which JSON cannot carry
+              : RequestData<O>;

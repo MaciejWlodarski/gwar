@@ -50,7 +50,7 @@ export class FakeSocket implements WebSocketLike {
   }
 }
 
-export const serverInfo = { name: "Test", welcome: "hi", version: "0", default_channel: 1, max_clients: 10 };
+export const serverInfo = { name: "Test", welcome: "hi", version: "0", default_channel: 1, max_clients: 10, upload_limit: 0 };
 
 export function challenge(passwordRequired = false) {
   return { ev: "challenge", d: { protocol: 1, nonce: "abc", server: serverInfo, password_required: passwordRequired } };

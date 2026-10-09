@@ -7,9 +7,11 @@ import type { Channel } from "../proto/Channel";
 import type { ChatMessage } from "../proto/ChatMessage";
 import type { Client } from "../proto/Client";
 import type { Event } from "../proto/Event";
+import type { Member } from "../proto/Member";
 import type { Permission } from "../proto/Permission";
 import type { Welcome } from "../proto/Welcome";
 import { AUDIO_SLOTS } from "../net/protocol";
+import { permissionsOf } from "../lib/permissions";
 import type { ChatItem, Phase, SessionState, SysText, Thread, ThreadKey, StoredThreadKey } from "./types";
 
 export const MAX_ITEMS = 1000;
@@ -47,7 +49,7 @@ export type Action =
   | { type: "closeDm"; uid: string }
   | { type: "reset" };
 
-const emptyThread = (): Thread => ({ items: [], unread: 0, hasMore: true, loaded: false, lastRead: 0, locked: false });
+const emptyThread = (): Thread => ({ items: [], unread: 0, mentions: 0, hasMore: true, loaded: false, lastRead: 0, locked: false });
 
 export function channelThreadKey(channel: number): StoredThreadKey {
   return `ch:${channel}`;
@@ -79,9 +81,14 @@ export function myChannelId(state: SessionState): number | null {
 export function computePermissions(state: Pick<SessionState, "groups" | "clients" | "me">, fallback: Permission[] = []): Permission[] {
   const me = state.me ? state.clients[state.me.session] : undefined;
   if (!me) return fallback;
-  const set = new Set<Permission>();
-  for (const g of me.groups) for (const p of state.groups[g]?.permissions ?? []) set.add(p);
-  return [...set];
+  return permissionsOf(me.groups, state.groups);
+}
+
+/** Recomputes what I may do after groups or memberships changed. */
+function refreshPermissions(state: SessionState): SessionState {
+  const permissions = computePermissions(state, state.permissions);
+  const same = permissions.length === state.permissions.length && permissions.every((p, i) => p === state.permissions[i]);
+  return same ? state : { ...state, permissions };
 }
 
 function sysItem(at: number, text: SysText, salt: string): ChatItem {
@@ -92,11 +99,21 @@ function msgItem(msg: ChatMessage): ChatItem {
   return { kind: "msg", key: `m${msg.id}`, at: msg.sent_at, msg };
 }
 
-function pushItem(thread: Thread, item: ChatItem, countUnread: boolean): Thread {
+function pushItem(thread: Thread, item: ChatItem, countUnread: boolean, mentionsMe = false): Thread {
   if (item.kind === "msg" && thread.items.some((i) => i.key === item.key)) return thread;
   let items = [...thread.items, item];
   if (items.length > MAX_ITEMS) items = items.slice(items.length - MAX_ITEMS);
-  return { ...thread, items, unread: thread.unread + (countUnread ? 1 : 0) };
+  return {
+    ...thread,
+    items,
+    unread: thread.unread + (countUnread ? 1 : 0),
+    mentions: thread.mentions + (countUnread && mentionsMe ? 1 : 0),
+  };
+}
+
+/** Whether a message names me. */
+export function mentionsUser(msg: ChatMessage, uid: string | undefined): boolean {
+  return !!uid && (msg.mentions ?? []).includes(uid);
 }
 
 function withThread(state: SessionState, key: StoredThreadKey, fn: (t: Thread) => Thread): SessionState {
@@ -121,6 +138,11 @@ export function latestMessageId(thread: Thread | undefined): number {
     if (item?.kind === "msg") return item.msg.id;
   }
   return 0;
+}
+
+/** Unread messages in a channel that mention me (0 if unknown). */
+export function channelMentions(state: Pick<SessionState, "threads">, channel: number): number {
+  return state.threads[channelThreadKey(channel)]?.mentions ?? 0;
 }
 
 /** Unread messages in a channel (0 if unknown). */
@@ -176,13 +198,75 @@ function onChatMessage(state: SessionState, msg: ChatMessage): SessionState {
       : msg.author_name
     : undefined;
   return withThread(state, key, (t) => {
-    const next = pushItem({ ...t, locked: key.startsWith("ch:") ? false : t.locked }, msgItem(msg), !mine && !isViewing(state, key));
+    const next = pushItem(
+      { ...t, locked: key.startsWith("ch:") ? false : t.locked },
+      msgItem(msg),
+      !mine && !isViewing(state, key),
+      mentionsUser(msg, state.me?.uid),
+    );
     if (key.startsWith("dm:") && !next.peer) {
       return { ...next, peer: { uid: key.slice(3), name: peerName ?? msg.author_name } };
     }
     if (key.startsWith("dm:") && next.peer && !mine) return { ...next, peer: { ...next.peer, name: msg.author_name } };
     return next;
   });
+}
+
+/** An edited message replaces the old text in place; unread counts do not change. */
+function onChatEdited(state: SessionState, msg: ChatMessage): SessionState {
+  const key = threadForMessage(state, msg);
+  const thread = key ? state.threads[key] : undefined;
+  if (!key || !thread) return state;
+  const itemKey = `m${msg.id}`;
+  const old = thread.items.find((i) => i.key === itemKey);
+  if (!old || old.kind !== "msg") return state;
+  const wasMention = mentionsUser(old.msg, state.me?.uid);
+  const isMention = mentionsUser(msg, state.me?.uid);
+  const unreadMention = msg.id > thread.lastRead && thread.unread > 0 && msg.author_uid !== state.me?.uid;
+  const mentions = unreadMention ? Math.max(0, thread.mentions + Number(isMention) - Number(wasMention)) : thread.mentions;
+  return withThread(state, key, (t) => ({ ...t, mentions, items: t.items.map((i) => (i.key === itemKey ? msgItem(msg) : i)) }));
+}
+
+function onChatDeleted(state: SessionState, channel: number, message: number): SessionState {
+  const key = channelThreadKey(channel);
+  const thread = state.threads[key];
+  const itemKey = `m${message}`;
+  const old = thread?.items.find((i) => i.key === itemKey);
+  if (!thread) return state;
+  // The server counts unread messages itself; mirror it for the one that went away.
+  const wasUnread = !!old && old.kind === "msg" && message > thread.lastRead && thread.unread > 0 && old.msg.author_uid !== state.me?.uid;
+  const wasMention = wasUnread && old?.kind === "msg" && mentionsUser(old.msg, state.me?.uid);
+  return withThread(state, key, (t) => ({
+    ...t,
+    items: t.items.filter((i) => i.key !== itemKey),
+    unread: Math.max(0, t.unread - Number(wasUnread)),
+    mentions: Math.max(0, t.mentions - Number(wasMention)),
+  }));
+}
+
+function onGroupDeleted(state: SessionState, group: number): SessionState {
+  const { [group]: _gone, ...groups } = state.groups;
+  const strip = (ids: number[]) => (ids.includes(group) ? ids.filter((g) => g !== group) : ids);
+  const clients = Object.fromEntries(Object.entries(state.clients).map(([id, c]) => [id, c.groups.includes(group) ? { ...c, groups: strip(c.groups) } : c]));
+  const members = Object.fromEntries(Object.entries(state.members).map(([uid, m]) => [uid, m.groups.includes(group) ? { ...m, groups: strip(m.groups) } : m]));
+  return refreshPermissions({ ...state, groups, clients, members });
+}
+
+function onMemberUpdated(state: SessionState, member: Member): SessionState {
+  // Online sessions of the same person carry their own copy of the groups.
+  let changed = false;
+  const clients = Object.fromEntries(
+    Object.entries(state.clients).map(([id, c]) => {
+      if (c.uid !== member.uid || sameIds(c.groups, member.groups)) return [id, c];
+      changed = true;
+      return [id, { ...c, groups: member.groups }];
+    }),
+  );
+  return refreshPermissions({ ...state, members: { ...state.members, [member.uid]: member }, clients: changed ? clients : state.clients });
+}
+
+function sameIds(a: readonly number[], b: readonly number[]): boolean {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
 }
 
 function removeClient(state: SessionState, id: number): SessionState {
@@ -209,14 +293,17 @@ function channelNotices(prev: SessionState, next: SessionState, at: number, id: 
 
 function reduceEvent(state: SessionState, event: Event, now: number): SessionState {
   switch (event.ev) {
-    // Not shown yet.
     case "chat.edited":
+      return onChatEdited(state, event.d);
     case "chat.deleted":
+      return onChatDeleted(state, event.d.channel, event.d.message);
     case "group.created":
     case "group.updated":
+      return refreshPermissions({ ...state, groups: { ...state.groups, [event.d.id]: event.d } });
     case "group.deleted":
+      return onGroupDeleted(state, event.d.group);
     case "member.updated":
-      return state;
+      return onMemberUpdated(state, event.d);
     case "server.updated":
       return { ...state, server: event.d };
     case "channel.created":
@@ -271,6 +358,7 @@ function reduceEvent(state: SessionState, event: Event, now: number): SessionSta
         ...t,
         lastRead: Math.max(t.lastRead, message),
         unread: message >= latestMessageId(t) ? 0 : t.unread,
+        mentions: message >= latestMessageId(t) ? 0 : t.mentions,
       }));
     }
     case "voice.talking": {
@@ -330,11 +418,11 @@ export function reduce(state: SessionState, action: Action): SessionState {
       next = withThread(next, channelThreadKey(view), () => emptyThread());
       for (const u of w.unread ?? []) {
         if (!channels[u.channel]) continue;
-        next = withThread(next, channelThreadKey(u.channel), (t) => ({ ...t, unread: u.count, lastRead: u.last_read }));
+        next = withThread(next, channelThreadKey(u.channel), (t) => ({ ...t, unread: u.count, mentions: Math.min(u.mentions ?? 0, u.count), lastRead: u.last_read }));
       }
       // The channel I am looking at is on screen: nothing there is unread.
       if (storedKey(next, next.activeThread) === channelThreadKey(view) && next.focused) {
-        next = withThread(next, channelThreadKey(view), (t) => ({ ...t, unread: 0 }));
+        next = withThread(next, channelThreadKey(view), (t) => ({ ...t, unread: 0, mentions: 0 }));
       }
       if (action.resync) {
         next = withThread(next, "server", (t) => pushItem(t, sysItem(action.now, { key: "sys.reconnected" }, "re"), false));
@@ -370,7 +458,7 @@ export function reduce(state: SessionState, action: Action): SessionState {
     case "selectChannel": {
       if (!state.channels[action.channel]) return state;
       const next = { ...state, viewChannel: action.channel, activeThread: "channel" as const };
-      return withThread(next, channelThreadKey(action.channel), (t) => (t.unread === 0 ? t : { ...t, unread: 0 }));
+      return withThread(next, channelThreadKey(action.channel), (t) => (t.unread === 0 ? t : { ...t, unread: 0, mentions: 0 }));
     }
     case "focus": {
       if (state.focused === action.focused) return state;
@@ -378,13 +466,13 @@ export function reduce(state: SessionState, action: Action): SessionState {
       if (!action.focused) return next;
       const key = storedKey(next, next.activeThread);
       if (!key || !next.threads[key] || next.threads[key].unread === 0) return next;
-      return withThread(next, key, (t) => ({ ...t, unread: 0 }));
+      return withThread(next, key, (t) => ({ ...t, unread: 0, mentions: 0 }));
     }
     case "setActive": {
       const next = { ...state, activeThread: action.key };
       const key = storedKey(next, action.key);
       if (!key || !next.threads[key] || next.threads[key].unread === 0) return next;
-      return withThread(next, key, (t) => ({ ...t, unread: 0 }));
+      return withThread(next, key, (t) => ({ ...t, unread: 0, mentions: 0 }));
     }
     case "openDm": {
       const key = dmKey(action.uid);

@@ -16,6 +16,20 @@ export function UnreadBadge({ count, className }: { count: number; className?: s
   );
 }
 
+/** Pill with the number of unread messages that mention me. */
+export function MentionBadge({ count, className }: { count: number; className?: string }) {
+  const t = useT();
+  if (count <= 0) return null;
+  return (
+    <span
+      title={t("tree.mentions", { count: unreadLabel(count) })}
+      className={cn("shrink-0 rounded-full bg-danger px-1.5 text-[11px] leading-4 font-semibold text-white tabular-nums", className)}
+    >
+      @{unreadLabel(count)}
+    </span>
+  );
+}
+
 /** Marks a server as a TeamSpeak server (as opposed to a native vc/1 one). */
 export function TeamSpeakBadge({ className, short }: { className?: string; short?: boolean }) {
   const t = useT();

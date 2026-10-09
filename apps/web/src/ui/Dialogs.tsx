@@ -10,6 +10,9 @@ import { newId, useSettings, type ServerKind } from "../state/settings";
 import { useSession, useUi } from "../state/stores";
 import { Button, Dialog, Field, Input, Segmented, Select, Textarea } from "./kit";
 import { SettingsDialog } from "./Settings";
+import { BanDialog } from "./BanDialog";
+import { Lightbox } from "./Attachments";
+import { InvitesDialog, ServerSettingsDialog } from "./ServerSettings";
 
 export function Dialogs() {
   const dialog = useUi((s) => s.dialog);
@@ -25,7 +28,13 @@ export function Dialogs() {
     case "channelPassword":
       return <ChannelPasswordDialog channel={dialog.channel} />;
     case "serverSettings":
-      return <ServerSettingsDialog />;
+      return <ServerSettingsDialog tab={dialog.tab} />;
+    case "invites":
+      return <InvitesDialog />;
+    case "ban":
+      return <BanDialog person={dialog.person} back={dialog.back} />;
+    case "lightbox":
+      return <Lightbox url={dialog.url} name={dialog.name} />;
     case "redeem":
       return <RedeemDialog />;
     case "createToken":
@@ -360,59 +369,6 @@ function ChannelPasswordDialog({ channel }: { channel: number }) {
 }
 
 // ------------------------------------------------------------------- server
-
-function ServerSettingsDialog() {
-  const t = useT();
-  const close = useClose();
-  const server = useSession((s) => s.server);
-  const [name, setName] = useState(server?.name ?? "");
-  const [welcome, setWelcome] = useState(server?.welcome ?? "");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const submit = async (e?: FormEvent) => {
-    e?.preventDefault();
-    if (busy || !name.trim()) return;
-    setBusy(true);
-    try {
-      await controller.updateServer({ name: name.trim(), welcome });
-      close();
-    } catch (err) {
-      setError(describeRequestError(err));
-      setBusy(false);
-    }
-  };
-
-  return (
-    <Dialog
-      open
-      onOpenChange={(o) => !o && close()}
-      title={t("server.settings")}
-      footer={
-        <>
-          <Button onClick={close}>{t("common.cancel")}</Button>
-          <Button variant="primary" busy={busy} disabled={!name.trim()} onClick={() => void submit()}>
-            {t("common.save")}
-          </Button>
-        </>
-      }
-    >
-      <form onSubmit={(e) => void submit(e)} className="flex flex-col gap-3">
-        <Field label={t("serverSettings.name")}>
-          {(id) => <Input id={id} value={name} onChange={(e) => setName(e.target.value)} maxLength={64} autoFocus />}
-        </Field>
-        <Field label={t("serverSettings.welcome")} hint={t("serverSettings.welcomeHint")}>
-          {(id) => <Textarea id={id} rows={4} value={welcome} onChange={(e) => setWelcome(e.target.value)} maxLength={1000} />}
-        </Field>
-        {error && (
-          <p role="alert" className="rounded-md bg-danger-soft px-3 py-2 text-sm text-danger">
-            {error}
-          </p>
-        )}
-      </form>
-    </Dialog>
-  );
-}
 
 function RedeemDialog() {
   const t = useT();
