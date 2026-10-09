@@ -99,6 +99,8 @@ struct Cli {
 enum Command {
     /// Print a new one-time token granting the Admin group.
     AdminToken,
+    /// Write a consistent copy of the database to this file (safe while running).
+    Backup { path: PathBuf },
 }
 
 /// The address the OS would route public traffic from; no packets are sent.
@@ -117,10 +119,18 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&cli.data_dir).with_context(|| format!("create {}", cli.data_dir.display()))?;
     let database = cli.data_dir.join("vc.sqlite3");
 
-    if let Some(Command::AdminToken) = cli.command {
-        let token = issue_token(&Store::open(&database)?, ADMIN_GROUP)?;
-        println!("{token}");
-        return Ok(());
+    match cli.command {
+        Some(Command::AdminToken) => {
+            let token = issue_token(&Store::open(&database)?, ADMIN_GROUP)?;
+            println!("{token}");
+            return Ok(());
+        }
+        Some(Command::Backup { path }) => {
+            Store::open(&database)?.backup_to(&path)?;
+            println!("{}", path.display());
+            return Ok(());
+        }
+        None => {}
     }
 
     let ice_servers: Vec<IceServer> = match &cli.ice_servers {

@@ -204,6 +204,12 @@ impl Store {
         Ok(())
     }
 
+    /// A consistent copy of the database, safe while the server runs (for backups).
+    pub fn backup_to(&self, path: &Path) -> Result<()> {
+        self.db.execute("VACUUM INTO ?1", [path.to_string_lossy()])?;
+        Ok(())
+    }
+
     pub fn meta(&self, key: &str) -> Result<Option<String>> {
         Ok(self.db.query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0)).optional()?)
     }
