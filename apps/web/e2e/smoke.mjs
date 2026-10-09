@@ -8,8 +8,11 @@
  * Channels created by the test get a per-run suffix and are deleted at the end, so it
  * can run repeatedly against a server that already has data (e.g. E2E_REUSE=1).
  *
- * Starts (and stops) a throwaway server with an empty data dir, and the Vite
- * dev server when it is not already running. Environment:
+ * Starts (and stops) a throwaway server with an empty data dir, a throwaway
+ * Gwar Connect service (built with `cargo build -p gwar-connect`) and the Vite
+ * dev server when it is not already running (an already running one must have
+ * been started with VITE_CONNECT_URL pointing at a Connect service whose
+ * --origin is WEB_URL, or the Gwar Connect checks fail). Environment:
  *   WEB_URL      default http://127.0.0.1:5173
  *   SERVER_HTTP  default 127.0.0.1:8799 (host:port, TCP for WS and UDP for media)
  *   E2E_REUSE=1  use the server already running at SERVER_HTTP instead of a
@@ -19,6 +22,8 @@
  *                  falling back to `cargo run -p vc-server`)
  *   E2E_LATENCY_MS  simulate this round-trip time (ms) on the WebSocket via a local
  *                   delaying TCP proxy (default 0). The suite must pass at any value.
+ *   GWAR_CONNECT_BIN  path to the gwar-connect binary (default ../../target/debug/gwar-connect,
+ *                     falling back to `cargo run -p gwar-connect`)
  *   HEADED=1     show the browser
  */
 import { spawn, spawnSync } from "node:child_process";
@@ -74,7 +79,7 @@ async function waitFor(fn, what, timeout = 15000) {
   throw new Error(`timeout waiting for ${what}`);
 }
 
-async function ensureServer() {
+async function ensureServer(connectUrl) {
   if (process.env.E2E_REUSE && (await reachable(`http://${SERVER}/health`))) {
     console.log(`using running server at ${SERVER}`);
     if (process.env.ADMIN_TOKEN) return process.env.ADMIN_TOKEN;
@@ -89,7 +94,7 @@ async function ensureServer() {
   }
   const dataDir = mkdtempSync(path.join(tmpdir(), "vc-e2e-"));
   const bin = process.env.VC_SERVER_BIN ?? path.join(repoRoot, "target/debug/vc-server");
-  const args = ["--data-dir", dataDir, "--http", SERVER, "--media", SERVER, "--public-ip", SERVER.split(":")[0]];
+  const args = ["--data-dir", dataDir, "--http", SERVER, "--media", SERVER, "--public-ip", SERVER.split(":")[0], "--connect-url", connectUrl];
   const child = existsSync(bin)
     ? spawn(bin, args, { cwd: repoRoot })
     : spawn("cargo", ["run", "-q", "-p", "vc-server", "--", ...args], { cwd: repoRoot });
@@ -125,9 +130,37 @@ function startLatencyProxy() {
   console.log(`simulating ${LATENCY_MS} ms RTT on ${CLIENT_ADDR} -> ${SERVER}`);
 }
 
-async function ensureWeb() {
+/** Starts a throwaway Gwar Connect service that accepts the web app's origin; returns its base URL. */
+async function ensureConnect() {
+  const port = await new Promise((resolve) => {
+    const probe = net.createServer().listen(0, "127.0.0.1", () => {
+      const { port } = probe.address();
+      probe.close(() => resolve(port));
+    });
+  });
+  const dataDir = mkdtempSync(path.join(tmpdir(), "gwar-connect-e2e-"));
+  const bin = process.env.GWAR_CONNECT_BIN ?? path.join(repoRoot, "target/debug/gwar-connect");
+  const args = ["--data-dir", dataDir, "--http", `127.0.0.1:${port}`, "--origin", new URL(WEB_URL).origin];
+  const child = existsSync(bin)
+    ? spawn(bin, args, { cwd: repoRoot })
+    : spawn("cargo", ["run", "-q", "-p", "gwar-connect", "--", ...args], { cwd: repoRoot });
+  child.on("exit", (code) => code && console.error(`gwar-connect exited with code ${code}`));
+  children.push(child);
+  const base = `http://127.0.0.1:${port}`;
+  await waitFor(async () => {
+    try {
+      return (await fetch(`${base}/v1/revocations?since=0`, { signal: AbortSignal.timeout(1000) })).ok;
+    } catch {
+      return false;
+    }
+  }, "gwar-connect start", 120000);
+  console.log(`started gwar-connect at ${base} (data dir ${dataDir})`);
+  return base;
+}
+
+async function ensureWeb(connectUrl) {
   if (await reachable(WEB_URL)) return;
-  const child = spawn("npx", ["vite", "--host", "127.0.0.1"], { cwd: webRoot });
+  const child = spawn("npx", ["vite", "--host", "127.0.0.1"], { cwd: webRoot, env: { ...process.env, VITE_CONNECT_URL: connectUrl } });
   children.push(child);
   await waitFor(() => reachable(WEB_URL), "vite dev server", 30000);
   console.log("started vite dev server");
@@ -214,7 +247,7 @@ async function connect(page, nickname, { mobile = false, address = CLIENT_ADDR }
   await page.goto(WEB_URL);
   await page.getByLabel("Server address").fill(address);
   await page.getByLabel("Nickname").fill(nickname);
-  await page.getByRole("button", { name: "Connect" }).click();
+  await page.getByRole("button", { name: "Connect", exact: true }).click();
   // After connecting you are on the server, not in voice. On phones the voice panel lives in the drawer.
   if (mobile) await page.getByRole("button", { name: "Channels and servers" }).waitFor({ timeout: 20000 });
   else await page.getByText("Not in voice").waitFor({ timeout: 20000 });
@@ -239,8 +272,9 @@ async function shot(page, name) {
 }
 
 async function main() {
-  const token = await ensureServer();
-  await ensureWeb();
+  const connectUrl = await ensureConnect();
+  const token = await ensureServer(connectUrl);
+  await ensureWeb(connectUrl);
   if (LATENCY_MS > 0) startLatencyProxy();
 
   const browser = await chromium.launch({
@@ -695,7 +729,7 @@ async function main() {
     await e.goto(WEB_URL);
     await e.getByLabel("Server address").fill(CLIENT_ADDR);
     await e.getByLabel("Nickname").fill("Erin");
-    await e.getByRole("button", { name: "Connect" }).click();
+    await e.getByRole("button", { name: "Connect", exact: true }).click();
     await e.getByText("Not in voice").waitFor({ timeout: 20000 });
     await treeItem(e, /Lobby/).dblclick();
     await e.getByText("Voice connected").waitFor({ timeout: 20000 });
@@ -747,7 +781,7 @@ async function main() {
     await e.goto(WEB_URL);
     await e.getByLabel("Server address").fill(CLIENT_ADDR);
     await e.getByLabel("Nickname").fill("Eve");
-    await e.getByRole("button", { name: "Connect" }).click();
+    await e.getByRole("button", { name: "Connect", exact: true }).click();
     await e.getByText("Not in voice").waitFor({ timeout: 15000 });
     await sleep(500);
     if ((await e.getByText(/Microphone access is blocked/).count()) !== 0) throw new Error("mic error before joining voice");
@@ -960,7 +994,7 @@ async function main() {
     await waitFor(async () => (await ivy.getByLabel("Server address").inputValue()) === CLIENT_ADDR, "prefilled server address");
     await shot(ivy, "26-invite-join-dark");
     await ivy.getByLabel("Nickname").fill("Ivy");
-    await ivy.getByRole("button", { name: "Connect" }).click();
+    await ivy.getByRole("button", { name: "Connect", exact: true }).click();
     await ivy.getByText("Not in voice").waitFor({ timeout: 20000 });
     await waitFor(async () => (await nameColor(a, memberSection(a, "Online").getByText("Ivy", { exact: true }))) === ROLE_RGB, "Ivy has the invite's role colour");
 
@@ -991,9 +1025,9 @@ async function main() {
     await b.getByText(/Reason: e2e spam/).waitFor();
     await shot(b, "28-banned-dark");
     await sleep(2500);
-    if ((await b.getByRole("button", { name: "Connect" }).count()) === 0) throw new Error("banned client reconnected");
+    if ((await b.getByRole("button", { name: "Connect", exact: true }).count()) === 0) throw new Error("banned client reconnected");
     // Connecting again is refused with the reason.
-    await b.getByRole("button", { name: "Connect" }).click();
+    await b.getByRole("button", { name: "Connect", exact: true }).click();
     await b.getByRole("alert").filter({ hasText: /banned/ }).filter({ hasText: "e2e spam" }).first().waitFor({ timeout: 8000 });
     // The ban is listed with its reason; lifting it lets Bob in.
     await openSettings(a, "Bans");
@@ -1004,7 +1038,7 @@ async function main() {
     await ban.getByRole("button", { name: "Unban" }).click();
     await ban.waitFor({ state: "detached" });
     await a.keyboard.press("Escape");
-    await b.getByRole("button", { name: "Connect" }).click();
+    await b.getByRole("button", { name: "Connect", exact: true }).click();
     await b.getByText("Not in voice").waitFor({ timeout: 20000 });
     await treeItem(b, TALK).dblclick();
     await b.getByText("Voice connected").waitFor({ timeout: 20000 });
@@ -1017,7 +1051,7 @@ async function main() {
     await a.getByRole("dialog").getByRole("button", { name: "Kick from server" }).click();
     await b.getByText(/You were kicked from the server by Alice/).waitFor({ timeout: 5000 });
     await sleep(2500);
-    if ((await b.getByRole("button", { name: "Connect" }).count()) === 0) throw new Error("kicked client reconnected");
+    if ((await b.getByRole("button", { name: "Connect", exact: true }).count()) === 0) throw new Error("kicked client reconnected");
     await shot(b, "17-kicked-dark");
   });
 
@@ -1081,7 +1115,7 @@ async function main() {
         await w.goto(`http://127.0.0.1:${port}/`);
         await waitFor(async () => (await w.getByLabel("Server address").inputValue()) === `127.0.0.1:${port}`, "prefilled address", 5000);
         await w.getByLabel("Nickname").fill("Webby");
-        await w.getByRole("button", { name: "Connect" }).click();
+        await w.getByRole("button", { name: "Connect", exact: true }).click();
         await w.getByText("Not in voice").waitFor({ timeout: 20000 });
         await w.getByRole("treeitem", { name: /Lobby/ }).dblclick();
         await w.getByText("Voice connected").waitFor({ timeout: 20000 });
@@ -1095,6 +1129,124 @@ async function main() {
       }
     });
   }
+
+  // ---- Gwar Connect: one identity on every device
+  const readUid = async (page) => {
+    const field = page.getByLabel("User ID");
+    await waitFor(async () => (await field.inputValue()) !== "", "the user id", 10000);
+    return field.inputValue();
+  };
+  const settingsUid = async (page) => {
+    await page.getByRole("button", { name: "Settings" }).first().click();
+    await page.getByRole("tab", { name: "Identity" }).click();
+    return readUid(page);
+  };
+  const acct = `alice${rid}`;
+  const acctPassword = "correct horse battery";
+  let localUid = "";
+  let accountUid = "";
+  let recoveryCode = "";
+  const ctxC = await newCtx();
+  const c = await ctxC.newPage();
+  debugPages.push(c);
+  const ctxD = await newCtx();
+  const d = await ctxD.newPage();
+  debugPages.push(d);
+  const fd = recordFrames(d);
+
+  await check("connect: a new account keeps the local identity and shows the recovery code once", async () => {
+    await c.goto(WEB_URL);
+    localUid = await settingsUid(c);
+    if (!localUid) throw new Error("no local uid");
+    await c.getByRole("tab", { name: "Account" }).click();
+    await c.getByRole("button", { name: /Create an account/ }).click();
+    await c.getByLabel("Handle").fill(acct);
+    await c.getByLabel("Password", { exact: true }).fill(acctPassword);
+    await c.getByLabel("Repeat the password").fill(acctPassword);
+    await c.getByRole("radio", { name: "Keep my current identity" }).waitFor();
+    await shot(c, "19-account-create");
+    await c.getByRole("button", { name: "Create account" }).click();
+    await c.getByTestId("recovery-code").waitFor({ timeout: 30000 });
+    recoveryCode = (await c.getByTestId("recovery-code").innerText()).trim();
+    if (!/^([A-Z2-7]{4}-){7}[A-Z2-7]{4}$/.test(recoveryCode)) throw new Error(`bad recovery code ${recoveryCode}`);
+    const cont = c.getByRole("button", { name: "Continue" });
+    if (await cont.isEnabled()) throw new Error("continue must wait for the confirmation");
+    await shot(c, "20-account-recovery-code");
+    await c.getByRole("checkbox", { name: "I saved my recovery code" }).check();
+    await cont.click();
+    await c.getByText(`Signed in as @${acct}`).first().waitFor();
+    await c.getByRole("tab", { name: "Identity" }).click();
+    accountUid = await readUid(c);
+    if (accountUid !== localUid) throw new Error(`kept identity changed uid: ${localUid} -> ${accountUid}`);
+    if (await c.getByRole("button", { name: "Export identity" }).count()) throw new Error("device keys must not be exportable");
+  });
+
+  await check("connect: a second browser signs in to the same account and has the same uid", async () => {
+    await d.goto(WEB_URL);
+    const own = await settingsUid(d);
+    if (own === localUid) throw new Error("second browser should start with its own local identity");
+    await d.getByRole("tab", { name: "Account" }).click();
+    await d.getByLabel("Handle").fill(`@${acct.toUpperCase()}`);
+    await d.getByLabel("Password", { exact: true }).fill("wrong password");
+    await d.getByRole("button", { name: "Sign in", exact: true }).click();
+    await d.getByRole("alert").filter({ hasText: "Wrong handle or password" }).waitFor({ timeout: 30000 });
+    await d.getByLabel("Password", { exact: true }).fill(acctPassword);
+    await d.getByRole("button", { name: "Sign in", exact: true }).click();
+    await d.getByRole("button", { name: "Sign out" }).first().waitFor({ timeout: 30000 });
+    await d.getByRole("tab", { name: "Identity" }).click();
+    const uid = await readUid(d);
+    if (uid !== localUid) throw new Error(`second device uid ${uid} != ${localUid}`);
+    await shot(d, "21-account-identity");
+    await d.keyboard.press("Escape");
+  });
+
+  await check("connect: the server knows the signed-in device by the account's uid", async () => {
+    await connect(d, "Alice phone");
+    const welcomed = fd.frames.map((f) => f.ok).find((ok) => ok?.uid);
+    if (!welcomed) throw new Error("no welcome received");
+    if (welcomed.uid !== localUid) throw new Error(`server uid ${welcomed.uid} != account uid ${localUid}`);
+  });
+
+  await check("connect: the first browser revokes the second device with the password", async () => {
+    await c.getByRole("tab", { name: "Account" }).click();
+    const devices = c.getByRole("list", { name: "Devices" });
+    await devices.getByRole("listitem").nth(1).waitFor({ timeout: 10000 });
+    if ((await devices.getByRole("listitem").count()) !== 2) throw new Error("expected two devices");
+    if ((await devices.getByText("This device").count()) !== 1) throw new Error("this device must be marked");
+    await shot(c, "22-account-devices");
+    await devices.getByRole("button", { name: "Revoke" }).click();
+    const prompt = c.getByRole("dialog").filter({ hasText: "Enter your password to revoke" });
+    await prompt.getByLabel("Password").fill("wrong password");
+    await prompt.getByRole("button", { name: "Revoke" }).click();
+    await prompt.getByRole("alert").filter({ hasText: "Wrong password" }).waitFor({ timeout: 30000 });
+    await prompt.getByLabel("Password").fill(acctPassword);
+    await prompt.getByRole("button", { name: "Revoke" }).click();
+    await devices.getByText("Revoked", { exact: true }).waitFor({ timeout: 30000 });
+    if ((await devices.getByRole("button", { name: "Revoke" }).count()) !== 0) throw new Error("revoked devices can't be revoked again");
+  });
+
+  await check("connect: changing the password works and the old one stops", async () => {
+    await c.getByLabel("Current password").fill(acctPassword);
+    await c.getByLabel("New password").fill("another long password");
+    await c.getByLabel("Repeat the password").fill("another long password");
+    await c.getByRole("button", { name: "Change password" }).last().click();
+    await c.getByText("Password changed.").waitFor({ timeout: 30000 });
+  });
+
+  await check("connect: signing out brings the local identity back; the recovery code signs in again", async () => {
+    await c.getByRole("button", { name: "Sign out" }).last().click();
+    await c.getByText("Signed out.").first().waitFor();
+    await c.getByRole("tab", { name: "Identity" }).click();
+    if ((await readUid(c)) !== localUid) throw new Error("local identity was not restored");
+    await c.getByRole("tab", { name: "Account" }).click();
+    await c.getByRole("button", { name: /Recover with a code/ }).click();
+    await c.getByLabel("Handle").fill(acct);
+    await c.getByLabel("Recovery code").fill(recoveryCode.toLowerCase().replaceAll("-", " "));
+    await c.getByLabel("New password").fill("recovered password");
+    await c.getByLabel("Repeat the password").fill("recovered password");
+    await c.getByRole("button", { name: "Recover account" }).click();
+    await c.getByRole("button", { name: "Sign out" }).first().waitFor({ timeout: 30000 });
+  });
 
   await check("test channels are cleaned up", async () => {
     for (const name of [GAMES, TALK, SECRET, BULK]) {

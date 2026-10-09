@@ -1,9 +1,11 @@
 import * as Tabs from "@radix-ui/react-tabs";
-import { Bell, Check, Copy, Download, Languages, Monitor, Moon, Palette, SlidersHorizontal, Sun, Upload, UserRound } from "lucide-react";
+import { Bell, Check, CloudCog, Copy, Download, Languages, Monitor, Moon, Palette, SlidersHorizontal, Sun, Upload, UserRound } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { tNow, useT } from "../i18n";
 import { cn } from "../lib/cn";
-import { uidForPublicKey } from "../net/identity";
+import { accountKeyOf, uidForPublicKey } from "../net/identity";
+import { useAccount } from "../state/account";
+import { AccountTab } from "./AccountSettings";
 import { isDesktop } from "../platform";
 import { notificationsPermission, requestNotifications, type NotificationsPermission } from "../platform/notify";
 import { acceleratorFromEvent, acceleratorParts } from "../platform/desktop";
@@ -25,6 +27,7 @@ export function SettingsDialog({ tab }: { tab: SettingsTab }) {
     { id: "notifications", label: t("settings.notifications"), icon: <Bell className="size-4" /> },
     { id: "appearance", label: t("settings.appearance"), icon: <Palette className="size-4" /> },
     { id: "identity", label: t("settings.identity"), icon: <UserRound className="size-4" /> },
+    { id: "account", label: t("settings.account"), icon: <CloudCog className="size-4" /> },
     { id: "language", label: t("settings.language"), icon: <Languages className="size-4" /> },
   ];
   return (
@@ -53,6 +56,9 @@ export function SettingsDialog({ tab }: { tab: SettingsTab }) {
         </Tabs.Content>
         <Tabs.Content value="identity" className="outline-none">
           <IdentityTab />
+        </Tabs.Content>
+        <Tabs.Content value="account" className="outline-none">
+          <AccountTab />
         </Tabs.Content>
         <Tabs.Content value="language" className="outline-none">
           <LanguageTab />
@@ -428,22 +434,23 @@ function IdentityTab() {
   const [busy, setBusy] = useState(false);
   const file = useRef<HTMLInputElement>(null);
 
+  const connected = useAccount((s) => s.account);
   const [version, setVersion] = useState(0);
   useEffect(() => {
     let alive = true;
     controller
       .getIdentity()
       .then(async (id) => {
-        const u = await uidForPublicKey(id.publicKey);
+        const u = await uidForPublicKey(accountKeyOf(id));
         if (!alive) return;
-        setPublicKey(id.publicKey);
+        setPublicKey(accountKeyOf(id));
         setUid(u);
       })
       .catch(() => alive && useUi.getState().toast("error", tNow("settings.identityUnavailable")));
     return () => {
       alive = false;
     };
-  }, [version]);
+  }, [version, connected?.accountKey]);
 
   const copy = async () => {
     try {
@@ -507,7 +514,9 @@ function IdentityTab() {
         </Section>
       )}
       <Section title={t("identity.title")}>
-        <p className="text-sm text-muted">{t("identity.description")}</p>
+        <p className="text-sm text-muted">
+          {connected ? t("identity.connectNote", { handle: connected.handle }) : t("identity.description")}
+        </p>
         <Field label={t("identity.uid")}>
           {(id) => (
             <div className="flex gap-2">
@@ -518,10 +527,11 @@ function IdentityTab() {
             </div>
           )}
         </Field>
-        <Field label={t("identity.publicKey")}>
+        <Field label={connected ? t("identity.accountKey") : t("identity.publicKey")}>
           {(id) => <Input id={id} readOnly value={publicKey} className="font-mono text-xs" onFocus={(e) => e.currentTarget.select()} />}
         </Field>
       </Section>
+      {!connected && (
       <Section title={t("identity.backup")}>
         <p className="text-sm text-muted">{t("identity.backupHint")}</p>
         <div className="flex flex-wrap gap-2">
@@ -535,6 +545,7 @@ function IdentityTab() {
         </div>
         <p className="text-xs text-warn">{t("identity.importWarning")}</p>
       </Section>
+      )}
     </div>
   );
 }

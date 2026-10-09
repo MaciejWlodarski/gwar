@@ -30,7 +30,7 @@ import {
 } from "../net/connection";
 import { TsConnection } from "../net/ts-connection";
 import { parseBanMessage } from "../lib/ban";
-import { importIdentity, loadOrCreateIdentity, IdentityUnsupportedError, type Identity } from "../net/identity";
+import { importIdentity, loadActiveIdentity, IdentityUnsupportedError, type Identity } from "../net/identity";
 import { isDesktop } from "../platform";
 import { createVoiceEngine } from "../voice";
 import { VoiceError, type VoiceEngine } from "../voice/engine";
@@ -292,7 +292,7 @@ class Controller {
       session.setAddress(params.address, kind, httpOriginFromWsUrl(parsed.value.url));
 
       try {
-        this.identity ??= await loadOrCreateIdentity();
+        this.identity ??= await loadActiveIdentity();
       } catch (e) {
         session.dispatch({ type: "phase", phase: "idle" });
         throw new ConnectFailure("identity", e instanceof IdentityUnsupportedError ? e.message : String(e));
@@ -576,8 +576,22 @@ class Controller {
   // ---------------------------------------------------------------- identity
 
   async getIdentity(): Promise<Identity> {
-    this.identity ??= await loadOrCreateIdentity();
+    this.identity ??= await loadActiveIdentity();
     return this.identity;
+  }
+
+  /**
+   * Switches between the local identity (`null`, reloaded from storage) and a
+   * Gwar Connect one; disconnects because the open session belongs to the old key.
+   */
+  async switchIdentity(identity: Identity | null): Promise<void> {
+    await this.disconnect(true);
+    this.identity = identity;
+  }
+
+  /** Swaps the identity object without dropping the connection (same key, new certificate). */
+  async replaceIdentityQuietly(identity: Identity): Promise<void> {
+    this.identity = identity;
   }
 
   /** Replaces the browser identity; disconnects because the old session belongs to the old key. */

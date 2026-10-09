@@ -97,6 +97,21 @@ describe("handshake", () => {
     expect(conn.status.state).toBe("online");
   });
 
+  it("sends the device certificate when signed in with Gwar Connect, and signs with the device key", async () => {
+    const device = { account_key: "ACCOUNT", device_key: "PUBKEY", issued_at: 1, expires_at: 2, signature: "CERT" };
+    const conn = make({ identity: { ...fakeIdentity, device } });
+    const s = await handshake(conn);
+    const d = (s.sent[0] as { d: Record<string, unknown> }).d;
+    expect(d.public_key).toBe("PUBKEY");
+    expect(d.signature).toBe("sig(vc/1 hello|abc|PUBKEY)");
+    expect(d.device).toEqual(device);
+  });
+
+  it("sends no device field for a local identity", async () => {
+    const s = await handshake(make());
+    expect((s.sent[0] as { d: Record<string, unknown> }).d).not.toHaveProperty("device");
+  });
+
   it("includes the server password when given", async () => {
     const conn = make({ serverPassword: "pw" });
     const p = conn.connect();
