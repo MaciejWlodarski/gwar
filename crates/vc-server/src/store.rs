@@ -3,7 +3,7 @@
 
 use std::{collections::BTreeMap, path::Path};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use base64::{
     Engine,
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
@@ -184,6 +184,17 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE users ADD COLUMN connect_checked_at INTEGER;
 "#,
 ];
+
+/// References reassigned by a member merge (including ones already held by the target).
+#[derive(Debug, Default)]
+pub struct MergeReport {
+    pub messages: usize,
+    pub files: usize,
+    pub read_marks: usize,
+    pub groups: usize,
+    pub mentions: usize,
+    pub bans: usize,
+}
 
 const HISTORY_KEEP: i64 = 1000;
 
@@ -533,6 +544,58 @@ impl Store {
         self.db.execute("DELETE FROM users WHERE id=?1", [id])?;
         tx.commit()?;
         Ok(removal)
+    }
+
+    /// Reassigns every identity reference atomically; a dry run rolls the transaction back.
+    pub fn merge_members(&self, from: &str, into: &str, dry_run: bool) -> Result<MergeReport> {
+        if from == into {
+            bail!("cannot merge a member into itself");
+        }
+        let tx = self.db.unchecked_transaction()?;
+        let id = |uid: &str| -> Result<i64> {
+            tx.query_row("SELECT id FROM users WHERE uid=?1", [uid], |r| r.get(0))
+                .optional()?
+                .with_context(|| format!("no member with uid {uid}"))
+        };
+        let (from_id, into_id) = (id(from)?, id(into)?);
+        let mut report = MergeReport {
+            messages: tx.execute("UPDATE messages SET author_uid=?2 WHERE author_uid=?1", params![from, into])?,
+            files: tx.execute("UPDATE files SET uploader=?2 WHERE uploader=?1", params![from, into])?,
+            ..Default::default()
+        };
+        report.read_marks =
+            tx.query_row("SELECT COUNT(*) FROM read_marks WHERE user_id=?1", [from_id], |r| r.get(0))?;
+        tx.execute(
+            "INSERT INTO read_marks(user_id,channel,message) SELECT ?2,channel,message FROM read_marks WHERE user_id=?1
+             ON CONFLICT(user_id,channel) DO UPDATE SET message=MAX(read_marks.message,excluded.message)",
+            params![from_id, into_id],
+        )?;
+        report.groups = tx.query_row("SELECT COUNT(*) FROM user_groups WHERE user_id=?1", [from_id], |r| r.get(0))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO user_groups SELECT ?2,group_id FROM user_groups WHERE user_id=?1",
+            params![from_id, into_id],
+        )?;
+        report.mentions = tx.query_row("SELECT COUNT(*) FROM message_mentions WHERE uid=?1", [from], |r| r.get(0))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO message_mentions SELECT message,?2 FROM message_mentions WHERE uid=?1",
+            params![from, into],
+        )?;
+        tx.execute("DELETE FROM message_mentions WHERE uid=?1", [from])?;
+        report.bans = tx.execute("UPDATE bans SET uid=?2 WHERE uid=?1", params![from, into])?;
+        // bans.by and invites.created_by are display-name snapshots, not identity references.
+        // Revoked devices belong to cryptographic account keys and must never be reassigned.
+        tx.execute(
+            "UPDATE users SET created_at=MIN(created_at,(SELECT created_at FROM users WHERE id=?1)),
+             last_seen=MAX(last_seen,(SELECT last_seen FROM users WHERE id=?1)) WHERE id=?2",
+            params![from_id, into_id],
+        )?;
+        tx.execute("DELETE FROM users WHERE id=?1", [from_id])?;
+        if dry_run {
+            tx.rollback()?;
+        } else {
+            tx.commit()?;
+        }
+        Ok(report)
     }
 
     pub fn latest_message(&self, channel: ChannelId) -> Result<MessageId> {

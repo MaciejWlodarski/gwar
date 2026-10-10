@@ -101,8 +101,9 @@ The desktop app also connects to servers without HTTPS (e.g. on a LAN).
 
 Servers accept Gwar Connect devices out of the box and fetch the list of
 revoked devices from the official Connect service every five minutes
-(`--connect-url` points elsewhere, `--no-connect` turns it off). Back up the
-database while running with `vc-server --data-dir data backup copy.sqlite3`.
+(`--connect-url` points elsewhere, `--no-connect` turns it off). They also confirm
+Connect handles asynchronously, caching checks for 24 hours; `--no-connect`
+clears that cache. Back up the database while running with `vc-server --data-dir data backup copy.sqlite3`.
 
 Admins (or anyone with the "Remove members" permission) can remove a member
 from the member list, or clean up people not seen for a while in Server
@@ -114,12 +115,18 @@ member. The same works from the command line, straight on the database:
 vc-server --data-dir data members list [--inactive-days 90]
 vc-server --data-dir data members prune --inactive-days 90 --dry-run
 vc-server --data-dir data members prune --inactive-days 90 [--include-grouped] [--delete-messages]
+vc-server --data-dir data members remove [--delete-messages] [--dry-run] -- <uid>...
+vc-server --data-dir data members merge [--dry-run] -- <from-uid> <into-uid>
 ```
 
-`list` and `--dry-run` are safe while the server runs. A real `prune` must run
-with the server stopped (the server holds `data/vc.lock`; the command refuses
+`list` and removal/prune `--dry-run` are safe while the server runs. A real
+`prune` must run with the server stopped (the server holds `data/vc.lock`; the command refuses
 to run while it is held). Members with a role besides Member are kept unless
-`--include-grouped` is given.
+`--include-grouped` is given. `list` includes the member tag and confirmed
+Connect handle. `merge` moves the source's messages, uploads, roles, mentions,
+read marks and UID bans to an existing target, preserving the target's nickname.
+It is transactional and requires the server stopped, including `--dry-run`.
+Put UIDs beginning with `-` after `--`, as in the examples above.
 
 ## Develop
 
