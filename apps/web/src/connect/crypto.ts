@@ -30,6 +30,8 @@ export interface Kdf {
 export const KDF_PARAMS = { m: 65_536, t: 3, p: 1 } as const;
 /** Device certificates are valid for at most 400 days; we issue 365. */
 export const CERTIFICATE_DAYS = 365;
+/** What servers accept at most. */
+export const MAX_CERTIFICATE_DAYS = 400;
 
 export interface Secrets {
   encKey: Uint8Array;
@@ -175,6 +177,16 @@ export async function signText(jwk: JsonWebKey, text: string): Promise<string> {
   return encodeBase64Url(new Uint8Array(await subtle().sign(ED25519, key, buf(enc.encode(text)))));
 }
 
+/** True if `signature` is a valid Ed25519 signature of the UTF-8 `text` by the base64url public key. Never throws. */
+export async function verifyText(publicKey: string, text: string, signature: string): Promise<boolean> {
+  try {
+    const key = await subtle().importKey("raw", buf(decodeBase64Url(publicKey)), ED25519, false, ["verify"]);
+    return await subtle().verify(ED25519, key, buf(decodeBase64Url(signature)), buf(enc.encode(text)));
+  } catch {
+    return false;
+  }
+}
+
 // -------------------------------------------------------- signed statements
 
 export function deviceStatement(accountKey: string, deviceKey: string, issuedAt: number, expiresAt: number): string {
@@ -201,6 +213,12 @@ export async function certifyDevice(
 ): Promise<SignedDevice> {
   const signature = await signText(account.jwk, deviceStatement(account.publicKey, deviceKey, now, expiresAt));
   return { device_key: deviceKey, issued_at: now, expires_at: expiresAt, signature };
+}
+
+/** Whether the account key signed this certificate and its lifetime is one servers accept (docs/connect.md). */
+export async function verifyDeviceCertificate(accountKey: string, c: SignedDevice): Promise<boolean> {
+  if (c.expires_at <= c.issued_at || c.expires_at - c.issued_at > MAX_CERTIFICATE_DAYS * 86_400_000) return false;
+  return verifyText(accountKey, deviceStatement(accountKey, c.device_key, c.issued_at, c.expires_at), c.signature);
 }
 
 export async function signRevocation(account: KeyPairJwk, deviceKey: string, now: number = Date.now()) {

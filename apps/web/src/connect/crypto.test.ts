@@ -19,6 +19,8 @@ import {
   openVault,
   sealVault,
   vaultKey,
+  verifyDeviceCertificate,
+  verifyText,
 } from "./crypto";
 
 // The test vectors of docs/connect.md (the same as `client_crypto_vectors` in the service's tests).
@@ -104,6 +106,31 @@ describe("statements", () => {
       new TextEncoder().encode(revokeStatement(ACCOUNT_KEY, DEVICE_KEY, 5)),
     );
     expect(ok).toBe(true);
+  });
+});
+
+describe("verifying certificates", () => {
+  const DAY = 86_400_000;
+
+  it("accepts what the account key signed and rejects any change", async () => {
+    const account = await keyFromSeed(fill(32, 1));
+    const cert = await certifyDevice(account, DEVICE_KEY, 1_000, 1_000 + 365 * DAY);
+    expect(await verifyDeviceCertificate(ACCOUNT_KEY, cert)).toBe(true);
+    expect(await verifyDeviceCertificate(ACCOUNT_KEY, { ...cert, expires_at: cert.expires_at + 1 })).toBe(false);
+    expect(await verifyDeviceCertificate(ACCOUNT_KEY, { ...cert, device_key: ACCOUNT_KEY })).toBe(false);
+    expect(await verifyDeviceCertificate(DEVICE_KEY, cert)).toBe(false);
+  });
+
+  it("rejects lifetimes servers refuse, even when signed", async () => {
+    const account = await keyFromSeed(fill(32, 1));
+    expect(await verifyDeviceCertificate(ACCOUNT_KEY, await certifyDevice(account, DEVICE_KEY, 1_000, 1_000 + 400 * DAY))).toBe(true);
+    expect(await verifyDeviceCertificate(ACCOUNT_KEY, await certifyDevice(account, DEVICE_KEY, 1_000, 1_000 + 401 * DAY))).toBe(false);
+    expect(await verifyDeviceCertificate(ACCOUNT_KEY, await certifyDevice(account, DEVICE_KEY, 1_000, 1_000))).toBe(false);
+  });
+
+  it("says false, never throws, for garbage", async () => {
+    expect(await verifyText("not a key", "text", "!!")).toBe(false);
+    expect(await verifyText(ACCOUNT_KEY, "text", "AAAA")).toBe(false);
   });
 });
 

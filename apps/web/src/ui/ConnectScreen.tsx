@@ -289,6 +289,7 @@ function closeNotice(reason: ReturnType<typeof useSession.getState>["closeReason
     if (r.kind === "banned") return describeBan({ until: r.until, reason: r.reason }, r.by);
     return null;
   }
-  if (reason.kind === "error") return t("close.lost");
+  // A reconnect after the certificate ran out: the person has to act, so say so.
+  if (reason.kind === "error") return reason.error.kind === "certificate_expired" ? t("err.connect.certificate_expired") : t("close.lost");
   return null;
 }

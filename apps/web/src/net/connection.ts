@@ -33,6 +33,7 @@ export type ConnectErrorKind =
   | "wrong_password"
   | "server_full"
   | "banned" // the server refuses this user or address; the message says why and until when
+  | "certificate_expired" // the Gwar Connect device certificate we sent has run out; renew it in Settings > Account
   | "rejected" // any other error reply to hello (bad nickname, ...)
   | "protocol"; // protocol version mismatch or malformed handshake
 
@@ -123,8 +124,19 @@ export function shouldReconnectAfter(reason: LeaveReason): boolean {
   return reason.kind !== "kicked" && reason.kind !== "banned" && reason.kind !== "replaced";
 }
 
-function mapHelloError(code: ErrorCode, message: string, serverName?: string, ban?: BanNotice): ConnectError {
+/**
+ * Servers answer an unusable device certificate with the generic `not_authenticated` (the same code
+ * as a bad signature or a revoked device), so the cause is told apart here: our own clock against the
+ * certificate we sent, or the server's wording ("the device certificate has expired").
+ */
+export function isExpiredCertificate(device: Identity["device"], message: string, now: number = Date.now()): boolean {
+  return !!device && (device.expires_at <= now || /certificate has expired/i.test(message));
+}
+
+function mapHelloError(code: ErrorCode, message: string, serverName?: string, ban?: BanNotice, device?: Identity["device"]): ConnectError {
   switch (code) {
+    case "not_authenticated":
+      return new ConnectError(isExpiredCertificate(device, message) ? "certificate_expired" : "rejected", message, serverName);
     case "wrong_password":
       return new ConnectError("wrong_password", message, serverName);
     case "unavailable":
@@ -139,7 +151,12 @@ function mapHelloError(code: ErrorCode, message: string, serverName?: string, ba
 /** Errors after which retrying cannot help. */
 function isFatal(e: ConnectError): boolean {
   return (
-    e.kind === "wrong_password" || e.kind === "password_required" || e.kind === "protocol" || e.kind === "rejected" || e.kind === "banned"
+    e.kind === "wrong_password" ||
+    e.kind === "password_required" ||
+    e.kind === "protocol" ||
+    e.kind === "rejected" ||
+    e.kind === "certificate_expired" ||
+    e.kind === "banned"
   );
 }
 
@@ -403,7 +420,7 @@ export class Connection implements Link {
               resolve(welcome);
             })
             .catch((e: unknown) => {
-              if (e instanceof RequestError) fail(mapHelloError(e.code, e.message, serverName, e.ban));
+              if (e instanceof RequestError) fail(mapHelloError(e.code, e.message, serverName, e.ban, identity.device));
               else if (e instanceof RequestTimeoutError) fail(new ConnectError("timeout", e.message, serverName));
               else fail(new ConnectError("protocol", e instanceof Error ? e.message : String(e), serverName));
             });

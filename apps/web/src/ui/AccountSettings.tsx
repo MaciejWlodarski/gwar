@@ -5,6 +5,7 @@ import { normalizeHandle } from "../connect/account";
 import type { DeviceInfo } from "../connect/api";
 import { describeAccountError, type AccountContext } from "../connect/errors";
 import { MIN_PASSWORD_LENGTH, passwordStrength } from "../connect/crypto";
+import { certificateWarning } from "../connect/expiry";
 import { cn } from "../lib/cn";
 import { loadOrCreateIdentity, uidForPublicKey } from "../net/identity";
 import { accountActions, useAccount } from "../state/account";
@@ -107,7 +108,7 @@ export function AccountTab() {
   const account = useAccount((s) => s.account);
   const pending = useAccount((s) => s.pending);
   const [mode, setMode] = useState<Mode>("signin");
-  if (pending) return <RecoveryCode code={pending.recoveryCode} />;
+  if (pending) return <RecoveryCode code={pending.recoveryCode} handle={pending.prepared.handle} />;
   if (account) return <AccountView />;
   if (!loaded) return null;
   return (
@@ -281,12 +282,18 @@ function RecoverForm({ onMode }: { onMode: (m: Mode) => void }) {
 
 // ------------------------------------------------------------ recovery code
 
-function RecoveryCode({ code }: { code: string }) {
+/**
+ * The account is only prepared here: the service hears about it when the person confirms. If registering
+ * fails (handle taken, rate limit) the code stays and can be tried again, under another handle if needed.
+ */
+function RecoveryCode({ code, handle: prepared }: { code: string; handle: string }) {
   const t = useT();
   const toast = useUi((s) => s.toast);
   const [saved, setSaved] = useState(false);
   const [copied, setCopied] = useState(false);
-  const { busy, error, run } = useAction("session");
+  const [failed, setFailed] = useState(false);
+  const [handle, setHandle] = useState(prepared);
+  const { busy, error, setError, run } = useAction("register");
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(code);
@@ -329,21 +336,32 @@ function RecoveryCode({ code }: { code: string }) {
         {t("account.recoverySaved")}
       </label>
       {error && <Banner>{error}</Banner>}
-      <Button
-        variant="primary"
-        disabled={!saved}
-        busy={busy}
-        className="self-start"
-        onClick={() =>
-          void run(async () => {
-            const handle = useAccount.getState().pending?.record.handle ?? "";
-            await accountActions.confirmCreated();
-            toast("success", t("account.signedIn", { handle }));
-          })
-        }
-      >
-        {t("account.recoveryContinue")}
-      </Button>
+      {failed ? (
+        <>
+          <p className="text-sm text-muted">{t("account.recoveryHandle")}</p>
+          <HandleField value={handle} onChange={setHandle} />
+        </>
+      ) : (
+        <p className="text-sm text-muted">{t("account.recoveryCreating", { handle: prepared })}</p>
+      )}
+      <div className="flex flex-wrap items-center gap-3">
+        <Button
+          variant="primary"
+          disabled={!saved}
+          busy={busy}
+          onClick={() => {
+            const chosen = normalizeHandle(handle);
+            if (!chosen) return setError(t("account.handleInvalid"));
+            void run(async () => {
+              await accountActions.confirmCreated(chosen);
+              toast("success", t("account.signedIn", { handle: chosen }));
+            }).then((ok) => !ok && setFailed(true));
+          }}
+        >
+          {t("account.recoveryContinue")}
+        </Button>
+        {failed && <LinkButton onClick={accountActions.cancelCreate}>{t("account.back")}</LinkButton>}
+      </div>
     </div>
   );
 }
@@ -397,6 +415,8 @@ function AccountView() {
   const toast = useUi((s) => s.toast);
   const lang = useSettings((s) => s.language);
   const account = useAccount((s) => s.account)!;
+  const certChecked = useAccount((s) => s.certChecked);
+  const [now] = useState(() => Date.now());
   const [uid, setUid] = useState("");
   const [localUid, setLocalUid] = useState("");
   const [devices, setDevices] = useState<DeviceInfo[] | null>(null);
@@ -441,6 +461,7 @@ function AccountView() {
 
   const thisRevoked = devices?.some((d) => d.device_key === account.deviceKey && d.revoked_at !== null) ?? false;
   const when = (ms: number) => new Date(ms).toLocaleString(lang);
+  const warning = certificateWarning(account.expiresAt, now, certChecked);
 
   return (
     <div>
@@ -451,13 +472,29 @@ function AccountView() {
         <Field label={t("account.accountKey")}>
           {(id) => <Input id={id} readOnly value={account.accountKey} className="font-mono text-xs" onFocus={(e) => e.currentTarget.select()} />}
         </Field>
-        <div className="flex flex-wrap items-center gap-2 text-sm text-muted">
-          <ShieldCheck className="size-4 shrink-0" />
-          <span>{t("account.certExpires", { date: new Date(account.expiresAt).toLocaleDateString(lang) })}</span>
-          <Button size="sm" onClick={() => setRenewing(true)}>
-            {t("account.renew")}
-          </Button>
-        </div>
+        {warning.level === "none" ? (
+          <div className="flex flex-wrap items-center gap-2 text-sm text-muted">
+            <ShieldCheck className="size-4 shrink-0" />
+            <span>{t("account.certExpires", { date: new Date(account.expiresAt).toLocaleDateString(lang) })}</span>
+            <Button size="sm" onClick={() => setRenewing(true)}>
+              {t("account.renew")}
+            </Button>
+          </div>
+        ) : (
+          <div data-testid="cert-warning" role="alert" className="flex flex-col gap-2 rounded-lg border border-warn/50 px-3 py-2 text-sm text-warn">
+            <div className="flex gap-2">
+              <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+              <span>
+                {t(warning.level === "expired" ? "account.certExpiredWarn" : "account.certExpiringWarn", {
+                  date: new Date(account.expiresAt).toLocaleDateString(lang),
+                })}
+              </span>
+            </div>
+            <Button size="sm" variant="primary" className="self-start" onClick={() => setRenewing(true)}>
+              {t("account.renewWithPassword")}
+            </Button>
+          </div>
+        )}
       </Section>
 
       <Section title={t("account.devices")}>

@@ -1181,6 +1181,30 @@ async function main() {
     if (await c.getByRole("button", { name: "Export identity" }).count()) throw new Error("device keys must not be exportable");
   });
 
+  await check("connect: reloading before the recovery code is confirmed leaves no account behind", async () => {
+    const ctxE = await newCtx();
+    const e = await ctxE.newPage();
+    debugPages.push(e);
+    const ghost = `ghost${rid}`;
+    await e.goto(WEB_URL);
+    await e.getByRole("button", { name: "Settings" }).first().click();
+    await e.getByRole("tab", { name: "Account" }).click();
+    await e.getByRole("button", { name: /Create an account/ }).click();
+    await e.getByLabel("Handle").fill(ghost);
+    await e.getByLabel("Password", { exact: true }).fill(acctPassword);
+    await e.getByLabel("Repeat the password").fill(acctPassword);
+    await e.getByRole("button", { name: "Create account" }).click();
+    await e.getByTestId("recovery-code").waitFor({ timeout: 30000 });
+    await e.reload();
+    await e.getByRole("button", { name: "Settings" }).first().click();
+    await e.getByRole("tab", { name: "Account" }).click();
+    await e.getByLabel("Handle").fill(ghost);
+    await e.getByLabel("Password", { exact: true }).fill(acctPassword);
+    await e.getByRole("button", { name: "Sign in", exact: true }).click();
+    await e.getByRole("alert").filter({ hasText: "Wrong handle or password" }).waitFor({ timeout: 30000 });
+    await ctxE.close();
+  });
+
   await check("connect: a second browser signs in to the same account and has the same uid", async () => {
     await d.goto(WEB_URL);
     const own = await settingsUid(d);
