@@ -135,7 +135,10 @@ export function isExpiredCertificate(device: Identity["device"], message: string
 
 function mapHelloError(code: ErrorCode, message: string, serverName?: string, ban?: BanNotice, device?: Identity["device"]): ConnectError {
   switch (code) {
+    case "certificate_expired":
+      return new ConnectError("certificate_expired", message, serverName);
     case "not_authenticated":
+      // Servers before the certificate_expired code only said so in the message.
       return new ConnectError(isExpiredCertificate(device, message) ? "certificate_expired" : "rejected", message, serverName);
     case "wrong_password":
       return new ConnectError("wrong_password", message, serverName);

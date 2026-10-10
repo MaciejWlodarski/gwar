@@ -126,8 +126,8 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
                 identity_key = certificate.account_key.clone();
                 device = Some(certificate.device_key.clone());
             }
-            Err(problem) => {
-                let _ = sink.send(error(id, ErrorCode::NotAuthenticated, problem)).await;
+            Err((code, problem)) => {
+                let _ = sink.send(error(id, code, problem)).await;
                 return;
             }
         }

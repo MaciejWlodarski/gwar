@@ -8,7 +8,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use vc_proto::{DeviceCertificate, Uid, challenge_message};
+use vc_proto::{DeviceCertificate, ErrorCode, Uid, challenge_message};
 
 pub fn new_nonce() -> String {
     let mut bytes = [0u8; 32];
@@ -56,17 +56,23 @@ pub fn signed_by(public: &str, message: &str, signature: &str) -> bool {
 
 /// Checks a Gwar Connect device certificate for the device key that signed
 /// `hello`; the identity is then the account's: returns its uid.
-pub fn verify_device(c: &DeviceCertificate, public_key: &str, now: i64) -> Result<Uid, &'static str> {
+pub fn verify_device(c: &DeviceCertificate, public_key: &str, now: i64) -> Result<Uid, (ErrorCode, &'static str)> {
+    let invalid = |message| (ErrorCode::NotAuthenticated, message);
     if c.device_key != public_key {
-        return Err("the certificate is for another device");
+        return Err(invalid("the certificate is for another device"));
     }
-    if c.issued_at > now + SKEW_MS || c.expires_at <= now || c.expires_at - c.issued_at > MAX_CERT_MS {
-        return Err("the device certificate has expired; sign in again");
+    if c.issued_at > now + SKEW_MS || c.expires_at - c.issued_at > MAX_CERT_MS {
+        return Err(invalid("the device certificate is not valid"));
     }
     if !signed_by(&c.account_key, &device_statement(c), &c.signature) {
-        return Err("the device certificate is not signed by the account");
+        return Err(invalid("the device certificate is not signed by the account"));
     }
-    let key: [u8; 32] = URL_SAFE_NO_PAD.decode(&c.account_key).ok().and_then(|k| k.try_into().ok()).ok_or("bad key")?;
+    // Checked after the signature, so only a genuine certificate is reported as expired.
+    if c.expires_at <= now {
+        return Err((ErrorCode::CertificateExpired, "the device certificate has expired; renew it in Gwar Connect"));
+    }
+    let key: [u8; 32] =
+        URL_SAFE_NO_PAD.decode(&c.account_key).ok().and_then(|k| k.try_into().ok()).ok_or(invalid("bad key"))?;
     Ok(uid_for_key(&key))
 }
 

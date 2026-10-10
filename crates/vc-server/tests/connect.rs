@@ -108,3 +108,19 @@ async fn devices_of_one_account_are_one_person_until_revoked() {
     // The laptop is unaffected.
     as_device(&server, &laptop, certificate(&account, &laptop, now(), now() + year)).await.expect("laptop still in");
 }
+
+#[tokio::test]
+async fn an_expired_certificate_is_reported_as_such() {
+    let server = TestServer::start().await;
+    let account = SigningKey::from_bytes(&rand::random());
+    let device = SigningKey::from_bytes(&rand::random());
+    let day = 24 * 3600 * 1000;
+    let expired = certificate(&account, &device, now() - 30 * day, now() - day);
+    let err = as_device(&server, &device, expired).await.err().expect("refused");
+    assert_eq!(err.code, vc_proto::ErrorCode::CertificateExpired);
+    // A forged certificate is not reported as merely expired.
+    let mut forged = certificate(&account, &device, now() - 30 * day, now() - day);
+    forged["account_key"] = json!(b64(SigningKey::from_bytes(&rand::random()).verifying_key().as_bytes()));
+    let err = as_device(&server, &device, forged).await.err().expect("refused");
+    assert_eq!(err.code, vc_proto::ErrorCode::NotAuthenticated);
+}

@@ -138,6 +138,7 @@ describe("handshake", () => {
     ["wrong_password", "wrong_password"],
     ["unavailable", "server_full"],
     ["bad_request", "rejected"],
+    ["certificate_expired", "certificate_expired"],
   ])("maps hello error %s to %s", async (code, kind) => {
     const conn = make({ serverPassword: "x" });
     const p = conn.connect();

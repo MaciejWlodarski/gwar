@@ -398,6 +398,8 @@ wire! {
         Internal,
         Banned,
         TooLarge,
+        /// The Gwar Connect device certificate in `hello` has expired.
+        CertificateExpired,
     }
 
     #[serde(tag = "ev", content = "d")]
