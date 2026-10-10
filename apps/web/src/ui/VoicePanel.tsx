@@ -7,6 +7,7 @@ import { useSettings } from "../state/settings";
 import { useSession, useUi, useVoice } from "../state/stores";
 import { useMe, keyLabel, modKey } from "./hooks";
 import { Avatar, IconButton, Button } from "./kit";
+import { ConnectBadge } from "./badges";
 
 /** Mic toggle that doubles as a level meter and talking indicator. */
 export function MicButton({ size = "md" }: { size?: "sm" | "md" }) {
@@ -69,6 +70,17 @@ export function DeafenButton({ size = "md" }: { size?: "sm" | "md" }) {
   );
 }
 
+/** My nickname, with the Connect badge once the server has confirmed my handle. */
+function SelfName({ nickname }: { nickname?: string }) {
+  const handle = useSession((s) => (s.me ? s.members[s.me.uid]?.connect : undefined));
+  return (
+    <div className="flex min-w-0 items-center gap-1">
+      <span className="truncate text-sm font-medium">{nickname}</span>
+      <ConnectBadge handle={handle} />
+    </div>
+  );
+}
+
 export function VoicePanel() {
   const t = useT();
   const voiceState = useVoice((s) => s.state);
@@ -86,7 +98,7 @@ export function VoicePanel() {
         <div className="flex items-center gap-1 px-3 py-2.5">
           <Avatar name={me.nickname} seed={me.uid} size={32} />
           <div className="mr-auto ml-1.5 min-w-0 leading-tight">
-            <div className="truncate text-sm font-medium">{me.nickname}</div>
+            <SelfName nickname={me.nickname} />
             <div className="flex items-center gap-1 truncate text-xs text-subtle" title={t("voice.notInHint")}>
               <HeadphoneOff aria-hidden className="size-3 shrink-0" />
               <span className="truncate">{t("voice.notIn")}</span>
@@ -158,7 +170,7 @@ export function VoicePanel() {
       <div className="flex items-center gap-1 px-3 py-2.5">
         {me && <Avatar name={me.nickname} seed={me.uid} size={32} className={cn(me.talking && "talking-ring")} />}
         <div className="mr-auto ml-1.5 min-w-0 leading-tight">
-          <div className="truncate text-sm font-medium">{me?.nickname}</div>
+          <SelfName nickname={me?.nickname} />
           <div className="truncate text-xs text-subtle">{me?.away ?? ""}</div>
         </div>
         <MicButton />

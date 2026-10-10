@@ -282,6 +282,41 @@ async fn unknown_accounts_clear_the_cache_and_an_outage_keeps_it() {
 }
 
 #[tokio::test]
+async fn an_account_key_without_a_device_keeps_its_handle() {
+    // A browser that signed out but kept the account's key is still that account.
+    let fake = FakeConnect::start(false).await;
+    let account = new_key();
+    fake.known(&account, "current");
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("vc.sqlite3");
+    let store = vc_server::store::Store::open(&database).unwrap();
+    let id = store.touch_user(&uid_of(&account), &public_key(&account), "Account", 1).unwrap().id;
+    store.set_connect_handle(id, Some("old")).unwrap();
+    store.check_connect(id, now() - 24 * 3600 * 1000 - 1).unwrap();
+    let server = TestServer::start_with(|c| {
+        c.database = Some(database.clone());
+        c.connect_url = Some(fake.url.clone());
+    })
+    .await;
+    let mut client = Client::connect_as(&server, account.clone(), "ignored", None).await.unwrap();
+    assert_eq!(
+        client.welcome.members.iter().find(|m| m.uid == uid_of(&account)).unwrap().connect.as_deref(),
+        Some("old")
+    );
+    let changed = client.next_event_where("member.updated", |m| m["uid"] == uid_of(&account)).await;
+    assert_eq!(changed["connect"], "current");
+    assert_eq!(fake.calls(), 1);
+    client.close().await;
+    // Within a day the next device-less sign-in neither asks Connect again nor forgets the handle.
+    let again = Client::connect_as(&server, account.clone(), "ignored", None).await.unwrap();
+    assert_eq!(
+        again.welcome.members.iter().find(|m| m.uid == uid_of(&account)).unwrap().connect.as_deref(),
+        Some("current")
+    );
+    assert_eq!(fake.calls(), 1);
+}
+
+#[tokio::test]
 async fn local_identities_and_no_connect_never_show_a_handle() {
     let fake = FakeConnect::start(false).await;
     let local = new_key();
@@ -290,12 +325,12 @@ async fn local_identities_and_no_connect_never_show_a_handle() {
     let database = dir.path().join("vc.sqlite3");
     let store = vc_server::store::Store::open(&database).unwrap();
     let id = store.touch_user(&uid_of(&local), &public_key(&local), "Local", 1).unwrap().id;
-    store.set_connect_handle(id, Some("registered")).unwrap();
     let server = TestServer::start_with(|c| {
         c.database = Some(database.clone());
         c.connect_url = Some(fake.url.clone());
     })
     .await;
+    // A key never seen with a device certificate is not sent to Connect.
     let client = Client::connect_as(&server, local.clone(), "ignored", None).await.unwrap();
     assert!(client.welcome.members.iter().find(|m| m.uid == uid_of(&local)).unwrap().connect.is_none());
     assert_eq!(fake.calls(), 0);

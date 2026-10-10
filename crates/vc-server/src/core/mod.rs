@@ -599,17 +599,11 @@ impl Core {
             }
             groups.push(MEMBER_GROUP);
         }
-        if r.device.is_some() {
+        // The handle belongs to the key, however it signs in: a signed-out browser that kept the
+        // account's key is still that account. Keys never seen with a device certificate are not
+        // sent to Connect, so people who don't use it are not reported there.
+        if r.device.is_some() || known.as_ref().is_some_and(|m| m.connect.is_some()) {
             self.refresh_connect(&r.uid, user.id, &r.public_key);
-        } else {
-            self.connect_pending.remove(&r.uid);
-            if known.as_ref().is_some_and(|m| m.connect.is_some()) {
-                if let Err(e) = self.store.set_connect_handle(user.id, None) {
-                    warn!("store: {e:#}");
-                } else {
-                    self.announce_member(&r.uid);
-                }
-            }
         }
         if let Some(tags) = tags_before {
             self.announce_tags(tags);
@@ -724,7 +718,7 @@ impl Core {
                         Ok(_) => {}
                         Err(e) => warn!("store: {e:#}"),
                     },
-                    Err(e) => debug!("gwar connect account: {e:#}"),
+                    Err(e) => warn!(%uid, "gwar connect account lookup: {e:#}"),
                 }
             };
             let _ = tx.send(CoreMsg::Resume(Box::new(resume))).await;

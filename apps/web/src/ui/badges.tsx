@@ -1,4 +1,4 @@
-import { ShieldCheck } from "lucide-react";
+import { BadgeCheck } from "lucide-react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { unreadLabel } from "../lib/chat";
@@ -49,7 +49,7 @@ export function ConnectBadge({ handle }: { handle?: string | null }) {
   const t = useT();
   if (!handle) return null;
   const label = t("badge.connectAccount", { handle });
-  return <span title={label} aria-label={label} className="inline-flex shrink-0 align-middle text-accent"><ShieldCheck className="size-3.5" /></span>;
+  return <span title={label} aria-label={label} className="inline-flex shrink-0 align-middle text-accent"><BadgeCheck className="size-3.5" /></span>;
 }
 
 /** "@handle #tag": the verified Connect handle (if any) and the tag derived from the key. */
