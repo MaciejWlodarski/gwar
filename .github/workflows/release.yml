@@ -1,0 +1,227 @@
+name: release
+
+# Push a tag like v0.2.0 to build the desktop app and the server binaries and
+# put them in a DRAFT GitHub release, which is reviewed and published by hand.
+# Run it manually (Actions > release > Run workflow) for a dry run: it builds
+# everything and keeps the files as workflow artifacts, but creates no release.
+# See docs/releasing.md.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # Build Opus from the bundled source and link it statically, so neither the
+  # server nor the desktop bundles depend on a libopus installed on the host.
+  LIBOPUS_NO_PKG: "1"
+  LIBOPUS_STATIC: "1"
+  # The bundled Opus still declares CMake < 3.5 support, which CMake 4 rejects.
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+jobs:
+  # The tag must equal the version in every manifest. Without a tag (dry run)
+  # it only checks that they agree with each other.
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: version
+        env:
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: scripts/check-version.sh ${TAG:+"$TAG"}
+
+  desktop:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos
+            os: macos-14
+            # One universal (arm64 + x86_64) disk image.
+            args: --target universal-apple-darwin --bundles dmg
+            files: target/universal-apple-darwin/release/bundle/dmg/*.dmg
+          - name: windows
+            os: windows-2022
+            args: --bundles nsis,msi
+            files: |
+              target/release/bundle/nsis/*.exe
+              target/release/bundle/msi/*.msi
+          - name: linux
+            # The oldest Ubuntu GitHub offers, so the AppImage and the .deb run
+            # on older distributions too (they need at least this glibc).
+            os: ubuntu-22.04
+            args: --bundles appimage,deb
+            files: |
+              target/release/bundle/appimage/*.AppImage
+              target/release/bundle/deb/*.deb
+    runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.name == 'macos' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-${{ matrix.name }}
+      - name: Linux libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libasound2-dev patchelf xdg-utils cmake
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      # Sign and notarize on macOS only when the secrets exist. Tauri reads the
+      # variables below from the environment; exporting an empty one would make
+      # it try (and fail) to sign, so only non-empty sets are exported.
+      - name: macOS signing and notarization
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          export_var() { # name: pass it on to the following steps
+            { echo "$1<<GWAR_EOF"; printf '%s\n' "${!1}"; echo "GWAR_EOF"; } >> "$GITHUB_ENV"
+          }
+          if [ -n "$APPLE_CERTIFICATE" ] && [ -n "$APPLE_CERTIFICATE_PASSWORD" ] && [ -n "$APPLE_SIGNING_IDENTITY" ]; then
+            for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY; do export_var $v; done
+            echo "Signing with the Developer ID certificate."
+            if [ -n "$APPLE_ID" ] && [ -n "$APPLE_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
+              for v in APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do export_var $v; done
+              echo "Notarizing with the Apple ID."
+            else
+              echo "::warning::Apple notarization secrets are not set: the app is signed but not notarized."
+            fi
+          else
+            echo "::warning::Apple signing secrets are not set: the macOS app is ad-hoc signed only (Gatekeeper will warn)."
+          fi
+
+      # Windows code signing is not wired up (see docs/releasing.md): the
+      # installers are unsigned and SmartScreen warns about them.
+      - name: Build desktop
+        uses: tauri-apps/tauri-action@v1
+        with:
+          projectPath: apps/desktop
+          tauriScript: pnpm tauri
+          args: ${{ matrix.args }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: desktop-${{ matrix.name }}
+          path: ${{ matrix.files }}
+          if-no-files-found: error
+          retention-days: 7
+
+  server:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          # Native ARM runner (free for public repositories).
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: server-${{ matrix.target }}
+      - name: Build tools
+        run: sudo apt-get update && sudo apt-get install -y cmake pkg-config
+      - name: Build
+        run: cargo build --release --locked -p vc-server -p gwar-connect
+      - name: Check the binaries
+        run: |
+          file target/release/vc-server target/release/gwar-connect
+          ldd target/release/vc-server
+          if ldd target/release/vc-server | grep -q libopus; then
+            echo "::error::vc-server links libopus dynamically"; exit 1
+          fi
+          # Native runners, so the binaries can run here.
+          target/release/vc-server --version
+          target/release/gwar-connect --version
+      - name: Package
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          name="gwar-server-v${VERSION}-${TARGET}"
+          mkdir -p "dist/$name"
+          cp target/release/vc-server target/release/gwar-connect LICENSE THIRD_PARTY_NOTICES.md "dist/$name/"
+          strip "dist/$name/vc-server" "dist/$name/gwar-connect"
+          tar -czf "dist/$name.tar.gz" -C dist "$name"
+          tar -tzf "dist/$name.tar.gz"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: server-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  # Collects every file, writes SHA256SUMS over all of them and (on a tag)
+  # creates the draft release. One job does all uploads, so parallel builds
+  # cannot race to create the release.
+  release:
+    needs: [check, desktop, server]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sums=$(find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | LC_ALL=C sort | xargs sha256sum)
+          printf '%s\n' "$sums" > SHA256SUMS
+          cat SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+      - name: Draft release
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            # A re-run: refresh the files, but never touch a published release.
+            if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft)" != "true" ]; then
+              echo "::error::Release $TAG is already published; not changing it."; exit 1
+            fi
+            gh release upload "$TAG" dist/* --repo "$REPO" --clobber
+          else
+            gh release create "$TAG" dist/* --repo "$REPO" --draft --verify-tag \
+              --title "Gwar $TAG" --generate-notes
+          fi
