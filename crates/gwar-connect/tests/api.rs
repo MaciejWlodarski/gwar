@@ -420,3 +420,25 @@ const VAULT_JSON: &str = r#"{"teamspeak":{"identity":"1V","uid":"u","updated_at"
 const VAULT_BLOB: &str =
     "AwMDAwMDAwMDAwMDZgbHGQNI33i1QJYlr7AP1RbMIJv2WqEwRVph4x0WE_aS19RAscHc07sG1nH6et8NwocuVgdgFXyTeXCsQHpTYOstEa3cT7_Q";
 const CERT_SIGNATURE: &str = "hrl_m1SlEOKgUYV7RMz4dnlZ5wa5OY_m5-ZS9qWcZU82oGdpwkQdm5wVyUgxplRzxEiMoJnAs-BN6ktG0ufaDA";
+
+#[tokio::test]
+async fn public_accounts_can_be_looked_up_by_handle_or_key() {
+    let api = Api::start().await;
+    let account = SigningKey::from_bytes(&rand::random());
+    let device = SigningKey::from_bytes(&rand::random());
+    let (status, _) = api.post("/register", None, sign_up("lookup", "pw", &account, &device, &rand::random())).await;
+    assert_eq!(status, 200);
+    let key = b64(account.verifying_key().as_bytes());
+    let expected = json!({"handle": "lookup", "account_key": key});
+    assert_eq!(api.get("/accounts/lookup", None).await, (200, expected.clone()));
+    assert_eq!(api.get(&format!("/accounts/by-key/{key}"), None).await, (200, expected));
+    let unknown = b64(SigningKey::from_bytes(&rand::random()).verifying_key().as_bytes());
+    for path in [format!("/accounts/by-key/{unknown}"), "/accounts/by-key/malformed".into(), "/accounts/by-key".into()]
+    {
+        let (status, reply) = api.get(&path, None).await;
+        assert_eq!(status, 404);
+        assert_eq!(reply["error"], "not_found");
+    }
+    // A hyphen is not permitted in handles, so the static route cannot hide an account.
+    assert_eq!(crypto::handle("by-key"), None);
+}
