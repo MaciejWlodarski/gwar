@@ -110,7 +110,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum MembersCommand {
-    /// Print uid, last nickname, last seen, groups and message count of every member
+    /// Print uid, nickname, tag, Connect handle, last seen, groups and message count of every member
     /// (safe while the server runs).
     List {
         /// Only members not seen for this many days.
@@ -150,6 +150,15 @@ enum MembersCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Move all records from one member onto another, keeping the target's nickname.
+    /// Both members must exist and the server must be stopped, even for --dry-run.
+    Merge {
+        from_uid: String,
+        into_uid: String,
+        /// Show what would move and roll the transaction back.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn members(data_dir: &std::path::Path, database: &std::path::Path, command: MembersCommand) -> Result<()> {
@@ -178,6 +187,16 @@ fn members(data_dir: &std::path::Path, database: &std::path::Path, command: Memb
             print!("{}", members::format_list(&report.members, &store.groups()?, vc_server::core::now_ms()));
             let verb = if report.dry_run { "would remove" } else { "removed" };
             eprintln!("{verb} {} members", report.members.len());
+        }
+        MembersCommand::Merge { from_uid, into_uid, dry_run } => {
+            let _lock = members::lock_data_dir(data_dir)?;
+            let store = Store::open(database)?;
+            let report = members::merge(&store, &from_uid, &into_uid, dry_run)?;
+            let verb = if dry_run { "would merge" } else { "merged" };
+            println!(
+                "{verb} {from_uid} into {into_uid}: {} messages, {} files, {} read marks, {} group memberships, {} mentions, {} bans",
+                report.messages, report.files, report.read_marks, report.groups, report.mentions, report.bans
+            );
         }
     }
     Ok(())

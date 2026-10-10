@@ -249,6 +249,8 @@ impl Core {
         for s in online {
             self.remove(s, LeaveReason::Removed { by: by.to_owned() });
         }
+        let tags = self.store.member_tags().map_err(storage_error)?;
+        self.connect_pending.remove(&member.uid);
         let removal = self.store.remove_member(user_id, &member.uid, delete_messages).map_err(storage_error)?;
         self.remove_files(removal.files);
         let mut readers: BTreeMap<ChannelId, BTreeSet<SessionId>> = BTreeMap::new();
@@ -257,6 +259,7 @@ impl Core {
             self.broadcast(Event::ChatDeleted { channel, message }, |s| readers.contains(&s.id));
         }
         self.broadcast(Event::MemberRemoved { uid: member.uid.clone() }, |_| true);
+        self.announce_tags(tags);
         Ok(())
     }
 

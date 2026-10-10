@@ -130,7 +130,8 @@ JSON over HTTPS under `/v1`. Authenticated calls send
 | `PUT /v1/vault` | `{vault, version}` (the version the change was based on) → `{version}`; `409 conflict` if it changed meanwhile. At most 64 KiB. |
 | `POST /v1/logout` | → `{}` |
 | `GET /v1/revocations?since=<seq>` | public → `{revocations: [{seq, account_key, device_key, revoked_at, signature}]}` (at most 1000, ascending) |
-| `GET /v1/accounts/{handle}` | public → `{handle, account_key}` |
+| `GET /v1/accounts/{handle}` | public → `{handle, account_key}`; `404 not_found` if unknown |
+| `GET /v1/accounts/by-key/{account_key}` | public → `{handle, account_key}`; `404 not_found` if unknown |
 
 A session belongs to the first device it registered (`register`,
 `POST /v1/devices`), so revoking a device signs it out.
@@ -150,6 +151,17 @@ working.
 Servers fetch `GET {connect}/v1/revocations?since=…` every five minutes
 (`--connect-url`, default the official service; `--no-connect` turns it off),
 verify each entry with its account key and refuse revoked devices.
+
+A certificate proves key possession, not registration with Connect. After a
+device-authenticated hello, servers asynchronously look up the account key via
+`/v1/accounts/by-key/{account_key}` and cache the confirmed handle and the attempt
+time in `users`. At most one lookup runs per member per 24 hours, across devices
+and restarts, including failed attempts. A changed handle emits `member.updated`;
+404 clears it, while an outage keeps the cached value. Local-key hellos clear the
+member's handle without doing a lookup. `--no-connect` clears all stored handles
+and check times on startup; certificates still authenticate locally. Both public
+account lookups have the same policy (no login rate limit). The literal `by-key`
+cannot be a handle because hyphens are not allowed.
 
 ## Client flows
 

@@ -1,4 +1,4 @@
-//! WebSocket gateway for the `vc/1` protocol: authentication, framing,
+//! WebSocket gateway for the `vc/2` protocol: authentication, framing,
 //! rate limiting and the per-connection write queue.
 
 use std::{

@@ -213,6 +213,11 @@ impl Store {
         Ok(self.db.query_row(&sql, [handle], account_row).optional()?)
     }
 
+    pub fn account_by_key(&self, key: &str) -> Result<Option<Account>> {
+        let sql = format!("SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE account_key=?1");
+        Ok(self.db.query_row(&sql, [key], account_row).optional()?)
+    }
+
     pub fn account(&self, id: i64) -> Result<Option<Account>> {
         let sql = format!("SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE id=?1");
         Ok(self.db.query_row(&sql, [id], account_row).optional()?)

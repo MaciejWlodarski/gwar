@@ -51,6 +51,7 @@ pub fn router(state: Arc<Connect>, origins: &[String]) -> Router {
         .route("/v1/vault", get(api::vault).put(api::put_vault))
         .route("/v1/logout", post(api::logout))
         .route("/v1/revocations", get(api::revocations))
+        .route("/v1/accounts/by-key/{account_key}", get(api::lookup_by_key))
         .route("/v1/accounts/{handle}", get(api::lookup))
         .layer(cors)
         .with_state(state)

@@ -502,3 +502,11 @@ pub async fn lookup(State(state): State<AppState>, Path(handle): Path<String>) -
         None => Err(ApiError(StatusCode::NOT_FOUND, "not_found", "no such account".into())),
     }
 }
+
+pub async fn lookup_by_key(State(state): State<AppState>, Path(key): Path<String>) -> Reply {
+    let account = state.store.lock().expect("store lock").account_by_key(&key)?;
+    match account {
+        Some(a) => Ok(Json(json!({"handle": a.handle, "account_key": a.account_key}))),
+        None => Err(ApiError(StatusCode::NOT_FOUND, "not_found", "no such account".into())),
+    }
+}

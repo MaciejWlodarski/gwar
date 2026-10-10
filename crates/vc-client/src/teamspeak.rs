@@ -355,11 +355,8 @@ fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Option<Out
             ),
             ChatTarget::Server => command("sendtextmessage", &[("targetmode", "3".into()), ("msg", text.clone())]),
         },
-        Request::ClientUpdate(ClientUpdate { nickname, muted, deafened, away }) => {
+        Request::ClientUpdate(ClientUpdate { muted, deafened, away }) => {
             let mut args = Vec::new();
-            if let Some(n) = nickname {
-                args.push(("client_nickname", n.clone()));
-            }
             if let Some(m) = muted {
                 args.push(("client_input_muted", u8::from(*m).to_string()));
             }
@@ -452,6 +449,7 @@ fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Option<Out
         Request::GroupCreate(_)
         | Request::GroupUpdate(_)
         | Request::GroupDelete { .. }
+        | Request::MemberNickname { .. }
         | Request::MemberGroups { .. }
         | Request::MemberRemove { .. }
         | Request::MemberPrune(_)

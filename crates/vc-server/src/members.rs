@@ -3,7 +3,8 @@
 //! The running server keeps no copy of its members, but it does announce changes
 //! to connected clients and refuses to forget a member who is online. So the
 //! destructive commands run only while no server uses the data directory (see
-//! [`lock_data_dir`]); listing and previews only read and always work.
+//! [`lock_data_dir`]); listing and removal previews work while the server runs.
+//! Merging always needs the lock.
 
 use std::{
     fmt::Write as _,
@@ -118,7 +119,12 @@ fn remove_rows(store: &Store, files_dir: &Path, members: &[MemberRow], delete_me
     Ok(())
 }
 
-/// One line per member: uid, last nickname, last seen, groups and message count.
+/// Merges two existing members, or previews the same transaction.
+pub fn merge(store: &Store, from: &str, into: &str, dry_run: bool) -> Result<crate::store::MergeReport> {
+    store.merge_members(from, into, dry_run)
+}
+
+/// One line per member: uid, nickname, tag, Connect handle, last seen, groups and message count.
 pub fn format_list(rows: &[MemberRow], groups: &[Group], now: i64) -> String {
     let name = |id: &GroupId| groups.iter().find(|g| g.id == *id).map_or_else(|| id.to_string(), |g| g.name.clone());
     let mut out = String::new();
@@ -128,9 +134,11 @@ pub fn format_list(rows: &[MemberRow], groups: &[Group], now: i64) -> String {
         let ago = (now - m.last_seen).max(0) / DAY_MS;
         let _ = writeln!(
             out,
-            "{}\t{}\t{} ({ago}d ago)\t{roles}\t{}",
+            "{}\t{}\t{}\t{}\t{} ({ago}d ago)\t{roles}\t{}",
             m.uid,
             m.nickname,
+            m.tag,
+            m.connect.as_deref().unwrap_or(""),
             civil_date(m.last_seen),
             row.messages
         );

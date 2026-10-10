@@ -69,7 +69,7 @@ impl Ws {
         let public_key = URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes());
         let signature = URL_SAFE_NO_PAD.encode(key.sign(&challenge_message(nonce, &public_key)).to_bytes());
         let hello = json!({"id": 1, "op": "hello", "d": {
-            "protocol": 1, "nickname": nickname, "public_key": public_key, "signature": signature,
+            "protocol": vc_proto::PROTOCOL_VERSION, "nickname": nickname, "public_key": public_key, "signature": signature,
             "client": {"name": "test", "version": "0", "platform": "desktop"}}});
         stream.send(Message::Text(hello.to_string().into())).await.unwrap();
         let welcome = read(&mut stream).await;

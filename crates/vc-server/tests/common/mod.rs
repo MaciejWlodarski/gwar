@@ -1,4 +1,4 @@
-//! Test harness: an in-process server and a small `vc/1` WebSocket client.
+//! Test harness: an in-process server and a small `vc/2` WebSocket client.
 #![allow(dead_code)]
 
 use std::{collections::HashMap, collections::VecDeque, future::Future, time::Duration};
@@ -142,7 +142,7 @@ impl RawConn {
     /// Body of a valid `hello` for `key`; tests mutate fields to break it.
     pub fn hello(&self, key: &SigningKey, nickname: &str, password: Option<&str>) -> Value {
         let mut d = json!({
-            "protocol": 1,
+            "protocol": vc_proto::PROTOCOL_VERSION,
             "nickname": nickname,
             "public_key": public_key(key),
             "signature": sign(key, &self.nonce),

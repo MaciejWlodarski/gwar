@@ -1,4 +1,4 @@
-//! End-to-end tests of the `vc/1` protocol against a real in-process server.
+//! End-to-end tests of the `vc/2` protocol against a real in-process server.
 
 mod common;
 
@@ -22,7 +22,7 @@ fn ids(events: &[Value]) -> Vec<u64> {
 async fn challenge_is_sent_first_and_describes_the_server() {
     let server = TestServer::start().await;
     let raw = open(&server).await;
-    assert_eq!(raw.challenge["protocol"], 1);
+    assert_eq!(raw.challenge["protocol"], vc_proto::PROTOCOL_VERSION);
     assert_eq!(raw.challenge["password_required"], false);
     assert_eq!(raw.challenge["server"]["name"], "Gwar");
     assert!(raw.nonce.len() >= 32);
@@ -74,7 +74,7 @@ async fn wrong_protocol_version_is_rejected() {
     let server = TestServer::start().await;
     let mut raw = open(&server).await;
     let mut hello = raw.hello(&new_key(), "old", None);
-    hello["protocol"] = json!(2);
+    hello["protocol"] = json!(vc_proto::PROTOCOL_VERSION + 1);
     let err = raw.rejected(hello).await;
     assert_eq!(serde_json::to_value(err.code).unwrap(), "bad_request");
     raw.expect_closed().await;
@@ -156,7 +156,7 @@ async fn second_hello_and_garbage_after_login_are_bad_requests() {
     let server = TestServer::start().await;
     let mut c = Client::connect(&server, "alice").await;
     let hello = json!({
-        "protocol": 1, "nickname": "again", "public_key": public_key(&c.key), "signature": "x",
+        "protocol": vc_proto::PROTOCOL_VERSION, "nickname": "again", "public_key": public_key(&c.key), "signature": "x",
         "client": {"name": "t", "version": "0", "platform": "web"},
     });
     assert_eq!(c.fails("hello", hello).await, "bad_request");
@@ -838,24 +838,28 @@ async fn deleting_a_channel_drops_its_history() {
 // -------------------------------------------------------- client.update
 
 #[tokio::test]
-async fn client_update_nickname_is_validated_and_broadcast() {
+async fn member_nickname_is_validated_and_broadcast() {
     let server = TestServer::start().await;
     let mut a = Client::connect(&server, "alice").await;
     let mut b = Client::connect(&server, "bob").await;
 
     for bad in ["", "   ", &"x".repeat(33), "new\nline"] {
-        assert_eq!(a.fails("client.update", json!({"nickname": bad})).await, "bad_request", "{bad:?}");
+        assert_eq!(
+            a.fails("member.nickname", json!({"uid": a.welcome.uid, "nickname": bad})).await,
+            "bad_request",
+            "{bad:?}"
+        );
     }
     assert!(b.drain_events("client.updated").await.is_empty(), "rejected updates are silent");
 
-    a.ok("client.update", json!({"nickname": "  Alicia "})).await;
+    a.ok("member.nickname", json!({"uid": a.welcome.uid, "nickname": "  Alicia "})).await;
     let ev = b.next_event_where("client.updated", |d| d["id"] == a.id()).await;
     assert_eq!(ev["nickname"], "Alicia");
     assert_eq!(a.next_event("client.updated").await["nickname"], "Alicia");
     // A 32-character nickname is the maximum.
-    a.ok("client.update", json!({"nickname": "n".repeat(32)})).await;
+    a.ok("member.nickname", json!({"uid": a.welcome.uid, "nickname": "n".repeat(32)})).await;
     // Authors of later messages carry the new nickname.
-    a.ok("client.update", json!({"nickname": "Final"})).await;
+    a.ok("member.nickname", json!({"uid": a.welcome.uid, "nickname": "Final"})).await;
     let msg = a.ok("chat.send", json!({"target": "server", "text": "x"})).await;
     assert_eq!(msg["author_name"], "Final");
 }

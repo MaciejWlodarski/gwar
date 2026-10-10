@@ -403,3 +403,124 @@ fn the_command_line_lists_and_prunes_members() {
     assert!(cli(dir, &["remove", "recent"]).status.success());
     assert!(!seeded.known("recent"));
 }
+
+#[test]
+fn merging_members_moves_all_identity_references_transactionally() {
+    let seeded = Seeded::new();
+    let store = &seeded.store;
+    let role = store.insert_group("Mods", &[Permission::ClientKick], None).unwrap();
+    let from = seeded.member("-legacy", 5, &[2, role]);
+    let into = seeded.member("account", 10, &[1, 2]);
+    store.set_nickname(into, "Target name").unwrap();
+    store.set_connect_handle(into, Some("verified")).unwrap();
+    let channels = store.channels().unwrap();
+    let (lobby, side) = (channels[0].id, channels[1].id);
+    let first = store.add_message(lobby, "-legacy", "Original", "first", 1).unwrap();
+    let second = store.add_message(lobby, "account", "Target name", "second", 2).unwrap();
+    let third = store.add_message(side, "-legacy", "Original", "third", 3).unwrap();
+    store.mark_read(from, lobby, second).unwrap();
+    store.mark_read(into, lobby, first).unwrap();
+    store.mark_read(from, side, third).unwrap();
+    store.set_mentions(second, &["-legacy".into(), "account".into()]).unwrap();
+    store.set_mentions(third, &["-legacy".into()]).unwrap();
+    store.insert_file("attached", "-legacy", "a.txt", "text/plain", 3, None, 1).unwrap();
+    store.attach_file("attached", first).unwrap();
+    store.insert_file("pending", "-legacy", "p.txt", "text/plain", 3, None, 1).unwrap();
+    std::fs::create_dir_all(seeded.files()).unwrap();
+    std::fs::write(seeded.files().join("attached"), b"abc").unwrap();
+    std::fs::write(seeded.files().join("pending"), b"def").unwrap();
+    store
+        .insert_ban(&vc_proto::Ban {
+            id: 0,
+            uid: Some("-legacy".into()),
+            ip: None,
+            nickname: "Original".into(),
+            reason: None,
+            by: "-legacy".into(),
+            created_at: 1,
+            expires_at: None,
+        })
+        .unwrap();
+    store
+        .insert_invite(&vc_proto::Invite {
+            code: "invite".into(),
+            uses: 0,
+            max_uses: None,
+            expires_at: None,
+            group: Some(role),
+            created_by: "-legacy".into(),
+            created_at: 1,
+        })
+        .unwrap();
+    let connection = rusqlite::Connection::open(seeded.database()).unwrap();
+    connection.execute("INSERT INTO revoked_devices VALUES('device','-legacy',1)", []).unwrap();
+    let summary = "2 messages, 2 files, 2 read marks, 2 group memberships, 2 mentions, 1 bans";
+    let preview = cli(seeded.dir.path(), &["merge", "--dry-run", "--", "-legacy", "account"]);
+    assert!(preview.status.success(), "{}", String::from_utf8_lossy(&preview.stderr));
+    assert!(stdout(&preview).contains(summary));
+    assert!(seeded.known("-legacy"));
+    assert_eq!(store.message(first).unwrap().unwrap().author_uid, "-legacy");
+    assert_eq!(store.read_mark(into, lobby).unwrap(), first);
+    assert!(store.pending_file("pending", "-legacy").unwrap().is_some());
+
+    // Even the preview takes the exclusive data-directory lock.
+    let lock = lock_data_dir(seeded.dir.path()).unwrap();
+    for options in [vec!["merge", "--", "-legacy", "account"], vec!["merge", "--dry-run", "--", "-legacy", "account"]] {
+        let blocked = cli(seeded.dir.path(), &options);
+        assert!(!blocked.status.success());
+        assert!(String::from_utf8_lossy(&blocked.stderr).contains("stop it first"));
+    }
+    drop(lock);
+    for args in
+        [vec!["merge", "account", "absent"], vec!["merge", "absent", "account"], vec!["merge", "account", "account"]]
+    {
+        assert!(!cli(seeded.dir.path(), &args).status.success());
+        assert!(seeded.known("-legacy"));
+    }
+    // A failure at the very end rolls back updates to messages, files and every join table.
+    connection.execute_batch("CREATE TRIGGER reject_merge BEFORE DELETE ON users WHEN OLD.uid='-legacy' BEGIN SELECT RAISE(ABORT,'test rollback'); END;").unwrap();
+    let failed = cli(seeded.dir.path(), &["merge", "--", "-legacy", "account"]);
+    assert!(!failed.status.success());
+    assert_eq!(store.message(first).unwrap().unwrap().author_uid, "-legacy");
+    assert_eq!(store.read_mark(into, lobby).unwrap(), first);
+    assert!(store.pending_file("pending", "-legacy").unwrap().is_some());
+    assert_eq!(store.message(second).unwrap().unwrap().mentions.len(), 2);
+    connection.execute_batch("DROP TRIGGER reject_merge;").unwrap();
+
+    let merged = cli(seeded.dir.path(), &["merge", "--", "-legacy", "account"]);
+    assert!(merged.status.success(), "{}", String::from_utf8_lossy(&merged.stderr));
+    assert!(stdout(&merged).contains(summary));
+    assert!(!seeded.known("-legacy"));
+    let target = store.user_by_uid("account").unwrap().unwrap().1;
+    assert_eq!(target.nickname, "Target name");
+    assert_eq!(target.connect.as_deref(), Some("verified"));
+    assert_eq!(target.groups, vec![1, 2, role]);
+    assert_eq!(store.read_mark(into, lobby).unwrap(), second);
+    assert_eq!(store.read_mark(into, side).unwrap(), third);
+    for id in [first, third] {
+        let message = store.message(id).unwrap().unwrap();
+        assert_eq!(message.author_uid, "account");
+        assert_eq!(message.author_name, "Target name");
+    }
+    assert_eq!(store.message(second).unwrap().unwrap().mentions, vec!["account".to_owned()]);
+    assert_eq!(store.message(third).unwrap().unwrap().mentions, vec!["account".to_owned()]);
+    assert!(store.pending_file("pending", "account").unwrap().is_some());
+    assert_eq!(store.history(lobby, None, 10).unwrap()[0].attachments[0].id, "attached");
+    assert_eq!(std::fs::read(seeded.files().join("attached")).unwrap(), b"abc");
+    assert_eq!(std::fs::read(seeded.files().join("pending")).unwrap(), b"def");
+    assert_eq!(store.bans(0).unwrap()[0].uid.as_deref(), Some("account"));
+    assert_eq!(store.bans(0).unwrap()[0].by, "-legacy", "display-name snapshots stay unchanged");
+    assert_eq!(store.invites().unwrap()[0].created_by, "-legacy");
+    let account_key: String =
+        connection.query_row("SELECT account_key FROM revoked_devices", [], |r| r.get(0)).unwrap();
+    assert_eq!(account_key, "-legacy", "revocations stay bound to the original signing key");
+    assert_eq!(
+        connection
+            .query_row("SELECT author_name FROM messages WHERE id=?1", [first], |r| r.get::<_, String>(0))
+            .unwrap(),
+        "Original"
+    );
+    assert!(connection.prepare("PRAGMA foreign_key_check").unwrap().query([]).unwrap().next().unwrap().is_none());
+    let listing = stdout(&cli(seeded.dir.path(), &["list"]));
+    assert!(listing.contains(&format!("account\tTarget name\t{}\tverified\t", target.tag)));
+}
