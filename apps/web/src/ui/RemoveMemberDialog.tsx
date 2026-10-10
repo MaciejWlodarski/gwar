@@ -2,11 +2,13 @@ import { useState, type FormEvent } from "react";
 import { useT } from "../i18n";
 import { controller, describeRequestError } from "../state/controller";
 import { useUi, type PersonRef, type ServerSettingsTab } from "../state/stores";
+import { useMemberName } from "./hooks";
 import { Button, Dialog } from "./kit";
 
 /** Removes a member from the server. Not a ban: they can join again as a new member. */
 export function RemoveMemberDialog({ person, back }: { person: PersonRef; back?: ServerSettingsTab }) {
   const t = useT();
+  const nickname = useMemberName(person.uid, person.nickname);
   const [deleteMessages, setDeleteMessages] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -21,7 +23,7 @@ export function RemoveMemberDialog({ person, back }: { person: PersonRef; back?:
     setError(null);
     try {
       await controller.removeMember(person.uid, deleteMessages);
-      useUi.getState().toast("success", t("mod.removed", { name: person.nickname }));
+      useUi.getState().toast("success", t("mod.removed", { name: nickname }));
       close();
     } catch (err) {
       setError(describeRequestError(err));
@@ -33,7 +35,7 @@ export function RemoveMemberDialog({ person, back }: { person: PersonRef; back?:
     <Dialog
       open
       onOpenChange={(o) => !o && close()}
-      title={t("mod.removeTitle", { name: person.nickname })}
+      title={t("mod.removeTitle", { name: nickname })}
       description={t("mod.removeBody")}
       width="max-w-sm"
       footer={

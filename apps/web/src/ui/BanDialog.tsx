@@ -3,10 +3,12 @@ import { useT, type Key } from "../i18n";
 import { BAN_DURATIONS } from "../lib/ban";
 import { controller, describeRequestError } from "../state/controller";
 import { useUi, type PersonRef, type ServerSettingsTab } from "../state/stores";
+import { useMemberName } from "./hooks";
 import { Button, Dialog, Field, Input, Segmented } from "./kit";
 
 export function BanDialog({ person, back }: { person: PersonRef; back?: ServerSettingsTab }) {
   const t = useT();
+  const nickname = useMemberName(person.uid, person.nickname);
   const [reason, setReason] = useState("");
   const [duration, setDuration] = useState<(typeof BAN_DURATIONS)[number]["id"]>("1d");
   const [ip, setIp] = useState(false);
@@ -28,7 +30,7 @@ export function BanDialog({ person, back }: { person: PersonRef; back?: ServerSe
         ...(BAN_DURATIONS.find((d) => d.id === duration)?.seconds ? { duration: BAN_DURATIONS.find((d) => d.id === duration)!.seconds } : {}),
         ...(reason.trim() ? { reason: reason.trim() } : {}),
       });
-      useUi.getState().toast("success", t("mod.banned", { name: person.nickname }));
+      useUi.getState().toast("success", t("mod.banned", { name: nickname }));
       close();
     } catch (err) {
       setError(describeRequestError(err));
@@ -40,7 +42,7 @@ export function BanDialog({ person, back }: { person: PersonRef; back?: ServerSe
     <Dialog
       open
       onOpenChange={(o) => !o && close()}
-      title={t("mod.banTitle", { name: person.nickname })}
+      title={t("mod.banTitle", { name: nickname })}
       description={t("mod.banBody")}
       width="max-w-sm"
       footer={

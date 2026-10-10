@@ -91,6 +91,7 @@ export function ModerationItems({ person, groups }: { person: PersonRef; groups:
             useUi.getState().openDialog({
               kind: "confirm",
               title: t("tree.kickTitle", { name: person.nickname }),
+              memberTitle: { uid: person.uid, fallback: person.nickname, key: "tree.kickTitle" },
               body: t("tree.kickBody"),
               confirmLabel: t("tree.kick"),
               danger: true,

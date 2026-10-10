@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import type { Key } from "../i18n";
 import type { TsFound } from "../connect/teamspeak";
 import type { ChatTarget } from "../proto/ChatTarget";
 import type { CloseReason } from "../net/connection";
@@ -95,7 +96,7 @@ export type DialogState =
   | { kind: "lightbox"; url: string; name: string }
   | { kind: "redeem" }
   | { kind: "createToken" }
-  | { kind: "confirm"; title: string; body: string; confirmLabel: string; danger?: boolean; onConfirm: () => void }
+  | { kind: "confirm"; title: string; memberTitle?: { uid: string; fallback: string; key: Key }; body: string; confirmLabel: string; danger?: boolean; onConfirm: () => void }
   /** First TeamSpeak connection on a device: offers the official client's identities. Resolves with the chosen ones, or null. */
   | { kind: "tsFirstRun"; found: TsFound[]; resolve: (chosen: TsFound[] | null) => void };
 

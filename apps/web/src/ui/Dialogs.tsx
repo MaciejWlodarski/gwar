@@ -8,7 +8,7 @@ import { controller, describeRequestError } from "../state/controller";
 import { sortedChannels } from "../state/reducer";
 import { isDesktop } from "../platform";
 import { newId, useSettings, type ServerKind } from "../state/settings";
-import { useSession, useUi } from "../state/stores";
+import { useSession, useUi, type DialogState } from "../state/stores";
 import { Button, Dialog, Field, Input, Segmented, Select, Textarea } from "./kit";
 import { SettingsDialog } from "./Settings";
 import { BanDialog } from "./BanDialog";
@@ -17,7 +17,7 @@ import { Lightbox } from "./Attachments";
 import { InvitesDialog, ServerSettingsDialog } from "./ServerSettings";
 import { FirstRunDialog } from "./TeamspeakFound";
 import { IdentityPicker } from "./IdentityPicker";
-import { useTsIdentities } from "./hooks";
+import { useMemberName, useTsIdentities } from "./hooks";
 import { resolveIdentity } from "../connect/ts-list";
 
 export function Dialogs() {
@@ -64,14 +64,15 @@ function useClose() {
 
 // ------------------------------------------------------------------ confirm
 
-function ConfirmDialog({ title, body, confirmLabel, danger, onConfirm }: { title: string; body: string; confirmLabel: string; danger?: boolean; onConfirm: () => void }) {
+function ConfirmDialog({ title, memberTitle, body, confirmLabel, danger, onConfirm }: Extract<DialogState, { kind: "confirm" }>) {
   const t = useT();
   const close = useClose();
+  const nickname = useMemberName(memberTitle?.uid ?? "", memberTitle?.fallback ?? "");
   return (
     <Dialog
       open
       onOpenChange={(o) => !o && close()}
-      title={title}
+      title={memberTitle ? t(memberTitle.key, { name: nickname }) : title}
       description={body}
       width="max-w-sm"
       footer={

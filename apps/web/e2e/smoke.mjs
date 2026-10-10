@@ -24,6 +24,7 @@
  *                   delaying TCP proxy (default 0). The suite must pass at any value.
  *   GWAR_CONNECT_BIN  path to the gwar-connect binary (default ../../target/debug/gwar-connect,
  *                     falling back to `cargo run -p gwar-connect`)
+ *   E2E_SCREENSHOTS  optional screenshot output directory (default e2e/screenshots/)
  *   HEADED=1     show the browser
  */
 import { spawn, spawnSync } from "node:child_process";
@@ -38,7 +39,7 @@ import { chromium } from "playwright";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const webRoot = path.resolve(here, "..");
 const repoRoot = path.resolve(webRoot, "../..");
-const shots = path.join(here, "screenshots");
+const shots = process.env.E2E_SCREENSHOTS ?? path.join(here, "screenshots");
 mkdirSync(shots, { recursive: true });
 
 const WEB_URL = process.env.WEB_URL ?? "http://127.0.0.1:5173";
@@ -160,7 +161,7 @@ async function ensureConnect() {
 
 async function ensureWeb(connectUrl) {
   if (await reachable(WEB_URL)) return;
-  const child = spawn("npx", ["vite", "--host", "127.0.0.1"], { cwd: webRoot, env: { ...process.env, VITE_CONNECT_URL: connectUrl } });
+  const child = spawn("npx", ["vite", "--host", "127.0.0.1", "--port", new URL(WEB_URL).port || "5173", "--strictPort"], { cwd: webRoot, env: { ...process.env, VITE_CONNECT_URL: connectUrl } });
   children.push(child);
   await waitFor(() => reachable(WEB_URL), "vite dev server", 30000);
   console.log("started vite dev server");
@@ -213,7 +214,7 @@ async function check(name, fn) {
     console.log(`  ok   ${name}`);
   } catch (e) {
     results.push({ name, ok: false, error: e });
-    console.log(`  FAIL ${name}\n       ${String(e.message ?? e).split("\n")[0]}`);
+    console.log(`  FAIL ${name}\n${e.stack ?? e}`);
     for (const [i, p] of debugPages.entries()) {
       await p.screenshot({ path: path.join(shots, `fail-${results.length}-${i}.png`) }).catch(() => {});
     }
@@ -243,10 +244,20 @@ function recordFrames(page) {
   };
 }
 
+/** Escape first dismisses a focused member tooltip, then its containing drawer. */
+async function dismissDialog(page, name) {
+  const dialog = page.getByRole("dialog", { name, exact: true });
+  for (let attempt = 0; attempt < 3 && await dialog.isVisible(); attempt++) {
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(100);
+  }
+  await dialog.waitFor({ state: "detached" });
+}
+
 /** Set the identity's profile through Settings, before the first join. */
 async function setGlobalNickname(page, nickname, { mobile = false, pl = false } = {}) {
   const settings = page.getByRole("button", { name: pl ? "Ustawienia" : "Settings", exact: true }).first();
-  if (!(await settings.isVisible())) await page.getByRole("button", { name: pl ? "Serwery" : "Servers", exact: true }).click();
+  if (mobile && !(await settings.isVisible())) await page.getByRole("button", { name: pl ? "Serwery" : "Servers", exact: true }).click();
   await settings.click();
   await page.getByRole("tab", { name: pl ? "Tożsamość" : "Identity", exact: true }).click();
   const field = page.getByLabel(pl ? "Pseudonim" : "Nickname", { exact: true });
@@ -257,7 +268,7 @@ async function setGlobalNickname(page, nickname, { mobile = false, pl = false } 
   await waitFor(() => save.isEnabled(), "saved identity nickname", 15000);
   await page.getByText(pl ? "Zapisano" : "Saved", { exact: true }).waitFor();
   await page.keyboard.press("Escape");
-  if (mobile) await page.keyboard.press("Escape");
+  if (mobile) await dismissDialog(page, pl ? "Kanały i serwery" : "Channels and servers");
 }
 
 async function changeServerNickname(page, nickname) {
@@ -724,11 +735,11 @@ async function main() {
     // The join button has no hover on touch screens: it is always there.
     await m.getByRole("button", { name: "Channels and servers" }).click();
     await m.getByRole("button", { name: `Join voice in ${GAMES}` }).waitFor();
-    await m.keyboard.press("Escape");
+    await dismissDialog(m, "Channels and servers");
     await m.getByRole("button", { name: "Members" }).click();
     await memberSection(m, "Online").getByText("Carol").waitFor();
     await shot(m, "12b-mobile-dark-members");
-    await m.keyboard.press("Escape");
+    await dismissDialog(m, "Members");
   });
   await m.emulateMedia({ colorScheme: "light" });
   await shot(m, "13-mobile-light-chat");
@@ -1205,11 +1216,13 @@ async function main() {
   const fd = recordFrames(d);
 
   await check("member nickname updates history, exposes the tag, and persists across reconnects", async () => {
+    // Earlier moderation checks kick Bob and may remove his server membership.
+    await connect(b, "Bob");
     await treeItem(a, TALK).click();
     await treeItem(b, TALK).click();
-    await composer(b).fill(`before nickname snapshot ${rid}`);
+    await composer(b).fill(`history boundary ${rid}`);
     await composer(b).press("Enter");
-    await a.getByText(`before nickname snapshot ${rid}`, { exact: true }).waitFor();
+    await a.getByText(`history boundary ${rid}`, { exact: true }).waitFor();
     const message = `nickname snapshot ${rid}`;
     await composer(a).fill(message);
     await composer(a).press("Enter");
@@ -1356,8 +1369,9 @@ async function main() {
     const welcomed = fd.frames.map((f) => f.ok).find((ok) => ok?.uid);
     if (!welcomed) throw new Error("no welcome received");
     if (welcomed.uid !== localUid) throw new Error(`server uid ${welcomed.uid} != account uid ${localUid}`);
-    const member = welcomed.members.find((member) => member.uid === localUid);
-    if (member?.connect !== acct) throw new Error("server did not verify the Connect account handle");
+    // Verification runs off the hello path; the badge may arrive in member.updated.
+    await waitFor(() => [...welcomed.members, ...fd.events("member.updated")].some((member) => member.uid === localUid && member.connect === acct), "verified Connect account handle");
+    await memberSection(d, "Online").getByLabel(`Gwar Connect account: @${acct}`).waitFor();
     await d.getByRole("button", { name: "Server menu" }).click();
     await d.getByRole("menuitem", { name: "Change nickname", exact: true }).click();
     await d.getByRole("dialog").getByLabel("Nickname").fill("Account on server");
