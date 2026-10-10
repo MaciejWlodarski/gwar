@@ -1,3 +1,4 @@
+import { useAccountIdentity } from "./identity";
 import type { BanNotice } from "../proto/BanNotice";
 /**
  * Glue between the network client, the voice engine and the stores. UI
@@ -9,6 +10,7 @@ import type { ChannelUpdate } from "../proto/ChannelUpdate";
 import type { ChatTarget } from "../proto/ChatTarget";
 import { tNow, type Key } from "../i18n";
 import { absoluteUrl, httpOriginFromWsUrl, parseServerAddress, parseTeamSpeakAddress, pageContextFromLocation } from "../net/address";
+import { memberName } from "../lib/member-name";
 import { checkUpload } from "../lib/files";
 import { notificationBody, notifyReason } from "../lib/notify-rules";
 import { uploadFromApp } from "../platform/download";
@@ -62,7 +64,6 @@ export interface ConnectParams {
   /** `vc` (default) or `teamspeak` (desktop only). */
   kind?: ServerKind;
   address: string;
-  nickname: string;
   password?: string;
   /** Invite code from a link: admits without the server password. */
   invite?: string;
@@ -130,6 +131,7 @@ class Controller {
   private conn: Link | null = null;
   private engine: VoiceEngine;
   private identity: Identity | null = null;
+  private identityLoading: Promise<Identity> | null = null;
   private voiceRetry: ReturnType<typeof setTimeout> | null = null;
   private voiceRetries = 0;
   private initialised = false;
@@ -284,7 +286,7 @@ class Controller {
       session.setAddress(params.address, kind, null);
       conn = new TsConnection({
         address: parsed.value.address,
-        nickname: params.nickname.trim(),
+        nickname: (await this.getIdentity()).nickname,
         serverPassword: params.password || undefined,
         identity: params.identity,
       });
@@ -298,8 +300,9 @@ class Controller {
       session.setClose(null);
       session.setAddress(params.address, kind, httpOriginFromWsUrl(parsed.value.url));
 
+      let identity: Identity;
       try {
-        this.identity ??= await loadActiveIdentity();
+        identity = await this.getIdentity();
       } catch (e) {
         session.dispatch({ type: "phase", phase: "idle" });
         throw new ConnectFailure("identity", e instanceof IdentityUnsupportedError ? e.message : String(e));
@@ -307,8 +310,8 @@ class Controller {
 
       conn = new Connection({
         url: parsed.value.url,
-        identity: this.identity,
-        nickname: params.nickname.trim(),
+        identity,
+        nickname: identity.nickname,
         serverPassword: params.password || undefined,
         invite: params.invite || undefined,
         client: { name: "vc-web", version: CLIENT_VERSION, platform: platform() },
@@ -353,12 +356,11 @@ class Controller {
     ui.set({ busy: false, error: null, needPassword: false, serverName: null, invite: null });
     const settings = useSettings.getState();
     const kind: ServerKind = params.kind ?? "vc";
-    settings.setLast(params.address, params.nickname, kind);
+    settings.setLast(params.address, kind);
     const name = useSession.getState().server?.name || params.address;
     const existing = settings.bookmarks.find(
       (b) =>
         b.address.trim().toLowerCase() === params.address.trim().toLowerCase() &&
-        b.nickname === params.nickname &&
         (b.kind ?? "vc") === kind,
     );
     // A TeamSpeak server remembers which identity was used to get in.
@@ -366,7 +368,7 @@ class Controller {
     if (existing) {
       settings.saveBookmark({ ...existing, kind, name, password: params.password || existing.password, ...identity });
     } else if (opts.remember) {
-      settings.saveBookmark({ id: newId(), kind, name, address: params.address.trim(), nickname: params.nickname.trim(), password: params.password || undefined, ...identity });
+      settings.saveBookmark({ id: newId(), kind, name, address: params.address.trim(), password: params.password || undefined, ...identity });
     }
     return true;
   }
@@ -585,7 +587,22 @@ class Controller {
   // ---------------------------------------------------------------- identity
 
   async getIdentity(): Promise<Identity> {
-    this.identity ??= await loadActiveIdentity();
+    if (!this.identity) {
+      const pending = this.identityLoading ??= loadActiveIdentity();
+      let loaded: Identity;
+      try {
+        loaded = await pending;
+      } catch (e) {
+        if (this.identityLoading === pending) this.identityLoading = null;
+        throw e;
+      }
+      if (this.identityLoading === pending) {
+        this.identity ??= loaded;
+        this.identityLoading = null;
+      }
+      if (!this.identity) return this.getIdentity();
+    }
+    useAccountIdentity.setState({ nickname: this.identity.nickname });
     return this.identity;
   }
 
@@ -595,19 +612,25 @@ class Controller {
    */
   async switchIdentity(identity: Identity | null): Promise<void> {
     await this.disconnect(true);
+    this.identityLoading = null;
     this.identity = identity;
+    useAccountIdentity.setState({ nickname: identity?.nickname ?? "" });
   }
 
   /** Swaps the identity object without dropping the connection (same key, new certificate). */
   async replaceIdentityQuietly(identity: Identity): Promise<void> {
+    this.identityLoading = null;
     this.identity = identity;
+    useAccountIdentity.setState({ nickname: identity?.nickname ?? "" });
   }
 
   /** Replaces the browser identity; disconnects because the old session belongs to the old key. */
   async importIdentity(text: string): Promise<void> {
     const identity = await importIdentity(text);
     await this.disconnect(true);
+    this.identityLoading = null;
     this.identity = identity;
+    useAccountIdentity.setState({ nickname: identity?.nickname ?? "" });
   }
 
   // --------------------------------------------------------------- requests
@@ -757,8 +780,12 @@ class Controller {
     return this.connection.request("token.redeem", { token });
   }
 
-  updateProfile(update: { nickname?: string; away?: string }) {
+  updateProfile(update: { away?: string }) {
     return this.connection.request("client.update", update);
+  }
+
+  setMemberNickname(uid: string, nickname: string) {
+    return this.connection.request("member.nickname", { uid, nickname: nickname.trim() });
   }
 
   // --------------------------------------------------------------------- chat
@@ -909,13 +936,14 @@ class Controller {
     const s = useSession.getState();
     const reason = notifyReason(msg, { meUid: s.me?.uid, focused: s.focused, settings: useSettings.getState().notifications });
     if (!reason) return null;
+    const authorName = memberName(s.members, msg.author_uid, msg.author_name);
     const channel = typeof msg.target === "object" && "channel" in msg.target ? s.channels[msg.target.channel]?.name : undefined;
     const title =
       reason === "dm"
-        ? tNow("notify.dm", { name: msg.author_name })
+        ? tNow("notify.dm", { name: authorName })
         : channel
-          ? tNow("notify.channel", { name: msg.author_name, channel })
-          : tNow("notify.server", { name: msg.author_name, server: s.server?.name ?? "" });
+          ? tNow("notify.channel", { name: authorName, channel })
+          : tNow("notify.server", { name: authorName, server: s.server?.name ?? "" });
     return () => {
       notify({
         title,
@@ -932,7 +960,7 @@ class Controller {
     const t = msg.target;
     if (t === "server") s.dispatch({ type: "setActive", key: "server" });
     else if ("channel" in t) this.selectChannel(t.channel);
-    else s.dispatch({ type: "openDm", uid: msg.author_uid, name: msg.author_name });
+    else s.dispatch({ type: "openDm", uid: msg.author_uid, name: memberName(s.members, msg.author_uid, msg.author_name) });
   }
 
   async loadHistory(channel: number): Promise<void> {

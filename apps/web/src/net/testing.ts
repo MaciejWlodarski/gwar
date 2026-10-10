@@ -53,7 +53,7 @@ export class FakeSocket implements WebSocketLike {
 export const serverInfo = { name: "Test", welcome: "hi", version: "0", default_channel: 1, max_clients: 10, upload_limit: 0 };
 
 export function challenge(passwordRequired = false) {
-  return { ev: "challenge", d: { protocol: 1, nonce: "abc", server: serverInfo, password_required: passwordRequired } };
+  return { ev: "challenge", d: { protocol: 2, nonce: "abc", server: serverInfo, password_required: passwordRequired } };
 }
 
 export function welcome(overrides: Partial<Welcome> = {}): Welcome {
@@ -74,6 +74,7 @@ export function welcome(overrides: Partial<Welcome> = {}): Welcome {
 
 export const fakeIdentity: Identity = {
   publicKey: "PUBKEY",
+  nickname: "Ann",
   sign: async (m) => `sig(${new TextDecoder().decode(m).replace(/\n/g, "|")})`,
   exportBackup: () => ({ format: "vc-identity", version: 1, jwk: {} }),
 };

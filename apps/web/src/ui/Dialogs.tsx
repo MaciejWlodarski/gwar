@@ -1,3 +1,4 @@
+import { MemberProfileDialog, NicknameDialog } from "./MemberProfile";
 import { Check, Copy } from "lucide-react";
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { useT } from "../i18n";
@@ -36,6 +37,10 @@ export function Dialogs() {
       return <ServerSettingsDialog tab={dialog.tab} />;
     case "invites":
       return <InvitesDialog />;
+    case "nickname":
+      return <NicknameDialog key={dialog.uid} uid={dialog.uid} />;
+    case "memberProfile":
+      return <MemberProfileDialog uid={dialog.uid} fallback={dialog.fallback} />;
     case "ban":
       return <BanDialog person={dialog.person} back={dialog.back} />;
     case "removeMember":
@@ -96,12 +101,10 @@ function AddServerDialog({ editId }: { editId?: string }) {
   const t = useT();
   const close = useClose();
   const existing = useSettings((s) => s.bookmarks.find((b) => b.id === editId));
-  const lastNickname = useSettings((s) => s.lastNickname);
   const desktop = isDesktop();
   const [kind, setKind] = useState<ServerKind>(existing?.kind ?? "vc");
   const [name, setName] = useState(existing?.name ?? "");
   const [address, setAddress] = useState(existing?.address ?? "");
-  const [nickname, setNickname] = useState(existing?.nickname ?? lastNickname);
   const [password, setPassword] = useState(existing?.password ?? "");
   const tsList = useTsIdentities();
   const [identity, setIdentity] = useState<string | null>(existing?.identity ?? null);
@@ -109,13 +112,12 @@ function AddServerDialog({ editId }: { editId?: string }) {
 
   const save = (connect: boolean) => (e?: FormEvent) => {
     e?.preventDefault();
-    if (!address.trim() || !nickname.trim()) return;
+    if (!address.trim()) return;
     const bookmark = {
       id: existing?.id ?? newId(),
       name: name.trim() || address.trim(),
       kind,
       address: address.trim(),
-      nickname: nickname.trim(),
       password: password || undefined,
       // Without a choice to make, a remembered identity stays as it was.
       identity: kind === "teamspeak" ? (pickIdentity ? (resolveIdentity(tsList, identity) ?? undefined) : existing?.identity) : undefined,
@@ -124,7 +126,7 @@ function AddServerDialog({ editId }: { editId?: string }) {
     close();
     if (connect) {
       void controller.connectInteractive(
-        { kind, address: bookmark.address, nickname: bookmark.nickname, password: bookmark.password, identity: bookmark.identity },
+        { kind, address: bookmark.address, password: bookmark.password, identity: bookmark.identity },
         { remember: false },
       );
     }
@@ -139,10 +141,10 @@ function AddServerDialog({ editId }: { editId?: string }) {
       footer={
         <>
           <Button onClick={close}>{t("common.cancel")}</Button>
-          <Button onClick={() => save(false)()} disabled={!address.trim() || !nickname.trim()}>
+          <Button onClick={() => save(false)()} disabled={!address.trim()}>
             {t("common.save")}
           </Button>
-          <Button variant="primary" onClick={() => save(true)()} disabled={!address.trim() || !nickname.trim()}>
+          <Button variant="primary" onClick={() => save(true)()} disabled={!address.trim()}>
             {t("addServer.saveConnect")}
           </Button>
         </>
@@ -167,9 +169,7 @@ function AddServerDialog({ editId }: { editId?: string }) {
             <Input id={id} value={address} onChange={(e) => setAddress(e.target.value)} placeholder={kind === "teamspeak" ? "ts.example.com" : "voice.example.com"} spellCheck={false} autoCapitalize="none" autoFocus />
           )}
         </Field>
-        <Field label={t("connect.nickname")}>
-          {(id) => <Input id={id} value={nickname} onChange={(e) => setNickname(e.target.value)} maxLength={32} />}
-        </Field>
+
         <Field label={t("addServer.password")} hint={kind === "teamspeak" ? t("addServer.tsPasswordHint") : t("addServer.passwordHint")}>
           {(id) => <Input id={id} type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="off" />}
         </Field>

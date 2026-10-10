@@ -14,15 +14,13 @@ export function ServerRail() {
   const phase = useSession((s) => s.phase);
   const address = useSession((s) => s.address);
   const kind = useSession((s) => s.kind);
-  const nickname = useSession((s) => (s.me ? s.clients[s.me.session]?.nickname : undefined));
   const openDialog = useUi((s) => s.openDialog);
   const setDrawer = useUi((s) => s.setDrawer);
 
   const isActive = (b: Bookmark) =>
     phase !== "idle" &&
     (b.kind ?? "vc") === kind &&
-    b.address.trim().toLowerCase() === address.trim().toLowerCase() &&
-    (!nickname || b.nickname === nickname);
+    b.address.trim().toLowerCase() === address.trim().toLowerCase();
 
   const open = (b: Bookmark) => {
     if (isActive(b) && phase === "online") {
@@ -30,7 +28,7 @@ export function ServerRail() {
       return;
     }
     setDrawer(false);
-    void controller.connectInteractive({ kind: b.kind, address: b.address, nickname: b.nickname, password: b.password, identity: b.identity }, { remember: false });
+    void controller.connectInteractive({ kind: b.kind, address: b.address, password: b.password, identity: b.identity }, { remember: false });
   };
 
   return (
@@ -48,7 +46,7 @@ export function ServerRail() {
                       active ? "h-8 opacity-100" : "h-0 opacity-0",
                     )}
                   />
-                  <Tooltip label={`${b.name} · ${b.nickname}${b.kind === "teamspeak" ? ` · ${t("badge.teamspeak")}` : ""}`} side="right">
+                  <Tooltip label={`${b.name}${b.kind === "teamspeak" ? ` · ${t("badge.teamspeak")}` : ""}`} side="right">
                     <button
                       onClick={() => open(b)}
                       aria-label={b.name}

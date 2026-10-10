@@ -37,7 +37,8 @@ export function ChannelTree() {
   const channels = useSession((s) => s.channels);
   const clients = useSession((s) => s.clients);
   const compact = useSettings((s) => s.compact);
-  const tree = useMemo(() => buildTree(Object.values(channels), Object.values(clients)), [channels, clients]);
+  const members = useSession((s) => s.members);
+  const tree = useMemo(() => buildTree(Object.values(channels), Object.values(clients).map((c) => ({ ...c, nickname: members[c.uid]?.nickname ?? c.nickname }))), [channels, clients, members]);
   const ref = useRef<HTMLDivElement>(null);
 
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
@@ -252,9 +253,11 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
 });
 
 
-function UserRow({ client, depth, compact }: { client: Client; depth: number; compact: boolean }) {
+function UserRow({ client: sessionClient, depth, compact }: { client: Client; depth: number; compact: boolean }) {
   const t = useT();
-  const isMe = useSession((s) => s.me?.session === client.id);
+  const member = useSession((s) => s.members[sessionClient.uid]);
+  const client = { ...sessionClient, nickname: member?.nickname ?? sessionClient.nickname };
+  const isMe = useSession((s) => s.me?.uid === client.uid);
   const myChannel = useSession(myChannelId);
   const canMove = usePermission("client_move");
   const color = useGroupsColor(client.groups);
@@ -318,6 +321,9 @@ function UserRow({ client, depth, compact }: { client: Client; depth: number; co
           <ContextMenu.Label className={menuLabel}>
             {client.nickname} · {PLATFORM_LABEL[client.platform]}
           </ContextMenu.Label>
+          <ContextMenu.Item className={menuItem} onSelect={() => useUi.getState().openDialog({ kind: "memberProfile", uid: client.uid, fallback: client.nickname })}>
+            {t("member.viewProfile")}
+          </ContextMenu.Item>
           {!isMe && (
             <>
               <VolumeControl uid={client.uid} />

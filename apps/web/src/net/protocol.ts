@@ -13,7 +13,7 @@ import type { Event } from "../proto/Event";
 import type { Request } from "../proto/Request";
 import type { Welcome } from "../proto/Welcome";
 
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 /** Number of recvonly audio transceivers the server expects (`AUDIO_SLOTS`). */
 export const AUDIO_SLOTS = 8;
 export const MAX_MESSAGE_LENGTH = 4000;
@@ -47,6 +47,7 @@ export interface ResponseMap {
   "group.create": { group: Group };
   "group.update": { group: Group };
   "group.delete": Empty;
+  "member.nickname": Empty;
   "member.groups": { groups: number[] };
   "member.remove": Empty;
   "member.prune": { uids: string[]; count: number; members: Member[] };

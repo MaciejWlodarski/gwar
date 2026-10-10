@@ -15,6 +15,8 @@ export type StoredThreadKey = "server" | `ch:${number}` | `dm:${string}`;
 export interface SysText {
   key: "sys.welcome" | "sys.user_joined_channel" | "sys.user_left_channel" | "sys.you_joined_channel" | "sys.reconnected";
   params?: Record<string, string>;
+  /** Person named in a join/leave notice, so their current nickname can be shown. */
+  uid?: string;
 }
 
 export type ChatItem =

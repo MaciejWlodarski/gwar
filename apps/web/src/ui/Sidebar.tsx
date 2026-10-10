@@ -1,5 +1,5 @@
 import * as Dropdown from "@radix-ui/react-dropdown-menu";
-import { ChevronDown, Copy, KeyRound, LogOut, Plus, Settings2, Ticket, UserPlus } from "lucide-react";
+import { ChevronDown, Copy, KeyRound, LogOut, Plus, Pencil, Settings2, Ticket, UserPlus } from "lucide-react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { controller } from "../state/controller";
@@ -13,6 +13,7 @@ import { VoicePanel } from "./VoicePanel";
 function ServerHeader() {
   const t = useT();
   const server = useSession((s) => s.server);
+  const uid = useSession((s) => s.me?.uid);
   const address = useSession((s) => s.address);
   const phase = useSession((s) => s.phase);
   const kind = useSession((s) => s.kind);
@@ -58,6 +59,11 @@ function ServerHeader() {
       </Dropdown.Trigger>
       <Dropdown.Portal>
         <Dropdown.Content align="start" sideOffset={4} className={cn(menuContent, "w-64")}>
+          {kind === "vc" && uid && (
+            <Dropdown.Item className={menuItem} onSelect={() => openDialog({ kind: "nickname", uid })}>
+              <Pencil className="size-4" /> {t("nickname.change")}
+            </Dropdown.Item>
+          )}
           {canManage && (
             <Dropdown.Item className={menuItem} onSelect={() => openDialog({ kind: "serverSettings" })}>
               <Settings2 className="size-4" /> {t("server.settings")}

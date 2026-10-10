@@ -256,8 +256,8 @@ describe("members", () => {
         channels: [ch(1)],
         clients: [cl(1), cl(2)],
         members: [
-          { uid: "u1", nickname: "n1", groups: [2], last_seen: 5 },
-          { uid: "u9", nickname: "old", groups: [2], last_seen: 777 },
+          { uid: "u1", nickname: "n1", tag: "abcdefghij", groups: [2], last_seen: 5 },
+          { uid: "u9", nickname: "old", tag: "abcdefghij", groups: [2], last_seen: 777 },
         ],
       }),
     });
@@ -287,7 +287,7 @@ describe("members", () => {
         uid: "u1",
         channels: [ch(1)],
         clients: [cl(1)],
-        members: [{ uid: "u9", nickname: "old", groups: [2], last_seen: 777 }],
+        members: [{ uid: "u9", nickname: "old", tag: "abcdefghij", groups: [2], last_seen: 777 }],
       }),
     });
     const before = s;
@@ -307,9 +307,21 @@ describe("members", () => {
     expect(s.members["u1"]).toBeDefined();
   });
 
+  it("preserves verified member metadata on session updates and renames all sessions", () => {
+    let s = online();
+    s = ev(s, { ev: "member.updated", d: { uid: "u2", nickname: "Current", tag: "abcdefghij", connect: "alice", groups: [2], last_seen: 3 } });
+    s = ev(s, { ev: "client.updated", d: cl(2, 1, { nickname: "Old session name", muted: true }) });
+    expect(s.members["u2"]).toMatchObject({ nickname: "Current", tag: "abcdefghij", connect: "alice" });
+    s = ev(s, { ev: "client.joined", d: cl(3, null, { uid: "u2", nickname: "Old session name" }) });
+    s = ev(s, { ev: "member.updated", d: { ...s.members["u2"]!, nickname: "Renamed" } });
+    expect(s.clients[2]?.nickname).toBe("Renamed");
+    expect(s.clients[3]?.nickname).toBe("Renamed");
+    expect(s.members["u2"]?.connect).toBe("alice");
+  });
+
   it("follows nickname changes", () => {
     let s = online();
-    s = ev(s, { ev: "client.updated", d: cl(2, 1, { nickname: "renamed" }) });
+    s = ev(s, { ev: "member.updated", d: { uid: "u2", nickname: "renamed", tag: "abcdefghij", groups: [2], last_seen: 3 } });
     expect(s.members["u2"]?.nickname).toBe("renamed");
   });
 });
@@ -537,7 +549,7 @@ describe("roles", () => {
 
   it("member.updated changes the roles of a member and of their online sessions", () => {
     let s = online();
-    s = ev(s, { ev: "member.updated", d: { uid: "u2", nickname: "n2", groups: [2, 7], last_seen: 3 } });
+    s = ev(s, { ev: "member.updated", d: { uid: "u2", nickname: "n2", tag: "abcdefghij", groups: [2, 7], last_seen: 3 } });
     expect(s.members["u2"]?.groups).toEqual([2, 7]);
     expect(s.clients[2]?.groups).toEqual([2, 7]);
   });
@@ -546,7 +558,7 @@ describe("roles", () => {
     let s = online();
     s = ev(s, { ev: "group.created", d: { id: 6, name: "Inviters", permissions: ["invite_create"] } });
     expect(s.permissions).toEqual([]);
-    s = ev(s, { ev: "member.updated", d: { uid: "u1", nickname: "n1", groups: [2, 6], last_seen: 3 } });
+    s = ev(s, { ev: "member.updated", d: { uid: "u1", nickname: "n1", tag: "abcdefghij", groups: [2, 6], last_seen: 3 } });
     expect(s.permissions).toEqual(["invite_create"]);
   });
 });

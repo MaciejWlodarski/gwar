@@ -36,7 +36,6 @@ export function ConnectScreen() {
   const t = useT();
   const isMobile = useIsMobile();
   const lastAddress = useSettings((s) => s.lastAddress);
-  const lastNickname = useSettings((s) => s.lastNickname);
   const lastKind = useSettings((s) => s.lastKind);
   const desktop = isDesktop();
   const bookmarks = useSettings((s) => s.bookmarks);
@@ -47,7 +46,6 @@ export function ConnectScreen() {
   const account = useAccount((s) => s.account);
   const [kind, setKind] = useState<ServerKind>(desktop && !invite?.server ? lastKind : "vc");
   const [address, setAddress] = useState(invite?.server ?? lastAddress);
-  const [nickname, setNickname] = useState(lastNickname);
   const [password, setPassword] = useState("");
   const [remember, setRemember] = useState(true);
   // TeamSpeak: with more than one identity the person chooses; null means the default one.
@@ -96,7 +94,6 @@ export function ConnectScreen() {
       {
         kind,
         address,
-        nickname,
         password,
         invite: kind === "vc" ? invite?.code : undefined,
         identity: pickIdentity ? (resolveIdentity(tsList, identity) ?? undefined) : undefined,
@@ -180,20 +177,7 @@ export function ConnectScreen() {
               />
             )}
           </Field>
-          <Field label={t("connect.nickname")}>
-            {(id) => (
-              <Input
-                id={id}
-                value={nickname}
-                onChange={(e) => setNickname(e.target.value)}
-                placeholder={t("connect.nicknamePlaceholder")}
-                maxLength={32}
-                required
-                autoComplete="nickname"
-                autoFocus={!!address && !nickname}
-              />
-            )}
-          </Field>
+
           {(needPassword || kind === "teamspeak") && (
             <Field
               label={kind === "teamspeak" ? t("connect.tsPassword") : t("connect.password")}
@@ -252,7 +236,7 @@ export function ConnectScreen() {
                   <button
                     onClick={() =>
                       void controller.connectInteractive(
-                        { kind: b.kind, address: b.address, nickname: b.nickname, password: b.password, identity: b.identity },
+                        { kind: b.kind, address: b.address, password: b.password, identity: b.identity },
                         { remember: false },
                       )
                     }
@@ -266,7 +250,7 @@ export function ConnectScreen() {
                         {b.kind === "teamspeak" && <TeamSpeakBadge />}
                       </span>
                       <span className="block truncate text-xs text-muted">
-                        {b.nickname} · {b.address}
+                        {b.address}
                       </span>
                     </span>
                   </button>

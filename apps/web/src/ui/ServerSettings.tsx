@@ -4,6 +4,7 @@ import { Ban, Check, Copy, Link2, Lock, Plus, Search, ShieldCheck, Trash2, UserM
 import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { countKey, useLanguage, useT, type Key } from "../i18n";
 import { INVITE_EXPIRY, INVITE_USES } from "../lib/ban";
+import { memberName } from "../lib/member-name";
 import { cn } from "../lib/cn";
 import {
   ADMIN_GROUP,
@@ -586,6 +587,7 @@ function MembersTab() {
 
 /** Removes people who have not been here for a while: preview first, then the real thing. */
 function CleanupTab() {
+  const members = useSession((s) => s.members);
   const t = useT();
   const lang = useLanguage();
   const [form, setForm] = useState<PruneForm>({ days: PRUNE_DAYS_DEFAULT, keepRoles: true, deleteMessages: false });
@@ -683,10 +685,10 @@ function CleanupTab() {
           {shown.length > 0 && (
             <ul className="flex max-h-72 flex-col divide-y divide-line overflow-y-auto rounded-lg border border-line">
               {shown.map((m) => (
-                <li key={m.uid} data-prune={m.nickname} className="flex items-center gap-3 px-3 py-1.5">
-                  <Avatar name={m.nickname} seed={m.uid} size={24} />
+                <li key={m.uid} data-prune={memberName(members, m.uid, m.nickname)} className="flex items-center gap-3 px-3 py-1.5">
+                  <Avatar name={memberName(members, m.uid, m.nickname)} seed={m.uid} size={24} />
                   <div className="min-w-0 flex-1">
-                    <div className="truncate text-sm">{m.nickname}</div>
+                    <div className="truncate text-sm">{memberName(members, m.uid, m.nickname)}</div>
                     <div className="truncate font-mono text-[11px] text-subtle" title={m.uid}>
                       {m.uid}
                     </div>
@@ -763,6 +765,7 @@ function RoleMenu({
 // --------------------------------------------------------------------- bans
 
 function BansTab() {
+  const members = useSession((s) => s.members);
   const t = useT();
   const lang = useLanguage();
   const [bans, setBans] = useState<BanEntry[] | null>(null);
@@ -798,10 +801,10 @@ function BansTab() {
   return (
     <ul className="flex flex-col divide-y divide-line rounded-lg border border-line" aria-label={t("ss.bans")}>
       {bans.map((b) => (
-        <li key={b.id} data-ban={b.nickname} className="flex flex-wrap items-center gap-3 px-3 py-2">
+        <li key={b.id} data-ban={memberName(members, b.uid ?? "", b.nickname)} className="flex flex-wrap items-center gap-3 px-3 py-2">
           <div className="min-w-0 flex-1 basis-48">
             <div className="flex items-center gap-2 text-sm font-medium">
-              <span className="truncate">{b.nickname}</span>
+              <span className="truncate">{memberName(members, b.uid ?? "", b.nickname)}</span>
               {b.ip && <span className="shrink-0 rounded bg-hover px-1 text-[10px] leading-4 font-medium text-subtle">{t("ss.ipBan")}</span>}
             </div>
             <div className="truncate text-xs text-muted">{b.reason ? b.reason : t("ss.noReason")}</div>

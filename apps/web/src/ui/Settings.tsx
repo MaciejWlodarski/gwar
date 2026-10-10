@@ -4,7 +4,11 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { tNow, useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { accountKeyOf, uidForPublicKey } from "../net/identity";
-import { useAccount } from "../state/account";
+import { describeAccountError } from "../connect/errors";
+import { VaultLockedError } from "../connect/vault";
+import { validNickname } from "../net/nickname";
+import { useAccountIdentity } from "../state/identity";
+import { accountActions, useAccount } from "../state/account";
 import { AccountTab } from "./AccountSettings";
 import { isDesktop } from "../platform";
 import { notificationsPermission, requestNotifications, type NotificationsPermission } from "../platform/notify";
@@ -429,7 +433,11 @@ function IdentityTab() {
   const [uid, setUid] = useState<string>("");
   const [publicKey, setPublicKey] = useState<string>("");
   const [copied, setCopied] = useState(false);
-  const [nickname, setNickname] = useState(me?.nickname ?? "");
+  const globalNickname = useAccountIdentity((s) => s.nickname);
+  const [nicknameDraft, setNicknameDraft] = useState({ source: globalNickname, value: globalNickname });
+  const nickname = nicknameDraft.source === globalNickname ? nicknameDraft.value : globalNickname;
+  const setNickname = (value: string) => setNicknameDraft({ source: globalNickname, value });
+  const [nicknameError, setNicknameError] = useState<string | null>(null);
   const [away, setAway] = useState(me?.away ?? "");
   const [busy, setBusy] = useState(false);
   const file = useRef<HTMLInputElement>(null);
@@ -488,7 +496,7 @@ function IdentityTab() {
   const saveProfile = async () => {
     setBusy(true);
     try {
-      await controller.updateProfile({ nickname: nickname.trim(), away: away.trim() });
+      await controller.updateProfile({ away: away.trim() });
       toast("success", t("common.saved"));
     } catch {
       toast("error", t("err.req.internal"));
@@ -496,18 +504,39 @@ function IdentityTab() {
     setBusy(false);
   };
 
+  const saveNickname = async () => {
+    setBusy(true);
+    setNicknameError(null);
+    try {
+      await accountActions.changeNickname(nickname);
+      toast("success", t("common.saved"));
+    } catch (e) {
+      setNicknameError(e instanceof VaultLockedError ? t("nickname.vaultLocked") : describeAccountError(e, "session"));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div>
+      <Section title={t("nickname.identityTitle")}>
+        <Field label={t("connect.nickname")} hint={t("nickname.globalHint")}>
+          {(id) => <Input id={id} value={nickname} onChange={(e) => setNickname(e.target.value)} autoComplete="nickname" />}
+        </Field>
+        {nicknameError && <p role="alert" className="text-sm text-danger">{nicknameError}</p>}
+        <div>
+          <Button variant="primary" size="sm" busy={busy} onClick={() => void saveNickname()} disabled={!validNickname(nickname) || !globalNickname}>
+            {t("common.save")}
+          </Button>
+        </div>
+      </Section>
       {online && (
         <Section title={t("identity.profile")}>
-          <Field label={t("connect.nickname")}>
-            {(id) => <Input id={id} value={nickname} onChange={(e) => setNickname(e.target.value)} maxLength={32} />}
-          </Field>
           <Field label={t("identity.away")} hint={t("identity.awayHint")}>
             {(id) => <Input id={id} value={away} onChange={(e) => setAway(e.target.value)} maxLength={80} />}
           </Field>
           <div>
-            <Button variant="primary" size="sm" busy={busy} onClick={() => void saveProfile()} disabled={!nickname.trim()}>
+            <Button variant="primary" size="sm" busy={busy} onClick={() => void saveProfile()}>
               {t("common.save")}
             </Button>
           </div>

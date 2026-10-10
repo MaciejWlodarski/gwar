@@ -87,7 +87,7 @@ describe("handshake", () => {
     expect(hello.id).toBe(1);
     expect(hello.op).toBe("hello");
     expect(hello.d).toMatchObject({
-      protocol: 1,
+      protocol: 2,
       nickname: "Ann",
       public_key: "PUBKEY",
       signature: "sig(vc/1 hello|abc|PUBKEY)",
@@ -205,7 +205,7 @@ describe("handshake", () => {
     const s = FakeSocket.last();
     s.open();
     const c = challenge();
-    c.d.protocol = 2;
+    c.d.protocol = 3;
     s.push(c);
     await expect(p).rejects.toMatchObject({ kind: "protocol" });
   });

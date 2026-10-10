@@ -108,18 +108,18 @@ export function initDesktop(): (() => void) | undefined {
 }
 
 /**
- * Debug builds only: `VC_AUTOCONNECT="address|nickname"` connects on startup
+ * Debug builds only: `VC_AUTOCONNECT="address|kind"` connects on startup
  * and reports progress to the Rust log, for automated verification.
  */
 async function debugAutoconnect(api: TauriBridge): Promise<void> {
   const spec = await api.invoke<string | null>("debug_autoconnect").catch(() => null);
   if (!spec) return;
-  const [address = "", nickname = "desktop", kindName = "vc"] = spec.split("|");
+  const [address = "", kindName = "vc"] = spec.split("|");
   const kind = kindName === "teamspeak" ? "teamspeak" : "vc";
   const log = (message: string) => void api.invoke("debug_log", { message }).catch(() => {});
   // Handles for scripted checks (VC_DEBUG_EVAL_FILE); only exist in debug runs with autoconnect.
   Object.assign(window, { __vc: { controller, useSettings, useSession, useVoice, useUi, api, log } });
-  log(`autoconnect ${address} as ${nickname} (${kind})`);
+  log(`autoconnect ${address} as ${(await controller.getIdentity()).nickname} (${kind})`);
   useSession.subscribe((s, prev) => {
     if (s.phase !== prev.phase) log(`session phase: ${s.phase}`);
   });
@@ -127,6 +127,6 @@ async function debugAutoconnect(api: TauriBridge): Promise<void> {
     if (s.state !== prev.state) log(`voice state: ${s.state}`);
     if (s.micError !== prev.micError) log(`mic error: ${s.micError ? `${s.micError.kind} ${s.micError.message}` : "cleared"}`);
   });
-  const ok = await controller.connectInteractive({ kind, address, nickname }, { remember: false });
+  const ok = await controller.connectInteractive({ kind, address }, { remember: false });
   log(`connect ${ok ? "ok" : "failed"}`);
 }

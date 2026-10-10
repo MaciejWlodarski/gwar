@@ -6,10 +6,18 @@ import { controller } from "../state/controller";
 import { hasGlobalShortcut, isGlobalShortcutEvent } from "../platform/desktop";
 import { useSettings } from "../state/settings";
 import { useSession, useVoice } from "../state/stores";
+import { memberName } from "../lib/member-name";
 import { nameColor } from "../lib/permissions";
 
 export function useMe() {
-  return useSession((s) => (s.me ? s.clients[s.me.session] : undefined));
+  const client = useSession((s) => (s.me ? s.clients[s.me.session] : undefined));
+  const nickname = useSession((s) => s.me ? s.members[s.me.uid]?.nickname : undefined);
+  return client && nickname && nickname !== client.nickname ? { ...client, nickname } : client;
+}
+
+/** The current member nickname, with a session/history fallback for unknown identities. */
+export function useMemberName(uid: string, fallback: string): string {
+  return useSession((s) => memberName(s.members, uid, fallback));
 }
 
 export function usePermission(p: Permission): boolean {

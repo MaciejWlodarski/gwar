@@ -153,7 +153,7 @@ export function channelUnread(state: Pick<SessionState, "threads">, channel: num
 function upsertMember(state: SessionState, client: Client, lastSeen: number): SessionState {
   return {
     ...state,
-    members: { ...state.members, [client.uid]: { uid: client.uid, nickname: client.nickname, groups: client.groups, last_seen: lastSeen } },
+    members: { ...state.members, [client.uid]: { uid: client.uid, tag: "", ...state.members[client.uid], nickname: state.members[client.uid]?.tag ? state.members[client.uid]!.nickname : client.nickname, groups: client.groups, last_seen: lastSeen } },
   };
 }
 
@@ -257,9 +257,9 @@ function onMemberUpdated(state: SessionState, member: Member): SessionState {
   let changed = false;
   const clients = Object.fromEntries(
     Object.entries(state.clients).map(([id, c]) => {
-      if (c.uid !== member.uid || sameIds(c.groups, member.groups)) return [id, c];
+      if (c.uid !== member.uid || (sameIds(c.groups, member.groups) && c.nickname === member.nickname)) return [id, c];
       changed = true;
-      return [id, { ...c, groups: member.groups }];
+      return [id, { ...c, nickname: member.nickname, groups: member.groups }];
     }),
   );
   return refreshPermissions({ ...state, members: { ...state.members, [member.uid]: member }, clients: changed ? clients : state.clients });
@@ -287,7 +287,7 @@ function channelNotices(prev: SessionState, next: SessionState, at: number, id: 
   const isHere = after?.channel === myCh;
   if (wasHere === isHere) return next;
   const name = (after ?? before)?.nickname ?? "?";
-  const text: SysText = { key: isHere ? "sys.user_joined_channel" : "sys.user_left_channel", params: { name } };
+  const text: SysText = { key: isHere ? "sys.user_joined_channel" : "sys.user_left_channel", params: { name }, uid: (after ?? before)?.uid };
   return withThread(next, channelThreadKey(myCh), (t) => pushItem(t, sysItem(at, text, `${id}${isHere ? "j" : "l"}`), false));
 }
 
@@ -398,7 +398,7 @@ export function reduce(state: SessionState, action: Action): SessionState {
       const channels = Object.fromEntries(w.channels.map((c) => [c.id, c]));
       const members: SessionState["members"] = Object.fromEntries((w.members ?? []).map((m) => [m.uid, m]));
       // Online users are members too (a server may not list every one of them).
-      for (const c of w.clients) members[c.uid] ??= { uid: c.uid, nickname: c.nickname, groups: c.groups, last_seen: action.now };
+      for (const c of w.clients) members[c.uid] ??= { uid: c.uid, nickname: c.nickname, tag: "", groups: c.groups, last_seen: action.now };
       let next: SessionState = {
         ...state,
         phase: "online",

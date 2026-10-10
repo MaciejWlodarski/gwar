@@ -19,13 +19,14 @@ export const ALL_PERMISSIONS: Permission[] = [
   "message_manage",
   "file_upload",
   "member_remove",
+  "member_nickname",
 ];
 
 /** Permissions as the role editor presents them: thematic sections, each with plain-word labels (see i18n `perm.*`). */
 export const PERMISSION_SECTIONS: Array<{ id: "server" | "channels" | "people" | "chat"; permissions: Permission[] }> = [
   { id: "server", permissions: ["server_manage", "group_manage"] },
   { id: "channels", permissions: ["channel_create", "channel_edit", "channel_delete", "channel_join_locked"] },
-  { id: "people", permissions: ["client_move", "client_kick", "client_ban", "member_remove", "invite_create", "token_create"] },
+  { id: "people", permissions: ["client_move", "client_kick", "client_ban", "member_remove", "member_nickname", "invite_create", "token_create"] },
   { id: "chat", permissions: ["message_manage", "file_upload"] },
 ];
 

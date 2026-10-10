@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { activeMention, completeMention, filterPeople, resolveMentions, splitMentions, type Person } from "./mentions";
+import { activeMention, completeMention, filterPeople, resolveMentions, updatePickedMentions, picksFromMessage, splitMentions, type Person } from "./mentions";
 
 const people: Person[] = [
   { uid: "a", nickname: "Alice", online: true },
@@ -41,24 +41,40 @@ describe("completeMention", () => {
   });
 });
 
-describe("resolveMentions", () => {
-  it("collects whoever is named in full", () => {
-    expect(resolveMentions("hello @Alice and @Bobby!", people).sort()).toEqual(["a", "c"]);
+describe("selected mention uids", () => {
+  it("does not resolve typed nicknames from text", () => {
+    expect(resolveMentions("hello @Alice and @Bobby!", [])).toEqual([]);
   });
-  it("does not take a longer name for a shorter one", () => {
-    expect(resolveMentions("hi @Bobby", people)).toEqual(["c"]);
-    expect(resolveMentions("hi @Bob.", people)).toEqual(["b"]);
+  it("records the selected uid when nicknames are identical", () => {
+    const twins: Person[] = [{ uid: "x", nickname: "Sam", online: true, tag: "aaaaaaaaaa" }, { uid: "y", nickname: "Sam", online: true, tag: "bbbbbbbbbb" }];
+    const matches = filterPeople(twins, "sa", "me");
+    const selected = matches.find((p) => p.uid === "y")!;
+    const next = completeMention("@Sa", activeMention("@Sa", 3)!, 3, selected.nickname);
+    expect(next.text).toBe("@Sam ");
+    expect(resolveMentions(next.text, [{ uid: selected.uid, nickname: selected.nickname, start: 0, end: 4 }])).toEqual(["y"]);
   });
-  it("needs the @ and ignores e-mail addresses", () => {
-    expect(resolveMentions("Alice wrote to bob@Bob.com", people)).toEqual([]);
+  it("keeps both duplicate-name selections and drops only the one deleted", () => {
+    const before = "@Sam @Sam ";
+    const picks = [{ uid: "x", nickname: "Sam", start: 0, end: 4 }, { uid: "y", nickname: "Sam", start: 5, end: 9 }];
+    expect(resolveMentions(before, picks)).toEqual(["x", "y"]);
+    const after = "@Sam ";
+    expect(resolveMentions(after, updatePickedMentions(before, after, picks))).toEqual(["x"]);
   });
-  it("uses the chosen person when two share a nickname", () => {
-    const twins: Person[] = [
-      { uid: "x", nickname: "Sam", online: true },
-      { uid: "y", nickname: "Sam", online: true },
-    ];
-    expect(resolveMentions("@Sam", twins)).toEqual([]);
-    expect(resolveMentions("@Sam", twins, new Map([["y", "Sam"]]))).toEqual(["y"]);
+  it("uses the selection range when the first of two identical mentions is deleted", () => {
+    const picks = [{ uid: "x", nickname: "Sam", start: 0, end: 4 }, { uid: "y", nickname: "Sam", start: 5, end: 9 }];
+    const remaining = updatePickedMentions("@Sam @Sam ", "@Sam ", picks, { start: 0, end: 5 });
+    expect(resolveMentions("@Sam ", remaining)).toEqual(["y"]);
+  });
+  it("shifts untouched selections and forgets edited ones", () => {
+    const picks = [{ uid: "a", nickname: "Alice", start: 0, end: 6 }];
+    const shifted = updatePickedMentions("@Alice", "hello @Alice", picks);
+    expect(resolveMentions("hello @Alice", shifted)).toEqual(["a"]);
+    expect(resolveMentions("@Alicia", updatePickedMentions("@Alice", "@Alicia", picks))).toEqual([]);
+    expect(resolveMentions("@AliceX", picks)).toEqual([]);
+  });
+  it("preserves server-supplied mention uids in the message editor", () => {
+    expect(resolveMentions("hi @Alice", picksFromMessage("hi @Alice", people, ["a"]))).toEqual(["a"]);
+    expect(picksFromMessage("hi @Alice", people, ["b"])).toEqual([]);
   });
 });
 

@@ -1,5 +1,5 @@
 import { useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type RefObject } from "react";
-import { activeMention, completeMention, filterPeople, resolveMentions, type Person } from "../lib/mentions";
+import { activeMention, completeMention, filterPeople, resolveMentions, updatePickedMentions, picksFromMessage, type PickedMention, type Person } from "../lib/mentions";
 import { useSession } from "../state/stores";
 import { MentionMenu } from "./MentionMenu";
 
@@ -9,7 +9,7 @@ function usePeople(): Person[] {
   const clients = useSession((s) => s.clients);
   return useMemo(() => {
     const online = new Set(Object.values(clients).map((c) => c.uid));
-    return Object.values(members).map((m) => ({ uid: m.uid, nickname: m.nickname, online: online.has(m.uid) }));
+    return Object.values(members).map((m) => ({ uid: m.uid, nickname: m.nickname, tag: m.tag, connect: m.connect, online: online.has(m.uid) }));
   }, [members, clients]);
 }
 
@@ -17,13 +17,21 @@ function usePeople(): Person[] {
  * `@` autocomplete for a textarea: tracks the caret, offers matching people
  * (online first), inserts `@Nickname ` and remembers whom to put in `mentions`.
  */
-export function useMentionAutocomplete(value: string, setValue: (v: string) => void, ref: RefObject<HTMLTextAreaElement | null>) {
+export function useMentionAutocomplete(value: string, setValue: (v: string) => void, ref: RefObject<HTMLTextAreaElement | null>, initialMentions: readonly string[] = []) {
   const people = usePeople();
   const selfUid = useSession((s) => s.me?.uid);
   const [caret, setCaret] = useState(0);
   const [selection, setSelection] = useState({ query: "", index: 0 });
   const [dismissed, setDismissed] = useState<number | null>(null);
-  const picked = useRef(new Map<string, string>());
+  const picked = useRef<PickedMention[]>(picksFromMessage(value, people, initialMentions));
+  const previous = useRef(value);
+  const editSelection = useRef<{ start: number; end: number } | undefined>(undefined);
+  const currentPicks = () => updatePickedMentions(previous.current, value, picked.current, editSelection.current);
+  useLayoutEffect(() => {
+    picked.current = updatePickedMentions(previous.current, value, picked.current, editSelection.current);
+    previous.current = value;
+    editSelection.current = undefined;
+  }, [value]);
   // Where the caret goes once the completed text is in the textarea (set before the next paint, so typing is never overtaken).
   const pendingCaret = useRef<number | null>(null);
   useLayoutEffect(() => {
@@ -46,7 +54,12 @@ export function useMentionAutocomplete(value: string, setValue: (v: string) => v
   const choose = (p: Person) => {
     if (!active) return;
     const next = completeMention(value, active, Math.min(caret, value.length), p.nickname);
-    picked.current.set(p.uid, p.nickname);
+    picked.current = [
+      ...updatePickedMentions(value, next.text, currentPicks()),
+      { uid: p.uid, nickname: p.nickname, start: active.start, end: active.start + p.nickname.length + 1 },
+    ];
+    previous.current = next.text;
+    editSelection.current = undefined;
     pendingCaret.current = next.caret;
     setValue(next.text);
     setCaret(next.caret);
@@ -90,9 +103,13 @@ export function useMentionAutocomplete(value: string, setValue: (v: string) => v
     menu,
     open,
     onKeyDown,
+    beforeInput: () => {
+      const el = ref.current;
+      editSelection.current = el ? { start: el.selectionStart, end: el.selectionEnd } : undefined;
+    },
     sync,
     /** Uids to send for this text. */
-    mentionsFor: (text: string) => resolveMentions(text, people, picked.current),
-    reset: () => picked.current.clear(),
+    mentionsFor: (text: string) => resolveMentions(text, updatePickedMentions(value, text, currentPicks())),
+    reset: () => { picked.current = []; },
   };
 }

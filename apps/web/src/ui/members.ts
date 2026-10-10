@@ -29,6 +29,8 @@ export function useMembersPanel() {
 export interface MemberEntry {
   uid: string;
   nickname: string;
+  tag: string;
+  connect?: string | null;
   admin: boolean;
   online: boolean;
   platform: Platform | null;
@@ -60,12 +62,15 @@ export function groupMembers(
     const known = sessions.get(c.uid);
     if (!known || (known.channel === null && c.channel !== null)) sessions.set(c.uid, c);
   }
+  const known = new Map(members.map((m) => [m.uid, m]));
   const voice: MemberEntry[] = [];
   const online: MemberEntry[] = [];
   for (const c of sessions.values()) {
     const entry: MemberEntry = {
       uid: c.uid,
-      nickname: c.nickname,
+      nickname: known.get(c.uid)?.nickname ?? c.nickname,
+      tag: known.get(c.uid)?.tag ?? "",
+      connect: known.get(c.uid)?.connect,
       admin: isAdmin(c.groups, groups),
       online: true,
       platform: c.platform,
@@ -82,6 +87,8 @@ export function groupMembers(
     .map((m) => ({
       uid: m.uid,
       nickname: m.nickname,
+      tag: m.tag,
+      connect: m.connect,
       admin: isAdmin(m.groups, groups),
       online: false,
       platform: null,

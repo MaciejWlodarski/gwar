@@ -88,6 +88,8 @@ export type DialogState =
   | { kind: "channelPassword"; channel: number }
   | { kind: "serverSettings"; tab?: ServerSettingsTab }
   | { kind: "invites" }
+  | { kind: "nickname"; uid: string }
+  | { kind: "memberProfile"; uid: string; fallback: string }
   | { kind: "ban"; person: PersonRef; back?: ServerSettingsTab }
   | { kind: "removeMember"; person: PersonRef; back?: ServerSettingsTab }
   | { kind: "lightbox"; url: string; name: string }

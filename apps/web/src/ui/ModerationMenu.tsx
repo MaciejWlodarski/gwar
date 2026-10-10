@@ -1,5 +1,5 @@
 import * as ContextMenu from "@radix-ui/react-context-menu";
-import { Ban, ChevronRight, ShieldCheck, UserMinus, UserX } from "lucide-react";
+import { Ban, Pencil, ChevronRight, ShieldCheck, UserMinus, UserX } from "lucide-react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { canActOn, canAssignGroup, ADMIN_GROUP, MEMBER_GROUP, orderedGroups, toggleGroup } from "../lib/permissions";
@@ -23,21 +23,27 @@ export function ModerationItems({ person, groups }: { person: PersonRef; groups:
   const canBan = usePermission("client_ban");
   const canGroups = usePermission("group_manage");
   const canRemove = usePermission("member_remove");
-  if (isMe) return null;
+  const canRename = usePermission("member_nickname");
   // TeamSpeak servers keep their own bans and roles: only kicking is offered there, as before.
   const vc = kind === "vc";
   const stronger = vc && !canActOn(permissions, groups, defs);
-  const showKick = canKick && person.session !== undefined;
-  const showBan = vc && canBan;
-  const showRoles = vc && canGroups;
-  const showRemove = vc && canRemove;
-  if (!showKick && !showBan && !showRoles && !showRemove) return null;
+  const showRename = vc && (isMe || canRename);
+  const showKick = !isMe && canKick && person.session !== undefined;
+  const showBan = !isMe && vc && canBan;
+  const showRoles = !isMe && vc && canGroups;
+  const showRemove = !isMe && vc && canRemove;
+  if (!showRename && !showKick && !showBan && !showRoles && !showRemove) return null;
 
   const roles = orderedGroups(defs).filter((g) => g.id !== MEMBER_GROUP);
 
   return (
     <>
       <ContextMenu.Separator className={menuSeparator} />
+      {showRename && (
+        <ContextMenu.Item className={menuItem} onSelect={() => useUi.getState().openDialog({ kind: "nickname", uid: person.uid })}>
+          <Pencil className="size-4" /> {t("nickname.change")}
+        </ContextMenu.Item>
+      )}
       {showRoles && (
         <ContextMenu.Sub>
           <ContextMenu.SubTrigger className={cn(menuItem, "justify-between")}>

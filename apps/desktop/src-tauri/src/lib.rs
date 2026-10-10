@@ -21,7 +21,7 @@ mod debug {
 
     use crate::voice::{Snapshot, Voice};
 
-    /// `VC_AUTOCONNECT="address|nickname"` makes the UI connect on startup.
+    /// `VC_AUTOCONNECT="address|kind"` makes the UI connect on startup.
     #[tauri::command]
     pub fn debug_autoconnect() -> Option<String> {
         if cfg!(debug_assertions) { std::env::var("VC_AUTOCONNECT").ok() } else { None }

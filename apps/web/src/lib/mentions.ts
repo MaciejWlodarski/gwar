@@ -4,6 +4,8 @@ export interface Person {
   uid: string;
   nickname: string;
   online: boolean;
+  tag?: string;
+  connect?: string | null;
 }
 
 export interface ActiveMention {
@@ -56,27 +58,59 @@ function mentionPattern(names: readonly string[]): RegExp | null {
   return new RegExp(`(^|[^\\w@])@(${unique.map(escapeRe).join("|")})(?![\\p{L}\\p{N}_])`, "giu");
 }
 
-/**
- * Uids to send with a message: the people chosen from the menu whose `@Name` is
- * still in the text, plus anyone typed out in full when the name is unambiguous.
- */
-export function resolveMentions(text: string, people: readonly Person[], picked: ReadonlyMap<string, string> = new Map()): string[] {
-  const out = new Set<string>();
-  const pattern = mentionPattern(people.map((p) => p.nickname));
+/** A selected mention, tied to a text range rather than resolved from its nickname. */
+export interface PickedMention {
+  uid: string;
+  nickname: string;
+  start: number;
+  end: number;
+}
+
+/** Keep untouched selections and shift them after an edit; edited/deleted selections are dropped. */
+export function updatePickedMentions(before: string, after: string, picked: readonly PickedMention[], selection?: { start: number; end: number }): PickedMention[] {
+  if (before === after) return [...picked];
+  let start = 0;
+  while (start < before.length && start < after.length && before[start] === after[start]) start++;
+  let oldEnd = before.length;
+  let newEnd = after.length;
+  while (oldEnd > start && newEnd > start && before[oldEnd - 1] === after[newEnd - 1]) { oldEnd--; newEnd--; }
+  const delta = newEnd - oldEnd;
+  if (selection && selection.start < selection.end) {
+    const insertedEnd = selection.end + delta;
+    if (insertedEnd >= selection.start && before.slice(0, selection.start) === after.slice(0, selection.start) && before.slice(selection.end) === after.slice(insertedEnd)) {
+      start = selection.start;
+      oldEnd = selection.end;
+    }
+  }
+  return picked.flatMap((p) => {
+    if (p.end <= start) return [p];
+    if (p.start >= oldEnd) return [{ ...p, start: p.start + delta, end: p.end + delta }];
+    return [];
+  });
+}
+
+/** Only explicit picker selections are sent, even when names are unique or duplicated. */
+export function resolveMentions(text: string, picked: readonly PickedMention[]): string[] {
+  return [...new Set(picked.filter((p) => {
+    if (text.slice(p.start, p.end) !== `@${p.nickname}`) return false;
+    return !/[\p{L}\p{N}_]/u.test(text[p.end] ?? "") && (p.start === 0 || !/[\w@]/u.test(text[p.start - 1] ?? ""));
+  }).map((p) => p.uid))];
+}
+
+/** Existing server-supplied mention uids can be retained while editing a message. */
+export function picksFromMessage(text: string, people: readonly Person[], uids: readonly string[]): PickedMention[] {
+  const known = people.filter((p) => uids.includes(p.uid));
+  const pattern = mentionPattern(known.map((p) => p.nickname));
   if (!pattern) return [];
-  const byName = new Map<string, string[]>();
-  for (const p of people) {
-    const key = p.nickname.toLowerCase();
-    byName.set(key, [...(byName.get(key) ?? []), p.uid]);
-  }
-  for (const m of text.matchAll(pattern)) {
-    const name = (m[2] ?? "").toLowerCase();
-    const uids = byName.get(name) ?? [];
-    const chosen = uids.find((u) => picked.has(u));
-    if (chosen) out.add(chosen);
-    else if (uids.length === 1 && uids[0]) out.add(uids[0]);
-  }
-  return [...out];
+  const used = new Set<string>();
+  return [...text.matchAll(pattern)].flatMap((m) => {
+    const nickname = m[2] ?? "";
+    const person = known.find((p) => !used.has(p.uid) && p.nickname.toLowerCase() === nickname.toLowerCase());
+    if (!person) return [];
+    used.add(person.uid);
+    const start = (m.index ?? 0) + (m[1]?.length ?? 0);
+    return [{ uid: person.uid, nickname, start, end: start + nickname.length + 1 }];
+  });
 }
 
 export type MentionToken = { kind: "text"; value: string } | { kind: "mention"; value: string; uid: string };

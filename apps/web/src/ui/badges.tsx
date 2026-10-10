@@ -1,3 +1,4 @@
+import { ShieldCheck } from "lucide-react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { unreadLabel } from "../lib/chat";
@@ -41,4 +42,12 @@ export function TeamSpeakBadge({ className, short }: { className?: string; short
       {short ? t("badge.teamspeakShort") : t("badge.teamspeak")}
     </span>
   );
+}
+
+/** Only the server's verified account handle enables this badge. */
+export function ConnectBadge({ handle }: { handle?: string | null }) {
+  const t = useT();
+  if (!handle) return null;
+  const label = t("badge.connectAccount", { handle });
+  return <span title={label} aria-label={label} className="inline-flex shrink-0 align-middle text-accent"><ShieldCheck className="size-3.5" /></span>;
 }

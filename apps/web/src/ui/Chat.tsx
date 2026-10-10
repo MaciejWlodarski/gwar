@@ -2,6 +2,7 @@ import { AlertCircle, ArrowDown, Check, Hash, Loader2, Lock, Menu, Megaphone, Me
 import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type KeyboardEvent, type MouseEvent } from "react";
 import { countKey, useLanguage, useT, type TFn } from "../i18n";
 import { cn } from "../lib/cn";
+import { memberName } from "../lib/member-name";
 import { buildRows, type Row } from "../lib/chat";
 import { useIsMobile } from "../lib/media";
 import { checkUpload, formatBytes } from "../lib/files";
@@ -14,7 +15,7 @@ import { myChannelId, storedKey } from "../state/reducer";
 import { useOutbox, useSession, useUi } from "../state/stores";
 import type { ThreadKey } from "../state/types";
 import { AttachmentList } from "./Attachments";
-import { MentionBadge, UnreadBadge } from "./badges";
+import { ConnectBadge, MentionBadge, UnreadBadge } from "./badges";
 import { usePermission, useUidColor } from "./hooks";
 import { useMembersPanel } from "./members";
 import { useMentionAutocomplete } from "./MentionInput";
@@ -118,6 +119,8 @@ const MessageRow = memo(function MessageRow({
   const time = formatTime(at, lang);
   const full = new Date(at).toLocaleString(lang);
   const color = useUidColor(msg.author_uid);
+  const member = useSession((s) => s.members[msg.author_uid]);
+  const authorName = member?.nickname ?? msg.author_name;
   const mentionsMe = !!meUid && (msg.mentions ?? []).includes(meUid);
   const attachments = msg.attachments ?? [];
   const showActions = (canEdit || canDelete) && !editing;
@@ -151,7 +154,7 @@ const MessageRow = memo(function MessageRow({
     >
       <div className="w-9 shrink-0 pt-0.5">
         {row.first ? (
-          <Avatar name={msg.author_name} seed={msg.author_uid} size={36} />
+          <Avatar name={authorName} seed={msg.author_uid} size={36} />
         ) : (
           <time
             dateTime={new Date(at).toISOString()}
@@ -165,9 +168,11 @@ const MessageRow = memo(function MessageRow({
       <div className="min-w-0 flex-1 pb-px">
         {row.first && (
           <div className="flex items-baseline gap-2">
-            <span className={cn("text-sm font-semibold", mine && !color && "text-accent")} style={color ? { color } : undefined}>
-              {msg.author_name}
-            </span>
+            <button className={cn("cursor-pointer text-sm font-semibold hover:underline", mine && !color && "text-accent")} style={color ? { color } : undefined}
+              onClick={() => useUi.getState().openDialog({ kind: "memberProfile", uid: msg.author_uid, fallback: msg.author_name })}>
+              {authorName}
+            </button>
+            <ConnectBadge handle={member?.connect} />
             <time dateTime={new Date(at).toISOString()} title={full} className="text-xs text-subtle">
               {time}
             </time>
@@ -217,7 +222,7 @@ function MessageEditor({ msg }: { msg: ChatMessage }) {
   const [text, setText] = useState(msg.text);
   const [busy, setBusy] = useState(false);
   const ref = useRef<HTMLTextAreaElement>(null);
-  const mention = useMentionAutocomplete(text, setText, ref);
+  const mention = useMentionAutocomplete(text, setText, ref, msg.mentions ?? []);
   const hasFiles = (msg.attachments ?? []).length > 0;
   const over = text.length > MAX_MESSAGE_LENGTH;
   const stop = () => useUi.getState().setEditing(null);
@@ -269,6 +274,7 @@ function MessageEditor({ msg }: { msg: ChatMessage }) {
           setText(e.target.value);
           mention.sync(e.target);
         }}
+        onBeforeInput={mention.beforeInput}
         onSelect={(e) => mention.sync(e.currentTarget)}
         onKeyDown={onKeyDown}
         className={cn(
@@ -292,6 +298,7 @@ function MessageEditor({ msg }: { msg: ChatMessage }) {
 
 function SysRow({ row, t }: { row: Extract<Row, { type: "sys" }>; t: TFn }) {
   const { text } = row.item;
+  const name = useSession((s) => text.uid ? memberName(s.members, text.uid, text.params?.name ?? "?") : undefined);
   if (text.key === "sys.welcome") {
     return (
       <div className="mx-4 my-3 rounded-lg border border-line bg-side px-4 py-3 text-sm">
@@ -306,7 +313,7 @@ function SysRow({ row, t }: { row: Extract<Row, { type: "sys" }>; t: TFn }) {
   }
   return (
     <div className="px-4 py-1 text-center text-xs text-subtle">
-      {t(text.key, text.params)}
+      {t(text.key, name === undefined ? text.params : { ...text.params, name })}
     </div>
   );
 }
@@ -781,6 +788,7 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
                 setText(e.target.value);
                 mention.sync(e.target);
               }}
+              onBeforeInput={mention.beforeInput}
               onSelect={(e) => mention.sync(e.currentTarget)}
               onKeyDown={onKeyDown}
               onPaste={onPaste}
@@ -828,6 +836,7 @@ function ThreadTabs() {
   });
   const serverUnread = useSession((s) => s.threads["server"]?.unread ?? 0);
   const threads = useSession((s) => s.threads);
+  const knownMembers = useSession((s) => s.members);
   const dispatch = useSession((s) => s.dispatch);
   const dms = useMemo(() => Object.entries(threads).filter(([k]) => k.startsWith("dm:")), [threads]);
 
@@ -870,7 +879,7 @@ function ThreadTabs() {
     <div role="tablist" aria-label={t("chat.conversations")} className="flex shrink-0 items-center gap-1 overflow-x-auto border-b border-line px-3 py-1.5">
       {tab("channel", channelName || t("chat.channel"), <Hash className="size-3.5 shrink-0" />, channelUnread, undefined, channelMentionCount)}
       {tab("server", t("chat.server"), <Megaphone className="size-3.5 shrink-0" />, serverUnread)}
-      {dms.map(([k, th]) => tab(k as ThreadKey, th.peer?.name ?? "?", <MessageSquare className="size-3.5 shrink-0" />, th.unread, k.slice(3)))}
+      {dms.map(([k, th]) => tab(k as ThreadKey, memberName(knownMembers, k.slice(3), th.peer?.name ?? "?"), <MessageSquare className="size-3.5 shrink-0" />, th.unread, k.slice(3)))}
     </div>
   );
 }
@@ -890,7 +899,7 @@ function ChatHeader() {
   const userCount = useSession((s) => Object.values(s.clients).filter((c) => c.channel !== null && c.channel === s.viewChannel).length);
   const inVoice = useSession((s) => myChannelId(s) !== null);
   const members = useMembersPanel();
-  const dmName = useSession((s) => (active.startsWith("dm:") ? s.threads[active]?.peer?.name : undefined));
+  const dmName = useSession((s) => (active.startsWith("dm:") ? memberName(s.members, active.slice(3), s.threads[active]?.peer?.name ?? "") : undefined));
 
   let title: string;
   let sub: string;
