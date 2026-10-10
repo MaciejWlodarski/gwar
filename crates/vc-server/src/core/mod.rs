@@ -677,20 +677,24 @@ impl Core {
     }
 
     fn refresh_connect(&mut self, uid: &str, user_id: i64, account_key: &str) {
+        const RETRY_MS: i64 = 5 * 60 * 1000;
+        const NOT_FOUND_MS: i64 = 60 * 60 * 1000;
+        const SUCCESS_MS: i64 = 24 * 60 * 60 * 1000;
+
         let Some(lookup) = self.connect.clone() else { return };
         let now = now_ms();
-        let checked = match self.store.connect_checked_at(user_id) {
-            Ok(checked) => checked,
+        let next_check = match self.store.connect_next_check(user_id) {
+            Ok(next_check) => next_check,
             Err(e) => {
                 warn!("store: {e:#}");
                 return;
             }
         };
-        if self.connect_pending.contains_key(uid) || checked.is_some_and(|t| now - t < 24 * 3600 * 1000) {
+        if self.connect_pending.contains_key(uid) || next_check.is_some_and(|t| t > now) {
             return;
         }
         let Some(tx) = self.me.upgrade() else { return };
-        if let Err(e) = self.store.check_connect(user_id, now) {
+        if let Err(e) = self.store.schedule_connect(user_id, now + RETRY_MS) {
             warn!("store: {e:#}");
             return;
         }
@@ -708,11 +712,17 @@ impl Core {
                 core.connect_pending.remove(&uid);
                 match result {
                     Ok(handle) => match core.store.user_by_uid(&uid) {
-                        Ok(Some((id, member))) if id == user_id && member.connect != handle => {
-                            if let Err(e) = core.store.set_connect_handle(id, handle.as_deref()) {
+                        Ok(Some((id, member))) if id == user_id => {
+                            let delay = if handle.is_some() { SUCCESS_MS } else { NOT_FOUND_MS };
+                            if let Err(e) = core.store.schedule_connect(id, now_ms() + delay) {
                                 warn!("store: {e:#}");
-                            } else {
-                                core.announce_member(&uid);
+                            }
+                            if member.connect != handle {
+                                if let Err(e) = core.store.set_connect_handle(id, handle.as_deref()) {
+                                    warn!("store: {e:#}");
+                                } else {
+                                    core.announce_member(&uid);
+                                }
                             }
                         }
                         Ok(_) => {}

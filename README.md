@@ -77,8 +77,10 @@ A member is shown as **nickname** `@handle #tag`, for example
   people with the same nickname. The mention picker shows it too.
 - **@handle**: your [Gwar Connect](docs/connect.md) account name, shown next to
   a shield. Only Connect accounts have one. The server shows it after Connect
-  confirms that the identity belongs to that account. The server checks this
-  again at most once a day and keeps the last answer while Connect is down.
+  confirms that the identity belongs to that account. The next lookup is allowed
+  after 24 hours on success, one hour on 404 (which clears the handle), or five
+  minutes on error; the five-minute guard is saved before HTTP, across devices
+  and restarts. Errors keep the cached handle while Connect is down.
   It is only as trustworthy as Connect, while the #tag needs no one.
 
 ## Download

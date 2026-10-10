@@ -106,7 +106,9 @@ impl Lookup {
         if reply.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
-        let account: Account = reply.error_for_status()?.json().await?;
+        let reply = reply.error_for_status()?;
+        ensure!(reply.status() == reqwest::StatusCode::OK, "Connect returned status {}", reply.status());
+        let account: Account = reply.json().await?;
         ensure!(account.account_key == key, "Connect returned a different account key");
         ensure!(
             (3..=32).contains(&account.handle.len())

@@ -183,6 +183,10 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE users ADD COLUMN connect_handle TEXT;
     ALTER TABLE users ADD COLUMN connect_checked_at INTEGER;
 "#,
+    r#"
+    ALTER TABLE users RENAME COLUMN connect_checked_at TO connect_next_check;
+    UPDATE users SET connect_next_check=NULL;
+"#,
 ];
 
 /// References reassigned by a member merge (including ones already held by the target).
@@ -457,13 +461,13 @@ impl Store {
         Ok(())
     }
 
-    pub fn connect_checked_at(&self, user_id: i64) -> Result<Option<i64>> {
-        Ok(self.db.query_row("SELECT connect_checked_at FROM users WHERE id=?1", [user_id], |r| r.get(0))?)
+    pub fn connect_next_check(&self, user_id: i64) -> Result<Option<i64>> {
+        Ok(self.db.query_row("SELECT connect_next_check FROM users WHERE id=?1", [user_id], |r| r.get(0))?)
     }
 
-    /// Records an attempt before starting HTTP, including failed lookups in the daily limit.
-    pub fn check_connect(&self, user_id: i64, now: i64) -> Result<()> {
-        self.db.execute("UPDATE users SET connect_checked_at=?2 WHERE id=?1", params![user_id, now])?;
+    /// Persists the next eligible lookup time, including the guard before starting HTTP.
+    pub fn schedule_connect(&self, user_id: i64, at: i64) -> Result<()> {
+        self.db.execute("UPDATE users SET connect_next_check=?2 WHERE id=?1", params![user_id, at])?;
         Ok(())
     }
 
@@ -474,7 +478,7 @@ impl Store {
 
     /// Disabling Connect forgets cached handles, so enabling it starts with fresh checks.
     pub fn clear_connect_cache(&self) -> Result<()> {
-        self.db.execute("UPDATE users SET connect_handle=NULL,connect_checked_at=NULL", [])?;
+        self.db.execute("UPDATE users SET connect_handle=NULL,connect_next_check=NULL", [])?;
         Ok(())
     }
 
@@ -1106,12 +1110,37 @@ mod tests {
         let (id, member) = store.user_by_uid("old").unwrap().unwrap();
         assert_eq!(member.nickname, "Kept");
         assert!(member.connect.is_none());
-        assert_eq!(store.connect_checked_at(id).unwrap(), None);
-        store.check_connect(id, 30).unwrap();
+        assert_eq!(store.connect_next_check(id).unwrap(), None);
+        store.schedule_connect(id, 30).unwrap();
         store.set_connect_handle(id, Some("account")).unwrap();
         let reopened = Store::init(store.db).unwrap();
-        assert_eq!(reopened.connect_checked_at(id).unwrap(), Some(30));
+        assert_eq!(reopened.connect_next_check(id).unwrap(), Some(30));
         assert_eq!(reopened.user_by_uid("old").unwrap().unwrap().1.connect.as_deref(), Some("account"));
+    }
+
+    #[test]
+    fn migration_resets_connect_check_times_and_preserves_handles() {
+        let db = Connection::open_in_memory().unwrap();
+        for migration in &MIGRATIONS[..6] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.pragma_update(None, "user_version", 6).unwrap();
+        db.execute_batch(
+            "INSERT INTO users(uid,public_key,nickname,created_at,last_seen,connect_handle,connect_checked_at) VALUES
+               ('known','k','Kept',10,20,'account',30), ('unknown','k','Local',10,20,NULL,40);",
+        )
+        .unwrap();
+        let store = Store::init(db).unwrap();
+        let (id, member) = store.user_by_uid("known").unwrap().unwrap();
+        assert_eq!(member.nickname, "Kept");
+        assert_eq!(member.connect.as_deref(), Some("account"));
+        assert_eq!(store.connect_next_check(id).unwrap(), None);
+        let (id, member) = store.user_by_uid("unknown").unwrap().unwrap();
+        assert!(member.connect.is_none());
+        assert_eq!(store.connect_next_check(id).unwrap(), None);
+        assert!(store.db.prepare("SELECT connect_checked_at FROM users").is_err());
+        let version: usize = store.db.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, MIGRATIONS.len());
     }
 
     #[test]

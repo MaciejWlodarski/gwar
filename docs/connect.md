@@ -154,15 +154,16 @@ verify each entry with its account key and refuse revoked devices.
 
 A certificate proves key possession, not registration with Connect. After a
 device-authenticated hello, servers asynchronously look up the account key via
-`/v1/accounts/by-key/{account_key}` and cache the confirmed handle and the attempt
-time in `users`. At most one lookup runs per member per 24 hours, across devices
-and restarts, including failed attempts. A changed handle emits `member.updated`;
+`/v1/accounts/by-key/{account_key}` and cache the confirmed handle and next-check
+time in `users`. Before HTTP, a five-minute retry guard is persisted across devices
+and restarts; a valid 200 extends it to 24 hours, a 404 to one hour, and errors keep
+the five-minute guard. A changed handle emits `member.updated`;
 404 clears it, while an outage keeps the cached value. A hello signed directly
 with the key (no device certificate, e.g. a browser that signed out but kept the
 account's key) keeps a confirmed handle and refreshes it the same way, since the
 handle belongs to the key. Keys never confirmed are not looked up then, so people
 who don't use Connect are never reported to it. `--no-connect` clears all stored handles
-and check times on startup; certificates still authenticate locally. Both public
+and next-check times on startup; certificates still authenticate locally. Both public
 account lookups have the same policy (no login rate limit). The literal `by-key`
 cannot be a handle because hyphens are not allowed.
 
