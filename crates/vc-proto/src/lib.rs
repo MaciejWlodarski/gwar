@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "ts")]
 use ts_rs::TS;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Number of server→client audio slots a WebRTC client must offer as `recvonly`.
 pub const AUDIO_SLOTS: usize = 8;
@@ -29,6 +29,12 @@ pub const PRUNE_BATCH: usize = 50;
 
 /// Most members a `member.prune` dry run lists (the count covers all of them).
 pub const PRUNE_PREVIEW: usize = 500;
+
+/// Shortest member tag (see [`Member::tag`]): 10 base32 characters, 50 bits.
+pub const TAG_MIN_LEN: usize = 10;
+
+/// Longest nickname, in characters.
+pub const NICKNAME_MAX_LEN: usize = 32;
 
 pub type ChannelId = u32;
 pub type SessionId = u32;
@@ -127,6 +133,10 @@ wire! {
         GroupUpdate(GroupUpdate),
         #[serde(rename = "group.delete")]
         GroupDelete { group: GroupId },
+        /// Sets a member's nickname on this server (online or not): your own, or
+        /// anyone's with `member_nickname`. Every session of that member follows.
+        #[serde(rename = "member.nickname")]
+        MemberNickname { uid: Uid, nickname: String },
         /// Sets a member's groups (online or not).
         #[serde(rename = "member.groups")]
         MemberGroups { uid: Uid, groups: Vec<GroupId> },
@@ -157,6 +167,8 @@ wire! {
 
     pub struct Hello {
         pub protocol: u32,
+        /// The identity's own nickname. Used only when this identity joins the
+        /// server for the first time; afterwards the member's stored nickname wins.
         pub nickname: String,
         /// Base64url (no padding) Ed25519 public key.
         pub public_key: String,
@@ -198,8 +210,6 @@ wire! {
 
     #[derive(Default)]
     pub struct ClientUpdate {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub nickname: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub muted: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -432,7 +442,7 @@ wire! {
         GroupUpdated(Group),
         #[serde(rename = "group.deleted")]
         GroupDeleted { group: GroupId },
-        /// A member's groups or nickname changed (online or not).
+        /// A member's groups, nickname, tag or Connect handle changed (online or not).
         #[serde(rename = "member.updated")]
         MemberUpdated(Member),
         /// A member was removed from the server (their record, not a ban).
@@ -480,7 +490,16 @@ wire! {
 
     pub struct Member {
         pub uid: Uid,
+        /// The nickname on this server (the same on every device of this member).
         pub nickname: String,
+        /// Shortest prefix, at least [`TAG_MIN_LEN`] characters, of the uid's bytes in
+        /// lowercase base32 that no other member of this server shares. Tells apart
+        /// members with the same nickname; it may grow when a new member collides.
+        pub tag: String,
+        /// Handle of the Gwar Connect account this identity belongs to, as confirmed
+        /// by the Connect service. `None` for local identities.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub connect: Option<String>,
         pub groups: Vec<GroupId>,
         /// Unix time in milliseconds.
         #[cfg_attr(feature = "ts", ts(type = "number"))]
@@ -610,6 +629,7 @@ wire! {
         InviteCreate,
         FileUpload,
         MemberRemove,
+        MemberNickname,
     }
 
     pub struct ChatMessage {
@@ -617,6 +637,8 @@ wire! {
         pub target: ChatTarget,
         pub author: SessionId,
         pub author_uid: Uid,
+        /// The author's nickname when the message was sent; show the member's
+        /// current nickname instead when the member is known.
         pub author_name: String,
         pub text: String,
         /// Unix time in milliseconds.
@@ -658,7 +680,7 @@ wire! {
 }
 
 impl Permission {
-    pub const ALL: [Permission; 14] = [
+    pub const ALL: [Permission; 15] = [
         Permission::ServerManage,
         Permission::ChannelCreate,
         Permission::ChannelEdit,
@@ -673,6 +695,7 @@ impl Permission {
         Permission::InviteCreate,
         Permission::FileUpload,
         Permission::MemberRemove,
+        Permission::MemberNickname,
     ];
 
     /// What every new member may do.
@@ -762,7 +785,14 @@ mod tests {
             ok: Response::Pruned {
                 uids: vec!["u".into()],
                 count: 3,
-                members: vec![Member { uid: "u".into(), nickname: "n".into(), groups: vec![2], last_seen: 7 }],
+                members: vec![Member {
+                    uid: "u".into(),
+                    nickname: "n".into(),
+                    tag: "abcdefghij".into(),
+                    connect: None,
+                    groups: vec![2],
+                    last_seen: 7,
+                }],
             },
         };
         let text = serde_json::to_string(&reply).unwrap();
@@ -775,6 +805,8 @@ mod tests {
     fn removing_members_is_not_a_default_permission() {
         assert!(Permission::ALL.contains(&Permission::MemberRemove));
         assert!(!Permission::MEMBER_DEFAULT.contains(&Permission::MemberRemove));
+        assert!(Permission::ALL.contains(&Permission::MemberNickname));
+        assert!(!Permission::MEMBER_DEFAULT.contains(&Permission::MemberNickname));
     }
 
     #[test]

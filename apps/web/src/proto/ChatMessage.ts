@@ -2,7 +2,12 @@
 import type { Attachment } from "./Attachment";
 import type { ChatTarget } from "./ChatTarget";
 
-export type ChatMessage = { id: number, target: ChatTarget, author: number, author_uid: string, author_name: string, text: string, 
+export type ChatMessage = { id: number, target: ChatTarget, author: number, author_uid: string, 
+/**
+ * The author's nickname when the message was sent; show the member's
+ * current nickname instead when the member is known.
+ */
+author_name: string, text: string, 
 /**
  * Unix time in milliseconds.
  */

@@ -2,7 +2,12 @@
 import type { ClientSoftware } from "./ClientSoftware";
 import type { DeviceCertificate } from "./DeviceCertificate";
 
-export type Hello = { protocol: number, nickname: string, 
+export type Hello = { protocol: number, 
+/**
+ * The identity's own nickname. Used only when this identity joins the
+ * server for the first time; afterwards the member's stored nickname wins.
+ */
+nickname: string, 
 /**
  * Base64url (no padding) Ed25519 public key.
  */
