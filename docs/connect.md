@@ -90,13 +90,19 @@ All signatures are Ed25519 over the UTF-8 text, fields separated by `\n`:
 
 - **Device certificate**, by the account key:
   `gwar device v1\n{account_key}\n{device_key}\n{issued_at}\n{expires_at}`.
-  Certificates last at most 400 days; clients renew them at login.
+  Certificates last at most 400 days. Whenever a client has the account key
+  (sign-up, log-in, recovery, password change, revocation), it renews the
+  certificates of **all** the account's active devices
+  (`POST /v1/devices/renew`), and every device picks its own up from
+  `GET /v1/devices` when it starts. So a device stays valid as long as the
+  password is entered on any device of the account now and then; one that is
+  close to expiry with nothing newer asks for the password.
 - **Revocation**, by the account key: `gwar revoke v1\n{account_key}\n{device_key}\n{revoked_at}`.
 
 ## Connect API
 
 JSON over HTTPS under `/v1`. Authenticated calls send
-`Authorization: Bearer <token>` (sessions last 90 days). Errors are
+`Authorization: Bearer <token>`; a session ends after 90 days without use. Errors are
 `{"error": "<code>", "message": "..."}` with an HTTP status.
 
 | Call | Body → reply |
@@ -107,8 +113,9 @@ JSON over HTTPS under `/v1`. Authenticated calls send
 | `POST /v1/recover` | `{handle, recovery_auth}` → `{token, account_key, recovery_blob}` |
 | `GET /v1/account` | → `{handle, account_key, created_at}` |
 | `PUT /v1/account/password` | `{kdf, auth_key, key_blob}` → `{}` (other sessions end) |
-| `GET /v1/devices` | → `{devices: [{device_key, name, created_at, last_seen, revoked_at}]}` |
+| `GET /v1/devices` | → `{devices: [{device_key, name, created_at, last_seen, revoked_at, certificate: {issued_at, expires_at, signature} \| null}]}` (`certificate` is the newest one Connect has) |
 | `POST /v1/devices` | `{device_key, name, issued_at, expires_at, signature}` → `{}` |
+| `POST /v1/devices/renew` | `{certificates: [{device_key, issued_at, expires_at, signature}]}` (at most 100) → `{renewed}`; each must be signed by the account key; revoked devices and certificates no newer than the stored one are skipped |
 | `POST /v1/devices/revoke` | `{device_key, revoked_at, signature}` → `{}` (that device's sessions end) |
 | `GET /v1/vault` | → `{vault, version, updated_at}` (`vault: null, version: 0` before the first write) |
 | `PUT /v1/vault` | `{vault, version}` (the version the change was based on) → `{version}`; `409 conflict` if it changed meanwhile. At most 64 KiB. |
@@ -116,8 +123,8 @@ JSON over HTTPS under `/v1`. Authenticated calls send
 | `GET /v1/revocations?since=<seq>` | public → `{revocations: [{seq, account_key, device_key, revoked_at, signature}]}` (at most 1000, ascending) |
 | `GET /v1/accounts/{handle}` | public → `{handle, account_key}` |
 
-A session belongs to the device it registered (`register`, `POST /v1/devices`),
-so revoking a device signs it out.
+A session belongs to the first device it registered (`register`,
+`POST /v1/devices`), so revoking a device signs it out.
 
 Handles are 3–32 characters of `a-z 0-9 _ .`, compared lowercase. Registration,
 login and recovery are rate-limited per address and per handle.

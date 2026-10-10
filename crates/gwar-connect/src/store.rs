@@ -50,6 +50,8 @@ pub struct Device {
     pub created_at: i64,
     pub last_seen: i64,
     pub revoked_at: Option<i64>,
+    /// The newest certificate Connect has for it (none for devices registered before renewal existed).
+    pub certificate: Option<Certificate>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -111,7 +113,22 @@ const MIGRATIONS: &[&str] = &[
         updated_at INTEGER NOT NULL
     );
     "#,
+    // 2: the newest certificate of each device, so the account can renew all
+    // of them at once and each device picks its own up.
+    r#"
+    ALTER TABLE devices ADD COLUMN issued_at INTEGER;
+    ALTER TABLE devices ADD COLUMN expires_at INTEGER;
+    ALTER TABLE devices ADD COLUMN signature TEXT;
+    "#,
 ];
+
+/// A device certificate as stored (docs/connect.md).
+#[derive(Debug, Clone, Serialize)]
+pub struct Certificate {
+    pub issued_at: i64,
+    pub expires_at: i64,
+    pub signature: String,
+}
 
 /// An account's encrypted vault (see docs/connect.md).
 #[derive(Debug, Clone, Serialize)]
@@ -231,18 +248,42 @@ impl Store {
 
     pub fn devices(&self, account: i64) -> Result<Vec<Device>> {
         let mut stmt = self.db.prepare(
-            "SELECT device_key,name,created_at,last_seen,revoked_at FROM devices WHERE account_id=?1 ORDER BY created_at",
+            "SELECT device_key,name,created_at,last_seen,revoked_at,issued_at,expires_at,signature
+             FROM devices WHERE account_id=?1 ORDER BY created_at",
         )?;
         let rows = stmt.query_map([account], |r| {
+            let certificate = match (r.get(5)?, r.get(6)?, r.get(7)?) {
+                (Some(issued_at), Some(expires_at), Some(signature)) => {
+                    Some(Certificate { issued_at, expires_at, signature })
+                }
+                _ => None,
+            };
             Ok(Device {
                 device_key: r.get(0)?,
                 name: r.get(1)?,
                 created_at: r.get(2)?,
                 last_seen: r.get(3)?,
                 revoked_at: r.get(4)?,
+                certificate,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Keeps `certificate` for the device if it lasts longer than the stored one; whether it did.
+    pub fn set_certificate(&self, device_key: &str, c: &Certificate) -> Result<bool> {
+        let changed = self.db.execute(
+            "UPDATE devices SET issued_at=?2, expires_at=?3, signature=?4
+             WHERE device_key=?1 AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at < ?3)",
+            params![device_key, c.issued_at, c.expires_at, c.signature],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Marks the device as used now.
+    pub fn touch_device(&self, device_key: &str, now: i64) -> Result<()> {
+        self.db.execute("UPDATE devices SET last_seen=?2 WHERE device_key=?1", params![device_key, now])?;
+        Ok(())
     }
 
     pub fn revoke(&self, account_key: &str, device_key: &str, revoked_at: i64, signature: &str) -> Result<()> {
@@ -284,20 +325,34 @@ impl Store {
         Ok(())
     }
 
-    pub fn session(&self, token_hash: &str, now: i64) -> Result<Option<i64>> {
+    /// The account and device of a live session.
+    pub fn session(&self, token_hash: &str, now: i64) -> Result<Option<(i64, Option<String>)>> {
         Ok(self
             .db
             .query_row(
-                "SELECT account_id FROM sessions WHERE token_hash=?1 AND expires_at > ?2",
+                "SELECT account_id,device_key FROM sessions WHERE token_hash=?1 AND expires_at > ?2",
                 params![token_hash, now],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?)
     }
 
-    /// Records that the session was used to register `device_key`.
+    /// Moves a session's expiry to `expires_at`, at most once a day.
+    pub fn extend_session(&self, token_hash: &str, expires_at: i64) -> Result<()> {
+        self.db.execute(
+            "UPDATE sessions SET expires_at=?2 WHERE token_hash=?1 AND expires_at < ?2 - 86400000",
+            params![token_hash, expires_at],
+        )?;
+        Ok(())
+    }
+
+    /// Records that the session was used to register `device_key`. A session
+    /// belongs to the first device it registers; later ones don't move it.
     pub fn bind_session(&self, token_hash: &str, device_key: &str) -> Result<()> {
-        self.db.execute("UPDATE sessions SET device_key=?2 WHERE token_hash=?1", [token_hash, device_key])?;
+        self.db.execute(
+            "UPDATE sessions SET device_key=?2 WHERE token_hash=?1 AND device_key IS NULL",
+            [token_hash, device_key],
+        )?;
         Ok(())
     }
 

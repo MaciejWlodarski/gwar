@@ -22,7 +22,7 @@ use tracing::warn;
 
 use crate::{
     crypto::{self, KEY_BLOB_LEN, MAX_VAULT_LEN, SKEW_MS, b64, unb64_len},
-    store::{Account, Kdf, NewAccount, Store},
+    store::{Account, Certificate, Kdf, NewAccount, Store},
 };
 
 const SESSION_MS: i64 = 90 * 24 * 3600 * 1000;
@@ -122,12 +122,23 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     headers.get(header::AUTHORIZATION)?.to_str().ok()?.strip_prefix("Bearer ")
 }
 
-/// The account behind the request's session.
+/// The account behind the request's session. Using a session keeps it (and
+/// its device) alive: sessions end after [`SESSION_MS`] without use.
 fn authenticated(state: &Connect, headers: &HeaderMap) -> Result<Account, ApiError> {
     let token = bearer(headers).ok_or_else(ApiError::unauthorized)?;
+    let hash = token_hash(token);
+    let now = now_ms();
     let store = state.store.lock().expect("store lock");
-    let id = store.session(&token_hash(token), now_ms())?.ok_or_else(ApiError::unauthorized)?;
+    let (id, device) = store.session(&hash, now)?.ok_or_else(ApiError::unauthorized)?;
+    store.extend_session(&hash, now + SESSION_MS)?;
+    if let Some(device) = device {
+        store.touch_device(&device, now)?;
+    }
     store.account(id)?.ok_or_else(ApiError::unauthorized)
+}
+
+fn certificate(d: &DeviceCert) -> Certificate {
+    Certificate { issued_at: d.issued_at, expires_at: d.expires_at, signature: d.signature.clone() }
 }
 
 fn new_session(store: &Store, account: i64) -> anyhow::Result<String> {
@@ -246,6 +257,7 @@ pub async fn register(
         return Err(ApiError(StatusCode::CONFLICT, "taken", "this handle or identity already has an account".into()));
     };
     store.upsert_device(id, &d.device_key, &device_name(&d.name), now)?;
+    store.set_certificate(&d.device_key, &certificate(d))?;
     let token = new_session(&store, id)?;
     store.bind_session(&token_hash(&token), &d.device_key)?;
     Ok(Json(json!({"token": token})))
@@ -374,10 +386,40 @@ pub async fn add_device(State(state): State<AppState>, headers: HeaderMap, Json(
         _ => {}
     }
     store.upsert_device(account.id, &d.device_key, &device_name(&d.name), now)?;
+    store.set_certificate(&d.device_key, &certificate(&d))?;
     if let Some(token) = bearer(&headers) {
         store.bind_session(&token_hash(token), &d.device_key)?;
     }
     Ok(Json(json!({})))
+}
+
+#[derive(Deserialize)]
+pub struct Renew {
+    certificates: Vec<DeviceCert>,
+}
+
+/// New certificates for the account's devices, made by a client that holds
+/// the account key. Each device picks its own up from `GET /v1/devices`.
+pub async fn renew_devices(State(state): State<AppState>, headers: HeaderMap, Json(r): Json<Renew>) -> Reply {
+    let account = authenticated(&state, &headers)?;
+    if r.certificates.len() > 100 {
+        return Err(ApiError::bad("too many certificates"));
+    }
+    let now = now_ms();
+    let store = state.store.lock().expect("store lock");
+    let mut renewed = 0;
+    for d in &r.certificates {
+        crypto::check_certificate(&account.account_key, &d.device_key, d.issued_at, d.expires_at, &d.signature, now)
+            .map_err(ApiError::bad)?;
+        match store.device_owner(&d.device_key)? {
+            Some((owner, None)) if owner == account.id => {
+                renewed += usize::from(store.set_certificate(&d.device_key, &certificate(d))?);
+            }
+            // Revoked or someone else's: never renewed.
+            _ => {}
+        }
+    }
+    Ok(Json(json!({"renewed": renewed})))
 }
 
 #[derive(Deserialize)]
