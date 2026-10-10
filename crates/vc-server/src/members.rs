@@ -75,19 +75,47 @@ pub fn prune(store: &Store, files_dir: &Path, options: &PruneOptions) -> Result<
         .filter(|m| options.include_grouped || !m.has_roles())
         .collect();
     if !options.dry_run {
-        for row in &members {
-            // One member at a time, each in its own transaction.
-            let removal = store.remove_member(row.id, &row.member.uid, options.delete_messages)?;
-            for file in removal.files {
-                match std::fs::remove_file(files_dir.join(&file)) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => tracing::warn!("remove file {file}: {e}"),
-                }
+        remove_rows(store, files_dir, &members, options.delete_messages)?;
+    }
+    Ok(PruneReport { members, dry_run: options.dry_run })
+}
+
+/// Removes (or previews removing) the members with these uids, whatever their
+/// roles; fails before changing anything if one of them is unknown.
+pub fn remove(
+    store: &Store,
+    files_dir: &Path,
+    uids: &[String],
+    delete_messages: bool,
+    dry_run: bool,
+) -> Result<PruneReport> {
+    let everyone = list(store, None)?;
+    let mut members = Vec::new();
+    for uid in uids {
+        match everyone.iter().find(|m| &m.member.uid == uid) {
+            Some(row) => members.push(row.clone()),
+            None => bail!("no member with uid {uid}"),
+        }
+    }
+    if !dry_run {
+        remove_rows(store, files_dir, &members, delete_messages)?;
+    }
+    Ok(PruneReport { members, dry_run })
+}
+
+fn remove_rows(store: &Store, files_dir: &Path, members: &[MemberRow], delete_messages: bool) -> Result<()> {
+    for row in members {
+        // One member at a time, each in its own transaction.
+        let removal = store.remove_member(row.id, &row.member.uid, delete_messages)?;
+        for file in removal.files {
+            match std::fs::remove_file(files_dir.join(&file)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!("remove file {file}: {e}"),
             }
         }
     }
-    Ok(PruneReport { members, dry_run: options.dry_run })
+    Ok(())
 }
 
 /// One line per member: uid, last nickname, last seen, groups and message count.

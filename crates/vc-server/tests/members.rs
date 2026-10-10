@@ -395,4 +395,11 @@ fn the_command_line_lists_and_prunes_members() {
     assert!(!seeded.known("stale-mod") && seeded.known("recent"));
     let conflict = cli(dir, &["prune", "--inactive-days", "30", "--keep-groups", "--include-grouped"]);
     assert!(!conflict.status.success());
+
+    // Named members go regardless of roles or activity; an unknown uid changes nothing.
+    let typo = cli(dir, &["remove", "recent", "nobody"]);
+    assert!(!typo.status.success() && seeded.known("recent"));
+    assert!(cli(dir, &["remove", "recent", "--dry-run"]).status.success() && seeded.known("recent"));
+    assert!(cli(dir, &["remove", "recent"]).status.success());
+    assert!(!seeded.known("recent"));
 }

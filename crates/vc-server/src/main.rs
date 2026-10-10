@@ -138,6 +138,18 @@ enum MembersCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Remove these members (by uid), whatever their roles. Not a ban. Like `prune`,
+    /// the server must be stopped unless it is a --dry-run.
+    Remove {
+        #[arg(required = true)]
+        uids: Vec<String>,
+        /// Also delete their messages and files.
+        #[arg(long)]
+        delete_messages: bool,
+        /// Only show who would be removed.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn members(data_dir: &std::path::Path, database: &std::path::Path, command: MembersCommand) -> Result<()> {
@@ -155,6 +167,14 @@ fn members(data_dir: &std::path::Path, database: &std::path::Path, command: Memb
             let store = Store::open(database)?;
             let options = PruneOptions { inactive_days, include_grouped, delete_messages, dry_run };
             let report = members::prune(&store, &data_dir.join("files"), &options)?;
+            print!("{}", members::format_list(&report.members, &store.groups()?, vc_server::core::now_ms()));
+            let verb = if report.dry_run { "would remove" } else { "removed" };
+            eprintln!("{verb} {} members", report.members.len());
+        }
+        MembersCommand::Remove { uids, delete_messages, dry_run } => {
+            let _lock = (!dry_run).then(|| members::lock_data_dir(data_dir)).transpose()?;
+            let store = Store::open(database)?;
+            let report = members::remove(&store, &data_dir.join("files"), &uids, delete_messages, dry_run)?;
             print!("{}", members::format_list(&report.members, &store.groups()?, vc_server::core::now_ms()));
             let verb = if report.dry_run { "would remove" } else { "removed" };
             eprintln!("{verb} {} members", report.members.len());
