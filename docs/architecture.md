@@ -78,6 +78,17 @@ and it works on any self-hosted server. Groups (Admin, Member) carry permission
 lists; one-time tokens grant groups. Channel and server passwords are stored as
 Argon2 of TeamSpeak's wire form `base64(sha1(password))`.
 
+Members are the users' rows in SQLite (`users`, with groups and read marks).
+`member.remove` deletes one (and with `delete_messages` their stored messages
+and files, announcing `chat.deleted` for each); it follows the same rule as bans
+and group changes: nobody acts on a member holding permissions they lack.
+`member.prune` does it for everyone unseen for N days (`users.last_seen`, set on
+connect and disconnect and refreshed for connected users every ten minutes and at
+shutdown). The core is a single actor, so one call removes at most 50 members
+and the client repeats it. Private and server-wide messages are never stored,
+so there is nothing of them to delete. `vc-server members` does the same on the
+database directly and needs the server stopped (`data/vc.lock`).
+
 ## TeamSpeak
 
 - **Official TS3/TS6 clients on our server.** They only accept servers holding

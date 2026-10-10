@@ -240,6 +240,7 @@ describe("reconnect", () => {
   it("does not reconnect after kick or replacement", () => {
     expect(shouldReconnectAfter({ kind: "kicked", by: "a", reason: null })).toBe(false);
     expect(shouldReconnectAfter({ kind: "replaced" })).toBe(false);
+    expect(shouldReconnectAfter({ kind: "removed", by: "a" })).toBe(false);
     expect(shouldReconnectAfter({ kind: "banned", by: "a", reason: null, until: null })).toBe(false);
     expect(shouldReconnectAfter({ kind: "server_shutdown" })).toBe(true);
     expect(shouldReconnectAfter({ kind: "timeout" })).toBe(true);

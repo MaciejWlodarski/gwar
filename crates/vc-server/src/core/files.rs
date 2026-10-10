@@ -186,6 +186,7 @@ impl Core {
         let mut gone = self.store.expire_unattached(now_ms() - UNATTACHED_KEEP_MS).unwrap_or_default();
         gone.extend(self.store.expire_orphans().unwrap_or_default());
         self.remove_files(gone);
+        self.touch_online();
     }
 }
 

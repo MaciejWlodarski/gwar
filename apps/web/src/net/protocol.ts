@@ -8,6 +8,7 @@ import type { Channel } from "../proto/Channel";
 import type { ChatMessage } from "../proto/ChatMessage";
 import type { Group } from "../proto/Group";
 import type { Invite } from "../proto/Invite";
+import type { Member } from "../proto/Member";
 import type { Event } from "../proto/Event";
 import type { Request } from "../proto/Request";
 import type { Welcome } from "../proto/Welcome";
@@ -47,6 +48,8 @@ export interface ResponseMap {
   "group.update": { group: Group };
   "group.delete": Empty;
   "member.groups": { groups: number[] };
+  "member.remove": Empty;
+  "member.prune": { uids: string[]; count: number; members: Member[] };
   "ban.create": { ban: Ban };
   "ban.list": { bans: Ban[] };
   "ban.delete": Empty;

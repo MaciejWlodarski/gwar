@@ -40,7 +40,8 @@ use.
   down. See [docs/connect.md](docs/connect.md).
 - **Moderation.** Roles with any permissions and colors, bans (timed or
   permanent, by identity or IP), invite links that can grant a role, server
-  settings. Nobody can hand out more than they hold.
+  settings, removing members and cleaning up the inactive ones. Nobody can hand
+  out more than they hold.
 - **Chat like you expect.** Mentions with notifications, editing and deleting,
   images, video, audio and files (drag and drop or paste).
 - **One web app, plus a desktop app, with one UI.** The project hosts the web
@@ -86,6 +87,23 @@ Servers accept Gwar Connect devices out of the box and fetch the list of
 revoked devices from the official Connect service every five minutes
 (`--connect-url` points elsewhere, `--no-connect` turns it off). Back up the
 database while running with `vc-server --data-dir data backup copy.sqlite3`.
+
+Admins (or anyone with the "Remove members" permission) can remove a member
+from the member list, or clean up people not seen for a while in Server
+settings. Removing is not a ban: the member's record, roles and read marks go
+(their messages and files too, if asked) and they can join again as a new
+member. The same works from the command line, straight on the database:
+
+```bash
+vc-server --data-dir data members list [--inactive-days 90]
+vc-server --data-dir data members prune --inactive-days 90 --dry-run
+vc-server --data-dir data members prune --inactive-days 90 [--include-grouped] [--delete-messages]
+```
+
+`list` and `--dry-run` are safe while the server runs. A real `prune` must run
+with the server stopped (the server holds `data/vc.lock`; the command refuses
+to run while it is held). Members with a role besides Member are kept unless
+`--include-grouped` is given.
 
 ## Develop
 

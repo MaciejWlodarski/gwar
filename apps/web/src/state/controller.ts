@@ -30,6 +30,7 @@ import {
 } from "../net/connection";
 import { TsConnection } from "../net/ts-connection";
 import { parseBanMessage } from "../lib/ban";
+import type { pruneRequest } from "../lib/prune";
 import { importIdentity, loadActiveIdentity, IdentityUnsupportedError, type Identity } from "../net/identity";
 import { isDesktop } from "../platform";
 import { createVoiceEngine } from "../voice";
@@ -709,6 +710,15 @@ class Controller {
 
   setMemberGroups(uid: string, groups: number[]) {
     return this.connection.request("member.groups", { uid, groups });
+  }
+
+  removeMember(uid: string, deleteMessages: boolean) {
+    return this.connection.request("member.remove", { uid, delete_messages: deleteMessages });
+  }
+
+  /** One batch of `member.prune`; `pruneAll` repeats it. */
+  pruneMembers(request: NonNullable<ReturnType<typeof pruneRequest>>) {
+    return this.connection.request("member.prune", request);
   }
 
   createBan(ban: Partial<BanCreate>) {

@@ -4,22 +4,27 @@
 //! a permission they don't have themselves. That keeps moderators from
 //! promoting themselves or demoting admins.
 
-use std::{collections::BTreeSet, net::IpAddr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::IpAddr,
+};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;
 use vc_proto::{
-    Ban, BanCreate, BanId, ErrorCode, Event, Group, GroupCreate, GroupId, GroupUpdate, Invite, InviteCreate,
-    LeaveReason, Permission, Response, ServerUpdate, SessionId, Uid,
+    Ban, BanCreate, BanId, ChannelId, ErrorCode, Event, Group, GroupCreate, GroupId, GroupUpdate, Invite, InviteCreate,
+    LeaveReason, Member, MemberPrune, PRUNE_BATCH, PRUNE_PREVIEW, Permission, Response, ServerUpdate, SessionId, Uid,
 };
 
-use super::{Core, Reply, bridge::BridgeNote, clean, err, now_ms, passwords, storage_error};
+use super::{Core, ErrorBody, Reply, bridge::BridgeNote, clean, err, now_ms, passwords, storage_error};
 use crate::store::{ADMIN_GROUP, MEMBER_GROUP};
 
 const MAX_GROUP_NAME: usize = 32;
 const MAX_REASON: usize = 200;
 const MAX_INVITE_USES: u32 = 10_000;
 const MAX_DURATION_SECS: u64 = 10 * 365 * 24 * 3600;
+const MAX_INACTIVE_DAYS: u32 = 3650;
+const DAY_MS: i64 = 24 * 3600 * 1000;
 
 pub(super) fn ban_message(ban: &Ban) -> String {
     let mut message = String::from("you are banned from this server");
@@ -174,6 +179,85 @@ impl Core {
         }
         self.broadcast(Event::MemberUpdated(member), |_| true);
         Ok(Response::Groups { groups: wanted })
+    }
+
+    // --------------------------------------------------------------- removal
+
+    pub(super) fn member_remove(&mut self, session: SessionId, uid: Uid, delete_messages: bool) -> Reply {
+        self.require(session, Permission::MemberRemove)?;
+        if self.sessions[&session].uid == uid {
+            return Err(err(ErrorCode::BadRequest, "you cannot remove yourself"));
+        }
+        let Some((user_id, member)) = self.store.user_by_uid(&uid).map_err(storage_error)? else {
+            return Err(err(ErrorCode::NotFound, "no such member"));
+        };
+        if !self.covers(session, &self.group_permissions(&member.groups)) {
+            return Err(err(ErrorCode::Forbidden, "this member has permissions you do not have"));
+        }
+        let by = self.sessions[&session].nickname.clone();
+        self.erase_member(&by, user_id, &member, delete_messages)?;
+        Ok(Response::Empty {})
+    }
+
+    /// Removes members not seen for `inactive_days`, a batch per call. Online members, the
+    /// caller and, with `without_groups_only`, anyone holding a role are always spared, as is
+    /// anyone holding permissions the caller lacks. Core work is bounded by [`PRUNE_BATCH`]:
+    /// the caller repeats the request while `count` exceeds the uids returned.
+    pub(super) fn member_prune(&mut self, session: SessionId, p: MemberPrune) -> Reply {
+        self.require(session, Permission::MemberRemove)?;
+        if p.inactive_days == 0 || p.inactive_days > MAX_INACTIVE_DAYS {
+            return Err(err(ErrorCode::BadRequest, "inactive days must be 1–3650"));
+        }
+        let cutoff = now_ms() - i64::from(p.inactive_days) * DAY_MS;
+        let me = &self.sessions[&session];
+        let (my_uid, by) = (me.uid.clone(), me.nickname.clone());
+        let online: BTreeSet<&str> = self.sessions.values().map(|s| s.uid.as_str()).collect();
+        let mut doomed: Vec<_> = self
+            .store
+            .member_rows(Some(cutoff))
+            .map_err(storage_error)?
+            .into_iter()
+            .filter(|m| m.member.uid != my_uid && !online.contains(m.member.uid.as_str()))
+            .filter(|m| !(p.without_groups_only && m.has_roles()))
+            .filter(|m| self.covers(session, &self.group_permissions(&m.member.groups)))
+            .collect();
+        let count = doomed.len() as u32;
+        if p.dry_run {
+            doomed.truncate(PRUNE_PREVIEW);
+            let members: Vec<_> = doomed.into_iter().map(|m| m.member).collect();
+            return Ok(Response::Pruned { uids: members.iter().map(|m| m.uid.clone()).collect(), count, members });
+        }
+        doomed.truncate(PRUNE_BATCH);
+        let mut members = Vec::with_capacity(doomed.len());
+        for row in doomed {
+            self.erase_member(&by, row.id, &row.member, p.delete_messages)?;
+            members.push(row.member);
+        }
+        Ok(Response::Pruned { uids: members.iter().map(|m| m.uid.clone()).collect(), count, members })
+    }
+
+    /// Disconnects the member's sessions, deletes their record (and their messages
+    /// if asked) and tells everyone. The caller has checked that this is allowed.
+    fn erase_member(
+        &mut self,
+        by: &str,
+        user_id: i64,
+        member: &Member,
+        delete_messages: bool,
+    ) -> Result<(), ErrorBody> {
+        let online: Vec<_> = self.sessions.values().filter(|s| s.uid == member.uid).map(|s| s.id).collect();
+        for s in online {
+            self.remove(s, LeaveReason::Removed { by: by.to_owned() });
+        }
+        let removal = self.store.remove_member(user_id, &member.uid, delete_messages).map_err(storage_error)?;
+        self.remove_files(removal.files);
+        let mut readers: BTreeMap<ChannelId, BTreeSet<SessionId>> = BTreeMap::new();
+        for (message, channel) in removal.messages {
+            let readers = readers.entry(channel).or_insert_with(|| self.readers(channel));
+            self.broadcast(Event::ChatDeleted { channel, message }, |s| readers.contains(&s.id));
+        }
+        self.broadcast(Event::MemberRemoved { uid: member.uid.clone() }, |_| true);
+        Ok(())
     }
 
     /// Checks an invite at connect: `Some(group)` if valid. It is only used

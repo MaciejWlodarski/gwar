@@ -1064,6 +1064,29 @@ async function main() {
     await shot(a, "17b-members-offline-dark");
   });
 
+  await check("an admin removes an offline member (not a ban) and previews a clean-up", async () => {
+    await openSettings(a, "Members");
+    await a.getByLabel("Search members").fill("Bob");
+    const row = a.locator('[data-member="Bob"]').first();
+    await row.getByRole("button", { name: "Remove Bob" }).click();
+    await a.getByRole("dialog").getByText(/This is not a ban/).waitFor();
+    await a.getByRole("checkbox", { name: /Also delete their messages and files/ }).check();
+    await shot(a, "30-remove-member-dark");
+    await a.getByRole("dialog").getByRole("button", { name: "Remove member…" }).click();
+    // Back on the members tab, the removed Bob is gone from the list and from the member panel.
+    await a.getByLabel("Search members").fill("Bob");
+    await waitFor(async () => (await a.locator('[data-member="Bob"]').count()) === 0, "Bob leaves the members list");
+    // The clean-up needs a preview before it can remove anything.
+    await a.getByRole("tab", { name: "Clean up" }).click();
+    const remove = a.getByRole("button", { name: "Remove", exact: true });
+    if (!(await remove.isDisabled())) throw new Error("Remove is enabled before a preview");
+    await a.getByLabel("Not seen for (days)").fill("30");
+    await a.getByRole("button", { name: "Preview" }).click();
+    await a.getByText("Nobody matches. Nothing to remove.").waitFor();
+    await shot(a, "31-settings-cleanup-dark");
+    await a.keyboard.press("Escape");
+  });
+
   await check("older history loads when scrolling to the top", async () => {
     await a.getByRole("button", { name: "Server menu" }).click();
     await a.getByRole("menuitem", { name: "Create channel" }).click();

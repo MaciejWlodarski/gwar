@@ -1,5 +1,5 @@
 import * as ContextMenu from "@radix-ui/react-context-menu";
-import { Ban, ChevronRight, ShieldCheck, UserX } from "lucide-react";
+import { Ban, ChevronRight, ShieldCheck, UserMinus, UserX } from "lucide-react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { canActOn, canAssignGroup, ADMIN_GROUP, MEMBER_GROUP, orderedGroups, toggleGroup } from "../lib/permissions";
@@ -9,7 +9,7 @@ import { usePermission } from "./hooks";
 import { menuContent, menuItem, menuItemDanger, menuSeparator } from "./kit";
 
 /**
- * Kick, ban and role items for the context menu of a person (in the channel
+ * Kick, ban, remove and role items for the context menu of a person (in the channel
  * tree or the member list). Each shows only if I may use it; role toggles that
  * would break a rule are disabled instead.
  */
@@ -22,6 +22,7 @@ export function ModerationItems({ person, groups }: { person: PersonRef; groups:
   const canKick = usePermission("client_kick");
   const canBan = usePermission("client_ban");
   const canGroups = usePermission("group_manage");
+  const canRemove = usePermission("member_remove");
   if (isMe) return null;
   // TeamSpeak servers keep their own bans and roles: only kicking is offered there, as before.
   const vc = kind === "vc";
@@ -29,7 +30,8 @@ export function ModerationItems({ person, groups }: { person: PersonRef; groups:
   const showKick = canKick && person.session !== undefined;
   const showBan = vc && canBan;
   const showRoles = vc && canGroups;
-  if (!showKick && !showBan && !showRoles) return null;
+  const showRemove = vc && canRemove;
+  if (!showKick && !showBan && !showRoles && !showRemove) return null;
 
   const roles = orderedGroups(defs).filter((g) => g.id !== MEMBER_GROUP);
 
@@ -100,6 +102,15 @@ export function ModerationItems({ person, groups }: { person: PersonRef; groups:
           onSelect={() => useUi.getState().openDialog({ kind: "ban", person })}
         >
           <Ban className="size-4" /> {t("mod.ban")}
+        </ContextMenu.Item>
+      )}
+      {showRemove && (
+        <ContextMenu.Item
+          className={cn(menuItem, menuItemDanger)}
+          disabled={stronger}
+          onSelect={() => useUi.getState().openDialog({ kind: "removeMember", person })}
+        >
+          <UserMinus className="size-4" /> {t("mod.remove")}
         </ContextMenu.Item>
       )}
     </>

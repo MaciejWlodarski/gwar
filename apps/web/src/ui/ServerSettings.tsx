@@ -1,8 +1,8 @@
 import * as Dropdown from "@radix-ui/react-dropdown-menu";
 import * as Tabs from "@radix-ui/react-tabs";
-import { Ban, Check, Copy, Link2, Lock, Plus, Search, ShieldCheck, Trash2, UserPlus, Users, X } from "lucide-react";
+import { Ban, Check, Copy, Link2, Lock, Plus, Search, ShieldCheck, Trash2, UserMinus, UserPlus, Users, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
-import { useLanguage, useT, type Key } from "../i18n";
+import { countKey, useLanguage, useT, type Key } from "../i18n";
 import { INVITE_EXPIRY, INVITE_USES } from "../lib/ban";
 import { cn } from "../lib/cn";
 import {
@@ -18,6 +18,7 @@ import {
   orderedGroups,
   toggleGroup,
 } from "../lib/permissions";
+import { PRUNE_DAYS_DEFAULT, PRUNE_DAYS_MAX, parsePruneDays, pruneAll, pruneKey, pruneRequest, type PruneForm, type PruneReply } from "../lib/prune";
 import { formatRelative, formatUntil } from "../lib/time";
 import { webOrigin } from "../lib/official";
 import { buildInviteLink } from "../net/invite";
@@ -29,7 +30,7 @@ import { controller, describeRequestError } from "../state/controller";
 import { sortedChannels } from "../state/reducer";
 import { useSession, useUi, type ServerSettingsTab } from "../state/stores";
 import { usePermission } from "./hooks";
-import { Avatar, Button, Dialog, EmptyState, Field, IconButton, Input, Select, Spinner, Textarea, menuContent, menuItem } from "./kit";
+import { Avatar, Button, Dialog, EmptyState, Field, IconButton, Input, Select, Spinner, Switch, Textarea, menuContent, menuItem } from "./kit";
 
 // ------------------------------------------------------------------ helpers
 
@@ -85,17 +86,19 @@ export function ServerSettingsDialog({ tab }: { tab?: ServerSettingsTab }) {
   const canGroups = usePermission("group_manage");
   const canBan = usePermission("client_ban");
   const canInvite = usePermission("invite_create");
+  const canRemove = usePermission("member_remove");
   const vc = kind === "vc";
 
   const tabs = useMemo(() => {
     const list: Array<{ id: ServerSettingsTab; label: string; icon: ReactNode }> = [];
     if (canServer) list.push({ id: "overview", label: t("ss.overview"), icon: <Lock className="size-4" /> });
     if (vc && (canGroups || canServer)) list.push({ id: "roles", label: t("ss.roles"), icon: <ShieldCheck className="size-4" /> });
-    if (vc && (canGroups || canServer || canBan)) list.push({ id: "members", label: t("ss.members"), icon: <Users className="size-4" /> });
+    if (vc && (canGroups || canServer || canBan || canRemove)) list.push({ id: "members", label: t("ss.members"), icon: <Users className="size-4" /> });
+    if (vc && canRemove) list.push({ id: "cleanup", label: t("ss.cleanup"), icon: <UserMinus className="size-4" /> });
     if (vc && canBan) list.push({ id: "bans", label: t("ss.bans"), icon: <Ban className="size-4" /> });
     if (vc && canInvite) list.push({ id: "invites", label: t("ss.invites"), icon: <Link2 className="size-4" /> });
     return list;
-  }, [t, vc, canServer, canGroups, canBan, canInvite]);
+  }, [t, vc, canServer, canGroups, canBan, canRemove, canInvite]);
 
   const [chosen, setCurrent] = useState<ServerSettingsTab>(tab ?? "overview");
   // Permissions can change under us (a role edit): fall back from tabs that are no longer allowed.
@@ -127,6 +130,9 @@ export function ServerSettingsDialog({ tab }: { tab?: ServerSettingsTab }) {
         </Tabs.Content>
         <Tabs.Content value="members" className="outline-none">
           <MembersTab />
+        </Tabs.Content>
+        <Tabs.Content value="cleanup" className="outline-none">
+          <CleanupTab />
         </Tabs.Content>
         <Tabs.Content value="bans" className="outline-none">
           <BansTab />
@@ -491,6 +497,7 @@ function MembersTab() {
   const meUid = useSession((s) => s.me?.uid);
   const canGroups = usePermission("group_manage");
   const canBan = usePermission("client_ban");
+  const canRemove = usePermission("member_remove");
   const [query, setQuery] = useState("");
   const [now] = useState(() => Date.now());
   const online = useMemo(() => new Map(Object.values(clients).map((c) => [c.uid, c.id])), [clients]);
@@ -555,10 +562,142 @@ function MembersTab() {
                     <Ban className="size-4" />
                   </IconButton>
                 )}
+                {canRemove && !isMe && (
+                  <IconButton
+                    label={t("mod.removeNamed", { name: m.nickname })}
+                    tone="danger"
+                    size="sm"
+                    disabled={stronger}
+                    onClick={() => useUi.getState().openDialog({ kind: "removeMember", person: { uid: m.uid, nickname: m.nickname, session }, back: "members" })}
+                  >
+                    <UserMinus className="size-4" />
+                  </IconButton>
+                )}
               </li>
             );
           })}
         </ul>
+      )}
+    </div>
+  );
+}
+
+// ----------------------------------------------------------------- clean up
+
+/** Removes people who have not been here for a while: preview first, then the real thing. */
+function CleanupTab() {
+  const t = useT();
+  const lang = useLanguage();
+  const [form, setForm] = useState<PruneForm>({ days: PRUNE_DAYS_DEFAULT, keepRoles: true, deleteMessages: false });
+  const [preview, setPreview] = useState<{ key: string; reply: PruneReply } | null>(null);
+  const [busy, setBusy] = useState<"preview" | "remove" | null>(null);
+  const [progress, setProgress] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+
+  const change = (next: Partial<PruneForm>) => {
+    setForm((f) => ({ ...f, ...next }));
+    setError(null);
+  };
+  const key = pruneKey(form);
+  const daysValid = parsePruneDays(form.days) !== null;
+  // A preview only vouches for the settings it ran with.
+  const current = preview && preview.key === key ? preview.reply : null;
+
+  const runPreview = async () => {
+    const request = pruneRequest(form, true);
+    if (!request || !key || busy) return;
+    setBusy("preview");
+    setError(null);
+    try {
+      const reply = await controller.pruneMembers(request);
+      setNow(Date.now());
+      setPreview({ key, reply });
+    } catch (e) {
+      setError(describeRequestError(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const runRemove = async () => {
+    const request = pruneRequest(form, false);
+    if (!request || !current || busy) return;
+    setBusy("remove");
+    setProgress(0);
+    setError(null);
+    try {
+      const removed = await pruneAll(() => controller.pruneMembers(request), setProgress);
+      useUi.getState().toast("success", t(countKey(lang, "ss.pruneDone", removed), { count: removed }));
+      setPreview(null);
+    } catch (e) {
+      setError(describeRequestError(e));
+      setPreview(null);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const shown = current?.members ?? [];
+  return (
+    <div className="flex flex-col gap-4">
+      <p className="text-sm text-muted">{t("ss.cleanupIntro")}</p>
+      <Field label={t("ss.pruneDays")} hint={t("ss.pruneDaysHint", { max: PRUNE_DAYS_MAX })} error={daysValid ? undefined : t("ss.pruneDaysInvalid", { max: PRUNE_DAYS_MAX })}>
+        {(id) => (
+          <Input
+            id={id}
+            inputMode="numeric"
+            value={form.days}
+            onChange={(e) => change({ days: e.target.value })}
+            disabled={busy !== null}
+            className="w-32"
+          />
+        )}
+      </Field>
+      <Switch checked={form.keepRoles} onCheckedChange={(v) => change({ keepRoles: v })} label={t("ss.pruneKeepRoles")} description={t("ss.pruneKeepRolesHint")} />
+      <Switch checked={form.deleteMessages} onCheckedChange={(v) => change({ deleteMessages: v })} label={t("ss.pruneMessages")} description={t("ss.pruneMessagesHint")} />
+      <p className="text-xs text-subtle">{t("ss.pruneAlwaysKept")}</p>
+      <ErrorLine>{error}</ErrorLine>
+      <div className="flex flex-wrap gap-2">
+        <Button onClick={() => void runPreview()} busy={busy === "preview"} disabled={!daysValid || busy === "remove"}>
+          {t("ss.prunePreview")}
+        </Button>
+        <Button
+          variant="danger"
+          onClick={() => void runRemove()}
+          busy={busy === "remove"}
+          disabled={!current || current.count === 0 || busy === "preview"}
+        >
+          {busy === "remove"
+            ? t("ss.pruneRunning", { done: progress, total: current?.count ?? progress })
+            : current && current.count > 0
+              ? t(countKey(lang, "ss.pruneRemove", current.count), { count: current.count })
+              : t("ss.pruneRemoveIdle")}
+        </Button>
+      </div>
+      {current && (
+        <section aria-label={t("ss.pruneListLabel")} className="flex flex-col gap-2">
+          <p role="status" className="text-sm font-medium">
+            {current.count === 0 ? t("ss.pruneNone") : t(countKey(lang, "ss.pruneFound", current.count), { count: current.count })}
+          </p>
+          {shown.length > 0 && (
+            <ul className="flex max-h-72 flex-col divide-y divide-line overflow-y-auto rounded-lg border border-line">
+              {shown.map((m) => (
+                <li key={m.uid} data-prune={m.nickname} className="flex items-center gap-3 px-3 py-1.5">
+                  <Avatar name={m.nickname} seed={m.uid} size={24} />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm">{m.nickname}</div>
+                    <div className="truncate font-mono text-[11px] text-subtle" title={m.uid}>
+                      {m.uid}
+                    </div>
+                  </div>
+                  <span className="shrink-0 text-[11px] text-subtle">{m.last_seen > 0 ? formatRelative(m.last_seen, now, lang) : t("members.lastSeenUnknown")}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+          {current.count > shown.length && <p className="text-xs text-subtle">{t("ss.pruneMore", { count: current.count - shown.length })}</p>}
+        </section>
       )}
     </div>
   );

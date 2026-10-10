@@ -101,6 +101,66 @@ enum Command {
     AdminToken,
     /// Write a consistent copy of the database to this file (safe while running).
     Backup { path: PathBuf },
+    /// List or clean up the people this server has seen.
+    Members {
+        #[command(subcommand)]
+        command: MembersCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum MembersCommand {
+    /// Print uid, last nickname, last seen, groups and message count of every member
+    /// (safe while the server runs).
+    List {
+        /// Only members not seen for this many days.
+        #[arg(long)]
+        inactive_days: Option<u32>,
+    },
+    /// Remove members not seen for a while. Not a ban: they can join again as new members.
+    /// Changes the database directly, so the server must be stopped (preview with --dry-run
+    /// at any time). The server's own `member.prune` request does the same from the web app
+    /// while it runs.
+    Prune {
+        /// Remove members not seen for at least this many days.
+        #[arg(long)]
+        inactive_days: u32,
+        /// Spare members who hold a role besides the default one (the default).
+        #[arg(long, conflicts_with = "include_grouped")]
+        keep_groups: bool,
+        /// Also remove members who hold roles.
+        #[arg(long)]
+        include_grouped: bool,
+        /// Also delete their messages and files.
+        #[arg(long)]
+        delete_messages: bool,
+        /// Only show who would be removed.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+fn members(data_dir: &std::path::Path, database: &std::path::Path, command: MembersCommand) -> Result<()> {
+    use vc_server::members::{self, PruneOptions};
+    match command {
+        MembersCommand::List { inactive_days } => {
+            let store = Store::open(database)?;
+            let rows = members::list(&store, inactive_days)?;
+            print!("{}", members::format_list(&rows, &store.groups()?, vc_server::core::now_ms()));
+            eprintln!("{} members", rows.len());
+        }
+        MembersCommand::Prune { inactive_days, keep_groups: _, include_grouped, delete_messages, dry_run } => {
+            // Only the real thing needs the server out of the way.
+            let _lock = (!dry_run).then(|| members::lock_data_dir(data_dir)).transpose()?;
+            let store = Store::open(database)?;
+            let options = PruneOptions { inactive_days, include_grouped, delete_messages, dry_run };
+            let report = members::prune(&store, &data_dir.join("files"), &options)?;
+            print!("{}", members::format_list(&report.members, &store.groups()?, vc_server::core::now_ms()));
+            let verb = if report.dry_run { "would remove" } else { "removed" };
+            eprintln!("{verb} {} members", report.members.len());
+        }
+    }
+    Ok(())
 }
 
 /// The address the OS would route public traffic from; no packets are sent.
@@ -130,8 +190,11 @@ async fn main() -> Result<()> {
             println!("{}", path.display());
             return Ok(());
         }
+        Some(Command::Members { command }) => return members(&cli.data_dir, &database, command),
         None => {}
     }
+    // Held while the server runs, so `members prune` can tell.
+    let _data_dir_lock = vc_server::members::lock_data_dir(&cli.data_dir)?;
 
     let ice_servers: Vec<IceServer> = match &cli.ice_servers {
         Some(path) => serde_json::from_str(&std::fs::read_to_string(path)?).context("parse ICE servers")?,

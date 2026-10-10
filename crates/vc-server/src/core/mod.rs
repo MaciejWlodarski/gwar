@@ -412,7 +412,20 @@ impl Core {
         }
     }
 
+    /// Stamps everyone connected as seen now, so a long session survives a crash
+    /// or restart without looking like an absence.
+    fn touch_online(&self) {
+        let now = now_ms();
+        let users: BTreeSet<_> = self.sessions.values().filter(|s| s.out.is_some()).map(|s| s.user_id).collect();
+        for user in users {
+            if let Err(e) = self.store.set_last_seen(user, now) {
+                warn!("store: {e:#}");
+            }
+        }
+    }
+
     fn shutdown(&mut self) {
+        self.touch_online();
         let ids: Vec<_> = self.sessions.keys().copied().collect();
         for id in ids {
             if let Some(out) = self.sessions.get(&id).and_then(|s| s.out.as_ref()) {
@@ -773,6 +786,8 @@ impl Core {
             Request::GroupUpdate(update) => self.group_update(session, update),
             Request::GroupDelete { group } => self.group_delete(session, group),
             Request::MemberGroups { uid, groups } => self.member_groups(session, uid, groups),
+            Request::MemberRemove { uid, delete_messages } => self.member_remove(session, uid, delete_messages),
+            Request::MemberPrune(prune) => self.member_prune(session, prune),
             Request::BanCreate(ban) => self.ban_create(session, ban),
             Request::BanList {} => self.ban_list(session),
             Request::BanDelete { ban } => self.ban_delete(session, ban),

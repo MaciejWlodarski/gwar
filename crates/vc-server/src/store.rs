@@ -31,6 +31,31 @@ pub struct UserRow {
     pub groups: Vec<GroupId>,
 }
 
+/// A stored member with what the maintenance tools need to judge them.
+#[derive(Debug, Clone)]
+pub struct MemberRow {
+    pub id: i64,
+    pub member: Member,
+    /// Stored channel messages written by this member.
+    pub messages: u32,
+}
+
+impl MemberRow {
+    /// Whether the member holds a role besides the default one.
+    pub fn has_roles(&self) -> bool {
+        self.member.groups.iter().any(|g| *g != MEMBER_GROUP)
+    }
+}
+
+/// What deleting a member took with it, for the caller to announce and clean up.
+#[derive(Debug, Default)]
+pub struct Removal {
+    /// Deleted messages and the channels they were in.
+    pub messages: Vec<(MessageId, ChannelId)>,
+    /// Files to remove from disk.
+    pub files: Vec<FileId>,
+}
+
 pub struct Store {
     db: Connection,
 }
@@ -135,6 +160,18 @@ const MIGRATIONS: &[&str] = &[
         account_key TEXT NOT NULL,
         revoked_at INTEGER NOT NULL
     );
+"#,
+    // Member removal and pruning look people up by uid and by last visit.
+    // `users.last_seen` has been set on every connect and disconnect since the
+    // first version, so there is nothing to add; the backfill only repairs rows
+    // a crash or restart left behind: a member who wrote a message after their
+    // recorded last visit was evidently here then, so `last_seen` rises to
+    // their newest message. It never goes down.
+    r#"
+    CREATE INDEX messages_by_author ON messages(author_uid, id);
+    CREATE INDEX files_by_uploader ON files(uploader);
+    CREATE INDEX users_by_last_seen ON users(last_seen);
+    UPDATE users SET last_seen = MAX(last_seen, COALESCE((SELECT MAX(sent_at) FROM messages WHERE author_uid = users.uid), 0));
 "#,
 ];
 
@@ -402,6 +439,46 @@ impl Store {
     pub fn set_last_seen(&self, user_id: i64, now: i64) -> Result<()> {
         self.db.execute("UPDATE users SET last_seen=?2 WHERE id=?1", params![user_id, now])?;
         Ok(())
+    }
+
+    /// Every member (those last seen before `seen_before`, if given), longest away first.
+    pub fn member_rows(&self, seen_before: Option<i64>) -> Result<Vec<MemberRow>> {
+        let mut stmt = self.db.prepare(
+            "SELECT id,uid,nickname,last_seen,(SELECT COUNT(*) FROM messages WHERE author_uid = users.uid)
+             FROM users WHERE ?1 IS NULL OR last_seen < ?1 ORDER BY last_seen, id",
+        )?;
+        let rows = stmt.query_map([seen_before], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get(3)?, r.get(4)?))
+        })?;
+        rows.map(|row| {
+            let (id, uid, nickname, last_seen, messages) = row?;
+            Ok(MemberRow { id, member: Member { uid, nickname, groups: self.user_groups(id)?, last_seen }, messages })
+        })
+        .collect()
+    }
+
+    /// Deletes a member: groups, read marks, mentions of them and unattached uploads.
+    /// With `delete_messages` also everything they wrote, with its files.
+    /// All or nothing; the caller announces the deleted messages and removes the files.
+    pub fn remove_member(&self, id: i64, uid: &str, delete_messages: bool) -> Result<Removal> {
+        let tx = self.db.unchecked_transaction()?;
+        let mut removal = Removal::default();
+        if delete_messages {
+            let mut stmt = self.db.prepare("SELECT id,channel FROM messages WHERE author_uid=?1 ORDER BY id")?;
+            let rows = stmt.query_map([uid], |r| Ok((r.get::<_, MessageId>(0)?, r.get::<_, ChannelId>(1)?)))?;
+            removal.messages = rows.collect::<rusqlite::Result<_>>()?;
+            for (message, _) in &removal.messages {
+                removal.files.extend(self.delete_message(*message)?);
+            }
+        }
+        let mut stmt = self.db.prepare("DELETE FROM files WHERE uploader=?1 AND message IS NULL RETURNING id")?;
+        let pending = stmt.query_map([uid], |r| r.get::<_, FileId>(0))?;
+        removal.files.extend(pending.collect::<rusqlite::Result<Vec<_>>>()?);
+        self.db.execute("DELETE FROM message_mentions WHERE uid=?1", [uid])?;
+        // The foreign keys take the group memberships and read marks along.
+        self.db.execute("DELETE FROM users WHERE id=?1", [id])?;
+        tx.commit()?;
+        Ok(removal)
     }
 
     pub fn latest_message(&self, channel: ChannelId) -> Result<MessageId> {
@@ -818,5 +895,82 @@ mod tests {
         let ids: Vec<_> = (0..5).map(|i| store.add_message(channel, "u", "n", &i.to_string(), i).unwrap()).collect();
         let page = store.history(channel, Some(ids[4]), 2).unwrap();
         assert_eq!(page.iter().map(|m| m.id).collect::<Vec<_>>(), vec![ids[2], ids[3]]);
+    }
+
+    #[test]
+    fn migration_backfills_last_seen_from_messages_and_never_lowers_it() {
+        // A database as the previous release left it (four migrations applied).
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        for migration in &MIGRATIONS[..4] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.pragma_update(None, "user_version", 4).unwrap();
+        db.execute_batch(
+            "INSERT INTO channels(id,name) VALUES(1,'c');
+             INSERT INTO users(id,uid,public_key,nickname,created_at,last_seen) VALUES
+               (1,'wrote-later','k','a',10,100), (2,'wrote-earlier','k','b',10,9000), (3,'silent','k','c',10,50);
+             INSERT INTO messages(channel,author_uid,author_name,text,sent_at) VALUES
+               (1,'wrote-later','a','x',5000), (1,'wrote-later','a','y',4000), (1,'wrote-earlier','b','z',200);",
+        )
+        .unwrap();
+
+        let store = Store::init(db).unwrap();
+        let seen = |uid: &str| store.user_by_uid(uid).unwrap().unwrap().1.last_seen;
+        assert_eq!(seen("wrote-later"), 5000, "raised to the newest message");
+        assert_eq!(seen("wrote-earlier"), 9000, "never lowered");
+        assert_eq!(seen("silent"), 50, "no messages, no change");
+        let version: usize = store.db.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, MIGRATIONS.len());
+        let indexes: Vec<String> = store
+            .db
+            .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name IN ('messages_by_author','files_by_uploader','users_by_last_seen')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(indexes.len(), 3);
+        // Opening again changes nothing.
+        let again = Store::init(store.db).unwrap();
+        assert_eq!(again.user_by_uid("wrote-later").unwrap().unwrap().1.last_seen, 5000);
+    }
+
+    #[test]
+    fn removing_a_member_takes_everything_tied_to_them() {
+        let store = Store::in_memory().unwrap();
+        let channel = store.channels().unwrap()[0].id;
+        let gone = store.touch_user("gone", "k", "gone", 1).unwrap().id;
+        let other = store.touch_user("other", "k", "other", 1).unwrap().id;
+        store.add_user_group(gone, MEMBER_GROUP).unwrap();
+        store.read_mark(gone, channel).unwrap();
+        store.read_mark(other, channel).unwrap();
+        let theirs = store.add_message(channel, "gone", "gone", "bye", 2).unwrap();
+        let mine = store.add_message(channel, "other", "other", "hi @gone", 3).unwrap();
+        store.set_mentions(mine, &["gone".to_owned()]).unwrap();
+        store.insert_file("attached", "gone", "a", "x", 1, None, 2).unwrap();
+        store.attach_file("attached", theirs).unwrap();
+        store.insert_file("pending", "gone", "p", "x", 1, None, 2).unwrap();
+        store.insert_file("other-file", "other", "o", "x", 1, None, 2).unwrap();
+
+        // Without deleting messages: the record, its pending upload and mentions go.
+        let kept = store.remove_member(gone, "gone", false).unwrap();
+        assert!(kept.messages.is_empty());
+        assert_eq!(kept.files, vec!["pending".to_owned()]);
+        assert!(store.user_by_uid("gone").unwrap().is_none());
+        assert!(store.message(mine).unwrap().unwrap().mentions.is_empty());
+        assert!(store.message(theirs).unwrap().is_some());
+        assert!(store.file("attached").unwrap().is_some());
+        let marks: i64 = store.db.query_row("SELECT COUNT(*) FROM read_marks", [], |r| r.get(0)).unwrap();
+        let groups: i64 =
+            store.db.query_row("SELECT COUNT(*) FROM user_groups WHERE user_id=?1", [gone], |r| r.get(0)).unwrap();
+        assert_eq!((marks, groups), (1, 0));
+
+        // With: their messages and files too, and nobody else's.
+        let removal = store.remove_member(store.touch_user("gone", "k", "gone", 4).unwrap().id, "gone", true).unwrap();
+        assert_eq!(removal.messages, vec![(theirs, channel)]);
+        assert_eq!(removal.files, vec!["attached".to_owned()]);
+        assert!(store.message(theirs).unwrap().is_none() && store.message(mine).unwrap().is_some());
+        assert!(store.file("other-file").unwrap().is_some());
     }
 }
