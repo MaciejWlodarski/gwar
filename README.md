@@ -57,6 +57,22 @@ use.
 Gwar is early software: it works and is tested end to end, but expect rough
 edges and breaking changes.
 
+## Download
+
+Prebuilt apps are on the [GitHub Releases page](https://github.com/MaciejWlodarski/gwar/releases):
+
+- **Desktop app:** macOS (universal `.dmg`), Windows (`.exe` or `.msi`) and
+  Linux (`.AppImage` or `.deb`). Builds may be unsigned: macOS and Windows then
+  warn at the first start, and [docs/releasing.md](docs/releasing.md) shows how
+  to open them anyway.
+- **Server:** `vc-server` and `gwar-connect` for Linux x86-64 and ARM64
+  (`gwar-server-*.tar.gz`), so you do not need Rust to run your own. Unpack and
+  continue with "Run a server" below, using `./vc-server` instead of
+  `./target/release/vc-server`.
+
+`SHA256SUMS` on each release lists the checksum of every file. Maintainers: see
+[docs/releasing.md](docs/releasing.md) for how a release is made.
+
 ## Run a server
 
 You run only the server; people connect with the official web app or the
