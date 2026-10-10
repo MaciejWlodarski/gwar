@@ -6,6 +6,8 @@
 import { create } from "zustand";
 import { ConnectApiError, connectApi, type DeviceInfo } from "../connect/api";
 import * as flows from "../connect/account";
+import { changeProfileNickname, refreshProfile, syncProfileAfterUnlock } from "../connect/profile";
+import { validNickname } from "../net/nickname";
 import { deviceName } from "../connect/device-name";
 import { certificateWarning } from "../connect/expiry";
 import { changeIdentities, refreshFromVault, syncAfterUnlock, tsBridge } from "../connect/teamspeak";
@@ -90,8 +92,22 @@ function syncTeamspeak(record: ConnectRecord): void {
     .finally(bumpTs);
 }
 
+/** Adopt or seed the profile before replacing the identity; offline sign-in keeps a cached nickname. */
+async function syncedProfile(record: ConnectRecord): Promise<ConnectRecord> {
+  const cached = await loadConnectRecord();
+  const local = record.nickname ?? (cached?.accountKey === record.accountKey ? cached.nickname : undefined) ?? (await loadOrCreateIdentity()).nickname;
+  let nickname = local;
+  try {
+    nickname = await syncProfileAfterUnlock(connectApi, record, local);
+  } catch (e) {
+    console.warn("account profile sync failed", e);
+  }
+  return { ...record, nickname };
+}
+
 /** Signs this device in with a finished record: stores it and makes it the identity. */
 async function activate(record: ConnectRecord): Promise<void> {
+  record = await syncedProfile(record);
   await indexedDbConnectStore.save(record);
   await controller.switchIdentity(await identityFromConnect(record));
   useAccount.setState({ account: summarize(record), pending: null, loaded: true, certChecked: true });
@@ -109,6 +125,7 @@ async function applyRecord(record: ConnectRecord): Promise<void> {
 }
 
 async function refresh(record: ConnectRecord): Promise<void> {
+  record = await syncedProfile(record);
   await indexedDbConnectStore.save(record);
   syncTeamspeak(record);
   await applyRecord(record);
@@ -151,10 +168,44 @@ function checkCertificate(record: ConnectRecord): void {
 }
 
 export const accountActions = {
+  /** Saves to the vault first when signed in, then replaces the cached identity without reconnecting. */
+  async changeNickname(value: string): Promise<void> {
+    const nickname = validNickname(value);
+    if (!nickname) throw new Error(tNow("nickname.invalid"));
+    const record = await loadConnectRecord();
+    if (record) {
+      const saved = await changeProfileNickname(connectApi, record, nickname);
+      const latest = await current();
+      if (latest.accountKey !== record.accountKey) return;
+      const next = { ...latest, nickname: saved };
+      await indexedDbConnectStore.save(next);
+      await applyRecord(next);
+    } else {
+      const identity = await loadOrCreateIdentity();
+      const backup = { ...identity.exportBackup(), nickname };
+      await indexedDbIdentityStore.save(backup);
+      await controller.replaceIdentityQuietly(await loadOrCreateIdentity());
+    }
+  },
+
   /** Reads the stored sign-in (call once at startup). */
   async load(): Promise<void> {
+    await controller.getIdentity().catch((e: unknown) => console.warn("identity load skipped", e));
     const record = await loadConnectRecord();
     useAccount.setState({ account: record ? summarize(record) : null, loaded: true, certChecked: !record?.token });
+    if (record?.vaultKey) {
+      refreshProfile(connectApi, record)
+        .then(async (nickname) => {
+          if (!nickname) return;
+          const latest = await loadConnectRecord();
+          // Do not apply a delayed refresh to another account or over a local edit.
+          if (!latest || latest.accountKey !== record.accountKey || latest.nickname !== record.nickname) return;
+          const next = { ...latest, nickname };
+          await indexedDbConnectStore.save(next);
+          await applyRecord(next);
+        })
+        .catch((e: unknown) => console.warn("account profile refresh skipped", e));
+    }
     if (record?.token) checkCertificate(record);
     else warnAboutExpiry();
     // Pick up an identity another desktop put in the vault. Never waited for: starting must not depend on the network.

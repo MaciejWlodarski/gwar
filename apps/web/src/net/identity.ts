@@ -15,8 +15,10 @@
 import type { DeviceCertificate } from "../proto/DeviceCertificate";
 import { decodeBase64Url, encodeBase64Url } from "./base64url";
 import { kvDelete, kvGet, kvSet } from "./kv";
+import { defaultNickname, legacyNickname, validNickname } from "./nickname";
 
 export interface Identity {
+  readonly nickname: string;
   /**
    * Base64url (no padding) raw 32-byte Ed25519 public key: the one that signs
    * the challenge. For a Gwar Connect identity this is the *device* key.
@@ -37,6 +39,8 @@ export interface IdentityBackup {
   format: "vc-identity";
   version: 1;
   jwk: JsonWebKey;
+  /** Missing only in backups saved before identity nicknames. */
+  nickname?: string;
 }
 
 export interface IdentityStore {
@@ -61,6 +65,8 @@ export const indexedDbIdentityStore: IdentityStore = {
 export interface ConnectRecord {
   version: 1;
   handle: string;
+  /** Cached account profile; the encrypted vault is authoritative. */
+  nickname?: string;
   /** Account public key (the uid is derived from it). */
   accountKey: string;
   deviceName: string;
@@ -150,6 +156,7 @@ async function fromBackup(backup: IdentityBackup, device?: DeviceCertificate): P
   const publicKey = backup.jwk.x as string;
   return {
     publicKey,
+    nickname: validNickname(backup.nickname) ?? defaultNickname(),
     device,
     async sign(message) {
       const sig = await subtle.sign(ALGORITHM, key, message as BufferSource);
@@ -166,7 +173,7 @@ async function fromBackup(backup: IdentityBackup, device?: DeviceCertificate): P
 /** The identity of a device signed in to Gwar Connect. */
 export function identityFromConnect(record: ConnectRecord): Promise<Identity> {
   const { kty, crv, x, d } = record.deviceJwk;
-  return fromBackup({ format: "vc-identity", version: 1, jwk: { kty, crv, x, d } }, record.certificate);
+  return fromBackup({ format: "vc-identity", version: 1, jwk: { kty, crv, x, d }, nickname: record.nickname }, record.certificate);
 }
 
 /** The key the uid comes from: the account key when signed in to Connect, otherwise the identity key itself. */
@@ -184,12 +191,17 @@ export async function generateIdentity(): Promise<Identity> {
     throw new IdentityUnsupportedError();
   }
   const jwk = await subtle.exportKey("jwk", pair.privateKey);
-  return fromBackup({ format: "vc-identity", version: 1, jwk });
+  return fromBackup({ format: "vc-identity", version: 1, jwk, nickname: defaultNickname() });
 }
 
 export async function loadOrCreateIdentity(store: IdentityStore = indexedDbIdentityStore): Promise<Identity> {
   const existing = await store.load();
-  if (existing && isValidBackup(existing)) return fromBackup(existing);
+  if (existing && isValidBackup(existing)) {
+    const nickname = validNickname(existing.nickname) ?? legacyNickname() ?? defaultNickname();
+    const backup = { ...existing, nickname };
+    if (existing.nickname !== nickname) await store.save(backup);
+    return fromBackup(backup);
+  }
   const identity = await generateIdentity();
   await store.save(identity.exportBackup());
   return identity;
@@ -203,8 +215,14 @@ export async function loadActiveIdentity(
   store: IdentityStore = indexedDbIdentityStore,
   connect: ConnectStore = indexedDbConnectStore,
 ): Promise<Identity> {
-  const record = await connect.load().catch(() => undefined);
-  if (record && isValidConnectRecord(record)) return identityFromConnect(record);
+  const record = await loadConnectRecord(connect);
+  if (record) {
+    if (!validNickname(record.nickname)) {
+      record.nickname = (await loadOrCreateIdentity(store)).nickname;
+      await connect.save(record);
+    }
+    return identityFromConnect(record);
+  }
   return loadOrCreateIdentity(store);
 }
 
@@ -225,7 +243,7 @@ export async function importIdentity(text: string, store: IdentityStore = indexe
   if (!isValidBackup(parsed)) throw new Error("invalid identity file");
   // Normalise to exactly the fields we need; drop key_ops etc.
   const { kty, crv, x, d } = parsed.jwk;
-  const backup: IdentityBackup = { format: "vc-identity", version: 1, jwk: { kty, crv, x, d } };
+  const backup: IdentityBackup = { format: "vc-identity", version: 1, jwk: { kty, crv, x, d }, nickname: validNickname(parsed.nickname) ?? legacyNickname() ?? defaultNickname() };
   const identity = await fromBackup(backup);
   // Make sure the public half really belongs to the private half.
   const probe = new TextEncoder().encode("probe");

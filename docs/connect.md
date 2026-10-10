@@ -47,11 +47,11 @@ There is one blob for the password and one for the recovery code.
 ## Vault
 
 Each account has one encrypted **vault**: a JSON object for secrets that have
-to be the same on every device but are not Gwar keys. Today it holds the
-TeamSpeak identities:
+to be the same on every device but are not Gwar keys. It holds the account
+profile and TeamSpeak identities:
 
 ```json
-{"teamspeak": {"identities": [{"uid": "<TeamSpeak uid>", "name": "Main", "identity": "<counter>V<obfuscated key>", "updated_at": 1760000000000}], "default": "<TeamSpeak uid>"}}
+{"profile": {"nickname": "gwar-48213", "updated_at": 1760000000000}, "teamspeak": {"identities": [{"uid": "<TeamSpeak uid>", "name": "Main", "identity": "<counter>V<obfuscated key>", "updated_at": 1760000000000}], "default": "<TeamSpeak uid>"}}
 ```
 
 - `identity` is in the format of the official TeamSpeak client's identity
@@ -83,6 +83,15 @@ TeamSpeak has no notion of devices: every device signed in to the account uses
 the same TeamSpeak key. Revoking a device stops it from fetching the vault,
 but a copy it already has stays valid on TeamSpeak servers; replace the
 TeamSpeak identity if that matters.
+
+The `profile` section holds the account identity's global `nickname` (trimmed,
+non-empty, at most 32 characters) and `updated_at` (Unix milliseconds). It is
+used when joining a server for the first time; existing members keep their
+server nickname. After unlocking, clients adopt the vault nickname or seed
+an absent profile from this device's local identity nickname. At startup they
+refresh it from the vault. Edits write the encrypted vault first with its
+optimistic version, re-read and retry on `409 conflict`, then update the local
+cache. Writers preserve other profile fields and all other vault sections.
 
 ## Signed statements
 

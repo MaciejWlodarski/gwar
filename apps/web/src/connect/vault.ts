@@ -7,6 +7,7 @@
  * started from; if another device wrote in between (409) they are applied
  * again on top of what is there now.
  */
+import { validNickname } from "../net/nickname";
 import { decodeBase64Url } from "../net/base64url";
 import type { ConnectRecord } from "../net/identity";
 import { ConnectApi, ConnectApiError } from "./api";
@@ -35,7 +36,14 @@ export interface TeamspeakVault {
   [unknown: string]: unknown;
 }
 
+export interface VaultProfile {
+  nickname: string;
+  updated_at: number;
+  [unknown: string]: unknown;
+}
+
 export interface VaultContents {
+  profile?: VaultProfile;
   teamspeak?: TeamspeakVault;
   [unknown: string]: unknown;
 }
@@ -136,4 +144,17 @@ export function withTeamspeakList(contents: VaultContents, list: TsList, now: nu
   if (list.default === null) delete ts.default;
   else ts.default = list.default;
   return { ...contents, teamspeak: ts };
+}
+
+/** A valid profile nickname, if this account has set one. */
+export function vaultNickname(contents: VaultContents): string | undefined {
+  return validNickname(contents.profile?.nickname);
+}
+
+/** Replaces the nickname while preserving other profile fields and vault sections. */
+export function withNickname(contents: VaultContents, nickname: string, now: number = Date.now()): VaultContents {
+  const clean = validNickname(nickname);
+  if (!clean) throw new Error("nickname must contain 1 to 32 characters");
+  if (contents.profile?.nickname === clean) return contents;
+  return { ...contents, profile: { ...contents.profile, nickname: clean, updated_at: now } };
 }

@@ -1,3 +1,4 @@
+import { validNickname } from "../net/nickname";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import type { InputMode } from "../voice/engine";
@@ -16,7 +17,6 @@ export interface Bookmark {
   address: string;
   /** Missing in bookmarks saved before TeamSpeak support: those are `vc`. */
   kind?: ServerKind;
-  nickname: string;
   /** Stored in plain text in localStorage (needed to reconnect). */
   password?: string;
   /** TeamSpeak only: the uid of the identity to connect with. Missing, or no longer in the list: the default one. */
@@ -64,6 +64,7 @@ export interface SettingsState {
   /** Per-user playback volume 0..2 keyed by uid. */
   userVolumes: Record<string, number>;
   bookmarks: Bookmark[];
+  /** Migration source for identities saved before nicknames belonged to them. */
   lastNickname: string;
   lastAddress: string;
   lastKind: ServerKind;
@@ -80,7 +81,7 @@ export interface SettingsState {
   setUserVolume(uid: string, volume: number): void;
   saveBookmark(bookmark: Bookmark): void;
   removeBookmark(id: string): void;
-  setLast(address: string, nickname: string, kind?: ServerKind): void;
+  setLast(address: string, kind?: ServerKind): void;
   setTsDetectAsked(asked: boolean): void;
 }
 
@@ -141,15 +142,22 @@ export const useSettings = create<SettingsState>()(
           return { bookmarks: exists ? s.bookmarks.map((b) => (b.id === bookmark.id ? bookmark : b)) : [...s.bookmarks, bookmark] };
         }),
       removeBookmark: (id) => set((s) => ({ bookmarks: s.bookmarks.filter((b) => b.id !== id) })),
-      setLast: (lastAddress, lastNickname, lastKind = "vc") => set({ lastAddress, lastNickname, lastKind }),
+      setLast: (lastAddress, lastKind = "vc") => set({ lastAddress, lastKind }),
       setTsDetectAsked: (tsDetectAsked) => set({ tsDetectAsked }),
     }),
     {
       name: "vc.settings",
       version: 1,
+      // Persist the cleaned bookmark shape while retaining the legacy migration source.
+      onRehydrateStorage: () => (state) => {
+        if (state) queueMicrotask(() => state.setLast(state.lastAddress, state.lastKind));
+      },
       merge: (persisted, current) => {
         const p = (persisted ?? {}) as Partial<SettingsState>;
-        return { ...current, ...p, audio: { ...current.audio, ...(p.audio ?? {}) }, desktop: { ...current.desktop, ...(p.desktop ?? {}) },
+        const legacy = p.bookmarks as Array<Bookmark & { nickname?: string }> | undefined;
+        const lastNickname = validNickname(p.lastNickname) ?? legacy?.map((b) => validNickname(b.nickname)).find(Boolean) ?? "";
+        const bookmarks = legacy?.map(({ nickname: _nickname, ...bookmark }) => bookmark) ?? current.bookmarks;
+        return { ...current, ...p, lastNickname, bookmarks, audio: { ...current.audio, ...(p.audio ?? {}) }, desktop: { ...current.desktop, ...(p.desktop ?? {}) },
           notifications: { ...current.notifications, ...(p.notifications ?? {}) },
         };
       },
