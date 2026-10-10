@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use tsclientlib::{
     ChannelId as TsChannelId, Connection, DisconnectOptions, Identity, MessageTarget, OutCommandExt, StreamItem,
-    events::Event as BookEvent,
+    TsError, events::Event as BookEvent,
 };
 use tsproto_packets::packets::{AudioData, CodecType, Direction, Flags, OutAudio, OutCommand, PacketType};
 use vc_proto::SessionId;
@@ -212,14 +212,14 @@ async fn connect(server: SocketAddr, spec: &PuppetSpec, nickname: String) -> Res
     if let Some(away) = &spec.away {
         builder = builder.away(away.clone());
     }
-    let mut con = builder.connect().map_err(|e| anyhow!("{e}"))?;
+    let mut con = builder.connect()?;
     tokio::time::timeout(CONNECT_TIMEOUT, async {
         let mut events = con.events();
         while let Some(item) = events.next().await {
             match item {
                 Ok(StreamItem::BookEvents(_)) => return Ok(()),
                 Ok(_) => {}
-                Err(e) => return Err(anyhow!("{e}")),
+                Err(e) => return Err(e.into()),
             }
         }
         Err(anyhow!("connection closed"))
@@ -239,13 +239,18 @@ async fn run(
     mut uplink: mpsc::Receiver<AudioPacket>,
 ) -> Result<()> {
     tokio::time::sleep(spec.delay).await;
-    // TeamSpeak refuses a nickname that is already taken; try a few variants.
-    let mut attempt = 0;
+    // A virtual server has at most u16::MAX clients, so this many variants suffice.
+    let mut variant = 1;
     let mut con = loop {
-        let nickname = if attempt == 0 { spec.nickname.clone() } else { format!("{} ({attempt})", spec.nickname) };
+        let nickname = nickname_variant(&spec.nickname, variant);
         match connect(server, &spec, nickname).await {
             Ok(con) => break con,
-            Err(e) if attempt < 3 && e.to_string().to_ascii_lowercase().contains("nickname") => attempt += 1,
+            Err(e)
+                if variant <= u32::from(u16::MAX)
+                    && e.downcast_ref::<tsclientlib::Error>().is_some_and(nickname_taken) =>
+            {
+                variant += 1
+            }
             Err(e) => return Err(e),
         }
     };
@@ -256,7 +261,8 @@ async fn run(
     shared.plane.uplinks.register(spec.session, uplink_tx);
     let mut packet_id: u16 = 0;
     // Commands awaiting TeamSpeak's answer, to name the one that failed.
-    let mut pending: HashMap<tsclientlib::MessageHandle, String> = HashMap::new();
+    let mut pending: HashMap<tsclientlib::MessageHandle, Pending> = HashMap::new();
+    let mut nickname_generation = 0;
     enum Step {
         Uplink(AudioPacket),
         Item(Option<Result<StreamItem, tsclientlib::Error>>),
@@ -309,12 +315,23 @@ async fn run(
                     }
                 }
                 StreamItem::MessageResult(handle, result) => {
-                    let command = pending.remove(&handle).unwrap_or_default();
-                    match result {
-                        // E.g. a move into the channel the puppet is already in.
-                        Err(e) if format!("{e:?}").contains("AlreadyIn") => {}
-                        Err(e) => warn!(session = spec.session, %command, "puppet command failed: {e}"),
-                        Ok(()) => {}
+                    match pending.remove(&handle) {
+                        Some(Pending::Nickname { base, variant, generation }) if generation == nickname_generation => {
+                            match result {
+                                Err(e) if e.error == TsError::ClientNicknameInuse && variant <= u32::from(u16::MAX) => {
+                                    queue_nickname(&mut con, &mut pending, base, variant + 1, generation)?;
+                                }
+                                Err(e) => warn!(session = spec.session, "puppet nickname failed: {e}"),
+                                Ok(()) => {}
+                            }
+                        }
+                        Some(Pending::Command(command)) => match result {
+                            // E.g. a move into the channel the puppet is already in.
+                            Err(e) if format!("{e:?}").contains("AlreadyIn") => {}
+                            Err(e) => warn!(session = spec.session, %command, "puppet command failed: {e}"),
+                            Ok(()) => {}
+                        },
+                        _ => {}
                     }
                 }
                 // Reconnecting would change our client id; let the bridge start over.
@@ -329,15 +346,54 @@ async fn run(
             }
             Step::Cmd(Some(cmd)) => {
                 debug!(session = spec.session, ?cmd, "puppet command");
+                if let PuppetCmd::Nickname(base) = cmd {
+                    nickname_generation += 1;
+                    queue_nickname(&mut con, &mut pending, base, 1, nickname_generation)?;
+                    continue;
+                }
                 let label = format!("{cmd:?}").split([' ', '(']).next().unwrap_or_default().to_owned();
                 if let Some(command) = command_for(clid, cmd)
                     && let Ok(handle) = command.send_with_result(&mut con)
                 {
-                    pending.insert(handle, label);
+                    pending.insert(handle, Pending::Command(label));
                 }
             }
         }
     }
+}
+
+enum Pending {
+    Command(String),
+    Nickname { base: String, variant: u32, generation: u64 },
+}
+
+fn nickname_taken(error: &tsclientlib::Error) -> bool {
+    match error {
+        tsclientlib::Error::ConnectTs(e) => *e == TsError::ClientNicknameInuse,
+        tsclientlib::Error::CommandError(e) => e.error == TsError::ClientNicknameInuse,
+        tsclientlib::Error::ConnectFailed { errors, .. } => errors.iter().any(nickname_taken),
+        _ => false,
+    }
+}
+
+fn nickname_variant(base: &str, variant: u32) -> String {
+    let suffix = if variant == 1 { String::new() } else { format!(" ({variant})") };
+    let mut nickname: String = base.chars().take(30 - suffix.len()).collect();
+    nickname.push_str(&suffix);
+    nickname
+}
+
+fn queue_nickname(
+    con: &mut Connection,
+    pending: &mut HashMap<tsclientlib::MessageHandle, Pending>,
+    base: String,
+    variant: u32,
+    generation: u64,
+) -> Result<()> {
+    let nickname = nickname_variant(&base, variant);
+    let handle = command("clientupdate", &[("client_nickname", nickname)]).send_with_result(con)?;
+    pending.insert(handle, Pending::Nickname { base, variant, generation });
+    Ok(())
 }
 
 fn command_for(clid: u16, cmd: PuppetCmd) -> Option<OutCommand> {
@@ -370,4 +426,30 @@ fn command(name: &str, args: &[(&str, String)]) -> OutCommand {
         command.write_arg(key, value);
     }
     command
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nickname_variants_start_at_two_and_fit_the_limit() {
+        assert_eq!(nickname_variant("alice", 1), "alice");
+        assert_eq!(nickname_variant("alice", 2), "alice (2)");
+        assert_eq!(nickname_variant("alice", 3), "alice (3)");
+        let long = "é".repeat(32);
+        for variant in [1, 2, 12, 65536] {
+            let name = nickname_variant(&long, variant);
+            assert_eq!(name.chars().count(), 30);
+            if variant > 1 {
+                assert!(name.ends_with(&format!(" ({variant})")));
+            }
+        }
+    }
+
+    #[test]
+    fn only_name_collisions_are_retried() {
+        assert!(nickname_taken(&tsclientlib::Error::ConnectTs(TsError::ClientNicknameInuse)));
+        assert!(!nickname_taken(&tsclientlib::Error::ConnectionGone));
+    }
 }

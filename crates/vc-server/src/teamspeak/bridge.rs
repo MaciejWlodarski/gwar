@@ -714,7 +714,7 @@ impl<'a> Bridge<'a> {
         let spec = PuppetSpec {
             session,
             generation: local.generation,
-            nickname: c.nickname.chars().take(30).collect(),
+            nickname: c.nickname.clone(),
             identity,
             channel: c.channel.and_then(|c| self.map.ts(c)).unwrap_or(0),
             muted: c.muted,
@@ -786,7 +786,7 @@ impl<'a> Bridge<'a> {
             puppet.send(PuppetCmd::Flags { muted: after.muted, deafened: after.deafened });
         }
         if before.nickname != after.nickname {
-            puppet.send(PuppetCmd::Nickname(after.nickname.chars().take(30).collect()));
+            puppet.send(PuppetCmd::Nickname(after.nickname.clone()));
         }
         if before.away != after.away {
             puppet.send(PuppetCmd::Away(after.away.clone()));
