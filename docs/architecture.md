@@ -138,6 +138,19 @@ therefore have different TS suffixes while retaining the same Gwar nickname.
     straight into their puppet; what puppets hear from TeamSpeak users is
     published to the SFU as the remote session's voice (the first copy of a
     frame wins). No buffering, no transcoding.
+  - channel chat from TeamSpeak uses a dedicated ServerQuery listener in
+    every bridged channel occupied by a remote TeamSpeak user (`listeners.rs`).
+    Each logs in as `serveradmin`, selects virtual server 1, moves into its
+    channel and subscribes to `textchannel`. The pool follows remote joins,
+    moves and leaves, releases empty channels, and retries failed connections
+    every five seconds with a warning. It is capped at 128 occupied channels
+    (overflow warns); query clients use no voice slots. Messages retain their
+    decoded text and are attributed to the remote user's Gwar session in the
+    listener's mapped channel. Puppets relay only private messages and pokes,
+    so channel text has exactly one source, including repeated identical text.
+    Our own puppets and query clients are excluded from remote sessions to
+    prevent echoes. Server chat uses the main query's `textserver` subscription;
+    Gwar channel chat uses a puppet or the separate, movable posting query.
 - **Our client on TeamSpeak servers.** `vc-client::teamspeak` (tsclientlib)
   presents a TeamSpeak server as `vc/2` (Welcome + events), so the UI has no
   TeamSpeak-specific code; voice goes straight to the native engine.

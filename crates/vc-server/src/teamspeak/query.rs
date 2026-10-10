@@ -3,7 +3,7 @@
 //! One task owns the socket and serializes commands; `notify*` lines are routed to a separate channel and never
 //! mistaken for a reply, even when they arrive between a command and its `error` line.
 
-use std::{collections::BTreeMap, net::SocketAddr, time::Duration};
+use std::{collections::BTreeMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use tokio::{
@@ -13,6 +13,7 @@ use tokio::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
     },
     sync::{mpsc, oneshot},
+    task::JoinHandle,
     time::{Instant, interval_at, sleep, timeout},
 };
 
@@ -189,14 +190,36 @@ struct Request {
     reply: Option<Reply>,
 }
 
+struct Lines {
+    rx: mpsc::Receiver<String>,
+    task: JoinHandle<()>,
+}
+
+impl Drop for Lines {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+struct Connection {
+    tx: mpsc::Sender<Request>,
+    task: JoinHandle<()>,
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 #[derive(Clone)]
 pub struct Query {
-    tx: mpsc::Sender<Request>,
+    connection: Arc<Connection>,
 }
 
 impl Query {
     /// Connect, log in and select virtual server `server_id`. The notification receiver closes when the connection
-    /// dies.
+    /// dies. Dropping the last query handle closes the socket and its reader task.
     pub async fn connect(
         addr: SocketAddr,
         login: &str,
@@ -210,11 +233,11 @@ impl Query {
         stream.set_nodelay(true).ok();
         let (read, write) = stream.into_split();
         let (line_tx, line_rx) = mpsc::channel(256);
-        tokio::spawn(read_lines(read, line_tx));
-        let mut line_rx = line_rx;
+        let task = tokio::spawn(read_lines(read, line_tx));
+        let mut lines = Lines { rx: line_rx, task };
         // Banner: "TS3" plus a welcome line.
         for expected in 0..2 {
-            let line = timeout(Duration::from_secs(10), line_rx.recv())
+            let line = timeout(Duration::from_secs(10), lines.rx.recv())
                 .await
                 .context("timed out waiting for the query banner")?
                 .context("connection closed before the banner")?;
@@ -224,14 +247,33 @@ impl Query {
         }
         let (tx, rx) = mpsc::channel(32);
         let (notify_tx, notify_rx) = mpsc::channel(NOTIFICATION_BACKLOG);
-        tokio::spawn(run(write, line_rx, rx, notify_tx));
-        let query = Query { tx };
+        let task = tokio::spawn(run(write, lines, rx, notify_tx));
+        let query = Query { connection: Arc::new(Connection { tx, task }) };
         query
             .call(Cmd::new("login").arg("client_login_name", login).arg("client_login_password", password))
             .await
             .context("query login")?;
         query.call(Cmd::new("use").arg("sid", server_id)).await.context("select virtual server")?;
         Ok((query, notify_rx))
+    }
+
+    /// A dedicated query client stays in `cid` to hear that channel's text.
+    pub(super) async fn listen_channel(
+        addr: SocketAddr,
+        password: &str,
+        cid: u64,
+    ) -> Result<(Query, mpsc::Receiver<Notification>)> {
+        let (query, notes) = Self::connect(addr, "serveradmin", password, 1).await?;
+        query.call(Cmd::new("clientupdate").arg("client_nickname", format!("Gwar chat {cid}"))).await?;
+        let me = query.call(Cmd::new("whoami")).await?;
+        let clid = me.first().and_then(|r| r.get("client_id")).context("whoami returned no client id")?;
+        if let Err(e) = query.call(Cmd::new("clientmove").arg("clid", clid).arg("cid", cid)).await
+            && e.downcast_ref::<QueryError>().map(|e| e.id) != Some(770)
+        {
+            return Err(e.context("move channel listener"));
+        }
+        query.call(Cmd::new("servernotifyregister").arg("event", "textchannel")).await?;
+        Ok((query, notes))
     }
 
     /// Run a command. A non-zero error id comes back as a [`QueryError`] inside the `anyhow::Error`.
@@ -252,7 +294,8 @@ impl Query {
 
     async fn send(&self, line: &str) -> Result<Vec<Record>> {
         let (reply, rx) = oneshot::channel();
-        self.tx
+        self.connection
+            .tx
             .send(Request { line: line.to_owned(), reply: Some(reply) })
             .await
             .map_err(|_| anyhow::anyhow!("query connection closed"))?;
@@ -285,7 +328,7 @@ async fn read_lines(read: OwnedReadHalf, tx: mpsc::Sender<String>) {
 /// The connection task: sends one request at a time and demultiplexes server lines.
 async fn run(
     mut write: OwnedWriteHalf,
-    mut lines: mpsc::Receiver<String>,
+    mut lines: Lines,
     mut requests: mpsc::Receiver<Request>,
     notifications: mpsc::Sender<Notification>,
 ) {
@@ -293,7 +336,7 @@ async fn run(
     let mut current: Option<(Option<Reply>, Vec<Record>)> = None;
     loop {
         tokio::select! {
-            line = lines.recv() => {
+            line = lines.rx.recv() => {
                 let Some(line) = line else { return };
                 if line.starts_with("notify") {
                     if notifications.try_send(parse_notification(&line)).is_err_and(|e| matches!(e, mpsc::error::TrySendError::Full(_))) {
@@ -329,7 +372,7 @@ async fn run(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -439,6 +482,171 @@ mod tests {
             }
         });
         addr
+    }
+
+    #[derive(Debug, Clone)]
+    enum ChannelInput {
+        Text { cid: u64, mode: u8, invoker: u16, text: String },
+        Disconnect(u64),
+    }
+
+    pub(crate) enum ChannelEvent {
+        Ready { cid: u64, commands: Vec<String> },
+        Closed(u64),
+    }
+
+    pub(crate) struct ChannelServer {
+        pub addr: SocketAddr,
+        input: tokio::sync::broadcast::Sender<ChannelInput>,
+        pub events: mpsc::UnboundedReceiver<ChannelEvent>,
+        task: JoinHandle<()>,
+    }
+
+    impl ChannelServer {
+        pub fn message(&self, cid: u64, mode: u8, invoker: u16, text: &str) {
+            self.input.send(ChannelInput::Text { cid, mode, invoker, text: text.to_owned() }).unwrap();
+        }
+
+        pub fn disconnect(&self, cid: u64) {
+            self.input.send(ChannelInput::Disconnect(cid)).unwrap();
+        }
+
+        pub async fn event(&mut self) -> ChannelEvent {
+            timeout(Duration::from_secs(8), self.events.recv()).await.unwrap().unwrap()
+        }
+    }
+
+    impl Drop for ChannelServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    /// Each fake query client hears text only in its current channel after registration.
+    pub(crate) async fn channel_server() -> ChannelServer {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (input, _) = tokio::sync::broadcast::channel(256);
+        let (events, rx) = mpsc::unbounded_channel();
+        let server_input = input.clone();
+        let task = tokio::spawn(async move {
+            let mut clients = tokio::task::JoinSet::new();
+            let mut clid = 100u16;
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (sock, _) = accepted.unwrap();
+                        clients.spawn(channel_client(sock, clid, server_input.subscribe(), events.clone()));
+                        clid += 1;
+                    }
+                    _ = clients.join_next(), if !clients.is_empty() => {}
+                }
+            }
+        });
+        ChannelServer { addr, input, events: rx, task }
+    }
+
+    async fn channel_client(
+        sock: TcpStream,
+        clid: u16,
+        mut input: tokio::sync::broadcast::Receiver<ChannelInput>,
+        events: mpsc::UnboundedSender<ChannelEvent>,
+    ) {
+        let (read, mut write) = sock.into_split();
+        let mut lines = BufReader::new(read).lines();
+        let mut cid = 1;
+        let mut registered = false;
+        let mut commands = Vec::new();
+        write.write_all(b"TS3\n\rWelcome to the TeamSpeak 3 ServerQuery interface\n\r").await.unwrap();
+        loop {
+            tokio::select! {
+                line = lines.next_line() => {
+                    let Ok(Some(line)) = line else { break };
+                    let (name, args) = line.split_once(' ').unwrap_or((&line, ""));
+                    let args = parse_records(args).remove(0);
+                    let mut reply = String::new();
+                    let mut error = 0;
+                    match name {
+                        "login" => {
+                            assert_eq!(args["client_login_name"], "serveradmin");
+                            assert_eq!(args["client_login_password"], "p ss");
+                        }
+                        "use" => assert_eq!(args["sid"], "1"),
+                        "clientupdate" => assert!(args["client_nickname"].starts_with("Gwar chat ")),
+                        "whoami" => reply = format!("client_id={clid} client_channel_id={cid}\n\r"),
+                        "clientmove" => {
+                            assert_eq!(args["clid"], clid.to_string());
+                            let next = args["cid"].parse().unwrap();
+                            if cid == next { error = 770; }
+                            cid = next;
+                        }
+                        "servernotifyregister" => {
+                            assert_eq!(args["event"], "textchannel");
+                            registered = true;
+                        }
+                        other => panic!("unexpected command {other}"),
+                    }
+                    commands.push(line);
+                    if registered && commands.last().unwrap().starts_with("servernotifyregister") {
+                        let _ = events.send(ChannelEvent::Ready { cid, commands: commands.clone() });
+                    }
+                    reply.push_str(&format!("error id={error} msg=ok\n\r"));
+                    if write.write_all(reply.as_bytes()).await.is_err() { break; }
+                }
+                message = input.recv() => match message {
+                    Ok(ChannelInput::Text { cid: channel, mode, invoker, text }) if registered && channel == cid => {
+                        let line = format!("notifytextmessage targetmode={mode} invokerid={invoker} msg={}\n\r", escape(&text));
+                        if write.write_all(line.as_bytes()).await.is_err() { break; }
+                    }
+                    Ok(ChannelInput::Disconnect(channel)) if channel == cid => break,
+                    Ok(_) => {},
+                    Err(_) => break,
+                },
+            }
+        }
+        let _ = events.send(ChannelEvent::Closed(cid));
+    }
+
+    #[tokio::test]
+    async fn channel_listener_setup_and_text() {
+        let mut server = channel_server().await;
+        let (query, mut notes) = Query::listen_channel(server.addr, "p ss", 42).await.unwrap();
+        let ChannelEvent::Ready { cid, commands } = server.event().await else { panic!("listener not ready") };
+        assert_eq!(cid, 42);
+        assert_eq!(
+            commands,
+            [
+                "login client_login_name=serveradmin client_login_password=p\\sss",
+                "use sid=1",
+                "clientupdate client_nickname=Gwar\\schat\\s42",
+                "whoami",
+                "clientmove clid=100 cid=42",
+                "servernotifyregister event=textchannel",
+            ]
+        );
+        server.message(99, 2, 7, "another channel");
+        server.message(42, 2, 7, "[b]Hi[/b] | / \\\n日本");
+        let note = timeout(Duration::from_secs(3), notes.recv()).await.unwrap().unwrap();
+        assert_eq!(note.name, "notifytextmessage");
+        assert_eq!(note.records[0]["invokerid"], "7");
+        assert_eq!(note.records[0]["msg"], "[b]Hi[/b] | / \\\n日本");
+        assert!(notes.try_recv().is_err());
+        drop(query);
+        assert!(matches!(server.event().await, ChannelEvent::Closed(42)));
+        assert!(notes.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn listener_can_start_in_default_channel_and_query_clones_keep_socket_alive() {
+        let mut server = channel_server().await;
+        let (query, notes) = Query::listen_channel(server.addr, "p ss", 1).await.unwrap();
+        assert!(matches!(server.event().await, ChannelEvent::Ready { cid: 1, .. }));
+        let clone = query.clone();
+        drop(query);
+        drop(notes);
+        assert_eq!(clone.call(Cmd::new("whoami")).await.unwrap()[0]["client_id"], "100");
+        drop(clone);
+        assert!(matches!(server.event().await, ChannelEvent::Closed(1)));
     }
 
     async fn interleaving(eol: &'static str) {

@@ -6,9 +6,10 @@
 //!   channel, mute flags, chat), learned from ServerQuery notifications.
 //! * Every user of ours gets a puppet connection (see [`super::puppet`]) that
 //!   carries their voice and chat to TeamSpeak and hears TeamSpeak users.
+//! * Dedicated query listeners hear channel chat even when no puppet is there.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
@@ -27,6 +28,7 @@ use vc_proto::{
 use super::{
     channels::{self, ChannelMap, TsChannel},
     install,
+    listeners::{self, ChannelListeners},
     process::{ProcessConfig, TsProcess},
     puppet::{self, PuppetCmd, PuppetEvent, PuppetHandle, PuppetSpec, Shared},
     query::{Cmd, Query, QueryError, Record},
@@ -237,8 +239,7 @@ struct Bridge<'a> {
     puppet_clids: HashMap<u16, SessionId>,
     puppet_events: mpsc::Sender<PuppetEvent>,
     puppet_group: Option<u64>,
-    /// Channel messages already relayed: every puppet in the channel reports them.
-    relayed: VecDeque<(u16, u64, Instant)>,
+    listeners: ChannelListeners,
     /// Last description written per TeamSpeak channel (who is here without a puppet).
     descriptions: HashMap<u64, String>,
     /// Our own ServerQuery client id, once looked up.
@@ -256,6 +257,7 @@ impl<'a> Bridge<'a> {
         let (query, mut notifications) =
             Query::connect(link.query, "serveradmin", &link.password, 1).await.context("connect ServerQuery")?;
         let (puppet_events, mut puppet_rx) = mpsc::channel(256);
+        let (listener_events, mut listener_rx) = mpsc::channel(256);
         let mut bridge = Bridge {
             query,
             core: core.clone(),
@@ -273,11 +275,11 @@ impl<'a> Bridge<'a> {
             puppet_clids: HashMap::new(),
             puppet_events,
             puppet_group: None,
-            relayed: VecDeque::new(),
+            listeners: ChannelListeners::new(link.query, link.password.clone(), listener_events),
             descriptions: HashMap::new(),
             query_clid: None,
         };
-        let result = bridge.serve(&mut notifications, &mut puppet_rx, ready).await;
+        let result = bridge.serve(&mut notifications, &mut puppet_rx, &mut listener_rx, ready).await;
         // Hand the TeamSpeak users back; the next attach starts from scratch.
         for (clid, remote) in bridge.remotes.drain() {
             bridge.shared.forget(clid);
@@ -290,6 +292,7 @@ impl<'a> Bridge<'a> {
         &mut self,
         notifications: &mut mpsc::Receiver<super::query::Notification>,
         puppet_rx: &mut mpsc::Receiver<PuppetEvent>,
+        listener_rx: &mut mpsc::Receiver<listeners::Text>,
         ready: &watch::Sender<bool>,
     ) -> Result<()> {
         let (tx, mut notes) = mpsc::unbounded_channel();
@@ -324,6 +327,7 @@ impl<'a> Bridge<'a> {
                     None => bail!("ServerQuery connection closed"),
                 },
                 Some(event) = puppet_rx.recv() => self.on_puppet(event).await,
+                Some(text) = listener_rx.recv() => self.on_listener(text).await,
                 _ = sweep.tick() => self.shared.sweep(),
                 _ = poll.tick() => self.poll().await,
             }
@@ -531,6 +535,7 @@ impl<'a> Bridge<'a> {
             warn!(channel, "TeamSpeak channel delete: {e:#}");
         }
         let _ = self.map.save();
+        self.reconcile(Duration::ZERO);
     }
 
     async fn load_remotes(&mut self) -> Result<()> {
@@ -677,9 +682,10 @@ impl<'a> Bridge<'a> {
         if shares_channel || chatting { Presence::Puppet } else { Presence::Listed }
     }
 
-    /// Starts puppets for users who need one now and retires idle ones.
+    /// Keeps listeners in occupied channels and starts or retires puppets.
     /// `stagger` spreads simultaneous starts so the flood guard stays calm.
     fn reconcile(&mut self, stagger: Duration) {
+        self.listeners.reconcile(listener_channels(&self.remotes, &self.map));
         let now = Instant::now();
         let decisions: Vec<_> = self.locals.values().map(|l| (l.client.id, self.presence(l, now))).collect();
         let mut started = 0u32;
@@ -803,6 +809,7 @@ impl<'a> Bridge<'a> {
                 if let Err(e) = self.ensure_channel(&channel, password).await {
                     warn!(channel = channel.id, "TeamSpeak channel sync: {e:#}");
                 }
+                self.reconcile(Duration::ZERO);
             }
             BridgeNote::Event(event) => self.on_event(event).await,
             BridgeNote::Unban { uid } => self.unban(&uid).await,
@@ -843,6 +850,7 @@ impl<'a> Bridge<'a> {
                     // Our side already removed the session; make TeamSpeak follow.
                     self.remotes.remove(&clid);
                     self.shared.forget(clid);
+                    self.reconcile(Duration::ZERO);
                     let cmd = match &reason {
                         LeaveReason::Banned { reason, until, .. } => {
                             // TeamSpeak keeps the ban itself (0 = permanent).
@@ -919,7 +927,7 @@ impl<'a> Bridge<'a> {
                 ChatTarget::Client(_) => return,
             };
             if let Err(e) = result {
-                debug!("relayed message: {e:#}");
+                warn!("relayed message: {e:#}");
             }
         }
     }
@@ -1044,18 +1052,8 @@ impl<'a> Bridge<'a> {
                 {
                     local.chatting_until = Some(Instant::now() + CHAT_KEEP);
                 }
-                let (author, cid) = (remote.session, remote.cid);
-                let target = match target {
-                    MessageTarget::Channel => {
-                        if !self.first_report(invoker, &text) {
-                            return;
-                        }
-                        ChatTarget::Channel(self.our_channel(cid))
-                    }
-                    MessageTarget::Client(_) | MessageTarget::Poke(_) => ChatTarget::Client(session),
-                    // Server messages arrive through ServerQuery.
-                    MessageTarget::Server => return,
-                };
+                let author = remote.session;
+                let Some(target) = puppet_chat_target(session, target) else { return };
                 self.core.bridge(BridgeMsg::Chat(author, target, text)).await;
             }
             PuppetEvent::Gone { session, generation, error } => {
@@ -1086,19 +1084,38 @@ impl<'a> Bridge<'a> {
         )
     }
 
-    /// Whether this channel message is new (each puppet in the channel reports it).
-    fn first_report(&mut self, invoker: u16, text: &str) -> bool {
-        use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
-        let hash = BuildHasherDefault::<DefaultHasher>::default().hash_one(text);
-        let now = Instant::now();
-        while self.relayed.front().is_some_and(|(_, _, at)| now.duration_since(*at) > Duration::from_secs(2)) {
-            self.relayed.pop_front();
+    async fn on_listener(&mut self, text: listeners::Text) {
+        if self.listeners.accepts(&text)
+            && let Some(message) = channel_chat(&self.remotes, &self.map, text.cid, text.invoker, text.text)
+        {
+            self.core.bridge(message).await;
         }
-        if self.relayed.iter().any(|(i, h, _)| *i == invoker && *h == hash) {
-            return false;
-        }
-        self.relayed.push_back((invoker, hash, now));
-        true
+    }
+}
+
+fn listener_channels(remotes: &HashMap<u16, Remote>, map: &ChannelMap) -> BTreeSet<u64> {
+    remotes.values().filter(|r| map.ours(r.cid).is_some()).map(|r| r.cid).collect()
+}
+
+/// Only remote sessions may author TeamSpeak chat; our puppets and query
+/// clients never enter `remotes`, so our outgoing messages cannot echo back.
+fn channel_chat(
+    remotes: &HashMap<u16, Remote>,
+    map: &ChannelMap,
+    cid: u64,
+    invoker: u16,
+    text: String,
+) -> Option<BridgeMsg> {
+    let remote = remotes.get(&invoker)?;
+    let channel = map.ours(cid)?;
+    Some(BridgeMsg::Chat(remote.session, ChatTarget::Channel(channel), text))
+}
+
+fn puppet_chat_target(session: SessionId, target: MessageTarget) -> Option<ChatTarget> {
+    match target {
+        MessageTarget::Client(_) | MessageTarget::Poke(_) => Some(ChatTarget::Client(session)),
+        // Channel and server messages have one source: their query listener.
+        MessageTarget::Channel | MessageTarget::Server => None,
     }
 }
 
@@ -1207,6 +1224,85 @@ fn ignore_duplicate<T>(result: Result<T>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn remote(session: SessionId, cid: u64) -> Remote {
+        Remote { session, nickname: "TeamSpeak user".into(), cid, muted: false, deafened: false, away: None }
+    }
+
+    #[tokio::test]
+    async fn listener_relays_channel_text_to_remote_author_without_puppet_duplicates() {
+        use crate::teamspeak::query::tests::{ChannelEvent, channel_server};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut map = ChannelMap::load(&dir.path().join("channels.json")).unwrap();
+        map.link(3, 42);
+        let remotes = HashMap::from([(7, remote(123, 42))]);
+        let mut server = channel_server().await;
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut pool = ChannelListeners::new(server.addr, "p ss".into(), tx);
+        pool.reconcile(listener_channels(&remotes, &map));
+        assert!(matches!(server.event().await, ChannelEvent::Ready { cid: 42, .. }));
+        // Identical successive messages are separate messages, not duplicates.
+        for _ in 0..2 {
+            let body = "[b]Hi[/b] | / \\ 日本\nagain";
+            server.message(42, 2, 7, body);
+            let text = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await.unwrap().unwrap();
+            assert!(pool.accepts(&text));
+            let message = channel_chat(&remotes, &map, text.cid, text.invoker, text.text).unwrap();
+            let BridgeMsg::Chat(author, target, text) = message else { panic!("expected channel chat") };
+            assert_eq!(author, 123);
+            assert_eq!(target, ChatTarget::Channel(3));
+            assert_eq!(text, body);
+            assert_eq!(puppet_chat_target(456, MessageTarget::Channel), None);
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn channel_chat_ignores_own_puppet_query_and_unknown_invokers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut map = ChannelMap::load(&dir.path().join("channels.json")).unwrap();
+        map.link(3, 42);
+        let remotes = HashMap::from([(7, remote(123, 42))]);
+        // Puppets (8), the posting query (9) and listeners (100) are not remotes.
+        for invoker in [8, 9, 100, 0] {
+            assert!(channel_chat(&remotes, &map, 42, invoker, "echo".into()).is_none());
+        }
+        assert!(channel_chat(&remotes, &map, 99, 7, "unbridged".into()).is_none());
+        let moved = HashMap::from([(7, remote(123, 55))]);
+        let message = channel_chat(&moved, &map, 42, 7, "sent before moving".into()).unwrap();
+        assert!(matches!(message, BridgeMsg::Chat(123, ChatTarget::Channel(3), _)));
+    }
+
+    #[test]
+    fn listener_channels_follow_remote_membership_and_ignore_unbridged_channels() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut map = ChannelMap::load(&dir.path().join("channels.json")).unwrap();
+        map.link(3, 42);
+        map.link(4, 55);
+        let mut remotes = HashMap::from([(7, remote(123, 42)), (8, remote(124, 42)), (9, remote(125, 99))]);
+        assert_eq!(listener_channels(&remotes, &map), BTreeSet::from([42]));
+        remotes.get_mut(&7).unwrap().cid = 55;
+        assert_eq!(listener_channels(&remotes, &map), BTreeSet::from([42, 55]));
+        remotes.remove(&8);
+        assert_eq!(listener_channels(&remotes, &map), BTreeSet::from([55]));
+        remotes.remove(&7);
+        assert!(listener_channels(&remotes, &map).is_empty());
+    }
+
+    #[test]
+    fn puppets_relay_private_messages_and_pokes_only() {
+        assert_eq!(
+            puppet_chat_target(123, MessageTarget::Client(tsclientlib::ClientId(7))),
+            Some(ChatTarget::Client(123))
+        );
+        assert_eq!(
+            puppet_chat_target(123, MessageTarget::Poke(tsclientlib::ClientId(7))),
+            Some(ChatTarget::Client(123))
+        );
+        assert_eq!(puppet_chat_target(123, MessageTarget::Channel), None);
+        assert_eq!(puppet_chat_target(123, MessageTarget::Server), None);
+    }
 
     #[test]
     fn long_messages_are_split_and_attachments_become_links() {

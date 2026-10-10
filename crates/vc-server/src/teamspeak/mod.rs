@@ -9,6 +9,7 @@
 pub mod bridge;
 pub mod channels;
 pub mod install;
+mod listeners;
 pub mod process;
 pub mod puppet;
 pub mod query;
