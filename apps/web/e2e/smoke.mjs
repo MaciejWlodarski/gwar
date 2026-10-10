@@ -243,10 +243,37 @@ function recordFrames(page) {
   };
 }
 
+/** Set the identity's profile through Settings, before the first join. */
+async function setGlobalNickname(page, nickname, { mobile = false, pl = false } = {}) {
+  const settings = page.getByRole("button", { name: pl ? "Ustawienia" : "Settings", exact: true }).first();
+  if (!(await settings.isVisible())) await page.getByRole("button", { name: pl ? "Serwery" : "Servers", exact: true }).click();
+  await settings.click();
+  await page.getByRole("tab", { name: pl ? "Tożsamość" : "Identity", exact: true }).click();
+  const field = page.getByLabel(pl ? "Pseudonim" : "Nickname", { exact: true });
+  await waitFor(async () => (await field.inputValue()) !== "", "identity nickname", 10000);
+  await field.fill(nickname);
+  const save = page.getByRole("dialog").getByRole("button", { name: pl ? "Zapisz" : "Save", exact: true }).first();
+  await save.click();
+  await waitFor(() => save.isEnabled(), "saved identity nickname", 15000);
+  await page.getByText(pl ? "Zapisano" : "Saved", { exact: true }).waitFor();
+  await page.keyboard.press("Escape");
+  if (mobile) await page.keyboard.press("Escape");
+}
+
+async function changeServerNickname(page, nickname) {
+  await page.getByRole("button", { name: "Server menu" }).click();
+  await page.getByRole("menuitem", { name: "Change nickname", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Change nickname", exact: true });
+  await dialog.getByLabel("Nickname").fill(nickname);
+  await dialog.getByRole("button", { name: "Save", exact: true }).click();
+  await dialog.waitFor({ state: "detached" });
+}
+
 async function connect(page, nickname, { mobile = false, address = CLIENT_ADDR } = {}) {
   await page.goto(WEB_URL);
   await page.getByLabel("Server address").fill(address);
-  await page.getByLabel("Nickname").fill(nickname);
+  await setGlobalNickname(page, nickname, { mobile });
+  if (await page.getByLabel("Nickname").count()) throw new Error("connect screen still asks for a nickname");
   await page.getByRole("button", { name: "Connect", exact: true }).click();
   // After connecting you are on the server, not in voice. On phones the voice panel lives in the drawer.
   if (mobile) await page.getByRole("button", { name: "Channels and servers" }).waitFor({ timeout: 20000 });
@@ -714,7 +741,7 @@ async function main() {
   await check("Polish UI is the default for pl browsers", async () => {
     await p.goto(WEB_URL);
     await p.getByLabel("Adres serwera").fill(CLIENT_ADDR);
-    await p.getByLabel("Pseudonim").fill("Dorota");
+    await setGlobalNickname(p, "Dorota", { pl: true });
     await p.getByRole("button", { name: "Połącz" }).click();
     await p.getByText("Poza kanałem głosowym").waitFor({ timeout: 20000 });
     await treeItem(p, /Lobby/).dblclick();
@@ -728,7 +755,7 @@ async function main() {
   await check("an English dark client shows the busy server", async () => {
     await e.goto(WEB_URL);
     await e.getByLabel("Server address").fill(CLIENT_ADDR);
-    await e.getByLabel("Nickname").fill("Erin");
+    await setGlobalNickname(e, "Erin");
     await e.getByRole("button", { name: "Connect", exact: true }).click();
     await e.getByText("Not in voice").waitFor({ timeout: 20000 });
     await treeItem(e, /Lobby/).dblclick();
@@ -780,7 +807,7 @@ async function main() {
     const e = await ctx.newPage();
     await e.goto(WEB_URL);
     await e.getByLabel("Server address").fill(CLIENT_ADDR);
-    await e.getByLabel("Nickname").fill("Eve");
+    await setGlobalNickname(e, "Eve");
     await e.getByRole("button", { name: "Connect", exact: true }).click();
     await e.getByText("Not in voice").waitFor({ timeout: 15000 });
     await sleep(500);
@@ -993,7 +1020,7 @@ async function main() {
     if (/invite=/.test(ivy.url())) throw new Error(`the invite stays in the address bar: ${ivy.url()}`);
     await waitFor(async () => (await ivy.getByLabel("Server address").inputValue()) === CLIENT_ADDR, "prefilled server address");
     await shot(ivy, "26-invite-join-dark");
-    await ivy.getByLabel("Nickname").fill("Ivy");
+    await setGlobalNickname(ivy, "Ivy");
     await ivy.getByRole("button", { name: "Connect", exact: true }).click();
     await ivy.getByText("Not in voice").waitFor({ timeout: 20000 });
     await waitFor(async () => (await nameColor(a, memberSection(a, "Online").getByText("Ivy", { exact: true }))) === ROLE_RGB, "Ivy has the invite's role colour");
@@ -1137,7 +1164,7 @@ async function main() {
         const w = await ctx.newPage();
         await w.goto(`http://127.0.0.1:${port}/`);
         await waitFor(async () => (await w.getByLabel("Server address").inputValue()) === `127.0.0.1:${port}`, "prefilled address", 5000);
-        await w.getByLabel("Nickname").fill("Webby");
+        await setGlobalNickname(w, "Webby");
         await w.getByRole("button", { name: "Connect", exact: true }).click();
         await w.getByText("Not in voice").waitFor({ timeout: 20000 });
         await w.getByRole("treeitem", { name: /Lobby/ }).dblclick();
@@ -1177,10 +1204,65 @@ async function main() {
   debugPages.push(d);
   const fd = recordFrames(d);
 
+  await check("member nickname updates history, exposes the tag, and persists across reconnects", async () => {
+    await treeItem(a, TALK).click();
+    await treeItem(b, TALK).click();
+    await composer(b).fill(`before nickname snapshot ${rid}`);
+    await composer(b).press("Enter");
+    await a.getByText(`before nickname snapshot ${rid}`, { exact: true }).waitFor();
+    const message = `nickname snapshot ${rid}`;
+    await composer(a).fill(message);
+    await composer(a).press("Enter");
+    const row = a.locator("[data-message]").filter({ hasText: message });
+    await row.waitFor();
+    await changeServerNickname(a, "Alice renamed");
+    // The old history object is unchanged; the row subscribes to the member by uid.
+    await row.getByRole("button", { name: "Alice renamed", exact: true }).waitFor();
+    await row.getByRole("button", { name: "Alice renamed", exact: true }).click();
+    const profile = a.getByRole("dialog", { name: "Member profile" });
+    await profile.getByText(/^@[a-z2-7]{10,}$/).waitFor();
+    if (!(await profile.getByLabel("Full user ID").inputValue())) throw new Error("profile has no uid");
+    await a.keyboard.press("Escape");
+    await a.getByRole("button", { name: "Server menu" }).click();
+    await a.getByRole("menuitem", { name: "Disconnect" }).click();
+    await setGlobalNickname(a, "Global changed");
+    await a.getByRole("button", { name: "Connect", exact: true }).click();
+    await a.getByText("Not in voice").waitFor();
+    // Hello's global profile must not replace this server's stored nickname.
+    await a.getByRole("button", { name: "Server menu" }).click();
+    await a.getByRole("menuitem", { name: "Change nickname", exact: true }).click();
+    if ((await a.getByRole("dialog").getByLabel("Nickname").inputValue()) !== "Alice renamed") throw new Error("server nickname was not retained");
+    await a.getByRole("dialog").getByLabel("Nickname").fill("Alice");
+    await a.getByRole("dialog").getByRole("button", { name: "Save", exact: true }).click();
+    await a.getByRole("dialog").waitFor({ state: "detached" });
+    await setGlobalNickname(a, "Alice");
+  });
+
+  await check("duplicate nickname mention suggestions send only the selected member uid", async () => {
+    await treeItem(a, TALK).click();
+    const bob = fb.clients().find((client) => client.nickname === "Bob");
+    const carol = await a.evaluate(async () => { const { useSession } = await import("/src/state/stores.ts"); return Object.values(useSession.getState().members).find((member) => member.nickname === "Carol"); });
+    if (!bob || !carol) throw new Error("missing test member uids");
+    await a.evaluate(async ({ uid }) => { const { controller } = await import("/src/state/controller.ts"); await controller.setMemberNickname(uid, "Bob"); }, { uid: carol.uid });
+    await composer(a).pressSequentially("@Bo");
+    const options = a.getByRole("option").filter({ hasText: "Bob" });
+    await waitFor(async () => (await options.count()) === 2, "duplicate nickname suggestions");
+    const tag = await a.evaluate(async ({ uid }) => { const { useSession } = await import("/src/state/stores.ts"); return useSession.getState().members[uid].tag; }, { uid: carol.uid });
+    await options.filter({ hasText: `@${tag}` }).click();
+    const text = `@Bob duplicate mention ${rid}`;
+    await composer(a).pressSequentially(`duplicate mention ${rid}`);
+    await composer(a).press("Enter");
+    await waitFor(() => fa.events("chat.message").some((msg) => msg.text === text && msg.mentions?.length === 1 && msg.mentions[0] === carol.uid), "selected mention uid");
+    await a.evaluate(async ({ uid }) => { const { controller } = await import("/src/state/controller.ts"); await controller.setMemberNickname(uid, "Carol"); }, { uid: carol.uid });
+  });
+
   await check("connect: a new account keeps the local identity and shows the recovery code once", async () => {
     await c.goto(WEB_URL);
     localUid = await settingsUid(c);
     if (!localUid) throw new Error("no local uid");
+    await c.getByLabel("Nickname").fill("Account nickname");
+    await c.getByRole("dialog").getByRole("button", { name: "Save", exact: true }).first().click();
+    await c.getByText("Saved", { exact: true }).waitFor();
     await c.getByRole("tab", { name: "Account" }).click();
     await c.getByRole("button", { name: /Create an account/ }).click();
     await c.getByLabel("Handle").fill(acct);
@@ -1243,6 +1325,7 @@ async function main() {
     await d.getByRole("tab", { name: "Identity" }).click();
     const uid = await readUid(d);
     if (uid !== localUid) throw new Error(`second device uid ${uid} != ${localUid}`);
+    if ((await d.getByLabel("Nickname").inputValue()) !== "Account nickname") throw new Error("second device did not adopt the vault nickname");
     await shot(d, "21-account-identity");
     await d.keyboard.press("Escape");
   });
@@ -1259,6 +1342,7 @@ async function main() {
       return (await loadVault(connectApi, record)).contents;
     });
     if (written.future?.kept !== true) throw new Error("vault lost a field");
+    if (written.profile?.nickname !== "Account nickname") throw new Error("TeamSpeak vault update lost the profile");
     await d.getByRole("button", { name: "Settings" }).first().click();
     await d.getByRole("tab", { name: "Account" }).click();
     const identities = d.getByRole("list", { name: "TeamSpeak identities" });
@@ -1272,6 +1356,13 @@ async function main() {
     const welcomed = fd.frames.map((f) => f.ok).find((ok) => ok?.uid);
     if (!welcomed) throw new Error("no welcome received");
     if (welcomed.uid !== localUid) throw new Error(`server uid ${welcomed.uid} != account uid ${localUid}`);
+    const member = welcomed.members.find((member) => member.uid === localUid);
+    if (member?.connect !== acct) throw new Error("server did not verify the Connect account handle");
+    await d.getByRole("button", { name: "Server menu" }).click();
+    await d.getByRole("menuitem", { name: "Change nickname", exact: true }).click();
+    await d.getByRole("dialog").getByLabel("Nickname").fill("Account on server");
+    await d.getByRole("dialog").getByRole("button", { name: "Save", exact: true }).click();
+    await d.getByRole("dialog").waitFor({ state: "detached" });
   });
 
   await check("connect: the first browser revokes the second device with the password", async () => {
