@@ -4,6 +4,7 @@ import { parseServerAddress, sameOriginUrl, type PageContext } from "./address";
 const http: PageContext = { protocol: "http:", hostname: "localhost", port: "5173" };
 const https: PageContext = { protocol: "https:", hostname: "voice.example.com", port: "" };
 const tauri: PageContext = { protocol: "tauri:", hostname: "localhost", port: "" };
+const windowsApp: PageContext = { protocol: "http:", hostname: "tauri.localhost", port: "" };
 
 const url = (input: string, page: PageContext) => {
   const r = parseServerAddress(input, page);
@@ -46,8 +47,17 @@ describe("parseServerAddress", () => {
     expect(url("voice.example.com", https)).toBe("wss://voice.example.com/ws");
   });
 
-  it("treats non-http pages (tauri) as plain http", () => {
-    expect(url("example.com", tauri)).toBe("ws://example.com:8790/ws");
+  it("the desktop app reaches domain names over wss and local hosts over plain ws", () => {
+    expect(url("voice.example.com", tauri)).toBe("wss://voice.example.com/ws");
+    expect(url("voice.example.com", windowsApp)).toBe("wss://voice.example.com/ws");
+    expect(url("voice.example.com:8790", tauri)).toBe("ws://voice.example.com:8790/ws");
+    expect(url("1.2.3.4", tauri)).toBe("ws://1.2.3.4:8790/ws");
+    expect(url("localhost", tauri)).toBe("ws://localhost:8790/ws");
+    expect(url("::1", tauri)).toBe("ws://[::1]:8790/ws");
+    expect(url("nas", tauri)).toBe("ws://nas:8790/ws");
+    expect(url("pc.local", windowsApp)).toBe("ws://pc.local:8790/ws");
+    expect(url("ws://voice.example.com", tauri)).toBe("ws://voice.example.com/ws");
+    expect(url("https://192.168.1.10", tauri)).toBe("wss://192.168.1.10/ws");
   });
 
   it("honours explicit schemes and maps http(s) to ws(s)", () => {

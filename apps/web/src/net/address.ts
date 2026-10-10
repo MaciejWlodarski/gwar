@@ -6,14 +6,19 @@
  *     map to `ws://`/`wss://`. Anything else (ftp:, javascript: ...) is rejected.
  *  2. No scheme: the connection is `wss` when the page itself is served over
  *     https (browsers block `ws://` from secure pages, "mixed content"),
- *     otherwise `ws`. Pages that are not http(s) at all (Tauri, file:) count
- *     as plain http. The exception is a loopback host (localhost, 127.0.0.1)
+ *     otherwise `ws`. The exception is a loopback host (localhost, 127.0.0.1)
  *     on an https page: browsers allow plain `ws://` there, so a server run
  *     on the same machine stays reachable from the hosted web app.
+ *     The desktop app (a `tauri:` page, or `http://tauri.localhost` on
+ *     Windows) has no mixed-content rule, so it decides by the host: a public
+ *     domain name is `wss` (servers on a domain run TLS, `--domain` or a
+ *     reverse proxy), while an IP address, localhost or a local name
+ *     (no dot, `.local`, `.lan`, `.home.arpa`, `.internal`) is plain `ws`,
+ *     and so is any host on the server's plain default port 8790.
  *  3. Port: an explicit port always wins. A bare host without a port gets the
- *     server default 8790 when the page is plain http (dev / LAN use, where
- *     the server is run directly), and no port (=> 443) when the page is
- *     https, because a TLS deployment sits behind a reverse proxy. The one
+ *     server default 8790 when the connection is plain `ws` (dev / LAN use,
+ *     where the server is run directly), and no port (=> 443) when it is
+ *     `wss`, because a TLS deployment sits behind a reverse proxy. The one
  *     exception is the page's own host: typing the host this page came from
  *     reuses the page's port, so "same server as the web client" just works.
  *  4. Path: empty or `/` becomes `/ws`; any other explicit path is kept.
@@ -55,6 +60,21 @@ export function sameOriginUrl(page: PageContext): string {
   const secure = page.protocol === "https:";
   const host = page.hostname.includes(":") ? `[${page.hostname}]` : page.hostname;
   return `${secure ? "wss" : "ws"}://${host}${page.port ? `:${page.port}` : ""}${DEFAULT_PATH}`;
+}
+
+/** The desktop app's own page rather than a web page served over http(s). */
+function isAppPage(page: PageContext): boolean {
+  return (page.protocol !== "http:" && page.protocol !== "https:") || page.hostname === "tauri.localhost";
+}
+
+const LOCAL_SUFFIXES = [".local", ".lan", ".home.arpa", ".internal", ".localhost"];
+
+/** A host that is reached on the local network: plain `ws` from the desktop app. */
+function isLocalHost(host: string): boolean {
+  if (LOOPBACK.has(host) || host.startsWith("[")) return true;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return true;
+  if (!host.includes(".")) return true;
+  return LOCAL_SUFFIXES.some((suffix) => host.endsWith(suffix));
 }
 
 function isIpv6Bare(text: string): boolean {
@@ -100,13 +120,15 @@ export function parseServerAddress(input: string, page: PageContext): ParseResul
   const pageHost = page.hostname.includes(":") ? `[${page.hostname}]` : page.hostname;
   const isPageHost = host === pageHost.toLowerCase();
   const plainLoopback = pageSecure && LOOPBACK.has(host) && !isPageHost;
-  const secure = (scheme ?? (pageSecure && !plainLoopback ? "wss" : "ws")) === "wss";
+  const appPlain = isLocalHost(host) || port === String(DEFAULT_PORT);
+  const defaultScheme = isAppPage(page) ? (appPlain ? "ws" : "wss") : pageSecure && !plainLoopback ? "wss" : "ws";
+  const secure = (scheme ?? defaultScheme) === "wss";
 
   if (!secure && pageSecure && !LOOPBACK.has(host)) return { ok: false, error: "mixed_content" };
 
   if (!port && !explicitScheme) {
     if (isPageHost && page.port) port = page.port;
-    else if (!pageSecure || plainLoopback) port = String(DEFAULT_PORT);
+    else if (!secure) port = String(DEFAULT_PORT);
   }
 
   if (path === "" || path === "/") path = DEFAULT_PATH;
