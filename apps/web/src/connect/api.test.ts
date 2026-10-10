@@ -36,6 +36,7 @@ describe("ConnectApi", () => {
     const { api, fetchFn } = make(() => reply(200, {}));
     await api.changePassword("t", { salt: "s", m: 1, t: 1, p: 1 }, "a", "b");
     await api.addDevice("t", { device_key: "d", name: "n", issued_at: 1, expires_at: 2, signature: "s" });
+    await api.renewDevices("t", [{ device_key: "d", issued_at: 1, expires_at: 2, signature: "s" }]);
     await api.revokeDevice("t", { device_key: "d", revoked_at: 1, signature: "s" });
     await api.logout("t");
     await api.getVault("t");
@@ -45,12 +46,33 @@ describe("ConnectApi", () => {
     expect(seen).toEqual([
       "PUT /v1/account/password",
       "POST /v1/devices",
+      "POST /v1/devices/renew",
       "POST /v1/devices/revoke",
       "POST /v1/logout",
       "GET /v1/vault",
       "PUT /v1/vault",
       "GET /v1/accounts/%40a%20b",
     ]);
+  });
+
+  it("renews with a list of certificates and reads the count", async () => {
+    const { api, fetchFn } = make(() => reply(200, { renewed: 2 }));
+    const certificates = [
+      { device_key: "a", issued_at: 1, expires_at: 2, signature: "s" },
+      { device_key: "b", issued_at: 1, expires_at: 2, signature: "t" },
+    ];
+    expect(await api.renewDevices("tok", certificates)).toBe(2);
+    const [, init] = fetchFn.mock.calls[0] as unknown as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({ certificates });
+    expect((init.headers as Record<string, string>).Authorization).toBe("Bearer tok");
+  });
+
+  it("lists devices with their newest certificate", async () => {
+    const device = { device_key: "a", name: "n", created_at: 1, last_seen: 2, revoked_at: null, certificate: { issued_at: 1, expires_at: 2, signature: "s" } };
+    const { api } = make(() => reply(200, { devices: [device, { ...device, device_key: "b", certificate: null }] }));
+    const list = await api.devices("tok");
+    expect(list[0]!.certificate).toEqual({ issued_at: 1, expires_at: 2, signature: "s" });
+    expect(list[1]!.certificate).toBeNull();
   });
 
   it("reads and writes the vault with the version it was based on", async () => {

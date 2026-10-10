@@ -151,6 +151,36 @@ describe("handshake", () => {
     await expect(p).rejects.toMatchObject({ kind });
   });
 
+  it.each([
+    ["a certificate that ran out", 2, "invalid identity", "certificate_expired"],
+    ["the server saying so", Date.now() + 1e10, "the device certificate has expired; sign in again", "certificate_expired"],
+    ["another problem with a valid certificate", Date.now() + 1e10, "the device certificate is not signed by the account", "rejected"],
+    ["a revoked device", Date.now() + 1e10, "this device was signed out of its Gwar account", "rejected"],
+  ])("tells an expired device certificate apart from other not_authenticated replies: %s", async (_name, expiresAt, message, kind) => {
+    const device = { account_key: "ACCOUNT", device_key: "PUBKEY", issued_at: 1, expires_at: expiresAt, signature: "CERT" };
+    const conn = make({ identity: { ...fakeIdentity, device } });
+    const p = conn.connect();
+    p.catch(() => {});
+    const s = FakeSocket.last();
+    s.open();
+    s.push(challenge());
+    await vi.waitFor(() => expect(s.sent.length).toBe(1));
+    s.push({ re: 1, err: { code: "not_authenticated", message } });
+    await expect(p).rejects.toMatchObject({ kind });
+  });
+
+  it("a local identity's not_authenticated is never blamed on a certificate", async () => {
+    const conn = make();
+    const p = conn.connect();
+    p.catch(() => {});
+    const s = FakeSocket.last();
+    s.open();
+    s.push(challenge());
+    await vi.waitFor(() => expect(s.sent.length).toBe(1));
+    s.push({ re: 1, err: { code: "not_authenticated", message: "the device certificate has expired" } });
+    await expect(p).rejects.toMatchObject({ kind: "rejected" });
+  });
+
   it("reports unreachable when the socket closes early", async () => {
     const conn = make();
     const p = conn.connect();

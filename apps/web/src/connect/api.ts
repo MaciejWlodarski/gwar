@@ -73,6 +73,8 @@ export interface DeviceInfo {
   created_at: number;
   last_seen: number;
   revoked_at: number | null;
+  /** The newest certificate Connect has for this device; null for a device that never had one. */
+  certificate: { issued_at: number; expires_at: number; signature: string } | null;
 }
 
 export interface Revocation {
@@ -155,6 +157,11 @@ export class ConnectApi {
 
   async addDevice(token: string, device: DeviceCertBody): Promise<void> {
     await this.call("POST", "/devices", device, token);
+  }
+
+  /** New certificates for devices of the account, all signed by the account key. Returns how many were stored. */
+  async renewDevices(token: string, certificates: SignedDevice[]): Promise<number> {
+    return (await this.call<{ renewed: number }>("POST", "/devices/renew", { certificates }, token)).renewed;
   }
 
   async revokeDevice(token: string, revocation: { device_key: string; revoked_at: number; signature: string }): Promise<void> {

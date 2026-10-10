@@ -7,6 +7,7 @@ import { create } from "zustand";
 import { ConnectApiError, connectApi, type DeviceInfo } from "../connect/api";
 import * as flows from "../connect/account";
 import { deviceName } from "../connect/device-name";
+import { certificateWarning } from "../connect/expiry";
 import { changeIdentities, refreshFromVault, syncAfterUnlock, tsBridge } from "../connect/teamspeak";
 import { addEntry, cleanName, DEFAULT_NAME, type TsEntry, type TsList } from "../connect/ts-list";
 import { loadVault, VaultLockedError, vaultList } from "../connect/vault";
@@ -20,6 +21,9 @@ import {
 } from "../net/identity";
 import { isDesktop } from "../platform";
 import { controller } from "./controller";
+import { useSettings } from "./settings";
+import { useUi } from "./stores";
+import { tNow } from "../i18n";
 
 export interface AccountSummary {
   handle: string;
@@ -36,13 +40,18 @@ interface AccountStore {
   /** Becomes true once storage was read. */
   loaded: boolean;
   account: AccountSummary | null;
-  /** Created but not yet confirmed: holds the recovery code so it survives closing the dialog. */
-  pending: { record: ConnectRecord; recoveryCode: string } | null;
+  /**
+   * Prepared but not registered: the recovery code is on screen and the service has heard nothing
+   * yet. It lives in memory only, so a reload leaves no account behind and the person starts again.
+   */
+  pending: { prepared: flows.PreparedAccount; recoveryCode: string } | null;
+  /** The start-up look for a newer certificate has finished (found one or not), so the expiry is final. */
+  certChecked: boolean;
   /** Bumped when the TeamSpeak identity may have changed behind the UI's back (a sync finished). */
   tsRevision: number;
 }
 
-export const useAccount = create<AccountStore>()(() => ({ loaded: false, account: null, pending: null, tsRevision: 0 }));
+export const useAccount = create<AccountStore>()(() => ({ loaded: false, account: null, pending: null, certChecked: false, tsRevision: 0 }));
 
 const summarize = (r: ConnectRecord): AccountSummary => ({
   handle: r.handle,
@@ -85,26 +94,69 @@ function syncTeamspeak(record: ConnectRecord): void {
 async function activate(record: ConnectRecord): Promise<void> {
   await indexedDbConnectStore.save(record);
   await controller.switchIdentity(await identityFromConnect(record));
-  useAccount.setState({ account: summarize(record), pending: null, loaded: true });
+  useAccount.setState({ account: summarize(record), pending: null, loaded: true, certChecked: true });
   syncTeamspeak(record);
 }
 
-async function refresh(record: ConnectRecord): Promise<void> {
-  await indexedDbConnectStore.save(record);
-  // Same device key: no reconnect needed, but the next hello carries the new certificate.
+/** Shows a stored record that keeps this device's key (new token, vault key or certificate) without reconnecting. */
+async function applyRecord(record: ConnectRecord): Promise<void> {
   useAccount.setState({ account: summarize(record) });
-  syncTeamspeak(record);
+  // Same device key: no reconnect needed, but the next hello carries the new certificate.
   if (record.certificate.device_key === (await controller.getIdentity()).publicKey) {
     const identity = await identityFromConnect(record);
     await controller.replaceIdentityQuietly(identity);
   }
 }
 
+async function refresh(record: ConnectRecord): Promise<void> {
+  await indexedDbConnectStore.save(record);
+  syncTeamspeak(record);
+  await applyRecord(record);
+}
+
+/** The expiry warning toast is shown once per app start. */
+let warned = false;
+
+function warnAboutExpiry(): void {
+  const { account, certChecked } = useAccount.getState();
+  if (warned || !account) return;
+  const warning = certificateWarning(account.expiresAt, Date.now(), certChecked);
+  if (warning.level === "none") return;
+  warned = true;
+  const { toast } = useUi.getState();
+  const date = new Date(account.expiresAt).toLocaleDateString(useSettings.getState().language);
+  toast(warning.level === "expired" ? "error" : "info", tNow(warning.level === "expired" ? "account.certExpiredToast" : "account.certExpiringToast", { date }));
+}
+
+/**
+ * Quietly looks for a certificate that another device renewed for this one.
+ * It never blocks or fails startup: network errors and a 401 (the session
+ * ended, which also happens to a revoked device) are only logged. If Connect
+ * does list this device as revoked we change nothing: the person stays signed
+ * in as before, Settings > Account says the device was revoked, and servers
+ * refuse its hello with their own message.
+ */
+function checkCertificate(record: ConnectRecord): void {
+  flows
+    .pickUpCertificate(record, deps())
+    .then(async ({ outcome, record: next }) => {
+      if (outcome === "revoked") console.warn("Gwar Connect lists this device as revoked");
+      if (outcome === "updated" && useAccount.getState().account?.deviceKey === next.certificate.device_key) await applyRecord(next);
+    })
+    .catch((e: unknown) => console.warn("certificate check skipped", e))
+    .finally(() => {
+      useAccount.setState({ certChecked: true });
+      warnAboutExpiry();
+    });
+}
+
 export const accountActions = {
   /** Reads the stored sign-in (call once at startup). */
   async load(): Promise<void> {
     const record = await loadConnectRecord();
-    useAccount.setState({ account: record ? summarize(record) : null, loaded: true });
+    useAccount.setState({ account: record ? summarize(record) : null, loaded: true, certChecked: !record?.token });
+    if (record?.token) checkCertificate(record);
+    else warnAboutExpiry();
     // Pick up an identity another desktop put in the vault. Never waited for: starting must not depend on the network.
     const ts = tsBridge();
     if (record?.vaultKey && ts) {
@@ -114,17 +166,32 @@ export const accountActions = {
     }
   },
 
-  /** Registers an account. The recovery code is returned once; {@link confirmCreated} finishes it. */
+  /**
+   * Builds an account locally and returns nothing to the service yet: the recovery code goes on screen
+   * (`pending`) and {@link confirmCreated} registers once the person kept it.
+   */
   async create(p: { handle: string; password: string; keepIdentity: boolean }): Promise<void> {
     const keep = p.keepIdentity ? (await loadOrCreateIdentity(indexedDbIdentityStore)).exportBackup().jwk : undefined;
-    const created = await flows.createAccount({ handle: p.handle, password: p.password, keepIdentity: keep }, deps());
-    useAccount.setState({ pending: { record: created.record, recoveryCode: created.recoveryCode } });
+    const { prepared, recoveryCode } = await flows.prepareAccount({ handle: p.handle, password: p.password, keepIdentity: keep }, deps());
+    useAccount.setState({ pending: { prepared, recoveryCode } });
   },
 
-  /** The person confirmed they kept the recovery code. */
-  async confirmCreated(): Promise<void> {
+  /**
+   * The person confirmed they kept the recovery code: registers the account. On an error (handle taken,
+   * rate limit) the prepared account stays, so this can be called again, with another `handle` if wanted;
+   * the code stays valid because nothing in the account depends on the handle.
+   */
+  async confirmCreated(handle?: string): Promise<void> {
     const pending = useAccount.getState().pending;
-    if (pending) await activate(pending.record);
+    if (!pending) return;
+    const prepared = handle === undefined ? pending.prepared : pending.prepared.withHandle(handle);
+    const record = await flows.registerPrepared(prepared, deps());
+    await activate(record);
+  },
+
+  /** Drops the prepared account (nothing was registered). */
+  cancelCreate(): void {
+    useAccount.setState({ pending: null });
   },
 
   async signIn(p: { handle: string; password: string }): Promise<void> {
