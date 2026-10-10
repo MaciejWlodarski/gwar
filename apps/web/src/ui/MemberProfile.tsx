@@ -4,7 +4,7 @@ import { useT } from "../i18n";
 import { validNickname } from "../net/nickname";
 import { controller, describeRequestError } from "../state/controller";
 import { useSession, useUi } from "../state/stores";
-import { ConnectBadge } from "./badges";
+import { ConnectBadge, IdentityLine } from "./badges";
 import { useMemberName, usePermission } from "./hooks";
 import { Avatar, Button, Dialog, Field, Input } from "./kit";
 
@@ -86,15 +86,9 @@ export function MemberProfileDialog({ uid, fallback }: { uid: string; fallback: 
               <span className="truncate font-semibold">{nickname}</span>
               <ConnectBadge handle={member?.connect} />
             </div>
-            {member?.tag && <div className="font-mono text-xs text-muted">@{member.tag}</div>}
+            <IdentityLine connect={member?.connect} tag={member?.tag} className="block" />
           </div>
         </div>
-        {member?.connect && (
-          <div className="flex items-center gap-2 text-xs text-muted">
-            <ConnectBadge handle={member.connect} />
-            {t("badge.connectProfile", { handle: member.connect })}
-          </div>
-        )}
         <Field label={t("member.uid")}>
           {(id) => (
             <div className="flex gap-2">

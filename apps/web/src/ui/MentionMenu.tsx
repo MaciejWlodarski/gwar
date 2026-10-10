@@ -1,7 +1,7 @@
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import type { Person } from "../lib/mentions";
-import { ConnectBadge } from "./badges";
+import { IdentityLine } from "./badges";
 import { Avatar } from "./kit";
 
 export function MentionMenu({ matches, index, onPick, onHover }: { matches: Person[]; index: number; onPick: (p: Person) => void; onHover: (i: number) => void }) {
@@ -28,8 +28,7 @@ export function MentionMenu({ matches, index, onPick, onHover }: { matches: Pers
             <Avatar name={p.nickname} seed={p.uid} size={20} />
           </span>
           <span className={cn("min-w-0 flex-1 truncate", !p.online && "text-muted")}>{p.nickname}</span>
-          <span className="shrink-0 font-mono text-xs text-muted">@{p.tag}</span>
-          <ConnectBadge handle={p.connect} />
+          <IdentityLine connect={p.connect} tag={p.tag} />
           <span className="shrink-0 text-[11px] text-subtle">{p.online ? t("members.online") : t("members.offline")}</span>
         </div>
       ))}

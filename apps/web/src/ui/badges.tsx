@@ -51,3 +51,15 @@ export function ConnectBadge({ handle }: { handle?: string | null }) {
   const label = t("badge.connectAccount", { handle });
   return <span title={label} aria-label={label} className="inline-flex shrink-0 align-middle text-accent"><ShieldCheck className="size-3.5" /></span>;
 }
+
+/** "@handle #tag": the verified Connect handle (if any) and the tag derived from the key. */
+export function IdentityLine({ connect, tag, className }: { connect?: string | null; tag?: string | null; className?: string }) {
+  if (!connect && !tag) return null;
+  return (
+    <span className={cn("shrink-0 font-mono text-xs text-muted", className)}>
+      {connect && <span className="text-accent">@{connect}</span>}
+      {connect && tag && " "}
+      {tag && <span>#{tag}</span>}
+    </span>
+  );
+}

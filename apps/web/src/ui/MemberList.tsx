@@ -8,7 +8,7 @@ import { formatRelative } from "../lib/time";
 import { useSession, useUi } from "../state/stores";
 import { Avatar, menuContent, menuItem, menuLabel, Tooltip } from "./kit";
 import { ModerationItems } from "./ModerationMenu";
-import { ConnectBadge } from "./badges";
+import { ConnectBadge, IdentityLine } from "./badges";
 import { groupMembers, type MemberEntry } from "./members";
 
 function MemberRow({ entry, mine, now }: { entry: MemberEntry; mine: boolean; now: number }) {
@@ -31,8 +31,7 @@ function MemberRow({ entry, mine, now }: { entry: MemberEntry; mine: boolean; no
         <Tooltip label={
           <div className="flex flex-col gap-1">
             <span>{entry.nickname}</span>
-            {entry.tag && <span className="font-mono text-muted">@{entry.tag}</span>}
-            {entry.connect && <span>{t("badge.connectProfile", { handle: entry.connect })}</span>}
+            <IdentityLine connect={entry.connect} tag={entry.tag} />
             {lastSeen && <span>{lastSeen}</span>}
           </div>
         }>

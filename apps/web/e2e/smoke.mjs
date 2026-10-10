@@ -1233,7 +1233,7 @@ async function main() {
     await row.getByRole("button", { name: "Alice renamed", exact: true }).waitFor();
     await row.getByRole("button", { name: "Alice renamed", exact: true }).click();
     const profile = a.getByRole("dialog", { name: "Member profile" });
-    await profile.getByText(/^@[a-z2-7]{10,}$/).waitFor();
+    await profile.getByText(/^#[a-z2-7]{10,}$/).waitFor();
     if (!(await profile.getByLabel("Full user ID").inputValue())) throw new Error("profile has no uid");
     await a.keyboard.press("Escape");
     await a.getByRole("button", { name: "Server menu" }).click();
@@ -1261,7 +1261,7 @@ async function main() {
     const options = a.getByRole("option").filter({ hasText: "Bob" });
     await waitFor(async () => (await options.count()) === 2, "duplicate nickname suggestions");
     const tag = await a.evaluate(async ({ uid }) => { const { useSession } = await import("/src/state/stores.ts"); return useSession.getState().members[uid].tag; }, { uid: carol.uid });
-    await options.filter({ hasText: `@${tag}` }).click();
+    await options.filter({ hasText: `#${tag}` }).click();
     const text = `@Bob duplicate mention ${rid}`;
     await composer(a).pressSequentially(`duplicate mention ${rid}`);
     await composer(a).press("Enter");

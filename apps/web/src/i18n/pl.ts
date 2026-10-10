@@ -31,7 +31,6 @@ export const pl: Record<Key, string> = {
   "member.profile": "Profil członka",
   "member.viewProfile": "Zobacz profil",
   "member.uid": "Pełny identyfikator użytkownika",
-  "badge.connectProfile": "Gwar Connect · @{handle}",
   "badge.connectAccount": "Konto Gwar Connect: @{handle}",
   "perm.member_nickname": "Zmiana pseudonimów członków",
   "perm.member_nickname.hint": "Zmiana pseudonimów innych członków na tym serwerze. Każdy może zmienić własny.",

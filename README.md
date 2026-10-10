@@ -58,6 +58,29 @@ use.
 Gwar is early software: it works and is tested end to end, but expect rough
 edges and breaking changes.
 
+## Names: nickname, #tag and @handle
+
+A member is shown as **nickname** `@handle #tag`, for example
+**murzyn** `@zireael #c3tgigirh5`.
+
+- **Nickname**: what people see in chat and in the member list. It is chosen
+  per server and the same on all your devices. Two people may have the same
+  nickname. Your identity has a global nickname (a random `gwar-#####` at
+  first, change it in Settings → Identity). A server uses it only the first
+  time you join. After that, change it on that server with *Change nickname*.
+  Roles with the *Change member nicknames* permission can rename others.
+  History always shows the current nickname.
+- **#tag**: derived from your identity key (lowercase base32 of the uid). The
+  server uses the shortest prefix that is unique on that server, at least
+  10 characters. Nobody can choose it, change it or take someone else's,
+  and every identity has one, with or without an account. Use it to tell apart
+  people with the same nickname. The mention picker shows it too.
+- **@handle**: your [Gwar Connect](docs/connect.md) account name, shown next to
+  a shield. Only Connect accounts have one. The server shows it after Connect
+  confirms that the identity belongs to that account. The server checks this
+  again at most once a day and keeps the last answer while Connect is down.
+  It is only as trustworthy as Connect, while the #tag needs no one.
+
 ## Download
 
 Prebuilt apps are on the [GitHub Releases page](https://github.com/MaciejWlodarski/gwar/releases):

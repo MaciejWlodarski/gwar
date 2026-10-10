@@ -29,7 +29,6 @@ export const en = {
   "member.profile": "Member profile",
   "member.viewProfile": "View profile",
   "member.uid": "Full user ID",
-  "badge.connectProfile": "Gwar Connect · @{handle}",
   "badge.connectAccount": "Gwar Connect account: @{handle}",
   "perm.member_nickname": "Change member nicknames",
   "perm.member_nickname.hint": "Change other members’ nicknames on this server. Everyone can change their own.",
