@@ -1,7 +1,7 @@
 //! Voice server core.
 //!
 //! ```text
-//!  browser / desktop ──WS vc/1──▶ gateway ──▶ core actor ──▶ SQLite
+//!  browser / desktop ──WS vc/2──▶ gateway ──▶ core actor ──▶ SQLite
 //!                                                │ routing snapshot
 //!  browser / desktop ◀─WebRTC Opus─▶ media SFU ◀─┤
 //!  official TeamSpeak server ◀─query + puppets─▶ teamspeak bridge (optional)
@@ -72,7 +72,7 @@ pub struct Config {
     pub tls: Option<tls::Tls>,
     /// Also answer plain HTTP here with a redirect to HTTPS.
     pub redirect_http: Option<SocketAddr>,
-    /// Gwar Connect, whose revoked devices this server refuses (see [`connect`]).
+    /// Gwar Connect, for revocations and confirmed account handles (see [`connect`]).
     pub connect_url: Option<String>,
 }
 
@@ -140,6 +140,7 @@ pub async fn start(config: Config) -> Result<Running> {
             password: password.clone(),
             upload_limit: config.upload_limit,
             files_dir,
+            connect_url: config.connect_url.clone(),
         },
         routing.clone(),
         media_tx.clone(),

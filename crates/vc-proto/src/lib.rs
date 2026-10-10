@@ -1,4 +1,4 @@
-//! Wire protocol `vc/1`.
+//! Wire protocol `vc/2`.
 //!
 //! One WebSocket carries JSON text frames in both directions:
 //!

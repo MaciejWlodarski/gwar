@@ -1,10 +1,9 @@
-//! Revocations from Gwar Connect (docs/connect.md). Servers never ask Connect
-//! who someone is; they only follow its public feed of revoked devices, and
-//! believe an entry only if the account key signed it. If Connect is down,
-//! nothing else is affected.
+//! Gwar Connect: signed device revocations and public account-handle lookups.
+//! Authentication verifies certificates locally; neither HTTP path blocks hello.
 
 use std::time::Duration;
 
+use anyhow::{Result, ensure};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
@@ -81,4 +80,44 @@ async fn fetch(client: &reqwest::Client, url: &str, since: i64) -> anyhow::Resul
     let url = format!("{}/v1/revocations?since={since}", url.trim_end_matches('/'));
     let feed: Feed = client.get(url).send().await?.error_for_status()?.json().await?;
     Ok(feed.revocations)
+}
+
+#[derive(Clone)]
+pub(crate) struct Lookup {
+    url: String,
+    client: reqwest::Client,
+}
+
+#[derive(Deserialize)]
+struct Account {
+    handle: String,
+    account_key: String,
+}
+
+impl Lookup {
+    pub fn new(url: String) -> Result<Self> {
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?;
+        Ok(Self { url, client })
+    }
+
+    pub async fn account(&self, key: &str) -> Result<Option<String>> {
+        let url = format!("{}/v1/accounts/by-key/{key}", self.url.trim_end_matches('/'));
+        let reply = self.client.get(url).send().await?;
+        if reply.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let account: Account = reply.error_for_status()?.json().await?;
+        ensure!(account.account_key == key, "Connect returned a different account key");
+        ensure!(
+            (3..=32).contains(&account.handle.len())
+                && account
+                    .handle
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'.')
+                && !account.handle.starts_with('.')
+                && !account.handle.ends_with('.'),
+            "Connect returned an invalid handle"
+        );
+        Ok(Some(account.handle))
+    }
 }

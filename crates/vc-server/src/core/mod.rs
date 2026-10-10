@@ -36,8 +36,8 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use vc_proto::{
     Channel, ChannelCreate, ChannelId, ChannelUpdate, ChatMessage, ChatTarget, Client, ClientUpdate, ErrorBody,
-    ErrorCode, Event, Group, GroupId, IceServer, LeaveReason, MessageId, Permission, Platform, Request, Response,
-    ServerFrame, ServerInfo, SessionId, Uid, Unread, Welcome,
+    ErrorCode, Event, Group, GroupId, IceServer, LeaveReason, MessageId, NICKNAME_MAX_LEN, Permission, Platform,
+    Request, Response, ServerFrame, ServerInfo, SessionId, Uid, Unread, Welcome,
 };
 
 use self::bridge::{BridgeMsg, BridgeNote, RemoteClient};
@@ -176,6 +176,7 @@ pub struct CoreConfig {
     /// Largest upload in bytes; 0 disables uploads.
     pub upload_limit: u64,
     pub files_dir: PathBuf,
+    pub connect_url: Option<String>,
 }
 
 struct Session {
@@ -220,12 +221,14 @@ pub struct Core {
     password: ServerPassword,
     files_dir: PathBuf,
     uploads: HashMap<String, files::PendingUpload>,
+    connect: Option<crate::connect::Lookup>,
+    connect_pending: HashMap<Uid, u64>,
+    next_connect_lookup: u64,
 }
 
 /// Messages with ids at or above this value are delivered live and not stored.
 pub const EPHEMERAL_MESSAGE_BASE: MessageId = 1 << 31;
 
-const MAX_NICKNAME: usize = 32;
 const MAX_CHANNEL_NAME: usize = 64;
 const MAX_TOPIC: usize = 255;
 const MAX_MESSAGE: usize = 4000;
@@ -325,6 +328,10 @@ impl Core {
         media: mpsc::Sender<MediaCmd>,
         me: mpsc::WeakSender<CoreMsg>,
     ) -> Result<Self> {
+        if config.connect_url.is_none() {
+            store.clear_connect_cache()?;
+        }
+        let connect = config.connect_url.map(crate::connect::Lookup::new).transpose()?;
         let channels = store.channels()?.into_iter().map(|c| (c.id, c)).collect::<BTreeMap<_, _>>();
         let default_channel = store
             .meta("default_channel")?
@@ -359,6 +366,9 @@ impl Core {
             password: config.password,
             files_dir: config.files_dir,
             uploads: HashMap::new(),
+            connect,
+            connect_pending: HashMap::new(),
+            next_connect_lookup: 0,
         })
     }
 
@@ -518,10 +528,6 @@ impl Core {
         if self.sessions.values().filter(|s| s.out.is_some()).count() >= self.info.max_clients as usize {
             return fail(ErrorCode::Unavailable, "server is full");
         }
-        let nickname = match clean(&r.nickname, MAX_NICKNAME, "nickname") {
-            Ok(n) => n,
-            Err(e) => return fail(e.code, &e.message),
-        };
         if r.device.as_deref().is_some_and(|d| self.store.device_revoked(d).unwrap_or(false)) {
             return fail(ErrorCode::NotAuthenticated, "this device was signed out of its Gwar account");
         }
@@ -538,6 +544,24 @@ impl Core {
                 warn!("store: {e:#}");
                 return fail(ErrorCode::Internal, "storage error");
             }
+        };
+        let nickname = match &known {
+            Some(member) => member.nickname.clone(),
+            None => match clean(&r.nickname, NICKNAME_MAX_LEN, "nickname") {
+                Ok(n) => n,
+                Err(e) => return fail(e.code, &e.message),
+            },
+        };
+        let tags_before = if known.is_none() {
+            match self.store.member_tags() {
+                Ok(tags) => Some(tags),
+                Err(e) => {
+                    warn!("store: {e:#}");
+                    return fail(ErrorCode::Internal, "storage error");
+                }
+            }
+        } else {
+            None
         };
         let invited = match r.invite.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
             Some(code) => match self.admit_by_invite(code, known.as_ref()) {
@@ -575,12 +599,27 @@ impl Core {
             }
             groups.push(MEMBER_GROUP);
         }
+        if r.device.is_some() {
+            self.refresh_connect(&r.uid, user.id, &r.public_key);
+        } else {
+            self.connect_pending.remove(&r.uid);
+            if known.as_ref().is_some_and(|m| m.connect.is_some()) {
+                if let Err(e) = self.store.set_connect_handle(user.id, None) {
+                    warn!("store: {e:#}");
+                } else {
+                    self.announce_member(&r.uid);
+                }
+            }
+        }
+        if let Some(tags) = tags_before {
+            self.announce_tags(tags);
+        }
         let id = self.allocate_session();
         let session = Session {
             id,
             user_id: user.id,
             uid: r.uid,
-            nickname,
+            nickname: user.nickname,
             channel: None,
             unlocked: BTreeSet::new(),
             groups,
@@ -620,6 +659,95 @@ impl Core {
         self.broadcast(Event::ClientJoined(joined), |s| s.id != id);
         self.publish_routing();
         Some(id)
+    }
+
+    fn announce_member(&mut self, uid: &str) {
+        match self.store.user_by_uid(uid) {
+            Ok(Some((_, member))) => self.broadcast(Event::MemberUpdated(member), |_| true),
+            Ok(None) => {}
+            Err(e) => warn!("store: {e:#}"),
+        }
+    }
+
+    fn announce_tags(&mut self, before: BTreeMap<Uid, String>) {
+        match self.store.member_tags() {
+            Ok(after) => {
+                for (uid, tag) in after {
+                    if before.get(&uid) != Some(&tag) {
+                        self.announce_member(&uid);
+                    }
+                }
+            }
+            Err(e) => warn!("store: {e:#}"),
+        }
+    }
+
+    fn refresh_connect(&mut self, uid: &str, user_id: i64, account_key: &str) {
+        let Some(lookup) = self.connect.clone() else { return };
+        let now = now_ms();
+        let checked = match self.store.connect_checked_at(user_id) {
+            Ok(checked) => checked,
+            Err(e) => {
+                warn!("store: {e:#}");
+                return;
+            }
+        };
+        if self.connect_pending.contains_key(uid) || checked.is_some_and(|t| now - t < 24 * 3600 * 1000) {
+            return;
+        }
+        let Some(tx) = self.me.upgrade() else { return };
+        if let Err(e) = self.store.check_connect(user_id, now) {
+            warn!("store: {e:#}");
+            return;
+        }
+        self.next_connect_lookup += 1;
+        let generation = self.next_connect_lookup;
+        let uid = uid.to_owned();
+        let account_key = account_key.to_owned();
+        self.connect_pending.insert(uid.clone(), generation);
+        tokio::spawn(async move {
+            let result = lookup.account(&account_key).await;
+            let resume = move |core: &mut Core| {
+                if core.connect_pending.get(&uid) != Some(&generation) {
+                    return;
+                }
+                core.connect_pending.remove(&uid);
+                match result {
+                    Ok(handle) => match core.store.user_by_uid(&uid) {
+                        Ok(Some((id, member))) if id == user_id && member.connect != handle => {
+                            if let Err(e) = core.store.set_connect_handle(id, handle.as_deref()) {
+                                warn!("store: {e:#}");
+                            } else {
+                                core.announce_member(&uid);
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(e) => warn!("store: {e:#}"),
+                    },
+                    Err(e) => debug!("gwar connect account: {e:#}"),
+                }
+            };
+            let _ = tx.send(CoreMsg::Resume(Box::new(resume))).await;
+        });
+    }
+
+    fn member_nickname(&mut self, session: SessionId, uid: Uid, nickname: String) -> Reply {
+        if self.sessions[&session].uid != uid {
+            self.require(session, Permission::MemberNickname)?;
+        }
+        let nickname = clean(&nickname, NICKNAME_MAX_LEN, "nickname")?;
+        let Some((user_id, mut member)) = self.store.user_by_uid(&uid).map_err(storage_error)? else {
+            return Err(err(ErrorCode::NotFound, "no such member"));
+        };
+        self.store.set_nickname(user_id, &nickname).map_err(storage_error)?;
+        member.nickname = nickname.clone();
+        self.broadcast(Event::MemberUpdated(member), |_| true);
+        let online: Vec<_> = self.sessions.values().filter(|s| s.uid == uid).map(|s| s.id).collect();
+        for id in online {
+            self.sessions.get_mut(&id).expect("online session").nickname = nickname.clone();
+            self.client_updated(id);
+        }
+        Ok(Response::Empty {})
     }
 
     fn allocate_session(&mut self) -> SessionId {
@@ -668,18 +796,30 @@ impl Core {
                     let _ = reply.send(None);
                     return;
                 }
+                let known = match self.store.user_by_uid(&client.uid) {
+                    Ok(known) => known,
+                    Err(e) => {
+                        warn!("store: {e:#}");
+                        let _ = reply.send(None);
+                        return;
+                    }
+                };
+                let (user_id, nickname, groups) = match known {
+                    Some((id, member)) => (id, member.nickname, member.groups),
+                    None => (0, client.nickname, Vec::new()),
+                };
                 let id = self.allocate_session();
                 // TeamSpeak users are always in some channel.
                 let channel =
                     Some(client.channel).filter(|c| self.channels.contains_key(c)).or(Some(self.info.default_channel));
                 let session = Session {
                     id,
-                    user_id: 0,
+                    user_id,
                     uid: client.uid,
-                    nickname: client.nickname,
+                    nickname,
                     channel,
                     unlocked: BTreeSet::new(),
-                    groups: Vec::new(),
+                    groups,
                     platform: client.platform,
                     ip: None,
                     device: None,
@@ -703,7 +843,15 @@ impl Core {
                     || u.deafened.is_some_and(|d| d != s.deafened)
                     || u.channel.is_some_and(|c| Some(c) != s.channel);
                 if let Some(nickname) = u.nickname {
-                    s.nickname = nickname;
+                    if s.user_id == 0 {
+                        s.nickname = nickname;
+                    } else {
+                        match self.store.user_by_uid(&s.uid) {
+                            Ok(Some((_, member))) => s.nickname = member.nickname,
+                            Ok(None) => {}
+                            Err(e) => warn!("store: {e:#}"),
+                        }
+                    }
                 }
                 if let Some(channel) = u.channel.filter(|c| self.channels.contains_key(c)) {
                     if Some(channel) != s.channel {
@@ -785,6 +933,7 @@ impl Core {
             Request::GroupCreate(create) => self.group_create(session, create),
             Request::GroupUpdate(update) => self.group_update(session, update),
             Request::GroupDelete { group } => self.group_delete(session, group),
+            Request::MemberNickname { uid, nickname } => self.member_nickname(session, uid, nickname),
             Request::MemberGroups { uid, groups } => self.member_groups(session, uid, groups),
             Request::MemberRemove { uid, delete_messages } => self.member_remove(session, uid, delete_messages),
             Request::MemberPrune(prune) => self.member_prune(session, prune),
@@ -804,7 +953,6 @@ impl Core {
     }
 
     fn client_update(&mut self, session: SessionId, u: ClientUpdate) -> Reply {
-        let nickname = u.nickname.as_deref().map(|n| clean(n, MAX_NICKNAME, "nickname")).transpose()?;
         let away = match u.away.as_deref().map(str::trim) {
             Some("") => Some(None),
             Some(text) => Some(Some(clean(text, MAX_AWAY, "away message")?)),
@@ -812,9 +960,6 @@ impl Core {
         };
         let s = self.sessions.get_mut(&session).expect("checked by caller");
         let routing_changed = u.muted.is_some_and(|m| m != s.muted) || u.deafened.is_some_and(|d| d != s.deafened);
-        if let Some(nickname) = nickname {
-            s.nickname = nickname;
-        }
         s.muted = u.muted.unwrap_or(s.muted);
         s.deafened = u.deafened.unwrap_or(s.deafened);
         if let Some(away) = away {

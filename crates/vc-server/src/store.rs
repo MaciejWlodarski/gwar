@@ -1,13 +1,18 @@
 //! SQLite persistence. Owned by the core actor; every call is a short local
 //! transaction, so it runs inline rather than on a blocking pool.
 
-use std::path::Path;
+use std::{collections::BTreeMap, path::Path};
 
 use anyhow::{Context, Result};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
 use vc_proto::{
     Attachment, Ban, BanId, ChannelId, ChatMessage, ChatTarget, FileId, Group, GroupId, Invite, Member, MessageId,
-    Permission, UNREAD_CAP, Uid,
+    Permission, TAG_MIN_LEN, UNREAD_CAP, Uid,
 };
 
 pub const ADMIN_GROUP: GroupId = 1;
@@ -29,6 +34,7 @@ pub struct ChannelRow {
 pub struct UserRow {
     pub id: i64,
     pub groups: Vec<GroupId>,
+    pub nickname: String,
 }
 
 /// A stored member with what the maintenance tools need to judge them.
@@ -172,6 +178,10 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX files_by_uploader ON files(uploader);
     CREATE INDEX users_by_last_seen ON users(last_seen);
     UPDATE users SET last_seen = MAX(last_seen, COALESCE((SELECT MAX(sent_at) FROM messages WHERE author_uid = users.uid), 0));
+"#,
+    r#"
+    ALTER TABLE users ADD COLUMN connect_handle TEXT;
+    ALTER TABLE users ADD COLUMN connect_checked_at INTEGER;
 "#,
 ];
 
@@ -343,12 +353,13 @@ impl Store {
     pub fn user_by_uid(&self, uid: &str) -> Result<Option<(i64, Member)>> {
         let row = self
             .db
-            .query_row("SELECT id,nickname,last_seen FROM users WHERE uid=?1", [uid], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            .query_row("SELECT id,nickname,last_seen,connect_handle FROM users WHERE uid=?1", [uid], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get(3)?))
             })
             .optional()?;
-        let Some((id, nickname, last_seen)) = row else { return Ok(None) };
-        Ok(Some((id, Member { uid: uid.to_owned(), nickname, groups: self.user_groups(id)?, last_seen })))
+        let Some((id, nickname, last_seen, connect)) = row else { return Ok(None) };
+        let tag = self.member_tags()?.remove(uid).unwrap_or_default();
+        Ok(Some((id, Member { uid: uid.to_owned(), nickname, tag, connect, groups: self.user_groups(id)?, last_seen })))
     }
 
     pub fn set_user_groups(&self, user_id: i64, groups: &[GroupId]) -> Result<()> {
@@ -361,15 +372,17 @@ impl Store {
         Ok(())
     }
 
-    /// Records a connecting identity and returns its stored groups.
+    /// Records a connecting identity, keeping its existing nickname.
     pub fn touch_user(&self, uid: &str, public_key: &str, nickname: &str, now: i64) -> Result<UserRow> {
         self.db.execute(
             "INSERT INTO users(uid,public_key,nickname,created_at,last_seen) VALUES(?1,?2,?3,?4,?4)
-             ON CONFLICT(uid) DO UPDATE SET nickname=excluded.nickname, last_seen=excluded.last_seen",
+             ON CONFLICT(uid) DO UPDATE SET last_seen=excluded.last_seen",
             params![uid, public_key, nickname, now],
         )?;
-        let id: i64 = self.db.query_row("SELECT id FROM users WHERE uid=?1", [uid], |r| r.get(0))?;
-        Ok(UserRow { id, groups: self.user_groups(id)? })
+        let (id, nickname) = self.db.query_row("SELECT id,nickname FROM users WHERE uid=?1", [uid], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        Ok(UserRow { id, groups: self.user_groups(id)?, nickname })
     }
 
     pub fn user_groups(&self, user_id: i64) -> Result<Vec<GroupId>> {
@@ -421,17 +434,52 @@ impl Store {
         Ok(id as MessageId)
     }
 
+    /// Shortest distinguishing tags over the entire member table, including old members.
+    pub fn member_tags(&self) -> Result<BTreeMap<Uid, String>> {
+        let mut stmt = self.db.prepare("SELECT uid FROM users")?;
+        let uids = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(member_tags(uids))
+    }
+
+    pub fn set_nickname(&self, user_id: i64, nickname: &str) -> Result<()> {
+        self.db.execute("UPDATE users SET nickname=?2 WHERE id=?1", params![user_id, nickname])?;
+        Ok(())
+    }
+
+    pub fn connect_checked_at(&self, user_id: i64) -> Result<Option<i64>> {
+        Ok(self.db.query_row("SELECT connect_checked_at FROM users WHERE id=?1", [user_id], |r| r.get(0))?)
+    }
+
+    /// Records an attempt before starting HTTP, including failed lookups in the daily limit.
+    pub fn check_connect(&self, user_id: i64, now: i64) -> Result<()> {
+        self.db.execute("UPDATE users SET connect_checked_at=?2 WHERE id=?1", params![user_id, now])?;
+        Ok(())
+    }
+
+    pub fn set_connect_handle(&self, user_id: i64, handle: Option<&str>) -> Result<()> {
+        self.db.execute("UPDATE users SET connect_handle=?2 WHERE id=?1", params![user_id, handle])?;
+        Ok(())
+    }
+
+    /// Disabling Connect forgets cached handles, so enabling it starts with fresh checks.
+    pub fn clear_connect_cache(&self) -> Result<()> {
+        self.db.execute("UPDATE users SET connect_handle=NULL,connect_checked_at=NULL", [])?;
+        Ok(())
+    }
+
     /// Users seen since `since` (ms), most recent first.
     pub fn members(&self, since: i64, limit: u32) -> Result<Vec<Member>> {
+        let tags = self.member_tags()?;
         let mut stmt = self.db.prepare(
-            "SELECT id,uid,nickname,last_seen FROM users WHERE last_seen >= ?1 ORDER BY last_seen DESC LIMIT ?2",
+            "SELECT id,uid,nickname,last_seen,connect_handle FROM users WHERE last_seen >= ?1 ORDER BY last_seen DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![since, limit], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?))
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?, r.get(4)?))
         })?;
         rows.map(|row| {
-            let (id, uid, nickname, last_seen) = row?;
-            Ok(Member { uid, nickname, groups: self.user_groups(id)?, last_seen })
+            let (id, uid, nickname, last_seen, connect) = row?;
+            let tag = tags.get(&uid).cloned().unwrap_or_default();
+            Ok(Member { uid, nickname, tag, connect, groups: self.user_groups(id)?, last_seen })
         })
         .collect()
     }
@@ -443,16 +491,22 @@ impl Store {
 
     /// Every member (those last seen before `seen_before`, if given), longest away first.
     pub fn member_rows(&self, seen_before: Option<i64>) -> Result<Vec<MemberRow>> {
+        let tags = self.member_tags()?;
         let mut stmt = self.db.prepare(
-            "SELECT id,uid,nickname,last_seen,(SELECT COUNT(*) FROM messages WHERE author_uid = users.uid)
+            "SELECT id,uid,nickname,last_seen,(SELECT COUNT(*) FROM messages WHERE author_uid = users.uid),connect_handle
              FROM users WHERE ?1 IS NULL OR last_seen < ?1 ORDER BY last_seen, id",
         )?;
         let rows = stmt.query_map([seen_before], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get(3)?, r.get(4)?))
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
         })?;
         rows.map(|row| {
-            let (id, uid, nickname, last_seen, messages) = row?;
-            Ok(MemberRow { id, member: Member { uid, nickname, groups: self.user_groups(id)?, last_seen }, messages })
+            let (id, uid, nickname, last_seen, messages, connect) = row?;
+            let tag = tags.get(&uid).cloned().unwrap_or_default();
+            Ok(MemberRow {
+                id,
+                member: Member { uid, nickname, tag, connect, groups: self.user_groups(id)?, last_seen },
+                messages,
+            })
         })
         .collect()
     }
@@ -529,8 +583,8 @@ impl Store {
     /// Newest `limit` channel messages older than `before`, returned oldest first.
     pub fn history(&self, channel: ChannelId, before: Option<MessageId>, limit: u32) -> Result<Vec<ChatMessage>> {
         let mut stmt = self.db.prepare(
-            "SELECT id,author_uid,author_name,text,sent_at,edited_at FROM messages
-             WHERE channel=?1 AND id < ?2 ORDER BY id DESC LIMIT ?3",
+            "SELECT m.id,m.author_uid,COALESCE(u.nickname,m.author_name),m.text,m.sent_at,m.edited_at FROM messages m
+             LEFT JOIN users u ON u.uid=m.author_uid WHERE m.channel=?1 AND m.id < ?2 ORDER BY m.id DESC LIMIT ?3",
         )?;
         let rows = stmt.query_map(params![channel, before.unwrap_or(MessageId::MAX), limit], |r| {
             Ok(ChatMessage {
@@ -560,7 +614,7 @@ impl Store {
         let row = self
             .db
             .query_row(
-                "SELECT channel,author_uid,author_name,text,sent_at,edited_at FROM messages WHERE id=?1",
+                "SELECT m.channel,m.author_uid,COALESCE(u.nickname,m.author_name),m.text,m.sent_at,m.edited_at FROM messages m LEFT JOIN users u ON u.uid=m.author_uid WHERE m.id=?1",
                 [id],
                 |r| {
                     Ok(ChatMessage {
@@ -815,6 +869,43 @@ impl Store {
     }
 }
 
+fn member_tags(uids: Vec<Uid>) -> BTreeMap<Uid, String> {
+    let mut full: Vec<_> = uids
+        .into_iter()
+        .map(|uid| {
+            let decoded = match uid.strip_prefix("ts:") {
+                Some(ts) => STANDARD.decode(ts),
+                None => URL_SAFE_NO_PAD.decode(&uid),
+            };
+            let bytes =
+                decoded.ok().filter(|b| b.len() == 20).unwrap_or_else(|| Sha256::digest(uid.as_bytes())[..20].to_vec());
+            let alphabet = b"abcdefghijklmnopqrstuvwxyz234567";
+            let mut encoded = String::with_capacity(32);
+            let (mut bits, mut count) = (0u32, 0);
+            for byte in bytes {
+                bits = (bits << 8) | u32::from(byte);
+                count += 8;
+                while count >= 5 {
+                    count -= 5;
+                    encoded.push(alphabet[((bits >> count) & 31) as usize] as char);
+                }
+            }
+            (encoded, uid)
+        })
+        .collect();
+    full.sort_unstable();
+    let common = |a: &str, b: &str| a.bytes().zip(b.bytes()).take_while(|(a, b)| a == b).count();
+    full.iter()
+        .enumerate()
+        .map(|(i, (tag, uid))| {
+            let left = i.checked_sub(1).map_or(0, |j| common(tag, &full[j].0));
+            let right = full.get(i + 1).map_or(0, |(next, _)| common(tag, next));
+            let len = TAG_MIN_LEN.max(left.max(right) + 1).min(tag.len());
+            (uid.clone(), tag[..len].to_owned())
+        })
+        .collect()
+}
+
 fn attachment_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attachment> {
     let id: String = r.get(0)?;
     let name: String = r.get(1)?;
@@ -934,6 +1025,80 @@ mod tests {
         // Opening again changes nothing.
         let again = Store::init(store.db).unwrap();
         assert_eq!(again.user_by_uid("wrote-later").unwrap().unwrap().1.last_seen, 5000);
+    }
+
+    #[test]
+    fn migration_adds_the_connect_cache_and_preserves_member_names() {
+        let db = Connection::open_in_memory().unwrap();
+        for migration in &MIGRATIONS[..5] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.pragma_update(None, "user_version", 5).unwrap();
+        db.execute(
+            "INSERT INTO users(uid,public_key,nickname,created_at,last_seen) VALUES('old','k','Kept',10,20)",
+            [],
+        )
+        .unwrap();
+        let store = Store::init(db).unwrap();
+        let (id, member) = store.user_by_uid("old").unwrap().unwrap();
+        assert_eq!(member.nickname, "Kept");
+        assert!(member.connect.is_none());
+        assert_eq!(store.connect_checked_at(id).unwrap(), None);
+        store.check_connect(id, 30).unwrap();
+        store.set_connect_handle(id, Some("account")).unwrap();
+        let reopened = Store::init(store.db).unwrap();
+        assert_eq!(reopened.connect_checked_at(id).unwrap(), Some(30));
+        assert_eq!(reopened.user_by_uid("old").unwrap().unwrap().1.connect.as_deref(), Some("account"));
+    }
+
+    #[test]
+    fn tags_use_the_shortest_unique_base32_prefix_over_all_members() {
+        let store = Store::in_memory().unwrap();
+        let a = URL_SAFE_NO_PAD.encode([0u8; 20]);
+        let mut bytes = [0u8; 20];
+        bytes[7] = 128;
+        let b = URL_SAFE_NO_PAD.encode(bytes);
+        store.touch_user(&a, "k", "same", 1).unwrap();
+        assert_eq!(store.member_tags().unwrap()[&a], "a".repeat(10));
+        let b_id = store.touch_user(&b, "k", "same", 2).unwrap().id;
+        let tags = store.member_tags().unwrap();
+        assert_eq!(tags[&a], "a".repeat(12));
+        assert_eq!(tags[&b], format!("{}i", "a".repeat(11)));
+        // Even a snapshot excluding the old member must account for its tag collision.
+        assert_eq!(store.members(2, 1).unwrap()[0].tag, tags[&b]);
+        let single = member_tags(vec![format!("ts:{}", STANDARD.encode([255u8; 20]))]);
+        assert_eq!(single.values().next().unwrap(), &"7".repeat(10));
+        store.remove_member(b_id, &b, false).unwrap();
+        assert_eq!(store.user_by_uid(&a).unwrap().unwrap().1.tag, "a".repeat(10));
+        let fallback = member_tags(vec!["not a uid".into()]);
+        assert_eq!(fallback["not a uid"].len(), TAG_MIN_LEN);
+        assert!(fallback["not a uid"].bytes().all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)));
+    }
+
+    #[test]
+    fn tags_can_expand_to_the_whole_uid() {
+        let a = URL_SAFE_NO_PAD.encode([0u8; 20]);
+        let mut bytes = [0u8; 20];
+        bytes[19] = 1;
+        let b = URL_SAFE_NO_PAD.encode(bytes);
+        let tags = member_tags(vec![a.clone(), b.clone()]);
+        assert_eq!(tags[&a], "a".repeat(32));
+        assert_eq!(tags[&b], format!("{}b", "a".repeat(31)));
+    }
+
+    #[test]
+    fn message_snapshots_survive_renames_and_member_removal() {
+        let store = Store::in_memory().unwrap();
+        let user = store.touch_user("u", "k", "Before", 1).unwrap();
+        let channel = store.channels().unwrap()[0].id;
+        let message = store.add_message(channel, "u", "Before", "hi", 2).unwrap();
+        store.touch_user("u", "k", "Ignored", 3).unwrap();
+        assert_eq!(store.user_by_uid("u").unwrap().unwrap().1.nickname, "Before");
+        store.set_nickname(user.id, "After").unwrap();
+        assert_eq!(store.history(channel, None, 10).unwrap()[0].author_name, "After");
+        assert_eq!(store.message(message).unwrap().unwrap().author_name, "After");
+        store.remove_member(user.id, "u", false).unwrap();
+        assert_eq!(store.message(message).unwrap().unwrap().author_name, "Before");
     }
 
     #[test]
