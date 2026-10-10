@@ -19,6 +19,14 @@ describe("permissionsOf", () => {
   });
 });
 
+describe("member removal", () => {
+  it("is part of the full set, so Admin has it, and is not given to plain members", () => {
+    expect(ALL_PERMISSIONS).toContain("member_remove");
+    expect(permissionsOf([1], groups)).toContain("member_remove");
+    expect(permissionsOf([2], groups)).not.toContain("member_remove");
+  });
+});
+
 describe("moderation rules", () => {
   const mod = permissionsOf([2, 3], groups);
   it("lets me hand out only roles within my own permissions", () => {

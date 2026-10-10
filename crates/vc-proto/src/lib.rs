@@ -24,6 +24,12 @@ pub const AUDIO_SLOTS: usize = 8;
 /// Unread counts stop at this value ("99+").
 pub const UNREAD_CAP: u32 = 100;
 
+/// Most members one `member.prune` call removes; repeat the call for more.
+pub const PRUNE_BATCH: usize = 50;
+
+/// Most members a `member.prune` dry run lists (the count covers all of them).
+pub const PRUNE_PREVIEW: usize = 500;
+
 pub type ChannelId = u32;
 pub type SessionId = u32;
 pub type GroupId = u32;
@@ -124,6 +130,13 @@ wire! {
         /// Sets a member's groups (online or not).
         #[serde(rename = "member.groups")]
         MemberGroups { uid: Uid, groups: Vec<GroupId> },
+        /// Removes a member and everything tied to them (groups, read marks, and with
+        /// `delete_messages` their messages and files). Not a ban: they can join again.
+        #[serde(rename = "member.remove")]
+        MemberRemove { uid: Uid, #[serde(default)] delete_messages: bool },
+        /// Removes members not seen for a while (or previews that with `dry_run`).
+        #[serde(rename = "member.prune")]
+        MemberPrune(MemberPrune),
         #[serde(rename = "ban.create")]
         BanCreate(BanCreate),
         #[serde(rename = "ban.list")]
@@ -287,6 +300,18 @@ wire! {
         pub reason: Option<String>,
     }
 
+    /// Every field is required: a forgotten flag must never widen what gets removed.
+    pub struct MemberPrune {
+        /// Members not seen for at least this many days (1 to 3650).
+        pub inactive_days: u32,
+        /// Spare members who hold any role besides the default Member one.
+        pub without_groups_only: bool,
+        /// Also delete their messages and files.
+        pub delete_messages: bool,
+        /// Only report what would be removed.
+        pub dry_run: bool,
+    }
+
     #[derive(Default)]
     pub struct InviteCreate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -331,6 +356,12 @@ wire! {
         Invites { invites: Vec<Invite> },
         /// `PUT` the file's bytes to `upload_url` (relative to the server's HTTP origin).
         Upload { file: FileId, upload_url: String },
+        /// Result of `member.prune`. `uids` are the members removed by this call (for a
+        /// dry run, the first ones that would be, at most [`PRUNE_PREVIEW`]); `count` is how
+        /// many matched in all. A real run removes at most [`PRUNE_BATCH`] per call:
+        /// repeat it while `count` exceeds `uids.len()`. `members` are the same people
+        /// as they were stored (nickname, groups, last seen), in the same order.
+        Pruned { uids: Vec<Uid>, count: u32, members: Vec<Member> },
         Empty {},
     }
 
@@ -402,6 +433,9 @@ wire! {
         /// A member's groups or nickname changed (online or not).
         #[serde(rename = "member.updated")]
         MemberUpdated(Member),
+        /// A member was removed from the server (their record, not a ban).
+        #[serde(rename = "member.removed")]
+        MemberRemoved { uid: Uid },
         #[serde(rename = "voice.talking")]
         VoiceTalking { client: SessionId, talking: bool },
         /// The given receive slot now carries audio of `client` (or nothing).
@@ -573,6 +607,7 @@ wire! {
         MessageManage,
         InviteCreate,
         FileUpload,
+        MemberRemove,
     }
 
     pub struct ChatMessage {
@@ -607,6 +642,8 @@ wire! {
         },
         ServerShutdown,
         Replaced,
+        /// An admin removed this member from the server (they may join again as a new one).
+        Removed { by: String },
     }
 
     pub struct IceServer {
@@ -619,7 +656,7 @@ wire! {
 }
 
 impl Permission {
-    pub const ALL: [Permission; 13] = [
+    pub const ALL: [Permission; 14] = [
         Permission::ServerManage,
         Permission::ChannelCreate,
         Permission::ChannelEdit,
@@ -633,6 +670,7 @@ impl Permission {
         Permission::MessageManage,
         Permission::InviteCreate,
         Permission::FileUpload,
+        Permission::MemberRemove,
     ];
 
     /// What every new member may do.
@@ -691,6 +729,50 @@ mod tests {
         let target = serde_json::to_value(ChatTarget::Channel(9)).unwrap();
         assert_eq!(target, json!({"channel": 9}));
         assert_eq!(serde_json::to_value(ChatTarget::Server).unwrap(), json!("server"));
+    }
+
+    #[test]
+    fn member_removal_frames() {
+        let remove: ClientFrame =
+            serde_json::from_value(json!({"id": 1, "op": "member.remove", "d": {"uid": "u"}})).unwrap();
+        assert_eq!(remove.request, Request::MemberRemove { uid: "u".into(), delete_messages: false });
+
+        let prune =
+            json!({"inactive_days": 90, "without_groups_only": true, "delete_messages": false, "dry_run": true});
+        let frame: ClientFrame = serde_json::from_value(json!({"id": 2, "op": "member.prune", "d": prune})).unwrap();
+        assert_eq!(
+            frame.request,
+            Request::MemberPrune(MemberPrune {
+                inactive_days: 90,
+                without_groups_only: true,
+                delete_messages: false,
+                dry_run: true
+            })
+        );
+        // A forgotten flag must not default to something destructive.
+        let partial = json!({"id": 3, "op": "member.prune", "d": {"inactive_days": 90}});
+        assert!(serde_json::from_value::<ClientFrame>(partial).is_err());
+
+        let event = ServerFrame::Event(Event::MemberRemoved { uid: "u".into() });
+        assert_eq!(serde_json::to_value(&event).unwrap(), json!({"ev": "member.removed", "d": {"uid": "u"}}));
+        let reply = ServerFrame::Ok {
+            re: 2,
+            ok: Response::Pruned {
+                uids: vec!["u".into()],
+                count: 3,
+                members: vec![Member { uid: "u".into(), nickname: "n".into(), groups: vec![2], last_seen: 7 }],
+            },
+        };
+        let text = serde_json::to_string(&reply).unwrap();
+        assert_eq!(serde_json::from_str::<ServerFrame>(&text).unwrap(), reply);
+        let reason = serde_json::to_value(LeaveReason::Removed { by: "root".into() }).unwrap();
+        assert_eq!(reason, json!({"kind": "removed", "by": "root"}));
+    }
+
+    #[test]
+    fn removing_members_is_not_a_default_permission() {
+        assert!(Permission::ALL.contains(&Permission::MemberRemove));
+        assert!(!Permission::MEMBER_DEFAULT.contains(&Permission::MemberRemove));
     }
 
     #[test]

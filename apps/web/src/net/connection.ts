@@ -120,7 +120,7 @@ export function backoffDelay(attempt: number, random: () => number = Math.random
 
 /** Whether a server-announced departure should be followed by a reconnect. */
 export function shouldReconnectAfter(reason: LeaveReason): boolean {
-  return reason.kind !== "kicked" && reason.kind !== "banned" && reason.kind !== "replaced";
+  return reason.kind !== "kicked" && reason.kind !== "banned" && reason.kind !== "removed" && reason.kind !== "replaced";
 }
 
 function mapHelloError(code: ErrorCode, message: string, serverName?: string, ban?: BanNotice): ConnectError {

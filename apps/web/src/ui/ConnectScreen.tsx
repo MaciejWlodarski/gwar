@@ -285,6 +285,7 @@ function closeNotice(reason: ReturnType<typeof useSession.getState>["closeReason
   if (reason.kind === "server") {
     const r = reason.reason;
     if (r.kind === "kicked") return r.reason ? t("close.kickedReason", { by: r.by, reason: r.reason }) : t("close.kicked", { by: r.by });
+    if (r.kind === "removed") return t("close.removed", { by: r.by });
     if (r.kind === "replaced") return t("close.replaced");
     if (r.kind === "banned") return describeBan({ until: r.until, reason: r.reason }, r.by);
     return null;

@@ -453,6 +453,8 @@ fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Option<Out
         | Request::GroupUpdate(_)
         | Request::GroupDelete { .. }
         | Request::MemberGroups { .. }
+        | Request::MemberRemove { .. }
+        | Request::MemberPrune(_)
         | Request::BanCreate(_)
         | Request::BanList {}
         | Request::BanDelete { .. }

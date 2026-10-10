@@ -17,7 +17,7 @@ export function translate(language: Language, key: Key, params?: Params): string
 const pluralRules: Record<Language, Intl.PluralRules> = { en: new Intl.PluralRules("en"), pl: new Intl.PluralRules("pl") };
 
 /** Picks `<base>.one|few|many|other` for a count (falls back to `.other`). */
-export function countKey(language: Language, base: "chat.users", count: number): Key {
+export function countKey(language: Language, base: "chat.users" | "ss.pruneFound" | "ss.pruneRemove" | "ss.pruneDone", count: number): Key {
   const category = pluralRules[language].select(count);
   const candidate = `${base}.${category}` as Key;
   return candidate in dictionaries[language] ? candidate : (`${base}.other` as Key);

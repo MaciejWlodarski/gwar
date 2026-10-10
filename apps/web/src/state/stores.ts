@@ -69,7 +69,7 @@ export interface Toast {
 }
 
 export type SettingsTab = "audio" | "notifications" | "appearance" | "identity" | "account" | "language";
-export type ServerSettingsTab = "overview" | "roles" | "members" | "bans" | "invites";
+export type ServerSettingsTab = "overview" | "roles" | "members" | "cleanup" | "bans" | "invites";
 
 /** Whom a moderation dialog is about: an online session and/or a known member. */
 export interface PersonRef {
@@ -89,6 +89,7 @@ export type DialogState =
   | { kind: "serverSettings"; tab?: ServerSettingsTab }
   | { kind: "invites" }
   | { kind: "ban"; person: PersonRef; back?: ServerSettingsTab }
+  | { kind: "removeMember"; person: PersonRef; back?: ServerSettingsTab }
   | { kind: "lightbox"; url: string; name: string }
   | { kind: "redeem" }
   | { kind: "createToken" }

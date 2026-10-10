@@ -277,6 +277,36 @@ describe("members", () => {
     expect(Object.values(s.clients).some((c) => c.uid === "u2")).toBe(true);
   });
 
+  it("drops a removed member from the list", () => {
+    let s = reduce(initialState, {
+      type: "welcome",
+      resync: false,
+      now: 1,
+      welcome: welcome({
+        session: 1,
+        uid: "u1",
+        channels: [ch(1)],
+        clients: [cl(1)],
+        members: [{ uid: "u9", nickname: "old", groups: [2], last_seen: 777 }],
+      }),
+    });
+    const before = s;
+    s = ev(s, { ev: "member.removed", d: { uid: "nobody" } });
+    expect(s).toBe(before);
+    s = ev(s, { ev: "member.removed", d: { uid: "u9" } });
+    expect(Object.keys(s.members)).toEqual(["u1"]);
+  });
+
+  it("does not bring back a member who was disconnected by their removal", () => {
+    let s = online();
+    s = ev(s, { ev: "client.left", d: { client: 2, reason: { kind: "removed", by: "n1" } } });
+    expect(s.members["u2"]).toBeDefined();
+    s = ev(s, { ev: "member.removed", d: { uid: "u2" } });
+    expect(s.members["u2"]).toBeUndefined();
+    expect(s.clients[2]).toBeUndefined();
+    expect(s.members["u1"]).toBeDefined();
+  });
+
   it("follows nickname changes", () => {
     let s = online();
     s = ev(s, { ev: "client.updated", d: cl(2, 1, { nickname: "renamed" }) });

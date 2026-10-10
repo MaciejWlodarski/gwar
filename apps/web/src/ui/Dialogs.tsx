@@ -11,6 +11,7 @@ import { useSession, useUi } from "../state/stores";
 import { Button, Dialog, Field, Input, Segmented, Select, Textarea } from "./kit";
 import { SettingsDialog } from "./Settings";
 import { BanDialog } from "./BanDialog";
+import { RemoveMemberDialog } from "./RemoveMemberDialog";
 import { Lightbox } from "./Attachments";
 import { InvitesDialog, ServerSettingsDialog } from "./ServerSettings";
 import { FirstRunDialog } from "./TeamspeakFound";
@@ -37,6 +38,8 @@ export function Dialogs() {
       return <InvitesDialog />;
     case "ban":
       return <BanDialog person={dialog.person} back={dialog.back} />;
+    case "removeMember":
+      return <RemoveMemberDialog person={dialog.person} back={dialog.back} />;
     case "lightbox":
       return <Lightbox url={dialog.url} name={dialog.name} />;
     case "redeem":

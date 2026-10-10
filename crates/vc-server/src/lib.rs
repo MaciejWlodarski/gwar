@@ -13,6 +13,7 @@ pub mod files;
 pub mod gateway;
 pub mod identity;
 pub mod media;
+pub mod members;
 pub mod store;
 #[cfg(feature = "teamspeak")]
 pub mod teamspeak;

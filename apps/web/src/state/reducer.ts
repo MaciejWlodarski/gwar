@@ -304,6 +304,11 @@ function reduceEvent(state: SessionState, event: Event, now: number): SessionSta
       return onGroupDeleted(state, event.d.group);
     case "member.updated":
       return onMemberUpdated(state, event.d);
+    case "member.removed": {
+      if (!(event.d.uid in state.members)) return state;
+      const { [event.d.uid]: _gone, ...members } = state.members;
+      return { ...state, members };
+    }
     case "server.updated":
       return { ...state, server: event.d };
     case "channel.created":
