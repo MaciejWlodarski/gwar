@@ -117,6 +117,8 @@ async fn tag_changes_are_announced_on_member_join_and_removal() {
         .running
         .core
         .connect(ConnectRequest {
+            hello_key: "k".into(),
+            certificate: None,
             request_id: 1,
             uid: b.clone(),
             public_key: "k".into(),

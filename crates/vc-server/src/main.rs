@@ -158,7 +158,8 @@ enum MembersCommand {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Move all records from one member onto another, keeping the target's nickname.
+    /// Move unsigned messages and member records onto another, keeping the target's nickname.
+    /// Signed messages retain their original author uid and mentions.
     /// Both members must exist and the server must be stopped, even for --dry-run.
     Merge {
         from_uid: String,
@@ -202,7 +203,7 @@ fn members(data_dir: &std::path::Path, database: &std::path::Path, command: Memb
             let report = members::merge(&store, &from_uid, &into_uid, dry_run)?;
             let verb = if dry_run { "would merge" } else { "merged" };
             println!(
-                "{verb} {from_uid} into {into_uid}: {} messages, {} files, {} read marks, {} group memberships, {} mentions, {} bans",
+                "{verb} {from_uid} into {into_uid}: {} unsigned messages, {} files, {} read marks, {} group memberships, {} unsigned mentions, {} bans; signed messages keep their original author uid and mentions",
                 report.messages, report.files, report.read_marks, report.groups, report.mentions, report.bans
             );
         }

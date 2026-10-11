@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ChatItem } from "../state/types";
-import { buildRows, unreadLabel } from "./chat";
+import { buildRows, messageTarget, unreadLabel } from "./chat";
 
 const base = new Date(2026, 5, 10, 12, 0, 0).getTime();
 const m = (id: number, uid: string, at: number): ChatItem => ({
@@ -39,5 +39,21 @@ describe("unreadLabel", () => {
     expect(unreadLabel(99)).toBe("99");
     expect(unreadLabel(100)).toBe("99+");
     expect(unreadLabel(250)).toBe("99+");
+  });
+});
+
+
+describe("messageTarget", () => {
+  it("uses the peer uid for my private messages", () => {
+    expect(messageTarget("dm:bob", "alice", "alice")).toBe("dm:alice:bob");
+    expect(messageTarget("dm:alice", "bob", "bob")).toBe("dm:alice:bob");
+  });
+  it("uses my uid for received private messages", () => {
+    expect(messageTarget("dm:bob", "bob", "alice")).toBe("dm:alice:bob");
+    expect(messageTarget("dm:alice", "alice", "bob")).toBe("dm:alice:bob");
+  });
+  it("uses the stored channel or server target", () => {
+    expect(messageTarget("ch:7", "alice", "alice")).toBe("channel:7");
+    expect(messageTarget("server", "bob", "alice")).toBe("server");
   });
 });

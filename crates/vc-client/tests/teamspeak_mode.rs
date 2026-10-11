@@ -85,6 +85,7 @@ async fn teamspeak_mode_maps_state_chat_and_moves() {
     // Chat both ways.
     ts.handle
         .request(Request::ChatSend {
+            signature: vc_proto::MessageSignature::default(),
             target: ChatTarget::Channel(lobby_ts),
             text: "from TeamSpeak mode".into(),
             mentions: Vec::new(),
@@ -203,23 +204,20 @@ async fn teamspeak_users_get_attachment_links_and_can_be_banned() {
     // An attachment arrives on TeamSpeak as a link.
     let reserved = alice
         .connection
-        .request(Request::FileUpload { name: "notes.txt".into(), size: 5, mime: "text/plain".into() })
+        .request(Request::FileUpload {
+            name: "notes.txt".into(),
+            size: 5,
+            mime: "text/plain".into(),
+            sha256: "LPJNul-wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ".into(),
+        })
         .await
         .unwrap();
     let url = format!("http://{}{}", bridged.server.http, reserved["upload_url"].as_str().unwrap());
     let put = reqwest::Client::new().put(url).body("hello").send().await.unwrap();
-    assert_eq!(put.status(), 204);
+    assert_eq!(put.status(), 200);
+    let attachment: vc_proto::Attachment = put.json().await.unwrap();
     let file = reserved["file"].as_str().unwrap().to_owned();
-    alice
-        .connection
-        .request(Request::ChatSend {
-            target: ChatTarget::Channel(lobby),
-            text: "see this".into(),
-            mentions: Vec::new(),
-            attachments: vec![file.clone()],
-        })
-        .await
-        .unwrap();
+    alice.connection.send_chat(ChatTarget::Channel(lobby), "see this".into(), Vec::new(), &[attachment]).await.unwrap();
     let link = format!("{}/files/{file}/notes.txt", support::PUBLIC_URL);
     until(
         &mut ts.events,

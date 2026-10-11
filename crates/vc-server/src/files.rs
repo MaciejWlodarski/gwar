@@ -12,8 +12,10 @@ use axum::{
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::StreamExt;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::warn;
 
@@ -100,6 +102,7 @@ pub async fn upload(
         }
         let mut file = tokio::fs::File::create(&part).await?;
         let mut written: u64 = 0;
+        let mut hash = Sha256::new();
         let mut header = Vec::with_capacity(SNIFF);
         let mut stream = body.into_data_stream();
         while let Some(chunk) = stream.next().await {
@@ -111,10 +114,12 @@ pub async fn upload(
             if header.len() < SNIFF {
                 header.extend_from_slice(&chunk[..chunk.len().min(SNIFF - header.len())]);
             }
+            hash.update(&chunk);
             file.write_all(&chunk).await?;
         }
         file.flush().await?;
-        if written == 0 {
+        let sha256 = URL_SAFE_NO_PAD.encode(hash.finalize());
+        if written != slot.size || sha256 != slot.sha256 {
             return Ok(Err(StatusCode::BAD_REQUEST));
         }
         tokio::fs::rename(&part, &slot.path).await?;
@@ -123,13 +128,16 @@ pub async fn upload(
             .filter(|m| m.starts_with("image/"))
             .and_then(|_| imagesize::blob_size(&header).ok())
             .map(|s| (s.width as u32, s.height as u32));
-        Ok::<_, std::io::Error>(Ok(Uploaded { id: id.clone(), size: written, media, dimensions }))
+        Ok::<_, std::io::Error>(Ok(Uploaded { id: id.clone(), size: written, sha256, media, dimensions }))
     }
     .await;
     match result {
         Ok(Ok(uploaded)) => {
             if gateway.core.upload_finish(uploaded).await {
-                StatusCode::NO_CONTENT.into_response()
+                match gateway.core.file_info(id.clone()).await {
+                    Some((file, _)) => axum::Json(file).into_response(),
+                    None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                }
             } else {
                 let _ = tokio::fs::remove_file(&slot.path).await;
                 StatusCode::INTERNAL_SERVER_ERROR.into_response()

@@ -27,6 +27,7 @@ async fn main() -> anyhow::Result<()> {
     let r = ts
         .handle
         .request(Request::ChatSend {
+            signature: vc_proto::MessageSignature::default(),
             target: ChatTarget::Channel(channel),
             text,
             mentions: Vec::new(),

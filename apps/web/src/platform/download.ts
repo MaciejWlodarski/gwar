@@ -1,3 +1,4 @@
+import type { Attachment } from "../proto/Attachment";
 import { isDesktop, tauri } from ".";
 import { absoluteUrl, filePath } from "../net/address";
 
@@ -111,10 +112,23 @@ export async function saveFile(path: string, name: string, opts: FileOptions): P
   return true;
 }
 
-export async function uploadFromApp(path: string, file: Blob, uploadLimit: number): Promise<number> {
+export async function uploadFromApp(path: string, file: Blob, uploadLimit: number): Promise<Attachment> {
   filePath(path, "PUT");
   fileCap(file.size, uploadLimit);
   await nativeReady;
   const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<number>("upload_put", new Uint8Array(await file.arrayBuffer()), { headers: { "x-upload-path": path } });
+  return invoke<Attachment>("upload_put", new Uint8Array(await file.arrayBuffer()), { headers: { "x-upload-path": path } });
+}
+
+/** Save the exact inspected bytes; native code never refetches a potentially substituted URL. */
+export async function saveBlob(blob: Blob, name: string): Promise<boolean> {
+  if (blob.size > MAX_FILE_BYTES) throw new Error("File exceeds size limit");
+  if (isDesktop()) {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return invoke<boolean>("save_blob_as", new Uint8Array(await blob.arrayBuffer()), { headers: { "x-file-name": encodeURIComponent(name) } });
+  }
+  const url = URL.createObjectURL(blob), a = document.createElement("a");
+  a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  return true;
 }

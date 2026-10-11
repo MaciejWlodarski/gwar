@@ -205,10 +205,9 @@ async fn mentions_are_kept_and_counted_as_unread() {
     bob.close().await;
     let mut alice = Client::connect(&server, "alice").await;
     let lobby = alice.default_channel();
-    let sent = alice
-        .ok("chat.send", json!({"target": {"channel": lobby}, "text": "hi @bob", "mentions": [bob_uid, "nobody"]}))
-        .await;
-    assert_eq!(sent["mentions"], json!([bob_uid]), "unknown users are dropped");
+    let sent =
+        alice.ok("chat.send", json!({"target": {"channel": lobby}, "text": "hi @bob", "mentions": [bob_uid]})).await;
+    assert_eq!(sent["mentions"], json!([bob_uid]), "signed mentions are kept");
     alice.ok("chat.send", json!({"target": {"channel": lobby}, "text": "plain"})).await;
 
     let bob = Client::connect_as(&server, key, "bob", None).await.unwrap();
@@ -256,10 +255,13 @@ const PNG_1X1: &[u8] = &[
 ];
 
 async fn upload(server: &TestServer, client: &mut Client, name: &str, mime: &str, bytes: &[u8]) -> String {
-    let reserved = client.ok("file.upload", json!({"name": name, "size": bytes.len(), "mime": mime})).await;
+    let reserved =
+        client.ok("file.upload", json!({"name": name, "size": bytes.len(), "sha256": hash(bytes), "mime": mime})).await;
     let url = format!("{}{}", server.http(), reserved["upload_url"].as_str().unwrap());
-    let status = reqwest::Client::new().put(&url).body(bytes.to_vec()).send().await.unwrap().status();
-    assert_eq!(status, 204, "upload accepted");
+    let response = reqwest::Client::new().put(&url).body(bytes.to_vec()).send().await.unwrap();
+    assert_eq!(response.status(), 200, "upload accepted");
+    let att: vc_proto::Attachment = response.json().await.unwrap();
+    client.files.insert(att.id.clone(), att);
     // The token works once.
     let again = reqwest::Client::new().put(&url).body(bytes.to_vec()).send().await.unwrap().status();
     assert_eq!(again, 403);
@@ -298,7 +300,7 @@ async fn uploads_attach_to_messages_and_are_served_safely() {
         alice.fails("chat.send", json!({"target": {"channel": lobby}, "text": "x", "attachments": [image]})).await,
         "not_found"
     );
-    alice.ok("chat.delete", json!({"message": sent["id"]})).await;
+    alice.ok("chat.edit", json!({"message": sent["id"], "text": vc_proto::DELETION_TEXT})).await;
     let after = get(files[0]["url"].as_str().unwrap()).await.unwrap();
     assert_eq!(after.status(), 404);
 }

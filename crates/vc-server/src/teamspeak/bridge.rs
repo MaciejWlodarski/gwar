@@ -811,7 +811,7 @@ impl<'a> Bridge<'a> {
                 }
                 self.reconcile(Duration::ZERO);
             }
-            BridgeNote::Event(event) => self.on_event(event).await,
+            BridgeNote::Event(event) => self.on_event(*event).await,
             BridgeNote::Unban { uid } => self.unban(&uid).await,
         }
     }
@@ -1307,6 +1307,7 @@ mod tests {
     #[test]
     fn long_messages_are_split_and_attachments_become_links() {
         let mut m = ChatMessage {
+            signature: None,
             id: 1,
             target: ChatTarget::Server,
             author: 1,
@@ -1316,6 +1317,7 @@ mod tests {
             sent_at: 0,
             mentions: vec![],
             attachments: vec![vc_proto::Attachment {
+                sha256: String::new(),
                 id: "f1".into(),
                 name: "cat.png".into(),
                 mime: "image/png".into(),

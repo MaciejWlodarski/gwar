@@ -1,4 +1,6 @@
 /** Bounded validators tied to generated protocol types. No schema dependency. */
+import type { MessageSignature } from "../proto/MessageSignature";
+import type { DeviceCertificate } from "../proto/DeviceCertificate";
 import type { Attachment } from "../proto/Attachment";
 import type { Ban } from "../proto/Ban";
 import type { BanNotice } from "../proto/BanNotice";
@@ -69,8 +71,12 @@ const unread = shape<Unread>({ channel: id, last_read: id, count: int(1000000), 
 const ice = shape<IceServer>({ urls: array(str(2048), 16), username: optional(nullable(str(1024))), credential: optional(nullable(str(1024))) });
 const welcome = shape<Welcome>({ session: id, uid, server, permissions: array(permissions, 32), groups: array(group, 128), channels: array(channel, 1024), clients: array(client, 4096), members: array(member, 10000), unread: array(unread, 1024), ice_servers: array(ice, 32) });
 const target: Rule<ChatTarget> = (v): v is ChatTarget => v === "server" || shape<{ channel: number }>({ channel: id })(v) || shape<{ client: number }>({ client: id })(v);
-const attachment = shape<Attachment>({ id: str(64), name: str(512), mime: str(100), size: int(MAX_FILE_BYTES, 1), url: path(), width: optional(nullable(int(4294967295))), height: optional(nullable(int(4294967295))) });
-const message = shape<ChatMessage>({ id, target, author: id, author_uid: uid, author_name: str(256), text, sent_at: id, mentions: optional(array(uid, 128)), attachments: optional(array(attachment, 10)), edited_at: optional(nullable(id)) });
+const certificate = shape<DeviceCertificate>({ account_key: fixed(32), device_key: fixed(32), issued_at: id, expires_at: id, signature: fixed(64) });
+const commitment: Rule<string> = (v): v is string => v === "-" || fixed(32)(v);
+const conversation: Rule<string> = (v): v is string => str(128)(v) && /^(server|channel:(0|[1-9][0-9]*)|dm:[A-Za-z0-9_-]{27}:[A-Za-z0-9_-]{27})$/.test(v);
+const signature = shape<MessageSignature>({ server_key: fixed(32), conversation, author_uid: fixed(20), key: fixed(32), certificate: nullable(certificate), certificate_hash: commitment, message_id: fixed(16), revision: int(4294967295), previous_revision_hash: commitment, created_at: id, signed_at: id, body_hash: fixed(32), signature: fixed(64) });
+export const attachment = shape<Attachment>({ id: str(64), name: str(512), mime: str(100), size: int(MAX_FILE_BYTES, 1), url: path(), width: optional(nullable(int(4294967295))), height: optional(nullable(int(4294967295))), sha256: (v): v is string => v === "" || fixed(32)(v) });
+const message = shape<ChatMessage>({ id, target, author: id, author_uid: uid, author_name: str(256), text, sent_at: id, mentions: optional(array(uid, 128)), attachments: optional(array(attachment, 10)), edited_at: optional(nullable(id)), signature: optional(nullable(signature)) });
 const notice = shape<BanNotice>({ by: str(256), reason: optional(nullable(text)), until: optional(nullable(id)) });
 export const error = shape<ErrorBody>({ code: errorCode, message: text, ban: optional(nullable(notice)) });
 const leave: Rule<LeaveReason> = (v): v is LeaveReason => {

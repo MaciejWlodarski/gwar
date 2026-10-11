@@ -8,7 +8,11 @@ pub mod ts_identity;
 pub mod ts_import;
 pub mod voice;
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -24,8 +28,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::debug;
 use vc_proto::{
     ChannelId, ChatMessage, ChatTarget, ClientFrame, ClientSoftware, DeviceCertificate, ErrorBody, Event, Hello, Join,
-    PROTOCOL_VERSION, Request, Response, ServerFrame, Welcome, certificate_hash, decode_fixed, hello_statement,
-    normalize_endpoint, server_proof_statement,
+    MessageSignature, PROTOCOL_VERSION, Request, Response, ServerFrame, Welcome, certificate_hash, decode_fixed,
+    hello_statement, message_body_hash, message_statement, normalize_endpoint, server_proof_statement,
 };
 
 pub use identity::Identity;
@@ -95,6 +99,10 @@ pub struct Connection {
     outgoing: mpsc::Sender<(Request, Pending)>,
     /// Verified identity epoch for this server connection.
     pub server_key: String,
+    identity: Identity,
+    certificate: Option<DeviceCertificate>,
+    uid: String,
+    clients: Arc<RwLock<HashMap<u32, String>>>,
 }
 
 pub struct Connected {
@@ -193,6 +201,18 @@ pub async fn connect(options: ConnectOptions) -> Result<Connected, ClientError> 
         _ => return Err(ClientError::Protocol("expected welcome".into())),
     };
 
+    let uid = hello
+        .certificate
+        .as_ref()
+        .map(|c| {
+            use sha2::{Digest, Sha256};
+            URL_SAFE_NO_PAD
+                .encode(&Sha256::digest(decode_fixed::<32>(&c.account_key).expect("certificate checked"))[..20])
+        })
+        .unwrap_or_else(|| options.identity.uid());
+    let clients =
+        Arc::new(RwLock::new(welcome.clients.iter().map(|c| (c.id, c.uid.clone())).collect::<HashMap<_, _>>()));
+    let current_clients = clients.clone();
     let (outgoing, mut requests) = mpsc::channel::<(Request, Pending)>(64);
     let (events_tx, events) = mpsc::channel(1024);
     tokio::spawn(async move {
@@ -233,6 +253,11 @@ pub async fn connect(options: ConnectOptions) -> Result<Connected, ClientError> 
                     }
                     match serde_json::from_value::<Event>(value) {
                         Ok(event) => {
+                            match &event {
+                                Event::ClientJoined(c) | Event::ClientUpdated(c) => { current_clients.write().unwrap().insert(c.id, c.uid.clone()); }
+                                Event::ClientLeft { client, .. } => { current_clients.write().unwrap().remove(client); }
+                                _ => {}
+                            }
                             if events_tx.send(event).await.is_err() {
                                 break;
                             }
@@ -245,7 +270,18 @@ pub async fn connect(options: ConnectOptions) -> Result<Connected, ClientError> 
         let _ = ws.close(None).await;
     });
 
-    Ok(Connected { connection: Connection { outgoing, server_key: challenge.server_pk }, welcome, events })
+    Ok(Connected {
+        connection: Connection {
+            outgoing,
+            server_key: challenge.server_pk,
+            identity: options.identity,
+            certificate: hello.certificate,
+            uid,
+            clients,
+        },
+        welcome,
+        events,
+    })
 }
 
 async fn read_frame<S>(ws: &mut S) -> Result<ServerFrame, ClientError>
@@ -286,8 +322,58 @@ impl Connection {
     }
 
     pub async fn chat(&self, target: ChatTarget, text: impl Into<String>) -> Result<ChatMessage, ClientError> {
-        self.request_as(Request::ChatSend { target, text: text.into(), mentions: Vec::new(), attachments: Vec::new() })
-            .await
+        self.send_chat(target, text.into(), Vec::new(), &[]).await
+    }
+
+    pub async fn send_chat(
+        &self,
+        target: ChatTarget,
+        text: String,
+        mentions: Vec<String>,
+        attachments: &[vc_proto::Attachment],
+    ) -> Result<ChatMessage, ClientError> {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+        let signed_target = match target {
+            ChatTarget::Channel(id) => format!("channel:{id}"),
+            ChatTarget::Server => "server".into(),
+            ChatTarget::Client(id) => vc_proto::dm_conversation(
+                &self.uid,
+                self.clients
+                    .read()
+                    .unwrap()
+                    .get(&id)
+                    .ok_or_else(|| ClientError::Protocol("unknown recipient".into()))?,
+            ),
+        };
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+        let mut signature = MessageSignature {
+            server_key: self.server_key.clone(),
+            conversation: signed_target.clone(),
+            author_uid: self.uid.clone(),
+            key: self.identity.public_key(),
+            certificate: self.certificate.clone(),
+            certificate_hash: certificate_hash(self.certificate.as_ref())
+                .ok_or_else(|| ClientError::Protocol("invalid certificate".into()))?,
+            message_id: URL_SAFE_NO_PAD.encode(rand::random::<[u8; 16]>()),
+            revision: 0,
+            previous_revision_hash: "-".into(),
+            created_at: now,
+            signed_at: now,
+            body_hash: message_body_hash(&text, &mentions, attachments),
+            signature: String::new(),
+        };
+        signature.signature = self.identity.sign(
+            message_statement(&self.server_key, &signed_target, &self.uid, &signature, &signature.body_hash).as_bytes(),
+        );
+        self.request_as(Request::ChatSend {
+            target,
+            text,
+            mentions,
+            attachments: attachments.iter().map(|a| a.id.clone()).collect(),
+            signature,
+        })
+        .await
     }
 
     /// Exchanges a WebRTC offer for the server's answer SDP.

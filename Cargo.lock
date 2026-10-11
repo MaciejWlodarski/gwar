@@ -6896,6 +6896,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1",
+ "sha2",
  "str0m",
  "thiserror 2.0.21",
  "tokio",
@@ -6916,6 +6917,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "open",
+ "percent-encoding",
  "reqwest",
  "rtrb",
  "serde",
@@ -6939,6 +6941,7 @@ name = "vc-proto"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "ed25519-dalek",
  "serde",
  "serde_json",
  "sha2",

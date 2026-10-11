@@ -28,6 +28,7 @@ pub(super) struct PendingUpload {
     mime: String,
     size: u64,
     token: String,
+    sha256: String,
     until: Instant,
 }
 
@@ -35,12 +36,14 @@ pub(super) struct PendingUpload {
 pub struct UploadSlot {
     pub path: PathBuf,
     pub size: u64,
+    pub sha256: String,
 }
 
 /// A finished upload as checked by the HTTP side.
 pub struct Uploaded {
     pub id: String,
     pub size: u64,
+    pub sha256: String,
     /// Image, audio or video type sniffed from the bytes, if any.
     pub media: Option<&'static str>,
     pub dimensions: Option<(u32, u32)>,
@@ -95,7 +98,14 @@ impl Core {
         self.files_dir.join(id)
     }
 
-    pub(super) fn file_upload(&mut self, session: SessionId, name: String, size: u64, mime: String) -> Reply {
+    pub(super) fn file_upload(
+        &mut self,
+        session: SessionId,
+        name: String,
+        size: u64,
+        mime: String,
+        sha256: String,
+    ) -> Reply {
         self.require(session, Permission::FileUpload)?;
         if self.info.upload_limit == 0 {
             return Err(err(ErrorCode::Unavailable, "uploads are disabled on this server"));
@@ -105,6 +115,9 @@ impl Core {
         }
         if size > self.info.upload_limit {
             return Err(err(ErrorCode::TooLarge, "file is too large"));
+        }
+        if !crate::identity::valid_hash(&sha256, 32) {
+            return Err(err(ErrorCode::BadRequest, "invalid attachment hash"));
         }
         let now = Instant::now();
         self.uploads.retain(|_, u| u.until > now);
@@ -119,7 +132,7 @@ impl Core {
         let upload_url = format!("/api/files/{id}?token={token}");
         self.uploads.insert(
             id.clone(),
-            PendingUpload { uploader, name: clean_name(&name), mime, size, token, until: now + UPLOAD_WINDOW },
+            PendingUpload { uploader, name: clean_name(&name), mime, size, token, sha256, until: now + UPLOAD_WINDOW },
         );
         Ok(Response::Upload { file: id, upload_url })
     }
@@ -134,9 +147,9 @@ impl Core {
                     .map(|u| {
                         // The token is spent; the upload stays reserved until it finishes.
                         u.token.clear();
-                        u.size
+                        (u.size, u.sha256.clone())
                     })
-                    .map(|size| UploadSlot { path: self.files_dir.join(&id), size });
+                    .map(|(size, sha256)| UploadSlot { path: self.files_dir.join(&id), size, sha256 });
                 let _ = reply.send(slot);
             }
             FileMsg::Finish { upload, reply } => {
@@ -144,6 +157,10 @@ impl Core {
                     let _ = reply.send(false);
                     return;
                 };
+                if upload.sha256 != pending.sha256 || upload.size != pending.size {
+                    let _ = reply.send(false);
+                    return;
+                }
                 // Only sniffed media types are ever served as themselves.
                 let mime = upload.media.map(str::to_owned).unwrap_or(pending.mime);
                 let stored = self.store.insert_file(
@@ -152,6 +169,7 @@ impl Core {
                     &pending.name,
                     &mime,
                     upload.size,
+                    &upload.sha256,
                     upload.dimensions,
                     now_ms(),
                 );

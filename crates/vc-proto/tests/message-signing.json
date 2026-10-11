@@ -1,0 +1,148 @@
+[
+  {
+    "text": "Zażółć 🦀\n1:a,",
+    "mentions": [
+      "dZl3bDCF4_naDRMHHrC0q1D9K_Y",
+      "ti6Gf6LzOv5i1daxZC4WIdVDMHg",
+      "dZl3bDCF4_naDRMHHrC0q1D9K_Y"
+    ],
+    "attachments": [],
+    "signature": {
+      "server_key": "GX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE",
+      "conversation": "channel:42",
+      "author_uid": "NHUPmL1Z_PyUbaRaqr6TO-FUpLU",
+      "key": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+      "certificate": {
+        "account_key": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+        "device_key": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+        "issued_at": 1699999999000,
+        "expires_at": 1707775999000,
+        "signature": "63TqDxTPj6OLusEP521QDTzmwrrycA10DBU-q_zHdH5Ofn_uOW2YTkJCfKmxXwhs5BiJhm9lu1YyzHzyRFneDg"
+      },
+      "certificate_hash": "od853OrRvI7xdr3ZuELM2itbJxVf60ILb52fy7CjDAU",
+      "message_id": "AQEBAQEBAQEBAQEBAQEBAQ",
+      "revision": 0,
+      "previous_revision_hash": "-",
+      "created_at": 1700000000000,
+      "signed_at": 1700000000000,
+      "body_hash": "QVzxhottyEqAfw7doJBDZEnjOtuJKjDnqWhiRlqEmuM",
+      "signature": "XUnsJ5SwkNco2AD7n6WJ9_KEdILPGSy-Jk6HirpEs1KYkpNQeLa3bpJjo-rMdIGa-uZLUJZ3lV53oAn_B1AiDg"
+    },
+    "canonical_body": "MjA6WmHFvMOzxYLEhyDwn6aACjE6YSwsMToyLDI3OmRabDNiRENGNF9uYURSTUhIckMwcTFEOUtfWSwyNzp0aTZHZjZMek92NWkxZGF4WkM0V0lkVkRNSGcsMTowLA",
+    "statement": "gwar message v2\nGX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE\nchannel:42\nNHUPmL1Z_PyUbaRaqr6TO-FUpLU\ngTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q\nod853OrRvI7xdr3ZuELM2itbJxVf60ILb52fy7CjDAU\nAQEBAQEBAQEBAQEBAQEBAQ\n0\n-\n1700000000000\n1700000000000\nQVzxhottyEqAfw7doJBDZEnjOtuJKjDnqWhiRlqEmuM",
+    "revision_hash": "fYj4kIe3lzQwXtfcXrPn8S_6CW0Z0PfPcaz_UpLCQ-I"
+  },
+  {
+    "text": "edited",
+    "mentions": [],
+    "attachments": [],
+    "signature": {
+      "server_key": "GX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE",
+      "conversation": "channel:42",
+      "author_uid": "NHUPmL1Z_PyUbaRaqr6TO-FUpLU",
+      "key": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+      "certificate": {
+        "account_key": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+        "device_key": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+        "issued_at": 1699999999000,
+        "expires_at": 1707775999000,
+        "signature": "63TqDxTPj6OLusEP521QDTzmwrrycA10DBU-q_zHdH5Ofn_uOW2YTkJCfKmxXwhs5BiJhm9lu1YyzHzyRFneDg"
+      },
+      "certificate_hash": "od853OrRvI7xdr3ZuELM2itbJxVf60ILb52fy7CjDAU",
+      "message_id": "AQEBAQEBAQEBAQEBAQEBAQ",
+      "revision": 1,
+      "previous_revision_hash": "fYj4kIe3lzQwXtfcXrPn8S_6CW0Z0PfPcaz_UpLCQ-I",
+      "created_at": 1700000000000,
+      "signed_at": 1700000000100,
+      "body_hash": "5p-qDpld3gIRwil7HNBjma8iSsZQWVrKWP1J3yNe4xo",
+      "signature": "Ulofxb5b9q-yAVlsj4c1-2amOicdg5-HvLwQbEt9CHtWADYfINrCPbB8wq8ZgVpBihyqOrHxte--nl_NnfWcBQ"
+    },
+    "canonical_body": "NjplZGl0ZWQsMTowLDE6MCw",
+    "statement": "gwar message v2\nGX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE\nchannel:42\nNHUPmL1Z_PyUbaRaqr6TO-FUpLU\ngTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q\nod853OrRvI7xdr3ZuELM2itbJxVf60ILb52fy7CjDAU\nAQEBAQEBAQEBAQEBAQEBAQ\n1\nfYj4kIe3lzQwXtfcXrPn8S_6CW0Z0PfPcaz_UpLCQ-I\n1700000000000\n1700000000100\n5p-qDpld3gIRwil7HNBjma8iSsZQWVrKWP1J3yNe4xo",
+    "revision_hash": "_QfEnZ6tlsNTf7k6F71qN7b5TA483bs6SbmYj-0XrrE"
+  },
+  {
+    "text": "\u0000gwar deleted v1",
+    "mentions": [],
+    "attachments": [],
+    "signature": {
+      "server_key": "GX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE",
+      "conversation": "channel:42",
+      "author_uid": "NHUPmL1Z_PyUbaRaqr6TO-FUpLU",
+      "key": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+      "certificate": {
+        "account_key": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+        "device_key": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+        "issued_at": 1699999999000,
+        "expires_at": 1707775999000,
+        "signature": "63TqDxTPj6OLusEP521QDTzmwrrycA10DBU-q_zHdH5Ofn_uOW2YTkJCfKmxXwhs5BiJhm9lu1YyzHzyRFneDg"
+      },
+      "certificate_hash": "od853OrRvI7xdr3ZuELM2itbJxVf60ILb52fy7CjDAU",
+      "message_id": "AQEBAQEBAQEBAQEBAQEBAQ",
+      "revision": 2,
+      "previous_revision_hash": "_QfEnZ6tlsNTf7k6F71qN7b5TA483bs6SbmYj-0XrrE",
+      "created_at": 1700000000000,
+      "signed_at": 1700000000200,
+      "body_hash": "SaT23qEu4BSvBel2IUyDLlN9qL5CpP9GfyBEjwMuq_s",
+      "signature": "ckNww61cVJzbVnqm0OlBof3MkmUt6G00ZjlMvQKO6e8FEM4QJNeOTPGzSUFKKIt-3ZY3sEfGcrC4YlIt_AsvAg"
+    },
+    "canonical_body": "MTY6AGd3YXIgZGVsZXRlZCB2MSwxOjAsMTowLA",
+    "statement": "gwar message v2\nGX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE\nchannel:42\nNHUPmL1Z_PyUbaRaqr6TO-FUpLU\ngTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q\nod853OrRvI7xdr3ZuELM2itbJxVf60ILb52fy7CjDAU\nAQEBAQEBAQEBAQEBAQEBAQ\n2\n_QfEnZ6tlsNTf7k6F71qN7b5TA483bs6SbmYj-0XrrE\n1700000000000\n1700000000200\nSaT23qEu4BSvBel2IUyDLlN9qL5CpP9GfyBEjwMuq_s",
+    "revision_hash": "xa4eXflbaM3FjS2amOP-Esnlr76R7bPmPP4gIkYoS2A"
+  },
+  {
+    "text": "private",
+    "mentions": [],
+    "attachments": [],
+    "signature": {
+      "server_key": "GX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE",
+      "conversation": "dm:dZl3bDCF4_naDRMHHrC0q1D9K_Y:ti6Gf6LzOv5i1daxZC4WIdVDMHg",
+      "author_uid": "ti6Gf6LzOv5i1daxZC4WIdVDMHg",
+      "key": "7UkoxijRwsbq6QM4kFmVYSlZJzpcY_k2NsFGFKyHN9E",
+      "certificate": null,
+      "certificate_hash": "-",
+      "message_id": "BAQEBAQEBAQEBAQEBAQEBA",
+      "revision": 0,
+      "previous_revision_hash": "-",
+      "created_at": 1700000000000,
+      "signed_at": 1700000000000,
+      "body_hash": "h0jUL4xUx_X17mSl6FbjptjK3TTQWSDCWfWAe0KOyPM",
+      "signature": "ghLRPg7Pps1f-evpT9P_QtWuptG8dh7zat5Djd5esFNwUu8WBzv8sunm0aLdRpAylPG_rYrQ5lFGmAPptAFOCA"
+    },
+    "canonical_body": "Nzpwcml2YXRlLDE6MCwxOjAs",
+    "statement": "gwar message v2\nGX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE\ndm:dZl3bDCF4_naDRMHHrC0q1D9K_Y:ti6Gf6LzOv5i1daxZC4WIdVDMHg\nti6Gf6LzOv5i1daxZC4WIdVDMHg\n7UkoxijRwsbq6QM4kFmVYSlZJzpcY_k2NsFGFKyHN9E\n-\nBAQEBAQEBAQEBAQEBAQEBA\n0\n-\n1700000000000\n1700000000000\nh0jUL4xUx_X17mSl6FbjptjK3TTQWSDCWfWAe0KOyPM",
+    "revision_hash": "yRk5RJTThzsDkkWzdoy4uRNQb00rXFW654ZwWJ454Q4"
+  },
+  {
+    "text": "attachments",
+    "mentions": [],
+    "attachments": [
+      {
+        "id": "ignored",
+        "url": "/files/ignored/a.txt",
+        "sha256": "LPJNul-wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ",
+        "size": 5,
+        "mime": "text/plain",
+        "name": "a,🔒.txt"
+      }
+    ],
+    "signature": {
+      "server_key": "GX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE",
+      "conversation": "server",
+      "author_uid": "ti6Gf6LzOv5i1daxZC4WIdVDMHg",
+      "key": "7UkoxijRwsbq6QM4kFmVYSlZJzpcY_k2NsFGFKyHN9E",
+      "certificate": null,
+      "certificate_hash": "-",
+      "message_id": "BQUFBQUFBQUFBQUFBQUFBQ",
+      "revision": 0,
+      "previous_revision_hash": "-",
+      "created_at": 1700000000000,
+      "signed_at": 1700000000000,
+      "body_hash": "LnzXBz8wG385D_5crrNyJDqqwHghT2mRRLL9clj1Oms",
+      "signature": "G9PNMS8hdaJDktEq90UOt7Y57kPOHb-hgSlXSiW5E1j2fj5bkPlPU5RRE2jT49pyVI_QeLQmQpnBY2qGp9d7Bg"
+    },
+    "canonical_body": "MTE6YXR0YWNobWVudHMsMTowLDE6MSw0MzpMUEpOdWwtd293NG02RHNxeGJuaW5oc1dIbHdmcDBKZWN3UXpZcE9MbUNRLDE6NSwxMDp0ZXh0L3BsYWluLDEwOmEs8J-Uki50eHQs",
+    "statement": "gwar message v2\nGX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE\nserver\nti6Gf6LzOv5i1daxZC4WIdVDMHg\n7UkoxijRwsbq6QM4kFmVYSlZJzpcY_k2NsFGFKyHN9E\n-\nBQUFBQUFBQUFBQUFBQUFBQ\n0\n-\n1700000000000\n1700000000000\nLnzXBz8wG385D_5crrNyJDqqwHghT2mRRLL9clj1Oms",
+    "revision_hash": "f3KriXURyk8oqzHoBP6ii2q_okeeSmGzMU8rWBYSL_U"
+  }
+]

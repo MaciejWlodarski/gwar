@@ -9,7 +9,9 @@ use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
-use vc_proto::{ErrorBody, Hello, Welcome, normalize_endpoint, server_proof_statement};
+use vc_proto::{
+    Attachment, ChatMessage, ErrorBody, Hello, MessageSignature, Welcome, normalize_endpoint, server_proof_statement,
+};
 use vc_server::{Config, Running};
 
 /// Upper bound for any single wait so a broken test fails instead of hanging.
@@ -89,6 +91,11 @@ impl Drop for TestServer {
 }
 
 // ---------------------------------------------------------------- identity
+
+pub fn hash(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    B64.encode(Sha256::digest(bytes))
+}
 
 pub fn new_key() -> SigningKey {
     SigningKey::from_bytes(&rand::random::<[u8; 32]>())
@@ -229,6 +236,10 @@ pub struct Client {
     pub key: SigningKey,
     pub welcome: Welcome,
     pub challenge: Value,
+    pub server_key: String,
+    pub certificate: Option<vc_proto::DeviceCertificate>,
+    pub files: HashMap<String, Attachment>,
+    pub messages: HashMap<u32, ChatMessage>,
     next_id: u32,
     replies: HashMap<u32, Result<Value, ErrorBody>>,
     events: VecDeque<Value>,
@@ -280,6 +291,10 @@ impl Client {
         let welcome = serde_json::from_value(frame["ok"].clone()).expect("welcome");
         Ok(Self {
             ws: raw.ws,
+            server_key: h.expected_server_pk.clone(),
+            certificate: h.certificate.clone(),
+            files: HashMap::new(),
+            messages: HashMap::new(),
             key,
             welcome,
             challenge: raw.challenge,
@@ -287,6 +302,67 @@ impl Client {
             replies: HashMap::new(),
             events: VecDeque::new(),
         })
+    }
+
+    pub fn signature(
+        &self,
+        target: &str,
+        text: &str,
+        mentions: &[String],
+        attachments: &[Attachment],
+    ) -> MessageSignature {
+        let now = vc_server::core::now_ms();
+        let mut sig = MessageSignature {
+            server_key: self.server_key.clone(),
+            conversation: target.into(),
+            author_uid: self.welcome.uid.clone(),
+            key: public_key(&self.key),
+            certificate: self.certificate.clone(),
+            certificate_hash: vc_proto::certificate_hash(self.certificate.as_ref()).unwrap(),
+            message_id: B64.encode(rand::random::<[u8; 16]>()),
+            revision: 0,
+            previous_revision_hash: "-".into(),
+            created_at: now,
+            signed_at: now,
+            body_hash: vc_proto::message_body_hash(text, mentions, attachments),
+            signature: String::new(),
+        };
+        self.resign(&mut sig, target, text, mentions, attachments);
+        sig
+    }
+
+    pub fn resign(
+        &self,
+        sig: &mut MessageSignature,
+        target: &str,
+        text: &str,
+        mentions: &[String],
+        attachments: &[Attachment],
+    ) {
+        sig.body_hash = vc_proto::message_body_hash(text, mentions, attachments);
+        let statement = vc_proto::message_statement(
+            &sig.server_key,
+            target,
+            &self.welcome.uid,
+            sig,
+            &vc_proto::message_body_hash(text, mentions, attachments),
+        );
+        sig.signature = B64.encode(self.key.sign(statement.as_bytes()).to_bytes());
+    }
+
+    fn remember(&mut self, v: &Value) {
+        if let Ok(message) = serde_json::from_value::<ChatMessage>(v.clone()) {
+            self.messages.insert(message.id, message);
+        }
+        if let Some(messages) = v["messages"].as_array() {
+            for message in messages {
+                self.remember(message);
+            }
+        }
+        if let Ok(client) = serde_json::from_value::<vc_proto::Client>(v.clone()) {
+            self.welcome.clients.retain(|c| c.id != client.id);
+            self.welcome.clients.push(client);
+        }
     }
 
     pub fn id(&self) -> u32 {
@@ -300,6 +376,7 @@ impl Client {
     /// Reads one frame from the socket and files it as a reply or an event.
     async fn pump(&mut self) -> Option<()> {
         let frame = recv(&mut self.ws).await?;
+        self.remember(frame.get("ok").or_else(|| frame.get("d")).unwrap_or(&Value::Null));
         match frame.get("re").and_then(Value::as_u64) {
             Some(re) => {
                 let result = match frame.get("err") {
@@ -314,12 +391,79 @@ impl Client {
     }
 
     /// Sends a request without waiting for the reply.
-    pub async fn send(&mut self, op: &str, d: Value) -> u32 {
+    pub async fn send(&mut self, op: &str, mut d: Value) -> u32 {
+        if op == "chat.send"
+            && d["target"]["client"]
+                .as_u64()
+                .is_some_and(|id| !self.welcome.clients.iter().any(|c| u64::from(c.id) == id))
+        {
+            self.next_id += 1;
+            let ping = self.next_id;
+            self.ws
+                .send(Message::text(json!({"id": ping, "op": "ping", "d": {}}).to_string()))
+                .await
+                .expect("send ping");
+            let _ = self.reply(ping).await;
+        }
+        if matches!(op, "chat.send" | "chat.edit") && d.get("signature").is_none() {
+            let old = d["message"].as_u64().and_then(|id| self.messages.get(&(id as u32))).cloned();
+            let target =
+                old.as_ref().map(|m| serde_json::to_value(&m.target).unwrap()).unwrap_or_else(|| d["target"].clone());
+            let signed_target = if target == "server" {
+                "server".into()
+            } else if let Some(id) = target["channel"].as_u64() {
+                format!("channel:{id}")
+            } else {
+                vc_proto::dm_conversation(
+                    &self.welcome.uid,
+                    self.welcome
+                        .clients
+                        .iter()
+                        .find(|c| u64::from(c.id) == target["client"].as_u64().unwrap_or(0))
+                        .map(|c| c.uid.as_str())
+                        .unwrap_or("unknown"),
+                )
+            };
+            let mentions: Vec<String> =
+                serde_json::from_value(d.get("mentions").cloned().unwrap_or(json!([]))).unwrap();
+            let attachments = if d["text"] == vc_proto::DELETION_TEXT {
+                Vec::new()
+            } else {
+                old.as_ref().map(|m| m.attachments.clone()).unwrap_or_else(|| {
+                    d["attachments"]
+                        .as_array()
+                        .map(|ids| ids.iter().filter_map(|id| self.files.get(id.as_str()?).cloned()).collect())
+                        .unwrap_or_default()
+                })
+            };
+            let mut sig = self.signature(&signed_target, d["text"].as_str().unwrap_or(""), &mentions, &attachments);
+            if op == "chat.edit" {
+                if let Some(original) = old.and_then(|m| m.signature) {
+                    sig.message_id = original.message_id.clone();
+                    sig.revision = original.revision + 1;
+                    sig.previous_revision_hash = vc_proto::message_revision_hash(&original);
+                    sig.created_at = original.created_at;
+                }
+                sig.signed_at = vc_server::core::now_ms();
+                self.resign(&mut sig, &signed_target, d["text"].as_str().unwrap_or(""), &mentions, &attachments);
+            }
+            d["signature"] = serde_json::to_value(sig).unwrap();
+        }
+        if op == "file.upload" && d.get("sha256").is_none() {
+            d["sha256"] = json!(hash(b""));
+        }
         self.next_id += 1;
         let id = self.next_id;
         let frame = json!({"id": id, "op": op, "d": d});
         self.ws.send(Message::text(frame.to_string())).await.expect("send");
         id
+    }
+
+    pub async fn send_raw_request(&mut self, frame: Value) -> bool {
+        self.ws.send(Message::text(frame.to_string())).await.is_ok()
+    }
+    pub async fn raw_frame(&mut self) -> Option<Value> {
+        recv(&mut self.ws).await
     }
 
     pub async fn send_raw(&mut self, text: &str) {

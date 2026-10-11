@@ -53,6 +53,11 @@ impl Identity {
         Ok(Self(SigningKey::from_bytes(&seed)))
     }
 
+    pub fn uid(&self) -> String {
+        use sha2::{Digest, Sha256};
+        URL_SAFE_NO_PAD.encode(&Sha256::digest(self.0.verifying_key().as_bytes())[..20])
+    }
+
     pub fn public_key(&self) -> String {
         URL_SAFE_NO_PAD.encode(self.0.verifying_key().as_bytes())
     }

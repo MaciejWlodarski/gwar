@@ -8,4 +8,4 @@ url: string,
 /**
  * Pixel size, for images.
  */
-width?: number | null, height?: number | null, };
+width?: number | null, height?: number | null, sha256: string, };

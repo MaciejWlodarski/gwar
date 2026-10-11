@@ -99,6 +99,7 @@ wire! {
             /// Ids of finished uploads (see `file.upload`) to attach.
             #[serde(default, skip_serializing_if = "Vec::is_empty")]
             attachments: Vec<FileId>,
+            signature: MessageSignature,
         },
         /// Changes the text of your own channel message.
         #[serde(rename = "chat.edit")]
@@ -107,6 +108,7 @@ wire! {
             text: String,
             #[serde(default, skip_serializing_if = "Vec::is_empty")]
             mentions: Vec<Uid>,
+            signature: MessageSignature,
         },
         /// Deletes a channel message: your own, or anyone's with `message_manage`.
         #[serde(rename = "chat.delete")]
@@ -128,7 +130,7 @@ wire! {
         TokenCreate { group: GroupId },
         /// Reserves an upload; the reply says where to `PUT` the bytes.
         #[serde(rename = "file.upload")]
-        FileUpload { name: String, size: u64, mime: String },
+        FileUpload { name: String, size: u64, mime: String, sha256: String },
         #[serde(rename = "group.create")]
         GroupCreate(GroupCreate),
         #[serde(rename = "group.update")]
@@ -369,7 +371,7 @@ wire! {
         ServerProof(ServerProof),
         Welcome(Box<Welcome>),
         Channel(Channel),
-        Message(ChatMessage),
+        Message(Box<ChatMessage>),
         History { messages: Vec<ChatMessage> },
         Token { token: String },
         Groups { groups: Vec<GroupId> },
@@ -636,6 +638,8 @@ wire! {
         pub width: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub height: Option<u32>,
+        // Base64url (no padding) SHA-256 of the file bytes.
+        pub sha256: String,
     }
 
     #[derive(Copy, Eq, Hash, PartialOrd, Ord)]
@@ -658,6 +662,25 @@ wire! {
         MemberNickname,
     }
 
+    #[derive(Default)]
+    pub struct MessageSignature {
+        pub server_key: String,
+        pub conversation: String,
+        pub author_uid: Uid,
+        pub key: String,
+        pub certificate: Option<DeviceCertificate>,
+        pub certificate_hash: String,
+        pub message_id: String,
+        pub revision: u32,
+        pub previous_revision_hash: String,
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        pub created_at: i64,
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        pub signed_at: i64,
+        pub body_hash: String,
+        pub signature: String,
+    }
+
     pub struct ChatMessage {
         pub id: MessageId,
         pub target: ChatTarget,
@@ -677,6 +700,8 @@ wire! {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         #[cfg_attr(feature = "ts", ts(type = "number | null"))]
         pub edited_at: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub signature: Option<Box<MessageSignature>>,
     }
 
     #[serde(tag = "kind", rename_all = "snake_case")]
@@ -734,6 +759,87 @@ impl ErrorBody {
     }
 }
 
+/// Canonical signed body: UTF-8 netstrings, including decimal list counts.
+pub fn canonical_message_body(text: &str, mentions: &[Uid], attachments: &[Attachment]) -> Vec<u8> {
+    fn append(out: &mut Vec<u8>, value: &str) {
+        out.extend_from_slice(format!("{}:", value.len()).as_bytes());
+        out.extend_from_slice(value.as_bytes());
+        out.push(b',');
+    }
+    let mut out = Vec::new();
+    append(&mut out, text);
+    let mentions: std::collections::BTreeSet<_> = mentions.iter().collect();
+    append(&mut out, &mentions.len().to_string());
+    for uid in mentions {
+        append(&mut out, uid);
+    }
+    append(&mut out, &attachments.len().to_string());
+    for a in attachments {
+        for value in [&a.sha256, &a.size.to_string(), &a.mime, &a.name] {
+            append(&mut out, value);
+        }
+    }
+    out
+}
+
+pub fn message_body_hash(text: &str, mentions: &[Uid], attachments: &[Attachment]) -> String {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use sha2::{Digest, Sha256};
+    URL_SAFE_NO_PAD.encode(Sha256::digest(canonical_message_body(text, mentions, attachments)))
+}
+
+/// Reserved text of a final author-signed deletion revision. No mentions or attachments.
+pub const DELETION_TEXT: &str = "\0gwar deleted v1";
+
+pub fn dm_conversation(a: &str, b: &str) -> String {
+    if a <= b { format!("dm:{a}:{b}") } else { format!("dm:{b}:{a}") }
+}
+
+/// Exact v2 statement, without a trailing newline. Verifiers validate all fields first.
+pub fn message_statement(
+    server_key: &str,
+    conversation: &str,
+    author: &str,
+    s: &MessageSignature,
+    hash: &str,
+) -> String {
+    format!(
+        "gwar message v2\n{server_key}\n{conversation}\n{author}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{hash}",
+        s.key, s.certificate_hash, s.message_id, s.revision, s.previous_revision_hash, s.created_at, s.signed_at
+    )
+}
+
+pub fn message_revision_hash(s: &MessageSignature) -> String {
+    sha256_b64(
+        format!(
+            "{}\n{}",
+            message_statement(&s.server_key, &s.conversation, &s.author_uid, s, &s.body_hash),
+            s.signature
+        )
+        .as_bytes(),
+    )
+}
+
+pub fn valid_message_fields(s: &MessageSignature) -> bool {
+    decode_fixed::<32>(&s.server_key).is_some()
+        && decode_fixed::<32>(&s.key).is_some()
+        && decode_fixed::<20>(&s.author_uid).is_some()
+        && decode_fixed::<16>(&s.message_id).is_some()
+        && decode_fixed::<32>(&s.body_hash).is_some()
+        && decode_fixed::<64>(&s.signature).is_some()
+        && certificate_hash(s.certificate.as_ref()).as_deref() == Some(&s.certificate_hash)
+        && !s.conversation.contains(['\r', '\n'])
+        && s.conversation.len() <= 128
+        && safe_timestamp(s.created_at)
+        && safe_timestamp(s.signed_at)
+        && s.signed_at >= s.created_at
+        && if s.revision == 0 {
+            s.previous_revision_hash == "-" && s.signed_at == s.created_at
+        } else {
+            decode_fixed::<32>(&s.previous_revision_hash).is_some()
+        }
+}
+
 /// Strict canonical unpadded base64url with an exact decoded length.
 pub fn decode_fixed<const N: usize>(value: &str) -> Option<[u8; N]> {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
@@ -759,7 +865,11 @@ pub fn certificate_hash(certificate: Option<&DeviceCertificate>) -> Option<Strin
     decode_fixed::<32>(&c.account_key)?;
     decode_fixed::<32>(&c.device_key)?;
     decode_fixed::<64>(&c.signature)?;
-    if !safe_timestamp(c.issued_at) || !safe_timestamp(c.expires_at) || c.expires_at <= c.issued_at {
+    if !safe_timestamp(c.issued_at)
+        || !safe_timestamp(c.expires_at)
+        || c.expires_at <= c.issued_at
+        || c.expires_at - c.issued_at > 90 * 86_400_000
+    {
         return None;
     }
     Some(sha256_b64(
@@ -843,6 +953,35 @@ pub fn handle_statement(a: &HandleAttestation) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn message_v2_shared_vectors() {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        use ed25519_dalek::{Signature, VerifyingKey};
+        let vectors: serde_json::Value = serde_json::from_str(include_str!("../tests/message-signing.json")).unwrap();
+        for v in vectors.as_array().unwrap() {
+            let s: MessageSignature = serde_json::from_value(v["signature"].clone()).unwrap();
+            let mentions = serde_json::from_value::<Vec<Uid>>(v["mentions"].clone()).unwrap();
+            let files = serde_json::from_value::<Vec<Attachment>>(v["attachments"].clone()).unwrap();
+            let body = canonical_message_body(v["text"].as_str().unwrap(), &mentions, &files);
+            assert_eq!(URL_SAFE_NO_PAD.encode(&body), v["canonical_body"]);
+            assert_eq!(sha256_b64(&body), s.body_hash);
+            assert!(valid_message_fields(&s));
+            let statement = message_statement(&s.server_key, &s.conversation, &s.author_uid, &s, &s.body_hash);
+            assert_eq!(statement, v["statement"]);
+            assert_eq!(message_revision_hash(&s), v["revision_hash"]);
+            VerifyingKey::from_bytes(&decode_fixed::<32>(&s.key).unwrap())
+                .unwrap()
+                .verify_strict(statement.as_bytes(), &Signature::from_bytes(&decode_fixed::<64>(&s.signature).unwrap()))
+                .unwrap();
+            let mut bad = s.clone();
+            bad.message_id.push('=');
+            assert!(!valid_message_fields(&bad));
+            let mut bad = s.clone();
+            bad.conversation.push('\n');
+            assert!(!valid_message_fields(&bad));
+        }
+    }
 
     #[test]
     fn endpoint_normalization_shared_vectors() {

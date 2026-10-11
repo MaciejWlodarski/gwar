@@ -1,3 +1,4 @@
+import { decodeBase64Url } from "../net/base64url";
 import type { HandleMember } from "../net/handle-attestation";
 import { useVerifiedHandle } from "./useVerifiedHandle";
 import { BadgeCheck } from "lucide-react";
@@ -56,8 +57,9 @@ export function ConnectBadge({ member }: { member?: HandleMember | null }) {
 }
 
 /** "@handle #tag": the verified Connect handle (if any) and the tag derived from the key. */
-export function IdentityLine({ member, tag, className }: { member?: HandleMember | null; tag?: string | null; className?: string }) {
+export function IdentityLine({ member, className }: { member?: HandleMember | null; tag?: string | null; className?: string }) {
   const connect = useVerifiedHandle(member);
+  const tag = member?.uid ? localTag(member.uid) : undefined;
   if (!connect && !tag) return null;
   return (
     <span className={cn("shrink-0 font-mono text-xs text-muted", className)}>
@@ -66,4 +68,13 @@ export function IdentityLine({ member, tag, className }: { member?: HandleMember
       {tag && <span>#{tag}</span>}
     </span>
   );
+}
+
+export function localTag(uid: string): string | undefined {
+  try {
+    const bytes = uid.startsWith("ts:") ? Uint8Array.from(atob(uid.slice(3)), (c) => c.charCodeAt(0)) : decodeBase64Url(uid);
+    let bits = 0, value = 0, out = "";
+    for (const b of bytes) { value = (value << 8) | b; bits += 8; while (bits >= 5) { bits -= 5; out += "abcdefghijklmnopqrstuvwxyz234567"[(value >>> bits) & 31]; } }
+    return out.slice(0, 10) || undefined;
+  } catch { return undefined; }
 }

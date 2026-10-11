@@ -1,4 +1,10 @@
+import { attachment as attachmentSchema } from "../net/schema";
+import { messageTarget } from "../lib/chat";
+import { verifiedAttachmentBlob, uploadAttachment, localAttachmentMetadata } from "../net/attachment";
 import { serverPins, type ServerIdentityChanged } from "../net/server-pins";
+import { signMessage, sha256, MessageVerifier, fullyVerified, DELETION_TEXT, invalidVerification, sameMessageIdentity, notificationAllowed } from "../net/message-signature";
+import type { Attachment } from "../proto/Attachment";
+import type { MessageSignature } from "../proto/MessageSignature";
 import { useAccountIdentity } from "./identity";
 import type { BanNotice } from "../proto/BanNotice";
 /**
@@ -34,7 +40,7 @@ import {
 import { TsConnection } from "../net/ts-connection";
 import { parseBanMessage } from "../lib/ban";
 import type { pruneRequest } from "../lib/prune";
-import { importIdentity, loadActiveIdentity, IdentityUnsupportedError, type Identity } from "../net/identity";
+import { uidForPublicKey, accountKeyOf, importIdentity, loadActiveIdentity, IdentityUnsupportedError, type Identity } from "../net/identity";
 import { isDesktop } from "../platform";
 import { createVoiceEngine } from "../voice";
 import { VoiceError, type VoiceEngine } from "../voice/engine";
@@ -137,6 +143,10 @@ class Controller {
   private conn: Link | null = null;
   private engine: VoiceEngine;
   private identity: Identity | null = null;
+  private verifier = new MessageVerifier();
+  private messageQueue = Promise.resolve();
+  private messagePending = 0;
+  private uploaded = new Map<string, Attachment>();
   private identityLoading: Promise<Identity> | null = null;
   private voiceRetry: ReturnType<typeof setTimeout> | null = null;
   private voiceRetries = 0;
@@ -420,9 +430,40 @@ class Controller {
       this.rejoin = null;
     });
     conn.onEvent((event) => {
-      const alert = event.ev === "chat.message" ? this.notificationFor(event.d) : null;
-      session.dispatch({ type: "event", event, now: Date.now() });
-      alert?.();
+      if (event.ev === "chat.message" && !event.d.signature) {
+        const exists = Object.values(useSession.getState().threads).some((t) => t.items.some((i) => i.kind === "msg" && i.msg.id === event.d.id));
+        if (!exists) session.dispatch({ type: "event", event, now: Date.now(), trusted: false });
+        if (!exists && event.d.author_uid.startsWith("ts:")) this.notificationFor(event.d)?.();
+        return;
+      }
+      if (event.ev === "chat.message" || event.ev === "chat.edited") {
+        const alert = event.ev === "chat.message" ? this.notificationFor(event.d) : null;
+        const key = conn.serverKey;
+        const epoch = useSession.getState().epoch;
+        if (this.messagePending >= 256) { useUi.getState().toast("error", "Message verification queue is full"); return; }
+        this.messagePending++;
+        this.messageQueue = this.messageQueue.then(async () => {
+          const result = await this.verifyIncoming(event.d);
+          if (this.conn !== conn || epoch !== useSession.getState().epoch || key !== conn.serverKey) return;
+          const existing = Object.values(useSession.getState().threads).flatMap((t) => t.items).find((i) => i.kind === "msg" && i.msg.id === event.d.id);
+          if ((existing?.kind === "msg" && (result.status !== "verified" || !sameMessageIdentity(existing.msg, event.d))) || result.continuity === "rollback" || result.continuity === "fork") {
+            useUi.getState().toast("error", "Message replacement rejected: invalid signature, rollback or fork");
+            return;
+          }
+          let trusted = fullyVerified(result);
+          if (trusted && (event.d.attachments?.length ?? 0) > 0) {
+            const state = useSession.getState();
+            try { await Promise.all(event.d.attachments!.map((a) => verifiedAttachmentBlob(a, a.url, undefined, { origin: state.httpOrigin, size: a.size, uploadLimit: state.server?.upload_limit ?? 0 }))); }
+            catch { trusted = false; }
+          }
+          const latest = await this.verifyIncoming(event.d);
+          if ((existing?.kind === "msg" && (latest.status !== "verified" || !sameMessageIdentity(existing.msg, event.d))) || latest.continuity === "rollback" || latest.continuity === "fork"
+              || this.conn !== conn || epoch !== useSession.getState().epoch) return;
+          trusted = trusted && fullyVerified(latest);
+          session.dispatch({ type: "event", event, now: Date.now(), trusted });
+          if (notificationAllowed(result, trusted)) alert?.();
+        }).catch(() => {}).finally(() => { this.messagePending--; });
+      } else session.dispatch({ type: "event", event, now: Date.now() });
       if (event.ev === "voice.closed") {
         useUi.getState().toast("info", tNow("voice.closed"));
         this.scheduleVoiceRetry(1000);
@@ -833,6 +874,30 @@ class Controller {
     return peer ? { client: peer.id } : null;
   }
 
+  /** The host and key belong to the connection that sent hello, including after a quiet certificate renewal. */
+  get messageServerKey(): string { return this.conn?.serverKey ?? ""; }
+
+  get messageUid(): Promise<string | undefined> {
+    return this.conn instanceof Connection ? uidForPublicKey(accountKeyOf(this.conn.identity)) : Promise.resolve(useSession.getState().me?.uid);
+  }
+
+  private async signChat(target: ChatTarget, text: string, mentions: string[], attachments: Attachment[], original?: MessageSignature): Promise<MessageSignature> {
+    const conn = this.connection;
+    // The direct TeamSpeak transport ignores Gwar signatures.
+    if (!(conn instanceof Connection)) return { server_key: "", conversation: "server", author_uid: "", key: "", certificate: null, certificate_hash: "-", message_id: "", revision: 0, previous_revision_hash: "-", created_at: 0, signed_at: 0, body_hash: "", signature: "" };
+    const s = useSession.getState();
+    let signedTarget: string;
+    if (target === "server") signedTarget = "server";
+    else if ("channel" in target) signedTarget = `channel:${target.channel}`;
+    else {
+      const peer = s.clients[target.client];
+      if (!peer) throw new Error("unknown recipient");
+      signedTarget = messageTarget(`dm:${peer.uid}`, s.me?.uid ?? "", s.me?.uid);
+    }
+    if (!s.me) throw new Error("no session");
+    return signMessage(conn.identity, { serverKey: conn.serverKey!, target: signedTarget }, await uidForPublicKey(accountKeyOf(conn.identity)), text, mentions, attachments, original);
+  }
+
   async sendChat(key: ThreadKey, text: string, options: SendOptions = {}): Promise<boolean> {
     const state = useSession.getState();
     const target = this.resolveTarget(key);
@@ -853,7 +918,14 @@ class Controller {
 
   private async deliver(m: Omit<FailedSend, "id" | "error">): Promise<boolean> {
     try {
+      const attachments = (m.attachments ?? []).map((id) => {
+        const att = this.uploaded.get(id);
+        if (!att && this.conn instanceof Connection) throw new Error("unknown upload");
+        return att!;
+      });
+      const signature = await this.signChat(m.target, m.text, m.mentions ?? [], attachments);
       await this.connection.request("chat.send", {
+        signature,
         target: m.target,
         text: m.text,
         ...(m.mentions ? { mentions: m.mentions } : {}),
@@ -884,10 +956,20 @@ class Controller {
 
   /** Changes the text of one of my channel messages; shows a toast and returns false on failure. */
   async editMessage(message: number, text: string, mentions: string[]): Promise<boolean> {
-    return (await this.attempt(this.connection.request("chat.edit", { message, text, ...(mentions.length ? { mentions } : {}) }))) !== undefined;
+    try {
+      const msg = Object.values(useSession.getState().threads).flatMap((t) => t.items).find((i) => i.kind === "msg" && i.msg.id === message);
+      if (!msg || msg.kind !== "msg" || (!msg.msg.signature && this.conn instanceof Connection)) throw new Error("unknown signed message");
+      const signature = await this.signChat(msg.msg.target, text, mentions, text === DELETION_TEXT ? [] : msg.msg.attachments ?? [], msg.msg.signature ?? undefined);
+      return (await this.attempt(this.connection.request("chat.edit", { message, text, signature, ...(mentions.length ? { mentions } : {}) }))) !== undefined;
+    } catch (e) { useUi.getState().toast("error", describeRequestError(e)); return false; }
   }
 
   async deleteMessage(message: number): Promise<boolean> {
+    const state = useSession.getState();
+    const item = Object.values(state.threads).flatMap((t) => t.items).find((i) => i.kind === "msg" && i.msg.id === message);
+    if (item?.kind === "msg" && item.msg.author_uid === state.me?.uid && this.conn instanceof Connection) {
+      return this.editMessage(message, DELETION_TEXT, []);
+    }
     return (await this.attempt(this.connection.request("chat.delete", { message }))) !== undefined;
   }
 
@@ -908,44 +990,90 @@ class Controller {
     if (s.kind !== "vc") throw new UploadError("unsupported");
     const check = checkUpload(file.size, s.server?.upload_limit ?? 0);
     if (!check.ok) throw new UploadError(check.reason);
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const hash = await sha256(bytes);
+    const expected = localAttachmentMetadata(file.name, file.type || "application/octet-stream", bytes);
     let reserved: { file: string; upload_url: string };
     try {
-      reserved = await this.connection.request("file.upload", { name: file.name, size: file.size, mime: file.type || "application/octet-stream" });
+      reserved = await this.connection.request("file.upload", { name: file.name, size: file.size, mime: file.type || "application/octet-stream", sha256: hash });
     } catch (e) {
       if (e instanceof RequestError && (e.code === "too_large" || e.code === "forbidden")) throw new UploadError(e.code === "too_large" ? "too_large" : "forbidden");
       throw new UploadError("network");
     }
     const url = absoluteUrl(s.httpOrigin, reserved.upload_url, "PUT");
+    const remember = (att: Attachment): string => {
+      if (!attachmentSchema(att) || att.id !== reserved.file || att.sha256 !== hash || att.size !== file.size || att.name !== expected.name || att.mime !== expected.mime) throw new UploadError("network");
+      this.uploaded.set(att.id, { ...att, sha256: hash });
+      return att.id;
+    };
     if (isDesktop()) {
-      // The desktop app sends it itself (no CORS from the app's origin); no byte-level progress there.
       if (opts.signal?.aborted) throw new UploadError("aborted");
       opts.onProgress?.(0.5);
-      let status: number;
+      let att: Attachment;
       try {
-        status = await uploadFromApp(reserved.upload_url, file, s.server?.upload_limit ?? 0);
+        att = await uploadFromApp(reserved.upload_url, file, s.server?.upload_limit ?? 0);
       } catch {
         throw new UploadError("network");
       }
       if (opts.signal?.aborted) throw new UploadError("aborted");
-      if (status < 200 || status >= 300) throw new UploadError(status === 413 ? "too_large" : status === 403 ? "forbidden" : "network");
       opts.onProgress?.(1);
-      return reserved.file;
+      return remember(att);
     }
+    let att: Attachment;
     try {
       const signal = AbortSignal.any([AbortSignal.timeout(FILE_TIMEOUT_MS), ...(opts.signal ? [opts.signal] : [])]);
       const response = await fetch(url, { method: "PUT", body: file, redirect: "error", credentials: "omit", signal });
       if (!response.ok) throw new UploadError(response.status === 413 ? "too_large" : response.status === 403 ? "forbidden" : "network");
+      att = await uploadAttachment(response);
     } catch (e) {
       if (e instanceof UploadError) throw e;
       throw new UploadError(opts.signal?.aborted ? "aborted" : "network");
     }
     opts.onProgress?.(1);
-    return reserved.file;
+    return remember(att);
   }
 
   /** Absolute URL of an attachment or other server-relative path. */
   attachmentUrl(path: string): string {
     return absoluteUrl(useSession.getState().httpOrigin, path);
+  }
+
+  private async verifyIncoming(msg: ChatMessage, channel?: number) {
+    const state = useSession.getState();
+    const me = await this.messageUid;
+    let thread: "server" | `ch:${number}` | `dm:${string}`;
+    if (channel !== undefined) thread = `ch:${channel}`;
+    else if (msg.target === "server") thread = "server";
+    else if ("channel" in msg.target) thread = `ch:${msg.target.channel}`;
+    else {
+      const recipient = state.clients[msg.target.client]?.uid;
+      if (msg.author_uid !== me && recipient !== me) return invalidVerification();
+      const peer = msg.author_uid === me ? recipient : msg.author_uid;
+      if (!peer) return invalidVerification();
+      thread = `dm:${peer}`;
+    }
+    return this.verifier.verify(msg, { serverKey: this.messageServerKey, target: messageTarget(thread, msg.author_uid, me) });
+  }
+
+  private async checkedHistory(messages: ChatMessage[], channel: number): Promise<ChatMessage[]> {
+    const accepted: ChatMessage[] = [];
+    for (const msg of messages) {
+      const result = await this.verifyIncoming(msg, channel);
+      const existing = Object.values(useSession.getState().threads).flatMap((t) => t.items).find((i) => i.kind === "msg" && i.msg.id === msg.id);
+      if ((existing?.kind === "msg" && (result.status !== "verified" || !sameMessageIdentity(existing.msg, msg))) || result.continuity === "fork" || result.continuity === "rollback") continue;
+      accepted.push(msg);
+    }
+    return accepted;
+  }
+
+  private applyHistory(messages: ChatMessage[], channel: number, before: number | null): Promise<void> {
+    const epoch = useSession.getState().epoch, conn = this.conn;
+    const run = this.messageQueue.then(async () => {
+      const accepted = await this.checkedHistory(messages, channel);
+      if (this.conn === conn && useSession.getState().epoch === epoch) useSession.getState().dispatch({ type: "history", channel, messages: accepted, before, limit: HISTORY_PAGE });
+    });
+    this.messageQueue = run.catch(() => {});
+    return run;
   }
 
   // ----------------------------------------------------------- notifications
@@ -969,7 +1097,7 @@ class Controller {
           : tNow("notify.server", { name: authorName, server: s.server?.name ?? "" });
     return () => {
       notify({
-        title,
+        title: msg.author_uid.startsWith("ts:") ? `${title} · TeamSpeak / unsigned` : title,
         body: notificationBody(msg),
         tag: `msg-${msg.id}-${typeof msg.target === "string" ? "server" : Object.keys(msg.target)[0]}`,
         onClick: () => this.openMessage(msg),
@@ -994,7 +1122,7 @@ class Controller {
     }
     try {
       const r = await this.connection.request("chat.history", { channel, limit: HISTORY_PAGE });
-      useSession.getState().dispatch({ type: "history", channel, messages: r.messages, before: null, limit: HISTORY_PAGE });
+      await this.applyHistory(r.messages, channel, null);
     } catch (e) {
       // A password channel I have not entered this session.
       if (e instanceof RequestError && e.code === "forbidden") useSession.getState().dispatch({ type: "historyForbidden", channel });
@@ -1040,7 +1168,7 @@ class Controller {
     this.loadingOlder = true;
     try {
       const r = await this.connection.request("chat.history", { channel, before: first.msg.id, limit: HISTORY_PAGE });
-      s.dispatch({ type: "history", channel, messages: r.messages, before: first.msg.id, limit: HISTORY_PAGE });
+      await this.applyHistory(r.messages, channel, first.msg.id);
     } catch (e) {
       useUi.getState().toast("error", describeRequestError(e));
     } finally {

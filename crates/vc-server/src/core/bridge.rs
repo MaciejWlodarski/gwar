@@ -22,7 +22,7 @@ pub enum BridgeNote {
     Channel { channel: Channel, created: bool, password: Option<Option<String>> },
     /// Any other event caused on our side, e.g. our user joined, an admin
     /// moved or kicked a remote session, someone wrote in a channel.
-    Event(Event),
+    Event(Box<Event>),
     /// A ban on a remote user was lifted on our side.
     Unban { uid: Uid },
 }

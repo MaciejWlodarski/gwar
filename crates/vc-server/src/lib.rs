@@ -16,6 +16,7 @@ pub mod media;
 pub mod members;
 mod preauth;
 pub mod server_key;
+use base64::Engine;
 pub mod store;
 #[cfg(feature = "teamspeak")]
 pub mod teamspeak;
@@ -225,6 +226,7 @@ pub async fn start(config: Config) -> Result<Running> {
             upload_limit: config.upload_limit,
             files_dir,
             connect_url: config.connect_url.clone(),
+            server_key: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(server_key.verifying_key().as_bytes()),
         },
         routing.clone(),
         media_tx.clone(),

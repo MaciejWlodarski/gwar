@@ -1,39 +1,67 @@
-import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+// @vitest-environment happy-dom
+import { Blob } from "node:buffer";
+import { webcrypto } from "node:crypto";
+import { URL } from "node:url";
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Attachment } from "../proto/Attachment";
+import { sha256 } from "../net/message-signature";
+import { fetchFileBytes, saveBlob } from "../platform/download";
+import { useSession } from "../state/stores";
 import { AttachmentList } from "./Attachments";
 import { TooltipProvider } from "./kit";
+vi.mock("../platform/download", () => ({ MAX_FILE_BYTES: 30 * 1024 * 1024, fetchFileBytes: vi.fn(), saveBlob: vi.fn(async () => true) }));
 
-const att = (extra: Partial<Attachment>): Attachment => ({ id: "f1", name: "a.bin", mime: "application/octet-stream", size: 2048, url: "/files/f1/a.bin", ...extra });
-const html = (list: Attachment[]) =>
-  renderToStaticMarkup(
-    <TooltipProvider>
-      <AttachmentList attachments={list} />
-    </TooltipProvider>,
-  );
-
-describe("AttachmentList", () => {
-  it("sizes images up front without fetching until mounted", () => {
-    const out = html([att({ name: "cat.png", mime: "image/png", url: "/files/f1/cat.png", width: 800, height: 600 })]);
-    expect(out).not.toContain('src="/files/');
-    expect(out).toContain("width:400px;height:300px");
+describe("attachment trust", () => {
+  let container: HTMLDivElement, root: Root;
+  const bytes = new TextEncoder().encode("hello");
+  const media = async (mime: string, hash?: string): Promise<Attachment> => ({ id: "f1", name: "media", mime, url: "/files/f1/media", size: bytes.length, sha256: hash ?? await sha256(bytes) });
+  const show = async (att: Attachment, verified: boolean | null) => {
+    await act(async () => { root.render(<TooltipProvider><AttachmentList attachments={[att]} verified={verified} /></TooltipProvider>); });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+  };
+  beforeEach(() => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); vi.stubGlobal("crypto", webcrypto); vi.stubGlobal("Blob", Blob); vi.stubGlobal("URL", URL);
+    vi.mocked(fetchFileBytes).mockResolvedValue(bytes); vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:checked"); vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    useSession.setState({ httpOrigin: "https://voice.example" });
+    container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
   });
-
-  it("plays video and audio in place, with a download button", () => {
-    const video = html([att({ name: "clip.mp4", mime: "video/mp4", url: "/files/f2/clip.mp4", width: 1280, height: 720 })]);
-    expect(video).toContain("<video");
-    expect(video).toContain('preload="metadata"');
-    expect(video).not.toContain('src="/files/');
-    expect(video).toContain("Download");
-    const audio = html([att({ name: "song.mp3", mime: "audio/mpeg", url: "/files/f3/song.mp3" })]);
-    expect(audio).toContain("<audio");
-    expect(audio).toContain("song.mp3");
+  afterEach(async () => { await act(async () => root.unmount()); container.remove(); vi.restoreAllMocks(); vi.clearAllMocks(); vi.unstubAllGlobals(); });
+  for (const [mime, tag] of [["video/mp4", "video"], ["audio/ogg", "audio"]] as const) {
+    it(`holds unsigned ${mime} until explicit loading`, async () => {
+      await show(await media(mime, ""), false);
+      expect(container.querySelector(tag)).toBeNull(); expect(fetchFileBytes).not.toHaveBeenCalled();
+      const load = [...container.querySelectorAll("button")].find((b) => b.textContent === "Load unverified attachment")!;
+      await act(async () => load.click());
+      await vi.waitFor(() => expect(container.querySelector(tag)?.getAttribute("src")).toBe("blob:checked"));
+      expect(fetchFileBytes).toHaveBeenCalledWith("/files/f1/media", expect.objectContaining({ origin: "https://voice.example", size: 5 }));
+    });
+    it(`hashes signed ${mime} before creating an object URL`, async () => {
+      await show(await media(mime), true);
+      await vi.waitFor(() => expect(container.querySelector(tag)?.getAttribute("src")).toBe("blob:checked"));
+      expect(await (vi.mocked(URL.createObjectURL).mock.calls[0]![0] as Blob).text()).toBe("hello");
+    });
+    it(`does not display substituted ${mime} until explicitly requested`, async () => {
+      await show(await media(mime, "wrong"), true);
+      expect(container.querySelector(tag)).toBeNull(); expect(URL.createObjectURL).not.toHaveBeenCalled();
+      expect(container.textContent).toContain("Attachment verification failed"); expect(container.textContent).toContain("Load unverified attachment");
+    });
+    it(`does not fetch pending ${mime}`, async () => { await show(await media(mime), null); expect(fetchFileBytes).not.toHaveBeenCalled(); expect(container.querySelector(tag)).toBeNull(); });
+  }
+  it("does not fetch unsigned images or create an image element", async () => { await show(await media("image/png", ""), false); expect(container.querySelector("img")).toBeNull(); expect(fetchFileBytes).not.toHaveBeenCalled(); });
+  it("downloads only matching signed bytes, then permits explicitly labeled unverified saving after failure", async () => {
+    await show(await media("text/plain", "wrong"), true);
+    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Download media"]')!.click());
+    await vi.waitFor(() => expect(container.querySelector('button[aria-label="Download unverified attachment: media"]')).not.toBeNull());
+    expect(saveBlob).not.toHaveBeenCalled();
+    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Download unverified attachment: media"]')!.click());
+    await vi.waitFor(() => expect(saveBlob).toHaveBeenCalledOnce());
+    expect(await vi.mocked(saveBlob).mock.calls[0]![0].text()).toBe("hello");
   });
-
-  it("shows everything else as a file card, and SVG never inline", () => {
-    const out = html([att({ name: "report.pdf", mime: "application/pdf" }), att({ id: "f9", name: "x.svg", mime: "image/svg+xml" })]);
-    expect(out.match(/data-attachment="file"/g)).toHaveLength(2);
-    expect(out).not.toContain("<img");
-    expect(out).toContain("2 KB");
+  it("saves unsigned files only after a labeled user click", async () => {
+    await show(await media("application/octet-stream", ""), false); expect(fetchFileBytes).not.toHaveBeenCalled();
+    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Download unverified attachment: media"]')!.click());
+    await vi.waitFor(() => expect(saveBlob).toHaveBeenCalledOnce());
   });
 });

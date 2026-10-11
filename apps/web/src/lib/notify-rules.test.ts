@@ -28,6 +28,6 @@ describe("notifyReason", () => {
 describe("notificationBody", () => {
   it("shortens long text and falls back to the file names", () => {
     expect(notificationBody({ ...base, text: "x".repeat(300) }, 20)).toBe(`${"x".repeat(19)}…`);
-    expect(notificationBody({ ...base, text: "", attachments: [{ id: "f", name: "cat.png", mime: "image/png", size: 1, url: "/f" }] })).toBe("cat.png");
+    expect(notificationBody({ ...base, text: "", attachments: [{ sha256: "hash", id: "f", name: "cat.png", mime: "image/png", size: 1, url: "/f" }] })).toBe("cat.png");
   });
 });

@@ -87,6 +87,7 @@ pub fn run() {
             files::files_cancel,
             files::fetch_file,
             files::save_file_as,
+            files::save_blob_as,
             files::upload_put,
             shortcuts::set_global_shortcut,
             ts::ts_connect,

@@ -62,7 +62,7 @@ function online(): SessionState {
 }
 
 type Ev = Extract<Action, { type: "event" }>["event"];
-const ev = (state: SessionState, event: Ev) => reduce(state, { type: "event", event, now: 5000 });
+const ev = (state: SessionState, event: Ev) => reduce(state, { type: "event", event, now: 5000, trusted: true });
 
 describe("welcome", () => {
   it("loads server state and adds the welcome text to server chat", () => {
@@ -475,7 +475,7 @@ describe("editing and deleting messages", () => {
     s = ev(s, { ev: "chat.message", d: msg(11) });
     expect(s.threads["ch:1"]!.unread).toBe(2);
     s = ev(s, { ev: "chat.deleted", d: { channel: 1, message: 10 } });
-    expect(s.threads["ch:1"]!.items.some((i) => i.key === "m10")).toBe(false);
+    expect(s.threads["ch:1"]!.items.some((i) => i.key === "m10" && i.kind === "msg" && i.removed)).toBe(true);
     expect(s.threads["ch:1"]!.unread).toBe(1);
     // Deleting something already read does not eat into the count.
     s = ev(s, { ev: "chat.read", d: { channel: 1, message: 11 } });
@@ -505,7 +505,7 @@ describe("mentions", () => {
     expect(s.threads["ch:1"]?.mentions).toBe(0);
   });
 
-  it("starts from the server's count and clears when the channel is read or opened", () => {
+  it("disregards the server's unverified mention count and clears when the channel is read or opened", () => {
     let s = reduce(initialState, {
       type: "welcome",
       resync: false,
@@ -518,9 +518,9 @@ describe("mentions", () => {
         unread: [{ channel: 2, last_read: 4, count: 3, mentions: 2 }],
       }),
     });
-    expect(s.threads["ch:2"]).toMatchObject({ unread: 3, mentions: 2 });
+    expect(s.threads["ch:2"]).toMatchObject({ unread: 3, mentions: 0 });
     s = ev(s, { ev: "chat.message", d: msg(20, { target: { channel: 2 }, mentions: ["u1"] }) });
-    expect(s.threads["ch:2"]).toMatchObject({ unread: 4, mentions: 3 });
+    expect(s.threads["ch:2"]).toMatchObject({ unread: 4, mentions: 1 });
     s = reduce(s, { type: "selectChannel", channel: 2 });
     expect(s.threads["ch:2"]).toMatchObject({ unread: 0, mentions: 0 });
   });

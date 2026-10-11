@@ -17,3 +17,6 @@ ts-rs = { version = "12", optional = true }
 [features]
 # Generates TypeScript bindings into apps/web/src/proto (run `cargo test -p vc-proto --features ts`).
 ts = ["dep:ts-rs"]
+
+[dev-dependencies]
+ed25519-dalek = "2"

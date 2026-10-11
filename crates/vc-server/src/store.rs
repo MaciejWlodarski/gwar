@@ -215,6 +215,17 @@ const MIGRATIONS: &[&str] = &[
         SELECT device_key,account_key,revoked_at FROM revoked_devices_old;
     DROP TABLE revoked_devices_old;
     "#,
+    r#"
+    ALTER TABLE messages ADD COLUMN signature TEXT;
+    ALTER TABLE files ADD COLUMN sha256 TEXT NOT NULL DEFAULT '';
+    ALTER TABLE files ADD COLUMN position INTEGER NOT NULL DEFAULT 0;
+"#,
+    r#"
+    CREATE TABLE message_identities (
+        server_key TEXT NOT NULL, author_uid TEXT NOT NULL, message_id TEXT NOT NULL,
+        PRIMARY KEY(server_key, author_uid, message_id)
+    );
+    "#,
 ];
 
 /// References reassigned by a member merge (including ones already held by the target).
@@ -599,7 +610,7 @@ impl Store {
         let mut stmt = self.db.prepare("DELETE FROM files WHERE uploader=?1 AND message IS NULL RETURNING id")?;
         let pending = stmt.query_map([uid], |r| r.get::<_, FileId>(0))?;
         removal.files.extend(pending.collect::<rusqlite::Result<Vec<_>>>()?);
-        self.db.execute("DELETE FROM message_mentions WHERE uid=?1", [uid])?;
+        self.db.execute("DELETE FROM message_mentions WHERE uid=?1 AND message IN (SELECT id FROM messages WHERE signature IS NULL)", [uid])?;
         // The foreign keys take the group memberships and read marks along.
         self.db.execute("DELETE FROM users WHERE id=?1", [id])?;
         tx.commit()?;
@@ -619,7 +630,10 @@ impl Store {
         };
         let (from_id, into_id) = (id(from)?, id(into)?);
         let mut report = MergeReport {
-            messages: tx.execute("UPDATE messages SET author_uid=?2 WHERE author_uid=?1", params![from, into])?,
+            messages: tx.execute(
+                "UPDATE messages SET author_uid=?2 WHERE author_uid=?1 AND signature IS NULL",
+                params![from, into],
+            )?,
             files: tx.execute("UPDATE files SET uploader=?2 WHERE uploader=?1", params![from, into])?,
             ..Default::default()
         };
@@ -635,12 +649,12 @@ impl Store {
             "INSERT OR IGNORE INTO user_groups SELECT ?2,group_id FROM user_groups WHERE user_id=?1",
             params![from_id, into_id],
         )?;
-        report.mentions = tx.query_row("SELECT COUNT(*) FROM message_mentions WHERE uid=?1", [from], |r| r.get(0))?;
+        report.mentions = tx.query_row("SELECT COUNT(*) FROM message_mentions WHERE uid=?1 AND message IN (SELECT id FROM messages WHERE signature IS NULL)", [from], |r| r.get(0))?;
         tx.execute(
-            "INSERT OR IGNORE INTO message_mentions SELECT message,?2 FROM message_mentions WHERE uid=?1",
+            "INSERT OR IGNORE INTO message_mentions SELECT message,?2 FROM message_mentions WHERE uid=?1 AND message IN (SELECT id FROM messages WHERE signature IS NULL)",
             params![from, into],
         )?;
-        tx.execute("DELETE FROM message_mentions WHERE uid=?1", [from])?;
+        tx.execute("DELETE FROM message_mentions WHERE uid=?1 AND message IN (SELECT id FROM messages WHERE signature IS NULL)", [from])?;
         report.bans = tx.execute("UPDATE bans SET uid=?2 WHERE uid=?1", params![from, into])?;
         // bans.by and invites.created_by are display-name snapshots, not identity references.
         // Revoked devices belong to cryptographic account keys and must never be reassigned.
@@ -706,7 +720,7 @@ impl Store {
     /// Newest `limit` channel messages older than `before`, returned oldest first.
     pub fn history(&self, channel: ChannelId, before: Option<MessageId>, limit: u32) -> Result<Vec<ChatMessage>> {
         let mut stmt = self.db.prepare(
-            "SELECT m.id,m.author_uid,COALESCE(u.nickname,m.author_name),m.text,m.sent_at,m.edited_at FROM messages m
+            "SELECT m.id,m.author_uid,COALESCE(u.nickname,m.author_name),m.text,m.sent_at,m.edited_at,m.signature FROM messages m
              LEFT JOIN users u ON u.uid=m.author_uid WHERE m.channel=?1 AND m.id < ?2 ORDER BY m.id DESC LIMIT ?3",
         )?;
         let rows = stmt.query_map(params![channel, before.unwrap_or(MessageId::MAX), limit], |r| {
@@ -721,6 +735,7 @@ impl Store {
                 mentions: Vec::new(),
                 attachments: Vec::new(),
                 edited_at: r.get(5)?,
+                signature: decode_signature(r, 6)?,
             })
         })?;
         let mut messages: Vec<_> = rows.collect::<rusqlite::Result<_>>()?;
@@ -737,7 +752,7 @@ impl Store {
         let row = self
             .db
             .query_row(
-                "SELECT m.channel,m.author_uid,COALESCE(u.nickname,m.author_name),m.text,m.sent_at,m.edited_at FROM messages m LEFT JOIN users u ON u.uid=m.author_uid WHERE m.id=?1",
+                "SELECT m.channel,m.author_uid,COALESCE(u.nickname,m.author_name),m.text,m.sent_at,m.edited_at,m.signature FROM messages m LEFT JOIN users u ON u.uid=m.author_uid WHERE m.id=?1",
                 [id],
                 |r| {
                     Ok(ChatMessage {
@@ -751,6 +766,7 @@ impl Store {
                         mentions: Vec::new(),
                         attachments: Vec::new(),
                         edited_at: r.get(5)?,
+                        signature: decode_signature(r, 6)?,
                     })
                 },
             )
@@ -759,6 +775,37 @@ impl Store {
         message.mentions = self.mentions(id)?;
         message.attachments = self.attachments(id)?;
         Ok(Some(message))
+    }
+
+    pub fn reserve_message_identity(&self, server_key: &str, author_uid: &str, message_id: &str) -> Result<()> {
+        self.db
+            .execute("INSERT INTO message_identities VALUES(?1,?2,?3)", params![server_key, author_uid, message_id])?;
+        Ok(())
+    }
+
+    /// The body, signature and attachment order change together.
+    pub fn save_message_body(&mut self, msg: &ChatMessage) -> Result<()> {
+        let tx = self.db.transaction()?;
+        let signature = msg.signature.as_ref().map(serde_json::to_string).transpose()?;
+        tx.execute(
+            "UPDATE messages SET text=?2,sent_at=?3,edited_at=?4,signature=?5 WHERE id=?1",
+            params![msg.id, msg.text, msg.sent_at, msg.edited_at, signature],
+        )?;
+        tx.execute("DELETE FROM message_mentions WHERE message=?1", [msg.id])?;
+        for uid in &msg.mentions {
+            tx.execute("INSERT INTO message_mentions(message,uid) VALUES(?1,?2)", params![msg.id, uid])?;
+        }
+        if msg.text == vc_proto::DELETION_TEXT {
+            tx.execute("DELETE FROM files WHERE message=?1", [msg.id])?;
+        }
+        for (position, file) in msg.attachments.iter().enumerate() {
+            tx.execute(
+                "UPDATE files SET message=?2,position=?3 WHERE id=?1",
+                params![file.id, msg.id, position as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn set_mentions(&self, message: MessageId, uids: &[Uid]) -> Result<()> {
@@ -811,12 +858,13 @@ impl Store {
         name: &str,
         mime: &str,
         size: u64,
+        sha256: &str,
         dimensions: Option<(u32, u32)>,
         now: i64,
     ) -> Result<()> {
         self.db.execute(
-            "INSERT INTO files(id,uploader,name,mime,size,width,height,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-            params![id, uploader, name, mime, size as i64, dimensions.map(|d| d.0), dimensions.map(|d| d.1), now],
+            "INSERT INTO files(id,uploader,name,mime,size,width,height,created_at,sha256) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![id, uploader, name, mime, size as i64, dimensions.map(|d| d.0), dimensions.map(|d| d.1), now, sha256],
         )?;
         Ok(())
     }
@@ -826,7 +874,7 @@ impl Store {
         Ok(self
             .db
             .query_row(
-                "SELECT id,name,mime,size,width,height FROM files WHERE id=?1 AND uploader=?2 AND message IS NULL",
+                "SELECT id,name,mime,size,width,height,sha256 FROM files WHERE id=?1 AND uploader=?2 AND message IS NULL",
                 params![id, uploader],
                 attachment_row,
             )
@@ -841,13 +889,14 @@ impl Store {
     pub fn file(&self, id: &str) -> Result<Option<Attachment>> {
         Ok(self
             .db
-            .query_row("SELECT id,name,mime,size,width,height FROM files WHERE id=?1", [id], attachment_row)
+            .query_row("SELECT id,name,mime,size,width,height,sha256 FROM files WHERE id=?1", [id], attachment_row)
             .optional()?)
     }
 
     fn attachments(&self, message: MessageId) -> Result<Vec<Attachment>> {
-        let mut stmt =
-            self.db.prepare("SELECT id,name,mime,size,width,height FROM files WHERE message=?1 ORDER BY rowid")?;
+        let mut stmt = self
+            .db
+            .prepare("SELECT id,name,mime,size,width,height,sha256 FROM files WHERE message=?1 ORDER BY position")?;
         let rows = stmt.query_map([message], attachment_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -1039,6 +1088,15 @@ fn member_tags(uids: Vec<Uid>) -> BTreeMap<Uid, String> {
         .collect()
 }
 
+fn decode_signature(r: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<Box<vc_proto::MessageSignature>>> {
+    r.get::<_, Option<String>>(index)?
+        .map(|s| {
+            serde_json::from_str(&s)
+                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(e)))
+        })
+        .transpose()
+}
+
 fn attachment_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attachment> {
     let id: String = r.get(0)?;
     let name: String = r.get(1)?;
@@ -1050,6 +1108,7 @@ fn attachment_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attachment> {
         size: r.get::<_, i64>(3)? as u64,
         width: r.get(4)?,
         height: r.get(5)?,
+        sha256: r.get(6)?,
     })
 }
 
@@ -1281,10 +1340,10 @@ mod tests {
         let theirs = store.add_message(channel, "gone", "gone", "bye", 2).unwrap();
         let mine = store.add_message(channel, "other", "other", "hi @gone", 3).unwrap();
         store.set_mentions(mine, &["gone".to_owned()]).unwrap();
-        store.insert_file("attached", "gone", "a", "x", 1, None, 2).unwrap();
+        store.insert_file("attached", "gone", "a", "x", 1, "hash", None, 2).unwrap();
         store.attach_file("attached", theirs).unwrap();
-        store.insert_file("pending", "gone", "p", "x", 1, None, 2).unwrap();
-        store.insert_file("other-file", "other", "o", "x", 1, None, 2).unwrap();
+        store.insert_file("pending", "gone", "p", "x", 1, "hash", None, 2).unwrap();
+        store.insert_file("other-file", "other", "o", "x", 1, "hash", None, 2).unwrap();
 
         // Without deleting messages: the record, its pending upload and mentions go.
         let kept = store.remove_member(gone, "gone", false).unwrap();

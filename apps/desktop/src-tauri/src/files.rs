@@ -291,8 +291,34 @@ pub async fn save_file_as(
     .await
 }
 
+/// Writes only the inspected bytes supplied by the local client, through a native save dialog.
 #[tauri::command]
-pub async fn upload_put(files: State<'_, Files>, request: Request<'_>) -> Result<u16, String> {
+pub async fn save_blob_as(
+    app: tauri::AppHandle,
+    files: State<'_, Files>,
+    request: Request<'_>,
+) -> Result<bool, String> {
+    let _permit = files.slots.try_acquire().map_err(|_| "too many file requests")?;
+    let InvokeBody::Raw(data) = request.body() else { return Err("expected raw bytes".into()) };
+    if data.len() as u64 > MAX_BYTES {
+        return Err("file exceeds size limit".into());
+    }
+    let name = request.headers().get("x-file-name").and_then(|v| v.to_str().ok()).ok_or("missing file name")?;
+    if name.len() > 2048 {
+        return Err("file name too long".into());
+    }
+    let name = percent_encoding::percent_decode_str(name).decode_utf8().map_err(|e| e.to_string())?;
+    let (tx, rx) = oneshot::channel();
+    app.dialog().file().set_file_name(proposed_name(&name)).save_file(move |path| {
+        let _ = tx.send(path);
+    });
+    let Some(destination) = rx.await.map_err(|e| e.to_string())? else { return Ok(false) };
+    tokio::fs::write(destination.into_path().map_err(|e| e.to_string())?, data).await.map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+pub async fn upload_put(files: State<'_, Files>, request: Request<'_>) -> Result<vc_proto::Attachment, String> {
     let _permit = files.slots.try_acquire().map_err(|_| "too many file requests")?;
     let server = files.connected()?;
     let path = request.headers().get("x-upload-path").and_then(|v| v.to_str().ok()).ok_or("missing upload path")?;
@@ -308,7 +334,18 @@ pub async fn upload_put(files: State<'_, Files>, request: Request<'_>) -> Result
     if response.status().is_redirection() {
         return Err("redirect rejected".into());
     }
-    Ok(response.status().as_u16())
+    let mut response = response.error_for_status().map_err(|e| e.to_string())?;
+    if response.content_length().is_some_and(|size| size > 16 * 1024) {
+        return Err("upload response too large".into());
+    }
+    let mut data = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        if data.len() + chunk.len() > 16 * 1024 {
+            return Err("upload response too large".into());
+        }
+        data.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&data).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

@@ -229,7 +229,7 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>) -> Option<View> 
                 u32::from(c.id.0),
                 Client {
                     id: u32::from(c.id.0),
-                    uid: c.uid.as_ref().map(|u| STANDARD.encode(&u.0)).unwrap_or_default(),
+                    uid: c.uid.as_ref().map(|u| format!("ts:{}", STANDARD.encode(&u.0))).unwrap_or_default(),
                     nickname: c.name.clone(),
                     channel: Some(c.channel.0 as u32),
                     groups: c.server_groups.iter().map(|g| g.0 as u32).collect(),
@@ -550,9 +550,10 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
     let mut mic_packet: u16 = 0;
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let mut next_message: u32 = 1 << 31;
+    type PendingRequest = (Box<Request>, oneshot::Sender<Result<Value, ErrorBody>>);
     enum Step {
         Item(Option<Result<StreamItem, tsclientlib::Error>>),
-        Request(Option<(Request, oneshot::Sender<Result<Value, ErrorBody>>)>),
+        Request(Option<PendingRequest>),
         Mic(Option<Vec<u8>>),
         Tick,
     }
@@ -561,7 +562,7 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
             let mut stream = con.events();
             tokio::select! {
                 item = stream.next() => Step::Item(item),
-                request = requests.recv() => Step::Request(request),
+                request = requests.recv() => Step::Request(request.map(|(request, reply)| (Box::new(request), reply))),
                 frame = mic.recv() => Step::Mic(frame),
                 _ = tick.tick() => Step::Tick,
             }
@@ -585,10 +586,15 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                             };
                             next_message = next_message.wrapping_add(1).max(1 << 31);
                             out.push(Event::ChatMessage(ChatMessage {
+                                signature: None,
                                 id: next_message,
                                 target,
                                 author: u32::from(invoker.id.0),
-                                author_uid: invoker.uid.as_ref().map(|u| STANDARD.encode(&u.0)).unwrap_or_default(),
+                                author_uid: invoker
+                                    .uid
+                                    .as_ref()
+                                    .map(|u| format!("ts:{}", STANDARD.encode(&u.0)))
+                                    .unwrap_or_else(|| "ts:unknown".into()),
                                 author_name: invoker.name.clone(),
                                 text: message,
                                 sent_at: now_ms(),
@@ -728,6 +734,7 @@ mod tests {
     #[test]
     fn chat_outside_own_channel_is_refused_locally() {
         let request = Request::ChatSend {
+            signature: vc_proto::MessageSignature::default(),
             target: ChatTarget::Channel(5),
             text: "x".into(),
             mentions: Vec::new(),

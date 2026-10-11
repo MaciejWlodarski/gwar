@@ -240,6 +240,8 @@ export class Connection implements Link {
     this.invite = options.invite;
   }
 
+  get identity(): Identity { return this.options.identity; }
+
   get status(): ConnectionStatus {
     return this.status_;
   }

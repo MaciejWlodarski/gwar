@@ -74,10 +74,14 @@ fn uids(reply: &Value) -> Vec<String> {
 }
 
 async fn upload(server: &TestServer, client: &mut Client, name: &str, bytes: &[u8]) -> String {
-    let reserved = client.ok("file.upload", json!({"name": name, "size": bytes.len(), "mime": "text/plain"})).await;
+    let reserved = client
+        .ok("file.upload", json!({"name": name, "size": bytes.len(), "sha256": hash(bytes), "mime": "text/plain"}))
+        .await;
     let url = format!("{}{}", server.http(), reserved["upload_url"].as_str().unwrap());
-    let status = reqwest::Client::new().put(&url).body(bytes.to_vec()).send().await.unwrap().status();
-    assert_eq!(status, 204, "upload accepted");
+    let response = reqwest::Client::new().put(&url).body(bytes.to_vec()).send().await.unwrap();
+    assert_eq!(response.status(), 200, "upload accepted");
+    let att: vc_proto::Attachment = response.json().await.unwrap();
+    client.files.insert(att.id.clone(), att);
     reserved["file"].as_str().unwrap().to_owned()
 }
 
@@ -355,7 +359,7 @@ fn the_command_line_lists_and_prunes_members() {
     let lobby = seeded.store.channels().unwrap()[0].id;
     seeded.store.add_message(lobby, "stale", "stale", "ancient", now_ms() - 100 * DAY).unwrap();
     std::fs::create_dir_all(seeded.files()).unwrap();
-    seeded.store.insert_file("f1", "stale", "a.txt", "text/plain", 3, None, now_ms()).unwrap();
+    seeded.store.insert_file("f1", "stale", "a.txt", "text/plain", 3, "hash", None, now_ms()).unwrap();
     let message = seeded.store.add_message(lobby, "stale", "stale", "with file", now_ms() - 99 * DAY).unwrap();
     seeded.store.attach_file("f1", message).unwrap();
     std::fs::write(seeded.files().join("f1"), "abc").unwrap();
@@ -430,9 +434,21 @@ fn merging_members_moves_all_identity_references_transactionally() {
     store.mark_read(from, side, third).unwrap();
     store.set_mentions(second, &["-legacy".into(), "account".into()]).unwrap();
     store.set_mentions(third, &["-legacy".into()]).unwrap();
-    store.insert_file("attached", "-legacy", "a.txt", "text/plain", 3, None, 1).unwrap();
+    let signed_id = store.add_message(side, "-legacy", "Original", "signed", 4).unwrap();
+    let mut signed = store.message(signed_id).unwrap().unwrap();
+    signed.mentions = vec!["-legacy".into()];
+    signed.signature = Some(Box::new(vc_proto::MessageSignature {
+        key: "key".into(),
+        certificate: None,
+        message_id: "message_id".into(),
+        created_at: 4,
+        signature: "signature".into(),
+        ..Default::default()
+    }));
+    Store::open(&seeded.database()).unwrap().save_message_body(&signed).unwrap();
+    store.insert_file("attached", "-legacy", "a.txt", "text/plain", 3, "hash", None, 1).unwrap();
     store.attach_file("attached", first).unwrap();
-    store.insert_file("pending", "-legacy", "p.txt", "text/plain", 3, None, 1).unwrap();
+    store.insert_file("pending", "-legacy", "p.txt", "text/plain", 3, "hash", None, 1).unwrap();
     std::fs::create_dir_all(seeded.files()).unwrap();
     std::fs::write(seeded.files().join("attached"), b"abc").unwrap();
     std::fs::write(seeded.files().join("pending"), b"def").unwrap();
@@ -463,7 +479,7 @@ fn merging_members_moves_all_identity_references_transactionally() {
     connection
         .execute("INSERT INTO revoked_devices(device_key,account_key,revoked_at) VALUES('device','-legacy',1)", [])
         .unwrap();
-    let summary = "2 messages, 2 files, 2 read marks, 2 group memberships, 2 mentions, 1 bans";
+    let summary = "2 unsigned messages, 2 files, 2 read marks, 2 group memberships, 2 unsigned mentions, 1 bans; signed messages keep their original author uid and mentions";
     let preview = cli(seeded.dir.path(), &["merge", "--dry-run", "--", "-legacy", "account"]);
     assert!(preview.status.success(), "{}", String::from_utf8_lossy(&preview.stderr));
     assert!(stdout(&preview).contains(summary));
@@ -513,6 +529,11 @@ fn merging_members_moves_all_identity_references_transactionally() {
     }
     assert_eq!(store.message(second).unwrap().unwrap().mentions, vec!["account".to_owned()]);
     assert_eq!(store.message(third).unwrap().unwrap().mentions, vec!["account".to_owned()]);
+    let preserved = store.message(signed_id).unwrap().unwrap();
+    assert_eq!(preserved.author_uid, signed.author_uid);
+    assert_eq!(preserved.author_name, "Original");
+    assert_eq!(preserved.mentions, signed.mentions);
+    assert_eq!(preserved.signature, signed.signature);
     assert!(store.pending_file("pending", "account").unwrap().is_some());
     assert_eq!(store.history(lobby, None, 10).unwrap()[0].attachments[0].id, "attached");
     assert_eq!(std::fs::read(seeded.files().join("attached")).unwrap(), b"abc");

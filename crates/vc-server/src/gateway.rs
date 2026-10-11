@@ -232,6 +232,8 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
     let (out, mut outbound) = mpsc::channel(OUTBOUND_QUEUE);
     let request = ConnectRequest {
         request_id: id,
+        hello_key: hello.client_signing_pk.clone(),
+        certificate: hello.certificate.clone(),
         uid,
         public_key: identity_key,
         device,

@@ -613,7 +613,7 @@ async fn channel_chat_reaches_everyone_who_can_read_it() {
 
     // Alice writes without being in voice anywhere.
     let sent = a.ok("chat.send", json!({"target": {"channel": default}, "text": "  hi there  "})).await;
-    assert_eq!(sent["text"], "hi there");
+    assert_eq!(sent["text"], "  hi there  ", "the signed text is preserved");
     assert_eq!(sent["author"], a.id());
     assert_eq!(sent["author_name"], "alice");
     assert_eq!(sent["author_uid"], uid_of(&a.key));

@@ -355,9 +355,9 @@ describe("sending, editing and deleting", () => {
   it("sends mentions and attachments along with the text", async () => {
     connectFake();
     await controller.sendChat("channel", "hi @n2", { mentions: ["u2"], attachments: ["f1"] });
-    expect(link.sent("chat.send").at(-1)?.d).toEqual({ target: { channel: 1 }, text: "hi @n2", mentions: ["u2"], attachments: ["f1"] });
+    expect(link.sent("chat.send").at(-1)?.d).toMatchObject({ target: { channel: 1 }, text: "hi @n2", mentions: ["u2"], attachments: ["f1"], signature: expect.any(Object) });
     await controller.sendChat("channel", "plain");
-    expect(link.sent("chat.send").at(-1)?.d).toEqual({ target: { channel: 1 }, text: "plain" });
+    expect(link.sent("chat.send").at(-1)?.d).toMatchObject({ target: { channel: 1 }, text: "plain", signature: expect.any(Object) });
   });
 
   it("keeps mentions and attachments of a failed send for the retry", async () => {
@@ -372,8 +372,9 @@ describe("sending, editing and deleting", () => {
 
   it("edits and deletes through the server", async () => {
     connectFake();
+    link.emit({ ev: "chat.message", d: message(5, 1) });
     expect(await controller.editMessage(5, "new", ["u2"])).toBe(true);
-    expect(link.sent("chat.edit")).toEqual([{ op: "chat.edit", d: { message: 5, text: "new", mentions: ["u2"] } }]);
+    expect(link.sent("chat.edit")).toEqual([{ op: "chat.edit", d: { message: 5, text: "new", mentions: ["u2"], signature: expect.any(Object) } }]);
     expect(await controller.deleteMessage(5)).toBe(true);
     expect(link.sent("chat.delete")).toEqual([{ op: "chat.delete", d: { message: 5 } }]);
     link.failing.add("chat.delete");
@@ -381,13 +382,13 @@ describe("sending, editing and deleting", () => {
     expect(stores.useUi.getState().toasts).toHaveLength(1);
   });
 
-  it("applies edit and delete events to the thread", async () => {
+  it("rejects unsigned edits and labels server removals", async () => {
     connectFake();
     link.emit({ ev: "chat.message", d: message(10, 1) });
     link.emit({ ev: "chat.edited", d: message(10, 1, { text: "changed", edited_at: 99 }) });
-    expect(session().threads["ch:1"]?.items.some((i) => i.kind === "msg" && i.msg.text === "changed")).toBe(true);
+    expect(session().threads["ch:1"]?.items.some((i) => i.kind === "msg" && i.msg.text === "changed")).toBe(false);
     link.emit({ ev: "chat.deleted", d: { channel: 1, message: 10 } });
-    expect(session().threads["ch:1"]?.items.some((i) => i.key === "m10")).toBe(false);
+    expect(session().threads["ch:1"]?.items.some((i) => i.key === "m10" && i.kind === "msg" && i.removed)).toBe(true);
   });
 });
 
@@ -428,10 +429,11 @@ describe("notifications", () => {
   it("notifies about a mention while the window is in the background, and clicking opens that chat", async () => {
     connectFake();
     session().dispatch({ type: "focus", focused: false });
-    link.emit({ ev: "chat.message", d: message(50, 2, { mentions: ["u1"], text: "hey you" }) });
+    link.emit({ ev: "chat.message", d: message(50, 2, { author_uid: "ts:peer", mentions: ["u1"], text: "hey you" }) });
     expect(notifyMock).toHaveBeenCalledTimes(1);
     const call = notifyMock.mock.calls[0]![0] as { title: string; body: string; onClick: () => void };
     expect(call.title).toContain("n2");
+    expect(call.title).toContain("TeamSpeak / unsigned");
     expect(call.body).toBe("hey you");
     call.onClick();
     expect(session().viewChannel).toBe(2);
@@ -451,22 +453,46 @@ describe("notifications", () => {
   it("notifies about private messages and opens the conversation", async () => {
     connectFake();
     session().dispatch({ type: "focus", focused: false });
-    link.emit({ ev: "chat.message", d: message(54, 1, { target: { client: 1 }, text: "psst" }) });
+    link.emit({ ev: "chat.message", d: message(54, 1, { author_uid: "ts:peer", target: { client: 1 }, text: "psst" }) });
     expect(notifyMock).toHaveBeenCalledTimes(1);
     (notifyMock.mock.calls[0]![0] as { onClick: () => void }).onClick();
-    expect(session().activeThread).toBe("dm:u2");
+    expect(session().activeThread).toBe("dm:ts:peer");
   });
 
   it("can notify about everything", async () => {
     prefs({ allMessages: true });
     connectFake();
     session().dispatch({ type: "focus", focused: false });
-    link.emit({ ev: "chat.message", d: message(55, 2) });
+    link.emit({ ev: "chat.message", d: message(55, 2, { author_uid: "ts:peer" }) });
     expect(notifyMock).toHaveBeenCalledTimes(1);
   });
 });
 
+it("suppresses unsigned Gwar mentions and DMs even when all notifications are enabled", () => {
+  notifyMock.mockClear(); settings.useSettings.getState().setNotifications({ mentions: true, privateMessages: true, allMessages: true });
+  connectFake(); session().dispatch({ type: "focus", focused: false });
+  link.emit({ ev: "chat.message", d: message(60, 2, { mentions: ["u1"] }) });
+  link.emit({ ev: "chat.message", d: message(61, 1, { target: { client: 1 } }) });
+  expect(notifyMock).not.toHaveBeenCalled();
+});
+
 describe("uploads", () => {
+  it("refuses server substitutions of locally derived upload names and MIME", async () => {
+    connectFake(); stores.useSession.setState({ httpOrigin: "http://localhost:8799", server: { ...session().server!, upload_limit: 100 } });
+    vi.spyOn(link, "request").mockResolvedValue({ file: "file", upload_url: "/api/files/file?token=x" } as never);
+    const file = new File(["hello"], "notes.txt", { type: "text/plain" });
+    const { sha256 } = await import("../net/message-signature");
+    const att = { id: "file", name: "notes.txt", mime: "text/plain", size: 5, url: "/files/file/notes.txt", sha256: await sha256(new TextEncoder().encode("hello")) };
+    const request = vi.spyOn(globalThis, "fetch");
+    try {
+      for (const changed of [{ ...att, name: "forged.txt" }, { ...att, mime: "text/html" }]) {
+        request.mockResolvedValueOnce(new Response(JSON.stringify(changed)));
+        await expect(controller.uploadFile(file)).rejects.toMatchObject({ kind: "network" });
+      }
+      request.mockResolvedValueOnce(new Response(JSON.stringify(att)));
+      expect(await controller.uploadFile(file)).toBe("file");
+    } finally { request.mockRestore(); }
+  });
   it("refuses files over the server limit before asking the server", async () => {
     connectFake();
     stores.useSession.setState({ server: { ...session().server!, upload_limit: 100 } });

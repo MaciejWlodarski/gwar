@@ -102,7 +102,7 @@ export type DialogState =
   | { kind: "memberProfile"; uid: string; fallback: string }
   | { kind: "ban"; person: PersonRef; back?: ServerSettingsTab }
   | { kind: "removeMember"; person: PersonRef; back?: ServerSettingsTab }
-  | { kind: "lightbox"; attachment: Attachment }
+  | { kind: "lightbox"; attachment: Attachment; verified: boolean }
   | { kind: "redeem" }
   | { kind: "createToken" }
   | { kind: "serverKey" }

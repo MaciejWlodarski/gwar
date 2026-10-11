@@ -1,4 +1,14 @@
-import type { ChatItem } from "../state/types";
+import type { ChatItem, StoredThreadKey } from "../state/types";
+
+/** A DM binds exactly the two participants of the locally open conversation. */
+export function messageTarget(key: StoredThreadKey | null | undefined, authorUid: string, uid: string | undefined): string {
+  if (key?.startsWith("ch:")) return `channel:${key.slice(3)}`;
+  if (key === "server") return "server";
+  if (!uid || !key?.startsWith("dm:")) return "invalid";
+  const peer = key.slice(3);
+  if (authorUid !== uid && authorUid !== peer) return "invalid";
+  return `dm:${[uid, peer].sort().join(":")}`;
+}
 
 /** "99+" above 99: the server caps its count at 100. */
 export function unreadLabel(count: number): string {
@@ -27,7 +37,9 @@ export function buildRows(items: ChatItem[]): Row[] {
   const rows: Row[] = [];
   let prev: Row | null = null;
   let lastDay = "";
-  for (const item of items) {
+  for (const original of items) {
+    const signedAt = original.kind === "msg" ? original.msg.signature?.created_at : undefined;
+    const item = signedAt != null && Number.isFinite(new Date(signedAt).getTime()) ? { ...original, at: signedAt } : original;
     const day = dayKey(item.at);
     if (day !== lastDay) {
       lastDay = day;

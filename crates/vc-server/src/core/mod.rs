@@ -35,9 +35,9 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use vc_proto::{
-    Channel, ChannelCreate, ChannelId, ChannelUpdate, ChatMessage, ChatTarget, Client, ClientUpdate, ErrorBody,
-    ErrorCode, Event, Group, GroupId, IceServer, LeaveReason, MessageId, NICKNAME_MAX_LEN, Permission, Platform,
-    Request, Response, ServerFrame, ServerInfo, SessionId, Uid, Unread, Welcome,
+    Channel, ChannelCreate, ChannelId, ChannelUpdate, ChatMessage, ChatTarget, Client, ClientUpdate, DeviceCertificate,
+    ErrorBody, ErrorCode, Event, Group, GroupId, IceServer, LeaveReason, MessageId, MessageSignature, NICKNAME_MAX_LEN,
+    Permission, Platform, Request, Response, ServerFrame, ServerInfo, SessionId, Uid, Unread, Welcome,
 };
 
 use self::bridge::{BridgeMsg, BridgeNote, RemoteClient};
@@ -62,6 +62,8 @@ pub const OUTBOUND_QUEUE: usize = 1024;
 
 pub struct ConnectRequest {
     pub request_id: u32,
+    pub hello_key: String,
+    pub certificate: Option<DeviceCertificate>,
     pub uid: Uid,
     pub public_key: String,
     pub nickname: String,
@@ -190,9 +192,12 @@ pub struct CoreConfig {
     pub upload_limit: u64,
     pub files_dir: PathBuf,
     pub connect_url: Option<String>,
+    pub server_key: String,
 }
 
 struct Session {
+    hello_key: String,
+    certificate: Option<DeviceCertificate>,
     id: SessionId,
     user_id: i64,
     uid: Uid,
@@ -239,6 +244,7 @@ pub struct Core {
     connect: Option<crate::connect::Lookup>,
     connect_pending: HashMap<Uid, u64>,
     next_connect_lookup: u64,
+    server_key: String,
 }
 
 /// Messages with ids at or above this value are delivered live and not stored.
@@ -400,6 +406,7 @@ impl Core {
             connect,
             connect_pending: HashMap::new(),
             next_connect_lookup: 0,
+            server_key: config.server_key,
         })
     }
 
@@ -499,7 +506,7 @@ impl Core {
 
     fn broadcast(&mut self, event: Event, filter: impl Fn(&Session) -> bool) {
         if !self.applying_remote && !matches!(event, Event::VoiceTalking { .. }) {
-            self.notify_bridge(|| BridgeNote::Event(event.clone()));
+            self.notify_bridge(|| BridgeNote::Event(Box::new(event.clone())));
         }
         let frame = encode(&ServerFrame::Event(event));
         let targets: Vec<_> = self.sessions.values().filter(|s| filter(s)).map(|s| s.id).collect();
@@ -651,6 +658,8 @@ impl Core {
         }
         let id = self.allocate_session();
         let session = Session {
+            hello_key: r.hello_key,
+            certificate: r.certificate,
             id,
             user_id: user.id,
             uid: r.uid,
@@ -878,6 +887,8 @@ impl Core {
                 let channel =
                     Some(client.channel).filter(|c| self.channels.contains_key(c)).or(Some(self.info.default_channel));
                 let session = Session {
+                    hello_key: String::new(),
+                    certificate: None,
                     id,
                     user_id,
                     uid: client.uid,
@@ -944,7 +955,7 @@ impl Core {
             BridgeMsg::Chat(session, target, text) => {
                 let mentions = self.detect_mentions(&text);
                 if self.sessions.get(&session).is_some_and(|s| s.out.is_none())
-                    && let Err(e) = self.chat_send(session, target, text, mentions, Vec::new())
+                    && let Err(e) = self.chat_send(session, target, text, mentions, Vec::new(), None)
                 {
                     debug!(session, "remote chat rejected: {}", e.message);
                 }
@@ -991,12 +1002,14 @@ impl Core {
             Request::ChannelCreate(create) => return self.channel_create(session, id, create),
             Request::ChannelUpdate(update) => return self.channel_update(session, id, update),
             Request::ChannelDelete { channel } => self.channel_delete(session, channel),
-            Request::ChatSend { target, text, mentions, attachments } => {
-                self.chat_send(session, target, text, mentions, attachments)
+            Request::ChatSend { target, text, mentions, attachments, signature } => {
+                self.chat_send(session, target, text, mentions, attachments, Some(signature))
             }
-            Request::ChatEdit { message, text, mentions } => self.chat_edit(session, message, text, mentions),
+            Request::ChatEdit { message, text, mentions, signature } => {
+                self.chat_edit(session, message, text, mentions, signature)
+            }
             Request::ChatDelete { message } => self.chat_delete(session, message),
-            Request::FileUpload { name, size, mime } => self.file_upload(session, name, size, mime),
+            Request::FileUpload { name, size, mime, sha256 } => self.file_upload(session, name, size, mime, sha256),
             Request::GroupCreate(create) => self.group_create(session, create),
             Request::GroupUpdate(update) => self.group_update(session, update),
             Request::GroupDelete { group } => self.group_delete(session, group),
@@ -1414,6 +1427,7 @@ impl Core {
         depth
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn chat_send(
         &mut self,
         session: SessionId,
@@ -1421,25 +1435,30 @@ impl Core {
         text: String,
         mentions: Vec<Uid>,
         attachments: Vec<String>,
+        signature: Option<MessageSignature>,
     ) -> Reply {
-        let text = text.trim();
         // A message may be just attachments.
-        if (text.is_empty() && attachments.is_empty()) || text.chars().count() > MAX_MESSAGE {
+        if (text.trim().is_empty() && attachments.is_empty()) || text.chars().count() > MAX_MESSAGE {
             return Err(err(ErrorCode::BadRequest, "message must be 1–4000 characters"));
         }
-        if attachments.len() > MAX_ATTACHMENTS {
+        if attachments.len() > MAX_ATTACHMENTS || attachments.iter().collect::<BTreeSet<_>>().len() != attachments.len()
+        {
             return Err(err(ErrorCode::BadRequest, "too many attachments"));
         }
-        let mentions = self.valid_mentions(mentions);
+        if text == vc_proto::DELETION_TEXT {
+            return Err(err(ErrorCode::BadRequest, "deletion must be an edit"));
+        }
+        let mentions = self.signed_mentions(mentions, signature.is_some())?;
         let author = &self.sessions[&session];
         let mut message = ChatMessage {
+            signature: signature.clone().map(Box::new),
             id: 0,
             target: target.clone(),
             author: session,
             author_uid: author.uid.clone(),
             author_name: author.nickname.clone(),
-            text: text.to_owned(),
-            sent_at: now_ms(),
+            text,
+            sent_at: signature.as_ref().map_or_else(now_ms, |s| s.created_at),
             mentions,
             attachments: Vec::new(),
             edited_at: None,
@@ -1456,15 +1475,14 @@ impl Core {
                         None => return Err(err(ErrorCode::NotFound, "no such upload")),
                     }
                 }
+                message.attachments = files;
+                self.verify_message(session, &message, false)?;
+                self.reserve_message_identity(&message)?;
                 message.id = self
                     .store
                     .add_message(channel, &message.author_uid, &message.author_name, &message.text, message.sent_at)
                     .map_err(storage_error)?;
-                self.store.set_mentions(message.id, &message.mentions).map_err(storage_error)?;
-                for file in &files {
-                    self.store.attach_file(&file.id, message.id).map_err(storage_error)?;
-                }
-                message.attachments = files;
+                self.store.save_message_body(&message).map_err(storage_error)?;
                 // Everyone who can read the channel, in voice there or not (for unread counts).
                 let readers: BTreeSet<_> =
                     self.sessions.values().filter(|s| self.can_read(s, channel)).map(|s| s.id).collect();
@@ -1477,15 +1495,19 @@ impl Core {
                 if !self.sessions.contains_key(&to) {
                     return Err(err(ErrorCode::NotFound, "no such client"));
                 }
+                self.verify_message(session, &message, false)?;
+                self.reserve_message_identity(&message)?;
                 message.id = self.ephemeral_id();
                 self.broadcast(Event::ChatMessage(message.clone()), |s| s.id == to || s.id == session);
             }
             ChatTarget::Server => {
+                self.verify_message(session, &message, false)?;
+                self.reserve_message_identity(&message)?;
                 message.id = self.ephemeral_id();
                 self.broadcast(Event::ChatMessage(message.clone()), |_| true);
             }
         }
-        Ok(Response::Message(message))
+        Ok(Response::Message(Box::new(message)))
     }
 
     fn ephemeral_id(&mut self) -> MessageId {
@@ -1614,6 +1636,7 @@ mod expiry_tests {
                 upload_limit: 0,
                 files_dir: PathBuf::new(),
                 connect_url: None,
+                server_key: String::new(),
             },
             routing.clone(),
             media,
@@ -1623,6 +1646,8 @@ mod expiry_tests {
         let session = core
             .connect(ConnectRequest {
                 request_id: 1,
+                hello_key: String::new(),
+                certificate: None,
                 uid: crate::identity::uid_for_key(&[1; 32]),
                 public_key: URL_SAFE_NO_PAD.encode([1; 32]),
                 nickname: "device".into(),

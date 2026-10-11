@@ -10,6 +10,10 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 use vc_proto::{DeviceCertificate, ErrorCode, Hello, Uid, certificate_hash, decode_fixed, hello_statement};
 
+pub fn valid_hash(value: &str, bytes: usize) -> bool {
+    URL_SAFE_NO_PAD.decode(value).is_ok_and(|raw| raw.len() == bytes && URL_SAFE_NO_PAD.encode(raw) == value)
+}
+
 pub fn new_nonce() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);

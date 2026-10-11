@@ -18,6 +18,7 @@ custom-protocol = ["tauri/custom-protocol"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+percent-encoding = "2"
 vc-client = { path = "../../../crates/vc-client" }
 vc-proto = { path = "../../../crates/vc-proto" }
 anyhow.workspace = true
