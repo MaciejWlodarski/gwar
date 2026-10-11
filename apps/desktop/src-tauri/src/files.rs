@@ -321,8 +321,9 @@ pub async fn save_blob_as(
 pub async fn upload_put(files: State<'_, Files>, request: Request<'_>) -> Result<vc_proto::Attachment, String> {
     let _permit = files.slots.try_acquire().map_err(|_| "too many file requests")?;
     let server = files.connected()?;
-    let path = request.headers().get("x-upload-path").and_then(|v| v.to_str().ok()).ok_or("missing upload path")?;
-    let url = file_url(&server.origin, path, true)?;
+    let header = |name: &str| request.headers().get(name).and_then(|v| v.to_str().ok());
+    let path = header("x-upload-path").ok_or("missing upload path")?;
+    let url = upload_url(&server, header("x-upload-origin").ok_or("missing upload origin")?, path)?;
     let InvokeBody::Raw(data) = request.body() else { return Err("expected raw bytes".into()) };
     cap(data.len() as u64, server.limit)?;
     let mut closed = server.closed.subscribe();
@@ -346,6 +347,15 @@ pub async fn upload_put(files: State<'_, Files>, request: Request<'_>) -> Result
         data.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&data).map_err(|e| e.to_string())
+}
+
+/// Where an upload reserved on `reserved_on` goes: only to that same server. If the interface has meanwhile
+/// switched to another one, the bytes are refused before any request is made.
+fn upload_url(server: &Server, reserved_on: &str, path: &str) -> Result<Url, String> {
+    if origin(reserved_on)?.origin() != server.origin.origin() {
+        return Err("the server changed during the upload".into());
+    }
+    file_url(&server.origin, path, true)
 }
 
 #[cfg(test)]
@@ -428,6 +438,22 @@ mod tests {
                 .unwrap(),
             limit: MAX_BYTES,
             closed: watch::channel(false).0,
+        }
+    }
+
+    #[test]
+    fn uploads_go_only_to_the_server_they_were_reserved_on() {
+        let b = Server {
+            origin: origin("https://b.example").unwrap(),
+            client: Client::new(),
+            limit: MAX_BYTES,
+            closed: watch::channel(false).0,
+        };
+        let path = "/api/files/a?token=t";
+        assert_eq!(upload_url(&b, "https://b.example", path).unwrap().as_str(), "https://b.example/api/files/a?token=t");
+        assert!(upload_url(&b, "https://b.example:443/", path).is_ok());
+        for reserved_on in ["https://a.example", "http://b.example", "https://b.example:8443", "not a url"] {
+            assert!(upload_url(&b, reserved_on, path).is_err(), "{reserved_on}");
         }
     }
 

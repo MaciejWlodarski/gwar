@@ -52,6 +52,8 @@ import type { ThreadKey } from "./types";
 
 export const CLIENT_VERSION = "0.1.0";
 const HISTORY_PAGE = 50;
+/** Finished uploads not yet sent in a message. */
+const MAX_PENDING_UPLOADS = 64;
 /** Reading is reported to the server at most this often. */
 const READ_DEBOUNCE_MS = 1000;
 
@@ -528,6 +530,7 @@ class Controller {
     const dialog = useUi.getState().dialog.kind;
     if (dialog !== "none" && dialog !== "settings" && dialog !== "addServer") useUi.getState().closeDialog();
     useOutbox.getState().clear();
+    this.uploaded.clear();
     useSession.getState().dispatch({ type: "reset" });
     useVoice.getState().set({ state: "idle", level: 0, pttActive: false, micError: null });
   }
@@ -945,6 +948,7 @@ class Controller {
         ...(m.mentions ? { mentions: m.mentions } : {}),
         ...(m.attachments ? { attachments: m.attachments } : {}),
       });
+      for (const id of m.attachments ?? []) this.uploaded.delete(id);
       return true;
     } catch (e) {
       // A draft whose session has ended belongs to no thread here: it is dropped, never kept for another server.
@@ -1061,6 +1065,8 @@ class Controller {
       if (!attachmentSchema(att) || att.id !== reserved.file || att.sha256 !== hash || att.size !== file.size || att.name !== expected.name || att.mime !== expected.mime) throw new UploadError("network");
       stillHere();
       this.uploaded.set(att.id, { conn: bound.conn, att: { ...att, sha256: hash } });
+      // Uploads waiting to be sent are few; the oldest unsent ones are forgotten first.
+      while (this.uploaded.size > MAX_PENDING_UPLOADS) this.uploaded.delete(this.uploaded.keys().next().value!);
       return att.id;
     };
     stillHere();
@@ -1069,7 +1075,8 @@ class Controller {
       opts.onProgress?.(0.5);
       let att: Attachment;
       try {
-        att = await uploadFromApp(reserved.upload_url, file, s.server?.upload_limit ?? 0);
+        if (!s.httpOrigin) throw new UploadError("network");
+        att = await uploadFromApp(reserved.upload_url, bytes, s.server?.upload_limit ?? 0, s.httpOrigin, stillHere);
       } catch {
         throw new UploadError("network");
       }

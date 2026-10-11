@@ -8,6 +8,18 @@ import type { EventName, Op } from "../net/protocol";
 import { welcome } from "../net/testing";
 import type { VoiceEngine } from "../voice/engine";
 
+// Native file commands, recording where uploads would go (only the desktop upload test turns the app native).
+const native = vi.hoisted(() => ({ origin: null as string | null, sent: [] as Array<{ origin: string | null; reservedOn: string; bytes: Uint8Array }>, attachment: {} }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async (op: string, data: { origin?: string | null }, options?: { headers: Record<string, string> }) => {
+  if (op === "files_set_server") { native.origin = data.origin ?? null; return; }
+  if (op === "upload_put") {
+    native.sent.push({ origin: native.origin, reservedOn: options!.headers["x-upload-origin"]!, bytes: data as unknown as Uint8Array });
+    // Like the native command: refused unless still connected to the server that reserved the upload.
+    if (native.origin !== options!.headers["x-upload-origin"]) throw new Error("the server changed during the upload");
+    return native.attachment;
+  }
+}) }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
 const notifyMock = vi.hoisted(() => vi.fn());
 vi.mock("../platform/notify", () => ({ notify: notifyMock }));
 
@@ -727,6 +739,31 @@ describe("edits stay on their connection; history ownership follows each verifie
     expect(await editing).toBe(false);
     expect(a.request).not.toHaveBeenCalled();
     g.c.conn = link;
+  });
+
+  it("a desktop upload never reaches a server the app switched to meanwhile (Astra r4 probe, inverted)", async () => {
+    vi.useRealTimers(); connectFake();
+    const g = await genuine(), { a, switchTo } = await servers(g), held = gate();
+    stores.useSession.setState({ httpOrigin: "https://a.example", server: { ...session().server!, upload_limit: 100 } });
+    const bytes = new TextEncoder().encode("private bytes for A");
+    const file = new File([bytes], "secret.txt", { type: "text/plain" });
+    a.request.mockResolvedValue({ file: "file", upload_url: "/api/files/file?token=x" });
+    const { setConnectedServer } = await import("../platform/download");
+    vi.stubGlobal("window", { __TAURI_INTERNALS__: {}, addEventListener: vi.fn(), removeEventListener: vi.fn() });
+    native.sent.length = 0;
+    await setConnectedServer("https://a.example", 100);
+    // The session ends while the native side is still getting ready (here: during the reservation reply).
+    a.request.mockImplementation(async () => { await held.pass(); return { file: "file", upload_url: "/api/files/file?token=x" }; });
+    try {
+      const pending = controller.uploadFile(file);
+      const result = expect(pending).rejects.toMatchObject({ kind: "network" });
+      await held.started; switchTo(); await setConnectedServer("https://b.example", 100); held.release(); await result;
+      expect(native.sent.filter((s) => s.origin === "https://b.example")).toEqual([]);
+      expect(g.c.uploaded.size).toBe(0);
+      // Even if the interface did call the native command, it names the server the upload was reserved on.
+      const { uploadFromApp } = await import("../platform/download");
+      await expect(uploadFromApp("/api/files/file?token=x", bytes, 100, "https://a.example")).rejects.toThrow("server changed");
+    } finally { vi.unstubAllGlobals(); g.c.conn = link; }
   });
 
   it("a forged duplicate in a history page never inherits the genuine row's ownership", async () => {

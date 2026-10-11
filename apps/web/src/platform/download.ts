@@ -112,12 +112,15 @@ export async function saveFile(path: string, name: string, opts: FileOptions): P
   return true;
 }
 
-export async function uploadFromApp(path: string, file: Blob, uploadLimit: number): Promise<Attachment> {
+/** Uploads exactly `bytes` to the server at `origin`, which reserved the upload. Native code refuses if it is no
+ *  longer connected to that server; `stillHere` throws if the session that started the upload has ended. */
+export async function uploadFromApp(path: string, bytes: Uint8Array, uploadLimit: number, origin: string, stillHere: () => void = () => {}): Promise<Attachment> {
   filePath(path, "PUT");
-  fileCap(file.size, uploadLimit);
+  fileCap(bytes.byteLength, uploadLimit);
   await nativeReady;
   const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<Attachment>("upload_put", new Uint8Array(await file.arrayBuffer()), { headers: { "x-upload-path": path } });
+  stillHere();
+  return invoke<Attachment>("upload_put", bytes, { headers: { "x-upload-path": path, "x-upload-origin": origin } });
 }
 
 /** Save the exact inspected bytes; native code never refetches a potentially substituted URL. */
