@@ -199,7 +199,7 @@ const MIGRATIONS: &[&str] = &[
 "#,
     r#"
     ALTER TABLE users ADD COLUMN connect_attestation TEXT;
-    UPDATE users SET connect_handle=NULL,connect_next_check=NULL;
+    UPDATE users SET connect_next_check=NULL;
 "#,
 ];
 
@@ -487,15 +487,22 @@ impl Store {
 
     pub fn set_connect_attestation(&self, user_id: i64, a: Option<&HandleAttestation>) -> Result<()> {
         let json = a.map(serde_json::to_string).transpose()?;
-        self.db.execute("UPDATE users SET connect_attestation=?2 WHERE id=?1", params![user_id, json])?;
+        let handle = a.map(|a| a.handle.as_str());
+        self.db.execute(
+            "UPDATE users SET connect_attestation=?2,connect_handle=?3 WHERE id=?1",
+            params![user_id, json, handle],
+        )?;
         Ok(())
     }
 
-    /// Includes expired attestations so a returning account still triggers refresh.
+    /// Includes expired attestations (and handles confirmed before attestations existed)
+    /// so a returning account still triggers refresh.
     pub fn has_connect_attestation(&self, user_id: i64) -> Result<bool> {
-        Ok(self
-            .db
-            .query_row("SELECT connect_attestation IS NOT NULL FROM users WHERE id=?1", [user_id], |r| r.get(0))?)
+        Ok(self.db.query_row(
+            "SELECT connect_attestation IS NOT NULL OR connect_handle IS NOT NULL FROM users WHERE id=?1",
+            [user_id],
+            |r| r.get(0),
+        )?)
     }
 
     /// Disabling Connect forgets cached handles, so enabling it starts with fresh checks.
@@ -1177,9 +1184,12 @@ mod tests {
         assert_eq!(member.nickname, "Kept");
         assert!(member.connect.is_none());
         assert_eq!(store.connect_next_check(id).unwrap(), None);
+        // The unsigned handle is not shown, but still marks the key as a Connect account.
+        assert!(store.has_connect_attestation(id).unwrap());
         let (id, member) = store.user_by_uid("unknown").unwrap().unwrap();
         assert!(member.connect.is_none());
         assert_eq!(store.connect_next_check(id).unwrap(), None);
+        assert!(!store.has_connect_attestation(id).unwrap());
         assert!(store.db.prepare("SELECT connect_checked_at FROM users").is_err());
         let version: usize = store.db.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(version, MIGRATIONS.len());
