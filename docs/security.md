@@ -171,11 +171,15 @@ gwar message v2
   the channel ids it saw and saw deleted (by event or by their absence from a
   later channel list); messages in a channel whose id it saw deleted show "the
   server reused the id of a deleted channel" and never count as fully verified.
-  The record fails closed: if it cannot be read or stored, or a server floods it
-  past 10,000 ids, that server's record is marked incomplete for good and every
-  channel message there is qualified ("cannot rule out a reused channel id").
-  If storage refuses even that small marker, the record lasts only until the
-  app reloads. A client that never saw the deletion cannot tell, so a signature binds a
+  The record fails closed: if it cannot be read or stored, holds anything but
+  what the client wrote, or a server floods it past 10,000 ids, that server's
+  record is marked incomplete for good and every channel message there is
+  qualified ("cannot rule out a reused channel id"). If storage refuses even
+  that small marker, the record stays in memory however many other servers
+  the client visits; should more than 64 such records pile up, the client
+  drops the oldest and qualifies every channel message on every server until
+  it reloads. A reload is the one point where an unstored record is lost. A
+  client that never saw the deletion cannot tell, so a signature binds a
   message to the channel id, not to the channel's name or lifetime. A direct
   message must involve exactly the two participants of the open conversation.
 - Edits keep the message id and creation time and chain to the previous

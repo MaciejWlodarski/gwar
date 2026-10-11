@@ -4,9 +4,10 @@ import type { MessageVerification } from "./message-signature";
 
 const memory = () => {
   const m = new Map<string, string>();
-  const store = { full: false, broken: false, m,
+  // full: only the small incomplete marker fits; frozen: no write fits; broken: nothing works.
+  const store = { full: false, frozen: false, broken: false, m,
     getItem: (k: string) => { if (store.broken) throw new Error("denied"); return m.get(k) ?? null; },
-    setItem: (k: string, v: string) => { if (store.broken || (store.full && !v.includes("\"incomplete\":true"))) throw new DOMException("quota", "QuotaExceededError"); m.set(k, v); } };
+    setItem: (k: string, v: string) => { if (store.broken || store.frozen || (store.full && !v.includes("\"incomplete\":true"))) throw new DOMException("quota", "QuotaExceededError"); m.set(k, v); } };
   return store;
 };
 const ok: MessageVerification = { status: "verified", continuity: "proven", authorization: [] };
@@ -41,10 +42,47 @@ describe("channel lifecycle", () => {
     store.broken = true;
     expect(channelLifecycle(store).check("A", 1)).toBe("unknown");
     store.broken = false;
-    for (const raw of ["{not json", "null", "[1]"]) {
+    // Astra r4 probe, inverted: anything but exactly what was saved is incomplete.
+    const malformed = ["{not json", "null", "[1]", "[]", "{}", "1", "\"x\"",
+      `{"known":[1],"deleted":"lost","incomplete":false}`, `{"known":[1],"deleted":["2"],"incomplete":false}`,
+      `{"known":[1],"deleted":[],"incomplete":"false"}`, `{"known":[1],"deleted":[],"incomplete":0}`, `{"known":[1],"deleted":[-1],"incomplete":false}`,
+      `{"known":[1.5],"deleted":[],"incomplete":false}`, `{"known":[1],"deleted":[]}`,
+      `{"known":[1],"deleted":[],"incomplete":false,"extra":1}`,
+      JSON.stringify({ known: Array.from({ length: MAX_IDS + 1 }, (_, i) => i), deleted: [], incomplete: false })];
+    for (const raw of malformed) {
       store.m.set("vc.channels:A", raw);
-      expect(channelLifecycle(store).check("A", 1)).toBe(raw === "[1]" ? "ok" : "unknown");
+      expect([raw.slice(0, 60), channelLifecycle(store).check("A", 1)]).toEqual([raw.slice(0, 60), "unknown"]);
     }
+    store.m.set("vc.channels:A", `{"known":[1],"deleted":[2],"incomplete":false}`);
+    expect([1, 2].map((id) => channelLifecycle(store).check("A", id))).toEqual(["ok", "reused"]);
+    store.m.delete("vc.channels:A");
+    expect(channelLifecycle(store).check("A", 1)).toBe("ok");
+  });
+  it("never drops an unsaved record from memory, however many servers pass through (Astra r4 probe, inverted)", () => {
+    const store = memory(), c = channelLifecycle(store);
+    c.observe("A", [1]);
+    store.frozen = true;
+    c.deleted("A", 1);
+    c.created("A", 1);
+    for (let i = 0; i < 200; i++) c.check(`other${i}`, 1);
+    expect(c.check("A", 1)).toBe("reused");
+    store.frozen = false;
+    for (let i = 0; i < 200; i++) c.check(`again${i}`, 1);
+    c.observe("A", [1]);
+    expect([c.check("A", 1), channelLifecycle(store).check("A", 1)]).toEqual(["reused", "reused"]);
+    expect(c.check("other0", 1)).toBe("ok");
+  });
+  it("drops saved records first; past the bound of unsaved ones every record is uncertain for the session", () => {
+    const store = memory(), c = channelLifecycle(store);
+    c.observe("saved", [1]);
+    store.frozen = true;
+    for (let i = 0; i < 63; i++) c.deleted(`s${i}`, 1);
+    expect([c.check("s0", 1), c.check("saved", 1), c.check("fresh", 1)]).toEqual(["reused", "ok", "ok"]);
+    c.deleted("s63", 1); // 64 unsaved: memory holds nothing else
+    c.check("fresh2", 1); // so s1, the least recently used (s0 was checked above), has to go
+    store.frozen = false;
+    expect(["saved", "fresh", "s1", "s63"].map((k) => c.check(k, 1))).toEqual(["unknown", "unknown", "unknown", "reused"]);
+    expect(channelLifecycle(store).check("saved", 1)).toBe("ok");
   });
   it("an attacker flooding deletions makes the record incomplete instead of forgetting (Astra r3 probe, inverted)", () => {
     const c = channelLifecycle(memory());

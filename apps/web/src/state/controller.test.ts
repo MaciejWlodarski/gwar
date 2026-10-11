@@ -785,18 +785,27 @@ describe("edits stay on their connection; history ownership follows each verifie
 });
 
 describe("channel id reuse", () => {
-  for (const failing of [false, true]) it(`a channel recreated under an id this client saw deleted never verifies fully${failing ? ", even when storage writes fail (Astra r3 probe, inverted)" : " (Astra r2 probe, inverted)"}`, async () => {
+  const cases = {
+    stored: " (Astra r2 probe, inverted)",
+    full: ", even when storage writes fail (Astra r3 probe, inverted)",
+    churn: ", even when no write fits and 64 other servers pass through before writes recover (Astra r4 probe, inverted)",
+  };
+  for (const [mode, title] of Object.entries(cases)) it(`a channel recreated under an id this client saw deleted never verifies fully${title}`, async () => {
     vi.useRealTimers();
+    const failing = mode !== "stored";
     const store = new Map<string, string>();
     let full = false;
-    vi.stubGlobal("localStorage", { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => { if (full) throw new DOMException("quota", "QuotaExceededError"); store.set(k, v); } });
+    vi.stubGlobal("localStorage", { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => {
+      if (full && (mode === "churn" || !v.includes("\"incomplete\":true"))) throw new DOMException("quota", "QuotaExceededError");
+      store.set(k, v);
+    } });
     try {
       connectFake();
       const { keyFromSeed, signText } = await import("../connect/crypto");
       const { uidForPublicKey } = await import("../net/identity");
       const { signMessage, MessageVerifier, fullyVerified } = await import("../net/message-signature");
       const { MessageStorage } = await import("../net/message-storage");
-      const pair = await keyFromSeed(new Uint8Array(32).fill(failing ? 40 : 39));
+      const pair = await keyFromSeed(new Uint8Array(32).fill({ stored: 39, full: 40, churn: 41 }[mode]!));
       const identity = { ...pair, sign: (bytes: Uint8Array) => signText(pair.jwk, new TextDecoder().decode(bytes)) } as unknown as import("../net/identity").Identity;
       const uid = await uidForPublicKey(pair.publicKey);
       const msg = message(71, 1, { author_uid: uid, text: "old channel" });
@@ -810,9 +819,16 @@ describe("channel id reuse", () => {
       full = failing;
       link.emit({ ev: "channel.deleted", d: { channel: 1 } });
       link.emit({ ev: "channel.created", d: chan(1, { name: "replacement channel" }) });
+      if (mode === "churn") {
+        const { channels } = await import("../net/channel-lifecycle");
+        for (let i = 0; i < 64; i++) channels.observe(`churn-${i}`, [1]);
+        full = false;
+        link.welcomeNow(welcome({ channels: [chan(1)], clients: [client(1, null)], uid }));
+      }
       await c.applyHistory([msg], 1, null);
       const result = await c.verifyIncoming(msg, 1);
-      expect(result).toMatchObject({ status: "verified", authorization: ["channel-reused"] });
+      // Under churn every other server's record is unsaved too: past the bound the whole session is uncertain.
+      expect(result).toMatchObject({ status: "verified", authorization: [mode === "churn" ? "channel-history-incomplete" : "channel-reused"] });
       expect(fullyVerified(result)).toBe(false);
     } finally { vi.unstubAllGlobals(); }
   });

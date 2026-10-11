@@ -20,29 +20,50 @@ export const MAX_IDS = 10_000;
 /** Servers whose records stay in memory. */
 const MAX_SERVERS = 64;
 const PREFIX = "vc.channels:";
-type Record = { known: Set<number>; deleted: Set<number>; incomplete: boolean };
+/** `unsaved`: storage does not hold what memory knows, so this record must never be dropped from memory. */
+type Record = { known: Set<number>; deleted: Set<number>; incomplete: boolean; unsaved: boolean };
 type Store = Pick<Storage, "getItem" | "setItem">;
 
-const ids = (v: unknown): number[] => (Array.isArray(v) ? v.filter((n): n is number => Number.isSafeInteger(n) && n >= 0) : []);
+const isIds = (v: unknown): v is number[] =>
+  Array.isArray(v) && v.length <= MAX_IDS && v.every((n) => Number.isSafeInteger(n) && n >= 0);
+
+/** Exactly what `save` writes; anything else (or nothing readable) is an incomplete record, never a clean one. */
+function parse(raw: string | null): Record {
+  const empty = { known: new Set<number>(), deleted: new Set<number>(), unsaved: false };
+  if (raw === null) return { ...empty, incomplete: false };
+  try {
+    const v: unknown = JSON.parse(raw);
+    if (typeof v === "object" && v !== null && !Array.isArray(v) && Object.keys(v).length === 3) {
+      const { known, deleted, incomplete } = v as { [k: string]: unknown };
+      if (isIds(known) && isIds(deleted) && typeof incomplete === "boolean") return { known: new Set(known), deleted: new Set(deleted), incomplete, unsaved: false };
+    }
+  } catch { /* malformed */ }
+  return { ...empty, incomplete: true };
+}
 
 export function channelLifecycle(given?: Store): ChannelLifecycle {
   const storage = () => given ?? globalThis.localStorage;
-  // The record in memory is authoritative for this session; storage carries it across reloads.
+  // The record in memory is authoritative for this session; storage carries it across reloads. Saved records
+  // can be dropped from memory and read again; unsaved ones cannot, so they stay. If more than MAX_SERVERS of
+  // them would have to stay, the oldest goes and every record is uncertain for the rest of the session.
   const memory = new Map<string, Record>();
+  let uncertain = false;
   const load = (serverKey: string): Record => {
     const cached = memory.get(serverKey);
     if (cached) { memory.delete(serverKey); memory.set(serverKey, cached); return cached; }
     let record: Record;
-    try {
-      const raw = storage().getItem(PREFIX + serverKey);
-      const v = (raw === null ? {} : JSON.parse(raw)) as { known?: unknown; deleted?: unknown; incomplete?: unknown } | null;
-      if (typeof v !== "object" || v === null) throw new Error("malformed");
-      record = { known: new Set(ids(v.known)), deleted: new Set(ids(v.deleted)), incomplete: v.incomplete === true };
-    } catch {
-      record = { known: new Set(), deleted: new Set(), incomplete: true };
-    }
+    try { record = parse(storage().getItem(PREFIX + serverKey)); } catch { record = { ...parse(null), incomplete: true }; }
     memory.set(serverKey, record);
-    while (memory.size > MAX_SERVERS) memory.delete(memory.keys().next().value!);
+    // Never the record just loaded: the caller may change it, and a failed save must still find it here.
+    for (const [key, r] of memory) {
+      if (memory.size <= MAX_SERVERS) break;
+      if (!r.unsaved && key !== serverKey) memory.delete(key);
+    }
+    while (memory.size > MAX_SERVERS) {
+      const [key] = memory.keys();
+      memory.delete(key!);
+      uncertain = true;
+    }
     return record;
   };
   const save = (serverKey: string, r: Record) => {
@@ -55,10 +76,13 @@ export function channelLifecycle(given?: Store): ChannelLifecycle {
     const write = (value: object) => storage().setItem(PREFIX + serverKey, JSON.stringify(value));
     try {
       write({ known: [...r.known], deleted: [...r.deleted], incomplete: r.incomplete });
+      r.unsaved = false;
     } catch {
-      // What was not stored is lost on reload: from now on the record is incomplete. The small marker usually fits.
+      // What was not stored is lost on reload: from now on the record is incomplete. The small marker usually fits;
+      // until something is stored, memory keeps the record.
       r.incomplete = true;
-      try { write({ known: [], deleted: [], incomplete: true }); } catch { /* memory still holds it for this session */ }
+      r.unsaved = true;
+      try { write({ known: [], deleted: [], incomplete: true }); r.unsaved = false; } catch { /* kept in memory */ }
     }
   };
   return {
@@ -81,7 +105,7 @@ export function channelLifecycle(given?: Store): ChannelLifecycle {
     },
     check(serverKey, id) {
       const r = load(serverKey);
-      return r.deleted.has(id) ? "reused" : r.incomplete ? "unknown" : "ok";
+      return r.deleted.has(id) ? "reused" : r.incomplete || uncertain ? "unknown" : "ok";
     },
   };
 }
