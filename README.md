@@ -138,7 +138,7 @@ public-key fingerprint. Clients store a pin for each canonical WebSocket
 endpoint after verifying the first server proof. A changed key blocks login:
 the user must check it with the owner and explicitly choose the dangerous
 option to forget the old pin and trust the new key. No silent rotation or
-legacy login fallback. The fingerprint is visible in the server sidebar.
+legacy login fallback. The server menu's **Server key** shows the fingerprint.
 
 Login signatures bind the full endpoint, including scheme, host, effective
 port and WebSocket path. Configure the exclusive accepted set using:
@@ -146,7 +146,7 @@ port and WebSocket path. Configure the exclusive accepted set using:
 - `--domain`: `wss://<domain>/ws` for each configured domain;
 - `--public-url`: maps HTTP(S) to WS(S), retains host/port and uses `/ws`;
 - `--public-endpoint`: repeatable full endpoint URLs, including alias paths
-  (or comma-delimited `VC_PUBLIC_ENDPOINTS`); replaces `--public-host`;
+  (or comma-delimited `VC_PUBLIC_ENDPOINTS`);
 - explicit `--public-ip`: a global unicast IP adds `wss://<ip>[:port]/ws` only
   when vc-server terminates TLS itself. It uses the actual listening port,
   omitted only for 443. Behind a reverse proxy it adds no login endpoint;
