@@ -95,7 +95,7 @@ async function ensureServer(connectUrl) {
   }
   const dataDir = mkdtempSync(path.join(tmpdir(), "vc-e2e-"));
   const bin = process.env.VC_SERVER_BIN ?? path.join(repoRoot, "target/debug/vc-server");
-  const args = ["--data-dir", dataDir, "--http", SERVER, "--media", SERVER, "--public-ip", SERVER.split(":")[0], "--connect-url", connectUrl];
+  const args = ["--data-dir", dataDir, "--http", SERVER, "--media", SERVER, "--public-ip", SERVER.split(":")[0], "--public-host", CLIENT_ADDR, "--connect-url", connectUrl];
   const child = existsSync(bin)
     ? spawn(bin, args, { cwd: repoRoot })
     : spawn("cargo", ["run", "-q", "-p", "vc-server", "--", ...args], { cwd: repoRoot });
