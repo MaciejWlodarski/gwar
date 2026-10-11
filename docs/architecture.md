@@ -107,7 +107,7 @@ Invite links include `server_key=<full public key>`, which must match the
 challenge. A pin mismatch is a blocking English/Polish dialog with both keys
 and an explicit dangerous forget-and-trust action. An invite mismatch blocks
 without that override. The verified key is exposed as `Connection.serverKey`
-(native: `Connection.server_key`) for message context and shown in the sidebar.
+(native: `Connection.server_key`) for message context and shown under Server menu > Server key.
 Native clients require an expected key unless first-contact trust is explicitly
 enabled; the default is off and tests opt in for ephemeral servers.
 
