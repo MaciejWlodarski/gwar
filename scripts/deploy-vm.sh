@@ -107,6 +107,10 @@ mv -f "server-$day.sqlite3.tmp" "server-$day.sqlite3"
 if [[ -x ~/gwar-connect/gwar-connect ]]; then
   ~/gwar-connect/gwar-connect --data-dir ~/gwar-connect/data backup "connect-$day.sqlite3.tmp" >/dev/null
   mv -f "connect-$day.sqlite3.tmp" "connect-$day.sqlite3"
+  # Signs handle attestations and never changes: keep one private copy.
+  if [[ -f ~/gwar-connect/data/service-key.ed25519 ]]; then
+    install -m 600 ~/gwar-connect/data/service-key.ed25519 connect-service-key.ed25519
+  fi
 fi
 find ~/gwar-backups -name '*.sqlite3' -mtime +14 -delete
 SCRIPT
