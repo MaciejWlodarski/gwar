@@ -113,8 +113,15 @@ async fn write_ini(config: &ProcessConfig) -> Result<()> {
     }
     let path = ini_path(config);
     let tmp = path.with_extension("tmp");
+    // A fresh file every time: a leftover one would keep its own permissions (or be a link).
+    match tokio::fs::remove_file(&tmp).await {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(e).with_context(|| format!("remove {}", tmp.display()));
+        }
+        _ => {}
+    }
     let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
     let mut file = options.open(&tmp).await.with_context(|| format!("create {}", tmp.display()))?;
@@ -425,6 +432,12 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&ini).unwrap().permissions().mode() & 0o777, 0o600);
+            // A readable leftover from an interrupted write is not reused.
+            let tmp = dir.path().join("state/ts3server.tmp");
+            std::fs::write(&tmp, "").unwrap();
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
+            prepare_state(&config).await.unwrap();
             assert_eq!(std::fs::metadata(&ini).unwrap().permissions().mode() & 0o777, 0o600);
         }
         for bad in ["", "two\nlines"] {

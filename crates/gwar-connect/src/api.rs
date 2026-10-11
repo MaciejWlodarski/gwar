@@ -133,7 +133,7 @@ type Reply = Result<Json<Value>, ApiError>;
 /// client sends is believed otherwise. For a list the last entry, the proxy's, counts.
 fn client_ip(state: &Connect, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
     let ip = match &state.client_ip_header {
-        Some(name) if peer.ip().is_loopback() => headers
+        Some(name) if peer.ip().to_canonical().is_loopback() => headers
             .get(name)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.rsplit(',').next())
@@ -753,6 +753,11 @@ mod tests {
         assert_eq!(ip(&connect(Some("x-forwarded-for")), local, &headers), "203.0.113.5");
         assert_eq!(ip(&connect(Some("x-real-ip")), "[2001:db8::9]:1".parse().unwrap(), &headers), "2001:db8::");
         assert_eq!(ip(&connect(None), "[::ffff:192.0.2.9]:1".parse().unwrap(), &headers), "192.0.2.9");
+        // A local IPv4 proxy seen through a dual-stack listener is still local.
+        assert_eq!(
+            ip(&connect(Some("x-forwarded-for")), "[::ffff:127.0.0.1]:1".parse().unwrap(), &headers),
+            "203.0.113.5"
+        );
     }
 
     #[tokio::test(start_paused = true)]

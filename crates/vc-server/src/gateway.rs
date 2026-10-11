@@ -76,7 +76,7 @@ pub async fn upgrade(
 /// client's own `X-Real-IP` through would otherwise let anyone choose their address.
 /// For a list (`X-Forwarded-For`) the last entry, the one the proxy added, counts.
 pub fn client_ip(peer: SocketAddr, headers: &HeaderMap, trusted: Option<&HeaderName>) -> IpAddr {
-    if !peer.ip().is_loopback() {
+    if !peer.ip().to_canonical().is_loopback() {
         return peer.ip();
     }
     let Some(name) = trusted else {
@@ -382,6 +382,9 @@ mod tests {
         // Nor from anyone but a local proxy.
         assert_eq!(client_ip(remote, &headers, Some(&real)), remote.ip());
         assert_eq!(client_ip(local, &headers, Some(&real)).to_string(), "203.0.113.9");
+        // A local IPv4 proxy seen through a dual-stack listener is still local.
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:5000".parse().unwrap();
+        assert_eq!(client_ip(mapped, &headers, Some(&real)).to_string(), "203.0.113.9");
         // The proxy appends its peer: the client's own first entry does not count.
         assert_eq!(client_ip(local, &headers, Some(&forwarded)).to_string(), "203.0.113.10");
         // A missing or unparsable header falls back to the peer.

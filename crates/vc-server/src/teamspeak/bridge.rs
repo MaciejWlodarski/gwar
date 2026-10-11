@@ -908,7 +908,7 @@ impl<'a> Bridge<'a> {
             return;
         }
         // Otherwise ServerQuery (invisible to TeamSpeak users) posts it, signed.
-        let signed = format!("[{}] {body}", plain(&m.author_name));
+        let signed = signed_text(&m.author_name, &body);
         for text in split_for_teamspeak(&signed) {
             let result = match m.target {
                 ChatTarget::Server => {
@@ -1125,6 +1125,12 @@ fn puppet_chat_target(session: SessionId, target: MessageTarget) -> Option<ChatT
 /// names). A zero-width space after each `[` keeps any tag from being recognised.
 fn plain(text: &str) -> String {
     text.replace('[', "[\u{200B}")
+}
+
+/// A relayed message posted by ServerQuery, under its author's name: `[name] text`. The
+/// brackets are ours, so they are neutralised too (a name like `hr` would make a tag).
+fn signed_text(author: &str, body: &str) -> String {
+    format!("{} {body}", plain(&format!("[{author}]")))
 }
 
 /// How a message of ours reads on TeamSpeak: the text, then a link per
@@ -1347,6 +1353,8 @@ mod tests {
         m.attachments[0].name = "[b]invoice[/b].pdf".into();
         let relayed = ts_text(&m, None);
         assert_eq!(relayed.matches('[').count(), relayed.matches("[\u{200B}").count(), "{relayed:?}");
+        // Nor does the name a relayed message is signed with: `[hr]` is a tag on its own.
+        assert_eq!(signed_text("hr", "hi"), "[\u{200B}hr] hi");
         assert_eq!(
             relayed.replace('\u{200B}', ""),
             "[img]https://tracker.example/p.png[/img] [url=https://evil.example]bank[/url]\n📎 [b]invoice[/b].pdf"
