@@ -75,8 +75,8 @@ A member is shown as **nickname** `@handle #tag`, for example
   10 characters. Nobody can choose it, change it or take someone else's,
   and every identity has one, with or without an account. Use it to tell apart
   people with the same nickname. The mention picker shows it too.
-- **@handle**: your [Gwar Connect](docs/connect.md) account name, shown next to
-  a shield. Only Connect accounts have one. The server shows it after Connect
+- **@handle**: your [Gwar Connect](docs/connect.md) account name, shown with a
+  verified badge. Only Connect accounts have one. The server shows it after Connect
   confirms that the identity belongs to that account. The next lookup is allowed
   after 24 hours on success, one hour on 404 (which clears the handle), or five
   minutes on error; the five-minute guard is saved before HTTP, across devices
@@ -127,8 +127,8 @@ The desktop app also connects to servers without HTTPS (e.g. on a LAN).
 Servers accept Gwar Connect devices out of the box and fetch the list of
 revoked devices from the official Connect service every five minutes
 (`--connect-url` points elsewhere, `--no-connect` turns it off). They also confirm
-Connect handles asynchronously, caching checks for 24 hours; `--no-connect`
-clears that cache. Back up the database while running with `vc-server --data-dir data backup copy.sqlite3`.
+Connect handles asynchronously (rechecked daily, sooner after a failure);
+`--no-connect` clears that cache. Back up the database while running with `vc-server --data-dir data backup copy.sqlite3`.
 
 Admins (or anyone with the "Remove members" permission) can remove a member
 from the member list, or clean up people not seen for a while in Server
