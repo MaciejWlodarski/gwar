@@ -700,3 +700,35 @@ describe("edits stay on their connection; history ownership follows each verifie
     }
   });
 });
+
+describe("channel id reuse", () => {
+  it("a channel recreated under an id this client saw deleted never verifies fully (Astra r2 probe, inverted)", async () => {
+    vi.useRealTimers();
+    const store = new Map<string, string>();
+    vi.stubGlobal("localStorage", { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => void store.set(k, v) });
+    try {
+      connectFake();
+      const { keyFromSeed, signText } = await import("../connect/crypto");
+      const { uidForPublicKey } = await import("../net/identity");
+      const { signMessage, MessageVerifier, fullyVerified } = await import("../net/message-signature");
+      const { MessageStorage } = await import("../net/message-storage");
+      const pair = await keyFromSeed(new Uint8Array(32).fill(39));
+      const identity = { ...pair, sign: (bytes: Uint8Array) => signText(pair.jwk, new TextDecoder().decode(bytes)) } as unknown as import("../net/identity").Identity;
+      const uid = await uidForPublicKey(pair.publicKey);
+      const msg = message(71, 1, { author_uid: uid, text: "old channel" });
+      msg.signature = await signMessage(identity, { serverKey: pair.publicKey, target: "channel:1" }, uid, msg.text, [], []);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const c = controller as any;
+      c.verifier = new MessageVerifier(new MessageStorage(`reuse-${crypto.randomUUID()}`));
+      Object.defineProperty(link, "serverKey", { value: pair.publicKey });
+      await c.applyHistory([msg], 1, null);
+      expect(fullyVerified(await c.verifyIncoming(msg, 1))).toBe(true);
+      link.emit({ ev: "channel.deleted", d: { channel: 1 } });
+      link.emit({ ev: "channel.created", d: chan(1, { name: "replacement channel" }) });
+      await c.applyHistory([msg], 1, null);
+      const result = await c.verifyIncoming(msg, 1);
+      expect(result).toMatchObject({ status: "verified", authorization: ["channel-reused"] });
+      expect(fullyVerified(result)).toBe(false);
+    } finally { vi.unstubAllGlobals(); }
+  });
+});

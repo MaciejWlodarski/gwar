@@ -14,7 +14,9 @@ export type MessageVerification = {
   status: "verified" | "invalid" | "unsigned" | "unsigned-ts";
   continuity: "proven" | "unproven" | "rollback" | "fork" | "storage-unavailable";
   duplicate?: boolean;
-  authorization: Array<"device-revoked" | "certificate-expired" | "revocations-stale">;
+  /** Qualifications of a valid signature: the signing device, revocation freshness, or (added by the view's
+   *  context) a channel id the server reused after deleting it. */
+  authorization: Array<"device-revoked" | "certificate-expired" | "revocations-stale" | "channel-reused">;
 };
 export interface MessageContext { serverKey: string; target: string }
 export const invalidVerification = (): MessageVerification => ({ status: "invalid", continuity: "unproven", authorization: [] });

@@ -25,10 +25,15 @@ const PAGE: usize = 1000;
 struct Http {
     base: String,
     client: reqwest::Client,
+    deadline: Duration,
 }
 
 impl Http {
     fn new(url: &str) -> Result<Self> {
+        Self::with_deadline(url, DEADLINE)
+    }
+
+    fn with_deadline(url: &str, deadline: Duration) -> Result<Self> {
         let parsed = reqwest::Url::parse(url).with_context(|| format!("invalid Gwar Connect URL {url}"))?;
         let loopback = match parsed.host_str() {
             Some(host) if host.eq_ignore_ascii_case("localhost") => true,
@@ -47,16 +52,16 @@ impl Http {
             "Gwar Connect URL must not carry credentials, a query or a fragment: {url}"
         );
         let client = reqwest::Client::builder()
-            .timeout(DEADLINE)
+            .timeout(deadline)
             .redirect(reqwest::redirect::Policy::none())
             .https_only(parsed.scheme() == "https")
             .build()?;
-        Ok(Self { base: url.trim_end_matches('/').to_owned(), client })
+        Ok(Self { base: url.trim_end_matches('/').to_owned(), client, deadline })
     }
 
     /// `GET {base}{path}`: `Ok(None)` for `404`, the parsed body for `200`, an error for anything else.
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<Option<T>> {
-        tokio::time::timeout(DEADLINE, async {
+        tokio::time::timeout(self.deadline, async {
             let mut reply = self.client.get(format!("{}{path}", self.base)).send().await?;
             match reply.status() {
                 reqwest::StatusCode::OK => {}
@@ -360,6 +365,21 @@ mod tests {
         })
         .await;
         assert_eq!(ask(&url).await, [false; 3]);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_stalled_body_ends_at_the_deadline() {
+        use axum::response::IntoResponse;
+        let (url, task) = serve(|_| {
+            let start = futures::stream::once(async { Ok::<_, std::io::Error>(b"{\"revocations\": [".to_vec()) });
+            axum::body::Body::from_stream(futures::StreamExt::chain(start, futures::stream::pending())).into_response()
+        })
+        .await;
+        let http = Http::with_deadline(&url, Duration::from_millis(300)).unwrap();
+        let started = std::time::Instant::now();
+        assert!(fetch(&http, 0).await.is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
         task.abort();
     }
 

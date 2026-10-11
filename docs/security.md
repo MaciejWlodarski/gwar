@@ -167,8 +167,11 @@ gwar message v2
   for everyone whether they connected by domain or by IP. Old server keys verify
   only their own history.
 - Channels are named by id, and an honest server never reuses one (ids come
-  from a counter that survives deletion). A malicious server can reuse an id;
-  a client that never saw the deletion cannot tell, so a signature binds a
+  from a counter that survives deletion). The client remembers, per server key,
+  the channel ids it saw and saw deleted (by event or by their absence from a
+  later channel list); messages in a channel whose id it saw deleted show "the
+  server reused the id of a deleted channel" and never count as fully verified.
+  A client that never saw the deletion cannot tell, so a signature binds a
   message to the channel id, not to the channel's name or lifetime. A direct
   message must involve exactly the two participants of the open conversation.
 - Edits keep the message id and creation time and chain to the previous
@@ -187,8 +190,12 @@ gwar message v2
   capacity fails closed rather than evicting revocations.
 - A client signs an edit or a deletion only over a revision of its own that
   verifies here; anything else goes to the server as an unsigned removal
-  request. A row that verified is never displaced by one that did not under the
-  same signed identity.
+  request. The edit is bound to the connection it started on: if the client
+  switches server, reconnects or resyncs before signing or sending, it is
+  dropped, so nothing written for one server is signed for or sent to another.
+- Authenticity belongs to each received row, never to the server's numeric id.
+  A row that verified is never displaced by one that did not under the same id
+  or signed identity, and one signed identity is shown once.
 - Author deletion is a final signed revision (the exact body encoding is in
   architecture.md). A verified deletion disappears, also on a device that never
   saw the earlier revisions; one whose signing device is revoked, expired or not
@@ -202,8 +209,9 @@ gwar message v2
   are hashed when they load, not before notifying. Attachments that fail or lack
   a signature load only on request. TeamSpeak messages are shown as unsigned.
 - Images load automatically only near the visible part of the chat, at most
-  three at a time and within 256 MiB of decoded images; the rest wait, and
-  images far off screen are released.
+  three at a time and within an estimated 256 MiB of image memory (two RGBA
+  frames plus the fetched bytes per image, reserved before decoding); the rest
+  wait, and images far off screen are released.
 - Signature status, handle attestation, connection security and historical
   authorization are shown separately. A verified message does not mean the
   voice is authentic.

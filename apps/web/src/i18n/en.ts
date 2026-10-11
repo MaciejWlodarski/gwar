@@ -347,6 +347,7 @@ export const en = {
   "chat.fork": "Conflicting message revisions (fork)",
   "chat.deviceRevoked": "signing device revoked; signing time unproven",
   "chat.certificateExpired": "certificate expired; signing time unproven",
+  "chat.channelReused": "the server reused the id of a channel deleted earlier, so this message may come from the deleted channel",
   "chat.revocationsStale": "revocation information stale or unavailable",
   "chat.continuityUnproven": "continuity unproven; this device has no record of earlier versions, so it cannot detect a rollback. Older evicted history also has no rollback protection",
   "chat.checkpointsUnavailable": "checkpoints unavailable; rollback protection unavailable",

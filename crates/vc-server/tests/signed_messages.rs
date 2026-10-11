@@ -395,8 +395,12 @@ async fn edit_after_certificate_renewal_keeps_the_message_identity() {
     let id = alice.ok("chat.send", send(json!({"channel": channel}), "before renewal", &sig)).await["id"].clone();
     drop(alice);
 
-    // The same device key, certified again with a new lifetime: a different certificate hash.
-    let mut alice = connect(certificate(&account, &device, now_ms() - 1000, now_ms() + 2 * 86_400_000)).await.unwrap();
+    // The same device key, certified again after the message was written: a different certificate hash.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let renewed_at = now_ms();
+    assert!(renewed_at > sig.created_at);
+    let mut alice = connect(certificate(&account, &device, renewed_at, renewed_at + 2 * 86_400_000)).await.unwrap();
+    assert_eq!(alice.certificate.as_ref().unwrap().issued_at, renewed_at);
     let mut edit = sig.clone();
     edit.certificate = alice.certificate.clone();
     edit.certificate_hash = vc_proto::certificate_hash(alice.certificate.as_ref()).unwrap();

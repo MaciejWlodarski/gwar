@@ -2,6 +2,7 @@ import { attachment as attachmentSchema } from "../net/schema";
 import { messageTarget } from "../lib/chat";
 import { uploadAttachment, localAttachmentMetadata } from "../net/attachment";
 import { serverPins, type ServerIdentityChanged } from "../net/server-pins";
+import { channels as channelLifecycle, withChannelLifecycle } from "../net/channel-lifecycle";
 import { signMessage, sha256, MessageVerifier, fullyVerified, DELETION_TEXT, invalidVerification, sameMessageIdentity, notificationAllowed } from "../net/message-signature";
 import type { Attachment } from "../proto/Attachment";
 import type { MessageSignature } from "../proto/MessageSignature";
@@ -414,6 +415,7 @@ class Controller {
       this.sentRead.clear();
       void setConnectedServer(useSession.getState().kind === "vc" ? useSession.getState().httpOrigin : null, welcome.server.upload_limit).catch((e) => console.warn("Native file origin:", e));
       session.setSecurity(conn.serverKey ?? null, conn.endpoint ?? null, !!conn.endpoint && isPlaintextRemote(conn.endpoint));
+      if (conn.serverKey) channelLifecycle.observe(conn.serverKey, welcome.channels.map((c) => c.id));
       session.dispatch({ type: "welcome", welcome, resync, now: Date.now() });
       const myCh = myChannelId(useSession.getState());
       const v = useVoice.getState();
@@ -430,6 +432,9 @@ class Controller {
       this.rejoin = null;
     });
     conn.onEvent((event) => {
+      // Recorded before anything else, so messages that follow are checked against it.
+      if (conn.serverKey && event.ev === "channel.created") channelLifecycle.created(conn.serverKey, event.d.id);
+      if (conn.serverKey && event.ev === "channel.deleted") channelLifecycle.deleted(conn.serverKey, event.d.channel);
       if (event.ev === "chat.message" && !event.d.signature) {
         const exists = Object.values(useSession.getState().threads).some((t) => t.items.some((i) => i.kind === "msg" && i.msg.id === event.d.id));
         if (!exists) session.dispatch({ type: "event", event, now: Date.now(), verified: false });
@@ -1093,7 +1098,8 @@ class Controller {
       if (!peer) return invalidVerification();
       thread = `dm:${peer}`;
     }
-    return this.verifier.verify(msg, { serverKey: conn?.serverKey ?? "", target: messageTarget(thread, msg.author_uid, me) });
+    const ctx = { serverKey: conn?.serverKey ?? "", target: messageTarget(thread, msg.author_uid, me) };
+    return withChannelLifecycle(await this.verifier.verify(msg, ctx), ctx.serverKey, ctx.target);
   }
 
   private async checkedHistory(messages: ChatMessage[], channel: number): Promise<{ accepted: ChatMessage[]; authentic: boolean[] }> {

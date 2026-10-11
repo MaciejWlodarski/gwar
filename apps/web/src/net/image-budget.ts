@@ -51,7 +51,8 @@ export class ImageBudget {
   }
 }
 
-/** Decoded RGBA pixels plus the encoded bytes kept for the object URL. */
-export const imageMemory = (width: number, height: number, bytes: number) => width * height * 4 + bytes;
+/** Two RGBA frames (the decoder's bitmap and canvas while converting; then the displayed image and the retained
+ *  PNG, which is at most about one frame) plus the fetched bytes. An estimate, not a measured process ceiling. */
+export const imageMemory = (width: number, height: number, bytes: number) => width * height * 8 + bytes;
 
 export const imageBudget = new ImageBudget({ fetches: 3, memory: 256 * 1024 * 1024 });

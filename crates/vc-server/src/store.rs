@@ -353,6 +353,20 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// The next id from a counter that never goes back and never wraps: once `u32` ids run out, inserts fail.
+    fn next_id(&self, counter: &'static str) -> Result<u32> {
+        let id: Option<i64> = self
+            .db
+            .query_row(
+                &format!("UPDATE {counter} SET last = last + 1 WHERE id = 0 AND last < {} RETURNING last", u32::MAX),
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let id = id.ok_or_else(|| anyhow::anyhow!("{counter}: ids exhausted"))?;
+        Ok(u32::try_from(id)?)
+    }
+
     pub fn insert_channel(
         &self,
         parent: Option<ChannelId>,
@@ -362,15 +376,12 @@ impl Store {
         password_hash: Option<&str>,
         max_clients: Option<u32>,
     ) -> Result<ChannelId> {
-        let id: i64 =
-            self.db.query_row("UPDATE channel_counter SET last = last + 1 WHERE id = 0 RETURNING last", [], |r| {
-                r.get(0)
-            })?;
+        let id = self.next_id("channel_counter")?;
         self.db.execute(
             "INSERT INTO channels(id,parent,name,topic,position,password_hash,max_clients) VALUES(?1,?2,?3,?4,?5,?6,?7)",
             params![id, parent, name, topic, position, password_hash, max_clients],
         )?;
-        Ok(id as ChannelId)
+        Ok(id)
     }
 
     pub fn update_channel(&self, row: &ChannelRow) -> Result<()> {
@@ -491,10 +502,7 @@ impl Store {
         text: &str,
         sent_at: i64,
     ) -> Result<MessageId> {
-        let id: i64 =
-            self.db.query_row("UPDATE message_counter SET last = last + 1 WHERE id = 0 RETURNING last", [], |r| {
-                r.get(0)
-            })?;
+        let id = self.next_id("message_counter")?;
         self.db.execute(
             "INSERT INTO messages(id,channel,author_uid,author_name,text,sent_at) VALUES(?1,?2,?3,?4,?5,?6)",
             params![id, channel, author_uid, author_name, text, sent_at],
@@ -1229,6 +1237,24 @@ mod tests {
         })
         .unwrap();
         assert_eq!(reopened.insert_channel(None, "new", "", 0, None, None).unwrap(), 42);
+    }
+
+    #[test]
+    fn counters_survive_reopening_and_never_wrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vc.sqlite3");
+        let first = {
+            let store = Store::open(&path).unwrap();
+            let id = store.insert_channel(None, "a", "", 0, None, None).unwrap();
+            store.delete_channel(id).unwrap();
+            id
+        };
+        let store = Store::open(&path).unwrap();
+        assert!(store.insert_channel(None, "b", "", 0, None, None).unwrap() > first);
+        store.db.execute_batch(&format!("UPDATE channel_counter SET last = {}", u32::MAX)).unwrap();
+        let before = store.channels().unwrap().len();
+        assert!(store.insert_channel(None, "c", "", 0, None, None).is_err());
+        assert_eq!(store.channels().unwrap().len(), before);
     }
 
     #[test]

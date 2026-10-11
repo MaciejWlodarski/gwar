@@ -349,6 +349,7 @@ export const pl: Record<Key, string> = {
   "chat.fork": "Sprzeczne wersje wiadomości (rozwidlenie historii)",
   "chat.deviceRevoked": "urządzenie podpisujące zostało unieważnione; czas podpisania niepotwierdzony",
   "chat.certificateExpired": "certyfikat wygasł; czas podpisania niepotwierdzony",
+  "chat.channelReused": "serwer ponownie użył identyfikatora wcześniej usuniętego kanału, więc ta wiadomość może pochodzić z usuniętego kanału",
   "chat.revocationsStale": "informacje o unieważnieniach są nieaktualne lub niedostępne",
   "chat.continuityUnproven": "ciągłość niepotwierdzona; to urządzenie nie ma zapisu wcześniejszych wersji, więc nie może wykryć cofnięcia zmian. Starsza historia usunięta z pamięci również nie ma tej ochrony",
   "chat.checkpointsUnavailable": "punkty kontrolne niedostępne; ochrona przed cofnięciem zmian niedostępna",
