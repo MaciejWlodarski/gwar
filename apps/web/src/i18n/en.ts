@@ -138,6 +138,7 @@ export const en = {
   "identity.importFailed": "That file is not a valid identity backup.",
 
   "security.fingerprint": "Server key fingerprint",
+  "security.fingerprintHelp": "Compare it with the server owner to make sure you are connected to the right server.",
   "security.changedTitle": "Server identity changed",
   "security.changedBody": "This server’s identity changed. This can mean a different server or an attack. Check the fingerprint with the server owner before trusting the new key.",
   "security.inviteMismatch": "The server key does not match this invite. The connection is blocked. Obtain a trusted invite from the server owner.",
@@ -154,6 +155,7 @@ export const en = {
   "server.createToken": "Create invite token",
   "server.redeem": "Redeem token",
   "server.copyAddress": "Copy server address",
+  "server.key": "Server key",
   "server.disconnect": "Disconnect from server",
   "serverSettings.name": "Server name",
   "serverSettings.welcome": "Welcome message",

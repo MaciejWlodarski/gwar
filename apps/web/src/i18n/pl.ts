@@ -140,6 +140,7 @@ export const pl: Record<Key, string> = {
   "identity.importFailed": "To nie jest prawidłowa kopia zapasowa tożsamości.",
 
   "security.fingerprint": "Odcisk klucza serwera",
+  "security.fingerprintHelp": "Porównaj go z właścicielem serwera, aby upewnić się, że łączysz się z właściwym serwerem.",
   "security.changedTitle": "Tożsamość serwera się zmieniła",
   "security.changedBody": "Tożsamość tego serwera się zmieniła. Może to oznaczać inny serwer lub atak. Przed zaufaniem nowemu kluczowi sprawdź odcisk u właściciela serwera.",
   "security.inviteMismatch": "Klucz serwera nie pasuje do zaproszenia. Połączenie jest zablokowane. Uzyskaj zaufane zaproszenie od właściciela serwera.",
@@ -156,6 +157,7 @@ export const pl: Record<Key, string> = {
   "server.createToken": "Utwórz token zaproszenia",
   "server.redeem": "Wykorzystaj token",
   "server.copyAddress": "Kopiuj adres serwera",
+  "server.key": "Klucz serwera",
   "server.disconnect": "Rozłącz z serwerem",
   "serverSettings.name": "Nazwa serwera",
   "serverSettings.welcome": "Wiadomość powitalna",

@@ -1,5 +1,5 @@
 import * as Dropdown from "@radix-ui/react-dropdown-menu";
-import { ChevronDown, Copy, KeyRound, LogOut, Plus, Pencil, Settings2, Ticket, UserPlus } from "lucide-react";
+import { ChevronDown, Copy, Fingerprint, KeyRound, LogOut, Plus, Pencil, Settings2, Ticket, UserPlus } from "lucide-react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { controller } from "../state/controller";
@@ -26,6 +26,7 @@ function ServerHeader() {
   const canInvite = usePermission("invite_create") && kind === "vc";
   const canCreate = usePermission("channel_create");
   const canToken = usePermission("token_create") && kind === "vc"; // TeamSpeak has no vc tokens
+  const serverKey = useSession((s) => s.serverKey);
 
   const copyAddress = async () => {
     try {
@@ -92,6 +93,11 @@ function ServerHeader() {
           <Dropdown.Item className={menuItem} onSelect={() => void copyAddress()}>
             <Copy className="size-4" /> {t("server.copyAddress")}
           </Dropdown.Item>
+          {serverKey && (
+            <Dropdown.Item className={menuItem} onSelect={() => openDialog({ kind: "serverKey" })}>
+              <Fingerprint className="size-4" /> {t("server.key")}
+            </Dropdown.Item>
+          )}
           <Dropdown.Separator className={menuSeparator} />
           <Dropdown.Item className={cn(menuItem, menuItemDanger)} onSelect={() => void controller.disconnect()}>
             <LogOut className="size-4" /> {t("server.disconnect")}
@@ -103,16 +109,10 @@ function ServerHeader() {
 }
 
 export function Sidebar({ className }: { className?: string }) {
-  const t = useT();
-  const serverKey = useSession((s) => s.serverKey);
   const phase = useSession((s) => s.phase);
   return (
     <aside className={cn("flex h-full w-[280px] shrink-0 flex-col border-r border-line bg-side", className)}>
       <ServerHeader />
-      {serverKey && <div className="border-b border-line px-3 py-2 text-xs text-muted">
-        <div>{t("security.fingerprint")}</div>
-        <code data-testid="server-fingerprint" className="block break-all select-all">{serverKey}</code>
-      </div>}
       <div className={cn("min-h-0 flex-1 overflow-y-auto transition-opacity duration-150", phase === "reconnecting" && "opacity-50")}>
         <ChannelTree />
       </div>

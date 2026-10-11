@@ -10,7 +10,7 @@ import type { Identity } from "./identity";
 import type { Hello } from "../proto/Hello";
 import { certificateHash, decodeFixed, helloStatement, newNonce, normalizeEndpoint, verifyProof } from "./handshake";
 import { checkCandidate, serverPins, ServerIdentityChanged, type PinStore } from "./server-pins";
-import { isLoopbackHost } from "./address";
+import { isPlaintextRemote } from "./address";
 import {
   PROTOCOL_VERSION,
   type EventData,
@@ -380,8 +380,7 @@ export class Connection implements Link {
       let endpoint: string;
       try {
         endpoint = this.endpoint;
-        const parsed = new URL(endpoint);
-        if (parsed.protocol === "ws:" && !isLoopbackHost(parsed.hostname) && !(client.platform === "desktop" && this.options.insecureLan === true)) {
+        if (isPlaintextRemote(endpoint) && !(client.platform === "desktop" && this.options.insecureLan === true)) {
           throw new ConnectError("insecure_transport", "TLS is required for this server");
         }
         this.serverKey_ = null;

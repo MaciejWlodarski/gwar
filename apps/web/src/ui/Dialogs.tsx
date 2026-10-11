@@ -51,6 +51,8 @@ export function Dialogs() {
       return <RedeemDialog />;
     case "createToken":
       return <CreateTokenDialog />;
+    case "serverKey":
+      return <ServerKeyDialog />;
     case "confirm":
       return <ConfirmDialog {...dialog} />;
     case "tsFirstRun":
@@ -92,7 +94,7 @@ function ConfirmDialog({ title, memberTitle, body, confirmLabel, danger, serverI
         </div>
       }
     >
-      {serverIdentity ? <p className="whitespace-pre-line break-all text-sm text-muted">{body}</p> : <span className="sr-only">{body}</span>}
+      {serverIdentity ? <p className="whitespace-pre-line wrap-anywhere text-sm text-muted">{body}</p> : <span className="sr-only">{body}</span>}
     </Dialog>
   );
 }
@@ -443,6 +445,48 @@ function RedeemDialog() {
           {(id) => <Input id={id} value={token} onChange={(e) => setToken(e.target.value)} className="font-mono" autoFocus spellCheck={false} autoComplete="off" />}
         </Field>
       </form>
+    </Dialog>
+  );
+}
+
+/** The verified key of the connected server, to compare with its owner. */
+function ServerKeyDialog() {
+  const t = useT();
+  const close = useClose();
+  const serverKey = useSession((s) => s.serverKey);
+  const endpoint = useSession((s) => s.endpoint);
+  const [copied, setCopied] = useState(false);
+
+  const copy = async () => {
+    if (!serverKey) return;
+    try {
+      await navigator.clipboard.writeText(serverKey);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      useUi.getState().toast("error", t("toast.copyFailed"));
+    }
+  };
+
+  return (
+    <Dialog
+      open
+      onOpenChange={(o) => !o && close()}
+      title={t("security.fingerprint")}
+      description={t("security.fingerprintHelp")}
+      width="max-w-sm"
+      footer={<Button onClick={close}>{t("common.close")}</Button>}
+    >
+      <div className="flex flex-col gap-2">
+        <p className="text-xs text-subtle wrap-anywhere">{endpoint}</p>
+        <div className="flex items-center gap-2 rounded-lg border border-line-strong bg-side p-2">
+          <code data-testid="server-fingerprint" className="min-w-0 flex-1 font-mono text-xs break-all select-all">{serverKey}</code>
+          <Button size="sm" onClick={() => void copy()}>
+            {copied ? <Check className="size-4" /> : <Copy className="size-4" />}
+            {copied ? t("toast.copied") : t("common.copy")}
+          </Button>
+        </div>
+      </div>
     </Dialog>
   );
 }

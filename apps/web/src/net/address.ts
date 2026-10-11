@@ -25,6 +25,12 @@ export function isLoopbackHost(host: string): boolean {
   return host === "localhost" || host === "[::1]" || host === "::1" || (/^127(?:\.\d{1,3}){3}$/.test(host) && host.split(".").every((part) => Number(part) <= 255));
 }
 
+/** Plaintext to another machine: it can be impersonated or taken over. Loopback stays on this machine. */
+export function isPlaintextRemote(endpoint: string): boolean {
+  const url = new URL(endpoint);
+  return url.protocol === "ws:" && !isLoopbackHost(url.hostname);
+}
+
 export function pageContextFromLocation(loc: Pick<Location, "protocol" | "hostname" | "port"> = window.location): PageContext {
   return { protocol: loc.protocol, hostname: loc.hostname, port: loc.port };
 }

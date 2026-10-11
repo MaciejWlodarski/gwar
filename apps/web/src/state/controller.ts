@@ -10,7 +10,7 @@ import type { ChannelCreate } from "../proto/ChannelCreate";
 import type { ChannelUpdate } from "../proto/ChannelUpdate";
 import type { ChatTarget } from "../proto/ChatTarget";
 import { tNow, type Key } from "../i18n";
-import { absoluteUrl, httpOriginFromWsUrl, parseServerAddress, parseTeamSpeakAddress, pageContextFromLocation } from "../net/address";
+import { absoluteUrl, httpOriginFromWsUrl, isPlaintextRemote, parseServerAddress, parseTeamSpeakAddress, pageContextFromLocation } from "../net/address";
 import { memberName } from "../lib/member-name";
 import { checkUpload } from "../lib/files";
 import { notificationBody, notifyReason } from "../lib/notify-rules";
@@ -403,7 +403,7 @@ class Controller {
       this.historyRequested.clear();
       this.sentRead.clear();
       void setConnectedServer(useSession.getState().kind === "vc" ? useSession.getState().httpOrigin : null, welcome.server.upload_limit).catch((e) => console.warn("Native file origin:", e));
-      session.setSecurity(conn.serverKey ?? null, conn.endpoint ?? null, conn.endpoint?.startsWith("ws://") ?? false);
+      session.setSecurity(conn.serverKey ?? null, conn.endpoint ?? null, !!conn.endpoint && isPlaintextRemote(conn.endpoint));
       session.dispatch({ type: "welcome", welcome, resync, now: Date.now() });
       const myCh = myChannelId(useSession.getState());
       const v = useVoice.getState();

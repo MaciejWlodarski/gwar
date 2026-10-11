@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { absoluteUrl, parseServerAddress, sameOriginUrl, type PageContext } from "./address";
+import { absoluteUrl, isPlaintextRemote, parseServerAddress, sameOriginUrl, type PageContext } from "./address";
 
 const http: PageContext = { protocol: "http:", hostname: "localhost", port: "5173" };
 const https: PageContext = { protocol: "https:", hostname: "voice.example.com", port: "" };
@@ -128,5 +128,16 @@ describe("explicit desktop LAN opt-in", () => {
     expect(parseServerAddress("ws://192.168.1.2:8790", tauri, true)).toMatchObject({ ok: true, value: { secure: false } });
     expect(parseServerAddress("ws://192.168.1.2:8790", http, true).ok).toBe(false);
     expect(parseServerAddress("ws://127.attacker.example", tauri).ok).toBe(false);
+  });
+});
+
+describe("isPlaintextRemote", () => {
+  it("flags ws:// to another machine only", () => {
+    expect(isPlaintextRemote("ws://192.168.1.20:8790/ws")).toBe(true);
+    expect(isPlaintextRemote("ws://voice.example.com/ws")).toBe(true);
+    expect(isPlaintextRemote("ws://127.0.0.1:8790/ws")).toBe(false);
+    expect(isPlaintextRemote("ws://localhost:8790/ws")).toBe(false);
+    expect(isPlaintextRemote("ws://[::1]:8790/ws")).toBe(false);
+    expect(isPlaintextRemote("wss://192.168.1.20/ws")).toBe(false);
   });
 });

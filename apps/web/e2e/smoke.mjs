@@ -304,6 +304,17 @@ const composer = (page) => page.getByRole("textbox", { name: "Message", exact: t
 const escapeRe = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const treeItem = (page, name) => page.getByRole("treeitem", { name: typeof name === "string" ? new RegExp(escapeRe(name)) : name });
 
+/** The verified server key, read from the server menu's "Server key" dialog. */
+async function serverFingerprint(page) {
+  await page.getByRole("button", { name: /^(Server menu|Menu serwera)$/ }).click();
+  await page.getByRole("menuitem", { name: /^(Server key|Klucz serwera)$/ }).click();
+  const key = page.getByTestId("server-fingerprint");
+  const text = await key.innerText();
+  await page.keyboard.press("Escape");
+  await key.waitFor({ state: "detached" });
+  return text;
+}
+
 async function shot(page, name) {
   await page.waitForTimeout(250);
   await page.screenshot({ path: path.join(shots, `${name}.png`) });
@@ -382,18 +393,16 @@ async function main() {
     if ((await a.evaluate(() => window.__pcs.length)) !== 0) throw new Error("a peer connection exists before joining voice");
   });
   await check("verified server fingerprint is visible and pinned after first connection", async () => {
-    const fingerprint = await a.getByTestId("server-fingerprint").innerText();
+    const fingerprint = await serverFingerprint(a);
     const stored = await a.evaluate((endpoint) => localStorage.getItem(`vc.server-pin:${endpoint}`), CLIENT_ADDR);
     if (!stored || JSON.parse(stored).server_pk !== fingerprint || !/^[A-Za-z0-9_-]{43}$/.test(fingerprint)) throw new Error("missing verified fingerprint or pin");
   });
-  await check("plaintext risk stays red and visible in the connected UI", async () => {
-    const warning = a.getByTestId("connection-warning");
-    await warning.waitFor();
-    if (!/connection can be impersonated or taken over/.test(await warning.innerText())) throw new Error("missing persistent warning");
-    if (await warning.evaluate((el) => getComputedStyle(el).backgroundColor === "rgba(0, 0, 0, 0)")) throw new Error("warning has no red background");
+  await check("plaintext to loopback shows no impersonation warning", async () => {
+    // Remote plaintext is desktop-only (see ConnectionWarning and address tests); loopback stays on this machine.
+    if ((await a.getByTestId("connection-warning").count()) !== 0) throw new Error("loopback connection shown as insecure");
   });
   await check("browser rejects weak Ed25519 keys and proof points independently of WebCrypto", async () => {
-    const serverKey = await a.getByTestId("server-fingerprint").innerText();
+    const serverKey = await serverFingerprint(a);
     const rejects = await a.evaluate(async ({ endpoint, serverKey }) => {
       const { serverPublicKey, verifyProof } = await import("/src/net/handshake.ts");
       const identity = Uint8Array.from([1, ...new Array(31).fill(0)]);
@@ -434,10 +443,10 @@ async function main() {
       await shot(page, pl ? "03-pin-changed-pl" : "03-pin-changed-en");
       await dialog.getByRole("button", { name: pl ? "Niebezpieczne: zapomnij stary klucz i zaufaj nowemu" : "Dangerous: forget old pin and trust new key", exact: true }).click();
       if (pl) await page.setViewportSize({ width: 1280, height: 800 });
-      const fingerprint = page.getByTestId("server-fingerprint");
-      await fingerprint.waitFor({ timeout: 15000 });
+      await page.getByRole("button", { name: /^(Server menu|Menu serwera)$/ }).waitFor({ timeout: 15000 });
+      const fingerprint = await serverFingerprint(page);
       const replacement = JSON.parse(await page.evaluate((endpoint) => localStorage.getItem(`vc.server-pin:${endpoint}`), CLIENT_ADDR));
-      if (replacement.server_pk !== await fingerprint.innerText() || replacement.first_seen <= 1) throw new Error("explicit trust did not persist the verified replacement");
+      if (replacement.server_pk !== fingerprint || replacement.first_seen <= 1) throw new Error("explicit trust did not persist the verified replacement");
       await ctx.close();
     });
   }
@@ -755,7 +764,7 @@ async function main() {
     await b.getByText("Reconnected to the server").waitFor();
     const pinAfter = await b.evaluate((endpoint) => localStorage.getItem(`vc.server-pin:${endpoint}`), CLIENT_ADDR);
     if (pinBefore !== pinAfter) throw new Error("second connection replaced the first-contact pin");
-    const fingerprint = await b.getByTestId("server-fingerprint").innerText();
+    const fingerprint = await serverFingerprint(b);
     if (fingerprint !== JSON.parse(pinAfter).server_pk) throw new Error("verified fingerprint is not visible");
   });
 
@@ -1073,6 +1082,7 @@ async function main() {
   let inviteLink = "";
   await check("an invite link admits a new user, who gets the invite's role", async () => {
     await ctxA.grantPermissions(["clipboard-read", "clipboard-write"], { origin: new URL(WEB_URL).origin });
+    const fingerprint = await serverFingerprint(a);
     await a.getByRole("button", { name: "Server menu" }).click();
     await a.getByRole("menuitem", { name: "Invite people" }).click();
     await a.getByRole("combobox", { name: "Uses" }).click();
@@ -1090,7 +1100,6 @@ async function main() {
     // The web app (Vite) and the server are different origins here, so the link has to name the server.
     const link = new URL(inviteLink);
     if (link.origin === `http://${SERVER}` || link.searchParams.get("server") !== CLIENT_ADDR) throw new Error(`invite link does not name the server: ${inviteLink}`);
-    const fingerprint = await a.getByTestId("server-fingerprint").innerText();
     if (link.searchParams.get("server_key") !== fingerprint) throw new Error("invite fingerprint differs from verified server key");
     await shot(a, "25-invites-dark");
     await a.keyboard.press("Escape");
