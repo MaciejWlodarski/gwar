@@ -951,6 +951,15 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Whether `id` is a stored file or a removed one still charged.
+    pub fn file_known(&self, id: &str) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM files WHERE id=?1) OR EXISTS(SELECT 1 FROM removed_files WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Stops charging removed files whose bytes are gone.
     pub fn forget_removed(&self, ids: &[FileId]) -> Result<()> {
         let tx = self.db.unchecked_transaction()?;

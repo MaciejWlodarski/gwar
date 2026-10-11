@@ -373,7 +373,45 @@ impl Core {
             warn!("store: {e:#}");
         }
         self.remove_files();
+        self.sweep_files();
         self.touch_online();
+    }
+
+    /// Whether the bytes named `name` belong to no upload and no file. Ids are random and
+    /// never reused, so bytes stray now stay stray; when in doubt they are kept.
+    fn stray(&self, name: &str) -> bool {
+        match name.strip_suffix(".part") {
+            Some(id) => !self.uploads.contains_key(id),
+            None => !self.uploads.contains_key(name) && matches!(self.store.file_known(name), Ok(false)),
+        }
+    }
+
+    /// Deletes bytes that belong to no upload and no file, such as those of an upload a
+    /// restart cut short (reservations live only in memory). Lists the directory off the actor.
+    fn sweep_files(&mut self) {
+        let Some(tx) = self.me.upgrade() else { return };
+        let dir = self.files_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let Ok(entries) = std::fs::read_dir(&dir) else { return };
+            let names: Vec<String> = entries
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect();
+            let found = move |core: &mut Core| {
+                let stray: Vec<_> = names.into_iter().filter(|name| core.stray(name)).collect();
+                if stray.is_empty() {
+                    return;
+                }
+                let dir = core.files_dir.clone();
+                tokio::task::spawn_blocking(move || {
+                    for name in stray {
+                        unlink(&dir.join(name));
+                    }
+                });
+            };
+            let _ = tx.blocking_send(CoreMsg::Resume(Box::new(found)));
+        });
     }
 }
 
@@ -542,6 +580,49 @@ pub(crate) mod tests {
         on_core(&core, |core| core.tick()).await;
         assert_eq!(charged(&core).await, 0);
         assert!(!files.join("old").exists());
+    }
+
+    /// After a restart, bytes of uploads that never finished go; files, removed files still
+    /// charged, and uploads in progress stay.
+    #[tokio::test]
+    async fn stray_bytes_are_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        for id in ["stored", "removed"] {
+            store.insert_file(id, "u", "f", "x", 3, "h", None, now_ms()).unwrap();
+        }
+        let core = test_core_storing(store, None, dir.path().into(), 100);
+        // The state first, then the bytes, so that the tick at startup cannot see one without the other.
+        on_core(&core, |core| {
+            core.store.raw().execute("DELETE FROM files WHERE id='removed'", []).unwrap();
+            // Not removable just now: only the sweep could take it.
+            core.removing.insert("removed".into());
+            core.uploads.insert("busy".into(), pending(true));
+            core.uploads.insert("busy2".into(), pending(true));
+        })
+        .await;
+        for name in ["stored", "removed", "busy.part", "busy2", "cut.part", "cut", "stored.part"] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        on_core(&core, |core| core.tick()).await;
+        let gone = |name: &str| !dir.path().join(name).exists();
+        for _ in 0..100 {
+            if ["cut.part", "cut", "stored.part"].iter().all(|n| gone(n)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for name in ["cut.part", "cut", "stored.part"] {
+            assert!(gone(name), "{name} was left");
+        }
+        for name in ["stored", "removed", "busy.part", "busy2"] {
+            assert!(!gone(name), "{name} was swept");
+        }
+        on_core(&core, |core| {
+            core.store.raw().execute_batch("ALTER TABLE files RENAME TO hidden").unwrap();
+            assert!(!core.stray("stored"), "swept without knowing whether it is stored");
+        })
+        .await;
     }
 
     #[test]
