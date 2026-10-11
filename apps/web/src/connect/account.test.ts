@@ -345,7 +345,7 @@ describe("device-bound session paths", () => {
   it("refuses a substituted or expired challenge before producing the device proof", async () => {
     for (const change of [{ service_key: "foreign" }, { expires_at: 1 }, { challenge: "not a nonce" }, { credential_version: -1 }]) {
       const { service, deps } = setup();
-      const broken = { ...deps(), api: new ConnectApi("http://c", (async (url, init) => {
+      const broken = { ...deps(), api: new ConnectApi("https://c", (async (url, init) => {
         const response = await service.fetch(url, init);
         if (!String(url).endsWith("/challenges")) return response;
         return new Response(JSON.stringify({ ...await response.json(), ...change }));
@@ -362,7 +362,7 @@ describe("signed credential updates", () => {
       const { service, deps } = setup();
       const record = (await createAccount({ handle: "credentials", password: "first password" }, deps())).record;
       const before = { ...service.accounts.get("credentials")! };
-      const malicious = { ...deps(), api: new ConnectApi("http://c", (async (url, init) => {
+      const malicious = { ...deps(), api: new ConnectApi("https://c", (async (url, init) => {
         if (String(url).endsWith("/account/password")) {
           const body = JSON.parse(init!.body as string);
           if (field === "kdf") body.kdf.salt = "AAAAAAAAAAAAAAAAAAAAAA";
