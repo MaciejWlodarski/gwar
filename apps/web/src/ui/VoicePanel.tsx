@@ -76,7 +76,7 @@ function SelfName({ nickname }: { nickname?: string }) {
   return (
     <div className="flex min-w-0 items-center gap-1">
       <span className="truncate text-sm font-medium">{nickname}</span>
-      <ConnectBadge member={member} />
+      <ConnectBadge member={member} name={nickname} />
     </div>
   );
 }

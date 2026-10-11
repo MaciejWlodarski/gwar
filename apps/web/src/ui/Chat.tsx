@@ -186,7 +186,7 @@ export const MessageRow = memo(function MessageRow({
               onClick={() => useUi.getState().openDialog({ kind: "memberProfile", uid: msg.author_uid, fallback: msg.author_name })}>
               {authorName}
             </button>
-            {verification?.status === "verified" && <ConnectBadge member={member} />}
+            {verification?.status === "verified" && <ConnectBadge member={member} name={authorName} />}
             <time dateTime={new Date(at).toISOString()} title={full} className="text-xs text-subtle">
               {time}
             </time>

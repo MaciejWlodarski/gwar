@@ -47,13 +47,25 @@ export function TeamSpeakBadge({ className, short }: { className?: string; short
   );
 }
 
-/** Only a handle verified by this client enables the badge. */
-export function ConnectBadge({ member }: { member?: HandleMember | null }) {
+/** Only a handle verified by this client enables the badge. Next to a server-chosen `name` that is not the
+ *  handle itself, the handle is shown in full, so the check never vouches for a nickname. */
+export function ConnectBadge({ member, name }: { member?: HandleMember | null; name?: string }) {
   const t = useT();
   const handle = useVerifiedHandle(member);
   if (!handle) return null;
   const label = t("badge.connectAccount", { handle });
-  return <span title={label} aria-label={label} className="inline-flex shrink-0 align-middle text-accent"><BadgeCheck className="size-3.5" /></span>;
+  const visible = name !== undefined && !sameAsHandle(name, handle);
+  return (
+    <span title={label} aria-label={label} data-testid="connect-badge" className="inline-flex shrink-0 items-center gap-0.5 align-middle text-accent">
+      <BadgeCheck aria-hidden className="size-3.5" />
+      {visible && <span className="font-mono text-xs">@{handle}</span>}
+    </span>
+  );
+}
+
+function sameAsHandle(name: string, handle: string): boolean {
+  const n = name.trim().replace(/^@/, "");
+  return n === handle || n.toLowerCase() === handle.toLowerCase();
 }
 
 /** "@handle #tag": the verified Connect handle (if any) and the tag derived from the key. */

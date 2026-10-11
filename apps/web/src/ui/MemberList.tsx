@@ -58,7 +58,7 @@ function MemberRow({ entry, mine, now }: { entry: MemberEntry; mine: boolean; no
                 </span>
                 {entry.channel && <span className="block truncate text-[11px] text-subtle">{entry.channel}</span>}
               </span>
-              <ConnectBadge member={entry} />
+              <ConnectBadge member={entry} name={entry.nickname} />
               {entry.admin && <Shield aria-label={t("members.admin")} className="size-3.5 shrink-0 text-accent" />}
               {entry.platform && isTeamSpeak(entry.platform) && (
                 <span className="shrink-0 rounded bg-hover px-1 text-[10px] leading-4 font-medium text-subtle">{PLATFORM_LABEL[entry.platform]}</span>
