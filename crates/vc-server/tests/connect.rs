@@ -723,3 +723,23 @@ async fn cross_account_revocations_do_not_poison_login_or_live_sessions() {
     assert!(as_device(&restarted, &device, certificate(&victim, &device, now(), now() + 86400000)).await.is_err());
     assert!(store.device_revoked(&public_key(&victim), &public_key(&device)).unwrap());
 }
+
+#[tokio::test]
+async fn certificate_expiry_disconnects_an_idle_session_and_ends_voice_routing() {
+    let server = TestServer::start().await;
+    let mut observer = Client::connect(&server, "observer").await;
+    let account = new_key();
+    let device = new_key();
+    let mut client = as_device(&server, &device, certificate(&account, &device, now(), now() + 600)).await.unwrap();
+    let session = client.welcome.session;
+    client.ok("channel.join", json!({"channel": client.default_channel()})).await;
+    assert!(server.running.plane.routing.load().members.contains_key(&session));
+    let reason = client.expect_disconnect().await;
+    assert_eq!(reason["kind"], "kicked");
+    assert!(reason["reason"].as_str().unwrap().contains("certificate expired"));
+    assert!(!server.running.plane.routing.load().members.contains_key(&session));
+    let left = observer.next_event_where("client.left", |e| e["client"] == session).await;
+    assert!(left["reason"]["reason"].as_str().unwrap().contains("certificate expired"));
+    let late = Client::connect(&server, "late").await;
+    assert!(!late.welcome.clients.iter().any(|c| c.id == session));
+}

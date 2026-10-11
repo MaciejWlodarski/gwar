@@ -183,6 +183,7 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
         uid,
         public_key: identity_key,
         device,
+        device_expires_at: hello.device.as_ref().map(|c| c.expires_at),
         nickname: hello.nickname,
         platform: hello.client.platform,
         out: out.clone(),

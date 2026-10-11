@@ -125,6 +125,7 @@ async fn tag_changes_are_announced_on_member_join_and_removal() {
             out,
             ip: None,
             device: None,
+            device_expires_at: None,
             invite: None,
             password_ok: true,
         })

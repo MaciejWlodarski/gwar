@@ -70,6 +70,8 @@ pub struct ConnectRequest {
     pub ip: Option<IpAddr>,
     /// The Gwar Connect device key, when signing in through an account.
     pub device: Option<String>,
+    /// Expiry of the certificate verified by the gateway.
+    pub device_expires_at: Option<i64>,
     pub invite: Option<String>,
     /// Whether the gateway already verified the server password (or none is set).
     pub password_ok: bool,
@@ -194,6 +196,7 @@ struct Session {
     platform: Platform,
     ip: Option<IpAddr>,
     device: Option<String>,
+    device_expires_at: Option<i64>,
     account_key: String,
     muted: bool,
     deafened: bool,
@@ -315,8 +318,24 @@ pub fn spawn(
         }
     });
     tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            core.handle(msg);
+        loop {
+            let expiry = core.sessions.values().filter_map(|s| s.device_expires_at).min();
+            let wait = async {
+                match expiry {
+                    Some(at) => {
+                        tokio::time::sleep(Duration::from_millis(at.saturating_sub(now_ms()).max(0) as u64)).await
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                biased;
+                _ = wait => core.expire_sessions(),
+                msg = rx.recv() => match msg {
+                    Some(msg) => core.handle(msg),
+                    None => break,
+                },
+            }
         }
         core.shutdown();
     });
@@ -376,6 +395,7 @@ impl Core {
     }
 
     fn handle(&mut self, msg: CoreMsg) {
+        self.expire_sessions();
         match msg {
             CoreMsg::Connect(request, reply) => {
                 let session = self.connect(request);
@@ -531,6 +551,12 @@ impl Core {
         if self.sessions.values().filter(|s| s.out.is_some()).count() >= self.info.max_clients as usize {
             return fail(ErrorCode::Unavailable, "server is full");
         }
+        if r.device.is_some() && r.device_expires_at.is_none_or(|at| at <= now_ms()) {
+            return fail(
+                ErrorCode::CertificateExpired,
+                "this device certificate expired; enter your password to renew it",
+            );
+        }
         if r.device.as_deref().is_some_and(|d| self.store.device_revoked(&r.public_key, d).unwrap_or(false)) {
             return fail(ErrorCode::NotAuthenticated, "this device was signed out of its Gwar account");
         }
@@ -623,6 +649,7 @@ impl Core {
             platform: r.platform,
             ip: r.ip,
             device: r.device,
+            device_expires_at: r.device_expires_at,
             account_key: r.public_key,
             muted: false,
             deafened: false,
@@ -767,6 +794,19 @@ impl Core {
         }
     }
 
+    fn expire_sessions(&mut self) {
+        let now = now_ms();
+        let expired: Vec<_> =
+            self.sessions.values().filter(|s| s.device_expires_at.is_some_and(|at| at <= now)).map(|s| s.id).collect();
+        let reason = LeaveReason::Kicked {
+            by: "Gwar".into(),
+            reason: Some("this device certificate expired; enter your password to renew it".into()),
+        };
+        for session in expired {
+            self.remove(session, reason.clone());
+        }
+    }
+
     fn remove(&mut self, session: SessionId, reason: LeaveReason) {
         let Some(s) = self.sessions.remove(&session) else { return };
         info!(session, uid = %s.uid, ?reason, "client left");
@@ -776,7 +816,14 @@ impl Core {
                 warn!("store: {e:#}");
             }
         }
-        let _ = self.media.try_send(MediaCmd::Remove { session });
+        if let Err(tokio::sync::mpsc::error::TrySendError::Full(command)) =
+            self.media.try_send(MediaCmd::Remove { session })
+        {
+            let media = self.media.clone();
+            tokio::spawn(async move {
+                let _ = media.send(command).await;
+            });
+        }
         self.publish_routing();
         self.broadcast(Event::ClientLeft { client: session, reason }, |_| true);
     }
@@ -829,6 +876,7 @@ impl Core {
                     platform: client.platform,
                     ip: None,
                     device: None,
+                    device_expires_at: None,
                     account_key: String::new(),
                     muted: client.muted,
                     deafened: client.deafened,
@@ -1530,5 +1578,70 @@ fn client_view(s: &Session) -> Client {
         away: s.away.clone(),
         talking: s.talking,
         voice: s.voice,
+    }
+}
+
+#[cfg(test)]
+mod expiry_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn expiry_queues_sfu_removal_even_when_the_media_queue_is_full() {
+        let store = Store::in_memory().unwrap();
+        let channel = store.channels().unwrap()[0].id;
+        let routing = Arc::new(ArcSwap::from_pointee(Routing::default()));
+        let (media, mut commands) = mpsc::channel(1);
+        media.try_send(MediaCmd::Remove { session: 0 }).ok().unwrap();
+        let core = spawn(
+            store,
+            CoreConfig {
+                max_clients: 10,
+                ice_servers: Vec::new(),
+                version: "test".into(),
+                password: Arc::new(ArcSwap::from_pointee(None)),
+                upload_limit: 0,
+                files_dir: PathBuf::new(),
+                connect_url: None,
+            },
+            routing.clone(),
+            media,
+        )
+        .unwrap();
+        let (out, mut frames) = mpsc::channel(OUTBOUND_QUEUE);
+        let session = core
+            .connect(ConnectRequest {
+                request_id: 1,
+                uid: crate::identity::uid_for_key(&[1; 32]),
+                public_key: URL_SAFE_NO_PAD.encode([1; 32]),
+                nickname: "device".into(),
+                platform: Platform::Web,
+                out,
+                ip: None,
+                device: Some(URL_SAFE_NO_PAD.encode([2; 32])),
+                device_expires_at: Some(now_ms() + 300),
+                invite: None,
+                password_ok: true,
+            })
+            .await
+            .unwrap();
+        core.request(session, 2, Request::ChannelJoin { channel, password: None }).await;
+        core.info().await.unwrap();
+        assert!(routing.load().members.contains_key(&session));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(Outbound::Close(reason)) = frames.recv().await {
+                    assert!(matches!(reason, LeaveReason::Kicked { reason: Some(reason), .. } if reason.contains("certificate expired")));
+                    break;
+                }
+            }
+        }).await.unwrap();
+        assert!(!routing.load().members.contains_key(&session));
+        assert!(matches!(commands.recv().await, Some(MediaCmd::Remove { session: 0 })));
+        let removed = tokio::time::timeout(Duration::from_secs(2), commands.recv()).await.unwrap();
+        assert!(matches!(removed, Some(MediaCmd::Remove { session: gone }) if gone == session));
+        // A late request cannot restart voice or recover a subscription after removal.
+        core.request(session, 3, Request::ChannelJoin { channel, password: None }).await;
+        core.info().await.unwrap();
+        assert!(!routing.load().members.contains_key(&session));
     }
 }
