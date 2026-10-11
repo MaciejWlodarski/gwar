@@ -20,7 +20,9 @@ export interface SysText {
 }
 
 export type ChatItem =
-  | { kind: "msg"; key: string; at: number; msg: ChatMessage; removed?: boolean; verified?: boolean }
+  /** verified: fully verified (mentions, notifications); authentic: the signature verified here, so the
+   *  row owns its id and signed identity. Unauthenticated rows never block or outlive an authentic one. */
+  | { kind: "msg"; key: string; at: number; msg: ChatMessage; removed?: boolean; verified?: boolean; authentic?: boolean }
   | { kind: "sys"; key: string; at: number; text: SysText };
 
 export interface Thread {

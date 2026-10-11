@@ -370,16 +370,52 @@ describe("sending, editing and deleting", () => {
     expect(link.sent("chat.send").at(-1)?.d).toMatchObject({ mentions: ["u2"], attachments: ["f1"] });
   });
 
-  it("edits and deletes through the server", async () => {
+  type Verification = import("../net/message-signature").MessageVerification;
+  const verifying = (result: Verification) =>
+    vi.spyOn(controller as unknown as { verifyIncoming: (msg: ChatMessage) => Promise<Verification> }, "verifyIncoming").mockResolvedValue(result);
+  const signed = {} as NonNullable<ChatMessage["signature"]>;
+
+  it("edits and deletes my verified messages with a signature, others through the server", async () => {
     connectFake();
-    link.emit({ ev: "chat.message", d: message(5, 1) });
-    expect(await controller.editMessage(5, "new", ["u2"])).toBe(true);
-    expect(link.sent("chat.edit")).toEqual([{ op: "chat.edit", d: { message: 5, text: "new", mentions: ["u2"], signature: expect.any(Object) } }]);
-    expect(await controller.deleteMessage(5)).toBe(true);
-    expect(link.sent("chat.delete")).toEqual([{ op: "chat.delete", d: { message: 5 } }]);
-    link.failing.add("chat.delete");
-    expect(await controller.deleteMessage(6)).toBe(false);
-    expect(stores.useUi.getState().toasts).toHaveLength(1);
+    const verify = verifying({ status: "verified", continuity: "proven", authorization: [] });
+    try {
+      link.emit({ ev: "chat.message", d: message(5, 1, { author: 1, author_uid: "u1", signature: signed }) });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(await controller.editMessage(5, "new", ["u2"])).toBe(true);
+      expect(link.sent("chat.edit")).toEqual([{ op: "chat.edit", d: { message: 5, text: "new", mentions: ["u2"], signature: expect.any(Object) } }]);
+      expect(await controller.deleteMessage(5)).toBe(true);
+      expect(link.sent("chat.edit").at(-1)?.d).toMatchObject({ message: 5, text: "\0gwar deleted v1" });
+      expect(link.sent("chat.delete")).toEqual([]);
+      link.emit({ ev: "chat.message", d: message(6, 1) });
+      expect(await controller.deleteMessage(6)).toBe(true);
+      expect(link.sent("chat.delete")).toEqual([{ op: "chat.delete", d: { message: 6 } }]);
+      link.failing.add("chat.delete");
+      expect(await controller.deleteMessage(7)).toBe(false);
+      expect(stores.useUi.getState().toasts).toHaveLength(1);
+    } finally { verify.mockRestore(); }
+  });
+
+  it("never signs an edit or deletion of a message that does not verify here", async () => {
+    connectFake();
+    const verify = verifying({ status: "verified", continuity: "proven", authorization: [] });
+    // A genuine envelope with a grafted attachment: displayed (as invalid), never endorsed.
+    const grafted = message(8, 1, { author: 1, author_uid: "u1", signature: signed,
+      attachments: [{ id: "evil", name: "invoice.pdf", url: "/files/evil/invoice.pdf", size: 1, mime: "application/pdf", sha256: "x" }] });
+    try {
+      link.emit({ ev: "chat.message", d: grafted });
+      await vi.advanceTimersByTimeAsync(10);
+      for (const result of [
+        { status: "invalid", continuity: "unproven", authorization: [] },
+        { status: "verified", continuity: "fork", authorization: [] },
+        { status: "verified", continuity: "proven", authorization: ["device-revoked"] },
+      ] as Verification[]) {
+        verify.mockResolvedValue(result);
+        expect(await controller.editMessage(8, "only the text changed", [])).toBe(false);
+        expect(await controller.deleteMessage(8)).toBe(true); // falls back to a server removal request
+      }
+      expect(link.sent("chat.edit")).toEqual([]);
+      expect(stores.useUi.getState().toasts.at(0)?.text).toMatch(/could not be verified/);
+    } finally { verify.mockRestore(); }
   });
 
   it("rejects unsigned edits and labels server removals", async () => {

@@ -563,3 +563,51 @@ describe("roles", () => {
     expect(s.permissions).toEqual(["invite_create"]);
   });
 });
+
+describe("signed identity ownership", () => {
+  const sig = (message_id: string) => ({ server_key: "S", message_id }) as unknown as NonNullable<ChatMessage["signature"]>;
+  const live = (s: SessionState, m: ChatMessage, authentic: boolean) =>
+    reduce(s, { type: "event", now: 5, event: { ev: "chat.message", d: m }, verified: authentic, authentic });
+  const texts = (s: SessionState) => (s.threads["ch:1"]?.items ?? []).flatMap((i) => (i.kind === "msg" ? [`${i.msg.id}:${i.msg.text}`] : []));
+
+  it("a forged first claim does not keep out the genuine message", () => {
+    let s = live(online(), msg(1, { text: "FORGED", signature: sig("A") }), false);
+    s = live(s, msg(2, { text: "genuine", signature: sig("A") }), true);
+    expect(texts(s)).toEqual(["2:genuine"]);
+  });
+
+  it("an unauthenticated row under a server id does not block an authentic message with that id", () => {
+    let s = live(online(), msg(5, { text: "unsigned squatter" }), false);
+    s = live(s, msg(5, { text: "genuine", signature: sig("B") }), true);
+    expect(texts(s)).toEqual(["5:genuine"]);
+  });
+
+  it("an authentic row owns its id and identity against later claims", () => {
+    let s = live(online(), msg(1, { text: "genuine", signature: sig("A") }), true);
+    s = live(s, msg(2, { text: "replayed elsewhere", signature: sig("A") }), false);
+    s = live(s, msg(2, { text: "replayed elsewhere", signature: sig("A") }), true);
+    s = live(s, msg(1, { text: "other", signature: sig("C") }), true);
+    expect(texts(s)).toEqual(["1:genuine"]);
+  });
+
+  it("history follows the same rules", () => {
+    let s = live(online(), msg(1, { text: "FORGED", signature: sig("A") }), false);
+    s = live(s, msg(3, { text: "unsigned squatter" }), false);
+    s = reduce(s, { type: "history", channel: 1, before: null, limit: 50, authentic: [2, 3],
+      messages: [msg(2, { text: "genuine", signature: sig("A") }), msg(3, { text: "genuine 3", signature: sig("D") })] });
+    expect(texts(s)).toEqual(["2:genuine", "3:genuine 3"]);
+    s = reduce(s, { type: "history", channel: 1, before: null, limit: 50, authentic: [],
+      messages: [msg(4, { text: "FORGED again", signature: sig("A") })] });
+    expect(texts(s)).toEqual(["2:genuine", "3:genuine 3"]);
+  });
+});
+
+describe("direct message routing", () => {
+  it("takes the direction from the author uid, not the server's session id", () => {
+    // A server claims my session sent Bob's message to client 2: it is still Bob's incoming message.
+    const s = reduce(online(), { type: "event", now: 5, event: { ev: "chat.message", d: msg(9, { target: { client: 2 }, author: 1, author_uid: "u2" }) } });
+    expect(Object.keys(s.threads).filter((k) => k.startsWith("dm:"))).toEqual(["dm:u2"]);
+    const mine = reduce(online(), { type: "event", now: 5, event: { ev: "chat.message", d: msg(10, { target: { client: 2 }, author: 1, author_uid: "u1" }) } });
+    expect(mine.threads["dm:u2"]?.items.some((i) => i.key === "m10")).toBe(true);
+  });
+});

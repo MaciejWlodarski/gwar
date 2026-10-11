@@ -358,6 +358,7 @@ export const pl: Record<Key, string> = {
   "chat.unverifiedDeletion": "Niezweryfikowane żądanie usunięcia",
   "chat.verificationQueueFull": "Kolejka weryfikacji wiadomości jest pełna",
   "chat.replacementRejected": "Odrzucono zastąpienie wiadomości: nieprawidłowy podpis, cofnięcie zmian lub rozwidlenie historii",
+  "chat.editUnverified": "Nie udało się zweryfikować tej wiadomości, więc nie można jej edytować ani usunąć Twoim podpisem",
   "chat.edited": "(edytowano)",
   "chat.editedAt": "Edytowano {when}",
   "close.banned": "{by} zbanował(a) Cię na tym serwerze.",

@@ -38,8 +38,8 @@ export const initialState: SessionState = {
 export type Action =
   | { type: "phase"; phase: Phase }
   | { type: "welcome"; welcome: Welcome; resync: boolean; now: number }
-  | { type: "event"; event: Event; now: number; verified?: boolean }
-  | { type: "history"; channel: number; messages: ChatMessage[]; before: number | null; limit: number }
+  | { type: "event"; event: Event; now: number; verified?: boolean; authentic?: boolean }
+  | { type: "history"; channel: number; messages: ChatMessage[]; before: number | null; limit: number; authentic?: number[] }
   | { type: "historyForbidden"; channel: number }
   | { type: "setActive"; key: ThreadKey }
   /** Open a channel's chat (whether or not I am in its voice). */
@@ -96,15 +96,36 @@ function sysItem(at: number, text: SysText, salt: string): ChatItem {
   return { kind: "sys", key: `s${at}-${salt}`, at, text };
 }
 
-function msgItem(msg: ChatMessage, verified = false): ChatItem {
-  return { kind: "msg", key: `m${msg.id}`, at: msg.sent_at, msg, verified };
+function msgItem(msg: ChatMessage, verified = false, authentic = false): ChatItem {
+  return { kind: "msg", key: `m${msg.id}`, at: msg.sent_at, msg, verified, authentic };
+}
+
+/** The identity a message signature claims; only an authentic row may own it. */
+function signedIdentity(msg: ChatMessage): string | null {
+  const s = msg.signature;
+  return s ? `${s.server_key}:${msg.author_uid}:${s.message_id}` : null;
+}
+
+/** Rows that claim the same server id or signed identity as `item`. */
+function clashesWith(item: Extract<ChatItem, { kind: "msg" }>) {
+  const id = signedIdentity(item.msg);
+  return (i: ChatItem) => i.kind === "msg" && (i.key === item.key || (id !== null && signedIdentity(i.msg) === id));
 }
 
 function pushItem(thread: Thread, item: ChatItem, countUnread: boolean, mentionsMe = false): Thread {
-  if (item.kind === "msg" && thread.items.some((i) => i.key === item.key || (i.kind === "msg" && i.msg.signature && item.msg.signature
-      && i.msg.signature.server_key === item.msg.signature.server_key && i.msg.author_uid === item.msg.author_uid
-      && i.msg.signature.message_id === item.msg.signature.message_id))) return thread;
-  let items = [...thread.items, item];
+  let base = thread.items;
+  if (item.kind === "msg") {
+    const clash = clashesWith(item);
+    const clashes = base.filter(clash);
+    // An authentic row keeps its id and identity; an unauthenticated claim never displaces anything.
+    if (clashes.some((i) => i.kind === "msg" && i.authentic) || (clashes.length > 0 && !item.authentic)) return thread;
+    // An authentic arrival replaces unauthenticated claims (a server could send a forgery first).
+    if (clashes.length > 0) {
+      base = base.filter((i) => !clash(i));
+      countUnread = false;
+    }
+  }
+  let items = [...base, item];
   if (items.length > MAX_ITEMS) items = items.slice(items.length - MAX_ITEMS);
   return {
     ...thread,
@@ -167,14 +188,20 @@ export function mergeItems(a: ChatItem[], b: ChatItem[]): ChatItem[] {
   for (const item of [...a, ...b]) {
     if (seen.has(item.key)) {
       const index = all.findIndex((i) => i.key === item.key), old = all[index];
-      // History has passed the controller's signature/checkpoint gate. Keep the newest accepted revision.
-      if (old?.kind === "msg" && item.kind === "msg" && sameMessageIdentity(old.msg, item.msg)
-          && item.msg.signature!.revision > old.msg.signature!.revision) all[index] = item;
+      // History has passed the controller's signature/checkpoint gate. Keep the newest accepted revision;
+      // an authentic row replaces an unauthenticated one under the same id.
+      if (old?.kind === "msg" && item.kind === "msg" && ((item.authentic && !old.authentic) || (old.authentic && item.authentic
+          && sameMessageIdentity(old.msg, item.msg) && item.msg.signature!.revision > old.msg.signature!.revision))) all[index] = item;
       continue;
     }
     seen.add(item.key);
     all.push(item);
   }
+  // Unauthenticated claims on a signed identity that an authentic row owns are dropped.
+  const owned = new Set(all.flatMap((i) => (i.kind === "msg" && i.authentic ? [signedIdentity(i.msg)] : [])));
+  const kept = all.filter((i) => i.kind !== "msg" || i.authentic || !owned.has(signedIdentity(i.msg)));
+  all.length = 0;
+  all.push(...kept);
   // Messages from one channel are ordered by id; sys lines by time. A stable
   // sort on time keeps equal timestamps in arrival order.
   return all
@@ -188,16 +215,16 @@ function threadForMessage(state: SessionState, msg: ChatMessage): StoredThreadKe
   const t = msg.target;
   if (t === "server") return "server";
   if ("channel" in t) return channelThreadKey(t.channel);
-  const meSession = state.me?.session;
-  // Private: the thread is keyed by the *other* party's uid.
-  if (msg.author === meSession || msg.author_uid === state.me?.uid) {
+  // Private: the thread is keyed by the *other* party's uid. The direction comes from the
+  // author uid (the one the signature binds), never from the server-assigned session id.
+  if (msg.author_uid === state.me?.uid) {
     const to = state.clients[t.client];
     return to ? dmKey(to.uid) : null;
   }
   return dmKey(msg.author_uid);
 }
 
-function onChatMessage(state: SessionState, msg: ChatMessage, verified = false): SessionState {
+function onChatMessage(state: SessionState, msg: ChatMessage, verified = false, authentic = false): SessionState {
   const key = threadForMessage(state, msg);
   if (!key) return state;
   const mine = msg.author_uid === state.me?.uid;
@@ -209,7 +236,7 @@ function onChatMessage(state: SessionState, msg: ChatMessage, verified = false):
   return withThread(state, key, (t) => {
     const next = pushItem(
       { ...t, locked: key.startsWith("ch:") ? false : t.locked },
-      msgItem(msg, verified),
+      msgItem(msg, verified, authentic),
       !mine && !isViewing(state, key),
       verified && mentionsUser(msg, state.me?.uid),
     );
@@ -222,7 +249,7 @@ function onChatMessage(state: SessionState, msg: ChatMessage, verified = false):
 }
 
 /** An edited message replaces the old text in place; unread counts do not change. */
-function onChatEdited(state: SessionState, msg: ChatMessage, verified = false): SessionState {
+function onChatEdited(state: SessionState, msg: ChatMessage, verified = false, authentic = false): SessionState {
   const key = threadForMessage(state, msg);
   const thread = key ? state.threads[key] : undefined;
   if (!key || !thread) return state;
@@ -233,7 +260,7 @@ function onChatEdited(state: SessionState, msg: ChatMessage, verified = false): 
   const isMention = verified && mentionsUser(msg, state.me?.uid);
   const unreadMention = msg.id > thread.lastRead && thread.unread > 0 && msg.author_uid !== state.me?.uid;
   const mentions = unreadMention ? Math.max(0, thread.mentions + Number(isMention) - Number(wasMention)) : thread.mentions;
-  return withThread(state, key, (t) => ({ ...t, mentions, items: t.items.map((i) => (i.key === itemKey ? msgItem(msg, verified) : i)) }));
+  return withThread(state, key, (t) => ({ ...t, mentions, items: t.items.map((i) => (i.key === itemKey ? msgItem(msg, verified, authentic) : i)) }));
 }
 
 function onChatDeleted(state: SessionState, channel: number, message: number): SessionState {
@@ -300,10 +327,10 @@ function channelNotices(prev: SessionState, next: SessionState, at: number, id: 
   return withThread(next, channelThreadKey(myCh), (t) => pushItem(t, sysItem(at, text, `${id}${isHere ? "j" : "l"}`), false));
 }
 
-function reduceEvent(state: SessionState, event: Event, now: number, verified = false): SessionState {
+function reduceEvent(state: SessionState, event: Event, now: number, verified = false, authentic = false): SessionState {
   switch (event.ev) {
     case "chat.edited":
-      return onChatEdited(state, event.d, verified);
+      return onChatEdited(state, event.d, verified, authentic);
     case "chat.deleted":
       return onChatDeleted(state, event.d.channel, event.d.message);
     case "group.created":
@@ -364,7 +391,7 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
       return channelNotices(state, next, now, event.d.client);
     }
     case "chat.message":
-      return onChatMessage(state, event.d, verified);
+      return onChatMessage(state, event.d, verified, authentic);
     case "chat.read": {
       const { channel, message } = event.d;
       if (!state.channels[channel]) return state;
@@ -448,12 +475,13 @@ export function reduce(state: SessionState, action: Action): SessionState {
       return next;
     }
     case "event":
-      return reduceEvent(state, action.event, action.now, action.verified);
+      return reduceEvent(state, action.event, action.now, action.verified, action.authentic);
     case "history": {
       const key = channelThreadKey(action.channel);
       if (!state.threads[key] && !state.channels[action.channel]) return state;
       return withThread(state, key, (t) => {
-        const incoming = action.messages.map((m) => msgItem(m));
+        const authentic = new Set(action.authentic ?? []);
+        const incoming = action.messages.map((m) => msgItem(m, false, authentic.has(m.id)));
         const merged = mergeItems(t.items, incoming);
         return {
           ...t,

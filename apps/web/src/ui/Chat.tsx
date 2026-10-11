@@ -492,17 +492,20 @@ function MessageList({ threadKey }: { threadKey: ThreadKey }) {
           // Only channel messages (stored on the server) can be edited or deleted.
           const stored = vc && typeof m.target === "object" && "channel" in m.target;
           const own = m.author_uid === mineUid;
+          const verification = verified.get(m.id)?.fingerprint === messageFingerprint(m, { serverKey, target: targetFor(m) }) ? verified.get(m.id)?.state : undefined;
+          // My signature may only extend a message this client verified (the controller checks again).
+          const signable = !vc || (verification?.status === "verified" && !verification.authorization.includes("device-revoked"));
           return (
             <MessageRow
               key={row.key}
               row={row}
-              verification={verified.get(m.id)?.fingerprint === messageFingerprint(m, { serverKey, target: targetFor(m) }) ? verified.get(m.id)?.state : undefined}
+              verification={verification}
               mine={own}
               meUid={mineUid}
               lang={lang}
               compact={compact}
-              canEdit={stored && own}
-              canDelete={stored && (own || canManageMessages)}
+              canEdit={stored && own && signable}
+              canDelete={stored && ((own && signable) || canManageMessages)}
               editing={editing === m.id}
             />
           );
