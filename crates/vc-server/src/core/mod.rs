@@ -1661,7 +1661,17 @@ fn client_view(s: &Session) -> Client {
 mod expiry_tests {
     use super::*;
 
-    fn test_core(store: Store, password: Option<&str>) -> CoreHandle {
+    pub(super) fn test_core(store: Store, password: Option<&str>) -> CoreHandle {
+        test_core_storing(store, password, PathBuf::new(), 0)
+    }
+
+    /// A core whose uploads of up to `upload_limit` bytes go to `files_dir`.
+    pub(super) fn test_core_storing(
+        store: Store,
+        password: Option<&str>,
+        files_dir: PathBuf,
+        upload_limit: u64,
+    ) -> CoreHandle {
         let (media, _commands) = mpsc::channel(8);
         spawn(
             store,
@@ -1670,10 +1680,10 @@ mod expiry_tests {
                 ice_servers: Vec::new(),
                 version: "test".into(),
                 password: Arc::new(ArcSwap::from_pointee(password.map(Arc::from))),
-                upload_limit: 0,
+                upload_limit,
                 upload_quota: 0,
                 storage_limit: 0,
-                files_dir: PathBuf::new(),
+                files_dir,
                 connect_url: None,
                 server_key: String::new(),
             },
@@ -1684,7 +1694,10 @@ mod expiry_tests {
     }
 
     /// Runs `f` on the actor, between any other messages.
-    async fn on_core<T: Send + 'static>(core: &CoreHandle, f: impl FnOnce(&mut Core) -> T + Send + 'static) -> T {
+    pub(super) async fn on_core<T: Send + 'static>(
+        core: &CoreHandle,
+        f: impl FnOnce(&mut Core) -> T + Send + 'static,
+    ) -> T {
         let (tx, rx) = oneshot::channel();
         core.tx.send(CoreMsg::Resume(Box::new(move |core| drop(tx.send(f(core)))))).await.unwrap();
         rx.await.unwrap()

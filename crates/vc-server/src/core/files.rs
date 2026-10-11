@@ -66,7 +66,7 @@ pub enum FileMsg {
         upload: Uploaded,
         reply: oneshot::Sender<bool>,
     },
-    /// A started upload failed and its bytes are gone from disk.
+    /// A started upload ended without finishing: its bytes go, then its reservation.
     Abort {
         id: String,
     },
@@ -84,7 +84,7 @@ impl CoreHandle {
         rx.await.ok().flatten()
     }
 
-    /// Releases the reservation of a started upload whose bytes were removed.
+    /// Gives up a started upload (see [`FileMsg::Abort`]); harmless once it has finished.
     pub async fn upload_abort(&self, id: String) {
         let _ = self.tx.send(CoreMsg::Files(FileMsg::Abort { id })).await;
     }
@@ -226,9 +226,24 @@ impl Core {
             }
             FileMsg::Abort { id } => {
                 // Only a started upload: an unused token cannot be released by anyone but its expiry.
-                if self.uploads.get(&id).is_some_and(|u| u.token.is_empty()) {
-                    self.uploads.remove(&id);
+                if self.uploads.get(&id).is_some_and(|u| !u.token.is_empty()) {
+                    return;
                 }
+                // A finished upload's bytes are the stored file's (its `Finish` came first).
+                if !matches!(self.store.file(&id), Ok(None)) {
+                    return;
+                }
+                let path = self.file_path(&id);
+                let paths = [path.with_extension("part"), path];
+                let Some(tx) = self.me.upgrade() else { return };
+                tokio::task::spawn_blocking(move || {
+                    for path in paths {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    // The space is free once the bytes are gone, not before.
+                    let release = move |core: &mut Core| drop(core.uploads.remove(&id));
+                    let _ = tx.blocking_send(CoreMsg::Resume(Box::new(release)));
+                });
             }
             FileMsg::Info { id, reply } => {
                 let file = self.store.file(&id).map_err(storage_error).ok().flatten();
@@ -262,7 +277,52 @@ impl Core {
 
 #[cfg(test)]
 mod tests {
-    use super::clean_name;
+    use super::*;
+    use crate::{
+        core::expiry_tests::{on_core, test_core_storing},
+        store::Store,
+    };
+
+    fn pending(size: u64) -> PendingUpload {
+        PendingUpload {
+            uploader: "u".into(),
+            name: "f".into(),
+            mime: "x".into(),
+            size,
+            token: String::new(),
+            sha256: "h".into(),
+            until: Instant::now() + UPLOAD_WINDOW,
+        }
+    }
+
+    /// A handler that goes away after its upload finished must not take the stored bytes with
+    /// it; one that goes away before removes them and only then frees the space.
+    #[tokio::test]
+    async fn abandoning_an_upload_removes_only_unfinished_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core_storing(Store::in_memory().unwrap(), None, dir.path().into(), 100);
+        on_core(&core, |core| {
+            core.uploads.insert("done".into(), pending(3));
+            core.uploads.insert("half".into(), pending(3));
+        })
+        .await;
+        std::fs::write(dir.path().join("done"), "abc").unwrap();
+        std::fs::write(dir.path().join("half.part"), "a").unwrap();
+        let done = Uploaded { id: "done".into(), size: 3, sha256: "h".into(), media: None, dimensions: None };
+        assert!(core.upload_finish(done).await);
+        core.upload_abort("done".into()).await;
+        core.upload_abort("half".into()).await;
+        for _ in 0..100 {
+            if !on_core(&core, |core| core.uploads.contains_key("half")).await {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!on_core(&core, |core| core.uploads.contains_key("half")).await, "space never freed");
+        assert!(!dir.path().join("half.part").exists());
+        assert_eq!(std::fs::read(dir.path().join("done")).unwrap(), b"abc");
+        assert!(core.file_info("done".into()).await.is_some());
+    }
 
     #[test]
     fn names_lose_paths_and_control_characters() {

@@ -103,27 +103,21 @@ async fn paced<S: futures::Stream + Unpin>(
     tokio::time::timeout(UPLOAD_IDLE.min(left), stream.next()).await.map_err(|_| StatusCode::REQUEST_TIMEOUT)
 }
 
-/// Until disarmed, removes an upload's bytes and then releases its reservation, however the
-/// upload ends: an error, a timeout or the client going away (which drops the handler).
+/// Until disarmed, gives the upload up however it ends: an error, a timeout or the client
+/// going away (which drops the handler). The core removes the bytes unless the upload
+/// finished, so a handler dropped after `Finish` reached the core loses nothing.
 struct Abandoned {
     core: CoreHandle,
     id: String,
-    paths: [std::path::PathBuf; 2],
     armed: bool,
 }
 
 impl Drop for Abandoned {
     fn drop(&mut self) {
-        if !self.armed {
-            return;
+        if self.armed {
+            let (core, id) = (self.core.clone(), std::mem::take(&mut self.id));
+            tokio::spawn(async move { core.upload_abort(id).await });
         }
-        let (core, id, paths) = (self.core.clone(), std::mem::take(&mut self.id), self.paths.clone());
-        tokio::spawn(async move {
-            for path in paths {
-                let _ = tokio::fs::remove_file(path).await;
-            }
-            core.upload_abort(id).await;
-        });
     }
 }
 
@@ -140,8 +134,7 @@ pub async fn upload(
         return (StatusCode::FORBIDDEN, "unknown or used upload").into_response();
     };
     let part = slot.path.with_extension("part");
-    let mut abandoned =
-        Abandoned { core: gateway.core.clone(), id: id.clone(), paths: [part.clone(), slot.path.clone()], armed: true };
+    let mut abandoned = Abandoned { core: gateway.core.clone(), id: id.clone(), armed: true };
     let result = async {
         if let Some(dir) = part.parent() {
             tokio::fs::create_dir_all(dir).await?;
