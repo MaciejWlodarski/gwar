@@ -1,7 +1,8 @@
 import { boundedImageBlob, verifiedAttachmentBlob } from "../net/attachment";
+import { imageBudget, imageMemory, type ImageBudget } from "../net/image-budget";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { Download, File as FileIcon, FileArchive, FileAudio, FileText, FileVideo, Loader2, X } from "lucide-react";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode, type RefCallback } from "react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { fileKind, fitBox, formatBytes, isInlineImage, type FileKind } from "../lib/files";
@@ -29,7 +30,30 @@ function AttachmentState({ failed, onLoad, untrusted = false }: { failed: boolea
     {onLoad && <Tooltip label={t("file.unverifiedRisk")}><Button size="sm" variant="ghost" className="ml-2 underline" onClick={onLoad}>{t("file.loadUnverified")}</Button></Tooltip>}</span>;
 }
 
-function useAttachmentUrl(att: Attachment, verified: boolean, autoLoad = true) {
+/** Images more than this far outside the chat's visible area are not loaded, or are released. */
+const NEAR = "1500px 0px";
+
+function scrollParent(node: Element): Element | null {
+  for (let p = node.parentElement; p; p = p.parentElement) if (/auto|scroll/.test(getComputedStyle(p).overflowY)) return p;
+  return null;
+}
+
+/** Whether the element is near the visible part of its scroll container. */
+function useNearView<T extends Element>(): [RefCallback<T>, boolean] {
+  const [node, setNode] = useState<T | null>(null);
+  const [near, setNear] = useState(false);
+  useEffect(() => {
+    if (!node) return;
+    if (typeof IntersectionObserver === "undefined") { setNear(true); return; }
+    const observer = new IntersectionObserver((entries) => setNear(entries.some((e) => e.isIntersecting)), { root: scrollParent(node), rootMargin: NEAR });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [node]);
+  return [setNode, near];
+}
+
+type UrlOptions = { autoLoad?: boolean; active?: boolean; budget?: ImageBudget };
+function useAttachmentUrl(att: Attachment, verified: boolean, { autoLoad = true, active = true, budget }: UrlOptions = {}) {
   const origin = useSession((s) => s.httpOrigin), limit = useSession((s) => s.server?.upload_limit ?? 0);
   const [explicit, setExplicit] = useState<string>();
   const [requested, setRequested] = useState<string>();
@@ -39,17 +63,29 @@ function useAttachmentUrl(att: Attachment, verified: boolean, autoLoad = true) {
   const open = () => setRequested(key);
   const allowed = verified || explicit === key;
   useEffect(() => {
-    if (!allowed || (!autoLoad && requested !== key && explicit !== key)) return;
-    const abort = new AbortController();
-    let url: string | undefined;
-    const opts = { origin, size: att.size, uploadLimit: limit, signal: abort.signal };
-    const fetchBlob = explicit === key ? fetchFileBytes(att.url, opts).then((bytes) => new Blob([bytes], { type: att.mime })) : verifiedAttachmentBlob(att, att.url, undefined, opts);
-    void fetchBlob.then(boundedImageBlob).then((blob) => {
-      if (abort.signal.aborted) return;
-      url = URL.createObjectURL(blob); setLoaded({ key, url, failed: false });
-    }).catch(() => { if (!abort.signal.aborted) setLoaded({ key, url: "", failed: true }); });
-    return () => { abort.abort(); if (url) URL.revokeObjectURL(url); };
-  }, [key, allowed, explicit, origin, limit, att, autoLoad, requested]);
+    if (!active || !allowed || (!autoLoad && requested !== key && explicit !== key)) return;
+    const abort = new AbortController(), signal = abort.signal;
+    let url: string | undefined, release: (() => void) | undefined;
+    const opts = { origin, size: att.size, uploadLimit: limit, signal };
+    // With a budget, the fetch waits for a slot and decoding waits until the decoded image fits in memory;
+    // the memory stays reserved until the image is released.
+    void (async () => {
+      const slot = await budget?.fetchSlot(signal);
+      try {
+        const blob = explicit === key ? new Blob([await fetchFileBytes(att.url, opts)], { type: att.mime }) : await verifiedAttachmentBlob(att, att.url, undefined, opts);
+        const image = await boundedImageBlob(blob, budget && (async (width, height) => {
+          release = await budget.reserve(imageMemory(width, height, blob.size), signal);
+          signal.throwIfAborted();
+        }));
+        signal.throwIfAborted();
+        url = URL.createObjectURL(image); setLoaded({ key, url, failed: false });
+      } finally { slot?.(); }
+    })().catch(() => { release?.(); if (!signal.aborted) setLoaded({ key, url: "", failed: true }); });
+    return () => {
+      abort.abort(); release?.();
+      if (url) { URL.revokeObjectURL(url); const gone = url; setLoaded((l) => l?.url === gone ? undefined : l); }
+    };
+  }, [key, allowed, explicit, origin, limit, att, autoLoad, requested, active, budget]);
   return { open, requested: requested === key || explicit === key, url: loaded?.key === key ? loaded.url : "", failed: loaded?.key === key && loaded.failed, load, allowed, unverified: explicit === key };
 }
 function useSave(att: Attachment, verified: boolean) {
@@ -88,9 +124,15 @@ function DownloadButton({ att, verified }: { att: Attachment; verified: boolean 
 function ImageAttachment({ att, verified }: { att: Attachment; verified: boolean }) {
   const t = useT();
   const [failed, setFailed] = useState(false);
-  const { url, failed: hashFailed, load, allowed, unverified } = useAttachmentUrl(att, verified);
+  const [ref, near] = useNearView<HTMLDivElement>();
+  const { url, failed: hashFailed, load, allowed, unverified } = useAttachmentUrl(att, verified, { active: near, budget: imageBudget });
   const box = att.width && att.height ? fitBox(att.width, att.height, MAX_W, MAX_H) : null;
-  if (hashFailed || !url) return <AttachmentState failed={hashFailed} untrusted={!allowed} onLoad={hashFailed || !allowed ? load : undefined} />;
+  return <div ref={ref} className="max-w-full">{body()}</div>;
+  function body() {
+  if (hashFailed) return <AttachmentState failed untrusted={!allowed} onLoad={load} />;
+  // Until it is loaded (or after it was released far off screen) the image keeps its box, so the chat does not shift.
+  if (!url) return allowed && box ? <div style={{ width: box.width, height: box.height }} className="flex max-w-full items-center justify-center rounded-lg bg-side"><AttachmentState failed={false} /></div>
+    : <AttachmentState failed={false} untrusted={!allowed} onLoad={!allowed ? load : undefined} />;
   if (failed) return <FileCard att={att} verified={verified} />;
   return (
     <>{unverified && <span className="text-xs text-warn">{t("file.loadedUnverified")}</span>}<button
@@ -114,11 +156,12 @@ function ImageAttachment({ att, verified }: { att: Attachment; verified: boolean
       />
     </button></>
   );
+  }
 }
 
 function VideoAttachment({ att, verified }: { att: Attachment; verified: boolean }) {
   const t = useT();
-  const { url, failed, load, allowed, unverified, open, requested } = useAttachmentUrl(att, verified, false);
+  const { url, failed, load, allowed, unverified, open, requested } = useAttachmentUrl(att, verified, { autoLoad: false });
   if (verified && !requested) return <Button size="sm" onClick={open}>{t("file.open", { name: att.name })}</Button>;
   if (failed || !url) return <AttachmentState failed={failed} untrusted={!allowed} onLoad={failed || !allowed ? load : undefined} />;
   const box = att.width && att.height ? fitBox(att.width, att.height, MAX_W, MAX_H) : null;
@@ -145,7 +188,7 @@ function VideoAttachment({ att, verified }: { att: Attachment; verified: boolean
 
 function AudioAttachment({ att, verified }: { att: Attachment; verified: boolean }) {
   const t = useT();
-  const { url, failed, load, allowed, unverified, open, requested } = useAttachmentUrl(att, verified, false);
+  const { url, failed, load, allowed, unverified, open, requested } = useAttachmentUrl(att, verified, { autoLoad: false });
   if (verified && !requested) return <Button size="sm" onClick={open}>{t("file.open", { name: att.name })}</Button>;
   if (failed || !url) return <AttachmentState failed={failed} untrusted={!allowed} onLoad={failed || !allowed ? load : undefined} />;
   return (

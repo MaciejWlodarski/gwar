@@ -50,12 +50,15 @@ export function imageDimensions(bytes: Uint8Array): [number, number] {
   throw new Error("Unsupported or malformed inline image");
 }
 /** Convert the bounded decoded first frame to a static PNG, including explicitly loaded unsigned images. */
-export async function boundedImageBlob(blob: Blob): Promise<Blob> {
+export async function boundedImageBlob(blob: Blob, beforeDecode?: (width: number, height: number) => Promise<void>): Promise<Blob> {
   if (!blob.type.startsWith("image/")) return blob;
-  checkImageDimensions(...imageDimensions(new Uint8Array(await blob.arrayBuffer())));
+  const [width, height] = imageDimensions(new Uint8Array(await blob.arrayBuffer()));
+  checkImageDimensions(width, height);
+  await beforeDecode?.(width, height);
   const bitmap = await createImageBitmap(blob);
   try {
     checkImageDimensions(bitmap.width, bitmap.height);
+    if (bitmap.width * bitmap.height > width * height) throw new Error("Image decodes larger than its header");
     const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
     const context = canvas.getContext("2d");
     if (!context) throw new Error("Image decoder unavailable");
