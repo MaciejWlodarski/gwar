@@ -29,6 +29,29 @@ For user units to keep running without a login session, enable lingering once:
 
 nginx terminates HTTPS (certbot) for both names.
 
+The production web build includes a CSP meta policy: local scripts, WASM for
+hash-wasm's Argon2, HTTPS/WSS connections, and bounded attachment blobs. Vite dev
+omits it for HMR and loopback smoke tests. The desktop uses `build:desktop` and
+its native CSP to permit IPC and explicitly selected LAN transports.
+
+Hosting must also set these HTTP headers. `frame-ancestors` is ignored in a
+meta policy; `nosniff`, Referrer-Policy and HSTS must be response headers. Put the
+following in `/etc/nginx/snippets/gwar-security-headers.conf` and include it in
+each static location that declares `add_header` (nginx header inheritance does
+not cross such locations):
+
+```nginx
+add_header Content-Security-Policy "frame-ancestors 'none'" always;
+add_header X-Content-Type-Options "nosniff" always;
+add_header Referrer-Policy "no-referrer" always;
+add_header Strict-Transport-Security "max-age=31536000" always;
+```
+
+Serve HTTPS only, redirect port 80 to HTTPS, and add `includeSubDomains` to HSTS
+only when every subdomain supports HTTPS. The header CSP combines with the
+meta policy; it does not replace it.
+
+
 `gwar.maciejwlodarski.com` sits behind Cloudflare, so the real client address
 comes from `CF-Connecting-IP`, trusted only from Cloudflare's ranges
 (`/etc/nginx/snippets/cloudflare-realip.conf`, generated from
@@ -39,6 +62,7 @@ comes from `CF-Connecting-IP`, trusted only from Cloudflare's ranges
 server {
     server_name gwar.maciejwlodarski.com;
     include snippets/cloudflare-realip.conf;
+    include snippets/gwar-security-headers.conf;
     root /var/www/gwar;
     index index.html;
 
@@ -50,10 +74,12 @@ server {
         proxy_set_header X-Forwarded-Proto https;
     }
     location /assets/ {
+        include snippets/gwar-security-headers.conf;
         add_header Cache-Control "public, max-age=31536000, immutable";
         try_files $uri =404;
     }
     location / {
+        include snippets/gwar-security-headers.conf;
         add_header Cache-Control "no-cache";
         try_files $uri /index.html;
     }
@@ -62,6 +88,7 @@ server {
 
 server {
     server_name voice.maciejwlodarski.com;
+    include snippets/gwar-security-headers.conf;
     client_max_body_size 30m;
 
     location / {
