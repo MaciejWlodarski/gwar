@@ -68,7 +68,7 @@ impl MemberRow {
 pub struct Removal {
     /// Deleted messages and the channels they were in.
     pub messages: Vec<(MessageId, ChannelId)>,
-    /// Files to remove from disk.
+    /// Files to remove from disk (then [`Store::forget_removed`]).
     pub files: Vec<FileId>,
 }
 
@@ -249,6 +249,14 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE tokens ADD COLUMN creator_uid TEXT;
     DELETE FROM tokens;
+    "#,
+    // A file whose row is deleted stays charged to its uploader until its bytes are gone from
+    // disk, so space that could not be freed is never handed out again.
+    r#"
+    CREATE TABLE removed_files (id TEXT PRIMARY KEY, uploader TEXT NOT NULL, size INTEGER NOT NULL);
+    CREATE TRIGGER files_removed AFTER DELETE ON files BEGIN
+        INSERT OR REPLACE INTO removed_files(id,uploader,size) VALUES(old.id, old.uploader, old.size);
+    END;
     "#,
 ];
 
@@ -689,6 +697,7 @@ impl Store {
             files: tx.execute("UPDATE files SET uploader=?2 WHERE uploader=?1", params![from, into])?,
             ..Default::default()
         };
+        tx.execute("UPDATE removed_files SET uploader=?2 WHERE uploader=?1", params![from, into])?;
         report.read_marks =
             tx.query_row("SELECT COUNT(*) FROM read_marks WHERE user_id=?1", [from_id], |r| r.get(0))?;
         tx.execute(
@@ -923,14 +932,33 @@ impl Store {
         Ok(())
     }
 
-    /// Bytes of stored uploads, all or `uploader`'s.
+    /// Bytes of stored uploads, all or `uploader`'s, including removed ones whose bytes may
+    /// still be on disk.
     pub fn stored_bytes(&self, uploader: Option<&str>) -> Result<u64> {
         let bytes: i64 = self.db.query_row(
-            "SELECT COALESCE(SUM(size),0) FROM files WHERE ?1 IS NULL OR uploader=?1",
+            "SELECT COALESCE((SELECT SUM(size) FROM files WHERE ?1 IS NULL OR uploader=?1),0)
+                  + COALESCE((SELECT SUM(size) FROM removed_files WHERE ?1 IS NULL OR uploader=?1),0)",
             [uploader],
             |r| r.get(0),
         )?;
         Ok(bytes.max(0) as u64)
+    }
+
+    /// Files whose rows are deleted but whose bytes were not yet seen gone.
+    pub fn removed_files(&self) -> Result<Vec<FileId>> {
+        let mut stmt = self.db.prepare("SELECT id FROM removed_files")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Stops charging removed files whose bytes are gone.
+    pub fn forget_removed(&self, ids: &[FileId]) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        for id in ids {
+            tx.execute("DELETE FROM removed_files WHERE id=?1", [id])?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// An uploaded file not yet attached to a message, if `uploader` owns it.
@@ -1552,5 +1580,29 @@ mod tests {
         assert_eq!(removal.files, vec!["attached".to_owned()]);
         assert!(store.message(theirs).unwrap().is_none() && store.message(mine).unwrap().is_some());
         assert!(store.file("other-file").unwrap().is_some());
+    }
+
+    #[test]
+    fn removed_files_stay_charged_until_forgotten() {
+        let store = Store::in_memory().unwrap();
+        let channel = store.insert_channel(None, "a", "", 0, None, None).unwrap();
+        let message = store.add_message(channel, "u", "n", "m", 1).unwrap();
+        for (id, uploader, size, created_at) in
+            [("kept", "u", 1, 100), ("old", "u", 2, 0), ("sent", "u", 4, 0), ("theirs", "v", 8, 0)]
+        {
+            store.insert_file(id, uploader, "f", "x", size, "h", None, created_at).unwrap();
+        }
+        store.attach_file("sent", message).unwrap();
+        assert_eq!(store.expire_unattached(50).unwrap().len(), 2);
+        assert_eq!(store.delete_message(message).unwrap(), vec!["sent".to_owned()]);
+        assert_eq!((store.stored_bytes(Some("u")).unwrap(), store.stored_bytes(None).unwrap()), (7, 15));
+        // A merge takes the charge along.
+        store.touch_user("u", "ku", "u", 0).unwrap();
+        store.touch_user("v", "kv", "v", 0).unwrap();
+        store.merge_members("v", "u", false).unwrap();
+        assert_eq!((store.stored_bytes(Some("u")).unwrap(), store.stored_bytes(Some("v")).unwrap()), (15, 0));
+        store.forget_removed(&["old".into(), "theirs".into()]).unwrap();
+        assert_eq!(store.stored_bytes(None).unwrap(), 5);
+        assert_eq!(store.removed_files().unwrap(), vec!["sent".to_owned()]);
     }
 }

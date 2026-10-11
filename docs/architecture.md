@@ -434,6 +434,9 @@ uploads count against the quotas until they finish; a started upload has ten
 minutes for its bytes and keeps its space until it is stored or given up (an
 error, a timeout, the client going away), which frees the space once its bytes
 are removed. A stored file's bytes are never removed by a late give-up.
+Deleted files (expired, their message or member removed) stay charged to their
+uploader until their bytes are gone from disk; a failed deletion is retried
+every ten minutes and after a restart.
 
 File responses use `Cache-Control: no-store` for media and other files. Without
 expiring download capabilities, even a short private cache can outlive removal;

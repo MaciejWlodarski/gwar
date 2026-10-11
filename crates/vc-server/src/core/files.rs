@@ -141,6 +141,18 @@ fn clean_name(name: &str) -> String {
     if cleaned.is_empty() { "file".to_owned() } else { cleaned }
 }
 
+/// Removes a file; true once it is gone (also if it never was there).
+fn unlink(path: &std::path::Path) -> bool {
+    match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            warn!("remove {}: {e}", path.display());
+            false
+        }
+    }
+}
+
 impl Core {
     pub(super) fn file_path(&self, id: &str) -> PathBuf {
         self.files_dir.join(id)
@@ -298,14 +310,7 @@ impl Core {
         let path = self.file_path(&id);
         let paths = [path.with_extension("part"), path];
         tokio::task::spawn_blocking(move || {
-            let removed = paths.iter().all(|path| match std::fs::remove_file(path) {
-                Ok(()) => true,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
-                Err(e) => {
-                    warn!("remove {}: {e}", path.display());
-                    false
-                }
-            });
+            let removed = paths.iter().all(|path| unlink(path));
             // The space is free once the bytes are gone, not before.
             let done = move |core: &mut Core| match removed {
                 true => drop(core.uploads.remove(&id)),
@@ -319,16 +324,33 @@ impl Core {
         });
     }
 
-    /// Deletes stored files from disk (off the actor).
-    pub(super) fn remove_files(&self, ids: Vec<String>) {
+    /// Deletes the bytes of removed files (off the actor). Each stays charged to its uploader
+    /// until its bytes are gone; what fails is tried again by the next tick.
+    pub(super) fn remove_files(&mut self) {
+        let ids = match self.store.removed_files() {
+            Ok(ids) => ids,
+            Err(e) => {
+                warn!("store: {e:#}");
+                return;
+            }
+        };
+        let Some(tx) = self.me.upgrade() else { return };
+        let ids: Vec<_> = ids.into_iter().filter(|id| self.removing.insert(id.clone())).collect();
         if ids.is_empty() {
             return;
         }
-        let paths: Vec<_> = ids.iter().map(|id| self.file_path(id)).collect();
+        let dir = self.files_dir.clone();
         tokio::task::spawn_blocking(move || {
-            for path in paths {
-                let _ = std::fs::remove_file(path);
-            }
+            let gone: Vec<_> = ids.iter().filter(|id| unlink(&dir.join(id))).cloned().collect();
+            let done = move |core: &mut Core| {
+                for id in &ids {
+                    core.removing.remove(id);
+                }
+                if let Err(e) = core.store.forget_removed(&gone) {
+                    warn!("store: {e:#}");
+                }
+            };
+            let _ = tx.blocking_send(CoreMsg::Resume(Box::new(done)));
         });
     }
 
@@ -344,9 +366,13 @@ impl Core {
         for id in stuck {
             self.remove_given_up(id);
         }
-        let mut gone = self.store.expire_unattached(now_ms() - UNATTACHED_KEEP_MS).unwrap_or_default();
-        gone.extend(self.store.expire_orphans().unwrap_or_default());
-        self.remove_files(gone);
+        if let Err(e) = self.store.expire_unattached(now_ms() - UNATTACHED_KEEP_MS) {
+            warn!("store: {e:#}");
+        }
+        if let Err(e) = self.store.expire_orphans() {
+            warn!("store: {e:#}");
+        }
+        self.remove_files();
         self.touch_online();
     }
 }
@@ -476,6 +502,46 @@ pub(crate) mod tests {
         on_core(&core, |core| core.tick()).await;
         assert!(released(&core, "f").await);
         assert!(!files.join("f.part").exists());
+    }
+
+    /// Bytes charged to "u" once no removal is running.
+    async fn charged(core: &CoreHandle) -> u64 {
+        for _ in 0..100 {
+            let idle = on_core(core, |core| core.removing.is_empty().then(|| core.store.stored_bytes(Some("u")))).await;
+            if let Some(bytes) = idle {
+                return bytes.unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the removal never finished");
+    }
+
+    /// A removed file's space is freed once its bytes are gone, and not before.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn removed_files_stay_charged_until_their_bytes_are_gone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let files = dir.path().join("files");
+        std::fs::create_dir(&files).unwrap();
+        std::fs::write(files.join("old"), "abc").unwrap();
+        let store = Store::in_memory().unwrap();
+        store.insert_file("old", "u", "f", "x", 3, "h", None, 0).unwrap();
+        std::fs::set_permissions(&files, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // (Root may delete there anyway; then only the freeing is tested.)
+        let stuck = std::fs::write(files.join("probe"), "").is_err();
+        let core = test_core_storing(store, None, files.clone(), 100);
+        on_core(&core, |core| core.tick()).await;
+        if stuck {
+            assert_eq!(charged(&core).await, 3, "freed while its bytes are still there");
+            assert!(files.join("old").exists());
+            on_core(&core, |core| core.tick()).await;
+            assert_eq!(charged(&core).await, 3);
+        }
+        std::fs::set_permissions(&files, std::fs::Permissions::from_mode(0o755)).unwrap();
+        on_core(&core, |core| core.tick()).await;
+        assert_eq!(charged(&core).await, 0);
+        assert!(!files.join("old").exists());
     }
 
     #[test]

@@ -271,7 +271,9 @@ impl Core {
         let tags = self.store.member_tags().map_err(storage_error)?;
         self.connect_pending.remove(&member.uid);
         let removal = self.store.remove_member(user_id, &member.uid, delete_messages).map_err(storage_error)?;
-        self.remove_files(removal.files);
+        if !removal.files.is_empty() {
+            self.remove_files();
+        }
         let mut readers: BTreeMap<ChannelId, BTreeSet<SessionId>> = BTreeMap::new();
         for (message, channel) in removal.messages {
             let readers = readers.entry(channel).or_insert_with(|| self.readers(channel));

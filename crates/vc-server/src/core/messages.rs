@@ -180,7 +180,9 @@ impl Core {
         stored.signature = Some(Box::new(signature));
         self.verify_message(session, &stored, true)?;
         self.store.save_message_body(&stored).map_err(storage_error)?;
-        self.remove_files(deleted_files);
+        if !deleted_files.is_empty() {
+            self.remove_files();
+        }
         stored.author = session;
         let readers = self.readers(channel);
         self.broadcast(Event::ChatEdited(stored.clone()), |s| readers.contains(&s.id));
@@ -202,8 +204,9 @@ impl Core {
                 "server removal requires message_manage; authors use a signed deletion revision",
             ));
         }
-        let files = self.store.delete_message(message).map_err(storage_error)?;
-        self.remove_files(files);
+        if !self.store.delete_message(message).map_err(storage_error)?.is_empty() {
+            self.remove_files();
+        }
         let readers = self.readers(channel);
         self.broadcast(Event::ChatDeleted { channel, message }, |s| readers.contains(&s.id));
         Ok(Response::Empty {})

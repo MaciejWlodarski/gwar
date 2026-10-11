@@ -19,7 +19,7 @@ use vc_proto::BanNotice;
 pub use passwords::{hash_secret, ts_wire_form, verify_secret};
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     net::IpAddr,
     path::PathBuf,
     sync::Arc,
@@ -244,6 +244,8 @@ pub struct Core {
     password: ServerPassword,
     files_dir: PathBuf,
     uploads: HashMap<String, files::PendingUpload>,
+    /// Removed files whose bytes are being deleted right now.
+    removing: HashSet<String>,
     /// Turns at slow work (password hashing) running off the actor.
     slow_work: Arc<tokio::sync::Semaphore>,
     /// Stored bytes allowed per member and in total; 0 means no limit.
@@ -414,6 +416,7 @@ impl Core {
             password: config.password,
             files_dir: config.files_dir,
             uploads: HashMap::new(),
+            removing: HashSet::new(),
             slow_work: Arc::new(tokio::sync::Semaphore::new(SLOW_WORK)),
             upload_quota: config.upload_quota,
             storage_limit: config.storage_limit,

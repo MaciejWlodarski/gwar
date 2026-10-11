@@ -108,13 +108,20 @@ fn remove_rows(store: &Store, files_dir: &Path, members: &[MemberRow], delete_me
     for row in members {
         // One member at a time, each in its own transaction.
         let removal = store.remove_member(row.id, &row.member.uid, delete_messages)?;
-        for file in removal.files {
-            match std::fs::remove_file(files_dir.join(&file)) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => tracing::warn!("remove file {file}: {e}"),
-            }
-        }
+        // A file that cannot be deleted now stays charged; the server tries again when it runs.
+        let gone: Vec<_> = removal
+            .files
+            .into_iter()
+            .filter(|file| match std::fs::remove_file(files_dir.join(file)) {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                Err(e) => {
+                    tracing::warn!("remove file {file}: {e}");
+                    false
+                }
+            })
+            .collect();
+        store.forget_removed(&gone)?;
     }
     Ok(())
 }
@@ -170,6 +177,34 @@ mod tests {
         assert_eq!(civil_date(0), "1970-01-01");
         assert_eq!(civil_date(951_782_400_000), "2000-02-29");
         assert_eq!(civil_date(1_760_000_000_000), "2025-10-09");
+    }
+
+    /// Files that cannot be deleted stay charged (for the server to retry); deleted ones do not.
+    #[cfg(unix)]
+    #[test]
+    fn removing_members_frees_only_the_files_that_are_gone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        for (uid, file, size) in [("u", "a", 3), ("v", "b", 5)] {
+            store.touch_user(uid, uid, uid, 0).unwrap();
+            store.insert_file(file, uid, "f", "x", size, "h", None, 0).unwrap();
+            std::fs::write(dir.path().join(file), "x").unwrap();
+        }
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        // (Root may delete there anyway.)
+        let stuck = std::fs::write(dir.path().join("probe"), "").is_err();
+        remove(&store, dir.path(), &["u".into()], false, false).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        remove(&store, dir.path(), &["v".into()], false, false).unwrap();
+        assert!(!dir.path().join("b").exists());
+        if stuck {
+            assert!(dir.path().join("a").exists());
+            assert_eq!(store.stored_bytes(None).unwrap(), 3);
+            assert_eq!(store.removed_files().unwrap(), vec!["a".to_owned()]);
+        } else {
+            assert_eq!(store.stored_bytes(None).unwrap(), 0);
+        }
     }
 
     #[test]
