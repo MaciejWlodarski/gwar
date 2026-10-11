@@ -23,7 +23,7 @@ fn now() -> i64 {
 async fn as_device(server: &TestServer, device: &SigningKey, cert: Value) -> Result<Client, vc_proto::ErrorBody> {
     Client::connect_with(server, device.clone(), move |raw, key| {
         let mut hello = raw.hello(key, "acct", None);
-        hello["device"] = cert;
+        set_certificate(&mut hello, cert, key);
         hello
     })
     .await
@@ -43,8 +43,8 @@ async fn devices_of_one_account_are_one_person_until_revoked() {
     let account = SigningKey::from_bytes(&rand::random());
     let laptop = SigningKey::from_bytes(&rand::random());
     let phone = SigningKey::from_bytes(&rand::random());
-    let year = 365 * 24 * 3600 * 1000;
-    let mut first = certificate(&account, &laptop, now(), now() + year);
+    let lifetime = 90 * 24 * 3600 * 1000;
+    let mut first = certificate(&account, &laptop, now(), now() + lifetime);
     first["name"] = json!("laptop");
     let blob = b64(&[0u8; 60]);
     let register = json!({
@@ -68,21 +68,22 @@ async fn devices_of_one_account_are_one_person_until_revoked() {
     ));
 
     // Both devices are the same member: the account's uid.
-    let laptop_client = as_device(&server, &laptop, certificate(&account, &laptop, now(), now() + year)).await.unwrap();
+    let laptop_client =
+        as_device(&server, &laptop, certificate(&account, &laptop, now(), now() + lifetime)).await.unwrap();
     let mut phone_client =
-        as_device(&server, &phone, certificate(&account, &phone, now(), now() + year)).await.unwrap();
+        as_device(&server, &phone, certificate(&account, &phone, now(), now() + lifetime)).await.unwrap();
     let account_uid = vc_server::identity::uid_for_key(account.verifying_key().as_bytes());
     assert_eq!(laptop_client.welcome.uid, account_uid);
     assert_eq!(phone_client.welcome.uid, account_uid);
 
     // Forged, expired or mismatched certificates are refused.
     let thief = SigningKey::from_bytes(&rand::random());
-    assert!(as_device(&server, &thief, certificate(&thief, &phone, now(), now() + year)).await.is_err());
-    assert!(as_device(&server, &phone, certificate(&account, &phone, now() - year - 2, now() - 1)).await.is_err());
-    assert!(as_device(&server, &thief, certificate(&account, &phone, now(), now() + year)).await.is_err());
+    assert!(as_device(&server, &thief, certificate(&thief, &phone, now(), now() + lifetime)).await.is_err());
+    assert!(as_device(&server, &phone, certificate(&account, &phone, now() - lifetime - 2, now() - 1)).await.is_err());
+    assert!(as_device(&server, &thief, certificate(&account, &phone, now(), now() + lifetime)).await.is_err());
 
     // The phone signed in on Connect too.
-    let mut phone_cert = certificate(&account, &phone, now(), now() + year);
+    let mut phone_cert = certificate(&account, &phone, now(), now() + lifetime);
     phone_cert["name"] = json!("phone");
     let login: Value = http
         .post(format!("{url}/v1/login"))
@@ -112,10 +113,12 @@ async fn devices_of_one_account_are_one_person_until_revoked() {
     assert_eq!(status.status(), 200);
     let gone = phone_client.expect_disconnect().await;
     assert_eq!(gone["kind"], "kicked");
-    let again = as_device(&server, &phone, certificate(&account, &phone, now(), now() + year)).await;
+    let again = as_device(&server, &phone, certificate(&account, &phone, now(), now() + lifetime)).await;
     assert_eq!(again.err().expect("revoked").code, vc_proto::ErrorCode::NotAuthenticated);
     // The laptop is unaffected.
-    as_device(&server, &laptop, certificate(&account, &laptop, now(), now() + year)).await.expect("laptop still in");
+    as_device(&server, &laptop, certificate(&account, &laptop, now(), now() + lifetime))
+        .await
+        .expect("laptop still in");
 }
 
 #[tokio::test]

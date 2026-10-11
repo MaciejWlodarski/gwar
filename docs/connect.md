@@ -107,7 +107,7 @@ All signatures are Ed25519 over the UTF-8 text, fields separated by `\n`:
 
 - **Device certificate**, by the account key:
   `gwar device v1\n{account_key}\n{device_key}\n{issued_at}\n{expires_at}`.
-  Certificates last at most 400 days. Whenever a client has the account key
+  Certificates last at most 90 days. Whenever a client has the account key
   (sign-up, log-in, recovery, password change, revocation), it certifies only
   the public key derived from the private device key it generated and holds.
   Each device renews its own certificate after entering the password. The
@@ -215,13 +215,47 @@ login and recovery are rate-limited per address and per handle.
 
 ## On Gwar servers
 
-`hello` gains an optional `device` field:
+The vc/3 `hello` has an optional `certificate` field:
 `{account_key, device_key, issued_at, expires_at, signature}`. With it,
-`public_key` must equal `device_key` and sign the host-bound challenge
-(`vc/1 hello\n{host}\n{nonce}\n{public_key}`, see architecture.md); the
-server checks the certificate (signature, validity, not revoked) and the uid
-comes from `account_key`. Without it nothing changes, so local identities keep
-working.
+`client_signing_pk` must equal `device_key`; the uid comes from `account_key`.
+The server checks the certificate's signature, current validity and revocation
+before sending its identity proof, and checks authorization again at join.
+Certificates last at most 90 days. Without a certificate, the local signing
+key remains the identity. Passwords and bearer invite codes are sent in `join`
+only after the client verifies the server proof; they are rejected in hello.
+
+All binary fields use strict canonical unpadded base64url. Public keys and
+nonces decode to exactly 32 bytes, signatures to 64, hashes to 32. Fields may
+not contain CR/LF; timestamps are unsigned decimal Unix milliseconds in the
+JavaScript safe-integer range. Statements are UTF-8 with **no trailing newline**.
+Both sides generate independent random 32-byte nonces for every connection.
+
+`certificate_hash` is literal `-` for a local identity, otherwise
+`b64url(SHA256(UTF8("gwar device v1\n{account_pk}\n{device_pk}\n{issued_at}\n{expires_at}\n{account_signature}")))`.
+Certificate wire fields are `account_key`, `device_key`, `issued_at`,
+`expires_at`, `signature`; the commitment includes that account signature.
+
+Client statement H, signed by `client_signing_pk`:
+
+```text
+gwar client hello v3
+{endpoint}
+{expected_server_pk}
+{server_nonce}
+{client_nonce}
+{client_signing_pk}
+{certificate_hash}
+```
+
+`hello_hash = b64url(SHA256(UTF8(H)))`. The server signs:
+
+```text
+gwar server proof v3
+{hello_hash}
+{client_signature}
+```
+
+`client_signature` is the exact canonical `hello.signature` value.
 
 Servers fetch `GET {connect}/v1/revocations?since=…` every five minutes
 (`--connect-url`, default the official service; `--no-connect` turns it off),

@@ -7,25 +7,4 @@ export type Hello = { protocol: number,
  * The identity's own nickname. Used only when this identity joins the
  * server for the first time; afterwards the member's stored nickname wins.
  */
-nickname: string, 
-/**
- * Base64url (no padding) Ed25519 public key.
- */
-public_key: string, 
-/**
- * Normalized authority of the URL the client dialed.
- */
-host: string, 
-/**
- * Base64url signature over `challenge_message(host, nonce, public_key)`.
- */
-signature: string, server_password: string | null, 
-/**
- * Invite code: admits without the server password and may grant a group.
- */
-invite?: string | null, 
-/**
- * A Gwar Connect device certificate: `public_key` is then a device key
- * and the identity (uid) comes from the certificate's account key.
- */
-device?: DeviceCertificate | null, client: ClientSoftware, };
+nickname: string, endpoint: string, expected_server_pk: string, server_nonce: string, client_nonce: string, client_signing_pk: string, certificate_hash: string, signature: string, certificate?: DeviceCertificate | null, client: ClientSoftware, };

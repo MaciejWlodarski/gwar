@@ -1,14 +1,13 @@
+import { normalizeEndpoint } from "./handshake";
 import { describe, expect, it } from "vitest";
-import hostVectors from "../../../../crates/vc-proto/tests/host-normalization.json";
+import endpointVectors from "../../../../crates/vc-proto/tests/endpoint-normalization.json";
 import { generateKeyPair, certifyDevice } from "../connect/crypto";
 import { decodeBase64Url } from "./base64url";
 import {
   accountKeyOf,
-  challengeMessage,
   identityFromConnect,
   loadActiveIdentity,
   loadConnectRecord,
-  normalizeHost,
   type ConnectRecord,
   type ConnectStore,
   type IdentityBackup,
@@ -42,13 +41,13 @@ async function record(): Promise<ConnectRecord> {
   };
 }
 
-describe("host normalization", () => {
-  it.each(hostVectors.valid)("normalizes %s to %s (shared Rust vectors)", (input, expected) => {
-    expect(normalizeHost(input!)).toBe(expected);
+describe("endpoint normalization", () => {
+  it.each(endpointVectors.valid)("normalizes %s to %s (shared Rust vectors)", (input, expected) => {
+    expect(normalizeEndpoint(input!)).toBe(expected);
   });
 
-  it.each(hostVectors.invalid)("rejects %s (shared Rust vectors)", (input) => {
-    expect(() => normalizeHost(input)).toThrow();
+  it.each(endpointVectors.invalid)("rejects %s (shared Rust vectors)", (input) => {
+    expect(() => normalizeEndpoint(input)).toThrow();
   });
 });
 
@@ -85,7 +84,7 @@ describe("identity switching", () => {
   it("a Connect identity signs the hello challenge with the device key and has no portable backup", async () => {
     const rec = await record();
     const id = await identityFromConnect(rec);
-    const msg = challengeMessage("test", "nonce", id.publicKey);
+    const msg = new TextEncoder().encode("gwar client hello v3\ntest bytes");
     const pub = await crypto.subtle.importKey("raw", decodeBase64Url(rec.certificate.device_key) as BufferSource, { name: "Ed25519" }, false, ["verify"]);
     const ok = await crypto.subtle.verify({ name: "Ed25519" }, pub, decodeBase64Url(await id.sign(msg)) as BufferSource, msg as BufferSource);
     expect(ok).toBe(true);

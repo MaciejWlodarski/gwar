@@ -830,7 +830,7 @@ export function InvitesPanel() {
   const defs = useSession((s) => s.groups);
   const mine = useSession((s) => s.permissions);
   const address = useSession((s) => s.address);
-  const httpOrigin = useSession((s) => s.httpOrigin);
+
   const [invites, setInvites] = useState<Invite[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [uses, setUses] = useState("inf");
@@ -854,7 +854,7 @@ export function InvitesPanel() {
   }, []);
 
   const link = (code: string) =>
-    buildInviteLink({ webOrigin: webOrigin(), serverOrigin: httpOrigin ?? webOrigin(), code });
+    buildInviteLink({ webOrigin: webOrigin(), serverEndpoint: useSession.getState().endpoint!, serverKey: useSession.getState().serverKey!, code });
 
   const create = async (e?: FormEvent) => {
     e?.preventDefault();

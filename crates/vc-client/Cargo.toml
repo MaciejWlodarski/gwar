@@ -1,12 +1,13 @@
 [package]
 name = "vc-client"
 version = "0.1.0"
-description = "Native client for the vc/1 protocol (used by the desktop app)"
+description = "Native client for the vc/3 protocol (used by the desktop app)"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
+url = "2"
 vc-proto = { path = "../vc-proto" }
 anyhow.workspace = true
 base64 = "0.22"

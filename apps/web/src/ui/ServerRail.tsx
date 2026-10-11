@@ -28,7 +28,7 @@ export function ServerRail() {
       return;
     }
     setDrawer(false);
-    void controller.connectInteractive({ kind: b.kind, address: b.address, password: b.password, identity: b.identity }, { remember: false });
+    void controller.connectInteractive({ kind: b.kind, address: b.address, password: b.password, identity: b.identity, insecureLan: b.insecureLan }, { remember: false });
   };
 
   return (

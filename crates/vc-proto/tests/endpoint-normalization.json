@@ -1,0 +1,67 @@
+{
+  "valid": [
+    [
+      "wss://Voice.Example.COM.:443/ws",
+      "wss://voice.example.com/ws"
+    ],
+    [
+      "ws://Example.COM.:80/ws",
+      "ws://example.com/ws"
+    ],
+    [
+      "wss://example.com:8443/ws",
+      "wss://example.com:8443/ws"
+    ],
+    [
+      "ws://127.0.0.1:8790/ws",
+      "ws://127.0.0.1:8790/ws"
+    ],
+    [
+      "wss://[2001:0DB8:0:0::1]:443/ws",
+      "wss://[2001:db8::1]/ws"
+    ],
+    [
+      "ws://[::1]:80/path",
+      "ws://[::1]/path"
+    ],
+    [
+      "WSS://BÜCHER.example/ws",
+      "wss://xn--bcher-kva.example/ws"
+    ],
+    [
+      "wss://example.com/a/../ws",
+      "wss://example.com/ws"
+    ],
+    [
+      "wss://example.com",
+      "wss://example.com/"
+    ],
+    [
+      "wss://example.com/ws/",
+      "wss://example.com/ws/"
+    ],
+    [
+      "wss://example.com/w%73",
+      "wss://example.com/w%73"
+    ]
+  ],
+  "invalid": [
+    "",
+    "example.com",
+    "https://example.com/ws",
+    "ftp://example.com/ws",
+    "wss://user@example.com/ws",
+    "wss://@example.com/ws",
+    "wss://user:pass@example.com/ws",
+    "wss://example.com/ws?",
+    "wss://example.com/ws?x=1",
+    "wss://example.com/ws#",
+    "wss://example.com/ws#x",
+    "wss://example.com:0/ws",
+    "wss://example.com:65536/ws",
+    "wss://example.com/\\ws",
+    "wss://example.com/\nws",
+    " wss://example.com/ws",
+    "wss://example.com/ws "
+  ]
+}

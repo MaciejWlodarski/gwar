@@ -23,6 +23,11 @@ async fn main() -> anyhow::Result<()> {
     let mut connected = connect(ConnectOptions {
         url: url.clone(),
         nickname: nickname.clone(),
+        invite: None,
+        certificate: None,
+        expected_server_key: None,
+        trust_on_first_use: true,
+        insecure_lan: false,
         server_password: None,
         identity: Identity::generate(),
         software: ClientSoftware { name: "peer".into(), version: "0".into(), platform: Platform::Desktop },

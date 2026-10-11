@@ -139,6 +139,16 @@ export const pl: Record<Key, string> = {
   "identity.imported": "Zaimportowano tożsamość. Połącz się ponownie, aby jej użyć.",
   "identity.importFailed": "To nie jest prawidłowa kopia zapasowa tożsamości.",
 
+  "security.fingerprint": "Odcisk klucza serwera",
+  "security.changedTitle": "Tożsamość serwera się zmieniła",
+  "security.changedBody": "Tożsamość tego serwera się zmieniła. Może to oznaczać inny serwer lub atak. Przed zaufaniem nowemu kluczowi sprawdź odcisk u właściciela serwera.",
+  "security.inviteMismatch": "Klucz serwera nie pasuje do zaproszenia. Połączenie jest zablokowane. Uzyskaj zaufane zaproszenie od właściciela serwera.",
+  "security.oldKey": "Oczekiwany klucz",
+  "security.newKey": "Przedstawiony klucz",
+  "security.trustDanger": "Niebezpieczne: zapomnij stary klucz i zaufaj nowemu",
+  "security.insecureLan": "Niezabezpieczone połączenie (LAN)",
+  "security.insecureWarning": "To połączenie nie jest szyfrowane: każdy w sieci może podszyć się pod serwer lub przejąć Twoją sesję",
+
   "server.menu": "Menu serwera",
   "server.reconnecting": "Łączenie ponownie…",
   "server.settings": "Ustawienia serwera",
@@ -298,6 +308,7 @@ export const pl: Record<Key, string> = {
   "err.addr.invalid": "Ten adres serwera wygląda niepoprawnie.",
   "err.addr.scheme": "Obsługiwane są tylko adresy ws://, wss://, http:// i https://.",
   "err.addr.mixed_content": "Ten serwer nie używa HTTPS, więc aplikacja webowa nie może się z nim połączyć. Poproś jego właściciela o włączenie HTTPS albo użyj aplikacji desktopowej.",
+  "err.addr.insecure": "Wymagany jest TLS. W aplikacji komputerowej możesz włączyć opcję „Niezabezpieczone połączenie (LAN)” dla tego serwera.",
   "err.connect.unreachableHttps": "Nie można połączyć się z serwerem. Sprawdź adres i czy serwer działa. Aplikacja webowa łączy się tylko z serwerami z HTTPS; jeśli ten go nie ma, poproś właściciela o włączenie go albo użyj aplikacji desktopowej.",
 
   "err.req.bad_request": "Serwer nie przyjął tego żądania",

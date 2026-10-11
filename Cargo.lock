@@ -6905,6 +6905,7 @@ dependencies = [
  "tsclientlib",
  "tsproto-packets",
  "tsproto-types",
+ "url",
  "vc-proto",
  "vc-server",
 ]
@@ -6937,8 +6938,10 @@ dependencies = [
 name = "vc-proto"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "serde",
  "serde_json",
+ "sha2",
  "ts-rs",
  "url",
 ]

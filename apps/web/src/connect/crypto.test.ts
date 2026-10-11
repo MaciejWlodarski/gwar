@@ -121,7 +121,7 @@ describe("verifying certificates", () => {
 
   it("accepts what the account key signed and rejects any change", async () => {
     const account = await keyFromSeed(fill(32, 1));
-    const cert = await certifyDevice(account, DEVICE_KEY, 1_000, 1_000 + 365 * DAY);
+    const cert = await certifyDevice(account, DEVICE_KEY, 1_000, 1_000 + 90 * DAY);
     expect(await verifyDeviceCertificate(ACCOUNT_KEY, cert)).toBe(true);
     expect(await verifyDeviceCertificate(ACCOUNT_KEY, { ...cert, expires_at: cert.expires_at + 1 })).toBe(false);
     expect(await verifyDeviceCertificate(ACCOUNT_KEY, { ...cert, device_key: ACCOUNT_KEY })).toBe(false);
@@ -130,8 +130,8 @@ describe("verifying certificates", () => {
 
   it("rejects lifetimes servers refuse, even when signed", async () => {
     const account = await keyFromSeed(fill(32, 1));
-    expect(await verifyDeviceCertificate(ACCOUNT_KEY, await certifyDevice(account, DEVICE_KEY, 1_000, 1_000 + 400 * DAY))).toBe(true);
-    expect(await verifyDeviceCertificate(ACCOUNT_KEY, await certifyDevice(account, DEVICE_KEY, 1_000, 1_000 + 401 * DAY))).toBe(false);
+    expect(await verifyDeviceCertificate(ACCOUNT_KEY, await certifyDevice(account, DEVICE_KEY, 1_000, 1_000 + 90 * DAY))).toBe(true);
+    expect(await verifyDeviceCertificate(ACCOUNT_KEY, await certifyDevice(account, DEVICE_KEY, 1_000, 1_000 + 91 * DAY))).toBe(false);
     expect(await verifyDeviceCertificate(ACCOUNT_KEY, await certifyDevice(account, DEVICE_KEY, 1_000, 1_000))).toBe(false);
   });
 

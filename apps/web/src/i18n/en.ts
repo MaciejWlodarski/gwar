@@ -137,6 +137,16 @@ export const en = {
   "identity.imported": "Identity imported. Reconnect to use it.",
   "identity.importFailed": "That file is not a valid identity backup.",
 
+  "security.fingerprint": "Server key fingerprint",
+  "security.changedTitle": "Server identity changed",
+  "security.changedBody": "This server’s identity changed. This can mean a different server or an attack. Check the fingerprint with the server owner before trusting the new key.",
+  "security.inviteMismatch": "The server key does not match this invite. The connection is blocked. Obtain a trusted invite from the server owner.",
+  "security.oldKey": "Expected key",
+  "security.newKey": "Presented key",
+  "security.trustDanger": "Dangerous: forget old pin and trust new key",
+  "security.insecureLan": "Insecure connection (LAN)",
+  "security.insecureWarning": "This connection can be impersonated or taken over: anyone on the network can impersonate the server or take over your session",
+
   "server.menu": "Server menu",
   "server.reconnecting": "Reconnecting…",
   "server.settings": "Server settings",
@@ -296,6 +306,7 @@ export const en = {
   "err.addr.invalid": "That server address doesn't look right.",
   "err.addr.scheme": "Only ws://, wss://, http:// and https:// addresses are supported.",
   "err.addr.mixed_content": "This server doesn't use HTTPS, so the web app can't connect to it. Ask its owner to enable HTTPS, or use the desktop app.",
+  "err.addr.insecure": "TLS is required. In the desktop app you can explicitly enable Insecure connection (LAN) for this server.",
   "err.connect.unreachableHttps": "Can't reach the server. Check the address and that the server is running. The web app can only connect to servers that use HTTPS; if this one doesn't, ask its owner to enable it, or use the desktop app.",
 
   "err.req.bad_request": "The server didn't accept that",

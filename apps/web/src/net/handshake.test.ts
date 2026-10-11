@@ -1,0 +1,206 @@
+import vectors from "../../../../crates/vc-proto/tests/handshake-v3.json";
+import { ed25519 } from "@noble/curves/ed25519.js";
+import { encodeBase64Url } from "./base64url";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { Connection, type ConnectionOptions } from "./connection";
+import { generateIdentity } from "./identity";
+import { decodeFixed, helloStatement, proofStatement, verifyProof } from "./handshake";
+import { serverPins, checkCandidate, ServerIdentityChanged } from "./server-pins";
+import { FakeSocket, fakeIdentity, testServerIdentity, challenge, finishHandshake, memoryPins } from "./testing";
+import type { Hello } from "../proto/Hello";
+
+beforeEach(() => { FakeSocket.reset(); });
+function make(extra: Partial<ConnectionOptions> = {}) {
+  return new Connection({ url: "wss://server.example/ws", identity: fakeIdentity, nickname: "test",
+    client: { name: "test", version: "0", platform: "web" }, createSocket: (url) => new FakeSocket(url),
+    pinStore: memoryPins(), ...extra });
+}
+async function begin(conn: Connection) {
+  const result = conn.connect(); result.catch(() => {});
+  const socket = FakeSocket.last(); socket.open(); socket.push(challenge());
+  await vi.waitFor(() => expect(socket.sent).toHaveLength(1));
+  return { socket, result };
+}
+
+describe("vc/3 pins and secrets", () => {
+  it("pins first use only after proof, reuses a match and keeps first_seen", async () => {
+    const pins = memoryPins();
+    const first = make({ pinStore: pins, serverPassword: "secret" });
+    const { socket, result } = await begin(first);
+    expect(pins.pins.size).toBe(0);
+    expect(socket.sent[0]!.d).not.toHaveProperty("server_password");
+    expect(socket.sent[0]!.d).not.toHaveProperty("invite");
+    await expect(first.request("ping", {})).rejects.toThrow();
+    await finishHandshake(socket); await result;
+    const pin = pins.load(first.endpoint)!;
+    expect(pin.server_pk).toBe(first.serverKey);
+    first.close();
+    const second = make({ pinStore: pins });
+    const next = await begin(second); await finishHandshake(next.socket); await next.result;
+    expect(pins.load(second.endpoint)).toBe(pin);
+    second.close();
+  });
+
+  it("blocks a pin mismatch before signing and sends nothing afterwards", async () => {
+    const pins = memoryPins(); const other = await generateIdentity();
+    pins.commit("wss://server.example/ws", other.publicKey);
+    const sign = vi.fn(fakeIdentity.sign);
+    const conn = make({ pinStore: pins, identity: { ...fakeIdentity, sign }, serverPassword: "secret", invite: "CODE" });
+    const result = conn.connect(); const socket = FakeSocket.last(); socket.open(); socket.push(challenge());
+    await expect(result).rejects.toMatchObject({ kind: "server_identity", identityChange: { source: "pin" } });
+    expect(sign).not.toHaveBeenCalled(); expect(socket.sent).toHaveLength(0); expect(socket.readyState).toBe(3);
+    socket.push(challenge()); expect(socket.sent).toHaveLength(0);
+    expect(pins.load(conn.endpoint)?.server_pk).toBe(other.publicKey);
+  });
+
+  it("invite fingerprint overrides first-contact TOFU before signing", async () => {
+    const other = await generateIdentity(); const pins = memoryPins(); const sign = vi.fn(fakeIdentity.sign);
+    const conn = make({ pinStore: pins, identity: { ...fakeIdentity, sign }, invite: "CODE", inviteServerKey: other.publicKey });
+    const result = conn.connect(); const socket = FakeSocket.last(); socket.open(); socket.push(challenge());
+    await expect(result).rejects.toMatchObject({ kind: "server_identity", identityChange: { source: "invite" } });
+    expect(sign).not.toHaveBeenCalled(); expect(socket.sent).toHaveLength(0); expect(pins.pins.size).toBe(0);
+    const good = make({ pinStore: pins, invite: "CODE", inviteServerKey: testServerIdentity.publicKey });
+    const next = await begin(good); await finishHandshake(next.socket); await next.result;
+    expect(next.socket.sent[1]).toMatchObject({ op: "join", d: { invite: "CODE" } }); good.close();
+  });
+
+  it.each(["missing", "wrong", "changed transcript"])("%s proof is fatal: no pin, join, password or application command", async (mode) => {
+    const pins = memoryPins(); const conn = make({ pinStore: pins, serverPassword: "secret", invite: "CODE" });
+    const { socket, result } = await begin(conn);
+    const hello = structuredClone(socket.sent[0]!.d) as Hello;
+    let proof: unknown = {};
+    if (mode !== "missing") {
+      if (mode === "changed transcript") hello.endpoint = "wss://attacker.example/ws";
+      const signer = mode === "wrong" ? await generateIdentity() : testServerIdentity;
+      proof = { server_proof: await signer.sign(new TextEncoder().encode(await proofStatement(hello))) };
+    }
+    socket.push({ re: 1, ok: proof });
+    await expect(result).rejects.toMatchObject({ kind: "protocol" });
+    expect(socket.sent).toHaveLength(1); expect(pins.pins.size).toBe(0); expect(conn.serverKey).toBeNull();
+    await expect(conn.request("ping", {})).rejects.toThrow();
+  });
+
+  it.each(["timeout", "closed"])("a %s before server proof is fatal", async (mode) => {
+    const pins = memoryPins(); const conn = make({ pinStore: pins, handshakeTimeoutMs: 500, serverPassword: "secret" });
+    const { socket, result } = await begin(conn);
+    if (mode === "closed") socket.drop();
+    await expect(result).rejects.toMatchObject({ kind: "protocol", message: "missing server proof" });
+    expect(conn.status).toMatchObject({ state: "closed", reason: { kind: "error", error: { kind: "protocol" } } });
+    expect(socket.sent).toHaveLength(1); expect(pins.pins.size).toBe(0);
+  });
+
+  it("rejects weak or invalid server keys before signing", async () => {
+    for (const bytes of [new Uint8Array(32), Uint8Array.from([1, ...new Array(31).fill(0)]), new Uint8Array(32).fill(255)]) {
+      const sign = vi.fn(fakeIdentity.sign); const conn = make({ identity: { ...fakeIdentity, sign } });
+      const result = conn.connect(); const socket = FakeSocket.last(); socket.open();
+      const frame = challenge(); frame.d.server_pk = encodeBase64Url(bytes); socket.push(frame);
+      await expect(result).rejects.toMatchObject({ kind: "protocol" });
+      expect(sign).not.toHaveBeenCalled(); expect(socket.sent).toHaveLength(0);
+    }
+  });
+
+  it("rejects weak signature points independently of WebCrypto", async () => {
+    const h = structuredClone(vectors[0]!.hello) as Hello;
+    const identity = Uint8Array.from([1, ...new Array(31).fill(0)]);
+    const signature = Uint8Array.from([...identity, ...new Array(32).fill(0)]);
+    h.expected_server_pk = encodeBase64Url(identity);
+    const acceptsEverything = vi.spyOn(crypto.subtle, "verify").mockResolvedValue(true);
+    try {
+      await expect(verifyProof(h, { server_proof: encodeBase64Url(signature) })).rejects.toThrow();
+      h.expected_server_pk = testServerIdentity.publicKey;
+      // A mathematically valid signature with R = identity is still forbidden by strict vc/3.
+      const secret = new Uint8Array(32).fill(3);
+      h.expected_server_pk = encodeBase64Url(ed25519.getPublicKey(secret));
+      const message = new TextEncoder().encode(await proofStatement(h));
+      const input = Uint8Array.from([...identity, ...decodeFixed(h.expected_server_pk, 32), ...message]);
+      const digest = new Uint8Array(await crypto.subtle.digest("SHA-512", input));
+      const littleEndian = (bytes: Uint8Array) => bytes.reduceRight((n, byte) => (n << 8n) | BigInt(byte), 0n);
+      let s = littleEndian(digest) * ed25519.utils.getExtendedPublicKey(secret).scalar % ed25519.Point.CURVE().n;
+      for (let i = 32; i < 64; i++) { signature[i] = Number(s & 255n); s >>= 8n; }
+      expect(ed25519.verify(signature, message, decodeFixed(h.expected_server_pk, 32), { zip215: false })).toBe(true);
+      await expect(verifyProof(h, { server_proof: encodeBase64Url(signature) })).rejects.toThrow();
+    } finally { acceptsEverything.mockRestore(); }
+  });
+
+  it("rejects a malformed challenge without signing or sending secrets", async () => {
+    const sign = vi.fn(fakeIdentity.sign);
+    const conn = make({ identity: { ...fakeIdentity, sign }, serverPassword: "secret" });
+    const result = conn.connect(); const socket = FakeSocket.last(); socket.open();
+    socket.push({ ev: "challenge", d: null });
+    await expect(result).rejects.toMatchObject({ kind: "protocol" });
+    expect(sign).not.toHaveBeenCalled(); expect(socket.sent).toHaveLength(0);
+  });
+
+  it("verifies proof before sending join or password", async () => {
+    const conn = make({ serverPassword: "secret" });
+    const { socket, result } = await begin(conn);
+    expect(socket.sent.map((f) => f.op)).toEqual(["hello"]);
+    const h = socket.sent[0]!.d as Hello;
+    const server_proof = await testServerIdentity.sign(new TextEncoder().encode(await proofStatement(h)));
+    socket.push({ re: 1, ok: { server_proof } });
+    await vi.waitFor(() => expect(socket.sent[1]).toMatchObject({ op: "join", d: { server_password: "secret" } }));
+    socket.push({ re: 2, ok: (await import("./testing")).welcome() }); await result; conn.close();
+  });
+
+  it("does not sign or commit a pin after the connection is closed during async crypto", async () => {
+    const pins = memoryPins(); let resolve!: (value: string) => void;
+    const sign = vi.fn(() => new Promise<string>((r) => { resolve = r; }));
+    const conn = make({ pinStore: pins, identity: { ...fakeIdentity, sign } });
+    const result = conn.connect(); result.catch(() => {}); const socket = FakeSocket.last(); socket.open(); socket.push(challenge());
+    await vi.waitFor(() => expect(sign).toHaveBeenCalled()); conn.close();
+    resolve("A".repeat(86)); await expect(result).rejects.toThrow();
+    await new Promise((r) => setTimeout(r, 10)); expect(socket.sent).toHaveLength(0); expect(pins.pins.size).toBe(0);
+  });
+});
+
+describe("vc/3 transport", () => {
+  it("blocks non-loopback plaintext without a desktop per-server toggle before opening a socket", async () => {
+    for (const platform of ["web", "desktop"] as const) {
+      const conn = make({ url: "ws://192.168.1.2:8790/ws", client: { name: "test", version: "0", platform } });
+      await expect(conn.connect()).rejects.toMatchObject({ kind: "insecure_transport" });
+      expect(FakeSocket.instances).toHaveLength(0);
+    }
+    await expect(make({ url: "ws://192.168.1.2/ws", insecureLan: true }).connect()).rejects.toMatchObject({ kind: "insecure_transport" });
+  });
+  it.each(["ws://127.0.0.1:8790/ws", "ws://localhost:8790/ws", "ws://[::1]:8790/ws"])("permits loopback %s", async (url) => {
+    const conn = make({ url }); const { socket, result } = await begin(conn); await finishHandshake(socket); await result; conn.close();
+  });
+  it("permits a desktop LAN connection only with the per-server opt-in", async () => {
+    const conn = make({ url: "ws://192.168.1.2:8790/ws", insecureLan: true, client: { name: "test", version: "0", platform: "desktop" } });
+    const { socket, result } = await begin(conn); await finishHandshake(socket); await result; conn.close();
+  });
+});
+
+describe("persistent pins and canonical fields", () => {
+  it("persists canonical endpoint, key and first-seen time and requires an explicit forget", () => {
+    const values = new Map<string, string>();
+    vi.stubGlobal("localStorage", { getItem: (k: string) => values.get(k) ?? null, setItem: (k: string, v: string) => values.set(k, v), removeItem: (k: string) => values.delete(k) });
+    try {
+      serverPins.commit("wss://SERVER.example.:443/ws", testServerIdentity.publicKey);
+      const pin = serverPins.load("wss://server.example/ws")!;
+      expect(pin.server_pk).toBe(testServerIdentity.publicKey); expect(pin.first_seen).toBeGreaterThan(0);
+      serverPins.commit("wss://server.example/ws", testServerIdentity.publicKey);
+      expect(serverPins.load("wss://server.example/ws")).toEqual(pin);
+      expect(() => checkCandidate("wss://server.example/ws", fakeIdentity.publicKey, serverPins)).toThrow(ServerIdentityChanged);
+      serverPins.forget("wss://server.example/ws", fakeIdentity.publicKey); expect(serverPins.load("wss://server.example/ws")).toEqual(pin);
+      serverPins.forget("wss://server.example/ws", testServerIdentity.publicKey); expect(serverPins.load("wss://server.example/ws")).toBeUndefined();
+    } finally { vi.unstubAllGlobals(); }
+  });
+  it.each(["A".repeat(43) + "=", "A".repeat(42) + "B", "bad\nkey", "AA"])("rejects noncanonical encodings: %s", (value) => expect(() => decodeFixed(value, 32)).toThrow());
+  it("has exact statement bytes with no trailing newline", () => {
+    const key = "A".repeat(43); const h = { endpoint: "wss://server.example/ws", expected_server_pk: key, server_nonce: key, client_nonce: key, client_signing_pk: key, certificate_hash: "-" };
+    expect(helloStatement(h)).toBe(`gwar client hello v3\nwss://server.example/ws\n${key}\n${key}\n${key}\n${key}\n-`);
+  });
+});
+
+describe("shared vc/3 wire vectors", () => {
+  it.each(vectors)("matches Rust H, certificate commitment, hello hash and proof", async (v) => {
+    const h = v.hello as Hello;
+    expect(helloStatement(h)).toBe(v.statement);
+    expect(await (await import("./handshake")).hashStatement(v.statement)).toBe(v.hello_hash);
+    expect(await proofStatement(h)).toBe(v.proof_statement);
+    await expect(verifyProof(h, { server_proof: v.server_proof })).resolves.toBeUndefined();
+    const key = await crypto.subtle.importKey("raw", decodeFixed(h.client_signing_pk, 32) as BufferSource, "Ed25519", false, ["verify"]);
+    expect(await crypto.subtle.verify("Ed25519", key, decodeFixed(h.signature, 64) as BufferSource, new TextEncoder().encode(v.statement))).toBe(true);
+  });
+});

@@ -1,33 +1,4 @@
-/**
- * Turns whatever a person types into the WebSocket URL of a vc/1 server.
- *
- * Rules (first match wins):
- *  1. Explicit scheme: `ws://`/`wss://` are used as typed; `http://`/`https://`
- *     map to `ws://`/`wss://`. Anything else (ftp:, javascript: ...) is rejected.
- *  2. No scheme: the connection is `wss` when the page itself is served over
- *     https (browsers block `ws://` from secure pages, "mixed content"),
- *     otherwise `ws`. The exception is a loopback host (localhost, 127.0.0.1)
- *     on an https page: browsers allow plain `ws://` there, so a server run
- *     on the same machine stays reachable from the hosted web app.
- *     The desktop app (a `tauri:` page, or `http://tauri.localhost` on
- *     Windows) has no mixed-content rule, so it decides by the host: a public
- *     domain name is `wss` (servers on a domain run TLS, `--domain` or a
- *     reverse proxy), while an IP address, localhost or a local name
- *     (no dot, `.local`, `.lan`, `.home.arpa`, `.internal`) is plain `ws`,
- *     and so is any host on the server's plain default port 8790.
- *  3. Port: an explicit port always wins. A bare host without a port gets the
- *     server default 8790 when the connection is plain `ws` (dev / LAN use,
- *     where the server is run directly), and no port (=> 443) when it is
- *     `wss`, because a TLS deployment sits behind a reverse proxy. The one
- *     exception is the page's own host: typing the host this page came from
- *     reuses the page's port, so "same server as the web client" just works.
- *  4. Path: empty or `/` becomes `/ws`; any other explicit path is kept.
- *  5. IPv6: `[::1]:8790` or a bare `::1` / `fe80::1` (several colons, no
- *     brackets) is accepted and bracketed in the URL.
- *  6. `ws://` to a non-loopback host from an https page is rejected as mixed
- *     content, with a dedicated error so the UI can explain that the server
- *     needs HTTPS (or that the desktop app can be used instead).
- */
+/** TLS by default; plaintext LAN connections require an explicit desktop opt-in. */
 export const DEFAULT_PORT = 8790;
 export const DEFAULT_PATH = "/ws";
 
@@ -37,7 +8,7 @@ export interface PageContext {
   port: string; // "" when default
 }
 
-export type AddressError = "empty" | "invalid" | "scheme" | "mixed_content";
+export type AddressError = "empty" | "invalid" | "scheme" | "mixed_content" | "insecure";
 
 export interface ParsedAddress {
   /** Full URL to open, e.g. `wss://voice.example.com/ws`. */
@@ -49,7 +20,10 @@ export interface ParsedAddress {
 
 export type ParseResult = { ok: true; value: ParsedAddress } | { ok: false; error: AddressError };
 
-const LOOPBACK = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+export function isLoopbackHost(host: string): boolean {
+  host = host.toLowerCase().replace(/\.+$/, "");
+  return host === "localhost" || host === "[::1]" || host === "::1" || (/^127(?:\.\d{1,3}){3}$/.test(host) && host.split(".").every((part) => Number(part) <= 255));
+}
 
 export function pageContextFromLocation(loc: Pick<Location, "protocol" | "hostname" | "port"> = window.location): PageContext {
   return { protocol: loc.protocol, hostname: loc.hostname, port: loc.port };
@@ -67,21 +41,11 @@ function isAppPage(page: PageContext): boolean {
   return (page.protocol !== "http:" && page.protocol !== "https:") || page.hostname === "tauri.localhost";
 }
 
-const LOCAL_SUFFIXES = [".local", ".lan", ".home.arpa", ".internal", ".localhost"];
-
-/** A host that is reached on the local network: plain `ws` from the desktop app. */
-function isLocalHost(host: string): boolean {
-  if (LOOPBACK.has(host) || host.startsWith("[")) return true;
-  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) return true;
-  if (!host.includes(".")) return true;
-  return LOCAL_SUFFIXES.some((suffix) => host.endsWith(suffix));
-}
-
 function isIpv6Bare(text: string): boolean {
   return !text.startsWith("[") && (text.match(/:/g)?.length ?? 0) >= 2;
 }
 
-export function parseServerAddress(input: string, page: PageContext): ParseResult {
+export function parseServerAddress(input: string, page: PageContext, insecureLan = false): ParseResult {
   let text = input.trim();
   if (!text) return { ok: false, error: "empty" };
 
@@ -105,13 +69,13 @@ export function parseServerAddress(input: string, page: PageContext): ParseResul
   if (slash < 0) slash = text.length;
   let authority = text.slice(0, slash);
   let path = text.slice(slash);
-  path = path.replace(/[?#].*$/, "");
+  if (/[?#]/.test(path) || /[\s\\]/.test(text)) return { ok: false, error: "invalid" };
   if (authority.includes("@")) return { ok: false, error: "invalid" };
 
   if (isIpv6Bare(authority)) authority = `[${authority}]`;
   const hostPort = /^(\[[0-9a-f:.]+\]|[^:[\]\s/]+)(?::(\d{1,5}))?$/i.exec(authority);
   if (!hostPort) return { ok: false, error: "invalid" };
-  const host = (hostPort[1] ?? "").toLowerCase();
+  const host = (hostPort[1] ?? "").toLowerCase().replace(/\.+$/, "");
   let port = hostPort[2] ?? "";
   if (port && (Number(port) < 1 || Number(port) > 65535)) return { ok: false, error: "invalid" };
   if (!host || host.startsWith(".") || host.endsWith(".") || host.includes("..")) return { ok: false, error: "invalid" };
@@ -119,12 +83,12 @@ export function parseServerAddress(input: string, page: PageContext): ParseResul
   const explicitScheme = scheme !== null;
   const pageHost = page.hostname.includes(":") ? `[${page.hostname}]` : page.hostname;
   const isPageHost = host === pageHost.toLowerCase();
-  const plainLoopback = pageSecure && LOOPBACK.has(host) && !isPageHost;
-  const appPlain = isLocalHost(host) || port === String(DEFAULT_PORT);
-  const defaultScheme = isAppPage(page) ? (appPlain ? "ws" : "wss") : pageSecure && !plainLoopback ? "wss" : "ws";
+  const loopback = isLoopbackHost(host);
+  const defaultScheme = loopback || (isAppPage(page) && insecureLan) ? "ws" : "wss";
   const secure = (scheme ?? defaultScheme) === "wss";
-
-  if (!secure && pageSecure && !LOOPBACK.has(host)) return { ok: false, error: "mixed_content" };
+  if (!secure && !loopback && !(isAppPage(page) && insecureLan)) {
+    return { ok: false, error: pageSecure ? "mixed_content" : "insecure" };
+  }
 
   if (!port && !explicitScheme) {
     if (isPageHost && page.port) port = page.port;

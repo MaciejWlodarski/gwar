@@ -1,4 +1,4 @@
-//! Test harness: an in-process server and a small `vc/2` WebSocket client.
+//! Test harness: an in-process server and a small `vc/3` WebSocket client.
 #![allow(dead_code)]
 
 use std::{collections::HashMap, collections::VecDeque, future::Future, time::Duration};
@@ -9,7 +9,7 @@ use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
-use vc_proto::{ErrorBody, Welcome, challenge_message, normalize_host};
+use vc_proto::{ErrorBody, Hello, Welcome, normalize_endpoint, server_proof_statement};
 use vc_server::{Config, Running};
 
 /// Upper bound for any single wait so a broken test fails instead of hanging.
@@ -44,7 +44,10 @@ pub fn base_config() -> Config {
         ice_servers: Vec::new(),
         teamspeak: None,
         public_url: None,
-        public_hosts: Vec::new(),
+        data_dir: None,
+        public_ip: None,
+        insecure_any_host: true,
+        public_endpoints: Vec::new(),
         upload_limit: 10 * 1024 * 1024,
         files_dir: None,
         web_origins: Vec::new(),
@@ -95,8 +98,35 @@ pub fn public_key(key: &SigningKey) -> String {
     B64.encode(key.verifying_key().as_bytes())
 }
 
-pub fn sign(key: &SigningKey, host: &str, nonce: &str) -> String {
-    B64.encode(key.sign(&challenge_message(host, nonce, &public_key(key))).to_bytes())
+pub fn sign(key: &SigningKey, hello: &Value) -> String {
+    let h = hello;
+    let statement = format!(
+        "gwar client hello v3\n{}\n{}\n{}\n{}\n{}\n{}",
+        h["endpoint"].as_str().unwrap(),
+        h["expected_server_pk"].as_str().unwrap(),
+        h["server_nonce"].as_str().unwrap(),
+        h["client_nonce"].as_str().unwrap(),
+        h["client_signing_pk"].as_str().unwrap(),
+        h["certificate_hash"].as_str().unwrap()
+    );
+    B64.encode(key.sign(statement.as_bytes()).to_bytes())
+}
+
+pub fn set_certificate(hello: &mut Value, cert: Value, key: &SigningKey) {
+    let certificate: vc_proto::DeviceCertificate = serde_json::from_value(cert.clone()).unwrap();
+    hello["certificate_hash"] = json!(vc_proto::sha256_b64(
+        format!(
+            "gwar device v1\n{}\n{}\n{}\n{}\n{}",
+            certificate.account_key,
+            certificate.device_key,
+            certificate.issued_at,
+            certificate.expires_at,
+            certificate.signature
+        )
+        .as_bytes()
+    ));
+    hello["certificate"] = cert;
+    hello["signature"] = json!(sign(key, hello));
 }
 
 pub fn uid_of(key: &SigningKey) -> String {
@@ -119,7 +149,7 @@ pub struct RawConn {
     pub ws: Ws,
     pub challenge: Value,
     pub nonce: String,
-    pub host: String,
+    pub endpoint: String,
 }
 
 pub async fn open(server: &TestServer) -> RawConn {
@@ -127,8 +157,8 @@ pub async fn open(server: &TestServer) -> RawConn {
     let frame = recv(&mut ws).await.expect("challenge frame");
     assert_eq!(frame["ev"], "challenge", "first server frame must be the challenge: {frame}");
     let challenge = frame["d"].clone();
-    let nonce = challenge["nonce"].as_str().expect("nonce").to_owned();
-    RawConn { ws, challenge, nonce, host: normalize_host(&server.url()).unwrap() }
+    let nonce = challenge["server_nonce"].as_str().expect("nonce").to_owned();
+    RawConn { ws, challenge, nonce, endpoint: normalize_endpoint(&server.url()).unwrap() }
 }
 
 impl RawConn {
@@ -150,23 +180,22 @@ impl RawConn {
         .await;
     }
 
-    /// Body of a valid `hello` for `key`; tests mutate fields to break it.
+    /// Body of a valid hello. Join secrets live in `join` in the test envelope.
     pub fn hello(&self, key: &SigningKey, nickname: &str, password: Option<&str>) -> Value {
-        let mut d = json!({
-            "protocol": vc_proto::PROTOCOL_VERSION,
-            "nickname": nickname,
-            "public_key": public_key(key),
-            "host": self.host,
-            "signature": sign(key, &self.host, &self.nonce),
+        let mut h = json!({
+            "protocol": vc_proto::PROTOCOL_VERSION, "nickname": nickname,
+            "endpoint": self.endpoint, "expected_server_pk": self.challenge["server_pk"],
+            "server_nonce": self.nonce, "client_nonce": B64.encode(rand::random::<[u8; 32]>()),
+            "client_signing_pk": public_key(key), "certificate_hash": "-", "signature": "",
             "client": {"name": "test", "version": "0", "platform": "web"},
         });
-        if let Some(p) = password {
-            d["server_password"] = json!(p);
-        }
-        d
+        h["signature"] = json!(sign(key, &h));
+        h["join"] = json!({"server_password": password});
+        h
     }
 
-    pub async fn send_hello(&mut self, d: Value) {
+    pub async fn send_hello(&mut self, mut d: Value) {
+        d.as_object_mut().unwrap().remove("join");
         self.send(json!({"id": 1, "op": "hello", "d": d})).await;
     }
 
@@ -227,10 +256,24 @@ impl Client {
         hello: impl FnOnce(&RawConn, &SigningKey) -> Value,
     ) -> Result<Self, ErrorBody> {
         let mut raw = open(server).await;
-        let hello = hello(&raw, &key);
-        raw.send_hello(hello).await;
+        let mut hello = hello(&raw, &key);
+        let join = hello.as_object_mut().unwrap().remove("join").unwrap_or_else(|| json!({}));
+        raw.send_hello(hello.clone()).await;
         let frame = raw.recv().await.expect("reply to hello");
         assert_eq!(frame["re"], 1, "{frame}");
+        if let Some(err) = frame.get("err") {
+            return Err(serde_json::from_value(err.clone()).unwrap());
+        }
+        let h: Hello = serde_json::from_value(hello).unwrap();
+        let pk = vc_proto::decode_fixed::<32>(&h.expected_server_pk).unwrap();
+        let sig = vc_proto::decode_fixed::<64>(frame["ok"]["server_proof"].as_str().unwrap()).unwrap();
+        ed25519_dalek::VerifyingKey::from_bytes(&pk)
+            .unwrap()
+            .verify_strict(server_proof_statement(&h).unwrap().as_bytes(), &ed25519_dalek::Signature::from_bytes(&sig))
+            .unwrap();
+        raw.send(json!({"id": 2, "op": "join", "d": join})).await;
+        let frame = raw.recv().await.expect("reply to join");
+        assert_eq!(frame["re"], 2, "{frame}");
         if let Some(err) = frame.get("err") {
             return Err(serde_json::from_value(err.clone()).unwrap());
         }
@@ -240,7 +283,7 @@ impl Client {
             key,
             welcome,
             challenge: raw.challenge,
-            next_id: 1,
+            next_id: 2,
             replies: HashMap::new(),
             events: VecDeque::new(),
         })

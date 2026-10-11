@@ -47,7 +47,7 @@ const SERVER = process.env.SERVER_HTTP ?? "127.0.0.1:8799";
 const LATENCY_MS = Number(process.env.E2E_LATENCY_MS ?? 0);
 const LATENCY_PORT = 8797;
 // What the browsers type as the server address (through the delay proxy when simulating latency).
-const CLIENT_ADDR = LATENCY_MS > 0 ? `127.0.0.1:${LATENCY_PORT}` : SERVER;
+const CLIENT_ADDR = `ws://${LATENCY_MS > 0 ? `127.0.0.1:${LATENCY_PORT}` : SERVER}/ws`;
 const rid = Math.random().toString(16).slice(2, 6);
 const GAMES = `Games-${rid}`;
 // A second channel of the run (the server may be shared, so no seed names).
@@ -95,7 +95,7 @@ async function ensureServer(connectUrl) {
   }
   const dataDir = mkdtempSync(path.join(tmpdir(), "vc-e2e-"));
   const bin = process.env.VC_SERVER_BIN ?? path.join(repoRoot, "target/debug/vc-server");
-  const args = ["--data-dir", dataDir, "--http", SERVER, "--media", SERVER, "--public-ip", SERVER.split(":")[0], "--public-host", CLIENT_ADDR, "--web-origin", new URL(WEB_URL).origin, "--connect-url", connectUrl];
+  const args = ["--data-dir", dataDir, "--http", SERVER, "--media", SERVER, "--public-ip", SERVER.split(":")[0], "--public-endpoint", CLIENT_ADDR, "--web-origin", new URL(WEB_URL).origin, "--connect-url", connectUrl];
   const child = existsSync(bin)
     ? spawn(bin, args, { cwd: repoRoot })
     : spawn("cargo", ["run", "-q", "-p", "vc-server", "--", ...args], { cwd: repoRoot });
@@ -381,6 +381,60 @@ async function main() {
     if ((await a.evaluate(() => window.__gum)) !== 0) throw new Error("the microphone was requested before joining voice");
     if ((await a.evaluate(() => window.__pcs.length)) !== 0) throw new Error("a peer connection exists before joining voice");
   });
+  await check("verified server fingerprint is visible and pinned after first connection", async () => {
+    const fingerprint = await a.getByTestId("server-fingerprint").innerText();
+    const stored = await a.evaluate((endpoint) => localStorage.getItem(`vc.server-pin:${endpoint}`), CLIENT_ADDR);
+    if (!stored || JSON.parse(stored).server_pk !== fingerprint || !/^[A-Za-z0-9_-]{43}$/.test(fingerprint)) throw new Error("missing verified fingerprint or pin");
+  });
+  await check("browser rejects weak Ed25519 keys and proof points independently of WebCrypto", async () => {
+    const serverKey = await a.getByTestId("server-fingerprint").innerText();
+    const rejects = await a.evaluate(async ({ endpoint, serverKey }) => {
+      const { serverPublicKey, verifyProof } = await import("/src/net/handshake.ts");
+      const identity = Uint8Array.from([1, ...new Array(31).fill(0)]);
+      const encode = (bytes) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      try { serverPublicKey(encode(identity)); return false; } catch { /* weak candidate rejected before signing */ }
+      const hello = { protocol: 3, nickname: "test", endpoint, expected_server_pk: serverKey,
+        server_nonce: "A".repeat(43), client_nonce: "A".repeat(43), client_signing_pk: serverKey,
+        certificate_hash: "-", signature: "A".repeat(86), client: { name: "test", version: "0", platform: "web" } };
+      try {
+        await verifyProof(hello, { server_proof: encode(Uint8Array.from([...identity, ...new Array(32).fill(0)])) });
+        return false;
+      } catch { return true; }
+    }, { endpoint: CLIENT_ADDR, serverKey });
+    if (!rejects) throw new Error("browser accepted weak Ed25519 points");
+  });
+  for (const pl of [false, true]) {
+    await check(`a changed pin blocks ${pl ? "Polish" : "English"} login until explicit dangerous trust`, async () => {
+      const ctx = await newCtx({ locale: pl ? "pl-PL" : "en-US" });
+      const page = await ctx.newPage();
+      const sent = [];
+      page.on("websocket", (ws) => ws.on("framesent", ({ payload }) => sent.push(String(payload))));
+      await page.goto(WEB_URL);
+      const oldPin = JSON.stringify({ server_pk: "A".repeat(43), first_seen: 1 });
+      await page.evaluate(({ endpoint, pin }) => localStorage.setItem(`vc.server-pin:${endpoint}`, pin), { endpoint: CLIENT_ADDR, pin: oldPin });
+      await page.getByLabel(pl ? "Adres serwera" : "Server address").fill(CLIENT_ADDR);
+      await setGlobalNickname(page, pl ? "PinPL" : "PinEN", { pl });
+      await page.getByRole("button", { name: pl ? "Połącz" : "Connect", exact: true }).click();
+      const dialog = page.getByRole("dialog", { name: pl ? "Tożsamość serwera się zmieniła" : "Server identity changed", exact: true });
+      await dialog.waitFor({ timeout: 15000 });
+      if (pl) await page.setViewportSize({ width: 390, height: 844 });
+      await sleep(200);
+      if (await dialog.evaluate((node) => node.scrollWidth > node.clientWidth)) throw new Error("identity dialog overflows");
+      const active = await page.evaluate(() => document.activeElement?.textContent);
+      if (active !== (pl ? "Anuluj" : "Cancel")) throw new Error("dangerous trust is the default focus");
+      if (sent.length !== 0) throw new Error("client sent data after a pin mismatch");
+      const unchanged = await page.evaluate((endpoint) => localStorage.getItem(`vc.server-pin:${endpoint}`), CLIENT_ADDR);
+      if (unchanged !== oldPin) throw new Error("pin changed without explicit trust");
+      await shot(page, pl ? "03-pin-changed-pl" : "03-pin-changed-en");
+      await dialog.getByRole("button", { name: pl ? "Niebezpieczne: zapomnij stary klucz i zaufaj nowemu" : "Dangerous: forget old pin and trust new key", exact: true }).click();
+      if (pl) await page.setViewportSize({ width: 1280, height: 800 });
+      const fingerprint = page.getByTestId("server-fingerprint");
+      await fingerprint.waitFor({ timeout: 15000 });
+      const replacement = JSON.parse(await page.evaluate((endpoint) => localStorage.getItem(`vc.server-pin:${endpoint}`), CLIENT_ADDR));
+      if (replacement.server_pk !== await fingerprint.innerText() || replacement.first_seen <= 1) throw new Error("explicit trust did not persist the verified replacement");
+      await ctx.close();
+    });
+  }
   await check("bob connects and is on the server, not in voice", () => connect(b, "Bob"));
   await check("both are listed as Online (not in voice) in the member list", async () => {
     for (const p of [a, b]) {
@@ -681,6 +735,8 @@ async function main() {
 
   console.log("reconnect");
   await check("client reconnects after the socket drops and resyncs", async () => {
+    const pinBefore = await b.evaluate((endpoint) => localStorage.getItem(`vc.server-pin:${endpoint}`), CLIENT_ADDR);
+    if (!pinBefore) throw new Error("first connection did not persist a server pin");
     const before = fa.events("client.joined").length;
     await b.evaluate(() => window.__sockets.filter((s) => s.url.endsWith("/ws")).forEach((s) => s.close()));
     await b.getByText("Connection lost. Reconnecting…").waitFor({ timeout: 5000 });
@@ -691,6 +747,10 @@ async function main() {
     await treeItem(b, /Alice/).waitFor();
     await b.getByRole("tab", { name: "Server" }).click();
     await b.getByText("Reconnected to the server").waitFor();
+    const pinAfter = await b.evaluate((endpoint) => localStorage.getItem(`vc.server-pin:${endpoint}`), CLIENT_ADDR);
+    if (pinBefore !== pinAfter) throw new Error("second connection replaced the first-contact pin");
+    const fingerprint = await b.getByTestId("server-fingerprint").innerText();
+    if (fingerprint !== JSON.parse(pinAfter).server_pk) throw new Error("verified fingerprint is not visible");
   });
 
   console.log("screenshots");
@@ -1019,11 +1079,13 @@ async function main() {
     await item.getByText("0 of 1 uses").waitFor();
     await item.getByRole("button", { name: "Copy link" }).click();
     inviteLink = await a.evaluate(() => navigator.clipboard.readText());
-    const expected = new RegExp(`^${escapeRe(new URL(WEB_URL).origin)}/\\?server=${escapeRe(encodeURIComponent(CLIENT_ADDR))}&invite=[\\w-]+$`);
+    const expected = new RegExp(`^${escapeRe(new URL(WEB_URL).origin)}/\\?server=${escapeRe(encodeURIComponent(CLIENT_ADDR))}&invite=[\\w-]+&server_key=[\\w-]{43}$`);
     if (!expected.test(inviteLink)) throw new Error(`unexpected invite link ${inviteLink}`);
     // The web app (Vite) and the server are different origins here, so the link has to name the server.
     const link = new URL(inviteLink);
     if (link.origin === `http://${SERVER}` || link.searchParams.get("server") !== CLIENT_ADDR) throw new Error(`invite link does not name the server: ${inviteLink}`);
+    const fingerprint = await a.getByTestId("server-fingerprint").innerText();
+    if (link.searchParams.get("server_key") !== fingerprint) throw new Error("invite fingerprint differs from verified server key");
     await shot(a, "25-invites-dark");
     await a.keyboard.press("Escape");
 
@@ -1165,11 +1227,13 @@ async function main() {
     await check("production build served by vc-server defaults to its own address", async () => {
       const bin = process.env.VC_SERVER_BIN ?? path.join(repoRoot, "target/debug/vc-server");
       if (!existsSync(bin)) return;
-      const port = 8798;
+      const port = await new Promise((resolve) => {
+        const probe = net.createServer().listen(0, "127.0.0.1", () => { const { port } = probe.address(); probe.close(() => resolve(port)); });
+      });
       const dir = mkdtempSync(path.join(tmpdir(), "vc-e2e-web-"));
       const child = spawn(
         bin,
-        ["--data-dir", dir, "--http", `127.0.0.1:${port}`, "--media", `127.0.0.1:${port}`, "--public-ip", "127.0.0.1", "--web-root", dist],
+        ["--data-dir", dir, "--http", `127.0.0.1:${port}`, "--media", `127.0.0.1:${port}`, "--public-ip", "127.0.0.1", "--public-endpoint", `ws://127.0.0.1:${port}/ws`, "--web-root", dist],
         { env: { ...process.env, VC_NO_TEAMSPEAK: "true" } },
       );
       children.push(child);

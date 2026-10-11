@@ -42,7 +42,7 @@ describe("account flows", () => {
     const phone = await signIn({ handle: "@ALICE", password: "correct horse" }, deps("Firefox on Linux"));
     expect(phone.accountKey).toBe(created.record.accountKey);
     expect(phone.certificate.device_key).not.toBe(created.record.certificate.device_key);
-    expect(phone.certificate.expires_at - phone.certificate.issued_at).toBe(365 * 86_400_000);
+    expect(phone.certificate.expires_at - phone.certificate.issued_at).toBe(90 * 86_400_000);
     expect(service.devices.map((d) => d.name)).toEqual(["Chrome on macOS", "Firefox on Linux"]);
   }, 30_000);
 

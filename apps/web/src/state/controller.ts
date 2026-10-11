@@ -1,3 +1,4 @@
+import { serverPins, type ServerIdentityChanged } from "../net/server-pins";
 import { useAccountIdentity } from "./identity";
 import type { BanNotice } from "../proto/BanNotice";
 /**
@@ -55,6 +56,7 @@ export class ConnectFailure extends Error {
     message: string,
     readonly serverName?: string,
     readonly ban?: BanNotice,
+    readonly identityChange?: ServerIdentityChanged,
   ) {
     super(message);
   }
@@ -67,6 +69,8 @@ export interface ConnectParams {
   password?: string;
   /** Invite code from a link: admits without the server password. */
   invite?: string;
+  inviteServerKey?: string;
+  insecureLan?: boolean;
   /** TeamSpeak only: the uid of the identity to connect with (default: the default one). */
   identity?: string;
 }
@@ -104,6 +108,8 @@ export function describeRequestError(e: unknown): string {
 
 export function describeConnectFailure(f: ConnectFailure): string {
   if (f.kind === "address") return f.message;
+  if (f.kind === "server_identity") return tNow("security.changedTitle");
+  if (f.kind === "insecure_transport") return tNow("err.addr.insecure");
   if (f.kind === "banned") {
     // Older servers only describe the ban in the message.
     return f.ban ? describeBan({ until: f.ban.until ?? null, reason: f.ban.reason ?? null }, f.ban.by) : describeBan(parseBanMessage(f.message));
@@ -291,7 +297,7 @@ class Controller {
         identity: params.identity,
       });
     } else {
-      const parsed = parseServerAddress(params.address, pageContextFromLocation());
+      const parsed = parseServerAddress(params.address, pageContextFromLocation(), params.insecureLan);
       if (!parsed.ok) {
         throw new ConnectFailure("address", tNow(`err.addr.${parsed.error}` as Key));
       }
@@ -314,18 +320,20 @@ class Controller {
         nickname: identity.nickname,
         serverPassword: params.password || undefined,
         invite: params.invite || undefined,
+        inviteServerKey: params.inviteServerKey,
+        insecureLan: params.insecureLan,
         client: { name: "vc-web", version: CLIENT_VERSION, platform: platform() },
       });
     }
     this.conn = conn;
-    this.wire(conn);
+    this.wire(conn, params);
     try {
       await conn.connect();
     } catch (e) {
       this.conn = null;
       session.dispatch({ type: "reset" });
       const err = e instanceof ConnectError ? e : new ConnectError("unreachable", String(e));
-      throw new ConnectFailure(err.kind, err.message, err.serverName, err.ban);
+      throw new ConnectFailure(err.kind, err.message, err.serverName, err.ban, err.identityChange);
     }
   }
 
@@ -340,6 +348,7 @@ class Controller {
       await this.connect(params);
     } catch (e) {
       if (e instanceof ConnectFailure) {
+        if (e.identityChange) this.confirmServerChange(e.identityChange, params, opts);
         // With an invite the server says "wrong password" when the invite is no good (and there is a password).
         const badInvite = !!params.invite && e.kind === "wrong_password";
         ui.set({
@@ -366,20 +375,35 @@ class Controller {
     // A TeamSpeak server remembers which identity was used to get in.
     const identity = kind === "teamspeak" && params.identity ? { identity: params.identity } : {};
     if (existing) {
-      settings.saveBookmark({ ...existing, kind, name, password: params.password || existing.password, ...identity });
+      settings.saveBookmark({ ...existing, kind, name, password: params.password || existing.password, insecureLan: params.insecureLan, ...identity });
     } else if (opts.remember) {
-      settings.saveBookmark({ id: newId(), kind, name, address: params.address.trim(), password: params.password || undefined, ...identity });
+      settings.saveBookmark({ id: newId(), kind, name, address: params.address.trim(), password: params.password || undefined, insecureLan: params.insecureLan, ...identity });
     }
     return true;
   }
 
-  private wire(conn: Link): void {
+  private confirmServerChange(change: ServerIdentityChanged, params: ConnectParams, opts: { remember: boolean }): void {
+    useUi.getState().openDialog({
+      kind: "confirm", title: tNow("security.changedTitle"),
+      body: `${tNow(change.source === "invite" ? "security.inviteMismatch" : "security.changedBody")}\n${change.endpoint}\n${tNow("security.oldKey")}: ${change.expected}\n${tNow("security.newKey")}: ${change.candidate}`,
+      confirmLabel: tNow(change.source === "invite" ? "common.close" : "security.trustDanger"),
+      danger: true, serverIdentity: true,
+      onConfirm: () => {
+        if (change.source === "invite") return;
+        serverPins.forget(change.endpoint, change.expected);
+        void this.connectInteractive({ ...params, inviteServerKey: params.inviteServerKey ?? change.candidate }, opts);
+      },
+    });
+  }
+
+  private wire(conn: Link, params: ConnectParams): void {
     const session = useSession.getState();
     conn.onWelcome((welcome, resync) => {
       this.entered.clear();
       this.historyRequested.clear();
       this.sentRead.clear();
       void setConnectedServer(useSession.getState().kind === "vc" ? useSession.getState().httpOrigin : null, welcome.server.upload_limit).catch((e) => console.warn("Native file origin:", e));
+      session.setSecurity(conn.serverKey ?? null, conn.endpoint ?? null, conn.endpoint?.startsWith("ws://") ?? false);
       session.dispatch({ type: "welcome", welcome, resync, now: Date.now() });
       const myCh = myChannelId(useSession.getState());
       const v = useVoice.getState();
@@ -409,6 +433,9 @@ class Controller {
       }
     });
     conn.onStatus((status: ConnectionStatus) => {
+      if (status.state === "closed" && status.reason.kind === "error" && status.reason.error.identityChange) {
+        this.confirmServerChange(status.reason.error.identityChange, params, { remember: false });
+      }
       switch (status.state) {
         case "connecting":
           session.dispatch({ type: "phase", phase: "connecting" });
@@ -524,7 +551,7 @@ class Controller {
       const ts = parseTeamSpeakAddress(useSession.getState().address);
       return ts.ok ? ts.value.host : undefined;
     }
-    const parsed = parseServerAddress(useSession.getState().address, pageContextFromLocation());
+    const parsed = parseServerAddress(useSession.getState().address, pageContextFromLocation(), true);
     return parsed.ok ? new URL(parsed.value.url).hostname.replace(/^\[|\]$/g, "") : undefined;
   }
 

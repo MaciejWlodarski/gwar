@@ -17,6 +17,8 @@ export interface Bookmark {
   address: string;
   /** Missing in bookmarks saved before TeamSpeak support: those are `vc`. */
   kind?: ServerKind;
+  /** Explicit per-server desktop LAN plaintext opt-in. */
+  insecureLan?: boolean;
   /** Stored in plain text in localStorage (needed to reconnect). */
   password?: string;
   /** TeamSpeak only: the uid of the identity to connect with. Missing, or no longer in the list: the default one. */

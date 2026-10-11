@@ -1,4 +1,4 @@
-//! Wire protocol `vc/2`.
+//! Wire protocol `vc/3`.
 //!
 //! One WebSocket carries JSON text frames in both directions:
 //!
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "ts")]
 use ts_rs::TS;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// Number of server→client audio slots a WebRTC client must offer as `recvonly`.
 pub const AUDIO_SLOTS: usize = 8;
@@ -66,7 +66,9 @@ wire! {
     #[serde(tag = "op", content = "d")]
     pub enum Request {
         #[serde(rename = "hello")]
-        Hello(Hello),
+        Hello(Box<Hello>),
+        #[serde(rename = "join")]
+        Join(Join),
         #[serde(rename = "ping")]
         Ping {},
         #[serde(rename = "client.update")]
@@ -165,31 +167,41 @@ wire! {
         VoiceOffer { sdp: String },
     }
 
+    #[serde(deny_unknown_fields)]
     pub struct Hello {
         pub protocol: u32,
         /// The identity's own nickname. Used only when this identity joins the
         /// server for the first time; afterwards the member's stored nickname wins.
         pub nickname: String,
-        /// Base64url (no padding) Ed25519 public key.
-        pub public_key: String,
-        /// Normalized authority of the URL the client dialed.
-        pub host: String,
-        /// Base64url signature over `challenge_message(host, nonce, public_key)`.
+        pub endpoint: String,
+        pub expected_server_pk: String,
+        pub server_nonce: String,
+        pub client_nonce: String,
+        pub client_signing_pk: String,
+        pub certificate_hash: String,
         pub signature: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub certificate: Option<DeviceCertificate>,
+        pub client: ClientSoftware,
+    }
+
+    /// Sent only after verifying the server proof, on the same connection.
+    #[serde(deny_unknown_fields)]
+    pub struct Join {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         pub server_password: Option<String>,
-        /// Invite code: admits without the server password and may grant a group.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub invite: Option<String>,
-        /// A Gwar Connect device certificate: `public_key` is then a device key
-        /// and the identity (uid) comes from the certificate's account key.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub device: Option<DeviceCertificate>,
-        pub client: ClientSoftware,
+    }
+
+    #[serde(deny_unknown_fields)]
+    pub struct ServerProof {
+        pub server_proof: String,
     }
 
     /// Signed by the account key over
     /// `gwar device v1\n{account_key}\n{device_key}\n{issued_at}\n{expires_at}` (docs/connect.md).
+    #[serde(deny_unknown_fields)]
     pub struct DeviceCertificate {
         pub account_key: String,
         pub device_key: String,
@@ -354,6 +366,7 @@ wire! {
 
     #[serde(untagged)]
     pub enum Response {
+        ServerProof(ServerProof),
         Welcome(Box<Welcome>),
         Channel(Channel),
         Message(ChatMessage),
@@ -467,8 +480,9 @@ wire! {
 
     pub struct Challenge {
         pub protocol: u32,
-        /// Base64url random nonce to sign.
-        pub nonce: String,
+        pub server_pk: String,
+        /// Base64url independent random 32-byte nonce, fresh per connection.
+        pub server_nonce: String,
         pub server: ServerInfo,
         pub password_required: bool,
     }
@@ -720,56 +734,104 @@ impl ErrorBody {
     }
 }
 
-/// Bytes a client signs to prove ownership of its identity key.
-///
-/// The host comes from the URL the client dialed, never from the challenge.
-/// Servers with configured public names reject signatures intended for another host.
-pub fn challenge_message(host: &str, nonce: &str, public_key: &str) -> Vec<u8> {
-    format!("vc/1 hello\n{host}\n{nonce}\n{public_key}").into_bytes()
+/// Strict canonical unpadded base64url with an exact decoded length.
+pub fn decode_fixed<const N: usize>(value: &str) -> Option<[u8; N]> {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
+    let bytes: [u8; N] = B64.decode(value).ok()?.try_into().ok()?;
+    (B64.encode(bytes) == value).then_some(bytes)
 }
 
-/// Normalized authority for login binding; mirrored in the web client's identity.ts.
-/// URLs drop scheme-default ports. Bare authorities keep their explicit port.
-pub fn normalize_host(address: &str) -> Option<String> {
-    let address = address.trim();
-    if address.is_empty() || address.chars().any(|c| c.is_whitespace() || c == '\\') {
+pub const MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+
+pub fn safe_timestamp(value: i64) -> bool {
+    (0..=MAX_SAFE_INTEGER).contains(&value)
+}
+
+pub fn sha256_b64(value: &[u8]) -> String {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
+    use sha2::{Digest, Sha256};
+    B64.encode(Sha256::digest(value))
+}
+
+/// Certificate commitment, including the account signature; `-` for a local key.
+pub fn certificate_hash(certificate: Option<&DeviceCertificate>) -> Option<String> {
+    let Some(c) = certificate else { return Some("-".into()) };
+    decode_fixed::<32>(&c.account_key)?;
+    decode_fixed::<32>(&c.device_key)?;
+    decode_fixed::<64>(&c.signature)?;
+    if !safe_timestamp(c.issued_at) || !safe_timestamp(c.expires_at) || c.expires_at <= c.issued_at {
         return None;
     }
-    let has_scheme = address.contains("://");
-    if !has_scheme && address.contains(['/', '?', '#']) {
+    Some(sha256_b64(
+        format!(
+            "gwar device v1\n{}\n{}\n{}\n{}\n{}",
+            c.account_key, c.device_key, c.issued_at, c.expires_at, c.signature
+        )
+        .as_bytes(),
+    ))
+}
+
+/// Exact H bytes; rejects noncanonical or ambiguous transcript fields.
+pub fn hello_statement(h: &Hello) -> Option<String> {
+    if normalize_endpoint(&h.endpoint).as_deref() != Some(&h.endpoint) {
         return None;
     }
-    let bare_ipv6 = !has_scheme && !address.starts_with('[') && address.matches(':').count() >= 2;
-    let input = if has_scheme {
-        address.to_owned()
-    } else if bare_ipv6 {
-        format!("https://[{address}]")
-    } else {
-        format!("https://{address}")
+    decode_fixed::<32>(&h.expected_server_pk)?;
+    decode_fixed::<32>(&h.server_nonce)?;
+    decode_fixed::<32>(&h.client_nonce)?;
+    decode_fixed::<32>(&h.client_signing_pk)?;
+    if certificate_hash(h.certificate.as_ref())? != h.certificate_hash {
+        return None;
+    }
+    Some(format!(
+        "gwar client hello v3\n{}\n{}\n{}\n{}\n{}\n{}",
+        h.endpoint, h.expected_server_pk, h.server_nonce, h.client_nonce, h.client_signing_pk, h.certificate_hash
+    ))
+}
+
+/// Exact server proof statement, with no trailing newline.
+pub fn server_proof_statement(h: &Hello) -> Option<String> {
+    decode_fixed::<64>(&h.signature)?;
+    Some(format!("gwar server proof v3\n{}\n{}", sha256_b64(hello_statement(h)?.as_bytes()), h.signature))
+}
+
+/// Canonical external WebSocket URL. Mirrored in apps/web/src/net/handshake.ts.
+/// The path is part of the identity binding; no credentials, query or fragment.
+pub fn normalize_endpoint(address: &str) -> Option<String> {
+    if address.is_empty() || address.chars().any(|c| c.is_whitespace() || matches!(c, '\\' | '?' | '#')) {
+        return None;
+    }
+    let mut url = url::Url::parse(address).ok()?;
+    if !matches!(url.scheme(), "ws" | "wss") || address.split("://").nth(1)?.split('/').next()?.contains('@') {
+        return None;
+    }
+    let hostname = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    if hostname.is_empty() || url.port() == Some(0) {
+        return None;
+    }
+    url.set_host(Some(&hostname)).ok()?;
+    Some(url.to_string())
+}
+
+/// `--public-url` supplies an origin, with HTTP(S) mapped to WS(S) and `/ws`.
+pub fn endpoint_from_public_url(address: &str) -> Option<String> {
+    let mut url = url::Url::parse(address).ok()?;
+    let scheme = match url.scheme() {
+        "https" | "wss" => "wss",
+        "http" | "ws" => "ws",
+        _ => return None,
     };
-    let url = url::Url::parse(&input).ok()?;
-    if !matches!(url.scheme(), "ws" | "wss" | "http" | "https")
+    url.set_scheme(scheme).ok()?;
+    url.set_path("/ws");
+    // Validate the original too; rewriting the path must not hide credentials or CR/LF.
+    if address.chars().any(|c| c.is_whitespace() || matches!(c, '\\' | '?' | '#'))
+        || address.split("://").nth(1)?.split('/').next()?.contains('@')
         || !url.username().is_empty()
         || url.password().is_some()
     {
         return None;
     }
-    let hostname = url.host_str()?.strip_suffix('.').unwrap_or(url.host_str()?).to_ascii_lowercase();
-    if hostname.is_empty() {
-        return None;
-    }
-    let port = if !has_scheme && !bare_ipv6 && !address.ends_with(']') {
-        match address.rsplit_once(':') {
-            Some((_, port)) => Some(port.parse::<u16>().ok()?),
-            None => None,
-        }
-    } else {
-        url.port()
-    };
-    Some(match port {
-        Some(port) => format!("{hostname}:{port}"),
-        None => hostname,
-    })
+    normalize_endpoint(url.as_str())
 }
 
 /// Exact UTF-8 statement signed by the Connect service; no trailing newline.
@@ -783,27 +845,27 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn challenge_binds_host_nonce_and_public_key() {
-        assert_eq!(challenge_message("b.example", "NONCE", "KEY"), b"vc/1 hello\nb.example\nNONCE\nKEY");
-    }
-
-    #[test]
-    fn host_normalization_shared_vectors() {
+    fn endpoint_normalization_shared_vectors() {
         let vectors: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/host-normalization.json")).unwrap();
+            serde_json::from_str(include_str!("../tests/endpoint-normalization.json")).unwrap();
         for vector in vectors["valid"].as_array().unwrap() {
             let (input, expected) = (vector[0].as_str().unwrap(), vector[1].as_str().unwrap());
-            assert_eq!(normalize_host(input).as_deref(), Some(expected), "{input}");
+            assert_eq!(normalize_endpoint(input).as_deref(), Some(expected), "{input}");
+        }
+        for input in vectors["invalid"].as_array().unwrap() {
+            let input = input.as_str().unwrap();
+            assert_eq!(normalize_endpoint(input), None, "{input}");
         }
     }
 
     #[test]
-    fn host_normalization_rejects_invalid_addresses() {
-        let vectors: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/host-normalization.json")).unwrap();
-        for input in vectors["invalid"].as_array().unwrap() {
-            let input = input.as_str().unwrap();
-            assert_eq!(normalize_host(input), None, "{input}");
+    fn vc3_statements_shared_vectors() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!("../tests/handshake-v3.json")).unwrap();
+        for v in vectors.as_array().unwrap() {
+            let h: Hello = serde_json::from_value(v["hello"].clone()).unwrap();
+            assert_eq!(hello_statement(&h).unwrap(), v["statement"].as_str().unwrap());
+            assert_eq!(sha256_b64(hello_statement(&h).unwrap().as_bytes()), v["hello_hash"].as_str().unwrap());
+            assert_eq!(server_proof_statement(&h).unwrap(), v["proof_statement"].as_str().unwrap());
         }
     }
 

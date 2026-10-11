@@ -1,7 +1,7 @@
 //! Voice server core.
 //!
 //! ```text
-//!  browser / desktop ──WS vc/2──▶ gateway ──▶ core actor ──▶ SQLite
+//!  browser / desktop ──WS vc/3──▶ gateway ──▶ core actor ──▶ SQLite
 //!                                                │ routing snapshot
 //!  browser / desktop ◀─WebRTC Opus─▶ media SFU ◀─┤
 //!  official TeamSpeak server ◀─query + puppets─▶ teamspeak bridge (optional)
@@ -15,6 +15,7 @@ pub mod identity;
 pub mod media;
 pub mod members;
 mod preauth;
+pub mod server_key;
 pub mod store;
 #[cfg(feature = "teamspeak")]
 pub mod teamspeak;
@@ -38,7 +39,7 @@ use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     services::{ServeDir, ServeFile},
 };
-use vc_proto::{IceServer, normalize_host};
+use vc_proto::{IceServer, endpoint_from_public_url, normalize_endpoint};
 
 use crate::{
     core::{CoreConfig, CoreHandle},
@@ -48,6 +49,12 @@ use crate::{
 };
 
 pub struct Config {
+    /// Persistent server identity directory; None uses an ephemeral key (tests).
+    pub data_dir: Option<PathBuf>,
+    /// Explicit public IP, never the inferred media address.
+    pub public_ip: Option<std::net::IpAddr>,
+    /// Isolated development only: accept any canonical signed endpoint.
+    pub insecure_any_host: bool,
     /// SQLite database path; `None` keeps state in memory (tests).
     pub database: Option<PathBuf>,
     pub http_bind: SocketAddr,
@@ -61,10 +68,10 @@ pub struct Config {
     /// Official TeamSpeak server to run and bridge; `None` disables TS compatibility.
     pub teamspeak: Option<TeamSpeakConfig>,
     /// Public base URL of the web origin (e.g. `https://voice.example.com`),
-    /// used in links to uploads posted to TeamSpeak and to bind login signatures.
+    /// used in links to uploads posted to TeamSpeak and to derive an external `/ws` endpoint.
     pub public_url: Option<String>,
-    /// Extra accepted login authorities; ACME domains and `public_url` are included too.
-    pub public_hosts: Vec<String>,
+    /// Extra accepted external WebSocket endpoints. Never derived from request headers.
+    pub public_endpoints: Vec<String>,
     /// Largest upload in bytes; 0 disables uploads.
     pub upload_limit: u64,
     /// Where uploads are stored; `None` uses a temporary directory (tests).
@@ -112,22 +119,81 @@ pub struct Running {
     pub tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
-fn accepted_hosts(config: &Config) -> Result<HashSet<String>> {
-    let mut names: Vec<&str> = config.public_hosts.iter().map(String::as_str).collect();
-    names.extend(config.public_url.as_deref());
-    if let Some(tls::Tls::Acme { domains, .. }) = &config.tls {
-        names.extend(domains.iter().map(String::as_str));
+/// Only global unicast addresses can add an automatic public endpoint.
+/// Special-purpose exclusions follow https://doc.rust-lang.org/std/net/struct.Ipv4Addr.html#method.is_global
+/// and the IPv6 registry; multicast, deprecated 6to4 and unallocated IPv6 ranges stay excluded.
+pub fn global_unicast(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let [a, b, c, d] = ip.octets();
+            !(a == 0
+                || a == 10
+                || a == 127
+                || a >= 224
+                || (a == 100 && (64..=127).contains(&b))
+                || (a == 169 && b == 254)
+                || (a == 172 && (16..=31).contains(&b))
+                || (a == 192 && b == 168)
+                || (a == 192 && b == 0 && ((c == 0 && d != 9 && d != 10) || c == 2))
+                || (a == 192 && b == 88 && c == 99)
+                || (a == 198 && (b == 18 || b == 19 || (b == 51 && c == 100)))
+                || (a == 203 && b == 0 && c == 113))
+        }
+        std::net::IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            (segments[0] & 0xe000) == 0x2000
+                && !(segments[0] == 0x2001 && segments[1] == 0xdb8)
+                && !(segments[0] == 0x2001
+                    && segments[1] < 0x200
+                    && !(matches!(segments, [0x2001, 1, 0, 0, 0, 0, 0, 1 | 2])
+                        || segments[1] == 3
+                        || (segments[1] == 4 && segments[2] == 0x112)
+                        || (0x20..=0x3f).contains(&segments[1])))
+                && segments[0] != 0x2002
+                && !(segments[0] == 0x3fff && segments[1] < 0x1000)
+        }
     }
-    names.into_iter().map(|name| normalize_host(name).with_context(|| format!("invalid public host: {name}"))).collect()
+}
+
+pub fn accepted_endpoints(config: &Config) -> Result<HashSet<String>> {
+    let mut endpoints = HashSet::new();
+    for endpoint in &config.public_endpoints {
+        endpoints.insert(normalize_endpoint(endpoint).with_context(|| format!("invalid public endpoint: {endpoint}"))?);
+    }
+    if let Some(url) = &config.public_url {
+        endpoints.insert(endpoint_from_public_url(url).context("invalid public URL")?);
+    }
+    if let Some(tls::Tls::Acme { domains, .. }) = &config.tls {
+        for domain in domains {
+            endpoints.insert(normalize_endpoint(&format!("wss://{domain}/ws")).context("invalid public domain")?);
+        }
+    }
+    if let Some(ip) = config.public_ip.filter(|ip| config.tls.is_some() && global_unicast(*ip)) {
+        let host = match ip {
+            std::net::IpAddr::V4(_) => ip.to_string(),
+            std::net::IpAddr::V6(_) => format!("[{ip}]"),
+        };
+        let port = if config.http_bind.port() != 443 { format!(":{}", config.http_bind.port()) } else { String::new() };
+        endpoints.insert(normalize_endpoint(&format!("wss://{host}{port}/ws")).context("invalid public IP endpoint")?);
+    }
+    Ok(endpoints)
 }
 
 pub async fn start(config: Config) -> Result<Running> {
-    let public_hosts = Arc::new(accepted_hosts(&config)?);
-    if public_hosts.is_empty() {
+    let public_endpoints = Arc::new(accepted_endpoints(&config)?);
+    anyhow::ensure!(
+        !public_endpoints.is_empty() || config.insecure_any_host,
+        "no accepted public endpoints; configure --domain, --public-url or --public-endpoint (isolated tests only: --insecure-any-host)"
+    );
+    if config.insecure_any_host {
         tracing::warn!(
-            "login relay protection is off; configure --domain, --public-url or --public-host (VC_PUBLIC_HOSTS) to enable it"
+            "INSECURE --insecure-any-host: login relay protection is DISABLED; isolated development/tests ONLY"
         );
     }
+    let server_key = Arc::new(match config.data_dir.as_deref() {
+        Some(dir) => server_key::load(dir)?,
+        None => server_key::generate(),
+    });
     let store = match &config.database {
         Some(path) => Store::open(path)?,
         None => Store::in_memory()?,
@@ -200,7 +266,14 @@ pub async fn start(config: Config) -> Result<Running> {
         }
         None => (None, None),
     };
-    let gateway = Gateway { core: core.clone(), password, public_hosts, preauth: Default::default() };
+    let gateway = Gateway {
+        core: core.clone(),
+        preauth: Default::default(),
+        password,
+        public_endpoints,
+        server_key,
+        insecure_any_host: config.insecure_any_host,
+    };
     // The web app runs on another origin than this server: let it upload and
     // fetch files. Uploads are authorized by one-time tokens, not cookies.
     let origins: Vec<HeaderValue> = config.web_origins.iter().filter_map(|o| o.parse().ok()).collect();
@@ -237,44 +310,4 @@ pub async fn start(config: Config) -> Result<Running> {
         }
     }
     Ok(Running { http, media: advertise, core, plane, teamspeak, teamspeak_ready, admin_token, tasks })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn accepted_hosts_include_all_domains_public_url_and_extra_names() {
-        let config = Config {
-            database: None,
-            http_bind: "127.0.0.1:0".parse().unwrap(),
-            media_bind: "127.0.0.1:0".parse().unwrap(),
-            media_advertise: "127.0.0.1:0".parse().unwrap(),
-            max_clients: 8,
-            server_password: None,
-            web_root: None,
-            ice_servers: Vec::new(),
-            teamspeak: None,
-            public_url: Some("https://Voice.Example.com.:443/base".into()),
-            public_hosts: vec!["192.168.1.2:8790".into(), "voice.example.com".into()],
-            upload_limit: 0,
-            files_dir: None,
-            web_origins: Vec::new(),
-            tls: Some(tls::Tls::Acme {
-                domains: vec!["One.Example.com.".into(), "two.example.com".into()],
-                email: None,
-                cache: PathBuf::new(),
-                staging: true,
-            }),
-            redirect_http: None,
-            connect_url: None,
-        };
-        assert_eq!(
-            accepted_hosts(&config).unwrap(),
-            ["voice.example.com", "one.example.com", "two.example.com", "192.168.1.2:8790"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect()
-        );
-    }
 }

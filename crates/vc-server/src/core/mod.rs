@@ -116,6 +116,7 @@ pub enum CoreMsg {
         connected: bool,
     },
     Info(oneshot::Sender<ServerInfo>),
+    DeviceAuthorized(String, String, oneshot::Sender<bool>),
     Bridge(BridgeMsg),
     Files(files::FileMsg),
     /// Devices revoked on Gwar Connect, and the feed position after them.
@@ -131,6 +132,14 @@ pub struct CoreHandle {
 }
 
 impl CoreHandle {
+    pub async fn device_authorized(&self, account_key: &str, device_key: &str) -> bool {
+        let (tx, rx) = oneshot::channel();
+        if self.tx.send(CoreMsg::DeviceAuthorized(account_key.into(), device_key.into(), tx)).await.is_err() {
+            return false;
+        }
+        rx.await.unwrap_or(false)
+    }
+
     pub async fn connect(&self, request: ConnectRequest) -> Option<SessionId> {
         let (tx, rx) = oneshot::channel();
         self.tx.send(CoreMsg::Connect(request, tx)).await.ok()?;
@@ -426,6 +435,9 @@ impl Core {
                     self.client_updated(session);
                 }
             }
+            CoreMsg::DeviceAuthorized(account_key, device_key, reply) => {
+                let _ = reply.send(self.store.device_revoked(&account_key, &device_key).is_ok_and(|revoked| !revoked));
+            }
             CoreMsg::Info(reply) => {
                 let _ = reply.send(self.info.clone());
             }
@@ -557,7 +569,7 @@ impl Core {
                 "this device certificate expired; enter your password to renew it",
             );
         }
-        if r.device.as_deref().is_some_and(|d| self.store.device_revoked(&r.public_key, d).unwrap_or(false)) {
+        if r.device.as_deref().is_some_and(|d| self.store.device_revoked(&r.public_key, d).unwrap_or(true)) {
             return fail(ErrorCode::NotAuthenticated, "this device was signed out of its Gwar account");
         }
         if let Some(ban) = self.ban_for(Some(&r.uid), r.ip) {
@@ -968,7 +980,7 @@ impl Core {
 
     fn request(&mut self, session: SessionId, id: u32, request: Request) -> Option<Reply> {
         let result = match request {
-            Request::Hello(_) => Err(err(ErrorCode::BadRequest, "already authenticated")),
+            Request::Hello(_) | Request::Join(_) => Err(err(ErrorCode::BadRequest, "already authenticated")),
             Request::Ping {} => Ok(Response::Empty {}),
             Request::ClientUpdate(update) => self.client_update(session, update),
             Request::ClientMove { client, channel } => self.client_move(session, client, channel),

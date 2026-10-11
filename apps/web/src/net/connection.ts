@@ -6,7 +6,11 @@ import type { Welcome } from "../proto/Welcome";
 import type { Challenge } from "../proto/Challenge";
 import type { Event } from "../proto/Event";
 import { encodeRequest, parseFrame, type ParsedFrame } from "./frames";
-import { challengeMessage, normalizeHost, type Identity } from "./identity";
+import type { Identity } from "./identity";
+import type { Hello } from "../proto/Hello";
+import { certificateHash, decodeFixed, helloStatement, newNonce, normalizeEndpoint, verifyProof } from "./handshake";
+import { checkCandidate, serverPins, ServerIdentityChanged, type PinStore } from "./server-pins";
+import { isLoopbackHost } from "./address";
 import {
   PROTOCOL_VERSION,
   type EventData,
@@ -36,6 +40,8 @@ export type ConnectErrorKind =
   | "banned" // the server refuses this user or address; the message says why and until when
   | "certificate_expired" // the Gwar Connect device certificate we sent has run out; renew it in Settings > Account
   | "rejected" // any other error reply to hello (bad nickname, ...)
+  | "server_identity"
+  | "insecure_transport"
   | "protocol"; // protocol version mismatch or malformed handshake
 
 export class ConnectError extends Error {
@@ -45,6 +51,7 @@ export class ConnectError extends Error {
     readonly serverName?: string,
     /** Who banned us, why and until when (with `banned`). */
     readonly ban?: BanNotice,
+    readonly identityChange?: ServerIdentityChanged,
   ) {
     super(message);
     this.name = "ConnectError";
@@ -101,6 +108,9 @@ export interface ConnectionOptions {
   serverPassword?: string;
   /** Invite code: admits without the server password. Used for the first connect only. */
   invite?: string;
+  inviteServerKey?: string;
+  insecureLan?: boolean;
+  pinStore?: PinStore;
   client: ClientInfo;
   /** Test seams. */
   createSocket?: (url: string) => WebSocketLike;
@@ -158,6 +168,8 @@ function isFatal(e: ConnectError): boolean {
     e.kind === "wrong_password" ||
     e.kind === "password_required" ||
     e.kind === "protocol" ||
+    e.kind === "server_identity" ||
+    e.kind === "insecure_transport" ||
     e.kind === "rejected" ||
     e.kind === "certificate_expired" ||
     e.kind === "banned"
@@ -166,12 +178,14 @@ function isFatal(e: ConnectError): boolean {
 
 /**
  * What the controller needs from a server session, whatever the transport:
- * `Connection` (WebSocket, vc/1) or `TsConnection` (Tauri bridge to a
- * TeamSpeak server, see ts-connection.ts). Both speak vc/1 shapes.
+ * `Connection` (WebSocket, vc/3) or `TsConnection` (Tauri bridge to a
+ * TeamSpeak server, see ts-connection.ts). Both speak vc/3 shapes.
  */
 export interface Link {
   readonly status: ConnectionStatus;
   readonly isOnline: boolean;
+  readonly serverKey?: string | null;
+  readonly endpoint?: string;
   onStatus(handler: (status: ConnectionStatus) => void): () => void;
   onWelcome(handler: (welcome: Welcome, resync: boolean) => void): () => void;
   on<E extends EventName>(ev: E, handler: (data: EventData<E>) => void): () => void;
@@ -192,11 +206,15 @@ interface Pending {
 type Handler = (data: never) => void;
 
 /**
- * One logical vc/1 session: handshake, request correlation, typed events and
+ * One logical vc/3 session: handshake, request correlation, typed events and
  * automatic reconnection. Every (re)connect ends with a fresh Welcome, which
  * `onWelcome` delivers so consumers can replace all derived state.
  */
 export class Connection implements Link {
+  private serverKey_: string | null = null;
+  get serverKey(): string | null { return this.serverKey_; }
+  readonly endpoint: string;
+
   private status_: ConnectionStatus = { state: "idle" };
   private socket: WebSocketLike | null = null;
   private nextId = 1;
@@ -217,6 +235,8 @@ export class Connection implements Link {
   private invite: string | undefined;
 
   constructor(private readonly options: ConnectionOptions) {
+    try { this.endpoint = normalizeEndpoint(options.url); }
+    catch (e) { throw new ConnectError("protocol", e instanceof Error ? e.message : String(e)); }
     this.invite = options.invite;
   }
 
@@ -348,7 +368,7 @@ export class Connection implements Link {
 
   /** Opens a socket, runs challenge/hello, and leaves the socket wired for normal traffic. */
   private openAndHandshake(): Promise<Welcome> {
-    const { url, identity, nickname, serverPassword, client } = this.options;
+    const { identity, nickname, serverPassword, client } = this.options;
     const create = this.options.createSocket ?? ((u: string) => new WebSocket(u) as unknown as WebSocketLike);
     const timeoutMs = this.options.handshakeTimeoutMs ?? 10_000;
     const generation = ++this.generation;
@@ -357,12 +377,17 @@ export class Connection implements Link {
 
     return new Promise<Welcome>((resolve, reject) => {
       let socket: WebSocketLike;
-      let host: string;
+      let endpoint: string;
       try {
-        host = normalizeHost(url);
-        socket = create(url);
+        endpoint = this.endpoint;
+        const parsed = new URL(endpoint);
+        if (parsed.protocol === "ws:" && !isLoopbackHost(parsed.hostname) && !(client.platform === "desktop" && this.options.insecureLan === true)) {
+          throw new ConnectError("insecure_transport", "TLS is required for this server");
+        }
+        this.serverKey_ = null;
+        socket = create(endpoint);
       } catch (e) {
-        reject(new ConnectError("unreachable", e instanceof Error ? e.message : String(e)));
+        reject(e instanceof ConnectError ? e : new ConnectError("protocol", e instanceof Error ? e.message : String(e)));
         return;
       }
       let settled = false;
@@ -383,23 +408,27 @@ export class Connection implements Link {
         reject(error);
       };
       this.abortHandshake = () => fail(new ConnectError("unreachable", "closed"));
+      let gotChallenge = false;
       const timer = setTimeout(
-        () => fail(new ConnectError("timeout", "server did not complete the handshake", serverName)),
+        () => fail(gotChallenge && this.serverKey_ === null
+          ? new ConnectError("protocol", "missing server proof", serverName)
+          : new ConnectError("timeout", "server did not complete the handshake", serverName)),
         timeoutMs,
       );
       this.socket = socket;
-      let gotChallenge = false;
 
       socket.onerror = () => {
         /* followed by onclose; reported there */
       };
       socket.onclose = () => {
-        fail(new ConnectError("unreachable", "connection closed during handshake", serverName));
+        fail(gotChallenge && this.serverKey_ === null
+          ? new ConnectError("protocol", "missing server proof", serverName)
+          : new ConnectError("unreachable", "connection closed during handshake", serverName));
       };
       socket.onmessage = (msg) => {
         if (settled || generation !== this.generation || typeof msg.data !== "string") return;
         const frame = parseFrame(msg.data);
-        if (!frame) return;
+        if (!frame) { fail(new ConnectError("protocol", "malformed handshake frame")); return; }
         if (!gotChallenge) {
           if (frame.kind !== "event" || frame.event.ev !== "challenge") {
             fail(new ConnectError("protocol", "expected challenge"));
@@ -407,7 +436,11 @@ export class Connection implements Link {
           }
           gotChallenge = true;
           const challenge: Challenge = frame.event.d;
-          serverName = challenge.server.name;
+          if (!challenge || typeof challenge !== "object") {
+            fail(new ConnectError("protocol", "malformed challenge"));
+            return;
+          }
+          serverName = challenge.server?.name;
           if (challenge.protocol !== PROTOCOL_VERSION) {
             fail(new ConnectError("protocol", `server speaks protocol ${challenge.protocol}`, serverName));
             return;
@@ -416,7 +449,7 @@ export class Connection implements Link {
             fail(new ConnectError("password_required", "server password required", serverName));
             return;
           }
-          void this.sendHello(socket, host, challenge, nickname, serverPassword, identity, client, timeoutMs)
+          void this.sendHello(socket, endpoint, challenge, nickname, serverPassword, identity, client, timeoutMs)
             .then((welcome) => {
               if (settled) return;
               settled = true;
@@ -426,10 +459,16 @@ export class Connection implements Link {
               resolve(welcome);
             })
             .catch((e: unknown) => {
-              if (e instanceof RequestError) fail(mapHelloError(e.code, e.message, serverName, e.ban, identity.device));
-              else if (e instanceof RequestTimeoutError) fail(new ConnectError("timeout", e.message, serverName));
+              if (e instanceof ServerIdentityChanged) fail(new ConnectError("server_identity", e.message, serverName, undefined, e));
+              else if (e instanceof ConnectError) fail(e);
+              else if (e instanceof RequestError) fail(mapHelloError(e.code, e.message, serverName, e.ban, identity.device));
+              else if (e instanceof RequestTimeoutError) fail(new ConnectError(e.op === "hello" ? "protocol" : "timeout", e.op === "hello" ? "missing server proof" : e.message, serverName));
               else fail(new ConnectError("protocol", e instanceof Error ? e.message : String(e), serverName));
             });
+          return;
+        }
+        if (frame.kind === "event" || !this.pending.has(frame.re)) {
+          fail(new ConnectError("protocol", "unexpected handshake frame"));
           return;
         }
         this.routeFrame(frame);
@@ -439,7 +478,7 @@ export class Connection implements Link {
 
   private async sendHello(
     socket: WebSocketLike,
-    host: string,
+    endpoint: string,
     challenge: Challenge,
     nickname: string,
     serverPassword: string | undefined,
@@ -447,23 +486,40 @@ export class Connection implements Link {
     client: ClientInfo,
     timeoutMs: number,
   ): Promise<Welcome> {
-    const signature = await identity.sign(challengeMessage(host, challenge.nonce, identity.publicKey));
-    const hello: Record<string, unknown> = {
+    const current = () => {
+      if (this.socket !== socket || socket.readyState !== OPEN) throw new ConnectionLostError();
+    };
+    decodeFixed(challenge.server_nonce, 32);
+    const pins = this.options.pinStore ?? serverPins;
+    checkCandidate(endpoint, challenge.server_pk, pins, this.options.inviteServerKey);
+    const hello: Hello = {
       protocol: PROTOCOL_VERSION,
       nickname,
-      public_key: identity.publicKey,
-      host,
-      signature,
+      endpoint,
+      expected_server_pk: challenge.server_pk,
+      server_nonce: challenge.server_nonce,
+      client_nonce: newNonce(),
+      client_signing_pk: identity.publicKey,
+      certificate_hash: await certificateHash(identity.device),
+      signature: "",
+      certificate: identity.device,
       client,
     };
-    if (identity.device) hello.device = identity.device;
-    if (serverPassword) hello.server_password = serverPassword;
-    if (this.invite) hello.invite = this.invite;
-    return this.send(socket, "hello", hello, timeoutMs, 1);
+    if ([nickname, client.name, client.version].some((value) => /[\r\n]/.test(value))) throw new Error("invalid hello metadata");
+    current();
+    hello.signature = await identity.sign(new TextEncoder().encode(helloStatement(hello)));
+    decodeFixed(hello.signature, 64);
+    current();
+    const proof = await this.send(socket, "hello", hello as unknown as Record<string, unknown>, timeoutMs, 1);
+    await verifyProof(hello, proof);
+    current();
+    pins.commit(endpoint, hello.expected_server_pk);
+    this.serverKey_ = hello.expected_server_pk;
+    return this.send(socket, "join", { server_password: serverPassword, invite: this.invite }, timeoutMs, 2);
   }
 
   private wireSocket(socket: WebSocketLike, generation: number): void {
-    this.nextId = 2;
+    this.nextId = 3;
     socket.onmessage = (msg) => {
       if (generation !== this.generation || typeof msg.data !== "string") return;
       const frame = parseFrame(msg.data);

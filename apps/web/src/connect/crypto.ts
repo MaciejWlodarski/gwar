@@ -44,10 +44,10 @@ export function checkKdf(kdf: Kdf): void {
     throw new Error("Unsupported password key derivation profile");
   }
 }
-/** Device certificates are valid for at most 400 days; we issue 365. */
-export const CERTIFICATE_DAYS = 365;
+/** Device certificates are valid for at most 90 days. */
+export const CERTIFICATE_DAYS = 90;
 /** What servers accept at most. */
-export const MAX_CERTIFICATE_DAYS = 400;
+export const MAX_CERTIFICATE_DAYS = 90;
 
 export interface Secrets {
   encKey: Uint8Array;

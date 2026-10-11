@@ -119,7 +119,7 @@ async fn invites_admit_without_password_grant_groups_and_run_out() {
     let with_invite = |code: String| {
         move |raw: &RawConn, key: &_| {
             let mut hello = raw.hello(key, "guest", None);
-            hello["invite"] = json!(code);
+            hello["join"]["invite"] = json!(code);
             hello
         }
     };
@@ -143,7 +143,7 @@ async fn members_return_without_the_password_and_keep_invites_unspent() {
     let hello = |code: String| {
         move |raw: &RawConn, key: &_| {
             let mut hello = raw.hello(key, "guest", None);
-            hello["invite"] = json!(code);
+            hello["join"]["invite"] = json!(code);
             hello
         }
     };
@@ -182,9 +182,9 @@ async fn server_settings_change_password_default_channel_and_limits() {
     assert_eq!(info["default_channel"], general);
     assert_eq!(info["max_clients"], 10);
 
-    let mut raw = open(&server).await;
+    let raw = open(&server).await;
     assert_eq!(raw.challenge["password_required"], true);
-    let err = raw.rejected(raw.hello(&new_key(), "x", None)).await;
+    let err = Client::connect_as(&server, new_key(), "x", None).await.err().expect("join requires the password");
     assert_eq!(err.code, vc_proto::ErrorCode::WrongPassword);
     Client::connect_as(&server, new_key(), "y", Some("hunter2")).await.expect("new password works");
 

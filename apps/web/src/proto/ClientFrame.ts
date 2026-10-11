@@ -8,13 +8,14 @@ import type { GroupCreate } from "./GroupCreate";
 import type { GroupUpdate } from "./GroupUpdate";
 import type { Hello } from "./Hello";
 import type { InviteCreate } from "./InviteCreate";
+import type { Join } from "./Join";
 import type { MemberPrune } from "./MemberPrune";
 import type { ServerUpdate } from "./ServerUpdate";
 
 /**
  * Client → server frame.
  */
-export type ClientFrame = { id: number, } & ({ "op": "hello", "d": Hello } | { "op": "ping", "d": Record<symbol, never> } | { "op": "client.update", "d": ClientUpdate } | { "op": "client.move", "d": { client: number, channel: number, } } | { "op": "client.kick", "d": { client: number, reason: string | null, } } | { "op": "channel.join", "d": { channel: number, password: string | null, } } | { "op": "channel.leave", "d": Record<symbol, never> } | { "op": "channel.create", "d": ChannelCreate } | { "op": "channel.update", "d": ChannelUpdate } | { "op": "channel.delete", "d": { channel: number, } } | { "op": "chat.send", "d": { target: ChatTarget, text: string, 
+export type ClientFrame = { id: number, } & ({ "op": "hello", "d": Hello } | { "op": "join", "d": Join } | { "op": "ping", "d": Record<symbol, never> } | { "op": "client.update", "d": ClientUpdate } | { "op": "client.move", "d": { client: number, channel: number, } } | { "op": "client.kick", "d": { client: number, reason: string | null, } } | { "op": "channel.join", "d": { channel: number, password: string | null, } } | { "op": "channel.leave", "d": Record<symbol, never> } | { "op": "channel.create", "d": ChannelCreate } | { "op": "channel.update", "d": ChannelUpdate } | { "op": "channel.delete", "d": { channel: number, } } | { "op": "chat.send", "d": { target: ChatTarget, text: string, 
 /**
  * Users mentioned as `@nickname` in `text` (the text stays readable as is).
  */

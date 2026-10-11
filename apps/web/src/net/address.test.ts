@@ -12,13 +12,13 @@ const url = (input: string, page: PageContext) => {
 };
 
 describe("parseServerAddress", () => {
-  it("bare host on an http page gets ws and the default port", () => {
-    expect(url("voice.example.com", http)).toBe("ws://voice.example.com:8790/ws");
-    expect(url("  1.2.3.4  ", http)).toBe("ws://1.2.3.4:8790/ws");
+  it("bare host on an http page gets wss", () => {
+    expect(url("voice.example.com", http)).toBe("wss://voice.example.com/ws");
+    expect(url("  1.2.3.4  ", http)).toBe("wss://1.2.3.4/ws");
   });
 
   it("keeps an explicit port", () => {
-    expect(url("1.2.3.4:9000", http)).toBe("ws://1.2.3.4:9000/ws");
+    expect(url("1.2.3.4:9000", http)).toBe("wss://1.2.3.4:9000/ws");
     expect(url("voice.example.com:8790", https)).toBe("wss://voice.example.com:8790/ws");
   });
 
@@ -50,26 +50,27 @@ describe("parseServerAddress", () => {
   it("the desktop app reaches domain names over wss and local hosts over plain ws", () => {
     expect(url("voice.example.com", tauri)).toBe("wss://voice.example.com/ws");
     expect(url("voice.example.com", windowsApp)).toBe("wss://voice.example.com/ws");
-    expect(url("voice.example.com:8790", tauri)).toBe("ws://voice.example.com:8790/ws");
-    expect(url("1.2.3.4", tauri)).toBe("ws://1.2.3.4:8790/ws");
+    expect(url("voice.example.com:8790", tauri)).toBe("wss://voice.example.com:8790/ws");
+    expect(url("1.2.3.4", tauri)).toBe("wss://1.2.3.4/ws");
     expect(url("localhost", tauri)).toBe("ws://localhost:8790/ws");
     expect(url("::1", tauri)).toBe("ws://[::1]:8790/ws");
-    expect(url("nas", tauri)).toBe("ws://nas:8790/ws");
-    expect(url("pc.local", windowsApp)).toBe("ws://pc.local:8790/ws");
-    expect(url("ws://voice.example.com", tauri)).toBe("ws://voice.example.com/ws");
+    expect(url("nas", tauri)).toBe("wss://nas/ws");
+    expect(url("pc.local", windowsApp)).toBe("wss://pc.local/ws");
+    expect(url("ws://voice.example.com", tauri)).toBe("insecure");
     expect(url("https://192.168.1.10", tauri)).toBe("wss://192.168.1.10/ws");
   });
 
   it("honours explicit schemes and maps http(s) to ws(s)", () => {
     expect(url("wss://x.example/ws", http)).toBe("wss://x.example/ws");
-    expect(url("ws://x.example", http)).toBe("ws://x.example/ws");
+    expect(url("ws://x.example", http)).toBe("insecure");
     expect(url("https://x.example", http)).toBe("wss://x.example/ws");
     expect(url("http://x.example:81", https)).toBe("mixed_content");
     expect(url("ws://localhost:8790", https)).toBe("ws://localhost:8790/ws");
   });
 
-  it("keeps explicit paths and drops query/hash", () => {
-    expect(url("wss://x.example/custom/ws?a=1#b", http)).toBe("wss://x.example/custom/ws");
+  it("keeps explicit paths and rejects query/hash", () => {
+    expect(url("wss://x.example/custom/ws", http)).toBe("wss://x.example/custom/ws");
+    expect(url("wss://x.example/custom/ws?a=1#b", http)).toBe("invalid");
   });
 
   it("handles IPv6", () => {
@@ -92,7 +93,7 @@ describe("parseServerAddress", () => {
     const r = parseServerAddress("voice.example.com", https);
     expect(r.ok && r.value.label).toBe("voice.example.com");
     const r2 = parseServerAddress("1.2.3.4", http);
-    expect(r2.ok && r2.value.label).toBe("1.2.3.4:8790");
+    expect(r2.ok && r2.value.label).toBe("1.2.3.4");
   });
 });
 
@@ -118,5 +119,14 @@ describe("file URL confinement", () => {
     }
     expect(() => absoluteUrl(null, "/files/a/b")).toThrow();
     expect(() => absoluteUrl("https://u:p@voice.example", "/files/a/b")).toThrow();
+  });
+});
+
+describe("explicit desktop LAN opt-in", () => {
+  it("applies only to the chosen server and never to web connections", () => {
+    expect(parseServerAddress("ws://192.168.1.2:8790", tauri).ok).toBe(false);
+    expect(parseServerAddress("ws://192.168.1.2:8790", tauri, true)).toMatchObject({ ok: true, value: { secure: false } });
+    expect(parseServerAddress("ws://192.168.1.2:8790", http, true).ok).toBe(false);
+    expect(parseServerAddress("ws://127.attacker.example", tauri).ok).toBe(false);
   });
 });

@@ -21,6 +21,7 @@ import { Toaster } from "./ui/Toaster";
 export function App() {
   const t = useT();
   const isMobile = useIsMobile();
+  const insecureConnection = useSession((s) => s.insecureConnection);
   const phase = useSession((s) => s.phase);
   const serverName = useSession((s) => s.server?.name);
   const unread = useSession((s) => {
@@ -54,17 +55,20 @@ export function App() {
 
   return (
     <TooltipProvider>
-      <div className="flex h-dvh w-full overflow-hidden bg-rail">
-        {!isMobile && <ServerRail />}
-        {showApp ? (
-          <>
-            {!isMobile && <Sidebar />}
-            <ChatArea />
-            {!isMobile && members.open && <MemberList />}
-          </>
-        ) : (
-          <ConnectScreen />
-        )}
+      <div className="flex h-dvh w-full flex-col overflow-hidden bg-rail">
+        {showApp && insecureConnection && <div role="alert" className="shrink-0 bg-red-700 px-4 py-2 text-sm text-white">{t("security.insecureWarning")}</div>}
+        <div className="flex min-h-0 w-full flex-1 overflow-hidden">
+          {!isMobile && <ServerRail />}
+          {showApp ? (
+            <>
+              {!isMobile && <Sidebar />}
+              <ChatArea />
+              {!isMobile && members.open && <MemberList />}
+            </>
+          ) : (
+            <ConnectScreen />
+          )}
+        </div>
       </div>
       {isMobile && (
         <DialogPrimitive.Root open={drawerOpen} onOpenChange={setDrawer}>

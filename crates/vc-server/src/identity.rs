@@ -5,10 +5,10 @@
 //! attach groups to them without a third party.
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
-use vc_proto::{DeviceCertificate, ErrorCode, Uid, challenge_message};
+use vc_proto::{DeviceCertificate, ErrorCode, Hello, Uid, certificate_hash, decode_fixed, hello_statement};
 
 pub fn new_nonce() -> String {
     let mut bytes = [0u8; 32];
@@ -22,16 +22,16 @@ pub fn uid_for_key(public_key: &[u8; 32]) -> Uid {
 }
 
 /// Verifies a `hello` signature and returns the identity's uid.
-pub fn verify_hello(host: &str, nonce: &str, public_key: &str, signature: &str) -> Option<Uid> {
-    let key: [u8; 32] = URL_SAFE_NO_PAD.decode(public_key).ok()?.try_into().ok()?;
-    let signature: [u8; 64] = URL_SAFE_NO_PAD.decode(signature).ok()?.try_into().ok()?;
+pub fn verify_hello(hello: &Hello) -> Option<Uid> {
+    let key = decode_fixed::<32>(&hello.client_signing_pk)?;
+    let signature = decode_fixed::<64>(&hello.signature)?;
     let verifying = VerifyingKey::from_bytes(&key).ok()?;
-    verifying.verify(&challenge_message(host, nonce, public_key), &Signature::from_bytes(&signature)).ok()?;
+    verifying.verify_strict(hello_statement(hello)?.as_bytes(), &Signature::from_bytes(&signature)).ok()?;
     Some(uid_for_key(&key))
 }
 
 /// Device certificates last at most this long (docs/connect.md).
-const MAX_CERT_MS: i64 = 400 * 24 * 3600 * 1000;
+const MAX_CERT_MS: i64 = 90 * 24 * 3600 * 1000;
 const SKEW_MS: i64 = 5 * 60 * 1000;
 
 pub fn device_statement(c: &DeviceCertificate) -> String {
@@ -44,10 +44,10 @@ pub fn revoke_statement(account_key: &str, device_key: &str, revoked_at: i64) ->
 
 /// Whether `signature` is `public`'s Ed25519 signature of `message`.
 pub fn signed_by(public: &str, message: &str, signature: &str) -> bool {
-    let Some(key) = URL_SAFE_NO_PAD.decode(public).ok().and_then(|k| <[u8; 32]>::try_from(k).ok()) else {
+    let Some(key) = decode_fixed::<32>(public) else {
         return false;
     };
-    let Some(signature) = URL_SAFE_NO_PAD.decode(signature).ok().and_then(|s| <[u8; 64]>::try_from(s).ok()) else {
+    let Some(signature) = decode_fixed::<64>(signature) else {
         return false;
     };
     VerifyingKey::from_bytes(&key)
@@ -61,7 +61,10 @@ pub fn verify_device(c: &DeviceCertificate, public_key: &str, now: i64) -> Resul
     if c.device_key != public_key {
         return Err(invalid("the certificate is for another device"));
     }
-    if c.issued_at > now + SKEW_MS || c.expires_at - c.issued_at > MAX_CERT_MS {
+    if certificate_hash(Some(c)).is_none()
+        || c.issued_at > now + SKEW_MS
+        || c.expires_at.saturating_sub(c.issued_at) > MAX_CERT_MS
+    {
         return Err(invalid("the device certificate is not valid"));
     }
     if !signed_by(&c.account_key, &device_statement(c), &c.signature) {
@@ -77,33 +80,7 @@ pub fn verify_device(c: &DeviceCertificate, public_key: &str, now: i64) -> Resul
 }
 
 #[cfg(test)]
-pub mod test_support {
-    use super::*;
-    use ed25519_dalek::{Signer, SigningKey};
-
-    pub struct TestIdentity(pub SigningKey);
-
-    impl TestIdentity {
-        pub fn generate() -> Self {
-            let mut seed = [0u8; 32];
-            rand::rng().fill_bytes(&mut seed);
-            Self(SigningKey::from_bytes(&seed))
-        }
-
-        pub fn public_key(&self) -> String {
-            URL_SAFE_NO_PAD.encode(self.0.verifying_key().as_bytes())
-        }
-
-        pub fn sign(&self, host: &str, nonce: &str) -> String {
-            let message = challenge_message(host, nonce, &self.public_key());
-            URL_SAFE_NO_PAD.encode(self.0.sign(&message).to_bytes())
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
-    use super::test_support::TestIdentity;
     use super::*;
 
     #[test]
@@ -118,19 +95,5 @@ mod tests {
             println!("{} {uid}", URL_SAFE_NO_PAD.encode(key));
             assert_eq!(uid, expected);
         }
-    }
-
-    #[test]
-    fn accepts_valid_and_rejects_replayed_signature() {
-        let id = TestIdentity::generate();
-        let nonce = new_nonce();
-        let signature = id.sign("b.example", &nonce);
-        let uid = verify_hello("b.example", &nonce, &id.public_key(), &signature).expect("valid");
-        assert_eq!(uid.len(), 27);
-        assert!(verify_hello("b.example", &new_nonce(), &id.public_key(), &signature).is_none());
-        assert!(verify_hello("a.example", &nonce, &id.public_key(), &signature).is_none());
-        let other = TestIdentity::generate();
-        assert!(verify_hello("b.example", &nonce, &other.public_key(), &signature).is_none());
-        assert!(verify_hello("b.example", &nonce, "not-base64!", &signature).is_none());
     }
 }

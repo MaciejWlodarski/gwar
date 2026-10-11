@@ -17,6 +17,8 @@ import type { LeaveReason } from "../proto/LeaveReason";
 import type { Member } from "../proto/Member";
 import type { Permission } from "../proto/Permission";
 import type { Platform } from "../proto/Platform";
+import type { ServerProof } from "../proto/ServerProof";
+import { decodeFixed } from "./handshake";
 import type { ServerInfo } from "../proto/ServerInfo";
 import type { Unread } from "../proto/Unread";
 import type { Welcome } from "../proto/Welcome";
@@ -51,7 +53,12 @@ const path = (put = false): Rule<string> => (v): v is string => {
   try { filePath(v, put ? "PUT" : "GET"); return true; } catch { return false; }
 };
 const server = shape<ServerInfo>({ name: str(256), welcome: text, version: str(64), default_channel: id, max_clients: int(65535), upload_limit: int(Number.MAX_SAFE_INTEGER) });
-const challenge = shape<Challenge>({ protocol: int(255), nonce: str(128), server, password_required: bool });
+const fixed = (bytes: number): Rule<string> => (v): v is string => {
+  if (typeof v !== "string" || v.length !== Math.ceil(bytes * 4 / 3)) return false;
+  try { decodeFixed(v, bytes); return true; } catch { return false; }
+};
+const challenge = shape<Challenge>({ protocol: int(255), server_pk: fixed(32), server_nonce: fixed(32), server, password_required: bool });
+const serverProof = shape<ServerProof>({ server_proof: fixed(64) });
 const channel = shape<Channel>({ id, parent: nullable(id), name: str(256), topic: text, position: int(2147483647, -2147483648), has_password: bool, max_clients: nullable(int(65535)) });
 const client = shape<Client>({ id, uid, nickname: str(256), channel: nullable(id), groups: ids, platform, muted: bool, deafened: bool, away: nullable(text), talking: bool, voice: bool });
 const color: Rule<string> = (v): v is string => typeof v === "string" && /^#[0-9a-f]{6}$/i.test(v);
@@ -90,7 +97,7 @@ export const events: { [K in EventName]: Rule<EventData<K>> } = {
   "voice.closed": shape({ reason: text }), "chat.read": shape({ channel: id, message: id }), "disconnected": shape({ reason: leave }),
 };
 export const responses: { [K in Op]: Rule<ResponseMap[K]> } = {
-  hello: welcome, ping: empty, "client.update": empty, "client.move": empty, "client.kick": empty,
+  hello: serverProof, join: welcome, ping: empty, "client.update": empty, "client.move": empty, "client.kick": empty,
   "channel.join": empty, "channel.leave": empty, "channel.create": channel, "channel.update": channel, "channel.delete": empty,
   "chat.send": message, "chat.edit": message, "chat.delete": empty, "chat.read": empty,
   "chat.history": shape({ messages: array(message, 100) }), "server.update": empty,

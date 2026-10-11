@@ -1,4 +1,4 @@
-//! WebSocket gateway for the `vc/2` protocol: authentication, framing,
+//! WebSocket gateway for the `vc/3` protocol: authentication, framing,
 //! rate limiting and the per-connection write queue.
 
 use std::{
@@ -16,11 +16,14 @@ use axum::{
     http::HeaderMap,
     response::Response,
 };
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use ed25519_dalek::{Signer, SigningKey};
 use futures::{SinkExt, StreamExt, stream::SplitStream};
 use tokio::{sync::mpsc, time::timeout};
 use tracing::debug;
 use vc_proto::{
-    Challenge, ClientFrame, ErrorBody, ErrorCode, Event, LeaveReason, PROTOCOL_VERSION, Request, ServerFrame,
+    Challenge, ClientFrame, ErrorBody, ErrorCode, Event, LeaveReason, PROTOCOL_VERSION, Request,
+    Response as ProtocolResponse, ServerFrame, ServerProof, server_proof_statement,
 };
 
 use crate::{
@@ -34,8 +37,9 @@ pub struct Gateway {
     pub preauth: crate::preauth::PreAuth,
     /// Argon2 hash of the server password, if one is set (changes with settings).
     pub password: ServerPassword,
-    /// Empty means login relay protection is off. Never derived from HTTP headers.
-    pub public_hosts: Arc<HashSet<String>>,
+    pub public_endpoints: Arc<HashSet<String>>,
+    pub insecure_any_host: bool,
+    pub server_key: Arc<SigningKey>,
 }
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
@@ -104,11 +108,12 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
     let nonce = identity::new_nonce();
     let challenge = Challenge {
         protocol: PROTOCOL_VERSION,
-        nonce: nonce.clone(),
+        server_nonce: nonce.clone(),
+        server_pk: URL_SAFE_NO_PAD.encode(gateway.server_key.verifying_key().as_bytes()),
         server,
         password_required: gateway.password.load().is_some(),
     };
-    if sink.send(text(&ServerFrame::Event(Event::Challenge(challenge)))).await.is_err() {
+    if sink.send(text(&ServerFrame::Event(Event::Challenge(challenge.clone())))).await.is_err() {
         return;
     }
 
@@ -128,23 +133,31 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
             return;
         }
     };
+    if [&hello.nickname, &hello.client.name, &hello.client.version].iter().any(|field| field.contains(['\r', '\n'])) {
+        let _ = sink.send(error(id, ErrorCode::BadRequest, "invalid hello fields")).await;
+        return;
+    }
     if hello.protocol != PROTOCOL_VERSION {
         let _ = sink.send(error(id, ErrorCode::BadRequest, "unsupported protocol version")).await;
         return;
     }
-    if !gateway.public_hosts.is_empty() && !gateway.public_hosts.contains(&hello.host) {
+    if !gateway.insecure_any_host && !gateway.public_endpoints.contains(&hello.endpoint) {
         let _ = sink.send(error(id, ErrorCode::NotAuthenticated, "this signature is for another server")).await;
         return;
     }
-    let Some(mut uid) = identity::verify_hello(&hello.host, &nonce, &hello.public_key, &hello.signature) else {
+    if hello.expected_server_pk != challenge.server_pk || hello.server_nonce != nonce {
+        let _ = sink.send(error(id, ErrorCode::NotAuthenticated, "wrong server key or nonce")).await;
+        return;
+    }
+    let Some(mut uid) = identity::verify_hello(&hello) else {
         let _ = sink.send(error(id, ErrorCode::NotAuthenticated, "invalid identity signature")).await;
         return;
     };
     // A Gwar Connect device speaks for its account: the identity is the account key.
-    let mut identity_key = hello.public_key.clone();
+    let mut identity_key = hello.client_signing_pk.clone();
     let mut device = None;
-    if let Some(certificate) = &hello.device {
-        match identity::verify_device(certificate, &hello.public_key, crate::core::now_ms()) {
+    if let Some(certificate) = &hello.certificate {
+        match identity::verify_device(certificate, &hello.client_signing_pk, crate::core::now_ms()) {
             Ok(account_uid) => {
                 uid = account_uid;
                 identity_key = certificate.account_key.clone();
@@ -156,6 +169,45 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
             }
         }
     }
+    if let Some(key) = &device
+        && !gateway.core.device_authorized(&identity_key, key).await
+    {
+        let _ =
+            sink.send(error(id, ErrorCode::NotAuthenticated, "this device was signed out of its Gwar account")).await;
+        return;
+    }
+    let proof = ServerProof {
+        server_proof: URL_SAFE_NO_PAD.encode(
+            gateway.server_key.sign(server_proof_statement(&hello).expect("validated hello").as_bytes()).to_bytes(),
+        ),
+    };
+    if sink.send(text(&ServerFrame::Ok { re: id, ok: ProtocolResponse::ServerProof(proof) })).await.is_err() {
+        return;
+    }
+    let Some(raw) = next_text(&mut stream, HELLO_TIMEOUT).await else { return };
+    if !gateway.preauth.hello(ip) {
+        let _ = sink.send(error(0, ErrorCode::RateLimited, "too many authentication frames")).await;
+        return;
+    }
+    let (id, join) = match serde_json::from_str::<ClientFrame>(&raw) {
+        Ok(ClientFrame { id, request: Request::Join(join) }) => (id, join),
+        Ok(frame) => {
+            let _ = sink.send(error(frame.id, ErrorCode::NotAuthenticated, "send join after server proof")).await;
+            return;
+        }
+        Err(_) => {
+            let _ = sink.send(error(0, ErrorCode::BadRequest, "malformed join")).await;
+            return;
+        }
+    };
+    // A certificate may expire while waiting for join.
+    if let Some(certificate) = &hello.certificate
+        && let Err((code, problem)) =
+            identity::verify_device(certificate, &hello.client_signing_pk, crate::core::now_ms())
+    {
+        let _ = sink.send(error(id, code, problem)).await;
+        return;
+    }
     // Whether the password matched; the core decides what that means (members
     // come back without it, an invite admits newcomers).
     let current = gateway.password.load_full();
@@ -166,7 +218,7 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
                 let _ = sink.send(error(id, ErrorCode::RateLimited, "password verification busy")).await;
                 return;
             };
-            let password = hello.server_password.clone().unwrap_or_default();
+            let password = join.server_password.clone().unwrap_or_default();
             password.len() <= 128
                 && tokio::task::spawn_blocking(move || {
                     let _permit = permit;
@@ -183,12 +235,12 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
         uid,
         public_key: identity_key,
         device,
-        device_expires_at: hello.device.as_ref().map(|c| c.expires_at),
+        device_expires_at: hello.certificate.as_ref().map(|c| c.expires_at),
         nickname: hello.nickname,
         platform: hello.client.platform,
         out: out.clone(),
         ip: Some(ip),
-        invite: hello.invite,
+        invite: join.invite,
         password_ok,
     };
     let session = gateway.core.connect(request).await;

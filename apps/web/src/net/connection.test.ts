@@ -12,13 +12,15 @@ import {
 } from "./connection";
 import { parseServerAddress } from "./address";
 import { encodeRequest, parseFrame } from "./frames";
-import { challengeMessage, generateIdentity } from "./identity";
+import { generateIdentity } from "./identity";
+import { helloStatement, newNonce } from "./handshake";
 import { decodeBase64Url } from "./base64url";
-import { challenge, fakeIdentity, FakeSocket, welcome } from "./testing";
+import { challenge, fakeIdentity, FakeSocket, welcome, finishHandshake, memoryPins, testServerIdentity } from "./testing";
 
 function make(overrides: Partial<ConnectionOptions> = {}) {
   return new Connection({
-    url: "ws://test/ws",
+    url: "ws://127.0.0.1/ws",
+    pinStore: memoryPins(),
     identity: fakeIdentity,
     nickname: "Ann",
     client: { name: "vc-web", version: "0.1.0", platform: "web" },
@@ -35,7 +37,7 @@ async function handshake(conn: Connection, w = welcome()) {
   s.open();
   s.push(challenge());
   await vi.waitFor(() => expect(s.sent.length).toBe(1));
-  s.push({ re: 1, ok: w });
+  await finishHandshake(s, w);
   await p;
   return s;
 }
@@ -64,93 +66,47 @@ describe("framing", () => {
   });
 });
 
-describe("signing message", () => {
-  it("matches vc_proto::challenge_message", () => {
-    expect(new TextDecoder().decode(challengeMessage("test", "NONCE", "KEY"))).toBe("vc/1 hello\ntest\nNONCE\nKEY");
-  });
-
-  it("produces a signature the public key verifies", async () => {
-    const id = await generateIdentity();
-    expect(decodeBase64Url(id.publicKey)).toHaveLength(32);
-    const msg = challengeMessage("test", "n", id.publicKey);
-    const sig = decodeBase64Url(await id.sign(msg));
-    expect(sig).toHaveLength(64);
-    const pub = await crypto.subtle.importKey("raw", decodeBase64Url(id.publicKey) as BufferSource, { name: "Ed25519" }, false, ["verify"]);
-    expect(await crypto.subtle.verify({ name: "Ed25519" }, pub, sig as BufferSource, msg as BufferSource)).toBe(true);
-  });
-});
-
 describe("handshake", () => {
-  it("binds the signature to the final dialed URL, ignoring server-supplied names", async () => {
+  it("binds the signature to the final endpoint, ignoring server-supplied names", async () => {
     const parsed = parseServerAddress("a.example:8790", { protocol: "tauri:", hostname: "localhost", port: "" });
     if (!parsed.ok) throw new Error(parsed.error);
     const conn = make({ url: parsed.value.url });
     const p = conn.connect();
     const s = FakeSocket.last();
-    expect(s.url).toBe(parsed.value.url);
     s.open();
     const relayed = challenge();
     s.push({ ...relayed, d: { ...relayed.d, server: { ...relayed.d.server, name: "b.example" } } });
     await vi.waitFor(() => expect(s.sent.length).toBe(1));
-    expect(s.sent[0]).toMatchObject({
-      op: "hello",
-      d: { host: "a.example:8790", signature: "sig(vc/1 hello|a.example:8790|abc|PUBKEY)" },
-    });
-    s.push({ re: 1, ok: welcome() });
+    expect(s.sent[0]).toMatchObject({ op: "hello", d: { endpoint: "wss://a.example:8790/ws", expected_server_pk: testServerIdentity.publicKey } });
+    await finishHandshake(s);
     await p;
   });
 
-  it("normalizes the dialed URL before signing", async () => {
-    const s = await handshake(make({ url: "wss://Voice.Example.com.:443/ws" }));
-    expect(s.sent[0]).toMatchObject({
-      op: "hello",
-      d: { host: "voice.example.com", signature: "sig(vc/1 hello|voice.example.com|abc|PUBKEY)" },
-    });
-  });
-
-  it("sends a signed hello after the challenge and resolves with Welcome", async () => {
-    const conn = make();
+  it("normalizes the dialed URL and sends hello, proof then join", async () => {
+    const conn = make({ url: "wss://Voice.Example.com.:443/ws", serverPassword: "pw" });
     const s = await handshake(conn);
-    const hello = s.sent[0] as { id: number; op: string; d: Record<string, unknown> };
-    expect(hello.id).toBe(1);
-    expect(hello.op).toBe("hello");
-    expect(hello.d).toMatchObject({
-      protocol: 2,
-      nickname: "Ann",
-      public_key: "PUBKEY",
-      host: "test",
-      signature: "sig(vc/1 hello|test|abc|PUBKEY)",
-      client: { name: "vc-web", version: "0.1.0", platform: "web" },
-    });
-    expect(hello.d).not.toHaveProperty("server_password");
+    expect(s.sent[0]).toMatchObject({ id: 1, op: "hello", d: {
+      protocol: 3, endpoint: "wss://voice.example.com/ws", client_signing_pk: fakeIdentity.publicKey, certificate_hash: "-",
+    } });
+    expect(s.sent[0]!.d).not.toHaveProperty("server_password");
+    expect(s.sent[1]).toMatchObject({ id: 2, op: "join", d: { server_password: "pw" } });
+    expect(conn.serverKey).toBe(testServerIdentity.publicKey);
     expect(conn.status.state).toBe("online");
   });
 
-  it("sends the device certificate when signed in with Gwar Connect, and signs with the device key", async () => {
-    const device = { account_key: "ACCOUNT", device_key: "PUBKEY", issued_at: 1, expires_at: 2, signature: "CERT" };
-    const conn = make({ identity: { ...fakeIdentity, device } });
-    const s = await handshake(conn);
-    const d = (s.sent[0] as { d: Record<string, unknown> }).d;
-    expect(d.public_key).toBe("PUBKEY");
-    expect(d.signature).toBe("sig(vc/1 hello|test|abc|PUBKEY)");
-    expect(d.device).toEqual(device);
+  it("signs exactly H with a real Ed25519 key", async () => {
+    const id = await generateIdentity();
+    const h = { endpoint: "wss://example.com/ws", expected_server_pk: testServerIdentity.publicKey, server_nonce: newNonce(), client_nonce: newNonce(), client_signing_pk: id.publicKey, certificate_hash: "-" };
+    const msg = new TextEncoder().encode(helloStatement(h));
+    const pub = await crypto.subtle.importKey("raw", decodeBase64Url(id.publicKey) as BufferSource, "Ed25519", false, ["verify"]);
+    expect(await crypto.subtle.verify("Ed25519", pub, decodeBase64Url(await id.sign(msg)) as BufferSource, msg)).toBe(true);
   });
 
-  it("sends no device field for a local identity", async () => {
-    const s = await handshake(make());
-    expect((s.sent[0] as { d: Record<string, unknown> }).d).not.toHaveProperty("device");
-  });
-
-  it("includes the server password when given", async () => {
-    const conn = make({ serverPassword: "pw" });
-    const p = conn.connect();
-    const s = FakeSocket.last();
-    s.open();
-    s.push(challenge(true));
-    await vi.waitFor(() => expect(s.sent.length).toBe(1));
-    expect((s.sent[0] as { d: Record<string, unknown> }).d.server_password).toBe("pw");
-    s.push({ re: 1, ok: welcome() });
-    await p;
+  it("commits the device certificate in hello", async () => {
+    const device = { account_key: testServerIdentity.publicKey, device_key: fakeIdentity.publicKey, issued_at: 1, expires_at: 2, signature: "A".repeat(86) };
+    const s = await handshake(make({ identity: { ...fakeIdentity, device } }));
+    expect(s.sent[0]!.d).toMatchObject({ certificate: device, client_signing_pk: fakeIdentity.publicKey });
+    expect((s.sent[0]!.d as Record<string, unknown>).certificate_hash).not.toBe("-");
   });
 
   it("fails with password_required without sending hello", async () => {
@@ -187,7 +143,7 @@ describe("handshake", () => {
     ["another problem with a valid certificate", Date.now() + 1e10, "the device certificate is not signed by the account", "rejected"],
     ["a revoked device", Date.now() + 1e10, "this device was signed out of its Gwar account", "rejected"],
   ])("tells an expired device certificate apart from other not_authenticated replies: %s", async (_name, expiresAt, message, kind) => {
-    const device = { account_key: "ACCOUNT", device_key: "PUBKEY", issued_at: 1, expires_at: expiresAt, signature: "CERT" };
+    const device = { account_key: testServerIdentity.publicKey, device_key: fakeIdentity.publicKey, issued_at: 1, expires_at: expiresAt, signature: "A".repeat(86) };
     const conn = make({ identity: { ...fakeIdentity, device } });
     const p = conn.connect();
     p.catch(() => {});
@@ -234,7 +190,7 @@ describe("handshake", () => {
     const s = FakeSocket.last();
     s.open();
     const c = challenge();
-    c.d.protocol = 3;
+    c.d.protocol = 2;
     s.push(c);
     await expect(p).rejects.toMatchObject({ kind: "protocol" });
   });
@@ -246,12 +202,12 @@ describe("requests", () => {
     const s = await handshake(conn);
     const a = conn.request("channel.join", { channel: 2 });
     const b = conn.request("ping", {});
-    const [ra, rb] = s.sent.slice(1) as Array<{ id: number }>;
-    expect(ra?.id).toBe(2);
-    expect(rb?.id).toBe(3);
-    s.push({ re: 3, ok: {} });
+    const [ra, rb] = s.sent.slice(2) as Array<{ id: number }>;
+    expect(ra?.id).toBe(3);
+    expect(rb?.id).toBe(4);
+    s.push({ re: 4, ok: {} });
     await expect(b).resolves.toEqual({});
-    s.push({ re: 2, err: { code: "wrong_password", message: "nope" } });
+    s.push({ re: 3, err: { code: "wrong_password", message: "nope" } });
     await expect(a).rejects.toBeInstanceOf(RequestError);
     await expect(a).rejects.toMatchObject({ code: "wrong_password", message: "nope" });
   });
@@ -330,14 +286,14 @@ describe("reconnect", () => {
     s3.push(challenge());
     await vi.waitFor(() => expect(s3.sent.length).toBe(1));
     expect((s3.sent[0] as { id: number }).id).toBe(1);
-    s3.push({ re: 1, ok: welcome({ session: 9 }) });
+    await finishHandshake(s3, welcome({ session: 9 }));
     await vi.waitFor(() => expect(conn.status.state).toBe("online"));
     expect(welcomes).toEqual([false, true]);
 
     // Requests work again with fresh ids.
     const p = conn.request("ping", {});
-    expect((s3.sent[1] as { id: number }).id).toBe(2);
-    s3.push({ re: 2, ok: {} });
+    expect((s3.sent[2] as { id: number }).id).toBe(3);
+    s3.push({ re: 3, ok: {} });
     await p;
     expect(statuses.map((x) => x.state)).toEqual(["connecting", "online", "reconnecting", "reconnecting", "online"]);
   });
@@ -360,7 +316,7 @@ describe("reconnect", () => {
       s.open();
       s.push(challenge(true));
       await vi.waitFor(() => expect(s.sent.length).toBe(1));
-      s.push({ re: 1, ok: welcome() });
+      await finishHandshake(s);
       await p;
       return s;
     })();
@@ -415,10 +371,10 @@ describe("identity helpers", () => {
 });
 
 describe("invites and bans", () => {
-  it("sends the invite in hello, and only the first time", async () => {
+  it("sends the invite in join, and only the first time", async () => {
     const conn = make({ invite: "CODE123" });
     const s1 = await handshake(conn);
-    expect(s1.sent[0]).toMatchObject({ op: "hello", d: { invite: "CODE123" } });
+    expect(s1.sent[1]).toMatchObject({ op: "join", d: { invite: "CODE123" } });
     s1.drop();
     await vi.advanceTimersByTimeAsync(600);
     const s2 = FakeSocket.last();
@@ -426,7 +382,7 @@ describe("invites and bans", () => {
     s2.push(challenge());
     await vi.waitFor(() => expect(s2.sent.length).toBe(1));
     expect((s2.sent[0]?.d as Record<string, unknown>).invite).toBeUndefined();
-    s2.push({ re: 1, ok: welcome() });
+    await finishHandshake(s2);
     conn.close();
   });
 
@@ -442,7 +398,7 @@ describe("invites and bans", () => {
     s.open();
     s.push(challenge(true));
     await vi.waitFor(() => expect(s.sent.length).toBe(1));
-    s.push({ re: 1, ok: welcome() });
+    await finishHandshake(s);
     await p;
     expect(conn.isOnline).toBe(true);
     conn.close();

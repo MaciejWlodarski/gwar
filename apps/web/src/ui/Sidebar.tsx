@@ -103,10 +103,16 @@ function ServerHeader() {
 }
 
 export function Sidebar({ className }: { className?: string }) {
+  const t = useT();
+  const serverKey = useSession((s) => s.serverKey);
   const phase = useSession((s) => s.phase);
   return (
     <aside className={cn("flex h-full w-[280px] shrink-0 flex-col border-r border-line bg-side", className)}>
       <ServerHeader />
+      {serverKey && <div className="border-b border-line px-3 py-2 text-xs text-muted">
+        <div>{t("security.fingerprint")}</div>
+        <code data-testid="server-fingerprint" className="block break-all select-all">{serverKey}</code>
+      </div>}
       <div className={cn("min-h-0 flex-1 overflow-y-auto transition-opacity duration-150", phase === "reconnecting" && "opacity-50")}>
         <ChannelTree />
       </div>

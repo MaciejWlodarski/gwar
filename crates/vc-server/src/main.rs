@@ -85,9 +85,12 @@ struct Cli {
     /// (used in links to uploads and to bind login signatures).
     #[arg(long, env = "VC_PUBLIC_URL")]
     public_url: Option<String>,
-    /// Extra public names accepted for login signatures (repeat for LAN addresses or host:port).
-    #[arg(long = "public-host", env = "VC_PUBLIC_HOSTS", value_delimiter = ',')]
-    public_hosts: Vec<String>,
+    /// Accepted external WebSocket URL (repeat for aliases, including the path).
+    #[arg(long = "public-endpoint", env = "VC_PUBLIC_ENDPOINTS", value_delimiter = ',')]
+    public_endpoints: Vec<String>,
+    /// Accept any signed endpoint. Unsafe: isolated local development/tests only.
+    #[arg(long, env = "VC_INSECURE_ANY_HOST", value_parser = clap::builder::BoolishValueParser::new())]
+    insecure_any_host: bool,
     /// Largest upload in MiB (0 disables uploads).
     #[arg(long, env = "VC_UPLOAD_LIMIT_MB", default_value_t = 25)]
     upload_limit_mb: u64,
@@ -100,6 +103,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Print the persistent server identity public key (base64url).
+    ServerKey,
     /// Print a new one-time token granting the Admin group.
     AdminToken,
     /// Write a consistent copy of the database to this file (safe while running).
@@ -222,6 +227,14 @@ async fn main() -> Result<()> {
     let database = cli.data_dir.join("vc.sqlite3");
 
     match cli.command {
+        Some(Command::ServerKey) => {
+            use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+            println!(
+                "{}",
+                URL_SAFE_NO_PAD.encode(vc_server::server_key::load(&cli.data_dir)?.verifying_key().as_bytes())
+            );
+            return Ok(());
+        }
         Some(Command::AdminToken) => {
             let token = issue_token(&Store::open(&database)?, ADMIN_GROUP)?;
             println!("{token}");
@@ -276,6 +289,9 @@ async fn main() -> Result<()> {
         .or_else(primary_ip)
         .context("cannot determine media IP; pass --public-ip")?;
     let running = vc_server::start(Config {
+        data_dir: Some(cli.data_dir.clone()),
+        public_ip: cli.public_ip,
+        insecure_any_host: cli.insecure_any_host,
         database: Some(database),
         http_bind,
         media_bind: media,
@@ -292,7 +308,7 @@ async fn main() -> Result<()> {
             public_url: public_url.clone(),
         }),
         public_url: public_url.clone(),
-        public_hosts: cli.public_hosts,
+        public_endpoints: cli.public_endpoints,
         upload_limit: cli.upload_limit_mb * 1024 * 1024,
         files_dir: Some(cli.data_dir.join("files")),
         web_origins,
@@ -335,15 +351,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn public_host_is_repeatable_and_comma_delimited() {
+    fn public_endpoint_is_repeatable_and_comma_delimited() {
         let cli = Cli::try_parse_from([
             "vc-server",
-            "--public-host",
-            "b.example,192.168.1.2:8790",
-            "--public-host",
-            "[::1]:8790",
+            "--public-endpoint",
+            "wss://b.example/ws,ws://192.168.1.2:8790/ws",
+            "--public-endpoint",
+            "ws://[::1]:8790/ws",
         ])
         .unwrap();
-        assert_eq!(cli.public_hosts, ["b.example", "192.168.1.2:8790", "[::1]:8790"]);
+        assert_eq!(cli.public_endpoints, ["wss://b.example/ws", "ws://192.168.1.2:8790/ws", "ws://[::1]:8790/ws"]);
     }
 }

@@ -9,7 +9,7 @@ import { sortedChannels } from "../state/reducer";
 import { isDesktop } from "../platform";
 import { newId, useSettings, type ServerKind } from "../state/settings";
 import { useSession, useUi, type DialogState } from "../state/stores";
-import { Button, Dialog, Field, Input, Segmented, Select, Textarea } from "./kit";
+import { Button, Dialog, Field, Input, Segmented, Select, Textarea, Switch } from "./kit";
 import { SettingsDialog } from "./Settings";
 import { BanDialog } from "./BanDialog";
 import { RemoveMemberDialog } from "./RemoveMemberDialog";
@@ -64,7 +64,7 @@ function useClose() {
 
 // ------------------------------------------------------------------ confirm
 
-function ConfirmDialog({ title, memberTitle, body, confirmLabel, danger, onConfirm }: Extract<DialogState, { kind: "confirm" }>) {
+function ConfirmDialog({ title, memberTitle, body, confirmLabel, danger, serverIdentity, onConfirm }: Extract<DialogState, { kind: "confirm" }>) {
   const t = useT();
   const close = useClose();
   const nickname = useMemberName(memberTitle?.uid ?? "", memberTitle?.fallback ?? "");
@@ -73,14 +73,15 @@ function ConfirmDialog({ title, memberTitle, body, confirmLabel, danger, onConfi
       open
       onOpenChange={(o) => !o && close()}
       title={memberTitle ? t(memberTitle.key, { name: nickname }) : title}
-      description={body}
-      width="max-w-sm"
+      description={serverIdentity ? undefined : body}
+      width={serverIdentity ? "max-w-xl" : "max-w-sm"}
       footer={
-        <>
-          <Button onClick={close}>{t("common.cancel")}</Button>
+        <div className={serverIdentity ? "flex w-full min-w-0 flex-col-reverse gap-2 sm:flex-row sm:justify-end" : "flex gap-2"}>
+          <Button onClick={close} autoFocus={serverIdentity}>{t("common.cancel")}</Button>
           <Button
             variant={danger ? "danger" : "primary"}
-            autoFocus
+            className={serverIdentity ? "h-auto min-h-9 max-w-full whitespace-normal py-2 text-center" : undefined}
+            autoFocus={!serverIdentity}
             onClick={() => {
               close();
               onConfirm();
@@ -88,10 +89,10 @@ function ConfirmDialog({ title, memberTitle, body, confirmLabel, danger, onConfi
           >
             {confirmLabel}
           </Button>
-        </>
+        </div>
       }
     >
-      <span className="sr-only">{body}</span>
+      {serverIdentity ? <p className="whitespace-pre-line break-all text-sm text-muted">{body}</p> : <span className="sr-only">{body}</span>}
     </Dialog>
   );
 }
@@ -107,6 +108,7 @@ function AddServerDialog({ editId }: { editId?: string }) {
   const [name, setName] = useState(existing?.name ?? "");
   const [address, setAddress] = useState(existing?.address ?? "");
   const [password, setPassword] = useState(existing?.password ?? "");
+  const [insecureLan, setInsecureLan] = useState(existing?.insecureLan ?? false);
   const tsList = useTsIdentities();
   const [identity, setIdentity] = useState<string | null>(existing?.identity ?? null);
   const pickIdentity = kind === "teamspeak" && !!tsList && tsList.identities.length >= 2;
@@ -118,6 +120,7 @@ function AddServerDialog({ editId }: { editId?: string }) {
       id: existing?.id ?? newId(),
       name: name.trim() || address.trim(),
       kind,
+      insecureLan: desktop && kind === "vc" && insecureLan,
       address: address.trim(),
       password: password || undefined,
       // Without a choice to make, a remembered identity stays as it was.
@@ -127,7 +130,7 @@ function AddServerDialog({ editId }: { editId?: string }) {
     close();
     if (connect) {
       void controller.connectInteractive(
-        { kind, address: bookmark.address, password: bookmark.password, identity: bookmark.identity },
+        { kind, address: bookmark.address, password: bookmark.password, identity: bookmark.identity, insecureLan: bookmark.insecureLan },
         { remember: false },
       );
     }
@@ -174,6 +177,10 @@ function AddServerDialog({ editId }: { editId?: string }) {
         <Field label={t("addServer.password")} hint={kind === "teamspeak" ? t("addServer.tsPasswordHint") : t("addServer.passwordHint")}>
           {(id) => <Input id={id} type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="off" />}
         </Field>
+        {desktop && kind === "vc" && <div className="flex flex-col gap-2">
+          <Switch checked={insecureLan} onCheckedChange={setInsecureLan} label={t("security.insecureLan")} />
+          {insecureLan && <p className="text-sm text-danger">{t("security.insecureWarning")}</p>}
+        </div>}
         {pickIdentity && <IdentityPicker list={tsList} value={identity} onChange={setIdentity} />}
         <button type="submit" className="hidden" />
       </form>

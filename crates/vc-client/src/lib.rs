@@ -1,4 +1,4 @@
-//! Native `vc/1` client: identity, handshake, request/response correlation
+//! Native `vc/3` client: identity, handshake, request/response correlation
 //! and the event stream. Media (WebRTC + audio devices) builds on top of it.
 
 pub mod identity;
@@ -10,6 +10,8 @@ pub mod voice;
 
 use std::{collections::HashMap, time::Duration};
 
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use ed25519_dalek::{Signature, VerifyingKey};
 use futures::{SinkExt, StreamExt};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -21,8 +23,9 @@ use tokio::{
 use tokio_tungstenite::tungstenite::Message;
 use tracing::debug;
 use vc_proto::{
-    ChannelId, ChatMessage, ChatTarget, ClientFrame, ClientSoftware, ErrorBody, Event, Hello, PROTOCOL_VERSION,
-    Request, ServerFrame, Welcome, normalize_host,
+    ChannelId, ChatMessage, ChatTarget, ClientFrame, ClientSoftware, DeviceCertificate, ErrorBody, Event, Hello, Join,
+    PROTOCOL_VERSION, Request, Response, ServerFrame, Welcome, certificate_hash, decode_fixed, hello_statement,
+    normalize_endpoint, server_proof_statement,
 };
 
 pub use identity::Identity;
@@ -52,8 +55,33 @@ pub struct ConnectOptions {
     pub url: String,
     pub nickname: String,
     pub server_password: Option<String>,
+    pub invite: Option<String>,
+    pub certificate: Option<DeviceCertificate>,
+    /// A configured pin or invite fingerprint. Checked before signing.
+    pub expected_server_key: Option<String>,
+    /// Explicit first-contact candidate, without persistent pins. Off by default.
+    pub trust_on_first_use: bool,
+    /// Explicit per-server plaintext LAN opt-in; loopback needs no opt-in.
+    pub insecure_lan: bool,
     pub identity: Identity,
     pub software: ClientSoftware,
+}
+
+impl ConnectOptions {
+    pub fn new(url: String, identity: Identity, software: ClientSoftware) -> Self {
+        Self {
+            url,
+            nickname: "gwar".into(),
+            server_password: None,
+            invite: None,
+            certificate: None,
+            expected_server_key: None,
+            trust_on_first_use: false,
+            insecure_lan: false,
+            identity,
+            software,
+        }
+    }
 }
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -65,6 +93,8 @@ type Pending = oneshot::Sender<Result<Value, ErrorBody>>;
 #[derive(Clone)]
 pub struct Connection {
     outgoing: mpsc::Sender<(Request, Pending)>,
+    /// Verified identity epoch for this server connection.
+    pub server_key: String,
 }
 
 pub struct Connected {
@@ -75,7 +105,15 @@ pub struct Connected {
 }
 
 pub async fn connect(options: ConnectOptions) -> Result<Connected, ClientError> {
-    let host = normalize_host(&options.url).ok_or_else(|| ClientError::Protocol("invalid server URL".into()))?;
+    let endpoint =
+        normalize_endpoint(&options.url).ok_or_else(|| ClientError::Protocol("invalid server URL".into()))?;
+    let url = url::Url::parse(&endpoint).map_err(|e| ClientError::Protocol(e.to_string()))?;
+    let host = url.host_str().unwrap_or_default();
+    let loopback =
+        host == "localhost" || host == "[::1]" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    if url.scheme() == "ws" && !loopback && !options.insecure_lan {
+        return Err(ClientError::Protocol("TLS required; plaintext LAN needs explicit opt-in".into()));
+    }
     let (mut ws, _) = timeout(HANDSHAKE_TIMEOUT, tokio_tungstenite::connect_async(&options.url))
         .await
         .map_err(|_| ClientError::Timeout)??;
@@ -89,42 +127,83 @@ pub async fn connect(options: ConnectOptions) -> Result<Connected, ClientError> 
     if challenge.protocol != PROTOCOL_VERSION {
         return Err(ClientError::Protocol(format!("server speaks vc/{}", challenge.protocol)));
     }
-    let public_key = options.identity.public_key();
-    let hello = ClientFrame {
-        id: 1,
-        request: Request::Hello(Hello {
-            protocol: PROTOCOL_VERSION,
-            nickname: options.nickname,
-            signature: options.identity.sign_challenge(&host, &challenge.nonce),
-            host,
-            public_key,
-            server_password: options.server_password,
-            invite: None,
-            device: None,
-            client: options.software,
-        }),
-    };
-    ws.send(Message::Text(serde_json::to_string(&hello).expect("serializable").into())).await?;
-    let welcome = match read_frame(&mut ws).await? {
-        ServerFrame::Ok { re: 1, ok } => serde_json::from_value(serde_json::to_value(ok).expect("serializable"))
-            .map_err(|e| ClientError::Protocol(e.to_string()))?,
-        ServerFrame::Err { err, .. } => return Err(ClientError::Server(err)),
-        other => {
-            return Err(ClientError::Protocol(format!("expected welcome, got {other:?}")));
+    if decode_fixed::<32>(&challenge.server_pk).is_none() || decode_fixed::<32>(&challenge.server_nonce).is_none() {
+        return Err(ClientError::Protocol("invalid challenge encoding".into()));
+    }
+    let key = VerifyingKey::from_bytes(&decode_fixed::<32>(&challenge.server_pk).expect("validated key"))
+        .map_err(|e| ClientError::Protocol(e.to_string()))?;
+    if key.is_weak() {
+        return Err(ClientError::Protocol("weak server key".into()));
+    }
+    match &options.expected_server_key {
+        Some(key) if key != &challenge.server_pk => {
+            return Err(ClientError::Protocol("server identity changed".into()));
         }
+        None if !options.trust_on_first_use => {
+            return Err(ClientError::Protocol("expected server key required (TOFU disabled)".into()));
+        }
+        _ => {}
+    }
+    let mut hello = Hello {
+        protocol: PROTOCOL_VERSION,
+        nickname: options.nickname,
+        endpoint,
+        expected_server_pk: challenge.server_pk.clone(),
+        server_nonce: challenge.server_nonce,
+        client_nonce: URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>()),
+        client_signing_pk: options.identity.public_key(),
+        certificate_hash: certificate_hash(options.certificate.as_ref())
+            .ok_or_else(|| ClientError::Protocol("invalid certificate".into()))?,
+        signature: String::new(),
+        certificate: options.certificate,
+        client: options.software,
+    };
+    hello.signature = options
+        .identity
+        .sign(hello_statement(&hello).ok_or_else(|| ClientError::Protocol("invalid hello".into()))?.as_bytes());
+    ws.send(Message::Text(
+        serde_json::to_string(&ClientFrame { id: 1, request: Request::Hello(Box::new(hello.clone())) })
+            .expect("serializable")
+            .into(),
+    ))
+    .await?;
+    let proof = match read_frame(&mut ws).await? {
+        ServerFrame::Ok { re: 1, ok: Response::ServerProof(proof) } => proof,
+        ServerFrame::Err { err, .. } => return Err(ClientError::Server(err)),
+        _ => return Err(ClientError::Protocol("expected server proof".into())),
+    };
+    let sig = Signature::from_bytes(
+        &decode_fixed::<64>(&proof.server_proof)
+            .ok_or_else(|| ClientError::Protocol("invalid proof encoding".into()))?,
+    );
+    key.verify_strict(server_proof_statement(&hello).expect("validated hello").as_bytes(), &sig)
+        .map_err(|_| ClientError::Protocol("invalid server proof".into()))?;
+    ws.send(Message::Text(
+        serde_json::to_string(&ClientFrame {
+            id: 2,
+            request: Request::Join(Join { server_password: options.server_password, invite: options.invite }),
+        })
+        .expect("serializable")
+        .into(),
+    ))
+    .await?;
+    let welcome = match read_frame(&mut ws).await? {
+        ServerFrame::Ok { re: 2, ok: Response::Welcome(welcome) } => *welcome,
+        ServerFrame::Err { err, .. } => return Err(ClientError::Server(err)),
+        _ => return Err(ClientError::Protocol("expected welcome".into())),
     };
 
     let (outgoing, mut requests) = mpsc::channel::<(Request, Pending)>(64);
     let (events_tx, events) = mpsc::channel(1024);
     tokio::spawn(async move {
         let mut pending: HashMap<u32, Pending> = HashMap::new();
-        let mut next_id: u32 = 2;
+        let mut next_id: u32 = 3;
         loop {
             tokio::select! {
                 request = requests.recv() => {
                     let Some((request, reply)) = request else { break };
                     let id = next_id;
-                    next_id = next_id.wrapping_add(1).max(2);
+                    next_id = next_id.wrapping_add(1).max(3);
                     let text = serde_json::to_string(&ClientFrame { id, request }).expect("serializable");
                     if ws.send(Message::Text(text.into())).await.is_err() {
                         break;
@@ -166,7 +245,7 @@ pub async fn connect(options: ConnectOptions) -> Result<Connected, ClientError> 
         let _ = ws.close(None).await;
     });
 
-    Ok(Connected { connection: Connection { outgoing }, welcome, events })
+    Ok(Connected { connection: Connection { outgoing, server_key: challenge.server_pk }, welcome, events })
 }
 
 async fn read_frame<S>(ws: &mut S) -> Result<ServerFrame, ClientError>

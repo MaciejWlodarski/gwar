@@ -2,8 +2,8 @@
 
 ```mermaid
 flowchart LR
-  Web[Browser<br/>apps/web] -- WSS vc/2 --> GW
-  Desk[Desktop app, Tauri<br/>apps/web + vc-client] -- WSS vc/2 --> GW
+  Web[Browser<br/>apps/web] -- WSS vc/3 --> GW
+  Desk[Desktop app, Tauri<br/>apps/web + vc-client] -- WSS vc/3 --> GW
   TS3[Official TS3/TS6 clients] -- UDP 9987 --> TSS
   Web -- WebRTC Opus --> SFU
   Desk -- WebRTC Opus --> SFU
@@ -28,14 +28,16 @@ to any server over `wss://`. Hence servers need HTTPS: `--domain` gets and
 renews a Let's Encrypt certificate inside the server (`src/tls.rs`), and
 uploads accept cross-origin requests from the web app's origin only (CORS on
 the file routes; uploads are authorized by one-time tokens, not cookies). The
-desktop app connects anywhere, including plain `ws://` on a LAN.
+desktop app connects anywhere, with TLS by default. Plaintext LAN requires an explicit per-server desktop
+opt-in and a persistent red impersonation/session-takeover warning; loopback
+is the development exception.
 
 ## Principles
 
 - **One owner of state.** `core` is an actor (a single tokio task): every
   change to channels, users and permissions goes through it in order, so every
   client sees the same sequence of events, without locks. Transports
-  (WebSocket, TeamSpeak) are thin: they translate to `vc/2` and back.
+  (WebSocket, TeamSpeak) are thin: they translate to `vc/3` and back.
 - **Audio is never decoded on the server.** Opus frames are forwarded as they
   are (SFU). The server only decides *who hears whom*, from a routing snapshot
   the core publishes (`ArcSwap`, lock-free reads). Clients decode and mix
@@ -45,40 +47,103 @@ desktop app connects anywhere, including plain `ws://` on a LAN.
   the server drops silence, drives the "talking" indicator and ends talk spurts
   for TeamSpeak clients.
 
-## The `vc/2` protocol
+## The `vc/3` protocol
 
 JSON over a WebSocket (`/ws`). The full, commented definition is
 [`crates/vc-proto/src/lib.rs`](../crates/vc-proto/src/lib.rs); the TypeScript
 types are generated with `cargo test -p vc-proto --features ts`.
 
-1. Server: `challenge {nonce}`. Client: `hello` with its Ed25519 public key,
-   `host`, and a signature of `"vc/1 hello\n{host}\n{nonce}\n{public_key}"`. Reply:
-   `Welcome` (server state, channels, clients, members, unread counts,
-   permissions, ICE servers).
-2. Requests `{"id", "op", "d"}` → `{"re", "ok" | "err"}`; events `{"ev", "d"}`.
-3. Voice: `voice.offer` (SDP with one sender and 8 receivers) → SDP answer;
-   `voice.slot` says whose voice flows through which slot.
+1. Server: `challenge {protocol: 3, server_pk, server_nonce, server,
+   password_required}`. The metadata helps the connect UI; only the key and
+   nonce enter the transcript. The client checks the candidate key against its
+   endpoint pin or invite fingerprint **before signing**.
+2. Client: `hello {protocol: 3, endpoint, expected_server_pk, server_nonce,
+   client_nonce, client_signing_pk, certificate?, certificate_hash, signature,
+   nickname, client}`. The server verifies its configured endpoint allowlist,
+   its own key, the connection nonce, the client signature, certificate
+   commitment and current certificate/revocation authorization. Nickname and
+   software are application metadata outside H.
+3. Server: hello reply `{server_proof}`. The client reconstructs H locally and
+   verifies the proof under `expected_server_pk`, then commits its first-contact
+   pin. Missing proof, changed transcript, malformed encoding or wrong protocol is
+   fatal; no legacy fallback.
+4. Client: `join {server_password?, invite?}` on the same connection, **only
+   after proof verification**. Hello rejects these secret fields. The server
+   rechecks device validity and authorization and grants a session only when
+   join succeeds. Its reply is `Welcome` (server state, channels, clients,
+   members, unread counts, permissions and ICE servers). No application
+   request is accepted before this point.
+5. Requests `{"id", "op", "d"}` → `{"re", "ok" | "err"}`; events `{"ev", "d"}`.
+   `voice.offer` negotiates WebRTC; `voice.slot` identifies its receive slots.
 
-The signed `host` is the normalized authority of the final WebSocket URL the
-client itself dialed, never a name supplied by the server. Normalization
-lowercases the hostname, strips a trailing dot, brackets IPv6, and drops port
-80 for WS/HTTP or 443 for WSS/HTTPS (other ports stay). Rust and TypeScript use
-the same test vectors in `crates/vc-proto/tests/host-normalization.json`.
+The endpoint is the client's locally constructed canonical external WebSocket
+URL: WS(S) scheme, lowercase host without a trailing dot, bracketed IPv6,
+effective port omitted at the scheme default, and exact path. No credentials,
+query or fragment. Rust and TypeScript share normalization and transcript
+vectors in `crates/vc-proto/tests/endpoint-normalization.json` and
+`handshake-v3.json`. The path and scheme are part of the binding, so a signature
+cannot be relayed to another accepted alias endpoint.
 
-At startup the server builds its accepted set from every `--domain`, the
-normalized authority of `--public-url`, and repeatable `--public-host` entries
-(`VC_PUBLIC_HOSTS`, comma-delimited). Bare configured authorities retain their
-explicit port; use a URL for a scheme-default port. The HTTP `Host` header is
-never used for this check. A signature for an unaccepted host is rejected with
-`not_authenticated`, including when the signer presents a Connect device
-certificate. Changing the claimed `host` also invalidates the signature.
-This prevents a server at A from relaying a victim's live login to B.
+Only configuration supplies accepted endpoints: every `--domain` gives
+`wss://<domain>/ws`; `--public-url` maps its scheme to WS(S), retains host/port
+and uses `/ws`; repeatable `--public-endpoint` supplies full endpoint URLs.
+An explicitly configured global unicast `--public-ip` adds `wss://<ip>/ws`,
+with the non-default listener port only when the server terminates TLS itself.
+Private, loopback and link-local addresses never auto-authorize login. Request
+headers cannot expand the set. An empty set refuses startup, unless the
+explicit **isolated development/test-only** `--insecure-any-host` disables
+this check and logs a loud warning.
 
-With none of those names configured, the server accepts any signed host and
-logs one startup warning that login relay protection is off, with the flags
-needed to enable it. This permits unconfigured development and LAN servers;
-configure their reachable names to protect them too. Old clients that omit
-`host` cannot authenticate.
+The server's Ed25519 seed is generated once, persisted atomically as
+`server-key.ed25519` in its data directory (0600 on Unix), and never logged.
+`vc-server --data-dir <dir> server-key` prints the public key. Back up the seed
+with the database; losing it changes the authenticated server epoch.
+The web/desktop client keeps `{server_pk, first_seen}` in localStorage under
+`vc.server-pin:<canonical endpoint>`. TOFU without a pin or trusted invite
+identifies a first-contact candidate; proof verification precedes pinning.
+Invite links include `server_key=<full public key>`, which must match the
+challenge. A pin mismatch is a blocking English/Polish dialog with both keys
+and an explicit dangerous forget-and-trust action. An invite mismatch blocks
+without that override. The verified key is exposed as `Connection.serverKey`
+(native: `Connection.server_key`) for message context and shown in the sidebar.
+Native clients require an expected key unless first-contact trust is explicitly
+enabled; the default is off and tests opt in for ephemeral servers.
+
+All binary fields use strict canonical unpadded base64url. Public keys and
+nonces decode to exactly 32 bytes, signatures to 64, hashes to 32. Fields may
+not contain CR/LF; timestamps are unsigned decimal Unix milliseconds in the
+JavaScript safe-integer range. Statements are UTF-8 with **no trailing newline**.
+Both sides generate independent random 32-byte nonces for every connection.
+The web client uses noble-curves for strict proof verification: canonical,
+non-weak, prime-order key and signature points, with ZIP-215 disabled. Some
+WebCrypto implementations accept weak points, so they are not the proof verifier.
+
+`certificate_hash` is literal `-` for a local identity, otherwise
+`b64url(SHA256(UTF8("gwar device v1\n{account_pk}\n{device_pk}\n{issued_at}\n{expires_at}\n{account_signature}")))`.
+Certificate wire fields are `account_key`, `device_key`, `issued_at`,
+`expires_at`, `signature`; the commitment includes that account signature.
+
+Client statement H, signed by `client_signing_pk`:
+
+```text
+gwar client hello v3
+{endpoint}
+{expected_server_pk}
+{server_nonce}
+{client_nonce}
+{client_signing_pk}
+{certificate_hash}
+```
+
+`hello_hash = b64url(SHA256(UTF8(H)))`. The server signs:
+
+```text
+gwar server proof v3
+{hello_hash}
+{client_signature}
+```
+
+`client_signature` is the exact canonical `hello.signature` value.
 
 ## Presence (like Discord)
 
@@ -173,7 +238,7 @@ therefore have different TS suffixes while retaining the same Gwar nickname.
     prevent echoes. Server chat uses the main query's `textserver` subscription;
     Gwar channel chat uses a puppet or the separate, movable posting query.
 - **Our client on TeamSpeak servers.** `vc-client::teamspeak` (tsclientlib)
-  presents a TeamSpeak server as `vc/2` (Welcome + events), so the UI has no
+  presents a TeamSpeak server as `vc/3` (Welcome + events), so the UI has no
   TeamSpeak-specific code; voice goes straight to the native engine.
 
 ## Clients

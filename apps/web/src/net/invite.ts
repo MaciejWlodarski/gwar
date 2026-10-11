@@ -1,5 +1,6 @@
+import { decodeFixed, normalizeEndpoint } from "./handshake";
 /**
- * Invite links: `https://app.example.org/?server=voice.example.com&invite=CODE`
+ * Invite links carry `server=<canonical endpoint>`, `invite=CODE` and `server_key=<public key>`.
  * (the web app names the server to join). Without `server` the web app's own
  * origin is the server, which is only the case when one host serves both.
  */
@@ -8,6 +9,7 @@ const CODE_RE = /^[A-Za-z0-9_-]{3,128}$/;
 
 export interface InviteTarget {
   code: string;
+  serverKey: string;
   /** Address of the server as a person would type it; absent means "the server on the web app's own origin". */
   server?: string;
 }
@@ -19,8 +21,10 @@ export function isValidInviteCode(code: string): boolean {
 function fromParams(params: URLSearchParams): InviteTarget | null {
   const code = params.get("invite")?.trim() ?? "";
   if (!isValidInviteCode(code)) return null;
+  const serverKey = params.get("server_key");
+  try { decodeFixed(serverKey, 32); } catch { return null; }
   const server = params.get("server")?.trim();
-  return server ? { code, server } : { code };
+  return server ? { code, server, serverKey: serverKey! } : { code, serverKey: serverKey! };
 }
 
 /** Reads `?invite=` / `&server=` from a page's search string; returns the cleaned search string too. */
@@ -30,6 +34,7 @@ export function readInviteFromSearch(search: string): { target: InviteTarget | n
   if (!params.has("invite") && !params.has("server")) return { target: null, rest: search };
   params.delete("invite");
   params.delete("server");
+  params.delete("server_key");
   const rest = params.toString();
   return { target, rest: rest ? `?${rest}` : "" };
 }
@@ -49,30 +54,20 @@ export function parseInviteLink(input: string): InviteTarget | null {
   }
   const target = fromParams(url.searchParams);
   if (!target) return null;
-  return { code: target.code, server: target.server ?? url.host };
+  return { ...target, server: target.server ?? `${url.protocol}//${url.host}` };
 }
 
 export interface BuildInviteOptions {
-  /** Public address of the web app (see `webOrigin`): the official one in the desktop app. */
   webOrigin: string;
-  /** HTTP origin of the connected server, e.g. `https://voice.example.com`. */
-  serverOrigin: string;
+  serverEndpoint: string;
+  serverKey: string;
   code: string;
 }
 
-/**
- * The shareable link for a code: `<web app>/?server=<host[:port]>&invite=<code>`.
- * `server` is left out only when the web app and the server share an origin; a
- * server on another scheme than the web app is written as a full origin so the
- * scheme survives.
- */
-export function buildInviteLink({ webOrigin, serverOrigin, code }: BuildInviteOptions): string {
+/** Include the exact endpoint and verified full public-key fingerprint. */
+export function buildInviteLink({ webOrigin, serverEndpoint, serverKey, code }: BuildInviteOptions): string {
+  decodeFixed(serverKey, 32);
   const web = new URL(webOrigin);
-  const server = new URL(serverOrigin);
-  const params = new URLSearchParams();
-  if (web.host.toLowerCase() !== server.host.toLowerCase() || web.protocol !== server.protocol) {
-    params.set("server", web.protocol === server.protocol ? server.host : server.origin);
-  }
-  params.set("invite", code);
+  const params = new URLSearchParams({ server: normalizeEndpoint(serverEndpoint), invite: code, server_key: serverKey });
   return `${web.origin}/?${params.toString()}`;
 }

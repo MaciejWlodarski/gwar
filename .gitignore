@@ -23,6 +23,7 @@ scripts/deploy.env
 *.ogg
 *.opus
 secrets/
+server-key.ed25519
 
 # Test output and OS clutter
 apps/web/e2e/screenshots/fail-*.png

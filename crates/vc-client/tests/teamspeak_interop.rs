@@ -76,6 +76,11 @@ async fn teamspeak_and_webrtc_clients_hear_each_other() {
     let native = connect(ConnectOptions {
         url,
         nickname: "native".into(),
+        invite: None,
+        certificate: None,
+        expected_server_key: None,
+        trust_on_first_use: true,
+        insecure_lan: false,
         server_password: None,
         identity: Identity::generate(),
         software: ClientSoftware { name: "test".into(), version: "0".into(), platform: Platform::Desktop },

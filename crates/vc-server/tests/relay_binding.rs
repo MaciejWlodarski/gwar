@@ -1,142 +1,286 @@
-//! Login signatures cannot be relayed to a server with a different public name.
+//! vc/3 relay binding, transcript proof and admission ordering.
 
 mod common;
-
 use common::*;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use serde_json::{Value, json};
 use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
-use vc_proto::{ErrorCode, normalize_host};
+use vc_proto::{ErrorCode, Hello, decode_fixed, normalize_endpoint, server_proof_statement};
+
+const A: &str = "wss://a.example/ws";
+const B: &str = "wss://b.example/ws";
 
 async fn server_b() -> TestServer {
-    TestServer::start_with(|c| c.public_hosts = vec!["b.example".into()]).await
+    TestServer::start_with(|c| {
+        c.public_endpoints = vec![B.into()];
+        c.insecure_any_host = false;
+    })
+    .await
 }
 
-fn hello_for(raw: &RawConn, key: &SigningKey, host: &str) -> Value {
-    let mut hello = raw.hello(key, "victim", None);
-    hello["host"] = json!(host);
-    hello["signature"] = json!(sign(key, host, &raw.nonce));
-    hello
+fn hello_for(raw: &RawConn, key: &SigningKey, endpoint: &str) -> Value {
+    let mut h = raw.hello(key, "victim", None);
+    h["endpoint"] = json!(endpoint);
+    h["signature"] = json!(sign(key, &h));
+    h
 }
 
 #[tokio::test]
-async fn accepts_identity_signed_for_its_public_host() {
+async fn accepted_endpoint_works_for_local_and_connect_identities() {
     let server = server_b().await;
     let key = new_key();
-    let client = Client::connect_with(&server, key.clone(), |raw, key| hello_for(raw, key, "b.example")).await.unwrap();
-    assert_eq!(client.welcome.uid, uid_of(&key));
-    client.close().await;
-}
-
-#[tokio::test]
-async fn rejects_relayed_identity_signature_for_another_server() {
-    let server = server_b().await;
-    let mut raw = open(&server).await;
-    // A forwards B's fresh nonce to the victim, who signs it for A.
-    let hello = hello_for(&raw, &new_key(), "a.example");
-    let err = raw.rejected(hello).await;
-    assert_eq!(err.code, ErrorCode::NotAuthenticated);
-    assert_eq!(err.message, "this signature is for another server");
-    raw.expect_closed().await;
-}
-
-#[tokio::test]
-async fn rejects_identity_signature_with_a_forged_host_field() {
-    let server = server_b().await;
-    let mut raw = open(&server).await;
-    let mut hello = hello_for(&raw, &new_key(), "a.example");
-    hello["host"] = json!("b.example");
-    let err = raw.rejected(hello).await;
-    assert_eq!(err.code, ErrorCode::NotAuthenticated);
-    assert_eq!(err.message, "invalid identity signature");
-    raw.expect_closed().await;
-}
-
-#[tokio::test]
-async fn accepts_device_signed_for_its_public_host() {
-    let server = server_b().await;
+    let local = Client::connect_with(&server, key.clone(), |raw, key| hello_for(raw, key, B)).await.unwrap();
+    assert_eq!(local.welcome.uid, uid_of(&key));
     let (account, device) = (new_key(), new_key());
     let now = vc_server::core::now_ms();
-    let cert = certificate(&account, &device, now, now + 86400000);
     let client = Client::connect_with(&server, device, |raw, key| {
-        let mut hello = hello_for(raw, key, "b.example");
-        hello["device"] = cert;
-        hello
+        let mut h = hello_for(raw, key, B);
+        set_certificate(&mut h, certificate(&account, key, now, now + 86400000), key);
+        h
     })
     .await
     .unwrap();
     assert_eq!(client.welcome.uid, uid_of(&account));
-    client.close().await;
 }
 
 #[tokio::test]
-async fn rejects_relayed_device_signature_for_another_server() {
+async fn relayed_signatures_for_another_endpoint_are_rejected_local_and_connect() {
     let server = server_b().await;
-    let mut raw = open(&server).await;
-    let (account, device) = (new_key(), new_key());
-    let now = vc_server::core::now_ms();
-    let mut hello = hello_for(&raw, &device, "a.example");
-    hello["device"] = certificate(&account, &device, now, now + 86400000);
-    let err = raw.rejected(hello).await;
-    assert_eq!(err.code, ErrorCode::NotAuthenticated);
-    assert_eq!(err.message, "this signature is for another server");
-    raw.expect_closed().await;
-}
-
-#[tokio::test]
-async fn rejects_device_signature_with_a_forged_host_field() {
-    let server = server_b().await;
-    let mut raw = open(&server).await;
-    let (account, device) = (new_key(), new_key());
-    let now = vc_server::core::now_ms();
-    let mut hello = hello_for(&raw, &device, "a.example");
-    hello["device"] = certificate(&account, &device, now, now + 86400000);
-    hello["host"] = json!("b.example");
-    let err = raw.rejected(hello).await;
-    assert_eq!(err.code, ErrorCode::NotAuthenticated);
-    assert_eq!(err.message, "invalid identity signature");
-    raw.expect_closed().await;
-}
-
-#[tokio::test]
-async fn unconfigured_server_accepts_any_signed_host() {
-    let server = TestServer::start().await;
-    for host in ["a.example", "b.example", "[::1]:8790"] {
-        let client = Client::connect_with(&server, new_key(), |raw, key| hello_for(raw, key, host)).await.unwrap();
-        client.close().await;
+    for connect in [false, true] {
+        let mut raw = open(&server).await;
+        let key = new_key();
+        let mut h = hello_for(&raw, &key, A);
+        if connect {
+            let now = vc_server::core::now_ms();
+            set_certificate(&mut h, certificate(&new_key(), &key, now, now + 86400000), &key);
+        }
+        assert_eq!(raw.rejected(h).await.code, ErrorCode::NotAuthenticated);
+        raw.expect_closed().await;
     }
 }
 
 #[tokio::test]
-async fn public_url_enables_binding_and_normalizes_its_authority() {
-    let server = TestServer::start_with(|c| c.public_url = Some("https://B.Example.:443/base".into())).await;
-    let client = Client::connect_with(&server, new_key(), |raw, key| hello_for(raw, key, "b.example")).await.unwrap();
-    client.close().await;
-    let mut raw = open(&server).await;
-    let hello = hello_for(&raw, &new_key(), "a.example");
-    assert_eq!(raw.rejected(hello).await.code, ErrorCode::NotAuthenticated);
+async fn forged_endpoint_field_is_rejected_local_and_connect() {
+    let server = server_b().await;
+    for connect in [false, true] {
+        let mut raw = open(&server).await;
+        let key = new_key();
+        let mut h = hello_for(&raw, &key, A);
+        if connect {
+            let now = vc_server::core::now_ms();
+            set_certificate(&mut h, certificate(&new_key(), &key, now, now + 86400000), &key);
+        }
+        h["endpoint"] = json!(B);
+        assert_eq!(raw.rejected(h).await.code, ErrorCode::NotAuthenticated);
+        raw.expect_closed().await;
+    }
 }
 
 #[tokio::test]
-async fn http_host_header_cannot_expand_the_accepted_set() {
+async fn wrong_expected_server_key_and_replayed_connection_nonce_are_rejected() {
     let server = server_b().await;
-    let mut request = server.url().into_client_request().unwrap();
-    request.headers_mut().insert("host", "a.example".parse().unwrap());
-    let (mut ws, _) = within("websocket connect", connect_async(request)).await.unwrap();
-    let challenge = recv(&mut ws).await.unwrap()["d"].clone();
-    let nonce = challenge["nonce"].as_str().unwrap().to_owned();
-    let mut raw = RawConn { ws, challenge, nonce, host: normalize_host(&server.url()).unwrap() };
-    let hello = hello_for(&raw, &new_key(), "a.example");
-    let err = raw.rejected(hello).await;
-    assert_eq!(err.code, ErrorCode::NotAuthenticated);
-    assert_eq!(err.message, "this signature is for another server");
+    let other = open(&server).await;
+    for field in ["expected_server_pk", "server_nonce"] {
+        let mut raw = open(&server).await;
+        let key = new_key();
+        let mut h = hello_for(&raw, &key, B);
+        h[field] = json!(if field == "server_nonce" { other.nonce.clone() } else { public_key(&new_key()) });
+        h["signature"] = json!(sign(&key, &h));
+        assert_eq!(raw.rejected(h).await.code, ErrorCode::NotAuthenticated);
+        raw.expect_closed().await;
+    }
+}
+
+#[tokio::test]
+async fn proof_verifies_and_binds_every_transcript_field_and_client_signature() {
+    let server = server_b().await;
+    let mut raw = open(&server).await;
+    let key = new_key();
+    let mut h = hello_for(&raw, &key, B);
+    let now = vc_server::core::now_ms();
+    set_certificate(&mut h, certificate(&new_key(), &key, now, now + 86400000), &key);
+    h.as_object_mut().unwrap().remove("join");
+    raw.send_hello(h.clone()).await;
+    let proof = raw.recv().await.unwrap();
+    let pk = decode_fixed::<32>(h["expected_server_pk"].as_str().unwrap()).unwrap();
+    let verifier = VerifyingKey::from_bytes(&pk).unwrap();
+    let sig = Signature::from_bytes(&decode_fixed::<64>(proof["ok"]["server_proof"].as_str().unwrap()).unwrap());
+    let verifies = |h: &Value| {
+        let h: Hello = serde_json::from_value(h.clone()).unwrap();
+        server_proof_statement(&h).is_some_and(|s| verifier.verify_strict(s.as_bytes(), &sig).is_ok())
+    };
+    assert!(verifies(&h));
+    for field in [
+        "endpoint",
+        "expected_server_pk",
+        "server_nonce",
+        "client_nonce",
+        "client_signing_pk",
+        "certificate_hash",
+        "signature",
+    ] {
+        let mut changed = h.clone();
+        changed[field] = json!(match field {
+            "endpoint" => A.to_owned(),
+            "signature" => sign(&new_key(), &h),
+            _ => public_key(&new_key()),
+        });
+        assert!(!verifies(&changed), "{field}");
+    }
+    let mut changed = h.clone();
+    changed["certificate"]["expires_at"] = json!(now + 86400001);
+    assert!(!verifies(&changed));
+    raw.send(json!({"id":2,"op":"join","d":{}})).await;
+    assert!(raw.recv().await.unwrap()["ok"]["session"].is_number());
+}
+
+#[tokio::test]
+async fn join_and_application_requests_before_hello_are_rejected() {
+    let server = server_b().await;
+    for op in ["join", "ping", "chat.send"] {
+        let mut raw = open(&server).await;
+        raw.send(json!({"id":5,"op":op,"d":{}})).await;
+        let reply = raw.recv().await.unwrap();
+        assert!(reply.get("err").is_some(), "{reply}");
+        raw.expect_closed().await;
+    }
+}
+
+#[tokio::test]
+async fn application_requests_after_proof_before_join_are_rejected() {
+    let server = server_b().await;
+    let mut raw = open(&server).await;
+    raw.send_hello(hello_for(&raw, &new_key(), B)).await;
+    assert!(raw.recv().await.unwrap()["ok"]["server_proof"].is_string());
+    raw.send(json!({"id":2,"op":"ping","d":{}})).await;
+    assert_eq!(raw.recv().await.unwrap()["err"]["code"], "not_authenticated");
     raw.expect_closed().await;
 }
 
 #[tokio::test]
-async fn invalid_public_host_fails_startup() {
+async fn hello_never_accepts_password_or_invite_fields() {
+    let server = server_b().await;
+    for field in ["server_password", "invite"] {
+        let mut raw = open(&server).await;
+        let mut h = hello_for(&raw, &new_key(), B);
+        h[field] = json!("secret");
+        raw.send_hello(h).await;
+        let reply = raw.recv().await.unwrap();
+        assert_eq!(reply["err"]["code"], "bad_request");
+        assert!(reply.get("ok").is_none());
+        raw.expect_closed().await;
+    }
+}
+
+#[tokio::test]
+async fn strict_fields_reject_noncanonical_lengths_crlf_and_certificate_substitution() {
+    let server = server_b().await;
+    for (field, value) in [
+        ("client_nonce", "AA"),
+        ("client_nonce", "bad\nnonce"),
+        ("certificate_hash", "AA"),
+        ("signature", "AAAA"),
+        ("endpoint", "wss://B.EXAMPLE/ws"),
+    ] {
+        let mut raw = open(&server).await;
+        let mut h = hello_for(&raw, &new_key(), B);
+        h[field] = json!(value);
+        assert_eq!(raw.rejected(h).await.code, ErrorCode::NotAuthenticated, "{field}");
+    }
+    let mut raw = open(&server).await;
+    let mut h = hello_for(&raw, &new_key(), B);
+    h["client_nonce"] = json!(format!("{}=", h["client_nonce"].as_str().unwrap()));
+    assert_eq!(raw.rejected(h).await.code, ErrorCode::NotAuthenticated);
+
+    let key = new_key();
+    let account = new_key();
+    let now = vc_server::core::now_ms();
+    let mut raw = open(&server).await;
+    let mut h = hello_for(&raw, &key, B);
+    set_certificate(&mut h, certificate(&account, &key, now, now + 86400000), &key);
+    // Preserve the signed H while substituting the certificate it commits to.
+    h["certificate"]["signature"] = json!(sign(&new_key(), &h));
+    assert_eq!(raw.rejected(h).await.code, ErrorCode::NotAuthenticated);
+    for (issued, expires) in [(-1, now + 86400000), (now, 9_007_199_254_740_992), (now, now + 91 * 86400000)] {
+        let mut raw = open(&server).await;
+        let mut h = hello_for(&raw, &key, B);
+        set_certificate(&mut h, certificate(&account, &key, issued, expires), &key);
+        assert_eq!(raw.rejected(h).await.code, ErrorCode::NotAuthenticated);
+    }
+}
+
+#[tokio::test]
+async fn empty_configuration_refuses_start_without_explicit_insecure_mode() {
     let mut config = base_config();
-    config.public_hosts = vec!["".into()];
-    let err = vc_server::start(config).await.err().expect("invalid name must not disable binding");
-    assert!(err.to_string().contains("invalid public host"));
+    config.insecure_any_host = false;
+    assert!(vc_server::start(config).await.err().unwrap().to_string().contains("no accepted public endpoints"));
+    let server = TestServer::start().await;
+    for endpoint in [A, B, "ws://[::1]:8790/ws"] {
+        Client::connect_with(&server, new_key(), |raw, key| hello_for(raw, key, endpoint)).await.unwrap();
+    }
+}
+
+#[test]
+fn configured_global_public_ip_includes_self_terminated_tls_port_private_ips_do_not() {
+    let mut config = base_config();
+    for ip in
+        ["127.0.0.1", "10.0.0.1", "192.168.1.2", "169.254.1.1", "::1", "fe80::1", "fc00::1", "224.1.2.3", "2001:db8::1"]
+    {
+        config.public_ip = Some(ip.parse().unwrap());
+        assert!(vc_server::accepted_endpoints(&config).unwrap().is_empty(), "{ip}");
+    }
+    config.http_bind = "127.0.0.1:8443".parse().unwrap();
+    config.tls = Some(vc_server::tls::Tls::Files { cert: "cert.pem".into(), key: "key.pem".into() });
+    for (ip, endpoint) in [("8.8.8.8", "wss://8.8.8.8:8443/ws"), ("2606:4700::1111", "wss://[2606:4700::1111]:8443/ws")]
+    {
+        config.public_ip = Some(ip.parse().unwrap());
+        assert_eq!(vc_server::accepted_endpoints(&config).unwrap(), [endpoint.into()].into());
+    }
+    config.tls = None;
+    assert_eq!(vc_server::accepted_endpoints(&config).unwrap(), ["wss://[2606:4700::1111]/ws".into()].into());
+}
+
+#[test]
+fn domains_public_url_and_explicit_endpoints_form_an_exclusive_set() {
+    let mut c = base_config();
+    c.public_url = Some("https://B.Example.:443/base".into());
+    c.public_endpoints = vec!["wss://Alias.Example:8443/voice/ws".into()];
+    c.tls = Some(vc_server::tls::Tls::Acme {
+        domains: vec!["One.Example.".into()],
+        email: None,
+        cache: Default::default(),
+        staging: true,
+    });
+    assert_eq!(
+        vc_server::accepted_endpoints(&c).unwrap(),
+        [B.into(), "wss://alias.example:8443/voice/ws".into(), "wss://one.example/ws".into()].into()
+    );
+}
+
+#[tokio::test]
+async fn request_headers_cannot_add_endpoints() {
+    let server = server_b().await;
+    let mut request = server.url().into_client_request().unwrap();
+    for (name, value) in [
+        ("host", "a.example"),
+        ("x-forwarded-host", "a.example"),
+        ("x-forwarded-proto", "wss"),
+        ("forwarded", "host=a.example;proto=wss"),
+    ] {
+        request.headers_mut().insert(name, value.parse().unwrap());
+    }
+    let (mut ws, _) = within("websocket connect", connect_async(request)).await.unwrap();
+    let challenge = recv(&mut ws).await.unwrap()["d"].clone();
+    let nonce = challenge["server_nonce"].as_str().unwrap().to_owned();
+    let mut raw = RawConn { ws, challenge, nonce, endpoint: normalize_endpoint(&server.url()).unwrap() };
+    let h = hello_for(&raw, &new_key(), A);
+    assert_eq!(raw.rejected(h).await.code, ErrorCode::NotAuthenticated);
+    raw.expect_closed().await;
+}
+
+#[tokio::test]
+async fn invalid_public_endpoint_fails_startup() {
+    let mut config = base_config();
+    config.public_endpoints = vec!["".into()];
+    assert!(vc_server::start(config).await.err().unwrap().to_string().contains("invalid public endpoint"));
 }

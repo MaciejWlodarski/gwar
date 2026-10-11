@@ -47,6 +47,8 @@ export function ConnectScreen() {
   const [kind, setKind] = useState<ServerKind>(desktop && !invite?.server ? lastKind : "vc");
   const [address, setAddress] = useState(invite?.server ?? lastAddress);
   const [password, setPassword] = useState("");
+  const [insecureLan, setInsecureLan] = useState(bookmarks.find((b) => b.address === address)?.insecureLan ?? false);
+  useEffect(() => setInsecureLan(bookmarks.find((b) => b.address === address)?.insecureLan ?? false), [address, bookmarks]);
   const [remember, setRemember] = useState(true);
   // TeamSpeak: with more than one identity the person chooses; null means the default one.
   const tsList = useTsIdentities();
@@ -96,6 +98,8 @@ export function ConnectScreen() {
         address,
         password,
         invite: kind === "vc" ? invite?.code : undefined,
+        inviteServerKey: kind === "vc" ? invite?.serverKey : undefined,
+        insecureLan: desktop && kind === "vc" && insecureLan,
         identity: pickIdentity ? (resolveIdentity(tsList, identity) ?? undefined) : undefined,
       },
       { remember },
@@ -199,6 +203,10 @@ export function ConnectScreen() {
 
           {pickIdentity && <IdentityPicker list={tsList} value={identity} onChange={setIdentity} />}
 
+          {desktop && kind === "vc" && <div className="flex flex-col gap-2">
+            <Switch checked={insecureLan} onCheckedChange={setInsecureLan} label={t("security.insecureLan")} />
+            {insecureLan && <p role="alert" className="text-sm text-danger">{t("security.insecureWarning")}</p>}
+          </div>}
           <Switch checked={remember} onCheckedChange={setRemember} label={t("connect.remember")} />
 
           {error && (
@@ -236,7 +244,7 @@ export function ConnectScreen() {
                   <button
                     onClick={() =>
                       void controller.connectInteractive(
-                        { kind: b.kind, address: b.address, password: b.password, identity: b.identity },
+                        { kind: b.kind, address: b.address, password: b.password, identity: b.identity, insecureLan: b.insecureLan },
                         { remember: false },
                       )
                     }

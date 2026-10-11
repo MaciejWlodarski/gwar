@@ -104,6 +104,9 @@ day=$(date +%F)
 cd ~/gwar-backups
 ~/vc/vc-server --data-dir ~/vc/data backup "server-$day.sqlite3.tmp" >/dev/null
 mv -f "server-$day.sqlite3.tmp" "server-$day.sqlite3"
+if [[ -f ~/vc/data/server-key.ed25519 ]]; then
+  install -m 600 ~/vc/data/server-key.ed25519 server-key.ed25519
+fi
 if [[ -x ~/gwar-connect/gwar-connect ]]; then
   ~/gwar-connect/gwar-connect --data-dir ~/gwar-connect/data backup "connect-$day.sqlite3.tmp" >/dev/null
   mv -f "connect-$day.sqlite3.tmp" "connect-$day.sqlite3"

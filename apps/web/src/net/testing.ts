@@ -1,5 +1,9 @@
+import type { PinStore, ServerPin } from "./server-pins";
 import type { Welcome } from "../proto/Welcome";
-import type { Identity } from "./identity";
+import { generateIdentity } from "./identity";
+import { newNonce, proofStatement } from "./handshake";
+import type { Hello } from "../proto/Hello";
+import { vi } from "vitest";
 import type { WebSocketLike } from "./connection";
 
 /** In-memory WebSocket for tests; the "server" side is driven by hand. */
@@ -53,7 +57,7 @@ export class FakeSocket implements WebSocketLike {
 export const serverInfo = { name: "Test", welcome: "hi", version: "0", default_channel: 1, max_clients: 10, upload_limit: 0 };
 
 export function challenge(passwordRequired = false) {
-  return { ev: "challenge", d: { protocol: 2, nonce: "abc", server: serverInfo, password_required: passwordRequired } };
+  return { ev: "challenge", d: { protocol: 3, server_pk: testServerIdentity.publicKey, server_nonce: newNonce(), server: serverInfo, password_required: passwordRequired } };
 }
 
 export function welcome(overrides: Partial<Welcome> = {}): Welcome {
@@ -72,9 +76,25 @@ export function welcome(overrides: Partial<Welcome> = {}): Welcome {
   };
 }
 
-export const fakeIdentity: Identity = {
-  publicKey: "PUBKEY",
-  nickname: "Ann",
-  sign: async (m) => `sig(${new TextDecoder().decode(m).replace(/\n/g, "|")})`,
-  exportBackup: () => ({ format: "vc-identity", version: 1, jwk: {} }),
-};
+export const fakeIdentity = await generateIdentity();
+export const testServerIdentity = await generateIdentity();
+
+export async function finishHandshake(s: FakeSocket, w = welcome()): Promise<void> {
+  const hello = s.sent[0]!.d as Hello;
+  const server_proof = await testServerIdentity.sign(new TextEncoder().encode(await proofStatement(hello)));
+  s.push({ re: 1, ok: { server_proof } });
+  await vi.waitFor(() => { if (s.sent.length < 2) throw new Error("waiting for join"); });
+  s.push({ re: 2, ok: w });
+}
+
+export function memoryPins(): PinStore & { pins: Map<string, ServerPin> } {
+  const pins = new Map<string, ServerPin>();
+  return { pins, load: (endpoint) => pins.get(endpoint),
+    commit(endpoint, server_pk) {
+      const old = pins.get(endpoint);
+      if (old && old.server_pk !== server_pk) throw new Error("pin changed");
+      if (!old) pins.set(endpoint, { server_pk, first_seen: Date.now() });
+    },
+    forget(endpoint, previous) { if (pins.get(endpoint)?.server_pk === previous) pins.delete(endpoint); },
+  };
+}

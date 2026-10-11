@@ -124,25 +124,52 @@ On first start the server prints a one-time **admin token**; open the web app,
 connect to `voice.example.com` and redeem it from the server menu ("Use
 token"). Get another one with `vc-server --data-dir data admin-token`.
 
-The desktop app also connects to servers without HTTPS (e.g. on a LAN).
+TLS is required by default. Plain `ws://` is allowed for loopback development.
+In the desktop app, a per-server **Insecure connection (LAN)** toggle also
+permits plaintext to other hosts. While connected a persistent red warning
+explains that anyone on the network can impersonate the server or take over
+the session. Pins and message signatures do not secure a plaintext session.
 
-Login signatures are bound to the server address the client dialed. The server
-accepts names from every `--domain`, the authority of `--public-url`, and extra
-`--public-host` entries (repeat the flag, or set comma-delimited `VC_PUBLIC_HOSTS`).
+The server generates `server-key.ed25519` in its data directory once (a
+32-byte Ed25519 seed, mode 0600 on Unix). **Back it up with the database**;
+losing it changes the server's identity. Never share the seed. Print the public
+key with `vc-server --data-dir data server-key`. Invite links include this full
+public-key fingerprint. Clients store a pin for each canonical WebSocket
+endpoint after verifying the first server proof. A changed key blocks login:
+the user must check it with the owner and explicitly choose the dangerous
+option to forget the old pin and trust the new key. No silent rotation or
+legacy login fallback. The fingerprint is visible in the server sidebar.
+
+Login signatures bind the full endpoint, including scheme, host, effective
+port and WebSocket path. Configure the exclusive accepted set using:
+
+- `--domain`: `wss://<domain>/ws` for each configured domain;
+- `--public-url`: maps HTTP(S) to WS(S), retains host/port and uses `/ws`;
+- `--public-endpoint`: repeatable full endpoint URLs, including alias paths
+  (or comma-delimited `VC_PUBLIC_ENDPOINTS`); replaces `--public-host`;
+- explicit `--public-ip`: only a global unicast IP adds `wss://<ip>/ws`.
+  When the server terminates TLS on a non-default port, that port is included.
+  Browser IP access needs a certificate valid for that IP.
+
 Behind a reverse proxy, set its public URL, for example:
 
 ```bash
 vc-server --http 127.0.0.1:8800 --public-url https://voice.example.com
 ```
 
-For LAN access, add `--public-host 192.168.1.10:8790` (or `[::1]:8790` for IPv6).
-Names are lowercased, a trailing hostname dot is stripped, and IPv6 is bracketed.
-URLs omit port 80 for HTTP/WS and 443 for HTTPS/WSS; bare `host:port` entries
-keep their port, so use a full URL when specifying a scheme-default port.
-The HTTP `Host` header does not change the accepted names. Without `--domain`,
-`--public-url` or `--public-host`, any signed host is accepted and startup logs
-one warning: **login relay protection is off**. Configure at least one public
-name to enable it, including for local development or LAN servers.
+Hostnames are lowercase without a trailing dot, IPv6 is bracketed, and default
+WS/WSS ports are omitted. No credentials, query or fragment. Request headers
+never add endpoints. Private, loopback and link-local `--public-ip` values
+never auto-authorize login. Configure loopback explicitly for development:
+
+```bash
+vc-server --public-endpoint ws://127.0.0.1:8790/ws
+```
+
+An empty set refuses startup. `--insecure-any-host` (`VC_INSECURE_ANY_HOST`)
+accepts any canonical endpoint and logs a loud warning. It is only for isolated
+local development/tests, never staging or ordinary LAN use with valuable
+identities. It disables relay protection even when pins exist.
 
 Servers accept Gwar Connect devices out of the box and fetch the list of
 revoked devices from the official Connect service every five minutes
@@ -180,7 +207,7 @@ Requirements: Rust (stable), Node 22+, pnpm, and libopus for the native clients
 
 ```bash
 pnpm install
-cargo run -p vc-server -- --data-dir data        # server on http://localhost:8790
+cargo run -p vc-server -- --data-dir data --public-endpoint ws://localhost:8790/ws --public-endpoint ws://127.0.0.1:8790/ws --public-endpoint ws://localhost:5173/ws --public-endpoint ws://127.0.0.1:5173/ws
 pnpm --filter web dev                            # web app on http://localhost:5173
 pnpm --filter desktop dev                        # desktop app
 ```

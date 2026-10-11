@@ -24,7 +24,7 @@ use tokio::{
     time::{sleep_until, timeout},
 };
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
-use vc_proto::{AUDIO_SLOTS, challenge_message, normalize_host};
+use vc_proto::{AUDIO_SLOTS, Hello, hello_statement, normalize_endpoint, server_proof_statement};
 use vc_server::{Config, Running};
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -42,7 +42,10 @@ async fn server() -> Running {
         ice_servers: vec![],
         teamspeak: None,
         public_url: None,
-        public_hosts: Vec::new(),
+        data_dir: None,
+        public_ip: None,
+        insecure_any_host: true,
+        public_endpoints: Vec::new(),
         upload_limit: 10 * 1024 * 1024,
         files_dir: None,
         web_origins: Vec::new(),
@@ -65,18 +68,40 @@ impl Ws {
     async fn connect(http: SocketAddr, nickname: &str) -> Ws {
         let (mut stream, _) = tokio_tungstenite::connect_async(format!("ws://{http}/ws")).await.unwrap();
         let challenge = read(&mut stream).await;
-        let nonce = challenge["d"]["nonce"].as_str().unwrap();
         let key = SigningKey::from_bytes(&rand::random());
-        let public_key = URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes());
-        let host = normalize_host(&format!("ws://{http}/ws")).unwrap();
-        let signature = URL_SAFE_NO_PAD.encode(key.sign(&challenge_message(&host, nonce, &public_key)).to_bytes());
-        let hello = json!({"id": 1, "op": "hello", "d": {
-            "protocol": vc_proto::PROTOCOL_VERSION, "nickname": nickname, "public_key": public_key, "host": host, "signature": signature,
-            "client": {"name": "test", "version": "0", "platform": "desktop"}}});
-        stream.send(Message::Text(hello.to_string().into())).await.unwrap();
+        let mut hello = Hello {
+            protocol: vc_proto::PROTOCOL_VERSION,
+            nickname: nickname.into(),
+            endpoint: normalize_endpoint(&format!("ws://{http}/ws")).unwrap(),
+            expected_server_pk: challenge["d"]["server_pk"].as_str().unwrap().into(),
+            server_nonce: challenge["d"]["server_nonce"].as_str().unwrap().into(),
+            client_nonce: URL_SAFE_NO_PAD.encode(rand::random::<[u8; 32]>()),
+            client_signing_pk: URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes()),
+            certificate_hash: "-".into(),
+            signature: String::new(),
+            certificate: None,
+            client: vc_proto::ClientSoftware {
+                name: "test".into(),
+                version: "0".into(),
+                platform: vc_proto::Platform::Desktop,
+            },
+        };
+        hello.signature = URL_SAFE_NO_PAD.encode(key.sign(hello_statement(&hello).unwrap().as_bytes()).to_bytes());
+        stream.send(Message::Text(json!({"id":1,"op":"hello","d":hello}).to_string().into())).await.unwrap();
+        let proof = read(&mut stream).await;
+        let pk = vc_proto::decode_fixed::<32>(&hello.expected_server_pk).unwrap();
+        let sig = vc_proto::decode_fixed::<64>(proof["ok"]["server_proof"].as_str().unwrap()).unwrap();
+        ed25519_dalek::VerifyingKey::from_bytes(&pk)
+            .unwrap()
+            .verify_strict(
+                server_proof_statement(&hello).unwrap().as_bytes(),
+                &ed25519_dalek::Signature::from_bytes(&sig),
+            )
+            .unwrap();
+        stream.send(Message::Text(json!({"id":2,"op":"join","d":{}}).to_string().into())).await.unwrap();
         let welcome = read(&mut stream).await;
         let session = welcome["ok"]["session"].as_u64().expect("welcome");
-        Ws { stream, events: VecDeque::new(), next_id: 2, session }
+        Ws { stream, events: VecDeque::new(), next_id: 3, session }
     }
 
     async fn request(&mut self, op: &str, d: Value) -> Value {

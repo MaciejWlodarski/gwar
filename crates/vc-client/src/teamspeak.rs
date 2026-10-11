@@ -460,7 +460,7 @@ fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Option<Out
         | Request::InviteList {}
         | Request::InviteDelete { .. } => return Err(refused("manage this server in the TeamSpeak client")),
         Request::VoiceOffer { .. } => return Err(refused("voice on TeamSpeak servers is native")),
-        Request::Hello(_) => return Err(refused("already connected")),
+        Request::Hello(_) | Request::Join(_) => return Err(refused("already connected")),
     };
     Ok(Some(cmd))
 }
