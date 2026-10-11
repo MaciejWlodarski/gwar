@@ -206,7 +206,8 @@ gwar message v2
 ```
 
 `server_key` is the vc/3-verified server identity, independent of endpoint aliases.
-`conversation` is `server`, `channel:{immutable_channel_id}`, or
+`conversation` is `server`, `channel:{channel_id}` (never reused by an honest
+server: channel and message ids come from counters that survive deletion), or
 `dm:{lower_uid}:{higher_uid}` (ASCII-byte sorted). Both DM participants come
 from the client's open conversation; the signed author determines direction.
 `author_uid` derives from the certificate account key, or the signing key for

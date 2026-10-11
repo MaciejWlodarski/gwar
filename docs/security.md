@@ -53,13 +53,15 @@ the server, presence, voice authenticity.
 ## Transport
 
 - TLS (`wss://`, `https://`) is required, except to loopback.
-  **Planned:** `ws://` to any other host only through a per-server opt-in in
-  the desktop app, with a permanent red warning "connection can be impersonated
-  or taken over". A later protocol version will replace this with a Noise
-  handshake bound to the identities.
+  `ws://` to any other host works only through a per-server opt-in in the
+  desktop app, with a permanent red warning "connection can be impersonated or
+  taken over" (**implemented**). A later protocol version will replace this with
+  a Noise handshake bound to the identities.
 - A browser connecting by IP needs a TLS certificate valid for that IP.
-- Connect is reached only over HTTPS, without following redirects
-  (**implemented**).
+- Connect is reached only over HTTPS (plain HTTP only on loopback), without
+  following redirects (**implemented**). Servers also accept only a `200` reply
+  (or `404` where absence is the answer), read at most 1 MiB and 1,000
+  revocations per page, and give each request, body included, 20 seconds.
 
 ## Logging in to a server (vc/3, implemented)
 
@@ -116,6 +118,10 @@ service key **only** from its own configured Connect URL, checks the signature,
 the expiry and that the account key derives to the member's uid, and only then
 shows `@handle` and the badge. A server cannot invent a handle for anyone.
 
+Nicknames are the server's word. Next to a nickname that is not the handle
+itself, the badge shows the verified `@handle` in full, so the check mark never
+vouches for a name the server chose.
+
 Handle lookup by key is public by design.
 
 ## Connect account integrity (implemented)
@@ -160,8 +166,11 @@ gwar message v2
 - The server key, not the address, binds a message to a server, so it verifies
   for everyone whether they connected by domain or by IP. Old server keys verify
   only their own history.
-- Channels are named by immutable id. A direct message must involve exactly the
-  two participants of the open conversation.
+- Channels are named by id, and an honest server never reuses one (ids come
+  from a counter that survives deletion). A malicious server can reuse an id;
+  a client that never saw the deletion cannot tell, so a signature binds a
+  message to the channel id, not to the channel's name or lifetime. A direct
+  message must involve exactly the two participants of the open conversation.
 - Edits keep the message id and creation time and chain to the previous
   revision. A missing predecessor is shown as "continuity unproven"; two
   different revisions with the same number are a fork.
@@ -176,26 +185,41 @@ gwar message v2
   retaining account/device pairs permanently with the cursor. Feed omissions
   do not undo them. Stale/unavailable feeds are explicit; the 20,000-record
   capacity fails closed rather than evicting revocations.
+- A client signs an edit or a deletion only over a revision of its own that
+  verifies here; anything else goes to the server as an unsigned removal
+  request. A row that verified is never displaced by one that did not under the
+  same signed identity.
 - Author deletion is a final signed revision (the exact body encoding is in
-  architecture.md). A moderator's unsigned removal says removed by the server.
+  architecture.md). A fully verified deletion disappears; one with a
+  qualification (for example from a revoked device) stays as an inspectable
+  "deleted by the author" line with its warning. A moderator's unsigned removal
+  says removed by the server.
+- Until its signature is checked a message is visibly pending, so a quiet
+  message is always a verified one.
 - Notifications and mention highlights require current, continuous verification.
-  Signed attachment notifications also require byte hashes. Attachments that fail
-  or lack a signature load only on request. TeamSpeak messages are shown as
-  unsigned.
+  For attachments that covers the signed metadata (name, size, hash); the bytes
+  are hashed when they load, not before notifying. Attachments that fail or lack
+  a signature load only on request. TeamSpeak messages are shown as unsigned.
+- Images load automatically only near the visible part of the chat, at most
+  three at a time and within 256 MiB of decoded images; the rest wait, and
+  images far off screen are released.
 - Signature status, handle attestation, connection security and historical
   authorization are shown separately. A verified message does not mean the
   voice is authentic.
 
 ## Hostile input (implemented)
 
-- Every server message is validated at runtime before use.
+- The web app (also the desktop app's interface) validates every server message
+  at runtime, with bounds, before use. The native protocol client in
+  `vc-client`, used by tests and tools but not by the apps, relies on typed
+  parsing without those bounds.
 - File URLs are confined to the server's own origin and to
   `/files/{id}/{name}` (GET) and `/api/files/{id}?token=` (PUT), in the web app
   and in the desktop app's native code.
 - Unauthenticated connections are rate limited per IP and frames are size
   limited before parsing.
-- The web app has a Content-Security-Policy; responses carrying secrets are
-  `no-store`.
+- The web app has a Content-Security-Policy. Gwar Connect marks every reply
+  `Cache-Control: no-store`.
 
 ## What a malicious server can still do
 
@@ -234,7 +258,9 @@ Every guarantee assumes your client runs genuine code.
   hosting on every load. Local identity keys are exportable so they can be
   backed up.
 - **Desktop app.** Code is bundled; the webview has a CSP. Builds are not yet
-  signed or notarized; there is no auto-updater.
+  signed or notarized; there is no auto-updater. The native file commands
+  confine requests to the file paths of the server origin the interface names;
+  they trust the interface to name the current server.
 - **Web apps hosted by other servers** are other origins: they don't have your
   keys, but they can phish your Connect password.
 - **Uploaded files** are served with `nosniff`, a sandboxing CSP and
