@@ -429,7 +429,10 @@ URL can fetch it without a session. Channel membership governs message access,
 not later downloads. Removing someone from a channel or server does not revoke
 URLs they already know. Deleting the message/file removes it from the server;
 copies already downloaded remain. Upload tokens are one-use and expire after
-ten minutes; download capabilities do not expire.
+ten minutes; download capabilities do not expire. Reserved and in-progress
+uploads count against the quotas until they finish; a started upload has ten
+minutes for its bytes, and one that fails or is abandoned frees its space as
+soon as its partial file is removed.
 
 File responses use `Cache-Control: no-store` for media and other files. Without
 expiring download capabilities, even a short private cache can outlive removal;

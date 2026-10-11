@@ -18,6 +18,11 @@ use super::{Core, CoreHandle, CoreMsg, Reply, err, now_ms, storage_error};
 
 /// How long a reserved upload waits for its bytes.
 const UPLOAD_WINDOW: Duration = Duration::from_secs(600);
+/// How long the bytes may take once they start coming (enforced by the HTTP side).
+pub const UPLOAD_DEADLINE: Duration = Duration::from_secs(600);
+/// A started upload stays reserved this much past its deadline, so its bytes count against
+/// the quotas for as long as anything may still be writing them.
+const FINISH_GRACE: Duration = Duration::from_secs(60);
 /// Uploads not attached to a message within this time are removed.
 const UNATTACHED_KEEP_MS: i64 = 24 * 3600 * 1000;
 const MAX_NAME: usize = 120;
@@ -37,6 +42,8 @@ pub struct UploadSlot {
     pub path: PathBuf,
     pub size: u64,
     pub sha256: String,
+    /// When the bytes must be complete.
+    pub deadline: Instant,
 }
 
 /// A finished upload as checked by the HTTP side.
@@ -50,9 +57,23 @@ pub struct Uploaded {
 }
 
 pub enum FileMsg {
-    Begin { id: String, token: String, reply: oneshot::Sender<Option<UploadSlot>> },
-    Finish { upload: Uploaded, reply: oneshot::Sender<bool> },
-    Info { id: String, reply: oneshot::Sender<Option<(Attachment, PathBuf)>> },
+    Begin {
+        id: String,
+        token: String,
+        reply: oneshot::Sender<Option<UploadSlot>>,
+    },
+    Finish {
+        upload: Uploaded,
+        reply: oneshot::Sender<bool>,
+    },
+    /// A started upload failed and its bytes are gone from disk.
+    Abort {
+        id: String,
+    },
+    Info {
+        id: String,
+        reply: oneshot::Sender<Option<(Attachment, PathBuf)>>,
+    },
 }
 
 impl CoreHandle {
@@ -61,6 +82,11 @@ impl CoreHandle {
         let (reply, rx) = oneshot::channel();
         self.tx.send(CoreMsg::Files(FileMsg::Begin { id, token, reply })).await.ok()?;
         rx.await.ok().flatten()
+    }
+
+    /// Releases the reservation of a started upload whose bytes were removed.
+    pub async fn upload_abort(&self, id: String) {
+        let _ = self.tx.send(CoreMsg::Files(FileMsg::Abort { id })).await;
     }
 
     pub async fn upload_finish(&self, upload: Uploaded) -> bool {
@@ -156,16 +182,20 @@ impl Core {
     pub(super) fn file_msg(&mut self, msg: FileMsg) {
         match msg {
             FileMsg::Begin { id, token, reply } => {
+                let now = Instant::now();
+                let deadline = now + UPLOAD_DEADLINE;
                 let slot = self
                     .uploads
                     .get_mut(&id)
-                    .filter(|u| u.until > Instant::now() && !u.token.is_empty() && u.token == token)
+                    .filter(|u| u.until > now && !u.token.is_empty() && u.token == token)
                     .map(|u| {
-                        // The token is spent; the upload stays reserved until it finishes.
+                        // The token is spent; the upload stays reserved until it finishes or fails,
+                        // and in any case past the moment the HTTP side stops writing it.
                         u.token.clear();
+                        u.until = deadline + FINISH_GRACE;
                         (u.size, u.sha256.clone())
                     })
-                    .map(|(size, sha256)| UploadSlot { path: self.files_dir.join(&id), size, sha256 });
+                    .map(|(size, sha256)| UploadSlot { path: self.files_dir.join(&id), size, sha256, deadline });
                 let _ = reply.send(slot);
             }
             FileMsg::Finish { upload, reply } => {
@@ -193,6 +223,12 @@ impl Core {
                     warn!("store: {e:#}");
                 }
                 let _ = reply.send(stored.is_ok());
+            }
+            FileMsg::Abort { id } => {
+                // Only a started upload: an unused token cannot be released by anyone but its expiry.
+                if self.uploads.get(&id).is_some_and(|u| u.token.is_empty()) {
+                    self.uploads.remove(&id);
+                }
             }
             FileMsg::Info { id, reply } => {
                 let file = self.store.file(&id).map_err(storage_error).ok().flatten();

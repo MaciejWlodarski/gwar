@@ -443,6 +443,39 @@ async fn stored_uploads_count_against_member_and_server_limits() {
     alice.ok("file.upload", json!({"name": "g", "size": 60, "mime": "x"})).await;
 }
 
+#[tokio::test]
+async fn failed_uploads_give_their_space_back() {
+    let server = TestServer::start_with(|c| c.storage_limit = 100).await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let mut bob = Client::connect(&server, "bob").await;
+    let put = |reserved: serde_json::Value, body: Vec<u8>| {
+        let url = format!("{}{}", server.http(), reserved["upload_url"].as_str().unwrap());
+        async move { reqwest::Client::new().put(&url).body(body).send().await.unwrap().status() }
+    };
+    let reserved = alice.ok("file.upload", json!({"name": "a", "size": 100, "mime": "x"})).await;
+    assert_eq!(bob.fails("file.upload", json!({"name": "b", "size": 1, "mime": "x"})).await, "quota_exceeded");
+    // Too many bytes, then the wrong bytes: each failure releases the reservation (soon after).
+    assert_eq!(put(reserved, vec![0; 500]).await, 413);
+    let mut reserved = None;
+    for _ in 0..50 {
+        match bob.request("file.upload", json!({"name": "b", "size": 100, "mime": "x"})).await {
+            Ok(ok) => {
+                reserved = Some(ok);
+                break;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+        }
+    }
+    assert_eq!(put(reserved.expect("space released after a refused upload"), vec![1; 100]).await, 400);
+    for _ in 0..50 {
+        if alice.request("file.upload", json!({"name": "c", "size": 100, "mime": "x"})).await.is_ok() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("space not released after a mismatched upload");
+}
+
 fn server_limit(client: &Client) -> u64 {
     client.welcome.server.upload_limit
 }

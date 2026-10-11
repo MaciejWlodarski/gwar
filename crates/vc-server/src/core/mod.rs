@@ -1209,13 +1209,18 @@ impl Core {
             return Some(Err(e));
         }
         let teamspeak = self.is_teamspeak(session);
+        let checked = hash.clone();
         self.defer(
-            move || passwords::verify_secret(&password, &hash, teamspeak),
+            move || passwords::verify_secret(&password, &checked, teamspeak),
             move |core, ok| {
                 if !core.sessions.contains_key(&session) {
                     return;
                 }
-                let result = if ok {
+                // A password set while this one was being checked shuts this join out too.
+                let current = core.channels.get(&channel).and_then(|c| c.password_hash.as_ref());
+                let result = if current.is_some_and(|current| *current != hash) {
+                    Err(err(ErrorCode::WrongPassword, "the channel password has changed"))
+                } else if ok {
                     core.enter_channel(session, channel)
                 } else {
                     Err(err(ErrorCode::WrongPassword, "wrong channel password"))
@@ -1656,6 +1661,83 @@ fn client_view(s: &Session) -> Client {
 mod expiry_tests {
     use super::*;
 
+    fn test_core(store: Store, password: Option<&str>) -> CoreHandle {
+        let (media, _commands) = mpsc::channel(8);
+        spawn(
+            store,
+            CoreConfig {
+                max_clients: 10,
+                ice_servers: Vec::new(),
+                version: "test".into(),
+                password: Arc::new(ArcSwap::from_pointee(password.map(Arc::from))),
+                upload_limit: 0,
+                upload_quota: 0,
+                storage_limit: 0,
+                files_dir: PathBuf::new(),
+                connect_url: None,
+                server_key: String::new(),
+            },
+            Arc::new(ArcSwap::from_pointee(Routing::default())),
+            media,
+        )
+        .unwrap()
+    }
+
+    /// Runs `f` on the actor, between any other messages.
+    async fn on_core<T: Send + 'static>(core: &CoreHandle, f: impl FnOnce(&mut Core) -> T + Send + 'static) -> T {
+        let (tx, rx) = oneshot::channel();
+        core.tx.send(CoreMsg::Resume(Box::new(move |core| drop(tx.send(f(core)))))).await.unwrap();
+        rx.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_join_checked_against_a_replaced_password_is_refused() {
+        let store = Store::in_memory().unwrap();
+        let old = passwords::hash_secret("old", false);
+        let locked = store.insert_channel(None, "locked", "", 1, Some(&old), None).unwrap();
+        let core = test_core(store, None);
+        let (out, mut frames) = mpsc::channel(OUTBOUND_QUEUE);
+        let session = core
+            .connect(ConnectRequest {
+                request_id: 1,
+                hello_key: String::new(),
+                certificate: None,
+                uid: crate::identity::uid_for_key(&[1; 32]),
+                public_key: URL_SAFE_NO_PAD.encode([1; 32]),
+                nickname: "guest".into(),
+                platform: Platform::Web,
+                out,
+                ip: None,
+                device: None,
+                device_expires_at: None,
+                invite: None,
+                password_ok: true,
+            })
+            .await
+            .unwrap();
+        // The join's check of the old password finishes only after the new one is in place.
+        let new = passwords::hash_secret("new", false);
+        on_core(&core, move |core| {
+            assert!(core.channel_join(session, 7, locked, Some("old".into())).is_none(), "checked off the actor");
+            let row = core.channels[&locked].clone();
+            core.apply_channel_update(locked, row, Some(Some(new)), None).unwrap();
+        })
+        .await;
+        let reply = loop {
+            let Some(Outbound::Frame(frame)) = frames.recv().await else { continue };
+            let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            if frame["re"] == 7 {
+                break frame;
+            }
+        };
+        assert_eq!(reply["err"]["code"], "wrong_password", "{reply}");
+        let (channel, unlocked) =
+            on_core(&core, move |core| (core.sessions[&session].channel, core.sessions[&session].unlocked.clone()))
+                .await;
+        assert_ne!(channel, Some(locked));
+        assert!(unlocked.is_empty());
+    }
+
     #[tokio::test]
     async fn invites_from_before_ownership_admit_nobody() {
         let store = Store::in_memory().unwrap();
@@ -1675,25 +1757,7 @@ mod expiry_tests {
             .raw()
             .execute("INSERT INTO invites(code,uses,created_by,created_at) VALUES('old',0,'maker',1)", [])
             .unwrap();
-        let (media, _commands) = mpsc::channel(8);
-        let core = spawn(
-            store,
-            CoreConfig {
-                max_clients: 10,
-                ice_servers: Vec::new(),
-                version: "test".into(),
-                password: Arc::new(ArcSwap::from_pointee(Some("secret".into()))),
-                upload_limit: 0,
-                upload_quota: 0,
-                storage_limit: 0,
-                files_dir: PathBuf::new(),
-                connect_url: None,
-                server_key: String::new(),
-            },
-            Arc::new(ArcSwap::from_pointee(Routing::default())),
-            media,
-        )
-        .unwrap();
+        let core = test_core(store, Some("secret"));
         for (key, code, admitted) in [(1u8, "old", false), (2, "owned", true)] {
             let (out, _frames) = mpsc::channel(OUTBOUND_QUEUE);
             let session = core

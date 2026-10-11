@@ -19,7 +19,10 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::warn;
 
-use crate::{core::files::Uploaded, gateway::Gateway};
+use crate::{
+    core::{CoreHandle, files::Uploaded},
+    gateway::Gateway,
+};
 
 /// Bytes kept from the start of an upload to recognize its type.
 const SNIFF: usize = 64 * 1024;
@@ -84,17 +87,44 @@ fn media_type(header: &[u8]) -> Option<&'static str> {
 }
 
 /// An upload's bytes must keep coming (at most this long between chunks) and be
-/// complete within the deadline, the same window a reservation waits for them.
+/// complete within the deadline its reservation gives them.
 const UPLOAD_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
-const UPLOAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// The next chunk of an upload, or `REQUEST_TIMEOUT` when the sender stalls or runs out of time.
 async fn paced<S: futures::Stream + Unpin>(
     stream: &mut S,
     deadline: tokio::time::Instant,
 ) -> Result<Option<S::Item>, StatusCode> {
-    let wait = UPLOAD_IDLE.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
-    tokio::time::timeout(wait, stream.next()).await.map_err(|_| StatusCode::REQUEST_TIMEOUT)
+    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+    // A chunk already waiting would be taken even with no time left.
+    if left.is_zero() {
+        return Err(StatusCode::REQUEST_TIMEOUT);
+    }
+    tokio::time::timeout(UPLOAD_IDLE.min(left), stream.next()).await.map_err(|_| StatusCode::REQUEST_TIMEOUT)
+}
+
+/// Until disarmed, removes an upload's bytes and then releases its reservation, however the
+/// upload ends: an error, a timeout or the client going away (which drops the handler).
+struct Abandoned {
+    core: CoreHandle,
+    id: String,
+    paths: [std::path::PathBuf; 2],
+    armed: bool,
+}
+
+impl Drop for Abandoned {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (core, id, paths) = (self.core.clone(), std::mem::take(&mut self.id), self.paths.clone());
+        tokio::spawn(async move {
+            for path in paths {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+            core.upload_abort(id).await;
+        });
+    }
 }
 
 pub async fn upload(
@@ -110,6 +140,8 @@ pub async fn upload(
         return (StatusCode::FORBIDDEN, "unknown or used upload").into_response();
     };
     let part = slot.path.with_extension("part");
+    let mut abandoned =
+        Abandoned { core: gateway.core.clone(), id: id.clone(), paths: [part.clone(), slot.path.clone()], armed: true };
     let result = async {
         if let Some(dir) = part.parent() {
             tokio::fs::create_dir_all(dir).await?;
@@ -120,7 +152,7 @@ pub async fn upload(
         let mut header = Vec::with_capacity(SNIFF);
         let mut stream = body.into_data_stream();
         // A slow or stalled sender cannot hold the upload (and its file) open for long.
-        let deadline = tokio::time::Instant::now() + UPLOAD_DEADLINE;
+        let deadline = tokio::time::Instant::from_std(slot.deadline);
         loop {
             let next = match paced(&mut stream, deadline).await {
                 Ok(next) => next,
@@ -154,23 +186,18 @@ pub async fn upload(
     .await;
     match result {
         Ok(Ok(uploaded)) => {
-            if gateway.core.upload_finish(uploaded).await {
-                match gateway.core.file_info(id.clone()).await {
-                    Some((file, _)) => axum::Json(file).into_response(),
-                    None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-                }
-            } else {
-                let _ = tokio::fs::remove_file(&slot.path).await;
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            if !gateway.core.upload_finish(uploaded).await {
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            abandoned.armed = false;
+            match gateway.core.file_info(id.clone()).await {
+                Some((file, _)) => axum::Json(file).into_response(),
+                None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
             }
         }
-        Ok(Err(status)) => {
-            let _ = tokio::fs::remove_file(&part).await;
-            status.into_response()
-        }
+        Ok(Err(status)) => status.into_response(),
         Err(e) => {
             warn!("upload {id}: {e}");
-            let _ = tokio::fs::remove_file(&part).await;
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -263,7 +290,8 @@ async fn serve_file(mut handle: tokio::fs::File, mime: &str, name: &str, request
 mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
 
-    use super::{UPLOAD_DEADLINE, UPLOAD_IDLE, byte_range, media_type, paced, serve_file, valid_id};
+    use super::{UPLOAD_IDLE, byte_range, media_type, paced, serve_file, valid_id};
+    use crate::core::files::UPLOAD_DEADLINE;
     use axum::http::StatusCode;
     use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
@@ -287,6 +315,9 @@ mod tests {
             received += 1;
         }
         assert_eq!(start.elapsed(), UPLOAD_DEADLINE, "after {received} chunks");
+        // Past the deadline even a chunk that is already there is refused.
+        let mut ready = futures::stream::iter([1u8]);
+        assert_eq!(paced(&mut ready, deadline).await, Err(StatusCode::REQUEST_TIMEOUT));
         // An honest stream ends normally.
         let mut done = futures::stream::iter([1u8]);
         assert_eq!(paced(&mut done, deadline + UPLOAD_DEADLINE).await, Ok(Some(1)));
