@@ -21,7 +21,7 @@ describe("attachment bytes", () => {
 
 it("bounds header and decoded image dimensions before creating a preview", async () => {
   const { imageDimensions, checkImageDimensions, boundedImageBlob } = await import("./attachment");
-  const bytes = new Uint8Array(24); bytes.set([137, 80, 78, 71]);
+  const bytes = new Uint8Array(24); bytes.set([137, 80, 78, 71]); bytes.set([73, 72, 68, 82], 12);
   const view = new DataView(bytes.buffer); view.setUint32(16, 100_000); view.setUint32(20, 100_000);
   expect(imageDimensions(bytes)).toEqual([100_000, 100_000]);
   expect(() => checkImageDimensions(4096, 4096)).toThrow();
@@ -34,6 +34,51 @@ it("bounds header and decoded image dimensions before creating a preview", async
   const close = vi.fn(); decode.mockResolvedValue({ width: 100_000, height: 1, close });
   await expect(boundedImageBlob(new Blob([bytes], { type: "image/png" }))).rejects.toThrow("dimensions limit");
   expect(close).toHaveBeenCalledOnce(); vi.unstubAllGlobals();
+});
+
+// Sizes real decoders would compute differently from the header (seen in Chromium and WebKit).
+describe("image headers that decoders size differently", () => {
+  const gif = (screen: [number, number], frames: Array<[number, number, number, number]>, trailer = true) => {
+    const b: number[] = [...new TextEncoder().encode("GIF89a")];
+    const u16 = (n: number) => b.push(n & 255, n >> 8);
+    u16(screen[0]); u16(screen[1]); b.push(0x80, 0, 0, 0, 0, 0, 255, 255, 255);
+    b.push(0x21, 0xf9, 4, 0, 0, 0, 0, 0); // graphic control extension
+    for (const [left, top, w, h] of frames) { b.push(0x2c); u16(left); u16(top); u16(w); u16(h); b.push(0, 2, 2, 0x4c, 0x01, 0); }
+    if (trailer) b.push(0x3b);
+    return new Uint8Array(b);
+  };
+  const jpeg = (...frames: Array<[number, number]>) => {
+    const b = [0xff, 0xd8, 0xff, 0xe0, 0, 4, 0, 0];
+    for (const [w, h] of frames) b.push(0xff, 0xc0, 0, 11, 8, h >> 8, h & 255, w >> 8, w & 255, 1, 1, 0x11, 0);
+    b.push(0xff, 0xda, 0, 8, 1, 1, 0, 0, 63, 0, 0x12, 0x34, 0xff, 0xd9);
+    return new Uint8Array(b);
+  };
+
+  it("takes a GIF's screen only when every frame lies inside it", async () => {
+    const { imageDimensions } = await import("./attachment");
+    expect(imageDimensions(gif([10, 10], [[0, 0, 10, 10], [2, 2, 8, 8]]))).toEqual([10, 10]);
+    // Chromium decodes this at 300x200.
+    expect(() => imageDimensions(gif([10, 10], [[0, 0, 300, 200]]))).toThrow("outside");
+    expect(() => imageDimensions(gif([10, 10], [[0, 0, 10, 10], [5, 0, 10, 10]]))).toThrow("outside");
+    expect(() => imageDimensions(gif([10, 10], []))).toThrow("malformed");
+    expect(() => imageDimensions(gif([10, 10], [[0, 0, 10, 10]], false))).toThrow("malformed");
+  });
+
+  it("takes a JPEG's size only from its single frame header", async () => {
+    const { imageDimensions } = await import("./attachment");
+    expect(imageDimensions(jpeg([300, 200]))).toEqual([300, 200]);
+    // WebKit decodes this at the second header's size.
+    expect(() => imageDimensions(jpeg([16, 16], [4000, 4000]))).toThrow("more than one frame header");
+    expect(() => imageDimensions(jpeg())).toThrow("malformed");
+    expect(() => imageDimensions(jpeg([16, 16]).subarray(0, 12))).toThrow("malformed");
+  });
+
+  it("reads a PNG's size only from IHDR in its place", async () => {
+    const { imageDimensions } = await import("./attachment");
+    const png = new Uint8Array(40); png.set([137, 80, 78, 71, 13, 10, 26, 10]);
+    png.set(new TextEncoder().encode("CgBI"), 12); // Apple's variant, decoded by WebKit with IHDR later
+    expect(() => imageDimensions(png)).toThrow("malformed");
+  });
 });
 
 it("bounds and validates chunked upload metadata before it can be signed", async () => {

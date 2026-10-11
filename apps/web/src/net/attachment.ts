@@ -18,12 +18,21 @@ export function checkImageDimensions(width: number, height: number): void {
   if (!Number.isSafeInteger(width) || !Number.isSafeInteger(height) || width < 1 || height < 1
       || width > MAX_IMAGE_SIDE || height > MAX_IMAGE_SIDE || width * height > MAX_IMAGE_PIXELS) throw new Error("Image exceeds decoded dimensions limit");
 }
-/** Read dimensions before decoding to avoid accepting compressed image bombs. */
+/**
+ * Read dimensions before decoding to avoid accepting compressed image bombs. The
+ * answer must be what every real decoder will allocate, so anything a decoder
+ * could size differently is refused: a GIF frame outside its logical screen
+ * (Chromium enlarges the image to its first frame), more than one JPEG frame
+ * header (WebKit sizes by the last one), a PNG whose first chunk is not IHDR.
+ */
 export function imageDimensions(bytes: Uint8Array): [number, number] {
   const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const ascii = (at: number, n: number) => new TextDecoder().decode(bytes.subarray(at, at + n));
-  if (bytes.length >= 24 && bytes[0] === 137 && ascii(1, 3) === "PNG") return [v.getUint32(16), v.getUint32(20)];
-  if (bytes.length >= 10 && ascii(0, 3) === "GIF") return [v.getUint16(6, true), v.getUint16(8, true)];
+  if (bytes.length >= 24 && bytes[0] === 137 && ascii(1, 3) === "PNG") {
+    if (ascii(12, 4) !== "IHDR") throw new Error("Unsupported or malformed inline image");
+    return [v.getUint32(16), v.getUint32(20)];
+  }
+  if (bytes.length >= 13 && ascii(0, 3) === "GIF") return gifDimensions(bytes, v);
   if (bytes.length >= 30 && ascii(0, 4) === "RIFF" && ascii(8, 4) === "WEBP") {
     const kind = ascii(12, 4);
     const u24 = (at: number) => bytes[at]! + bytes[at + 1]! * 256 + bytes[at + 2]! * 65536;
@@ -33,21 +42,59 @@ export function imageDimensions(bytes: Uint8Array): [number, number] {
       const bits = v.getUint32(21, true); return [(bits & 16383) + 1, ((bits >>> 14) & 16383) + 1];
     }
   }
-  if (bytes[0] === 255 && bytes[1] === 216) {
-    let at = 2;
-    while (at + 9 < bytes.length) {
-      if (bytes[at] !== 255) break;
-      while (bytes[at] === 255) at++;
-      const marker = bytes[at++]!;
-      if (marker === 217 || marker === 218) break;
-      if (marker === 1 || (marker >= 208 && marker <= 215)) continue;
-      const size = v.getUint16(at);
-      if ([192, 193, 194, 195, 197, 198, 199, 201, 202, 203, 205, 206, 207].includes(marker)) return [v.getUint16(at + 5), v.getUint16(at + 3)];
-      if (size < 2) break;
-      at += size;
-    }
-  }
+  if (bytes[0] === 255 && bytes[1] === 216) return jpegDimensions(bytes, v);
   throw new Error("Unsupported or malformed inline image");
+}
+const malformed = () => new Error("Unsupported or malformed inline image");
+/** The logical screen, once every frame is known to lie inside it. */
+function gifDimensions(bytes: Uint8Array, v: DataView): [number, number] {
+  const width = v.getUint16(6, true), height = v.getUint16(8, true);
+  const table = (flags: number) => (flags & 0x80 ? 3 * 2 ** ((flags & 7) + 1) : 0);
+  // Data sub-blocks: a length byte, that many bytes, until a zero length.
+  const skipBlocks = (at: number) => {
+    while (at < bytes.length && bytes[at] !== 0) at += 1 + bytes[at]!;
+    if (at >= bytes.length) throw malformed();
+    return at + 1;
+  };
+  let at = 13 + table(bytes[10]!), frames = 0;
+  for (;;) {
+    if (at >= bytes.length) throw malformed();
+    const block = bytes[at]!;
+    if (block === 0x3b) break;
+    if (block === 0x21) { at = skipBlocks(at + 2); continue; }
+    if (block !== 0x2c || at + 10 > bytes.length) throw malformed();
+    const left = v.getUint16(at + 1, true), top = v.getUint16(at + 3, true);
+    const w = v.getUint16(at + 5, true), h = v.getUint16(at + 7, true);
+    if (left + w > width || top + h > height) throw new Error("GIF frame outside its image");
+    frames++;
+    at = skipBlocks(at + 10 + table(bytes[at + 9]!) + 1);
+  }
+  if (frames === 0) throw malformed();
+  return [width, height];
+}
+const JPEG_FRAMES = new Set([192, 193, 194, 195, 197, 198, 199, 201, 202, 203, 205, 206, 207]);
+/** The one frame header before the first scan; a second one is refused. */
+function jpegDimensions(bytes: Uint8Array, v: DataView): [number, number] {
+  let at = 2, found: [number, number] | null = null;
+  for (;;) {
+    if (at + 1 >= bytes.length || bytes[at] !== 255) throw malformed();
+    while (bytes[at] === 255 && at < bytes.length) at++;
+    const marker = bytes[at++];
+    if (marker === undefined || marker === 216 || marker === 217) throw malformed();
+    if (marker === 1 || (marker >= 208 && marker <= 215)) continue;
+    if (at + 2 > bytes.length) throw malformed();
+    const size = v.getUint16(at);
+    if (size < 2 || at + size > bytes.length) throw malformed();
+    if (marker === 218) break;
+    if (JPEG_FRAMES.has(marker)) {
+      if (found) throw new Error("JPEG with more than one frame header");
+      if (size < 7) throw malformed();
+      found = [v.getUint16(at + 5), v.getUint16(at + 3)];
+    }
+    at += size;
+  }
+  if (!found) throw malformed();
+  return found;
 }
 /** Convert the bounded decoded first frame to a static PNG, including explicitly loaded unsigned images. */
 export async function boundedImageBlob(blob: Blob, beforeDecode?: (width: number, height: number) => Promise<void>): Promise<Blob> {

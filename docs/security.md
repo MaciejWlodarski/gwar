@@ -229,6 +229,15 @@ gwar message v2
   three at a time and within an estimated 256 MiB of image memory (two RGBA
   frames plus the fetched bytes per image, reserved before decoding); the rest
   wait, and images far off screen are released.
+- That estimate rests on the size read from the image header, so the header is
+  read only where real decoders agree with it: a GIF frame must lie inside the
+  logical screen (Chromium otherwise decodes the larger frame), a JPEG may have
+  only one frame header before its scan (WebKit uses the last one), and a PNG
+  must start with IHDR. Anything decoding larger than its header is still
+  dropped after decoding. `apps/web/e2e/images.mjs` checks this against the
+  Chromium and WebKit decoders; the Windows (WebView2) and Linux (WebKitGTK)
+  desktop builds share those engines, but not necessarily their exact image
+  libraries.
 - Signature status, handle attestation, connection security and historical
   authorization are shown separately. A verified message does not mean the
   voice is authentic.
