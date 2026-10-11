@@ -10,13 +10,13 @@ describe("certificateWarning", () => {
     expect(certificateWarning(now + 300 * DAY, now, true)).toEqual({ level: "none" });
   });
 
-  it("warns from 30 days before the end, counting days left", () => {
-    expect(certificateWarning(now + WARN_DAYS * DAY, now, true)).toEqual({ level: "expiring", daysLeft: 30 });
+  it("warns from 14 days before the end, counting days left", () => {
+    expect(certificateWarning(now + WARN_DAYS * DAY, now, true)).toEqual({ level: "expiring", daysLeft: 14 });
     expect(certificateWarning(now + 2 * DAY + 1, now, true)).toEqual({ level: "expiring", daysLeft: 3 });
     expect(certificateWarning(now + 1, now, true)).toEqual({ level: "expiring", daysLeft: 1 });
   });
 
-  it("waits for the look at newer certificates: another device may have renewed this one", () => {
+  it("waits for the look at newer certificates: this device may have saved a renewal", () => {
     expect(certificateWarning(now + 5 * DAY, now, false)).toEqual({ level: "none" });
     expect(certificateWarning(now - DAY, now, false)).toEqual({ level: "none" });
   });

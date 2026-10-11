@@ -86,7 +86,7 @@ fn revocation(account: &SigningKey, device: &SigningKey) -> Value {
 fn certificate(account: &SigningKey, device: &SigningKey, name: &str) -> Value {
     let (account_key, device_key) = (b64(account.verifying_key().as_bytes()), b64(device.verifying_key().as_bytes()));
     let issued_at = gwar_connect::api::now_ms();
-    let expires_at = issued_at + 365 * 24 * 3600 * 1000;
+    let expires_at = issued_at + 90 * 24 * 3600 * 1000;
     let statement = crypto::device_statement(&account_key, &device_key, issued_at, expires_at);
     json!({"device_key": device_key, "name": name, "issued_at": issued_at, "expires_at": expires_at,
            "signature": b64(&account.sign(statement.as_bytes()).to_bytes())})

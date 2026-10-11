@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use crate::store::{Challenge, Kdf};
 
 /// Device certificates last at most this long.
-pub const MAX_CERT_MS: i64 = 400 * 24 * 3600 * 1000;
+pub const MAX_CERT_MS: i64 = 90 * 24 * 3600 * 1000;
 /// Clock skew tolerated on "issued at" and "revoked at".
 pub const SKEW_MS: i64 = 5 * 60 * 1000;
 /// AES-GCM nonce + 32-byte seed + tag.
@@ -120,6 +120,26 @@ pub fn handle(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn certificate_lifetime_is_exactly_ninety_days() {
+        use ed25519_dalek::{Signer, SigningKey};
+        let account = SigningKey::from_bytes(&[1; 32]);
+        let device = SigningKey::from_bytes(&[2; 32]);
+        let account_key = b64(account.verifying_key().as_bytes());
+        let device_key = b64(device.verifying_key().as_bytes());
+        let now = 1_700_000_000_000;
+        assert_eq!(MAX_CERT_MS, 90 * 86_400_000);
+        for (length, accepted) in [(MAX_CERT_MS, true), (MAX_CERT_MS + 1, false), (400 * 86_400_000, false)] {
+            let signature = b64(&account
+                .sign(device_statement(&account_key, &device_key, now, now + length).as_bytes())
+                .to_bytes());
+            assert_eq!(
+                check_certificate(&account_key, &device_key, now, now + length, &signature, now).is_ok(),
+                accepted
+            );
+        }
+    }
 
     #[test]
     fn handles_are_normalized_and_restricted() {

@@ -1,7 +1,7 @@
 /** When to tell the person that this device's certificate needs the password (docs/connect.md, "Signed statements"). */
 
 /** Warn when the certificate has this many days left or fewer. */
-export const WARN_DAYS = 30;
+export const WARN_DAYS = 14;
 
 export type CertificateWarning =
   | { level: "none" }
