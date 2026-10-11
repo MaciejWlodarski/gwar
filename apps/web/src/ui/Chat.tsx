@@ -339,7 +339,7 @@ function SysRow({ row, t }: { row: Extract<Row, { type: "sys" }>; t: TFn }) {
   );
 }
 
-function MessageList({ threadKey }: { threadKey: ThreadKey }) {
+export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
   const t = useT();
   const lang = useLanguage();
   const mineUid = useSession((s) => s.me?.uid);
@@ -365,19 +365,44 @@ function MessageList({ threadKey }: { threadKey: ThreadKey }) {
         authorizationRefresh.current = { verifier, tick: authTick, work: authTick ? verifier.refresh() : Promise.resolve() };
       }
       await authorizationRefresh.current.work;
-      if (active) setSigningUid(uid);
-      // Each row shows its result as soon as it is known; until then it is visibly pending.
-      await Promise.all((thread?.items ?? []).filter((i) => i.kind === "msg").map(async (i) => {
-        const target = messageTarget(key, i.msg.author_uid, uid);
-        const ctx = { serverKey, target };
-        const entry = { fingerprint: messageFingerprint(i.msg, ctx), state: await verifier.verify(i.msg, ctx) };
+      if (!active) return;
+      setSigningUid(uid);
+      const rows = (thread?.items ?? []).flatMap((i) => {
+        if (i.kind !== "msg") return [];
+        const ctx = { serverKey, target: messageTarget(key, i.msg.author_uid, uid) };
+        return [{ msg: i.msg, ctx, fingerprint: messageFingerprint(i.msg, ctx) }];
+      });
+      // Results are kept only for the rows the thread still holds, so the map is bounded like the thread.
+      const live = new Map(rows.map((r) => [r.msg.id, r.fingerprint]));
+      setVerified((prev) => {
+        const next = new Map([...prev].filter(([id, e]) => live.get(id) === e.fingerprint));
+        return next.size === prev.size ? prev : next;
+      });
+      // Each row shows its result as soon as it is known (batched per frame); until then it is visibly pending.
+      const flush = () => {
+        timer = undefined;
+        const batch = pending; pending = [];
         if (active) setVerified((prev) => {
-          const old = prev.get(i.msg.id);
-          return old?.fingerprint === entry.fingerprint && old.state === entry.state ? prev : new Map(prev).set(i.msg.id, entry);
+          let next = prev;
+          for (const [id, entry] of batch) {
+            const old = next.get(id);
+            if (old?.fingerprint === entry.fingerprint && old.state === entry.state) continue;
+            if (next === prev) next = new Map(prev);
+            next.set(id, entry);
+          }
+          return next;
         });
+      };
+      await Promise.all(rows.map(async ({ msg, ctx, fingerprint }) => {
+        const state = await verifier.verify(msg, ctx);
+        if (!active) return;
+        pending.push([msg.id, { fingerprint, state }]);
+        timer ??= setTimeout(flush, 16);
       }));
     });
-    return () => { active = false; };
+    let pending: [number, { fingerprint: string; state: MessageVerification }][] = [];
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    return () => { active = false; clearTimeout(timer); };
   }, [thread?.items, serverKey, key, mineUid, verifier, authTick]);
   const rows = useMemo(() => buildRows((thread?.items ?? []).filter((i) => {
     if (i.kind !== "msg" || i.msg.text !== DELETION_TEXT) return true;
