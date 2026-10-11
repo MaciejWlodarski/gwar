@@ -9,7 +9,7 @@ use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
-use vc_proto::{ErrorBody, Welcome, challenge_message};
+use vc_proto::{ErrorBody, Welcome, challenge_message, normalize_host};
 use vc_server::{Config, Running};
 
 /// Upper bound for any single wait so a broken test fails instead of hanging.
@@ -44,6 +44,7 @@ pub fn base_config() -> Config {
         ice_servers: Vec::new(),
         teamspeak: None,
         public_url: None,
+        public_hosts: Vec::new(),
         upload_limit: 10 * 1024 * 1024,
         files_dir: None,
         web_origins: Vec::new(),
@@ -94,12 +95,21 @@ pub fn public_key(key: &SigningKey) -> String {
     B64.encode(key.verifying_key().as_bytes())
 }
 
-pub fn sign(key: &SigningKey, nonce: &str) -> String {
-    B64.encode(key.sign(&challenge_message(nonce, &public_key(key))).to_bytes())
+pub fn sign(key: &SigningKey, host: &str, nonce: &str) -> String {
+    B64.encode(key.sign(&challenge_message(host, nonce, &public_key(key))).to_bytes())
 }
 
 pub fn uid_of(key: &SigningKey) -> String {
     vc_server::identity::uid_for_key(key.verifying_key().as_bytes())
+}
+
+/// A device certificate signed by `account` for `device`.
+pub fn certificate(account: &SigningKey, device: &SigningKey, issued_at: i64, expires_at: i64) -> Value {
+    let (account_key, device_key) =
+        (B64.encode(account.verifying_key().as_bytes()), B64.encode(device.verifying_key().as_bytes()));
+    let statement = format!("gwar device v1\n{account_key}\n{device_key}\n{issued_at}\n{expires_at}");
+    json!({"account_key": account_key, "device_key": device_key, "issued_at": issued_at, "expires_at": expires_at,
+           "signature": B64.encode(account.sign(statement.as_bytes()).to_bytes())})
 }
 
 // ---------------------------------------------------------------- raw conn
@@ -109,6 +119,7 @@ pub struct RawConn {
     pub ws: Ws,
     pub challenge: Value,
     pub nonce: String,
+    pub host: String,
 }
 
 pub async fn open(server: &TestServer) -> RawConn {
@@ -117,7 +128,7 @@ pub async fn open(server: &TestServer) -> RawConn {
     assert_eq!(frame["ev"], "challenge", "first server frame must be the challenge: {frame}");
     let challenge = frame["d"].clone();
     let nonce = challenge["nonce"].as_str().expect("nonce").to_owned();
-    RawConn { ws, challenge, nonce }
+    RawConn { ws, challenge, nonce, host: normalize_host(&server.url()).unwrap() }
 }
 
 impl RawConn {
@@ -145,7 +156,8 @@ impl RawConn {
             "protocol": vc_proto::PROTOCOL_VERSION,
             "nickname": nickname,
             "public_key": public_key(key),
-            "signature": sign(key, &self.nonce),
+            "host": self.host,
+            "signature": sign(key, &self.host, &self.nonce),
             "client": {"name": "test", "version": "0", "platform": "web"},
         });
         if let Some(p) = password {

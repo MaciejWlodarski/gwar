@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use common::*;
 use serde_json::{Value, json};
-use vc_proto::Permission;
+use vc_proto::{Permission, normalize_host};
 
 const MEMBER: u64 = 2;
 const ADMIN: u64 = 1;
@@ -37,7 +37,7 @@ async fn bad_signature_is_rejected_and_connection_closed() {
     let key = new_key();
     let mut hello = raw.hello(&key, "mallory", None);
     // Signed by a different key than the one announced.
-    hello["signature"] = json!(sign(&new_key(), &raw.nonce));
+    hello["signature"] = json!(sign(&new_key(), &raw.host, &raw.nonce));
     let err = raw.rejected(hello).await;
     assert_eq!(serde_json::to_value(err.code).unwrap(), "not_authenticated");
     raw.expect_closed().await;
@@ -50,7 +50,7 @@ async fn signature_over_another_nonce_is_rejected() {
     let mut raw = open(&server).await;
     let key = new_key();
     let mut hello = raw.hello(&key, "replay", None);
-    hello["signature"] = json!(sign(&key, &other.nonce));
+    hello["signature"] = json!(sign(&key, &raw.host, &other.nonce));
     let err = raw.rejected(hello).await;
     assert_eq!(serde_json::to_value(err.code).unwrap(), "not_authenticated");
     raw.expect_closed().await;
@@ -157,6 +157,7 @@ async fn second_hello_and_garbage_after_login_are_bad_requests() {
     let mut c = Client::connect(&server, "alice").await;
     let hello = json!({
         "protocol": vc_proto::PROTOCOL_VERSION, "nickname": "again", "public_key": public_key(&c.key), "signature": "x",
+        "host": normalize_host(&server.url()).unwrap(),
         "client": {"name": "t", "version": "0", "platform": "web"},
     });
     assert_eq!(c.fails("hello", hello).await, "bad_request");

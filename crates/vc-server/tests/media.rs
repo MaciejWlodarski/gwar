@@ -24,7 +24,7 @@ use tokio::{
     time::{sleep_until, timeout},
 };
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
-use vc_proto::{AUDIO_SLOTS, challenge_message};
+use vc_proto::{AUDIO_SLOTS, challenge_message, normalize_host};
 use vc_server::{Config, Running};
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -42,6 +42,7 @@ async fn server() -> Running {
         ice_servers: vec![],
         teamspeak: None,
         public_url: None,
+        public_hosts: Vec::new(),
         upload_limit: 10 * 1024 * 1024,
         files_dir: None,
         web_origins: Vec::new(),
@@ -67,9 +68,10 @@ impl Ws {
         let nonce = challenge["d"]["nonce"].as_str().unwrap();
         let key = SigningKey::from_bytes(&rand::random());
         let public_key = URL_SAFE_NO_PAD.encode(key.verifying_key().as_bytes());
-        let signature = URL_SAFE_NO_PAD.encode(key.sign(&challenge_message(nonce, &public_key)).to_bytes());
+        let host = normalize_host(&format!("ws://{http}/ws")).unwrap();
+        let signature = URL_SAFE_NO_PAD.encode(key.sign(&challenge_message(&host, nonce, &public_key)).to_bytes());
         let hello = json!({"id": 1, "op": "hello", "d": {
-            "protocol": vc_proto::PROTOCOL_VERSION, "nickname": nickname, "public_key": public_key, "signature": signature,
+            "protocol": vc_proto::PROTOCOL_VERSION, "nickname": nickname, "public_key": public_key, "host": host, "signature": signature,
             "client": {"name": "test", "version": "0", "platform": "desktop"}}});
         stream.send(Message::Text(hello.to_string().into())).await.unwrap();
         let welcome = read(&mut stream).await;

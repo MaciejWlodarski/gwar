@@ -19,14 +19,6 @@ fn now() -> i64 {
     vc_server::core::now_ms()
 }
 
-/// A device certificate signed by `account` for `device`.
-fn certificate(account: &SigningKey, device: &SigningKey, issued_at: i64, expires_at: i64) -> Value {
-    let (account_key, device_key) = (b64(account.verifying_key().as_bytes()), b64(device.verifying_key().as_bytes()));
-    let statement = format!("gwar device v1\n{account_key}\n{device_key}\n{issued_at}\n{expires_at}");
-    json!({"account_key": account_key, "device_key": device_key, "issued_at": issued_at, "expires_at": expires_at,
-           "signature": b64(&account.sign(statement.as_bytes()).to_bytes())})
-}
-
 /// Connects as `device`, presenting `cert`.
 async fn as_device(server: &TestServer, device: &SigningKey, cert: Value) -> Result<Client, vc_proto::ErrorBody> {
     Client::connect_with(server, device.clone(), move |raw, key| {

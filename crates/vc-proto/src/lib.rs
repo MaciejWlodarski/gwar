@@ -172,7 +172,9 @@ wire! {
         pub nickname: String,
         /// Base64url (no padding) Ed25519 public key.
         pub public_key: String,
-        /// Base64url signature over `challenge_message(nonce, public_key)`.
+        /// Normalized authority of the URL the client dialed.
+        pub host: String,
+        /// Base64url signature over `challenge_message(host, nonce, public_key)`.
         pub signature: String,
         #[serde(default)]
         pub server_password: Option<String>,
@@ -710,16 +712,85 @@ impl ErrorBody {
 
 /// Bytes a client signs to prove ownership of its identity key.
 ///
-/// Binding the public key and protocol label prevents replaying the signature
-/// against another server (which issues a different nonce) or another protocol.
-pub fn challenge_message(nonce: &str, public_key: &str) -> Vec<u8> {
-    format!("vc/1 hello\n{nonce}\n{public_key}").into_bytes()
+/// The host comes from the URL the client dialed, never from the challenge.
+/// Servers with configured public names reject signatures intended for another host.
+pub fn challenge_message(host: &str, nonce: &str, public_key: &str) -> Vec<u8> {
+    format!("vc/1 hello\n{host}\n{nonce}\n{public_key}").into_bytes()
+}
+
+/// Normalized authority for login binding; mirrored in the web client's identity.ts.
+/// URLs drop scheme-default ports. Bare authorities keep their explicit port.
+pub fn normalize_host(address: &str) -> Option<String> {
+    let address = address.trim();
+    if address.is_empty() || address.chars().any(|c| c.is_whitespace() || c == '\\') {
+        return None;
+    }
+    let has_scheme = address.contains("://");
+    if !has_scheme && address.contains(['/', '?', '#']) {
+        return None;
+    }
+    let bare_ipv6 = !has_scheme && !address.starts_with('[') && address.matches(':').count() >= 2;
+    let input = if has_scheme {
+        address.to_owned()
+    } else if bare_ipv6 {
+        format!("https://[{address}]")
+    } else {
+        format!("https://{address}")
+    };
+    let url = url::Url::parse(&input).ok()?;
+    if !matches!(url.scheme(), "ws" | "wss" | "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    let hostname = url.host_str()?.strip_suffix('.').unwrap_or(url.host_str()?).to_ascii_lowercase();
+    if hostname.is_empty() {
+        return None;
+    }
+    let port = if !has_scheme && !bare_ipv6 && !address.ends_with(']') {
+        match address.rsplit_once(':') {
+            Some((_, port)) => Some(port.parse::<u16>().ok()?),
+            None => None,
+        }
+    } else {
+        url.port()
+    };
+    Some(match port {
+        Some(port) => format!("{hostname}:{port}"),
+        None => hostname,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn challenge_binds_host_nonce_and_public_key() {
+        assert_eq!(challenge_message("b.example", "NONCE", "KEY"), b"vc/1 hello\nb.example\nNONCE\nKEY");
+    }
+
+    #[test]
+    fn host_normalization_shared_vectors() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/host-normalization.json")).unwrap();
+        for vector in vectors["valid"].as_array().unwrap() {
+            let (input, expected) = (vector[0].as_str().unwrap(), vector[1].as_str().unwrap());
+            assert_eq!(normalize_host(input).as_deref(), Some(expected), "{input}");
+        }
+    }
+
+    #[test]
+    fn host_normalization_rejects_invalid_addresses() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/host-normalization.json")).unwrap();
+        for input in vectors["invalid"].as_array().unwrap() {
+            let input = input.as_str().unwrap();
+            assert_eq!(normalize_host(input), None, "{input}");
+        }
+    }
 
     #[test]
     fn request_frame_shape() {

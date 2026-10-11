@@ -10,6 +10,7 @@ import {
   type ConnectionOptions,
   type ConnectionStatus,
 } from "./connection";
+import { parseServerAddress } from "./address";
 import { encodeRequest, parseFrame } from "./frames";
 import { challengeMessage, generateIdentity } from "./identity";
 import { decodeBase64Url } from "./base64url";
@@ -65,13 +66,13 @@ describe("framing", () => {
 
 describe("signing message", () => {
   it("matches vc_proto::challenge_message", () => {
-    expect(new TextDecoder().decode(challengeMessage("NONCE", "KEY"))).toBe("vc/1 hello\nNONCE\nKEY");
+    expect(new TextDecoder().decode(challengeMessage("test", "NONCE", "KEY"))).toBe("vc/1 hello\ntest\nNONCE\nKEY");
   });
 
   it("produces a signature the public key verifies", async () => {
     const id = await generateIdentity();
     expect(decodeBase64Url(id.publicKey)).toHaveLength(32);
-    const msg = challengeMessage("n", id.publicKey);
+    const msg = challengeMessage("test", "n", id.publicKey);
     const sig = decodeBase64Url(await id.sign(msg));
     expect(sig).toHaveLength(64);
     const pub = await crypto.subtle.importKey("raw", decodeBase64Url(id.publicKey) as BufferSource, { name: "Ed25519" }, false, ["verify"]);
@@ -80,6 +81,33 @@ describe("signing message", () => {
 });
 
 describe("handshake", () => {
+  it("binds the signature to the final dialed URL, ignoring server-supplied names", async () => {
+    const parsed = parseServerAddress("a.example:8790", { protocol: "tauri:", hostname: "localhost", port: "" });
+    if (!parsed.ok) throw new Error(parsed.error);
+    const conn = make({ url: parsed.value.url });
+    const p = conn.connect();
+    const s = FakeSocket.last();
+    expect(s.url).toBe(parsed.value.url);
+    s.open();
+    const relayed = challenge();
+    s.push({ ...relayed, d: { ...relayed.d, server: { ...relayed.d.server, name: "b.example" }, host: "b.example" } });
+    await vi.waitFor(() => expect(s.sent.length).toBe(1));
+    expect(s.sent[0]).toMatchObject({
+      op: "hello",
+      d: { host: "a.example:8790", signature: "sig(vc/1 hello|a.example:8790|abc|PUBKEY)" },
+    });
+    s.push({ re: 1, ok: welcome() });
+    await p;
+  });
+
+  it("normalizes the dialed URL before signing", async () => {
+    const s = await handshake(make({ url: "wss://Voice.Example.com.:443/ws" }));
+    expect(s.sent[0]).toMatchObject({
+      op: "hello",
+      d: { host: "voice.example.com", signature: "sig(vc/1 hello|voice.example.com|abc|PUBKEY)" },
+    });
+  });
+
   it("sends a signed hello after the challenge and resolves with Welcome", async () => {
     const conn = make();
     const s = await handshake(conn);
@@ -90,7 +118,8 @@ describe("handshake", () => {
       protocol: 2,
       nickname: "Ann",
       public_key: "PUBKEY",
-      signature: "sig(vc/1 hello|abc|PUBKEY)",
+      host: "test",
+      signature: "sig(vc/1 hello|test|abc|PUBKEY)",
       client: { name: "vc-web", version: "0.1.0", platform: "web" },
     });
     expect(hello.d).not.toHaveProperty("server_password");
@@ -103,7 +132,7 @@ describe("handshake", () => {
     const s = await handshake(conn);
     const d = (s.sent[0] as { d: Record<string, unknown> }).d;
     expect(d.public_key).toBe("PUBKEY");
-    expect(d.signature).toBe("sig(vc/1 hello|abc|PUBKEY)");
+    expect(d.signature).toBe("sig(vc/1 hello|test|abc|PUBKEY)");
     expect(d.device).toEqual(device);
   });
 

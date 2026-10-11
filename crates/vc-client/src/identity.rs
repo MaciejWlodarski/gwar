@@ -58,8 +58,8 @@ impl Identity {
         URL_SAFE_NO_PAD.encode(self.0.verifying_key().as_bytes())
     }
 
-    pub fn sign_challenge(&self, nonce: &str) -> String {
-        let message = challenge_message(nonce, &self.public_key());
+    pub fn sign_challenge(&self, host: &str, nonce: &str) -> String {
+        let message = challenge_message(host, nonce, &self.public_key());
         URL_SAFE_NO_PAD.encode(self.0.sign(&message).to_bytes())
     }
 }
@@ -67,6 +67,18 @@ impl Identity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn challenge_signature_is_bound_to_the_dialed_host() {
+        use ed25519_dalek::{Signature, Verifier};
+
+        let id = Identity::generate();
+        let signature = URL_SAFE_NO_PAD.decode(id.sign_challenge("b.example", "nonce")).unwrap();
+        let signature = Signature::from_slice(&signature).unwrap();
+        let key = id.0.verifying_key();
+        assert!(key.verify(&challenge_message("b.example", "nonce", &id.public_key()), &signature).is_ok());
+        assert!(key.verify(&challenge_message("a.example", "nonce", &id.public_key()), &signature).is_err());
+    }
 
     #[test]
     fn export_round_trip_and_persistence() {

@@ -55,9 +55,10 @@ pub async fn start() -> Option<Bridged> {
 
     let media: SocketAddr = format!("127.0.0.1:{}", free_port(true)).parse().unwrap();
     let ts_voice: SocketAddr = format!("127.0.0.1:{}", free_port(true)).parse().unwrap();
+    let http: SocketAddr = format!("127.0.0.1:{}", free_port(false)).parse().unwrap();
     let server = vc_server::start(vc_server::Config {
         database: None,
-        http_bind: "127.0.0.1:0".parse().unwrap(),
+        http_bind: http,
         media_bind: media,
         media_advertise: media,
         max_clients: 8,
@@ -72,6 +73,7 @@ pub async fn start() -> Option<Bridged> {
             public_url: Some(PUBLIC_URL.into()),
         }),
         public_url: Some(PUBLIC_URL.into()),
+        public_hosts: vec![http.to_string()],
         upload_limit: 10 * 1024 * 1024,
         files_dir: None,
         web_origins: Vec::new(),

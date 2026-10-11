@@ -22,11 +22,11 @@ pub fn uid_for_key(public_key: &[u8; 32]) -> Uid {
 }
 
 /// Verifies a `hello` signature and returns the identity's uid.
-pub fn verify_hello(nonce: &str, public_key: &str, signature: &str) -> Option<Uid> {
+pub fn verify_hello(host: &str, nonce: &str, public_key: &str, signature: &str) -> Option<Uid> {
     let key: [u8; 32] = URL_SAFE_NO_PAD.decode(public_key).ok()?.try_into().ok()?;
     let signature: [u8; 64] = URL_SAFE_NO_PAD.decode(signature).ok()?.try_into().ok()?;
     let verifying = VerifyingKey::from_bytes(&key).ok()?;
-    verifying.verify(&challenge_message(nonce, public_key), &Signature::from_bytes(&signature)).ok()?;
+    verifying.verify(&challenge_message(host, nonce, public_key), &Signature::from_bytes(&signature)).ok()?;
     Some(uid_for_key(&key))
 }
 
@@ -94,8 +94,8 @@ pub mod test_support {
             URL_SAFE_NO_PAD.encode(self.0.verifying_key().as_bytes())
         }
 
-        pub fn sign(&self, nonce: &str) -> String {
-            let message = challenge_message(nonce, &self.public_key());
+        pub fn sign(&self, host: &str, nonce: &str) -> String {
+            let message = challenge_message(host, nonce, &self.public_key());
             URL_SAFE_NO_PAD.encode(self.0.sign(&message).to_bytes())
         }
     }
@@ -110,12 +110,13 @@ mod tests {
     fn accepts_valid_and_rejects_replayed_signature() {
         let id = TestIdentity::generate();
         let nonce = new_nonce();
-        let signature = id.sign(&nonce);
-        let uid = verify_hello(&nonce, &id.public_key(), &signature).expect("valid");
+        let signature = id.sign("b.example", &nonce);
+        let uid = verify_hello("b.example", &nonce, &id.public_key(), &signature).expect("valid");
         assert_eq!(uid.len(), 27);
-        assert!(verify_hello(&new_nonce(), &id.public_key(), &signature).is_none());
+        assert!(verify_hello("b.example", &new_nonce(), &id.public_key(), &signature).is_none());
+        assert!(verify_hello("a.example", &nonce, &id.public_key(), &signature).is_none());
         let other = TestIdentity::generate();
-        assert!(verify_hello(&nonce, &other.public_key(), &signature).is_none());
-        assert!(verify_hello(&nonce, "not-base64!", &signature).is_none());
+        assert!(verify_hello("b.example", &nonce, &other.public_key(), &signature).is_none());
+        assert!(verify_hello("b.example", &nonce, "not-base64!", &signature).is_none());
     }
 }

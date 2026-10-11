@@ -51,13 +51,34 @@ JSON over a WebSocket (`/ws`). The full, commented definition is
 [`crates/vc-proto/src/lib.rs`](../crates/vc-proto/src/lib.rs); the TypeScript
 types are generated with `cargo test -p vc-proto --features ts`.
 
-1. Server: `challenge {nonce}`. Client: `hello` with its Ed25519 public key and
-   a signature of `"vc/1 hello\n" + nonce + "\n" + public_key`. Reply:
+1. Server: `challenge {nonce}`. Client: `hello` with its Ed25519 public key,
+   `host`, and a signature of `"vc/1 hello\n{host}\n{nonce}\n{public_key}"`. Reply:
    `Welcome` (server state, channels, clients, members, unread counts,
    permissions, ICE servers).
 2. Requests `{"id", "op", "d"}` → `{"re", "ok" | "err"}`; events `{"ev", "d"}`.
 3. Voice: `voice.offer` (SDP with one sender and 8 receivers) → SDP answer;
    `voice.slot` says whose voice flows through which slot.
+
+The signed `host` is the normalized authority of the final WebSocket URL the
+client itself dialed, never a name supplied by the server. Normalization
+lowercases the hostname, strips a trailing dot, brackets IPv6, and drops port
+80 for WS/HTTP or 443 for WSS/HTTPS (other ports stay). Rust and TypeScript use
+the same test vectors in `crates/vc-proto/tests/host-normalization.json`.
+
+At startup the server builds its accepted set from every `--domain`, the
+normalized authority of `--public-url`, and repeatable `--public-host` entries
+(`VC_PUBLIC_HOSTS`, comma-delimited). Bare configured authorities retain their
+explicit port; use a URL for a scheme-default port. The HTTP `Host` header is
+never used for this check. A signature for an unaccepted host is rejected with
+`not_authenticated`, including when the signer presents a Connect device
+certificate. Changing the claimed `host` also invalidates the signature.
+This prevents a server at A from relaying a victim's live login to B.
+
+With none of those names configured, the server accepts any signed host and
+logs one startup warning that login relay protection is off, with the flags
+needed to enable it. This permits unconfigured development and LAN servers;
+configure their reachable names to protect them too. Old clients that omit
+`host` cannot authenticate.
 
 ## Presence (like Discord)
 

@@ -2,7 +2,9 @@
 //! rate limiting and the per-connection write queue.
 
 use std::{
+    collections::HashSet,
     net::{IpAddr, SocketAddr},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -31,6 +33,8 @@ pub struct Gateway {
     pub core: CoreHandle,
     /// Argon2 hash of the server password, if one is set (changes with settings).
     pub password: ServerPassword,
+    /// Empty means login relay protection is off. Never derived from HTTP headers.
+    pub public_hosts: Arc<HashSet<String>>,
 }
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
@@ -112,7 +116,11 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
         let _ = sink.send(error(id, ErrorCode::BadRequest, "unsupported protocol version")).await;
         return;
     }
-    let Some(mut uid) = identity::verify_hello(&nonce, &hello.public_key, &hello.signature) else {
+    if !gateway.public_hosts.is_empty() && !gateway.public_hosts.contains(&hello.host) {
+        let _ = sink.send(error(id, ErrorCode::NotAuthenticated, "this signature is for another server")).await;
+        return;
+    }
+    let Some(mut uid) = identity::verify_hello(&hello.host, &nonce, &hello.public_key, &hello.signature) else {
         let _ = sink.send(error(id, ErrorCode::NotAuthenticated, "invalid identity signature")).await;
         return;
     };

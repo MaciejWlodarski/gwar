@@ -22,7 +22,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::debug;
 use vc_proto::{
     ChannelId, ChatMessage, ChatTarget, ClientFrame, ClientSoftware, ErrorBody, Event, Hello, PROTOCOL_VERSION,
-    Request, ServerFrame, Welcome,
+    Request, ServerFrame, Welcome, normalize_host,
 };
 
 pub use identity::Identity;
@@ -75,6 +75,7 @@ pub struct Connected {
 }
 
 pub async fn connect(options: ConnectOptions) -> Result<Connected, ClientError> {
+    let host = normalize_host(&options.url).ok_or_else(|| ClientError::Protocol("invalid server URL".into()))?;
     let (mut ws, _) = timeout(HANDSHAKE_TIMEOUT, tokio_tungstenite::connect_async(&options.url))
         .await
         .map_err(|_| ClientError::Timeout)??;
@@ -94,7 +95,8 @@ pub async fn connect(options: ConnectOptions) -> Result<Connected, ClientError> 
         request: Request::Hello(Hello {
             protocol: PROTOCOL_VERSION,
             nickname: options.nickname,
-            signature: options.identity.sign_challenge(&challenge.nonce),
+            signature: options.identity.sign_challenge(&host, &challenge.nonce),
+            host,
             public_key,
             server_password: options.server_password,
             invite: None,

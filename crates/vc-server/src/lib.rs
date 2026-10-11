@@ -19,7 +19,7 @@ pub mod store;
 pub mod teamspeak;
 pub mod tls;
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{collections::HashSet, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
@@ -37,7 +37,7 @@ use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     services::{ServeDir, ServeFile},
 };
-use vc_proto::IceServer;
+use vc_proto::{IceServer, normalize_host};
 
 use crate::{
     core::{CoreConfig, CoreHandle},
@@ -60,8 +60,10 @@ pub struct Config {
     /// Official TeamSpeak server to run and bridge; `None` disables TS compatibility.
     pub teamspeak: Option<TeamSpeakConfig>,
     /// Public base URL of the web origin (e.g. `https://voice.example.com`),
-    /// used in links to uploads posted to TeamSpeak.
+    /// used in links to uploads posted to TeamSpeak and to bind login signatures.
     pub public_url: Option<String>,
+    /// Extra accepted login authorities; ACME domains and `public_url` are included too.
+    pub public_hosts: Vec<String>,
     /// Largest upload in bytes; 0 disables uploads.
     pub upload_limit: u64,
     /// Where uploads are stored; `None` uses a temporary directory (tests).
@@ -109,7 +111,22 @@ pub struct Running {
     pub tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
+fn accepted_hosts(config: &Config) -> Result<HashSet<String>> {
+    let mut names: Vec<&str> = config.public_hosts.iter().map(String::as_str).collect();
+    names.extend(config.public_url.as_deref());
+    if let Some(tls::Tls::Acme { domains, .. }) = &config.tls {
+        names.extend(domains.iter().map(String::as_str));
+    }
+    names.into_iter().map(|name| normalize_host(name).with_context(|| format!("invalid public host: {name}"))).collect()
+}
+
 pub async fn start(config: Config) -> Result<Running> {
+    let public_hosts = Arc::new(accepted_hosts(&config)?);
+    if public_hosts.is_empty() {
+        tracing::warn!(
+            "login relay protection is off; configure --domain, --public-url or --public-host (VC_PUBLIC_HOSTS) to enable it"
+        );
+    }
     let store = match &config.database {
         Some(path) => Store::open(path)?,
         None => Store::in_memory()?,
@@ -182,7 +199,7 @@ pub async fn start(config: Config) -> Result<Running> {
         }
         None => (None, None),
     };
-    let gateway = Gateway { core: core.clone(), password };
+    let gateway = Gateway { core: core.clone(), password, public_hosts };
     // The web app runs on another origin than this server: let it upload and
     // fetch files. Uploads are authorized by one-time tokens, not cookies.
     let origins: Vec<HeaderValue> = config.web_origins.iter().filter_map(|o| o.parse().ok()).collect();
@@ -219,4 +236,44 @@ pub async fn start(config: Config) -> Result<Running> {
         }
     }
     Ok(Running { http, media: advertise, core, plane, teamspeak, teamspeak_ready, admin_token, tasks })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepted_hosts_include_all_domains_public_url_and_extra_names() {
+        let config = Config {
+            database: None,
+            http_bind: "127.0.0.1:0".parse().unwrap(),
+            media_bind: "127.0.0.1:0".parse().unwrap(),
+            media_advertise: "127.0.0.1:0".parse().unwrap(),
+            max_clients: 8,
+            server_password: None,
+            web_root: None,
+            ice_servers: Vec::new(),
+            teamspeak: None,
+            public_url: Some("https://Voice.Example.com.:443/base".into()),
+            public_hosts: vec!["192.168.1.2:8790".into(), "voice.example.com".into()],
+            upload_limit: 0,
+            files_dir: None,
+            web_origins: Vec::new(),
+            tls: Some(tls::Tls::Acme {
+                domains: vec!["One.Example.com.".into(), "two.example.com".into()],
+                email: None,
+                cache: PathBuf::new(),
+                staging: true,
+            }),
+            redirect_http: None,
+            connect_url: None,
+        };
+        assert_eq!(
+            accepted_hosts(&config).unwrap(),
+            ["voice.example.com", "one.example.com", "two.example.com", "192.168.1.2:8790"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
+        );
+    }
 }

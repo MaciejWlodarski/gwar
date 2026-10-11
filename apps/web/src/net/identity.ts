@@ -104,8 +104,30 @@ export class IdentityUnsupportedError extends Error {
 const ALGORITHM = { name: "Ed25519" } as const;
 
 /** The exact bytes signed in `hello`; mirrors `vc_proto::challenge_message`. */
-export function challengeMessage(nonce: string, publicKey: string): Uint8Array {
-  return new TextEncoder().encode(`vc/1 hello\n${nonce}\n${publicKey}`);
+export function challengeMessage(host: string, nonce: string, publicKey: string): Uint8Array {
+  return new TextEncoder().encode(`vc/1 hello\n${host}\n${nonce}\n${publicKey}`);
+}
+
+/** Normalized login authority; mirrors `vc_proto::normalize_host`. Bare ports are kept. */
+export function normalizeHost(address: string): string {
+  address = address.trim();
+  if (!address || /[\s\\]/.test(address)) throw new Error("invalid server address");
+  const hasScheme = address.includes("://");
+  if (!hasScheme && /[/?#]/.test(address)) throw new Error("invalid server address");
+  const bareIpv6 = !hasScheme && !address.startsWith("[") && (address.match(/:/g)?.length ?? 0) >= 2;
+  const url = new URL(hasScheme ? address : `https://${bareIpv6 ? `[${address}]` : address}`);
+  if (!["ws:", "wss:", "http:", "https:"].includes(url.protocol) || url.username || url.password) {
+    throw new Error("invalid server address");
+  }
+  const hostname = url.hostname.toLowerCase().replace(/\.$/, "");
+  if (!hostname) throw new Error("invalid server address");
+  let port = url.port;
+  if (!hasScheme && !bareIpv6 && !address.endsWith("]") && address.includes(":")) {
+    const rawPort = address.slice(address.lastIndexOf(":") + 1);
+    if (!/^\d+$/.test(rawPort)) throw new Error("invalid server address");
+    port = String(Number(rawPort));
+  }
+  return hostname + (port ? `:${port}` : "");
 }
 
 function isValidBackup(value: unknown): value is IdentityBackup {

@@ -124,6 +124,24 @@ token"). Get another one with `vc-server --data-dir data admin-token`.
 
 The desktop app also connects to servers without HTTPS (e.g. on a LAN).
 
+Login signatures are bound to the server address the client dialed. The server
+accepts names from every `--domain`, the authority of `--public-url`, and extra
+`--public-host` entries (repeat the flag, or set comma-delimited `VC_PUBLIC_HOSTS`).
+Behind a reverse proxy, set its public URL, for example:
+
+```bash
+vc-server --http 127.0.0.1:8800 --public-url https://voice.example.com
+```
+
+For LAN access, add `--public-host 192.168.1.10:8790` (or `[::1]:8790` for IPv6).
+Names are lowercased, a trailing hostname dot is stripped, and IPv6 is bracketed.
+URLs omit port 80 for HTTP/WS and 443 for HTTPS/WSS; bare `host:port` entries
+keep their port, so use a full URL when specifying a scheme-default port.
+The HTTP `Host` header does not change the accepted names. Without `--domain`,
+`--public-url` or `--public-host`, any signed host is accepted and startup logs
+one warning: **login relay protection is off**. Configure at least one public
+name to enable it, including for local development or LAN servers.
+
 Servers accept Gwar Connect devices out of the box and fetch the list of
 revoked devices from the official Connect service every five minutes
 (`--connect-url` points elsewhere, `--no-connect` turns it off). They also confirm

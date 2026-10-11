@@ -82,9 +82,12 @@ struct Cli {
     #[arg(long, env = "VC_TEAMSPEAK_VOICE", default_value = "0.0.0.0:9987")]
     teamspeak_voice: SocketAddr,
     /// Public base URL of the web origin, e.g. https://voice.example.com
-    /// (used in links to uploads posted to TeamSpeak).
+    /// (used in links to uploads and to bind login signatures).
     #[arg(long, env = "VC_PUBLIC_URL")]
     public_url: Option<String>,
+    /// Extra public names accepted for login signatures (repeat for LAN addresses or host:port).
+    #[arg(long = "public-host", env = "VC_PUBLIC_HOSTS", value_delimiter = ',')]
+    public_hosts: Vec<String>,
     /// Largest upload in MiB (0 disables uploads).
     #[arg(long, env = "VC_UPLOAD_LIMIT_MB", default_value_t = 25)]
     upload_limit_mb: u64,
@@ -289,6 +292,7 @@ async fn main() -> Result<()> {
             public_url: public_url.clone(),
         }),
         public_url: public_url.clone(),
+        public_hosts: cli.public_hosts,
         upload_limit: cli.upload_limit_mb * 1024 * 1024,
         files_dir: Some(cli.data_dir.join("files")),
         web_origins,
@@ -324,4 +328,22 @@ async fn shutdown_signal() -> Result<()> {
     #[cfg(not(unix))]
     tokio::signal::ctrl_c().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn public_host_is_repeatable_and_comma_delimited() {
+        let cli = Cli::try_parse_from([
+            "vc-server",
+            "--public-host",
+            "b.example,192.168.1.2:8790",
+            "--public-host",
+            "[::1]:8790",
+        ])
+        .unwrap();
+        assert_eq!(cli.public_hosts, ["b.example", "192.168.1.2:8790", "[::1]:8790"]);
+    }
 }

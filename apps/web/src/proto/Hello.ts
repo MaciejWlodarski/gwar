@@ -13,7 +13,11 @@ nickname: string,
  */
 public_key: string, 
 /**
- * Base64url signature over `challenge_message(nonce, public_key)`.
+ * Normalized authority of the URL the client dialed.
+ */
+host: string, 
+/**
+ * Base64url signature over `challenge_message(host, nonce, public_key)`.
  */
 signature: string, server_password: string | null, 
 /**

@@ -143,7 +143,8 @@ login and recovery are rate-limited per address and per handle.
 
 `hello` gains an optional `device` field:
 `{account_key, device_key, issued_at, expires_at, signature}`. With it,
-`public_key` must equal `device_key` and sign the challenge as before; the
+`public_key` must equal `device_key` and sign the host-bound challenge
+(`vc/1 hello\n{host}\n{nonce}\n{public_key}`, see architecture.md); the
 server checks the certificate (signature, validity, not revoked) and the uid
 comes from `account_key`. Without it nothing changes, so local identities keep
 working.

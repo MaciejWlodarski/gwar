@@ -5,7 +5,7 @@ import type { Welcome } from "../proto/Welcome";
 import type { Challenge } from "../proto/Challenge";
 import type { Event } from "../proto/Event";
 import { encodeRequest, parseFrame, type ParsedFrame } from "./frames";
-import { challengeMessage, type Identity } from "./identity";
+import { challengeMessage, normalizeHost, type Identity } from "./identity";
 import {
   PROTOCOL_VERSION,
   type EventData,
@@ -356,7 +356,9 @@ export class Connection implements Link {
 
     return new Promise<Welcome>((resolve, reject) => {
       let socket: WebSocketLike;
+      let host: string;
       try {
+        host = normalizeHost(url);
         socket = create(url);
       } catch (e) {
         reject(new ConnectError("unreachable", e instanceof Error ? e.message : String(e)));
@@ -413,7 +415,7 @@ export class Connection implements Link {
             fail(new ConnectError("password_required", "server password required", serverName));
             return;
           }
-          void this.sendHello(socket, challenge, nickname, serverPassword, identity, client, timeoutMs)
+          void this.sendHello(socket, host, challenge, nickname, serverPassword, identity, client, timeoutMs)
             .then((welcome) => {
               if (settled) return;
               settled = true;
@@ -436,6 +438,7 @@ export class Connection implements Link {
 
   private async sendHello(
     socket: WebSocketLike,
+    host: string,
     challenge: Challenge,
     nickname: string,
     serverPassword: string | undefined,
@@ -443,11 +446,12 @@ export class Connection implements Link {
     client: ClientInfo,
     timeoutMs: number,
   ): Promise<Welcome> {
-    const signature = await identity.sign(challengeMessage(challenge.nonce, identity.publicKey));
+    const signature = await identity.sign(challengeMessage(host, challenge.nonce, identity.publicKey));
     const hello: Record<string, unknown> = {
       protocol: PROTOCOL_VERSION,
       nickname,
       public_key: identity.publicKey,
+      host,
       signature,
       client,
     };

@@ -25,6 +25,7 @@ async fn connects_chats_and_reports_errors() {
         ice_servers: vec![],
         teamspeak: None,
         public_url: None,
+        public_hosts: Vec::new(),
         upload_limit: 10 * 1024 * 1024,
         files_dir: None,
         web_origins: Vec::new(),
