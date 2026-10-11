@@ -509,7 +509,7 @@ export const en = {
   "account.strength.strong": "Strong password",
   "account.identityChoice": "Which identity should the account use?",
   "account.keep": "Keep my current identity",
-  "account.keepHint": "Your roles on servers stay with you.",
+  "account.keepHint": "Your roles on servers stay with you. Any identity backup you exported before this remains a full account credential, even after this device is revoked.",
   "account.fresh": "Start fresh",
   "account.freshHint": "A new identity without roles. The current one stays on this device and comes back when you sign out.",
   "account.create": "Create account",

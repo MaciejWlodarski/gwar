@@ -107,6 +107,8 @@ async function syncedProfile(record: ConnectRecord): Promise<ConnectRecord> {
 
 /** Signs this device in with a finished record: stores it and makes it the identity. */
 async function activate(record: ConnectRecord): Promise<void> {
+  record = { ...record, nickname: record.nickname ?? validNickname((await indexedDbIdentityStore.load())?.nickname) ?? undefined };
+  await indexedDbConnectStore.save(record);
   record = await syncedProfile(record);
   await indexedDbConnectStore.save(record);
   await controller.switchIdentity(await identityFromConnect(record));
@@ -146,7 +148,7 @@ function warnAboutExpiry(): void {
 }
 
 /**
- * Quietly looks for a certificate that another device renewed for this one.
+ * Quietly looks for this device's previously saved renewal.
  * It never blocks or fails startup: network errors and a 401 (the session
  * ended, which also happens to a revoked device) are only logged. If Connect
  * does list this device as revoked we change nothing: the person stays signed
@@ -321,7 +323,7 @@ export const accountActions = {
     return connectApi.devices((await current()).token);
   },
 
-  /** Back to the local identity, which was kept the whole time. */
+  /** Back to an unrelated local identity, or a fresh one after root migration. */
   async signOut(): Promise<void> {
     const record = await loadConnectRecord();
     if (record) await flows.signOut(record, deps());

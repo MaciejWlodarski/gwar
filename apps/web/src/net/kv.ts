@@ -51,3 +51,24 @@ export async function kvDelete(key: string): Promise<void> {
     db.close();
   }
 }
+
+/** Commit the device before deleting a matching plaintext account root, in one durable transaction. */
+export async function kvEnroll(key: string, value: unknown, accountKey: string): Promise<void> {
+  const db = await open();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE, "readwrite", { durability: "strict" });
+      const store = tx.objectStore(STORE);
+      store.put(value, key);
+      const identity = store.get("identity");
+      identity.onsuccess = () => {
+        if (identity.result?.jwk?.x === accountKey) store.delete("identity");
+      };
+      tx.oncomplete = () => resolve();
+      tx.onabort = () => reject(tx.error ?? new Error("indexedDB enrollment aborted"));
+      tx.onerror = () => reject(tx.error ?? new Error("indexedDB enrollment failed"));
+    });
+  } finally {
+    db.close();
+  }
+}

@@ -165,8 +165,7 @@ time in `users`. Before HTTP, a five-minute retry guard is persisted across devi
 and restarts; a valid 200 extends it to 24 hours, a 404 to one hour, and errors keep
 the five-minute guard. A refreshed attestation emits `member.updated`;
 404 clears it, while an outage keeps the cached value. A hello signed directly
-with the key (no device certificate, e.g. a browser that signed out but kept the
-account's key) keeps a confirmed handle and refreshes it the same way, since the
+with the key (no device certificate, e.g. an old exported root backup) keeps a confirmed handle and refreshes it the same way, since the
 handle belongs to the key. Keys never confirmed are not looked up then, so people
 who don't use Connect are never reported to it. `--no-connect` clears all stored attestations
 and next-check times on startup; certificates still authenticate locally. Both public
@@ -207,7 +206,12 @@ HTTP. Servers cache the entire attestation and omit it once expired.
 
 - **Sign up:** choose a handle and password; use the current identity as the
   account key (keeps roles) or a new one; make a device key and certificate;
-  show the recovery code once.
+  show the recovery code once. On activation, durably store the device record
+  and remove a matching plaintext local root in one IndexedDB transaction.
+  Older signed-in records are repaired on load and sign-out. An unrelated
+  local identity stays; otherwise sign-out creates a fresh local identity.
+  A previously exported identity backup remains a full account credential,
+  even after revoking the device that exported it.
 - **Log in on a device:** prelogin → derive secrets → login → decrypt the
   account key in memory → certify a fresh device key → register the device →
   forget the account key. The device keeps only its own key and certificate.

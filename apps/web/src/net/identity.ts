@@ -14,7 +14,7 @@
  */
 import type { DeviceCertificate } from "../proto/DeviceCertificate";
 import { decodeBase64Url, encodeBase64Url } from "./base64url";
-import { kvDelete, kvGet, kvSet } from "./kv";
+import { kvDelete, kvEnroll, kvGet, kvSet } from "./kv";
 import { defaultNickname, legacyNickname, validNickname } from "./nickname";
 
 export interface Identity {
@@ -60,7 +60,7 @@ export const indexedDbIdentityStore: IdentityStore = {
  * What a device keeps of a Gwar Connect account: its own key and certificate,
  * never the account key (that only exists in memory while signing in).
  * The device private key is stored as a JWK like the local identity's.
- * The local identity stays in its own record, so signing out restores it.
+ * An unrelated local identity stays. A local account root is removed on enrollment.
  */
 export interface ConnectRecord {
   version: 1;
@@ -90,8 +90,12 @@ export interface ConnectStore {
 
 export const indexedDbConnectStore: ConnectStore = {
   load: () => kvGet<ConnectRecord>(CONNECT_KEY),
-  save: (record) => kvSet(CONNECT_KEY, record),
-  clear: () => kvDelete(CONNECT_KEY),
+  save: (record) => kvEnroll(CONNECT_KEY, record, record.accountKey),
+  clear: async () => {
+    const record = await kvGet<ConnectRecord>(CONNECT_KEY);
+    if (record) await kvEnroll(CONNECT_KEY, record, record.accountKey);
+    await kvDelete(CONNECT_KEY);
+  },
 };
 
 export class IdentityUnsupportedError extends Error {
@@ -240,9 +244,10 @@ export async function loadActiveIdentity(
   const record = await loadConnectRecord(connect);
   if (record) {
     if (!validNickname(record.nickname)) {
-      record.nickname = (await loadOrCreateIdentity(store)).nickname;
-      await connect.save(record);
+      record.nickname = validNickname((await store.load())?.nickname) ?? defaultNickname();
     }
+    // Also removes plaintext roots left by older clients, after saving the device.
+    await connect.save(record);
     return identityFromConnect(record);
   }
   return loadOrCreateIdentity(store);

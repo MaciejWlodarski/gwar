@@ -9,7 +9,7 @@
  */
 import { decodeBase64Url, encodeBase64Url } from "../net/base64url";
 import type { ConnectRecord, ConnectStore } from "../net/identity";
-import { ConnectApi, ConnectApiError, type DeviceCertBody, type DeviceInfo, type RegisterBody } from "./api";
+import { ConnectApi, ConnectApiError, type DeviceCertBody, type RegisterBody } from "./api";
 import {
   certifyDevice,
   formatRecoveryCode,

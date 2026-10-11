@@ -511,7 +511,7 @@ export const pl: Record<Key, string> = {
   "account.strength.strong": "Mocne hasło",
   "account.identityChoice": "Której tożsamości ma używać konto?",
   "account.keep": "Zachowaj moją obecną tożsamość",
-  "account.keepHint": "Twoje role na serwerach zostają z Tobą.",
+  "account.keepHint": "Twoje role na serwerach zostają z Tobą. Wcześniej wyeksportowana kopia tożsamości pozostaje pełnym kluczem do konta, nawet po unieważnieniu tego urządzenia.",
   "account.fresh": "Zacznij od nowa",
   "account.freshHint": "Nowa tożsamość bez ról. Obecna zostaje na tym urządzeniu i wraca po wylogowaniu.",
   "account.create": "Załóż konto",
