@@ -60,6 +60,7 @@ describe("image headers that decoders size differently", () => {
     // Chromium decodes this at 300x200.
     expect(() => imageDimensions(gif([10, 10], [[0, 0, 300, 200]]))).toThrow("outside");
     expect(() => imageDimensions(gif([10, 10], [[0, 0, 10, 10], [5, 0, 10, 10]]))).toThrow("outside");
+    expect(() => imageDimensions(gif([10, 10], [[0, 5, 10, 10]]))).toThrow("outside");
     expect(() => imageDimensions(gif([10, 10], []))).toThrow("malformed");
     expect(() => imageDimensions(gif([10, 10], [[0, 0, 10, 10]], false))).toThrow("malformed");
   });
@@ -78,6 +79,14 @@ describe("image headers that decoders size differently", () => {
     const png = new Uint8Array(40); png.set([137, 80, 78, 71, 13, 10, 26, 10]);
     png.set(new TextEncoder().encode("CgBI"), 12); // Apple's variant, decoded by WebKit with IHDR later
     expect(() => imageDimensions(png)).toThrow("malformed");
+  });
+
+  it("reads a lossless WebP shorter than the other kinds' headers", async () => {
+    const { imageDimensions } = await import("./attachment");
+    // `cwebp -lossless -z 9` of a transparent 1x1 PNG: 28 bytes.
+    const webp = Uint8Array.from(atob("UklGRhQAAABXRUJQVlA4TAgAAAAvAAAAEIiICA=="), (c) => c.charCodeAt(0));
+    expect(imageDimensions(webp)).toEqual([1, 1]);
+    expect(() => imageDimensions(webp.subarray(0, 24))).toThrow("malformed");
   });
 });
 

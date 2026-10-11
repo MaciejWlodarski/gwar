@@ -33,12 +33,13 @@ export function imageDimensions(bytes: Uint8Array): [number, number] {
     return [v.getUint32(16), v.getUint32(20)];
   }
   if (bytes.length >= 13 && ascii(0, 3) === "GIF") return gifDimensions(bytes, v);
-  if (bytes.length >= 30 && ascii(0, 4) === "RIFF" && ascii(8, 4) === "WEBP") {
+  // Each WebP kind ends its dimensions at its own offset: a tiny lossless image is under 30 bytes.
+  if (bytes.length >= 16 && ascii(0, 4) === "RIFF" && ascii(8, 4) === "WEBP") {
     const kind = ascii(12, 4);
     const u24 = (at: number) => bytes[at]! + bytes[at + 1]! * 256 + bytes[at + 2]! * 65536;
-    if (kind === "VP8X") return [1 + u24(24), 1 + u24(27)];
-    if (kind === "VP8 " && bytes[23] === 157 && bytes[24] === 1 && bytes[25] === 42) return [v.getUint16(26, true) & 16383, v.getUint16(28, true) & 16383];
-    if (kind === "VP8L" && bytes[20] === 47) {
+    if (kind === "VP8X" && bytes.length >= 30) return [1 + u24(24), 1 + u24(27)];
+    if (kind === "VP8 " && bytes.length >= 30 && bytes[23] === 157 && bytes[24] === 1 && bytes[25] === 42) return [v.getUint16(26, true) & 16383, v.getUint16(28, true) & 16383];
+    if (kind === "VP8L" && bytes.length >= 25 && bytes[20] === 47) {
       const bits = v.getUint32(21, true); return [(bits & 16383) + 1, ((bits >>> 14) & 16383) + 1];
     }
   }

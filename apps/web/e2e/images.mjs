@@ -36,13 +36,31 @@ function gif(screen, frames) {
 
 const sofAt = (jpeg) => { for (let i = 2; i < jpeg.length - 1; i++) if (jpeg[i] === 0xff && jpeg[i + 1] === 0xc0) return i; throw new Error("no SOF0"); };
 const sofSegment = (jpeg) => { const i = sofAt(jpeg); return jpeg.subarray(i, i + 2 + jpeg.readUInt16BE(i + 2)); };
-/** Wraps a plain WebP's VP8 chunk in a VP8X container claiming another canvas size. */
-function vp8x(webp, width, height) {
+const riff = (chunks) => {
+  const body = Buffer.concat([Buffer.from("WEBP"), ...chunks]);
+  const header = Buffer.alloc(8); header.write("RIFF", 0); header.writeUInt32LE(body.length, 4);
+  return Buffer.concat([header, body]);
+};
+/** The lossy `VP8 ` chunk of a WebP (canvas encoders may wrap it in VP8X). */
+function vp8Chunk(webp) {
+  for (let at = 12; at + 8 <= webp.length;) {
+    const size = webp.readUInt32LE(at + 4), end = at + 8 + size + (size & 1);
+    if (webp.toString("latin1", at, at + 4) === "VP8 ") return webp.subarray(at, end);
+    at = end;
+  }
+  throw new Error("no VP8 chunk");
+}
+/** A VP8 chunk in a VP8X container claiming a `width`x`height` canvas. */
+function vp8x(chunk, width, height) {
   const x = Buffer.alloc(18); x.write("VP8X", 0); x.writeUInt32LE(10, 4);
   x.writeUIntLE(width - 1, 12, 3); x.writeUIntLE(height - 1, 15, 3);
-  const body = Buffer.concat([Buffer.from("WEBP"), x, webp.subarray(12)]);
-  const riff = Buffer.alloc(8); riff.write("RIFF", 0); riff.writeUInt32LE(body.length, 4);
-  return Buffer.concat([riff, body]);
+  return riff([x, chunk]);
+}
+/** A JPEG with an Exif orientation (6 and 8 turn it a quarter, swapping its sides). */
+function oriented(jpeg, orientation) {
+  const tiff = Buffer.from([0x4d, 0x4d, 0, 42, 0, 0, 0, 8, 0, 1, 0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, orientation, 0, 0, 0, 0, 0, 0]);
+  const app1 = Buffer.concat([Buffer.from([0xff, 0xe1, 0, 2 + 6 + tiff.length]), Buffer.from("Exif\0\0", "latin1"), tiff]);
+  return Buffer.concat([jpeg.subarray(0, 2), app1, jpeg.subarray(2)]);
 }
 
 const server = await createServer({ root, configFile: path.join(root, "vite.config.ts"), logLevel: "error", server: { port: 0, host: "127.0.0.1" } });
@@ -64,7 +82,9 @@ try {
   const jpeg = await encode(300, 200, "image/jpeg"), smallJpeg = await encode(16, 16, "image/jpeg");
   const webp = await encode(300, 200, "image/webp");
   const eoi = smallJpeg.length - 2, smallSof = sofSegment(smallJpeg), smallSofEnd = sofAt(smallJpeg) + smallSof.length;
-  const offsetGif = gif([10, 10], [[0, 0, 300, 200]]); offsetGif.writeUInt16LE(50, 21); offsetGif.writeUInt16LE(50, 23);
+  const vp8 = vp8Chunk(webp);
+  // `cwebp -lossless -z 9` of a transparent 1x1 PNG: 28 bytes.
+  const tinyLossless = Buffer.from("UklGRhQAAABXRUJQVlA4TAgAAAAvAAAAEIiICA==", "base64");
 
   // [name, bytes, mime, expected]: "ok" decodes through boundedImageBlob, "refused" never reaches a decoder,
   // "bounded" may decode or not but never beyond its header.
@@ -72,15 +92,21 @@ try {
     ["canvas PNG", png, "image/png", "ok"],
     ["canvas JPEG", jpeg, "image/jpeg", "ok"],
     ["canvas WebP", webp, "image/webp", "ok"],
+    ["plain VP8 WebP", riff([vp8]), "image/webp", "ok"],
+    ["VP8X WebP with its own canvas", vp8x(vp8, 300, 200), "image/webp", "ok"],
+    ["28-byte lossless WebP", tinyLossless, "image/webp", "ok"],
+    ["JPEG turned by Exif (6)", oriented(jpeg, 6), "image/jpeg", "ok"],
+    ["JPEG turned by Exif (8)", oriented(jpeg, 8), "image/jpeg", "ok"],
     ["animated GIF, frames inside", gif([30, 20], [[0, 0, 30, 20], [5, 5, 10, 10]]), "image/gif", "ok"],
     ["GIF frame larger than its screen", gif([10, 10], [[0, 0, 300, 200]]), "image/gif", "refused"],
-    ["GIF frame offset past its screen", offsetGif, "image/gif", "refused"],
+    ["GIF frame offset right past its screen", gif([10, 10], [[5, 0, 10, 10]]), "image/gif", "refused"],
+    ["GIF frame offset down past its screen", gif([10, 10], [[0, 5, 10, 10]]), "image/gif", "refused"],
     ["GIF second frame past its screen", gif([30, 20], [[0, 0, 30, 20], [20, 0, 30, 20]]), "image/gif", "refused"],
     ["JPEG small SOF before the real one", Buffer.concat([jpeg.subarray(0, 2), Buffer.from([0xff, 0xc0, 0, 17, 8, 0, 16, 0, 16, 3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]), jpeg.subarray(2)]), "image/jpeg", "refused"],
     ["JPEG large SOF after the real one", Buffer.concat([smallJpeg.subarray(0, smallSofEnd), sofSegment(jpeg), smallJpeg.subarray(smallSofEnd)]), "image/jpeg", "refused"],
     ["JPEG large SOF after the scan", Buffer.concat([smallJpeg.subarray(0, eoi), sofSegment(jpeg), smallJpeg.subarray(eoi)]), "image/jpeg", "bounded"],
     ["JPEG with a large JPEG appended", Buffer.concat([smallJpeg, jpeg]), "image/jpeg", "bounded"],
-    ["WebP VP8X canvas smaller than its VP8", vp8x(webp, 10, 10), "image/webp", "bounded"],
+    ["WebP VP8X canvas smaller than its VP8", vp8x(vp8, 10, 10), "image/webp", "bounded"],
   ];
 
   for (const [engineName, engine] of [["chromium", chromium], ["webkit", webkit]]) {
@@ -105,13 +131,16 @@ try {
         return { header, decoded, bounded };
       }, [bytes.toString("base64"), mime]);
       const label = `${engineName}: ${name}`;
+      // What a decoder allocates is its pixel count; Exif orientation may swap the sides.
+      const within = ([dw, dh], [w, h]) => dw * dh <= w * h && Math.max(dw, dh) <= Math.max(w, h);
       if (expected === "refused") assert.ok(result.refused, `${label} reached a decoder: ${JSON.stringify(result)}`);
       else {
         assert.ok(!result.refused, `${label} was refused: ${result.refused}`);
-        const [w, h] = result.header;
-        if (result.decoded) assert.ok(result.decoded[0] <= w && result.decoded[1] <= h, `${label} decodes ${result.decoded} from a ${w}x${h} header`);
-        if (expected === "ok") assert.deepEqual(result.bounded, result.header, `${label}: ${JSON.stringify(result)}`);
-        else if (Array.isArray(result.bounded)) assert.ok(result.bounded[0] <= w && result.bounded[1] <= h, label);
+        if (result.decoded) assert.ok(within(result.decoded, result.header), `${label} decodes ${result.decoded} from a ${result.header} header`);
+        if (expected === "ok") {
+          assert.ok(result.decoded, `${label} did not decode: ${JSON.stringify(result)}`);
+          assert.deepEqual(result.bounded, result.decoded, `${label}: ${JSON.stringify(result)}`);
+        } else if (Array.isArray(result.bounded)) assert.ok(within(result.bounded, result.header), label);
       }
       passed++;
       console.log(`PASS ${label} (${expected})`);
