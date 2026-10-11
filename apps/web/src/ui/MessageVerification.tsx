@@ -8,7 +8,7 @@ export function verificationExplanation(v: MessageVerification, t: TFn): string 
   if (v.status === "unsigned-ts") return t("chat.teamSpeakUnsigned");
   if (v.status === "unsigned") return t("chat.notVerified");
   if (v.status === "invalid") return t(v.continuity === "rollback" ? "chat.rollback" : v.continuity === "fork" ? "chat.fork" : "chat.signatureInvalid");
-  const notes = v.authorization.map((a) => t(a === "device-revoked" ? "chat.deviceRevoked" : a === "certificate-expired" ? "chat.certificateExpired" : a === "channel-reused" ? "chat.channelReused" : "chat.revocationsStale"));
+  const notes = v.authorization.map((a) => t(a === "device-revoked" ? "chat.deviceRevoked" : a === "certificate-expired" ? "chat.certificateExpired" : a === "channel-reused" ? "chat.channelReused" : a === "channel-history-incomplete" ? "chat.channelHistoryIncomplete" : "chat.revocationsStale"));
   if (v.continuity !== "proven") notes.push(t(v.continuity === "storage-unavailable" ? "chat.checkpointsUnavailable" : "chat.continuityUnproven"));
   return [t("chat.signatureValid"), ...notes].join("; ");
 }

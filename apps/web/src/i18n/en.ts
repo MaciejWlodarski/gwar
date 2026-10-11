@@ -348,6 +348,7 @@ export const en = {
   "chat.deviceRevoked": "signing device revoked; signing time unproven",
   "chat.certificateExpired": "certificate expired; signing time unproven",
   "chat.channelReused": "the server reused the id of a channel deleted earlier, so this message may come from the deleted channel",
+  "chat.channelHistoryIncomplete": "this client could not keep a complete record of this server's deleted channels, so it cannot rule out a reused channel id",
   "chat.revocationsStale": "revocation information stale or unavailable",
   "chat.continuityUnproven": "continuity unproven; this device has no record of earlier versions, so it cannot detect a rollback. Older evicted history also has no rollback protection",
   "chat.checkpointsUnavailable": "checkpoints unavailable; rollback protection unavailable",

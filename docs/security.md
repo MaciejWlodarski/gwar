@@ -171,6 +171,9 @@ gwar message v2
   the channel ids it saw and saw deleted (by event or by their absence from a
   later channel list); messages in a channel whose id it saw deleted show "the
   server reused the id of a deleted channel" and never count as fully verified.
+  The record fails closed: if it cannot be read or stored, or a server floods it
+  past 10,000 ids, that server's record is marked incomplete for good and every
+  channel message there is qualified ("cannot rule out a reused channel id").
   A client that never saw the deletion cannot tell, so a signature binds a
   message to the channel id, not to the channel's name or lifetime. A direct
   message must involve exactly the two participants of the open conversation.
@@ -190,9 +193,12 @@ gwar message v2
   capacity fails closed rather than evicting revocations.
 - A client signs an edit or a deletion only over a revision of its own that
   verifies here; anything else goes to the server as an unsigned removal
-  request. The edit is bound to the connection it started on: if the client
-  switches server, reconnects or resyncs before signing or sending, it is
-  dropped, so nothing written for one server is signed for or sent to another.
+  request. Every new message, edit, deletion and upload is bound to the
+  connection it started on: if the client switches server, reconnects or
+  resyncs before signing or sending, it is dropped, so nothing written for one
+  server is signed for or sent to another. A failed message is kept for retry
+  only while its session lasts, and is retried only on the server it was
+  written for.
 - Authenticity belongs to each received row, never to the server's numeric id.
   A row that verified is never displaced by one that did not under the same id
   or signed identity, and one signed identity is shown once.
