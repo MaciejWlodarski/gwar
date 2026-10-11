@@ -908,7 +908,7 @@ impl<'a> Bridge<'a> {
             return;
         }
         // Otherwise ServerQuery (invisible to TeamSpeak users) posts it, signed.
-        let signed = format!("[{}] {body}", m.author_name);
+        let signed = format!("[{}] {body}", plain(&m.author_name));
         for text in split_for_teamspeak(&signed) {
             let result = match m.target {
                 ChatTarget::Server => {
@@ -1119,18 +1119,28 @@ fn puppet_chat_target(session: SessionId, target: MessageTarget) -> Option<ChatT
     }
 }
 
+/// Text from our side as plain text on TeamSpeak, which renders BBCode in chat and
+/// channel descriptions: Gwar shows `[img]…` literally, so TeamSpeak must too (no
+/// images fetched from TeamSpeak users' machines, no disguised links, no styled
+/// names). A zero-width space after each `[` keeps any tag from being recognised.
+fn plain(text: &str) -> String {
+    text.replace('[', "[\u{200B}")
+}
+
 /// How a message of ours reads on TeamSpeak: the text, then a link per
 /// attachment (TeamSpeak chats show plain text only; both TS3 and TS6 make
 /// URLs clickable). Mentions are already readable as `@nickname`.
 fn ts_text(m: &ChatMessage, public_url: Option<&str>) -> String {
-    let mut text = m.text.clone();
+    let mut text = plain(&m.text);
     for file in &m.attachments {
         if !text.is_empty() {
             text.push('\n');
         }
         match public_url {
-            Some(base) => text.push_str(&format!("📎 {} — {}{}", file.name, base.trim_end_matches('/'), file.url)),
-            None => text.push_str(&format!("📎 {}", file.name)),
+            Some(base) => {
+                text.push_str(&format!("📎 {} — {}{}", plain(&file.name), base.trim_end_matches('/'), file.url))
+            }
+            None => text.push_str(&format!("📎 {}", plain(&file.name))),
         }
     }
     text
@@ -1160,6 +1170,7 @@ fn describe(names: &[String]) -> String {
     if names.is_empty() {
         return String::new();
     }
+    let names: Vec<_> = names.iter().map(|n| plain(n)).collect();
     format!("[b]In the app ({}):[/b] {}", names.len(), names.join(", "))
 }
 
@@ -1332,6 +1343,14 @@ mod tests {
             ts_text(&m, Some("https://gwar.example/")),
             "look\n📎 cat.png — https://gwar.example/files/f1/cat.png"
         );
+        m.text = "[img]https://tracker.example/p.png[/img] [url=https://evil.example]bank[/url]".into();
+        m.attachments[0].name = "[b]invoice[/b].pdf".into();
+        let relayed = ts_text(&m, None);
+        assert_eq!(relayed.matches('[').count(), relayed.matches("[\u{200B}").count(), "{relayed:?}");
+        assert_eq!(
+            relayed.replace('\u{200B}', ""),
+            "[img]https://tracker.example/p.png[/img] [url=https://evil.example]bank[/url]\n📎 [b]invoice[/b].pdf"
+        );
         m.text = "x".repeat(2500);
         let parts = split_for_teamspeak(&m.text);
         assert_eq!(parts.len(), 3);
@@ -1342,6 +1361,8 @@ mod tests {
     fn description_lists_users_without_puppets() {
         assert_eq!(describe(&[]), "");
         assert_eq!(describe(&["Ania".into(), "Bartek".into()]), "[b]In the app (2):[/b] Ania, Bartek");
+        // Nicknames are names, not markup.
+        assert_eq!(describe(&["[img]x[/img]".into()]), "[b]In the app (1):[/b] [\u{200B}img]x[\u{200B}/img]");
     }
 
     #[test]
