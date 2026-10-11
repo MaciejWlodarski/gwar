@@ -183,3 +183,24 @@ therefore have different TS suffixes while retaining the same Gwar nickname.
 - `apps/desktop`: Tauri 2 with the same UI; voice through the native
   `vc-client` (cpal, Opus with FEC, jitter buffer with PLC), global
   push-to-talk, tray.
+
+## Files
+
+`GET /files/{random-id}/{name}` is a bearer capability: anyone who knows the
+URL can fetch it without a session. Channel membership governs message access,
+not later downloads. Removing someone from a channel or server does not revoke
+URLs they already know. Deleting the message/file removes it from the server;
+copies already downloaded remain. Upload tokens are one-use and expire after
+ten minutes; download capabilities do not expire.
+
+File responses use `Cache-Control: no-store` for media and other files. Without
+expiring download capabilities, even a short private cache can outlive removal;
+no-store also prevents shared caches from retaining attachments. Downloads keep
+`nosniff`, `default-src 'none'; sandbox` and safe Content-Disposition. Clients
+accept only the selected server's file routes, reject redirects, and cap reads
+at the declared size, server upload limit and 30 MiB, with a 30-second timeout.
+Native file requests also have a four-request concurrency cap and cancel on
+disconnect; public DNS names resolving to private addresses are rejected. LAN
+origins must use a private literal, localhost, a `.local` name or a local host
+name. Their addresses are pinned for that connection, so later DNS changes
+cannot redirect requests into the LAN.
