@@ -204,3 +204,37 @@ describe("shared vc/3 wire vectors", () => {
     expect(await crypto.subtle.verify("Ed25519", key, decodeFixed(h.signature, 64) as BufferSource, new TextEncoder().encode(v.statement))).toBe(true);
   });
 });
+
+describe("vc/3 immutable endpoint and runtime validation", () => {
+  it("stores the canonical endpoint once for dialing, transcript and pinning", async () => {
+    const options: Partial<ConnectionOptions> = { url: "wss://SERVER.example.:443/ws" };
+    const conn = make(options);
+    expect(conn.endpoint).toBe("wss://server.example/ws");
+    // Mutating the caller's options cannot change the authenticated endpoint.
+    const mutable = { url: "wss://SERVER.example.:443/ws", identity: fakeIdentity, nickname: "test",
+      client: { name: "test", version: "0", platform: "web" as const }, createSocket: (url: string) => new FakeSocket(url), pinStore: memoryPins() };
+    const cached = new Connection(mutable);
+    mutable.url = "invalid";
+    const { socket, result } = await begin(cached);
+    expect(socket.url).toBe(cached.endpoint);
+    expect(socket.sent[0]!.d).toMatchObject({ endpoint: cached.endpoint });
+    await finishHandshake(socket); await result;
+    expect(cached.serverKey).toBe(testServerIdentity.publicKey);
+    cached.close();
+  });
+  it("rejects a challenge failing its schema before signing or sending secrets", async () => {
+    const sign = vi.fn(fakeIdentity.sign);
+    const conn = make({ identity: { ...fakeIdentity, sign }, serverPassword: "secret" });
+    const result = conn.connect(); const socket = FakeSocket.last(); socket.open();
+    const valid = challenge(); socket.push({ ...valid, d: { ...valid.d, extra: "hostile" } });
+    await expect(result).rejects.toMatchObject({ kind: "protocol" });
+    expect(sign).not.toHaveBeenCalled(); expect(socket.sent).toHaveLength(0);
+  });
+  it("rejects a proof failing its schema without pinning or joining", async () => {
+    const pins = memoryPins(); const conn = make({ pinStore: pins, serverPassword: "secret" });
+    const { socket, result } = await begin(conn);
+    socket.push({ re: 1, ok: { server_proof: "A".repeat(86), extra: "hostile" } });
+    await expect(result).rejects.toMatchObject({ kind: "protocol" });
+    expect(pins.pins.size).toBe(0); expect(socket.sent).toHaveLength(1);
+  });
+});

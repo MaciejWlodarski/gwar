@@ -27,7 +27,12 @@ For user units to keep running without a login session, enable lingering once:
 
 ## nginx
 
-nginx terminates HTTPS (certbot) for both names.
+nginx terminates HTTPS (certbot) for both names. The server runs without
+`--tls`; set `--public-url https://voice.maciejwlodarski.com` to authorize
+`wss://voice.maciejwlodarski.com/ws`. `--public-ip` advertises UDP media and
+adds no login endpoint behind nginx. Additional externally reachable aliases
+need a repeatable `--public-endpoint` with their exact scheme, port and path.
+Never use `--insecure-any-host` for these services.
 
 The production web build includes a CSP meta policy: local scripts, WASM for
 hash-wasm's Argon2, HTTPS/WSS connections, and bounded attachment blobs. Vite dev
@@ -122,3 +127,12 @@ systemctl --user start gwar-connect
 ```
 
 The same works for `vc-server` with `~/vc/data/vc.sqlite3`.
+
+Back up `~/vc/data/server-key.ed25519` together with the server database and
+restore both. This private 32-byte seed identifies the server; keep its Unix
+permissions at 0600. Losing it changes the identity and blocks pinned clients.
+`vc-server --data-dir ~/vc/data server-key` prints the public fingerprint for
+users to check. Clients pin each endpoint only after verifying the proof; invite
+links carry `server_key`. A changed pin requires checking with the owner before
+explicitly trusting the replacement. The deployment backup timer copies the
+server key beside the Connect service key.

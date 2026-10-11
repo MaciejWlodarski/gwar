@@ -1,13 +1,14 @@
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { useEffect } from "react";
-import { accountActions } from "./state/account";
 import { useT } from "./i18n";
+import { accountActions } from "./state/account";
 import { useIsMobile } from "./lib/media";
 import { initDesktop } from "./platform/desktop";
 import { controller } from "./state/controller";
 import { totalDmUnread } from "./state/reducer";
 import { useSession, useUi } from "./state/stores";
 import { ChatArea } from "./ui/Chat";
+import { ConnectionWarning } from "./ui/ConnectionWarning";
 import { ConnectScreen } from "./ui/ConnectScreen";
 import { Dialogs } from "./ui/Dialogs";
 import { useShortcuts, useTheme } from "./ui/hooks";
@@ -56,7 +57,7 @@ export function App() {
   return (
     <TooltipProvider>
       <div className="flex h-dvh w-full flex-col overflow-hidden bg-rail">
-        {showApp && insecureConnection && <div role="alert" className="shrink-0 bg-red-700 px-4 py-2 text-sm text-white">{t("security.insecureWarning")}</div>}
+        <ConnectionWarning phase={phase} insecure={insecureConnection} />
         <div className="flex min-h-0 w-full flex-1 overflow-hidden">
           {!isMobile && <ServerRail />}
           {showApp ? (

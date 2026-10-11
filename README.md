@@ -147,8 +147,10 @@ port and WebSocket path. Configure the exclusive accepted set using:
 - `--public-url`: maps HTTP(S) to WS(S), retains host/port and uses `/ws`;
 - `--public-endpoint`: repeatable full endpoint URLs, including alias paths
   (or comma-delimited `VC_PUBLIC_ENDPOINTS`); replaces `--public-host`;
-- explicit `--public-ip`: only a global unicast IP adds `wss://<ip>/ws`.
-  When the server terminates TLS on a non-default port, that port is included.
+- explicit `--public-ip`: a global unicast IP adds `wss://<ip>[:port]/ws` only
+  when vc-server terminates TLS itself. It uses the actual listening port,
+  omitted only for 443. Behind a reverse proxy it adds no login endpoint;
+  configure `--public-url` or `--public-endpoint`.
   Browser IP access needs a certificate valid for that IP.
 
 Behind a reverse proxy, set its public URL, for example:

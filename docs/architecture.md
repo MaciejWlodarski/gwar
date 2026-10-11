@@ -28,8 +28,8 @@ to any server over `wss://`. Hence servers need HTTPS: `--domain` gets and
 renews a Let's Encrypt certificate inside the server (`src/tls.rs`), and
 uploads accept cross-origin requests from the web app's origin only (CORS on
 the file routes; uploads are authorized by one-time tokens, not cookies). The
-desktop app connects anywhere, with TLS by default. Plaintext LAN requires an explicit per-server desktop
-opt-in and a persistent red impersonation/session-takeover warning; loopback
+desktop app connects anywhere, with TLS by default. Plaintext LAN requires an
+explicit per-server desktop opt-in and a persistent red impersonation/session-takeover warning; loopback
 is the development exception.
 
 ## Principles
@@ -87,8 +87,10 @@ cannot be relayed to another accepted alias endpoint.
 Only configuration supplies accepted endpoints: every `--domain` gives
 `wss://<domain>/ws`; `--public-url` maps its scheme to WS(S), retains host/port
 and uses `/ws`; repeatable `--public-endpoint` supplies full endpoint URLs.
-An explicitly configured global unicast `--public-ip` adds `wss://<ip>/ws`,
-with the non-default listener port only when the server terminates TLS itself.
+An explicitly configured global unicast `--public-ip` adds
+`wss://<ip>[:port]/ws` only when vc-server terminates TLS itself, using the
+actual listener port (omitted only for 443). Behind a reverse proxy, configure
+`--public-url` or `--public-endpoint`; the external scheme and port are unknown.
 Private, loopback and link-local addresses never auto-authorize login. Request
 headers cannot expand the set. An empty set refuses startup, unless the
 explicit **isolated development/test-only** `--insecure-any-host` disables
@@ -324,19 +326,20 @@ cannot redirect requests into the LAN.
 ## Input bounds
 
 The gateway admits at most 16 live connections per IP and 1024 globally. Its
-per-IP connection-attempt and hello buckets each hold 20 tokens and refill at
+per-IP connection-attempt and authentication-frame buckets each hold 20 tokens and refill at
 one per second, before identity/password work. The IP table holds 8192 entries;
 inactive entries expire after five minutes. At most four server-password Argon2
 checks run concurrently, with no waiting queue. WebSocket frames and assembled
-messages are capped at 96 KiB before parsing; hello and idle deadlines include
-ping traffic.
+messages are capped at 96 KiB before parsing; hello, join and idle deadlines
+include ping traffic.
 
 Clients validate every incoming event and per-operation response against small
 handwritten schemas checked by TypeScript against generated protocol types.
 Frames are capped at 2 MiB before parsing; schemas reject unknown/pollution keys,
 unsafe integers and unbounded strings/arrays. Updating generated types requires
-updating these validators. The handshake and signing branches must extend the
-schemas for their new wire fields; unknown fields are deliberately rejected.
+updating these validators. The vc/3 challenge validates canonical 32-byte keys
+and nonces; hello replies accept exactly `{server_proof}` with a canonical 64-byte signature, and join
+replies validate Welcome. Unknown fields are deliberately rejected.
 Declared image dimensions are clamped to 1–16384 pixels before layout, then to
 the 400×300 display box. Connect uses a shared HTTPS/dev-loopback transport,
 no URL credentials, no redirects or cookies, a ten-second deadline covering

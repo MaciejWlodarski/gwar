@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { parseFrame } from "./frames";
 import { responseFor } from "./schema";
+import { challenge, welcome } from "./testing";
 
 beforeEach(() => { vi.spyOn(console, "warn").mockImplementation(() => {}); });
 const message = { id: 1, target: { channel: 1 }, author: 1, author_uid: "uid", author_name: "Name", text: "hello", sent_at: 1 };
@@ -58,6 +59,35 @@ describe("bounded server frames", () => {
         expect(() => parseFrame(raw)).not.toThrow();
         expect(parseFrame(raw)).toBeNull();
       }
+    }
+  });
+});
+
+describe("vc/3 runtime schemas", () => {
+  it("validates challenge keys and nonces with exact fields and canonical encodings", () => {
+    const valid = challenge();
+    expect(parseFrame(JSON.stringify(valid))?.kind).toBe("event");
+    for (const field of ["server_pk", "server_nonce"] as const) {
+      for (const value of [null, 32, "", "A".repeat(42), "A".repeat(44), "B".repeat(43), `${valid.d[field]}=`, `${valid.d[field]}\n`]) {
+        expect(parseFrame(JSON.stringify({ ...valid, d: { ...valid.d, [field]: value } }))).toBeNull();
+      }
+      const missing = { ...valid.d } as Partial<typeof valid.d>;
+      delete missing[field];
+      expect(parseFrame(JSON.stringify({ ...valid, d: missing }))).toBeNull();
+    }
+    expect(parseFrame(JSON.stringify({ ...valid, d: { ...valid.d, nonce: "legacy" } }))).toBeNull();
+    expect(parseFrame(JSON.stringify({ ...valid, d: { ...valid.d, extra: true } }))).toBeNull();
+  });
+  it("accepts exactly server_proof for hello and Welcome only for join", () => {
+    const proof = { server_proof: "A".repeat(86) };
+    expect(responseFor("hello", proof)).toBe(true);
+    expect(parseFrame(JSON.stringify({ re: 1, ok: proof }))?.kind).toBe("ok");
+    expect(responseFor("hello", welcome())).toBe(false);
+    expect(responseFor("join", welcome())).toBe(true);
+    expect(responseFor("join", proof)).toBe(false);
+    for (const value of [null, [], { ...proof, extra: true }, { server_proof: 1 }, { server_proof: "B".repeat(86) }, { server_proof: `${proof.server_proof}=` }]) {
+      expect(responseFor("hello", value)).toBe(false);
+      expect(parseFrame(JSON.stringify({ re: 1, ok: value }))).toBeNull();
     }
   });
 });

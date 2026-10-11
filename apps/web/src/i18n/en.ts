@@ -145,7 +145,7 @@ export const en = {
   "security.newKey": "Presented key",
   "security.trustDanger": "Dangerous: forget old pin and trust new key",
   "security.insecureLan": "Insecure connection (LAN)",
-  "security.insecureWarning": "This connection can be impersonated or taken over: anyone on the network can impersonate the server or take over your session",
+  "security.insecureWarning": "This connection can be impersonated or taken over. Traffic is not encrypted.",
 
   "server.menu": "Server menu",
   "server.reconnecting": "Reconnecting…",

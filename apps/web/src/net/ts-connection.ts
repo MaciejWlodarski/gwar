@@ -211,7 +211,7 @@ export class TsConnection implements Link {
         password: this.options.serverPassword ?? null,
         identity: this.options.identity ?? null,
       });
-      if (!responseFor("hello", welcome)) {
+      if (!responseFor("join", welcome)) {
         console.warn("Dropped malformed native welcome");
         void api.invoke("ts_disconnect", { session });
         throw new Error("Malformed server welcome");

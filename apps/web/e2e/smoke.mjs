@@ -386,6 +386,12 @@ async function main() {
     const stored = await a.evaluate((endpoint) => localStorage.getItem(`vc.server-pin:${endpoint}`), CLIENT_ADDR);
     if (!stored || JSON.parse(stored).server_pk !== fingerprint || !/^[A-Za-z0-9_-]{43}$/.test(fingerprint)) throw new Error("missing verified fingerprint or pin");
   });
+  await check("plaintext risk stays red and visible in the connected UI", async () => {
+    const warning = a.getByTestId("connection-warning");
+    await warning.waitFor();
+    if (!/connection can be impersonated or taken over/.test(await warning.innerText())) throw new Error("missing persistent warning");
+    if (await warning.evaluate((el) => getComputedStyle(el).backgroundColor === "rgba(0, 0, 0, 0)")) throw new Error("warning has no red background");
+  });
   await check("browser rejects weak Ed25519 keys and proof points independently of WebCrypto", async () => {
     const serverKey = await a.getByTestId("server-fingerprint").innerText();
     const rejects = await a.evaluate(async ({ endpoint, serverKey }) => {

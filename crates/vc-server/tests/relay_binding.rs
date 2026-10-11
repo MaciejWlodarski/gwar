@@ -1,6 +1,7 @@
 //! vc/3 relay binding, transcript proof and admission ordering.
 
 mod common;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use common::*;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use serde_json::{Value, json};
@@ -236,8 +237,10 @@ fn configured_global_public_ip_includes_self_terminated_tls_port_private_ips_do_
         config.public_ip = Some(ip.parse().unwrap());
         assert_eq!(vc_server::accepted_endpoints(&config).unwrap(), [endpoint.into()].into());
     }
-    config.tls = None;
+    config.http_bind = "127.0.0.1:443".parse().unwrap();
     assert_eq!(vc_server::accepted_endpoints(&config).unwrap(), ["wss://[2606:4700::1111]/ws".into()].into());
+    config.tls = None;
+    assert!(vc_server::accepted_endpoints(&config).unwrap().is_empty());
 }
 
 #[test]
@@ -283,4 +286,79 @@ async fn invalid_public_endpoint_fails_startup() {
     let mut config = base_config();
     config.public_endpoints = vec!["".into()];
     assert!(vc_server::start(config).await.err().unwrap().to_string().contains("invalid public endpoint"));
+}
+
+#[test]
+fn nginx_public_url_does_not_infer_a_public_ip_login_endpoint() {
+    let mut config = base_config();
+    config.http_bind = "127.0.0.1:8800".parse().unwrap();
+    config.public_ip = Some("8.8.8.8".parse().unwrap());
+    config.public_url = Some("https://voice.maciejwlodarski.com".into());
+    assert_eq!(vc_server::accepted_endpoints(&config).unwrap(), ["wss://voice.maciejwlodarski.com/ws".into()].into());
+}
+
+#[tokio::test]
+async fn oversized_join_is_closed_before_parsing_or_password_work() {
+    let server = server_b().await;
+    let mut raw = open(&server).await;
+    let h = hello_for(&raw, &new_key(), B);
+    raw.send_hello(h).await;
+    assert!(raw.recv().await.unwrap()["ok"]["server_proof"].is_string());
+    raw.send(json!({"id":2,"op":"join","d":{"server_password":"x".repeat(96 * 1024)}})).await;
+    raw.expect_closed().await;
+    assert!(server.running.core.info().await.is_some());
+}
+
+#[tokio::test]
+async fn revocation_is_account_scoped_before_proof_and_rechecked_at_join() {
+    let server = server_b().await;
+    let account_a = new_key();
+    let account_b = new_key();
+    let device = new_key();
+    let now = vc_server::core::now_ms();
+    let revoke = |account: &SigningKey, seq| vc_server::core::RevokedDevice {
+        seq,
+        account_key: public_key(account),
+        device_key: public_key(&device),
+        revoked_at: now,
+        signature: URL_SAFE_NO_PAD.encode(
+            ed25519_dalek::Signer::sign(
+                account,
+                vc_server::identity::revoke_statement(&public_key(account), &public_key(&device), now).as_bytes(),
+            )
+            .to_bytes(),
+        ),
+    };
+    server.running.core.revoked(vec![revoke(&account_a, 1)], 1).await;
+    server.running.core.info().await.unwrap();
+    let mut denied = open(&server).await;
+    let mut h = hello_for(&denied, &device, B);
+    set_certificate(&mut h, certificate(&account_a, &device, now, now + 86400000), &device);
+    assert_eq!(denied.rejected(h).await.code, ErrorCode::NotAuthenticated);
+    denied.expect_closed().await;
+    let mut raw = open(&server).await;
+    let mut h = hello_for(&raw, &device, B);
+    set_certificate(&mut h, certificate(&account_b, &device, now, now + 86400000), &device);
+    raw.send_hello(h).await;
+    assert!(raw.recv().await.unwrap()["ok"]["server_proof"].is_string());
+    server.running.core.revoked(vec![revoke(&account_b, 2)], 2).await;
+    server.running.core.info().await.unwrap();
+    raw.send(json!({"id":2,"op":"join","d":{}})).await;
+    assert_eq!(raw.recv().await.unwrap()["err"]["code"], "not_authenticated");
+    raw.expect_closed().await;
+}
+
+#[tokio::test]
+async fn swapping_a_valid_certificate_under_another_account_breaks_the_hello_commitment() {
+    let server = server_b().await;
+    let device = new_key();
+    let now = vc_server::core::now_ms();
+    let mut raw = open(&server).await;
+    let mut h = hello_for(&raw, &device, B);
+    set_certificate(&mut h, certificate(&new_key(), &device, now, now + 86400000), &device);
+    // Both certificates are current and properly signed for this device key.
+    // Only the original certificate is committed to by the signed H.
+    h["certificate"] = certificate(&new_key(), &device, now, now + 86400000);
+    assert_eq!(raw.rejected(h).await.code, ErrorCode::NotAuthenticated);
+    raw.expect_closed().await;
 }

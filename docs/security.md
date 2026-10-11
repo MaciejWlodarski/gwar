@@ -89,8 +89,8 @@ directory; back it up, losing it means a new server identity). Login:
    never something the server sent. `certificate_hash` identifies the device
    certificate, or is `-` for a local identity.
 4. The server accepts only its own configured endpoints (`--public-endpoint`,
-   `--domain`, `--public-url`, and `--public-ip` if it is a global unicast
-   address), never request headers. It checks that `expected_server_key` is its
+   `--domain`, `--public-url`, and a global unicast `--public-ip` only when
+   vc-server terminates TLS itself, with its listening port), never request headers. It checks that `expected_server_key` is its
    own, the nonce is this connection's, the signature, and that the certificate
    is current and not revoked. Then it signs
    `gwar server proof v3\n{hello_hash}\n{client_signature}`.

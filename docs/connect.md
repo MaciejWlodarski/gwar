@@ -266,7 +266,8 @@ cursor are ignored, and a missing entry never clears a stored revocation.
 Connect can withhold the feed; its sequence numbers do not prove completeness.
 The core disconnects an ongoing session at certificate expiry with an explicit
 renewal reason, removes its subscriptions and voice routing, and closes its
-SFU transport. The 400-day certificate limit is unchanged.
+SFU transport. vc/3 accepts certificates lasting at most 90 days. Connect
+service issuance limits are handled separately.
 
 A certificate proves key possession, not registration with Connect. After a
 device-authenticated hello, servers asynchronously look up the account key via

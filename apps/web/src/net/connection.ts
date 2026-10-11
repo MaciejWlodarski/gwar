@@ -471,6 +471,10 @@ export class Connection implements Link {
           fail(new ConnectError("protocol", "unexpected handshake frame"));
           return;
         }
+        if (frame.kind === "ok" && !responseFor(this.pending.get(frame.re)!.op, frame.ok)) {
+          fail(new ConnectError("protocol", "malformed handshake response"));
+          return;
+        }
         this.routeFrame(frame);
       };
     });
