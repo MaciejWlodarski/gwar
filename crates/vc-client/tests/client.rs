@@ -34,6 +34,7 @@ async fn connects_chats_and_reports_errors() {
         public_ip: None,
         insecure_any_host: true,
         public_endpoints: Vec::new(),
+        client_ip_header: None,
         upload_limit: 10 * 1024 * 1024,
         upload_quota: 0,
         storage_limit: 0,

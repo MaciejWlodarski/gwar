@@ -11,7 +11,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use anyhow::{Context, Result};
 use axum::{
     Router,
-    http::{HeaderValue, Method, header},
+    http::{HeaderName, HeaderValue, Method, header},
     routing::{get, post, put},
 };
 use tokio::net::TcpListener;
@@ -29,6 +29,9 @@ pub struct Config {
     pub bind: SocketAddr,
     /// Web app origins allowed to call the API from a browser.
     pub origins: Vec<String>,
+    /// Header a reverse proxy on this host sets to the client's address (e.g.
+    /// `x-real-ip`), believed only from loopback peers.
+    pub client_ip_header: Option<String>,
 }
 
 /// Origins of the desktop app's webview on each platform.
@@ -76,7 +79,14 @@ pub async fn start(config: Config) -> Result<SocketAddr> {
         Some(path) => service_key::load(path.parent().unwrap_or_else(|| std::path::Path::new(".")))?,
         None => service_key::generate(),
     };
-    let state = Arc::new(Connect::with_service_key(store, key)?);
+    let mut connect = Connect::with_service_key(store, key)?;
+    connect.client_ip_header = config
+        .client_ip_header
+        .as_deref()
+        .map(|h| HeaderName::try_from(h.trim()))
+        .transpose()
+        .context("--client-ip-header is not a valid header name")?;
+    let state = Arc::new(connect);
     let app = router(state, &config.origins);
     let listener = TcpListener::bind(config.bind).await.context("bind HTTP listener")?;
     let addr = listener.local_addr()?;

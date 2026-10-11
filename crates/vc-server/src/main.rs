@@ -91,6 +91,10 @@ struct Cli {
     /// Accept any signed endpoint. Unsafe: isolated local development/tests only.
     #[arg(long, env = "VC_INSECURE_ANY_HOST", value_parser = clap::builder::BoolishValueParser::new())]
     insecure_any_host: bool,
+    /// Header your reverse proxy sets to the client's address, e.g. `x-real-ip`; believed
+    /// only from loopback. Without it every proxied client shares the proxy's address.
+    #[arg(long, env = "VC_CLIENT_IP_HEADER")]
+    client_ip_header: Option<String>,
     /// Largest upload in MiB (0 disables uploads).
     #[arg(long, env = "VC_UPLOAD_LIMIT_MB", default_value_t = 25)]
     upload_limit_mb: u64,
@@ -316,6 +320,7 @@ async fn main() -> Result<()> {
         }),
         public_url: public_url.clone(),
         public_endpoints: cli.public_endpoints,
+        client_ip_header: cli.client_ip_header,
         upload_limit: cli.upload_limit_mb * 1024 * 1024,
         upload_quota: cli.upload_quota_mb.saturating_mul(1024 * 1024),
         storage_limit: cli.storage_limit_mb.saturating_mul(1024 * 1024),

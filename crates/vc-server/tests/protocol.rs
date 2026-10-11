@@ -675,6 +675,28 @@ async fn a_new_channel_password_shuts_out_who_already_left() {
 }
 
 #[tokio::test]
+async fn channel_password_guesses_cannot_queue_unbounded_hashing() {
+    let server = TestServer::start().await;
+    let mut admin = admin(&server, "root").await;
+    let secret = channel_id(&admin.create_channel(json!({"name": "Secret", "password": "pw"})).await);
+    let mut guesser = Client::connect(&server, "guesser").await;
+    // Hashing takes far longer than sending these: only a few run, the rest are refused at once.
+    let mut ids = Vec::new();
+    for i in 0..12 {
+        ids.push(guesser.send("channel.join", json!({"channel": secret, "password": format!("guess{i}")})).await);
+    }
+    let mut codes = Vec::new();
+    for id in ids {
+        codes.push(serde_json::to_value(guesser.reply(id).await.unwrap_err().code).unwrap());
+    }
+    let busy = codes.iter().filter(|c| *c == "rate_limited").count();
+    assert!(busy >= 12 - 4, "at most four hashes at once: {codes:?}");
+    assert!(codes.iter().all(|c| c == "rate_limited" || c == "wrong_password"), "{codes:?}");
+    // Afterwards the right password still works.
+    guesser.ok("channel.join", json!({"channel": secret, "password": "pw"})).await;
+}
+
+#[tokio::test]
 async fn leaving_voice_keeps_you_on_the_server() {
     let server = TestServer::start().await;
     let mut a = Client::connect(&server, "alice").await;

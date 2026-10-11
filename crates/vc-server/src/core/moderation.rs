@@ -17,7 +17,10 @@ use vc_proto::{
 };
 
 use super::{Core, ErrorBody, Reply, bridge::BridgeNote, clean, err, now_ms, passwords, storage_error};
-use crate::store::{ADMIN_GROUP, MEMBER_GROUP};
+use crate::{
+    preauth::subscriber,
+    store::{ADMIN_GROUP, MEMBER_GROUP},
+};
 
 const MAX_GROUP_NAME: usize = 32;
 const MAX_REASON: usize = 200;
@@ -35,6 +38,13 @@ pub(super) fn ban_message(ban: &Ban) -> String {
         message.push_str(&format!(": {reason}"));
     }
     message
+}
+
+/// Whether `ban` covers this identity or address. An IP ban covers the banned
+/// address's [`subscriber`] range: one IPv6 host usually owns a whole /64.
+fn bans(ban: &Ban, uid: Option<&str>, ip: Option<IpAddr>) -> bool {
+    (uid.is_some() && ban.uid.as_deref() == uid)
+        || ip.is_some_and(|ip| ban.ip.as_deref().and_then(|b| b.parse().ok()).map(subscriber) == Some(subscriber(ip)))
 }
 
 fn valid_color(color: &str) -> bool {
@@ -286,12 +296,7 @@ impl Core {
 
     /// The ban in force for this identity or address, if any.
     pub(super) fn ban_for(&self, uid: Option<&str>, ip: Option<IpAddr>) -> Option<Ban> {
-        let ip = ip.map(|ip| ip.to_string());
-        self.store
-            .bans(now_ms())
-            .ok()?
-            .into_iter()
-            .find(|b| (uid.is_some() && b.uid.as_deref() == uid) || (ip.is_some() && b.ip.is_some() && b.ip == ip))
+        self.store.bans(now_ms()).ok()?.into_iter().find(|b| bans(b, uid, ip))
     }
 
     pub(super) fn ban_create(&mut self, session: SessionId, b: BanCreate) -> Reply {
@@ -336,10 +341,11 @@ impl Core {
         };
         ban.id = self.store.insert_ban(&ban).map_err(storage_error)?;
         // Everyone the ban covers leaves now.
+        let range = ip.map(subscriber);
         let banned: Vec<_> = self
             .sessions
             .values()
-            .filter(|s| s.uid == uid || (ban.ip.is_some() && s.ip.map(|ip| ip.to_string()) == ban.ip))
+            .filter(|s| s.uid == uid || (range.is_some() && s.ip.map(subscriber) == range))
             .map(|s| s.id)
             .collect();
         let reason = LeaveReason::Banned { by: ban.by.clone(), reason: ban.reason.clone(), until: ban.expires_at };
@@ -473,19 +479,16 @@ impl Core {
         match u.password {
             None => Some(apply(self, None)),
             // Hashing is slow: do it off the actor, then apply everything together.
-            Some(password) => {
-                self.defer(
-                    move || (!password.is_empty()).then(|| passwords::hash_secret(&password, false)),
-                    move |core, hash| {
-                        if !core.sessions.contains_key(&session) {
-                            return;
-                        }
-                        let result = apply(core, Some(hash));
-                        core.reply(session, id, result);
-                    },
-                );
-                None
-            }
+            Some(password) => self.defer(
+                move || (!password.is_empty()).then(|| passwords::hash_secret(&password, false)),
+                move |core, hash| {
+                    if !core.sessions.contains_key(&session) {
+                        return;
+                    }
+                    let result = apply(core, Some(hash));
+                    core.reply(session, id, result);
+                },
+            ),
         }
     }
 
@@ -523,5 +526,33 @@ impl Core {
         for session in gone {
             self.remove(session, reason.clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ip_bans_cover_the_banned_ipv6_64() {
+        let ban = |ip: &str| Ban {
+            id: 1,
+            uid: Some("u".into()),
+            ip: Some(ip.into()),
+            nickname: String::new(),
+            reason: None,
+            by: String::new(),
+            created_at: 0,
+            expires_at: None,
+        };
+        let v6 = ban("2001:db8:1:2::5");
+        assert!(bans(&v6, None, Some("2001:db8:1:2:ffff::1".parse().unwrap())));
+        assert!(!bans(&v6, None, Some("2001:db8:1:3::5".parse().unwrap())));
+        assert!(bans(&v6, Some("u"), None));
+        assert!(!bans(&v6, Some("other"), None));
+        let v4 = ban("192.0.2.1");
+        assert!(bans(&v4, None, Some("::ffff:192.0.2.1".parse().unwrap())));
+        assert!(!bans(&v4, None, Some("192.0.2.2".parse().unwrap())));
+        assert!(!bans(&Ban { ip: None, ..v4 }, None, Some("192.0.2.1".parse().unwrap())));
     }
 }

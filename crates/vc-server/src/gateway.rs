@@ -13,7 +13,7 @@ use axum::{
         ConnectInfo, State, WebSocketUpgrade,
         ws::{Message, Utf8Bytes, WebSocket},
     },
-    http::HeaderMap,
+    http::{HeaderMap, HeaderName},
     response::Response,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -40,6 +40,8 @@ pub struct Gateway {
     pub public_endpoints: Arc<HashSet<String>>,
     pub insecure_any_host: bool,
     pub server_key: Arc<SigningKey>,
+    /// Header a reverse proxy on this host sets to the client's address.
+    pub client_ip_header: Option<HeaderName>,
 }
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
@@ -55,7 +57,7 @@ pub async fn upgrade(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> Response {
-    let ip = client_ip(peer, &headers);
+    let ip = client_ip(peer, &headers, gateway.client_ip_header.as_ref());
     let Some(permit) = gateway.preauth.connection(ip) else {
         return axum::response::IntoResponse::into_response(axum::http::StatusCode::TOO_MANY_REQUESTS);
     };
@@ -65,16 +67,32 @@ pub async fn upgrade(
     })
 }
 
-/// The client's address. Behind a reverse proxy on the same host the TCP peer
-/// is loopback, so the proxy's `X-Real-IP` / `X-Forwarded-For` is trusted then
-/// (and only then: anyone could send those headers directly).
-pub fn client_ip(peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
+/// The client's address. Behind a reverse proxy on the same host the TCP peer is
+/// loopback; only then, and only when the operator names the header the proxy
+/// sets (`--client-ip-header`), is that header believed: a proxy that passes a
+/// client's own `X-Real-IP` through would otherwise let anyone choose their address.
+/// For a list (`X-Forwarded-For`) the last entry, the one the proxy added, counts.
+pub fn client_ip(peer: SocketAddr, headers: &HeaderMap, trusted: Option<&HeaderName>) -> IpAddr {
     if !peer.ip().is_loopback() {
         return peer.ip();
     }
-    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    header("x-real-ip")
-        .or_else(|| header("x-forwarded-for").and_then(|v| v.rsplit(',').next()))
+    let Some(name) = trusted else {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        if headers.contains_key("x-real-ip") || headers.contains_key("x-forwarded-for") {
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    "requests come through a local proxy, but --client-ip-header is not set: \
+                     every client counts as {} for per-address limits and bans",
+                    peer.ip()
+                )
+            });
+        }
+        return peer.ip();
+    };
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.rsplit(',').next())
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(peer.ip())
 }
@@ -328,5 +346,32 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
     drop(out);
     if !writer_done {
         let _ = writer.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forwarded_addresses_count_only_from_a_named_header_behind_loopback() {
+        let local: SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let remote: SocketAddr = "198.51.100.7:5000".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "203.0.113.9".parse().unwrap());
+        headers.insert("x-forwarded-for", "192.0.2.66, 203.0.113.10".parse().unwrap());
+        let real = HeaderName::from_static("x-real-ip");
+        let forwarded = HeaderName::from_static("x-forwarded-for");
+        // Without a configured header nothing a client sends is believed.
+        assert_eq!(client_ip(local, &headers, None), local.ip());
+        // Nor from anyone but a local proxy.
+        assert_eq!(client_ip(remote, &headers, Some(&real)), remote.ip());
+        assert_eq!(client_ip(local, &headers, Some(&real)).to_string(), "203.0.113.9");
+        // The proxy appends its peer: the client's own first entry does not count.
+        assert_eq!(client_ip(local, &headers, Some(&forwarded)).to_string(), "203.0.113.10");
+        // A missing or unparsable header falls back to the peer.
+        headers.insert("x-real-ip", "not an address".parse().unwrap());
+        assert_eq!(client_ip(local, &headers, Some(&real)), local.ip());
+        assert_eq!(client_ip(local, &HeaderMap::new(), Some(&real)), local.ip());
     }
 }

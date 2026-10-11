@@ -11,7 +11,7 @@ use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_ha
 use axum::{
     Json,
     extract::{ConnectInfo, Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderName, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use hmac::{Hmac, Mac};
@@ -35,7 +35,16 @@ pub struct Connect {
     limits: Mutex<HashMap<String, Vec<Instant>>>,
     /// Keys the fake salts of unknown handles, so prelogin reveals nothing.
     secret: [u8; 32],
+    /// Header a reverse proxy on this host sets to the client's address; `None`:
+    /// the TCP peer is the client.
+    pub client_ip_header: Option<HeaderName>,
+    /// Argon2 runs (19 MiB each) at once; the rest wait their turn.
+    argon2: Arc<tokio::sync::Semaphore>,
 }
+
+/// Argon2 runs allowed at the same time, and how long a request waits for one.
+const ARGON2_PARALLEL: usize = 4;
+const ARGON2_WAIT: Duration = Duration::from_secs(10);
 
 impl Connect {
     pub fn new(store: Store) -> anyhow::Result<Self> {
@@ -56,6 +65,8 @@ impl Connect {
             service_key,
             limits: Mutex::default(),
             secret: secret.try_into().expect("32 bytes"),
+            client_ip_header: None,
+            argon2: Arc::new(tokio::sync::Semaphore::new(ARGON2_PARALLEL)),
         })
     }
 
@@ -96,6 +107,9 @@ impl ApiError {
     fn limited() -> Self {
         Self(StatusCode::TOO_MANY_REQUESTS, "rate_limited", "too many attempts, try again later".into())
     }
+    fn busy() -> Self {
+        Self(StatusCode::SERVICE_UNAVAILABLE, "busy", "the service is busy, try again shortly".into())
+    }
 }
 
 impl From<anyhow::Error> for ApiError {
@@ -113,16 +127,27 @@ impl IntoResponse for ApiError {
 
 type Reply = Result<Json<Value>, ApiError>;
 
-/// The caller's address; behind a local reverse proxy, its forwarded one.
-fn client_ip(peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
-    if !peer.ip().is_loopback() {
-        return peer.ip();
+/// The caller's address, for rate limits: an IPv4 address or an IPv6 /64 (one
+/// IPv6 host usually owns a whole /64). Behind a reverse proxy on this host the
+/// header the operator named (`--client-ip-header`) gives the address; nothing a
+/// client sends is believed otherwise. For a list the last entry, the proxy's, counts.
+fn client_ip(state: &Connect, peer: SocketAddr, headers: &HeaderMap) -> IpAddr {
+    let ip = match &state.client_ip_header {
+        Some(name) if peer.ip().is_loopback() => headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.rsplit(',').next())
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(peer.ip()),
+        _ => peer.ip(),
+    };
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6((u128::from(v6) & !((1u128 << 64) - 1)).into()),
+        },
     }
-    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-    header("x-real-ip")
-        .or_else(|| header("x-forwarded-for").and_then(|v| v.rsplit(',').next()))
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(peer.ip())
 }
 
 fn token_hash(token: &str) -> String {
@@ -178,10 +203,21 @@ fn check_blob(blob: &str) -> Result<(), ApiError> {
     unb64_len(blob, KEY_BLOB_LEN).map(|_| ()).ok_or_else(|| ApiError::bad("invalid key blob"))
 }
 
+/// A turn at Argon2, waiting at most [`ARGON2_WAIT`]. The blocking task keeps it,
+/// so a client hanging up mid-hash does not free a turn before the work ends.
+async fn argon2_turn(state: &Connect) -> Result<tokio::sync::OwnedSemaphorePermit, ApiError> {
+    match tokio::time::timeout(ARGON2_WAIT, state.argon2.clone().acquire_owned()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        _ => Err(ApiError::busy()),
+    }
+}
+
 /// Argon2 of the client's authentication key (32 bytes, base64url).
-async fn hash_auth(auth_key: &str) -> Result<String, ApiError> {
+async fn hash_auth(state: &Connect, auth_key: &str) -> Result<String, ApiError> {
     let key = unb64_len(auth_key, 32).ok_or_else(|| ApiError::bad("invalid authentication key"))?;
+    let turn = argon2_turn(state).await?;
     let hashed = tokio::task::spawn_blocking(move || {
+        let _turn = turn;
         let salt = SaltString::encode_b64(&rand::random::<[u8; 16]>()).expect("salt");
         Argon2::default().hash_password(&key, &salt).map(|h| h.to_string())
     })
@@ -191,13 +227,15 @@ async fn hash_auth(auth_key: &str) -> Result<String, ApiError> {
     Ok(hashed)
 }
 
-async fn verify_auth(auth_key: &str, hash: &str) -> bool {
-    let (Some(key), hash) = (unb64_len(auth_key, 32), hash.to_owned()) else { return false };
-    tokio::task::spawn_blocking(move || {
+async fn verify_auth(state: &Connect, auth_key: &str, hash: &str) -> Result<bool, ApiError> {
+    let (Some(key), hash) = (unb64_len(auth_key, 32), hash.to_owned()) else { return Ok(false) };
+    let turn = argon2_turn(state).await?;
+    Ok(tokio::task::spawn_blocking(move || {
+        let _turn = turn;
         PasswordHash::new(&hash).is_ok_and(|parsed| Argon2::default().verify_password(&key, &parsed).is_ok())
     })
     .await
-    .unwrap_or(false)
+    .unwrap_or(false))
 }
 
 fn recovery_hash(recovery_auth: &str) -> Result<String, ApiError> {
@@ -240,7 +278,7 @@ pub async fn register(
     headers: HeaderMap,
     Json(r): Json<Register>,
 ) -> Reply {
-    let ip = client_ip(peer, &headers);
+    let ip = client_ip(&state, peer, &headers);
     if !state.allow(format!("register:{ip}"), 5, Duration::from_secs(3600)) {
         return Err(ApiError::limited());
     }
@@ -254,7 +292,7 @@ pub async fn register(
     // claim someone else's existing identity.
     crypto::check_certificate(&r.account_key, &d.device_key, d.issued_at, d.expires_at, &d.signature, now)
         .map_err(ApiError::bad)?;
-    let auth_hash = hash_auth(&r.auth_key).await?;
+    let auth_hash = hash_auth(&state, &r.auth_key).await?;
     let recovery_hash = recovery_hash(&r.recovery_auth)?;
     let store = state.store.lock().expect("store lock");
     let account = NewAccount {
@@ -322,10 +360,10 @@ pub async fn login(
     Json(r): Json<Login>,
 ) -> Reply {
     let handle = crypto::handle(&r.handle).ok_or_else(ApiError::unauthorized)?;
-    limit_login(&state, client_ip(peer, &headers), &handle)?;
+    limit_login(&state, client_ip(&state, peer, &headers), &handle)?;
     let account = state.store.lock().expect("store lock").account_by_handle(&handle)?;
     let Some(account) = account else { return Err(ApiError::unauthorized()) };
-    if !verify_auth(&r.auth_key, &account.auth_hash).await {
+    if !verify_auth(&state, &r.auth_key, &account.auth_hash).await? {
         return Err(ApiError::unauthorized());
     }
     let store = state.store.lock().expect("store lock");
@@ -349,7 +387,7 @@ pub async fn recover(
     Json(r): Json<Recover>,
 ) -> Reply {
     let handle = crypto::handle(&r.handle).ok_or_else(ApiError::unauthorized)?;
-    limit_login(&state, client_ip(peer, &headers), &handle)?;
+    limit_login(&state, client_ip(&state, peer, &headers), &handle)?;
     let store = state.store.lock().expect("store lock");
     let Some(account) = store.account_by_handle(&handle)? else { return Err(ApiError::unauthorized()) };
     let given = recovery_hash(&r.recovery_auth).map_err(|_| ApiError::unauthorized())?;
@@ -505,7 +543,7 @@ pub async fn password(State(state): State<AppState>, headers: HeaderMap, Json(r)
     if !crypto::verify(&account.account_key, &statement, &r.signature) {
         return Err(ApiError::bad("credential signature does not match the account key"));
     }
-    let auth_hash = hash_auth(&r.auth_key).await?;
+    let auth_hash = hash_auth(&state, &r.auth_key).await?;
     let store = state.store.lock().expect("store lock");
     if !store.update_credentials(
         &c,
@@ -690,5 +728,46 @@ pub async fn lookup_by_key(State(state): State<AppState>, Path(key): Path<String
     match account {
         Some(a) => Ok(public_account(&state, a)),
         None => Err(ApiError(StatusCode::NOT_FOUND, "not_found", "no such account".into())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn connect(header: Option<&'static str>) -> Connect {
+        let mut c = Connect::new(Store::in_memory().unwrap()).unwrap();
+        c.client_ip_header = header.map(HeaderName::from_static);
+        c
+    }
+
+    #[test]
+    fn rate_limits_key_on_a_trusted_address_and_ipv6_64s() {
+        let local: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-real-ip", "2001:db8:1:2::77".parse().unwrap());
+        headers.insert("x-forwarded-for", "192.0.2.1, 203.0.113.5".parse().unwrap());
+        let ip = |c: &Connect, peer: SocketAddr, h: &HeaderMap| client_ip(c, peer, h).to_string();
+        assert_eq!(ip(&connect(None), local, &headers), "127.0.0.1");
+        assert_eq!(ip(&connect(Some("x-real-ip")), local, &headers), "2001:db8:1:2::");
+        assert_eq!(ip(&connect(Some("x-forwarded-for")), local, &headers), "203.0.113.5");
+        assert_eq!(ip(&connect(Some("x-real-ip")), "[2001:db8::9]:1".parse().unwrap(), &headers), "2001:db8::");
+        assert_eq!(ip(&connect(None), "[::ffff:192.0.2.9]:1".parse().unwrap(), &headers), "192.0.2.9");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn argon2_work_is_bounded_and_waits_its_turn() {
+        let c = connect(None);
+        let held: Vec<_> = (0..ARGON2_PARALLEL).map(|_| c.argon2.try_acquire().unwrap()).collect();
+        // Nobody frees a turn: the request gives up instead of piling more work on.
+        assert!(argon2_turn(&c).await.is_err());
+        // A turn freed in time is taken.
+        let waiting = argon2_turn(&c);
+        let release = async {
+            tokio::time::sleep(ARGON2_WAIT / 2).await;
+            drop(held);
+        };
+        let (turn, ()) = tokio::join!(waiting, release);
+        assert!(turn.is_ok());
     }
 }

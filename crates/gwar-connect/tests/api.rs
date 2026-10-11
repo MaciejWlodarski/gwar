@@ -541,6 +541,7 @@ async fn service_key_survives_restart_and_matches_cli() {
             database: Some(database.clone()),
             bind: "127.0.0.1:0".parse().unwrap(),
             origins: vec![],
+            client_ip_header: None,
         })
         .await
         .unwrap();

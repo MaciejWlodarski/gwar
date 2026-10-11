@@ -112,8 +112,13 @@ server {
 }
 ```
 
-Both services trust forwarded addresses only from loopback, so they must not be
-published directly.
+nginx overwrites `X-Real-IP` with the address it sees, and the units run with
+`--client-ip-header x-real-ip`, so per-address limits and bans see real clients.
+The header is believed only from a loopback peer, so the services must not be
+published directly. Without the option every proxied client shares nginx's
+address (the server logs a warning); naming a header the proxy does not set
+would let clients choose their own address. IPv6 clients are limited and banned
+per /64.
 
 ## Restoring a backup
 

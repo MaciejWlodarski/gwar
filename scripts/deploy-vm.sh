@@ -70,7 +70,7 @@ Description=Voice communicator server (development)
 
 [Service]
 WorkingDirectory=%h/vc
-ExecStart=%h/vc/vc-server --data-dir %h/vc/data --http 127.0.0.1:8800 --media ${MEDIA_BIND} --public-ip ${PUBLIC_IP} --web-root %h/vc/src/apps/web/dist ${EXTRA_ARGS}
+ExecStart=%h/vc/vc-server --data-dir %h/vc/data --http 127.0.0.1:8800 --client-ip-header x-real-ip --media ${MEDIA_BIND} --public-ip ${PUBLIC_IP} --web-root %h/vc/src/apps/web/dist ${EXTRA_ARGS}
 Restart=on-failure
 UMask=0077
 
@@ -87,7 +87,7 @@ Description=Gwar Connect (accounts)
 
 [Service]
 WorkingDirectory=%h/gwar-connect
-ExecStart=%h/gwar-connect/gwar-connect --data-dir %h/gwar-connect/data --http 127.0.0.1:8900 ${CONNECT_ARGS}
+ExecStart=%h/gwar-connect/gwar-connect --data-dir %h/gwar-connect/data --http 127.0.0.1:8900 --client-ip-header x-real-ip ${CONNECT_ARGS}
 Restart=on-failure
 UMask=0077
 

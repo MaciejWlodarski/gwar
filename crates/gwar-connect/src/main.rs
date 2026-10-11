@@ -22,6 +22,10 @@ struct Cli {
         default_value = "https://gwar.maciejwlodarski.com"
     )]
     origins: Vec<String>,
+    /// Header your reverse proxy sets to the client's address, e.g. `x-real-ip`; believed
+    /// only from loopback. Without it every proxied client shares the proxy's address.
+    #[arg(long, env = "GWAR_CONNECT_CLIENT_IP_HEADER")]
+    client_ip_header: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -57,7 +61,8 @@ async fn main() -> Result<()> {
     }
     let mut origins = cli.origins;
     origins.extend(DESKTOP_ORIGINS.iter().map(|o| o.to_string()));
-    let addr = gwar_connect::start(Config { database: Some(database), bind: cli.http, origins }).await?;
+    let config = Config { database: Some(database), bind: cli.http, origins, client_ip_header: cli.client_ip_header };
+    let addr = gwar_connect::start(config).await?;
     tracing::info!(%addr, "Gwar Connect ready");
     tokio::signal::ctrl_c().await?;
     Ok(())

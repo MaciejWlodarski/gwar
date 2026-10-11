@@ -36,6 +36,7 @@ async fn devices_of_one_account_are_one_person_until_revoked() {
         database: None,
         bind: "127.0.0.1:0".parse().unwrap(),
         origins: vec![],
+        client_ip_header: None,
     })
     .await
     .unwrap();

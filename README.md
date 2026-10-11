@@ -160,8 +160,12 @@ port and WebSocket path. Configure the exclusive accepted set using:
 Behind a reverse proxy, set its public URL, for example:
 
 ```bash
-vc-server --http 127.0.0.1:8800 --public-url https://voice.example.com
+vc-server --http 127.0.0.1:8800 --public-url https://voice.example.com --client-ip-header x-real-ip
 ```
+
+`--client-ip-header` names the header your proxy sets to the client's address
+(nginx: `proxy_set_header X-Real-IP $remote_addr;`). It is believed only from
+loopback; name only a header the proxy always overwrites.
 
 Hostnames are lowercase without a trailing dot, IPv6 is bracketed, and default
 WS/WSS ports are omitted. No credentials, query or fragment. Request headers

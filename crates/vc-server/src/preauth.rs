@@ -66,9 +66,22 @@ impl Drop for Connection {
         inner.connections -= 1;
     }
 }
+/// The unit address limits and bans apply to: an IPv4 address, or an IPv6 /64.
+/// One IPv6 host commonly owns a whole /64, so per-address limits on single IPv6
+/// addresses would not hold anyone back.
+pub fn subscriber(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6((u128::from(v6) & !((1u128 << 64) - 1)).into()),
+        },
+    }
+}
+
 impl PreAuth {
     pub fn connection(&self, ip: IpAddr) -> Option<Connection> {
-        self.connection_at(ip, Instant::now())
+        self.connection_at(subscriber(ip), Instant::now())
     }
     fn connection_at(&self, ip: IpAddr, now: Instant) -> Option<Connection> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -94,7 +107,7 @@ impl PreAuth {
         Some(Connection { limits: self.clone(), ip })
     }
     pub fn hello(&self, ip: IpAddr) -> bool {
-        self.hello_at(ip, Instant::now())
+        self.hello_at(subscriber(ip), Instant::now())
     }
     fn hello_at(&self, ip: IpAddr, now: Instant) -> bool {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).ips.get_mut(&ip).is_some_and(|i| i.hellos.take(now))
@@ -139,6 +152,19 @@ mod tests {
         }
         assert!(limits.connection_at("255.255.255.255".parse().unwrap(), now).is_none());
         assert!(limits.connection_at("255.255.255.255".parse().unwrap(), now + TTL).is_some());
+    }
+    #[test]
+    fn one_ipv6_host_is_one_subscriber() {
+        let limits = PreAuth::default();
+        let host = |i: u16| -> IpAddr { format!("2001:db8:1:2::{i:x}").parse().unwrap() };
+        let mut held: Vec<_> = (0..PER_IP as u16).map(|i| limits.connection(host(i)).unwrap()).collect();
+        // The whole /64 shares one budget; the next /64 has its own.
+        assert!(limits.connection(host(999)).is_none());
+        assert!(limits.connection("2001:db8:1:3::1".parse().unwrap()).is_some());
+        held.clear();
+        assert_eq!(subscriber(host(7)), "2001:db8:1:2::".parse::<IpAddr>().unwrap());
+        assert_eq!(subscriber("::ffff:192.0.2.1".parse().unwrap()), "192.0.2.1".parse::<IpAddr>().unwrap());
+        assert_eq!(subscriber("192.0.2.1".parse().unwrap()), "192.0.2.1".parse::<IpAddr>().unwrap());
     }
     #[tokio::test]
     async fn password_work_has_no_unbounded_queue() {

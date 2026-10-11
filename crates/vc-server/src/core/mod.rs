@@ -244,6 +244,8 @@ pub struct Core {
     password: ServerPassword,
     files_dir: PathBuf,
     uploads: HashMap<String, files::PendingUpload>,
+    /// Turns at slow work (password hashing) running off the actor.
+    slow_work: Arc<tokio::sync::Semaphore>,
     /// Stored bytes allowed per member and in total; 0 means no limit.
     upload_quota: u64,
     storage_limit: u64,
@@ -260,6 +262,8 @@ const MAX_CHANNEL_NAME: usize = 64;
 const MAX_TOPIC: usize = 255;
 const MAX_MESSAGE: usize = 4000;
 const MAX_PASSWORD: usize = 128;
+/// Password hashes computed at once (Argon2, 19 MiB each); more are refused.
+const SLOW_WORK: usize = 4;
 const MAX_AWAY: usize = 80;
 const MAX_ATTACHMENTS: usize = 10;
 /// Members listed in `Welcome`: seen within this window, at most this many.
@@ -409,6 +413,7 @@ impl Core {
             password: config.password,
             files_dir: config.files_dir,
             uploads: HashMap::new(),
+            slow_work: Arc::new(tokio::sync::Semaphore::new(SLOW_WORK)),
             upload_quota: config.upload_quota,
             storage_limit: config.storage_limit,
             connect,
@@ -554,16 +559,24 @@ impl Core {
     }
 
     /// Runs `work` on the blocking pool, then `then` back on the actor.
+    /// Runs slow work (password hashing) off the actor, then `then` on it. At most
+    /// [`SLOW_WORK`] run at once; past that the request is refused, not queued.
+    /// Returns what a request handler returns: `None` once the work is under way.
     fn defer<T: Send + 'static>(
         &self,
         work: impl FnOnce() -> T + Send + 'static,
         then: impl FnOnce(&mut Core, T) + Send + 'static,
-    ) {
-        let Some(tx) = self.me.upgrade() else { return };
+    ) -> Option<Reply> {
+        let Ok(turn) = self.slow_work.clone().try_acquire_owned() else {
+            return Some(Err(err(ErrorCode::RateLimited, "password work busy, try again")));
+        };
+        let tx = self.me.upgrade()?;
         tokio::task::spawn_blocking(move || {
             let value = work();
+            drop(turn);
             let _ = tx.blocking_send(CoreMsg::Resume(Box::new(move |core| then(core, value))));
         });
+        None
     }
 
     // ------------------------------------------------------------ lifecycle
@@ -1208,8 +1221,7 @@ impl Core {
                 };
                 core.reply(session, id, result);
             },
-        );
-        None
+        )
     }
 
     fn sibling_name_taken(&self, parent: Option<ChannelId>, name: &str, except: Option<ChannelId>) -> bool {
@@ -1260,8 +1272,7 @@ impl Core {
                 let result = core.insert_channel(parent, name, topic, hash, max_clients, plaintext);
                 core.reply(session, id, result);
             },
-        );
-        None
+        )
     }
 
     fn insert_channel(
@@ -1376,8 +1387,7 @@ impl Core {
                 let result = core.apply_channel_update(channel, row, password, plaintext);
                 core.reply(session, id, result);
             },
-        );
-        None
+        )
     }
 
     fn apply_channel_update(

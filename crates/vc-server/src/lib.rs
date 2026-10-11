@@ -73,6 +73,9 @@ pub struct Config {
     pub public_url: Option<String>,
     /// Extra accepted external WebSocket endpoints. Never derived from request headers.
     pub public_endpoints: Vec<String>,
+    /// Header a reverse proxy on this host sets to the client's address (e.g.
+    /// `x-real-ip`), believed only from loopback peers; `None`: the TCP peer is the client.
+    pub client_ip_header: Option<String>,
     /// Largest upload in bytes; 0 disables uploads.
     pub upload_limit: u64,
     /// Bytes one member may keep stored (attached or not); 0 means no limit.
@@ -281,6 +284,12 @@ pub async fn start(config: Config) -> Result<Running> {
         public_endpoints,
         server_key,
         insecure_any_host: config.insecure_any_host,
+        client_ip_header: config
+            .client_ip_header
+            .as_deref()
+            .map(|h| axum::http::HeaderName::try_from(h.trim()))
+            .transpose()
+            .context("--client-ip-header is not a valid header name")?,
     };
     // The web app runs on another origin than this server: let it upload and
     // fetch files. Uploads are authorized by one-time tokens, not cookies.
