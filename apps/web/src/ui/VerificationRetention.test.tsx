@@ -41,4 +41,4 @@ it("drops verification results of rows the thread evicted, including late comple
     expect(observed.map.has(1)).toBe(false);
     expect(observed.map.has(2000)).toBe(true);
   } finally { await act(async () => root.unmount()); div.remove(); vi.unstubAllGlobals(); }
-});
+}, 30_000); // 2,000 mounted messages: about 2 s here, several times that on a CI runner
