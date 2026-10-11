@@ -147,7 +147,8 @@ class Controller {
   private verifier = new MessageVerifier();
   private messageQueue = Promise.resolve();
   private messagePending = 0;
-  private uploaded = new Map<string, Attachment>();
+  /** Finished uploads, each usable only on the connection it was uploaded through. */
+  private uploaded = new Map<string, { conn: Link; att: Attachment }>();
   private identityLoading: Promise<Identity> | null = null;
   private voiceRetry: ReturnType<typeof setTimeout> | null = null;
   private voiceRetries = 0;
@@ -886,7 +887,8 @@ class Controller {
    *  reconnect or a resync), so nothing verified or signed for one server is ever signed for or sent to another. */
   private bind() {
     const conn = this.connection, epoch = useSession.getState().epoch, serverKey = conn.serverKey;
-    return { conn, check: () => { if (this.conn !== conn || useSession.getState().epoch !== epoch || conn.serverKey !== serverKey) throw new ConnectionLostError(); } };
+    const current = () => this.conn === conn && useSession.getState().epoch === epoch && conn.serverKey === serverKey;
+    return { conn, current, check: () => { if (!current()) throw new ConnectionLostError(); } };
   }
 
   private async signChat(target: ChatTarget, text: string, mentions: string[], attachments: Attachment[], original?: MessageSignature, conn = this.connection): Promise<MessageSignature> {
@@ -923,15 +925,20 @@ class Controller {
     });
   }
 
-  private async deliver(m: Omit<FailedSend, "id" | "error">): Promise<boolean> {
+  /** Signs and sends one message on the connection it started on; a failure while that session lasts goes to the outbox. */
+  private async deliver(m: Omit<FailedSend, "id" | "error" | "serverKey">): Promise<boolean> {
+    let bound: ReturnType<Controller["bind"]> | undefined;
     try {
+      bound = this.bind();
+      const conn = bound.conn;
       const attachments = (m.attachments ?? []).map((id) => {
-        const att = this.uploaded.get(id);
-        if (!att && this.conn instanceof Connection) throw new Error("unknown upload");
-        return att!;
+        const upload = this.uploaded.get(id);
+        if (upload?.conn !== conn && conn instanceof Connection) throw new Error("unknown upload");
+        return upload?.att as Attachment;
       });
-      const signature = await this.signChat(m.target, m.text, m.mentions ?? [], attachments);
-      await this.connection.request("chat.send", {
+      const signature = await this.signChat(m.target, m.text, m.mentions ?? [], attachments, undefined, conn);
+      bound.check();
+      await conn.request("chat.send", {
         signature,
         target: m.target,
         text: m.text,
@@ -940,8 +947,10 @@ class Controller {
       });
       return true;
     } catch (e) {
+      // A draft whose session has ended belongs to no thread here: it is dropped, never kept for another server.
+      if (bound && !bound.current()) return false;
       const locked = e instanceof RequestError && e.code === "forbidden" && typeof m.target === "object" && "channel" in m.target;
-      useOutbox.getState().add({ ...m, error: locked ? tNow("chat.locked") : describeRequestError(e) });
+      useOutbox.getState().add({ ...m, serverKey: bound?.conn.serverKey ?? null, error: locked ? tNow("chat.locked") : describeRequestError(e) });
       return false;
     }
   }
@@ -949,6 +958,8 @@ class Controller {
   async retrySend(id: number): Promise<void> {
     const item = useOutbox.getState().remove(id);
     if (!item) return;
+    // Only the server the draft was written for may receive it.
+    if (item.serverKey !== (this.conn?.serverKey ?? null)) { useUi.getState().toast("error", tNow("err.req.lost")); return; }
     let target = item.target;
     if (item.dmUid) {
       const peer = Object.values(useSession.getState().clients).find((c) => c.uid === item.dmUid);
@@ -1007,6 +1018,8 @@ class Controller {
     if (current?.kind !== "msg" || current.msg.signature?.revision !== original.signature?.revision) throw new Error(tNow("chat.editChanged"));
     const signature = await this.signChat(original.target, text, mentions, text === DELETION_TEXT ? [] : original.attachments ?? [], original.signature ?? undefined, conn);
     check();
+    const now = Object.values(useSession.getState().threads).flatMap((t) => t.items).find((i) => i.kind === "msg" && i.msg.id === original.id);
+    if (now?.kind !== "msg" || now.msg.signature?.revision !== original.signature?.revision) throw new Error(tNow("chat.editChanged"));
     await conn.request("chat.edit", { message: original.id, text, signature, ...(mentions.length ? { mentions } : {}) });
     return true;
   }
@@ -1028,12 +1041,17 @@ class Controller {
     if (s.kind !== "vc") throw new UploadError("unsupported");
     const check = checkUpload(file.size, s.server?.upload_limit ?? 0);
     if (!check.ok) throw new UploadError(check.reason);
+    // The file goes only to the server it was chosen on.
+    let bound: ReturnType<Controller["bind"]>;
+    try { bound = this.bind(); } catch { throw new UploadError("network"); }
+    const stillHere = () => { if (!bound.current()) throw new UploadError("network"); };
     const bytes = new Uint8Array(await file.arrayBuffer());
     const hash = await sha256(bytes);
     const expected = localAttachmentMetadata(file.name, file.type || "application/octet-stream", bytes);
     let reserved: { file: string; upload_url: string };
+    stillHere();
     try {
-      reserved = await this.connection.request("file.upload", { name: file.name, size: file.size, mime: file.type || "application/octet-stream", sha256: hash });
+      reserved = await bound.conn.request("file.upload", { name: file.name, size: file.size, mime: file.type || "application/octet-stream", sha256: hash });
     } catch (e) {
       if (e instanceof RequestError && (e.code === "too_large" || e.code === "forbidden")) throw new UploadError(e.code === "too_large" ? "too_large" : "forbidden");
       throw new UploadError("network");
@@ -1041,9 +1059,11 @@ class Controller {
     const url = absoluteUrl(s.httpOrigin, reserved.upload_url, "PUT");
     const remember = (att: Attachment): string => {
       if (!attachmentSchema(att) || att.id !== reserved.file || att.sha256 !== hash || att.size !== file.size || att.name !== expected.name || att.mime !== expected.mime) throw new UploadError("network");
-      this.uploaded.set(att.id, { ...att, sha256: hash });
+      stillHere();
+      this.uploaded.set(att.id, { conn: bound.conn, att: { ...att, sha256: hash } });
       return att.id;
     };
+    stillHere();
     if (isDesktop()) {
       if (opts.signal?.aborted) throw new UploadError("aborted");
       opts.onProgress?.(0.5);

@@ -180,6 +180,8 @@ export interface FailedSend {
   text: string;
   mentions?: string[];
   attachments?: string[];
+  /** The server (key) the draft was written for; a retry goes nowhere else. */
+  serverKey: string | null;
   error: string;
 }
 

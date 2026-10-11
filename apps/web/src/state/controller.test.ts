@@ -683,6 +683,52 @@ describe("edits stay on their connection; history ownership follows each verifie
     g.c.conn = link;
   });
 
+  it("a new message is never sent, kept or retried elsewhere when the connection changes during signing (Astra r3 probe, inverted)", async () => {
+    vi.useRealTimers(); connectFake();
+    const g = await genuine(), { a, b, switchTo } = await servers(g), held = gate();
+    const sign = g.identity.sign;
+    g.identity.sign = async (bytes: Uint8Array) => { const result = await sign(bytes); await held.pass(); return result; };
+    stores.useSession.setState({ viewChannel: 1 });
+    const sending = controller.sendChat("channel", "secret intended only for A");
+    await held.started; switchTo();
+    stores.useSession.setState({ viewChannel: 1, channels: { 1: chan(1) } });
+    held.release();
+    expect(await sending).toBe(false);
+    expect(a.request).not.toHaveBeenCalled(); expect(b.request).not.toHaveBeenCalled();
+    expect(stores.useOutbox.getState().failed).toEqual([]);
+    g.c.conn = link;
+  });
+
+  it("a failed draft is retried only on the server it was written for", async () => {
+    vi.useRealTimers(); connectFake();
+    const g = await genuine(), { b, switchTo } = await servers(g);
+    switchTo();
+    stores.useSession.setState({ viewChannel: 1, channels: { 1: chan(1) } });
+    stores.useOutbox.getState().add({ thread: "ch:1", target: { channel: 1 }, text: "draft for A", serverKey: g.ctx.serverKey, error: "x" });
+    const pending = stores.useOutbox.getState().failed[0]!;
+    await controller.retrySend(pending.id);
+    expect(b.request).not.toHaveBeenCalled();
+    expect(stores.useOutbox.getState().failed).toEqual([]);
+    g.c.conn = link;
+  });
+
+  it("an edit is not sent when a newer revision arrived while it was being signed (Astra r3 probe, inverted)", async () => {
+    vi.useRealTimers(); connectFake();
+    const g = await genuine(), { a } = await servers(g), held = gate();
+    const { signMessage } = await import("../net/message-signature");
+    const newer = { ...g.msg, text: "earlier genuine edit from another device" };
+    newer.signature = await signMessage(g.identity, g.ctx, g.uid, newer.text, [], [], g.msg.signature!);
+    const sign = g.identity.sign;
+    g.identity.sign = async (bytes: Uint8Array) => { const result = await sign(bytes); await held.pass(); return result; };
+    const editing = controller.editMessage(g.msg.id, "competing edit", []);
+    await held.started;
+    session().dispatch({ type: "event", now: Date.now(), event: { ev: "chat.edited", d: newer }, authentic: true });
+    held.release();
+    expect(await editing).toBe(false);
+    expect(a.request).not.toHaveBeenCalled();
+    g.c.conn = link;
+  });
+
   it("a forged duplicate in a history page never inherits the genuine row's ownership", async () => {
     vi.useRealTimers(); connectFake();
     const { msg, ctx, c } = await genuine();
