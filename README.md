@@ -239,8 +239,8 @@ build without it with `--no-default-features`.
 | `apps/desktop` | Tauri 2 desktop app: native voice, global push-to-talk, tray |
 | `scripts/deploy-vm.sh` | Deploys the server and Connect to a Linux host over SSH |
 
-More in [docs/architecture.md](docs/architecture.md), [docs/connect.md](docs/connect.md)
-and [docs/deploy.md](docs/deploy.md).
+More in [docs/architecture.md](docs/architecture.md), [docs/connect.md](docs/connect.md),
+[docs/security.md](docs/security.md) and [docs/deploy.md](docs/deploy.md).
 
 ## Tests
 
