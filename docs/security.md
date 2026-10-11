@@ -174,7 +174,8 @@ gwar message v2
   The record fails closed: if it cannot be read or stored, or a server floods it
   past 10,000 ids, that server's record is marked incomplete for good and every
   channel message there is qualified ("cannot rule out a reused channel id").
-  A client that never saw the deletion cannot tell, so a signature binds a
+  If storage refuses even that small marker, the record lasts only until the
+  app reloads. A client that never saw the deletion cannot tell, so a signature binds a
   message to the channel id, not to the channel's name or lifetime. A direct
   message must involve exactly the two participants of the open conversation.
 - Edits keep the message id and creation time and chain to the previous
