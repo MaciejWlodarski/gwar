@@ -57,12 +57,12 @@ function useSave(att: Attachment, verified: boolean) {
   const [busy, setBusy] = useState(false), [failed, setFailed] = useState(false);
   const abort = useRef<AbortController | null>(null);
   useEffect(() => () => abort.current?.abort(), []);
-  const run = async () => {
+  /** Unverified bytes are saved only when the caller's control says so; a retry verifies again. */
+  const run = async (unverified: boolean) => {
     abort.current?.abort(); const request = new AbortController(); abort.current = request; setBusy(true);
     try {
       const s = useSession.getState(), opts = { origin: s.httpOrigin, size: att.size, uploadLimit: s.server?.upload_limit ?? 0, signal: request.signal };
-      // A second, explicitly labeled click after a hash failure permits saving unverified bytes.
-      const blob = verified && !failed ? await verifiedAttachmentBlob(att, att.url, undefined, opts)
+      const blob = verified && !unverified ? await verifiedAttachmentBlob(att, att.url, undefined, opts)
         : new Blob([await fetchFileBytes(att.url, opts)], { type: att.mime });
       request.signal.throwIfAborted();
       const ok = await saveBlob(blob, att.name);
@@ -77,8 +77,9 @@ function useSave(att: Attachment, verified: boolean) {
 function DownloadButton({ att, verified }: { att: Attachment; verified: boolean }) {
   const t = useT();
   const { busy, run, failed } = useSave(att, verified);
+  // After a failed check the same button is relabeled as an unverified download.
   return (
-    <IconButton label={failed || !verified ? t("file.downloadUnverified") : t("file.download")} size="sm" onClick={() => void run()} disabled={busy}>
+    <IconButton label={failed || !verified ? t("file.downloadUnverified") : t("file.download")} size="sm" onClick={() => void run(failed || !verified)} disabled={busy}>
       {busy ? <Loader2 className="size-4 animate-spin" /> : failed ? <X className="size-4 text-danger" /> : <Download className="size-4" />}
     </IconButton>
   );
@@ -179,7 +180,7 @@ function FileCard({ att, verified }: { att: Attachment; verified: boolean }) {
         </span>
         <span role={failed ? "alert" : undefined} className="block text-xs text-subtle">{failed ? t("file.notVerified") : formatBytes(att.size)}</span>
       </span>
-      <IconButton label={failed || !verified ? t("file.downloadUnverifiedNamed", { name: att.name }) : t("file.downloadNamed", { name: att.name })} onClick={() => void run()} disabled={busy}>
+      <IconButton label={failed || !verified ? t("file.downloadUnverifiedNamed", { name: att.name }) : t("file.downloadNamed", { name: att.name })} onClick={() => void run(failed || !verified)} disabled={busy}>
         {busy ? <Loader2 className="size-4 animate-spin" /> : <Download className="size-4" />}
       </IconButton>
     </div>
@@ -211,7 +212,7 @@ export function Lightbox({ attachment, verified }: { attachment: Attachment; ver
   const name = attachment.name;
   const t = useT();
   const close = useUi((s) => s.closeDialog);
-  const { busy, run } = useSave(attachment, verified);
+  const { busy, run, failed: saveFailed } = useSave(attachment, verified);
   return (
     <DialogPrimitive.Root open onOpenChange={(o) => !o && close()}>
       <DialogPrimitive.Portal>
@@ -233,9 +234,16 @@ export function Lightbox({ attachment, verified }: { attachment: Attachment; ver
           <img src={url || undefined} alt={name} className="max-h-[calc(100dvh-8rem)] max-w-full rounded-lg object-contain shadow-pop" />
           <div className="flex items-center gap-2 rounded-lg border border-line-strong bg-raised px-3 py-1.5 text-sm">
             <span className="max-w-[50vw] truncate text-muted">{name}</span>
-            <IconButton label={t("file.saveImage")} size="sm" onClick={() => void run()} disabled={busy}>
+            {saveFailed && verified && <span role="alert" className="text-xs text-danger">{t("file.notVerified")}</span>}
+            {/* Saving retries the check; unverified bytes need the separate, labeled action. */}
+            <IconButton label={verified ? t("file.saveImage") : t("file.downloadUnverified")} size="sm" onClick={() => void run(!verified)} disabled={busy}>
               <Download className="size-4" />
             </IconButton>
+            {saveFailed && verified && (
+              <Tooltip label={t("file.unverifiedRisk")}>
+                <Button size="sm" variant="ghost" className="underline" onClick={() => void run(true)} disabled={busy}>{t("file.downloadUnverified")}</Button>
+              </Tooltip>
+            )}
             <DialogPrimitive.Close asChild>
               <IconButton label={t("common.close")} size="sm">
                 <X className="size-4" />

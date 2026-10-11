@@ -9,7 +9,7 @@ import type { Attachment } from "../proto/Attachment";
 import { sha256 } from "../net/message-signature";
 import { fetchFileBytes, saveBlob } from "../platform/download";
 import { useSession } from "../state/stores";
-import { AttachmentList } from "./Attachments";
+import { AttachmentList, Lightbox } from "./Attachments";
 import { TooltipProvider } from "./kit";
 vi.mock("../platform/download", () => ({ MAX_FILE_BYTES: 30 * 1024 * 1024, fetchFileBytes: vi.fn(), saveBlob: vi.fn(async () => true) }));
 
@@ -54,6 +54,24 @@ describe("attachment trust", () => {
     });
     it(`does not fetch pending ${mime}`, async () => { await show(await media(mime), null); expect(fetchFileBytes).not.toHaveBeenCalled(); expect(container.querySelector(tag)).toBeNull(); });
   }
+  it("a lightbox retry verifies again; substituted bytes are saved only through the labeled action", async () => {
+    const att = await media("image/png");
+    const substituted = new TextEncoder().encode("evil!");
+    vi.mocked(fetchFileBytes).mockResolvedValueOnce(bytes).mockResolvedValue(substituted);
+    vi.stubGlobal("createImageBitmap", undefined);
+    await act(async () => { root.render(<TooltipProvider><Lightbox attachment={att} verified /></TooltipProvider>); });
+    const save = () => document.querySelector<HTMLButtonElement>('button[aria-label="Save image"]')!;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      await act(async () => save().click());
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    }
+    expect(saveBlob).not.toHaveBeenCalled();
+    expect(document.body.textContent).toContain("Attachment verification failed");
+    const unverified = [...document.querySelectorAll("button")].find((b) => b.textContent === "Download unverified attachment")!;
+    await act(async () => unverified.click());
+    await vi.waitFor(() => expect(saveBlob).toHaveBeenCalledOnce());
+    expect(await (vi.mocked(saveBlob).mock.calls[0]![0] as unknown as Blob).text()).toBe("evil!");
+  });
   it("does not fetch unsigned images or create an image element", async () => { await show(await media("image/png", ""), false); expect(container.querySelector("img")).toBeNull(); expect(fetchFileBytes).not.toHaveBeenCalled(); });
   it("downloads only matching signed bytes, then permits explicitly labeled unverified saving after failure", async () => {
     await show(await media("text/plain", "wrong"), true);
