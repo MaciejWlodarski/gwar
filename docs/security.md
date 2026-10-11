@@ -116,7 +116,12 @@ Connect has a **service key** and signs
 days. Servers fetch these attestations and pass them on. The client gets the
 service key **only** from its own configured Connect URL, checks the signature,
 the expiry and that the account key derives to the member's uid, and only then
-shows `@handle` and the badge. A server cannot invent a handle for anyone.
+shows `@handle` and the badge. A server cannot invent a handle for anyone. A
+shown badge goes away when its attestation expires: the validity window is
+checked again on every render, at expiry, every 30 seconds and whenever the
+page is focused or visible again. After a clock change or sleep it stays only
+until the next of these runs; a browser that delays or suspends the page's
+timers delays that too.
 
 Nicknames are the server's word. Next to a nickname that is not the handle
 itself, the badge shows the verified `@handle` in full, so the check mark never

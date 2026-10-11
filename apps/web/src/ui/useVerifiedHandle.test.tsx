@@ -100,3 +100,34 @@ it("a changed attestation or uid hides the old result at once, while the new che
   await show({ ...m, connect: { ...m.connect!, handle: "mallory" } }); expect(div.textContent).toBe("none");
   await show({ ...m, uid: "other" }); expect(div.textContent).toBe("none");
 });
+it("the expiry timer's clamp withdraws a very long-lived badge early, never late", async () => {
+  const m = await shown(NOW + 3_000_000_000);
+  act(() => { vi.advanceTimersByTime(2_147_483_647); });
+  expect(Date.now()).toBeLessThan(m.connect!.expires_at);
+  expect(div.textContent).toBe("none");
+});
+it("a withdrawn badge leaves no timers or listeners behind (Astra r7 follow-up)", async () => {
+  const added = vi.spyOn(window, "addEventListener"), removed = vi.spyOn(window, "removeEventListener");
+  await shown();
+  expect(vi.getTimerCount()).toBe(2);
+  await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+  expect(div.textContent).toBe("none");
+  expect(vi.getTimerCount()).toBe(0);
+  const names = (spy: typeof added) => spy.mock.calls.map(([name]) => name).filter((n) => n === "focus" || n === "pageshow").sort();
+  expect(names(removed)).toEqual(names(added));
+});
+for (const [target, event] of [["window", "focus"], ["window", "pageshow"], ["document", "visibilitychange"]] as const) {
+  it(`coming back (${event}) rechecks at once, before any timer fires`, async () => {
+    await shown();
+    vi.setSystemTime(NOW + 60_001);
+    act(() => { (target === "window" ? window : document).dispatchEvent(new Event(event)); });
+    expect(div.textContent).toBe("none");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+}
+it("unmounting a shown badge clears its timers", async () => {
+  await shown();
+  await act(async () => root.unmount());
+  expect(vi.getTimerCount()).toBe(0);
+  root = createRoot(div); // for afterEach
+});
