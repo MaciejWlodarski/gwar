@@ -83,6 +83,20 @@ fn media_type(header: &[u8]) -> Option<&'static str> {
     None
 }
 
+/// An upload's bytes must keep coming (at most this long between chunks) and be
+/// complete within the deadline, the same window a reservation waits for them.
+const UPLOAD_IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+const UPLOAD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The next chunk of an upload, or `REQUEST_TIMEOUT` when the sender stalls or runs out of time.
+async fn paced<S: futures::Stream + Unpin>(
+    stream: &mut S,
+    deadline: tokio::time::Instant,
+) -> Result<Option<S::Item>, StatusCode> {
+    let wait = UPLOAD_IDLE.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+    tokio::time::timeout(wait, stream.next()).await.map_err(|_| StatusCode::REQUEST_TIMEOUT)
+}
+
 pub async fn upload(
     State(gateway): State<Gateway>,
     Path(id): Path<String>,
@@ -105,7 +119,14 @@ pub async fn upload(
         let mut hash = Sha256::new();
         let mut header = Vec::with_capacity(SNIFF);
         let mut stream = body.into_data_stream();
-        while let Some(chunk) = stream.next().await {
+        // A slow or stalled sender cannot hold the upload (and its file) open for long.
+        let deadline = tokio::time::Instant::now() + UPLOAD_DEADLINE;
+        loop {
+            let next = match paced(&mut stream, deadline).await {
+                Ok(next) => next,
+                Err(status) => return Ok(Err(status)),
+            };
+            let Some(chunk) = next else { break };
             let chunk = chunk.map_err(std::io::Error::other)?;
             written += chunk.len() as u64;
             if written > slot.size {
@@ -242,8 +263,35 @@ async fn serve_file(mut handle: tokio::fs::File, mime: &str, name: &str, request
 mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
 
-    use super::{byte_range, media_type, serve_file, valid_id};
+    use super::{UPLOAD_DEADLINE, UPLOAD_IDLE, byte_range, media_type, paced, serve_file, valid_id};
+    use axum::http::StatusCode;
     use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_or_dripping_uploads_time_out() {
+        let start = tokio::time::Instant::now();
+        let deadline = start + UPLOAD_DEADLINE;
+        let mut stalled = futures::stream::pending::<u8>();
+        assert_eq!(paced(&mut stalled, deadline).await, Err(StatusCode::REQUEST_TIMEOUT));
+        assert_eq!(start.elapsed(), UPLOAD_IDLE);
+
+        // One byte every 20 s never stalls, but the whole upload has a deadline.
+        let start = tokio::time::Instant::now();
+        let deadline = start + UPLOAD_DEADLINE;
+        let mut drip = Box::pin(futures::stream::unfold((), |()| async {
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            Some((1u8, ()))
+        }));
+        let mut received = 0;
+        while received < 100 && paced(&mut drip, deadline).await.is_ok() {
+            received += 1;
+        }
+        assert_eq!(start.elapsed(), UPLOAD_DEADLINE, "after {received} chunks");
+        // An honest stream ends normally.
+        let mut done = futures::stream::iter([1u8]);
+        assert_eq!(paced(&mut done, deadline + UPLOAD_DEADLINE).await, Ok(Some(1)));
+        assert_eq!(paced(&mut done, deadline + UPLOAD_DEADLINE).await, Ok(None));
+    }
 
     #[tokio::test]
     async fn ranges_stream_only_the_slice_and_keep_security_headers() {

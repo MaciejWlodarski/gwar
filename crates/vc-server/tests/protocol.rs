@@ -1035,3 +1035,20 @@ async fn request_bursts_are_rate_limited() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     a.sync().await;
 }
+
+#[tokio::test]
+async fn malformed_floods_use_up_the_allowance_and_then_the_connection() {
+    let server = TestServer::start().await;
+    let mut a = Client::connect(&server, "alice").await;
+    // Garbage is charged like any request: after it, a real request is refused...
+    for _ in 0..40 {
+        a.send_raw("{").await;
+    }
+    let id = a.send("ping", json!({})).await;
+    assert_eq!(a.reply(id).await.unwrap_err().code, vc_proto::ErrorCode::RateLimited);
+    // ...and a client that keeps going past the limit is dropped.
+    for _ in 0..200 {
+        a.send_raw("{").await;
+    }
+    assert_eq!(a.expect_disconnect().await["kind"], "timeout");
+}

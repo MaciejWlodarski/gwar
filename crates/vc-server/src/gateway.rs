@@ -49,6 +49,9 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 const MAX_FRAME: usize = 96 * 1024;
 const RATE_BURST: f64 = 40.0;
+/// Refused frames in a row (each still answered) after which the connection is dropped:
+/// refusing costs work too, so a client that ignores `rate_limited` is cut off.
+const RATE_OVERRUN: u32 = 80;
 const RATE_PER_SEC: f64 = 20.0;
 
 pub async fn upgrade(
@@ -303,6 +306,7 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
     let mut writer_done = false;
     let mut tokens = RATE_BURST;
     let mut refilled = Instant::now();
+    let mut refused = 0u32;
     let reason = loop {
         let raw = tokio::select! {
             raw = next_text(&mut stream, IDLE_TIMEOUT) => raw,
@@ -317,6 +321,18 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
         let now = Instant::now();
         tokens = (tokens + now.duration_since(refilled).as_secs_f64() * RATE_PER_SEC).min(RATE_BURST);
         refilled = now;
+        // Every frame costs a token, malformed ones too.
+        let allowed = tokens >= 1.0;
+        if allowed {
+            tokens -= 1.0;
+            refused = 0;
+        } else {
+            refused += 1;
+            if refused > RATE_OVERRUN {
+                debug!(session, "dropping a connection that keeps sending past the rate limit");
+                break LeaveReason::Timeout;
+            }
+        }
         let frame = match serde_json::from_str::<ClientFrame>(&raw) {
             Ok(frame) => frame,
             Err(e) => {
@@ -332,14 +348,13 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
                 continue;
             }
         };
-        if tokens < 1.0 {
+        if !allowed {
             let reply = ServerFrame::Err { re: frame.id, err: ErrorBody::new(ErrorCode::RateLimited, "slow down") };
             if out.try_send(Outbound::Frame(encode(&reply))).is_err() {
                 break LeaveReason::Timeout;
             }
             continue;
         }
-        tokens -= 1.0;
         gateway.core.request(session, frame.id, frame.request).await;
     };
     gateway.core.disconnect(session, reason).await;
