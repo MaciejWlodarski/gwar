@@ -238,6 +238,11 @@ const MIGRATIONS: &[&str] = &[
     CREATE TABLE channel_counter (id INTEGER PRIMARY KEY CHECK (id = 0), last INTEGER NOT NULL);
     INSERT INTO channel_counter VALUES (0, COALESCE((SELECT MAX(id) FROM channels), 0));
     "#,
+    // Invites belong to the identity that made them; `created_by` is only the name shown.
+    // Older invites have no owner and are left to server managers.
+    r#"
+    ALTER TABLE invites ADD COLUMN creator_uid TEXT;
+    "#,
 ];
 
 /// References reassigned by a member merge (including ones already held by the target).
@@ -683,6 +688,7 @@ impl Store {
         )?;
         tx.execute("DELETE FROM message_mentions WHERE uid=?1 AND message IN (SELECT id FROM messages WHERE signature IS NULL)", [from])?;
         report.bans = tx.execute("UPDATE bans SET uid=?2 WHERE uid=?1", params![from, into])?;
+        tx.execute("UPDATE invites SET creator_uid=?2 WHERE creator_uid=?1", params![from, into])?;
         // bans.by and invites.created_by are display-name snapshots, not identity references.
         // Revoked devices belong to cryptographic account keys and must never be reassigned.
         tx.execute(
@@ -1012,27 +1018,30 @@ impl Store {
 
     // -------------------------------------------------------------- invites
 
-    pub fn insert_invite(&self, invite: &Invite) -> Result<()> {
+    pub fn insert_invite(&self, invite: &Invite, creator_uid: &str) -> Result<()> {
         self.db.execute(
-            "INSERT INTO invites(code,group_id,max_uses,uses,expires_at,created_by,created_at)
-             VALUES(?1,?2,?3,0,?4,?5,?6)",
+            "INSERT INTO invites(code,group_id,max_uses,uses,expires_at,created_by,created_at,creator_uid)
+             VALUES(?1,?2,?3,0,?4,?5,?6,?7)",
             params![
                 invite.code,
                 invite.group,
                 invite.max_uses,
                 invite.expires_at,
                 invite.created_by,
-                invite.created_at
+                invite.created_at,
+                creator_uid
             ],
         )?;
         Ok(())
     }
 
-    pub fn invites(&self) -> Result<Vec<Invite>> {
+    /// Every invite, or with `creator` only the ones that identity made.
+    pub fn invites(&self, creator: Option<&str>) -> Result<Vec<Invite>> {
         let mut stmt = self.db.prepare(
-            "SELECT code,uses,max_uses,expires_at,group_id,created_by,created_at FROM invites ORDER BY created_at DESC",
+            "SELECT code,uses,max_uses,expires_at,group_id,created_by,created_at FROM invites
+             WHERE ?1 IS NULL OR creator_uid=?1 ORDER BY created_at DESC",
         )?;
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map([creator], |r| {
             Ok(Invite {
                 code: r.get(0)?,
                 uses: r.get(1)?,
@@ -1073,8 +1082,12 @@ impl Store {
             .optional()?)
     }
 
-    pub fn delete_invite(&self, code: &str) -> Result<bool> {
-        Ok(self.db.execute("DELETE FROM invites WHERE code=?1", [code])? > 0)
+    /// Deletes an invite; with `creator` only one that identity made.
+    pub fn delete_invite(&self, code: &str, creator: Option<&str>) -> Result<bool> {
+        Ok(self
+            .db
+            .execute("DELETE FROM invites WHERE code=?1 AND (?2 IS NULL OR creator_uid=?2)", params![code, creator])?
+            > 0)
     }
 }
 
@@ -1218,6 +1231,11 @@ mod tests {
         assert!(newest > first);
     }
 
+    /// Index of the migration containing `sql`: a database before it is "the previous release".
+    fn migration_adding(sql: &str) -> usize {
+        MIGRATIONS.iter().position(|m| m.contains(sql)).expect("migration exists")
+    }
+
     #[test]
     fn channel_ids_never_repeat_after_deleting_the_newest() {
         let store = Store::in_memory().unwrap();
@@ -1228,10 +1246,11 @@ mod tests {
         let reopened = Store::init({
             let db = Connection::open_in_memory().unwrap();
             db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-            for migration in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+            let before = migration_adding("CREATE TABLE channel_counter");
+            for migration in &MIGRATIONS[..before] {
                 db.execute_batch(migration).unwrap();
             }
-            db.pragma_update(None, "user_version", MIGRATIONS.len() - 1).unwrap();
+            db.pragma_update(None, "user_version", before).unwrap();
             db.execute_batch("INSERT INTO channels(id,name) VALUES(41,'old');").unwrap();
             db
         })
@@ -1261,10 +1280,11 @@ mod tests {
     fn message_counter_migration_starts_after_existing_messages() {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        for migration in &MIGRATIONS[..MIGRATIONS.len() - 2] {
+        let before = migration_adding("CREATE TABLE message_counter");
+        for migration in &MIGRATIONS[..before] {
             db.execute_batch(migration).unwrap();
         }
-        db.pragma_update(None, "user_version", MIGRATIONS.len() - 2).unwrap();
+        db.pragma_update(None, "user_version", before).unwrap();
         db.execute_batch(
             "INSERT INTO channels(id,name) VALUES(1,'c');
              INSERT INTO messages(id,channel,author_uid,author_name,text,sent_at) VALUES (41,1,'u','n','x',1);",
@@ -1370,6 +1390,29 @@ mod tests {
         assert!(store.db.prepare("SELECT connect_checked_at FROM users").is_err());
         let version: usize = store.db.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(version, MIGRATIONS.len());
+    }
+
+    #[test]
+    fn invites_from_before_ownership_belong_to_nobody() {
+        let db = Connection::open_in_memory().unwrap();
+        let before = migration_adding("ADD COLUMN creator_uid");
+        for migration in &MIGRATIONS[..before] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.pragma_update(None, "user_version", before).unwrap();
+        db.execute("INSERT INTO invites(code,uses,created_by,created_at) VALUES('old',0,'root',1)", []).unwrap();
+        let store = Store::init(db).unwrap();
+        // Whoever is called "root" now does not own it; only an unrestricted (manager) view sees it.
+        assert!(store.invites(Some("root")).unwrap().is_empty());
+        assert!(!store.delete_invite("old", Some("root")).unwrap());
+        assert_eq!(store.invites(None).unwrap()[0].code, "old");
+        let invite =
+            Invite { code: "new".into(), created_by: "Name".into(), ..store.invites(None).unwrap()[0].clone() };
+        store.insert_invite(&invite, "uid").unwrap();
+        assert_eq!(store.invites(Some("uid")).unwrap()[0].code, "new");
+        assert!(!store.delete_invite("new", Some("other")).unwrap());
+        assert!(store.delete_invite("new", Some("uid")).unwrap());
+        assert!(store.delete_invite("old", None).unwrap());
     }
 
     #[test]

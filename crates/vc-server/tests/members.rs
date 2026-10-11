@@ -465,15 +465,18 @@ fn merging_members_moves_all_identity_references_transactionally() {
         })
         .unwrap();
     store
-        .insert_invite(&vc_proto::Invite {
-            code: "invite".into(),
-            uses: 0,
-            max_uses: None,
-            expires_at: None,
-            group: Some(role),
-            created_by: "-legacy".into(),
-            created_at: 1,
-        })
+        .insert_invite(
+            &vc_proto::Invite {
+                code: "invite".into(),
+                uses: 0,
+                max_uses: None,
+                expires_at: None,
+                group: Some(role),
+                created_by: "-legacy".into(),
+                created_at: 1,
+            },
+            "-legacy",
+        )
         .unwrap();
     let connection = rusqlite::Connection::open(seeded.database()).unwrap();
     connection
@@ -540,7 +543,9 @@ fn merging_members_moves_all_identity_references_transactionally() {
     assert_eq!(std::fs::read(seeded.files().join("pending")).unwrap(), b"def");
     assert_eq!(store.bans(0).unwrap()[0].uid.as_deref(), Some("account"));
     assert_eq!(store.bans(0).unwrap()[0].by, "-legacy", "display-name snapshots stay unchanged");
-    assert_eq!(store.invites().unwrap()[0].created_by, "-legacy");
+    assert_eq!(store.invites(None).unwrap()[0].created_by, "-legacy");
+    assert!(store.invites(Some("-legacy")).unwrap().is_empty());
+    assert_eq!(store.invites(Some("account")).unwrap()[0].code, "invite", "the invite follows its owner");
     let account_key: String =
         connection.query_row("SELECT account_key FROM revoked_devices", [], |r| r.get(0)).unwrap();
     assert_eq!(account_key, "-legacy", "revocations stay bound to the original signing key");

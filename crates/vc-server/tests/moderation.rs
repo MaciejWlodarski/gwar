@@ -167,7 +167,31 @@ async fn members_create_invites_but_not_for_groups_above_them() {
     assert_eq!(alice.fails("invite.create", json!({"group": 1})).await, "forbidden");
     let code = invite["invite"]["code"].clone();
     alice.ok("invite.delete", json!({"code": code})).await;
-    assert_eq!(alice.fails("invite.delete", json!({"code": code})).await, "forbidden");
+    assert_eq!(alice.fails("invite.delete", json!({"code": code})).await, "not_found");
+}
+
+#[tokio::test]
+async fn invites_belong_to_their_creator_not_to_a_nickname() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let mods = group_id(&root.ok("group.create", json!({"name": "Mods", "permissions": ["client_kick"]})).await);
+    let invite = root.ok("invite.create", json!({"group": mods})).await;
+    let code = invite["invite"]["code"].clone();
+
+    // Anyone may take any nickname, including the admin's: it must not open the admin's invites.
+    let mut mallory = Client::connect(&server, "mallory").await;
+    let own = mallory.ok("invite.create", json!({})).await["invite"]["code"].clone();
+    mallory.ok("member.nickname", json!({"uid": mallory.welcome.uid, "nickname": "root"})).await;
+    let listed = mallory.ok("invite.list", json!({})).await;
+    assert_eq!(listed["invites"].as_array().unwrap().iter().map(|i| &i["code"]).collect::<Vec<_>>(), vec![&own]);
+    assert_eq!(listed["invites"][0]["created_by"], "mallory", "the shown name is the one at creation");
+    assert_eq!(mallory.fails("invite.delete", json!({"code": code})).await, "forbidden");
+
+    // Managers see and remove every invite.
+    let all = root.ok("invite.list", json!({})).await;
+    assert_eq!(all["invites"].as_array().unwrap().len(), 2);
+    root.ok("invite.delete", json!({"code": own})).await;
+    root.ok("invite.delete", json!({"code": code})).await;
 }
 
 // ------------------------------------------------------------- settings

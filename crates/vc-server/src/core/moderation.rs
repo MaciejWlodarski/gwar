@@ -394,35 +394,30 @@ impl Core {
             created_by: self.sessions[&session].nickname.clone(),
             created_at: now,
         };
-        self.store.insert_invite(&invite).map_err(storage_error)?;
+        self.store.insert_invite(&invite, &self.sessions[&session].uid).map_err(storage_error)?;
         Ok(Response::Invite { invite })
     }
 
     /// Everyone with `invite_create` sees the invites they made; managers see all.
+    /// Ownership is the creator's identity, never their (changeable) nickname.
     pub(super) fn invite_list(&mut self, session: SessionId) -> Reply {
         self.require(session, Permission::InviteCreate)?;
-        let all = self.has(session, Permission::ServerManage);
-        let me = self.sessions[&session].nickname.clone();
-        let invites =
-            self.store.invites().map_err(storage_error)?.into_iter().filter(|i| all || i.created_by == me).collect();
-        Ok(Response::Invites { invites })
+        let uid = self.sessions[&session].uid.clone();
+        let creator = (!self.has(session, Permission::ServerManage)).then_some(uid.as_str());
+        Ok(Response::Invites { invites: self.store.invites(creator).map_err(storage_error)? })
     }
 
     pub(super) fn invite_delete(&mut self, session: SessionId, code: &str) -> Reply {
         self.require(session, Permission::InviteCreate)?;
-        let mine = self
-            .store
-            .invites()
-            .map_err(storage_error)?
-            .into_iter()
-            .any(|i| i.code == code && i.created_by == self.sessions[&session].nickname);
-        if !mine && !self.has(session, Permission::ServerManage) {
+        let uid = self.sessions[&session].uid.clone();
+        let creator = (!self.has(session, Permission::ServerManage)).then_some(uid.as_str());
+        if self.store.delete_invite(code, creator).map_err(storage_error)? {
+            return Ok(Response::Empty {});
+        }
+        if creator.is_some() && self.store.invites(None).map_err(storage_error)?.iter().any(|i| i.code == code) {
             return Err(err(ErrorCode::Forbidden, "you can only delete your own invites"));
         }
-        if !self.store.delete_invite(code).map_err(storage_error)? {
-            return Err(err(ErrorCode::NotFound, "no such invite"));
-        }
-        Ok(Response::Empty {})
+        Err(err(ErrorCode::NotFound, "no such invite"))
     }
 
     // -------------------------------------------------------------- settings
