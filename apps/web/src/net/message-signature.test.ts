@@ -74,6 +74,21 @@ describe("adversarial message verification", () => {
     const f = await fixture(true); f.msg.signature!.certificate!.expires_at += 1;
     expect((await verifyMessage(f.msg, f.ctx)).status).toBe("invalid");
   });
+  it("fully verifies an edit signed after the device certificate was renewed", async () => {
+    const f = await fixture(true), store = storage(), verifier = new MessageVerifier(store);
+    vi.spyOn(Date, "now").mockReturnValue(now); await store.mergeFeed([], CONNECT_URL, now);
+    expect(fullyVerified(await verifier.verify(f.msg, f.ctx))).toBe(true);
+    // The old certificate has expired; the same device key carries a renewed one.
+    const later = now + 1500, renewed = { ...await certifyDevice(f.account, f.identity.publicKey, now + 500, now + 90 * 86_400_000), account_key: f.account.publicKey };
+    vi.spyOn(Date, "now").mockReturnValue(later);
+    const edit = { ...structuredClone(f.msg), text: "after renewal" };
+    edit.signature = await signMessage({ ...f.identity, device: renewed } as Identity, f.ctx, f.msg.author_uid, edit.text, [], [], f.msg.signature!);
+    expect(edit.signature.certificate_hash).not.toBe(f.msg.signature!.certificate_hash);
+    await store.mergeFeed([], CONNECT_URL, later);
+    const result = await verifier.verify(edit, f.ctx);
+    vi.restoreAllMocks();
+    expect(result).toMatchObject({ status: "verified", continuity: "proven", authorization: [] });
+  });
   it("rejects post-expiry edits and labels historical expiration separately", async () => {
     const f = await fixture(true), store = storage(); await store.mergeFeed([], CONNECT_URL, now);
     const historical = await verifyMessage(f.msg, f.ctx, store, now + 1001);

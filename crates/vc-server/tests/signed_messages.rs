@@ -375,3 +375,39 @@ async fn revoked_session_cannot_backdate_an_edit() {
     let history = observer.ok("chat.history", json!({"channel": channel})).await;
     assert_eq!(history["messages"][0]["text"], "original");
 }
+
+#[tokio::test]
+async fn edit_after_certificate_renewal_keeps_the_message_identity() {
+    let server = TestServer::start().await;
+    let account = new_key();
+    let device = new_key();
+    let connect = |cert: Value| {
+        Client::connect_with(&server, device.clone(), move |raw, key| {
+            let mut hello = raw.hello(key, "device", None);
+            set_certificate(&mut hello, cert, key);
+            hello
+        })
+    };
+    let mut alice = connect(certificate(&account, &device, now_ms() - 2000, now_ms() + 86_400_000)).await.unwrap();
+    let channel = alice.default_channel();
+    let target = format!("channel:{channel}");
+    let sig = alice.signature(&target, "before renewal", &[], &[]);
+    let id = alice.ok("chat.send", send(json!({"channel": channel}), "before renewal", &sig)).await["id"].clone();
+    drop(alice);
+
+    // The same device key, certified again with a new lifetime: a different certificate hash.
+    let mut alice = connect(certificate(&account, &device, now_ms() - 1000, now_ms() + 2 * 86_400_000)).await.unwrap();
+    let mut edit = sig.clone();
+    edit.certificate = alice.certificate.clone();
+    edit.certificate_hash = vc_proto::certificate_hash(alice.certificate.as_ref()).unwrap();
+    assert_ne!(edit.certificate_hash, sig.certificate_hash);
+    edit.revision = 1;
+    edit.previous_revision_hash = vc_proto::message_revision_hash(&sig);
+    edit.signed_at = now_ms();
+    alice.resign(&mut edit, &target, "after renewal", &[], &[]);
+    alice.ok("chat.edit", json!({"message": id, "text": "after renewal", "signature": edit})).await;
+    let mut observer = Client::connect(&server, "observer").await;
+    let history = observer.ok("chat.history", json!({"channel": channel})).await;
+    assert_eq!(history["messages"][0]["signature"], json!(edit));
+    assert_eq!(history["messages"][0]["text"], "after renewal");
+}
