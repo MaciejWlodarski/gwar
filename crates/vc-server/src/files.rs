@@ -110,15 +110,15 @@ async fn paced<S: futures::Stream + Unpin>(
 struct Abandoned {
     core: CoreHandle,
     id: String,
-    token: String,
+    attempt: u64,
     armed: bool,
 }
 
 impl Drop for Abandoned {
     fn drop(&mut self) {
         if self.armed {
-            let (core, id, token) = (self.core.clone(), std::mem::take(&mut self.id), std::mem::take(&mut self.token));
-            tokio::spawn(async move { core.upload_abort(id, token).await });
+            let (core, id, attempt) = (self.core.clone(), std::mem::take(&mut self.id), self.attempt);
+            tokio::spawn(async move { core.upload_abort(id, attempt).await });
         }
     }
 }
@@ -136,10 +136,11 @@ pub async fn upload(
 }
 
 async fn receive(core: CoreHandle, id: String, token: String, body: Body) -> Response {
-    let mut abandoned = Abandoned { core: core.clone(), id: id.clone(), token: token.clone(), armed: true };
-    let Some(slot) = core.upload_begin(id.clone(), token).await else {
-        // Not started by us: whoever did owns it.
-        abandoned.armed = false;
+    // This request's own name: another request with the same token can never give up ours.
+    static ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let attempt = ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut abandoned = Abandoned { core: core.clone(), id: id.clone(), attempt, armed: true };
+    let Some(slot) = core.upload_begin(id.clone(), token, attempt).await else {
         return (StatusCode::FORBIDDEN, "unknown or used upload").into_response();
     };
     let part = slot.path.with_extension("part");
