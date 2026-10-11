@@ -25,13 +25,15 @@ const Alert = ({ children }: { children: string }) => (
   </p>
 );
 
+type PublicEntry = Pick<TsEntry, "uid" | "name">;
+
 type Open =
   | { kind: "import" }
   | { kind: "generate" }
   | { kind: "find" }
-  | { kind: "rename"; entry: TsEntry }
+  | { kind: "rename"; entry: PublicEntry }
   | { kind: "export"; entry: TsEntry }
-  | { kind: "delete"; entry: TsEntry };
+  | { kind: "delete"; entry: PublicEntry };
 
 /** The unique id, shortened; a click copies the whole of it. */
 function CopyUid({ uid }: { uid: string }) {
@@ -61,7 +63,7 @@ function CopyUid({ uid }: { uid: string }) {
   );
 }
 
-function Row({ entry, level, isDefault, actions }: { entry: TsEntry; level?: number; isDefault: boolean; actions?: ReactNode }) {
+function Row({ entry, level, isDefault, actions }: { entry: PublicEntry; level?: number; isDefault: boolean; actions?: ReactNode }) {
   const t = useT();
   return (
     <li className="flex items-center gap-2 rounded-lg border border-line px-3 py-2">
@@ -171,7 +173,6 @@ export function TeamspeakIdentity({ onUnlock }: { onUnlock?: () => void }) {
               <Row
                 key={e.uid}
                 entry={e}
-                level={e.level}
                 isDefault={isDefault}
                 actions={
                   <div className="flex shrink-0 items-center">
@@ -186,7 +187,11 @@ export function TeamspeakIdentity({ onUnlock }: { onUnlock?: () => void }) {
                     >
                       <Star className="size-4" />
                     </IconButton>
-                    <IconButton label={t("ts.export")} size="sm" onClick={() => setOpen({ kind: "export", entry: e })}>
+                    <IconButton label={t("ts.export")} size="sm" onClick={() => void act(async () => {
+                      const list = await bridge.exportList("active", e.uid);
+                      const entry = list.identities[0];
+                      if (entry) setOpen({ kind: "export", entry });
+                    })}>
                       <Download className="size-4" />
                     </IconButton>
                     <IconButton label={t("ts.delete")} size="sm" tone="danger" disabled={locked} onClick={() => setOpen({ kind: "delete", entry: e })}>
@@ -393,7 +398,7 @@ function FindFlow({ bridge, known, onClose }: { bridge: TsBridge; known: Readonl
   return <FoundDialog mode="find" found={found} error={error} known={known} busy={busy} onConfirm={(c) => void add(c)} onCancel={onClose} />;
 }
 
-function RenameDialog({ entry, onClose }: { entry: TsEntry; onClose: () => void }) {
+function RenameDialog({ entry, onClose }: { entry: PublicEntry; onClose: () => void }) {
   const t = useT();
   const [name, setName] = useState(entry.name);
   const [error, setError] = useState<string | null>(null);
@@ -434,7 +439,7 @@ function RenameDialog({ entry, onClose }: { entry: TsEntry; onClose: () => void 
   );
 }
 
-function DeleteDialog({ entry, signedIn, onClose }: { entry: TsEntry; signedIn: boolean; onClose: () => void }) {
+function DeleteDialog({ entry, signedIn, onClose }: { entry: PublicEntry; signedIn: boolean; onClose: () => void }) {
   const t = useT();
   const toast = useUi((s) => s.toast);
   const [error, setError] = useState<string | null>(null);

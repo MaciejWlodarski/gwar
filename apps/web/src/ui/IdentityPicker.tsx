@@ -1,9 +1,9 @@
 import { useT } from "../i18n";
-import { resolveIdentity, type TsList } from "../connect/ts-list";
+import { resolveIdentity, type TsPublicList } from "../connect/ts-list";
 import { Field, Select } from "./kit";
 
 /** Which TeamSpeak identity to connect with. `value` null (or a uid that is gone) shows the default one. */
-export function IdentityPicker({ list, value, onChange }: { list: TsList; value: string | null | undefined; onChange: (uid: string) => void }) {
+export function IdentityPicker({ list, value, onChange }: { list: TsPublicList; value: string | null | undefined; onChange: (uid: string) => void }) {
   const t = useT();
   return (
     <Field label={t("connect.tsIdentity")}>

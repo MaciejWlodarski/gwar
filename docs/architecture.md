@@ -184,6 +184,57 @@ therefore have different TS suffixes while retaining the same Gwar nickname.
   `vc-client` (cpal, Opus with FEC, jitter buffer with PLC), global
   push-to-talk, tray.
 
+### Native command surface
+
+Only the local `main` webview has capabilities; there is no remote URL grant.
+It can listen/unlisten to native events and request/show notifications. Broad
+`core:default`, renderer dialog APIs, filesystem, shell and general HTTP plugin
+permissions are absent. Custom commands below are app-owned IPC and need their
+own validation. A compromised renderer still has audio, TeamSpeak networking
+and identity-write access; CSP and frame validation reduce that exposure.
+
+| Command | Risk and boundary |
+| --- | --- |
+| `voice_start` | High: native UDP/WebRTC and microphone; selected server host, one run. |
+| `voice_answer` | High: remote SDP/ICE reaches native WebRTC; current run only. |
+| `voice_stop` | Low: stops audio. |
+| `voice_set_muted` | Medium: changes microphone transmission. |
+| `voice_set_deafened` | Low: changes playback. |
+| `voice_set_ptt` | Medium: opens/closes microphone transmission. |
+| `voice_set_input_mode` | Medium: changes microphone gate. |
+| `voice_set_master_gain` | Low: changes playback gain. |
+| `voice_set_slot_gain` | Low: changes per-speaker playback gain. |
+| `voice_set_devices` | Medium: selects native input/output devices. |
+| `audio_devices` | Low: device-name metadata. |
+| `mic_test_start` | Medium: opens microphone for a local meter. |
+| `mic_test_stop` | Low: stops microphone test. |
+| `open_mic_privacy_settings` | Low: opens a fixed OS settings URI. |
+| `files_set_server` | High: sets native allowed origin from the locally selected connection; clears old requests, pins DNS, bounds upload limit. |
+| `files_cancel` | Low: cancels a file request by ID. |
+| `fetch_file` | Medium: bounded GET of the stored origin's download route; no redirects or proxy. |
+| `save_file_as` | Medium: bounded GET, native save dialog and write to the chosen path; no write until fetch succeeds. |
+| `upload_put` | Medium: bounded PUT of the stored origin's one-use upload route; no redirects. |
+| `set_global_shortcut` | Medium: registers supported audio actions with the OS. |
+| `ts_connect` | High: native UDP connection and private identity use; JS passes a public UID, Rust loads the key directly. |
+| `ts_request` | High: typed TeamSpeak operations on the current native session. |
+| `ts_disconnect` | Low: closes the matching native session. |
+| `ts_identity_list` | Low: source/default, UID and name only; no private identity text. |
+| `ts_identity_parse` | Medium: bounded parsing of caller-supplied private text; reads no stored key. |
+| `ts_identity_generate` | Medium: creates a new unstored key for explicit import/vault flows. |
+| `ts_identity_set_list` | High: replaces a bounded native list; public UID references preserve stored keys without returning them. |
+| `ts_identity_detect` | High: discovers official-client private keys only after a Rust-owned native confirmation. |
+| `ts_identity_export` | High: exposes selected/list private keys, including vault seeding, only after a Rust-owned native confirmation. |
+| `tray_set_state` | Low: updates mute/deafen indicators. |
+| `set_close_to_tray` | Low: changes close behavior. |
+| `debug_autoconnect` | Low: reads one dedicated environment setting in debug builds; returns nothing in release. |
+| `debug_log` | Low: debug log text; no effect in release. |
+
+Unused `debug_snapshot` IPC and file-driven webview evaluation were removed.
+Confirmed export/vault sync still passes private TeamSpeak text to JS for vault
+encryption; routine listing, selection, metadata edits and connection do not.
+This change does not move the Gwar signing keys or decrypted account vault into
+native protected storage.
+
 ## Files
 
 `GET /files/{random-id}/{name}` is a bearer capability: anyone who knows the

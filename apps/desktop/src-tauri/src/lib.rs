@@ -17,9 +17,6 @@ use tauri::{Manager, WindowEvent};
 /// Debug-only hooks used by automated verification. They are compiled out of
 /// release builds (the commands exist but answer with nothing).
 mod debug {
-    use tauri::State;
-
-    use crate::voice::{Snapshot, Voice};
 
     /// `VC_AUTOCONNECT="address|kind"` makes the UI connect on startup.
     #[tauri::command]
@@ -32,35 +29,6 @@ mod debug {
         if cfg!(debug_assertions) {
             tracing::info!(target: "ui", "{message}");
         }
-    }
-
-    /// Debug builds with `VC_DEBUG_EVAL_FILE=<path>`: whenever the file changes,
-    /// run its contents in the main webview (scripted UI checks).
-    pub fn watch_eval_file(app: tauri::AppHandle) {
-        use tauri::Manager;
-        let Some(path) = cfg!(debug_assertions).then(|| std::env::var("VC_DEBUG_EVAL_FILE").ok()).flatten() else {
-            return;
-        };
-        std::thread::spawn(move || {
-            let mut last = None;
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(300));
-                let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else { continue };
-                if last == Some(modified) {
-                    continue;
-                }
-                last = Some(modified);
-                if let (Ok(js), Some(window)) = (std::fs::read_to_string(&path), app.get_webview_window("main")) {
-                    tracing::info!(target: "ui", "eval {} bytes", js.len());
-                    let _ = window.eval(js);
-                }
-            }
-        });
-    }
-
-    #[tauri::command]
-    pub fn debug_snapshot(voice: State<'_, Voice>) -> Option<Snapshot> {
-        cfg!(debug_assertions).then(|| voice.snapshot())
     }
 }
 
@@ -89,7 +57,6 @@ pub fn run() {
         .manage(tray::CloseToTray(AtomicBool::new(true)))
         .setup(|app| {
             tray::install(app.handle())?;
-            debug::watch_eval_file(app.handle().clone());
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -130,11 +97,11 @@ pub fn run() {
             ts_identity::ts_identity_generate,
             ts_identity::ts_identity_set_list,
             ts_identity::ts_identity_detect,
+            ts_identity::ts_identity_export,
             tray::tray_set_state,
             tray::set_close_to_tray,
             debug::debug_autoconnect,
             debug::debug_log,
-            debug::debug_snapshot,
         ]);
 
     builder.build(tauri::generate_context!()).expect("error while building the Voice app").run(|app, event| {

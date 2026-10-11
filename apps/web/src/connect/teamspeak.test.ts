@@ -25,7 +25,12 @@ class FakeDesktop implements TsBridge {
     await this.onList?.();
     const account = which === "active" ? this.account : null;
     const used = account ?? this.device;
-    return { source: account ? "account" : "device", default: used.default, identities: used.identities.map((e) => ({ ...e, level: 8 })) };
+    return { source: account ? "account" : "device", default: used.default, identities: used.identities.map((e) => ({ uid: e.uid, name: e.name })) };
+  }
+  async exportList(which: "active" | "device", uid?: string): Promise<TsList> {
+    await this.list(which);
+    const used = which === "active" ? this.account ?? this.device : this.device;
+    return { default: used.default, identities: used.identities.filter((e) => !uid || e.uid === uid) };
   }
   async parse(): Promise<never> {
     throw new Error("not used");
@@ -36,7 +41,7 @@ class FakeDesktop implements TsBridge {
   }
   async setList(which: "account" | "device", next: TsList | null) {
     this.calls.push(`setList:${which}:${next ? next.identities.map((e) => e.uid).join(",") + `;${next.default}` : "null"}`);
-    if (which === "device") this.device = next!;
+    if (which === "device") this.device = next! && { ...next, identities: next.identities.map((e) => ({ ...e, identity: e.identity === `native:${e.uid}` ? this.device.identities.find((saved) => saved.uid === e.uid)!.identity : e.identity })) };
     else this.account = next;
   }
   async detect() {
@@ -202,7 +207,8 @@ describe("changeIdentities", () => {
   it("signed out: only this device's own list changes", async () => {
     const { api, ts } = await signedIn("ts.device");
     const next = await changeIdentities(api, undefined, ts, (l) => deleteEntry(add(entry("c"))(l), "own1"));
-    expect(next).toEqual({ default: "own2", identities: [entry("own2"), entry("c")] });
+    expect(next).toEqual({ default: "own2", identities: [{ ...entry("own2"), identity: "native:own2" }, entry("c")] });
+    expect(ts.device).toEqual({ default: "own2", identities: [entry("own2"), entry("c")] });
     expect(ts.calls).toEqual(["list:device", "setList:device:own2,c;own2"]);
     expect(ts.account).toBeNull();
   }, 30_000);

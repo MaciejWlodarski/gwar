@@ -20,9 +20,7 @@ import { loadVault, updateVault, vaultList, withTeamspeakList } from "./vault";
 /** Most servers refuse identities below this security level. */
 export const MIN_LEVEL = 8;
 
-export interface TsEntryInfo extends TsEntry {
-  level: number;
-}
+export type TsEntryInfo = Pick<TsEntry, "uid" | "name">;
 
 export interface TsListInfo {
   /** Which list the desktop is using for TeamSpeak connections. */
@@ -52,6 +50,8 @@ export interface TsBridge {
   list(which: "active" | "device"): Promise<TsListInfo>;
   /** Reads a bare identity string or the text of an identity `.ini`; rejects with a readable message. */
   parse(text: string): Promise<TsParsed>;
+  /** Native consent before any stored private keys reach the webview. */
+  exportList(which: "active" | "device", uid?: string): Promise<TsList>;
   /** Makes a new identity without storing it. */
   generate(): Promise<TsParsed>;
   /** Replaces the account's or the device's list (the old device list is kept as a backup); null removes the account's. */
@@ -62,12 +62,13 @@ export interface TsBridge {
 
 export const desktopTsBridge: TsBridge = {
   list: async (which) => (await tauri()).invoke<TsListInfo>("ts_identity_list", { which }),
+  exportList: async (which, uid) => (await tauri()).invoke<TsList>("ts_identity_export", { which, uid }),
   parse: async (text) => (await tauri()).invoke<TsParsed>("ts_identity_parse", { text }),
   generate: async () => (await tauri()).invoke<TsParsed>("ts_identity_generate"),
   setList: async (which, list) =>
     (await tauri()).invoke("ts_identity_set_list", {
       which,
-      list: list && { default: list.default, identities: list.identities.map(({ name, identity }) => ({ name, identity })) },
+      list: list && { default: list.default, identities: list.identities.map(({ uid, name, identity }) => ({ uid, name, identity })) },
     }),
   detect: async () => (await tauri()).invoke<TsFound[]>("ts_identity_detect"),
 };
@@ -75,10 +76,10 @@ export const desktopTsBridge: TsBridge = {
 /** The desktop's bridge, or null in the browser. */
 export const tsBridge = (): TsBridge | null => (isDesktop() ? desktopTsBridge : null);
 
-/** The list without the levels. */
+/** Native key references for public metadata edits, never exported private text. */
 export const plainList = (info: TsListInfo): TsList => ({
   default: info.default,
-  identities: info.identities.map(({ uid, name, identity }) => ({ uid, name, identity })),
+  identities: info.identities.map(({ uid, name }) => ({ uid, name, identity: `native:${uid}` })),
 });
 
 /** A parsed identity as a list entry. */
@@ -94,7 +95,7 @@ export type SyncOutcome =
 
 /** The device's own list; if it has none, a new identity named "Default" is made and stored first. */
 async function deviceListOrNew(ts: TsBridge): Promise<TsList> {
-  const own = plainList(await ts.list("device"));
+  const own = await ts.exportList("device");
   if (own.identities.length > 0) return own;
   const made = await ts.generate();
   const list = addEntry(emptyList(), entryOf(made, DEFAULT_NAME)).list;
@@ -125,7 +126,7 @@ export async function refreshFromVault(api: ConnectApi, record: ConnectRecord, t
   const found = vaultList((await loadVault(api, record)).contents);
   if (found.identities.length === 0) return "empty";
   const info = await ts.list("active");
-  if (info.source === "account" && sameList(plainList(info), found)) return "unchanged";
+  if (info.source === "account" && info.default === found.default && JSON.stringify(info.identities.map(({ uid, name }) => ({ uid, name }))) === JSON.stringify(found.identities.map(({ uid, name }) => ({ uid, name })))) return "unchanged";
   await ts.setList("account", found);
   return "applied";
 }

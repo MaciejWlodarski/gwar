@@ -70,8 +70,10 @@ export function setDefault(list: TsList, uid: string): TsList {
  * The uid to connect with: the wanted one (a bookmark's, say) if it is still in the list,
  * otherwise the default. Null for an empty list.
  */
-export function resolveIdentity(list: TsList, wanted?: string | null): string | null {
-  return (wanted && list.identities.find((e) => e.uid === wanted)?.uid) || normalizeList(list).default;
+export type TsPublicList = { default: string | null; identities: Array<Pick<TsEntry, "uid" | "name">> };
+
+export function resolveIdentity(list: TsPublicList, wanted?: string | null): string | null {
+  return (wanted && list.identities.find((e) => e.uid === wanted)?.uid) || (list.identities.some((e) => e.uid === list.default) ? list.default : list.identities[0]?.uid ?? null);
 }
 
 /** True if both lists hold the same entries in the same order with the same default. */

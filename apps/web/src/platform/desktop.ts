@@ -117,7 +117,7 @@ async function debugAutoconnect(api: TauriBridge): Promise<void> {
   const [address = "", kindName = "vc"] = spec.split("|");
   const kind = kindName === "teamspeak" ? "teamspeak" : "vc";
   const log = (message: string) => void api.invoke("debug_log", { message }).catch(() => {});
-  // Handles for scripted checks (VC_DEBUG_EVAL_FILE); only exist in debug runs with autoconnect.
+
   Object.assign(window, { __vc: { controller, useSettings, useSession, useVoice, useUi, api, log } });
   log(`autoconnect ${address} as ${(await controller.getIdentity()).nickname} (${kind})`);
   useSession.subscribe((s, prev) => {

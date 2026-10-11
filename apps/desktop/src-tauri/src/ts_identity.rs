@@ -12,7 +12,7 @@
 //!
 //! Commands (the UI does the vault sync and every list edit, see `apps/web/src/connect/teamspeak.ts`):
 //!
-//! - `ts_identity_list {which}` (`active` or `device`) -> `{source, default, identities: [{uid, name, level, identity}]}`
+//! - `ts_identity_list {which}` (`active` or `device`) -> `{source, default, identities: [{uid, name}]}`
 //! - `ts_identity_parse {text}` -> `{identity, uid, level}`, nothing is stored
 //! - `ts_identity_generate` -> the same for a new identity, nothing is stored
 //! - `ts_identity_set_list {which, list}` replaces the `device` or `account` list with
@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use vc_client::{
     ts_identities::{self, DEFAULT_NAME, List},
     ts_identity::{self, Identity as TsIdentity},
@@ -112,6 +113,14 @@ impl Files {
     }
 
     fn set_list(&self, which: &str, list: Option<ListIn>) -> Result<(), String> {
+        if list.as_ref().is_some_and(|l| {
+            l.identities.len() > 128
+                || l.identities.iter().any(|e| {
+                    e.name.len() > 256 || e.identity.len() > 16384 || e.uid.as_ref().is_some_and(|u| u.len() > 128)
+                })
+        }) {
+            return Err("identity list too large".into());
+        }
         match (which, list) {
             ("device", Some(list)) => {
                 if self.device.exists() {
@@ -120,9 +129,13 @@ impl Files {
                     std::fs::copy(&self.device, PathBuf::from(backup))
                         .map_err(|e| format!("cannot back up the old identities: {e}"))?;
                 }
-                ts_identities::save(&self.device, &list.into_list()).map_err(err)
+                let next = list.resolve(self.list(Source::Device).map_err(err)?);
+                ts_identities::save(&self.device, &next).map_err(err)
             }
-            ("account", Some(list)) => ts_identities::save(&self.account, &list.into_list()).map_err(err),
+            ("account", Some(list)) => {
+                let next = list.resolve(self.list(Source::Account).map_err(err)?);
+                ts_identities::save(&self.account, &next).map_err(err)
+            }
             ("account", None) => {
                 for path in [&self.account, &self.account_legacy] {
                     match std::fs::remove_file(path) {
@@ -147,9 +160,6 @@ pub fn load_for_connect(app: &AppHandle, uid: Option<&str>) -> Result<TsIdentity
 pub struct EntryInfo {
     uid: String,
     name: String,
-    level: u8,
-    /// The secret key, `<counter>V<obfuscated key>`: the UI copies lists into the vault and exports from here.
-    identity: String,
 }
 
 #[derive(Serialize)]
@@ -161,22 +171,15 @@ pub struct ListInfo {
 }
 
 fn list_info(source: Source, list: List) -> ListInfo {
-    let identities = list
-        .identities
-        .into_iter()
-        .map(|e| EntryInfo {
-            level: e.identity().map_or(0, |i| i.level()),
-            uid: e.uid,
-            name: e.name,
-            identity: e.identity,
-        })
-        .collect();
+    let identities = list.identities.into_iter().map(|e| EntryInfo { uid: e.uid, name: e.name }).collect();
     ListInfo { source: source.name(), default: list.default, identities }
 }
 
 #[derive(Deserialize)]
 pub struct EntryIn {
     name: String,
+    #[serde(default)]
+    uid: Option<String>,
     identity: String,
 }
 
@@ -187,6 +190,18 @@ pub struct ListIn {
 }
 
 impl ListIn {
+    /// A public native reference means retain the native entry identified by its public uid.
+    fn resolve(mut self, existing: List) -> List {
+        for entry in &mut self.identities {
+            if entry.uid.as_ref().is_some_and(|uid| entry.identity == format!("native:{uid}"))
+                && let Some(saved) = entry.uid.as_deref().and_then(|uid| existing.find(uid))
+            {
+                entry.identity.clone_from(&saved.identity);
+            }
+        }
+        self.into_list()
+    }
+
     /// Unusable entries and repeated uids are dropped; the uids are worked out here, not trusted.
     fn into_list(self) -> List {
         List::from_texts(
@@ -223,6 +238,9 @@ pub async fn ts_identity_list(app: AppHandle, which: String) -> Result<ListInfo,
 
 #[tauri::command]
 pub fn ts_identity_parse(text: String) -> Result<ParsedIdentity, String> {
+    if text.len() > 16384 {
+        return Err("identity text too large".into());
+    }
     ts_identity::parse(&text).map(|i| parsed(&i)).map_err(err)
 }
 
@@ -236,9 +254,47 @@ pub async fn ts_identity_set_list(app: AppHandle, which: String, list: Option<Li
     tokio::task::spawn_blocking(move || files(&app)?.set_list(&which, list)).await.map_err(|e| e.to_string())?
 }
 
+async fn confirm(app: &AppHandle, message: &'static str) -> Result<(), String> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog().message(message).title("TeamSpeak private identities").buttons(MessageDialogButtons::OkCancel).show(
+        move |yes| {
+            let _ = tx.send(yes);
+        },
+    );
+    if !rx.await.map_err(|e| e.to_string())? {
+        return Err("cancelled".into());
+    }
+    Ok(())
+}
+
+/// The only read of stored private keys exposed to JS. Vault seeding needs the same consent.
 #[tauri::command]
-pub async fn ts_identity_detect() -> Vec<ts_import::Found> {
-    tokio::task::spawn_blocking(ts_import::detect_here).await.unwrap_or_default()
+pub async fn ts_identity_export(app: AppHandle, which: String, uid: Option<String>) -> Result<List, String> {
+    confirm(&app, "Allow Gwar to export private TeamSpeak identities? The web interface will receive secret keys for export or encrypted account sync.").await?;
+    tokio::task::spawn_blocking(move || {
+        let files = files(&app)?;
+        let mut list = match which.as_str() {
+            "active" => files.active().map_err(err)?.1,
+            "device" => files.list(Source::Device).map_err(err)?,
+            _ => return Err("unknown list".into()),
+        };
+        if let Some(uid) = uid {
+            list.identities.retain(|e| e.uid == uid);
+            if list.identities.is_empty() {
+                return Err("identity not found".into());
+            }
+            list.default = Some(uid);
+        }
+        Ok(list)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn ts_identity_detect(app: AppHandle) -> Result<Vec<ts_import::Found>, String> {
+    confirm(&app, "Allow Gwar to read private identities from this computer's TeamSpeak client settings? The web interface will receive secret keys for import.").await?;
+    tokio::task::spawn_blocking(ts_import::detect_here).await.map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -271,8 +327,40 @@ mod tests {
     fn list_in(items: &[(&str, &TsIdentity)], default: Option<&TsIdentity>) -> ListIn {
         ListIn {
             default: default.map(uid),
-            identities: items.iter().map(|(name, i)| EntryIn { name: (*name).into(), identity: export(i) }).collect(),
+            identities: items
+                .iter()
+                .map(|(name, i)| EntryIn { name: (*name).into(), uid: None, identity: export(i) })
+                .collect(),
         }
+    }
+
+    #[test]
+    fn public_edits_preserve_native_keys() {
+        let secret = ts_identity::generate();
+        let mut existing = List::default();
+        existing.push("Old", &secret);
+        let uid = uid(&secret);
+        let next = ListIn {
+            default: Some(uid.clone()),
+            identities: vec![EntryIn { name: "New".into(), uid: Some(uid.clone()), identity: format!("native:{uid}") }],
+        }
+        .resolve(existing);
+        assert_eq!(next.identities[0].name, "New");
+        assert_eq!(next.identities[0].identity, export(&secret));
+    }
+
+    #[test]
+    fn identity_list_serializes_public_metadata_only() {
+        let secret = ts_identity::generate();
+        let mut list = List::default();
+        list.push("Default", &secret);
+        let json = serde_json::to_value(super::list_info(Source::Device, list)).unwrap();
+        let entry = &json["identities"][0];
+        assert_eq!(entry.as_object().unwrap().len(), 2);
+        assert_eq!(entry["uid"], uid(&secret));
+        assert_eq!(entry["name"], "Default");
+        assert!(!json.to_string().contains(&export(&secret)));
+        assert!(entry.get("identity").is_none());
     }
 
     #[test]
@@ -356,7 +444,7 @@ mod tests {
         files.set_list("device", Some(list_in(&[("a", &a)], None))).unwrap();
         assert!(!dir.0.join("teamspeak-identities.json.bak").exists());
         let mut next = list_in(&[("b", &b), ("again", &b)], Some(&a));
-        next.identities.push(EntryIn { name: "junk".into(), identity: "nope".into() });
+        next.identities.push(EntryIn { name: "junk".into(), uid: None, identity: "nope".into() });
         files.set_list("device", Some(next)).unwrap();
         assert!(dir.0.join("teamspeak-identities.json.bak").exists());
         let list = files.list(Source::Device).unwrap();
