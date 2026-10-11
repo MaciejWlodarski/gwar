@@ -57,7 +57,7 @@ impl Core {
     }
 
     /// Whether everything `permissions` allows is also allowed to `session`.
-    fn covers(&self, session: SessionId, permissions: &BTreeSet<Permission>) -> bool {
+    pub(super) fn covers(&self, session: SessionId, permissions: &BTreeSet<Permission>) -> bool {
         permissions.is_subset(&self.my_permissions(session))
     }
 

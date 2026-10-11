@@ -57,6 +57,27 @@ async fn custom_roles_grant_only_what_their_manager_holds() {
     alice.next_event_where("group.deleted", |d| d["group"] == mods).await;
 }
 
+#[tokio::test]
+async fn moderators_cannot_kick_or_move_someone_stronger() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let mut bob = Client::connect(&server, "bob").await;
+    let lobby = seed_channel(&root, "Lobby");
+    let mods = group_id(
+        &root.ok("group.create", json!({"name": "Mods", "permissions": ["client_kick", "client_move"]})).await,
+    );
+    with_groups(&mut root, &alice, json!([2, mods])).await;
+
+    assert_eq!(alice.fails("client.kick", json!({"client": root.id()})).await, "forbidden");
+    assert_eq!(alice.fails("client.move", json!({"client": root.id(), "channel": lobby})).await, "forbidden");
+    // Equals and weaker are fine, and so is moving yourself.
+    alice.ok("client.move", json!({"client": alice.id(), "channel": lobby})).await;
+    alice.ok("client.move", json!({"client": bob.id(), "channel": lobby})).await;
+    alice.ok("client.kick", json!({"client": bob.id()})).await;
+    bob.expect_disconnect().await;
+}
+
 // ----------------------------------------------------------------- bans
 
 #[tokio::test]

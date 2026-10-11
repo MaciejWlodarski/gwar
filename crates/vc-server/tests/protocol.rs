@@ -650,6 +650,31 @@ async fn password_channel_chat_needs_the_password_once() {
 }
 
 #[tokio::test]
+async fn a_new_channel_password_shuts_out_who_already_left() {
+    let server = TestServer::start().await;
+    let mut admin = admin(&server, "root").await;
+    let secret = channel_id(&admin.create_channel(json!({"name": "Secret", "password": "pw"})).await);
+    let mut gone = Client::connect(&server, "gone").await;
+    let mut inside = Client::connect(&server, "inside").await;
+    gone.ok("channel.join", json!({"channel": secret, "password": "pw"})).await;
+    gone.ok("channel.leave", json!({})).await;
+    inside.ok("channel.join", json!({"channel": secret, "password": "pw"})).await;
+
+    // Renaming keeps access; only a new password changes who may read.
+    admin.ok("channel.update", json!({"channel": secret, "topic": "same password"})).await;
+    gone.ok("chat.history", json!({"channel": secret})).await;
+    admin.ok("channel.update", json!({"channel": secret, "password": "new"})).await;
+    assert_eq!(gone.fails("chat.history", json!({"channel": secret})).await, "forbidden");
+    assert_eq!(gone.fails("chat.send", json!({"target": {"channel": secret}, "text": "x"})).await, "forbidden");
+    // Who is inside stays, like on TeamSpeak.
+    inside.ok("chat.send", json!({"target": {"channel": secret}, "text": "still in"})).await;
+    gone.sync().await;
+    assert!(gone.drain_events("chat.message").await.is_empty());
+    gone.ok("channel.join", json!({"channel": secret, "password": "new"})).await;
+    gone.ok("chat.history", json!({"channel": secret})).await;
+}
+
+#[tokio::test]
 async fn leaving_voice_keeps_you_on_the_server() {
     let server = TestServer::start().await;
     let mut a = Client::connect(&server, "alice").await;

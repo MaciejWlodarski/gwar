@@ -1071,8 +1071,11 @@ impl Core {
         if !self.channels.contains_key(&channel) {
             return Err(err(ErrorCode::NotFound, "no such channel"));
         }
-        if !self.sessions.contains_key(&client) {
+        let Some(target) = self.sessions.get(&client) else {
             return Err(err(ErrorCode::NotFound, "no such client"));
+        };
+        if !self.covers(session, &self.permissions(target)) {
+            return Err(err(ErrorCode::Forbidden, "this client has permissions you do not have"));
         }
         self.move_client(client, Some(channel));
         Ok(Response::Empty {})
@@ -1083,8 +1086,11 @@ impl Core {
         if client == session {
             return Err(err(ErrorCode::BadRequest, "cannot kick yourself"));
         }
-        if !self.sessions.contains_key(&client) {
+        let Some(target) = self.sessions.get(&client) else {
             return Err(err(ErrorCode::NotFound, "no such client"));
+        };
+        if !self.covers(session, &self.permissions(target)) {
+            return Err(err(ErrorCode::Forbidden, "this client has permissions you do not have"));
         }
         let reason = reason.map(|r| r.chars().take(MAX_AWAY).collect());
         let by = self.sessions[&session].nickname.clone();
@@ -1379,8 +1385,15 @@ impl Core {
         if row.parent.is_some_and(|p| !self.channels.contains_key(&p) || self.is_descendant(p, channel)) {
             return Err(err(ErrorCode::Conflict, "channel tree changed; try again"));
         }
+        let new_password = matches!(password_hash, Some(Some(_)));
         row.password_hash = password_hash.unwrap_or_else(|| current.password_hash.clone());
         self.store.update_channel(&row).map_err(storage_error)?;
+        // A new password shuts out everyone who entered with the old one and has left since.
+        if new_password {
+            for s in self.sessions.values_mut().filter(|s| s.channel != Some(channel)) {
+                s.unlocked.remove(&channel);
+            }
+        }
         let view = channel_view(&row);
         self.channels.insert(channel, row);
         self.notify_bridge(|| BridgeNote::Channel { channel: view.clone(), created: false, password: plaintext });
