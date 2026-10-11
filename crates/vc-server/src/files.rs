@@ -14,7 +14,7 @@ use axum::{
 };
 use futures::StreamExt;
 use serde::Deserialize;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::warn;
 
 use crate::{core::files::Uploaded, gateway::Gateway};
@@ -148,13 +148,13 @@ pub async fn upload(
 }
 
 /// `bytes=a-b`, `bytes=a-` or `bytes=-n` within `len`, as an inclusive range.
-fn byte_range(headers: &HeaderMap, len: usize) -> Option<(usize, usize)> {
+fn byte_range(headers: &HeaderMap, len: u64) -> Option<(u64, u64)> {
     let spec = headers.get(header::RANGE)?.to_str().ok()?.strip_prefix("bytes=")?;
     let (start, end) = spec.split_once('-')?;
     let (start, end) = match (start.trim(), end.trim()) {
         ("", n) => (len.checked_sub(n.parse().ok()?)?, len.checked_sub(1)?),
         (a, "") => (a.parse().ok()?, len.checked_sub(1)?),
-        (a, b) => (a.parse().ok()?, b.parse::<usize>().ok()?.min(len.checked_sub(1)?)),
+        (a, b) => (a.parse().ok()?, b.parse::<u64>().ok()?.min(len.checked_sub(1)?)),
     };
     (start <= end && end < len).then_some((start, end))
 }
@@ -170,13 +170,17 @@ pub async fn download(
     let Some((file, path)) = gateway.core.file_info(id).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Ok(bytes) = tokio::fs::read(&path).await else {
+    let Ok(handle) = tokio::fs::File::open(&path).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let content_type = INLINE.iter().copied().find(|t| *t == file.mime).unwrap_or("application/octet-stream");
+    serve_file(handle, &file.mime, &file.name, request).await
+}
+
+async fn serve_file(mut handle: tokio::fs::File, mime: &str, name: &str, request: HeaderMap) -> Response {
+    let Ok(metadata) = handle.metadata().await else { return StatusCode::NOT_FOUND.into_response() };
+    let content_type = INLINE.iter().copied().find(|t| *t == mime).unwrap_or("application/octet-stream");
     let inline = content_type != "application/octet-stream";
-    let encoded: String = file
-        .name
+    let encoded: String = name
         .bytes()
         .map(|b| {
             if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
@@ -187,24 +191,32 @@ pub async fn download(
         })
         .collect();
     let disposition = format!("{}; filename*=UTF-8''{encoded}", if inline { "inline" } else { "attachment" });
-    let len = bytes.len();
+    let len = metadata.len();
     let range = byte_range(&request, len);
-    let mut response = match range {
-        Some((start, end)) => {
-            let mut partial = Response::new(Body::from(bytes[start..=end].to_vec()));
-            *partial.status_mut() = StatusCode::PARTIAL_CONTENT;
-            if let Ok(value) = HeaderValue::from_str(&format!("bytes {start}-{end}/{len}")) {
-                partial.headers_mut().insert(header::CONTENT_RANGE, value);
-            }
-            partial
-        }
-        None if request.contains_key(header::RANGE) => {
-            let mut unsatisfiable = Response::new(Body::empty());
-            *unsatisfiable.status_mut() = StatusCode::RANGE_NOT_SATISFIABLE;
-            return unsatisfiable;
-        }
-        None => Response::new(Body::from(bytes)),
-    };
+    if range.is_none() && request.contains_key(header::RANGE) {
+        let mut response = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+        response.headers_mut().insert(header::CONTENT_RANGE, HeaderValue::from_str(&format!("bytes */{len}")).unwrap());
+        return response;
+    }
+    let (start, length) = range.map_or((0, len), |(start, end)| (start, end - start + 1));
+    if handle.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    // Read only the selected slice, at most 64 KiB per poll. No whole-file allocation.
+    let stream = futures::stream::try_unfold(handle.take(length), |mut reader| async move {
+        let mut chunk = vec![0; 64 * 1024];
+        let read = reader.read(&mut chunk).await?;
+        chunk.truncate(read);
+        Ok::<_, std::io::Error>((read != 0).then_some((chunk, reader)))
+    });
+    let mut response = Response::new(Body::from_stream(stream));
+    if let Some((start, end)) = range {
+        *response.status_mut() = StatusCode::PARTIAL_CONTENT;
+        response
+            .headers_mut()
+            .insert(header::CONTENT_RANGE, HeaderValue::from_str(&format!("bytes {start}-{end}/{len}")).unwrap());
+    }
+    response.headers_mut().insert(header::CONTENT_LENGTH, HeaderValue::from_str(&length.to_string()).unwrap());
     let headers = response.headers_mut();
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
@@ -222,7 +234,28 @@ pub async fn download(
 mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
 
-    use super::{byte_range, media_type, valid_id};
+    use super::{byte_range, media_type, serve_file, valid_id};
+    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn ranges_stream_only_the_slice_and_keep_security_headers() {
+        let temp = tempfile::tempfile().unwrap();
+        let mut file = tokio::fs::File::from_std(temp);
+        let len = 1u64 << 33;
+        file.set_len(len).await.unwrap();
+        file.seek(std::io::SeekFrom::Start(len - 1)).await.unwrap();
+        file.write_all(b"x").await.unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_str(&format!("bytes={}-", len - 1)).unwrap());
+        let response = serve_file(file, "image/png", "photo.png", headers).await;
+        assert_eq!(response.status(), axum::http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "1");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert_eq!(response.headers()[header::CONTENT_SECURITY_POLICY], "default-src 'none'; sandbox");
+        assert!(response.headers()[header::CONTENT_DISPOSITION].to_str().unwrap().starts_with("inline;"));
+        assert_eq!(&axum::body::to_bytes(response.into_body(), 1).await.unwrap()[..], b"x");
+    }
 
     #[test]
     fn ids_cannot_escape_the_files_directory() {

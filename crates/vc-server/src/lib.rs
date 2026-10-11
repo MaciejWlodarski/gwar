@@ -14,6 +14,7 @@ pub mod gateway;
 pub mod identity;
 pub mod media;
 pub mod members;
+mod preauth;
 pub mod store;
 #[cfg(feature = "teamspeak")]
 pub mod teamspeak;
@@ -199,7 +200,7 @@ pub async fn start(config: Config) -> Result<Running> {
         }
         None => (None, None),
     };
-    let gateway = Gateway { core: core.clone(), password, public_hosts };
+    let gateway = Gateway { core: core.clone(), password, public_hosts, preauth: Default::default() };
     // The web app runs on another origin than this server: let it upload and
     // fetch files. Uploads are authorized by one-time tokens, not cookies.
     let origins: Vec<HeaderValue> = config.web_origins.iter().filter_map(|o| o.parse().ok()).collect();

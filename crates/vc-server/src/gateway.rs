@@ -31,6 +31,7 @@ use crate::{
 #[derive(Clone)]
 pub struct Gateway {
     pub core: CoreHandle,
+    pub preauth: crate::preauth::PreAuth,
     /// Argon2 hash of the server password, if one is set (changes with settings).
     pub password: ServerPassword,
     /// Empty means login relay protection is off. Never derived from HTTP headers.
@@ -51,7 +52,13 @@ pub async fn upgrade(
     headers: HeaderMap,
 ) -> Response {
     let ip = client_ip(peer, &headers);
-    ws.max_message_size(MAX_FRAME).on_upgrade(move |socket| connection(socket, gateway, ip))
+    let Some(permit) = gateway.preauth.connection(ip) else {
+        return axum::response::IntoResponse::into_response(axum::http::StatusCode::TOO_MANY_REQUESTS);
+    };
+    ws.max_message_size(MAX_FRAME).max_frame_size(MAX_FRAME).on_upgrade(move |socket| async move {
+        let _permit = permit;
+        connection(socket, gateway, ip).await;
+    })
 }
 
 /// The client's address. Behind a reverse proxy on the same host the TCP peer
@@ -77,13 +84,18 @@ fn error(re: u32, code: ErrorCode, message: &str) -> Message {
 }
 
 async fn next_text(stream: &mut SplitStream<WebSocket>, wait: Duration) -> Option<Utf8Bytes> {
-    loop {
-        match timeout(wait, stream.next()).await.ok()?? {
-            Ok(Message::Text(text)) => return Some(text),
-            Ok(Message::Ping(_) | Message::Pong(_)) => continue,
-            _ => return None,
+    timeout(wait, async {
+        loop {
+            match stream.next().await? {
+                Ok(Message::Text(text)) if text.len() <= MAX_FRAME => return Some(text),
+                Ok(Message::Ping(_) | Message::Pong(_)) => continue,
+                _ => return None,
+            }
         }
-    }
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
@@ -101,6 +113,10 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
     }
 
     let Some(raw) = next_text(&mut stream, HELLO_TIMEOUT).await else { return };
+    if !gateway.preauth.hello(ip) {
+        let _ = sink.send(error(0, ErrorCode::RateLimited, "too many hellos")).await;
+        return;
+    }
     let (id, hello) = match serde_json::from_str::<ClientFrame>(&raw) {
         Ok(ClientFrame { id, request: Request::Hello(hello) }) => (id, hello),
         Ok(frame) => {
@@ -146,11 +162,18 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
     let password_ok = match current.as_ref().clone() {
         None => true,
         Some(hash) => {
+            let Ok(permit) = gateway.preauth.passwords.clone().try_acquire_owned() else {
+                let _ = sink.send(error(id, ErrorCode::RateLimited, "password verification busy")).await;
+                return;
+            };
             let password = hello.server_password.clone().unwrap_or_default();
             password.len() <= 128
-                && tokio::task::spawn_blocking(move || crate::core::verify_secret(&password, &hash, false))
-                    .await
-                    .unwrap_or(false)
+                && tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    crate::core::verify_secret(&password, &hash, false)
+                })
+                .await
+                .unwrap_or(false)
         }
     };
 

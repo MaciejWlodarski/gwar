@@ -204,3 +204,13 @@ disconnect; public DNS names resolving to private addresses are rejected. LAN
 origins must use a private literal, localhost, a `.local` name or a local host
 name. Their addresses are pinned for that connection, so later DNS changes
 cannot redirect requests into the LAN.
+
+## Input bounds
+
+The gateway admits at most 16 live connections per IP and 1024 globally. Its
+per-IP connection-attempt and hello buckets each hold 20 tokens and refill at
+one per second, before identity/password work. The IP table holds 8192 entries;
+inactive entries expire after five minutes. At most four server-password Argon2
+checks run concurrently, with no waiting queue. WebSocket frames and assembled
+messages are capped at 96 KiB before parsing; hello and idle deadlines include
+ping traffic.
