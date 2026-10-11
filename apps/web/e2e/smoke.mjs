@@ -1300,6 +1300,14 @@ async function main() {
     await c.getByRole("tab", { name: "Identity" }).click();
     accountUid = await readUid(c);
     if (accountUid !== localUid) throw new Error(`kept identity changed uid: ${localUid} -> ${accountUid}`);
+    const localRoot = await c.evaluate(async () => {
+      const { kvGet } = await import("/src/net/kv.ts");
+      const { loadConnectRecord } = await import("/src/net/identity.ts");
+      const identity = await kvGet("identity");
+      const account = await loadConnectRecord();
+      return identity?.jwk?.x === account?.accountKey;
+    });
+    if (localRoot) throw new Error("plaintext account root remains after enrollment");
     if (await c.getByRole("button", { name: "Export identity" }).count()) throw new Error("device keys must not be exportable");
   });
 
@@ -1415,11 +1423,11 @@ async function main() {
     await c.getByText("Password changed.").waitFor({ timeout: 30000 });
   });
 
-  await check("connect: signing out brings the local identity back; the recovery code signs in again", async () => {
+  await check("connect: signing out never restores the account root; the recovery code signs in again", async () => {
     await c.getByRole("button", { name: "Sign out" }).last().click();
     await c.getByText("Signed out.").first().waitFor();
     await c.getByRole("tab", { name: "Identity" }).click();
-    if ((await readUid(c)) !== localUid) throw new Error("local identity was not restored");
+    if ((await readUid(c)) === localUid) throw new Error("sign-out restored the plaintext account root");
     await c.getByRole("tab", { name: "Account" }).click();
     await c.getByRole("button", { name: /Recover with a code/ }).click();
     await c.getByLabel("Handle").fill(acct);

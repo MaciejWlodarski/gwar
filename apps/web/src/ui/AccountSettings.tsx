@@ -498,6 +498,7 @@ function AccountView() {
       </Section>
 
       <Section title={t("account.devices")}>
+        <p className="text-xs text-subtle">{t("account.devicesHint")}</p>
         {thisRevoked && <Banner>{t("account.thisRevoked")}</Banner>}
         {devicesError && <Banner>{devicesError}</Banner>}
         <ul className="flex flex-col gap-1.5" aria-label={t("account.devices")}>

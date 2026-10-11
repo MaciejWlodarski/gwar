@@ -9,9 +9,14 @@
  */
 import { decodeBase64Url, encodeBase64Url } from "../net/base64url";
 import type { ConnectRecord, ConnectStore } from "../net/identity";
-import { ConnectApi, ConnectApiError, type DeviceCertBody, type RegisterBody } from "./api";
+import { ConnectApi, ConnectApiError, type DeviceCertBody, type RegisterBody, type CredentialAuthorization } from "./api";
 import {
   certifyDevice,
+  checkChallenge,
+  credentialsStatement,
+  sessionStatement,
+  signText,
+  type Kdf,
   formatRecoveryCode,
   generateKeyPair,
   generateRecoveryCode,
@@ -61,20 +66,36 @@ const certificateOf = (account: string, cert: Awaited<ReturnType<typeof certifyD
   signature: cert.signature,
 });
 
+async function sessionToken(api: ConnectApi, token: string, accountKey: string, device: KeyPairJwk, cert: Awaited<ReturnType<typeof certifyDevice>>): Promise<string> {
+  const service = await api.serviceKey();
+  const c = await api.challenge(token, "session", cert);
+  checkChallenge(c, service);
+  const signature = await signText(device.jwk, await sessionStatement(service, accountKey, token, c, cert));
+  return api.session(token, c.challenge, cert, signature);
+}
+
+async function credentialAuthorization(api: ConnectApi, token: string, account: KeyPairJwk, purpose: "password" | "recovery", kdf: Kdf | null, auth: string, blob: string): Promise<CredentialAuthorization> {
+  const service = await api.serviceKey();
+  const c = await api.challenge(token, purpose);
+  checkChallenge(c, service);
+  const signature = await signText(account.jwk, await credentialsStatement(purpose, service, account.publicKey, token, c, kdf, auth, blob));
+  return { challenge: c.challenge, credential_version: c.credential_version, signature };
+}
+
 /** Renew only a key whose private half is held on this device. */
 async function withAccountKey(
   account: KeyPairJwk,
   token: string,
   deps: FlowDeps,
   self: ConnectRecord,
-): Promise<{ vaultKey: string; certificate: Certificate }> {
+): Promise<{ token: string; vaultKey: string; certificate: Certificate }> {
   const device = await keyFromSeed(seedOfJwk(self.deviceJwk));
   if (device.publicKey !== self.certificate.device_key || self.accountKey !== account.publicKey) {
     throw new ConnectApiError("server", "the local device key does not match the account");
   }
   const cert = await certifyDevice(account, device.publicKey);
   await deps.api.addDevice(token, certBody(cert, self.deviceName));
-  return { vaultKey: await vaultKeyOf(account), certificate: certificateOf(account.publicKey, cert) };
+  return { token: await sessionToken(deps.api, token, account.publicKey, device, cert), vaultKey: await vaultKeyOf(account), certificate: certificateOf(account.publicKey, cert) };
 }
 
 function recordOf(
@@ -183,7 +204,9 @@ export async function prepareAccount(p: CreateParams, deps: FlowDeps): Promise<{
 export async function registerPrepared(prepared: PreparedAccount, deps: FlowDeps): Promise<ConnectRecord> {
   const { body, record } = prepared.request();
   const { token } = await deps.api.register(body);
-  return record(token);
+  const next = record(token);
+  const device = await keyFromSeed(seedOfJwk(next.deviceJwk));
+  return { ...next, token: await sessionToken(deps.api, token, next.accountKey, device, body.device) };
 }
 
 /** Prepares and registers in one go, for callers that need no confirmation step. */
@@ -221,7 +244,7 @@ async function enroll(handle: string, token: string, account: KeyPairJwk, deps: 
   const cert = await certifyDevice(account, device.publicKey);
   await deps.api.addDevice(token, certBody(cert, deps.deviceName));
   const vaultKey = await vaultKeyOf(account);
-  return recordOf(handle, account.publicKey, device, certificateOf(account.publicKey, cert), deps.deviceName, token, vaultKey);
+  return recordOf(handle, account.publicKey, device, certificateOf(account.publicKey, cert), deps.deviceName, await sessionToken(deps.api, token, account.publicKey, device, cert), vaultKey);
 }
 
 /** Lost password: the recovery code opens the account, then a new password is set and this device is enrolled. */
@@ -237,20 +260,22 @@ export async function recover(p: { handle: string; code: string; newPassword: st
   const reply = await deps.api.recover(handle, encodeBase64Url(recovery.authKey));
   const account = await keyFromSeed(await openKey(recovery.encKey, reply.recovery_blob, reply.account_key));
   if (account.publicKey !== reply.account_key) throw new ConnectApiError("server", "the stored key does not match the account");
-  await setPassword(deps.api, reply.token, account, p.newPassword);
-  return enroll(handle, reply.token, account, deps);
+  const record = await enroll(handle, reply.token, account, deps);
+  await setPassword(deps.api, record.token, account, p.newPassword);
+  return record;
 }
 
 async function setPassword(api: ConnectApi, token: string, account: KeyPairJwk, password: string): Promise<void> {
   const kdf = newKdf();
   const secrets = await passwordSecrets(password, kdf);
   const blob = await sealKey(secrets.encKey, seedOfJwk(account.jwk), account.publicKey);
-  await api.changePassword(token, kdf, encodeBase64Url(secrets.authKey), blob);
+  const auth = encodeBase64Url(secrets.authKey);
+  await api.changePassword(token, { kdf, auth_key: auth, key_blob: blob, ...await credentialAuthorization(api, token, account, "password", kdf, auth, blob) });
 }
 
 /** What a flow that unlocked the account key stores on this device: the new session, the vault key and any newer certificate. */
-async function saveUnlocked(record: ConnectRecord, token: string, opened: { vaultKey: string; certificate?: Certificate }, deps: FlowDeps): Promise<ConnectRecord> {
-  const next = { ...record, token, vaultKey: opened.vaultKey, certificate: opened.certificate ?? record.certificate };
+async function saveUnlocked(record: ConnectRecord, opened: { token: string; vaultKey: string; certificate: Certificate }, deps: FlowDeps): Promise<ConnectRecord> {
+  const next = { ...record, ...opened };
   await deps.store.save(next);
   return next;
 }
@@ -262,30 +287,45 @@ export async function changePassword(
   deps: FlowDeps,
 ): Promise<ConnectRecord> {
   const { token, account } = await unlock(deps.api, record.handle, p.password);
-  await setPassword(deps.api, token, account, p.newPassword);
-  return saveUnlocked(record, token, await withAccountKey(account, token, deps, record), deps);
+  const opened = await withAccountKey(account, token, deps, record);
+  await setPassword(deps.api, opened.token, account, p.newPassword);
+  return saveUnlocked(record, opened, deps);
 }
 
 /** Revokes another device of this account; needs the password to sign with the account key. */
 export async function revokeDevice(record: ConnectRecord, deviceKey: string, password: string, deps: FlowDeps): Promise<ConnectRecord> {
   const { token, account } = await unlock(deps.api, record.handle, password);
-  await deps.api.revokeDevice(token, await signRevocation(account, deviceKey));
-  return saveUnlocked(record, token, await withAccountKey(account, token, deps, record), deps);
+  const opened = await withAccountKey(account, token, deps, record);
+  await deps.api.revokeDevice(opened.token, await signRevocation(account, deviceKey));
+  return saveUnlocked(record, opened, deps);
 }
 
 /** Renews only this device's certificate. */
 export async function renewCertificate(record: ConnectRecord, password: string, deps: FlowDeps): Promise<ConnectRecord> {
   const { token, account } = await unlock(deps.api, record.handle, password);
-  return saveUnlocked(record, token, await withAccountKey(account, token, deps, record), deps);
+  return saveUnlocked(record, await withAccountKey(account, token, deps, record), deps);
 }
 
 /**
  * Records saved before the vault existed have no vault key. The password
- * derives it (and refreshes the session token, and renews the certificates).
+ * derives it (and refreshes the session token, and renews this certificate).
  */
 export async function unlockVault(record: ConnectRecord, password: string, deps: FlowDeps): Promise<ConnectRecord> {
   const { token, account } = await unlock(deps.api, record.handle, password);
-  return saveUnlocked(record, token, await withAccountKey(account, token, deps, record), deps);
+  return saveUnlocked(record, await withAccountKey(account, token, deps, record), deps);
+}
+
+/** Replace recovery credentials with account-key authorization; show the new code once. */
+export async function changeRecoveryCode(record: ConnectRecord, password: string, deps: FlowDeps): Promise<Created> {
+  const { token, account } = await unlock(deps.api, record.handle, password);
+  const opened = await withAccountKey(account, token, deps, record);
+  const code = generateRecoveryCode();
+  const secrets = await recoverySecrets(code, decodeBase64Url(account.publicKey));
+  const auth = encodeBase64Url(secrets.authKey);
+  const blob = await sealKey(secrets.encKey, seedOfJwk(account.jwk), account.publicKey);
+  await deps.api.changeRecovery(opened.token, { recovery_auth: auth, recovery_blob: blob,
+    ...await credentialAuthorization(deps.api, opened.token, account, "recovery", null, auth, blob) });
+  return { record: await saveUnlocked(record, opened, deps), recoveryCode: formatRecoveryCode(code) };
 }
 
 export type PickUp = "updated" | "current" | "unlisted" | "revoked" | "invalid";
@@ -315,7 +355,7 @@ export async function pickUpCertificate(record: ConnectRecord, deps: FlowDeps): 
   return { outcome: "updated", record: next };
 }
 
-/** Forgets the account on this device (best effort on the service). The local identity is untouched. */
+/** Forgets the account on this device (best effort on the service). A matching local root is also removed by the store. */
 export async function signOut(record: ConnectRecord, deps: Pick<FlowDeps, "api" | "store">): Promise<void> {
   await deps.api.logout(record.token).catch(() => undefined);
   await deps.store.clear();

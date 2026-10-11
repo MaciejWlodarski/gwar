@@ -34,7 +34,7 @@ describe("ConnectApi", () => {
 
   it("uses the documented paths and methods", async () => {
     const { api, fetchFn } = make(() => reply(200, {}));
-    await api.changePassword("t", { salt: "s", m: 1, t: 1, p: 1 }, "a", "b");
+    await api.changePassword("t", { kdf: { salt: "s", m: 65536, t: 3, p: 1 }, auth_key: "a", key_blob: "b", challenge: "c", credential_version: 0, signature: "s" });
     await api.addDevice("t", { device_key: "d", name: "n", issued_at: 1, expires_at: 2, signature: "s" });
     await api.revokeDevice("t", { device_key: "d", revoked_at: 1, signature: "s" });
     await api.logout("t");

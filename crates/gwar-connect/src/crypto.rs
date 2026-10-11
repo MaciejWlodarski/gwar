@@ -2,6 +2,9 @@
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signature, VerifyingKey};
+use sha2::{Digest, Sha256};
+
+use crate::store::{Challenge, Kdf};
 
 /// Device certificates last at most this long.
 pub const MAX_CERT_MS: i64 = 400 * 24 * 3600 * 1000;
@@ -56,13 +59,52 @@ pub fn check_certificate(
     if unb64_len(device_key, 32).is_none() {
         return Err("invalid device key");
     }
-    if issued_at > now + SKEW_MS || expires_at <= now || expires_at - issued_at > MAX_CERT_MS {
+    if issued_at < 0
+        || expires_at > 9_007_199_254_740_991
+        || issued_at > now.saturating_add(SKEW_MS)
+        || expires_at <= now
+        || expires_at <= issued_at
+        || expires_at - issued_at > MAX_CERT_MS
+    {
         return Err("certificate dates are out of range");
     }
     if !verify(account_key, &device_statement(account_key, device_key, issued_at, expires_at), signature) {
         return Err("certificate signature does not match the account key");
     }
     Ok(())
+}
+
+pub fn hash(bytes: &[u8]) -> String {
+    b64(&Sha256::digest(bytes))
+}
+
+pub fn certificate_hash(account: &str, device: &str, c: &crate::store::Certificate) -> String {
+    hash(format!("{}\n{}", device_statement(account, device, c.issued_at, c.expires_at), c.signature).as_bytes())
+}
+
+pub fn session_statement(service: &str, account: &str, c: &Challenge) -> String {
+    format!(
+        "gwar session v1\n{service}\n{account}\n{}\n{}\n{}\n{}",
+        c.certificate_hash, c.token_hash, c.nonce, c.expires_at
+    )
+}
+
+pub fn kdf_hash(kdf: &Kdf) -> String {
+    hash(format!("gwar kdf v1\nargon2id\n19\n{}\n{}\n{}\n{}\n64", kdf.salt, kdf.m, kdf.t, kdf.p).as_bytes())
+}
+
+pub fn credentials_statement(
+    service: &str,
+    account: &str,
+    c: &Challenge,
+    kdf_hash: &str,
+    auth_hash: &str,
+    blob_hash: &str,
+) -> String {
+    format!(
+        "gwar credentials v1\n{}\n{service}\n{account}\n{}\n{}\n{}\n{}\n{kdf_hash}\n{auth_hash}\n{blob_hash}",
+        c.purpose, c.token_hash, c.nonce, c.expires_at, c.credential_version
+    )
 }
 
 /// Lowercased handle if valid: 3–32 of `a-z 0-9 _ .`, not starting or ending with a dot.

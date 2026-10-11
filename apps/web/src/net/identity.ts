@@ -72,7 +72,7 @@ export interface ConnectRecord {
   deviceName: string;
   deviceJwk: JsonWebKey;
   certificate: DeviceCertificate;
-  /** Connect session token (90 days); lists devices and reads and writes the vault. */
+  /** Device-bound session token (90 idle days, capped by its proven certificate); lists devices and reads and writes the vault. */
   token: string;
   /**
    * Opens the account's vault (base64url, docs/connect.md): derived from the

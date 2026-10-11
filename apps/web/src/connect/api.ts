@@ -1,7 +1,7 @@
 /** HTTP client for the Gwar Connect service (docs/connect.md, "Connect API"). */
 import { connectJson } from "./transport";
 import { CONNECT_URL } from "../lib/official";
-import type { Kdf, SignedDevice } from "./crypto";
+import type { ChallengePurpose, ConnectChallenge, Kdf, SignedDevice } from "./crypto";
 
 export type ConnectErrorKind =
   | "network" // could not reach the service
@@ -48,6 +48,23 @@ export interface RegisterBody {
   recovery_auth: string;
   recovery_blob: string;
   device: DeviceCertBody;
+}
+
+export interface CredentialAuthorization {
+  challenge: string;
+  credential_version: number;
+  signature: string;
+}
+
+export interface PasswordBody extends CredentialAuthorization {
+  kdf: Kdf;
+  auth_key: string;
+  key_blob: string;
+}
+
+export interface RecoveryBody extends CredentialAuthorization {
+  recovery_auth: string;
+  recovery_blob: string;
 }
 
 export interface LoginReply {
@@ -141,8 +158,24 @@ export class ConnectApi {
     return this.call("GET", "/account", undefined, token);
   }
 
-  async changePassword(token: string, kdf: Kdf, authKey: string, keyBlob: string): Promise<void> {
-    await this.call("PUT", "/account/password", { kdf, auth_key: authKey, key_blob: keyBlob }, token);
+  async serviceKey(): Promise<string> {
+    return (await this.call<{ key: string }>("GET", "/service-key")).key;
+  }
+
+  challenge(token: string, purpose: ChallengePurpose, device?: SignedDevice): Promise<ConnectChallenge> {
+    return this.call("POST", "/challenges", { purpose, device }, token);
+  }
+
+  async session(token: string, challenge: string, device: SignedDevice, signature: string): Promise<string> {
+    return (await this.call<{ token: string }>("POST", "/session", { challenge, device, signature }, token)).token;
+  }
+
+  async changePassword(token: string, body: PasswordBody): Promise<void> {
+    await this.call("PUT", "/account/password", body, token);
+  }
+
+  async changeRecovery(token: string, body: RecoveryBody): Promise<void> {
+    await this.call("PUT", "/account/recovery", body, token);
   }
 
   async devices(token: string): Promise<DeviceInfo[]> {

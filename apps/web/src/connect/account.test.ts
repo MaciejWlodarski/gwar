@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   changePassword,
+  changeRecoveryCode,
   createAccount,
   normalizeHandle,
   pickUpCertificate,
@@ -262,7 +263,7 @@ describe("preparing and registering an account", () => {
     expect(recoveryCode).toMatch(/^([A-Z2-7]{4}-){7}[A-Z2-7]{4}$/);
 
     const record = await registerPrepared(prepared, deps("A"));
-    expect(service.requests).toEqual(["POST /register"]);
+    expect(service.requests).toEqual(["POST /register", "GET /service-key", "POST /challenges", "POST /session"]);
     expect(service.accounts.get("rita")?.account_key).toBe(record.accountKey);
     expect(record.vaultKey).toMatch(/^[A-Za-z0-9_-]{43}$/);
     // The code shown before registering opens the account.
@@ -322,3 +323,66 @@ describe("device names", () => {
     expect(deviceName(chromeMac, true)).toBe("Gwar desktop on macOS");
   });
 });
+
+describe("device-bound session paths", () => {
+  it("password change, revocation and vault unlock keep tokens bound to this device and revocation ends them", async () => {
+    const { service, deps } = setup();
+    const created = await createAccount({ handle: "bound", password: "first password" }, deps("A"));
+    const a = created.record;
+    const other = await signIn({ handle: "bound", password: "first password" }, deps("B"));
+    const unlocked = await unlockVault(a, "first password", deps("A"));
+    const revoked = await revokeDevice(unlocked, other.certificate.device_key, "first password", deps("A"));
+    const changed = await changePassword(revoked, { password: "first password", newPassword: "second password" }, deps("A"));
+    for (const record of [a, unlocked, revoked, changed]) {
+      expect(service.enrollmentTokens.has(record.token)).toBe(false);
+      expect(service.sessionDevices.get(record.token)).toBe(a.certificate.device_key);
+    }
+    const fresh = await signIn({ handle: "bound", password: "second password" }, deps("C"));
+    await revokeDevice(fresh, a.certificate.device_key, "second password", deps("C"));
+    for (const record of [a, unlocked, revoked, changed]) await expect(deps().api.getVault(record.token)).rejects.toMatchObject({ kind: "unauthorized" });
+  }, 90_000);
+
+  it("refuses a substituted or expired challenge before producing the device proof", async () => {
+    for (const change of [{ service_key: "foreign" }, { expires_at: 1 }, { challenge: "not a nonce" }, { credential_version: -1 }]) {
+      const { service, deps } = setup();
+      const broken = { ...deps(), api: new ConnectApi("http://c", (async (url, init) => {
+        const response = await service.fetch(url, init);
+        if (!String(url).endsWith("/challenges")) return response;
+        return new Response(JSON.stringify({ ...await response.json(), ...change }));
+      }) as typeof fetch) };
+      await expect(createAccount({ handle: "challenge", password: "right password" }, broken)).rejects.toThrow("Invalid Connect challenge");
+      expect(service.requests).not.toContain("POST /session");
+    }
+  }, 60_000);
+});
+
+describe("signed credential updates", () => {
+  it("rejects alteration of the KDF, authentication key or key blob after the account signed them", async () => {
+    for (const field of ["kdf", "auth_key", "key_blob"]) {
+      const { service, deps } = setup();
+      const record = (await createAccount({ handle: "credentials", password: "first password" }, deps())).record;
+      const before = { ...service.accounts.get("credentials")! };
+      const malicious = { ...deps(), api: new ConnectApi("http://c", (async (url, init) => {
+        if (String(url).endsWith("/account/password")) {
+          const body = JSON.parse(init!.body as string);
+          if (field === "kdf") body.kdf.salt = "AAAAAAAAAAAAAAAAAAAAAA";
+          else body[field] = field === "auth_key" ? "A".repeat(43) : "A".repeat(80);
+          init = { ...init, body: JSON.stringify(body) };
+        }
+        return service.fetch(url, init);
+      }) as typeof fetch) };
+      await expect(changePassword(record, { password: "first password", newPassword: "new password" }, malicious)).rejects.toMatchObject({ kind: "bad_request" });
+      expect(service.accounts.get("credentials")).toEqual(before);
+    }
+  }, 90_000);
+});
+
+
+it("rotates recovery credentials with an account-signed update", async () => {
+  const { deps } = setup();
+  const created = await createAccount({ handle: "rotation", password: "right password" }, deps());
+  const rotated = await changeRecoveryCode(created.record, "right password", deps());
+  await expect(recover({ handle: "rotation", code: created.recoveryCode, newPassword: "new password" }, deps())).rejects.toMatchObject({ kind: "unauthorized" });
+  const back = await recover({ handle: "rotation", code: rotated.recoveryCode, newPassword: "new password" }, deps());
+  expect(back.accountKey).toBe(created.record.accountKey);
+}, 60_000);

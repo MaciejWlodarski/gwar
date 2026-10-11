@@ -1,0 +1,35 @@
+{
+  "account_key": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+  "device": {
+    "device_key": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+    "issued_at": 1,
+    "expires_at": 2,
+    "signature": "hrl_m1SlEOKgUYV7RMz4dnlZ5wa5OY_m5-ZS9qWcZU82oGdpwkQdm5wVyUgxplRzxEiMoJnAs-BN6ktG0ufaDA"
+  },
+  "token": "token",
+  "challenge": {
+    "challenge": "AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM",
+    "expires_at": 5,
+    "credential_version": 0,
+    "service_key": "GX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE"
+  },
+  "kdf": {
+    "salt": "BwcHBwcHBwcHBwcHBwcHBw",
+    "m": 65536,
+    "t": 3,
+    "p": 1
+  },
+  "auth_key": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ",
+  "key_blob": "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUF",
+  "certificate_hash": "cDrpW9X3CltPIJn95cibPtTvsgVIX79ydjoF1eqzz5E",
+  "kdf_hash": "LtvDyr0W_IwfQLwH3IDXTL7fSBo-e1ddUvvbGRoi2WM",
+  "session_statement": "gwar session v1\nGX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE\niojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w\ncDrpW9X3CltPIJn95cibPtTvsgVIX79ydjoF1eqzz5E\nPEaenWxYddN6Q_NT1PiOYfz4EsZu7jRXRlpAsNpBU-A\nAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM\n5",
+  "session_hash": "6rMfx1f27_bJrlyv2I7eKcac4johY4RJFCKX5eJrWyo",
+  "session_signature": "8iVGzkPVxFA4GiZAE3xipo1dcm13gTuqfUlB2_Kw3Lbb6-YtNGT-1gYf34aPkksG7IIiMx6O9AB-uiHHUpEGBg",
+  "password_statement": "gwar credentials v1\npassword\nGX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE\niojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w\nPEaenWxYddN6Q_NT1PiOYfz4EsZu7jRXRlpAsNpBU-A\nAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM\n5\n0\nLtvDyr0W_IwfQLwH3IDXTL7fSBo-e1ddUvvbGRoi2WM\nn0-2jz4drIIgL5qlgc4Lvx92XfDprDyMV-IPaFq6uO0\nS22N2sTW7whzVpIGty-XwPGxnvgpa32Vw_RhBDrQuCo",
+  "password_hash": "u_Ms42GSdCxYSNR4nc35_cgUh7m6KwPcU53A1PN7SeE",
+  "password_signature": "jTQPOtyVGVj706dX1wJHcOQ3ep3AQ-vIQTtZqlXmYg5O3a_gzwAKJ4_Zt7mW_kxIG9ed8s9Jkf9gr0_ONfblCA",
+  "recovery_statement": "gwar credentials v1\nrecovery\nGX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE\niojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w\nPEaenWxYddN6Q_NT1PiOYfz4EsZu7jRXRlpAsNpBU-A\nAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM\n5\n0\n-\nn0-2jz4drIIgL5qlgc4Lvx92XfDprDyMV-IPaFq6uO0\nS22N2sTW7whzVpIGty-XwPGxnvgpa32Vw_RhBDrQuCo",
+  "recovery_hash": "7nj2kTwERRSf-dfUHhKKQ7sIWEc5S98QjA5SpPLhUo4",
+  "recovery_signature": "xZ6lZ9xsC6ziHblOtbw_aBEKbVpVlOsFjhclfyJ_QWxp9g1sS3e807quydV_7CGdQGgX-5Q_lO56VpKeoYXDBw"
+}

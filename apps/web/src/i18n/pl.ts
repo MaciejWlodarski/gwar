@@ -539,6 +539,7 @@ export const pl: Record<Key, string> = {
   "account.accountKey": "Klucz konta",
   "account.thisDevice": "To urządzenie",
   "account.devices": "Urządzenia",
+  "account.devicesHint": "Nazwy i aktywność podaje Connect; lista może być niepełna. Urządzenia rozpoznajesz po ich kluczach.",
   "account.devicesFailed": "Nie udało się wczytać urządzeń.",
   "account.refresh": "Odśwież",
   "account.revoked": "Unieważnione",

@@ -22,10 +22,11 @@ use tracing::warn;
 
 use crate::{
     crypto::{self, KEY_BLOB_LEN, MAX_VAULT_LEN, SKEW_MS, b64, unb64_len},
-    store::{Account, Certificate, Kdf, NewAccount, Store},
+    store::{Account, Certificate, Challenge, Credentials, Kdf, NewAccount, Store},
 };
 
 const SESSION_MS: i64 = 90 * 24 * 3600 * 1000;
+const CHALLENGE_MS: i64 = 5 * 60 * 1000;
 const MAX_DEVICE_NAME: usize = 64;
 
 pub struct Connect {
@@ -141,9 +142,7 @@ fn authenticated(state: &Connect, headers: &HeaderMap) -> Result<Account, ApiErr
     let store = state.store.lock().expect("store lock");
     let (id, device) = store.session(&hash, now)?.ok_or_else(ApiError::unauthorized)?;
     store.extend_session(&hash, now + SESSION_MS)?;
-    if let Some(device) = device {
-        store.touch_device(&device, now)?;
-    }
+    store.touch_device(&device, now)?;
     store.account(id)?.ok_or_else(ApiError::unauthorized)
 }
 
@@ -151,19 +150,27 @@ fn certificate(d: &DeviceCert) -> Certificate {
     Certificate { issued_at: d.issued_at, expires_at: d.expires_at, signature: d.signature.clone() }
 }
 
-fn new_session(store: &Store, account: i64) -> anyhow::Result<String> {
+fn new_enrollment(store: &Store, account: i64, device: Option<&str>) -> anyhow::Result<String> {
     let token = b64(&rand::random::<[u8; 32]>());
     let now = now_ms();
-    store.insert_session(&token_hash(&token), account, now, now + SESSION_MS)?;
+    store.insert_enrollment(&token_hash(&token), account, device, now, now + CHALLENGE_MS)?;
     Ok(token)
+}
+
+fn enrollment(state: &Connect, headers: &HeaderMap) -> Result<Account, ApiError> {
+    let token = bearer(headers).ok_or_else(ApiError::unauthorized)?;
+    let store = state.store.lock().expect("store lock");
+    let (id, _) = store.enrollment(&token_hash(token), now_ms())?.ok_or_else(ApiError::unauthorized)?;
+    store.account(id)?.ok_or_else(ApiError::unauthorized)
+}
+
+fn service(state: &Connect) -> String {
+    b64(state.service_key.verifying_key().as_bytes())
 }
 
 fn check_kdf(kdf: &Kdf) -> Result<(), ApiError> {
     let salt = crypto::unb64(&kdf.salt).ok_or_else(|| ApiError::bad("invalid salt"))?;
-    let ok = (16..=64).contains(&salt.len())
-        && kdf.m == 65_536
-        && kdf.t == 3
-        && kdf.p == 1;
+    let ok = (16..=64).contains(&salt.len()) && kdf.m == 65_536 && kdf.t == 3 && kdf.p == 1;
     if ok { Ok(()) } else { Err(ApiError::bad("unsupported key derivation parameters")) }
 }
 
@@ -268,8 +275,7 @@ pub async fn register(
     };
     store.upsert_device(id, &d.device_key, &device_name(&d.name), now)?;
     store.set_certificate(&d.device_key, &certificate(d))?;
-    let token = new_session(&store, id)?;
-    store.bind_session(&token_hash(&token), &d.device_key)?;
+    let token = new_enrollment(&store, id, Some(&d.device_key))?;
     Ok(Json(json!({"token": token})))
 }
 
@@ -322,7 +328,11 @@ pub async fn login(
     if !verify_auth(&r.auth_key, &account.auth_hash).await {
         return Err(ApiError::unauthorized());
     }
-    let token = new_session(&state.store.lock().expect("store lock"), account.id)?;
+    let store = state.store.lock().expect("store lock");
+    if store.account(account.id)?.is_none_or(|a| a.credential_version != account.credential_version) {
+        return Err(ApiError::unauthorized());
+    }
+    let token = new_enrollment(&store, account.id, None)?;
     Ok(Json(json!({"token": token, "account_key": account.account_key, "key_blob": account.key_blob})))
 }
 
@@ -347,7 +357,7 @@ pub async fn recover(
     if given != account.recovery_hash {
         return Err(ApiError::unauthorized());
     }
-    let token = new_session(&store, account.id)?;
+    let token = new_enrollment(&store, account.id, None)?;
     Ok(Json(json!({"token": token, "account_key": account.account_key, "recovery_blob": account.recovery_blob})))
 }
 
@@ -357,21 +367,200 @@ pub async fn account(State(state): State<AppState>, headers: HeaderMap) -> Reply
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChallengeRequest {
+    purpose: String,
+    device: Option<DeviceCert>,
+}
+
+pub async fn challenge(State(state): State<AppState>, headers: HeaderMap, Json(r): Json<ChallengeRequest>) -> Reply {
+    let account = match r.purpose.as_str() {
+        "session" => enrollment(&state, &headers)?,
+        "password" | "recovery" => authenticated(&state, &headers)?,
+        _ => return Err(ApiError::bad("unsupported challenge purpose")),
+    };
+    let hash = token_hash(bearer(&headers).ok_or_else(ApiError::unauthorized)?);
+    if !state.allow(format!("challenge:{hash}"), 30, Duration::from_secs(60)) {
+        return Err(ApiError::limited());
+    }
+    let now = now_ms();
+    let store = state.store.lock().expect("store lock");
+    let (certificate_hash, device_key, certificate_expires_at) = if r.purpose == "session" {
+        let d = r.device.ok_or_else(|| ApiError::bad("device certificate required"))?;
+        crypto::check_certificate(&account.account_key, &d.device_key, d.issued_at, d.expires_at, &d.signature, now)
+            .map_err(ApiError::bad)?;
+        let (_, bound) = store.enrollment(&hash, now)?.ok_or_else(ApiError::unauthorized)?;
+        if bound.as_deref() != Some(&d.device_key) || store.device_owner(&d.device_key)? != Some((account.id, None)) {
+            return Err(ApiError::unauthorized());
+        }
+        (
+            crypto::certificate_hash(&account.account_key, &d.device_key, &certificate(&d)),
+            Some(d.device_key),
+            d.expires_at,
+        )
+    } else {
+        if r.device.is_some() {
+            return Err(ApiError::bad("unexpected device certificate"));
+        }
+        ("-".into(), None, 0)
+    };
+    let c = Challenge {
+        nonce: b64(&rand::random::<[u8; 32]>()),
+        token_hash: hash,
+        account_id: account.id,
+        purpose: r.purpose,
+        certificate_hash,
+        device_key,
+        certificate_expires_at,
+        credential_version: account.credential_version,
+        expires_at: now + CHALLENGE_MS,
+    };
+    store.insert_challenge(&c)?;
+    Ok(Json(
+        json!({"challenge": c.nonce, "expires_at": c.expires_at, "credential_version": c.credential_version, "service_key": service(&state)}),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionProof {
+    challenge: String,
+    device: DeviceCert,
+    signature: String,
+}
+
+pub async fn session(State(state): State<AppState>, headers: HeaderMap, Json(r): Json<SessionProof>) -> Reply {
+    let account = enrollment(&state, &headers)?;
+    let hash = token_hash(bearer(&headers).ok_or_else(ApiError::unauthorized)?);
+    let now = now_ms();
+    let store = state.store.lock().expect("store lock");
+    let c = store.challenge(&hash, &r.challenge, now)?.ok_or_else(ApiError::unauthorized)?;
+    let d = &r.device;
+    crypto::check_certificate(&account.account_key, &d.device_key, d.issued_at, d.expires_at, &d.signature, now)
+        .map_err(ApiError::bad)?;
+    if c.purpose != "session"
+        || c.account_id != account.id
+        || c.device_key.as_deref() != Some(&d.device_key)
+        || c.certificate_hash != crypto::certificate_hash(&account.account_key, &d.device_key, &certificate(d))
+        || !crypto::verify(
+            &d.device_key,
+            &crypto::session_statement(&service(&state), &account.account_key, &c),
+            &r.signature,
+        )
+    {
+        return Err(ApiError::bad("device proof does not match the challenge"));
+    }
+    let token = b64(&rand::random::<[u8; 32]>());
+    if !store.exchange_session(&c, &token_hash(&token), now, now + SESSION_MS)? {
+        return Err(ApiError::unauthorized());
+    }
+    Ok(Json(json!({"token": token})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Password {
     kdf: Kdf,
     auth_key: String,
     key_blob: String,
+    challenge: String,
+    credential_version: i64,
+    signature: String,
+}
+
+fn credential_challenge(
+    state: &Connect,
+    headers: &HeaderMap,
+    account: &Account,
+    nonce: &str,
+    version: i64,
+    purpose: &str,
+) -> Result<Challenge, ApiError> {
+    let hash = token_hash(bearer(headers).ok_or_else(ApiError::unauthorized)?);
+    let store = state.store.lock().expect("store lock");
+    let c = store.challenge(&hash, nonce, now_ms())?.ok_or_else(ApiError::unauthorized)?;
+    if c.account_id != account.id || c.purpose != purpose {
+        return Err(ApiError::bad("wrong challenge purpose"));
+    }
+    if c.credential_version != version || account.credential_version != version {
+        return Err(ApiError(StatusCode::CONFLICT, "conflict", "the credentials changed; unlock again".into()));
+    }
+    Ok(c)
 }
 
 pub async fn password(State(state): State<AppState>, headers: HeaderMap, Json(r): Json<Password>) -> Reply {
     let account = authenticated(&state, &headers)?;
     check_kdf(&r.kdf)?;
     check_blob(&r.key_blob)?;
+    let auth = unb64_len(&r.auth_key, 32).ok_or_else(|| ApiError::bad("invalid authentication key"))?;
+    let c = credential_challenge(&state, &headers, &account, &r.challenge, r.credential_version, "password")?;
+    let statement = crypto::credentials_statement(
+        &service(&state),
+        &account.account_key,
+        &c,
+        &crypto::kdf_hash(&r.kdf),
+        &crypto::hash(&auth),
+        &crypto::hash(&crypto::unb64(&r.key_blob).expect("checked blob")),
+    );
+    if !crypto::verify(&account.account_key, &statement, &r.signature) {
+        return Err(ApiError::bad("credential signature does not match the account key"));
+    }
     let auth_hash = hash_auth(&r.auth_key).await?;
     let store = state.store.lock().expect("store lock");
-    store.set_password(account.id, &r.kdf, &auth_hash, &r.key_blob)?;
-    if let Some(token) = bearer(&headers) {
-        store.end_other_sessions(account.id, &token_hash(token))?;
+    if !store.update_credentials(
+        &c,
+        &Credentials::Password { kdf: &r.kdf, auth_hash: &auth_hash, key_blob: &r.key_blob },
+        now_ms(),
+    )? {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "conflict",
+            "challenge expired, consumed or credentials changed".into(),
+        ));
+    }
+    Ok(Json(json!({})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecoveryCredentials {
+    recovery_auth: String,
+    recovery_blob: String,
+    challenge: String,
+    credential_version: i64,
+    signature: String,
+}
+
+pub async fn recovery_credentials(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(r): Json<RecoveryCredentials>,
+) -> Reply {
+    let account = authenticated(&state, &headers)?;
+    check_blob(&r.recovery_blob)?;
+    let auth_hash = recovery_hash(&r.recovery_auth)?;
+    let c = credential_challenge(&state, &headers, &account, &r.challenge, r.credential_version, "recovery")?;
+    let statement = crypto::credentials_statement(
+        &service(&state),
+        &account.account_key,
+        &c,
+        "-",
+        &auth_hash,
+        &crypto::hash(&crypto::unb64(&r.recovery_blob).expect("checked blob")),
+    );
+    if !crypto::verify(&account.account_key, &statement, &r.signature) {
+        return Err(ApiError::bad("credential signature does not match the account key"));
+    }
+    if !state.store.lock().expect("store lock").update_credentials(
+        &c,
+        &Credentials::Recovery { auth_hash: &auth_hash, key_blob: &r.recovery_blob },
+        now_ms(),
+    )? {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "conflict",
+            "challenge expired, consumed or credentials changed".into(),
+        ));
     }
     Ok(Json(json!({})))
 }
@@ -383,11 +572,16 @@ pub async fn devices(State(state): State<AppState>, headers: HeaderMap) -> Reply
 }
 
 pub async fn add_device(State(state): State<AppState>, headers: HeaderMap, Json(d): Json<DeviceCert>) -> Reply {
-    let account = authenticated(&state, &headers)?;
+    let account = enrollment(&state, &headers)?;
     let now = now_ms();
     crypto::check_certificate(&account.account_key, &d.device_key, d.issued_at, d.expires_at, &d.signature, now)
         .map_err(ApiError::bad)?;
     let store = state.store.lock().expect("store lock");
+    let hash = token_hash(bearer(&headers).ok_or_else(ApiError::unauthorized)?);
+    let (_, bound) = store.enrollment(&hash, now)?.ok_or_else(ApiError::unauthorized)?;
+    if bound.as_ref().is_some_and(|key| key != &d.device_key) {
+        return Err(ApiError::bad("enrollment belongs to another device"));
+    }
     match store.device_owner(&d.device_key)? {
         Some((owner, _)) if owner != account.id => {
             return Err(ApiError(StatusCode::CONFLICT, "taken", "device key belongs to another account".into()));
@@ -397,9 +591,7 @@ pub async fn add_device(State(state): State<AppState>, headers: HeaderMap, Json(
     }
     store.upsert_device(account.id, &d.device_key, &device_name(&d.name), now)?;
     store.set_certificate(&d.device_key, &certificate(&d))?;
-    if let Some(token) = bearer(&headers) {
-        store.bind_session(&token_hash(token), &d.device_key)?;
-    }
+    store.bind_enrollment(&hash, &d.device_key)?;
     Ok(Json(json!({})))
 }
 
@@ -413,7 +605,7 @@ pub struct Revoke {
 pub async fn revoke_device(State(state): State<AppState>, headers: HeaderMap, Json(r): Json<Revoke>) -> Reply {
     let account = authenticated(&state, &headers)?;
     let now = now_ms();
-    if (r.revoked_at - now).abs() > SKEW_MS {
+    if r.revoked_at < 0 || r.revoked_at.abs_diff(now) > SKEW_MS as u64 {
         return Err(ApiError::bad("revocation time is off"));
     }
     let statement = crypto::revoke_statement(&account.account_key, &r.device_key, r.revoked_at);

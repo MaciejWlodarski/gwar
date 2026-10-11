@@ -34,7 +34,7 @@ export const KDF_PROFILE = { algorithm: "argon2id", version: 19, length: 64, ...
 export function checkKdf(kdf: Kdf): void {
   let salt: Uint8Array;
   try {
-    if (!kdf || Object.keys(kdf).sort().join(",") !== "m,p,salt,t" || typeof kdf.salt !== "string" || !/^[A-Za-z0-9_-]+$/.test(kdf.salt)) throw new Error();
+    if (!kdf || Object.keys(kdf).sort().join(",") !== "m,p,salt,t" || typeof kdf.salt !== "string" || kdf.salt.length < 22 || kdf.salt.length > 86 || !/^[A-Za-z0-9_-]+$/.test(kdf.salt)) throw new Error();
     salt = decodeBase64Url(kdf.salt);
     if (encodeBase64Url(salt) !== kdf.salt) throw new Error();
   } catch {
@@ -240,6 +240,54 @@ export async function verifyDeviceCertificate(accountKey: string, c: SignedDevic
 
 export async function signRevocation(account: KeyPairJwk, deviceKey: string, now: number = Date.now()) {
   return { device_key: deviceKey, revoked_at: now, signature: await signText(account.jwk, revokeStatement(account.publicKey, deviceKey, now)) };
+}
+
+export interface ConnectChallenge {
+  challenge: string;
+  expires_at: number;
+  credential_version: number;
+  service_key: string;
+}
+
+export type ChallengePurpose = "session" | "password" | "recovery";
+
+export async function hashBytes(bytes: Uint8Array): Promise<string> {
+  return encodeBase64Url(new Uint8Array(await subtle().digest("SHA-256", buf(bytes))));
+}
+
+export const hashText = (text: string): Promise<string> => hashBytes(enc.encode(text));
+
+export function checkChallenge(c: ConnectChallenge, serviceKey: string): void {
+  const canonical = (text: string, length: number) => {
+    if (typeof text !== "string" || text.length !== Math.ceil(length * 4 / 3) || !/^[A-Za-z0-9_-]+$/.test(text)) return false;
+    const bytes = decodeBase64Url(text);
+    return bytes.length === length && encodeBase64Url(bytes) === text;
+  };
+  if (!c || !canonical(serviceKey, 32) || c.service_key !== serviceKey || !canonical(c.challenge, 32)
+      || !Number.isSafeInteger(c.expires_at) || c.expires_at <= Date.now() || c.expires_at > Date.now() + 300_000
+      || !Number.isSafeInteger(c.credential_version) || c.credential_version < 0) {
+    throw new Error("Invalid Connect challenge");
+  }
+}
+
+export function certificateHash(accountKey: string, c: SignedDevice): Promise<string> {
+  return hashText(`${deviceStatement(accountKey, c.device_key, c.issued_at, c.expires_at)}\n${c.signature}`);
+}
+
+export async function sessionStatement(serviceKey: string, accountKey: string, token: string, c: ConnectChallenge, device: SignedDevice): Promise<string> {
+  return `gwar session v1\n${serviceKey}\n${accountKey}\n${await certificateHash(accountKey, device)}\n${await hashText(token)}\n${c.challenge}\n${c.expires_at}`;
+}
+
+export function kdfHash(kdf: Kdf): Promise<string> {
+  checkKdf(kdf);
+  return hashText(`gwar kdf v1\nargon2id\n19\n${kdf.salt}\n${kdf.m}\n${kdf.t}\n${kdf.p}\n64`);
+}
+
+export async function credentialsStatement(
+  purpose: "password" | "recovery", serviceKey: string, accountKey: string, token: string, c: ConnectChallenge,
+  kdf: Kdf | null, authKey: string, keyBlob: string,
+): Promise<string> {
+  return `gwar credentials v1\n${purpose}\n${serviceKey}\n${accountKey}\n${await hashText(token)}\n${c.challenge}\n${c.expires_at}\n${c.credential_version}\n${kdf ? await kdfHash(kdf) : "-"}\n${await hashBytes(decodeBase64Url(authKey))}\n${await hashBytes(decodeBase64Url(keyBlob))}`;
 }
 
 // ----------------------------------------------------------- recovery code

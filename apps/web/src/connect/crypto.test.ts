@@ -1,7 +1,14 @@
 import { describe, expect, it } from "vitest";
+import integrityVectors from "../../../../crates/gwar-connect/tests/integrity-vectors.json";
 import { decodeBase64Url, encodeBase64Url } from "../net/base64url";
 import {
   certifyDevice,
+  certificateHash,
+  credentialsStatement,
+  hashText,
+  kdfHash,
+  sessionStatement,
+  signText,
   formatRecoveryCode,
   keyFromSeed,
   normalizePassword,
@@ -196,6 +203,27 @@ describe("password profile allowlist", () => {
     const kdf = newKdf();
     for (const change of [{ m: 19456 }, { m: 1048576 }, { t: 1 }, { t: 10 }, { p: 2 }, { version: 16 }, { length: 32 }, { algorithm: "argon2i" }, { salt: "AA" }, { salt: b64(fill(65, 1)) }, { salt: kdf.salt + "=" }]) {
       await expect(passwordSecrets("secret", { ...kdf, ...change })).rejects.toThrow("Unsupported password key derivation profile");
+    }
+  });
+});
+
+
+describe("shared Connect integrity vectors", () => {
+  it("matches Rust session and credential statements, hashes and signatures", async () => {
+    const v = integrityVectors;
+    const account = await keyFromSeed(fill(32, 1));
+    const device = await keyFromSeed(fill(32, 2));
+    expect(await certificateHash(v.account_key, v.device)).toBe(v.certificate_hash);
+    expect(await kdfHash(v.kdf)).toBe(v.kdf_hash);
+    const session = await sessionStatement(v.challenge.service_key, v.account_key, v.token, v.challenge, v.device);
+    expect(session).toBe(v.session_statement);
+    expect(await hashText(session)).toBe(v.session_hash);
+    expect(await signText(device.jwk, session)).toBe(v.session_signature);
+    for (const purpose of ["password", "recovery"] as const) {
+      const statement = await credentialsStatement(purpose, v.challenge.service_key, v.account_key, v.token, v.challenge, purpose === "password" ? v.kdf : null, v.auth_key, v.key_blob);
+      expect(statement).toBe(v[`${purpose}_statement`]);
+      expect(await hashText(statement)).toBe(v[`${purpose}_hash`]);
+      expect(await signText(account.jwk, statement)).toBe(v[`${purpose}_signature`]);
     }
   });
 });

@@ -31,6 +31,7 @@ pub struct Account {
     pub recovery_hash: String,
     pub recovery_blob: String,
     pub created_at: i64,
+    pub credential_version: i64,
 }
 
 pub struct NewAccount<'a> {
@@ -62,6 +63,23 @@ pub struct Revocation {
     pub device_key: String,
     pub revoked_at: i64,
     pub signature: String,
+}
+
+pub struct Challenge {
+    pub nonce: String,
+    pub token_hash: String,
+    pub account_id: i64,
+    pub purpose: String,
+    pub certificate_hash: String,
+    pub device_key: Option<String>,
+    pub certificate_expires_at: i64,
+    pub credential_version: i64,
+    pub expires_at: i64,
+}
+
+pub enum Credentials<'a> {
+    Password { kdf: &'a Kdf, auth_hash: &'a str, key_blob: &'a str },
+    Recovery { auth_hash: &'a str, key_blob: &'a str },
 }
 
 const SCHEMA: &str = r#"
@@ -121,6 +139,24 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE devices ADD COLUMN expires_at INTEGER;
     ALTER TABLE devices ADD COLUMN signature TEXT;
     "#,
+    // 3: every persistent session needs fresh device proof. Legacy tokens end.
+    r#"
+    DELETE FROM sessions;
+    ALTER TABLE sessions ADD COLUMN kind TEXT NOT NULL DEFAULT 'device';
+    ALTER TABLE sessions ADD COLUMN certificate_expires_at INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE accounts ADD COLUMN credential_version INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE challenges (
+        nonce TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL REFERENCES sessions(token_hash) ON DELETE CASCADE,
+        account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        purpose TEXT NOT NULL,
+        certificate_hash TEXT NOT NULL,
+        device_key TEXT,
+        certificate_expires_at INTEGER NOT NULL,
+        credential_version INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL
+    );
+    "#,
 ];
 
 /// A device certificate as stored (docs/connect.md).
@@ -151,10 +187,12 @@ fn account_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
         recovery_hash: r.get(6)?,
         recovery_blob: r.get(7)?,
         created_at: r.get(8)?,
+        credential_version: r.get(9)?,
     })
 }
 
-const ACCOUNT_COLUMNS: &str = "id,handle,account_key,kdf,auth_hash,key_blob,recovery_hash,recovery_blob,created_at";
+const ACCOUNT_COLUMNS: &str =
+    "id,handle,account_key,kdf,auth_hash,key_blob,recovery_hash,recovery_blob,created_at,credential_version";
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
@@ -222,14 +260,6 @@ impl Store {
     pub fn account(&self, id: i64) -> Result<Option<Account>> {
         let sql = format!("SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE id=?1");
         Ok(self.db.query_row(&sql, [id], account_row).optional()?)
-    }
-
-    pub fn set_password(&self, id: i64, kdf: &Kdf, auth_hash: &str, key_blob: &str) -> Result<()> {
-        self.db.execute(
-            "UPDATE accounts SET kdf=?2, auth_hash=?3, key_blob=?4 WHERE id=?1",
-            params![id, serde_json::to_string(kdf)?, auth_hash, key_blob],
-        )?;
-        Ok(())
     }
 
     // -------------------------------------------------------------- devices
@@ -322,54 +352,153 @@ impl Store {
 
     // ------------------------------------------------------------- sessions
 
-    pub fn insert_session(&self, token_hash: &str, account: i64, now: i64, expires_at: i64) -> Result<()> {
-        self.db.execute("DELETE FROM sessions WHERE expires_at < ?1", [now])?;
+    pub fn insert_enrollment(
+        &self,
+        token_hash: &str,
+        account: i64,
+        device: Option<&str>,
+        now: i64,
+        expires_at: i64,
+    ) -> Result<()> {
+        self.db.execute("DELETE FROM sessions WHERE expires_at <= ?1", [now])?;
         self.db.execute(
-            "INSERT INTO sessions(token_hash,account_id,created_at,expires_at) VALUES(?1,?2,?3,?4)",
-            params![token_hash, account, now, expires_at],
+            "INSERT INTO sessions(token_hash,account_id,device_key,created_at,expires_at,kind) VALUES(?1,?2,?3,?4,?5,'enrollment')",
+            params![token_hash, account, device, now, expires_at],
         )?;
         Ok(())
     }
 
-    /// The account and device of a live session.
-    pub fn session(&self, token_hash: &str, now: i64) -> Result<Option<(i64, Option<String>)>> {
+    pub fn enrollment(&self, token_hash: &str, now: i64) -> Result<Option<(i64, Option<String>)>> {
+        Ok(self.db.query_row(
+            "SELECT s.account_id,s.device_key FROM sessions s WHERE s.token_hash=?1 AND s.kind='enrollment'
+             AND s.expires_at>?2 AND (s.device_key IS NULL OR EXISTS
+               (SELECT 1 FROM devices d WHERE d.account_id=s.account_id AND d.device_key=s.device_key AND d.revoked_at IS NULL))",
+            params![token_hash, now], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?)
+    }
+
+    /// Every usable persistent token belongs to a non-revoked, unexpired device.
+    pub fn session(&self, token_hash: &str, now: i64) -> Result<Option<(i64, String)>> {
         Ok(self
             .db
             .query_row(
-                "SELECT account_id,device_key FROM sessions WHERE token_hash=?1 AND expires_at > ?2",
+                "SELECT s.account_id,s.device_key FROM sessions s JOIN devices d
+             ON d.account_id=s.account_id AND d.device_key=s.device_key
+             WHERE s.token_hash=?1 AND s.kind='device' AND s.expires_at>?2
+             AND s.certificate_expires_at>?2 AND d.revoked_at IS NULL AND d.expires_at>?2",
                 params![token_hash, now],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?)
     }
 
-    /// Moves a session's expiry to `expires_at`, at most once a day.
     pub fn extend_session(&self, token_hash: &str, expires_at: i64) -> Result<()> {
         self.db.execute(
-            "UPDATE sessions SET expires_at=?2 WHERE token_hash=?1 AND expires_at < ?2 - 86400000",
+            "UPDATE sessions SET expires_at=MIN(?2,certificate_expires_at)
+             WHERE token_hash=?1 AND kind='device' AND expires_at < MIN(?2,certificate_expires_at) - 86400000",
             params![token_hash, expires_at],
         )?;
         Ok(())
     }
 
-    /// Records that the session was used to register `device_key`. A session
-    /// belongs to the first device it registers; later ones don't move it.
-    pub fn bind_session(&self, token_hash: &str, device_key: &str) -> Result<()> {
+    /// An enrollment credential can enroll or renew only its first device.
+    pub fn bind_enrollment(&self, token_hash: &str, device_key: &str) -> Result<()> {
         self.db.execute(
-            "UPDATE sessions SET device_key=?2 WHERE token_hash=?1 AND device_key IS NULL",
+            "UPDATE sessions SET device_key=?2 WHERE token_hash=?1 AND kind='enrollment' AND device_key IS NULL",
             [token_hash, device_key],
         )?;
         Ok(())
     }
 
-    pub fn delete_session(&self, token_hash: &str) -> Result<()> {
-        self.db.execute("DELETE FROM sessions WHERE token_hash=?1", [token_hash])?;
+    pub fn insert_challenge(&self, c: &Challenge) -> Result<()> {
+        self.db.execute("DELETE FROM challenges WHERE expires_at <= ?1", [c.expires_at - 300000])?;
+        // One outstanding challenge per token and purpose.
+        self.db.execute("DELETE FROM challenges WHERE token_hash=?1 AND purpose=?2", [&c.token_hash, &c.purpose])?;
+        self.db.execute(
+            "INSERT INTO challenges(nonce,token_hash,account_id,purpose,certificate_hash,device_key,certificate_expires_at,credential_version,expires_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![c.nonce, c.token_hash, c.account_id, c.purpose, c.certificate_hash, c.device_key, c.certificate_expires_at, c.credential_version, c.expires_at],
+        )?;
         Ok(())
     }
 
-    /// Ends every session of `account` except `keep`.
-    pub fn end_other_sessions(&self, account: i64, keep: &str) -> Result<()> {
-        self.db.execute("DELETE FROM sessions WHERE account_id=?1 AND token_hash<>?2", params![account, keep])?;
+    pub fn challenge(&self, token_hash: &str, nonce: &str, now: i64) -> Result<Option<Challenge>> {
+        Ok(self.db.query_row(
+            "SELECT nonce,token_hash,account_id,purpose,certificate_hash,device_key,certificate_expires_at,credential_version,expires_at
+             FROM challenges WHERE token_hash=?1 AND nonce=?2 AND expires_at>?3",
+            params![token_hash, nonce, now], |r| Ok(Challenge {
+                nonce: r.get(0)?, token_hash: r.get(1)?, account_id: r.get(2)?, purpose: r.get(3)?, certificate_hash: r.get(4)?,
+                device_key: r.get(5)?, certificate_expires_at: r.get(6)?, credential_version: r.get(7)?, expires_at: r.get(8)?,
+            }),
+        ).optional()?)
+    }
+
+    /// Consume both challenge and enrollment credential with session issuance.
+    pub fn exchange_session(&self, c: &Challenge, token_hash: &str, now: i64, idle_expires_at: i64) -> Result<bool> {
+        let tx = self.db.unchecked_transaction()?;
+        if self.enrollment(&c.token_hash, now)?.is_none() || c.certificate_expires_at <= now {
+            return Ok(false);
+        }
+        let consumed = tx.execute(
+            "DELETE FROM challenges WHERE nonce=?1 AND token_hash=?2 AND purpose='session' AND expires_at>?3",
+            params![c.nonce, c.token_hash, now],
+        )?;
+        if consumed != 1 {
+            return Ok(false);
+        }
+        tx.execute(
+            "INSERT INTO sessions(token_hash,account_id,created_at,expires_at,device_key,kind,certificate_expires_at)
+             VALUES(?1,?2,?3,?4,?5,'device',?6)",
+            params![
+                token_hash,
+                c.account_id,
+                now,
+                idle_expires_at.min(c.certificate_expires_at),
+                c.device_key,
+                c.certificate_expires_at
+            ],
+        )?;
+        tx.execute("DELETE FROM sessions WHERE token_hash=?1", [&c.token_hash])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Signature verification precedes this call; version, authorization and consumption are atomic.
+    pub fn update_credentials(&self, c: &Challenge, credentials: &Credentials<'_>, now: i64) -> Result<bool> {
+        let tx = self.db.unchecked_transaction()?;
+        if self.session(&c.token_hash, now)?.is_none() {
+            return Ok(false);
+        }
+        let changed = match credentials {
+            Credentials::Password { kdf, auth_hash, key_blob } => tx.execute(
+                "UPDATE accounts SET kdf=?2,auth_hash=?3,key_blob=?4,credential_version=credential_version+1
+                 WHERE id=?1 AND credential_version=?5",
+                params![c.account_id, serde_json::to_string(kdf)?, auth_hash, key_blob, c.credential_version],
+            )?,
+            Credentials::Recovery { auth_hash, key_blob } => tx.execute(
+                "UPDATE accounts SET recovery_hash=?2,recovery_blob=?3,credential_version=credential_version+1
+                 WHERE id=?1 AND credential_version=?4",
+                params![c.account_id, auth_hash, key_blob, c.credential_version],
+            )?,
+        };
+        if changed != 1 {
+            return Ok(false);
+        }
+        let consumed = tx.execute(
+            "DELETE FROM challenges WHERE nonce=?1 AND token_hash=?2 AND purpose=?3 AND expires_at>?4",
+            params![c.nonce, c.token_hash, c.purpose, now],
+        )?;
+        if consumed != 1 {
+            return Ok(false);
+        }
+        tx.execute("DELETE FROM sessions WHERE account_id=?1 AND token_hash<>?2", params![c.account_id, c.token_hash])?;
+        tx.execute("DELETE FROM challenges WHERE account_id=?1", [c.account_id])?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn delete_session(&self, token_hash: &str) -> Result<()> {
+        self.db.execute("DELETE FROM sessions WHERE token_hash=?1", [token_hash])?;
         Ok(())
     }
 
@@ -422,7 +551,7 @@ mod tests {
         )
         .unwrap();
         let store = Store::init(db).unwrap();
-        store.bind_session("t", "device").unwrap();
+        assert!(store.session("t", 1).unwrap().is_none());
         assert_eq!(store.vault(1).unwrap().version, 0);
         let version: usize = store.db.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(version, MIGRATIONS.len());

@@ -1,7 +1,7 @@
-import { decodeBase64Url } from "../net/base64url";
+import { decodeBase64Url, encodeBase64Url } from "../net/base64url";
 import type { ConnectRecord, ConnectStore } from "../net/identity";
 import { ConnectApi } from "./api";
-import { deviceStatement, openVault, revokeStatement, sealVault } from "./crypto";
+import { certificateHash, credentialsStatement, keyFromSeed, newKdf, openVault, revokeStatement, sealVault, sessionStatement, verifyDeviceCertificate, verifyText, type ConnectChallenge, type SignedDevice } from "./crypto";
 
 const DAY_MS = 86_400_000;
 
@@ -19,16 +19,16 @@ interface FakeDevice {
   certificate: FakeCertificate | null;
 }
 
-/** A tiny in-memory Connect service speaking the documented JSON API. It checks signatures like the real one. */
+/** In-memory API fixture; the real API regressions also exercise SQLite atomicity. */
 export class FakeService {
-  accounts = new Map<string, { account_key: string; kdf: unknown; auth_key: string; key_blob: string; recovery_auth: string; recovery_blob: string }>();
+  accounts = new Map<string, { account_key: string; kdf: unknown; auth_key: string; key_blob: string; recovery_auth: string; recovery_blob: string; credential_version: number }>();
   devices: FakeDevice[] = [];
-  /** Every `POST /v1/devices/renew` body received, to see what a client sent. */
-  renewals: Array<{ certificates: Array<{ device_key: string; issued_at: number; expires_at: number; signature: string }> }> = [];
-  /** Every request path (with method), in order. */
   requests: string[] = [];
   sessions = new Map<string, string>();
-  /** The sealed vault per handle, and its version (0 before the first write). */
+  enrollmentTokens = new Set<string>();
+  sessionDevices = new Map<string, string>();
+  expiries = new Map<string, number>();
+  challenges = new Map<string, { token: string; purpose: string; cert?: SignedDevice; reply: ConnectChallenge }>();
   vaults = new Map<string, { vault: string; version: number }>();
   n = 0;
 
@@ -37,103 +37,111 @@ export class FakeService {
     this.requests.push(`${init?.method ?? "GET"} ${path}`);
     const body = init?.body ? JSON.parse(init.body as string) : {};
     const auth = (init?.headers as Record<string, string> | undefined)?.Authorization?.replace("Bearer ", "");
-    const handleOfSession = auth ? this.sessions.get(auth) : undefined;
+    const handle = auth ? this.sessions.get(auth) : undefined;
     const ok = (data: unknown) => new Response(JSON.stringify(data), { status: 200 });
     const err = (status: number, error: string) => new Response(JSON.stringify({ error, message: error }), { status });
-    const session = (handle: string) => {
-      const t = `token-${++this.n}`;
-      this.sessions.set(t, handle);
-      return t;
+    const service = (await keyFromSeed(new Uint8Array(32).fill(42))).publicKey;
+    const session = (handle: string, enrollment: boolean, device?: string, expiry = Date.now() + 300_000) => {
+      const token = `token-${++this.n}`;
+      this.sessions.set(token, handle);
+      if (enrollment) this.enrollmentTokens.add(token);
+      if (device) this.sessionDevices.set(token, device);
+      this.expiries.set(token, expiry);
+      return token;
     };
-    const verify = async (accountKey: string, text: string, sig: string) => {
-      const key = await crypto.subtle.importKey("raw", decodeBase64Url(accountKey) as BufferSource, { name: "Ed25519" }, false, ["verify"]);
-      return crypto.subtle.verify({ name: "Ed25519" }, key, decodeBase64Url(sig) as BufferSource, new TextEncoder().encode(text));
-    };
-    // Like the service: a certificate replaces the stored one only if it lasts longer, and never for a revoked device.
-    const setCertificate = (device: FakeDevice, c: FakeCertificate) => {
-      if (device.revoked_at !== null || (device.certificate && device.certificate.expires_at >= c.expires_at)) return false;
-      device.certificate = { issued_at: c.issued_at, expires_at: c.expires_at, signature: c.signature };
-      return true;
-    };
-    // The service's check_certificate: lifetime and signature.
-    const certificateProblem = async (accountKey: string, c: { device_key: string; issued_at: number; expires_at: number; signature: string }) => {
-      if (c.expires_at <= Date.now() || c.expires_at - c.issued_at > 400 * DAY_MS) return true;
-      return !(await verify(accountKey, deviceStatement(accountKey, c.device_key, c.issued_at, c.expires_at), c.signature));
-    };
+    if (path === "/service-key") return ok({ key: service });
     if (path === "/register") {
       if (this.accounts.has(body.handle)) return err(409, "taken");
       const d = body.device;
-      if (!(await verify(body.account_key, deviceStatement(body.account_key, d.device_key, d.issued_at, d.expires_at), d.signature))) return err(400, "bad_request");
-      this.accounts.set(body.handle, body);
-      this.devices.push({ handle: body.handle, device_key: d.device_key, name: d.name, revoked_at: null, certificate: { issued_at: d.issued_at, expires_at: d.expires_at, signature: d.signature } });
-      return ok({ token: session(body.handle) });
+      if (!await verifyDeviceCertificate(body.account_key, d)) return err(400, "bad_request");
+      this.accounts.set(body.handle, { ...body, credential_version: 0 });
+      this.devices.push({ handle: body.handle, device_key: d.device_key, name: d.name, revoked_at: null, certificate: d });
+      return ok({ token: session(body.handle, true, d.device_key) });
     }
-    if (path === "/prelogin") return ok({ kdf: this.accounts.get(body.handle)?.kdf ?? { salt: "AAAAAAAAAAAAAAAAAAAAAA", m: 19456, t: 2, p: 1 } });
-    if (path === "/login") {
+    if (path === "/prelogin") return ok({ kdf: this.accounts.get(body.handle)?.kdf ?? newKdf() });
+    if (path === "/login" || path === "/recover") {
       const a = this.accounts.get(body.handle);
-      if (!a || a.auth_key !== body.auth_key) return err(401, "unauthorized");
-      return ok({ token: session(body.handle), account_key: a.account_key, key_blob: a.key_blob });
-    }
-    if (path === "/recover") {
-      const a = this.accounts.get(body.handle);
-      if (!a || a.recovery_auth !== body.recovery_auth) return err(401, "unauthorized");
-      return ok({ token: session(body.handle), account_key: a.account_key, recovery_blob: a.recovery_blob });
+      const recovery = path === "/recover";
+      if (!a || (recovery ? a.recovery_auth !== body.recovery_auth : a.auth_key !== body.auth_key)) return err(401, "unauthorized");
+      return ok({ token: session(body.handle, true), account_key: a.account_key, ...(recovery ? { recovery_blob: a.recovery_blob } : { key_blob: a.key_blob }) });
     }
     if (path.startsWith("/accounts/")) {
       const a = this.accounts.get(decodeURIComponent(path.slice(10)));
       return a ? ok({ handle: path.slice(10), account_key: a.account_key }) : err(404, "not_found");
     }
-    if (!handleOfSession) return err(401, "unauthorized");
-    const a = this.accounts.get(handleOfSession)!;
-    if (path === "/account/password") {
-      Object.assign(a, { kdf: body.kdf, auth_key: body.auth_key, key_blob: body.key_blob });
-      return ok({});
-    }
-    if (path === "/devices" && init?.method === "GET") {
-      return ok({ devices: this.devices.filter((d) => d.handle === handleOfSession).map((d) => ({ ...d, created_at: 1, last_seen: 1 })) });
-    }
-    if (path === "/devices") {
-      if (!(await verify(a.account_key, deviceStatement(a.account_key, body.device_key, body.issued_at, body.expires_at), body.signature))) return err(400, "bad_request");
+    if (!handle || !auth || (this.expiries.get(auth) ?? 0) <= Date.now()) return err(401, "unauthorized");
+    const a = this.accounts.get(handle)!;
+    const enrollment = this.enrollmentTokens.has(auth);
+    if (path === "/devices" && init?.method === "POST") {
+      if (!enrollment) return err(401, "unauthorized");
+      if (!await verifyDeviceCertificate(a.account_key, body)) return err(400, "bad_request");
+      const bound = this.sessionDevices.get(auth);
+      if (bound && bound !== body.device_key) return err(400, "bad_request");
       const known = this.devices.find((d) => d.device_key === body.device_key);
       if (known?.revoked_at) return err(410, "revoked");
+      if (known && known.handle !== handle) return err(409, "taken");
+      const certificate = { issued_at: body.issued_at, expires_at: body.expires_at, signature: body.signature };
       if (known) {
         known.name = body.name;
-        setCertificate(known, body);
-      } else {
-        this.devices.push({ handle: handleOfSession, device_key: body.device_key, name: body.name, revoked_at: null, certificate: { issued_at: body.issued_at, expires_at: body.expires_at, signature: body.signature } });
-      }
+        if (!known.certificate || known.certificate.expires_at < body.expires_at) known.certificate = certificate;
+      } else this.devices.push({ handle, device_key: body.device_key, name: body.name, revoked_at: null, certificate });
+      this.sessionDevices.set(auth, body.device_key);
       return ok({});
     }
-    if (path === "/devices/renew") {
-      const certificates: Array<{ device_key: string; issued_at: number; expires_at: number; signature: string }> = body.certificates ?? [];
-      this.renewals.push({ certificates });
-      if (certificates.length > 100) return err(400, "bad_request");
-      let renewed = 0;
-      for (const c of certificates) {
-        if (await certificateProblem(a.account_key, c)) return err(400, "bad_request");
-        const device = this.devices.find((d) => d.device_key === c.device_key);
-        // Revoked, unknown or someone else's: skipped, not an error.
-        if (device && device.handle === handleOfSession && setCertificate(device, c)) renewed++;
-      }
-      return ok({ renewed });
+    if (path === "/challenges") {
+      if (body.purpose === "session" ? !enrollment : enrollment) return err(401, "unauthorized");
+      if (!["session", "password", "recovery"].includes(body.purpose)) return err(400, "bad_request");
+      if (body.purpose === "session" && (this.sessionDevices.get(auth) !== body.device?.device_key || !await verifyDeviceCertificate(a.account_key, body.device))) return err(400, "bad_request");
+      const reply = { challenge: encodeBase64Url(crypto.getRandomValues(new Uint8Array(32))), expires_at: Date.now() + 300_000, credential_version: a.credential_version, service_key: service };
+      this.challenges.set(reply.challenge, { token: auth, purpose: body.purpose, cert: body.device, reply });
+      return ok(reply);
     }
+    if (path === "/session") {
+      const c = this.challenges.get(body.challenge);
+      if (!enrollment || !c || c.token !== auth || c.purpose !== "session" || c.reply.expires_at <= Date.now()) return err(401, "unauthorized");
+      if (await certificateHash(a.account_key, body.device) !== await certificateHash(a.account_key, c.cert!) || !await verifyText(body.device.device_key, await sessionStatement(service, a.account_key, auth, c.reply, body.device), body.signature)) return err(400, "bad_request");
+      const d = this.devices.find((d) => d.device_key === body.device.device_key && d.handle === handle);
+      if (!d || d.revoked_at !== null || body.device.expires_at <= Date.now()) return err(401, "unauthorized");
+      this.challenges.delete(body.challenge);
+      this.sessions.delete(auth);
+      return ok({ token: session(handle, false, d.device_key, Math.min(Date.now() + 90 * DAY_MS, body.device.expires_at)) });
+    }
+    if (enrollment) return err(401, "unauthorized");
+    if (path === "/account/password" || path === "/account/recovery") {
+      const c = this.challenges.get(body.challenge);
+      const purpose = path.endsWith("password") ? "password" : "recovery";
+      if (!c || c.token !== auth || c.purpose !== purpose || c.reply.expires_at <= Date.now()) return err(401, "unauthorized");
+      if (body.credential_version !== a.credential_version || c.reply.credential_version !== a.credential_version) return err(409, "conflict");
+      const recovery = purpose === "recovery";
+      const statement = await credentialsStatement(purpose, service, a.account_key, auth, c.reply, recovery ? null : body.kdf, recovery ? body.recovery_auth : body.auth_key, recovery ? body.recovery_blob : body.key_blob);
+      if (!await verifyText(a.account_key, statement, body.signature)) return err(400, "bad_request");
+      this.challenges.delete(body.challenge);
+      Object.assign(a, recovery ? { recovery_auth: body.recovery_auth, recovery_blob: body.recovery_blob } : { kdf: body.kdf, auth_key: body.auth_key, key_blob: body.key_blob });
+      a.credential_version++;
+      for (const [t, h] of this.sessions) if (h === handle && t !== auth) this.sessions.delete(t);
+      return ok({});
+    }
+    if (path === "/devices" && init?.method === "GET") return ok({ devices: this.devices.filter((d) => d.handle === handle).map((d) => ({ ...d, created_at: 1, last_seen: 1 })) });
     if (path === "/devices/revoke") {
-      if (!(await verify(a.account_key, revokeStatement(a.account_key, body.device_key, body.revoked_at), body.signature))) return err(400, "bad_request");
-      this.devices.find((d) => d.device_key === body.device_key)!.revoked_at = body.revoked_at;
+      if (!await verifyText(a.account_key, revokeStatement(a.account_key, body.device_key, body.revoked_at), body.signature)) return err(400, "bad_request");
+      const d = this.devices.find((d) => d.device_key === body.device_key && d.handle === handle);
+      if (!d) return err(404, "not_found");
+      d.revoked_at = body.revoked_at;
+      for (const [t, device] of this.sessionDevices) if (device === body.device_key) this.sessions.delete(t);
       return ok({});
     }
     if (path === "/vault" && init?.method === "GET") {
-      const v = this.vaults.get(handleOfSession);
+      const v = this.vaults.get(handle);
       return ok({ vault: v?.vault ?? null, version: v?.version ?? 0, updated_at: 1 });
     }
     if (path === "/vault") {
-      const have = this.vaults.get(handleOfSession)?.version ?? 0;
+      const have = this.vaults.get(handle)?.version ?? 0;
       if (body.version !== have) return err(409, "conflict");
-      this.vaults.set(handleOfSession, { vault: body.vault, version: have + 1 });
+      this.vaults.set(handle, { vault: body.vault, version: have + 1 });
       return ok({ version: have + 1 });
     }
     if (path === "/logout") {
-      this.sessions.delete(auth!);
+      this.sessions.delete(auth);
       return ok({});
     }
     return err(404, "not_found");

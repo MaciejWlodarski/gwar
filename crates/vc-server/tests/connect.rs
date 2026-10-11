@@ -49,14 +49,15 @@ async fn devices_of_one_account_are_one_person_until_revoked() {
     let blob = b64(&[0u8; 60]);
     let register = json!({
         "handle": "ann", "account_key": first["account_key"],
-        "kdf": {"salt": b64(&[1u8; 16]), "m": 19456, "t": 2, "p": 1},
+        "kdf": {"salt": b64(&[1u8; 16]), "m": 65536, "t": 3, "p": 1},
         "auth_key": b64(&[2u8; 32]), "key_blob": blob, "recovery_auth": b64(&[3u8; 32]), "recovery_blob": blob,
         "device": first,
     });
     let http = reqwest::Client::new();
     let reply: Value =
         http.post(format!("{url}/v1/register")).json(&register).send().await.unwrap().json().await.unwrap();
-    let token = reply["token"].as_str().unwrap().to_owned();
+    let enrollment = reply["token"].as_str().unwrap().to_owned();
+    let token = connect_session(&http, &url, &enrollment, &account, &laptop, first.clone()).await;
 
     let server = TestServer::start().await;
     tokio::spawn(vc_server::connect::follow_every(
@@ -83,7 +84,22 @@ async fn devices_of_one_account_are_one_person_until_revoked() {
     // The phone signed in on Connect too.
     let mut phone_cert = certificate(&account, &phone, now(), now() + year);
     phone_cert["name"] = json!("phone");
-    let added = http.post(format!("{url}/v1/devices")).bearer_auth(&token).json(&phone_cert).send().await.unwrap();
+    let login: Value = http
+        .post(format!("{url}/v1/login"))
+        .json(&json!({"handle": "ann", "auth_key": b64(&[2; 32])}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let added = http
+        .post(format!("{url}/v1/devices"))
+        .bearer_auth(login["token"].as_str().unwrap())
+        .json(&phone_cert)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(added.status(), 200);
 
     // Revoking the phone on Connect signs it out here, and keeps it out.
@@ -617,4 +633,47 @@ async fn a_404_clears_even_an_expired_cached_attestation() {
     })
     .await;
     assert_next_check_in(&store, id, 3600 * 1000);
+}
+
+async fn connect_session(
+    http: &reqwest::Client,
+    url: &str,
+    token: &str,
+    account: &SigningKey,
+    device: &SigningKey,
+    cert: Value,
+) -> String {
+    let reply: Value = http
+        .post(format!("{url}/v1/challenges"))
+        .bearer_auth(token)
+        .json(&json!({"purpose": "session", "device": cert}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let c = gwar_connect::store::Challenge {
+        nonce: reply["challenge"].as_str().unwrap().into(),
+        token_hash: gwar_connect::crypto::hash(token.as_bytes()),
+        account_id: 0,
+        purpose: "session".into(),
+        certificate_hash: gwar_connect::crypto::certificate_hash(
+            &public_key(account),
+            &public_key(device),
+            &gwar_connect::store::Certificate {
+                issued_at: cert["issued_at"].as_i64().unwrap(),
+                expires_at: cert["expires_at"].as_i64().unwrap(),
+                signature: cert["signature"].as_str().unwrap().into(),
+            },
+        ),
+        device_key: None,
+        certificate_expires_at: 0,
+        credential_version: 0,
+        expires_at: reply["expires_at"].as_i64().unwrap(),
+    };
+    let statement =
+        gwar_connect::crypto::session_statement(reply["service_key"].as_str().unwrap(), &public_key(account), &c);
+    let reply: Value = http.post(format!("{url}/v1/session")).bearer_auth(token).json(&json!({"challenge": c.nonce, "device": cert, "signature": b64(&device.sign(statement.as_bytes()).to_bytes())})).send().await.unwrap().json().await.unwrap();
+    reply["token"].as_str().unwrap().into()
 }

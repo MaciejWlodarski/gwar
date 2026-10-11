@@ -537,6 +537,7 @@ export const en = {
   "account.accountKey": "Account key",
   "account.thisDevice": "This device",
   "account.devices": "Devices",
+  "account.devicesHint": "Names and activity are reported by Connect; this list may be incomplete. Device keys identify the devices.",
   "account.devicesFailed": "Could not load the devices.",
   "account.refresh": "Refresh",
   "account.revoked": "Revoked",

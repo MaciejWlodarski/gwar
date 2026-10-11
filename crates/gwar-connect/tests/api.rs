@@ -8,6 +8,7 @@ use gwar_connect::{Config, crypto};
 use hkdf::Hkdf;
 use serde_json::{Value, json};
 use sha2::Sha256;
+use std::sync::Arc;
 
 const M: u32 = 65_536;
 const T: u32 = 3;
@@ -94,18 +95,102 @@ fn certificate(account: &SigningKey, device: &SigningKey, name: &str) -> Value {
 struct Api {
     base: String,
     http: reqwest::Client,
+    state: Arc<gwar_connect::Connect>,
 }
 
 impl Api {
     async fn start() -> Self {
-        let addr = gwar_connect::start(Config {
-            database: None,
-            bind: "127.0.0.1:0".parse().unwrap(),
-            origins: vec!["https://app.example".into()],
-        })
-        .await
-        .unwrap();
-        Self { base: format!("http://{addr}/v1"), http: reqwest::Client::new() }
+        let state = Arc::new(gwar_connect::Connect::new(gwar_connect::store::Store::in_memory().unwrap()).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = gwar_connect::router(state.clone(), &["https://app.example".into()]);
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.unwrap();
+        });
+        Self { base: format!("http://{addr}/v1"), http: reqwest::Client::new(), state }
+    }
+
+    async fn challenge(&self, token: &str, purpose: &str, device: Option<Value>) -> gwar_connect::store::Challenge {
+        let (status, reply) =
+            self.post("/challenges", Some(token), json!({"purpose": purpose, "device": device})).await;
+        assert_eq!(status, 200, "{reply}");
+        gwar_connect::store::Challenge {
+            nonce: reply["challenge"].as_str().unwrap().into(),
+            token_hash: crypto::hash(token.as_bytes()),
+            account_id: self
+                .state
+                .store
+                .lock()
+                .unwrap()
+                .session(&crypto::hash(token.as_bytes()), gwar_connect::api::now_ms())
+                .unwrap()
+                .map(|s| s.0)
+                .unwrap_or(0),
+            purpose: purpose.into(),
+            certificate_hash: String::new(),
+            device_key: None,
+            certificate_expires_at: 0,
+            credential_version: reply["credential_version"].as_i64().unwrap(),
+            expires_at: reply["expires_at"].as_i64().unwrap(),
+        }
+    }
+
+    async fn device_session(&self, token: &str, account: &SigningKey, device: &SigningKey, cert: Value) -> String {
+        let mut c = self.challenge(token, "session", Some(cert.clone())).await;
+        let (_, service) = self.get("/service-key", None).await;
+        let account_key = b64(account.verifying_key().as_bytes());
+        let device_key = b64(device.verifying_key().as_bytes());
+        let certificate = gwar_connect::store::Certificate {
+            issued_at: cert["issued_at"].as_i64().unwrap(),
+            expires_at: cert["expires_at"].as_i64().unwrap(),
+            signature: cert["signature"].as_str().unwrap().into(),
+        };
+        c.certificate_hash = crypto::certificate_hash(&account_key, &device_key, &certificate);
+        let statement = crypto::session_statement(service["key"].as_str().unwrap(), &account_key, &c);
+        let body = json!({"challenge": c.nonce, "device": cert, "signature": b64(&device.sign(statement.as_bytes()).to_bytes())});
+        let (status, reply) = self.post("/session", Some(token), body).await;
+        assert_eq!(status, 200, "{reply}");
+        reply["token"].as_str().unwrap().into()
+    }
+
+    async fn register(
+        &self,
+        handle: &str,
+        password: &str,
+        account: &SigningKey,
+        device: &SigningKey,
+        code: &[u8; 20],
+    ) -> String {
+        let body = sign_up(handle, password, account, device, code);
+        let (status, reply) = self.post("/register", None, body.clone()).await;
+        assert_eq!(status, 200, "{reply}");
+        self.device_session(reply["token"].as_str().unwrap(), account, device, body["device"].clone()).await
+    }
+
+    async fn signed_credentials(&self, token: &str, account: &SigningKey, purpose: &str, mut body: Value) -> Value {
+        let c = self.challenge(token, purpose, None).await;
+        let (_, service) = self.get("/service-key", None).await;
+        let recovery = purpose == "recovery";
+        let kdf_hash =
+            if recovery { "-".into() } else { crypto::kdf_hash(&serde_json::from_value(body["kdf"].clone()).unwrap()) };
+        let auth_hash = crypto::hash(
+            &crypto::unb64(body[if recovery { "recovery_auth" } else { "auth_key" }].as_str().unwrap()).unwrap(),
+        );
+        let blob_hash = crypto::hash(
+            &crypto::unb64(body[if recovery { "recovery_blob" } else { "key_blob" }].as_str().unwrap()).unwrap(),
+        );
+        let statement = crypto::credentials_statement(
+            service["key"].as_str().unwrap(),
+            &b64(account.verifying_key().as_bytes()),
+            &c,
+            &kdf_hash,
+            &auth_hash,
+            &blob_hash,
+        );
+        body["challenge"] = json!(c.nonce);
+        body["credential_version"] = json!(c.credential_version);
+        body["signature"] = json!(b64(&account.sign(statement.as_bytes()).to_bytes()));
+        body
     }
 
     async fn call(
@@ -179,10 +264,7 @@ async fn one_identity_on_every_device() {
     let account = SigningKey::from_bytes(&rand::random());
     let laptop = SigningKey::from_bytes(&rand::random());
     let code: [u8; 20] = rand::random();
-    let (status, reply) =
-        api.post("/register", None, sign_up("Maciej", "correct horse", &account, &laptop, &code)).await;
-    assert_eq!(status, 200, "{reply}");
-    let token = reply["token"].as_str().unwrap().to_owned();
+    let token = api.register("Maciej", "correct horse", &account, &laptop, &code).await;
     let (_, me) = api.get("/account", Some(&token)).await;
     assert_eq!(me["handle"], "maciej");
 
@@ -192,6 +274,7 @@ async fn one_identity_on_every_device() {
     let phone = SigningKey::from_bytes(&rand::random());
     let (status, _) = api.post("/devices", Some(&phone_token), certificate(&decrypted, &phone, "phone")).await;
     assert_eq!(status, 200);
+    let phone_token = api.device_session(&phone_token, &account, &phone, certificate(&account, &phone, "phone")).await;
     let (_, list) = api.get("/devices", Some(&token)).await;
     assert_eq!(list["devices"].as_array().unwrap().len(), 2);
 
@@ -218,7 +301,8 @@ async fn one_identity_on_every_device() {
     assert_eq!(entry["device_key"], phone_key);
     assert!(crypto::verify(&account_key, &statement, entry["signature"].as_str().unwrap()));
     assert_eq!(api.get("/devices", Some(&phone_token)).await.0, 401, "its session ended");
-    let (status, _) = api.post("/devices", Some(&token), certificate(&account, &phone, "phone")).await;
+    let (enrollment, _) = log_in(&api, "maciej", "correct horse").await.unwrap();
+    let (status, _) = api.post("/devices", Some(&enrollment), certificate(&account, &phone, "phone")).await;
     assert_eq!(status, 410, "a revoked device stays revoked");
 }
 
@@ -260,8 +344,13 @@ async fn the_recovery_code_restores_access_and_a_new_password() {
     let (enc, auth) = password_secrets("new password", &salt, M, T);
     let body = json!({"kdf": {"salt": b64(&salt), "m": M, "t": T, "p": 1}, "auth_key": b64(&auth),
                       "key_blob": seal(&enc, rand::random(), &account.to_bytes(), account_key)});
-    let token = reply["token"].as_str().unwrap();
-    let (status, _) = api.call(reqwest::Method::PUT, "/account/password", Some(token), Some(body)).await;
+    let enrollment = reply["token"].as_str().unwrap();
+    let device = SigningKey::from_bytes(&rand::random());
+    let cert = certificate(&account, &device, "recovered");
+    assert_eq!(api.post("/devices", Some(enrollment), cert.clone()).await.0, 200);
+    let token = api.device_session(enrollment, &account, &device, cert).await;
+    let body = api.signed_credentials(&token, &account, "password", body).await;
+    let (status, _) = api.put("/account/password", Some(&token), body).await;
     assert_eq!(status, 200);
     assert!(log_in(&api, "bob", "old password").await.is_none());
     assert!(log_in(&api, "bob", "new password").await.is_some());
@@ -272,14 +361,8 @@ async fn the_vault_follows_the_account_and_survives_a_password_change() {
     let api = Api::start().await;
     let account = SigningKey::from_bytes(&rand::random());
     let account_key = b64(account.verifying_key().as_bytes());
-    let (_, reply) = api
-        .post(
-            "/register",
-            None,
-            sign_up("dana", "pw", &account, &SigningKey::from_bytes(&rand::random()), &rand::random()),
-        )
-        .await;
-    let laptop_token = reply["token"].as_str().unwrap().to_owned();
+    let laptop = SigningKey::from_bytes(&rand::random());
+    let laptop_token = api.register("dana", "pw", &account, &laptop, &rand::random()).await;
     let (status, empty) = api.get("/vault", Some(&laptop_token)).await;
     assert_eq!((status, &empty["vault"], &empty["version"]), (200, &Value::Null, &json!(0)));
 
@@ -296,7 +379,11 @@ async fn the_vault_follows_the_account_and_survives_a_password_change() {
     assert_eq!(api.put("/vault", Some(&laptop_token), json!({"vault": "AAAA", "version": 1})).await.0, 400);
 
     // A new device logs in and reads it with the key it derives from the account key.
-    let (phone_token, decrypted) = log_in(&api, "dana", "pw").await.unwrap();
+    let (enrollment, decrypted) = log_in(&api, "dana", "pw").await.unwrap();
+    let phone = SigningKey::from_bytes(&rand::random());
+    let cert = certificate(&account, &phone, "phone");
+    assert_eq!(api.post("/devices", Some(&enrollment), cert.clone()).await.0, 200);
+    let phone_token = api.device_session(&enrollment, &account, &phone, cert).await;
     let (_, got) = api.get("/vault", Some(&phone_token)).await;
     assert_eq!(open_vault(&vault_key(&decrypted), got["vault"].as_str().unwrap(), &account_key), contents);
 
@@ -305,8 +392,12 @@ async fn the_vault_follows_the_account_and_survives_a_password_change() {
     let (enc, auth) = password_secrets("pw2", &salt, M, T);
     let body = json!({"kdf": {"salt": b64(&salt), "m": M, "t": T, "p": 1}, "auth_key": b64(&auth),
                       "key_blob": seal(&enc, rand::random(), &account.to_bytes(), &account_key)});
+    let body = api.signed_credentials(&phone_token, &account, "password", body).await;
     assert_eq!(api.put("/account/password", Some(&phone_token), body).await.0, 200);
-    let (token, decrypted) = log_in(&api, "dana", "pw2").await.unwrap();
+    let (enrollment, decrypted) = log_in(&api, "dana", "pw2").await.unwrap();
+    let cert = certificate(&account, &phone, "phone");
+    assert_eq!(api.post("/devices", Some(&enrollment), cert.clone()).await.0, 200);
+    let token = api.device_session(&enrollment, &account, &phone, cert).await;
     let (_, got) = api.get("/vault", Some(&token)).await;
     assert_eq!(open_vault(&vault_key(&decrypted), got["vault"].as_str().unwrap(), &account_key), contents);
 }
@@ -316,11 +407,12 @@ async fn revoking_a_device_ends_its_sessions() {
     let api = Api::start().await;
     let account = SigningKey::from_bytes(&rand::random());
     let laptop = SigningKey::from_bytes(&rand::random());
-    let (_, reply) = api.post("/register", None, sign_up("erin", "pw", &account, &laptop, &rand::random())).await;
-    let laptop_token = reply["token"].as_str().unwrap().to_owned();
+    let laptop_token = api.register("erin", "pw", &account, &laptop, &rand::random()).await;
     let (phone_token, _) = log_in(&api, "erin", "pw").await.unwrap();
     let phone = SigningKey::from_bytes(&rand::random());
-    assert_eq!(api.post("/devices", Some(&phone_token), certificate(&account, &phone, "phone")).await.0, 200);
+    let cert = certificate(&account, &phone, "phone");
+    assert_eq!(api.post("/devices", Some(&phone_token), cert.clone()).await.0, 200);
+    let phone_token = api.device_session(&phone_token, &account, &phone, cert).await;
     assert_eq!(api.get("/vault", Some(&phone_token)).await.0, 200);
 
     assert_eq!(api.post("/devices/revoke", Some(&laptop_token), revocation(&account, &phone)).await.0, 200);
@@ -328,7 +420,6 @@ async fn revoking_a_device_ends_its_sessions() {
     assert_eq!(api.get("/vault", Some(&laptop_token)).await.0, 200, "the laptop's is not");
 }
 
-/// A certificate for `device` lasting `days` from now.
 #[tokio::test]
 async fn bulk_renewal_is_removed() {
     let api = Api::start().await;
@@ -456,4 +547,236 @@ async fn service_key_survives_restart_and_matches_cli() {
         .unwrap();
     assert!(output.status.success());
     assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), keys[0]);
+}
+
+#[tokio::test]
+async fn enrollment_tokens_cannot_access_the_vault_or_change_credentials() {
+    let api = Api::start().await;
+    let account = SigningKey::from_bytes(&rand::random());
+    let device = SigningKey::from_bytes(&rand::random());
+    let body = sign_up("enroll", "password", &account, &device, &rand::random());
+    let (_, reply) = api.post("/register", None, body.clone()).await;
+    let token = reply["token"].as_str().unwrap();
+    for path in ["/account", "/vault", "/devices"] {
+        assert_eq!(api.get(path, Some(token)).await.0, 401);
+    }
+    assert_eq!(api.put("/vault", Some(token), json!({"vault": body["key_blob"], "version": 0})).await.0, 401);
+    assert_eq!(api.post("/challenges", Some(token), json!({"purpose": "password"})).await.0, 401);
+    assert_eq!(api.post("/devices/revoke", Some(token), revocation(&account, &device)).await.0, 401);
+    // One enrollment credential cannot enroll another device after its first one.
+    assert_eq!(
+        api.post("/devices", Some(token), certificate(&account, &SigningKey::from_bytes(&rand::random()), "other"))
+            .await
+            .0,
+        400
+    );
+    let session = api.device_session(token, &account, &device, body["device"].clone()).await;
+    assert_eq!(api.get("/vault", Some(&session)).await.0, 200);
+    assert_eq!(api.get("/vault", Some(token)).await.0, 401);
+    let (login, _) = log_in(&api, "enroll", "password").await.unwrap();
+    assert_eq!(api.get("/vault", Some(&login)).await.0, 401);
+    api.state.store.lock().unwrap().insert_enrollment(&crypto::hash(b"expired"), 1, None, 0, 1).unwrap();
+    assert_eq!(api.post("/devices", Some("expired"), body["device"].clone()).await.0, 401);
+}
+
+#[tokio::test]
+async fn session_proofs_are_one_use_and_bind_service_account_certificate_and_token() {
+    let api = Api::start().await;
+    let account = SigningKey::from_bytes(&rand::random());
+    let device = SigningKey::from_bytes(&rand::random());
+    let body = sign_up("proof", "password", &account, &device, &rand::random());
+    let (_, reply) = api.post("/register", None, body.clone()).await;
+    let token = reply["token"].as_str().unwrap();
+    let cert = body["device"].clone();
+    api.challenge(token, "session", Some(cert.clone())).await;
+    let hash = crypto::hash(token.as_bytes());
+    // Read the challenge through the API, then use the exact stored statement.
+    let reply = api.post("/challenges", Some(token), json!({"purpose": "session", "device": cert})).await.1;
+    let c = api
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .challenge(&hash, reply["challenge"].as_str().unwrap(), gwar_connect::api::now_ms())
+        .unwrap()
+        .unwrap();
+    let service = reply["service_key"].as_str().unwrap();
+    let statement = crypto::session_statement(service, &b64(account.verifying_key().as_bytes()), &c);
+    let proof =
+        json!({"challenge": c.nonce, "device": cert, "signature": b64(&device.sign(statement.as_bytes()).to_bytes())});
+    for wrong in [
+        statement.replace(service, &b64(&[0; 32])),
+        statement.replace(&b64(account.verifying_key().as_bytes()), &b64(&[1; 32])),
+        statement.replace(&c.certificate_hash, &b64(&[2; 32])),
+        statement.replace(&hash, &crypto::hash(b"other-token")),
+        statement.replace("gwar session v1", "gwar credentials v1"),
+    ] {
+        let mut bad = proof.clone();
+        bad["signature"] = json!(b64(&device.sign(wrong.as_bytes()).to_bytes()));
+        assert_eq!(api.post("/session", Some(token), bad).await.0, 400);
+    }
+    let mut bad = proof.clone();
+    bad["signature"] = json!(b64(&account.sign(statement.as_bytes()).to_bytes()));
+    assert_eq!(api.post("/session", Some(token), bad).await.0, 400);
+    let mut bad = proof.clone();
+    bad["device"]["expires_at"] = json!(cert["expires_at"].as_i64().unwrap() + 1);
+    assert_eq!(api.post("/session", Some(token), bad).await.0, 400);
+    assert_eq!(api.post("/session", Some(token), proof.clone()).await.0, 200);
+    assert_eq!(api.post("/session", Some(token), proof).await.0, 401);
+}
+
+#[tokio::test]
+async fn expired_challenges_and_device_certificates_end_connect_access() {
+    let api = Api::start().await;
+    let account = SigningKey::from_bytes(&rand::random());
+    let device = SigningKey::from_bytes(&rand::random());
+    let mut body = sign_up("expiry", "password", &account, &device, &rand::random());
+    let at = gwar_connect::api::now_ms();
+    let until = at + 2000;
+    let text = crypto::device_statement(
+        &b64(account.verifying_key().as_bytes()),
+        &b64(device.verifying_key().as_bytes()),
+        at,
+        until,
+    );
+    body["device"] = json!({"device_key": b64(device.verifying_key().as_bytes()), "name": "device", "issued_at": at, "expires_at": until, "signature": b64(&account.sign(text.as_bytes()).to_bytes())});
+    let (_, reply) = api.post("/register", None, body.clone()).await;
+    let enrollment = reply["token"].as_str().unwrap();
+    let c = api.challenge(enrollment, "session", Some(body["device"].clone())).await;
+    let mut stored = api
+        .state
+        .store
+        .lock()
+        .unwrap()
+        .challenge(&crypto::hash(enrollment.as_bytes()), &c.nonce, gwar_connect::api::now_ms())
+        .unwrap()
+        .unwrap();
+    stored.expires_at = gwar_connect::api::now_ms() - 1;
+    api.state.store.lock().unwrap().insert_challenge(&stored).unwrap();
+    assert_eq!(
+        api.post(
+            "/session",
+            Some(enrollment),
+            json!({"challenge": c.nonce, "device": body["device"], "signature": b64(&[0;64])})
+        )
+        .await
+        .0,
+        401
+    );
+    let session = api.device_session(enrollment, &account, &device, body["device"].clone()).await;
+    assert_eq!(api.get("/vault", Some(&session)).await.0, 200);
+    tokio::time::sleep(std::time::Duration::from_millis((until - gwar_connect::api::now_ms()).max(0) as u64 + 10))
+        .await;
+    assert_eq!(api.get("/vault", Some(&session)).await.0, 401);
+}
+
+#[tokio::test]
+async fn credential_updates_require_the_account_signature_over_every_new_field() {
+    let api = Api::start().await;
+    let account = SigningKey::from_bytes(&rand::random());
+    let device = SigningKey::from_bytes(&rand::random());
+    let token = api.register("credentials", "old password", &account, &device, &rand::random()).await;
+    let credentials = sign_up("unused", "new password", &account, &device, &rand::random());
+    let body =
+        json!({"kdf": credentials["kdf"], "auth_key": credentials["auth_key"], "key_blob": credentials["key_blob"]});
+    assert_eq!(api.put("/account/password", Some(&token), body.clone()).await.0, 422, "bearer alone is insufficient");
+    let signed = api.signed_credentials(&token, &account, "password", body).await;
+    for (field, value) in [
+        ("auth_key", json!(b64(&[99; 32]))),
+        ("key_blob", json!(b64(&[99; 60]))),
+        ("signature", json!(b64(&device.sign(b"not an account signature").to_bytes()))),
+    ] {
+        let mut bad = signed.clone();
+        bad[field] = value;
+        assert_eq!(api.put("/account/password", Some(&token), bad).await.0, 400);
+    }
+    let mut bad = signed.clone();
+    bad["kdf"]["salt"] = json!(b64(&[99; 16]));
+    assert_eq!(api.put("/account/password", Some(&token), bad).await.0, 400);
+    let mut bad = signed.clone();
+    bad["kdf"]["m"] = json!(19456);
+    assert_eq!(api.put("/account/password", Some(&token), bad).await.0, 400);
+    let mut bad = signed.clone();
+    bad["credential_version"] = json!(1);
+    assert_eq!(api.put("/account/password", Some(&token), bad).await.0, 409);
+    let (first, second) = tokio::join!(
+        api.put("/account/password", Some(&token), signed.clone()),
+        api.put("/account/password", Some(&token), signed)
+    );
+    assert_eq!([first.0, second.0].iter().filter(|&&s| s == 200).count(), 1, "one challenge commits once");
+    assert!(log_in(&api, "credentials", "old password").await.is_none());
+    assert!(log_in(&api, "credentials", "new password").await.is_some());
+    let current = api.state.store.lock().unwrap().account_by_handle("credentials").unwrap().unwrap();
+    assert_eq!(current.credential_version, 1);
+}
+
+#[tokio::test]
+async fn recovery_credential_updates_are_signed_and_versioned_too() {
+    let api = Api::start().await;
+    let account = SigningKey::from_bytes(&rand::random());
+    let device = SigningKey::from_bytes(&rand::random());
+    let token = api.register("rotation", "password", &account, &device, &[1; 20]).await;
+    let credentials = sign_up("unused", "password", &account, &device, &[2; 20]);
+    let body = json!({"recovery_auth": credentials["recovery_auth"], "recovery_blob": credentials["recovery_blob"]});
+    let signed = api.signed_credentials(&token, &account, "recovery", body).await;
+    for field in ["recovery_auth", "recovery_blob"] {
+        let mut bad = signed.clone();
+        bad[field] = json!(b64(&vec![99; if field == "recovery_auth" { 32 } else { 60 }]));
+        assert_eq!(api.put("/account/recovery", Some(&token), bad).await.0, 400);
+    }
+    assert_eq!(api.put("/account/recovery", Some(&token), signed.clone()).await.0, 200);
+    assert_eq!(api.put("/account/recovery", Some(&token), signed).await.0, 401);
+    let (_, old_auth) = recovery_secrets(&[1; 20], account.verifying_key().as_bytes());
+    assert_eq!(api.post("/recover", None, json!({"handle":"rotation", "recovery_auth":b64(&old_auth)})).await.0, 401);
+    assert_eq!(
+        api.post("/recover", None, json!({"handle":"rotation", "recovery_auth":credentials["recovery_auth"]})).await.0,
+        200
+    );
+}
+
+#[test]
+fn client_integrity_vectors() {
+    let v: Value = serde_json::from_str(include_str!("integrity-vectors.json")).unwrap();
+    let account = SigningKey::from_bytes(&[1; 32]);
+    let device = SigningKey::from_bytes(&[2; 32]);
+    let account_key = b64(account.verifying_key().as_bytes());
+    let cert = gwar_connect::store::Certificate {
+        issued_at: 1,
+        expires_at: 2,
+        signature: v["device"]["signature"].as_str().unwrap().into(),
+    };
+    let certificate_hash = crypto::certificate_hash(&account_key, &b64(device.verifying_key().as_bytes()), &cert);
+    assert_eq!(certificate_hash, v["certificate_hash"]);
+    let mut c = gwar_connect::store::Challenge {
+        nonce: v["challenge"]["challenge"].as_str().unwrap().into(),
+        token_hash: crypto::hash(b"token"),
+        account_id: 0,
+        purpose: "session".into(),
+        certificate_hash,
+        device_key: None,
+        certificate_expires_at: 2,
+        credential_version: 0,
+        expires_at: 5,
+    };
+    let service = v["challenge"]["service_key"].as_str().unwrap();
+    let statement = crypto::session_statement(service, &account_key, &c);
+    assert_eq!(statement, v["session_statement"]);
+    assert_eq!(crypto::hash(statement.as_bytes()), v["session_hash"]);
+    assert_eq!(b64(&device.sign(statement.as_bytes()).to_bytes()), v["session_signature"]);
+    let kdf_hash = crypto::kdf_hash(&serde_json::from_value(v["kdf"].clone()).unwrap());
+    assert_eq!(kdf_hash, v["kdf_hash"]);
+    for purpose in ["password", "recovery"] {
+        c.purpose = purpose.into();
+        let statement = crypto::credentials_statement(
+            service,
+            &account_key,
+            &c,
+            if purpose == "password" { &kdf_hash } else { "-" },
+            &crypto::hash(&[4; 32]),
+            &crypto::hash(&[5; 60]),
+        );
+        assert_eq!(statement, v[format!("{purpose}_statement")]);
+        assert_eq!(crypto::hash(statement.as_bytes()), v[format!("{purpose}_hash")]);
+        assert_eq!(b64(&account.sign(statement.as_bytes()).to_bytes()), v[format!("{purpose}_signature")]);
+    }
 }
