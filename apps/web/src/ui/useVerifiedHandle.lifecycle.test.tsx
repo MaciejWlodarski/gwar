@@ -94,6 +94,7 @@ for (const identical of [false, true]) {
     expect(typeof withdraw).toBe("function");
     const replacement = identical ? { ...m, connect: { ...m.connect! } } : await member(NOW + 120_000);
     await show(replacement); await settle();
+    for (let i = 0; i < 200 && ls.rows().filter(r => r.fn !== old[0]!.fn).length < 3; i++) await settle();
     const fresh = ls.rows().filter(r => r.fn !== old[0]!.fn);
     expect(fresh).toHaveLength(3); expect(ls.live()).toEqual(fresh);
     expect(fresh[0]!.fn).not.toBe(old[0]!.fn);
@@ -142,23 +143,30 @@ for (const pending of ["key", "crypto"] as const) {
   for (const cleanup of ["unmount", "replacement"] as const) {
     it(`late ${pending} after ${cleanup} cannot set state, add listeners or alter new timers`, async () => {
       const ls = listeners(); let release!: () => void;
-      let started = false;
+      let started = false, finished = pending === "key";
       if (pending === "key") {
         vi.mocked(loadServiceKey).mockReturnValueOnce(new Promise(r => { release = () => r(service.publicKey); started = true; }));
       } else {
         const realVerify = crypto.subtle.verify.bind(crypto.subtle);
         const held = new Promise<void>(r => { release = r; });
         vi.spyOn(crypto.subtle, "verify").mockImplementationOnce(async (...args: Parameters<typeof crypto.subtle.verify>) => {
-          const valid = await realVerify(...args); started = true; await held; return valid;
+          const valid = await realVerify(...args); started = true; await held; finished = true; return valid;
         });
       }
       await show(await member());
       for (let i = 0; i < 100 && !started; i++) await settle();
       expect(started).toBe(true); expect(ls.rows()).toHaveLength(0);
       if (cleanup === "unmount") await act(async () => root.unmount());
-      else { await show(await member(NOW + 120_000)); await settle(); expect(div.textContent).toBe("alice"); }
+      else {
+        await show(await member(NOW + 120_000));
+        // Real signature checks are slow on CI runners: wait (bounded) for the replacement's badge.
+        for (let i = 0; i < 200 && div.textContent !== "alice"; i++) await settle();
+        expect(div.textContent).toBe("alice");
+      }
       const n = writes.count, rows = ls.rows(), timers = vi.getTimerCount();
       release(); await settle();
+      for (let i = 0; i < 100 && !finished; i++) await settle();
+      expect(finished).toBe(true); await settle(); // the late completion really ran before the checks below
       expect(writes.count).toBe(n); expect(ls.rows()).toEqual(rows); expect(vi.getTimerCount()).toBe(timers);
       if (cleanup === "unmount") { expect(timers).toBe(0); root = createRoot(div); }
       else {
@@ -175,6 +183,7 @@ for (const pending of ["key", "crypto"] as const) {
 it("StrictMode setup/cleanup replay leaves exactly one live listener set and two timers", async () => {
   const ls = listeners(); const m = await member();
   await act(async () => root.render(<StrictMode><Badge m={m} /></StrictMode>)); await settle();
+  for (let i = 0; i < 200 && div.textContent !== "alice"; i++) await settle();
   expect(div.textContent).toBe("alice"); expect(ls.rows()).toHaveLength(3); expect(ls.live()).toHaveLength(3); expect(vi.getTimerCount()).toBe(2);
   await act(async () => root.unmount()); expect(ls.live()).toHaveLength(0); expect(vi.getTimerCount()).toBe(0);
   root = createRoot(div);

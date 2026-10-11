@@ -48,9 +48,10 @@ describe("attachment trust", () => {
       await show(await media(mime, "wrong"), true);
       expect(fetchFileBytes).not.toHaveBeenCalled();
       await act(async () => container.querySelector<HTMLButtonElement>('button')!.click());
-      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      // Hashing takes a while on slow machines: wait for the outcome, then check nothing was shown on the way.
+      await vi.waitFor(() => expect(container.textContent).toContain("Attachment verification failed"));
       expect(container.querySelector(tag)).toBeNull(); expect(URL.createObjectURL).not.toHaveBeenCalled();
-      expect(container.textContent).toContain("Attachment verification failed"); expect(container.textContent).toContain("Load unverified attachment");
+      expect(container.textContent).toContain("Load unverified attachment");
     });
     it(`does not fetch pending ${mime}`, async () => { await show(await media(mime), null); expect(fetchFileBytes).not.toHaveBeenCalled(); expect(container.querySelector(tag)).toBeNull(); });
   }
