@@ -33,7 +33,13 @@ it("bounds header and decoded image dimensions before creating a preview", async
   view.setUint32(16, 1); view.setUint32(20, 1);
   const close = vi.fn(); decode.mockResolvedValue({ width: 100_000, height: 1, close });
   await expect(boundedImageBlob(new Blob([bytes], { type: "image/png" }))).rejects.toThrow("dimensions limit");
-  expect(close).toHaveBeenCalledOnce(); vi.unstubAllGlobals();
+  expect(close).toHaveBeenCalledOnce();
+  // Within the limits but larger than its header said: refused, closed, never drawn.
+  view.setUint32(16, 10); view.setUint32(20, 10);
+  const closeLarger = vi.fn(); decode.mockResolvedValue({ width: 20, height: 10, close: closeLarger });
+  const canvas = vi.fn(); vi.stubGlobal("OffscreenCanvas", canvas);
+  await expect(boundedImageBlob(new Blob([bytes], { type: "image/png" }))).rejects.toThrow("larger than its header");
+  expect(closeLarger).toHaveBeenCalledOnce(); expect(canvas).not.toHaveBeenCalled(); vi.unstubAllGlobals();
 });
 
 // Sizes real decoders would compute differently from the header (seen in Chromium and WebKit).
