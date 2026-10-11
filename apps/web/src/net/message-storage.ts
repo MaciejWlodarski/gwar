@@ -10,42 +10,46 @@ export const MAX_REVOCATIONS = 20_000;
 export const REVOCATION_FRESH_MS = 5 * 60_000;
 export interface Revocation { seq: number; account_key: string; device_key: string; revoked_at: number; signature: string }
 interface Checkpoint { revision: number; hash: string; created: number; conversation: string; at: number; proven?: boolean; deleted?: boolean }
-interface State { checkpoints: Record<string, Checkpoint>; revocations: Record<string, Revocation>; feeds: Record<string, { cursor: number; checked: number; available?: boolean }> }
-const empty = (): State => ({ checkpoints: {}, revocations: {}, feeds: {} });
+interface Feed { cursor: number; checked: number; available?: boolean }
+export interface RevocationState { revokedAt?: number; fresh: boolean }
 const pair = (account: string, device: string) => `${account}:${device}`;
+const requestValue = <T>(request: IDBRequest<T>): Promise<T> => new Promise((resolve, reject) => {
+  request.onsuccess = () => resolve(request.result);
+  request.onerror = () => reject(request.error);
+});
 
 export class MessageStorage {
   private db?: Promise<IDBDatabase>;
-  constructor(private name = "gwar-message-auth-v2") {}
+  constructor(private name = "gwar-message-auth-v3") {}
   private open(): Promise<IDBDatabase> {
     return this.db ??= new Promise((resolve, reject) => {
-      const request = indexedDB.open(this.name, 1);
-      request.onupgradeneeded = () => request.result.createObjectStore("state");
+      const request = indexedDB.open(this.name, 2);
+      request.onupgradeneeded = () => {
+        request.result.createObjectStore("checkpoints").createIndex("at", "at");
+        request.result.createObjectStore("revocations");
+        request.result.createObjectStore("feeds");
+      };
       request.onerror = () => reject(request.error);
       request.onsuccess = () => resolve(request.result);
     });
   }
-  private async transaction<T>(change: (s: State) => T, write = false): Promise<T> {
+  private async transaction<T>(stores: string[], mode: IDBTransactionMode, change: (tx: IDBTransaction) => Promise<T>): Promise<T> {
     const db = await this.open();
     return new Promise((resolve, reject) => {
-      const tx = db.transaction("state", write ? "readwrite" : "readonly", { durability: "strict" });
-      const store = tx.objectStore("state");
-      const request = store.get("auth");
-      let result: T;
+      const tx = db.transaction(stores, mode, { durability: "strict" });
+      let result: T, failure: unknown;
       tx.oncomplete = () => resolve(result);
-      tx.onabort = tx.onerror = () => reject(tx.error ?? new Error("Message storage unavailable"));
-      request.onsuccess = () => {
-        try {
-          const state = (request.result as State | undefined) ?? empty();
-          result = change(state);
-          if (write) store.put(state, "auth");
-        } catch { tx.abort(); }
-      };
+      tx.onabort = tx.onerror = () => reject(failure ?? tx.error ?? new Error("Message storage unavailable"));
+      void change(tx).then((value) => { result = value; }).catch((error: unknown) => {
+        failure = error;
+        tx.abort();
+      });
     });
   }
   async checkpoint(key: string, next: Checkpoint, predecessor: string): Promise<{ continuity: "proven" | "unproven" | "rollback" | "fork"; duplicate: boolean }> {
-    return this.transaction((s) => {
-      const old = s.checkpoints[key];
+    return this.transaction(["checkpoints"], "readwrite", async (tx) => {
+      const store = tx.objectStore("checkpoints");
+      const old: Checkpoint | undefined = await requestValue(store.get(key));
       if (old) {
         if (old.deleted && next.revision > old.revision) return { continuity: "fork", duplicate: false };
         if (next.revision < old.revision) return { continuity: "rollback", duplicate: false };
@@ -54,45 +58,74 @@ export class MessageStorage {
         if (next.revision === old.revision + 1 && predecessor !== old.hash) return { continuity: "fork", duplicate: false };
       }
       const proven = next.revision === 0 || (!!old && !!old.proven && next.revision === old.revision + 1 && predecessor === old.hash);
-      s.checkpoints[key] = { ...next, proven };
-      const keys = Object.keys(s.checkpoints);
-      if (keys.length > MAX_CHECKPOINTS) {
-        keys.sort((a, b) => s.checkpoints[a]!.at - s.checkpoints[b]!.at);
-        for (const expired of keys.slice(0, keys.length - MAX_CHECKPOINTS)) delete s.checkpoints[expired];
+      store.put({ ...next, proven }, key);
+      if (!old) {
+        const count = await requestValue(store.count());
+        if (count > MAX_CHECKPOINTS) {
+          await new Promise<void>((resolve, reject) => {
+            let remaining = count - MAX_CHECKPOINTS;
+            const cursor = store.index("at").openCursor();
+            cursor.onerror = () => reject(cursor.error);
+            cursor.onsuccess = () => {
+              if (!cursor.result || remaining === 0) return resolve();
+              cursor.result.delete(); remaining--; cursor.result.continue();
+            };
+          });
+        }
       }
       return { continuity: proven ? "proven" : "unproven", duplicate: false };
-    }, true);
+    });
   }
-  async revocation(account: string, device: string, base = CONNECT_URL, now = Date.now()) {
-    return this.transaction((s) => ({ revokedAt: s.revocations[pair(account, device)]?.revoked_at,
-      fresh: !!s.feeds[base]?.available && now - s.feeds[base]!.checked >= 0 && now - s.feeds[base]!.checked <= REVOCATION_FRESH_MS }));
+  /** One read transaction for all authorization notes in a visible thread. */
+  async revocations(pairs: Array<{ account: string; device: string }>, base = CONNECT_URL, now = Date.now()): Promise<Map<string, RevocationState>> {
+    return this.transaction(["revocations", "feeds"], "readonly", async (tx) => {
+      const feed: Feed | undefined = await requestValue(tx.objectStore("feeds").get(base));
+      const fresh = !!feed?.available && now - feed.checked >= 0 && now - feed.checked <= REVOCATION_FRESH_MS;
+      const keys = [...new Set(pairs.map((p) => pair(p.account, p.device)))];
+      const states = await Promise.all(keys.map(async (key) => {
+        const entry: Revocation | undefined = await requestValue(tx.objectStore("revocations").get(key));
+        return [key, { revokedAt: entry?.revoked_at, fresh }] as const;
+      }));
+      return new Map(states);
+    });
   }
-  async cursor(base = CONNECT_URL): Promise<number> { return this.transaction((s) => s.feeds[base]?.cursor ?? 0); }
+  async revocation(account: string, device: string, base = CONNECT_URL, now = Date.now()): Promise<RevocationState> {
+    return (await this.revocations([{ account, device }], base, now)).get(pair(account, device))!;
+  }
+  async cursor(base = CONNECT_URL): Promise<number> {
+    return this.transaction(["feeds"], "readonly", async (tx) => (await requestValue<Feed | undefined>(tx.objectStore("feeds").get(base)))?.cursor ?? 0);
+  }
   async unavailable(base = CONNECT_URL): Promise<void> {
-    await this.transaction((s) => { if (s.feeds[base]) s.feeds[base]!.available = false; }, true);
+    await this.transaction(["feeds"], "readwrite", async (tx) => {
+      const store = tx.objectStore("feeds"), feed: Feed | undefined = await requestValue(store.get(base));
+      if (feed) store.put({ ...feed, available: false }, base);
+    });
   }
   async mergeFeed(entries: Revocation[], base = CONNECT_URL, now = Date.now(), complete = true): Promise<void> {
-    let previous = await this.cursor(base);
+    let previous = 0;
     for (const e of entries) {
       decodeFixed(e.account_key, 32); decodeFixed(e.device_key, 32); decodeFixed(e.signature, 64);
       if (!Number.isSafeInteger(e.seq) || e.seq <= previous || !Number.isSafeInteger(e.revoked_at) || e.revoked_at < 0
           || !strictVerify(e.account_key, revokeStatement(e.account_key, e.device_key, e.revoked_at), e.signature)) throw new Error("Invalid revocation feed");
       previous = e.seq;
     }
-    await this.transaction((s) => {
-      if (!s.feeds[base] && Object.keys(s.feeds).length >= 8) throw new Error("Revocation service storage full");
-      const feed = s.feeds[base] ?? { cursor: 0, checked: 0 };
+    await this.transaction(["revocations", "feeds"], "readwrite", async (tx) => {
+      const feeds = tx.objectStore("feeds"), revocations = tx.objectStore("revocations");
+      const oldFeed: Feed | undefined = await requestValue(feeds.get(base));
+      if (!oldFeed && await requestValue(feeds.count()) >= 8) throw new Error("Revocation service storage full");
+      const feed = oldFeed ?? { cursor: 0, checked: 0 };
+      if (entries.length && entries[0]!.seq <= feed.cursor) throw new Error("Invalid revocation feed");
       for (const e of entries) {
-        const key = pair(e.account_key, e.device_key), old = s.revocations[key];
+        const key = pair(e.account_key, e.device_key), old: Revocation | undefined = await requestValue(revocations.get(key));
         // Keep the earliest account-signed revocation even if a later feed omits or changes it.
-        if (!old || e.revoked_at < old.revoked_at) s.revocations[key] = e;
+        if (!old || e.revoked_at < old.revoked_at) revocations.put(e, key);
         feed.cursor = Math.max(feed.cursor, e.seq);
       }
-      if (Object.keys(s.revocations).length > MAX_REVOCATIONS) throw new Error("Revocation storage full");
+      if (await requestValue(revocations.count()) > MAX_REVOCATIONS) throw new Error("Revocation storage full");
       feed.available = complete;
       if (complete) feed.checked = now;
-      s.feeds[base] = feed;
-    }, true);
+      feeds.put(feed, base);
+    });
   }
 }
 export const messageStorage = new MessageStorage();

@@ -1023,13 +1023,26 @@ async function main() {
     if ((await row.getByRole("button", { name: "Delete message" }).count()) !== 0) throw new Error("Bob may delete Alice's message");
     // Delete with a confirmation.
     const mine = a.locator("[data-message]").filter({ hasText: `edited ${rid}` });
+    const deletedId = await mine.getAttribute("data-message");
     await mine.hover();
     await mine.getByRole("button", { name: "Delete message" }).click();
     await a.getByRole("dialog").getByRole("button", { name: "Delete" }).click();
     await b.getByText(`hey @Bob edited ${rid}`).waitFor({ state: "detached" });
-    const deletion = b.locator("[data-message]").filter({ hasText: "Deleted by the author" });
-    await deletion.waitFor();
-    if ((await deletion.getAttribute("data-message-verification")) !== "verified") throw new Error("author deletion is not verified");
+    for (const page of [a, b]) await page.locator(`[data-message="${deletedId}"]`).waitFor({ state: "detached" });
+    // An admin's deletion is a server moderation event, not an author-signed revision.
+    await composer(b).fill(`moderation transparency ${rid}`);
+    await composer(b).press("Enter");
+    const moderated = a.locator("[data-message]").filter({ hasText: `moderation transparency ${rid}` });
+    await moderated.waitFor();
+    const moderatedId = await moderated.getAttribute("data-message");
+    // Keep a newer stored row: the existing server can reuse the highest deleted numeric ID.
+    await composer(a).fill(`moderation retained history ${rid}`);
+    await composer(a).press("Enter");
+    await b.getByText(`moderation retained history ${rid}`, { exact: true }).waitFor();
+    await moderated.hover();
+    await moderated.getByRole("button", { name: "Delete message" }).click({ modifiers: ["Shift"] });
+    await b.locator(`[data-message="${moderatedId}"]`).getByTestId("message-server-removed").waitFor();
+    if (await b.locator(`[data-message="${moderatedId}"]`).getByTestId("message-server-removed").textContent() !== "Message removed by the server") throw new Error("moderation placeholder differs");
     await shot(b, "40-signed-deletion-dark");
     // Shift+click skips the question.
     await composer(a).fill(`quick ${rid}`);
@@ -1039,6 +1052,35 @@ async function main() {
     await quick.getByRole("button", { name: "Delete message" }).click({ modifiers: ["Shift"] });
     await quick.waitFor({ state: "detached" });
     await b.getByText(`quick ${rid}`).waitFor({ state: "detached" });
+  });
+
+  await check("a forged deletion is visibly invalid in English and Polish", async () => {
+    const id = 0; // A fixture-only ID below the real history, so read positions stay unchanged.
+    await b.evaluate(async ({ id }) => {
+      const { useSession } = await window.__gwarE2eImport("/src/state/stores.ts");
+      const { DELETION_TEXT } = await window.__gwarE2eImport("/src/net/message-signature.ts");
+      const state = useSession.getState();
+      const source = state.threads[`ch:${state.viewChannel}`].items.find((i) => i.kind === "msg" && i.msg.signature);
+      state.dispatch({ type: "event", event: { ev: "chat.message", d: { ...source.msg, id, text: DELETION_TEXT, signature: { ...source.msg.signature, message_id: "AAAAAAAAAAAAAAAAAAAAAA" } } }, now: Date.now() });
+    }, { id });
+    const row = b.locator(`[data-message="${id}"]`);
+    await row.getByTestId("message-verification-invalid").getByText("Not verified", { exact: true }).waitFor();
+    await row.getByText("Unverified deletion request").waitFor();
+    if (await row.locator("[data-mention]").count()) throw new Error("invalid message highlighted mentions");
+    await shot(b, "43-invalid-message-dark");
+    await b.evaluate(async () => {
+      const { useSettings } = await window.__gwarE2eImport("/src/state/settings.ts");
+      useSettings.getState().setLanguage("pl");
+    });
+    await row.getByTestId("message-verification-invalid").getByText("Niezweryfikowana", { exact: true }).waitFor();
+    await row.getByText("Niezweryfikowane żądanie usunięcia").waitFor();
+    await shot(b, "44-invalid-message-pl-dark");
+    await b.evaluate(async ({ id }) => {
+      const { useSettings } = await window.__gwarE2eImport("/src/state/settings.ts");
+      const { useSession } = await window.__gwarE2eImport("/src/state/stores.ts");
+      useSettings.getState().setLanguage("en");
+      useSession.setState((s) => ({ threads: Object.fromEntries(Object.entries(s.threads).map(([key, thread]) => [key, { ...thread, items: thread.items.filter((i) => i.kind !== "msg" || i.msg.id !== id) }])) }));
+    }, { id });
   });
 
   // The page is served by Vite; --web-origin permits fetching bytes for hash checks.
@@ -1082,11 +1124,16 @@ async function main() {
     if (r.headers.get("content-type") !== "image/png") throw new Error(`content type ${r.headers.get("content-type")}`);
   });
 
-  await check("substituted attachment bytes suppress mention highlights and require explicit loading", async () => {
+  await check("attachment bytes load lazily and a substitution fails only the attachment", async () => {
     const pattern = "**/files/*/integrity.png";
     const substituted = makePng(64, 48, [60, 80, 200]);
     if (substituted.length !== png.length) throw new Error("byte substitution fixture must preserve size");
-    await ctxB.route(pattern, (route) => route.fulfill({ status: 200, contentType: "image/png", body: substituted, headers: { "access-control-allow-origin": new URL(WEB_URL).origin, "cache-control": "no-store" } }));
+    let releaseBytes;
+    const bytesReady = new Promise((resolve) => { releaseBytes = resolve; });
+    await ctxB.route(pattern, async (route) => {
+      await bytesReady;
+      await route.fulfill({ status: 200, contentType: "image/png", body: substituted, headers: { "access-control-allow-origin": new URL(WEB_URL).origin, "cache-control": "no-store" } });
+    });
     try {
       await a.locator("input[type=file]").setInputFiles({ name: "integrity.png", mimeType: "image/png", buffer: png });
       await a.getByRole("list", { name: "Files to send" }).getByText(/\d+ B$/).waitFor({ timeout: 10000 });
@@ -1096,8 +1143,13 @@ async function main() {
       await composer(a).pressSequentially(`test ${rid}`);
       await composer(a).press("Enter");
       const row = b.locator("[data-message]").filter({ hasText: `integrity @Bob test ${rid}` });
+      await row.waitFor();
+      await waitFor(() => row.getAttribute("data-message-verification").then((v) => v === "verified"), "message displayed before attachment bytes arrive");
+      if (!(await row.getAttribute("data-mentions-me")) || !(await row.locator("[data-mention]").count())) throw new Error("signed attachment metadata did not preserve mention highlighting");
+      if (await row.getByTestId("message-verification-invalid").count()) throw new Error("attachment delay invalidated the message");
+      releaseBytes();
       await row.getByText("Attachment verification failed", { exact: true }).waitFor();
-      if (await row.getAttribute("data-mentions-me") || await row.locator("[data-mention]").count()) throw new Error("substituted bytes raised a mention highlight");
+      if (await row.getAttribute("data-message-verification") !== "verified") throw new Error("substituted bytes invalidated the message");
       if (await row.getByRole("img", { name: "integrity.png" }).count()) throw new Error("substituted bytes displayed automatically");
       await shot(b, "41-attachment-verification-failed-dark");
       await row.getByRole("button", { name: "Load unverified attachment", exact: true }).click();
@@ -1105,11 +1157,14 @@ async function main() {
       await row.getByRole("img", { name: "integrity.png" }).waitFor();
       await shot(b, "42-attachment-explicitly-loaded-dark");
     } finally {
+      releaseBytes();
       await ctxB.unroute(pattern);
     }
   });
 
   await check("a text file is shown as a file card, an oversized file is refused up front", async () => {
+    let fileRequests = 0;
+    await ctxB.route("**/files/*/notes.txt", async (route) => { fileRequests++; await route.continue(); });
     await a.locator("input[type=file]").setInputFiles({ name: "notes.txt", mimeType: "text/plain", buffer: Buffer.from(`notes ${rid}\n`) });
     await a.getByRole("list", { name: "Files to send" }).getByText(/\d+ B$/).waitFor({ timeout: 10000 });
     await composer(a).press("Enter"); // attachments only, no text
@@ -1118,6 +1173,7 @@ async function main() {
       await card.waitFor({ timeout: 10000 });
       await card.getByRole("button", { name: "Download notes.txt" }).waitFor();
     }
+    if (fileRequests !== 0) throw new Error("file bytes fetched before the download click");
     await shot(b, "24-chat-file-card-dark");
     const att = fa.events("chat.message").find((m) => m.attachments?.some((x) => x.name === "notes.txt")).attachments[0];
     const r = await fetch(`http://${SERVER}${att.url}`);
@@ -1126,6 +1182,8 @@ async function main() {
     const download = b.waitForEvent("download");
     await b.locator('[data-attachment="file"]').filter({ hasText: "notes.txt" }).getByRole("button", { name: "Download notes.txt" }).click();
     const saved = await download;
+    if (fileRequests !== 1) throw new Error(`file bytes fetched ${fileRequests} times`);
+    await ctxB.unroute("**/files/*/notes.txt");
     if (saved.suggestedFilename() !== "notes.txt" || readFileSync(await saved.path(), "utf8") !== `notes ${rid}\n`) throw new Error("bounded download differs");
     // Over the limit: refused before anything is sent to the server.
     await a.locator("input[type=file]").setInputFiles({ name: "huge.bin", mimeType: "application/octet-stream", buffer: Buffer.alloc(26 * 1024 * 1024) });
@@ -1556,7 +1614,7 @@ async function main() {
           await page.getByText(`verification private ${rid}`, { exact: true }).waitFor();
         } else if (tab) await page.getByRole("tab", { name: tab }).click();
         await waitFor(() => page.locator('[data-message][data-message-verification="pending"]').count().then((n) => n === 0), "message verification complete");
-        if (await page.locator("[data-message-warning]").count()) {
+        if (await page.locator('[data-testid^="message-verification-"]').count() || await page.getByText("Signature valid", { exact: true }).count()) {
           const diagnostic = await page.evaluate(async () => {
             const { controller } = await window.__gwarE2eImport("/src/state/controller.ts");
             const { useSession } = await window.__gwarE2eImport("/src/state/stores.ts");

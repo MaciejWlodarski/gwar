@@ -236,32 +236,44 @@ The server retains this tombstone, removes its files and refuses further edits.
 Clients that saw it reject resurrection. A fresh client seeing a later revision
 can only report continuity unproven. Unsigned `chat.delete` requires moderation
 permission and means **removed by the server**, never deleted by the author.
-Clients retain that distinction even for already displayed content.
+Verified author deletions hide the row entirely. Server moderation leaves a small
+localized placeholder, including for already displayed content.
 
 Clients verify every displayed message locally. Signature status, separately
 verified Connect handle attestation, connection security and historical
 certificate/revocation authorization are separate labels. A signature does not
-authenticate voice. `#tag` is derived locally from the UID. Unsigned Gwar messages
+authenticate voice. Profile `#tag` is derived locally from the UID and is not
+repeated in message headers. Unsigned Gwar messages
 and invalid replacements cannot raise notifications or mention highlights;
 TeamSpeak messages may notify, labeled **TeamSpeak / unsigned**, without a handle
-badge. Only a valid, current, continuous message may notify; signed attachments
-also need a complete byte-hash check. File-message mention highlights require
-a live byte check; loading historical files does not raise highlights. Repeated signed identities do not notify
-again. Unverified/unsigned attachments, including hash failures, load only after
+badge. Only a valid, current, continuous message may notify or highlight mentions.
+The signed attachment metadata is sufficient for message display and notifications;
+attachment bytes load lazily for rendered images or an explicit open/download
+action, and hash before being displayed or saved. A byte mismatch affects only
+that attachment. Repeated signed identities do not notify again. Unverified/unsigned
+attachments, including hash failures, load only after
 a labeled user action. Image headers and decoded first frames are limited to
 4096 pixels per side and 16 million pixels; previews become static PNGs.
 
-The web/desktop client stores one atomic IndexedDB state in
-`gwar-message-auth-v2` / `state` / `auth`. Checkpoints key
+The web/desktop client uses IndexedDB `gwar-message-auth-v3` (version 2) with
+separate `checkpoints`, `revocations` and `feeds` stores keyed per record. Each
+checkpoint update and feed merge uses one atomic transaction. Checkpoints key
 `(server_key, author_uid, message_id)` to the highest revision, statement/signature
 hash, immutable context, creation time, continuity and final deletion marker.
 The same revision/hash is idempotent; a lower revision is rollback; a changed
 same revision, immutable context or known predecessor is a fork. These are
 rejected before UI replacement. Live/history verification is serialized and
 bounded at 256 queued live messages. Checkpoints cap at 10,000, evicting oldest
-seen entries. The UI discloses fresh devices have no checkpoints and evicted
-history loses rollback protection. Browser storage rollback/clearing is outside
-this protection; missing predecessors remain **continuity unproven**.
+seen entries using the `at` index. The continuity tooltip discloses fresh devices
+have no checkpoints and evicted history loses rollback protection. Browser storage
+rollback/clearing is outside
+this protection; missing predecessors remain **continuity unproven**. Visible
+message/context fingerprints share cached and in-flight verification. Thread
+updates check only new fingerprints; the minute timer refreshes time-dependent
+authorization notes with one bulk read and no checkpoint writes. Fully verified
+messages have no extra signature marker; historical qualifications use a subtle
+icon and localized tooltip, unsigned Gwar messages a warning icon, and invalid
+messages a red icon with visible text.
 
 Account-signed revocations are fetched directly from the client's configured
 Connect through the shared HTTPS/no-redirect transport. The cursor, freshness
@@ -273,7 +285,7 @@ most once per minute; freshness lasts five minutes and failures immediately
 mark it unavailable. Feed sequence numbers cannot prove completeness.
 `signed_at >= revoked_at` fails. Earlier signatures show **signing device
 revoked; signing time unproven**. A certificate valid at signing time but expired
-now shows **certificate expired; historical timing unproven**. Stale/unavailable
+now shows **certificate expired; signing time unproven**. Stale/unavailable
 feeds and unavailable checkpoint storage are explicit states.
 
 Stored chat author names remain send-time snapshots. History and message reads

@@ -1,5 +1,6 @@
-import { localTag } from "./badges";
-import { messageFingerprint, MessageVerifier, fullyVerified, verificationLabel, DELETION_TEXT, type MessageVerification } from "../net/message-signature";
+import { MessageVerificationCache } from "../net/message-verification-cache";
+import { MessageVerificationIndicator } from "./MessageVerification";
+import { messageFingerprint, fullyVerified, DELETION_TEXT, type MessageVerification } from "../net/message-signature";
 import { AlertCircle, ArrowDown, Check, Hash, Loader2, Lock, Menu, Megaphone, MessageSquare, Paperclip, Pencil, RotateCw, Send, Trash2, Users, X } from "lucide-react";
 import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type KeyboardEvent, type MouseEvent } from "react";
 import { countKey, useLanguage, useT, type TFn } from "../i18n";
@@ -97,7 +98,7 @@ function formatDay(at: number, lang: string, t: TFn): string {
 
 // ----------------------------------------------------------------- messages
 
-const MessageRow = memo(function MessageRow({
+export const MessageRow = memo(function MessageRow({
   row,
   mine,
   meUid,
@@ -123,16 +124,14 @@ const MessageRow = memo(function MessageRow({
   const signedAt = msg.signature?.created_at;
   const at = signedAt != null && Number.isFinite(new Date(signedAt).getTime()) ? signedAt : Number.isFinite(new Date(row.item.at).getTime()) ? row.item.at : 0;
   const editedAt = msg.signature && msg.signature.revision > 0 ? msg.signature.signed_at : undefined;
-  const warning = verification ? <span data-message-warning={verification.status !== "verified" || undefined} className={cn("block text-[11px]", verification.status === "invalid" ? "text-danger" : fullyVerified(verification) ? "text-subtle" : "text-warn")} title="Chat signatures do not authenticate voice">{verificationLabel(verification)}</span> : null;
+  const warning = verification && !fullyVerified(verification) && (row.first || verification.status !== "unsigned-ts") ? <MessageVerificationIndicator verification={verification} showAuthor={row.first} /> : null;
   const time = formatTime(at, lang);
   const full = new Date(at).toLocaleString(lang);
   const color = useUidColor(msg.author_uid);
   const member = useSession((s) => s.members[msg.author_uid]);
   const authorName = member?.nickname ?? msg.author_name;
   const attachments = msg.attachments ?? [];
-  // Live file messages are trusted only after the controller hashes all bytes.
-  // History may display a verified signature without raising file-message mention highlights.
-  const mentionsTrusted = fullyVerified(verification) && (!attachments.length || row.item.trusted === true);
+  const mentionsTrusted = fullyVerified(verification);
   const mentionsMe = mentionsTrusted && !!meUid && (msg.mentions ?? []).includes(meUid);
   const showActions = (canEdit || canDelete) && !editing && !row.item.removed && msg.text !== DELETION_TEXT;
 
@@ -151,6 +150,8 @@ const MessageRow = memo(function MessageRow({
       onConfirm: () => void controller.deleteMessage(msg.id),
     });
   };
+
+  if (msg.text === DELETION_TEXT && verification?.status === "verified") return null;
 
   return (
     <div
@@ -185,19 +186,18 @@ const MessageRow = memo(function MessageRow({
               {authorName}
             </button>
             {verification?.status === "verified" && <ConnectBadge member={member} />}
-            <span className="font-mono text-[11px] text-subtle">#{localTag(msg.author_uid)}</span>
-            {warning}
             <time dateTime={new Date(at).toISOString()} title={full} className="text-xs text-subtle">
               {time}
             </time>
+            {warning}
           </div>
         )}
-        {!row.first && warning}
+        {!row.first && warning && <span className="float-left mt-1 mr-1.5">{warning}</span>}
         {editing ? (
           <MessageEditor msg={msg} />
         ) : (
           <>
-            {row.item.removed ? <span className="text-xs text-subtle">Removed by the server</span> : msg.text === DELETION_TEXT && verification?.status === "verified" ? <span className="text-xs text-subtle">Deleted by the author</span> : msg.text && (
+            {row.item.removed ? <span data-testid="message-server-removed" className="text-xs text-subtle">{t("chat.serverRemoved")}</span> : msg.text === DELETION_TEXT ? <span className="text-xs text-danger">{t("chat.unverifiedDeletion")}</span> : msg.text && (
               <div className="text-sm leading-[1.5] break-words whitespace-pre-wrap text-fg">
                 <RichText msg={mentionsTrusted ? msg : { ...msg, mentions: [] }} meUid={mentionsTrusted ? meUid : undefined} />
                 {editedAt != null && (
@@ -348,11 +348,16 @@ function MessageList({ threadKey }: { threadKey: ThreadKey }) {
   useEffect(() => { const timer = setInterval(() => setAuthTick((n) => n + 1), 60_000); return () => clearInterval(timer); }, []);
   const [verified, setVerified] = useState<Map<number, { fingerprint: string; state: MessageVerification }>>(new Map());
   const [signingUid, setSigningUid] = useState<string | undefined>();
-  const verifier = useMemo(() => new MessageVerifier(), [serverKey, key]);
+  const verifier = useMemo(() => new MessageVerificationCache(), [serverKey, key]);
+  const authorizationRefresh = useRef({ verifier, tick: 0, work: Promise.resolve() });
   const targetFor = (msg: ChatMessage) => messageTarget(key, msg.author_uid, signingUid);
   useEffect(() => {
     let active = true;
     void controller.messageUid.then(async (uid) => {
+      if (authorizationRefresh.current.verifier !== verifier || authorizationRefresh.current.tick !== authTick) {
+        authorizationRefresh.current = { verifier, tick: authTick, work: authTick ? verifier.refresh() : Promise.resolve() };
+      }
+      await authorizationRefresh.current.work;
       const entries = await Promise.all((thread?.items ?? []).filter((i) => i.kind === "msg").map(async (i) => {
         const target = messageTarget(key, i.msg.author_uid, uid);
         const ctx = { serverKey, target };
@@ -362,7 +367,11 @@ function MessageList({ threadKey }: { threadKey: ThreadKey }) {
     });
     return () => { active = false; };
   }, [thread?.items, serverKey, key, mineUid, verifier, authTick]);
-  const rows = useMemo(() => buildRows(thread?.items ?? []), [thread?.items]);
+  const rows = useMemo(() => buildRows((thread?.items ?? []).filter((i) => {
+    if (i.kind !== "msg" || i.msg.text !== DELETION_TEXT) return true;
+    const entry = verified.get(i.msg.id);
+    return entry?.fingerprint !== messageFingerprint(i.msg, { serverKey, target: targetFor(i.msg) }) || entry.state.status !== "verified";
+  })), [thread?.items, verified, serverKey, key, signingUid]);
   const ref = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const restoreFrom = useRef<number | null>(null);
@@ -433,7 +442,6 @@ function MessageList({ threadKey }: { threadKey: ThreadKey }) {
         aria-label={t("chat.messages")}
         className="h-full overflow-y-auto overscroll-contain pt-2 pb-2"
       >
-        {vc && <p className="px-4 text-[11px] text-subtle">This device has bounded checkpoints for messages it has seen. A fresh device has none; older evicted history has no rollback protection. Chat signatures do not authenticate voice.</p>}
         {hasHistory && isChannel && thread && thread.loaded && !thread.hasMore && messageCount > 0 && (
           <div className="px-4 py-3 text-center text-xs text-subtle">{t("chat.beginning")}</div>
         )}

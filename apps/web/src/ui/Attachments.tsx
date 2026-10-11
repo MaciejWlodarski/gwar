@@ -9,7 +9,7 @@ import { isDesktop } from "../platform";
 import { fetchFileBytes, saveBlob } from "../platform/download";
 import type { Attachment } from "../proto/Attachment";
 import { useSession, useUi } from "../state/stores";
-import { IconButton } from "./kit";
+import { Button, IconButton, Tooltip } from "./kit";
 
 const MAX_W = 400;
 const MAX_H = 300;
@@ -25,18 +25,21 @@ const KIND_ICON: Record<FileKind, ReactNode> = {
 
 function AttachmentState({ failed, onLoad, untrusted = false }: { failed: boolean; onLoad?: () => void; untrusted?: boolean }) {
   const t = useT();
-  return <span className="text-xs text-subtle"><span role={failed ? "alert" : "status"}>{untrusted ? "Unverified attachment" : t(failed ? "file.notVerified" : "file.verifying")}</span>
-    {onLoad && <button className="ml-2 underline" onClick={onLoad}>Load unverified attachment</button>}</span>;
+  return <span className="text-xs text-subtle"><span role={failed ? "alert" : "status"}>{untrusted ? t("file.unverified") : t(failed ? "file.notVerified" : "file.verifying")}</span>
+    {onLoad && <Tooltip label={t("file.unverifiedRisk")}><Button size="sm" variant="ghost" className="ml-2 underline" onClick={onLoad}>{t("file.loadUnverified")}</Button></Tooltip>}</span>;
 }
-function useAttachmentUrl(att: Attachment, verified: boolean) {
+
+function useAttachmentUrl(att: Attachment, verified: boolean, autoLoad = true) {
   const origin = useSession((s) => s.httpOrigin), limit = useSession((s) => s.server?.upload_limit ?? 0);
   const [explicit, setExplicit] = useState<string>();
+  const [requested, setRequested] = useState<string>();
   const key = JSON.stringify([origin, att, limit, verified]);
   const [loaded, setLoaded] = useState<{ key: string; url: string; failed: boolean }>();
   const load = () => setExplicit(key);
+  const open = () => setRequested(key);
   const allowed = verified || explicit === key;
   useEffect(() => {
-    if (!allowed) return;
+    if (!allowed || (!autoLoad && requested !== key && explicit !== key)) return;
     const abort = new AbortController();
     let url: string | undefined;
     const opts = { origin, size: att.size, uploadLimit: limit, signal: abort.signal };
@@ -46,8 +49,8 @@ function useAttachmentUrl(att: Attachment, verified: boolean) {
       url = URL.createObjectURL(blob); setLoaded({ key, url, failed: false });
     }).catch(() => { if (!abort.signal.aborted) setLoaded({ key, url: "", failed: true }); });
     return () => { abort.abort(); if (url) URL.revokeObjectURL(url); };
-  }, [key, allowed, explicit, origin, limit, att]);
-  return { url: loaded?.key === key ? loaded.url : "", failed: loaded?.key === key && loaded.failed, load, allowed, unverified: explicit === key };
+  }, [key, allowed, explicit, origin, limit, att, autoLoad, requested]);
+  return { open, requested: requested === key || explicit === key, url: loaded?.key === key ? loaded.url : "", failed: loaded?.key === key && loaded.failed, load, allowed, unverified: explicit === key };
 }
 function useSave(att: Attachment, verified: boolean) {
   const t = useT();
@@ -64,8 +67,8 @@ function useSave(att: Attachment, verified: boolean) {
       request.signal.throwIfAborted();
       const ok = await saveBlob(blob, att.name);
       if (ok && isDesktop() && !request.signal.aborted) useUi.getState().toast("success", t("file.saved", { name: att.name }));
-    } catch (e) {
-      if (!request.signal.aborted) { setFailed(true); useUi.getState().toast("error", t("file.saveFailed", { reason: e instanceof Error ? e.message : String(e) })); }
+    } catch {
+      if (!request.signal.aborted) { setFailed(true); useUi.getState().toast("error", t("file.notVerified")); }
     } finally { if (!request.signal.aborted) setBusy(false); }
   };
   return { busy, run, failed };
@@ -75,7 +78,7 @@ function DownloadButton({ att, verified }: { att: Attachment; verified: boolean 
   const t = useT();
   const { busy, run, failed } = useSave(att, verified);
   return (
-    <IconButton label={failed || !verified ? "Download unverified attachment" : t("file.download")} size="sm" onClick={() => void run()} disabled={busy}>
+    <IconButton label={failed || !verified ? t("file.downloadUnverified") : t("file.download")} size="sm" onClick={() => void run()} disabled={busy}>
       {busy ? <Loader2 className="size-4 animate-spin" /> : failed ? <X className="size-4 text-danger" /> : <Download className="size-4" />}
     </IconButton>
   );
@@ -89,7 +92,7 @@ function ImageAttachment({ att, verified }: { att: Attachment; verified: boolean
   if (hashFailed || !url) return <AttachmentState failed={hashFailed} untrusted={!allowed} onLoad={hashFailed || !allowed ? load : undefined} />;
   if (failed) return <FileCard att={att} verified={verified} />;
   return (
-    <>{unverified && <span className="text-xs text-warn">Attachment loaded without verification</span>}<button
+    <>{unverified && <span className="text-xs text-warn">{t("file.loadedUnverified")}</span>}<button
       type="button"
       disabled={!url}
       aria-label={t("file.open", { name: att.name })}
@@ -113,12 +116,14 @@ function ImageAttachment({ att, verified }: { att: Attachment; verified: boolean
 }
 
 function VideoAttachment({ att, verified }: { att: Attachment; verified: boolean }) {
-  const { url, failed, load, allowed, unverified } = useAttachmentUrl(att, verified);
+  const t = useT();
+  const { url, failed, load, allowed, unverified, open, requested } = useAttachmentUrl(att, verified, false);
+  if (verified && !requested) return <Button size="sm" onClick={open}>{t("file.open", { name: att.name })}</Button>;
   if (failed || !url) return <AttachmentState failed={failed} untrusted={!allowed} onLoad={failed || !allowed ? load : undefined} />;
   const box = att.width && att.height ? fitBox(att.width, att.height, MAX_W, MAX_H) : null;
   return (
     <div className="flex max-w-full flex-col overflow-hidden rounded-lg border border-line bg-side" style={{ width: box?.width ?? MAX_W }}>
-      {unverified && <span className="text-xs text-warn">Attachment loaded without verification</span>}
+      {unverified && <span className="text-xs text-warn">{t("file.loadedUnverified")}</span>}
       <video
         controls
         preload="metadata"
@@ -138,7 +143,9 @@ function VideoAttachment({ att, verified }: { att: Attachment; verified: boolean
 }
 
 function AudioAttachment({ att, verified }: { att: Attachment; verified: boolean }) {
-  const { url, failed, load, allowed, unverified } = useAttachmentUrl(att, verified);
+  const t = useT();
+  const { url, failed, load, allowed, unverified, open, requested } = useAttachmentUrl(att, verified, false);
+  if (verified && !requested) return <Button size="sm" onClick={open}>{t("file.open", { name: att.name })}</Button>;
   if (failed || !url) return <AttachmentState failed={failed} untrusted={!allowed} onLoad={failed || !allowed ? load : undefined} />;
   return (
     <div className="flex w-full max-w-[400px] flex-col gap-1.5 rounded-lg border border-line bg-side p-2.5">
@@ -154,7 +161,7 @@ function AudioAttachment({ att, verified }: { att: Attachment; verified: boolean
         </span>
         <DownloadButton att={att} verified={verified} />
       </div>
-      {unverified && <span className="text-xs text-warn">Attachment loaded without verification</span>}
+      {unverified && <span className="text-xs text-warn">{t("file.loadedUnverified")}</span>}
       <audio controls preload="metadata" src={url} className="h-9 w-full" />
     </div>
   );
@@ -172,7 +179,7 @@ function FileCard({ att, verified }: { att: Attachment; verified: boolean }) {
         </span>
         <span role={failed ? "alert" : undefined} className="block text-xs text-subtle">{failed ? t("file.notVerified") : formatBytes(att.size)}</span>
       </span>
-      <IconButton label={failed || !verified ? `Download unverified attachment: ${att.name}` : t("file.downloadNamed", { name: att.name })} onClick={() => void run()} disabled={busy}>
+      <IconButton label={failed || !verified ? t("file.downloadUnverifiedNamed", { name: att.name }) : t("file.downloadNamed", { name: att.name })} onClick={() => void run()} disabled={busy}>
         {busy ? <Loader2 className="size-4 animate-spin" /> : <Download className="size-4" />}
       </IconButton>
     </div>
@@ -222,7 +229,7 @@ export function Lightbox({ attachment, verified }: { attachment: Attachment; ver
         >
           <DialogPrimitive.Title className="sr-only">{name}</DialogPrimitive.Title>
           {!url && <AttachmentState failed={failed} untrusted={!allowed} onLoad={failed || !allowed ? load : undefined} />}
-          {unverified && <span className="text-xs text-warn">Attachment loaded without verification</span>}
+          {unverified && <span className="text-xs text-warn">{t("file.loadedUnverified")}</span>}
           <img src={url || undefined} alt={name} className="max-h-[calc(100dvh-8rem)] max-w-full rounded-lg object-contain shadow-pop" />
           <div className="flex items-center gap-2 rounded-lg border border-line-strong bg-raised px-3 py-1.5 text-sm">
             <span className="max-w-[50vw] truncate text-muted">{name}</span>

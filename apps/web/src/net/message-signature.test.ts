@@ -8,9 +8,13 @@ import type { ChatMessage } from "../proto/ChatMessage";
 import type { MessageSignature } from "../proto/MessageSignature";
 import { uidForPublicKey, type Identity } from "./identity";
 import { MessageStorage, REVOCATION_FRESH_MS } from "./message-storage";
-import { canonicalMessageBody, messageBodyHash, messageStatement, MessageVerifier, signMessage, verifyMessage, revisionHash, verificationLabel, fullyVerified, notificationAllowed, DELETION_TEXT, sameMessageIdentity } from "./message-signature";
+import { canonicalMessageBody, messageBodyHash, messageStatement, MessageVerifier, signMessage, verifyMessage, revisionHash, fullyVerified, notificationAllowed, DELETION_TEXT, sameMessageIdentity } from "./message-signature";
 import { encodeBase64Url } from "./base64url";
 import { events } from "./schema";
+import { MessageVerificationCache } from "./message-verification-cache";
+import { verificationExplanation } from "../ui/MessageVerification";
+import { translate, type TFn } from "../i18n";
+const verificationLabel = (v: Parameters<typeof verificationExplanation>[0]) => verificationExplanation(v, ((key, params) => translate("en", key, params)) as TFn);
 
 vi.mock("./message-storage", async (original) => ({ ...await original<object>(), refreshRevocations: vi.fn().mockResolvedValue(undefined) }));
 const now = 1_700_000_000_000;
@@ -73,7 +77,7 @@ describe("adversarial message verification", () => {
   it("rejects post-expiry edits and labels historical expiration separately", async () => {
     const f = await fixture(true), store = storage(); await store.mergeFeed([], CONNECT_URL, now);
     const historical = await verifyMessage(f.msg, f.ctx, store, now + 1001);
-    expect(historical.authorization).toContain("certificate-expired"); expect(verificationLabel(historical)).toContain("historical timing unproven");
+    expect(historical.authorization).toContain("certificate-expired"); expect(verificationLabel(historical)).toContain("signing time unproven");
     vi.spyOn(Date, "now").mockReturnValue(now + 1001);
     const signature = await signMessage(f.identity, f.ctx, f.msg.author_uid, "edited", [], [], f.msg.signature!); vi.restoreAllMocks();
     expect((await verifyMessage({ ...f.msg, text: "edited", signature }, f.ctx, store, now + 1001)).status).toBe("invalid");
@@ -133,19 +137,19 @@ describe("adversarial message verification", () => {
   it("rejects resurrection after a final signed deletion and suppresses exact replay notifications", async () => {
     const f = await fixture(), verifier = new MessageVerifier(storage()); await verifier.verify(f.msg, f.ctx);
     const deletion = await editMessage(f, DELETION_TEXT); await verifier.verify(deletion, f.ctx);
-    const replay = await verifier.verify(deletion, f.ctx); expect(replay.duplicate).toBe(true); expect(notificationAllowed(replay, true)).toBe(false);
+    const replay = await verifier.verify(deletion, f.ctx); expect(replay.duplicate).toBe(true); expect(notificationAllowed(replay)).toBe(false);
     vi.spyOn(Date, "now").mockReturnValue(now + 2);
     const signature = await signMessage(f.identity, f.ctx, f.msg.author_uid, "resurrected", [], [], deletion.signature!); vi.restoreAllMocks();
     expect((await verifier.verify({ ...f.msg, text: "resurrected", signature }, f.ctx)).continuity).toBe("fork");
   });
   it("labels unsigned Gwar and TeamSpeak separately and suppresses unverified notifications", async () => {
     const f = await fixture(); f.msg.signature = undefined;
-    const unsigned = await verifyMessage(f.msg, f.ctx); expect(unsigned.status).toBe("unsigned"); expect(notificationAllowed(unsigned, true)).toBe(false);
+    const unsigned = await verifyMessage(f.msg, f.ctx); expect(unsigned.status).toBe("unsigned"); expect(notificationAllowed(unsigned)).toBe(false);
     f.msg.author_uid = "ts:abc"; const ts = await verifyMessage(f.msg, f.ctx);
-    expect(verificationLabel(ts)).toBe("TeamSpeak / unsigned"); expect(notificationAllowed(ts, false)).toBe(true);
+    expect(verificationLabel(ts)).toContain("TeamSpeak messages are unsigned"); expect(notificationAllowed(ts)).toBe(true);
     const signed = await fixture(); const valid = await new MessageVerifier(storage()).verify(signed.msg, signed.ctx);
-    expect(notificationAllowed(valid, true)).toBe(true); expect(notificationAllowed(valid, false)).toBe(false);
-    expect(notificationAllowed({ ...valid, authorization: ["revocations-stale"] }, true)).toBe(false);
+    expect(notificationAllowed(valid)).toBe(true);
+    expect(notificationAllowed({ ...valid, authorization: ["revocations-stale"] })).toBe(false);
   });
   it("runtime schemas reject every malformed v2 field", async () => {
     const f = await fixture(); expect(events["chat.message"](f.msg)).toBe(true);
@@ -153,5 +157,57 @@ describe("adversarial message verification", () => {
       const msg = structuredClone(f.msg); (msg.signature as unknown as Record<string, unknown>)[field] = field === "certificate" ? { device_key: "bad" } : null;
       expect(events["chat.message"](msg), field).toBe(false);
     }
+  });
+});
+
+describe("message view verification cache", () => {
+  it("shares in-flight fingerprints and verifies only the new message after a thread update", async () => {
+    const f = await fixture(), store = storage(), cache = new MessageVerificationCache(store);
+    const checkpoint = vi.spyOn(store, "checkpoint");
+    const initial = Array.from({ length: 12 }, (_, id) => ({ ...f.msg, id }));
+    const states = await Promise.all(initial.map((m) => cache.verify(m, f.ctx)));
+    expect(states.every((s) => s.status === "verified")).toBe(true);
+    expect(checkpoint).toHaveBeenCalledTimes(12);
+    const next = { ...f.msg, id: 12 };
+    const a = cache.verify(next, f.ctx), b = cache.verify(next, f.ctx);
+    expect(a).toBe(b);
+    await Promise.all([...initial, next].map((m) => cache.verify(m, f.ctx)));
+    expect(checkpoint).toHaveBeenCalledTimes(13);
+    await cache.refresh();
+    expect(checkpoint).toHaveBeenCalledTimes(13);
+  });
+  it("rechecks changed content/context and rejects a cached revision replayed after an edit", async () => {
+    const f = await fixture(), cache = new MessageVerificationCache(storage());
+    expect((await cache.verify(f.msg, f.ctx)).status).toBe("verified");
+    expect((await cache.verify({ ...f.msg, text: "tampered" }, f.ctx)).status).toBe("invalid");
+    const edited = await editMessage(f, "new revision");
+    expect((await cache.verify(edited, f.ctx)).status).toBe("verified");
+    expect((await cache.verify(f.msg, f.ctx)).continuity).toBe("rollback");
+    expect((await cache.verify(edited, { ...f.ctx, target: "channel:8" })).status).toBe("invalid");
+  });
+  it("refreshes expiry, freshness and retained revocations with no checkpoint writes", async () => {
+    const f = await fixture(true), store = storage(), cache = new MessageVerificationCache(store);
+    await store.mergeFeed([], CONNECT_URL, now);
+    const checkpoint = vi.spyOn(store, "checkpoint");
+    await cache.verify(f.msg, f.ctx);
+    const reads = vi.spyOn(store, "revocations");
+    await cache.refresh(now);
+    expect((await cache.verify(f.msg, f.ctx)).authorization).toEqual([]);
+    await cache.refresh(now + REVOCATION_FRESH_MS + 1);
+    expect((await cache.verify(f.msg, f.ctx)).authorization).toEqual(["revocations-stale", "certificate-expired"]);
+    const c = f.msg.signature!.certificate!;
+    await store.mergeFeed([{ seq: 1, account_key: c.account_key, device_key: c.device_key, revoked_at: now,
+      signature: await signText(f.account.jwk, revokeStatement(c.account_key, c.device_key, now)) }], CONNECT_URL, now);
+    await cache.refresh(now);
+    expect((await cache.verify(f.msg, f.ctx)).status).toBe("invalid");
+    expect(checkpoint).toHaveBeenCalledTimes(1);
+    expect(reads).toHaveBeenCalledTimes(3);
+  });
+  it("qualifies cached messages if authorization storage becomes unavailable", async () => {
+    const f = await fixture(true), store = storage(), cache = new MessageVerificationCache(store);
+    await cache.verify(f.msg, f.ctx);
+    vi.spyOn(store, "revocations").mockRejectedValue(new Error("unavailable"));
+    await cache.refresh(now);
+    expect((await cache.verify(f.msg, f.ctx)).authorization).toContain("revocations-stale");
   });
 });

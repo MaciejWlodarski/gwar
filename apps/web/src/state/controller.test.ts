@@ -510,3 +510,52 @@ describe("uploads", () => {
     expect(controller.canUpload).toBe(false);
   });
 });
+
+describe("bounded incoming verification", () => {
+  it("verifies a signed file message once and notifies without fetching its bytes", async () => {
+    connectFake(); session().dispatch({ type: "focus", focused: false });
+    settings.useSettings.getState().setNotifications({ mentions: true, privateMessages: true, allMessages: false });
+    const c = controller as unknown as { verifyIncoming: (msg: ChatMessage) => Promise<import("../net/message-signature").MessageVerification> };
+    const verify = vi.spyOn(c, "verifyIncoming").mockResolvedValue({ status: "verified", continuity: "proven", authorization: [] });
+    const fetch = vi.spyOn(globalThis, "fetch");
+    try {
+      const msg = message(62, 2, { mentions: ["u1"], signature: {} as NonNullable<ChatMessage["signature"]>,
+        attachments: [{ id: "large", name: "large.bin", url: "/files/large/large.bin", size: 25 * 1024 * 1024, mime: "application/octet-stream", sha256: "signed-metadata" }] });
+      link.emit({ ev: "chat.message", d: msg });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(verify).toHaveBeenCalledExactlyOnceWith(msg);
+      expect(fetch).not.toHaveBeenCalled(); expect(notifyMock).toHaveBeenCalledOnce();
+      expect(session().threads["ch:2"]?.items.some((i) => i.kind === "msg" && i.msg.id === 62)).toBe(true);
+    } finally { verify.mockRestore(); fetch.mockRestore(); }
+  });
+  it("discards a queued event when its epoch changes without verifying it again", async () => {
+    connectFake();
+    let resolve!: (v: import("../net/message-signature").MessageVerification) => void;
+    const blocked = new Promise<import("../net/message-signature").MessageVerification>((r) => { resolve = r; });
+    const c = controller as unknown as { verifyIncoming: (msg: ChatMessage) => Promise<import("../net/message-signature").MessageVerification> };
+    const verify = vi.spyOn(c, "verifyIncoming").mockReturnValue(blocked);
+    try {
+      link.emit({ ev: "chat.message", d: message(63, 2, { signature: {} as NonNullable<ChatMessage["signature"]> }) });
+      await vi.advanceTimersByTimeAsync(0);
+      session().dispatch({ type: "reset" });
+      resolve({ status: "verified", continuity: "proven", authorization: [] });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(verify).toHaveBeenCalledOnce(); expect(session().threads).toEqual({});
+    } finally { verify.mockRestore(); }
+  });
+  it("keeps the 256 queue bound and localizes the overflow toast", async () => {
+    connectFake(); settings.useSettings.setState({ language: "pl" });
+    let resolve!: (v: import("../net/message-signature").MessageVerification) => void;
+    const blocked = new Promise<import("../net/message-signature").MessageVerification>((r) => { resolve = r; });
+    const c = controller as unknown as { verifyIncoming: (msg: ChatMessage) => Promise<import("../net/message-signature").MessageVerification> };
+    const verify = vi.spyOn(c, "verifyIncoming").mockResolvedValue({ status: "verified", continuity: "proven", authorization: [] }).mockReturnValueOnce(blocked);
+    try {
+      for (let id = 1000; id < 1257; id++) link.emit({ ev: "chat.message", d: message(id, 2, { signature: {} as NonNullable<ChatMessage["signature"]> }) });
+      expect(stores.useUi.getState().toasts.at(-1)?.text).toBe("Kolejka weryfikacji wiadomości jest pełna");
+      await vi.advanceTimersByTimeAsync(0);
+      resolve({ status: "verified", continuity: "proven", authorization: [] });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(verify).toHaveBeenCalledTimes(256);
+    } finally { verify.mockRestore(); settings.useSettings.setState({ language: "en" }); }
+  });
+});

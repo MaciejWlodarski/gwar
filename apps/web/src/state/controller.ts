@@ -1,6 +1,6 @@
 import { attachment as attachmentSchema } from "../net/schema";
 import { messageTarget } from "../lib/chat";
-import { verifiedAttachmentBlob, uploadAttachment, localAttachmentMetadata } from "../net/attachment";
+import { uploadAttachment, localAttachmentMetadata } from "../net/attachment";
 import { serverPins, type ServerIdentityChanged } from "../net/server-pins";
 import { signMessage, sha256, MessageVerifier, fullyVerified, DELETION_TEXT, invalidVerification, sameMessageIdentity, notificationAllowed } from "../net/message-signature";
 import type { Attachment } from "../proto/Attachment";
@@ -432,7 +432,7 @@ class Controller {
     conn.onEvent((event) => {
       if (event.ev === "chat.message" && !event.d.signature) {
         const exists = Object.values(useSession.getState().threads).some((t) => t.items.some((i) => i.kind === "msg" && i.msg.id === event.d.id));
-        if (!exists) session.dispatch({ type: "event", event, now: Date.now(), trusted: false });
+        if (!exists) session.dispatch({ type: "event", event, now: Date.now(), verified: false });
         if (!exists && event.d.author_uid.startsWith("ts:")) this.notificationFor(event.d)?.();
         return;
       }
@@ -440,28 +440,19 @@ class Controller {
         const alert = event.ev === "chat.message" ? this.notificationFor(event.d) : null;
         const key = conn.serverKey;
         const epoch = useSession.getState().epoch;
-        if (this.messagePending >= 256) { useUi.getState().toast("error", "Message verification queue is full"); return; }
+        if (this.messagePending >= 256) { useUi.getState().toast("error", tNow("chat.verificationQueueFull")); return; }
         this.messagePending++;
         this.messageQueue = this.messageQueue.then(async () => {
+          if (this.conn !== conn || epoch !== useSession.getState().epoch || key !== conn.serverKey) return;
           const result = await this.verifyIncoming(event.d);
           if (this.conn !== conn || epoch !== useSession.getState().epoch || key !== conn.serverKey) return;
           const existing = Object.values(useSession.getState().threads).flatMap((t) => t.items).find((i) => i.kind === "msg" && i.msg.id === event.d.id);
           if ((existing?.kind === "msg" && (result.status !== "verified" || !sameMessageIdentity(existing.msg, event.d))) || result.continuity === "rollback" || result.continuity === "fork") {
-            useUi.getState().toast("error", "Message replacement rejected: invalid signature, rollback or fork");
+            useUi.getState().toast("error", tNow("chat.replacementRejected"));
             return;
           }
-          let trusted = fullyVerified(result);
-          if (trusted && (event.d.attachments?.length ?? 0) > 0) {
-            const state = useSession.getState();
-            try { await Promise.all(event.d.attachments!.map((a) => verifiedAttachmentBlob(a, a.url, undefined, { origin: state.httpOrigin, size: a.size, uploadLimit: state.server?.upload_limit ?? 0 }))); }
-            catch { trusted = false; }
-          }
-          const latest = await this.verifyIncoming(event.d);
-          if ((existing?.kind === "msg" && (latest.status !== "verified" || !sameMessageIdentity(existing.msg, event.d))) || latest.continuity === "rollback" || latest.continuity === "fork"
-              || this.conn !== conn || epoch !== useSession.getState().epoch) return;
-          trusted = trusted && fullyVerified(latest);
-          session.dispatch({ type: "event", event, now: Date.now(), trusted });
-          if (notificationAllowed(result, trusted)) alert?.();
+          session.dispatch({ type: "event", event, now: Date.now(), verified: fullyVerified(result) });
+          if (notificationAllowed(result)) alert?.();
         }).catch(() => {}).finally(() => { this.messagePending--; });
       } else session.dispatch({ type: "event", event, now: Date.now() });
       if (event.ev === "voice.closed") {
@@ -1097,7 +1088,7 @@ class Controller {
           : tNow("notify.server", { name: authorName, server: s.server?.name ?? "" });
     return () => {
       notify({
-        title: msg.author_uid.startsWith("ts:") ? `${title} · TeamSpeak / unsigned` : title,
+        title: msg.author_uid.startsWith("ts:") ? `${title} · ${tNow("chat.teamSpeakNotification")}` : title,
         body: notificationBody(msg),
         tag: `msg-${msg.id}-${typeof msg.target === "string" ? "server" : Object.keys(msg.target)[0]}`,
         onClick: () => this.openMessage(msg),

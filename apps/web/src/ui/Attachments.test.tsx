@@ -39,11 +39,16 @@ describe("attachment trust", () => {
     });
     it(`hashes signed ${mime} before creating an object URL`, async () => {
       await show(await media(mime), true);
+      expect(fetchFileBytes).not.toHaveBeenCalled();
+      await act(async () => container.querySelector<HTMLButtonElement>('button')!.click());
       await vi.waitFor(() => expect(container.querySelector(tag)?.getAttribute("src")).toBe("blob:checked"));
       expect(await (vi.mocked(URL.createObjectURL).mock.calls[0]![0] as Blob).text()).toBe("hello");
     });
     it(`does not display substituted ${mime} until explicitly requested`, async () => {
       await show(await media(mime, "wrong"), true);
+      expect(fetchFileBytes).not.toHaveBeenCalled();
+      await act(async () => container.querySelector<HTMLButtonElement>('button')!.click());
+      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
       expect(container.querySelector(tag)).toBeNull(); expect(URL.createObjectURL).not.toHaveBeenCalled();
       expect(container.textContent).toContain("Attachment verification failed"); expect(container.textContent).toContain("Load unverified attachment");
     });
@@ -52,6 +57,7 @@ describe("attachment trust", () => {
   it("does not fetch unsigned images or create an image element", async () => { await show(await media("image/png", ""), false); expect(container.querySelector("img")).toBeNull(); expect(fetchFileBytes).not.toHaveBeenCalled(); });
   it("downloads only matching signed bytes, then permits explicitly labeled unverified saving after failure", async () => {
     await show(await media("text/plain", "wrong"), true);
+    expect(fetchFileBytes).not.toHaveBeenCalled();
     await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="Download media"]')!.click());
     await vi.waitFor(() => expect(container.querySelector('button[aria-label="Download unverified attachment: media"]')).not.toBeNull());
     expect(saveBlob).not.toHaveBeenCalled();

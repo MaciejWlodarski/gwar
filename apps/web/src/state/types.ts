@@ -20,7 +20,7 @@ export interface SysText {
 }
 
 export type ChatItem =
-  | { kind: "msg"; key: string; at: number; msg: ChatMessage; removed?: boolean; trusted?: boolean }
+  | { kind: "msg"; key: string; at: number; msg: ChatMessage; removed?: boolean; verified?: boolean }
   | { kind: "sys"; key: string; at: number; text: SysText };
 
 export interface Thread {

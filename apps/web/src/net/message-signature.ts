@@ -21,17 +21,8 @@ export const invalidVerification = (): MessageVerification => ({ status: "invali
 export function fullyVerified(v?: MessageVerification): boolean {
   return v?.status === "verified" && v.continuity === "proven" && v.authorization.length === 0;
 }
-export function notificationAllowed(v: MessageVerification, attachmentBytesVerified: boolean): boolean {
-  return v.status === "unsigned-ts" || (fullyVerified(v) && !v.duplicate && attachmentBytesVerified);
-}
-export function verificationLabel(v: MessageVerification): string {
-  if (v.status === "unsigned-ts") return "TeamSpeak / unsigned";
-  if (v.status === "unsigned") return "Unsigned Gwar message";
-  if (v.status === "invalid") return `Signature invalid${v.continuity === "fork" || v.continuity === "rollback" ? `; ${v.continuity}` : ""}`;
-  const notes: string[] = v.authorization.map((a) => a === "device-revoked" ? "signing device revoked; signing time unproven"
-    : a === "certificate-expired" ? "certificate expired; historical timing unproven" : "revocation information stale or unavailable");
-  if (v.continuity !== "proven") notes.push(v.continuity === "storage-unavailable" ? "checkpoints unavailable" : "continuity unproven");
-  return ["Signature valid", ...notes].join("; ");
+export function notificationAllowed(v: MessageVerification): boolean {
+  return v.status === "unsigned-ts" || (fullyVerified(v) && !v.duplicate);
 }
 export function strictVerify(key: string, text: string, signature: string): boolean {
   try {

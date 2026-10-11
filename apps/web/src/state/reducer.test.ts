@@ -62,7 +62,7 @@ function online(): SessionState {
 }
 
 type Ev = Extract<Action, { type: "event" }>["event"];
-const ev = (state: SessionState, event: Ev) => reduce(state, { type: "event", event, now: 5000, trusted: true });
+const ev = (state: SessionState, event: Ev) => reduce(state, { type: "event", event, now: 5000, verified: true });
 
 describe("welcome", () => {
   it("loads server state and adds the welcome text to server chat", () => {
