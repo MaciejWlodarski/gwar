@@ -9,8 +9,8 @@ export type CertificateWarning =
   | { level: "expired" };
 
 /**
- * `checked` is true once the start-up check for a newer certificate (another
- * device may have renewed this one) has finished, whatever it found; before
+ * `checked` is true once the start-up check for this device's previously
+ * saved renewal has finished, whatever it found; before
  * that the stored expiry may be about to change, so nothing is shown yet.
  */
 export function certificateWarning(expiresAt: number, now: number, checked: boolean): CertificateWarning {
