@@ -102,7 +102,35 @@ async fn prepare_state(config: &ProcessConfig) -> Result<()> {
         allow.push_str(&format!("{}\n", config.voice.ip()));
     }
     tokio::fs::write(state.join("query_ip_allowlist.txt"), allow).await?;
+    write_ini(config).await
+}
+
+/// The serveradmin password goes in an owner-only ini file: on the command line
+/// every local user could read it from the process list.
+async fn write_ini(config: &ProcessConfig) -> Result<()> {
+    if config.admin_password.is_empty() || config.admin_password.chars().any(|c| c.is_control()) {
+        anyhow::bail!("the ServerQuery password must be one non-empty line");
+    }
+    let path = ini_path(config);
+    let tmp = path.with_extension("tmp");
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&tmp).await.with_context(|| format!("create {}", tmp.display()))?;
+    tokio::io::AsyncWriteExt::write_all(
+        &mut file,
+        format!("serveradmin_password={}\n", config.admin_password).as_bytes(),
+    )
+    .await?;
+    file.sync_all().await?;
+    drop(file);
+    tokio::fs::rename(&tmp, &path).await?;
     Ok(())
+}
+
+fn ini_path(config: &ProcessConfig) -> PathBuf {
+    config.state_dir.join("ts3server.ini")
 }
 
 fn server_binary(dir: &Path) -> PathBuf {
@@ -150,7 +178,7 @@ fn arguments(config: &ProcessConfig) -> Vec<String> {
         "query_protocols=raw".into(),
         format!("filetransfer_ip={}", config.filetransfer.ip()),
         format!("filetransfer_port={}", config.filetransfer.port()),
-        format!("serveradmin_password={}", config.admin_password),
+        format!("inifile={}", ini_path(config).display()),
         format!("logpath={}", state.join("logs").display()),
         format!("dbsqlpath={sql}"),
         format!("query_ip_allowlist={}", state.join("query_ip_allowlist.txt").display()),
@@ -374,13 +402,34 @@ mod tests {
             "query_protocols=raw",
             "filetransfer_ip=127.0.0.1",
             "filetransfer_port=30033",
-            "serveradmin_password=pw",
+            "inifile=/var/ts/ts3server.ini",
             "logpath=/var/ts/logs",
             "dbsqlpath=/opt/ts/server-3.13.7/sql/",
             "query_ip_allowlist=/var/ts/query_ip_allowlist.txt",
             "create_default_virtualserver=1",
         ] {
             assert!(args.iter().any(|a| a == expected), "missing {expected}: {args:?}");
+        }
+        assert!(!args.iter().any(|a| a.contains("pw")), "the password stays off the command line: {args:?}");
+    }
+
+    #[tokio::test]
+    async fn the_password_is_in_an_owner_only_ini() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config(false);
+        config.state_dir = dir.path().join("state");
+        config.admin_password = "secret".into();
+        prepare_state(&config).await.unwrap();
+        let ini = dir.path().join("state/ts3server.ini");
+        assert_eq!(std::fs::read_to_string(&ini).unwrap(), "serveradmin_password=secret\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&ini).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        for bad in ["", "two\nlines"] {
+            config.admin_password = bad.into();
+            assert!(prepare_state(&config).await.is_err(), "{bad:?}");
         }
     }
 
