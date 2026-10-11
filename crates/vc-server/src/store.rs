@@ -232,6 +232,12 @@ const MIGRATIONS: &[&str] = &[
     CREATE TABLE message_counter (id INTEGER PRIMARY KEY CHECK (id = 0), last INTEGER NOT NULL);
     INSERT INTO message_counter VALUES (0, COALESCE((SELECT MAX(id) FROM messages), 0));
     "#,
+    // Channel ids never repeat either: signed messages name `channel:{id}`, so a recreated
+    // channel must not inherit the context of a deleted one.
+    r#"
+    CREATE TABLE channel_counter (id INTEGER PRIMARY KEY CHECK (id = 0), last INTEGER NOT NULL);
+    INSERT INTO channel_counter VALUES (0, COALESCE((SELECT MAX(id) FROM channels), 0));
+    "#,
 ];
 
 /// References reassigned by a member merge (including ones already held by the target).
@@ -356,11 +362,15 @@ impl Store {
         password_hash: Option<&str>,
         max_clients: Option<u32>,
     ) -> Result<ChannelId> {
+        let id: i64 =
+            self.db.query_row("UPDATE channel_counter SET last = last + 1 WHERE id = 0 RETURNING last", [], |r| {
+                r.get(0)
+            })?;
         self.db.execute(
-            "INSERT INTO channels(parent,name,topic,position,password_hash,max_clients) VALUES(?1,?2,?3,?4,?5,?6)",
-            params![parent, name, topic, position, password_hash, max_clients],
+            "INSERT INTO channels(id,parent,name,topic,position,password_hash,max_clients) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![id, parent, name, topic, position, password_hash, max_clients],
         )?;
-        Ok(self.db.last_insert_rowid() as ChannelId)
+        Ok(id as ChannelId)
     }
 
     pub fn update_channel(&self, row: &ChannelRow) -> Result<()> {
@@ -1201,13 +1211,34 @@ mod tests {
     }
 
     #[test]
+    fn channel_ids_never_repeat_after_deleting_the_newest() {
+        let store = Store::in_memory().unwrap();
+        let first = store.insert_channel(None, "a", "", 0, None, None).unwrap();
+        store.delete_channel(first).unwrap();
+        let second = store.insert_channel(None, "b", "", 0, None, None).unwrap();
+        assert!(second > first);
+        let reopened = Store::init({
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+            for migration in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+                db.execute_batch(migration).unwrap();
+            }
+            db.pragma_update(None, "user_version", MIGRATIONS.len() - 1).unwrap();
+            db.execute_batch("INSERT INTO channels(id,name) VALUES(41,'old');").unwrap();
+            db
+        })
+        .unwrap();
+        assert_eq!(reopened.insert_channel(None, "new", "", 0, None, None).unwrap(), 42);
+    }
+
+    #[test]
     fn message_counter_migration_starts_after_existing_messages() {
         let db = Connection::open_in_memory().unwrap();
         db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
-        for migration in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+        for migration in &MIGRATIONS[..MIGRATIONS.len() - 2] {
             db.execute_batch(migration).unwrap();
         }
-        db.pragma_update(None, "user_version", MIGRATIONS.len() - 1).unwrap();
+        db.pragma_update(None, "user_version", MIGRATIONS.len() - 2).unwrap();
         db.execute_batch(
             "INSERT INTO channels(id,name) VALUES(1,'c');
              INSERT INTO messages(id,channel,author_uid,author_name,text,sent_at) VALUES (41,1,'u','n','x',1);",
