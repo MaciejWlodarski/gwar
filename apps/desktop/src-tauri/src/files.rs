@@ -151,7 +151,8 @@ fn decoded(path: &str) -> Result<String, String> {
         });
     }
     let out = String::from_utf8(out).map_err(|_| "invalid file path")?;
-    if out.contains("..") || out.bytes().any(|b| b.is_ascii_control() || b == b'\\' || b == b'%') {
+    // Names may contain "%" or "..", but no segment may be a dot segment.
+    if out.split('/').any(|seg| seg == "." || seg == "..") || out.bytes().any(|b| b.is_ascii_control() || b == b'\\') {
         return Err("invalid file path".into());
     }
     Ok(out)
@@ -319,13 +320,13 @@ mod tests {
     fn paths_and_methods_are_confined() {
         let origin = origin("https://voice.example").unwrap();
         assert!(file_url(&origin, "/files/a/photo%20one.png", false).is_ok());
+        assert!(file_url(&origin, "/files/a/v1..2%20100%25.zip", false).is_ok());
         assert!(file_url(&origin, "/api/files/a?token=abc", true).is_ok());
         for path in [
             "http://localhost/files/a/b",
             "//localhost/files/a/b",
             "/files/a/../b",
             "/files/a/%2e%2e",
-            "/files/a/%252e%252e",
             "/files/a/%2fb",
             "/files/a/x?y",
             "/files/a/%5cb",

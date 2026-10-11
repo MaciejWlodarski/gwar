@@ -107,12 +107,13 @@ describe("sameOriginUrl", () => {
 describe("file URL confinement", () => {
   it("accepts only the download and upload routes for their methods", () => {
     expect(absoluteUrl("https://voice.example", "/files/abc/photo%20one.png")).toBe("https://voice.example/files/abc/photo%20one.png");
+    expect(absoluteUrl("https://voice.example", "/files/abc/v1..2%20100%25.zip")).toBe("https://voice.example/files/abc/v1..2%20100%25.zip");
     expect(absoluteUrl("http://192.168.1.2:8790", "/api/files/abc?token=abc", "PUT")).toBe("http://192.168.1.2:8790/api/files/abc?token=abc");
     expect(() => absoluteUrl("https://voice.example", "/api/files/a?token=x")).toThrow();
     expect(() => absoluteUrl("https://voice.example", "/files/a/b", "PUT")).toThrow();
   });
   it("rejects absolute, traversal, encoded, credential and odd-scheme inputs", () => {
-    for (const path of ["https://voice.example/files/a/b", "http://127.0.0.1/a", "//evil.example/files/a/b", "/files/a/../b", "/files/a/%2e%2e", "/files/a/%252e%252e", "/files/a/%2fb", "/files/a/%5cb", "/files/a/b#c", "/files/a/b?q=1", "file:///etc/passwd", "javascript:alert(1)"]) {
+    for (const path of ["https://voice.example/files/a/b", "http://127.0.0.1/a", "//evil.example/files/a/b", "/files/a/../b", "/files/a/%2e%2e", "/files/a/%2fb", "/files/a/%5cb", "/files/a/b#c", "/files/a/b?q=1", "file:///etc/passwd", "javascript:alert(1)"]) {
       expect(() => absoluteUrl("https://voice.example", path), path).toThrow();
     }
     expect(() => absoluteUrl(null, "/files/a/b")).toThrow();
