@@ -677,3 +677,49 @@ async fn connect_session(
     let reply: Value = http.post(format!("{url}/v1/session")).bearer_auth(token).json(&json!({"challenge": c.nonce, "device": cert, "signature": b64(&device.sign(statement.as_bytes()).to_bytes())})).send().await.unwrap().json().await.unwrap();
     reply["token"].as_str().unwrap().into()
 }
+
+fn signed_revocation(account: &SigningKey, device: &SigningKey, seq: i64) -> vc_server::core::RevokedDevice {
+    let at = now();
+    let statement = vc_server::identity::revoke_statement(&public_key(account), &public_key(device), at);
+    vc_server::core::RevokedDevice {
+        seq,
+        account_key: public_key(account),
+        device_key: public_key(device),
+        revoked_at: at,
+        signature: b64(&account.sign(statement.as_bytes()).to_bytes()),
+    }
+}
+
+#[tokio::test]
+async fn cross_account_revocations_do_not_poison_login_or_live_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("vc.sqlite3");
+    let server = TestServer::start_with(|c| c.database = Some(database.clone())).await;
+    let victim = new_key();
+    let attacker = new_key();
+    let device = new_key();
+    let mut live = as_device(&server, &device, certificate(&victim, &device, now(), now() + 86400000)).await.unwrap();
+    let mut other =
+        as_device(&server, &device, certificate(&attacker, &device, now(), now() + 86400000)).await.unwrap();
+    server.running.core.revoked(vec![signed_revocation(&attacker, &device, 1)], 1).await;
+    other.expect_disconnect().await;
+    live.ok("ping", json!({})).await;
+    as_device(&server, &device, certificate(&victim, &device, now(), now() + 86400000)).await.unwrap().close().await;
+    let store = vc_server::store::Store::open(&database).unwrap();
+    assert!(store.device_revoked(&public_key(&attacker), &public_key(&device)).unwrap());
+    assert!(!store.device_revoked(&public_key(&victim), &public_key(&device)).unwrap());
+    // An old feed entry cannot revoke the victim or move the cursor backwards.
+    server.running.core.revoked(vec![signed_revocation(&victim, &device, 0)], 0).await;
+    live.ok("ping", json!({})).await;
+    assert_eq!(store.meta("connect_seq").unwrap().as_deref(), Some("1"));
+    server.running.core.revoked(vec![signed_revocation(&victim, &device, 2)], 2).await;
+    live.expect_disconnect().await;
+    server.running.core.revoked(vec![], 3).await;
+    server.running.core.info().await.unwrap();
+    assert_eq!(store.meta("connect_seq").unwrap().as_deref(), Some("3"));
+    drop(server);
+    let running = vc_server::start(vc_server::Config { database: Some(database), ..base_config() }).await.unwrap();
+    let restarted = TestServer { running, admin_token: String::new() };
+    assert!(as_device(&restarted, &device, certificate(&victim, &device, now(), now() + 86400000)).await.is_err());
+    assert!(store.device_revoked(&public_key(&victim), &public_key(&device)).unwrap());
+}

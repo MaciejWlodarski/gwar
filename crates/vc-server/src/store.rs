@@ -201,6 +201,20 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE users ADD COLUMN connect_attestation TEXT;
     UPDATE users SET connect_next_check=NULL;
 "#,
+    // Revocations authorize an account/device pair, never a device key alone.
+    r#"
+    ALTER TABLE revoked_devices RENAME TO revoked_devices_old;
+    CREATE TABLE revoked_devices (
+        device_key TEXT NOT NULL,
+        account_key TEXT NOT NULL,
+        revoked_at INTEGER NOT NULL,
+        signature TEXT,
+        PRIMARY KEY(account_key,device_key)
+    );
+    INSERT INTO revoked_devices(device_key,account_key,revoked_at)
+        SELECT device_key,account_key,revoked_at FROM revoked_devices_old;
+    DROP TABLE revoked_devices_old;
+    "#,
 ];
 
 /// References reassigned by a member merge (including ones already held by the target).
@@ -894,18 +908,28 @@ impl Store {
 
     // -------------------------------------------------- Gwar Connect devices
 
-    pub fn revoke_device(&self, device_key: &str, account_key: &str, revoked_at: i64) -> Result<()> {
-        self.db.execute(
-            "INSERT OR IGNORE INTO revoked_devices(device_key,account_key,revoked_at) VALUES(?1,?2,?3)",
-            params![device_key, account_key, revoked_at],
-        )?;
-        Ok(())
+    /// Permanently retain signed revocations and advance the cursor together.
+    pub fn apply_revocations(&self, devices: &[crate::core::RevokedDevice], seq: i64) -> Result<bool> {
+        let tx = self.db.unchecked_transaction()?;
+        let current = self.meta("connect_seq")?.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+        if seq <= current {
+            return Ok(false);
+        }
+        for d in devices.iter().filter(|d| d.seq > current && d.seq <= seq) {
+            tx.execute(
+                "INSERT OR IGNORE INTO revoked_devices(device_key,account_key,revoked_at,signature) VALUES(?1,?2,?3,?4)",
+                params![d.device_key, d.account_key, d.revoked_at, d.signature],
+            )?;
+        }
+        self.set_meta("connect_seq", &seq.to_string())?;
+        tx.commit()?;
+        Ok(true)
     }
 
-    pub fn device_revoked(&self, device_key: &str) -> Result<bool> {
+    pub fn device_revoked(&self, account_key: &str, device_key: &str) -> Result<bool> {
         Ok(self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM revoked_devices WHERE device_key=?1)",
-            [device_key],
+            "SELECT EXISTS(SELECT 1 FROM revoked_devices WHERE account_key=?1 AND device_key=?2)",
+            [account_key, device_key],
             |r| r.get(0),
         )?)
     }

@@ -496,18 +496,31 @@ impl Core {
 
     /// Stores revocations from Gwar Connect and signs those devices out.
     pub(super) fn revoked(&mut self, devices: Vec<super::RevokedDevice>, seq: i64) {
-        for d in &devices {
-            if let Err(e) = self.store.revoke_device(&d.device_key, &d.account_key, d.revoked_at) {
+        let current = self.store.meta("connect_seq").ok().flatten().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+        let devices: Vec<_> = devices
+            .into_iter()
+            .filter(|d| d.seq > current && d.seq <= seq)
+            .filter(|d| {
+                let statement = crate::identity::revoke_statement(&d.account_key, &d.device_key, d.revoked_at);
+                crate::identity::signed_by(&d.account_key, &statement, &d.signature)
+            })
+            .collect();
+        match self.store.apply_revocations(&devices, seq) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => {
                 tracing::warn!("store: {e:#}");
+                return;
             }
-        }
-        if let Err(e) = self.store.set_meta("connect_seq", &seq.to_string()) {
-            tracing::warn!("store: {e:#}");
         }
         let gone: Vec<_> = self
             .sessions
             .values()
-            .filter(|s| s.device.as_ref().is_some_and(|d| devices.iter().any(|r| &r.device_key == d)))
+            .filter(|s| {
+                s.device
+                    .as_ref()
+                    .is_some_and(|d| devices.iter().any(|r| r.account_key == s.account_key && &r.device_key == d))
+            })
             .map(|s| s.id)
             .collect();
         let reason =

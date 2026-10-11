@@ -76,6 +76,8 @@ pub struct ConnectRequest {
 }
 
 pub struct RevokedDevice {
+    pub seq: i64,
+    pub signature: String,
     pub device_key: String,
     pub account_key: String,
     pub revoked_at: i64,
@@ -192,6 +194,7 @@ struct Session {
     platform: Platform,
     ip: Option<IpAddr>,
     device: Option<String>,
+    account_key: String,
     muted: bool,
     deafened: bool,
     away: Option<String>,
@@ -528,7 +531,7 @@ impl Core {
         if self.sessions.values().filter(|s| s.out.is_some()).count() >= self.info.max_clients as usize {
             return fail(ErrorCode::Unavailable, "server is full");
         }
-        if r.device.as_deref().is_some_and(|d| self.store.device_revoked(d).unwrap_or(false)) {
+        if r.device.as_deref().is_some_and(|d| self.store.device_revoked(&r.public_key, d).unwrap_or(false)) {
             return fail(ErrorCode::NotAuthenticated, "this device was signed out of its Gwar account");
         }
         if let Some(ban) = self.ban_for(Some(&r.uid), r.ip) {
@@ -620,6 +623,7 @@ impl Core {
             platform: r.platform,
             ip: r.ip,
             device: r.device,
+            account_key: r.public_key,
             muted: false,
             deafened: false,
             away: None,
@@ -825,6 +829,7 @@ impl Core {
                     platform: client.platform,
                     ip: None,
                     device: None,
+                    account_key: String::new(),
                     muted: client.muted,
                     deafened: client.deafened,
                     away: client.away,

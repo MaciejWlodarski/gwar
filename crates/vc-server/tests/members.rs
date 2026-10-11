@@ -460,7 +460,9 @@ fn merging_members_moves_all_identity_references_transactionally() {
         })
         .unwrap();
     let connection = rusqlite::Connection::open(seeded.database()).unwrap();
-    connection.execute("INSERT INTO revoked_devices VALUES('device','-legacy',1)", []).unwrap();
+    connection
+        .execute("INSERT INTO revoked_devices(device_key,account_key,revoked_at) VALUES('device','-legacy',1)", [])
+        .unwrap();
     let summary = "2 messages, 2 files, 2 read marks, 2 group memberships, 2 mentions, 1 bans";
     let preview = cli(seeded.dir.path(), &["merge", "--dry-run", "--", "-legacy", "account"]);
     assert!(preview.status.success(), "{}", String::from_utf8_lossy(&preview.stderr));

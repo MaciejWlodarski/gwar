@@ -42,24 +42,11 @@ pub async fn follow_every(url: String, core: CoreHandle, mut seq: i64, every: Du
             match fetch(&client, &url, seq).await {
                 Ok(entries) if entries.is_empty() => break,
                 Ok(entries) => {
-                    let last = entries.last().map(|e| e.seq).unwrap_or(seq);
                     let full = entries.len() >= 1000;
-                    let devices = entries
-                        .into_iter()
-                        .filter(|e| {
-                            let statement = identity::revoke_statement(&e.account_key, &e.device_key, e.revoked_at);
-                            let ok = identity::signed_by(&e.account_key, &statement, &e.signature);
-                            if !ok {
-                                warn!(device = e.device_key, "ignoring a revocation not signed by its account");
-                            }
-                            ok
-                        })
-                        .map(|e| RevokedDevice {
-                            device_key: e.device_key,
-                            account_key: e.account_key,
-                            revoked_at: e.revoked_at,
-                        })
-                        .collect();
+                    let (devices, last) = verified_revocations(entries, seq);
+                    if last == seq {
+                        break;
+                    }
                     core.revoked(devices, last).await;
                     seq = last;
                     if !full {
@@ -74,6 +61,30 @@ pub async fn follow_every(url: String, core: CoreHandle, mut seq: i64, every: Du
         }
         tokio::time::sleep(every).await;
     }
+}
+
+fn verified_revocations(mut entries: Vec<Entry>, mut seq: i64) -> (Vec<RevokedDevice>, i64) {
+    entries.sort_by_key(|e| e.seq);
+    let mut devices = Vec::new();
+    for e in entries {
+        if e.seq <= seq {
+            continue;
+        }
+        seq = e.seq;
+        let statement = identity::revoke_statement(&e.account_key, &e.device_key, e.revoked_at);
+        if !identity::signed_by(&e.account_key, &statement, &e.signature) {
+            warn!(device = e.device_key, "ignoring a revocation not signed by its account");
+            continue;
+        }
+        devices.push(RevokedDevice {
+            seq: e.seq,
+            signature: e.signature,
+            device_key: e.device_key,
+            account_key: e.account_key,
+            revoked_at: e.revoked_at,
+        });
+    }
+    (devices, seq)
 }
 
 async fn fetch(client: &reqwest::Client, url: &str, since: i64) -> anyhow::Result<Vec<Entry>> {
@@ -173,6 +184,26 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
     use vc_proto::{HandleAttestation, handle_statement};
+
+    #[test]
+    fn revocation_cursors_ignore_old_and_duplicate_entries_and_never_go_backwards() {
+        let account = SigningKey::from_bytes(&[1; 32]);
+        let key = URL_SAFE_NO_PAD.encode(account.verifying_key().as_bytes());
+        let entry = |seq| Entry {
+            seq,
+            account_key: key.clone(),
+            device_key: key.clone(),
+            revoked_at: 1,
+            signature: URL_SAFE_NO_PAD
+                .encode(account.sign(identity::revoke_statement(&key, &key, 1).as_bytes()).to_bytes()),
+        };
+        let (devices, cursor) = verified_revocations(vec![entry(8), entry(4), entry(7), entry(7)], 5);
+        assert_eq!(cursor, 8);
+        assert_eq!(devices.iter().map(|d| d.seq).collect::<Vec<_>>(), vec![7, 8]);
+        let (devices, cursor) = verified_revocations(vec![entry(1), entry(8)], cursor);
+        assert!(devices.is_empty());
+        assert_eq!(cursor, 8);
+    }
 
     #[tokio::test]
     async fn service_key_is_lazy_cached_and_retried_after_failure() {
