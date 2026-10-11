@@ -226,6 +226,12 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY(server_key, author_uid, message_id)
     );
     "#,
+    // Message ids never repeat, even after the newest message is deleted:
+    // clients keep removed messages and refuse a different message under the same id.
+    r#"
+    CREATE TABLE message_counter (id INTEGER PRIMARY KEY CHECK (id = 0), last INTEGER NOT NULL);
+    INSERT INTO message_counter VALUES (0, COALESCE((SELECT MAX(id) FROM messages), 0));
+    "#,
 ];
 
 /// References reassigned by a member merge (including ones already held by the target).
@@ -475,11 +481,14 @@ impl Store {
         text: &str,
         sent_at: i64,
     ) -> Result<MessageId> {
+        let id: i64 =
+            self.db.query_row("UPDATE message_counter SET last = last + 1 WHERE id = 0 RETURNING last", [], |r| {
+                r.get(0)
+            })?;
         self.db.execute(
-            "INSERT INTO messages(channel,author_uid,author_name,text,sent_at) VALUES(?1,?2,?3,?4,?5)",
-            params![channel, author_uid, author_name, text, sent_at],
+            "INSERT INTO messages(id,channel,author_uid,author_name,text,sent_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![id, channel, author_uid, author_name, text, sent_at],
         )?;
-        let id = self.db.last_insert_rowid();
         self.db.execute(
             "DELETE FROM messages WHERE channel=?1 AND id <= ?2 - ?3 AND id NOT IN
              (SELECT id FROM messages WHERE channel=?1 ORDER BY id DESC LIMIT ?3)",
@@ -1178,6 +1187,34 @@ mod tests {
         let ids: Vec<_> = (0..5).map(|i| store.add_message(channel, "u", "n", &i.to_string(), i).unwrap()).collect();
         let page = store.history(channel, Some(ids[4]), 2).unwrap();
         assert_eq!(page.iter().map(|m| m.id).collect::<Vec<_>>(), vec![ids[2], ids[3]]);
+    }
+
+    #[test]
+    fn message_ids_never_repeat_after_deleting_the_newest() {
+        let store = Store::in_memory().unwrap();
+        let channel = store.channels().unwrap()[0].id;
+        let first = store.add_message(channel, "u", "n", "a", 1).unwrap();
+        let newest = store.add_message(channel, "u", "n", "b", 2).unwrap();
+        store.delete_message(newest).unwrap();
+        assert!(store.add_message(channel, "u", "n", "c", 3).unwrap() > newest);
+        assert!(newest > first);
+    }
+
+    #[test]
+    fn message_counter_migration_starts_after_existing_messages() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        for migration in &MIGRATIONS[..MIGRATIONS.len() - 1] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.pragma_update(None, "user_version", MIGRATIONS.len() - 1).unwrap();
+        db.execute_batch(
+            "INSERT INTO channels(id,name) VALUES(1,'c');
+             INSERT INTO messages(id,channel,author_uid,author_name,text,sent_at) VALUES (41,1,'u','n','x',1);",
+        )
+        .unwrap();
+        let store = Store::init(db).unwrap();
+        assert_eq!(store.add_message(1, "u", "n", "y", 2).unwrap(), 42);
     }
 
     #[test]
