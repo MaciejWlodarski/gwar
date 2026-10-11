@@ -9,7 +9,10 @@ export default defineConfig(({ command, mode }) => ({
   plugins: [react(), tailwindcss(), {
     name: "production-csp",
     transformIndexHtml(html) {
-      return command === "build" ? html.replace("<head>", `<head>\n    <meta http-equiv="Content-Security-Policy" content="${contentSecurityPolicy(mode === "desktop")}" />`) : html;
+      // Only the isolated browser fixture permits plaintext loopback services.
+      const policy = contentSecurityPolicy(mode === "desktop");
+      const e2ePolicy = mode === "e2e" ? policy.replace("connect-src 'self' https: wss:", "connect-src 'self' https: wss: http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:*") : policy;
+      return command === "build" ? html.replace("<head>", `<head>\n    <meta http-equiv="Content-Security-Policy" content="${e2ePolicy}" />`) : html;
     },
   }],
   server: {

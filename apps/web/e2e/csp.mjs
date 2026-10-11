@@ -36,8 +36,9 @@ try {
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
   await page.locator("#root").waitFor();
   await page.waitForFunction(() => document.querySelector("#root")?.childElementCount > 0);
-  const initial = await page.evaluate(() => ({ policy: document.querySelector('meta[http-equiv="Content-Security-Policy"]')?.content, theme: document.documentElement.dataset.theme }));
+  const initial = await page.evaluate(() => ({ policy: document.querySelector('meta[http-equiv="Content-Security-Policy"]')?.content, theme: document.documentElement.dataset.theme, testApi: typeof window.__gwarE2eImport }));
   check("production policy and static theme bootstrap", () => { assert.match(initial.policy, /script-src 'self' 'wasm-unsafe-eval'/); assert.match(initial.theme, /^(dark|light)$/); });
+  check("test-only module access excluded from release", () => assert.equal(initial.testApi, "undefined"));
   await page.evaluate(() => {
     window.__violations = [];
     document.addEventListener("securitypolicyviolation", (event) => window.__violations.push(event.effectiveDirective));

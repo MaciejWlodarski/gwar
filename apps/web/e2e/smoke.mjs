@@ -9,8 +9,8 @@
  * can run repeatedly against a server that already has data (e.g. E2E_REUSE=1).
  *
  * Starts (and stops) a throwaway server with an empty data dir, a throwaway
- * Gwar Connect service (built with `cargo build -p gwar-connect`) and the Vite
- * dev server when it is not already running (an already running one must have
+ * Gwar Connect service (built with `cargo build -p gwar-connect`) and a built
+ * app served by Vite preview when it is not already running (an existing app must have
  * been started with VITE_CONNECT_URL pointing at a Connect service whose
  * --origin is WEB_URL, or the Gwar Connect checks fail). Environment:
  *   WEB_URL      default http://127.0.0.1:5173
@@ -48,6 +48,7 @@ const LATENCY_MS = Number(process.env.E2E_LATENCY_MS ?? 0);
 const LATENCY_PORT = 8797;
 // What the browsers type as the server address (through the delay proxy when simulating latency).
 const CLIENT_ADDR = `ws://${LATENCY_MS > 0 ? `127.0.0.1:${LATENCY_PORT}` : SERVER}/ws`;
+const CLIENT_ALIAS = CLIENT_ADDR.replace("127.0.0.1", "localhost");
 const rid = Math.random().toString(16).slice(2, 6);
 const GAMES = `Games-${rid}`;
 // A second channel of the run (the server may be shared, so no seed names).
@@ -95,7 +96,7 @@ async function ensureServer(connectUrl) {
   }
   const dataDir = mkdtempSync(path.join(tmpdir(), "vc-e2e-"));
   const bin = process.env.VC_SERVER_BIN ?? path.join(repoRoot, "target/debug/vc-server");
-  const args = ["--data-dir", dataDir, "--http", SERVER, "--media", SERVER, "--public-ip", SERVER.split(":")[0], "--public-endpoint", CLIENT_ADDR, "--web-origin", new URL(WEB_URL).origin, "--connect-url", connectUrl];
+  const args = ["--data-dir", dataDir, "--http", SERVER, "--media", SERVER, "--public-ip", SERVER.split(":")[0], "--public-endpoint", CLIENT_ADDR, "--public-endpoint", CLIENT_ALIAS, "--web-origin", new URL(WEB_URL).origin, "--connect-url", connectUrl];
   const child = existsSync(bin)
     ? spawn(bin, args, { cwd: repoRoot })
     : spawn("cargo", ["run", "-q", "-p", "vc-server", "--", ...args], { cwd: repoRoot });
@@ -161,10 +162,14 @@ async function ensureConnect() {
 
 async function ensureWeb(connectUrl) {
   if (await reachable(WEB_URL)) return;
-  const child = spawn("npx", ["vite", "--host", "127.0.0.1", "--port", new URL(WEB_URL).port || "5173", "--strictPort"], { cwd: webRoot, env: { ...process.env, VITE_CONNECT_URL: connectUrl } });
+  // Build with the existing development-only loopback Connect exception. Release
+  // builds still require HTTPS. The test serves dist, with a loopback-only test CSP exception.
+  const build = spawnSync("npx", ["vite", "build", "--mode", "e2e"], { cwd: webRoot, env: { ...process.env, NODE_ENV: "development", VITE_CONNECT_URL: connectUrl }, encoding: "utf8" });
+  if (build.status !== 0) throw new Error(`e2e web build failed: ${build.stdout} ${build.stderr}`);
+  const child = spawn("npx", ["vite", "preview", "--host", "127.0.0.1", "--port", new URL(WEB_URL).port || "5173", "--strictPort"], { cwd: webRoot, env: { ...process.env, VITE_CONNECT_URL: connectUrl } });
   children.push(child);
-  await waitFor(() => reachable(WEB_URL), "vite dev server", 30000);
-  console.log("started vite dev server");
+  await waitFor(() => reachable(WEB_URL), "vite preview", 30000);
+  console.log("started vite preview serving apps/web/dist");
 }
 
 const debugPages = [];
@@ -404,7 +409,7 @@ async function main() {
   await check("browser rejects weak Ed25519 keys and proof points independently of WebCrypto", async () => {
     const serverKey = await serverFingerprint(a);
     const rejects = await a.evaluate(async ({ endpoint, serverKey }) => {
-      const { serverPublicKey, verifyProof } = await import("/src/net/handshake.ts");
+      const { serverPublicKey, verifyProof } = await window.__gwarE2eImport("/src/net/handshake.ts");
       const identity = Uint8Array.from([1, ...new Array(31).fill(0)]);
       const encode = (bytes) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
       try { serverPublicKey(encode(identity)); return false; } catch { /* weak candidate rejected before signing */ }
@@ -450,7 +455,7 @@ async function main() {
       await ctx.close();
     });
   }
-  await check("bob connects and is on the server, not in voice", () => connect(b, "Bob"));
+  await check("bob connects and is on the server, not in voice", () => connect(b, "Bob", { address: CLIENT_ALIAS }));
   await check("both are listed as Online (not in voice) in the member list", async () => {
     for (const p of [a, b]) {
       await memberSection(p, "Online").getByText("Alice").waitFor({ timeout: 10000 });
@@ -657,6 +662,11 @@ async function main() {
     await composer(b).fill(`Bob answers in Talk ${rid}`);
     await composer(b).press("Enter");
     await a.getByText(`Bob answers in Talk ${rid}`).waitFor();
+    // Same server key through IP and DNS aliases: both directions must verify.
+    for (const page of [a, b]) for (const text of [`Alice writes in Talk ${rid}`, `Bob answers in Talk ${rid}`]) {
+      const row = page.locator("[data-message]").filter({ hasText: text });
+      await waitFor(() => row.getAttribute("data-message-verification").then((v) => v === "verified"), "verified channel message across aliases");
+    }
     // Nobody moved: both are still listed under Games, nobody under Talk.
     for (const p of [a, b]) {
       await treeItem(p, GAMES).locator("xpath=..").getByText("Bob").waitFor();
@@ -688,7 +698,7 @@ async function main() {
     await waitFor(() => fb.events("chat.read").length > seen, "chat.read echoed to Bob", 6000);
   });
 
-  await check("private message with unread badge", async () => {
+  await check("private messages verify in both directions across endpoint aliases, with unread badges", async () => {
     await treeItem(b, /Alice/).dblclick();
     await composer(b).fill("psst");
     await composer(b).press("Enter");
@@ -696,6 +706,18 @@ async function main() {
     await a.getByRole("tab", { name: /Bob 1/ }).waitFor();
     await a.getByRole("tab", { name: /Bob/ }).click();
     await a.getByText("psst").waitFor();
+    // Both ends rebuild the private target (recipient's uid) and verify the signature.
+    for (const page of [a, b]) {
+      const row = page.locator("[data-message]").filter({ hasText: "psst" });
+      await waitFor(() => row.getAttribute("data-message-verification").then((v) => v === "verified"), "verified private message");
+    }
+    await composer(a).fill(`alias DM reply ${rid}`);
+    await composer(a).press("Enter");
+    for (const page of [a, b]) {
+      const row = page.locator("[data-message]").filter({ hasText: `alias DM reply ${rid}` });
+      await row.waitFor();
+      await waitFor(() => row.getAttribute("data-message-verification").then((v) => v === "verified"), "verified reply across endpoint aliases");
+    }
   });
 
   await check("server chat reaches everyone", async () => {
@@ -750,7 +772,7 @@ async function main() {
 
   console.log("reconnect");
   await check("client reconnects after the socket drops and resyncs", async () => {
-    const pinBefore = await b.evaluate((endpoint) => localStorage.getItem(`vc.server-pin:${endpoint}`), CLIENT_ADDR);
+    const pinBefore = await b.evaluate((endpoint) => localStorage.getItem(`vc.server-pin:${endpoint}`), CLIENT_ALIAS);
     if (!pinBefore) throw new Error("first connection did not persist a server pin");
     const before = fa.events("client.joined").length;
     await b.evaluate(() => window.__sockets.filter((s) => s.url.endsWith("/ws")).forEach((s) => s.close()));
@@ -762,7 +784,7 @@ async function main() {
     await treeItem(b, /Alice/).waitFor();
     await b.getByRole("tab", { name: "Server" }).click();
     await b.getByText("Reconnected to the server").waitFor();
-    const pinAfter = await b.evaluate((endpoint) => localStorage.getItem(`vc.server-pin:${endpoint}`), CLIENT_ADDR);
+    const pinAfter = await b.evaluate((endpoint) => localStorage.getItem(`vc.server-pin:${endpoint}`), CLIENT_ALIAS);
     if (pinBefore !== pinAfter) throw new Error("second connection replaced the first-contact pin");
     const fingerprint = await serverFingerprint(b);
     if (fingerprint !== JSON.parse(pinAfter).server_pk) throw new Error("verified fingerprint is not visible");
@@ -1005,6 +1027,10 @@ async function main() {
     await mine.getByRole("button", { name: "Delete message" }).click();
     await a.getByRole("dialog").getByRole("button", { name: "Delete" }).click();
     await b.getByText(`hey @Bob edited ${rid}`).waitFor({ state: "detached" });
+    const deletion = b.locator("[data-message]").filter({ hasText: "Deleted by the author" });
+    await deletion.waitFor();
+    if ((await deletion.getAttribute("data-message-verification")) !== "verified") throw new Error("author deletion is not verified");
+    await shot(b, "40-signed-deletion-dark");
     // Shift+click skips the question.
     await composer(a).fill(`quick ${rid}`);
     await composer(a).press("Enter");
@@ -1015,7 +1041,8 @@ async function main() {
     await b.getByText(`quick ${rid}`).waitFor({ state: "detached" });
   });
 
-  // The page is served by Vite, not by the server, so the browser needs CORS to PUT to the server.
+  // The page is served by Vite; --web-origin permits fetching bytes for hash checks.
+  // Keep the upload route for reused servers without that origin configured.
   // Real deployments serve the client from the server (checked with the production build below).
   await ctxA.route("**/api/files/**", async (route) => {
     const cors = { "access-control-allow-origin": "*", "access-control-allow-methods": "PUT, OPTIONS", "access-control-allow-headers": "*" };
@@ -1053,6 +1080,33 @@ async function main() {
     if (att.width !== 64 || att.height !== 48) throw new Error(`dimensions ${att.width}x${att.height}`);
     const r = await fetch(`http://${SERVER}${att.url}`);
     if (r.headers.get("content-type") !== "image/png") throw new Error(`content type ${r.headers.get("content-type")}`);
+  });
+
+  await check("substituted attachment bytes suppress mention highlights and require explicit loading", async () => {
+    const pattern = "**/files/*/integrity.png";
+    const substituted = makePng(64, 48, [60, 80, 200]);
+    if (substituted.length !== png.length) throw new Error("byte substitution fixture must preserve size");
+    await ctxB.route(pattern, (route) => route.fulfill({ status: 200, contentType: "image/png", body: substituted, headers: { "access-control-allow-origin": new URL(WEB_URL).origin, "cache-control": "no-store" } }));
+    try {
+      await a.locator("input[type=file]").setInputFiles({ name: "integrity.png", mimeType: "image/png", buffer: png });
+      await a.getByRole("list", { name: "Files to send" }).getByText(/\d+ B$/).waitFor({ timeout: 10000 });
+      await composer(a).fill("integrity @Bo");
+      await a.getByRole("option", { name: /Bob/ }).waitFor();
+      await composer(a).press("Enter");
+      await composer(a).pressSequentially(`test ${rid}`);
+      await composer(a).press("Enter");
+      const row = b.locator("[data-message]").filter({ hasText: `integrity @Bob test ${rid}` });
+      await row.getByText("Attachment verification failed", { exact: true }).waitFor();
+      if (await row.getAttribute("data-mentions-me") || await row.locator("[data-mention]").count()) throw new Error("substituted bytes raised a mention highlight");
+      if (await row.getByRole("img", { name: "integrity.png" }).count()) throw new Error("substituted bytes displayed automatically");
+      await shot(b, "41-attachment-verification-failed-dark");
+      await row.getByRole("button", { name: "Load unverified attachment", exact: true }).click();
+      await row.getByText("Attachment loaded without verification", { exact: true }).waitFor();
+      await row.getByRole("img", { name: "integrity.png" }).waitFor();
+      await shot(b, "42-attachment-explicitly-loaded-dark");
+    } finally {
+      await ctxB.unroute(pattern);
+    }
   });
 
   await check("a text file is shown as a file card, an oversized file is refused up front", async () => {
@@ -1239,7 +1293,7 @@ async function main() {
 
   const dist = path.join(webRoot, "dist");
   if (existsSync(path.join(dist, "index.html")) && !process.env.VC_SERVER_BIN?.includes("cargo")) {
-    await check("production build served by vc-server defaults to its own address", async () => {
+    await check("built app served by vc-server defaults to its own address", async () => {
       const bin = process.env.VC_SERVER_BIN ?? path.join(repoRoot, "target/debug/vc-server");
       if (!existsSync(bin)) return;
       const port = await new Promise((resolve) => {
@@ -1318,7 +1372,8 @@ async function main() {
     const profile = a.getByRole("dialog", { name: "Member profile" });
     await profile.getByText(/^#[a-z2-7]{10,}$/).waitFor();
     if (!(await profile.getByLabel("Full user ID").inputValue())) throw new Error("profile has no uid");
-    await a.keyboard.press("Escape");
+    await profile.getByRole("button", { name: "Close", exact: true }).click();
+    await profile.waitFor({ state: "detached" });
     await a.getByRole("button", { name: "Server menu" }).click();
     await a.getByRole("menuitem", { name: "Disconnect" }).click();
     await setGlobalNickname(a, "Global changed");
@@ -1337,19 +1392,19 @@ async function main() {
   await check("duplicate nickname mention suggestions send only the selected member uid", async () => {
     await treeItem(a, TALK).click();
     const bob = fb.clients().find((client) => client.nickname === "Bob");
-    const carol = await a.evaluate(async () => { const { useSession } = await import("/src/state/stores.ts"); return Object.values(useSession.getState().members).find((member) => member.nickname === "Carol"); });
+    const carol = await a.evaluate(async () => { const { useSession } = await window.__gwarE2eImport("/src/state/stores.ts"); return Object.values(useSession.getState().members).find((member) => member.nickname === "Carol"); });
     if (!bob || !carol) throw new Error("missing test member uids");
-    await a.evaluate(async ({ uid }) => { const { controller } = await import("/src/state/controller.ts"); await controller.setMemberNickname(uid, "Bob"); }, { uid: carol.uid });
+    await a.evaluate(async ({ uid }) => { const { controller } = await window.__gwarE2eImport("/src/state/controller.ts"); await controller.setMemberNickname(uid, "Bob"); }, { uid: carol.uid });
     await composer(a).pressSequentially("@Bo");
     const options = a.getByRole("option").filter({ hasText: "Bob" });
     await waitFor(async () => (await options.count()) === 2, "duplicate nickname suggestions");
-    const tag = await a.evaluate(async ({ uid }) => { const { useSession } = await import("/src/state/stores.ts"); return useSession.getState().members[uid].tag; }, { uid: carol.uid });
+    const tag = await a.evaluate(async ({ uid }) => { const { useSession } = await window.__gwarE2eImport("/src/state/stores.ts"); return useSession.getState().members[uid].tag; }, { uid: carol.uid });
     await options.filter({ hasText: `#${tag}` }).click();
     const text = `@Bob duplicate mention ${rid}`;
     await composer(a).pressSequentially(`duplicate mention ${rid}`);
     await composer(a).press("Enter");
     await waitFor(() => fa.events("chat.message").some((msg) => msg.text === text && msg.mentions?.length === 1 && msg.mentions[0] === carol.uid), "selected mention uid");
-    await a.evaluate(async ({ uid }) => { const { controller } = await import("/src/state/controller.ts"); await controller.setMemberNickname(uid, "Carol"); }, { uid: carol.uid });
+    await a.evaluate(async ({ uid }) => { const { controller } = await window.__gwarE2eImport("/src/state/controller.ts"); await controller.setMemberNickname(uid, "Carol"); }, { uid: carol.uid });
   });
 
   await check("connect: a new account keeps the local identity and shows the recovery code once", async () => {
@@ -1380,8 +1435,8 @@ async function main() {
     accountUid = await readUid(c);
     if (accountUid !== localUid) throw new Error(`kept identity changed uid: ${localUid} -> ${accountUid}`);
     const localRoot = await c.evaluate(async () => {
-      const { kvGet } = await import("/src/net/kv.ts");
-      const { loadConnectRecord } = await import("/src/net/identity.ts");
+      const { kvGet } = await window.__gwarE2eImport("/src/net/kv.ts");
+      const { loadConnectRecord } = await window.__gwarE2eImport("/src/net/identity.ts");
       const identity = await kvGet("identity");
       const account = await loadConnectRecord();
       return identity?.jwk?.x === account?.accountKey;
@@ -1437,9 +1492,9 @@ async function main() {
   await check("connect: the vault is shared between devices; the browser shows the TeamSpeak uid and keeps unknown fields", async () => {
     // Written like the desktop app would (the browser cannot do TeamSpeak itself), through the app's own modules.
     const written = await c.evaluate(async () => {
-      const { loadConnectRecord } = await import("/src/net/identity.ts");
-      const { connectApi } = await import("/src/connect/api.ts");
-      const { loadVault, updateVault, withTeamspeakList } = await import("/src/connect/vault.ts");
+      const { loadConnectRecord } = await window.__gwarE2eImport("/src/net/identity.ts");
+      const { connectApi } = await window.__gwarE2eImport("/src/connect/api.ts");
+      const { loadVault, updateVault, withTeamspeakList } = await window.__gwarE2eImport("/src/connect/vault.ts");
       const record = await loadConnectRecord();
       const list = { default: "E2E-TS-UID", identities: [{ uid: "E2E-TS-UID", name: "E2E TeamSpeak", identity: "1Vfake" }] };
       await updateVault(connectApi, record, (v) => ({ ...withTeamspeakList(v, list, 1), future: { kept: true } }));
@@ -1463,8 +1518,16 @@ async function main() {
     // Verification runs off the hello path; the badge may arrive in member.updated.
     await waitFor(() => [...welcomed.members, ...fd.events("member.updated")].some((member) => member.uid === localUid && member.connect?.handle === acct), "verified Connect account handle");
     await memberSection(d, "Online").getByLabel(`Gwar Connect account: @${acct}`).waitFor();
+    await d.getByRole("tab", { name: "Server", exact: true }).click();
+    const signedText = `signed account ${rid}`;
+    await composer(d).fill(signedText);
+    await composer(d).press("Enter");
+    const signedRow = d.locator("[data-message]").filter({ hasText: signedText });
+    await signedRow.locator(`[aria-label="Gwar Connect account: @${acct}"]`).waitFor();
+    await waitFor(() => signedRow.getAttribute("data-message-verification").then((v) => v === "verified"), "verified account message");
+    if (await signedRow.locator("[data-message-warning]").count()) throw new Error("valid account message was flagged");
     const trustedKey = await d.evaluate(async () => {
-      const { loadServiceKey } = await import("/src/connect/service-key.ts");
+      const { loadServiceKey } = await window.__gwarE2eImport("/src/connect/service-key.ts");
       return loadServiceKey();
     });
     const serviceKey = await (await fetch(`${connectUrl}/v1/service-key`)).json();
@@ -1474,6 +1537,45 @@ async function main() {
     await d.getByRole("dialog").getByLabel("Nickname").fill("Account on server");
     await d.getByRole("dialog").getByRole("button", { name: "Save", exact: true }).click();
     await d.getByRole("dialog").waitFor({ state: "detached" });
+  });
+
+  await check("normal chat flow has no message verification warnings", async () => {
+    for (const page of [a, b, d]) {
+      const tabs = page === d ? [null, "Server"] : [null, "private", "Server"];
+      for (const tab of tabs) {
+        if (tab === "private") {
+          // Explicit reconnects earlier in the suite clear private history.
+          const peerUid = await (page === a ? b : a).evaluate(async () => (await window.__gwarE2eImport("/src/state/stores.ts")).useSession.getState().me.uid);
+          await page.evaluate(async ({ uid, name }) => {
+            (await window.__gwarE2eImport("/src/state/stores.ts")).useSession.getState().dispatch({ type: "openDm", uid, name });
+          }, { uid: peerUid, name: page === a ? "Bob" : "Alice" });
+          if (page === a) {
+            await composer(a).fill(`verification private ${rid}`);
+            await composer(a).press("Enter");
+          }
+          await page.getByText(`verification private ${rid}`, { exact: true }).waitFor();
+        } else if (tab) await page.getByRole("tab", { name: tab }).click();
+        await waitFor(() => page.locator('[data-message][data-message-verification="pending"]').count().then((n) => n === 0), "message verification complete");
+        if (await page.locator("[data-message-warning]").count()) {
+          const diagnostic = await page.evaluate(async () => {
+            const { controller } = await window.__gwarE2eImport("/src/state/controller.ts");
+            const { useSession } = await window.__gwarE2eImport("/src/state/stores.ts");
+            const { storedKey } = await window.__gwarE2eImport("/src/state/reducer.ts");
+            const { verifyMessage } = await window.__gwarE2eImport("/src/net/message-signature.ts");
+            const { messageTarget } = await window.__gwarE2eImport("/src/lib/chat.ts");
+            const state = useSession.getState();
+            const key = storedKey(state, state.activeThread);
+            const uid = await controller.messageUid;
+            const messages = await Promise.all((state.threads[key]?.items ?? []).filter((i) => i.kind === "msg").map(async (i) => {
+              const target = messageTarget(key, i.msg.author_uid, uid);
+              return { id: i.msg.id, text: i.msg.text, verification: await verifyMessage(i.msg, { serverKey: controller.messageServerKey, target }) };
+            }));
+            return { serverKey: controller.messageServerKey, key, messages };
+          });
+          throw new Error(`valid message was flagged: ${JSON.stringify(diagnostic)}`);
+        }
+      }
+    }
   });
 
   await check("connect: the first browser revokes the second device with the password", async () => {

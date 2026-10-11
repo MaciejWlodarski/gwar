@@ -46,7 +46,7 @@ the server, presence, voice authenticity.
 - `#tag` is derived locally from the uid; it needs nobody.
 - Connect accounts have an account key, stored only encrypted; each device has
   its own key, certified by the account key. Certificates last at most 90 days
-  (**planned**: enforced at issuance and by every verifier; the client asks to
+  (**implemented**: enforced at issuance and by every verifier; the client asks to
   renew in the last 14 days). Revocations are signed by the account key.
 - `@handle` needs Connect: see "Handles".
 
@@ -61,7 +61,7 @@ the server, presence, voice authenticity.
 - Connect is reached only over HTTPS, without following redirects
   (**implemented**).
 
-## Logging in to a server (vc/3, in progress)
+## Logging in to a server (vc/3, implemented)
 
 Threats: a malicious server A relays your login to an honest server B and logs
 in to B as you (relay); or A pretends to be B.
@@ -138,7 +138,7 @@ Handle lookup by key is public by design.
 - Migrating an old browser's plaintext account root is crash-safe: the device
   record is saved before the root is removed.
 
-## Messages (planned)
+## Messages (implemented)
 
 Every message, edit and attachment is signed by the author's session key:
 
@@ -147,7 +147,7 @@ gwar message v2
 {server_key}
 {conversation}            server | channel:{id} | dm:{lower_uid}:{higher_uid}
 {author_uid}
-{client_signing_key}
+{client_signing_pk}
 {certificate_hash}
 {message_id}              16 random bytes from the client
 {revision}                0, then +1 per edit
@@ -168,9 +168,18 @@ gwar message v2
 - The certificate is checked at `signed_at`. An expired or revoked device can
   still sign with a false time, so such messages show "signature valid; device
   revoked (or certificate expired); signing time unproven".
-- The client remembers what it has seen (idempotent, bounded) and refuses
-  rollbacks and substitutions. A fresh device has no such memory.
-- Notifications are raised only for verified messages. Attachments that fail
+- IndexedDB checkpoints keep 10,000 signed identities atomically and refuse
+  rollbacks, forks and predecessor substitution. Exact reloading is normal;
+  fresh devices and evicted history have no checkpoints. Missing predecessors
+  show continuity unproven.
+- Clients fetch account-signed revocations from their own configured Connect,
+  retaining account/device pairs permanently with the cursor. Feed omissions
+  do not undo them. Stale/unavailable feeds are explicit; the 20,000-record
+  capacity fails closed rather than evicting revocations.
+- Author deletion is a final signed revision (the exact body encoding is in
+  architecture.md). A moderator's unsigned removal says removed by the server.
+- Notifications and mention highlights require current, continuous verification.
+  Signed attachment notifications also require byte hashes. Attachments that fail
   or lack a signature load only on request. TeamSpeak messages are shown as
   unsigned.
 - Signature status, handle attestation, connection security and historical
@@ -196,8 +205,9 @@ These are limits of a voice chat relayed through a server:
   (the SFU terminates DTLS-SRTP). Direct messages are not end-to-end encrypted.
 - **Lie about presence**: who is online, where, who is talking.
 - **Voice**: inject audio or attribute it to anyone; voice is not signed.
-- **Delivery**: drop, delay, reorder or hide messages. Removing a message is
-  distinguishable from the author deleting it only once deletions are signed.
+- **Delivery**: drop, delay, reorder or hide messages. An observed server removal is
+  distinct from a signed author deletion; silently omitted history cannot be detected
+  on a fresh device.
 - **Nicknames, channel names, roles** on that server are its word.
 - **Show forged or altered content**, but only with a warning.
 - **Track** your IP address and when you are online, and link your uid across

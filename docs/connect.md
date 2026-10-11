@@ -113,7 +113,8 @@ All signatures are Ed25519 over the UTF-8 text, fields separated by `\n`:
   Each device renews its own certificate after entering the password. The
   device inventory is for inspection and revocation; its names, last-seen
   times and completeness are unverified service claims, never instructions
-  to sign. A device close to expiry asks for the password.
+  to sign. The prompt starts exactly 14 days before expiry. Issuance and every verifier
+  enforce the 90-day maximum.
 - **Revocation**, by the account key: `gwar revoke v1\n{account_key}\n{device_key}\n{revoked_at}`.
 
 ### Session and credential challenges
@@ -266,8 +267,7 @@ cursor are ignored, and a missing entry never clears a stored revocation.
 Connect can withhold the feed; its sequence numbers do not prove completeness.
 The core disconnects an ongoing session at certificate expiry with an explicit
 renewal reason, removes its subscriptions and voice routing, and closes its
-SFU transport. vc/3 accepts certificates lasting at most 90 days. Connect
-service issuance limits are handled separately.
+SFU transport. Issuance, vc/3 and message verifiers all enforce a 90-day maximum.
 
 A certificate proves key possession, not registration with Connect. After a
 device-authenticated hello, servers asynchronously look up the account key via
@@ -290,8 +290,25 @@ Your client checks each handle's Ed25519 attestation against the service key it
 fetches from its configured Connect service over HTTPS. It checks the signed
 account key against the member's uid and rejects expired attestations or issuance
 more than five minutes in the future.
-The game server can still lie about presence (who is online or in which channel),
-voice, and, until message signing lands, message authorship.
+Chat messages, edits and author deletions use the hello key and exact certificate,
+the vc/3-verified server key (independent of endpoint aliases), locally rebuilt
+conversation and account-derived UID. The v2 revision chain and netstring body
+are specified in [architecture.md](architecture.md#signed-messages-v2).
+Certificate validity is checked at each operation's signed time, including edits.
+Honest servers also require current session authorization.
+
+Clients independently fetch this service's public revocation feed over the shared
+HTTPS/no-redirect transport and persist signed account/device pairs permanently,
+with their cursor. Feed omission cannot undo a revocation already seen. Capacity
+limits fail closed. A revoked or expired device can fabricate an earlier signing
+time: historical signatures explicitly show that uncertainty. Stale/unavailable
+revocation data is also shown. Handles, signatures, historical authorization and
+connection security remain separate; signed chat does not authenticate voice.
+
+Unverified or unsigned attachments load only through an explicit user action.
+Signed bytes are hashed before preview/download; decoded images are bounded.
+The server can still lie about presence, voice, delivery, order, removal and
+nicknames. Author-signed deletion is distinguished from server removal.
 
 ## Service key and handle attestations
 

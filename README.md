@@ -42,6 +42,10 @@ use.
   permanent, by identity or IP), invite links that can grant a role, server
   settings, removing members and cleaning up the inactive ones. Nobody can hand
   out more than they hold.
+- **Signed chat.** Clients verify authors, chained edits, author deletions and
+  attachment bytes, across endpoint aliases. Historical authorization uncertainty,
+  stale revocation information and unsigned TeamSpeak chat are labeled separately;
+  chat signatures do not authenticate voice. Fresh devices have no rollback checkpoints.
 - **Chat like you expect.** Mentions with notifications, editing and deleting,
   images, video, audio and files (drag and drop or paste).
 - **One web app, plus a desktop app, with one UI.** The project hosts the web
@@ -197,8 +201,11 @@ vc-server --data-dir data members merge [--dry-run] -- <from-uid> <into-uid>
 `prune` must run with the server stopped (the server holds `data/vc.lock`; the command refuses
 to run while it is held). Members with a role besides Member are kept unless
 `--include-grouped` is given. `list` includes the member tag and confirmed
-Connect handle. `merge` moves the source's messages, uploads, roles, mentions,
-read marks and UID bans to an existing target, preserving the target's nickname.
+Connect handle. `merge` moves the source's unsigned messages, uploads, roles,
+mentions in unsigned messages, read marks and UID bans to an existing target,
+preserving the target's nickname. Signed messages keep their original `author_uid`
+and mentions because the signature binds them; the CLI reports only unsigned
+messages and mentions moved.
 It is transactional and requires the server stopped, including `--dry-run`.
 Put UIDs beginning with `-` after `--`, as in the examples above.
 

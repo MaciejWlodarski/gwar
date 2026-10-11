@@ -168,13 +168,113 @@ with `member_nickname`. Duplicates are allowed. The empty-ok reply follows
 `bad_request` for invalid names, `forbidden` for missing permission, `not_found`
 for an unknown member, and `internal` for storage failures.
 
-`Member.tag` is the shortest distinguishing lowercase RFC 4648 base32 prefix
+The server's `Member.tag` is the shortest distinguishing lowercase RFC 4648 base32 prefix
 (minimum 10 characters) across **all** members, even those omitted from Welcome.
 UIDs decode from base64url; `ts:` UIDs decode from standard base64. Malformed UIDs
 fall back to the first 20 bytes of SHA-256 of the UID string. Sorted neighbours
-determine the prefix lengths; joins and removals announce affected tags through
+determine the prefix lengths; clients derive displayed tags from UID bytes locally.
+Joins and removals announce affected tags through
 `member.updated`. Tags may grow or shrink. `Member.connect` is a public handle
 confirmed asynchronously by Connect (see [connect.md](connect.md)).
+
+## Signed messages (v2)
+
+Every Gwar send/edit uses the vc/3 hello key and exact certificate. Honest
+servers enforce their persistent server key, locally routed conversation and
+account-derived author, current certificate/revocation authorization, and
+`signed_at` within five minutes of now. Edits preserve identity/context/creation
+fields, increment revision exactly once and commit to the stored predecessor.
+Message IDs cannot be reused, even after removal. Uploads check received bytes
+against the declared SHA-256 and size. History keeps the full signature envelope,
+mentions and attachment order; member merges never reattribute signed messages.
+
+Exact UTF-8 statement, `\n` separators, no trailing newline:
+
+```text
+gwar message v2
+{server_key}
+{conversation}
+{author_uid}
+{client_signing_pk}
+{certificate_hash}
+{message_id}
+{revision}
+{previous_revision_hash}
+{created_at}
+{signed_at}
+{body_hash}
+```
+
+`server_key` is the vc/3-verified server identity, independent of endpoint aliases.
+`conversation` is `server`, `channel:{immutable_channel_id}`, or
+`dm:{lower_uid}:{higher_uid}` (ASCII-byte sorted). Both DM participants come
+from the client's open conversation; the signed author determines direction.
+`author_uid` derives from the certificate account key, or the signing key for
+local identities. Wire `MessageSignature.key` is `client_signing_pk`; the
+certificate commitment is vc/3's `certificate_hash` (`-` for local identities).
+IDs are 16 random client bytes in canonical unpadded base64url. Revision 0 uses
+predecessor `-` and equal creation/signing times. Each edit is revision +1, with
+`previous_revision_hash = b64url(SHA256(previous_statement + "\n" + previous_signature))`.
+Times are unsigned decimal Unix ms, in the JavaScript safe-integer range.
+Binary fields have exact lengths and canonical encodings; CR/LF in statement
+fields and weak/non-strict Ed25519 signatures fail. Rust and TypeScript consume
+`crates/vc-proto/tests/message-signing.json`.
+
+`body_hash` is base64url SHA-256 of UTF-8 netstrings (`{byte_len}:{bytes},`):
+text, decimal count of sorted unique mention UIDs, each UID, decimal attachment
+count, then each attachment's SHA-256, decimal size, MIME and name in message
+order. IDs, URLs and layout dimensions are outside this body: URL confinement
+still applies, and complete bytes are hashed before display or saving. Upload
+metadata is capped at 16 KiB and validated; its signed name and MIME must match
+local filename cleanup and byte sniffing, rather than server-selected replacements.
+
+Author deletion is a **final v2 revision**, using exact text bytes
+`00 67 77 61 72 20 64 65 6c 65 74 65 64 20 76 31` (`"\0gwar deleted v1"`),
+no mentions and no attachments. Its canonical body is the concatenation of
+`16:` + those 16 bytes + `,1:0,1:0,`; the usual body hash and statement sign it.
+The server retains this tombstone, removes its files and refuses further edits.
+Clients that saw it reject resurrection. A fresh client seeing a later revision
+can only report continuity unproven. Unsigned `chat.delete` requires moderation
+permission and means **removed by the server**, never deleted by the author.
+Clients retain that distinction even for already displayed content.
+
+Clients verify every displayed message locally. Signature status, separately
+verified Connect handle attestation, connection security and historical
+certificate/revocation authorization are separate labels. A signature does not
+authenticate voice. `#tag` is derived locally from the UID. Unsigned Gwar messages
+and invalid replacements cannot raise notifications or mention highlights;
+TeamSpeak messages may notify, labeled **TeamSpeak / unsigned**, without a handle
+badge. Only a valid, current, continuous message may notify; signed attachments
+also need a complete byte-hash check. File-message mention highlights require
+a live byte check; loading historical files does not raise highlights. Repeated signed identities do not notify
+again. Unverified/unsigned attachments, including hash failures, load only after
+a labeled user action. Image headers and decoded first frames are limited to
+4096 pixels per side and 16 million pixels; previews become static PNGs.
+
+The web/desktop client stores one atomic IndexedDB state in
+`gwar-message-auth-v2` / `state` / `auth`. Checkpoints key
+`(server_key, author_uid, message_id)` to the highest revision, statement/signature
+hash, immutable context, creation time, continuity and final deletion marker.
+The same revision/hash is idempotent; a lower revision is rollback; a changed
+same revision, immutable context or known predecessor is a fork. These are
+rejected before UI replacement. Live/history verification is serialized and
+bounded at 256 queued live messages. Checkpoints cap at 10,000, evicting oldest
+seen entries. The UI discloses fresh devices have no checkpoints and evicted
+history loses rollback protection. Browser storage rollback/clearing is outside
+this protection; missing predecessors remain **continuity unproven**.
+
+Account-signed revocations are fetched directly from the client's configured
+Connect through the shared HTTPS/no-redirect transport. The cursor, freshness
+and permanent `(account_key, device_key)` records commit together. Feed omissions
+never erase a record; the earliest signed revocation wins. Storage caps at
+20,000 revocations and eight service cursors; capacity failure aborts the update
+and marks authorization unavailable, without eviction. Refresh attempts are at
+most once per minute; freshness lasts five minutes and failures immediately
+mark it unavailable. Feed sequence numbers cannot prove completeness.
+`signed_at >= revoked_at` fails. Earlier signatures show **signing device
+revoked; signing time unproven**. A certificate valid at signing time but expired
+now shows **certificate expired; historical timing unproven**. Stale/unavailable
+feeds and unavailable checkpoint storage are explicit states.
 
 Stored chat author names remain send-time snapshots. History and message reads
 use the member's current name while their record exists, then fall back to the
@@ -280,6 +380,7 @@ and identity-write access; CSP and frame validation reduce that exposure.
 | `files_cancel` | Low: cancels a file request by ID. |
 | `fetch_file` | Medium: bounded GET of the stored origin's download route; no redirects or proxy. |
 | `save_file_as` | Medium: bounded GET, native save dialog and write to the chosen path; no write until fetch succeeds. |
+| `save_blob_as` | Medium: bounded inspected bytes, native save dialog; no network refetch. |
 | `upload_put` | Medium: bounded PUT of the stored origin's one-use upload route; no redirects. |
 | `set_global_shortcut` | Medium: registers supported audio actions with the OS. |
 | `ts_connect` | High: native UDP connection and private identity use; JS passes a public UID, Rust loads the key directly. |
