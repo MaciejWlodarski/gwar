@@ -421,6 +421,16 @@ async fn revoking_a_device_ends_its_sessions() {
 }
 
 #[tokio::test]
+async fn no_reply_may_be_cached() {
+    let api = Api::start().await;
+    for (path, method) in [("/service-key", "GET"), ("/vault", "GET"), ("/login", "POST"), ("/missing", "GET")] {
+        let request = api.http.request(method.parse().unwrap(), format!("{}{path}", api.base));
+        let reply = request.header("content-type", "application/json").body("{}").send().await.unwrap();
+        assert_eq!(reply.headers()["cache-control"], "no-store", "{method} {path}");
+    }
+}
+
+#[tokio::test]
 async fn bulk_renewal_is_removed() {
     let api = Api::start().await;
     assert_eq!(api.post("/devices/renew", None, json!({"certificates": []})).await.0, 404);

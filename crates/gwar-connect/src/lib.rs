@@ -15,7 +15,10 @@ use axum::{
     routing::{get, post, put},
 };
 use tokio::net::TcpListener;
-use tower_http::cors::{AllowOrigin, CorsLayer};
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    set_header::SetResponseHeaderLayer,
+};
 
 pub use api::Connect;
 use store::Store;
@@ -58,6 +61,8 @@ pub fn router(state: Arc<Connect>, origins: &[String]) -> Router {
         .route("/v1/accounts/by-key/{account_key}", get(api::lookup_by_key))
         .route("/v1/accounts/{handle}", get(api::lookup))
         .layer(cors)
+        // Replies carry sessions, vaults and encrypted keys; no cache may keep any of them.
+        .layer(SetResponseHeaderLayer::overriding(header::CACHE_CONTROL, HeaderValue::from_static("no-store")))
         .with_state(state)
 }
 
