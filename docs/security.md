@@ -176,9 +176,10 @@ gwar message v2
   record is marked incomplete for good and every channel message there is
   qualified ("cannot rule out a reused channel id"). If storage refuses even
   that small marker, the record stays in memory however many other servers
-  the client visits; should more than 64 such records pile up, the client
-  drops the oldest and qualifies every channel message on every server until
-  it reloads. A reload is the one point where an unstored record is lost. A
+  the client visits. Memory holds 64 server records; once all 64 are such
+  records, the next server the client loads makes it drop the oldest one, and
+  from then until it reloads every channel message on every server is
+  qualified. A reload is the one point where an unstored record is lost. A
   client that never saw the deletion cannot tell, so a signature binds a
   message to the channel id, not to the channel's name or lifetime. A direct
   message must involve exactly the two participants of the open conversation.

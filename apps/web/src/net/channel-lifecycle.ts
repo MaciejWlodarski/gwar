@@ -44,8 +44,8 @@ function parse(raw: string | null): Record {
 export function channelLifecycle(given?: Store): ChannelLifecycle {
   const storage = () => given ?? globalThis.localStorage;
   // The record in memory is authoritative for this session; storage carries it across reloads. Saved records
-  // can be dropped from memory and read again; unsaved ones cannot, so they stay. If more than MAX_SERVERS of
-  // them would have to stay, the oldest goes and every record is uncertain for the rest of the session.
+  // can be dropped from memory and read again; unsaved ones cannot, so they stay. When every slot holds one and
+  // another record is loaded, the oldest goes and every record is uncertain for the rest of the session.
   const memory = new Map<string, Record>();
   let uncertain = false;
   const load = (serverKey: string): Record => {
