@@ -301,7 +301,7 @@ lists; one-time tokens grant groups. Nobody can make a token or invite for a
 group with permissions they lack, and one only works while its maker still
 could make it: demoting or removing them voids what they handed out. Tokens the
 server issues itself (the first admin token, `vc-server admin-token`) have no maker;
-invites from before makers were recorded admit nobody. Channel and server
+invites and tokens from before makers were recorded admit nobody. Channel and server
 passwords are stored as Argon2 of TeamSpeak's wire form `base64(sha1(password))`.
 
 Members are the users' rows in SQLite (`users`, with groups and read marks).

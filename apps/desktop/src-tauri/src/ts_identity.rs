@@ -27,7 +27,7 @@
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Mutex, MutexGuard},
 };
 
 use serde::{Deserialize, Serialize};
@@ -107,6 +107,7 @@ impl Files {
     /// The identity to connect with: the one with this uid, else the default of the active list. With
     /// no identity at all, one named "Default" is made and stored.
     fn for_connect(&self, uid: Option<&str>) -> anyhow::Result<TsIdentity> {
+        let _files = lock();
         let (source, mut list) = self.active()?;
         if let Some(entry) = list.pick(uid) {
             return entry.identity();
@@ -134,8 +135,8 @@ impl Files {
         }) {
             return Err("identity list too large".into());
         }
-        // One write at a time, so what is removed is what the user agreed to.
-        let _write = WRITE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // What is removed is what the user agreed to: nothing else changes the lists meanwhile.
+        let _files = lock();
         match (which, list) {
             ("device", Some(list)) => {
                 if !self.device_removals(&list)?.is_subset(allowed) {
@@ -169,7 +170,12 @@ impl Files {
     }
 }
 
-static WRITE: Mutex<()> = Mutex::new(());
+/// Held across every read-modify-write of the lists (connecting may add a default identity and
+/// reading may migrate an older file), so none of them overwrites another's change.
+fn lock() -> MutexGuard<'static, ()> {
+    static FILES: Mutex<()> = Mutex::new(());
+    FILES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// The identity a TeamSpeak connection uses; see [`Files::for_connect`].
 pub fn load_for_connect(app: &AppHandle, uid: Option<&str>) -> Result<TsIdentity, String> {
@@ -246,6 +252,7 @@ fn parsed(identity: &TsIdentity) -> ParsedIdentity {
 pub async fn ts_identity_list(app: AppHandle, which: String) -> Result<ListInfo, String> {
     tokio::task::spawn_blocking(move || {
         let files = files(&app)?;
+        let _files = lock();
         match which.as_str() {
             "active" => files.active().map(|(source, list)| list_info(source, list)).map_err(err),
             "device" => files.list(Source::Device).map(|list| list_info(Source::Device, list)).map_err(err),
@@ -274,9 +281,13 @@ pub async fn ts_identity_set_list(app: AppHandle, which: String, list: Option<Li
     let mut allowed = BTreeSet::new();
     if let ("device", Some(list)) = (which.as_str(), &list) {
         let (app, list) = (app.clone(), list.clone());
-        allowed = tokio::task::spawn_blocking(move || files(&app)?.device_removals(&list))
-            .await
-            .map_err(|e| e.to_string())??;
+        allowed = tokio::task::spawn_blocking(move || {
+            let files = files(&app)?;
+            let _files = lock();
+            files.device_removals(&list)
+        })
+        .await
+        .map_err(|e| e.to_string())??;
     }
     if !allowed.is_empty() {
         confirm(&app, "Delete TeamSpeak identities from this computer? Their private keys exist only here; the previous list is kept as a backup.").await?;
@@ -305,6 +316,7 @@ pub async fn ts_identity_export(app: AppHandle, which: String, uid: Option<Strin
     confirm(&app, "Allow Gwar to export private TeamSpeak identities? The web interface will receive secret keys for export or encrypted account sync.").await?;
     tokio::task::spawn_blocking(move || {
         let files = files(&app)?;
+        let _files = lock();
         let mut list = match which.as_str() {
             "active" => files.active().map_err(err)?.1,
             "device" => files.list(Source::Device).map_err(err)?,
@@ -502,6 +514,29 @@ mod tests {
         // The account's list mirrors the vault and needs no consent.
         files.set_list("account", Some(list_in(&[("a", &a)], None)), &none).unwrap();
         files.set_list("account", Some(list_in(&[], None)), &none).unwrap();
+    }
+
+    #[test]
+    fn connecting_waits_for_other_changes_to_the_lists() {
+        let dir = Dir::new();
+        let files = Files::in_dir(&dir.0);
+        let held = lock();
+        let connecting = std::thread::spawn({
+            let files = Files::in_dir(&dir.0);
+            move || files.for_connect(None).unwrap()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!files.device.exists(), "made a default identity while the lists were locked");
+        let imported = ts_identity::generate();
+        ts_identities::save(&files.device, &{
+            let mut list = List::default();
+            list.push("Imported", &imported);
+            list
+        })
+        .unwrap();
+        drop(held);
+        assert_eq!(uid(&connecting.join().unwrap()), uid(&imported));
+        assert_eq!(files.list(Source::Device).unwrap().identities.len(), 1);
     }
 
     #[test]

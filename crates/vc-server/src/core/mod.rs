@@ -306,8 +306,8 @@ fn check_password_len(password: &str) -> Result<(), ErrorBody> {
     Ok(())
 }
 
-/// Creates a single-use token for `group`, e.g. the first admin token.
-/// A new token for `group`; `creator`: the member it comes from, `None` for the server itself.
+/// A new single-use token for `group`; `creator`: the member it comes from, `None` for the
+/// server itself (e.g. the first admin token).
 pub fn issue_token(store: &Store, group: GroupId, creator: Option<&str>) -> Result<String> {
     let token = new_token();
     store.insert_token(&token_hash(&token), group, creator, now_ms())?;

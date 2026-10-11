@@ -244,9 +244,11 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE invites ADD COLUMN creator_uid TEXT;
     "#,
     // Who made a token, so it grants only while they still could; NULL: the server itself
-    // (the first admin token, `vc-server token`).
+    // (the first admin token, `vc-server admin-token`). Older tokens have no known maker and
+    // would pass as the server's, so they lapse; `admin-token` issues a new one.
     r#"
     ALTER TABLE tokens ADD COLUMN creator_uid TEXT;
+    DELETE FROM tokens;
     "#,
 ];
 
@@ -1443,6 +1445,25 @@ mod tests {
         assert!(!store.delete_invite("new", Some("other")).unwrap());
         assert!(store.delete_invite("new", Some("uid")).unwrap());
         assert!(store.delete_invite("old", None).unwrap());
+    }
+
+    #[test]
+    fn tokens_from_before_makers_lapse() {
+        let db = Connection::open_in_memory().unwrap();
+        let before = migration_adding("tokens ADD COLUMN creator_uid");
+        for migration in &MIGRATIONS[..before] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.pragma_update(None, "user_version", before).unwrap();
+        db.execute_batch(
+            "INSERT INTO groups(id,name,permissions) VALUES(1,'Admin','[]');
+             INSERT INTO tokens(token_hash,group_id,created_at) VALUES('old',1,1);",
+        )
+        .unwrap();
+        let store = Store::init(db).unwrap();
+        assert_eq!(store.redeem_token("old").unwrap(), None);
+        store.insert_token("new", 1, None, 2).unwrap();
+        assert_eq!(store.redeem_token("new").unwrap(), Some((1, None)));
     }
 
     #[test]
