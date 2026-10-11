@@ -357,6 +357,8 @@ export const en = {
   "chat.unverifiedDeletion": "Unverified deletion request",
   "chat.verificationQueueFull": "Message verification queue is full",
   "chat.replacementRejected": "Message replacement rejected: invalid signature, rollback or fork",
+  "chat.editInProgress": "This message is already being changed",
+  "chat.editChanged": "The message changed in the meantime; try again",
   "chat.editUnverified": "This message could not be verified, so it cannot be edited or deleted with your signature",
   "chat.verifying": "Checking the signature…",
   "chat.edited": "(edited)",

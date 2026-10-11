@@ -595,3 +595,108 @@ describe("bounded incoming verification", () => {
     } finally { verify.mockRestore(); settings.useSettings.setState({ language: "en" }); }
   });
 });
+
+// Gate regressions (Astra r2 probes, inverted): production verifier, signing and reducer; scheduling is controlled.
+import "fake-indexeddb/auto";
+describe("edits stay on their connection; history ownership follows each verified row", () => {
+  async function genuine(text = "genuine victim message") {
+    const { keyFromSeed, signText } = await import("../connect/crypto");
+    const { uidForPublicKey } = await import("../net/identity");
+    const { signMessage, MessageVerifier } = await import("../net/message-signature");
+    const { MessageStorage } = await import("../net/message-storage");
+    const pair = await keyFromSeed(new Uint8Array(32).fill(37));
+    const identity = { ...pair, nickname: "victim", sign: (bytes: Uint8Array) => signText(pair.jwk, new TextDecoder().decode(bytes)) } as unknown as import("../net/identity").Identity;
+    const uid = await uidForPublicKey(pair.publicKey);
+    const ctx = { serverKey: pair.publicKey, target: "channel:1" };
+    const msg = message(71, 1, { author_uid: uid, text });
+    msg.signature = await signMessage(identity, ctx, uid, text, [], []);
+    const storage = new MessageStorage(`gate-${crypto.randomUUID()}`);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const c = controller as any;
+    c.verifier = new MessageVerifier(storage);
+    return { identity, uid, ctx, msg, storage, c };
+  }
+  async function servers(g: Awaited<ReturnType<typeof genuine>>) {
+    const { Connection } = await import("../net/connection");
+    const { keyFromSeed } = await import("../connect/crypto");
+    const connection = (serverKey: string, identity = g.identity) => {
+      const conn = Object.create(Connection.prototype);
+      Object.assign(conn, { options: { identity }, serverKey_: serverKey, request: vi.fn(async () => ({})) });
+      return conn;
+    };
+    const a = connection(g.ctx.serverKey), b = connection((await keyFromSeed(new Uint8Array(32).fill(38))).publicKey);
+    g.c.conn = a;
+    stores.useSession.setState({ me: { session: 1, uid: g.uid } });
+    session().dispatch({ type: "event", now: Date.now(), event: { ev: "chat.message", d: g.msg }, authentic: true });
+    const switchTo = () => {
+      g.c.conn = b;
+      session().dispatch({ type: "reset" });
+      stores.useSession.setState({ me: { session: 1, uid: g.uid }, kind: "vc" });
+    };
+    return { a, b, connection, switchTo };
+  }
+  const gate = () => {
+    let release!: () => void, entered!: () => void;
+    const hold = new Promise<void>((r) => { release = r; }), started = new Promise<void>((r) => { entered = r; });
+    return { release, started, pass: async () => { entered(); await hold; } };
+  };
+
+  it("never signs for or sends to another server when the connection changes during verification", async () => {
+    vi.useRealTimers(); connectFake();
+    const g = await genuine(), { a, b, switchTo } = await servers(g), held = gate();
+    const verify = g.c.verifier.verify.bind(g.c.verifier);
+    g.c.verifier.verify = async (...args: unknown[]) => { const result = await verify(...args); await held.pass(); return result; };
+    const sign = vi.spyOn(g.identity, "sign");
+    const editing = controller.editMessage(g.msg.id, "private text intended for server A", []);
+    await held.started; switchTo(); held.release();
+    expect(await editing).toBe(false);
+    expect(a.request).not.toHaveBeenCalled(); expect(b.request).not.toHaveBeenCalled(); expect(sign).not.toHaveBeenCalled();
+    g.c.conn = link;
+  });
+
+  it("never sends a signature when the connection changes during signing", async () => {
+    vi.useRealTimers(); connectFake();
+    const g = await genuine(), held = gate();
+    const sign = g.identity.sign;
+    g.identity.sign = async (bytes: Uint8Array) => { const signature = await sign(bytes); await held.pass(); return signature; };
+    const { a, b, switchTo } = await servers(g);
+    const deleting = controller.deleteMessage(g.msg.id);
+    await held.started; switchTo(); held.release();
+    expect(await deleting).toBe(false);
+    expect(a.request).not.toHaveBeenCalled(); expect(b.request).not.toHaveBeenCalled();
+    g.c.conn = link;
+  });
+
+  it("refuses a second change of the same message while the first is in flight", async () => {
+    vi.useRealTimers(); connectFake();
+    const g = await genuine(), held = gate();
+    const verify = g.c.verifier.verify.bind(g.c.verifier);
+    g.c.verifier.verify = async (...args: unknown[]) => { const result = await verify(...args); await held.pass(); return result; };
+    const { a } = await servers(g);
+    const first = controller.editMessage(g.msg.id, "one", []);
+    await held.started;
+    expect(await controller.editMessage(g.msg.id, "two", [])).toBe(false);
+    held.release();
+    expect(await first).toBe(true);
+    expect(a.request).toHaveBeenCalledTimes(1);
+    expect(a.request.mock.calls[0][1]).toMatchObject({ message: g.msg.id, text: "one" });
+    g.c.conn = link;
+  });
+
+  it("a forged duplicate in a history page never inherits the genuine row's ownership", async () => {
+    vi.useRealTimers(); connectFake();
+    const { msg, ctx, c } = await genuine();
+    Object.defineProperty(link, "serverKey", { value: ctx.serverKey });
+    const forged = { ...structuredClone(msg), text: "FORGED" };
+    for (const page of [[forged, msg], [msg, forged]]) {
+      session().dispatch({ type: "reset" }); connectFake();
+      Object.defineProperty(link, "serverKey", { value: ctx.serverKey });
+      await c.applyHistory(page, 1, null);
+      const rows = session().threads["ch:1"]!.items.filter((i) => i.kind === "msg");
+      expect(rows).toEqual([expect.objectContaining({ authentic: true, msg: expect.objectContaining({ text: msg.text }) })]);
+      link.emit({ ev: "chat.message", d: { ...msg, id: 72 } });
+      await c.messageQueue;
+      expect(session().threads["ch:1"]!.items.filter((i) => i.kind === "msg").map((i) => i.kind === "msg" && i.msg.text)).toEqual([msg.text]);
+    }
+  });
+});

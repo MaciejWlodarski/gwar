@@ -593,12 +593,22 @@ describe("signed identity ownership", () => {
   it("history follows the same rules", () => {
     let s = live(online(), msg(1, { text: "FORGED", signature: sig("A") }), false);
     s = live(s, msg(3, { text: "unsigned squatter" }), false);
-    s = reduce(s, { type: "history", channel: 1, before: null, limit: 50, authentic: [2, 3],
+    s = reduce(s, { type: "history", channel: 1, before: null, limit: 50, authentic: [true, true],
       messages: [msg(2, { text: "genuine", signature: sig("A") }), msg(3, { text: "genuine 3", signature: sig("D") })] });
     expect(texts(s)).toEqual(["2:genuine", "3:genuine 3"]);
-    s = reduce(s, { type: "history", channel: 1, before: null, limit: 50, authentic: [],
+    s = reduce(s, { type: "history", channel: 1, before: null, limit: 50, authentic: [false],
       messages: [msg(4, { text: "FORGED again", signature: sig("A") })] });
     expect(texts(s)).toEqual(["2:genuine", "3:genuine 3"]);
+  });
+
+  it("an authentic replay under another id does not duplicate the message, in history or by edit", () => {
+    let s = reduce(online(), { type: "history", channel: 1, before: null, limit: 50, authentic: [true, true, false],
+      messages: [msg(2, { text: "genuine", signature: sig("A") }), msg(5, { text: "genuine", signature: sig("A") }), msg(6, { text: "squatter" })] });
+    expect(texts(s)).toEqual(["2:genuine", "6:squatter"]);
+    // An edit cannot move the identity onto another row, and an unauthenticated edit cannot replace an authentic row.
+    s = reduce(s, { type: "event", now: 6, event: { ev: "chat.edited", d: msg(6, { text: "claims A", signature: sig("A") }) }, authentic: true });
+    s = reduce(s, { type: "event", now: 6, event: { ev: "chat.edited", d: msg(2, { text: "FORGED edit", signature: sig("A") }) }, authentic: false });
+    expect(texts(s)).toEqual(["2:genuine", "6:squatter"]);
   });
 });
 

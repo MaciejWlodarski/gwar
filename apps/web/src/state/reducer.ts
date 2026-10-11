@@ -39,7 +39,7 @@ export type Action =
   | { type: "phase"; phase: Phase }
   | { type: "welcome"; welcome: Welcome; resync: boolean; now: number }
   | { type: "event"; event: Event; now: number; verified?: boolean; authentic?: boolean }
-  | { type: "history"; channel: number; messages: ChatMessage[]; before: number | null; limit: number; authentic?: number[] }
+  | { type: "history"; channel: number; messages: ChatMessage[]; before: number | null; limit: number; authentic?: boolean[] }
   | { type: "historyForbidden"; channel: number }
   | { type: "setActive"; key: ThreadKey }
   /** Open a channel's chat (whether or not I am in its voice). */
@@ -197,9 +197,18 @@ export function mergeItems(a: ChatItem[], b: ChatItem[]): ChatItem[] {
     seen.add(item.key);
     all.push(item);
   }
-  // Unauthenticated claims on a signed identity that an authentic row owns are dropped.
-  const owned = new Set(all.flatMap((i) => (i.kind === "msg" && i.authentic ? [signedIdentity(i.msg)] : [])));
-  const kept = all.filter((i) => i.kind !== "msg" || i.authentic || !owned.has(signedIdentity(i.msg)));
+  // One row per signed identity: the authentic one with the highest revision (the first on a tie) owns it, and
+  // every other claim on it, authentic replay or not, is dropped.
+  const owners = new Map<string, ChatItem>();
+  for (const i of all) {
+    const id = i.kind === "msg" && i.authentic ? signedIdentity(i.msg) : null;
+    const owner = id === null ? undefined : owners.get(id);
+    if (id !== null && (!owner || (owner.kind === "msg" && i.kind === "msg" && i.msg.signature!.revision > owner.msg.signature!.revision))) owners.set(id, i);
+  }
+  const kept = all.filter((i) => {
+    const id = i.kind === "msg" ? signedIdentity(i.msg) : null;
+    return id === null || !owners.has(id) || owners.get(id) === i;
+  });
   all.length = 0;
   all.push(...kept);
   // Messages from one channel are ordered by id; sys lines by time. A stable
@@ -260,7 +269,12 @@ function onChatEdited(state: SessionState, msg: ChatMessage, verified = false, a
   const isMention = verified && mentionsUser(msg, state.me?.uid);
   const unreadMention = msg.id > thread.lastRead && thread.unread > 0 && msg.author_uid !== state.me?.uid;
   const mentions = unreadMention ? Math.max(0, thread.mentions + Number(isMention) - Number(wasMention)) : thread.mentions;
-  return withThread(state, key, (t) => ({ ...t, mentions, items: t.items.map((i) => (i.key === itemKey ? msgItem(msg, verified, authentic) : i)) }));
+  // The same ownership as for new rows: an unauthenticated edit never replaces an authentic row, an edit never takes
+  // a signed identity that another authentic row owns, and an authentic edit drops unauthenticated claims on it.
+  const item = msgItem(msg, verified, authentic) as Extract<ChatItem, { kind: "msg" }>;
+  const others = thread.items.filter((i) => i.key !== itemKey && clashesWith(item)(i));
+  if ((old.authentic && !authentic) || others.some((i) => i.kind === "msg" && i.authentic) || (others.length > 0 && !authentic)) return state;
+  return withThread(state, key, (t) => ({ ...t, mentions, items: t.items.flatMap((i) => (i.key === itemKey ? [item] : others.includes(i) ? [] : [i])) }));
 }
 
 function onChatDeleted(state: SessionState, channel: number, message: number): SessionState {
@@ -424,7 +438,8 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
 export function reduce(state: SessionState, action: Action): SessionState {
   switch (action.type) {
     case "reset":
-      return { ...initialState, focused: state.focused };
+      // The epoch only grows, so work bound to an earlier session never matches a later one.
+      return { ...initialState, focused: state.focused, epoch: state.epoch + 1 };
     case "phase":
       return state.phase === action.phase ? state : { ...state, phase: action.phase };
     case "welcome": {
@@ -480,8 +495,7 @@ export function reduce(state: SessionState, action: Action): SessionState {
       const key = channelThreadKey(action.channel);
       if (!state.threads[key] && !state.channels[action.channel]) return state;
       return withThread(state, key, (t) => {
-        const authentic = new Set(action.authentic ?? []);
-        const incoming = action.messages.map((m) => msgItem(m, false, authentic.has(m.id)));
+        const incoming = action.messages.map((m, i) => msgItem(m, false, action.authentic?.[i] === true));
         const merged = mergeItems(t.items, incoming);
         return {
           ...t,

@@ -870,11 +870,21 @@ class Controller {
   get messageServerKey(): string { return this.conn?.serverKey ?? ""; }
 
   get messageUid(): Promise<string | undefined> {
-    return this.conn instanceof Connection ? uidForPublicKey(accountKeyOf(this.conn.identity)) : Promise.resolve(useSession.getState().me?.uid);
+    return this.uidOn(this.conn);
   }
 
-  private async signChat(target: ChatTarget, text: string, mentions: string[], attachments: Attachment[], original?: MessageSignature): Promise<MessageSignature> {
-    const conn = this.connection;
+  private uidOn(conn: Link | null): Promise<string | undefined> {
+    return conn instanceof Connection ? uidForPublicKey(accountKeyOf(conn.identity)) : Promise.resolve(useSession.getState().me?.uid);
+  }
+
+  /** The connection an operation started on; `check` throws once the session has moved on (another server, a
+   *  reconnect or a resync), so nothing verified or signed for one server is ever signed for or sent to another. */
+  private bind() {
+    const conn = this.connection, epoch = useSession.getState().epoch, serverKey = conn.serverKey;
+    return { conn, check: () => { if (this.conn !== conn || useSession.getState().epoch !== epoch || conn.serverKey !== serverKey) throw new ConnectionLostError(); } };
+  }
+
+  private async signChat(target: ChatTarget, text: string, mentions: string[], attachments: Attachment[], original?: MessageSignature, conn = this.connection): Promise<MessageSignature> {
     // The direct TeamSpeak transport ignores Gwar signatures.
     if (!(conn instanceof Connection)) return { server_key: "", conversation: "server", author_uid: "", key: "", certificate: null, certificate_hash: "-", message_id: "", revision: 0, previous_revision_hash: "-", created_at: 0, signed_at: 0, body_hash: "", signature: "" };
     const s = useSession.getState();
@@ -948,26 +958,52 @@ class Controller {
 
   /** Changes the text of one of my channel messages; shows a toast and returns false on failure. */
   async editMessage(message: number, text: string, mentions: string[]): Promise<boolean> {
-    try {
-      const item = Object.values(useSession.getState().threads).flatMap((t) => t.items).find((i) => i.kind === "msg" && i.msg.id === message);
-      if (!item || item.kind !== "msg") throw new Error("unknown message");
-      // Sign only what this client authenticated itself: a server could graft
-      // attachments onto a genuine envelope and have the edit endorse them.
-      const original = structuredClone(item.msg);
-      if (useSession.getState().kind === "vc" && !(await this.editableOriginal(original))) throw new Error(tNow("chat.editUnverified"));
-      const signature = await this.signChat(original.target, text, mentions, text === DELETION_TEXT ? [] : original.attachments ?? [], original.signature ?? undefined);
-      return (await this.attempt(this.connection.request("chat.edit", { message, text, signature, ...(mentions.length ? { mentions } : {}) }))) !== undefined;
-    } catch (e) { useUi.getState().toast("error", describeRequestError(e)); return false; }
+    return this.changeMessage(message, async (original, bound) => {
+      if (useSession.getState().kind === "vc" && !(await this.editableOriginal(original, bound.conn))) throw new Error(tNow("chat.editUnverified"));
+      return this.sendEdit(original, text, mentions, bound);
+    });
   }
 
   async deleteMessage(message: number): Promise<boolean> {
-    const state = useSession.getState();
-    const item = Object.values(state.threads).flatMap((t) => t.items).find((i) => i.kind === "msg" && i.msg.id === message);
-    // My verified message: a signed deletion. Otherwise a moderator's server removal.
-    if (item?.kind === "msg" && state.kind === "vc" && (await this.editableOriginal(structuredClone(item.msg)))) {
-      return this.editMessage(message, DELETION_TEXT, []);
-    }
-    return (await this.attempt(this.connection.request("chat.delete", { message }))) !== undefined;
+    return this.changeMessage(message, async (original, bound) => {
+      // My verified message: a signed deletion. Otherwise a moderator's server removal.
+      if (useSession.getState().kind === "vc" && (await this.editableOriginal(original, bound.conn))) return this.sendEdit(original, DELETION_TEXT, [], bound);
+      bound.check();
+      await bound.conn.request("chat.delete", { message });
+      return true;
+    });
+  }
+
+  /** Message ids with an edit or deletion in flight, per connection; a second one would race the first. */
+  private changing = new WeakMap<Link, Set<number>>();
+
+  /** Runs one edit or deletion bound to the connection it started on, over a snapshot of the message. */
+  private async changeMessage(message: number, run: (original: ChatMessage, bound: ReturnType<Controller["bind"]>) => Promise<boolean>): Promise<boolean> {
+    let busy: Set<number> | undefined;
+    try {
+      const bound = this.bind();
+      const item = Object.values(useSession.getState().threads).flatMap((t) => t.items).find((i) => i.kind === "msg" && i.msg.id === message);
+      if (!item || item.kind !== "msg") throw new Error("unknown message");
+      busy = this.changing.get(bound.conn) ?? new Set();
+      this.changing.set(bound.conn, busy);
+      if (busy.has(message)) { busy = undefined; throw new Error(tNow("chat.editInProgress")); }
+      busy.add(message);
+      // Sign only what this client authenticated itself: a server could graft
+      // attachments onto a genuine envelope and have the edit endorse them.
+      return await run(structuredClone(item.msg), bound);
+    } catch (e) { useUi.getState().toast("error", describeRequestError(e)); return false; }
+    finally { busy?.delete(message); }
+  }
+
+  private async sendEdit(original: ChatMessage, text: string, mentions: string[], { conn, check }: ReturnType<Controller["bind"]>): Promise<boolean> {
+    check();
+    // A newer revision arrived meanwhile: signing over the snapshot would fork my own message.
+    const current = Object.values(useSession.getState().threads).flatMap((t) => t.items).find((i) => i.kind === "msg" && i.msg.id === original.id);
+    if (current?.kind !== "msg" || current.msg.signature?.revision !== original.signature?.revision) throw new Error(tNow("chat.editChanged"));
+    const signature = await this.signChat(original.target, text, mentions, text === DELETION_TEXT ? [] : original.attachments ?? [], original.signature ?? undefined, conn);
+    check();
+    await conn.request("chat.edit", { message: original.id, text, signature, ...(mentions.length ? { mentions } : {}) });
+    return true;
   }
 
   // ----------------------------------------------------------- attachments
@@ -1035,17 +1071,17 @@ class Controller {
     return absoluteUrl(useSession.getState().httpOrigin, path);
   }
 
-  /** My own message whose current revision verifies here, without a fork, rollback or revoked signing device. */
-  private async editableOriginal(msg: ChatMessage): Promise<boolean> {
-    if (!msg.signature || msg.author_uid !== (await this.messageUid) || msg.text === DELETION_TEXT) return false;
-    const result = await this.verifyIncoming(msg);
+  /** My own message whose current revision verifies on `conn`, without a fork, rollback or revoked signing device. */
+  private async editableOriginal(msg: ChatMessage, conn: Link): Promise<boolean> {
+    if (!msg.signature || msg.author_uid !== (await this.uidOn(conn)) || msg.text === DELETION_TEXT) return false;
+    const result = await this.verifyIncoming(msg, undefined, conn);
     return result.status === "verified" && result.continuity !== "rollback" && result.continuity !== "fork"
       && !result.authorization.includes("device-revoked");
   }
 
-  private async verifyIncoming(msg: ChatMessage, channel?: number) {
+  private async verifyIncoming(msg: ChatMessage, channel?: number, conn = this.conn) {
     const state = useSession.getState();
-    const me = await this.messageUid;
+    const me = await this.uidOn(conn);
     let thread: "server" | `ch:${number}` | `dm:${string}`;
     if (channel !== undefined) thread = `ch:${channel}`;
     else if (msg.target === "server") thread = "server";
@@ -1057,17 +1093,18 @@ class Controller {
       if (!peer) return invalidVerification();
       thread = `dm:${peer}`;
     }
-    return this.verifier.verify(msg, { serverKey: this.messageServerKey, target: messageTarget(thread, msg.author_uid, me) });
+    return this.verifier.verify(msg, { serverKey: conn?.serverKey ?? "", target: messageTarget(thread, msg.author_uid, me) });
   }
 
-  private async checkedHistory(messages: ChatMessage[], channel: number): Promise<{ accepted: ChatMessage[]; authentic: number[] }> {
-    const accepted: ChatMessage[] = [], authentic: number[] = [];
+  private async checkedHistory(messages: ChatMessage[], channel: number): Promise<{ accepted: ChatMessage[]; authentic: boolean[] }> {
+    // `authentic[i]` belongs to `accepted[i]` itself: numeric ids are the server's and may repeat within a page.
+    const accepted: ChatMessage[] = [], authentic: boolean[] = [];
     for (const msg of messages) {
       const result = await this.verifyIncoming(msg, channel);
       const existing = Object.values(useSession.getState().threads).flatMap((t) => t.items).find((i) => i.kind === "msg" && i.msg.id === msg.id);
       if ((existing?.kind === "msg" && existing.authentic && (result.status !== "verified" || !sameMessageIdentity(existing.msg, msg))) || result.continuity === "fork" || result.continuity === "rollback") continue;
       accepted.push(msg);
-      if (result.status === "verified") authentic.push(msg.id);
+      authentic.push(result.status === "verified");
     }
     return { accepted, authentic };
   }
