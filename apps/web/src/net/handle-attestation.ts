@@ -36,12 +36,17 @@ async function verify(a: HandleAttestation, serviceKey: string): Promise<string 
   }
 }
 
+/** Whether `now` lies in the attestation's validity window (issuance may be up to five minutes ahead). */
+export function attestationCurrent(a: Pick<HandleAttestation, "issued_at" | "expires_at">, now: number): boolean {
+  return Number.isFinite(now) && a.issued_at <= now + SKEW_MS && now < a.expires_at;
+}
+
 /** WebCrypto verification is asynchronous; signature/uid work is cached per attestation. */
 export async function verifiedHandle(member: HandleMember | null | undefined, serviceKey: string | null, now: number): Promise<string | null> {
   const a = member?.connect;
   if (!a || typeof a !== "object" || !serviceKey || !Number.isFinite(now) ||
       !Number.isSafeInteger(a.issued_at) || !Number.isSafeInteger(a.expires_at) ||
-      a.issued_at > now + SKEW_MS || now >= a.expires_at || a.expires_at <= a.issued_at ||
+      !attestationCurrent(a, now) || a.expires_at <= a.issued_at ||
       typeof a.account_key !== "string" || typeof a.signature !== "string" ||
       typeof a.handle !== "string" || !/^[a-z0-9_][a-z0-9_.]{1,30}[a-z0-9_]$/.test(a.handle)) return null;
   // Snapshot fields before awaiting; a mutated object cannot reuse a successful check.
