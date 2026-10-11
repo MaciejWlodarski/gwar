@@ -854,14 +854,25 @@ pub fn device_statement(c: &DeviceCertificate) -> String {
     format!("gwar device v1\n{}\n{}\n{}\n{}", c.account_key, c.device_key, c.issued_at, c.expires_at)
 }
 
-/// Whether `signature` is `public`'s strict Ed25519 signature of `message`.
+/// Whether `signature` is `public`'s strict Ed25519 signature of `message`. Like the web
+/// app, the key and the signature's R must be torsion-free points, which `verify_strict`
+/// alone does not require of points with a small-order component.
 pub fn signed_by(public: &str, message: &str, signature: &str) -> bool {
+    use curve25519_dalek::edwards::CompressedEdwardsY;
     use ed25519_dalek::{Signature, VerifyingKey};
     let (Some(key), Some(signature)) = (decode_fixed::<32>(public), decode_fixed::<64>(signature)) else {
         return false;
     };
-    VerifyingKey::from_bytes(&key)
-        .is_ok_and(|k| k.verify_strict(message.as_bytes(), &Signature::from_bytes(&signature)).is_ok())
+    let torsion_free = |bytes: &[u8]| {
+        CompressedEdwardsY::from_slice(bytes)
+            .ok()
+            .and_then(|point| point.decompress())
+            .is_some_and(|point| !point.is_small_order() && point.is_torsion_free())
+    };
+    torsion_free(&key)
+        && torsion_free(&signature[..32])
+        && VerifyingKey::from_bytes(&key)
+            .is_ok_and(|k| k.verify_strict(message.as_bytes(), &Signature::from_bytes(&signature)).is_ok())
 }
 
 /// What one message's own signature proves. Stateless: revocations and the
@@ -919,7 +930,7 @@ pub fn verify_message(msg: &ChatMessage, server_key: &str, conversation: &str, n
         || s.author_uid != msg.author_uid
         || decode_fixed::<32>(author_key).map(|key| uid_for_key(&key)).as_ref() != Some(&msg.author_uid)
         || !certificate_valid
-        || msg.attachments.iter().any(|a| decode_fixed::<32>(&a.sha256).is_none())
+        || msg.attachments.iter().any(|a| decode_fixed::<32>(&a.sha256).is_none() || a.size > MAX_SAFE_INTEGER as u64)
         || s.body_hash != hash
         || !deletion_valid
         || !signed_by(&s.key, &message_statement(server_key, conversation, &msg.author_uid, s, &hash), &s.signature)
@@ -1210,14 +1221,93 @@ mod tests {
                 (|s: &mut MessageSignature| s.server_key = B64.encode([8; 32])) as fn(&mut MessageSignature),
                 |s| s.conversation = "channel:6".into(),
                 |s| s.body_hash = B64.encode([0; 32]),
+                |s| {
+                    let mut signature = decode_fixed::<64>(&s.signature).unwrap();
+                    signature[40] ^= 1;
+                    s.signature = B64.encode(signature);
+                },
             ] {
                 let mut m = msg.clone();
                 tamper(m.signature.as_mut().unwrap());
                 assert_eq!(verify_message(&m, &server(), "channel:5", NOW), MessageCheck::Invalid);
             }
+            // Other words with a matching body hash still carry the old signature.
+            let mut rewritten = msg.clone();
+            rewritten.text = "bye".into();
+            rewritten.signature.as_mut().unwrap().body_hash = message_body_hash("bye", &[], &[]);
+            assert_eq!(verify_message(&rewritten, &server(), "channel:5", NOW), MessageCheck::Invalid);
+            let mut huge = msg.clone();
+            huge.attachments = vec![Attachment {
+                id: "f".into(),
+                name: "f".into(),
+                mime: "x".into(),
+                size: MAX_SAFE_INTEGER as u64 + 1,
+                sha256: B64.encode([1; 32]),
+                url: "/files/f/f".into(),
+                width: None,
+                height: None,
+            }];
+            let s = huge.signature.as_mut().unwrap();
+            s.body_hash = message_body_hash("hi", &[], &huge.attachments);
+            s.signature = B64.encode(
+                alice
+                    .sign(message_statement(&server(), "channel:5", &huge.author_uid, s, &s.body_hash).as_bytes())
+                    .to_bytes(),
+            );
+            assert_eq!(
+                verify_message(&huge, &server(), "channel:5", NOW),
+                MessageCheck::Invalid,
+                "size beyond what the web app reads exactly"
+            );
+            huge.attachments[0].size -= 1;
+            let s = huge.signature.as_mut().unwrap();
+            s.body_hash = message_body_hash("hi", &[], &huge.attachments);
+            s.signature = B64.encode(
+                alice
+                    .sign(message_statement(&server(), "channel:5", &huge.author_uid, s, &s.body_hash).as_bytes())
+                    .to_bytes(),
+            );
+            assert_eq!(verify_message(&huge, &server(), "channel:5", NOW), ok);
             let server_wide = signed(&alice, None, ChatTarget::Server, "server", "all");
             assert_eq!(verify_message(&server_wide, &server(), "server", NOW), ok);
             assert_eq!(verify_message(&server_wide, &server(), "channel:5", NOW), MessageCheck::Invalid);
+        }
+
+        /// A key with a small-order component can sign so that `verify_strict` accepts it (for
+        /// one message in eight); the web app refuses such keys, so the same message must not
+        /// verify here and fail there.
+        #[test]
+        fn keys_with_a_small_order_component_are_refused() {
+            use curve25519_dalek::{
+                constants::{ED25519_BASEPOINT_POINT, EIGHT_TORSION},
+                scalar::Scalar,
+            };
+            use ed25519_dalek::{Signature, VerifyingKey};
+            use sha2::{Digest, Sha512};
+            let (a, r) = (Scalar::from(7u64), Scalar::from(11u64));
+            let honest = (ED25519_BASEPOINT_POINT * a).compress().to_bytes();
+            let mixed = (ED25519_BASEPOINT_POINT * a + EIGHT_TORSION[1]).compress().to_bytes();
+            let big_r = (ED25519_BASEPOINT_POINT * r).compress().to_bytes();
+            let sign = |key: [u8; 32], message: &str| {
+                let h: [u8; 64] =
+                    Sha512::new().chain_update(big_r).chain_update(key).chain_update(message).finalize().into();
+                let s = r + Scalar::from_bytes_mod_order_wide(&h) * a;
+                let mut signature = [0; 64];
+                signature[..32].copy_from_slice(&big_r);
+                signature[32..].copy_from_slice(s.as_bytes());
+                signature
+            };
+            let message = (0..64)
+                .map(|i| format!("m{i}"))
+                .find(|m| {
+                    VerifyingKey::from_bytes(&mixed)
+                        .unwrap()
+                        .verify_strict(m.as_bytes(), &Signature::from_bytes(&sign(mixed, m)))
+                        .is_ok()
+                })
+                .expect("one message in eight verifies");
+            assert!(signed_by(&B64.encode(honest), &message, &B64.encode(sign(honest, &message))));
+            assert!(!signed_by(&B64.encode(mixed), &message, &B64.encode(sign(mixed, &message))));
         }
 
         #[test]

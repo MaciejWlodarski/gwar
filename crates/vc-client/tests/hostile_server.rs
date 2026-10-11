@@ -36,9 +36,19 @@ fn client(id: u32, uid: &str) -> Client {
     }
 }
 
-/// Completes the handshake, then hands the socket's sending side to the test as
-/// frames to send; whatever the client sends afterwards is ignored.
+/// Completes the handshake, announcing us as client 1 and then `clients`; hands the
+/// socket's sending side to the test as frames to send. What the client sends afterwards
+/// is ignored.
 async fn hostile(clients: Vec<Client>) -> (Connected, mpsc::Sender<String>, String) {
+    let (connected, frames, me) =
+        start(move |me| json!(std::iter::once(client(1, me)).chain(clients).collect::<Vec<_>>())).await;
+    (connected.unwrap(), frames, me)
+}
+
+/// Like [`hostile`], with the welcome's client list as `clients(our uid)` makes it.
+async fn start(
+    clients: impl FnOnce(&str) -> Value + Send + 'static,
+) -> (Result<Connected, ClientError>, mpsc::Sender<String>, String) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/ws", listener.local_addr().unwrap());
     let (frames, mut to_send) = mpsc::channel::<String>(16);
@@ -73,11 +83,13 @@ async fn hostile(clients: Vec<Client>) -> (Connected, mpsc::Sender<String>, Stri
             permissions: vec![],
             groups: vec![],
             channels: vec![],
-            clients,
+            clients: vec![],
             members: vec![],
             unread: vec![],
             ice_servers: vec![],
         };
+        let mut welcome = serde_json::to_value(welcome).unwrap();
+        welcome["clients"] = clients(&me);
         ws.send(Message::Text(json!({"re":2,"ok":welcome}).to_string().into())).await.unwrap();
         me_tx.send(me).unwrap();
         loop {
@@ -96,7 +108,7 @@ async fn hostile(clients: Vec<Client>) -> (Connected, mpsc::Sender<String>, Stri
         ClientSoftware { name: "test".into(), version: "0".into(), platform: Platform::Desktop },
     );
     options.expected_server_key = Some(server_pk());
-    let connected = connect(options).await.unwrap();
+    let connected = connect(options).await;
     (connected, frames, me_rx.await.unwrap())
 }
 
@@ -177,12 +189,16 @@ async fn forged_chat_never_reaches_the_event_stream() {
     teamspeak.author_uid = "ts:bob".into();
     teamspeak.text = "from teamspeak".into();
     let to_us = signed(&alice, ChatTarget::Client(1), &dm_conversation(&alice_uid, &me), "for us");
+    // Alice's genuine DM to us, shown to us as if it were addressed to Carol.
+    let mut readdressed = to_us.clone();
+    readdressed.target = ChatTarget::Client(3);
     for (ev, m) in [
         ("chat.message", &unsigned),
         ("chat.edited", &altered),
         ("chat.message", &moved),
         ("chat.message", &relayed),
         ("chat.message", &teamspeak),
+        ("chat.message", &readdressed),
         ("chat.message", &signed(&alice, ChatTarget::Channel(1), "channel:1", "genuine")),
         ("chat.message", &to_us),
     ] {
@@ -202,6 +218,7 @@ async fn forged_chat_never_reaches_the_event_stream() {
     let check = |m: &ChatMessage| connected.connection.verify_message(m);
     assert_eq!(check(&to_us), MessageCheck::Verified { certificate_expired: false });
     assert_eq!(check(&relayed), MessageCheck::Invalid);
+    assert_eq!(check(&readdressed), MessageCheck::Invalid);
     assert_eq!(check(&altered), MessageCheck::Invalid);
     assert_eq!(check(&unsigned), MessageCheck::Unsigned);
     assert_eq!(check(&teamspeak), MessageCheck::UnsignedTeamSpeak);
@@ -214,6 +231,20 @@ async fn oversized_frames_end_the_connection() {
     frames.send(event("server.updated", json!({"padding": filler}))).await.unwrap();
     let end = tokio::time::timeout(Duration::from_secs(10), async { while connected.events.recv().await.is_some() {} });
     end.await.expect("the connection closes");
+}
+
+#[tokio::test]
+async fn a_welcome_with_too_many_clients_is_refused() {
+    // Clients as arrays, so that many fit in one frame.
+    let (connected, _frames, _) = start(|me| {
+        let mut clients = vec![json!([1, me, "me", null, [], "desktop", false, false, null, false, false])];
+        clients.extend(
+            (10..10 + 65_535).map(|id| json!([id, "u", "c", null, [], "desktop", false, false, null, false, false])),
+        );
+        json!(clients)
+    })
+    .await;
+    assert!(matches!(connected, Err(ClientError::Protocol(ref e)) if e == "too many clients"), "{:?}", connected.err());
 }
 
 #[tokio::test]
@@ -235,7 +266,8 @@ async fn announcing_too_many_clients_ends_the_connection() {
     })
     .await;
     assert!(ended.is_ok(), "the connection closes");
-    assert_eq!(joined, 65_535);
+    // We are the first of the 65 535.
+    assert_eq!(joined, 65_534);
     sender.abort();
 }
 

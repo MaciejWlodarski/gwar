@@ -13,6 +13,7 @@ url = "2"
 base64 = "0.22"
 sha2 = "0.10"
 ed25519-dalek = "2"
+curve25519-dalek = "4"
 ts-rs = { version = "12", optional = true }
 
 [features]

@@ -212,6 +212,9 @@ pub async fn connect(options: ConnectOptions) -> Result<Connected, ClientError> 
         ServerFrame::Err { err, .. } => return Err(ClientError::Server(err)),
         _ => return Err(ClientError::Protocol("expected welcome".into())),
     };
+    if welcome.clients.len() > MAX_CLIENTS {
+        return Err(ClientError::Protocol("too many clients".into()));
+    }
 
     let uid = hello
         .certificate
@@ -313,17 +316,23 @@ pub async fn connect(options: ConnectOptions) -> Result<Connected, ClientError> 
 }
 
 /// The conversation `msg` must be signed for, as its reader sees it: a direct
-/// message from someone else must be to us, and our own names its recipient.
+/// message from someone else must be addressed to us, and our own names its recipient.
 fn verify(msg: &ChatMessage, me: &str, server_key: &str, clients: &HashMap<u32, String>) -> MessageCheck {
     let conversation = match msg.target {
         ChatTarget::Channel(id) => format!("channel:{id}"),
         ChatTarget::Server => "server".into(),
-        ChatTarget::Client(_) if msg.author_uid != me => dm_conversation(me, &msg.author_uid),
-        ChatTarget::Client(to) => match clients.get(&to) {
-            Some(peer) => dm_conversation(me, peer),
-            None if msg.signature.is_none() => String::new(),
-            None => return MessageCheck::Invalid,
-        },
+        ChatTarget::Client(to) => {
+            let recipient = clients.get(&to).map(String::as_str);
+            let peer = if msg.author_uid == me {
+                recipient
+            } else {
+                (recipient == Some(me)).then_some(msg.author_uid.as_str())
+            };
+            match peer {
+                Some(peer) => dm_conversation(me, peer),
+                None => return MessageCheck::Invalid,
+            }
+        }
     };
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
     vc_proto::verify_message(msg, server_key, &conversation, now)
@@ -348,8 +357,10 @@ where
 impl Connection {
     /// What `msg`'s own signature proves here. Live chat events are checked
     /// before delivery; messages in replies, such as `chat.history`, are the
-    /// server's word until checked with this. Device revocations and the
-    /// continuity of edits are not checked.
+    /// server's word until checked with this. The check is against the message's
+    /// own target, so a caller must also see that it is where it asked for (a
+    /// history of channel 5 holds only `channel:5` messages). Device revocations
+    /// and the continuity of edits are not checked.
     pub fn verify_message(&self, msg: &ChatMessage) -> MessageCheck {
         verify(msg, &self.uid, &self.server_key, &self.clients.read().unwrap())
     }
