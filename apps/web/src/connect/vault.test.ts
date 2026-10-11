@@ -18,7 +18,7 @@ function racing(service: FakeService, before: (n: number) => Promise<void>): Con
     if (init?.method === "PUT" && String(url).endsWith("/vault")) await before(++puts);
     return service.fetch(url, init);
   };
-  return new ConnectApi("http://c", fetchFn as typeof fetch);
+  return new ConnectApi("https://c", fetchFn as typeof fetch);
 }
 
 describe("vault", () => {

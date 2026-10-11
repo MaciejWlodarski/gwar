@@ -144,7 +144,7 @@ export function setup() {
   const service = new FakeService();
   let stored: ConnectRecord | undefined;
   const store: ConnectStore = { load: async () => stored, save: async (r) => void (stored = r), clear: async () => void (stored = undefined) };
-  const deps = (name = "Chrome on macOS") => ({ api: new ConnectApi("http://c", service.fetch as typeof fetch), store, deviceName: name });
+  const deps = (name = "Chrome on macOS") => ({ api: new ConnectApi("https://c", service.fetch as typeof fetch), store, deviceName: name });
   return { service, store, deps, stored: () => stored };
 }
 

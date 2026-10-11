@@ -1,4 +1,5 @@
 /** HTTP client for the Gwar Connect service (docs/connect.md, "Connect API"). */
+import { connectJson } from "./transport";
 import { CONNECT_URL } from "../lib/official";
 import type { Kdf, SignedDevice } from "./crypto";
 
@@ -104,20 +105,13 @@ export class ConnectApi {
     if (body !== undefined) headers["Content-Type"] = "application/json";
     if (token) headers.Authorization = `Bearer ${token}`;
     let response: Response;
+    let data: unknown;
     try {
-      response = await this.fetchFn(`${this.base}/v1${path}`, {
-        method,
-        headers,
-        body: body === undefined ? undefined : JSON.stringify(body),
-      });
+      ({ response, data } = await connectJson(this.base, `/v1${path}`, {
+        method, headers, body: body === undefined ? undefined : JSON.stringify(body),
+      }, this.fetchFn));
     } catch (e) {
       throw new ConnectApiError("network", e instanceof Error ? e.message : String(e));
-    }
-    let data: unknown = null;
-    try {
-      data = await response.json();
-    } catch {
-      /* an empty or non-JSON body */
     }
     if (!response.ok) {
       const err = (data ?? {}) as { error?: string; message?: string };

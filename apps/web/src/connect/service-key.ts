@@ -1,3 +1,4 @@
+import { connectJson, connectUrl } from "./transport";
 import { CONNECT_URL } from "../lib/official";
 import { decodeBase64Url, encodeBase64Url } from "../net/base64url";
 
@@ -20,19 +21,13 @@ export function loadServiceKey(): Promise<string | null> {
 }
 
 async function fetchKey(): Promise<string | null> {
-  let url: URL;
-  try { url = new URL(CONNECT_URL); } catch { return null; }
-  // Plain HTTP is only for local development and the smoke test.
-  const local = import.meta.env.DEV && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
-  if (url.protocol !== "https:" && !(url.protocol === "http:" && local)) return null;
+  try { connectUrl(CONNECT_URL, "/v1/service-key"); } catch { return null; }
   let cached: string | null = null;
   try { cached = validKey(localStorage.getItem(storageKey)); } catch { /* storage may be disabled */ }
   try {
-    const reply = await fetch(`${CONNECT_URL}/v1/service-key`, {
-      redirect: "error", credentials: "omit", cache: "no-store", signal: AbortSignal.timeout(10_000),
-    });
-    if (reply.status !== 200) return cached;
-    const key = validKey((await reply.json() as { key?: unknown }).key);
+    const { response, data } = await connectJson(CONNECT_URL, "/v1/service-key");
+    if (response.status !== 200) return cached;
+    const key = validKey((data as { key?: unknown } | null)?.key);
     if (!key) return cached;
     try { localStorage.setItem(storageKey, key); } catch { /* memory caching still works */ }
     return key;

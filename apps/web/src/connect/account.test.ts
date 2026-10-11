@@ -225,7 +225,7 @@ describe("renewing every device's certificate", () => {
         if (broken(String(url), init?.method ?? "GET")) return new Response(JSON.stringify({ error: "internal", message: "boom" }), { status: 500 });
         return service.fetch(url, init);
       }) as typeof fetch;
-      return { ...base, api: new ConnectApi("http://c", fetchFn) };
+      return { ...base, api: new ConnectApi("https://c", fetchFn) };
     };
     const b = await signIn({ handle: "mona", password: pw }, breaking((u) => u.endsWith("/devices/renew")));
     expect(b.certificate.device_key).toBeTruthy();
@@ -292,9 +292,9 @@ describe("picking up a newer certificate at start", () => {
     expect(await pickUpCertificate(a, deps("A"))).toMatchObject({ outcome: "revoked", record: a });
     service.devices.length = 0;
     expect(await pickUpCertificate(a, deps("A"))).toMatchObject({ outcome: "unlisted", record: a });
-    const offline = { ...deps("A"), api: new ConnectApi("http://c", (() => Promise.reject(new TypeError("offline"))) as typeof fetch) };
+    const offline = { ...deps("A"), api: new ConnectApi("https://c", (() => Promise.reject(new TypeError("offline"))) as typeof fetch) };
     await expect(pickUpCertificate(a, offline)).rejects.toMatchObject({ kind: "network" });
-    const ended = { ...deps("A"), api: new ConnectApi("http://c", (async () => new Response(JSON.stringify({ error: "unauthorized", message: "no" }), { status: 401 })) as typeof fetch) };
+    const ended = { ...deps("A"), api: new ConnectApi("https://c", (async () => new Response(JSON.stringify({ error: "unauthorized", message: "no" }), { status: 401 })) as typeof fetch) };
     await expect(pickUpCertificate(a, ended)).rejects.toMatchObject({ kind: "unauthorized" });
   }, 60_000);
 
@@ -353,7 +353,7 @@ describe("preparing and registering an account", () => {
     let limited = true;
     const flaky = {
       ...deps(),
-      api: new ConnectApi("http://c", (async (url: string | URL | Request, init?: RequestInit) =>
+      api: new ConnectApi("https://c", (async (url: string | URL | Request, init?: RequestInit) =>
         limited ? new Response(JSON.stringify({ error: "rate_limited", message: "slow down" }), { status: 429 }) : service.fetch(url, init)) as typeof fetch),
     };
     await expect(registerPrepared(prepared, flaky)).rejects.toMatchObject({ kind: "rate_limited" });

@@ -221,3 +221,6 @@ Frames are capped at 2 MiB before parsing; schemas reject unknown/pollution keys
 unsafe integers and unbounded strings/arrays. Updating generated types requires
 updating these validators. The handshake and signing branches must extend the
 schemas for their new wire fields; unknown fields are deliberately rejected.
+Connect uses a shared HTTPS/dev-loopback transport,
+no URL credentials, no redirects or cookies, a ten-second deadline covering
+the body, and a 4 MiB JSON ceiling.

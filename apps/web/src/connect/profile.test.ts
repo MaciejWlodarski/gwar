@@ -28,7 +28,7 @@ describe("vault profile sync", () => {
   it("adopts another device's seed after a 409 conflict", async () => {
     const { record, service } = await account();
     let puts = 0;
-    const api = new ConnectApi("http://c", (async (url, init) => {
+    const api = new ConnectApi("https://c", (async (url, init) => {
       if (init?.method === "PUT" && ++puts === 1) await writeServerVault(service, record, { profile: { nickname: "Other device", updated_at: 5 }, future: true });
       return service.fetch(url, init);
     }) as typeof fetch);
@@ -38,7 +38,7 @@ describe("vault profile sync", () => {
   it("retries edits on the latest vault and preserves other profile fields", async () => {
     const { record, service } = await account();
     let puts = 0;
-    const api = new ConnectApi("http://c", (async (url, init) => {
+    const api = new ConnectApi("https://c", (async (url, init) => {
       if (init?.method === "PUT" && ++puts === 1) await writeServerVault(service, record, { profile: { nickname: "Other", updated_at: 5, avatar: "kept" }, teamspeak: { default: "ts" } });
       return service.fetch(url, init);
     }) as typeof fetch);
