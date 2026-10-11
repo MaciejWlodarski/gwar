@@ -129,7 +129,8 @@ describe("adversarial message verification", () => {
     expect(sameMessageIdentity(f.msg, edit)).toBe(true);
     expect(sameMessageIdentity(f.msg, other.msg)).toBe(false);
     const { mergeItems } = await import("../state/reducer");
-    const item = (msg: ChatMessage) => ({ kind: "msg" as const, key: "m1", at: now, msg });
+    const item = (msg: ChatMessage, authentic = true) => ({ kind: "msg" as const, key: "m1", at: now, msg, authentic });
+    expect(mergeItems([item(f.msg)], [item(edit, false)])[0]).toMatchObject({ msg: { text: "hello" } });
     expect(mergeItems([item(f.msg)], [item(edit)])[0]).toMatchObject({ msg: { text: "new" } });
     expect(mergeItems([item(edit)], [item(f.msg)])[0]).toMatchObject({ msg: { text: "new" } });
     expect(mergeItems([item(f.msg)], [item(other.msg)])[0]).toMatchObject({ msg: { signature: { message_id: f.msg.signature!.message_id } } });
