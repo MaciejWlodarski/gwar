@@ -412,7 +412,14 @@ fn merging_members_moves_all_identity_references_transactionally() {
     let from = seeded.member("-legacy", 5, &[2, role]);
     let into = seeded.member("account", 10, &[1, 2]);
     store.set_nickname(into, "Target name").unwrap();
-    store.set_connect_handle(into, Some("verified")).unwrap();
+    let attestation = vc_proto::HandleAttestation {
+        account_key: "account-key".into(),
+        handle: "verified".into(),
+        issued_at: 1,
+        expires_at: i64::MAX,
+        signature: "signature".into(),
+    };
+    store.set_connect_attestation(into, Some(&attestation)).unwrap();
     let channels = store.channels().unwrap();
     let (lobby, side) = (channels[0].id, channels[1].id);
     let first = store.add_message(lobby, "-legacy", "Original", "first", 1).unwrap();
@@ -493,7 +500,7 @@ fn merging_members_moves_all_identity_references_transactionally() {
     assert!(!seeded.known("-legacy"));
     let target = store.user_by_uid("account").unwrap().unwrap().1;
     assert_eq!(target.nickname, "Target name");
-    assert_eq!(target.connect.as_deref(), Some("verified"));
+    assert_eq!(target.connect, Some(attestation));
     assert_eq!(target.groups, vec![1, 2, role]);
     assert_eq!(store.read_mark(into, lobby).unwrap(), second);
     assert_eq!(store.read_mark(into, side).unwrap(), third);

@@ -86,21 +86,46 @@ async fn fetch(client: &reqwest::Client, url: &str, since: i64) -> anyhow::Resul
 pub(crate) struct Lookup {
     url: String,
     client: reqwest::Client,
+    service_key: std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
 #[derive(Deserialize)]
 struct Account {
     handle: String,
     account_key: String,
+    attestation: vc_proto::HandleAttestation,
 }
 
 impl Lookup {
-    pub fn new(url: String) -> Result<Self> {
-        let client = reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?;
-        Ok(Self { url, client })
+    async fn key(&self) -> Result<String> {
+        #[derive(Deserialize)]
+        struct ServiceKey {
+            key: String,
+        }
+        let mut cached = self.service_key.lock().await;
+        if let Some(key) = &*cached {
+            return Ok(key.clone());
+        }
+        let url = format!("{}/v1/service-key", self.url.trim_end_matches('/'));
+        let reply = self.client.get(url).send().await?.error_for_status()?;
+        ensure!(reply.status() == reqwest::StatusCode::OK, "Connect returned status {}", reply.status());
+        let ServiceKey { key } = reply.json().await?;
+        use base64::Engine;
+        let raw: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(&key)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid Connect service key length"))?;
+        ed25519_dalek::VerifyingKey::from_bytes(&raw)?;
+        *cached = Some(key.clone());
+        Ok(key)
     }
 
-    pub async fn account(&self, key: &str) -> Result<Option<String>> {
+    pub fn new(url: String) -> Result<Self> {
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?;
+        Ok(Self { url, client, service_key: Default::default() })
+    }
+
+    pub async fn account(&self, key: &str) -> Result<Option<vc_proto::HandleAttestation>> {
         let url = format!("{}/v1/accounts/by-key/{key}", self.url.trim_end_matches('/'));
         let reply = self.client.get(url).send().await?;
         if reply.status() == reqwest::StatusCode::NOT_FOUND {
@@ -120,6 +145,95 @@ impl Lookup {
                 && !account.handle.ends_with('.'),
             "Connect returned an invalid handle"
         );
-        Ok(Some(account.handle))
+        let a = account.attestation;
+        ensure!(a.account_key == key && a.handle == account.handle, "Connect returned a mismatched attestation");
+        let service_key = self.key().await?;
+        ensure!(
+            identity::signed_by(&service_key, &vc_proto::handle_statement(&a), &a.signature),
+            "Connect attestation signature is invalid"
+        );
+        let now = crate::core::now_ms();
+        ensure!(
+            a.issued_at <= now.saturating_add(5 * 60 * 1000) && a.expires_at > now && a.expires_at > a.issued_at,
+            "Connect attestation dates are out of range"
+        );
+        Ok(Some(a))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Json, Router, http::StatusCode, routing::get};
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use ed25519_dalek::{Signer, SigningKey};
+    use serde_json::json;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    use vc_proto::{HandleAttestation, handle_statement};
+
+    #[tokio::test]
+    async fn service_key_is_lazy_cached_and_retried_after_failure() {
+        let service = SigningKey::from_bytes(&[42; 32]);
+        let public = URL_SAFE_NO_PAD.encode(service.verifying_key().as_bytes());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let failing = Arc::new(AtomicBool::new(true));
+        let a = HandleAttestation {
+            account_key: public.clone(),
+            handle: "account".into(),
+            issued_at: crate::core::now_ms(),
+            expires_at: crate::core::now_ms() + 7 * 86400000,
+            signature: String::new(),
+        };
+        let mut a = a;
+        a.signature = URL_SAFE_NO_PAD.encode(service.sign(handle_statement(&a).as_bytes()).to_bytes());
+        let app = Router::new()
+            .route(
+                "/v1/service-key",
+                get({
+                    let calls = calls.clone();
+                    let failing = failing.clone();
+                    let public = public.clone();
+                    move || {
+                        let calls = calls.clone();
+                        let failing = failing.clone();
+                        let public = public.clone();
+                        async move {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            if failing.load(Ordering::SeqCst) {
+                                (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})))
+                            } else {
+                                (StatusCode::OK, Json(json!({"key": public})))
+                            }
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1/accounts/by-key/{key}",
+                get({
+                    let a = a.clone();
+                    move || {
+                        let a = a.clone();
+                        async move { Json(json!({"handle": a.handle, "account_key": a.account_key, "attestation": a})) }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let lookup = Lookup::new(format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(lookup.account(&public).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        failing.store(false, Ordering::SeqCst);
+        assert_eq!(lookup.account(&public).await.unwrap(), Some(a.clone()));
+        failing.store(true, Ordering::SeqCst);
+        assert_eq!(lookup.clone().account(&public).await.unwrap(), Some(a));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        task.abort();
     }
 }

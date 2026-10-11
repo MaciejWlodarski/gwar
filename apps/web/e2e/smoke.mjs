@@ -1370,8 +1370,14 @@ async function main() {
     if (!welcomed) throw new Error("no welcome received");
     if (welcomed.uid !== localUid) throw new Error(`server uid ${welcomed.uid} != account uid ${localUid}`);
     // Verification runs off the hello path; the badge may arrive in member.updated.
-    await waitFor(() => [...welcomed.members, ...fd.events("member.updated")].some((member) => member.uid === localUid && member.connect === acct), "verified Connect account handle");
+    await waitFor(() => [...welcomed.members, ...fd.events("member.updated")].some((member) => member.uid === localUid && member.connect?.handle === acct), "verified Connect account handle");
     await memberSection(d, "Online").getByLabel(`Gwar Connect account: @${acct}`).waitFor();
+    const trustedKey = await d.evaluate(async () => {
+      const { loadServiceKey } = await import("/src/connect/service-key.ts");
+      return loadServiceKey();
+    });
+    const serviceKey = await (await fetch(`${connectUrl}/v1/service-key`)).json();
+    if (trustedKey !== serviceKey.key) throw new Error("client did not use the local Connect service key");
     await d.getByRole("button", { name: "Server menu" }).click();
     await d.getByRole("menuitem", { name: "Change nickname", exact: true }).click();
     await d.getByRole("dialog").getByLabel("Nickname").fill("Account on server");

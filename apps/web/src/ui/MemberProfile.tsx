@@ -84,9 +84,9 @@ export function MemberProfileDialog({ uid, fallback }: { uid: string; fallback: 
           <div className="min-w-0">
             <div className="flex items-center gap-2">
               <span className="truncate font-semibold">{nickname}</span>
-              <ConnectBadge handle={member?.connect} />
+              <ConnectBadge member={member} />
             </div>
-            <IdentityLine connect={member?.connect} tag={member?.tag} className="block" />
+            <IdentityLine member={member} tag={member?.tag} className="block" />
           </div>
         </div>
         <Field label={t("member.uid")}>

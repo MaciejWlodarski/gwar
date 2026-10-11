@@ -1,11 +1,12 @@
 /** Mentions: composer autocomplete, the uids to send, and finding them again in message text. */
+import type { HandleAttestation } from "../proto/HandleAttestation";
 
 export interface Person {
   uid: string;
   nickname: string;
   online: boolean;
   tag?: string;
-  connect?: string | null;
+  connect?: HandleAttestation | null;
 }
 
 export interface ActiveMention {

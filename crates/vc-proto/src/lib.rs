@@ -490,6 +490,17 @@ wire! {
         pub ice_servers: Vec<IceServer>,
     }
 
+    /// Connect service signature binding a handle to an account identity.
+    pub struct HandleAttestation {
+        pub account_key: String,
+        pub handle: String,
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        pub issued_at: i64,
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        pub expires_at: i64,
+        pub signature: String,
+    }
+
     pub struct Member {
         pub uid: Uid,
         /// The nickname on this server (the same on every device of this member).
@@ -498,10 +509,9 @@ wire! {
         /// lowercase base32 that no other member of this server shares. Tells apart
         /// members with the same nickname; it may grow when a new member collides.
         pub tag: String,
-        /// Handle of the Gwar Connect account this identity belongs to, as confirmed
-        /// by the Connect service. `None` for local identities.
+        /// Handle attestation to verify against the client's own Connect service key.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub connect: Option<String>,
+        pub connect: Option<HandleAttestation>,
         pub groups: Vec<GroupId>,
         /// Unix time in milliseconds.
         #[cfg_attr(feature = "ts", ts(type = "number"))]
@@ -762,6 +772,11 @@ pub fn normalize_host(address: &str) -> Option<String> {
     })
 }
 
+/// Exact UTF-8 statement signed by the Connect service; no trailing newline.
+pub fn handle_statement(a: &HandleAttestation) -> String {
+    format!("gwar handle v1\n{}\n{}\n{}\n{}", a.account_key, a.handle, a.issued_at, a.expires_at)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -790,6 +805,18 @@ mod tests {
             let input = input.as_str().unwrap();
             assert_eq!(normalize_host(input), None, "{input}");
         }
+    }
+
+    #[test]
+    fn handle_statement_has_exact_bytes() {
+        let a = HandleAttestation {
+            account_key: "key".into(),
+            handle: "handle".into(),
+            issued_at: 123,
+            expires_at: 456,
+            signature: "ignored".into(),
+        };
+        assert_eq!(handle_statement(&a), "gwar handle v1\nkey\nhandle\n123\n456");
     }
 
     #[test]

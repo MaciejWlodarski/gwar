@@ -11,9 +11,19 @@ use base64::{
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use vc_proto::{
-    Attachment, Ban, BanId, ChannelId, ChatMessage, ChatTarget, FileId, Group, GroupId, Invite, Member, MessageId,
-    Permission, TAG_MIN_LEN, UNREAD_CAP, Uid,
+    Attachment, Ban, BanId, ChannelId, ChatMessage, ChatTarget, FileId, Group, GroupId, HandleAttestation, Invite,
+    Member, MessageId, Permission, TAG_MIN_LEN, UNREAD_CAP, Uid,
 };
+
+/// Expired attestations never reach a wire member, including offline/history lookups.
+fn read_attestation(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<Option<HandleAttestation>> {
+    let json: Option<String> = row.get(column)?;
+    let a = json
+        .map(|s| serde_json::from_str::<HandleAttestation>(&s))
+        .transpose()
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, Box::new(e)))?;
+    Ok(a.filter(|a| a.expires_at > crate::core::now_ms()))
+}
 
 pub const ADMIN_GROUP: GroupId = 1;
 pub const MEMBER_GROUP: GroupId = 2;
@@ -186,6 +196,10 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE users RENAME COLUMN connect_checked_at TO connect_next_check;
     UPDATE users SET connect_next_check=NULL;
+"#,
+    r#"
+    ALTER TABLE users ADD COLUMN connect_attestation TEXT;
+    UPDATE users SET connect_handle=NULL,connect_next_check=NULL;
 "#,
 ];
 
@@ -368,8 +382,8 @@ impl Store {
     pub fn user_by_uid(&self, uid: &str) -> Result<Option<(i64, Member)>> {
         let row = self
             .db
-            .query_row("SELECT id,nickname,last_seen,connect_handle FROM users WHERE uid=?1", [uid], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get(3)?))
+            .query_row("SELECT id,nickname,last_seen,connect_attestation FROM users WHERE uid=?1", [uid], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, read_attestation(r, 3)?))
             })
             .optional()?;
         let Some((id, nickname, last_seen, connect)) = row else { return Ok(None) };
@@ -471,14 +485,22 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_connect_handle(&self, user_id: i64, handle: Option<&str>) -> Result<()> {
-        self.db.execute("UPDATE users SET connect_handle=?2 WHERE id=?1", params![user_id, handle])?;
+    pub fn set_connect_attestation(&self, user_id: i64, a: Option<&HandleAttestation>) -> Result<()> {
+        let json = a.map(serde_json::to_string).transpose()?;
+        self.db.execute("UPDATE users SET connect_attestation=?2 WHERE id=?1", params![user_id, json])?;
         Ok(())
+    }
+
+    /// Includes expired attestations so a returning account still triggers refresh.
+    pub fn has_connect_attestation(&self, user_id: i64) -> Result<bool> {
+        Ok(self
+            .db
+            .query_row("SELECT connect_attestation IS NOT NULL FROM users WHERE id=?1", [user_id], |r| r.get(0))?)
     }
 
     /// Disabling Connect forgets cached handles, so enabling it starts with fresh checks.
     pub fn clear_connect_cache(&self) -> Result<()> {
-        self.db.execute("UPDATE users SET connect_handle=NULL,connect_next_check=NULL", [])?;
+        self.db.execute("UPDATE users SET connect_handle=NULL,connect_attestation=NULL,connect_next_check=NULL", [])?;
         Ok(())
     }
 
@@ -486,10 +508,16 @@ impl Store {
     pub fn members(&self, since: i64, limit: u32) -> Result<Vec<Member>> {
         let tags = self.member_tags()?;
         let mut stmt = self.db.prepare(
-            "SELECT id,uid,nickname,last_seen,connect_handle FROM users WHERE last_seen >= ?1 ORDER BY last_seen DESC LIMIT ?2",
+            "SELECT id,uid,nickname,last_seen,connect_attestation FROM users WHERE last_seen >= ?1 ORDER BY last_seen DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![since, limit], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, i64>(3)?, r.get(4)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                read_attestation(r, 4)?,
+            ))
         })?;
         rows.map(|row| {
             let (id, uid, nickname, last_seen, connect) = row?;
@@ -508,11 +536,18 @@ impl Store {
     pub fn member_rows(&self, seen_before: Option<i64>) -> Result<Vec<MemberRow>> {
         let tags = self.member_tags()?;
         let mut stmt = self.db.prepare(
-            "SELECT id,uid,nickname,last_seen,(SELECT COUNT(*) FROM messages WHERE author_uid = users.uid),connect_handle
+            "SELECT id,uid,nickname,last_seen,(SELECT COUNT(*) FROM messages WHERE author_uid = users.uid),connect_attestation
              FROM users WHERE ?1 IS NULL OR last_seen < ?1 ORDER BY last_seen, id",
         )?;
         let rows = stmt.query_map([seen_before], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                read_attestation(r, 5)?,
+            ))
         })?;
         rows.map(|row| {
             let (id, uid, nickname, last_seen, messages, connect) = row?;
@@ -1112,14 +1147,21 @@ mod tests {
         assert!(member.connect.is_none());
         assert_eq!(store.connect_next_check(id).unwrap(), None);
         store.schedule_connect(id, 30).unwrap();
-        store.set_connect_handle(id, Some("account")).unwrap();
+        let a = HandleAttestation {
+            account_key: "key".into(),
+            handle: "account".into(),
+            issued_at: 1,
+            expires_at: i64::MAX,
+            signature: "signature".into(),
+        };
+        store.set_connect_attestation(id, Some(&a)).unwrap();
         let reopened = Store::init(store.db).unwrap();
         assert_eq!(reopened.connect_next_check(id).unwrap(), Some(30));
-        assert_eq!(reopened.user_by_uid("old").unwrap().unwrap().1.connect.as_deref(), Some("account"));
+        assert_eq!(reopened.user_by_uid("old").unwrap().unwrap().1.connect, Some(a));
     }
 
     #[test]
-    fn migration_resets_connect_check_times_and_preserves_handles() {
+    fn migration_resets_connect_check_times_and_discards_unsigned_handles() {
         let db = Connection::open_in_memory().unwrap();
         for migration in &MIGRATIONS[..6] {
             db.execute_batch(migration).unwrap();
@@ -1133,7 +1175,7 @@ mod tests {
         let store = Store::init(db).unwrap();
         let (id, member) = store.user_by_uid("known").unwrap().unwrap();
         assert_eq!(member.nickname, "Kept");
-        assert_eq!(member.connect.as_deref(), Some("account"));
+        assert!(member.connect.is_none());
         assert_eq!(store.connect_next_check(id).unwrap(), None);
         let (id, member) = store.user_by_uid("unknown").unwrap().unwrap();
         assert!(member.connect.is_none());

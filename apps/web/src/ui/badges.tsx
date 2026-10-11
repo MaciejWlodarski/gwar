@@ -1,3 +1,5 @@
+import type { HandleMember } from "../net/handle-attestation";
+import { useVerifiedHandle } from "./useVerifiedHandle";
 import { BadgeCheck } from "lucide-react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
@@ -44,16 +46,18 @@ export function TeamSpeakBadge({ className, short }: { className?: string; short
   );
 }
 
-/** Only the server's verified account handle enables this badge. */
-export function ConnectBadge({ handle }: { handle?: string | null }) {
+/** Only a handle verified by this client enables the badge. */
+export function ConnectBadge({ member }: { member?: HandleMember | null }) {
   const t = useT();
+  const handle = useVerifiedHandle(member);
   if (!handle) return null;
   const label = t("badge.connectAccount", { handle });
   return <span title={label} aria-label={label} className="inline-flex shrink-0 align-middle text-accent"><BadgeCheck className="size-3.5" /></span>;
 }
 
 /** "@handle #tag": the verified Connect handle (if any) and the tag derived from the key. */
-export function IdentityLine({ connect, tag, className }: { connect?: string | null; tag?: string | null; className?: string }) {
+export function IdentityLine({ member, tag, className }: { member?: HandleMember | null; tag?: string | null; className?: string }) {
+  const connect = useVerifiedHandle(member);
   if (!connect && !tag) return null;
   return (
     <span className={cn("shrink-0 font-mono text-xs text-muted", className)}>

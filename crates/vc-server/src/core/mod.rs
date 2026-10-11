@@ -602,7 +602,7 @@ impl Core {
         // The handle belongs to the key, however it signs in: a signed-out browser that kept the
         // account's key is still that account. Keys never seen with a device certificate are not
         // sent to Connect, so people who don't use it are not reported there.
-        if r.device.is_some() || known.as_ref().is_some_and(|m| m.connect.is_some()) {
+        if r.device.is_some() || self.store.has_connect_attestation(user.id).unwrap_or(false) {
             self.refresh_connect(&r.uid, user.id, &r.public_key);
         }
         if let Some(tags) = tags_before {
@@ -717,12 +717,10 @@ impl Core {
                             if let Err(e) = core.store.schedule_connect(id, now_ms() + delay) {
                                 warn!("store: {e:#}");
                             }
-                            if member.connect != handle {
-                                if let Err(e) = core.store.set_connect_handle(id, handle.as_deref()) {
-                                    warn!("store: {e:#}");
-                                } else {
-                                    core.announce_member(&uid);
-                                }
+                            if let Err(e) = core.store.set_connect_attestation(id, handle.as_ref()) {
+                                warn!("store: {e:#}");
+                            } else if member.connect != handle {
+                                core.announce_member(&uid);
                             }
                         }
                         Ok(_) => {}

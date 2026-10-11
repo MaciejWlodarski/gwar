@@ -1,3 +1,4 @@
+import type { HandleAttestation } from "../proto/HandleAttestation";
 import { useIsMobile, useMediaQuery } from "../lib/media";
 import type { Client } from "../proto/Client";
 import type { Group } from "../proto/Group";
@@ -30,7 +31,7 @@ export interface MemberEntry {
   uid: string;
   nickname: string;
   tag: string;
-  connect?: string | null;
+  connect?: HandleAttestation | null;
   admin: boolean;
   online: boolean;
   platform: Platform | null;

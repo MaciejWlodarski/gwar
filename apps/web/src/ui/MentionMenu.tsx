@@ -28,7 +28,7 @@ export function MentionMenu({ matches, index, onPick, onHover }: { matches: Pers
             <Avatar name={p.nickname} seed={p.uid} size={20} />
           </span>
           <span className={cn("min-w-0 flex-1 truncate", !p.online && "text-muted")}>{p.nickname}</span>
-          <IdentityLine connect={p.connect} tag={p.tag} />
+          <IdentityLine member={p} tag={p.tag} />
           <span className="shrink-0 text-[11px] text-subtle">{p.online ? t("members.online") : t("members.offline")}</span>
         </div>
       ))}

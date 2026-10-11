@@ -8,7 +8,7 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(version, about = "Gwar Connect: accounts that keep one identity across devices")]
 struct Cli {
-    /// Directory for the database.
+    /// Directory for the database and service signing key.
     #[arg(long, env = "GWAR_CONNECT_DATA_DIR", default_value = "connect-data")]
     data_dir: PathBuf,
     /// Listen address (put HTTPS in front, e.g. a reverse proxy).
@@ -30,6 +30,8 @@ struct Cli {
 enum Command {
     /// Writes a consistent copy of the database to this file.
     Backup { path: PathBuf },
+    /// Prints the public handle signing key (creates it on first use).
+    ServiceKey,
 }
 
 #[tokio::main]
@@ -40,10 +42,18 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     std::fs::create_dir_all(&cli.data_dir).with_context(|| format!("create {}", cli.data_dir.display()))?;
     let database = cli.data_dir.join("connect.sqlite3");
-    if let Some(Command::Backup { path }) = cli.command {
-        Store::open(&database)?.backup_to(&path)?;
-        println!("{}", path.display());
-        return Ok(());
+    match cli.command {
+        Some(Command::Backup { path }) => {
+            Store::open(&database)?.backup_to(&path)?;
+            println!("{}", path.display());
+            return Ok(());
+        }
+        Some(Command::ServiceKey) => {
+            let key = gwar_connect::service_key::load(&cli.data_dir)?;
+            println!("{}", gwar_connect::crypto::b64(key.verifying_key().as_bytes()));
+            return Ok(());
+        }
+        None => {}
     }
     let mut origins = cli.origins;
     origins.extend(DESKTOP_ORIGINS.iter().map(|o| o.to_string()));

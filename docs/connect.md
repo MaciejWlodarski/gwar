@@ -155,18 +155,48 @@ verify each entry with its account key and refuse revoked devices.
 
 A certificate proves key possession, not registration with Connect. After a
 device-authenticated hello, servers asynchronously look up the account key via
-`/v1/accounts/by-key/{account_key}` and cache the confirmed handle and next-check
+`/v1/accounts/by-key/{account_key}` and cache the signed handle attestation and next-check
 time in `users`. Before HTTP, a five-minute retry guard is persisted across devices
 and restarts; a valid 200 extends it to 24 hours, a 404 to one hour, and errors keep
-the five-minute guard. A changed handle emits `member.updated`;
+the five-minute guard. A refreshed attestation emits `member.updated`;
 404 clears it, while an outage keeps the cached value. A hello signed directly
 with the key (no device certificate, e.g. a browser that signed out but kept the
 account's key) keeps a confirmed handle and refreshes it the same way, since the
 handle belongs to the key. Keys never confirmed are not looked up then, so people
-who don't use Connect are never reported to it. `--no-connect` clears all stored handles
+who don't use Connect are never reported to it. `--no-connect` clears all stored attestations
 and next-check times on startup; certificates still authenticate locally. Both public
 account lookups have the same policy (no login rate limit). The literal `by-key`
 cannot be a handle because hyphens are not allowed.
+
+## What your client verifies
+
+Your client checks each handle's Ed25519 attestation against the service key it
+fetches from its configured Connect service over HTTPS. It checks the signed
+account key against the member's uid and rejects expired attestations or issuance
+more than five minutes in the future.
+The game server can still lie about presence (who is online or in which channel),
+voice, and, until message signing lands, message authorship.
+
+## Service key and handle attestations
+
+Connect keeps its service signing seed in `service-key.ed25519` in the data
+directory (0600 on Unix). Back it up with the database. `gwar-connect --data-dir <dir> service-key` prints the public key; `GET /v1/service-key` returns
+`{"key":"<base64url public key>"}`. Both public account lookups include a fresh
+seven-day `attestation` with `account_key`, `handle`, `issued_at`, `expires_at`
+(milliseconds), and `signature`. The signed UTF-8 bytes, with no trailing newline:
+
+```text
+gwar handle v1
+{account_key}
+{handle}
+{issued_at}
+{expires_at}
+```
+
+Clients refresh the key once per app session and cache it by Connect URL in memory
+and localStorage. A previously fetched key can be used during an outage; without
+a key, no handles or Connect badges appear. Local development permits loopback
+HTTP. Servers cache the entire attestation and omit it once expired.
 
 ## Client flows
 

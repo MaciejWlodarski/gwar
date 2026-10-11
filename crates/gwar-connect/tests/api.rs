@@ -429,9 +429,23 @@ async fn public_accounts_can_be_looked_up_by_handle_or_key() {
     let (status, _) = api.post("/register", None, sign_up("lookup", "pw", &account, &device, &rand::random())).await;
     assert_eq!(status, 200);
     let key = b64(account.verifying_key().as_bytes());
-    let expected = json!({"handle": "lookup", "account_key": key});
-    assert_eq!(api.get("/accounts/lookup", None).await, (200, expected.clone()));
-    assert_eq!(api.get(&format!("/accounts/by-key/{key}"), None).await, (200, expected));
+    let (status, service) = api.get("/service-key", None).await;
+    assert_eq!(status, 200);
+    let service = service["key"].as_str().unwrap();
+    assert_eq!(crypto::unb64_len(service, 32).unwrap().len(), 32);
+    for path in ["/accounts/lookup".into(), format!("/accounts/by-key/{key}")] {
+        let before = gwar_connect::api::now_ms();
+        let (status, reply) = api.get(&path, None).await;
+        assert_eq!(status, 200);
+        assert_eq!(reply["handle"], "lookup");
+        assert_eq!(reply["account_key"], key);
+        let a: vc_proto::HandleAttestation = serde_json::from_value(reply["attestation"].clone()).unwrap();
+        assert_eq!(a.account_key, key);
+        assert_eq!(a.handle, "lookup");
+        assert!((before..=gwar_connect::api::now_ms()).contains(&a.issued_at));
+        assert_eq!(a.expires_at - a.issued_at, 7 * 24 * 3600 * 1000);
+        assert!(crypto::verify(service, &vc_proto::handle_statement(&a), &a.signature));
+    }
     let unknown = b64(SigningKey::from_bytes(&rand::random()).verifying_key().as_bytes());
     for path in [format!("/accounts/by-key/{unknown}"), "/accounts/by-key/malformed".into(), "/accounts/by-key".into()]
     {
@@ -441,4 +455,33 @@ async fn public_accounts_can_be_looked_up_by_handle_or_key() {
     }
     // A hyphen is not permitted in handles, so the static route cannot hide an account.
     assert_eq!(crypto::handle("by-key"), None);
+}
+
+#[tokio::test]
+async fn service_key_survives_restart_and_matches_cli() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("connect.sqlite3");
+    let http = reqwest::Client::new();
+    let mut keys = Vec::new();
+    for _ in 0..2 {
+        let addr = gwar_connect::start(Config {
+            database: Some(database.clone()),
+            bind: "127.0.0.1:0".parse().unwrap(),
+            origins: vec![],
+        })
+        .await
+        .unwrap();
+        let reply: Value =
+            http.get(format!("http://{addr}/v1/service-key")).send().await.unwrap().json().await.unwrap();
+        keys.push(reply["key"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(keys[0], keys[1]);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_gwar-connect"))
+        .arg("--data-dir")
+        .arg(dir.path())
+        .arg("service-key")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), keys[0]);
 }

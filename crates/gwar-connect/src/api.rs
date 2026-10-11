@@ -30,6 +30,7 @@ const MAX_DEVICE_NAME: usize = 64;
 
 pub struct Connect {
     pub store: Mutex<Store>,
+    service_key: ed25519_dalek::SigningKey,
     limits: Mutex<HashMap<String, Vec<Instant>>>,
     /// Keys the fake salts of unknown handles, so prelogin reveals nothing.
     secret: [u8; 32],
@@ -37,6 +38,10 @@ pub struct Connect {
 
 impl Connect {
     pub fn new(store: Store) -> anyhow::Result<Self> {
+        Self::with_service_key(store, crate::service_key::generate())
+    }
+
+    pub fn with_service_key(store: Store, service_key: ed25519_dalek::SigningKey) -> anyhow::Result<Self> {
         let secret = match store.meta("secret")?.and_then(|s| crypto::unb64_len(&s, 32)) {
             Some(secret) => secret,
             None => {
@@ -45,7 +50,12 @@ impl Connect {
                 secret.to_vec()
             }
         };
-        Ok(Self { store: Mutex::new(store), limits: Mutex::default(), secret: secret.try_into().expect("32 bytes") })
+        Ok(Self {
+            store: Mutex::new(store),
+            service_key,
+            limits: Mutex::default(),
+            secret: secret.try_into().expect("32 bytes"),
+        })
     }
 
     /// Allows at most `max` calls per `window` for `key`.
@@ -493,12 +503,21 @@ pub async fn revocations(State(state): State<AppState>, Query(q): Query<Since>) 
     Ok(Json(json!({"revocations": list})))
 }
 
+pub async fn service_key(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({"key": b64(state.service_key.verifying_key().as_bytes())}))
+}
+
+fn public_account(state: &Connect, a: Account) -> Json<Value> {
+    let attestation = crate::service_key::attest(&state.service_key, &a.account_key, &a.handle, now_ms());
+    Json(json!({"handle": a.handle, "account_key": a.account_key, "attestation": attestation}))
+}
+
 pub async fn lookup(State(state): State<AppState>, Path(handle): Path<String>) -> Reply {
     let handle = crypto::handle(&handle)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "not_found", "no such account".into()))?;
     let account = state.store.lock().expect("store lock").account_by_handle(&handle)?;
     match account {
-        Some(a) => Ok(Json(json!({"handle": a.handle, "account_key": a.account_key}))),
+        Some(a) => Ok(public_account(&state, a)),
         None => Err(ApiError(StatusCode::NOT_FOUND, "not_found", "no such account".into())),
     }
 }
@@ -506,7 +525,7 @@ pub async fn lookup(State(state): State<AppState>, Path(handle): Path<String>) -
 pub async fn lookup_by_key(State(state): State<AppState>, Path(key): Path<String>) -> Reply {
     let account = state.store.lock().expect("store lock").account_by_key(&key)?;
     match account {
-        Some(a) => Ok(Json(json!({"handle": a.handle, "account_key": a.account_key}))),
+        Some(a) => Ok(public_account(&state, a)),
         None => Err(ApiError(StatusCode::NOT_FOUND, "not_found", "no such account".into())),
     }
 }

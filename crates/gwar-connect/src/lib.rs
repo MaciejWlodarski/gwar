@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod crypto;
+pub mod service_key;
 pub mod store;
 
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
@@ -39,6 +40,7 @@ pub fn router(state: Arc<Connect>, origins: &[String]) -> Router {
         .max_age(std::time::Duration::from_secs(3600));
     Router::new()
         .route("/health", get(|| async { "ok" }))
+        .route("/v1/service-key", get(api::service_key))
         .route("/v1/register", post(api::register))
         .route("/v1/prelogin", post(api::prelogin))
         .route("/v1/login", post(api::login))
@@ -63,7 +65,11 @@ pub async fn start(config: Config) -> Result<SocketAddr> {
         Some(path) => Store::open(path)?,
         None => Store::in_memory()?,
     };
-    let state = Arc::new(Connect::new(store)?);
+    let key = match &config.database {
+        Some(path) => service_key::load(path.parent().unwrap_or_else(|| std::path::Path::new(".")))?,
+        None => service_key::generate(),
+    };
+    let state = Arc::new(Connect::with_service_key(store, key)?);
     let app = router(state, &config.origins);
     let listener = TcpListener::bind(config.bind).await.context("bind HTTP listener")?;
     let addr = listener.local_addr()?;

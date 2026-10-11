@@ -70,13 +70,13 @@ export function DeafenButton({ size = "md" }: { size?: "sm" | "md" }) {
   );
 }
 
-/** My nickname, with the Connect badge once the server has confirmed my handle. */
+/** My nickname, with a client-verified Connect badge. */
 function SelfName({ nickname }: { nickname?: string }) {
-  const handle = useSession((s) => (s.me ? s.members[s.me.uid]?.connect : undefined));
+  const member = useSession((s) => (s.me ? s.members[s.me.uid] : undefined));
   return (
     <div className="flex min-w-0 items-center gap-1">
       <span className="truncate text-sm font-medium">{nickname}</span>
-      <ConnectBadge handle={handle} />
+      <ConnectBadge member={member} />
     </div>
   );
 }

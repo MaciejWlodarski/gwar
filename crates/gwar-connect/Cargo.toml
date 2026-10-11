@@ -11,6 +11,7 @@ name = "gwar-connect"
 path = "src/main.rs"
 
 [dependencies]
+vc-proto = { path = "../vc-proto" }
 anyhow.workspace = true
 argon2 = "0.5"
 axum = "0.8"
@@ -30,6 +31,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+tempfile = "3"
 aes-gcm = "0.10"
 hkdf = "0.12"
 reqwest = { version = "0.13", default-features = false, features = ["json"] }

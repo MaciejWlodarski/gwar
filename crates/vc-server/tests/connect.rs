@@ -118,6 +118,14 @@ async fn an_expired_certificate_is_reported_as_such() {
     assert_eq!(err.code, vc_proto::ErrorCode::NotAuthenticated);
 }
 
+fn service_key() -> SigningKey {
+    SigningKey::from_bytes(&[42; 32])
+}
+
+fn attestation(account_key: &str, handle: &str) -> vc_proto::HandleAttestation {
+    gwar_connect::service_key::attest(&service_key(), account_key, handle, now())
+}
+
 // --------------------------------------------------------- confirmed handles
 
 #[derive(Default)]
@@ -144,6 +152,7 @@ impl FakeConnect {
         });
         let app = Router::new()
             .route("/v1/accounts/by-key/{key}", get(fake_account))
+            .route("/v1/service-key", get(|| async { axum::Json(json!({"key": public_key(&service_key())})) }))
             .route("/v1/revocations", get(|| async { axum::Json(json!({"revocations": []})) }))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -186,7 +195,10 @@ async fn fake_account(
         return (status, axum::Json(body));
     }
     match state.handles.lock().unwrap().get(&key) {
-        Some(handle) => (StatusCode::OK, axum::Json(json!({"handle": handle, "account_key": key}))),
+        Some(handle) => (
+            StatusCode::OK,
+            axum::Json(json!({"handle": handle, "account_key": key, "attestation": attestation(&key, handle)})),
+        ),
         None => (StatusCode::NOT_FOUND, axum::Json(json!({"error": "not_found"}))),
     }
 }
@@ -219,7 +231,7 @@ async fn handles_are_confirmed_asynchronously_and_cached_across_devices_and_rest
     fake.state.gate.as_ref().unwrap().add_permits(1);
     let uid = first.welcome.uid.clone();
     let changed = first.next_event_where("member.updated", |m| m["uid"] == uid).await;
-    assert_eq!(changed["connect"], "registered");
+    assert_eq!(changed["connect"]["handle"], "registered");
     assert_next_check_in(&store, id, 24 * 3600 * 1000);
     first.close().await;
     second.close().await;
@@ -232,7 +244,10 @@ async fn handles_are_confirmed_asynchronously_and_cached_across_devices_and_rest
             .unwrap();
     let restarted = TestServer { running, admin_token: String::new() };
     let again = as_device(&restarted, &device, certificate(&account, &device, now(), now() + 86400000)).await.unwrap();
-    assert_eq!(again.welcome.members.iter().find(|m| m.uid == uid).unwrap().connect.as_deref(), Some("registered"));
+    assert_eq!(
+        again.welcome.members.iter().find(|m| m.uid == uid).unwrap().connect.as_ref().map(|a| a.handle.as_str()),
+        Some("registered")
+    );
     assert_eq!(fake.calls(), 1);
 }
 
@@ -249,7 +264,7 @@ async fn unknown_accounts_clear_the_cache_and_an_outage_keeps_it() {
     let store = vc_server::store::Store::open(&database).unwrap();
     for key in [&known, &unknown, &outage] {
         let user = store.touch_user(&uid_of(key), &public_key(key), "member", 1).unwrap();
-        store.set_connect_handle(user.id, Some("old")).unwrap();
+        store.set_connect_attestation(user.id, Some(&attestation(&public_key(key), "old"))).unwrap();
         store.schedule_connect(user.id, now() - 1).unwrap();
     }
     let server = TestServer::start_with(|c| {
@@ -259,7 +274,10 @@ async fn unknown_accounts_clear_the_cache_and_an_outage_keeps_it() {
     .await;
     let device = new_key();
     let mut changed = as_device(&server, &device, certificate(&known, &device, now(), now() + 86400000)).await.unwrap();
-    assert_eq!(changed.next_event_where("member.updated", |m| m["uid"] == uid_of(&known)).await["connect"], "current");
+    assert_eq!(
+        changed.next_event_where("member.updated", |m| m["uid"] == uid_of(&known)).await["connect"]["handle"],
+        "current"
+    );
     let mut missing =
         as_device(&server, &device, certificate(&unknown, &device, now(), now() + 86400000)).await.unwrap();
     let event = missing.next_event_where("member.updated", |m| m["uid"] == uid_of(&unknown)).await;
@@ -271,11 +289,17 @@ async fn unknown_accounts_clear_the_cache_and_an_outage_keeps_it() {
         }
     })
     .await;
-    assert_eq!(store.user_by_uid(&uid_of(&outage)).unwrap().unwrap().1.connect.as_deref(), Some("old"));
+    assert_eq!(
+        store.user_by_uid(&uid_of(&outage)).unwrap().unwrap().1.connect.as_ref().map(|a| a.handle.as_str()),
+        Some("old")
+    );
     for key in [&unknown, &outage] {
         let again = as_device(&server, &device, certificate(key, &device, now(), now() + 86400000)).await.unwrap();
         let member = again.welcome.members.iter().find(|m| m.uid == uid_of(key)).unwrap();
-        assert_eq!(member.connect.as_deref(), if uid_of(key) == uid_of(&unknown) { None } else { Some("old") });
+        assert_eq!(
+            member.connect.as_ref().map(|a| a.handle.as_str()),
+            if uid_of(key) == uid_of(&unknown) { None } else { Some("old") }
+        );
     }
     assert_eq!(fake.calls(), 3, "negative and failed lookups wait until their next check");
     drop(down);
@@ -289,12 +313,21 @@ fn assert_next_check_in(store: &vc_server::store::Store, id: i64, delay: i64) {
 #[tokio::test]
 async fn failed_lookups_retry_after_five_minutes_across_restarts() {
     let account = new_key();
+    let key = public_key(&account);
+    let wrong_service = gwar_connect::service_key::attest(&new_key(), &key, "registered", now());
+    let wrong_account = attestation(&public_key(&new_key()), "registered");
+    let expired = gwar_connect::service_key::attest(&service_key(), &key, "registered", now() - 8 * 86400000);
+    let future = gwar_connect::service_key::attest(&service_key(), &key, "registered", now() + 6 * 60 * 1000);
     let responses = [
         (StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "unavailable"})),
         (StatusCode::CREATED, json!({"handle": "registered", "account_key": public_key(&account)})),
         (StatusCode::OK, json!({"invalid": "body"})),
         (StatusCode::OK, json!({"handle": "registered", "account_key": public_key(&new_key())})),
         (StatusCode::OK, json!({"handle": "Invalid!", "account_key": public_key(&account)})),
+        (StatusCode::OK, json!({"handle": "registered", "account_key": key, "attestation": wrong_service})),
+        (StatusCode::OK, json!({"handle": "registered", "account_key": key, "attestation": wrong_account})),
+        (StatusCode::OK, json!({"handle": "registered", "account_key": key, "attestation": expired})),
+        (StatusCode::OK, json!({"handle": "registered", "account_key": key, "attestation": future})),
     ];
     for (status, body) in responses {
         let fake = FakeConnect::start(false).await;
@@ -303,7 +336,7 @@ async fn failed_lookups_retry_after_five_minutes_across_restarts() {
         let database = dir.path().join("vc.sqlite3");
         let store = vc_server::store::Store::open(&database).unwrap();
         let id = store.touch_user(&uid_of(&account), &public_key(&account), "Account", 1).unwrap().id;
-        store.set_connect_handle(id, Some("cached")).unwrap();
+        store.set_connect_attestation(id, Some(&attestation(&public_key(&account), "cached"))).unwrap();
         let server = TestServer::start_with(|c| {
             c.database = Some(database.clone());
             c.connect_url = Some(fake.url.clone());
@@ -327,7 +360,15 @@ async fn failed_lookups_retry_after_five_minutes_across_restarts() {
         let again =
             as_device(&restarted, &device, certificate(&account, &device, now(), now() + 86400000)).await.unwrap();
         assert_eq!(
-            again.welcome.members.iter().find(|m| m.uid == uid_of(&account)).unwrap().connect.as_deref(),
+            again
+                .welcome
+                .members
+                .iter()
+                .find(|m| m.uid == uid_of(&account))
+                .unwrap()
+                .connect
+                .as_ref()
+                .map(|a| a.handle.as_str()),
             Some("cached")
         );
         assert_next_check_in(&store, id, 5 * 60 * 1000);
@@ -339,7 +380,7 @@ async fn failed_lookups_retry_after_five_minutes_across_restarts() {
         let mut retry =
             as_device(&restarted, &device, certificate(&account, &device, now(), now() + 86400000)).await.unwrap();
         assert_eq!(
-            retry.next_event_where("member.updated", |m| m["uid"] == uid_of(&account)).await["connect"],
+            retry.next_event_where("member.updated", |m| m["uid"] == uid_of(&account)).await["connect"]["handle"],
             "registered"
         );
         assert_eq!(fake.calls(), 2);
@@ -378,7 +419,7 @@ async fn unknown_accounts_retry_after_an_hour() {
     store.schedule_connect(id, now() - 1).unwrap();
     let mut retry = as_device(&server, &device, certificate(&account, &device, now(), now() + 86400000)).await.unwrap();
     assert_eq!(
-        retry.next_event_where("member.updated", |m| m["uid"] == uid_of(&account)).await["connect"],
+        retry.next_event_where("member.updated", |m| m["uid"] == uid_of(&account)).await["connect"]["handle"],
         "registered"
     );
     assert_eq!(fake.calls(), 2);
@@ -394,7 +435,9 @@ async fn successful_lookups_schedule_a_day_even_when_the_handle_is_unchanged() {
     let database = dir.path().join("vc.sqlite3");
     let store = vc_server::store::Store::open(&database).unwrap();
     let id = store.touch_user(&uid_of(&account), &public_key(&account), "Account", 1).unwrap().id;
-    store.set_connect_handle(id, Some("registered")).unwrap();
+    let previous =
+        gwar_connect::service_key::attest(&service_key(), &public_key(&account), "registered", now() - 86400000);
+    store.set_connect_attestation(id, Some(&previous)).unwrap();
     store.schedule_connect(id, now() - 1).unwrap();
     let server = TestServer::start_with(|c| {
         c.database = Some(database);
@@ -409,11 +452,23 @@ async fn successful_lookups_schedule_a_day_even_when_the_handle_is_unchanged() {
     })
     .await;
     assert_next_check_in(&store, id, 24 * 3600 * 1000);
-    assert!(first.drain_events("member.updated").await.is_empty());
+    let updated = first.next_event_where("member.updated", |m| m["uid"] == uid_of(&account)).await;
+    assert_eq!(updated["connect"]["handle"], "registered");
+    let stored = store.user_by_uid(&uid_of(&account)).unwrap().unwrap().1.connect.unwrap();
+    assert_ne!(stored, previous);
+    assert_eq!(serde_json::to_value(stored).unwrap(), updated["connect"]);
     first.close().await;
     let again = as_device(&server, &device, certificate(&account, &device, now(), now() + 86400000)).await.unwrap();
     assert_eq!(
-        again.welcome.members.iter().find(|m| m.uid == uid_of(&account)).unwrap().connect.as_deref(),
+        again
+            .welcome
+            .members
+            .iter()
+            .find(|m| m.uid == uid_of(&account))
+            .unwrap()
+            .connect
+            .as_ref()
+            .map(|a| a.handle.as_str()),
         Some("registered")
     );
     assert_eq!(fake.calls(), 1);
@@ -429,7 +484,7 @@ async fn an_account_key_without_a_device_keeps_its_handle() {
     let database = dir.path().join("vc.sqlite3");
     let store = vc_server::store::Store::open(&database).unwrap();
     let id = store.touch_user(&uid_of(&account), &public_key(&account), "Account", 1).unwrap().id;
-    store.set_connect_handle(id, Some("old")).unwrap();
+    store.set_connect_attestation(id, Some(&attestation(&public_key(&account), "old"))).unwrap();
     store.schedule_connect(id, now() - 1).unwrap();
     let server = TestServer::start_with(|c| {
         c.database = Some(database.clone());
@@ -438,17 +493,33 @@ async fn an_account_key_without_a_device_keeps_its_handle() {
     .await;
     let mut client = Client::connect_as(&server, account.clone(), "ignored", None).await.unwrap();
     assert_eq!(
-        client.welcome.members.iter().find(|m| m.uid == uid_of(&account)).unwrap().connect.as_deref(),
+        client
+            .welcome
+            .members
+            .iter()
+            .find(|m| m.uid == uid_of(&account))
+            .unwrap()
+            .connect
+            .as_ref()
+            .map(|a| a.handle.as_str()),
         Some("old")
     );
     let changed = client.next_event_where("member.updated", |m| m["uid"] == uid_of(&account)).await;
-    assert_eq!(changed["connect"], "current");
+    assert_eq!(changed["connect"]["handle"], "current");
     assert_eq!(fake.calls(), 1);
     client.close().await;
     // Within a day the next device-less sign-in neither asks Connect again nor forgets the handle.
     let again = Client::connect_as(&server, account.clone(), "ignored", None).await.unwrap();
     assert_eq!(
-        again.welcome.members.iter().find(|m| m.uid == uid_of(&account)).unwrap().connect.as_deref(),
+        again
+            .welcome
+            .members
+            .iter()
+            .find(|m| m.uid == uid_of(&account))
+            .unwrap()
+            .connect
+            .as_ref()
+            .map(|a| a.handle.as_str()),
         Some("current")
     );
     assert_eq!(fake.calls(), 1);
@@ -474,7 +545,7 @@ async fn local_identities_and_no_connect_never_show_a_handle() {
     assert_eq!(fake.calls(), 0);
     client.close().await;
     drop(server);
-    store.set_connect_handle(id, Some("registered")).unwrap();
+    store.set_connect_attestation(id, Some(&attestation(&public_key(&local), "registered"))).unwrap();
     store.schedule_connect(id, now() + 24 * 3600 * 1000).unwrap();
     let running =
         vc_server::start(vc_server::Config { database: Some(database), ..common::base_config() }).await.unwrap();
@@ -484,4 +555,66 @@ async fn local_identities_and_no_connect_never_show_a_handle() {
     assert!(client.welcome.members.iter().find(|m| m.uid == uid_of(&local)).unwrap().connect.is_none());
     assert_eq!(store.connect_next_check(id).unwrap(), None);
     assert_eq!(fake.calls(), 0);
+}
+
+#[tokio::test]
+async fn expired_cached_attestations_are_hidden_and_refreshed_without_a_device() {
+    let fake = FakeConnect::start(false).await;
+    let account = new_key();
+    fake.known(&account, "current");
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("vc.sqlite3");
+    let store = vc_server::store::Store::open(&database).unwrap();
+    let id = store.touch_user(&uid_of(&account), &public_key(&account), "Account", 1).unwrap().id;
+    let expired = gwar_connect::service_key::attest(&service_key(), &public_key(&account), "old", now() - 8 * 86400000);
+    store.set_connect_attestation(id, Some(&expired)).unwrap();
+    store.schedule_connect(id, now() + 86400000).unwrap();
+    assert!(store.user_by_uid(&uid_of(&account)).unwrap().unwrap().1.connect.is_none());
+    assert!(store.members(0, 10).unwrap()[0].connect.is_none());
+    assert!(store.member_rows(None).unwrap()[0].member.connect.is_none());
+    let server = TestServer::start_with(|c| {
+        c.database = Some(database);
+        c.connect_url = Some(fake.url.clone());
+    })
+    .await;
+    let client = Client::connect_as(&server, account.clone(), "ignored", None).await.unwrap();
+    assert!(client.welcome.members.iter().find(|m| m.uid == uid_of(&account)).unwrap().connect.is_none());
+    assert_eq!(fake.calls(), 0);
+    client.close().await;
+    store.schedule_connect(id, now() - 1).unwrap();
+    let mut again = Client::connect_as(&server, account.clone(), "ignored", None).await.unwrap();
+    let updated = again.next_event_where("member.updated", |m| m["uid"] == uid_of(&account)).await;
+    let a: vc_proto::HandleAttestation = serde_json::from_value(updated["connect"].clone()).unwrap();
+    assert_eq!(a.handle, "current");
+    assert_eq!(a.account_key, public_key(&account));
+    assert!(vc_server::identity::signed_by(&public_key(&service_key()), &vc_proto::handle_statement(&a), &a.signature));
+    assert_eq!(store.user_by_uid(&uid_of(&account)).unwrap().unwrap().1.connect, Some(a));
+    assert_next_check_in(&store, id, 24 * 3600 * 1000);
+}
+
+#[tokio::test]
+async fn a_404_clears_even_an_expired_cached_attestation() {
+    let fake = FakeConnect::start(false).await;
+    let account = new_key();
+    let device = new_key();
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("vc.sqlite3");
+    let store = vc_server::store::Store::open(&database).unwrap();
+    let id = store.touch_user(&uid_of(&account), &public_key(&account), "Account", 1).unwrap().id;
+    let expired = gwar_connect::service_key::attest(&service_key(), &public_key(&account), "old", now() - 8 * 86400000);
+    store.set_connect_attestation(id, Some(&expired)).unwrap();
+    let server = TestServer::start_with(|c| {
+        c.database = Some(database);
+        c.connect_url = Some(fake.url.clone());
+    })
+    .await;
+    let client = as_device(&server, &device, certificate(&account, &device, now(), now() + 86400000)).await.unwrap();
+    assert!(client.welcome.members.iter().find(|m| m.uid == uid_of(&account)).unwrap().connect.is_none());
+    within("expired cache cleared", async {
+        while store.has_connect_attestation(id).unwrap() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert_next_check_in(&store, id, 3600 * 1000);
 }

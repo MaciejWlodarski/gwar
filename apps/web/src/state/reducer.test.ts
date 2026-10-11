@@ -309,14 +309,15 @@ describe("members", () => {
 
   it("preserves verified member metadata on session updates and renames all sessions", () => {
     let s = online();
-    s = ev(s, { ev: "member.updated", d: { uid: "u2", nickname: "Current", tag: "abcdefghij", connect: "alice", groups: [2], last_seen: 3 } });
+    const connect = { account_key: "key", handle: "alice", issued_at: 1, expires_at: 2, signature: "sig" };
+    s = ev(s, { ev: "member.updated", d: { uid: "u2", nickname: "Current", tag: "abcdefghij", connect, groups: [2], last_seen: 3 } });
     s = ev(s, { ev: "client.updated", d: cl(2, 1, { nickname: "Old session name", muted: true }) });
-    expect(s.members["u2"]).toMatchObject({ nickname: "Current", tag: "abcdefghij", connect: "alice" });
+    expect(s.members["u2"]).toMatchObject({ nickname: "Current", tag: "abcdefghij", connect });
     s = ev(s, { ev: "client.joined", d: cl(3, null, { uid: "u2", nickname: "Old session name" }) });
     s = ev(s, { ev: "member.updated", d: { ...s.members["u2"]!, nickname: "Renamed" } });
     expect(s.clients[2]?.nickname).toBe("Renamed");
     expect(s.clients[3]?.nickname).toBe("Renamed");
-    expect(s.members["u2"]?.connect).toBe("alice");
+    expect(s.members["u2"]?.connect).toEqual(connect);
   });
 
   it("follows nickname changes", () => {

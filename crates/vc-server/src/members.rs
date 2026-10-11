@@ -138,7 +138,7 @@ pub fn format_list(rows: &[MemberRow], groups: &[Group], now: i64) -> String {
             m.uid,
             m.nickname,
             m.tag,
-            m.connect.as_deref().unwrap_or(""),
+            m.connect.as_ref().map(|a| a.handle.as_str()).unwrap_or(""),
             civil_date(m.last_seen),
             row.messages
         );

@@ -107,6 +107,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn uid_vectors_match_web() {
+        let ascending = std::array::from_fn(|i| i as u8);
+        for (key, expected) in [
+            ([0; 32], "Zmh6rfhivXdsj8GLjp-OIAiXFIU"),
+            ([1; 32], "cs1uhCLEB_ttCYaQ8RMLfe1-wvc"),
+            (ascending, "Yw3NKWbEM2aRElRIu7JbT_QSpJw"),
+        ] {
+            let uid = uid_for_key(&key);
+            println!("{} {uid}", URL_SAFE_NO_PAD.encode(key));
+            assert_eq!(uid, expected);
+        }
+    }
+
+    #[test]
     fn accepts_valid_and_rejects_replayed_signature() {
         let id = TestIdentity::generate();
         let nonce = new_nonce();
