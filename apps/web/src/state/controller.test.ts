@@ -9,13 +9,13 @@ import { welcome } from "../net/testing";
 import type { VoiceEngine } from "../voice/engine";
 
 // Native file commands, recording where uploads would go (only the desktop upload test turns the app native).
-const native = vi.hoisted(() => ({ origin: null as string | null, sent: [] as Array<{ origin: string | null; reservedOn: string; bytes: Uint8Array }>, attachment: {} }));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async (op: string, data: { origin?: string | null }, options?: { headers: Record<string, string> }) => {
-  if (op === "files_set_server") { native.origin = data.origin ?? null; return; }
+const native = vi.hoisted(() => ({ origin: null as string | null, session: null as string | null, sent: [] as Array<{ origin: string | null; bytes: Uint8Array }>, attachment: {} }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async (op: string, data: { origin?: string | null; session?: string | null }, options?: { headers: Record<string, string> }) => {
+  if (op === "files_set_server") { native.origin = data.origin ?? null; native.session = data.session ?? null; return; }
   if (op === "upload_put") {
-    native.sent.push({ origin: native.origin, reservedOn: options!.headers["x-upload-origin"]!, bytes: data as unknown as Uint8Array });
-    // Like the native command: refused unless still connected to the server that reserved the upload.
-    if (native.origin !== options!.headers["x-upload-origin"]) throw new Error("the server changed during the upload");
+    // Like the native command: refused, before anything is sent, unless the connection that reserved it is current.
+    if (!native.session || native.session !== options!.headers["x-upload-session"]) throw new Error("the server changed");
+    native.sent.push({ origin: native.origin, bytes: data as unknown as Uint8Array });
     return native.attachment;
   }
 }) }));
@@ -744,25 +744,29 @@ describe("edits stay on their connection; history ownership follows each verifie
   it("a desktop upload never reaches a server the app switched to meanwhile (Astra r4 probe, inverted)", async () => {
     vi.useRealTimers(); connectFake();
     const g = await genuine(), { a, switchTo } = await servers(g), held = gate();
-    stores.useSession.setState({ httpOrigin: "https://a.example", server: { ...session().server!, upload_limit: 100 } });
+    stores.useSession.setState({ httpOrigin: "https://a.example", fileSession: "sA", server: { ...session().server!, upload_limit: 100 } });
     const bytes = new TextEncoder().encode("private bytes for A");
     const file = new File([bytes], "secret.txt", { type: "text/plain" });
     a.request.mockResolvedValue({ file: "file", upload_url: "/api/files/file?token=x" });
     const { setConnectedServer } = await import("../platform/download");
     vi.stubGlobal("window", { __TAURI_INTERNALS__: {}, addEventListener: vi.fn(), removeEventListener: vi.fn() });
     native.sent.length = 0;
-    await setConnectedServer("https://a.example", 100);
+    await setConnectedServer("https://a.example", 100, "sA");
     // The session ends while the native side is still getting ready (here: during the reservation reply).
     a.request.mockImplementation(async () => { await held.pass(); return { file: "file", upload_url: "/api/files/file?token=x" }; });
     try {
       const pending = controller.uploadFile(file);
       const result = expect(pending).rejects.toMatchObject({ kind: "network" });
-      await held.started; switchTo(); await setConnectedServer("https://b.example", 100); held.release(); await result;
-      expect(native.sent.filter((s) => s.origin === "https://b.example")).toEqual([]);
+      await held.started; switchTo(); await setConnectedServer("https://b.example", 100, "sB"); held.release(); await result;
+      expect(native.sent).toEqual([]);
       expect(g.c.uploaded.size).toBe(0);
-      // Even if the interface did call the native command, it names the server the upload was reserved on.
+      // Even if the interface did call the native command, it names the connection the upload was reserved on:
+      // refused on another server, and after a reconnect to the same one.
       const { uploadFromApp } = await import("../platform/download");
-      await expect(uploadFromApp("/api/files/file?token=x", bytes, 100, "https://a.example")).rejects.toThrow("server changed");
+      await expect(uploadFromApp("/api/files/file?token=x", bytes, 100, "sA")).rejects.toThrow("server changed");
+      await setConnectedServer("https://a.example", 100, "sA2");
+      await expect(uploadFromApp("/api/files/file?token=x", bytes, 100, "sA")).rejects.toThrow("server changed");
+      expect(native.sent).toEqual([]);
     } finally { vi.unstubAllGlobals(); g.c.conn = link; }
   });
 
@@ -831,5 +835,39 @@ describe("channel id reuse", () => {
       expect(result).toMatchObject({ status: "verified", authorization: [mode === "churn" ? "channel-history-incomplete" : "channel-reused"] });
       expect(fullyVerified(result)).toBe(false);
     } finally { vi.unstubAllGlobals(); }
+  });
+});
+
+describe("native file sessions", () => {
+  const welcomeAgain = (resync: boolean) => link.welcomeNow(welcome({ session: 1, uid: "u1", channels: [chan(1)], clients: [client(1, null)] }), resync);
+  it("every welcome names a new connection for native file commands; TeamSpeak and leaving have none", async () => {
+    connectFake();
+    session().setAddress("test", "vc", "https://a.example");
+    welcomeAgain(false);
+    const first = session().fileSession;
+    expect(first).toMatch(/^[0-9a-f-]{36}$/);
+    welcomeAgain(true); // a resync is a new session on the server too: older file work must not continue
+    expect(session().fileSession).toMatch(/^[0-9a-f-]{36}$/);
+    expect(session().fileSession).not.toBe(first);
+    session().setAddress("ts", "teamspeak", null);
+    welcomeAgain(false);
+    expect(session().fileSession).toBeNull();
+    session().setAddress("test", "vc", "https://a.example");
+    welcomeAgain(false);
+    await controller.disconnect(true);
+    expect(session().fileSession).toBeNull();
+  });
+});
+
+describe("ending a session", () => {
+  it("closes dialogs about the ended session but keeps a changed server identity, whatever the timing", async () => {
+    const confirm = { kind: "confirm" as const, title: "t", body: "b", confirmLabel: "ok", onConfirm: () => {} };
+    for (const [serverIdentity, kept] of [[true, true], [false, false]] as const) {
+      connectFake();
+      stores.useUi.getState().openDialog({ ...confirm, serverIdentity });
+      await controller.disconnect(true);
+      expect(stores.useUi.getState().dialog.kind).toBe(kept ? "confirm" : "none");
+      stores.useUi.getState().closeDialog();
+    }
   });
 });

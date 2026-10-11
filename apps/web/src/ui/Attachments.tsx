@@ -55,9 +55,10 @@ function useNearView<T extends Element>(): [RefCallback<T>, boolean] {
 type UrlOptions = { autoLoad?: boolean; active?: boolean; budget?: ImageBudget };
 function useAttachmentUrl(att: Attachment, verified: boolean, { autoLoad = true, active = true, budget }: UrlOptions = {}) {
   const origin = useSession((s) => s.httpOrigin), limit = useSession((s) => s.server?.upload_limit ?? 0);
+  const session = useSession((s) => s.fileSession);
   const [explicit, setExplicit] = useState<string>();
   const [requested, setRequested] = useState<string>();
-  const key = JSON.stringify([origin, att, limit, verified]);
+  const key = JSON.stringify([origin, session, att, limit, verified]);
   const [loaded, setLoaded] = useState<{ key: string; url: string; failed: boolean }>();
   const load = () => setExplicit(key);
   const open = () => setRequested(key);
@@ -66,7 +67,7 @@ function useAttachmentUrl(att: Attachment, verified: boolean, { autoLoad = true,
     if (!active || !allowed || (!autoLoad && requested !== key && explicit !== key)) return;
     const abort = new AbortController(), signal = abort.signal;
     let url: string | undefined, release: (() => void) | undefined;
-    const opts = { origin, size: att.size, uploadLimit: limit, signal };
+    const opts = { origin, session, size: att.size, uploadLimit: limit, signal };
     // With a budget, the fetch waits for a slot and decoding waits until the decoded image fits in memory;
     // the memory stays reserved until the image is released.
     void (async () => {
@@ -97,7 +98,7 @@ function useSave(att: Attachment, verified: boolean) {
   const run = async (unverified: boolean) => {
     abort.current?.abort(); const request = new AbortController(); abort.current = request; setBusy(true);
     try {
-      const s = useSession.getState(), opts = { origin: s.httpOrigin, size: att.size, uploadLimit: s.server?.upload_limit ?? 0, signal: request.signal };
+      const s = useSession.getState(), opts = { origin: s.httpOrigin, session: s.fileSession, size: att.size, uploadLimit: s.server?.upload_limit ?? 0, signal: request.signal };
       const blob = verified && !unverified ? await verifiedAttachmentBlob(att, att.url, undefined, opts)
         : new Blob([await fetchFileBytes(att.url, opts)], { type: att.mime });
       request.signal.throwIfAborted();

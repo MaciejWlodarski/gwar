@@ -21,10 +21,13 @@ interface SessionStore extends SessionState {
   kind: ServerKind;
   /** HTTP origin of the vc server (uploads, attachments); null on TeamSpeak. */
   httpOrigin: string | null;
+  /** Names this connection to the desktop's native file commands; a command carrying an older one is refused. */
+  fileSession: string | null;
   serverKey: string | null;
   endpoint: string | null;
   insecureConnection: boolean;
   setSecurity(serverKey: string | null, endpoint: string | null, insecureConnection: boolean): void;
+  setFileSession(fileSession: string | null): void;
   dispatch(action: Action): void;
   setClose(reason: CloseReason | null): void;
   setAddress(address: string, kind?: ServerKind, httpOrigin?: string | null): void;
@@ -36,10 +39,12 @@ export const useSession = create<SessionStore>()((set) => ({
   address: "",
   kind: "vc",
   httpOrigin: null,
+  fileSession: null,
   serverKey: null,
   endpoint: null,
   insecureConnection: false,
   setSecurity: (serverKey, endpoint, insecureConnection) => set({ serverKey, endpoint, insecureConnection }),
+  setFileSession: (fileSession) => set({ fileSession }),
   dispatch: (action) => set((s) => reduce(s, action)),
   setClose: (closeReason) => set({ closeReason }),
   setAddress: (address, kind = "vc", httpOrigin = null) => set({ address, kind, httpOrigin }),

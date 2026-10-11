@@ -19,6 +19,9 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 struct Server {
+    /// Names one connection of the interface: a command naming another one (a stale upload or download after a
+    /// reconnect, even to the same origin) is refused before anything is sent.
+    session: String,
     origin: Url,
     client: Client,
     limit: u64,
@@ -38,8 +41,13 @@ impl Default for Files {
 }
 
 impl Files {
-    fn connected(&self) -> Result<Server, String> {
-        self.server.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or_else(|| "no connected server".into())
+    /// The connected server, if it is still the one of `session`.
+    fn current(&self, session: &str) -> Result<Server, String> {
+        let server = self.server.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or("no connected server")?;
+        if server.session != session {
+            return Err("the server changed".into());
+        }
+        Ok(server)
     }
 
     fn replace(&self, server: Option<Server>) {
@@ -99,7 +107,10 @@ fn checked_targets(host: &str, addresses: &[SocketAddr]) -> Result<(), String> {
     Ok(())
 }
 
-async fn server(value: &str, limit: u64) -> Result<Server, String> {
+async fn server(value: &str, limit: u64, session: String) -> Result<Server, String> {
+    if !token(&session, 64) {
+        return Err("invalid file session".into());
+    }
     let origin = origin(value)?;
     let host = origin.host_str().ok_or("missing host")?.trim_matches(['[', ']']);
     let addresses: Vec<_> = tokio::time::timeout(
@@ -119,7 +130,7 @@ async fn server(value: &str, limit: u64) -> Result<Server, String> {
         .resolve_to_addrs(host, &addresses)
         .build()
         .map_err(|e| e.to_string())?;
-    Ok(Server { origin, client, limit: limit.min(MAX_BYTES), closed: watch::channel(false).0 })
+    Ok(Server { session, origin, client, limit: limit.min(MAX_BYTES), closed: watch::channel(false).0 })
 }
 
 #[tauri::command]
@@ -127,10 +138,11 @@ pub async fn files_set_server(
     files: State<'_, Files>,
     origin: Option<String>,
     upload_limit: u64,
+    session: Option<String>,
 ) -> Result<(), String> {
     files.replace(None);
     if let Some(origin) = origin {
-        files.replace(Some(server(&origin, upload_limit).await?));
+        files.replace(Some(server(&origin, upload_limit, session.ok_or("missing file session")?).await?));
     }
     Ok(())
 }
@@ -222,12 +234,13 @@ async fn bytes(server: &Server, path: &str, size: u64) -> Result<Vec<u8>, String
 #[tauri::command]
 pub async fn fetch_file(
     files: State<'_, Files>,
+    session: String,
     path: String,
     size: u64,
     request_id: String,
 ) -> Result<Response, String> {
     let _permit = files.slots.try_acquire().map_err(|_| "too many file requests")?;
-    let server = files.connected()?;
+    let server = files.current(&session)?;
     cancellable(&files, &request_id, bytes(&server, &path, size)).await.map(Response::new)
 }
 
@@ -268,13 +281,14 @@ fn proposed_name(name: &str) -> String {
 pub async fn save_file_as(
     app: tauri::AppHandle,
     files: State<'_, Files>,
+    session: String,
     path: String,
     file_name: String,
     size: u64,
     request_id: String,
 ) -> Result<bool, String> {
     let _permit = files.slots.try_acquire().map_err(|_| "too many file requests")?;
-    let server = files.connected()?;
+    let server = files.current(&session)?;
     file_url(&server.origin, &path, false)?;
     cap(size, server.limit)?;
     cancellable(&files, &request_id, async {
@@ -320,10 +334,10 @@ pub async fn save_blob_as(
 #[tauri::command]
 pub async fn upload_put(files: State<'_, Files>, request: Request<'_>) -> Result<vc_proto::Attachment, String> {
     let _permit = files.slots.try_acquire().map_err(|_| "too many file requests")?;
-    let server = files.connected()?;
     let header = |name: &str| request.headers().get(name).and_then(|v| v.to_str().ok());
-    let path = header("x-upload-path").ok_or("missing upload path")?;
-    let url = upload_url(&server, header("x-upload-origin").ok_or("missing upload origin")?, path)?;
+    // Only the connection the upload was reserved on; checked before the destination is chosen.
+    let server = files.current(header("x-upload-session").ok_or("missing file session")?)?;
+    let url = file_url(&server.origin, header("x-upload-path").ok_or("missing upload path")?, true)?;
     let InvokeBody::Raw(data) = request.body() else { return Err("expected raw bytes".into()) };
     cap(data.len() as u64, server.limit)?;
     let mut closed = server.closed.subscribe();
@@ -347,15 +361,6 @@ pub async fn upload_put(files: State<'_, Files>, request: Request<'_>) -> Result
         data.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&data).map_err(|e| e.to_string())
-}
-
-/// Where an upload reserved on `reserved_on` goes: only to that same server. If the interface has meanwhile
-/// switched to another one, the bytes are refused before any request is made.
-fn upload_url(server: &Server, reserved_on: &str, path: &str) -> Result<Url, String> {
-    if origin(reserved_on)?.origin() != server.origin.origin() {
-        return Err("the server changed during the upload".into());
-    }
-    file_url(&server.origin, path, true)
 }
 
 #[cfg(test)]
@@ -429,6 +434,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(1)).await;
         });
         Server {
+            session: "s".into(),
             origin: origin(&format!("http://{address}")).unwrap(),
             client: Client::builder()
                 .no_proxy()
@@ -441,22 +447,38 @@ mod tests {
         }
     }
 
-    #[test]
-    fn uploads_go_only_to_the_server_they_were_reserved_on() {
-        let b = Server {
-            origin: origin("https://b.example").unwrap(),
+    fn at(session: &str, origin_: &str) -> Server {
+        Server {
+            session: session.into(),
+            origin: origin(origin_).unwrap(),
             client: Client::new(),
             limit: MAX_BYTES,
             closed: watch::channel(false).0,
-        };
-        let path = "/api/files/a?token=t";
-        assert_eq!(
-            upload_url(&b, "https://b.example", path).unwrap().as_str(),
-            "https://b.example/api/files/a?token=t"
-        );
-        assert!(upload_url(&b, "https://b.example:443/", path).is_ok());
-        for reserved_on in ["https://a.example", "http://b.example", "https://b.example:8443", "not a url"] {
-            assert!(upload_url(&b, reserved_on, path).is_err(), "{reserved_on}");
+        }
+    }
+
+    #[test]
+    fn file_commands_reach_only_the_connection_that_issued_them() {
+        let files = Files::default();
+        assert_eq!(files.current("a").err().unwrap(), "no connected server");
+        files.replace(Some(at("a", "https://a.example")));
+        assert_eq!(files.current("a").unwrap().origin.as_str(), "https://a.example/");
+        // Another server, and a reconnect to the same one: commands of the old connection are refused.
+        for next in [at("b", "https://b.example"), at("a2", "https://a.example")] {
+            let stale = files.server.lock().unwrap().as_ref().unwrap().session.clone();
+            let session = next.session.clone();
+            files.replace(Some(next));
+            assert_eq!(files.current(&stale).err().unwrap(), "the server changed");
+            assert!(files.current(&session).is_ok());
+        }
+        files.replace(None);
+        assert!(files.current("a2").is_err());
+    }
+
+    #[tokio::test]
+    async fn a_server_needs_a_well_formed_session() {
+        for session in ["", "has space", "x".repeat(65).as_str(), "a/b"] {
+            assert_eq!(server("https://1.1.1.1", 1, session.into()).await.err().unwrap(), "invalid file session");
         }
     }
 

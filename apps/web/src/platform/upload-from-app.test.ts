@@ -36,7 +36,7 @@ describe("desktop upload helper", () => {
     native.setServerHeld = wait.promise;
     void setConnectedServer("https://b.example", 100);
     let current = true;
-    const pending = uploadFromApp(path, new Uint8Array([1]), 100, "https://a.example", () => { if (!current) throw new Error("stale session"); });
+    const pending = uploadFromApp(path, new Uint8Array([1]), 100, "s1", () => { if (!current) throw new Error("stale session"); });
     const result = expect(pending).rejects.toThrow("stale session");
     await new Promise((r) => setTimeout(r, 0));
     current = false;
@@ -50,7 +50,7 @@ describe("desktop upload helper", () => {
     vi.doMock("@tauri-apps/api/core", async () => { await wait.promise; return core(); });
     const { uploadFromApp } = await import("./download");
     let current = true;
-    const pending = uploadFromApp(path, new Uint8Array([1]), 100, "https://a.example", () => { if (!current) throw new Error("stale session"); });
+    const pending = uploadFromApp(path, new Uint8Array([1]), 100, "s1", () => { if (!current) throw new Error("stale session"); });
     const result = expect(pending).rejects.toThrow("stale session");
     await new Promise((r) => setTimeout(r, 0));
     current = false;
@@ -59,12 +59,31 @@ describe("desktop upload helper", () => {
     expect(native.invoke).not.toHaveBeenCalled();
   });
 
-  it("checks the session last, then hands native code the same bytes and the reserved origin", async () => {
+  it("checks the session last, then hands native code the same bytes and the reserving session", async () => {
     const { uploadFromApp } = await import("./download");
     const bytes = new Uint8Array([4, 5, 6]), stillHere = vi.fn();
-    await uploadFromApp(path, bytes, 100, "https://a.example", stillHere);
-    expect(native.invoke).toHaveBeenCalledExactlyOnceWith("upload_put", bytes, { headers: { "x-upload-path": path, "x-upload-origin": "https://a.example" } });
+    await uploadFromApp(path, bytes, 100, "s1", stillHere);
+    expect(native.invoke).toHaveBeenCalledExactlyOnceWith("upload_put", bytes, { headers: { "x-upload-path": path, "x-upload-session": "s1" } });
     expect(native.invoke.mock.calls[0]![1]).toBe(bytes);
     expect(native.invoke.mock.invocationCallOrder[0]).toBeGreaterThan(stillHere.mock.invocationCallOrder[0]!);
+  });
+});
+
+describe("desktop file fetches", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.doMock("@tauri-apps/api/core", core);
+    native.invoke = vi.fn(async () => new Uint8Array([7, 8]).buffer);
+  });
+  afterEach(() => { vi.doUnmock("@tauri-apps/api/core"); });
+
+  it("name the connection the file belongs to, and need one", async () => {
+    const { fetchFileBytes } = await import("./download");
+    const opts = { origin: "https://a.example", size: 2, uploadLimit: 10 };
+    expect(await fetchFileBytes("/files/f/a.txt", { ...opts, session: "s1" })).toEqual(new Uint8Array([7, 8]));
+    expect(native.invoke).toHaveBeenCalledWith("fetch_file", expect.objectContaining({ session: "s1", path: "/files/f/a.txt" }));
+    native.invoke.mockClear();
+    await expect(fetchFileBytes("/files/f/a.txt", { ...opts, session: null })).rejects.toThrow("no connected server");
+    expect(native.invoke).not.toHaveBeenCalled();
   });
 });

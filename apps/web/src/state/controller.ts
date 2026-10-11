@@ -416,7 +416,7 @@ class Controller {
       this.entered.clear();
       this.historyRequested.clear();
       this.sentRead.clear();
-      void setConnectedServer(useSession.getState().kind === "vc" ? useSession.getState().httpOrigin : null, welcome.server.upload_limit).catch((e) => console.warn("Native file origin:", e));
+      this.nativeFiles(useSession.getState().kind === "vc" ? useSession.getState().httpOrigin : null, welcome.server.upload_limit);
       session.setSecurity(conn.serverKey ?? null, conn.endpoint ?? null, !!conn.endpoint && isPlaintextRemote(conn.endpoint));
       if (conn.serverKey) channelLifecycle.observe(conn.serverKey, welcome.channels.map((c) => c.id));
       session.dispatch({ type: "welcome", welcome, resync, now: Date.now() });
@@ -485,7 +485,7 @@ class Controller {
           session.dispatch({ type: "phase", phase: "online" });
           break;
         case "reconnecting":
-          void setConnectedServer(null);
+          this.nativeFiles(null);
           // A new session starts outside voice: remember where to go back to.
           this.rejoin ??= useSession.getState().kind === "vc" ? myChannelId(useSession.getState()) : null;
           session.dispatch({ type: "phase", phase: "reconnecting" });
@@ -512,8 +512,15 @@ class Controller {
     if (!silent) useSession.getState().setClose({ kind: "user" });
   }
 
+  /** Every welcome (a resync too) starts a new native file session; file work of an older one is refused. */
+  private nativeFiles(origin: string | null, uploadLimit = 0): Promise<unknown> {
+    const fileSession = origin ? crypto.randomUUID() : null;
+    useSession.getState().setFileSession(fileSession);
+    return setConnectedServer(origin, uploadLimit, fileSession).catch((e) => console.warn("Native file origin:", e));
+  }
+
   private async teardown(): Promise<void> {
-    await setConnectedServer(null);
+    await this.nativeFiles(null);
     if (this.voiceRetry) clearTimeout(this.voiceRetry);
     this.voiceRetry = null;
     if (this.readTimer) clearTimeout(this.readTimer);
@@ -527,8 +534,10 @@ class Controller {
     useUi.getState().setJoining(null);
     useUi.getState().setEditing(null);
     // Dialogs about the session that just ended (server settings, a ban, a picture ...) would sit over the connect screen.
-    const dialog = useUi.getState().dialog.kind;
-    if (dialog !== "none" && dialog !== "settings" && dialog !== "addServer") useUi.getState().closeDialog();
+    // A changed server identity is about the next attempt, not the ended session: it stays, whatever the timing.
+    const dialog = useUi.getState().dialog;
+    const nextAttempt = dialog.kind === "confirm" && dialog.serverIdentity === true;
+    if (dialog.kind !== "none" && dialog.kind !== "settings" && dialog.kind !== "addServer" && !nextAttempt) useUi.getState().closeDialog();
     useOutbox.getState().clear();
     this.uploaded.clear();
     useSession.getState().dispatch({ type: "reset" });
@@ -1075,8 +1084,8 @@ class Controller {
       opts.onProgress?.(0.5);
       let att: Attachment;
       try {
-        if (!s.httpOrigin) throw new UploadError("network");
-        att = await uploadFromApp(reserved.upload_url, bytes, s.server?.upload_limit ?? 0, s.httpOrigin, stillHere);
+        if (!s.fileSession) throw new UploadError("network");
+        att = await uploadFromApp(reserved.upload_url, bytes, s.server?.upload_limit ?? 0, s.fileSession, stillHere);
       } catch {
         throw new UploadError("network");
       }

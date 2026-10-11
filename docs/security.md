@@ -285,8 +285,13 @@ Every guarantee assumes your client runs genuine code.
   backed up.
 - **Desktop app.** Code is bundled; the webview has a CSP. Builds are not yet
   signed or notarized; there is no auto-updater. The native file commands
-  confine requests to the file paths of the server origin the interface names;
-  they trust the interface to name the current server.
+  confine requests to the file paths of the server origin the interface names.
+  Each connection (every welcome, a resync too) gets a random file session;
+  uploads, downloads and saves name the session they belong to, and native code
+  refuses any other before choosing a destination or sending a byte, so work
+  of a closed connection never reaches the next one, even on the same server.
+  A compromised interface could still name any server, as it can connect to
+  one.
 - **Web apps hosted by other servers** are other origins: they don't have your
   keys, but they can phish your Connect password.
 - **Uploaded files** are served with `nosniff`, a sandboxing CSP and

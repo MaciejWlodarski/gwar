@@ -7,15 +7,18 @@ export const FILE_TIMEOUT_MS = 30_000;
 
 let nativeReady: Promise<unknown> = Promise.resolve();
 
-/** Ordered native connection state updates; file commands wait for them. */
-export function setConnectedServer(origin: string | null, uploadLimit = 0): Promise<unknown> {
+/** Ordered native connection state updates; file commands wait for them. `session` names the connection: native
+ *  code refuses file commands that carry another one. */
+export function setConnectedServer(origin: string | null, uploadLimit = 0, session: string | null = null): Promise<unknown> {
   if (!isDesktop()) return Promise.resolve();
-  nativeReady = nativeReady.catch(() => {}).then(async () => (await tauri()).invoke("files_set_server", { origin, uploadLimit }));
+  nativeReady = nativeReady.catch(() => {}).then(async () => (await tauri()).invoke("files_set_server", { origin, uploadLimit, session }));
   return nativeReady;
 }
 
 export interface FileOptions {
   origin: string | null;
+  /** The desktop's native file session of the connection the file belongs to. */
+  session?: string | null;
   size: number;
   uploadLimit: number;
   signal?: AbortSignal;
@@ -40,6 +43,7 @@ export async function fetchFileBytes(path: string, opts: FileOptions, fetchFn: t
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   try {
     if (isDesktop()) {
+      if (!opts.session) throw new Error("no connected server");
       await nativeReady;
       controller.signal.throwIfAborted();
       const api = await tauri();
@@ -48,7 +52,7 @@ export async function fetchFileBytes(path: string, opts: FileOptions, fetchFn: t
       const cancel = () => { void api.invoke("files_cancel", { requestId }); };
       controller.signal.addEventListener("abort", cancel, { once: true });
       try {
-        const raw = await api.invoke<ArrayBuffer>("fetch_file", { path, size: cap, uploadLimit: opts.uploadLimit, requestId });
+        const raw = await api.invoke<ArrayBuffer>("fetch_file", { session: opts.session, path, size: cap, uploadLimit: opts.uploadLimit, requestId });
         controller.signal.throwIfAborted();
         const bytes = new Uint8Array(raw);
         if (bytes.length > cap) throw new Error("File exceeds size limit");
@@ -90,6 +94,7 @@ export async function saveFile(path: string, name: string, opts: FileOptions): P
   const cap = fileCap(opts.size, opts.uploadLimit);
   absoluteUrl(opts.origin, path);
   if (isDesktop()) {
+    if (!opts.session) throw new Error("no connected server");
     await nativeReady;
     const api = await tauri();
     const requestId = crypto.randomUUID();
@@ -97,7 +102,7 @@ export async function saveFile(path: string, name: string, opts: FileOptions): P
     opts.signal?.throwIfAborted();
     opts.signal?.addEventListener("abort", cancel, { once: true });
     try {
-      return await api.invoke<boolean>("save_file_as", { path, fileName: name, size: cap, requestId });
+      return await api.invoke<boolean>("save_file_as", { session: opts.session, path, fileName: name, size: cap, requestId });
     } finally { opts.signal?.removeEventListener("abort", cancel); }
   }
   const bytes = await fetchFileBytes(path, opts);
@@ -112,15 +117,16 @@ export async function saveFile(path: string, name: string, opts: FileOptions): P
   return true;
 }
 
-/** Uploads exactly `bytes` to the server at `origin`, which reserved the upload. Native code refuses if it is no
- *  longer connected to that server; `stillHere` throws if the session that started the upload has ended. */
-export async function uploadFromApp(path: string, bytes: Uint8Array, uploadLimit: number, origin: string, stillHere: () => void = () => {}): Promise<Attachment> {
+/** Uploads exactly `bytes` over the native file session `session`, the connection that reserved the upload. Native
+ *  code refuses if that connection is gone (even after a reconnect to the same server); `stillHere` throws if the
+ *  session that started the upload has ended. */
+export async function uploadFromApp(path: string, bytes: Uint8Array, uploadLimit: number, session: string, stillHere: () => void = () => {}): Promise<Attachment> {
   filePath(path, "PUT");
   fileCap(bytes.byteLength, uploadLimit);
   await nativeReady;
   const { invoke } = await import("@tauri-apps/api/core");
   stillHere();
-  return invoke<Attachment>("upload_put", bytes, { headers: { "x-upload-path": path, "x-upload-origin": origin } });
+  return invoke<Attachment>("upload_put", bytes, { headers: { "x-upload-path": path, "x-upload-session": session } });
 }
 
 /** Save the exact inspected bytes; native code never refetches a potentially substituted URL. */
