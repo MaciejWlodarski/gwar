@@ -450,7 +450,10 @@ mod tests {
             closed: watch::channel(false).0,
         };
         let path = "/api/files/a?token=t";
-        assert_eq!(upload_url(&b, "https://b.example", path).unwrap().as_str(), "https://b.example/api/files/a?token=t");
+        assert_eq!(
+            upload_url(&b, "https://b.example", path).unwrap().as_str(),
+            "https://b.example/api/files/a?token=t"
+        );
         assert!(upload_url(&b, "https://b.example:443/", path).is_ok());
         for reserved_on in ["https://a.example", "http://b.example", "https://b.example:8443", "not a url"] {
             assert!(upload_url(&b, reserved_on, path).is_err(), "{reserved_on}");
