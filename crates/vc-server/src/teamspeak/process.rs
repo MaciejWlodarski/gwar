@@ -429,6 +429,11 @@ mod tests {
         prepare_state(&config).await.unwrap();
         let ini = dir.path().join("state/ts3server.ini");
         assert_eq!(std::fs::read_to_string(&ini).unwrap(), "serveradmin_password=secret\n");
+        // Every start replaces the ini of the previous one (`rename` replaces an existing file,
+        // on Windows too).
+        config.admin_password = "rotated".into();
+        prepare_state(&config).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&ini).unwrap(), "serveradmin_password=rotated\n");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
