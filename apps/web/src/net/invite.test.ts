@@ -78,8 +78,8 @@ describe("server HTTP origin", () => {
   });
   it("makes relative paths absolute", () => {
     expect(absoluteUrl("http://h:1", "/files/a/b.png")).toBe("http://h:1/files/a/b.png");
-    expect(absoluteUrl("http://h:1/", "files/a")).toBe("http://h:1/files/a");
-    expect(absoluteUrl(null, "/files/a")).toBe("/files/a");
-    expect(absoluteUrl("http://h", "https://cdn/x")).toBe("https://cdn/x");
+    expect(() => absoluteUrl("http://h:1/", "files/a")).toThrow();
+    expect(() => absoluteUrl(null, "/files/a")).toThrow();
+    expect(() => absoluteUrl("http://h", "https://cdn/x")).toThrow();
   });
 });

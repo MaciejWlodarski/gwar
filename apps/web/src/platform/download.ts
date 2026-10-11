@@ -1,32 +1,120 @@
 import { isDesktop, tauri } from ".";
+import { absoluteUrl, filePath } from "../net/address";
 
-/**
- * Saves a server file. The browser downloads it (the server marks everything
- * but images as an attachment). The desktop webview does not handle downloads,
- * so there a native "Save as" dialog asks for the place and the app fetches the
- * file itself. Resolves to false if the person cancelled.
- */
-export async function saveFile(url: string, name: string): Promise<boolean> {
-  if (isDesktop()) return (await tauri()).invoke<boolean>("save_url_as", { url, fileName: name });
+export const MAX_FILE_BYTES = 30 * 1024 * 1024;
+export const FILE_TIMEOUT_MS = 30_000;
+
+let nativeReady: Promise<unknown> = Promise.resolve();
+
+/** Ordered native connection state updates; file commands wait for them. */
+export function setConnectedServer(origin: string | null, uploadLimit = 0): Promise<unknown> {
+  if (!isDesktop()) return Promise.resolve();
+  nativeReady = nativeReady.catch(() => {}).then(async () => (await tauri()).invoke("files_set_server", { origin, uploadLimit }));
+  return nativeReady;
+}
+
+export interface FileOptions {
+  origin: string | null;
+  size: number;
+  uploadLimit: number;
+  signal?: AbortSignal;
+}
+
+export function fileCap(size: number, uploadLimit: number): number {
+  if (!Number.isSafeInteger(size) || size <= 0 || !Number.isSafeInteger(uploadLimit) || uploadLimit <= 0 || size > Math.min(uploadLimit, MAX_FILE_BYTES)) {
+    throw new Error("File exceeds size limit");
+  }
+  return size;
+}
+
+/** Streams within the declared size, server limit and local ceiling. Used before display or saving. */
+export async function fetchFileBytes(path: string, opts: FileOptions, fetchFn: typeof fetch = fetch, timeoutMs = FILE_TIMEOUT_MS): Promise<Uint8Array<ArrayBuffer>> {
+  const cap = fileCap(opts.size, opts.uploadLimit);
+  const url = absoluteUrl(opts.origin, path);
+  const controller = new AbortController();
+  const abort = () => controller.abort(opts.signal?.reason);
+  opts.signal?.addEventListener("abort", abort, { once: true });
+  if (opts.signal?.aborted) abort();
+  const timer = setTimeout(() => controller.abort(new Error("File request timed out")), Math.min(timeoutMs, FILE_TIMEOUT_MS));
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  try {
+    if (isDesktop()) {
+      await nativeReady;
+      controller.signal.throwIfAborted();
+      const api = await tauri();
+      controller.signal.throwIfAborted();
+      const requestId = crypto.randomUUID();
+      const cancel = () => { void api.invoke("files_cancel", { requestId }); };
+      controller.signal.addEventListener("abort", cancel, { once: true });
+      try {
+        const raw = await api.invoke<ArrayBuffer>("fetch_file", { path, size: cap, uploadLimit: opts.uploadLimit, requestId });
+        controller.signal.throwIfAborted();
+        const bytes = new Uint8Array(raw);
+        if (bytes.length > cap) throw new Error("File exceeds size limit");
+        return bytes;
+      } finally { controller.signal.removeEventListener("abort", cancel); }
+    }
+    const response = await fetchFn(url, { redirect: "error", credentials: "omit", signal: controller.signal });
+    if (!response.ok || response.redirected) throw new Error(`File HTTP ${response.status}`);
+    const length = response.headers.get("Content-Length");
+    if (length !== null && (!/^\d+$/.test(length) || Number(length) > cap)) throw new Error("File exceeds size limit");
+    if (!response.body) throw new Error("Missing file body");
+    reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    while (true) {
+      const next = await reader.read();
+      controller.signal.throwIfAborted();
+      if (next.done) break;
+      size += next.value.length;
+      if (size > cap) throw new Error("File exceeds size limit");
+      chunks.push(next.value);
+    }
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+    return bytes;
+  } catch (e) {
+    controller.abort();
+    await reader?.cancel().catch(() => {});
+    throw e;
+  } finally {
+    clearTimeout(timer);
+    opts.signal?.removeEventListener("abort", abort);
+    reader?.releaseLock();
+  }
+}
+
+export async function saveFile(path: string, name: string, opts: FileOptions): Promise<boolean> {
+  const cap = fileCap(opts.size, opts.uploadLimit);
+  absoluteUrl(opts.origin, path);
+  if (isDesktop()) {
+    await nativeReady;
+    const api = await tauri();
+    const requestId = crypto.randomUUID();
+    const cancel = () => { void api.invoke("files_cancel", { requestId }); };
+    opts.signal?.throwIfAborted();
+    opts.signal?.addEventListener("abort", cancel, { once: true });
+    try {
+      return await api.invoke<boolean>("save_file_as", { path, fileName: name, size: cap, requestId });
+    } finally { opts.signal?.removeEventListener("abort", cancel); }
+  }
+  const bytes = await fetchFileBytes(path, opts);
+  const url = URL.createObjectURL(new Blob([bytes], { type: "application/octet-stream" }));
   const a = document.createElement("a");
   a.href = url;
-  a.download = name;
-  // The server is usually another origin, where browsers ignore `download` (the server's `Content-Disposition: attachment`
-  // still makes non-images download). Keep the app's page in place if the browser shows the file instead.
-  a.target = "_blank";
-  a.rel = "noopener noreferrer";
+  a.download = name.split(/[\\/]/).pop() || "file";
   document.body.appendChild(a);
   a.click();
   a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
   return true;
 }
 
-/**
- * Sends a file to a one-time upload URL from the desktop app. The webview's own
- * origin (`tauri://`) would need CORS on the server for a `PUT`; the app does the
- * request itself instead. Resolves to the HTTP status.
- */
-export async function uploadFromApp(url: string, file: Blob): Promise<number> {
+export async function uploadFromApp(path: string, file: Blob, uploadLimit: number): Promise<number> {
+  filePath(path, "PUT");
+  fileCap(file.size, uploadLimit);
+  await nativeReady;
   const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<number>("upload_put", new Uint8Array(await file.arrayBuffer()), { headers: { "x-upload-url": url } });
+  return invoke<number>("upload_put", new Uint8Array(await file.arrayBuffer()), { headers: { "x-upload-path": path } });
 }

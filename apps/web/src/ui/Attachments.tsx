@@ -1,14 +1,12 @@
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { Download, File as FileIcon, FileArchive, FileAudio, FileText, FileVideo, Loader2, X } from "lucide-react";
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { fileKind, fitBox, formatBytes, isInlineImage, type FileKind } from "../lib/files";
 import { isDesktop } from "../platform";
-import { saveFile } from "../platform/download";
-import { absoluteUrl } from "../net/address";
+import { fetchFileBytes, saveFile } from "../platform/download";
 import type { Attachment } from "../proto/Attachment";
-import { controller } from "../state/controller";
 import { useSession, useUi } from "../state/stores";
 import { IconButton } from "./kit";
 
@@ -24,23 +22,42 @@ const KIND_ICON: Record<FileKind, ReactNode> = {
   other: <FileIcon className="size-5" />,
 };
 
-function useAttachmentUrl(att: Pick<Attachment, "url">): string {
+function useAttachmentUrl(att: Attachment): string | undefined {
   const origin = useSession((s) => s.httpOrigin);
-  return absoluteUrl(origin, att.url);
+  const limit = useSession((s) => s.server?.upload_limit ?? 0);
+  const [loaded, setLoaded] = useState<{ key: string; url: string }>();
+  const key = `${origin}:${att.url}:${att.size}:${limit}:${att.mime}`;
+  useEffect(() => {
+    const abort = new AbortController();
+    let url: string | undefined;
+    void fetchFileBytes(att.url, { origin, size: att.size, uploadLimit: limit, signal: abort.signal }).then((bytes) => {
+      if (abort.signal.aborted) return;
+      url = URL.createObjectURL(new Blob([bytes], { type: att.mime }));
+      setLoaded({ key, url });
+    }).catch((e) => { if (!abort.signal.aborted) console.warn("Attachment rejected:", e); });
+    return () => { abort.abort(); if (url) URL.revokeObjectURL(url); };
+  }, [key, origin, limit, att.url, att.size, att.mime]);
+  return loaded?.key === key ? loaded.url : undefined;
 }
 
-function useSave(att: Pick<Attachment, "url" | "name">) {
+function useSave(att: Attachment) {
   const t = useT();
   const [busy, setBusy] = useState(false);
+  const abort = useRef<AbortController | null>(null);
+  useEffect(() => () => abort.current?.abort(), []);
   const run = async () => {
+    abort.current?.abort();
+    const request = new AbortController();
+    abort.current = request;
     setBusy(true);
     try {
-      const ok = await saveFile(controller.attachmentUrl(att.url), att.name);
-      if (ok && isDesktop()) useUi.getState().toast("success", t("file.saved", { name: att.name }));
+      const s = useSession.getState();
+      const ok = await saveFile(att.url, att.name, { origin: s.httpOrigin, size: att.size, uploadLimit: s.server?.upload_limit ?? 0, signal: request.signal });
+      if (ok && isDesktop() && !request.signal.aborted) useUi.getState().toast("success", t("file.saved", { name: att.name }));
     } catch (e) {
-      useUi.getState().toast("error", t("file.saveFailed", { reason: e instanceof Error ? e.message : String(e) }));
+      if (!request.signal.aborted) useUi.getState().toast("error", t("file.saveFailed", { reason: e instanceof Error ? e.message : String(e) }));
     }
-    setBusy(false);
+    if (!request.signal.aborted) setBusy(false);
   };
   return { busy, run };
 }
@@ -64,8 +81,9 @@ function ImageAttachment({ att }: { att: Attachment }) {
   return (
     <button
       type="button"
+      disabled={!url}
       aria-label={t("file.open", { name: att.name })}
-      onClick={() => useUi.getState().openDialog({ kind: "lightbox", url, name: att.name })}
+      onClick={() => useUi.getState().openDialog({ kind: "lightbox", attachment: att })}
       // The box is sized up front from the server's dimensions, so loading does not shift the chat.
       style={box ? { width: box.width, height: box.height } : { maxWidth: MAX_W, maxHeight: MAX_H }}
       className="block max-w-full cursor-zoom-in overflow-hidden rounded-lg bg-side shadow-[0_0_0_1px_var(--line)]"
@@ -166,10 +184,12 @@ export function AttachmentList({ attachments }: { attachments: Attachment[] }) {
   );
 }
 
-export function Lightbox({ url, name }: { url: string; name: string }) {
+export function Lightbox({ attachment }: { attachment: Attachment }) {
+  const url = useAttachmentUrl(attachment);
+  const name = attachment.name;
   const t = useT();
   const close = useUi((s) => s.closeDialog);
-  const { busy, run } = useSave({ url: url, name });
+  const { busy, run } = useSave(attachment);
   return (
     <DialogPrimitive.Root open onOpenChange={(o) => !o && close()}>
       <DialogPrimitive.Portal>

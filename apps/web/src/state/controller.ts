@@ -13,7 +13,7 @@ import { absoluteUrl, httpOriginFromWsUrl, parseServerAddress, parseTeamSpeakAdd
 import { memberName } from "../lib/member-name";
 import { checkUpload } from "../lib/files";
 import { notificationBody, notifyReason } from "../lib/notify-rules";
-import { uploadFromApp } from "../platform/download";
+import { setConnectedServer, FILE_TIMEOUT_MS, uploadFromApp } from "../platform/download";
 import { notify } from "../platform/notify";
 import type { BanCreate } from "../proto/BanCreate";
 import type { ChatMessage } from "../proto/ChatMessage";
@@ -379,6 +379,7 @@ class Controller {
       this.entered.clear();
       this.historyRequested.clear();
       this.sentRead.clear();
+      void setConnectedServer(useSession.getState().kind === "vc" ? useSession.getState().httpOrigin : null, welcome.server.upload_limit).catch((e) => console.warn("Native file origin:", e));
       session.dispatch({ type: "welcome", welcome, resync, now: Date.now() });
       const myCh = myChannelId(useSession.getState());
       const v = useVoice.getState();
@@ -416,6 +417,7 @@ class Controller {
           session.dispatch({ type: "phase", phase: "online" });
           break;
         case "reconnecting":
+          void setConnectedServer(null);
           // A new session starts outside voice: remember where to go back to.
           this.rejoin ??= useSession.getState().kind === "vc" ? myChannelId(useSession.getState()) : null;
           session.dispatch({ type: "phase", phase: "reconnecting" });
@@ -443,6 +445,7 @@ class Controller {
   }
 
   private async teardown(): Promise<void> {
+    await setConnectedServer(null);
     if (this.voiceRetry) clearTimeout(this.voiceRetry);
     this.voiceRetry = null;
     if (this.readTimer) clearTimeout(this.readTimer);
@@ -885,14 +888,14 @@ class Controller {
       if (e instanceof RequestError && (e.code === "too_large" || e.code === "forbidden")) throw new UploadError(e.code === "too_large" ? "too_large" : "forbidden");
       throw new UploadError("network");
     }
-    const url = absoluteUrl(s.httpOrigin, reserved.upload_url);
+    const url = absoluteUrl(s.httpOrigin, reserved.upload_url, "PUT");
     if (isDesktop()) {
       // The desktop app sends it itself (no CORS from the app's origin); no byte-level progress there.
       if (opts.signal?.aborted) throw new UploadError("aborted");
       opts.onProgress?.(0.5);
       let status: number;
       try {
-        status = await uploadFromApp(url, file);
+        status = await uploadFromApp(reserved.upload_url, file, s.server?.upload_limit ?? 0);
       } catch {
         throw new UploadError("network");
       }
@@ -901,21 +904,14 @@ class Controller {
       opts.onProgress?.(1);
       return reserved.file;
     }
-    await new Promise<void>((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      const abort = () => xhr.abort();
-      opts.signal?.addEventListener("abort", abort, { once: true });
-      xhr.open("PUT", url);
-      xhr.upload.onprogress = (e) => e.lengthComputable && opts.onProgress?.(e.loaded / e.total);
-      xhr.onload = () => {
-        opts.signal?.removeEventListener("abort", abort);
-        if (xhr.status >= 200 && xhr.status < 300) resolve();
-        else reject(new UploadError(xhr.status === 413 ? "too_large" : xhr.status === 403 ? "forbidden" : "network"));
-      };
-      xhr.onerror = () => reject(new UploadError("network"));
-      xhr.onabort = () => reject(new UploadError("aborted"));
-      xhr.send(file);
-    });
+    try {
+      const signal = AbortSignal.any([AbortSignal.timeout(FILE_TIMEOUT_MS), ...(opts.signal ? [opts.signal] : [])]);
+      const response = await fetch(url, { method: "PUT", body: file, redirect: "error", credentials: "omit", signal });
+      if (!response.ok) throw new UploadError(response.status === 413 ? "too_large" : response.status === 403 ? "forbidden" : "network");
+    } catch (e) {
+      if (e instanceof UploadError) throw e;
+      throw new UploadError(opts.signal?.aborted ? "aborted" : "network");
+    }
     opts.onProgress?.(1);
     return reserved.file;
   }

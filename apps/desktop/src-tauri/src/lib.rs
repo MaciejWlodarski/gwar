@@ -85,6 +85,7 @@ pub fn run() {
         .manage(voice::Voice::default())
         .manage(shortcuts::Shortcuts::default())
         .manage(ts::Ts::default())
+        .manage(files::Files::default())
         .manage(tray::CloseToTray(AtomicBool::new(true)))
         .setup(|app| {
             tray::install(app.handle())?;
@@ -115,7 +116,10 @@ pub fn run() {
             voice::mic_test_start,
             voice::mic_test_stop,
             voice::open_mic_privacy_settings,
-            files::save_url_as,
+            files::files_set_server,
+            files::files_cancel,
+            files::fetch_file,
+            files::save_file_as,
             files::upload_put,
             shortcuts::set_global_shortcut,
             ts::ts_connect,

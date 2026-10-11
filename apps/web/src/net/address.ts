@@ -187,9 +187,30 @@ export function httpOriginFromWsUrl(wsUrl: string): string | null {
   }
 }
 
-/** Joins a server-relative path (`/files/...`) to the server's HTTP origin. */
-export function absoluteUrl(origin: string | null, path: string): string {
-  if (/^https?:\/\//i.test(path)) return path;
-  if (!origin) return path;
-  return origin.replace(/\/+$/, "") + (path.startsWith("/") ? path : `/${path}`);
+export type FileMethod = "GET" | "PUT";
+
+/** Only the two file routes. Decode before checking, never normalize hostile paths. */
+export function filePath(path: string, method: FileMethod = "GET"): string {
+  if (path.length > 2048 || /[\\\s#]/.test(path)) throw new Error("Invalid file path");
+  let decoded: string;
+  try { decoded = decodeURIComponent(path); } catch { throw new Error("Invalid file path"); }
+  if (/[\\\x00-\x1f\x7f%]/.test(decoded) || decoded.includes("..")) throw new Error("Invalid file path");
+  const valid = method === "GET"
+    ? /^\/files\/[A-Za-z0-9_-]{1,64}\/[^/?#]+$/.test(decoded)
+    : /^\/api\/files\/[A-Za-z0-9_-]{1,64}\?token=[A-Za-z0-9_-]{1,128}$/.test(decoded);
+  if (!valid) throw new Error("Invalid file path");
+  return path;
+}
+
+/** Resolves a file path against the locally selected server origin. */
+export function absoluteUrl(origin: string | null, path: string, method: FileMethod = "GET"): string {
+  filePath(path, method);
+  if (!origin) throw new Error("No connected server");
+  const base = new URL(origin);
+  if (!["http:", "https:"].includes(base.protocol) || base.username || base.password || base.pathname !== "/" || base.search || base.hash) {
+    throw new Error("Invalid server origin");
+  }
+  const url = new URL(path, base);
+  if (url.origin !== base.origin) throw new Error("Invalid file origin");
+  return url.href;
 }

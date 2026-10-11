@@ -13,9 +13,9 @@ const html = (list: Attachment[]) =>
   );
 
 describe("AttachmentList", () => {
-  it("shows images inline, sized up front (no server origin known in this render, so the path stays relative)", () => {
+  it("sizes images up front without fetching until mounted", () => {
     const out = html([att({ name: "cat.png", mime: "image/png", url: "/files/f1/cat.png", width: 800, height: 600 })]);
-    expect(out).toContain('src="/files/f1/cat.png"');
+    expect(out).not.toContain('src="/files/');
     expect(out).toContain("width:400px;height:300px");
   });
 
@@ -23,7 +23,7 @@ describe("AttachmentList", () => {
     const video = html([att({ name: "clip.mp4", mime: "video/mp4", url: "/files/f2/clip.mp4", width: 1280, height: 720 })]);
     expect(video).toContain("<video");
     expect(video).toContain('preload="metadata"');
-    expect(video).toContain('src="/files/f2/clip.mp4"');
+    expect(video).not.toContain('src="/files/');
     expect(video).toContain("Download");
     const audio = html([att({ name: "song.mp3", mime: "audio/mpeg", url: "/files/f3/song.mp3" })]);
     expect(audio).toContain("<audio");

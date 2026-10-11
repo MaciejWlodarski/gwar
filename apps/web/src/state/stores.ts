@@ -1,3 +1,4 @@
+import type { Attachment } from "../proto/Attachment";
 import { create } from "zustand";
 import type { Key } from "../i18n";
 import type { TsFound } from "../connect/teamspeak";
@@ -93,7 +94,7 @@ export type DialogState =
   | { kind: "memberProfile"; uid: string; fallback: string }
   | { kind: "ban"; person: PersonRef; back?: ServerSettingsTab }
   | { kind: "removeMember"; person: PersonRef; back?: ServerSettingsTab }
-  | { kind: "lightbox"; url: string; name: string }
+  | { kind: "lightbox"; attachment: Attachment }
   | { kind: "redeem" }
   | { kind: "createToken" }
   | { kind: "confirm"; title: string; memberTitle?: { uid: string; fallback: string; key: Key }; body: string; confirmLabel: string; danger?: boolean; onConfirm: () => void }

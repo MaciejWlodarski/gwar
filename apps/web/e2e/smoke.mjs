@@ -29,7 +29,7 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import net from "node:net";
-import { existsSync, mkdirSync, mkdtempSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import zlib from "node:zlib";
@@ -95,7 +95,7 @@ async function ensureServer(connectUrl) {
   }
   const dataDir = mkdtempSync(path.join(tmpdir(), "vc-e2e-"));
   const bin = process.env.VC_SERVER_BIN ?? path.join(repoRoot, "target/debug/vc-server");
-  const args = ["--data-dir", dataDir, "--http", SERVER, "--media", SERVER, "--public-ip", SERVER.split(":")[0], "--public-host", CLIENT_ADDR, "--connect-url", connectUrl];
+  const args = ["--data-dir", dataDir, "--http", SERVER, "--media", SERVER, "--public-ip", SERVER.split(":")[0], "--public-host", CLIENT_ADDR, "--web-origin", new URL(WEB_URL).origin, "--connect-url", connectUrl];
   const child = existsSync(bin)
     ? spawn(bin, args, { cwd: repoRoot })
     : spawn("cargo", ["run", "-q", "-p", "vc-server", "--", ...args], { cwd: repoRoot });
@@ -994,6 +994,10 @@ async function main() {
     const r = await fetch(`http://${SERVER}${att.url}`);
     if (!/^attachment/.test(r.headers.get("content-disposition") ?? "")) throw new Error("text file is not an attachment");
     if ((await r.text()) !== `notes ${rid}\n`) throw new Error("file content differs");
+    const download = b.waitForEvent("download");
+    await b.locator('[data-attachment="file"]').filter({ hasText: "notes.txt" }).getByRole("button", { name: "Download notes.txt" }).click();
+    const saved = await download;
+    if (saved.suggestedFilename() !== "notes.txt" || readFileSync(await saved.path(), "utf8") !== `notes ${rid}\n`) throw new Error("bounded download differs");
     // Over the limit: refused before anything is sent to the server.
     await a.locator("input[type=file]").setInputFiles({ name: "huge.bin", mimeType: "application/octet-stream", buffer: Buffer.alloc(26 * 1024 * 1024) });
     await a.getByText(/huge\.bin: That file is too large\. The limit is 25 MB\./).waitFor();

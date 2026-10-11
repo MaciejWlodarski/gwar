@@ -46,7 +46,7 @@ export function Dialogs() {
     case "removeMember":
       return <RemoveMemberDialog person={dialog.person} back={dialog.back} />;
     case "lightbox":
-      return <Lightbox url={dialog.url} name={dialog.name} />;
+      return <Lightbox attachment={dialog.attachment} />;
     case "redeem":
       return <RedeemDialog />;
     case "createToken":
