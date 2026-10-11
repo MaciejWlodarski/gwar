@@ -26,7 +26,7 @@ describe("quiet localized message verification", () => {
   afterEach(async () => {
     await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals();
   });
-  const show = async (verification: MessageVerification, options: { first?: boolean; text?: string; removed?: boolean } = {}) => {
+  const show = async (verification: MessageVerification | undefined, options: { first?: boolean; text?: string; removed?: boolean } = {}) => {
     const row: Extract<Row, { type: "msg" }> = { type: "msg", key: "m1", first: options.first ?? true,
       item: { kind: "msg", key: "m1", at: msg.sent_at, msg: { ...msg, text: options.text ?? msg.text }, removed: options.removed } };
     await act(async () => root.render(<TooltipProvider><MessageRow row={row} mine={false} meUid="bob" lang="en" compact={false} canEdit={false} canDelete={false} editing={false} verification={verification} /></TooltipProvider>));
@@ -71,9 +71,22 @@ describe("quiet localized message verification", () => {
     expect(badge.textContent).toBe("TS"); expect(badge.getAttribute("aria-label")).toContain("TeamSpeak messages are unsigned");
     expect(container.querySelector('[aria-label^="Gwar Connect account"]')).toBeNull();
   });
-  it("hides a verified author deletion even when authorization is historically qualified", async () => {
-    await show({ ...valid, continuity: "unproven", authorization: ["certificate-expired"] }, { text: DELETION_TEXT });
+  it("hides a fully verified author deletion", async () => {
+    await show(valid, { text: DELETION_TEXT });
     expect(container.querySelector("[data-message]")).toBeNull(); expect(container.textContent).toBe("");
+  });
+  it("keeps a qualified author deletion as an inspectable tombstone", async () => {
+    await show({ ...valid, authorization: ["device-revoked"] }, { text: DELETION_TEXT });
+    expect(container.querySelector('[data-testid="message-author-deleted"]')?.textContent).toBe("Deleted by the author");
+    expect(container.querySelector('[data-testid="message-verification-qualified"]')?.getAttribute("aria-label")).toContain("device revoked");
+    expect(container.textContent).not.toContain("Unverified deletion request");
+  });
+  it("shows a message as pending until its signature is checked", async () => {
+    await show(undefined);
+    expect(container.querySelector('[data-testid="message-verification-pending"]')?.getAttribute("aria-label")).toBe("Checking the signature…");
+    expect(container.querySelector("[data-message]")?.getAttribute("data-message-verification")).toBe("pending");
+    expect(container.querySelector("[data-mention]")).toBeNull();
+    expect(container.querySelector(".text-muted")?.textContent).toContain("hello");
   });
   it("keeps a forged deletion visible as invalid", async () => {
     await show({ ...valid, status: "invalid" }, { text: DELETION_TEXT });

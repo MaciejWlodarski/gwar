@@ -1,4 +1,4 @@
-import { History, ShieldX, TriangleAlert } from "lucide-react";
+import { History, Loader2, ShieldX, TriangleAlert } from "lucide-react";
 import { useT, type TFn } from "../i18n";
 import { fullyVerified, type MessageVerification } from "../net/message-signature";
 import { TeamSpeakBadge } from "./badges";
@@ -11,6 +11,19 @@ export function verificationExplanation(v: MessageVerification, t: TFn): string 
   const notes = v.authorization.map((a) => t(a === "device-revoked" ? "chat.deviceRevoked" : a === "certificate-expired" ? "chat.certificateExpired" : "chat.revocationsStale"));
   if (v.continuity !== "proven") notes.push(t(v.continuity === "storage-unavailable" ? "chat.checkpointsUnavailable" : "chat.continuityUnproven"));
   return [t("chat.signatureValid"), ...notes].join("; ");
+}
+
+/** Until its signature is checked a message is visibly pending, so quiet always means verified. */
+export function MessageVerificationPending() {
+  const t = useT();
+  const label = t("chat.verifying");
+  return (
+    <Tooltip label={label}>
+      <span tabIndex={0} aria-label={label} data-testid="message-verification-pending" className="inline-flex cursor-default items-center align-middle text-subtle">
+        <Loader2 aria-hidden className="size-3.5 animate-spin" />
+      </span>
+    </Tooltip>
+  );
 }
 
 /** Positive verification stays quiet; historical qualifications stay calm. */

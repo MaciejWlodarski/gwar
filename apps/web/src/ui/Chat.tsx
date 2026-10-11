@@ -1,5 +1,5 @@
 import { MessageVerificationCache } from "../net/message-verification-cache";
-import { MessageVerificationIndicator } from "./MessageVerification";
+import { MessageVerificationIndicator, MessageVerificationPending } from "./MessageVerification";
 import { messageFingerprint, fullyVerified, DELETION_TEXT, type MessageVerification } from "../net/message-signature";
 import { AlertCircle, ArrowDown, Check, Hash, Loader2, Lock, Menu, Megaphone, MessageSquare, Paperclip, Pencil, RotateCw, Send, Trash2, Users, X } from "lucide-react";
 import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type KeyboardEvent, type MouseEvent } from "react";
@@ -124,7 +124,7 @@ export const MessageRow = memo(function MessageRow({
   const signedAt = msg.signature?.created_at;
   const at = signedAt != null && Number.isFinite(new Date(signedAt).getTime()) ? signedAt : Number.isFinite(new Date(row.item.at).getTime()) ? row.item.at : 0;
   const editedAt = msg.signature && msg.signature.revision > 0 ? msg.signature.signed_at : undefined;
-  const warning = verification && !fullyVerified(verification) && (row.first || verification.status !== "unsigned-ts") ? <MessageVerificationIndicator verification={verification} showAuthor={row.first} /> : null;
+  const warning = !verification ? <MessageVerificationPending /> : !fullyVerified(verification) && (row.first || verification.status !== "unsigned-ts") ? <MessageVerificationIndicator verification={verification} showAuthor={row.first} /> : null;
   const time = formatTime(at, lang);
   const full = new Date(at).toLocaleString(lang);
   const color = useUidColor(msg.author_uid);
@@ -151,7 +151,8 @@ export const MessageRow = memo(function MessageRow({
     });
   };
 
-  if (msg.text === DELETION_TEXT && verification?.status === "verified") return null;
+  // Only a fully verified deletion disappears; a qualified one (e.g. from a revoked device) stays inspectable.
+  if (msg.text === DELETION_TEXT && verification && fullyVerified(verification)) return null;
 
   return (
     <div
@@ -197,8 +198,8 @@ export const MessageRow = memo(function MessageRow({
           <MessageEditor msg={msg} />
         ) : (
           <>
-            {row.item.removed ? <span data-testid="message-server-removed" className="text-xs text-subtle">{t("chat.serverRemoved")}</span> : msg.text === DELETION_TEXT ? <span className="text-xs text-danger">{t("chat.unverifiedDeletion")}</span> : msg.text && (
-              <div className="text-sm leading-[1.5] break-words whitespace-pre-wrap text-fg">
+            {row.item.removed ? <span data-testid="message-server-removed" className="text-xs text-subtle">{t("chat.serverRemoved")}</span> : msg.text === DELETION_TEXT ? verification?.status === "verified" ? <span data-testid="message-author-deleted" className="text-xs text-subtle">{t("chat.authorDeleted")}</span> : <span className="text-xs text-danger">{t("chat.unverifiedDeletion")}</span> : msg.text && (
+              <div className={cn("text-sm leading-[1.5] break-words whitespace-pre-wrap", verification ? "text-fg" : "text-muted")}>
                 <RichText msg={mentionsTrusted ? msg : { ...msg, mentions: [] }} meUid={mentionsTrusted ? meUid : undefined} />
                 {editedAt != null && (
                   <Tooltip label={t("chat.editedAt", { when: new Date(editedAt).toLocaleString(lang) })}>
@@ -349,6 +350,7 @@ function MessageList({ threadKey }: { threadKey: ThreadKey }) {
   const [verified, setVerified] = useState<Map<number, { fingerprint: string; state: MessageVerification }>>(new Map());
   const [signingUid, setSigningUid] = useState<string | undefined>();
   const verifier = useMemo(() => new MessageVerificationCache(), [serverKey, key]);
+  useEffect(() => setVerified(new Map()), [verifier]);
   const authorizationRefresh = useRef({ verifier, tick: 0, work: Promise.resolve() });
   const targetFor = (msg: ChatMessage) => messageTarget(key, msg.author_uid, signingUid);
   useEffect(() => {
@@ -358,19 +360,24 @@ function MessageList({ threadKey }: { threadKey: ThreadKey }) {
         authorizationRefresh.current = { verifier, tick: authTick, work: authTick ? verifier.refresh() : Promise.resolve() };
       }
       await authorizationRefresh.current.work;
-      const entries = await Promise.all((thread?.items ?? []).filter((i) => i.kind === "msg").map(async (i) => {
+      if (active) setSigningUid(uid);
+      // Each row shows its result as soon as it is known; until then it is visibly pending.
+      await Promise.all((thread?.items ?? []).filter((i) => i.kind === "msg").map(async (i) => {
         const target = messageTarget(key, i.msg.author_uid, uid);
         const ctx = { serverKey, target };
-        return [i.msg.id, { fingerprint: messageFingerprint(i.msg, ctx), state: await verifier.verify(i.msg, ctx) }] as const;
+        const entry = { fingerprint: messageFingerprint(i.msg, ctx), state: await verifier.verify(i.msg, ctx) };
+        if (active) setVerified((prev) => {
+          const old = prev.get(i.msg.id);
+          return old?.fingerprint === entry.fingerprint && old.state === entry.state ? prev : new Map(prev).set(i.msg.id, entry);
+        });
       }));
-      if (active) { setSigningUid(uid); setVerified(new Map(entries)); }
     });
     return () => { active = false; };
   }, [thread?.items, serverKey, key, mineUid, verifier, authTick]);
   const rows = useMemo(() => buildRows((thread?.items ?? []).filter((i) => {
     if (i.kind !== "msg" || i.msg.text !== DELETION_TEXT) return true;
     const entry = verified.get(i.msg.id);
-    return entry?.fingerprint !== messageFingerprint(i.msg, { serverKey, target: targetFor(i.msg) }) || entry.state.status !== "verified";
+    return entry?.fingerprint !== messageFingerprint(i.msg, { serverKey, target: targetFor(i.msg) }) || !fullyVerified(entry.state);
   })), [thread?.items, verified, serverKey, key, signingUid]);
   const ref = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
