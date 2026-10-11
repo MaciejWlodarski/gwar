@@ -5,7 +5,7 @@
  * device keeps is a {@link ConnectRecord}: its own key and certificate, and
  * the vault key derived from the account key (it cannot sign anything).
  * Every flow that decrypts the account key refreshes that vault key and
- * renews the certificates of all the account's active devices.
+ * renews only this device's certificate.
  */
 import { decodeBase64Url, encodeBase64Url } from "../net/base64url";
 import type { ConnectRecord, ConnectStore } from "../net/identity";
@@ -61,54 +61,20 @@ const certificateOf = (account: string, cert: Awaited<ReturnType<typeof certifyD
   signature: cert.signature,
 });
 
-/** The service takes at most this many certificates in one renewal. */
-const MAX_RENEWALS = 100;
-
-/**
- * New certificates for every active device of the account, in one call. Never
- * fails the flow it belongs to: whatever goes wrong is logged and the old
- * certificates stay valid. Returns this device's new certificate if it was
- * made. `fresh` says this device was certified a moment ago, so it is left out.
- */
-async function renewDevices(
-  account: KeyPairJwk,
-  token: string,
-  deps: FlowDeps,
-  self: { deviceKey: string; fresh?: boolean },
-  known?: DeviceInfo[],
-): Promise<Certificate | undefined> {
-  try {
-    const devices = known ?? (await deps.api.devices(token));
-    const keys = devices
-      .filter((d) => d.revoked_at === null && !(self.fresh && d.device_key === self.deviceKey))
-      .map((d) => d.device_key)
-      // This device first, so a very long list can never leave it out.
-      .sort((a, b) => Number(b === self.deviceKey) - Number(a === self.deviceKey))
-      .slice(0, MAX_RENEWALS);
-    if (keys.length === 0) return undefined;
-    const now = Date.now();
-    const certificates = await Promise.all(keys.map((key) => certifyDevice(account, key, now)));
-    await deps.api.renewDevices(token, certificates);
-    const mine = certificates.find((c) => c.device_key === self.deviceKey);
-    return mine && certificateOf(account.publicKey, mine);
-  } catch (e) {
-    console.warn("could not renew the devices' certificates", e);
-    return undefined;
-  }
-}
-
-/**
- * Everything a flow gets out of holding the account key, in one place so that
- * none misses a part: the vault key, and fresh certificates for all the
- * account's active devices (including this one, unless it is `fresh`).
- */
+/** Renew only a key whose private half is held on this device. */
 async function withAccountKey(
   account: KeyPairJwk,
   token: string,
   deps: FlowDeps,
-  self: { deviceKey: string; fresh?: boolean },
-): Promise<{ vaultKey: string; certificate?: Certificate }> {
-  return { vaultKey: await vaultKeyOf(account), certificate: await renewDevices(account, token, deps, self) };
+  self: ConnectRecord,
+): Promise<{ vaultKey: string; certificate: Certificate }> {
+  const device = await keyFromSeed(seedOfJwk(self.deviceJwk));
+  if (device.publicKey !== self.certificate.device_key || self.accountKey !== account.publicKey) {
+    throw new ConnectApiError("server", "the local device key does not match the account");
+  }
+  const cert = await certifyDevice(account, device.publicKey);
+  await deps.api.addDevice(token, certBody(cert, self.deviceName));
+  return { vaultKey: await vaultKeyOf(account), certificate: certificateOf(account.publicKey, cert) };
 }
 
 function recordOf(
@@ -249,12 +215,12 @@ export async function signIn(p: { handle: string; password: string }, deps: Flow
   return enroll(handle, token, account, deps);
 }
 
-/** Certifies a fresh device key for this device and registers it; the other devices are renewed along the way. */
+/** Certifies a fresh device key for this device and registers it. */
 async function enroll(handle: string, token: string, account: KeyPairJwk, deps: FlowDeps): Promise<ConnectRecord> {
   const device = await generateKeyPair();
   const cert = await certifyDevice(account, device.publicKey);
   await deps.api.addDevice(token, certBody(cert, deps.deviceName));
-  const { vaultKey } = await withAccountKey(account, token, deps, { deviceKey: device.publicKey, fresh: true });
+  const vaultKey = await vaultKeyOf(account);
   return recordOf(handle, account.publicKey, device, certificateOf(account.publicKey, cert), deps.deviceName, token, vaultKey);
 }
 
@@ -297,30 +263,20 @@ export async function changePassword(
 ): Promise<ConnectRecord> {
   const { token, account } = await unlock(deps.api, record.handle, p.password);
   await setPassword(deps.api, token, account, p.newPassword);
-  return saveUnlocked(record, token, await withAccountKey(account, token, deps, { deviceKey: record.certificate.device_key }), deps);
+  return saveUnlocked(record, token, await withAccountKey(account, token, deps, record), deps);
 }
 
 /** Revokes another device of this account; needs the password to sign with the account key. */
 export async function revokeDevice(record: ConnectRecord, deviceKey: string, password: string, deps: FlowDeps): Promise<ConnectRecord> {
   const { token, account } = await unlock(deps.api, record.handle, password);
   await deps.api.revokeDevice(token, await signRevocation(account, deviceKey));
-  // The list is read after the revocation, so the revoked device is not renewed.
-  return saveUnlocked(record, token, await withAccountKey(account, token, deps, { deviceKey: record.certificate.device_key }), deps);
+  return saveUnlocked(record, token, await withAccountKey(account, token, deps, record), deps);
 }
 
-/**
- * Issues new certificates (they last a year) for every active device of the
- * account, this one included. Unlike the other flows this one is asked for, so
- * it fails if this device's own certificate could not be renewed.
- */
+/** Renews only this device's certificate. */
 export async function renewCertificate(record: ConnectRecord, password: string, deps: FlowDeps): Promise<ConnectRecord> {
   const { token, account } = await unlock(deps.api, record.handle, password);
-  const opened = await withAccountKey(account, token, deps, { deviceKey: record.certificate.device_key });
-  // Not listed (or the renewal failed): certify this device alone. That fails with "revoked" for a revoked one.
-  // Registering also ties the new session to this device, so revoking the device ends it.
-  const cert = opened.certificate ?? certificateOf(account.publicKey, await certifyDevice(account, record.certificate.device_key));
-  await deps.api.addDevice(token, certBody(cert, record.deviceName));
-  return saveUnlocked(record, token, { ...opened, certificate: cert }, deps);
+  return saveUnlocked(record, token, await withAccountKey(account, token, deps, record), deps);
 }
 
 /**
@@ -329,14 +285,14 @@ export async function renewCertificate(record: ConnectRecord, password: string, 
  */
 export async function unlockVault(record: ConnectRecord, password: string, deps: FlowDeps): Promise<ConnectRecord> {
   const { token, account } = await unlock(deps.api, record.handle, password);
-  return saveUnlocked(record, token, await withAccountKey(account, token, deps, { deviceKey: record.certificate.device_key }), deps);
+  return saveUnlocked(record, token, await withAccountKey(account, token, deps, record), deps);
 }
 
 export type PickUp = "updated" | "current" | "unlisted" | "revoked" | "invalid";
 
 /**
- * At start: this device's newest certificate may have been issued by another
- * device (it renews everyone's). Adopts it if it is for the same account and
+ * At start: pick up this device's own previously saved renewal. Adopts it
+ * if it is for the same account and
  * device, expires later than ours and is signed by the account key; the
  * signature is checked here, so Connect cannot hand out anything the account
  * key did not sign. Throws on network and session errors; the caller ignores them.

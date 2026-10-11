@@ -28,6 +28,22 @@ export interface Kdf {
 
 /** Parameters for new accounts and new passwords (docs/connect.md). */
 export const KDF_PARAMS = { m: 65_536, t: 3, p: 1 } as const;
+/** The sole password profile: Argon2id v=19, 64 bytes. */
+export const KDF_PROFILE = { algorithm: "argon2id", version: 19, length: 64, ...KDF_PARAMS } as const;
+
+export function checkKdf(kdf: Kdf): void {
+  let salt: Uint8Array;
+  try {
+    if (!kdf || Object.keys(kdf).sort().join(",") !== "m,p,salt,t" || typeof kdf.salt !== "string" || !/^[A-Za-z0-9_-]+$/.test(kdf.salt)) throw new Error();
+    salt = decodeBase64Url(kdf.salt);
+    if (encodeBase64Url(salt) !== kdf.salt) throw new Error();
+  } catch {
+    throw new Error("Unsupported password key derivation profile");
+  }
+  if (kdf.m !== KDF_PARAMS.m || kdf.t !== KDF_PARAMS.t || kdf.p !== KDF_PARAMS.p || salt.length < 16 || salt.length > 64) {
+    throw new Error("Unsupported password key derivation profile");
+  }
+}
 /** Device certificates are valid for at most 400 days; we issue 365. */
 export const CERTIFICATE_DAYS = 365;
 /** What servers accept at most. */
@@ -55,6 +71,7 @@ export function normalizePassword(password: string): string {
 
 /** `Argon2id(password, salt, m, t, p, 64 bytes)` = `enc_key ‖ auth_key`. */
 export async function passwordSecrets(password: string, kdf: Kdf): Promise<Secrets> {
+  checkKdf(kdf);
   const { argon2id } = await import("hash-wasm");
   const out = await argon2id({
     password: enc.encode(normalizePassword(password)),
@@ -62,7 +79,7 @@ export async function passwordSecrets(password: string, kdf: Kdf): Promise<Secre
     parallelism: kdf.p,
     iterations: kdf.t,
     memorySize: kdf.m,
-    hashLength: 64,
+    hashLength: KDF_PROFILE.length,
     outputType: "binary",
   });
   return splitSecrets(out);

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import {
   changePassword,
   createAccount,
@@ -145,99 +145,38 @@ describe("vault key", () => {
 
 /** The server's certificate for a device, by the name it registered under. */
 const serverCertificate = (service: FakeService, name: string) => service.devices.find((d) => d.name === name)!.certificate!;
-const renewedKeys = (service: FakeService, n: number) => service.renewals[n]!.certificates.map((c) => c.device_key);
-
-describe("renewing every device's certificate", () => {
-  it("renews all active devices when the account key is held, this one first, and never revoked ones or the one just certified", async () => {
+describe("renewing only the local device", () => {
+  it("never certifies an attacker key inserted in the inventory in any unlocking flow", async () => {
     const { service, deps } = setup();
-    const pw = "right password";
-    const a = (await createAccount({ handle: "kate", password: pw }, deps("A"))).record;
-    // Creating an account has nothing to renew: its only device was certified a moment ago.
-    expect(service.renewals).toHaveLength(0);
-    expect(service.requests).toEqual(["POST /register"]);
-
-    await sleep(5);
-    const b = await signIn({ handle: "kate", password: pw }, deps("B"));
-    expect(renewedKeys(service, 0)).toEqual([a.certificate.device_key]);
-    await sleep(5);
-    const c = await signIn({ handle: "kate", password: pw }, deps("C"));
-    expect(renewedKeys(service, 1).sort()).toEqual([a.certificate.device_key, b.certificate.device_key].sort());
-    expect(renewedKeys(service, 1)).not.toContain(c.certificate.device_key);
-
-    // Revoking B: the list is read after, so B is left out. A (the device doing it) goes first.
-    const bBefore = serverCertificate(service, "B");
-    const aBefore = serverCertificate(service, "A");
-    await sleep(5);
-    const next = await revokeDevice(a, b.certificate.device_key, pw, deps("A"));
-    expect(renewedKeys(service, 2)).toEqual([a.certificate.device_key, c.certificate.device_key]);
-    expect(serverCertificate(service, "B")).toEqual(bBefore);
-    expect(serverCertificate(service, "A").expires_at).toBeGreaterThan(aBefore.expires_at);
-    // This device's record carries its new certificate.
-    expect(next.certificate.expires_at).toBe(serverCertificate(service, "A").expires_at);
-    expect(next.certificate.signature).toBe(serverCertificate(service, "A").signature);
-    expect(next.certificate.device_key).toBe(a.certificate.device_key);
-  }, 90_000);
-
-  it("every other flow with the account key renews too: password change, renew, vault unlock, recovery", async () => {
-    const { service, deps, stored } = setup();
-    const created = await createAccount({ handle: "lena", password: "first password" }, deps("A"));
-    await sleep(5);
-    const b = await signIn({ handle: "lena", password: "first password" }, deps("B"));
-    service.renewals.length = 0;
-
-    await sleep(5);
-    const changed = await changePassword(created.record, { password: "first password", newPassword: "second password" }, deps("A"));
-    expect(service.renewals).toHaveLength(1);
-    expect(renewedKeys(service, 0)[0]).toBe(created.record.certificate.device_key);
-    expect(renewedKeys(service, 0)).toHaveLength(2);
-    expect(changed.certificate.expires_at).toBeGreaterThan(created.record.certificate.expires_at);
-    expect(stored()?.certificate).toEqual(changed.certificate);
-
-    await sleep(5);
-    const renewed = await renewCertificate(changed, "second password", deps("A"));
-    expect(service.renewals).toHaveLength(2);
-    expect(renewedKeys(service, 1)).toContain(b.certificate.device_key);
-    expect(renewed.certificate.expires_at).toBeGreaterThan(changed.certificate.expires_at);
-    expect(renewed.certificate.expires_at).toBe(serverCertificate(service, "A").expires_at);
-
-    await sleep(5);
-    const unlocked = await unlockVault({ ...renewed, vaultKey: undefined }, "second password", deps("A"));
-    expect(service.renewals).toHaveLength(3);
-    expect(unlocked.certificate.expires_at).toBeGreaterThan(renewed.certificate.expires_at);
-
-    // Recovery enrols a new device (left out, it is fresh) and renews the two others.
-    await sleep(5);
-    const phone = await recover({ handle: "lena", code: created.recoveryCode, newPassword: "third password" }, deps("Phone"));
-    expect(service.renewals).toHaveLength(4);
-    expect(renewedKeys(service, 3).sort()).toEqual([created.record.certificate.device_key, b.certificate.device_key].sort());
-    expect(renewedKeys(service, 3)).not.toContain(phone.certificate.device_key);
+    const created = await createAccount({ handle: "kate", password: "right password" }, deps("A"));
+    const attacker = await generateKeyPair();
+    service.devices.push({ handle: "kate", device_key: attacker.publicKey, name: "attacker", revoked_at: null, certificate: null });
+    const other = await signIn({ handle: "kate", password: "right password" }, deps("B"));
+    let own = await unlockVault(created.record, "right password", deps("A"));
+    own = await renewCertificate(own, "right password", deps("A"));
+    own = await revokeDevice(own, other.certificate.device_key, "right password", deps("A"));
+    await changePassword(own, { password: "right password", newPassword: "other password" }, deps("A"));
+    await recover({ handle: "kate", code: created.recoveryCode, newPassword: "fresh password" }, deps("C"));
+    expect(service.devices.find((d) => d.device_key === attacker.publicKey)?.certificate).toBeNull();
+    expect(service.requests).not.toContain("GET /devices");
+    expect(service.requests).not.toContain("POST /devices/renew");
   }, 120_000);
 
-  it("a renewal that fails never fails the flow", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+  it("derives the renewal public key from the locally held private key", async () => {
+    const { deps } = setup();
+    const rec = (await createAccount({ handle: "lena", password: "right password" }, deps())).record;
+    const attacker = await generateKeyPair();
+    await expect(renewCertificate({ ...rec, certificate: { ...rec.certificate, device_key: attacker.publicKey } }, "right password", deps())).rejects.toThrow("local device key");
+  }, 60_000);
+
+  it("rejects a malicious prelogin profile before sending auth_key", async () => {
     const { service, deps } = setup();
-    const pw = "right password";
-    const a = (await createAccount({ handle: "mona", password: pw }, deps("A"))).record;
-    // The renewal is refused, or the list of devices cannot be read.
-    const breaking = (broken: (path: string, method: string) => boolean) => {
-      const base = deps("B");
-      const fetchFn = (async (url: string | URL | Request, init?: RequestInit) => {
-        if (broken(String(url), init?.method ?? "GET")) return new Response(JSON.stringify({ error: "internal", message: "boom" }), { status: 500 });
-        return service.fetch(url, init);
-      }) as typeof fetch;
-      return { ...base, api: new ConnectApi("https://c", fetchFn) };
-    };
-    const b = await signIn({ handle: "mona", password: pw }, breaking((u) => u.endsWith("/devices/renew")));
-    expect(b.certificate.device_key).toBeTruthy();
-    expect(service.renewals).toHaveLength(0);
-    const c = await signIn({ handle: "mona", password: pw }, breaking((u, m) => u.endsWith("/v1/devices") && m === "GET"));
-    expect(c.vaultKey).toBe(a.vaultKey);
-    expect(service.renewals).toHaveLength(0);
-    const next = await changePassword(a, { password: pw, newPassword: "other password" }, breaking((u) => u.endsWith("/devices/renew")));
-    expect(next.certificate).toEqual(a.certificate);
-    expect(warn).toHaveBeenCalled();
-    warn.mockRestore();
-  }, 120_000);
+    await createAccount({ handle: "mona", password: "right password" }, deps());
+    service.accounts.get("mona")!.kdf = { salt: "AAAAAAAAAAAAAAAAAAAAAA", m: 19456, t: 1, p: 1 };
+    service.requests.length = 0;
+    await expect(signIn({ handle: "mona", password: "right password" }, deps())).rejects.toThrow("Unsupported password key derivation profile");
+    expect(service.requests).toEqual(["POST /prelogin"]);
+  }, 30_000);
 });
 
 describe("picking up a newer certificate at start", () => {
@@ -250,9 +189,9 @@ describe("picking up a newer certificate at start", () => {
     // Nothing newer yet.
     expect(await pickUpCertificate(a, deps("A"))).toMatchObject({ outcome: "current", record: a });
 
-    // Another device signs in and renews A.
+    // A renewal reached Connect before its local save.
     await sleep(5);
-    await signIn({ handle: "nina", password: pw }, { ...deps("B"), store: { load: async () => undefined, save: async () => undefined, clear: async () => undefined } });
+    await renewCertificate(a, pw, { ...deps("A"), store: { load: async () => undefined, save: async () => undefined, clear: async () => undefined } });
     const newest = serverCertificate(service, "A");
     expect(newest.expires_at).toBeGreaterThan(a.certificate.expires_at);
 
@@ -303,7 +242,7 @@ describe("picking up a newer certificate at start", () => {
     const pw = "right password";
     const a = (await createAccount({ handle: "quin", password: pw }, deps("A"))).record;
     await sleep(5);
-    await signIn({ handle: "quin", password: pw }, { ...deps("B"), store: { load: async () => undefined, save: async () => undefined, clear: async () => undefined } });
+    await renewCertificate(a, pw, { ...deps("A"), store: { load: async () => undefined, save: async () => undefined, clear: async () => undefined } });
     expect(serverCertificate(service, "A").expires_at).toBeGreaterThan(a.certificate.expires_at);
     // The store has no record any more (the person signed out while the request was in flight).
     expect(stored()).toBeUndefined();

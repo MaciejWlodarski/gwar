@@ -153,11 +153,6 @@ export class ConnectApi {
     await this.call("POST", "/devices", device, token);
   }
 
-  /** New certificates for devices of the account, all signed by the account key. Returns how many were stored. */
-  async renewDevices(token: string, certificates: SignedDevice[]): Promise<number> {
-    return (await this.call<{ renewed: number }>("POST", "/devices/renew", { certificates }, token)).renewed;
-  }
-
   async revokeDevice(token: string, revocation: { device_key: string; revoked_at: number; signature: string }): Promise<void> {
     await this.call("POST", "/devices/revoke", revocation, token);
   }

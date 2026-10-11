@@ -161,9 +161,9 @@ fn new_session(store: &Store, account: i64) -> anyhow::Result<String> {
 fn check_kdf(kdf: &Kdf) -> Result<(), ApiError> {
     let salt = crypto::unb64(&kdf.salt).ok_or_else(|| ApiError::bad("invalid salt"))?;
     let ok = (16..=64).contains(&salt.len())
-        && (19_456..=1_048_576).contains(&kdf.m)
-        && (1..=10).contains(&kdf.t)
-        && (1..=4).contains(&kdf.p);
+        && kdf.m == 65_536
+        && kdf.t == 3
+        && kdf.p == 1;
     if ok { Ok(()) } else { Err(ApiError::bad("unsupported key derivation parameters")) }
 }
 
@@ -401,35 +401,6 @@ pub async fn add_device(State(state): State<AppState>, headers: HeaderMap, Json(
         store.bind_session(&token_hash(token), &d.device_key)?;
     }
     Ok(Json(json!({})))
-}
-
-#[derive(Deserialize)]
-pub struct Renew {
-    certificates: Vec<DeviceCert>,
-}
-
-/// New certificates for the account's devices, made by a client that holds
-/// the account key. Each device picks its own up from `GET /v1/devices`.
-pub async fn renew_devices(State(state): State<AppState>, headers: HeaderMap, Json(r): Json<Renew>) -> Reply {
-    let account = authenticated(&state, &headers)?;
-    if r.certificates.len() > 100 {
-        return Err(ApiError::bad("too many certificates"));
-    }
-    let now = now_ms();
-    let store = state.store.lock().expect("store lock");
-    let mut renewed = 0;
-    for d in &r.certificates {
-        crypto::check_certificate(&account.account_key, &d.device_key, d.issued_at, d.expires_at, &d.signature, now)
-            .map_err(ApiError::bad)?;
-        match store.device_owner(&d.device_key)? {
-            Some((owner, None)) if owner == account.id => {
-                renewed += usize::from(store.set_certificate(&d.device_key, &certificate(d))?);
-            }
-            // Revoked or someone else's: never renewed.
-            _ => {}
-        }
-    }
-    Ok(Json(json!({"renewed": renewed})))
 }
 
 #[derive(Deserialize)]

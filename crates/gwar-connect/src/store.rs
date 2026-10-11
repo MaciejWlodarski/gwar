@@ -12,6 +12,7 @@ pub struct Store {
 
 /// Argon2id parameters a client derives its password secrets with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Kdf {
     pub salt: String,
     pub m: u32,

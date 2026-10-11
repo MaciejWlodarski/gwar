@@ -170,7 +170,7 @@ describe("passwords", () => {
   it("are NFKC-normalized", async () => {
     expect(normalizePassword("ｐａｓｓ")).toBe("pass");
     expect(normalizePassword("é")).toBe("é");
-    const kdf = { salt: b64(fill(16, 7)), m: 19_456, t: 2, p: 1 };
+    const kdf = { salt: b64(fill(16, 7)), m: 65_536, t: 3, p: 1 };
     const a = await passwordSecrets("é", kdf);
     const b = await passwordSecrets("é", kdf);
     expect(b64(a.authKey)).toBe(b64(b.authKey));
@@ -187,5 +187,15 @@ describe("passwords", () => {
     expect(passwordStrength("abcdefgh")).toBe("weak");
     expect(passwordStrength("abcdefg1")).toBe("fair");
     expect(passwordStrength("correct horse battery")).toBe("strong");
+  });
+});
+
+
+describe("password profile allowlist", () => {
+  it("rejects downgrades, resource exhaustion and alternate profiles before hashing", async () => {
+    const kdf = newKdf();
+    for (const change of [{ m: 19456 }, { m: 1048576 }, { t: 1 }, { t: 10 }, { p: 2 }, { version: 16 }, { length: 32 }, { algorithm: "argon2i" }, { salt: "AA" }, { salt: b64(fill(65, 1)) }, { salt: kdf.salt + "=" }]) {
+      await expect(passwordSecrets("secret", { ...kdf, ...change })).rejects.toThrow("Unsupported password key derivation profile");
+    }
   });
 });

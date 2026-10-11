@@ -9,8 +9,8 @@ use hkdf::Hkdf;
 use serde_json::{Value, json};
 use sha2::Sha256;
 
-const M: u32 = 19_456; // fast in tests; the protocol allows 19456..1048576
-const T: u32 = 2;
+const M: u32 = 65_536;
+const T: u32 = 3;
 
 fn b64(bytes: &[u8]) -> String {
     B64.encode(bytes)
@@ -329,51 +329,23 @@ async fn revoking_a_device_ends_its_sessions() {
 }
 
 /// A certificate for `device` lasting `days` from now.
-fn certificate_for(account: &SigningKey, device: &SigningKey, days: i64) -> Value {
-    let mut c = certificate(account, device, "");
-    let issued_at = c["issued_at"].as_i64().unwrap();
-    let expires_at = issued_at + days * 24 * 3600 * 1000;
-    let (account_key, device_key) = (b64(account.verifying_key().as_bytes()), b64(device.verifying_key().as_bytes()));
-    let statement = crypto::device_statement(&account_key, &device_key, issued_at, expires_at);
-    c["expires_at"] = json!(expires_at);
-    c["signature"] = json!(b64(&account.sign(statement.as_bytes()).to_bytes()));
-    c
-}
-
-fn expiry_of(devices: &Value, device: &SigningKey) -> i64 {
-    let key = b64(device.verifying_key().as_bytes());
-    let entry = devices["devices"].as_array().unwrap().iter().find(|d| d["device_key"] == key).unwrap();
-    entry["certificate"]["expires_at"].as_i64().unwrap()
+#[tokio::test]
+async fn bulk_renewal_is_removed() {
+    let api = Api::start().await;
+    assert_eq!(api.post("/devices/renew", None, json!({"certificates": []})).await.0, 404);
 }
 
 #[tokio::test]
-async fn one_device_renews_every_device_of_the_account() {
+async fn registration_rejects_unsupported_password_profiles() {
     let api = Api::start().await;
     let account = SigningKey::from_bytes(&rand::random());
-    let laptop = SigningKey::from_bytes(&rand::random());
-    let (_, reply) = api.post("/register", None, sign_up("fran", "pw", &account, &laptop, &rand::random())).await;
-    let laptop_token = reply["token"].as_str().unwrap().to_owned();
-    let (phone_token, _) = log_in(&api, "fran", "pw").await.unwrap();
-    let (phone, old) = (SigningKey::from_bytes(&rand::random()), SigningKey::from_bytes(&rand::random()));
-    assert_eq!(api.post("/devices", Some(&phone_token), certificate_for(&account, &phone, 30)).await.0, 200);
-    assert_eq!(api.post("/devices", Some(&laptop_token), certificate_for(&account, &old, 30)).await.0, 200);
-    assert_eq!(api.post("/devices/revoke", Some(&laptop_token), revocation(&account, &old)).await.0, 200);
-    let (_, before) = api.get("/devices", Some(&phone_token)).await;
-
-    // The laptop unlocks the account key and renews everything it lists.
-    let renewal =
-        json!({"certificates": [certificate_for(&account, &phone, 365), certificate_for(&account, &old, 365)]});
-    let (status, reply) = api.post("/devices/renew", Some(&laptop_token), renewal).await;
-    assert_eq!((status, &reply["renewed"]), (200, &json!(1)), "the revoked device is not renewed");
-
-    // The phone finds its newer certificate without the password.
-    let (_, after) = api.get("/devices", Some(&phone_token)).await;
-    assert!(expiry_of(&after, &phone) > expiry_of(&before, &phone));
-    // An older certificate never replaces a newer one, and only the account key signs them.
-    let shorter = json!({"certificates": [certificate_for(&account, &phone, 10)]});
-    assert_eq!(api.post("/devices/renew", Some(&laptop_token), shorter).await.1["renewed"], 0);
-    let forged = json!({"certificates": [certificate_for(&phone, &phone, 365)]});
-    assert_eq!(api.post("/devices/renew", Some(&phone_token), forged).await.0, 400);
+    let device = SigningKey::from_bytes(&rand::random());
+    let body = sign_up("profile", "password", &account, &device, &rand::random());
+    for (field, value) in [("m", json!(19456)), ("t", json!(1)), ("p", json!(2)), ("salt", json!(b64(&[0; 65])))] {
+        let mut bad = body.clone();
+        bad["kdf"][field] = value;
+        assert_eq!(api.post("/register", None, bad).await.0, 400);
+    }
 }
 
 #[tokio::test]

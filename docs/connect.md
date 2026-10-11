@@ -37,6 +37,12 @@ milliseconds. Strings are UTF-8; passwords are NFKC-normalized first.
 | recovery secrets | `HKDF-SHA256(ikm=code bytes, salt=account public key, info="gwar recovery v1", 64 bytes)` = `enc_key ‖ auth_key` | derived on the device |
 | vault key | `HKDF-SHA256(ikm=account private seed, salt=account public key, info="gwar vault v1", 32 bytes)` | derived when the account key is decrypted; signed-in devices keep it |
 
+The client-owned password profile is exactly Argon2id v=19, m=65536 KiB,
+t=3, p=1, output=64 bytes, with a canonical 16–64-byte salt. The algorithm,
+version and output length are implicit in `kdf`; only `{salt, m, t, p}` is
+accepted. Clients reject other profiles before deriving or sending `auth_key`.
+Connect accepts the same profile on registration and credential changes.
+
 Connect stores `Argon2id(auth_key)` (its own salt, PHC string) for the password
 and `sha256(recovery auth_key)` for the recovery code (160 bits of entropy).
 
@@ -100,12 +106,12 @@ All signatures are Ed25519 over the UTF-8 text, fields separated by `\n`:
 - **Device certificate**, by the account key:
   `gwar device v1\n{account_key}\n{device_key}\n{issued_at}\n{expires_at}`.
   Certificates last at most 400 days. Whenever a client has the account key
-  (sign-up, log-in, recovery, password change, revocation), it renews the
-  certificates of **all** the account's active devices
-  (`POST /v1/devices/renew`), and every device picks its own up from
-  `GET /v1/devices` when it starts. So a device stays valid as long as the
-  password is entered on any device of the account now and then; one that is
-  close to expiry with nothing newer asks for the password.
+  (sign-up, log-in, recovery, password change, revocation), it certifies only
+  the public key derived from the private device key it generated and holds.
+  Each device renews its own certificate after entering the password. The
+  device inventory is for inspection and revocation; its names, last-seen
+  times and completeness are unverified service claims, never instructions
+  to sign. A device close to expiry asks for the password.
 - **Revocation**, by the account key: `gwar revoke v1\n{account_key}\n{device_key}\n{revoked_at}`.
 
 ## Connect API
@@ -124,7 +130,6 @@ JSON over HTTPS under `/v1`. Authenticated calls send
 | `PUT /v1/account/password` | `{kdf, auth_key, key_blob}` → `{}` (other sessions end) |
 | `GET /v1/devices` | → `{devices: [{device_key, name, created_at, last_seen, revoked_at, certificate: {issued_at, expires_at, signature} \| null}]}` (`certificate` is the newest one Connect has) |
 | `POST /v1/devices` | `{device_key, name, issued_at, expires_at, signature}` → `{}` |
-| `POST /v1/devices/renew` | `{certificates: [{device_key, issued_at, expires_at, signature}]}` (at most 100) → `{renewed}`; each must be signed by the account key; revoked devices and certificates no newer than the stored one are skipped |
 | `POST /v1/devices/revoke` | `{device_key, revoked_at, signature}` → `{}` (that device's sessions end) |
 | `GET /v1/vault` | → `{vault, version, updated_at}` (`vault: null, version: 0` before the first write) |
 | `PUT /v1/vault` | `{vault, version}` (the version the change was based on) → `{version}`; `409 conflict` if it changed meanwhile. At most 64 KiB. |
