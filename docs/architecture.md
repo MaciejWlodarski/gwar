@@ -404,7 +404,7 @@ and identity-write access; CSP and frame validation reduce that exposure.
 | `ts_identity_list` | Low: source/default, UID and name only; no private identity text. |
 | `ts_identity_parse` | Medium: bounded parsing of caller-supplied private text; reads no stored key. |
 | `ts_identity_generate` | Medium: creates a new unstored key for explicit import/vault flows. |
-| `ts_identity_set_list` | High: replaces a bounded native list; public UID references preserve stored keys without returning them. |
+| `ts_identity_set_list` | High: replaces a bounded native list; public UID references preserve stored keys without returning them. Deleting identities from the device list, which exist nowhere else, needs a Rust-owned native confirmation. |
 | `ts_identity_detect` | High: discovers official-client private keys only after a Rust-owned native confirmation. |
 | `ts_identity_export` | High: exposes selected/list private keys, including vault seeding, only after a Rust-owned native confirmation. |
 | `tray_set_state` | Low: updates mute/deafen indicators. |

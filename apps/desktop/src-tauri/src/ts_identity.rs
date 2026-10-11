@@ -17,13 +17,18 @@
 //! - `ts_identity_generate` -> the same for a new identity, nothing is stored
 //! - `ts_identity_set_list {which, list}` replaces the `device` or `account` list with
 //!   `{default, identities: [{name, identity}]}`; null removes the account list. The device list
-//!   it replaces is kept as `.bak`.
+//!   it replaces is kept as `.bak`, and removing identities from it needs the user's consent in a
+//!   native dialog: they exist nowhere else. The account's are in the Connect vault.
 //! - `ts_identity_detect` -> `[{source, name, uid, level, identity, selected}]` from the official
 //!   TeamSpeak client on this computer. Reads files only when called, which the UI does on request.
 //!
 //! A TeamSpeak connection that is already open keeps the identity it started with.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
@@ -112,7 +117,15 @@ impl Files {
         Ok(identity)
     }
 
-    fn set_list(&self, which: &str, list: Option<ListIn>) -> Result<(), String> {
+    /// Uids a replacement of the device's list would delete from this computer.
+    fn device_removals(&self, list: &ListIn) -> Result<BTreeSet<String>, String> {
+        let current = self.list(Source::Device).map_err(err)?;
+        let next = list.clone().resolve(current.clone());
+        Ok(current.identities.into_iter().map(|e| e.uid).filter(|uid| next.find(uid).is_none()).collect())
+    }
+
+    /// `allowed`: the device identities the user agreed to delete.
+    fn set_list(&self, which: &str, list: Option<ListIn>, allowed: &BTreeSet<String>) -> Result<(), String> {
         if list.as_ref().is_some_and(|l| {
             l.identities.len() > 128
                 || l.identities.iter().any(|e| {
@@ -121,8 +134,13 @@ impl Files {
         }) {
             return Err("identity list too large".into());
         }
+        // One write at a time, so what is removed is what the user agreed to.
+        let _write = WRITE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         match (which, list) {
             ("device", Some(list)) => {
+                if !self.device_removals(&list)?.is_subset(allowed) {
+                    return Err("removing TeamSpeak identities from this device needs confirmation".into());
+                }
                 if self.device.exists() {
                     let mut backup = self.device.clone().into_os_string();
                     backup.push(".bak");
@@ -151,6 +169,8 @@ impl Files {
     }
 }
 
+static WRITE: Mutex<()> = Mutex::new(());
+
 /// The identity a TeamSpeak connection uses; see [`Files::for_connect`].
 pub fn load_for_connect(app: &AppHandle, uid: Option<&str>) -> Result<TsIdentity, String> {
     files(app)?.for_connect(uid).map_err(err)
@@ -175,7 +195,7 @@ fn list_info(source: Source, list: List) -> ListInfo {
     ListInfo { source: source.name(), default: list.default, identities }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct EntryIn {
     name: String,
     #[serde(default)]
@@ -183,7 +203,7 @@ pub struct EntryIn {
     identity: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ListIn {
     default: Option<String>,
     identities: Vec<EntryIn>,
@@ -251,7 +271,19 @@ pub async fn ts_identity_generate() -> Result<ParsedIdentity, String> {
 
 #[tauri::command]
 pub async fn ts_identity_set_list(app: AppHandle, which: String, list: Option<ListIn>) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || files(&app)?.set_list(&which, list)).await.map_err(|e| e.to_string())?
+    let mut allowed = BTreeSet::new();
+    if let ("device", Some(list)) = (which.as_str(), &list) {
+        let (app, list) = (app.clone(), list.clone());
+        allowed = tokio::task::spawn_blocking(move || files(&app)?.device_removals(&list))
+            .await
+            .map_err(|e| e.to_string())??;
+    }
+    if !allowed.is_empty() {
+        confirm(&app, "Delete TeamSpeak identities from this computer? Their private keys exist only here; the previous list is kept as a backup.").await?;
+    }
+    tokio::task::spawn_blocking(move || files(&app)?.set_list(&which, list, &allowed))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 async fn confirm(app: &AppHandle, message: &'static str) -> Result<(), String> {
@@ -396,11 +428,11 @@ mod tests {
         assert!(files.account.exists() && files.device.exists());
 
         // Signing out removes the account's list, and the old file with it, or it would come back.
-        files.set_list("account", None).unwrap();
+        files.set_list("account", None, &BTreeSet::new()).unwrap();
         assert!(!files.account.exists() && !files.account_legacy.exists());
         assert_eq!(files.active().unwrap().0, Source::Device);
         assert!(files.device_legacy.exists(), "the device's old file is left alone");
-        files.set_list("account", None).unwrap();
+        files.set_list("account", None, &BTreeSet::new()).unwrap();
     }
 
     #[test]
@@ -408,7 +440,7 @@ mod tests {
         let dir = Dir::new();
         let files = Files::in_dir(&dir.0);
         let (a, b, c) = (ts_identity::generate(), ts_identity::generate(), ts_identity::generate());
-        files.set_list("device", Some(list_in(&[("a", &a), ("b", &b)], Some(&b)))).unwrap();
+        files.set_list("device", Some(list_in(&[("a", &a), ("b", &b)], Some(&b))), &BTreeSet::new()).unwrap();
         assert_eq!(uid(&files.for_connect(None).unwrap()), uid(&b));
         assert_eq!(uid(&files.for_connect(Some(&uid(&a))).unwrap()), uid(&a));
         assert_eq!(
@@ -423,17 +455,53 @@ mod tests {
         let dir = Dir::new();
         let files = Files::in_dir(&dir.0);
         let (own, shared) = (ts_identity::generate(), ts_identity::generate());
-        files.set_list("device", Some(list_in(&[("own", &own)], None))).unwrap();
+        files.set_list("device", Some(list_in(&[("own", &own)], None)), &BTreeSet::new()).unwrap();
         assert_eq!(uid(&files.for_connect(None).unwrap()), uid(&own));
-        files.set_list("account", Some(list_in(&[("shared", &shared)], None))).unwrap();
+        files.set_list("account", Some(list_in(&[("shared", &shared)], None)), &BTreeSet::new()).unwrap();
         assert_eq!(uid(&files.for_connect(None).unwrap()), uid(&shared));
         assert_eq!(files.active().unwrap().0, Source::Account);
 
         // A signed-in device whose list was emptied makes the new identity in the account's list, not the device's.
-        files.set_list("account", Some(ListIn { default: None, identities: vec![] })).unwrap();
+        files.set_list("account", Some(ListIn { default: None, identities: vec![] }), &BTreeSet::new()).unwrap();
         let made = files.for_connect(None).unwrap();
         assert_eq!(files.list(Source::Account).unwrap().identities[0].uid, uid(&made));
         assert_eq!(files.list(Source::Device).unwrap().identities.len(), 1);
+    }
+
+    #[test]
+    fn device_identities_are_deleted_only_with_consent_for_them() {
+        let dir = Dir::new();
+        let files = Files::in_dir(&dir.0);
+        let (a, b, c) = (ts_identity::generate(), ts_identity::generate(), ts_identity::generate());
+        let none = BTreeSet::new();
+        files.set_list("device", Some(list_in(&[("a", &a), ("b", &b)], None)), &none).unwrap();
+        // Adding, renaming by native reference and reordering delete nothing.
+        let mut renamed = list_in(&[("c", &c)], None);
+        for i in [&b, &a] {
+            renamed.identities.push(EntryIn {
+                name: "renamed".into(),
+                uid: Some(uid(i)),
+                identity: format!("native:{}", uid(i)),
+            });
+        }
+        assert!(files.device_removals(&renamed).unwrap().is_empty());
+        files.set_list("device", Some(renamed), &none).unwrap();
+        assert_eq!(files.list(Source::Device).unwrap().identities.len(), 3);
+
+        let without_a = list_in(&[("b", &b), ("c", &c)], None);
+        assert_eq!(files.device_removals(&without_a).unwrap(), BTreeSet::from([uid(&a)]));
+        for allowed in [none.clone(), BTreeSet::from([uid(&b)])] {
+            assert!(files.set_list("device", Some(without_a.clone()), &allowed).is_err());
+            assert!(files.list(Source::Device).unwrap().find(&uid(&a)).is_some());
+        }
+        // A key swapped under a kept name is a deletion too.
+        let swapped = list_in(&[("a", &c), ("b", &b), ("c", &c)], None);
+        assert!(files.set_list("device", Some(swapped), &none).is_err());
+        files.set_list("device", Some(without_a), &BTreeSet::from([uid(&a)])).unwrap();
+        assert!(files.list(Source::Device).unwrap().find(&uid(&a)).is_none());
+        // The account's list mirrors the vault and needs no consent.
+        files.set_list("account", Some(list_in(&[("a", &a)], None)), &none).unwrap();
+        files.set_list("account", Some(list_in(&[], None)), &none).unwrap();
     }
 
     #[test]
@@ -441,11 +509,11 @@ mod tests {
         let dir = Dir::new();
         let files = Files::in_dir(&dir.0);
         let (a, b) = (ts_identity::generate(), ts_identity::generate());
-        files.set_list("device", Some(list_in(&[("a", &a)], None))).unwrap();
+        files.set_list("device", Some(list_in(&[("a", &a)], None)), &BTreeSet::new()).unwrap();
         assert!(!dir.0.join("teamspeak-identities.json.bak").exists());
         let mut next = list_in(&[("b", &b), ("again", &b)], Some(&a));
         next.identities.push(EntryIn { name: "junk".into(), uid: None, identity: "nope".into() });
-        files.set_list("device", Some(next)).unwrap();
+        files.set_list("device", Some(next), &BTreeSet::from([uid(&a)])).unwrap();
         assert!(dir.0.join("teamspeak-identities.json.bak").exists());
         let list = files.list(Source::Device).unwrap();
         assert_eq!(list.identities.len(), 1);
@@ -455,7 +523,7 @@ mod tests {
             Some(uid(&b).as_str()),
             "a default that is not in the list becomes the first"
         );
-        assert!(files.set_list("device", None).is_err());
-        assert!(files.set_list("elsewhere", None).is_err());
+        assert!(files.set_list("device", None, &BTreeSet::new()).is_err());
+        assert!(files.set_list("elsewhere", None, &BTreeSet::new()).is_err());
     }
 }
