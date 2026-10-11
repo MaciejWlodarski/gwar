@@ -363,6 +363,34 @@ async fn uploads_respect_the_size_limit() {
     assert_eq!(status, 413);
 }
 
+#[tokio::test]
+async fn stored_uploads_count_against_member_and_server_limits() {
+    let server = TestServer::start_with(|c| {
+        c.upload_quota = 100;
+        c.storage_limit = 250;
+    })
+    .await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let mut bob = Client::connect(&server, "bob").await;
+    let mut carol = Client::connect(&server, "carol").await;
+    let lobby = alice.default_channel();
+    let first = upload(&server, &mut alice, "a", "x", &[1; 60]).await;
+    // Alice's reserved (not yet sent) bytes count too.
+    alice.ok("file.upload", json!({"name": "b", "size": 30, "mime": "x"})).await;
+    assert_eq!(alice.fails("file.upload", json!({"name": "c", "size": 11, "mime": "x"})).await, "quota_exceeded");
+    alice.ok("file.upload", json!({"name": "c", "size": 10, "mime": "x"})).await;
+    // Alice's files do not use up Bob's quota...
+    upload(&server, &mut bob, "d", "x", &[2; 70]).await;
+    bob.ok("file.upload", json!({"name": "e", "size": 30, "mime": "x"})).await;
+    // ...but the server total is shared: 200 of 250 bytes are taken.
+    assert_eq!(carol.fails("file.upload", json!({"name": "f", "size": 51, "mime": "x"})).await, "quota_exceeded");
+    carol.ok("file.upload", json!({"name": "f", "size": 50, "mime": "x"})).await;
+    // Deleting a message frees its files.
+    let sent = alice.ok("chat.send", json!({"target": {"channel": lobby}, "text": "", "attachments": [first]})).await;
+    alice.ok("chat.edit", json!({"message": sent["id"], "text": vc_proto::DELETION_TEXT})).await;
+    alice.ok("file.upload", json!({"name": "g", "size": 60, "mime": "x"})).await;
+}
+
 fn server_limit(client: &Client) -> u64 {
     client.welcome.server.upload_limit
 }

@@ -126,6 +126,22 @@ impl Core {
         if self.uploads.values().filter(|u| u.uploader == uploader).count() >= 10 {
             return Err(err(ErrorCode::RateLimited, "too many uploads in progress"));
         }
+        // Identities are free, so a per-member quota alone cannot protect the disk: the total is capped too.
+        // Reserved uploads count as if they were already stored.
+        for (limit, who, message) in [
+            (self.upload_quota, Some(uploader.as_str()), "your upload quota is used up"),
+            (self.storage_limit, None, "the server's file storage is full"),
+        ] {
+            if limit == 0 {
+                continue;
+            }
+            let reserved: u64 =
+                self.uploads.values().filter(|u| who.is_none_or(|w| u.uploader == w)).map(|u| u.size).sum();
+            let stored = self.store.stored_bytes(who).map_err(storage_error)?;
+            if stored.saturating_add(reserved).saturating_add(size) > limit {
+                return Err(err(ErrorCode::QuotaExceeded, message));
+            }
+        }
         let id = random_id(16);
         let token = random_id(24);
         let mime = mime.chars().filter(|c| c.is_ascii_graphic()).take(100).collect();

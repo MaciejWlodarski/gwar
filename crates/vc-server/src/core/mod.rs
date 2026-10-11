@@ -190,6 +190,9 @@ pub struct CoreConfig {
     pub password: ServerPassword,
     /// Largest upload in bytes; 0 disables uploads.
     pub upload_limit: u64,
+    /// Stored bytes per member and in total; 0 means no limit.
+    pub upload_quota: u64,
+    pub storage_limit: u64,
     pub files_dir: PathBuf,
     pub connect_url: Option<String>,
     pub server_key: String,
@@ -241,6 +244,9 @@ pub struct Core {
     password: ServerPassword,
     files_dir: PathBuf,
     uploads: HashMap<String, files::PendingUpload>,
+    /// Stored bytes allowed per member and in total; 0 means no limit.
+    upload_quota: u64,
+    storage_limit: u64,
     connect: Option<crate::connect::Lookup>,
     connect_pending: HashMap<Uid, u64>,
     next_connect_lookup: u64,
@@ -403,6 +409,8 @@ impl Core {
             password: config.password,
             files_dir: config.files_dir,
             uploads: HashMap::new(),
+            upload_quota: config.upload_quota,
+            storage_limit: config.storage_limit,
             connect,
             connect_pending: HashMap::new(),
             next_connect_lookup: 0,
@@ -1647,6 +1655,8 @@ mod expiry_tests {
                 version: "test".into(),
                 password: Arc::new(ArcSwap::from_pointee(None)),
                 upload_limit: 0,
+                upload_quota: 0,
+                storage_limit: 0,
                 files_dir: PathBuf::new(),
                 connect_url: None,
                 server_key: String::new(),

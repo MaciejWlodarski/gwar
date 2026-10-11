@@ -902,6 +902,16 @@ impl Store {
         Ok(())
     }
 
+    /// Bytes of stored uploads, all or `uploader`'s.
+    pub fn stored_bytes(&self, uploader: Option<&str>) -> Result<u64> {
+        let bytes: i64 = self.db.query_row(
+            "SELECT COALESCE(SUM(size),0) FROM files WHERE ?1 IS NULL OR uploader=?1",
+            [uploader],
+            |r| r.get(0),
+        )?;
+        Ok(bytes.max(0) as u64)
+    }
+
     /// An uploaded file not yet attached to a message, if `uploader` owns it.
     pub fn pending_file(&self, id: &str, uploader: &str) -> Result<Option<Attachment>> {
         Ok(self

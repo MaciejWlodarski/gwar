@@ -549,6 +549,13 @@ describe("uploads", () => {
     expect(link.sent("file.upload")).toHaveLength(0);
   });
 
+  it("tells a full storage quota apart from a network failure", async () => {
+    connectFake(); stores.useSession.setState({ server: { ...session().server!, upload_limit: 100 } });
+    const { RequestError } = await import("../net/connection");
+    vi.spyOn(link, "request").mockRejectedValueOnce(new RequestError("quota_exceeded", "your upload quota is used up"));
+    await expect(controller.uploadFile(new File(["hello"], "a.txt"))).rejects.toMatchObject({ kind: "quota" });
+  });
+
   it("is off when the server takes no uploads, and on TeamSpeak", async () => {
     connectFake();
     expect(controller.canUpload).toBe(false);

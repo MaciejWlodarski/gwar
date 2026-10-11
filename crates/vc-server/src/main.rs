@@ -94,6 +94,12 @@ struct Cli {
     /// Largest upload in MiB (0 disables uploads).
     #[arg(long, env = "VC_UPLOAD_LIMIT_MB", default_value_t = 25)]
     upload_limit_mb: u64,
+    /// MiB of uploads one member may keep stored (0 = no limit).
+    #[arg(long, env = "VC_UPLOAD_QUOTA_MB", default_value_t = 1024)]
+    upload_quota_mb: u64,
+    /// MiB all uploads together may take on disk (0 = no limit).
+    #[arg(long, env = "VC_STORAGE_LIMIT_MB", default_value_t = 10240)]
+    storage_limit_mb: u64,
     /// Loopback port of the TeamSpeak server's ServerQuery.
     #[arg(long, env = "VC_TEAMSPEAK_QUERY_PORT", default_value_t = 10011)]
     teamspeak_query_port: u16,
@@ -311,6 +317,8 @@ async fn main() -> Result<()> {
         public_url: public_url.clone(),
         public_endpoints: cli.public_endpoints,
         upload_limit: cli.upload_limit_mb * 1024 * 1024,
+        upload_quota: cli.upload_quota_mb.saturating_mul(1024 * 1024),
+        storage_limit: cli.storage_limit_mb.saturating_mul(1024 * 1024),
         files_dir: Some(cli.data_dir.join("files")),
         web_origins,
         tls,

@@ -611,6 +611,8 @@ function uploadErrorText(e: unknown, t: TFn): string {
     switch (e.kind) {
       case "too_large":
         return t("file.tooLarge", { limit });
+      case "quota":
+        return t("file.quota");
       case "disabled":
       case "unsupported":
         return t("file.disabled");

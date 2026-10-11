@@ -84,7 +84,7 @@ export interface ConnectParams {
   identity?: string;
 }
 
-export type UploadErrorKind = "disabled" | "too_large" | "empty" | "forbidden" | "network" | "aborted" | "unsupported";
+export type UploadErrorKind = "disabled" | "too_large" | "quota" | "empty" | "forbidden" | "network" | "aborted" | "unsupported";
 
 export class UploadError extends Error {
   constructor(readonly kind: UploadErrorKind) {
@@ -1067,6 +1067,7 @@ class Controller {
       reserved = await bound.conn.request("file.upload", { name: file.name, size: file.size, mime: file.type || "application/octet-stream", sha256: hash });
     } catch (e) {
       if (e instanceof RequestError && (e.code === "too_large" || e.code === "forbidden")) throw new UploadError(e.code === "too_large" ? "too_large" : "forbidden");
+      if (e instanceof RequestError && e.code === "quota_exceeded") throw new UploadError("quota");
       throw new UploadError("network");
     }
     const url = absoluteUrl(s.httpOrigin, reserved.upload_url, "PUT");

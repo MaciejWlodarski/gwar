@@ -75,6 +75,10 @@ pub struct Config {
     pub public_endpoints: Vec<String>,
     /// Largest upload in bytes; 0 disables uploads.
     pub upload_limit: u64,
+    /// Bytes one member may keep stored (attached or not); 0 means no limit.
+    pub upload_quota: u64,
+    /// Bytes all uploads together may take; 0 means no limit.
+    pub storage_limit: u64,
     /// Where uploads are stored; `None` uses a temporary directory (tests).
     pub files_dir: Option<PathBuf>,
     /// Web app origins allowed to upload cross-origin (see [`OFFICIAL_WEB_ORIGIN`]).
@@ -224,6 +228,8 @@ pub async fn start(config: Config) -> Result<Running> {
             version: env!("CARGO_PKG_VERSION").into(),
             password: password.clone(),
             upload_limit: config.upload_limit,
+            upload_quota: config.upload_quota,
+            storage_limit: config.storage_limit,
             files_dir,
             connect_url: config.connect_url.clone(),
             server_key: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(server_key.verifying_key().as_bytes()),

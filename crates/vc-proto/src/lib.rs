@@ -425,6 +425,8 @@ wire! {
         Internal,
         Banned,
         TooLarge,
+        /// An upload would go over the uploader's or the server's storage limit.
+        QuotaExceeded,
         /// The Gwar Connect device certificate in `hello` has expired.
         CertificateExpired,
     }

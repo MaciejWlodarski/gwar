@@ -78,6 +78,8 @@ pub async fn start() -> Option<Bridged> {
         insecure_any_host: true,
         public_endpoints: vec![format!("ws://{http}/ws")],
         upload_limit: 10 * 1024 * 1024,
+        upload_quota: 0,
+        storage_limit: 0,
         files_dir: None,
         web_origins: Vec::new(),
         tls: None,
