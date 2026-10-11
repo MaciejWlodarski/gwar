@@ -246,8 +246,13 @@ gwar message v2
 
 - The web app (also the desktop app's interface) validates every server message
   at runtime, with bounds, before use. The native protocol client in
-  `vc-client`, used by tests and tools but not by the apps, relies on typed
-  parsing without those bounds.
+  `vc-client`, used by tests and tools but not by the apps, bounds what a
+  server can make it hold (frame size, requests awaiting a reply, announced
+  clients). Its event stream passes on chat messages and edits only when their
+  signature verifies for this server and conversation, or when they come
+  unsigned from TeamSpeak; `Connection::verify_message` applies the same check
+  to messages in replies such as history. It does not check device
+  revocations or the continuity of edits, which need state the web app keeps.
 - File URLs are confined to the server's own origin and to
   `/files/{id}/{name}` (GET) and `/api/files/{id}?token=` (PUT), in the web app
   and in the desktop app's native code.

@@ -24,12 +24,13 @@ use tokio::{
     sync::{mpsc, oneshot},
     time::timeout,
 };
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
 use tracing::debug;
 use vc_proto::{
-    ChannelId, ChatMessage, ChatTarget, ClientFrame, ClientSoftware, DeviceCertificate, ErrorBody, Event, Hello, Join,
-    MessageSignature, PROTOCOL_VERSION, Request, Response, ServerFrame, Welcome, certificate_hash, decode_fixed,
-    hello_statement, message_body_hash, message_statement, normalize_endpoint, server_proof_statement,
+    ChannelId, ChatMessage, ChatTarget, ClientFrame, ClientSoftware, DeviceCertificate, ErrorBody, ErrorCode, Event,
+    Hello, Join, MessageCheck, MessageSignature, PROTOCOL_VERSION, Request, Response, ServerFrame, Welcome,
+    certificate_hash, decode_fixed, dm_conversation, hello_statement, message_body_hash, message_statement,
+    normalize_endpoint, server_proof_statement, uid_for_key,
 };
 
 pub use identity::Identity;
@@ -90,6 +91,12 @@ impl ConnectOptions {
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Largest server frame, in bytes: the web app's 2 Mi UTF-16 units in UTF-8.
+const MAX_FRAME: usize = 6 * 1024 * 1024;
+/// Requests awaiting a reply; more fail at once rather than piling up.
+const MAX_PENDING: usize = 256;
+/// Most clients a server can announce (`ServerInfo::max_clients`).
+const MAX_CLIENTS: usize = 65_535;
 
 type Pending = oneshot::Sender<Result<Value, ErrorBody>>;
 
@@ -108,7 +115,10 @@ pub struct Connection {
 pub struct Connected {
     pub connection: Connection,
     pub welcome: Welcome,
-    /// Server events in order. Ends when the connection closes.
+    /// Server events in order. Ends when the connection closes, also when the
+    /// server breaks the protocol's bounds. Chat messages and edits arrive only
+    /// if [`Connection::verify_message`] verifies them or they come unsigned
+    /// from TeamSpeak; the server's word alone is not enough.
     pub events: mpsc::Receiver<Event>,
 }
 
@@ -122,9 +132,11 @@ pub async fn connect(options: ConnectOptions) -> Result<Connected, ClientError> 
     if url.scheme() == "ws" && !loopback && !options.insecure_lan {
         return Err(ClientError::Protocol("TLS required; plaintext LAN needs explicit opt-in".into()));
     }
-    let (mut ws, _) = timeout(HANDSHAKE_TIMEOUT, tokio_tungstenite::connect_async(&options.url))
-        .await
-        .map_err(|_| ClientError::Timeout)??;
+    let limits = WebSocketConfig::default().max_message_size(Some(MAX_FRAME)).max_frame_size(Some(MAX_FRAME));
+    let (mut ws, _) =
+        timeout(HANDSHAKE_TIMEOUT, tokio_tungstenite::connect_async_with_config(&options.url, Some(limits), false))
+            .await
+            .map_err(|_| ClientError::Timeout)??;
 
     let challenge = match read_frame(&mut ws).await? {
         ServerFrame::Event(Event::Challenge(challenge)) => challenge,
@@ -204,15 +216,12 @@ pub async fn connect(options: ConnectOptions) -> Result<Connected, ClientError> 
     let uid = hello
         .certificate
         .as_ref()
-        .map(|c| {
-            use sha2::{Digest, Sha256};
-            URL_SAFE_NO_PAD
-                .encode(&Sha256::digest(decode_fixed::<32>(&c.account_key).expect("certificate checked"))[..20])
-        })
+        .map(|c| uid_for_key(&decode_fixed::<32>(&c.account_key).expect("certificate checked")))
         .unwrap_or_else(|| options.identity.uid());
     let clients =
         Arc::new(RwLock::new(welcome.clients.iter().map(|c| (c.id, c.uid.clone())).collect::<HashMap<_, _>>()));
     let current_clients = clients.clone();
+    let (me, server_key) = (uid.clone(), challenge.server_pk.clone());
     let (outgoing, mut requests) = mpsc::channel::<(Request, Pending)>(64);
     let (events_tx, events) = mpsc::channel(1024);
     tokio::spawn(async move {
@@ -222,6 +231,11 @@ pub async fn connect(options: ConnectOptions) -> Result<Connected, ClientError> 
             tokio::select! {
                 request = requests.recv() => {
                     let Some((request, reply)) = request else { break };
+                    pending.retain(|_, waiting| !waiting.is_closed());
+                    if pending.len() >= MAX_PENDING {
+                        let _ = reply.send(Err(ErrorBody::new(ErrorCode::RateLimited, "too many requests awaiting a reply")));
+                        continue;
+                    }
                     let id = next_id;
                     next_id = next_id.wrapping_add(1).max(3);
                     let text = serde_json::to_string(&ClientFrame { id, request }).expect("serializable");
@@ -254,8 +268,22 @@ pub async fn connect(options: ConnectOptions) -> Result<Connected, ClientError> 
                     match serde_json::from_value::<Event>(value) {
                         Ok(event) => {
                             match &event {
-                                Event::ClientJoined(c) | Event::ClientUpdated(c) => { current_clients.write().unwrap().insert(c.id, c.uid.clone()); }
+                                Event::ClientJoined(c) | Event::ClientUpdated(c) => {
+                                    let mut clients = current_clients.write().unwrap();
+                                    if clients.len() >= MAX_CLIENTS && !clients.contains_key(&c.id) {
+                                        debug!("server announced more than {MAX_CLIENTS} clients");
+                                        break;
+                                    }
+                                    clients.insert(c.id, c.uid.clone());
+                                }
                                 Event::ClientLeft { client, .. } => { current_clients.write().unwrap().remove(client); }
+                                Event::ChatMessage(m) | Event::ChatEdited(m) => {
+                                    let check = verify(m, &me, &server_key, &current_clients.read().unwrap());
+                                    if matches!(check, MessageCheck::Invalid | MessageCheck::Unsigned) {
+                                        debug!("dropping chat message {} from {}: {check:?}", m.id, m.author_uid);
+                                        continue;
+                                    }
+                                }
                                 _ => {}
                             }
                             if events_tx.send(event).await.is_err() {
@@ -284,6 +312,23 @@ pub async fn connect(options: ConnectOptions) -> Result<Connected, ClientError> 
     })
 }
 
+/// The conversation `msg` must be signed for, as its reader sees it: a direct
+/// message from someone else must be to us, and our own names its recipient.
+fn verify(msg: &ChatMessage, me: &str, server_key: &str, clients: &HashMap<u32, String>) -> MessageCheck {
+    let conversation = match msg.target {
+        ChatTarget::Channel(id) => format!("channel:{id}"),
+        ChatTarget::Server => "server".into(),
+        ChatTarget::Client(_) if msg.author_uid != me => dm_conversation(me, &msg.author_uid),
+        ChatTarget::Client(to) => match clients.get(&to) {
+            Some(peer) => dm_conversation(me, peer),
+            None if msg.signature.is_none() => String::new(),
+            None => return MessageCheck::Invalid,
+        },
+    };
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+    vc_proto::verify_message(msg, server_key, &conversation, now)
+}
+
 async fn read_frame<S>(ws: &mut S) -> Result<ServerFrame, ClientError>
 where
     S: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
@@ -301,6 +346,14 @@ where
 }
 
 impl Connection {
+    /// What `msg`'s own signature proves here. Live chat events are checked
+    /// before delivery; messages in replies, such as `chat.history`, are the
+    /// server's word until checked with this. Device revocations and the
+    /// continuity of edits are not checked.
+    pub fn verify_message(&self, msg: &ChatMessage) -> MessageCheck {
+        verify(msg, &self.uid, &self.server_key, &self.clients.read().unwrap())
+    }
+
     /// Sends a request and returns the raw `ok` payload.
     pub async fn request(&self, request: Request) -> Result<Value, ClientError> {
         let (tx, rx) = oneshot::channel();

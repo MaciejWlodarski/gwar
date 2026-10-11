@@ -7,8 +7,8 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signature, VerifyingKey};
 use rand::RngCore;
-use sha2::{Digest, Sha256};
 use vc_proto::{DeviceCertificate, ErrorCode, Hello, Uid, certificate_hash, decode_fixed, hello_statement};
+pub use vc_proto::{device_statement, signed_by, uid_for_key};
 
 pub fn valid_hash(value: &str, bytes: usize) -> bool {
     URL_SAFE_NO_PAD.decode(value).is_ok_and(|raw| raw.len() == bytes && URL_SAFE_NO_PAD.encode(raw) == value)
@@ -18,11 +18,6 @@ pub fn new_nonce() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
-}
-
-/// Stable, printable user id: first 20 bytes of SHA-256 over the raw public key.
-pub fn uid_for_key(public_key: &[u8; 32]) -> Uid {
-    URL_SAFE_NO_PAD.encode(&Sha256::digest(public_key)[..20])
 }
 
 /// Verifies a `hello` signature and returns the identity's uid.
@@ -38,24 +33,8 @@ pub fn verify_hello(hello: &Hello) -> Option<Uid> {
 const MAX_CERT_MS: i64 = 90 * 24 * 3600 * 1000;
 const SKEW_MS: i64 = 5 * 60 * 1000;
 
-pub fn device_statement(c: &DeviceCertificate) -> String {
-    format!("gwar device v1\n{}\n{}\n{}\n{}", c.account_key, c.device_key, c.issued_at, c.expires_at)
-}
-
 pub fn revoke_statement(account_key: &str, device_key: &str, revoked_at: i64) -> String {
     format!("gwar revoke v1\n{account_key}\n{device_key}\n{revoked_at}")
-}
-
-/// Whether `signature` is `public`'s Ed25519 signature of `message`.
-pub fn signed_by(public: &str, message: &str, signature: &str) -> bool {
-    let Some(key) = decode_fixed::<32>(public) else {
-        return false;
-    };
-    let Some(signature) = decode_fixed::<64>(signature) else {
-        return false;
-    };
-    VerifyingKey::from_bytes(&key)
-        .is_ok_and(|k| k.verify_strict(message.as_bytes(), &Signature::from_bytes(&signature)).is_ok())
 }
 
 /// Checks a Gwar Connect device certificate for the device key that signed
