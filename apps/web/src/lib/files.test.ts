@@ -33,3 +33,15 @@ describe("files", () => {
     expect(fitBox(2000, 100)).toEqual({ width: 400, height: 20 });
   });
 });
+
+it("clamps hostile dimensions before layout", () => {
+  for (const [w, h] of [[Number.MAX_VALUE, 1], [1, Number.MAX_VALUE], [Infinity, NaN], [-1, 0]]) {
+    const box = fitBox(w!, h!);
+    expect(Number.isFinite(box.width)).toBe(true);
+    expect(Number.isFinite(box.height)).toBe(true);
+    expect(box.width).toBeGreaterThanOrEqual(1);
+    expect(box.width).toBeLessThanOrEqual(400);
+    expect(box.height).toBeGreaterThanOrEqual(1);
+    expect(box.height).toBeLessThanOrEqual(300);
+  }
+});

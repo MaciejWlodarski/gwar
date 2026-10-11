@@ -45,6 +45,11 @@ export interface Box {
 
 /** The display size of an image: its own size scaled down to fit the box, never up. */
 export function fitBox(width: number, height: number, maxW = 400, maxH = 300): Box {
+  const dimension = (v: number) => Number.isFinite(v) ? Math.max(1, Math.min(16384, Math.trunc(v))) : 1;
+  width = dimension(width);
+  height = dimension(height);
+  maxW = Math.max(1, Math.min(400, Number.isFinite(maxW) ? maxW : 400));
+  maxH = Math.max(1, Math.min(300, Number.isFinite(maxH) ? maxH : 300));
   const scale = Math.min(1, maxW / width, maxH / height);
   return { width: Math.max(1, Math.round(width * scale)), height: Math.max(1, Math.round(height * scale)) };
 }
