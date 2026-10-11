@@ -436,7 +436,9 @@ error, a timeout, the client going away), which frees the space once its bytes
 are removed. A stored file's bytes are never removed by a late give-up.
 Deleted files (expired, their message or member removed) stay charged to their
 uploader until their bytes are gone from disk; a failed deletion is retried
-every ten minutes and after a restart. Reservations live only in memory, so
+every ten minutes and after a restart. A file deleted while it is being
+downloaded keeps its bytes, and its charge, until that download ends; no new
+download can start. Reservations live only in memory, so
 the same tick deletes bytes in the files directory that belong to no upload and
 no file, such as an upload a restart cut short.
 

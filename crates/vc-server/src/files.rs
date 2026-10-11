@@ -225,16 +225,23 @@ pub async fn download(
     if !valid_id(&id) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let Some((file, path)) = gateway.core.file_info(id).await else {
+    let Some((file, path, reading)) = gateway.core.file_open(id).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let Ok(handle) = tokio::fs::File::open(&path).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    serve_file(handle, &file.mime, &file.name, request).await
+    serve_file(handle, reading, &file.mime, &file.name, request).await
 }
 
-async fn serve_file(mut handle: tokio::fs::File, mime: &str, name: &str, request: HeaderMap) -> Response {
+/// Streams `handle`, keeping `reading` until the body is done or dropped.
+async fn serve_file(
+    mut handle: tokio::fs::File,
+    reading: impl Send + 'static,
+    mime: &str,
+    name: &str,
+    request: HeaderMap,
+) -> Response {
     let Ok(metadata) = handle.metadata().await else { return StatusCode::NOT_FOUND.into_response() };
     let content_type = INLINE.iter().copied().find(|t| *t == mime).unwrap_or("application/octet-stream");
     let inline = content_type != "application/octet-stream";
@@ -261,11 +268,11 @@ async fn serve_file(mut handle: tokio::fs::File, mime: &str, name: &str, request
         return StatusCode::NOT_FOUND.into_response();
     }
     // Read only the selected slice, at most 64 KiB per poll. No whole-file allocation.
-    let stream = futures::stream::try_unfold(handle.take(length), |mut reader| async move {
+    let stream = futures::stream::try_unfold((handle.take(length), reading), |(mut reader, reading)| async move {
         let mut chunk = vec![0; 64 * 1024];
         let read = reader.read(&mut chunk).await?;
         chunk.truncate(read);
-        Ok::<_, std::io::Error>((read != 0).then_some((chunk, reader)))
+        Ok::<_, std::io::Error>((read != 0).then_some((chunk, (reader, reading))))
     });
     let mut response = Response::new(Body::from_stream(stream));
     if let Some((start, end)) = range {
@@ -360,7 +367,7 @@ mod tests {
         file.write_all(b"x").await.unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(header::RANGE, HeaderValue::from_str(&format!("bytes={}-", len - 1)).unwrap());
-        let response = serve_file(file, "image/png", "photo.png", headers).await;
+        let response = serve_file(file, (), "image/png", "photo.png", headers).await;
         assert_eq!(response.status(), axum::http::StatusCode::PARTIAL_CONTENT);
         assert_eq!(response.headers()[header::CONTENT_LENGTH], "1");
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");

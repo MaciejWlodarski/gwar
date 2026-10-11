@@ -246,6 +246,8 @@ pub struct Core {
     uploads: HashMap<String, files::PendingUpload>,
     /// Removed files whose bytes are being deleted right now.
     removing: HashSet<String>,
+    /// Stored files being downloaded, and by how many requests.
+    reading: HashMap<String, usize>,
     /// Turns at slow work (password hashing) running off the actor.
     slow_work: Arc<tokio::sync::Semaphore>,
     /// Stored bytes allowed per member and in total; 0 means no limit.
@@ -417,6 +419,7 @@ impl Core {
             files_dir: config.files_dir,
             uploads: HashMap::new(),
             removing: HashSet::new(),
+            reading: HashMap::new(),
             slow_work: Arc::new(tokio::sync::Semaphore::new(SLOW_WORK)),
             upload_quota: config.upload_quota,
             storage_limit: config.storage_limit,

@@ -321,7 +321,9 @@ Every guarantee assumes your client runs genuine code.
   (`--storage-limit-mb`, 10 GiB), counting files not yet sent. Identities are
   free, so the total cap is what protects the disk; uploads not attached to a
   message are deleted after a day. Space is freed only once a file's bytes are
-  gone from disk, so a deletion that fails keeps counting until it is retried.
+  gone from disk, so a deletion that fails keeps counting until it is retried,
+  and a file deleted during a download counts until that download ends (anyone
+  holding the link can keep a deleted file counting that long).
 
 ## TeamSpeak
 

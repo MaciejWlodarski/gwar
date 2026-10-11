@@ -10,7 +10,7 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 use vc_proto::{Attachment, ErrorCode, Permission, Response, SessionId};
 
@@ -51,6 +51,25 @@ impl PendingUpload {
     /// bytes are gone, however long that takes.
     fn live(&self, now: Instant) -> bool {
         self.state != UploadState::Waiting || self.until > now
+    }
+}
+
+/// Keeps a stored file's bytes on disk, and charged, while a download reads them; dropping it
+/// ends the read.
+pub struct Reading {
+    tx: mpsc::Sender<CoreMsg>,
+    id: String,
+}
+
+impl Drop for Reading {
+    fn drop(&mut self) {
+        let done = CoreMsg::Files(FileMsg::Done { id: std::mem::take(&mut self.id) });
+        if let Err(mpsc::error::TrySendError::Full(done)) = self.tx.try_send(done)
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let tx = self.tx.clone();
+            runtime.spawn(async move { tx.send(done).await });
+        }
     }
 }
 
@@ -95,6 +114,15 @@ pub enum FileMsg {
         id: String,
         reply: oneshot::Sender<Option<(Attachment, PathBuf)>>,
     },
+    /// A stored file to download, held by the returned [`Reading`].
+    Open {
+        id: String,
+        reply: oneshot::Sender<Option<(Attachment, PathBuf, Reading)>>,
+    },
+    /// A [`Reading`] ended.
+    Done {
+        id: String,
+    },
 }
 
 impl CoreHandle {
@@ -117,6 +145,14 @@ impl CoreHandle {
             return false;
         }
         rx.await.unwrap_or(false)
+    }
+
+    /// A stored file to download and where it is on disk; its bytes stay until the
+    /// [`Reading`] is dropped, even if the file is deleted meanwhile.
+    pub async fn file_open(&self, id: String) -> Option<(Attachment, PathBuf, Reading)> {
+        let (reply, rx) = oneshot::channel();
+        self.tx.send(CoreMsg::Files(FileMsg::Open { id, reply })).await.ok()?;
+        rx.await.ok().flatten()
     }
 
     /// A stored file and where it is on disk.
@@ -282,6 +318,25 @@ impl Core {
                 let file = self.store.file(&id).map_err(storage_error).ok().flatten();
                 let _ = reply.send(file.map(|f| (f, self.file_path(&id))));
             }
+            FileMsg::Open { id, reply } => {
+                let Some(tx) = self.me.upgrade() else { return };
+                let file = self.store.file(&id).map_err(storage_error).ok().flatten();
+                let opened = file.map(|f| {
+                    *self.reading.entry(id.clone()).or_default() += 1;
+                    (f, self.file_path(&id), Reading { tx, id })
+                });
+                // If the request is gone, the reply is dropped and its `Reading` with it.
+                let _ = reply.send(opened);
+            }
+            FileMsg::Done { id } => {
+                let Some(count) = self.reading.get_mut(&id) else { return };
+                *count -= 1;
+                if *count == 0 {
+                    self.reading.remove(&id);
+                    // Deleted while it was read: its bytes can go now.
+                    self.remove_files();
+                }
+            }
         }
     }
 
@@ -324,8 +379,9 @@ impl Core {
         });
     }
 
-    /// Deletes the bytes of removed files (off the actor). Each stays charged to its uploader
-    /// until its bytes are gone; what fails is tried again by the next tick.
+    /// Deletes the bytes of removed files (off the actor), except while they are downloaded.
+    /// Each stays charged to its uploader until its bytes are gone; what fails is tried again
+    /// by the next tick.
     pub(super) fn remove_files(&mut self) {
         let ids = match self.store.removed_files() {
             Ok(ids) => ids,
@@ -335,7 +391,8 @@ impl Core {
             }
         };
         let Some(tx) = self.me.upgrade() else { return };
-        let ids: Vec<_> = ids.into_iter().filter(|id| self.removing.insert(id.clone())).collect();
+        let ids: Vec<_> =
+            ids.into_iter().filter(|id| !self.reading.contains_key(id) && self.removing.insert(id.clone())).collect();
         if ids.is_empty() {
             return;
         }
@@ -623,6 +680,47 @@ pub(crate) mod tests {
             assert!(!core.stray("stored"), "swept without knowing whether it is stored");
         })
         .await;
+    }
+
+    /// A file deleted while it is downloaded keeps its bytes, and its charge, until the download
+    /// ends; a download whose request went away holds nothing.
+    #[tokio::test]
+    async fn a_file_being_read_is_removed_after_the_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::in_memory().unwrap();
+        for id in ["f", "g"] {
+            store.insert_file(id, "u", "f", "x", 3, "h", None, now_ms()).unwrap();
+            std::fs::write(dir.path().join(id), "abc").unwrap();
+        }
+        let core = test_core_storing(store, None, dir.path().into(), 100);
+        let (_, path, reading) = core.file_open("f".into()).await.unwrap();
+        on_core(&core, |core| {
+            let (reply, rx) = oneshot::channel();
+            drop(rx);
+            core.file_msg(FileMsg::Open { id: "g".into(), reply });
+            core.store.raw().execute_batch("DELETE FROM files").unwrap();
+            core.tick();
+        })
+        .await;
+        for _ in 0..100 {
+            if !dir.path().join("g").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!dir.path().join("g").exists(), "an abandoned read kept the bytes");
+        assert_eq!(charged(&core).await, 3, "freed while it is read");
+        assert_eq!(std::fs::read(&path).unwrap(), b"abc");
+        assert!(core.file_open("f".into()).await.is_none(), "deleted files cannot be opened");
+        drop(reading);
+        for _ in 0..100 {
+            if charged(&core).await == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(charged(&core).await, 0);
+        assert!(!path.exists());
     }
 
     #[test]

@@ -437,10 +437,55 @@ async fn stored_uploads_count_against_member_and_server_limits() {
     // ...but the server total is shared: 200 of 250 bytes are taken.
     assert_eq!(carol.fails("file.upload", json!({"name": "f", "size": 51, "mime": "x"})).await, "quota_exceeded");
     carol.ok("file.upload", json!({"name": "f", "size": 50, "mime": "x"})).await;
-    // Deleting a message frees its files.
+    // Deleting a message frees its files (once their bytes are gone, just after).
     let sent = alice.ok("chat.send", json!({"target": {"channel": lobby}, "text": "", "attachments": [first]})).await;
     alice.ok("chat.edit", json!({"message": sent["id"], "text": vc_proto::DELETION_TEXT})).await;
-    alice.ok("file.upload", json!({"name": "g", "size": 60, "mime": "x"})).await;
+    upload_soon(&mut alice, 60).await.expect("space freed after deleting the message");
+}
+
+/// Reserves `size` bytes, retrying for a second while space is being freed.
+async fn upload_soon(client: &mut Client, size: usize) -> Option<Value> {
+    for _ in 0..50 {
+        if let Ok(reserved) = client.request("file.upload", json!({"name": "later", "size": size, "mime": "x"})).await {
+            return Some(reserved);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    None
+}
+
+#[tokio::test]
+async fn a_file_being_downloaded_keeps_its_space_until_the_download_ends() {
+    // Large enough not to fit in the socket buffers: the download stays open until read.
+    const SIZE: usize = 32 << 20;
+    let server = TestServer::start_with(|c| {
+        c.upload_limit = SIZE as u64;
+        c.storage_limit = SIZE as u64;
+    })
+    .await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let lobby = alice.default_channel();
+    let bytes = vec![7u8; SIZE];
+    let reserved =
+        alice.ok("file.upload", json!({"name": "big", "size": SIZE, "sha256": hash(&bytes), "mime": "x"})).await;
+    let put = format!("{}{}", server.http(), reserved["upload_url"].as_str().unwrap());
+    // (Not `upload`: a refused second PUT of this size ends in a reset connection.)
+    let response = reqwest::Client::new().put(&put).body(bytes).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    let file: vc_proto::Attachment = response.json().await.unwrap();
+    alice.files.insert(file.id.clone(), file.clone());
+    let file = file.id;
+    let sent = alice.ok("chat.send", json!({"target": {"channel": lobby}, "text": "", "attachments": [file]})).await;
+    let url = format!("{}{}", server.http(), sent["attachments"][0]["url"].as_str().unwrap());
+    let download = reqwest::get(&url).await.unwrap();
+    assert_eq!(download.status(), 200);
+    alice.ok("chat.edit", json!({"message": sent["id"], "text": vc_proto::DELETION_TEXT})).await;
+    assert_eq!(reqwest::get(&url).await.unwrap().status(), 404);
+    // The bytes are still on disk for the open download, so they still count.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(alice.fails("file.upload", json!({"name": "b", "size": 1, "mime": "x"})).await, "quota_exceeded");
+    assert_eq!(download.bytes().await.unwrap().len(), SIZE);
+    upload_soon(&mut alice, SIZE).await.expect("space freed after the download ended");
 }
 
 #[tokio::test]
