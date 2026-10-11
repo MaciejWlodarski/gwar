@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 import { loadServiceKey } from "../connect/service-key";
 import { attestationFingerprint, verifiedHandle, type HandleMember } from "../net/handle-attestation";
 
-/** A stale async result never enables a badge for a different member or attestation. */
+/** A stale async result never enables a badge for a different member or attestation. `verifiedHandle` checks the
+ *  attestation's times when it verifies; the timer withdraws the badge when it expires. */
 export function useVerifiedHandle(member: HandleMember | null | undefined): string | null {
   const a = member?.connect;
   const uid = member?.uid;
@@ -24,6 +25,5 @@ export function useVerifiedHandle(member: HandleMember | null | undefined): stri
     });
     return () => { active = false; clearTimeout(timer); };
   }, [a, uid, fingerprint]);
-  return a && typeof a === "object" && a.issued_at <= Date.now() + 5 * 60 * 1000 && Date.now() < a.expires_at &&
-    result !== null && result.uid === uid && result.fingerprint === fingerprint ? result.handle : null;
+  return a && typeof a === "object" && result !== null && result.uid === uid && result.fingerprint === fingerprint ? result.handle : null;
 }

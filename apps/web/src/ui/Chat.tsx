@@ -356,7 +356,9 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
   const [verified, setVerified] = useState<Map<number, { fingerprint: string; state: MessageVerification }>>(new Map());
   const [signingUid, setSigningUid] = useState<string | undefined>();
   const verifier = useMemo(() => new MessageVerificationCache(), [serverKey, key]);
-  useEffect(() => setVerified(new Map()), [verifier]);
+  // A new verifier starts with no results; reset while rendering so no frame shows the old ones.
+  const [verifiedBy, setVerifiedBy] = useState(verifier);
+  if (verifiedBy !== verifier) { setVerifiedBy(verifier); setVerified(new Map()); }
   const authorizationRefresh = useRef({ verifier, tick: 0, work: Promise.resolve() });
   const targetFor = (msg: ChatMessage) => messageTarget(key, msg.author_uid, signingUid);
   useEffect(() => {

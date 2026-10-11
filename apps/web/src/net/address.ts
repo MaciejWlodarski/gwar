@@ -164,7 +164,8 @@ export function filePath(path: string, method: FileMethod = "GET"): string {
   if (path.length > 2048 || /[\\\s#]/.test(path)) throw new Error("Invalid file path");
   let decoded: string;
   try { decoded = decodeURIComponent(path); } catch { throw new Error("Invalid file path"); }
-  // Names may contain "%" or "..", but no segment may be a dot segment.
+  // Names may contain "%" or "..", but no segment may be a dot segment, and no character may be a control one.
+  // eslint-disable-next-line no-control-regex
   if (/[\\\x00-\x1f\x7f]/.test(decoded) || decoded.split("/").some((seg) => seg === "." || seg === "..")) throw new Error("Invalid file path");
   const valid = method === "GET"
     ? /^\/files\/[A-Za-z0-9_-]{1,64}\/[^/?#]+$/.test(decoded)

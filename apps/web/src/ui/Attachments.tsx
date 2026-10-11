@@ -42,14 +42,14 @@ function scrollParent(node: Element): Element | null {
 function useNearView<T extends Element>(): [RefCallback<T>, boolean] {
   const [node, setNode] = useState<T | null>(null);
   const [near, setNear] = useState(false);
+  const observable = typeof IntersectionObserver !== "undefined";
   useEffect(() => {
-    if (!node) return;
-    if (typeof IntersectionObserver === "undefined") { setNear(true); return; }
+    if (!node || !observable) return;
     const observer = new IntersectionObserver((entries) => setNear(entries.some((e) => e.isIntersecting)), { root: scrollParent(node), rootMargin: NEAR });
     observer.observe(node);
     return () => observer.disconnect();
-  }, [node]);
-  return [setNode, near];
+  }, [node, observable]);
+  return [setNode, near || !observable];
 }
 
 type UrlOptions = { autoLoad?: boolean; active?: boolean; budget?: ImageBudget };

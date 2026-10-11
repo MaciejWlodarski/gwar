@@ -47,8 +47,14 @@ export function ConnectScreen() {
   const [kind, setKind] = useState<ServerKind>(desktop && !invite?.server ? lastKind : "vc");
   const [address, setAddress] = useState(invite?.server ?? lastAddress);
   const [password, setPassword] = useState("");
-  const [insecureLan, setInsecureLan] = useState(bookmarks.find((b) => b.address === address)?.insecureLan ?? false);
-  useEffect(() => setInsecureLan(bookmarks.find((b) => b.address === address)?.insecureLan ?? false), [address, bookmarks]);
+  const savedInsecureLan = bookmarks.find((b) => b.address === address)?.insecureLan ?? false;
+  const [insecureLan, setInsecureLan] = useState(savedInsecureLan);
+  // Another address (or its bookmark changing) brings back that bookmark's choice.
+  const [insecureFor, setInsecureFor] = useState({ address, bookmarks });
+  if (insecureFor.address !== address || insecureFor.bookmarks !== bookmarks) {
+    setInsecureFor({ address, bookmarks });
+    setInsecureLan(savedInsecureLan);
+  }
   const [remember, setRemember] = useState(true);
   // TeamSpeak: with more than one identity the person chooses; null means the default one.
   const tsList = useTsIdentities();

@@ -19,6 +19,11 @@ export default tseslint.config(
     },
   },
   {
+    // Plain scripts the page loads as they are.
+    files: ["public/**/*.js"],
+    languageOptions: { globals: globals.browser },
+  },
+  {
     files: ["e2e/**/*.mjs", "*.config.{js,ts}"],
     // e2e scripts run in node but also ship functions into the page.
     languageOptions: { globals: { ...globals.node, ...globals.browser } },
