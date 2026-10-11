@@ -15,7 +15,7 @@ tag: string,
 /**
  * Handle attestation to verify against the client's own Connect service key.
  */
-connect?: HandleAttestation | null, groups: Array<number>,
+connect?: HandleAttestation | null, groups: Array<number>, 
 /**
  * Unix time in milliseconds.
  */
