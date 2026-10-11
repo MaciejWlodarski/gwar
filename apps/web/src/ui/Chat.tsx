@@ -98,6 +98,12 @@ function formatDay(at: number, lang: string, t: TFn): string {
 
 // ----------------------------------------------------------------- messages
 
+/** An author deletion disappears when its signature holds and nothing qualifies the signing device. Missing
+ *  earlier revisions (a fresh device) do not matter; a revoked, expired or unchecked device keeps it visible. */
+function quietDeletion(v: MessageVerification): boolean {
+  return v.status === "verified" && v.authorization.length === 0 && v.continuity !== "rollback" && v.continuity !== "fork";
+}
+
 export const MessageRow = memo(function MessageRow({
   row,
   mine,
@@ -151,8 +157,7 @@ export const MessageRow = memo(function MessageRow({
     });
   };
 
-  // Only a fully verified deletion disappears; a qualified one (e.g. from a revoked device) stays inspectable.
-  if (msg.text === DELETION_TEXT && verification && fullyVerified(verification)) return null;
+  if (msg.text === DELETION_TEXT && verification && quietDeletion(verification)) return null;
 
   return (
     <div
@@ -377,7 +382,7 @@ function MessageList({ threadKey }: { threadKey: ThreadKey }) {
   const rows = useMemo(() => buildRows((thread?.items ?? []).filter((i) => {
     if (i.kind !== "msg" || i.msg.text !== DELETION_TEXT) return true;
     const entry = verified.get(i.msg.id);
-    return entry?.fingerprint !== messageFingerprint(i.msg, { serverKey, target: targetFor(i.msg) }) || !fullyVerified(entry.state);
+    return entry?.fingerprint !== messageFingerprint(i.msg, { serverKey, target: targetFor(i.msg) }) || !quietDeletion(entry.state);
   })), [thread?.items, verified, serverKey, key, signingUid]);
   const ref = useRef<HTMLDivElement>(null);
   const stick = useRef(true);

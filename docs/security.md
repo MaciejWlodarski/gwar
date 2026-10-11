@@ -190,9 +190,10 @@ gwar message v2
   request. A row that verified is never displaced by one that did not under the
   same signed identity.
 - Author deletion is a final signed revision (the exact body encoding is in
-  architecture.md). A fully verified deletion disappears; one with a
-  qualification (for example from a revoked device) stays as an inspectable
-  "deleted by the author" line with its warning. A moderator's unsigned removal
+  architecture.md). A verified deletion disappears, also on a device that never
+  saw the earlier revisions; one whose signing device is revoked, expired or not
+  checked against current revocations stays as an inspectable "deleted by the
+  author" line with its warning. A moderator's unsigned removal
   says removed by the server.
 - Until its signature is checked a message is visibly pending, so a quiet
   message is always a verified one.

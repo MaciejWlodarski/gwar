@@ -71,8 +71,8 @@ describe("quiet localized message verification", () => {
     expect(badge.textContent).toBe("TS"); expect(badge.getAttribute("aria-label")).toContain("TeamSpeak messages are unsigned");
     expect(container.querySelector('[aria-label^="Gwar Connect account"]')).toBeNull();
   });
-  it("hides a fully verified author deletion", async () => {
-    await show(valid, { text: DELETION_TEXT });
+  for (const continuity of ["proven", "unproven"] as const) it(`hides a verified author deletion (continuity ${continuity})`, async () => {
+    await show({ ...valid, continuity }, { text: DELETION_TEXT });
     expect(container.querySelector("[data-message]")).toBeNull(); expect(container.textContent).toBe("");
   });
   it("keeps a qualified author deletion as an inspectable tombstone", async () => {
@@ -80,6 +80,8 @@ describe("quiet localized message verification", () => {
     expect(container.querySelector('[data-testid="message-author-deleted"]')?.textContent).toBe("Deleted by the author");
     expect(container.querySelector('[data-testid="message-verification-qualified"]')?.getAttribute("aria-label")).toContain("device revoked");
     expect(container.textContent).not.toContain("Unverified deletion request");
+    await show({ ...valid, authorization: ["revocations-stale"] }, { text: DELETION_TEXT });
+    expect(container.querySelector('[data-testid="message-author-deleted"]')).not.toBeNull();
   });
   it("shows a message as pending until its signature is checked", async () => {
     await show(undefined);
