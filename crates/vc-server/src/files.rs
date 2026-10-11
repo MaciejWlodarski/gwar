@@ -16,7 +16,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures::StreamExt;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tracing::warn;
 
 use crate::{
@@ -228,21 +228,35 @@ pub async fn download(
     let Some((file, path, reading)) = gateway.core.file_open(id).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Ok(handle) = tokio::fs::File::open(&path).await else {
+    // Opened off the runtime by a task that owns the lease, so even a request cancelled
+    // meanwhile keeps the lease until the handle is closed.
+    let opened = tokio::task::spawn_blocking(move || {
+        let held = Held { file: std::fs::File::open(&path)?, _lease: reading };
+        let len = held.file.metadata()?.len();
+        Ok::<_, std::io::Error>((held, len))
+    });
+    let Ok(Ok((held, len))) = opened.await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    serve_file(handle, reading, &file.mime, &file.name, request).await
+    serve_file(held, len, &file.mime, &file.name, request).await
 }
 
-/// Streams `handle`, keeping `reading` until the body is done or dropped.
-async fn serve_file(
-    mut handle: tokio::fs::File,
-    reading: impl Send + 'static,
+/// An open file with the lease that keeps its bytes on disk. Fields drop in order: the
+/// handle closes before the lease ends.
+struct Held<L> {
+    file: std::fs::File,
+    _lease: L,
+}
+
+/// Streams `len` bytes of `held`. Every read runs on a blocking task that owns `held`, so if
+/// the body is dropped mid-read, the lease ends only after that read and the handle are done.
+async fn serve_file<L: Send + 'static>(
+    mut held: Held<L>,
+    len: u64,
     mime: &str,
     name: &str,
     request: HeaderMap,
 ) -> Response {
-    let Ok(metadata) = handle.metadata().await else { return StatusCode::NOT_FOUND.into_response() };
     let content_type = INLINE.iter().copied().find(|t| *t == mime).unwrap_or("application/octet-stream");
     let inline = content_type != "application/octet-stream";
     let encoded: String = name
@@ -256,7 +270,6 @@ async fn serve_file(
         })
         .collect();
     let disposition = format!("{}; filename*=UTF-8''{encoded}", if inline { "inline" } else { "attachment" });
-    let len = metadata.len();
     let range = byte_range(&request, len);
     if range.is_none() && request.contains_key(header::RANGE) {
         let mut response = StatusCode::RANGE_NOT_SATISFIABLE.into_response();
@@ -264,15 +277,31 @@ async fn serve_file(
         return response;
     }
     let (start, length) = range.map_or((0, len), |(start, end)| (start, end - start + 1));
-    if handle.seek(std::io::SeekFrom::Start(start)).await.is_err() {
+    // Moves the offset of the freshly opened file only; no data is read here.
+    if start > 0 && std::io::Seek::seek(&mut held.file, std::io::SeekFrom::Start(start)).is_err() {
         return StatusCode::NOT_FOUND.into_response();
     }
     // Read only the selected slice, at most 64 KiB per poll. No whole-file allocation.
-    let stream = futures::stream::try_unfold((handle.take(length), reading), |(mut reader, reading)| async move {
-        let mut chunk = vec![0; 64 * 1024];
-        let read = reader.read(&mut chunk).await?;
-        chunk.truncate(read);
-        Ok::<_, std::io::Error>((read != 0).then_some((chunk, (reader, reading))))
+    let stream = futures::stream::try_unfold((held, length), |(mut held, left)| async move {
+        if left == 0 {
+            return Ok(None);
+        }
+        let (held, chunk) = tokio::task::spawn_blocking(move || {
+            let mut chunk = vec![0; left.min(64 * 1024) as usize];
+            let read = std::io::Read::read(&mut held.file, &mut chunk).map(|n| {
+                chunk.truncate(n);
+                chunk
+            });
+            (held, read)
+        })
+        .await
+        .map_err(std::io::Error::other)?;
+        let chunk = chunk?;
+        if chunk.is_empty() {
+            return Ok(None);
+        }
+        let left = left - chunk.len() as u64;
+        Ok::<_, std::io::Error>(Some((chunk, (held, left))))
     });
     let mut response = Response::new(Body::from_stream(stream));
     if let Some((start, end)) = range {
@@ -299,10 +328,9 @@ async fn serve_file(
 mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
 
-    use super::{UPLOAD_IDLE, byte_range, media_type, paced, serve_file, valid_id};
+    use super::{Held, UPLOAD_IDLE, byte_range, media_type, paced, serve_file, valid_id};
     use crate::core::files::UPLOAD_DEADLINE;
     use axum::http::StatusCode;
-    use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
     #[tokio::test(start_paused = true)]
     async fn stalled_or_dripping_uploads_time_out() {
@@ -359,15 +387,15 @@ mod tests {
 
     #[tokio::test]
     async fn ranges_stream_only_the_slice_and_keep_security_headers() {
-        let temp = tempfile::tempfile().unwrap();
-        let mut file = tokio::fs::File::from_std(temp);
+        use std::io::{Seek, Write};
+        let mut file = tempfile::tempfile().unwrap();
         let len = 1u64 << 33;
-        file.set_len(len).await.unwrap();
-        file.seek(std::io::SeekFrom::Start(len - 1)).await.unwrap();
-        file.write_all(b"x").await.unwrap();
+        file.set_len(len).unwrap();
+        file.seek(std::io::SeekFrom::Start(len - 1)).unwrap();
+        file.write_all(b"x").unwrap();
         let mut headers = HeaderMap::new();
         headers.insert(header::RANGE, HeaderValue::from_str(&format!("bytes={}-", len - 1)).unwrap());
-        let response = serve_file(file, (), "image/png", "photo.png", headers).await;
+        let response = serve_file(Held { file, _lease: () }, len, "image/png", "photo.png", headers).await;
         assert_eq!(response.status(), axum::http::StatusCode::PARTIAL_CONTENT);
         assert_eq!(response.headers()[header::CONTENT_LENGTH], "1");
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
@@ -375,6 +403,52 @@ mod tests {
         assert_eq!(response.headers()[header::CONTENT_SECURITY_POLICY], "default-src 'none'; sandbox");
         assert!(response.headers()[header::CONTENT_DISPOSITION].to_str().unwrap().starts_with("inline;"));
         assert_eq!(&axum::body::to_bytes(response.into_body(), 1).await.unwrap()[..], b"x");
+    }
+
+    /// A download dropped while a read is still running keeps its lease until that read is
+    /// done. (A FIFO stands in for a slow disk: its read waits for a writer.)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dropped_download_keeps_its_lease_until_the_read_ends() {
+        use futures::StreamExt;
+        use std::{
+            io::Write,
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+        };
+        struct Lease(Arc<AtomicBool>);
+        impl Drop for Lease {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let writer = std::thread::spawn({
+            let fifo = fifo.clone();
+            move || std::fs::OpenOptions::new().write(true).open(fifo).unwrap()
+        });
+        let file = std::fs::File::open(&fifo).unwrap();
+        let mut writer = writer.join().unwrap();
+        let ended = Arc::new(AtomicBool::new(false));
+        let response = serve_file(Held { file, _lease: Lease(ended.clone()) }, 10, "x", "f", HeaderMap::new()).await;
+        let mut body = response.into_body().into_data_stream();
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), body.next()).await.is_err());
+        drop(body);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!ended.load(Ordering::SeqCst), "the lease ended while a read was still running");
+        writer.write_all(b"data").unwrap();
+        drop(writer);
+        for _ in 0..100 {
+            if ended.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the lease never ended");
     }
 
     #[test]
