@@ -214,3 +214,10 @@ inactive entries expire after five minutes. At most four server-password Argon2
 checks run concurrently, with no waiting queue. WebSocket frames and assembled
 messages are capped at 96 KiB before parsing; hello and idle deadlines include
 ping traffic.
+
+Clients validate every incoming event and per-operation response against small
+handwritten schemas checked by TypeScript against generated protocol types.
+Frames are capped at 2 MiB before parsing; schemas reject unknown/pollution keys,
+unsafe integers and unbounded strings/arrays. Updating generated types requires
+updating these validators. The handshake and signing branches must extend the
+schemas for their new wire fields; unknown fields are deliberately rejected.

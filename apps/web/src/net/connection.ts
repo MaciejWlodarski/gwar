@@ -1,3 +1,4 @@
+import { responseFor } from "./schema";
 import type { BanNotice } from "../proto/BanNotice";
 import type { ErrorCode } from "../proto/ErrorCode";
 import type { LeaveReason } from "../proto/LeaveReason";
@@ -182,7 +183,7 @@ export interface Link {
 }
 
 interface Pending {
-  op: string;
+  op: Op;
   resolve: (value: never) => void;
   reject: (error: Error) => void;
   timer: ReturnType<typeof setTimeout>;
@@ -480,6 +481,10 @@ export class Connection implements Link {
     if (frame.kind === "ok" || frame.kind === "err") {
       const p = this.pending.get(frame.re);
       if (!p) return;
+      if (frame.kind === "ok" && !responseFor(p.op, frame.ok)) {
+        console.warn("Dropped server response with wrong payload", p.op);
+        return;
+      }
       this.pending.delete(frame.re);
       clearTimeout(p.timer);
       if (frame.kind === "ok") p.resolve(frame.ok as never);

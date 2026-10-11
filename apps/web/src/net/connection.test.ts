@@ -90,7 +90,7 @@ describe("handshake", () => {
     expect(s.url).toBe(parsed.value.url);
     s.open();
     const relayed = challenge();
-    s.push({ ...relayed, d: { ...relayed.d, server: { ...relayed.d.server, name: "b.example" }, host: "b.example" } });
+    s.push({ ...relayed, d: { ...relayed.d, server: { ...relayed.d.server, name: "b.example" } } });
     await vi.waitFor(() => expect(s.sent.length).toBe(1));
     expect(s.sent[0]).toMatchObject({
       op: "hello",

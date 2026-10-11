@@ -1,3 +1,4 @@
+import { error as validError, responseFor } from "./schema";
 /**
  * A session on a TeamSpeak 3/6 server (desktop app only). The native client
  * presents the TS server through `vc/1` shapes (see `vc_client::teamspeak`), so
@@ -50,7 +51,7 @@ export function classifyTsError(message: string, hadPassword: boolean, serverNam
 }
 
 function isErrorBody(e: unknown): e is { code: ErrorCode; message: string } {
-  return typeof e === "object" && e !== null && "code" in e && "message" in e;
+  return validError(e);
 }
 
 export class TsConnection implements Link {
@@ -127,7 +128,9 @@ export class TsConnection implements Link {
       timer = setTimeout(() => reject(new RequestTimeoutError(op)), timeoutMs);
     });
     try {
-      return (await Promise.race([api.invoke<unknown>("ts_request", { session: this.session, op, d }), timeout])) as ResponseMap[O];
+      const reply = await Promise.race([api.invoke<unknown>("ts_request", { session: this.session, op, d }), timeout]);
+      if (!responseFor(op, reply)) { console.warn("Dropped malformed native server response", op); throw new RequestError("bad_request", "Malformed server response"); }
+      return reply as ResponseMap[O];
     } catch (e) {
       if (e instanceof RequestTimeoutError) throw e;
       if (isErrorBody(e)) throw new RequestError(e.code, e.message);
@@ -201,13 +204,19 @@ export class TsConnection implements Link {
     this.serverReason = null;
     this.held = [];
     try {
-      return await api.invoke<Welcome>("ts_connect", {
+      const welcome = await api.invoke<Welcome>("ts_connect", {
         session,
         address: this.options.address,
         nickname: this.options.nickname,
         password: this.options.serverPassword ?? null,
         identity: this.options.identity ?? null,
       });
+      if (!responseFor("hello", welcome)) {
+        console.warn("Dropped malformed native welcome");
+        void api.invoke("ts_disconnect", { session });
+        throw new Error("Malformed server welcome");
+      }
+      return welcome;
     } catch (e) {
       this.held = null;
       if (this.session === session) this.session = 0;
