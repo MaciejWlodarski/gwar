@@ -1,10 +1,10 @@
 //! Gwar Connect: signed device revocations and public account-handle lookups.
 //! Authentication verifies certificates locally; neither HTTP path blocks hello.
 
-use std::time::Duration;
+use std::{net::IpAddr, time::Duration};
 
-use anyhow::{Result, ensure};
-use serde::Deserialize;
+use anyhow::{Context, Result, bail, ensure};
+use serde::{Deserialize, de::DeserializeOwned};
 use tracing::{debug, warn};
 
 use crate::{
@@ -13,6 +13,68 @@ use crate::{
 };
 
 const EVERY: Duration = Duration::from_secs(300);
+/// One request, including reading its body.
+const DEADLINE: Duration = Duration::from_secs(20);
+/// Larger than a full revocations page (1000 entries of ~300 bytes).
+const MAX_BODY: usize = 1 << 20;
+const PAGE: usize = 1000;
+
+/// The only way this server talks to Connect: HTTPS (plain HTTP only to loopback), no redirects, a
+/// bounded body read within one deadline, and nothing but `200` (or `404` where absence is an answer).
+#[derive(Clone)]
+struct Http {
+    base: String,
+    client: reqwest::Client,
+}
+
+impl Http {
+    fn new(url: &str) -> Result<Self> {
+        let parsed = reqwest::Url::parse(url).with_context(|| format!("invalid Gwar Connect URL {url}"))?;
+        let loopback = match parsed.host_str() {
+            Some(host) if host.eq_ignore_ascii_case("localhost") => true,
+            Some(host) => host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()),
+            None => false,
+        };
+        ensure!(
+            parsed.scheme() == "https" || (parsed.scheme() == "http" && loopback),
+            "Gwar Connect must be reached over HTTPS (plain HTTP only on loopback): {url}"
+        );
+        ensure!(
+            parsed.username().is_empty()
+                && parsed.password().is_none()
+                && parsed.query().is_none()
+                && parsed.fragment().is_none(),
+            "Gwar Connect URL must not carry credentials, a query or a fragment: {url}"
+        );
+        let client = reqwest::Client::builder()
+            .timeout(DEADLINE)
+            .redirect(reqwest::redirect::Policy::none())
+            .https_only(parsed.scheme() == "https")
+            .build()?;
+        Ok(Self { base: url.trim_end_matches('/').to_owned(), client })
+    }
+
+    /// `GET {base}{path}`: `Ok(None)` for `404`, the parsed body for `200`, an error for anything else.
+    async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<Option<T>> {
+        tokio::time::timeout(DEADLINE, async {
+            let mut reply = self.client.get(format!("{}{path}", self.base)).send().await?;
+            match reply.status() {
+                reqwest::StatusCode::OK => {}
+                reqwest::StatusCode::NOT_FOUND => return Ok(None),
+                status => bail!("Connect returned status {status}"),
+            }
+            ensure!(reply.content_length().is_none_or(|n| n <= MAX_BODY as u64), "Connect reply is too large");
+            let mut body = Vec::new();
+            while let Some(chunk) = reply.chunk().await? {
+                ensure!(body.len() + chunk.len() <= MAX_BODY, "Connect reply is too large");
+                body.extend_from_slice(&chunk);
+            }
+            Ok(Some(serde_json::from_slice(&body)?))
+        })
+        .await
+        .context("Connect did not answer in time")?
+    }
+}
 
 #[derive(Deserialize)]
 struct Feed {
@@ -35,14 +97,17 @@ pub async fn follow(url: String, core: CoreHandle, seq: i64) {
 
 /// [`follow`], checking every `every`.
 pub async fn follow_every(url: String, core: CoreHandle, mut seq: i64, every: Duration) {
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(20)).build().expect("http client");
+    let http = match Http::new(&url) {
+        Ok(http) => http,
+        Err(e) => return warn!("not following Gwar Connect revocations: {e:#}"),
+    };
     loop {
-        // Drain the feed (1000 per page), then wait.
+        // Drain the feed (PAGE per page), then wait.
         loop {
-            match fetch(&client, &url, seq).await {
+            match fetch(&http, seq).await {
                 Ok(entries) if entries.is_empty() => break,
                 Ok(entries) => {
-                    let full = entries.len() >= 1000;
+                    let full = entries.len() >= PAGE;
                     let (devices, last) = verified_revocations(entries, seq);
                     if last == seq {
                         break;
@@ -87,16 +152,16 @@ fn verified_revocations(mut entries: Vec<Entry>, mut seq: i64) -> (Vec<RevokedDe
     (devices, seq)
 }
 
-async fn fetch(client: &reqwest::Client, url: &str, since: i64) -> anyhow::Result<Vec<Entry>> {
-    let url = format!("{}/v1/revocations?since={since}", url.trim_end_matches('/'));
-    let feed: Feed = client.get(url).send().await?.error_for_status()?.json().await?;
+async fn fetch(http: &Http, since: i64) -> Result<Vec<Entry>> {
+    let feed: Feed =
+        http.get(&format!("/v1/revocations?since={since}")).await?.context("Connect has no revocations feed")?;
+    ensure!(feed.revocations.len() <= PAGE, "Connect returned an oversized revocations page");
     Ok(feed.revocations)
 }
 
 #[derive(Clone)]
 pub(crate) struct Lookup {
-    url: String,
-    client: reqwest::Client,
+    http: Http,
     service_key: std::sync::Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
@@ -117,10 +182,7 @@ impl Lookup {
         if let Some(key) = &*cached {
             return Ok(key.clone());
         }
-        let url = format!("{}/v1/service-key", self.url.trim_end_matches('/'));
-        let reply = self.client.get(url).send().await?.error_for_status()?;
-        ensure!(reply.status() == reqwest::StatusCode::OK, "Connect returned status {}", reply.status());
-        let ServiceKey { key } = reply.json().await?;
+        let ServiceKey { key } = self.http.get("/v1/service-key").await?.context("Connect has no service key")?;
         use base64::Engine;
         let raw: [u8; 32] = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(&key)?
@@ -132,19 +194,17 @@ impl Lookup {
     }
 
     pub fn new(url: String) -> Result<Self> {
-        let client = reqwest::Client::builder().timeout(Duration::from_secs(20)).build()?;
-        Ok(Self { url, client, service_key: Default::default() })
+        Ok(Self { http: Http::new(&url)?, service_key: Default::default() })
     }
 
     pub async fn account(&self, key: &str) -> Result<Option<vc_proto::HandleAttestation>> {
-        let url = format!("{}/v1/accounts/by-key/{key}", self.url.trim_end_matches('/'));
-        let reply = self.client.get(url).send().await?;
-        if reply.status() == reqwest::StatusCode::NOT_FOUND {
+        ensure!(
+            !key.is_empty() && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "invalid account key"
+        );
+        let Some(account) = self.http.get::<Account>(&format!("/v1/accounts/by-key/{key}")).await? else {
             return Ok(None);
-        }
-        let reply = reply.error_for_status()?;
-        ensure!(reply.status() == reqwest::StatusCode::OK, "Connect returned status {}", reply.status());
-        let account: Account = reply.json().await?;
+        };
         ensure!(account.account_key == key, "Connect returned a different account key");
         ensure!(
             (3..=32).contains(&account.handle.len())
@@ -203,6 +263,116 @@ mod tests {
         let (devices, cursor) = verified_revocations(vec![entry(1), entry(8)], cursor);
         assert!(devices.is_empty());
         assert_eq!(cursor, 8);
+    }
+
+    #[test]
+    fn connect_is_reached_only_over_https_or_loopback() {
+        for ok in ["https://gwar.example/connect", "http://127.0.0.1:9", "http://[::1]:9/", "http://localhost:9"] {
+            assert!(Http::new(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "http://gwar.example/connect",
+            "http://10.0.0.1",
+            "ftp://gwar.example",
+            "https://user:pw@gwar.example",
+            "https://gwar.example/?a=b",
+            "not a url",
+        ] {
+            assert!(Http::new(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// Valid Connect answers for the three things the server asks for.
+    fn honest(path: &str) -> serde_json::Value {
+        let service = SigningKey::from_bytes(&[42; 32]);
+        let public = URL_SAFE_NO_PAD.encode(service.verifying_key().as_bytes());
+        let mut a = HandleAttestation {
+            account_key: public.clone(),
+            handle: "account".into(),
+            issued_at: crate::core::now_ms(),
+            expires_at: crate::core::now_ms() + 86400000,
+            signature: String::new(),
+        };
+        a.signature = URL_SAFE_NO_PAD.encode(service.sign(handle_statement(&a).as_bytes()).to_bytes());
+        match path {
+            "/v1/service-key" => json!({"key": public}),
+            "/v1/revocations" => json!({"revocations": []}),
+            _ => json!({"handle": a.handle, "account_key": a.account_key, "attestation": a}),
+        }
+    }
+
+    async fn serve(
+        reply: impl Fn(&str) -> axum::response::Response + Clone + Send + Sync + 'static,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new().fallback(move |uri: axum::http::Uri| async move { reply(uri.path()) });
+        (url, tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }))
+    }
+
+    /// Asks for revocations, the service key and an account; `Ok` for each request that succeeded.
+    async fn ask(url: &str) -> [bool; 3] {
+        let account = URL_SAFE_NO_PAD.encode(SigningKey::from_bytes(&[42; 32]).verifying_key().as_bytes());
+        let lookup = Lookup::new(url.into()).unwrap();
+        [
+            fetch(&Http::new(url).unwrap(), 0).await.is_ok(),
+            lookup.key().await.is_ok(),
+            lookup.account(&account).await.is_ok_and(|a| a.is_some()),
+        ]
+    }
+
+    #[tokio::test]
+    async fn redirects_are_never_followed() {
+        use axum::response::IntoResponse;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (target, target_task) = serve({
+            let hits = hits.clone();
+            move |path| {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Json(honest(path)).into_response()
+            }
+        })
+        .await;
+        assert_eq!(ask(&target).await, [true; 3]);
+        hits.store(0, Ordering::SeqCst);
+        let (url, task) =
+            serve(move |path| axum::response::Redirect::temporary(&format!("{target}{path}")).into_response()).await;
+        assert_eq!(ask(&url).await, [false; 3]);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        task.abort();
+        target_task.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_replies_are_refused_with_or_without_a_length() {
+        use axum::response::IntoResponse;
+        let padded = |path: &str| {
+            let mut body = honest(path);
+            body["padding"] = json!("x".repeat(MAX_BODY));
+            serde_json::to_vec(&body).unwrap()
+        };
+        let (url, task) = serve(move |path| padded(path).into_response()).await;
+        assert_eq!(ask(&url).await, [false; 3]);
+        task.abort();
+        let (url, task) = serve(move |path| {
+            let chunks = padded(path).chunks(4096).map(|c| Ok::<_, std::io::Error>(c.to_vec())).collect::<Vec<_>>();
+            axum::body::Body::from_stream(futures::stream::iter(chunks)).into_response()
+        })
+        .await;
+        assert_eq!(ask(&url).await, [false; 3]);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn oversized_revocation_pages_are_refused() {
+        use axum::response::IntoResponse;
+        let page = || {
+            let entry = json!({"seq": 1, "account_key": "a", "device_key": "d", "revoked_at": 1, "signature": "s"});
+            Json(json!({"revocations": vec![entry; PAGE + 1]})).into_response()
+        };
+        let (url, task) = serve(move |_| page()).await;
+        assert!(fetch(&Http::new(&url).unwrap(), 0).await.is_err());
+        task.abort();
     }
 
     #[tokio::test]
