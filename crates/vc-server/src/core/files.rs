@@ -16,13 +16,11 @@ use vc_proto::{Attachment, ErrorCode, Permission, Response, SessionId};
 
 use super::{Core, CoreHandle, CoreMsg, Reply, err, now_ms, storage_error};
 
-/// How long a reserved upload waits for its bytes.
+/// How long a reserved upload waits for its bytes to start coming. Once started, it stays
+/// reserved until it finishes or is given up, however long writing it takes.
 const UPLOAD_WINDOW: Duration = Duration::from_secs(600);
 /// How long the bytes may take once they start coming (enforced by the HTTP side).
 pub const UPLOAD_DEADLINE: Duration = Duration::from_secs(600);
-/// A started upload stays reserved this much past its deadline, so its bytes count against
-/// the quotas for as long as anything may still be writing them.
-const FINISH_GRACE: Duration = Duration::from_secs(60);
 /// Uploads not attached to a message within this time are removed.
 const UNATTACHED_KEEP_MS: i64 = 24 * 3600 * 1000;
 const MAX_NAME: usize = 120;
@@ -35,6 +33,15 @@ pub(super) struct PendingUpload {
     token: String,
     sha256: String,
     until: Instant,
+    /// Its token was used: bytes may be on disk until `Finish` or `Abort`.
+    started: bool,
+}
+
+impl PendingUpload {
+    /// Whether it still holds its space at `now`.
+    fn live(&self, now: Instant) -> bool {
+        self.started || self.until > now
+    }
 }
 
 /// What the HTTP side needs to accept one upload.
@@ -66,9 +73,11 @@ pub enum FileMsg {
         upload: Uploaded,
         reply: oneshot::Sender<bool>,
     },
-    /// A started upload ended without finishing: its bytes go, then its reservation.
+    /// The upload this token started ended without finishing: its bytes go, then its
+    /// reservation. Sent by whoever presented the token, whether or not it got to start.
     Abort {
         id: String,
+        token: String,
     },
     Info {
         id: String,
@@ -84,9 +93,9 @@ impl CoreHandle {
         rx.await.ok().flatten()
     }
 
-    /// Gives up a started upload (see [`FileMsg::Abort`]); harmless once it has finished.
-    pub async fn upload_abort(&self, id: String) {
-        let _ = self.tx.send(CoreMsg::Files(FileMsg::Abort { id })).await;
+    /// Gives up an upload (see [`FileMsg::Abort`]); harmless once it has finished.
+    pub async fn upload_abort(&self, id: String, token: String) {
+        let _ = self.tx.send(CoreMsg::Files(FileMsg::Abort { id, token })).await;
     }
 
     pub async fn upload_finish(&self, upload: Uploaded) -> bool {
@@ -146,7 +155,7 @@ impl Core {
             return Err(err(ErrorCode::BadRequest, "invalid attachment hash"));
         }
         let now = Instant::now();
-        self.uploads.retain(|_, u| u.until > now);
+        self.uploads.retain(|_, u| u.live(now));
         // One user can't reserve unbounded space.
         let uploader = self.sessions[&session].uid.clone();
         if self.uploads.values().filter(|u| u.uploader == uploader).count() >= 10 {
@@ -174,7 +183,16 @@ impl Core {
         let upload_url = format!("/api/files/{id}?token={token}");
         self.uploads.insert(
             id.clone(),
-            PendingUpload { uploader, name: clean_name(&name), mime, size, token, sha256, until: now + UPLOAD_WINDOW },
+            PendingUpload {
+                uploader,
+                name: clean_name(&name),
+                mime,
+                size,
+                token,
+                sha256,
+                until: now + UPLOAD_WINDOW,
+                started: false,
+            },
         );
         Ok(Response::Upload { file: id, upload_url })
     }
@@ -187,19 +205,18 @@ impl Core {
                 let slot = self
                     .uploads
                     .get_mut(&id)
-                    .filter(|u| u.until > now && !u.token.is_empty() && u.token == token)
+                    .filter(|u| !u.started && u.until > now && u.token == token)
                     .map(|u| {
-                        // The token is spent; the upload stays reserved until it finishes or fails,
-                        // and in any case past the moment the HTTP side stops writing it.
-                        u.token.clear();
-                        u.until = deadline + FINISH_GRACE;
+                        // The token works once; the upload stays reserved until it finishes or is given up.
+                        u.started = true;
                         (u.size, u.sha256.clone())
                     })
                     .map(|(size, sha256)| UploadSlot { path: self.files_dir.join(&id), size, sha256, deadline });
                 let _ = reply.send(slot);
             }
             FileMsg::Finish { upload, reply } => {
-                let Some(pending) = self.uploads.remove(&upload.id) else {
+                // A refused upload stays reserved until its `Abort` removes the bytes.
+                let Some(pending) = self.uploads.get(&upload.id).filter(|u| u.started) else {
                     let _ = reply.send(false);
                     return;
                 };
@@ -208,7 +225,7 @@ impl Core {
                     return;
                 }
                 // Only sniffed media types are ever served as themselves.
-                let mime = upload.media.map(str::to_owned).unwrap_or(pending.mime);
+                let mime = upload.media.map(str::to_owned).unwrap_or_else(|| pending.mime.clone());
                 let stored = self.store.insert_file(
                     &upload.id,
                     &pending.uploader,
@@ -219,17 +236,18 @@ impl Core {
                     upload.dimensions,
                     now_ms(),
                 );
-                if let Err(e) = &stored {
-                    warn!("store: {e:#}");
+                match &stored {
+                    Ok(()) => drop(self.uploads.remove(&upload.id)),
+                    Err(e) => warn!("store: {e:#}"),
                 }
                 let _ = reply.send(stored.is_ok());
             }
-            FileMsg::Abort { id } => {
-                // Only a started upload: an unused token cannot be released by anyone but its expiry.
-                if self.uploads.get(&id).is_some_and(|u| !u.token.is_empty()) {
+            FileMsg::Abort { id, token } => {
+                // Only the upload this token started; a finished one is gone from `uploads` (its
+                // `Finish` came first) and its bytes are the stored file's.
+                if !self.uploads.get(&id).is_some_and(|u| u.started && u.token == token) {
                     return;
                 }
-                // A finished upload's bytes are the stored file's (its `Finish` came first).
                 if !matches!(self.store.file(&id), Ok(None)) {
                     return;
                 }
@@ -267,7 +285,7 @@ impl Core {
 
     pub(super) fn tick(&mut self) {
         let now = Instant::now();
-        self.uploads.retain(|_, u| u.until > now);
+        self.uploads.retain(|_, u| u.live(now));
         let mut gone = self.store.expire_unattached(now_ms() - UNATTACHED_KEEP_MS).unwrap_or_default();
         gone.extend(self.store.expire_orphans().unwrap_or_default());
         self.remove_files(gone);
@@ -276,23 +294,72 @@ impl Core {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         core::expiry_tests::{on_core, test_core_storing},
         store::Store,
     };
 
-    fn pending(size: u64) -> PendingUpload {
+    /// A reservation for 3 bytes with token "t", started or not.
+    fn pending(started: bool) -> PendingUpload {
         PendingUpload {
             uploader: "u".into(),
             name: "f".into(),
             mime: "x".into(),
-            size,
-            token: String::new(),
+            size: 3,
+            token: "t".into(),
             sha256: "h".into(),
             until: Instant::now() + UPLOAD_WINDOW,
+            started,
         }
+    }
+
+    /// Reserves `id` (not started, token "t").
+    pub(crate) async fn reserve(core: &CoreHandle, id: &'static str) {
+        on_core(core, move |core| drop(core.uploads.insert(id.into(), pending(false)))).await;
+    }
+
+    async fn reserved(core: &CoreHandle, id: &'static str) -> bool {
+        on_core(core, move |core| core.uploads.contains_key(id)).await
+    }
+
+    /// Waits for the core to finish giving `id` up.
+    pub(crate) async fn released(core: &CoreHandle, id: &'static str) -> bool {
+        for _ in 0..100 {
+            if !reserved(core, id).await {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_started_upload_holds_its_space_until_it_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core_storing(Store::in_memory().unwrap(), None, dir.path().into(), 100);
+        on_core(&core, |core| {
+            let past = Instant::now() - Duration::from_secs(1);
+            core.uploads.insert("waiting".into(), PendingUpload { until: past, ..pending(false) });
+            core.uploads.insert("writing".into(), PendingUpload { until: past, ..pending(true) });
+            core.uploads.insert("refused".into(), pending(true));
+            core.tick();
+        })
+        .await;
+        assert!(!reserved(&core, "waiting").await, "an unused reservation expires");
+        assert!(reserved(&core, "writing").await, "however long the bytes take");
+        // Only the token that started it gives it up.
+        core.upload_abort("writing".into(), "other".into()).await;
+        assert!(!released(&core, "writing").await);
+        // A refused finish keeps the space until the bytes are removed.
+        std::fs::write(dir.path().join("refused"), "abc").unwrap();
+        let wrong = Uploaded { id: "refused".into(), size: 3, sha256: "x".into(), media: None, dimensions: None };
+        assert!(!core.upload_finish(wrong).await);
+        assert!(reserved(&core, "refused").await);
+        core.upload_abort("refused".into(), "t".into()).await;
+        assert!(released(&core, "refused").await);
+        assert!(!dir.path().join("refused").exists());
     }
 
     /// A handler that goes away after its upload finished must not take the stored bytes with
@@ -302,23 +369,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let core = test_core_storing(Store::in_memory().unwrap(), None, dir.path().into(), 100);
         on_core(&core, |core| {
-            core.uploads.insert("done".into(), pending(3));
-            core.uploads.insert("half".into(), pending(3));
+            core.uploads.insert("done".into(), pending(true));
+            core.uploads.insert("half".into(), pending(true));
         })
         .await;
         std::fs::write(dir.path().join("done"), "abc").unwrap();
         std::fs::write(dir.path().join("half.part"), "a").unwrap();
         let done = Uploaded { id: "done".into(), size: 3, sha256: "h".into(), media: None, dimensions: None };
         assert!(core.upload_finish(done).await);
-        core.upload_abort("done".into()).await;
-        core.upload_abort("half".into()).await;
-        for _ in 0..100 {
-            if !on_core(&core, |core| core.uploads.contains_key("half")).await {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert!(!on_core(&core, |core| core.uploads.contains_key("half")).await, "space never freed");
+        core.upload_abort("done".into(), "t".into()).await;
+        core.upload_abort("half".into(), "t".into()).await;
+        assert!(released(&core, "half").await, "space never freed");
         assert!(!dir.path().join("half.part").exists());
         assert_eq!(std::fs::read(dir.path().join("done")).unwrap(), b"abc");
         assert!(core.file_info("done".into()).await.is_some());

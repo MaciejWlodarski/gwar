@@ -104,19 +104,21 @@ async fn paced<S: futures::Stream + Unpin>(
 }
 
 /// Until disarmed, gives the upload up however it ends: an error, a timeout or the client
-/// going away (which drops the handler). The core removes the bytes unless the upload
-/// finished, so a handler dropped after `Finish` reached the core loses nothing.
+/// going away (which drops the handler), from before the token is presented on. The core
+/// acts only on an upload this token started and never on a finished one, so a handler
+/// dropped around `Begin` or `Finish` leaves nothing behind and takes nothing stored.
 struct Abandoned {
     core: CoreHandle,
     id: String,
+    token: String,
     armed: bool,
 }
 
 impl Drop for Abandoned {
     fn drop(&mut self) {
         if self.armed {
-            let (core, id) = (self.core.clone(), std::mem::take(&mut self.id));
-            tokio::spawn(async move { core.upload_abort(id).await });
+            let (core, id, token) = (self.core.clone(), std::mem::take(&mut self.id), std::mem::take(&mut self.token));
+            tokio::spawn(async move { core.upload_abort(id, token).await });
         }
     }
 }
@@ -130,11 +132,17 @@ pub async fn upload(
     if !valid_id(&id) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let Some(slot) = gateway.core.upload_begin(id.clone(), query.token).await else {
+    receive(gateway.core, id, query.token, body).await
+}
+
+async fn receive(core: CoreHandle, id: String, token: String, body: Body) -> Response {
+    let mut abandoned = Abandoned { core: core.clone(), id: id.clone(), token: token.clone(), armed: true };
+    let Some(slot) = core.upload_begin(id.clone(), token).await else {
+        // Not started by us: whoever did owns it.
+        abandoned.armed = false;
         return (StatusCode::FORBIDDEN, "unknown or used upload").into_response();
     };
     let part = slot.path.with_extension("part");
-    let mut abandoned = Abandoned { core: gateway.core.clone(), id: id.clone(), armed: true };
     let result = async {
         if let Some(dir) = part.parent() {
             tokio::fs::create_dir_all(dir).await?;
@@ -179,11 +187,11 @@ pub async fn upload(
     .await;
     match result {
         Ok(Ok(uploaded)) => {
-            if !gateway.core.upload_finish(uploaded).await {
+            if !core.upload_finish(uploaded).await {
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
             abandoned.armed = false;
-            match gateway.core.file_info(id.clone()).await {
+            match core.file_info(id.clone()).await {
                 Some((file, _)) => axum::Json(file).into_response(),
                 None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
             }
@@ -315,6 +323,30 @@ mod tests {
         let mut done = futures::stream::iter([1u8]);
         assert_eq!(paced(&mut done, deadline + UPLOAD_DEADLINE).await, Ok(Some(1)));
         assert_eq!(paced(&mut done, deadline + UPLOAD_DEADLINE).await, Ok(None));
+    }
+
+    /// The client goes away while its token is with the core: the upload it started is
+    /// given up all the same.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_upload_dropped_while_starting_is_given_up() {
+        use crate::core::{
+            expiry_tests::{on_core, test_core_storing},
+            files::tests::{released, reserve},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core_storing(crate::store::Store::in_memory().unwrap(), None, dir.path().into(), 100);
+        reserve(&core, "f").await;
+        // The core is busy, so the token waits in its queue when the handler goes away.
+        let busy = tokio::spawn({
+            let core = core.clone();
+            async move { on_core(&core, |_| std::thread::sleep(std::time::Duration::from_millis(300))).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let body = axum::body::Body::from_stream(futures::stream::pending::<Result<Vec<u8>, std::io::Error>>());
+        let receiving = super::receive(core.clone(), "f".into(), "t".into(), body);
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(50), receiving).await.is_err());
+        busy.await.unwrap();
+        assert!(released(&core, "f").await, "the started upload kept its space");
     }
 
     #[tokio::test]

@@ -431,8 +431,9 @@ URLs they already know. Deleting the message/file removes it from the server;
 copies already downloaded remain. Upload tokens are one-use and expire after
 ten minutes; download capabilities do not expire. Reserved and in-progress
 uploads count against the quotas until they finish; a started upload has ten
-minutes for its bytes, and one that fails or is abandoned frees its space as
-soon as its partial file is removed.
+minutes for its bytes and keeps its space until it is stored or given up (an
+error, a timeout, the client going away), which frees the space once its bytes
+are removed. A stored file's bytes are never removed by a late give-up.
 
 File responses use `Cache-Control: no-store` for media and other files. Without
 expiring download capabilities, even a short private cache can outlive removal;

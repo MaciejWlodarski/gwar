@@ -1658,15 +1658,15 @@ fn client_view(s: &Session) -> Client {
 }
 
 #[cfg(test)]
-mod expiry_tests {
+pub(crate) mod expiry_tests {
     use super::*;
 
-    pub(super) fn test_core(store: Store, password: Option<&str>) -> CoreHandle {
+    pub(crate) fn test_core(store: Store, password: Option<&str>) -> CoreHandle {
         test_core_storing(store, password, PathBuf::new(), 0)
     }
 
     /// A core whose uploads of up to `upload_limit` bytes go to `files_dir`.
-    pub(super) fn test_core_storing(
+    pub(crate) fn test_core_storing(
         store: Store,
         password: Option<&str>,
         files_dir: PathBuf,
@@ -1694,7 +1694,7 @@ mod expiry_tests {
     }
 
     /// Runs `f` on the actor, between any other messages.
-    pub(super) async fn on_core<T: Send + 'static>(
+    pub(crate) async fn on_core<T: Send + 'static>(
         core: &CoreHandle,
         f: impl FnOnce(&mut Core) -> T + Send + 'static,
     ) -> T {
