@@ -241,6 +241,21 @@ pub async fn download(
     serve_file(held, len, &file.mime, &file.name, request).await
 }
 
+/// Up to `max` bytes; empty at the end. Retries reads interrupted by a signal.
+fn read_chunk(reader: &mut impl std::io::Read, max: usize) -> std::io::Result<Vec<u8>> {
+    let mut chunk = vec![0; max];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(n) => {
+                chunk.truncate(n);
+                return Ok(chunk);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// An open file with the lease that keeps its bytes on disk. Fields drop in order: the
 /// handle closes before the lease ends.
 struct Held<L> {
@@ -287,11 +302,7 @@ async fn serve_file<L: Send + 'static>(
             return Ok(None);
         }
         let (held, chunk) = tokio::task::spawn_blocking(move || {
-            let mut chunk = vec![0; left.min(64 * 1024) as usize];
-            let read = std::io::Read::read(&mut held.file, &mut chunk).map(|n| {
-                chunk.truncate(n);
-                chunk
-            });
+            let read = read_chunk(&mut held.file, left.min(64 * 1024) as usize);
             (held, read)
         })
         .await
@@ -328,7 +339,7 @@ async fn serve_file<L: Send + 'static>(
 mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
 
-    use super::{Held, UPLOAD_IDLE, byte_range, media_type, paced, serve_file, valid_id};
+    use super::{Held, UPLOAD_IDLE, byte_range, media_type, paced, read_chunk, serve_file, valid_id};
     use crate::core::files::UPLOAD_DEADLINE;
     use axum::http::StatusCode;
 
@@ -449,6 +460,24 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("the lease never ended");
+    }
+
+    #[test]
+    fn reads_interrupted_by_a_signal_are_retried() {
+        /// Fails once with `kind`, then reads "data".
+        struct Failing(Option<std::io::ErrorKind>);
+        impl std::io::Read for Failing {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if let Some(kind) = self.0.take() {
+                    return Err(kind.into());
+                }
+                buf[..4].copy_from_slice(b"data");
+                Ok(4)
+            }
+        }
+        assert_eq!(read_chunk(&mut Failing(Some(std::io::ErrorKind::Interrupted)), 8).unwrap(), b"data");
+        let other = read_chunk(&mut Failing(Some(std::io::ErrorKind::Other)), 8);
+        assert!(other.is_err(), "other errors still end the download");
     }
 
     #[test]
