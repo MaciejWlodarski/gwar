@@ -247,7 +247,7 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Command::AdminToken) => {
-            let token = issue_token(&Store::open(&database)?, ADMIN_GROUP)?;
+            let token = issue_token(&Store::open(&database)?, ADMIN_GROUP, None)?;
             println!("{token}");
             return Ok(());
         }

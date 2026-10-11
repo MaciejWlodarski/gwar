@@ -215,6 +215,58 @@ async fn invites_belong_to_their_creator_not_to_a_nickname() {
     root.ok("invite.delete", json!({"code": code})).await;
 }
 
+#[tokio::test]
+async fn invites_and_tokens_lapse_with_their_makers_rights() {
+    let server = TestServer::start_with(|c| c.server_password = Some("secret".into())).await;
+    let mut root = Client::connect_as(&server, new_key(), "root", Some("secret")).await.unwrap();
+    root.redeem(&server.admin_token).await;
+    let mods = group_id(
+        &root
+            .ok(
+                "group.create",
+                json!({"name": "Mods", "permissions": ["client_kick", "invite_create", "token_create"]}),
+            )
+            .await,
+    );
+    let mut alice = Client::connect_as(&server, new_key(), "alice", Some("secret")).await.unwrap();
+    with_groups(&mut root, &alice, json!([2, mods])).await;
+    let mut codes = Vec::new();
+    for group in [json!(mods), json!(mods), Value::Null] {
+        codes.push(
+            alice.ok("invite.create", json!({"group": group})).await["invite"]["code"].as_str().unwrap().to_owned(),
+        );
+    }
+    let plain = group_id(&root.ok("group.create", json!({"name": "Plain", "permissions": []})).await);
+    let mut token =
+        async |group| alice.ok("token.create", json!({"group": group})).await["token"].as_str().unwrap().to_owned();
+    let (first_token, second_token, plain_token) = (token(mods).await, token(mods).await, token(plain).await);
+    let with_invite = |code: String| {
+        move |raw: &RawConn, key: &_| {
+            let mut hello = raw.hello(key, "guest", None);
+            hello["join"]["invite"] = json!(code);
+            hello
+        }
+    };
+    let in_mods =
+        |c: &Client| c.welcome.clients.iter().find(|x| x.id == c.id()).unwrap().groups.contains(&(mods as u32));
+
+    // While Alice holds the rights, what she made works.
+    let guest = Client::connect_with(&server, new_key(), with_invite(codes[0].clone())).await.expect("invite admits");
+    assert!(in_mods(&guest));
+    let mut bob = Client::connect_as(&server, new_key(), "bob", Some("secret")).await.unwrap();
+    bob.redeem(&first_token).await;
+
+    // Demoted, she keeps only a member's rights: her group grants lapse, a plain invite still admits.
+    with_groups(&mut root, &alice, json!([2])).await;
+    let refused = Client::connect_with(&server, new_key(), with_invite(codes[1].clone())).await.err().expect("lapsed");
+    assert_eq!(refused.code, vc_proto::ErrorCode::WrongPassword);
+    assert!(!in_mods(&Client::connect_with(&server, new_key(), with_invite(codes[2].clone())).await.expect("admits")));
+    let mut carol = Client::connect_as(&server, new_key(), "carol", Some("secret")).await.unwrap();
+    assert_eq!(carol.fails("token.redeem", json!({"token": second_token})).await, "forbidden");
+    // Even for a group with nothing in it: she can no longer make tokens at all.
+    assert_eq!(carol.fails("token.redeem", json!({"token": plain_token})).await, "forbidden");
+}
+
 // ------------------------------------------------------------- settings
 
 #[tokio::test]

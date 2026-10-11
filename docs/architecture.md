@@ -297,8 +297,12 @@ snapshot after removal.
 
 A user is their Ed25519 key (like a TeamSpeak identity): no central accounts,
 and it works on any self-hosted server. Groups (Admin, Member) carry permission
-lists; one-time tokens grant groups. Channel and server passwords are stored as
-Argon2 of TeamSpeak's wire form `base64(sha1(password))`.
+lists; one-time tokens grant groups. Nobody can make a token or invite for a
+group with permissions they lack, and one only works while its maker still
+could make it: demoting or removing them voids what they handed out. Tokens the
+server issues itself (the first admin token, `vc-server admin-token`) have no maker;
+invites from before makers were recorded admit nobody. Channel and server
+passwords are stored as Argon2 of TeamSpeak's wire form `base64(sha1(password))`.
 
 Members are the users' rows in SQLite (`users`, with groups and read marks).
 `member.remove` deletes one (and with `delete_messages` their stored messages

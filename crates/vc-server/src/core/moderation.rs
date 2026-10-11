@@ -66,6 +66,15 @@ impl Core {
         groups.iter().filter_map(|g| self.groups.get(g)).flat_map(|g| g.permissions.iter().copied()).collect()
     }
 
+    /// Whether the member `uid`, online or not, could now make an invite or token
+    /// (`kind`) for `group`. Grants made earlier lapse with their maker's rights.
+    pub(super) fn could_grant(&self, uid: &str, kind: Permission, group: Option<GroupId>) -> anyhow::Result<bool> {
+        let Some(groups) = self.store.groups_of(uid)? else { return Ok(false) };
+        let theirs = self.group_permissions(&groups);
+        let granted = group.map(|g| self.group_permissions(&[g])).unwrap_or_default();
+        Ok(theirs.contains(&kind) && granted.is_subset(&theirs))
+    }
+
     /// Whether everything `permissions` allows is also allowed to `session`.
     pub(super) fn covers(&self, session: SessionId, permissions: &BTreeSet<Permission>) -> bool {
         permissions.is_subset(&self.my_permissions(session))
@@ -281,7 +290,15 @@ impl Core {
         known: Option<&vc_proto::Member>,
     ) -> anyhow::Result<Option<Option<GroupId>>> {
         let now = now_ms();
-        let Some(group) = self.store.peek_invite(code, now)? else { return Ok(None) };
+        let Some((group, creator)) = self.store.peek_invite(code, now)? else { return Ok(None) };
+        // An invite from before ownership was recorded has nobody to vouch for it.
+        let vouched = match &creator {
+            Some(creator) => self.could_grant(creator, Permission::InviteCreate, group)?,
+            None => false,
+        };
+        if !vouched {
+            return Ok(None);
+        }
         let useful = match known {
             None => true,
             Some(member) => group.is_some_and(|g| !member.groups.contains(&g)),

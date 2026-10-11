@@ -243,6 +243,11 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE invites ADD COLUMN creator_uid TEXT;
     "#,
+    // Who made a token, so it grants only while they still could; NULL: the server itself
+    // (the first admin token, `vc-server token`).
+    r#"
+    ALTER TABLE tokens ADD COLUMN creator_uid TEXT;
+    "#,
 ];
 
 /// References reassigned by a member merge (including ones already held by the target).
@@ -448,6 +453,17 @@ impl Store {
         Ok(Some((id, Member { uid: uid.to_owned(), nickname, tag, connect, groups: self.user_groups(id)?, last_seen })))
     }
 
+    #[cfg(test)]
+    pub(crate) fn raw(&self) -> &Connection {
+        &self.db
+    }
+
+    /// The groups of the member `uid`, `None` if there is no such member.
+    pub fn groups_of(&self, uid: &str) -> Result<Option<Vec<GroupId>>> {
+        let id = self.db.query_row("SELECT id FROM users WHERE uid=?1", [uid], |r| r.get::<_, i64>(0)).optional()?;
+        id.map(|id| self.user_groups(id)).transpose()
+    }
+
     pub fn set_user_groups(&self, user_id: i64, groups: &[GroupId]) -> Result<()> {
         let tx = self.db.unchecked_transaction()?;
         tx.execute("DELETE FROM user_groups WHERE user_id=?1", [user_id])?;
@@ -483,19 +499,21 @@ impl Store {
         Ok(())
     }
 
-    pub fn insert_token(&self, token_hash: &str, group: GroupId, now: i64) -> Result<()> {
+    pub fn insert_token(&self, token_hash: &str, group: GroupId, creator: Option<&str>, now: i64) -> Result<()> {
         self.db.execute(
-            "INSERT INTO tokens(token_hash,group_id,created_at) VALUES(?1,?2,?3)",
-            params![token_hash, group, now],
+            "INSERT INTO tokens(token_hash,group_id,created_at,creator_uid) VALUES(?1,?2,?3,?4)",
+            params![token_hash, group, now, creator],
         )?;
         Ok(())
     }
 
-    /// Consumes a single-use token, returning the group it grants.
-    pub fn redeem_token(&self, token_hash: &str) -> Result<Option<GroupId>> {
+    /// Consumes a single-use token, returning the group it grants and who made it.
+    pub fn redeem_token(&self, token_hash: &str) -> Result<Option<(GroupId, Option<String>)>> {
         Ok(self
             .db
-            .query_row("DELETE FROM tokens WHERE token_hash=?1 RETURNING group_id", [token_hash], |r| r.get(0))
+            .query_row("DELETE FROM tokens WHERE token_hash=?1 RETURNING group_id,creator_uid", [token_hash], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .optional()?)
     }
 
@@ -689,6 +707,7 @@ impl Store {
         tx.execute("DELETE FROM message_mentions WHERE uid=?1 AND message IN (SELECT id FROM messages WHERE signature IS NULL)", [from])?;
         report.bans = tx.execute("UPDATE bans SET uid=?2 WHERE uid=?1", params![from, into])?;
         tx.execute("UPDATE invites SET creator_uid=?2 WHERE creator_uid=?1", params![from, into])?;
+        tx.execute("UPDATE tokens SET creator_uid=?2 WHERE creator_uid=?1", params![from, into])?;
         // bans.by and invites.created_by are display-name snapshots, not identity references.
         // Revoked devices belong to cryptographic account keys and must never be reassigned.
         tx.execute(
@@ -1066,14 +1085,15 @@ impl Store {
     }
 
     /// Whether an invite is valid now, without using it; returns the group it grants.
-    pub fn peek_invite(&self, code: &str, now: i64) -> Result<Option<Option<GroupId>>> {
+    /// A valid invite's group and creator, without using it.
+    pub fn peek_invite(&self, code: &str, now: i64) -> Result<Option<(Option<GroupId>, Option<String>)>> {
         Ok(self
             .db
             .query_row(
-                "SELECT group_id FROM invites
+                "SELECT group_id,creator_uid FROM invites
                  WHERE code=?1 AND (expires_at IS NULL OR expires_at > ?2) AND (max_uses IS NULL OR uses < max_uses)",
                 params![code, now],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?)
     }
@@ -1200,8 +1220,8 @@ mod tests {
     #[test]
     fn tokens_are_single_use() {
         let store = Store::in_memory().unwrap();
-        store.insert_token("h", ADMIN_GROUP, 0).unwrap();
-        assert_eq!(store.redeem_token("h").unwrap(), Some(ADMIN_GROUP));
+        store.insert_token("h", ADMIN_GROUP, None, 0).unwrap();
+        assert_eq!(store.redeem_token("h").unwrap(), Some((ADMIN_GROUP, None)));
         assert_eq!(store.redeem_token("h").unwrap(), None);
     }
 
@@ -1405,7 +1425,7 @@ mod tests {
     #[test]
     fn invites_from_before_ownership_belong_to_nobody() {
         let db = Connection::open_in_memory().unwrap();
-        let before = migration_adding("ADD COLUMN creator_uid");
+        let before = migration_adding("invites ADD COLUMN creator_uid");
         for migration in &MIGRATIONS[..before] {
             db.execute_batch(migration).unwrap();
         }

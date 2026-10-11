@@ -307,9 +307,10 @@ fn check_password_len(password: &str) -> Result<(), ErrorBody> {
 }
 
 /// Creates a single-use token for `group`, e.g. the first admin token.
-pub fn issue_token(store: &Store, group: GroupId) -> Result<String> {
+/// A new token for `group`; `creator`: the member it comes from, `None` for the server itself.
+pub fn issue_token(store: &Store, group: GroupId, creator: Option<&str>) -> Result<String> {
     let token = new_token();
-    store.insert_token(&token_hash(&token), group, now_ms())?;
+    store.insert_token(&token_hash(&token), group, creator, now_ms())?;
     Ok(token)
 }
 
@@ -319,7 +320,7 @@ pub fn ensure_first_admin_token(store: &Store) -> Result<Option<String>> {
     if store.meta("admin_token_issued")?.is_some() {
         return Ok(None);
     }
-    let token = issue_token(store, ADMIN_GROUP)?;
+    let token = issue_token(store, ADMIN_GROUP, None)?;
     store.set_meta("admin_token_issued", "1")?;
     warn!("first start: redeem this one-time admin token in your client: {token}");
     Ok(Some(token))
@@ -1574,14 +1575,19 @@ impl Core {
         if !g.permissions.iter().all(|p| mine.contains(p)) {
             return Err(err(ErrorCode::Forbidden, "cannot grant permissions you do not have"));
         }
-        let token = issue_token(&self.store, group).map_err(storage_error)?;
+        let token = issue_token(&self.store, group, Some(&self.sessions[&session].uid)).map_err(storage_error)?;
         Ok(Response::Token { token })
     }
 
     fn token_redeem(&mut self, session: SessionId, token: &str) -> Reply {
-        let Some(group) = self.store.redeem_token(&token_hash(token.trim())).map_err(storage_error)? else {
+        let Some((group, creator)) = self.store.redeem_token(&token_hash(token.trim())).map_err(storage_error)? else {
             return Err(err(ErrorCode::NotFound, "invalid or used token"));
         };
+        if let Some(creator) = creator
+            && !self.could_grant(&creator, Permission::TokenCreate, Some(group)).map_err(storage_error)?
+        {
+            return Err(err(ErrorCode::Forbidden, "whoever made this token can no longer grant its group"));
+        }
         let user_id = self.sessions[&session].user_id;
         self.store.add_user_group(user_id, group).map_err(storage_error)?;
         let groups = self.store.user_groups(user_id).map_err(storage_error)?;
@@ -1649,6 +1655,67 @@ fn client_view(s: &Session) -> Client {
 #[cfg(test)]
 mod expiry_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn invites_from_before_ownership_admit_nobody() {
+        let store = Store::in_memory().unwrap();
+        let maker = store.touch_user("maker", &URL_SAFE_NO_PAD.encode([7; 32]), "maker", 1).unwrap();
+        store.set_user_groups(maker.id, &[crate::store::MEMBER_GROUP]).unwrap();
+        let invite = |code: &str| vc_proto::Invite {
+            code: code.into(),
+            uses: 0,
+            max_uses: None,
+            expires_at: None,
+            group: None,
+            created_by: "maker".into(),
+            created_at: 1,
+        };
+        store.insert_invite(&invite("owned"), "maker").unwrap();
+        store
+            .raw()
+            .execute("INSERT INTO invites(code,uses,created_by,created_at) VALUES('old',0,'maker',1)", [])
+            .unwrap();
+        let (media, _commands) = mpsc::channel(8);
+        let core = spawn(
+            store,
+            CoreConfig {
+                max_clients: 10,
+                ice_servers: Vec::new(),
+                version: "test".into(),
+                password: Arc::new(ArcSwap::from_pointee(Some("secret".into()))),
+                upload_limit: 0,
+                upload_quota: 0,
+                storage_limit: 0,
+                files_dir: PathBuf::new(),
+                connect_url: None,
+                server_key: String::new(),
+            },
+            Arc::new(ArcSwap::from_pointee(Routing::default())),
+            media,
+        )
+        .unwrap();
+        for (key, code, admitted) in [(1u8, "old", false), (2, "owned", true)] {
+            let (out, _frames) = mpsc::channel(OUTBOUND_QUEUE);
+            let session = core
+                .connect(ConnectRequest {
+                    request_id: 1,
+                    hello_key: String::new(),
+                    certificate: None,
+                    uid: crate::identity::uid_for_key(&[key; 32]),
+                    public_key: URL_SAFE_NO_PAD.encode([key; 32]),
+                    nickname: "guest".into(),
+                    platform: Platform::Web,
+                    out,
+                    ip: None,
+                    device: None,
+                    device_expires_at: None,
+                    invite: Some(code.into()),
+                    password_ok: false,
+                })
+                .await;
+            assert_eq!(session.is_some(), admitted, "{code}");
+        }
+    }
 
     #[tokio::test]
     async fn expiry_queues_sfu_removal_even_when_the_media_queue_is_full() {
