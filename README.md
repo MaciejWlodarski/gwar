@@ -185,7 +185,8 @@ Being honest about the limits is part of the design:
   Connect could serve you an older copy of your encrypted vault.
 - The web app runs the code its host serves on every load (see
   [The official web app](#the-official-web-app)). Desktop builds are not
-  signed yet.
+  code-signed by Apple or Microsoft yet; their checksums are signed with the
+  release key (see [Download](#download)).
 - TeamSpeak users have no Gwar keys, so their messages are shown as unsigned.
 
 ### By design

@@ -325,7 +325,9 @@ Every guarantee assumes your client runs genuine code.
   already served a modified page: a check run by code from the same origin
   proves nothing. Local identity keys are exportable so they can be backed up.
 - **Desktop app.** Code is bundled; the webview has a CSP. Builds are not yet
-  signed or notarized; there is no auto-updater. The native file commands
+  code-signed or notarized, but each release's `SHA256SUMS` is signed with the
+  release key in `docs/release-key.pub` and every file has a GitHub build
+  attestation (docs/releasing.md); there is no auto-updater. The native file commands
   confine requests to the file paths of the server origin the interface names.
   Each connection (every welcome, a resync too) gets a random file session;
   uploads, downloads and saves name the session they belong to, and native code
