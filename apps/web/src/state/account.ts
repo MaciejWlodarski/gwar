@@ -376,11 +376,13 @@ export const accountActions = {
   async signOut(): Promise<void> {
     const record = await loadConnectRecord();
     const synced = !!record?.vaultKey && (await flushBookmarks(record.accountKey));
+    const flushed = useSettings.getState().bookmarkEdits;
     if (record) await flows.signOut(record, deps());
-    useSettings.getState().setBookmarkAccount(null);
-    // Synced: the account's servers leave this device and come back on signing in. Otherwise they stay, hidden,
-    // and sync when the account signs in here again.
-    if (record && synced) useSettings.getState().dropAccountBookmarks(record.accountKey);
+    const settings = useSettings.getState();
+    settings.setBookmarkAccount(null);
+    // Synced, and nothing edited while signing out: the account's servers leave this device and come back on
+    // signing in. Otherwise they stay, hidden, and sync when the account signs in here again.
+    if (record && synced && settings.bookmarkEdits === flushed) settings.dropAccountBookmarks(record.accountKey);
     // TeamSpeak goes back to this device's own identities.
     await tsBridge()?.setList("account", null).catch((e: unknown) => console.warn("could not drop the account's TeamSpeak identities", e));
     bumpTs();
