@@ -406,25 +406,26 @@ Connect, next to the vault (which is capped at 64 KiB and stays as it is):
 - **Uploading** uses the newest generation that is **safe** by what the
   device knows: it carries every revocation of the account the device
   knows, its creator and every recipient are current, unrevoked devices of
-  the account, and it is sealed to the current recovery key. A generation
-  made before a revocation is therefore unsafe even if a key transfer the
-  device never saw reached the revoked device.
-  Otherwise the device queues uploads and creates the next generation
-  itself (a fresh key); if Connect already holds an unsafe manifest for that
-  number, it takes the next free number. It never falls back to an unsafe or
-  older generation, so a withheld manifest can stall uploads, never weaken
-  them. Once a device learns of a revocation, the old generation is unsafe,
-  so this happens before its next upload; if no remaining device is online,
-  the next one to connect does it first. A revocation withheld by Connect is
-  not learned, so until then uploads continue under the old generation.
+  the account, and it is sealed to the current recovery key. Otherwise the
+  device queues uploads and creates the next generation itself (a fresh
+  key); if Connect already holds an unsafe manifest for that number, it
+  takes the next free number. It never falls back to an unsafe or older
+  generation, so a withheld manifest can stall uploads, never weaken them.
+  Once a device learns of a revocation, every generation made before it is
+  unsafe, even one a transfer the device never saw may have brought to the
+  revoked device, so a new one is made before its next upload; if no
+  remaining device is online, the next one to connect does it first. A
+  revocation withheld by Connect is not learned, so until then uploads
+  continue under the old generation.
 - **Delivering keys later** (to a new device, or to a new recovery key) uses
   a **key transfer**, signed by a current device of the account: account
   key, manifest hash and generation, the recipient (device key and X25519
   key, or recovery key version), and the HPKE encapsulation and ciphertext.
   The sender first learns the manifest's revocations and never transfers to
-  a device revoked by them or by its own feed. Manifests never change. An existing device sends transfers for every
-  generation it can open when it sees a new device's certificate; until one
-  is online, the new device reads nothing from the archive.
+  a device revoked by them or by its own feed. Manifests never change. An
+  existing device sends transfers for every generation it can open when it
+  sees a new device's certificate; until one is online, the new device reads
+  nothing from the archive.
 - **Changing the recovery code** (which needs the password and a signed-in
   device) publishes a new recovery key version; that device then sends
   transfers of every generation it can open to the new recovery key and
@@ -648,6 +649,12 @@ The direction above is settled; these are pinned down before building:
   atomic checkpoint storage;
 - restart validation, including member lists bound to the successor's
   `group_id`;
+- the state machine of an access list whose signer expires or is revoked
+  (kept for history, no longer current), across renewals, owner changes and
+  concurrent lists;
+- durable storage of the revocations a device learns from manifests and its
+  own actions, independent of the feed cursor, rechecked before every upload
+  and transfer; the withheld-generation case is a regression test;
 - crash-safe ordering of a recovery code change (credentials, recovery key,
   transfers, new generation), manifest predecessors across skipped numbers,
   and domain-separated recovery key derivation and HPKE context;
