@@ -15,7 +15,7 @@ import type { ConnectRecord } from "../net/identity";
 import { isDesktop, tauri } from "../platform";
 import { ConnectApi } from "./api";
 import { addEntry, DEFAULT_NAME, emptyList, normalizeList, sameList, type TsEntry, type TsList } from "./ts-list";
-import { loadVault, updateVault, vaultList, withTeamspeakList } from "./vault";
+import { loadVault, updateVault, vaultList, withTeamspeakList, type VaultContents } from "./vault";
 
 /** Most servers refuse identities below this security level. */
 export const MIN_LEVEL = 8;
@@ -95,12 +95,45 @@ export type SyncOutcome =
 
 /** The device's own list; if it has none, a new identity named "Default" is made and stored first. */
 async function deviceListOrNew(ts: TsBridge): Promise<TsList> {
-  const own = await ts.exportList("device");
-  if (own.identities.length > 0) return own;
+  // Public metadata first: exporting private keys asks the user, which is pointless for an empty list.
+  if ((await ts.list("device")).identities.length > 0) return ts.exportList("device");
   const made = await ts.generate();
   const list = addEntry(emptyList(), entryOf(made, DEFAULT_NAME)).list;
   await ts.setList("device", list);
   return list;
+}
+
+/** The identities this desktop uses now (the account's, if it used them before), or null if it uses none. */
+async function inUseList(ts: TsBridge): Promise<TsList | null> {
+  return (await ts.list("active")).identities.length > 0 ? ts.exportList("active") : null;
+}
+
+/** Thrown inside a vault update that needs a list from the desktop first; the update then runs again. */
+class NeedsList extends Error {
+  constructor(readonly which: "inUse" | "device") { super(`needs the ${which} list`); }
+}
+
+/**
+ * `updateVault` with lists from the desktop that `change` may need. They are fetched (which may ask the user)
+ * only when an attempt needs them, and the update then starts over on fresh vault contents, so the decision is
+ * always made on the contents that are written.
+ */
+async function updateWithLists(
+  api: ConnectApi,
+  record: ConnectRecord,
+  ts: TsBridge,
+  change: (contents: VaultContents, lists: { inUse?: TsList; device?: TsList }) => VaultContents,
+) {
+  const lists: { inUse?: TsList; device?: TsList } = {};
+  for (;;) {
+    try {
+      return await updateVault(api, record, (c) => change(c, lists));
+    } catch (e) {
+      if (!(e instanceof NeedsList)) throw e;
+      if (e.which === "inUse") lists.inUse = (await inUseList(ts)) ?? emptyList();
+      else lists.device = await deviceListOrNew(ts);
+    }
+  }
 }
 
 /** Run after any flow that stored a (new) vault key. Throws on network or TeamSpeak errors; callers log them. */
@@ -109,10 +142,19 @@ export async function syncAfterUnlock(api: ConnectApi, record: ConnectRecord, ts
   let { contents } = await loadVault(api, record);
   let outcome: SyncOutcome = "adopted";
   if (vaultList(contents).identities.length === 0) {
-    const own = await deviceListOrNew(ts);
-    // Another desktop may have seeded it meanwhile; then its identities win.
-    ({ contents } = await updateVault(api, record, (c) => (vaultList(c).identities.length > 0 ? c : withTeamspeakList(c, own, now))));
-    outcome = sameList(vaultList(contents), own) ? "seeded" : "adopted";
+    let seeded: TsList | undefined;
+    // Another desktop may have seeded it meanwhile; then its identities win. No TeamSpeak section at all (never
+    // written, or lost, e.g. Connect restored an old backup) seeds the identities in use, so a desktop that used
+    // the account's identities keeps them; a list the user emptied seeds the device's own.
+    ({ contents } = await updateWithLists(api, record, ts, (c, lists) => {
+      if (vaultList(c).identities.length > 0) return c;
+      const missing = c.teamspeak === undefined;
+      if (missing && !lists.inUse) throw new NeedsList("inUse");
+      seeded = missing && lists.inUse!.identities.length > 0 ? lists.inUse : lists.device;
+      if (!seeded) throw new NeedsList("device");
+      return withTeamspeakList(c, seeded, now);
+    }));
+    outcome = seeded && sameList(vaultList(contents), seeded) ? "seeded" : "adopted";
   }
   await ts.setList("account", vaultList(contents));
   return outcome;
@@ -149,7 +191,11 @@ export async function changeIdentities(
     await ts.setList("device", next);
     return next;
   }
-  const state = await updateVault(api, record, (c) => withTeamspeakList(c, normalizeList(change(vaultList(c))), now));
+  // A vault without a TeamSpeak section lost it (see syncAfterUnlock): start from the identities in use, not from none.
+  const state = await updateWithLists(api, record, ts, (c, lists) => {
+    if (c.teamspeak === undefined && !lists.inUse) throw new NeedsList("inUse");
+    return withTeamspeakList(c, normalizeList(change(c.teamspeak === undefined ? lists.inUse! : vaultList(c))), now);
+  });
   const next = vaultList(state.contents);
   await ts.setList("account", next);
   return next;
