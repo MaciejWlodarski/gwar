@@ -251,6 +251,16 @@ describe("changeIdentities", () => {
     expect(vaultList((await serverVault(service, record))!.contents as never)).toEqual(next);
   }, 30_000);
 
+  it("signed in: after the vault lost its section, a change on a desktop using no identities starts from none", async () => {
+    const { api, record, service, ts } = await signedIn("ts.lost.empty");
+    ts.device = emptyList();
+    await writeServerVault(service, record, { other: 1 });
+    const next = await changeIdentities(api, record, ts, add(entry("c")), 9);
+    expect(next).toEqual({ default: "c", identities: [entry("c")] });
+    expect(ts.made).toBe(0);
+    expect(ts.device).toEqual(emptyList());
+  }, 30_000);
+
   it("signed in: a failed vault write leaves the desktop alone", async () => {
     const { api, record, service, ts } = await signedIn("ts.fail");
     service.sessions.clear();

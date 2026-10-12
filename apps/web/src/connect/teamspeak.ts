@@ -130,7 +130,7 @@ async function updateWithLists(
       return await updateVault(api, record, (c) => change(c, lists));
     } catch (e) {
       if (!(e instanceof NeedsList)) throw e;
-      if (e.which === "inUse") lists.inUse = (await inUseList(ts)) ?? (await deviceListOrNew(ts));
+      if (e.which === "inUse") lists.inUse = (await inUseList(ts)) ?? emptyList();
       else lists.device = await deviceListOrNew(ts);
     }
   }
@@ -148,9 +148,10 @@ export async function syncAfterUnlock(api: ConnectApi, record: ConnectRecord, ts
     // the account's identities keeps them; a list the user emptied seeds the device's own.
     ({ contents } = await updateWithLists(api, record, ts, (c, lists) => {
       if (vaultList(c).identities.length > 0) return c;
-      const which = c.teamspeak === undefined ? "inUse" : "device";
-      seeded = lists[which];
-      if (!seeded) throw new NeedsList(which);
+      const missing = c.teamspeak === undefined;
+      if (missing && !lists.inUse) throw new NeedsList("inUse");
+      seeded = missing && lists.inUse!.identities.length > 0 ? lists.inUse : lists.device;
+      if (!seeded) throw new NeedsList("device");
       return withTeamspeakList(c, seeded, now);
     }));
     outcome = seeded && sameList(vaultList(contents), seeded) ? "seeded" : "adopted";
