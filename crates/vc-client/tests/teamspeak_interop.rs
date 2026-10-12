@@ -193,37 +193,57 @@ async fn teamspeak_whisper_reaches_only_its_target() {
     .await
     .expect("both puppets on TeamSpeak");
 
+    let level = |heard: &Arc<Mutex<Vec<f32>>>| {
+        let samples = heard.lock().unwrap().clone();
+        rms(&samples[samples.len().saturating_sub(96_000)..])
+    };
+    // Plain speech reaches both, so both can hear at all.
+    speak(&mut ts, None).await;
+    for (name, (_, _, heard)) in ["target", "bystander"].iter().zip(&listeners) {
+        let heard_level = level(heard);
+        assert!(heard_level > 0.05, "{name} heard plain speech at rms {heard_level}");
+    }
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    for (_, _, heard) in &listeners {
+        heard.lock().unwrap().clear();
+    }
+
+    speak(&mut ts, Some(target)).await;
+    let (target_level, bystander_level) = (level(&listeners[0].2), level(&listeners[1].2));
+    assert!(target_level > 0.05, "the whisper target heard rms {target_level}");
+    assert!(bystander_level < 0.005, "the bystander overheard the whisper at rms {bystander_level}");
+}
+
+/// Sends a tone from a TeamSpeak client for two seconds, to its channel or
+/// whispered to one client.
+async fn speak(ts: &mut Connection, whisper_to: Option<u16>) {
     let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
     let mut frame = [0f32; 960];
     let mut packet = [0u8; 1275];
     let mut t = 0u64;
-    let end = Instant::now() + Duration::from_secs(4);
+    let end = Instant::now() + Duration::from_secs(2);
     while Instant::now() < end {
         for s in frame.iter_mut() {
             *s = tone(t);
             t += 1;
         }
         let n = encoder.encode_float(&frame, &mut packet).unwrap();
-        let whisper = AudioData::C2SWhisper {
-            id: 0,
-            codec: CodecType::OpusVoice,
-            channels: Vec::new(),
-            clients: vec![target],
-            data: &packet[..n],
+        let data = &packet[..n];
+        let audio = match whisper_to {
+            Some(client) => AudioData::C2SWhisper {
+                id: 0,
+                codec: CodecType::OpusVoice,
+                channels: Vec::new(),
+                clients: vec![client],
+                data,
+            },
+            None => AudioData::C2S { id: 0, codec: CodecType::OpusVoice, data },
         };
-        ts.send_audio(OutAudio::new(&whisper)).unwrap();
+        ts.send_audio(OutAudio::new(&audio)).unwrap();
         let _ = timeout(Duration::from_millis(20), async {
             let mut events = ts.events();
             while events.next().await.is_some() {}
         })
         .await;
     }
-
-    let level = |heard: &Arc<Mutex<Vec<f32>>>| {
-        let samples = heard.lock().unwrap().clone();
-        rms(&samples[samples.len().saturating_sub(96_000)..])
-    };
-    let (target_level, bystander_level) = (level(&listeners[0].2), level(&listeners[1].2));
-    assert!(target_level > 0.05, "the whisper target heard rms {target_level}");
-    assert!(bystander_level < 0.005, "the bystander overheard the whisper at rms {bystander_level}");
 }
