@@ -131,7 +131,11 @@ export const MessageRow = memo(function MessageRow({
   const signedAt = msg.signature?.created_at;
   const at = signedAt != null && Number.isFinite(new Date(signedAt).getTime()) ? signedAt : Number.isFinite(new Date(row.item.at).getTime()) ? row.item.at : 0;
   const editedAt = msg.signature && msg.signature.revision > 0 ? msg.signature.signed_at : undefined;
-  const warning = !verification ? <MessageVerificationPending /> : !fullyVerified(verification) && (row.first || verification.status !== "unsigned-ts") ? <MessageVerificationIndicator verification={verification} showAuthor={row.first} /> : null;
+  // TeamSpeak authorship is about the author, so it sits by the name; every other state is
+  // about one message and sits right after its text, so text always starts at the same edge.
+  const teamspeak = row.first && verification?.status === "unsigned-ts" ? <MessageVerificationIndicator verification={verification} showAuthor /> : null;
+  const warning = !verification ? <MessageVerificationPending /> : !fullyVerified(verification) && verification.status !== "unsigned-ts" ? <MessageVerificationIndicator verification={verification} /> : null;
+  const trailing = warning && <span className="ml-1.5 inline-block align-[-0.15em] leading-none">{warning}</span>;
   const time = formatTime(at, lang);
   const full = new Date(at).toLocaleString(lang);
   const color = useUidColor(msg.author_uid);
@@ -196,15 +200,17 @@ export const MessageRow = memo(function MessageRow({
             <time dateTime={new Date(at).toISOString()} title={full} className="text-xs text-subtle">
               {time}
             </time>
-            {warning}
+            {teamspeak}
           </div>
         )}
-        {!row.first && warning && <span className="float-left mt-1 mr-1.5">{warning}</span>}
         {editing ? (
-          <MessageEditor msg={msg} />
+          <>
+            {warning && <div className="leading-none">{warning}</div>}
+            <MessageEditor msg={msg} />
+          </>
         ) : (
           <>
-            {row.item.removed ? <span data-testid="message-server-removed" className="text-xs text-subtle">{t("chat.serverRemoved")}</span> : msg.text === DELETION_TEXT ? verification?.status === "verified" ? <span data-testid="message-author-deleted" className="text-xs text-subtle">{t("chat.authorDeleted")}</span> : <span className="text-xs text-danger">{t("chat.unverifiedDeletion")}</span> : msg.text && (
+            {row.item.removed ? <div><span data-testid="message-server-removed" className="text-xs text-subtle">{t("chat.serverRemoved")}</span>{trailing}</div> : msg.text === DELETION_TEXT ? verification?.status === "verified" ? <div><span data-testid="message-author-deleted" className="text-xs text-subtle">{t("chat.authorDeleted")}</span>{trailing}</div> : <div><span className="text-xs text-danger">{t("chat.unverifiedDeletion")}</span>{trailing}</div> : msg.text && (
               <div className={cn("text-sm leading-[1.5] break-words whitespace-pre-wrap", verification ? "text-fg" : "text-muted")}>
                 <RichText msg={mentionsTrusted ? msg : { ...msg, mentions: [] }} meUid={mentionsTrusted ? meUid : undefined} />
                 {editedAt != null && (
@@ -214,8 +220,10 @@ export const MessageRow = memo(function MessageRow({
                     </span>
                   </Tooltip>
                 )}
+                {trailing}
               </div>
             )}
+            {!row.item.removed && !msg.text && warning && <div className="leading-none">{warning}</div>}
             {!row.item.removed && attachments.length > 0 && <AttachmentList attachments={attachments} verified={verification === undefined ? null : fullyVerified(verification)} />}
           </>
         )}
