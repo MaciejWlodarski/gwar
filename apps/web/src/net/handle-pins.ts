@@ -35,10 +35,13 @@ function readStored(handle: string): string | null | undefined {
   }
 }
 
-/** Reads storage into the cache; an unreadable storage keeps what is known. */
-function refresh(handle: string) {
+/** Reads storage into the cache and returns what it read; an unreadable storage keeps what is known. */
+function refresh(handle: string): string | null | undefined {
   const stored = readStored(handle);
-  if (stored !== undefined) cache.set(handle, stored);
+  if (stored === undefined) return undefined;
+  cache.set(handle, stored);
+  if (stored && !unsaved.get(handle)?.accepted) unsaved.delete(handle); // a stored pin replaces an unsaved first sighting
+  return stored;
 }
 
 function pinOf(handle: string): string | null {
@@ -81,10 +84,8 @@ export function handleStatus(handle: string, uid: string): HandleStatus | "pendi
 export function rememberHandle(handle: string, uid: string): Promise<void> {
   return locked(() => {
     const before = pinOf(handle);
-    const stored = readStored(handle);
     const mine = unsaved.get(handle);
-    if (stored !== undefined) cache.set(handle, stored);
-    if (stored && !mine?.accepted) unsaved.delete(handle); // a stored pin replaces this tab's unsaved first sighting
+    const stored = refresh(handle);
     // Stored here or by another tab: that pin stays. Nothing stored: this tab's first sighting (maybe one storage
     // refused before) is stored now. Unreadable storage: remember it in memory, never write over what can't be seen.
     if (stored === null && !mine?.accepted) write(handle, mine?.uid ?? uid, false);

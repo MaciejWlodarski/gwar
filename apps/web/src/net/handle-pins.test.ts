@@ -165,6 +165,18 @@ describe("handle continuity", () => {
     expect(handleStatus("alice", "A")).toBe("pending");
   });
 
+  it("an unsaved first sighting does not come back after another tab's pin arrived by storage event", async () => {
+    denyWrites();
+    await rememberHandle("alice", "A");
+    allow();
+    otherTab("alice", "B");
+    storageEvent(PREFIX + "alice");
+    expect(handleStatus("alice", "B")).toBe("verified");
+    storage.clear();
+    storageEvent(null);
+    expect(handleStatus("alice", "A")).toBe("pending");
+  });
+
   it("serializes changes through Web Locks when the browser has them", async () => {
     const names: string[] = [];
     vi.stubGlobal("navigator", { locks: { request: async (name: string, run: () => unknown) => { names.push(name); return run(); } } });
