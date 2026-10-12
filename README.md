@@ -169,7 +169,7 @@ The full threat model, with every mechanism and its limits, is in
 ## Names: nickname, #tag and @handle
 
 A member is shown as **nickname** `@handle #tag`, for example
-**Kasia** `@kasia_w #kd5wx7rmq2`.
+**Dominika** `@dominika #kd5wx7rmq2`.
 
 - **Nickname**: what people see in chat and in the member list. It is chosen
   per server and the same on all your devices. Two people may have the same

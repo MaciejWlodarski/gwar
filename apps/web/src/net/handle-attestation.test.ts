@@ -11,7 +11,7 @@ let account: KeyPairJwk;
 let uid: string;
 let a: HandleAttestation;
 async function signed(changes: Partial<HandleAttestation> = {}): Promise<HandleAttestation> {
-  const statement = { account_key: account.publicKey, handle: "kasia_w", issued_at: NOW, expires_at: NOW + 7 * 86400000, signature: "", ...changes };
+  const statement = { account_key: account.publicKey, handle: "dominika", issued_at: NOW, expires_at: NOW + 7 * 86400000, signature: "", ...changes };
   statement.signature = await signText(service.jwk, new TextDecoder().decode(handleStatement(statement)));
   return statement;
 }
@@ -24,8 +24,8 @@ beforeAll(async () => {
 
 describe("verifiedHandle", () => {
   it("accepts a valid attestation and mirrors the Rust statement", async () => {
-    expect(new TextDecoder().decode(handleStatement(a))).toBe(`gwar handle v1\n${account.publicKey}\nkasia_w\n${NOW}\n${NOW + 7 * 86400000}`);
-    expect(await verifiedHandle({ uid, connect: a }, service.publicKey, NOW)).toBe("kasia_w");
+    expect(new TextDecoder().decode(handleStatement(a))).toBe(`gwar handle v1\n${account.publicKey}\ndominika\n${NOW}\n${NOW + 7 * 86400000}`);
+    expect(await verifiedHandle({ uid, connect: a }, service.publicKey, NOW)).toBe("dominika");
   });
   it("rejects a different service key", async () => {
     expect(await verifiedHandle({ uid, connect: a }, (await generateKeyPair()).publicKey, NOW)).toBeNull();
@@ -48,7 +48,7 @@ describe("verifiedHandle", () => {
     expect(await verifiedHandle({ uid, connect: await signed({ issued_at: NOW + 300001 }) }, service.publicKey, NOW)).toBeNull();
   });
   it("accepts issuance at the skew boundary", async () => {
-    expect(await verifiedHandle({ uid, connect: await signed({ issued_at: NOW + 300000 }) }, service.publicKey, NOW)).toBe("kasia_w");
+    expect(await verifiedHandle({ uid, connect: await signed({ issued_at: NOW + 300000 }) }, service.publicKey, NOW)).toBe("dominika");
   });
   it("hides handles without a key or attestation", async () => {
     expect(await verifiedHandle({ uid, connect: a }, null, NOW)).toBeNull();
@@ -59,13 +59,13 @@ describe("verifiedHandle", () => {
     for (const changes of [{ signature: "bad" }, { account_key: "bad" }, { issued_at: NaN }, { expires_at: Infinity }, { issued_at: 1.5 }, { handle: "bad\nname" }]) {
       expect(await verifiedHandle({ uid, connect: { ...a, ...changes } }, service.publicKey, NOW)).toBeNull();
     }
-    expect(await verifiedHandle({ uid, connect: "kasia_w" as unknown as HandleAttestation }, service.publicKey, NOW)).toBeNull();
+    expect(await verifiedHandle({ uid, connect: "dominika" as unknown as HandleAttestation }, service.publicKey, NOW)).toBeNull();
   });
   it("memoizes crypto but rechecks uid and expiry on every call", async () => {
     const copy = { ...a };
     const verify = vi.spyOn(crypto.subtle, "verify");
-    expect(await verifiedHandle({ uid, connect: copy }, service.publicKey, NOW)).toBe("kasia_w");
-    expect(await verifiedHandle({ uid, connect: copy }, service.publicKey, NOW + 1)).toBe("kasia_w");
+    expect(await verifiedHandle({ uid, connect: copy }, service.publicKey, NOW)).toBe("dominika");
+    expect(await verifiedHandle({ uid, connect: copy }, service.publicKey, NOW + 1)).toBe("dominika");
     expect(await verifiedHandle({ uid: "bad", connect: copy }, service.publicKey, NOW)).toBeNull();
     expect(await verifiedHandle({ uid, connect: copy }, service.publicKey, a.expires_at)).toBeNull();
     expect(verify).toHaveBeenCalledTimes(1);
