@@ -44,7 +44,8 @@ function refresh(handle: string) {
 function pinOf(handle: string): string | null {
   const mine = unsaved.get(handle);
   if (mine?.accepted) return mine.uid;
-  if (!cache.has(handle)) refresh(handle);
+  // Read once while rendering; a failed read counts as unknown, and a later rememberHandle reads again and notifies.
+  if (!cache.has(handle)) cache.set(handle, readStored(handle) ?? null);
   return cache.get(handle) ?? mine?.uid ?? null;
 }
 
@@ -83,6 +84,7 @@ export function rememberHandle(handle: string, uid: string): Promise<void> {
     const stored = readStored(handle);
     const mine = unsaved.get(handle);
     if (stored !== undefined) cache.set(handle, stored);
+    if (stored && !mine?.accepted) unsaved.delete(handle); // a stored pin replaces this tab's unsaved first sighting
     // Stored here or by another tab: that pin stays. Nothing stored: this tab's first sighting (maybe one storage
     // refused before) is stored now. Unreadable storage: remember it in memory, never write over what can't be seen.
     if (stored === null && !mine?.accepted) write(handle, mine?.uid ?? uid, false);

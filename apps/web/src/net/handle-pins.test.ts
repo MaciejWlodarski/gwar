@@ -142,6 +142,29 @@ describe("handle continuity", () => {
     expect(handleStatus("bob", "B")).toBe("verified");
   });
 
+  it("after reads recover, a stored pin takes over without two accounts verified", async () => {
+    otherTab("alice", "B");
+    denyReads(); denyWrites();
+    await rememberHandle("alice", "A");
+    expect(handleStatus("alice", "A")).toBe("verified");
+    allow();
+    expect(handleStatus("alice", "B")).toBe("changed");
+    await rememberHandle("alice", "B");
+    expect(handleStatus("alice", "B")).toBe("verified");
+    expect(handleStatus("alice", "A")).toBe("changed");
+  });
+
+  it("an unsaved first sighting does not come back after the stored pin is cleared", async () => {
+    denyWrites();
+    await rememberHandle("alice", "A");
+    allow();
+    otherTab("alice", "B");
+    await rememberHandle("alice", "A");
+    storage.clear();
+    storageEvent(null);
+    expect(handleStatus("alice", "A")).toBe("pending");
+  });
+
   it("serializes changes through Web Locks when the browser has them", async () => {
     const names: string[] = [];
     vi.stubGlobal("navigator", { locks: { request: async (name: string, run: () => unknown) => { names.push(name); return run(); } } });
