@@ -5,7 +5,7 @@
  *
  * Change it here only (and `OFFICIAL_WEB_ORIGIN` in vc-server).
  */
-export const OFFICIAL_WEB_ORIGIN = "https://gwar.maciejwlodarski.com";
+export const OFFICIAL_WEB_ORIGIN = "https://gwar.app";
 
 /**
  * Gwar Connect, the optional account service (docs/connect.md). nginx serves it

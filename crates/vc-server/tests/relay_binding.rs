@@ -293,8 +293,8 @@ fn nginx_public_url_does_not_infer_a_public_ip_login_endpoint() {
     let mut config = base_config();
     config.http_bind = "127.0.0.1:8800".parse().unwrap();
     config.public_ip = Some("8.8.8.8".parse().unwrap());
-    config.public_url = Some("https://voice.maciejwlodarski.com".into());
-    assert_eq!(vc_server::accepted_endpoints(&config).unwrap(), ["wss://voice.maciejwlodarski.com/ws".into()].into());
+    config.public_url = Some("https://voice.gwar.app".into());
+    assert_eq!(vc_server::accepted_endpoints(&config).unwrap(), ["wss://voice.gwar.app/ws".into()].into());
 }
 
 #[tokio::test]

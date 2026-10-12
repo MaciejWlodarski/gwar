@@ -18,7 +18,7 @@ never leave their owner, never from hidden behavior.
 | Party | Trusted for | Not trusted for |
 | --- | --- | --- |
 | Your client (the web app as served to you, the desktop binary) | everything: it holds your keys and makes every verification decision | — |
-| Official web hosting (`gwar.maciejwlodarski.com`) | serving the genuine web app and the Connect URL to web users | — |
+| Official web hosting (`gwar.app`) | serving the genuine web app and the Connect URL to web users | — |
 | Gwar Connect | mapping handles to account keys; storing encrypted blobs; publishing revocations; availability of sign-in | your password, your keys, your vault, the content of revocations (it can only withhold them) |
 | A server you join | availability, routing voice, presence, ordering and delivery, its own permissions | anyone's identity (yours included), the authorship and content of messages, handles |
 | Other members | nothing | — |
@@ -293,7 +293,7 @@ These are limits of a voice chat relayed through a server:
 
 Every guarantee assumes your client runs genuine code.
 
-- **Web app.** Whoever controls `gwar.maciejwlodarski.com` or its TLS can serve
+- **Web app.** Whoever controls `gwar.app` or its TLS can serve
   modified JavaScript that reads your keys or password; web users trust the
   hosting on every load. Local identity keys are exportable so they can be
   backed up.

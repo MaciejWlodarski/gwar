@@ -5,8 +5,10 @@ How the official services run. A self-hosted server needs none of this:
 
 | Address | What | DNS |
 | --- | --- | --- |
-| `gwar.maciejwlodarski.com` | the web app (static) and Gwar Connect under `/connect/` | proxied by Cloudflare |
-| `voice.maciejwlodarski.com` | the project's Gwar server (WebSocket, files, UDP voice, TeamSpeak) | DNS only: voice is UDP straight to the host |
+| `gwar.app` | the web app (static) and Gwar Connect under `/connect/` | Cloudflare, DNS only (may be proxied) |
+| `www.gwar.app` | redirects to `gwar.app` | CNAME to `gwar.app` |
+| `voice.gwar.app` | the project's public Gwar server (WebSocket, files, UDP voice, TeamSpeak) | DNS only: voice is UDP straight to the host |
+| `_ts3._udp.gwar.app` | SRV record to `voice.gwar.app` port 9987, so TeamSpeak clients can type `gwar.app` | — |
 
 `scripts/deploy-vm.sh [--web]` copies the source to the host, builds
 `vc-server` and `gwar-connect` there and installs them as systemd user units:
@@ -28,8 +30,8 @@ For user units to keep running without a login session, enable lingering once:
 ## nginx
 
 nginx terminates HTTPS (certbot) for both names. The server runs without
-`--tls`; set `--public-url https://voice.maciejwlodarski.com` to authorize
-`wss://voice.maciejwlodarski.com/ws`. `--public-ip` advertises UDP media and
+`--tls`; set `--public-url https://voice.gwar.app` to authorize
+`wss://voice.gwar.app/ws`. `--public-ip` advertises UDP media and
 adds no login endpoint behind nginx. Additional externally reachable aliases
 need a repeatable `--public-endpoint` with their exact scheme, port and path.
 Never use `--insecure-any-host` for these services.
@@ -57,7 +59,7 @@ only when every subdomain supports HTTPS. The header CSP combines with the
 meta policy; it does not replace it.
 
 
-`gwar.maciejwlodarski.com` sits behind Cloudflare, so the real client address
+When `gwar.app` is proxied by Cloudflare, the real client address
 comes from `CF-Connecting-IP`, trusted only from Cloudflare's ranges
 (`/etc/nginx/snippets/cloudflare-realip.conf`, generated from
 <https://www.cloudflare.com/ips/>: `set_real_ip_from …;` per range plus
@@ -65,7 +67,7 @@ comes from `CF-Connecting-IP`, trusted only from Cloudflare's ranges
 
 ```nginx
 server {
-    server_name gwar.maciejwlodarski.com;
+    server_name gwar.app;
     include snippets/cloudflare-realip.conf;
     include snippets/gwar-security-headers.conf;
     root /var/www/gwar;
@@ -92,7 +94,7 @@ server {
 }
 
 server {
-    server_name voice.maciejwlodarski.com;
+    server_name voice.gwar.app;
     include snippets/gwar-security-headers.conf;
     client_max_body_size 30m;
 
