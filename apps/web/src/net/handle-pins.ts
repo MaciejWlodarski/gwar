@@ -6,46 +6,46 @@ import { CONNECT_URL } from "../lib/official";
  * handle that turns up on a different account is shown as changed instead of verified, until the user accepts it.
  * Pins are scoped to the configured Connect service, not to its signing key, so a key change does not reset them.
  *
- * Each handle is its own localStorage entry, so a change to one never rewrites another, and changes run under a
- * Web Lock shared by all tabs (where the browser has Web Locks), so two tabs never interleave a read and a write.
+ * Each handle is its own localStorage entry, written once when first seen and again only when the user accepts
+ * another account, so a change to one handle never rewrites another. Changes run under a Web Lock shared by all
+ * tabs (where the browser has Web Locks) and decide on a fresh read of the entry. There is no size limit: an
+ * entry is ~100 bytes, and a full storage only means new pins live in memory.
  */
 export type HandleStatus = "verified" | "changed";
 
-interface Pin { uid: string; seen: number }
-
-/** Longest-unseen pins go first beyond this. */
-const LIMIT = 5000;
-/** `seen` is refreshed at most this often, so showing a member does not write storage on every render. */
-const REFRESH_MS = 7 * 24 * 60 * 60 * 1000;
 const PREFIX = `gwar.connect.handle-pin:${CONNECT_URL}:`;
 const LOCK = `gwar.connect.handle-pins:${CONNECT_URL}`;
 
-/** Stored pins as last read (`null`: none stored). */
-const cache = new Map<string, Pin | null>();
-/** Changes storage refused: they hold for this page, over whatever storage says. */
-const unsaved = new Map<string, Pin>();
+/** Pinned uid per handle as last read (`null`: none stored). */
+const cache = new Map<string, string | null>();
+/** Pins storage refused, for this page. An accepted account outranks storage; a first sighting does not. */
+const unsaved = new Map<string, { uid: string; accepted: boolean }>();
 let version = 0;
 const listeners = new Set<() => void>();
 
-function parse(raw: string | null): Pin | null {
+/** The stored uid (`null`: none, or corrupt, which only code on this origin can write); undefined if unreadable. */
+function readStored(handle: string): string | null | undefined {
+  let raw: string | null;
+  try { raw = localStorage.getItem(PREFIX + handle); } catch { return undefined; }
   try {
-    const p = JSON.parse(raw ?? "null") as Partial<Pin> | null;
-    return typeof p?.uid === "string" && Number.isSafeInteger(p.seen) ? { uid: p.uid, seen: p.seen! } : null;
+    const uid = (JSON.parse(raw ?? "null") as { uid?: unknown } | null)?.uid;
+    return typeof uid === "string" ? uid : null;
   } catch {
-    return null; // Corrupt: only code on this origin can write it, and that code could do anything anyway.
+    return null;
   }
 }
 
-/** The stored pin, fresh from storage; undefined if storage cannot be read. */
-function readStored(handle: string): Pin | null | undefined {
-  try { return parse(localStorage.getItem(PREFIX + handle)); } catch { return undefined; }
+/** Reads storage into the cache; an unreadable storage keeps what is known. */
+function refresh(handle: string) {
+  const stored = readStored(handle);
+  if (stored !== undefined) cache.set(handle, stored);
 }
 
-function pinOf(handle: string): Pin | null {
+function pinOf(handle: string): string | null {
   const mine = unsaved.get(handle);
-  if (mine) return mine;
-  if (!cache.has(handle)) cache.set(handle, readStored(handle) ?? null);
-  return cache.get(handle)!;
+  if (mine?.accepted) return mine.uid;
+  if (!cache.has(handle)) refresh(handle);
+  return cache.get(handle) ?? mine?.uid ?? null;
 }
 
 function notify() {
@@ -53,78 +53,51 @@ function notify() {
   for (const listener of listeners) listener();
 }
 
-/** Every stored pin, for eviction. */
-function storedPins(): Array<[string, Pin]> {
-  const pins: Array<[string, Pin]> = [];
+function write(handle: string, uid: string, accepted: boolean): boolean {
   try {
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i);
-      if (!key?.startsWith(PREFIX)) continue;
-      const pin = parse(localStorage.getItem(key));
-      if (pin) pins.push([key.slice(PREFIX.length), pin]);
-    }
-  } catch { /* nothing to evict then */ }
-  return pins;
-}
-
-/** Stores `pin`; a new pin may evict the longest-unseen ones (refreshes never add, so they skip the scan). */
-function write(handle: string, pin: Pin, added: boolean): boolean {
-  try {
-    localStorage.setItem(PREFIX + handle, JSON.stringify(pin));
+    localStorage.setItem(PREFIX + handle, JSON.stringify({ uid }));
   } catch {
-    unsaved.set(handle, pin);
+    unsaved.set(handle, { uid, accepted });
     return false;
   }
   unsaved.delete(handle);
-  cache.set(handle, pin);
-  const pins = added ? storedPins() : [];
-  if (pins.length > LIMIT) {
-    pins.sort((a, b) => a[1].seen - b[1].seen);
-    for (const [old] of pins.slice(0, pins.length - LIMIT)) {
-      try { localStorage.removeItem(PREFIX + old); } catch { /* evicted next time */ }
-      cache.set(old, null);
-    }
-  }
+  cache.set(handle, uid);
   return true;
 }
 
-/** Runs `run` under the cross-tab lock where the browser has Web Locks. */
 async function locked<T>(run: () => T): Promise<T> {
   const locks = typeof navigator !== "undefined" ? navigator.locks : undefined;
   return locks ? await locks.request(LOCK, run) : run();
 }
 
-function update(handle: string, next: (pin: Pin | null) => Pin | null): boolean {
-  const stored = readStored(handle);
-  const pin = unsaved.get(handle) ?? (stored === undefined ? pinOf(handle) : stored);
-  const before = pinOf(handle)?.uid;
-  if (stored !== undefined) cache.set(handle, stored);
-  const changed = next(pin);
-  const saved = changed ? write(handle, changed, !pin) : true;
-  if (changed || pinOf(handle)?.uid !== before) notify();
-  return saved;
-}
-
 /** Read-only, safe while rendering. "pending": not pinned yet, so not shown until {@link rememberHandle} decides. */
 export function handleStatus(handle: string, uid: string): HandleStatus | "pending" {
   const pin = pinOf(handle);
-  return !pin ? "pending" : pin.uid === uid ? "verified" : "changed";
+  return !pin ? "pending" : pin === uid ? "verified" : "changed";
 }
 
-/**
- * Records a verified sighting: pins a handle seen for the first time, never replaces a pin for another account,
- * and refreshes when the handle was last seen (also when it shows up on another account, so a handle on screen
- * as changed is not the next one forgotten).
- */
-export function rememberHandle(handle: string, uid: string, now = Date.now()): Promise<void> {
+/** Pins a handle seen for the first time; a handle already pinned (here, in storage or by another tab) stays. */
+export function rememberHandle(handle: string, uid: string): Promise<void> {
   return locked(() => {
-    update(handle, (pin) => (pin && now - pin.seen < REFRESH_MS ? null : { uid: pin?.uid ?? uid, seen: now }));
+    const before = pinOf(handle);
+    const stored = readStored(handle);
+    const mine = unsaved.get(handle);
+    if (stored !== undefined) cache.set(handle, stored);
+    // Stored here or by another tab: that pin stays. Nothing stored: this tab's first sighting (maybe one storage
+    // refused before) is stored now. Unreadable storage: remember it in memory, never write over what can't be seen.
+    if (stored === null && !mine?.accepted) write(handle, mine?.uid ?? uid, false);
+    else if (stored === undefined && !before) unsaved.set(handle, { uid, accepted: false });
+    if (pinOf(handle) !== before) notify();
   });
 }
 
 /** The user accepted that the handle now belongs to `uid`. False if it could not be stored (it holds until reload). */
-export function acceptHandle(handle: string, uid: string, now = Date.now()): Promise<boolean> {
-  return locked(() => update(handle, () => ({ uid, seen: now })));
+export function acceptHandle(handle: string, uid: string): Promise<boolean> {
+  return locked(() => {
+    const saved = write(handle, uid, true);
+    notify();
+    return saved;
+  });
 }
 
 export function subscribeHandlePins(listener: () => void): () => void {
@@ -136,11 +109,11 @@ export function handlePinsVersion(): number {
   return version;
 }
 
-// Another tab pinned, accepted or evicted a handle, or cleared storage.
+// Another tab pinned or accepted a handle, or cleared storage. Unreadable storage keeps what this tab knows.
 if (typeof window !== "undefined") {
   window.addEventListener("storage", (e) => {
-    if (e.key === null) cache.clear();
-    else if (e.key.startsWith(PREFIX)) cache.delete(e.key.slice(PREFIX.length));
+    if (e.key === null) for (const handle of cache.keys()) refresh(handle);
+    else if (e.key.startsWith(PREFIX)) refresh(e.key.slice(PREFIX.length));
     else return;
     notify();
   });
