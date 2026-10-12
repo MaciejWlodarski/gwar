@@ -62,7 +62,7 @@ describe("syncAfterUnlock", () => {
     await writeServerVault(service, record, { other: "kept" });
     expect(await syncAfterUnlock(api, record, ts, 1234)).toBe("seeded");
     expect((await serverVault(service, record))?.contents).toEqual({ other: "kept", teamspeak: stored(ts.device, 1234) });
-    expect(ts.calls).toEqual(["list:active", "setList:account:own1,own2;own2"]);
+    expect(ts.calls).toEqual(["list:active", "list:active", "setList:account:own1,own2;own2"]);
   }, 30_000);
 
   it("a device without identities makes one named Default first, then seeds with it", async () => {
@@ -91,6 +91,22 @@ describe("syncAfterUnlock", () => {
     await writeServerVault(service, record, { teamspeak: { identities: [] } });
     expect(await syncAfterUnlock(api, record, ts, 7)).toBe("seeded");
     expect(ts.account).toEqual(list(["own1", "own2"]));
+  }, 30_000);
+
+  it("a list another desktop empties while this one asks for its identities seeds the device's own", async () => {
+    const { api, record, service, ts } = await signedIn("ts.emptied.meanwhile");
+    ts.account = list(["acc1"]);
+    ts.onList = async () => { ts.onList = null; await writeServerVault(service, record, { teamspeak: { identities: [] } }); };
+    expect(await syncAfterUnlock(api, record, ts, 7)).toBe("seeded");
+    expect(vaultList((await serverVault(service, record))!.contents as never)).toEqual(list(["own1", "own2"]));
+    expect(ts.account).toEqual(list(["own1", "own2"]));
+  }, 30_000);
+
+  it("an empty desktop asks once at most: nothing to export, a new identity is made", async () => {
+    const { api, record, ts } = await signedIn("ts.blank");
+    ts.device = emptyList();
+    await syncAfterUnlock(api, record, ts, 5);
+    expect(ts.calls.filter((c) => c.startsWith("list:"))).toEqual(["list:active", "list:device"]);
   }, 30_000);
 
   it("a later desktop adopts the vault's list without touching its own", async () => {
@@ -216,6 +232,22 @@ describe("changeIdentities", () => {
     expect(next).toEqual({ default: "acc2", identities: [entry("acc1"), entry("acc2"), entry("c")] });
     expect(ts.account).toEqual(next);
     expect((await serverVault(service, record))?.contents).toMatchObject({ other: 1 });
+    expect(vaultList((await serverVault(service, record))!.contents as never)).toEqual(next);
+  }, 30_000);
+
+  it("signed in: a section lost while a change retries after a conflict starts from the identities in use", async () => {
+    const { api, record, service, ts } = await signedIn("ts.lost.retry");
+    ts.account = list(["acc1", "acc2"]);
+    await writeServerVault(service, record, { teamspeak: stored(ts.account, 5) });
+    const put = api.putVault.bind(api);
+    let first = true;
+    api.putVault = async (...args: Parameters<typeof put>) => {
+      if (first) { first = false; await writeServerVault(service, record, { other: 1 }); }
+      return put(...args);
+    };
+    const next = await changeIdentities(api, record, ts, (l) => renameEntry(l, "acc2", "Work"), 9);
+    expect(next).toEqual({ default: "acc1", identities: [entry("acc1"), entry("acc2", "Work")] });
+    expect(ts.account).toEqual(next);
     expect(vaultList((await serverVault(service, record))!.contents as never)).toEqual(next);
   }, 30_000);
 
