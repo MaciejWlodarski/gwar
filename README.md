@@ -472,7 +472,7 @@ VC_TS3_DIR=/tmp/ts3 cargo test -p vc-client --test teamspeak_mode --test teamspe
 - **End-to-end encryption** with MLS: direct messages first, then channels
   (chosen when a channel is created, with or without history for new
   members), files and voice (SFrame). Channels that TeamSpeak users share stay
-  unencrypted and are marked as such.
+  unencrypted and are marked as such. Design: [docs/e2e.md](docs/e2e.md).
 - **More TeamSpeak options**: bring your own TeamSpeak license for more slots,
   and a mixed stand-in so Gwar users can still talk when the free slots run out.
 

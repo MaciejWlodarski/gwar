@@ -369,5 +369,6 @@ account's devices; revoking a device does not invalidate a copy it already has.
 ## Later
 
 Noise for LAN connections, stronger evidence of signing time, vault
-checkpoints against rollback, non-exportable signing keys, signed releases,
-signed server key rotation, end-to-end encrypted direct messages.
+checkpoints against rollback, non-exportable signing keys, signed server key
+rotation. End-to-end encryption of channels, direct messages and voice is
+designed in [e2e.md](e2e.md).
