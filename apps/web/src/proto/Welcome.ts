@@ -16,4 +16,8 @@ members: Array<Member>,
 /**
  * Read state of every channel this user can read.
  */
-unread: Array<Unread>, ice_servers: Array<IceServer>, };
+unread: Array<Unread>, ice_servers: Array<IceServer>, 
+/**
+ * Sent as `Authorization: Bearer <token>` with file downloads; valid while this session lasts.
+ */
+file_access: string, };

@@ -456,6 +456,8 @@ export const en = {
   "ss.password": "Server password",
   "ss.passwordHint": "Leave empty to keep the current one. People with an invite don't need it.",
   "ss.passwordPlaceholder": "New password",
+  "ss.membersOnlyFiles": "Files only for people on this server",
+  "ss.membersOnlyFilesHint": "Off: a file link opens for anyone who has it, and TeamSpeak users get links. On: only people connected here who can read the channel open its files; TeamSpeak users see only file names.",
   "ss.removePassword": "Remove the server password",
   "ss.createRole": "Create role",
   "ss.builtin": "Built-in role",

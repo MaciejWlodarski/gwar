@@ -11,6 +11,7 @@ import type { ChatTarget } from "../proto/ChatTarget";
 import type { Client } from "../proto/Client";
 import type { ErrorBody } from "../proto/ErrorBody";
 import type { ErrorCode } from "../proto/ErrorCode";
+import type { FileAccess } from "../proto/FileAccess";
 import type { Group } from "../proto/Group";
 import type { HandleAttestation } from "../proto/HandleAttestation";
 import type { IceServer } from "../proto/IceServer";
@@ -54,7 +55,9 @@ const path = (put = false): Rule<string> => (v): v is string => {
   if (!str(2048)(v)) return false;
   try { filePath(v, put ? "PUT" : "GET"); return true; } catch { return false; }
 };
-const server = shape<ServerInfo>({ name: str(256), welcome: text, version: str(64), default_channel: id, max_clients: int(65535), upload_limit: int(Number.MAX_SAFE_INTEGER) });
+const server = shape<ServerInfo>({ name: str(256), welcome: text, version: str(64), default_channel: id, max_clients: int(65535), upload_limit: int(Number.MAX_SAFE_INTEGER), file_access: literal<FileAccess>(["link", "members"]) });
+/** A download bearer token: empty, or URL-safe characters only, so it is always a valid header value. */
+const bearer: Rule<string> = (v): v is string => str(128)(v) && /^[A-Za-z0-9_-]*$/.test(v);
 const fixed = (bytes: number): Rule<string> => (v): v is string => {
   if (typeof v !== "string" || v.length !== Math.ceil(bytes * 4 / 3)) return false;
   try { decodeFixed(v, bytes); return true; } catch { return false; }
@@ -69,7 +72,7 @@ const attestation = shape<HandleAttestation>({ account_key: str(128), handle: st
 const member = shape<Member>({ uid, nickname: str(256), tag: str(128), connect: optional(nullable(attestation)), groups: ids, last_seen: id });
 const unread = shape<Unread>({ channel: id, last_read: id, count: int(1000000), mentions: int(1000000) });
 const ice = shape<IceServer>({ urls: array(str(2048), 16), username: optional(nullable(str(1024))), credential: optional(nullable(str(1024))) });
-const welcome = shape<Welcome>({ session: id, uid, server, permissions: array(permissions, 32), groups: array(group, 128), channels: array(channel, 1024), clients: array(client, 4096), members: array(member, 10000), unread: array(unread, 1024), ice_servers: array(ice, 32) });
+const welcome = shape<Welcome>({ session: id, uid, server, permissions: array(permissions, 32), groups: array(group, 128), channels: array(channel, 1024), clients: array(client, 4096), members: array(member, 10000), unread: array(unread, 1024), ice_servers: array(ice, 32), file_access: bearer });
 const target: Rule<ChatTarget> = (v): v is ChatTarget => v === "server" || shape<{ channel: number }>({ channel: id })(v) || shape<{ client: number }>({ client: id })(v);
 const certificate = shape<DeviceCertificate>({ account_key: fixed(32), device_key: fixed(32), issued_at: id, expires_at: id, signature: fixed(64) });
 const commitment: Rule<string> = (v): v is string => v === "-" || fixed(32)(v);

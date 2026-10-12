@@ -19,6 +19,8 @@ export interface FileOptions {
   origin: string | null;
   /** The desktop's native file session of the connection the file belongs to. */
   session?: string | null;
+  /** Bearer token for a server whose files are for members only; omitted otherwise. */
+  access?: string | null;
   size: number;
   uploadLimit: number;
   signal?: AbortSignal;
@@ -52,14 +54,15 @@ export async function fetchFileBytes(path: string, opts: FileOptions, fetchFn: t
       const cancel = () => { void api.invoke("files_cancel", { requestId }); };
       controller.signal.addEventListener("abort", cancel, { once: true });
       try {
-        const raw = await api.invoke<ArrayBuffer>("fetch_file", { session: opts.session, path, size: cap, uploadLimit: opts.uploadLimit, requestId });
+        const raw = await api.invoke<ArrayBuffer>("fetch_file", { session: opts.session, path, size: cap, uploadLimit: opts.uploadLimit, access: opts.access ?? null, requestId });
         controller.signal.throwIfAborted();
         const bytes = new Uint8Array(raw);
         if (bytes.length > cap) throw new Error("File exceeds size limit");
         return bytes;
       } finally { controller.signal.removeEventListener("abort", cancel); }
     }
-    const response = await fetchFn(url, { redirect: "error", credentials: "omit", signal: controller.signal });
+    const headers = opts.access ? { Authorization: `Bearer ${opts.access}` } : undefined;
+    const response = await fetchFn(url, { redirect: "error", credentials: "omit", signal: controller.signal, headers });
     if (!response.ok || response.redirected) throw new Error(`File HTTP ${response.status}`);
     const length = response.headers.get("Content-Length");
     if (length !== null && (!/^\d+$/.test(length) || Number(length) > cap)) throw new Error("File exceeds size limit");
@@ -102,7 +105,7 @@ export async function saveFile(path: string, name: string, opts: FileOptions): P
     opts.signal?.throwIfAborted();
     opts.signal?.addEventListener("abort", cancel, { once: true });
     try {
-      return await api.invoke<boolean>("save_file_as", { session: opts.session, path, fileName: name, size: cap, requestId });
+      return await api.invoke<boolean>("save_file_as", { session: opts.session, path, fileName: name, size: cap, access: opts.access ?? null, requestId });
     } finally { opts.signal?.removeEventListener("abort", cancel); }
   }
   const bytes = await fetchFileBytes(path, opts);

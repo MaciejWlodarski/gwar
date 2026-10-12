@@ -994,6 +994,18 @@ impl Store {
             .optional()?)
     }
 
+    /// The channel a file was posted in (`None` before it is posted) and its uploader.
+    pub fn file_place(&self, id: &str) -> Result<Option<(Option<ChannelId>, String)>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT m.channel, f.uploader FROM files f LEFT JOIN messages m ON m.id = f.message WHERE f.id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
     fn attachments(&self, message: MessageId) -> Result<Vec<Attachment>> {
         let mut stmt = self
             .db

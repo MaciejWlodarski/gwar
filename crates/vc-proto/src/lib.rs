@@ -284,6 +284,8 @@ wire! {
         pub password: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub max_clients: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub file_access: Option<FileAccess>,
     }
 
     #[derive(Default)]
@@ -506,6 +508,9 @@ wire! {
         #[serde(default)]
         pub unread: Vec<Unread>,
         pub ice_servers: Vec<IceServer>,
+        /// Sent as `Authorization: Bearer <token>` with file downloads; valid while this session lasts.
+        #[serde(default)]
+        pub file_access: String,
     }
 
     /// Connect service signature binding a handle to an account identity.
@@ -557,6 +562,20 @@ wire! {
         #[serde(default)]
         #[cfg_attr(feature = "ts", ts(type = "number"))]
         pub upload_limit: u64,
+        #[serde(default)]
+        pub file_access: FileAccess,
+    }
+
+    /// Who may download a file (`GET /files/…`).
+    #[derive(Copy, Eq, Default)]
+    #[serde(rename_all = "snake_case")]
+    pub enum FileAccess {
+        /// Anyone with its link, like a key: TeamSpeak users get links to files posted on Gwar.
+        #[default]
+        Link,
+        /// Only clients connected to this server that can read the channel the file was posted in,
+        /// sending their [`Welcome::file_access`] token. TeamSpeak users see only file names.
+        Members,
     }
 
     pub struct Channel {

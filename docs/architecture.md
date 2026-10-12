@@ -424,12 +424,24 @@ native protected storage.
 
 ## Files
 
-`GET /files/{random-id}/{name}` is a bearer capability: anyone who knows the
-URL can fetch it without a session. Channel membership governs message access,
-not later downloads. Removing someone from a channel or server does not revoke
-URLs they already know. Deleting the message/file removes it from the server;
-copies already downloaded remain. Upload tokens are one-use and expire after
-ten minutes; download capabilities do not expire. Reserved and in-progress
+Who may download `GET /files/{random-id}/{name}` is a server setting
+(`ServerInfo.file_access`, changed with `server.update` by `server_manage`):
+
+- `link` (the default): the URL is a bearer capability. Anyone who knows it
+  can fetch the file without a session, including TeamSpeak users, to whom the
+  bridge posts links. Channel membership governs message access, not later
+  downloads; removing someone from a channel or server does not revoke URLs
+  they already know.
+- `members`: the request must carry `Authorization: Bearer <token>`, the
+  random token of a live session (`Welcome.file_access`, 256 bits, gone when
+  the session ends), and that session must be able to read the channel the
+  file was posted in (an unposted upload: be its uploader). Anything else gets
+  `404`, like a missing file. The bridge posts only file names to TeamSpeak.
+  Clients send the token only to a members-only server.
+
+Deleting the message/file removes it from the server; copies already
+downloaded remain. Upload tokens are one-use and expire after ten minutes;
+download links do not expire. Reserved and in-progress
 uploads count against the quotas until they finish; a started upload has ten
 minutes for its bytes and keeps its space until it is stored or given up (an
 error, a timeout, the client going away), which frees the space once its bytes

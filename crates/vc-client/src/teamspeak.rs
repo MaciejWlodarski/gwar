@@ -258,6 +258,7 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>) -> Option<View> 
         max_clients: u32::from(state.server.max_clients),
         // TeamSpeak chats carry text only.
         upload_limit: 0,
+        file_access: Default::default(),
     };
     Some(View { server: Some(server), channels, clients })
 }
@@ -534,6 +535,7 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
         members: Vec::new(),
         unread: Vec::new(),
         ice_servers: Vec::new(),
+        file_access: String::new(),
     };
 
     let (request_tx, mut requests) = mpsc::channel(64);

@@ -12,7 +12,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
-use vc_proto::{Attachment, ErrorCode, Permission, Response, SessionId};
+use vc_proto::{Attachment, ErrorCode, FileAccess, Permission, Response, SessionId};
 
 use super::{Core, CoreHandle, CoreMsg, Reply, err, now_ms, storage_error};
 
@@ -114,9 +114,11 @@ pub enum FileMsg {
         id: String,
         reply: oneshot::Sender<Option<(Attachment, PathBuf)>>,
     },
-    /// A stored file to download, held by the returned [`Reading`].
+    /// A stored file to download, held by the returned [`Reading`]. `access` is the
+    /// requester's bearer token; it matters only with [`FileAccess::Members`].
     Open {
         id: String,
+        access: Option<String>,
         reply: oneshot::Sender<Option<(Attachment, PathBuf, Reading)>>,
     },
     /// A [`Reading`] ended.
@@ -149,9 +151,9 @@ impl CoreHandle {
 
     /// A stored file to download and where it is on disk; its bytes stay until the
     /// [`Reading`] is dropped, even if the file is deleted meanwhile.
-    pub async fn file_open(&self, id: String) -> Option<(Attachment, PathBuf, Reading)> {
+    pub async fn file_open(&self, id: String, access: Option<String>) -> Option<(Attachment, PathBuf, Reading)> {
         let (reply, rx) = oneshot::channel();
-        self.tx.send(CoreMsg::Files(FileMsg::Open { id, reply })).await.ok()?;
+        self.tx.send(CoreMsg::Files(FileMsg::Open { id, access, reply })).await.ok()?;
         rx.await.ok().flatten()
     }
 
@@ -163,7 +165,7 @@ impl CoreHandle {
     }
 }
 
-fn random_id(bytes: usize) -> String {
+pub(super) fn random_id(bytes: usize) -> String {
     let mut buf = vec![0u8; bytes];
     rand::rng().fill_bytes(&mut buf);
     URL_SAFE_NO_PAD.encode(buf)
@@ -318,8 +320,11 @@ impl Core {
                 let file = self.store.file(&id).map_err(storage_error).ok().flatten();
                 let _ = reply.send(file.map(|f| (f, self.file_path(&id))));
             }
-            FileMsg::Open { id, reply } => {
+            FileMsg::Open { id, access, reply } => {
                 let Some(tx) = self.me.upgrade() else { return };
+                if !self.may_download(&id, access.as_deref()) {
+                    return;
+                }
                 let file = self.store.file(&id).map_err(storage_error).ok().flatten();
                 let opened = file.map(|f| {
                     *self.reading.entry(id.clone()).or_default() += 1;
@@ -336,6 +341,29 @@ impl Core {
                     // Deleted while it was read: its bytes can go now.
                     self.remove_files();
                 }
+            }
+        }
+    }
+
+    /// With [`FileAccess::Members`], only a client connected here that can read the file's
+    /// channel (or, before it is posted, its uploader) may download it.
+    fn may_download(&self, id: &str, access: Option<&str>) -> bool {
+        if self.info.file_access == FileAccess::Link {
+            return true;
+        }
+        let Some(session) = access
+            .filter(|a| !a.is_empty())
+            .and_then(|a| self.sessions.values().find(|s| s.out.is_some() && s.file_access == a))
+        else {
+            return false;
+        };
+        match self.store.file_place(id) {
+            Ok(Some((Some(channel), _))) => self.can_read(session, channel),
+            Ok(Some((None, uploader))) => uploader == session.uid,
+            Ok(None) => false,
+            Err(e) => {
+                warn!("store: {e:#}");
+                false
             }
         }
     }
@@ -693,11 +721,11 @@ pub(crate) mod tests {
             std::fs::write(dir.path().join(id), "abc").unwrap();
         }
         let core = test_core_storing(store, None, dir.path().into(), 100);
-        let (_, path, reading) = core.file_open("f".into()).await.unwrap();
+        let (_, path, reading) = core.file_open("f".into(), None).await.unwrap();
         on_core(&core, |core| {
             let (reply, rx) = oneshot::channel();
             drop(rx);
-            core.file_msg(FileMsg::Open { id: "g".into(), reply });
+            core.file_msg(FileMsg::Open { id: "g".into(), access: None, reply });
             core.store.raw().execute_batch("DELETE FROM files").unwrap();
             core.tick();
         })
@@ -711,7 +739,7 @@ pub(crate) mod tests {
         assert!(!dir.path().join("g").exists(), "an abandoned read kept the bytes");
         assert_eq!(charged(&core).await, 3, "freed while it is read");
         assert_eq!(std::fs::read(&path).unwrap(), b"abc");
-        assert!(core.file_open("f".into()).await.is_none(), "deleted files cannot be opened");
+        assert!(core.file_open("f".into(), None).await.is_none(), "deleted files cannot be opened");
         drop(reading);
         for _ in 0..100 {
             if charged(&core).await == 0 {

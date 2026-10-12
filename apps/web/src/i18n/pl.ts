@@ -458,6 +458,8 @@ export const pl: Record<Key, string> = {
   "ss.password": "Hasło serwera",
   "ss.passwordHint": "Zostaw puste, aby zachować obecne. Osoby z zaproszeniem go nie potrzebują.",
   "ss.passwordPlaceholder": "Nowe hasło",
+  "ss.membersOnlyFiles": "Pliki tylko dla osób na serwerze",
+  "ss.membersOnlyFilesHint": "Wyłączone: link do pliku otwiera każdy, kto go ma, a użytkownicy TeamSpeaka dostają linki. Włączone: pliki otwierają tylko osoby połączone z tym serwerem, które widzą dany kanał; użytkownicy TeamSpeaka widzą tylko nazwy plików.",
   "ss.removePassword": "Usuń hasło serwera",
   "ss.createRole": "Utwórz rolę",
   "ss.builtin": "Rola wbudowana",

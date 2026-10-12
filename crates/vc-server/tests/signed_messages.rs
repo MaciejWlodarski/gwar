@@ -415,3 +415,61 @@ async fn edit_after_certificate_renewal_keeps_the_message_identity() {
     assert_eq!(history["messages"][0]["signature"], json!(edit));
     assert_eq!(history["messages"][0]["text"], "after renewal");
 }
+
+#[tokio::test]
+async fn members_only_files_open_for_readers_of_their_channel() {
+    let server = TestServer::start().await;
+    let mut admin = admin(&server, "admin").await;
+    let mut bob = Client::connect(&server, "bob").await;
+    let get = |file: &Attachment, token: Option<&str>| {
+        let mut request = reqwest::Client::new().get(format!("{}{}", server.http(), file.url));
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        async move { request.send().await.unwrap().status().as_u16() }
+    };
+    let post = async |client: &mut Client, channel: u32, file: &Attachment| {
+        let target = format!("channel:{channel}");
+        let sig = client.signature(&target, "file", &[], std::slice::from_ref(file));
+        client
+            .ok(
+                "chat.send",
+                json!({"target": {"channel": channel}, "text": "file", "attachments": [&file.id], "signature": sig}),
+            )
+            .await;
+    };
+    let lobby = admin.default_channel();
+    let open = upload(&server, &mut admin, "open.txt", b"open").await;
+    post(&mut admin, lobby, &open).await;
+    assert_eq!(admin.welcome.server.file_access, vc_proto::FileAccess::Link);
+    assert_eq!(get(&open, None).await, 200, "links open for anyone by default");
+
+    assert_eq!(bob.fails("server.update", json!({"file_access": "members"})).await, "forbidden");
+    admin.ok("server.update", json!({"file_access": "members"})).await;
+    let updated = bob.next_event("server.updated").await;
+    assert_eq!(updated["file_access"], "members");
+    let (admin_token, bob_token) = (admin.welcome.file_access.clone(), bob.welcome.file_access.clone());
+    assert!(admin_token.len() >= 40 && admin_token != bob_token);
+    assert_eq!(get(&open, None).await, 404);
+    assert_eq!(get(&open, Some("not-a-session")).await, 404);
+    assert_eq!(get(&open, Some(&bob_token)).await, 200);
+
+    // A password channel's files are for those who can read it; an unposted upload for its uploader.
+    let locked = admin.ok("channel.create", json!({"name": "Locked", "password": "secret"})).await["id"]
+        .as_u64()
+        .unwrap() as u32;
+    let hidden = upload(&server, &mut admin, "hidden.txt", b"hidden").await;
+    post(&mut admin, locked, &hidden).await;
+    assert_eq!(get(&hidden, Some(&admin_token)).await, 200);
+    assert_eq!(get(&hidden, Some(&bob_token)).await, 404);
+    let draft = upload(&server, &mut admin, "draft.txt", b"draft").await;
+    assert_eq!(get(&draft, Some(&admin_token)).await, 200);
+    assert_eq!(get(&draft, Some(&bob_token)).await, 404);
+
+    // The token ends with its session, and the server can go back to links.
+    bob.close().await;
+    admin.sync().await;
+    assert_eq!(get(&open, Some(&bob_token)).await, 404);
+    admin.ok("server.update", json!({"file_access": "link"})).await;
+    assert_eq!(get(&hidden, None).await, 200);
+}

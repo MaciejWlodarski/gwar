@@ -44,7 +44,7 @@ function fakeBridge() {
       if (command === "ts_connect") {
         // An event races the welcome reply.
         listeners.get("ts://event")?.({ session: args?.session, frame: JSON.stringify({ ev: "voice.talking", d: { client: 1, talking: true } }) } as never);
-        return { session: 1, uid: "uid", server: { name: "TS", welcome: "", version: "1", default_channel: 1, max_clients: 64, upload_limit: 0 }, permissions: [], groups: [], channels: [], clients: [], members: [], unread: [], ice_servers: [] };
+        return { session: 1, uid: "uid", server: { name: "TS", welcome: "", version: "1", default_channel: 1, max_clients: 64, upload_limit: 0, file_access: "link" }, permissions: [], groups: [], channels: [], clients: [], members: [], unread: [], ice_servers: [], file_access: "" };
       }
       if (command === "ts_request") throw { code: "forbidden", message: "no" };
       return undefined;

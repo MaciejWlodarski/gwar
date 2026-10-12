@@ -14,6 +14,15 @@ describe("bounded file fetching", () => {
     await expect(fetchFileBytes("/files/a/b", options, mock(new Response(null, { status: 302 })))).rejects.toThrow("302");
   });
 
+  it("sends the download token only when given one", async () => {
+    const fetch = mock(new Response(new Uint8Array(4)));
+    await fetchFileBytes("/files/a/b", { ...options, access: "tok" }, fetch);
+    expect(fetch.mock.calls[0]?.[1]?.headers).toEqual({ Authorization: "Bearer tok" });
+    const open = mock(new Response(new Uint8Array(4)));
+    await fetchFileBytes("/files/a/b", options, open);
+    expect(open.mock.calls[0]?.[1]?.headers).toBeUndefined();
+  });
+
   it("caps both declared length and streamed bytes and cancels overruns", async () => {
     await expect(fetchFileBytes("/files/a/b", options, mock(new Response("x", { headers: { "Content-Length": "5" } })))).rejects.toThrow("size limit");
     const cancel = vi.fn();

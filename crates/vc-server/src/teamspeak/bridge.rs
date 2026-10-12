@@ -22,7 +22,8 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 use tsclientlib::{Identity, MessageTarget};
 use vc_proto::{
-    Channel, ChannelId, ChatMessage, ChatTarget, Client, Event, LeaveReason, Platform, ServerInfo, SessionId,
+    Channel, ChannelId, ChatMessage, ChatTarget, Client, Event, FileAccess, LeaveReason, Platform, ServerInfo,
+    SessionId,
 };
 
 use super::{
@@ -925,7 +926,9 @@ impl<'a> Bridge<'a> {
             ChatTarget::Channel(channel) => author.is_some_and(|l| l.client.channel == Some(channel)),
             _ => true,
         });
-        let body = ts_text(&m, self.public_url.as_deref());
+        // Links open only for Gwar members on a members-only server: TeamSpeak users get the names.
+        let links = self.server.as_ref().is_none_or(|s| s.file_access == FileAccess::Link);
+        let body = ts_text(&m, self.public_url.as_deref().filter(|_| links));
         if let Some(puppet) = puppet {
             for text in split_for_teamspeak(&body) {
                 puppet.send(PuppetCmd::Text { mode, target, text });

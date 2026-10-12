@@ -293,12 +293,13 @@ pub async fn start(config: Config) -> Result<Running> {
             .context("--client-ip-header is not a valid header name")?,
     };
     // The web app runs on another origin than this server: let it upload and
-    // fetch files. Uploads are authorized by one-time tokens, not cookies.
+    // fetch files. Uploads are authorized by one-time tokens and downloads by
+    // the session's bearer token (if the server needs one), never by cookies.
     let origins: Vec<HeaderValue> = config.web_origins.iter().filter_map(|o| o.parse().ok()).collect();
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::list(origins))
         .allow_methods([Method::GET, Method::PUT])
-        .allow_headers([header::CONTENT_TYPE, header::RANGE])
+        .allow_headers([header::CONTENT_TYPE, header::RANGE, header::AUTHORIZATION])
         .max_age(std::time::Duration::from_secs(3600));
     let files_routes = Router::new()
         // Uploads enforce their own reserved size.

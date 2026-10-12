@@ -85,6 +85,11 @@ describe("vc/3 runtime schemas", () => {
     expect(responseFor("hello", welcome())).toBe(false);
     expect(responseFor("join", welcome())).toBe(true);
     expect(responseFor("join", proof)).toBe(false);
+    // The download token becomes an HTTP header value: URL-safe characters only.
+    expect(responseFor("join", welcome({ file_access: "" }))).toBe(true);
+    for (const file_access of ["a\r\nX-Evil: 1", "a b", "x".repeat(129)]) expect(responseFor("join", welcome({ file_access }))).toBe(false);
+    expect(responseFor("join", welcome({ server: { ...welcome().server, file_access: "members" } }))).toBe(true);
+    expect(responseFor("join", welcome({ server: { ...welcome().server, file_access: "anyone" as never } }))).toBe(false);
     for (const value of [null, [], { ...proof, extra: true }, { server_proof: 1 }, { server_proof: "B".repeat(86) }, { server_proof: `${proof.server_proof}=` }]) {
       expect(responseFor("hello", value)).toBe(false);
       expect(parseFrame(JSON.stringify({ re: 1, ok: value }))).toBeNull();

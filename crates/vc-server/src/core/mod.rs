@@ -36,8 +36,9 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use vc_proto::{
     Channel, ChannelCreate, ChannelId, ChannelUpdate, ChatMessage, ChatTarget, Client, ClientUpdate, DeviceCertificate,
-    ErrorBody, ErrorCode, Event, Group, GroupId, IceServer, LeaveReason, MessageId, MessageSignature, NICKNAME_MAX_LEN,
-    Permission, Platform, Request, Response, ServerFrame, ServerInfo, SessionId, Uid, Unread, Welcome,
+    ErrorBody, ErrorCode, Event, FileAccess, Group, GroupId, IceServer, LeaveReason, MessageId, MessageSignature,
+    NICKNAME_MAX_LEN, Permission, Platform, Request, Response, ServerFrame, ServerInfo, SessionId, Uid, Unread,
+    Welcome,
 };
 
 use self::bridge::{BridgeMsg, BridgeNote, RemoteClient};
@@ -222,6 +223,8 @@ struct Session {
     voice: bool,
     /// `None` for remote sessions, which live on a bridged server.
     out: Option<OutboundTx>,
+    /// Bearer token for file downloads (see [`vc_proto::FileAccess`]); empty for remote sessions.
+    file_access: String,
 }
 
 pub struct Core {
@@ -398,6 +401,10 @@ impl Core {
             default_channel,
             max_clients: store.meta("max_clients")?.and_then(|v| v.parse().ok()).unwrap_or(config.max_clients),
             upload_limit: config.upload_limit,
+            file_access: match store.meta("file_access")?.as_deref() {
+                Some("members") => FileAccess::Members,
+                _ => FileAccess::Link,
+            },
         };
         let groups = store.groups()?.into_iter().map(|g| (g.id, g)).collect();
         Ok(Self {
@@ -706,6 +713,7 @@ impl Core {
             talking: false,
             voice: false,
             out: Some(r.out),
+            file_access: files::random_id(32),
         };
         info!(session = id, uid = %session.uid, platform = ?session.platform, "client connected");
         let joined = client_view(&session);
@@ -728,6 +736,7 @@ impl Core {
             members,
             unread,
             ice_servers: self.ice_servers.clone(),
+            file_access: self.sessions[&id].file_access.clone(),
         };
         self.reply(id, r.request_id, Ok(Response::Welcome(Box::new(welcome))));
         self.broadcast(Event::ClientJoined(joined), |s| s.id != id);
@@ -935,6 +944,7 @@ impl Core {
                     talking: false,
                     voice: true,
                     out: None,
+                    file_access: String::new(),
                 };
                 info!(session = id, uid = %session.uid, platform = ?session.platform, "remote client joined");
                 let joined = client_view(&session);

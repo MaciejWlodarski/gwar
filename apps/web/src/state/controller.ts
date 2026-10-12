@@ -416,7 +416,7 @@ class Controller {
       this.entered.clear();
       this.historyRequested.clear();
       this.sentRead.clear();
-      this.nativeFiles(useSession.getState().kind === "vc" ? useSession.getState().httpOrigin : null, welcome.server.upload_limit);
+      this.nativeFiles(useSession.getState().kind === "vc" ? useSession.getState().httpOrigin : null, welcome.server.upload_limit, welcome.file_access);
       session.setSecurity(conn.serverKey ?? null, conn.endpoint ?? null, !!conn.endpoint && isPlaintextRemote(conn.endpoint));
       if (conn.serverKey) channelLifecycle.observe(conn.serverKey, welcome.channels.map((c) => c.id));
       session.dispatch({ type: "welcome", welcome, resync, now: Date.now() });
@@ -513,9 +513,9 @@ class Controller {
   }
 
   /** Every welcome (a resync too) starts a new native file session; file work of an older one is refused. */
-  private nativeFiles(origin: string | null, uploadLimit = 0): Promise<unknown> {
+  private nativeFiles(origin: string | null, uploadLimit = 0, fileAccess = ""): Promise<unknown> {
     const fileSession = origin ? crypto.randomUUID() : null;
-    useSession.getState().setFileSession(fileSession);
+    useSession.getState().setFileSession(fileSession, origin && fileAccess ? fileAccess : null);
     return setConnectedServer(origin, uploadLimit, fileSession).catch((e) => console.warn("Native file origin:", e));
   }
 
