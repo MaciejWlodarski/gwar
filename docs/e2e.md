@@ -259,6 +259,9 @@ with signed statements that newcomers can check without any history:
   dishonest server cannot invent a member list; it can only show an older one
   the newcomer has not seen superseded, the same first-contact limit as under
   "Freshness".
+- A member list counts only while its signer is on the manager list in the
+  same access list; when the owner removes a manager, the owner's client
+  re-signs the member lists that manager signed, in the same commits.
 - The owner and the managers are always allowed readers, as admins see every
   channel on Discord.
 
