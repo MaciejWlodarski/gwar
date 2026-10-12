@@ -228,8 +228,12 @@ Prebuilt apps are on the [GitHub Releases page](https://github.com/MaciejWlodars
   continue with "Run a server" below, using `./vc-server` instead of
   `./target/release/vc-server`.
 
-`SHA256SUMS` on each release lists the checksum of every file. Maintainers: see
-[docs/releasing.md](docs/releasing.md) for how a release is made.
+`SHA256SUMS` on each release lists the checksum of every file, and
+`SHA256SUMS.minisig` signs it with the release key in
+[docs/release-key.pub](docs/release-key.pub). Every file also has a GitHub
+build attestation naming the workflow and commit that built it. How to check a
+download: [docs/releasing.md](docs/releasing.md#verify-a-download), which also
+describes how a release is made.
 
 ## Run a server
 

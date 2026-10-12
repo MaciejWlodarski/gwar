@@ -186,13 +186,15 @@ jobs:
           retention-days: 7
 
   # Collects every file, writes SHA256SUMS over all of them and (on a tag)
-  # creates the draft release. One job does all uploads, so parallel builds
-  # cannot race to create the release.
+  # attests their provenance and creates the draft release. One job does all
+  # uploads, so parallel builds cannot race to create the release.
   release:
     needs: [check, desktop, server]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
@@ -211,6 +213,13 @@ jobs:
           path: dist/*
           if-no-files-found: error
           retention-days: 14
+      # GitHub build provenance: which repository, workflow and commit built each
+      # file (`gh attestation verify`, docs/releasing.md).
+      - name: Attest provenance
+        if: github.event_name == 'push'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
       - name: Draft release
         if: github.event_name == 'push'
         env:
@@ -228,3 +237,52 @@ jobs:
             gh release create "$TAG" dist/* --repo "$REPO" --draft --verify-tag \
               --title "Gwar $TAG" --generate-notes
           fi
+
+  # Signs SHA256SUMS with the release key (minisign), so a download can be
+  # checked against the key in this repository and not only against a
+  # checksum file that came with it. The key lives only in the `release`
+  # environment, which accepts `v*` tags and waits for the owner's approval.
+  sign:
+    if: github.event_name == 'push'
+    needs: release
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          sparse-checkout: docs/release-key.pub
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-assets
+          path: dist
+      - name: Install minisign
+        run: sudo apt-get update && sudo apt-get install -y minisign
+      - name: Sign SHA256SUMS
+        working-directory: dist
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "::error::The release environment has no MINISIGN_SECRET_KEY."; exit 1
+          fi
+          sha256sum --check SHA256SUMS
+          key=$(mktemp)
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
+          minisign -S -s "$key" -m SHA256SUMS -t "gwar $TAG SHA256SUMS"
+          # The signature must check against the public key in the repository.
+          minisign -V -p ../docs/release-key.pub -m SHA256SUMS
+      - name: Upload the signature
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft)" != "true" ]; then
+            echo "::error::Release $TAG is already published; not changing it."; exit 1
+          fi
+          gh release upload "$TAG" dist/SHA256SUMS.minisig --repo "$REPO" --clobber
