@@ -134,7 +134,7 @@ export const MessageRow = memo(function MessageRow({
   // TeamSpeak authorship is about the author, so it sits by the name; every other state is
   // about one message and sits right after its text, so text always starts at the same edge.
   const teamspeak = row.first && verification?.status === "unsigned-ts" ? <MessageVerificationIndicator verification={verification} showAuthor /> : null;
-  const warning = !verification ? <MessageVerificationPending /> : verification.status !== "unsigned-ts" ? <MessageVerificationIndicator verification={verification} /> : null;
+  const warning = !verification ? <MessageVerificationPending /> : !fullyVerified(verification) && verification.status !== "unsigned-ts" ? <MessageVerificationIndicator verification={verification} /> : null;
   const trailing = warning && <span className="ml-1.5 inline-block align-[-0.15em] leading-none">{warning}</span>;
   const time = formatTime(at, lang);
   const full = new Date(at).toLocaleString(lang);
@@ -204,7 +204,10 @@ export const MessageRow = memo(function MessageRow({
           </div>
         )}
         {editing ? (
-          <MessageEditor msg={msg} />
+          <>
+            {warning && <div className="leading-none">{warning}</div>}
+            <MessageEditor msg={msg} />
+          </>
         ) : (
           <>
             {row.item.removed ? <div><span data-testid="message-server-removed" className="text-xs text-subtle">{t("chat.serverRemoved")}</span>{trailing}</div> : msg.text === DELETION_TEXT ? verification?.status === "verified" ? <div><span data-testid="message-author-deleted" className="text-xs text-subtle">{t("chat.authorDeleted")}</span>{trailing}</div> : <div><span className="text-xs text-danger">{t("chat.unverifiedDeletion")}</span>{trailing}</div> : msg.text && (
