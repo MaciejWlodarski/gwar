@@ -49,6 +49,8 @@ const PUPPET_GROUP: &str = "Voice bridge";
 const PUPPET_DESCRIPTION: &str = "Gwar user (bridged)";
 /// Flood points one address may collect before TeamSpeak blocks it (default 250).
 const PUPPET_IP_BLOCK: u32 = 2500;
+/// Connections one puppet identity may have at once (one per device of a member).
+const PUPPET_CLONES: u32 = 100;
 /// Powers of TeamSpeak's stock Server Admin group (ServerQuery has 100).
 const SERVER_ADMIN_POWER: u32 = 75;
 
@@ -434,20 +436,23 @@ impl<'a> Bridge<'a> {
         // Puppets all connect from our address; a flood ban triggered by our
         // users coming and going must not lock them out. Our core already
         // checked channel passwords and limits before a puppet follows its user.
-        for perm in [
-            "b_client_ignore_antiflood",
-            "b_client_ignore_bans",
-            "b_channel_join_ignore_password",
-            "b_channel_join_ignore_maxclients",
+        for (perm, value) in [
+            ("b_client_ignore_antiflood", 1),
+            ("b_client_ignore_bans", 1),
+            ("b_channel_join_ignore_password", 1),
+            ("b_channel_join_ignore_maxclients", 1),
             // Our users may write to everyone.
-            "b_client_server_textmessage_send",
+            ("b_client_server_textmessage_send", 1),
+            // Every device of a member has a puppet with the member's identity,
+            // and a guest identity may be connected only once.
+            ("i_client_max_clones_uid", PUPPET_CLONES),
         ] {
             self.query
                 .call(
                     Cmd::new("servergroupaddperm")
                         .arg("sgid", sgid)
                         .arg("permsid", perm)
-                        .arg("permvalue", 1)
+                        .arg("permvalue", value)
                         .arg("permnegated", 0)
                         .arg("permskip", 0),
                 )
