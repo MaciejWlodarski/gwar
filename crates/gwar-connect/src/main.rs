@@ -15,12 +15,7 @@ struct Cli {
     #[arg(long, env = "GWAR_CONNECT_HTTP", default_value = "127.0.0.1:8900")]
     http: SocketAddr,
     /// Web app origins allowed to use the API from a browser (the desktop app's are always allowed).
-    #[arg(
-        long = "origin",
-        env = "GWAR_CONNECT_ORIGINS",
-        value_delimiter = ',',
-        default_value = "https://gwar.app"
-    )]
+    #[arg(long = "origin", env = "GWAR_CONNECT_ORIGINS", value_delimiter = ',', default_value = "https://gwar.app")]
     origins: Vec<String>,
     /// Header your reverse proxy sets to the client's address, e.g. `x-real-ip`; believed
     /// only from loopback. Without it every proxied client shares the proxy's address.
