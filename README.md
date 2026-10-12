@@ -250,7 +250,7 @@ On first start the server prints a one-time **admin token**; open the web app,
 connect to `voice.example.com` and redeem it from the server menu ("Use
 token"). Get another one with `vc-server --data-dir data admin-token`.
 
-Connections are always encrypted: plain `ws://` works only to loopback for
+Connections are encrypted by default: plain `ws://` works only to loopback for
 development, or through the desktop app's explicit LAN option (see
 [Security](#encrypted-connections)).
 
@@ -263,9 +263,10 @@ port and path), so the server accepts only the addresses you configure:
 - `--public-url`: the same host and port as `ws(s)://…/ws`;
 - `--public-endpoint`: any full address, repeatable, including alias paths
   (or comma-separated `VC_PUBLIC_ENDPOINTS`);
-- `--public-ip`: a global unicast IP adds `wss://<ip>[:port]/ws`, but only when
-  the server terminates TLS itself (behind a proxy use `--public-url` or
-  `--public-endpoint`). Browsers need a certificate valid for that IP.
+- `--public-ip`: a global unicast IP adds `wss://<ip>[:port]/ws` with the
+  actual listening port (omitted for 443), but only when the server terminates
+  TLS itself (behind a proxy use `--public-url` or `--public-endpoint`).
+  Browsers need a certificate valid for that IP.
 
 The server refuses to start without any. Addresses are compared in canonical
 form (lowercase host, IPv6 in brackets, no default port, credentials, query
@@ -334,10 +335,11 @@ vc-server --data-dir data members merge [--dry-run] -- <from-uid> <into-uid>
   holds `data/vc.lock`, and the commands refuse to run while it does.
 - `prune` keeps members with a role besides Member unless `--include-grouped`
   is given.
-- `merge` moves one identity's unsigned messages, uploads, roles, read marks
-  and UID bans to an existing member, in one transaction, keeping the target's
-  nickname. Signed messages stay with their original author, because the
-  signature binds them.
+- `merge` moves one identity's unsigned messages (and the mentions in them),
+  uploads, roles, read marks and UID bans to an existing member, in one
+  transaction, keeping the target's nickname. Signed messages keep their
+  original author and mentions, because the signature binds them; the counts it
+  reports cover only unsigned messages and mentions.
 - Put UIDs beginning with `-` after `--`, as in the examples above.
 
 ## Develop
