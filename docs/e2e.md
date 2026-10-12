@@ -470,11 +470,18 @@ Local identities have one device and no archive.
   current epoch, used as the SFrame base key. The SFrame key id is
   `epoch (low 32 bits) ‖ leaf_index (32 bits)`, so receivers find the key per
   frame even though the SFU moves speakers between the 8 receive slots.
-  Replay windows are kept per key.
+  The key id carries only the low half of the epoch, so receivers keep keys
+  and replay windows per full `(group, epoch, leaf)`; a frame whose key id
+  matches several kept epochs is tried newest first (at most eight), and
+  only a frame that authenticates changes any state.
+- A leaf index is not a device. When a device is removed, its keys go from
+  every kept epoch before its freed leaf can belong to another device, and
+  acknowledgements are counted per device of the validated epoch.
 - One encryptor owns each sender key and its SFrame counter. An engine that
   restarts, or cannot prove its counter continued, does not reuse the key: it
   stays silent and commits an update of its leaf, then sends in that new
-  epoch once it is active. Others keeping its old key to receive is harmless.
+  epoch once it is active; it accepts no sending key from before that
+  update. Others keeping its old key to receive is harmless.
 - Every participant can derive every sender's key, so a participant could
   forge another's audio. Accepted for now (see Not goals).
 
@@ -483,24 +490,35 @@ Local identities have one device and no archive.
 - An epoch change is identified by `(group_id, epoch)`. A participant
   acknowledges it (`voice.epoch.ack`, relayed by the server to the call) only
   once the new keys are installed in its actual decryptor (worker or native
-  engine). Acknowledgements for epochs other than the newest are ignored.
+  engine). Acknowledgements for older epochs are ignored; those for an epoch
+  the participant has not processed yet are kept (a bounded number) until it
+  does. A participant that caught up after a gap asks the call to repeat
+  acknowledgements of the newest epoch.
 - Each sender **activates** the newest epoch it has processed by one rule:
   if any commit since its current sending epoch removed a leaf, at once;
   otherwise (additions, updates) when every participant of the new epoch,
   newcomers included, has acknowledged it, or two seconds after the sender
   processed it, whichever comes first. A newer commit replaces a pending one
-  and keeps the earlier start of the two-second wait.
+  and keeps the earlier start of the two-second wait, and a removal anywhere
+  in the pending chain keeps it immediate. "At once" means the sender stops
+  using the old key the moment it processes the commit, even while the new
+  keys are still being installed; it stays silent until they are.
+- The two seconds count from when the sender processed the commit. They
+  bound the wait for acknowledgements, not delivery: a commit the server
+  withholds delays the change until it arrives (see "Freshness").
 - A removed participant gets nothing under keys it does not have, whatever
-  the SFU does; the SFU also stops forwarding to it. A newcomer hears others
-  once they activate; the two-second limit bounds the wait, so a slow device
-  can briefly miss audio.
-- Receivers keep an epoch's keys while it is the epoch of some current
-  sender's latest frame that decrypted (silent senders included, through
-  their last frame), or for ten seconds after the receiver processed a newer
-  commit, whichever is longer; keys of removed senders go at once. At most
-  eight epochs are kept per call; past that the oldest goes, and a sender
-  that far behind stays silent to that receiver until it catches up and
-  sends in a newer epoch.
+  the SFU does; the SFU also stops forwarding to it. It can still decrypt a
+  sender who has not processed its removal yet, until that sender does; that
+  is the cutoff, per sender. A newcomer hears others once they activate; the
+  two-second limit bounds the wait, so a slow device can briefly miss audio.
+- Receivers keep an epoch's keys while it is the newest epoch in which some
+  current device's frame authenticated (silent senders included, through
+  their last frame; a late frame from an older epoch never moves this back),
+  or for ten seconds after the receiver processed the first commit that
+  superseded it, whichever is longer; keys of removed senders go at once.
+  At most eight epochs are kept per call; past that the oldest goes, and a
+  sender that far behind stays silent to that receiver until it catches up
+  and sends in a newer epoch.
 - Acknowledgements are relayed by the server and not signed, so a dishonest
   server could make senders switch early (a newcomer misses a moment of
   audio) or hold them until the two-second limit. That only affects
@@ -520,8 +538,10 @@ Local identities have one device and no archive.
   `sframe` crate, decrypting before it inspects Opus or fills the jitter
   buffer. The web layer, which runs MLS, passes keys through a new
   `voice_set_keys` command (High risk class): bound to the engine run,
-  server, session, voice group and epoch, with receive keys installed
+  server, session, voice group and full epoch, with receive keys installed
   separately from sender activation, and ignored after the run ends.
+  Repeating an identical install keeps the counter and replay windows;
+  different keys for the same binding stop the engine.
 - **Frame size**: Opus frames are kept small (20 ms at the current bitrates
   is about 120–200 bytes, plus at most 33 bytes of SFrame). Clients drop,
   never truncate, an encoded frame over 1000 bytes before encryption, so a
@@ -701,7 +721,19 @@ Safari; real Safari was not run. Times are median / p95 / p99.
   duplicates, both wraps, resets, silence, mute and bursts matched expected
   traces. The rules it added are under "SFU". The VM measurement is still to
   do.
-- **S5:** results pending.
+- **S5: passed in simulation.** Real OpenMLS groups and `sframe` keys, with
+  a modelled network and SFU, ran every scenario of the S5 row 40 times on
+  three network profiles: 4,955,406 encryptions without a repeated key and
+  counter, no frame decrypted by a removed participant after its sender
+  processed the removal (166 million attempts), no plaintext, and audio
+  back after every transition. The first frame in a new epoch arrived
+  within 22 ms on a LAN and 193 / 278 / 295 ms after a join at 50 ms round
+  trip with 1% loss; participants already in the call keep hearing each
+  other through additions and updates. A commit withheld for good leaves
+  that participant silent, as designed. The rules it sharpened (full-epoch
+  keys, leaf reuse, removal while keys install, kept and repeated
+  acknowledgements, retention timing) are under "Voice". Not tested: the
+  real key-install command, browsers and audio devices.
 - **S6: passed at code level.** By the owner's decision this run used fakes
   in place of the official server. 17 tests, each with a plaintext control
   that proves the path works, cover moves during speech, the grace period,
