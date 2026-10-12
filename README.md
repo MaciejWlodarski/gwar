@@ -2,7 +2,9 @@
 
 **Gwar** is an open-source, self-hosted voice chat. Run your own server,
 talk from the browser or the desktop app, and keep your friends who still use
-TeamSpeak in the same conversation.
+TeamSpeak in the same conversation. It is built to stay trustworthy even when
+the server you join is not: your identity is a key only you hold, and every
+message is signed (see [Security](#security)).
 
 **Use it:** the web app at <https://gwar.maciejwlodarski.com> connects to any
 Gwar server (the project's own is `voice.maciejwlodarski.com`); so does the
@@ -42,10 +44,9 @@ use.
   permanent, by identity or IP), invite links that can grant a role, server
   settings, removing members and cleaning up the inactive ones. Nobody can hand
   out more than they hold.
-- **Signed chat.** Clients verify authors, chained edits, author deletions and
-  attachment bytes, across endpoint aliases. Historical authorization uncertainty,
-  stale revocation information and unsigned TeamSpeak chat are labeled separately;
-  chat signatures do not authenticate voice. Fresh devices have no rollback checkpoints.
+- **Signed chat.** Every message, edit, deletion and attachment is signed by
+  its author and verified by every client, so a server cannot put words in
+  anyone's mouth. See [Security](#security).
 - **Chat like you expect.** Mentions with notifications, editing and deleting,
   images, video, audio and files (drag and drop or paste).
 - **One web app, plus a desktop app, with one UI.** The project hosts the web
@@ -62,10 +63,113 @@ use.
 Gwar is early software: it works and is tested end to end, but expect rough
 edges and breaking changes.
 
+## Security
+
+Gwar starts from the assumption that everything is public: the code, the
+protocol, and possibly a modified server you join by mistake. Nothing depends
+on hidden behavior; security comes only from keys that never leave their owner.
+A server is trusted to route voice and deliver messages, but never with who you
+are or what you said: even a hostile server cannot log in as you elsewhere,
+forge your messages or show a fake verified name without a visible warning.
+
+### Your identity is a key
+
+- Every identity is an **Ed25519 key pair generated on your device**. Your uid
+  is a hash of the public key and your `#tag` comes from the uid, so nobody, not
+  even a server operator, can choose, take or fake them.
+- Joining a server needs no account, e-mail or sign-up anywhere.
+
+### Logging in: mutual proof, no relaying
+
+- Every server has its own **Ed25519 server key**. Invite links carry its full
+  fingerprint, and clients pin it for each server address. If the key changes,
+  login stops until you check it with the owner; there is no silent rotation
+  and no fallback to a weaker login.
+- Login is a **mutual challenge-response**: your client signs the exact address
+  it dialed, the server key it expects and fresh random values from both sides,
+  and the server must answer with a proof signed by its own key. A malicious
+  server cannot replay your login to another server, and cannot pretend to be a
+  server whose key it does not hold.
+- Server passwords and invites are sent only after the server has proven itself.
+
+### Encrypted connections
+
+- Everything travels over **TLS** (`https://`, `wss://`); the server can obtain
+  and renew Let's Encrypt certificates by itself.
+- Voice uses **WebRTC, encrypted with DTLS-SRTP**.
+- Plaintext is allowed only to loopback for development, or through an explicit
+  per-server LAN option in the desktop app, which shows a permanent red warning
+  while connected.
+
+### Every message is signed
+
+- Each message, edit, deletion and attachment is **signed by its author's key**
+  and bound to the server's key, the conversation and the message id. A server
+  cannot alter a message, move it to another channel or present it as someone
+  else's without clients noticing.
+- **Edits form a hash chain**, and clients keep local checkpoints that refuse
+  rollbacks and forks of messages they have already seen.
+- Attachments are **checked against their signed hash** before they are shown
+  or saved.
+- Until its signature is checked a message is visibly pending; anything that
+  fails or cannot be fully verified carries a warning. Notifications and
+  mentions fire only for verified messages.
+
+### Gwar Connect: an account that never sees your secrets
+
+- **Your password never leaves your device.** It is stretched there with
+  **Argon2id** (64 MiB, 3 passes) into two keys: one encrypts your account key
+  with **AES-256-GCM**, the other signs you in, and Connect keeps only an
+  Argon2 hash of it. A leaked Connect database lets nobody sign in; reading an
+  account key would take an offline guessing attack on that account's password.
+- A **recovery code** with 160 random bits, shown once, restores access if you
+  forget the password.
+- Every device has **its own key, certified by your account key** for at most
+  90 days. A lost device is revoked with a signed revocation; servers then
+  disconnect it, and you stay the same person.
+- Your **vault** (profile, TeamSpeak identities) is encrypted on your devices
+  with AES-256-GCM under a key derived from your account key; Connect stores
+  only ciphertext.
+- An `@handle` badge is a **signed attestation** that your client checks
+  against the key of its own Connect service, so a server cannot invent one.
+  Servers verify devices themselves and keep working when Connect is down.
+
+### Hardened against hostile input
+
+- Clients validate every server message, with size and count bounds, before
+  using it. Servers limit frame sizes before parsing and rate-limit
+  connections that have not logged in yet.
+- The web app and the desktop interface run under a **Content-Security-Policy**.
+  Uploaded files are served with a sandboxing CSP and `nosniff`, and only from
+  the server's own origin.
+- Images are decoded only near the visible part of the chat and within a memory
+  budget; an image that decodes larger than its header claims is dropped.
+- Storage is capped per member and in total, so free identities cannot fill the
+  disk.
+
+### What Gwar does not protect, yet
+
+Being honest about the limits is part of the design:
+
+- **The server you are on can read its content**: messages, direct messages,
+  files and voice. Voice goes through the server (an SFU) and is not
+  end-to-end encrypted. For private conversations, use a server you trust, or
+  run your own.
+- **Direct messages are not end-to-end encrypted yet**; per-device end-to-end
+  encryption is on the roadmap.
+- Voice is not signed, and presence, nicknames, channel names and roles are the
+  server's word.
+- The web app is only as trustworthy as its hosting, which serves the code on
+  every load. Desktop builds are not signed yet.
+- TeamSpeak users have no Gwar keys, so their messages are shown as unsigned.
+
+The full threat model, with every mechanism and its limits, is in
+[docs/security.md](docs/security.md).
+
 ## Names: nickname, #tag and @handle
 
 A member is shown as **nickname** `@handle #tag`, for example
-**murzyn** `@zireael #c3tgigirh5`.
+**Kasia** `@kasia_w #kd5wx7rmq2`.
 
 - **Nickname**: what people see in chat and in the member list. It is chosen
   per server and the same on all your devices. Two people may have the same
