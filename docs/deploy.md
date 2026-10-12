@@ -39,6 +39,10 @@ adds no login endpoint behind nginx. Additional externally reachable aliases
 need a repeatable `--public-endpoint` with their exact scheme, port and path.
 Never use `--insecure-any-host` for these services.
 
+`scripts/deploy-vm.sh --web` publishes the web app only from a tree without
+uncommitted changes and writes `version.json` (`{"commit": "<sha>"}`) next to
+it, so the live app names the commit it was built from.
+
 The production web build includes a CSP meta policy: local scripts, WASM for
 hash-wasm's Argon2, HTTPS/WSS connections, and bounded attachment blobs. Vite dev
 omits it for HMR and loopback smoke tests. The desktop uses `build:desktop` and

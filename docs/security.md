@@ -274,12 +274,17 @@ These are limits of a voice chat relayed through a server:
   on a fresh device.
 - **Nicknames, channel names, roles** on that server are its word.
 - **Show forged or altered content**, but only with a warning.
-- **Track** your IP address and when you are online, and link your uid across
-  servers (the uid is global by design).
+- **Track** your IP address, when you are online and how much you send, and
+  link your uid across servers. Both are by design, not planned work: every
+  service sees the address you connect from, and the uid is global so your
+  identity, signatures and handle carry over between servers.
 
 ## What a malicious Connect can do
 
-- Attest a handle to any key; it is the authority for handles.
+- Attest a handle to any key; it is the authority for handles. Clients remember
+  the account behind each handle they verified and show a handle that moves to
+  another account as changed, not verified (see "Handles"); a handle seen for
+  the first time is taken as is.
 - Withhold revocations: a revoked device stays accepted until its certificate
   expires (at most 90 days). Revocations already seen are kept forever.
 - Run an offline guessing attack on your password with the stored blob; weak
@@ -294,10 +299,13 @@ These are limits of a voice chat relayed through a server:
 
 Every guarantee assumes your client runs genuine code.
 
-- **Web app.** Whoever controls `gwar.app` or its TLS can serve
-  modified JavaScript that reads your keys or password; web users trust the
-  hosting on every load. Local identity keys are exportable so they can be
-  backed up.
+- **Web app.** `gwar.app` is the only official web app. Whoever controls it
+  or its TLS can serve modified JavaScript that reads your keys or password;
+  web users trust the hosting on every load. It loads no third-party scripts,
+  runs under a CSP, and `/version.json` names the commit it was built from, so
+  anyone can compare it with the repository. That helps audits, not a user
+  already served a modified page: a check run by code from the same origin
+  proves nothing. Local identity keys are exportable so they can be backed up.
 - **Desktop app.** Code is bundled; the webview has a CSP. Builds are not yet
   signed or notarized; there is no auto-updater. The native file commands
   confine requests to the file paths of the server origin the interface names.

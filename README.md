@@ -6,8 +6,8 @@ TeamSpeak in the same conversation. It is built to stay trustworthy even when
 the server you join is not: your identity is a key only you hold, and Gwar
 clients sign what you write (see [Security](#security)).
 
-**Use it:** the web app at <https://gwar.app> connects to any
-Gwar server; so does the desktop app. The project runs a public server that
+**Use it:** the web app at <https://gwar.app>, the only official one,
+connects to any Gwar server; so does the desktop app. The project runs a public server that
 anyone can use for free: type `gwar.app` in Gwar or in a TeamSpeak client.
 
 *Gwar* is Polish for the buzz of many voices talking at once.
@@ -173,20 +173,49 @@ Being honest about the limits is part of the design:
 - **Direct messages are not end-to-end encrypted yet**; per-device end-to-end
   encryption is on the roadmap.
 - Voice is not signed, and presence, nicknames, channel names and roles are the
-  server's word. A server can also hide, delay or reorder messages, and sees
-  your IP address and when you are online; your uid is the same on every
-  server, so servers can tell it is you.
+  server's word. A server can also hide, delay or reorder messages.
 - **File links are like keys** by default: anyone holding a file's link can
   download it without logging in, also after leaving the server, until the
   message is deleted. TeamSpeak users need that to open files posted on Gwar.
   A server admin can make files members-only instead: then only people
   connected to the server who can read the channel open them, and TeamSpeak
   users see only file names.
-- Gwar Connect decides which account owns an `@handle`, and could serve you an
-  older copy of your encrypted vault.
-- The web app is only as trustworthy as its hosting, which serves the code on
-  every load. Desktop builds are not signed yet.
+- Gwar Connect vouches for `@handle`s. Your client notices when a handle it
+  already knows moves to a different account, but not on first sight, and
+  Connect could serve you an older copy of your encrypted vault.
+- The web app runs the code its host serves on every load (see
+  [The official web app](#the-official-web-app)). Desktop builds are not
+  signed yet.
 - TeamSpeak users have no Gwar keys, so their messages are shown as unsigned.
+
+### By design
+
+These are deliberate, not missing features:
+
+- **A server sees your IP address**, when you are online and how much you
+  send, like any service you connect to. Encryption protects what you say,
+  not the fact that you connect. Gwar Connect, if you use it, sees when your
+  devices sign in and sync.
+- **Your uid is the same on every server.** That continuity is the point: your
+  identity, your signatures and your `@handle` carry over everywhere, so
+  servers that compare notes can tell it is you, with or without a handle.
+
+### The official web app
+
+<https://gwar.app> is the only official Gwar web app. It connects to any
+self-hosted Gwar server, so server operators do not need to host a web client.
+
+- The web app runs the code gwar.app serves on every load. Whoever controlled
+  its hosting or deployment could serve modified code that reaches your keys,
+  your password and your messages; signatures (and, later, end-to-end
+  encryption) assume your client is genuine.
+- gwar.app loads no third-party scripts, runs under a strict
+  Content-Security-Policy, and publishes the commit it was built from at
+  <https://gwar.app/version.json>.
+- Copies of the web app hosted anywhere else are run by someone else; entering
+  your Connect password there trusts them with it.
+- The desktop app bundles its interface and never loads it from gwar.app.
+  Download it from the [releases](#download) of this repository.
 
 The full threat model, with every mechanism and its limits, is in
 [docs/security.md](docs/security.md).
@@ -432,8 +461,10 @@ VC_TS3_DIR=/tmp/ts3 cargo test -p vc-client --test teamspeak_mode --test teamspe
 - **Streaming**: screen sharing and video, peer to peer and through the server.
 - **Better audio on desktop**: noise suppression and echo cancellation.
 - **Fully native clients** later, keeping the same protocol.
-- **Direct messages between Connect accounts**, end-to-end encrypted per
-  device and relayed when the other side is offline.
+- **End-to-end encryption** with MLS: direct messages first, then channels
+  (chosen when a channel is created, with or without history for new
+  members), files and voice (SFrame). Channels that TeamSpeak users share stay
+  unencrypted and are marked as such.
 - **More TeamSpeak options**: bring your own TeamSpeak license for more slots,
   and a mixed stand-in so Gwar users can still talk when the free slots run out.
 

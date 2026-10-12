@@ -42,7 +42,14 @@ WEB_DIR=${VC_WEB_DIR:-}
 PUBLISH_WEB=0
 
 if [[ "${1:-}" == "--web" ]]; then
+  # The published app names the commit it was built from (README, "The official web app"),
+  # so it must be exactly that commit.
+  if ! git diff --quiet HEAD -- || [[ -n "$(git ls-files --others --exclude-standard -- apps crates)" ]]; then
+    echo "refusing to publish the web app from a tree with uncommitted changes" >&2
+    exit 1
+  fi
   pnpm --filter web build
+  printf '{"commit":"%s"}\n' "$(git rev-parse HEAD)" > apps/web/dist/version.json
   PUBLISH_WEB=1
 fi
 
