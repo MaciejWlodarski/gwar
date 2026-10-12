@@ -454,7 +454,7 @@ async fn members_only_files_open_for_readers_of_their_channel() {
     assert_eq!(get(&open, Some("not-a-session")).await, 404);
     assert_eq!(get(&open, Some(&bob_token)).await, 200);
 
-    // A password channel's files are for those who can read it; an unposted upload for its uploader.
+    // A password channel's files are for those who can read it; an upload in no message is for nobody.
     let locked = admin.ok("channel.create", json!({"name": "Locked", "password": "secret"})).await["id"]
         .as_u64()
         .unwrap() as u32;
@@ -463,7 +463,7 @@ async fn members_only_files_open_for_readers_of_their_channel() {
     assert_eq!(get(&hidden, Some(&admin_token)).await, 200);
     assert_eq!(get(&hidden, Some(&bob_token)).await, 404);
     let draft = upload(&server, &mut admin, "draft.txt", b"draft").await;
-    assert_eq!(get(&draft, Some(&admin_token)).await, 200);
+    assert_eq!(get(&draft, Some(&admin_token)).await, 404);
     assert_eq!(get(&draft, Some(&bob_token)).await, 404);
 
     // The token ends with its session, and the server can go back to links.

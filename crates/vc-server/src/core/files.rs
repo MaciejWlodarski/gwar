@@ -345,8 +345,9 @@ impl Core {
         }
     }
 
-    /// With [`FileAccess::Members`], only a client connected here that can read the file's
-    /// channel (or, before it is posted, its uploader) may download it.
+    /// With [`FileAccess::Members`], only a client connected here that can read the channel the
+    /// file is posted in may download it. A file in no message (not posted yet, or its message or
+    /// channel deleted) is for nobody: its uploader has the bytes.
     fn may_download(&self, id: &str, access: Option<&str>) -> bool {
         if self.info.file_access == FileAccess::Link {
             return true;
@@ -357,9 +358,8 @@ impl Core {
         else {
             return false;
         };
-        match self.store.file_place(id) {
-            Ok(Some((Some(channel), _))) => self.can_read(session, channel),
-            Ok(Some((None, uploader))) => uploader == session.uid,
+        match self.store.file_channel(id) {
+            Ok(Some(channel)) => self.can_read(session, channel),
             Ok(None) => false,
             Err(e) => {
                 warn!("store: {e:#}");

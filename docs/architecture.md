@@ -435,8 +435,8 @@ Who may download `GET /files/{random-id}/{name}` is a server setting
 - `members`: the request must carry `Authorization: Bearer <token>`, the
   random token of a live session (`Welcome.file_access`, 256 bits, gone when
   the session ends), and that session must be able to read the channel the
-  file was posted in (an unposted upload: be its uploader). Anything else gets
-  `404`, like a missing file. The bridge posts only file names to TeamSpeak.
+  file is posted in. Anything else gets `404`, like a missing file; so does a
+  file in no message (not posted yet, or its message or channel deleted). The bridge posts only file names to TeamSpeak.
   Clients send the token only to a members-only server.
 
 Deleting the message/file removes it from the server; copies already
