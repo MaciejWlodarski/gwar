@@ -23,6 +23,20 @@ export interface Bookmark {
   password?: string;
   /** TeamSpeak only: the uid of the identity to connect with. Missing, or no longer in the list: the default one. */
   identity?: string;
+  /** Unix ms of the last change to what Gwar Connect syncs (all but `insecureLan`); missing before syncing existed. */
+  updatedAt?: number;
+}
+
+/** How long a removed bookmark is remembered, so syncing does not bring it back from another device. */
+export const BOOKMARK_TOMBSTONE_MS = 90 * 86_400_000;
+
+/** Whether two bookmarks differ in what Gwar Connect syncs. */
+function syncedChange(a: Bookmark, b: Bookmark): boolean {
+  return a.name !== b.name || a.address !== b.address || (a.kind ?? "vc") !== (b.kind ?? "vc") || (a.password ?? "") !== (b.password ?? "") || (a.identity ?? "") !== (b.identity ?? "");
+}
+
+function pruneRemoved(removed: Record<string, number>, now: number): Record<string, number> {
+  return Object.fromEntries(Object.entries(removed).filter(([, at]) => now - at < BOOKMARK_TOMBSTONE_MS));
 }
 
 export interface AudioSettings {
@@ -66,6 +80,10 @@ export interface SettingsState {
   /** Per-user playback volume 0..2 keyed by uid. */
   userVolumes: Record<string, number>;
   bookmarks: Bookmark[];
+  /** Bookmarks removed on this device, by id, with when (Unix ms); see {@link BOOKMARK_TOMBSTONE_MS}. */
+  removedBookmarks: Record<string, number>;
+  /** Counts changes made on this device (not those that came from syncing), so a sync can follow them. */
+  bookmarkEdits: number;
   /** Migration source for identities saved before nicknames belonged to them. */
   lastNickname: string;
   lastAddress: string;
@@ -83,6 +101,8 @@ export interface SettingsState {
   setUserVolume(uid: string, volume: number): void;
   saveBookmark(bookmark: Bookmark): void;
   removeBookmark(id: string): void;
+  /** The list after a sync with Gwar Connect; not counted as an edit. */
+  replaceBookmarks(bookmarks: Bookmark[]): void;
   setLast(address: string, kind?: ServerKind): void;
   setTsDetectAsked(asked: boolean): void;
 }
@@ -119,6 +139,8 @@ export const useSettings = create<SettingsState>()(
       notifications: defaultNotifications,
       userVolumes: {},
       bookmarks: [],
+      removedBookmarks: {},
+      bookmarkEdits: 0,
       lastNickname: "",
       lastAddress: "",
       lastKind: "vc",
@@ -140,10 +162,27 @@ export const useSettings = create<SettingsState>()(
         }),
       saveBookmark: (bookmark) =>
         set((s) => {
-          const exists = s.bookmarks.some((b) => b.id === bookmark.id);
-          return { bookmarks: exists ? s.bookmarks.map((b) => (b.id === bookmark.id ? bookmark : b)) : [...s.bookmarks, bookmark] };
+          const existing = s.bookmarks.find((b) => b.id === bookmark.id);
+          const changed = !existing || syncedChange(existing, bookmark);
+          const saved = { ...bookmark, updatedAt: changed ? Date.now() : existing.updatedAt };
+          if (saved.updatedAt === undefined) delete saved.updatedAt;
+          const { [bookmark.id]: _revived, ...removedBookmarks } = s.removedBookmarks;
+          return {
+            bookmarks: existing ? s.bookmarks.map((b) => (b.id === bookmark.id ? saved : b)) : [...s.bookmarks, saved],
+            removedBookmarks,
+            bookmarkEdits: s.bookmarkEdits + (changed ? 1 : 0),
+          };
         }),
-      removeBookmark: (id) => set((s) => ({ bookmarks: s.bookmarks.filter((b) => b.id !== id) })),
+      removeBookmark: (id) =>
+        set((s) => {
+          const now = Date.now();
+          return {
+            bookmarks: s.bookmarks.filter((b) => b.id !== id),
+            removedBookmarks: { ...pruneRemoved(s.removedBookmarks, now), [id]: now },
+            bookmarkEdits: s.bookmarkEdits + 1,
+          };
+        }),
+      replaceBookmarks: (bookmarks) => set((s) => ({ bookmarks, removedBookmarks: pruneRemoved(s.removedBookmarks, Date.now()) })),
       setLast: (lastAddress, lastKind = "vc") => set({ lastAddress, lastKind }),
       setTsDetectAsked: (tsDetectAsked) => set({ tsDetectAsked }),
     }),

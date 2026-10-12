@@ -30,3 +30,41 @@ it("drops bookmark nicknames without losing bookmarks, credentials, identity cho
   useSettings.getState().setLast("new.example.com", "vc");
   expect(useSettings.getState().lastNickname).toBe("Łucja");
 });
+
+it("times only synced changes, remembers removals and forgets them when the server is saved again", async () => {
+  const storage = new Map<string, string>();
+  const browserStorage = { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value), removeItem: (key: string) => storage.delete(key) };
+  vi.stubGlobal("localStorage", browserStorage);
+  vi.stubGlobal("window", { localStorage: browserStorage });
+  vi.resetModules();
+  vi.useFakeTimers({ now: 1_000 });
+  try {
+    const { useSettings } = await import("./settings");
+    const s = () => useSettings.getState();
+    s().saveBookmark({ id: "a", name: "A", address: "a.example.com", kind: "vc" });
+    expect(s().bookmarks[0]?.updatedAt).toBe(1_000);
+    expect(s().bookmarkEdits).toBe(1);
+
+    vi.setSystemTime(2_000);
+    s().saveBookmark({ ...s().bookmarks[0]!, insecureLan: true });
+    expect(s().bookmarks[0]).toMatchObject({ updatedAt: 1_000, insecureLan: true });
+    expect(s().bookmarkEdits).toBe(1);
+
+    s().saveBookmark({ ...s().bookmarks[0]!, password: "secret" });
+    expect(s().bookmarks[0]?.updatedAt).toBe(2_000);
+    expect(s().bookmarkEdits).toBe(2);
+
+    vi.setSystemTime(3_000);
+    s().removeBookmark("a");
+    expect(s().bookmarks).toEqual([]);
+    expect(s().removedBookmarks).toEqual({ a: 3_000 });
+
+    s().replaceBookmarks([{ id: "b", name: "B", address: "b.example.com", kind: "vc", updatedAt: 5 }]);
+    expect(s().bookmarkEdits).toBe(3);
+    s().saveBookmark({ id: "a", name: "A", address: "a.example.com", kind: "vc" });
+    expect(s().removedBookmarks).toEqual({});
+    expect(s().bookmarks.map((b) => b.id)).toEqual(["b", "a"]);
+  } finally {
+    vi.useRealTimers();
+  }
+});

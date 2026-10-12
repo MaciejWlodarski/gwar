@@ -41,8 +41,9 @@ use.
   desktop and (later) the phone. Connect never sees your password or your
   key: it stores your identity encrypted, each device gets its own key
   certified by your identity, and a lost device is revoked without changing who
-  you are. Servers verify devices themselves and keep working if Connect is
-  down. See [docs/connect.md](docs/connect.md).
+  you are. Your saved servers follow you to every device. Servers verify
+  devices themselves and keep working if Connect is down. See
+  [docs/connect.md](docs/connect.md).
 - **Signed chat.** Gwar clients sign every message, edit, deletion and
   attachment and verify everyone else's, so a server cannot put words in a
   Gwar user's mouth without a warning. See [Security](#security).
@@ -142,9 +143,9 @@ The limits are listed plainly [at the end](#what-gwar-does-not-protect-yet).
   disconnect the device. If Connect withholds a revocation, the device works
   until its certificate expires; revoking it cannot take back what it already
   copied.
-- Your **vault** (profile, TeamSpeak identities) is encrypted on your devices
-  with AES-256-GCM under a key derived from your account key; Connect stores
-  only ciphertext.
+- Your **vault** (profile, TeamSpeak identities, saved servers with their
+  passwords) is encrypted on your devices with AES-256-GCM under a key derived
+  from your account key; Connect stores only ciphertext.
 - An `@handle` badge is a **signed attestation** that your client checks
   against the key of its own Connect service, so a server cannot invent one.
   Servers verify devices themselves and keep working when Connect is down.

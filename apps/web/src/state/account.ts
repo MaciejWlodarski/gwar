@@ -13,6 +13,7 @@ import { certificateWarning } from "../connect/expiry";
 import { changeIdentities, refreshFromVault, syncAfterUnlock, tsBridge } from "../connect/teamspeak";
 import { addEntry, cleanName, DEFAULT_NAME, type TsEntry, type TsList } from "../connect/ts-list";
 import { loadVault, VaultLockedError, vaultList } from "../connect/vault";
+import { syncServers, toBookmarks } from "../connect/servers";
 import {
   identityFromConnect,
   indexedDbConnectStore,
@@ -92,6 +93,44 @@ function syncTeamspeak(record: ConnectRecord): void {
     .finally(bumpTs);
 }
 
+let serverSync: Promise<void> = Promise.resolve();
+let serverSyncQueued = false;
+let serverSyncedAt = 0;
+
+/**
+ * Lines the saved servers up with the vault (see `connect/servers.ts`). Runs one at a time, in the
+ * background, and only logs failures; local bookmarks keep working without it.
+ */
+function syncBookmarks(): void {
+  if (serverSyncQueued) return;
+  serverSyncQueued = true;
+  serverSync = serverSync
+    .then(async () => {
+      serverSyncQueued = false;
+      const record = await loadConnectRecord();
+      if (!record?.vaultKey) return;
+      const before = useSettings.getState();
+      const merged = await syncServers(connectApi, record, { bookmarks: before.bookmarks, removed: before.removedBookmarks });
+      serverSyncedAt = Date.now();
+      if ((await loadConnectRecord())?.accountKey !== record.accountKey) return;
+      const after = useSettings.getState();
+      // Edited meanwhile: that edit syncs next, and the list stays as the person left it until then.
+      if (after.bookmarkEdits !== before.bookmarkEdits) return syncBookmarks();
+      after.replaceBookmarks(toBookmarks(merged, after.bookmarks));
+    })
+    .catch((e: unknown) => console.warn("saved servers sync skipped", e));
+}
+
+// Every saved, edited or removed server goes to the vault; other devices pick it up when they start or come back.
+useSettings.subscribe((s, prev) => {
+  if (s.bookmarkEdits !== prev.bookmarkEdits) syncBookmarks();
+});
+if (typeof window !== "undefined") {
+  window.addEventListener("focus", () => {
+    if (Date.now() - serverSyncedAt > 60_000 && useAccount.getState().account?.hasVaultKey) syncBookmarks();
+  });
+}
+
 /** Adopt or seed the profile before replacing the identity; offline sign-in keeps a cached nickname. */
 async function syncedProfile(record: ConnectRecord): Promise<ConnectRecord> {
   const cached = await loadConnectRecord();
@@ -114,6 +153,7 @@ async function activate(record: ConnectRecord): Promise<void> {
   await controller.switchIdentity(await identityFromConnect(record));
   useAccount.setState({ account: summarize(record), pending: null, loaded: true, certChecked: true });
   syncTeamspeak(record);
+  syncBookmarks();
 }
 
 /** Shows a stored record that keeps this device's key (new token, vault key or certificate) without reconnecting. */
@@ -130,6 +170,7 @@ async function refresh(record: ConnectRecord): Promise<void> {
   record = await syncedProfile(record);
   await indexedDbConnectStore.save(record);
   syncTeamspeak(record);
+  syncBookmarks();
   await applyRecord(record);
 }
 
@@ -208,6 +249,7 @@ export const accountActions = {
         })
         .catch((e: unknown) => console.warn("account profile refresh skipped", e));
     }
+    if (record?.vaultKey) syncBookmarks();
     if (record?.token) checkCertificate(record);
     else warnAboutExpiry();
     // Pick up an identity another desktop put in the vault. Never waited for: starting must not depend on the network.
