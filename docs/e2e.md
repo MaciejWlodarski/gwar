@@ -127,6 +127,7 @@ gwar conversation v1
 {conversation}
 {kind}              channel | dm | server | voice
 {incarnation}       0, then +1 per restart (below)
+{previous_group_id} the incarnation it replaces; - for 0
 {private}           0 | 1
 {history}           0 | 1  (new members see history)
 {founding_owner}    private channels; - otherwise
@@ -140,16 +141,22 @@ gwar conversation v1
 descriptor, and take `private` and `history` only from it, never from server
 metadata. The creator must be allowed to create it: the owner or a manager
 for a private channel (checked as in "Private channels"), a participant for a
-direct message, a member of the channel group for a voice call.
+direct message, a member of the channel group for a voice call, and any
+member of the server for a public channel or server-wide chat (the server's
+word, as membership itself is).
 
 Each client **pins** the group id per conversation and incarnation the first
 time it joins, and afterwards accepts only that group. A channel deleted and
 recreated gets a new channel id, so it is a new conversation. A conversation
 is **restarted** (next incarnation) only when its group cannot continue, for
-example because the server lost its state: the new descriptor must come from
-someone allowed to create it, and clients show a quiet "This conversation
-was restarted" line. Messages of earlier incarnations stay readable with the
-keys a device has. Voice groups are pinned only for the call (see "Voice").
+example because the server lost its state. A successor names its
+predecessor, keeps its `kind`, `private`, `history` and `founding_owner`,
+and must come from someone allowed to create the predecessor; a client that
+missed several restarts follows the chain from the incarnation it pinned.
+Clients keep the highest accepted incarnation as the live one and show a
+quiet "This conversation was restarted" line; earlier incarnations stay
+readable with the keys a device has, but nobody writes to them. Voice groups
+are pinned only for the call (see "Voice").
 
 For a direct message, the server keeps one group per pair: it accepts the
 first creation and answers later attempts with the existing group, which the
@@ -214,9 +221,12 @@ of every commit:
 ### Removal
 
 Catching up and being allowed to send are separate. A client processes every
-valid commit in order, even when the resulting tree holds a leaf that should
-go (an offline client catching up, or a competing commit by a client with a
-staler revocation feed); but while the current tree breaks a rule, it
+valid commit in order, judging it by the rules **as they stood in that
+epoch** (the access list and certificates then), even when the resulting
+tree holds a leaf that should go (an offline client catching up, or a
+competing commit by a client with a staler revocation feed). Replaying
+history never lowers what the client already knows to be current (its
+checkpoints below). But while the current tree breaks a current rule, it
 **stops sending and sharing history** in that group, commits the removal
 itself, and if another commit wins first, recomputes what still has to go
 and retries. Removal needs a member's commit; if no member device can commit
@@ -234,12 +244,12 @@ with signed statements that newcomers can check without any history:
   nominate its own owner to a fresh client, exactly as it could present its
   own key.
 - **Ownership moves** only by a chain of statements, each signed by a device
-  of the previous owner:
-  `gwar owner v1\n{server_key}\n{seq}\n{previous_owner_uid}\n{new_owner_uid}\n{signed_at}`.
-  The server serves the chain; a client follows it from the owner it pinned.
-  If the owner's keys are lost for good there is no link, and a new owner
-  shows the same neutral notice as a changed handle, which the user can
-  accept.
+  of the previous owner and naming the hash of the previous link:
+  `gwar owner v1\n{server_key}\n{seq}\n{previous_link_hash}\n{previous_owner_uid}\n{new_owner_uid}\n{signed_at}`.
+  The server serves the chain; a client accepts a chain only if it extends
+  the head it pinned. If the owner's keys are lost for good there is no link,
+  and a new owner shows the same neutral notice as a changed handle, which
+  the user can accept.
 - The **managers** of the server's private channels are a list signed by a
   device of the current owner:
   `gwar managers v1\n{server_key}\n{seq}\n{owner_uid}\n{manager uids}\n{signed_at}`.
@@ -247,21 +257,33 @@ with signed statements that newcomers can check without any history:
   `channel_edit`, the owner's client signs a new list. When another admin
   does it, the server reports a pending manager, and the list waits until the
   owner's client confirms it ("Allow @name to manage private channels?").
-- Each private channel's GroupContext holds the **access list**: the current
-  owner chain head, the manager list, and the members:
+- Each private channel's GroupContext holds the **access list**: the owner
+  chain head, the manager list, and the members:
   `gwar channel members v1\n{group_id}\n{seq}\n{member uids}\n{signer_uid}\n{signed_at}`,
-  signed by a device of the owner or of a manager on that manager list.
-- A client accepts an access list only if its owner follows from its pinned
-  owner, the manager list is signed by that owner, the member list by the
-  owner or a listed manager, and every `seq` is not lower than the last it
-  saw. Any member may commit a newer signed list (with the removal of leaves
-  it requires, in the same commit). A newcomer checks the signatures, so a
-  dishonest server cannot invent a member list; it can only show an older one
-  the newcomer has not seen superseded, the same first-contact limit as under
+  signed by a device of the current owner or of a manager on that manager
+  list. When the owner removes a manager or ownership moves, the owner's
+  client re-signs the member lists that no longer qualify, in the same
+  commits.
+- Clients **checkpoint** `(seq, statement hash)` for the owner chain head and
+  the manager list per server, and for each member list. A lower `seq` is
+  rejected; the same `seq` is accepted only with the same content, so two
+  devices signing different lists at the same number cannot be swapped later.
+  Any member may commit a newer signed list (with the removal of leaves it
+  requires, in the same commit). A newcomer checks the signatures, so a
+  dishonest server cannot invent a list; it can only show an older one the
+  newcomer has not seen superseded, the same first-contact limit as under
   "Freshness".
-- A member list counts only while its signer is on the manager list in the
-  same access list; when the owner removes a manager, the owner's client
-  re-signs the member lists that manager signed, in the same commits.
+- **Who signed, and when.** These statements are checked like messages: the
+  signature and the certificate chain to the right uid. A statement counts as
+  **current** only if its signer's certificate is current and not revoked;
+  otherwise it is history, valid only where the client accepted it earlier
+  or a later current statement follows it. Owner chain links are history
+  once a later link exists. So that a current statement always exists, the
+  owner's and managers' clients re-sign the manager list and member lists at
+  least every 60 days; if no owner or manager has been active for 90 days,
+  newcomers cannot join that private channel until one returns. The
+  descriptor's own signature is history: its authority for newcomers comes
+  from the current access list.
 - The owner and the managers are always allowed readers, as admins see every
   channel on Discord.
 
@@ -340,7 +362,8 @@ member is online."
 The same mechanism lets a **returning member** catch up on epochs it missed
 (its devices were all offline past the handshake log, or it was away): a
 sharer includes only epochs in which, by its own records, that uid had a
-device in the group. In a channel without history for new members, that is
+device in the group, and shares nothing where it has no such record; holding
+a key is not evidence. In a channel without history for new members, that is
 all a returning member gets. A key nobody kept is lost for good, and the
 messages of that epoch stay unreadable on that device.
 
@@ -359,29 +382,47 @@ Connect, next to the vault (which is capped at 64 KiB and stays as it is):
 
 - Records are encrypted with an **archive key** that is random, not derived
   from the account seed, and has numbered generations. Each device publishes
-  an X25519 key signed by its device key, with its device record.
+  an X25519 key signed by its device key, with its device record. The
+  **recovery key** is an X25519 key derived from the recovery code; its
+  public half is published with a version, signed by the account key, when
+  the recovery code is set.
 - A generation is created by a device of the account with a current
   certificate, as a **manifest** signed by its device key: account key,
-  generation, hash of the previous manifest, recipients, and the generation
-  key sealed (HPKE) to each recipient's X25519 key and to the **recovery
-  key**, an X25519 key derived from the recovery code whose public half is
-  published, signed by the account key, when the recovery code is set.
-  Devices check the manifest before using a generation, never upload under an
-  unchecked one, and Connect accepts only the first manifest for each
-  generation number.
-- **Revocation**: once a device of the account learns of a revocation, it
-  queues its archive uploads, creates the next generation for the remaining
-  devices (or adopts one another device created first), and only then
-  uploads. If no remaining device is online, the next one to connect does
-  this before anything else. A revocation withheld by Connect is not learned,
-  so until then uploads continue under the old generation.
-- **New device**: an existing device seals all earlier generation keys to the
-  new device when it sees its certificate; until one is online, the new
-  device reads nothing from the archive. The recovery code opens every
-  generation too, so history survives losing all devices. Older generations
-  stay usable for reading; only uploads always use the newest.
-- Each record is AEAD-encrypted with AAD binding account key, server key,
-  group id, epoch and generation; imports only add keys and never overwrite.
+  generation, hash of the previous manifest, recipients, recovery key
+  version, and the generation key sealed (HPKE) to each recipient and to the
+  recovery key. Connect accepts only the first manifest for each generation
+  number. Devices checkpoint `(generation, manifest hash)` and reject a
+  different manifest for a number they saw.
+- **Uploading** uses the newest generation that is **safe** by what the
+  device knows: its creator and every recipient are current, unrevoked
+  devices of the account, and it is sealed to the current recovery key.
+  Otherwise the device queues uploads and creates the next generation
+  itself (a fresh key); if Connect already holds an unsafe manifest for that
+  number, it takes the next free number. It never falls back to an unsafe or
+  older generation, so a withheld manifest can stall uploads, never weaken
+  them. Once a device learns of a revocation, the old generation is unsafe,
+  so this happens before its next upload; if no remaining device is online,
+  the next one to connect does it first. A revocation withheld by Connect is
+  not learned, so until then uploads continue under the old generation.
+- **Delivering keys later** (to a new device, or to a new recovery key) uses
+  a **key transfer**, signed by a current device of the account: account
+  key, manifest hash and generation, the recipient (device key and X25519
+  key, or recovery key version), and the HPKE encapsulation and ciphertext.
+  Manifests never change. An existing device sends transfers for every
+  generation it can open when it sees a new device's certificate; until one
+  is online, the new device reads nothing from the archive.
+- **Changing the recovery code** (which needs the password and a signed-in
+  device) publishes a new recovery key version; that device then sends
+  transfers of every generation it can open to the new recovery key and
+  creates a new generation sealed to it. If it cannot open some generation,
+  it says so: "History before … can't be restored with the new recovery
+  code." With that caveat, the recovery code opens the whole archive, so
+  history survives losing all devices.
+- Older generations stay usable for **reading**; only uploads follow the
+  rules above.
+- Each record holds its context (server key, group id, epoch) and key inside
+  the encryption, under a random record id; the AAD binds account key,
+  generation and record id. Imports only add keys and never overwrite.
 - A new device that can open the archive gets your history, also in channels
   without history for new members.
 - An older or partial archive can only hide keys, and so hide newer revisions
@@ -432,10 +473,18 @@ Local identities have one device and no archive.
   the SFU does; the SFU also stops forwarding to it. A newcomer hears others
   once they activate; the two-second limit bounds the wait, so a slow device
   can briefly miss audio.
-- Receivers keep the keys of every epoch some sender may still use (each
-  epoch until ten seconds after a newer one was activated by everyone they
-  hear from), at most eight; past that the oldest goes and a sender lagging
-  that far is briefly silent.
+- Receivers keep an epoch's keys while it is the epoch of some current
+  sender's latest frame that decrypted (silent senders included, through
+  their last frame), or for ten seconds after the receiver processed a newer
+  commit, whichever is longer; keys of removed senders go at once. At most
+  eight epochs are kept per call; past that the oldest goes, and a sender
+  that far behind stays silent to that receiver until it catches up and
+  sends in a newer epoch.
+- Acknowledgements are relayed by the server and not signed, so a dishonest
+  server could make senders switch early (a newcomer misses a moment of
+  audio) or hold them until the two-second limit. That only affects
+  availability: keys always come from locally validated MLS state, and
+  removals never wait.
 
 ### Clients
 
@@ -467,14 +516,21 @@ Local identities have one device and no archive.
     push-to-talk, dropped frames). Browsers do this already; the native
     engine must carry the capture position with each frame instead of using
     wall-clock time;
-  - while the same speaker stays on a slot, the forwarded time advances by
-    the difference of the sender's timestamps (modulo 2^32), and the packet
-    is forwarded at once; a packet older than the last forwarded one is
-    dropped;
-  - on a speaker change, or a difference that is negative or over five
-    seconds (a reset), the forwarded time advances by the elapsed wall-clock
-    time rounded up to whole 20 ms frames, at least one; voice frames are 20
-    ms, which clients enforce.
+  - per sender stream (SSRC), the SFU orders packets by extended RTP
+    sequence number: duplicates and packets older than the last forwarded
+    are dropped. A new SSRC starts a new baseline;
+  - for a newer packet from the same speaker on a slot, the forwarded time
+    advances by the sender's timestamp difference (modulo 2^32) and the
+    packet goes out at once. A difference that is negative or over five
+    seconds despite a newer sequence number is a source reset;
+  - on a speaker change or a source reset, the forwarded time advances by
+    the elapsed wall-clock time rounded up to whole 20 ms frames, at least
+    one.
+- **Frame duration**: clients ask for 20 ms frames (`ptime`/`maxptime` 20;
+  the native engine always uses 20 ms). The sender checks each frame's Opus
+  duration before encrypting and counts other durations; they are still
+  sent, because timing rests on the sender's timestamps and only the
+  speaker-change estimate assumes 20 ms. S2 verifies that browsers keep 20 ms.
 - **Speech gate**: unchanged, from the RFC 6464 audio level header extension,
   which stays in the clear. Who talks, and when, remains visible to the
   server, as it is today. Rewritten RTP headers are not part of SFrame's
@@ -529,7 +585,10 @@ Local identities have one device and no archive.
 - Everything it sees today about connections (IP addresses, timing).
 
 Gwar Connect additionally sees which devices use the key archive, when, from
-which addresses, and the number and size of records.
+which addresses, and the number and size of records; archive generation
+numbers, who created each manifest and for which devices, recovery key
+versions and key transfers. Record contents, including which server, group
+and epoch a key belongs to, are encrypted.
 
 ## Protocol changes (sketch)
 
@@ -562,9 +621,9 @@ p95/p99.
 | S1 MLS in the web app | Does OpenMLS 0.9 work in WebAssembly for create, external commit, add/remove, external-sender removals, exporter, GroupContext extensions, in Chrome, Firefox and Safari? Can it sign with the existing device key? Can a client catch up through epochs holding expired leaves and then remove them? Bundle size, speed, persistence in IndexedDB? | All operations work in the three browsers; gzip size under 400 KB; a commit in a 100-device group under 100 ms (p95) on a laptop; state survives reloads and a crash mid-commit. Otherwise mls-rs or ts-mls is evaluated the same way. |
 | S2 SFrame in browsers | Does `RTCRtpScriptTransform` encrypt to our SFU and decrypt across slot changes in Chrome, Firefox and Safari, failing closed? | Clean audio with eight senders; speakers moving between slots keep decrypting; added latency p99 under 2 ms including worker queueing, also with the tab in the background; no plaintext frame ever sent or played. |
 | S3 SFrame native | Does `sframe` 2.0 in `vc-client` interoperate with S2? | Shared test vectors pass both ways; frames at the 1000-byte cap with the widest key id and counter, and the negotiated RTP extensions, cross the real SFU intact in both directions; larger frames are dropped. |
-| S4 SFU and latency | Timestamp-based forwarding, speech gate, end-to-end cost. | Talking indicators and slots unchanged; mouth-to-ear p95 within 2 ms of plaintext on the VM; correct timing with packet loss, silence, mute, burst delivery and resumed speech. |
-| S5 Churn | Joins, removals, restarts, overlapping transitions, lost acknowledgements, withheld commits, repeated key installation, leaf reuse, epoch wrap, a call ending and a new one starting with returning devices, stale `voice_set_keys` calls. | Zero nonce reuse; a removed participant decrypts nothing after the removal commit is processed; no plaintext fallback; audio resumes after every transition (time to usable audio measured). |
-| S6 TeamSpeak isolation | With the official TS3 server: moves, whispers, puppets in their grace period, query listeners, restarts. | Zero bytes of an encrypted channel's audio or text reach TeamSpeak. |
+| S4 SFU and latency | Timestamp-based forwarding, speech gate, end-to-end cost. | Talking indicators and slots unchanged; mouth-to-ear p95 within 2 ms of plaintext on the VM; correct timing with packet loss, reordering, duplicates, timestamp wrap and resets, silence, mute, burst delivery and resumed speech. |
+| S5 Churn | Joins, removals, restarts, overlapping transitions, lost, fabricated or duplicate acknowledgements, withheld commits, repeated key installation, leaf reuse, epoch wrap, silent senders across epochs, more than eight epochs in a row, a call ending and a new one starting with returning devices, stale `voice_set_keys` calls. | Zero nonce reuse; a removed participant decrypts nothing after the removal commit is processed; no plaintext fallback; audio resumes after every transition (time to usable audio measured). |
+| S6 TeamSpeak isolation | With the official TS3 server: moves, whispers, puppets in their grace period, query listeners, restarts. | Zero bytes of an encrypted channel's audio or text reach TeamSpeak, and no TeamSpeak audio, whisper or text enters an encrypted conversation; plaintext channels keep working both ways. |
 
 ## Open questions
 
