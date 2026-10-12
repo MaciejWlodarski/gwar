@@ -736,12 +736,13 @@ Safari 27 through WebDriver. Times are median / p95 / p99.
   covered); WebKit and Safari give no receive time, and decryption itself took
   0.10 ms in WebKit and 0.08 ms in Safari (0.66 ms with its window minimised).
   The Firefox and WebKit figures come from a rerun on an idle machine. Safari
-  also passed every functional check, as receiver and sender, with Chrome and
-  with the desktop engine. During parallel builds Firefox reached 62 ms p99
-  with a covered window, so behaviour under CPU load belongs to the latency
-  work. Not measured: the queues before the sender transform and after the
-  receiver's, which browsers do not expose, and hidden Firefox and WebKit tabs
-  under normal background policy.
+  also passed the browser functional checks, as receiver and sender with
+  Chrome, and exchanged frames with the native engine both ways (decrypted and
+  decoded; desktop playback not tested). During parallel builds Firefox
+  reached 62 ms p99 with a covered window, so behaviour under CPU load belongs
+  to the latency work. Not measured: the queues before the sender transform
+  and after the receiver's, which browsers do not expose, and hidden Firefox
+  and WebKit tabs under normal background policy.
 - **S3: interoperable with empty metadata, not fully RFC-conformant.** 42
   shared vectors both ways and all RFC header vectors; 200 frames of 1000
   bytes with the widest key id and counter crossed the SFU intact in each
@@ -753,11 +754,11 @@ Safari 27 through WebDriver. Times are median / p95 / p99.
   runs, without SFrame); talking indicators and slots were unchanged, and
   loss, reordering, duplicates, both wraps, resets, silence, mute and bursts
   matched expected traces. The rules it added are under "SFU". Through the
-  VM over the internet (about 34 ms round trip) both builds landed between
-  155 and 208 ms per call, a spread set when each call starts (playout
-  buffering) that hides a 2 ms difference; no regression showed, so the
-  loopback figure stands as the forwarding cost, and the spread goes to the
-  latency work.
+  VM over the internet (about 34 ms round trip) the median of each call was
+  between 155 and 208 ms for both builds, a spread set when each call starts
+  (playout buffering), so this path cannot resolve the 2 ms gate. The
+  loopback figure stays the measured forwarding cost, and the spread goes to
+  the latency work.
 - **S5: passed in simulation.** Real OpenMLS groups and `sframe` keys, with
   a modelled network and SFU, ran every scenario of the S5 row 40 times on
   three network profiles: 4,955,406 encryptions without a repeated key and
