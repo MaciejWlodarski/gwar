@@ -101,6 +101,35 @@ refresh it from the vault. Edits write the encrypted vault first with its
 optimistic version, re-read and retry on `409 conflict`, then update the local
 cache. Writers preserve other profile fields and all other vault sections.
 
+The `servers` section holds the saved servers, so every signed-in device shows
+the same list:
+
+```json
+{"servers": {"entries": [{"id": "<random>", "name": "Gwar", "address": "gwar.app", "kind": "vc", "password": "<server password, if any>", "updated_at": 1760000000000}, {"id": "<random>", "updated_at": 1760000000000, "deleted": true}]}}
+```
+
+- `kind` is `vc` or `teamspeak`; a TeamSpeak entry may name the TeamSpeak
+  identity to use (`identity`, a `uid` from the `teamspeak` section).
+  Limits: `id` 64, `name` 64, `address` 255, `password` 128 characters; a
+  bookmark beyond them stays on its device.
+- A removed server becomes a tombstone (`deleted`, `id`, `updated_at`) kept for
+  90 days, so a device that still has it does not bring it back. Merging keeps
+  the newer `updated_at` per `id` (the vault on a tie); bookmarks saved before
+  syncing count as time 0. At most 100 entries; tombstones go first.
+- The desktop app's plaintext LAN opt-in is a choice about one device's
+  network and is never synced.
+- A device remembers which account each bookmark and removal belongs to: the
+  signed-in one, from the moment it is made. Bookmarks saved while signed out
+  join the first account that syncs on that device; another account's are never
+  merged in. Signing out syncs until the vault has every change, then removes
+  the account's servers from the device (signing in brings them back). If that
+  sync fails, they stay on the device, hidden, and sync when the account signs
+  in there again.
+- A local edit or removal is timed after the version it replaces, so it wins
+  even when this device's clock is behind the one that wrote that version.
+- Clients merge their list in after signing in or unlocking, at startup, when
+  the window regains focus (at most once a minute) and after every local edit.
+
 ## Signed statements
 
 All signatures are Ed25519 over the UTF-8 text, fields separated by `\n`:

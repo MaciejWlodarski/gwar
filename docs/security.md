@@ -31,7 +31,7 @@ by mistake. The design treats this as the normal case.
 
 1. Private keys: account key, device keys, local identity keys, server keys.
 2. The Connect password and the recovery code.
-3. The vault (profile, TeamSpeak identities).
+3. The vault (profile, TeamSpeak identities, saved servers and their passwords).
 4. Who said what: authenticity of messages, edits and attachments.
 5. Your roles on honest servers.
 6. Handles (`@name`) as a human-readable identity.
@@ -284,7 +284,8 @@ These are limits of a voice chat relayed through a server:
   expires (at most 90 days). Revocations already seen are kept forever.
 - Run an offline guessing attack on your password with the stored blob; weak
   passwords fall, the recovery code (160 bits) does not.
-- Serve an older vault (rollback). A revoked device keeps the vault key it had.
+- Serve an older vault (rollback), which can bring back a removed saved server
+  or an old server password. A revoked device keeps the vault key it had.
 - Deny service; learn which servers look up which accounts.
 - It cannot sign as you, decrypt your account key without your password, read
   the vault, or forge revocations.

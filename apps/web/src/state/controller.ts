@@ -46,7 +46,7 @@ import { isDesktop } from "../platform";
 import { createVoiceEngine } from "../voice";
 import { VoiceError, type VoiceEngine } from "../voice/engine";
 import { channelThreadKey, latestMessageId, myChannelId, storedKey } from "./reducer";
-import { newId, useSettings, type ServerKind } from "./settings";
+import { inAccount, newId, useSettings, type ServerKind } from "./settings";
 import { useConnectUi, useOutbox, useSession, useUi, useVoice, type FailedSend } from "./stores";
 import type { ThreadKey } from "./types";
 
@@ -383,6 +383,7 @@ class Controller {
     const name = useSession.getState().server?.name || params.address;
     const existing = settings.bookmarks.find(
       (b) =>
+        inAccount(b, settings.bookmarkAccount) &&
         b.address.trim().toLowerCase() === params.address.trim().toLowerCase() &&
         (b.kind ?? "vc") === kind,
     );
