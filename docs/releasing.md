@@ -29,8 +29,16 @@ GitHub release. Nothing is public until you publish the draft by hand.
    from any version (manifests, `tauri.conf.json`, `package.json` files or
    `Cargo.lock`). Then it builds everything in parallel (macOS, Windows, Linux
    desktop; Linux x86-64 and ARM64 server) and, if all builds pass, creates the
-   draft release with all files and `SHA256SUMS`.
-5. Open the draft under Releases. Edit the generated notes, optionally
+   draft release with all files and `SHA256SUMS`, with a GitHub provenance
+   attestation for each file.
+5. The **sign** job then waits for your approval (the `release` environment).
+   Approving hands the release key to that job, so first check that the run
+   is for your tag, on the commit you pushed, and that nobody changed
+   `.github/workflows/release.yml` there. Then approve it, and it adds
+   `SHA256SUMS.minisig` to the draft. Approve before publishing; it refuses to
+   change a published release.
+6. Once the sign job has finished and `SHA256SUMS.minisig` is on the draft,
+   open the draft under Releases. Edit the generated notes, optionally
    download and try a few assets, then press **Publish release**.
 
 Tags must look like `v1.2.3` (no `-rc1` suffixes: the Windows MSI format does
@@ -59,6 +67,7 @@ job only verifies that all versions agree with each other.
 | `gwar-server-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` | `vc-server` and `gwar-connect`, Linux x86-64 |
 | `gwar-server-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz` | the same for Linux ARM64 (Oracle Ampere, Raspberry Pi 4/5 with a 64-bit OS) |
 | `SHA256SUMS` | SHA-256 of every file above |
+| `SHA256SUMS.minisig` | minisign signature of `SHA256SUMS` with the release key |
 
 The desktop file names come from Tauri, so they can differ slightly from this
 table. The server archives hold a folder with `vc-server`, `gwar-connect`,
@@ -68,7 +77,23 @@ default `teamspeak` feature), link Opus statically, and are built on Ubuntu
 
 ## Verify a download
 
-Put the file next to `SHA256SUMS` and check just that file:
+**1. The signature** proves `SHA256SUMS` comes from the Gwar release key, not
+just from whoever served you the files. Install
+[minisign](https://jedisct1.github.io/minisign/) (`brew install minisign`,
+`apt install minisign`, `scoop install minisign`) and run, next to
+`SHA256SUMS` and `SHA256SUMS.minisig`:
+
+```bash
+minisign -Vm SHA256SUMS -P RWQ7B0C3dfQMu/i6pOK6gtlo5MBdyDidCO7Iec4mv6zBuOjwL5+p446A
+```
+
+It must print `Signature and comment signature verified` and a trusted comment
+`gwar vX.Y.Z SHA256SUMS` with the version you downloaded. The key is also in
+[release-key.pub](release-key.pub); take it from this repository, not from a
+download page.
+
+**2. The checksum** ties your file to the signed list. Put the file next to
+`SHA256SUMS` and check just that file:
 
 ```bash
 # Linux
@@ -81,12 +106,53 @@ Windows (PowerShell): compare the output of
 `(Get-FileHash .\Gwar_0.2.0_x64-setup.exe -Algorithm SHA256).Hash` with the
 line for that file in `SHA256SUMS` (case does not matter).
 
-The checksums only prove the download is complete and matches what the
-workflow built; they are not a signature.
+**3. Provenance (optional)** shows which workflow and commit built the file,
+with the [GitHub CLI](https://cli.github.com/):
 
-## Signing and the secrets
+```bash
+gh attestation verify Gwar_0.2.0_universal.dmg --repo MaciejWlodarski/gwar \
+  --signer-workflow MaciejWlodarski/gwar/.github/workflows/release.yml \
+  --source-ref refs/tags/v0.2.0
+```
 
-Signing is optional. Without secrets the workflow still builds everything,
+A valid attestation
+proves where a file was built, not that the code was good.
+
+None of this removes the operating system warnings below: those need paid
+certificates.
+
+## The release key
+
+`SHA256SUMS` is signed with a dedicated minisign key, used for nothing else.
+Its public half is [release-key.pub](release-key.pub); the secret half exists
+only as the `MINISIGN_SECRET_KEY` secret of the `release` environment
+(Settings > Environments). That environment accepts only `v*` tags and needs
+the owner's approval for every run, so a workflow on another branch or a pull
+request (forks included) cannot use the key. GitHub never shows a secret again,
+in the interface or the API, but a job you approve receives it in plain text:
+a tag whose workflow was changed could send the key anywhere. That is why the
+approval step above asks you to check the run first. With another repository
+administrator, approval would no longer be only yours.
+
+If the key is lost or may have leaked, make a new one in a private folder,
+store it, and only then replace the public half:
+
+```bash
+dir=$(mktemp -d)
+minisign -G -W -p "$dir/release-key.pub" -s "$dir/release.key"
+gh secret set MINISIGN_SECRET_KEY --env release < "$dir/release.key" &&
+  cp "$dir/release-key.pub" docs/release-key.pub &&
+  rm -r "$dir"
+```
+
+If `gh secret set` fails, the new key stays in `$dir`; try again from there.
+Then update the key in "Verify a download" above, commit, and say in the next
+release notes that the key changed. Releases signed with the old key stay
+checkable with the old public key from the repository history.
+
+## Code signing and the secrets
+
+Code signing is optional. Without secrets the workflow still builds everything,
 just unsigned, and prints a warning. Add secrets under Settings > Secrets and
 variables > Actions.
 
@@ -126,4 +192,4 @@ provider, so it is left out until there is one.
 
 ### Linux and the server binaries
 
-Nothing to sign. Check them with `SHA256SUMS`.
+No code signing; check them with the signed `SHA256SUMS` (see "Verify a download").
