@@ -31,9 +31,12 @@ GitHub release. Nothing is public until you publish the draft by hand.
    desktop; Linux x86-64 and ARM64 server) and, if all builds pass, creates the
    draft release with all files and `SHA256SUMS`, with a GitHub provenance
    attestation for each file.
-5. The **sign** job then waits for your approval (the `release` environment):
-   approve it in the run, and it adds `SHA256SUMS.minisig` to the draft.
-   Approve before publishing; it refuses to change a published release.
+5. The **sign** job then waits for your approval (the `release` environment).
+   Approving hands the release key to that job, so first check that the run
+   is for your tag, on the commit you pushed, and that nobody changed
+   `.github/workflows/release.yml` there. Then approve it, and it adds
+   `SHA256SUMS.minisig` to the draft. Approve before publishing; it refuses to
+   change a published release.
 6. Open the draft under Releases. Edit the generated notes, optionally
    download and try a few assets, then press **Publish release**.
 
@@ -107,10 +110,11 @@ with the [GitHub CLI](https://cli.github.com/):
 
 ```bash
 gh attestation verify Gwar_0.2.0_universal.dmg --repo MaciejWlodarski/gwar \
-  --signer-workflow MaciejWlodarski/gwar/.github/workflows/release.yml
+  --signer-workflow MaciejWlodarski/gwar/.github/workflows/release.yml \
+  --source-ref refs/tags/v0.2.0
 ```
 
-Check that the reported source ref is the release tag. A valid attestation
+A valid attestation
 proves where a file was built, not that the code was good.
 
 None of this removes the operating system warnings below: those need paid
@@ -123,16 +127,24 @@ Its public half is [release-key.pub](release-key.pub); the secret half exists
 only as the `MINISIGN_SECRET_KEY` secret of the `release` environment
 (Settings > Environments). That environment accepts only `v*` tags and needs
 the owner's approval for every run, so a workflow on another branch or a pull
-request cannot use the key. Nobody can read a secret back, not even the owner.
+request (forks included) cannot use the key. GitHub never shows a secret again,
+in the interface or the API, but a job you approve receives it in plain text:
+a tag whose workflow was changed could send the key anywhere. That is why the
+approval step above asks you to check the run first. With another repository
+administrator, approval would no longer be only yours.
 
-If the key is lost or may have leaked, make a new one and replace both halves:
+If the key is lost or may have leaked, make a new one in a private folder,
+store it, and only then replace the public half:
 
 ```bash
-minisign -G -W -p docs/release-key.pub -s /tmp/gwar-release.key
-gh secret set MINISIGN_SECRET_KEY --env release < /tmp/gwar-release.key
-rm /tmp/gwar-release.key
+dir=$(mktemp -d)
+minisign -G -W -p "$dir/release-key.pub" -s "$dir/release.key"
+gh secret set MINISIGN_SECRET_KEY --env release < "$dir/release.key" &&
+  cp "$dir/release-key.pub" docs/release-key.pub &&
+  rm -r "$dir"
 ```
 
+If `gh secret set` fails, the new key stays in `$dir`; try again from there.
 Then update the key in "Verify a download" above, commit, and say in the next
 release notes that the key changed. Releases signed with the old key stay
 checkable with the old public key from the repository history.

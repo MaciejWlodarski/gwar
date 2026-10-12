@@ -198,8 +198,26 @@ jobs:
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
-          path: dist
+          path: built
           merge-multiple: true
+      # The artifacts keep the bundle folders (nsis/, msi/, appimage/, deb/...):
+      # collect every file into one flat folder, which is what gets checksummed,
+      # attested, signed and uploaded, and check that nothing is missing.
+      - name: Collect the files
+        run: |
+          mkdir dist
+          while IFS= read -r -d '' f; do
+            name=$(basename "$f")
+            if [ -e "dist/$name" ]; then echo "::error::Two files are named $name."; exit 1; fi
+            cp "$f" "dist/$name"
+          done < <(find built -type f -print0)
+          ls -l dist
+          missing=0
+          for pattern in '*.dmg' '*-setup.exe' '*.msi' '*.AppImage' '*.deb' \
+            'gwar-server-*-x86_64-unknown-linux-gnu.tar.gz' 'gwar-server-*-aarch64-unknown-linux-gnu.tar.gz'; do
+            if ! compgen -G "dist/$pattern" > /dev/null; then echo "::error::No $pattern was built."; missing=1; fi
+          done
+          exit "$missing"
       - name: Checksums
         working-directory: dist
         run: |
