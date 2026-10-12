@@ -212,8 +212,11 @@ A member is shown as **nickname** `@handle #tag`, for example
   verified badge. Your client checks Connect's signed attestation itself,
   against the key of its own Connect service and the member's uid, so a server
   cannot invent one. Handles refresh in the background and an expired one is
-  hidden (details in [docs/connect.md](docs/connect.md)). A handle is only as
-  trustworthy as Connect, while the #tag needs no one.
+  hidden (details in [docs/connect.md](docs/connect.md)). Your client remembers
+  which account it saw behind each handle: if the same handle later shows up on
+  a different account, it is marked as changed instead of verified until you
+  accept it in the member's profile. A handle is only as trustworthy as
+  Connect, while the #tag needs no one.
 
 ## Download
 

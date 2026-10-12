@@ -129,6 +129,24 @@ vouches for a name the server chose.
 
 Handle lookup by key is public by design.
 
+**Handle continuity.** Connect may move a handle to another account (and a
+compromised Connect could sign one for an account of its choosing), which would
+make a new account look like someone you already know. The client therefore
+remembers the account (uid) it first verified behind each handle, per Connect
+service (not per service key, so a key change does not reset this), in local
+storage. A handle that later shows up on a different account gets a neutral
+"belonged to a different account before" marker instead of the check mark; the
+member's profile explains it and lets the user accept the new account, which
+moves the pin. Existing conversations stay with the uid they were held with.
+A new handle shows no badge until it is pinned, so two accounts showing the
+same new handle at once are never both verified. Each handle is stored on its
+own, written once when first seen and again only when the user accepts another
+account; changes run under a Web Lock shared by all tabs and decide on a fresh
+read, so tabs do not overwrite each other's pins. Limits: the first sighting is
+trusted as is; pins are per device (a new device, cleared or corrupt storage
+starts empty); if the browser refuses storage, pins live only until the page
+reloads (accepting then says it was not saved).
+
 ## Connect account integrity (implemented)
 
 - The client derives keys only with Argon2id v19, m=65536 KiB, t=3, p=1,

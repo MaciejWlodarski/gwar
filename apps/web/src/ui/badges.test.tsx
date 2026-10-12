@@ -1,9 +1,11 @@
 // @vitest-environment happy-dom
-import { act } from "react";
+import { act, useLayoutEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { acceptHandle, resetHandlePins } from "../net/handle-pins";
 import { useSettings } from "../state/settings";
 import { ConnectBadge } from "./badges";
+import { useConnectHandle } from "./useConnectHandle";
 
 vi.mock("./useVerifiedHandle", () => ({ useVerifiedHandle: () => "mallory" }));
 const member = { uid: "uid" };
@@ -13,6 +15,7 @@ describe("Connect badge", () => {
   beforeEach(() => {
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
     useSettings.setState({ language: "en" });
+    localStorage.clear(); resetHandlePins();
     container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
   });
   afterEach(async () => {
@@ -35,5 +38,42 @@ describe("Connect badge", () => {
   it("shows the handle for look-alike nicknames", async () => {
     await show("mallоry"); // Cyrillic о
     expect(container.textContent).toBe("@mallory");
+  });
+  it("marks a handle seen on a different account before instead of verifying it", async () => {
+    await acceptHandle("mallory", "someone-else");
+    await show("mallory");
+    expect(container.querySelector('[data-testid="connect-badge"]')).toBeNull();
+    const changed = container.querySelector('[data-testid="connect-badge-changed"]')!;
+    expect(changed.textContent).toBe("@mallory");
+    expect(changed.getAttribute("aria-label")).toContain("different account");
+  });
+  it("verifies again once the user accepts the account", async () => {
+    await acceptHandle("mallory", "someone-else");
+    await show("mallory");
+    await act(async () => acceptHandle("mallory", "uid"));
+    expect(container.querySelector('[data-testid="connect-badge"]')).not.toBeNull();
+  });
+  it("pins the first account it verifies", async () => {
+    await show("Alice");
+    await act(async () => root.render(<ConnectBadge member={{ uid: "other" }} name="Alice" />));
+    expect(container.querySelector('[data-testid="connect-badge-changed"]')).not.toBeNull();
+  });
+  it("never shows two accounts as verified for the same new handle, not even for one commit", async () => {
+    const commits: string[] = [];
+    function Probe({ uid }: { uid: string }) {
+      const connect = useConnectHandle({ uid });
+      useLayoutEffect(() => { commits.push(`${uid}:${connect?.status ?? "none"}`); });
+      return null;
+    }
+    await act(async () => root.render(<><Probe uid="A" /><Probe uid="B" /></>));
+    expect(commits).not.toContain("B:verified");
+    expect(commits.slice(-2)).toEqual(["A:verified", "B:changed"]);
+  });
+  it("shows the handle again after another tab cleared the pins", async () => {
+    await show("Alice");
+    expect(container.querySelector('[data-testid="connect-badge"]')).not.toBeNull();
+    localStorage.clear();
+    await act(async () => { window.dispatchEvent(new StorageEvent("storage", { key: null })); });
+    expect(container.querySelector('[data-testid="connect-badge"]')).not.toBeNull();
   });
 });

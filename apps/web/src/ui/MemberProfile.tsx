@@ -1,11 +1,13 @@
 import { Copy, Pencil } from "lucide-react";
 import { useState, type FormEvent } from "react";
 import { useT } from "../i18n";
+import { acceptHandle } from "../net/handle-pins";
 import { validNickname } from "../net/nickname";
 import { controller, describeRequestError } from "../state/controller";
 import { useSession, useUi } from "../state/stores";
 import { ConnectBadge, IdentityLine } from "./badges";
 import { useMemberName, usePermission } from "./hooks";
+import { useConnectHandle } from "./useConnectHandle";
 import { Avatar, Button, Dialog, Field, Input } from "./kit";
 
 export function NicknameDialog({ uid }: { uid: string }) {
@@ -68,6 +70,7 @@ export function MemberProfileDialog({ uid, fallback }: { uid: string; fallback: 
   const own = useSession((s) => s.me?.uid === uid);
   const vc = useSession((s) => s.kind === "vc");
   const mayRename = usePermission("member_nickname");
+  const connect = useConnectHandle(member);
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(uid);
@@ -89,6 +92,17 @@ export function MemberProfileDialog({ uid, fallback }: { uid: string; fallback: 
             <IdentityLine member={member} tag={member?.tag} className="block" />
           </div>
         </div>
+        {connect?.status === "changed" && (
+          <div className="flex flex-col gap-2 rounded-md bg-raised p-3 text-sm text-muted">
+            <p>{t("member.handleChanged", { handle: connect.handle })}</p>
+            <Button
+              className="self-start"
+              onClick={() => void acceptHandle(connect.handle, uid).then((saved) => saved || useUi.getState().toast("error", t("member.acceptNotSaved")))}
+            >
+              {t("member.acceptHandle")}
+            </Button>
+          </div>
+        )}
         <Field label={t("member.uid")}>
           {(id) => (
             <div className="flex gap-2">
