@@ -589,7 +589,8 @@ Local identities have one device and no archive.
     advances by the sender's timestamp difference (modulo 2^32) and the
     packet goes out at once. A difference that is negative or over five
     seconds despite a newer sequence number is a source reset (so is a
-    real silence longer than five seconds, which costs nothing audible); a
+    real silence longer than five seconds, harmless when packets arrive on
+    time); a
     difference of zero (one frame per packet, so a sender fault) drops the
     packet and is counted;
   - on a speaker change or a source reset, the forwarded time advances by
@@ -623,7 +624,8 @@ Local identities have one device and no archive.
   whether that channel is encrypted, from the moment it enters the server;
   every later boundary (the SFU's puppet feed, the puppet socket, delivery
   queues, query and listener routes) checks it again, together with the
-  puppet's generation and its confirmed TeamSpeak channel, so a move never
+  generation and confirmed TeamSpeak channel of the puppet or connection
+  that route uses, so a move never
   changes where a queued packet may go. All writes to TeamSpeak go through
   these checks. Plaintext audio or text queued across a move is dropped,
   never re-sent into the new channel.
@@ -729,7 +731,8 @@ Safari; real Safari was not run. Times are median / p95 / p99.
   sent nothing. From receiving a frame to handing it on decrypted, p99:
   Chrome 0.10 ms (also in a hidden tab), Firefox 0.56 ms (0.82 ms with the
   window covered); WebKit gives no receive time, and its decryption itself
-  took 0.10 ms. During parallel builds Firefox reached 62 ms p99 with a
+  took 0.10 ms. The Firefox and WebKit figures come from a rerun on an idle
+  machine. During parallel builds Firefox reached 62 ms p99 with a
   covered window, so behaviour under CPU load belongs to the latency work.
   Not measured: the queues before the sender transform and after the
   receiver's, which browsers do not expose, and hidden Firefox and WebKit
@@ -749,8 +752,9 @@ Safari; real Safari was not run. Times are median / p95 / p99.
 - **S5: passed in simulation.** Real OpenMLS groups and `sframe` keys, with
   a modelled network and SFU, ran every scenario of the S5 row 40 times on
   three network profiles: 4,955,406 encryptions without a repeated key and
-  counter, no frame decrypted by a removed participant after its sender
-  processed the removal (166 million attempts), no plaintext, and audio
+  counter, no frame encrypted after its sender processed a removal
+  decrypted by the removed participant (166 million attempts), no
+  plaintext, and audio
   back after every transition whose commits arrived. After a join, everyone
   heard everyone in the new epoch within 22 ms on a LAN, and 193 / 278 /
   295 ms at 50 ms round trip with 1% loss (the simulation counts no CPU
