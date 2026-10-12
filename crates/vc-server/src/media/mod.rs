@@ -51,6 +51,11 @@ impl Routing {
         self.members.get(&from).is_some_and(|m| !m.muted && !m.deafened)
     }
 
+    /// Whether `to` should hear a whisper from `from`, wherever both are.
+    pub fn can_whisper(&self, from: SessionId, to: SessionId) -> bool {
+        from != to && self.can_speak(from) && self.members.get(&to).is_some_and(|m| !m.deafened)
+    }
+
     /// Everyone who should hear `from`: same channel, not deafened, not the speaker.
     pub fn recipients(&self, from: SessionId) -> impl Iterator<Item = SessionId> + '_ {
         let channel = self.members.get(&from).filter(|m| !m.muted && !m.deafened).map(|m| m.channel);
@@ -124,6 +129,15 @@ impl MediaPlane {
         self.sinks.fan_out(&self.routing.load(), &packet);
         let _ = self.webrtc.try_send(webrtc::MediaCmd::Forward(packet));
     }
+
+    /// Routes a frame meant for `to` alone (a TeamSpeak whisper).
+    pub fn deliver(&self, to: SessionId, packet: AudioPacket) {
+        if !self.routing.load().can_whisper(packet.from, to) {
+            return;
+        }
+        self.sinks.send(to, &packet);
+        let _ = self.webrtc.try_send(webrtc::MediaCmd::ForwardTo(to, packet));
+    }
 }
 
 #[cfg(test)]
@@ -144,5 +158,20 @@ mod tests {
         routing.members.insert(1, m(10, true, false));
         assert_eq!(routing.recipients(1).count(), 0);
         assert!(!routing.can_speak(1));
+    }
+
+    #[test]
+    fn whispers_cross_channels_but_not_deafness() {
+        let mut routing = Routing::default();
+        let m = |channel, muted, deafened| Member { channel, muted, deafened };
+        routing.members.insert(1, m(10, false, false));
+        routing.members.insert(2, m(11, false, false));
+        routing.members.insert(3, m(11, false, true));
+        assert!(routing.can_whisper(1, 2));
+        assert!(!routing.can_whisper(1, 3));
+        assert!(!routing.can_whisper(1, 1));
+        assert!(!routing.can_whisper(1, 9));
+        routing.members.insert(1, m(10, true, false));
+        assert!(!routing.can_whisper(1, 2));
     }
 }

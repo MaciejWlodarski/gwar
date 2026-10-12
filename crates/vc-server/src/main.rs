@@ -104,6 +104,11 @@ struct Cli {
     /// MiB all uploads together may take on disk (0 = no limit).
     #[arg(long, env = "VC_STORAGE_LIMIT_MB", default_value_t = 10240)]
     storage_limit_mb: u64,
+    /// TCP address of TeamSpeak file transfer (icons, avatars, channel files).
+    /// TeamSpeak tells clients a specific address as is, so bind one only if
+    /// clients can reach it; the default lets them use the server's address.
+    #[arg(long, env = "VC_TEAMSPEAK_FILETRANSFER", default_value = "0.0.0.0:30033")]
+    teamspeak_filetransfer: SocketAddr,
     /// Loopback port of the TeamSpeak server's ServerQuery.
     #[arg(long, env = "VC_TEAMSPEAK_QUERY_PORT", default_value_t = 10011)]
     teamspeak_query_port: u16,
@@ -315,7 +320,7 @@ async fn main() -> Result<()> {
             dir: cli.data_dir.join("teamspeak"),
             voice: cli.teamspeak_voice,
             query_port: cli.teamspeak_query_port,
-            filetransfer: ([127, 0, 0, 1], 30033).into(),
+            filetransfer: cli.teamspeak_filetransfer,
             public_url: public_url.clone(),
         }),
         public_url: public_url.clone(),

@@ -6,7 +6,8 @@
 //! frames go straight from the SFU into their puppet's connection, and what a
 //! puppet hears from TeamSpeak users is published to the media plane as the
 //! speaker's remote session the moment it arrives. Every puppet in a channel
-//! hears the same speakers; the first copy of each frame wins.
+//! hears the same speakers; the first copy of each frame wins. A whisper
+//! reaches only the puppets it targets and goes to their users alone.
 
 use std::{
     collections::HashMap,
@@ -96,6 +97,19 @@ impl Shared {
             entry.talking = true;
             self.core.talking(session, true);
         }
+    }
+
+    /// Delivers a whisper from TeamSpeak client `from` to the user behind the
+    /// puppet that received it. Each targeted puppet gets its own copy.
+    fn whispered(&self, from: u16, to: SessionId, opus: &[u8]) {
+        let Some(session) = self.mirrors.read().expect("mirrors lock").get(&from).copied() else { return };
+        let packet = if opus.is_empty() {
+            AudioPacket::end_of_speech(session)
+        } else {
+            let Some(samples) = opus::packet_samples(opus) else { return };
+            AudioPacket { from: session, opus: Arc::from(opus), samples }
+        };
+        self.plane.deliver(to, packet);
     }
 
     /// Ends talk spurts whose end-of-speech packet was lost.
@@ -294,13 +308,13 @@ async fn run(
             Step::Item(None) => return Err(anyhow!("connection closed")),
             Step::Item(Some(Err(e))) => return Err(anyhow!("{e}")),
             Step::Item(Some(Ok(item))) => match item {
-                StreamItem::Audio(packet) => {
-                    if let AudioData::S2C { from, codec, data, .. } = packet.data().data()
-                        && matches!(codec, CodecType::OpusVoice | CodecType::OpusMusic)
-                    {
-                        shared.heard(*from, data);
+                StreamItem::Audio(packet) => match packet.data().data() {
+                    AudioData::S2C { from, codec, data, .. } if is_opus(*codec) => shared.heard(*from, data),
+                    AudioData::S2CWhisper { from, codec, data, .. } if is_opus(*codec) => {
+                        shared.whispered(*from, spec.session, data)
                     }
-                }
+                    _ => {}
+                },
                 StreamItem::BookEvents(book) => {
                     for event in book {
                         if let BookEvent::Message { target, invoker, message } = event {
@@ -360,6 +374,10 @@ async fn run(
             }
         }
     }
+}
+
+fn is_opus(codec: CodecType) -> bool {
+    matches!(codec, CodecType::OpusVoice | CodecType::OpusMusic)
 }
 
 enum Pending {

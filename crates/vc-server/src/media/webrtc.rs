@@ -40,6 +40,8 @@ pub enum MediaCmd {
     },
     /// A frame from another transport, to be written to local WebRTC listeners.
     Forward(AudioPacket),
+    /// Like `Forward`, for one listener only.
+    ForwardTo(SessionId, AudioPacket),
 }
 
 /// A speaker stays "talking" this long after its last voiced frame.
@@ -222,6 +224,11 @@ pub async fn run(
                 Some(MediaCmd::Remove { session }) => close_peer(&mut peers, session, &core, None),
                 Some(MediaCmd::Forward(packet)) => {
                     deliver_local(&mut peers, &routing.load(), &packet, Instant::now());
+                }
+                Some(MediaCmd::ForwardTo(to, packet)) => {
+                    if let Some(peer) = peers.get_mut(&to) {
+                        peer.forward(&packet, Instant::now());
+                    }
                 }
                 None => break,
             },

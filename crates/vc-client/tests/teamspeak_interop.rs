@@ -72,21 +72,7 @@ async fn teamspeak_and_webrtc_clients_hear_each_other() {
     drop(support::ts_client(bridged.ts_voice, "probe").await);
 
     // Native WebRTC participant: speaks a tone and records what it hears.
-    let url = format!("ws://{}/ws", bridged.server.http);
-    let native = connect(ConnectOptions {
-        url,
-        nickname: "native".into(),
-        invite: None,
-        certificate: None,
-        expected_server_key: None,
-        trust_on_first_use: true,
-        insecure_lan: false,
-        server_password: None,
-        identity: Identity::generate(),
-        software: ClientSoftware { name: "test".into(), version: "0".into(), platform: Platform::Desktop },
-    })
-    .await
-    .unwrap();
+    let native = native(&bridged, "native").await;
     // Plain TeamSpeak participant.
     let mut ts = Connection::build(bridged.ts_voice.to_string())
         .name("ts-user".to_string())
@@ -148,4 +134,96 @@ async fn teamspeak_and_webrtc_clients_hear_each_other() {
     let level = rms(&samples[samples.len().saturating_sub(48_000)..]);
     assert!(level > 0.05, "native client heard rms {level} from the TS speaker");
     assert!(native_frames_at_ts > 20, "TS client received only {native_frames_at_ts} frames from the native speaker");
+}
+
+async fn native(bridged: &support::Bridged, nickname: &str) -> vc_client::Connected {
+    connect(ConnectOptions {
+        url: format!("ws://{}/ws", bridged.server.http),
+        nickname: nickname.into(),
+        invite: None,
+        certificate: None,
+        expected_server_key: None,
+        trust_on_first_use: true,
+        insecure_lan: false,
+        server_password: None,
+        identity: Identity::generate(),
+        software: ClientSoftware { name: "test".into(), version: "0".into(), platform: Platform::Desktop },
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn teamspeak_whisper_reaches_only_its_target() {
+    let Some(bridged) = support::start().await else { return };
+    drop(support::ts_client(bridged.ts_voice, "probe").await);
+
+    // Two silent native listeners in the default channel; each gets a puppet
+    // once the TeamSpeak user joins them.
+    let mut listeners = Vec::new();
+    for nickname in ["target", "bystander"] {
+        let client = native(&bridged, nickname).await;
+        client.connection.join(client.welcome.server.default_channel, None).await.unwrap();
+        let heard = Arc::new(Mutex::new(Vec::new()));
+        let voice =
+            voice::start(&client.connection, Box::new(FakeIo { heard: heard.clone(), tone: false }), bridged.media)
+                .await
+                .unwrap();
+        listeners.push((client, voice, heard));
+    }
+    let mut ts = Connection::build(bridged.ts_voice.to_string())
+        .name("whisperer".to_string())
+        .identity(TsIdentity::create())
+        .connect()
+        .unwrap();
+    let puppet = |ts: &Connection, name: &str| {
+        let state = ts.get_state().ok()?;
+        state.clients.values().find(|c| c.name == name).map(|c| c.id.0)
+    };
+    let target = timeout(Duration::from_secs(20), async {
+        loop {
+            if let Some(clid) = puppet(&ts, "target")
+                && puppet(&ts, "bystander").is_some()
+            {
+                return clid;
+            }
+            let _ = timeout(Duration::from_millis(100), ts.events().next()).await;
+        }
+    })
+    .await
+    .expect("both puppets on TeamSpeak");
+
+    let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
+    let mut frame = [0f32; 960];
+    let mut packet = [0u8; 1275];
+    let mut t = 0u64;
+    let end = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < end {
+        for s in frame.iter_mut() {
+            *s = tone(t);
+            t += 1;
+        }
+        let n = encoder.encode_float(&frame, &mut packet).unwrap();
+        let whisper = AudioData::C2SWhisper {
+            id: 0,
+            codec: CodecType::OpusVoice,
+            channels: Vec::new(),
+            clients: vec![target],
+            data: &packet[..n],
+        };
+        ts.send_audio(OutAudio::new(&whisper)).unwrap();
+        let _ = timeout(Duration::from_millis(20), async {
+            let mut events = ts.events();
+            while events.next().await.is_some() {}
+        })
+        .await;
+    }
+
+    let level = |heard: &Arc<Mutex<Vec<f32>>>| {
+        let samples = heard.lock().unwrap().clone();
+        rms(&samples[samples.len().saturating_sub(96_000)..])
+    };
+    let (target_level, bystander_level) = (level(&listeners[0].2), level(&listeners[1].2));
+    assert!(target_level > 0.05, "the whisper target heard rms {target_level}");
+    assert!(bystander_level < 0.005, "the bystander overheard the whisper at rms {bystander_level}");
 }

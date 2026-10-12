@@ -5,7 +5,8 @@
 #   voice     : UDP 9988 (WebRTC) on the VM's private address; the cloud NAT
 #               maps the public IP to it, so browsers get PUBLIC_IP:9988
 #   TeamSpeak : UDP 9987, the bridged official TeamSpeak server (VC_TEAMSPEAK=0 disables it;
-#               enabling it accepts the TeamSpeak server license)
+#               enabling it accepts the TeamSpeak server license), and its file
+#               transfer on TCP 30033 (all addresses, so clients use the public IP)
 #   Connect   : 127.0.0.1:8900, Gwar Connect (VC_CONNECT=0 skips it); nginx publishes it
 #               under /connect/ (see docs/deploy.md)
 #   Backups   : daily copies of both databases in ~/gwar-backups, kept 14 days

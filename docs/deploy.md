@@ -13,7 +13,7 @@ How the official services run. A self-hosted server needs none of this:
 
 | Unit | Listens on | Data |
 | --- | --- | --- |
-| `vc-server.service` | HTTP `127.0.0.1:8800`, WebRTC UDP 9988, TeamSpeak UDP 9987 | `~/vc/data` |
+| `vc-server.service` | HTTP `127.0.0.1:8800`, WebRTC UDP 9988, TeamSpeak UDP 9987 and TCP 30033 | `~/vc/data` |
 | `gwar-connect.service` | HTTP `127.0.0.1:8900` | `~/gwar-connect/data` |
 | `gwar-backup.timer` | daily at 04:20 | copies in `~/gwar-backups`, kept 14 days |
 
