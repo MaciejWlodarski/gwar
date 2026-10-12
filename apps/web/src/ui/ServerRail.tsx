@@ -3,14 +3,14 @@ import { Plus, Settings } from "lucide-react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { controller } from "../state/controller";
-import { useSettings, type Bookmark } from "../state/settings";
+import { useBookmarks, useSettings, type Bookmark } from "../state/settings";
 import { useSession, useUi } from "../state/stores";
 import { TeamSpeakBadge } from "./badges";
 import { Avatar, IconButton, Tooltip, menuContent, menuItem, menuItemDanger } from "./kit";
 
 export function ServerRail() {
   const t = useT();
-  const bookmarks = useSettings((s) => s.bookmarks);
+  const bookmarks = useBookmarks();
   const phase = useSession((s) => s.phase);
   const address = useSession((s) => s.address);
   const kind = useSession((s) => s.kind);

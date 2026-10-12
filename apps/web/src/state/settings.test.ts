@@ -57,7 +57,7 @@ it("times only synced changes, remembers removals and forgets them when the serv
     vi.setSystemTime(3_000);
     s().removeBookmark("a");
     expect(s().bookmarks).toEqual([]);
-    expect(s().removedBookmarks).toEqual({ a: 3_000 });
+    expect(s().removedBookmarks).toEqual({ a: { at: 3_000 } });
 
     s().replaceBookmarks([{ id: "b", name: "B", address: "b.example.com", kind: "vc", updatedAt: 5 }]);
     expect(s().bookmarkEdits).toBe(3);
@@ -70,16 +70,26 @@ it("times only synced changes, remembers removals and forgets them when the serv
     s().saveBookmark({ id: "c", name: "C2", address: "c.example.com", kind: "vc" });
     expect(s().bookmarks[0]).toMatchObject({ name: "C2", updatedAt: 9_001, account: "acct" });
     s().removeBookmark("c");
-    expect(s().removedBookmarks).toEqual({ c: 9_002 });
+    expect(s().removedBookmarks).toEqual({ c: { at: 9_002, account: "acct" } });
 
+    // Signed in: new bookmarks and removals belong to the account at once, before any sync.
+    s().setBookmarkAccount("acct");
+    s().saveBookmark({ id: "n", name: "N", address: "n.example.com" });
+    expect(s().bookmarks.at(-1)?.account).toBe("acct");
     s().replaceBookmarks([
       { id: "d", name: "D", address: "d.example.com", account: "acct" },
+      { id: "big", name: "Big", address: "big.example.com", password: "p".repeat(200), account: "acct" },
       { id: "e", name: "E", address: "e.example.com", account: "other" },
       { id: "f", name: "F", address: "f.example.com" },
     ]);
+    s().removeBookmark("f");
+    expect(s().removedBookmarks.f).toMatchObject({ account: "acct" });
+    s().removeBookmark("e");
+    expect(s().removedBookmarks.e).toMatchObject({ account: "other" });
+    // Signing out after a full sync: what reached the vault goes; what cannot sync and the other account's stay.
     s().dropAccountBookmarks("acct");
-    expect(s().bookmarks.map((b) => b.id)).toEqual(["e", "f"]);
-    expect(s().removedBookmarks).toEqual({});
+    expect(s().bookmarks.map((b) => b.id)).toEqual(["big"]);
+    expect(Object.keys(s().removedBookmarks)).toEqual(["e"]);
   } finally {
     vi.useRealTimers();
   }

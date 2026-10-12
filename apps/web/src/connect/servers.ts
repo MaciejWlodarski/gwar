@@ -12,7 +12,7 @@
  * are never merged into this one's vault.
  */
 import type { ConnectRecord } from "../net/identity";
-import { BOOKMARK_TOMBSTONE_MS, type Bookmark, type ServerKind } from "../state/settings";
+import { BOOKMARK_LIMITS, BOOKMARK_TOMBSTONE_MS, inAccount, syncable, type Bookmark, type BookmarkRemoval, type ServerKind } from "../state/settings";
 import type { ConnectApi } from "./api";
 import { updateVault, type VaultContents } from "./vault";
 
@@ -21,7 +21,7 @@ export const TOMBSTONE_MS = BOOKMARK_TOMBSTONE_MS;
 /** Most entries (tombstones included) kept in the vault; the vault itself holds at most 64 KiB. */
 export const MAX_SERVERS = 100;
 
-const LIMITS = { id: 64, name: 64, address: 255, password: 128, identity: 64 } as const;
+const LIMITS = BOOKMARK_LIMITS;
 
 export interface VaultServer {
   id: string;
@@ -37,32 +37,23 @@ export interface VaultServer {
   [unknown: string]: unknown;
 }
 
-/** What this device knows: its bookmarks (with `updatedAt`) and the ids it removed, with when. */
+/** What this device knows: its bookmarks (with `updatedAt`) and the ids it removed. */
 export interface LocalServers {
   bookmarks: Bookmark[];
-  removed: Record<string, number>;
+  removed: Record<string, BookmarkRemoval>;
 }
 
-/** The bookmarks this account may sync: its own and those saved without an account. */
-export function forAccount(bookmarks: Bookmark[], account: string): Bookmark[] {
-  return bookmarks.filter((b) => b.account === undefined || b.account === account);
+/** The part of this device's list that `account` may sync: its own, and what was saved without an account. */
+export function forAccount(local: LocalServers, account: string): LocalServers {
+  return {
+    bookmarks: local.bookmarks.filter((b) => inAccount(b, account)),
+    removed: Object.fromEntries(Object.entries(local.removed).filter(([, r]) => inAccount(r, account))),
+  };
 }
 
 const text = (v: unknown, max: number): string | undefined => (typeof v === "string" && v.length <= max ? v : undefined);
 
 const tombstone = (id: string, at: number): VaultServer => ({ id, name: "", address: "", kind: "vc", updated_at: at, deleted: true });
-
-/** Whether a bookmark fits the vault's limits; one that does not stays on this device only. */
-export function syncable(b: Bookmark): boolean {
-  return (
-    b.id.length > 0 &&
-    b.id.length <= LIMITS.id &&
-    b.address.trim().length > 0 &&
-    b.address.trim().length <= LIMITS.address &&
-    (b.password ?? "").length <= LIMITS.password &&
-    (b.identity ?? "").length <= LIMITS.identity
-  );
-}
 
 /** The usable entries of the vault, in order; malformed and repeated ids are skipped. */
 export function vaultServers(contents: VaultContents): VaultServer[] {
@@ -117,7 +108,7 @@ export function fromBookmark(b: Bookmark): VaultServer {
 export function mergeServers(vault: VaultServer[], local: LocalServers, now: number = Date.now()): VaultServer[] {
   const mine = new Map<string, VaultServer>();
   for (const b of local.bookmarks) if (syncable(b)) mine.set(b.id, fromBookmark(b));
-  for (const [id, at] of Object.entries(local.removed)) {
+  for (const [id, { at }] of Object.entries(local.removed)) {
     const kept = mine.get(id);
     if (id.length <= LIMITS.id && Number.isSafeInteger(at) && (!kept || kept.updated_at < at)) mine.set(id, tombstone(id, at));
   }
@@ -148,12 +139,12 @@ export function withServers(contents: VaultContents, entries: VaultServer[]): Va
 }
 
 /**
- * The account's bookmarks for the merged list, then this device's bookmarks that cannot be synced;
- * other accounts' bookmarks are left out. A bookmark that cannot be synced keeps its place over the
- * vault's older version. Local-only settings (the LAN opt-in) stay with a server whose address did not change.
+ * The account's bookmarks for the merged list, then this device's bookmarks that cannot be synced, then
+ * other accounts' bookmarks (hidden, see `useBookmarks`). A bookmark that cannot be synced keeps its place
+ * over the vault's older version. Local-only settings (the LAN opt-in) stay with a server whose address did not change.
  */
 export function toBookmarks(entries: VaultServer[], previous: Bookmark[], account: string): Bookmark[] {
-  const mine = forAccount(previous, account);
+  const mine = previous.filter((b) => inAccount(b, account));
   const before = new Map(mine.map((b) => [b.id, b]));
   const localOnly = new Map(mine.filter((b) => !syncable(b)).map((b) => [b.id, b]));
   const synced = entries
@@ -171,7 +162,7 @@ export function toBookmarks(entries: VaultServer[], previous: Bookmark[], accoun
       if (old?.insecureLan && e.kind === "vc" && old.address.trim() === e.address) b.insecureLan = true;
       return b;
     });
-  return [...synced, ...localOnly.values()];
+  return [...synced, ...localOnly.values(), ...previous.filter((b) => !inAccount(b, account))];
 }
 
 /**
@@ -179,7 +170,7 @@ export function toBookmarks(entries: VaultServer[], previous: Bookmark[], accoun
  * Writes only when something changed, and a concurrent write by another device is merged again (see `updateVault`).
  */
 export async function syncServers(api: ConnectApi, record: ConnectRecord, local: LocalServers, now: number = Date.now()): Promise<VaultServer[]> {
-  const own = { ...local, bookmarks: forAccount(local.bookmarks, record.accountKey) };
+  const own = forAccount(local, record.accountKey);
   let merged: VaultServer[] = [];
   await updateVault(api, record, (contents) => {
     const vault = vaultServers(contents);

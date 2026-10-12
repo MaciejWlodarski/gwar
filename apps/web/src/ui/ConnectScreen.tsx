@@ -5,7 +5,7 @@ import { pageContextFromLocation, sameOriginUrl } from "../net/address";
 import { parseInviteLink } from "../net/invite";
 import { controller, describeBan } from "../state/controller";
 import { isDesktop } from "../platform";
-import { useSettings, type ServerKind } from "../state/settings";
+import { useBookmarks, useSettings, type ServerKind } from "../state/settings";
 import { useAccount } from "../state/account";
 import { useConnectUi, useSession, useUi } from "../state/stores";
 import { Avatar, Button, Field, IconButton, Input, Segmented, Switch } from "./kit";
@@ -38,7 +38,7 @@ export function ConnectScreen() {
   const lastAddress = useSettings((s) => s.lastAddress);
   const lastKind = useSettings((s) => s.lastKind);
   const desktop = isDesktop();
-  const bookmarks = useSettings((s) => s.bookmarks);
+  const bookmarks = useBookmarks();
   const { busy, error, needPassword, serverName, invite } = useConnectUi();
   const closeReason = useSession((s) => s.closeReason);
   const setDrawer = useUi((s) => s.setDrawer);

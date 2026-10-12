@@ -118,10 +118,13 @@ the same list:
   syncing count as time 0. At most 100 entries; tombstones go first.
 - The desktop app's plaintext LAN opt-in is a choice about one device's
   network and is never synced.
-- A device remembers which account each bookmark syncs with. Bookmarks saved
-  without an account join the first account that syncs on that device; another
-  account's bookmarks are never merged in. Signing out syncs once more, then
-  removes the account's servers from the device; signing in brings them back.
+- A device remembers which account each bookmark and removal belongs to: the
+  signed-in one, from the moment it is made. Bookmarks saved while signed out
+  join the first account that syncs on that device; another account's are never
+  merged in. Signing out syncs until the vault has every change, then removes
+  the account's servers from the device (signing in brings them back). If that
+  sync fails, they stay on the device, hidden, and sync when the account signs
+  in there again.
 - A local edit or removal is timed after the version it replaces, so it wins
   even when this device's clock is behind the one that wrote that version.
 - Clients merge their list in after signing in or unlocking, at startup, when

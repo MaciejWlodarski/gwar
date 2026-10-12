@@ -57,7 +57,7 @@ describe("mergeServers", () => {
   it("removals win only when newer, and bookmarks from before syncing lose to the vault", () => {
     const merged = mergeServers(
       [entry("old", 5), entry("fresh", 20), entry("legacy", 1, { name: "vault legacy" }), { ...entry("deleted", 30), deleted: true }],
-      { bookmarks: [bookmark("legacy", undefined, { name: "local legacy" }), bookmark("deleted", 10)], removed: { old: T(10), fresh: T(10) } },
+      { bookmarks: [bookmark("legacy", undefined, { name: "local legacy" }), bookmark("deleted", 10)], removed: { old: { at: T(10) }, fresh: { at: T(10) } } },
       NOW,
     );
     expect(merged.map((e) => [e.id, !!e.deleted, e.name])).toEqual([
@@ -109,10 +109,14 @@ describe("toBookmarks", () => {
     ]);
   });
 
-  it("leaves out another account's bookmarks", () => {
-    const previous = [bookmark("theirs", 1, { account: "someone else" }), bookmark("huge", 1, { password: "p".repeat(200), account: "someone else" }), bookmark("unowned", 1)];
-    expect(forAccount(previous, ACCT).map((b) => b.id)).toEqual(["unowned"]);
-    expect(toBookmarks([entry("unowned", 1)], previous, ACCT).map((b) => [b.id, b.account])).toEqual([["unowned", ACCT]]);
+  it("syncs only the account's own and unowned bookmarks and removals, and keeps other accounts' for later", () => {
+    const theirs = bookmark("theirs", 1, { account: "someone else" });
+    const previous = [theirs, bookmark("unowned", 1)];
+    const local = { bookmarks: previous, removed: { gone: { at: T(1), account: "someone else" }, mine: { at: T(1), account: ACCT }, any: { at: T(1) } } };
+    const own = forAccount(local, ACCT);
+    expect(own.bookmarks.map((b) => b.id)).toEqual(["unowned"]);
+    expect(Object.keys(own.removed)).toEqual(["mine", "any"]);
+    expect(toBookmarks([entry("unowned", 1)], previous, ACCT).map((b) => [b.id, b.account])).toEqual([["unowned", ACCT], ["theirs", "someone else"]]);
   });
 });
 
@@ -134,7 +138,7 @@ describe("syncServers", () => {
     ]);
 
     // The laptop removes the TeamSpeak server; the phone, which still has it, does not bring it back.
-    await syncServers(api, laptop, { bookmarks: toBookmarks(onPhone, [], phone.accountKey).filter((b) => b.id !== "ts"), removed: { ts: T(30) } }, NOW);
+    await syncServers(api, laptop, { bookmarks: toBookmarks(onPhone, [], phone.accountKey).filter((b) => b.id !== "ts"), removed: { ts: { at: T(30), account: laptop.accountKey } } }, NOW);
     const again = await syncServers(api, phone, { bookmarks: toBookmarks(onPhone, [], phone.accountKey), removed: {} }, NOW);
     expect(toBookmarks(again, [], phone.accountKey).map((b) => b.id)).toEqual(["gwar"]);
 
@@ -154,7 +158,8 @@ describe("syncServers", () => {
     const s = setup();
     const { record } = await createAccount({ handle: "servers.none", password: "right password" }, s.deps());
     expect(await syncServers(s.deps().api, record, { bookmarks: [], removed: {} }, NOW)).toEqual([]);
-    expect(await syncServers(s.deps().api, record, { bookmarks: [bookmark("theirs", 1, { account: "someone else", password: "theirs" })], removed: {} }, NOW)).toEqual([]);
+    const theirs = { bookmarks: [bookmark("theirs", 1, { account: "someone else", password: "theirs" })], removed: { old: { at: T(1), account: "someone else" } } };
+    expect(await syncServers(s.deps().api, record, theirs, NOW)).toEqual([]);
     expect(await serverVault(s.service, record)).toBeNull();
   }, 30_000);
 });

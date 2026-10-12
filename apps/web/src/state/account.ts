@@ -14,6 +14,7 @@ import { changeIdentities, refreshFromVault, syncAfterUnlock, tsBridge } from ".
 import { addEntry, cleanName, DEFAULT_NAME, type TsEntry, type TsList } from "../connect/ts-list";
 import { loadVault, VaultLockedError, vaultList } from "../connect/vault";
 import { syncServers, toBookmarks } from "../connect/servers";
+import { syncQueue } from "./sync-queue";
 import {
   identityFromConnect,
   indexedDbConnectStore,
@@ -93,38 +94,36 @@ function syncTeamspeak(record: ConnectRecord): void {
     .finally(bumpTs);
 }
 
-let serverSync: Promise<void> = Promise.resolve();
-let serverSyncQueued = false;
 let serverSyncedAt = 0;
+/** `bookmarkEdits` as of the last sync that reached the vault and was applied here, and for which account. */
+let serverSynced: { edits: number; account: string } | null = null;
 
 /**
- * Lines the saved servers up with the vault (see `connect/servers.ts`). Runs one at a time, in the
- * background, and only logs failures; local bookmarks keep working without it.
+ * Lines the saved servers up with the vault (see `connect/servers.ts`), in the background; failures are
+ * only logged, and local bookmarks keep working without it.
  */
+const bookmarkSync = syncQueue(async () => {
+  const record = await loadConnectRecord();
+  if (!record?.vaultKey) return;
+  const before = useSettings.getState();
+  const merged = await syncServers(connectApi, record, { bookmarks: before.bookmarks, removed: before.removedBookmarks });
+  serverSyncedAt = Date.now();
+  if ((await loadConnectRecord())?.accountKey !== record.accountKey) return;
+  const after = useSettings.getState();
+  // Edited meanwhile: that edit syncs next, and the list stays as the person left it until then.
+  if (after.bookmarkEdits !== before.bookmarkEdits) return syncBookmarks();
+  after.replaceBookmarks(toBookmarks(merged, after.bookmarks, record.accountKey));
+  serverSynced = { edits: before.bookmarkEdits, account: record.accountKey };
+}, "saved servers sync");
+
 function syncBookmarks(): void {
-  if (serverSyncQueued) return;
-  serverSyncQueued = true;
-  serverSync = serverSync
-    .then(async () => {
-      serverSyncQueued = false;
-      const record = await loadConnectRecord();
-      if (!record?.vaultKey) return;
-      const before = useSettings.getState();
-      const merged = await syncServers(connectApi, record, { bookmarks: before.bookmarks, removed: before.removedBookmarks });
-      serverSyncedAt = Date.now();
-      if ((await loadConnectRecord())?.accountKey !== record.accountKey) return;
-      const after = useSettings.getState();
-      // Edited meanwhile: that edit syncs next, and the list stays as the person left it until then.
-      if (after.bookmarkEdits !== before.bookmarkEdits) return syncBookmarks();
-      after.replaceBookmarks(toBookmarks(merged, after.bookmarks, record.accountKey));
-    })
-    .catch((e: unknown) => console.warn("saved servers sync skipped", e));
+  bookmarkSync.sync();
 }
 
-/** Waits for a sync that includes every edit made so far. */
-async function flushBookmarks(): Promise<void> {
-  syncBookmarks();
-  await serverSync;
+/** Syncs until the vault has every edit made so far, including edits made while it waits. */
+function flushBookmarks(account: string): Promise<boolean> {
+  serverSynced = null;
+  return bookmarkSync.flush(() => serverSynced?.account === account && serverSynced.edits === useSettings.getState().bookmarkEdits);
 }
 
 // Every saved, edited or removed server goes to the vault; other devices pick it up when they start or come back.
@@ -158,6 +157,7 @@ async function activate(record: ConnectRecord): Promise<void> {
   await indexedDbConnectStore.save(record);
   await controller.switchIdentity(await identityFromConnect(record));
   useAccount.setState({ account: summarize(record), pending: null, loaded: true, certChecked: true });
+  useSettings.getState().setBookmarkAccount(record.accountKey);
   syncTeamspeak(record);
   syncBookmarks();
 }
@@ -242,6 +242,7 @@ export const accountActions = {
     await controller.getIdentity().catch((e: unknown) => console.warn("identity load skipped", e));
     const record = await loadConnectRecord();
     useAccount.setState({ account: record ? summarize(record) : null, loaded: true, certChecked: !record?.token });
+    useSettings.getState().setBookmarkAccount(record?.accountKey ?? null);
     if (record?.vaultKey) {
       refreshProfile(connectApi, record)
         .then(async (nickname) => {
@@ -374,10 +375,12 @@ export const accountActions = {
   /** Back to an unrelated local identity, or a fresh one after root migration. */
   async signOut(): Promise<void> {
     const record = await loadConnectRecord();
-    if (record?.vaultKey) await flushBookmarks();
+    const synced = !!record?.vaultKey && (await flushBookmarks(record.accountKey));
     if (record) await flows.signOut(record, deps());
-    // The account's saved servers stay in its vault and come back on signing in again.
-    if (record) useSettings.getState().dropAccountBookmarks(record.accountKey);
+    useSettings.getState().setBookmarkAccount(null);
+    // Synced: the account's servers leave this device and come back on signing in. Otherwise they stay, hidden,
+    // and sync when the account signs in here again.
+    if (record && synced) useSettings.getState().dropAccountBookmarks(record.accountKey);
     // TeamSpeak goes back to this device's own identities.
     await tsBridge()?.setList("account", null).catch((e: unknown) => console.warn("could not drop the account's TeamSpeak identities", e));
     bumpTs();

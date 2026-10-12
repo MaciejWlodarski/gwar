@@ -1,4 +1,5 @@
 import { validNickname } from "../net/nickname";
+import { useMemo } from "react";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import type { InputMode } from "../voice/engine";
@@ -32,6 +33,39 @@ export interface Bookmark {
 /** How long a removed bookmark is remembered, so syncing does not bring it back from another device. */
 export const BOOKMARK_TOMBSTONE_MS = 90 * 86_400_000;
 
+/** Longest synced fields, in characters (the vault holds at most 64 KiB). */
+export const BOOKMARK_LIMITS = { id: 64, name: 64, address: 255, password: 128, identity: 64 } as const;
+
+/** A removal this device still has to sync: when, and in which account's list. */
+export interface BookmarkRemoval {
+  at: number;
+  account?: string;
+}
+
+/** Whether a bookmark fits the vault's limits; one that does not stays on this device only. */
+export function syncable(b: Bookmark): boolean {
+  return (
+    b.id.length > 0 &&
+    b.id.length <= BOOKMARK_LIMITS.id &&
+    b.address.trim().length > 0 &&
+    b.address.trim().length <= BOOKMARK_LIMITS.address &&
+    (b.password ?? "").length <= BOOKMARK_LIMITS.password &&
+    (b.identity ?? "").length <= BOOKMARK_LIMITS.identity
+  );
+}
+
+/** Whether a bookmark or removal belongs to `account`'s list: its own, or made without an account. */
+export function inAccount(item: { account?: string }, account: string | null): boolean {
+  return item.account === undefined || item.account === account;
+}
+
+/** The saved servers shown now: another account's (kept until they reach its vault) stay hidden. */
+export function useBookmarks(): Bookmark[] {
+  const bookmarks = useSettings((s) => s.bookmarks);
+  const account = useSettings((s) => s.bookmarkAccount);
+  return useMemo(() => bookmarks.filter((b) => inAccount(b, account)), [bookmarks, account]);
+}
+
 /** Whether two bookmarks differ in what Gwar Connect syncs. */
 function syncedChange(a: Bookmark, b: Bookmark): boolean {
   return a.name !== b.name || a.address !== b.address || (a.kind ?? "vc") !== (b.kind ?? "vc") || (a.password ?? "") !== (b.password ?? "") || (a.identity ?? "") !== (b.identity ?? "");
@@ -42,8 +76,14 @@ function nextChange(previous: number | undefined): number {
   return Math.max(Date.now(), (previous ?? 0) + 1);
 }
 
-function pruneRemoved(removed: Record<string, number>, now: number): Record<string, number> {
-  return Object.fromEntries(Object.entries(removed).filter(([, at]) => now - at < BOOKMARK_TOMBSTONE_MS));
+function removal(removed: Bookmark | undefined, account: string | null): BookmarkRemoval {
+  const at = nextChange(removed?.updatedAt);
+  const owner = removed?.account ?? account ?? undefined;
+  return owner === undefined ? { at } : { at, account: owner };
+}
+
+function pruneRemoved(removed: Record<string, BookmarkRemoval>, now: number): Record<string, BookmarkRemoval> {
+  return Object.fromEntries(Object.entries(removed).filter(([, r]) => now - r.at < BOOKMARK_TOMBSTONE_MS));
 }
 
 export interface AudioSettings {
@@ -87,8 +127,10 @@ export interface SettingsState {
   /** Per-user playback volume 0..2 keyed by uid. */
   userVolumes: Record<string, number>;
   bookmarks: Bookmark[];
-  /** Bookmarks removed on this device, by id, with when (Unix ms); see {@link BOOKMARK_TOMBSTONE_MS}. */
-  removedBookmarks: Record<string, number>;
+  /** Bookmarks removed on this device, by id; see {@link BOOKMARK_TOMBSTONE_MS}. */
+  removedBookmarks: Record<string, BookmarkRemoval>;
+  /** The signed-in Gwar Connect account (its account key): new bookmarks and removals belong to its list. */
+  bookmarkAccount: string | null;
   /** Counts changes made on this device (not those that came from syncing), so a sync can follow them. */
   bookmarkEdits: number;
   /** Migration source for identities saved before nicknames belonged to them. */
@@ -110,7 +152,11 @@ export interface SettingsState {
   removeBookmark(id: string): void;
   /** The list after a sync with Gwar Connect; not counted as an edit. */
   replaceBookmarks(bookmarks: Bookmark[]): void;
-  /** After signing out: the account's servers and every pending removal leave this device (they stay in its vault). */
+  setBookmarkAccount(account: string | null): void;
+  /**
+   * After signing out with everything synced: the account's servers leave this device (they stay in its vault),
+   * with the removals already synced. One that cannot sync stays, hidden, like everything when the last sync failed.
+   */
   dropAccountBookmarks(account: string): void;
   setLast(address: string, kind?: ServerKind): void;
   setTsDetectAsked(asked: boolean): void;
@@ -149,6 +195,7 @@ export const useSettings = create<SettingsState>()(
       userVolumes: {},
       bookmarks: [],
       removedBookmarks: {},
+      bookmarkAccount: null,
       bookmarkEdits: 0,
       lastNickname: "",
       lastAddress: "",
@@ -173,7 +220,8 @@ export const useSettings = create<SettingsState>()(
         set((s) => {
           const existing = s.bookmarks.find((b) => b.id === bookmark.id);
           const changed = !existing || syncedChange(existing, bookmark);
-          const saved: Bookmark = { ...bookmark, updatedAt: changed ? nextChange(existing?.updatedAt) : existing.updatedAt, account: existing?.account };
+          const account = existing?.account ?? s.bookmarkAccount ?? undefined;
+          const saved: Bookmark = { ...bookmark, updatedAt: changed ? nextChange(existing?.updatedAt) : existing.updatedAt, account };
           if (saved.updatedAt === undefined) delete saved.updatedAt;
           if (saved.account === undefined) delete saved.account;
           const { [bookmark.id]: _revived, ...removedBookmarks } = s.removedBookmarks;
@@ -188,12 +236,17 @@ export const useSettings = create<SettingsState>()(
           const now = Date.now();
           return {
             bookmarks: s.bookmarks.filter((b) => b.id !== id),
-            removedBookmarks: { ...pruneRemoved(s.removedBookmarks, now), [id]: nextChange(s.bookmarks.find((b) => b.id === id)?.updatedAt) },
+            removedBookmarks: { ...pruneRemoved(s.removedBookmarks, now), [id]: removal(s.bookmarks.find((b) => b.id === id), s.bookmarkAccount) },
             bookmarkEdits: s.bookmarkEdits + 1,
           };
         }),
       replaceBookmarks: (bookmarks) => set((s) => ({ bookmarks, removedBookmarks: pruneRemoved(s.removedBookmarks, Date.now()) })),
-      dropAccountBookmarks: (account) => set((s) => ({ bookmarks: s.bookmarks.filter((b) => b.account !== account), removedBookmarks: {} })),
+      setBookmarkAccount: (bookmarkAccount) => set({ bookmarkAccount }),
+      dropAccountBookmarks: (account) =>
+        set((s) => ({
+          bookmarks: s.bookmarks.filter((b) => b.account !== account || !syncable(b)),
+          removedBookmarks: Object.fromEntries(Object.entries(s.removedBookmarks).filter(([, r]) => !inAccount(r, account))),
+        })),
       setLast: (lastAddress, lastKind = "vc") => set({ lastAddress, lastKind }),
       setTsDetectAsked: (tsDetectAsked) => set({ tsDetectAsked }),
     }),
