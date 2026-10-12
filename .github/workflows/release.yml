@@ -199,18 +199,22 @@ jobs:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: built
-          merge-multiple: true
+          # Only the build artifacts (a re-run would also find release-assets),
+          # each in its own folder, so duplicates reach the check below.
+          pattern: "{desktop-*,server-*}"
       # The artifacts keep the bundle folders (nsis/, msi/, appimage/, deb/...):
       # collect every file into one flat folder, which is what gets checksummed,
       # attested, signed and uploaded, and check that nothing is missing.
       - name: Collect the files
         run: |
           mkdir dist
+          files=$(mktemp)
+          find built -type f -print0 > "$files"
           while IFS= read -r -d '' f; do
             name=$(basename "$f")
             if [ -e "dist/$name" ]; then echo "::error::Two files are named $name."; exit 1; fi
             cp "$f" "dist/$name"
-          done < <(find built -type f -print0)
+          done < "$files"
           ls -l dist
           missing=0
           for pattern in '*.dmg' '*-setup.exe' '*.msi' '*.AppImage' '*.deb' \
