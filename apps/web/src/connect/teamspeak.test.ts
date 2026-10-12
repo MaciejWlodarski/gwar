@@ -62,7 +62,7 @@ describe("syncAfterUnlock", () => {
     await writeServerVault(service, record, { other: "kept" });
     expect(await syncAfterUnlock(api, record, ts, 1234)).toBe("seeded");
     expect((await serverVault(service, record))?.contents).toEqual({ other: "kept", teamspeak: stored(ts.device, 1234) });
-    expect(ts.calls).toEqual(["list:device", "setList:account:own1,own2;own2"]);
+    expect(ts.calls).toEqual(["list:active", "setList:account:own1,own2;own2"]);
   }, 30_000);
 
   it("a device without identities makes one named Default first, then seeds with it", async () => {
@@ -73,7 +73,24 @@ describe("syncAfterUnlock", () => {
     expect(ts.device).toEqual(expected);
     expect(ts.account).toEqual(expected);
     expect(vaultList((await serverVault(service, record))!.contents as never)).toEqual(expected);
-    expect(ts.calls).toEqual(["list:device", "setList:device:made1;made1", "setList:account:made1;made1"]);
+    expect(ts.calls).toEqual(["list:active", "list:device", "setList:device:made1;made1", "setList:account:made1;made1"]);
+  }, 30_000);
+
+  it("after the vault is gone, a desktop that used the account's identities seeds those, not its own", async () => {
+    const { api, record, service, ts } = await signedIn("ts.gone");
+    ts.account = list(["acc1", "acc2"], "acc2");
+    expect(await syncAfterUnlock(api, record, ts, 7)).toBe("seeded");
+    expect(vaultList((await serverVault(service, record))!.contents as never)).toEqual(ts.account);
+    expect(ts.account).toEqual(list(["acc1", "acc2"], "acc2"));
+    expect(ts.made).toBe(0);
+  }, 30_000);
+
+  it("a list the user emptied is seeded with the device's own identities, as before", async () => {
+    const { api, record, service, ts } = await signedIn("ts.emptied");
+    ts.account = list(["acc1"]);
+    await writeServerVault(service, record, { teamspeak: { identities: [] } });
+    expect(await syncAfterUnlock(api, record, ts, 7)).toBe("seeded");
+    expect(ts.account).toEqual(list(["own1", "own2"]));
   }, 30_000);
 
   it("a later desktop adopts the vault's list without touching its own", async () => {
@@ -189,6 +206,17 @@ describe("changeIdentities", () => {
         default: "old-uid",
       },
     });
+  }, 30_000);
+
+  it("signed in: after the vault lost its TeamSpeak section, a change starts from the identities in use", async () => {
+    const { api, record, service, ts } = await signedIn("ts.lost");
+    ts.account = list(["acc1", "acc2"], "acc2");
+    await writeServerVault(service, record, { other: 1 });
+    const next = await changeIdentities(api, record, ts, add(entry("c")), 9);
+    expect(next).toEqual({ default: "acc2", identities: [entry("acc1"), entry("acc2"), entry("c")] });
+    expect(ts.account).toEqual(next);
+    expect((await serverVault(service, record))?.contents).toMatchObject({ other: 1 });
+    expect(vaultList((await serverVault(service, record))!.contents as never)).toEqual(next);
   }, 30_000);
 
   it("signed in: a failed vault write leaves the desktop alone", async () => {

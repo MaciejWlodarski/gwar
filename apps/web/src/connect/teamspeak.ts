@@ -15,7 +15,7 @@ import type { ConnectRecord } from "../net/identity";
 import { isDesktop, tauri } from "../platform";
 import { ConnectApi } from "./api";
 import { addEntry, DEFAULT_NAME, emptyList, normalizeList, sameList, type TsEntry, type TsList } from "./ts-list";
-import { loadVault, updateVault, vaultList, withTeamspeakList } from "./vault";
+import { loadVault, updateVault, vaultList, withTeamspeakList, type VaultContents } from "./vault";
 
 /** Most servers refuse identities below this security level. */
 export const MIN_LEVEL = 8;
@@ -109,7 +109,11 @@ export async function syncAfterUnlock(api: ConnectApi, record: ConnectRecord, ts
   let { contents } = await loadVault(api, record);
   let outcome: SyncOutcome = "adopted";
   if (vaultList(contents).identities.length === 0) {
-    const own = await deviceListOrNew(ts);
+    // No TeamSpeak section at all: never written, or the vault itself is gone (e.g. Connect restored an old backup).
+    // Then this desktop's active list is seeded, which is the account's identities if it used them before, so
+    // they are not swapped for new ones. An emptied list (the user deleted every identity) seeds the device's own.
+    const active = contents.teamspeak === undefined ? await ts.exportList("active") : emptyList();
+    const own = active.identities.length > 0 ? active : await deviceListOrNew(ts);
     // Another desktop may have seeded it meanwhile; then its identities win.
     ({ contents } = await updateVault(api, record, (c) => (vaultList(c).identities.length > 0 ? c : withTeamspeakList(c, own, now))));
     outcome = sameList(vaultList(contents), own) ? "seeded" : "adopted";
@@ -149,7 +153,11 @@ export async function changeIdentities(
     await ts.setList("device", next);
     return next;
   }
-  const state = await updateVault(api, record, (c) => withTeamspeakList(c, normalizeList(change(vaultList(c))), now));
+  // A vault without a TeamSpeak section lost it (see syncAfterUnlock): start from the identities in use, not from none.
+  const missing = (await loadVault(api, record)).contents.teamspeak === undefined;
+  const inUse = missing ? await ts.exportList("active") : null;
+  const base = (c: VaultContents) => (c.teamspeak === undefined && inUse ? inUse : vaultList(c));
+  const state = await updateVault(api, record, (c) => withTeamspeakList(c, normalizeList(change(base(c))), now));
   const next = vaultList(state.contents);
   await ts.setList("account", next);
   return next;

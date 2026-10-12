@@ -384,7 +384,10 @@ HTTP. Servers cache the entire attestation and omit it once expired.
   a flow that has the vault key: if the vault has identities, the desktop adopts
   them as its account list; otherwise the first desktop seeds the vault with its
   whole device list (making one identity named "Default" first if it has none),
-  keeping its TeamSpeak groups. Desktops refresh from the vault when they start,
+  keeping its TeamSpeak groups. A vault that has no TeamSpeak part at all (for
+  example after Connect was restored from an older backup) is seeded, and
+  changed, from the identities the desktop uses now, so it never swaps the
+  account's identities for new ones. Desktops refresh from the vault when they start,
   quietly. Every change (add, import, rename, delete, set default, generate) is
   written to the vault first and then to the desktop; signed out it only changes
   the device's list. Deleting the default makes the first remaining one the
