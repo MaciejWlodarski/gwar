@@ -248,6 +248,26 @@ struct Bridge<'a> {
     query_clid: Option<u64>,
 }
 
+/// Runs `channelcreate` and lets the stock Server Admin power manage the
+/// channel's permissions. A channel takes its creator's powers as the ones
+/// needed to manage it, and ServerQuery's 100 would lock out every TeamSpeak
+/// admin, so this sets what one of them would have; deleting stays ours (it
+/// would only come back), so its needed power remains. A channel whose power
+/// cannot be set is deleted again, and the next sync creates it anew.
+async fn create_channel(query: &Query, create: Cmd) -> Result<u64> {
+    let created = query.call(create).await?;
+    let cid = created.first().and_then(|r| r.get("cid")?.parse().ok()).context("channelcreate returned no cid")?;
+    let perm = Cmd::new("channeladdperm")
+        .arg("cid", cid)
+        .arg("permsid", "i_channel_needed_permission_modify_power")
+        .arg("permvalue", SERVER_ADMIN_POWER);
+    if let Err(e) = query.call(perm).await {
+        let _ = query.call(Cmd::new("channeldelete").arg("cid", cid).arg("force", 1)).await;
+        return Err(e.context("set the permission power of a new TeamSpeak channel"));
+    }
+    Ok(cid)
+}
+
 impl<'a> Bridge<'a> {
     async fn run(
         link: &Link,
@@ -496,23 +516,7 @@ impl<'a> Bridge<'a> {
             if let Some(Some(p)) = &password {
                 cmd = cmd.arg("channel_password", p);
             }
-            let created = self.query.call(cmd).await?;
-            let cid =
-                created.first().and_then(|r| r.get("cid")?.parse().ok()).context("channelcreate returned no cid")?;
-            // A channel takes its creator's powers as the ones needed to manage
-            // it, and ServerQuery's 100 would lock out every TeamSpeak admin.
-            // Give channel permissions the stock Server Admin power, as if one
-            // of them had made the channel; deleting stays ours (it would only
-            // come back), so its needed power remains. Without that the
-            // channel is not kept, and the next sync creates it again.
-            let perm = Cmd::new("channeladdperm")
-                .arg("cid", cid)
-                .arg("permsid", "i_channel_needed_permission_modify_power")
-                .arg("permvalue", SERVER_ADMIN_POWER);
-            if let Err(e) = self.query.call(perm).await {
-                let _ = self.query.call(Cmd::new("channeldelete").arg("cid", cid).arg("force", 1)).await;
-                return Err(e.context("set the permission power of a new TeamSpeak channel"));
-            }
+            let cid = create_channel(&self.query, cmd).await?;
             want.cid = cid;
             want.password = matches!(password, Some(Some(_)));
             self.ts.insert(cid, want);
@@ -1260,6 +1264,53 @@ mod tests {
 
     fn remote(session: SessionId, cid: u64) -> Remote {
         Remote { session, nickname: "TeamSpeak user".into(), cid, muted: false, deafened: false, away: None }
+    }
+
+    /// A ServerQuery that answers `channelcreate` with cid 42 and refuses
+    /// `channeladdperm` when `refuse` is set; returns the commands it got.
+    async fn channel_query(refuse: bool) -> (Query, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let commands = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = commands.clone();
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let (read, mut write) = sock.into_split();
+            write.write_all(b"TS3\n\rWelcome\n\r").await.unwrap();
+            let mut lines = BufReader::new(read).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let name = line.split(' ').next().unwrap_or_default().to_owned();
+                seen.lock().unwrap().push(line);
+                let reply = match name.as_str() {
+                    "channelcreate" => "cid=42\n\rerror id=0 msg=ok\n\r",
+                    "channeladdperm" if refuse => "error id=2568 msg=insufficient\\sclient\\spermissions\n\r",
+                    _ => "error id=0 msg=ok\n\r",
+                };
+                write.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let (query, _notes) = Query::connect(addr, "serveradmin", "p", 1).await.unwrap();
+        (query, commands)
+    }
+
+    #[tokio::test]
+    async fn new_channels_get_the_server_admin_permission_power_or_go() {
+        let (query, commands) = channel_query(false).await;
+        assert_eq!(create_channel(&query, Cmd::new("channelcreate").arg("channel_name", "A")).await.unwrap(), 42);
+        let sent = commands.lock().unwrap().clone();
+        assert!(sent.contains(
+            &"channeladdperm cid=42 permsid=i_channel_needed_permission_modify_power permvalue=75".to_owned()
+        ));
+        assert!(!sent.iter().any(|c| c.starts_with("channeldelete")), "{sent:?}");
+
+        let (query, commands) = channel_query(true).await;
+        assert!(create_channel(&query, Cmd::new("channelcreate").arg("channel_name", "A")).await.is_err());
+        let sent = commands.lock().unwrap().clone();
+        assert_eq!(sent.last().unwrap(), "channeldelete cid=42 force=1", "{sent:?}");
     }
 
     #[tokio::test]
