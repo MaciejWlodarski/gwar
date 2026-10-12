@@ -2,7 +2,7 @@
 
 Status: **design** (phase 2). Nothing in this document is implemented. It
 records what was agreed, how it fits the existing identities, protocol and
-server, and which spikes must pass before building it. [security.md](security.md)
+server, and what the spikes measured (see "Spikes"). [security.md](security.md)
 describes what is implemented today.
 
 ## Goals
@@ -56,18 +56,30 @@ post-quantum suites (MLS can add them later); push notifications.
 
 - **MLS library: OpenMLS** (Rust, 0.9), compiled to WebAssembly for the web
   app. The desktop app runs the same web interface, so one MLS implementation
-  serves both; the native voice engine only receives media keys. OpenMLS
-  supports external commits, external senders and the mandatory suite. Its
-  WebAssembly target is built without tests upstream, and external commits are
-  reported to panic there (`SystemTime::now`, openmls#1983), so spike S1
-  decides; the fallbacks are mls-rs (WebAssembly builds) and ts-mls
-  (TypeScript, not audited).
+  serves both; the native voice engine only receives media keys. Spike S1
+  ran every operation this design needs in Chrome, Firefox and WebKit; the
+  crate's `js` feature avoids the external-commit panic of openmls#1983.
+  mls-rs passed too and is smaller (267 KB against 447 KB gzip), but OpenMLS
+  is chosen: its core had an independent security audit (SRLabs, 2025–2026),
+  and Wire and XMTP run it in browsers, while mls-rs has had no full
+  third-party audit. The audit left out the crypto and storage providers,
+  and Wire and XMTP use their own integrations, so the provider Gwar uses
+  (`openmls_rust_crypto`) and our storage get their own review before
+  release. The module is loaded on first use, not with the page. Its size
+  budget, first set at 400 KB gzip, is raised to 450 KB, which leaves little
+  room: further size work belongs to the implementation.
 - **Ciphersuite** `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (0x0001):
   Ed25519 matches every Gwar key.
 - **SFrame**: browsers through `RTCRtpScriptTransform` (Chrome/Edge 141+,
-  Firefox 117+, Safari 15.4+); the desktop's native engine through the Rust
-  `sframe` crate (2.0). Both use the RFC 9605 wire format, so they
-  interoperate.
+  Firefox 117+, Safari 15.4+) with a small RFC 9605 implementation on
+  WebCrypto in the worker, not audited, which gets its own review before
+  release; the
+  desktop's native engine through the Rust `sframe` crate (2.0). They
+  interoperate (S3). SFrame application metadata is always empty: `sframe`
+  2.0 authenticates metadata before the header, the reverse of RFC 9605,
+  which only differs when metadata is present. Clients reject non-empty
+  metadata, and a test keeps the RFC vector that fails today until it is
+  fixed upstream.
 
 All new statements follow the existing rules: UTF-8, `\n` separators, no
 trailing newline, canonical unpadded base64url for binary fields, decimal
@@ -84,8 +96,8 @@ groups leaves by uid.
 - The **leaf signature key is the device key itself**. MLS signs with its own
   labels (`MLS 1.0 …`), which no Gwar statement starts with. The key is
   stored as a JWK today and only imported as non-extractable for WebCrypto,
-  so the MLS library can sign with it; spike S1 confirms this. Should it
-  fail, a separate MLS key bound by a device-key signature is the fallback.
+  so the MLS library signs with its seed; spike S1 confirmed this, and no
+  separate MLS key is needed.
 - The credential is a `BasicCredential` whose identity is the canonical
   encoding of the device certificate (Connect accounts) or `-` and the key
   (local identities).
@@ -97,15 +109,17 @@ results from every commit (adds, updates, external commits, path updates):
 - the leaf signature key equals the device key in the credential, and the
   encoding is canonical;
 - the uid derives from the account key (or the local key);
-- the certificate is current and not revoked, by the client's own Connect
-  feed (a stale feed is used as it is, as for messages today; it cannot be
-  forced fresh);
+- the certificate is current and not revoked in the commit's epoch, by the
+  client's own Connect feed (a stale feed is used as it is, as for messages
+  today; it cannot be forced fresh); a client catching up judges each commit
+  by its own epoch (see "Removal");
 - one leaf per device key, and an update keeps the leaf's uid and device key;
 - the resulting membership satisfies the conversation's rule (below).
 
 Historical checks on old messages may accept an expired or revoked device
-with a qualification; membership never does. A revoked or expired leaf is
-removed by the first member device that notices. Renewing a certificate is an
+with a qualification; current membership never does: a tree that holds such a
+leaf after catching up blocks sending until the leaf is removed, which the
+first member device that notices does. Renewing a certificate is an
 MLS update of the device's own leaf. Each device commits an update of its
 leaf at least every seven days while it is online; an overdue device updates
 before sending.
@@ -464,11 +478,19 @@ Local identities have one device and no archive.
   current epoch, used as the SFrame base key. The SFrame key id is
   `epoch (low 32 bits) ‖ leaf_index (32 bits)`, so receivers find the key per
   frame even though the SFU moves speakers between the 8 receive slots.
-  Replay windows are kept per key.
+  The key id carries only the low half of the epoch, so receivers keep keys
+  and replay windows per full `(group, epoch, leaf)`; a frame whose key id
+  matches several kept epochs is tried newest first (at most eight), and
+  only a frame that authenticates changes any state.
+- A leaf index is not a device. When a device is removed, its keys go from
+  every kept epoch before its freed leaf can belong to another device, and
+  acknowledgements are counted per device of the validated epoch.
 - One encryptor owns each sender key and its SFrame counter. An engine that
   restarts, or cannot prove its counter continued, does not reuse the key: it
   stays silent and commits an update of its leaf, then sends in that new
-  epoch once it is active. Others keeping its old key to receive is harmless.
+  epoch once it is active. Until then it accepts no key from before that
+  update, for sending or, when its replay windows were lost, for receiving.
+  Others keeping its old key to receive is harmless.
 - Every participant can derive every sender's key, so a participant could
   forge another's audio. Accepted for now (see Not goals).
 
@@ -477,24 +499,37 @@ Local identities have one device and no archive.
 - An epoch change is identified by `(group_id, epoch)`. A participant
   acknowledges it (`voice.epoch.ack`, relayed by the server to the call) only
   once the new keys are installed in its actual decryptor (worker or native
-  engine). Acknowledgements for epochs other than the newest are ignored.
+  engine). Acknowledgements for older epochs are ignored; those for an epoch
+  the participant has not processed yet are kept (a bounded number) until it
+  does. A participant that caught up after a gap asks the call to repeat
+  acknowledgements of the newest epoch.
 - Each sender **activates** the newest epoch it has processed by one rule:
   if any commit since its current sending epoch removed a leaf, at once;
   otherwise (additions, updates) when every participant of the new epoch,
   newcomers included, has acknowledged it, or two seconds after the sender
   processed it, whichever comes first. A newer commit replaces a pending one
-  and keeps the earlier start of the two-second wait.
+  and keeps the earlier start of the two-second wait, and a removal anywhere
+  in the pending chain keeps it immediate. "At once" means the sender stops
+  using the old key the moment it processes the commit, even while the new
+  keys are still being installed; it stays silent until they are.
+- The two seconds count from when the sender processed the commit. They
+  bound the wait for acknowledgements, not delivery or key installation: a
+  commit the server withholds delays the change until it arrives (see
+  "Freshness").
 - A removed participant gets nothing under keys it does not have, whatever
-  the SFU does; the SFU also stops forwarding to it. A newcomer hears others
-  once they activate; the two-second limit bounds the wait, so a slow device
-  can briefly miss audio.
-- Receivers keep an epoch's keys while it is the epoch of some current
-  sender's latest frame that decrypted (silent senders included, through
-  their last frame), or for ten seconds after the receiver processed a newer
-  commit, whichever is longer; keys of removed senders go at once. At most
-  eight epochs are kept per call; past that the oldest goes, and a sender
-  that far behind stays silent to that receiver until it catches up and
-  sends in a newer epoch.
+  the SFU does; the SFU also stops forwarding to it. It can still decrypt a
+  sender who has not processed its removal yet, until that sender does; that
+  is the cutoff, per sender, and frames encrypted before it stay readable to
+  it whenever they arrive. A newcomer hears others once they activate; the
+  two-second limit bounds the wait, so a slow device can briefly miss audio.
+- Receivers keep an epoch's keys while it is the newest epoch in which some
+  current device's frame authenticated (silent senders included, through
+  their last frame; a late frame from an older epoch never moves this back),
+  or for ten seconds after the receiver processed the first commit that
+  superseded it, whichever is longer; keys of removed senders go at once.
+  At most eight epochs are kept per call; past that the oldest goes, and a
+  sender that far behind stays silent to that receiver until it catches up
+  and sends in a newer epoch.
 - Acknowledgements are relayed by the server and not signed, so a dishonest
   server could make senders switch early (a newcomer misses a moment of
   audio) or hold them until the two-second limit. That only affects
@@ -514,8 +549,12 @@ Local identities have one device and no archive.
   `sframe` crate, decrypting before it inspects Opus or fills the jitter
   buffer. The web layer, which runs MLS, passes keys through a new
   `voice_set_keys` command (High risk class): bound to the engine run,
-  server, session, voice group and epoch, with receive keys installed
+  server, session, voice group and full epoch, with receive keys installed
   separately from sender activation, and ignored after the run ends.
+  Repeating an identical install keeps the counter and replay windows;
+  different keys for the same binding stop the engine. An install overtaken
+  by a newer one is ignored, and no install brings back keys that were
+  purged or replay windows that were reset.
 - **Frame size**: Opus frames are kept small (20 ms at the current bitrates
   is about 120–200 bytes, plus at most 33 bytes of SFrame). Clients drop,
   never truncate, an encoded frame over 1000 bytes before encryption, so a
@@ -523,21 +562,37 @@ Local identities have one device and no archive.
 
 ### SFU
 
-- It forwards the encrypted payload unchanged.
+- It forwards the encrypted payload unchanged, as opaque bytes: str0m runs in
+  RTP mode, which gives the SFU each packet's SSRC, extended sequence number,
+  timestamp and header extensions without depacketizing Opus (S4).
+- **Streams**: each call and each engine run sends on a fresh SSRC, in
+  plaintext channels too. Leaving a call (including a move to another
+  channel) discards every frame captured, encoded or queued for it in the
+  client; a frame is never sent under another call's SSRC. The server binds
+  an SSRC to the call when it is negotiated, retires the departing stream
+  at once, and drops packets of unknown or retired SSRCs before routing
+  them (retired ones are bounded per microphone, refusing new ones past the
+  limit). So a frame delayed from an earlier call or run never enters
+  another one, and a sequence number only restarts with a new SSRC.
 - **Timing**: today a slot's RTP time advances by the previous packet's
   duration, read from the Opus header, which is now encrypted. Instead:
   - senders stamp each packet with the capture position of its first sample
     (48 kHz), which also advances over frames not sent (silence, mute,
     push-to-talk, dropped frames). Browsers do this already; the native
-    engine must carry the capture position with each frame instead of using
-    wall-clock time;
+    engine counts positions where audio is captured, carries them with each
+    frame instead of using wall-clock time, and discards a partial frame
+    across a gap in capture;
   - per sender stream (SSRC), the SFU orders packets by extended RTP
     sequence number: duplicates and packets older than the last forwarded
     are dropped. A new SSRC starts a new baseline;
   - for a newer packet from the same speaker on a slot, the forwarded time
     advances by the sender's timestamp difference (modulo 2^32) and the
     packet goes out at once. A difference that is negative or over five
-    seconds despite a newer sequence number is a source reset;
+    seconds despite a newer sequence number is a source reset (so is a
+    real silence longer than five seconds, harmless when packets arrive on
+    time); a
+    difference of zero (one frame per packet, so a sender fault) drops the
+    packet and is counted;
   - on a speaker change or a source reset, the forwarded time advances by
     the elapsed wall-clock time rounded up to whole 20 ms frames, at least
     one.
@@ -545,7 +600,7 @@ Local identities have one device and no archive.
   the native engine always uses 20 ms). The sender checks each frame's Opus
   duration before encrypting and counts other durations; they are still
   sent, because timing rests on the sender's timestamps and only the
-  speaker-change estimate assumes 20 ms. S2 verifies that browsers keep 20 ms.
+  speaker-change estimate assumes 20 ms. In S2 all three browsers kept 20 ms.
 - **Speech gate**: unchanged, from the RFC 6464 audio level header extension,
   which stays in the clear. Who talks, and when, remains visible to the
   server, as it is today. Rewritten RTP headers are not part of SFrame's
@@ -564,7 +619,21 @@ Local identities have one device and no archive.
   audio and text enter and leave it, not only by channel permissions: the SFU
   feeds no puppet audio from an encrypted channel (also during a puppet's
   grace period or a refused move), whispers from TeamSpeak cannot target
-  encrypted voice, and no channel text crosses in either direction.
+  encrypted voice, and no channel text crosses in either direction. Each
+  audio packet and each queued text keeps the channel it came from, and
+  whether that channel is encrypted, from the moment it enters the server;
+  every later boundary (the SFU's puppet feed, the puppet socket, delivery
+  queues, query and listener routes) checks it again, together with the
+  generation and confirmed TeamSpeak channel of the puppet or connection
+  that route uses, so a move never
+  changes where a queued packet may go. All writes to TeamSpeak go through
+  these checks. Plaintext audio or text queued across a move is dropped,
+  never re-sent into the new channel.
+- An encrypted channel's description on TeamSpeak is a fixed notice, never
+  its participant list; nothing of an encrypted conversation (text,
+  attachment names, titles) is copied into public metadata.
+- Direct messages and server chat are classified by their own conversation,
+  never by the voice channel the sender is in.
 - Direct messages with TeamSpeak users stay plaintext and labeled; a
   puppet kept for them carries text only, never audio from an encrypted
   channel.
@@ -640,6 +709,70 @@ p95/p99.
 | S5 Churn | Joins, removals, restarts, overlapping transitions, lost, fabricated or duplicate acknowledgements, withheld commits, repeated key installation, leaf reuse, epoch wrap, silent senders across epochs, more than eight epochs in a row, a call ending and a new one starting with returning devices, stale `voice_set_keys` calls. | Zero nonce reuse; a removed participant decrypts nothing after the removal commit is processed; no plaintext fallback; audio resumes after every transition (time to usable audio measured). |
 | S6 TeamSpeak isolation | With the official TS3 server: moves, whispers, puppets in their grace period, query listeners, restarts. | Zero bytes of an encrypted channel's audio or text reach TeamSpeak, and no TeamSpeak audio, whisper or text enters an encrypted conversation; plaintext channels keep working both ways. |
 
+### Results
+
+Measured in October 2026 on an Apple M5 laptop (macOS 27) with Chrome 155,
+Firefox 155–157 and WebKit 26–27 through Playwright. WebKit stands in for
+Safari; real Safari was not run. Times are median / p95 / p99.
+
+- **S1: passed with OpenMLS except for size**, which the choice above
+  accepts. Every operation worked in all three browsers, 20 runs each,
+  including signing with the existing device key and catching up through five
+  epochs with an expired certificate before removing it. A commit in a
+  100-device group took 9.4 / 10.1 / 10.5 ms in Chrome and at most 12 ms p95
+  in Firefox and WebKit; a whole local round with the IndexedDB write took
+  19–30 ms median. State survived reloads and nine forced browser kills per
+  browser between creating and merging a commit. Gzip size 447 KB (mls-rs:
+  267 KB, every gate passed).
+- **S2: the functional checks passed; the latency gate is only partly
+  measured.** Eight senders decrypted correctly through the real SFU, also
+  while moving between slots; injected plaintext, tampered, replayed and
+  unknown-key frames silenced only their sender, and a sender without keys
+  sent nothing. From receiving a frame to handing it on decrypted, p99:
+  Chrome 0.10 ms (also in a hidden tab), Firefox 0.56 ms (0.82 ms with the
+  window covered); WebKit gives no receive time, and its decryption itself
+  took 0.10 ms. The Firefox and WebKit figures come from a rerun on an idle
+  machine. During parallel builds Firefox reached 62 ms p99 with a
+  covered window, so behaviour under CPU load belongs to the latency work.
+  Not measured: the queues before the sender transform and after the
+  receiver's, which browsers do not expose, and hidden Firefox and WebKit
+  tabs under normal background policy.
+- **S3: interoperable with empty metadata, not fully RFC-conformant.** 42
+  shared vectors both ways and all
+  RFC header vectors; 200 frames of 1000 bytes with the widest key id and
+  counter crossed the SFU intact in each direction for each browser; larger
+  frames were dropped before encryption. `sframe` 2.0 fails the RFC vector
+  with non-empty metadata (see "Building blocks").
+- **S4: passed locally.** Forwarding by sender timestamps added 0.17 ms at
+  p95 (400 markers per variant, native clients over loopback, alternating
+  runs, without SFrame); talking indicators and slots were unchanged, and
+  loss, reordering, duplicates, both wraps, resets, silence, mute and bursts
+  matched expected traces. The rules it added are under "SFU". The VM
+  measurement is still to do.
+- **S5: passed in simulation.** Real OpenMLS groups and `sframe` keys, with
+  a modelled network and SFU, ran every scenario of the S5 row 40 times on
+  three network profiles: 4,955,406 encryptions without a repeated key and
+  counter, no frame encrypted after its sender processed a removal
+  decrypted by the removed participant (166 million attempts), no
+  plaintext, and audio
+  back after every transition whose commits arrived. After a join, everyone
+  heard everyone in the new epoch within 22 ms on a LAN, and 193 / 278 /
+  295 ms at 50 ms round trip with 1% loss (the simulation counts no CPU
+  time); when acknowledgements are lost or updates overlap, the change waits
+  up to the two-second limit while the old keys keep the audio going. A
+  commit withheld for good leaves that participant unable to hear the others
+  once they switch, as designed. The rules it sharpened (full-epoch
+  keys, leaf reuse, removal while keys install, kept and repeated
+  acknowledgements, retention timing) are under "Voice". Not tested: the
+  real key-install command, browsers and audio devices.
+- **S6: passed at code level.** By the owner's decision this run used fakes
+  in place of the official server. 17 tests, each with a plaintext control
+  that proves the path works, cover moves during speech, the grace period,
+  refused moves, whispers, text both ways, listeners and reconnects. The run
+  with the official server remains, and so do frames delayed from before
+  the server classifies them: the per-call SSRC rule under "SFU" is meant to
+  close that gap, and is tested with the implementation.
+
 ## Left for the implementation spec
 
 The direction above is settled; these are pinned down before building:
@@ -664,7 +797,15 @@ The direction above is settled; these are pinned down before building:
   windows, with retirement after authentication;
 - per-SSRC RTP state from the transport (today's `AudioPacket` drops it),
   native playback of frames other than 20 ms, and bridge queues that keep
-  each packet's originating channel across moves.
+  each packet's originating channel across moves;
+- a write-ahead outbox for commits, reconciled with the server by commit
+  hash after a crash, and an external commit that stays inactive until the
+  server accepted it (S1 tested recovery only at chosen points);
+- a review of the WebCrypto SFrame worker code, and of the OpenMLS crypto
+  provider and storage integration.
+
+Still to measure before building: real Safari (S1, S2 used WebKit), the SFU
+change on the VM (S4), and S6 with the official TeamSpeak server.
 
 ## Open questions
 
@@ -674,4 +815,4 @@ The direction above is settled; these are pinned down before building:
 - History bundles grow with every epoch (about 40 bytes each). If channels
   reach many thousands of epochs, a key tree can replace the flat list.
 - SFrame suite for voice: `AES_128_GCM_SHA256_128` (16-byte tag) by default;
-  S4 measures whether a shorter-tag suite is worth it for bandwidth.
+  whether a shorter-tag suite is worth it for bandwidth is not measured yet.
