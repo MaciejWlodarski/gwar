@@ -3,8 +3,8 @@
 **Gwar** is an open-source, self-hosted voice chat. Run your own server,
 talk from the browser or the desktop app, and keep your friends who still use
 TeamSpeak in the same conversation. It is built to stay trustworthy even when
-the server you join is not: your identity is a key only you hold, and every
-message is signed (see [Security](#security)).
+the server you join is not: your identity is a key only you hold, and Gwar
+clients sign what you write (see [Security](#security)).
 
 **Use it:** the web app at <https://gwar.maciejwlodarski.com> connects to any
 Gwar server (the project's own is `voice.maciejwlodarski.com`); so does the
@@ -44,9 +44,9 @@ use.
   permanent, by identity or IP), invite links that can grant a role, server
   settings, removing members and cleaning up the inactive ones. Nobody can hand
   out more than they hold.
-- **Signed chat.** Every message, edit, deletion and attachment is signed by
-  its author and verified by every client, so a server cannot put words in
-  anyone's mouth. See [Security](#security).
+- **Signed chat.** Gwar clients sign every message, edit, deletion and
+  attachment and verify everyone else's, so a server cannot put words in a
+  Gwar user's mouth without a warning. See [Security](#security).
 - **Chat like you expect.** Mentions with notifications, editing and deleting,
   images, video, audio and files (drag and drop or paste).
 - **One web app, plus a desktop app, with one UI.** The project hosts the web
@@ -71,6 +71,7 @@ on hidden behavior; security comes only from keys that never leave their owner.
 A server is trusted to route voice and deliver messages, but never with who you
 are or what you said: even a hostile server cannot log in as you elsewhere,
 forge your messages or show a fake verified name without a visible warning.
+The limits are listed plainly [at the end](#what-gwar-does-not-protect-yet).
 
 ### Your identity is a key
 
@@ -82,15 +83,19 @@ forge your messages or show a fake verified name without a visible warning.
 ### Logging in: mutual proof, no relaying
 
 - Every server has its own **Ed25519 server key**. Invite links carry its full
-  fingerprint, and clients pin it for each server address. If the key changes,
-  login stops until you check it with the owner; there is no silent rotation
-  and no fallback to a weaker login.
+  fingerprint, and clients pin it for each server address. Without an invite,
+  the first connection trusts the key it is shown (as SSH does) and pins it.
+  If the key later changes, login stops until you check it with the owner;
+  there is no silent rotation and no fallback to a weaker login.
 - Login is a **mutual challenge-response**: your client signs the exact address
   it dialed, the server key it expects and fresh random values from both sides,
   and the server must answer with a proof signed by its own key. A malicious
   server cannot replay your login to another server, and cannot pretend to be a
   server whose key it does not hold.
 - Server passwords and invites are sent only after the server has proven itself.
+- These guarantees need TLS and a server that lists its real addresses. The
+  plaintext LAN option and the development flag `--insecure-any-host` give
+  them up, and say so.
 
 ### Encrypted connections
 
@@ -103,30 +108,37 @@ forge your messages or show a fake verified name without a visible warning.
 
 ### Every message is signed
 
-- Each message, edit, deletion and attachment is **signed by its author's key**
-  and bound to the server's key, the conversation and the message id. A server
-  cannot alter a message, move it to another channel or present it as someone
-  else's without clients noticing.
-- **Edits form a hash chain**, and clients keep local checkpoints that refuse
-  rollbacks and forks of messages they have already seen.
+- Each message, edit, author deletion and attachment written in Gwar is
+  **signed by its author's key** and bound to the server's key, the
+  conversation and the message id. A server cannot alter such a message, move
+  it to another channel or present it as someone else's without clients
+  noticing.
+- **Edits form a hash chain.** Clients keep local checkpoints that catch
+  rollbacks and forks of messages they have already seen; a fresh device, or
+  one whose stored history was cleared, has nothing to compare against.
 - Attachments are **checked against their signed hash** before they are shown
-  or saved.
+  or saved; one that fails or has no signature loads only when you ask.
 - Until its signature is checked a message is visibly pending; anything that
   fails or cannot be fully verified carries a warning. Notifications and
-  mentions fire only for verified messages.
+  mentions need a verified signature. TeamSpeak messages (which cannot be
+  signed) and removals by moderators are labeled as such.
 
 ### Gwar Connect: an account that never sees your secrets
 
 - **Your password never leaves your device.** It is stretched there with
   **Argon2id** (64 MiB, 3 passes) into two keys: one encrypts your account key
   with **AES-256-GCM**, the other signs you in, and Connect keeps only an
-  Argon2 hash of it. A leaked Connect database lets nobody sign in; reading an
-  account key would take an offline guessing attack on that account's password.
+  Argon2 hash of it. A leaked Connect database holds no usable credentials;
+  an attacker would have to guess each password offline, which is slow by
+  design but succeeds against weak passwords. Choose a strong one.
 - A **recovery code** with 160 random bits, shown once, restores access if you
   forget the password.
 - Every device has **its own key, certified by your account key** for at most
-  90 days. A lost device is revoked with a signed revocation; servers then
-  disconnect it, and you stay the same person.
+  90 days. A lost device is revoked with a signed revocation, and you stay the
+  same person. Servers check for revocations every five minutes and then
+  disconnect the device. If Connect withholds a revocation, the device works
+  until its certificate expires; revoking it cannot take back what it already
+  copied.
 - Your **vault** (profile, TeamSpeak identities) is encrypted on your devices
   with AES-256-GCM under a key derived from your account key; Connect stores
   only ciphertext.
@@ -158,7 +170,14 @@ Being honest about the limits is part of the design:
 - **Direct messages are not end-to-end encrypted yet**; per-device end-to-end
   encryption is on the roadmap.
 - Voice is not signed, and presence, nicknames, channel names and roles are the
-  server's word.
+  server's word. A server can also hide, delay or reorder messages, and sees
+  your IP address and when you are online; your uid is the same on every
+  server, so servers can tell it is you.
+- **File links are like keys**: anyone holding a file's link can download it
+  without logging in, also after leaving the server, until the message is
+  deleted.
+- Gwar Connect decides which account owns an `@handle`, and could serve you an
+  older copy of your encrypted vault.
 - The web app is only as trustworthy as its hosting, which serves the code on
   every load. Desktop builds are not signed yet.
 - TeamSpeak users have no Gwar keys, so their messages are shown as unsigned.
