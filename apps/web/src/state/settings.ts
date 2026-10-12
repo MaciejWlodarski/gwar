@@ -25,6 +25,8 @@ export interface Bookmark {
   identity?: string;
   /** Unix ms of the last change to what Gwar Connect syncs (all but `insecureLan`); missing before syncing existed. */
   updatedAt?: number;
+  /** The Gwar Connect account (its account key) whose vault this bookmark syncs with. Missing: saved without an account, and the next account to sync takes it. */
+  account?: string;
 }
 
 /** How long a removed bookmark is remembered, so syncing does not bring it back from another device. */
@@ -33,6 +35,11 @@ export const BOOKMARK_TOMBSTONE_MS = 90 * 86_400_000;
 /** Whether two bookmarks differ in what Gwar Connect syncs. */
 function syncedChange(a: Bookmark, b: Bookmark): boolean {
   return a.name !== b.name || a.address !== b.address || (a.kind ?? "vc") !== (b.kind ?? "vc") || (a.password ?? "") !== (b.password ?? "") || (a.identity ?? "") !== (b.identity ?? "");
+}
+
+/** A change's time: now, but always after the last one, so a device whose clock is behind still wins with a newer edit. */
+function nextChange(previous: number | undefined): number {
+  return Math.max(Date.now(), (previous ?? 0) + 1);
 }
 
 function pruneRemoved(removed: Record<string, number>, now: number): Record<string, number> {
@@ -103,6 +110,8 @@ export interface SettingsState {
   removeBookmark(id: string): void;
   /** The list after a sync with Gwar Connect; not counted as an edit. */
   replaceBookmarks(bookmarks: Bookmark[]): void;
+  /** After signing out: the account's servers and every pending removal leave this device (they stay in its vault). */
+  dropAccountBookmarks(account: string): void;
   setLast(address: string, kind?: ServerKind): void;
   setTsDetectAsked(asked: boolean): void;
 }
@@ -164,8 +173,9 @@ export const useSettings = create<SettingsState>()(
         set((s) => {
           const existing = s.bookmarks.find((b) => b.id === bookmark.id);
           const changed = !existing || syncedChange(existing, bookmark);
-          const saved = { ...bookmark, updatedAt: changed ? Date.now() : existing.updatedAt };
+          const saved: Bookmark = { ...bookmark, updatedAt: changed ? nextChange(existing?.updatedAt) : existing.updatedAt, account: existing?.account };
           if (saved.updatedAt === undefined) delete saved.updatedAt;
+          if (saved.account === undefined) delete saved.account;
           const { [bookmark.id]: _revived, ...removedBookmarks } = s.removedBookmarks;
           return {
             bookmarks: existing ? s.bookmarks.map((b) => (b.id === bookmark.id ? saved : b)) : [...s.bookmarks, saved],
@@ -178,11 +188,12 @@ export const useSettings = create<SettingsState>()(
           const now = Date.now();
           return {
             bookmarks: s.bookmarks.filter((b) => b.id !== id),
-            removedBookmarks: { ...pruneRemoved(s.removedBookmarks, now), [id]: now },
+            removedBookmarks: { ...pruneRemoved(s.removedBookmarks, now), [id]: nextChange(s.bookmarks.find((b) => b.id === id)?.updatedAt) },
             bookmarkEdits: s.bookmarkEdits + 1,
           };
         }),
       replaceBookmarks: (bookmarks) => set((s) => ({ bookmarks, removedBookmarks: pruneRemoved(s.removedBookmarks, Date.now()) })),
+      dropAccountBookmarks: (account) => set((s) => ({ bookmarks: s.bookmarks.filter((b) => b.account !== account), removedBookmarks: {} })),
       setLast: (lastAddress, lastKind = "vc") => set({ lastAddress, lastKind }),
       setTsDetectAsked: (tsDetectAsked) => set({ tsDetectAsked }),
     }),

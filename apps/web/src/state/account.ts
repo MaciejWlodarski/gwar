@@ -116,9 +116,15 @@ function syncBookmarks(): void {
       const after = useSettings.getState();
       // Edited meanwhile: that edit syncs next, and the list stays as the person left it until then.
       if (after.bookmarkEdits !== before.bookmarkEdits) return syncBookmarks();
-      after.replaceBookmarks(toBookmarks(merged, after.bookmarks));
+      after.replaceBookmarks(toBookmarks(merged, after.bookmarks, record.accountKey));
     })
     .catch((e: unknown) => console.warn("saved servers sync skipped", e));
+}
+
+/** Waits for a sync that includes every edit made so far. */
+async function flushBookmarks(): Promise<void> {
+  syncBookmarks();
+  await serverSync;
 }
 
 // Every saved, edited or removed server goes to the vault; other devices pick it up when they start or come back.
@@ -368,7 +374,10 @@ export const accountActions = {
   /** Back to an unrelated local identity, or a fresh one after root migration. */
   async signOut(): Promise<void> {
     const record = await loadConnectRecord();
+    if (record?.vaultKey) await flushBookmarks();
     if (record) await flows.signOut(record, deps());
+    // The account's saved servers stay in its vault and come back on signing in again.
+    if (record) useSettings.getState().dropAccountBookmarks(record.accountKey);
     // TeamSpeak goes back to this device's own identities.
     await tsBridge()?.setList("account", null).catch((e: unknown) => console.warn("could not drop the account's TeamSpeak identities", e));
     bumpTs();

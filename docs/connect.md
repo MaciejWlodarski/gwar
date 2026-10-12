@@ -118,6 +118,12 @@ the same list:
   syncing count as time 0. At most 100 entries; tombstones go first.
 - The desktop app's plaintext LAN opt-in is a choice about one device's
   network and is never synced.
+- A device remembers which account each bookmark syncs with. Bookmarks saved
+  without an account join the first account that syncs on that device; another
+  account's bookmarks are never merged in. Signing out syncs once more, then
+  removes the account's servers from the device; signing in brings them back.
+- A local edit or removal is timed after the version it replaces, so it wins
+  even when this device's clock is behind the one that wrote that version.
 - Clients merge their list in after signing in or unlocking, at startup, when
   the window regains focus (at most once a minute) and after every local edit.
 

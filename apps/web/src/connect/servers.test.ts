@@ -1,10 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { Bookmark } from "../state/settings";
 import { createAccount, signIn } from "./account";
-import { MAX_SERVERS, mergeServers, syncServers, TOMBSTONE_MS, toBookmarks, vaultServers, type VaultServer } from "./servers";
+import { forAccount, MAX_SERVERS, mergeServers, syncServers, TOMBSTONE_MS, toBookmarks, vaultServers, type VaultServer } from "./servers";
 import { serverVault, setup, writeServerVault } from "./testing";
 
 const NOW = 1_800_000_000_000;
+const ACCT = "account-key";
 /** Small times are offsets from a recent moment, so tombstones are fresh. */
 const T = (n: number) => NOW - 1_000_000 + n;
 const entry = (id: string, at: number, extra: Partial<VaultServer> = {}): VaultServer => ({ id, name: id, address: `${id}.example.com`, kind: "vc", updated_at: T(at), ...extra });
@@ -92,12 +93,26 @@ describe("toBookmarks", () => {
       bookmark("moved", 1, { address: "10.0.0.2:8790", insecureLan: true }),
       bookmark("huge", 1, { password: "p".repeat(200) }),
     ];
-    const result = toBookmarks([entry("lan", 2, { address: "192.168.1.10:8790" }), entry("moved", 2, { address: "10.0.0.3:8790" }), { ...entry("x", 3), deleted: true }], previous);
+    const result = toBookmarks([entry("lan", 2, { address: "192.168.1.10:8790" }), entry("moved", 2, { address: "10.0.0.3:8790" }), { ...entry("x", 3), deleted: true }], previous, ACCT);
     expect(result).toEqual([
-      { id: "lan", name: "lan", address: "192.168.1.10:8790", kind: "vc", updatedAt: T(2), insecureLan: true },
-      { id: "moved", name: "moved", address: "10.0.0.3:8790", kind: "vc", updatedAt: T(2) },
+      { id: "lan", name: "lan", address: "192.168.1.10:8790", kind: "vc", updatedAt: T(2), account: ACCT, insecureLan: true },
+      { id: "moved", name: "moved", address: "10.0.0.3:8790", kind: "vc", updatedAt: T(2), account: ACCT },
       previous[2],
     ]);
+  });
+
+  it("a bookmark edited past the limits keeps its place and its edit over the vault's older version", () => {
+    const edited = bookmark("a", 5, { password: "p".repeat(129), account: ACCT });
+    expect(toBookmarks([entry("a", 1, { password: "short" }), entry("b", 1)], [edited, bookmark("b", 1, { account: ACCT })], ACCT)).toEqual([
+      edited,
+      { id: "b", name: "b", address: "b.example.com", kind: "vc", updatedAt: T(1), account: ACCT },
+    ]);
+  });
+
+  it("leaves out another account's bookmarks", () => {
+    const previous = [bookmark("theirs", 1, { account: "someone else" }), bookmark("huge", 1, { password: "p".repeat(200), account: "someone else" }), bookmark("unowned", 1)];
+    expect(forAccount(previous, ACCT).map((b) => b.id)).toEqual(["unowned"]);
+    expect(toBookmarks([entry("unowned", 1)], previous, ACCT).map((b) => [b.id, b.account])).toEqual([["unowned", ACCT]]);
   });
 });
 
@@ -113,15 +128,15 @@ describe("syncServers", () => {
 
     const phone = await signIn({ handle: "servers.sync", password: "right password" }, s.deps("Firefox on Linux"));
     const onPhone = await syncServers(api, phone, { bookmarks: [bookmark("ts", 20, { kind: "teamspeak", address: "ts.example.com", identity: "uid1" })], removed: {} }, NOW);
-    expect(toBookmarks(onPhone, [])).toEqual([
-      { id: "gwar", name: "Gwar", address: "gwar.app", kind: "vc", updatedAt: T(10), password: "secret" },
-      { id: "ts", name: "ts", address: "ts.example.com", kind: "teamspeak", updatedAt: T(20), identity: "uid1" },
+    expect(toBookmarks(onPhone, [], phone.accountKey)).toEqual([
+      { id: "gwar", name: "Gwar", address: "gwar.app", kind: "vc", updatedAt: T(10), account: phone.accountKey, password: "secret" },
+      { id: "ts", name: "ts", address: "ts.example.com", kind: "teamspeak", updatedAt: T(20), account: phone.accountKey, identity: "uid1" },
     ]);
 
     // The laptop removes the TeamSpeak server; the phone, which still has it, does not bring it back.
-    await syncServers(api, laptop, { bookmarks: toBookmarks(onPhone, []).filter((b) => b.id !== "ts"), removed: { ts: T(30) } }, NOW);
-    const again = await syncServers(api, phone, { bookmarks: toBookmarks(onPhone, []), removed: {} }, NOW);
-    expect(toBookmarks(again, []).map((b) => b.id)).toEqual(["gwar"]);
+    await syncServers(api, laptop, { bookmarks: toBookmarks(onPhone, [], phone.accountKey).filter((b) => b.id !== "ts"), removed: { ts: T(30) } }, NOW);
+    const again = await syncServers(api, phone, { bookmarks: toBookmarks(onPhone, [], phone.accountKey), removed: {} }, NOW);
+    expect(toBookmarks(again, [], phone.accountKey).map((b) => b.id)).toEqual(["gwar"]);
 
     const stored = await serverVault(s.service, laptop);
     expect(stored?.contents).toEqual({
@@ -131,14 +146,15 @@ describe("syncServers", () => {
 
     // Nothing changed: nothing is written.
     const version = stored!.version;
-    await syncServers(api, phone, { bookmarks: toBookmarks(again, []), removed: {} }, NOW);
+    await syncServers(api, phone, { bookmarks: toBookmarks(again, [], phone.accountKey), removed: {} }, NOW);
     expect((await serverVault(s.service, laptop))?.version).toBe(version);
   }, 60_000);
 
-  it("writes nothing for an account without servers", async () => {
+  it("writes nothing for an account without servers, and never another account's servers", async () => {
     const s = setup();
     const { record } = await createAccount({ handle: "servers.none", password: "right password" }, s.deps());
     expect(await syncServers(s.deps().api, record, { bookmarks: [], removed: {} }, NOW)).toEqual([]);
+    expect(await syncServers(s.deps().api, record, { bookmarks: [bookmark("theirs", 1, { account: "someone else", password: "theirs" })], removed: {} }, NOW)).toEqual([]);
     expect(await serverVault(s.service, record)).toBeNull();
   }, 30_000);
 });

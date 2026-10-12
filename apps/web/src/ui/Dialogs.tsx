@@ -172,12 +172,12 @@ function AddServerDialog({ editId }: { editId?: string }) {
         {!desktop && <p className="-mt-1 text-xs text-subtle">{t("connect.tsWebOnly")}</p>}
         <Field label={t("connect.address")} hint={kind === "teamspeak" ? t("connect.tsAddressHint") : t("connect.addressHint")}>
           {(id) => (
-            <Input id={id} value={address} onChange={(e) => setAddress(e.target.value)} placeholder={kind === "teamspeak" ? "ts.example.com" : "voice.example.com"} spellCheck={false} autoCapitalize="none" autoFocus />
+            <Input id={id} value={address} onChange={(e) => setAddress(e.target.value)} placeholder={kind === "teamspeak" ? "ts.example.com" : "voice.example.com"} maxLength={255} spellCheck={false} autoCapitalize="none" autoFocus />
           )}
         </Field>
 
         <Field label={t("addServer.password")} hint={kind === "teamspeak" ? t("addServer.tsPasswordHint") : t("addServer.passwordHint")}>
-          {(id) => <Input id={id} type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="off" />}
+          {(id) => <Input id={id} type="password" value={password} onChange={(e) => setPassword(e.target.value)} maxLength={128} autoComplete="off" />}
         </Field>
         {desktop && kind === "vc" && <div className="flex flex-col gap-2">
           <Switch checked={insecureLan} onCheckedChange={setInsecureLan} label={t("security.insecureLan")} />

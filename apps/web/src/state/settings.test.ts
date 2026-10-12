@@ -64,6 +64,22 @@ it("times only synced changes, remembers removals and forgets them when the serv
     s().saveBookmark({ id: "a", name: "A", address: "a.example.com", kind: "vc" });
     expect(s().removedBookmarks).toEqual({});
     expect(s().bookmarks.map((b) => b.id)).toEqual(["b", "a"]);
+
+    // A synced bookmark from a device whose clock is ahead: edits and removals here still come after it.
+    s().replaceBookmarks([{ id: "c", name: "C", address: "c.example.com", kind: "vc", updatedAt: 9_000, account: "acct" }]);
+    s().saveBookmark({ id: "c", name: "C2", address: "c.example.com", kind: "vc" });
+    expect(s().bookmarks[0]).toMatchObject({ name: "C2", updatedAt: 9_001, account: "acct" });
+    s().removeBookmark("c");
+    expect(s().removedBookmarks).toEqual({ c: 9_002 });
+
+    s().replaceBookmarks([
+      { id: "d", name: "D", address: "d.example.com", account: "acct" },
+      { id: "e", name: "E", address: "e.example.com", account: "other" },
+      { id: "f", name: "F", address: "f.example.com" },
+    ]);
+    s().dropAccountBookmarks("acct");
+    expect(s().bookmarks.map((b) => b.id)).toEqual(["e", "f"]);
+    expect(s().removedBookmarks).toEqual({});
   } finally {
     vi.useRealTimers();
   }

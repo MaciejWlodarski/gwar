@@ -6,6 +6,10 @@
  * for {@link TOMBSTONE_MS}, so a device that still has it does not bring it back.
  * Merging keeps, per id, the newer of the two sides. The desktop's plaintext LAN
  * opt-in is a decision about one device's network and is never synced.
+ *
+ * A bookmark belongs to the account it synced with (`Bookmark.account`); one saved
+ * without an account joins the next account that syncs. Another account's bookmarks
+ * are never merged into this one's vault.
  */
 import type { ConnectRecord } from "../net/identity";
 import { BOOKMARK_TOMBSTONE_MS, type Bookmark, type ServerKind } from "../state/settings";
@@ -37,6 +41,11 @@ export interface VaultServer {
 export interface LocalServers {
   bookmarks: Bookmark[];
   removed: Record<string, number>;
+}
+
+/** The bookmarks this account may sync: its own and those saved without an account. */
+export function forAccount(bookmarks: Bookmark[], account: string): Bookmark[] {
+  return bookmarks.filter((b) => b.account === undefined || b.account === account);
 }
 
 const text = (v: unknown, max: number): string | undefined => (typeof v === "string" && v.length <= max ? v : undefined);
@@ -139,34 +148,42 @@ export function withServers(contents: VaultContents, entries: VaultServer[]): Va
 }
 
 /**
- * Bookmarks for the merged list, then this device's bookmarks that cannot be synced.
- * Local-only settings (the LAN opt-in) stay with a server whose address did not change.
+ * The account's bookmarks for the merged list, then this device's bookmarks that cannot be synced;
+ * other accounts' bookmarks are left out. A bookmark that cannot be synced keeps its place over the
+ * vault's older version. Local-only settings (the LAN opt-in) stay with a server whose address did not change.
  */
-export function toBookmarks(entries: VaultServer[], previous: Bookmark[]): Bookmark[] {
-  const before = new Map(previous.map((b) => [b.id, b]));
+export function toBookmarks(entries: VaultServer[], previous: Bookmark[], account: string): Bookmark[] {
+  const mine = forAccount(previous, account);
+  const before = new Map(mine.map((b) => [b.id, b]));
+  const localOnly = new Map(mine.filter((b) => !syncable(b)).map((b) => [b.id, b]));
   const synced = entries
     .filter((e) => !e.deleted)
     .map((e) => {
+      const kept = localOnly.get(e.id);
+      if (kept) {
+        localOnly.delete(e.id);
+        return kept;
+      }
       const old = before.get(e.id);
-      const b: Bookmark = { id: e.id, name: e.name, address: e.address, kind: e.kind, updatedAt: e.updated_at };
+      const b: Bookmark = { id: e.id, name: e.name, address: e.address, kind: e.kind, updatedAt: e.updated_at, account };
       if (e.password) b.password = e.password;
       if (e.identity) b.identity = e.identity;
       if (old?.insecureLan && e.kind === "vc" && old.address.trim() === e.address) b.insecureLan = true;
       return b;
     });
-  const ids = new Set(synced.map((b) => b.id));
-  return [...synced, ...previous.filter((b) => !syncable(b) && !ids.has(b.id))];
+  return [...synced, ...localOnly.values()];
 }
 
 /**
- * Merges this device's list into the vault and returns the result. Writes only when something changed,
- * and a concurrent write by another device is merged again (see `updateVault`).
+ * Merges this device's list (only what {@link forAccount} allows) into the vault and returns the result.
+ * Writes only when something changed, and a concurrent write by another device is merged again (see `updateVault`).
  */
 export async function syncServers(api: ConnectApi, record: ConnectRecord, local: LocalServers, now: number = Date.now()): Promise<VaultServer[]> {
+  const own = { ...local, bookmarks: forAccount(local.bookmarks, record.accountKey) };
   let merged: VaultServer[] = [];
   await updateVault(api, record, (contents) => {
     const vault = vaultServers(contents);
-    merged = mergeServers(vault, local, now);
+    merged = mergeServers(vault, own, now);
     return JSON.stringify(merged.map(stored)) === JSON.stringify(vault.map(stored)) ? contents : withServers(contents, merged);
   });
   return merged;
