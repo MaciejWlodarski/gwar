@@ -6,9 +6,9 @@ TeamSpeak in the same conversation. It is built to stay trustworthy even when
 the server you join is not: your identity is a key only you hold, and Gwar
 clients sign what you write (see [Security](#security)).
 
-**Use it:** the web app at <https://gwar.app>, the only official one,
-connects to any Gwar server; so does the desktop app. The project runs a public server that
-anyone can use for free: type `gwar.app` in Gwar or in a TeamSpeak client.
+**Use it:** the official web app at <https://gwar.app> and the desktop app
+connect to any Gwar server. The project also runs a public server that anyone
+can use for free: type `gwar.app` in Gwar or in a TeamSpeak client.
 
 *Gwar* is Polish for the buzz of many voices talking at once.
 
@@ -29,9 +29,10 @@ use.
 - **Always on, like Discord.** You stay connected to a server without being in
   voice: read and write any channel's chat, see who is in which voice channel,
   join voice when you want to talk. Unread counts follow you across devices.
-- **Channels and chat.** Nested channels, passwords, user limits, persistent
-  channel history, private and server-wide messages, a member list with online
-  and offline users.
+- **Channels and chat.** Nested channels, passwords, user limits, channel
+  history kept on the server (the latest 1,000 messages per channel), live
+  private and server-wide messages, a member list with online and offline
+  users.
 - **Chat like you expect.** Mentions with notifications, editing and deleting,
   images, video, audio and files (drag and drop or paste).
 - **Your identity is a key, not an account.** Every client holds an Ed25519
@@ -69,9 +70,10 @@ edges and breaking changes.
 Gwar starts from the assumption that everything is public: the code, the
 protocol, and possibly a modified server you join by mistake. Nothing depends
 on hidden behavior; security comes only from keys that never leave their owner.
-A server is trusted to route voice and deliver messages, but never with who you
-are or what you said: even a hostile server cannot log in as you elsewhere,
-forge your messages or show a fake verified name without a visible warning.
+A server is trusted to route voice and deliver messages, and today it can read
+them, but it is never trusted with who you are: even a hostile server cannot
+log in as you elsewhere, forge your messages or show a fake verified name
+without a visible warning.
 The limits are listed plainly [at the end](#what-gwar-does-not-protect-yet).
 
 ### Your identity is a key
@@ -167,11 +169,10 @@ The limits are listed plainly [at the end](#what-gwar-does-not-protect-yet).
 Being honest about the limits is part of the design:
 
 - **The server you are on can read its content**: messages, direct messages,
-  files and voice. Voice goes through the server (an SFU) and is not
-  end-to-end encrypted. For private conversations, use a server you trust, or
-  run your own.
-- **Direct messages are not end-to-end encrypted yet**; per-device end-to-end
-  encryption is on the roadmap.
+  files and voice. Nothing is end-to-end encrypted yet; voice goes through the
+  server (an SFU). For private conversations, use a server you trust, or run
+  your own. End-to-end encryption is designed in [docs/e2e.md](docs/e2e.md)
+  and not built yet.
 - Voice is not signed, and presence, nicknames, channel names and roles are the
   server's word. A server can also hide, delay or reorder messages.
 - **File links are like keys** by default: anyone holding a file's link can
@@ -261,12 +262,13 @@ Prebuilt apps are on the [GitHub Releases page](https://github.com/MaciejWlodars
   continue with "Run a server" below, using `./vc-server` instead of
   `./target/release/vc-server`.
 
-`SHA256SUMS` on each release lists the checksum of every file, and
+`SHA256SUMS` on each release lists the checksum of every built file, and
 `SHA256SUMS.minisig` signs it with the release key in
-[docs/release-key.pub](docs/release-key.pub). Every file also has a GitHub
-build attestation naming the workflow and commit that built it. How to check a
-download: [docs/releasing.md](docs/releasing.md#verify-a-download), which also
-describes how a release is made.
+[docs/release-key.pub](docs/release-key.pub). The built files and
+`SHA256SUMS` also have a GitHub build attestation naming the workflow and
+commit that built them. How to check a download:
+[docs/releasing.md](docs/releasing.md#verify-a-download), which also describes
+how a release is made.
 
 ## Run a server
 
@@ -285,7 +287,14 @@ listens for HTTPS on 443 and redirects plain HTTP from port 80. Open
 **TCP 443** (and 80 for the redirect) and **UDP 9987** for voice. Already have a
 certificate or a reverse proxy? Use `--tls-cert`/`--tls-key`, or plain HTTP on
 `--http` behind your proxy. `--public-ip` sets the address announced for voice
-when the server is behind NAT; `vc-server --help` lists every option.
+when the server is behind NAT.
+
+Other useful options: `--max-clients` (128 by default), `--server-password`,
+`--ice-servers` (a JSON file of TURN servers for clients behind strict
+firewalls), and upload limits `--upload-limit-mb` (25 MiB per file),
+`--upload-quota-mb` (1 GiB per member) and `--storage-limit-mb` (10 GiB in
+total). The server options also have `VC_…` environment variables;
+`vc-server --help` lists them all.
 
 On first start the server prints a one-time **admin token**; open the web app,
 connect to `voice.example.com` and redeem it from the server menu ("Use
@@ -339,9 +348,9 @@ believed only from loopback, so name one the proxy always overwrites.
 On first start the server creates `server-key.ed25519` in its data directory
 (an Ed25519 seed, mode 0600 on Unix). It is the server's identity: clients pin
 it, and invite links and the server menu's **Server key** show its
-fingerprint (`vc-server --data-dir data server-key` prints it). **Back it up
-with the database and never share it**; with a new key clients see a new server
-and have to confirm the change with you.
+fingerprint, the full public key (`vc-server --data-dir data server-key`
+prints it). **Back it up with the database and never share it**; with a new
+key clients see a new server and have to confirm the change with you.
 
 Back up the database while the server runs with
 `vc-server --data-dir data backup copy.sqlite3`.
@@ -377,15 +386,17 @@ vc-server --data-dir data members merge [--dry-run] -- <from-uid> <into-uid>
 - `prune` keeps members with a role besides Member unless `--include-grouped`
   is given.
 - `merge` moves one identity's unsigned messages (and the mentions in them),
-  uploads, roles, read marks and UID bans to an existing member, in one
-  transaction, keeping the target's nickname. Signed messages keep their
-  original author and mentions, because the signature binds them; the counts it
-  reports cover only unsigned messages and mentions.
+  uploads, roles, read marks, UID bans and the invites and tokens it
+  created to an existing member, in one transaction, keeping the target's
+  nickname. Signed messages keep their original author and mentions, because
+  the signature binds them, so its message and mention counts cover only
+  unsigned ones.
 - Put UIDs beginning with `-` after `--`, as in the examples above.
 
 ## Develop
 
-Requirements: Rust (stable), Node 22+, pnpm, and libopus for the native clients
+Requirements: Rust (stable), Node 22+, pnpm (the version pinned in
+`package.json`), and libopus for the native clients
 (`brew install opus` or `apt install libopus-dev libasound2-dev`).
 
 ```bash
@@ -421,7 +432,7 @@ and bridges it:
 - a Gwar user who shares a channel with TeamSpeak users (or chats with one
   privately) gets a stand-in client on TeamSpeak, so TeamSpeak users see, hear
   and message them; everyone else is listed in the channel description. Voice
-  crosses the bridge as Opus with about a millisecond of overhead.
+  crosses the bridge as Opus, without being decoded or re-encoded.
 
 TeamSpeak clients connect to `your-host:9987` (UDP); Gwar's WebRTC voice then
 moves to 9988, so open both ports, and TCP 30033 for TeamSpeak file transfer
@@ -434,16 +445,17 @@ run per machine.
 license, which you accept when enabling this option; Gwar does not ship it.
 Its free license allows 32 slots (TeamSpeak users plus Gwar stand-ins) and is
 for **non-commercial use only**; commercial operators need a license from
-TeamSpeak. Gwar itself has no slot limits. Gwar is not affiliated with
-TeamSpeak. TeamSpeak support is a cargo feature (`teamspeak`, on by default);
-build without it with `--no-default-features`.
+TeamSpeak. Gwar's own limit is `--max-clients`, independent of TeamSpeak's
+slots. Gwar is not affiliated with TeamSpeak. TeamSpeak support is a cargo
+feature (`teamspeak`, on by default); build without it with
+`--no-default-features`.
 
 ## Project layout
 
 | Path | What it is |
 | --- | --- |
 | `crates/vc-server` | Server: core (state, permissions, SQLite), WebSocket gateway, WebRTC SFU, TeamSpeak bridge |
-| `crates/vc-proto` | The `vc/1` protocol (Rust types, generated TypeScript types) |
+| `crates/vc-proto` | The `vc/3` protocol (Rust types, generated TypeScript types) |
 | `crates/vc-client` | Native client: protocol, voice engine, TeamSpeak mode |
 | `crates/gwar-connect` | Gwar Connect, the optional account service |
 | `apps/web` | The shared UI (React): the hosted web app and the desktop app's UI |
@@ -451,28 +463,36 @@ build without it with `--no-default-features`.
 | `scripts/deploy-vm.sh` | Deploys the server and Connect to a Linux host over SSH |
 
 More in [docs/architecture.md](docs/architecture.md), [docs/connect.md](docs/connect.md),
-[docs/security.md](docs/security.md) and [docs/deploy.md](docs/deploy.md).
+[docs/security.md](docs/security.md), [docs/deploy.md](docs/deploy.md),
+[docs/releasing.md](docs/releasing.md) and, for what comes next,
+[docs/e2e.md](docs/e2e.md).
 
 ## Tests
 
 ```bash
 cargo test --workspace          # includes end-to-end WebRTC voice tests
 pnpm --filter web test          # UI unit tests
-pnpm --filter web e2e           # Playwright: two browsers against a real server
+pnpm --filter web e2e           # Playwright: two users against a local server and Connect
 VC_TS3_DIR=/tmp/ts3 cargo test -p vc-client --test teamspeak_mode --test teamspeak_interop -- --test-threads=1
                                 # against the real TeamSpeak server (downloaded into VC_TS3_DIR)
 ```
 
 ## Roadmap
 
+- **Steadier connections and even lower latency**, the next focus: voice
+  should feel at least as immediate as on TeamSpeak.
+- **End-to-end encryption**: channel chat, direct messages, server-wide chat
+  and their files with MLS, voice with SFrame. Encrypted direct messages and
+  server-wide chat are stored as ciphertext, so they reach you after you were
+  offline. Encryption is chosen when a channel is created, with or without
+  history for new members, and your history follows you to your devices
+  through Gwar Connect. Channels shared with TeamSpeak users stay unencrypted
+  and are labeled as such. Design: [docs/e2e.md](docs/e2e.md); prototypes
+  are in progress.
 - **Mobile app** (iOS and Android).
 - **Streaming**: screen sharing and video, peer to peer and through the server.
 - **Better audio on desktop**: noise suppression and echo cancellation.
 - **Fully native clients** later, keeping the same protocol.
-- **End-to-end encryption** with MLS: direct messages first, then channels
-  (chosen when a channel is created, with or without history for new
-  members), files and voice (SFrame). Channels that TeamSpeak users share stay
-  unencrypted and are marked as such. Design: [docs/e2e.md](docs/e2e.md).
 - **More TeamSpeak options**: bring your own TeamSpeak license for more slots,
   and a mixed stand-in so Gwar users can still talk when the free slots run out.
 
