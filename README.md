@@ -479,8 +479,19 @@ VC_TS3_DIR=/tmp/ts3 cargo test -p vc-client --test teamspeak_mode --test teamspe
 
 ## Roadmap
 
-- **Steadier connections and even lower latency**, the next focus: voice
-  should feel at least as immediate as on TeamSpeak.
+- **Steadier connections and even lower latency**, the next focus. The goal
+  is lower mouth-to-ear latency than TeamSpeak on the same network, measured
+  on both. The default becomes a balanced low-latency mode: 10 ms Opus
+  frames that keep its speech codec and loss recovery, a jitter buffer that
+  starts at one frame and grows only when the network needs it, and a
+  smaller playout buffer. Each step is measured for latency and for audio
+  lost on lossy links, so lower latency never costs choppy voice. An extreme
+  mode for very good connections may follow as an option.
+- **Clean audio**: noise suppression and echo cancellation, applied on your
+  device before encoding (so they also work with end-to-end encryption). On
+  the desktop RNNoise by default, which adds almost no latency, with
+  DeepFilterNet as a higher-quality option for loud surroundings; the web
+  app starts with the browser's own suppression.
 - **End-to-end encryption**: channel chat, direct messages, server-wide chat
   and their files with MLS, voice with SFrame. Encrypted direct messages and
   server-wide chat are stored as ciphertext, so they reach you after you were
@@ -491,7 +502,6 @@ VC_TS3_DIR=/tmp/ts3 cargo test -p vc-client --test teamspeak_mode --test teamspe
   are in progress.
 - **Mobile app** (iOS and Android).
 - **Streaming**: screen sharing and video, peer to peer and through the server.
-- **Better audio on desktop**: noise suppression and echo cancellation.
 - **Fully native clients** later, keeping the same protocol.
 - **More TeamSpeak options**: bring your own TeamSpeak license for more slots,
   and a mixed stand-in so Gwar users can still talk when the free slots run out.
