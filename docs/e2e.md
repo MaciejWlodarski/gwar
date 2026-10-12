@@ -243,13 +243,16 @@ with signed statements that newcomers can check without any history:
   without a pin or an invite is trust-on-first-use: a dishonest server could
   nominate its own owner to a fresh client, exactly as it could present its
   own key.
-- **Ownership moves** only by a chain of statements, each signed by a device
-  of the previous owner and naming the hash of the previous link:
+- **Ownership moves** only by a chain of statements, each signed by the
+  previous owner's **account key** (a local identity's own key) and naming
+  the hash of the previous link:
   `gwar owner v1\n{server_key}\n{seq}\n{previous_link_hash}\n{previous_owner_uid}\n{new_owner_uid}\n{signed_at}`.
-  The server serves the chain; a client accepts a chain only if it extends
-  the head it pinned. If the owner's keys are lost for good there is no link,
-  and a new owner shows the same neutral notice as a changed handle, which
-  the user can accept.
+  Moving ownership asks for the password, as revoking a device does, so a
+  lost or revoked device cannot sign a link, and a link is checked by its
+  signature alone. The server serves the chain; a client accepts a chain
+  only if it extends the head it pinned. If the owner's account is lost for
+  good (password and recovery code) there is no link, and a new owner shows
+  the same neutral notice as a changed handle, which the user can accept.
 - The **managers** of the server's private channels are a list signed by a
   device of the current owner:
   `gwar managers v1\n{server_key}\n{seq}\n{owner_uid}\n{manager uids}\n{signed_at}`.
@@ -273,17 +276,22 @@ with signed statements that newcomers can check without any history:
   dishonest server cannot invent a list; it can only show an older one the
   newcomer has not seen superseded, the same first-contact limit as under
   "Freshness".
-- **Who signed, and when.** These statements are checked like messages: the
-  signature and the certificate chain to the right uid. A statement counts as
-  **current** only if its signer's certificate is current and not revoked;
-  otherwise it is history, valid only where the client accepted it earlier
-  or a later current statement follows it. Owner chain links are history
-  once a later link exists. So that a current statement always exists, the
-  owner's and managers' clients re-sign the manager list and member lists at
-  least every 60 days; if no owner or manager has been active for 90 days,
-  newcomers cannot join that private channel until one returns. The
-  descriptor's own signature is history: its authority for newcomers comes
-  from the current access list.
+- **Who signed, and when.** The manager list and member lists are checked
+  like messages: the signature and the certificate chain to the right uid.
+  Each is a full list, so only the newest one grants authority, and only
+  while it is **current**: its signer's certificate is current and not
+  revoked. A client moves a checkpoint only to a list that is current when
+  it first sees it; a newer list from a since-revoked or expired device is
+  ignored, and the next current list supersedes it. Members keep the last
+  list they accepted; newcomers need a current one. Older lists matter only
+  for replaying past epochs, which never grants current authority: sending
+  and history sharing follow the current tree and the current lists. So
+  that a current list always exists, the owner's and managers' clients
+  re-sign the manager list and member lists at least every 60 days and
+  before their certificates expire; if no owner or manager has been active
+  for 90 days, newcomers cannot join that private channel until one
+  returns. The descriptor's own signature is history: its authority for
+  newcomers comes from the current access list.
 - The owner and the managers are always allowed readers, as admins see every
   channel on Discord.
 
@@ -389,13 +397,18 @@ Connect, next to the vault (which is capped at 64 KiB and stays as it is):
 - A generation is created by a device of the account with a current
   certificate, as a **manifest** signed by its device key: account key,
   generation, hash of the previous manifest, recipients, recovery key
-  version, and the generation key sealed (HPKE) to each recipient and to the
+  version, the account's signed revocations (`gwar revoke v1`) its creator
+  knows, and the generation key sealed (HPKE) to each recipient and to the
   recovery key. Connect accepts only the first manifest for each generation
   number. Devices checkpoint `(generation, manifest hash)` and reject a
-  different manifest for a number they saw.
+  different manifest for a number they saw, and learn every revocation a
+  manifest carries.
 - **Uploading** uses the newest generation that is **safe** by what the
-  device knows: its creator and every recipient are current, unrevoked
-  devices of the account, and it is sealed to the current recovery key.
+  device knows: it carries every revocation of the account the device
+  knows, its creator and every recipient are current, unrevoked devices of
+  the account, and it is sealed to the current recovery key. A generation
+  made before a revocation is therefore unsafe even if a key transfer the
+  device never saw reached the revoked device.
   Otherwise the device queues uploads and creates the next generation
   itself (a fresh key); if Connect already holds an unsafe manifest for that
   number, it takes the next free number. It never falls back to an unsafe or
@@ -408,7 +421,8 @@ Connect, next to the vault (which is capped at 64 KiB and stays as it is):
   a **key transfer**, signed by a current device of the account: account
   key, manifest hash and generation, the recipient (device key and X25519
   key, or recovery key version), and the HPKE encapsulation and ciphertext.
-  Manifests never change. An existing device sends transfers for every
+  The sender first learns the manifest's revocations and never transfers to
+  a device revoked by them or by its own feed. Manifests never change. An existing device sends transfers for every
   generation it can open when it sees a new device's certificate; until one
   is online, the new device reads nothing from the archive.
 - **Changing the recovery code** (which needs the password and a signed-in
@@ -624,6 +638,26 @@ p95/p99.
 | S4 SFU and latency | Timestamp-based forwarding, speech gate, end-to-end cost. | Talking indicators and slots unchanged; mouth-to-ear p95 within 2 ms of plaintext on the VM; correct timing with packet loss, reordering, duplicates, timestamp wrap and resets, silence, mute, burst delivery and resumed speech. |
 | S5 Churn | Joins, removals, restarts, overlapping transitions, lost, fabricated or duplicate acknowledgements, withheld commits, repeated key installation, leaf reuse, epoch wrap, silent senders across epochs, more than eight epochs in a row, a call ending and a new one starting with returning devices, stale `voice_set_keys` calls. | Zero nonce reuse; a removed participant decrypts nothing after the removal commit is processed; no plaintext fallback; audio resumes after every transition (time to usable audio measured). |
 | S6 TeamSpeak isolation | With the official TS3 server: moves, whispers, puppets in their grace period, query listeners, restarts. | Zero bytes of an encrypted channel's audio or text reach TeamSpeak, and no TeamSpeak audio, whisper or text enters an encrypted conversation; plaintext channels keep working both ways. |
+
+## Left for the implementation spec
+
+The direction above is settled; these are pinned down before building:
+
+- canonical encodings and hash inputs of every signed statement, the owner
+  chain's genesis, sequence numbers when devices sign concurrently, and
+  atomic checkpoint storage;
+- restart validation, including member lists bound to the successor's
+  `group_id`;
+- crash-safe ordering of a recovery code change (credentials, recovery key,
+  transfers, new generation), manifest predecessors across skipped numbers,
+  and domain-separated recovery key derivation and HPKE context;
+- what a device keeps as evidence of past membership, and imported versus
+  locally derived keys when they disagree;
+- voice key installation that is idempotent and keeps counters and replay
+  windows, with retirement after authentication;
+- per-SSRC RTP state from the transport (today's `AudioPacket` drops it),
+  native playback of frames other than 20 ms, and bridge queues that keep
+  each packet's originating channel across moves.
 
 ## Open questions
 
