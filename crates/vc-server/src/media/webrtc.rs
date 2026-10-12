@@ -226,7 +226,9 @@ pub async fn run(
                     deliver_local(&mut peers, &routing.load(), &packet, Instant::now());
                 }
                 Some(MediaCmd::ForwardTo(to, packet)) => {
-                    if let Some(peer) = peers.get_mut(&to) {
+                    if routing.load().can_whisper(packet.from, to)
+                        && let Some(peer) = peers.get_mut(&to)
+                    {
                         peer.forward(&packet, Instant::now());
                     }
                 }
