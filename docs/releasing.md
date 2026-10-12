@@ -37,7 +37,8 @@ GitHub release. Nothing is public until you publish the draft by hand.
    `.github/workflows/release.yml` there. Then approve it, and it adds
    `SHA256SUMS.minisig` to the draft. Approve before publishing; it refuses to
    change a published release.
-6. Open the draft under Releases. Edit the generated notes, optionally
+6. Once the sign job has finished and `SHA256SUMS.minisig` is on the draft,
+   open the draft under Releases. Edit the generated notes, optionally
    download and try a few assets, then press **Publish release**.
 
 Tags must look like `v1.2.3` (no `-rc1` suffixes: the Windows MSI format does
