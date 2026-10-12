@@ -79,7 +79,7 @@ post-quantum suites (MLS can add them later); push notifications.
   2.0 authenticates metadata before the header, the reverse of RFC 9605,
   which only differs when metadata is present. Clients reject non-empty
   metadata, and a test keeps the RFC vector that fails today until it is
-  fixed upstream.
+  fixed upstream ([sframe-rs#124](https://github.com/TobTheRock/sframe-rs/issues/124)).
 
 All new statements follow the existing rules: UTF-8, `\n` separators, no
 trailing newline, canonical unpadded base64url for binary fields, decimal
@@ -712,8 +712,8 @@ p95/p99.
 ### Results
 
 Measured in October 2026 on an Apple M5 laptop (macOS 27) with Chrome 155,
-Firefox 155–157 and WebKit 26–27 through Playwright. WebKit stands in for
-Safari; real Safari was not run. Times are median / p95 / p99.
+Firefox 155–157 and WebKit 26–27 through Playwright, and S1–S3 again in
+Safari 27 through WebDriver. Times are median / p95 / p99.
 
 - **S1: passed with OpenMLS except for size**, which the choice above
   accepts. Every operation worked in all three browsers, 20 runs each,
@@ -722,33 +722,42 @@ Safari; real Safari was not run. Times are median / p95 / p99.
   100-device group took 9.4 / 10.1 / 10.5 ms in Chrome and at most 12 ms p95
   in Firefox and WebKit; a whole local round with the IndexedDB write took
   19–30 ms median. State survived reloads and nine forced browser kills per
-  browser between creating and merging a commit. Gzip size 447 KB (mls-rs:
-  267 KB, every gate passed).
+  browser between creating and merging a commit. In Safari 27 the
+  operations, the expired-certificate catch-up and a reload passed too
+  (commit 11 / 11 / 11 ms, local round 22 ms median); forced kills were not
+  repeated there, so as not to close the owner's own Safari. Gzip size
+  447 KB (mls-rs: 267 KB, every gate passed).
 - **S2: the functional checks passed; the latency gate is only partly
   measured.** Eight senders decrypted correctly through the real SFU, also
   while moving between slots; injected plaintext, tampered, replayed and
   unknown-key frames silenced only their sender, and a sender without keys
-  sent nothing. From receiving a frame to handing it on decrypted, p99:
-  Chrome 0.10 ms (also in a hidden tab), Firefox 0.56 ms (0.82 ms with the
-  window covered); WebKit gives no receive time, and its decryption itself
-  took 0.10 ms. The Firefox and WebKit figures come from a rerun on an idle
-  machine. During parallel builds Firefox reached 62 ms p99 with a
-  covered window, so behaviour under CPU load belongs to the latency work.
-  Not measured: the queues before the sender transform and after the
-  receiver's, which browsers do not expose, and hidden Firefox and WebKit
-  tabs under normal background policy.
+  sent nothing. From receiving a frame to handing it on decrypted, p99: Chrome
+  0.10 ms (also in a hidden tab), Firefox 0.56 ms (0.82 ms with the window
+  covered); WebKit and Safari give no receive time, and decryption itself took
+  0.10 ms in WebKit and 0.08 ms in Safari (0.66 ms with its window minimised).
+  The Firefox and WebKit figures come from a rerun on an idle machine. Safari
+  also passed every functional check, as receiver and sender, with Chrome and
+  with the desktop engine. During parallel builds Firefox reached 62 ms p99
+  with a covered window, so behaviour under CPU load belongs to the latency
+  work. Not measured: the queues before the sender transform and after the
+  receiver's, which browsers do not expose, and hidden Firefox and WebKit tabs
+  under normal background policy.
 - **S3: interoperable with empty metadata, not fully RFC-conformant.** 42
-  shared vectors both ways and all
-  RFC header vectors; 200 frames of 1000 bytes with the widest key id and
-  counter crossed the SFU intact in each direction for each browser; larger
-  frames were dropped before encryption. `sframe` 2.0 fails the RFC vector
-  with non-empty metadata (see "Building blocks").
+  shared vectors both ways and all RFC header vectors; 200 frames of 1000
+  bytes with the widest key id and counter crossed the SFU intact in each
+  direction for each browser, Safari included; larger frames were dropped
+  before encryption. `sframe` 2.0 fails the RFC vector with non-empty metadata
+  (see "Building blocks").
 - **S4: passed locally.** Forwarding by sender timestamps added 0.17 ms at
   p95 (400 markers per variant, native clients over loopback, alternating
   runs, without SFrame); talking indicators and slots were unchanged, and
   loss, reordering, duplicates, both wraps, resets, silence, mute and bursts
-  matched expected traces. The rules it added are under "SFU". The VM
-  measurement is still to do.
+  matched expected traces. The rules it added are under "SFU". Through the
+  VM over the internet (about 34 ms round trip) both builds landed between
+  155 and 208 ms per call, a spread set when each call starts (playout
+  buffering) that hides a 2 ms difference; no regression showed, so the
+  loopback figure stands as the forwarding cost, and the spread goes to the
+  latency work.
 - **S5: passed in simulation.** Real OpenMLS groups and `sframe` keys, with
   a modelled network and SFU, ran every scenario of the S5 row 40 times on
   three network profiles: 4,955,406 encryptions without a repeated key and
@@ -804,8 +813,7 @@ The direction above is settled; these are pinned down before building:
 - a review of the WebCrypto SFrame worker code, and of the OpenMLS crypto
   provider and storage integration.
 
-Still to measure before building: real Safari (S1, S2 used WebKit), the SFU
-change on the VM (S4), and S6 with the official TeamSpeak server.
+Still to measure before building: S6 with the official TeamSpeak server.
 
 ## Open questions
 
