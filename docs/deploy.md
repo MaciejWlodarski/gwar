@@ -5,7 +5,7 @@ How the official services run. A self-hosted server needs none of this:
 
 | Address | What | DNS |
 | --- | --- | --- |
-| `gwar.app` | the web app (static), Gwar Connect under `/connect/` and the project's public Gwar server (`/ws`, `/api/files/`, `/files/`) | DNS only |
+| `gwar.app` | the web app (static), Gwar Connect under `/connect/` and the project's public Gwar server (`/health`, `/ws`, `/api/files/`, `/files/`) | DNS only |
 | `www.gwar.app` | redirects to `gwar.app` (nginx, below) | CNAME to `gwar.app` |
 | `voice.gwar.app` | the same Gwar server under its own name; TeamSpeak voice (UDP) and file transfer (TCP 30033) | DNS only: voice is UDP straight to the host |
 | `_ts3._udp.gwar.app` | SRV record to `voice.gwar.app` port 9987, so TeamSpeak clients can type `gwar.app` | — |
@@ -91,6 +91,8 @@ server {
     # The Gwar server's routes; the snippet is the proxy block of voice.gwar.app below.
     # Downloads share the web app's origin safely: only sniffed media is inline, and every
     # file is served with nosniff and `Content-Security-Policy: default-src 'none'; sandbox`.
+    # The web app asks /health whether a Gwar server answers on its own origin.
+    location = /health { include snippets/gwar-server-proxy.conf; }
     location = /ws { include snippets/gwar-server-proxy.conf; }
     location /api/files/ {
         client_max_body_size 30m;
