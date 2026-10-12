@@ -6,7 +6,7 @@ How the official services run. A self-hosted server needs none of this:
 | Address | What | DNS |
 | --- | --- | --- |
 | `gwar.app` | the web app (static) and Gwar Connect under `/connect/` | Cloudflare, DNS only (may be proxied) |
-| `www.gwar.app` | redirects to `gwar.app` | CNAME to `gwar.app` |
+| `www.gwar.app` | redirects to `gwar.app` (nginx, below) | CNAME to `gwar.app` |
 | `voice.gwar.app` | the project's public Gwar server (WebSocket, files, UDP voice, TeamSpeak) | DNS only: voice is UDP straight to the host |
 | `_ts3._udp.gwar.app` | SRV record to `voice.gwar.app` port 9987, so TeamSpeak clients can type `gwar.app` | — |
 
@@ -29,7 +29,7 @@ For user units to keep running without a login session, enable lingering once:
 
 ## nginx
 
-nginx terminates HTTPS (certbot) for both names. The server runs without
+nginx terminates HTTPS (certbot) for these names. The server runs without
 `--tls`; set `--public-url https://voice.gwar.app` to authorize
 `wss://voice.gwar.app/ws`. `--public-ip` advertises UDP media and
 adds no login endpoint behind nginx. Additional externally reachable aliases
@@ -110,6 +110,13 @@ server {
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
     }
+    # listen 443 ssl; ... (managed by certbot)
+}
+
+server {
+    server_name www.gwar.app;
+    include snippets/gwar-security-headers.conf;
+    return 301 https://gwar.app$request_uri;
     # listen 443 ssl; ... (managed by certbot)
 }
 ```
