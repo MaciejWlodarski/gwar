@@ -41,15 +41,26 @@ CONNECT_ARGS=${VC_CONNECT_ARGS:-}
 WEB_DIR=${VC_WEB_DIR:-}
 PUBLISH_WEB=0
 
+# The published app names the commit it was built from (README, "The official web app"), so it must be
+# exactly that commit: no uncommitted or untracked sources, no local .env files, no VITE_* overrides.
+web_tree_clean() {
+  git diff --quiet HEAD -- &&
+    [[ -z "$(git ls-files --others --exclude-standard -- apps crates)" ]] &&
+    [[ -z "$(git ls-files --others --ignored --exclude-standard -- apps/web | grep -E '(^|/)\.env' || true)" ]]
+}
 if [[ "${1:-}" == "--web" ]]; then
-  # The published app names the commit it was built from (README, "The official web app"),
-  # so it must be exactly that commit.
-  if ! git diff --quiet HEAD -- || [[ -n "$(git ls-files --others --exclude-standard -- apps crates)" ]]; then
-    echo "refusing to publish the web app from a tree with uncommitted changes" >&2
+  if ! web_tree_clean; then
+    echo "refusing to publish the web app: uncommitted changes, untracked sources or a local .env file" >&2
     exit 1
   fi
-  pnpm --filter web build
-  printf '{"commit":"%s"}\n' "$(git rev-parse HEAD)" > apps/web/dist/version.json
+  commit=$(git rev-parse HEAD)
+  # shellcheck disable=SC2046
+  env $(env | grep -o '^VITE_[A-Za-z0-9_]*' | sed 's/^/-u /') pnpm --filter web build
+  if [[ "$(git rev-parse HEAD)" != "$commit" ]] || ! web_tree_clean; then
+    echo "refusing to publish the web app: the tree changed during the build" >&2
+    exit 1
+  fi
+  printf '{"commit":"%s"}\n' "$commit" > apps/web/dist/version.json
   PUBLISH_WEB=1
 fi
 
