@@ -262,7 +262,7 @@ Prebuilt apps are on the [GitHub Releases page](https://github.com/MaciejWlodars
   continue with "Run a server" below, using `./vc-server` instead of
   `./target/release/vc-server`.
 
-`SHA256SUMS` on each release lists the checksum of every other file, and
+`SHA256SUMS` on each release lists the checksum of every built file, and
 `SHA256SUMS.minisig` signs it with the release key in
 [docs/release-key.pub](docs/release-key.pub). The built files and
 `SHA256SUMS` also have a GitHub build attestation naming the workflow and
@@ -293,7 +293,7 @@ Other useful options: `--max-clients` (128 by default), `--server-password`,
 `--ice-servers` (a JSON file of TURN servers for clients behind strict
 firewalls), and upload limits `--upload-limit-mb` (25 MiB per file),
 `--upload-quota-mb` (1 GiB per member) and `--storage-limit-mb` (10 GiB in
-total). Every option also has a `VC_…` environment variable;
+total). The server options also have `VC_…` environment variables;
 `vc-server --help` lists them all.
 
 On first start the server prints a one-time **admin token**; open the web app,
@@ -386,11 +386,11 @@ vc-server --data-dir data members merge [--dry-run] -- <from-uid> <into-uid>
 - `prune` keeps members with a role besides Member unless `--include-grouped`
   is given.
 - `merge` moves one identity's unsigned messages (and the mentions in them),
-  uploads, roles, read marks, UID bans and the invites and admin tokens it
+  uploads, roles, read marks, UID bans and the invites and tokens it
   created to an existing member, in one transaction, keeping the target's
   nickname. Signed messages keep their original author and mentions, because
-  the signature binds them; the counts it reports cover only unsigned
-  messages and mentions.
+  the signature binds them, so its message and mention counts cover only
+  unsigned ones.
 - Put UIDs beginning with `-` after `--`, as in the examples above.
 
 ## Develop
