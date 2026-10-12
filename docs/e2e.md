@@ -2,7 +2,7 @@
 
 Status: **design** (phase 2). Nothing in this document is implemented. It
 records what was agreed, how it fits the existing identities, protocol and
-server, and which spikes must pass before building it. [security.md](security.md)
+server, and what the spikes measured (see "Spikes"). [security.md](security.md)
 describes what is implemented today.
 
 ## Goals
@@ -56,18 +56,24 @@ post-quantum suites (MLS can add them later); push notifications.
 
 - **MLS library: OpenMLS** (Rust, 0.9), compiled to WebAssembly for the web
   app. The desktop app runs the same web interface, so one MLS implementation
-  serves both; the native voice engine only receives media keys. OpenMLS
-  supports external commits, external senders and the mandatory suite. Its
-  WebAssembly target is built without tests upstream, and external commits are
-  reported to panic there (`SystemTime::now`, openmls#1983), so spike S1
-  decides; the fallbacks are mls-rs (WebAssembly builds) and ts-mls
-  (TypeScript, not audited).
+  serves both; the native voice engine only receives media keys. Spike S1
+  ran every operation this design needs in Chrome, Firefox and WebKit; the
+  crate's `js` feature avoids the external-commit panic of openmls#1983.
+  mls-rs passed too and is smaller (267 KB against 447 KB gzip), but OpenMLS
+  is chosen: it had an independent security audit (SRLabs, 2025–2026; the
+  crypto and storage providers were outside its scope) and ships in browsers
+  at Wire and XMTP, while mls-rs has not been audited. The module is loaded
+  on first use, not with the page, and its size budget is 450 KB gzip.
 - **Ciphersuite** `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (0x0001):
   Ed25519 matches every Gwar key.
 - **SFrame**: browsers through `RTCRtpScriptTransform` (Chrome/Edge 141+,
-  Firefox 117+, Safari 15.4+); the desktop's native engine through the Rust
-  `sframe` crate (2.0). Both use the RFC 9605 wire format, so they
-  interoperate.
+  Firefox 117+, Safari 15.4+) with a small RFC 9605 implementation on
+  WebCrypto in the worker, which gets its own review before release; the
+  desktop's native engine through the Rust `sframe` crate (2.0). They
+  interoperate (S3). SFrame application metadata is always empty: `sframe`
+  2.0 authenticates metadata before the header, the reverse of RFC 9605,
+  which only differs when metadata is present; a test pins this until it is
+  fixed upstream.
 
 All new statements follow the existing rules: UTF-8, `\n` separators, no
 trailing newline, canonical unpadded base64url for binary fields, decimal
@@ -84,8 +90,8 @@ groups leaves by uid.
 - The **leaf signature key is the device key itself**. MLS signs with its own
   labels (`MLS 1.0 …`), which no Gwar statement starts with. The key is
   stored as a JWK today and only imported as non-extractable for WebCrypto,
-  so the MLS library can sign with it; spike S1 confirms this. Should it
-  fail, a separate MLS key bound by a device-key signature is the fallback.
+  so the MLS library signs with its seed; spike S1 confirmed this, and no
+  separate MLS key is needed.
 - The credential is a `BasicCredential` whose identity is the canonical
   encoding of the device certificate (Connect accounts) or `-` and the key
   (local identities).
@@ -523,21 +529,31 @@ Local identities have one device and no archive.
 
 ### SFU
 
-- It forwards the encrypted payload unchanged.
+- It forwards the encrypted payload unchanged, as opaque bytes: str0m runs in
+  RTP mode, which gives the SFU each packet's SSRC, extended sequence number,
+  timestamp and header extensions without depacketizing Opus (S4).
+- **Streams**: each call and each engine run sends on a fresh SSRC. The
+  server binds an SSRC to the call when it is negotiated and drops packets of
+  SSRCs it has retired (bounded per microphone, refusing new ones past the
+  limit), so a frame delayed from an earlier call or run never enters another
+  one, and a sequence number only restarts with a new SSRC.
 - **Timing**: today a slot's RTP time advances by the previous packet's
   duration, read from the Opus header, which is now encrypted. Instead:
   - senders stamp each packet with the capture position of its first sample
     (48 kHz), which also advances over frames not sent (silence, mute,
     push-to-talk, dropped frames). Browsers do this already; the native
-    engine must carry the capture position with each frame instead of using
-    wall-clock time;
+    engine counts positions where audio is captured, carries them with each
+    frame instead of using wall-clock time, and discards a partial frame
+    across a gap in capture;
   - per sender stream (SSRC), the SFU orders packets by extended RTP
     sequence number: duplicates and packets older than the last forwarded
     are dropped. A new SSRC starts a new baseline;
   - for a newer packet from the same speaker on a slot, the forwarded time
     advances by the sender's timestamp difference (modulo 2^32) and the
     packet goes out at once. A difference that is negative or over five
-    seconds despite a newer sequence number is a source reset;
+    seconds despite a newer sequence number is a source reset; a difference
+    of zero (one frame per packet, so a sender fault) drops the packet and is
+    counted;
   - on a speaker change or a source reset, the forwarded time advances by
     the elapsed wall-clock time rounded up to whole 20 ms frames, at least
     one.
@@ -545,7 +561,7 @@ Local identities have one device and no archive.
   the native engine always uses 20 ms). The sender checks each frame's Opus
   duration before encrypting and counts other durations; they are still
   sent, because timing rests on the sender's timestamps and only the
-  speaker-change estimate assumes 20 ms. S2 verifies that browsers keep 20 ms.
+  speaker-change estimate assumes 20 ms. In S2 all three browsers kept 20 ms.
 - **Speech gate**: unchanged, from the RFC 6464 audio level header extension,
   which stays in the clear. Who talks, and when, remains visible to the
   server, as it is today. Rewritten RTP headers are not part of SFrame's
@@ -564,7 +580,17 @@ Local identities have one device and no archive.
   audio and text enter and leave it, not only by channel permissions: the SFU
   feeds no puppet audio from an encrypted channel (also during a puppet's
   grace period or a refused move), whispers from TeamSpeak cannot target
-  encrypted voice, and no channel text crosses in either direction.
+  encrypted voice, and no channel text crosses in either direction. Each
+  audio packet and each queued text keeps the channel it came from, and
+  whether that channel is encrypted, from the moment it enters the server;
+  every later boundary (the SFU's puppet feed, the puppet socket, delivery
+  queues, query and listener routes) checks it again, so a move never
+  changes where a queued packet may go. All writes to TeamSpeak go through
+  these checks.
+- An encrypted channel's description on TeamSpeak is a fixed notice, never
+  its participant list.
+- Direct messages and server chat are classified by their own conversation,
+  never by the voice channel the sender is in.
 - Direct messages with TeamSpeak users stay plaintext and labeled; a
   puppet kept for them carries text only, never audio from an encrypted
   channel.
@@ -640,6 +666,49 @@ p95/p99.
 | S5 Churn | Joins, removals, restarts, overlapping transitions, lost, fabricated or duplicate acknowledgements, withheld commits, repeated key installation, leaf reuse, epoch wrap, silent senders across epochs, more than eight epochs in a row, a call ending and a new one starting with returning devices, stale `voice_set_keys` calls. | Zero nonce reuse; a removed participant decrypts nothing after the removal commit is processed; no plaintext fallback; audio resumes after every transition (time to usable audio measured). |
 | S6 TeamSpeak isolation | With the official TS3 server: moves, whispers, puppets in their grace period, query listeners, restarts. | Zero bytes of an encrypted channel's audio or text reach TeamSpeak, and no TeamSpeak audio, whisper or text enters an encrypted conversation; plaintext channels keep working both ways. |
 
+### Results
+
+Measured in October 2026 on an Apple M5 laptop (macOS 27) with Chrome 155,
+Firefox 155–157 and WebKit 26–27 through Playwright. WebKit stands in for
+Safari; real Safari was not run. Times are median / p95 / p99.
+
+- **S1: passed with OpenMLS except for size**, which the choice above
+  accepts. Every operation worked in all three browsers, 20 runs each,
+  including signing with the existing device key and catching up through five
+  epochs with an expired certificate before removing it. A commit in a
+  100-device group took 9.4 / 10.1 / 10.5 ms in Chrome and at most 12 ms p95
+  in Firefox and WebKit; a whole local round with the IndexedDB write took
+  19–30 ms median. State survived reloads and nine forced browser kills per
+  browser between creating and merging a commit. Gzip size 447 KB (mls-rs:
+  267 KB, every gate passed).
+- **S2: passed.** Eight senders decrypted correctly through the real SFU,
+  also while moving between slots; injected plaintext, tampered, replayed and
+  unknown-key frames silenced only their sender, and a sender without keys
+  sent nothing. Added time per received frame, p99: Chrome 0.10 ms (also in a
+  hidden tab), Firefox 0.56 ms (0.82 ms with the window covered), WebKit
+  0.10 ms. During parallel builds Firefox reached 62 ms p99 with a covered
+  window, so behaviour under CPU load belongs to the latency work. Not
+  measured: hidden Firefox and WebKit tabs under normal background policy,
+  and the browser's own queue before the sender transform (not exposed).
+- **S3: passed with empty metadata.** 42 shared vectors both ways and all
+  RFC header vectors; 200 frames of 1000 bytes with the widest key id and
+  counter crossed the SFU intact in each direction for each browser; larger
+  frames were dropped before encryption. `sframe` 2.0 fails the RFC vector
+  with non-empty metadata (see "Building blocks").
+- **S4: passed locally.** Forwarding by sender timestamps added 0.17 ms at
+  p95 (400 markers per variant, native clients over loopback, alternating
+  runs); talking indicators and slots were unchanged, and loss, reordering,
+  duplicates, both wraps, resets, silence, mute and bursts matched expected
+  traces. The rules it added are under "SFU". The VM measurement is still to
+  do.
+- **S5:** results pending.
+- **S6: passed at code level.** By the owner's decision this run used fakes
+  in place of the official server. 17 tests, each with a plaintext control
+  that proves the path works, cover moves during speech, the grace period,
+  refused moves, whispers, text both ways, listeners and reconnects. The run
+  with the official server, and delayed frames before the server classifies
+  them (now covered by the per-call SSRC rule), remain.
+
 ## Left for the implementation spec
 
 The direction above is settled; these are pinned down before building:
@@ -664,7 +733,14 @@ The direction above is settled; these are pinned down before building:
   windows, with retirement after authentication;
 - per-SSRC RTP state from the transport (today's `AudioPacket` drops it),
   native playback of frames other than 20 ms, and bridge queues that keep
-  each packet's originating channel across moves.
+  each packet's originating channel across moves;
+- a write-ahead outbox for commits, reconciled with the server by commit
+  hash after a crash, and an external commit that stays inactive until the
+  server accepted it (S1 tested recovery only at chosen points);
+- a review of the WebCrypto SFrame worker code.
+
+Still to measure before building: real Safari (S1, S2 used WebKit), the SFU
+change on the VM (S4), and S6 with the official TeamSpeak server.
 
 ## Open questions
 
@@ -674,4 +750,4 @@ The direction above is settled; these are pinned down before building:
 - History bundles grow with every epoch (about 40 bytes each). If channels
   reach many thousands of epochs, a key tree can replace the flat list.
 - SFrame suite for voice: `AES_128_GCM_SHA256_128` (16-byte tag) by default;
-  S4 measures whether a shorter-tag suite is worth it for bandwidth.
+  whether a shorter-tag suite is worth it for bandwidth is not measured yet.
