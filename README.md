@@ -111,17 +111,19 @@ The limits are listed plainly [at the end](#what-gwar-does-not-protect-yet).
 - Each message, edit, author deletion and attachment written in Gwar is
   **signed by its author's key** and bound to the server's key, the
   conversation and the message id. A server cannot alter such a message, move
-  it to another channel or present it as someone else's without clients
-  noticing.
-- **Edits form a hash chain.** Clients keep local checkpoints that catch
-  rollbacks and forks of messages they have already seen; a fresh device, or
-  one whose stored history was cleared, has nothing to compare against.
+  it to another channel id or present it as someone else's without clients
+  noticing. The signature names the channel by id, not by its name.
+- **Edits form a hash chain.** Clients keep up to 10,000 local checkpoints
+  that catch rollbacks and forks of messages they have already seen; a fresh
+  device, cleared storage or a checkpoint that was evicted has nothing to
+  compare against.
 - Attachments are **checked against their signed hash** before they are shown
   or saved; one that fails or has no signature loads only when you ask.
 - Until its signature is checked a message is visibly pending; anything that
   fails or cannot be fully verified carries a warning. Notifications and
-  mentions need a verified signature. TeamSpeak messages (which cannot be
-  signed) and removals by moderators are labeled as such.
+  mention highlights for Gwar messages need a verified signature. TeamSpeak
+  messages cannot be signed: they still notify, labeled as TeamSpeak, and
+  removals by moderators are labeled as the server's.
 
 ### Gwar Connect: an account that never sees your secrets
 
