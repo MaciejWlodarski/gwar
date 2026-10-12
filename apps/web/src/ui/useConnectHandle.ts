@@ -15,10 +15,11 @@ export function useConnectHandle(member: HandleMember | null | undefined): Conne
   const handle = useVerifiedHandle(member);
   const uid = member?.uid;
   useSyncExternalStore(subscribeHandlePins, handlePinsVersion);
+  const status = handle && uid ? handleStatus(handle, uid) : null;
+  // Runs again when the pin disappears (another tab cleared or evicted it), so a shown handle never stays hidden.
+  const pending = status === "pending";
   useEffect(() => {
-    if (handle && uid) rememberHandle(handle, uid);
-  }, [handle, uid]);
-  if (!handle || !uid) return null;
-  const status = handleStatus(handle, uid);
-  return status === "pending" ? null : { handle, status };
+    if (handle && uid) void rememberHandle(handle, uid);
+  }, [handle, uid, pending]);
+  return !handle || !status || status === "pending" ? null : { handle, status };
 }

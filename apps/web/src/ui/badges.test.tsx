@@ -40,7 +40,7 @@ describe("Connect badge", () => {
     expect(container.textContent).toBe("@mallory");
   });
   it("marks a handle seen on a different account before instead of verifying it", async () => {
-    acceptHandle("mallory", "someone-else");
+    await acceptHandle("mallory", "someone-else");
     await show("mallory");
     expect(container.querySelector('[data-testid="connect-badge"]')).toBeNull();
     const changed = container.querySelector('[data-testid="connect-badge-changed"]')!;
@@ -48,7 +48,7 @@ describe("Connect badge", () => {
     expect(changed.getAttribute("aria-label")).toContain("different account");
   });
   it("verifies again once the user accepts the account", async () => {
-    acceptHandle("mallory", "someone-else");
+    await acceptHandle("mallory", "someone-else");
     await show("mallory");
     await act(async () => acceptHandle("mallory", "uid"));
     expect(container.querySelector('[data-testid="connect-badge"]')).not.toBeNull();
@@ -68,5 +68,12 @@ describe("Connect badge", () => {
     await act(async () => root.render(<><Probe uid="A" /><Probe uid="B" /></>));
     expect(commits).not.toContain("B:verified");
     expect(commits.slice(-2)).toEqual(["A:verified", "B:changed"]);
+  });
+  it("shows the handle again after another tab cleared the pins", async () => {
+    await show("Alice");
+    expect(container.querySelector('[data-testid="connect-badge"]')).not.toBeNull();
+    localStorage.clear();
+    await act(async () => { window.dispatchEvent(new StorageEvent("storage", { key: null })); });
+    expect(container.querySelector('[data-testid="connect-badge"]')).not.toBeNull();
   });
 });

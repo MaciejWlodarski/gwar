@@ -97,7 +97,7 @@ export function MemberProfileDialog({ uid, fallback }: { uid: string; fallback: 
             <p>{t("member.handleChanged", { handle: connect.handle })}</p>
             <Button
               className="self-start"
-              onClick={() => { if (!acceptHandle(connect.handle, uid)) useUi.getState().toast("error", t("member.acceptNotSaved")); }}
+              onClick={() => void acceptHandle(connect.handle, uid).then((saved) => saved || useUi.getState().toast("error", t("member.acceptNotSaved")))}
             >
               {t("member.acceptHandle")}
             </Button>
