@@ -108,6 +108,7 @@ pub struct TeamSpeakConfig {
     pub voice: SocketAddr,
     /// Loopback port for ServerQuery.
     pub query_port: u16,
+    /// TCP file transfer bind (icons, avatars, channel files).
     pub filetransfer: SocketAddr,
     /// See [`Config::public_url`].
     pub public_url: Option<String>,

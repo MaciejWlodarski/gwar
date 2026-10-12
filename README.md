@@ -254,7 +254,8 @@ and bridges it:
   crosses the bridge as Opus with about a millisecond of overhead.
 
 TeamSpeak clients connect to `your-host:9987` (UDP); Gwar's WebRTC voice then
-moves to 9988, so open both ports. On ARM64 hosts the x86-64 TeamSpeak server
+moves to 9988, so open both ports, and TCP 30033 for TeamSpeak file transfer
+(icons, avatars, channel files; `--teamspeak-filetransfer` moves it). On ARM64 hosts the x86-64 TeamSpeak server
 runs under emulation (`apt install qemu-user libc6-amd64-cross
 libstdc++6-amd64-cross`, or box64). Only one free-licensed TeamSpeak server may
 run per machine.

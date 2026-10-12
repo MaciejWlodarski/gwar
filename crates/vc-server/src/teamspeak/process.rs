@@ -38,7 +38,7 @@ pub struct ProcessConfig {
     pub voice: SocketAddr,
     /// Raw ServerQuery port, bound to 127.0.0.1 only.
     pub query_port: u16,
-    /// TCP file transfer bind, default `127.0.0.1:30033`.
+    /// TCP file transfer bind, e.g. `0.0.0.0:30033`.
     pub filetransfer: SocketAddr,
     /// `serveradmin` query password.
     pub admin_password: String,

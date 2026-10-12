@@ -49,6 +49,8 @@ const PUPPET_GROUP: &str = "Voice bridge";
 const PUPPET_DESCRIPTION: &str = "Gwar user (bridged)";
 /// Flood points one address may collect before TeamSpeak blocks it (default 250).
 const PUPPET_IP_BLOCK: u32 = 2500;
+/// Powers of TeamSpeak's stock Server Admin group (ServerQuery has 100).
+const SERVER_ADMIN_POWER: u32 = 75;
 
 /// Installs, runs and bridges the TeamSpeak server for as long as the process
 /// lives. `ready` is true while the bridge is fully in sync.
@@ -501,7 +503,20 @@ impl<'a> Bridge<'a> {
             want.password = matches!(password, Some(Some(_)));
             self.ts.insert(cid, want);
             self.map.link(channel.id, cid);
-            return self.map.save();
+            self.map.save()?;
+            // A channel takes its creator's powers as the ones needed to manage
+            // it, and ServerQuery's 100 would lock out every TeamSpeak admin.
+            // Give channel permissions the stock Server Admin power, as if one
+            // of them had made the channel; deleting stays ours (it would only
+            // come back), so its needed power remains.
+            let perm = Cmd::new("channeladdperm")
+                .arg("cid", cid)
+                .arg("permsid", "i_channel_needed_permission_modify_power")
+                .arg("permvalue", SERVER_ADMIN_POWER);
+            if let Err(e) = self.query.call(perm).await {
+                warn!(channel = channel.id, "TeamSpeak channel permission power: {e:#}");
+            }
+            return Ok(());
         };
 
         let current = self.ts.get(&cid).cloned().unwrap_or_default();
