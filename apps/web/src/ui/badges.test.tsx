@@ -2,6 +2,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { acceptHandle, resetHandlePins } from "../net/handle-pins";
 import { useSettings } from "../state/settings";
 import { ConnectBadge } from "./badges";
 
@@ -13,6 +14,7 @@ describe("Connect badge", () => {
   beforeEach(() => {
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
     useSettings.setState({ language: "en" });
+    localStorage.clear(); resetHandlePins();
     container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
   });
   afterEach(async () => {
@@ -35,5 +37,24 @@ describe("Connect badge", () => {
   it("shows the handle for look-alike nicknames", async () => {
     await show("mallоry"); // Cyrillic о
     expect(container.textContent).toBe("@mallory");
+  });
+  it("marks a handle seen on a different account before instead of verifying it", async () => {
+    acceptHandle("mallory", "someone-else");
+    await show("mallory");
+    expect(container.querySelector('[data-testid="connect-badge"]')).toBeNull();
+    const changed = container.querySelector('[data-testid="connect-badge-changed"]')!;
+    expect(changed.textContent).toBe("@mallory");
+    expect(changed.getAttribute("aria-label")).toContain("different account");
+  });
+  it("verifies again once the user accepts the account", async () => {
+    acceptHandle("mallory", "someone-else");
+    await show("mallory");
+    await act(async () => acceptHandle("mallory", "uid"));
+    expect(container.querySelector('[data-testid="connect-badge"]')).not.toBeNull();
+  });
+  it("pins the first account it verifies", async () => {
+    await show("Alice");
+    await act(async () => root.render(<ConnectBadge member={{ uid: "other" }} name="Alice" />));
+    expect(container.querySelector('[data-testid="connect-badge-changed"]')).not.toBeNull();
   });
 });

@@ -318,7 +318,10 @@ cannot be a handle because hyphens are not allowed.
 Your client checks each handle's Ed25519 attestation against the service key it
 fetches from its configured Connect service over HTTPS. It checks the signed
 account key against the member's uid and rejects expired attestations or issuance
-more than five minutes in the future.
+more than five minutes in the future. It also remembers which account it first
+verified behind each handle and marks the handle as changed, not verified, when
+it shows up on a different account, until you accept that account in the
+member's profile ([security.md](security.md#handles-implemented)).
 Chat messages, edits and author deletions use the hello key and exact certificate,
 the vc/3-verified server key (independent of endpoint aliases), locally rebuilt
 conversation and account-derived UID. The v2 revision chain and netstring body

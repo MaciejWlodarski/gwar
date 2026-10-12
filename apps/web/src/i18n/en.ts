@@ -29,7 +29,10 @@ export const en = {
   "member.profile": "Member profile",
   "member.viewProfile": "View profile",
   "member.uid": "Full user ID",
+  "member.handleChanged": "@{handle} belonged to a different account before. Handles can move between accounts, so this may be someone else. If you know it is the same person (for example on a new account), accept it.",
+  "member.acceptHandle": "Accept this account",
   "badge.connectAccount": "Gwar Connect account: @{handle}",
+  "badge.handleChanged": "@{handle}: this handle belonged to a different account before",
   "perm.member_nickname": "Change member nicknames",
   "perm.member_nickname.hint": "Change other members’ nicknames on this server. Everyone can change their own.",
 

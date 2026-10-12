@@ -1,7 +1,7 @@
 import { decodeBase64Url } from "../net/base64url";
 import type { HandleMember } from "../net/handle-attestation";
-import { useVerifiedHandle } from "./useVerifiedHandle";
-import { BadgeCheck } from "lucide-react";
+import { useConnectHandle } from "./useConnectHandle";
+import { BadgeCheck, BadgeInfo } from "lucide-react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { unreadLabel } from "../lib/chat";
@@ -48,11 +48,22 @@ export function TeamSpeakBadge({ className, short }: { className?: string; short
 }
 
 /** Only a handle verified by this client enables the badge. Next to a server-chosen `name` that is not the
- *  handle itself, the handle is shown in full, so the check never vouches for a nickname. */
+ *  handle itself, the handle is shown in full, so the check never vouches for a nickname. A handle this client
+ *  saw on a different account before gets a neutral marker instead of the check, with the handle always shown. */
 export function ConnectBadge({ member, name }: { member?: HandleMember | null; name?: string }) {
   const t = useT();
-  const handle = useVerifiedHandle(member);
-  if (!handle) return null;
+  const connect = useConnectHandle(member);
+  if (!connect) return null;
+  const { handle, status } = connect;
+  if (status === "changed") {
+    const label = t("badge.handleChanged", { handle });
+    return (
+      <span title={label} aria-label={label} data-testid="connect-badge-changed" className="inline-flex shrink-0 items-center gap-0.5 align-middle text-muted">
+        <BadgeInfo aria-hidden className="size-3.5" />
+        <span className="font-mono text-xs">@{handle}</span>
+      </span>
+    );
+  }
   const label = t("badge.connectAccount", { handle });
   const visible = name !== undefined && !sameAsHandle(name, handle);
   return (
@@ -70,12 +81,18 @@ function sameAsHandle(name: string, handle: string): boolean {
 
 /** "@handle #tag": the verified Connect handle (if any) and the tag derived from the key. */
 export function IdentityLine({ member, className }: { member?: HandleMember | null; tag?: string | null; className?: string }) {
-  const connect = useVerifiedHandle(member);
+  const t = useT();
+  const connect = useConnectHandle(member);
   const tag = member?.uid ? localTag(member.uid) : undefined;
   if (!connect && !tag) return null;
+  const changed = connect?.status === "changed";
   return (
     <span className={cn("shrink-0 font-mono text-xs text-muted", className)}>
-      {connect && <span className="text-accent">@{connect}</span>}
+      {connect && (
+        <span className={changed ? undefined : "text-accent"} title={changed ? t("badge.handleChanged", { handle: connect.handle }) : undefined}>
+          @{connect.handle}
+        </span>
+      )}
       {connect && tag && " "}
       {tag && <span>#{tag}</span>}
     </span>
