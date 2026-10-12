@@ -1,5 +1,7 @@
 //! HTTP side of uploads (see `core::files`): `PUT /api/files/{id}?token=…`
 //! stores the bytes of a reserved upload, `GET /files/{id}/{name}` serves it.
+//! With `FileAccess::Members` a download needs `Authorization: Bearer <token>`,
+//! the token from the requester's `Welcome`.
 //!
 //! Served files can't run in the page: only sniffed raster images, audio and
 //! video are sent as themselves (so chats can show and play them), everything
@@ -225,7 +227,13 @@ pub async fn download(
     if !valid_id(&id) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let Some((file, path, reading)) = gateway.core.file_open(id).await else {
+    let access = request
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::to_owned);
+    // A file the requester may not see is answered like a missing one.
+    let Some((file, path, reading)) = gateway.core.file_open(id, access).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
     // Opened off the runtime by a task that owns the lease, so even a request cancelled

@@ -994,6 +994,16 @@ impl Store {
             .optional()?)
     }
 
+    /// The channel of the message a file is attached to; `None` for a missing file or one in no message.
+    pub fn file_channel(&self, id: &str) -> Result<Option<ChannelId>> {
+        Ok(self
+            .db
+            .query_row("SELECT m.channel FROM files f JOIN messages m ON m.id = f.message WHERE f.id=?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
     fn attachments(&self, message: MessageId) -> Result<Vec<Attachment>> {
         let mut stmt = self
             .db

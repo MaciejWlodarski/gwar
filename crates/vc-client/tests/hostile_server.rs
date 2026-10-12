@@ -79,6 +79,7 @@ async fn start(
                 default_channel: 1,
                 max_clients: 8,
                 upload_limit: 0,
+                file_access: Default::default(),
             },
             permissions: vec![],
             groups: vec![],
@@ -87,6 +88,7 @@ async fn start(
             members: vec![],
             unread: vec![],
             ice_servers: vec![],
+            file_access: String::new(),
         };
         let mut welcome = serde_json::to_value(welcome).unwrap();
         welcome["clients"] = clients(&me);

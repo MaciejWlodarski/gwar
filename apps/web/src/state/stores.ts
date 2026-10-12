@@ -23,11 +23,13 @@ interface SessionStore extends SessionState {
   httpOrigin: string | null;
   /** Names this connection to the desktop's native file commands; a command carrying an older one is refused. */
   fileSession: string | null;
+  /** This connection's bearer token for downloads from a members-only server (`Welcome.file_access`). */
+  fileAccess: string | null;
   serverKey: string | null;
   endpoint: string | null;
   insecureConnection: boolean;
   setSecurity(serverKey: string | null, endpoint: string | null, insecureConnection: boolean): void;
-  setFileSession(fileSession: string | null): void;
+  setFileSession(fileSession: string | null, fileAccess?: string | null): void;
   dispatch(action: Action): void;
   setClose(reason: CloseReason | null): void;
   setAddress(address: string, kind?: ServerKind, httpOrigin?: string | null): void;
@@ -40,11 +42,12 @@ export const useSession = create<SessionStore>()((set) => ({
   kind: "vc",
   httpOrigin: null,
   fileSession: null,
+  fileAccess: null,
   serverKey: null,
   endpoint: null,
   insecureConnection: false,
   setSecurity: (serverKey, endpoint, insecureConnection) => set({ serverKey, endpoint, insecureConnection }),
-  setFileSession: (fileSession) => set({ fileSession }),
+  setFileSession: (fileSession, fileAccess = null) => set({ fileSession, fileAccess }),
   dispatch: (action) => set((s) => reduce(s, action)),
   setClose: (closeReason) => set({ closeReason }),
   setAddress: (address, kind = "vc", httpOrigin = null) => set({ address, kind, httpOrigin }),

@@ -204,15 +204,23 @@ fn cap(size: u64, limit: u64) -> Result<usize, String> {
     Ok(size as usize)
 }
 
-async fn bytes(server: &Server, path: &str, size: u64) -> Result<Vec<u8>, String> {
+/// `access` is the connection's download token, for a server whose files are for members only.
+async fn bytes(server: &Server, path: &str, size: u64, access: Option<&str>) -> Result<Vec<u8>, String> {
     let cap = cap(size, server.limit)?;
     let url = file_url(&server.origin, path, false)?;
+    if access.is_some_and(|a| !token(a, 128)) {
+        return Err("invalid file access token".into());
+    }
     let mut closed = server.closed.subscribe();
     if *closed.borrow() {
         return Err("disconnected".into());
     }
     let fetch = async {
-        let mut response = server.client.get(url).send().await.map_err(|e| e.to_string())?;
+        let mut request = server.client.get(url);
+        if let Some(access) = access {
+            request = request.bearer_auth(access);
+        }
+        let mut response = request.send().await.map_err(|e| e.to_string())?;
         if !response.status().is_success() {
             return Err(format!("file HTTP {}", response.status()));
         }
@@ -237,11 +245,12 @@ pub async fn fetch_file(
     session: String,
     path: String,
     size: u64,
+    access: Option<String>,
     request_id: String,
 ) -> Result<Response, String> {
     let _permit = files.slots.try_acquire().map_err(|_| "too many file requests")?;
     let server = files.current(&session)?;
-    cancellable(&files, &request_id, bytes(&server, &path, size)).await.map(Response::new)
+    cancellable(&files, &request_id, bytes(&server, &path, size, access.as_deref())).await.map(Response::new)
 }
 
 #[tauri::command]
@@ -278,6 +287,7 @@ fn proposed_name(name: &str) -> String {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn save_file_as(
     app: tauri::AppHandle,
     files: State<'_, Files>,
@@ -285,6 +295,7 @@ pub async fn save_file_as(
     path: String,
     file_name: String,
     size: u64,
+    access: Option<String>,
     request_id: String,
 ) -> Result<bool, String> {
     let _permit = files.slots.try_acquire().map_err(|_| "too many file requests")?;
@@ -298,7 +309,7 @@ pub async fn save_file_as(
         });
         let Some(destination) = rx.await.map_err(|e| e.to_string())? else { return Ok(false) };
         // Fetch before touching the chosen file. Failed/cancelled requests preserve it.
-        let data = bytes(&server, &path, size).await?;
+        let data = bytes(&server, &path, size, access.as_deref()).await?;
         tokio::fs::write(destination.into_path().map_err(|e| e.to_string())?, data).await.map_err(|e| e.to_string())?;
         Ok(true)
     })
@@ -486,12 +497,33 @@ mod tests {
     async fn redirects_overruns_timeouts_and_disconnects_fail() {
         let redirect =
             reply(b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/\r\nContent-Length: 0\r\n\r\n", TIMEOUT).await;
-        assert!(bytes(&redirect, "/files/a/b", 4).await.unwrap_err().contains("302"));
+        assert!(bytes(&redirect, "/files/a/b", 4, None).await.unwrap_err().contains("302"));
         let large = reply(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n12345", TIMEOUT).await;
-        assert!(bytes(&large, "/files/a/b", 4).await.is_err());
+        assert!(bytes(&large, "/files/a/b", 4, None).await.is_err());
         let slow = reply(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n", Duration::from_millis(20)).await;
-        assert!(bytes(&slow, "/files/a/b", 4).await.is_err());
+        assert!(bytes(&slow, "/files/a/b", 4, None).await.is_err());
         slow.closed.send_replace(true);
-        assert_eq!(bytes(&slow, "/files/a/b", 4).await.unwrap_err(), "disconnected");
+        assert_eq!(bytes(&slow, "/files/a/b", 4, None).await.unwrap_err(), "disconnected");
+    }
+    #[tokio::test]
+    async fn the_download_token_is_sent_as_a_bearer_credential() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 4096];
+            let n = socket.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+            let sent = request.contains("\r\nauthorization: bearer tok-1_x\r\n");
+            let response: &[u8] = if sent {
+                b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nfile"
+            } else {
+                b"HTTP/1.1 404 Not Found\r\n\r\n"
+            };
+            let _ = socket.write_all(response).await;
+        });
+        let server = at("s", &format!("http://{address}"));
+        assert_eq!(bytes(&server, "/files/a/b", 4, Some("tok-1_x")).await.unwrap(), b"file");
+        assert_eq!(bytes(&server, "/files/a/b", 4, Some("tok\r\nx")).await.unwrap_err(), "invalid file access token");
     }
 }

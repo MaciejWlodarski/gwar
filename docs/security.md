@@ -312,12 +312,18 @@ Every guarantee assumes your client runs genuine code.
 - **Uploaded files** are served with `nosniff`, a sandboxing CSP and
   `Content-Disposition`, from the server's origin. Attachments are hashed before
   display or download.
-- **File links are capabilities.** A file's URL carries a random 128-bit id and
-  needs no login: anyone holding the link can download the file until its
-  message is deleted, including people who were never on the server. Links
-  posted to TeamSpeak (when the server has a public URL) are such links, as are
-  links copied out of the app. Password channels protect their chat, not the
-  links of files already shared.
+- **File links are capabilities by default.** A file's URL carries a random
+  128-bit id and needs no login: anyone holding the link can download the file
+  until its message is deleted, including people who were never on the server.
+  Links posted to TeamSpeak (when the server has a public URL) are such links,
+  as are links copied out of the app. Password channels protect their chat, not
+  the links of files already shared.
+- **Members-only files** (server setting `file_access: members`): a download
+  also needs the bearer token of a live session that can read the file's
+  channel, so a link alone, a former member or someone outside a password
+  channel gets `404`. TeamSpeak users then get no links. The server itself
+  still reads every file; this protects files from outsiders, not from the
+  server.
 - **Storage** is capped per member (`--upload-quota-mb`, 1 GiB) and in total
   (`--storage-limit-mb`, 10 GiB), counting files not yet sent. Identities are
   free, so the total cap is what protects the disk; uploads not attached to a

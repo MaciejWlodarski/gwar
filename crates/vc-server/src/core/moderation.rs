@@ -12,8 +12,9 @@ use std::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::RngCore;
 use vc_proto::{
-    Ban, BanCreate, BanId, ChannelId, ErrorCode, Event, Group, GroupCreate, GroupId, GroupUpdate, Invite, InviteCreate,
-    LeaveReason, Member, MemberPrune, PRUNE_BATCH, PRUNE_PREVIEW, Permission, Response, ServerUpdate, SessionId, Uid,
+    Ban, BanCreate, BanId, ChannelId, ErrorCode, Event, FileAccess, Group, GroupCreate, GroupId, GroupUpdate, Invite,
+    InviteCreate, LeaveReason, Member, MemberPrune, PRUNE_BATCH, PRUNE_PREVIEW, Permission, Response, ServerUpdate,
+    SessionId, Uid,
 };
 
 use super::{Core, ErrorBody, Reply, bridge::BridgeNote, clean, err, now_ms, passwords, storage_error};
@@ -486,6 +487,14 @@ impl Core {
             if let Some(max) = u.max_clients {
                 core.store.set_meta("max_clients", &max.to_string()).map_err(storage_error)?;
                 core.info.max_clients = max;
+            }
+            if let Some(access) = u.file_access {
+                let value = match access {
+                    FileAccess::Link => "link",
+                    FileAccess::Members => "members",
+                };
+                core.store.set_meta("file_access", value).map_err(storage_error)?;
+                core.info.file_access = access;
             }
             if let Some(hash) = password_hash {
                 // Stored even when empty: an explicit "no password" outlives the command line.

@@ -176,9 +176,12 @@ Being honest about the limits is part of the design:
   server's word. A server can also hide, delay or reorder messages, and sees
   your IP address and when you are online; your uid is the same on every
   server, so servers can tell it is you.
-- **File links are like keys**: anyone holding a file's link can download it
-  without logging in, also after leaving the server, until the message is
-  deleted.
+- **File links are like keys** by default: anyone holding a file's link can
+  download it without logging in, also after leaving the server, until the
+  message is deleted. TeamSpeak users need that to open files posted on Gwar.
+  A server admin can make files members-only instead: then only people
+  connected to the server who can read the channel open them, and TeamSpeak
+  users see only file names.
 - Gwar Connect decides which account owns an `@handle`, and could serve you an
   older copy of your encrypted vault.
 - The web app is only as trustworthy as its hosting, which serves the code on

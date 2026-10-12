@@ -174,6 +174,7 @@ function OverviewTab() {
   const [maxClients, setMaxClients] = useState(String(server?.max_clients ?? ""));
   const [password, setPassword] = useState("");
   const [removePassword, setRemovePassword] = useState(false);
+  const [membersOnlyFiles, setMembersOnlyFiles] = useState(server?.file_access === "members");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const options = useMemo(() => sortedChannels(Object.values(channels)).map((c) => ({ value: String(c.id), label: c.name })), [channels]);
@@ -194,6 +195,8 @@ function OverviewTab() {
       if (max !== server?.max_clients) update.max_clients = max;
       if (removePassword) update.password = "";
       else if (password) update.password = password;
+      const fileAccess = membersOnlyFiles ? "members" : "link";
+      if (fileAccess !== server?.file_access) update.file_access = fileAccess;
     }
     setBusy(true);
     setError(null);
@@ -255,6 +258,7 @@ function OverviewTab() {
             />
             {t("ss.removePassword")}
           </label>
+          <Switch checked={membersOnlyFiles} onCheckedChange={setMembersOnlyFiles} label={t("ss.membersOnlyFiles")} description={t("ss.membersOnlyFilesHint")} />
         </>
       )}
       <ErrorLine>{error}</ErrorLine>
