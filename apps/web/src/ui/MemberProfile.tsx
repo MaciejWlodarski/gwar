@@ -95,7 +95,10 @@ export function MemberProfileDialog({ uid, fallback }: { uid: string; fallback: 
         {connect?.status === "changed" && (
           <div className="flex flex-col gap-2 rounded-md bg-raised p-3 text-sm text-muted">
             <p>{t("member.handleChanged", { handle: connect.handle })}</p>
-            <Button className="self-start" onClick={() => acceptHandle(connect.handle, uid)}>
+            <Button
+              className="self-start"
+              onClick={() => { if (!acceptHandle(connect.handle, uid)) useUi.getState().toast("error", t("member.acceptNotSaved")); }}
+            >
               {t("member.acceptHandle")}
             </Button>
           </div>

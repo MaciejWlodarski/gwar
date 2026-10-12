@@ -10,63 +10,91 @@ export type HandleStatus = "verified" | "changed";
 
 interface Pin { uid: string; seen: number }
 
-/** Oldest-seen pins go first beyond this (a pin is ~80 bytes in localStorage). */
+/** Longest-unseen pins go first beyond this (a pin is ~80 bytes in localStorage). */
 const LIMIT = 5000;
 /** `seen` is refreshed at most this often, so showing a member does not write storage on every render. */
 const REFRESH_MS = 7 * 24 * 60 * 60 * 1000;
 const STORAGE_KEY = `gwar.connect.handle-pins:${CONNECT_URL}`;
 
+/** What this tab knows; mutations re-read storage first, so they never write back another tab's stale copy. */
 let cache: Map<string, Pin> | undefined;
 let version = 0;
 const listeners = new Set<() => void>();
 
-function load(): Map<string, Pin> {
-  if (cache) return cache;
-  cache = new Map();
+/** The stored pins, or undefined if storage cannot be read (then this tab keeps what it has in memory). */
+function read(): Map<string, Pin> | undefined {
+  let raw: string | null;
+  try { raw = localStorage.getItem(STORAGE_KEY); } catch { return undefined; }
+  const pins = new Map<string, Pin>();
   try {
-    const raw: unknown = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}");
-    if (raw && typeof raw === "object") {
-      for (const [handle, pin] of Object.entries(raw as Record<string, unknown>)) {
+    const parsed: unknown = JSON.parse(raw ?? "{}");
+    if (parsed && typeof parsed === "object") {
+      for (const [handle, pin] of Object.entries(parsed as Record<string, unknown>)) {
         const p = pin as Partial<Pin> | null;
-        if (typeof p?.uid === "string" && Number.isSafeInteger(p.seen)) cache.set(handle, { uid: p.uid, seen: p.seen! });
+        if (typeof p?.uid === "string" && Number.isSafeInteger(p.seen)) pins.set(handle, { uid: p.uid, seen: p.seen! });
       }
     }
-  } catch { /* storage may be disabled or corrupt: start empty */ }
-  return cache;
+  } catch { /* Corrupt JSON: only code running on this origin can write it, and that code could do anything anyway. */ }
+  return pins;
 }
 
-function save(pins: Map<string, Pin>) {
+function current(): Map<string, Pin> {
+  return cache ??= read() ?? new Map();
+}
+
+function notify() {
+  version++;
+  for (const listener of listeners) listener();
+}
+
+/**
+ * Applies one change to `handle` on the freshest pins and stores them; false if storage refused (the change then
+ * holds in memory). Without a change it still adopts the fresh copy, and renders again if another tab had pinned
+ * `handle` meanwhile.
+ */
+function mutate(handle: string, change: (pins: Map<string, Pin>) => boolean): boolean {
+  const before = current().get(handle)?.uid;
+  const pins = read() ?? new Map(current());
+  if (!change(pins)) {
+    cache = pins;
+    if (pins.get(handle)?.uid !== before) notify();
+    return true;
+  }
   while (pins.size > LIMIT) {
     let oldest: string | undefined;
     for (const [handle, pin] of pins) if (oldest === undefined || pin.seen < pins.get(oldest)!.seen) oldest = handle;
     pins.delete(oldest!);
   }
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(Object.fromEntries(pins))); } catch { /* memory still works */ }
-  version++;
-  for (const listener of listeners) listener();
+  cache = pins;
+  let saved = true;
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(Object.fromEntries(pins))); } catch { saved = false; }
+  notify();
+  return saved;
 }
 
-/** Read-only, safe while rendering: an unpinned handle counts as verified until `remember` pins it. */
-export function handleStatus(handle: string, uid: string): HandleStatus {
-  const pin = load().get(handle);
-  return !pin || pin.uid === uid ? "verified" : "changed";
+/** Read-only, safe while rendering. "pending": not pinned yet, so not shown until {@link rememberHandle} decides. */
+export function handleStatus(handle: string, uid: string): HandleStatus | "pending" {
+  const pin = current().get(handle);
+  return !pin ? "pending" : pin.uid === uid ? "verified" : "changed";
 }
 
-/** Pins a handle seen for the first time; never replaces a pin for another account. */
+/**
+ * Records a verified sighting: pins a handle seen for the first time, never replaces a pin for another account,
+ * and refreshes when the handle was last seen (also when it shows up on another account, so a handle on screen
+ * as changed is not the next one forgotten).
+ */
 export function rememberHandle(handle: string, uid: string, now = Date.now()) {
-  const pins = load();
-  const pin = pins.get(handle);
-  if (pin && pin.uid !== uid) return;
-  if (pin && now - pin.seen < REFRESH_MS) return;
-  pins.set(handle, { uid, seen: now });
-  save(pins);
+  mutate(handle, (pins) => {
+    const pin = pins.get(handle);
+    if (pin && now - pin.seen < REFRESH_MS) return false;
+    pins.set(handle, { uid: pin?.uid ?? uid, seen: now });
+    return true;
+  });
 }
 
-/** The user accepted that the handle now belongs to `uid`. */
-export function acceptHandle(handle: string, uid: string, now = Date.now()) {
-  const pins = load();
-  pins.set(handle, { uid, seen: now });
-  save(pins);
+/** The user accepted that the handle now belongs to `uid`. False if it could not be stored (it holds until reload). */
+export function acceptHandle(handle: string, uid: string, now = Date.now()): boolean {
+  return mutate(handle, (pins) => { pins.set(handle, { uid, seen: now }); return true; });
 }
 
 export function subscribeHandlePins(listener: () => void): () => void {
@@ -78,13 +106,12 @@ export function handlePinsVersion(): number {
   return version;
 }
 
-// Another tab accepted or pinned a handle.
+// Another tab pinned or accepted a handle.
 if (typeof window !== "undefined") {
   window.addEventListener("storage", (e) => {
     if (e.key !== STORAGE_KEY && e.key !== null) return;
-    cache = undefined;
-    version++;
-    for (const listener of listeners) listener();
+    cache = read() ?? cache;
+    notify();
   });
 }
 

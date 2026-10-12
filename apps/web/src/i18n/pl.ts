@@ -33,6 +33,7 @@ export const pl: Record<Key, string> = {
   "member.uid": "Pełny identyfikator użytkownika",
   "member.handleChanged": "@{handle} należał wcześniej do innego konta. Handle może przejść na inne konto, więc to może być ktoś inny. Jeśli wiesz, że to ta sama osoba (np. na nowym koncie), zaakceptuj.",
   "member.acceptHandle": "Akceptuj to konto",
+  "member.acceptNotSaved": "Zaakceptowano na teraz, ale przeglądarka nie pozwoliła tego zapisać; po odświeżeniu pytanie wróci.",
   "badge.connectAccount": "Konto Gwar Connect: @{handle}",
   "badge.handleChanged": "@{handle}: ten handle należał wcześniej do innego konta",
   "perm.member_nickname": "Zmiana pseudonimów członków",

@@ -31,6 +31,7 @@ export const en = {
   "member.uid": "Full user ID",
   "member.handleChanged": "@{handle} belonged to a different account before. Handles can move between accounts, so this may be someone else. If you know it is the same person (for example on a new account), accept it.",
   "member.acceptHandle": "Accept this account",
+  "member.acceptNotSaved": "Accepted for now, but this browser did not let Gwar save it; it will be asked again after a reload.",
   "badge.connectAccount": "Gwar Connect account: @{handle}",
   "badge.handleChanged": "@{handle}: this handle belonged to a different account before",
   "perm.member_nickname": "Change member nicknames",

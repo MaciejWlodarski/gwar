@@ -138,9 +138,14 @@ storage. A handle that later shows up on a different account gets a neutral
 "belonged to a different account before" marker instead of the check mark; the
 member's profile explains it and lets the user accept the new account, which
 moves the pin. Existing conversations stay with the uid they were held with.
-Limits: the first sighting is trusted as is, pins are per device (a new device
-or cleared storage starts empty), and at most 5,000 handles are kept, the
-longest-unseen go first.
+A new handle shows no badge until it is pinned, so two accounts showing the
+same new handle at once are never both verified. Every change re-reads storage
+first, so tabs do not overwrite each other's pins. Limits: the first sighting is
+trusted as is; pins are per device (a new device, cleared or corrupt storage
+starts empty); if the browser refuses storage, pins live only until the page
+reloads (accepting then says it was not saved); at most 5,000 handles are kept,
+the longest-unseen go first, and a handle seen on another account counts as
+seen.
 
 ## Connect account integrity (implemented)
 

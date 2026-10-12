@@ -9,7 +9,8 @@ export interface ConnectHandle {
   status: HandleStatus;
 }
 
-/** A verified handle together with its continuity status; the first verified sighting pins it. */
+/** A verified handle together with its continuity status. The first verified sighting pins it; until then nothing
+ *  is shown, so two accounts showing the same new handle at once are never both verified. */
 export function useConnectHandle(member: HandleMember | null | undefined): ConnectHandle | null {
   const handle = useVerifiedHandle(member);
   const uid = member?.uid;
@@ -18,5 +19,6 @@ export function useConnectHandle(member: HandleMember | null | undefined): Conne
     if (handle && uid) rememberHandle(handle, uid);
   }, [handle, uid]);
   if (!handle || !uid) return null;
-  return { handle, status: handleStatus(handle, uid) };
+  const status = handleStatus(handle, uid);
+  return status === "pending" ? null : { handle, status };
 }
