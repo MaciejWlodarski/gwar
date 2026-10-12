@@ -81,8 +81,17 @@ async fn teamspeak_server_admins_manage_permissions_of_mirrored_channels() {
         }
     })
     .await;
-    let perms = channel_permissions(&query, &cid).await;
-    assert!(perms.contains(&("i_channel_needed_permission_modify_power".into(), "75".into())), "{perms:?}");
+    // The bridge sets the power right after creating the channel.
+    let perms = within("the Server Admin permission power", async {
+        loop {
+            let perms = channel_permissions(&query, &cid).await;
+            if perms.contains(&("i_channel_needed_permission_modify_power".into(), "75".into())) {
+                return perms;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
     // Deleting stays out of reach: the bridge would only bring the channel back.
     assert!(perms.contains(&("i_channel_needed_delete_power".into(), "100".into())), "{perms:?}");
 
