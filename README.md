@@ -6,9 +6,10 @@ TeamSpeak in the same conversation. It is built to stay trustworthy even when
 the server you join is not: your identity is a key only you hold, and Gwar
 clients sign what you write (see [Security](#security)).
 
-**Use it:** the web app at <https://gwar.maciejwlodarski.com> connects to any
-Gwar server (the project's own is `voice.maciejwlodarski.com`); so does the
-desktop app.
+**Use it:** the web app at <https://gwar.app> connects to any
+Gwar server; so does the desktop app. The project runs a public server that
+anyone can use for free: `voice.gwar.app` in Gwar, or `gwar.app` in a
+TeamSpeak client.
 
 *Gwar* is Polish for the buzz of many voices talking at once.
 

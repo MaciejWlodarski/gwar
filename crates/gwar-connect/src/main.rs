@@ -19,7 +19,7 @@ struct Cli {
         long = "origin",
         env = "GWAR_CONNECT_ORIGINS",
         value_delimiter = ',',
-        default_value = "https://gwar.maciejwlodarski.com"
+        default_value = "https://gwar.app"
     )]
     origins: Vec<String>,
     /// Header your reverse proxy sets to the client's address, e.g. `x-real-ip`; believed
