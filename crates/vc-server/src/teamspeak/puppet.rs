@@ -255,10 +255,10 @@ async fn run(
     tokio::time::sleep(spec.delay).await;
     // A virtual server has at most u16::MAX clients, so this many variants suffice.
     let mut variant = 1;
-    let mut con = loop {
+    let (mut con, requested) = loop {
         let nickname = nickname_variant(&spec.nickname, variant);
-        match connect(server, &spec, nickname).await {
-            Ok(con) => break con,
+        match connect(server, &spec, nickname.clone()).await {
+            Ok(con) => break (con, nickname),
             Err(e)
                 if variant <= u32::from(u16::MAX)
                     && e.downcast_ref::<tsclientlib::Error>().is_some_and(nickname_taken) =>
@@ -277,6 +277,11 @@ async fn run(
     // Commands awaiting TeamSpeak's answer, to name the one that failed.
     let mut pending: HashMap<tsclientlib::MessageHandle, Pending> = HashMap::new();
     let mut nickname_generation = 0;
+    // On a taken name TeamSpeak may admit the client under a numbered one
+    // ("alice1") instead of refusing it. Our own client is listed a little
+    // after connecting; if its name is not the one asked for, continue with
+    // our next variant.
+    let mut admitted_as = Some(requested);
     enum Step {
         Uplink(AudioPacket),
         Item(Option<Result<StreamItem, tsclientlib::Error>>),
@@ -316,6 +321,17 @@ async fn run(
                     _ => {}
                 },
                 StreamItem::BookEvents(book) => {
+                    let listed = admitted_as.as_ref().and_then(|_| {
+                        let state = con.get_state().ok()?;
+                        Some(state.clients.get(&state.own_client)?.name.clone())
+                    });
+                    if let Some(name) = listed
+                        && let Some(requested) = admitted_as.take()
+                        && name.trim() != requested.trim()
+                        && nickname_generation == 0
+                    {
+                        queue_nickname(&mut con, &mut pending, spec.nickname.clone(), variant + 1, 0)?;
+                    }
                     for event in book {
                         if let BookEvent::Message { target, invoker, message } = event {
                             let text = PuppetEvent::Text {
