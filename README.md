@@ -32,6 +32,8 @@ use.
 - **Channels and chat.** Nested channels, passwords, user limits, persistent
   channel history, private and server-wide messages, a member list with online
   and offline users.
+- **Chat like you expect.** Mentions with notifications, editing and deleting,
+  images, video, audio and files (drag and drop or paste).
 - **Your identity is a key, not an account.** Every client holds an Ed25519
   key; it works on any Gwar server without signing up anywhere.
 - **Optional Gwar Connect account** to be the same person on the web, the
@@ -40,15 +42,13 @@ use.
   certified by your identity, and a lost device is revoked without changing who
   you are. Servers verify devices themselves and keep working if Connect is
   down. See [docs/connect.md](docs/connect.md).
+- **Signed chat.** Gwar clients sign every message, edit, deletion and
+  attachment and verify everyone else's, so a server cannot put words in a
+  Gwar user's mouth without a warning. See [Security](#security).
 - **Moderation.** Roles with any permissions and colors, bans (timed or
   permanent, by identity or IP), invite links that can grant a role, server
   settings, removing members and cleaning up the inactive ones. Nobody can hand
   out more than they hold.
-- **Signed chat.** Gwar clients sign every message, edit, deletion and
-  attachment and verify everyone else's, so a server cannot put words in a
-  Gwar user's mouth without a warning. See [Security](#security).
-- **Chat like you expect.** Mentions with notifications, editing and deleting,
-  images, video, audio and files (drag and drop or paste).
 - **One web app, plus a desktop app, with one UI.** The project hosts the web
   app; it connects to any server. The Tauri 2 desktop app has a native audio
   engine (Opus with FEC, jitter buffer with loss concealment), global
@@ -205,14 +205,11 @@ A member is shown as **nickname** `@handle #tag`, for example
   and every identity has one, with or without an account. Use it to tell apart
   people with the same nickname. The mention picker shows it too.
 - **@handle**: your [Gwar Connect](docs/connect.md) account name, shown with a
-  verified badge. Your client checks Connect's signed handle attestation against
-  the key fetched from its own configured Connect service and the member's uid.
-  The next lookup is allowed
-  after 24 hours on success, one hour on 404 (which clears the handle), or five
-  minutes on error; the five-minute guard is saved before HTTP, across devices
-  and restarts. Errors keep the cached attestation while Connect is down; expired
-  ones are hidden.
-  It is only as trustworthy as Connect, while the #tag needs no one.
+  verified badge. Your client checks Connect's signed attestation itself,
+  against the key of its own Connect service and the member's uid, so a server
+  cannot invent one. Handles refresh in the background and an expired one is
+  hidden (details in [docs/connect.md](docs/connect.md)). A handle is only as
+  trustworthy as Connect, while the #tag needs no one.
 
 ## Download
 
@@ -253,64 +250,69 @@ On first start the server prints a one-time **admin token**; open the web app,
 connect to `voice.example.com` and redeem it from the server menu ("Use
 token"). Get another one with `vc-server --data-dir data admin-token`.
 
-TLS is required by default. Plain `ws://` is allowed for loopback development.
-In the desktop app, a per-server **Insecure connection (LAN)** toggle also
-permits plaintext to other hosts. While connected a persistent red warning
-explains that anyone on the network can impersonate the server or take over
-the session. Pins and message signatures do not secure a plaintext session.
+Connections are always encrypted: plain `ws://` works only to loopback for
+development, or through the desktop app's explicit LAN option (see
+[Security](#encrypted-connections)).
 
-The server generates `server-key.ed25519` in its data directory once (a
-32-byte Ed25519 seed, mode 0600 on Unix). **Back it up with the database**;
-losing it changes the server's identity. Never share the seed. Print the public
-key with `vc-server --data-dir data server-key`. Invite links include this full
-public-key fingerprint. Clients store a pin for each canonical WebSocket
-endpoint after verifying the first server proof. A changed key blocks login:
-the user must check it with the owner and explicitly choose the dangerous
-option to forget the old pin and trust the new key. No silent rotation or
-legacy login fallback. The server menu's **Server key** shows the fingerprint.
+### Addresses clients log in to
 
-Login signatures bind the full endpoint, including scheme, host, effective
-port and WebSocket path. Configure the exclusive accepted set using:
+A login signature covers the exact address the client dialed (scheme, host,
+port and path), so the server accepts only the addresses you configure:
 
-- `--domain`: `wss://<domain>/ws` for each configured domain;
-- `--public-url`: maps HTTP(S) to WS(S), retains host/port and uses `/ws`;
-- `--public-endpoint`: repeatable full endpoint URLs, including alias paths
-  (or comma-delimited `VC_PUBLIC_ENDPOINTS`);
-- explicit `--public-ip`: a global unicast IP adds `wss://<ip>[:port]/ws` only
-  when vc-server terminates TLS itself. It uses the actual listening port,
-  omitted only for 443. Behind a reverse proxy it adds no login endpoint;
-  configure `--public-url` or `--public-endpoint`.
-  Browser IP access needs a certificate valid for that IP.
+- `--domain`: `wss://<domain>/ws` for each domain;
+- `--public-url`: the same host and port as `ws(s)://…/ws`;
+- `--public-endpoint`: any full address, repeatable, including alias paths
+  (or comma-separated `VC_PUBLIC_ENDPOINTS`);
+- `--public-ip`: a global unicast IP adds `wss://<ip>[:port]/ws`, but only when
+  the server terminates TLS itself (behind a proxy use `--public-url` or
+  `--public-endpoint`). Browsers need a certificate valid for that IP.
 
-Behind a reverse proxy, set its public URL, for example:
-
-```bash
-vc-server --http 127.0.0.1:8800 --public-url https://voice.example.com --client-ip-header x-real-ip
-```
-
-`--client-ip-header` names the header your proxy sets to the client's address
-(nginx: `proxy_set_header X-Real-IP $remote_addr;`). It is believed only from
-loopback; name only a header the proxy always overwrites.
-
-Hostnames are lowercase without a trailing dot, IPv6 is bracketed, and default
-WS/WSS ports are omitted. No credentials, query or fragment. Request headers
-never add endpoints. Private, loopback and link-local `--public-ip` values
-never auto-authorize login. Configure loopback explicitly for development:
+The server refuses to start without any. Addresses are compared in canonical
+form (lowercase host, IPv6 in brackets, no default port, credentials, query
+or fragment); request headers never add one, and private, loopback and
+link-local IPs are never added automatically. For local development, list
+loopback explicitly:
 
 ```bash
 vc-server --public-endpoint ws://127.0.0.1:8790/ws
 ```
 
-An empty set refuses startup. `--insecure-any-host` (`VC_INSECURE_ANY_HOST`)
-accepts any canonical endpoint and logs a loud warning. It is only for isolated
-local development/tests, never staging or ordinary LAN use with valuable
-identities. It disables relay protection even when pins exist.
+`--insecure-any-host` (`VC_INSECURE_ANY_HOST`) accepts any address with a loud
+warning. It gives up the protection against relayed logins, even for pinned
+servers, so use it only for isolated development and tests.
 
-Servers accept Gwar Connect devices out of the box and fetch the list of
-revoked devices from the official Connect service every five minutes
-(`--connect-url` points elsewhere, `--no-connect` turns it off). They also confirm
-Connect handles asynchronously (rechecked daily, sooner after a failure);
-`--no-connect` clears that cache. Back up the database while running with `vc-server --data-dir data backup copy.sqlite3`.
+### Behind a reverse proxy
+
+Set the public URL and the header your proxy puts the client's address in:
+
+```bash
+vc-server --http 127.0.0.1:8800 --public-url https://voice.example.com --client-ip-header x-real-ip
+```
+
+With nginx that is `proxy_set_header X-Real-IP $remote_addr;`. The header is
+believed only from loopback, so name one the proxy always overwrites.
+
+### Server key and backups
+
+On first start the server creates `server-key.ed25519` in its data directory
+(an Ed25519 seed, mode 0600 on Unix). It is the server's identity: clients pin
+it, and invite links and the server menu's **Server key** show its
+fingerprint (`vc-server --data-dir data server-key` prints it). **Back it up
+with the database and never share it**; with a new key clients see a new server
+and have to confirm the change with you.
+
+Back up the database while the server runs with
+`vc-server --data-dir data backup copy.sqlite3`.
+
+### Gwar Connect
+
+Servers accept Gwar Connect devices out of the box. Every five minutes they
+fetch the list of revoked devices from the official Connect service, and they
+confirm handles in the background (daily, sooner after a failure).
+`--connect-url` points to another Connect service; `--no-connect` turns both
+off and clears the handle cache.
+
+### Removing members
 
 Admins (or anyone with the "Remove members" permission) can remove a member
 from the member list, or clean up people not seen for a while in Server
@@ -326,17 +328,17 @@ vc-server --data-dir data members remove [--delete-messages] [--dry-run] -- <uid
 vc-server --data-dir data members merge [--dry-run] -- <from-uid> <into-uid>
 ```
 
-`list` and removal/prune `--dry-run` are safe while the server runs. A real
-`prune` must run with the server stopped (the server holds `data/vc.lock`; the command refuses
-to run while it is held). Members with a role besides Member are kept unless
-`--include-grouped` is given. `list` includes the member tag and confirmed
-Connect handle. `merge` moves the source's unsigned messages, uploads, roles,
-mentions in unsigned messages, read marks and UID bans to an existing target,
-preserving the target's nickname. Signed messages keep their original `author_uid`
-and mentions because the signature binds them; the CLI reports only unsigned
-messages and mentions moved.
-It is transactional and requires the server stopped, including `--dry-run`.
-Put UIDs beginning with `-` after `--`, as in the examples above.
+- `list` (with each member's tag and confirmed handle) and the `--dry-run` of
+  `prune` and `remove` are safe while the server runs. A real `prune` or
+  `remove`, and `merge` even with `--dry-run`, need the server stopped: it
+  holds `data/vc.lock`, and the commands refuse to run while it does.
+- `prune` keeps members with a role besides Member unless `--include-grouped`
+  is given.
+- `merge` moves one identity's unsigned messages, uploads, roles, read marks
+  and UID bans to an existing member, in one transaction, keeping the target's
+  nickname. Signed messages stay with their original author, because the
+  signature binds them.
+- Put UIDs beginning with `-` after `--`, as in the examples above.
 
 ## Develop
 
