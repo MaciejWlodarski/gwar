@@ -8,8 +8,7 @@ clients sign what you write (see [Security](#security)).
 
 **Use it:** the web app at <https://gwar.app> connects to any
 Gwar server; so does the desktop app. The project runs a public server that
-anyone can use for free: `voice.gwar.app` in Gwar, or `gwar.app` in a
-TeamSpeak client.
+anyone can use for free: type `gwar.app` in Gwar or in a TeamSpeak client.
 
 *Gwar* is Polish for the buzz of many voices talking at once.
 
