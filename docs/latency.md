@@ -75,6 +75,37 @@ the matching window. A 300 ms delay should add about 300 ms to the measured
 latency, including when that moves the onset into a later marker period.
 The run drains for an additional matching window after marker generation.
 
+## Pipeline scheduling
+
+The dedicated voice pipeline requests best-effort real-time scheduling for its
+480-sample/48 kHz (10 ms) work: Mach time constraints on macOS and MMCSS
+"Pro Audio" on Windows. Both have an OS backstop for a thread that stops
+blocking (XNU demotes it after overrunning its computation budget; MMCSS keeps a
+share for ordinary threads). Linux stays timeshare: `SCHED_FIFO` has no such
+backstop beyond global RT throttling, and an always-ready capture device (ALSA
+`null`) would let the pipeline hold a core. Each pipeline pass also takes only
+the capture samples queued when its capture drain starts and at most 256
+incoming packets, so a producer faster than real time cannot starve playback. The guard restores the old policy on exit;
+refused promotion logs once at debug level and voice continues. CPAL's
+`realtime` feature also enables WASAPI callback promotion; CoreAudio owns its RT
+callbacks. Mozilla's `audio_thread_priority` (used by CPAL off macOS) would add
+an older `mach2` on macOS, so the pipeline binds the OS calls directly. macOS
+audio workgroups are not joined yet.
+
+Local check (2026-10-14, Mac under ten busy loops, four baseline/candidate pairs,
+100/100 markers each): the pipeline thread moved from `31T` to `97R` in
+`ps -M`. Fixed callbacks: median 57.6/56.7 → 47.7/47.3 ms, underruns 2/0 → 0/0,
+final headroom 20/10 → 10/10 ms. With `LATENCY_CALLBACK_JITTER=1` the medians
+moved +7.3/−3.6 ms (noise), so the gain is fewer scheduling misses under load,
+not a general latency cut. The harness's virtual callbacks do not exercise CPAL
+callback priority; Windows promotion is untested at runtime.
+
+Compare unchanged baseline and candidate executables back-to-back under the
+same local CPU load, including `LATENCY_CALLBACK_JITTER=1`. The harness uses
+virtual callback threads, so it measures pipeline scheduling rather than CPAL
+callback priority. `receiver_playout.underruns` and `headroom_samples` are the
+active-playback counters; lower latency alone does not establish better scheduling.
+
 ## Loopback network impairments
 
 Set `LATENCY_NET` on a direct local invocation to insert a UDP relay between
@@ -269,12 +300,52 @@ Fractional corrections use the minimum queue + staged PCM margin observed
 before refills over a full trailing five seconds. This retains sparse low-water
 evidence such as a 5 ms packet delay every three seconds. The margin excludes
 the pending refill, adaptive jitter reserve beyond packet batching, and 120 samples (2.5 ms)
-of safety. Arrival phase contributes no credit. Each correction removes at most
-240 samples, then rebuilds the observation window. Every concealment also
-requires a fresh full window. Genuine surplus may take tens of seconds to
-converge; the two-second nonquiet deadline cannot bypass the five-second
-window, and speech onsets remain protected. Surplus below 120 samples is not
-corrected.
+of safety. Arrival phase contributes no credit. Each correction proposes at most
+720 samples (15 ms), then rebuilds the observation window after the actual cut.
+Every concealment also requires a fresh full window. Surplus below 120 samples
+is not corrected.
+
+Voiced corrections search 120--720 sample lags within the available budget,
+using mean-centered normalized correlation (>0.98) and similar window energies.
+One selected lag is removed with a linear overlap-add lasting that entire lag;
+`shrunk` receives exactly the number removed. Speech onsets remain protected,
+including onsets in lookahead packets. Correlated speech need not wait for the
+old nonquiet deadline; uncorrelated audio never uses that deadline to force a
+cut. Quiet audio retains the <=240-sample skip and 120-sample boundary fade.
+Burst recovery still discards whole packets and fades as before.
+
+A 10 ms packet cannot contain two periods of low-pitched speech. Only when a
+correction is eligible, the decoder stages already queued contiguous packets
+until it can search the full budget (at most 30 ms of search input). It never
+waits for another packet or conceals a missing lookahead packet, and stops before
+stall recovery. This adds no fixed startup delay or played-sample history; the
+extra decoded tail remains included in depth accounting. A pitch period larger
+than the safe budget is left as residual latency until quiet audio arrives.
+Synthetic tests compare splice jumps and magnitude-spectrum error against an
+equal-count skip with the previous 120-sample fade, using 100--300 Hz harmonic
+signals with and without 2% / 5 Hz vibrato. These are waveform checks, not a
+listening test or a guarantee of perceptual transparency on real speech.
+
+Local paired check (2026-10-14), `bdaac83` baseline then TSM candidate for each
+scenario, 100 markers per run; impairment specs use `seed=1` exactly once.
+Values below are baseline / candidate; trim totals include burst recovery.
+Raw CSV/JSON, logs, binary/source hashes and run order are retained locally in
+`target/latency/tsm-pairs/`; the local runner is `target/tsm_pairs.py`.
+
+| Scenario | Median ms | p95 ms | Concealments | Trimmed ms | Trim events | Concealments after trim |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| No impairment | 56.68 / 47.19 | 59.93 / 50.72 | 2 / 2 | 5 / 0 | 1 / 0 | 0 / 0 |
+| up:stall=270ms@12s | 50.09 / 47.54 | 60.47 / 50.35 | 13 / 11 | 260 / 250 | 1 / 1 | 0 / 0 |
+| down:jitter=10ms | 57.33 / 57.21 | 60.50 / 60.74 | 3 / 2 | 0 / 0 | 0 / 0 | 0 / 0 |
+| down:loss=2% | 47.82 / 46.81 | 57.17 / 50.24 | 64 / 64 | 0 / 0 | 0 / 0 | 0 / 0 |
+
+All runs passed the matching gate: 99/100 markers for both stall runs and 100/100
+otherwise, with zero active-stream underruns. No candidate run performed a
+fractional correction (its sole trim was whole-packet stall recovery), so this
+comparison demonstrates no latency improvement attributable to TSM. These are
+single pairs on a shared Mac, not controlled idle-host measurements. Synthetic
+splice tests did show 39.5--99.98% less normalized magnitude-spectrum error than
+the equal-count skip/fade baseline across all 36 tone/vibrato/phase cases.
 
 For a variable output device, invoke the example directly with
 `LATENCY_CALLBACK_JITTER=1 target/release/examples/latency output.csv 100`.
@@ -419,3 +490,15 @@ baseline/candidate median 40.78/41.48 ms, p95 47.47/47.55 ms, p99 49.68/49.55 ms
 No builds, tests or injected load ran during measurement; Spotlight remained
 active, so these were not fully idle-host measurements. Real internet impairment,
 live browser playback and official TeamSpeak interoperability remain unverified.
+
+## Relative-delay estimator experiment (2026-10-14)
+
+A NetEQ-style replacement for the peak-hold estimator was tried and rejected
+(branch `experiment/jitter-quantile`, not merged): relative arrival delay against the fastest
+transit in a two-second window, a 97th-percentile histogram of 200 ms maxima
+with 20 s forgetting, and a three-packet fast attack. In two harness pairs per
+case it helped downlink jitter (`down:jitter=10ms` p95 97.9 → 59.7 ms) but
+regressed the unimpaired relay (median 46.0 → 58.0 ms) and the documented mixed
+spec (concealments 246 → 411). The target only limits shrinking, and the
+five-second low-water rule already retains periodic spikes, so longer estimator
+memory mostly kept extra delay. Other relative-delay designs remain untested.
