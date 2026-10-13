@@ -20,7 +20,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots"] }
 tracing.workspace = true
-cpal = "0.18"
+cpal = { version = "0.18", features = ["realtime"] }
 audiopus = "=0.3.0-rc.0"
 rtrb = "0.4"
 str0m = { version = "0.24", default-features = false, features = ["aws-lc-rs"] }
@@ -42,3 +42,10 @@ tracing-subscriber.workspace = true
 block2 = "0.6"
 objc2 = "0.6"
 objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "AVCaptureDevice", "AVMediaFormat"] }
+# Pipeline thread scheduling: thin bindings already in the dependency graph.
+libc = "0.2"
+mach2 = "0.6"
+
+[target.'cfg(target_os = "windows")'.dependencies.windows-sys]
+version = "0.61"
+features = ["Win32_Foundation", "Win32_System_Threading"]

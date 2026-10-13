@@ -75,6 +75,37 @@ the matching window. A 300 ms delay should add about 300 ms to the measured
 latency, including when that moves the onset into a later marker period.
 The run drains for an additional matching window after marker generation.
 
+## Pipeline scheduling
+
+The dedicated voice pipeline requests best-effort real-time scheduling for its
+480-sample/48 kHz (10 ms) work: Mach time constraints on macOS and MMCSS
+"Pro Audio" on Windows. Both have an OS backstop for a thread that stops
+blocking (XNU demotes it after overrunning its computation budget; MMCSS keeps a
+share for ordinary threads). Linux stays timeshare: `SCHED_FIFO` has no such
+backstop beyond global RT throttling, and an always-ready capture device (ALSA
+`null`) would let the pipeline hold a core. Each pipeline pass also takes only
+the capture samples queued when its capture drain starts and at most 256
+incoming packets, so a producer faster than real time cannot starve playback. The guard restores the old policy on exit;
+refused promotion logs once at debug level and voice continues. CPAL's
+`realtime` feature also enables WASAPI callback promotion; CoreAudio owns its RT
+callbacks. Mozilla's `audio_thread_priority` (used by CPAL off macOS) would add
+an older `mach2` on macOS, so the pipeline binds the OS calls directly. macOS
+audio workgroups are not joined yet.
+
+Local check (2026-10-14, Mac under ten busy loops, four baseline/candidate pairs,
+100/100 markers each): the pipeline thread moved from `31T` to `97R` in
+`ps -M`. Fixed callbacks: median 57.6/56.7 → 47.7/47.3 ms, underruns 2/0 → 0/0,
+final headroom 20/10 → 10/10 ms. With `LATENCY_CALLBACK_JITTER=1` the medians
+moved +7.3/−3.6 ms (noise), so the gain is fewer scheduling misses under load,
+not a general latency cut. The harness's virtual callbacks do not exercise CPAL
+callback priority; Windows promotion is untested at runtime.
+
+Compare unchanged baseline and candidate executables back-to-back under the
+same local CPU load, including `LATENCY_CALLBACK_JITTER=1`. The harness uses
+virtual callback threads, so it measures pipeline scheduling rather than CPAL
+callback priority. `receiver_playout.underruns` and `headroom_samples` are the
+active-playback counters; lower latency alone does not establish better scheduling.
+
 ## Loopback network impairments
 
 Set `LATENCY_NET` on a direct local invocation to insert a UDP relay between
