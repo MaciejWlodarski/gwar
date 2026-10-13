@@ -219,8 +219,8 @@ A ring overflow discards any partial frame spanning the missing samples.
 The SFU uses RTP events for the actual SSRC, extended sequence number and raw
 32-bit timestamp (MediaData has no SSRC). Timestamp wrap uses wrapping subtraction.
 Duplicate timestamps and older sequences drop before speech-state updates;
-a sequence restart requires a fresh SSRC or voice session. Retired SSRCs cannot
-return; after 32 changes, further changes require a new voice session.
+a sequence restart requires a fresh SSRC or voice session. The last 32 retired
+SSRCs cannot return.
 TeamSpeak uses its wrapping u16 packet id times 960 as a synthetic clock,
 with half-range ordering and separate voice/whisper identities. Its 20 ms counter cannot describe a silence gap unless
 the sender advances that counter. Both bridge directions retain Opus durations.

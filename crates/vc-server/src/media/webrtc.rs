@@ -55,6 +55,8 @@ const SLOT_REUSE: Duration = Duration::from_millis(800);
 const SPEECH_LEVEL: i8 = -50;
 const SAMPLE_RATE: u64 = 48_000;
 const MAX_SOURCE_DELTA: u32 = 5 * SAMPLE_RATE as u32;
+/// Late packets from these SSRCs are dropped; the oldest is forgotten first.
+const RETIRED_SSRCS: usize = 32;
 
 struct Slot {
     mid: Mid,
@@ -423,10 +425,13 @@ fn ingest(peer: &mut Peer, data: &RtpPacket, routing: &SharedRouting, core: &Cor
         match clock.delta(old) {
             Err(()) => return None,
             Ok(None) => {
-                if peer.retired_ssrcs.contains(&*data.header.ssrc) || peer.retired_ssrcs.len() >= 32 {
+                if peer.retired_ssrcs.contains(&*data.header.ssrc) {
                     return None;
                 }
                 if let SourceClock::Rtp { ssrc, .. } = old {
+                    if peer.retired_ssrcs.len() == RETIRED_SSRCS {
+                        peer.retired_ssrcs.remove(0);
+                    }
                     peer.retired_ssrcs.push(ssrc);
                 }
             }
