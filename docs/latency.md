@@ -85,8 +85,18 @@ Linux needs an existing `rtprio` limit of at least 10 or `CAP_SYS_NICE`; no D-Bu
 library, RTKit daemon or process-wide resource-limit change is required. CPAL's
 `realtime` feature also enables WASAPI callback promotion. CoreAudio owns its RT
 callbacks; CPAL 0.18.2's Linux promotion without D-Bus is a no-op, and its ALSA
-backend deliberately avoids promoting server-backed plugins. See
-[audio-priority.md](audio-priority.md) for backend details and local evidence.
+backend deliberately avoids promoting server-backed plugins. Mozilla's
+`audio_thread_priority` (used by CPAL off macOS) would add an older `mach2` on
+macOS and is a no-op on Linux without D-Bus, so the pipeline binds the OS calls
+directly. macOS audio workgroups are not joined yet.
+
+Local check (2026-10-14, Mac under ten busy loops, four baseline/candidate pairs,
+100/100 markers each): the pipeline thread moved from `31T` to `97R` in
+`ps -M`. Fixed callbacks: median 57.6/56.7 → 47.7/47.3 ms, underruns 2/0 → 0/0,
+final headroom 20/10 → 10/10 ms. With `LATENCY_CALLBACK_JITTER=1` the medians
+moved +7.3/−3.6 ms (noise), so the gain is fewer scheduling misses under load,
+not a general latency cut. The harness's virtual callbacks do not exercise CPAL
+callback priority; Windows and Linux promotion are untested at runtime.
 
 Compare unchanged baseline and candidate executables back-to-back under the
 same local CPU load, including `LATENCY_CALLBACK_JITTER=1`. The harness uses
