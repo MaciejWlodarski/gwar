@@ -24,7 +24,7 @@ use vc_client::{
     ConnectOptions, Identity, connect,
     voice::{
         self,
-        io::{AudioIo, AudioPorts},
+        io::{AudioIo, AudioPorts, OutputTiming},
     },
 };
 use vc_proto::{ClientSoftware, Platform};
@@ -46,6 +46,8 @@ const MIN_TONE_ENERGY_FRACTION: f64 = 0.6;
 struct Settings {
     minimum_ms: f64,
     extra_delay_ms: usize,
+    /// Receiver callbacks cycle through 10/20/5 ms (`LATENCY_CALLBACK_JITTER=1`).
+    callback_jitter: bool,
 }
 impl Settings {
     fn from_env() -> anyhow::Result<Self> {
@@ -66,7 +68,13 @@ impl Settings {
             .context("LATENCY_EXTRA_DELAY_MS must be a nonnegative integer")?
             .unwrap_or(0);
         anyhow::ensure!(extra_delay_ms < MATCH_WINDOW_MS as usize, "extra delay must be below {MATCH_WINDOW_MS} ms");
-        Ok(Self { minimum_ms, extra_delay_ms })
+        let callback_jitter = match std::env::var("LATENCY_CALLBACK_JITTER") {
+            Ok(value) if value == "1" => true,
+            Ok(value) if value == "0" => false,
+            Err(std::env::VarError::NotPresent) => false,
+            _ => anyhow::bail!("LATENCY_CALLBACK_JITTER must be 0 or 1"),
+        };
+        Ok(Self { minimum_ms, extra_delay_ms, callback_jitter })
     }
 }
 
@@ -221,6 +229,7 @@ struct FakeIo {
     stop: Arc<AtomicBool>,
     count: usize,
     delay_samples: usize,
+    callback_jitter: bool,
 }
 struct Guard {
     stop: Arc<AtomicBool>,
@@ -239,11 +248,13 @@ impl AudioIo for FakeIo {
     fn open(self: Box<Self>) -> anyhow::Result<AudioPorts> {
         let (mut mic_tx, mic) = RingBuffer::new(RATE);
         let (speaker, mut speaker_rx) = RingBuffer::new(RATE / 2);
+        let output = Arc::new(OutputTiming::default());
+        let timing = output.clone();
         let stop = self.stop.clone();
         let thread_stop = stop.clone();
         let thread = thread::Builder::new().name("latency-audio".into()).spawn(move || {
-            // Both virtual devices share the same 10 ms callback phase. This
-            // avoids attributing random sender/receiver device phase to SFU cost.
+            // Both devices start on the same phase; only the receiver varies its
+            // block sizes when callback jitter is enabled.
             let start = self.epoch + Duration::from_millis(200);
             if let Some(wait) = start.checked_duration_since(Instant::now()) {
                 thread::sleep(wait);
@@ -252,10 +263,13 @@ impl AudioIo for FakeIo {
             // Delay decoded audio, including silence and carrier, before playout.
             // Capture/playout timestamps always remain the actual callback times.
             let mut delay = DelayLine::new(self.delay_samples);
+            let mut callback = 0;
             while !thread_stop.load(Ordering::Relaxed) {
+                let block = if self.callback_jitter { [480, 960, 240][callback % 3] } else { BLOCK };
+                let mut missing = 0;
                 let now = Instant::now();
                 let mut data = self.data.lock().unwrap();
-                for i in 0..BLOCK {
+                for i in 0..block {
                     let at = position + i;
                     let in_marker =
                         at >= WARMUP && (at - WARMUP) / PERIOD < self.count && (at - WARMUP) % PERIOD < MARKER;
@@ -281,6 +295,7 @@ impl AudioIo for FakeIo {
                     }
                     let value = speaker_rx.pop().unwrap_or_else(|_| {
                         data.underflows += 1;
+                        missing += 1;
                         0.0
                     });
                     if !self.tone {
@@ -289,14 +304,16 @@ impl AudioIo for FakeIo {
                     }
                 }
                 drop(data);
-                position += BLOCK;
+                timing.report(block, missing);
+                callback += 1;
+                position += block;
                 let due = start + Duration::from_secs_f64(position as f64 / RATE as f64);
                 if let Some(wait) = due.checked_duration_since(Instant::now()) {
                     thread::sleep(wait);
                 }
             }
         })?;
-        Ok(AudioPorts { mic, speaker, _guard: Box::new(Guard { stop, thread: Some(thread) }) })
+        Ok(AudioPorts { mic, speaker, output, _guard: Box::new(Guard { stop, thread: Some(thread) }) })
     }
 }
 fn options(url: &str, name: &str) -> ConnectOptions {
@@ -464,6 +481,7 @@ async fn run(
             stop: Arc::new(AtomicBool::new(false)),
             count,
             delay_samples: 0,
+            callback_jitter: false,
         }),
         server_addr,
     )
@@ -477,6 +495,7 @@ async fn run(
             stop: Arc::new(AtomicBool::new(false)),
             count,
             delay_samples: settings.extra_delay_ms * RATE / 1000,
+            callback_jitter: settings.callback_jitter,
         }),
         server_addr,
     )
@@ -534,6 +553,23 @@ async fn run(
         ambiguous.len(),
         matching.rejected.len()
     );
+    let slots = receiver_stats
+        .slots
+        .iter()
+        .enumerate()
+        .map(|(slot, stats)| {
+            serde_json::json!({
+                "slot": slot,
+                "target_samples": stats.target_samples,
+                "queued_packets": stats.queued_packets,
+                "queued_samples": stats.queued_samples,
+                "staged_samples": stats.staged_samples,
+                "concealments": stats.concealments,
+                "late_drops": stats.late_drops,
+                "shrink_samples": stats.shrink_samples,
+            })
+        })
+        .collect::<Vec<_>>();
     let metadata = serde_json::json!({
         "voice_events": voice_events,
         "markers": marker_count,
@@ -558,12 +594,22 @@ async fn run(
         "p95_ms": percentile(0.95),
         "p99_ms": percentile(0.99),
         "receiver_underflow_samples": heard.underflows,
+        "receiver_playout": {
+            "speaker_samples": receiver_stats.speaker_samples,
+            "callback_samples": receiver_stats.callback_samples,
+            "callback_max_samples": receiver_stats.callback_max_samples,
+            "headroom_samples": receiver_stats.headroom_samples,
+            "underruns": receiver_stats.underruns,
+            "underrun_samples": receiver_stats.underrun_samples,
+            "slots": slots,
+        },
         "receiver_frames_sent": receiver_stats.frames_sent,
         "receiver_frames_received": receiver_stats.frames_received,
         "url": url,
         "server": server_addr.to_string(),
         "sample_rate": RATE,
         "callback_samples": BLOCK,
+        "receiver_callback_pattern": if settings.callback_jitter { vec![480, 960, 240] } else { vec![BLOCK] },
         "rms_window_samples": RMS_WINDOW,
         "rms_on_threshold": 0.18,
         "rms_off_threshold": 0.11,

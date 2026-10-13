@@ -154,6 +154,21 @@ playout time, identity (or `null`), confidence and tone energy fraction.
 latency and reason. Floor, tone frequencies, classification thresholds and
 artificial delay in both ms and samples are recorded too.
 
+`receiver_playout` is the receiver's final live snapshot: speaker queue level,
+latest and held maximum callback sizes, scheduling headroom, active-stream
+underrun events and samples, and per-slot target/queue/staged samples,
+concealment events, late drops and shrunk samples. All sample counts use 48 kHz
+mono; divide by 48 for ms. These cumulative counters include warmup; raw
+receiver underflows also include idle callbacks, whereas playout underruns count
+only callbacks during playback.
+
+For a variable output device, invoke the example directly with
+`LATENCY_CALLBACK_JITTER=1 target/release/examples/latency output.csv 100`.
+The receiver cycles through 480/960/240-sample callbacks (10/20/5 ms) on the same
+sample clock; the sender stays at 480. JSON records `receiver_callback_pattern`.
+The comparison runners clear `LATENCY_*` variables, so use direct invocation for
+this mode.
+
 Quantiles use empirical nearest rank, including the lower median for even n;
 all-lost quantiles are `null`. CSV/JSON are written before rejecting below-floor
 candidates or more than 5% lost markers.
