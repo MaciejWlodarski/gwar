@@ -78,17 +78,19 @@ The run drains for an additional matching window after marker generation.
 ## Pipeline scheduling
 
 The dedicated voice pipeline requests best-effort real-time scheduling for its
-480-sample/48 kHz (10 ms) work: Mach time constraints on macOS, MMCSS "Pro Audio"
-on Windows, and `SCHED_FIFO` priority 10 on Linux. The guard restores the old
-policy on exit; refused promotion logs once at debug level and voice continues.
-Linux needs an existing `rtprio` limit of at least 10 or `CAP_SYS_NICE`; no D-Bus
-library, RTKit daemon or process-wide resource-limit change is required. CPAL's
-`realtime` feature also enables WASAPI callback promotion. CoreAudio owns its RT
-callbacks; CPAL 0.18.2's Linux promotion without D-Bus is a no-op, and its ALSA
-backend deliberately avoids promoting server-backed plugins. Mozilla's
-`audio_thread_priority` (used by CPAL off macOS) would add an older `mach2` on
-macOS and is a no-op on Linux without D-Bus, so the pipeline binds the OS calls
-directly. macOS audio workgroups are not joined yet.
+480-sample/48 kHz (10 ms) work: Mach time constraints on macOS and MMCSS
+"Pro Audio" on Windows. Both have an OS backstop for a thread that stops
+blocking (XNU demotes it after overrunning its computation budget; MMCSS keeps a
+share for ordinary threads). Linux stays timeshare: `SCHED_FIFO` has no such
+backstop beyond global RT throttling, and an always-ready capture device (ALSA
+`null`) would let the pipeline hold a core. Each pipeline pass also takes only
+the capture samples and packets queued when it starts, so a producer faster than
+real time cannot starve playback. The guard restores the old policy on exit;
+refused promotion logs once at debug level and voice continues. CPAL's
+`realtime` feature also enables WASAPI callback promotion; CoreAudio owns its RT
+callbacks. Mozilla's `audio_thread_priority` (used by CPAL off macOS) would add
+an older `mach2` on macOS, so the pipeline binds the OS calls directly. macOS
+audio workgroups are not joined yet.
 
 Local check (2026-10-14, Mac under ten busy loops, four baseline/candidate pairs,
 100/100 markers each): the pipeline thread moved from `31T` to `97R` in
@@ -96,7 +98,7 @@ Local check (2026-10-14, Mac under ten busy loops, four baseline/candidate pairs
 final headroom 20/10 → 10/10 ms. With `LATENCY_CALLBACK_JITTER=1` the medians
 moved +7.3/−3.6 ms (noise), so the gain is fewer scheduling misses under load,
 not a general latency cut. The harness's virtual callbacks do not exercise CPAL
-callback priority; Windows and Linux promotion are untested at runtime.
+callback priority; Windows promotion is untested at runtime.
 
 Compare unchanged baseline and candidate executables back-to-back under the
 same local CPU load, including `LATENCY_CALLBACK_JITTER=1`. The harness uses

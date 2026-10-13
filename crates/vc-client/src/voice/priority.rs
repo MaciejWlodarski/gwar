@@ -173,53 +173,9 @@ mod platform {
     }
 }
 
-#[cfg(target_os = "linux")]
-mod platform {
-    use anyhow::{Result, ensure};
-
-    pub(super) struct Priority {
-        policy: libc::c_int,
-        param: libc::sched_param,
-    }
-
-    fn check(code: libc::c_int) -> Result<()> {
-        // pthread APIs return errno directly; last_os_error() would report the wrong error.
-        ensure!(code == 0, "pthread scheduling: {}", std::io::Error::from_raw_os_error(code));
-        Ok(())
-    }
-
-    impl Priority {
-        pub(super) fn promote() -> Result<Self> {
-            let mut policy = 0;
-            let mut param = libc::sched_param { sched_priority: 0 };
-            // SAFETY: valid outputs for the live calling thread.
-            check(unsafe { libc::pthread_getschedparam(libc::pthread_self(), &mut policy, &mut param) })?;
-            let requested = libc::sched_param { sched_priority: 10 };
-            // No process-wide resource-limit changes or synchronous D-Bus calls. Permission
-            // comes from RLIMIT_RTPRIO/CAP_SYS_NICE; refused promotion leaves voice running.
-            // SAFETY: valid policy/priority for the calling thread; forks cannot inherit RT.
-            check(unsafe {
-                libc::pthread_setschedparam(
-                    libc::pthread_self(),
-                    libc::SCHED_FIFO | libc::SCHED_RESET_ON_FORK,
-                    &requested,
-                )
-            })?;
-            Ok(Self { policy, param })
-        }
-
-        pub(super) fn restore(&mut self) -> Result<()> {
-            // An unprivileged thread cannot clear RESET_ON_FORK once set; keep the harmless
-            // flag while restoring the original policy and priority.
-            // SAFETY: the saved policy belongs to this same live thread.
-            check(unsafe {
-                libc::pthread_setschedparam(libc::pthread_self(), self.policy | libc::SCHED_RESET_ON_FORK, &self.param)
-            })
-        }
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+// Linux has no OS backstop like XNU demotion or MMCSS reserve: a SCHED_FIFO pipeline
+// fed by an always-ready device (ALSA `null`) would hold a core. Stay timeshare there.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod platform {
     use anyhow::Result;
     pub(super) struct Priority;

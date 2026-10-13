@@ -42,13 +42,9 @@ tracing-subscriber.workspace = true
 block2 = "0.6"
 objc2 = "0.6"
 objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "AVCaptureDevice", "AVMediaFormat"] }
-
-# Thin OS bindings already present in the workspace's dependency graph.
-[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+# Pipeline thread scheduling: thin bindings already in the dependency graph.
 libc = "0.2"
-
-[target.'cfg(target_os = "macos")'.dependencies.mach2]
-version = "0.6"
+mach2 = "0.6"
 
 [target.'cfg(target_os = "windows")'.dependencies.windows-sys]
 version = "0.61"

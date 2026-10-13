@@ -402,6 +402,8 @@ fn level_db(frame: &[f32]) -> f32 {
 }
 
 const HANGOVER: Duration = Duration::from_millis(300);
+/// Packets per pipeline pass; eight slots of 10 ms audio deliver about eight per pass.
+const RECEIVE_BATCH: usize = 256;
 
 fn voice_encoder() -> Result<Encoder> {
     let mut encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip)?;
@@ -461,7 +463,10 @@ fn pipeline<const CAPTURE: usize>(
 
     while !controls.stop.load(Ordering::Relaxed) {
         // ---- capture
-        while let Ok(sample) = mic.pop() {
+        // Take only what is queued now: a producer faster than real time (an
+        // always-ready device) must not keep a promoted thread from playback.
+        for _ in 0..mic.slots() {
+            let Ok(sample) = mic.pop() else { break };
             let Some(capture_position) = capture.push(sample) else { continue };
             let frame = &capture.samples;
             let db = level_db(frame);
@@ -491,7 +496,7 @@ fn pipeline<const CAPTURE: usize>(
         }
 
         // ---- receive
-        while let Ok(item) = incoming.try_recv() {
+        for item in incoming.try_iter().take(RECEIVE_BATCH) {
             if let Some(slot) = slots.get_mut(item.slot) {
                 slot.receive(item)?;
             }
