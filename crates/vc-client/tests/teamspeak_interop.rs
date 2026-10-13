@@ -251,3 +251,86 @@ async fn speak(ts: &mut Connection, whisper_to: Option<u16>) {
         .await;
     }
 }
+
+/// The bridge orders each TeamSpeak speaker's frames by the voice id its
+/// puppets receive, so a late-joining listener must see the same ids.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn teamspeak_voice_ids_are_the_same_for_every_listener() {
+    let Some(bridged) = support::start().await else { return };
+    drop(support::ts_client(bridged.ts_voice, "probe").await);
+    let joined = |name: &str| {
+        let mut ts = Connection::build(bridged.ts_voice.to_string())
+            .name(name.to_string())
+            .identity(TsIdentity::create())
+            .connect()
+            .unwrap();
+        async move {
+            timeout(Duration::from_secs(8), async {
+                let mut events = ts.events();
+                while let Some(item) = events.next().await {
+                    if let StreamItem::MessageEvent(tsclientlib::messages::s2c::InMessage::ChannelListFinished(_)) =
+                        item.unwrap()
+                    {
+                        return;
+                    }
+                }
+            })
+            .await
+            .expect("TS client connected");
+            ts
+        }
+    };
+    let mut speaker = joined("speaker").await;
+    let from = speaker.get_state().unwrap().own_client.0;
+    let mut listeners = vec![joined("early").await];
+    let mut ids = vec![Vec::new(), Vec::new()];
+    let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
+    let mut t = 0u64;
+    // The early listener hears a first spurt alone, so a per-listener counter
+    // would put it ahead of the late listener.
+    for (seconds, late) in [(1, false), (2, true)] {
+        if late {
+            listeners.push(joined("late").await);
+        }
+        let end = Instant::now() + Duration::from_secs(seconds);
+        let mut speaking = true;
+        while speaking || Instant::now() < end + Duration::from_millis(500) {
+            speaking = Instant::now() < end;
+            if speaking {
+                let mut frame = [0f32; 960];
+                for s in frame.iter_mut() {
+                    *s = tone(t);
+                    t += 1;
+                }
+                let mut packet = [0u8; 1275];
+                let n = encoder.encode_float(&frame, &mut packet).unwrap();
+                let audio = AudioData::C2S { id: 0, codec: CodecType::OpusVoice, data: &packet[..n] };
+                speaker.send_audio(OutAudio::new(&audio)).unwrap();
+            }
+            let _ = timeout(Duration::from_millis(5), async {
+                let mut events = speaker.events();
+                while events.next().await.is_some() {}
+            })
+            .await;
+            for (listener, ids) in listeners.iter_mut().zip(&mut ids) {
+                let _ = timeout(Duration::from_millis(5), async {
+                    let mut events = listener.events();
+                    while let Some(Ok(item)) = events.next().await {
+                        if let StreamItem::Audio(audio) = item
+                            && let AudioData::S2C { id, from: sender, .. } = audio.data().data()
+                            && *sender == from
+                        {
+                            ids.push(*id);
+                        }
+                    }
+                })
+                .await;
+            }
+        }
+    }
+    eprintln!("voice ids: early {:?}", ids[0]);
+    eprintln!("voice ids: late {:?}", ids[1]);
+    assert!(ids[1].len() > 50, "late listener heard {} frames", ids[1].len());
+    let tail = |ids: &[u16]| ids[ids.len() - 20..].to_vec();
+    assert_eq!(tail(&ids[0]), tail(&ids[1]), "TeamSpeak renumbers voice per listener");
+}
