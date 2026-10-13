@@ -364,7 +364,7 @@ before applying output gain, then measures level/energy after that gain
 ([receive implementation](https://webrtc.googlesource.com/src/+/refs/heads/main/audio/channel_receive.cc)).
 These stats are recorded, but the PCM tone check determines playback.
 
-Round 2 retained [13 completed controls and raw counter endpoints](latency-browser-reuse.json)
+Round 2 ran 13 completed controls (raw counters kept locally, not committed)
 with 30–60-second post-switch windows. Prewarming removed the initial burst, yet
 buffering rose 37.83→48.58 ms and remained 49.14 ms in the final ten seconds;
 target/minimum stayed at 40 ms after reuse. Another prewarmed run retained about
