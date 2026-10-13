@@ -29,7 +29,7 @@ use vc_proto::SessionId;
 
 use crate::{
     core::CoreHandle,
-    media::{AudioPacket, MediaPlane, opus},
+    media::{AudioPacket, MediaPlane, SourceClock, opus},
 };
 
 /// A remote speaker counts as talking this long after its last frame.
@@ -45,14 +45,14 @@ pub struct Shared {
     heard: Mutex<HashMap<u16, Heard>>,
 }
 
-/// Recent frames of one TeamSpeak speaker. Frames are matched by content,
-/// which holds however the server numbers packets per recipient.
+/// Recent frames of one TeamSpeak speaker, shared across receiving puppets.
 struct Heard {
     session: SessionId,
     recent: [u64; 8],
     next: usize,
     at: Instant,
     talking: bool,
+    clock: Option<SourceClock>,
 }
 
 fn digest(data: &[u8]) -> u64 {
@@ -67,13 +67,26 @@ impl Shared {
 
     /// Publishes one frame from TeamSpeak client `from` unless another
     /// puppet already delivered it.
-    fn heard(&self, from: u16, opus: &[u8]) {
+    fn heard(&self, from: u16, id: u16, opus: &[u8]) {
         let Some(session) = self.mirrors.read().expect("mirrors lock").get(&from).copied() else { return };
         let now = Instant::now();
-        let hash = digest(opus);
+        let hash = digest(opus) ^ u64::from(id);
         let mut heard = self.heard.lock().expect("heard lock");
-        let entry =
-            heard.entry(from).or_insert(Heard { session, recent: [!hash; 8], next: 0, at: now, talking: false });
+        let entry = heard.entry(from).or_insert(Heard {
+            session,
+            recent: [!hash; 8],
+            next: 0,
+            at: now,
+            talking: false,
+            clock: None,
+        });
+        if entry.session != session {
+            entry.clock = None;
+        }
+        let clock = SourceClock::TeamSpeak { id, whisper: false };
+        if entry.clock.is_some_and(|old| clock.delta(old).is_err()) {
+            return;
+        }
         if entry.session != session || now.duration_since(entry.at) > Duration::from_secs(1) {
             entry.session = session;
             entry.recent = [!hash; 8];
@@ -83,6 +96,7 @@ impl Shared {
         entry.recent[entry.next] = hash;
         entry.next = (entry.next + 1) % entry.recent.len();
         entry.at = now;
+        entry.clock = Some(clock);
         if opus.is_empty() {
             if entry.talking {
                 entry.talking = false;
@@ -92,7 +106,12 @@ impl Shared {
             return;
         }
         let Some(samples) = opus::packet_samples(opus) else { return };
-        self.plane.publish(AudioPacket { from: session, opus: Arc::from(opus), samples });
+        self.plane.publish(AudioPacket {
+            from: session,
+            opus: Arc::from(opus),
+            samples,
+            clock: SourceClock::TeamSpeak { id, whisper: false },
+        });
         if !entry.talking {
             entry.talking = true;
             self.core.talking(session, true);
@@ -101,13 +120,18 @@ impl Shared {
 
     /// Delivers a whisper from TeamSpeak client `from` to the user behind the
     /// puppet that received it. Each targeted puppet gets its own copy.
-    fn whispered(&self, from: u16, to: SessionId, opus: &[u8]) {
+    fn whispered(&self, from: u16, to: SessionId, id: u16, opus: &[u8]) {
         let Some(session) = self.mirrors.read().expect("mirrors lock").get(&from).copied() else { return };
         let packet = if opus.is_empty() {
             AudioPacket::end_of_speech(session)
         } else {
             let Some(samples) = opus::packet_samples(opus) else { return };
-            AudioPacket { from: session, opus: Arc::from(opus), samples }
+            AudioPacket {
+                from: session,
+                opus: Arc::from(opus),
+                samples,
+                clock: SourceClock::TeamSpeak { id, whisper: true },
+            }
         };
         self.plane.deliver(to, packet);
     }
@@ -320,9 +344,9 @@ async fn run(
             Step::Item(Some(Err(e))) => return Err(anyhow!("{e}")),
             Step::Item(Some(Ok(item))) => match item {
                 StreamItem::Audio(packet) => match packet.data().data() {
-                    AudioData::S2C { from, codec, data, .. } if is_opus(*codec) => shared.heard(*from, data),
-                    AudioData::S2CWhisper { from, codec, data, .. } if is_opus(*codec) => {
-                        shared.whispered(*from, spec.session, data)
+                    AudioData::S2C { from, id, codec, data } if is_opus(*codec) => shared.heard(*from, *id, data),
+                    AudioData::S2CWhisper { from, id, codec, data, .. } if is_opus(*codec) => {
+                        shared.whispered(*from, spec.session, *id, data)
                     }
                     _ => {}
                 },

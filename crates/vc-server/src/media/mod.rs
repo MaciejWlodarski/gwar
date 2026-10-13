@@ -21,11 +21,45 @@ pub struct AudioPacket {
     pub from: SessionId,
     pub opus: Arc<[u8]>,
     pub samples: u32,
+    pub clock: SourceClock,
+}
+
+/// Original media clock and ordering identity, before SFU timestamp rewriting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceClock {
+    Rtp { ssrc: u32, sequence: u64, ticks: u32 },
+    TeamSpeak { id: u16, whisper: bool },
+}
+
+impl SourceClock {
+    /// None means a new clock; Err means a duplicate or reordered packet.
+    pub(crate) fn delta(self, previous: Self) -> Result<Option<u32>, ()> {
+        match (self, previous) {
+            (Self::Rtp { ssrc, sequence, ticks }, Self::Rtp { ssrc: old, sequence: seq, ticks: time })
+                if ssrc == old =>
+            {
+                if sequence <= seq || ticks == time {
+                    return Err(());
+                }
+                Ok(Some(ticks.wrapping_sub(time)))
+            }
+            (Self::TeamSpeak { id, whisper }, Self::TeamSpeak { id: old, whisper: was_whisper })
+                if whisper == was_whisper =>
+            {
+                let delta = id.wrapping_sub(old);
+                if delta == 0 || delta >= 0x8000 {
+                    return Err(());
+                }
+                Ok(Some(u32::from(delta) * 960))
+            }
+            _ => Ok(None),
+        }
+    }
 }
 
 impl AudioPacket {
     pub fn end_of_speech(from: SessionId) -> Self {
-        Self { from, opus: Arc::from([]), samples: 0 }
+        Self { from, opus: Arc::from([]), samples: 0, clock: SourceClock::TeamSpeak { id: 0, whisper: false } }
     }
 
     pub fn is_end(&self) -> bool {

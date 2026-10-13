@@ -12,7 +12,7 @@ use std::{
 };
 
 use rtrb::RingBuffer;
-use vc_client::voice::io::{AudioIo, AudioPorts, OutputTiming};
+use vc_client::voice::io::{AudioIo, AudioPorts, CaptureSample, OutputTiming};
 
 /// Fake audio is only honoured in debug builds.
 pub fn enabled() -> bool {
@@ -61,7 +61,7 @@ impl Drop for StopOnDrop {
 
 impl AudioIo for FakeIo {
     fn open(self: Box<Self>) -> anyhow::Result<AudioPorts> {
-        let (mut mic_tx, mic) = RingBuffer::<f32>::new(48_000);
+        let (mut mic_tx, mic) = RingBuffer::<CaptureSample>::new(48_000);
         let (speaker, mut speaker_rx) = RingBuffer::<f32>::new(24_000);
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
@@ -76,7 +76,7 @@ impl AudioIo for FakeIo {
                 for _ in 0..480 {
                     let s = if tone { (t as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.3 } else { 0.0 };
                     t += 1;
-                    let _ = mic_tx.push(s);
+                    let _ = mic_tx.push(CaptureSample { position: t - 1, value: s });
                 }
                 let missing = 480usize.saturating_sub(speaker_rx.slots());
                 for _ in 0..480 {
@@ -109,7 +109,7 @@ pub struct NullIo;
 
 impl AudioIo for NullIo {
     fn open(self: Box<Self>) -> anyhow::Result<AudioPorts> {
-        let (_mic_tx, mic) = RingBuffer::<f32>::new(1);
+        let (_mic_tx, mic) = RingBuffer::<CaptureSample>::new(1);
         let (speaker, _speaker_rx) = RingBuffer::<f32>::new(48_000 / 2);
         let output = Arc::new(OutputTiming::default());
         // The unused ring ends are dropped; the engine only ever sees empty/full rings.

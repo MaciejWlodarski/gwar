@@ -24,6 +24,7 @@ use tokio::{
     time::{sleep_until, timeout},
 };
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
+use vc_proto::rtp::{SLOT_GENERATION_ID, SlotGeneration, slot_generation_extension};
 use vc_proto::{AUDIO_SLOTS, Hello, hello_statement, normalize_endpoint, server_proof_statement};
 use vc_server::{Config, Running};
 
@@ -149,8 +150,8 @@ enum Cmd {
     Send { payload: Vec<u8>, ticks: u64, level: i8 },
 }
 
-/// Received frame: (receive-slot index, payload).
-type Received = (usize, Vec<u8>);
+/// Received frame: (receive-slot index, payload, media ticks, generation).
+type Received = (usize, Vec<u8>, u64, Option<u16>);
 
 struct RtcClient {
     commands: mpsc::Sender<Cmd>,
@@ -161,7 +162,11 @@ struct RtcClient {
 async fn rtc_client(ws: &mut Ws) -> RtcClient {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let local = socket.local_addr().unwrap();
-    let mut rtc = Rtc::builder().clear_codecs().enable_opus(true, false).build(Instant::now());
+    let mut rtc = Rtc::builder()
+        .set_extension(SLOT_GENERATION_ID, slot_generation_extension())
+        .clear_codecs()
+        .enable_opus(true, false)
+        .build(Instant::now());
     rtc.add_local_candidate(Candidate::host(local, "udp").unwrap());
     let mut api = rtc.sdp_api();
     let mic = api.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
@@ -189,7 +194,12 @@ async fn rtc_client(ws: &mut Ws) -> RtcClient {
                     }
                     Output::Event(RtcEvent::MediaData(data)) => {
                         if let Some(slot) = slots.iter().position(|m| *m == data.mid) {
-                            let _ = received_tx.try_send((slot, data.data.to_vec()));
+                            let _ = received_tx.try_send((
+                                slot,
+                                data.data.to_vec(),
+                                data.time.rebase(Frequency::FORTY_EIGHT_KHZ).numer(),
+                                data.ext_vals.user_values.get::<SlotGeneration>().map(|g| g.0),
+                            ));
                         }
                     }
                     Output::Event(_) => {}
@@ -259,7 +269,7 @@ async fn opus_is_forwarded_unchanged_within_channel_only() {
     speak(&a, 7, 15, -20).await;
     let got = drain(&mut b, 300).await;
     assert!(got.len() >= 10, "bob received {} frames", got.len());
-    assert!(got.iter().all(|(slot, p)| *slot == got[0].0 && p[0] == 0xf8 && p[1] == 7));
+    assert!(got.iter().all(|(slot, p, _, _)| *slot == got[0].0 && p[0] == 0xf8 && p[1] == 7));
     let slot = bob.event(|e| e["ev"] == "voice.slot").await;
     assert_eq!(slot["d"]["client"], alice_id);
     assert_eq!(slot["d"]["slot"], got[0].0);
@@ -287,5 +297,62 @@ async fn opus_is_forwarded_unchanged_within_channel_only() {
     // Back together: audio flows again.
     bob.request("channel.join", json!({"channel": 1})).await;
     speak(&a, 11, 10, -20).await;
-    assert!(drain(&mut b, 300).await.iter().any(|(_, p)| p[1] == 11));
+    assert!(drain(&mut b, 300).await.iter().any(|(_, p, _, _)| p[1] == 11));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sender_burst_recovers_receiver_latency_and_preserves_real_pause() {
+    use vc_client::voice::jitter::{JitterBuffer, Playout};
+
+    let running = server().await;
+    let mut alice = Ws::connect(running.http, "burst-sender").await;
+    let mut bob = Ws::connect(running.http, "burst-receiver").await;
+    alice.request("channel.join", json!({"channel": 1})).await;
+    bob.request("channel.join", json!({"channel": 1})).await;
+    let mut a = rtc_client(&mut alice).await;
+    let mut b = rtc_client(&mut bob).await;
+    timeout(WAIT, a.connected.recv()).await.unwrap().unwrap();
+    timeout(WAIT, b.connected.recv()).await.unwrap().unwrap();
+    let send = |i: u64| Cmd::Send { payload: vec![0xf0, i as u8], ticks: i * 480, level: -20 };
+    a.commands.send(send(0)).await.unwrap();
+    let first = timeout(WAIT, b.received.recv()).await.unwrap().unwrap();
+    assert_eq!(first.3, Some(1));
+    let mut buffer = JitterBuffer::new();
+    buffer.push(first.2, 480, first.1);
+    assert!(matches!(buffer.pop(), Playout::Packet { .. }));
+    // The sender captures continuously, but its uplink holds 27 frames.
+    for _ in 0..27 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        buffer.pop();
+    }
+    for i in 1..=27 {
+        a.commands.send(send(i)).await.unwrap();
+    }
+    for i in 1..=27 {
+        let packet = timeout(WAIT, b.received.recv()).await.unwrap().unwrap();
+        assert_eq!(packet.2, first.2 + i * 480);
+        assert_eq!(packet.3, first.3);
+        buffer.push(packet.2, 480, packet.1);
+    }
+    let Playout::Packet { data, .. } = buffer.pop() else { panic!("burst did not resume playout") };
+    assert!(data[1] >= 25, "receiver kept stale burst latency: {data:?}");
+    for i in 28..=47 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        a.commands.send(send(i)).await.unwrap();
+        let packet = timeout(WAIT, b.received.recv()).await.unwrap().unwrap();
+        buffer.push(packet.2, 480, packet.1);
+        let Playout::Packet { data, .. } = buffer.pop() else { panic!("playout stalled after recovery") };
+        assert!(u64::from(data[1]) >= i - 2, "latency returned after recovery");
+    }
+    // Silence reaches the SFU gate, then a fresh spurt resumes on the same clock.
+    tokio::time::sleep(Duration::from_millis(450)).await;
+    a.commands.send(Cmd::Send { payload: vec![0xf0, 90], ticks: 90 * 480, level: -90 }).await.unwrap();
+    assert!(timeout(Duration::from_millis(50), b.received.recv()).await.is_err());
+    a.commands.send(send(100)).await.unwrap();
+    let resumed = timeout(WAIT, b.received.recv()).await.unwrap().unwrap();
+    assert_eq!(resumed.2, first.2 + 100 * 480);
+    assert_eq!(resumed.3, first.3);
+    for task in running.tasks {
+        task.abort();
+    }
 }

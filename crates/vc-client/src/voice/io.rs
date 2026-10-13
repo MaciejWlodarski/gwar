@@ -18,9 +18,16 @@ use super::permission::{self, MicPermission, MicPermissionDenied};
 
 pub const RATE: u32 = 48_000;
 
+/// One resampled microphone sample; position advances even when the ring is full.
+#[derive(Debug, Clone, Copy)]
+pub struct CaptureSample {
+    pub position: u64,
+    pub value: f32,
+}
+
 /// Ring ends handed to the engine. Dropping `_guard` stops the devices.
 pub struct AudioPorts {
-    pub mic: Consumer<f32>,
+    pub mic: Consumer<CaptureSample>,
     pub speaker: Producer<f32>,
     pub _guard: Box<dyn Send>,
     /// Shared with the output callback; report each callback to wake the pipeline.
@@ -161,7 +168,7 @@ fn find<E>(devices: Result<impl Iterator<Item = cpal::Device>, E>, name: &str) -
 fn open_input(
     host: &cpal::Host,
     name: Option<&str>,
-    mut mic_tx: Producer<f32>,
+    mut mic_tx: Producer<CaptureSample>,
     timing: Arc<OutputTiming>,
     on_issue: Option<IssueSink>,
 ) -> Result<cpal::Stream> {
@@ -176,13 +183,15 @@ fn open_input(
     let channels = usize::from(config.channels());
     let mut to_engine = Resampler::new(config.sample_rate(), RATE);
     let mut mono = Vec::new();
+    let mut position = 0;
     let stream = device.build_input_stream(
         config.config(),
         move |data: &[f32], _| {
             mono.clear();
             mono.extend(data.chunks(channels).map(|frame| frame.iter().sum::<f32>() / frame.len() as f32));
             to_engine.process(&mono, |s| {
-                let _ = mic_tx.push(s);
+                let _ = mic_tx.push(CaptureSample { position, value: s });
+                position += 1;
             });
             timing.wake();
         },
@@ -247,7 +256,7 @@ fn open_output(
 
 impl AudioIo for DeviceIo {
     fn open(self: Box<Self>) -> Result<AudioPorts> {
-        let (mic_tx, mic) = RingBuffer::<f32>::new(RATE as usize); // 1 s
+        let (mic_tx, mic) = RingBuffer::<CaptureSample>::new(RATE as usize); // 1 s
         let (speaker, speaker_rx) = RingBuffer::<f32>::new(RATE as usize / 2);
         let output = Arc::new(OutputTiming::default());
         let timing = output.clone();

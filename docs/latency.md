@@ -206,3 +206,36 @@ pooled p95. The runners impose no fixed performance pass threshold.
 
 See [the 10 ms implementation report](opus-10ms.md) for transport compatibility,
 FEC evidence, bandwidth budgets and the paired local baseline measurements.
+
+## SFU media clock
+
+Each receive slot maps the current source's 48 kHz media deltas, independent of
+packet arrival spacing. Forward deltas up to five seconds preserve uplink
+bursts and real silence, including packets omitted by the speech gate. Native
+frames carry their first resampled capture position through the microphone ring
+and outgoing queue; mute, PTT, VAD and queue drops still advance that position.
+A ring overflow discards any partial frame spanning the missing samples.
+
+The SFU uses RTP events for the actual SSRC, extended sequence number and raw
+32-bit timestamp (MediaData has no SSRC). Timestamp wrap uses wrapping subtraction.
+Duplicate timestamps and older sequences drop before speech-state updates;
+a sequence restart requires a fresh SSRC or voice session. Retired SSRCs cannot
+return; after 32 changes, further changes require a new voice session.
+TeamSpeak uses its wrapping u16 packet id times 960 as a synthetic clock,
+with half-range ordering and separate voice/whisper identities. Its 20 ms counter cannot describe a silence gap unless
+the sender advances that counter. Both bridge directions retain Opus durations.
+
+First packets, speaker/SSRC changes, backward timestamps and deltas over five
+seconds use elapsed wall time rounded up to the previous packet's duration,
+at least one frame. Speaker reassignment also increments the existing slot
+generation. Zero deltas drop: forwarding the same media instant would duplicate
+playout. Dropping reordered packets keeps each output clock monotonic and lets
+the receiver conceal loss without replaying stale audio. Very long genuine
+pauses use the same wall-time fallback as a clock reset.
+
+Local release comparison against `26bc30d` (three 100-marker runs per build):
+baseline/candidate median 40.78/41.48 ms, p95 47.47/47.55 ms, p99 49.68/49.55 ms;
+298/300 and 299/300 markers matched, respectively, with no receiver underflows.
+No builds, tests or injected load ran during measurement; Spotlight remained
+active, so these were not fully idle-host measurements. Real internet impairment,
+live browser playback and official TeamSpeak interoperability remain unverified.

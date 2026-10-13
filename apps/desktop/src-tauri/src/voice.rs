@@ -521,7 +521,7 @@ pub async fn mic_test_start(app: AppHandle, voice: State<'_, Voice>, input: Opti
             let mut acc = (0f32, 0usize);
             while !stop.load(Ordering::Relaxed) {
                 while let Ok(s) = mic.pop() {
-                    acc.0 += s * s;
+                    acc.0 += s.value * s.value;
                     acc.1 += 1;
                 }
                 if acc.1 > 0 {

@@ -24,7 +24,7 @@ use vc_client::{
     ConnectOptions, Identity, connect,
     voice::{
         self,
-        io::{AudioIo, AudioPorts, OutputTiming},
+        io::{AudioIo, AudioPorts, CaptureSample, OutputTiming},
     },
 };
 use vc_proto::{ClientSoftware, Platform};
@@ -290,7 +290,7 @@ impl AudioIo for FakeIo {
                     } else {
                         0.0
                     };
-                    if mic_tx.push(value).is_err() {
+                    if mic_tx.push(CaptureSample { position: at as u64, value }).is_err() {
                         return;
                     }
                     let value = speaker_rx.pop().unwrap_or_else(|_| {
