@@ -107,11 +107,17 @@ impl SlotMap {
         };
         self.slots[slot] = Some((speaker, now));
         let time = match self.clocks.get(&speaker) {
-            Some(&(last, time)) => time + u64::from(packet_id.wrapping_sub(last)) * 960,
+            Some(&(last, time)) => {
+                // Reordered packets belong before the anchor, including across u16 wrap.
+                let delta = i64::from(packet_id.wrapping_sub(last) as i16);
+                time.saturating_add_signed(delta * 960)
+            }
             // Start far from 0 so a new speaker never looks "late" to the jitter buffer.
             None => 1 << 32,
         };
-        self.clocks.insert(speaker, (packet_id, time));
+        if self.clocks.get(&speaker).is_none_or(|&(last, _)| packet_id.wrapping_sub(last) as i16 > 0) {
+            self.clocks.insert(speaker, (packet_id, time));
+        }
         Some((slot, time, fresh))
     }
 
@@ -723,6 +729,11 @@ mod tests {
         let (a2, t1, fresh) = map.place(7, 0).unwrap(); // u16 wrap
         assert_eq!((a2, fresh), (a, false));
         assert_eq!(t1 - t0, 960);
+        let (_, reordered, _) = map.place(7, 65_534).unwrap();
+        assert_eq!(reordered, t0 - 960);
+        let (_, t2, _) = map.place(7, 1).unwrap();
+        assert_eq!(t2, t1 + 960);
+        assert_eq!(map.place(7, 0).unwrap().1, t1);
         let (b, _, _) = map.place(9, 3).unwrap();
         assert_ne!(a, b);
         assert_eq!(map.remove(7), Some(a));

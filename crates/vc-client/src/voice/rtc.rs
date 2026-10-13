@@ -14,7 +14,7 @@ use str0m::{
 use tokio::{net::UdpSocket, sync::mpsc, time::sleep_until};
 use vc_proto::AUDIO_SLOTS;
 
-use super::{Counters, Incoming, LinkState, Outgoing};
+use super::{Counters, Incoming, LinkState, Outgoing, io::OutputTiming, jitter::Clock};
 use std::sync::Arc;
 
 /// Marks the link lost however the transport task ends.
@@ -31,6 +31,7 @@ pub(crate) async fn start<F, Fut>(
     mut outgoing: mpsc::Receiver<Outgoing>,
     incoming: std::sync::mpsc::SyncSender<Incoming>,
     counters: Arc<Counters>,
+    wake: Arc<OutputTiming>,
 ) -> Result<()>
 where
     F: FnOnce(String) -> Fut,
@@ -64,11 +65,14 @@ where
                         if let Some(slot) = slots.iter().position(|m| *m == data.mid) {
                             let item = Incoming {
                                 slot,
+                                arrived: Instant::now(),
+                                clock: Clock::Rtp,
                                 rtp_time: data.time.rebase(Frequency::FORTY_EIGHT_KHZ).numer(),
                                 opus: data.data.to_vec(),
                             };
                             counters.frame_received();
                             let _ = incoming.try_send(item);
+                            wake.wake();
                         }
                     }
                     Ok(Output::Event(Event::Connected)) => {

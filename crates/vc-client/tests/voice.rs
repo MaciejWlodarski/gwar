@@ -115,10 +115,14 @@ async fn tone_travels_between_native_clients() {
     let silent = Arc::new(Mutex::new(Vec::new()));
     let heard = Arc::new(Mutex::new(Vec::new()));
     let _va = voice::start(&a.connection, Box::new(FakeIo { heard: silent, tone: true }), server.http).await.unwrap();
-    let _vb =
+    let vb =
         voice::start(&b.connection, Box::new(FakeIo { heard: heard.clone(), tone: false }), server.http).await.unwrap();
 
     tokio::time::sleep(Duration::from_secs(3)).await;
+    let stats = vb.stats();
+    assert_eq!(stats.callback_samples, 480);
+    assert!(stats.speaker_samples <= 960, "{stats:?}");
+    assert!(stats.slots.iter().all(|slot| slot.staged_samples <= 960), "{stats:?}");
     let samples = heard.lock().unwrap().clone();
     let tail = &samples[samples.len().saturating_sub(48_000)..];
     let level = rms(tail);

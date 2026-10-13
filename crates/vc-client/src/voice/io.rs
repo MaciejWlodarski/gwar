@@ -3,7 +3,7 @@
 
 use std::{
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc as std_mpsc,
     },
@@ -23,12 +23,14 @@ pub struct AudioPorts {
     pub mic: Consumer<f32>,
     pub speaker: Producer<f32>,
     pub _guard: Box<dyn Send>,
+    /// Shared with the output callback; report each callback to wake the pipeline.
     pub output: Arc<OutputTiming>,
 }
 
 /// Callback measurements in 48 kHz mono samples. Custom devices report once per callback.
 #[derive(Default)]
 pub struct OutputTiming {
+    pipeline: OnceLock<thread::Thread>,
     pub(crate) callback_samples: AtomicUsize,
     pub(crate) playing: AtomicBool,
     pub(crate) underruns: AtomicU64,
@@ -36,6 +38,16 @@ pub struct OutputTiming {
 }
 
 impl OutputTiming {
+    pub(crate) fn attach(&self) {
+        let _ = self.pipeline.set(thread::current());
+    }
+
+    pub(crate) fn wake(&self) {
+        if let Some(pipeline) = self.pipeline.get() {
+            pipeline.unpark();
+        }
+    }
+
     /// `missing` excludes intentionally silent samples supplied by the pipeline.
     pub fn report(&self, samples: usize, missing: usize) {
         self.callback_samples.store(samples, Ordering::Relaxed);
@@ -43,6 +55,7 @@ impl OutputTiming {
             self.underruns.fetch_add(1, Ordering::Relaxed);
             self.underrun_samples.fetch_add(missing as u64, Ordering::Relaxed);
         }
+        self.wake();
     }
 }
 
@@ -144,6 +157,7 @@ fn open_input(
     host: &cpal::Host,
     name: Option<&str>,
     mut mic_tx: Producer<f32>,
+    timing: Arc<OutputTiming>,
     on_issue: Option<IssueSink>,
 ) -> Result<cpal::Stream> {
     if permission::ensure_microphone_access() == MicPermission::Denied {
@@ -165,6 +179,7 @@ fn open_input(
             to_engine.process(&mono, |s| {
                 let _ = mic_tx.push(s);
             });
+            timing.wake();
         },
         move |e| {
             tracing::warn!("microphone stream error: {e}");
@@ -241,7 +256,7 @@ impl AudioIo for DeviceIo {
                     sink(issue);
                 }
             };
-            let input = open_input(&host, self.input.as_deref(), mic_tx, self.on_issue.clone());
+            let input = open_input(&host, self.input.as_deref(), mic_tx, timing.clone(), self.on_issue.clone());
             let output = open_output(&host, self.output.as_deref(), speaker_rx, timing, self.on_issue.clone());
             if let (Err(i), Err(o)) = (&input, &output) {
                 // A denied microphone stays recognisable for the caller (see `permission::is_denied`).
@@ -276,7 +291,25 @@ impl AudioIo for DeviceIo {
 
 #[cfg(test)]
 mod tests {
-    use super::Resampler;
+    use super::{OutputTiming, Resampler};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn underruns_exclude_idle_output_and_count_callbacks_and_samples_separately() {
+        let timing = OutputTiming::default();
+        timing.report(480, 480);
+        assert_eq!(timing.underruns.load(Ordering::Relaxed), 0);
+        timing.playing.store(true, Ordering::Relaxed);
+        timing.report(480, 0);
+        timing.report(480, 120);
+        timing.report(960, 960);
+        assert_eq!(timing.callback_samples.load(Ordering::Relaxed), 960);
+        assert_eq!(timing.underruns.load(Ordering::Relaxed), 2);
+        assert_eq!(timing.underrun_samples.load(Ordering::Relaxed), 1080);
+        timing.playing.store(false, Ordering::Relaxed);
+        timing.report(480, 480);
+        assert_eq!(timing.underruns.load(Ordering::Relaxed), 2);
+    }
 
     #[test]
     fn resampler_keeps_duration() {
