@@ -114,11 +114,8 @@ constant but does not implement a setting or change the product UI.
 
 ## Local verification and measurements
 
-Measured on macOS arm64 with Rust 1.99.0 (Homebrew) and libopus 1.6.1.
-The baseline is the untouched `a0f568603d1d32960c01574ebe5009c76bc88623`,
-archived into `target/base-src` and built with `--target-dir target/base`.
-The candidate uses `target/release/examples/latency`. Each binary embeds its
-corresponding local server. Release runs were sequential, with 80 markers/run:
+Measured on macOS arm64 with Rust 1.99.0 and libopus 1.6.1, against a baseline
+build of `a0f5686`. Each binary embeds its corresponding local server. Release runs were sequential, with 80 markers/run:
 five idle, two with 14 owned CPU-busy processes, and one with
 `LATENCY_CALLBACK_JITTER=1`, per build. No builds/tests ran alongside measurements.
 
@@ -167,43 +164,9 @@ limit generalization; use the per-run numbers below, not only pooled tails.
 | Variable callbacks | 1 | baseline | 80 | 90.203 | 98.663 | 103.373 | 1 | 3 | 0 |
 | Variable callbacks | 2 | candidate | 80 | 75.410 | 80.504 | 84.977 | 0 | 1 | 0 |
 
-### Checks and retained evidence
+### Open acceptance work
 
-All returned exit status 0:
-
-- `cargo fmt --all -- --check`
-- `cargo clippy --offline --workspace --exclude vc-desktop --all-targets -- -D warnings`
-- `cargo test --offline --workspace --exclude vc-desktop`: 369 passed, zero failed,
-  five ignored. Tests requiring TS configuration also return early with no TS
-  environment; this does not constitute real-TS coverage.
-- `cargo build --offline -p vc-desktop`
-- `cargo build --offline --release -p vc-client --example latency`
-
-Web source was untouched. No remote server or TeamSpeak server was contacted.
-Real TS interoperability stays with CI. Only owned load PIDs were stopped, and
-all load processes were reaped by the runner before it exited successfully.
-
-Local artifacts (ignored by git): `target/phase3/{idle,cpu,callback}` contain
-all CSV/JSON/client logs, binary hashes, run ordering and summaries;
-`target/phase3/report.json` contains aggregate and individual counters;
-`target/phase3/verified` contains check logs and exit statuses. The local runner
-is `target/phase3/measure.py`; it uses the existing runner validation and clears
-inherited `VC_*`/`LATENCY_*` variables.
-
-An initial complete matrix and its candidate binary are retained under
-`target/phase3/initial`. That implementation used the old two-packet SFU pause
-threshold: shortening frames also halved scheduling tolerance to 20 ms. The
-initial candidate had worse tails, especially under CPU load. A deterministic
-21 ms delayed-batch regression motivated the 40 ms floor; all checks and the
-entire matrix were then rerun. No run was retried or excluded from either
-matrix. The final tables above use only the final implementation.
-
-Final binary SHA-256:
-
-- baseline: `6b5e899ce85d1de286258e34cf8e8b2b666da54341636e73a0c12b217b35d165`
-- candidate: `57fbaa1e258a242b4538cc9164ca0edc9915a77c14a56381fba3fbbd63bc6fd6`
-
-Open acceptance work: real TS/browser playback, physical-device speech listening,
-WAN loss and longer calls; also investigate the three unmatched idle markers
-before treating this as a perceptual-quality result. The bandwidth-driven
-low-latency setting proposal remains unimplemented.
+Real TS/browser playback, physical-device speech listening, WAN loss and longer
+calls; also investigate the three unmatched idle markers before treating this
+as a perceptual-quality result. The bandwidth-driven low-latency setting
+proposal remains unimplemented.
