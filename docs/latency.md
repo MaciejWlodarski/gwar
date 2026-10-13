@@ -75,6 +75,106 @@ the matching window. A 300 ms delay should add about 300 ms to the measured
 latency, including when that moves the onset into a later marker period.
 The run drains for an additional matching window after marker generation.
 
+## Loopback network impairments
+
+Set `LATENCY_NET` on a direct local invocation to insert a UDP relay between
+both native clients and the fresh server. Signaling stays on its direct
+WebSocket connection. Unset the variable for the original direct media path;
+`LATENCY_NET=seed=1` exercises the relay without impairments. The relay rejects
+existing/remote server mode. The comparison runners clear `LATENCY_*`, so invoke
+the example directly for network experiments:
+
+```sh
+LATENCY_NET='seed=42;up:jitter=10ms' \
+  target/release/examples/latency target/latency/up-jitter.csv 100
+LATENCY_NET='seed=42;down:jitter=10ms' \
+  target/release/examples/latency target/latency/down-jitter.csv 100
+LATENCY_NET='up:stall=270ms@12s' \
+  target/release/examples/latency target/latency/up-stall.csv 100
+LATENCY_NET='down:stall=270ms@12s' \
+  target/release/examples/latency target/latency/down-stall.csv 100
+LATENCY_NET='seed=42;up:delay=20ms,jitter=5ms,keep_order,stall=270ms@12s,every=10s;down:loss=1%,burst=3@0.5%,reorder=0.5%' \
+  target/release/examples/latency target/latency/mixed.csv 100
+```
+
+The spec consists of semicolon-separated `up:options`, `down:options`, and an
+optional global `seed=N` section. Options use commas; each direction/key may
+appear once. Omitted directions pass through. Durations require `ms` or `s`
+and accept decimals (0 through 24 hours); percentages require `%` (0 through
+100). Invalid specs fail before starting a server.
+
+- `delay=20ms`: fixed delay on each surviving packet, default zero.
+- `jitter=5ms`: signed uniform jitter in `[-5ms,+5ms]`, added to base delay;
+  the total is clamped to zero. With no base delay, half of uniform draws pass
+  immediately and half add up to 5 ms. `distribution=normal` uses a normal draw
+  with sigma `jitter/3`, clipped to the same bounds; default is `uniform`.
+- `keep_order` (or `keep_order=true`): hold a packet until the previous packet's
+  scheduled release if needed. Default is false, so jitter may reorder packets.
+- `stall=270ms@12s`: block egress from 12.000 through 12.270 seconds on the
+  measurement clock, shared with `capture_s`/`playout_s`. The clock starts before
+  voice setup; the first marker is around 2.2 seconds. Packets whose scheduled
+  egress falls inside the window wait until its end, then leave as a burst,
+  without pacing. Packets already in flight are included. `every=10s` repeats
+  at 12, 22, 32… seconds; the period must exceed the stall duration.
+- `loss=1%`: independent random packet loss, default zero.
+- `burst=3@1%`: when outside a burst, each packet has a 1% chance of starting
+  a loss of three consecutive packets, including the trigger. During the burst
+  no new burst is started. Independent loss is applied to remaining packets.
+- `reorder=0.5%`: independently add a hold to selected surviving packets so
+  later packets can overtake them. `reorder_delay=20ms` sets that hold (default
+  20 ms). Selection does not guarantee reordering if no packet overtakes it.
+  Nonzero `reorder` conflicts with `keep_order`.
+- `seed=42`: unsigned 64-bit seed, either global or inside a direction to
+  override the global seed. The default global seed is 1.
+
+Loss is applied first, then delay/jitter, the optional reorder hold, the stall,
+and finally order preservation. The relay treats every UDP datagram alike,
+including ICE/DTLS/RTCP; it never decrypts media. Severe impairments during
+startup can prevent the voice connection. Each direction applies to **both**
+clients, with independent random streams per client/direction. The server
+advertises the relay's reserved loopback port using the existing
+`Config.media_advertise`; its UDP bind stays on a different random port. `Running.media_bind` exposes
+that actual socket address; `Running.media` remains the advertised address.
+A separate upstream socket per client preserves ICE session routing and sends
+server replies back from the advertised relay address. No production server
+flags, defaults, or voice-engine behavior change.
+
+SplitMix64 fixes the random algorithm across dependency upgrades. A seed
+reproduces packet decisions and scheduled release times for the same packet
+arrival trace. Real audio callbacks, OS UDP scheduling, ICE/control traffic and
+actual release times still vary between runs; a seed does not make the full
+mouth-to-ear measurement bit-for-bit deterministic. No packet is released
+before its scheduled deadline. Each direction/flow has a 65,536-packet queue
+limit; exceeding it or a socket/task error fails the run.
+
+The run JSON's `network` is `null` without the relay. Otherwise it records the
+original spec (`network.spec.source`), resolved settings and seeds, relay/server
+addresses, flow count, and aggregate `up`/`down` counts:
+`received`, `forwarded`, `delayed`, `dropped`, `reordered`, and `pending`.
+`delayed` counts surviving packets scheduled later than arrival, once per
+packet even if several impairments apply. `dropped` counts deliberate loss.
+`reordered` counts a forwarded packet whose arrival sequence is below the
+highest sequence already forwarded on its own flow; it does not count inversion
+pairs or packets merely selected by `reorder`. `pending` counts packets still
+queued at shutdown, separately from deliberate loss. With a completed relay,
+`received = forwarded + dropped + pending` in each direction.
+
+`stall_windows` lists windows that actually held packets, separately per flow
+(first-arriving client is flow 0). Each contains planned `start_s`/`end_s`,
+`first_packet_s` (arrival, possibly before the window for in-flight packets),
+held `packets`, and measured `first_release_s`/`last_release_s` (`null` if none
+were sent before shutdown). Resolved durations serialize as `{secs,nanos}`.
+CSV/JSON retain the original matching and loss gates: an impairment run can
+write useful output and still exit unsuccessfully if more than 5% of markers
+are unmatched. Inspect per-marker CSV timelines and applied stall windows,
+because a call's median alone can hide persistent latency after a stall.
+
+On `a0f5686`, `up:stall=270ms@12s` left about +240 ms on every later marker
+of the call (the SFU re-stamps slot RTP time from arrival, so the burst looks
+like a new talk spurt), while `down:stall=270ms@12s` recovered to baseline
+within one marker. `up:jitter=10ms` cost far more than `down:jitter=10ms`
+(103 vs 63 ms median) for the same reason.
+
 ## Compare builds
 
 Build each checkout into its **own `--target-dir`**: a shared directory can

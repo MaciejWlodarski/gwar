@@ -116,7 +116,10 @@ pub struct TeamSpeakConfig {
 
 pub struct Running {
     pub http: SocketAddr,
+    /// Address advertised to media clients (may differ from the socket bind).
     pub media: SocketAddr,
+    /// Actual local UDP socket address, including an OS-assigned port.
+    pub media_bind: SocketAddr,
     pub core: CoreHandle,
     pub plane: media::MediaPlane,
     /// TeamSpeak voice address, when enabled.
@@ -328,5 +331,15 @@ pub async fn start(config: Config) -> Result<Running> {
             Err(e) => tracing::warn!("{e:#}"),
         }
     }
-    Ok(Running { http, media: advertise, core, plane, teamspeak, teamspeak_ready, admin_token, tasks })
+    Ok(Running {
+        http,
+        media: advertise,
+        media_bind: media_addr,
+        core,
+        plane,
+        teamspeak,
+        teamspeak_ready,
+        admin_token,
+        tasks,
+    })
 }

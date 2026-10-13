@@ -15,8 +15,15 @@ fn b64(bytes: &[u8]) -> String {
     B64.encode(bytes)
 }
 
+const CERTIFICATE_LIFETIME: i64 = 90 * 24 * 3600 * 1000;
+
 fn now() -> i64 {
     vc_server::core::now_ms()
+}
+
+fn fresh_certificate(account: &SigningKey, device: &SigningKey, mut clock: impl FnMut() -> i64) -> Value {
+    let issued_at = clock();
+    certificate(account, device, issued_at, issued_at + CERTIFICATE_LIFETIME)
 }
 
 /// Connects as `device`, presenting `cert`.
@@ -44,8 +51,7 @@ async fn devices_of_one_account_are_one_person_until_revoked() {
     let account = SigningKey::from_bytes(&rand::random());
     let laptop = SigningKey::from_bytes(&rand::random());
     let phone = SigningKey::from_bytes(&rand::random());
-    let lifetime = 90 * 24 * 3600 * 1000;
-    let mut first = certificate(&account, &laptop, now(), now() + lifetime);
+    let mut first = fresh_certificate(&account, &laptop, now);
     first["name"] = json!("laptop");
     let blob = b64(&[0u8; 60]);
     let register = json!({
@@ -69,22 +75,23 @@ async fn devices_of_one_account_are_one_person_until_revoked() {
     ));
 
     // Both devices are the same member: the account's uid.
-    let laptop_client =
-        as_device(&server, &laptop, certificate(&account, &laptop, now(), now() + lifetime)).await.unwrap();
-    let mut phone_client =
-        as_device(&server, &phone, certificate(&account, &phone, now(), now() + lifetime)).await.unwrap();
+    let laptop_client = as_device(&server, &laptop, fresh_certificate(&account, &laptop, now)).await.unwrap();
+    let mut phone_client = as_device(&server, &phone, fresh_certificate(&account, &phone, now)).await.unwrap();
     let account_uid = vc_server::identity::uid_for_key(account.verifying_key().as_bytes());
     assert_eq!(laptop_client.welcome.uid, account_uid);
     assert_eq!(phone_client.welcome.uid, account_uid);
 
     // Forged, expired or mismatched certificates are refused.
     let thief = SigningKey::from_bytes(&rand::random());
-    assert!(as_device(&server, &thief, certificate(&thief, &phone, now(), now() + lifetime)).await.is_err());
-    assert!(as_device(&server, &phone, certificate(&account, &phone, now() - lifetime - 2, now() - 1)).await.is_err());
-    assert!(as_device(&server, &thief, certificate(&account, &phone, now(), now() + lifetime)).await.is_err());
+    assert!(as_device(&server, &thief, fresh_certificate(&thief, &phone, now)).await.is_err());
+    let expired_at = now() - 1;
+    let expired = certificate(&account, &phone, expired_at - CERTIFICATE_LIFETIME, expired_at);
+    let err = as_device(&server, &phone, expired).await.err().expect("expired certificate refused");
+    assert_eq!(err.code, vc_proto::ErrorCode::CertificateExpired);
+    assert!(as_device(&server, &thief, fresh_certificate(&account, &phone, now)).await.is_err());
 
     // The phone signed in on Connect too.
-    let mut phone_cert = certificate(&account, &phone, now(), now() + lifetime);
+    let mut phone_cert = fresh_certificate(&account, &phone, now);
     phone_cert["name"] = json!("phone");
     let login: Value = http
         .post(format!("{url}/v1/login"))
@@ -114,12 +121,32 @@ async fn devices_of_one_account_are_one_person_until_revoked() {
     assert_eq!(status.status(), 200);
     let gone = phone_client.expect_disconnect().await;
     assert_eq!(gone["kind"], "kicked");
-    let again = as_device(&server, &phone, certificate(&account, &phone, now(), now() + lifetime)).await;
+    let again = as_device(&server, &phone, fresh_certificate(&account, &phone, now)).await;
     assert_eq!(again.err().expect("revoked").code, vc_proto::ErrorCode::NotAuthenticated);
     // The laptop is unaffected.
-    as_device(&server, &laptop, certificate(&account, &laptop, now(), now() + lifetime))
-        .await
-        .expect("laptop still in");
+    as_device(&server, &laptop, fresh_certificate(&account, &laptop, now)).await.expect("laptop still in");
+}
+
+#[tokio::test]
+async fn maximum_lifetime_certificate_uses_one_clock_sample() {
+    let server = TestServer::start().await;
+    let (account, device) = (new_key(), new_key());
+    let issued_at = now();
+    let mut time = issued_at;
+    let cert = fresh_certificate(&account, &device, || {
+        let sample = time;
+        time += 1;
+        sample
+    });
+    let client = as_device(&server, &device, cert).await.expect("90-day certificate accepted across a clock tick");
+    assert_eq!(client.welcome.uid, uid_of(&account));
+    client.close().await;
+
+    // A second clock sample would exceed the lifetime limit by one millisecond.
+    let overlong = certificate(&account, &device, issued_at, issued_at + CERTIFICATE_LIFETIME + 1);
+    let err = as_device(&server, &device, overlong).await.err().expect("overlong certificate refused");
+    assert_eq!(err.code, vc_proto::ErrorCode::NotAuthenticated);
+    assert_eq!(err.message, "invalid identity signature");
 }
 
 #[tokio::test]

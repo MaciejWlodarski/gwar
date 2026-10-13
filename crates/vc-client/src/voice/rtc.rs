@@ -56,9 +56,13 @@ where
     let answer = signal(offer.to_sdp_string()).await?;
     rtc.sdp_api().accept_answer(pending, SdpAnswer::from_sdp_string(&answer)?)?;
     for mid in &slots {
+        let extension_id =
+            rtc.media(*mid).and_then(|media| media.remote_extmap().id_of(slot_generation_extension())).with_context(
+                || format!("native voice answer lacks the slot-generation extension on receive media {mid}"),
+            )?;
         ensure!(
-            rtc.media(*mid).is_some_and(|media| media.remote_extmap().id_of(slot_generation_extension()).is_some()),
-            "native voice answer lacks the slot-generation extension on receive media {mid}"
+            answer_sends_generation(&answer, *mid, extension_id),
+            "native voice answer does not send the slot-generation extension on receive media {mid}"
         );
     }
 
@@ -150,6 +154,28 @@ fn send_ticks(elapsed: std::time::Duration, last: Option<u64>) -> u64 {
     wall.max(last.map_or(0, |ticks| ticks + frame))
 }
 
+// str0m discards extmap directions. Read the answerer's (server's) direction
+// in the matching m-section; no qualifier inherits the media direction.
+fn answer_sends_generation(answer: &str, mid: Mid, id: u8) -> bool {
+    let Some(media) = answer
+        .split("\nm=")
+        .skip(1)
+        .map(|section| section.trim_end_matches('\r'))
+        .find(|section| section.lines().any(|line| line.strip_prefix("a=mid:") == Some(&*mid)))
+    else {
+        return false;
+    };
+    media.lines().filter_map(|line| line.strip_prefix("a=extmap:")).any(|extmap| {
+        let mut fields = extmap.split_whitespace();
+        let Some(mapping) = fields.next() else { return false };
+        let (value, direction) =
+            mapping.split_once('/').map_or((mapping, None), |(value, direction)| (value, Some(direction)));
+        value.parse::<u8>() == Ok(id)
+            && fields.next() == Some(slot_generation_extension().as_uri())
+            && matches!(direction, None | Some("sendonly" | "sendrecv"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +189,31 @@ mod tests {
         assert_eq!(send_ticks(Duration::ZERO, Some(0)), frame);
         assert_eq!(send_ticks(Duration::from_millis(20), Some(frame)), 960.max(2 * frame));
         assert_eq!(send_ticks(Duration::from_secs(1), Some(960)), 48_000);
+    }
+
+    #[test]
+    fn generation_direction_matches_the_media_and_mapping() {
+        let extension = slot_generation_extension();
+        let uri = extension.as_uri();
+        for newline in ["\r\n", "\n"] {
+            // Put extmap before mid and include extension attributes.
+            let answer = [
+                "v=0".to_owned(),
+                "m=audio 9 UDP/TLS/RTP/SAVPF 111".to_owned(),
+                format!("a=extmap:9/sendonly {uri}"),
+                "a=mid:mic".to_owned(),
+                "m=audio 9 UDP/TLS/RTP/SAVPF 111".to_owned(),
+                format!("a=extmap:9/recvonly {uri} extra"),
+                "a=mid:slot".to_owned(),
+            ]
+            .join(newline);
+            assert!(answer_sends_generation(&answer, "mic".into(), 9));
+            assert!(!answer_sends_generation(&answer, "slot".into(), 9));
+            assert!(!answer_sends_generation(&answer, "mic".into(), 8));
+            assert!(!answer_sends_generation(&answer, "missing".into(), 9));
+            assert!(answer_sends_generation(&answer.replace("/recvonly", "/sendonly"), "slot".into(), 9));
+            assert!(!answer_sends_generation(&answer.replace(uri, &format!("{uri}:other")), "mic".into(), 9));
+        }
     }
 
     #[tokio::test]
@@ -213,6 +264,59 @@ mod tests {
                 assert!(error.contains("answer lacks the slot-generation extension on receive media"), "{error}");
             } else {
                 result.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn start_requires_sending_generation_on_every_receive_slot() {
+        for direction in [None, Some("inactive"), Some("recvonly"), Some("sendonly"), Some("sendrecv")] {
+            // Changing only the microphone must not affect receive slots.
+            for changed in 0..=AUDIO_SLOTS {
+                let (_outgoing, receiver) = mpsc::channel(1);
+                let (incoming, _receiver) = std::sync::mpsc::sync_channel(1);
+                let result = start(
+                    |offer| async move {
+                        let mut server = Rtc::builder()
+                            .set_extension(SLOT_GENERATION_ID, slot_generation_extension())
+                            .clear_codecs()
+                            .enable_opus(true, false)
+                            .build(Instant::now());
+                        let answer = server.sdp_api().accept_offer(SdpOffer::from_sdp_string(&offer)?)?.to_sdp_string();
+                        let mut media = None;
+                        let answer = answer
+                            .lines()
+                            .map(|line| {
+                                if line.starts_with("m=") {
+                                    media = Some(media.map_or(0, |i| i + 1));
+                                }
+                                if media == Some(changed)
+                                    && let Some(extmap) = line.strip_prefix("a=extmap:")
+                                    && let Some((id, uri)) = extmap.split_once(' ')
+                                    && uri == slot_generation_extension().as_uri()
+                                {
+                                    let qualifier = direction.map_or(String::new(), |d| format!("/{d}"));
+                                    return format!("a=extmap:{id}{qualifier} {uri}");
+                                }
+                                line.to_owned()
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\r\n");
+                        Ok(format!("{answer}\r\n"))
+                    },
+                    "127.0.0.1".parse().unwrap(),
+                    receiver,
+                    incoming,
+                    Arc::new(Counters::default()),
+                    Arc::new(OutputTiming::default()),
+                )
+                .await;
+                if changed > 0 && matches!(direction, Some("inactive" | "recvonly")) {
+                    let error = result.unwrap_err().to_string();
+                    assert!(error.contains("slot-generation extension on receive media"), "{error}");
+                } else {
+                    result.unwrap();
+                }
             }
         }
     }
