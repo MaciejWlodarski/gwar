@@ -8,8 +8,9 @@ use str0m::{
     Candidate, Event, Input, Output, Rtc,
     change::SdpAnswer,
     format::Codec,
-    media::{Direction, Frequency, MediaKind, MediaTime, Mid},
+    media::{Direction, Frequency, MediaKind, Mid},
     net::{Protocol, Receive},
+    rtp::{ExtensionValues, RtpWrite},
 };
 use tokio::{net::UdpSocket, sync::mpsc, time::sleep_until};
 use vc_proto::{
@@ -42,8 +43,11 @@ where
 {
     let socket = UdpSocket::bind(SocketAddr::new(local_ip, 0)).await.context("bind media socket")?;
     let local = socket.local_addr()?;
+    // RTP mode: our jitter buffer orders packets itself. str0m's frame mode would
+    // hold up to 15 packets behind every downlink loss and release them as a burst.
     let mut rtc = Rtc::builder()
         .set_extension(SLOT_GENERATION_ID, slot_generation_extension())
+        .set_rtp_mode(true)
         .clear_codecs()
         .enable_opus(true, false)
         .build(Instant::now());
@@ -62,10 +66,22 @@ where
         );
     }
 
+    let pt = rtc
+        .media(mic)
+        .and_then(|m| {
+            rtc.codec_config()
+                .params()
+                .iter()
+                .find(|p| m.remote_pts().contains(&p.pt()) && p.spec().codec == Codec::Opus)
+        })
+        .map(|p| p.pt())
+        .context("native voice answer lacks Opus on the microphone")?;
+
     tokio::spawn(async move {
         let _lost = LostOnDrop(counters.clone());
         let mut buf = vec![0u8; 2048];
         let mut last_ticks = None;
+        let mut sequence = 0u64;
         loop {
             let deadline = loop {
                 match rtc.poll_output() {
@@ -73,18 +89,24 @@ where
                     Ok(Output::Transmit(t)) => {
                         let _ = socket.try_send_to(&t.contents, t.destination);
                     }
-                    Ok(Output::Event(Event::MediaData(data))) => {
-                        if let Some(slot) = slots.iter().position(|m| *m == data.mid) {
-                            let rtp_time = data.time.rebase(Frequency::FORTY_EIGHT_KHZ).numer();
-                            let generation =
-                                data.ext_vals.user_values.get::<SlotGeneration>().copied().map(super::Generation::Rtp);
+                    Ok(Output::Event(Event::RtpPacket(packet))) => {
+                        let mid = rtc.direct_api().stream_rx(&packet.header.ssrc).map(|s| s.mid());
+                        if let Some(slot) = slots.iter().position(|m| Some(*m) == mid) {
+                            let rtp_time = packet.time.rebase(Frequency::FORTY_EIGHT_KHZ).numer();
+                            let generation = packet
+                                .header
+                                .ext_vals
+                                .user_values
+                                .get::<SlotGeneration>()
+                                .copied()
+                                .map(super::Generation::Rtp);
                             let item = Incoming {
                                 slot,
                                 arrived: Instant::now(),
                                 clock: Clock::Rtp,
                                 rtp_time,
                                 generation,
-                                opus: data.data.to_vec(),
+                                opus: packet.payload.to_vec(),
                             };
                             counters.frame_received();
                             let _ = incoming.try_send(item);
@@ -114,12 +136,11 @@ where
                     let Some(frame) = frame else { return };
                     let ticks = send_ticks(frame.capture_position, last_ticks);
                     last_ticks = Some(ticks);
-                    let pt = rtc.writer(mic).and_then(|w| w.payload_params().find(|p| p.spec().codec == Codec::Opus).map(|p| p.pt()));
-                    if let (Some(writer), Some(pt)) = (rtc.writer(mic), pt) {
-                        {
-                            let time = MediaTime::new(ticks, Frequency::FORTY_EIGHT_KHZ);
-                            let _ = writer.audio_level(frame.level, frame.speech).write(pt, Instant::now(), time, frame.opus);
-                        }
+                    if let Some(stream) = rtc.direct_api().stream_tx_by_mid(mic, None) {
+                        let ext_vals = ExtensionValues { audio_level: Some(frame.level), voice_activity: Some(frame.speech), ..Default::default() };
+                        let write = RtpWrite::new(pt, sequence.into(), ticks as u32, Instant::now(), frame.opus);
+                        stream.write_rtp(write.ext_vals(ext_vals));
+                        sequence += 1;
                     }
                 }
                 received = socket.recv_from(&mut buf) => {
