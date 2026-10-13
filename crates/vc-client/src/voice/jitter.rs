@@ -58,6 +58,7 @@ pub struct JitterBuffer {
     observing_since: Option<Instant>,
     last_observation: Option<Instant>,
     last_shrink: Option<Instant>,
+    last_attempt: Option<Instant>,
     pub(crate) concealments: u64,
     pub(crate) late_drops: u64,
     pub(crate) shrink_samples: u64,
@@ -78,6 +79,8 @@ const SAFETY: u64 = 120; // Retain 2.5 ms beyond the observed refill low-water m
 const FORCE_SHRINK: Duration = Duration::from_secs(2);
 const SHRINK_STEP: u64 = 720; // Allow one low-pitched period (15 ms); the decoder commits the actual cut.
 const SHRINK_INTERVAL: Duration = Duration::from_secs(1);
+// A declined proposal (noise, onset) costs a pitch search; retry at most 5 times a second.
+const SHRINK_RETRY: Duration = Duration::from_millis(200);
 
 impl Default for JitterBuffer {
     fn default() -> Self {
@@ -103,6 +106,7 @@ impl JitterBuffer {
             observing_since: None,
             last_observation: None,
             last_shrink: None,
+            last_attempt: None,
             concealments: 0,
             late_drops: 0,
             shrink_samples: 0,
@@ -217,6 +221,7 @@ impl JitterBuffer {
         self.above_since = None;
         self.clear_depth();
         self.last_shrink = None;
+        self.last_attempt = None;
     }
 
     pub fn pop(&mut self) -> Playout {
@@ -341,7 +346,11 @@ impl JitterBuffer {
             let shrink = demand > 0
                 && self.surplus >= SAFETY
                 && held >= QUIET_SHRINK
-                && self.last_shrink.is_none_or(|at| now.saturating_duration_since(at) >= SHRINK_INTERVAL);
+                && self.last_shrink.is_none_or(|at| now.saturating_duration_since(at) >= SHRINK_INTERVAL)
+                && self.last_attempt.is_none_or(|at| now.saturating_duration_since(at) >= SHRINK_RETRY);
+            if shrink {
+                self.last_attempt = Some(now);
+            }
             return Playout::Packet {
                 data: packet.data,
                 skip: if shrink { SHRINK_STEP.min(self.surplus).min(available) as usize } else { 0 },
@@ -810,6 +819,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn declined_corrections_are_retried_at_a_bounded_rate() {
+        // Sustained noise with real surplus: the decoder declines every proposal,
+        // and each proposal costs a pitch search, so proposals must stay sparse.
+        let mut jb = JitterBuffer::new();
+        let now = Instant::now();
+        let mut ts = 0;
+        for _ in 0..40 {
+            jb.push_at(ts, 480, vec![1], now, Clock::Rtp);
+            ts += 480;
+        }
+        for ms in (0..5000).step_by(10) {
+            jb.observe_depth(now + Duration::from_millis(ms), 0, 480);
+        }
+        let mut proposals = 0;
+        for ms in (5000..7000).step_by(10) {
+            let at = now + Duration::from_millis(ms);
+            jb.arrival = None;
+            jb.push_at(ts, 480, vec![1], at, Clock::Rtp);
+            ts += 480;
+            if let Playout::Packet { skip, .. } = jb.pop_at(at) {
+                proposals += usize::from(skip > 0);
+                jb.shrunk(at, 0);
+            }
+        }
+        assert!((5..=10).contains(&proposals), "proposals={proposals}");
+        assert_eq!(jb.trim_events, 0);
     }
 
     #[test]
