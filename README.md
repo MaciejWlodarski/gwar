@@ -464,7 +464,7 @@ feature (`teamspeak`, on by default); build without it with
 
 More in [docs/architecture.md](docs/architecture.md), [docs/connect.md](docs/connect.md),
 [docs/security.md](docs/security.md), [docs/deploy.md](docs/deploy.md),
-[docs/releasing.md](docs/releasing.md) and, for what comes next,
+[docs/releasing.md](docs/releasing.md), [docs/latency.md](docs/latency.md) and, for what comes next,
 [docs/e2e.md](docs/e2e.md).
 
 ## Tests
