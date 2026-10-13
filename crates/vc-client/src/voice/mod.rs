@@ -129,6 +129,8 @@ struct SlotCounters {
     target_samples: AtomicU64,
     staged_samples: AtomicU64,
     shrink_samples: AtomicU64,
+    trim_events: AtomicU64,
+    concealments_after_trim: AtomicU64,
 }
 
 /// Per-slot receive queue snapshot; sample counts use the 48 kHz clock.
@@ -142,6 +144,9 @@ pub struct SlotStats {
     pub target_samples: u64,
     pub staged_samples: u64,
     pub shrink_samples: u64,
+    pub trim_events: u64,
+    /// Concealments within one second of a trim, including stall recovery.
+    pub concealments_after_trim: u64,
 }
 
 /// Snapshot of transport counters, for diagnostics and the connection indicator.
@@ -222,6 +227,8 @@ impl VoiceHandle {
                     target_samples: s.target_samples.load(Ordering::Relaxed),
                     staged_samples: s.staged_samples.load(Ordering::Relaxed),
                     shrink_samples: s.shrink_samples.load(Ordering::Relaxed),
+                    trim_events: s.trim_events.load(Ordering::Relaxed),
+                    concealments_after_trim: s.concealments_after_trim.load(Ordering::Relaxed),
                 }
             }),
             speaker_samples: c.speaker_samples.load(Ordering::Relaxed),
@@ -487,6 +494,8 @@ fn pipeline(
             stats.target_samples.store(buffer.target_samples(), Ordering::Relaxed);
             stats.staged_samples.store(slot.staged_samples() as u64, Ordering::Relaxed);
             stats.shrink_samples.store(buffer.shrink_samples, Ordering::Relaxed);
+            stats.trim_events.store(buffer.trim_events, Ordering::Relaxed);
+            stats.concealments_after_trim.store(buffer.concealments_after_trim, Ordering::Relaxed);
         }
         // Capture, receive and output all unpark us. The timeout also handles device failure.
         thread::park_timeout(Duration::from_millis(20));

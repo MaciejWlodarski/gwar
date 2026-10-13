@@ -157,10 +157,21 @@ artificial delay in both ms and samples are recorded too.
 `receiver_playout` is the receiver's final live snapshot: speaker queue level,
 latest and held maximum callback sizes, scheduling headroom, active-stream
 underrun events and samples, and per-slot target/queue/staged samples,
-concealment events, late drops and shrunk samples. All sample counts use 48 kHz
-mono; divide by 48 for ms. These cumulative counters include warmup; raw
+concealment events, late drops, shrunk samples, `trim_events` and
+`concealments_after_trim` (concealments within one second after a trim). A trim
+event is one fractional correction or one stall-recovery batch; these counters
+include both. Proximity is diagnostic correlation, not proof that a trim caused
+the concealment. All sample counts use 48 kHz mono; divide by 48 for ms. These cumulative counters include warmup; raw
 receiver underflows also include idle callbacks, whereas playout underruns count
 only callbacks during playback.
+
+Fractional corrections use the minimum queue + staged PCM margin observed
+before refills over a full trailing second. The margin excludes the pending
+refill, adaptive jitter reserve beyond packet batching, and 120 samples (2.5 ms)
+of safety. Arrival phase contributes no credit. Each correction removes at most
+240 samples, then rebuilds the observation window; nonquiet audio still waits
+for the two-second deadline and speech onsets remain protected. Surplus
+below 120 samples is not corrected.
 
 For a variable output device, invoke the example directly with
 `LATENCY_CALLBACK_JITTER=1 target/release/examples/latency output.csv 100`.

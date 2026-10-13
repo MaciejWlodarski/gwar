@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn quiet_shrink_preserves_speech_onset_after_silence_or_plc() {
-        for (plc, delay) in [(false, 600), (true, 600), (false, 2500), (true, 2500)] {
+        for (plc, delay) in [(false, 1200), (true, 1200), (false, 2500), (true, 2500)] {
             let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
             let mut reference = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
             let mut slot = Slot::new().unwrap();
@@ -306,6 +306,9 @@ mod tests {
                 slot.mix_into(&mut concealed, 1.0, now + Duration::from_millis(20)).unwrap();
                 assert_eq!(concealed.as_slice(), decode(&mut reference, None));
             }
+            for ms in (40..delay).step_by(20) {
+                slot.buffer.observe_depth(now + Duration::from_millis(ms), 0, 960);
+            }
             let expected = decode(&mut reference, Some(&onset));
             assert!(level_db(&expected) > -42.0);
             let mut actual = [0.0; 960];
@@ -324,10 +327,13 @@ mod tests {
             slot.buffer.push(i * 960, 960, encode(&encoder, false));
         }
         slot.mix_into(&mut [0.0; 960], 1.0, now).unwrap();
-        slot.mix_into(&mut [0.0; 1], 1.0, now + Duration::from_millis(600)).unwrap();
+        for ms in (20..=1000).step_by(20) {
+            slot.buffer.observe_depth(now + Duration::from_millis(ms), 0, 960);
+        }
+        slot.mix_into(&mut [0.0; 1], 1.0, now + Duration::from_millis(1000)).unwrap();
         assert_eq!(slot.buffer.shrink_samples, 240);
         assert_eq!(slot.fade_left, 119);
-        slot.mix_into(&mut [0.0; 119], 1.0, now + Duration::from_millis(600)).unwrap();
+        slot.mix_into(&mut [0.0; 119], 1.0, now + Duration::from_millis(1000)).unwrap();
         assert_eq!(slot.fade_left, 0);
     }
 
@@ -373,6 +379,58 @@ mod tests {
     }
 
     #[test]
+    fn small_arrival_jitter_never_trims_refill_margin_into_starvation() {
+        use super::super::jitter::Clock;
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            for callback in [240, 480, 960] {
+                for phase in [-96, 0, 96] {
+                    for excess in [0, 480] {
+                        let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
+                        let mut slot = Slot::new().unwrap();
+                        let now = Instant::now();
+                        // Cover one refill when a packet arrives just after it.
+                        slot.end = callback + excess;
+                        let mut packet = 0u64;
+                        let mut at_five_seconds = 0;
+                        for tick in (0..60 * 48_000u64).step_by(callback) {
+                            let at = now + Duration::from_secs_f64(tick as f64 / 48_000.0);
+                            loop {
+                                // Deterministic +/-3 ms jitter, independent of refills.
+                                let jitter = [0, 144, -96, 48, -144, 96, -48][packet as usize % 7];
+                                let arrival = (packet as i64 * 960 + phase + jitter).max(0) as u64;
+                                if arrival > tick {
+                                    break;
+                                }
+                                slot.buffer.push_at(
+                                    packet * 960,
+                                    960,
+                                    encode(&encoder, true),
+                                    now + Duration::from_secs_f64(arrival as f64 / 48_000.0),
+                                    clock,
+                                );
+                                packet += 1;
+                            }
+                            slot.mix_into(&mut vec![0.0; callback], 1.0, at).unwrap();
+                            if tick == 5 * 48_000 {
+                                at_five_seconds = slot.buffer.shrink_samples;
+                            }
+                        }
+                        let label = format!("{clock:?}, callback={callback}, phase={phase}, excess={excess}");
+                        assert_eq!(slot.buffer.concealments, 0, "{label}, shrunk={}", slot.buffer.shrink_samples);
+                        assert_eq!(slot.buffer.concealments_after_trim, 0, "{label}");
+                        if excess == 0 {
+                            assert_eq!(slot.buffer.shrink_samples, 0, "{label}: tail is refill margin");
+                        } else {
+                            assert!(at_five_seconds >= 240, "{label}: persistent surplus did not converge");
+                            assert!(slot.buffer.shrink_samples <= excess as u64, "{label}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn fractional_staged_surplus_converges_with_bounded_forced_corrections() {
         use super::super::jitter::Clock;
         for clock in [Clock::Rtp, Clock::Sequence] {
@@ -412,7 +470,9 @@ mod tests {
                         converged.is_some_and(|tick| tick <= 5 * 48_000),
                         "{clock:?}, excess={excess}, callback={callback}, corrected={corrected}"
                     );
-                    assert_eq!(corrected, (excess / 240 * 240) as u64);
+                    // Preserve 2.5 ms of safety; residual corrections below
+                    // 2.5 ms are deliberately ignored.
+                    assert!((120..240).contains(&(excess as u64 - corrected)));
                     assert_eq!(slot.buffer.concealments, 0);
                 }
             }

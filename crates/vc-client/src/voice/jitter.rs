@@ -1,7 +1,7 @@
 //! Per-slot adaptive playout, using 48 kHz RTP time or TS packet-counter time.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -52,10 +52,15 @@ pub struct JitterBuffer {
     jitter: f64,
     above_since: Option<Instant>,
     surplus: u64,
+    low_water: VecDeque<(Instant, u64)>,
+    observing_since: Option<Instant>,
+    last_observation: Option<Instant>,
     last_shrink: Option<Instant>,
     pub(crate) concealments: u64,
     pub(crate) late_drops: u64,
     pub(crate) shrink_samples: u64,
+    pub(crate) trim_events: u64,
+    pub(crate) concealments_after_trim: u64,
 }
 
 const FRAME: u64 = 960;
@@ -63,7 +68,9 @@ const MAX_CONCEAL: u32 = 5;
 const STALL: Duration = Duration::from_millis(100);
 const MAX_PACKETS: usize = 64;
 const MAX_TARGET: u64 = FRAME * 8;
-const QUIET_SHRINK: Duration = Duration::from_millis(500);
+const QUIET_SHRINK: Duration = Duration::from_secs(1);
+const DEPTH_WINDOW: Duration = Duration::from_secs(1);
+const SAFETY: u64 = 120; // Retain 2.5 ms beyond the observed refill low-water mark.
 const FORCE_SHRINK: Duration = Duration::from_secs(2);
 const SHRINK_STEP: u64 = 240; // At most 5 ms per correction.
 const SHRINK_INTERVAL: Duration = Duration::from_secs(1);
@@ -88,10 +95,15 @@ impl JitterBuffer {
             jitter: 0.0,
             above_since: None,
             surplus: 0,
+            low_water: VecDeque::new(),
+            observing_since: None,
+            last_observation: None,
             last_shrink: None,
             concealments: 0,
             late_drops: 0,
             shrink_samples: 0,
+            trim_events: 0,
+            concealments_after_trim: 0,
         }
     }
 
@@ -193,7 +205,7 @@ impl JitterBuffer {
         self.arrival = None;
         self.jitter = 0.0;
         self.above_since = None;
-        self.surplus = 0;
+        self.clear_depth();
         self.last_shrink = None;
     }
 
@@ -205,21 +217,47 @@ impl JitterBuffer {
     pub(crate) fn shrunk(&mut self, now: Instant, samples: usize) {
         if samples > 0 {
             self.shrink_samples += samples as u64;
+            self.trim_events += 1;
             self.last_shrink = Some(now);
+            // The old minimum describes audio we just removed. Rebuild the
+            // window before allowing another correction. Keep the speech deadline.
+            self.clear_depth();
         }
     }
 
-    /// Observe once per refill, including the decoded tail. Compensate for
-    /// packet arrival phase so a fractional-frame surplus stays measurable
-    /// between arrivals. Clamp the phase to one packet, never extrapolate a stall.
+    fn clear_depth(&mut self) {
+        self.low_water.clear();
+        self.observing_since = None;
+        self.last_observation = None;
+        self.surplus = 0;
+    }
+
+    /// Sample queue + decoded tail immediately before each refill. The packet
+    /// target includes one packet of batching; at the low-water point only the
+    /// pending refill, additional jitter reserve and safety margin are required.
+    /// Arrival phase is never audio credit. A full second of observations must
+    /// support a surplus, and any lower sample vetoes a correction immediately.
     pub(crate) fn observe_depth(&mut self, now: Instant, staged: usize, demand: usize) {
-        let phase = self.arrival.map_or(0, |(_, at, samples)| {
-            ((now.saturating_duration_since(at).as_secs_f64() * 48_000.0) as u64).min(samples)
-        });
+        if self.last_observation.is_some_and(|at| now.saturating_duration_since(at) >= STALL) {
+            self.clear_depth();
+            self.above_since = None;
+        }
+        self.last_observation = Some(now);
+        let since = *self.observing_since.get_or_insert(now);
         let packet_samples = self.packets.first_key_value().map_or(self.last_samples, |(_, p)| p.samples);
-        let target = self.target_samples().max(packet_samples).max(demand as u64);
-        self.surplus = (self.depth().1 + staged as u64 + phase).saturating_sub(target);
-        if self.surplus >= SHRINK_STEP {
+        let reserve = self.target_samples().saturating_sub(packet_samples) + SAFETY;
+        let margin = (self.depth().1 + staged as u64).saturating_sub(demand as u64 + reserve);
+        // Monotone queue: the front is the minimum of the trailing window.
+        while self.low_water.front().is_some_and(|&(at, _)| now.saturating_duration_since(at) > DEPTH_WINDOW) {
+            self.low_water.pop_front();
+        }
+        while self.low_water.back().is_some_and(|&(_, value)| value >= margin) {
+            self.low_water.pop_back();
+        }
+        self.low_water.push_back((now, margin));
+        let minimum = self.low_water.front().unwrap().1;
+        self.surplus = if now.saturating_duration_since(since) >= DEPTH_WINDOW { minimum } else { 0 };
+        if minimum >= SAFETY {
             self.above_since.get_or_insert(now);
         } else {
             self.above_since = None;
@@ -227,7 +265,7 @@ impl JitterBuffer {
     }
 
     pub(crate) fn pop_at(&mut self, now: Instant) -> Playout {
-        self.observe_depth(now, 0, 0);
+        self.observe_depth(now, 0, FRAME as usize);
         self.pop_for(now, FRAME as usize)
     }
 
@@ -252,7 +290,9 @@ impl JitterBuffer {
             if fade {
                 self.next = self.packets.first_key_value().map(|(&ts, _)| ts);
                 self.held = 0;
+                self.trim_events += 1;
                 self.last_shrink = Some(now);
+                self.clear_depth();
                 self.above_since = None;
             }
         }
@@ -271,7 +311,7 @@ impl JitterBuffer {
             self.held = self.held.saturating_sub(covered);
             self.next = Some(next);
         }
-        let available = self.depth().1.saturating_sub(demand as u64);
+        let available = self.depth().1.saturating_sub(demand as u64 + SAFETY);
         let held = self.above_since.map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
         if let Some(packet) = self.packets.remove(&next) {
             self.next = Some(next.saturating_add(packet.step));
@@ -281,7 +321,8 @@ impl JitterBuffer {
             self.last_samples = packet.samples;
             self.missing = 0;
             self.held = 0;
-            let shrink = held >= QUIET_SHRINK
+            let shrink = self.surplus >= SAFETY
+                && held >= QUIET_SHRINK
                 && self.last_shrink.is_none_or(|at| now.saturating_duration_since(at) >= SHRINK_INTERVAL);
             return Playout::Packet {
                 data: packet.data,
@@ -314,6 +355,11 @@ impl JitterBuffer {
             self.last_samples
         };
         self.concealments += 1;
+        if self.last_shrink.is_some_and(|at| now.saturating_duration_since(at) <= SHRINK_INTERVAL) {
+            self.concealments_after_trim += 1;
+        }
+        self.clear_depth();
+        self.above_since = None;
         Playout::Conceal(samples as usize)
     }
 }
@@ -386,18 +432,45 @@ mod tests {
             jb.push_at(i * FRAME, FRAME, vec![1], now, Clock::Rtp);
         }
         assert_eq!(pop_at(&mut jb, now, false), packet(1));
-        assert_eq!(pop_at(&mut jb, now + Duration::from_millis(600), false), packet(1));
+        for ms in (20..=1000).step_by(20) {
+            jb.observe_depth(now + Duration::from_millis(ms), 0, FRAME as usize);
+        }
+        assert_eq!(pop_at(&mut jb, now + Duration::from_millis(1000), false), packet(1));
         assert_eq!(
-            pop_at(&mut jb, now + Duration::from_millis(620), true),
+            pop_at(&mut jb, now + Duration::from_millis(1020), true),
             Playout::Packet { data: vec![1], skip: 240, quiet_only: true, fade: false }
         );
-        assert_eq!(pop_at(&mut jb, now + Duration::from_millis(620), true), packet(1));
-        assert_eq!(pop_at(&mut jb, now + Duration::from_millis(640), true), packet(1));
-        assert_eq!(pop_at(&mut jb, now + Duration::from_millis(1000), true), packet(1));
+        assert_eq!(pop_at(&mut jb, now + Duration::from_millis(1020), true), packet(1));
+        assert_eq!(pop_at(&mut jb, now + Duration::from_millis(1040), true), packet(1));
+        assert_eq!(pop_at(&mut jb, now + Duration::from_millis(1060), true), packet(1));
+        for ms in (1080..=3000).step_by(20) {
+            jb.observe_depth(now + Duration::from_millis(ms), 0, FRAME as usize);
+        }
         assert_eq!(
             pop_at(&mut jb, now + Duration::from_secs(3), false),
             Playout::Packet { data: vec![1], skip: 240, quiet_only: true, fade: false }
         );
+    }
+
+    #[test]
+    fn concealments_after_trim_counts_only_the_one_second_window_and_resets_with_source() {
+        let mut jb = JitterBuffer::new();
+        let now = Instant::now();
+        jb.push_at(0, FRAME, vec![1], now, Clock::Rtp);
+        jb.pop_at(now);
+        jb.shrunk(now, 240);
+        assert_eq!(jb.trim_events, 1);
+        assert_eq!(jb.pop_at(now + Duration::from_secs(1)), Playout::Conceal(960));
+        assert_eq!(jb.concealments_after_trim, 1);
+        assert_eq!(jb.pop_at(now + Duration::from_millis(1001)), Playout::Conceal(960));
+        assert_eq!(jb.concealments_after_trim, 1);
+        jb.reset();
+        jb.push_at(0, FRAME, vec![1], now, Clock::Rtp);
+        jb.pop_at(now);
+        jb.pop_at(now);
+        assert_eq!(jb.concealments, 3);
+        assert_eq!(jb.concealments_after_trim, 1);
+        assert_eq!(jb.trim_events, 1);
     }
 
     #[test]
