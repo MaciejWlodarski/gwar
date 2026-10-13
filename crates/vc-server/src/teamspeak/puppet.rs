@@ -2,9 +2,9 @@
 //! so TeamSpeak users see each of our users as a normal client, hear them
 //! natively and can message them.
 //!
-//! Audio is the hot path and is never buffered here: our user's gated Opus
-//! frames go straight from the SFU into their puppet's connection, and what a
-//! puppet hears from TeamSpeak users is published to the media plane as the
+//! Native 10 ms frames are paired into 20 ms packets for TeamSpeak. Other
+//! durations pass through unchanged. Audio heard from TeamSpeak users is
+//! published to the media plane as the
 //! speaker's remote session the moment it arrives. Every puppet in a channel
 //! hears the same speakers; the first copy of each frame wins. A whisper
 //! reaches only the puppets it targets and goes to their users alone.
@@ -274,6 +274,7 @@ async fn run(
 
     shared.plane.uplinks.register(spec.session, uplink_tx);
     let mut packet_id: u16 = 0;
+    let mut packetizer = super::packetizer::Packetizer::default();
     // Commands awaiting TeamSpeak's answer, to name the one that failed.
     let mut pending: HashMap<tsclientlib::MessageHandle, Pending> = HashMap::new();
     let mut nickname_generation = 0;
@@ -284,6 +285,7 @@ async fn run(
     let mut admitted_as = Some(requested);
     enum Step {
         Uplink(AudioPacket),
+        Flush,
         Item(Option<Result<StreamItem, tsclientlib::Error>>),
         Cmd(Option<PuppetCmd>),
     }
@@ -292,6 +294,12 @@ async fn run(
             let mut stream = con.events();
             tokio::select! {
                 biased;
+                _ = async {
+                    match packetizer.deadline() {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => std::future::pending().await,
+                    }
+                } => Step::Flush,
                 Some(packet) = uplink.recv() => Step::Uplink(packet),
                 item = stream.next() => Step::Item(item),
                 cmd = cmds.recv() => Step::Cmd(cmd),
@@ -299,16 +307,14 @@ async fn run(
         };
         match step {
             Step::Uplink(packet) => {
-                let data: &[u8] = &packet.opus;
-                // TOC bit 2 marks stereo, which TeamSpeak carries as "Opus Music".
-                let codec = if data.first().is_some_and(|toc| toc & 0x04 != 0) {
-                    CodecType::OpusMusic
-                } else {
-                    CodecType::OpusVoice
-                };
-                let out = OutAudio::new(&AudioData::C2S { id: packet_id, codec, data });
-                packet_id = packet_id.wrapping_add(1);
-                let _ = con.send_audio(out);
+                for data in packetizer.push(&packet.opus, Instant::now()) {
+                    send_audio(&mut con, &mut packet_id, &data);
+                }
+            }
+            Step::Flush => {
+                if let Some(data) = packetizer.flush() {
+                    send_audio(&mut con, &mut packet_id, &data);
+                }
             }
             Step::Item(None) => return Err(anyhow!("connection closed")),
             Step::Item(Some(Err(e))) => return Err(anyhow!("{e}")),
@@ -369,6 +375,10 @@ async fn run(
                 _ => {}
             },
             Step::Cmd(None) | Step::Cmd(Some(PuppetCmd::Quit)) => {
+                if let Some(data) = packetizer.flush() {
+                    send_audio(&mut con, &mut packet_id, &data);
+                    send_audio(&mut con, &mut packet_id, &[]);
+                }
                 let _ = con.disconnect(DisconnectOptions::new());
                 // Let the disconnect packet go out (and be acknowledged) before dropping.
                 let _ = tokio::time::timeout(Duration::from_secs(2), con.events().for_each(|_| async {})).await;
@@ -390,6 +400,15 @@ async fn run(
             }
         }
     }
+}
+
+fn send_audio(con: &mut Connection, packet_id: &mut u16, data: &[u8]) {
+    // TOC bit 2 marks stereo, which TeamSpeak carries as "Opus Music".
+    let codec =
+        if data.first().is_some_and(|toc| toc & 0x04 != 0) { CodecType::OpusMusic } else { CodecType::OpusVoice };
+    let out = OutAudio::new(&AudioData::C2S { id: *packet_id, codec, data });
+    *packet_id = packet_id.wrapping_add(1);
+    let _ = con.send_audio(out);
 }
 
 fn is_opus(codec: CodecType) -> bool {

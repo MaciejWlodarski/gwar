@@ -108,7 +108,7 @@ impl Slot {
             self.previous_level = -120.0;
             self.generation = item.generation;
         }
-        let samples = super::opus_samples(&item.opus).unwrap_or(super::FRAME as u32);
+        let Some(samples) = super::opus_samples(&item.opus) else { return Ok(()) };
         self.buffer.push_at(item.rtp_time, u64::from(samples), item.opus, item.arrived, item.clock);
         Ok(())
     }
@@ -264,7 +264,11 @@ mod tests {
     }
 
     fn encode(encoder: &Encoder, speech: bool) -> Vec<u8> {
-        let pcm = (0..960).map(|i| if speech { (i as f32 * 0.06).sin() * 0.3 } else { 0.0 }).collect::<Vec<_>>();
+        encode_n(encoder, speech, 960)
+    }
+
+    fn encode_n(encoder: &Encoder, speech: bool, samples: usize) -> Vec<u8> {
+        let pcm = (0..samples).map(|i| if speech { (i as f32 * 0.06).sin() * 0.3 } else { 0.0 }).collect::<Vec<_>>();
         let mut data = vec![0; 1275];
         let n = encoder.encode_float(&pcm, &mut data).unwrap();
         data.truncate(n);
@@ -435,38 +439,40 @@ mod tests {
         use super::super::{Incoming, jitter::Clock};
         // Regression from target/review-r3-final/slot_probe.rs: a one-second
         // window produced 38 trims and 10 concealments in each clock.
-        for clock in [Clock::Rtp, Clock::Sequence] {
-            let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
-            let mut slot = Slot::new().unwrap();
-            let now = Instant::now();
-            slot.end = 480; // One 10 ms refill of staged PCM, not removable surplus.
-            let mut packet = 0u64;
-            for tick in (0..60 * 48_000u64).step_by(480) {
-                let at = now + Duration::from_secs_f64(tick as f64 / 48_000.0);
-                loop {
-                    let scheduled = packet * 960;
-                    let late = scheduled > 0 && scheduled.is_multiple_of(3 * 48_000);
-                    let arrival = scheduled + if late { 5 * 48 } else { 0 };
-                    if arrival > tick {
-                        break;
+        for frame in [480, 960] {
+            for clock in [Clock::Rtp, Clock::Sequence] {
+                let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
+                let mut slot = Slot::new().unwrap();
+                let now = Instant::now();
+                slot.end = 480; // One 10 ms refill of staged PCM, not removable surplus.
+                let mut packet = 0u64;
+                for tick in (0..60 * 48_000u64).step_by(480) {
+                    let at = now + Duration::from_secs_f64(tick as f64 / 48_000.0);
+                    loop {
+                        let scheduled = packet * frame;
+                        let late = scheduled > 0 && scheduled.is_multiple_of(3 * 48_000);
+                        let arrival = scheduled + if late { 5 * 48 } else { 0 };
+                        if arrival > tick {
+                            break;
+                        }
+                        slot.receive(Incoming {
+                            slot: 0,
+                            generation: None,
+                            rtp_time: if clock == Clock::Sequence { packet * 960 } else { scheduled },
+                            arrived: now + Duration::from_secs_f64(arrival as f64 / 48_000.0),
+                            clock,
+                            opus: encode_n(&encoder, true, frame as usize),
+                        })
+                        .unwrap();
+                        packet += 1;
                     }
-                    slot.receive(Incoming {
-                        slot: 0,
-                        generation: None,
-                        rtp_time: scheduled,
-                        arrived: now + Duration::from_secs_f64(arrival as f64 / 48_000.0),
-                        clock,
-                        opus: encode(&encoder, true),
-                    })
-                    .unwrap();
-                    packet += 1;
+                    slot.mix_refill(&mut [0.0; 480], 1.0, at, 480).unwrap();
                 }
-                slot.mix_refill(&mut [0.0; 480], 1.0, at, 480).unwrap();
+                assert_eq!(slot.buffer.trim_events, 0, "{clock:?}");
+                assert_eq!(slot.buffer.shrink_samples, 0, "{clock:?}");
+                assert_eq!(slot.buffer.concealments, 0, "{clock:?}");
+                assert_eq!(slot.buffer.concealments_after_trim, 0, "{clock:?}");
             }
-            assert_eq!(slot.buffer.trim_events, 0, "{clock:?}");
-            assert_eq!(slot.buffer.shrink_samples, 0, "{clock:?}");
-            assert_eq!(slot.buffer.concealments, 0, "{clock:?}");
-            assert_eq!(slot.buffer.concealments_after_trim, 0, "{clock:?}");
         }
     }
 
@@ -549,6 +555,37 @@ mod tests {
         slot.receive(incoming(None, 960)).unwrap();
         assert_eq!(slot.buffer.depth().0, 2);
         assert_eq!(slot.generation(), 0);
+    }
+
+    #[test]
+    fn generation_switches_reset_duration_decoder_and_concealment_quantum() {
+        use super::super::{Generation, Incoming, jitter::Clock};
+        use vc_proto::rtp::SlotGeneration;
+        let mut slot = Slot::new().unwrap();
+        let now = Instant::now();
+        for (generation, samples) in [960, 480, 960, 480].into_iter().enumerate() {
+            let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
+            let opus = encode_n(&encoder, true, samples);
+            let mut reference = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
+            let expected = decode(&mut reference, Some(&opus));
+            slot.receive(Incoming {
+                slot: 0,
+                rtp_time: 0,
+                generation: Some(Generation::Rtp(SlotGeneration(generation as u16))),
+                arrived: now,
+                clock: Clock::Rtp,
+                opus,
+            })
+            .unwrap();
+            assert_eq!(slot.staged_samples(), 0);
+            assert_eq!(slot.buffer.target_samples(), samples as u64);
+            let mut actual = vec![0.0; samples];
+            slot.mix_into(&mut actual, 1.0, now).unwrap();
+            assert_eq!(actual, expected);
+            // One sample of PLC leaves exactly the remainder of this frame staged.
+            slot.mix_into(&mut [0.0], 1.0, now).unwrap();
+            assert_eq!(slot.staged_samples(), samples - 1);
+        }
     }
 
     #[test]

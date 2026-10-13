@@ -201,3 +201,8 @@ the manifest. Remote runs also retain server and tunnel logs.
 Compare loss and underflows alongside latency. Frame counters cover warmup too.
 Inspect individual call levels: startup buffering or network drift can dominate
 pooled p95. The runners impose no fixed performance pass threshold.
+
+## Native 10 ms frames
+
+See [the 10 ms implementation report](opus-10ms.md) for transport compatibility,
+FEC evidence, bandwidth budgets and the paired local baseline measurements.

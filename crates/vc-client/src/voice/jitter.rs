@@ -43,7 +43,8 @@ struct Recovery {
 pub struct JitterBuffer {
     packets: BTreeMap<u64, Packet>,
     next: Option<u64>,
-    missing: u32,
+    /// Consecutive concealed audio, in 48 kHz samples.
+    missing: u64,
     last_samples: u64,
     held: u64,
     recovering: Option<Recovery>,
@@ -63,11 +64,11 @@ pub struct JitterBuffer {
     pub(crate) concealments_after_trim: u64,
 }
 
-const FRAME: u64 = 960;
-const MAX_CONCEAL: u32 = 5;
+const FRAME: u64 = 960; // TS packet-counter stride and unknown-stream default.
+const MAX_CONCEAL: u64 = 4800; // 100 ms of audio, independent of packet duration.
 const STALL: Duration = Duration::from_millis(100);
 const MAX_PACKETS: usize = 64;
-const MAX_TARGET: u64 = FRAME * 8;
+const MAX_TARGET: u64 = 7680; // 160 ms, independent of packet duration.
 const QUIET_SHRINK: Duration = Duration::from_secs(1);
 // Retain sparse dips (including a 5 ms delay every three seconds). Corrections
 // must be slower than that jitter pattern; genuine surplus can take tens of seconds.
@@ -189,12 +190,18 @@ impl JitterBuffer {
         (self.packets.len(), self.packets.values().map(|p| p.samples).sum())
     }
 
+    fn frame_samples(&self) -> u64 {
+        // Read the next packet before startup/after a source change; thereafter
+        // the last played duration is also the PLC quantum when the queue is empty.
+        self.packets.first_key_value().map_or(self.last_samples, |(_, p)| p.samples)
+    }
+
     pub(crate) fn target_samples(&self) -> u64 {
-        (self.jitter.ceil() as u64 + 240).clamp(FRAME, MAX_TARGET)
+        (self.jitter.ceil() as u64 + 240).clamp(self.frame_samples(), MAX_TARGET)
     }
 
     pub(crate) fn playing(&self) -> bool {
-        self.next.is_some() && self.missing <= MAX_CONCEAL
+        self.next.is_some() && self.missing < MAX_CONCEAL
     }
 
     pub(crate) fn reset(&mut self) {
@@ -267,8 +274,9 @@ impl JitterBuffer {
     }
 
     pub(crate) fn pop_at(&mut self, now: Instant) -> Playout {
-        self.observe_depth(now, 0, FRAME as usize);
-        self.pop_for(now, FRAME as usize)
+        let frame = self.frame_samples() as usize;
+        self.observe_depth(now, 0, frame);
+        self.pop_for(now, frame)
     }
 
     pub(crate) fn pop_for(&mut self, now: Instant, demand: usize) -> Playout {
@@ -308,7 +316,7 @@ impl JitterBuffer {
         if let Some((&ts, _)) = self.packets.first_key_value() {
             // Head-hold PLC is credit for a gap subsequently proven lost. A packet
             // at the held head was merely late and may still buy a frame of depth.
-            let covered = if self.missing > MAX_CONCEAL { ts - next } else { (ts - next).min(self.held) };
+            let covered = if self.missing >= MAX_CONCEAL { ts - next } else { (ts - next).min(self.held) };
             next += covered;
             self.held = self.held.saturating_sub(covered);
             self.next = Some(next);
@@ -337,15 +345,14 @@ impl JitterBuffer {
                 fade,
             };
         }
-        self.missing = self.missing.saturating_add(1);
         // Stop generating audio, but retain the timeline until an explicit source
         // boundary or a media-clock pause. Starvation alone is not a new spurt.
-        if self.missing > MAX_CONCEAL {
+        if self.missing >= MAX_CONCEAL {
             return Playout::Idle;
         }
         let samples = if let Some((&ts, _)) = self.packets.first_key_value() {
             let samples = match self.clock {
-                Clock::Rtp => (ts - next).min(FRAME),
+                Clock::Rtp => (ts - next).min(self.last_samples),
                 Clock::Sequence => self.last_samples,
             };
             let step = if self.clock == Clock::Sequence { FRAME } else { samples };
@@ -356,6 +363,7 @@ impl JitterBuffer {
             self.held += if self.clock == Clock::Sequence { FRAME } else { self.last_samples };
             self.last_samples
         };
+        self.missing = self.missing.saturating_add(samples);
         self.concealments += 1;
         if self.last_shrink.is_some_and(|at| now.saturating_duration_since(at) <= SHRINK_INTERVAL) {
             self.concealments_after_trim += 1;
@@ -385,6 +393,54 @@ mod tests {
             *quiet_only = true;
         }
         result
+    }
+
+    #[test]
+    fn ten_ms_target_loss_and_starvation_budget_follow_audio_time() {
+        let mut jb = JitterBuffer::new();
+        let now = Instant::now();
+        jb.push_at(0, 480, vec![0], now, Clock::Rtp);
+        jb.push_at(960, 480, vec![2], now + Duration::from_millis(20), Clock::Rtp);
+        assert_eq!(jb.target_samples(), 480);
+        assert_eq!(jb.pop(), packet(0));
+        assert_eq!(jb.pop(), Playout::Conceal(480));
+        assert_eq!(jb.pop(), packet(2));
+        for _ in 0..10 {
+            assert_eq!(jb.pop(), Playout::Conceal(480));
+        }
+        assert_eq!(jb.pop(), Playout::Idle);
+        assert!(!jb.playing());
+        jb.push_at(48_000, 960, vec![3], now + Duration::from_secs(1), Clock::Rtp);
+        assert_eq!(jb.pop(), packet(3));
+        assert_eq!(jb.target_samples(), 960);
+        assert_eq!(jb.pop(), Playout::Conceal(960));
+    }
+
+    #[test]
+    fn ten_ms_stall_recovery_retains_refill_and_resets_with_twenty_ms_source() {
+        let now = Instant::now();
+        let mut jb = JitterBuffer::new();
+        jb.push_at(0, 480, vec![0], now, Clock::Rtp);
+        assert_eq!(jb.pop_at(now), packet(0));
+        for i in 1..20 {
+            jb.pop_at(now + Duration::from_millis(i * 10));
+        }
+        let burst = now + Duration::from_millis(200);
+        for i in 1..=20 {
+            jb.push_at(i * 480, 480, vec![i as u8], burst, Clock::Rtp);
+        }
+        assert_eq!(jb.target_samples(), 480);
+        assert!(matches!(jb.pop_for(burst, 960), Playout::Packet { data, fade: true, .. } if data == vec![19]));
+        assert_eq!(jb.pop_for(burst, 480), packet(20));
+        assert_eq!(jb.concealments, 10);
+        jb.reset();
+        jb.push_at(0, 960, vec![0], burst, Clock::Rtp);
+        assert_eq!(jb.target_samples(), 960);
+        assert_eq!(jb.pop_at(burst), packet(0));
+        assert_eq!(jb.pop_at(burst), Playout::Conceal(960));
+        jb.reset();
+        jb.push_at(0, 480, vec![0], burst, Clock::Rtp);
+        assert_eq!(jb.target_samples(), 480);
     }
 
     #[test]
@@ -543,7 +599,7 @@ mod tests {
                     assert_eq!(jb.pop_at(at), packet(1));
                     assert!(jb.depth().1 <= jb.target_samples() + FRAME);
                 }
-                assert_eq!(jb.concealments, u64::from(MAX_CONCEAL));
+                assert_eq!(jb.concealments, MAX_CONCEAL / FRAME);
             }
         }
     }
@@ -632,7 +688,7 @@ mod tests {
         }
         jb.push_at(25 * FRAME, FRAME, vec![25], start + Duration::from_millis(500), Clock::Sequence);
         assert_eq!(jb.pop(), packet(25));
-        assert_eq!(jb.concealments, u64::from(MAX_CONCEAL));
+        assert_eq!(jb.concealments, MAX_CONCEAL / FRAME);
     }
 
     #[test]
@@ -669,7 +725,7 @@ mod tests {
             assert_eq!(pop_at(&mut jb, at, false), packet(i as u8));
             at += Duration::from_secs_f64(samples as f64 / 48_000.0);
         }
-        assert_eq!(jb.target_samples(), FRAME);
+        assert_eq!(jb.target_samples(), 5760);
     }
 
     // A sample-clock simulation: arrival and device clocks run independently.

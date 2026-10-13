@@ -33,7 +33,9 @@ use self::{
 };
 use crate::Connection;
 
-pub const FRAME: usize = 960; // 20 ms at 48 kHz
+/// Native WebRTC packet duration. Set to 960 to restore 20 ms capture.
+pub const FRAME: usize = 480; // 10 ms at 48 kHz
+const TS_FRAME: usize = 960; // Direct TeamSpeak retains its 20 ms packet clock.
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InputMode {
@@ -317,7 +319,7 @@ where
     let pipeline_controls = controls.clone();
     let pipeline_counters = counters.clone();
     thread::Builder::new().name("vc-voice-pipeline".into()).spawn(move || {
-        if let Err(e) = pipeline(pipeline_controls, pipeline_counters, mic, speaker, timing, out_tx, in_rx) {
+        if let Err(e) = pipeline::<FRAME>(pipeline_controls, pipeline_counters, mic, speaker, timing, out_tx, in_rx) {
             tracing::warn!("voice pipeline stopped: {e:#}");
         }
     })?;
@@ -376,7 +378,8 @@ pub async fn start_teamspeak(
     let pipeline_controls = controls.clone();
     let pipeline_counters = counters.clone();
     thread::Builder::new().name("vc-voice-pipeline".into()).spawn(move || {
-        if let Err(e) = pipeline(pipeline_controls, pipeline_counters, mic, speaker, timing, out_tx, in_rx) {
+        if let Err(e) = pipeline::<TS_FRAME>(pipeline_controls, pipeline_counters, mic, speaker, timing, out_tx, in_rx)
+        {
             tracing::warn!("voice pipeline stopped: {e:#}");
         }
     })?;
@@ -398,7 +401,15 @@ fn level_db(frame: &[f32]) -> f32 {
 
 const HANGOVER: Duration = Duration::from_millis(300);
 
-fn pipeline(
+fn voice_encoder() -> Result<Encoder> {
+    let mut encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip)?;
+    encoder.set_bitrate(Bitrate::BitsPerSecond(48_000))?;
+    encoder.set_inband_fec(true)?;
+    encoder.set_packet_loss_perc(5)?;
+    Ok(encoder)
+}
+
+fn pipeline<const CAPTURE: usize>(
     controls: Arc<Controls>,
     counters: Arc<Counters>,
     mut mic: rtrb::Consumer<f32>,
@@ -407,13 +418,10 @@ fn pipeline(
     out: mpsc::Sender<Outgoing>,
     incoming: std::sync::mpsc::Receiver<Incoming>,
 ) -> Result<()> {
-    let mut encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip)?;
-    encoder.set_bitrate(Bitrate::BitsPerSecond(48_000))?;
-    encoder.set_inband_fec(true)?;
-    encoder.set_packet_loss_perc(5)?;
+    let encoder = voice_encoder()?;
     output.attach();
     let mut slots = (0..AUDIO_SLOTS).map(|_| Slot::new()).collect::<Result<Vec<_>>>()?;
-    let mut frame = vec![0f32; FRAME];
+    let mut frame = vec![0f32; CAPTURE];
     let mut mix = vec![0f32; FRAME];
     let mut packet = vec![0u8; 1275];
     let mut last_voice = Instant::now() - HANGOVER;
@@ -421,7 +429,7 @@ fn pipeline(
 
     while !controls.stop.load(Ordering::Relaxed) {
         // ---- capture
-        while mic.slots() >= FRAME {
+        while mic.slots() >= CAPTURE {
             for s in frame.iter_mut() {
                 *s = mic.pop().unwrap_or(0.0);
             }
@@ -518,4 +526,108 @@ pub fn opus_samples(packet: &[u8]) -> Option<u32> {
         _ => u32::from(*packet.get(1)? & 0x3f),
     };
     (frames > 0 && frame * frames <= 5760).then_some(frame * frames)
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::*;
+    use audiopus::{Bandwidth, MutSignals, coder::Decoder, packet::Packet};
+
+    #[tokio::test]
+    async fn direct_teamspeak_capture_remains_twenty_ms_without_a_server() {
+        struct Capture;
+        impl AudioIo for Capture {
+            fn open(self: Box<Self>) -> Result<AudioPorts> {
+                let (mut tx, mic) = rtrb::RingBuffer::new(1920);
+                let (speaker, rx) = rtrb::RingBuffer::new(1920);
+                for i in 0..960 {
+                    tx.push((i as f32 * 0.04).sin() * 0.3).unwrap();
+                }
+                Ok(AudioPorts { mic, speaker, output: Arc::new(OutputTiming::default()), _guard: Box::new((tx, rx)) })
+            }
+        }
+        let (_incoming, input) = mpsc::channel(1);
+        let (output, mut outgoing) = mpsc::channel(4);
+        let _handle = start_teamspeak(Box::new(Capture), input, output).await.unwrap();
+        let packet = tokio::time::timeout(Duration::from_secs(2), outgoing.recv()).await.unwrap().unwrap();
+        assert_eq!(opus_samples(&packet), Some(960));
+    }
+
+    #[test]
+    fn ten_ms_silk_and_hybrid_recover_lbrr_instead_of_plc() {
+        for bandwidth in [Bandwidth::Wideband, Bandwidth::Fullband] {
+            for fec_enabled in [false, true] {
+                let mut encoder = voice_encoder().unwrap();
+                // Label this synthetic voiced fixture so music detection does not
+                // choose CELT. Production retains Opus's automatic classification.
+                encoder.set_signal(audiopus::Signal::Voice).unwrap();
+                encoder.set_bandwidth(bandwidth).unwrap();
+                encoder.set_inband_fec(fec_enabled).unwrap();
+                let mut packets = Vec::new();
+                for frame in 0..80 {
+                    let pcm: Vec<_> = (0..480)
+                        .map(|i| {
+                            let t = (frame * 480 + i) as f32 / 48_000.0;
+                            let pitch = std::f32::consts::TAU * (130.0 * t + 0.2 * (3.0 * t).sin());
+                            (pitch.sin() + 0.4 * (2.0 * pitch).sin() + 0.2 * (3.0 * pitch).sin()) * 0.2
+                        })
+                        .collect();
+                    let mut data = vec![0; 1275];
+                    let n = encoder.encode_float(&pcm, &mut data).unwrap();
+                    data.truncate(n);
+                    assert_eq!(opus_samples(&data), Some(480));
+                    packets.push(data);
+                }
+                let mut recovered = 0;
+                for lost in [10, 20, 40, 60] {
+                    let mut fec = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
+                    let mut plc = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
+                    let mut a = [0.0; 480];
+                    let mut b = [0.0; 480];
+                    for packet in &packets[..lost] {
+                        for (decoder, pcm) in [(&mut fec, &mut a), (&mut plc, &mut b)] {
+                            decoder
+                                .decode_float(
+                                    Some(Packet::try_from(packet.as_slice()).unwrap()),
+                                    MutSignals::try_from(&mut pcm[..]).unwrap(),
+                                    false,
+                                )
+                                .unwrap();
+                        }
+                    }
+                    let next = &packets[lost + 1];
+                    assert_eq!(
+                        fec.decode_float(
+                            Some(Packet::try_from(next.as_slice()).unwrap()),
+                            MutSignals::try_from(&mut a[..]).unwrap(),
+                            true
+                        )
+                        .unwrap(),
+                        480
+                    );
+                    assert_eq!(plc.decode_float(None, MutSignals::try_from(&mut b[..]).unwrap(), false).unwrap(), 480);
+                    if a != b {
+                        recovered += 1;
+                    }
+                    if fec_enabled {
+                        let config = next[0] >> 3;
+                        assert!(
+                            match bandwidth {
+                                Bandwidth::Wideband => config <= 11,
+                                _ => (12..=15).contains(&config),
+                            },
+                            "{bandwidth:?}: TOC={:x}",
+                            next[0]
+                        );
+                    }
+                }
+                eprintln!("10 ms {bandwidth:?}, FEC={fec_enabled}: {recovered}/4 recoveries differ from PLC");
+                if fec_enabled {
+                    assert!(recovered > 0);
+                } else {
+                    assert_eq!(recovered, 0);
+                }
+            }
+        }
+    }
 }
