@@ -30,12 +30,16 @@ use vc_server::{Config, Running};
 const WAIT: Duration = Duration::from_secs(5);
 
 async fn server() -> Running {
+    server_advertising(None).await
+}
+
+async fn server_advertising(advertise: Option<SocketAddr>) -> Running {
     let any: SocketAddr = "127.0.0.1:0".parse().unwrap();
     vc_server::start(Config {
         database: None,
         http_bind: any,
         media_bind: any,
-        media_advertise: any,
+        media_advertise: advertise.unwrap_or(any),
         max_clients: 16,
         server_password: None,
         web_root: None,
@@ -288,4 +292,39 @@ async fn opus_is_forwarded_unchanged_within_channel_only() {
     bob.request("channel.join", json!({"channel": 1})).await;
     speak(&a, 11, 10, -20).await;
     assert!(drain(&mut b, 300).await.iter().any(|(_, p)| p[1] == 11));
+}
+
+#[tokio::test]
+async fn advertised_media_port_can_differ_from_bound_port() {
+    let default = server().await;
+    assert_eq!(default.media, default.media_bind);
+    assert_ne!(default.media_bind.port(), 0);
+
+    // Reserve the advertised port so the real socket must bind elsewhere.
+    let relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let advertise = relay.local_addr().unwrap();
+    let running = server_advertising(Some(advertise)).await;
+    assert_eq!(running.media, advertise);
+    assert_ne!(running.media_bind, advertise);
+    assert!(UdpSocket::bind(running.media_bind).await.is_err(), "returned bind address must be occupied");
+
+    let mut ws = Ws::connect(running.http, "port mapping").await;
+    ws.request("channel.join", json!({"channel": 1})).await;
+    let mut rtc = Rtc::builder().clear_codecs().enable_opus(true, false).build(Instant::now());
+    let mut api = rtc.sdp_api();
+    api.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
+    let (offer, _) = api.apply().unwrap();
+    let answer = ws.request("voice.offer", json!({"sdp": offer.to_sdp_string()})).await;
+    let candidates: Vec<_> =
+        answer["sdp"].as_str().unwrap().lines().filter(|line| line.starts_with("a=candidate:")).collect();
+    assert!(!candidates.is_empty());
+    for candidate in candidates {
+        let fields: Vec<_> = candidate.split_whitespace().collect();
+        assert_eq!(fields[4], advertise.ip().to_string());
+        assert_eq!(fields[5], advertise.port().to_string());
+    }
+    for task in default.tasks.into_iter().chain(running.tasks) {
+        task.abort();
+        let _ = task.await;
+    }
 }
