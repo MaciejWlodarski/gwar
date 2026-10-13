@@ -334,9 +334,10 @@ Runs take about 31 seconds after compilation. Each retains `report.json`, SDP,
 process/build logs and the WAV under `target/web-audio/<run>/`. No existing
 server, physical audio device, Connect service or TeamSpeak server is used.
 The script creates its own endpoints and rejects non-loopback browser requests.
-Only processes it starts are stopped. The optional trace records clear RTP
-sequence/timestamp/SSRC headers, forwards to `Running.media_bind`, and reports
-unused ICE-candidate control-reply errors separately; RTP delivery errors fail.
+Only processes it starts are stopped. The optional trace records receive times and
+clear RTP sequence/timestamp/SSRC/marker headers, forwards to `Running.media_bind`,
+and reports unused ICE-candidate control-reply errors separately; RTP delivery
+errors fail.
 
 Stats are matched to the speaker's `voice.slot` and receiver MID. Counters use
 window differences: concealment is `delta(concealedSamples) /
@@ -347,6 +348,15 @@ loopback packet loss, less than 1% concealment and less than 60 ms mean bufferin
 Raw counters, target/minimum buffering, per-second snapshots and both PCM tone
 checks are retained even when the final quality assertions fail.
 
+For longer controls, set `E2E_AUDIO_RESEARCH=1` (removes only the 60 ms ceiling),
+`E2E_AUDIO_PRE_SECONDS=30`, `E2E_AUDIO_POST_SECONDS=60` and
+`E2E_AUDIO_SCENARIO=reuse|pause|prewarmed|continuous`. `pause` mutes/unmutes the
+same running native engine after `E2E_AUDIO_GAP_MS` (default 2200); `prewarmed`
+activates an already-connected, muted native engine after one second.
+`E2E_AUDIO_SENDER=browser` compares the browser's 20 ms sender (except prewarmed).
+The fixture keeps native signaling alive during long windows. Summarize reports
+with `python3 apps/web/e2e/native-audio-summary.py target/web-audio/<run>`.
+
 Chromium 153 on macOS reported `audioLevel=0` and `totalAudioEnergy=0` while the
 actual app output carried the native tone at about 0.176 RMS. The app uses a muted
 media element to feed WebAudio; libwebrtc delivers PCM to that external sink
@@ -354,17 +364,24 @@ before applying output gain, then measures level/energy after that gain
 ([receive implementation](https://webrtc.googlesource.com/src/+/refs/heads/main/audio/channel_receive.cc)).
 These stats are recorded, but the PCM tone check determines playback.
 
-The final direct run took 29.3 seconds: 36.51/59.76 ms buffering,
-0.080/0% concealment, zero packet loss and zero native underruns.
-This remains manual: an earlier direct run during concurrent compilation averaged
-35.75/64.03 ms buffering before/after reuse, with 0/0.22% concealment and zero
-packet loss. A subsequent traced run averaged 32.74/49.91 ms, with no concealment
-or native underruns. The trace had 2447 deltas of 480 ticks and one 104640-tick
-speaker-change gap on the same slot SSRC. No 10/20 ms timestamp mismatch was
-observed. Host scheduling and Chromium's adaptation remain possible causes of
-the buffer variation; these runs do not isolate the cause or establish a stable
-CI performance limit. Physical output, other browsers and internet paths are
-outside this check.
+Round 2 retained [13 completed controls and raw counter endpoints](latency-browser-reuse.json)
+with 30–60-second post-switch windows. Prewarming removed the initial burst, yet
+buffering rose 37.83→48.58 ms and remained 49.14 ms in the final ten seconds;
+target/minimum stayed at 40 ms after reuse. Another prewarmed run retained about
+29.3 ms against an unchanged 20 ms target. Same-engine mute/resume averaged
+27.43→27.42 ms. The 20 ms browser control also rose initially (32.85→35.27 ms),
+then reached 19.92 ms. A target increase is not necessary for the rise.
+
+Switch clock offsets stayed below one packet. Experimental single-sample
+anchoring reduced them to −0.20/+0.17 ms, but buffering changed +4.07/−2.05 ms
+versus +0.80/+3.41 ms in interleaved rounded runs; no clock fix is justified.
+The tested [NetEQ logic](https://webrtc.googlesource.com/src/+/9ea5afcad008b940468c2a15aec339592cf5a935/modules/audio_coding/neteq/decision_logic.cc)
+postpones decoding after prolonged concealment and allows 20 ms plus arrival
+variation above target before acceleration. Retained delay history, recovery
+and this hysteresis best explain the results; internal decisions were not traced.
+All completed measurement phases had zero packet loss and under 0.14% concealment. Shared-host
+scheduling, physical devices, other browsers and internet paths remain unisolated;
+these measurements do not establish a stable CI performance limit.
 
 ## SFU media clock
 

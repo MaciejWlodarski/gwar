@@ -6,12 +6,16 @@
  * Build once: cargo build -p vc-client --example web_audio
  * Run: pnpm --filter web e2e:native-audio
  * JSON snapshots, SDP, process logs and generated fake-mic WAV are retained in
- * target/web-audio/<run>. The measurement takes about 30 s, excluding builds.
+ * target/web-audio/<run>. The default takes about 30 s, excluding builds.
+ * E2E_AUDIO_SCENARIO=reuse|pause|continuous|prewarmed, E2E_AUDIO_SENDER=native|browser,
+ * E2E_AUDIO_PRE_SECONDS / POST_SECONDS and E2E_AUDIO_GAP_MS select research controls.
+ * E2E_AUDIO_RESEARCH=1 retains quality checks but removes the 60 ms delay ceiling.
  */
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { createInterface } from "node:readline";
@@ -27,6 +31,19 @@ const children = [];
 const report = { revision: spawnSync("git", ["rev-parse", "HEAD"], { cwd: repoRoot, encoding: "utf8" }).stdout.trim(), phases: [], reassignments: [], slotEvents: [], errors: [] };
 let browser;
 const runStarted = Date.now();
+const scenario = process.env.E2E_AUDIO_SCENARIO ?? "reuse";
+assert(["reuse", "pause", "continuous", "prewarmed"].includes(scenario), "unknown audio scenario");
+const preSeconds = Number(process.env.E2E_AUDIO_PRE_SECONDS ?? 10);
+const postSeconds = Number(process.env.E2E_AUDIO_POST_SECONDS ?? 10);
+const gapMs = Number(process.env.E2E_AUDIO_GAP_MS ?? 2200);
+for (const seconds of [preSeconds, postSeconds]) assert(Number.isInteger(seconds) && seconds > 0 && seconds <= 120);
+assert(Number.isFinite(gapMs) && gapMs >= 0 && gapMs <= 60000);
+const research = process.env.E2E_AUDIO_RESEARCH === "1";
+const sender = process.env.E2E_AUDIO_SENDER ?? "native";
+assert(["native", "browser"].includes(sender), "unknown audio sender");
+assert(sender === "native" || scenario !== "prewarmed", "prewarmed control uses the native fixture");
+const packetSamples = sender === "native" ? 480 : 960;
+report.options = { scenario, sender, preSeconds, postSeconds, gapMs, research };
 
 async function deadline(promise, ms, what) {
   let timer;
@@ -151,6 +168,12 @@ async function stats(page, slot) {
       mid: transceiver.mid,
       trackId: transceiver.receiver.track.id,
       pcCount: window.__pcs.length,
+      receiverDelayControls: {
+        jitterBufferTargetSupported: "jitterBufferTarget" in transceiver.receiver,
+        jitterBufferTarget: transceiver.receiver.jitterBufferTarget ?? null,
+        playoutDelayHintSupported: "playoutDelayHint" in transceiver.receiver,
+        playoutDelayHint: transceiver.receiver.playoutDelayHint ?? null,
+      },
       state: pc.connectionState,
       offer: pc.localDescription.sdp,
       answer: pc.remoteDescription.sdp,
@@ -214,19 +237,25 @@ function summarize(phase) {
     audioLevel: b.audioLevel,
     totalAudioEnergy: delta("totalAudioEnergy"),
     browserOutput: phase.output.at(-1),
-    nativeFramesReceived: n.framesReceived - p.framesReceived,
-    nativeFramesSent: n.framesSent - p.framesSent,
-    nativeRms: Math.sqrt(nativeEnergy / nativeSamples),
-    nativeToneFraction: nativeEnergy > 0 ? (n.toneEnergy - p.toneEnergy) / nativeEnergy : 0,
-    nativeUnderruns: n.underruns - p.underruns,
-    nativeUnderrunSamples: n.underrunSamples - p.underrunSamples,
+    ...(sender === "native" ? {
+      nativeFramesReceived: n.framesReceived - p.framesReceived,
+      nativeFramesSent: n.framesSent - p.framesSent,
+      nativeRms: Math.sqrt(nativeEnergy / nativeSamples),
+      nativeToneFraction: nativeEnergy > 0 ? (n.toneEnergy - p.toneEnergy) / nativeEnergy : 0,
+      nativeUnderruns: n.underruns - p.underruns,
+      nativeUnderrunSamples: n.underrunSamples - p.underrunSamples,
+    } : {}),
   };
 }
 
 async function main() {
   const started = Date.now();
-  const nativeBin = path.join(repoRoot, "target/debug/examples/web_audio");
+  const nativeBin = path.resolve(repoRoot, process.env.E2E_AUDIO_FIXTURE ?? "target/debug/examples/web_audio");
+  assert(nativeBin.startsWith(path.join(repoRoot, "target") + path.sep), "fixture must be built in this checkout's target directory");
+  report.fixture = path.relative(repoRoot, nativeBin);
   assert(existsSync(nativeBin), "build the fixture first: cargo build -p vc-client --example web_audio");
+  report.fixtureSha256 = createHash("sha256").update(readFileSync(nativeBin)).digest("hex");
+  report.harnessSha256 = createHash("sha256").update(readFileSync(fileURLToPath(import.meta.url))).digest("hex");
   const webUrl = `http://127.0.0.1:${await port()}`;
   const build = spawnSync("pnpm", ["exec", "vite", "build", "--mode", "e2e"], {
     cwd: webRoot, env: { ...process.env, NODE_ENV: "development", VITE_CONNECT_URL: `${webUrl}/connect` }, encoding: "utf8",
@@ -283,13 +312,63 @@ async function main() {
   await page.goto(webUrl);
   await connect(page, report.server.url);
 
-  for (const cmd of ["start", "replace"]) {
+  let sourceContext;
+  let sourcePage;
+  async function speakerCommand(cmd) {
+    if (sender === "native") return command(cmd);
+    if (["start", "replace"].includes(cmd)) {
+      await sourceContext?.close();
+      sourceContext = await browser.newContext({ locale: "en-US", permissions: ["microphone"] });
+      await sourceContext.route("**/*", (route) => {
+        const url = new URL(route.request().url());
+        if (url.hostname !== "127.0.0.1") {
+          report.errors.push(`blocked non-loopback sender request: ${url}`);
+          return route.abort();
+        }
+        return route.continue();
+      });
+      await sourceContext.addInitScript(spy);
+      sourcePage = await sourceContext.newPage();
+      sourcePage.on("pageerror", (error) => report.errors.push(error.message));
+      await sourcePage.goto(webUrl);
+      await connect(sourcePage, report.server.url);
+    } else if (["mute", "resume"].includes(cmd)) {
+      await sourcePage.evaluate(async (muted) => {
+        const { controller } = await window.__gwarE2eImport("/src/state/controller.ts");
+        controller.setMuted(muted);
+      }, cmd === "mute");
+    } else if (cmd === "stop") {
+      await sourceContext.close();
+      return { event: cmd };
+    }
+    return sourcePage.evaluate(async (cmd) => {
+      const { useSession } = await window.__gwarE2eImport("/src/state/stores.ts");
+      const pc = window.__pcs.at(-1);
+      return { event: cmd, native: { session: useSession.getState().me.session, frequency: 700 }, offer: pc.localDescription.sdp, answer: pc.remoteDescription.sdp };
+    }, cmd);
+  }
+
+  for (const [index, cmd] of ["start", "replace"].entries()) {
     let start;
     let slot;
     // The SFU chooses the oldest available slot, including slots never used.
     // Visit the other seven fixed slots before requiring the first to be reused.
     for (let attempt = 0; attempt < 8; attempt++) {
-      start = await command(cmd);
+      if (index === 1 && scenario === "pause") {
+        await speakerCommand("mute");
+        await sleep(gapMs);
+        start = await speakerCommand("resume");
+      } else if (index === 1 && scenario === "continuous") {
+        start = await speakerCommand("snapshot");
+      } else if (index === 1 && scenario === "prewarmed" && attempt === 7) {
+        await speakerCommand("prepare");
+        await sleep(1000);
+        start = await speakerCommand("activate");
+        assert.equal(start.native.link, "Connected", "prepared sender ICE is not connected");
+        assert.equal(start.native.framesSent, 0, "prepared sender transmitted before activation");
+      } else {
+        start = await speakerCommand(cmd);
+      }
       await waitFor(() => {
         slot = report.slotEvents.findLast((event) => event.client === start.native.session)?.slot;
         return slot !== undefined;
@@ -305,34 +384,41 @@ async function main() {
       phase.slot = report.slotEvents.findLast((event) => event.client === phase.session)?.slot;
       return phase.slot !== undefined;
     }, "native speaker slot");
+    const transitionStats = await stats(page, phase.slot);
+    phase.transition = { at: Date.now(), browser: transitionStats, native: start.native };
     await waitFor(async () => {
       const tone = await outputTone(page, phase.frequency);
       return tone?.state === "running" && tone.rms > 0.05 && tone.toneFraction > 0.8;
     }, `${phase.frequency} Hz in browser speaker output`);
-    await sleep(2000); // Exclude startup and reassignment from steady-state deltas.
+    phase.startup = [];
+    for (let second = 0; second < 2; second++) {
+      await sleep(1000);
+      phase.startup.push(await stats(page, phase.slot));
+    } // Keep startup separately from steady-state deltas.
     phase.before = await stats(page, phase.slot);
-    phase.nativeBefore = (await command("snapshot")).native;
-    for (let second = 0; second < 10; second++) {
+    phase.nativeBefore = (await speakerCommand("snapshot")).native;
+    for (let second = 0; second < (index === 0 ? preSeconds : postSeconds); second++) {
       await sleep(1000);
       phase.output.push(await outputTone(page, phase.frequency));
-      phase.timeline.push({ browser: await stats(page, phase.slot), native: (await command("snapshot")).native });
+      phase.timeline.push({ browser: await stats(page, phase.slot), native: (await speakerCommand("snapshot")).native });
     }
     phase.after = await stats(page, phase.slot);
-    phase.nativeAfter = (await command("snapshot")).native;
+    phase.nativeAfter = (await speakerCommand("snapshot")).native;
     phase.summary = summarize(phase);
     console.log(JSON.stringify(phase.summary));
   }
-  // A negative control: a stopped sender must disappear from the app's output.
-  await command("stop");
-  await waitFor(async () => (await outputTone(page, 1500))?.rms < 0.01, "silence after native leaves");
   const trace = await command("packets");
   report.rtpTrace = trace.packets;
   report.rtpTraceControlReplyErrors = trace.controlReplyErrors;
+  // A negative control: a stopped sender must disappear from the app's output.
+  await speakerCommand("stop");
+  await waitFor(async () => (await outputTone(page, report.phases.at(-1).frequency))?.rms < 0.01, "silence after native leaves");
   fixture.stdin.end("quit\n");
   await deadline(once(fixture, "exit"), 15000, "fixture shutdown").then(([code]) => assert.equal(code, 0, "fixture shutdown"));
   const [first, second] = report.phases;
   assert.equal(first.slot, second.slot, "speaker change did not reuse a slot");
-  assert.notEqual(first.session, second.session, "speaker identity did not change");
+  if (["reuse", "prewarmed"].includes(scenario)) assert.notEqual(first.session, second.session, "speaker identity did not change");
+  else assert.equal(first.session, second.session, "same-sender control changed identity");
   assert.equal(first.after.trackId, second.after.trackId, "slot receiver track changed");
   assert.equal(first.after.inbound.ssrc, second.after.inbound.ssrc, "slot SSRC changed");
   assert.equal(second.after.pcCount, 1, "browser renegotiated with a new peer connection");
@@ -341,24 +427,26 @@ async function main() {
     assert.equal(phase.before.state, "connected");
     assert.equal(phase.after.state, "connected");
     assert.equal(phase.after.codec.mimeType.toLowerCase(), "audio/opus");
-    assert(s.packetsPerSecond > 95 && s.packetsPerSecond < 105, "native stream is not 10 ms / 100 packets per second");
+    assert(Math.abs(s.packetsPerSecond - 48000 / packetSamples) < 5, "unexpected sender packet rate");
     assert.equal(s.packetsLost, 0, "loopback packet loss");
     assert(s.concealmentPercent < 1, `browser concealment ${s.concealmentPercent}%`);
-    assert(s.jitterBufferMs > 0 && s.jitterBufferMs < 60, `browser jitter buffer ${s.jitterBufferMs} ms`);
-    assert(s.samplesPerPacket > 470 && s.samplesPerPacket < 490, "decoded sample clock does not match 480-sample packets");
-    assert.equal(phase.nativeAfter.link, "Connected", "native transport lost");
+    assert(s.jitterBufferMs > 0 && (research || s.jitterBufferMs < 60), `browser jitter buffer ${s.jitterBufferMs} ms`);
+    assert(Math.abs(s.samplesPerPacket - packetSamples) < 20, "decoded sample clock does not match packet duration");
+    if (sender === "native") assert.equal(phase.nativeAfter.link, "Connected", "native transport lost");
     // Chromium measures these fields after the muted media-element output gain,
     // whereas the app's WebAudio path receives PCM before that gain. Keep both
     // stats in the report and require the tone at the actual app speaker output.
     assert(Number.isFinite(s.audioLevel) && Number.isFinite(s.totalAudioEnergy), "missing browser energy stats");
     for (const tone of phase.output) assert(tone.state === "running" && tone.rms > 0.05 && tone.toneFraction > 0.8, "browser did not play the expected native tone");
-    assert(s.nativeFramesReceived > 400, "browser -> native transport stalled");
-    assert(s.nativeRms > 0.05 && s.nativeToneFraction > 0.8, "native did not play the browser's 700 Hz tone");
+    if (sender === "native") {
+      assert(s.nativeFramesReceived > s.seconds * 45, "browser -> native transport stalled");
+      assert(s.nativeRms > 0.05 && s.nativeToneFraction > 0.8, "native did not play the browser's 700 Hz tone");
+    }
   }
   assert.deepEqual(report.errors, [], "browser errors or non-loopback requests");
   report.elapsedSeconds = (Date.now() - started) / 1000;
   report.passed = true;
-  console.log(`PASS native/browser audio and slot reuse in ${report.elapsedSeconds.toFixed(1)} s; ${out}`);
+  console.log(`PASS ${sender} audio (${scenario}) in ${report.elapsedSeconds.toFixed(1)} s; ${out}`);
 }
 
 try {

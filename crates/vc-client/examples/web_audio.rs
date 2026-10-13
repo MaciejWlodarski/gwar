@@ -1,5 +1,5 @@
 //! Local native/browser media fixture for apps/web/e2e/native-audio.mjs.
-//! JSON lines on stdin: start, replace, snapshot, stop, packets, quit. Replies on stdout.
+//! Commands on stdin: start, replace, prepare, activate, mute, resume, snapshot, stop, packets, quit. Replies on stdout.
 //! Pass --trace-rtp after the origin to record headers through a local UDP relay.
 //! Uses the real server and native voice engine with virtual 10 ms audio devices.
 
@@ -211,6 +211,7 @@ fn record_rtp(packets: &Mutex<Vec<Value>>, epoch: Instant, direction: &str, clie
     }
     packets.lock().unwrap().push(json!({
         "direction": direction, "client": client, "seconds": epoch.elapsed().as_secs_f64(),
+        "marker": packet[1] & 0x80 != 0,
         "sequence": u16::from_be_bytes(packet[2..4].try_into().unwrap()),
         "timestamp": u32::from_be_bytes(packet[4..8].try_into().unwrap()),
         "ssrc": u32::from_be_bytes(packet[8..12].try_into().unwrap()),
@@ -227,7 +228,7 @@ struct Native {
 }
 
 impl Native {
-    async fn start(server: &vc_server::Running, frequency: f64) -> anyhow::Result<Self> {
+    async fn start(server: &vc_server::Running, frequency: f64, muted: bool) -> anyhow::Result<Self> {
         anyhow::ensure!(voice::FRAME == BLOCK, "native sender is no longer using 10 ms frames");
         let client = connect(ConnectOptions {
             url: format!("ws://{}/ws", server.http),
@@ -261,6 +262,7 @@ impl Native {
             },
         )
         .await?;
+        voice.set_muted(muted);
         let (offer, answer) = sdp.lock().unwrap().clone();
         anyhow::ensure!(offer.contains("minptime=10;useinbandfec=1"), "native offer is missing 10 ms Opus fmtp");
         Ok(Self { client, voice, playout, offer, answer, frequency })
@@ -358,6 +360,7 @@ async fn run(server: &vc_server::Running, trace: Option<&RtpTrace>) -> anyhow::R
         json!({"event": "ready", "url": format!("ws://{}/ws", server.http), "media": server.media, "mediaBind": server.media_bind}),
     )?;
     let mut native: Option<Native> = None;
+    let mut prepared: Option<Native> = None;
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Some(line) = lines.next_line().await? {
         match line.as_str() {
@@ -366,12 +369,36 @@ async fn run(server: &vc_server::Running, trace: Option<&RtpTrace>) -> anyhow::R
                     old.leave().await?;
                 }
                 let frequency = if line == "start" { 1000.0 } else { 1500.0 };
-                let next = Native::start(server, frequency).await?;
+                let next = Native::start(server, frequency, false).await?;
                 reply(json!({"event": line, "native": next.snapshot(), "offer": next.offer, "answer": next.answer}))?;
                 native = Some(next);
             }
+            "prepare" => {
+                anyhow::ensure!(prepared.is_none(), "a sender is already prepared");
+                prepared = Some(Native::start(server, 1500.0, true).await?);
+                reply(json!({"event": "prepare", "native": prepared.as_ref().unwrap().snapshot()}))?;
+            }
+            "activate" => {
+                if let Some(old) = native.take() {
+                    old.leave().await?;
+                }
+                let next = prepared.take().context("no prepared speaker")?;
+                next.voice.set_muted(false);
+                reply(
+                    json!({"event": "activate", "native": next.snapshot(), "offer": next.offer, "answer": next.answer}),
+                )?;
+                native = Some(next);
+            }
+            "mute" | "resume" => {
+                let speaker = native.as_ref().context("no native speaker")?;
+                speaker.voice.set_muted(line == "mute");
+                reply(json!({"event": line, "native": speaker.snapshot()}))?;
+            }
             "snapshot" => {
-                reply(json!({"event": "snapshot", "native": native.as_ref().context("no native speaker")?.snapshot()}))?
+                let speaker = native.as_ref().context("no native speaker")?;
+                // Long measurements must keep signaling alive, like the app's heartbeat.
+                speaker.client.connection.request(Request::Ping {}).await?;
+                reply(json!({"event": "snapshot", "native": speaker.snapshot()}))?;
             }
             "stop" => {
                 native.take().context("no native speaker")?.leave().await?;
@@ -394,6 +421,9 @@ async fn run(server: &vc_server::Running, trace: Option<&RtpTrace>) -> anyhow::R
     }
     if let Some(native) = native {
         native.leave().await?;
+    }
+    if let Some(prepared) = prepared {
+        prepared.leave().await?;
     }
     Ok(())
 }
