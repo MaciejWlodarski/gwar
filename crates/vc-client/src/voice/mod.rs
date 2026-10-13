@@ -8,6 +8,7 @@
 pub mod io;
 pub mod jitter;
 pub mod permission;
+mod playout;
 mod rtc;
 
 use std::{
@@ -21,17 +22,14 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use audiopus::{
-    Application, Bitrate, Channels, MutSignals, SampleRate,
-    coder::{Decoder, Encoder},
-    packet::Packet,
-};
+use audiopus::{Application, Bitrate, Channels, SampleRate, coder::Encoder};
 use tokio::sync::mpsc;
 use vc_proto::AUDIO_SLOTS;
 
 use self::{
-    io::{AudioIo, AudioPorts},
-    jitter::{JitterBuffer, Playout},
+    io::{AudioIo, AudioPorts, OutputTiming},
+    jitter::Clock,
+    playout::{Slot, SpeakerBuffer},
 };
 use crate::Connection;
 
@@ -102,6 +100,8 @@ pub(crate) struct Counters {
     frames_received: AtomicU64,
     /// 0 connecting, 1 connected, 2 lost.
     link: AtomicU8,
+    slots: [SlotCounters; AUDIO_SLOTS],
+    speaker_samples: AtomicU64,
 }
 
 impl Counters {
@@ -119,6 +119,36 @@ impl Counters {
     }
 }
 
+#[derive(Default)]
+struct SlotCounters {
+    generation: AtomicU64,
+    packets: AtomicU64,
+    samples: AtomicU64,
+    concealments: AtomicU64,
+    late_drops: AtomicU64,
+    target_samples: AtomicU64,
+    staged_samples: AtomicU64,
+    shrink_samples: AtomicU64,
+    trim_events: AtomicU64,
+    concealments_after_trim: AtomicU64,
+}
+
+/// Per-slot receive queue snapshot; sample counts use the 48 kHz clock.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SlotStats {
+    pub generation: u64,
+    pub queued_packets: u64,
+    pub queued_samples: u64,
+    pub concealments: u64,
+    pub late_drops: u64,
+    pub target_samples: u64,
+    pub staged_samples: u64,
+    pub shrink_samples: u64,
+    pub trim_events: u64,
+    /// Concealments within one second of a trim, including stall recovery.
+    pub concealments_after_trim: u64,
+}
+
 /// Snapshot of transport counters, for diagnostics and the connection indicator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VoiceStats {
@@ -127,6 +157,16 @@ pub struct VoiceStats {
     /// Opus frames received from the server (all slots).
     pub frames_received: u64,
     pub link: LinkState,
+    pub slots: [SlotStats; AUDIO_SLOTS],
+    pub speaker_samples: u64,
+    pub callback_samples: usize,
+    /// Slowly decaying callback maximum used to size the speaker queue.
+    pub callback_max_samples: usize,
+    /// Scheduling headroom beyond one held callback, in 48 kHz samples.
+    pub headroom_samples: usize,
+    /// Output callbacks missing samples while a receive stream was playing.
+    pub underruns: u64,
+    pub underrun_samples: u64,
 }
 
 /// Handle owned by the app; dropping it stops the engine.
@@ -134,6 +174,7 @@ pub struct VoiceHandle {
     controls: Arc<Controls>,
     counters: Arc<Counters>,
     _ports_guard: Box<dyn Send>,
+    output: Arc<OutputTiming>,
 }
 
 impl VoiceHandle {
@@ -175,6 +216,27 @@ impl VoiceHandle {
         VoiceStats {
             frames_sent: c.frames_sent.load(Ordering::Relaxed),
             frames_received: c.frames_received.load(Ordering::Relaxed),
+            slots: std::array::from_fn(|i| {
+                let s = &c.slots[i];
+                SlotStats {
+                    generation: s.generation.load(Ordering::Relaxed),
+                    queued_packets: s.packets.load(Ordering::Relaxed),
+                    queued_samples: s.samples.load(Ordering::Relaxed),
+                    concealments: s.concealments.load(Ordering::Relaxed),
+                    late_drops: s.late_drops.load(Ordering::Relaxed),
+                    target_samples: s.target_samples.load(Ordering::Relaxed),
+                    staged_samples: s.staged_samples.load(Ordering::Relaxed),
+                    shrink_samples: s.shrink_samples.load(Ordering::Relaxed),
+                    trim_events: s.trim_events.load(Ordering::Relaxed),
+                    concealments_after_trim: s.concealments_after_trim.load(Ordering::Relaxed),
+                }
+            }),
+            speaker_samples: c.speaker_samples.load(Ordering::Relaxed),
+            callback_samples: self.output.callback_samples.load(Ordering::Relaxed),
+            callback_max_samples: self.output.callback_max_samples.load(Ordering::Relaxed),
+            headroom_samples: self.output.headroom_samples.load(Ordering::Relaxed),
+            underruns: self.output.underruns.load(Ordering::Relaxed),
+            underrun_samples: self.output.underrun_samples.load(Ordering::Relaxed),
             link: match c.link.load(Ordering::Relaxed) {
                 0 => LinkState::Connecting,
                 1 => LinkState::Connected,
@@ -187,6 +249,7 @@ impl VoiceHandle {
 impl Drop for VoiceHandle {
     fn drop(&mut self) {
         self.controls.stop.store(true, Ordering::Relaxed);
+        self.output.wake();
     }
 }
 
@@ -198,10 +261,30 @@ pub(crate) struct Outgoing {
     pub speech: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Generation {
+    Rtp(vc_proto::rtp::SlotGeneration),
+    Sequence(u64),
+}
+
+impl Generation {
+    fn is_newer_than(self, old: Self) -> bool {
+        match (self, old) {
+            (Self::Rtp(new), Self::Rtp(old)) => new.is_newer_than(old),
+            (Self::Sequence(new), Self::Sequence(old)) => new > old,
+            _ => true,
+        }
+    }
+}
+
 /// A received frame for one slot.
 pub(crate) struct Incoming {
     pub slot: usize,
     pub rtp_time: u64,
+    /// Missing native metadata leaves the current ownership unchanged.
+    pub generation: Option<Generation>,
+    pub arrived: Instant,
+    pub clock: Clock,
     pub opus: Vec<u8>,
 }
 
@@ -227,17 +310,18 @@ where
     let (out_tx, out_rx) = mpsc::channel::<Outgoing>(64);
     let (in_tx, in_rx) = std::sync::mpsc::sync_channel::<Incoming>(512);
     let counters = Arc::new(Counters::default());
-    rtc::start(signal, local_ip, out_rx, in_tx, counters.clone()).await?;
+    rtc::start(signal, local_ip, out_rx, in_tx, counters.clone(), ports.output.clone()).await?;
     let controls = Arc::new(Controls::default());
-    let AudioPorts { mic, speaker, _guard } = ports;
+    let AudioPorts { mic, speaker, output, _guard } = ports;
+    let timing = output.clone();
     let pipeline_controls = controls.clone();
     let pipeline_counters = counters.clone();
     thread::Builder::new().name("vc-voice-pipeline".into()).spawn(move || {
-        if let Err(e) = pipeline(pipeline_controls, pipeline_counters, mic, speaker, out_tx, in_rx) {
+        if let Err(e) = pipeline(pipeline_controls, pipeline_counters, mic, speaker, timing, out_tx, in_rx) {
             tracing::warn!("voice pipeline stopped: {e:#}");
         }
     })?;
-    Ok(VoiceHandle { controls, counters, _ports_guard: _guard })
+    Ok(VoiceHandle { controls, counters, output, _ports_guard: _guard })
 }
 
 /// Voice on a TeamSpeak server (see [`crate::teamspeak`]): frames travel
@@ -253,6 +337,7 @@ pub async fn start_teamspeak(
     let counters = Arc::new(Counters::default());
     counters.set_link(LinkState::Connected);
     let link = counters.clone();
+    let wake = ports.output.clone();
     tokio::spawn(async move {
         // TS ends a talk spurt with an empty frame; send one after a short silence.
         let mut talking = false;
@@ -261,7 +346,8 @@ pub async fn start_teamspeak(
                 frame = audio_in.recv() => {
                     let Some(frame) = frame else { break };
                     link.frame_received();
-                    let _ = in_tx.try_send(Incoming { slot: frame.slot, rtp_time: frame.rtp_time, opus: frame.opus });
+                    let _ = in_tx.try_send(Incoming { slot: frame.slot, generation: Some(Generation::Sequence(frame.generation)), rtp_time: frame.rtp_time, opus: frame.opus, arrived: Instant::now(), clock: Clock::Sequence });
+                    wake.wake();
                 }
                 outgoing = async {
                     if talking {
@@ -285,15 +371,16 @@ pub async fn start_teamspeak(
         link.set_link(LinkState::Lost);
     });
     let controls = Arc::new(Controls::default());
-    let AudioPorts { mic, speaker, _guard } = ports;
+    let AudioPorts { mic, speaker, output, _guard } = ports;
+    let timing = output.clone();
     let pipeline_controls = controls.clone();
     let pipeline_counters = counters.clone();
     thread::Builder::new().name("vc-voice-pipeline".into()).spawn(move || {
-        if let Err(e) = pipeline(pipeline_controls, pipeline_counters, mic, speaker, out_tx, in_rx) {
+        if let Err(e) = pipeline(pipeline_controls, pipeline_counters, mic, speaker, timing, out_tx, in_rx) {
             tracing::warn!("voice pipeline stopped: {e:#}");
         }
     })?;
-    Ok(VoiceHandle { controls, counters, _ports_guard: _guard })
+    Ok(VoiceHandle { controls, counters, output, _ports_guard: _guard })
 }
 
 /// The local address the OS uses to reach `server` (no packets are sent).
@@ -310,14 +397,13 @@ fn level_db(frame: &[f32]) -> f32 {
 }
 
 const HANGOVER: Duration = Duration::from_millis(300);
-/// Playout target in the speaker ring, in samples (~60 ms).
-const SPEAKER_TARGET: usize = FRAME * 3;
 
 fn pipeline(
     controls: Arc<Controls>,
     counters: Arc<Counters>,
     mut mic: rtrb::Consumer<f32>,
     mut speaker: rtrb::Producer<f32>,
+    output: Arc<OutputTiming>,
     out: mpsc::Sender<Outgoing>,
     incoming: std::sync::mpsc::Receiver<Incoming>,
 ) -> Result<()> {
@@ -325,14 +411,13 @@ fn pipeline(
     encoder.set_bitrate(Bitrate::BitsPerSecond(48_000))?;
     encoder.set_inband_fec(true)?;
     encoder.set_packet_loss_perc(5)?;
-    let mut decoders =
-        (0..AUDIO_SLOTS).map(|_| Decoder::new(SampleRate::Hz48000, Channels::Mono)).collect::<Result<Vec<_>, _>>()?;
-    let mut buffers: Vec<_> = (0..AUDIO_SLOTS).map(|_| JitterBuffer::new(3)).collect();
+    output.attach();
+    let mut slots = (0..AUDIO_SLOTS).map(|_| Slot::new()).collect::<Result<Vec<_>>>()?;
     let mut frame = vec![0f32; FRAME];
-    let mut decoded = vec![0f32; FRAME * 6];
     let mut mix = vec![0f32; FRAME];
     let mut packet = vec![0u8; 1275];
     let mut last_voice = Instant::now() - HANGOVER;
+    let mut speaker_buffer = SpeakerBuffer::new(Instant::now());
 
     while !controls.stop.load(Ordering::Relaxed) {
         // ---- capture
@@ -365,45 +450,55 @@ fn pipeline(
 
         // ---- receive
         while let Ok(item) = incoming.try_recv() {
-            let samples = crate::voice::opus_samples(&item.opus).unwrap_or(FRAME as u32);
-            if let Some(buffer) = buffers.get_mut(item.slot) {
-                buffer.push(item.rtp_time, u64::from(samples), item.opus);
+            if let Some(slot) = slots.get_mut(item.slot) {
+                slot.receive(item)?;
             }
         }
 
-        // ---- playout: keep the device ring topped up to the target
-        while speaker.slots() > 0 && (speaker.buffer().capacity() - speaker.slots()) < SPEAKER_TARGET {
-            mix.fill(0.0);
-            let deafened = controls.deafened.load(Ordering::Relaxed);
-            for (slot, buffer) in buffers.iter_mut().enumerate() {
-                let n = match buffer.pop() {
-                    Playout::Packet(data) => {
-                        let input = Packet::try_from(data.as_slice()).ok();
-                        let output = MutSignals::try_from(&mut decoded[..])?;
-                        decoders[slot].decode_float(input, output, false).unwrap_or(0)
-                    }
-                    Playout::Conceal => {
-                        let output = MutSignals::try_from(&mut decoded[..FRAME])?;
-                        decoders[slot].decode_float(None, output, false).unwrap_or(0)
-                    }
-                    Playout::Idle => 0,
-                };
-                if n == 0 || deafened {
-                    continue;
-                }
-                let gain = f(&controls.slot_gain[slot]);
-                for (m, s) in mix.iter_mut().zip(&decoded[..n.min(FRAME)]) {
-                    *m += s * gain;
-                }
+        // Decode only as needed; each slot retains the rest of its packet.
+        speaker_buffer.update(
+            Instant::now(),
+            output.callback_samples.load(Ordering::Relaxed),
+            output.callback_peak.swap(0, Ordering::Relaxed),
+            output.underruns.load(Ordering::Relaxed),
+        );
+        output.callback_max_samples.store(speaker_buffer.callback, Ordering::Relaxed);
+        output.headroom_samples.store(speaker_buffer.headroom, Ordering::Relaxed);
+        let target = speaker_buffer.target(speaker.buffer().capacity());
+        let level = speaker.buffer().capacity() - speaker.slots();
+        let mut needed = target.saturating_sub(level);
+        let deafened = controls.deafened.load(Ordering::Relaxed);
+        while needed > 0 {
+            let take = needed.min(FRAME);
+            mix[..take].fill(0.0);
+            let now = Instant::now();
+            for (index, slot) in slots.iter_mut().enumerate() {
+                slot.mix_refill(&mut mix[..take], f(&controls.slot_gain[index]), now, needed)?;
             }
             let master = if deafened { 0.0 } else { f(&controls.master) };
-            for s in &mix {
-                if speaker.push((s * master).clamp(-1.0, 1.0)).is_err() {
-                    break;
-                }
+            output.playing.store(slots.iter().any(Slot::playing), Ordering::Relaxed);
+            for s in &mix[..take] {
+                let _ = speaker.push((s * master).clamp(-1.0, 1.0));
             }
+            needed -= take;
         }
-        thread::sleep(Duration::from_millis(5));
+        counters.speaker_samples.store((speaker.buffer().capacity() - speaker.slots()) as u64, Ordering::Relaxed);
+        for (slot, stats) in slots.iter().zip(&counters.slots) {
+            stats.generation.store(slot.generation(), Ordering::Relaxed);
+            let buffer = &slot.buffer;
+            let (packets, samples) = buffer.depth();
+            stats.packets.store(packets as u64, Ordering::Relaxed);
+            stats.samples.store(samples, Ordering::Relaxed);
+            stats.concealments.store(buffer.concealments, Ordering::Relaxed);
+            stats.late_drops.store(buffer.late_drops, Ordering::Relaxed);
+            stats.target_samples.store(buffer.target_samples(), Ordering::Relaxed);
+            stats.staged_samples.store(slot.staged_samples() as u64, Ordering::Relaxed);
+            stats.shrink_samples.store(buffer.shrink_samples, Ordering::Relaxed);
+            stats.trim_events.store(buffer.trim_events, Ordering::Relaxed);
+            stats.concealments_after_trim.store(buffer.concealments_after_trim, Ordering::Relaxed);
+        }
+        // Capture, receive and output all unpark us. The timeout also handles device failure.
+        thread::park_timeout(Duration::from_millis(20));
     }
     Ok(())
 }

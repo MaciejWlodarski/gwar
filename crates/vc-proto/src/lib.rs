@@ -11,6 +11,9 @@
 //! travels over the WebSocket: `voice.offer` negotiates a WebRTC session whose
 //! receive transceivers are fixed "speaker slots" announced through `voice.slot`.
 
+#[cfg(feature = "rtp")]
+pub mod rtp;
+
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "ts")]

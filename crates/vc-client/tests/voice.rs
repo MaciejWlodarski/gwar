@@ -12,7 +12,7 @@ use vc_client::{
     ConnectOptions, Identity, connect,
     voice::{
         self,
-        io::{AudioIo, AudioPorts},
+        io::{AudioIo, AudioPorts, OutputTiming},
     },
 };
 use vc_proto::{ClientSoftware, Platform};
@@ -30,6 +30,8 @@ impl AudioIo for FakeIo {
         let heard = self.heard.clone();
         let tone = self.tone;
         // Real-time pacing: 10 ms of samples in, 10 ms out, like a device.
+        let output = Arc::new(OutputTiming::default());
+        let timing = output.clone();
         thread::spawn(move || {
             let mut t = 0u64;
             loop {
@@ -41,14 +43,16 @@ impl AudioIo for FakeIo {
                     }
                 }
                 let mut out = heard.lock().unwrap();
+                let missing = 480usize.saturating_sub(speaker_rx.slots());
                 for _ in 0..480 {
                     out.push(speaker_rx.pop().unwrap_or(0.0));
                 }
+                timing.report(480, missing);
                 drop(out);
                 thread::sleep(Duration::from_millis(10));
             }
         });
-        Ok(AudioPorts { mic, speaker, _guard: Box::new(()) })
+        Ok(AudioPorts { mic, speaker, output, _guard: Box::new(()) })
     }
 }
 
@@ -111,10 +115,16 @@ async fn tone_travels_between_native_clients() {
     let silent = Arc::new(Mutex::new(Vec::new()));
     let heard = Arc::new(Mutex::new(Vec::new()));
     let _va = voice::start(&a.connection, Box::new(FakeIo { heard: silent, tone: true }), server.http).await.unwrap();
-    let _vb =
+    let vb =
         voice::start(&b.connection, Box::new(FakeIo { heard: heard.clone(), tone: false }), server.http).await.unwrap();
 
     tokio::time::sleep(Duration::from_secs(3)).await;
+    let stats = vb.stats();
+    assert_eq!(stats.callback_samples, 480);
+    // The generation extension must survive real SDP negotiation and SRTP.
+    assert!(stats.slots.iter().any(|slot| slot.generation > 0), "{stats:?}");
+    assert!(stats.speaker_samples <= (stats.callback_max_samples + stats.headroom_samples) as u64, "{stats:?}");
+    assert!(stats.slots.iter().all(|slot| slot.staged_samples <= 960), "{stats:?}");
     let samples = heard.lock().unwrap().clone();
     let tail = &samples[samples.len().saturating_sub(48_000)..];
     let level = rms(tail);

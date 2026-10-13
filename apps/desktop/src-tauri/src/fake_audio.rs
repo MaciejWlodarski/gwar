@@ -12,7 +12,7 @@ use std::{
 };
 
 use rtrb::RingBuffer;
-use vc_client::voice::io::{AudioIo, AudioPorts};
+use vc_client::voice::io::{AudioIo, AudioPorts, OutputTiming};
 
 /// Fake audio is only honoured in debug builds.
 pub fn enabled() -> bool {
@@ -67,6 +67,8 @@ impl AudioIo for FakeIo {
         let stopped = stop.clone();
         let FakeIo { tone, heard } = *self;
         // Real-time pacing: 10 ms of samples in, 10 ms out, like a device.
+        let output = Arc::new(OutputTiming::default());
+        let timing = output.clone();
         thread::Builder::new().name("vc-fake-audio".into()).spawn(move || {
             let mut t = 0u64;
             let (mut sum, mut n) = (0f32, 0usize);
@@ -76,6 +78,7 @@ impl AudioIo for FakeIo {
                     t += 1;
                     let _ = mic_tx.push(s);
                 }
+                let missing = 480usize.saturating_sub(speaker_rx.slots());
                 for _ in 0..480 {
                     let s = speaker_rx.pop().unwrap_or(0.0);
                     if s.abs() > 0.01 {
@@ -92,10 +95,11 @@ impl AudioIo for FakeIo {
                         (sum, n) = (0.0, 0);
                     }
                 }
+                timing.report(480, missing);
                 thread::sleep(Duration::from_millis(10));
             }
         })?;
-        Ok(AudioPorts { mic, speaker, _guard: Box::new(StopOnDrop(stop)) })
+        Ok(AudioPorts { mic, speaker, output, _guard: Box::new(StopOnDrop(stop)) })
     }
 }
 
@@ -107,7 +111,8 @@ impl AudioIo for NullIo {
     fn open(self: Box<Self>) -> anyhow::Result<AudioPorts> {
         let (_mic_tx, mic) = RingBuffer::<f32>::new(1);
         let (speaker, _speaker_rx) = RingBuffer::<f32>::new(48_000 / 2);
+        let output = Arc::new(OutputTiming::default());
         // The unused ring ends are dropped; the engine only ever sees empty/full rings.
-        Ok(AudioPorts { mic, speaker, _guard: Box::new(()) })
+        Ok(AudioPorts { mic, speaker, output, _guard: Box::new(()) })
     }
 }

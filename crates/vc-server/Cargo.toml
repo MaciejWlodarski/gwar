@@ -16,7 +16,7 @@ name = "vc-server"
 path = "src/main.rs"
 
 [dependencies]
-vc-proto = { path = "../vc-proto" }
+vc-proto = { path = "../vc-proto", features = ["rtp"] }
 anyhow.workspace = true
 arc-swap = "1"
 argon2 = "0.5"

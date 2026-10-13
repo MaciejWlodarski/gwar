@@ -154,6 +154,35 @@ playout time, identity (or `null`), confidence and tone energy fraction.
 latency and reason. Floor, tone frequencies, classification thresholds and
 artificial delay in both ms and samples are recorded too.
 
+`receiver_playout` is the receiver's final live snapshot: speaker queue level,
+latest and held maximum callback sizes, scheduling headroom, active-stream
+underrun events and samples, and per-slot target/queue/staged samples,
+concealment events, late drops, shrunk samples, `trim_events` and
+`concealments_after_trim` (concealments within one second after a trim). A trim
+event is one fractional correction or one stall-recovery batch; these counters
+include both. Proximity is diagnostic correlation, not proof that a trim caused
+the concealment. All sample counts use 48 kHz mono; divide by 48 for ms. These cumulative counters include warmup; raw
+receiver underflows also include idle callbacks, whereas playout underruns count
+only callbacks during playback.
+
+Fractional corrections use the minimum queue + staged PCM margin observed
+before refills over a full trailing five seconds. This retains sparse low-water
+evidence such as a 5 ms packet delay every three seconds. The margin excludes
+the pending refill, adaptive jitter reserve beyond packet batching, and 120 samples (2.5 ms)
+of safety. Arrival phase contributes no credit. Each correction removes at most
+240 samples, then rebuilds the observation window. Every concealment also
+requires a fresh full window. Genuine surplus may take tens of seconds to
+converge; the two-second nonquiet deadline cannot bypass the five-second
+window, and speech onsets remain protected. Surplus below 120 samples is not
+corrected.
+
+For a variable output device, invoke the example directly with
+`LATENCY_CALLBACK_JITTER=1 target/release/examples/latency output.csv 100`.
+The receiver cycles through 480/960/240-sample callbacks (10/20/5 ms) on the same
+sample clock; the sender stays at 480. JSON records `receiver_callback_pattern`.
+The comparison runners clear `LATENCY_*` variables, so use direct invocation for
+this mode.
+
 Quantiles use empirical nearest rank, including the lower median for even n;
 all-lost quantiles are `null`. CSV/JSON are written before rejecting below-floor
 candidates or more than 5% lost markers.

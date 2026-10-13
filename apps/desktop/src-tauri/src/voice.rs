@@ -517,7 +517,7 @@ pub async fn mic_test_start(app: AppHandle, voice: State<'_, Voice>, input: Opti
     thread::Builder::new()
         .name("vc-mic-test".into())
         .spawn(move || {
-            let vc_client::voice::io::AudioPorts { mut mic, speaker: _speaker, _guard } = ports;
+            let vc_client::voice::io::AudioPorts { mut mic, speaker: _speaker, _guard, .. } = ports;
             let mut acc = (0f32, 0usize);
             while !stop.load(Ordering::Relaxed) {
                 while let Ok(s) = mic.pop() {

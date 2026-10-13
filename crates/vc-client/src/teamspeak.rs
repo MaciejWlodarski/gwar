@@ -71,6 +71,7 @@ pub struct TsAudio {
     pub slot: usize,
     /// 48 kHz timeline for the jitter buffer, from TS's per-speaker packet counter.
     pub rtp_time: u64,
+    pub generation: u64,
     pub opus: Vec<u8>,
 }
 
@@ -79,6 +80,8 @@ struct SlotMap {
     slots: [Option<(u16, std::time::Instant)>; vc_proto::AUDIO_SLOTS],
     /// Per speaker: last packet id and its unwrapped 48 kHz time.
     clocks: HashMap<u16, (u16, u64)>,
+    generations: [u64; vc_proto::AUDIO_SLOTS],
+    ended_at: [Option<u64>; vc_proto::AUDIO_SLOTS],
 }
 
 /// A slot idle this long may be reassigned.
@@ -86,7 +89,12 @@ const SLOT_REUSE: Duration = Duration::from_millis(800);
 
 impl SlotMap {
     fn new() -> Self {
-        Self { slots: [None; vc_proto::AUDIO_SLOTS], clocks: HashMap::new() }
+        Self {
+            slots: [None; vc_proto::AUDIO_SLOTS],
+            clocks: HashMap::new(),
+            generations: [0; vc_proto::AUDIO_SLOTS],
+            ended_at: [None; vc_proto::AUDIO_SLOTS],
+        }
     }
 
     /// Returns (slot, rtp_time, newly assigned).
@@ -105,14 +113,42 @@ impl SlotMap {
                 (i, true)
             }
         };
+        if fresh {
+            self.generations[slot] += 1;
+            self.ended_at[slot] = None;
+        }
         self.slots[slot] = Some((speaker, now));
         let time = match self.clocks.get(&speaker) {
-            Some(&(last, time)) => time + u64::from(packet_id.wrapping_sub(last)) * 960,
-            // Start far from 0 so a new speaker never looks "late" to the jitter buffer.
+            Some(&(last, time)) => {
+                // Reordered packets belong before the anchor, including across u16 wrap.
+                let delta = i64::from(packet_id.wrapping_sub(last) as i16);
+                time.saturating_add_signed(delta * 960)
+            }
+            // Leave room for reordered packets before the initial counter anchor.
             None => 1 << 32,
         };
-        self.clocks.insert(speaker, (packet_id, time));
+        if self.ended_at[slot].is_some_and(|end| time <= end) {
+            return None;
+        }
+        if self.clocks.get(&speaker).is_none_or(|&(last, _)| packet_id.wrapping_sub(last) as i16 > 0) {
+            self.clocks.insert(speaker, (packet_id, time));
+        }
         Some((slot, time, fresh))
+    }
+
+    /// Empty TS frames end a spurt. The next packet carries the new generation,
+    /// even if the audio channel was full when the end marker arrived.
+    fn end(&mut self, speaker: u16, packet_id: u16) {
+        let Some(&(last, time)) = self.clocks.get(&speaker) else { return };
+        let delta = i64::from(packet_id.wrapping_sub(last) as i16);
+        if delta <= 0 {
+            return;
+        }
+        let Some(slot) = self.slots.iter().position(|s| s.is_some_and(|(who, _)| who == speaker)) else { return };
+        let time = time + delta as u64 * 960;
+        self.clocks.insert(speaker, (packet_id, time));
+        self.ended_at[slot] = Some(time);
+        self.generations[slot] += 1;
     }
 
     fn remove(&mut self, speaker: u16) -> Option<usize> {
@@ -621,11 +657,15 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                                     from: u32::from(*from),
                                     slot,
                                     rtp_time,
+                                    generation: slots.generations[slot],
                                     opus: data.to_vec(),
                                 });
                             }
-                        } else if talking.remove(from).is_some() {
-                            book_changed = true;
+                        } else {
+                            slots.end(*from, *id);
+                            if talking.remove(from).is_some() {
+                                book_changed = true;
+                            }
                         }
                     }
                 }
@@ -723,9 +763,36 @@ mod tests {
         let (a2, t1, fresh) = map.place(7, 0).unwrap(); // u16 wrap
         assert_eq!((a2, fresh), (a, false));
         assert_eq!(t1 - t0, 960);
+        let (_, reordered, _) = map.place(7, 65_534).unwrap();
+        assert_eq!(reordered, t0 - 960);
+        let (_, t2, _) = map.place(7, 1).unwrap();
+        assert_eq!(t2, t1 + 960);
+        assert_eq!(map.place(7, 0).unwrap().1, t1);
         let (b, _, _) = map.place(9, 3).unwrap();
         assert_ne!(a, b);
         assert_eq!(map.remove(7), Some(a));
+    }
+
+    #[test]
+    fn slot_generations_follow_end_markers_and_immediate_reuse() {
+        let mut map = SlotMap::new();
+        let (slot, origin, _) = map.place(7, 10).unwrap();
+        let generation = map.generations[slot];
+        map.place(7, 11).unwrap();
+        assert_eq!(map.generations[slot], generation);
+        map.end(7, 12);
+        assert!(map.place(7, 11).is_none()); // delayed audio before the end marker
+        assert_eq!(map.place(7, 13).unwrap().0, slot);
+        assert_eq!(map.generations[slot], generation + 1);
+        map.end(7, 12); // duplicate end marker must not reset the current spurt
+        assert_eq!(map.generations[slot], generation + 1);
+        map.remove(7);
+        let (replacement, time, fresh) = map.place(9, 1).unwrap();
+        assert_eq!((replacement, time, fresh), (slot, origin, true));
+        assert_eq!(map.generations[slot], generation + 2);
+        map.remove(9);
+        map.place(9, 1).unwrap(); // a reused TS client id still gets a new generation
+        assert_eq!(map.generations[slot], generation + 3);
     }
 
     #[test]
