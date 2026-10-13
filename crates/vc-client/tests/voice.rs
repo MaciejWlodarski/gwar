@@ -12,7 +12,7 @@ use vc_client::{
     ConnectOptions, Identity, connect,
     voice::{
         self,
-        io::{AudioIo, AudioPorts},
+        io::{AudioIo, AudioPorts, OutputTiming},
     },
 };
 use vc_proto::{ClientSoftware, Platform};
@@ -30,6 +30,8 @@ impl AudioIo for FakeIo {
         let heard = self.heard.clone();
         let tone = self.tone;
         // Real-time pacing: 10 ms of samples in, 10 ms out, like a device.
+        let output = Arc::new(OutputTiming::default());
+        let timing = output.clone();
         thread::spawn(move || {
             let mut t = 0u64;
             loop {
@@ -41,14 +43,16 @@ impl AudioIo for FakeIo {
                     }
                 }
                 let mut out = heard.lock().unwrap();
+                let missing = 480usize.saturating_sub(speaker_rx.slots());
                 for _ in 0..480 {
                     out.push(speaker_rx.pop().unwrap_or(0.0));
                 }
+                timing.report(480, missing);
                 drop(out);
                 thread::sleep(Duration::from_millis(10));
             }
         });
-        Ok(AudioPorts { mic, speaker, _guard: Box::new(()) })
+        Ok(AudioPorts { mic, speaker, output, _guard: Box::new(()) })
     }
 }
 

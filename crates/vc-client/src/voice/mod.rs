@@ -30,7 +30,7 @@ use tokio::sync::mpsc;
 use vc_proto::AUDIO_SLOTS;
 
 use self::{
-    io::{AudioIo, AudioPorts},
+    io::{AudioIo, AudioPorts, OutputTiming},
     jitter::{JitterBuffer, Playout},
 };
 use crate::Connection;
@@ -102,6 +102,8 @@ pub(crate) struct Counters {
     frames_received: AtomicU64,
     /// 0 connecting, 1 connected, 2 lost.
     link: AtomicU8,
+    slots: [SlotCounters; AUDIO_SLOTS],
+    speaker_samples: AtomicU64,
 }
 
 impl Counters {
@@ -119,6 +121,23 @@ impl Counters {
     }
 }
 
+#[derive(Default)]
+struct SlotCounters {
+    packets: AtomicU64,
+    samples: AtomicU64,
+    concealments: AtomicU64,
+    late_drops: AtomicU64,
+}
+
+/// Per-slot receive queue snapshot; sample counts use the 48 kHz clock.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SlotStats {
+    pub queued_packets: u64,
+    pub queued_samples: u64,
+    pub concealments: u64,
+    pub late_drops: u64,
+}
+
 /// Snapshot of transport counters, for diagnostics and the connection indicator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VoiceStats {
@@ -127,6 +146,12 @@ pub struct VoiceStats {
     /// Opus frames received from the server (all slots).
     pub frames_received: u64,
     pub link: LinkState,
+    pub slots: [SlotStats; AUDIO_SLOTS],
+    pub speaker_samples: u64,
+    pub callback_samples: usize,
+    /// Output callbacks missing samples while a receive stream was playing.
+    pub underruns: u64,
+    pub underrun_samples: u64,
 }
 
 /// Handle owned by the app; dropping it stops the engine.
@@ -134,6 +159,7 @@ pub struct VoiceHandle {
     controls: Arc<Controls>,
     counters: Arc<Counters>,
     _ports_guard: Box<dyn Send>,
+    output: Arc<OutputTiming>,
 }
 
 impl VoiceHandle {
@@ -175,6 +201,19 @@ impl VoiceHandle {
         VoiceStats {
             frames_sent: c.frames_sent.load(Ordering::Relaxed),
             frames_received: c.frames_received.load(Ordering::Relaxed),
+            slots: std::array::from_fn(|i| {
+                let s = &c.slots[i];
+                SlotStats {
+                    queued_packets: s.packets.load(Ordering::Relaxed),
+                    queued_samples: s.samples.load(Ordering::Relaxed),
+                    concealments: s.concealments.load(Ordering::Relaxed),
+                    late_drops: s.late_drops.load(Ordering::Relaxed),
+                }
+            }),
+            speaker_samples: c.speaker_samples.load(Ordering::Relaxed),
+            callback_samples: self.output.callback_samples.load(Ordering::Relaxed),
+            underruns: self.output.underruns.load(Ordering::Relaxed),
+            underrun_samples: self.output.underrun_samples.load(Ordering::Relaxed),
             link: match c.link.load(Ordering::Relaxed) {
                 0 => LinkState::Connecting,
                 1 => LinkState::Connected,
@@ -229,15 +268,16 @@ where
     let counters = Arc::new(Counters::default());
     rtc::start(signal, local_ip, out_rx, in_tx, counters.clone()).await?;
     let controls = Arc::new(Controls::default());
-    let AudioPorts { mic, speaker, _guard } = ports;
+    let AudioPorts { mic, speaker, output, _guard } = ports;
+    let timing = output.clone();
     let pipeline_controls = controls.clone();
     let pipeline_counters = counters.clone();
     thread::Builder::new().name("vc-voice-pipeline".into()).spawn(move || {
-        if let Err(e) = pipeline(pipeline_controls, pipeline_counters, mic, speaker, out_tx, in_rx) {
+        if let Err(e) = pipeline(pipeline_controls, pipeline_counters, mic, speaker, timing, out_tx, in_rx) {
             tracing::warn!("voice pipeline stopped: {e:#}");
         }
     })?;
-    Ok(VoiceHandle { controls, counters, _ports_guard: _guard })
+    Ok(VoiceHandle { controls, counters, output, _ports_guard: _guard })
 }
 
 /// Voice on a TeamSpeak server (see [`crate::teamspeak`]): frames travel
@@ -285,15 +325,16 @@ pub async fn start_teamspeak(
         link.set_link(LinkState::Lost);
     });
     let controls = Arc::new(Controls::default());
-    let AudioPorts { mic, speaker, _guard } = ports;
+    let AudioPorts { mic, speaker, output, _guard } = ports;
+    let timing = output.clone();
     let pipeline_controls = controls.clone();
     let pipeline_counters = counters.clone();
     thread::Builder::new().name("vc-voice-pipeline".into()).spawn(move || {
-        if let Err(e) = pipeline(pipeline_controls, pipeline_counters, mic, speaker, out_tx, in_rx) {
+        if let Err(e) = pipeline(pipeline_controls, pipeline_counters, mic, speaker, timing, out_tx, in_rx) {
             tracing::warn!("voice pipeline stopped: {e:#}");
         }
     })?;
-    Ok(VoiceHandle { controls, counters, _ports_guard: _guard })
+    Ok(VoiceHandle { controls, counters, output, _ports_guard: _guard })
 }
 
 /// The local address the OS uses to reach `server` (no packets are sent).
@@ -318,6 +359,7 @@ fn pipeline(
     counters: Arc<Counters>,
     mut mic: rtrb::Consumer<f32>,
     mut speaker: rtrb::Producer<f32>,
+    output: Arc<OutputTiming>,
     out: mpsc::Sender<Outgoing>,
     incoming: std::sync::mpsc::Receiver<Incoming>,
 ) -> Result<()> {
@@ -402,6 +444,15 @@ fn pipeline(
                     break;
                 }
             }
+        }
+        output.playing.store(buffers.iter().any(JitterBuffer::playing), Ordering::Relaxed);
+        counters.speaker_samples.store((speaker.buffer().capacity() - speaker.slots()) as u64, Ordering::Relaxed);
+        for (buffer, stats) in buffers.iter().zip(&counters.slots) {
+            let (packets, samples) = buffer.depth();
+            stats.packets.store(packets as u64, Ordering::Relaxed);
+            stats.samples.store(samples, Ordering::Relaxed);
+            stats.concealments.store(buffer.concealments, Ordering::Relaxed);
+            stats.late_drops.store(buffer.late_drops, Ordering::Relaxed);
         }
         thread::sleep(Duration::from_millis(5));
     }

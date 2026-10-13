@@ -23,6 +23,8 @@ pub struct JitterBuffer {
     missing: u32,
     /// Frames buffered before playout starts (adds latency, absorbs jitter).
     prefill: usize,
+    pub(crate) concealments: u64,
+    pub(crate) late_drops: u64,
 }
 
 /// Default frame length; actual packets carry their own duration.
@@ -35,13 +37,21 @@ const MAX_PACKETS: usize = 50;
 
 impl JitterBuffer {
     pub fn new(prefill: usize) -> Self {
-        Self { packets: BTreeMap::new(), next: None, missing: 0, prefill: prefill.max(1) }
+        Self {
+            packets: BTreeMap::new(),
+            next: None,
+            missing: 0,
+            prefill: prefill.max(1),
+            concealments: 0,
+            late_drops: 0,
+        }
     }
 
     /// Adds a packet of `samples` length (48 kHz) at RTP time `ts`.
     pub fn push(&mut self, ts: u64, samples: u64, packet: Vec<u8>) {
         if let Some(next) = self.next {
             if ts < next {
+                self.late_drops += 1;
                 return; // too late
             }
             if ts > next + RESYNC {
@@ -52,6 +62,14 @@ impl JitterBuffer {
             self.packets.pop_first();
         }
         self.packets.insert(ts, (packet, samples.max(1)));
+    }
+
+    pub(crate) fn depth(&self) -> (usize, u64) {
+        (self.packets.len(), self.packets.values().map(|(_, samples)| samples).sum())
+    }
+
+    pub(crate) fn playing(&self) -> bool {
+        self.next.is_some()
     }
 
     fn reset(&mut self) {
@@ -86,6 +104,7 @@ impl JitterBuffer {
                     self.reset();
                     return Playout::Idle;
                 }
+                self.concealments += 1;
                 self.next = Some(next + FRAME);
                 Playout::Conceal
             }

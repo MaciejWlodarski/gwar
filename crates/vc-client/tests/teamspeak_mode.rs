@@ -12,7 +12,7 @@ use std::{
 use rtrb::RingBuffer;
 use vc_client::voice::{
     self,
-    io::{AudioIo, AudioPorts},
+    io::{AudioIo, AudioPorts, OutputTiming},
 };
 
 use tokio::time::timeout;
@@ -256,6 +256,8 @@ impl AudioIo for FakeIo {
         let (mut mic_tx, mic) = RingBuffer::new(48_000);
         let (speaker, mut speaker_rx) = RingBuffer::new(24_000);
         let (heard, tone) = (self.heard.clone(), self.tone);
+        let output = Arc::new(OutputTiming::default());
+        let timing = output.clone();
         thread::spawn(move || {
             let mut t = 0u64;
             loop {
@@ -267,14 +269,16 @@ impl AudioIo for FakeIo {
                     }
                 }
                 let mut out = heard.lock().unwrap();
+                let missing = 480usize.saturating_sub(speaker_rx.slots());
                 for _ in 0..480 {
                     out.push(speaker_rx.pop().unwrap_or(0.0));
                 }
+                timing.report(480, missing);
                 drop(out);
                 thread::sleep(Duration::from_millis(10));
             }
         });
-        Ok(AudioPorts { mic, speaker, _guard: Box::new(()) })
+        Ok(AudioPorts { mic, speaker, output, _guard: Box::new(()) })
     }
 }
 

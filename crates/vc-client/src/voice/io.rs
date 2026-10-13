@@ -2,7 +2,11 @@
 //! device formats are adapted here.
 
 use std::{
-    sync::{Arc, mpsc as std_mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        mpsc as std_mpsc,
+    },
     thread,
 };
 
@@ -19,6 +23,27 @@ pub struct AudioPorts {
     pub mic: Consumer<f32>,
     pub speaker: Producer<f32>,
     pub _guard: Box<dyn Send>,
+    pub output: Arc<OutputTiming>,
+}
+
+/// Callback measurements in 48 kHz mono samples. Custom devices report once per callback.
+#[derive(Default)]
+pub struct OutputTiming {
+    pub(crate) callback_samples: AtomicUsize,
+    pub(crate) playing: AtomicBool,
+    pub(crate) underruns: AtomicU64,
+    pub(crate) underrun_samples: AtomicU64,
+}
+
+impl OutputTiming {
+    /// `missing` excludes intentionally silent samples supplied by the pipeline.
+    pub fn report(&self, samples: usize, missing: usize) {
+        self.callback_samples.store(samples, Ordering::Relaxed);
+        if missing > 0 && self.playing.load(Ordering::Relaxed) {
+            self.underruns.fetch_add(1, Ordering::Relaxed);
+            self.underrun_samples.fetch_add(missing as u64, Ordering::Relaxed);
+        }
+    }
 }
 
 pub trait AudioIo: Send {
@@ -158,6 +183,7 @@ fn open_output(
     host: &cpal::Host,
     name: Option<&str>,
     mut speaker_rx: Consumer<f32>,
+    timing: Arc<OutputTiming>,
     on_issue: Option<IssueSink>,
 ) -> Result<cpal::Stream> {
     let device = match name.and_then(|n| find(host.output_devices(), n)) {
@@ -166,6 +192,7 @@ fn open_output(
     };
     let config = device.default_output_config()?;
     let channels = usize::from(config.channels());
+    let device_rate = config.sample_rate() as usize;
     let mut to_device = Resampler::new(RATE, config.sample_rate());
     let mut pending: Vec<f32> = Vec::new();
     let stream = device.build_output_stream(
@@ -181,6 +208,10 @@ fn open_output(
                 frame.fill(if i < take { pending[i] } else { 0.0 });
             }
             pending.drain(..take);
+            timing.report(
+                (frames * RATE as usize).div_ceil(device_rate),
+                ((frames - take) * RATE as usize).div_ceil(device_rate),
+            );
         },
         move |e| {
             tracing::warn!("output stream error: {e}");
@@ -198,6 +229,8 @@ impl AudioIo for DeviceIo {
     fn open(self: Box<Self>) -> Result<AudioPorts> {
         let (mic_tx, mic) = RingBuffer::<f32>::new(RATE as usize); // 1 s
         let (speaker, speaker_rx) = RingBuffer::<f32>::new(RATE as usize / 2);
+        let output = Arc::new(OutputTiming::default());
+        let timing = output.clone();
         let (stop_tx, stop_rx) = std_mpsc::channel::<()>();
         let (ready_tx, ready_rx) = std_mpsc::channel::<Result<()>>();
         // cpal streams are not `Send` on every platform; they live on this thread.
@@ -209,7 +242,7 @@ impl AudioIo for DeviceIo {
                 }
             };
             let input = open_input(&host, self.input.as_deref(), mic_tx, self.on_issue.clone());
-            let output = open_output(&host, self.output.as_deref(), speaker_rx, self.on_issue.clone());
+            let output = open_output(&host, self.output.as_deref(), speaker_rx, timing, self.on_issue.clone());
             if let (Err(i), Err(o)) = (&input, &output) {
                 // A denied microphone stays recognisable for the caller (see `permission::is_denied`).
                 let error = if permission::is_denied(i) {
@@ -237,7 +270,7 @@ impl AudioIo for DeviceIo {
             drop((input, output));
         })?;
         ready_rx.recv().map_err(|_| anyhow!("audio thread died"))??;
-        Ok(AudioPorts { mic, speaker, _guard: Box::new(StopOnDrop(stop_tx)) })
+        Ok(AudioPorts { mic, speaker, output, _guard: Box::new(StopOnDrop(stop_tx)) })
     }
 }
 
