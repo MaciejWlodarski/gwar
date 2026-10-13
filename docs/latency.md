@@ -169,8 +169,11 @@ write useful output and still exit unsuccessfully if more than 5% of markers
 are unmatched. Inspect per-marker CSV timelines and applied stall windows,
 because a call's median alone can hide persistent latency after a stall.
 
-See [the recorded release experiment](latency-netem-results.md) for 100-marker
-uplink/downlink stall timelines and the checks performed on the current engine.
+On `a0f5686`, `up:stall=270ms@12s` left about +240 ms on every later marker
+of the call (the SFU re-stamps slot RTP time from arrival, so the burst looks
+like a new talk spurt), while `down:stall=270ms@12s` recovered to baseline
+within one marker. `up:jitter=10ms` cost far more than `down:jitter=10ms`
+(103 vs 63 ms median) for the same reason.
 
 ## Compare builds
 
