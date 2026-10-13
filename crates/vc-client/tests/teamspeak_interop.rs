@@ -4,7 +4,11 @@
 mod support;
 
 use std::{
-    sync::{Arc, Mutex},
+    collections::{HashMap, HashSet},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::Duration,
 };
@@ -253,84 +257,101 @@ async fn speak(ts: &mut Connection, whisper_to: Option<u16>) {
 }
 
 /// The bridge orders each TeamSpeak speaker's frames by the voice id its
-/// puppets receive, so a late-joining listener must see the same ids.
+/// puppets receive. A listener joining mid-spurt must see the same id for the
+/// same frame as one that heard the spurt from its start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn teamspeak_voice_ids_are_the_same_for_every_listener() {
     let Some(bridged) = support::start().await else { return };
     drop(support::ts_client(bridged.ts_voice, "probe").await);
-    let joined = |name: &str| {
-        let mut ts = Connection::build(bridged.ts_voice.to_string())
-            .name(name.to_string())
-            .identity(TsIdentity::create())
-            .connect()
-            .unwrap();
-        async move {
-            timeout(Duration::from_secs(8), async {
-                let mut events = ts.events();
-                while let Some(item) = events.next().await {
-                    if let StreamItem::MessageEvent(tsclientlib::messages::s2c::InMessage::ChannelListFinished(_)) =
-                        item.unwrap()
-                    {
-                        return;
-                    }
-                }
-            })
-            .await
-            .expect("TS client connected");
-            ts
-        }
-    };
-    let mut speaker = joined("speaker").await;
+    let address = bridged.ts_voice.to_string();
+    let speaker = joined(&address, "speaker").await;
     let from = speaker.get_state().unwrap().own_client.0;
-    let mut listeners = vec![joined("early").await];
-    let mut ids = vec![Vec::new(), Vec::new()];
+    let stop = Arc::new(AtomicBool::new(false));
+    let early = tokio::spawn(listen(joined(&address, "early").await, from, stop.clone()));
+    let speaking = tokio::spawn(speak_noise(speaker, stop.clone()));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let late = tokio::spawn(listen(joined(&address, "late").await, from, stop.clone()));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    stop.store(true, Ordering::Relaxed);
+    speaking.await.unwrap();
+    let (early, late) = (early.await.unwrap(), late.await.unwrap());
+
+    let late_frames: HashSet<u64> = late.iter().map(|(_, frame)| *frame).collect();
+    let prefix = early.iter().position(|(_, frame)| late_frames.contains(frame)).expect("frames heard by both");
+    assert!(prefix >= 20, "the late listener did not join mid-spurt ({prefix} early-only frames)");
+    let early_ids: HashMap<u64, u16> = early.iter().map(|(id, frame)| (*frame, *id)).collect();
+    let pairs: Vec<_> = late.iter().filter_map(|(id, frame)| Some((*id, *early_ids.get(frame)?))).collect();
+    assert!(pairs.len() > 50, "only {} frames heard by both", pairs.len());
+    assert!(pairs.iter().all(|(late, early)| late == early), "TeamSpeak renumbers voice per listener: {pairs:?}");
+}
+
+async fn joined(address: &str, name: &str) -> Connection {
+    let mut ts =
+        Connection::build(address.to_string()).name(name.to_string()).identity(TsIdentity::create()).connect().unwrap();
+    timeout(Duration::from_secs(8), async {
+        let mut events = ts.events();
+        while let Some(item) = events.next().await {
+            if let StreamItem::MessageEvent(tsclientlib::messages::s2c::InMessage::ChannelListFinished(_)) =
+                item.unwrap()
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("TS client connected");
+    ts
+}
+
+/// Speaks distinct frames (noise) every 20 ms until stopped.
+async fn speak_noise(mut ts: Connection, stop: Arc<AtomicBool>) {
     let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
-    let mut t = 0u64;
-    // The early listener hears a first spurt alone, so a per-listener counter
-    // would put it ahead of the late listener.
-    for (seconds, late) in [(1, false), (2, true)] {
-        if late {
-            listeners.push(joined("late").await);
+    let mut seed = 1u32;
+    while !stop.load(Ordering::Relaxed) {
+        let mut frame = [0f32; 960];
+        for s in frame.iter_mut() {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *s = (seed >> 8) as f32 / (1u32 << 24) as f32 * 0.4 - 0.2;
         }
-        let end = Instant::now() + Duration::from_secs(seconds);
-        let mut speaking = true;
-        while speaking || Instant::now() < end + Duration::from_millis(500) {
-            speaking = Instant::now() < end;
-            if speaking {
-                let mut frame = [0f32; 960];
-                for s in frame.iter_mut() {
-                    *s = tone(t);
-                    t += 1;
-                }
-                let mut packet = [0u8; 1275];
-                let n = encoder.encode_float(&frame, &mut packet).unwrap();
-                let audio = AudioData::C2S { id: 0, codec: CodecType::OpusVoice, data: &packet[..n] };
-                speaker.send_audio(OutAudio::new(&audio)).unwrap();
-            }
-            let _ = timeout(Duration::from_millis(5), async {
-                let mut events = speaker.events();
-                while events.next().await.is_some() {}
-            })
-            .await;
-            for (listener, ids) in listeners.iter_mut().zip(&mut ids) {
-                let _ = timeout(Duration::from_millis(5), async {
-                    let mut events = listener.events();
-                    while let Some(Ok(item)) = events.next().await {
-                        if let StreamItem::Audio(audio) = item
-                            && let AudioData::S2C { id, from: sender, .. } = audio.data().data()
-                            && *sender == from
-                        {
-                            ids.push(*id);
-                        }
-                    }
-                })
-                .await;
-            }
-        }
+        let mut packet = [0u8; 1275];
+        let n = encoder.encode_float(&frame, &mut packet).unwrap();
+        ts.send_audio(OutAudio::new(&AudioData::C2S { id: 0, codec: CodecType::OpusVoice, data: &packet[..n] }))
+            .unwrap();
+        let _ = timeout(Duration::from_millis(20), async {
+            let mut events = ts.events();
+            while events.next().await.is_some() {}
+        })
+        .await;
     }
-    eprintln!("voice ids: early {:?}", ids[0]);
-    eprintln!("voice ids: late {:?}", ids[1]);
-    assert!(ids[1].len() > 50, "late listener heard {} frames", ids[1].len());
-    let tail = |ids: &[u16]| ids[ids.len() - 20..].to_vec();
-    assert_eq!(tail(&ids[0]), tail(&ids[1]), "TeamSpeak renumbers voice per listener");
+}
+
+/// Collects (voice id, payload digest) of `from`'s frames until shortly after `stop`.
+async fn listen(mut ts: Connection, from: u16, stop: Arc<AtomicBool>) -> Vec<(u16, u64)> {
+    let mut heard = Vec::new();
+    let mut until = None;
+    while until.is_none_or(|end| Instant::now() < end) {
+        if until.is_none() && stop.load(Ordering::Relaxed) {
+            until = Some(Instant::now() + Duration::from_millis(300));
+        }
+        let _ = timeout(Duration::from_millis(20), async {
+            let mut events = ts.events();
+            while let Some(Ok(item)) = events.next().await {
+                if let StreamItem::Audio(audio) = item
+                    && let AudioData::S2C { id, from: sender, data, .. } = audio.data().data()
+                    && *sender == from
+                    && !data.is_empty()
+                {
+                    heard.push((
+                        *id,
+                        std::hash::BuildHasher::hash_one(
+                            &std::hash::BuildHasherDefault::<std::hash::DefaultHasher>::default(),
+                            data,
+                        ),
+                    ));
+                }
+            }
+        })
+        .await;
+    }
+    heard
 }

@@ -222,8 +222,11 @@ Duplicate timestamps and older sequences drop before speech-state updates;
 a sequence restart requires a fresh SSRC or voice session. The last 32 retired
 SSRCs cannot return.
 TeamSpeak uses its wrapping u16 packet id times 960 as a synthetic clock,
-with half-range ordering and separate voice/whisper identities. Its 20 ms counter cannot describe a silence gap unless
-the sender advances that counter. Both bridge directions retain Opus durations.
+with half-range ordering and separate voice/whisper identities; every listener
+sees the same ids (checked against the official server in CI). The ids do not
+advance across silence, so a TeamSpeak end marker re-anchors the slot on wall
+time, and an out-of-order id more than a second after the last write starts a
+new clock instead of being dropped. Both bridge directions retain Opus durations.
 
 First packets, speaker/SSRC changes, backward timestamps and deltas over five
 seconds use elapsed wall time rounded up to the previous packet's duration,

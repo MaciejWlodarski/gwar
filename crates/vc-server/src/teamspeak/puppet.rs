@@ -84,7 +84,9 @@ impl Shared {
             entry.clock = None;
         }
         let clock = SourceClock::TeamSpeak { id, whisper: false };
-        if entry.clock.is_some_and(|old| clock.delta(old).is_err()) {
+        // Only a recent id orders this one; see the slot clock's STALE_CLOCK.
+        let fresh = now.duration_since(entry.at) <= Duration::from_secs(1);
+        if fresh && entry.clock.is_some_and(|old| clock.delta(old).is_err()) {
             return;
         }
         if entry.session != session || now.duration_since(entry.at) > Duration::from_secs(1) {

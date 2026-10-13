@@ -57,6 +57,9 @@ const SAMPLE_RATE: u64 = 48_000;
 const MAX_SOURCE_DELTA: u32 = 5 * SAMPLE_RATE as u32;
 /// Late packets from these SSRCs are dropped; the oldest is forgotten first.
 const RETIRED_SSRCS: usize = 32;
+/// An out-of-order source time this long after the last write is a new clock:
+/// TeamSpeak's u16 ids cannot tell a reordered packet from a far-ahead one.
+const STALE_CLOCK: Duration = Duration::from_secs(1);
 
 struct Slot {
     mid: Mid,
@@ -77,8 +80,18 @@ impl Slot {
         self.clock = None;
     }
 
+    /// TeamSpeak ids advance per packet, not across silence: the next spurt
+    /// needs a fresh anchor so the pause stays a pause.
+    fn end_spurt(&mut self) {
+        if let Some(SourceClock::TeamSpeak { .. }) = self.clock {
+            self.clock = None;
+        }
+    }
+
     fn advance(&mut self, now: Instant, samples: u32, clock: SourceClock) -> bool {
+        let stale = self.last_write.is_none_or(|last| now.saturating_duration_since(last) > STALE_CLOCK);
         let delta = match self.clock.map(|old| clock.delta(old)).transpose() {
+            Err(()) if stale => None,
             Err(()) => return false,
             Ok(delta) => delta.flatten().filter(|delta| *delta <= MAX_SOURCE_DELTA),
         };
@@ -134,6 +147,9 @@ impl Peer {
     /// Writes one frame from `from` into a receive slot, assigning one if needed.
     fn forward(&mut self, packet: &AudioPacket, now: Instant) {
         if packet.is_end() {
+            if let Some(slot) = self.slots.iter_mut().find(|s| s.source == Some(packet.from)) {
+                slot.end_spurt();
+            }
             return;
         }
         let index = match self.slots.iter().position(|s| s.source == Some(packet.from)) {
@@ -534,6 +550,36 @@ mod clock_tests {
         assert_eq!(slot.ticks, SAMPLE_RATE + 960);
         assert!(!slot.advance(now, 960, SourceClock::TeamSpeak { id: 65535, whisper: false }));
         assert!(!slot.advance(now, 960, SourceClock::TeamSpeak { id: 0, whisper: false }));
+    }
+
+    #[test]
+    fn teamspeak_pause_and_long_absence_restart_on_wall_time() {
+        let now = Instant::now();
+        let ts = |id| SourceClock::TeamSpeak { id, whisper: false };
+        let mut slot = slot(now);
+        slot.advance(now, 960, ts(10));
+        // Ids continue across a six-second pause; the end marker re-anchors.
+        slot.end_spurt();
+        assert!(slot.advance(now + Duration::from_secs(6), 960, ts(11)));
+        assert_eq!(slot.ticks, SAMPLE_RATE + 6 * SAMPLE_RATE);
+        assert!(slot.advance(now + Duration::from_secs(6), 960, ts(12)));
+        assert_eq!(slot.ticks, SAMPLE_RATE + 6 * SAMPLE_RATE + 960);
+        // A recent backwards id is reordering; a jump past half the range after
+        // a long absence (e.g. deafened) is a new clock, not a stale packet.
+        assert!(!slot.advance(now + Duration::from_secs(6), 960, ts(11)));
+        let later = now + Duration::from_secs(8);
+        assert!(slot.advance(later, 960, ts(12u16.wrapping_add(40_000))));
+        assert_eq!(slot.ticks, SAMPLE_RATE + 8 * SAMPLE_RATE + 960);
+    }
+
+    #[test]
+    fn rtp_end_marker_keeps_the_source_clock() {
+        let now = Instant::now();
+        let mut slot = slot(now);
+        slot.advance(now, 480, rtp(0, 0));
+        slot.end_spurt();
+        assert!(slot.advance(now, 480, rtp(1, 48_000)));
+        assert_eq!(slot.ticks, 2 * SAMPLE_RATE);
     }
 
     #[test]

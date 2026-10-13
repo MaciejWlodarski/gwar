@@ -81,7 +81,7 @@ where
         let _lost = LostOnDrop(counters.clone());
         let mut buf = vec![0u8; 2048];
         let mut last_ticks = None;
-        let mut sequence = 0u64;
+        let mut sequence = u64::from(rand::random::<u16>()); // RFC 3550 §5.1
         loop {
             let deadline = loop {
                 match rtc.poll_output() {
