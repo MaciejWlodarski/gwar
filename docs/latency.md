@@ -343,3 +343,15 @@ baseline/candidate median 40.78/41.48 ms, p95 47.47/47.55 ms, p99 49.68/49.55 ms
 No builds, tests or injected load ran during measurement; Spotlight remained
 active, so these were not fully idle-host measurements. Real internet impairment,
 live browser playback and official TeamSpeak interoperability remain unverified.
+
+## Relative-delay estimator experiment (2026-10-14)
+
+A NetEQ-style replacement for the peak-hold estimator was tried and rejected
+(branch `experiment/jitter-quantile`, not merged): relative arrival delay against the fastest
+transit in a two-second window, a 97th-percentile histogram of 200 ms maxima
+with 20 s forgetting, and a three-packet fast attack. In two harness pairs per
+case it helped downlink jitter (`down:jitter=10ms` p95 97.9 → 59.7 ms) but
+regressed the unimpaired relay (median 46.0 → 58.0 ms) and the documented mixed
+spec (concealments 246 → 411). The target only limits shrinking, and the
+five-second low-water rule already retains periodic spikes, so longer estimator
+memory mostly kept extra delay. Other relative-delay designs remain untested.
