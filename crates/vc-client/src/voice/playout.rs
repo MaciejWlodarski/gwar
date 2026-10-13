@@ -73,13 +73,55 @@ pub(super) struct Slot {
 }
 
 const FADE: usize = 120; // 2.5 ms at a latency correction boundary.
+const MIN_LAG: usize = 120; // Search 2.5--15 ms pitch periods at 48 kHz.
+const MAX_LAG: usize = 720;
+
+/// Remove one period, retaining the phase at both ends of the overlap. Search
+/// only the budget we can actually spend; a sub-period cut is not a substitute.
+fn accelerate(pcm: &mut [f32], budget: usize) -> usize {
+    let mut best = 0;
+    let mut correlation = 0.98_f64;
+    for lag in MIN_LAG..=MAX_LAG.min(budget).min(pcm.len() / 2) {
+        let (mut aa, mut bb, mut ab, mut a_sum, mut b_sum) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for i in 0..lag {
+            let a = f64::from(pcm[i]);
+            let b = f64::from(pcm[i + lag]);
+            aa += a * a;
+            bb += b * b;
+            ab += a * b;
+            a_sum += a;
+            b_sum += b;
+        }
+        // Center the windows: DC and silence must not masquerade as periodic speech.
+        let count = lag as f64;
+        aa -= a_sum * a_sum / count;
+        bb -= b_sum * b_sum / count;
+        ab -= a_sum * b_sum / count;
+        if aa < count * 1e-6 || bb < count * 1e-6 || !(0.8..=1.25).contains(&(aa / bb)) {
+            continue;
+        }
+        let score = ab / (aa * bb).sqrt();
+        if score > correlation {
+            correlation = score;
+            best = lag;
+        }
+    }
+    if best > 0 {
+        for i in 0..best {
+            let blend = i as f32 / (best - 1) as f32;
+            pcm[i] = pcm[i] * (1.0 - blend) + pcm[i + best] * blend;
+        }
+        pcm.copy_within(2 * best.., best);
+    }
+    best
+}
 
 impl Slot {
     pub fn new() -> Result<Self> {
         Ok(Self {
             buffer: JitterBuffer::new(),
             decoder: Decoder::new(SampleRate::Hz48000, Channels::Mono)?,
-            decoded: vec![0.0; 5760],
+            decoded: vec![0.0; 5760 + 2 * MAX_LAG],
             position: 0,
             end: 0,
             generation: None,
@@ -140,19 +182,39 @@ impl Slot {
         while written < mix.len() {
             if self.position == self.end {
                 let (n, skip, fade) = match self.buffer.pop_for(now, demand - written) {
-                    Playout::Packet { data, skip, quiet_only, fade } => {
+                    Playout::Packet { data, skip, quiet_only: _, fade } => {
                         let input = Packet::try_from(data.as_slice()).ok();
-                        let output = MutSignals::try_from(&mut self.decoded[..])?;
-                        let n = self.decoder.decode_float(input, output, false).unwrap_or(0);
-                        // Inspect this candidate, never the preceding packet or PLC.
+                        let output = MutSignals::try_from(&mut self.decoded[..5760])?;
+                        let mut n = self.decoder.decode_float(input, output, false).unwrap_or(0);
                         let level = level_db(&self.decoded[..n]);
                         let quiet = n > 0 && level < -42.0;
-                        // Even forced corrections preserve a rising speech edge,
-                        // including the first voiced packet after PLC.
-                        let onset = !quiet && level > self.previous_level + 6.0;
+                        let mut onset = !quiet && level > self.previous_level + 6.0;
                         self.previous_level = level;
-                        let skip = if !onset && (!quiet_only || quiet) { skip.min(n) } else { 0 };
-                        self.buffer.shrunk(now, skip);
+                        if n > 0 && skip > 0 && !quiet && !onset && !fade {
+                            // Decode ahead only on proven surplus. This buys a whole
+                            // overlap even for 10 ms packets, without startup delay or
+                            // replaying history. A gap/recovery stops lookahead unchanged.
+                            while n < 2 * skip.min(MAX_LAG) {
+                                let Playout::Packet { data, .. } = self.buffer.pop_for(now, 0) else { break };
+                                let input = Packet::try_from(data.as_slice()).ok();
+                                let output = MutSignals::try_from(&mut self.decoded[n..n + 5760])?;
+                                let next = self.decoder.decode_float(input, output, false).unwrap_or(0);
+                                let level = level_db(&self.decoded[n..n + next]);
+                                onset |= next == 0 || (level >= -42.0 && level > self.previous_level + 6.0);
+                                self.previous_level = level;
+                                n += next;
+                                if onset {
+                                    break;
+                                }
+                            }
+                        }
+                        // The old nonquiet deadline cannot authorize an uncorrelated
+                        // cut. Periodic speech can accelerate as soon as surplus is safe.
+                        let removed =
+                            if !onset && !quiet && !fade { accelerate(&mut self.decoded[..n], skip) } else { 0 };
+                        n -= removed;
+                        let skip = if !onset && quiet { skip.min(STEP).min(n) } else { 0 };
+                        self.buffer.shrunk(now, removed + skip);
                         (n, skip, fade)
                     }
                     Playout::Conceal(samples) => {
@@ -425,7 +487,7 @@ mod tests {
                         if excess == 0 {
                             assert_eq!(slot.buffer.shrink_samples, 0, "{label}: tail is refill margin");
                         } else {
-                            assert!(at_twenty_seconds >= 240, "{label}: persistent surplus did not converge");
+                            assert!(at_twenty_seconds > 0, "{label}: persistent surplus did not converge");
                             assert!(slot.buffer.shrink_samples <= excess as u64, "{label}");
                         }
                     }
@@ -477,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn fractional_staged_surplus_converges_with_bounded_forced_corrections() {
+    fn fractional_staged_surplus_converges_with_bounded_periodic_corrections() {
         use super::super::jitter::Clock;
         for clock in [Clock::Rtp, Clock::Sequence] {
             for excess in [240, 480, 720, 912] {
@@ -493,13 +555,18 @@ mod tests {
                     for tick in (0..30 * 48_000).step_by(callback) {
                         let at = now + Duration::from_secs_f64(tick as f64 / 48_000.0);
                         if tick % 960 == 0 {
-                            // Nonquiet carrier: convergence must use the forced deadline.
-                            slot.buffer.push_at(tick, 960, encode(&encoder, true), at, clock);
+                            // Keep phase continuous across packets: resetting a tone
+                            // every 20 ms creates a discontinuity that TSM should reject.
+                            let pcm = harmonic(240.0, 0.0, tick as f32 * std::f32::consts::TAU / 200.0, 960);
+                            let mut data = vec![0; 1275];
+                            let n = encoder.encode_float(&pcm, &mut data).unwrap();
+                            data.truncate(n);
+                            slot.buffer.push_at(tick, 960, data, at, clock);
                         }
                         slot.mix_into(&mut vec![0.0; callback], 1.0, at).unwrap();
                         let total = slot.buffer.shrink_samples;
                         if total > corrected {
-                            assert!(total - corrected <= 240);
+                            assert!(total - corrected <= MAX_LAG as u64);
                             assert!(total <= excess as u64);
                             assert!(tick >= 5 * 48_000, "correction before the full observation window");
                             if let Some(previous) = last_correction {
@@ -508,7 +575,7 @@ mod tests {
                             last_correction = Some(tick);
                             corrected = total;
                         }
-                        if excess as u64 - total < 240 && converged.is_none() {
+                        if excess as u64 - total < 330 && converged.is_none() {
                             converged = Some(tick);
                         }
                     }
@@ -516,9 +583,9 @@ mod tests {
                         converged.is_some_and(|tick| tick <= 25 * 48_000),
                         "{clock:?}, excess={excess}, callback={callback}, corrected={corrected}"
                     );
-                    // Preserve 2.5 ms of safety; residual corrections below
-                    // 2.5 ms are deliberately ignored.
-                    assert!((120..240).contains(&(excess as u64 - corrected)));
+                    // Preserve safety plus up to one removable period (at most 209
+                    // samples here, allowing codec rounding around the 200-sample pitch).
+                    assert!((120..330).contains(&(excess as u64 - corrected)));
                     assert_eq!(slot.buffer.concealments, 0);
                 }
             }
@@ -620,5 +687,184 @@ mod tests {
         assert_eq!(actual, expected);
         assert_eq!(slot.staged_samples(), 0);
         assert_eq!(slot.buffer.concealments, 0);
+    }
+    fn harmonic(pitch: f32, vibrato: f32, phase: f32, n: usize) -> Vec<f32> {
+        let mut phase = phase;
+        (0..n)
+            .map(|i| {
+                let t = i as f32 / 48_000.0;
+                phase += std::f32::consts::TAU * pitch * (1.0 + vibrato * (std::f32::consts::TAU * 5.0 * t).sin())
+                    / 48_000.0;
+                0.25 * (phase.sin() + 0.35 * (2.0 * phase).sin() + 0.15 * (3.0 * phase).sin())
+            })
+            .collect()
+    }
+
+    fn maximum_jump(pcm: &[f32]) -> f32 {
+        pcm.windows(2).map(|pair| (pair[1] - pair[0]).abs()).fold(0.0, f32::max)
+    }
+
+    // Magnitude-spectrum error on the splice, including its entry and exit.
+    // Compare to the unmodified signal at the same output duration.
+    fn spectral_error(pcm: &[f32], reference: &[f32]) -> f64 {
+        let mut error = 0.0;
+        let mut power = 0.0;
+        for bin in 0..=pcm.len() / 2 {
+            let magnitude = |samples: &[f32]| {
+                let (mut real, mut imaginary) = (0.0, 0.0);
+                for (i, &sample) in samples.iter().enumerate() {
+                    let phase = std::f64::consts::TAU * bin as f64 * i as f64 / samples.len() as f64;
+                    real += f64::from(sample) * phase.cos();
+                    imaginary += f64::from(sample) * phase.sin();
+                }
+                real.hypot(imaginary)
+            };
+            let expected = magnitude(reference);
+            error += (magnitude(pcm) - expected).powi(2);
+            power += expected * expected;
+        }
+        (error / power).sqrt()
+    }
+
+    #[test]
+    fn harmonic_acceleration_preserves_pitch_and_splice_better_than_skip_fade() {
+        for pitch in [100.0, 125.0, 150.0, 200.0, 250.0, 300.0] {
+            for vibrato in [0.0, 0.02] {
+                for phase in [0.3, 1.5, 3.0] {
+                    let input = harmonic(pitch, vibrato, phase, 2161);
+                    let original = &input[1..];
+                    let mut actual = original.to_vec();
+                    let removed = accelerate(&mut actual, MAX_LAG);
+                    assert!((MIN_LAG..=MAX_LAG).contains(&removed), "pitch={pitch}");
+                    actual.truncate(original.len() - removed);
+                    assert_eq!(actual.len() + removed, original.len());
+                    assert_eq!(&actual[removed..], &original[2 * removed..]);
+                    let mut baseline = original[removed..].to_vec();
+                    for (i, sample) in baseline[..FADE].iter_mut().enumerate() {
+                        let blend = i as f32 / FADE as f32;
+                        *sample = input[0] * (1.0 - blend) + *sample * blend;
+                    }
+                    actual.insert(0, input[0]);
+                    baseline.insert(0, input[0]);
+                    let reference = &input[..actual.len()];
+                    let jump = maximum_jump(&actual);
+                    let baseline_jump = maximum_jump(&baseline);
+                    let error = spectral_error(&actual, reference);
+                    let baseline_error = spectral_error(&baseline, reference);
+                    eprintln!(
+                        "pitch={pitch} vibrato={vibrato} phase={phase} removed={removed} jump={jump:.6}/{baseline_jump:.6} spectral={error:.6}/{baseline_error:.6}"
+                    );
+                    assert!(jump <= baseline_jump * 1.01, "pitch={pitch}: {jump}/{baseline_jump}");
+                    assert!(jump <= maximum_jump(reference) * 1.03);
+                    assert!(error < baseline_error, "pitch={pitch}: {error}/{baseline_error}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn acceleration_rejects_noise_silence_dc_and_insufficient_budget_without_mutation() {
+        let mut seed = 1_u32;
+        let noise: Vec<f32> = (0..2160)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                (seed as f32 / u32::MAX as f32 - 0.5) * 0.5
+            })
+            .collect();
+        for original in [noise, vec![0.0; 2160], vec![0.2; 2160]] {
+            let mut pcm = original.clone();
+            assert_eq!(accelerate(&mut pcm, MAX_LAG), 0);
+            assert_eq!(pcm, original);
+        }
+        let original = harmonic(100.0, 0.02, 0.5, 2160);
+        for (length, budget) in [(2160, 119), (2160, 240), (480, MAX_LAG)] {
+            let mut pcm = original[..length].to_vec();
+            assert_eq!(accelerate(&mut pcm, budget), 0);
+            assert_eq!(pcm, original[..length]);
+        }
+    }
+
+    #[test]
+    fn acceleration_never_exceeds_budget_and_removes_exactly_one_overlap() {
+        let original = harmonic(200.0, 0.0, 0.5, 2160);
+        for budget in 0..=800 {
+            let mut pcm = original.clone();
+            let removed = accelerate(&mut pcm, budget);
+            assert!(removed <= budget.min(MAX_LAG));
+            if removed == 0 {
+                assert_eq!(pcm, original);
+            } else {
+                assert_eq!(pcm[0], original[0]);
+                assert_eq!(pcm[removed - 1], original[2 * removed - 1]);
+                assert_eq!(&pcm[removed..original.len() - removed], &original[2 * removed..]);
+            }
+        }
+    }
+
+    #[test]
+    fn queued_native_packets_accelerate_without_fade_and_commit_actual_samples() {
+        let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
+        let now = Instant::now();
+        let mut slot = Slot::new().unwrap();
+        let signal = harmonic(100.0, 0.02, 0.3, 480 * 12);
+        for (i, pcm) in signal.as_chunks::<480>().0.iter().enumerate() {
+            let mut data = vec![0; 1275];
+            let n = encoder.encode_float(pcm, &mut data).unwrap();
+            data.truncate(n);
+            slot.buffer.push(i as u64 * 480, 480, data);
+        }
+        slot.mix_into(&mut [0.0; 960], 1.0, now).unwrap();
+        for ms in (10..=5000).step_by(10) {
+            slot.buffer.observe_depth(now + Duration::from_millis(ms), 0, 480);
+        }
+        let before = slot.buffer.depth().1;
+        slot.mix_into(&mut [0.0; 1], 1.0, now + Duration::from_secs(5)).unwrap();
+        let removed = slot.buffer.shrink_samples;
+        assert!((450..=510).contains(&removed), "removed={removed}");
+        assert_eq!(before - slot.buffer.depth().1 - slot.staged_samples() as u64 - 1, removed);
+        assert_eq!(slot.fade_left, 0);
+        assert_eq!(slot.buffer.trim_events, 1);
+        assert_eq!(slot.buffer.concealments, 0);
+    }
+
+    #[test]
+    fn lookahead_onset_and_loud_noise_do_not_use_the_forced_skip() {
+        for noise in [false, true] {
+            let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
+            let mut reference = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
+            let now = Instant::now();
+            let mut slot = Slot::new().unwrap();
+            let mut signal = harmonic(100.0, 0.0, 0.3, 480 * 12);
+            let mut seed = 5_u32;
+            for (i, sample) in signal.iter_mut().enumerate() {
+                if noise {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    *sample = (seed as f32 / u32::MAX as f32 - 0.5) * 0.5;
+                } else if i < 3 * 480 {
+                    *sample *= 0.15; // The onset is in the second lookahead packet.
+                }
+            }
+            let mut expected = Vec::new();
+            for (i, pcm) in signal.as_chunks::<480>().0.iter().enumerate() {
+                let mut data = vec![0; 1275];
+                let n = encoder.encode_float(pcm, &mut data).unwrap();
+                data.truncate(n);
+                expected.extend(decode(&mut reference, Some(&data)));
+                slot.buffer.push(i as u64 * 480, 480, data);
+            }
+            slot.mix_into(&mut [0.0; 960], 1.0, now).unwrap();
+            for ms in (10..=5000).step_by(10) {
+                slot.buffer.observe_depth(now + Duration::from_millis(ms), 0, 960);
+            }
+            let mut actual = [0.0; 960];
+            slot.mix_into(&mut actual, 1.0, now + Duration::from_secs(5)).unwrap();
+            assert_eq!(slot.buffer.shrink_samples, 0, "noise={noise}");
+            assert_eq!(actual.as_slice(), &expected[960..1920], "noise={noise}");
+            assert_eq!(slot.buffer.concealments, 0);
+        }
     }
 }
