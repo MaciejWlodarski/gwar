@@ -1,7 +1,7 @@
 //! Native voice engine: microphone → gate → Opus → WebRTC, and WebRTC →
 //! per-slot jitter buffer → Opus decode → mix → speakers.
 //!
-//! Threads: a tokio task drives the str0m WebRTC session; one realtime-ish
+//! Threads: a tokio task drives the str0m WebRTC session; one best-effort realtime
 //! "pipeline" thread does all audio DSP and coding; device callbacks only
 //! move samples through lock-free rings (see [`io`]).
 
@@ -9,6 +9,7 @@ pub mod io;
 pub mod jitter;
 pub mod permission;
 mod playout;
+mod priority;
 mod rtc;
 
 use std::{
@@ -448,6 +449,7 @@ fn pipeline<const CAPTURE: usize>(
     out: mpsc::Sender<Outgoing>,
     incoming: std::sync::mpsc::Receiver<Incoming>,
 ) -> Result<()> {
+    let _priority = priority::Priority::promote();
     let encoder = voice_encoder()?;
     output.attach();
     let mut slots = (0..AUDIO_SLOTS).map(|_| Slot::new()).collect::<Result<Vec<_>>>()?;

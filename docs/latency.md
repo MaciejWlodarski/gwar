@@ -75,6 +75,25 @@ the matching window. A 300 ms delay should add about 300 ms to the measured
 latency, including when that moves the onset into a later marker period.
 The run drains for an additional matching window after marker generation.
 
+## Pipeline scheduling
+
+The dedicated voice pipeline requests best-effort real-time scheduling for its
+480-sample/48 kHz (10 ms) work: Mach time constraints on macOS, MMCSS "Pro Audio"
+on Windows, and `SCHED_FIFO` priority 10 on Linux. The guard restores the old
+policy on exit; refused promotion logs once at debug level and voice continues.
+Linux needs an existing `rtprio` limit of at least 10 or `CAP_SYS_NICE`; no D-Bus
+library, RTKit daemon or process-wide resource-limit change is required. CPAL's
+`realtime` feature also enables WASAPI callback promotion. CoreAudio owns its RT
+callbacks; CPAL 0.18.2's Linux promotion without D-Bus is a no-op, and its ALSA
+backend deliberately avoids promoting server-backed plugins. See
+[audio-priority.md](audio-priority.md) for backend details and local evidence.
+
+Compare unchanged baseline and candidate executables back-to-back under the
+same local CPU load, including `LATENCY_CALLBACK_JITTER=1`. The harness uses
+virtual callback threads, so it measures pipeline scheduling rather than CPAL
+callback priority. `receiver_playout.underruns` and `headroom_samples` are the
+active-playback counters; lower latency alone does not establish better scheduling.
+
 ## Loopback network impairments
 
 Set `LATENCY_NET` on a direct local invocation to insert a UDP relay between
