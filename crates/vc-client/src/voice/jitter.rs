@@ -7,11 +7,12 @@ use std::{
 
 #[derive(Debug, PartialEq)]
 pub enum Playout {
-    /// Decode the whole packet, then skip up to these samples if the candidate
-    /// is quiet (or the forced-shrink deadline expired). Commit via `shrunk`.
+    /// Decode before spending this budget, possibly across contiguous packets.
+    /// The decoder requires quiet PCM or a correlated overlap; commit via `shrunk`.
     Packet {
         data: Vec<u8>,
         skip: usize,
+        // Legacy age hint; it cannot authorize an uncorrelated speech cut.
         quiet_only: bool,
         fade: bool,
     },
@@ -57,6 +58,7 @@ pub struct JitterBuffer {
     observing_since: Option<Instant>,
     last_observation: Option<Instant>,
     last_shrink: Option<Instant>,
+    last_attempt: Option<Instant>,
     pub(crate) concealments: u64,
     pub(crate) late_drops: u64,
     pub(crate) shrink_samples: u64,
@@ -75,8 +77,10 @@ const QUIET_SHRINK: Duration = Duration::from_secs(1);
 const DEPTH_WINDOW: Duration = Duration::from_secs(5);
 const SAFETY: u64 = 120; // Retain 2.5 ms beyond the observed refill low-water mark.
 const FORCE_SHRINK: Duration = Duration::from_secs(2);
-const SHRINK_STEP: u64 = 240; // At most 5 ms per correction.
+const SHRINK_STEP: u64 = 720; // Allow one low-pitched period (15 ms); the decoder commits the actual cut.
 const SHRINK_INTERVAL: Duration = Duration::from_secs(1);
+// A declined proposal (noise, onset) costs a pitch search; retry at most 5 times a second.
+const SHRINK_RETRY: Duration = Duration::from_millis(200);
 
 impl Default for JitterBuffer {
     fn default() -> Self {
@@ -102,6 +106,7 @@ impl JitterBuffer {
             observing_since: None,
             last_observation: None,
             last_shrink: None,
+            last_attempt: None,
             concealments: 0,
             late_drops: 0,
             shrink_samples: 0,
@@ -216,13 +221,14 @@ impl JitterBuffer {
         self.above_since = None;
         self.clear_depth();
         self.last_shrink = None;
+        self.last_attempt = None;
     }
 
     pub fn pop(&mut self) -> Playout {
         self.pop_at(Instant::now())
     }
 
-    /// Commit a correction only after the decoded candidate passed the quiet check.
+    /// Commit only the samples actually removed after checking the decoded signal.
     pub(crate) fn shrunk(&mut self, now: Instant, samples: usize) {
         if samples > 0 {
             self.shrink_samples += samples as u64;
@@ -279,7 +285,13 @@ impl JitterBuffer {
         self.pop_for(now, frame)
     }
 
+    /// A zero demand only decodes ahead through contiguous queued packets. It must
+    /// not synthesize loss, recover a stall, or propose another correction.
     pub(crate) fn pop_for(&mut self, now: Instant, demand: usize) -> Playout {
+        if demand == 0 && (self.recovering.is_some() || !self.next.is_some_and(|next| self.packets.contains_key(&next)))
+        {
+            return Playout::Idle;
+        }
         let mut fade = false;
         if let Some(recovery) = &self.recovering {
             // Only discard media behind the stalled timeline's deadline, and
@@ -331,16 +343,17 @@ impl JitterBuffer {
             self.last_samples = packet.samples;
             self.missing = 0;
             self.held = 0;
-            let shrink = self.surplus >= SAFETY
+            let shrink = demand > 0
+                && self.surplus >= SAFETY
                 && held >= QUIET_SHRINK
-                && self.last_shrink.is_none_or(|at| now.saturating_duration_since(at) >= SHRINK_INTERVAL);
+                && self.last_shrink.is_none_or(|at| now.saturating_duration_since(at) >= SHRINK_INTERVAL)
+                && self.last_attempt.is_none_or(|at| now.saturating_duration_since(at) >= SHRINK_RETRY);
+            if shrink {
+                self.last_attempt = Some(now);
+            }
             return Playout::Packet {
                 data: packet.data,
-                skip: if shrink {
-                    SHRINK_STEP.min(self.surplus).min(available).min(packet.samples) as usize
-                } else {
-                    0
-                },
+                skip: if shrink { SHRINK_STEP.min(self.surplus).min(available) as usize } else { 0 },
                 quiet_only: held < FORCE_SHRINK,
                 fade,
             };
@@ -512,7 +525,7 @@ mod tests {
             }
             assert_eq!(
                 pop_at(&mut jb, now + Duration::from_millis(start_ms + 5000), false),
-                Playout::Packet { data: vec![1], skip: 240, quiet_only: true, fade: false }
+                Playout::Packet { data: vec![1], skip: 720, quiet_only: true, fade: false }
             );
             assert_eq!(pop_at(&mut jb, now + Duration::from_millis(start_ms + 5000), true), packet(1));
             assert_eq!(jb.trim_events, round + 1);
@@ -806,5 +819,52 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn declined_corrections_are_retried_at_a_bounded_rate() {
+        // Sustained noise with real surplus: the decoder declines every proposal,
+        // and each proposal costs a pitch search, so proposals must stay sparse.
+        let mut jb = JitterBuffer::new();
+        let now = Instant::now();
+        let mut ts = 0;
+        for _ in 0..40 {
+            jb.push_at(ts, 480, vec![1], now, Clock::Rtp);
+            ts += 480;
+        }
+        for ms in (0..5000).step_by(10) {
+            jb.observe_depth(now + Duration::from_millis(ms), 0, 480);
+        }
+        let mut proposals = 0;
+        for ms in (5000..7000).step_by(10) {
+            let at = now + Duration::from_millis(ms);
+            jb.arrival = None;
+            jb.push_at(ts, 480, vec![1], at, Clock::Rtp);
+            ts += 480;
+            if let Playout::Packet { skip, .. } = jb.pop_at(at) {
+                proposals += usize::from(skip > 0);
+                jb.shrunk(at, 0);
+            }
+        }
+        assert!((5..=10).contains(&proposals), "proposals={proposals}");
+        assert_eq!(jb.trim_events, 0);
+    }
+
+    #[test]
+    fn decode_ahead_stops_before_a_gap_and_does_not_spend_shrink_credit() {
+        let now = Instant::now();
+        let mut jb = JitterBuffer::new();
+        jb.push_at(0, 480, vec![0], now, Clock::Rtp);
+        jb.push_at(480, 480, vec![1], now, Clock::Rtp);
+        jb.push_at(1440, 480, vec![3], now, Clock::Rtp);
+        assert_eq!(jb.pop_for(now, 0), Playout::Idle); // no active timeline
+        assert_eq!(jb.pop_for(now, 480), packet(0));
+        assert_eq!(jb.pop_for(now, 0), packet(1));
+        assert_eq!(jb.pop_for(now, 0), Playout::Idle);
+        assert_eq!(jb.depth(), (1, 480));
+        assert_eq!(jb.concealments, 0);
+        assert_eq!(jb.shrink_samples, 0);
+        assert_eq!(jb.pop_for(now, 480), Playout::Conceal(480));
+        assert_eq!(jb.pop_for(now, 480), packet(3));
     }
 }
