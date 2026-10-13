@@ -4,9 +4,12 @@
 //! Marker count defaults to 100. Writes output.csv and output.csv.json.
 //! Set both LATENCY_URL (ws(s)://host:port/ws) and LATENCY_SERVER (IP:media-port)
 //! to use an existing server; otherwise starts a fresh loopback-only server.
+//! LATENCY_MIN_MS defaults to 5; below-floor matches fail the run.
+//! LATENCY_EXTRA_DELAY_MS adds a sample delay line to the fake output device.
 //! Exits with an error if more than 5% of markers are unmatched.
 use anyhow::Context;
 use rtrb::RingBuffer;
+use serde::Serialize;
 use std::{
     io::Write,
     path::PathBuf,
@@ -31,10 +34,183 @@ const BLOCK: usize = 480;
 const PERIOD: usize = 12_000; // 250 ms
 const WARMUP: usize = RATE * 2;
 const MARKER: usize = 960; // 20 ms
+// At least 200 Hz apart, and 100 Hz away from the 400 Hz carrier's harmonics.
+const TONES: [f64; 8] = [900.0, 1100.0, 1300.0, 1500.0, 1700.0, 1900.0, 2300.0, 2700.0];
+const MATCH_WINDOW_MS: f64 = TONES.len() as f64 * PERIOD as f64 * 1000.0 / RATE as f64;
+const RMS_WINDOW: usize = 240; // 5 ms
+const IDENTITY_WINDOW: usize = 480; // 10 ms after the detected onset
+const MIN_IDENTITY_CONFIDENCE: f64 = 0.8;
+const MIN_TONE_ENERGY_FRACTION: f64 = 0.6;
+
+#[derive(Clone, Copy)]
+struct Settings {
+    minimum_ms: f64,
+    extra_delay_ms: usize,
+}
+impl Settings {
+    fn from_env() -> anyhow::Result<Self> {
+        let minimum_ms = std::env::var("LATENCY_MIN_MS")
+            .ok()
+            .map(|value| value.parse::<f64>())
+            .transpose()
+            .context("LATENCY_MIN_MS must be a number")?
+            .unwrap_or(5.0);
+        anyhow::ensure!(
+            minimum_ms.is_finite() && minimum_ms > 0.0 && minimum_ms < MATCH_WINDOW_MS,
+            "LATENCY_MIN_MS must be positive and below {MATCH_WINDOW_MS}"
+        );
+        let extra_delay_ms = std::env::var("LATENCY_EXTRA_DELAY_MS")
+            .ok()
+            .map(|value| value.parse::<usize>())
+            .transpose()
+            .context("LATENCY_EXTRA_DELAY_MS must be a nonnegative integer")?
+            .unwrap_or(0);
+        anyhow::ensure!(extra_delay_ms < MATCH_WINDOW_MS as usize, "extra delay must be below {MATCH_WINDOW_MS} ms");
+        Ok(Self { minimum_ms, extra_delay_ms })
+    }
+}
+
+struct DelayLine {
+    samples: Vec<f32>,
+    position: usize,
+}
+impl DelayLine {
+    fn new(samples: usize) -> Self {
+        Self { samples: vec![0.0; samples], position: 0 }
+    }
+
+    fn process(&mut self, value: f32) -> f32 {
+        if self.samples.is_empty() {
+            return value;
+        }
+        let output = std::mem::replace(&mut self.samples[self.position], value);
+        self.position = (self.position + 1) % self.samples.len();
+        output
+    }
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct Marker {
+    capture_s: f64,
+    identity: usize,
+}
+#[derive(Serialize)]
+struct Onset {
+    playout_s: f64,
+    sample: usize,
+    identity: Option<usize>,
+    identity_confidence: f64,
+    tone_energy_fraction: f64,
+}
+struct Match {
+    marker: usize,
+    onset: usize,
+    latency_ms: f64,
+}
+#[derive(Serialize)]
+struct RejectedOnset {
+    marker: usize,
+    onset: usize,
+    latency_ms: f64,
+    reason: &'static str,
+}
+struct Matching {
+    matched: Vec<Match>,
+    lost: Vec<usize>,
+    rejected: Vec<RejectedOnset>,
+    unused: Vec<usize>,
+}
+
+fn match_markers(markers: &[Marker], onsets: &[Onset], minimum_ms: f64, window_ms: f64) -> Matching {
+    let mut used = vec![false; onsets.len()];
+    let mut result = Matching { matched: Vec::new(), lost: Vec::new(), rejected: Vec::new(), unused: Vec::new() };
+    for (marker, capture) in markers.iter().enumerate() {
+        let found = onsets.iter().enumerate().find(|&(index, onset)| {
+            !used[index]
+                && onset.identity == Some(capture.identity)
+                && (0.0..window_ms).contains(&((onset.playout_s - capture.capture_s) * 1000.0))
+        });
+        if let Some((onset, detected)) = found {
+            // Consume even a rejected onset, so it can never measure another marker.
+            used[onset] = true;
+            let latency_ms = (detected.playout_s - capture.capture_s) * 1000.0;
+            if latency_ms < minimum_ms {
+                result.rejected.push(RejectedOnset { marker, onset, latency_ms, reason: "below_minimum_latency" });
+                result.lost.push(marker);
+            } else {
+                result.matched.push(Match { marker, onset, latency_ms });
+            }
+        } else {
+            result.lost.push(marker);
+        }
+    }
+    result.unused = used.iter().enumerate().filter_map(|(i, &used)| (!used).then_some(i)).collect();
+    result
+}
+
+fn identify_tone(samples: &[(f64, f32)]) -> (Option<usize>, f64, f64) {
+    if samples.len() != IDENTITY_WINDOW {
+        return (None, 0.0, 0.0);
+    }
+    // Hann-weighted Goertzel bins reject leakage from the carrier and nearby tones.
+    let weights: Vec<_> = (0..samples.len())
+        .map(|i| 0.5 - 0.5 * (std::f64::consts::TAU * i as f64 / (samples.len() - 1) as f64).cos())
+        .collect();
+    let energy: f64 = samples.iter().zip(&weights).map(|((_, value), weight)| f64::from(*value).powi(2) * weight).sum();
+    let powers: Vec<_> = TONES
+        .iter()
+        .map(|frequency| {
+            let coefficient = 2.0 * (std::f64::consts::TAU * frequency / RATE as f64).cos();
+            let (mut previous, mut before_previous) = (0.0, 0.0);
+            for ((_, value), weight) in samples.iter().zip(&weights) {
+                let current = f64::from(*value) * weight + coefficient * previous - before_previous;
+                before_previous = previous;
+                previous = current;
+            }
+            (previous.powi(2) + before_previous.powi(2) - coefficient * previous * before_previous).max(0.0)
+        })
+        .collect();
+    let identity = (0..TONES.len()).max_by(|&a, &b| powers[a].total_cmp(&powers[b])).unwrap();
+    let total: f64 = powers.iter().sum();
+    let confidence = if total > 0.0 { powers[identity] / total } else { 0.0 };
+    let weighted_energy = energy * weights.iter().sum::<f64>();
+    let fraction = if weighted_energy > 0.0 { 2.0 * powers[identity] / weighted_energy } else { 0.0 };
+    let identified = confidence >= MIN_IDENTITY_CONFIDENCE && fraction >= MIN_TONE_ENERGY_FRACTION;
+    (identified.then_some(identity), confidence, fraction)
+}
+
+fn detect_onsets(samples: &[(f64, f32)]) -> Vec<Onset> {
+    let mut square = 0.0f64;
+    let mut high = false;
+    let mut onsets = Vec::new();
+    for i in 0..samples.len() {
+        square += f64::from(samples[i].1).powi(2);
+        if i >= RMS_WINDOW {
+            square -= f64::from(samples[i - RMS_WINDOW].1).powi(2);
+        }
+        let rms = (square.max(0.0) / RMS_WINDOW as f64).sqrt();
+        if !high && rms > 0.18 {
+            let end = (i + IDENTITY_WINDOW).min(samples.len());
+            let (identity, identity_confidence, tone_energy_fraction) = identify_tone(&samples[i..end]);
+            onsets.push(Onset {
+                playout_s: samples[i].0,
+                sample: i,
+                identity,
+                identity_confidence,
+                tone_energy_fraction,
+            });
+            high = true;
+        }
+        if high && rms < 0.11 {
+            high = false;
+        }
+    }
+    onsets
+}
 
 #[derive(Default)]
 struct Measurements {
-    captures: Vec<f64>,
+    captures: Vec<Marker>,
     samples: Vec<(f64, f32)>,
     underflows: usize,
 }
@@ -44,6 +220,7 @@ struct FakeIo {
     epoch: Instant,
     stop: Arc<AtomicBool>,
     count: usize,
+    delay_samples: usize,
 }
 struct Guard {
     stop: Arc<AtomicBool>,
@@ -72,6 +249,9 @@ impl AudioIo for FakeIo {
                 thread::sleep(wait);
             }
             let mut position = 0usize;
+            // Delay decoded audio, including silence and carrier, before playout.
+            // Capture/playout timestamps always remain the actual callback times.
+            let mut delay = DelayLine::new(self.delay_samples);
             while !thread_stop.load(Ordering::Relaxed) {
                 let now = Instant::now();
                 let mut data = self.data.lock().unwrap();
@@ -84,9 +264,12 @@ impl AudioIo for FakeIo {
                         && (at - WARMUP).is_multiple_of(PERIOD)
                         && data.captures.len() < self.count
                     {
-                        data.captures.push((now - self.epoch).as_secs_f64() + i as f64 / RATE as f64);
+                        data.captures.push(Marker {
+                            capture_s: (now - self.epoch).as_secs_f64() + i as f64 / RATE as f64,
+                            identity: (at - WARMUP) / PERIOD % TONES.len(),
+                        });
                     }
-                    let frequency = if in_marker { 1800.0 } else { 400.0 };
+                    let frequency = if in_marker { TONES[(at - WARMUP) / PERIOD % TONES.len()] } else { 400.0 };
                     let amplitude = if in_marker { 0.6 } else { 0.08 };
                     let value = if self.tone {
                         (at as f64 * frequency * std::f64::consts::TAU / RATE as f64).sin() as f32 * amplitude
@@ -101,7 +284,8 @@ impl AudioIo for FakeIo {
                         0.0
                     });
                     if !self.tone {
-                        data.samples.push(((now - self.epoch).as_secs_f64() + i as f64 / RATE as f64, value));
+                        data.samples
+                            .push(((now - self.epoch).as_secs_f64() + i as f64 / RATE as f64, delay.process(value)));
                     }
                 }
                 drop(data);
@@ -141,9 +325,10 @@ async fn main() -> anyhow::Result<()> {
         (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => None,
         _ => anyhow::bail!("set both LATENCY_URL and LATENCY_SERVER, or neither"),
     };
+    let settings = Settings::from_env()?;
     let mut tasks = ServerTasks { tasks: Vec::new(), data_dir: None };
     let result = tokio::select! {
-        result = measure(&output, count, remote, &mut tasks) => result,
+        result = measure(&output, count, remote, &mut tasks, settings) => result,
         signal = shutdown_signal() => {
             signal?;
             Err(anyhow::anyhow!("measurement interrupted"))
@@ -204,9 +389,10 @@ async fn measure(
     count: usize,
     remote: Option<(String, std::net::SocketAddr)>,
     tasks: &mut ServerTasks,
+    settings: Settings,
 ) -> anyhow::Result<()> {
     if let Some((url, addr)) = remote {
-        return run(output, count, &url, addr).await;
+        return run(output, count, &url, addr, settings).await;
     }
     // Keep transient server files beside the output, and never reuse state.
     let data_path = PathBuf::from(format!("{output}.data-{}", std::process::id()));
@@ -246,14 +432,20 @@ async fn measure(
     let url = format!("ws://{}/ws", server.http);
     tasks.tasks = server.tasks;
     tasks.data_dir = Some(data);
-    let result = run(output, count, &url, server.media).await;
+    let result = run(output, count, &url, server.media, settings).await;
     drop(server.core);
     drop(server.plane);
     tasks.shutdown().await;
     result
 }
 
-async fn run(output: &str, count: usize, url: &str, server_addr: std::net::SocketAddr) -> anyhow::Result<()> {
+async fn run(
+    output: &str,
+    count: usize,
+    url: &str,
+    server_addr: std::net::SocketAddr,
+    settings: Settings,
+) -> anyhow::Result<()> {
     let url = url.to_string();
     let a = connect(options(&url, "latency sender")).await?;
     let mut b = connect(options(&url, "latency receiver")).await?;
@@ -265,17 +457,34 @@ async fn run(output: &str, count: usize, url: &str, server_addr: std::net::Socke
     let heard = Arc::new(Mutex::new(Measurements::default()));
     let va = voice::start(
         &a.connection,
-        Box::new(FakeIo { data: sent.clone(), tone: true, epoch, stop: Arc::new(AtomicBool::new(false)), count }),
+        Box::new(FakeIo {
+            data: sent.clone(),
+            tone: true,
+            epoch,
+            stop: Arc::new(AtomicBool::new(false)),
+            count,
+            delay_samples: 0,
+        }),
         server_addr,
     )
     .await?;
     let vb = voice::start(
         &b.connection,
-        Box::new(FakeIo { data: heard.clone(), tone: false, epoch, stop: Arc::new(AtomicBool::new(false)), count }),
+        Box::new(FakeIo {
+            data: heard.clone(),
+            tone: false,
+            epoch,
+            stop: Arc::new(AtomicBool::new(false)),
+            count,
+            delay_samples: settings.extra_delay_ms * RATE / 1000,
+        }),
         server_addr,
     )
     .await?;
-    tokio::time::sleep(Duration::from_secs_f64(3.0 + count as f64 * 0.25)).await;
+    tokio::time::sleep(Duration::from_secs_f64(
+        3.0 + count as f64 * PERIOD as f64 / RATE as f64 + MATCH_WINDOW_MS / 1000.0,
+    ))
+    .await;
     let receiver_stats = vb.stats();
     println!("sender={:?} receiver={receiver_stats:?}", va.stats());
     let mut voice_events = Vec::new();
@@ -293,55 +502,37 @@ async fn run(output: &str, count: usize, url: &str, server_addr: std::net::Socke
     drop((va, vb));
     let sent = sent.lock().unwrap();
     let heard = heard.lock().unwrap();
-    // A trailing 5 ms RMS window detects the high-amplitude marker. The
-    // detector's small onset delay is identical in both builds (no correction).
-    let window = 240;
-    let mut square = 0.0f64;
-    let mut high = false;
-    let mut onsets = Vec::new();
-    for i in 0..heard.samples.len() {
-        square += f64::from(heard.samples[i].1).powi(2);
-        if i >= window {
-            square -= f64::from(heard.samples[i - window].1).powi(2);
-        }
-        let rms = (square.max(0.0) / window as f64).sqrt();
-        if !high && rms > 0.18 {
-            onsets.push((heard.samples[i].0, i));
-            high = true;
-        }
-        if high && rms < 0.11 {
-            high = false;
-        }
-    }
+    let onsets = detect_onsets(&heard.samples);
     anyhow::ensure!(sent.captures.len() == count, "only {} captures", sent.captures.len());
-    // Each marker is matched to the first onset within 250 ms (one marker
-    // period) after its capture; a marker lost on the network has none and
-    // is counted as lost instead of shifting every later match.
+    let matching = match_markers(&sent.captures, &onsets, settings.minimum_ms, MATCH_WINDOW_MS);
     let mut csv = std::fs::File::create(output)?;
-    writeln!(csv, "marker,capture_s,playout_s,latency_ms,playout_sample")?;
+    writeln!(csv, "marker,identity,capture_s,playout_s,latency_ms,playout_sample")?;
     let mut latencies = Vec::new();
-    let mut lost = Vec::new();
-    for (i, &capture) in sent.captures.iter().enumerate() {
-        let found = onsets.iter().find(|&&(playout, _)| (0.0..0.25).contains(&(playout - capture)));
-        match found {
-            Some(&(playout, sample)) => {
-                let latency = (playout - capture) * 1000.0;
-                writeln!(csv, "{i},{capture:.9},{playout:.9},{latency:.6},{sample}")?;
-                latencies.push(latency);
-            }
-            None => lost.push(i),
-        }
+    for found in &matching.matched {
+        let Marker { capture_s, identity } = sent.captures[found.marker];
+        let onset = &onsets[found.onset];
+        writeln!(
+            csv,
+            "{},{identity},{capture_s:.9},{:.9},{:.6},{}",
+            found.marker, onset.playout_s, found.latency_ms, onset.sample
+        )?;
+        latencies.push(found.latency_ms);
     }
+    let lost = &matching.lost;
+    let ambiguous: Vec<_> =
+        onsets.iter().enumerate().filter_map(|(i, onset)| onset.identity.is_none().then_some(i)).collect();
     let marker_count = count;
     let count = latencies.len();
     latencies.sort_by(f64::total_cmp);
     let percentile = |q: f64| latencies.get(((q * count as f64).ceil() as usize).saturating_sub(1)).copied();
     println!(
-        "n={count} median={:.3} p95={:.3} p99={:.3} ms underflow_samples={}",
+        "n={count} median={:.3} p95={:.3} p99={:.3} ms underflow_samples={} ambiguous_onsets={} rejected_onsets={}",
         percentile(0.5).unwrap_or(f64::NAN),
         percentile(0.95).unwrap_or(f64::NAN),
         percentile(0.99).unwrap_or(f64::NAN),
-        heard.underflows
+        heard.underflows,
+        ambiguous.len(),
+        matching.rejected.len()
     );
     let metadata = serde_json::json!({
         "voice_events": voice_events,
@@ -349,6 +540,20 @@ async fn run(output: &str, count: usize, url: &str, server_addr: std::net::Socke
         "n": count,
         "lost_markers": lost,
         "onsets": onsets.len(),
+        "detected_onsets": onsets,
+        "ambiguous_onsets": ambiguous,
+        "rejected_onsets": matching.rejected,
+        "unmatched_onsets": matching.unused,
+        "marker_captures": sent.captures,
+        "marker_identity_count": TONES.len(),
+        "marker_frequencies_hz": TONES,
+        "matching_window_ms": MATCH_WINDOW_MS,
+        "minimum_latency_ms": settings.minimum_ms,
+        "extra_delay_ms": settings.extra_delay_ms,
+        "extra_delay_samples": settings.extra_delay_ms * RATE / 1000,
+        "identity_window_samples": IDENTITY_WINDOW,
+        "minimum_identity_confidence": MIN_IDENTITY_CONFIDENCE,
+        "minimum_tone_energy_fraction": MIN_TONE_ENERGY_FRACTION,
         "median_ms": percentile(0.5),
         "p95_ms": percentile(0.95),
         "p99_ms": percentile(0.99),
@@ -359,7 +564,7 @@ async fn run(output: &str, count: usize, url: &str, server_addr: std::net::Socke
         "server": server_addr.to_string(),
         "sample_rate": RATE,
         "callback_samples": BLOCK,
-        "rms_window_samples": window,
+        "rms_window_samples": RMS_WINDOW,
         "rms_on_threshold": 0.18,
         "rms_off_threshold": 0.11,
         "marker_samples": MARKER,
@@ -367,6 +572,12 @@ async fn run(output: &str, count: usize, url: &str, server_addr: std::net::Socke
         "warmup_samples": WARMUP,
     });
     std::fs::write(format!("{output}.json"), serde_json::to_string_pretty(&metadata)?)?;
+    anyhow::ensure!(
+        matching.rejected.is_empty(),
+        "rejected {} onsets below {:.3} ms; see {output}.json",
+        matching.rejected.len(),
+        settings.minimum_ms
+    );
     anyhow::ensure!(
         lost.len() <= marker_count / 20,
         "lost {} of {marker_count} markers ({:.1}%); at least 95% must match; see {output}.json",
@@ -382,4 +593,113 @@ async fn run(output: &str, count: usize, url: &str, server_addr: std::net::Socke
         "no sender talking indicator; see {output}.json"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn synthetic(count: usize, latency_ms: f64) -> (Vec<Marker>, Vec<Onset>) {
+        let markers: Vec<_> = (0..count)
+            .map(|i| Marker { capture_s: 2.0 + i as f64 * PERIOD as f64 / RATE as f64, identity: i % TONES.len() })
+            .collect();
+        let onsets = markers
+            .iter()
+            .enumerate()
+            .map(|(i, marker)| Onset {
+                playout_s: marker.capture_s + latency_ms / 1000.0,
+                sample: i,
+                identity: Some(marker.identity),
+                identity_confidence: 1.0,
+                tone_energy_fraction: 1.0,
+            })
+            .collect();
+        (markers, onsets)
+    }
+
+    #[test]
+    fn latencies_beyond_one_period_do_not_alias() {
+        for latency in [350.0, 600.0, 1999.0] {
+            let (markers, onsets) = synthetic(100, latency);
+            let result = match_markers(&markers, &onsets, 5.0, MATCH_WINDOW_MS);
+            assert_eq!(result.matched.len(), 100);
+            assert!(result.lost.is_empty());
+            for (i, found) in result.matched.iter().enumerate() {
+                assert_eq!((found.marker, found.onset), (i, i));
+                assert!((found.latency_ms - latency).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn lost_marker_does_not_shift_later_matches() {
+        let (markers, mut onsets) = synthetic(100, 600.0);
+        onsets.remove(3);
+        let result = match_markers(&markers, &onsets, 5.0, MATCH_WINDOW_MS);
+        assert_eq!(result.lost, [3]);
+        assert_eq!(result.matched.len(), 99);
+        for found in result.matched {
+            assert_eq!(onsets[found.onset].sample, found.marker);
+            assert!((found.latency_ms - 600.0).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn duplicate_and_ambiguous_onsets_are_not_reused() {
+        let (markers, mut onsets) = synthetic(100, 350.0);
+        onsets[3].identity = None;
+        let duplicate = Onset { sample: 100, ..onsets[4] };
+        onsets.insert(5, duplicate);
+        let result = match_markers(&markers, &onsets, 5.0, MATCH_WINDOW_MS);
+        assert_eq!(result.lost, [3]);
+        assert_eq!(result.matched.len(), 99);
+        assert_eq!(result.unused, [3, 5]);
+        let used: std::collections::HashSet<_> = result.matched.iter().map(|found| found.onset).collect();
+        assert_eq!(used.len(), result.matched.len());
+        for found in result.matched {
+            assert_eq!(onsets[found.onset].sample, found.marker);
+        }
+    }
+
+    #[test]
+    fn below_floor_is_rejected_and_consumed() {
+        let (mut markers, onsets) = synthetic(1, 1.0);
+        markers.push(markers[0]);
+        let result = match_markers(&markers, &onsets, 5.0, MATCH_WINDOW_MS);
+        assert!(result.matched.is_empty());
+        assert_eq!(result.lost, [0, 1]);
+        assert_eq!(result.rejected.len(), 1);
+        assert_eq!(result.rejected[0].reason, "below_minimum_latency");
+        assert!(result.unused.is_empty());
+    }
+
+    #[test]
+    fn matching_window_is_exclusive() {
+        let (markers, onsets) = synthetic(1, MATCH_WINDOW_MS);
+        let result = match_markers(&markers, &onsets, 5.0, MATCH_WINDOW_MS);
+        assert!(result.matched.is_empty());
+        assert_eq!(result.lost, [0]);
+    }
+
+    #[test]
+    fn mixed_tones_and_carrier_have_no_identity() {
+        for frequencies in [[TONES[2], TONES[3]], [400.0, 400.0]] {
+            let samples: Vec<_> = (0..IDENTITY_WINDOW)
+                .map(|i| {
+                    let time = i as f64 / RATE as f64;
+                    let value = frequencies.iter().map(|f| (time * f * std::f64::consts::TAU).sin()).sum::<f64>();
+                    (time, value as f32 * 0.3)
+                })
+                .collect();
+            assert_eq!(identify_tone(&samples).0, None);
+        }
+    }
+
+    #[test]
+    fn delay_line_holds_the_audio_samples() {
+        let mut delay = DelayLine::new(3);
+        let output: Vec<_> = [1.0, 2.0, 3.0, 0.0, 0.0, 0.0].into_iter().map(|value| delay.process(value)).collect();
+        assert_eq!(output, [0.0, 0.0, 0.0, 1.0, 2.0, 3.0]);
+        assert_eq!(DelayLine::new(0).process(0.5), 0.5);
+    }
 }

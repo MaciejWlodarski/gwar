@@ -161,7 +161,7 @@ def main():
                             raise RuntimeError("invalid server PID")
                         wait_ready(args, tunnel, directory, pid)
                         print(f"run {run}/{len(results.order)}: {name} (server pid {pid})", flush=True)
-                        env = environment()
+                        env = environment(args)
                         env.update(LATENCY_URL=f"ws://127.0.0.1:{args.tunnel_port}/ws", LATENCY_SERVER=address(args.public_ip, args.media_port))
                         client_pid = run_client(results.binaries[name], results.path(run, name), args.markers, env)
                         results.accept(run, name, client_pid, server_pid=pid, server_binary=server_binaries[name])
@@ -182,5 +182,5 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, KeyboardInterrupt) as error:
+    except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError, KeyboardInterrupt) as error:
         raise SystemExit(str(error) or "interrupted") from error
