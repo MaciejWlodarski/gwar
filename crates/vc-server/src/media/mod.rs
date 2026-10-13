@@ -27,8 +27,17 @@ pub struct AudioPacket {
 /// Original media clock and ordering identity, before SFU timestamp rewriting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceClock {
-    Rtp { ssrc: u32, sequence: u64, ticks: u32 },
-    TeamSpeak { id: u16, whisper: bool },
+    Rtp {
+        ssrc: u32,
+        sequence: u64,
+        ticks: u32,
+    },
+    /// `spurt` changes with each talk spurt: ids do not advance across silence.
+    TeamSpeak {
+        id: u16,
+        whisper: bool,
+        spurt: u16,
+    },
 }
 
 impl SourceClock {
@@ -43,9 +52,15 @@ impl SourceClock {
                 }
                 Ok(Some(ticks.wrapping_sub(time)))
             }
-            (Self::TeamSpeak { id, whisper }, Self::TeamSpeak { id: old, whisper: was_whisper })
-                if whisper == was_whisper =>
-            {
+            (
+                Self::TeamSpeak { id, whisper, spurt },
+                Self::TeamSpeak { id: old, whisper: was_whisper, spurt: old_spurt },
+            ) if whisper == was_whisper => {
+                match spurt.wrapping_sub(old_spurt) {
+                    0 => {}
+                    newer if newer < 0x8000 => return Ok(None),
+                    _ => return Err(()),
+                }
                 let delta = id.wrapping_sub(old);
                 if delta == 0 || delta >= 0x8000 {
                     return Err(());
@@ -59,7 +74,12 @@ impl SourceClock {
 
 impl AudioPacket {
     pub fn end_of_speech(from: SessionId) -> Self {
-        Self { from, opus: Arc::from([]), samples: 0, clock: SourceClock::TeamSpeak { id: 0, whisper: false } }
+        Self {
+            from,
+            opus: Arc::from([]),
+            samples: 0,
+            clock: SourceClock::TeamSpeak { id: 0, whisper: false, spurt: 0 },
+        }
     }
 
     pub fn is_end(&self) -> bool {

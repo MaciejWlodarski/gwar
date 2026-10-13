@@ -224,9 +224,10 @@ SSRCs cannot return.
 TeamSpeak uses its wrapping u16 packet id times 960 as a synthetic clock,
 with half-range ordering and separate voice/whisper identities; every listener
 sees the same ids (checked against the official server in CI). The ids do not
-advance across silence, so a TeamSpeak end marker re-anchors the slot on wall
-time, and an out-of-order id more than a second after the last write starts a
-new clock instead of being dropped. Both bridge directions retain Opus durations.
+advance across silence, so the bridge numbers each talk spurt (per speaker, and
+per speaker and target for whispers) and a new spurt re-anchors the slot on wall
+time, even for a listener that missed the end marker. An out-of-order id more
+than a second after the last write starts a new clock instead of being dropped. Both bridge directions retain Opus durations.
 
 First packets, speaker/SSRC changes, backward timestamps and deltas over five
 seconds use elapsed wall time rounded up to the previous packet's duration,

@@ -80,14 +80,6 @@ impl Slot {
         self.clock = None;
     }
 
-    /// TeamSpeak ids advance per packet, not across silence: the next spurt
-    /// needs a fresh anchor so the pause stays a pause.
-    fn end_spurt(&mut self) {
-        if let Some(SourceClock::TeamSpeak { .. }) = self.clock {
-            self.clock = None;
-        }
-    }
-
     fn advance(&mut self, now: Instant, samples: u32, clock: SourceClock) -> bool {
         let stale = self.last_write.is_none_or(|last| now.saturating_duration_since(last) > STALE_CLOCK);
         let delta = match self.clock.map(|old| clock.delta(old)).transpose() {
@@ -147,9 +139,6 @@ impl Peer {
     /// Writes one frame from `from` into a receive slot, assigning one if needed.
     fn forward(&mut self, packet: &AudioPacket, now: Instant) {
         if packet.is_end() {
-            if let Some(slot) = self.slots.iter_mut().find(|s| s.source == Some(packet.from)) {
-                slot.end_spurt();
-            }
             return;
         }
         let index = match self.slots.iter().position(|s| s.source == Some(packet.from)) {
@@ -545,51 +534,51 @@ mod clock_tests {
         assert_eq!(slot.ticks, SAMPLE_RATE + 480);
         assert!(!slot.advance(now, 480, rtp(65535, u32::MAX - 479)));
         let mut slot = self::slot(now);
-        slot.advance(now, 960, SourceClock::TeamSpeak { id: 65535, whisper: false });
-        assert!(slot.advance(now, 960, SourceClock::TeamSpeak { id: 0, whisper: false }));
+        slot.advance(now, 960, SourceClock::TeamSpeak { id: 65535, whisper: false, spurt: 0 });
+        assert!(slot.advance(now, 960, SourceClock::TeamSpeak { id: 0, whisper: false, spurt: 0 }));
         assert_eq!(slot.ticks, SAMPLE_RATE + 960);
-        assert!(!slot.advance(now, 960, SourceClock::TeamSpeak { id: 65535, whisper: false }));
-        assert!(!slot.advance(now, 960, SourceClock::TeamSpeak { id: 0, whisper: false }));
+        assert!(!slot.advance(now, 960, SourceClock::TeamSpeak { id: 65535, whisper: false, spurt: 0 }));
+        assert!(!slot.advance(now, 960, SourceClock::TeamSpeak { id: 0, whisper: false, spurt: 0 }));
     }
 
     #[test]
-    fn teamspeak_pause_and_long_absence_restart_on_wall_time() {
+    fn teamspeak_spurts_restart_on_wall_time_even_without_an_end_marker() {
         let now = Instant::now();
-        let ts = |id| SourceClock::TeamSpeak { id, whisper: false };
+        let ts = |id, spurt| SourceClock::TeamSpeak { id, whisper: false, spurt };
         let mut slot = slot(now);
-        slot.advance(now, 960, ts(10));
-        // Ids continue across a six-second pause; the end marker re-anchors.
-        slot.end_spurt();
-        assert!(slot.advance(now + Duration::from_secs(6), 960, ts(11)));
+        slot.advance(now, 960, ts(10, 1));
+        // Ids continue across a six-second pause. This listener never saw the
+        // end marker (e.g. deafened), but the next spurt re-anchors anyway.
+        assert!(slot.advance(now + Duration::from_secs(6), 960, ts(11, 2)));
         assert_eq!(slot.ticks, SAMPLE_RATE + 6 * SAMPLE_RATE);
-        assert!(slot.advance(now + Duration::from_secs(6), 960, ts(12)));
+        assert!(slot.advance(now + Duration::from_secs(6), 960, ts(12, 2)));
         assert_eq!(slot.ticks, SAMPLE_RATE + 6 * SAMPLE_RATE + 960);
-        // A recent backwards id is reordering; a jump past half the range after
-        // a long absence (e.g. deafened) is a new clock, not a stale packet.
-        assert!(!slot.advance(now + Duration::from_secs(6), 960, ts(11)));
+        // Ordering survives the new spurt: late audio from the old one drops.
+        assert!(!slot.advance(now + Duration::from_secs(6), 960, ts(9, 1)));
+        assert!(!slot.advance(now + Duration::from_secs(6), 960, ts(11, 2)));
+        // Within one spurt, a jump past half the id range after a long
+        // absence is a new clock rather than a stale packet.
         let later = now + Duration::from_secs(8);
-        assert!(slot.advance(later, 960, ts(12u16.wrapping_add(40_000))));
+        assert!(slot.advance(later, 960, ts(12u16.wrapping_add(40_000), 2)));
         assert_eq!(slot.ticks, SAMPLE_RATE + 8 * SAMPLE_RATE + 960);
-    }
-
-    #[test]
-    fn rtp_end_marker_keeps_the_source_clock() {
-        let now = Instant::now();
-        let mut slot = slot(now);
-        slot.advance(now, 480, rtp(0, 0));
-        slot.end_spurt();
-        assert!(slot.advance(now, 480, rtp(1, 48_000)));
-        assert_eq!(slot.ticks, 2 * SAMPLE_RATE);
     }
 
     #[test]
     fn teamspeak_voice_and_whisper_have_independent_counters() {
         let now = Instant::now();
         let mut slot = slot(now);
-        slot.advance(now, 960, SourceClock::TeamSpeak { id: 100, whisper: false });
-        assert!(slot.advance(now + Duration::from_millis(200), 960, SourceClock::TeamSpeak { id: 0, whisper: true }));
+        slot.advance(now, 960, SourceClock::TeamSpeak { id: 100, whisper: false, spurt: 0 });
+        assert!(slot.advance(
+            now + Duration::from_millis(200),
+            960,
+            SourceClock::TeamSpeak { id: 0, whisper: true, spurt: 0 }
+        ));
         assert_eq!(slot.ticks, SAMPLE_RATE + 9600);
-        assert!(slot.advance(now + Duration::from_millis(200), 960, SourceClock::TeamSpeak { id: 1, whisper: true }));
+        assert!(slot.advance(
+            now + Duration::from_millis(200),
+            960,
+            SourceClock::TeamSpeak { id: 1, whisper: true, spurt: 0 }
+        ));
         assert_eq!(slot.ticks, SAMPLE_RATE + 10560);
     }
 
