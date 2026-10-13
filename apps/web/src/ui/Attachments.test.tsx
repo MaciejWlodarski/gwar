@@ -19,7 +19,6 @@ describe("attachment trust", () => {
   const media = async (mime: string, hash?: string): Promise<Attachment> => ({ id: "f1", name: "media", mime, url: "/files/f1/media", size: bytes.length, sha256: hash ?? await sha256(bytes) });
   const show = async (att: Attachment, verified: boolean | null) => {
     await act(async () => { root.render(<TooltipProvider><AttachmentList attachments={[att]} verified={verified} /></TooltipProvider>); });
-    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
   };
   beforeEach(() => {
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true); vi.stubGlobal("crypto", webcrypto); vi.stubGlobal("Blob", Blob); vi.stubGlobal("URL", URL);
@@ -62,14 +61,21 @@ describe("attachment trust", () => {
     vi.stubGlobal("createImageBitmap", undefined);
     await act(async () => { root.render(<TooltipProvider><Lightbox attachment={att} verified /></TooltipProvider>); });
     const save = () => document.querySelector<HTMLButtonElement>('button[aria-label="Save image"]')!;
+    const unverified = () => [...document.querySelectorAll("button")].find((b) => b.textContent === "Download unverified attachment");
+    // The preview consumes the matching bytes; every save must fetch and check the substitution again.
+    await vi.waitFor(() => expect(fetchFileBytes).toHaveBeenCalledOnce());
     for (let attempt = 0; attempt < 2; attempt++) {
       await act(async () => save().click());
-      await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+      // A timer tick can finish before hashing does, leaving the retry or unverified action disabled.
+      await vi.waitFor(() => {
+        expect(save().disabled).toBe(false);
+        expect(unverified()?.disabled).toBe(false);
+      });
+      expect(fetchFileBytes).toHaveBeenCalledTimes(attempt + 2);
+      expect(saveBlob).not.toHaveBeenCalled();
+      expect(save().parentElement?.querySelector('[role="alert"]')?.textContent).toBe("Attachment verification failed");
     }
-    expect(saveBlob).not.toHaveBeenCalled();
-    expect(document.body.textContent).toContain("Attachment verification failed");
-    const unverified = [...document.querySelectorAll("button")].find((b) => b.textContent === "Download unverified attachment")!;
-    await act(async () => unverified.click());
+    await act(async () => unverified()!.click());
     await vi.waitFor(() => expect(saveBlob).toHaveBeenCalledOnce());
     expect(await (vi.mocked(saveBlob).mock.calls[0]![0] as unknown as Blob).text()).toBe("evil!");
   });
