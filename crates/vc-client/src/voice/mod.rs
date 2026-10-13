@@ -29,7 +29,7 @@ use vc_proto::AUDIO_SLOTS;
 use self::{
     io::{AudioIo, AudioPorts, OutputTiming},
     jitter::Clock,
-    playout::{Slot, speaker_target},
+    playout::{Slot, SpeakerBuffer},
 };
 use crate::Connection;
 
@@ -153,6 +153,10 @@ pub struct VoiceStats {
     pub slots: [SlotStats; AUDIO_SLOTS],
     pub speaker_samples: u64,
     pub callback_samples: usize,
+    /// Slowly decaying callback maximum used to size the speaker queue.
+    pub callback_max_samples: usize,
+    /// Scheduling headroom beyond one held callback, in 48 kHz samples.
+    pub headroom_samples: usize,
     /// Output callbacks missing samples while a receive stream was playing.
     pub underruns: u64,
     pub underrun_samples: u64,
@@ -219,6 +223,8 @@ impl VoiceHandle {
             }),
             speaker_samples: c.speaker_samples.load(Ordering::Relaxed),
             callback_samples: self.output.callback_samples.load(Ordering::Relaxed),
+            callback_max_samples: self.output.callback_max_samples.load(Ordering::Relaxed),
+            headroom_samples: self.output.headroom_samples.load(Ordering::Relaxed),
             underruns: self.output.underruns.load(Ordering::Relaxed),
             underrun_samples: self.output.underrun_samples.load(Ordering::Relaxed),
             link: match c.link.load(Ordering::Relaxed) {
@@ -383,6 +389,7 @@ fn pipeline(
     let mut mix = vec![0f32; FRAME];
     let mut packet = vec![0u8; 1275];
     let mut last_voice = Instant::now() - HANGOVER;
+    let mut speaker_buffer = SpeakerBuffer::new(Instant::now());
 
     while !controls.stop.load(Ordering::Relaxed) {
         // ---- capture
@@ -422,7 +429,15 @@ fn pipeline(
         }
 
         // Decode only as needed; each slot retains the rest of its packet.
-        let target = speaker_target(output.callback_samples.load(Ordering::Relaxed), speaker.buffer().capacity());
+        speaker_buffer.update(
+            Instant::now(),
+            output.callback_samples.load(Ordering::Relaxed),
+            output.callback_peak.swap(0, Ordering::Relaxed),
+            output.underruns.load(Ordering::Relaxed),
+        );
+        output.callback_max_samples.store(speaker_buffer.callback, Ordering::Relaxed);
+        output.headroom_samples.store(speaker_buffer.headroom, Ordering::Relaxed);
+        let target = speaker_buffer.target(speaker.buffer().capacity());
         let level = speaker.buffer().capacity() - speaker.slots();
         let mut needed = target.saturating_sub(level);
         let deafened = controls.deafened.load(Ordering::Relaxed);

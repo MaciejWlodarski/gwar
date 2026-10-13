@@ -1,6 +1,6 @@
 //! Callback-sized mixing with a separate decoded tail for each receive slot.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use audiopus::{Channels, MutSignals, SampleRate, coder::Decoder, packet::Packet};
@@ -10,10 +10,53 @@ use super::{
     level_db,
 };
 
-/// One callback plus another callback of scheduling headroom (at least 5 ms).
-pub(super) fn speaker_target(callback: usize, capacity: usize) -> usize {
-    let callback = if callback == 0 { 480 } else { callback };
-    callback.saturating_add(callback.max(240)).min(capacity)
+const STEP: usize = 240; // 5 ms at 48 kHz.
+const MAX_HEADROOM: usize = 1920; // 40 ms, unless one device callback itself needs more.
+const CALLBACK_HOLD: Duration = Duration::from_secs(5);
+const HEADROOM_QUIET: Duration = Duration::from_secs(30);
+
+/// Pipeline-owned policy; the realtime callback only publishes atomic measurements.
+pub(super) struct SpeakerBuffer {
+    pub callback: usize,
+    pub headroom: usize,
+    callback_changed: Instant,
+    headroom_changed: Instant,
+    underruns: u64,
+}
+
+impl SpeakerBuffer {
+    pub fn new(now: Instant) -> Self {
+        Self { callback: 480, headroom: 480, callback_changed: now, headroom_changed: now, underruns: 0 }
+    }
+
+    /// `peak` is the largest callback since the previous update, never just the last one.
+    pub fn update(&mut self, now: Instant, current: usize, peak: usize, underruns: u64) {
+        let current = if current == 0 { 480 } else { current };
+        let peak = peak.max(current);
+        if peak >= self.callback {
+            self.callback = peak;
+            self.callback_changed = now;
+        } else if now.duration_since(self.callback_changed) >= CALLBACK_HOLD {
+            // Route/buffer changes settle down gradually: at most 5 ms every five seconds.
+            self.callback = self.callback.saturating_sub(STEP).max(peak);
+            self.callback_changed = now;
+        }
+        let base = self.callback.max(STEP);
+        self.headroom = self.headroom.max(base);
+        if underruns > self.underruns {
+            let events = (underruns - self.underruns).min((MAX_HEADROOM / STEP) as u64) as usize;
+            self.headroom = self.headroom.saturating_add(events * STEP).min(MAX_HEADROOM).max(self.headroom);
+            self.headroom_changed = now;
+        } else if now.duration_since(self.headroom_changed) >= HEADROOM_QUIET {
+            self.headroom = self.headroom.saturating_sub(STEP).max(base);
+            self.headroom_changed = now;
+        }
+        self.underruns = underruns;
+    }
+
+    pub fn target(&self, capacity: usize) -> usize {
+        self.callback.saturating_add(self.headroom).min(capacity)
+    }
 }
 
 pub(super) struct Slot {
@@ -109,11 +152,56 @@ mod tests {
     use audiopus::{Application, coder::Encoder};
 
     #[test]
-    fn target_tracks_callback_and_never_overshoots_with_frame_sized_refills() {
+    fn callback_max_holds_varying_sizes_then_decays() {
+        let now = Instant::now();
+        let mut buffer = SpeakerBuffer::new(now);
+        for (i, size) in [480, 960, 240, 480, 481, 480].into_iter().enumerate() {
+            buffer.update(now + Duration::from_millis(i as u64 * 10), size, size, 0);
+            assert_eq!(buffer.callback, if i == 0 { 480 } else { 960 });
+        }
+        buffer.update(now + Duration::from_secs(5), 240, 240, 0);
+        assert_eq!(buffer.callback, 960); // five seconds since the peak, not startup
+        for (seconds, expected) in [(6, 720), (11, 480), (16, 240)] {
+            buffer.update(now + Duration::from_secs(seconds), 240, 240, 0);
+            assert_eq!(buffer.callback, expected);
+        }
+        // A peak between pipeline wakeups must also grow the target immediately.
+        buffer.update(now + Duration::from_secs(17), 240, 2048, 0);
+        assert_eq!(buffer.target(24_000), 4096);
+        assert_eq!(buffer.target(1000), 1000);
+    }
+
+    #[test]
+    fn underruns_grow_headroom_and_quiet_time_decays_without_sleeping() {
+        let now = Instant::now();
+        let mut buffer = SpeakerBuffer::new(now);
+        buffer.update(now, 480, 480, 1);
+        assert_eq!(buffer.headroom, 720);
+        buffer.update(now, 480, 480, 3); // retain multiple events between wakeups
+        assert_eq!(buffer.headroom, 1200);
+        buffer.update(now, 480, 480, 100);
+        assert_eq!(buffer.headroom, MAX_HEADROOM);
+        buffer.update(now + Duration::from_secs(29), 480, 480, 101);
+        buffer.update(now + Duration::from_secs(58), 480, 480, 101);
+        assert_eq!(buffer.headroom, MAX_HEADROOM);
+        for step in 1..=8 {
+            buffer.update(now + Duration::from_secs(29 + step * 30), 480, 480, 101);
+            assert_eq!(buffer.headroom, MAX_HEADROOM.saturating_sub(step as usize * STEP).max(480));
+        }
+        buffer.update(now + Duration::from_secs(300), 2400, 2400, 102);
+        assert_eq!(buffer.headroom, 2400); // never less than a whole callback
+        buffer.update(now + Duration::from_secs(305), 480, 480, 103);
+        assert_eq!(buffer.headroom, 2400); // an underrun must not shrink a formerly large callback's headroom
+    }
+
+    #[test]
+    fn target_never_overshoots_with_frame_sized_refills() {
+        let now = Instant::now();
         for callback in [120, 480, 512, 960, 2048] {
-            let target = speaker_target(callback, 24_000);
+            let mut buffer = SpeakerBuffer::new(now);
+            buffer.update(now, callback, callback, 0);
+            let target = buffer.target(24_000);
             assert!(target >= 2 * callback);
-            assert!(target <= callback * 2 + 240);
             let mut level = target;
             for _ in 0..100 {
                 level -= callback;
@@ -126,7 +214,6 @@ mod tests {
                 assert_eq!(level, target);
             }
         }
-        assert_eq!(speaker_target(48_000, 24_000), 24_000);
     }
 
     #[test]

@@ -32,6 +32,9 @@ pub struct AudioPorts {
 pub struct OutputTiming {
     pipeline: OnceLock<thread::Thread>,
     pub(crate) callback_samples: AtomicUsize,
+    pub(crate) callback_peak: AtomicUsize,
+    pub(crate) callback_max_samples: AtomicUsize,
+    pub(crate) headroom_samples: AtomicUsize,
     pub(crate) playing: AtomicBool,
     pub(crate) underruns: AtomicU64,
     pub(crate) underrun_samples: AtomicU64,
@@ -51,6 +54,8 @@ impl OutputTiming {
     /// `missing` excludes intentionally silent samples supplied by the pipeline.
     pub fn report(&self, samples: usize, missing: usize) {
         self.callback_samples.store(samples, Ordering::Relaxed);
+        // Keep every peak until the pipeline consumes it, even across multiple callbacks.
+        self.callback_peak.fetch_max(samples, Ordering::Relaxed);
         if missing > 0 && self.playing.load(Ordering::Relaxed) {
             self.underruns.fetch_add(1, Ordering::Relaxed);
             self.underrun_samples.fetch_add(missing as u64, Ordering::Relaxed);
@@ -309,6 +314,18 @@ mod tests {
         timing.playing.store(false, Ordering::Relaxed);
         timing.report(480, 480);
         assert_eq!(timing.underruns.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn callback_peak_survives_smaller_callbacks_until_consumed() {
+        let timing = OutputTiming::default();
+        for size in [480, 960, 240, 481, 480] {
+            timing.report(size, 0);
+        }
+        assert_eq!(timing.callback_samples.load(Ordering::Relaxed), 480);
+        assert_eq!(timing.callback_peak.swap(0, Ordering::Relaxed), 960);
+        timing.report(240, 0);
+        assert_eq!(timing.callback_peak.swap(0, Ordering::Relaxed), 240);
     }
 
     #[test]
