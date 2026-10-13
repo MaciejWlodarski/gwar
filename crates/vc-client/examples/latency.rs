@@ -4,9 +4,13 @@
 //! Marker count defaults to 100. Writes output.csv and output.csv.json.
 //! Set both LATENCY_URL (ws(s)://host:port/ws) and LATENCY_SERVER (IP:media-port)
 //! to use an existing server; otherwise starts a fresh loopback-only server.
+//! LATENCY_NET adds a local-only seeded UDP relay; see docs/latency.md.
 //! LATENCY_MIN_MS defaults to 5; below-floor matches fail the run.
 //! LATENCY_EXTRA_DELAY_MS adds a sample delay line to the fake output device.
 //! Exits with an error if more than 5% of markers are unmatched.
+#[path = "latency/netem.rs"]
+mod netem;
+
 use anyhow::Context;
 use rtrb::RingBuffer;
 use serde::Serialize;
@@ -342,10 +346,12 @@ async fn main() -> anyhow::Result<()> {
         (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => None,
         _ => anyhow::bail!("set both LATENCY_URL and LATENCY_SERVER, or neither"),
     };
+    let net = std::env::var("LATENCY_NET").ok().map(|source| netem::Spec::parse(&source)).transpose()?;
+    anyhow::ensure!(remote.is_none() || net.is_none(), "LATENCY_NET is supported only with the fresh local server");
     let settings = Settings::from_env()?;
     let mut tasks = ServerTasks { tasks: Vec::new(), data_dir: None };
     let result = tokio::select! {
-        result = measure(&output, count, remote, &mut tasks, settings) => result,
+        result = measure(&output, count, remote, &mut tasks, settings, net) => result,
         signal = shutdown_signal() => {
             signal?;
             Err(anyhow::anyhow!("measurement interrupted"))
@@ -407,20 +413,23 @@ async fn measure(
     remote: Option<(String, std::net::SocketAddr)>,
     tasks: &mut ServerTasks,
     settings: Settings,
+    net: Option<netem::Spec>,
 ) -> anyhow::Result<()> {
     if let Some((url, addr)) = remote {
-        return run(output, count, &url, addr, settings).await;
+        return run(output, count, &url, addr, settings, None).await;
     }
     // Keep transient server files beside the output, and never reuse state.
     let data_path = PathBuf::from(format!("{output}.data-{}", std::process::id()));
     std::fs::create_dir(&data_path).context("create temporary server data directory")?;
     let data = DataDir(data_path);
     let any = "127.0.0.1:0".parse().unwrap();
+    let relay = if net.is_some() { Some(netem::Relay::bind().await?) } else { None };
+    let advertise = relay.as_ref().map(|relay| relay.address()).transpose()?.unwrap_or(any);
     let server = vc_server::start(vc_server::Config {
         database: Some(data.0.join("server.sqlite3")),
         http_bind: any,
         media_bind: any,
-        media_advertise: any,
+        media_advertise: advertise,
         max_clients: 8,
         server_password: None,
         web_root: None,
@@ -445,11 +454,12 @@ async fn measure(
     .context("start local latency server")?;
 
     assert!(server.http.ip().is_loopback() && server.media.ip().is_loopback());
-    println!("local server http={} media={}", server.http, server.media);
+    println!("local server http={} media={} media_bind={}", server.http, server.media, server.media_bind);
     let url = format!("ws://{}/ws", server.http);
     tasks.tasks = server.tasks;
     tasks.data_dir = Some(data);
-    let result = run(output, count, &url, server.media, settings).await;
+    let net = relay.zip(net).map(|(relay, spec)| (relay, spec, server.media_bind));
+    let result = run(output, count, &url, server.media, settings, net).await;
     drop(server.core);
     drop(server.plane);
     tasks.shutdown().await;
@@ -462,6 +472,7 @@ async fn run(
     url: &str,
     server_addr: std::net::SocketAddr,
     settings: Settings,
+    mut net: Option<(netem::Relay, netem::Spec, std::net::SocketAddr)>,
 ) -> anyhow::Result<()> {
     let url = url.to_string();
     let a = connect(options(&url, "latency sender")).await?;
@@ -470,6 +481,13 @@ async fn run(
         client.connection.join(client.welcome.server.default_channel, None).await?;
     }
     let epoch = Instant::now();
+    let media_addr = if let Some((relay, spec, server)) = &mut net {
+        relay.start(*server, spec.clone(), epoch);
+        println!("netem relay={} spec={}", relay.address()?, spec.source);
+        relay.address()?
+    } else {
+        server_addr
+    };
     let sent = Arc::new(Mutex::new(Measurements::default()));
     let heard = Arc::new(Mutex::new(Measurements::default()));
     let va = voice::start(
@@ -483,7 +501,7 @@ async fn run(
             delay_samples: 0,
             callback_jitter: false,
         }),
-        server_addr,
+        media_addr,
     )
     .await?;
     let vb = voice::start(
@@ -497,7 +515,7 @@ async fn run(
             delay_samples: settings.extra_delay_ms * RATE / 1000,
             callback_jitter: settings.callback_jitter,
         }),
-        server_addr,
+        media_addr,
     )
     .await?;
     tokio::time::sleep(Duration::from_secs_f64(
@@ -519,6 +537,7 @@ async fn run(
         }
     }
     drop((va, vb));
+    let network = if let Some((relay, _, _)) = &mut net { Some(relay.finish().await?) } else { None };
     let sent = sent.lock().unwrap();
     let heard = heard.lock().unwrap();
     let onsets = detect_onsets(&heard.samples);
@@ -573,6 +592,7 @@ async fn run(
         })
         .collect::<Vec<_>>();
     let metadata = serde_json::json!({
+        "network": network,
         "voice_events": voice_events,
         "markers": marker_count,
         "n": count,
