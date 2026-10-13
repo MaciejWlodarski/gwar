@@ -69,7 +69,9 @@ const STALL: Duration = Duration::from_millis(100);
 const MAX_PACKETS: usize = 64;
 const MAX_TARGET: u64 = FRAME * 8;
 const QUIET_SHRINK: Duration = Duration::from_secs(1);
-const DEPTH_WINDOW: Duration = Duration::from_secs(1);
+// Retain sparse dips (including a 5 ms delay every three seconds). Corrections
+// must be slower than that jitter pattern; genuine surplus can take tens of seconds.
+const DEPTH_WINDOW: Duration = Duration::from_secs(5);
 const SAFETY: u64 = 120; // Retain 2.5 ms beyond the observed refill low-water mark.
 const FORCE_SHRINK: Duration = Duration::from_secs(2);
 const SHRINK_STEP: u64 = 240; // At most 5 ms per correction.
@@ -235,7 +237,7 @@ impl JitterBuffer {
     /// Sample queue + decoded tail immediately before each refill. The packet
     /// target includes one packet of batching; at the low-water point only the
     /// pending refill, additional jitter reserve and safety margin are required.
-    /// Arrival phase is never audio credit. A full second of observations must
+    /// Arrival phase is never audio credit. A full five seconds of observations must
     /// support a surplus, and any lower sample vetoes a correction immediately.
     pub(crate) fn observe_depth(&mut self, now: Instant, staged: usize, demand: usize) {
         if self.last_observation.is_some_and(|at| now.saturating_duration_since(at) >= STALL) {
@@ -358,6 +360,7 @@ impl JitterBuffer {
         if self.last_shrink.is_some_and(|at| now.saturating_duration_since(at) <= SHRINK_INTERVAL) {
             self.concealments_after_trim += 1;
         }
+        // PLC is not surplus evidence: require a fresh full window after any loss.
         self.clear_depth();
         self.above_since = None;
         Playout::Conceal(samples as usize)
@@ -424,32 +427,41 @@ mod tests {
     }
 
     #[test]
-    fn shrink_waits_for_quiet_or_deadline_and_never_repeats_immediately() {
+    fn shrink_requires_a_full_window_after_each_correction_or_concealment() {
         let mut jb = JitterBuffer::new();
         let now = Instant::now();
-        // Prequeue a burst without conflating its arrival timing with the shrink policy.
-        for i in 0..10 {
-            jb.push_at(i * FRAME, FRAME, vec![1], now, Clock::Rtp);
+        // Continuous surplus observations cannot bypass the window, even after
+        // the nonquiet deadline. Repeat after a correction and then after PLC.
+        for (round, start_ms) in [(0, 0), (1, 5000), (2, 15020)] {
+            if round == 2 {
+                // Rebuild mature evidence before the loss so PLC must discard it.
+                for ms in (10020..=15020).step_by(20) {
+                    jb.observe_depth(now + Duration::from_millis(ms), 0, FRAME as usize);
+                }
+                jb.packets.clear();
+                assert_eq!(jb.pop_for(now + Duration::from_millis(start_ms), FRAME as usize), Playout::Conceal(960));
+            }
+            // Isolate depth policy from arrival-stall recovery in this fixture.
+            jb.arrival = None;
+            let next = jb.next.unwrap_or(0);
+            for i in 0..10 {
+                jb.push_at(next + i * FRAME, FRAME, vec![1], now + Duration::from_millis(start_ms), Clock::Rtp);
+            }
+            for ms in (start_ms..start_ms + 5000).step_by(20) {
+                let at = now + Duration::from_millis(ms);
+                jb.observe_depth(at, 0, FRAME as usize);
+                if ms == start_ms + 4980 {
+                    assert_eq!(pop_at(&mut jb, at, false), packet(1));
+                }
+            }
+            assert_eq!(
+                pop_at(&mut jb, now + Duration::from_millis(start_ms + 5000), false),
+                Playout::Packet { data: vec![1], skip: 240, quiet_only: true, fade: false }
+            );
+            assert_eq!(pop_at(&mut jb, now + Duration::from_millis(start_ms + 5000), true), packet(1));
+            assert_eq!(jb.trim_events, round + 1);
         }
-        assert_eq!(pop_at(&mut jb, now, false), packet(1));
-        for ms in (20..=1000).step_by(20) {
-            jb.observe_depth(now + Duration::from_millis(ms), 0, FRAME as usize);
-        }
-        assert_eq!(pop_at(&mut jb, now + Duration::from_millis(1000), false), packet(1));
-        assert_eq!(
-            pop_at(&mut jb, now + Duration::from_millis(1020), true),
-            Playout::Packet { data: vec![1], skip: 240, quiet_only: true, fade: false }
-        );
-        assert_eq!(pop_at(&mut jb, now + Duration::from_millis(1020), true), packet(1));
-        assert_eq!(pop_at(&mut jb, now + Duration::from_millis(1040), true), packet(1));
-        assert_eq!(pop_at(&mut jb, now + Duration::from_millis(1060), true), packet(1));
-        for ms in (1080..=3000).step_by(20) {
-            jb.observe_depth(now + Duration::from_millis(ms), 0, FRAME as usize);
-        }
-        assert_eq!(
-            pop_at(&mut jb, now + Duration::from_secs(3), false),
-            Playout::Packet { data: vec![1], skip: 240, quiet_only: true, fade: false }
-        );
+        assert_eq!(jb.concealments, 1);
     }
 
     #[test]

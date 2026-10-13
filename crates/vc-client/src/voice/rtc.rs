@@ -3,7 +3,7 @@
 
 use std::{net::IpAddr, net::SocketAddr, time::Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use str0m::{
     Candidate, Event, Input, Output, Rtc,
     change::SdpAnswer,
@@ -55,6 +55,12 @@ where
     let (offer, pending) = api.apply().context("create offer")?;
     let answer = signal(offer.to_sdp_string()).await?;
     rtc.sdp_api().accept_answer(pending, SdpAnswer::from_sdp_string(&answer)?)?;
+    for mid in &slots {
+        ensure!(
+            rtc.media(*mid).is_some_and(|media| media.remote_extmap().id_of(slot_generation_extension()).is_some()),
+            "native voice answer lacks the slot-generation extension on receive media {mid}"
+        );
+    }
 
     tokio::spawn(async move {
         let _lost = LostOnDrop(counters.clone());
@@ -132,4 +138,57 @@ where
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use str0m::change::SdpOffer;
+
+    #[tokio::test]
+    async fn start_requires_generation_on_every_receive_slot() {
+        // Keep the extension on the microphone, then omit it from each receive
+        // slot in turn. A session-wide or first-slot-only check is insufficient.
+        for omitted in (1..=AUDIO_SLOTS).map(Some).chain([None, Some(0)]) {
+            let (_outgoing, receiver) = mpsc::channel(1);
+            let (incoming, _receiver) = std::sync::mpsc::sync_channel(1);
+            let result = start(
+                |offer| async move {
+                    let mut server = Rtc::builder()
+                        .set_extension(SLOT_GENERATION_ID, slot_generation_extension())
+                        .clear_codecs()
+                        .enable_opus(true, false)
+                        .build(Instant::now());
+                    let answer = server.sdp_api().accept_offer(SdpOffer::from_sdp_string(&offer)?)?.to_sdp_string();
+                    let mut media = None;
+                    let answer = answer
+                        .lines()
+                        .filter(|line| {
+                            if line.starts_with("m=") {
+                                media = Some(media.map_or(0, |i| i + 1));
+                            }
+                            !(omitted.is_some()
+                                && media == omitted
+                                && line.starts_with("a=extmap:")
+                                && line.contains(slot_generation_extension().as_uri()))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\r\n");
+                    Ok(format!("{answer}\r\n"))
+                },
+                "127.0.0.1".parse().unwrap(),
+                receiver,
+                incoming,
+                Arc::new(Counters::default()),
+                Arc::new(OutputTiming::default()),
+            )
+            .await;
+            if omitted.is_some_and(|i| i > 0) {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("answer lacks the slot-generation extension on receive media"), "{error}");
+            } else {
+                result.unwrap();
+            }
+        }
+    }
 }

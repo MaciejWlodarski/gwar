@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn quiet_shrink_preserves_speech_onset_after_silence_or_plc() {
-        for (plc, delay) in [(false, 1200), (true, 1200), (false, 2500), (true, 2500)] {
+        for (plc, delay) in [(false, 1200), (true, 1200), (false, 5200), (true, 5200)] {
             let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
             let mut reference = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
             let mut slot = Slot::new().unwrap();
@@ -327,13 +327,13 @@ mod tests {
             slot.buffer.push(i * 960, 960, encode(&encoder, false));
         }
         slot.mix_into(&mut [0.0; 960], 1.0, now).unwrap();
-        for ms in (20..=1000).step_by(20) {
+        for ms in (20..=5000).step_by(20) {
             slot.buffer.observe_depth(now + Duration::from_millis(ms), 0, 960);
         }
-        slot.mix_into(&mut [0.0; 1], 1.0, now + Duration::from_millis(1000)).unwrap();
+        slot.mix_into(&mut [0.0; 1], 1.0, now + Duration::from_millis(5000)).unwrap();
         assert_eq!(slot.buffer.shrink_samples, 240);
         assert_eq!(slot.fade_left, 119);
-        slot.mix_into(&mut [0.0; 119], 1.0, now + Duration::from_millis(1000)).unwrap();
+        slot.mix_into(&mut [0.0; 119], 1.0, now + Duration::from_millis(5000)).unwrap();
         assert_eq!(slot.fade_left, 0);
     }
 
@@ -391,7 +391,7 @@ mod tests {
                         // Cover one refill when a packet arrives just after it.
                         slot.end = callback + excess;
                         let mut packet = 0u64;
-                        let mut at_five_seconds = 0;
+                        let mut at_twenty_seconds = 0;
                         for tick in (0..60 * 48_000u64).step_by(callback) {
                             let at = now + Duration::from_secs_f64(tick as f64 / 48_000.0);
                             loop {
@@ -411,8 +411,8 @@ mod tests {
                                 packet += 1;
                             }
                             slot.mix_into(&mut vec![0.0; callback], 1.0, at).unwrap();
-                            if tick == 5 * 48_000 {
-                                at_five_seconds = slot.buffer.shrink_samples;
+                            if tick == 20 * 48_000 {
+                                at_twenty_seconds = slot.buffer.shrink_samples;
                             }
                         }
                         let label = format!("{clock:?}, callback={callback}, phase={phase}, excess={excess}");
@@ -421,12 +421,52 @@ mod tests {
                         if excess == 0 {
                             assert_eq!(slot.buffer.shrink_samples, 0, "{label}: tail is refill margin");
                         } else {
-                            assert!(at_five_seconds >= 240, "{label}: persistent surplus did not converge");
+                            assert!(at_twenty_seconds >= 240, "{label}: persistent surplus did not converge");
                             assert!(slot.buffer.shrink_samples <= excess as u64, "{label}");
                         }
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn sparse_mild_jitter_keeps_refill_margin_in_both_clocks() {
+        use super::super::{Incoming, jitter::Clock};
+        // Regression from target/review-r3-final/slot_probe.rs: a one-second
+        // window produced 38 trims and 10 concealments in each clock.
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
+            let mut slot = Slot::new().unwrap();
+            let now = Instant::now();
+            slot.end = 480; // One 10 ms refill of staged PCM, not removable surplus.
+            let mut packet = 0u64;
+            for tick in (0..60 * 48_000u64).step_by(480) {
+                let at = now + Duration::from_secs_f64(tick as f64 / 48_000.0);
+                loop {
+                    let scheduled = packet * 960;
+                    let late = scheduled > 0 && scheduled.is_multiple_of(3 * 48_000);
+                    let arrival = scheduled + if late { 5 * 48 } else { 0 };
+                    if arrival > tick {
+                        break;
+                    }
+                    slot.receive(Incoming {
+                        slot: 0,
+                        generation: None,
+                        rtp_time: scheduled,
+                        arrived: now + Duration::from_secs_f64(arrival as f64 / 48_000.0),
+                        clock,
+                        opus: encode(&encoder, true),
+                    })
+                    .unwrap();
+                    packet += 1;
+                }
+                slot.mix_refill(&mut [0.0; 480], 1.0, at, 480).unwrap();
+            }
+            assert_eq!(slot.buffer.trim_events, 0, "{clock:?}");
+            assert_eq!(slot.buffer.shrink_samples, 0, "{clock:?}");
+            assert_eq!(slot.buffer.concealments, 0, "{clock:?}");
+            assert_eq!(slot.buffer.concealments_after_trim, 0, "{clock:?}");
         }
     }
 
@@ -444,7 +484,7 @@ mod tests {
                     let mut last_correction = None;
                     let mut corrected = 0;
                     let mut converged = None;
-                    for tick in (0..480_000).step_by(callback) {
+                    for tick in (0..30 * 48_000).step_by(callback) {
                         let at = now + Duration::from_secs_f64(tick as f64 / 48_000.0);
                         if tick % 960 == 0 {
                             // Nonquiet carrier: convergence must use the forced deadline.
@@ -455,9 +495,9 @@ mod tests {
                         if total > corrected {
                             assert!(total - corrected <= 240);
                             assert!(total <= excess as u64);
-                            assert!(tick >= 96_000, "forced correction before two seconds");
+                            assert!(tick >= 5 * 48_000, "correction before the full observation window");
                             if let Some(previous) = last_correction {
-                                assert!(tick - previous >= 48_000, "corrections less than one second apart");
+                                assert!(tick - previous >= 5 * 48_000, "corrections less than five seconds apart");
                             }
                             last_correction = Some(tick);
                             corrected = total;
@@ -467,7 +507,7 @@ mod tests {
                         }
                     }
                     assert!(
-                        converged.is_some_and(|tick| tick <= 5 * 48_000),
+                        converged.is_some_and(|tick| tick <= 25 * 48_000),
                         "{clock:?}, excess={excess}, callback={callback}, corrected={corrected}"
                     );
                     // Preserve 2.5 ms of safety; residual corrections below

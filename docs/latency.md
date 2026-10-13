@@ -166,12 +166,15 @@ receiver underflows also include idle callbacks, whereas playout underruns count
 only callbacks during playback.
 
 Fractional corrections use the minimum queue + staged PCM margin observed
-before refills over a full trailing second. The margin excludes the pending
-refill, adaptive jitter reserve beyond packet batching, and 120 samples (2.5 ms)
+before refills over a full trailing five seconds. This retains sparse low-water
+evidence such as a 5 ms packet delay every three seconds. The margin excludes
+the pending refill, adaptive jitter reserve beyond packet batching, and 120 samples (2.5 ms)
 of safety. Arrival phase contributes no credit. Each correction removes at most
-240 samples, then rebuilds the observation window; nonquiet audio still waits
-for the two-second deadline and speech onsets remain protected. Surplus
-below 120 samples is not corrected.
+240 samples, then rebuilds the observation window. Every concealment also
+requires a fresh full window. Genuine surplus may take tens of seconds to
+converge; the two-second nonquiet deadline cannot bypass the five-second
+window, and speech onsets remain protected. Surplus below 120 samples is not
+corrected.
 
 For a variable output device, invoke the example directly with
 `LATENCY_CALLBACK_JITTER=1 target/release/examples/latency output.csv 100`.
