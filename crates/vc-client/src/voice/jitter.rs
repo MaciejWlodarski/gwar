@@ -50,7 +50,7 @@ pub struct JitterBuffer {
     recovering: Option<Recovery>,
     clock: Clock,
     arrival: Option<(u64, Instant, u64)>,
-    jitter: f64,
+    delay: DelayEstimator,
     above_since: Option<Instant>,
     surplus: u64,
     low_water: VecDeque<(Instant, u64)>,
@@ -78,6 +78,98 @@ const FORCE_SHRINK: Duration = Duration::from_secs(2);
 const SHRINK_STEP: u64 = 240; // At most 5 ms per correction.
 const SHRINK_INTERVAL: Duration = Duration::from_secs(1);
 
+// Interval maxima give a short spike every few seconds meaningful weight even
+// with 10 ms packets. The rolling fastest transit removes offset and bounds
+// +/-500 ppm drift to 1 ms; history outlives a single minimum window.
+const DELAY_WINDOW: Duration = Duration::from_secs(2);
+const DELAY_INTERVAL: Duration = Duration::from_millis(200);
+const DELAY_BUCKET: u64 = 48; // 1 ms, rounded upward.
+const DELAY_BINS: usize = (MAX_TARGET / DELAY_BUCKET) as usize + 1;
+
+struct DelayEstimator {
+    transit: f64,
+    fastest: VecDeque<(Instant, f64)>,
+    histogram: [f64; DELAY_BINS],
+    interval: Option<Instant>,
+    maximum: u64,
+    recent: VecDeque<u64>,
+    quantile: u64,
+}
+
+impl DelayEstimator {
+    fn new() -> Self {
+        Self {
+            transit: 0.0,
+            fastest: VecDeque::new(),
+            histogram: [0.0; DELAY_BINS],
+            interval: None,
+            maximum: 0,
+            recent: VecDeque::new(),
+            quantile: 0,
+        }
+    }
+
+    fn update(&mut self, now: Instant, elapsed: f64, media: f64, observe: bool) {
+        if self.fastest.is_empty() {
+            self.fastest.push_back((now - Duration::from_secs_f64(elapsed), self.transit));
+        }
+        self.transit += elapsed * 48_000.0 - media;
+        while self.fastest.front().is_some_and(|&(at, _)| now.saturating_duration_since(at) > DELAY_WINDOW) {
+            self.fastest.pop_front();
+        }
+        while self.fastest.back().is_some_and(|&(_, value)| value >= self.transit) {
+            self.fastest.pop_back();
+        }
+        // Bound memory even for a peer sending faster than the minimum frame duration.
+        if self.fastest.len() >= 1024 {
+            self.fastest.pop_front();
+        }
+        self.fastest.push_back((now, self.transit));
+        if !observe {
+            self.interval = None;
+            self.maximum = 0;
+            self.recent.clear();
+            return;
+        }
+        let delay = (self.transit - self.fastest.front().unwrap().1).ceil().clamp(0.0, MAX_TARGET as f64) as u64;
+        self.maximum = self.maximum.max(delay);
+        self.recent.push_back(delay);
+        if self.recent.len() > 3 {
+            self.recent.pop_front();
+        }
+        let since = *self.interval.get_or_insert(now);
+        let duration = now.saturating_duration_since(since);
+        if duration < DELAY_INTERVAL {
+            return;
+        }
+        // Time-based forgetting keeps 10/20 ms streams comparable. Normalize by
+        // actual mass so startup learns immediately, without a fictitious prior.
+        let decay = (-duration.as_secs_f64() / 20.0).exp();
+        for weight in &mut self.histogram {
+            *weight *= decay;
+        }
+        self.histogram[self.maximum.div_ceil(DELAY_BUCKET) as usize] += 1.0;
+        let threshold = self.histogram.iter().sum::<f64>() * 0.97;
+        let mut mass = 0.0;
+        for (i, weight) in self.histogram.iter().enumerate() {
+            mass += weight;
+            if mass >= threshold {
+                self.quantile = i as u64 * DELAY_BUCKET;
+                break;
+            }
+        }
+        self.interval = Some(now);
+        self.maximum = 0;
+    }
+
+    fn target(&self) -> u64 {
+        // Three consecutive elevated arrivals react before the next histogram
+        // interval, but one isolated outlier cannot pin this fast path.
+        let sustained = if self.recent.len() == 3 { *self.recent.iter().min().unwrap() } else { 0 };
+        self.quantile.max(sustained)
+    }
+}
+
 impl Default for JitterBuffer {
     fn default() -> Self {
         Self::new()
@@ -95,7 +187,7 @@ impl JitterBuffer {
             recovering: None,
             clock: Clock::Rtp,
             arrival: None,
-            jitter: 0.0,
+            delay: DelayEstimator::new(),
             above_since: None,
             surplus: 0,
             low_water: VecDeque::new(),
@@ -168,12 +260,9 @@ impl JitterBuffer {
                     Clock::Rtp => (ts - last_ts) as f64,
                     Clock::Sequence => (ts - last_ts) as f64 / FRAME as f64 * last_samples as f64,
                 };
-                // Fast attack, two-second release. Ignore reordered packets for the estimator.
-                if self.recovering.is_none() {
-                    self.jitter = (self.jitter * (-elapsed / 2.0).exp())
-                        .max((elapsed * 48_000.0 - expected).abs())
-                        .min(MAX_TARGET as f64);
-                }
+                // Keep the transit clock through recovery, without teaching the
+                // histogram that a drained delivery burst is normal jitter.
+                self.delay.update(now, elapsed, expected, self.recovering.is_none());
                 self.arrival = Some((ts, now, samples));
             }
         } else {
@@ -197,7 +286,7 @@ impl JitterBuffer {
     }
 
     pub(crate) fn target_samples(&self) -> u64 {
-        (self.jitter.ceil() as u64 + 240).clamp(self.frame_samples(), MAX_TARGET)
+        (self.delay.target() + 240).clamp(self.frame_samples(), MAX_TARGET)
     }
 
     pub(crate) fn playing(&self) -> bool {
@@ -212,7 +301,7 @@ impl JitterBuffer {
         self.held = 0;
         self.recovering = None;
         self.arrival = None;
-        self.jitter = 0.0;
+        self.delay = DelayEstimator::new();
         self.above_since = None;
         self.clear_depth();
         self.last_shrink = None;
@@ -393,6 +482,106 @@ mod tests {
             *quiet_only = true;
         }
         result
+    }
+
+    #[test]
+    fn relative_delay_retains_periodic_spikes_for_both_packet_durations_and_clocks() {
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            for samples in [480, 960] {
+                let mut jb = JitterBuffer::new();
+                let start = Instant::now();
+                let mut previous = 0;
+                for i in 0..60 * 48_000 / samples {
+                    let media = i * samples;
+                    // A 40 ms egress stall every three seconds, preserving order.
+                    let phase = media % 144_000;
+                    let arrival = if media >= 144_000 && phase < 1920 { media + 1920 - phase } else { media };
+                    let ts = i * if clock == Clock::Sequence { FRAME } else { samples };
+                    jb.push_at(ts, samples, vec![1], start + Duration::from_secs_f64(arrival as f64 / 48_000.0), clock);
+                    jb.packets.clear();
+                    if media > 10 * 48_000 {
+                        assert!(jb.target_samples() >= 1920, "{clock:?}/{samples}/{media}: {}", jb.target_samples());
+                    }
+                    assert!(arrival >= previous);
+                    previous = arrival;
+                }
+                // A recovered network eventually releases the tail of the histogram.
+                for i in 60 * 48_000 / samples..180 * 48_000 / samples {
+                    jb.push_at(
+                        i * if clock == Clock::Sequence { FRAME } else { samples },
+                        samples,
+                        vec![1],
+                        start + Duration::from_secs_f64((i * samples) as f64 / 48_000.0),
+                        clock,
+                    );
+                    jb.packets.clear();
+                }
+                assert_eq!(jb.delay.target(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn estimator_ignores_reordering_and_duplicate_arrivals() {
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            for samples in [480, 960] {
+                let mut jb = JitterBuffer::new();
+                let now = Instant::now();
+                let step = if clock == Clock::Sequence { FRAME } else { samples };
+                jb.push_at(0, samples, vec![0], now, clock);
+                jb.push_at(
+                    2 * step,
+                    samples,
+                    vec![2],
+                    now + Duration::from_secs_f64(2.0 * samples as f64 / 48_000.0),
+                    clock,
+                );
+                let arrival = jb.arrival;
+                let recent = jb.delay.recent.clone();
+                jb.push_at(step, samples, vec![1], now + Duration::from_millis(50), clock);
+                jb.push_at(2 * step, samples, vec![2], now + Duration::from_millis(60), clock);
+                assert_eq!(jb.arrival, arrival);
+                assert_eq!(jb.delay.recent, recent);
+                assert_eq!(jb.delay.target(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn relative_delay_cancels_offset_and_bounds_clock_drift() {
+        for samples in [480, 960] {
+            for ppm in [-500.0, 500.0] {
+                let mut delay = DelayEstimator::new();
+                let start = Instant::now();
+                let elapsed = samples as f64 / 48_000.0 * (1.0 + ppm / 1_000_000.0);
+                for i in 1..600 * 48_000 / samples {
+                    delay.update(start + Duration::from_secs_f64(i as f64 * elapsed), elapsed, samples as f64, true);
+                    assert!(delay.target() <= 2 * DELAY_BUCKET, "{ppm}: {}", delay.target());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sustained_increase_attacks_before_histogram_interval_and_is_capped() {
+        for samples in [480, 960] {
+            let mut delay = DelayEstimator::new();
+            let start = Instant::now();
+            let frame = Duration::from_secs_f64(samples as f64 / 48_000.0);
+            for i in 1..=101 {
+                delay.update(start + frame * i, frame.as_secs_f64(), samples as f64, true);
+            }
+            let mut now = start + frame * 101 + Duration::from_millis(60);
+            for i in 0..3 {
+                now += frame;
+                delay.update(now, frame.as_secs_f64() + if i == 0 { 0.06 } else { 0.0 }, samples as f64, true);
+            }
+            assert_eq!(delay.quantile, 0);
+            assert!(delay.target() >= 2880);
+            now += Duration::from_secs(1);
+            delay.update(now, 1.0, samples as f64, true);
+            assert!(delay.target() <= MAX_TARGET);
+        }
     }
 
     #[test]
