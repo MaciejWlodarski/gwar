@@ -53,6 +53,7 @@ const SLOT_REUSE: Duration = Duration::from_millis(800);
 /// RFC 6464 level (negative dBov) above which a frame counts as speech.
 const SPEECH_LEVEL: i8 = -50;
 const SAMPLE_RATE: u64 = 48_000;
+const MIN_PAUSE_SAMPLES: u64 = 1920; // Retain 40 ms of scheduling tolerance.
 
 struct Slot {
     mid: Mid,
@@ -62,6 +63,23 @@ struct Slot {
     generation: u16,
     last_write: Option<Instant>,
     last_samples: u32,
+}
+
+impl Slot {
+    fn advance(&mut self, now: Instant, samples: u32) {
+        self.ticks += match self.last_write {
+            Some(last) => {
+                let elapsed = now.duration_since(last).as_micros() as u64 * SAMPLE_RATE / 1_000_000;
+                let frame = u64::from(self.last_samples);
+                // Preserve the 20 ms path's scheduling tolerance for shorter
+                // frames. A delayed 10 ms batch is not a new talk spurt.
+                if elapsed > (frame * 2).max(MIN_PAUSE_SAMPLES) { elapsed.div_ceil(frame) * frame } else { frame }
+            }
+            None => SAMPLE_RATE,
+        };
+        self.last_write = Some(now);
+        self.last_samples = samples;
+    }
 }
 
 struct Peer {
@@ -122,16 +140,7 @@ impl Peer {
         slot.last_used = now;
         // RTP time must advance with real time across pauses and speaker
         // changes so the browser's jitter buffer sees a clean discontinuity.
-        slot.ticks += match slot.last_write {
-            Some(last) => {
-                let elapsed = now.duration_since(last).as_micros() as u64 * SAMPLE_RATE / 1_000_000;
-                let frame = u64::from(slot.last_samples);
-                if elapsed > frame * 2 { elapsed.div_ceil(frame) * frame } else { frame }
-            }
-            None => SAMPLE_RATE,
-        };
-        slot.last_write = Some(now);
-        slot.last_samples = packet.samples;
+        slot.advance(now, packet.samples);
         let Some(writer) = self.rtc.writer(slot.mid) else { return };
         let Some(pt) = writer.payload_params().find(|p| p.spec().codec == Codec::Opus).map(|p| p.pt()) else {
             return;
@@ -397,4 +406,56 @@ fn ingest(peer: &mut Peer, data: &MediaData, routing: &SharedRouting, core: &Cor
     }
     let samples = opus::packet_samples(&data.data)?;
     Some(AudioPacket { from: peer.session, opus: Arc::clone(&data.data), samples })
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    #[test]
+    fn delayed_ten_ms_batch_does_not_invent_missing_media() {
+        let now = Instant::now();
+        let mut slot = Slot {
+            mid: "0".into(),
+            source: None,
+            last_used: now,
+            ticks: 0,
+            generation: 0,
+            last_write: None,
+            last_samples: 960,
+        };
+        // The third callback is 11 ms late; its successor is already queued.
+        // A 2-packet threshold would insert two nonexistent lost frames here.
+        for (index, ms) in [0, 10, 31, 31, 40, 50].into_iter().enumerate() {
+            slot.advance(now + Duration::from_millis(ms), 480);
+            assert_eq!(slot.ticks, SAMPLE_RATE + index as u64 * 480);
+        }
+    }
+
+    #[test]
+    fn mixed_senders_advance_by_previous_packet_duration_and_pauses_by_wall_time() {
+        let now = Instant::now();
+        let mut slot = Slot {
+            mid: "0".into(),
+            source: None,
+            last_used: now,
+            ticks: 0,
+            generation: 0,
+            last_write: None,
+            last_samples: 960,
+        };
+        for (ms, samples, ticks) in [
+            (0, 480, 48000),
+            (10, 480, 48480),
+            (20, 960, 48960),
+            (40, 480, 49920),
+            (50, 960, 50400),
+            (1050, 480, 98400),
+            (1060, 480, 98880),
+        ] {
+            slot.advance(now + Duration::from_millis(ms), samples);
+            assert_eq!(slot.ticks, ticks);
+            assert_eq!(slot.last_samples, samples);
+        }
+    }
 }

@@ -71,6 +71,7 @@ where
         let mut buf = vec![0u8; 2048];
         // RTP time follows the wall clock so pauses in speech stay pauses.
         let epoch = Instant::now();
+        let mut last_ticks = None;
         loop {
             let deadline = loop {
                 match rtc.poll_output() {
@@ -117,7 +118,8 @@ where
             tokio::select! {
                 frame = outgoing.recv() => {
                     let Some(frame) = frame else { return };
-                    let ticks = (epoch.elapsed().as_micros() as u64 * 48 / 1000) / 960 * 960;
+                    let ticks = send_ticks(epoch.elapsed(), last_ticks);
+                    last_ticks = Some(ticks);
                     let pt = rtc.writer(mic).and_then(|w| w.payload_params().find(|p| p.spec().codec == Codec::Opus).map(|p| p.pt()));
                     if let (Some(writer), Some(pt)) = (rtc.writer(mic), pt) {
                         {
@@ -142,6 +144,14 @@ where
         }
     });
     Ok(())
+}
+
+// Quantize to capture duration, but never reuse a timestamp when callbacks or
+// transport wakeups batch multiple packets. Keep wall-clock gaps across pauses.
+fn send_ticks(elapsed: std::time::Duration, last: Option<u64>) -> u64 {
+    let frame = super::FRAME as u64;
+    let wall = (elapsed.as_micros() as u64 * 48 / 1000) / frame * frame;
+    wall.max(last.map_or(0, |ticks| ticks + frame))
 }
 
 // str0m discards extmap directions. Read the answerer's (server's) direction
@@ -170,6 +180,16 @@ fn answer_sends_generation(answer: &str, mid: Mid, id: u8) -> bool {
 mod tests {
     use super::*;
     use str0m::change::SdpOffer;
+
+    #[test]
+    fn timestamp_quantum_tracks_capture_and_batches_do_not_reuse_ticks() {
+        use std::time::Duration;
+        let frame = super::super::FRAME as u64;
+        assert_eq!(send_ticks(Duration::ZERO, None), 0);
+        assert_eq!(send_ticks(Duration::ZERO, Some(0)), frame);
+        assert_eq!(send_ticks(Duration::from_millis(20), Some(frame)), 960.max(2 * frame));
+        assert_eq!(send_ticks(Duration::from_secs(1), Some(960)), 48_000);
+    }
 
     #[test]
     fn generation_direction_matches_the_media_and_mapping() {
@@ -205,12 +225,17 @@ mod tests {
             let (incoming, _receiver) = std::sync::mpsc::sync_channel(1);
             let result = start(
                 |offer| async move {
+                    assert!(offer.contains("minptime=10"));
+                    assert!(offer.contains("useinbandfec=1"));
+                    assert!(!offer.contains("a=ptime:") && !offer.contains("a=maxptime:"));
                     let mut server = Rtc::builder()
                         .set_extension(SLOT_GENERATION_ID, slot_generation_extension())
                         .clear_codecs()
                         .enable_opus(true, false)
                         .build(Instant::now());
                     let answer = server.sdp_api().accept_offer(SdpOffer::from_sdp_string(&offer)?)?.to_sdp_string();
+                    assert!(answer.contains("minptime=10"));
+                    assert!(!answer.contains("a=ptime:") && !answer.contains("a=maxptime:"));
                     let mut media = None;
                     let answer = answer
                         .lines()
