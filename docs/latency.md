@@ -84,8 +84,8 @@ blocking (XNU demotes it after overrunning its computation budget; MMCSS keeps a
 share for ordinary threads). Linux stays timeshare: `SCHED_FIFO` has no such
 backstop beyond global RT throttling, and an always-ready capture device (ALSA
 `null`) would let the pipeline hold a core. Each pipeline pass also takes only
-the capture samples and packets queued when it starts, so a producer faster than
-real time cannot starve playback. The guard restores the old policy on exit;
+the capture samples queued when its capture drain starts and at most 256
+incoming packets, so a producer faster than real time cannot starve playback. The guard restores the old policy on exit;
 refused promotion logs once at debug level and voice continues. CPAL's
 `realtime` feature also enables WASAPI callback promotion; CoreAudio owns its RT
 callbacks. Mozilla's `audio_thread_priority` (used by CPAL off macOS) would add
