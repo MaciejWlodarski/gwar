@@ -375,10 +375,7 @@ async fn run(
                 _ => {}
             },
             Step::Cmd(None) | Step::Cmd(Some(PuppetCmd::Quit)) => {
-                if let Some(data) = packetizer.flush() {
-                    send_audio(&mut con, &mut packet_id, &data);
-                    send_audio(&mut con, &mut packet_id, &[]);
-                }
+                end_spurt(&mut con, &mut packet_id, &mut packetizer);
                 let _ = con.disconnect(DisconnectOptions::new());
                 // Let the disconnect packet go out (and be acknowledged) before dropping.
                 let _ = tokio::time::timeout(Duration::from_secs(2), con.events().for_each(|_| async {})).await;
@@ -391,6 +388,10 @@ async fn run(
                     queue_nickname(&mut con, &mut pending, base, 1, nickname_generation)?;
                     continue;
                 }
+                // A held half-packet was captured in the old channel; end it there.
+                if let PuppetCmd::Move(_) = cmd {
+                    end_spurt(&mut con, &mut packet_id, &mut packetizer);
+                }
                 let label = format!("{cmd:?}").split([' ', '(']).next().unwrap_or_default().to_owned();
                 if let Some(command) = command_for(clid, cmd)
                     && let Ok(handle) = command.send_with_result(&mut con)
@@ -399,6 +400,13 @@ async fn run(
                 }
             }
         }
+    }
+}
+
+fn end_spurt(con: &mut Connection, packet_id: &mut u16, packetizer: &mut super::packetizer::Packetizer) {
+    if let Some(data) = packetizer.flush() {
+        send_audio(con, packet_id, &data);
+        send_audio(con, packet_id, &[]);
     }
 }
 
