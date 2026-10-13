@@ -36,7 +36,7 @@ pub enum SourceClock {
     TeamSpeak {
         id: u16,
         whisper: bool,
-        spurt: u16,
+        spurt: u32,
     },
 }
 
@@ -58,7 +58,7 @@ impl SourceClock {
             ) if whisper == was_whisper => {
                 match spurt.wrapping_sub(old_spurt) {
                     0 => {}
-                    newer if newer < 0x8000 => return Ok(None),
+                    newer if newer < 1 << 31 => return Ok(None),
                     _ => return Err(()),
                 }
                 let delta = id.wrapping_sub(old);

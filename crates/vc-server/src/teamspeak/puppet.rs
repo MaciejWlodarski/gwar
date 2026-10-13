@@ -12,7 +12,10 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU32, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -45,6 +48,9 @@ pub struct Shared {
     heard: Mutex<HashMap<u16, Heard>>,
     /// Whisper streams, per TeamSpeak speaker and targeted user.
     whispers: Mutex<HashMap<(u16, SessionId), Whisper>>,
+    /// Spurt numbers, shared so a stream recreated after eviction never
+    /// repeats one an SFU slot still remembers.
+    spurts: AtomicU32,
 }
 
 /// Recent frames of one TeamSpeak speaker, shared across receiving puppets.
@@ -55,14 +61,14 @@ struct Heard {
     at: Instant,
     talking: bool,
     clock: Option<SourceClock>,
-    spurt: u16,
+    spurt: u32,
 }
 
 struct Whisper {
     at: Instant,
     talking: bool,
     clock: Option<SourceClock>,
-    spurt: u16,
+    spurt: u32,
 }
 
 /// Only a recent id orders the next one; see the SFU slot's STALE_CLOCK.
@@ -79,7 +85,18 @@ fn digest(data: &[u8]) -> u64 {
 
 impl Shared {
     pub fn new(core: CoreHandle, plane: MediaPlane) -> Self {
-        Self { core, plane, mirrors: RwLock::default(), heard: Mutex::default(), whispers: Mutex::default() }
+        Self {
+            core,
+            plane,
+            mirrors: RwLock::default(),
+            heard: Mutex::default(),
+            whispers: Mutex::default(),
+            spurts: AtomicU32::new(0),
+        }
+    }
+
+    fn next_spurt(&self) -> u32 {
+        self.spurts.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
     }
 
     /// Publishes one frame from TeamSpeak client `from` unless another
@@ -125,7 +142,7 @@ impl Shared {
         let Some(samples) = opus::packet_samples(opus) else { return };
         if !entry.talking {
             entry.talking = true;
-            entry.spurt = entry.spurt.wrapping_add(1);
+            entry.spurt = self.next_spurt();
             self.core.talking(session, true);
         }
         let clock = SourceClock::TeamSpeak { id, whisper: false, spurt: entry.spurt };
@@ -152,7 +169,7 @@ impl Shared {
             let Some(samples) = opus::packet_samples(opus) else { return };
             if !stream.talking {
                 stream.talking = true;
-                stream.spurt = stream.spurt.wrapping_add(1);
+                stream.spurt = self.next_spurt();
             }
             let clock = SourceClock::TeamSpeak { id, whisper: true, spurt: stream.spurt };
             stream.clock = Some(clock);
@@ -563,6 +580,58 @@ mod tests {
             if variant > 1 {
                 assert!(name.ends_with(&format!(" ({variant})")));
             }
+        }
+    }
+
+    /// Spurt numbers of the frames `shared` forwards to the SFU.
+    fn spurts(rx: &mut mpsc::Receiver<crate::media::webrtc::MediaCmd>) -> Vec<(bool, u32)> {
+        use crate::media::webrtc::MediaCmd::{Forward, ForwardTo};
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|cmd| match cmd {
+                Forward(p) | ForwardTo(_, p) if !p.is_end() => match p.clock {
+                    SourceClock::TeamSpeak { whisper, spurt, .. } => Some((whisper, spurt)),
+                    SourceClock::Rtp { .. } => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn spurt_numbers_never_repeat_after_the_stream_is_forgotten() {
+        use crate::media::{MediaPlane, Member, Routing};
+        let core = crate::core::expiry_tests::test_core(crate::store::Store::in_memory().unwrap(), None);
+        let (webrtc, mut rx) = mpsc::channel(64);
+        let mut routing = Routing::default();
+        for session in [100, 200] {
+            routing.members.insert(session, Member { channel: 1, muted: false, deafened: false });
+        }
+        let plane = MediaPlane {
+            routing: Arc::new(arc_swap::ArcSwap::from_pointee(routing)),
+            sinks: Arc::default(),
+            uplinks: Arc::default(),
+            webrtc,
+        };
+        let shared = Shared::new(core, plane);
+        shared.mirrors.write().unwrap().insert(7, 100);
+        let frame = [0xf8, 1, 2, 3];
+        shared.heard(7, 10, &frame);
+        shared.whispered(7, 200, 10, &frame);
+        shared.heard(7, 11, &[]);
+        shared.whispered(7, 200, 11, &[]);
+        let first = spurts(&mut rx);
+        // What sweep() does to streams silent for a minute, while an SFU slot
+        // still holds the old clock: the next spurt must not reuse its number.
+        shared.heard.lock().unwrap().clear();
+        shared.whispers.lock().unwrap().clear();
+        shared.heard(7, 12, &[0xf8, 4, 5, 6]);
+        shared.whispered(7, 200, 12, &[0xf8, 4, 5, 6]);
+        let second = spurts(&mut rx);
+        assert_eq!(first.iter().map(|(whisper, _)| *whisper).collect::<Vec<_>>(), [false, true]);
+        assert_eq!(second.len(), 2);
+        for ((whisper, old), (again, new)) in first.into_iter().zip(second) {
+            assert_eq!(whisper, again);
+            assert!(new > old, "spurt {new} does not follow {old}");
         }
     }
 
