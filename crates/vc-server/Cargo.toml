@@ -53,6 +53,7 @@ zip = { version = "9", default-features = false, features = ["deflate"], optiona
 libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
+vc-client = { path = "../vc-client" }
 audiopus = "=0.3.0-rc.0"
 tokio = { workspace = true, features = ["test-util"] }
 gwar-connect = { path = "../gwar-connect" }

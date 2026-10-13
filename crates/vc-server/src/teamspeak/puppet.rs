@@ -12,7 +12,10 @@
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock,
+        atomic::{AtomicU32, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -29,7 +32,7 @@ use vc_proto::SessionId;
 
 use crate::{
     core::CoreHandle,
-    media::{AudioPacket, MediaPlane, opus},
+    media::{AudioPacket, MediaPlane, SourceClock, opus},
 };
 
 /// A remote speaker counts as talking this long after its last frame.
@@ -43,16 +46,36 @@ pub struct Shared {
     /// TeamSpeak client id → remote session, for TeamSpeak users only (never puppets).
     pub mirrors: RwLock<HashMap<u16, SessionId>>,
     heard: Mutex<HashMap<u16, Heard>>,
+    /// Whisper streams, per TeamSpeak speaker and targeted user.
+    whispers: Mutex<HashMap<(u16, SessionId), Whisper>>,
+    /// Spurt numbers, shared so a stream recreated after eviction never
+    /// repeats one an SFU slot still remembers.
+    spurts: AtomicU32,
 }
 
-/// Recent frames of one TeamSpeak speaker. Frames are matched by content,
-/// which holds however the server numbers packets per recipient.
+/// Recent frames of one TeamSpeak speaker, shared across receiving puppets.
 struct Heard {
     session: SessionId,
     recent: [u64; 8],
     next: usize,
     at: Instant,
     talking: bool,
+    clock: Option<SourceClock>,
+    spurt: u32,
+}
+
+struct Whisper {
+    at: Instant,
+    talking: bool,
+    clock: Option<SourceClock>,
+    spurt: u32,
+}
+
+/// Only a recent id orders the next one; see the SFU slot's STALE_CLOCK.
+fn out_of_order(clock: Option<SourceClock>, at: Instant, id: u16, now: Instant) -> bool {
+    let Some(old @ SourceClock::TeamSpeak { whisper, spurt, .. }) = clock else { return false };
+    now.duration_since(at) <= Duration::from_secs(1)
+        && SourceClock::TeamSpeak { id, whisper, spurt }.delta(old).is_err()
 }
 
 fn digest(data: &[u8]) -> u64 {
@@ -62,18 +85,42 @@ fn digest(data: &[u8]) -> u64 {
 
 impl Shared {
     pub fn new(core: CoreHandle, plane: MediaPlane) -> Self {
-        Self { core, plane, mirrors: RwLock::default(), heard: Mutex::default() }
+        Self {
+            core,
+            plane,
+            mirrors: RwLock::default(),
+            heard: Mutex::default(),
+            whispers: Mutex::default(),
+            spurts: AtomicU32::new(0),
+        }
+    }
+
+    fn next_spurt(&self) -> u32 {
+        self.spurts.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
     }
 
     /// Publishes one frame from TeamSpeak client `from` unless another
     /// puppet already delivered it.
-    fn heard(&self, from: u16, opus: &[u8]) {
+    fn heard(&self, from: u16, id: u16, opus: &[u8]) {
         let Some(session) = self.mirrors.read().expect("mirrors lock").get(&from).copied() else { return };
         let now = Instant::now();
-        let hash = digest(opus);
+        let hash = digest(opus) ^ u64::from(id);
         let mut heard = self.heard.lock().expect("heard lock");
-        let entry =
-            heard.entry(from).or_insert(Heard { session, recent: [!hash; 8], next: 0, at: now, talking: false });
+        let entry = heard.entry(from).or_insert(Heard {
+            session,
+            recent: [!hash; 8],
+            next: 0,
+            at: now,
+            talking: false,
+            clock: None,
+            spurt: 0,
+        });
+        if entry.session != session {
+            entry.clock = None;
+        }
+        if out_of_order(entry.clock, entry.at, id, now) {
+            return;
+        }
         if entry.session != session || now.duration_since(entry.at) > Duration::from_secs(1) {
             entry.session = session;
             entry.recent = [!hash; 8];
@@ -83,6 +130,7 @@ impl Shared {
         entry.recent[entry.next] = hash;
         entry.next = (entry.next + 1) % entry.recent.len();
         entry.at = now;
+        entry.clock = Some(SourceClock::TeamSpeak { id, whisper: false, spurt: entry.spurt });
         if opus.is_empty() {
             if entry.talking {
                 entry.talking = false;
@@ -92,23 +140,42 @@ impl Shared {
             return;
         }
         let Some(samples) = opus::packet_samples(opus) else { return };
-        self.plane.publish(AudioPacket { from: session, opus: Arc::from(opus), samples });
         if !entry.talking {
             entry.talking = true;
+            entry.spurt = self.next_spurt();
             self.core.talking(session, true);
         }
+        let clock = SourceClock::TeamSpeak { id, whisper: false, spurt: entry.spurt };
+        entry.clock = Some(clock);
+        self.plane.publish(AudioPacket { from: session, opus: Arc::from(opus), samples, clock });
     }
 
     /// Delivers a whisper from TeamSpeak client `from` to the user behind the
     /// puppet that received it. Each targeted puppet gets its own copy.
-    fn whispered(&self, from: u16, to: SessionId, opus: &[u8]) {
+    fn whispered(&self, from: u16, to: SessionId, id: u16, opus: &[u8]) {
         let Some(session) = self.mirrors.read().expect("mirrors lock").get(&from).copied() else { return };
+        let now = Instant::now();
+        let mut whispers = self.whispers.lock().expect("whispers lock");
+        let stream = whispers.entry((from, to)).or_insert(Whisper { at: now, talking: false, clock: None, spurt: 0 });
+        if out_of_order(stream.clock, stream.at, id, now) {
+            return;
+        }
+        stream.at = now;
         let packet = if opus.is_empty() {
+            stream.talking = false;
+            stream.clock = Some(SourceClock::TeamSpeak { id, whisper: true, spurt: stream.spurt });
             AudioPacket::end_of_speech(session)
         } else {
             let Some(samples) = opus::packet_samples(opus) else { return };
-            AudioPacket { from: session, opus: Arc::from(opus), samples }
+            if !stream.talking {
+                stream.talking = true;
+                stream.spurt = self.next_spurt();
+            }
+            let clock = SourceClock::TeamSpeak { id, whisper: true, spurt: stream.spurt };
+            stream.clock = Some(clock);
+            AudioPacket { from: session, opus: Arc::from(opus), samples, clock }
         };
+        drop(whispers);
         self.plane.deliver(to, packet);
     }
 
@@ -124,10 +191,18 @@ impl Shared {
             }
             now.duration_since(h.at) < Duration::from_secs(60)
         });
+        drop(heard);
+        self.whispers.lock().expect("whispers lock").retain(|_, w| {
+            if now.duration_since(w.at) > TALKING {
+                w.talking = false;
+            }
+            now.duration_since(w.at) < Duration::from_secs(60)
+        });
     }
 
     pub fn forget(&self, clid: u16) {
         self.mirrors.write().expect("mirrors lock").remove(&clid);
+        self.whispers.lock().expect("whispers lock").retain(|(from, _), _| *from != clid);
         if let Some(h) = self.heard.lock().expect("heard lock").remove(&clid)
             && h.talking
         {
@@ -320,9 +395,9 @@ async fn run(
             Step::Item(Some(Err(e))) => return Err(anyhow!("{e}")),
             Step::Item(Some(Ok(item))) => match item {
                 StreamItem::Audio(packet) => match packet.data().data() {
-                    AudioData::S2C { from, codec, data, .. } if is_opus(*codec) => shared.heard(*from, data),
-                    AudioData::S2CWhisper { from, codec, data, .. } if is_opus(*codec) => {
-                        shared.whispered(*from, spec.session, data)
+                    AudioData::S2C { from, id, codec, data } if is_opus(*codec) => shared.heard(*from, *id, data),
+                    AudioData::S2CWhisper { from, id, codec, data, .. } if is_opus(*codec) => {
+                        shared.whispered(*from, spec.session, *id, data)
                     }
                     _ => {}
                 },
@@ -505,6 +580,58 @@ mod tests {
             if variant > 1 {
                 assert!(name.ends_with(&format!(" ({variant})")));
             }
+        }
+    }
+
+    /// Spurt numbers of the frames `shared` forwards to the SFU.
+    fn spurts(rx: &mut mpsc::Receiver<crate::media::webrtc::MediaCmd>) -> Vec<(bool, u32)> {
+        use crate::media::webrtc::MediaCmd::{Forward, ForwardTo};
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|cmd| match cmd {
+                Forward(p) | ForwardTo(_, p) if !p.is_end() => match p.clock {
+                    SourceClock::TeamSpeak { whisper, spurt, .. } => Some((whisper, spurt)),
+                    SourceClock::Rtp { .. } => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn spurt_numbers_never_repeat_after_the_stream_is_forgotten() {
+        use crate::media::{MediaPlane, Member, Routing};
+        let core = crate::core::expiry_tests::test_core(crate::store::Store::in_memory().unwrap(), None);
+        let (webrtc, mut rx) = mpsc::channel(64);
+        let mut routing = Routing::default();
+        for session in [100, 200] {
+            routing.members.insert(session, Member { channel: 1, muted: false, deafened: false });
+        }
+        let plane = MediaPlane {
+            routing: Arc::new(arc_swap::ArcSwap::from_pointee(routing)),
+            sinks: Arc::default(),
+            uplinks: Arc::default(),
+            webrtc,
+        };
+        let shared = Shared::new(core, plane);
+        shared.mirrors.write().unwrap().insert(7, 100);
+        let frame = [0xf8, 1, 2, 3];
+        shared.heard(7, 10, &frame);
+        shared.whispered(7, 200, 10, &frame);
+        shared.heard(7, 11, &[]);
+        shared.whispered(7, 200, 11, &[]);
+        let first = spurts(&mut rx);
+        // What sweep() does to streams silent for a minute, while an SFU slot
+        // still holds the old clock: the next spurt must not reuse its number.
+        shared.heard.lock().unwrap().clear();
+        shared.whispers.lock().unwrap().clear();
+        shared.heard(7, 12, &[0xf8, 4, 5, 6]);
+        shared.whispered(7, 200, 12, &[0xf8, 4, 5, 6]);
+        let second = spurts(&mut rx);
+        assert_eq!(first.iter().map(|(whisper, _)| *whisper).collect::<Vec<_>>(), [false, true]);
+        assert_eq!(second.len(), 2);
+        for ((whisper, old), (again, new)) in first.into_iter().zip(second) {
+            assert_eq!(whisper, again);
+            assert!(new > old, "spurt {new} does not follow {old}");
         }
     }
 

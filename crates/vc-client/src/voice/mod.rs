@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use vc_proto::AUDIO_SLOTS;
 
 use self::{
-    io::{AudioIo, AudioPorts, OutputTiming},
+    io::{AudioIo, AudioPorts, CaptureSample, OutputTiming},
     jitter::Clock,
     playout::{Slot, SpeakerBuffer},
 };
@@ -257,6 +257,7 @@ impl Drop for VoiceHandle {
 
 /// An encoded microphone frame on its way to the network.
 pub(crate) struct Outgoing {
+    pub capture_position: u64,
     pub opus: Vec<u8>,
     /// RFC 6464 level, negative dBov.
     pub level: i8,
@@ -409,10 +410,39 @@ fn voice_encoder() -> Result<Encoder> {
     Ok(encoder)
 }
 
+struct CaptureFrame {
+    samples: Vec<f32>,
+    filled: usize,
+    start: u64,
+}
+
+impl CaptureFrame {
+    fn new(size: usize) -> Self {
+        Self { samples: vec![0.0; size], filled: 0, start: 0 }
+    }
+
+    fn push(&mut self, sample: CaptureSample) -> Option<u64> {
+        if sample.position != self.start + self.filled as u64 {
+            self.filled = 0;
+        }
+        if self.filled == 0 {
+            self.start = sample.position;
+        }
+        self.samples[self.filled] = sample.value;
+        self.filled += 1;
+        if self.filled == self.samples.len() {
+            self.filled = 0;
+            Some(self.start)
+        } else {
+            None
+        }
+    }
+}
+
 fn pipeline<const CAPTURE: usize>(
     controls: Arc<Controls>,
     counters: Arc<Counters>,
-    mut mic: rtrb::Consumer<f32>,
+    mut mic: rtrb::Consumer<CaptureSample>,
     mut speaker: rtrb::Producer<f32>,
     output: Arc<OutputTiming>,
     out: mpsc::Sender<Outgoing>,
@@ -421,7 +451,7 @@ fn pipeline<const CAPTURE: usize>(
     let encoder = voice_encoder()?;
     output.attach();
     let mut slots = (0..AUDIO_SLOTS).map(|_| Slot::new()).collect::<Result<Vec<_>>>()?;
-    let mut frame = vec![0f32; CAPTURE];
+    let mut capture = CaptureFrame::new(CAPTURE);
     let mut mix = vec![0f32; FRAME];
     let mut packet = vec![0u8; 1275];
     let mut last_voice = Instant::now() - HANGOVER;
@@ -429,11 +459,10 @@ fn pipeline<const CAPTURE: usize>(
 
     while !controls.stop.load(Ordering::Relaxed) {
         // ---- capture
-        while mic.slots() >= CAPTURE {
-            for s in frame.iter_mut() {
-                *s = mic.pop().unwrap_or(0.0);
-            }
-            let db = level_db(&frame);
+        while let Ok(sample) = mic.pop() {
+            let Some(capture_position) = capture.push(sample) else { continue };
+            let frame = &capture.samples;
+            let db = level_db(frame);
             set_f(&controls.input_level, db);
             let blocked = controls.muted.load(Ordering::Relaxed) || controls.deafened.load(Ordering::Relaxed);
             let wants = if controls.push_to_talk.load(Ordering::Relaxed) {
@@ -447,10 +476,13 @@ fn pipeline<const CAPTURE: usize>(
             let send = !blocked && last_voice.elapsed() < HANGOVER;
             controls.transmitting.store(send, Ordering::Relaxed);
             if send {
-                let n = encoder.encode_float(&frame, &mut packet[..])?;
+                let n = encoder.encode_float(frame, &mut packet[..])?;
                 let level = (-db.clamp(-127.0, 0.0)).round() as i8;
                 // Tell the server's speech gate the truth about voice activity.
-                if out.try_send(Outgoing { opus: packet[..n].to_vec(), level: -level, speech: true }).is_ok() {
+                if out
+                    .try_send(Outgoing { capture_position, opus: packet[..n].to_vec(), level: -level, speech: true })
+                    .is_ok()
+                {
                     counters.frames_sent.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -533,6 +565,74 @@ mod codec_tests {
     use super::*;
     use audiopus::{Bandwidth, MutSignals, coder::Decoder, packet::Packet};
 
+    #[test]
+    fn capture_frames_keep_positions_across_batches_and_ring_overflow() {
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(4);
+        let mut frame = CaptureFrame::new(3);
+        for position in 0..7 {
+            let _ = tx.push(CaptureSample { position, value: position as f32 });
+        }
+        let mut positions = Vec::new();
+        while let Ok(sample) = rx.pop() {
+            positions.extend(frame.push(sample));
+        }
+        assert_eq!(positions, vec![0]);
+        for position in 7..10 {
+            tx.push(CaptureSample { position, value: position as f32 }).unwrap();
+        }
+        while let Ok(sample) = rx.pop() {
+            positions.extend(frame.push(sample));
+        }
+        assert_eq!(positions, vec![0, 7]);
+        assert_eq!(frame.samples, vec![7.0, 8.0, 9.0]);
+        for position in 10..19 {
+            positions.extend(frame.push(CaptureSample { position, value: 0.0 }));
+        }
+        assert_eq!(positions, vec![0, 7, 10, 13, 16]);
+    }
+
+    #[test]
+    fn capture_clock_survives_gates_and_outgoing_queue_drops() {
+        for gate in 0..3 {
+            let controls = Arc::new(Controls::default());
+            controls.muted.store(gate == 0, Ordering::Relaxed);
+            controls.push_to_talk.store(gate == 1, Ordering::Relaxed);
+            let (mut tx, mic) = rtrb::RingBuffer::new(FRAME * 16);
+            let (speaker, _rx) = rtrb::RingBuffer::new(FRAME * 4);
+            let timing = Arc::new(OutputTiming::default());
+            let (out, mut outgoing) = mpsc::channel(1);
+            let (_incoming, input) = std::sync::mpsc::sync_channel(1);
+            let c = controls.clone();
+            let t = timing.clone();
+            let worker = thread::spawn(move || pipeline::<FRAME>(c, Arc::default(), mic, speaker, t, out, input));
+            let mut feed = |start: usize, count: usize, value: f32| {
+                for position in start..start + count {
+                    tx.push(CaptureSample { position: position as u64, value }).unwrap();
+                }
+                timing.wake();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while tx.slots() != tx.buffer().capacity() {
+                    assert!(Instant::now() < deadline, "pipeline did not drain capture");
+                    thread::sleep(Duration::from_millis(1));
+                }
+                // Let the final consumed sample pass through the gate/encoder.
+                thread::sleep(Duration::from_millis(10));
+            };
+            feed(0, FRAME * 10, if gate == 2 { 0.0 } else { 0.3 });
+            assert!(outgoing.try_recv().is_err());
+            controls.muted.store(false, Ordering::Relaxed);
+            controls.ptt.store(true, Ordering::Relaxed);
+            // Only the first of three frames fits the outgoing queue.
+            feed(FRAME * 10, FRAME * 3, 0.3);
+            assert_eq!(outgoing.try_recv().unwrap().capture_position, (FRAME * 10) as u64);
+            feed(FRAME * 13, FRAME, 0.3);
+            assert_eq!(outgoing.try_recv().unwrap().capture_position, (FRAME * 13) as u64);
+            controls.stop.store(true, Ordering::Relaxed);
+            timing.wake();
+            worker.join().unwrap().unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn direct_teamspeak_capture_remains_twenty_ms_without_a_server() {
         struct Capture;
@@ -541,7 +641,7 @@ mod codec_tests {
                 let (mut tx, mic) = rtrb::RingBuffer::new(1920);
                 let (speaker, rx) = rtrb::RingBuffer::new(1920);
                 for i in 0..960 {
-                    tx.push((i as f32 * 0.04).sin() * 0.3).unwrap();
+                    tx.push(CaptureSample { position: i, value: (i as f32 * 0.04).sin() * 0.3 }).unwrap();
                 }
                 Ok(AudioPorts { mic, speaker, output: Arc::new(OutputTiming::default()), _guard: Box::new((tx, rx)) })
             }

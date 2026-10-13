@@ -8,8 +8,9 @@ use str0m::{
     Candidate, Event, Input, Output, Rtc,
     change::SdpAnswer,
     format::Codec,
-    media::{Direction, Frequency, MediaKind, MediaTime, Mid},
+    media::{Direction, Frequency, MediaKind, Mid},
     net::{Protocol, Receive},
+    rtp::{ExtensionValues, RtpWrite},
 };
 use tokio::{net::UdpSocket, sync::mpsc, time::sleep_until};
 use vc_proto::{
@@ -42,8 +43,11 @@ where
 {
     let socket = UdpSocket::bind(SocketAddr::new(local_ip, 0)).await.context("bind media socket")?;
     let local = socket.local_addr()?;
+    // RTP mode: our jitter buffer orders packets itself. str0m's frame mode would
+    // hold up to 15 packets behind every downlink loss and release them as a burst.
     let mut rtc = Rtc::builder()
         .set_extension(SLOT_GENERATION_ID, slot_generation_extension())
+        .set_rtp_mode(true)
         .clear_codecs()
         .enable_opus(true, false)
         .build(Instant::now());
@@ -66,12 +70,22 @@ where
         );
     }
 
+    let pt = rtc
+        .media(mic)
+        .and_then(|m| {
+            rtc.codec_config()
+                .params()
+                .iter()
+                .find(|p| m.remote_pts().contains(&p.pt()) && p.spec().codec == Codec::Opus)
+        })
+        .map(|p| p.pt())
+        .context("native voice answer lacks Opus on the microphone")?;
+
     tokio::spawn(async move {
         let _lost = LostOnDrop(counters.clone());
         let mut buf = vec![0u8; 2048];
-        // RTP time follows the wall clock so pauses in speech stay pauses.
-        let epoch = Instant::now();
         let mut last_ticks = None;
+        let mut sequence = u64::from(rand::random::<u16>()); // RFC 3550 §5.1
         loop {
             let deadline = loop {
                 match rtc.poll_output() {
@@ -79,18 +93,24 @@ where
                     Ok(Output::Transmit(t)) => {
                         let _ = socket.try_send_to(&t.contents, t.destination);
                     }
-                    Ok(Output::Event(Event::MediaData(data))) => {
-                        if let Some(slot) = slots.iter().position(|m| *m == data.mid) {
-                            let rtp_time = data.time.rebase(Frequency::FORTY_EIGHT_KHZ).numer();
-                            let generation =
-                                data.ext_vals.user_values.get::<SlotGeneration>().copied().map(super::Generation::Rtp);
+                    Ok(Output::Event(Event::RtpPacket(packet))) => {
+                        let mid = rtc.direct_api().stream_rx(&packet.header.ssrc).map(|s| s.mid());
+                        if let Some(slot) = slots.iter().position(|m| Some(*m) == mid) {
+                            let rtp_time = packet.time.rebase(Frequency::FORTY_EIGHT_KHZ).numer();
+                            let generation = packet
+                                .header
+                                .ext_vals
+                                .user_values
+                                .get::<SlotGeneration>()
+                                .copied()
+                                .map(super::Generation::Rtp);
                             let item = Incoming {
                                 slot,
                                 arrived: Instant::now(),
                                 clock: Clock::Rtp,
                                 rtp_time,
                                 generation,
-                                opus: data.data.to_vec(),
+                                opus: packet.payload.to_vec(),
                             };
                             counters.frame_received();
                             let _ = incoming.try_send(item);
@@ -118,14 +138,13 @@ where
             tokio::select! {
                 frame = outgoing.recv() => {
                     let Some(frame) = frame else { return };
-                    let ticks = send_ticks(epoch.elapsed(), last_ticks);
+                    let ticks = send_ticks(frame.capture_position, last_ticks);
                     last_ticks = Some(ticks);
-                    let pt = rtc.writer(mic).and_then(|w| w.payload_params().find(|p| p.spec().codec == Codec::Opus).map(|p| p.pt()));
-                    if let (Some(writer), Some(pt)) = (rtc.writer(mic), pt) {
-                        {
-                            let time = MediaTime::new(ticks, Frequency::FORTY_EIGHT_KHZ);
-                            let _ = writer.audio_level(frame.level, frame.speech).write(pt, Instant::now(), time, frame.opus);
-                        }
+                    if let Some(stream) = rtc.direct_api().stream_tx_by_mid(mic, None) {
+                        let ext_vals = ExtensionValues { audio_level: Some(frame.level), voice_activity: Some(frame.speech), ..Default::default() };
+                        let write = RtpWrite::new(pt, sequence.into(), ticks as u32, Instant::now(), frame.opus);
+                        stream.write_rtp(write.ext_vals(ext_vals));
+                        sequence += 1;
                     }
                 }
                 received = socket.recv_from(&mut buf) => {
@@ -146,12 +165,9 @@ where
     Ok(())
 }
 
-// Quantize to capture duration, but never reuse a timestamp when callbacks or
-// transport wakeups batch multiple packets. Keep wall-clock gaps across pauses.
-fn send_ticks(elapsed: std::time::Duration, last: Option<u64>) -> u64 {
-    let frame = super::FRAME as u64;
-    let wall = (elapsed.as_micros() as u64 * 48 / 1000) / frame * frame;
-    wall.max(last.map_or(0, |ticks| ticks + frame))
+// Capture advances through gates and queue drops. Defend against faulty custom I/O.
+fn send_ticks(capture_position: u64, last: Option<u64>) -> u64 {
+    capture_position.max(last.map_or(0, |ticks| ticks + super::FRAME as u64))
 }
 
 // str0m discards extmap directions. Read the answerer's (server's) direction
@@ -183,12 +199,11 @@ mod tests {
 
     #[test]
     fn timestamp_quantum_tracks_capture_and_batches_do_not_reuse_ticks() {
-        use std::time::Duration;
         let frame = super::super::FRAME as u64;
-        assert_eq!(send_ticks(Duration::ZERO, None), 0);
-        assert_eq!(send_ticks(Duration::ZERO, Some(0)), frame);
-        assert_eq!(send_ticks(Duration::from_millis(20), Some(frame)), 960.max(2 * frame));
-        assert_eq!(send_ticks(Duration::from_secs(1), Some(960)), 48_000);
+        assert_eq!(send_ticks(0, None), 0);
+        assert_eq!(send_ticks(0, Some(0)), frame);
+        assert_eq!(send_ticks(960, Some(frame)), 960.max(2 * frame));
+        assert_eq!(send_ticks(48_000, Some(960)), 48_000);
     }
 
     #[test]

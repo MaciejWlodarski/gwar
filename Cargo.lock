@@ -6989,6 +6989,7 @@ dependencies = [
  "tracing-subscriber",
  "tsclientlib",
  "tsproto-packets",
+ "vc-client",
  "vc-proto",
  "zip",
 ]

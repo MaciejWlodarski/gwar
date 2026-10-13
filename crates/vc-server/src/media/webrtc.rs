@@ -18,8 +18,9 @@ use str0m::{
     Candidate, Event as RtcEvent, IceConnectionState, Input, Output, Rtc,
     change::SdpOffer,
     format::Codec,
-    media::{Frequency, MediaData, MediaKind, MediaTime, Mid},
+    media::{MediaKind, Mid},
     net::{Protocol, Receive},
+    rtp::{ExtensionValues, RtpPacket, RtpWrite},
 };
 use tokio::{net::UdpSocket, sync::mpsc, time::sleep_until};
 use tracing::{debug, info, warn};
@@ -27,7 +28,7 @@ use vc_proto::{AUDIO_SLOTS, ErrorBody, ErrorCode, Event, Response, ServerFrame, 
 
 use vc_proto::rtp::{SLOT_GENERATION_ID, SlotGeneration, slot_generation_extension};
 
-use super::{AudioPacket, SharedRouting, Sinks, opus};
+use super::{AudioPacket, SharedRouting, Sinks, SourceClock, opus};
 use crate::core::{CoreHandle, Outbound, OutboundTx, encode};
 
 pub enum MediaCmd {
@@ -53,7 +54,12 @@ const SLOT_REUSE: Duration = Duration::from_millis(800);
 /// RFC 6464 level (negative dBov) above which a frame counts as speech.
 const SPEECH_LEVEL: i8 = -50;
 const SAMPLE_RATE: u64 = 48_000;
-const MIN_PAUSE_SAMPLES: u64 = 1920; // Retain 40 ms of scheduling tolerance.
+const MAX_SOURCE_DELTA: u32 = 5 * SAMPLE_RATE as u32;
+/// Late packets from these SSRCs are dropped; the oldest is forgotten first.
+const RETIRED_SSRCS: usize = 32;
+/// An out-of-order source time this long after the last write is a new clock:
+/// TeamSpeak's u16 ids cannot tell a reordered packet from a far-ahead one.
+const STALE_CLOCK: Duration = Duration::from_secs(1);
 
 struct Slot {
     mid: Mid,
@@ -63,22 +69,36 @@ struct Slot {
     generation: u16,
     last_write: Option<Instant>,
     last_samples: u32,
+    clock: Option<SourceClock>,
+    sequence: u64,
 }
 
 impl Slot {
-    fn advance(&mut self, now: Instant, samples: u32) {
-        self.ticks += match self.last_write {
+    fn assign(&mut self, source: SessionId) {
+        self.source = Some(source);
+        self.generation = self.generation.wrapping_add(1);
+        self.clock = None;
+    }
+
+    fn advance(&mut self, now: Instant, samples: u32, clock: SourceClock) -> bool {
+        let stale = self.last_write.is_none_or(|last| now.saturating_duration_since(last) > STALE_CLOCK);
+        let delta = match self.clock.map(|old| clock.delta(old)).transpose() {
+            Err(()) if stale => None,
+            Err(()) => return false,
+            Ok(delta) => delta.flatten().filter(|delta| *delta <= MAX_SOURCE_DELTA),
+        };
+        self.ticks += delta.map(u64::from).unwrap_or_else(|| match self.last_write {
             Some(last) => {
-                let elapsed = now.duration_since(last).as_micros() as u64 * SAMPLE_RATE / 1_000_000;
-                let frame = u64::from(self.last_samples);
-                // Preserve the 20 ms path's scheduling tolerance for shorter
-                // frames. A delayed 10 ms batch is not a new talk spurt.
-                if elapsed > (frame * 2).max(MIN_PAUSE_SAMPLES) { elapsed.div_ceil(frame) * frame } else { frame }
+                let elapsed = now.duration_since(last).as_nanos() * u128::from(SAMPLE_RATE);
+                let frame = u128::from(self.last_samples);
+                (elapsed.div_ceil(1_000_000_000 * frame).max(1) * frame) as u64
             }
             None => SAMPLE_RATE,
-        };
+        });
+        self.clock = Some(clock);
         self.last_write = Some(now);
         self.last_samples = samples;
+        true
     }
 }
 
@@ -91,6 +111,8 @@ struct Peer {
     talking: bool,
     last_voice: Instant,
     connected: bool,
+    clock: Option<SourceClock>,
+    retired_ssrcs: Vec<u32>,
 }
 
 impl Peer {
@@ -130,33 +152,40 @@ impl Peer {
                     .min_by_key(|(_, s)| (s.source.is_some(), s.last_used))
                     .map(|(i, _)| i);
                 let Some(i) = candidate else { return };
-                self.slots[i].source = Some(packet.from);
-                self.slots[i].generation = self.slots[i].generation.wrapping_add(1);
+                self.slots[i].assign(packet.from);
                 self.notify(Event::VoiceSlot { slot: i as u32, client: Some(packet.from) });
                 i
             }
         };
         let slot = &mut self.slots[index];
-        slot.last_used = now;
-        // RTP time must advance with real time across pauses and speaker
-        // changes so the browser's jitter buffer sees a clean discontinuity.
-        slot.advance(now, packet.samples);
-        let Some(writer) = self.rtc.writer(slot.mid) else { return };
-        let Some(pt) = writer.payload_params().find(|p| p.spec().codec == Codec::Opus).map(|p| p.pt()) else {
+        let Some(pt) = self.rtc.media(slot.mid).and_then(|m| {
+            self.rtc
+                .codec_config()
+                .params()
+                .iter()
+                .find(|p| m.remote_pts().contains(&p.pt()) && p.spec().codec == Codec::Opus)
+                .map(|p| p.pt())
+        }) else {
             return;
         };
-        let time = MediaTime::new(slot.ticks, Frequency::FORTY_EIGHT_KHZ);
-        if let Err(e) =
-            writer.user_extension_value(SlotGeneration(slot.generation)).write(pt, now, time, packet.opus.clone())
-        {
-            debug!(session = self.session, "write failed: {e}");
+        let mut direct = self.rtc.direct_api();
+        let Some(stream) = direct.stream_tx_by_mid(slot.mid, None) else { return };
+        if !slot.advance(now, packet.samples, packet.clock) {
+            return;
         }
+        slot.last_used = now;
+        let mut extensions = ExtensionValues::default();
+        extensions.user_values.set(SlotGeneration(slot.generation));
+        stream.write_rtp(
+            RtpWrite::new(pt, slot.sequence.into(), slot.ticks as u32, now, packet.opus.clone()).ext_vals(extensions),
+        );
+        slot.sequence += 1;
     }
 }
 
 /// Speech decision for one frame from header extensions alone.
-fn is_speech(data: &MediaData) -> bool {
-    match (data.ext_vals.voice_activity, data.ext_vals.audio_level) {
+fn is_speech(data: &ExtensionValues) -> bool {
+    match (data.voice_activity, data.audio_level) {
         (vad, Some(level)) => level >= SPEECH_LEVEL || (vad == Some(true) && level >= SPEECH_LEVEL - 10),
         (Some(vad), None) => vad,
         // Without the extension we cannot tell; forward everything.
@@ -291,6 +320,7 @@ fn accept(
     let mut rtc = Rtc::builder()
         .set_extension(SLOT_GENERATION_ID, slot_generation_extension())
         .set_ice_lite(true)
+        .set_rtp_mode(true)
         .clear_codecs()
         .enable_opus(true, false)
         .build(Instant::now());
@@ -306,6 +336,8 @@ fn accept(
         talking: false,
         last_voice: Instant::now(),
         connected: false,
+        clock: None,
+        retired_ssrcs: Vec::new(),
     };
     Ok((peer, answer.to_sdp_string()))
 }
@@ -370,10 +402,12 @@ fn drive(
                             generation: 0,
                             last_write: None,
                             last_samples: 960,
+                            clock: None,
+                            sequence: 0,
                         });
                     }
                 }
-                RtcEvent::MediaData(data) if Some(data.mid) == peer.mic => {
+                RtcEvent::RtpPacket(data) => {
                     if let Some(packet) = ingest(peer, &data, routing, core) {
                         forwards.push(packet);
                     }
@@ -385,7 +419,32 @@ fn drive(
 }
 
 /// Applies the speech gate to one microphone frame.
-fn ingest(peer: &mut Peer, data: &MediaData, routing: &SharedRouting, core: &CoreHandle) -> Option<AudioPacket> {
+fn ingest(peer: &mut Peer, data: &RtpPacket, routing: &SharedRouting, core: &CoreHandle) -> Option<AudioPacket> {
+    let mid = peer.rtc.direct_api().stream_rx(&data.header.ssrc)?.mid();
+    if Some(mid) != peer.mic {
+        return None;
+    }
+    let samples = opus::packet_samples(&data.payload)?;
+    let clock = SourceClock::Rtp { ssrc: *data.header.ssrc, sequence: *data.seq_no, ticks: data.header.timestamp };
+    if let Some(old) = peer.clock {
+        match clock.delta(old) {
+            Err(()) => return None,
+            Ok(None) => {
+                if peer.retired_ssrcs.contains(&*data.header.ssrc) {
+                    return None;
+                }
+                if let SourceClock::Rtp { ssrc, .. } = old {
+                    if peer.retired_ssrcs.len() == RETIRED_SSRCS {
+                        peer.retired_ssrcs.remove(0);
+                    }
+                    peer.retired_ssrcs.push(ssrc);
+                }
+            }
+            Ok(Some(_)) => {}
+        }
+    }
+    // Order before touching speech state, including gated packets.
+    peer.clock = Some(clock);
     let now = Instant::now();
     if !routing.load().can_speak(peer.session) {
         if peer.talking {
@@ -394,7 +453,7 @@ fn ingest(peer: &mut Peer, data: &MediaData, routing: &SharedRouting, core: &Cor
         }
         return None;
     }
-    if is_speech(data) {
+    if is_speech(&data.header.ext_vals) {
         peer.last_voice = now;
         if !peer.talking {
             peer.talking = true;
@@ -404,58 +463,156 @@ fn ingest(peer: &mut Peer, data: &MediaData, routing: &SharedRouting, core: &Cor
     if !peer.talking {
         return None;
     }
-    let samples = opus::packet_samples(&data.data)?;
-    Some(AudioPacket { from: peer.session, opus: Arc::clone(&data.data), samples })
+    Some(AudioPacket { from: peer.session, opus: Arc::clone(&data.payload), samples, clock })
 }
 
 #[cfg(test)]
 mod clock_tests {
     use super::*;
 
-    #[test]
-    fn delayed_ten_ms_batch_does_not_invent_missing_media() {
-        let now = Instant::now();
-        let mut slot = Slot {
+    fn slot(now: Instant) -> Slot {
+        Slot {
             mid: "0".into(),
-            source: None,
+            source: Some(1),
             last_used: now,
             ticks: 0,
-            generation: 0,
+            generation: 1,
             last_write: None,
             last_samples: 960,
-        };
-        // The third callback is 11 ms late; its successor is already queued.
-        // A 2-packet threshold would insert two nonexistent lost frames here.
-        for (index, ms) in [0, 10, 31, 31, 40, 50].into_iter().enumerate() {
-            slot.advance(now + Duration::from_millis(ms), 480);
-            assert_eq!(slot.ticks, SAMPLE_RATE + index as u64 * 480);
+            clock: None,
+            sequence: 0,
+        }
+    }
+
+    fn rtp(sequence: u64, ticks: u32) -> SourceClock {
+        SourceClock::Rtp { ssrc: 42, sequence, ticks }
+    }
+
+    #[test]
+    fn uplink_stall_burst_keeps_capture_deltas() {
+        let now = Instant::now();
+        let mut slot = slot(now);
+        assert!(slot.advance(now, 480, rtp(0, 0)));
+        for i in 1..=27 {
+            assert!(slot.advance(now + Duration::from_millis(270), 480, rtp(i, i as u32 * 480)));
+            assert_eq!(slot.ticks, SAMPLE_RATE + i * 480);
         }
     }
 
     #[test]
-    fn mixed_senders_advance_by_previous_packet_duration_and_pauses_by_wall_time() {
+    fn true_pause_and_mixed_durations_follow_source_even_in_a_batch() {
         let now = Instant::now();
-        let mut slot = Slot {
-            mid: "0".into(),
-            source: None,
-            last_used: now,
-            ticks: 0,
-            generation: 0,
-            last_write: None,
-            last_samples: 960,
-        };
-        for (ms, samples, ticks) in [
-            (0, 480, 48000),
-            (10, 480, 48480),
-            (20, 960, 48960),
-            (40, 480, 49920),
-            (50, 960, 50400),
-            (1050, 480, 98400),
-            (1060, 480, 98880),
-        ] {
-            slot.advance(now + Duration::from_millis(ms), samples);
-            assert_eq!(slot.ticks, ticks);
-            assert_eq!(slot.last_samples, samples);
+        let mut slot = slot(now);
+        for (i, (ticks, duration)) in
+            [(0, 480), (480, 960), (1440, 2880), (4320, 5760), (10080, 480), (58080, 960)].into_iter().enumerate()
+        {
+            assert!(slot.advance(now, duration, rtp(i as u64, ticks)));
+            assert_eq!(slot.ticks, SAMPLE_RATE + u64::from(ticks));
+            assert_eq!(slot.last_samples, duration);
         }
+    }
+
+    #[test]
+    fn speaker_change_increments_generation_and_uses_wall_time() {
+        let now = Instant::now();
+        let mut slot = slot(now);
+        slot.advance(now, 960, rtp(100, 9000));
+        slot.assign(2);
+        assert_eq!(slot.generation, 2);
+        assert!(slot.advance(now + Duration::from_millis(801), 480, rtp(0, 0)));
+        assert_eq!(slot.ticks, SAMPLE_RATE + 41 * 960);
+        assert!(slot.advance(now + Duration::from_millis(801), 480, rtp(1, 480)));
+        assert_eq!(slot.ticks, SAMPLE_RATE + 41 * 960 + 480);
+    }
+
+    #[test]
+    fn rtp_and_teamspeak_wrap_without_discontinuity() {
+        let now = Instant::now();
+        let mut slot = slot(now);
+        slot.advance(now, 480, rtp(65535, u32::MAX - 479));
+        assert!(slot.advance(now, 480, rtp(65536, 0)));
+        assert_eq!(slot.ticks, SAMPLE_RATE + 480);
+        assert!(!slot.advance(now, 480, rtp(65535, u32::MAX - 479)));
+        let mut slot = self::slot(now);
+        slot.advance(now, 960, SourceClock::TeamSpeak { id: 65535, whisper: false, spurt: 0 });
+        assert!(slot.advance(now, 960, SourceClock::TeamSpeak { id: 0, whisper: false, spurt: 0 }));
+        assert_eq!(slot.ticks, SAMPLE_RATE + 960);
+        assert!(!slot.advance(now, 960, SourceClock::TeamSpeak { id: 65535, whisper: false, spurt: 0 }));
+        assert!(!slot.advance(now, 960, SourceClock::TeamSpeak { id: 0, whisper: false, spurt: 0 }));
+    }
+
+    #[test]
+    fn teamspeak_spurts_restart_on_wall_time_even_without_an_end_marker() {
+        let now = Instant::now();
+        let ts = |id, spurt| SourceClock::TeamSpeak { id, whisper: false, spurt };
+        let mut slot = slot(now);
+        slot.advance(now, 960, ts(10, 1));
+        // Ids continue across a six-second pause. This listener never saw the
+        // end marker (e.g. deafened), but the next spurt re-anchors anyway.
+        assert!(slot.advance(now + Duration::from_secs(6), 960, ts(11, 2)));
+        assert_eq!(slot.ticks, SAMPLE_RATE + 6 * SAMPLE_RATE);
+        assert!(slot.advance(now + Duration::from_secs(6), 960, ts(12, 2)));
+        assert_eq!(slot.ticks, SAMPLE_RATE + 6 * SAMPLE_RATE + 960);
+        // Ordering survives the new spurt: late audio from the old one drops.
+        assert!(!slot.advance(now + Duration::from_secs(6), 960, ts(9, 1)));
+        assert!(!slot.advance(now + Duration::from_secs(6), 960, ts(11, 2)));
+        // Within one spurt, a jump past half the id range after a long
+        // absence is a new clock rather than a stale packet.
+        let later = now + Duration::from_secs(8);
+        assert!(slot.advance(later, 960, ts(12u16.wrapping_add(40_000), 2)));
+        assert_eq!(slot.ticks, SAMPLE_RATE + 8 * SAMPLE_RATE + 960);
+    }
+
+    #[test]
+    fn teamspeak_voice_and_whisper_have_independent_counters() {
+        let now = Instant::now();
+        let mut slot = slot(now);
+        slot.advance(now, 960, SourceClock::TeamSpeak { id: 100, whisper: false, spurt: 0 });
+        assert!(slot.advance(
+            now + Duration::from_millis(200),
+            960,
+            SourceClock::TeamSpeak { id: 0, whisper: true, spurt: 0 }
+        ));
+        assert_eq!(slot.ticks, SAMPLE_RATE + 9600);
+        assert!(slot.advance(
+            now + Duration::from_millis(200),
+            960,
+            SourceClock::TeamSpeak { id: 1, whisper: true, spurt: 0 }
+        ));
+        assert_eq!(slot.ticks, SAMPLE_RATE + 10560);
+    }
+
+    #[test]
+    fn duplicate_timestamp_and_old_sequence_do_not_touch_slot_state() {
+        let now = Instant::now();
+        let mut slot = slot(now);
+        slot.advance(now, 480, rtp(10, 4800));
+        for stamp in [rtp(10, 4800), rtp(9, 4320), rtp(11, 4800), rtp(0, 0)] {
+            assert!(!slot.advance(now + Duration::from_secs(1), 960, stamp));
+            assert_eq!(slot.ticks, SAMPLE_RATE);
+            assert_eq!(slot.last_write, Some(now));
+            assert_eq!(slot.last_samples, 480);
+        }
+        assert!(slot.advance(now, 480, rtp(12, 5760)));
+        assert_eq!(slot.ticks, SAMPLE_RATE + 960);
+    }
+
+    #[test]
+    fn clock_resets_use_previous_duration_and_accept_exactly_five_seconds() {
+        let now = Instant::now();
+        let mut slot = slot(now);
+        slot.advance(now, 960, rtp(0, 9000));
+        slot.advance(now, 480, rtp(1, 249000));
+        assert_eq!(slot.ticks, SAMPLE_RATE + 240000);
+        slot.advance(now + Duration::from_millis(21), 960, rtp(2, 100));
+        assert_eq!(slot.ticks, SAMPLE_RATE + 240000 + 1440);
+        slot.advance(now + Duration::from_millis(21), 480, rtp(3, 240101));
+        assert_eq!(slot.ticks, SAMPLE_RATE + 240000 + 1440 + 960);
+        assert!(slot.advance(
+            now + Duration::from_millis(41),
+            480,
+            SourceClock::Rtp { ssrc: 43, sequence: 0, ticks: 0 }
+        ));
+        assert_eq!(slot.ticks, SAMPLE_RATE + 240000 + 1440 + 960 + 960);
     }
 }
