@@ -65,7 +65,7 @@ pub(super) struct Slot {
     decoded: Vec<f32>,
     position: usize,
     end: usize,
-    quiet: bool,
+    generation: Option<u64>,
     last_sample: f32,
     fade_from: f32,
     fade_left: usize,
@@ -81,11 +81,34 @@ impl Slot {
             decoded: vec![0.0; 5760],
             position: 0,
             end: 0,
-            quiet: true,
+            generation: None,
             last_sample: 0.0,
             fade_from: 0.0,
             fade_left: 0,
         })
+    }
+
+    pub fn receive(&mut self, item: super::Incoming) -> Result<()> {
+        if self.generation.is_some_and(|generation| item.generation < generation) {
+            return Ok(());
+        }
+        if self.generation != Some(item.generation) {
+            self.buffer.reset();
+            self.decoder = Decoder::new(SampleRate::Hz48000, Channels::Mono)?;
+            self.position = 0;
+            self.end = 0;
+            self.last_sample = 0.0;
+            self.fade_from = 0.0;
+            self.fade_left = 0;
+            self.generation = Some(item.generation);
+        }
+        let samples = super::opus_samples(&item.opus).unwrap_or(super::FRAME as u32);
+        self.buffer.push_at(item.rtp_time, u64::from(samples), item.opus, item.arrived, item.clock);
+        Ok(())
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.unwrap_or(0)
     }
 
     pub fn staged_samples(&self) -> usize {
@@ -100,24 +123,26 @@ impl Slot {
         let mut written = 0;
         while written < mix.len() {
             if self.position == self.end {
-                let (n, skip) = match self.buffer.pop_at(now, self.quiet) {
-                    Playout::Packet { data, skip } => {
+                let (n, skip, fade) = match self.buffer.pop_at(now) {
+                    Playout::Packet { data, skip, quiet_only, fade } => {
                         let input = Packet::try_from(data.as_slice()).ok();
                         let output = MutSignals::try_from(&mut self.decoded[..])?;
                         let n = self.decoder.decode_float(input, output, false).unwrap_or(0);
-                        self.quiet = n == 0 || level_db(&self.decoded[..n]) < -42.0;
-                        (n, skip)
+                        // Inspect this candidate, never the preceding packet or PLC.
+                        let quiet = n > 0 && level_db(&self.decoded[..n]) < -42.0;
+                        let skip = if !quiet_only || quiet { skip.min(n) } else { 0 };
+                        self.buffer.shrunk(now, skip);
+                        (n, skip, fade)
                     }
                     Playout::Conceal(samples) => {
                         let output = MutSignals::try_from(&mut self.decoded[..samples])?;
-                        self.quiet = true;
-                        (self.decoder.decode_float(None, output, false).unwrap_or(0), 0)
+                        (self.decoder.decode_float(None, output, false).unwrap_or(0), 0, false)
                     }
                     Playout::Idle => break,
                 };
                 self.position = skip.min(n);
                 self.end = n;
-                if skip > 0 {
+                if skip > 0 || fade {
                     self.fade_from = self.last_sample;
                     self.fade_left = FADE;
                 }
@@ -213,6 +238,112 @@ mod tests {
                 }
                 assert_eq!(level, target);
             }
+        }
+    }
+
+    fn encode(encoder: &Encoder, speech: bool) -> Vec<u8> {
+        let pcm = (0..960).map(|i| if speech { (i as f32 * 0.06).sin() * 0.3 } else { 0.0 }).collect::<Vec<_>>();
+        let mut data = vec![0; 1275];
+        let n = encoder.encode_float(&pcm, &mut data).unwrap();
+        data.truncate(n);
+        data
+    }
+
+    fn decode(decoder: &mut Decoder, data: Option<&[u8]>) -> Vec<f32> {
+        let mut pcm = vec![0.0; 960];
+        let n = decoder
+            .decode_float(
+                data.map(|p| Packet::try_from(p).unwrap()),
+                MutSignals::try_from(&mut pcm[..]).unwrap(),
+                false,
+            )
+            .unwrap();
+        pcm.truncate(n);
+        pcm
+    }
+
+    #[test]
+    fn quiet_shrink_preserves_speech_onset_after_silence_or_plc() {
+        for plc in [false, true] {
+            let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
+            let mut reference = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
+            let mut slot = Slot::new().unwrap();
+            let now = Instant::now();
+            let first = encode(&encoder, plc);
+            slot.buffer.push(0, 960, first.clone());
+            let onset = encode(&encoder, true);
+            let onset_ts = if plc { 1920 } else { 960 };
+            for i in 0..8 {
+                slot.buffer.push(onset_ts + i * 960, 960, onset.clone());
+            }
+            let mut initial = [0.0; 960];
+            slot.mix_into(&mut initial, 1.0, now).unwrap();
+            assert_eq!(initial.as_slice(), decode(&mut reference, Some(&first)));
+            if plc {
+                let mut concealed = [0.0; 960];
+                slot.mix_into(&mut concealed, 1.0, now + Duration::from_millis(20)).unwrap();
+                assert_eq!(concealed.as_slice(), decode(&mut reference, None));
+            }
+            let expected = decode(&mut reference, Some(&onset));
+            assert!(level_db(&expected) > -42.0);
+            let mut actual = [0.0; 960];
+            slot.mix_into(&mut actual, 1.0, now + Duration::from_millis(600)).unwrap();
+            assert_eq!(actual.as_slice(), expected);
+            assert_eq!(slot.buffer.shrink_samples, 0);
+        }
+    }
+
+    #[test]
+    fn quiet_candidate_is_shrunk_and_boundary_fades_for_120_samples() {
+        let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
+        let mut slot = Slot::new().unwrap();
+        let now = Instant::now();
+        for i in 0..8 {
+            slot.buffer.push(i * 960, 960, encode(&encoder, false));
+        }
+        slot.mix_into(&mut [0.0; 960], 1.0, now).unwrap();
+        slot.mix_into(&mut [0.0; 1], 1.0, now + Duration::from_millis(600)).unwrap();
+        assert_eq!(slot.buffer.shrink_samples, 960);
+        assert_eq!(slot.fade_left, 119);
+        slot.mix_into(&mut [0.0; 119], 1.0, now + Duration::from_millis(600)).unwrap();
+        assert_eq!(slot.fade_left, 0);
+    }
+
+    #[test]
+    fn new_slot_generation_discards_old_queue_pcm_and_decoder_in_both_transports() {
+        use super::super::{Incoming, jitter::Clock};
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
+            let mut slot = Slot::new().unwrap();
+            let now = Instant::now();
+            let old = encode(&encoder, true);
+            let new = encode(&encoder, false);
+            let incoming = |generation, rtp_time, opus: Vec<u8>| Incoming {
+                slot: 0,
+                generation,
+                rtp_time,
+                arrived: now,
+                clock,
+                opus,
+            };
+            slot.receive(incoming(1, (1 << 32) + 9600, old.clone())).unwrap();
+            slot.receive(incoming(1, (1 << 32) + 10560, old.clone())).unwrap();
+            slot.mix_into(&mut [0.0; 480], 1.0, now).unwrap();
+            assert_eq!(slot.staged_samples(), 480);
+            assert_eq!(slot.buffer.depth().0, 1);
+            slot.receive(incoming(2, 1 << 32, new.clone())).unwrap();
+            assert_eq!(slot.staged_samples(), 0);
+            assert_eq!(slot.buffer.depth().0, 1);
+            // An old transport message cannot roll ownership back.
+            slot.receive(incoming(1, (1 << 32) + 11520, old)).unwrap();
+            assert_eq!(slot.buffer.depth().0, 1);
+            let mut reference = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
+            let expected = decode(&mut reference, Some(&new));
+            let mut actual = [0.0; 960];
+            slot.mix_into(&mut actual, 1.0, now).unwrap();
+            assert_eq!(actual.as_slice(), expected);
+            assert_eq!(slot.buffer.late_drops, 0);
+            assert_eq!(slot.buffer.concealments, 0);
         }
     }
 

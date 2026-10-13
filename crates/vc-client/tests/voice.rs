@@ -121,7 +121,9 @@ async fn tone_travels_between_native_clients() {
     tokio::time::sleep(Duration::from_secs(3)).await;
     let stats = vb.stats();
     assert_eq!(stats.callback_samples, 480);
-    assert!(stats.speaker_samples <= 960, "{stats:?}");
+    // The generation extension must survive real SDP negotiation and SRTP.
+    assert!(stats.slots.iter().any(|slot| slot.generation > 0), "{stats:?}");
+    assert!(stats.speaker_samples <= (stats.callback_max_samples + stats.headroom_samples) as u64, "{stats:?}");
     assert!(stats.slots.iter().all(|slot| slot.staged_samples <= 960), "{stats:?}");
     let samples = heard.lock().unwrap().clone();
     let tail = &samples[samples.len().saturating_sub(48_000)..];

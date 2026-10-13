@@ -7,10 +7,13 @@ use std::{
 
 #[derive(Debug, PartialEq)]
 pub enum Playout {
-    /// Decode the whole packet, then skip these samples to reduce excess delay.
+    /// Decode the whole packet, then skip up to these samples if the candidate
+    /// is quiet (or the forced-shrink deadline expired). Commit via `shrunk`.
     Packet {
         data: Vec<u8>,
         skip: usize,
+        quiet_only: bool,
+        fade: bool,
     },
     /// PLC duration in 48 kHz samples.
     Conceal(usize),
@@ -35,6 +38,8 @@ pub struct JitterBuffer {
     next: Option<u64>,
     missing: u32,
     last_samples: u64,
+    held: u64,
+    recovering: Option<Instant>,
     clock: Clock,
     arrival: Option<(u64, Instant, u64)>,
     jitter: f64,
@@ -47,7 +52,7 @@ pub struct JitterBuffer {
 
 const FRAME: u64 = 960;
 const MAX_CONCEAL: u32 = 5;
-const RESYNC: u64 = 24_000;
+const STALL: Duration = Duration::from_millis(100);
 const MAX_PACKETS: usize = 64;
 const MAX_TARGET: u64 = FRAME * 8;
 const QUIET_SHRINK: Duration = Duration::from_millis(500);
@@ -67,6 +72,8 @@ impl JitterBuffer {
             next: None,
             missing: 0,
             last_samples: FRAME,
+            held: 0,
+            recovering: None,
             clock: Clock::Rtp,
             arrival: None,
             jitter: 0.0,
@@ -84,12 +91,35 @@ impl JitterBuffer {
 
     pub(crate) fn push_at(&mut self, ts: u64, samples: u64, data: Vec<u8>, now: Instant, clock: Clock) {
         let samples = samples.clamp(120, 5760);
-        // A wall-clock gap also detects TS talk spurts, whose packet clock can pause.
-        if self.clock != clock
-            || self.arrival.is_some_and(|(_, at, _)| now.saturating_duration_since(at) > Duration::from_millis(200))
-            || self.next.is_some_and(|next| ts > next.saturating_add(RESYNC))
-        {
+        if self.recovering.is_some_and(|until| now >= until) {
+            self.recovering = None;
+        }
+        if self.clock != clock {
             self.reset();
+        }
+        if let Some((last_ts, at, last_samples)) = self.arrival {
+            let elapsed = now.saturating_duration_since(at);
+            // A real RTP pause advances media time with wall time. Delayed delivery
+            // resumes with contiguous timestamps, even after a long arrival gap.
+            let media_gap = ts.saturating_sub(last_ts.saturating_add(last_samples));
+            if clock == Clock::Rtp
+                && elapsed >= STALL
+                && media_gap >= 4800
+                && media_gap.abs_diff((elapsed.as_secs_f64() * 48_000.0) as u64) <= 4800
+            {
+                self.reset();
+            } else if clock == Clock::Sequence
+                && elapsed >= Duration::from_secs(2)
+                && ts > last_ts
+                && ts - last_ts <= 2 * FRAME
+            {
+                // If an end marker was lost, a long pause with a nearly stopped
+                // counter is more likely a new TS spurt. Ordinary delivery stalls
+                // (including 500 ms) retain their timeline and use burst recovery.
+                self.reset();
+            } else if elapsed >= STALL && elapsed.as_secs_f64() * 48_000.0 > last_samples as f64 * 2.0 {
+                self.recovering = Some(now + Duration::from_millis(200));
+            }
         }
         self.clock = clock;
         if self.next.is_some_and(|next| ts < next) {
@@ -107,9 +137,11 @@ impl JitterBuffer {
                     Clock::Sequence => (ts - last_ts) as f64 / FRAME as f64 * last_samples as f64,
                 };
                 // Fast attack, two-second release. Ignore reordered packets for the estimator.
-                self.jitter = (self.jitter * (-elapsed / 2.0).exp())
-                    .max((elapsed * 48_000.0 - expected).abs())
-                    .min(MAX_TARGET as f64);
+                if self.recovering.is_none() {
+                    self.jitter = (self.jitter * (-elapsed / 2.0).exp())
+                        .max((elapsed * 48_000.0 - expected).abs())
+                        .min(MAX_TARGET as f64);
+                }
                 self.arrival = Some((ts, now, samples));
             }
         } else {
@@ -131,14 +163,16 @@ impl JitterBuffer {
     }
 
     pub(crate) fn playing(&self) -> bool {
-        self.next.is_some()
+        self.next.is_some() && self.missing <= MAX_CONCEAL
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.packets.clear();
         self.next = None;
         self.missing = 0;
         self.last_samples = FRAME;
+        self.held = 0;
+        self.recovering = None;
         self.arrival = None;
         self.jitter = 0.0;
         self.above_since = None;
@@ -146,49 +180,85 @@ impl JitterBuffer {
     }
 
     pub fn pop(&mut self) -> Playout {
-        self.pop_at(Instant::now(), false)
+        self.pop_at(Instant::now())
     }
 
-    pub(crate) fn pop_at(&mut self, now: Instant, quiet: bool) -> Playout {
-        let Some(next) = self.next.or_else(|| self.packets.first_key_value().map(|(&ts, _)| ts)) else {
+    /// Commit a correction only after the decoded candidate passed the quiet check.
+    pub(crate) fn shrunk(&mut self, now: Instant, samples: usize) {
+        if samples > 0 {
+            self.shrink_samples += samples as u64;
+            self.last_shrink = Some(now);
+            self.above_since = None;
+        }
+    }
+
+    pub(crate) fn pop_at(&mut self, now: Instant) -> Playout {
+        let mut fade = false;
+        if self.recovering.is_some() && !self.packets.is_empty() {
+            // PLC already replaced the stalled audio. Catch up in one correction,
+            // retaining about the pre-stall target, rather than replaying the burst.
+            let mut depth = self.depth().1;
+            while self.packets.len() > 1 {
+                let packet = self.packets.first_key_value().unwrap().1;
+                if depth <= self.target_samples().max(packet.samples) {
+                    break;
+                }
+                let (_, packet) = self.packets.pop_first().unwrap();
+                depth -= packet.samples;
+                self.shrink_samples += packet.samples;
+                fade = true;
+            }
+            if fade {
+                self.next = self.packets.first_key_value().map(|(&ts, _)| ts);
+                self.held = 0;
+                self.last_shrink = Some(now);
+                self.above_since = None;
+            }
+        }
+        let Some(mut next) = self.next.or_else(|| self.packets.first_key_value().map(|(&ts, _)| ts)) else {
             return Playout::Idle;
         };
         while self.packets.first_key_value().is_some_and(|(&ts, _)| ts < next) {
             self.packets.pop_first();
             self.late_drops += 1;
         }
+        if let Some((&ts, _)) = self.packets.first_key_value() {
+            // Head-hold PLC is credit for a gap subsequently proven lost. A packet
+            // at the held head was merely late and may still buy a frame of depth.
+            let covered = if self.missing > MAX_CONCEAL { ts - next } else { (ts - next).min(self.held) };
+            next += covered;
+            self.held = self.held.saturating_sub(covered);
+            self.next = Some(next);
+        }
         let depth = self.depth().1;
         let packet_samples = self.packets.get(&next).map_or(FRAME, |p| p.samples);
-        let shrink = if depth >= self.target_samples().max(packet_samples) + FRAME {
-            let since = *self.above_since.get_or_insert(now);
-            let held = now.saturating_duration_since(since);
-            (held >= FORCE_SHRINK || quiet && held >= QUIET_SHRINK)
-                && self.last_shrink.is_none_or(|at| now.saturating_duration_since(at) >= SHRINK_INTERVAL)
+        let held = if depth >= self.target_samples().max(packet_samples) + FRAME {
+            now.saturating_duration_since(*self.above_since.get_or_insert(now))
         } else {
             self.above_since = None;
-            false
+            Duration::ZERO
         };
         if let Some(packet) = self.packets.remove(&next) {
             self.next = Some(next.saturating_add(packet.step));
             self.last_samples = packet.samples;
             self.missing = 0;
-            let skip = if shrink {
-                self.last_shrink = Some(now);
-                self.above_since = None;
-                FRAME.min(packet.samples)
-            } else {
-                0
+            self.held = 0;
+            let shrink = held >= QUIET_SHRINK
+                && self.last_shrink.is_none_or(|at| now.saturating_duration_since(at) >= SHRINK_INTERVAL);
+            return Playout::Packet {
+                data: packet.data,
+                skip: if shrink { FRAME.min(packet.samples) as usize } else { 0 },
+                quiet_only: held < FORCE_SHRINK,
+                fade,
             };
-            self.shrink_samples += skip;
-            return Playout::Packet { data: packet.data, skip: skip as usize };
         }
-        self.missing += 1;
+        self.missing = self.missing.saturating_add(1);
+        // Stop generating audio, but retain the timeline until an explicit source
+        // boundary or a media-clock pause. Starvation alone is not a new spurt.
         if self.missing > MAX_CONCEAL {
-            self.reset();
             return Playout::Idle;
         }
         let samples = if let Some((&ts, _)) = self.packets.first_key_value() {
-            // A known gap is loss, not a request to wait. Never step over a short packet.
             let samples = match self.clock {
                 Clock::Rtp => (ts - next).min(FRAME),
                 Clock::Sequence => self.last_samples,
@@ -197,10 +267,9 @@ impl JitterBuffer {
             self.next = Some(next + step);
             samples
         } else {
-            // Hold the head on starvation: advancing it would make a slow sender
-            // permanently late. PLC buys one frame of depth, also correcting clock drift.
             self.next = Some(next);
-            FRAME
+            self.held += if self.clock == Clock::Sequence { FRAME } else { self.last_samples };
+            self.last_samples
         };
         self.concealments += 1;
         Playout::Conceal(samples as usize)
@@ -212,7 +281,19 @@ mod tests {
     use super::*;
 
     fn packet(n: u8) -> Playout {
-        Playout::Packet { data: vec![n], skip: 0 }
+        Playout::Packet { data: vec![n], skip: 0, quiet_only: true, fade: false }
+    }
+
+    fn pop_at(jb: &mut JitterBuffer, now: Instant, quiet: bool) -> Playout {
+        let mut result = jb.pop_at(now);
+        if let Playout::Packet { skip, quiet_only, .. } = &mut result {
+            if *quiet_only && !quiet {
+                *skip = 0;
+            }
+            jb.shrunk(now, *skip);
+            *quiet_only = true;
+        }
+        result
     }
 
     #[test]
@@ -228,24 +309,6 @@ mod tests {
         assert_eq!(jb.concealments, 1);
         jb.push(2880, 960, vec![3]);
         assert_eq!(jb.late_drops, 1);
-    }
-
-    #[test]
-    fn talk_spurt_restarts_at_first_packet_including_sequence_clock() {
-        for clock in [Clock::Rtp, Clock::Sequence] {
-            let mut jb = JitterBuffer::new();
-            let now = Instant::now();
-            jb.push_at(1 << 32, 960, vec![1], now, clock);
-            assert_eq!(jb.pop_at(now, false), packet(1));
-            for _ in 0..MAX_CONCEAL {
-                assert_eq!(jb.pop(), Playout::Conceal(960));
-            }
-            assert_eq!(jb.pop(), Playout::Idle);
-            // A different TS speaker can restart at exactly the same synthetic origin.
-            jb.push_at(1 << 32, 960, vec![2], now + Duration::from_secs(1), clock);
-            assert_eq!(jb.pop(), packet(2));
-            assert_eq!(jb.target_samples(), FRAME);
-        }
     }
 
     #[test]
@@ -280,23 +343,120 @@ mod tests {
         for i in 0..10 {
             jb.push_at(i * FRAME, FRAME, vec![1], now, Clock::Rtp);
         }
-        assert_eq!(jb.pop_at(now, false), packet(1));
-        assert_eq!(jb.pop_at(now + Duration::from_millis(600), false), packet(1));
-        assert_eq!(jb.pop_at(now + Duration::from_millis(620), true), Playout::Packet { data: vec![1], skip: 960 });
-        assert_eq!(jb.pop_at(now + Duration::from_millis(620), true), packet(1));
-        assert_eq!(jb.pop_at(now + Duration::from_millis(640), true), packet(1));
-        assert_eq!(jb.pop_at(now + Duration::from_millis(1000), true), packet(1));
-        assert_eq!(jb.pop_at(now + Duration::from_secs(3), false), Playout::Packet { data: vec![1], skip: 960 });
+        assert_eq!(pop_at(&mut jb, now, false), packet(1));
+        assert_eq!(pop_at(&mut jb, now + Duration::from_millis(600), false), packet(1));
+        assert_eq!(
+            pop_at(&mut jb, now + Duration::from_millis(620), true),
+            Playout::Packet { data: vec![1], skip: 960, quiet_only: true, fade: false }
+        );
+        assert_eq!(pop_at(&mut jb, now + Duration::from_millis(620), true), packet(1));
+        assert_eq!(pop_at(&mut jb, now + Duration::from_millis(640), true), packet(1));
+        assert_eq!(pop_at(&mut jb, now + Duration::from_millis(1000), true), packet(1));
+        assert_eq!(
+            pop_at(&mut jb, now + Duration::from_secs(3), false),
+            Playout::Packet { data: vec![1], skip: 960, quiet_only: true, fade: false }
+        );
     }
 
     #[test]
-    fn wall_clock_pause_reanchors_without_a_playout_poll() {
-        let mut jb = JitterBuffer::new();
+    fn rtp_pause_reanchors_but_sequence_pause_retains_timeline() {
         let now = Instant::now();
-        jb.push_at(1 << 32, FRAME, vec![1], now, Clock::Sequence);
-        assert_eq!(jb.pop_at(now, false), packet(1));
-        jb.push_at(1 << 32, FRAME, vec![2], now + Duration::from_millis(800), Clock::Sequence);
-        assert_eq!(jb.pop(), packet(2));
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            let mut jb = JitterBuffer::new();
+            jb.push_at(0, FRAME, vec![1], now, clock);
+            assert_eq!(jb.pop(), packet(1));
+            for _ in 0..10 {
+                jb.pop();
+            }
+            let ts = if clock == Clock::Rtp { 48_000 } else { FRAME };
+            jb.push_at(ts, FRAME, vec![2], now + Duration::from_secs(1), clock);
+            assert_eq!(jb.pop(), packet(2));
+        }
+    }
+
+    #[test]
+    fn head_hold_concealment_is_not_charged_twice_for_loss() {
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            let mut jb = JitterBuffer::new();
+            let now = Instant::now();
+            jb.push_at(0, FRAME, vec![0], now, clock);
+            assert_eq!(jb.pop(), packet(0));
+            assert_eq!(jb.pop(), Playout::Conceal(960));
+            jb.push_at(2 * FRAME, FRAME, vec![2], now + Duration::from_millis(40), clock);
+            assert_eq!(jb.pop(), packet(2));
+            jb.push_at(FRAME, FRAME, vec![1], now + Duration::from_millis(41), clock);
+            assert_eq!(jb.late_drops, 1);
+            assert_eq!(jb.concealments, 1);
+        }
+    }
+
+    #[test]
+    fn stalled_delivery_recovers_to_target_in_one_playout_in_both_clocks() {
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            for stall_ms in [200, 500] {
+                let mut jb = JitterBuffer::new();
+                let start = Instant::now();
+                jb.push_at(0, FRAME, vec![0], start, clock);
+                assert_eq!(jb.pop(), packet(0));
+                for i in 1..stall_ms / 20 {
+                    jb.pop_at(start + Duration::from_millis(i * 20));
+                }
+                assert!(!jb.playing());
+                let burst = start + Duration::from_millis(stall_ms);
+                for i in 1..=stall_ms / 20 {
+                    jb.push_at(i * FRAME, FRAME, vec![i as u8], burst, clock);
+                }
+                assert_eq!(jb.target_samples(), FRAME);
+                assert!(matches!(jb.pop_at(burst), Playout::Packet { fade: true, .. }));
+                assert!(jb.depth().1 <= jb.target_samples() + FRAME);
+                // No excess delay returns during the following second.
+                for i in 1..=50 {
+                    let at = burst + Duration::from_millis(i * 20);
+                    jb.push_at((stall_ms / 20 + i) * FRAME, FRAME, vec![1], at, clock);
+                    assert_eq!(jb.pop_at(at), packet(1));
+                    assert!(jb.depth().1 <= jb.target_samples() + FRAME);
+                }
+                assert_eq!(jb.concealments, u64::from(MAX_CONCEAL));
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_handles_bursts_split_across_pipeline_wakeups() {
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            let mut jb = JitterBuffer::new();
+            let start = Instant::now();
+            jb.push_at(0, FRAME, vec![0], start, clock);
+            jb.pop();
+            for i in 1..25 {
+                jb.pop_at(start + Duration::from_millis(i * 20));
+            }
+            let burst = start + Duration::from_millis(500);
+            jb.push_at(FRAME, FRAME, vec![1], burst, clock);
+            assert_eq!(jb.pop_at(burst), packet(1));
+            for i in 2..=25 {
+                jb.push_at(i * FRAME, FRAME, vec![i as u8], burst + Duration::from_millis(1), clock);
+            }
+            assert!(
+                matches!(jb.pop_at(burst + Duration::from_millis(20)), Playout::Packet { data, fade: true, .. } if data == vec![25])
+            );
+            assert_eq!(jb.depth().1, 0);
+            assert_eq!(jb.target_samples(), FRAME);
+        }
+    }
+
+    #[test]
+    fn exhausted_plc_does_not_pin_a_later_sequence_packet_behind_a_gap() {
+        let mut jb = JitterBuffer::new();
+        let start = Instant::now();
+        jb.push_at(0, FRAME, vec![0], start, Clock::Sequence);
+        jb.pop();
+        for i in 1..25 {
+            jb.pop_at(start + Duration::from_millis(i * 20));
+        }
+        jb.push_at(25 * FRAME, FRAME, vec![25], start + Duration::from_millis(500), Clock::Sequence);
+        assert_eq!(jb.pop(), packet(25));
+        assert_eq!(jb.concealments, u64::from(MAX_CONCEAL));
     }
 
     #[test]
@@ -317,7 +477,7 @@ mod tests {
         for i in 0..200 {
             let now = start + Duration::from_millis(i * 120);
             jb.push_at(i * 5760, 5760, vec![1], now, Clock::Rtp);
-            assert_eq!(jb.pop_at(now, true), packet(1));
+            assert_eq!(pop_at(&mut jb, now, true), packet(1));
         }
         assert_eq!(jb.shrink_samples, 0);
     }
@@ -330,7 +490,7 @@ mod tests {
         for (i, samples) in [480, 1920, 120, 5760].into_iter().enumerate() {
             jb.push_at((1 << 32) + i as u64 * FRAME, samples, vec![i as u8], at, Clock::Sequence);
             assert_eq!(jb.depth().1, samples);
-            assert_eq!(jb.pop_at(at, false), packet(i as u8));
+            assert_eq!(pop_at(&mut jb, at, false), packet(i as u8));
             at += Duration::from_secs_f64(samples as f64 / 48_000.0);
         }
         assert_eq!(jb.target_samples(), FRAME);
@@ -369,7 +529,7 @@ mod tests {
             if play > 29_000 * FRAME {
                 tail_depth = tail_depth.max(jb.depth().1);
             }
-            let result = jb.pop_at(start + Duration::from_secs_f64(play as f64 / 48_000.0), true);
+            let result = pop_at(&mut jb, start + Duration::from_secs_f64(play as f64 / 48_000.0), true);
             play += match result {
                 Playout::Packet { skip, .. } => FRAME - skip as u64,
                 Playout::Conceal(n) => n as u64,
@@ -387,12 +547,13 @@ mod tests {
     }
 
     #[test]
-    fn delay_spike_grows_target_then_releases_excess_depth() {
+    fn reordered_spike_uses_plc_credit_without_building_excess_depth() {
         let (jb, max, tail, target) = simulate(960.0, true, Clock::Rtp);
-        assert!(target > FRAME, "{target}");
-        assert!(max > FRAME, "{max}");
-        assert!(jb.concealments > 0);
-        assert!(jb.shrink_samples > 0);
+        assert_eq!(target, FRAME);
+        assert_eq!(max, 2 * FRAME);
+        assert_eq!(jb.concealments, 4);
+        assert_eq!(jb.late_drops, 3);
+        assert_eq!(jb.shrink_samples, FRAME);
         assert_eq!(tail, FRAME);
         assert_eq!(jb.target_samples(), FRAME);
     }

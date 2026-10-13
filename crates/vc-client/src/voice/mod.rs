@@ -121,6 +121,7 @@ impl Counters {
 
 #[derive(Default)]
 struct SlotCounters {
+    generation: AtomicU64,
     packets: AtomicU64,
     samples: AtomicU64,
     concealments: AtomicU64,
@@ -133,6 +134,7 @@ struct SlotCounters {
 /// Per-slot receive queue snapshot; sample counts use the 48 kHz clock.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SlotStats {
+    pub generation: u64,
     pub queued_packets: u64,
     pub queued_samples: u64,
     pub concealments: u64,
@@ -212,6 +214,7 @@ impl VoiceHandle {
             slots: std::array::from_fn(|i| {
                 let s = &c.slots[i];
                 SlotStats {
+                    generation: s.generation.load(Ordering::Relaxed),
                     queued_packets: s.packets.load(Ordering::Relaxed),
                     queued_samples: s.samples.load(Ordering::Relaxed),
                     concealments: s.concealments.load(Ordering::Relaxed),
@@ -255,6 +258,8 @@ pub(crate) struct Outgoing {
 pub(crate) struct Incoming {
     pub slot: usize,
     pub rtp_time: u64,
+    /// Monotonic receive-slot ownership/spurt generation supplied by the transport.
+    pub generation: u64,
     pub arrived: Instant,
     pub clock: Clock,
     pub opus: Vec<u8>,
@@ -318,7 +323,7 @@ pub async fn start_teamspeak(
                 frame = audio_in.recv() => {
                     let Some(frame) = frame else { break };
                     link.frame_received();
-                    let _ = in_tx.try_send(Incoming { slot: frame.slot, rtp_time: frame.rtp_time, opus: frame.opus, arrived: Instant::now(), clock: Clock::Sequence });
+                    let _ = in_tx.try_send(Incoming { slot: frame.slot, generation: frame.generation, rtp_time: frame.rtp_time, opus: frame.opus, arrived: Instant::now(), clock: Clock::Sequence });
                     wake.wake();
                 }
                 outgoing = async {
@@ -422,9 +427,8 @@ fn pipeline(
 
         // ---- receive
         while let Ok(item) = incoming.try_recv() {
-            let samples = crate::voice::opus_samples(&item.opus).unwrap_or(FRAME as u32);
             if let Some(slot) = slots.get_mut(item.slot) {
-                slot.buffer.push_at(item.rtp_time, u64::from(samples), item.opus, item.arrived, item.clock);
+                slot.receive(item)?;
             }
         }
 
@@ -457,6 +461,7 @@ fn pipeline(
         }
         counters.speaker_samples.store((speaker.buffer().capacity() - speaker.slots()) as u64, Ordering::Relaxed);
         for (slot, stats) in slots.iter().zip(&counters.slots) {
+            stats.generation.store(slot.generation(), Ordering::Relaxed);
             let buffer = &slot.buffer;
             let (packets, samples) = buffer.depth();
             stats.packets.store(packets as u64, Ordering::Relaxed);

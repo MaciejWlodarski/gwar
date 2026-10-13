@@ -6946,6 +6946,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "str0m",
  "ts-rs",
  "url",
 ]

@@ -25,6 +25,8 @@ use tokio::{net::UdpSocket, sync::mpsc, time::sleep_until};
 use tracing::{debug, info, warn};
 use vc_proto::{AUDIO_SLOTS, ErrorBody, ErrorCode, Event, Response, ServerFrame, SessionId};
 
+use vc_proto::rtp::{SLOT_GENERATION_ID, SlotGeneration, slot_generation_extension};
+
 use super::{AudioPacket, SharedRouting, Sinks, opus};
 use crate::core::{CoreHandle, Outbound, OutboundTx, encode};
 
@@ -57,6 +59,7 @@ struct Slot {
     source: Option<SessionId>,
     last_used: Instant,
     ticks: u64,
+    generation: u64,
     last_write: Option<Instant>,
     last_samples: u32,
 }
@@ -110,6 +113,7 @@ impl Peer {
                     .map(|(i, _)| i);
                 let Some(i) = candidate else { return };
                 self.slots[i].source = Some(packet.from);
+                self.slots[i].generation += 1;
                 self.notify(Event::VoiceSlot { slot: i as u32, client: Some(packet.from) });
                 i
             }
@@ -133,7 +137,9 @@ impl Peer {
             return;
         };
         let time = MediaTime::new(slot.ticks, Frequency::FORTY_EIGHT_KHZ);
-        if let Err(e) = writer.write(pt, now, time, packet.opus.clone()) {
+        if let Err(e) =
+            writer.user_extension_value(SlotGeneration(slot.generation)).write(pt, now, time, packet.opus.clone())
+        {
             debug!(session = self.session, "write failed: {e}");
         }
     }
@@ -273,7 +279,12 @@ fn accept(
     out: OutboundTx,
 ) -> Result<(Peer, String), &'static str> {
     let offer = SdpOffer::from_sdp_string(sdp).map_err(|_| "invalid SDP offer")?;
-    let mut rtc = Rtc::builder().set_ice_lite(true).clear_codecs().enable_opus(true, false).build(Instant::now());
+    let mut rtc = Rtc::builder()
+        .set_extension(SLOT_GENERATION_ID, slot_generation_extension())
+        .set_ice_lite(true)
+        .clear_codecs()
+        .enable_opus(true, false)
+        .build(Instant::now());
     let candidate = Candidate::host(advertise, "udp").map_err(|_| "bad media address")?;
     rtc.add_local_candidate(candidate);
     let answer = rtc.sdp_api().accept_offer(offer).map_err(|_| "offer not acceptable")?;
@@ -347,6 +358,7 @@ fn drive(
                             source: None,
                             last_used: Instant::now(),
                             ticks: 0,
+                            generation: 0,
                             last_write: None,
                             last_samples: 960,
                         });
