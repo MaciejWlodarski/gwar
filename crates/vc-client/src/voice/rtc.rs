@@ -20,31 +20,6 @@ use vc_proto::{
 use super::{Counters, Incoming, LinkState, Outgoing, io::OutputTiming, jitter::Clock};
 use std::sync::Arc;
 
-/// Compatibility fallback for older servers without the negotiated generation
-/// extension. Large RTP discontinuities reset playout; delivery stalls do not.
-#[derive(Default)]
-struct Stream {
-    last: Option<(u64, u64)>,
-    generation: u64,
-}
-
-impl Stream {
-    fn observe(&mut self, sequence: u64, timestamp: u64) -> u64 {
-        if let Some((seq, ts)) = self.last {
-            if sequence <= seq {
-                return self.generation;
-            }
-            // Opus supports up to 120 ms per packet. Allow that much media time
-            // for every lost packet before declaring a discontinuity.
-            if timestamp < ts || timestamp - ts > (sequence - seq).saturating_mul(5760) + 24_000 {
-                self.generation += 1;
-            }
-        }
-        self.last = Some((sequence, timestamp));
-        self.generation
-    }
-}
-
 /// Marks the link lost however the transport task ends.
 struct LostOnDrop(Arc<Counters>);
 impl Drop for LostOnDrop {
@@ -86,7 +61,6 @@ where
         let mut buf = vec![0u8; 2048];
         // RTP time follows the wall clock so pauses in speech stay pauses.
         let epoch = Instant::now();
-        let mut streams: [Stream; AUDIO_SLOTS] = std::array::from_fn(|_| Stream::default());
         loop {
             let deadline = loop {
                 match rtc.poll_output() {
@@ -97,11 +71,8 @@ where
                     Ok(Output::Event(Event::MediaData(data))) => {
                         if let Some(slot) = slots.iter().position(|m| *m == data.mid) {
                             let rtp_time = data.time.rebase(Frequency::FORTY_EIGHT_KHZ).numer();
-                            let generation = data
-                                .ext_vals
-                                .user_values
-                                .get::<SlotGeneration>()
-                                .map_or_else(|| streams[slot].observe(**data.seq_range.start(), rtp_time), |g| g.0);
+                            let generation =
+                                data.ext_vals.user_values.get::<SlotGeneration>().copied().map(super::Generation::Rtp);
                             let item = Incoming {
                                 slot,
                                 arrived: Instant::now(),
@@ -161,24 +132,4 @@ where
         }
     });
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn legacy_discontinuity_changes_generation_but_delivery_stalls_and_loss_do_not() {
-        let mut stream = Stream::default();
-        assert_eq!(stream.observe(0, 48_000), 0);
-        for i in 1..=25 {
-            // a 500 ms burst, same media timeline
-            assert_eq!(stream.observe(i, 48_000 + i * 960), 0);
-        }
-        assert_eq!(stream.observe(50, 96_000), 0); // packet loss
-        assert_eq!(stream.observe(51, 144_960), 1); // large media discontinuity
-        assert_eq!(stream.observe(52, 145_920), 1);
-        // A discontinuity survives a lost boundary packet too.
-        assert_eq!(stream.observe(54, 195_840), 2);
-    }
 }

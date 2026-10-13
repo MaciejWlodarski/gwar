@@ -59,7 +59,7 @@ struct Slot {
     source: Option<SessionId>,
     last_used: Instant,
     ticks: u64,
-    generation: u64,
+    generation: u16,
     last_write: Option<Instant>,
     last_samples: u32,
 }
@@ -113,7 +113,7 @@ impl Peer {
                     .map(|(i, _)| i);
                 let Some(i) = candidate else { return };
                 self.slots[i].source = Some(packet.from);
-                self.slots[i].generation += 1;
+                self.slots[i].generation = self.slots[i].generation.wrapping_add(1);
                 self.notify(Event::VoiceSlot { slot: i as u32, client: Some(packet.from) });
                 i
             }

@@ -33,17 +33,25 @@ struct Packet {
     step: u64,
 }
 
+struct Recovery {
+    until: Instant,
+    /// Fixed media deadline at the end of the arrival stall. Never advance this
+    /// with later pops: normal callback batching is not evidence of lateness.
+    before: u64,
+}
+
 pub struct JitterBuffer {
     packets: BTreeMap<u64, Packet>,
     next: Option<u64>,
     missing: u32,
     last_samples: u64,
     held: u64,
-    recovering: Option<Instant>,
+    recovering: Option<Recovery>,
     clock: Clock,
     arrival: Option<(u64, Instant, u64)>,
     jitter: f64,
     above_since: Option<Instant>,
+    surplus: u64,
     last_shrink: Option<Instant>,
     pub(crate) concealments: u64,
     pub(crate) late_drops: u64,
@@ -57,6 +65,7 @@ const MAX_PACKETS: usize = 64;
 const MAX_TARGET: u64 = FRAME * 8;
 const QUIET_SHRINK: Duration = Duration::from_millis(500);
 const FORCE_SHRINK: Duration = Duration::from_secs(2);
+const SHRINK_STEP: u64 = 240; // At most 5 ms per correction.
 const SHRINK_INTERVAL: Duration = Duration::from_secs(1);
 
 impl Default for JitterBuffer {
@@ -78,6 +87,7 @@ impl JitterBuffer {
             arrival: None,
             jitter: 0.0,
             above_since: None,
+            surplus: 0,
             last_shrink: None,
             concealments: 0,
             late_drops: 0,
@@ -91,7 +101,7 @@ impl JitterBuffer {
 
     pub(crate) fn push_at(&mut self, ts: u64, samples: u64, data: Vec<u8>, now: Instant, clock: Clock) {
         let samples = samples.clamp(120, 5760);
-        if self.recovering.is_some_and(|until| now >= until) {
+        if self.recovering.as_ref().is_some_and(|r| now >= r.until) {
             self.recovering = None;
         }
         if self.clock != clock {
@@ -118,7 +128,14 @@ impl JitterBuffer {
                 // (including 500 ms) retain their timeline and use burst recovery.
                 self.reset();
             } else if elapsed >= STALL && elapsed.as_secs_f64() * 48_000.0 > last_samples as f64 * 2.0 {
-                self.recovering = Some(now + Duration::from_millis(200));
+                let elapsed_samples = (elapsed.as_secs_f64() * 48_000.0) as u64;
+                let behind = elapsed_samples.saturating_sub(self.target_samples().saturating_sub(last_samples));
+                let advance = match clock {
+                    Clock::Rtp => behind,
+                    Clock::Sequence => behind / last_samples * FRAME,
+                };
+                self.recovering =
+                    Some(Recovery { until: now + Duration::from_millis(200), before: last_ts.saturating_add(advance) });
             }
         }
         self.clock = clock;
@@ -176,6 +193,7 @@ impl JitterBuffer {
         self.arrival = None;
         self.jitter = 0.0;
         self.above_since = None;
+        self.surplus = 0;
         self.last_shrink = None;
     }
 
@@ -188,19 +206,42 @@ impl JitterBuffer {
         if samples > 0 {
             self.shrink_samples += samples as u64;
             self.last_shrink = Some(now);
+        }
+    }
+
+    /// Observe once per refill, including the decoded tail. Compensate for
+    /// packet arrival phase so a fractional-frame surplus stays measurable
+    /// between arrivals. Clamp the phase to one packet, never extrapolate a stall.
+    pub(crate) fn observe_depth(&mut self, now: Instant, staged: usize, demand: usize) {
+        let phase = self.arrival.map_or(0, |(_, at, samples)| {
+            ((now.saturating_duration_since(at).as_secs_f64() * 48_000.0) as u64).min(samples)
+        });
+        let packet_samples = self.packets.first_key_value().map_or(self.last_samples, |(_, p)| p.samples);
+        let target = self.target_samples().max(packet_samples).max(demand as u64);
+        self.surplus = (self.depth().1 + staged as u64 + phase).saturating_sub(target);
+        if self.surplus >= SHRINK_STEP {
+            self.above_since.get_or_insert(now);
+        } else {
             self.above_since = None;
         }
     }
 
     pub(crate) fn pop_at(&mut self, now: Instant) -> Playout {
+        self.observe_depth(now, 0, 0);
+        self.pop_for(now, FRAME as usize)
+    }
+
+    pub(crate) fn pop_for(&mut self, now: Instant, demand: usize) -> Playout {
         let mut fade = false;
-        if self.recovering.is_some() && !self.packets.is_empty() {
-            // PLC already replaced the stalled audio. Catch up in one correction,
-            // retaining about the pre-stall target, rather than replaying the burst.
+        if let Some(recovery) = &self.recovering {
+            // Only discard media behind the stalled timeline's deadline, and
+            // retain enough audio for this refill as well as the pre-stall target.
             let mut depth = self.depth().1;
             while self.packets.len() > 1 {
-                let packet = self.packets.first_key_value().unwrap().1;
-                if depth <= self.target_samples().max(packet.samples) {
+                let (&ts, packet) = self.packets.first_key_value().unwrap();
+                if ts.saturating_add(packet.step) > recovery.before
+                    || depth - packet.samples < self.target_samples().max(demand as u64)
+                {
                     break;
                 }
                 let (_, packet) = self.packets.pop_first().unwrap();
@@ -230,16 +271,13 @@ impl JitterBuffer {
             self.held = self.held.saturating_sub(covered);
             self.next = Some(next);
         }
-        let depth = self.depth().1;
-        let packet_samples = self.packets.get(&next).map_or(FRAME, |p| p.samples);
-        let held = if depth >= self.target_samples().max(packet_samples) + FRAME {
-            now.saturating_duration_since(*self.above_since.get_or_insert(now))
-        } else {
-            self.above_since = None;
-            Duration::ZERO
-        };
+        let available = self.depth().1.saturating_sub(demand as u64);
+        let held = self.above_since.map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
         if let Some(packet) = self.packets.remove(&next) {
             self.next = Some(next.saturating_add(packet.step));
+            if self.recovering.as_ref().is_some_and(|r| next.saturating_add(packet.step) >= r.before) {
+                self.recovering = None;
+            }
             self.last_samples = packet.samples;
             self.missing = 0;
             self.held = 0;
@@ -247,7 +285,11 @@ impl JitterBuffer {
                 && self.last_shrink.is_none_or(|at| now.saturating_duration_since(at) >= SHRINK_INTERVAL);
             return Playout::Packet {
                 data: packet.data,
-                skip: if shrink { FRAME.min(packet.samples) as usize } else { 0 },
+                skip: if shrink {
+                    SHRINK_STEP.min(self.surplus).min(available).min(packet.samples) as usize
+                } else {
+                    0
+                },
                 quiet_only: held < FORCE_SHRINK,
                 fade,
             };
@@ -347,14 +389,14 @@ mod tests {
         assert_eq!(pop_at(&mut jb, now + Duration::from_millis(600), false), packet(1));
         assert_eq!(
             pop_at(&mut jb, now + Duration::from_millis(620), true),
-            Playout::Packet { data: vec![1], skip: 960, quiet_only: true, fade: false }
+            Playout::Packet { data: vec![1], skip: 240, quiet_only: true, fade: false }
         );
         assert_eq!(pop_at(&mut jb, now + Duration::from_millis(620), true), packet(1));
         assert_eq!(pop_at(&mut jb, now + Duration::from_millis(640), true), packet(1));
         assert_eq!(pop_at(&mut jb, now + Duration::from_millis(1000), true), packet(1));
         assert_eq!(
             pop_at(&mut jb, now + Duration::from_secs(3), false),
-            Playout::Packet { data: vec![1], skip: 960, quiet_only: true, fade: false }
+            Playout::Packet { data: vec![1], skip: 240, quiet_only: true, fade: false }
         );
     }
 
@@ -442,6 +484,55 @@ mod tests {
             );
             assert_eq!(jb.depth().1, 0);
             assert_eq!(jb.target_samples(), FRAME);
+        }
+    }
+
+    #[test]
+    fn recovered_stream_keeps_both_on_time_packets_in_a_40ms_refill() {
+        // Regression for target/review-r2/jitter_probe.rs.
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            let now = Instant::now();
+            let mut jb = JitterBuffer::new();
+            jb.push_at(0, FRAME, vec![0], now, clock);
+            assert_eq!(jb.pop_at(now), packet(0));
+            for i in 1..10 {
+                jb.pop_at(now + Duration::from_millis(i * 20));
+            }
+            let burst = now + Duration::from_millis(200);
+            for i in 1..=10 {
+                jb.push_at(i * FRAME, FRAME, vec![i as u8], burst, clock);
+            }
+            assert!(matches!(jb.pop_at(burst), Playout::Packet { data, fade: true, .. } if data == vec![10]));
+            let initial_trim = jb.shrink_samples;
+            let initial_plc = jb.concealments;
+            jb.push_at(11 * FRAME, FRAME, vec![11], now + Duration::from_millis(220), clock);
+            let refill = now + Duration::from_millis(240);
+            jb.push_at(12 * FRAME, FRAME, vec![12], refill, clock);
+            assert_eq!(jb.pop_at(refill), packet(11));
+            assert_eq!(jb.pop_at(refill), packet(12));
+            assert_eq!(jb.shrink_samples, initial_trim);
+            assert_eq!(jb.concealments, initial_plc);
+        }
+    }
+
+    #[test]
+    fn recovery_preserves_the_entire_pending_refill() {
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            let now = Instant::now();
+            let mut jb = JitterBuffer::new();
+            jb.push_at(0, FRAME, vec![0], now, clock);
+            jb.pop_at(now);
+            let burst = now + Duration::from_millis(200);
+            for i in 1..=10 {
+                jb.push_at(i * FRAME, FRAME, vec![i as u8], burst, clock);
+            }
+            assert!(
+                matches!(jb.pop_for(burst, 3 * FRAME as usize), Playout::Packet { data, fade: true, .. } if data == vec![8])
+            );
+            assert_eq!(jb.pop_for(burst, 2 * FRAME as usize), packet(9));
+            assert_eq!(jb.pop_for(burst, FRAME as usize), packet(10));
+            assert_eq!(jb.shrink_samples, 7 * FRAME);
+            assert_eq!(jb.concealments, 0);
         }
     }
 

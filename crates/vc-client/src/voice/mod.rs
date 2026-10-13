@@ -254,12 +254,28 @@ pub(crate) struct Outgoing {
     pub speech: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Generation {
+    Rtp(vc_proto::rtp::SlotGeneration),
+    Sequence(u64),
+}
+
+impl Generation {
+    fn is_newer_than(self, old: Self) -> bool {
+        match (self, old) {
+            (Self::Rtp(new), Self::Rtp(old)) => new.is_newer_than(old),
+            (Self::Sequence(new), Self::Sequence(old)) => new > old,
+            _ => true,
+        }
+    }
+}
+
 /// A received frame for one slot.
 pub(crate) struct Incoming {
     pub slot: usize,
     pub rtp_time: u64,
-    /// Monotonic receive-slot ownership/spurt generation supplied by the transport.
-    pub generation: u64,
+    /// Missing native metadata leaves the current ownership unchanged.
+    pub generation: Option<Generation>,
     pub arrived: Instant,
     pub clock: Clock,
     pub opus: Vec<u8>,
@@ -323,7 +339,7 @@ pub async fn start_teamspeak(
                 frame = audio_in.recv() => {
                     let Some(frame) = frame else { break };
                     link.frame_received();
-                    let _ = in_tx.try_send(Incoming { slot: frame.slot, generation: frame.generation, rtp_time: frame.rtp_time, opus: frame.opus, arrived: Instant::now(), clock: Clock::Sequence });
+                    let _ = in_tx.try_send(Incoming { slot: frame.slot, generation: Some(Generation::Sequence(frame.generation)), rtp_time: frame.rtp_time, opus: frame.opus, arrived: Instant::now(), clock: Clock::Sequence });
                     wake.wake();
                 }
                 outgoing = async {
@@ -450,7 +466,7 @@ fn pipeline(
             mix[..take].fill(0.0);
             let now = Instant::now();
             for (index, slot) in slots.iter_mut().enumerate() {
-                slot.mix_into(&mut mix[..take], f(&controls.slot_gain[index]), now)?;
+                slot.mix_refill(&mut mix[..take], f(&controls.slot_gain[index]), now, needed)?;
             }
             let master = if deafened { 0.0 } else { f(&controls.master) };
             output.playing.store(slots.iter().any(Slot::playing), Ordering::Relaxed);

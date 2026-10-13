@@ -65,10 +65,11 @@ pub(super) struct Slot {
     decoded: Vec<f32>,
     position: usize,
     end: usize,
-    generation: Option<u64>,
+    generation: Option<super::Generation>,
     last_sample: f32,
     fade_from: f32,
     fade_left: usize,
+    previous_level: f32,
 }
 
 const FADE: usize = 120; // 2.5 ms at a latency correction boundary.
@@ -85,14 +86,18 @@ impl Slot {
             last_sample: 0.0,
             fade_from: 0.0,
             fade_left: 0,
+            previous_level: -120.0,
         })
     }
 
     pub fn receive(&mut self, item: super::Incoming) -> Result<()> {
-        if self.generation.is_some_and(|generation| item.generation < generation) {
+        if let (Some(old), Some(new)) = (self.generation, item.generation)
+            && new != old
+            && !new.is_newer_than(old)
+        {
             return Ok(());
         }
-        if self.generation != Some(item.generation) {
+        if item.generation.is_some() && self.generation != item.generation {
             self.buffer.reset();
             self.decoder = Decoder::new(SampleRate::Hz48000, Channels::Mono)?;
             self.position = 0;
@@ -100,7 +105,8 @@ impl Slot {
             self.last_sample = 0.0;
             self.fade_from = 0.0;
             self.fade_left = 0;
-            self.generation = Some(item.generation);
+            self.previous_level = -120.0;
+            self.generation = item.generation;
         }
         let samples = super::opus_samples(&item.opus).unwrap_or(super::FRAME as u32);
         self.buffer.push_at(item.rtp_time, u64::from(samples), item.opus, item.arrived, item.clock);
@@ -108,7 +114,11 @@ impl Slot {
     }
 
     pub fn generation(&self) -> u64 {
-        self.generation.unwrap_or(0)
+        match self.generation {
+            Some(super::Generation::Rtp(g)) => u64::from(g.0),
+            Some(super::Generation::Sequence(g)) => g,
+            None => 0,
+        }
     }
 
     pub fn staged_samples(&self) -> usize {
@@ -119,22 +129,34 @@ impl Slot {
         self.staged_samples() > 0 || self.buffer.playing()
     }
 
-    pub fn mix_into(&mut self, mix: &mut [f32], gain: f32, now: Instant) -> Result<()> {
+    #[cfg(test)]
+    fn mix_into(&mut self, mix: &mut [f32], gain: f32, now: Instant) -> Result<()> {
+        self.mix_refill(mix, gain, now, mix.len())
+    }
+
+    pub fn mix_refill(&mut self, mix: &mut [f32], gain: f32, now: Instant, demand: usize) -> Result<()> {
+        self.buffer.observe_depth(now, self.staged_samples(), demand);
         let mut written = 0;
         while written < mix.len() {
             if self.position == self.end {
-                let (n, skip, fade) = match self.buffer.pop_at(now) {
+                let (n, skip, fade) = match self.buffer.pop_for(now, demand - written) {
                     Playout::Packet { data, skip, quiet_only, fade } => {
                         let input = Packet::try_from(data.as_slice()).ok();
                         let output = MutSignals::try_from(&mut self.decoded[..])?;
                         let n = self.decoder.decode_float(input, output, false).unwrap_or(0);
                         // Inspect this candidate, never the preceding packet or PLC.
-                        let quiet = n > 0 && level_db(&self.decoded[..n]) < -42.0;
-                        let skip = if !quiet_only || quiet { skip.min(n) } else { 0 };
+                        let level = level_db(&self.decoded[..n]);
+                        let quiet = n > 0 && level < -42.0;
+                        // Even forced corrections preserve a rising speech edge,
+                        // including the first voiced packet after PLC.
+                        let onset = !quiet && level > self.previous_level + 6.0;
+                        self.previous_level = level;
+                        let skip = if !onset && (!quiet_only || quiet) { skip.min(n) } else { 0 };
                         self.buffer.shrunk(now, skip);
                         (n, skip, fade)
                     }
                     Playout::Conceal(samples) => {
+                        self.previous_level = -120.0;
                         let output = MutSignals::try_from(&mut self.decoded[..samples])?;
                         (self.decoder.decode_float(None, output, false).unwrap_or(0), 0, false)
                     }
@@ -264,7 +286,7 @@ mod tests {
 
     #[test]
     fn quiet_shrink_preserves_speech_onset_after_silence_or_plc() {
-        for plc in [false, true] {
+        for (plc, delay) in [(false, 600), (true, 600), (false, 2500), (true, 2500)] {
             let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
             let mut reference = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
             let mut slot = Slot::new().unwrap();
@@ -287,7 +309,7 @@ mod tests {
             let expected = decode(&mut reference, Some(&onset));
             assert!(level_db(&expected) > -42.0);
             let mut actual = [0.0; 960];
-            slot.mix_into(&mut actual, 1.0, now + Duration::from_millis(600)).unwrap();
+            slot.mix_into(&mut actual, 1.0, now + Duration::from_millis(delay)).unwrap();
             assert_eq!(actual.as_slice(), expected);
             assert_eq!(slot.buffer.shrink_samples, 0);
         }
@@ -303,7 +325,7 @@ mod tests {
         }
         slot.mix_into(&mut [0.0; 960], 1.0, now).unwrap();
         slot.mix_into(&mut [0.0; 1], 1.0, now + Duration::from_millis(600)).unwrap();
-        assert_eq!(slot.buffer.shrink_samples, 960);
+        assert_eq!(slot.buffer.shrink_samples, 240);
         assert_eq!(slot.fade_left, 119);
         slot.mix_into(&mut [0.0; 119], 1.0, now + Duration::from_millis(600)).unwrap();
         assert_eq!(slot.fade_left, 0);
@@ -320,7 +342,10 @@ mod tests {
             let new = encode(&encoder, false);
             let incoming = |generation, rtp_time, opus: Vec<u8>| Incoming {
                 slot: 0,
-                generation,
+                generation: Some(match clock {
+                    Clock::Rtp => super::super::Generation::Rtp(vc_proto::rtp::SlotGeneration(generation as u16)),
+                    Clock::Sequence => super::super::Generation::Sequence(generation),
+                }),
                 rtp_time,
                 arrived: now,
                 clock,
@@ -345,6 +370,85 @@ mod tests {
             assert_eq!(slot.buffer.late_drops, 0);
             assert_eq!(slot.buffer.concealments, 0);
         }
+    }
+
+    #[test]
+    fn fractional_staged_surplus_converges_with_bounded_forced_corrections() {
+        use super::super::jitter::Clock;
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            for excess in [240, 480, 720, 912] {
+                for callback in [240, 480, 960] {
+                    let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
+                    let mut slot = Slot::new().unwrap();
+                    let now = Instant::now();
+                    // An already decoded fractional tail left by startup PLC.
+                    slot.end = excess;
+                    let mut last_correction = None;
+                    let mut corrected = 0;
+                    let mut converged = None;
+                    for tick in (0..480_000).step_by(callback) {
+                        let at = now + Duration::from_secs_f64(tick as f64 / 48_000.0);
+                        if tick % 960 == 0 {
+                            // Nonquiet carrier: convergence must use the forced deadline.
+                            slot.buffer.push_at(tick, 960, encode(&encoder, true), at, clock);
+                        }
+                        slot.mix_into(&mut vec![0.0; callback], 1.0, at).unwrap();
+                        let total = slot.buffer.shrink_samples;
+                        if total > corrected {
+                            assert!(total - corrected <= 240);
+                            assert!(total <= excess as u64);
+                            assert!(tick >= 96_000, "forced correction before two seconds");
+                            if let Some(previous) = last_correction {
+                                assert!(tick - previous >= 48_000, "corrections less than one second apart");
+                            }
+                            last_correction = Some(tick);
+                            corrected = total;
+                        }
+                        if excess as u64 - total < 240 && converged.is_none() {
+                            converged = Some(tick);
+                        }
+                    }
+                    assert!(
+                        converged.is_some_and(|tick| tick <= 5 * 48_000),
+                        "{clock:?}, excess={excess}, callback={callback}, corrected={corrected}"
+                    );
+                    assert_eq!(corrected, (excess / 240 * 240) as u64);
+                    assert_eq!(slot.buffer.concealments, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_generation_wrap_rejects_stale_packets_and_missing_metadata_preserves_state() {
+        use super::super::{Generation, Incoming, jitter::Clock};
+        use vc_proto::rtp::SlotGeneration;
+        let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
+        let mut slot = Slot::new().unwrap();
+        let now = Instant::now();
+        let opus = encode(&encoder, true);
+        let incoming = |generation: Option<u16>, rtp_time| Incoming {
+            slot: 0,
+            rtp_time,
+            arrived: now,
+            clock: Clock::Rtp,
+            opus: opus.clone(),
+            generation: generation.map(|g| Generation::Rtp(SlotGeneration(g))),
+        };
+        slot.receive(incoming(Some(65535), 0)).unwrap();
+        slot.mix_into(&mut [0.0; 480], 1.0, now).unwrap();
+        slot.receive(incoming(None, 960)).unwrap();
+        assert_eq!(slot.generation(), 65535);
+        assert_eq!(slot.staged_samples(), 480);
+        slot.receive(incoming(Some(0), 0)).unwrap();
+        assert_eq!(slot.generation(), 0);
+        assert_eq!(slot.staged_samples(), 0);
+        assert_eq!(slot.buffer.depth().0, 1);
+        slot.receive(incoming(Some(65535), 1920)).unwrap();
+        assert_eq!(slot.buffer.depth().0, 1);
+        slot.receive(incoming(None, 960)).unwrap();
+        assert_eq!(slot.buffer.depth().0, 2);
+        assert_eq!(slot.generation(), 0);
     }
 
     #[test]
