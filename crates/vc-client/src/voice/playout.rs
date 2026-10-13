@@ -73,6 +73,7 @@ pub(super) struct Slot {
 }
 
 const FADE: usize = 120; // 2.5 ms at a latency correction boundary.
+const QUIET_SKIP: usize = 240; // Unmatched cuts only in quiet audio, 5 ms at a time.
 const MIN_LAG: usize = 120; // Search 2.5--15 ms pitch periods at 48 kHz.
 const MAX_LAG: usize = 720;
 
@@ -213,7 +214,7 @@ impl Slot {
                         let removed =
                             if !onset && !quiet && !fade { accelerate(&mut self.decoded[..n], skip) } else { 0 };
                         n -= removed;
-                        let skip = if !onset && quiet { skip.min(STEP).min(n) } else { 0 };
+                        let skip = if !onset && quiet { skip.min(QUIET_SKIP).min(n) } else { 0 };
                         self.buffer.shrunk(now, removed + skip);
                         (n, skip, fade)
                     }
