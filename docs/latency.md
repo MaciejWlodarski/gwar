@@ -307,6 +307,65 @@ pooled p95. The runners impose no fixed performance pass threshold.
 See [the 10 ms implementation report](opus-10ms.md) for transport compatibility,
 FEC evidence, bandwidth budgets and the paired local baseline measurements.
 
+## Native 10 ms packets in Chromium
+
+The manual `apps/web/e2e/native-audio.mjs` check starts a fresh loopback-only
+server, the real native client with virtual audio devices, and the built web app
+in headless Chromium. It measures two 10-second steady-state windows after two
+seconds of warmup each. Native tones are 1000 Hz and 1500 Hz; Chromium sends a
+looped 700 Hz fake-microphone WAV with capture processing disabled. Decoded tones
+must reach the app's WebAudio master output and the native speaker ring.
+The test visits the other seven fixed receive slots before reusing the first
+with a new native identity, checking that its track, SSRC and peer connection
+stay the same. Stopping native audio must produce silence in the browser.
+
+```sh
+GWAR_CHECKOUT=/absolute/path/to/gwar
+pnpm --dir "$GWAR_CHECKOUT" install --frozen-lockfile
+pnpm --dir "$GWAR_CHECKOUT" --filter web exec playwright install chromium
+cargo build --manifest-path "$GWAR_CHECKOUT/Cargo.toml" \
+  --target-dir "$GWAR_CHECKOUT/target" -p vc-client --example web_audio
+pnpm --dir "$GWAR_CHECKOUT" --filter web e2e:native-audio
+# Optional diagnostic run through an additional loopback UDP hop:
+E2E_RTP_TRACE=1 pnpm --dir "$GWAR_CHECKOUT" --filter web e2e:native-audio
+```
+
+Runs take about 31 seconds after compilation. Each retains `report.json`, SDP,
+process/build logs and the WAV under `target/web-audio/<run>/`. No existing
+server, physical audio device, Connect service or TeamSpeak server is used.
+The script creates its own endpoints and rejects non-loopback browser requests.
+Only processes it starts are stopped. The optional trace records clear RTP
+sequence/timestamp/SSRC headers, forwards to `Running.media_bind`, and reports
+unused ICE-candidate control-reply errors separately; RTP delivery errors fail.
+
+Stats are matched to the speaker's `voice.slot` and receiver MID. Counters use
+window differences: concealment is `delta(concealedSamples) /
+delta(totalSamplesReceived)`; average buffering is `delta(jitterBufferDelay) /
+delta(jitterBufferEmittedCount)` ([WebRTC stats definitions](https://www.w3.org/TR/webrtc-stats/)).
+The check requires about 100 packets/s, about 480 decoded samples/packet, zero
+loopback packet loss, less than 1% concealment and less than 60 ms mean buffering.
+Raw counters, target/minimum buffering, per-second snapshots and both PCM tone
+checks are retained even when the final quality assertions fail.
+
+Chromium 153 on macOS reported `audioLevel=0` and `totalAudioEnergy=0` while the
+actual app output carried the native tone at about 0.176 RMS. The app uses a muted
+media element to feed WebAudio; libwebrtc delivers PCM to that external sink
+before applying output gain, then measures level/energy after that gain
+([receive implementation](https://webrtc.googlesource.com/src/+/refs/heads/main/audio/channel_receive.cc)).
+These stats are recorded, but the PCM tone check determines playback.
+
+The final direct run took 29.3 seconds: 36.51/59.76 ms buffering,
+0.080/0% concealment, zero packet loss and zero native underruns.
+This remains manual: an earlier direct run during concurrent compilation averaged
+35.75/64.03 ms buffering before/after reuse, with 0/0.22% concealment and zero
+packet loss. A subsequent traced run averaged 32.74/49.91 ms, with no concealment
+or native underruns. The trace had 2447 deltas of 480 ticks and one 104640-tick
+speaker-change gap on the same slot SSRC. No 10/20 ms timestamp mismatch was
+observed. Host scheduling and Chromium's adaptation remain possible causes of
+the buffer variation; these runs do not isolate the cause or establish a stable
+CI performance limit. Physical output, other browsers and internet paths are
+outside this check.
+
 ## SFU media clock
 
 Each receive slot maps the current source's 48 kHz media deltas, independent of
