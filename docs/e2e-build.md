@@ -212,7 +212,12 @@ credential, the OpenMLS provider and Gwar's own per-group records.
   unchanged, the latter equal to the pinned server key; external proposals
   only `Remove`. In addition, every leaf a commit **introduces or changes**
   (adds, the committer's path leaf, an external joiner) must have a
-  certificate covering the commit's time (see "Commit time"). That is all:
+  certificate covering the commit's time (see "Commit time"). This applies
+  to commits the device processes as a member; a Welcome or a GroupInfo it
+  joins from carries no commit time and is judged by the structural rules
+  alone (a newcomer cannot check the group's history either way; the server
+  checked the admitting commit), followed by the usual "not current now"
+  check below. That is all:
   revocations and certificates that ran out later never make a client reject
   a commit, because clients with different revocation feeds must still
   follow the same chain (design: "Removal").
