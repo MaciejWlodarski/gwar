@@ -468,6 +468,10 @@ impl Core {
 
     fn handle(&mut self, msg: CoreMsg) {
         self.expire_sessions();
+        // A busy queue can keep the loop's timer from firing; deadlines must not wait for it.
+        if self.history.deadline().is_some_and(|at| at <= now_ms()) {
+            self.history_wake();
+        }
         match msg {
             CoreMsg::Connect(request, reply) => {
                 let session = self.connect(request);

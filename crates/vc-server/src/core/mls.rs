@@ -210,7 +210,7 @@ impl Core {
         if !added.is_empty() {
             row.observer = observer.save();
             existing.extend(added.iter().map(|p| ProposalRow { leaf: p.leaf, proposal: p.proposal.clone() }));
-            self.store.mls_write_group(&row, &observer.leaves(), &existing, None, None)?;
+            self.store.mls_write_group(&row, &observer.leaves(), &existing, None, None, &[])?;
             self.mls_announce_proposals(&row, &added);
         }
         Ok(())
@@ -600,7 +600,7 @@ impl Core {
         };
         let proposals = self.mls_missing_proposals(&mut observer, &[]).map_err(storage_error)?;
         row.observer = observer.save();
-        self.store.mls_write_group(&row, &observer.leaves(), &proposals, None, None).map_err(storage_error)?;
+        self.store.mls_write_group(&row, &observer.leaves(), &proposals, None, None, &[]).map_err(storage_error)?;
         self.mls_announce_proposals(&row, &proposals);
         reply(MlsResponse::Created { group: row.group })
     }
@@ -662,6 +662,11 @@ impl Core {
         row.group_info = info;
         let pending = self.mls_missing_proposals(&mut observer, &[]).map_err(storage_error)?;
         row.observer = observer.save();
+        // A removed leaf ends its device's history routing, even when the same device
+        // rejoins in this commit: its request was for the old leaf.
+        let routed = channel_id(&row.conversation).is_some();
+        let removed: Vec<String> =
+            if routed { accepted.removed.iter().map(|l| l.device_key.clone()).collect() } else { Vec::new() };
         self.store
             .mls_write_group(
                 &row,
@@ -669,6 +674,7 @@ impl Core {
                 &pending,
                 Some(&entry),
                 welcome.as_deref().map(|w| (w, accepted.welcome_recipients.as_slice())),
+                &removed,
             )
             .map_err(storage_error)?;
         let readers = self.mls_readers(&row.conversation);
@@ -682,10 +688,8 @@ impl Core {
             });
         }
         self.mls_announce_proposals(&row, &pending);
-        if channel_id(&row.conversation).is_some() {
-            let after: BTreeSet<_> = observer.leaves().into_iter().map(|l| l.device_key).collect();
-            let removed = before.into_iter().map(|l| l.device_key).filter(|d| !after.contains(d)).collect();
-            self.history_members_changed(group, &removed);
+        if routed {
+            self.history_members_changed(group, &removed.into_iter().collect());
         }
         reply(MlsResponse::Committed { epoch: row.epoch })
     }

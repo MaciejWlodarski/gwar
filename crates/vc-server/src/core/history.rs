@@ -165,9 +165,9 @@ impl Core {
         }
     }
 
-    /// A commit changed a channel group's members: requests of removed devices end
-    /// with their rotations, removed senders' assignments are used up, and every
-    /// outstanding request may reach new members.
+    /// A commit changed a channel group's members: requests of removed devices (already
+    /// deleted with the commit) end with their rotations, removed senders' assignments
+    /// are used up, and every outstanding request may reach new members.
     pub(super) fn history_members_changed(&mut self, group: &str, removed: &BTreeSet<String>) {
         let mut keys = BTreeSet::new();
         for recipient in removed {
@@ -177,9 +177,6 @@ impl Core {
                 self.history.assignments.remove(&id);
             }
             self.history.rotations.remove(&key);
-            if let Err(e) = self.store.mls_cancel_request(group, recipient) {
-                warn!("store: {e:#}");
-            }
         }
         let senders: Vec<_> = self
             .history
@@ -396,7 +393,7 @@ mod tests {
             created_at: 1,
         };
         let core = test_core(store, None);
-        on_core(&core, move |core| core.store.mls_write_group(&row, &leaves, &[], None, None).unwrap()).await;
+        on_core(&core, move |core| core.store.mls_write_group(&row, &leaves, &[], None, None, &[]).unwrap()).await;
         core
     }
 
@@ -619,14 +616,52 @@ mod tests {
         .await;
         assert_eq!(capped, MAX_BACKOFF_MS);
         assert_eq!(active(&core).await.len(), 1);
-        // Removing the recipient's leaf cancels its request, assignments and rotation at once.
-        on_core(&core, |core| core.history_members_changed(GROUP, &BTreeSet::from([device(10)]))).await;
+        // A commit replacing the recipient's leaf (here the same device rejoining) ends its
+        // request with the commit's write, and its assignments and rotation at once.
+        let stale = active(&core).await.into_keys().next().unwrap();
+        on_core(&core, move |core| {
+            let row = core.store.mls_group(GROUP).unwrap().unwrap();
+            let leaves: Vec<_> = leaves
+                .iter()
+                .enumerate()
+                .map(|(index, (account, d))| Leaf { index: index as u32, device_key: device(*d), uid: uid(*account) })
+                .collect();
+            core.store.mls_write_group(&row, &leaves, &[], None, None, &[device(10)]).unwrap();
+            core.history_members_changed(GROUP, &BTreeSet::from([device(10)]));
+        })
+        .await;
         assert!(active(&core).await.is_empty());
         let state = on_core(&core, |core| {
             (core.history.rotations.len(), core.store.mls_history_requested(GROUP, &device(10), now_ms()).unwrap())
         })
         .await;
         assert_eq!(state, (0, false));
+        // Its next request starts afresh, and an answer to the old assignment ends nothing.
+        on_core(&core, |core| {
+            core.store.set_meta(&format!("mls_history_request:{GROUP}:{}", device(10)), "0").unwrap()
+        })
+        .await;
+        d.get_mut(&20).unwrap().wanted();
+        request(&core, 10).await;
+        assert_eq!(d.get_mut(&20).unwrap().wanted().len(), 1);
+        on_core(&core, move |core| core.history_answered(&stale)).await;
+        assert_eq!(active(&core).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn overdue_deadlines_are_handled_before_the_next_message() {
+        let leaves = [(1, 10), (2, 20), (3, 30)];
+        let (core, mut d) = net(&leaves, &[(2, 20), (3, 30), (1, 10)]).await;
+        request(&core, 10).await;
+        assert_eq!(active(&core).await.len(), 2);
+        // Expired without a wake: the next message must not see the assignments active,
+        // whether or not the loop's timer had a chance to fire.
+        on_core(&core, |core| core.history.assignments.values_mut().for_each(|a| a.expires_at = 0)).await;
+        let state = on_core(&core, |core| core.history.assignments.len()).await;
+        assert_eq!(state, 0);
+        for dev in d.values_mut() {
+            dev.wanted();
+        }
     }
 
     #[tokio::test]

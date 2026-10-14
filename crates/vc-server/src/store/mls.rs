@@ -111,6 +111,8 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Writes a group's state; `ended_requests` are devices whose history requests end with it
+    /// (removed from a channel group by the commit being written).
     pub fn mls_write_group(
         &self,
         row: &GroupRow,
@@ -118,8 +120,15 @@ impl Store {
         proposals: &[ProposalRow],
         log: Option<&MlsLogEntry>,
         welcome: Option<(&[u8], &[String])>,
+        ended_requests: &[String],
     ) -> Result<()> {
         let tx = self.db.unchecked_transaction()?;
+        for device in ended_requests {
+            tx.execute(
+                "DELETE FROM mls_history_requests WHERE group_id=?1 AND device_key=?2",
+                params![row.group, device],
+            )?;
+        }
         tx.execute("INSERT INTO mls_groups VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(group_id) DO UPDATE SET epoch=excluded.epoch, committed_at=excluded.committed_at, group_info=excluded.group_info, observer=excluded.observer",
             params![row.group,row.conversation,row.incarnation,row.epoch,row.committed_at,row.group_info,row.observer,row.created_at])?;
         tx.execute("DELETE FROM mls_leaves WHERE group_id=?1", [&row.group])?;
@@ -535,6 +544,7 @@ impl Store {
         )?)
     }
 
+    #[cfg(test)]
     pub fn mls_cancel_request(&self, group: &str, device: &str) -> Result<()> {
         self.db
             .execute("DELETE FROM mls_history_requests WHERE group_id=?1 AND device_key=?2", params![group, device])?;
@@ -606,6 +616,7 @@ mod tests {
                 &[],
                 None,
                 None,
+                &[],
             )
             .unwrap();
         store
@@ -656,6 +667,47 @@ mod tests {
         assert_eq!(share("recipient", "d", b"d", 7), ShareHistory::Limit);
         assert_eq!(share("another-recipient", "a", b"overflow", 7), ShareHistory::Stored);
         assert_eq!(count(&store), 67);
+    }
+
+    #[test]
+    fn requests_ended_by_a_commit_go_with_its_write_or_not_at_all() {
+        let store = store();
+        let row = store.mls_group("g").unwrap().unwrap();
+        store.mls_request_history("g", "removed", 100).unwrap();
+        store.mls_request_history("g", "kept", 100).unwrap();
+        store.db.execute_batch("CREATE TRIGGER fail_write BEFORE UPDATE ON mls_groups BEGIN SELECT RAISE(ABORT,'injected write failure'); END;").unwrap();
+        assert!(store.mls_write_group(&row, &[], &[], None, None, &["removed".into()]).is_err());
+        assert!(store.mls_history_requested("g", "removed", 100).unwrap());
+        store.db.execute_batch("DROP TRIGGER fail_write").unwrap();
+        store.mls_write_group(&row, &[], &[], None, None, &["removed".into()]).unwrap();
+        assert!(!store.mls_history_requested("g", "removed", 100).unwrap());
+        assert!(store.mls_history_requested("g", "kept", 100).unwrap());
+    }
+
+    #[test]
+    fn incarnations_page_in_numeric_order_after_an_exclusive_cursor() {
+        let store = store();
+        for incarnation in [10u64, 2, 1, 0] {
+            let row = GroupRow {
+                group: format!("c{incarnation}"),
+                conversation: "channel:1".into(),
+                incarnation,
+                epoch: 0,
+                committed_at: 1,
+                group_info: vec![],
+                observer: vec![],
+                created_at: 1,
+            };
+            store.mls_write_group(&row, &[], &[], None, None, &[]).unwrap();
+        }
+        let page = |after, limit| -> Vec<u64> {
+            store.mls_incarnations("channel:1", after, limit).unwrap().iter().map(|g| g.incarnation).collect()
+        };
+        assert_eq!(page(None, 2), [0, 1]);
+        assert_eq!(page(Some(1), 2), [2, 10], "numeric, not text, order");
+        assert_eq!(page(Some(10), 2), [0u64; 0]);
+        assert_eq!(page(None, 10), [0, 1, 2, 10]);
+        assert!(store.mls_incarnations("channel:2", None, 10).unwrap().is_empty());
     }
 
     #[test]

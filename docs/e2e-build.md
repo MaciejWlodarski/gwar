@@ -1005,7 +1005,7 @@ channels and server chat:
   (as implemented), first wins, and a device that lost joins the winner after
   accepting it below.
 - **Accepting.** `mls.group_history {conversation, after?, limit?}` returns
-  `{groups: [{group, descriptor}], next}`, the conversation's groups by
+  `{incarnations: [{group, descriptor}], next}`, the conversation's groups by
   incarnation, each with its complete encoded `SignedDescriptor`, under the
   conversation's read rule. A device verifies, along the chain: each
   encoded `SignedDescriptor` parses and its signature verifies, `group`
