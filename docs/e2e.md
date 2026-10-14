@@ -1,6 +1,7 @@
 # End-to-end encryption (design)
 
-Status: **design** (phase 2). Nothing in this document is implemented. It
+Status: **design** (phase 2); being built in phase 4, see
+[e2e-build.md](e2e-build.md) for the order and the exact encodings. It
 records what was agreed, how it fits the existing identities, protocol and
 server, and what the spikes measured (see "Spikes"). [security.md](security.md)
 describes what is implemented today.
@@ -109,10 +110,13 @@ results from every commit (adds, updates, external commits, path updates):
 - the leaf signature key equals the device key in the credential, and the
   encoding is canonical;
 - the uid derives from the account key (or the local key);
-- the certificate is current and not revoked in the commit's epoch, by the
-  client's own Connect feed (a stale feed is used as it is, as for messages
-  today; it cannot be forced fresh); a client catching up judges each commit
-  by its own epoch (see "Removal");
+- a leaf the commit introduces or changes has a certificate covering the
+  commit's time (signed by its committer); revocations and certificates that
+  ran out later never make a client reject a commit, so clients with
+  different Connect feeds follow the same chain. Instead a client does not
+  send in a group while it has a leaf that is not current now by its own
+  feed (a stale feed is used as it is, as for messages today), and commits
+  its removal (see "Removal");
 - one leaf per device key, and an update keeps the leaf's uid and device key;
 - the resulting membership satisfies the conversation's rule (below).
 
@@ -200,9 +204,10 @@ that only keeps them apart, since only their devices can be in either.
 
 ### Freshness
 
-Clients remember, per group, the highest epoch they saw and its epoch
-authenticator, and never accept a GroupInfo or tree behind it, or a
-different authenticator for the same epoch (a fork). After a gap they catch
+Clients remember, per group, the highest epoch they saw and the hash of its
+GroupContext (which commits to the tree and the transcript), and never accept
+a GroupInfo or tree behind it, or a different GroupContext for the same epoch
+(a fork). After a gap they catch
 up through the handshake log, which proves the chain; a GroupInfo alone does
 not, so a device that rejoins by external commit after a gap treats it as a
 first contact. A new device has no such memory: a
@@ -236,7 +241,8 @@ of every commit:
 
 Catching up and being allowed to send are separate. A client processes every
 valid commit in order, judging it by the rules **as they stood in that
-epoch** (the access list and certificates then), even when the resulting
+epoch** (the access list then, and certificates at the commit's time for
+the leaves it brings in), even when the resulting
 tree holds a leaf that should go (an offline client catching up, or a
 competing commit by a client with a staler revocation feed). Replaying
 history never lowers what the client already knows to be current (its
@@ -370,9 +376,11 @@ New epochs come with every membership change and every leaf update.
 
 When the channel's descriptor allows it, a newcomer receives a **history
 bundle**: earlier epoch keys, each tagged with group id and epoch, sealed
-with HPKE (RFC 9180) to the newcomer's leaf encryption key. The sender's
-device key signs the whole bundle: server key, group id, recipient device key
-and leaf key, the HPKE encapsulation and the ciphertext. The newcomer accepts
+with HPKE (RFC 9180) to the newcomer's **device HPKE key**, an X25519 key each
+device publishes signed by its device key (not the leaf encryption key, which
+changes with every update and whose old private halves OpenMLS deletes). The
+sender's device key signs the whole bundle: server key, group id, recipient
+device key and HPKE key, the HPKE encapsulation and the ciphertext. The newcomer accepts
 it only from a device that is a member of the group in its current epoch.
 Any member device that is online sends one.
 The server keeps bundles from up to three different uids and drops the rest.
@@ -386,7 +394,8 @@ The same mechanism lets a **returning member** catch up on epochs it missed
 sharer includes only epochs in which, by its own records, that uid had a
 device in the group, and shares nothing where it has no such record; holding
 a key is not evidence. In a channel without history for new members, that is
-all a returning member gets. A key nobody kept is lost for good, and the
+all a returning member gets; in a channel with history, it gets what any
+newcomer gets. A key nobody kept is lost for good, and the
 messages of that epoch stay unreadable on that device.
 
 Signatures are inside the ciphertext, so a wrong key can never make a forged
