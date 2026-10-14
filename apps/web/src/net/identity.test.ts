@@ -84,7 +84,7 @@ describe("identity switching", () => {
   it("a Connect identity signs the hello challenge with the device key and has no portable backup", async () => {
     const rec = await record();
     const id = await identityFromConnect(rec);
-    const msg = new TextEncoder().encode("gwar client hello v3\ntest bytes");
+    const msg = new TextEncoder().encode("gwar client hello v4\ntest bytes");
     const pub = await crypto.subtle.importKey("raw", decodeBase64Url(rec.certificate.device_key) as BufferSource, { name: "Ed25519" }, false, ["verify"]);
     const ok = await crypto.subtle.verify({ name: "Ed25519" }, pub, decodeBase64Url(await id.sign(msg)) as BufferSource, msg as BufferSource);
     expect(ok).toBe(true);

@@ -373,6 +373,9 @@ fn server_removal_proposals_are_committed_by_reference() {
     let proposal = observer.propose_remove(&server(), 1).unwrap();
     alice.process(&proposal);
     let (commit, info) = alice.commit_pending();
+    let saved = observer.save();
+    assert_eq!(observer.referenced_removals(&commit).unwrap(), vec![1]);
+    assert_eq!(observer.save(), saved);
     let (observer, accepted) = observer.commit(&commit, &info, None, NOW, 0).unwrap();
     assert_eq!(accepted.removed.len(), 1);
     assert_eq!(accepted.removed[0].device_key, bob.credential.device_key());

@@ -10,6 +10,7 @@
 pub mod bridge;
 pub mod files;
 mod messages;
+mod mls;
 mod moderation;
 mod passwords;
 
@@ -197,6 +198,7 @@ pub struct CoreConfig {
     pub files_dir: PathBuf,
     pub connect_url: Option<String>,
     pub server_key: String,
+    pub server_signer: Arc<ed25519_dalek::SigningKey>,
 }
 
 struct Session {
@@ -260,6 +262,8 @@ pub struct Core {
     connect_pending: HashMap<Uid, u64>,
     next_connect_lookup: u64,
     server_key: String,
+    server_signer: Arc<ed25519_dalek::SigningKey>,
+    mls_commit_clock: i64,
 }
 
 /// Messages with ids at or above this value are delivered live and not stored.
@@ -407,7 +411,8 @@ impl Core {
             },
         };
         let groups = store.groups()?.into_iter().map(|g| (g.id, g)).collect();
-        Ok(Self {
+        let mls_commit_clock = store.meta("mls_commit_clock")?.map(|s| s.parse()).transpose()?.unwrap_or(0);
+        let mut core = Self {
             store,
             info,
             ice_servers: config.ice_servers,
@@ -434,7 +439,11 @@ impl Core {
             connect_pending: HashMap::new(),
             next_connect_lookup: 0,
             server_key: config.server_key,
-        })
+            server_signer: config.server_signer,
+            mls_commit_clock,
+        };
+        core.mls_reconcile()?;
+        Ok(core)
     }
 
     fn handle(&mut self, msg: CoreMsg) {
@@ -1030,6 +1039,7 @@ impl Core {
     fn request(&mut self, session: SessionId, id: u32, request: Request) -> Option<Reply> {
         let result = match request {
             Request::Hello(_) | Request::Join(_) => Err(err(ErrorCode::BadRequest, "already authenticated")),
+            Request::Mls(request) => self.mls_request(session, request),
             Request::Ping {} => Ok(Response::Empty {}),
             Request::ClientUpdate(update) => self.client_update(session, update),
             Request::ClientMove { client, channel } => self.client_move(session, client, channel),
@@ -1702,6 +1712,7 @@ pub(crate) mod expiry_tests {
                 files_dir,
                 connect_url: None,
                 server_key: String::new(),
+                server_signer: Arc::new(crate::server_key::generate()),
             },
             Arc::new(ArcSwap::from_pointee(Routing::default())),
             media,
@@ -1830,6 +1841,7 @@ pub(crate) mod expiry_tests {
                 files_dir: PathBuf::new(),
                 connect_url: None,
                 server_key: String::new(),
+                server_signer: Arc::new(crate::server_key::generate()),
             },
             routing.clone(),
             media,

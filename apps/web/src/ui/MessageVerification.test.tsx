@@ -6,7 +6,7 @@ import { useSettings } from "../state/settings";
 import { useSession } from "../state/stores";
 import type { ChatMessage } from "../proto/ChatMessage";
 import type { Row } from "../lib/chat";
-import { DELETION_TEXT, type MessageVerification } from "../net/message-signature";
+import { DELETION_TEXT, verifyMessage, type MessageVerification } from "../net/message-signature";
 import { MessageRow } from "./Chat";
 import { TooltipProvider } from "./kit";
 
@@ -59,6 +59,15 @@ describe("quiet localized message verification", () => {
       expect(container.querySelector("[data-message]")?.getAttribute("data-message-verification")).toBe("invalid");
     });
   }
+  it("renders migrated unsigned Gwar history with its text and warning", async () => {
+    const history = JSON.parse(JSON.stringify({ messages: [msg] })) as { messages: ChatMessage[] };
+    const verification = await verifyMessage(history.messages[0]!, { serverKey: "unused", target: "channel:7" });
+    expect(verification.status).toBe("unsigned");
+    await show(verification);
+    expect(container.textContent).toContain("hello @Bob");
+    expect(container.querySelector('[data-testid="message-verification-unsigned"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="message-verification-invalid"]')).toBeNull();
+  });
   it("warns about unsigned Gwar messages with an icon and tooltip only", async () => {
     await show({ ...valid, status: "unsigned" });
     const icon = container.querySelector('[data-testid="message-verification-unsigned"]')!;

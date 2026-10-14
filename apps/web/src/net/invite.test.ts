@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { buildInviteLink, parseInviteLink, readInviteFromSearch } from "./invite";
 const key = "A".repeat(43);
-describe("vc/3 invites", () => {
+describe("vc/4 invites", () => {
   it("carries the full key and exact endpoint through sharing and pasting", () => {
     const link = buildInviteLink({ webOrigin: "https://web.example.com", serverEndpoint: "wss://Voice.Example.:8443/custom/ws", serverKey: key, code: "abc123" });
     expect(parseInviteLink(link)).toEqual({ code: "abc123", server: "wss://voice.example:8443/custom/ws", serverKey: key });

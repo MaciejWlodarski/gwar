@@ -1,0 +1,54 @@
+[
+  {
+    "hello": {
+      "protocol": 4,
+      "nickname": "test",
+      "endpoint": "wss://server.example:8443/ws",
+      "expected_server_pk": "7UkoxijRwsbq6QM4kFmVYSlZJzpcY_k2NsFGFKyHN9E",
+      "server_nonce": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ",
+      "client_nonce": "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU",
+      "client_signing_pk": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+      "certificate_hash": "-",
+      "signature": "ZwZ4R5XCD5cjOYYFZKds-CRry7aUg-XP0oPmbqjDyJvgMZvRDSJ1wJ8KqnFrg8XUejKSkViHuf8zrRkXUCP8AQ",
+      "certificate": null,
+      "client": {
+        "name": "test",
+        "version": "0",
+        "platform": "web"
+      }
+    },
+    "statement": "gwar client hello v4\nwss://server.example:8443/ws\n7UkoxijRwsbq6QM4kFmVYSlZJzpcY_k2NsFGFKyHN9E\nBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ\nBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU\ngTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q\n-",
+    "hello_hash": "MqiGs4c1uXcKlSoIFRxhRBN5C0vhUWO5A37drEBry5s",
+    "proof_statement": "gwar server proof v3\nMqiGs4c1uXcKlSoIFRxhRBN5C0vhUWO5A37drEBry5s\nZwZ4R5XCD5cjOYYFZKds-CRry7aUg-XP0oPmbqjDyJvgMZvRDSJ1wJ8KqnFrg8XUejKSkViHuf8zrRkXUCP8AQ",
+    "server_proof": "kbiJmoIKHwl6zc7Kfi7meUPY4Ii28Hkf_RlIOHtHaG8QqGoRfDUmzVRkUXG2ZpECd8Oc4Bj1DDZ50T8qmOz_Cg"
+  },
+  {
+    "hello": {
+      "protocol": 4,
+      "nickname": "test",
+      "endpoint": "wss://server.example:8443/ws",
+      "expected_server_pk": "7UkoxijRwsbq6QM4kFmVYSlZJzpcY_k2NsFGFKyHN9E",
+      "server_nonce": "BAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ",
+      "client_nonce": "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU",
+      "client_signing_pk": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+      "certificate_hash": "cDrpW9X3CltPIJn95cibPtTvsgVIX79ydjoF1eqzz5E",
+      "signature": "INN-b5p6mMVwxr4kCzCgxeatjgTX2Gki-EsJnAa7IVTrJKdReoSx7HQ9oaOnoRuwbtdZkagQ5OsuiqYUKfjzBg",
+      "certificate": {
+        "account_key": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+        "device_key": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+        "issued_at": 1,
+        "expires_at": 2,
+        "signature": "hrl_m1SlEOKgUYV7RMz4dnlZ5wa5OY_m5-ZS9qWcZU82oGdpwkQdm5wVyUgxplRzxEiMoJnAs-BN6ktG0ufaDA"
+      },
+      "client": {
+        "name": "test",
+        "version": "0",
+        "platform": "web"
+      }
+    },
+    "statement": "gwar client hello v4\nwss://server.example:8443/ws\n7UkoxijRwsbq6QM4kFmVYSlZJzpcY_k2NsFGFKyHN9E\nBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQ\nBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU\ngTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q\ncDrpW9X3CltPIJn95cibPtTvsgVIX79ydjoF1eqzz5E",
+    "hello_hash": "HEkJ1oaAVaL_dFrpLmJHjksyiz0aB3m43A_sLx7NxA8",
+    "proof_statement": "gwar server proof v3\nHEkJ1oaAVaL_dFrpLmJHjksyiz0aB3m43A_sLx7NxA8\nINN-b5p6mMVwxr4kCzCgxeatjgTX2Gki-EsJnAa7IVTrJKdReoSx7HQ9oaOnoRuwbtdZkagQ5OsuiqYUKfjzBg",
+    "server_proof": "2k3rbotldK1J5s11-BLifNpOPR2wXWvEP6g2ctzw9jVKZR6YbjFWETkBSG_WQByg31orTRKffguVnvd360yECA"
+  }
+]

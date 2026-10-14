@@ -245,7 +245,7 @@ login and recovery are rate-limited per address and per handle.
 
 ## On Gwar servers
 
-The vc/3 `hello` has an optional `certificate` field:
+The vc/4 `hello` has an optional `certificate` field:
 `{account_key, device_key, issued_at, expires_at, signature}`. With it,
 `client_signing_pk` must equal `device_key`; the uid comes from `account_key`.
 The server checks the certificate's signature, current validity and revocation
@@ -268,7 +268,7 @@ Certificate wire fields are `account_key`, `device_key`, `issued_at`,
 Client statement H, signed by `client_signing_pk`:
 
 ```text
-gwar client hello v3
+gwar client hello v4
 {endpoint}
 {expected_server_pk}
 {server_nonce}
@@ -296,7 +296,7 @@ cursor are ignored, and a missing entry never clears a stored revocation.
 Connect can withhold the feed; its sequence numbers do not prove completeness.
 The core disconnects an ongoing session at certificate expiry with an explicit
 renewal reason, removes its subscriptions and voice routing, and closes its
-SFU transport. Issuance, vc/3 and message verifiers all enforce a 90-day maximum.
+SFU transport. Issuance, vc/4 and message verifiers all enforce a 90-day maximum.
 
 A certificate proves key possession, not registration with Connect. After a
 device-authenticated hello, servers asynchronously look up the account key via
@@ -323,9 +323,9 @@ verified behind each handle and marks the handle as changed, not verified, when
 it shows up on a different account, until you accept that account in the
 member's profile ([security.md](security.md#handles-implemented)).
 Chat messages, edits and author deletions use the hello key and exact certificate,
-the vc/3-verified server key (independent of endpoint aliases), locally rebuilt
-conversation and account-derived UID. The v2 revision chain and netstring body
-are specified in [architecture.md](architecture.md#signed-messages-v2).
+the vc/4-verified server key (independent of endpoint aliases), locally rebuilt
+conversation and account-derived UID. The v3 revision chain and netstring body
+are specified in [architecture.md](architecture.md#signed-messages-v3).
 Certificate validity is checked at each operation's signed time, including edits.
 Honest servers also require current session authorization.
 

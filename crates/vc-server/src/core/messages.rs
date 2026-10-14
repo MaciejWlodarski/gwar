@@ -74,7 +74,9 @@ impl Core {
             };
         };
         let bad = || err(ErrorCode::BadRequest, "invalid message signature");
-        if !vc_proto::valid_message_fields(sig)
+        if sig.group_id != "-"
+            || sig.epoch != "-"
+            || !vc_proto::valid_message_fields(sig)
             || sig.key != s.hello_key
             || sig.certificate != s.certificate
             || sig.server_key != self.server_key

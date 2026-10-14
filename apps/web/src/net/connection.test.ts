@@ -86,7 +86,7 @@ describe("handshake", () => {
     const conn = make({ url: "wss://Voice.Example.com.:443/ws", serverPassword: "pw" });
     const s = await handshake(conn);
     expect(s.sent[0]).toMatchObject({ id: 1, op: "hello", d: {
-      protocol: 3, endpoint: "wss://voice.example.com/ws", client_signing_pk: fakeIdentity.publicKey, certificate_hash: "-",
+      protocol: 4, endpoint: "wss://voice.example.com/ws", client_signing_pk: fakeIdentity.publicKey, certificate_hash: "-",
     } });
     expect(s.sent[0]!.d).not.toHaveProperty("server_password");
     expect(s.sent[1]).toMatchObject({ id: 2, op: "join", d: { server_password: "pw" } });

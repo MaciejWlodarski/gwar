@@ -18,7 +18,7 @@ export type MessageVerification = {
    *  context) a channel id the server reused after deleting it. */
   authorization: Array<"device-revoked" | "certificate-expired" | "revocations-stale" | "channel-reused" | "channel-history-incomplete">;
 };
-export interface MessageContext { serverKey: string; target: string }
+export interface MessageContext { serverKey: string; target: string; participants?: readonly [string, string] }
 export const invalidVerification = (): MessageVerification => ({ status: "invalid", continuity: "unproven", authorization: [] });
 export function fullyVerified(v?: MessageVerification): boolean {
   return v?.status === "verified" && v.continuity === "proven" && v.authorization.length === 0;
@@ -42,7 +42,7 @@ export function canonicalMessageBody(text: string, mentions: string[], attachmen
     return x.length - y.length;
   });
   const fields = [text, String(uids.length), ...uids, String(attachments.length)];
-  for (const a of attachments) fields.push(a.sha256, String(a.size), a.mime, a.name);
+  for (const a of attachments) fields.push(a.sha256, String(a.size), a.mime, a.name, "-", "-", "-");
   const chunks = fields.map((field) => { const bytes = enc.encode(field); return [enc.encode(`${bytes.length}:`), bytes, enc.encode(",")]; }).flat();
   const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
   let at = 0;
@@ -60,7 +60,7 @@ export function messageBodyHash(text: string, mentions: string[], attachments: A
 
 /** Mirrors vc_proto::message_statement: exact UTF-8 fields and no trailing newline. */
 export function messageStatement(serverKey: string, target: string, authorUid: string, s: MessageSignature, hash: string): string {
-  return `gwar message v2\n${serverKey}\n${target}\n${authorUid}\n${s.key}\n${s.certificate_hash}\n${s.message_id}\n${s.revision}\n${s.previous_revision_hash}\n${s.created_at}\n${s.signed_at}\n${hash}`;
+  return `gwar message v3\n${serverKey}\n${target}\n${s.group_id}\n${s.epoch}\n${authorUid}\n${s.key}\n${s.certificate_hash}\n${s.message_id}\n${s.revision}\n${s.previous_revision_hash}\n${s.created_at}\n${s.signed_at}\n${hash}`;
 }
 export function revisionHash(s: MessageSignature): Promise<string> {
   return sha256(enc.encode(`${messageStatement(s.server_key, s.conversation, s.author_uid, s, s.body_hash)}\n${s.signature}`));
@@ -68,7 +68,7 @@ export function revisionHash(s: MessageSignature): Promise<string> {
 export async function signMessage(identity: Identity, ctx: MessageContext, authorUid: string, text: string, mentions: string[], attachments: Attachment[], original?: MessageSignature): Promise<MessageSignature> {
   const now = Date.now();
   const s: MessageSignature = {
-    server_key: ctx.serverKey, conversation: ctx.target, author_uid: authorUid,
+    server_key: ctx.serverKey, conversation: ctx.target, group_id: "-", epoch: "-", author_uid: authorUid,
     key: identity.publicKey, certificate: identity.device ?? null, certificate_hash: await certificateHash(identity.device),
     message_id: original?.message_id ?? encodeBase64Url(crypto.getRandomValues(new Uint8Array(16))),
     revision: original ? original.revision + 1 : 0, previous_revision_hash: original ? await revisionHash(original) : "-",
@@ -87,7 +87,7 @@ export async function verifyMessage(msg: ChatMessage, ctx: MessageContext, stora
     if (!s) return { ...result, status: msg.author_uid.startsWith("ts:") ? "unsigned-ts" : "unsigned", continuity: "unproven" };
     for (const [v, n] of [[s.server_key, 32], [s.key, 32], [s.author_uid, 20], [s.message_id, 16], [s.body_hash, 32], [s.signature, 64]] as const) decodeFixed(v, n);
     const safe = (v: number) => Number.isSafeInteger(v) && v >= 0;
-    if (!safe(s.created_at) || !safe(s.signed_at) || s.signed_at < s.created_at || !safe(s.revision) || s.revision > 0xffffffff
+    if (s.group_id !== "-" || s.epoch !== "-" || !safe(s.created_at) || !safe(s.signed_at) || s.signed_at < s.created_at || !safe(s.revision) || s.revision > 0xffffffff
         || s.server_key !== ctx.serverKey || s.conversation !== ctx.target || s.author_uid !== msg.author_uid
         || s.certificate_hash !== await certificateHash(s.certificate ?? undefined) || /[\r\n]/.test(ctx.target)) return invalidVerification();
     if (s.revision === 0) { if (s.previous_revision_hash !== "-" || s.signed_at !== s.created_at) return invalidVerification(); }
@@ -95,10 +95,13 @@ export async function verifyMessage(msg: ChatMessage, ctx: MessageContext, stora
     if (typeof msg.target === "object" && "channel" in msg.target && ctx.target !== `channel:${msg.target.channel}`) return invalidVerification();
     if (msg.target === "server" && ctx.target !== "server") return invalidVerification();
     if (typeof msg.target === "object" && "client" in msg.target) {
-      const participants = ctx.target.split(":");
-      if (participants.length !== 3 || participants[0] !== "dm" || participants[1]! > participants[2]!
-          || !participants.slice(1).includes(s.author_uid)) return invalidVerification();
-      decodeFixed(participants[1], 20); decodeFixed(participants[2], 20);
+      const participants = ctx.participants;
+      if (!participants || participants[0] === participants[1] || !participants.includes(s.author_uid)
+          || ctx.target !== `dm:${[...participants].sort().join(":")}`) return invalidVerification();
+      for (const uid of participants) {
+        if (uid.startsWith("ts:")) { if (uid.length === 3 || /[\r\n]/.test(uid)) return invalidVerification(); }
+        else decodeFixed(uid, 20);
+      }
     }
     if (s.certificate) {
       const c = s.certificate;
@@ -134,7 +137,7 @@ export function sameMessageIdentity(a: ChatMessage, b: ChatMessage): boolean {
   return !!x && !!y && x.server_key === y.server_key && x.author_uid === y.author_uid
     && x.message_id === y.message_id && x.conversation === y.conversation && x.created_at === y.created_at;
 }
-export function messageFingerprint(msg: ChatMessage, ctx: MessageContext): string { return JSON.stringify([ctx, msg]); }
+export function messageFingerprint(msg: ChatMessage, ctx: MessageContext): string { return JSON.stringify([{ serverKey: ctx.serverKey, target: ctx.target }, msg]); }
 export class MessageVerifier {
   constructor(private storage: MessageStorage = messageStorage) {}
   async verify(msg: ChatMessage, ctx: MessageContext): Promise<MessageVerification> {

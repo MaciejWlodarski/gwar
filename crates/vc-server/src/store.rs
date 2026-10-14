@@ -1,6 +1,8 @@
 //! SQLite persistence. Owned by the core actor; every call is a short local
 //! transaction, so it runs inline rather than on a blocking pool.
 
+pub mod mls;
+
 use std::{collections::BTreeMap, path::Path};
 
 use anyhow::{Context, Result, bail};
@@ -258,6 +260,33 @@ const MIGRATIONS: &[&str] = &[
         INSERT OR REPLACE INTO removed_files(id,uploader,size) VALUES(old.id, old.uploader, old.size);
     END;
     "#,
+    r#"
+    CREATE TABLE mls_devices (device_key TEXT PRIMARY KEY, uid TEXT NOT NULL, hpke_key TEXT NOT NULL, created_at INTEGER NOT NULL, signature TEXT NOT NULL);
+    CREATE INDEX mls_devices_by_uid ON mls_devices(uid, device_key);
+    CREATE TABLE mls_key_packages (ref TEXT PRIMARY KEY, device_key TEXT NOT NULL, uid TEXT NOT NULL, package BLOB NOT NULL, last_resort INTEGER NOT NULL, not_after INTEGER NOT NULL);
+    CREATE INDEX mls_packages_by_device ON mls_key_packages(uid, device_key, last_resort, not_after, ref);
+    CREATE UNIQUE INDEX mls_last_resort ON mls_key_packages(device_key) WHERE last_resort=1;
+    CREATE TABLE mls_groups (group_id TEXT PRIMARY KEY, conversation TEXT NOT NULL, incarnation INTEGER NOT NULL, epoch INTEGER NOT NULL, committed_at INTEGER NOT NULL, group_info BLOB NOT NULL, observer BLOB NOT NULL, created_at INTEGER NOT NULL, UNIQUE(conversation, incarnation));
+    CREATE TABLE mls_log (group_id TEXT NOT NULL REFERENCES mls_groups(group_id) ON DELETE CASCADE, epoch INTEGER NOT NULL, proposals TEXT NOT NULL, "commit" BLOB NOT NULL, committed_at INTEGER NOT NULL, PRIMARY KEY(group_id, epoch));
+    CREATE TABLE mls_leaves (group_id TEXT NOT NULL REFERENCES mls_groups(group_id) ON DELETE CASCADE, leaf INTEGER NOT NULL, device_key TEXT NOT NULL, uid TEXT NOT NULL, PRIMARY KEY(group_id, leaf), UNIQUE(group_id, device_key));
+    CREATE TABLE mls_welcomes (id TEXT PRIMARY KEY, device_key TEXT NOT NULL, group_id TEXT NOT NULL REFERENCES mls_groups(group_id) ON DELETE CASCADE, welcome BLOB NOT NULL, created_at INTEGER NOT NULL);
+    CREATE INDEX mls_welcomes_by_device ON mls_welcomes(device_key, id);
+    CREATE TABLE mls_proposals (group_id TEXT NOT NULL REFERENCES mls_groups(group_id) ON DELETE CASCADE, epoch INTEGER NOT NULL, leaf INTEGER NOT NULL, proposal BLOB NOT NULL, PRIMARY KEY(group_id, epoch, leaf));
+    CREATE TABLE mls_history_requests (group_id TEXT NOT NULL REFERENCES mls_groups(group_id) ON DELETE CASCADE, device_key TEXT NOT NULL, requested_at INTEGER NOT NULL, PRIMARY KEY(group_id, device_key));
+    CREATE TABLE mls_history (id TEXT PRIMARY KEY, group_id TEXT NOT NULL REFERENCES mls_groups(group_id) ON DELETE CASCADE, recipient_device TEXT NOT NULL, sender_uid TEXT NOT NULL, first_epoch INTEGER NOT NULL, last_epoch INTEGER NOT NULL, chunk BLOB NOT NULL, created_at INTEGER NOT NULL);
+    CREATE INDEX mls_history_by_recipient ON mls_history(recipient_device, id);
+    "#,
+    // v2 statements cannot be verified as v3. Preserve their bodies as unsigned history.
+    r#"
+    UPDATE messages SET signature=NULL WHERE signature IS NOT NULL AND
+        (json_type(signature, '$.group_id') IS NULL OR json_type(signature, '$.epoch') IS NULL);
+    "#,
+    r#"
+    ALTER TABLE mls_history ADD COLUMN chunk_hash BLOB;
+    CREATE INDEX mls_history_chunks ON mls_history(group_id, recipient_device, sender_uid);
+    CREATE INDEX mls_history_hashes ON mls_history(group_id, recipient_device, chunk_hash);
+    CREATE INDEX mls_history_group_inbox ON mls_history(recipient_device, group_id, id);
+    "#,
 ];
 
 /// References reassigned by a member merge (including ones already held by the target).
@@ -284,11 +313,24 @@ impl Store {
     }
 
     fn init(db: Connection) -> Result<Self> {
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;")?;
+        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
         let version: usize = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         for (index, migration) in MIGRATIONS.iter().enumerate().skip(version) {
             let tx = db.unchecked_transaction()?;
             tx.execute_batch(migration)?;
+            if migration.contains("ADD COLUMN chunk_hash") {
+                let mut stmt = tx.prepare("SELECT id,chunk FROM mls_history")?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let id: String = row.get(0)?;
+                    let chunk: Vec<u8> = row.get(1)?;
+                    tx.execute(
+                        "UPDATE mls_history SET chunk_hash=?2 WHERE id=?1",
+                        params![id, Sha256::digest(chunk).as_slice()],
+                    )?;
+                }
+                tx.execute("DELETE FROM mls_history WHERE rowid NOT IN (SELECT MIN(rowid) FROM mls_history GROUP BY group_id,recipient_device,chunk_hash)", [])?;
+            }
             tx.pragma_update(None, "user_version", index + 1)?;
             tx.commit()?;
         }
@@ -1244,6 +1286,85 @@ fn urlencode(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upgrading_v2_history_preserves_bodies_and_makes_them_unsigned() {
+        let db = Connection::open_in_memory().unwrap();
+        let before = migration_adding("CREATE TABLE mls_devices");
+        for migration in &MIGRATIONS[..before] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.pragma_update(None, "user_version", before).unwrap();
+        db.execute_batch(
+            "INSERT INTO channels(id,name) VALUES(1,'legacy');
+            INSERT INTO messages(id,channel,author_uid,author_name,text,sent_at,signature) VALUES
+            (1,1,'gwar-user','author','old text',1,'{\"key\":\"old device\",\"signature\":\"v2\"}'),
+            (2,1,'gwar-user','author','delete me',2,'{\"key\":\"old device\",\"signature\":\"v2\"}'),
+            (3,1,'ts:peer','peer','unsigned',3,NULL);",
+        )
+        .unwrap();
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../../vc-proto/tests/message-signing.json")).unwrap();
+        let v3 = vectors[0]["signature"].clone();
+        let mut v2 = v3.clone();
+        v2.as_object_mut().unwrap().remove("group_id");
+        v2.as_object_mut().unwrap().remove("epoch");
+        db.execute("UPDATE messages SET signature=?1 WHERE id IN (1,2)", [v2.to_string()]).unwrap();
+        db.execute("INSERT INTO messages(id,channel,author_uid,author_name,text,sent_at,signature) VALUES(4,1,'gwar-user','author','v3',4,?1)", [v3.to_string()]).unwrap();
+        let store = Store::init(db).unwrap();
+        let history = store.history(1, None, 100).unwrap();
+        assert_eq!(history.len(), 4);
+        assert!(history[..3].iter().all(|m| m.signature.is_none()));
+        assert!(history[3].signature.is_some());
+        assert_eq!(history[0].text, "old text");
+        assert_eq!(store.message(1).unwrap().unwrap().text, "old text");
+        store.edit_message(1, "edited", 4).unwrap();
+        let edited = store.message(1).unwrap().unwrap();
+        assert_eq!(edited.text, "edited");
+        assert_eq!(edited.edited_at, Some(4));
+        assert!(edited.signature.is_none());
+        store.delete_message(2).unwrap();
+        assert!(store.message(2).unwrap().is_none());
+        assert_eq!(store.history(1, None, 100).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn history_hash_migration_backfills_and_deduplicates_existing_chunks() {
+        let db = Connection::open_in_memory().unwrap();
+        let before = migration_adding("ADD COLUMN chunk_hash");
+        for migration in &MIGRATIONS[..before] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.pragma_update(None, "user_version", before).unwrap();
+        db.execute_batch(
+            "INSERT INTO mls_groups VALUES('g','dm:a:b',0,0,1,X'00',X'00',1);
+            INSERT INTO mls_history VALUES('one','g','recipient','sender',0,0,X'01',1);
+            INSERT INTO mls_history VALUES('two','g','recipient','sender',0,0,X'01',2);
+            INSERT INTO mls_history VALUES('other','g','other-device','sender',0,0,X'01',2);",
+        )
+        .unwrap();
+        let store = Store::init(db).unwrap();
+        assert_eq!(store.db.query_row::<u32, _, _>("SELECT COUNT(*) FROM mls_history", [], |r| r.get(0)).unwrap(), 2);
+        let hash: Vec<u8> =
+            store.db.query_row("SELECT chunk_hash FROM mls_history WHERE id='one'", [], |r| r.get(0)).unwrap();
+        assert_eq!(hash, Sha256::digest([1]).as_slice());
+        assert_eq!(
+            store.mls_share_history("g", "recipient", ("sender", "device"), &[1], (0, 0), 2).unwrap(),
+            mls::ShareHistory::Duplicate
+        );
+    }
+
+    #[test]
+    fn sqlite_connections_use_full_durability() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("durable.sqlite");
+        for store in [Store::in_memory().unwrap(), Store::open(&path).unwrap(), Store::open(&path).unwrap()] {
+            let synchronous: u32 = store.db.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
+            assert_eq!(synchronous, 2);
+            store.set_meta("mls_commit_clock", "123").unwrap();
+        }
+        assert_eq!(Store::open(&path).unwrap().meta("mls_commit_clock").unwrap().as_deref(), Some("123"));
+    }
 
     #[test]
     fn seeds_and_persists() {

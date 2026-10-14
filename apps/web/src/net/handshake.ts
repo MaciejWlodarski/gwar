@@ -54,7 +54,7 @@ export function helloStatement(h: Pick<Hello, "endpoint" | "expected_server_pk" 
   if (normalizeEndpoint(h.endpoint) !== h.endpoint) throw new Error("noncanonical endpoint");
   for (const value of [h.expected_server_pk, h.server_nonce, h.client_nonce, h.client_signing_pk]) decodeFixed(value, 32);
   if (h.certificate_hash !== "-") decodeFixed(h.certificate_hash, 32);
-  return `gwar client hello v3\n${h.endpoint}\n${h.expected_server_pk}\n${h.server_nonce}\n${h.client_nonce}\n${h.client_signing_pk}\n${h.certificate_hash}`;
+  return `gwar client hello v4\n${h.endpoint}\n${h.expected_server_pk}\n${h.server_nonce}\n${h.client_nonce}\n${h.client_signing_pk}\n${h.certificate_hash}`;
 }
 
 export async function proofStatement(h: Hello): Promise<string> {

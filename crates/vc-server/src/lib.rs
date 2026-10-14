@@ -1,7 +1,7 @@
 //! Voice server core.
 //!
 //! ```text
-//!  browser / desktop ──WS vc/3──▶ gateway ──▶ core actor ──▶ SQLite
+//!  browser / desktop ──WS vc/4──▶ gateway ──▶ core actor ──▶ SQLite
 //!                                                │ routing snapshot
 //!  browser / desktop ◀─WebRTC Opus─▶ media SFU ◀─┤
 //!  official TeamSpeak server ◀─query + puppets─▶ teamspeak bridge (optional)
@@ -239,6 +239,7 @@ pub async fn start(config: Config) -> Result<Running> {
             storage_limit: config.storage_limit,
             files_dir,
             connect_url: config.connect_url.clone(),
+            server_signer: server_key.clone(),
             server_key: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(server_key.verifying_key().as_bytes()),
         },
         routing.clone(),

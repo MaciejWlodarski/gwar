@@ -1,4 +1,4 @@
-//! End-to-end tests of the `vc/3` protocol against a real in-process server.
+//! End-to-end tests of the `vc/4` protocol against a real in-process server.
 
 mod common;
 

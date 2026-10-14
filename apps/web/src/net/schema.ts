@@ -50,7 +50,7 @@ const uid: Rule<string> = (v): v is string => str(128)(v) && v.length > 0 && v !
 const ids = array(id, 128);
 const permissions = literal<Permission>(["server_manage", "channel_create", "channel_edit", "channel_delete", "channel_join_locked", "client_move", "client_kick", "token_create", "client_ban", "group_manage", "message_manage", "invite_create", "file_upload", "member_remove", "member_nickname"]);
 const platform = literal<Platform>(["web", "desktop", "mobile", "ts3", "ts6"]);
-const errorCode = literal<ErrorCode>(["bad_request", "not_authenticated", "not_found", "forbidden", "wrong_password", "channel_full", "rate_limited", "conflict", "unavailable", "internal", "banned", "too_large", "quota_exceeded", "certificate_expired"]);
+const errorCode = literal<ErrorCode>(["bad_request", "not_authenticated", "not_found", "forbidden", "wrong_password", "channel_full", "rate_limited", "conflict", "unavailable", "internal", "banned", "too_large", "quota_exceeded", "certificate_expired", "stale", "expired", "early"]);
 const path = (put = false): Rule<string> => (v): v is string => {
   if (!str(2048)(v)) return false;
   try { filePath(v, put ? "PUT" : "GET"); return true; } catch { return false; }
@@ -76,8 +76,8 @@ const welcome = shape<Welcome>({ session: id, uid, server, permissions: array(pe
 const target: Rule<ChatTarget> = (v): v is ChatTarget => v === "server" || shape<{ channel: number }>({ channel: id })(v) || shape<{ client: number }>({ client: id })(v);
 const certificate = shape<DeviceCertificate>({ account_key: fixed(32), device_key: fixed(32), issued_at: id, expires_at: id, signature: fixed(64) });
 const commitment: Rule<string> = (v): v is string => v === "-" || fixed(32)(v);
-const conversation: Rule<string> = (v): v is string => str(128)(v) && /^(server|channel:(0|[1-9][0-9]*)|dm:[A-Za-z0-9_-]{27}:[A-Za-z0-9_-]{27})$/.test(v);
-const signature = shape<MessageSignature>({ server_key: fixed(32), conversation, author_uid: fixed(20), key: fixed(32), certificate: nullable(certificate), certificate_hash: commitment, message_id: fixed(16), revision: int(4294967295), previous_revision_hash: commitment, created_at: id, signed_at: id, body_hash: fixed(32), signature: fixed(64) });
+const conversation: Rule<string> = (v): v is string => str(128)(v) && /^(server|channel:(0|[1-9][0-9]*)|dm:(?:[A-Za-z0-9_-]{27}|ts:[^\r\n]+):(?:[A-Za-z0-9_-]{27}|ts:[^\r\n]+))$/.test(v);
+const signature = shape<MessageSignature>({ server_key: fixed(32), conversation, group_id: commitment, epoch: str(32), author_uid: fixed(20), key: fixed(32), certificate: nullable(certificate), certificate_hash: commitment, message_id: fixed(16), revision: int(4294967295), previous_revision_hash: commitment, created_at: id, signed_at: id, body_hash: fixed(32), signature: fixed(64) });
 export const attachment = shape<Attachment>({ id: str(64), name: str(512), mime: str(100), size: int(MAX_FILE_BYTES, 1), url: path(), width: optional(nullable(int(4294967295))), height: optional(nullable(int(4294967295))), sha256: (v): v is string => v === "" || fixed(32)(v) });
 const message = shape<ChatMessage>({ id, target, author: id, author_uid: uid, author_name: str(256), text, sent_at: id, mentions: optional(array(uid, 128)), attachments: optional(array(attachment, 10)), edited_at: optional(nullable(id)), signature: optional(nullable(signature)) });
 const notice = shape<BanNotice>({ by: str(256), reason: optional(nullable(text)), until: optional(nullable(id)) });
@@ -96,7 +96,20 @@ const ban = shape<Ban>({ id, uid: optional(nullable(uid)), ip: optional(nullable
 const invite = shape<Invite>({ code: str(128), uses: int(4294967295), max_uses: optional(nullable(int(4294967295))), expires_at: optional(nullable(id)), group: optional(nullable(id)), created_by: str(256), created_at: id });
 const empty = shape<Record<string, never>>({});
 
+const mlsBlob = str(175000);
+const mlsChunk = str(65536);
+const mlsGroupId = fixed(32);
+const mlsProposals = array(mlsBlob, 1024);
+const mlsWanted = shape({ group: mlsGroupId, device: fixed(32) });
+const mlsLogEntry = shape({ epoch: id, proposals: mlsProposals, commit: mlsBlob });
+const cursor = nullable(str(1024));
+
 export const events: { [K in EventName]: Rule<EventData<K>> } = {
+  "mls.commit": shape({ group: mlsGroupId, epoch: id, proposals: mlsProposals, commit: mlsBlob }),
+  "mls.proposal": shape({ group: mlsGroupId, epoch: id, proposal: mlsBlob }),
+  "mls.welcome": shape({ group: mlsGroupId }), "mls.history": shape({ group: mlsGroupId }),
+  "mls.history.wanted": mlsWanted,
+
   challenge, "server.updated": server, "channel.created": channel, "channel.updated": channel,
   "channel.deleted": shape({ channel: id }), "client.joined": client, "client.updated": client,
   "client.left": shape({ client: id, reason: leave }), "chat.message": message, "chat.edited": message,
@@ -106,6 +119,19 @@ export const events: { [K in EventName]: Rule<EventData<K>> } = {
   "voice.closed": shape({ reason: text }), "chat.read": shape({ channel: id, message: id }), "disconnected": shape({ reason: leave }),
 };
 export const responses: { [K in Op]: Rule<ResponseMap[K]> } = {
+  "mls.device.publish": empty, "mls.key_packages.publish": shape({ count: int(20) }),
+  "mls.key_packages.claim": shape({ packages: array(shape({ device_key: fixed(32), package: str(5462) }), 100), next: cursor }),
+  "mls.devices": shape({ devices: array(shape({ uid: fixed(20), device_key: fixed(32), hpke_key: fixed(32), created_at: id, signature: fixed(64) }), 100), next: cursor }),
+  "mls.group.create": shape({ group: mlsGroupId }), "mls.group_info": shape({ group_info: mlsBlob, epoch: id }),
+  "mls.commit": shape({ epoch: id }),
+  "mls.log": shape({ head: id, oldest: id, entries: array(mlsLogEntry, 100), pending: mlsProposals, next: nullable(id) }),
+  "mls.groups": shape({ groups: array(shape({ conversation, group: mlsGroupId, epoch: id, pending: bool }), 100), next: cursor }),
+  "mls.welcomes": shape({ welcomes: array(shape({ id: fixed(16), group: mlsGroupId, welcome: mlsBlob }), 100), next: cursor }),
+  "mls.welcomes.ack": empty, "mls.history.share": empty,
+  "mls.history.fetch": shape({ chunks: array(shape({ id: fixed(16), group: mlsGroupId, sender_uid: fixed(20), chunk: mlsChunk }), 100), next: cursor }),
+  "mls.history.wanted": shape({ wanted: array(mlsWanted, 100), next: cursor }),
+  "mls.history.ack": empty, "mls.history.request": empty,
+
   hello: serverProof, join: welcome, ping: empty, "client.update": empty, "client.move": empty, "client.kick": empty,
   "channel.join": empty, "channel.leave": empty, "channel.create": channel, "channel.update": channel, "channel.delete": empty,
   "chat.send": message, "chat.edit": message, "chat.delete": empty, "chat.read": empty,

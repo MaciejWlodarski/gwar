@@ -16,6 +16,7 @@ name = "vc-server"
 path = "src/main.rs"
 
 [dependencies]
+gwar-mls = { path = "../gwar-mls" }
 vc-proto = { path = "../vc-proto", features = ["rtp"] }
 anyhow.workspace = true
 arc-swap = "1"
@@ -36,6 +37,10 @@ sha2 = "0.10"
 str0m = { version = "0.24", default-features = false, features = ["aws-lc-rs"] }
 thiserror.workspace = true
 tokio.workspace = true
+# Direct socket access lets authentication raise the transport limits after join.
+tokio-tungstenite = "0.29"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 tower-http = { version = "0.6", features = ["fs", "cors"] }
 # HTTPS without a reverse proxy (own certificate or Let's Encrypt).
 rustls-acme = { version = "0.15", features = ["axum"] }
@@ -53,6 +58,8 @@ zip = { version = "9", default-features = false, features = ["deflate"], optiona
 libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
+openmls = "=0.9.1"
+openmls_rust_crypto = "=0.6.0"
 vc-client = { path = "../vc-client" }
 audiopus = "=0.3.0-rc.0"
 tokio = { workspace = true, features = ["test-util"] }
@@ -60,4 +67,3 @@ gwar-connect = { path = "../gwar-connect" }
 reqwest = { version = "0.13", default-features = false }
 rcgen = "0.13"
 tempfile = "3"
-tokio-tungstenite = "0.27"

@@ -1,4 +1,4 @@
-//! Wire protocol `vc/3`.
+//! Wire protocol `vc/4`.
 //!
 //! One WebSocket carries JSON text frames in both directions:
 //!
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "ts")]
 use ts_rs::TS;
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Number of server→client audio slots a WebRTC client must offer as `recvonly`.
 pub const AUDIO_SLOTS: usize = 8;
@@ -57,6 +57,9 @@ macro_rules! wire {
         $item
     )*};
 }
+
+mod mls;
+pub use mls::*;
 
 wire! {
     /// Client → server frame.
@@ -170,6 +173,8 @@ wire! {
         TokenRedeem { token: String },
         #[serde(rename = "voice.offer")]
         VoiceOffer { sdp: String },
+        #[serde(untagged)]
+        Mls(MlsRequest),
     }
 
     #[serde(deny_unknown_fields)]
@@ -371,7 +376,7 @@ wire! {
         Event(Event),
     }
 
-    #[serde(untagged)]
+    #[serde(untagged, deny_unknown_fields)]
     pub enum Response {
         ServerProof(ServerProof),
         Welcome(Box<Welcome>),
@@ -394,6 +399,7 @@ wire! {
         /// repeat it while `count` exceeds `uids.len()`. `members` are the same people
         /// as they were stored (nickname, groups, last seen), in the same order.
         Pruned { uids: Vec<Uid>, count: u32, members: Vec<Member> },
+        Mls(MlsResponse),
         Empty {},
     }
 
@@ -434,6 +440,9 @@ wire! {
         QuotaExceeded,
         /// The Gwar Connect device certificate in `hello` has expired.
         CertificateExpired,
+        Stale,
+        Expired,
+        Early,
     }
 
     #[serde(tag = "ev", content = "d")]
@@ -485,6 +494,8 @@ wire! {
         /// Sent right before the server closes this connection.
         #[serde(rename = "disconnected")]
         Disconnected { reason: LeaveReason },
+        #[serde(untagged)]
+        Mls(MlsEvent),
     }
 
     pub struct Challenge {
@@ -690,6 +701,8 @@ wire! {
     pub struct MessageSignature {
         pub server_key: String,
         pub conversation: String,
+        pub group_id: String,
+        pub epoch: String,
         pub author_uid: Uid,
         pub key: String,
         pub certificate: Option<DeviceCertificate>,
@@ -799,7 +812,7 @@ pub fn canonical_message_body(text: &str, mentions: &[Uid], attachments: &[Attac
     }
     append(&mut out, &attachments.len().to_string());
     for a in attachments {
-        for value in [&a.sha256, &a.size.to_string(), &a.mime, &a.name] {
+        for value in [&a.sha256, &a.size.to_string(), &a.mime, &a.name, "-", "-", "-"] {
             append(&mut out, value);
         }
     }
@@ -819,7 +832,7 @@ pub fn dm_conversation(a: &str, b: &str) -> String {
     if a <= b { format!("dm:{a}:{b}") } else { format!("dm:{b}:{a}") }
 }
 
-/// Exact v2 statement, without a trailing newline. Verifiers validate all fields first.
+/// Exact v3 statement, without a trailing newline. Verifiers validate all fields first.
 pub fn message_statement(
     server_key: &str,
     conversation: &str,
@@ -828,8 +841,16 @@ pub fn message_statement(
     hash: &str,
 ) -> String {
     format!(
-        "gwar message v2\n{server_key}\n{conversation}\n{author}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{hash}",
-        s.key, s.certificate_hash, s.message_id, s.revision, s.previous_revision_hash, s.created_at, s.signed_at
+        "gwar message v3\n{server_key}\n{conversation}\n{}\n{}\n{author}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{hash}",
+        s.group_id,
+        s.epoch,
+        s.key,
+        s.certificate_hash,
+        s.message_id,
+        s.revision,
+        s.previous_revision_hash,
+        s.created_at,
+        s.signed_at
     )
 }
 
@@ -844,8 +865,19 @@ pub fn message_revision_hash(s: &MessageSignature) -> String {
     )
 }
 
+fn canonical_epoch(value: &str) -> bool {
+    value.parse::<u64>().is_ok_and(|n| n <= MAX_SAFE_INTEGER as u64 && n.to_string() == value)
+}
+
+pub fn valid_dm_participant(uid: &str) -> bool {
+    decode_fixed::<20>(uid).is_some()
+        || uid.strip_prefix("ts:").is_some_and(|id| !id.is_empty() && !id.contains(['\r', '\n']))
+}
+
 pub fn valid_message_fields(s: &MessageSignature) -> bool {
     decode_fixed::<32>(&s.server_key).is_some()
+        && ((s.group_id == "-" && s.epoch == "-")
+            || (decode_fixed::<32>(&s.group_id).is_some() && canonical_epoch(&s.epoch)))
         && decode_fixed::<32>(&s.key).is_some()
         && decode_fixed::<20>(&s.author_uid).is_some()
         && decode_fixed::<16>(&s.message_id).is_some()
@@ -915,7 +947,13 @@ pub enum MessageCheck {
 
 /// Checks `msg` against the conversation the reader expects it in (see
 /// [`dm_conversation`]); mirrors the web app's `verifyMessage`.
-pub fn verify_message(msg: &ChatMessage, server_key: &str, conversation: &str, now: i64) -> MessageCheck {
+pub fn verify_message(
+    msg: &ChatMessage,
+    server_key: &str,
+    conversation: &str,
+    now: i64,
+    participants: Option<(&str, &str)>,
+) -> MessageCheck {
     let Some(s) = &msg.signature else {
         return if msg.author_uid.starts_with("ts:") {
             MessageCheck::UnsignedTeamSpeak
@@ -926,14 +964,12 @@ pub fn verify_message(msg: &ChatMessage, server_key: &str, conversation: &str, n
     let target_matches = match msg.target {
         ChatTarget::Channel(id) => conversation == format!("channel:{id}"),
         ChatTarget::Server => conversation == "server",
-        ChatTarget::Client(_) => {
-            let parts: Vec<_> = conversation.split(':').collect();
-            parts.len() == 3
-                && parts[0] == "dm"
-                && parts[1] <= parts[2]
-                && parts[1..].contains(&s.author_uid.as_str())
-                && parts[1..].iter().all(|uid| decode_fixed::<20>(uid).is_some())
-        }
+        ChatTarget::Client(_) => participants.is_some_and(|(reader, peer)| {
+            reader != peer
+                && [reader, peer].iter().all(|uid| valid_dm_participant(uid))
+                && [reader, peer].contains(&s.author_uid.as_str())
+                && conversation == dm_conversation(reader, peer)
+        }),
     };
     let author_key = s.certificate.as_ref().map_or(&s.key, |c| &c.account_key);
     let certificate_valid = s.certificate.as_ref().is_none_or(|c| {
@@ -946,6 +982,8 @@ pub fn verify_message(msg: &ChatMessage, server_key: &str, conversation: &str, n
     let deletion_valid =
         msg.text != DELETION_TEXT || (s.revision > 0 && msg.attachments.is_empty() && msg.mentions.is_empty());
     if !valid_message_fields(s)
+        || s.group_id != "-"
+        || s.epoch != "-"
         || !target_matches
         || s.server_key != server_key
         || s.conversation != conversation
@@ -1016,7 +1054,7 @@ pub fn hello_statement(h: &Hello) -> Option<String> {
         return None;
     }
     Some(format!(
-        "gwar client hello v3\n{}\n{}\n{}\n{}\n{}\n{}",
+        "gwar client hello v4\n{}\n{}\n{}\n{}\n{}\n{}",
         h.endpoint, h.expected_server_pk, h.server_nonce, h.client_nonce, h.client_signing_pk, h.certificate_hash
     ))
 }
@@ -1077,7 +1115,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn message_v2_shared_vectors() {
+    fn message_v3_shared_vectors() {
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
         use ed25519_dalek::{Signature, VerifyingKey};
         let vectors: serde_json::Value = serde_json::from_str(include_str!("../tests/message-signing.json")).unwrap();
@@ -1115,7 +1153,13 @@ mod tests {
                 signature: Some(Box::new(s.clone())),
             };
             assert!(matches!(
-                verify_message(&msg, &s.server_key, &s.conversation, s.signed_at),
+                verify_message(
+                    &msg,
+                    &s.server_key,
+                    &s.conversation,
+                    s.signed_at,
+                    v["participants"].as_array().map(|p| (p[0].as_str().unwrap(), p[1].as_str().unwrap()))
+                ),
                 MessageCheck::Verified { .. }
             ));
             let mut bad = s.clone();
@@ -1171,6 +1215,8 @@ mod tests {
             let mut s = MessageSignature {
                 server_key: server(),
                 conversation: conversation.into(),
+                group_id: "-".into(),
+                epoch: "-".into(),
                 author_uid: author.clone(),
                 key: pk(device),
                 certificate: account.cloned(),
@@ -1208,23 +1254,23 @@ mod tests {
             let alice = SigningKey::from_bytes(&[1; 32]);
             let msg = signed(&alice, None, ChatTarget::Channel(5), "channel:5", "hi");
             let ok = MessageCheck::Verified { certificate_expired: false };
-            assert_eq!(verify_message(&msg, &server(), "channel:5", NOW), ok);
-            assert_eq!(verify_message(&msg, &server(), "channel:6", NOW), MessageCheck::Invalid);
-            assert_eq!(verify_message(&msg, &B64.encode([8; 32]), "channel:5", NOW), MessageCheck::Invalid);
+            assert_eq!(verify_message(&msg, &server(), "channel:5", NOW, None), ok);
+            assert_eq!(verify_message(&msg, &server(), "channel:6", NOW, None), MessageCheck::Invalid);
+            assert_eq!(verify_message(&msg, &B64.encode([8; 32]), "channel:5", NOW, None), MessageCheck::Invalid);
             let mut moved = msg.clone();
             moved.target = ChatTarget::Channel(6);
-            assert_eq!(verify_message(&moved, &server(), "channel:6", NOW), MessageCheck::Invalid);
+            assert_eq!(verify_message(&moved, &server(), "channel:6", NOW, None), MessageCheck::Invalid);
             let mut edited = msg.clone();
             edited.text = "bye".into();
-            assert_eq!(verify_message(&edited, &server(), "channel:5", NOW), MessageCheck::Invalid);
+            assert_eq!(verify_message(&edited, &server(), "channel:5", NOW, None), MessageCheck::Invalid);
             let mut mentioned = msg.clone();
             mentioned.mentions = vec![uid(&alice)];
-            assert_eq!(verify_message(&mentioned, &server(), "channel:5", NOW), MessageCheck::Invalid);
+            assert_eq!(verify_message(&mentioned, &server(), "channel:5", NOW, None), MessageCheck::Invalid);
             let mut impostor = msg.clone();
             let mallory = SigningKey::from_bytes(&[2; 32]);
             impostor.author_uid = uid(&mallory);
             impostor.signature.as_mut().unwrap().author_uid = uid(&mallory);
-            assert_eq!(verify_message(&impostor, &server(), "channel:5", NOW), MessageCheck::Invalid);
+            assert_eq!(verify_message(&impostor, &server(), "channel:5", NOW, None), MessageCheck::Invalid);
             // Mallory signs with her own key under Alice's name.
             let (alice_uid, mallory_uid) = (uid(&alice), uid(&mallory));
             let mut forged = signed(&mallory, None, ChatTarget::Channel(5), "channel:5", "hi");
@@ -1237,7 +1283,7 @@ mod tests {
                     .to_bytes(),
             );
             assert_ne!(forged.author_uid, mallory_uid);
-            assert_eq!(verify_message(&forged, &server(), "channel:5", NOW), MessageCheck::Invalid);
+            assert_eq!(verify_message(&forged, &server(), "channel:5", NOW, None), MessageCheck::Invalid);
             // Signed fields that disagree with what was signed.
             for tamper in [
                 (|s: &mut MessageSignature| s.server_key = B64.encode([8; 32])) as fn(&mut MessageSignature),
@@ -1251,13 +1297,13 @@ mod tests {
             ] {
                 let mut m = msg.clone();
                 tamper(m.signature.as_mut().unwrap());
-                assert_eq!(verify_message(&m, &server(), "channel:5", NOW), MessageCheck::Invalid);
+                assert_eq!(verify_message(&m, &server(), "channel:5", NOW, None), MessageCheck::Invalid);
             }
             // Other words with a matching body hash still carry the old signature.
             let mut rewritten = msg.clone();
             rewritten.text = "bye".into();
             rewritten.signature.as_mut().unwrap().body_hash = message_body_hash("bye", &[], &[]);
-            assert_eq!(verify_message(&rewritten, &server(), "channel:5", NOW), MessageCheck::Invalid);
+            assert_eq!(verify_message(&rewritten, &server(), "channel:5", NOW, None), MessageCheck::Invalid);
             let mut huge = msg.clone();
             huge.attachments = vec![Attachment {
                 id: "f".into(),
@@ -1277,7 +1323,7 @@ mod tests {
                     .to_bytes(),
             );
             assert_eq!(
-                verify_message(&huge, &server(), "channel:5", NOW),
+                verify_message(&huge, &server(), "channel:5", NOW, None),
                 MessageCheck::Invalid,
                 "size beyond what the web app reads exactly"
             );
@@ -1289,10 +1335,10 @@ mod tests {
                     .sign(message_statement(&server(), "channel:5", &huge.author_uid, s, &s.body_hash).as_bytes())
                     .to_bytes(),
             );
-            assert_eq!(verify_message(&huge, &server(), "channel:5", NOW), ok);
+            assert_eq!(verify_message(&huge, &server(), "channel:5", NOW, None), ok);
             let server_wide = signed(&alice, None, ChatTarget::Server, "server", "all");
-            assert_eq!(verify_message(&server_wide, &server(), "server", NOW), ok);
-            assert_eq!(verify_message(&server_wide, &server(), "channel:5", NOW), MessageCheck::Invalid);
+            assert_eq!(verify_message(&server_wide, &server(), "server", NOW, None), ok);
+            assert_eq!(verify_message(&server_wide, &server(), "channel:5", NOW, None), MessageCheck::Invalid);
         }
 
         /// A key with a small-order component can sign so that `verify_strict` accepts it (for
@@ -1339,18 +1385,47 @@ mod tests {
             let to_bob = dm_conversation(&uid(&alice), &uid(&bob));
             let msg = signed(&alice, None, ChatTarget::Client(2), &to_bob, "psst");
             assert_eq!(
-                verify_message(&msg, &server(), &to_bob, NOW),
+                verify_message(&msg, &server(), &to_bob, NOW, Some((&uid(&alice), &uid(&bob)))),
                 MessageCheck::Verified { certificate_expired: false }
             );
             // Relayed to Carol as if it were to her.
             assert_eq!(
-                verify_message(&msg, &server(), &dm_conversation(&uid(&alice), &uid(&carol)), NOW),
+                verify_message(&msg, &server(), &dm_conversation(&uid(&alice), &uid(&carol)), NOW, None),
                 MessageCheck::Invalid
             );
             // A DM signed between two others is not from either reader's partner.
             let others = dm_conversation(&uid(&bob), &uid(&carol));
             let foreign = signed(&alice, None, ChatTarget::Client(2), &others, "x");
-            assert_eq!(verify_message(&foreign, &server(), &others, NOW), MessageCheck::Invalid);
+            assert_eq!(
+                verify_message(&foreign, &server(), &others, NOW, Some((&uid(&bob), &uid(&carol)))),
+                MessageCheck::Invalid
+            );
+        }
+
+        #[test]
+        fn teamspeak_direct_messages_verify_in_both_views() {
+            let alice = SigningKey::from_bytes(&[1; 32]);
+            let author = uid(&alice);
+            let peer = "ts:peer:with:colons";
+            let conversation = dm_conversation(&author, peer);
+            let msg = signed(&alice, None, ChatTarget::Client(2), &conversation, "hello");
+            for participants in [(&author[..], peer), (peer, &author[..])] {
+                assert_eq!(
+                    verify_message(&msg, &server(), &conversation, NOW, Some(participants)),
+                    MessageCheck::Verified { certificate_expired: false }
+                );
+                let mut reply = msg.clone();
+                reply.author_uid = peer.into();
+                reply.signature = None;
+                assert_eq!(
+                    verify_message(&reply, &server(), &conversation, NOW, Some(participants)),
+                    MessageCheck::UnsignedTeamSpeak
+                );
+            }
+            assert_eq!(
+                verify_message(&msg, &server(), &conversation, NOW, Some((&author, "ts:other"))),
+                MessageCheck::Invalid
+            );
         }
 
         #[test]
@@ -1360,11 +1435,11 @@ mod tests {
             let msg = signed(&device, Some(&c), ChatTarget::Channel(1), "channel:1", "hi");
             assert_eq!(msg.author_uid, uid(&account));
             assert_eq!(
-                verify_message(&msg, &server(), "channel:1", NOW),
+                verify_message(&msg, &server(), "channel:1", NOW, None),
                 MessageCheck::Verified { certificate_expired: false }
             );
             assert_eq!(
-                verify_message(&msg, &server(), "channel:1", NOW + 20_000),
+                verify_message(&msg, &server(), "channel:1", NOW + 20_000, None),
                 MessageCheck::Verified { certificate_expired: true }
             );
             let late = certificate(&account, &device, NOW - 500, NOW + 10_000);
@@ -1373,7 +1448,8 @@ mod tests {
                     &signed(&device, Some(&late), ChatTarget::Channel(1), "channel:1", "hi"),
                     &server(),
                     "channel:1",
-                    NOW
+                    NOW,
+                    None
                 ),
                 MessageCheck::Invalid
             );
@@ -1384,7 +1460,8 @@ mod tests {
                     &signed(&device, Some(&forged), ChatTarget::Channel(1), "channel:1", "hi"),
                     &server(),
                     "channel:1",
-                    NOW
+                    NOW,
+                    None
                 ),
                 MessageCheck::Invalid
             );
@@ -1395,7 +1472,8 @@ mod tests {
                     &signed(&device, Some(&elsewhere), ChatTarget::Channel(1), "channel:1", "hi"),
                     &server(),
                     "channel:1",
-                    NOW
+                    NOW,
+                    None
                 ),
                 MessageCheck::Invalid
             );
@@ -1406,12 +1484,12 @@ mod tests {
             let alice = SigningKey::from_bytes(&[1; 32]);
             let mut msg = signed(&alice, None, ChatTarget::Channel(1), "channel:1", "hi");
             msg.signature = None;
-            assert_eq!(verify_message(&msg, &server(), "channel:1", NOW), MessageCheck::Unsigned);
+            assert_eq!(verify_message(&msg, &server(), "channel:1", NOW, None), MessageCheck::Unsigned);
             msg.author_uid = "ts:abc".into();
-            assert_eq!(verify_message(&msg, &server(), "channel:1", NOW), MessageCheck::UnsignedTeamSpeak);
+            assert_eq!(verify_message(&msg, &server(), "channel:1", NOW, None), MessageCheck::UnsignedTeamSpeak);
             // A deletion is only ever a later revision.
             let deletion = signed(&alice, None, ChatTarget::Channel(1), "channel:1", DELETION_TEXT);
-            assert_eq!(verify_message(&deletion, &server(), "channel:1", NOW), MessageCheck::Invalid);
+            assert_eq!(verify_message(&deletion, &server(), "channel:1", NOW, None), MessageCheck::Invalid);
         }
     }
 
@@ -1431,7 +1509,7 @@ mod tests {
 
     #[test]
     fn vc3_statements_shared_vectors() {
-        let vectors: serde_json::Value = serde_json::from_str(include_str!("../tests/handshake-v3.json")).unwrap();
+        let vectors: serde_json::Value = serde_json::from_str(include_str!("../tests/handshake-v4.json")).unwrap();
         for v in vectors.as_array().unwrap() {
             let h: Hello = serde_json::from_value(v["hello"].clone()).unwrap();
             assert_eq!(hello_statement(&h).unwrap(), v["statement"].as_str().unwrap());

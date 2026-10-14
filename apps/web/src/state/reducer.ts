@@ -343,6 +343,12 @@ function channelNotices(prev: SessionState, next: SessionState, at: number, id: 
 
 function reduceEvent(state: SessionState, event: Event, now: number, verified = false, authentic = false): SessionState {
   switch (event.ev) {
+    case "mls.commit":
+    case "mls.proposal":
+    case "mls.welcome":
+    case "mls.history":
+    case "mls.history.wanted":
+      return state;
     case "chat.edited":
       return onChatEdited(state, event.d, verified, authentic);
     case "chat.deleted":

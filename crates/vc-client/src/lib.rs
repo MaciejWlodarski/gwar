@@ -1,4 +1,4 @@
-//! Native `vc/3` client: identity, handshake, request/response correlation
+//! Native `vc/4` client: identity, handshake, request/response correlation
 //! and the event stream. Media (WebRTC + audio devices) builds on top of it.
 
 pub mod identity;
@@ -318,6 +318,7 @@ pub async fn connect(options: ConnectOptions) -> Result<Connected, ClientError> 
 /// The conversation `msg` must be signed for, as its reader sees it: a direct
 /// message from someone else must be addressed to us, and our own names its recipient.
 fn verify(msg: &ChatMessage, me: &str, server_key: &str, clients: &HashMap<u32, String>) -> MessageCheck {
+    let mut participants = None;
     let conversation = match msg.target {
         ChatTarget::Channel(id) => format!("channel:{id}"),
         ChatTarget::Server => "server".into(),
@@ -329,13 +330,16 @@ fn verify(msg: &ChatMessage, me: &str, server_key: &str, clients: &HashMap<u32, 
                 (recipient == Some(me)).then_some(msg.author_uid.as_str())
             };
             match peer {
-                Some(peer) => dm_conversation(me, peer),
+                Some(peer) => {
+                    participants = Some((me, peer));
+                    dm_conversation(me, peer)
+                }
                 None => return MessageCheck::Invalid,
             }
         }
     };
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
-    vc_proto::verify_message(msg, server_key, &conversation, now)
+    vc_proto::verify_message(msg, server_key, &conversation, now, participants)
 }
 
 async fn read_frame<S>(ws: &mut S) -> Result<ServerFrame, ClientError>
@@ -414,6 +418,8 @@ impl Connection {
         let mut signature = MessageSignature {
             server_key: self.server_key.clone(),
             conversation: signed_target.clone(),
+            group_id: "-".into(),
+            epoch: "-".into(),
             author_uid: self.uid.clone(),
             key: self.identity.public_key(),
             certificate: self.certificate.clone(),

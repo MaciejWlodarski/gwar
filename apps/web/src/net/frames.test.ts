@@ -63,7 +63,7 @@ describe("bounded server frames", () => {
   });
 });
 
-describe("vc/3 runtime schemas", () => {
+describe("vc/4 runtime schemas", () => {
   it("validates challenge keys and nonces with exact fields and canonical encodings", () => {
     const valid = challenge();
     expect(parseFrame(JSON.stringify(valid))?.kind).toBe("event");
