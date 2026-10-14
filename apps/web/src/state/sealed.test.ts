@@ -357,6 +357,26 @@ describe("encrypted channels", () => {
     dm.reset(); await dm.scanUnread();
     expect(mentions()).toBe(0);
   });
+  it("recounts a view rebuilt by a Welcome from nothing left before it", async () => {
+    await dm.receive((await post(1)).sealed, true);
+    expect(mentions()).toBe(1);
+    // Reconnecting: the controller resets before the Welcome moves the view back here.
+    dm.reset();
+    useSession.setState(s => ({ epoch: s.epoch + 1, threads: {} })); unread(channel, 0);
+    useSession.setState({ activeThread: "channel", viewChannel: channel });
+    expect(mentions()).toBe(0);
+  });
+  it("retries every row waiting for a key, however many wait", async () => {
+    const rows: SealedMessage[] = [];
+    for (let id = 1; id <= 257; id++) rows.push((await post(id, [])).sealed);
+    const waiting = new Map(plains); plains.clear();
+    for (const row of rows) await dm.receive(row, false);
+    expect(useSession.getState().threads[thread]?.items.filter(i => i.kind === "msg" && i.cannotOpen === "no_key")).toHaveLength(257);
+    // Only the newest row's key arrives.
+    plains.set("257:0", waiting.get("257:0")!);
+    dm.refresh();
+    await vi.waitFor(() => expect(useSession.getState().threads[thread]?.items.find(i => i.key === "e257")).toMatchObject({ authentic: true }), { timeout: 10_000 });
+  }, 30_000);
   it("scans again in a new session while an earlier scan is still waiting", async () => {
     await post(1); unread();
     let answer!: (page: unknown) => void;

@@ -1002,10 +1002,12 @@ describe("encrypted channels", () => {
   it("counts encrypted channels' mentions again after a resync", async () => {
     connectFake({ encrypted: [1] });
     const order: string[] = [];
-    const sealed = { ...fakeSealed(), reset: vi.fn(() => order.push("reset")), refresh: vi.fn(), scanUnread: vi.fn(async () => { order.push("scan"); }) }; install(sealed);
+    const epoch = session().epoch;
+    // Reset before the Welcome: its view change recounts at once.
+    const sealed = { ...fakeSealed(), reset: vi.fn(() => order.push(`reset ${session().epoch - epoch}`)), refresh: vi.fn(), scanUnread: vi.fn(async () => { order.push(`scan ${session().epoch - epoch}`); }) }; install(sealed);
     link.welcomeNow(welcome({ session: 1, uid: "u1", channels: [chan(1, { encrypted: true })], clients: [client(1, null)] }), true);
     expect(sealed.refresh).toHaveBeenCalled();
-    expect(order).toEqual(["reset", "scan"]);
+    expect(order).toEqual(["reset 0", "scan 1"]);
   });
 
   it("lets the creator make an encrypted channel's group right away", async () => {

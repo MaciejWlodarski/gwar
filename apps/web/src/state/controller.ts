@@ -491,9 +491,11 @@ class Controller {
       this.nativeFiles(useSession.getState().kind === "vc" ? useSession.getState().httpOrigin : null, welcome.server.upload_limit, welcome.file_access);
       session.setSecurity(conn.serverKey ?? null, conn.endpoint ?? null, !!conn.endpoint && isPlaintextRemote(conn.endpoint));
       if (conn.serverKey) channelLifecycle.observe(conn.serverKey, welcome.channels.map((c) => c.id));
+      // A resync rebuilds channel threads: count the encrypted ones' mentions again,
+      // with nothing left from before (the Welcome's view change already recounts).
+      this.sealed?.reset();
       session.dispatch({ type: "welcome", welcome, resync, now: Date.now() });
-      // A resync rebuilds channel threads: count the encrypted ones' mentions again.
-      if (this.sealed) { this.sealed.reset(); this.sealed.refresh(); void this.sealed.scanUnread(); }
+      if (this.sealed) { this.sealed.refresh(); void this.sealed.scanUnread(); }
       const myCh = myChannelId(useSession.getState());
       const v = useVoice.getState();
       if (v.muted || v.deafened) void this.pushMuteState();

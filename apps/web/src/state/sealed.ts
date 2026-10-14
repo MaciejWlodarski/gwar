@@ -87,13 +87,31 @@ export class SealedConversations {
   refresh(): void {
     if (this.stopped || !this.current()) return;
     const state = useSession.getState();
-    for (const [key, thread] of Object.entries(state.threads)) {
+    for (const key of Object.keys(state.threads)) {
       if (!sealedThread(key, state.kind, state.channels)) continue;
       state.dispatch({ type: "sealedStatus", thread: key as SealedKey, securing: this.runtime.status(this.conversation(key as SealedKey)) !== "ready" });
-      for (const item of thread.items) if (item.kind === "msg" && item.sealed && item.cannotOpen === "no_key") {
-        void this.receive(item.sealed, false).catch(this.error);
-      }
     }
+    void this.retryMissing();
+  }
+  private retrying = false;
+  private retryAgain = false;
+  /** Opens rows that were waiting for a key, one at a time: however many wait,
+   * each pass reaches every one without filling the verification queue. */
+  private async retryMissing(): Promise<void> {
+    if (this.retrying) { this.retryAgain = true; return; }
+    this.retrying = true;
+    try {
+      do {
+        this.retryAgain = false;
+        const state = useSession.getState();
+        const rows = Object.entries(state.threads).filter(([key]) => sealedThread(key, state.kind, state.channels))
+          .flatMap(([, thread]) => thread.items.flatMap(i => i.kind === "msg" && i.sealed && i.cannotOpen === "no_key" ? [i.sealed] : []));
+        for (const row of rows) {
+          if (this.stopped || !this.current()) return;
+          await this.receive(row, false).catch(this.error);
+        }
+      } while (this.retryAgain);
+    } finally { this.retrying = false; }
   }
   async open(thread: SealedKey, before?: number): Promise<void> {
     const epoch = useSession.getState().epoch;
