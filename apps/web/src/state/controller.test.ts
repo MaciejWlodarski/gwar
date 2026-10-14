@@ -893,15 +893,27 @@ it("recounts a conversation's unread messages from the server after a removal", 
 
 it("a teardown that resumes after a newer connect leaves that connection alone", async () => {
   connectFake();
-  const c = controller as unknown as { conn: unknown; runtime: unknown; teardown(): Promise<void> };
+  const c = controller as unknown as { conn: unknown; connections: number; runtime: unknown; teardown(): Promise<void> };
   let finish!: () => void;
   c.runtime = { close: () => new Promise<void>((resolve) => { finish = resolve; }) };
   const stale = c.teardown();
   const newer = {};
-  c.conn = newer;
+  c.conn = newer; c.connections++;
   finish(); await stale;
   expect(c.conn).toBe(newer);
   expect(session().me).not.toBeNull();
+  c.conn = link;
+});
+
+it("a teardown still cleans up when a failed connect clears the connection meanwhile", async () => {
+  connectFake();
+  const c = controller as unknown as { conn: unknown; runtime: unknown; teardown(): Promise<void> };
+  let finish!: () => void;
+  c.runtime = { close: () => new Promise<void>((resolve) => { finish = resolve; }) };
+  const stale = c.teardown();
+  c.conn = null;
+  finish(); await stale;
+  expect(session().me).toBeNull();
   c.conn = link;
 });
 

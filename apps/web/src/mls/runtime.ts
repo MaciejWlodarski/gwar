@@ -80,8 +80,8 @@ export class MlsRuntime {
     const abortWaiting = () => waiting.abort(options.signal!.reason);
     options.signal?.addEventListener("abort", abortWaiting, { once: true });
     if (options.signal?.aborted) abortWaiting();
-    // Requests are ordered by time, then a random tie-break: a waiting tab
-    // yields only to a newer one, so concurrent contenders cannot evict each other.
+    // Requests are ordered by time, then a random tie-break: a tab, waiting or
+    // holding, yields only to a newer one, so contenders cannot evict each other.
     const mine = [performance.timeOrigin + performance.now(), Math.random()] as const;
     const newer = (other: unknown) => {
       if (!Array.isArray(other) || other.length !== 2 || !other.every(n => typeof n === "number")) return false;
@@ -91,8 +91,9 @@ export class MlsRuntime {
     let holding = false;
     if (takeover) {
       takeover.onmessage = event => {
+        if (!newer(event.data)) return; // Older requests have already yielded to this one.
         if (holding) options.onTakeover!();
-        else if (newer(event.data)) waiting.abort(new DeviceTakenOver());
+        else waiting.abort(new DeviceTakenOver());
       };
       takeover.postMessage(mine);
     }

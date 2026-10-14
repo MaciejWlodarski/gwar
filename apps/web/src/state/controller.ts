@@ -152,6 +152,8 @@ class SessionMoved extends Error {
 
 class Controller {
   private conn: Link | null = null;
+  /** Counts installed connections, so a slow teardown can tell when a newer one started. */
+  private connections = 0;
   private runtime: MlsRuntime | null = null;
   private connectionParams: ConnectParams | null = null;
   private runtimeAbort: AbortController | null = null;
@@ -362,6 +364,7 @@ class Controller {
       });
     }
     this.conn = conn;
+    this.connections++;
     this.connectionParams = { ...params };
     this.wire(conn, params);
     try {
@@ -611,16 +614,16 @@ class Controller {
   private async teardown(): Promise<void> {
     // A newer connect may finish its own teardown and start while this one
     // waits; it then owns the state below, so this one stops.
-    const conn = this.conn;
+    const generation = this.connections;
     this.runtimeAbort?.abort(); this.runtimeAbort = null;
     this.dm?.close(); this.dm = null;
     const runtime = this.runtime; this.runtime = null;
     if (this.revocationTimer) clearInterval(this.revocationTimer);
     this.revocationTimer = null;
     await runtime?.close();
-    if (this.conn !== conn) return;
+    if (this.connections !== generation) return;
     await this.nativeFiles(null);
-    if (this.conn !== conn) return;
+    if (this.connections !== generation) return;
     if (this.voiceRetry) clearTimeout(this.voiceRetry);
     this.voiceRetry = null;
     if (this.readTimer) clearTimeout(this.readTimer);
@@ -630,7 +633,7 @@ class Controller {
     this.historyRequested.clear();
     this.sentRead.clear();
     await this.engine.stop();
-    if (this.conn !== conn) return;
+    if (this.connections !== generation) return;
     this.conn = null;
     useUi.getState().setJoining(null);
     useUi.getState().setEditing(null);
