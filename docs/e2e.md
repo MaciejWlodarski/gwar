@@ -394,7 +394,8 @@ The same mechanism lets a **returning member** catch up on epochs it missed
 sharer includes only epochs in which, by its own records, that uid had a
 device in the group, and shares nothing where it has no such record; holding
 a key is not evidence. In a channel without history for new members, that is
-all a returning member gets. A key nobody kept is lost for good, and the
+all a returning member gets; in a channel with history, it gets what any
+newcomer gets. A key nobody kept is lost for good, and the
 messages of that epoch stay unreadable on that device.
 
 Signatures are inside the ciphertext, so a wrong key can never make a forged

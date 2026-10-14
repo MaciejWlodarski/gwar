@@ -243,7 +243,7 @@ credential, the OpenMLS provider and Gwar's own per-group records.
 - **Epoch keys**: after every merge and join that leaves the device a member,
   `epoch_key = MLS-Exporter("gwar chat v1", group_id, 32)` is stored with
   `(group_id, epoch)`, together with the uids that had leaves in that epoch
-  (evidence for returning members, step 3). Keys stay until the conversation
+  (evidence for history sharing in groups without history, below). Keys stay until the conversation
   is deleted.
 - **Commits** never merge locally before the server accepted them (write-ahead
   outbox, below). An external join is different: OpenMLS merges it when it is
@@ -294,16 +294,13 @@ credential, the OpenMLS provider and Gwar's own per-group records.
   are ignored. If two imports for an epoch disagree, the epoch is marked
   **conflicted**: its imported key is deleted and later imports for it are
   ignored, whatever the order they arrive in.
-- Which epochs a sender includes: for a newcomer in a group whose descriptor
-  says `history = 1`, every epoch key it holds; for a returning member, only
-  epochs whose evidence lists that uid; in a group with `history = 0`, only
-  the latter. A uid is **returning** if the evidence of any epoch the sender
-  derived **before** the admitting commit lists it, or if that commit's
-  `returning` (in the log entry and the `mls.commit` event) says so; the
-  sender records the classification in the share's outbox entry when it
-  processes the commit (`returning`, from the server's record of every uid that ever had a
-  leaf in the group, which survives any client's state loss). Evidence exists
-  only for derived epochs, so imported epochs go only to newcomers.
+- Which epochs a sender includes: in a group whose descriptor says
+  `history = 1`, every epoch key it holds (derived or imported), to any
+  member device; in a group with `history = 0`, only epochs it derived whose
+  evidence lists the recipient's uid. So there is no need to tell newcomers
+  from returning members: with history on, a returning member may see what
+  any newcomer sees; with history off, evidence decides, and imported epochs
+  (which carry no evidence) are never passed on.
 
 ### Web app storage and concurrency
 
@@ -336,9 +333,9 @@ credential, the OpenMLS provider and Gwar's own per-group records.
     won, so send the same bytes again. Only when the server answers
     `expired` (the commit's time is more than five minutes behind its commit
     clock, which never goes back, so no earlier copy can be accepted any
-    more) is the
-    pending commit discarded and a new one built (fresh time, current
-    rules);
+    more) or `bad_request` (it breaks a rule, which no later copy can
+    change) is the pending commit discarded and a new one built (fresh time,
+    current rules);
   - the log no longer reaches that epoch (its oldest retained epoch is
     later): drop the group state and rejoin by external commit.
   A joining group (external join) has no older state to fall back to: if
@@ -420,13 +417,13 @@ consumes only the packages it returns.
 | Request | Reply | Rule |
 | --- | --- | --- |
 | `mls.device.publish {hpke_key, created_at, signature}` | `{}` | the session's device; replaces an older one |
-| `mls.key_packages.publish {packages, last_resort?}` | `{count}` | each parsed with `ds::key_package`, device and uid of the session; at most 20 stored plus one last-resort |
-| `mls.key_packages.claim {uids}` | `{packages: [{device_key, package}]}` | one per device of those uids with a package, except the caller's device; consumes a regular one, else returns the last-resort one; skips revoked devices |
+| `mls.key_packages.publish {packages, last_resort?}` | `{count}` | each parsed with `ds::key_package`, device and uid of the session, already valid (`not_before` not after the server's clock); at most 20 stored plus one last-resort |
+| `mls.key_packages.claim {uids}` | `{packages: [{device_key, package}]}` | one per device of those uids with a package, except the caller's device; consumes a regular one, else returns the last-resort one; skips revoked devices and packages whose lifetime ends within 15 minutes |
 | `mls.devices {uids}` | `{devices: [{uid, device_key, hpke_key, created_at, signature}]}` | published device HPKE keys |
 | `mls.group.create {conversation, group_info}` | `{group}` | the GroupInfo of epoch 0, holding only the creator's device; `Observer::create` accepts it; the session may create it (below); first wins per `(conversation, incarnation)`, later attempts get `conflict` with the existing group id |
 | `mls.group_info {group}` | `{group_info, epoch}` | the session may read the conversation |
 | `mls.commit {group, epoch, commit, group_info, welcome?}` | `{epoch}` or error `stale` or `expired` | below |
-| `mls.log {group, since, limit?}` | `{head, oldest, entries: [{epoch, proposals, commit, returning}], pending}` | entries from epoch `since`, each keyed by the epoch its commit was made in (it moved the group to `epoch + 1`); `returning` the uids it admitted that had a leaf in the group before; `proposals` are the server proposals the commit references, to be processed before it; `pending` the server's outstanding proposals for the head epoch (see "Removal proposals"); 90 days kept |
+| `mls.log {group, since, limit?}` | `{head, oldest, entries: [{epoch, proposals, commit}], pending}` | entries from epoch `since`, each keyed by the epoch its commit was made in (it moved the group to `epoch + 1`); `proposals` are the server proposals the commit references, to be processed before it; `pending` the server's outstanding proposals for the head epoch (see "Removal proposals"); 90 days kept |
 | `mls.groups {}` | `{groups: [{conversation, group, epoch, pending}]}` | the live group of every conversation the session may read; `pending` whether outstanding proposals exist |
 | `mls.welcomes {}` | `{welcomes: [{id, group, welcome}]}` | for the session's device; repeatable |
 | `mls.welcomes.ack {ids}` | `{}` | after the client stored the joined group durably; deletes them. The client stores the Welcome's id with the joined group in one write, and acknowledges a Welcome whose id it already has without processing it again (its key package is used up) |
@@ -436,7 +433,7 @@ consumes only the packages it returns.
 | `mls.history.ack {ids}` | `{}` | after durable import; deletes them |
 | `mls.history.request {group}` | `{}` | stores an outstanding request of the session's device for the group and announces it to the group's online member devices (event `mls.history.wanted {group, device}`); at most once a minute per device and group. A request ends when a chunk for that device and group is stored after it, or after 30 days |
 
-Events: `mls.commit {group, epoch, proposals, commit, returning}`, `mls.proposal {group,
+Events: `mls.commit {group, epoch, proposals, commit}`, `mls.proposal {group,
 epoch, proposal}`, `mls.welcome {group}`, `mls.history {group}`,
 `mls.history.wanted {group, device}`; `mls.welcome` and `mls.history` only
 announce that something can be fetched.
@@ -448,7 +445,11 @@ entry the log still has, or `head` when it has none.
 
 The core actor handles `mls.commit` atomically. The commit must be for
 `group` at exactly the stored epoch, else `stale`; then `Observer::commit`
-must accept it, else `bad_request`. An external join (`NewMember`) is allowed
+must accept it, else `expired` (`DsError::Expired`, checked before anything
+else in the commit) or `bad_request`. A commit that is not expired is judged
+the same way whenever it arrives: key packages in it were valid when stored
+and claimed with at least 15 minutes left (clients add none with less than
+10), so none runs out while the commit can still be accepted. An external join (`NewMember`) is allowed
 only for a session whose uid may read the conversation, and its new leaf must
 be that session's device. `Observer::commit` works on a copy loaded from the
 stored state: only after the transaction that stores the commit (with the
@@ -497,10 +498,8 @@ New tables (migration in `store.rs`):
 - `mls_groups(group_id, conversation, incarnation, epoch, committed_at,
   group_info, observer, created_at)`; one live group per conversation, the
   highest incarnation;
-- `mls_log(group_id, epoch, proposals, commit, returning, committed_at)`;
+- `mls_log(group_id, epoch, proposals, commit, committed_at)`;
 - `mls_leaves(group_id, leaf, device_key, uid)`;
-- `mls_uids(group_id, uid)`: every uid that ever had a leaf in the group
-  (for `returning`);
 - `mls_welcomes(id, device_key, group_id, welcome, created_at)`;
 - `mls_proposals(group_id, epoch, leaf, proposal)`, the outstanding server
   proposals;
