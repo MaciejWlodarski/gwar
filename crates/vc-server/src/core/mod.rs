@@ -608,7 +608,11 @@ impl Core {
         let members = self
             .sessions
             .values()
-            .filter_map(|s| Some((s.id, Member { channel: s.channel?, muted: s.muted, deafened: s.deafened })))
+            .filter_map(|s| {
+                let channel = s.channel?;
+                let bridged = !self.is_encrypted(channel);
+                Some((s.id, Member { channel, muted: s.muted, deafened: s.deafened, bridged }))
+            })
             .collect();
         self.routing.store(Arc::new(Routing { members }));
     }
@@ -1870,6 +1874,10 @@ pub(crate) mod expiry_tests {
             .unwrap()
     }
 
+    async fn bridged(core: &CoreHandle, session: SessionId) -> Option<(ChannelId, bool)> {
+        on_core(core, move |core| core.routing.load().members.get(&session).map(|m| (m.channel, m.bridged))).await
+    }
+
     #[tokio::test]
     async fn teamspeak_compatibility_keeps_the_default_channel_plaintext() {
         // Refused at start while the stored default channel is encrypted.
@@ -1910,6 +1918,12 @@ pub(crate) mod expiry_tests {
         assert_eq!(refused.unwrap_err().code, ErrorCode::BadRequest);
         assert!(info.teamspeak);
         assert_ne!(info.default_channel, secret);
+
+        // The media plane knows at once that what is said in an encrypted channel stays here.
+        core.request(session, 3, Request::ChannelJoin { channel: secret, password: None }).await;
+        assert_eq!(bridged(&core, session).await, Some((secret, false)));
+        core.request(session, 4, Request::ChannelJoin { channel: info.default_channel, password: None }).await;
+        assert_eq!(bridged(&core, session).await, Some((info.default_channel, true)));
     }
 
     #[tokio::test]

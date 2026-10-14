@@ -745,7 +745,7 @@ mod tests {
         let (webrtc, mut rx) = mpsc::channel(64);
         let mut routing = Routing::default();
         for session in [100, 200] {
-            routing.members.insert(session, Member { channel: 1, muted: false, deafened: false });
+            routing.members.insert(session, Member { channel: 1, muted: false, deafened: false, bridged: true });
         }
         let plane = MediaPlane {
             routing: Arc::new(arc_swap::ArcSwap::from_pointee(routing)),
