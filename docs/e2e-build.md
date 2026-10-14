@@ -334,10 +334,12 @@ credential, the OpenMLS provider and Gwar's own per-group records.
     won, so send the same bytes again. Only when the server answers
     `expired` (the commit's time is more than five minutes behind its commit
     clock, which never goes back, so no earlier copy can be accepted any
-    more) or `bad_request` (it breaks a rule, which no later copy can
-    change) is the pending commit discarded and a new one built (fresh time,
-    current rules). On `early` (its time is ahead of the server's clock) or
-    any other error it is kept and sent again later;
+    more) is the pending commit discarded and a new one built (fresh time,
+    current rules). On any other error (`early`, `bad_request`, …) it is
+    kept and sent again with backoff: some checks depend on time (key
+    package lifetimes against the server's system clock), and every commit
+    reaches `expired` within five minutes, so a commit that is really broken
+    holds the group up no longer than that;
   - the log no longer reaches that epoch (its oldest retained epoch is
     later): drop the group state and rejoin by external commit.
   A joining group (external join) has no older state to fall back to: if
@@ -430,7 +432,7 @@ consumes only the packages it returns.
 | `mls.groups {}` | `{groups: [{conversation, group, epoch, pending}]}` | the live group of every conversation the session may read; `pending` whether outstanding proposals exist |
 | `mls.welcomes {}` | `{welcomes: [{id, group, welcome}]}` | for the session's device; repeatable |
 | `mls.welcomes.ack {ids}` | `{}` | after the client stored the joined group durably; deletes them. The client stores the Welcome's id with the joined group in one write, and acknowledges a Welcome whose id it already has without processing it again (its key package is used up) |
-| `mls.history.share {group, recipient, chunk}` | `{}` | below |
+| `mls.history.share {group, recipient, chunk}` | `{}` | the session's device and `recipient` both have leaves in the group's current epoch (observer); the chunk parses (netstrings, header fields canonical) and its header names the server key, `group`, `recipient` with its published HPKE key, and the session's device key as sender; the signature verifies with that key. The server stores it with `sender_uid` = the session's uid (subject to the three-sender limit) and, in the same transaction, ends the recipient's outstanding request for the group |
 | `mls.history.fetch {group?}` | `{chunks: [{id, group, sender_uid, chunk}]}` | chunks for the session's device; repeatable |
 | `mls.history.wanted {}` | `{wanted: [{group, device}]}` | the outstanding requests (below) in groups the session's device is a member of |
 | `mls.history.ack {ids}` | `{}` | after durable import; deletes them |
@@ -450,10 +452,9 @@ The core actor handles `mls.commit` atomically. The commit must be for
 `group` at exactly the stored epoch, else `stale`; then `Observer::commit`
 must accept it, else `expired` or `early` (`DsError::Expired` and
 `DsError::Early`; the former is checked before anything
-else in the commit) or `bad_request`. A commit that is neither expired nor
-early is judged the same way whenever it arrives: key packages in it were valid when stored
-and claimed with at least 15 minutes left (clients add none with less than
-10), so none runs out while the commit can still be accepted. An external join (`NewMember`) is allowed
+else in the commit) or `bad_request`. Key packages are claimed with at least
+15 minutes left (clients add none with less than 10), so a commit's adds do
+not run out while it can still be accepted. An external join (`NewMember`) is allowed
 only for a session whose uid may read the conversation, and its new leaf must
 be that session's device. `Observer::commit` works on a copy loaded from the
 stored state: only after the transaction that stores the commit (with the
