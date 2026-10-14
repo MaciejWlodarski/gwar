@@ -110,10 +110,13 @@ results from every commit (adds, updates, external commits, path updates):
 - the leaf signature key equals the device key in the credential, and the
   encoding is canonical;
 - the uid derives from the account key (or the local key);
-- the certificate is current and not revoked in the commit's epoch, by the
-  client's own Connect feed (a stale feed is used as it is, as for messages
-  today; it cannot be forced fresh); a client catching up judges each commit
-  by its own epoch (see "Removal");
+- a leaf the commit introduces or changes has a certificate covering the
+  commit's time (signed by its committer); revocations and certificates that
+  ran out later never make a client reject a commit, so clients with
+  different Connect feeds follow the same chain. Instead a client does not
+  send in a group while it has a leaf that is not current now by its own
+  feed (a stale feed is used as it is, as for messages today), and commits
+  its removal (see "Removal");
 - one leaf per device key, and an update keeps the leaf's uid and device key;
 - the resulting membership satisfies the conversation's rule (below).
 
@@ -238,7 +241,8 @@ of every commit:
 
 Catching up and being allowed to send are separate. A client processes every
 valid commit in order, judging it by the rules **as they stood in that
-epoch** (the access list and certificates then), even when the resulting
+epoch** (the access list then, and certificates at the commit's time for
+the leaves it brings in), even when the resulting
 tree holds a leaf that should go (an offline client catching up, or a
 competing commit by a client with a staler revocation feed). Replaying
 history never lowers what the client already knows to be current (its
