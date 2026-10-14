@@ -1603,3 +1603,31 @@ async fn channel_history_requests_end_only_through_a_chunk_naming_their_assignme
     assert_eq!(a.ok("mls.history.wanted", json!({})).await["wanted"], json!([]));
     assert_eq!(b.ok("mls.history.fetch", json!({})).await["chunks"].as_array().unwrap().len(), 3);
 }
+
+#[tokio::test]
+async fn a_device_rejoining_a_channel_group_ends_its_history_request_and_assignments() {
+    let server = TestServer::start().await;
+    let mut alice = Device::new(1, 11);
+    let mut bob = Device::new(2, 21);
+    let mut a = connect_device(&server, &alice).await;
+    a.redeem(&server.admin_token).await;
+    let mut b = connect_device(&server, &bob).await;
+    let secret = channel_id(&a.create_channel(json!({"name":"secret","encrypted":true})).await);
+    let group = create_channel_group(&mut a, &mut alice, secret, true, 1).await.unwrap();
+    join_channel(&mut b, &mut bob, &group).await;
+    a.next_event("mls.commit").await;
+    let public = hpke(&mut b, &bob, 4).await;
+    let recipient = public_key(&bob.signer.0);
+    b.ok("mls.history.request", json!({"group":group})).await;
+    let assignment = a.next_event("mls.history.wanted").await["assignment"].as_str().unwrap().to_owned();
+
+    // The same device joins again by external commit, which removes its old leaf:
+    // the request was for that leaf, so it ends with its assignment and is not routed again.
+    join_channel(&mut b, &mut bob, &group).await;
+    a.next_event("mls.commit").await;
+    assert_eq!(a.ok("mls.history.wanted", json!({})).await["wanted"], json!([]));
+    let bytes = chunk(&alice, &a, &group, &bob, &public);
+    a.ok("mls.history.share", json!({"group":group,"recipient":recipient,"chunk":b64(&bytes),"assignment":assignment}))
+        .await;
+    assert_eq!(a.ok("mls.history.wanted", json!({})).await["wanted"], json!([]));
+}

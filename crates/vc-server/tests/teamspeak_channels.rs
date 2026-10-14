@@ -67,7 +67,11 @@ async fn wait_for_permission(query: &Query, cid: &str, perm: (&str, &str)) -> Ve
 }
 
 /// A TeamSpeak client's `channeladdperm` of the channel's needed join power.
-async fn set_join_power(ts: &mut tsclientlib::Connection, cid: &str, power: &str) -> Result<(), tsclientlib::CommandError> {
+async fn set_join_power(
+    ts: &mut tsclientlib::Connection,
+    cid: &str,
+    power: &str,
+) -> Result<(), tsclientlib::CommandError> {
     let mut command = OutCommand::new(Direction::C2S, Flags::empty(), PacketType::Command, "channeladdperm");
     command.write_arg("cid", &cid);
     command.write_arg("permsid", &"i_channel_needed_join_power");
