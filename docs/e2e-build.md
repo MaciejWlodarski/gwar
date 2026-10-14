@@ -505,7 +505,7 @@ page without scanning key packages.
 | `mls.groups {}` | `{groups: [{conversation, group, epoch, pending}]}` | the live group of every conversation the session may read; `pending` whether outstanding proposals exist |
 | `mls.welcomes {}` | `{welcomes: [{id, group, welcome}]}` | for the session's device; repeatable |
 | `mls.welcomes.ack {ids}` | `{}` | after the client stored the joined group durably; deletes them. The client stores the Welcome's id with the joined group in one write, and acknowledges a Welcome whose id it already has without processing it again (its key package is used up) |
-| `mls.history.share {group, recipient, chunk}` | `{}` | the session's device and `recipient` both have leaves in the group's current epoch (observer); the chunk parses (netstrings, header fields canonical) and its header names the server key, `group`, `recipient` with its published HPKE key, and the session's device key as sender; the signature verifies with that key. The recipient must differ from the sender's own device, and `last_epoch` must not exceed the group's current epoch. In one write transaction the server checks these rules and the SHA-256 of the chunk bytes: the same hash for the same group and recipient is idempotent (`{}`, no new row or broadcast), even at quota. At most 64 stored chunks per `(group, recipient device, sender_uid)` and three distinct senders per recipient/group are allowed; exceeding either returns `quota_exceeded` without a write. A new chunk is stored with `sender_uid` = the session's uid and ends the recipient's outstanding request in that same transaction |
+| `mls.history.share {group, recipient, chunk, assignment?}` | `{}` | the session's device and `recipient` both have leaves in the group's current epoch (observer); the chunk parses (netstrings, header fields canonical) and its header names the server key, `group`, `recipient` with its published HPKE key, and the session's device key as sender; the signature verifies with that key. The recipient must differ from the sender's own device, and `last_epoch` must not exceed the group's current epoch. In one write transaction the server checks these rules and the SHA-256 of the chunk bytes: the same hash for the same group and recipient is idempotent (`{}`, no new row or broadcast), even at quota. At most 64 stored chunks per `(group, recipient device, sender_uid)` and three distinct senders per recipient/group are allowed; exceeding either returns `quota_exceeded` without a write. A new chunk is stored with `sender_uid` = the session's uid and ends the recipient's outstanding request in that same transaction (in channel and server groups only when it names an active assignment of that request, section 4) |
 | `mls.history.fetch {group?}` | `{chunks: [{id, group, sender_uid, chunk}]}` | chunks for the session's device; repeatable |
 | `mls.history.wanted {}` | `{wanted: [{group, device}]}` | the outstanding requests (below) in groups the session's device is a member of |
 | `mls.history.ack {ids}` | `{}` | after durable import; deletes them |
@@ -841,20 +841,35 @@ messages):
   `mls.history.wanted {group, device, assignment}`. At most three are active
   per request, preferring distinct uids and the most recently connected
   sessions, and only while the recipient device still has a leaf.
-- An active assignment ends exactly once, by the first of: a chunk stored by
-  that device for the recipient; `mls.history.decline {group, device,
-  assignment}` (nothing to share); its device disconnecting; one minute
-  passing. Responses naming an assignment that is no longer active change
-  nothing. The request keeps, per round, the devices that **declined**; a
-  device whose assignment timed out, was cancelled or lost its connection is
-  not marked and can be asked again (also after it reconnects). While the
-  request is outstanding, every ended assignment and every newly eligible
-  session leads to the next announcement, to a device that has not declined
-  in this round. When every eligible device has declined, the round ends and
-  the next starts after a backoff (one minute, doubling up to an hour).
-- A stored chunk ends the request as in section 2 and cancels its active
-  assignments; a later request starts a new round. Removing the recipient's
-  leaf from the group cancels its request and assignments in the same step.
+- In channel and server groups `mls.history.share` carries the
+  `assignment` it answers, and `mls.history.wanted {}` lists
+  `{group, device, assignment}`. An active assignment ends exactly once, by
+  the first of: a chunk naming it stored by that device for the recipient;
+  `mls.history.decline {group, device, assignment}` (nothing to share); its
+  device disconnecting; one minute passing. Only a chunk naming an active
+  assignment of the request ends the request and counts as that device's
+  turn. Chunks naming an ended or unknown assignment (the rest of a
+  multi-chunk answer, or a delayed one after a timeout, a rejoin or a server
+  restart) are checked and stored by the usual rules and quota, so their
+  keys still arrive, but change no request or routing; neither do stale
+  declines.
+- The server keeps a **rotation** per `(group, recipient device)`, across
+  that recipient's requests: the devices that **had a turn** (stored a chunk
+  for it or declined). A device whose assignment timed out, was cancelled or
+  lost its connection did not have a turn and can be asked again (also after
+  it reconnects), after the devices that never were. While a request is
+  outstanding, every ended assignment and every newly eligible session leads
+  to the next announcement, to a device without a turn in the rotation. A
+  stored chunk ends the request as in section 2 and cancels its active
+  assignments, but does not reset the rotation, so the recipient's next
+  request reaches devices that have not shared yet (an older key holder after
+  a sharer with recent keys only). When every eligible device has had a turn
+  the rotation starts over, but no earlier than a backoff after the previous
+  start (one minute, doubling up to an hour). Rotations live in memory and
+  are dropped when no request of that recipient was made for 30 days.
+  Removing the recipient's leaf from the group
+  cancels its request and assignments and drops its rotation in the same
+  step.
 - `mls.history.wanted {}` (the request) lists only the calling device's
   active assignments. Direct messages keep section 3's behaviour: every
   member device shares after an admission and answers every announced
@@ -1099,7 +1114,9 @@ limit (about 300 devices):
   `chat.sealed.remove`, channel deletion cleanup, read marks for channels,
   history routing (three assignments, decline, timeout, disconnect, a newly
   connected device, a timed-out device asked again after reconnecting, a
-  decline for an ended assignment ignored, the recipient removed while
+  decline or chunk for an ended assignment ending nothing (the chunk still
+  stored), three devices that keep timing out not keeping an untried one
+  waiting, the recipient removed while
   assignments run, a full round of declines backing off, and a recipient
   whose first sharer had only recent keys reaching an older one), `mls.group_history` paging and access, file ties
   and access,
