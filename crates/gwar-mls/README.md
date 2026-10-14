@@ -23,7 +23,7 @@ take_changes() -> Changes
 key_packages(n: usize, now: i64) -> Result<Vec<Vec<u8>>>
 last_resort_key_package(now: i64) -> Result<Vec<u8>>
 create(descriptor: SignedDescriptor) -> Result<Vec<u8>> // GroupInfo; Creating
-settle(server: &str, id: &[u8; 32], winner: &[u8; 32]) -> Result<bool>
+settle(server: &str, id: &[u8; 32], winner: Option<&[u8; 32]>) -> Result<bool>
 welcome(server: &str, id: &str, bytes: &[u8]) -> Result<WelcomeResult>
 join_external(server: &str, bytes: &[u8], now: i64,
               revocations: &dyn Revocations) -> Result<Outbox>
@@ -40,7 +40,6 @@ import_history(server: &str, id: &[u8; 32], bytes: &[u8]) -> Result<()>
 
 // Queries on &Agent:
 device_hpke_key() -> DeviceHpkeKey
-creation(server: &str, id: &[u8; 32]) -> Result<Vec<u8>> // GroupInfo while Creating
 group(server: &str, id: &[u8; 32]) -> Option<&GroupRecord>
 epoch(server: &str, id: &[u8; 32], epoch: u64) -> Option<&EpochRecord>
 outbox(server: &str, id: &[u8; 32]) -> Option<&Outbox>
@@ -56,13 +55,14 @@ sending, commits and history sharing are blocked; incoming commits, proposals,
 Welcomes and external joins cannot activate it. Register it with
 `mls.group.create`, then call `settle(server, id, winner)` with the group the
 server holds for the conversation: the `{group}` reply, or the group named by
-`conflict`. If `winner` is this group (also when a lost reply or a restart made
-the device register it again), it becomes **Active** with epoch zero derived and
-`settle` returns `true`; catch up through the log from there. Otherwise its
-OpenMLS group and record (pin) are deleted and it returns `false`: persist
-that, then join the winner by Welcome or external commit. A restarted device
-re-exports the GroupInfo of a `Creating` group with `creation`. Settling a
-group outside `Creating` is an error.
+`conflict`. After a restart (or a lost reply), take it from `mls.groups`
+instead, `None` if the conversation has no group. If `winner` is this group,
+it becomes **Active** with epoch zero derived and `settle` returns `true`;
+catch up through the log from there. Otherwise its OpenMLS group and record
+(pin) are deleted and it returns `false`: persist that, then join the winner
+by Welcome or external commit, or create the conversation again when there is
+none. Settling needs no certificate check, so it also works after the
+creator's leaf expired. Settling a group outside `Creating` is an error.
 
 Key packages are bare TLS
 KeyPackages; commits, GroupInfos and Welcomes are TLS MLS messages. `Outbox`

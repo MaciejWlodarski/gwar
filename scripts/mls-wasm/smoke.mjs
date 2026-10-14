@@ -45,7 +45,6 @@ reload(a);
 assert.throws(() => a.agent.execute({ op: 'share_history', server, group, recipient: b.agent.execute({ op: 'device_hpke_key' }), now, revocations: [] }), /cannot send/);
 reload(a);
 // Simulated successful mls.group.create reply {group}.
-assert.ok(a.agent.execute({ op: 'creation', server, group }).length > 0);
 assert.equal(a.agent.execute({ op: 'settle', server, group, winner: group }), true); persist(a); reload(a);
 assert.equal(a.agent.execute({ op: 'gate', server, group, now, revocations: [] }).status, 'active');
 assert.throws(() => a.agent.execute({ op: 'settle', server, group, winner: group }), /not creating/);

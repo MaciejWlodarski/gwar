@@ -52,7 +52,7 @@ fn fixture() -> Fixture {
     let info = a.create(d).unwrap();
     a.take_changes();
     let observer = Observer::create(&info, &server()).unwrap();
-    assert!(a.settle(&server(), &id, &id).unwrap());
+    assert!(a.settle(&server(), &id, Some(&id)).unwrap());
     a.take_changes();
     Fixture { a, b, observer, id, info, t }
 }
@@ -434,7 +434,7 @@ fn history_off_shares_only_derived_epochs_with_recipient_evidence() {
     let info = a.create(d).unwrap();
     a.take_changes();
     let observer = Observer::create(&info, &server()).unwrap();
-    assert!(a.settle(&server(), &id, &id).unwrap());
+    assert!(a.settle(&server(), &id, Some(&id)).unwrap());
     a.take_changes();
     let join = b.join_external(&server(), &info, t, &()).unwrap();
     b.take_changes();
@@ -816,7 +816,7 @@ fn a_losing_creation_is_settled_away_then_joins_the_winner() {
         let saved = f.b.durable.clone();
         assert_eq!(f.b.join_external(&server(), &f.info, f.t, &()), Err(Invalid("group pin")));
         f.b = Agent::load([21; 32], f.b.credential.clone(), saved).unwrap();
-        assert!(!f.b.settle(&server(), &losing_id, &f.id).unwrap());
+        assert!(!f.b.settle(&server(), &losing_id, Some(&f.id)).unwrap());
         f.b.take_changes();
         assert_eq!(f.b.durable, before);
         assert!(f.b.group(&server(), &other_id).is_some());
@@ -861,7 +861,7 @@ fn settle_rejects_groups_that_are_not_creating_without_changes() {
             }
         };
         let before = agent.durable.clone();
-        assert_eq!(agent.settle(&server(), &f.id, &[9; 32]), Err(Invalid("not creating")));
+        assert_eq!(agent.settle(&server(), &f.id, Some(&[9; 32])), Err(Invalid("not creating")));
         assert!(agent.take_changes().is_empty());
         assert_eq!(agent.durable, before);
     }
@@ -943,7 +943,7 @@ fn self_update_publishes_loaded_renewal_and_keeps_peer_gate_open_after_old_expir
     let info = a.create(d).unwrap();
     a.take_changes();
     let observer = Observer::create(&info, &server()).unwrap();
-    assert!(a.settle(&server(), &id, &id).unwrap());
+    assert!(a.settle(&server(), &id, Some(&id)).unwrap());
     a.take_changes();
     let out = b.join_external(&server(), &info, t, &()).unwrap();
     b.take_changes();
@@ -1079,19 +1079,19 @@ fn creation_waits_for_persisted_server_acceptance() {
     a = load();
     assert_eq!(a.join_external(&server(), &info, t, &()), Err(AgentError::Blocked));
     a = load();
-    assert_eq!(a.settle(&server(), &[0; 32], &[0; 32]), Err(Invalid("not creating")));
+    assert_eq!(a.settle(&server(), &[0; 32], None), Err(Invalid("not creating")));
     assert!(a.take_changes().is_empty());
     a = load();
-    assert!(a.settle(&server(), &id, &id).unwrap());
+    assert!(a.settle(&server(), &id, Some(&id)).unwrap());
     assert_eq!(a.sending_key(&server(), &id, t, &()), Err(AgentError::Unpersisted));
     a.take_changes().apply(&mut stores);
     a = Agent::load([11; 32], credential.clone(), stores.clone()).unwrap();
     assert_eq!(a.group(&server(), &id).unwrap().status, Status::Active);
     assert_eq!(a.sending_key(&server(), &id, t, &()).unwrap().0, 0);
-    assert_eq!(a.settle(&server(), &id, &[9; 32]), Err(Invalid("not creating")));
+    assert_eq!(a.settle(&server(), &id, None), Err(Invalid("not creating")));
     assert!(a.take_changes().is_empty());
     a = Agent::load([11; 32], credential, stores).unwrap();
-    assert_eq!(a.settle(&server(), &id, &id), Err(Invalid("not creating")));
+    assert_eq!(a.settle(&server(), &id, Some(&id)), Err(Invalid("not creating")));
 }
 
 #[test]
@@ -1104,7 +1104,7 @@ fn eviction_with_pending_commit_and_proposals_erases_only_target_mls_state() {
     let other_id = d.group_id();
     f.b.create(d).unwrap();
     f.b.take_changes();
-    assert!(f.b.settle(&server(), &other_id, &other_id).unwrap());
+    assert!(f.b.settle(&server(), &other_id, Some(&other_id)).unwrap());
     f.b.take_changes();
     f.b.key_packages(2, f.t).unwrap();
     f.b.take_changes();
@@ -1142,7 +1142,7 @@ fn eviction_with_pending_commit_and_proposals_erases_only_target_mls_state() {
 }
 
 #[test]
-fn a_creation_whose_reply_was_lost_is_settled_by_the_conflict_naming_it() {
+fn after_a_restart_a_creation_is_settled_with_the_servers_group_list() {
     let t = now();
     let mut a = device(1, 11, t);
     let mut b = device(2, 21, t);
@@ -1151,19 +1151,26 @@ fn a_creation_whose_reply_was_lost_is_settled_by_the_conflict_naming_it() {
     let info = a.create(d).unwrap();
     let mut stores = a.durable.clone();
     a.take_changes().apply(&mut stores);
-    // The server accepted it, the reply was lost, and the peer joined meanwhile.
+    let credential = a.credential.clone();
+    // Never registered: `mls.groups` lists no group, so the creation goes and
+    // the conversation can be created again.
+    let mut a = Agent::load([11; 32], credential.clone(), stores.clone()).unwrap();
+    assert!(!a.settle(&server(), &id, None).unwrap());
+    let mut fresh = stores.clone();
+    a.take_changes().apply(&mut fresh);
+    let mut a = Agent::load([11; 32], credential.clone(), fresh).unwrap();
+    assert!(a.group(&server(), &id).is_none());
+    a.create(descriptor(&a, &b, t + 1, true, true)).unwrap();
+    // Accepted, but the reply was lost and the peer joined meanwhile:
+    // `mls.groups` lists this group, so the creation won.
     let observer = Observer::create(&info, &server()).unwrap();
     let join = b.join_external(&server(), &info, t, &()).unwrap();
     b.take_changes();
     accept(observer, &join, t);
     acknowledge(&mut b, &id, &join);
-    // After a restart the device registers the same group again; the
-    // server's conflict names it, so the creation won.
-    let mut a = Agent::load([11; 32], a.credential.clone(), stores).unwrap();
-    Observer::create(&a.creation(&server(), &id).unwrap(), &server()).unwrap();
-    assert!(a.settle(&server(), &id, &id).unwrap());
+    let mut a = Agent::load([11; 32], credential, stores).unwrap();
+    assert!(a.settle(&server(), &id, Some(&id)).unwrap());
     a.take_changes();
-    assert_eq!(a.creation(&server(), &id), Err(Invalid("not creating")));
     a.receive(&server(), &id, &join.commit, &[]).unwrap();
     a.take_changes();
     assert_eq!(a.sending_key(&server(), &id, t, &()), b.sending_key(&server(), &id, t, &()));

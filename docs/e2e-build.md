@@ -245,13 +245,14 @@ credential, the OpenMLS provider and Gwar's own per-group records.
   `create` persists a tentative **Creating** group: the gate reports
   `creating`, without a sending key, commits or history sharing.
   `settle(server, id, winner)` takes the group the server holds for the
-  conversation (the `mls.group.create` reply `{group}`, or the group its
-  `conflict` names): if it is this group, the group becomes **Active** and
-  epoch zero is derived; otherwise the losing creation's OpenMLS group and
+  conversation (the `mls.group.create` reply `{group}`, the group its
+  `conflict` names, or, after a restart or a lost reply, the one `mls.groups`
+  lists, possibly none): if it is this group, the group becomes **Active**
+  and epoch zero is derived; otherwise the creation's OpenMLS group and
   record (pin) are deleted, so the device can join the winner by Welcome or
-  external commit. A device that lost the reply or restarted registers the
-  same group again (`creation` re-exports its GroupInfo); the `conflict`
-  then names its own group. Persist before using or leaving the group.
+  external commit, or create the conversation again. Settling checks no
+  certificate, so it works after the creator's leaf expired. Persist before
+  using or leaving the group.
 - **Removal of this device**: a commit that removes the device's own leaf is
   processed as any other, but ends its membership: no epoch key is exported
   for the new epoch (OpenMLS refuses, and the device must not have it), the
@@ -612,7 +613,7 @@ messages: like signed messages, their author is inside the signature.
   reply `{group}` or of `conflict`. If it won: `mls.key_packages.claim {uids:
   [peer, self]}` and one `mls.commit` adding every claimed device not yet in
   the group, with its Welcome; if not, join the winner by Welcome or external commit. A group
-  still **Creating** after a restart is registered again.
+  still **Creating** after a restart is settled with `mls.groups`.
 - Devices without a key package (never online since the update), and new
   devices, join on connect by external commit, in the background (design:
   "Joining").

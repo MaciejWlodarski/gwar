@@ -60,11 +60,10 @@ arrays or number arrays; output bytes are number arrays. For example:
 ```js
 agent.execute({ device_hpke_key: null });
 // After create, persist, then send mls.group.create. With the group from its
-// reply {group} or from conflict (true: ours won; false: join the winner):
+// reply {group} or from conflict, or after a restart from mls.groups (null if
+// none): true means ours won; false, join the winner or create again.
 agent.execute({ settle: { server, group, winner } });
 // Persist before sending, committing, sharing history or joining the winner.
-// After a restart, re-send a still-creating group's GroupInfo:
-agent.execute({ creation: { server, group } });
 agent.execute({ welcome: { server, id: welcomeId, bytes: welcomeBytes } });
 agent.execute({ gate: { server, group, now: Date.now(), revocations: [] } });
 agent.execute({ epoch: { server, group, epoch: '18446744073709551615' } });
@@ -74,7 +73,7 @@ agent.execute({ reconcile: {
 } });
 ```
 
-Operations are `key_packages`, `last_resort_key_package`, `create`, `creation`, `settle`, `welcome`,
+Operations are `key_packages`, `last_resort_key_package`, `create`, `settle`, `welcome`,
 `join_external`, `commit`, `receive`, `proposal`, `pending`, `reconcile`, `gate`,
 `sending_key`, `share_history`, `import_history`, `device_hpke_key`, `group`,
 `epoch`, and `outbox`. Their native signatures and recovery contract are in

@@ -602,31 +602,20 @@ impl Agent {
         })
     }
 
-    /// The GroupInfo of a group still **Creating**, to register it again
-    /// after a lost reply or a crash.
-    pub fn creation(&self, server: &str, id: &[u8; 32]) -> Result<Vec<u8>> {
-        if self.poisoned {
-            return Err(AgentError::Reload);
-        }
-        let key = group_key(server, id);
-        if self.groups.get(&key).is_none_or(|r| r.status != Status::Creating) {
-            return Err(Invalid("not creating"));
-        }
-        wire(self.mls(&key)?.export_group_info(self.provider.crypto(), &self.signer, true).map_err(err("group info"))?)
-    }
-
-    /// Settles a creation with the server's answer to `mls.group.create`:
-    /// the group it holds for the conversation, from `{group}` or `conflict`.
-    /// Returns whether this device's group is that group; a losing group is
-    /// deleted, with its pin, so the device can join the winner.
-    pub fn settle(&mut self, server: &str, id: &[u8; 32], winner: &[u8; 32]) -> Result<bool> {
+    /// Settles a creation with the group the server holds for the
+    /// conversation: from the `mls.group.create` reply `{group}` or
+    /// `conflict`, or after a restart from `mls.groups` (`None` when it lists
+    /// none). Returns whether this device's group is that group; otherwise it
+    /// is deleted, with its pin, so the device can join the winner or create
+    /// the conversation again.
+    pub fn settle(&mut self, server: &str, id: &[u8; 32], winner: Option<&[u8; 32]>) -> Result<bool> {
         self.operation(|a| {
             let key = group_key(server, id);
             if a.groups.get(&key).is_none_or(|r| r.status != Status::Creating) {
                 return Err(Invalid("not creating"));
             }
             let mut group = a.mls(&key)?;
-            if winner == id {
+            if winner == Some(id) {
                 a.derived(&key, &group)?;
                 return Ok(true);
             }
