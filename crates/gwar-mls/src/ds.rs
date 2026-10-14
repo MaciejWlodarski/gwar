@@ -89,6 +89,8 @@ pub enum CommitSender {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Accepted {
     pub epoch: u64,
+    /// The time its sender signed into the commit (Unix ms).
+    pub committed_at: i64,
     pub sender: CommitSender,
     pub added: Vec<Leaf>,
     pub removed: Vec<Leaf>,
@@ -103,8 +105,8 @@ fn group_info_in(bytes: &[u8]) -> Result<openmls::messages::group_info::Verifiab
     }
 }
 
-/// Verifies a GroupInfo with its ratchet tree: tree, signature, and the
-/// GroupContext it carries. Returns the observer it describes.
+/// Verifies a new group's first GroupInfo with its ratchet tree: tree,
+/// signature, lifetimes and the GroupContext it carries.
 fn verified_group_info(bytes: &[u8]) -> Result<(MemoryStorage, PublicGroup), DsError> {
     let info = group_info_in(bytes)?;
     let tree = info.extensions().ratchet_tree().ok_or(Invalid("no ratchet tree"))?.ratchet_tree().clone();
@@ -240,11 +242,16 @@ impl Observer {
     /// Processes and merges the next commit, checking the GroupInfo its sender
     /// uploads for the new epoch and the Welcome for the devices it adds.
     /// Consumes the observer: on error, load the saved state again.
+    ///
+    /// `now` is the server's clock and `previous` the time of the group's last
+    /// commit (both Unix ms); see [`commit_time`].
     pub fn commit(
         mut self,
         commit: &[u8],
         group_info: &[u8],
         welcome: Option<&[u8]>,
+        now: i64,
+        previous: i64,
     ) -> Result<(Self, Accepted), DsError> {
         let message = MlsMessageIn::tls_deserialize_exact(commit)
             .map_err(invalid("commit encoding"))?
@@ -264,6 +271,10 @@ impl Observer {
         }
         let crypto = RustCrypto::default();
         let processed = self.group.process_message(&crypto, message).map_err(invalid("commit"))?;
+        let committed_at = commit_time(processed.aad()).ok_or(Invalid("commit time"))?;
+        if committed_at.abs_diff(now) > MAX_CLOCK_SKEW_MS || committed_at < previous {
+            return Err(Invalid("commit time"));
+        }
         let sender = match processed.sender() {
             Sender::Member(index) => CommitSender::Member(index.u32()),
             Sender::NewMemberCommit => CommitSender::NewMember,
@@ -318,12 +329,7 @@ impl Observer {
         self.group.merge_commit(&self.storage, *staged).map_err(invalid("merge"))?;
         self.check_tree()?;
 
-        let (_, uploaded) = verified_group_info(group_info)?;
-        if uploaded.group_context() != self.group.group_context()
-            || uploaded.confirmation_tag() != self.group.confirmation_tag()
-        {
-            return Err(Invalid("group info does not match the commit"));
-        }
+        self.check_group_info(group_info)?;
 
         let welcome_recipients = match welcome {
             None if welcome_for.is_empty() => Vec::new(),
@@ -346,8 +352,37 @@ impl Observer {
         let find = |device: &str| leaves.iter().find(|l| l.device_key == device).cloned();
         let mut added: Vec<Leaf> = added_devices.iter().filter_map(|c| find(c.device_key())).collect();
         added.extend(external.iter().filter_map(|c| find(c.device_key())));
-        let accepted = Accepted { epoch: self.epoch(), sender, added, removed, welcome_recipients };
+        let accepted = Accepted { epoch: self.epoch(), committed_at, sender, added, removed, welcome_recipients };
         Ok((self, accepted))
+    }
+
+    /// The GroupInfo a committer uploads for the new epoch must describe exactly
+    /// the merged state: GroupContext, confirmation tag and tree, signed by a
+    /// member. Leaf lifetimes are not checked again (docs/e2e-build.md, "Lifetimes").
+    fn check_group_info(&self, bytes: &[u8]) -> Result<(), DsError> {
+        let info = group_info_in(bytes)?;
+        let mismatch = Invalid("group info does not match the commit");
+        let extensions = info.extensions();
+        let tree = extensions.ratchet_tree().ok_or(Invalid("no ratchet tree"))?.ratchet_tree();
+        if extensions.external_pub().is_none()
+            || extensions.iter().count() != 2
+            || tree.tls_serialize_detached().ok() != self.group.export_ratchet_tree().tls_serialize_detached().ok()
+        {
+            return Err(mismatch);
+        }
+        // GroupInfoTBS = group_context ‖ extensions ‖ confirmation_tag ‖ signer (u32).
+        let mut expected = self.group.group_context().tls_serialize_detached().map_err(invalid("encoding"))?;
+        expected.extend(extensions.tls_serialize_detached().map_err(invalid("encoding"))?);
+        expected.extend(self.group.confirmation_tag().tls_serialize_detached().map_err(invalid("encoding"))?);
+        let payload = info.unsigned_payload().map_err(invalid("encoding"))?;
+        let signer = payload
+            .strip_prefix(expected.as_slice())
+            .and_then(|rest| <[u8; 4]>::try_from(rest).ok())
+            .map(u32::from_be_bytes)
+            .ok_or(mismatch)?;
+        let leaf = self.group.leaf(LeafNodeIndex::new(signer)).ok_or(Invalid("group info signer"))?;
+        let key = OpenMlsSignaturePublicKey::from_signature_key(leaf.signature_key().clone(), SignatureScheme::ED25519);
+        info.verify_no_out(&RustCrypto::default(), &key).map_err(invalid("group info signature"))
     }
 
     /// An external `Remove` proposal for `leaf` in the current epoch, signed by
@@ -380,6 +415,22 @@ impl Observer {
         self.group.add_proposal(&self.storage, *queued).map_err(invalid("proposal store"))?;
         Ok(bytes)
     }
+}
+
+/// How far a commit's signed time may be from the server's clock.
+pub const MAX_CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
+
+const COMMIT_TIME_HEADER: &str = "gwar commit v1\n";
+
+/// The authenticated data a committer puts on every commit.
+pub fn commit_aad(committed_at: i64) -> Vec<u8> {
+    format!("{COMMIT_TIME_HEADER}{committed_at}").into_bytes()
+}
+
+/// The time in a commit's authenticated data (`gwar commit v1\n{unix ms}`).
+pub fn commit_time(aad: &[u8]) -> Option<i64> {
+    let text = std::str::from_utf8(aad).ok()?.strip_prefix(COMMIT_TIME_HEADER)?;
+    crate::encoding::decimal(text).map(|ms| ms as i64)
 }
 
 /// Length-prefixed key/value pairs written by [`Observer::save`].

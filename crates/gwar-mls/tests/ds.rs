@@ -4,7 +4,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use ed25519_dalek::{Signer as _, SigningKey};
 use gwar_mls::{
     Credential, DESCRIPTOR_EXTENSION, Descriptor, Kind, SUITE, SignedDescriptor,
-    ds::{self, CommitSender, DsError, Observer},
+    ds::{self, CommitSender, DsError, Observer, commit_aad},
     signer::{Ed25519Signer, server_credential},
 };
 use openmls::prelude::{
@@ -13,6 +13,9 @@ use openmls::prelude::{
 };
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use vc_proto::DeviceCertificate;
+
+/// The test's clock (Unix ms) for commit times.
+const NOW: i64 = 1_800_000_000_000;
 
 fn b64(bytes: &[u8]) -> String {
     B64.encode(bytes)
@@ -151,6 +154,7 @@ impl Device {
             .collect();
         let (provider, signer) = (&self.provider, &self.signer);
         let group = self.group.as_mut().unwrap();
+        group.set_aad(commit_aad(NOW));
         let (commit, welcome, _) = group.add_members(provider, signer, &packages).unwrap();
         group.merge_pending_commit(provider).unwrap();
         let (commit, welcome) = (wire(commit), wire(welcome));
@@ -160,6 +164,7 @@ impl Device {
     fn update(&mut self) -> (Vec<u8>, Vec<u8>) {
         let (provider, signer) = (&self.provider, &self.signer);
         let group = self.group.as_mut().unwrap();
+        group.set_aad(commit_aad(NOW));
         let commit = group.self_update(provider, signer, LeafNodeParameters::default()).unwrap().into_commit();
         group.merge_pending_commit(provider).unwrap();
         (wire(commit), self.group_info())
@@ -172,6 +177,7 @@ impl Device {
         };
         let (mut group, bundle) = MlsGroup::external_commit_builder()
             .with_config(join_config())
+            .with_aad(commit_aad(NOW))
             .build_group(&self.provider, info, self.with_key())
             .unwrap()
             .leaf_node_parameters(LeafNodeParameters::builder().with_capabilities(capabilities()).build())
@@ -206,6 +212,7 @@ impl Device {
     fn commit_pending(&mut self) -> (Vec<u8>, Vec<u8>) {
         let (provider, signer) = (&self.provider, &self.signer);
         let group = self.group.as_mut().unwrap();
+        group.set_aad(commit_aad(NOW));
         let (commit, _, _) = group.commit_to_pending_proposals(provider, signer).unwrap();
         group.merge_pending_commit(provider).unwrap();
         (wire(commit), self.group_info())
@@ -257,20 +264,20 @@ fn follows_adds_updates_and_external_joins() {
     assert_eq!(observer.epoch(), 0);
     let bob = Device::new(2, 21);
     let (commit, welcome, info) = alice.add(&[bob.key_package()]);
-    let (observer, accepted) = observer.commit(&commit, &info, Some(&welcome)).unwrap();
+    let (observer, accepted) = observer.commit(&commit, &info, Some(&welcome), NOW, 0).unwrap();
     assert_eq!(accepted.epoch, 1);
     assert_eq!(accepted.sender, CommitSender::Member(0));
     assert_eq!(accepted.welcome_recipients, vec![bob.credential.device_key().to_owned()]);
     assert_eq!(accepted.added.len(), 1);
 
     let (commit, info) = alice.update();
-    let (observer, accepted) = observer.commit(&commit, &info, None).unwrap();
+    let (observer, accepted) = observer.commit(&commit, &info, None, NOW, 0).unwrap();
     assert_eq!(accepted.epoch, 2);
 
     // Bob's second device joins by itself.
     let mut phone = Device::new(2, 22);
     let (commit, info) = phone.join_external(&alice.group_info());
-    let (observer, accepted) = observer.commit(&commit, &info, None).unwrap();
+    let (observer, accepted) = observer.commit(&commit, &info, None, NOW, 0).unwrap();
     assert_eq!(accepted.sender, CommitSender::NewMember);
     assert_eq!(accepted.added[0].device_key, phone.credential.device_key());
     assert_eq!(observer.leaves().len(), 3);
@@ -286,7 +293,7 @@ fn a_second_commit_for_the_same_epoch_is_stale() {
     let (mut alice, observer) = dm();
     let mut bob = Device::new(2, 21);
     let (commit, welcome, info) = alice.add(&[bob.key_package()]);
-    let (observer, _) = observer.commit(&commit, &info, Some(&welcome)).unwrap();
+    let (observer, _) = observer.commit(&commit, &info, Some(&welcome), NOW, 0).unwrap();
     let MlsMessageBodyIn::Welcome(welcome) = MlsMessageIn::tls_deserialize_exact(&welcome).unwrap().extract() else {
         panic!("not a welcome")
     };
@@ -299,12 +306,12 @@ fn a_second_commit_for_the_same_epoch_is_stale() {
     let (alice_commit, alice_info) = alice.update();
     let (bob_commit, bob_info) = bob.update();
     let saved = observer.save();
-    let (observer, _) = observer.commit(&alice_commit, &alice_info, None).unwrap();
-    assert_eq!(observer.commit(&bob_commit, &bob_info, None).err(), Some(DsError::Stale));
+    let (observer, _) = observer.commit(&alice_commit, &alice_info, None, NOW, 0).unwrap();
+    assert_eq!(observer.commit(&bob_commit, &bob_info, None, NOW, 0).err(), Some(DsError::Stale));
     // The same commit cannot be applied twice either.
     let (observer, _) =
-        Observer::load(&saved, &server_key()).unwrap().commit(&alice_commit, &alice_info, None).unwrap();
-    assert_eq!(observer.commit(&alice_commit, &alice_info, None).err(), Some(DsError::Stale));
+        Observer::load(&saved, &server_key()).unwrap().commit(&alice_commit, &alice_info, None, NOW, 0).unwrap();
+    assert_eq!(observer.commit(&alice_commit, &alice_info, None, NOW, 0).err(), Some(DsError::Stale));
 }
 
 #[test]
@@ -315,21 +322,24 @@ fn rejects_outsiders_mismatched_group_infos_and_stale_epochs() {
     // Carol is not a participant of Alice and Bob's conversation.
     let carol = Device::new(3, 31);
     let (commit, welcome, info) = alice.add(&[carol.key_package()]);
-    assert_eq!(observer.commit(&commit, &info, Some(&welcome)).err(), Some(DsError::Invalid("not a participant")));
+    assert_eq!(
+        observer.commit(&commit, &info, Some(&welcome), NOW, 0).err(),
+        Some(DsError::Invalid("not a participant"))
+    );
 
     // A fresh start: a commit whose uploaded GroupInfo is from another epoch.
     let (mut alice, observer) = dm();
     let stale_info = alice.group_info();
     let (commit, welcome, _) = alice.add(&[Device::new(2, 21).key_package()]);
     assert_eq!(
-        observer.commit(&commit, &stale_info, Some(&welcome)).err(),
+        observer.commit(&commit, &stale_info, Some(&welcome), NOW, 0).err(),
         Some(DsError::Invalid("group info does not match the commit"))
     );
 
     // A missing Welcome for an added device.
     let (mut alice, observer) = dm();
     let (commit, _, info) = alice.add(&[Device::new(2, 21).key_package()]);
-    assert_eq!(observer.commit(&commit, &info, None).err(), Some(DsError::Invalid("missing welcome")));
+    assert_eq!(observer.commit(&commit, &info, None, NOW, 0).err(), Some(DsError::Invalid("missing welcome")));
     assert!(Observer::load(&saved, &server_key()).is_ok());
     assert!(Observer::load(&saved[..saved.len() - 1], &server_key()).is_err());
 }
@@ -339,11 +349,11 @@ fn server_removal_proposals_are_committed_by_reference() {
     let (mut alice, observer) = dm();
     let bob = Device::new(2, 21);
     let (commit, welcome, info) = alice.add(&[bob.key_package()]);
-    let (mut observer, _) = observer.commit(&commit, &info, Some(&welcome)).unwrap();
+    let (mut observer, _) = observer.commit(&commit, &info, Some(&welcome), NOW, 0).unwrap();
     let proposal = observer.propose_remove(&server(), 1).unwrap();
     alice.process(&proposal);
     let (commit, info) = alice.commit_pending();
-    let (observer, accepted) = observer.commit(&commit, &info, None).unwrap();
+    let (observer, accepted) = observer.commit(&commit, &info, None, NOW, 0).unwrap();
     assert_eq!(accepted.removed.len(), 1);
     assert_eq!(accepted.removed[0].device_key, bob.credential.device_key());
     assert_eq!(observer.leaves().len(), 1);
@@ -355,4 +365,19 @@ fn rejects_groups_without_the_server_as_external_sender() {
     let descriptor = dm_descriptor(&alice, 2);
     alice.create(&descriptor, &b64(key(201).verifying_key().as_bytes()));
     assert_eq!(Observer::create(&alice.group_info(), &server_key()).err(), Some(DsError::Invalid("external senders")));
+}
+
+#[test]
+fn commit_times_follow_the_server_clock_and_never_go_back() {
+    let (mut alice, observer) = dm();
+    let saved = observer.save();
+    let (commit, info) = alice.update();
+    let load = || Observer::load(&saved, &server_key()).unwrap();
+    let skew = ds::MAX_CLOCK_SKEW_MS as i64;
+    assert_eq!(load().commit(&commit, &info, None, NOW + skew + 1, 0).err(), Some(DsError::Invalid("commit time")));
+    assert_eq!(load().commit(&commit, &info, None, NOW - skew - 1, 0).err(), Some(DsError::Invalid("commit time")));
+    assert_eq!(load().commit(&commit, &info, None, NOW, NOW + 1).err(), Some(DsError::Invalid("commit time")));
+    let (_, accepted) = load().commit(&commit, &info, None, NOW + skew, NOW).unwrap();
+    assert_eq!(accepted.committed_at, NOW);
+    assert_eq!(ds::commit_time(b"gwar commit v1\n01"), None);
 }
