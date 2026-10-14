@@ -37,7 +37,7 @@ pub(crate) fn parse_netstrings(mut input: &[u8], count: usize) -> Option<Vec<&[u
     let mut fields = Vec::with_capacity(count);
     while !input.is_empty() {
         let colon = input.iter().position(|&b| b == b':')?;
-        let len = decimal(std::str::from_utf8(&input[..colon]).ok()?)? as usize;
+        let len = usize::try_from(decimal(std::str::from_utf8(&input[..colon]).ok()?)?).ok()?;
         let rest = &input[colon + 1..];
         if rest.len() <= len || rest[len] != b',' {
             return None;
@@ -72,5 +72,7 @@ mod tests {
         assert!(parse_netstrings(&trailing, 3).is_none());
         assert!(parse_netstrings(b"01:a,", 1).is_none());
         assert!(parse_netstrings(b"2:a,", 1).is_none());
+        assert!(parse_netstrings(b"4294967297:a,", 1).is_none());
+        assert!(parse_netstrings(b"9007199254740991:a,", 1).is_none());
     }
 }

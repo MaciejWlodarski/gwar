@@ -115,11 +115,20 @@ impl Device {
     }
 
     fn create(&mut self, descriptor: &SignedDescriptor, external_sender: &str) {
+        self.create_requiring(descriptor, external_sender, &[CredentialType::Basic]);
+    }
+
+    fn create_requiring(
+        &mut self,
+        descriptor: &SignedDescriptor,
+        external_sender: &str,
+        credentials: &[CredentialType],
+    ) {
         let extensions = Extensions::from_vec(vec![
             Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(
                 &[ExtensionType::Unknown(DESCRIPTOR_EXTENSION)],
                 &[],
-                &[CredentialType::Basic],
+                credentials,
             )),
             Extension::Unknown(DESCRIPTOR_EXTENSION, UnknownExtension(descriptor.encode())),
             Extension::ExternalSenders(vec![ExternalSender::new(
@@ -376,6 +385,17 @@ fn rejects_groups_without_the_server_as_external_sender() {
     let descriptor = dm_descriptor(&alice, 2);
     alice.create(&descriptor, &b64(key(201).verifying_key().as_bytes()));
     assert_eq!(Observer::create(&alice.group_info(), &server_key()).err(), Some(DsError::Invalid("external senders")));
+}
+
+#[test]
+fn rejects_groups_that_do_not_require_basic_credentials() {
+    let mut alice = Device::new(1, 11);
+    let descriptor = dm_descriptor(&alice, 2);
+    alice.create_requiring(&descriptor, &server_key(), &[]);
+    assert_eq!(
+        Observer::create(&alice.group_info(), &server_key()).err(),
+        Some(DsError::Invalid("required capabilities"))
+    );
 }
 
 #[test]

@@ -24,6 +24,8 @@ const HPKE: HpkeConfig = HpkeConfig(HpkeKemType::DhKem25519, HpkeKdfType::HkdfSh
 pub enum HistoryError {
     #[error("invalid entries")]
     Entries,
+    #[error("invalid header")]
+    Header,
     #[error("the signing key is not the header's sender")]
     Sender,
     #[error("chunk too large")]
@@ -156,16 +158,19 @@ impl Chunk {
     /// Seals `entries` (epoch, epoch key), sorted, unique and within the
     /// header's range, signed by the sender's device key.
     pub fn seal(header: Header, entries: &[(u64, [u8; 32])], sender: &SigningKey) -> Result<Vec<u8>, HistoryError> {
+        let text = header.encode();
+        if Header::parse(&text).as_ref() != Some(&header) {
+            return Err(HistoryError::Header);
+        }
         if !valid_entries(&header, entries.iter().map(|(epoch, _)| *epoch)) {
             return Err(HistoryError::Entries);
         }
         if b64(sender.verifying_key().as_bytes()) != header.sender_device_key {
             return Err(HistoryError::Sender);
         }
-        let recipient = fixed::<32>(&header.recipient_hpke_key).ok_or(HistoryError::Entries)?;
+        let recipient = fixed::<32>(&header.recipient_hpke_key).ok_or(HistoryError::Header)?;
         let plaintext: Vec<u8> =
             entries.iter().flat_map(|(epoch, key)| epoch.to_be_bytes().into_iter().chain(*key)).collect();
-        let text = header.encode();
         let sealed = RustCrypto::default()
             .hpke_seal(HPKE, &recipient, &header.info(), text.as_bytes(), &plaintext)
             .map_err(|_| HistoryError::Open)?;
@@ -304,7 +309,14 @@ mod tests {
         }
         assert_eq!(Chunk::seal(h.clone(), &[(3, [0; 32])], &key(12)), Err(HistoryError::Sender));
         let wide = Header { last_epoch: h.first_epoch + MAX_CHUNK_EPOCHS, ..h.clone() };
-        assert_eq!(Chunk::seal(wide.clone(), &[(3, [0; 32])], &key(11)), Err(HistoryError::Entries));
+        assert_eq!(Chunk::seal(wide.clone(), &[(3, [0; 32])], &key(11)), Err(HistoryError::Header));
+        for bad in [
+            Header { created_at: -1, ..h.clone() },
+            Header { server_key: "x".into(), ..h.clone() },
+            Header { recipient_hpke_key: "x".into(), ..h.clone() },
+        ] {
+            assert_eq!(Chunk::seal(bad, &[(3, [0; 32])], &key(11)), Err(HistoryError::Header));
+        }
         assert!(Header::parse(&wide.encode()).is_none());
 
         let bytes = Chunk::seal(h.clone(), &[(4, [40; 32])], &key(11)).unwrap();

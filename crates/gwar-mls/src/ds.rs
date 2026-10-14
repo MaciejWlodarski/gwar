@@ -158,7 +158,9 @@ impl Observer {
             return Err(Invalid("descriptor"));
         }
         let required = extensions.required_capabilities().ok_or(Invalid("required capabilities"))?;
-        if !required.extension_types().contains(&ExtensionType::Unknown(DESCRIPTOR_EXTENSION)) {
+        if !required.extension_types().contains(&ExtensionType::Unknown(DESCRIPTOR_EXTENSION))
+            || !required.credential_types().contains(&CredentialType::Basic)
+        {
             return Err(Invalid("required capabilities"));
         }
         let senders = extensions.external_senders().ok_or(Invalid("external senders"))?;
