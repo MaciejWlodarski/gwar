@@ -7,7 +7,7 @@ import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRe
 import { countKey, useLanguage, useT, type TFn } from "../i18n";
 import { cn } from "../lib/cn";
 import { memberName } from "../lib/member-name";
-import { buildRows, messageTarget, encryptedDm, type Row } from "../lib/chat";
+import { buildRows, messageTarget, encryptedDm, sealedThread, type Row } from "../lib/chat";
 import { useIsMobile } from "../lib/media";
 import { checkUpload, formatBytes } from "../lib/files";
 import { splitMentions } from "../lib/mentions";
@@ -17,10 +17,10 @@ import type { ChatMessage } from "../proto/ChatMessage";
 import { controller, UploadError } from "../state/controller";
 import { myChannelId, storedKey } from "../state/reducer";
 import { useOutbox, useSession, useUi } from "../state/stores";
-import type { ThreadKey } from "../state/types";
+import type { ChatItem, ThreadKey } from "../state/types";
 import { AttachmentList } from "./Attachments";
 import { ConnectBadge, MentionBadge, UnreadBadge } from "./badges";
-import { usePermission, useUidColor } from "./hooks";
+import { usePermission, useRoster, useUidColor } from "./hooks";
 import { useMembersPanel } from "./members";
 import { useMentionAutocomplete } from "./MentionInput";
 import { DeafenButton, MicButton } from "./VoicePanel";
@@ -358,6 +358,10 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
   const key = useSession((s) => storedKey(s, threadKey));
   const thread = useSession((s) => (key ? s.threads[key] : undefined));
   const hasHistory = useSession((s) => s.kind !== "teamspeak");
+  const roster = useRoster(key);
+  // Without shared history, rows from before my account joined stay unreadable: one muted line stands for them.
+  const unshared = useCallback((i: ChatItem) => i.kind === "msg" && i.cannotOpen === "no_key" && !!i.sealed
+    && roster?.history === false && roster.since !== null && i.sealed.epoch < roster.since, [roster]);
   const allFailed = useOutbox((o) => o.failed);
   const failed = useMemo(() => allFailed.filter((f) => f.thread === key), [allFailed, key]);
   const serverKey = controller.messageServerKey;
@@ -418,10 +422,11 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
     return () => { active = false; clearTimeout(timer); };
   }, [thread?.items, serverKey, key, mineUid, verifier, authTick]);
   const rows = useMemo(() => buildRows((thread?.items ?? []).filter((i) => {
+    if (unshared(i)) return false;
     if (i.kind !== "msg" || i.msg.text !== DELETION_TEXT) return true;
     const entry = verified.get(i.msg.id);
     return entry?.fingerprint !== messageFingerprint(i.msg, { serverKey, target: targetFor(i.msg), sealed: i.sealed ? { group: i.sealed.group, epoch: i.sealed.epoch } : undefined }) || !quietDeletion(entry.state);
-  })), [thread?.items, verified, serverKey, key, signingUid]);
+  })), [thread?.items, verified, serverKey, key, signingUid, unshared]);
   const ref = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const restoreFrom = useRef<number | null>(null);
@@ -529,7 +534,8 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
             )}
           </EmptyState>
         )}
-        {thread?.items.some(i => i.kind === "msg" && i.cannotOpen === "no_key") && <p className="px-4 py-2 text-xs text-subtle" role="status">{t("chat.waitingHistory")}</p>}
+        {thread?.items.some(unshared) && <p className="px-4 py-2 text-center text-xs text-subtle">{t("chat.historyNotShared")}</p>}
+        {thread?.items.some(i => i.kind === "msg" && i.cannotOpen === "no_key" && !unshared(i)) && <p className="px-4 py-2 text-xs text-subtle" role="status">{t("chat.waitingHistory")}</p>}
         {rows.map((row) => {
           if (row.type === "day")
             return (
@@ -557,7 +563,7 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
               lang={lang}
               compact={compact}
               canEdit={stored && own && signable}
-              canDelete={stored && ((own && signable) || (!row.item.sealed && canManageMessages))}
+              canDelete={stored && ((own && signable) || (canManageMessages && (!row.item.sealed || row.item.sealed.conversation.startsWith("channel:"))))}
               editing={editing === m.id}
             />
           );
@@ -706,8 +712,8 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
   const ref = useRef<HTMLTextAreaElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const online = useSession((s) => s.phase === "online");
-  const encrypted = useSession(s => encryptedDm(threadKey, s.kind));
-  const securing = useSession(s => encrypted && s.threads[threadKey]?.securing !== false);
+  const encrypted = useSession(s => sealedThread(storedKey(s, threadKey), s.kind, s.channels));
+  const securing = useSession(s => encrypted && s.threads[storedKey(s, threadKey) ?? ""]?.securing !== false);
   const peerOnline = useSession((s) => (threadKey.startsWith("dm:") && !encrypted ? Object.values(s.clients).some((c) => c.uid === threadKey.slice(3)) : true));
   const peerName = useSession((s) => (threadKey.startsWith("dm:") ? s.threads[threadKey]?.peer?.name : undefined));
   const channelName = useSession((s) => (s.viewChannel === null ? "" : (s.channels[s.viewChannel]?.name ?? "")));
@@ -715,8 +721,8 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
   const locked = useSession((s) => threadKey === "channel" && s.viewChannel !== null && !!s.threads[`ch:${s.viewChannel}`]?.locked);
   const uploadsOn = useSession((s) => s.kind === "vc" && (s.server?.upload_limit ?? 0) > 0);
   const mayUpload = usePermission("file_upload");
-  // Files travel with channel messages only.
-  const canAttach = threadKey === "channel" && uploadsOn && mayUpload;
+  // Files travel with plaintext channel messages only (encrypted attachments come later).
+  const canAttach = threadKey === "channel" && !encrypted && uploadsOn && mayUpload;
   const disabled = !online || !peerOnline || locked || securing;
   const over = text.length > MAX_MESSAGE_LENGTH;
   const uploading = pending.some((f) => f.status === "uploading");
@@ -1003,7 +1009,9 @@ function ChatHeader() {
   const userCount = useSession((s) => Object.values(s.clients).filter((c) => c.channel !== null && c.channel === s.viewChannel).length);
   const inVoice = useSession((s) => myChannelId(s) !== null);
   const members = useMembersPanel();
-  const encrypted = useSession(s => encryptedDm(active, s.kind));
+  const sealed = useSession(s => { const key = storedKey(s, active); return sealedThread(key, s.kind, s.channels) ? key as `dm:${string}` | `ch:${number}` : null; });
+  const encrypted = !!sealed;
+  const vc = useSession(s => s.kind === "vc");
   const dmName = useSession((s) => (active.startsWith("dm:") ? memberName(s.members, active.slice(3), s.threads[active]?.peer?.name ?? "") : undefined));
 
   let title: string;
@@ -1012,6 +1020,7 @@ function ChatHeader() {
   if (active === "channel") {
     title = channel?.name ?? "";
     sub = channel?.topic || t("chat.noTopic");
+    if (encrypted) icon = <Lock className="size-5 text-subtle" />;
   } else if (active === "server") {
     icon = <Megaphone className="size-5 text-subtle" />;
     title = t("chat.server");
@@ -1037,6 +1046,17 @@ function ChatHeader() {
           {sub}
         </p>
       </div>
+      {active === "channel" && vc && !encrypted && (
+        <span className="hidden shrink-0 text-xs text-subtle md:inline">{t("chat.notEncrypted")}</span>
+      )}
+      {sealed && (
+        <Tooltip label={t("chat.messagesEncrypted")}>
+          <button type="button" onClick={() => useUi.getState().openDialog({ kind: "readers", thread: sealed })}
+            className="t hidden shrink-0 cursor-pointer items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted hover:bg-hover hover:text-fg sm:flex">
+            <Lock className="size-3.5" /> {t("channel.readers")}
+          </button>
+        </Tooltip>
+      )}
       {active === "channel" && userCount > 0 && (
         <span className="hidden shrink-0 text-xs text-subtle sm:inline">{t(countKey(lang, "chat.users", userCount), { count: userCount })}</span>
       )}

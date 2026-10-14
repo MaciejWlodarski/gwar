@@ -12,7 +12,7 @@ import { channelOf, credential, descriptor, participants } from "./descriptor";
 import { AgentOperationError, Engine, acquireDeviceLock, jobChange, jobKey } from "./engine";
 import { openStorage, type Persistence } from "./storage";
 import { loadAgent } from "./wasm";
-import type { AgentFactory, Change, CommitOutbox, ConversationStatus, Gate, GroupSummary, HistoryJob, OpenResult, PackageJob, Plaintext, RequestJob, Resolution, Revocation, SealedFields } from "./types";
+import type { AgentFactory, Change, CommitOutbox, ConversationStatus, Gate, GroupSummary, HistoryJob, OpenResult, PackageJob, Plaintext, RequestJob, Resolution, Revocation, Roster, SealedFields } from "./types";
 const bytes = (value: string): number[] => [...decodeBase64Url(value)];
 const encoded = (value: number[]): string => encodeBase64Url(new Uint8Array(value));
 /** The DS protocol currently uses safe JSON integers; core epochs remain u64 strings. */
@@ -68,6 +68,7 @@ export class MlsRuntime {
   private readonly groupVersions = new Map<string, number>();
   private readonly syncedVersions = new Map<string, number>();
   private readonly statuses = new Map<string, ConversationStatus>();
+  private readonly rosters = new Map<string, Roster>();
   private readonly listeners = new Set<() => void>();
   private readonly missing = new Map<string, Set<string>>();
   private readonly lastRequest = new Map<string, number>();
@@ -178,6 +179,8 @@ export class MlsRuntime {
     }
   }
   status(conversation: string): ConversationStatus { return this.statuses.get(conversation) ?? "securing"; }
+  /** Who can read an active conversation (devices by uid) and whether new members get earlier messages. */
+  roster(conversation: string): Roster | null { return this.rosters.get(conversation) ?? null; }
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   private notify(): void { for (const listener of this.listeners) listener(); }
   private markSecuring(): void { for (const key of this.statuses.keys()) this.statuses.set(key, "securing"); this.notify(); }
@@ -231,9 +234,12 @@ export class MlsRuntime {
   private gate(group: string): Gate { return this.engine.query({ gate: { ...this.args(group), now: this.now(), revocations: this.options.revocations() } }); }
   private outbox(group: string): CommitOutbox | null { return this.engine.query({ outbox: this.args(group) }); }
   private updateStatuses(): void {
+    this.rosters.clear();
     for (const g of this.inventory()) {
       const gate = this.gate(encoded(g.group));
       this.statuses.set(g.conversation, gate.status === "creating" ? "creating" : gate.status === "active" && !gate.rejoin && !gate.server_pending && !gate.blocked.length && !gate.pending_commit ? "ready" : "securing");
+      const first = g.record.evidence?.[this.uid]?.[0]?.first;
+      if (g.record.status === "active") this.rosters.set(g.conversation, { history: g.history, members: g.members, since: first === undefined ? null : Number(first) });
     }
     this.notify();
   }

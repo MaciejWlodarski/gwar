@@ -9,7 +9,7 @@ import { initialState } from '../state/reducer';
 import type { MessageVerification } from '../net/message-signature';
 import { MessageList } from './Chat';
 import { TooltipProvider } from './kit';
-const held = vi.hoisted(() => ({ jobs: [] as { serverKey: string; id: number; resolve: (s: MessageVerification) => void }[], map: new Map<number, { fingerprint: string }>(), controller: { messageServerKey: 'A', messageUid: Promise.resolve('me') } }));
+const held = vi.hoisted(() => ({ jobs: [] as { serverKey: string; id: number; resolve: (s: MessageVerification) => void }[], map: new Map<number, { fingerprint: string }>(), controller: { messageServerKey: 'A', messageUid: Promise.resolve('me'), onRoster: () => () => {}, roster: () => null } }));
 vi.mock('react', async (get) => {
   const original = await get<typeof import('react')>();
   return { ...original, useState: (...args: unknown[]) => {

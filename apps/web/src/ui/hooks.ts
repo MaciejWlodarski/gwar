@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { tsBridge, type TsListInfo } from "../connect/teamspeak";
 import { useAccount } from "../state/account";
 import type { Permission } from "../proto/Permission";
@@ -8,6 +8,17 @@ import { useSettings } from "../state/settings";
 import { useSession, useVoice } from "../state/stores";
 import { memberName } from "../lib/member-name";
 import { nameColor } from "../lib/permissions";
+import { sealedThread } from "../lib/chat";
+import type { Roster } from "../mls/types";
+import type { SealedKey } from "../state/sealed";
+import type { StoredThreadKey } from "../state/types";
+
+const subscribeRoster = (listener: () => void) => controller.onRoster(listener);
+/** Who can read an encrypted thread, once this device has secured it. */
+export function useRoster(key: StoredThreadKey | null | undefined): Roster | null {
+  const sealed = useSession(s => sealedThread(key, s.kind, s.channels));
+  return useSyncExternalStore(subscribeRoster, () => (sealed ? controller.roster(key as SealedKey) : null));
+}
 
 export function useMe() {
   const client = useSession((s) => (s.me ? s.clients[s.me.session] : undefined));

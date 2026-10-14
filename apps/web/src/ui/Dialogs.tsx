@@ -11,6 +11,7 @@ import { newId, useSettings, type ServerKind } from "../state/settings";
 import { useSession, useUi, type DialogState } from "../state/stores";
 import { Button, Dialog, Field, Input, Segmented, Select, Textarea, Switch } from "./kit";
 import { SettingsDialog } from "./Settings";
+import { ReadersDialog } from "./Readers";
 import { BanDialog } from "./BanDialog";
 import { RemoveMemberDialog } from "./RemoveMemberDialog";
 import { Lightbox } from "./Attachments";
@@ -53,6 +54,8 @@ export function Dialogs() {
       return <CreateTokenDialog />;
     case "serverKey":
       return <ServerKeyDialog />;
+    case "readers":
+      return <ReadersDialog thread={dialog.thread} />;
     case "confirm":
       return <ConfirmDialog {...dialog} />;
     case "tsFirstRun":
@@ -224,6 +227,11 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
   );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Encryption is chosen once, when the channel is created; on Gwar servers only.
+  const serverKey = controller.messageServerKey;
+  const offerEncryption = useSession((s) => s.kind === "vc") && props.mode === "create";
+  const [encrypted, setEncrypted] = useState(() => useSettings.getState().channelEncryption[serverKey] ?? false);
+  const [history, setHistory] = useState(true);
 
   useEffect(() => {
     if (props.mode === "edit" && !existing) close();
@@ -257,7 +265,9 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
           topic: topic.trim() || null,
           password: password || null,
           max_clients: max,
+          ...(offerEncryption && encrypted ? { encrypted: true, history } : {}),
         });
+        if (offerEncryption) useSettings.getState().setChannelEncryption(serverKey, encrypted);
       } else if (existing) {
         const parentChanged = parentId !== existing.parent;
         await controller.updateChannel({
@@ -325,6 +335,13 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
             {(id) => <Input id={id} inputMode="numeric" value={maxClients} onChange={(e) => setMaxClients(e.target.value.replace(/\D/g, ""))} maxLength={4} />}
           </Field>
         </div>
+        {offerEncryption && (
+          <div className="flex flex-col gap-1">
+            <Switch checked={encrypted} onCheckedChange={setEncrypted} label={t("channel.encrypted")} description={t("channel.encryptedHint")} />
+            {encrypted && <Switch checked={history} onCheckedChange={setHistory} label={t("channel.history")} description={t("channel.historyHint")} />}
+            <p className="text-xs text-subtle">{t("channel.encryptionPermanent")}</p>
+          </div>
+        )}
         {existing?.has_password && (
           <label className="flex cursor-pointer items-center gap-2 text-sm text-muted">
             <input

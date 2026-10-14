@@ -24,6 +24,8 @@ export interface GroupSummary {
     server_pending: boolean;
     welcome_ids?: string[];
     own_commit_at?: number | null;
+    /** Per uid, the epoch ranges in which it had a leaf, as this device saw them. */
+    evidence?: Record<string, { first: string; last: string }[]>;
   };
   members: { device_key: string; uid: string }[];
 }
@@ -47,6 +49,12 @@ export interface SealedFields {
 }
 export type OpenResult = { ok: Plaintext } | { reason: "no_key" | "cannot_open" };
 export type ConversationStatus = "ready" | "securing" | "creating";
+export interface Roster {
+  history: boolean;
+  members: GroupSummary["members"];
+  /** The first epoch my account had a leaf in, as this device saw it. */
+  since: number | null;
+}
 export interface HpkePublication { device_key: string; hpke_key: string; created_at: number; signature: string }
 /** `assignment` answers the server's routing in channel groups (none in direct messages). */
 export interface HistoryJob { publication: HpkePublication | null; kind: "history"; server: string; group: string; recipient: string; chunks: string[] | null; assignment?: string | null }
