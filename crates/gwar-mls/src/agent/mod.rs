@@ -130,6 +130,7 @@ pub struct Checkpoint {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {
+    Creating,
     Active,
     Joining,
     Removed,
@@ -340,10 +341,19 @@ impl Agent {
             if *key != group_key(&descriptor.descriptor.server_key, &descriptor.group_id()) {
                 return Err(Invalid("group key"));
             }
-            if matches!(record.status, Status::Active | Status::Joining) {
+            if matches!(record.status, Status::Creating | Status::Active | Status::Joining) {
                 let group = agent.mls(key)?;
                 client_context(group.public_group().group_context(), &descriptor.descriptor.server_key)?;
                 rules::tree(&descriptor, group.public_group().treesync().full_leaves().map(|(_, l)| l))?;
+                if record.status == Status::Creating
+                    && (group.epoch().as_u64() != 0
+                        || record.checkpoint.is_some()
+                        || descriptor.creator.device_key() != agent.credential.device_key()
+                        || descriptor.creator.uid() != agent.credential.uid()
+                        || agent.epochs.keys().any(|k| k.starts_with(&format!("{key}/"))))
+                {
+                    return Err(Invalid("stored creation"));
+                }
                 if record.status == Status::Active
                     && record.checkpoint.as_ref() != Some(&checkpoint(group.public_group().group_context())?)
                 {
@@ -587,9 +597,20 @@ impl Agent {
             .map_err(err("create group"))?;
             client_context(group.public_group().group_context(), &descriptor.descriptor.server_key)?;
             rules::tree(&descriptor, group.public_group().treesync().full_leaves().map(|(_, l)| l))?;
-            a.record(&descriptor, Status::Active);
-            a.derived(&key, &group)?;
+            a.record(&descriptor, Status::Creating);
             wire(group.export_group_info(a.provider.crypto(), &a.signer, true).map_err(err("group info"))?)
+        })
+    }
+
+    /// Confirm the server's `mls.group.create` reply `{group}`; persist before use.
+    pub fn created(&mut self, server: &str, id: &[u8; 32]) -> Result<()> {
+        self.operation(|a| {
+            let key = group_key(server, id);
+            if a.groups.get(&key).is_none_or(|r| r.status != Status::Creating) {
+                return Err(Invalid("not creating"));
+            }
+            let group = a.mls(&key)?;
+            a.derived(&key, &group)
         })
     }
 
@@ -600,7 +621,7 @@ impl Agent {
             let record = a.groups.get(&key).ok_or(Invalid("unknown group"))?;
             let descriptor = SignedDescriptor::parse(&record.descriptor).ok_or(Invalid("descriptor"))?;
             let mut group = a.mls(&key)?;
-            if record.status != Status::Active
+            if record.status != Status::Creating
                 || descriptor.creator.device_key() != a.credential.device_key()
                 || descriptor.creator.uid() != a.credential.uid()
                 || group.epoch().as_u64() != 0
@@ -634,7 +655,7 @@ impl Agent {
             status: record.status,
         };
         if record.status != Status::Active {
-            gate.rejoin = record.status != Status::Joining;
+            gate.rejoin = matches!(record.status, Status::Removed | Status::Rejoin);
             return Ok(gate);
         }
         let group = self.mls(&key)?;
@@ -676,7 +697,11 @@ impl Agent {
     }
     pub fn proposal(&mut self, server: &str, id: &[u8; 32], bytes: &[u8]) -> Result<()> {
         self.operation(|a| {
-            let mut group = a.mls(&group_key(server, id))?;
+            let key = group_key(server, id);
+            if a.groups.get(&key).is_none_or(|r| r.status != Status::Active) {
+                return Err(AgentError::Blocked);
+            }
+            let mut group = a.mls(&key)?;
             a.process_proposal(&mut group, bytes)
         })
     }
@@ -827,6 +852,9 @@ impl Agent {
         })
     }
     fn receive_inner(&mut self, key: &str, commit: &[u8], proposals: &[Vec<u8>]) -> Result<()> {
+        if self.groups.get(key).is_none_or(|r| r.status != Status::Active) {
+            return Err(AgentError::Blocked);
+        }
         let mut group = self.mls(key)?;
         for p in proposals {
             self.process_proposal(&mut group, p)?;
@@ -843,14 +871,15 @@ impl Agent {
         };
         self.check_staged(&group, &staged, &sender, time)?;
         let removed = staged.self_removed();
-        if !removed {
-            self.fresh(key, staged.group_context())?;
-        }
-        group.merge_staged_commit(&self.provider, *staged).map_err(err("merge commit"))?;
         if removed {
+            // Validation is complete. Delete before advancing: OpenMLS's delete
+            // removes only the current epoch's key pairs, and an eviction merge
+            // advances the public epoch without deleting the old private keys.
             group.delete(self.provider.storage()).map_err(err("delete group"))?;
             self.groups.get_mut(key).ok_or(Invalid("record"))?.status = Status::Removed;
         } else {
+            self.fresh(key, staged.group_context())?;
+            group.merge_staged_commit(&self.provider, *staged).map_err(err("merge commit"))?;
             self.derived(key, &group)?;
         }
         Ok(())
@@ -936,6 +965,9 @@ impl Agent {
             a.check_pin(&descriptor)?;
             let id = descriptor.group_id();
             let key = group_key(server, &id);
+            if a.groups.get(&key).is_some_and(|r| r.status == Status::Creating) {
+                return Err(AgentError::Blocked);
+            }
             a.fresh(&key, info.group_context())?;
             if !a.credential.is_current(now, revocations) {
                 return Err(AgentError::Blocked);
@@ -1140,7 +1172,10 @@ impl Agent {
             a.check_pin(&descriptor)?;
             let key = group_key(server, &descriptor.group_id());
             a.fresh(&key, staged.group_context())?;
-            if a.groups.get(&key).is_some_and(|r| matches!(r.status, Status::Active | Status::Joining)) {
+            if a.groups
+                .get(&key)
+                .is_some_and(|r| matches!(r.status, Status::Creating | Status::Active | Status::Joining))
+            {
                 return Err(Invalid("group already joined"));
             }
             if a.groups.get(&key).is_some_and(|r| {

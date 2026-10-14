@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
+import { gzipSync } from 'node:zlib';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -38,6 +40,26 @@ exit 23
   assert.equal(result.status, 1, result.stderr);
   assert.ok(result.stderr.includes(`Missing wasm artifact: ${artifact}`), result.stderr);
   console.log('Build path checks passed: custom target with spaces; missing artifact fails without fallback.');
+
+  const pkg = join(root, 'pkg');
+  await mkdir(join(pkg, 'snippets'), { recursive: true });
+  const wasm = join(pkg, 'agent.wasm');
+  const inline = join(pkg, 'snippets/inline.js');
+  const size = () => spawnSync(process.execPath, [resolve('scripts/mls-wasm/size.mjs'), pkg], { encoding: 'utf8' });
+  // Incompressible bytes exercise the new headroom and aggregate nested JS.
+  const payload = randomBytes(470_000);
+  await writeFile(wasm, payload);
+  result = size();
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.ok(result.stdout.includes(`Total gzip: ${gzipSync(payload, { level: 9 }).length} / 480000 bytes`));
+  await writeFile(inline, randomBytes(20_000));
+  result = size();
+  assert.equal(result.status, 1, result.stdout + result.stderr);
+  await rm(wasm);
+  result = size();
+  assert.notEqual(result.status, 0);
+  assert.ok(result.stderr.includes('No wasm artifact'), result.stderr);
+  console.log('Size checks passed: 470 KB accepted; aggregate wasm + nested JS over 480 KB rejected; missing wasm rejected.');
 } finally {
   await rm(root, { recursive: true, force: true });
 }

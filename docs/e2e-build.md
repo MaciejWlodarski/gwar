@@ -241,20 +241,28 @@ credential, the OpenMLS provider and Gwar's own per-group records.
   GroupInfo behind that epoch, or with another GroupContext for the same
   epoch (a fork), is rejected.
 - **Pins**: per `(server_key, conversation, incarnation)` the group id first
-  joined; only incarnation zero is accepted until the channels step. On a
+  joined; only incarnation zero is accepted until the channels step.
+  `create` persists a tentative **Creating** group: the gate reports
+  `creating`, without a sending key, commits or history sharing. After the
+  server's `mls.group.create` reply `{group}`, `created(server, id)` moves
+  it to **Active** and derives epoch zero; persist before using it. On a
   creation `conflict`, `abandon(server, id)` discards this device's losing
   creation so it can join the winner by Welcome or external commit. It is
-  allowed only for an active group this device created, still at epoch zero
-  with no outbox, and deletes only its OpenMLS group, group record (pin), and
-  epoch records. Persist before joining the winner; all other cases fail.
+  allowed only in **Creating**, and deletes its OpenMLS group and group
+  record (pin); no application epoch keys have been derived. After `created`,
+  abandonment is refused even at epoch zero without an outbox. Persist before
+  joining the winner; all other cases fail.
 - **Removal of this device**: a commit that removes the device's own leaf is
   processed as any other, but ends its membership: no epoch key is exported
   for the new epoch (OpenMLS refuses, and the device must not have it), the
   freshness checkpoint stays at the last epoch the device was a member of,
-  the OpenMLS group is deleted, and the group is marked **removed**, keeping
-  its epoch keys. If the client may still read the conversation, it rejoins
-  by external commit from the current GroupInfo, whose epoch is later than
-  the checkpoint.
+  all OpenMLS records for that group (including private epoch key pairs)
+  are deleted before advancing the epoch, and the group is marked **removed**,
+  keeping its application epoch keys and pin. The same complete OpenMLS
+  cleanup applies to Rejoin/pruned recovery, losing or expired external joins,
+  and abandonment (which also drops the tentative pin). If the client may
+  still read the conversation, it rejoins by external commit from the current
+  GroupInfo, whose epoch is later than the checkpoint.
 - **Epoch keys**: after every merge and join that leaves the device a member,
   `epoch_key = MLS-Exporter("gwar chat v1", group_id, 32)` is stored with
   `(group_id, epoch)`, together with the uids that had leaves in that epoch
@@ -325,7 +333,7 @@ credential, the OpenMLS provider and Gwar's own per-group records.
 ### Web app storage and concurrency
 
 - MLS runs in the page's main thread, in the wasm module loaded on first use
-  (gzip budget 450 KB, checked in CI).
+  (gzip budget 480 KB, checked in CI).
 - Only one tab per device runs MLS: the Web Locks API lock
   `gwar-mls:{device_key}` is taken before connecting. Before releasing it
   (connection replaced or closed) the tab finishes the operation in progress,
@@ -598,11 +606,13 @@ messages: like signed messages, their author is inside the signature.
   This fixes today's signed Gwar-to-TeamSpeak messages, which fail
   verification.
 - Opening a conversation: `mls.groups` already lists it, or the client creates
-  it: a descriptor (kind `dm`, incarnation 0, history 1), a group with its own
-  leaf, registered with `mls.group.create`; then
+  it: a descriptor (kind `dm`, incarnation 0, history 1), then agent `create`
+  with its own leaf, persisting the tentative **Creating** group before
+  registering it with `mls.group.create`. On reply `{group}`, call
+  `created(server, id)` and persist **Active**; then
   `mls.key_packages.claim {uids: [peer, self]}` and one `mls.commit` adding
-  every claimed device, with its Welcome. On `conflict` it discards its group
-  and joins the existing one.
+  every claimed device, with its Welcome. On `conflict`, call `abandon` and
+  persist its deletion before joining the winner by Welcome or external commit.
 - Devices without a key package (never online since the update), and new
   devices, join on connect by external commit, in the background (design:
   "Joining").

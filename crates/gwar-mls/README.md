@@ -22,7 +22,8 @@ Agent::load(seed: [u8; 32], credential: Credential, stores: Stores) -> Result<Ag
 take_changes() -> Changes
 key_packages(n: usize, now: i64) -> Result<Vec<Vec<u8>>>
 last_resort_key_package(now: i64) -> Result<Vec<u8>>
-create(descriptor: SignedDescriptor) -> Result<Vec<u8>> // GroupInfo
+create(descriptor: SignedDescriptor) -> Result<Vec<u8>> // GroupInfo; Creating
+created(server: &str, id: &[u8; 32]) -> Result<()>
 abandon(server: &str, id: &[u8; 32]) -> Result<()>
 welcome(server: &str, id: &str, bytes: &[u8]) -> Result<WelcomeResult>
 join_external(server: &str, bytes: &[u8], now: i64,
@@ -49,7 +50,15 @@ sending_key(server: &str, id: &[u8; 32], now: i64,
             revocations: &dyn Revocations) -> Result<(u64, [u8; 32])>
 ```
 
-`create` returns a TLS MLS GroupInfo message. Key packages are bare TLS
+`create` returns a TLS MLS GroupInfo message in persisted `Creating` state.
+After the server replies to `mls.group.create` with `{group}`, call
+`created(server, id)` and persist its changes to activate the group and derive
+epoch zero. Until then, `gate.status` is `creating` (`rejoin` is false), and
+sending, commits and history sharing are blocked. Incoming commits/proposals,
+Welcomes and external joins cannot activate that tentative group. A repeated
+`created` or one for a group outside `Creating` is an error.
+
+Key packages are bare TLS
 KeyPackages; commits, GroupInfos and Welcomes are TLS MLS messages. `Outbox`
 contains the source epoch, group id, SHA-256 of the commit, commit bytes,
 optional Welcome and resulting GroupInfo. `WelcomeResult` gives the group id
@@ -150,16 +159,21 @@ Feed authoritative log information to `reconcile`:
 
 When concurrent DM creations produce a server `conflict`, call `abandon` on
 this device's losing group, persist its changes, then join the winner by Welcome
-or external commit. It succeeds only for an active group created by this device,
-still at epoch zero with no outbox. It deletes that OpenMLS group, its group
-record (including the pin), and its epoch records; other groups, key packages
+or external commit. It succeeds only for a `Creating` group created by this
+device; after `created`, abandonment is refused even at epoch zero with no
+outbox. It deletes that OpenMLS group and its group record (including the pin);
+no application epoch keys have been derived. Other groups, key packages
 and the device HPKE key remain unchanged. Every other case is an error.
 
 A losing or expired external join is deleted and returns `Rejoin`. Pins,
 checkpoints, Welcome ids and old keys survive deleting OpenMLS membership.
-Eviction keeps the last member epoch checkpoint; rejoining requires a newer
-GroupInfo. Rebuilds use the current time and revocation view. No method retries
-network operations or invents server acceptance.
+After validating an own-leaf removal, eviction deletes the OpenMLS group
+before advancing its epoch, so its old private epoch key pairs are deleted too.
+Eviction, pruned recovery, losing/expired external joins and abandonment leave
+no OpenMLS records for that group. Eviction keeps the last member epoch
+checkpoint and application epoch keys; rejoining requires a newer GroupInfo.
+Rebuilds use the current time and revocation view. No method retries network
+operations or invents server acceptance.
 
 History sharing verifies the recipient's signed HPKE statement and membership.
 History-on shares all nonconflicted held keys. History-off shares only locally
@@ -204,16 +218,27 @@ scripts/mls-wasm/build.sh # pinned tools and frontend dependencies; see wasm REA
 node scripts/mls-wasm/smoke.mjs
 ```
 
-All passed. The MLS suite has 53 unit tests and 11 observer integration tests.
-The workspace suite passed 351 tests, with 5 existing TeamSpeak tests ignored.
-No live Gwar or TeamSpeak server was contacted; workspace integration tests
-use their own local test services. CI has not been run remotely for these fixes.
+All commands passed for round 2. The MLS suite has 55 unit tests and 11
+observer integration tests. The workspace suite passed 353 tests, with 5
+existing TeamSpeak tests ignored. Regressions cover persisted creation
+acceptance, rejection of abandonment after acceptance, complete eviction
+cleanup (including a losing pending commit and referenced proposals), pruned
+membership and external-join cleanup, unrelated storage preservation, and
+the 480,000-byte aggregate gzip limit.
 
-The [wasm build and Node smoke test](../gwar-mls-wasm/README.md) both passed
-using the custom Cargo target directory. The production artifact totals
-448,618 bytes gzip against the 450,000-byte limit (wasm 445,570, minified
-loader 2,856, inline JavaScript 192). The loader uses the existing locked
-Vite/Rolldown minifier, and Binaryen runs `-Oz --converge`; no new dependency
-or larger size budget was introduced. Headroom remains only 1,382 bytes.
+The production wasm artifact measured with Node **22.23.3** totals **450,867
+bytes gzip**: wasm 447,824, minified loader 2,852, inline JavaScript 191.
+The 480,000-byte budget leaves 29,133 bytes of headroom for message encryption.
+The build uses Rust 1.99.0, wasm-bindgen 0.2.129 and Binaryen 123.0.0.
+On this macOS host, the wasm build needed the installed rustup toolchain's
+`bin` ahead of Homebrew Rust (which lacked the wasm target), plus a local
+linker wrapper setting `DYLD_LIBRARY_PATH` to that same toolchain's `lib`
+directory so `rust-lld` could find `libLLVM.dylib`. These are local environment
+adjustments; CI uses the pinned tools in its Linux job.
+
+The Node smoke test passed creation acceptance, abandonment, eviction cleanup,
+commit recovery, Welcome deduplication, matching exporters, history and rollback.
+No live Gwar or TeamSpeak server was contacted; workspace integration tests
+use their own local test services. Remote CI has not been run for these fixes.
 Message seal/open, server delivery and browser storage/UI wiring remain
 outside this task.

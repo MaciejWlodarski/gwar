@@ -52,6 +52,8 @@ fn fixture() -> Fixture {
     let info = a.create(d).unwrap();
     a.take_changes();
     let observer = Observer::create(&info, &server()).unwrap();
+    a.created(&server(), &id).unwrap();
+    a.take_changes();
     Fixture { a, b, observer, id, info, t }
 }
 fn accept(observer: Observer, out: &Outbox, t: i64) -> Observer {
@@ -170,28 +172,32 @@ fn expired_and_pruned_outboxes() {
         assert!(f.a.epoch(&server(), &f.id, 1).is_some());
         if pruned {
             assert!(f.a.mls(&group_key(&server(), &f.id)).is_err());
+            assert!(f.a.durable.openmls.is_empty());
         } else {
             assert!(f.a.mls(&group_key(&server(), &f.id)).unwrap().pending_commit().is_none());
         }
     }
 }
 #[test]
-fn losing_or_expired_external_join_is_deleted() {
-    for expired in [false, true] {
-        let mut f = fixture();
-        f.b.join_external(&server(), &f.info, f.t, &()).unwrap();
+fn losing_expired_or_pruned_external_join_is_deleted() {
+    for case in 0..6 {
+        // Cases 3..6 replace an existing membership via drop_mls first.
+        let mut f = if case < 3 { fixture() } else { joined() };
+        let epochs = f.b.durable.epochs.clone();
+        let out = f.b.join_external(&server(), &f.info, f.t, &()).unwrap();
         f.b.take_changes();
         let winner = f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
         f.a.take_changes();
-        let result = if expired {
-            Reconcile::Rejected { reason: Rejection::Expired }
-        } else {
-            Reconcile::Entry { epoch: 0, commit: winner.commit, proposals: vec![] }
+        let result = match case % 3 {
+            0 => Reconcile::Rejected { reason: Rejection::Expired },
+            1 => Reconcile::Entry { epoch: out.epoch, commit: winner.commit, proposals: vec![] },
+            _ => Reconcile::Pruned { oldest: out.epoch + 1 },
         };
         assert_eq!(f.b.reconcile(&server(), &f.id, result).unwrap(), Resolution::Rejoin);
         f.b.take_changes();
         assert!(f.b.mls(&group_key(&server(), &f.id)).is_err());
-        assert!(f.b.epochs.is_empty());
+        assert_eq!(f.b.durable.epochs, epochs);
+        assert!(f.b.durable.openmls.is_empty());
         f.b.join_external(&server(), &winner.group_info, f.t, &()).unwrap();
     }
 }
@@ -214,6 +220,8 @@ fn revocation_blocks_sending_but_not_acceptance_and_removal_restores_it() {
     f.a.receive(&server(), &f.id, &out.commit, &[]).unwrap();
     f.a.take_changes();
     let checkpoint = f.b.group(&server(), &f.id).unwrap().checkpoint.clone();
+    let epochs = f.b.durable.epochs.clone();
+    let descriptor = f.b.group(&server(), &f.id).unwrap().descriptor.clone();
     let out = f.a.commit(&server(), &f.id, &[], &[], f.t, &revoked).unwrap();
     f.a.take_changes();
     f.observer = accept(f.observer, &out, f.t);
@@ -221,6 +229,10 @@ fn revocation_blocks_sending_but_not_acceptance_and_removal_restores_it() {
     f.b.receive(&server(), &f.id, &out.commit, &[]).unwrap();
     f.b.take_changes();
     assert_eq!(f.b.group(&server(), &f.id).unwrap().status, Status::Removed);
+    assert!(f.b.durable.openmls.is_empty());
+    assert_eq!(f.b.durable.epochs, epochs);
+    assert_eq!(f.b.group(&server(), &f.id).unwrap().descriptor, descriptor);
+    f.b = Agent::load([21; 32], f.b.credential.clone(), f.b.durable.clone()).unwrap();
     assert_eq!(f.b.group(&server(), &f.id).unwrap().checkpoint, checkpoint);
     assert!(f.b.epoch(&server(), &f.id, 3).is_none());
     assert!(f.a.gate(&server(), &f.id, f.t, &revoked).unwrap().can_send());
@@ -422,6 +434,8 @@ fn history_off_shares_only_derived_epochs_with_recipient_evidence() {
     let info = a.create(d).unwrap();
     a.take_changes();
     let observer = Observer::create(&info, &server()).unwrap();
+    a.created(&server(), &id).unwrap();
+    a.take_changes();
     let join = b.join_external(&server(), &info, t, &()).unwrap();
     b.take_changes();
     let observer = accept(observer, &join, t);
@@ -828,7 +842,7 @@ fn losing_creation_can_be_abandoned_then_join_the_winner() {
 
 #[test]
 fn abandon_rejects_unknown_joined_advanced_and_pending_groups_without_changes() {
-    for case in 0..5 {
+    for case in 0..6 {
         let mut f = if case == 2 || case == 3 { joined() } else { fixture() };
         let agent = match case {
             0 => &mut f.b, // Unknown group.
@@ -839,6 +853,7 @@ fn abandon_rejects_unknown_joined_advanced_and_pending_groups_without_changes() 
             }
             2 => &mut f.a, // Creator after epoch zero.
             3 => &mut f.b, // Joined by this device, created by another.
+            4 => &mut f.a, // Accepted creation at epoch zero without an outbox.
             _ => {
                 f.b.join_external(&server(), &f.info, f.t, &()).unwrap();
                 f.b.take_changes();
@@ -928,6 +943,8 @@ fn self_update_publishes_loaded_renewal_and_keeps_peer_gate_open_after_old_expir
     let info = a.create(d).unwrap();
     a.take_changes();
     let observer = Observer::create(&info, &server()).unwrap();
+    a.created(&server(), &id).unwrap();
+    a.take_changes();
     let out = b.join_external(&server(), &info, t, &()).unwrap();
     b.take_changes();
     let observer = accept(observer, &out, t);
@@ -1029,4 +1046,97 @@ fn load_validates_hpke_key_pair_and_positive_safe_statement_time() {
         assert_eq!(loaded.device_hpke_key().created_at, t);
         assert!(loaded.device_hpke_key().verify());
     }
+}
+
+#[test]
+fn creation_waits_for_persisted_server_acceptance() {
+    let t = now();
+    let mut a = device(1, 11, t);
+    let b = device(2, 21, t);
+    let d = descriptor(&a, &b, t, true, true);
+    let id = d.group_id();
+    let info = a.create(d).unwrap();
+    let mut stores = a.durable.clone();
+    a.take_changes().apply(&mut stores);
+    let credential = a.credential.clone();
+    let load = || Agent::load([11; 32], credential.clone(), stores.clone()).unwrap();
+    a = load();
+    let gate = a.gate(&server(), &id, t, &()).unwrap();
+    assert_eq!(gate.status, Status::Creating);
+    assert!(!gate.can_send() && !gate.rejoin && !gate.pending_commit);
+    assert!(a.epoch(&server(), &id, 0).is_none());
+    assert_eq!(a.sending_key(&server(), &id, t, &()), Err(AgentError::Blocked));
+    assert_eq!(a.commit(&server(), &id, &[], &[], t, &()), Err(AgentError::Blocked));
+    assert!(a.take_changes().is_empty());
+    a = load();
+    assert_eq!(a.share_history(&server(), &id, &b.device_hpke_key(), t, &()), Err(AgentError::Blocked));
+    assert!(a.take_changes().is_empty());
+    // Neither incoming traffic nor rejoining can silently accept a creation.
+    a = load();
+    assert_eq!(a.receive(&server(), &id, &[], &[]), Err(AgentError::Blocked));
+    a = load();
+    assert_eq!(a.proposal(&server(), &id, &[]), Err(AgentError::Blocked));
+    a = load();
+    assert_eq!(a.join_external(&server(), &info, t, &()), Err(AgentError::Blocked));
+    a = load();
+    assert_eq!(a.created(&server(), &[0; 32]), Err(Invalid("not creating")));
+    assert!(a.take_changes().is_empty());
+    a = load();
+    a.created(&server(), &id).unwrap();
+    assert_eq!(a.sending_key(&server(), &id, t, &()), Err(AgentError::Unpersisted));
+    a.take_changes().apply(&mut stores);
+    a = Agent::load([11; 32], credential.clone(), stores.clone()).unwrap();
+    assert_eq!(a.group(&server(), &id).unwrap().status, Status::Active);
+    assert_eq!(a.sending_key(&server(), &id, t, &()).unwrap().0, 0);
+    assert_eq!(a.abandon(&server(), &id), Err(Invalid("cannot abandon")));
+    assert!(a.take_changes().is_empty());
+    a = Agent::load([11; 32], credential, stores).unwrap();
+    assert_eq!(a.created(&server(), &id), Err(Invalid("not creating")));
+}
+
+#[test]
+fn eviction_with_pending_commit_and_proposals_erases_only_target_mls_state() {
+    let mut f = joined();
+    // Keep another accepted group plus key packages, then compare the entire
+    // OpenMLS store: deleting one group must preserve all unrelated records.
+    let target_records = f.b.durable.openmls.clone();
+    let d = descriptor(&f.b, &f.a, f.t, false, false);
+    let other_id = d.group_id();
+    f.b.create(d).unwrap();
+    f.b.take_changes();
+    f.b.created(&server(), &other_id).unwrap();
+    f.b.take_changes();
+    f.b.key_packages(2, f.t).unwrap();
+    f.b.take_changes();
+    let unrelated: Store =
+        f.b.durable
+            .openmls
+            .iter()
+            .filter(|(key, _)| !target_records.contains_key(*key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+    let proposal = f.observer.propose_remove(&Ed25519Signer(key(200)), 1).unwrap();
+    f.a.proposal(&server(), &f.id, &proposal).unwrap();
+    f.a.take_changes();
+    let winner = f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+    f.a.take_changes();
+    f.observer = accept(f.observer, &winner, f.t);
+    f.b.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+    f.b.take_changes();
+    let epochs = f.b.durable.epochs.clone();
+    let record = f.b.group(&server(), &f.id).unwrap().clone();
+    assert_eq!(
+        f.b.reconcile(
+            &server(),
+            &f.id,
+            Reconcile::Entry { epoch: winner.epoch, commit: winner.commit, proposals: vec![proposal] }
+        )
+        .unwrap(),
+        Resolution::Rejoin
+    );
+    f.b.take_changes();
+    assert_eq!(f.b.durable.openmls, unrelated);
+    assert_eq!(f.b.durable.epochs, epochs);
+    assert_eq!(f.b.group(&server(), &f.id).unwrap().descriptor, record.descriptor);
+    assert_eq!(f.b.group(&server(), &f.id).unwrap().checkpoint, record.checkpoint);
 }
