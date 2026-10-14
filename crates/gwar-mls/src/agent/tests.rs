@@ -462,7 +462,7 @@ fn history_chunks_cover_at_most_a_thousand_epochs_and_skip_conflicts() {
     let mut f = joined();
     let k = group_key(&server(), &f.id);
     for e in 2..2200 {
-        f.a.epochs.insert(epoch_key(&k, e), EpochRecord::Derived { key: [7; 32], uids: BTreeSet::new() });
+        f.a.epochs.insert(epoch_key(&k, e), EpochRecord::Derived { key: [7; 32] });
     }
     f.a.epochs.insert(epoch_key(&k, 2001), EpochRecord::Conflicted);
     let chunks = f.a.share_history(&server(), &f.id, &f.b.device_hpke_key(), f.t, &()).unwrap();
@@ -527,7 +527,7 @@ fn raw_commit(
         .unwrap()
         .stage_commit(&a.provider)
         .unwrap();
-    a.bundle(id, group.epoch().as_u64(), bundle).unwrap()
+    a.bundle(id, group.epoch().as_u64(), bundle, time).unwrap()
 }
 #[test]
 fn staged_commit_rejects_a_leaf_certified_only_after_its_time() {
@@ -750,7 +750,7 @@ fn staged_commit_requires_signed_commit_time() {
     let mut group = f.a.mls(&group_key(&server(), &f.id)).unwrap();
     group.set_aad(b"unrecognized time".to_vec());
     let bundle = group.self_update(&f.a.provider, &f.a.signer, LeafNodeParameters::default()).unwrap();
-    let out = f.a.bundle(&f.id, group.epoch().as_u64(), bundle).unwrap();
+    let out = f.a.bundle(&f.id, group.epoch().as_u64(), bundle, f.t).unwrap();
     assert_eq!(f.b.receive(&server(), &f.id, &out.commit, &[]), Err(Invalid("commit time")));
     assert!(f.b.take_changes().is_empty());
 }
@@ -1007,6 +1007,7 @@ fn load_rejects_noncanonical_and_orphan_store_keys() {
                             commit: vec![],
                             welcome: None,
                             group_info: vec![],
+                            committed_at: 0,
                         }),
                     );
                 }
@@ -1339,4 +1340,98 @@ fn stale_welcome_replacement_rejects_wrong_group_epoch_and_invalid_welcome() {
         assert_eq!(f.b.group(&server(), &f.id).unwrap().checkpoint.as_ref().unwrap().epoch, 1);
         f.b.replace_stale_welcome(&server(), &f.id, "readmission", &welcome).unwrap();
     }
+}
+#[test]
+fn evidence_records_epoch_ranges_per_uid_and_limits_history_off_sharing() {
+    let t = now();
+    let mut a = device(1, 11, t);
+    let mut b = device(2, 21, t);
+    let d = descriptor(&a, &b, t, false, false);
+    let id = d.group_id();
+    let info = a.create(d).unwrap();
+    a.take_changes();
+    let mut observer = Observer::create(&info, &server()).unwrap();
+    assert!(a.settle(&server(), &id, Some(&id)).unwrap());
+    a.take_changes();
+    let join = b.join_external(&server(), &info, t, &()).unwrap();
+    b.take_changes();
+    observer = accept(observer, &join, t);
+    acknowledge(&mut b, &id, &join);
+    a.receive(&server(), &id, &join.commit, &[]).unwrap();
+    a.take_changes();
+    // B leaves at epoch 2 and rejoins at epoch 3.
+    let remove = a.commit(&server(), &id, &[], &[1], t, &()).unwrap();
+    a.take_changes();
+    observer = accept(observer, &remove, t);
+    acknowledge(&mut a, &id, &remove);
+    let rejoin = b.join_external(&server(), &remove.group_info, t, &()).unwrap();
+    b.take_changes();
+    accept(observer, &rejoin, t);
+    acknowledge(&mut b, &id, &rejoin);
+    a.receive(&server(), &id, &rejoin.commit, &[]).unwrap();
+    a.take_changes();
+    let range = |first, last| Interval { first, last };
+    let evidence = &a.group(&server(), &id).unwrap().evidence;
+    assert_eq!(evidence[&a.credential.uid()], [range(0, 3)]);
+    assert_eq!(evidence[&b.credential.uid()], [range(1, 1), range(3, 3)]);
+    assert_eq!(b.group(&server(), &id).unwrap().evidence[&a.credential.uid()], [range(1, 1), range(3, 3)]);
+    let chunks = a.share_history(&server(), &id, &b.device_hpke_key(), t, &()).unwrap();
+    a.take_changes();
+    let epochs: Vec<_> = chunks
+        .iter()
+        .flat_map(|bytes| Chunk::parse(bytes).unwrap().open(&b.device.hpke_private).unwrap())
+        .map(|(e, _)| e)
+        .collect();
+    assert_eq!(epochs, [1, 3]);
+    // Stored evidence must stay sorted and disjoint.
+    let mut stores = a.durable.clone();
+    let key = group_key(&server(), &id);
+    let mut record = a.groups[&key].clone();
+    record.evidence.get_mut(&b.credential.uid()).unwrap().reverse();
+    stores.groups.insert(key.into_bytes(), json(&record));
+    assert_eq!(Agent::load([11; 32], a.credential.clone(), stores).err(), Some(Invalid("stored evidence")));
+}
+#[test]
+fn own_commit_time_follows_accepted_own_commits_only() {
+    let mut f = joined();
+    let own = |a: &Agent, id| a.group(&server(), id).unwrap().own_commit_at;
+    assert_eq!(own(&f.a, &f.id), Some(f.t));
+    assert_eq!(own(&f.b, &f.id), Some(f.t));
+    let out = f.a.commit(&server(), &f.id, &[], &[], f.t + 5, &()).unwrap();
+    f.a.take_changes();
+    assert_eq!(own(&f.a, &f.id), Some(f.t), "a pending commit is not accepted yet");
+    acknowledge(&mut f.a, &f.id, &out);
+    assert_eq!(own(&f.a, &f.id), Some(f.t + 5));
+    f.b.receive(&server(), &f.id, &out.commit, &[]).unwrap();
+    f.b.take_changes();
+    assert_eq!(own(&f.b, &f.id), Some(f.t));
+    let mut c = device(2, 23, f.t);
+    let packages = c.key_packages(1, f.t).unwrap();
+    c.take_changes();
+    let add = f.a.commit(&server(), &f.id, &packages, &[], f.t + 6, &()).unwrap();
+    f.a.take_changes();
+    acknowledge(&mut f.a, &f.id, &add);
+    c.welcome(&server(), "w", add.welcome.as_ref().unwrap()).unwrap();
+    c.take_changes();
+    assert_eq!(own(&c, &f.id), None);
+}
+#[test]
+fn forgetting_a_group_leaves_nothing_of_it() {
+    let mut f = joined();
+    let out = f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+    f.a.take_changes();
+    acknowledge(&mut f.a, &f.id, &out);
+    f.a.forget(&server(), &f.id).unwrap();
+    f.a.take_changes();
+    assert!(f.a.group(&server(), &f.id).is_none());
+    let stores = f.a.durable.clone();
+    let contains = |haystack: &[u8]| haystack.windows(32).any(|w| w == f.id);
+    assert!(!stores.openmls.keys().any(|k| contains(k)), "no OpenMLS record of the group");
+    assert!(stores.epochs.is_empty() && stores.outbox.is_empty());
+    assert_eq!(stores.groups.len(), 1, "only the device record");
+    // Forgetting is idempotent and the device can join again later.
+    f.a.forget(&server(), &f.id).unwrap();
+    f.a.take_changes();
+    let again = f.a.join_external(&server(), &out.group_info, f.t, &()).unwrap();
+    assert_eq!(again.group, f.id);
 }

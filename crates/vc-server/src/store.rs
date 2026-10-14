@@ -341,7 +341,7 @@ impl Store {
     /// A database for tests and memory-only servers, with plaintext channels.
     pub fn in_memory() -> Result<Self> {
         let store = Self::init(Connection::open_in_memory()?)?;
-        store.seed_channels(false)?;
+        store.seed_channels()?;
         Ok(store)
     }
 
@@ -406,7 +406,8 @@ impl Store {
     }
 
     /// A new database's channels, at the server's first start.
-    pub fn seed_channels(&self, encrypted: bool) -> Result<()> {
+    /// A new database's channels, plaintext like every channel created without choosing encryption.
+    pub fn seed_channels(&self) -> Result<()> {
         let has_channels: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM channels)", [], |r| r.get(0))?;
         if !has_channels {
             let channel = |name: &str, position| {
@@ -418,8 +419,8 @@ impl Store {
                     position,
                     password_hash: None,
                     max_clients: None,
-                    encrypted,
-                    history: encrypted,
+                    encrypted: false,
+                    history: false,
                 })
             };
             let lobby = channel("Lobby", 0)?;

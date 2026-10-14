@@ -44,6 +44,17 @@ impl Storage {
 }
 
 impl Storage {
+    /// Every epoch's encryption key pairs of a group, including ones OpenMLS
+    /// leaves behind when deleting a group (it deletes only the current epoch's).
+    pub(crate) fn purge_epoch_key_pairs(&self, group_id: &openmls::prelude::GroupId) -> Result<(), StorageError> {
+        let mut prefix = EPOCH_KEY_PAIRS_LABEL.to_vec();
+        prefix.extend(codec::encode(group_id)?);
+        self.values.write().unwrap().retain(|key, _| !key.starts_with(&prefix));
+        Ok(())
+    }
+}
+
+impl Storage {
     #[inline(always)]
     fn write<const VERSION: u16>(
         &self,

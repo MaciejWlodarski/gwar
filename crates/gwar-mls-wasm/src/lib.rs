@@ -175,6 +175,10 @@ enum Request {
         server: String,
         group: [u8; 32],
     },
+    Forget {
+        server: String,
+        group: [u8; 32],
+    },
 }
 
 #[wasm_bindgen]
@@ -264,6 +268,7 @@ impl Agent {
             Request::Group { server, group } => output(a.group(&server, &group)),
             Request::Epoch { server, group, epoch } => output(a.epoch(&server, &group, epoch)),
             Request::Outbox { server, group } => output(a.outbox(&server, &group)),
+            Request::Forget { server, group } => output(a.forget(&server, &group).map_err(error)?),
         }
     }
 }

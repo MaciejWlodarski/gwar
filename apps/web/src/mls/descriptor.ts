@@ -12,10 +12,18 @@ export function participants(conversation: string): [string, string] {
   decodeFixed(a, 20); decodeFixed(b, 20);
   return [a, b];
 }
-export async function descriptor(identity: Identity, uid: string, server: string, conversation: string, now: number): Promise<{ bytes: number[]; group: string }> {
-  if (!participants(conversation).includes(uid)) throw new Error("not a participant");
+/** The integer id of `channel:{id}`, or undefined for any other conversation. */
+export function channelOf(conversation: string): number | undefined {
+  const match = /^channel:(0|[1-9][0-9]{0,9})$/.exec(conversation);
+  const id = match ? Number(match[1]) : NaN;
+  return id <= 0xffffffff ? id : undefined;
+}
+export async function descriptor(identity: Identity, uid: string, server: string, conversation: string, now: number, history = true): Promise<{ bytes: number[]; group: string }> {
+  const kind = conversation.startsWith("dm:") ? "dm" : channelOf(conversation) !== undefined ? "channel" : undefined;
+  if (kind === "dm" && (!participants(conversation).includes(uid) || !history)) throw new Error("not a participant");
+  if (!kind) throw new Error("unsupported conversation");
   decodeFixed(server, 32);
-  const statement = enc.encode(["gwar conversation v1", server, conversation, "dm", "0", "-", "0", "1", "-", "-", uid, now, encodeBase64Url(crypto.getRandomValues(new Uint8Array(16)))].join("\n"));
+  const statement = enc.encode(["gwar conversation v1", server, conversation, kind, "0", "-", "0", history ? "1" : "0", "-", "-", uid, now, encodeBase64Url(crypto.getRandomValues(new Uint8Array(16)))].join("\n"));
   const fields = [statement, credential(identity), decodeFixed(await identity.sign(statement), 64)];
   // The descriptor signature is base64url text, unlike history's raw signature.
   fields[2] = enc.encode(encodeBase64Url(fields[2]!));

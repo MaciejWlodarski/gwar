@@ -23,6 +23,7 @@ export interface GroupSummary {
     checkpoint: { epoch: string; hash: number[] } | null;
     server_pending: boolean;
     welcome_ids?: string[];
+    own_commit_at?: number | null;
   };
   members: { device_key: string; uid: string }[];
 }
@@ -47,6 +48,7 @@ export interface SealedFields {
 export type OpenResult = { ok: Plaintext } | { reason: "no_key" | "cannot_open" };
 export type ConversationStatus = "ready" | "securing" | "creating";
 export interface HpkePublication { device_key: string; hpke_key: string; created_at: number; signature: string }
-export interface HistoryJob { publication: HpkePublication | null; kind: "history"; server: string; group: string; recipient: string; chunks: string[] | null }
+/** `assignment` answers the server's routing in channel groups (none in direct messages). */
+export interface HistoryJob { publication: HpkePublication | null; kind: "history"; server: string; group: string; recipient: string; chunks: string[] | null; assignment?: string | null }
 export interface PackageJob { kind: "packages"; server: string; packages: string[]; last_resort: string; expires_at: number }
 export type Job = HistoryJob | PackageJob;

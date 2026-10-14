@@ -45,6 +45,26 @@ still rejects non-dash group/epoch fields; sealed verification requires the
 exact outer context. The runtime sends only MLS protocol requests, never chat
 messages. Channel/server chat and TeamSpeak DMs keep their plaintext paths.
 
+**Channel groups.** The runtime reads the encrypted channels from every
+Welcome and from `channel.created`/`channel.deleted`, and keeps their groups
+without being asked (docs/e2e-build.md "Groups", "History in channels"):
+
+- a group the server does not list yet is created after a random delay of up
+  to five seconds, or right away after `channelCreated(id)`, which the client
+  that created the channel calls;
+- the device joins every other channel's group by external commit, one at a
+  time with up to two seconds of jitter between joins, and then calls
+  `mls.history.request`; it never shares on its own after an admission, but
+  answers the server's assignments (`mls.history.wanted` with `assignment`)
+  with chunks that carry the assignment, or `mls.history.decline` when it has
+  nothing the recipient may receive;
+- a failing channel backs off (5 seconds doubling up to 10 minutes) without
+  holding up direct messages;
+- it commits an update of its own leaf in a channel group whose last own
+  commit is older than seven days, one group per pass;
+- the group of a deleted channel is forgotten: the agent deletes its OpenMLS
+  state, every epoch's keys, outbox, evidence and pin.
+
 `sync()` is also public for explicit retries and deterministic tests. Connect
 performs the first synchronization, reconnect Welcomes and MLS events schedule
 another, and a 15-second maintenance pass covers clock/revocation changes,
@@ -71,7 +91,7 @@ fence and the current revocation gate immediately before each request.
 Renewed device credentials require closing and reconnecting the runtime with
 the renewed identity before the old certificate expires.
 
-The database is `gwar-mls-v1-{device_key}` with `openmls`, `groups`, `epochs`,
+The database is `gwar-mls-v2-{device_key}` with `openmls`, `groups`, `epochs`,
 and `outbox`. All four are loaded in one transaction. Each wasm mutation ends
 with `take_changes()` and one transaction with `durability: "strict"`. The
 engine waits for transaction completion before sending or acknowledging. Any

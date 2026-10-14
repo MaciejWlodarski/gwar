@@ -1375,8 +1375,7 @@ impl Core {
             if let Some(p) = &password {
                 check_password_len(p)?;
             }
-            // Plaintext by default until the web app reads encrypted channels (step 4a,
-            // second part); then the default follows TeamSpeak compatibility: `!self.info.teamspeak`.
+            // Encryption is chosen at creation; without a choice a channel is plaintext.
             let encrypted = c.encrypted.unwrap_or(false);
             if encrypted && password.is_some() {
                 return Err(err(ErrorCode::BadRequest, "an encrypted channel has no password"));
