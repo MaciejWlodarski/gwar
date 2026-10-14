@@ -16,6 +16,7 @@ name = "vc-server"
 path = "src/main.rs"
 
 [dependencies]
+gwar-mls = { path = "../gwar-mls" }
 vc-proto = { path = "../vc-proto", features = ["rtp"] }
 anyhow.workspace = true
 arc-swap = "1"
@@ -53,6 +54,8 @@ zip = { version = "9", default-features = false, features = ["deflate"], optiona
 libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
+openmls = "=0.9.1"
+openmls_rust_crypto = "=0.6.0"
 vc-client = { path = "../vc-client" }
 audiopus = "=0.3.0-rc.0"
 tokio = { workspace = true, features = ["test-util"] }

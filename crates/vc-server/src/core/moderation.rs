@@ -272,6 +272,7 @@ impl Core {
         let tags = self.store.member_tags().map_err(storage_error)?;
         self.connect_pending.remove(&member.uid);
         let removal = self.store.remove_member(user_id, &member.uid, delete_messages).map_err(storage_error)?;
+        self.mls_reconcile().map_err(storage_error)?;
         if !removal.files.is_empty() {
             self.remove_files();
         }
@@ -372,6 +373,7 @@ impl Core {
         for s in banned {
             self.remove(s, reason.clone());
         }
+        self.mls_reconcile().map_err(storage_error)?;
         Ok(Response::Ban { ban })
     }
 
@@ -553,6 +555,9 @@ impl Core {
             LeaveReason::Kicked { by: "Gwar Connect".into(), reason: Some("this device was signed out".into()) };
         for session in gone {
             self.remove(session, reason.clone());
+        }
+        if let Err(e) = self.mls_reconcile() {
+            tracing::warn!("MLS reconciliation: {e:#}");
         }
     }
 }

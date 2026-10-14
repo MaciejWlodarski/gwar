@@ -460,6 +460,9 @@ impl Core {
         self.remove_files();
         self.sweep_files();
         self.touch_online();
+        if let Err(e) = self.store.mls_prune(now_ms()).and_then(|_| self.mls_reconcile()) {
+            warn!("MLS cleanup: {e:#}");
+        }
     }
 
     /// Whether the bytes named `name` belong to no upload and no file. Ids are random and

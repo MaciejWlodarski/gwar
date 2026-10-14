@@ -906,7 +906,7 @@ class Controller {
 
   private async signChat(target: ChatTarget, text: string, mentions: string[], attachments: Attachment[], original?: MessageSignature, conn = this.connection): Promise<MessageSignature> {
     // The direct TeamSpeak transport ignores Gwar signatures.
-    if (!(conn instanceof Connection)) return { server_key: "", conversation: "server", author_uid: "", key: "", certificate: null, certificate_hash: "-", message_id: "", revision: 0, previous_revision_hash: "-", created_at: 0, signed_at: 0, body_hash: "", signature: "" };
+    if (!(conn instanceof Connection)) return { server_key: "", conversation: "server", group_id: "-", epoch: "-", author_uid: "", key: "", certificate: null, certificate_hash: "-", message_id: "", revision: 0, previous_revision_hash: "-", created_at: 0, signed_at: 0, body_hash: "", signature: "" };
     const s = useSession.getState();
     let signedTarget: string;
     if (target === "server") signedTarget = "server";
@@ -1136,7 +1136,7 @@ class Controller {
       if (!peer) return invalidVerification();
       thread = `dm:${peer}`;
     }
-    const ctx = { serverKey: conn?.serverKey ?? "", target: messageTarget(thread, msg.author_uid, me) };
+    const ctx = { serverKey: conn?.serverKey ?? "", target: messageTarget(thread, msg.author_uid, me), participants: thread.startsWith("dm:") ? [me!, thread.slice(3)] as const : undefined };
     return withChannelLifecycle(await this.verifier.verify(msg, ctx), ctx.serverKey, ctx.target);
   }
 

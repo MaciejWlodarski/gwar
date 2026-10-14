@@ -57,7 +57,7 @@ async fn start(
         let (tcp, _) = listener.accept().await.unwrap();
         let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
         let challenge = json!({"ev":"challenge","d":{
-            "protocol":3,"server_pk":server_pk(),"server_nonce":B64.encode([4;32]),"password_required":false,
+            "protocol":4,"server_pk":server_pk(),"server_nonce":B64.encode([4;32]),"password_required":false,
             "server":{"name":"test","welcome":"","version":"0","default_channel":1,"max_clients":8,"upload_limit":0}
         }});
         ws.send(Message::Text(challenge.to_string().into())).await.unwrap();
@@ -120,6 +120,8 @@ fn signed(author: &SigningKey, target: ChatTarget, conversation: &str, text: &st
     let mut s = MessageSignature {
         server_key: server_pk(),
         conversation: conversation.into(),
+        group_id: "-".into(),
+        epoch: "-".into(),
         author_uid: uid.clone(),
         key: B64.encode(author.verifying_key().as_bytes()),
         certificate: None,

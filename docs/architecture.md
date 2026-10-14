@@ -2,8 +2,8 @@
 
 ```mermaid
 flowchart LR
-  Web[Browser<br/>apps/web] -- WSS vc/3 --> GW
-  Desk[Desktop app, Tauri<br/>apps/web + vc-client] -- WSS vc/3 --> GW
+  Web[Browser<br/>apps/web] -- WSS vc/4 --> GW
+  Desk[Desktop app, Tauri<br/>apps/web + vc-client] -- WSS vc/4 --> GW
   TS3[Official TS3/TS6 clients] -- UDP 9987 --> TSS
   Web -- WebRTC Opus --> SFU
   Desk -- WebRTC Opus --> SFU
@@ -37,7 +37,7 @@ is the development exception.
 - **One owner of state.** `core` is an actor (a single tokio task): every
   change to channels, users and permissions goes through it in order, so every
   client sees the same sequence of events, without locks. Transports
-  (WebSocket, TeamSpeak) are thin: they translate to `vc/3` and back.
+  (WebSocket, TeamSpeak) are thin: they translate to `vc/4` and back.
 - **Audio is never decoded on the server.** Opus frames are forwarded as they
   are (SFU). The server only decides *who hears whom*, from a routing snapshot
   the core publishes (`ArcSwap`, lock-free reads). Clients decode and mix
@@ -47,17 +47,17 @@ is the development exception.
   the server drops silence, drives the "talking" indicator and ends talk spurts
   for TeamSpeak clients.
 
-## The `vc/3` protocol
+## The `vc/4` protocol
 
 JSON over a WebSocket (`/ws`). The full, commented definition is
 [`crates/vc-proto/src/lib.rs`](../crates/vc-proto/src/lib.rs); the TypeScript
 types are generated with `cargo test -p vc-proto --features ts`.
 
-1. Server: `challenge {protocol: 3, server_pk, server_nonce, server,
+1. Server: `challenge {protocol: 4, server_pk, server_nonce, server,
    password_required}`. The metadata helps the connect UI; only the key and
    nonce enter the transcript. The client checks the candidate key against its
    endpoint pin or invite fingerprint **before signing**.
-2. Client: `hello {protocol: 3, endpoint, expected_server_pk, server_nonce,
+2. Client: `hello {protocol: 4, endpoint, expected_server_pk, server_nonce,
    client_nonce, client_signing_pk, certificate?, certificate_hash, signature,
    nickname, client}`. The server verifies its configured endpoint allowlist,
    its own key, the connection nonce, the client signature, certificate
@@ -81,7 +81,7 @@ URL: WS(S) scheme, lowercase host without a trailing dot, bracketed IPv6,
 effective port omitted at the scheme default, and exact path. No credentials,
 query or fragment. Rust and TypeScript share normalization and transcript
 vectors in `crates/vc-proto/tests/endpoint-normalization.json` and
-`handshake-v3.json`. The path and scheme are part of the binding, so a signature
+`handshake-v4.json`. The path and scheme are part of the binding, so a signature
 cannot be relayed to another accepted alias endpoint.
 
 Only configuration supplies accepted endpoints: every `--domain` gives
@@ -128,7 +128,7 @@ Certificate wire fields are `account_key`, `device_key`, `issued_at`,
 Client statement H, signed by `client_signing_pk`:
 
 ```text
-gwar client hello v3
+gwar client hello v4
 {endpoint}
 {expected_server_pk}
 {server_nonce}
@@ -177,9 +177,30 @@ Joins and removals announce affected tags through
 `member.updated`. Tags may grow or shrink. `Member.connect` is a public handle
 confirmed asynchronously by Connect (see [connect.md](connect.md)).
 
-## Signed messages (v2)
+## MLS delivery service
 
-Every Gwar send/edit uses the vc/3 hello key and exact certificate. Honest
+The vc/4 delivery service follows direct message groups as public OpenMLS
+observers, without epoch secrets. It publishes signed device HPKE keys and key
+packages, orders commits, and keeps the handshake log, Welcomes and history
+chunks for 90 days. Outstanding history requests expire after 30 days.
+
+Only either participant may maintain a direct message group; creating it also
+requires the other participant to be a server member. Group mutations store the
+observer, leaves, removal proposals, log and Welcomes in one SQLite transaction.
+Revocations, bans and member removal reconcile durable removal proposals at
+startup and during cleanup. Offline devices fetch them through `mls.log`.
+
+The commit clock is the persisted high-water mark or the system clock, whichever
+is later. Commits outside its five-minute window receive `expired` or `early`;
+competing commits at the same epoch receive `stale`. Every list has a stable
+cursor (`next`), at most 100 entries and a 1 MiB response limit.
+
+The web app does not yet join MLS groups. Plaintext chat remains available;
+sealed messages and encrypted channel groups are later build steps.
+
+## Signed messages (v3)
+
+Every Gwar send/edit uses the vc/4 hello key and exact certificate. Honest
 servers enforce their persistent server key, locally routed conversation and
 account-derived author, current certificate/revocation authorization, and
 `signed_at` within five minutes of now. Edits preserve identity/context/creation
@@ -191,9 +212,11 @@ mentions and attachment order; member merges never reattribute signed messages.
 Exact UTF-8 statement, `\n` separators, no trailing newline:
 
 ```text
-gwar message v2
+gwar message v3
 {server_key}
 {conversation}
+{group_id}                - for plaintext
+{epoch}                   - for plaintext
 {author_uid}
 {client_signing_pk}
 {certificate_hash}
@@ -205,14 +228,16 @@ gwar message v2
 {body_hash}
 ```
 
-`server_key` is the vc/3-verified server identity, independent of endpoint aliases.
+`server_key` is the vc/4-verified server identity, independent of endpoint aliases.
 `conversation` is `server`, `channel:{channel_id}` (never reused by an honest
 server: channel and message ids come from counters that survive deletion), or
 `dm:{lower_uid}:{higher_uid}` (ASCII-byte sorted). Both DM participants come
 from the client's open conversation; the signed author determines direction.
+They are compared as complete identifiers, including a TeamSpeak peer's `ts:`
+id. Gwar-to-TeamSpeak messages verify; TeamSpeak replies remain unsigned.
 `author_uid` derives from the certificate account key, or the signing key for
 local identities. Wire `MessageSignature.key` is `client_signing_pk`; the
-certificate commitment is vc/3's `certificate_hash` (`-` for local identities).
+certificate commitment is vc/4's `certificate_hash` (`-` for local identities).
 IDs are 16 random client bytes in canonical unpadded base64url. Revision 0 uses
 predecessor `-` and equal creation/signing times. Each edit is revision +1, with
 `previous_revision_hash = b64url(SHA256(previous_statement + "\n" + previous_signature))`.
@@ -223,13 +248,14 @@ fields and weak/non-strict Ed25519 signatures fail. Rust and TypeScript consume
 
 `body_hash` is base64url SHA-256 of UTF-8 netstrings (`{byte_len}:{bytes},`):
 text, decimal count of sorted unique mention UIDs, each UID, decimal attachment
-count, then each attachment's SHA-256, decimal size, MIME and name in message
-order. IDs, URLs and layout dimensions are outside this body: URL confinement
-still applies, and complete bytes are hashed before display or saving. Upload
+count, then each attachment's SHA-256, decimal size, MIME and name, then file
+key, ciphertext SHA-256 and ciphertext size in message order. The last three
+fields are `-` for plaintext attachments. IDs, URLs and layout dimensions are
+outside this body: URL confinement still applies, and complete bytes are hashed before display or saving. Upload
 metadata is capped at 16 KiB and validated; its signed name and MIME must match
 local filename cleanup and byte sniffing, rather than server-selected replacements.
 
-Author deletion is a **final v2 revision**, using exact text bytes
+Author deletion is a **final v3 revision**, using exact text bytes
 `00 67 77 61 72 20 64 65 6c 65 74 65 64 20 76 31` (`"\0gwar deleted v1"`),
 no mentions and no attachments. Its canonical body is the concatenation of
 `16:` + those 16 bytes + `,1:0,1:0,`; the usual body hash and statement sign it.
@@ -359,7 +385,7 @@ therefore have different TS suffixes while retaining the same Gwar nickname.
     prevent echoes. Server chat uses the main query's `textserver` subscription;
     Gwar channel chat uses a puppet or the separate, movable posting query.
 - **Our client on TeamSpeak servers.** `vc-client::teamspeak` (tsclientlib)
-  presents a TeamSpeak server as `vc/3` (Welcome + events), so the UI has no
+  presents a TeamSpeak server as `vc/4` (Welcome + events), so the UI has no
   TeamSpeak-specific code; voice goes straight to the native engine.
 
 ## Clients
@@ -473,14 +499,14 @@ per-IP connection-attempt and authentication-frame buckets each hold 20 tokens a
 one per second, before identity/password work. The IP table holds 8192 entries;
 inactive entries expire after five minutes. At most four server-password Argon2
 checks run concurrently, with no waiting queue. WebSocket frames and assembled
-messages are capped at 96 KiB before parsing; hello, join and idle deadlines
+messages are capped at 96 KiB before authentication and 640 KiB afterwards; hello, join and idle deadlines
 include ping traffic.
 
 Clients validate every incoming event and per-operation response against small
 handwritten schemas checked by TypeScript against generated protocol types.
 Frames are capped at 2 MiB before parsing; schemas reject unknown/pollution keys,
 unsafe integers and unbounded strings/arrays. Updating generated types requires
-updating these validators. The vc/3 challenge validates canonical 32-byte keys
+updating these validators. The vc/4 challenge validates canonical 32-byte keys
 and nonces; hello replies accept exactly `{server_proof}` with a canonical 64-byte signature, and join
 replies validate Welcome. Unknown fields are deliberately rejected.
 Declared image dimensions are clamped to 1–16384 pixels before layout, then to

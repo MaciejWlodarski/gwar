@@ -1,4 +1,4 @@
-//! Test harness: an in-process server and a small `vc/3` WebSocket client.
+//! Test harness: an in-process server and a small `vc/4` WebSocket client.
 #![allow(dead_code)]
 
 use std::{collections::HashMap, collections::VecDeque, future::Future, time::Duration};
@@ -111,7 +111,7 @@ pub fn public_key(key: &SigningKey) -> String {
 pub fn sign(key: &SigningKey, hello: &Value) -> String {
     let h = hello;
     let statement = format!(
-        "gwar client hello v3\n{}\n{}\n{}\n{}\n{}\n{}",
+        "gwar client hello v4\n{}\n{}\n{}\n{}\n{}\n{}",
         h["endpoint"].as_str().unwrap(),
         h["expected_server_pk"].as_str().unwrap(),
         h["server_nonce"].as_str().unwrap(),
@@ -318,6 +318,8 @@ impl Client {
         let mut sig = MessageSignature {
             server_key: self.server_key.clone(),
             conversation: target.into(),
+            group_id: "-".into(),
+            epoch: "-".into(),
             author_uid: self.welcome.uid.clone(),
             key: public_key(&self.key),
             certificate: self.certificate.clone(),

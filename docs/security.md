@@ -63,7 +63,7 @@ the server, presence, voice authenticity.
   (or `404` where absence is the answer), read at most 1 MiB and 1,000
   revocations per page, and give each request, body included, 20 seconds.
 
-## Logging in to a server (vc/3, implemented)
+## Logging in to a server (vc/4, implemented)
 
 Threats: a malicious server A relays your login to an honest server B and logs
 in to B as you (relay); or A pretends to be B.
@@ -71,14 +71,14 @@ in to B as you (relay); or A pretends to be B.
 Each server has an Ed25519 **server key** (`server-key.ed25519` in its data
 directory; back it up, losing it means a new server identity). Login:
 
-1. The server sends `challenge {protocol: 3, server_key, server_nonce}`.
+1. The server sends `challenge {protocol: 4, server_key, server_nonce}`.
 2. The client compares `server_key` with its pin for this endpoint, or with the
    fingerprint in the invite it is using. First contact with neither is an
    explicit trust-on-first-use candidate.
 3. The client signs
 
    ```text
-   gwar client hello v3
+   gwar client hello v4
    {endpoint}
    {expected_server_key}
    {server_nonce}
@@ -172,9 +172,11 @@ reloads (accepting then says it was not saved).
 Every message, edit and attachment is signed by the author's session key:
 
 ```text
-gwar message v2
+gwar message v3
 {server_key}
 {conversation}            server | channel:{id} | dm:{lower_uid}:{higher_uid}
+{group_id}                - for plaintext
+{epoch}                   - for plaintext
 {author_uid}
 {client_signing_pk}
 {certificate_hash}

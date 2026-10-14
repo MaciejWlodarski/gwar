@@ -178,8 +178,8 @@ function isFatal(e: ConnectError): boolean {
 
 /**
  * What the controller needs from a server session, whatever the transport:
- * `Connection` (WebSocket, vc/3) or `TsConnection` (Tauri bridge to a
- * TeamSpeak server, see ts-connection.ts). Both speak vc/3 shapes.
+ * `Connection` (WebSocket, vc/4) or `TsConnection` (Tauri bridge to a
+ * TeamSpeak server, see ts-connection.ts). Both speak vc/4 shapes.
  */
 export interface Link {
   readonly status: ConnectionStatus;
@@ -206,7 +206,7 @@ interface Pending {
 type Handler = (data: never) => void;
 
 /**
- * One logical vc/3 session: handshake, request correlation, typed events and
+ * One logical vc/4 session: handshake, request correlation, typed events and
  * automatic reconnection. Every (re)connect ends with a fresh Welcome, which
  * `onWelcome` delivers so consumers can replace all derived state.
  */

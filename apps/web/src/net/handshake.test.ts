@@ -1,4 +1,4 @@
-import vectors from "../../../../crates/vc-proto/tests/handshake-v3.json";
+import vectors from "../../../../crates/vc-proto/tests/handshake-v4.json";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { encodeBase64Url } from "./base64url";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -22,7 +22,7 @@ async function begin(conn: Connection) {
   return { socket, result };
 }
 
-describe("vc/3 pins and secrets", () => {
+describe("vc/4 pins and secrets", () => {
   it("pins first use only after proof, reuses a match and keeps first_seen", async () => {
     const pins = memoryPins();
     const first = make({ pinStore: pins, serverPassword: "secret" });
@@ -108,7 +108,7 @@ describe("vc/3 pins and secrets", () => {
     try {
       await expect(verifyProof(h, { server_proof: encodeBase64Url(signature) })).rejects.toThrow();
       h.expected_server_pk = testServerIdentity.publicKey;
-      // A mathematically valid signature with R = identity is still forbidden by strict vc/3.
+      // A mathematically valid signature with R = identity is still forbidden by strict vc/4.
       const secret = new Uint8Array(32).fill(3);
       h.expected_server_pk = encodeBase64Url(ed25519.getPublicKey(secret));
       const message = new TextEncoder().encode(await proofStatement(h));
@@ -153,7 +153,7 @@ describe("vc/3 pins and secrets", () => {
   });
 });
 
-describe("vc/3 transport", () => {
+describe("vc/4 transport", () => {
   it("blocks non-loopback plaintext without a desktop per-server toggle before opening a socket", async () => {
     for (const platform of ["web", "desktop"] as const) {
       const conn = make({ url: "ws://192.168.1.2:8790/ws", client: { name: "test", version: "0", platform } });
@@ -189,11 +189,11 @@ describe("persistent pins and canonical fields", () => {
   it.each(["A".repeat(43) + "=", "A".repeat(42) + "B", "bad\nkey", "AA"])("rejects noncanonical encodings: %s", (value) => expect(() => decodeFixed(value, 32)).toThrow());
   it("has exact statement bytes with no trailing newline", () => {
     const key = "A".repeat(43); const h = { endpoint: "wss://server.example/ws", expected_server_pk: key, server_nonce: key, client_nonce: key, client_signing_pk: key, certificate_hash: "-" };
-    expect(helloStatement(h)).toBe(`gwar client hello v3\nwss://server.example/ws\n${key}\n${key}\n${key}\n${key}\n-`);
+    expect(helloStatement(h)).toBe(`gwar client hello v4\nwss://server.example/ws\n${key}\n${key}\n${key}\n${key}\n-`);
   });
 });
 
-describe("shared vc/3 wire vectors", () => {
+describe("shared vc/4 wire vectors", () => {
   it.each(vectors)("matches Rust H, certificate commitment, hello hash and proof", async (v) => {
     const h = v.hello as Hello;
     expect(helloStatement(h)).toBe(v.statement);
@@ -205,7 +205,7 @@ describe("shared vc/3 wire vectors", () => {
   });
 });
 
-describe("vc/3 immutable endpoint and runtime validation", () => {
+describe("vc/4 immutable endpoint and runtime validation", () => {
   it("stores the canonical endpoint once for dialing, transcript and pinning", async () => {
     const options: Partial<ConnectionOptions> = { url: "wss://SERVER.example.:443/ws" };
     const conn = make(options);

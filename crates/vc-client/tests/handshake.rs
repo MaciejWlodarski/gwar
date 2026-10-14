@@ -1,4 +1,4 @@
-//! Native vc/3 key policy and proof-before-secret checks.
+//! Native vc/4 key policy and proof-before-secret checks.
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use ed25519_dalek::{Signer, SigningKey};
 use futures::{SinkExt, StreamExt};
@@ -33,7 +33,7 @@ async fn fake_server(mode: &str) -> (String, String, tokio::task::JoinHandle<Vec
         let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
             json!({"ev":"challenge","d":{
-                "protocol":3,"server_pk":server_pk,"server_nonce":B64.encode([4;32]),"password_required":true,
+                "protocol":4,"server_pk":server_pk,"server_nonce":B64.encode([4;32]),"password_required":true,
                 "server":{"name":"test","welcome":"","version":"0","default_channel":1,"max_clients":8,"upload_limit":0}
             }})
             .to_string()

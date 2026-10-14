@@ -57,7 +57,7 @@ export class FakeSocket implements WebSocketLike {
 export const serverInfo = { name: "Test", welcome: "hi", version: "0", default_channel: 1, max_clients: 10, upload_limit: 0, file_access: "link" as const };
 
 export function challenge(passwordRequired = false) {
-  return { ev: "challenge", d: { protocol: 3, server_pk: testServerIdentity.publicKey, server_nonce: newNonce(), server: serverInfo, password_required: passwordRequired } };
+  return { ev: "challenge", d: { protocol: 4, server_pk: testServerIdentity.publicKey, server_nonce: newNonce(), server: serverInfo, password_required: passwordRequired } };
 }
 
 export function welcome(overrides: Partial<Welcome> = {}): Welcome {

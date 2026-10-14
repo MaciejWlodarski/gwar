@@ -38,6 +38,22 @@ async function editMessage(f: Awaited<ReturnType<typeof fixture>>, text: string)
   vi.restoreAllMocks(); return msg;
 }
 
+it("verifies signed Gwar messages from both TeamSpeak DM views and leaves replies unsigned", async () => {
+  const f = await fixture();
+  const author = f.msg.author_uid, peer = "ts:peer:with:colons";
+  const target = `dm:${[author, peer].sort().join(":")}`;
+  f.msg.target = { client: 2 };
+  f.msg.signature = await signMessage(f.identity, { ...f.ctx, target }, author, f.msg.text, [], []);
+  for (const participants of [[author, peer], [peer, author]] as const) {
+    const ctx = { ...f.ctx, target, participants };
+    expect((await verifyMessage(f.msg, ctx)).status).toBe("verified");
+    expect(events["chat.message"](f.msg)).toBe(true);
+    const reply = { ...f.msg, author_uid: peer, signature: undefined };
+    expect((await verifyMessage(reply, ctx)).status).toBe("unsigned-ts");
+    expect((await verifyMessage(f.msg, { ...ctx, participants: [author, "ts:other"] })).status).toBe("invalid");
+  }
+});
+
 describe("v2 shared vectors", () => {
   for (const [i, v] of vectors.entries()) it(`matches and strictly verifies vector ${i}`, async () => {
     const s = v.signature as MessageSignature;
@@ -48,7 +64,7 @@ describe("v2 shared vectors", () => {
     const store = storage(); await store.mergeFeed([], CONNECT_URL, now);
     const target = s.conversation.startsWith("channel:") ? { channel: 42 } : s.conversation.startsWith("dm:") ? { client: 9 } : "server";
     const msg: ChatMessage = { id: i, target, author: 1, author_uid: s.author_uid, author_name: "author", text: v.text, mentions: v.mentions, attachments: v.attachments, sent_at: s.created_at, signature: s };
-    expect((await verifyMessage(msg, { serverKey: s.server_key, target: s.conversation }, store, now)).status).toBe("verified");
+    expect((await verifyMessage(msg, { serverKey: s.server_key, target: s.conversation, participants: "participants" in v ? v.participants as [string, string] : undefined }, store, now)).status).toBe("verified");
   });
 });
 describe("adversarial message verification", () => {
@@ -57,7 +73,7 @@ describe("adversarial message verification", () => {
     for (const ctx of [{ ...f.ctx, serverKey: encodeBase64Url(new Uint8Array(32).fill(9)) }, { ...f.ctx, target: "channel:8" }, { ...f.ctx, target: "dm:a:b" }]) expect((await verifyMessage(f.msg, ctx)).status).toBe("invalid");
     const peer = await uidForPublicKey((await keyFromSeed(new Uint8Array(32).fill(5))).publicKey);
     const third = await uidForPublicKey((await keyFromSeed(new Uint8Array(32).fill(6))).publicKey);
-    const ctx = { ...f.ctx, target: messageTarget(`dm:${peer}`, f.msg.author_uid, f.msg.author_uid) };
+    const ctx = { ...f.ctx, target: messageTarget(`dm:${peer}`, f.msg.author_uid, f.msg.author_uid), participants: [f.msg.author_uid, peer] as const };
     f.msg.target = { client: 5 }; f.msg.signature = await signMessage(f.identity, ctx, f.msg.author_uid, f.msg.text, [], []);
     expect((await verifyMessage(f.msg, ctx)).status).toBe("verified");
     expect((await verifyMessage(f.msg, { ...ctx, target: messageTarget(`dm:${f.msg.author_uid}`, f.msg.author_uid, third) })).status).toBe("invalid");

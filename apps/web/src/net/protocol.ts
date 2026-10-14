@@ -1,5 +1,12 @@
+import type { MlsPackage } from "../proto/MlsPackage";
+import type { MlsDevice } from "../proto/MlsDevice";
+import type { MlsLogEntry } from "../proto/MlsLogEntry";
+import type { MlsGroup } from "../proto/MlsGroup";
+import type { MlsWelcome } from "../proto/MlsWelcome";
+import type { MlsHistoryChunk } from "../proto/MlsHistoryChunk";
+import type { MlsHistoryWanted } from "../proto/MlsHistoryWanted";
 /**
- * Typed view over the generated `vc/3` types: which response each request
+ * Typed view over the generated `vc/4` types: which response each request
  * produces and the payload type of each event. The generated unions describe
  * the wire; this file describes the conversation.
  */
@@ -13,7 +20,7 @@ import type { Event } from "../proto/Event";
 import type { Request } from "../proto/Request";
 import type { Welcome } from "../proto/Welcome";
 
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 /** Number of recvonly audio transceivers the server expects (`AUDIO_SLOTS`). */
 export const AUDIO_SLOTS = 8;
 export const MAX_MESSAGE_LENGTH = 4000;
@@ -25,6 +32,23 @@ export type RequestData<O extends Op> = Extract<Request, { op: O }>["d"];
 
 /** Successful reply payload per request op. */
 export interface ResponseMap {
+  "mls.device.publish": Empty;
+  "mls.key_packages.publish": { count: number };
+  "mls.key_packages.claim": { packages: MlsPackage[]; next: string | null };
+  "mls.devices": { devices: MlsDevice[]; next: string | null };
+  "mls.group.create": { group: string };
+  "mls.group_info": { group_info: string; epoch: number };
+  "mls.commit": { epoch: number };
+  "mls.log": { head: number; oldest: number; entries: MlsLogEntry[]; pending: string[]; next: number | null };
+  "mls.groups": { groups: MlsGroup[]; next: string | null };
+  "mls.welcomes": { welcomes: MlsWelcome[]; next: string | null };
+  "mls.welcomes.ack": Empty;
+  "mls.history.share": Empty;
+  "mls.history.fetch": { chunks: MlsHistoryChunk[]; next: string | null };
+  "mls.history.wanted": { wanted: MlsHistoryWanted[]; next: string | null };
+  "mls.history.ack": Empty;
+  "mls.history.request": Empty;
+
   hello: { server_proof: string };
   join: Welcome;
   ping: Empty;

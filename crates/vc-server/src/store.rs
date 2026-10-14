@@ -1,6 +1,8 @@
 //! SQLite persistence. Owned by the core actor; every call is a short local
 //! transaction, so it runs inline rather than on a blocking pool.
 
+pub mod mls;
+
 use std::{collections::BTreeMap, path::Path};
 
 use anyhow::{Context, Result, bail};
@@ -257,6 +259,22 @@ const MIGRATIONS: &[&str] = &[
     CREATE TRIGGER files_removed AFTER DELETE ON files BEGIN
         INSERT OR REPLACE INTO removed_files(id,uploader,size) VALUES(old.id, old.uploader, old.size);
     END;
+    "#,
+    r#"
+    CREATE TABLE mls_devices (device_key TEXT PRIMARY KEY, uid TEXT NOT NULL, hpke_key TEXT NOT NULL, created_at INTEGER NOT NULL, signature TEXT NOT NULL);
+    CREATE INDEX mls_devices_by_uid ON mls_devices(uid, device_key);
+    CREATE TABLE mls_key_packages (ref TEXT PRIMARY KEY, device_key TEXT NOT NULL, uid TEXT NOT NULL, package BLOB NOT NULL, last_resort INTEGER NOT NULL, not_after INTEGER NOT NULL);
+    CREATE INDEX mls_packages_by_device ON mls_key_packages(uid, device_key, last_resort, not_after, ref);
+    CREATE UNIQUE INDEX mls_last_resort ON mls_key_packages(device_key) WHERE last_resort=1;
+    CREATE TABLE mls_groups (group_id TEXT PRIMARY KEY, conversation TEXT NOT NULL, incarnation INTEGER NOT NULL, epoch INTEGER NOT NULL, committed_at INTEGER NOT NULL, group_info BLOB NOT NULL, observer BLOB NOT NULL, created_at INTEGER NOT NULL, UNIQUE(conversation, incarnation));
+    CREATE TABLE mls_log (group_id TEXT NOT NULL REFERENCES mls_groups(group_id) ON DELETE CASCADE, epoch INTEGER NOT NULL, proposals TEXT NOT NULL, "commit" BLOB NOT NULL, committed_at INTEGER NOT NULL, PRIMARY KEY(group_id, epoch));
+    CREATE TABLE mls_leaves (group_id TEXT NOT NULL REFERENCES mls_groups(group_id) ON DELETE CASCADE, leaf INTEGER NOT NULL, device_key TEXT NOT NULL, uid TEXT NOT NULL, PRIMARY KEY(group_id, leaf), UNIQUE(group_id, device_key));
+    CREATE TABLE mls_welcomes (id TEXT PRIMARY KEY, device_key TEXT NOT NULL, group_id TEXT NOT NULL REFERENCES mls_groups(group_id) ON DELETE CASCADE, welcome BLOB NOT NULL, created_at INTEGER NOT NULL);
+    CREATE INDEX mls_welcomes_by_device ON mls_welcomes(device_key, id);
+    CREATE TABLE mls_proposals (group_id TEXT NOT NULL REFERENCES mls_groups(group_id) ON DELETE CASCADE, epoch INTEGER NOT NULL, leaf INTEGER NOT NULL, proposal BLOB NOT NULL, PRIMARY KEY(group_id, epoch, leaf));
+    CREATE TABLE mls_history_requests (group_id TEXT NOT NULL REFERENCES mls_groups(group_id) ON DELETE CASCADE, device_key TEXT NOT NULL, requested_at INTEGER NOT NULL, PRIMARY KEY(group_id, device_key));
+    CREATE TABLE mls_history (id TEXT PRIMARY KEY, group_id TEXT NOT NULL REFERENCES mls_groups(group_id) ON DELETE CASCADE, recipient_device TEXT NOT NULL, sender_uid TEXT NOT NULL, first_epoch INTEGER NOT NULL, last_epoch INTEGER NOT NULL, chunk BLOB NOT NULL, created_at INTEGER NOT NULL);
+    CREATE INDEX mls_history_by_recipient ON mls_history(recipient_device, id);
     "#,
 ];
 

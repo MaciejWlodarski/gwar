@@ -250,6 +250,27 @@ impl Observer {
         Some(Leaf { index: index.u32(), device_key: credential.device_key().to_owned(), uid: credential.uid() })
     }
 
+    /// Server removal proposals this commit references, in commit order.
+    /// Processes on a disposable copy; the observer is unchanged.
+    pub fn referenced_removals(&self, commit: &[u8]) -> Result<Vec<u32>, DsError> {
+        let copy = Self::load(&self.save(), &self.server_key)?;
+        let message = MlsMessageIn::tls_deserialize_exact(commit)
+            .map_err(invalid("commit encoding"))?
+            .try_into_protocol_message()
+            .map_err(invalid("not a handshake"))?;
+        let processed = copy.group.process_message(&RustCrypto::default(), message).map_err(invalid("commit"))?;
+        let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else {
+            return Err(Invalid("not a commit"));
+        };
+        Ok(staged
+            .queued_proposals()
+            .filter_map(|p| match (p.sender(), p.proposal_or_ref_type(), p.proposal()) {
+                (Sender::External(_), ProposalOrRefType::Reference, Proposal::Remove(r)) => Some(r.removed().u32()),
+                _ => None,
+            })
+            .collect())
+    }
+
     /// Processes and merges the next commit, checking the GroupInfo its sender
     /// uploads for the new epoch and the Welcome for the devices it adds.
     /// Consumes the observer: on error, load the saved state again.

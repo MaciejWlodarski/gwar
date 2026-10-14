@@ -1,4 +1,4 @@
-//! vc/3 relay binding, transcript proof and admission ordering.
+//! vc/4 relay binding, transcript proof and admission ordering.
 
 mod common;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};

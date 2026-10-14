@@ -1,4 +1,4 @@
-//! WebSocket gateway for the `vc/3` protocol: authentication, framing,
+//! WebSocket gateway for the `vc/4` protocol: authentication, framing,
 //! rate limiting and the per-connection write queue.
 
 use std::{
@@ -48,6 +48,7 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 const MAX_FRAME: usize = 96 * 1024;
+const AUTHENTICATED_MAX_FRAME: usize = 640 * 1024;
 const RATE_BURST: f64 = 40.0;
 /// Refused frames in a row (each still answered) after which the connection is dropped:
 /// refusing costs work too, so a client that ignores `rate_limited` is cut off.
@@ -64,10 +65,12 @@ pub async fn upgrade(
     let Some(permit) = gateway.preauth.connection(ip) else {
         return axum::response::IntoResponse::into_response(axum::http::StatusCode::TOO_MANY_REQUESTS);
     };
-    ws.max_message_size(MAX_FRAME).max_frame_size(MAX_FRAME).on_upgrade(move |socket| async move {
-        let _permit = permit;
-        connection(socket, gateway, ip).await;
-    })
+    ws.max_message_size(AUTHENTICATED_MAX_FRAME).max_frame_size(AUTHENTICATED_MAX_FRAME).on_upgrade(
+        move |socket| async move {
+            let _permit = permit;
+            connection(socket, gateway, ip).await;
+        },
+    )
 }
 
 /// The client's address. Behind a reverse proxy on the same host the TCP peer is
@@ -108,11 +111,11 @@ fn error(re: u32, code: ErrorCode, message: &str) -> Message {
     text(&ServerFrame::Err { re, err: ErrorBody::new(code, message) })
 }
 
-async fn next_text(stream: &mut SplitStream<WebSocket>, wait: Duration) -> Option<Utf8Bytes> {
+async fn next_text(stream: &mut SplitStream<WebSocket>, wait: Duration, limit: usize) -> Option<Utf8Bytes> {
     timeout(wait, async {
         loop {
             match stream.next().await? {
-                Ok(Message::Text(text)) if text.len() <= MAX_FRAME => return Some(text),
+                Ok(Message::Text(text)) if text.len() <= limit => return Some(text),
                 Ok(Message::Ping(_) | Message::Pong(_)) => continue,
                 _ => return None,
             }
@@ -138,7 +141,7 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
         return;
     }
 
-    let Some(raw) = next_text(&mut stream, HELLO_TIMEOUT).await else { return };
+    let Some(raw) = next_text(&mut stream, HELLO_TIMEOUT, MAX_FRAME).await else { return };
     if !gateway.preauth.hello(ip) {
         let _ = sink.send(error(0, ErrorCode::RateLimited, "too many hellos")).await;
         return;
@@ -205,7 +208,7 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
     if sink.send(text(&ServerFrame::Ok { re: id, ok: ProtocolResponse::ServerProof(proof) })).await.is_err() {
         return;
     }
-    let Some(raw) = next_text(&mut stream, HELLO_TIMEOUT).await else { return };
+    let Some(raw) = next_text(&mut stream, HELLO_TIMEOUT, MAX_FRAME).await else { return };
     if !gateway.preauth.hello(ip) {
         let _ = sink.send(error(0, ErrorCode::RateLimited, "too many authentication frames")).await;
         return;
@@ -309,7 +312,7 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
     let mut refused = 0u32;
     let reason = loop {
         let raw = tokio::select! {
-            raw = next_text(&mut stream, IDLE_TIMEOUT) => raw,
+            raw = next_text(&mut stream, IDLE_TIMEOUT, AUTHENTICATED_MAX_FRAME) => raw,
             _ = &mut writer => {
                 writer_done = true;
                 None

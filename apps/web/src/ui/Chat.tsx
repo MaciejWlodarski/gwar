@@ -380,7 +380,7 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
       setSigningUid(uid);
       const rows = (thread?.items ?? []).flatMap((i) => {
         if (i.kind !== "msg") return [];
-        const ctx = { serverKey, target: messageTarget(key, i.msg.author_uid, uid) };
+        const ctx = { serverKey, target: messageTarget(key, i.msg.author_uid, uid), participants: key?.startsWith("dm:") ? [uid!, key.slice(3)] as const : undefined };
         return [{ msg: i.msg, ctx, fingerprint: messageFingerprint(i.msg, ctx) }];
       });
       // Results are kept only for the rows the thread still holds, so the map is bounded like the thread.

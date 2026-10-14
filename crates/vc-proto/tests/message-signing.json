@@ -26,11 +26,13 @@
       "created_at": 1700000000000,
       "signed_at": 1700000000000,
       "body_hash": "QVzxhottyEqAfw7doJBDZEnjOtuJKjDnqWhiRlqEmuM",
-      "signature": "XUnsJ5SwkNco2AD7n6WJ9_KEdILPGSy-Jk6HirpEs1KYkpNQeLa3bpJjo-rMdIGa-uZLUJZ3lV53oAn_B1AiDg"
+      "signature": "WrGFi2NLUBOavzN0UxFZOkMXV5XsAOLgnZnTx1WJiJR3297oXMZSCotSFqlOFTWYrKC-OYyTugR6kFt4sZocAA",
+      "group_id": "-",
+      "epoch": "-"
     },
     "canonical_body": "MjA6WmHFvMOzxYLEhyDwn6aACjE6YSwsMToyLDI3OmRabDNiRENGNF9uYURSTUhIckMwcTFEOUtfWSwyNzp0aTZHZjZMek92NWkxZGF4WkM0V0lkVkRNSGcsMTowLA",
-    "statement": "gwar message v2\nGX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE\nchannel:42\nNHUPmL1Z_PyUbaRaqr6TO-FUpLU\ngTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q\nod853OrRvI7xdr3ZuELM2itbJxVf60ILb52fy7CjDAU\nAQEBAQEBAQEBAQEBAQEBAQ\n0\n-\n1700000000000\n1700000000000\nQVzxhottyEqAfw7doJBDZEnjOtuJKjDnqWhiRlqEmuM",
-    "revision_hash": "fYj4kIe3lzQwXtfcXrPn8S_6CW0Z0PfPcaz_UpLCQ-I"
+    "statement": "gwar message v3\nGX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE\nchannel:42\n-\n-\nNHUPmL1Z_PyUbaRaqr6TO-FUpLU\ngTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q\nod853OrRvI7xdr3ZuELM2itbJxVf60ILb52fy7CjDAU\nAQEBAQEBAQEBAQEBAQEBAQ\n0\n-\n1700000000000\n1700000000000\nQVzxhottyEqAfw7doJBDZEnjOtuJKjDnqWhiRlqEmuM",
+    "revision_hash": "pUXZKTimRUNlImxTDNTesu920QnOdqxNKj9tPc0JAR0"
   },
   {
     "text": "edited",
@@ -51,15 +53,17 @@
       "certificate_hash": "od853OrRvI7xdr3ZuELM2itbJxVf60ILb52fy7CjDAU",
       "message_id": "AQEBAQEBAQEBAQEBAQEBAQ",
       "revision": 1,
-      "previous_revision_hash": "fYj4kIe3lzQwXtfcXrPn8S_6CW0Z0PfPcaz_UpLCQ-I",
+      "previous_revision_hash": "pUXZKTimRUNlImxTDNTesu920QnOdqxNKj9tPc0JAR0",
       "created_at": 1700000000000,
       "signed_at": 1700000000100,
       "body_hash": "5p-qDpld3gIRwil7HNBjma8iSsZQWVrKWP1J3yNe4xo",
-      "signature": "Ulofxb5b9q-yAVlsj4c1-2amOicdg5-HvLwQbEt9CHtWADYfINrCPbB8wq8ZgVpBihyqOrHxte--nl_NnfWcBQ"
+      "signature": "hmQczoLCkSQf2Hc-rP3ClJqn-0n5qTRiE0pUpzhNur_Mdyi8bQ6Py1DST38OuLKkPZSsE1iO3GyVTUBHF2xpAQ",
+      "group_id": "-",
+      "epoch": "-"
     },
     "canonical_body": "NjplZGl0ZWQsMTowLDE6MCw",
-    "statement": "gwar message v2\nGX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE\nchannel:42\nNHUPmL1Z_PyUbaRaqr6TO-FUpLU\ngTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q\nod853OrRvI7xdr3ZuELM2itbJxVf60ILb52fy7CjDAU\nAQEBAQEBAQEBAQEBAQEBAQ\n1\nfYj4kIe3lzQwXtfcXrPn8S_6CW0Z0PfPcaz_UpLCQ-I\n1700000000000\n1700000000100\n5p-qDpld3gIRwil7HNBjma8iSsZQWVrKWP1J3yNe4xo",
-    "revision_hash": "_QfEnZ6tlsNTf7k6F71qN7b5TA483bs6SbmYj-0XrrE"
+    "statement": "gwar message v3\nGX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE\nchannel:42\n-\n-\nNHUPmL1Z_PyUbaRaqr6TO-FUpLU\ngTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q\nod853OrRvI7xdr3ZuELM2itbJxVf60ILb52fy7CjDAU\nAQEBAQEBAQEBAQEBAQEBAQ\n1\npUXZKTimRUNlImxTDNTesu920QnOdqxNKj9tPc0JAR0\n1700000000000\n1700000000100\n5p-qDpld3gIRwil7HNBjma8iSsZQWVrKWP1J3yNe4xo",
+    "revision_hash": "Wt61XVK4uG4V0egciF43-aqVuFiGLR7alxwUdLlAoJ0"
   },
   {
     "text": "\u0000gwar deleted v1",
@@ -80,15 +84,17 @@
       "certificate_hash": "od853OrRvI7xdr3ZuELM2itbJxVf60ILb52fy7CjDAU",
       "message_id": "AQEBAQEBAQEBAQEBAQEBAQ",
       "revision": 2,
-      "previous_revision_hash": "_QfEnZ6tlsNTf7k6F71qN7b5TA483bs6SbmYj-0XrrE",
+      "previous_revision_hash": "Wt61XVK4uG4V0egciF43-aqVuFiGLR7alxwUdLlAoJ0",
       "created_at": 1700000000000,
       "signed_at": 1700000000200,
       "body_hash": "SaT23qEu4BSvBel2IUyDLlN9qL5CpP9GfyBEjwMuq_s",
-      "signature": "ckNww61cVJzbVnqm0OlBof3MkmUt6G00ZjlMvQKO6e8FEM4QJNeOTPGzSUFKKIt-3ZY3sEfGcrC4YlIt_AsvAg"
+      "signature": "qNtczBWgxLZdkW96ZBbWjeG58xALDJCx-pn2_fjEBavEJRYti1AFwigVsfPQUWQpmi3T5cAjtjJS7BG2F3X1CA",
+      "group_id": "-",
+      "epoch": "-"
     },
     "canonical_body": "MTY6AGd3YXIgZGVsZXRlZCB2MSwxOjAsMTowLA",
-    "statement": "gwar message v2\nGX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE\nchannel:42\nNHUPmL1Z_PyUbaRaqr6TO-FUpLU\ngTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q\nod853OrRvI7xdr3ZuELM2itbJxVf60ILb52fy7CjDAU\nAQEBAQEBAQEBAQEBAQEBAQ\n2\n_QfEnZ6tlsNTf7k6F71qN7b5TA483bs6SbmYj-0XrrE\n1700000000000\n1700000000200\nSaT23qEu4BSvBel2IUyDLlN9qL5CpP9GfyBEjwMuq_s",
-    "revision_hash": "xa4eXflbaM3FjS2amOP-Esnlr76R7bPmPP4gIkYoS2A"
+    "statement": "gwar message v3\nGX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE\nchannel:42\n-\n-\nNHUPmL1Z_PyUbaRaqr6TO-FUpLU\ngTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q\nod853OrRvI7xdr3ZuELM2itbJxVf60ILb52fy7CjDAU\nAQEBAQEBAQEBAQEBAQEBAQ\n2\nWt61XVK4uG4V0egciF43-aqVuFiGLR7alxwUdLlAoJ0\n1700000000000\n1700000000200\nSaT23qEu4BSvBel2IUyDLlN9qL5CpP9GfyBEjwMuq_s",
+    "revision_hash": "pfH0YRUVx84x5U2LKLTG-6sS1TE7XK2vlpPT9dMSlT8"
   },
   {
     "text": "private",
@@ -107,11 +113,17 @@
       "created_at": 1700000000000,
       "signed_at": 1700000000000,
       "body_hash": "h0jUL4xUx_X17mSl6FbjptjK3TTQWSDCWfWAe0KOyPM",
-      "signature": "ghLRPg7Pps1f-evpT9P_QtWuptG8dh7zat5Djd5esFNwUu8WBzv8sunm0aLdRpAylPG_rYrQ5lFGmAPptAFOCA"
+      "signature": "_Be431UdpCvZuj73iGXBf7Hwsm0cpQ89tF3pFEiX4eFwFylVexCRTeICxZT3W8S-KGXgI1e0plTSs3Uk2Wv8AA",
+      "group_id": "-",
+      "epoch": "-"
     },
     "canonical_body": "Nzpwcml2YXRlLDE6MCwxOjAs",
-    "statement": "gwar message v2\nGX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE\ndm:dZl3bDCF4_naDRMHHrC0q1D9K_Y:ti6Gf6LzOv5i1daxZC4WIdVDMHg\nti6Gf6LzOv5i1daxZC4WIdVDMHg\n7UkoxijRwsbq6QM4kFmVYSlZJzpcY_k2NsFGFKyHN9E\n-\nBAQEBAQEBAQEBAQEBAQEBA\n0\n-\n1700000000000\n1700000000000\nh0jUL4xUx_X17mSl6FbjptjK3TTQWSDCWfWAe0KOyPM",
-    "revision_hash": "yRk5RJTThzsDkkWzdoy4uRNQb00rXFW654ZwWJ454Q4"
+    "statement": "gwar message v3\nGX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE\ndm:dZl3bDCF4_naDRMHHrC0q1D9K_Y:ti6Gf6LzOv5i1daxZC4WIdVDMHg\n-\n-\nti6Gf6LzOv5i1daxZC4WIdVDMHg\n7UkoxijRwsbq6QM4kFmVYSlZJzpcY_k2NsFGFKyHN9E\n-\nBAQEBAQEBAQEBAQEBAQEBA\n0\n-\n1700000000000\n1700000000000\nh0jUL4xUx_X17mSl6FbjptjK3TTQWSDCWfWAe0KOyPM",
+    "revision_hash": "GG7AmkAOH7Ew14AEO7W-1Ae8CgU60C-2x-MqDPweRxM",
+    "participants": [
+      "dZl3bDCF4_naDRMHHrC0q1D9K_Y",
+      "ti6Gf6LzOv5i1daxZC4WIdVDMHg"
+    ]
   },
   {
     "text": "attachments",
@@ -138,11 +150,91 @@
       "previous_revision_hash": "-",
       "created_at": 1700000000000,
       "signed_at": 1700000000000,
-      "body_hash": "LnzXBz8wG385D_5crrNyJDqqwHghT2mRRLL9clj1Oms",
-      "signature": "G9PNMS8hdaJDktEq90UOt7Y57kPOHb-hgSlXSiW5E1j2fj5bkPlPU5RRE2jT49pyVI_QeLQmQpnBY2qGp9d7Bg"
+      "body_hash": "DsNhlXdrRQ7gbe4UBVdnljFC5unNze3l9IUnQN2VoYQ",
+      "signature": "WDxOtOdf5fj9AWLIQc-RInbzs5lohtbG5Ixgr9cd_S_jb6Hn51_utt_Gci4pwa6UFQPKGk5W37pfC-DN5HnwDA",
+      "group_id": "-",
+      "epoch": "-"
     },
-    "canonical_body": "MTE6YXR0YWNobWVudHMsMTowLDE6MSw0MzpMUEpOdWwtd293NG02RHNxeGJuaW5oc1dIbHdmcDBKZWN3UXpZcE9MbUNRLDE6NSwxMDp0ZXh0L3BsYWluLDEwOmEs8J-Uki50eHQs",
-    "statement": "gwar message v2\nGX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE\nserver\nti6Gf6LzOv5i1daxZC4WIdVDMHg\n7UkoxijRwsbq6QM4kFmVYSlZJzpcY_k2NsFGFKyHN9E\n-\nBQUFBQUFBQUFBQUFBQUFBQ\n0\n-\n1700000000000\n1700000000000\nLnzXBz8wG385D_5crrNyJDqqwHghT2mRRLL9clj1Oms",
-    "revision_hash": "f3KriXURyk8oqzHoBP6ii2q_okeeSmGzMU8rWBYSL_U"
+    "canonical_body": "MTE6YXR0YWNobWVudHMsMTowLDE6MSw0MzpMUEpOdWwtd293NG02RHNxeGJuaW5oc1dIbHdmcDBKZWN3UXpZcE9MbUNRLDE6NSwxMDp0ZXh0L3BsYWluLDEwOmEs8J-Uki50eHQsMTotLDE6LSwxOi0s",
+    "statement": "gwar message v3\nGX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE\nserver\n-\n-\nti6Gf6LzOv5i1daxZC4WIdVDMHg\n7UkoxijRwsbq6QM4kFmVYSlZJzpcY_k2NsFGFKyHN9E\n-\nBQUFBQUFBQUFBQUFBQUFBQ\n0\n-\n1700000000000\n1700000000000\nDsNhlXdrRQ7gbe4UBVdnljFC5unNze3l9IUnQN2VoYQ",
+    "revision_hash": "a7alBCwbId2NSetUujS73bfj1f0L5XFO9KCWbOzzxf0"
+  },
+  {
+    "text": "Zażółć 🦀\n1:a,",
+    "mentions": [
+      "dZl3bDCF4_naDRMHHrC0q1D9K_Y",
+      "ti6Gf6LzOv5i1daxZC4WIdVDMHg",
+      "dZl3bDCF4_naDRMHHrC0q1D9K_Y"
+    ],
+    "attachments": [],
+    "signature": {
+      "server_key": "GX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE",
+      "conversation": "dm:NHUPmL1Z_PyUbaRaqr6TO-FUpLU:ts:peer",
+      "author_uid": "NHUPmL1Z_PyUbaRaqr6TO-FUpLU",
+      "key": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+      "certificate": {
+        "account_key": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+        "device_key": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+        "issued_at": 1699999999000,
+        "expires_at": 1707775999000,
+        "signature": "63TqDxTPj6OLusEP521QDTzmwrrycA10DBU-q_zHdH5Ofn_uOW2YTkJCfKmxXwhs5BiJhm9lu1YyzHzyRFneDg"
+      },
+      "certificate_hash": "od853OrRvI7xdr3ZuELM2itbJxVf60ILb52fy7CjDAU",
+      "message_id": "BQUFBQUFBQUFBQUFBQUFBQ",
+      "revision": 0,
+      "previous_revision_hash": "-",
+      "created_at": 1700000000000,
+      "signed_at": 1700000000000,
+      "body_hash": "QVzxhottyEqAfw7doJBDZEnjOtuJKjDnqWhiRlqEmuM",
+      "signature": "kbPmUeLOrEuTNpDt8d1bkyi_YGGNcj2t5F4wPtVtii-d3dhsB2d2VvPB0ZL8LKoUdJuy5WDbOzgG8SxCrxE8Dw",
+      "group_id": "-",
+      "epoch": "-"
+    },
+    "canonical_body": "MjA6WmHFvMOzxYLEhyDwn6aACjE6YSwsMToyLDI3OmRabDNiRENGNF9uYURSTUhIckMwcTFEOUtfWSwyNzp0aTZHZjZMek92NWkxZGF4WkM0V0lkVkRNSGcsMTowLA",
+    "statement": "gwar message v3\nGX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE\ndm:NHUPmL1Z_PyUbaRaqr6TO-FUpLU:ts:peer\n-\n-\nNHUPmL1Z_PyUbaRaqr6TO-FUpLU\ngTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q\nod853OrRvI7xdr3ZuELM2itbJxVf60ILb52fy7CjDAU\nBQUFBQUFBQUFBQUFBQUFBQ\n0\n-\n1700000000000\n1700000000000\nQVzxhottyEqAfw7doJBDZEnjOtuJKjDnqWhiRlqEmuM",
+    "revision_hash": "hUCarPSI6W5YMeLdJb9Nbt3STZS44Z_BzrbL_xnJPHA",
+    "participants": [
+      "NHUPmL1Z_PyUbaRaqr6TO-FUpLU",
+      "ts:peer"
+    ]
+  },
+  {
+    "text": "Zażółć 🦀\n1:a,",
+    "mentions": [
+      "dZl3bDCF4_naDRMHHrC0q1D9K_Y",
+      "ti6Gf6LzOv5i1daxZC4WIdVDMHg",
+      "dZl3bDCF4_naDRMHHrC0q1D9K_Y"
+    ],
+    "attachments": [],
+    "signature": {
+      "server_key": "GX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE",
+      "conversation": "dm:NHUPmL1Z_PyUbaRaqr6TO-FUpLU:ts:peer",
+      "author_uid": "NHUPmL1Z_PyUbaRaqr6TO-FUpLU",
+      "key": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+      "certificate": {
+        "account_key": "iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w",
+        "device_key": "gTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q",
+        "issued_at": 1699999999000,
+        "expires_at": 1707775999000,
+        "signature": "63TqDxTPj6OLusEP521QDTzmwrrycA10DBU-q_zHdH5Ofn_uOW2YTkJCfKmxXwhs5BiJhm9lu1YyzHzyRFneDg"
+      },
+      "certificate_hash": "od853OrRvI7xdr3ZuELM2itbJxVf60ILb52fy7CjDAU",
+      "message_id": "BgYGBgYGBgYGBgYGBgYGBg",
+      "revision": 0,
+      "previous_revision_hash": "-",
+      "created_at": 1700000000000,
+      "signed_at": 1700000000000,
+      "body_hash": "QVzxhottyEqAfw7doJBDZEnjOtuJKjDnqWhiRlqEmuM",
+      "signature": "lMKFV3adbGCw2FcG8H4wJexOCrtlMqCWXge8qTbVsDu40Ppdz6-5nLqP6kJ2hnd5llgDtiZSzDawH-pLTO6xAA",
+      "group_id": "-",
+      "epoch": "-"
+    },
+    "canonical_body": "MjA6WmHFvMOzxYLEhyDwn6aACjE6YSwsMToyLDI3OmRabDNiRENGNF9uYURSTUhIckMwcTFEOUtfWSwyNzp0aTZHZjZMek92NWkxZGF4WkM0V0lkVkRNSGcsMTowLA",
+    "statement": "gwar message v3\nGX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE\ndm:NHUPmL1Z_PyUbaRaqr6TO-FUpLU:ts:peer\n-\n-\nNHUPmL1Z_PyUbaRaqr6TO-FUpLU\ngTl3Dqh9F19Wo1Rmw0x-zMuNipG07jeiXfYPW4_Js5Q\nod853OrRvI7xdr3ZuELM2itbJxVf60ILb52fy7CjDAU\nBgYGBgYGBgYGBgYGBgYGBg\n0\n-\n1700000000000\n1700000000000\nQVzxhottyEqAfw7doJBDZEnjOtuJKjDnqWhiRlqEmuM",
+    "revision_hash": "Pk_lbXCWVgWKJRTyteNLsCal1uHwZGwXjdyEbxPtb7w",
+    "participants": [
+      "ts:peer",
+      "NHUPmL1Z_PyUbaRaqr6TO-FUpLU"
+    ]
   }
 ]
