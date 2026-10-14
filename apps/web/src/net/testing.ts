@@ -71,6 +71,7 @@ export function welcome(overrides: Partial<Welcome> = {}): Welcome {
     clients: [],
     members: [],
     unread: [],
+    conversations: [],
     ice_servers: [],
     file_access: "test-file-access",
     ...overrides,

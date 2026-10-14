@@ -232,11 +232,25 @@ async fn upload_rejects_different_received_bytes() {
 async fn private_targets_bind_the_recipient_uid() {
     let server = TestServer::start().await;
     let mut alice = Client::connect(&server, "alice").await;
-    let bob = Client::connect(&server, "bob").await;
-    let good = alice.signature(&vc_proto::dm_conversation(&alice.welcome.uid, &bob.welcome.uid), "private", &[], &[]);
-    alice.ok("chat.send", send(json!({"client": bob.id()}), "private", &good)).await;
+    let bob_uid = "ts:bob";
+    let bob = server
+        .running
+        .core
+        .remote_join(vc_server::core::bridge::RemoteClient {
+            uid: bob_uid.into(),
+            nickname: "bob".into(),
+            channel: alice.default_channel(),
+            platform: vc_proto::Platform::Ts3,
+            muted: false,
+            deafened: false,
+            away: None,
+        })
+        .await
+        .unwrap();
+    let good = alice.signature(&vc_proto::dm_conversation(&alice.welcome.uid, bob_uid), "private", &[], &[]);
+    alice.ok("chat.send", send(json!({"client": bob}), "private", &good)).await;
     let bad = alice.signature(&vc_proto::dm_conversation(&alice.welcome.uid, &alice.welcome.uid), "private", &[], &[]);
-    assert_eq!(alice.fails("chat.send", send(json!({"client": bob.id()}), "private", &bad)).await, "bad_request");
+    assert_eq!(alice.fails("chat.send", send(json!({"client": bob}), "private", &bad)).await, "bad_request");
 }
 
 #[tokio::test]
@@ -486,8 +500,8 @@ async fn migrated_v2_history_is_readable_edits_fail_cleanly_and_moderators_can_d
     let db = rusqlite::Connection::open(&database).unwrap();
     let version: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
     // Restore the pre-change schema and populate its old signature format.
-    db.execute_batch("DROP INDEX mls_history_hashes; DROP INDEX mls_history_chunks; DROP INDEX mls_history_group_inbox; ALTER TABLE mls_history DROP COLUMN chunk_hash;").unwrap();
-    db.pragma_update(None, "user_version", version - 2).unwrap();
+    db.execute_batch("DROP TABLE conversation_reads; DROP TABLE sealed_message_identities; DROP TABLE sealed_messages; DROP INDEX mls_history_hashes; DROP INDEX mls_history_chunks; DROP INDEX mls_history_group_inbox; ALTER TABLE mls_history DROP COLUMN chunk_hash;").unwrap();
+    db.pragma_update(None, "user_version", version - 3).unwrap();
     db.execute(
         "UPDATE messages SET signature=?1 WHERE id=?2",
         rusqlite::params![json!({"key":public_key(&key),"signature":"v2"}).to_string(), id],

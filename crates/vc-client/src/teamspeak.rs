@@ -497,6 +497,7 @@ fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Option<Out
         | Request::InviteList {}
         | Request::InviteDelete { .. } => return Err(refused("manage this server in the TeamSpeak client")),
         Request::VoiceOffer { .. } => return Err(refused("voice on TeamSpeak servers is native")),
+        Request::Sealed(_) => return Err(refused("encrypted direct messages require a Gwar server")),
         Request::Mls(_) => return Err(refused("MLS requires a Gwar server")),
         Request::Hello(_) | Request::Join(_) => return Err(refused("already connected")),
     };
@@ -571,6 +572,7 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
         // TeamSpeak keeps no member list or read state.
         members: Vec::new(),
         unread: Vec::new(),
+        conversations: Vec::new(),
         ice_servers: Vec::new(),
         file_access: String::new(),
     };

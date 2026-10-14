@@ -272,6 +272,10 @@ impl Core {
         let tags = self.store.member_tags().map_err(storage_error)?;
         self.connect_pending.remove(&member.uid);
         let removal = self.store.remove_member(user_id, &member.uid, delete_messages).map_err(storage_error)?;
+        for (conversation, ids) in removal.sealed {
+            let readers = self.mls_readers(&conversation);
+            self.broadcast(Event::ChatSealedRemoved { conversation, ids }, |s| readers.contains(&s.id));
+        }
         self.mls_reconcile().map_err(storage_error)?;
         if !removal.files.is_empty() {
             self.remove_files();

@@ -758,30 +758,23 @@ async fn welcome_lists_members_including_offline_ones() {
 }
 
 #[tokio::test]
-async fn private_messages_go_to_target_and_sender_only() {
+async fn plaintext_private_messages_between_gwar_members_are_refused() {
     let server = TestServer::start().await;
     let mut a = Client::connect(&server, "alice").await;
     let mut b = Client::connect(&server, "bob").await;
-    let mut c = Client::connect(&server, "carol").await;
-
-    let first = a.ok("chat.send", json!({"target": {"client": c.id()}, "text": "psst"})).await;
-    assert_eq!(first["target"], json!({"client": c.id()}));
-    assert!(first["id"].as_u64().unwrap() >= EPHEMERAL_BASE);
-    assert_eq!(c.next_event("chat.message").await, first);
-    assert_eq!(a.next_event("chat.message").await, first);
-    assert!(b.drain_events("chat.message").await.is_empty());
-
-    // Private messages work across channels and ids keep increasing.
-    c.ok("channel.join", json!({"channel": seed_channel(&c, "AFK")})).await;
-    let second = b.ok("chat.send", json!({"target": {"client": c.id()}, "text": "again"})).await;
-    assert!(second["id"].as_u64().unwrap() > first["id"].as_u64().unwrap());
-    assert_eq!(c.next_event("chat.message").await["text"], "again");
+    let mut spoofed = Client::connect_with(&server, new_key(), |raw, key| {
+        let mut hello = raw.hello(key, "spoofed", None);
+        hello["client"]["platform"] = json!("ts3");
+        hello
+    })
+    .await
+    .unwrap();
+    assert_eq!(spoofed.fails("chat.send", json!({"target":{"client":b.id()},"text":"plaintext"})).await, "forbidden");
+    assert_eq!(a.fails("chat.send", json!({"target":{"client":b.id()},"text":"private"})).await, "forbidden");
+    assert_eq!(a.fails("chat.send", json!({"target":{"client":a.id()},"text":"note"})).await, "forbidden");
+    assert_eq!(a.fails("chat.send", json!({"target":{"client":9999},"text":"x"})).await, "not_found");
     assert!(a.drain_events("chat.message").await.is_empty());
-
-    assert_eq!(a.fails("chat.send", json!({"target": {"client": 9999}, "text": "x"})).await, "not_found");
-    // Messaging yourself delivers once.
-    a.ok("chat.send", json!({"target": {"client": a.id()}, "text": "note"})).await;
-    assert_eq!(a.drain_events("chat.message").await.len(), 1);
+    assert!(b.drain_events("chat.message").await.is_empty());
 }
 
 #[tokio::test]

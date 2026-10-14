@@ -2,6 +2,7 @@
 //! transaction, so it runs inline rather than on a blocking pool.
 
 pub mod mls;
+mod sealed;
 
 use std::{collections::BTreeMap, path::Path};
 
@@ -54,7 +55,7 @@ pub struct UserRow {
 pub struct MemberRow {
     pub id: i64,
     pub member: Member,
-    /// Stored channel messages written by this member.
+    /// Stored channel and sealed messages written by this member.
     pub messages: u32,
 }
 
@@ -70,6 +71,8 @@ impl MemberRow {
 pub struct Removal {
     /// Deleted messages and the channels they were in.
     pub messages: Vec<(MessageId, ChannelId)>,
+    /// Deleted sealed messages, grouped by conversation for participant-only announcements.
+    pub sealed: BTreeMap<String, Vec<MessageId>>,
     /// Files to remove from disk (then [`Store::forget_removed`]).
     pub files: Vec<FileId>,
 }
@@ -286,6 +289,23 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX mls_history_chunks ON mls_history(group_id, recipient_device, sender_uid);
     CREATE INDEX mls_history_hashes ON mls_history(group_id, recipient_device, chunk_hash);
     CREATE INDEX mls_history_group_inbox ON mls_history(recipient_device, group_id, id);
+    "#,
+    r#"
+    CREATE TABLE sealed_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation TEXT NOT NULL, group_id TEXT NOT NULL REFERENCES mls_groups(group_id),
+        author_uid TEXT NOT NULL, author_name TEXT NOT NULL, message_id TEXT NOT NULL,
+        revision INTEGER NOT NULL, epoch INTEGER NOT NULL, ciphertext BLOB NOT NULL,
+        sent_at INTEGER NOT NULL, edited_at INTEGER, deleted INTEGER NOT NULL,
+        UNIQUE(conversation,message_id)
+    );
+    CREATE INDEX sealed_by_conversation ON sealed_messages(conversation,id);
+    CREATE INDEX sealed_by_author ON sealed_messages(author_uid,id);
+    CREATE TABLE sealed_message_identities (conversation TEXT NOT NULL,message_id TEXT NOT NULL,PRIMARY KEY(conversation,message_id));
+    CREATE TABLE conversation_reads (
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        conversation TEXT NOT NULL, message INTEGER NOT NULL,PRIMARY KEY(user_id,conversation)
+    );
     "#,
 ];
 
@@ -670,7 +690,7 @@ impl Store {
     pub fn member_rows(&self, seen_before: Option<i64>) -> Result<Vec<MemberRow>> {
         let tags = self.member_tags()?;
         let mut stmt = self.db.prepare(
-            "SELECT id,uid,nickname,last_seen,(SELECT COUNT(*) FROM messages WHERE author_uid = users.uid),connect_attestation
+            "SELECT id,uid,nickname,last_seen,(SELECT COUNT(*) FROM messages WHERE author_uid = users.uid)+(SELECT COUNT(*) FROM sealed_messages WHERE author_uid = users.uid),connect_attestation
              FROM users WHERE ?1 IS NULL OR last_seen < ?1 ORDER BY last_seen, id",
         )?;
         let rows = stmt.query_map([seen_before], |r| {
@@ -702,6 +722,15 @@ impl Store {
         let tx = self.db.unchecked_transaction()?;
         let mut removal = Removal::default();
         if delete_messages {
+            let mut stmt = tx.prepare("DELETE FROM sealed_messages WHERE author_uid=?1 RETURNING conversation,id")?;
+            let rows = stmt.query_map([uid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, MessageId>(1)?)))?;
+            for row in rows {
+                let (conversation, id) = row?;
+                removal.sealed.entry(conversation).or_default().push(id);
+            }
+            for ids in removal.sealed.values_mut() {
+                ids.sort_unstable();
+            }
             let mut stmt = self.db.prepare("SELECT id,channel FROM messages WHERE author_uid=?1 ORDER BY id")?;
             let rows = stmt.query_map([uid], |r| Ok((r.get::<_, MessageId>(0)?, r.get::<_, ChannelId>(1)?)))?;
             removal.messages = rows.collect::<rusqlite::Result<_>>()?;

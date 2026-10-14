@@ -60,6 +60,8 @@ macro_rules! wire {
 
 mod mls;
 pub use mls::*;
+mod sealed;
+pub use sealed::*;
 
 wire! {
     /// Client → server frame.
@@ -119,9 +121,9 @@ wire! {
         /// Deletes a channel message: your own, or anyone's with `message_manage`.
         #[serde(rename = "chat.delete")]
         ChatDelete { message: MessageId },
-        /// Marks the channel read up to `message` (for this user on every device).
+        /// Marks a channel or conversation read up to `message` on every device.
         #[serde(rename = "chat.read")]
-        ChatRead { channel: ChannelId, message: MessageId },
+        ChatRead { #[serde(flatten)] target: ChatReadTarget, message: MessageId },
         #[serde(rename = "chat.history")]
         ChatHistory {
             channel: ChannelId,
@@ -175,6 +177,8 @@ wire! {
         VoiceOffer { sdp: String },
         #[serde(untagged)]
         Mls(MlsRequest),
+        #[serde(untagged)]
+        Sealed(SealedRequest),
     }
 
     #[serde(deny_unknown_fields)]
@@ -383,6 +387,8 @@ wire! {
         Channel(Channel),
         Message(Box<ChatMessage>),
         History { messages: Vec<ChatMessage> },
+        SealedMessage(Box<SealedMessage>),
+        SealedHistory { sealed: Vec<SealedMessage> },
         Token { token: String },
         Groups { groups: Vec<GroupId> },
         Answer { sdp: String },
@@ -441,6 +447,7 @@ wire! {
         /// The Gwar Connect device certificate in `hello` has expired.
         CertificateExpired,
         Stale,
+        Pending,
         Expired,
         Early,
     }
@@ -467,6 +474,10 @@ wire! {
         ChatMessage(ChatMessage),
         #[serde(rename = "chat.edited")]
         ChatEdited(ChatMessage),
+        #[serde(rename = "chat.sealed")]
+        ChatSealed(SealedMessage),
+        #[serde(rename = "chat.sealed.removed")]
+        ChatSealedRemoved { conversation: String, ids: Vec<MessageId> },
         #[serde(rename = "chat.deleted")]
         ChatDeleted { channel: ChannelId, message: MessageId },
         #[serde(rename = "group.created")]
@@ -488,9 +499,9 @@ wire! {
         VoiceSlot { slot: u32, client: Option<SessionId> },
         #[serde(rename = "voice.closed")]
         VoiceClosed { reason: String },
-        /// This user read `channel` up to `message` (possibly on another device).
+        /// This user read a channel or conversation up to `message` on another device.
         #[serde(rename = "chat.read")]
-        ChatRead { channel: ChannelId, message: MessageId },
+        ChatRead { #[serde(flatten)] target: ChatReadTarget, message: MessageId },
         /// Sent right before the server closes this connection.
         #[serde(rename = "disconnected")]
         Disconnected { reason: LeaveReason },
@@ -521,6 +532,8 @@ wire! {
         /// Read state of every channel this user can read.
         #[serde(default)]
         pub unread: Vec<Unread>,
+        /// Direct messages with unread sealed messages, including offline peers.
+        pub conversations: Vec<ConversationUnread>,
         pub ice_servers: Vec<IceServer>,
         /// Sent as `Authorization: Bearer <token>` with file downloads; valid while this session lasts.
         #[serde(default)]

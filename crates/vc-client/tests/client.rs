@@ -65,6 +65,41 @@ async fn connects_chats_and_reports_errors() {
         }
     }
 
+    let err = a.connection.chat(ChatTarget::Client(b.welcome.session), "plaintext DM").await.unwrap_err();
+    assert!(
+        matches!(err, vc_client::ClientError::Server(ref e) if e.code == ErrorCode::Forbidden && e.message.contains("chat.sealed.send")),
+        "{err}"
+    );
+    a.connection.chat(ChatTarget::Channel(lobby), "still connected").await.unwrap();
+    let ts = server
+        .core
+        .remote_join(vc_server::core::bridge::RemoteClient {
+            uid: "ts:peer".into(),
+            nickname: "TS".into(),
+            channel: lobby,
+            platform: Platform::Ts3,
+            muted: false,
+            deafened: false,
+            away: None,
+        })
+        .await
+        .unwrap();
+    // The actor's joined event must reach the native client's recipient map first.
+    while !matches!(b.events.recv().await.unwrap(), Event::ClientJoined(ref c) if c.id == ts) {}
+    let message = b.connection.chat(ChatTarget::Client(ts), "to TS").await.unwrap();
+    assert!(matches!(b.connection.verify_message(&message), vc_proto::MessageCheck::Verified { .. }));
+    server
+        .core
+        .bridge(vc_server::core::bridge::BridgeMsg::Chat(ts, ChatTarget::Client(b.welcome.session), "from TS".into()))
+        .await;
+    loop {
+        if let Event::ChatMessage(m) = b.events.recv().await.unwrap()
+            && m.text == "from TS"
+        {
+            assert_eq!(b.connection.verify_message(&m), vc_proto::MessageCheck::UnsignedTeamSpeak);
+            break;
+        }
+    }
     let err = a.connection.join(9999, None).await.unwrap_err();
     assert!(matches!(err, vc_client::ClientError::Server(ref e) if e.code == ErrorCode::NotFound), "{err}");
 }

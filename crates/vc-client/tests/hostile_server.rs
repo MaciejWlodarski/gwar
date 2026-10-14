@@ -94,6 +94,7 @@ async fn start_with_reply(
             clients: vec![],
             members: vec![],
             unread: vec![],
+            conversations: vec![],
             ice_servers: vec![],
             file_access: String::new(),
         };

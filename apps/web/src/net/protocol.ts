@@ -12,6 +12,7 @@ import type { MlsHistoryWanted } from "../proto/MlsHistoryWanted";
  */
 import type { Ban } from "../proto/Ban";
 import type { Channel } from "../proto/Channel";
+import type { SealedMessage } from "../proto/SealedMessage";
 import type { ChatMessage } from "../proto/ChatMessage";
 import type { Group } from "../proto/Group";
 import type { Invite } from "../proto/Invite";
@@ -60,6 +61,10 @@ export interface ResponseMap {
   "channel.create": Channel;
   "channel.update": Channel;
   "channel.delete": Empty;
+  "chat.sealed.send": SealedMessage;
+  "chat.sealed.edit": SealedMessage;
+  "chat.delete_own": SealedMessage;
+  "chat.sealed.history": { sealed: SealedMessage[] };
   "chat.send": ChatMessage;
   "chat.edit": ChatMessage;
   "chat.delete": Empty;

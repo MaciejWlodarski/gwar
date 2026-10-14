@@ -6,6 +6,8 @@ import type { Ban } from "../proto/Ban";
 import type { BanNotice } from "../proto/BanNotice";
 import type { Challenge } from "../proto/Challenge";
 import type { Channel } from "../proto/Channel";
+import type { SealedMessage } from "../proto/SealedMessage";
+import type { ConversationUnread } from "../proto/ConversationUnread";
 import type { ChatMessage } from "../proto/ChatMessage";
 import type { ChatTarget } from "../proto/ChatTarget";
 import type { Client } from "../proto/Client";
@@ -50,7 +52,7 @@ const uid: Rule<string> = (v): v is string => str(128)(v) && v.length > 0 && v !
 const ids = array(id, 128);
 const permissions = literal<Permission>(["server_manage", "channel_create", "channel_edit", "channel_delete", "channel_join_locked", "client_move", "client_kick", "token_create", "client_ban", "group_manage", "message_manage", "invite_create", "file_upload", "member_remove", "member_nickname"]);
 const platform = literal<Platform>(["web", "desktop", "mobile", "ts3", "ts6"]);
-const errorCode = literal<ErrorCode>(["bad_request", "not_authenticated", "not_found", "forbidden", "wrong_password", "channel_full", "rate_limited", "conflict", "unavailable", "internal", "banned", "too_large", "quota_exceeded", "certificate_expired", "stale", "expired", "early"]);
+const errorCode = literal<ErrorCode>(["bad_request", "not_authenticated", "not_found", "forbidden", "wrong_password", "channel_full", "rate_limited", "conflict", "unavailable", "internal", "banned", "too_large", "quota_exceeded", "certificate_expired", "stale", "pending", "expired", "early"]);
 const path = (put = false): Rule<string> => (v): v is string => {
   if (!str(2048)(v)) return false;
   try { filePath(v, put ? "PUT" : "GET"); return true; } catch { return false; }
@@ -71,8 +73,9 @@ const group = shape<Group>({ id, name: str(256), permissions: array(permissions,
 const attestation = shape<HandleAttestation>({ account_key: str(128), handle: str(64), issued_at: id, expires_at: id, signature: str(128) });
 const member = shape<Member>({ uid, nickname: str(256), tag: str(128), connect: optional(nullable(attestation)), groups: ids, last_seen: id });
 const unread = shape<Unread>({ channel: id, last_read: id, count: int(1000000), mentions: int(1000000) });
+const conversationUnread = shape<ConversationUnread>({ conversation: str(128), last_read: id, count: int(100) });
 const ice = shape<IceServer>({ urls: array(str(2048), 16), username: optional(nullable(str(1024))), credential: optional(nullable(str(1024))) });
-const welcome = shape<Welcome>({ session: id, uid, server, permissions: array(permissions, 32), groups: array(group, 128), channels: array(channel, 1024), clients: array(client, 4096), members: array(member, 10000), unread: array(unread, 1024), ice_servers: array(ice, 32), file_access: bearer });
+const welcome = shape<Welcome>({ session: id, uid, server, permissions: array(permissions, 32), groups: array(group, 128), channels: array(channel, 1024), clients: array(client, 4096), members: array(member, 10000), unread: array(unread, 1024), conversations: array(conversationUnread, 10000), ice_servers: array(ice, 32), file_access: bearer });
 const target: Rule<ChatTarget> = (v): v is ChatTarget => v === "server" || shape<{ channel: number }>({ channel: id })(v) || shape<{ client: number }>({ client: id })(v);
 const certificate = shape<DeviceCertificate>({ account_key: fixed(32), device_key: fixed(32), issued_at: id, expires_at: id, signature: fixed(64) });
 const commitment: Rule<string> = (v): v is string => v === "-" || fixed(32)(v);
@@ -80,6 +83,7 @@ const conversation: Rule<string> = (v): v is string => str(128)(v) && /^(server|
 const signature = shape<MessageSignature>({ server_key: fixed(32), conversation, group_id: commitment, epoch: str(32), author_uid: fixed(20), key: fixed(32), certificate: nullable(certificate), certificate_hash: commitment, message_id: fixed(16), revision: int(4294967295), previous_revision_hash: commitment, created_at: id, signed_at: id, body_hash: fixed(32), signature: fixed(64) });
 export const attachment = shape<Attachment>({ id: str(64), name: str(512), mime: str(100), size: int(MAX_FILE_BYTES, 1), url: path(), width: optional(nullable(int(4294967295))), height: optional(nullable(int(4294967295))), sha256: (v): v is string => v === "" || fixed(32)(v) });
 const message = shape<ChatMessage>({ id, target, author: id, author_uid: uid, author_name: str(256), text, sent_at: id, mentions: optional(array(uid, 128)), attachments: optional(array(attachment, 10)), edited_at: optional(nullable(id)), signature: optional(nullable(signature)) });
+const sealedMessage = shape<SealedMessage>({ id, conversation, group: fixed(32), epoch: id, author_uid: fixed(20), author_name: str(256), message_id: fixed(16), revision: int(4294967295), ciphertext: str(32768), sent_at: id, edited_at: optional(nullable(id)), deleted: bool });
 const notice = shape<BanNotice>({ by: str(256), reason: optional(nullable(text)), until: optional(nullable(id)) });
 export const error = shape<ErrorBody>({ code: errorCode, message: text, ban: optional(nullable(notice)) });
 const leave: Rule<LeaveReason> = (v): v is LeaveReason => {
@@ -110,13 +114,14 @@ export const events: { [K in EventName]: Rule<EventData<K>> } = {
   "mls.welcome": shape({ group: mlsGroupId }), "mls.history": shape({ group: mlsGroupId }),
   "mls.history.wanted": mlsWanted,
 
+  "chat.sealed": sealedMessage, "chat.sealed.removed": shape({ conversation, ids: array(id, 1000) }),
   challenge, "server.updated": server, "channel.created": channel, "channel.updated": channel,
   "channel.deleted": shape({ channel: id }), "client.joined": client, "client.updated": client,
   "client.left": shape({ client: id, reason: leave }), "chat.message": message, "chat.edited": message,
   "chat.deleted": shape({ channel: id, message: id }), "group.created": group, "group.updated": group,
   "group.deleted": shape({ group: id }), "member.updated": member, "member.removed": shape({ uid }),
   "voice.talking": shape({ client: id, talking: bool }), "voice.slot": shape({ slot: int(7), client: nullable(id) }),
-  "voice.closed": shape({ reason: text }), "chat.read": shape({ channel: id, message: id }), "disconnected": shape({ reason: leave }),
+  "voice.closed": shape({ reason: text }), "chat.read": (v): v is EventData<"chat.read"> => shape({ channel: id, message: id })(v) || shape({ conversation, message: id })(v), "disconnected": shape({ reason: leave }),
 };
 export const responses: { [K in Op]: Rule<ResponseMap[K]> } = {
   "mls.device.publish": empty, "mls.key_packages.publish": shape({ count: int(20) }),
@@ -134,6 +139,8 @@ export const responses: { [K in Op]: Rule<ResponseMap[K]> } = {
 
   hello: serverProof, join: welcome, ping: empty, "client.update": empty, "client.move": empty, "client.kick": empty,
   "channel.join": empty, "channel.leave": empty, "channel.create": channel, "channel.update": channel, "channel.delete": empty,
+  "chat.sealed.send": sealedMessage, "chat.sealed.edit": sealedMessage, "chat.delete_own": sealedMessage,
+  "chat.sealed.history": shape({ sealed: array(sealedMessage, 100) }),
   "chat.send": message, "chat.edit": message, "chat.delete": empty, "chat.read": empty,
   "chat.history": shape({ messages: array(message, 100) }), "server.update": empty,
   "token.create": shape({ token: str(256) }), "token.redeem": shape({ groups: ids }),
