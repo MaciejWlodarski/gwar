@@ -170,9 +170,10 @@ one blob. `ds` wraps this with Gwar's rules:
   state for each commit, so a rejected commit leaves nothing behind.
   Processes a commit at the observer's epoch, checks the commit time (see
   "Commit time") and Gwar's structural rules on the resulting tree
-  (well-formed credentials, one leaf per device key, an update keeps uid and
-  device key, the descriptor, external senders and required capabilities
-  unchanged, the membership rule of the kind), merges it, and checks the
+  (the client's "Acceptance" rules below, with no revocation view: only
+  add, remove and external-init proposals; leaves the commit introduces or
+  changes certified at its time; an external commit replaces only the
+  joiner's own earlier leaf), merges it, and checks the
   uploaded GroupInfo: the observer's new GroupContext and confirmation tag, a
   ratchet tree extension equal to the observer's tree, and a signature by one
   of the members. Returns the sender (`Member(index)` or `NewMember`), the
