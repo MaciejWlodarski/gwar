@@ -175,8 +175,8 @@ credential, the OpenMLS provider and Gwar's own per-group records.
   device's revocation view (account key, device key, revoked at) from its
   Connect feed. Leaf validation (design: "Identities in MLS") runs on every
   Welcome, external join, and staged commit before merge, with these rules:
-  well-formed credential; current at the commit's processing time; one leaf
-  per device key; an update keeps uid and device key; the membership rule of
+  well-formed credential; current at the commit's time (see "Commit time");
+  one leaf per device key; an update keeps uid and device key; the membership rule of
   the descriptor's kind (direct message: only devices of its two uids;
   channel and server: any well-formed device, the server's word); the
   descriptor unchanged; the external senders unchanged and equal to the
@@ -220,10 +220,11 @@ credential, the OpenMLS provider and Gwar's own per-group records.
   signed by the device key.
 - A bundle is HPKE base mode (`DHKEM(X25519)`, HKDF-SHA256, AES-128-GCM, as the
   MLS suite) to the recipient's device HPKE key, `info = "gwar history v1" ‖
-  group_id`. The plaintext lists `(epoch u64 BE, key 32 bytes)` entries for
-  one group, sorted by epoch, unique.
-- The sender's device key signs
-  `gwar history bundle v1\n{server_key}\n{group_id}\n{recipient_device_key}\n{recipient_hpke_key}\n{sender_device_key}\n{created_at}\n{sha256(enc ‖ ciphertext)}`.
+  group_id`. A bundle is sent as **chunks** of at most 1000 epochs each; a
+  chunk's plaintext lists `(epoch u64 BE, key 32 bytes)` entries for one
+  group, sorted by epoch, unique, all within its range.
+- The sender's device key signs each chunk:
+  `gwar history chunk v1\n{server_key}\n{group_id}\n{recipient_device_key}\n{recipient_hpke_key}\n{sender_device_key}\n{first_epoch}\n{last_epoch}\n{created_at}\n{sha256(enc ‖ ciphertext)}`.
 - The recipient accepts it only from a sender whose device key is a current
   member of the group in the recipient's current epoch, imports only epochs it
   lacks (a key it derived itself always wins), and never overwrites.
@@ -284,10 +285,31 @@ plaintext attachment. `MessageSignature` gains `group_id` and `epoch`
 (strings). The server keeps verifying plaintext conversations as today, with
 v3.
 
+### Commit time
+
+Every commit carries its time in the `PublicMessage` authenticated data,
+signed with the commit by its sender: `gwar commit v1\n{committed_at}` (Unix
+ms). The server rejects a commit whose time is more than five minutes from
+its own clock, or earlier than the previous commit's time of that group.
+Clients judge a commit's credentials **at that time** (expiry and revocation),
+the same live and on replay, and also reject a live commit (received through
+`mls.commit` and processed at once) more than five minutes from their clock.
+Whether a leaf may stay is then judged separately at the current time (see
+"Catching up vs. sending").
+
+### Size limits
+
+Decoded sizes: a key package 4 KiB; a commit, GroupInfo or Welcome 128 KiB
+each; a history bundle chunk 48 KiB. The gateway's limit for one WebSocket
+message from an authenticated session rises to 512 KiB (base64 and JSON
+overhead included); before authentication it stays as it is. List replies are
+paged (`limit` at most 100 entries and 1 MiB). Direct messages stay far below
+these limits; groups whose GroupInfo can outgrow them (server-wide chat on a
+large server) are specified with step 4, which moves such blobs to HTTP.
+
 ### Delivery service requests
 
-All binary fields are base64url. Sizes are capped (a key package 4 KiB, a
-GroupInfo or commit 256 KiB, a Welcome 256 KiB, a history bundle 64 KiB).
+All binary fields are base64url.
 
 | Request | Reply | Rule |
 | --- | --- | --- |
@@ -298,36 +320,43 @@ GroupInfo or commit 256 KiB, a Welcome 256 KiB, a history bundle 64 KiB).
 | `mls.group.create {conversation, group_info}` | `{group}` | the GroupInfo of epoch 0, holding only the creator's device; `Observer::create` accepts it; the session may create it (below); first wins per `(conversation, incarnation)`, later attempts get `conflict` with the existing group id |
 | `mls.group_info {group}` | `{group_info, epoch}` | the session may read the conversation |
 | `mls.commit {group, epoch, commit, group_info, welcome?}` | `{epoch}` or error `stale` | below |
-| `mls.log {group, since, limit}` | `{entries: [{epoch, commit}]}` | commits from epoch `since`, 90 days kept |
-| `mls.groups {}` | `{groups: [{conversation, group, epoch}]}` | every group the session may read |
-| `mls.history.share {group, recipient, bundle}` | `{}` | stored per recipient device, at most three sender uids per (group, recipient) |
-| `mls.history.fetch {group}` | `{bundles}` | bundles for the session's device |
-| `mls.welcomes {}` | `{welcomes: [{group, welcome}]}` | Welcomes for the session's device; each deleted once fetched |
+| `mls.log {group, since, limit?}` | `{entries: [{epoch, proposals, commit}]}` | from epoch `since`; `proposals` are the server proposals the commit references, to be processed before it; 90 days kept |
+| `mls.groups {}` | `{groups: [{conversation, group, epoch}]}` | the live group of every conversation the session may read |
+| `mls.welcomes {}` | `{welcomes: [{id, group, welcome}]}` | for the session's device; repeatable |
+| `mls.welcomes.ack {ids}` | `{}` | after the client stored the joined group durably; deletes them |
+| `mls.history.share {group, recipient, chunk}` | `{}` | below |
+| `mls.history.fetch {group?}` | `{chunks: [{id, group, sender_uid, chunk}]}` | for the session's device; repeatable |
+| `mls.history.ack {ids}` | `{}` | after durable import; deletes them |
+| `mls.history.request {group}` | `{}` | asks the group's online member devices to share again (event `mls.history.wanted {group, device}`), at most once a minute per device and group |
 
-Events: `mls.commit {group, epoch, commit}`, `mls.proposal {group, epoch,
-proposal}`, `mls.welcome {group}`, `mls.history {group}`; the last two only
-announce that `mls.welcomes` or `mls.history.fetch` has something.
+Events: `mls.commit {group, epoch, proposals, commit}`, `mls.proposal {group,
+epoch, proposal}`, `mls.welcome {group}`, `mls.history {group}`,
+`mls.history.wanted {group, device}`; `mls.welcome` and `mls.history` only
+announce that something can be fetched.
 
 ### Commit ordering
 
 The core actor handles `mls.commit` atomically. The commit must be for
-`group` at exactly the stored epoch, else `stale`; then
-`Observer::commit` must accept it, else `bad_request`. An external join
-(`NewMember`) is allowed only for a session whose uid may read the
-conversation, and its new leaf must be that session's device. The commit, the
-new GroupInfo, the observer state, the leaf map and the Welcome are stored in
-one transaction; then `mls.commit` goes to every session that may read the
-conversation, and the Welcome to its recipients.
+`group` at exactly the stored epoch, else `stale`; then `Observer::commit`
+must accept it, else `bad_request`. An external join (`NewMember`) is allowed
+only for a session whose uid may read the conversation, and its new leaf must
+be that session's device. `Observer::commit` works on a copy loaded from the
+stored state: only after the transaction that stores the commit (with the
+server proposals it references), the new GroupInfo, the observer state, the
+leaf map and the Welcome has succeeded does the actor keep the new observer
+(or simply reload it next time). Then `mls.commit` goes to every session that
+may read the conversation, and the Welcome to its recipients.
 
 ### Removal proposals
 
-The server proposes `Remove` (signed by its key, via `Observer::propose_remove`)
-for every leaf of a device that: was revoked (Connect feed), belongs to a
-member who was removed from the server or banned, or (direct messages) does
-not belong to a participant. Proposals are re-issued for the new epoch after
-each commit while the leaf is still there, and sent as `mls.proposal` to
-sessions that may read the conversation. Any member commits them; the
-server only checks that a commit is well-formed and in order.
+The server proposes `Remove` (signed by its key, via
+`Observer::propose_remove`) for every leaf of a device that: was revoked
+(Connect feed), belongs to a member who was removed from the server or banned,
+or (direct messages) does not belong to a participant. Proposals are issued
+again for each new epoch while the leaf is still there, and sent as
+`mls.proposal` to sessions that may read the conversation. Any member commits
+them; the server only checks that a commit is valid and in order. A proposal
+a commit references is stored with that commit's log entry.
 
 ### Who may do what
 
@@ -338,17 +367,30 @@ server only checks that a commit is well-formed and in order.
 
 ### Storage (server)
 
-New tables (migration in `store.rs`): `mls_devices(device_key, uid,
-hpke_key, created_at, signature)`, `mls_key_packages(ref, device_key, uid,
-package, last_resort, not_after)`, `mls_groups(group_id, conversation,
-incarnation, epoch, group_info, observer, created_at)`, `mls_log(group_id, epoch,
-commit, created_at)`, `mls_leaves(group_id, leaf, device_key, uid)`,
-`mls_welcomes(device_key, group_id, welcome, created_at)`,
-`mls_history(group_id, recipient_device, sender_uid, bundle, created_at)`.
-Expired key packages, log entries older than 90 days and Welcomes older than
-90 days are pruned with the existing periodic cleanup. Deleting a
-conversation (channel, member removal of a direct-message participant)
-deletes its groups.
+New tables (migration in `store.rs`):
+
+- `mls_devices(device_key, uid, hpke_key, created_at, signature)`;
+- `mls_key_packages(ref, device_key, uid, package, last_resort, not_after)`;
+- `mls_groups(group_id, conversation, incarnation, epoch, committed_at,
+  group_info, observer, created_at)`; one live group per conversation, the
+  highest incarnation;
+- `mls_log(group_id, epoch, proposals, commit, committed_at)`;
+- `mls_leaves(group_id, leaf, device_key, uid)`;
+- `mls_welcomes(id, device_key, group_id, welcome, created_at)`;
+- `mls_history(id, group_id, recipient_device, sender_uid, first_epoch,
+  last_epoch, chunk, created_at)`;
+- `sealed_messages(id, conversation, group_id, author_uid, author_name,
+  message_id, revision, epoch, ciphertext, sent_at, edited_at, deleted)`, with
+  the server's numeric message id as today, unique `(conversation,
+  message_id)`;
+- `conversation_reads(user_id, conversation, message)`.
+
+Expired key packages, and log entries, Welcomes and history chunks older than
+90 days are pruned with the existing periodic cleanup. Groups of a direct
+message are never deleted: a participant removed from the server loses their
+devices' leaves by removal proposals, and if they come back, their devices
+join the same group again. A deleted channel takes its groups with it (a new
+channel is a new conversation).
 
 ## 3. Encrypted direct messages
 
@@ -366,28 +408,38 @@ deletes its groups.
 - Devices without a key package (never online since the update), and new
   devices, join on connect by external commit, in the background (design:
   "Joining").
-- History: when a member device sees a new leaf in a direct-message group, it
-  sends a bundle (above) to that device after its next commit is accepted,
-  unless the recipient already has bundles from three uids. A device that
-  cannot open a message says "Earlier messages will appear when another
-  member is online."
+- History: after processing an accepted commit that admits a device (an add
+  or an external join) in a group whose descriptor says `history = 1`, every
+  member device that holds epoch keys queues a share for that device in its
+  outbox and sends it, retrying after reconnects until the server accepted
+  it. The server keeps chunks from at most three sender uids per (group,
+  recipient) and drops further senders. A device missing epoch keys after
+  importing what it received calls `mls.history.request`; online members
+  answer `mls.history.wanted` by sharing again (by their own evidence, see
+  "History bundles"). Until keys arrive, a message the device cannot open
+  says "Earlier messages will appear when another member is online."
 
 ### Messages
 
 | Request | Reply | Rule |
 | --- | --- | --- |
-| `chat.sealed.send {conversation, message_id, epoch, ciphertext}` | `SealedMessage` | the session may write the conversation; `message_id` unique in it; ciphertext at most 24 KiB |
-| `chat.sealed.edit {conversation, message_id, revision, epoch, ciphertext}` | `SealedMessage` | only the author's uid; `revision` above the stored one |
-| `chat.delete_own {conversation, message_id, revision, epoch, ciphertext}` | `SealedMessage` | the signed deletion revision; stored with `deleted`, no further edits |
+| `chat.sealed.send {conversation, group, epoch, message_id, ciphertext}` | `SealedMessage` | the session may write the conversation; `group` is its live group; `message_id` unique in it; ciphertext at most 24 KiB |
+| `chat.sealed.edit {conversation, group, epoch, message_id, revision, ciphertext}` | `SealedMessage` | only the author's uid; `group` live; `revision` above the stored one |
+| `chat.delete_own {conversation, group, epoch, message_id, revision, ciphertext}` | `SealedMessage` | the signed deletion revision; stored with `deleted`, no further edits |
 | `chat.sealed.history {conversation, before?, limit?}` | `{messages}` | as channel history |
 | `chat.read {conversation, message}` | `{}` | read marks per conversation |
 
-`SealedMessage {id, conversation, author_uid, author_name, message_id,
-revision, epoch, ciphertext, sent_at, edited_at?, deleted}`; event
-`chat.sealed` for new messages, edits and deletions. The server stores the
-latest revision only (as today), keeps at most the newest 1000 per
-conversation, and counts unread messages per conversation for each
-participant (no mentions: they are inside the ciphertext).
+`SealedMessage {id, conversation, group, epoch, author_uid, author_name,
+message_id, revision, ciphertext, sent_at, edited_at?, deleted}`; event
+`chat.sealed` for new messages, edits and deletions, to the sessions of both
+participants. The server stores the latest revision only (as today), keeps
+at most the newest 1000 per conversation, and counts unread messages per
+conversation for each participant (no mentions: they are inside the
+ciphertext). A participant without a read mark has read nothing in that
+conversation (unlike channels, where a missing mark starts at the newest
+message). `Welcome` gains `conversations: [{conversation, last_read, count}]`
+for every direct message with unread messages, and the `chat.read` event gains
+the conversation form, for the user's other sessions.
 
 ### Client
 
