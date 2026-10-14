@@ -59,11 +59,12 @@ arrays or number arrays; output bytes are number arrays. For example:
 
 ```js
 agent.execute({ device_hpke_key: null });
-// After create, persist, then send mls.group.create. On reply {group}:
-agent.execute({ created: { server, group } });
-// Persist created before sending, committing or sharing history.
-// Alternatively, on creation conflict, persist abandon before joining the winner:
-agent.execute({ abandon: { server, group: losingGroup } });
+// After create, persist, then send mls.group.create. With the group from its
+// reply {group} or from conflict (true: ours won; false: join the winner):
+agent.execute({ settle: { server, group, winner } });
+// Persist before sending, committing, sharing history or joining the winner.
+// After a restart, re-send a still-creating group's GroupInfo:
+agent.execute({ creation: { server, group } });
 agent.execute({ welcome: { server, id: welcomeId, bytes: welcomeBytes } });
 agent.execute({ gate: { server, group, now: Date.now(), revocations: [] } });
 agent.execute({ epoch: { server, group, epoch: '18446744073709551615' } });
@@ -73,7 +74,7 @@ agent.execute({ reconcile: {
 } });
 ```
 
-Operations are `key_packages`, `last_resort_key_package`, `create`, `created`, `abandon`, `welcome`,
+Operations are `key_packages`, `last_resort_key_package`, `create`, `creation`, `settle`, `welcome`,
 `join_external`, `commit`, `receive`, `proposal`, `pending`, `reconcile`, `gate`,
 `sending_key`, `share_history`, `import_history`, `device_hpke_key`, `group`,
 `epoch`, and `outbox`. Their native signatures and recovery contract are in
@@ -82,9 +83,8 @@ All epoch values are canonical decimal strings, preserving full u64 precision.
 Other numeric inputs must be safe integers. Device creation time must be positive;
 the HPKE statement returned by `device_hpke_key` preserves that time exactly.
 Unknown fields are rejected. `create` leaves `group.status` and `gate.status`
-at `creating`, with no sending key, commits or history sharing. Only `created`
-activates it; `abandon` is refused after activation. Both changes must be
-persisted. Eviction deletes all OpenMLS records for that group while retaining
+at `creating`, with no sending key, commits or history sharing, until `settle`
+activates or deletes it; its changes must be persisted. Eviction deletes all OpenMLS records for that group while retaining
 application epoch keys, its pin and last member checkpoint.
 Revocations are `{account_key, device_key, revoked_at}` entries, using the
 earliest timestamp if repeated. Missing records return `null`.

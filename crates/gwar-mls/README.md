@@ -23,8 +23,7 @@ take_changes() -> Changes
 key_packages(n: usize, now: i64) -> Result<Vec<Vec<u8>>>
 last_resort_key_package(now: i64) -> Result<Vec<u8>>
 create(descriptor: SignedDescriptor) -> Result<Vec<u8>> // GroupInfo; Creating
-created(server: &str, id: &[u8; 32]) -> Result<()>
-abandon(server: &str, id: &[u8; 32]) -> Result<()>
+settle(server: &str, id: &[u8; 32], winner: &[u8; 32]) -> Result<bool>
 welcome(server: &str, id: &str, bytes: &[u8]) -> Result<WelcomeResult>
 join_external(server: &str, bytes: &[u8], now: i64,
               revocations: &dyn Revocations) -> Result<Outbox>
@@ -41,6 +40,7 @@ import_history(server: &str, id: &[u8; 32], bytes: &[u8]) -> Result<()>
 
 // Queries on &Agent:
 device_hpke_key() -> DeviceHpkeKey
+creation(server: &str, id: &[u8; 32]) -> Result<Vec<u8>> // GroupInfo while Creating
 group(server: &str, id: &[u8; 32]) -> Option<&GroupRecord>
 epoch(server: &str, id: &[u8; 32], epoch: u64) -> Option<&EpochRecord>
 outbox(server: &str, id: &[u8; 32]) -> Option<&Outbox>
@@ -51,12 +51,18 @@ sending_key(server: &str, id: &[u8; 32], now: i64,
 ```
 
 `create` returns a TLS MLS GroupInfo message in persisted `Creating` state.
-After the server replies to `mls.group.create` with `{group}`, call
-`created(server, id)` and persist its changes to activate the group and derive
-epoch zero. Until then, `gate.status` is `creating` (`rejoin` is false), and
-sending, commits and history sharing are blocked. Incoming commits/proposals,
-Welcomes and external joins cannot activate that tentative group. A repeated
-`created` or one for a group outside `Creating` is an error.
+Until it is settled, `gate.status` is `creating` (`rejoin` is false), and
+sending, commits and history sharing are blocked; incoming commits, proposals,
+Welcomes and external joins cannot activate it. Register it with
+`mls.group.create`, then call `settle(server, id, winner)` with the group the
+server holds for the conversation: the `{group}` reply, or the group named by
+`conflict`. If `winner` is this group (also when a lost reply or a restart made
+the device register it again), it becomes **Active** with epoch zero derived and
+`settle` returns `true`; catch up through the log from there. Otherwise its
+OpenMLS group and record (pin) are deleted and it returns `false`: persist
+that, then join the winner by Welcome or external commit. A restarted device
+re-exports the GroupInfo of a `Creating` group with `creation`. Settling a
+group outside `Creating` is an error.
 
 Key packages are bare TLS
 KeyPackages; commits, GroupInfos and Welcomes are TLS MLS messages. `Outbox`
@@ -157,19 +163,11 @@ Feed authoritative log information to `reconcile`:
 | Any other rejection | Keep and retry with caller backoff; `Retry` |
 | `Pruned` with oldest epoch later than source | Delete OpenMLS state and rejoin; `Rejoin` |
 
-When concurrent DM creations produce a server `conflict`, call `abandon` on
-this device's losing group, persist its changes, then join the winner by Welcome
-or external commit. It succeeds only for a `Creating` group created by this
-device; after `created`, abandonment is refused even at epoch zero with no
-outbox. It deletes that OpenMLS group and its group record (including the pin);
-no application epoch keys have been derived. Other groups, key packages
-and the device HPKE key remain unchanged. Every other case is an error.
-
 A losing or expired external join is deleted and returns `Rejoin`. Pins,
 checkpoints, Welcome ids and old keys survive deleting OpenMLS membership.
 After validating an own-leaf removal, eviction deletes the OpenMLS group
 before advancing its epoch, so its old private epoch key pairs are deleted too.
-Eviction, pruned recovery, losing/expired external joins and abandonment leave
+Eviction, pruned recovery, losing/expired external joins and lost creations leave
 no OpenMLS records for that group. Eviction keeps the last member epoch
 checkpoint and application epoch keys; rejoining requires a newer GroupInfo.
 Rebuilds use the current time and revocation view. No method retries network
@@ -221,7 +219,7 @@ node scripts/mls-wasm/smoke.mjs
 All commands passed for round 2. The MLS suite has 55 unit tests and 11
 observer integration tests. The workspace suite passed 353 tests, with 5
 existing TeamSpeak tests ignored. Regressions cover persisted creation
-acceptance, rejection of abandonment after acceptance, complete eviction
+acceptance, settling a lost reply and a lost creation, complete eviction
 cleanup (including a losing pending commit and referenced proposals), pruned
 membership and external-join cleanup, unrelated storage preservation, and
 the 480,000-byte aggregate gzip limit.
@@ -236,7 +234,7 @@ linker wrapper setting `DYLD_LIBRARY_PATH` to that same toolchain's `lib`
 directory so `rust-lld` could find `libLLVM.dylib`. These are local environment
 adjustments; CI uses the pinned tools in its Linux job.
 
-The Node smoke test passed creation acceptance, abandonment, eviction cleanup,
+The Node smoke test passed creation settlement (won and lost), eviction cleanup,
 commit recovery, Welcome deduplication, matching exporters, history and rollback.
 No live Gwar or TeamSpeak server was contacted; workspace integration tests
 use their own local test services. Remote CI has not been run for these fixes.

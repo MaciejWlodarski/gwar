@@ -602,41 +602,38 @@ impl Agent {
         })
     }
 
-    /// Confirm the server's `mls.group.create` reply `{group}`; persist before use.
-    pub fn created(&mut self, server: &str, id: &[u8; 32]) -> Result<()> {
+    /// The GroupInfo of a group still **Creating**, to register it again
+    /// after a lost reply or a crash.
+    pub fn creation(&self, server: &str, id: &[u8; 32]) -> Result<Vec<u8>> {
+        if self.poisoned {
+            return Err(AgentError::Reload);
+        }
+        let key = group_key(server, id);
+        if self.groups.get(&key).is_none_or(|r| r.status != Status::Creating) {
+            return Err(Invalid("not creating"));
+        }
+        wire(self.mls(&key)?.export_group_info(self.provider.crypto(), &self.signer, true).map_err(err("group info"))?)
+    }
+
+    /// Settles a creation with the server's answer to `mls.group.create`:
+    /// the group it holds for the conversation, from `{group}` or `conflict`.
+    /// Returns whether this device's group is that group; a losing group is
+    /// deleted, with its pin, so the device can join the winner.
+    pub fn settle(&mut self, server: &str, id: &[u8; 32], winner: &[u8; 32]) -> Result<bool> {
         self.operation(|a| {
             let key = group_key(server, id);
             if a.groups.get(&key).is_none_or(|r| r.status != Status::Creating) {
                 return Err(Invalid("not creating"));
             }
-            let group = a.mls(&key)?;
-            a.derived(&key, &group)
-        })
-    }
-
-    /// Discard this device's losing creation before joining the server's winner.
-    pub fn abandon(&mut self, server: &str, id: &[u8; 32]) -> Result<()> {
-        self.operation(|a| {
-            let key = group_key(server, id);
-            let record = a.groups.get(&key).ok_or(Invalid("unknown group"))?;
-            let descriptor = SignedDescriptor::parse(&record.descriptor).ok_or(Invalid("descriptor"))?;
             let mut group = a.mls(&key)?;
-            if record.status != Status::Creating
-                || descriptor.creator.device_key() != a.credential.device_key()
-                || descriptor.creator.uid() != a.credential.uid()
-                || group.epoch().as_u64() != 0
-                || a.outbox.contains_key(&key)
-            {
-                return Err(Invalid("cannot abandon"));
+            if winner == id {
+                a.derived(&key, &group)?;
+                return Ok(true);
             }
+            // A creating group has no epoch keys, outbox or other members.
             group.delete(a.provider.storage()).map_err(err("delete group"))?;
             a.groups.remove(&key);
-            let prefix = format!("{key}/");
-            let epochs: Vec<_> = a.epochs.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
-            for epoch in epochs {
-                a.epochs.remove(&epoch);
-            }
-            Ok(())
+            Ok(false)
         })
     }
 

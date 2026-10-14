@@ -243,15 +243,15 @@ credential, the OpenMLS provider and Gwar's own per-group records.
 - **Pins**: per `(server_key, conversation, incarnation)` the group id first
   joined; only incarnation zero is accepted until the channels step.
   `create` persists a tentative **Creating** group: the gate reports
-  `creating`, without a sending key, commits or history sharing. After the
-  server's `mls.group.create` reply `{group}`, `created(server, id)` moves
-  it to **Active** and derives epoch zero; persist before using it. On a
-  creation `conflict`, `abandon(server, id)` discards this device's losing
-  creation so it can join the winner by Welcome or external commit. It is
-  allowed only in **Creating**, and deletes its OpenMLS group and group
-  record (pin); no application epoch keys have been derived. After `created`,
-  abandonment is refused even at epoch zero without an outbox. Persist before
-  joining the winner; all other cases fail.
+  `creating`, without a sending key, commits or history sharing.
+  `settle(server, id, winner)` takes the group the server holds for the
+  conversation (the `mls.group.create` reply `{group}`, or the group its
+  `conflict` names): if it is this group, the group becomes **Active** and
+  epoch zero is derived; otherwise the losing creation's OpenMLS group and
+  record (pin) are deleted, so the device can join the winner by Welcome or
+  external commit. A device that lost the reply or restarted registers the
+  same group again (`creation` re-exports its GroupInfo); the `conflict`
+  then names its own group. Persist before using or leaving the group.
 - **Removal of this device**: a commit that removes the device's own leaf is
   processed as any other, but ends its membership: no epoch key is exported
   for the new epoch (OpenMLS refuses, and the device must not have it), the
@@ -260,7 +260,7 @@ credential, the OpenMLS provider and Gwar's own per-group records.
   are deleted before advancing the epoch, and the group is marked **removed**,
   keeping its application epoch keys and pin. The same complete OpenMLS
   cleanup applies to Rejoin/pruned recovery, losing or expired external joins,
-  and abandonment (which also drops the tentative pin). If the client may
+  and a lost creation (which also drops the tentative pin). If the client may
   still read the conversation, it rejoins by external commit from the current
   GroupInfo, whose epoch is later than the checkpoint.
 - **Epoch keys**: after every merge and join that leaves the device a member,
@@ -608,11 +608,11 @@ messages: like signed messages, their author is inside the signature.
 - Opening a conversation: `mls.groups` already lists it, or the client creates
   it: a descriptor (kind `dm`, incarnation 0, history 1), then agent `create`
   with its own leaf, persisting the tentative **Creating** group before
-  registering it with `mls.group.create`. On reply `{group}`, call
-  `created(server, id)` and persist **Active**; then
-  `mls.key_packages.claim {uids: [peer, self]}` and one `mls.commit` adding
-  every claimed device, with its Welcome. On `conflict`, call `abandon` and
-  persist its deletion before joining the winner by Welcome or external commit.
+  registering it with `mls.group.create`, then `settle` with the group of the
+  reply `{group}` or of `conflict`. If it won: `mls.key_packages.claim {uids:
+  [peer, self]}` and one `mls.commit` adding every claimed device not yet in
+  the group, with its Welcome; if not, join the winner by Welcome or external commit. A group
+  still **Creating** after a restart is registered again.
 - Devices without a key package (never online since the update), and new
   devices, join on connect by external commit, in the background (design:
   "Joining").

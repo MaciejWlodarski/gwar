@@ -59,13 +59,14 @@ enum Request {
     Create {
         descriptor: Vec<u8>,
     },
-    Created {
+    Creation {
         server: String,
         group: [u8; 32],
     },
-    Abandon {
+    Settle {
         server: String,
         group: [u8; 32],
+        winner: [u8; 32],
     },
     Welcome {
         server: String,
@@ -181,8 +182,8 @@ impl Agent {
                 a.create(SignedDescriptor::parse(&descriptor).ok_or_else(|| error("invalid descriptor"))?)
                     .map_err(error)?,
             ),
-            Request::Created { server, group } => output(a.created(&server, &group).map_err(error)?),
-            Request::Abandon { server, group } => output(a.abandon(&server, &group).map_err(error)?),
+            Request::Creation { server, group } => output(a.creation(&server, &group).map_err(error)?),
+            Request::Settle { server, group, winner } => output(a.settle(&server, &group, &winner).map_err(error)?),
             Request::Welcome { server, id, bytes } => output(a.welcome(&server, &id, &bytes).map_err(error)?),
             Request::JoinExternal { server, bytes, now, revocations } => {
                 output(a.join_external(&server, &bytes, now, &revocations).map_err(error)?)
