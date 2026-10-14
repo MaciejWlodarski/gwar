@@ -22,11 +22,10 @@ abort-on-panic and stripped symbols, followed by Binaryen `-Oz --converge`
 `js` feature and getrandom 0.2's `js` feature are enabled. Production wasm
 logging is disabled. CI builds this exact target, runs the smoke test, and
 fails if all emitted wasm and JavaScript files exceed **480,000 bytes gzip**
-(level 9, each file compressed separately). This budget leaves room for
-message encryption; load the module on first use and cache it. The round-2
-build measured with Rust 1.99.0 and Node 22.23.3 is **450,867 bytes gzip**
-(wasm 447,824; minified loader 2,852; inline JavaScript 191), leaving 29,133
-bytes of headroom. Generated files in `pkg` are
+(level 9, each file compressed separately). Load the module on first use and cache it. Including chat encryption and
+runtime inventory, the build measured with Rust 1.99.0 and Node 22.23.3 is
+**467,108 bytes gzip** (wasm 464,065; minified loader 2,852; inline JavaScript
+191), leaving 12,892 bytes of headroom. Generated files in `pkg` are
 ignored; Cargo metadata resolves the artifact directory, including custom
 `CARGO_TARGET_DIR` values, and a missing artifact fails the build. The loader
 is minified with the existing locked frontend Vite/Rolldown dependency; no
@@ -74,9 +73,9 @@ agent.execute({ reconcile: {
 ```
 
 Operations are `key_packages`, `last_resort_key_package`, `create`, `settle`, `welcome`,
-`join_external`, `commit`, `receive`, `proposal`, `pending`, `reconcile`, `gate`,
+`replace_stale_welcome`, `join_external`, `commit`, `receive`, `proposal`, `pending`, `reconcile`, `gate`,
 `sending_key`, `share_history`, `import_history`, `device_hpke_key`, `group`,
-`epoch`, and `outbox`. Their native signatures and recovery contract are in
+`epoch`, `outbox`, `inventory`, `seal_message`, and `open_message`. Their native signatures and recovery contract are in
 [the core README](../gwar-mls/README.md). `sending_key` returns `[epoch, key]`.
 All epoch values are canonical decimal strings, preserving full u64 precision.
 Other numeric inputs must be safe integers. Device creation time must be positive;
@@ -85,6 +84,12 @@ Unknown fields are rejected. `create` leaves `group.status` and `gate.status`
 at `creating`, with no sending key, commits or history sharing, until `settle`
 activates or deletes it; its changes must be persisted. Eviction deletes all OpenMLS records for that group while retaining
 application epoch keys, its pin and last member checkpoint.
+`replace_stale_welcome: {server, group, id, bytes}` is for a log gap that
+prevents replay of stale active/joining membership. It shares Welcome validation,
+requires the expected group and a strictly newer epoch than the local checkpoint
+and pending commit source, and replaces membership plus any pending outbox.
+Persist its changes and delivery id atomically before acknowledging; on failure,
+reload durable state, including the unconsumed key package.
 Revocations are `{account_key, device_key, revoked_at}` entries, using the
 earliest timestamp if repeated. Missing records return `null`.
 
@@ -93,3 +98,41 @@ revocation feed and error/retry policy. After any exception or failed storage
 transaction, discard/free the agent and load durable state. Call `gate` after
 joins/merges to report blocked leaves, and `sending_key` immediately before
 sending. There is no UI or delivery service in this wrapper.
+
+## Chat and browser runtime
+
+`inventory: {server}` returns `{group, conversation, history, record, members}`
+for every locally known group on that server. Members contain `device_key`
+and `uid`. Records include Creating state and durable Welcome ids.
+
+```js
+const context = {
+  server_key, conversation, group_id: groupBytes32,
+  epoch: '1', message_id: messageIdBytes16, revision: 0,
+};
+const ciphertext = agent.execute({ seal_message: {
+  context, plaintext: new TextEncoder().encode(JSON.stringify({text, mentions, attachments, signature})),
+  now: Date.now(), revocations: [],
+} });
+// Persist take_changes() before returning ciphertext to the sender.
+const result = agent.execute({ open_message: { context, ciphertext } });
+// {ok: number[]} (the exact decrypted JSON bytes) or
+// {reason: 'no_key' | 'cannot_open'}
+// Parse/validate the full JSON and verify its v3 signature before use.
+```
+
+Sealing checks the sending gate again and requires the signature's context
+to match the current group and epoch. Opening checks every inner context
+field by parsing only the six fields inside `signature`; both operations
+preserve the plaintext bytes unchanged. Full plaintext validation and author
+signature verification remain the caller's job (implemented by the web runtime).
+Missing keys and authentication failures are typed read results; malformed wrapper
+requests and operational failures still throw. Opening is a read-only query;
+it does not call `take_changes()` or create a persistence transaction.
+
+[The web runtime](../../apps/web/src/mls/README.md) supplies lazy loading,
+Web Locks, atomic IndexedDB persistence, connection-driven sync, outbox
+reconciliation and history transfer. It reserves `@runtime/` keys in the
+outbox store and removes that namespace from the snapshot passed to wasm.
+No core schema exception or fifth IndexedDB store is needed. The browser
+integration test runs in the `mls-wasm` CI job after building this package.

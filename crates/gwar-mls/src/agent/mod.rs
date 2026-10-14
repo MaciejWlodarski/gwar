@@ -236,6 +236,20 @@ struct DeviceRecord {
     created_at: i64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct Member {
+    pub device_key: String,
+    pub uid: String,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct GroupSummary {
+    pub group: [u8; 32],
+    pub conversation: String,
+    pub history: bool,
+    pub record: GroupRecord,
+    pub members: Vec<Member>,
+}
+
 pub struct Agent {
     signer: Ed25519Signer,
     credential: Credential,
@@ -483,6 +497,36 @@ impl Agent {
             .key_package()
             .tls_serialize_detached()
             .map_err(err("key package encoding"))
+    }
+    /// Browser synchronization inventory, including tentative creations and pins.
+    pub fn inventory(&self, server: &str) -> Result<Vec<GroupSummary>> {
+        self.groups
+            .iter()
+            .filter(|(key, _)| key.starts_with(&format!("{server}/")))
+            .map(|(key, record)| {
+                let d = SignedDescriptor::parse(&record.descriptor).ok_or(Invalid("descriptor"))?;
+                let members = if matches!(record.status, Status::Active | Status::Joining | Status::Creating) {
+                    self.mls(key)?
+                        .public_group()
+                        .treesync()
+                        .full_leaves()
+                        .map(|(_, leaf)| {
+                            let c = leaf_credential(leaf).ok_or(Invalid("credential"))?;
+                            Ok(Member { device_key: c.device_key().into(), uid: c.uid() })
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    Vec::new()
+                };
+                Ok(GroupSummary {
+                    group: d.group_id(),
+                    conversation: d.descriptor.conversation,
+                    history: d.descriptor.history,
+                    record: record.clone(),
+                    members,
+                })
+            })
+            .collect()
     }
     pub fn device_hpke_key(&self) -> DeviceHpkeKey {
         DeviceHpkeKey::sign(&self.signer.0, &self.device.hpke_public, self.device.created_at)
@@ -958,7 +1002,11 @@ impl Agent {
             if !a.credential.is_current(now, revocations) {
                 return Err(AgentError::Blocked);
             }
-            if a.outbox.contains_key(&key) {
+            // A signed newer GroupInfo proves the source epoch is already
+            // consumed. This permits recovery when its winning log entry can
+            // no longer be replayed (e.g. expired Add packages). Equal/older
+            // heads must retain the pending bytes for normal reconciliation.
+            if a.outbox.get(&key).is_some_and(|out| info.epoch().as_u64() <= out.epoch) {
                 return Err(Invalid("pending commit"));
             }
             if a.groups.get(&key).is_some_and(|r| {
@@ -984,7 +1032,7 @@ impl Agent {
                 return Err(Invalid("external replacement identity"));
             }
 
-            if a.groups.get(&key).is_some_and(|r| r.status == Status::Active) {
+            if a.groups.get(&key).is_some_and(|r| matches!(r.status, Status::Active | Status::Joining)) {
                 a.drop_mls(&key)?;
             }
             let (group, bundle) = MlsGroup::external_commit_builder()
@@ -1130,6 +1178,27 @@ pub struct WelcomeResult {
 impl Agent {
     /// Persist before acknowledging. A duplicate never consumes its key package again.
     pub fn welcome(&mut self, server: &str, id: &str, bytes: &[u8]) -> Result<WelcomeResult> {
+        self.accept_welcome(server, id, bytes, None)
+    }
+    /// Recover membership whose log cannot be replayed. The caller establishes
+    /// the log gap; the Welcome must authenticate this group at a newer epoch.
+    /// Persist the entire result before acknowledging, as for `welcome`.
+    pub fn replace_stale_welcome(
+        &mut self,
+        server: &str,
+        group: &[u8; 32],
+        id: &str,
+        bytes: &[u8],
+    ) -> Result<WelcomeResult> {
+        self.accept_welcome(server, id, bytes, Some(group))
+    }
+    fn accept_welcome(
+        &mut self,
+        server: &str,
+        id: &str,
+        bytes: &[u8],
+        replace: Option<&[u8; 32]>,
+    ) -> Result<WelcomeResult> {
         self.operation(|a| {
             if id.is_empty() {
                 return Err(Invalid("welcome id"));
@@ -1137,6 +1206,9 @@ impl Agent {
             for (key, record) in &a.groups {
                 if key.starts_with(&format!("{server}/")) && record.welcome_ids.contains(id) {
                     let descriptor = SignedDescriptor::parse(&record.descriptor).ok_or(Invalid("descriptor"))?;
+                    if replace.is_some_and(|group| *group != descriptor.group_id()) {
+                        return Err(Invalid("welcome replacement group"));
+                    }
                     return Ok(WelcomeResult { group: descriptor.group_id(), duplicate: true });
                 }
             }
@@ -1149,16 +1221,28 @@ impl Agent {
             if welcome.ciphersuite() != SUITE {
                 return Err(Invalid("ciphersuite"));
             }
-            let staged = StagedWelcome::build_from_welcome(&a.provider, &join_config(), welcome)
+            let builder = StagedWelcome::build_from_welcome(&a.provider, &join_config(), welcome)
                 .map_err(err("welcome"))?
-                .skip_lifetime_validation()
-                .build()
-                .map_err(err("staged welcome"))?;
+                .skip_lifetime_validation();
+            let builder = if replace.is_some() { builder.replace_old_group() } else { builder };
+            let staged = builder.build().map_err(err("staged welcome"))?;
             let descriptor = client_context(staged.group_context(), server)?;
             a.check_pin(&descriptor)?;
             let key = group_key(server, &descriptor.group_id());
             a.fresh(&key, staged.group_context())?;
-            if a.groups
+            if let Some(expected) = replace {
+                if *expected != descriptor.group_id() {
+                    return Err(Invalid("welcome replacement group"));
+                }
+                let old = a.groups.get(&key).ok_or(Invalid("welcome replacement membership"))?;
+                if !matches!(old.status, Status::Active | Status::Joining)
+                    || old.checkpoint.as_ref().is_none_or(|c| staged.group_context().epoch().as_u64() <= c.epoch)
+                    || a.outbox.get(&key).is_some_and(|out| staged.group_context().epoch().as_u64() <= out.epoch)
+                {
+                    return Err(Invalid("welcome replacement epoch or status"));
+                }
+            } else if a
+                .groups
                 .get(&key)
                 .is_some_and(|r| matches!(r.status, Status::Creating | Status::Active | Status::Joining))
             {
@@ -1176,6 +1260,9 @@ impl Agent {
                 .is_some_and(|c| c.device_key() == a.credential.device_key() && c.uid() == a.credential.uid())
             {
                 return Err(Invalid("welcome identity"));
+            }
+            if replace.is_some() {
+                a.drop_mls(&key)?;
             }
             let group = staged.into_group(&a.provider).map_err(err("welcome group"))?;
             rules::tree(&descriptor, group.public_group().treesync().full_leaves().map(|(_, l)| l))?;

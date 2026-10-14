@@ -1175,3 +1175,167 @@ fn after_a_restart_a_creation_is_settled_with_the_servers_group_list() {
     a.take_changes();
     assert_eq!(a.sending_key(&server(), &id, t, &()), b.sending_key(&server(), &id, t, &()));
 }
+
+#[test]
+fn chat_uses_sending_gate_and_derived_or_imported_epoch_keys() {
+    use crate::chat::{self, ChatError, Context};
+    let mut f = fixture();
+    let d = SignedDescriptor::parse(&f.a.group(&server(), &f.id).unwrap().descriptor).unwrap();
+    let c = Context {
+        server_key: server(),
+        conversation: d.descriptor.conversation,
+        group_id: f.id,
+        epoch: 0,
+        message_id: [7; 16],
+        revision: 0,
+    };
+    let p = serde_json::to_vec(&serde_json::json!({
+        "text": "hello", "mentions": [], "attachments": [],
+        "signature": {
+            "server_key": server(), "conversation": c.conversation,
+            "group_id": b64(&f.id), "epoch": "0",
+            "message_id": b64(&c.message_id), "revision": 0
+        }
+    }))
+    .unwrap();
+    let mut invalid_utf8 = p.clone();
+    let text = invalid_utf8.windows(5).position(|w| w == b"hello").unwrap();
+    invalid_utf8[text] = 0xff;
+    assert_eq!(chat::seal(&f.a, &c, &invalid_utf8, f.t, &()), Err(ChatError::Context));
+    let ciphertext = chat::seal(&f.a, &c, &p, f.t, &()).unwrap();
+    assert_ne!(ciphertext, chat::seal(&f.a, &c, &p, f.t, &()).unwrap());
+    assert_eq!(chat::open(&f.a, &c, &ciphertext).unwrap(), p);
+    f.a.pending(&server(), &f.id, true).unwrap();
+    f.a.take_changes();
+    assert_eq!(chat::seal(&f.a, &c, &p, f.t, &()).unwrap_err(), ChatError::Agent(AgentError::Blocked));
+    f.a.pending(&server(), &f.id, false).unwrap();
+    f.a.take_changes();
+    let out = f.b.join_external(&server(), &f.info, f.t, &()).unwrap();
+    f.b.take_changes();
+    f.observer = accept(f.observer, &out, f.t);
+    acknowledge(&mut f.b, &f.id, &out);
+    f.a.receive(&server(), &f.id, &out.commit, &[]).unwrap();
+    f.a.take_changes();
+    assert_eq!(chat::open(&f.b, &c, &ciphertext).unwrap_err(), ChatError::NoKey);
+    assert_eq!(chat::seal(&f.a, &c, &p, f.t, &()).unwrap_err(), ChatError::Context);
+    let chunks = f.a.share_history(&server(), &f.id, &f.b.device_hpke_key(), f.t, &()).unwrap();
+    f.a.take_changes();
+    for chunk in chunks {
+        f.b.import_history(&server(), &f.id, &chunk).unwrap();
+        f.b.take_changes();
+    }
+    assert_eq!(chat::open(&f.b, &c, &ciphertext).unwrap(), p);
+    let mut wrong = c.clone();
+    wrong.conversation.push('x');
+    assert_eq!(chat::open(&f.b, &wrong, &ciphertext).unwrap_err(), ChatError::Context);
+}
+
+#[test]
+fn pending_commit_recovery_requires_a_valid_strictly_newer_group_info() {
+    for external in [false, true] {
+        let mut f = joined();
+        let pending = if external {
+            f.a.join_external(&server(), &f.info, f.t, &()).unwrap()
+        } else {
+            f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap()
+        };
+        let mut durable = f.a.durable.clone();
+        f.a.take_changes().apply(&mut durable);
+        let reload = |stores| Agent::load([11; 32], f.a.credential.clone(), stores).unwrap();
+        let mut a = reload(durable.clone());
+        assert!(a.join_external(&server(), &f.info, f.t, &()).is_err());
+        assert!(a.take_changes().is_empty());
+        let mut a = reload(durable.clone());
+        assert_eq!(a.outbox(&server(), &f.id).unwrap().hash, pending.hash);
+        let winner = f.b.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+        f.b.take_changes();
+        f.observer = accept(f.observer, &winner, f.t);
+        let mut invalid = winner.group_info.clone();
+        let last = invalid.len() - 1;
+        invalid[last] ^= 1;
+        assert!(a.join_external(&server(), &invalid, f.t, &()).is_err());
+        assert!(a.take_changes().is_empty());
+        let mut a = reload(durable);
+        let recovery = a.join_external(&server(), &winner.group_info, f.t, &()).unwrap();
+        a.take_changes();
+        assert_eq!(recovery.epoch, pending.epoch + 1);
+        assert_eq!(a.group(&server(), &f.id).unwrap().status, Status::Joining);
+        assert!(a.epoch(&server(), &f.id, recovery.epoch).is_none());
+        assert!(a.sending_key(&server(), &f.id, f.t, &()).is_err());
+        f.observer = accept(f.observer, &recovery, f.t);
+        acknowledge(&mut a, &f.id, &recovery);
+        assert_eq!(a.sending_key(&server(), &f.id, f.t, &()).unwrap().0, recovery.epoch + 1);
+    }
+}
+
+// B remains at epoch 1 while A removes and readmits it at epochs 2 and 3.
+fn offline_readmission() -> (Fixture, Vec<u8>) {
+    let mut f = joined();
+    let packages = f.b.key_packages(1, f.t).unwrap();
+    f.b.take_changes();
+    let out = f.a.commit(&server(), &f.id, &[], &[1], f.t, &()).unwrap();
+    f.a.take_changes();
+    f.observer = accept(f.observer, &out, f.t);
+    acknowledge(&mut f.a, &f.id, &out);
+    let out = f.a.commit(&server(), &f.id, &packages, &[], f.t, &()).unwrap();
+    f.a.take_changes();
+    f.observer = accept(f.observer, &out, f.t);
+    acknowledge(&mut f.a, &f.id, &out);
+    (f, out.welcome.unwrap())
+}
+
+#[test]
+fn pruned_readmission_derives_welcome_epoch_and_survives_reload() {
+    for pending in [false, true] {
+        let (mut f, welcome) = offline_readmission();
+        if pending {
+            f.b.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+            f.b.take_changes();
+        }
+        let old_key = f.b.epoch(&server(), &f.id, 1).unwrap().clone();
+        let saved = f.b.durable.clone();
+        assert!(f.b.welcome(&server(), "readmission", &welcome).is_err());
+        f.b = Agent::load([21; 32], f.b.credential.clone(), saved).unwrap();
+        assert!(!f.b.replace_stale_welcome(&server(), &f.id, "readmission", &welcome).unwrap().duplicate);
+        f.b.take_changes();
+        f.b = Agent::load([21; 32], f.b.credential.clone(), f.b.durable.clone()).unwrap();
+        assert_eq!(f.b.sending_key(&server(), &f.id, f.t, &()), f.a.sending_key(&server(), &f.id, f.t, &()));
+        assert!(matches!(f.b.epoch(&server(), &f.id, 3), Some(EpochRecord::Derived { .. })));
+        assert_eq!(f.b.epoch(&server(), &f.id, 1), Some(&old_key));
+        assert!(f.b.epoch(&server(), &f.id, 2).is_none());
+        assert!(f.b.outbox(&server(), &f.id).is_none());
+        assert!(f.b.replace_stale_welcome(&server(), &f.id, "readmission", b"").unwrap().duplicate);
+        assert!(f.b.take_changes().is_empty());
+    }
+}
+
+#[test]
+fn stale_welcome_replacement_rejects_wrong_group_epoch_and_invalid_welcome() {
+    for case in 0..6 {
+        let (mut f, welcome) = offline_readmission();
+        let key = group_key(&server(), &f.id);
+        if case == 1 || case == 2 {
+            let mut checkpoint = f.a.groups[&key].checkpoint.clone().unwrap();
+            if case == 2 {
+                checkpoint.epoch += 1;
+            }
+            f.b.groups.get_mut(&key).unwrap().checkpoint = Some(checkpoint);
+        }
+        if case == 5 {
+            f.b.groups.get_mut(&key).unwrap().status = Status::Creating;
+        }
+        let expected_server = server();
+        let result = f.b.replace_stale_welcome(
+            if case == 4 { "wrong server" } else { &expected_server },
+            if case == 0 { &[99; 32] } else { &f.id },
+            "readmission",
+            if case == 3 { b"invalid" } else { &welcome },
+        );
+        assert!(result.is_err(), "case {case}");
+        assert!(f.b.take_changes().is_empty());
+        // Rejection must leave the durable old membership and package usable.
+        f.b = Agent::load([21; 32], f.b.credential.clone(), f.b.durable.clone()).unwrap();
+        assert_eq!(f.b.group(&server(), &f.id).unwrap().checkpoint.as_ref().unwrap().epoch, 1);
+        f.b.replace_stale_welcome(&server(), &f.id, "readmission", &welcome).unwrap();
+    }
+}

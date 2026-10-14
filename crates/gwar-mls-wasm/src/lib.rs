@@ -31,6 +31,19 @@ fn credential(bytes: &[u8]) -> Result<Credential, JsValue> {
     Credential::parse(bytes).ok_or_else(|| error("invalid credential"))
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OpenResult {
+    Ok(Vec<u8>),
+    Reason(OpenFailure),
+}
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OpenFailure {
+    NoKey,
+    CannotOpen,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Revoked {
@@ -49,6 +62,19 @@ impl Revocations for View {
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
+    Inventory {
+        server: String,
+    },
+    SealMessage {
+        context: gwar_mls::chat::Context,
+        plaintext: Vec<u8>,
+        now: i64,
+        revocations: View,
+    },
+    OpenMessage {
+        context: gwar_mls::chat::Context,
+        ciphertext: Vec<u8>,
+    },
     KeyPackages {
         count: usize,
         now: i64,
@@ -66,6 +92,12 @@ enum Request {
     },
     Welcome {
         server: String,
+        id: String,
+        bytes: Vec<u8>,
+    },
+    ReplaceStaleWelcome {
+        server: String,
+        group: [u8; 32],
         id: String,
         bytes: Vec<u8>,
     },
@@ -172,6 +204,21 @@ impl Agent {
         let a = &mut self.inner;
         let text = encode(&request)?;
         match serde_json::from_slice(text.as_bytes()).map_err(error)? {
+            Request::Inventory { server } => output(a.inventory(&server).map_err(error)?),
+            Request::SealMessage { context, plaintext, now, revocations } => {
+                output(gwar_mls::chat::seal(a, &context, &plaintext, now, &revocations).map_err(error)?)
+            }
+            Request::OpenMessage { context, ciphertext } => {
+                // Missing keys are an expected read result, not a poisoned mutation.
+                match gwar_mls::chat::open(a, &context, &ciphertext) {
+                    Ok(plaintext) => output(OpenResult::Ok(plaintext)),
+                    Err(gwar_mls::chat::ChatError::NoKey) => output(OpenResult::Reason(OpenFailure::NoKey)),
+                    Err(gwar_mls::chat::ChatError::CannotOpen | gwar_mls::chat::ChatError::Context) => {
+                        output(OpenResult::Reason(OpenFailure::CannotOpen))
+                    }
+                    Err(e) => Err(error(e)),
+                }
+            }
             Request::KeyPackages { count, now } => output(a.key_packages(count, now).map_err(error)?),
             Request::LastResortKeyPackage { now } => output(a.last_resort_key_package(now).map_err(error)?),
             Request::Create { descriptor } => output(
@@ -182,6 +229,9 @@ impl Agent {
                 output(a.settle(&server, &group, winner.as_ref()).map_err(error)?)
             }
             Request::Welcome { server, id, bytes } => output(a.welcome(&server, &id, &bytes).map_err(error)?),
+            Request::ReplaceStaleWelcome { server, group, id, bytes } => {
+                output(a.replace_stale_welcome(&server, &group, &id, &bytes).map_err(error)?)
+            }
             Request::JoinExternal { server, bytes, now, revocations } => {
                 output(a.join_external(&server, &bytes, now, &revocations).map_err(error)?)
             }
