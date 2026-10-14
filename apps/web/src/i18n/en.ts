@@ -409,6 +409,7 @@ export const en = {
   "file.dropHint": "Drop files to send them",
   "file.channelOnly": "Files can only be sent in channel chats.",
   "file.disabled": "File uploads are not available here.",
+  "file.encryptedChannel": "Files can't be sent in encrypted channels yet.",
   "file.tooLarge": "That file is too large. The limit is {limit}.",
   "file.quota": "No upload space left: your files or the server's storage reached the limit. Deleting messages with files frees space.",
   "file.tooMany": "You can attach up to {max} files to one message.",

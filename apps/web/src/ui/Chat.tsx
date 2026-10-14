@@ -756,7 +756,7 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
     (files: File[]) => {
       if (files.length === 0) return;
       if (!canAttach) {
-        useUi.getState().toast("error", t(uploadsOn && mayUpload ? "file.channelOnly" : "file.disabled"));
+        useUi.getState().toast("error", t(threadKey === "channel" && encrypted ? "file.encryptedChannel" : uploadsOn && mayUpload ? "file.channelOnly" : "file.disabled"));
         return;
       }
       const limit = useSession.getState().server?.upload_limit ?? 0;
@@ -782,7 +782,7 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
           });
       }
     },
-    [canAttach, mayUpload, uploadsOn, pendingByThread, draftKey, patch, t],
+    [canAttach, encrypted, mayUpload, uploadsOn, pendingByThread, draftKey, threadKey, patch, t],
   );
 
   // The chat area forwards dropped files here.
@@ -1088,6 +1088,8 @@ export function ChatArea() {
   const active = useSession((s) => s.activeThread);
   const phase = useSession((s) => s.phase);
   const storage = useSession((s) => storedKey(s, s.activeThread));
+  // Files travel with plaintext channel messages only: no drop invitation in an encrypted channel.
+  const sealedChannel = useSession(s => s.activeThread === "channel" && !!sealedThread(storedKey(s, s.activeThread), s.kind, s.channels));
   const attachRef = useRef<((files: File[]) => void) | null>(null);
   const [dragging, setDragging] = useState(false);
   const depth = useRef(0);
@@ -1128,7 +1130,7 @@ export function ChatArea() {
       <ThreadTabs />
       <MessageList key={storage ?? active} threadKey={active} />
       <Composer threadKey={active} attachRef={attachRef} />
-      {dragging && (
+      {dragging && !sealedChannel && (
         <div
           aria-hidden
           className="pointer-events-none absolute inset-2 z-30 flex items-center justify-center rounded-xl border-2 border-dashed border-accent bg-surface/85 text-sm font-medium text-accent"

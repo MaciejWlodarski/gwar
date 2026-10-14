@@ -411,6 +411,7 @@ export const pl: Record<Key, string> = {
   "file.dropHint": "Upuść pliki, aby je wysłać",
   "file.channelOnly": "Pliki można wysyłać tylko na czatach kanałów.",
   "file.disabled": "Wysyłanie plików nie jest tu dostępne.",
+  "file.encryptedChannel": "W kanałach szyfrowanych nie można jeszcze wysyłać plików.",
   "file.tooLarge": "Ten plik jest za duży. Limit to {limit}.",
   "file.quota": "Brak miejsca na pliki: osiągnięto limit Twoich plików albo całego serwera. Usunięcie wiadomości z plikami zwalnia miejsce.",
   "file.tooMany": "Do jednej wiadomości możesz dołączyć maksymalnie {max} plików.",
