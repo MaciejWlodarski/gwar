@@ -615,6 +615,11 @@ messages: like signed messages, their author is inside the signature.
 
 ## 3. Encrypted direct messages
 
+Status: core, delivery service, browser runtime, and web client/UI implemented.
+The local `pnpm --filter web e2e:dm` suite exercises four simulated devices,
+offline delivery, history recovery, edits, deletions and revoked-device isolation.
+Encrypted attachments, channels and voice remain subsequent steps.
+
 ### Conversation and group
 
 - Direct messages between two Gwar members are always end-to-end encrypted.

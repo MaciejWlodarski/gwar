@@ -20,6 +20,12 @@ const requestValue = <T>(request: IDBRequest<T>): Promise<T> => new Promise((res
 
 export class MessageStorage {
   private db?: Promise<IDBDatabase>;
+  private known: Array<Pick<Revocation, "account_key" | "device_key" | "revoked_at">> = [];
+  currentRevocations = () => this.known;
+  async loadRevocations(): Promise<void> {
+    const entries = await this.transaction(["revocations"], "readonly", tx => requestValue<Revocation[]>(tx.objectStore("revocations").getAll()));
+    this.known = entries.map(({ account_key, device_key, revoked_at }) => ({ account_key, device_key, revoked_at }));
+  }
   constructor(private name = "gwar-message-auth-v3") {}
   private open(): Promise<IDBDatabase> {
     return this.db ??= new Promise((resolve, reject) => {
@@ -126,6 +132,7 @@ export class MessageStorage {
       if (complete) feed.checked = now;
       feeds.put(feed, base);
     });
+    await this.loadRevocations();
   }
 }
 export const messageStorage = new MessageStorage();

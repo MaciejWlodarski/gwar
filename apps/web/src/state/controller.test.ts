@@ -878,3 +878,15 @@ describe("ending a session", () => {
     }
   });
 });
+
+
+it("drops plaintext Gwar-to-Gwar DMs before state or notifications, retaining TeamSpeak DMs", () => {
+  connectFake();
+  const msg = { id: 700, target: { client: 1 }, author: 2, author_uid: "u2", author_name: "Peer", text: "plaintext", sent_at: 1 };
+  link.emit({ ev: "chat.message", d: msg });
+  link.emit({ ev: "chat.edited", d: msg });
+  expect(session().threads["dm:u2"]).toBeUndefined();
+  expect(notifyMock).not.toHaveBeenCalled();
+  link.emit({ ev: "chat.message", d: { ...msg, author_uid: "ts:peer" } });
+  expect(session().threads["dm:ts:peer"]?.items).toHaveLength(1);
+});

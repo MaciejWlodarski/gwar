@@ -546,8 +546,12 @@ export class MlsRuntime {
         return plaintext ? { ok: plaintext } : { reason: "cannot_open" };
       }
       if (result.reason === "no_key") {
-        const epochs = this.missing.get(message.group) ?? new Set<string>(); epochs.add(context.epoch); this.missing.set(message.group, epochs);
-        this.schedule();
+        const epochs = this.missing.get(message.group) ?? new Set<string>();
+        const newDemand = !epochs.has(context.epoch);
+        epochs.add(context.epoch); this.missing.set(message.group, epochs);
+        // Subscribers retry unopened rows after sync. Repeated demand must not
+        // turn that notification into an immediate synchronization loop.
+        if (newDemand) this.schedule();
       }
       return result;
     });

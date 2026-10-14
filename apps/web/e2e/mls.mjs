@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 /** Real local DS + browser IndexedDB/Web Locks/wasm, no UI. Never reuses a server. */
+import { stopProcesses } from "./processes.mjs";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -100,11 +101,6 @@ try {
 
 } finally {
   await browser?.close();
-  const signal = (child, name) => { try { process.kill(-child.pid, name); } catch { /* already gone */ } };
-  for (const child of children) signal(child, "SIGTERM");
-  await Promise.all(children.map(child => child.exitCode !== null || child.signalCode !== null ? undefined : new Promise(resolve => {
-    const kill = setTimeout(() => signal(child, "SIGKILL"), 5000);
-    child.once("exit", () => { clearTimeout(kill); resolve(); });
-  })));
+  await stopProcesses(children);
   await rm(directory, { recursive: true, force: true });
 }

@@ -162,10 +162,10 @@ async function activate(record: ConnectRecord): Promise<void> {
   syncBookmarks();
 }
 
-/** Shows a stored record that keeps this device's key (new token, vault key or certificate) without reconnecting. */
+/** Shows a stored record with the same device key; certificate changes restart its MLS session. */
 async function applyRecord(record: ConnectRecord): Promise<void> {
   useAccount.setState({ account: summarize(record) });
-  // Same device key: no reconnect needed, but the next hello carries the new certificate.
+  // Nickname/token changes stay connected; a new certificate must reach both hello and MLS.
   if (record.certificate.device_key === (await controller.getIdentity()).publicKey) {
     const identity = await identityFromConnect(record);
     await controller.replaceIdentityQuietly(identity);

@@ -1,8 +1,9 @@
 # Browser MLS runtime
 
 `MlsRuntime` owns one unconnected Gwar `Link`, the device Web Lock, the
-in-memory wasm agent and its IndexedDB database. It is deliberately not wired
-into the controller or DM UI yet. TeamSpeak links must not use it.
+in-memory wasm agent and its IndexedDB database. The application controller
+owns its lifecycle and `state/direct-messages.ts` wires it to encrypted DM
+state and the chat UI. TeamSpeak links must not use it.
 
 ```ts
 const runtime = await MlsRuntime.connect({
@@ -37,12 +38,12 @@ parses the full plaintext and verifies its body hash, device certificate and
 v3 author signature. Step 3 rejects attachments. It uses the agent query path
 without an IndexedDB write. Invalid envelopes/plaintext/authentication return
 `cannot_open`; absent keys return `no_key`; storage, runtime, closed-session
-and operational crypto failures reject the promise. The UI step must
-extend/use `MessageVerifier` for encrypted message contexts to apply revision
-continuity and revocation rules before rendering or notifying. Today's
-plaintext verifier rejects non-dash
-group/epoch fields. The runtime sends only MLS protocol requests, never chat
-messages. No existing plaintext message send path changes here.
+and operational crypto failures reject the promise. The UI uses
+`MessageVerifier` for encrypted message contexts to apply revision continuity
+and revocation rules before rendering or notifying. Plaintext verification
+still rejects non-dash group/epoch fields; sealed verification requires the
+exact outer context. The runtime sends only MLS protocol requests, never chat
+messages. Channel/server chat and TeamSpeak DMs keep their plaintext paths.
 
 `sync()` is also public for explicit retries and deterministic tests. Connect
 performs the first synchronization, reconnect Welcomes and MLS events schedule
@@ -57,8 +58,8 @@ with a small burst, leaving capacity for other features using the link.
 
 The module dynamically imports the generated wasm package on the first
 `connect`, after acquiring `gwar-mls:{device_key}`. Build it first with
-`scripts/mls-wasm/build.sh`. Normal UI bundles do not reference this module
-until the UI integration step. An unsupported Web Locks environment fails
+`scripts/mls-wasm/build.sh`. Web and desktop builds require the generated package before typechecking
+or bundling the application. An unsupported Web Locks environment fails
 explicitly; there is no unlocked fallback. An optional AbortSignal cancels a
 waiting lock acquisition or closes an established runtime. `close()` prevents
 queued work from starting, closes the connection, drains the running operation
@@ -136,4 +137,5 @@ rotation with failed atomic replacement, identical history retries, read-only
 opening and operational failure propagation, and full v3 plaintext validation.
 Build `cargo build -p vc-server --no-default-features` and the wasm first;
 install Chromium using `pnpm --filter web exec playwright install chromium`.
-The `mls-wasm` CI job runs this test. No production or TeamSpeak service is used.
+The `mls-wasm` CI job runs this test. `e2e:dm` additionally exercises the real
+controller and React chat UI with four devices. No production or TeamSpeak service is used.

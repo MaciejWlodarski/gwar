@@ -50,7 +50,7 @@ post-quantum suites (MLS can add them later); push notifications.
   server is set up.
 - Encrypted direct messages and server-wide chat are **stored** (as
   ciphertext), so they reach members who are offline and survive a reload.
-  Today both are live-only and never stored.
+  Direct messages are implemented; server-wide chat remains live-only until step 4.
 - Pre-release: no compatibility with today's protocol (`vc/3` becomes `vc/4`).
 
 ## Building blocks

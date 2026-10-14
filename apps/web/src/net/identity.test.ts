@@ -4,6 +4,7 @@ import endpointVectors from "../../../../crates/vc-proto/tests/endpoint-normaliz
 import { generateKeyPair, certifyDevice } from "../connect/crypto";
 import { decodeBase64Url } from "./base64url";
 import {
+  identitySeed,
   accountKeyOf,
   identityFromConnect,
   loadActiveIdentity,
@@ -90,4 +91,13 @@ describe("identity switching", () => {
     expect(ok).toBe(true);
     expect(() => id.exportBackup()).toThrow();
   });
+});
+
+it("gives MLS the Connect device seed while preserving the backup restriction", async () => {
+  const rec = await record(), identity = await identityFromConnect(rec);
+  const seed = identitySeed(identity);
+  expect(seed).toEqual(decodeBase64Url(rec.deviceJwk.d!));
+  seed.fill(0);
+  expect(identitySeed(identity)).toEqual(decodeBase64Url(rec.deviceJwk.d!));
+  expect(() => identity.exportBackup()).toThrow();
 });

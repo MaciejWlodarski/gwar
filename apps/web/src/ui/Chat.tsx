@@ -7,7 +7,7 @@ import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRe
 import { countKey, useLanguage, useT, type TFn } from "../i18n";
 import { cn } from "../lib/cn";
 import { memberName } from "../lib/member-name";
-import { buildRows, messageTarget, type Row } from "../lib/chat";
+import { buildRows, messageTarget, encryptedDm, type Row } from "../lib/chat";
 import { useIsMobile } from "../lib/media";
 import { checkUpload, formatBytes } from "../lib/files";
 import { splitMentions } from "../lib/mentions";
@@ -134,7 +134,7 @@ export const MessageRow = memo(function MessageRow({
   // TeamSpeak authorship is about the author, so it sits by the name; every other state is
   // about one message and sits right after its text, so text always starts at the same edge.
   const teamspeak = row.first && verification?.status === "unsigned-ts" ? <MessageVerificationIndicator verification={verification} showAuthor /> : null;
-  const warning = !verification ? <MessageVerificationPending /> : !fullyVerified(verification) && verification.status !== "unsigned-ts" ? <MessageVerificationIndicator verification={verification} /> : null;
+  const warning = row.item.cannotOpen ? null : !verification ? <MessageVerificationPending /> : !fullyVerified(verification) && verification.status !== "unsigned-ts" ? <MessageVerificationIndicator verification={verification} /> : null;
   const trailing = warning && <span className="ml-1.5 inline-block align-[-0.15em] leading-none">{warning}</span>;
   const time = formatTime(at, lang);
   const full = new Date(at).toLocaleString(lang);
@@ -144,7 +144,7 @@ export const MessageRow = memo(function MessageRow({
   const attachments = msg.attachments ?? [];
   const mentionsTrusted = fullyVerified(verification);
   const mentionsMe = mentionsTrusted && !!meUid && (msg.mentions ?? []).includes(meUid);
-  const showActions = (canEdit || canDelete) && !editing && !row.item.removed && msg.text !== DELETION_TEXT;
+  const showActions = (canEdit || canDelete) && !editing && !row.item.removed && !row.item.cannotOpen && msg.text !== DELETION_TEXT;
 
   const remove = (e: MouseEvent) => {
     // Shift skips the confirmation.
@@ -210,7 +210,9 @@ export const MessageRow = memo(function MessageRow({
           </>
         ) : (
           <>
-            {row.item.removed ? <div><span data-testid="message-server-removed" className="text-xs text-subtle">{t("chat.serverRemoved")}</span>{trailing}</div> : msg.text === DELETION_TEXT ? verification?.status === "verified" ? <div><span data-testid="message-author-deleted" className="text-xs text-subtle">{t("chat.authorDeleted")}</span>{trailing}</div> : <div><span className="text-xs text-danger">{t("chat.unverifiedDeletion")}</span>{trailing}</div> : msg.text && (
+            {row.item.cannotOpen ? <span data-testid="message-cannot-open" className="text-xs text-subtle" title={t(row.item.cannotOpen === "no_key" ? "chat.noKeyReason" : "chat.cannotOpenReason")}>
+              {t(row.item.removed ? "chat.deleted" : "chat.cannotOpen")}
+            </span> : row.item.removed ? <div><span data-testid="message-server-removed" className="text-xs text-subtle">{t("chat.serverRemoved")}</span>{trailing}</div> : msg.text === DELETION_TEXT ? verification?.status === "verified" ? <div><span data-testid="message-author-deleted" className="text-xs text-subtle">{t("chat.authorDeleted")}</span>{trailing}</div> : <div><span className="text-xs text-danger">{t("chat.unverifiedDeletion")}</span>{trailing}</div> : msg.text && (
               <div className={cn("text-sm leading-[1.5] break-words whitespace-pre-wrap", verification ? "text-fg" : "text-muted")}>
                 <RichText msg={mentionsTrusted ? msg : { ...msg, mentions: [] }} meUid={mentionsTrusted ? meUid : undefined} />
                 {editedAt != null && (
@@ -379,8 +381,8 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
       if (!active) return;
       setSigningUid(uid);
       const rows = (thread?.items ?? []).flatMap((i) => {
-        if (i.kind !== "msg") return [];
-        const ctx = { serverKey, target: messageTarget(key, i.msg.author_uid, uid), participants: key?.startsWith("dm:") ? [uid!, key.slice(3)] as const : undefined };
+        if (i.kind !== "msg" || i.cannotOpen) return [];
+        const ctx = { serverKey, target: messageTarget(key, i.msg.author_uid, uid), participants: key?.startsWith("dm:") ? [uid!, key.slice(3)] as const : undefined, sealed: i.sealed ? { group: i.sealed.group, epoch: i.sealed.epoch } : undefined };
         return [{ msg: i.msg, ctx, fingerprint: messageFingerprint(i.msg, ctx) }];
       });
       // Results are kept only for the rows the thread still holds, so the map is bounded like the thread.
@@ -418,7 +420,7 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
   const rows = useMemo(() => buildRows((thread?.items ?? []).filter((i) => {
     if (i.kind !== "msg" || i.msg.text !== DELETION_TEXT) return true;
     const entry = verified.get(i.msg.id);
-    return entry?.fingerprint !== messageFingerprint(i.msg, { serverKey, target: targetFor(i.msg) }) || !quietDeletion(entry.state);
+    return entry?.fingerprint !== messageFingerprint(i.msg, { serverKey, target: targetFor(i.msg), sealed: i.sealed ? { group: i.sealed.group, epoch: i.sealed.epoch } : undefined }) || !quietDeletion(entry.state);
   })), [thread?.items, verified, serverKey, key, signingUid]);
   const ref = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
@@ -427,7 +429,7 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
   const [showJump, setShowJump] = useState(false);
   const firstKey = thread?.items[0]?.key;
   const lastKey = thread?.items.at(-1)?.key;
-  const isChannel = key?.startsWith("ch:") ?? false;
+  const isChannel = threadKey === "channel" || (hasHistory && encryptedDm(threadKey, "vc"));
   const locked = isChannel && !!thread?.locked;
   const viewChannel = useSession((s) => s.viewChannel);
   const vc = useSession((s) => s.kind === "vc");
@@ -491,7 +493,7 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
         className="h-full overflow-y-auto overscroll-contain pt-2 pb-2"
       >
         {hasHistory && isChannel && thread && thread.loaded && !thread.hasMore && messageCount > 0 && (
-          <div className="px-4 py-3 text-center text-xs text-subtle">{t("chat.beginning")}</div>
+          <div className="px-4 py-3 text-center text-xs text-subtle">{t(threadKey === "channel" ? "chat.beginning" : "chat.conversationBeginning")}</div>
         )}
         {loadingOlder && (
           <div className="flex justify-center py-2 text-subtle">
@@ -526,6 +528,7 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
             )}
           </EmptyState>
         )}
+        {thread?.items.some(i => i.kind === "msg" && i.cannotOpen === "no_key") && <p className="px-4 py-2 text-xs text-subtle" role="status">{t("chat.waitingHistory")}</p>}
         {rows.map((row) => {
           if (row.type === "day")
             return (
@@ -538,9 +541,9 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
           if (row.type === "sys") return <SysRow key={row.key} row={row} t={t} />;
           const m = row.item.msg;
           // Only channel messages (stored on the server) can be edited or deleted.
-          const stored = vc && typeof m.target === "object" && "channel" in m.target;
+          const stored = vc && (!!row.item.sealed || (typeof m.target === "object" && "channel" in m.target));
           const own = m.author_uid === mineUid;
-          const verification = verified.get(m.id)?.fingerprint === messageFingerprint(m, { serverKey, target: targetFor(m) }) ? verified.get(m.id)?.state : undefined;
+          const verification = verified.get(m.id)?.fingerprint === messageFingerprint(m, { serverKey, target: targetFor(m), sealed: row.item.sealed ? { group: row.item.sealed.group, epoch: row.item.sealed.epoch } : undefined }) ? verified.get(m.id)?.state : undefined;
           // My signature may only extend a message this client verified (the controller checks again).
           const signable = !vc || (verification?.status === "verified" && !verification.authorization.includes("device-revoked"));
           return (
@@ -553,7 +556,7 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
               lang={lang}
               compact={compact}
               canEdit={stored && own && signable}
-              canDelete={stored && ((own && signable) || canManageMessages)}
+              canDelete={stored && ((own && signable) || (!row.item.sealed && canManageMessages))}
               editing={editing === m.id}
             />
           );
@@ -702,7 +705,9 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
   const ref = useRef<HTMLTextAreaElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const online = useSession((s) => s.phase === "online");
-  const peerOnline = useSession((s) => (threadKey.startsWith("dm:") ? Object.values(s.clients).some((c) => c.uid === threadKey.slice(3)) : true));
+  const encrypted = useSession(s => encryptedDm(threadKey, s.kind));
+  const securing = useSession(s => encrypted && s.threads[threadKey]?.securing !== false);
+  const peerOnline = useSession((s) => (threadKey.startsWith("dm:") && !encrypted ? Object.values(s.clients).some((c) => c.uid === threadKey.slice(3)) : true));
   const peerName = useSession((s) => (threadKey.startsWith("dm:") ? s.threads[threadKey]?.peer?.name : undefined));
   const channelName = useSession((s) => (s.viewChannel === null ? "" : (s.channels[s.viewChannel]?.name ?? "")));
   // A password channel I have not entered: the server would refuse, and I cannot read it either.
@@ -711,7 +716,7 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
   const mayUpload = usePermission("file_upload");
   // Files travel with channel messages only.
   const canAttach = threadKey === "channel" && uploadsOn && mayUpload;
-  const disabled = !online || !peerOnline || locked;
+  const disabled = !online || !peerOnline || locked || securing;
   const over = text.length > MAX_MESSAGE_LENGTH;
   const uploading = pending.some((f) => f.status === "uploading");
   const ready = pending.filter((f) => f.status === "done");
@@ -802,7 +807,8 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
     });
     mention.reset();
     ref.current?.focus();
-    await controller.sendChat(threadKey, value, { mentions, attachments });
+    const sent = await controller.sendChat(threadKey, value, { mentions, attachments });
+    if (!sent && encrypted) setDrafts(d => ({ ...d, [threadKey]: d[threadKey] ? `${value}\n${d[threadKey]}` : value }));
   };
 
   const editLast = () => {
@@ -836,7 +842,7 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
     addFiles(files);
   };
 
-  const placeholder = locked
+  const placeholder = securing ? t("chat.securing") : locked
     ? t("chat.placeholderLocked")
     : !peerOnline
     ? t("chat.peerOfflineNamed", { name: peerName ?? "" })
@@ -996,6 +1002,7 @@ function ChatHeader() {
   const userCount = useSession((s) => Object.values(s.clients).filter((c) => c.channel !== null && c.channel === s.viewChannel).length);
   const inVoice = useSession((s) => myChannelId(s) !== null);
   const members = useMembersPanel();
+  const encrypted = useSession(s => encryptedDm(active, s.kind));
   const dmName = useSession((s) => (active.startsWith("dm:") ? memberName(s.members, active.slice(3), s.threads[active]?.peer?.name ?? "") : undefined));
 
   let title: string;
@@ -1011,7 +1018,8 @@ function ChatHeader() {
   } else {
     icon = <MessageSquare className="size-5 text-subtle" />;
     title = dmName ?? "";
-    sub = t("chat.dmHint");
+    sub = t(encrypted ? "chat.encrypted" : "chat.notEncrypted");
+    if (encrypted) icon = <Lock className="size-5 text-subtle" />;
   }
 
   return (

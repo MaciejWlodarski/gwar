@@ -1,4 +1,8 @@
 import { attachment as attachmentSchema } from "../net/schema";
+import { DirectMessages } from "./direct-messages";
+import type { MlsRuntime } from "../mls/runtime";
+import { messageStorage, refreshRevocations } from "../net/message-storage";
+import { encryptedDm, dmPeer } from "../lib/chat";
 import { messageTarget } from "../lib/chat";
 import { uploadAttachment, localAttachmentMetadata } from "../net/attachment";
 import { serverPins, type ServerIdentityChanged } from "../net/server-pins";
@@ -41,7 +45,7 @@ import {
 import { TsConnection } from "../net/ts-connection";
 import { parseBanMessage } from "../lib/ban";
 import type { pruneRequest } from "../lib/prune";
-import { uidForPublicKey, accountKeyOf, importIdentity, loadActiveIdentity, IdentityUnsupportedError, type Identity } from "../net/identity";
+import { identitySeed, uidForPublicKey, accountKeyOf, importIdentity, loadActiveIdentity, IdentityUnsupportedError, type Identity } from "../net/identity";
 import { isDesktop } from "../platform";
 import { createVoiceEngine } from "../voice";
 import { VoiceError, type VoiceEngine } from "../voice/engine";
@@ -144,6 +148,12 @@ export function describeVoiceError(e: VoiceError): string {
 
 class Controller {
   private conn: Link | null = null;
+  private runtime: MlsRuntime | null = null;
+  private connectionParams: ConnectParams | null = null;
+  private runtimeAbort: AbortController | null = null;
+  private dm: DirectMessages | null = null;
+  private dmReady: Promise<void> = Promise.resolve();
+  private revocationTimer: ReturnType<typeof setInterval> | null = null;
   private engine: VoiceEngine;
   private identity: Identity | null = null;
   private verifier = new MessageVerifier();
@@ -161,7 +171,7 @@ class Controller {
   /** Channels whose history was requested: `epoch:channel:inVoice`. */
   private historyRequested = new Set<string>();
   /** Newest message per channel I already told the server about. */
-  private sentRead = new Map<number, number>();
+  private sentRead = new Map<number | string, number>();
   private readTimer: ReturnType<typeof setTimeout> | null = null;
   /** The voice channel I was in when the connection dropped; rejoined after the resync. */
   private rejoin: number | null = null;
@@ -271,6 +281,14 @@ class Controller {
       void this.loadHistory(ch);
     });
 
+    useSession.subscribe(s => {
+      if (s.phase !== "online" || !encryptedDm(s.activeThread, s.kind) || !this.dm) return;
+      const key = `${s.epoch}:${s.activeThread}`;
+      if (s.threads[s.activeThread]?.loaded || this.historyRequested.has(key)) return;
+      this.historyRequested.add(key);
+      void this.dm.open(s.activeThread.slice(3)).catch(() => {}).finally(() => this.historyRequested.delete(key));
+    });
+
     // Tell the server what I have read.
     useSession.subscribe((s) => this.checkRead(s));
 
@@ -340,10 +358,39 @@ class Controller {
       });
     }
     this.conn = conn;
+    this.connectionParams = { ...params };
     this.wire(conn, params);
     try {
-      await conn.connect();
+      if (conn instanceof Connection) {
+        const abort = new AbortController(); this.runtimeAbort = abort;
+        const start = async () => {
+          await messageStorage.loadRevocations();
+          const { MlsRuntime } = await import("../mls/runtime");
+          if (abort.signal.aborted || this.conn !== conn) throw new ConnectionLostError();
+          const runtime = await MlsRuntime.connect({ identity: conn.identity,
+            seed: identitySeed(conn.identity), link: conn,
+            revocations: messageStorage.currentRevocations, signal: abort.signal,
+            onError: error => console.warn("Conversation synchronization:", error),
+          });
+          if (abort.signal.aborted || this.conn !== conn) { await runtime.close(); throw new ConnectionLostError(); }
+          const uid = (await this.uidOn(conn))!;
+          if (abort.signal.aborted || this.conn !== conn) { await runtime.close(); throw new ConnectionLostError(); }
+          this.runtime = runtime;
+          this.dm = new DirectMessages(runtime, conn, conn.identity, uid,
+            () => this.conn === conn && conn.isOnline, msg => this.notificationFor(msg)?.(),
+            error => console.warn("Conversation history:", error));
+          const refresh = () => { void refreshRevocations().then(() => { if (this.conn === conn) return runtime.sync(); }).catch(() => {}); };
+          this.revocationTimer = setInterval(refresh, 60_000);
+          this.dm.refresh();
+          const s = useSession.getState();
+          if (encryptedDm(s.activeThread, s.kind)) void this.dm.open(s.activeThread.slice(3)).catch(() => {});
+        };
+        this.dmReady = start();
+        await this.dmReady;
+      } else await conn.connect();
     } catch (e) {
+      if (this.conn !== conn) throw e;
+      this.runtimeAbort?.abort(); this.runtimeAbort = null;
       this.conn = null;
       session.dispatch({ type: "reset" });
       const err = e instanceof ConnectError ? e : new ConnectError("unreachable", String(e));
@@ -414,6 +461,7 @@ class Controller {
   private wire(conn: Link, params: ConnectParams): void {
     const session = useSession.getState();
     conn.onWelcome((welcome, resync) => {
+      if (this.conn !== conn) return;
       this.entered.clear();
       this.historyRequested.clear();
       this.sentRead.clear();
@@ -436,11 +484,25 @@ class Controller {
       this.rejoin = null;
     });
     conn.onEvent((event) => {
+      if (this.conn !== conn) return;
+      if (event.ev === "chat.sealed.removed") this.dm?.remove(event.d.conversation, event.d.ids);
+      if (event.ev === "chat.sealed") {
+        const epoch = useSession.getState().epoch;
+        void this.dmReady.then(() => {
+          if (this.conn === conn && epoch === useSession.getState().epoch) return this.dm?.receive(event.d, true);
+        }).catch(error => console.warn("Conversation message:", error));
+        return;
+      }
+      if ((event.ev === "chat.message" || event.ev === "chat.edited") && typeof event.d.target === "object" && "client" in event.d.target) {
+        const s = useSession.getState(), msg = event.d;
+        const recipient = s.clients[(msg.target as { client: number }).client]?.uid;
+        if (s.kind === "vc" && (!recipient || ![msg.author_uid, recipient].some(uid => uid.startsWith("ts:")))) return;
+      }
       // Recorded before anything else, so messages that follow are checked against it.
       if (conn.serverKey && event.ev === "channel.created") channelLifecycle.created(conn.serverKey, event.d.id);
       if (conn.serverKey && event.ev === "channel.deleted") channelLifecycle.deleted(conn.serverKey, event.d.channel);
       if (event.ev === "chat.message" && !event.d.signature) {
-        const exists = Object.values(useSession.getState().threads).some((t) => t.items.some((i) => i.kind === "msg" && i.msg.id === event.d.id));
+        const exists = Object.values(useSession.getState().threads).some((t) => t.items.some((i) => i.kind === "msg" && !i.sealed && i.msg.id === event.d.id));
         if (!exists) session.dispatch({ type: "event", event, now: Date.now(), verified: false });
         if (!exists && event.d.author_uid.startsWith("ts:")) this.notificationFor(event.d)?.();
         return;
@@ -455,7 +517,7 @@ class Controller {
           if (this.conn !== conn || epoch !== useSession.getState().epoch || key !== conn.serverKey) return;
           const result = await this.verifyIncoming(event.d);
           if (this.conn !== conn || epoch !== useSession.getState().epoch || key !== conn.serverKey) return;
-          const existing = Object.values(useSession.getState().threads).flatMap((t) => t.items).find((i) => i.kind === "msg" && i.msg.id === event.d.id);
+          const existing = Object.values(useSession.getState().threads).flatMap((t) => t.items).find((i) => i.kind === "msg" && !i.sealed && i.msg.id === event.d.id);
           // Only an authentic row is protected; a forged first claim must not keep out the genuine message.
           if ((existing?.kind === "msg" && existing.authentic && (result.status !== "verified" || !sameMessageIdentity(existing.msg, event.d))) || result.continuity === "rollback" || result.continuity === "fork") {
             useUi.getState().toast("error", tNow("chat.replacementRejected"));
@@ -465,6 +527,7 @@ class Controller {
           if (notificationAllowed(result)) alert?.();
         }).catch(() => {}).finally(() => { this.messagePending--; });
       } else session.dispatch({ type: "event", event, now: Date.now() });
+      if (event.ev === "chat.read" && "conversation" in event.d) void this.dm?.refreshUnread(event.d.conversation).catch(() => {});
       if (event.ev === "voice.closed") {
         useUi.getState().toast("info", tNow("voice.closed"));
         this.scheduleVoiceRetry(1000);
@@ -475,6 +538,7 @@ class Controller {
       }
     });
     conn.onStatus((status: ConnectionStatus) => {
+      if (this.conn !== conn) return;
       if (status.state === "closed" && status.reason.kind === "error" && status.reason.error.identityChange) {
         this.confirmServerChange(status.reason.error.identityChange, params, { remember: false });
       }
@@ -521,6 +585,12 @@ class Controller {
   }
 
   private async teardown(): Promise<void> {
+    this.runtimeAbort?.abort(); this.runtimeAbort = null;
+    this.dm?.close(); this.dm = null;
+    const runtime = this.runtime; this.runtime = null;
+    if (this.revocationTimer) clearInterval(this.revocationTimer);
+    this.revocationTimer = null;
+    await runtime?.close();
     await this.nativeFiles(null);
     if (this.voiceRetry) clearTimeout(this.voiceRetry);
     this.voiceRetry = null;
@@ -699,11 +769,20 @@ class Controller {
     useAccountIdentity.setState({ nickname: identity?.nickname ?? "" });
   }
 
-  /** Swaps the identity object without dropping the connection (same key, new certificate). */
+  /** Nickname-only updates keep the connection; renewed credentials restart the MLS session. */
   async replaceIdentityQuietly(identity: Identity): Promise<void> {
+    const s = useSession.getState();
+    const changed = this.conn instanceof Connection && JSON.stringify(this.conn.identity.device) !== JSON.stringify(identity.device);
+    const reconnect = changed ? this.connectionParams : null;
+    const channel = myChannelId(s);
+    if (reconnect) await this.disconnect(true);
     this.identityLoading = null;
     this.identity = identity;
     useAccountIdentity.setState({ nickname: identity?.nickname ?? "" });
+    if (reconnect) {
+      await this.connect(reconnect);
+      if (channel !== null) await this.rejoinVoice(channel);
+    }
   }
 
   /** Replaces the browser identity; disconnects because the old session belongs to the old key. */
@@ -922,6 +1001,13 @@ class Controller {
 
   async sendChat(key: ThreadKey, text: string, options: SendOptions = {}): Promise<boolean> {
     const state = useSession.getState();
+    if (encryptedDm(key, state.kind)) {
+      try {
+        if (!this.dm || options.attachments?.length) throw new Error(tNow("chat.securing"));
+        await this.dm.send(key.slice(3), text, options.mentions ?? []);
+        return true;
+      } catch (error) { useUi.getState().toast("error", describeRequestError(error)); return false; }
+    }
     const target = this.resolveTarget(key);
     const thread = storedKey(state, key);
     if (!target || !thread) {
@@ -1012,7 +1098,8 @@ class Controller {
     let busy: Set<number> | undefined;
     try {
       const bound = this.bind();
-      const item = Object.values(useSession.getState().threads).flatMap((t) => t.items).find((i) => i.kind === "msg" && i.msg.id === message);
+      const state = useSession.getState(), key = storedKey(state, state.activeThread);
+      const item = (key ? state.threads[key]?.items : [])?.find(i => i.kind === "msg" && i.msg.id === message);
       if (!item || item.kind !== "msg") throw new Error("unknown message");
       busy = this.changing.get(bound.conn) ?? new Set();
       this.changing.set(bound.conn, busy);
@@ -1028,11 +1115,18 @@ class Controller {
   private async sendEdit(original: ChatMessage, text: string, mentions: string[], { conn, check }: ReturnType<Controller["bind"]>): Promise<boolean> {
     check();
     // A newer revision arrived meanwhile: signing over the snapshot would fork my own message.
-    const current = Object.values(useSession.getState().threads).flatMap((t) => t.items).find((i) => i.kind === "msg" && i.msg.id === original.id);
+    const current = Object.values(useSession.getState().threads).flatMap((t) => t.items).find((i) => i.kind === "msg" && i.msg.id === original.id && i.msg.signature?.conversation === original.signature?.conversation);
     if (current?.kind !== "msg" || current.msg.signature?.revision !== original.signature?.revision) throw new Error(tNow("chat.editChanged"));
+    if (original.signature?.group_id !== undefined && original.signature.group_id !== "-") {
+      const peer = dmPeer(original.signature.conversation, await this.uidOn(conn));
+      check();
+      if (!peer || !this.dm) throw new ConnectionLostError();
+      await this.dm.send(peer, text, mentions, original.signature);
+      return true;
+    }
     const signature = await this.signChat(original.target, text, mentions, text === DELETION_TEXT ? [] : original.attachments ?? [], original.signature ?? undefined, conn);
     check();
-    const now = Object.values(useSession.getState().threads).flatMap((t) => t.items).find((i) => i.kind === "msg" && i.msg.id === original.id);
+    const now = Object.values(useSession.getState().threads).flatMap((t) => t.items).find((i) => i.kind === "msg" && i.msg.id === original.id && i.msg.signature?.conversation === original.signature?.conversation);
     if (now?.kind !== "msg" || now.msg.signature?.revision !== original.signature?.revision) throw new Error(tNow("chat.editChanged"));
     await conn.request("chat.edit", { message: original.id, text, signature, ...(mentions.length ? { mentions } : {}) });
     return true;
@@ -1127,6 +1221,14 @@ class Controller {
     const me = await this.uidOn(conn);
     let thread: "server" | `ch:${number}` | `dm:${string}`;
     if (channel !== undefined) thread = `ch:${channel}`;
+    else if (msg.signature?.group_id && msg.signature.group_id !== "-") {
+      const peer = dmPeer(msg.signature.conversation, me);
+      if (!peer) return invalidVerification();
+      const item = state.threads[`dm:${peer}`]?.items.find(i => i.kind === "msg" && i.msg.id === msg.id);
+      if (item?.kind !== "msg" || !item.sealed) return invalidVerification();
+      return this.verifier.verify(msg, { serverKey: conn?.serverKey ?? "", target: item.sealed.conversation,
+        participants: [me!, peer], sealed: { group: item.sealed.group, epoch: item.sealed.epoch } });
+    }
     else if (msg.target === "server") thread = "server";
     else if ("channel" in msg.target) thread = `ch:${msg.target.channel}`;
     else {
@@ -1145,7 +1247,7 @@ class Controller {
     const accepted: ChatMessage[] = [], authentic: boolean[] = [];
     for (const msg of messages) {
       const result = await this.verifyIncoming(msg, channel);
-      const existing = Object.values(useSession.getState().threads).flatMap((t) => t.items).find((i) => i.kind === "msg" && i.msg.id === msg.id);
+      const existing = Object.values(useSession.getState().threads).flatMap((t) => t.items).find((i) => i.kind === "msg" && !i.sealed && i.msg.id === msg.id);
       if ((existing?.kind === "msg" && existing.authentic && (result.status !== "verified" || !sameMessageIdentity(existing.msg, msg))) || result.continuity === "fork" || result.continuity === "rollback") continue;
       accepted.push(msg);
       authentic.push(result.status === "verified");
@@ -1219,9 +1321,15 @@ class Controller {
   // ---------------------------------------------------------------- read state
 
   /** The newest message of the open channel chat that the server does not know I have read, if any. */
-  private unreadReport(s: SessionSnapshot): { channel: number; message: number } | null {
+  private unreadReport(s: SessionSnapshot): { channel: number; message: number } | { conversation: string; message: number } | null {
     // TeamSpeak keeps no read state: unread counts there are purely local.
-    if (s.phase !== "online" || s.kind !== "vc" || !s.focused || s.activeThread !== "channel" || s.viewChannel === null) return null;
+    if (s.phase !== "online" || s.kind !== "vc" || !s.focused) return null;
+    if (encryptedDm(s.activeThread, s.kind)) {
+      const thread = s.threads[s.activeThread], latest = latestMessageId(thread);
+      const conversation = messageTarget(`dm:${s.activeThread.slice(3)}`, s.me!.uid, s.me!.uid);
+      return thread && latest > Math.max(thread.lastRead, this.sentRead.get(conversation) ?? 0) ? { conversation, message: latest } : null;
+    }
+    if (s.activeThread !== "channel" || s.viewChannel === null) return null;
     const thread = s.threads[channelThreadKey(s.viewChannel)];
     if (!thread || thread.locked) return null;
     const latest = latestMessageId(thread);
@@ -1236,8 +1344,10 @@ class Controller {
       this.readTimer = null;
       const report = this.unreadReport(useSession.getState());
       if (!report || !this.conn?.isOnline) return;
-      this.sentRead.set(report.channel, report.message);
-      this.conn.request("chat.read", report).catch(() => this.sentRead.delete(report.channel));
+      const key = "channel" in report ? report.channel : report.conversation;
+      const conn = this.conn;
+      this.sentRead.set(key, report.message);
+      conn.request("chat.read", report).catch(() => { if (this.conn === conn) this.sentRead.delete(key); });
       // Messages that arrived meanwhile go out with the next tick.
       this.checkRead(useSession.getState());
     }, READ_DEBOUNCE_MS);
@@ -1246,6 +1356,11 @@ class Controller {
   async loadOlder(): Promise<void> {
     const s = useSession.getState();
     const key = storedKey(s, s.activeThread);
+    if (key && encryptedDm(key, s.kind)) {
+      const thread = s.threads[key], first = thread?.items.find(i => i.kind === "msg");
+      if (thread?.hasMore && first?.kind === "msg") await this.dm?.open(key.slice(3), first.msg.id);
+      return;
+    }
     if (!key?.startsWith("ch:") || this.loadingOlder) return;
     const channel = Number(key.slice(3));
     const thread = s.threads[key];
