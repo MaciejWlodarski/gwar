@@ -1,0 +1,6 @@
+[advisories]
+# libcrux-kem 0.0.9 is in Cargo.lock only as an optional dependency of hpke-rs
+# 0.7 (its `libcrux` feature, which openmls_rust_crypto 0.6 does not enable),
+# so it is never built; CI checks that it stays out of the build. Drop this
+# when openmls_rust_crypto moves to hpke-rs 0.8.
+ignore = ["RUSTSEC-2026-0330", "RUSTSEC-2026-0331"]
