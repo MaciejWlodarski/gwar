@@ -210,7 +210,7 @@ export const en = {
   "channel.historyHint": "Members' devices share earlier messages with people who join later.",
   "channel.encryptionPermanent": "These options can't be changed after the channel is created.",
   "channel.readers": "Who can read",
-  "channel.readersHint": "Devices that hold this channel's keys right now.",
+  "channel.readersHint": "Devices in this channel's group, as this device sees it.",
   "channel.readersPending": "This channel is still being secured on this device.",
   "channel.devices.one": "{count} device",
   "channel.devices.other": "{count} devices",

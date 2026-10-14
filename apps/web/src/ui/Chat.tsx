@@ -734,7 +734,7 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
   const hasContent = !!text.trim() || ready.length > 0;
 
   const setText = (value: string) => setDrafts((d) => ({ ...d, [draftKey]: value }));
-  const mention = useMentionAutocomplete(text, setText, ref);
+  const mention = useMentionAutocomplete(text, setText, ref, [], draftKey);
 
   useLayoutEffect(() => {
     const el = ref.current;

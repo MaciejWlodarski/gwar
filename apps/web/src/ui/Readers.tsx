@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import { countKey, useLanguage, useT } from "../i18n";
 import type { SealedKey } from "../state/sealed";
-import { useUi } from "../state/stores";
+import { useSession, useUi } from "../state/stores";
 import { useMemberName, useRoster } from "./hooks";
 import { Avatar, Dialog } from "./kit";
 
@@ -11,6 +11,8 @@ export function ReadersDialog({ thread }: { thread: SealedKey }) {
   const lang = useLanguage();
   const close = useUi((s) => s.closeDialog);
   const roster = useRoster(thread);
+  // While securing, the list is the last group this device knew; changes may be on their way.
+  const securing = useSession(s => s.threads[thread]?.securing !== false);
   const byUid = useMemo(() => {
     const counts = new Map<string, number>();
     for (const m of roster?.members ?? []) counts.set(m.uid, (counts.get(m.uid) ?? 0) + 1);
@@ -19,7 +21,7 @@ export function ReadersDialog({ thread }: { thread: SealedKey }) {
   return (
     <Dialog open onOpenChange={(o) => !o && close()} title={t("channel.readers")} width="max-w-sm">
       <p className="mb-3 text-sm text-muted">
-        {t("chat.messagesEncrypted")}. {roster ? t("channel.readersHint") : t("channel.readersPending")}
+        {t("chat.messagesEncrypted")}. {roster && !securing ? t("channel.readersHint") : t("channel.readersPending")}
       </p>
       <ul className="flex max-h-80 flex-col gap-1 overflow-y-auto">
         {byUid.map(([uid, devices]) => (
