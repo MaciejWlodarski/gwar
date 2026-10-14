@@ -57,8 +57,20 @@ the web app.
 
 ### Building blocks
 
-- `openmls` 0.9 (feature `js` only in the wasm wrapper), `openmls_rust_crypto`
-  0.6, `openmls_traits` 0.6, pinned exactly.
+- `openmls` 0.9.1, `openmls_rust_crypto` 0.6.0, `openmls_traits` 0.6.0,
+  pinned exactly. The wasm wrapper enables `openmls`' `js` feature and
+  `getrandom` 0.2's `js` feature (`openmls_rust_crypto` reaches `getrandom`
+  0.2 through `rand_core` 0.6); CI builds the wrapper with production
+  features.
+- **Lifetimes.** OpenMLS checks key package lifetimes against the wall clock
+  (at most 84 days, its limit). Gwar's rule is the device certificate, so:
+  key packages last until the device certificate expires, at most 84 days;
+  joins (Welcome, external commit) skip OpenMLS' lifetime check and apply
+  Gwar's certificate rules instead; the server never re-validates lifetimes
+  of leaves already in a tree (below). A device that cannot replay an old
+  commit because an Add in it carries a key package expired since (only
+  possible when catching up weeks late) rejoins by external commit and gets
+  the epochs in between through history bundles.
 - Ciphersuite `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`, only.
 - Wire format policy `PURE_PLAINTEXT_WIRE_FORMAT_POLICY`: handshake messages
   are `PublicMessage`, so the server can order commits and see senders, as
@@ -147,15 +159,19 @@ one blob. `ds` wraps this with Gwar's rules:
   the GroupInfo signature); checks the descriptor extension parses
   (`SignedDescriptor::parse`), `group_id` is its hash, the external senders
   hold exactly the server key, and every leaf credential is well-formed.
-- `Observer::commit(commit, group_info) -> Accepted`: processes a commit at the
-  observer's epoch, checks Gwar's structural rules on the resulting tree
+- `Observer::commit(self, commit, group_info, welcome) -> (Observer,
+  Accepted)`: consumes the observer, which the server loads from its stored
+  state for each commit, so a rejected commit leaves nothing behind.
+  Processes a commit at the observer's epoch, checks the commit time (see
+  "Commit time") and Gwar's structural rules on the resulting tree
   (well-formed credentials, one leaf per device key, an update keeps uid and
-  device key, the descriptor and external senders unchanged, the membership
-  rule of the kind), merges it, and checks that the uploaded GroupInfo has
-  the new epoch, the observer's new GroupContext and a valid signature.
-  Returns the sender (`Member(index)` or `NewMember`), the leaves added and
-  removed (index, device key, uid), and Welcome recipients are checked
-  against the added leaves' `KeyPackageRef`s.
+  device key, the descriptor, external senders and required capabilities
+  unchanged, the membership rule of the kind), merges it, and checks the
+  uploaded GroupInfo: the observer's new GroupContext and confirmation tag, a
+  ratchet tree extension equal to the observer's tree, and a signature by one
+  of the members. Returns the sender (`Member(index)` or `NewMember`), the
+  leaves added and removed (index, device key, uid), and the device keys the
+  Welcome is for, checked against the added leaves' `KeyPackageRef`s.
 - `Observer::propose_remove(server_signer, leaf) -> bytes`: an external
   `Remove` proposal signed by the server key, also stored in the observer so
   that a commit may include it by reference. Commits may reference only the
@@ -186,10 +202,15 @@ credential, the OpenMLS provider and Gwar's own per-group records.
   merging, the agent reports leaves that are *not current now*; while any
   exist the group is **blocked**: no sending, no history sharing, and the
   caller commits their removal.
-- **Freshness**: per group the highest epoch seen and its epoch
-  authenticator; a GroupInfo or tree behind it, or another authenticator for
-  the same epoch, is rejected.
-- **Pins**: per `(conversation, incarnation)` the group id first joined.
+- **Sending gate**: whether the group is blocked is computed again before
+  every send and history share, at the current time and with the current
+  revocation view, not only after merges.
+- **Freshness**: per group the highest epoch seen and the SHA-256 of its
+  GroupContext (public; it commits to the tree and the transcript). A
+  GroupInfo behind that epoch, or with another GroupContext for the same
+  epoch (a fork), is rejected.
+- **Pins**: per `(server_key, conversation, incarnation)` the group id first
+  joined.
 - **Epoch keys**: after every merge and join,
   `epoch_key = MLS-Exporter("gwar chat v1", group_id, 32)` is stored with
   `(group_id, epoch)`, together with the uids that had leaves in that epoch
@@ -226,8 +247,12 @@ credential, the OpenMLS provider and Gwar's own per-group records.
 - The sender's device key signs each chunk:
   `gwar history chunk v1\n{server_key}\n{group_id}\n{recipient_device_key}\n{recipient_hpke_key}\n{sender_device_key}\n{first_epoch}\n{last_epoch}\n{created_at}\n{sha256(enc ‖ ciphertext)}`.
 - The recipient accepts it only from a sender whose device key is a current
-  member of the group in the recipient's current epoch, imports only epochs it
-  lacks (a key it derived itself always wins), and never overwrites.
+  member of the group in the recipient's current epoch. Each stored key
+  records its provenance: **derived** (by the device itself) or **imported**
+  (with the sender uid). A derived key always wins and imports for that epoch
+  are ignored. If two imports for an epoch disagree, the epoch is marked
+  **conflicted**: its imported key is deleted and later imports for it are
+  ignored, whatever the order they arrive in.
 - Which epochs a sender includes: for a newcomer in a group whose descriptor
   says `history = 1`, every epoch key it holds; for a returning member, only
   epochs whose evidence lists that uid; in a group with `history = 0`, only
@@ -238,20 +263,32 @@ credential, the OpenMLS provider and Gwar's own per-group records.
 - MLS runs in the page's main thread, in the wasm module loaded on first use
   (gzip budget 450 KB, checked in CI).
 - Only one tab per device runs MLS: the Web Locks API lock
-  `gwar-mls:{device_key}` is taken before connecting and released when the
-  connection is replaced or closed.
-- IndexedDB database `gwar-mls-v1`: `openmls` (the provider's key/value
-  pairs), `groups` (Gwar records per group: conversation, incarnation, pin,
-  freshness, blocked state), `epochs` (epoch keys and evidence), `outbox`.
-- Every agent operation ends with `take_changes()`: the changed and deleted
-  keys of all stores, written by the caller in **one** IndexedDB transaction
-  before anything is sent. A crash before the write loses the operation; a
-  crash after it finds the outbox.
+  `gwar-mls:{device_key}` is taken before connecting. Before releasing it
+  (connection replaced or closed) the tab finishes the operation in progress,
+  including its write, and starts no other.
+- One IndexedDB database per device, `gwar-mls-v1-{device_key}`, with stores
+  `openmls` (the provider's key/value pairs), `groups` (Gwar records per
+  group, keyed by server key and group id: conversation, incarnation, pin,
+  freshness), `epochs` (epoch keys with provenance, evidence, conflicts),
+  `outbox`.
+- Agent operations run one at a time. Each ends with `take_changes()`: the
+  changed and deleted keys of all stores, written by the caller in **one**
+  IndexedDB transaction before anything is sent and before the next
+  operation starts. If that write fails, the in-memory agent is dropped and
+  loaded again from IndexedDB. A crash before the write loses the operation;
+  a crash after it finds the outbox.
 - **Outbox**: before sending a commit, its record (group, epoch, commit hash,
   commit, Welcome, GroupInfo) is written with the pending commit. After a
-  reconnect, the client reads the handshake log from that epoch: if the
-  commit there has the same hash it merges, otherwise it discards the
-  pending commit, processes the log and retries if still needed.
+  reconnect, the client reads the handshake log at that epoch:
+  - the same commit hash there: merge the pending commit;
+  - another commit there: discard the pending commit, process the log, and
+    commit again if still needed;
+  - no entry at that epoch yet: nothing won, so send the same bytes again;
+  - the log no longer reaches that epoch (pruned): drop the group state and
+    rejoin by external commit.
+  An external join has no group to fall back to: if another commit wins, the
+  half-joined state is deleted and the join is built again from the newest
+  GroupInfo.
 
 ## 2. Protocol `vc/4` and the delivery service
 
