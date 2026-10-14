@@ -513,7 +513,8 @@ page without scanning key packages.
 
 Events: `mls.commit {group, epoch, proposals, commit}`, `mls.proposal {group,
 epoch, proposal}`, `mls.welcome {group}`, `mls.history {group}`,
-`mls.history.wanted {group, device}`; `mls.welcome` and `mls.history` only
+`mls.history.wanted {group, device}` (with `assignment` in channel and server
+groups, section 4); `mls.welcome` and `mls.history` only
 announce that something can be fetched.
 
 ### Commit ordering
@@ -833,21 +834,27 @@ messages):
   or not it had a leaf before: senders decide by their own evidence), and
   again, as in section 3, while rows it has fetched stay unopenable after
   importing what arrived.
-- The server routes each outstanding request by **assignments**. It keeps,
-  per `(group, recipient device)`, the devices it has **asked**: an
-  assignment is announced (`mls.history.wanted {group, device}`) to a member
-  device that has a leaf in the group's current epoch, is online, and has not
-  been asked yet, preferring distinct uids and the most recently connected
-  sessions, at most three assignments active at a time. An assignment ends
-  when that device stores a chunk for the recipient, answers
-  `mls.history.decline {group, device}` (it has nothing to share), disconnects,
-  or after one minute. While the request is outstanding, each ended
-  assignment without a chunk, and each newly connected eligible device, gets
-  the next device announced. Once every eligible device was asked, the
-  request waits for new ones. A stored chunk ends the request as in section
-  2 (and with it the active assignments); a later request continues with
-  devices not asked yet. The asked set is cleared when the recipient's leaf
-  leaves the group, and entries expire after 30 days.
+- The server routes each outstanding request by **assignments**, kept in
+  memory (a restart of the server starts routing afresh from the stored
+  requests). An assignment has a random id and asks one member device that
+  has a leaf in the group's current epoch and is online:
+  `mls.history.wanted {group, device, assignment}`. At most three are active
+  per request, preferring distinct uids and the most recently connected
+  sessions, and only while the recipient device still has a leaf.
+- An active assignment ends exactly once, by the first of: a chunk stored by
+  that device for the recipient; `mls.history.decline {group, device,
+  assignment}` (nothing to share); its device disconnecting; one minute
+  passing. Responses naming an assignment that is no longer active change
+  nothing. The request keeps, per round, the devices that **declined**; a
+  device whose assignment timed out, was cancelled or lost its connection is
+  not marked and can be asked again (also after it reconnects). While the
+  request is outstanding, every ended assignment and every newly eligible
+  session leads to the next announcement, to a device that has not declined
+  in this round. When every eligible device has declined, the round ends and
+  the next starts after a backoff (one minute, doubling up to an hour).
+- A stored chunk ends the request as in section 2 and cancels its active
+  assignments; a later request starts a new round. Removing the recipient's
+  leaf from the group cancels its request and assignments in the same step.
 - `mls.history.wanted {}` (the request) lists only the calling device's
   active assignments. Direct messages keep section 3's behaviour: every
   member device shares after an admission and answers every announced
@@ -898,8 +905,16 @@ The sealed message requests of section 3 apply to `channel:{id}` and to
   unread rows (`chat.sealed.history`, continuing after byte-short pages) until
   its read mark, the oldest retained row (at most 1000), or `UNREAD_CAP`
   verified messages mentioning it, and opens them to count those mentions,
-  without notifying; at most four conversations at a time. A read, edit or
-  removal arriving meanwhile is applied to the count as for direct messages.
+  without notifying; at most four conversations at a time.
+- **Mention accounting.** The client keeps one mention contribution per
+  conversation and authenticated message identity, from its latest accepted
+  revision. History opening, live delivery and retries after a missing key
+  set that contribution idempotently; an edit replaces it, a removal clears
+  it. Removals are remembered (tombstones) until outstanding scans and opens
+  for that conversation finish, and every result is checked against the
+  current read mark before it is applied. If a scan stopped at `UNREAD_CAP`
+  and the count later falls below it (an edit or removal), the client scans
+  again until the cap, its read mark or the oldest retained row.
   The server cannot check mentions; receiving clients ignore mentions of uids
   that are not members they know.
 - **Notifications** use the existing settings (`mentions`, `allMessages`, own
@@ -934,7 +949,15 @@ chat, direct messages with TeamSpeak users. For text, in this step:
   The same holds from TeamSpeak to Gwar: channel text is attributed to the
   channel the TeamSpeak user was confirmed in when it arrived. Direct
   messages and server chat are classified by their own conversation, never
-  by the sender's voice channel.
+  by the sender's voice channel. In the code this means: `PuppetCmd::Text`
+  carries the originating channel, its classification and a route
+  generation that also changes on every move (today `Local.generation`
+  changes only when a puppet is replaced); `puppet.rs` tracks its confirmed
+  TeamSpeak channel and pending or failed moves, and channel text waits for
+  a confirmed matching channel or is dropped; the query path keeps its
+  awaited move to the message's fixed destination; incoming channel text
+  keeps the channel id and generation captured by the listener, never
+  `Remote.cid` read later.
 - Server chat is bridged only while its stored mode is plaintext (below).
 
 ### Restarts
@@ -946,9 +969,11 @@ channels and server chat:
   incarnation (its live pin). The trigger is an authenticated observation
   behind its durable freshness checkpoint for that group, or forking from it:
   a GroupInfo of an earlier epoch or with another GroupContext for the same
-  epoch, or a log whose head is behind it. A second fetch at least a minute
-  later must show the same; any successful catch-up in between cancels the
-  trigger. A server whose live incarnation is older than the device's pin
+  epoch, or a log whose head is behind it. It takes two such failed checks
+  against the same live pin and checkpoint, at least one minute apart. Any
+  validated response at that checkpoint or continuing from it cancels the
+  trigger, also when there was nothing to merge, and a later failure starts
+  the wait again; a changed pin or checkpoint discards pending checks. A server whose live incarnation is older than the device's pin
   (it lost a restart) never replaces the pin and never leads the device to
   create a sibling: the device stays blocked in that conversation ("Securing
   this conversation…") until the server again holds its pinned incarnation
@@ -963,8 +988,10 @@ channels and server chat:
 - **Accepting.** `mls.group_history {conversation, after?, limit?}` returns
   `{groups: [{group, descriptor}], next}`, the conversation's groups by
   incarnation, each with its complete encoded `SignedDescriptor`, under the
-  conversation's read rule. A device verifies, along the chain: the
-  descriptor's signature and `group_id = SHA256(descriptor)`, server key and
+  conversation's read rule. A device verifies, along the chain: each
+  encoded `SignedDescriptor` parses and its signature verifies, `group`
+  equals its `group_id()` (the SHA-256 of the canonical descriptor statement,
+  section 1, not of the signed envelope), server key and
   conversation, consecutive incarnation numbers, each `previous_group_id`
   equal to the group before, the unchanged fields above, and that each
   creator may create the conversation (at its creation time, by the rules of
@@ -1071,8 +1098,10 @@ limit (about 300 devices):
   encrypted), group creation rules, plaintext/sealed refusals both ways,
   `chat.sealed.remove`, channel deletion cleanup, read marks for channels,
   history routing (three assignments, decline, timeout, disconnect, a newly
-  connected device, and a recipient whose first sharer had only recent keys
-  reaching an older one), `mls.group_history` paging and access, file ties
+  connected device, a timed-out device asked again after reconnecting, a
+  decline for an ended assignment ignored, the recipient removed while
+  assignments run, a full round of declines backing off, and a recipient
+  whose first sharer had only recent keys reaching an older one), `mls.group_history` paging and access, file ties
   and access,
   tree endpoint access and epoch, TeamSpeak text refusal into encrypted
   conversations, no puppet in an encrypted channel, fixed description and
@@ -1085,6 +1114,7 @@ limit (about 300 devices):
 - Web (Playwright, two users with two devices each): create an encrypted
   channel, both join, messages, edits, deletions, a newcomer with and without
   history, mentions counted after opening (also a mention only in the oldest
-  of 101 unread messages), notifications not repeated after a delayed key or
+  of 101 unread messages; a scan overlapping a live edit; a removal while
+  opening; an edit or removal after stopping at 100 of 101 mentions), notifications not repeated after a delayed key or
   an edit, an encrypted attachment opened on the other device, server chat in
   4c.
