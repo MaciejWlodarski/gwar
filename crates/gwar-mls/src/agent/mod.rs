@@ -66,15 +66,7 @@ fn current_time(now: i64) -> Result<()> {
     Ok(())
 }
 fn client_context(context: &GroupContext, server: &str) -> Result<SignedDescriptor> {
-    let descriptor = rules::context(context, server)?;
-    if !context
-        .extensions()
-        .required_capabilities()
-        .is_some_and(|r| r.credential_types().contains(&CredentialType::Basic))
-    {
-        return Err(Invalid("required Basic credential"));
-    }
-    Ok(descriptor)
+    Ok(rules::context(context, server)?)
 }
 fn checkpoint(context: &GroupContext) -> Result<Checkpoint> {
     Ok(Checkpoint {
@@ -259,7 +251,7 @@ pub struct Agent {
 impl Agent {
     pub fn new(seed: [u8; 32], credential: Credential, now: i64) -> Result<Self> {
         let signer = Self::signer(seed, &credential)?;
-        if !(0..=vc_proto::MAX_SAFE_INTEGER).contains(&now) {
+        if !(1..=vc_proto::MAX_SAFE_INTEGER).contains(&now) {
             return Err(Invalid("time"));
         }
         let provider = Provider::default();
@@ -299,7 +291,12 @@ impl Agent {
         let signer = Self::signer(seed, &credential)?;
         let device: DeviceRecord =
             parse(stores.groups.get(b"@device".as_slice()).ok_or(Invalid("missing device record"))?)?;
-        if device.version != 1 || device.device_key != credential.device_key() {
+        if device.version != 1
+            || device.device_key != credential.device_key()
+            || !(1..=vc_proto::MAX_SAFE_INTEGER).contains(&device.created_at)
+            || device.hpke_public
+                != x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(device.hpke_private)).to_bytes()
+        {
             return Err(Invalid("device record"));
         }
         let provider = Provider::default();
@@ -323,6 +320,21 @@ impl Agent {
             ready: false,
             poisoned: false,
         };
+        for key in agent.epochs.keys() {
+            let (group, epoch) = key.rsplit_once('/').ok_or(Invalid("epoch key"))?;
+            if !agent.groups.contains_key(group)
+                || epoch.len() != 20
+                || !epoch.bytes().all(|c| c.is_ascii_digit())
+                || epoch.parse::<u64>().is_err()
+            {
+                return Err(Invalid("epoch key"));
+            }
+        }
+        for key in agent.outbox.keys() {
+            if !agent.groups.contains_key(key) {
+                return Err(Invalid("outbox key"));
+            }
+        }
         for (key, record) in &agent.groups {
             let descriptor = SignedDescriptor::parse(&record.descriptor).ok_or(Invalid("stored descriptor"))?;
             if *key != group_key(&descriptor.descriptor.server_key, &descriptor.group_id()) {
@@ -573,10 +585,37 @@ impl Agent {
                 a.with_key(),
             )
             .map_err(err("create group"))?;
+            client_context(group.public_group().group_context(), &descriptor.descriptor.server_key)?;
             rules::tree(&descriptor, group.public_group().treesync().full_leaves().map(|(_, l)| l))?;
             a.record(&descriptor, Status::Active);
             a.derived(&key, &group)?;
             wire(group.export_group_info(a.provider.crypto(), &a.signer, true).map_err(err("group info"))?)
+        })
+    }
+
+    /// Discard this device's losing creation before joining the server's winner.
+    pub fn abandon(&mut self, server: &str, id: &[u8; 32]) -> Result<()> {
+        self.operation(|a| {
+            let key = group_key(server, id);
+            let record = a.groups.get(&key).ok_or(Invalid("unknown group"))?;
+            let descriptor = SignedDescriptor::parse(&record.descriptor).ok_or(Invalid("descriptor"))?;
+            let mut group = a.mls(&key)?;
+            if record.status != Status::Active
+                || descriptor.creator.device_key() != a.credential.device_key()
+                || descriptor.creator.uid() != a.credential.uid()
+                || group.epoch().as_u64() != 0
+                || a.outbox.contains_key(&key)
+            {
+                return Err(Invalid("cannot abandon"));
+            }
+            group.delete(a.provider.storage()).map_err(err("delete group"))?;
+            a.groups.remove(&key);
+            let prefix = format!("{key}/");
+            let epochs: Vec<_> = a.epochs.keys().filter(|k| k.starts_with(&prefix)).cloned().collect();
+            for epoch in epochs {
+                a.epochs.remove(&epoch);
+            }
+            Ok(())
         })
     }
 
@@ -748,6 +787,7 @@ impl Agent {
                 .propose_adds(packages)
                 .propose_removals(removals.into_iter().map(LeafNodeIndex::new))
                 .force_self_update(true)
+                .leaf_node_parameters(LeafNodeParameters::builder().with_credential_with_key(a.with_key()).build())
                 .load_psks(a.provider.storage())
                 .map_err(err("commit PSKs"))?
                 .build(a.provider.rand(), a.provider.crypto(), &a.signer, |_| true)
@@ -996,7 +1036,10 @@ impl Agent {
             let mut chunks = Vec::new();
             let mut rest = entries.as_slice();
             while let Some((first, _)) = rest.first() {
-                let n = rest.iter().take_while(|(e, _)| e - first < history::MAX_CHUNK_EPOCHS).count();
+                let n = rest
+                    .iter()
+                    .take_while(|(e, _)| e.checked_sub(*first).is_some_and(|span| span < history::MAX_CHUNK_EPOCHS))
+                    .count();
                 let entries = &rest[..n];
                 chunks.push(
                     Chunk::seal(

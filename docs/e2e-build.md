@@ -148,6 +148,10 @@ direct message `private` is 0 and `history` is 1, and both uids are distinct
 and sorted), the creator credential is well-formed with uid `creator_uid`, and
 the signature verifies with its `device_key`.
 
+Restarts are rejected until step 4 specifies the predecessor chain with
+channels: the shared context rules return `Invalid("restart")` for every
+`incarnation != 0`, on the observer and all client creation/join paths.
+
 ### External sender
 
 Every group's `external_senders` holds exactly one entry: the server's
@@ -237,7 +241,12 @@ credential, the OpenMLS provider and Gwar's own per-group records.
   GroupInfo behind that epoch, or with another GroupContext for the same
   epoch (a fork), is rejected.
 - **Pins**: per `(server_key, conversation, incarnation)` the group id first
-  joined.
+  joined; only incarnation zero is accepted until the channels step. On a
+  creation `conflict`, `abandon(server, id)` discards this device's losing
+  creation so it can join the winner by Welcome or external commit. It is
+  allowed only for an active group this device created, still at epoch zero
+  with no outbox, and deletes only its OpenMLS group, group record (pin), and
+  epoch records. Persist before joining the winner; all other cases fail.
 - **Removal of this device**: a commit that removes the device's own leaf is
   processed as any other, but ends its membership: no epoch key is exported
   for the new epoch (OpenMLS refuses, and the device must not have it), the
@@ -251,6 +260,9 @@ credential, the OpenMLS provider and Gwar's own per-group records.
   `(group_id, epoch)`, together with the uids that had leaves in that epoch
   (evidence for history sharing in groups without history, below). Keys stay until the conversation
   is deleted.
+- **Certificate renewal**: loading an agent with a renewed credential makes
+  each subsequent member commit publish it in the committer's path leaf. Do
+  this before the old leaf expires; an expired own leaf requires rejoining.
 - **Commits** never merge locally before the server accepted them (write-ahead
   outbox, below). An external join is different: OpenMLS merges it when it is
   built, so the agent keeps that group as **joining**, persisted but not
@@ -276,7 +288,9 @@ credential, the OpenMLS provider and Gwar's own per-group records.
 - **Device HPKE key**: X25519, generated once per device, kept with the MLS
   state. Published with the statement
   `gwar device hpke v1\n{device_key}\n{hpke_public_key}\n{created_at}`,
-  signed by the device key.
+  signed by the device key. Its creation time is a positive JavaScript safe
+  integer. Loading checks this bound and derives the public key from the stored
+  private key to reject inconsistent pairs; wasm returns the time as a number.
 - A bundle is sent as **chunks** of at most 1000 epochs each; a chunk's
   plaintext lists `(epoch u64 BE, key 32 bytes)` entries for one group,
   sorted by epoch, unique, all within its range.
@@ -321,6 +335,9 @@ credential, the OpenMLS provider and Gwar's own per-group records.
   group, keyed by server key and group id: conversation, incarnation, pin,
   freshness), `epochs` (epoch keys with provenance, evidence, conflicts),
   `outbox`.
+- Loading validates canonical group keys and requires epoch and outbox keys
+  to name a known group exactly. Epoch suffixes are exactly 20 decimal digits
+  encoding a u64; history chunk spans use checked arithmetic.
 - Agent operations run one at a time. Each ends with `take_changes()`: the
   changed and deleted keys of all stores, written by the caller in **one**
   IndexedDB transaction before anything is sent and before the next

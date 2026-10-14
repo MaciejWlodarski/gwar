@@ -253,6 +253,7 @@ fn server_proposals_are_committed_by_reference() {
     let proposal = f.observer.propose_remove(&Ed25519Signer(key(200)), index).unwrap();
     f.a.proposal(&server(), &f.id, &proposal).unwrap();
     f.a.take_changes();
+    assert!(f.a.durable.openmls.keys().any(|k| k.starts_with(b"QueuedProposal")));
     assert!(!f.a.gate(&server(), &f.id, f.t, &()).unwrap().can_send());
     let out = f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
     f.a.take_changes();
@@ -260,6 +261,11 @@ fn server_proposals_are_committed_by_reference() {
     acknowledge(&mut f.a, &f.id, &out);
     f.b.receive(&server(), &f.id, &out.commit, &[proposal]).unwrap();
     f.b.take_changes();
+    for a in [&f.a, &f.b] {
+        assert!(
+            !a.durable.openmls.keys().any(|k| k.starts_with(b"QueuedProposal") || k.starts_with(b"ProposalQueueRefs"))
+        );
+    }
     assert_eq!(f.b.group(&server(), &f.id).unwrap().status, Status::Removed);
 }
 #[test]
@@ -775,4 +781,252 @@ fn external_replacement_cannot_change_uid() {
         Err(AgentError::Rule(ds::DsError::Invalid("external removal")))
     );
     assert!(f.b.take_changes().is_empty());
+}
+
+#[test]
+fn losing_creation_can_be_abandoned_then_join_the_winner() {
+    for welcome in [false, true] {
+        let mut f = fixture();
+        // Preserve a separate group, key packages and the device HPKE key exactly.
+        let other = descriptor(&f.b, &f.a, f.t, false, false);
+        let other_id = other.group_id();
+        f.b.create(other).unwrap();
+        f.b.take_changes();
+        let packages = f.b.key_packages(1, f.t).unwrap();
+        f.b.take_changes();
+        let before = f.b.durable.clone();
+        let losing = descriptor(&f.b, &f.a, f.t, true, true);
+        let losing_id = losing.group_id();
+        f.b.create(losing).unwrap();
+        f.b.take_changes();
+        let saved = f.b.durable.clone();
+        assert_eq!(f.b.join_external(&server(), &f.info, f.t, &()), Err(Invalid("group pin")));
+        f.b = Agent::load([21; 32], f.b.credential.clone(), saved).unwrap();
+        f.b.abandon(&server(), &losing_id).unwrap();
+        f.b.take_changes();
+        assert_eq!(f.b.durable, before);
+        assert!(f.b.group(&server(), &other_id).is_some());
+        f.b = Agent::load([21; 32], f.b.credential.clone(), f.b.durable.clone()).unwrap();
+        if welcome {
+            let out = f.a.commit(&server(), &f.id, &packages, &[], f.t, &()).unwrap();
+            f.a.take_changes();
+            f.observer = accept(f.observer, &out, f.t);
+            acknowledge(&mut f.a, &f.id, &out);
+            f.b.welcome(&server(), "winner", out.welcome.as_ref().unwrap()).unwrap();
+            f.b.take_changes();
+        } else {
+            let out = f.b.join_external(&server(), &f.info, f.t, &()).unwrap();
+            f.b.take_changes();
+            f.observer = accept(f.observer, &out, f.t);
+            acknowledge(&mut f.b, &f.id, &out);
+            f.a.receive(&server(), &f.id, &out.commit, &[]).unwrap();
+            f.a.take_changes();
+        }
+        assert_eq!(f.a.sending_key(&server(), &f.id, f.t, &()), f.b.sending_key(&server(), &f.id, f.t, &()));
+    }
+}
+
+#[test]
+fn abandon_rejects_unknown_joined_advanced_and_pending_groups_without_changes() {
+    for case in 0..5 {
+        let mut f = if case == 2 || case == 3 { joined() } else { fixture() };
+        let agent = match case {
+            0 => &mut f.b, // Unknown group.
+            1 => {
+                f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+                f.a.take_changes();
+                &mut f.a // Creator at epoch zero, but with an outbox.
+            }
+            2 => &mut f.a, // Creator after epoch zero.
+            3 => &mut f.b, // Joined by this device, created by another.
+            _ => {
+                f.b.join_external(&server(), &f.info, f.t, &()).unwrap();
+                f.b.take_changes();
+                &mut f.b // Unaccepted external join.
+            }
+        };
+        let before = agent.durable.clone();
+        assert!(agent.abandon(&server(), &f.id).is_err());
+        assert!(agent.take_changes().is_empty());
+        assert_eq!(agent.durable, before);
+    }
+}
+
+// Build a valid MLS group without Gwar's policy to exercise hostile incoming artifacts.
+fn raw_create(a: &Agent, descriptor: &SignedDescriptor) -> MlsGroup {
+    let extensions = Extensions::from_vec(vec![
+        Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(
+            &[ExtensionType::Unknown(DESCRIPTOR_EXTENSION)],
+            &[],
+            &[CredentialType::Basic],
+        )),
+        Extension::Unknown(DESCRIPTOR_EXTENSION, UnknownExtension(descriptor.encode())),
+        Extension::ExternalSenders(vec![ExternalSender::new(
+            key(200).verifying_key().as_bytes().to_vec().into(),
+            BasicCredential::new(server_credential(&server())).into(),
+        )]),
+    ])
+    .unwrap();
+    MlsGroup::new_with_group_id(
+        &a.provider,
+        &a.signer,
+        &MlsGroupCreateConfig::builder()
+            .ciphersuite(SUITE)
+            .capabilities(capabilities())
+            .use_ratchet_tree_extension(true)
+            .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+            .with_group_context_extensions(extensions)
+            .build(),
+        GroupId::from_slice(&descriptor.group_id()),
+        a.with_key(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn restarts_are_rejected_by_observer_create_and_all_agent_join_paths() {
+    let t = now();
+    let mut a = device(1, 11, t);
+    let mut b = device(2, 21, t);
+    let mut d = descriptor(&a, &b, t, true, true).descriptor;
+    d.incarnation = 1;
+    d.previous_group_id = Some(b64(&[9; 32]));
+    let d = SignedDescriptor::sign(d, a.credential.clone(), &a.signer.0);
+    let mut group = raw_create(&a, &d);
+    let info = wire(group.export_group_info(a.provider.crypto(), &a.signer, true).unwrap()).unwrap();
+    assert!(matches!(Observer::create(&info, &server()), Err(ds::DsError::Invalid("restart"))));
+    let rejected = Err(AgentError::Rule(ds::DsError::Invalid("restart")));
+    assert_eq!(b.join_external(&server(), &info, t, &()), rejected);
+    assert!(b.take_changes().is_empty());
+    b = Agent::load([21; 32], b.credential.clone(), b.durable.clone()).unwrap();
+    let packages = b.key_packages(1, t).unwrap();
+    b.take_changes();
+    let package = KeyPackageIn::tls_deserialize_exact(&packages[0])
+        .unwrap()
+        .validate(a.provider.crypto(), ProtocolVersion::Mls10)
+        .unwrap();
+    let (_, welcome, _) = group.add_members(&a.provider, &a.signer, &[package]).unwrap();
+    assert_eq!(
+        b.welcome(&server(), "restart", &wire(welcome).unwrap()),
+        Err(AgentError::Rule(ds::DsError::Invalid("restart")))
+    );
+    assert!(b.take_changes().is_empty());
+    // Reload the clean creator so its create path is tested independently of raw storage.
+    a = Agent::load([11; 32], a.credential.clone(), a.durable.clone()).unwrap();
+    assert_eq!(a.create(d), Err(AgentError::Rule(ds::DsError::Invalid("restart"))));
+    assert!(a.take_changes().is_empty());
+}
+
+#[test]
+fn self_update_publishes_loaded_renewal_and_keeps_peer_gate_open_after_old_expiry() {
+    let t = now();
+    let mut a = device(1, 11, t);
+    a.credential = certified(&key(1), &key(11), t - 29 * 86_400_000);
+    let mut b = device(2, 21, t);
+    let d = descriptor(&a, &b, t, true, true);
+    let id = d.group_id();
+    let info = a.create(d).unwrap();
+    a.take_changes();
+    let observer = Observer::create(&info, &server()).unwrap();
+    let out = b.join_external(&server(), &info, t, &()).unwrap();
+    b.take_changes();
+    let observer = accept(observer, &out, t);
+    acknowledge(&mut b, &id, &out);
+    a.receive(&server(), &id, &out.commit, &[]).unwrap();
+    a.take_changes();
+    let after_expiry = t + 86_400_000;
+    assert!(!b.gate(&server(), &id, after_expiry, &()).unwrap().can_send());
+    let renewed = certified(&key(1), &key(11), t);
+    let mut a = Agent::load([11; 32], renewed.clone(), a.durable.clone()).unwrap();
+    let out = a.commit(&server(), &id, &[], &[], t, &()).unwrap();
+    a.take_changes();
+    let observer = accept(observer, &out, t);
+    acknowledge(&mut a, &id, &out);
+    b.receive(&server(), &id, &out.commit, &[]).unwrap();
+    b.take_changes();
+    let group = b.mls(&group_key(&server(), &id)).unwrap();
+    assert!(group.public_group().treesync().full_leaves().any(|(_, l)| leaf_credential(l) == Some(renewed.clone())));
+    assert_eq!(observer.epoch(), 2);
+    assert!(b.gate(&server(), &id, after_expiry, &()).unwrap().can_send());
+}
+
+#[test]
+fn load_rejects_noncanonical_and_orphan_store_keys() {
+    let f = joined();
+    let group = group_key(&server(), &f.id);
+    for suffix in [
+        "10",
+        "2",
+        "",
+        "0000000000000000000a",
+        "000000000000000000000",
+        "+0000000000000000001",
+        "18446744073709551616",
+        "00000000000000000001/extra",
+    ] {
+        let mut stores = f.a.durable.clone();
+        stores.epochs.insert(format!("{group}/{suffix}").into_bytes(), json(&EpochRecord::Conflicted));
+        assert!(matches!(Agent::load([11; 32], f.a.credential.clone(), stores), Err(Invalid("epoch key"))));
+    }
+    for which in 0..3 {
+        for key in [b"unknown".to_vec(), format!("{group}/extra").into_bytes(), vec![255]] {
+            let mut stores = f.a.durable.clone();
+            match which {
+                0 => {
+                    let record = stores.groups[&group.as_bytes().to_vec()].clone();
+                    stores.groups.insert(key, record);
+                }
+                1 => {
+                    stores.epochs.insert(key, json(&EpochRecord::Conflicted));
+                }
+                _ => {
+                    stores.outbox.insert(
+                        key,
+                        json(&Outbox {
+                            group: f.id,
+                            epoch: 0,
+                            hash: [0; 32],
+                            commit: vec![],
+                            welcome: None,
+                            group_info: vec![],
+                        }),
+                    );
+                }
+            }
+            assert!(Agent::load([11; 32], f.a.credential.clone(), stores).is_err());
+        }
+    }
+    let mut stores = f.a.durable.clone();
+    stores.epochs.insert(epoch_key(&group, u64::MAX).into_bytes(), json(&EpochRecord::Conflicted));
+    assert!(Agent::load([11; 32], f.a.credential.clone(), stores).is_ok());
+}
+
+#[test]
+fn load_validates_hpke_key_pair_and_positive_safe_statement_time() {
+    let a = device(1, 11, now());
+    for case in 0..6 {
+        let mut stores = a.durable.clone();
+        let mut record: DeviceRecord = parse(&stores.groups[b"@device".as_slice()]).unwrap();
+        match case {
+            0 => record.hpke_public[0] ^= 1,
+            1 => record.hpke_private[1] ^= 1,
+            2 => record.created_at = 0,
+            3 => record.created_at = -1,
+            4 => record.created_at = vc_proto::MAX_SAFE_INTEGER + 1,
+            _ => record.created_at = i64::MAX,
+        }
+        stores.groups.insert(b"@device".to_vec(), json(&record));
+        assert!(matches!(Agent::load([11; 32], a.credential.clone(), stores), Err(Invalid("device record"))));
+    }
+    let credential = Credential::Local { device_key: public(&key(11)) };
+    for t in [0, -1, vc_proto::MAX_SAFE_INTEGER + 1] {
+        assert!(matches!(Agent::new([11; 32], credential.clone(), t), Err(Invalid("time"))));
+    }
+    for t in [1, vc_proto::MAX_SAFE_INTEGER] {
+        let mut a = Agent::new([11; 32], credential.clone(), t).unwrap();
+        a.take_changes();
+        let loaded = Agent::load([11; 32], credential.clone(), a.durable.clone()).unwrap();
+        assert_eq!(loaded.device_hpke_key().created_at, t);
+        assert!(loaded.device_hpke_key().verify());
+    }
 }

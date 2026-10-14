@@ -29,6 +29,9 @@ pub(crate) fn context(context: &GroupContext, server_key: &str) -> Result<Signed
     {
         return Err(Invalid("descriptor"));
     }
+    if descriptor.descriptor.incarnation != 0 {
+        return Err(Invalid("restart"));
+    }
     let required = extensions.required_capabilities().ok_or(Invalid("required capabilities"))?;
     if !required.extension_types().contains(&ExtensionType::Unknown(DESCRIPTOR_EXTENSION))
         || !required.credential_types().contains(&CredentialType::Basic)

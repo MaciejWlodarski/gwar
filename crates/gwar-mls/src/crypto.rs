@@ -65,9 +65,9 @@ impl OpenMlsCrypto for Crypto {
         if hash_type != HashType::Sha2_256 {
             return Err(CryptoError::UnsupportedCiphersuite);
         }
-        let hkdf = hkdf::Hkdf::<Sha256>::from_prk(prk).map_err(|_| CryptoError::InvalidLength)?;
+        let hkdf = hkdf::Hkdf::<Sha256>::from_prk(prk).map_err(|_| CryptoError::HkdfOutputLengthInvalid)?;
         let mut output = vec![0; okm_len];
-        hkdf.expand(info, &mut output).map_err(|_| CryptoError::InvalidLength)?;
+        hkdf.expand(info, &mut output).map_err(|_| CryptoError::HkdfOutputLengthInvalid)?;
         Ok(output.into())
     }
     fn hash(&self, hash_type: HashType, data: &[u8]) -> Result<Vec<u8>, CryptoError> {
@@ -229,6 +229,11 @@ mod tests {
             ours.hkdf_expand(hash, prk.as_slice(), b"info", 64).unwrap(),
             upstream.hkdf_expand(hash, prk.as_slice(), b"info", 64).unwrap()
         );
+        for (prk, length) in [(b"short".as_slice(), 32), (&[7; 32], 255 * 32 + 1)] {
+            let expected = upstream.hkdf_expand(hash, prk, b"info", length);
+            assert_eq!(expected, Err(CryptoError::HkdfOutputLengthInvalid));
+            assert_eq!(ours.hkdf_expand(hash, prk, b"info", length), expected);
+        }
         let (sk, pk) = ours.signature_key_gen(SignatureScheme::ED25519).unwrap();
         let sig = ours.sign(SignatureScheme::ED25519, b"message", &sk).unwrap();
         upstream.verify_signature(SignatureScheme::ED25519, b"message", &pk, &sig).unwrap();
@@ -238,6 +243,37 @@ mod tests {
         let other = upstream.derive_hpke_keypair(HPKE, &[7; 32]).unwrap();
         assert_eq!(pair.public, other.public);
         assert_eq!(pair.private.as_ref(), other.private.as_ref());
+        for length in [0, 32, 64] {
+            let (enc, secret) =
+                ours.hpke_setup_sender_and_export(HPKE, &pair.public, b"info", b"export", length).unwrap();
+            assert_eq!(
+                &secret[..],
+                &upstream
+                    .hpke_setup_receiver_and_export(HPKE, &enc, pair.private.as_ref(), b"info", b"export", length)
+                    .unwrap()[..]
+            );
+            let (enc, secret) =
+                upstream.hpke_setup_sender_and_export(HPKE, &pair.public, b"info", b"export", length).unwrap();
+            assert_eq!(
+                &secret[..],
+                &ours
+                    .hpke_setup_receiver_and_export(HPKE, &enc, pair.private.as_ref(), b"info", b"export", length)
+                    .unwrap()[..]
+            );
+        }
+        let excessive = 255 * 32 + 1;
+        assert_eq!(
+            ours.hpke_setup_sender_and_export(HPKE, &pair.public, b"info", b"export", excessive).unwrap_err(),
+            upstream.hpke_setup_sender_and_export(HPKE, &pair.public, b"info", b"export", excessive).unwrap_err()
+        );
+        let (enc, _) = ours.hpke_setup_sender_and_export(HPKE, &pair.public, b"info", b"export", 32).unwrap();
+        assert_eq!(
+            ours.hpke_setup_receiver_and_export(HPKE, &enc, pair.private.as_ref(), b"info", b"export", excessive)
+                .unwrap_err(),
+            upstream
+                .hpke_setup_receiver_and_export(HPKE, &enc, pair.private.as_ref(), b"info", b"export", excessive)
+                .unwrap_err()
+        );
         let sealed = ours.hpke_seal(HPKE, &pair.public, b"info", b"aad", b"message").unwrap();
         assert_eq!(upstream.hpke_open(HPKE, &sealed, pair.private.as_ref(), b"info", b"aad").unwrap(), b"message");
         let sealed = upstream.hpke_seal(HPKE, &pair.public, b"info", b"aad", b"message").unwrap();

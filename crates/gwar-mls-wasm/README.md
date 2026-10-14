@@ -4,6 +4,7 @@ CI pins the build tools: Rust 1.99.0, wasm-bindgen-cli 0.2.129 and Binaryen
 123.0.0. Install them with registry tools:
 
 ```sh
+pnpm install --frozen-lockfile
 rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.129 --locked --root .build-tools
 npm install --prefix .build-tools --no-audit --no-fund binaryen@123.0.0
@@ -13,13 +14,17 @@ node scripts/mls-wasm/smoke.mjs
 ```
 
 The `wasm-release` profile uses `opt-level=z`, full LTO, one codegen unit,
-abort-on-panic and stripped symbols, followed by Binaryen `-Oz`. OpenMLS's
+abort-on-panic and stripped symbols, followed by Binaryen `-Oz --converge`
+(repeat optimization passes while binary size decreases). OpenMLS's
 `js` feature and getrandom 0.2's `js` feature are enabled. Production wasm
 logging is disabled. CI builds this exact target, runs the smoke test, and
 fails if all emitted wasm and JavaScript files exceed **450,000 bytes gzip**
 (level 9, each file compressed separately). The measured build on Rust 1.99.0
-is 449,280 bytes, including inline JavaScript. Generated files in `pkg` are
-ignored; its package entry is `@gwar/mls-wasm`.
+is 448,618 bytes, including inline JavaScript. Generated files in `pkg` are
+ignored; Cargo metadata resolves the artifact directory, including custom
+`CARGO_TARGET_DIR` values, and a missing artifact fails the build. The loader
+is minified with the existing locked frontend Vite/Rolldown dependency; no
+new dependency is added. Its package entry is `@gwar/mls-wasm`.
 
 ```js
 import init, { Agent } from './pkg/gwar_mls_wasm.js';
@@ -48,6 +53,8 @@ arrays or number arrays; output bytes are number arrays. For example:
 
 ```js
 agent.execute({ device_hpke_key: null });
+// After a creation conflict, persist abandon before joining the winner:
+agent.execute({ abandon: { server, group: losingGroup } });
 agent.execute({ welcome: { server, id: welcomeId, bytes: welcomeBytes } });
 agent.execute({ gate: { server, group, now: Date.now(), revocations: [] } });
 agent.execute({ epoch: { server, group, epoch: '18446744073709551615' } });
@@ -57,13 +64,15 @@ agent.execute({ reconcile: {
 } });
 ```
 
-Operations are `key_packages`, `last_resort_key_package`, `create`, `welcome`,
+Operations are `key_packages`, `last_resort_key_package`, `create`, `abandon`, `welcome`,
 `join_external`, `commit`, `receive`, `proposal`, `pending`, `reconcile`, `gate`,
 `sending_key`, `share_history`, `import_history`, `device_hpke_key`, `group`,
 `epoch`, and `outbox`. Their native signatures and recovery contract are in
 [the core README](../gwar-mls/README.md). `sending_key` returns `[epoch, key]`.
 All epoch values are canonical decimal strings, preserving full u64 precision.
-Other numeric inputs must be safe integers. Unknown fields are rejected.
+Other numeric inputs must be safe integers. Device creation time must be positive;
+the HPKE statement returned by `device_hpke_key` preserves that time exactly.
+Unknown fields are rejected.
 Revocations are `{account_key, device_key, revoked_at}` entries, using the
 earliest timestamp if repeated. Missing records return `null`.
 

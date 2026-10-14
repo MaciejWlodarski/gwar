@@ -2,7 +2,8 @@
 
 `gwar_mls::Agent` implements the client part of MLS core. It has no wasm
 or networking dependency. The observer and agent share structural validation
-in `rules.rs`; the observer's behavior and integration tests are unchanged.
+in `rules.rs`; both reject restart descriptors until the channels step specifies
+the predecessor chain.
 Message encryption (`chat`), server delivery, IndexedDB and Web Locks adapters,
 and web UI integration belong to later steps.
 
@@ -10,7 +11,8 @@ and web UI integration belong to later steps.
 
 All fallible methods return `Result<T, agent::AgentError>`. Server keys are
 canonical base64url Ed25519 public keys, group ids are raw 32-byte hashes,
-times are caller-supplied Unix milliseconds, and epochs are `u64`.
+times are caller-supplied Unix milliseconds within the JavaScript safe-integer
+range, and epochs are `u64`. Device creation time must also be greater than zero.
 
 ```rust
 Agent::new(seed: [u8; 32], credential: Credential, now: i64) -> Result<Agent>
@@ -21,6 +23,7 @@ take_changes() -> Changes
 key_packages(n: usize, now: i64) -> Result<Vec<Vec<u8>>>
 last_resort_key_package(now: i64) -> Result<Vec<u8>>
 create(descriptor: SignedDescriptor) -> Result<Vec<u8>> // GroupInfo
+abandon(server: &str, id: &[u8; 32]) -> Result<()>
 welcome(server: &str, id: &str, bytes: &[u8]) -> Result<WelcomeResult>
 join_external(server: &str, bytes: &[u8], now: i64,
               revocations: &dyn Revocations) -> Result<Outbox>
@@ -83,7 +86,11 @@ callers and tests. Finish the current write before releasing the Web Lock.
 | `outbox` | Same key as group | Pending commit and its delivery artifacts |
 
 Gwar values use strict UTF-8 JSON with unknown fields rejected. Epoch fields
-use canonical decimal strings; epoch keys use 20 zero-padded decimal digits.
+use canonical decimal strings; epoch keys use exactly 20 zero-padded decimal
+digits representing a u64. Loading rejects noncanonical group keys, epoch or
+outbox keys without an exact known group prefix, and malformed epoch suffixes.
+The device record must contain a matching X25519 private/public key pair and
+a positive safe-integer creation time, also used in the wasm HPKE statement.
 Byte fields are arrays. Epoch provenance uses externally tagged variants:
 `{"derived":{"key":[...],"uids":[...]}}`, `{"imported":{...}}`, or `"conflicted"`.
 Sets are sorted. Group descriptors retain conversation/incarnation and the
@@ -104,7 +111,9 @@ and comparing the device's stores per mutation.
 ## Acceptance, sending and recovery
 
 Welcome and external joins validate the resulting tree structurally, with
-pins and freshness. They require no admission proof or server time. Member
+pins and freshness. All group contexts must have incarnation zero; restarts
+return `Invalid("restart")` through the shared rule error until step 4. They
+require no admission proof or server time. Member
 staged commits additionally check introduced/changed certificates at the time
 in signed `ds::commit_aad`. Later revocation or expiry never rejects an otherwise
 valid commit. Joins skip OpenMLS leaf lifetime checks; key packages expire no
@@ -114,7 +123,10 @@ Call `gate` after every join or merge with the caller's current time and
 revocation view. Its `blocked` field reports noncurrent leaf indices;
 `commit` includes their removal automatically. `sending_key` and `share_history`
 recompute the gate. An own-leaf removal proposal or noncurrent own leaf requires
-rejoining. A normal pending member commit retains the prior accepted epoch;
+rejoining. Load with the renewed credential before committing an update while
+the old certificate is still current; every member commit publishes the loaded
+credential in its path leaf, and external joins already use it for their leaf.
+A normal pending member commit retains the prior accepted epoch;
 `pending_commit` reports it separately. A joining external commit exports no
 epoch key and cannot send until accepted.
 
@@ -136,6 +148,13 @@ Feed authoritative log information to `reconcile`:
 | Any other rejection | Keep and retry with caller backoff; `Retry` |
 | `Pruned` with oldest epoch later than source | Delete OpenMLS state and rejoin; `Rejoin` |
 
+When concurrent DM creations produce a server `conflict`, call `abandon` on
+this device's losing group, persist its changes, then join the winner by Welcome
+or external commit. It succeeds only for an active group created by this device,
+still at epoch zero with no outbox. It deletes that OpenMLS group, its group
+record (including the pin), and its epoch records; other groups, key packages
+and the device HPKE key remain unchanged. Every other case is an error.
+
 A losing or expired external join is deleted and returns `Rejoin`. Pins,
 checkpoints, Welcome ids and old keys survive deleting OpenMLS membership.
 Eviction keeps the last member epoch checkpoint; rejoining requires a newer
@@ -154,7 +173,8 @@ imports permanently remove that imported key regardless of arrival order.
 The crypto adapter restricts the standard RustCrypto/HPKE primitives to Gwar's
 single suite and reuses the existing SHA-256 implementation. This avoids linking
 unused algorithms and duplicate hash implementations into wasm. Conformance
-checks compare it with the unmodified provider; existing history vectors and
+checks compare it with the unmodified provider, including HKDF errors and
+HPKE sender/receiver exporters in both directions; existing history vectors and
 observer interoperability tests remain unchanged. The storage adaptation's
 license is in `THIRD_PARTY_NOTICES.md`.
 
@@ -171,26 +191,29 @@ it is not browser IndexedDB, Web Locks or server-integration coverage.
 
 ## Validation commands
 
-Local validation with Rust 1.99.0:
+Local validation with Rust 1.99.0, using
+`CARGO_TARGET_DIR=/tmp/astra-p4-agent-fix-target`:
 
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --exclude vc-desktop --all-targets --offline -- -D warnings
-cargo test --workspace --exclude vc-desktop --exclude vc-client --offline
-cargo test -p vc-client --offline --lib --bins --test client --test handshake --test hostile_server --test voice
-cargo test -p vc-client --offline --doc
-cargo test -p gwar-mls --offline
+cargo clippy --workspace --exclude vc-desktop --all-targets -- -D warnings
+cargo test -p gwar-mls
+cargo test --workspace --exclude vc-desktop --exclude vc-client
+node scripts/mls-wasm/test-build.mjs
+scripts/mls-wasm/build.sh # pinned tools and frontend dependencies; see wasm README
+node scripts/mls-wasm/smoke.mjs
 ```
 
-All passed. The vc-client split deliberately avoids running `teamspeak_mode`
-and `teamspeak_interop`, which require a TeamSpeak server. The MLS suite has
-47 unit tests and the 10 unchanged observer integration tests. Existing ignored
-workspace tests remain ignored. No Gwar external or production service was used.
+All passed. The MLS suite has 53 unit tests and 11 observer integration tests.
+The workspace suite passed 351 tests, with 5 existing TeamSpeak tests ignored.
+No live Gwar or TeamSpeak server was contacted; workspace integration tests
+use their own local test services. CI has not been run remotely for these fixes.
 
-The [wasm build and Node smoke test](../gwar-mls-wasm/README.md) both passed.
-The final production artifact totals 449,280 bytes gzip against the 450,000-byte
-limit (wasm 445,148, loader 3,940, inline JavaScript 192). CI is configured but
-has not been run remotely. No step-1 agent or wrapper work remains deferred;
-the separate sending-gate query and snapshot-based delta tracking are the API
-and storage choices described above. Message seal/open, server delivery and
-browser storage/UI wiring remain outside this task.
+The [wasm build and Node smoke test](../gwar-mls-wasm/README.md) both passed
+using the custom Cargo target directory. The production artifact totals
+448,618 bytes gzip against the 450,000-byte limit (wasm 445,570, minified
+loader 2,856, inline JavaScript 192). The loader uses the existing locked
+Vite/Rolldown minifier, and Binaryen runs `-Oz --converge`; no new dependency
+or larger size budget was introduced. Headroom remains only 1,382 bytes.
+Message seal/open, server delivery and browser storage/UI wiring remain
+outside this task.

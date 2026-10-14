@@ -697,7 +697,7 @@ impl StorageProvider<CURRENT_VERSION> for Storage {
         let proposal_refs: Vec<ProposalRef> = self.read_list(PROPOSAL_QUEUE_REFS_LABEL, &codec::encode(group_id)?)?;
         let mut values = self.values.write().unwrap();
         for proposal_ref in proposal_refs {
-            let key = codec::encode(&(group_id, proposal_ref))?;
+            let key = build_key::<CURRENT_VERSION, _>(QUEUED_PROPOSAL_LABEL, &(group_id, proposal_ref))?;
             values.remove(&key);
         }
 

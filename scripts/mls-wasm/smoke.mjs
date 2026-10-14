@@ -37,6 +37,13 @@ const statement = ['gwar conversation v1', server, `dm:${[a.uid, b.uid].sort().j
 const descriptor = Buffer.concat([Buffer.from(statement), Buffer.from(a.credential), Buffer.from(sign(null, Buffer.from(statement), a.key).toString('base64url'))].map(v => Buffer.concat([Buffer.from(`${v.length}:`), v, Buffer.from(',')])));
 const group = [...hash(statement)];
 a.agent.execute({ op: 'create', descriptor: bytes(descriptor) }); persist(a);
+const losingStatement = statement.split('\n').map((v, i) => i === 10 ? b.uid : v).join('\n');
+const losingDescriptor = Buffer.concat([Buffer.from(losingStatement), Buffer.from(b.credential), Buffer.from(sign(null, Buffer.from(losingStatement), b.key).toString('base64url'))].map(v => Buffer.concat([Buffer.from(`${v.length}:`), v, Buffer.from(',')])));
+const losingGroup = [...hash(losingStatement)];
+b.agent.execute({ op: 'create', descriptor: bytes(losingDescriptor) }); persist(b); reload(b);
+b.agent.execute({ op: 'abandon', server, group: losingGroup }); persist(b); reload(b);
+assert.equal(b.agent.execute({ op: 'group', server, group: losingGroup }), null);
+assert.equal(b.agent.execute({ op: 'epoch', server, group: losingGroup, epoch: '0' }), null);
 const adds = b.agent.execute({ op: 'key_packages', count: 1, now }); persist(b);
 const outbox = a.agent.execute({ op: 'commit', server, group, adds, removes: [], now, revocations: [] }); persist(a); reload(a);
 assert.deepEqual(a.agent.execute({ op: 'outbox', server, group }), outbox);
@@ -52,5 +59,23 @@ assert.throws(() => a.agent.execute({ op: 'receive', server, group, commit: [], 
 assert.deepEqual(a.agent.take_changes(), { openmls: [], groups: [], epochs: [], outbox: [] });
 reload(a);
 assert.equal(a.agent.execute({ op: 'gate', server, group, now, revocations: [] }).status, 'active');
+for (const time of [0, -1, Number.MAX_SAFE_INTEGER + 1]) {
+  assert.throws(() => new Agent(a.seed, a.credential, time));
+}
+for (const time of [1, Number.MAX_SAFE_INTEGER]) {
+  const d = { ...a, agent: new Agent(a.seed, a.credential, time), stores: { openmls: new Map(), groups: new Map(), epochs: new Map(), outbox: new Map() } };
+  persist(d); reload(d);
+  assert.equal(d.agent.execute({ op: 'device_hpke_key' }).created_at, time);
+  const records = Object.fromEntries(Object.entries(d.stores).map(([store, values]) => [store, [...values.values()]]));
+  const storedDevice = records.groups.find(r => Buffer.from(r.key).toString() === '@device');
+  const original = JSON.parse(Buffer.from(storedDevice.value).toString());
+  for (const invalid of [0, -1, Number.MAX_SAFE_INTEGER + 1]) {
+    storedDevice.value = [...Buffer.from(JSON.stringify({ ...original, created_at: invalid }))];
+    assert.throws(() => Agent.load(d.seed, d.credential, records), /device record/);
+  }
+  storedDevice.value = [...Buffer.from(JSON.stringify({ ...original, hpke_public: Array(32).fill(0) }))];
+  assert.throws(() => Agent.load(d.seed, d.credential, records), /device record/);
+  d.agent.free();
+}
 a.agent.free(); b.agent.free();
-console.log('Wasm smoke passed: typed bytes, plain objects, commit recovery, Welcome dedupe, exporter, history, rollback.');
+console.log('Wasm smoke passed: typed bytes, plain objects, abandonment, safe device times, HPKE validation, commit recovery, Welcome dedupe, exporter, history, rollback.');

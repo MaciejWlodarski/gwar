@@ -59,6 +59,10 @@ enum Request {
     Create {
         descriptor: Vec<u8>,
     },
+    Abandon {
+        server: String,
+        group: [u8; 32],
+    },
     Welcome {
         server: String,
         id: String,
@@ -148,7 +152,7 @@ pub struct Agent {
 impl Agent {
     #[wasm_bindgen(constructor)]
     pub fn new(seed_bytes: &[u8], credential_bytes: &[u8], now: f64) -> Result<Agent, JsValue> {
-        if !now.is_finite() || now.fract() != 0.0 || !(0.0..=9_007_199_254_740_991.0).contains(&now) {
+        if !now.is_finite() || now.fract() != 0.0 || !(1.0..=9_007_199_254_740_991.0).contains(&now) {
             return Err(error("invalid time"));
         }
         Ok(Self { inner: Core::new(seed(seed_bytes)?, credential(credential_bytes)?, now as i64).map_err(error)? })
@@ -173,6 +177,7 @@ impl Agent {
                 a.create(SignedDescriptor::parse(&descriptor).ok_or_else(|| error("invalid descriptor"))?)
                     .map_err(error)?,
             ),
+            Request::Abandon { server, group } => output(a.abandon(&server, &group).map_err(error)?),
             Request::Welcome { server, id, bytes } => output(a.welcome(&server, &id, &bytes).map_err(error)?),
             Request::JoinExternal { server, bytes, now, revocations } => {
                 output(a.join_external(&server, &bytes, now, &revocations).map_err(error)?)
