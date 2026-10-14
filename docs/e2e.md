@@ -1,6 +1,7 @@
 # End-to-end encryption (design)
 
-Status: **design** (phase 2). Nothing in this document is implemented. It
+Status: **design** (phase 2); being built in phase 4, see
+[e2e-build.md](e2e-build.md) for the order and the exact encodings. It
 records what was agreed, how it fits the existing identities, protocol and
 server, and what the spikes measured (see "Spikes"). [security.md](security.md)
 describes what is implemented today.
@@ -370,9 +371,11 @@ New epochs come with every membership change and every leaf update.
 
 When the channel's descriptor allows it, a newcomer receives a **history
 bundle**: earlier epoch keys, each tagged with group id and epoch, sealed
-with HPKE (RFC 9180) to the newcomer's leaf encryption key. The sender's
-device key signs the whole bundle: server key, group id, recipient device key
-and leaf key, the HPKE encapsulation and the ciphertext. The newcomer accepts
+with HPKE (RFC 9180) to the newcomer's **device HPKE key**, an X25519 key each
+device publishes signed by its device key (not the leaf encryption key, which
+changes with every update and whose old private halves OpenMLS deletes). The
+sender's device key signs the whole bundle: server key, group id, recipient
+device key and HPKE key, the HPKE encapsulation and the ciphertext. The newcomer accepts
 it only from a device that is a member of the group in its current epoch.
 Any member device that is online sends one.
 The server keeps bundles from up to three different uids and drops the rest.
