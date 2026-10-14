@@ -337,9 +337,11 @@ credential, the OpenMLS provider and Gwar's own per-group records.
     more) is the pending commit discarded and a new one built (fresh time,
     current rules). On any other error (`early`, `bad_request`, …) it is
     kept and sent again with backoff: some checks depend on time (key
-    package lifetimes against the server's system clock), and every commit
-    reaches `expired` within five minutes, so a commit that is really broken
-    holds the group up no longer than that;
+    package lifetimes against the server's system clock), and a commit
+    becomes `expired` once the server's commit clock passes
+    `committed_at + 5 min`, so a commit that is really broken holds the group
+    up only until then (about five minutes when the clocks agree; longer if
+    the commit's time was ahead or the server's clock was set back);
   - the log no longer reaches that epoch (its oldest retained epoch is
     later): drop the group state and rejoin by external commit.
   A joining group (external join) has no older state to fall back to: if
