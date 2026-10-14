@@ -295,7 +295,7 @@ GroupInfo or commit 256 KiB, a Welcome 256 KiB, a history bundle 64 KiB).
 | `mls.key_packages.publish {packages, last_resort?}` | `{count}` | each parsed with `ds::key_package`, device and uid of the session; at most 20 stored plus one last-resort |
 | `mls.key_packages.claim {uids}` | `{packages: [{device_key, package}]}` | one per device of those uids with a package, except the caller's device; consumes a regular one, else returns the last-resort one; skips revoked devices |
 | `mls.devices {uids}` | `{devices: [{uid, device_key, hpke_key, created_at, signature}]}` | published device HPKE keys |
-| `mls.group.create {conversation, group_info, commit?, welcome?}` | `{group}` | the session may create it (below); first wins per `(conversation, incarnation)`, later attempts get `conflict` with the existing group id |
+| `mls.group.create {conversation, group_info}` | `{group}` | the GroupInfo of epoch 0, holding only the creator's device; `Observer::create` accepts it; the session may create it (below); first wins per `(conversation, incarnation)`, later attempts get `conflict` with the existing group id |
 | `mls.group_info {group}` | `{group_info, epoch}` | the session may read the conversation |
 | `mls.commit {group, epoch, commit, group_info, welcome?}` | `{epoch}` or error `stale` | below |
 | `mls.log {group, since, limit}` | `{entries: [{epoch, commit}]}` | commits from epoch `since`, 90 days kept |
@@ -359,9 +359,10 @@ deletes its groups.
   "Not end-to-end encrypted", as today.
 - Opening a conversation: `mls.groups` already lists it, or the client creates
   it: a descriptor (kind `dm`, incarnation 0, history 1), a group with its own
-  leaf, `mls.key_packages.claim {uids: [peer, self]}`, one commit adding every
-  claimed device, then `mls.group.create` with the commit, Welcome and
-  GroupInfo. On `conflict` it discards its group and joins the existing one.
+  leaf, registered with `mls.group.create`; then
+  `mls.key_packages.claim {uids: [peer, self]}` and one `mls.commit` adding
+  every claimed device, with its Welcome. On `conflict` it discards its group
+  and joins the existing one.
 - Devices without a key package (never online since the update), and new
   devices, join on connect by external commit, in the background (design:
   "Joining").
