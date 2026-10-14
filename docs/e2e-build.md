@@ -225,7 +225,8 @@ credential, the OpenMLS provider and Gwar's own per-group records.
   every send and history share, at the current time and with the current
   revocation view, not only after merges. A group with an outstanding server
   proposal (`mls.proposal`, `pending`) is blocked too, until a commit
-  includes it.
+  includes it; if the proposal removes the device's own leaf, the device
+  rejoins instead (see section 3, "Messages").
 - **Freshness**: per group the highest epoch seen and the SHA-256 of its
   GroupContext (public; it commits to the tree and the transcript). A
   GroupInfo behind that epoch, or with another GroupContext for the same
@@ -335,7 +336,8 @@ credential, the OpenMLS provider and Gwar's own per-group records.
     clock, which never goes back, so no earlier copy can be accepted any
     more) or `bad_request` (it breaks a rule, which no later copy can
     change) is the pending commit discarded and a new one built (fresh time,
-    current rules);
+    current rules). On `early` (its time is ahead of the server's clock) or
+    any other error it is kept and sent again later;
   - the log no longer reaches that epoch (its oldest retained epoch is
     later): drop the group state and rejoin by external commit.
   A joining group (external join) has no older state to fall back to: if
@@ -379,8 +381,9 @@ v3.
 Every commit carries its time in the `PublicMessage` authenticated data,
 signed with the commit by its sender: `gwar commit v1\n{committed_at}` (Unix
 ms). The server rejects a commit whose time is more than five minutes behind
-its commit clock with `expired`, and one more than five minutes ahead of it, or
-earlier than the previous commit's time of that group, with `bad_request`.
+its commit clock with `expired`, one more than five minutes ahead of it with
+`early` (it may be accepted later), and one earlier than the previous
+commit's time of that group with `bad_request`.
 The commit clock is the larger of the system clock and the highest value it
 returned before, which is persisted (table `meta`) before any `expired`
 reply, so a system clock set back never revives an expired commit. The
@@ -445,9 +448,10 @@ entry the log still has, or `head` when it has none.
 
 The core actor handles `mls.commit` atomically. The commit must be for
 `group` at exactly the stored epoch, else `stale`; then `Observer::commit`
-must accept it, else `expired` (`DsError::Expired`, checked before anything
-else in the commit) or `bad_request`. A commit that is not expired is judged
-the same way whenever it arrives: key packages in it were valid when stored
+must accept it, else `expired` or `early` (`DsError::Expired` and
+`DsError::Early`; the former is checked before anything
+else in the commit) or `bad_request`. A commit that is neither expired nor
+early is judged the same way whenever it arrives: key packages in it were valid when stored
 and claimed with at least 15 minutes left (clients add none with less than
 10), so none runs out while the commit can still be accepted. An external join (`NewMember`) is allowed
 only for a session whose uid may read the conversation, and its new leaf must
@@ -535,7 +539,15 @@ messages: like signed messages, their author is inside the signature.
   direct message unless its sender or its recipient is a TeamSpeak user
   (messages from TeamSpeak arrive through the bridge), and clients drop a
   plaintext direct message unless one of its two participants is a
-  TeamSpeak user.
+  TeamSpeak user. Such a conversation is `dm_conversation(uid, ts_uid)`
+  with the TeamSpeak participant's `ts:…` id. The verifiers (`vc-proto`
+  `verify_message`, web `verifyMessage`) stop splitting a direct message's
+  conversation on `:` and instead compare it with `dm_conversation` of its
+  two known participants, the author being one of them and every Gwar
+  participant a valid uid; a Gwar author's message to a TeamSpeak user is
+  signed and verified as before, and a TeamSpeak user's message is unsigned.
+  This fixes today's signed Gwar-to-TeamSpeak messages, which fail
+  verification.
 - Opening a conversation: `mls.groups` already lists it, or the client creates
   it: a descriptor (kind `dm`, incarnation 0, history 1), a group with its own
   leaf, registered with `mls.group.create`; then
@@ -571,7 +583,10 @@ messages: like signed messages, their author is inside the signature.
 Sealed writes are also refused with `pending` while the group has an
 outstanding server proposal (see "Removal proposals"). On `stale` or
 `pending` the client catches up (`mls.log`), commits outstanding proposals
-if needed, checks that the group is not blocked, then signs the message again
+if needed (a device whose own leaf an outstanding proposal removes cannot
+commit it: if it may still read the conversation, as after a ban was lifted,
+it rejoins by external commit, replacing its old leaf; otherwise it stops),
+checks that the group is not blocked, then signs the message again
 with the new `group` and `epoch` (same `message_id`, revision and predecessor
 hash) and encrypts it with the new epoch's key. A write is never accepted
 under an epoch a removed device still knows.
