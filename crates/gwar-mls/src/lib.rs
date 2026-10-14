@@ -17,4 +17,5 @@ pub const SUITE: openmls::prelude::Ciphersuite =
 pub const DESCRIPTOR_EXTENSION: u16 = 0xff00;
 
 pub mod ds;
+pub mod history;
 pub mod signer;
