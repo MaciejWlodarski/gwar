@@ -421,8 +421,9 @@ fn an_old_commit_is_expired_even_when_its_key_packages_ran_out() {
     let (mut alice, observer) = dm();
     let saved = observer.save();
     let bob = Device::new(2, 21);
-    let (commit, welcome, info) = alice.add(&[bob.key_package_for(Lifetime::new(1))]);
-    std::thread::sleep(std::time::Duration::from_millis(2500));
+    // Whole-second lifetimes: leave a second for the add itself, then sleep past expiry.
+    let (commit, welcome, info) = alice.add(&[bob.key_package_for(Lifetime::new(2))]);
+    std::thread::sleep(std::time::Duration::from_millis(3500));
     let load = || Observer::load(&saved, &server_key()).unwrap();
     assert_eq!(load().commit(&commit, &info, Some(&welcome), NOW, 0).err(), Some(DsError::Invalid("commit")));
     let late = NOW + ds::MAX_CLOCK_SKEW_MS + 1;

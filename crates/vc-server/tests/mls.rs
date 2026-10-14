@@ -1233,6 +1233,10 @@ async fn sealed_cap_paging_unread_and_persistence() {
             .request(a.id(), 10000 + id, serde_json::from_value(json!({"op":"chat.sealed.send","d":request})).unwrap())
             .await;
         last = a.reply(10000 + id).await.unwrap();
+        // Injected requests bypass the socket; keep it within the idle timeout on slow disks.
+        if id % 100 == 0 {
+            a.sync().await;
+        }
     }
     let store = vc_server::store::Store::open(&database).unwrap();
     assert!(
