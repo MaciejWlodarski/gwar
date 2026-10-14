@@ -25,8 +25,8 @@ export class DirectMessages {
   private queued = new Map<string, number>();
   private removed = new Set<string>();
   private opening = new Set<string>();
-  /** Running unread recounts per peer; true when a removal asked for a fresh pass. */
-  private reading = new Map<string, boolean>();
+  /** Running unread recounts per peer, with the ids removed since each started. */
+  private reading = new Map<string, Set<number>>();
   private unsubscribe: () => void;
   private stopped = false;
   private verifier = new MessageVerifier();
@@ -75,7 +75,7 @@ export class DirectMessages {
           if (row.conversation !== conversation || (before !== undefined && row.id >= before)) throw new Error("Invalid conversation history cursor");
           await this.receive(row, false, epoch);
         }
-      } finally { for (const k of held) this.release(k); }
+      } finally { for (const k of held) this.release(k); this.prune(); }
       check();
       // Byte-limited pages may be short; only an empty page proves the end.
       useSession.getState().dispatch({ type: "dmHistory", peer, hasMore: page.sealed.length > 0 });
@@ -83,18 +83,19 @@ export class DirectMessages {
   }
   /** A read event can advance through rows this device has never loaded. Count
    * ciphertext metadata in bounded pages, without opening or notifying. */
-  async refreshUnread(conversation: string): Promise<void> {
+  async refreshUnread(conversation: string, removed: number[] = []): Promise<void> {
     const peer = dmPeer(conversation, this.uid);
     if (!peer) return;
-    // A running pass may already have counted rows removed since: start it over.
-    if (this.reading.has(peer)) { this.reading.set(peer, true); return; }
-    this.reading.set(peer, false);
+    // A running pass may already have counted rows removed since: it drops them before counting.
+    const running = this.reading.get(peer);
+    if (running) { for (const id of removed) running.add(id); return; }
+    const gone = new Set(removed);
+    this.reading.set(peer, gone);
     const epoch = useSession.getState().epoch;
     try {
       let before: number | null = null, through = 0;
       const ids = new Set<number>();
       for (;;) {
-        if (this.reading.get(peer)) { this.reading.set(peer, false); before = null; through = 0; ids.clear(); }
         this.check(); if (epoch !== useSession.getState().epoch) return;
         const page: { sealed: SealedMessage[] } = await this.link.request("chat.sealed.history", { conversation, before, limit: 100 });
         this.check(); if (epoch !== useSession.getState().epoch) return;
@@ -103,9 +104,8 @@ export class DirectMessages {
           if (row.conversation !== conversation || (before !== null && row.id >= before)) throw new Error("Invalid conversation history cursor");
           ids.add(row.id); through = Math.max(through, row.id);
         }
-        const unread = [...ids].filter(id => id > mark).length;
+        const unread = [...ids].filter(id => id > mark && !gone.has(id)).length;
         const oldest = page.sealed.length ? Math.min(...page.sealed.map(row => row.id)) : 0;
-        if (this.reading.get(peer)) continue;
         if (unread >= 100 || !oldest || oldest <= mark) {
           useSession.getState().dispatch({ type: "dmUnread", peer, count: Math.min(100, unread), through });
           return;

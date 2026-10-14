@@ -887,7 +887,7 @@ it("recounts a conversation's unread messages from the server after a removal", 
   c.dm = dm;
   link.emit({ ev: "chat.sealed.removed", d: { conversation: "dm:x:y", ids: [1] } });
   expect(dm.remove).toHaveBeenCalledWith("dm:x:y", [1]);
-  expect(dm.refreshUnread).toHaveBeenCalledWith("dm:x:y");
+  expect(dm.refreshUnread).toHaveBeenCalledWith("dm:x:y", [1]);
   c.dm = null;
 });
 

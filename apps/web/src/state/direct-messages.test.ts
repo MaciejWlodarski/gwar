@@ -189,16 +189,46 @@ it("bounds notification intent to admitted rows and drops it once they are gone"
   dm.remove(conversation, rows.map(r => r.id)); finish(); await Promise.all(results);
   expect(pending().size).toBe(0);
 });
-it("starts a running unread recount over after a removal", async () => {
+it("drops rows removed during a running unread recount", async () => {
   const sealed = await row();
   useSession.getState().dispatch({ type: "dmStatus", peer: b, securing: false });
   let finish!: (value: unknown) => void;
   request.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; })).mockResolvedValueOnce({ sealed: [] });
   const running = dm.refreshUnread(conversation);
-  void dm.refreshUnread(conversation);
-  finish({ sealed: [{ ...sealed, id: 5 }] });
+  void dm.refreshUnread(conversation, [5]);
+  finish({ sealed: [{ ...sealed, id: 5 }, { ...sealed, id: 6 }] });
   await running;
-  expect(useSession.getState().threads[`dm:${b}`]?.unread ?? 0).toBe(0);
+  expect(useSession.getState().threads[`dm:${b}`]?.unread).toBe(1);
+});
+it("finishes an unread recount while removals keep arriving", async () => {
+  const sealed = await row();
+  useSession.getState().dispatch({ type: "dmStatus", peer: b, securing: false });
+  let calls = 0;
+  request.mockImplementation(async (_method: string, params: { before: number | null }) => {
+    // Bounded, so a recount that keeps restarting fails on the call count instead of hanging.
+    if (++calls < 50) void dm.refreshUnread(conversation, [100 + calls]);
+    const id = (params.before ?? 10) - 1;
+    return { sealed: id ? [{ ...sealed, id }] : [] };
+  });
+  vi.useFakeTimers();
+  try {
+    const running = dm.refreshUnread(conversation);
+    await vi.runAllTimersAsync(); await running;
+  } finally { vi.useRealTimers(); }
+  expect(request).toHaveBeenCalledTimes(10);
+  expect(useSession.getState().threads[`dm:${b}`]?.unread).toBe(9);
+});
+it("drops notification intent once a page releases a row removed while opening", async () => {
+  const sealed = await row();
+  request.mockResolvedValue({ sealed: [sealed] });
+  let finish!: () => void;
+  const paused = new Promise<void>(resolve => { finish = resolve; });
+  runtime.openMessage = vi.fn(async () => { await paused; return { reason: "no_key" as const }; });
+  const opening = dm.open(b);
+  await vi.waitFor(() => expect(runtime.openMessage).toHaveBeenCalledTimes(1));
+  const live = dm.receive(sealed, true);
+  dm.remove(conversation, [sealed.id]); finish(); await Promise.all([opening, live]);
+  expect((dm as unknown as { pending: Set<string> }).pending.size).toBe(0);
 });
 it("refreshes unread counts past byte-limited pages without notifications", async () => {
   const sealed = await row();

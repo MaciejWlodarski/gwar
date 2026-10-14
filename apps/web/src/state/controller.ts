@@ -547,7 +547,7 @@ class Controller {
       } else session.dispatch({ type: "event", event, now: Date.now() });
       if (event.ev === "chat.read" && "conversation" in event.d) void this.dm?.refreshUnread(event.d.conversation).catch(() => {});
       // Removed rows may never have been loaded here: count again from the server.
-      if (event.ev === "chat.sealed.removed") void this.dm?.refreshUnread(event.d.conversation).catch(() => {});
+      if (event.ev === "chat.sealed.removed") void this.dm?.refreshUnread(event.d.conversation, event.d.ids).catch(() => {});
       if (event.ev === "voice.closed") {
         useUi.getState().toast("info", tNow("voice.closed"));
         this.scheduleVoiceRetry(1000);
