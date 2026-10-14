@@ -28,3 +28,7 @@ server-key.ed25519
 # Test output and OS clutter
 apps/web/e2e/screenshots/fail-*.png
 .DS_Store
+
+# Generated MLS bindings and isolated local build tooling
+crates/gwar-mls-wasm/pkg/
+.build-tools/
