@@ -386,7 +386,7 @@ fn commit_times_follow_the_server_clock_and_never_go_back() {
     let load = || Observer::load(&saved, &server_key()).unwrap();
     let skew = ds::MAX_CLOCK_SKEW_MS;
     assert_eq!(load().commit(&commit, &info, None, NOW + skew + 1, 0).err(), Some(DsError::Expired));
-    assert_eq!(load().commit(&commit, &info, None, NOW - skew - 1, 0).err(), Some(DsError::Invalid("commit time")));
+    assert_eq!(load().commit(&commit, &info, None, NOW - skew - 1, 0).err(), Some(DsError::Early));
     assert_eq!(load().commit(&commit, &info, None, NOW, NOW + 1).err(), Some(DsError::Invalid("commit time")));
     let (_, accepted) = load().commit(&commit, &info, None, NOW + skew, NOW).unwrap();
     assert_eq!(accepted.committed_at, NOW);

@@ -32,6 +32,10 @@ pub enum DsError {
     /// be accepted, so its sender builds a new one.
     #[error("commit expired")]
     Expired,
+    /// The commit's time is too far ahead of the server's clock: it may be
+    /// accepted later, so its sender keeps it.
+    #[error("commit too early")]
+    Early,
     #[error("invalid: {0}")]
     Invalid(&'static str),
 }
@@ -287,7 +291,10 @@ impl Observer {
         if now.saturating_sub(committed_at) > MAX_CLOCK_SKEW_MS {
             return Err(DsError::Expired);
         }
-        if committed_at.saturating_sub(now) > MAX_CLOCK_SKEW_MS || committed_at < previous {
+        if committed_at.saturating_sub(now) > MAX_CLOCK_SKEW_MS {
+            return Err(DsError::Early);
+        }
+        if committed_at < previous {
             return Err(Invalid("commit time"));
         }
         let sender = match processed.sender() {
