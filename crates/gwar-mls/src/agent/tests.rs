@@ -1175,3 +1175,95 @@ fn after_a_restart_a_creation_is_settled_with_the_servers_group_list() {
     a.take_changes();
     assert_eq!(a.sending_key(&server(), &id, t, &()), b.sending_key(&server(), &id, t, &()));
 }
+
+#[test]
+fn chat_uses_sending_gate_and_derived_or_imported_epoch_keys() {
+    use crate::chat::{self, ChatError, Context, Plaintext};
+    let mut f = fixture();
+    let d = SignedDescriptor::parse(&f.a.group(&server(), &f.id).unwrap().descriptor).unwrap();
+    let c = Context {
+        server_key: server(),
+        conversation: d.descriptor.conversation,
+        group_id: f.id,
+        epoch: 0,
+        message_id: [7; 16],
+        revision: 0,
+    };
+    let p = Plaintext {
+        text: "hello".into(),
+        mentions: vec![],
+        attachments: vec![],
+        signature: vc_proto::MessageSignature {
+            server_key: server(),
+            conversation: c.conversation.clone(),
+            group_id: b64(&f.id),
+            epoch: "0".into(),
+            message_id: b64(&c.message_id),
+            ..Default::default()
+        },
+    };
+    let ciphertext = chat::seal(&f.a, &c, &p, f.t, &()).unwrap();
+    assert_ne!(ciphertext, chat::seal(&f.a, &c, &p, f.t, &()).unwrap());
+    assert_eq!(chat::open(&f.a, &c, &ciphertext).unwrap().text, "hello");
+    f.a.pending(&server(), &f.id, true).unwrap();
+    f.a.take_changes();
+    assert_eq!(chat::seal(&f.a, &c, &p, f.t, &()).unwrap_err(), ChatError::Agent(AgentError::Blocked));
+    f.a.pending(&server(), &f.id, false).unwrap();
+    f.a.take_changes();
+    let out = f.b.join_external(&server(), &f.info, f.t, &()).unwrap();
+    f.b.take_changes();
+    f.observer = accept(f.observer, &out, f.t);
+    acknowledge(&mut f.b, &f.id, &out);
+    f.a.receive(&server(), &f.id, &out.commit, &[]).unwrap();
+    f.a.take_changes();
+    assert_eq!(chat::open(&f.b, &c, &ciphertext).unwrap_err(), ChatError::NoKey);
+    assert_eq!(chat::seal(&f.a, &c, &p, f.t, &()).unwrap_err(), ChatError::Context);
+    let chunks = f.a.share_history(&server(), &f.id, &f.b.device_hpke_key(), f.t, &()).unwrap();
+    f.a.take_changes();
+    for chunk in chunks {
+        f.b.import_history(&server(), &f.id, &chunk).unwrap();
+        f.b.take_changes();
+    }
+    assert_eq!(chat::open(&f.b, &c, &ciphertext).unwrap().text, "hello");
+    let mut wrong = c.clone();
+    wrong.conversation.push('x');
+    assert_eq!(chat::open(&f.b, &wrong, &ciphertext).unwrap_err(), ChatError::Context);
+}
+
+#[test]
+fn pending_commit_recovery_requires_a_valid_strictly_newer_group_info() {
+    for external in [false, true] {
+        let mut f = joined();
+        let pending = if external {
+            f.a.join_external(&server(), &f.info, f.t, &()).unwrap()
+        } else {
+            f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap()
+        };
+        let mut durable = f.a.durable.clone();
+        f.a.take_changes().apply(&mut durable);
+        let reload = |stores| Agent::load([11; 32], f.a.credential.clone(), stores).unwrap();
+        let mut a = reload(durable.clone());
+        assert!(a.join_external(&server(), &f.info, f.t, &()).is_err());
+        assert!(a.take_changes().is_empty());
+        let mut a = reload(durable.clone());
+        assert_eq!(a.outbox(&server(), &f.id).unwrap().hash, pending.hash);
+        let winner = f.b.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+        f.b.take_changes();
+        f.observer = accept(f.observer, &winner, f.t);
+        let mut invalid = winner.group_info.clone();
+        let last = invalid.len() - 1;
+        invalid[last] ^= 1;
+        assert!(a.join_external(&server(), &invalid, f.t, &()).is_err());
+        assert!(a.take_changes().is_empty());
+        let mut a = reload(durable);
+        let recovery = a.join_external(&server(), &winner.group_info, f.t, &()).unwrap();
+        a.take_changes();
+        assert_eq!(recovery.epoch, pending.epoch + 1);
+        assert_eq!(a.group(&server(), &f.id).unwrap().status, Status::Joining);
+        assert!(a.epoch(&server(), &f.id, recovery.epoch).is_none());
+        assert!(a.sending_key(&server(), &f.id, f.t, &()).is_err());
+        f.observer = accept(f.observer, &recovery, f.t);
+        acknowledge(&mut a, &f.id, &recovery);
+        assert_eq!(a.sending_key(&server(), &f.id, f.t, &()).unwrap().0, recovery.epoch + 1);
+    }
+}

@@ -125,3 +125,8 @@ jobs:
         run: scripts/mls-wasm/build.sh
       - name: JavaScript agent smoke test
         run: node scripts/mls-wasm/smoke.mjs
+      - name: Browser MLS runtime with the local delivery service
+        run: |
+          cargo build -p vc-server --no-default-features
+          pnpm --filter web exec playwright install --with-deps chromium
+          pnpm --filter web e2e:mls

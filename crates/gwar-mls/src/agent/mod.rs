@@ -236,6 +236,20 @@ struct DeviceRecord {
     created_at: i64,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct Member {
+    pub device_key: String,
+    pub uid: String,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct GroupSummary {
+    pub group: [u8; 32],
+    pub conversation: String,
+    pub history: bool,
+    pub record: GroupRecord,
+    pub members: Vec<Member>,
+}
+
 pub struct Agent {
     signer: Ed25519Signer,
     credential: Credential,
@@ -483,6 +497,36 @@ impl Agent {
             .key_package()
             .tls_serialize_detached()
             .map_err(err("key package encoding"))
+    }
+    /// Browser synchronization inventory, including tentative creations and pins.
+    pub fn inventory(&self, server: &str) -> Result<Vec<GroupSummary>> {
+        self.groups
+            .iter()
+            .filter(|(key, _)| key.starts_with(&format!("{server}/")))
+            .map(|(key, record)| {
+                let d = SignedDescriptor::parse(&record.descriptor).ok_or(Invalid("descriptor"))?;
+                let members = if matches!(record.status, Status::Active | Status::Joining | Status::Creating) {
+                    self.mls(key)?
+                        .public_group()
+                        .treesync()
+                        .full_leaves()
+                        .map(|(_, leaf)| {
+                            let c = leaf_credential(leaf).ok_or(Invalid("credential"))?;
+                            Ok(Member { device_key: c.device_key().into(), uid: c.uid() })
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    Vec::new()
+                };
+                Ok(GroupSummary {
+                    group: d.group_id(),
+                    conversation: d.descriptor.conversation,
+                    history: d.descriptor.history,
+                    record: record.clone(),
+                    members,
+                })
+            })
+            .collect()
     }
     pub fn device_hpke_key(&self) -> DeviceHpkeKey {
         DeviceHpkeKey::sign(&self.signer.0, &self.device.hpke_public, self.device.created_at)
@@ -958,7 +1002,11 @@ impl Agent {
             if !a.credential.is_current(now, revocations) {
                 return Err(AgentError::Blocked);
             }
-            if a.outbox.contains_key(&key) {
+            // A signed newer GroupInfo proves the source epoch is already
+            // consumed. This permits recovery when its winning log entry can
+            // no longer be replayed (e.g. expired Add packages). Equal/older
+            // heads must retain the pending bytes for normal reconciliation.
+            if a.outbox.get(&key).is_some_and(|out| info.epoch().as_u64() <= out.epoch) {
                 return Err(Invalid("pending commit"));
             }
             if a.groups.get(&key).is_some_and(|r| {
@@ -984,7 +1032,7 @@ impl Agent {
                 return Err(Invalid("external replacement identity"));
             }
 
-            if a.groups.get(&key).is_some_and(|r| r.status == Status::Active) {
+            if a.groups.get(&key).is_some_and(|r| matches!(r.status, Status::Active | Status::Joining)) {
                 a.drop_mls(&key)?;
             }
             let (group, bundle) = MlsGroup::external_commit_builder()

@@ -81,7 +81,10 @@ the web app.
   of leaves already in a tree (below). A device that cannot replay an old
   commit because an Add in it carries a key package expired since (only
   possible when catching up weeks late) rejoins by external commit and gets
-  the epochs in between through history bundles.
+  the epochs in between through history bundles. If it has an outbox at that
+  epoch, a validated GroupInfo strictly newer than the source epoch may
+  replace the pending state for this recovery; an equal/older head may not.
+  Failure to validate exposes no changes and requires the usual reload.
 - Ciphersuite `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`, only.
 - Wire format policy `PURE_PLAINTEXT_WIRE_FORMAT_POLICY`: handshake messages
   are `PublicMessage`, so the server can order commits and see senders, as
@@ -343,7 +346,13 @@ credential, the OpenMLS provider and Gwar's own per-group records.
   `openmls` (the provider's key/value pairs), `groups` (Gwar records per
   group, keyed by server key and group id: conversation, incarnation, pin,
   freshness), `epochs` (epoch keys with provenance, evidence, conflicts),
-  `outbox`.
+  `outbox`. The browser adapter reserves UTF-8 `@runtime/` keys in that
+  outbox for package publication and history jobs; it filters those keys
+  before passing the four-store snapshot to the core. Core commit keys keep
+  their server/group form and strict validation. History intents for newly
+  admitted devices are written in the same transaction as the accepted
+  group transition; sealed chunk bytes are persisted before sending and
+  reused on retry for server deduplication.
 - Loading validates canonical group keys and requires epoch and outbox keys
   to name a known group exactly. Epoch suffixes are exactly 20 decimal digits
   encoding a u64; history chunk spans use checked arithmetic.

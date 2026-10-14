@@ -4,8 +4,9 @@
 or networking dependency. The observer and agent share structural validation
 in `rules.rs`; both reject restart descriptors until the channels step specifies
 the predecessor chain.
-Message encryption (`chat`), server delivery, IndexedDB and Web Locks adapters,
-and web UI integration belong to later steps.
+Message encryption is in `chat`. The browser delivery, IndexedDB and Web Locks
+adapter is documented in [the web runtime](../../apps/web/src/mls/README.md).
+The DM UI integration remains a separate step.
 
 ## Native API
 
@@ -39,6 +40,7 @@ share_history(server: &str, id: &[u8; 32], recipient: &DeviceHpkeKey,
 import_history(server: &str, id: &[u8; 32], bytes: &[u8]) -> Result<()>
 
 // Queries on &Agent:
+inventory(server: &str) -> Result<Vec<GroupSummary>>
 device_hpke_key() -> DeviceHpkeKey
 group(server: &str, id: &[u8; 32]) -> Option<&GroupRecord>
 epoch(server: &str, id: &[u8; 32], epoch: u64) -> Option<&EpochRecord>
@@ -70,6 +72,27 @@ contains the source epoch, group id, SHA-256 of the commit, commit bytes,
 optional Welcome and resulting GroupInfo. `WelcomeResult` gives the group id
 and a `duplicate` flag; acknowledge both results after persistence.
 
+## Chat envelope
+
+`chat::seal(&Agent, &Context, &Plaintext, now, revocations)` returns nonce,
+ciphertext and tag bytes. It obtains the key through `sending_key`, checks
+that the context names the descriptor's conversation and current epoch, then
+uses HKDF-SHA256 with the raw 16-byte message id and big-endian u32 revision,
+and AES-256-GCM with a fresh random 96-bit nonce. The AAD is exactly the
+versioned statement in the build spec.
+
+`chat::open(&Agent, &Context, ciphertext)` returns `Plaintext` or `ChatError`.
+It uses derived or imported epoch keys and checks the inner signature's
+server, conversation, group, epoch, message id and revision. Missing groups
+or keys return `NoKey`; authentication/JSON errors cannot yield plaintext.
+The caller **must verify the returned v3 MessageSignature**, including
+revision and revocation rules. This module does not assert author authenticity.
+
+`inventory(server)` returns each group's id, conversation, history policy,
+record and current member device keys/uids, including Creating groups. It
+allows the runtime to settle creations and atomically queue history intents
+when an accepted transition admits devices without parsing OpenMLS records.
+
 ## Operation and persistence contract
 
 Acquire `gwar-mls:{device_key}` with Web Locks before opening the connection.
@@ -99,6 +122,10 @@ callers and tests. Finish the current write before releasing the Web Lock.
 | `groups` | UTF-8 `@device` | Version 1, device key, HPKE private/public key and statement creation time |
 | `epochs` | UTF-8 `{server_key}/{group_id_base64url}/{epoch:020}` | Derived key and UID evidence, imported key and sender UIDs, or conflicted |
 | `outbox` | Same key as group | Pending commit and its delivery artifacts |
+
+The web runtime also owns `@runtime/` outbox keys for package publication and
+history jobs; its adapter filters that namespace before `Agent::load`. Core
+load continues to reject any outbox key without a known group.
 
 Gwar values use strict UTF-8 JSON with unknown fields rejected. Epoch fields
 use canonical decimal strings; epoch keys use exactly 20 zero-padded decimal
@@ -171,7 +198,13 @@ Eviction, pruned recovery, losing/expired external joins and lost creations leav
 no OpenMLS records for that group. Eviction keeps the last member epoch
 checkpoint and application epoch keys; rejoining requires a newer GroupInfo.
 Rebuilds use the current time and revocation view. No method retries network
-operations or invents server acceptance.
+operations or invents server acceptance. If a winning log entry cannot be
+replayed (for example an expired Add key package), `join_external` can replace
+a pending commit only from a validated GroupInfo **strictly newer than its
+source epoch**. Equal/older heads cannot discard the outbox. Invalid newer
+GroupInfos poison the operation without exposing changes, so reload retains
+the pending bytes. A successful recovery is still Joining with no new sending
+key until its external commit is accepted.
 
 History sharing verifies the recipient's signed HPKE statement and membership.
 History-on shares all nonconflicted held keys. History-off shares only locally
@@ -201,42 +234,33 @@ policy/conflicts, lifetime handling and persistence. The wasm smoke test runs
 in Node with in-memory stores and a simulated authoritative acceptance result;
 it is not browser IndexedDB, Web Locks or server-integration coverage.
 
-## Validation commands
-
-Local validation with Rust 1.99.0, using
-`CARGO_TARGET_DIR=/tmp/astra-p4-agent-fix-target`:
+## Validation
 
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --exclude vc-desktop --all-targets -- -D warnings
-cargo test -p gwar-mls
-cargo test --workspace --exclude vc-desktop --exclude vc-client
+cargo clippy -p gwar-mls -p gwar-mls-wasm --all-targets -- -D warnings
+cargo test -p gwar-mls -p gwar-mls-wasm
 node scripts/mls-wasm/test-build.mjs
-scripts/mls-wasm/build.sh # pinned tools and frontend dependencies; see wasm README
+scripts/mls-wasm/build.sh # pinned tools; see wasm README
 node scripts/mls-wasm/smoke.mjs
+pnpm --filter web lint
+pnpm --filter web test
+pnpm --filter web build
+cargo build -p vc-server --no-default-features
+pnpm --filter web e2e:mls
 ```
 
-All commands passed for round 2. The MLS suite has 55 unit tests and 11
-observer integration tests. The workspace suite passed 353 tests, with 5
-existing TeamSpeak tests ignored. Regressions cover persisted creation
-acceptance, settling a lost reply and a lost creation, complete eviction
-cleanup (including a losing pending commit and referenced proposals), pruned
-membership and external-join cleanup, unrelated storage preservation, and
-the 480,000-byte aggregate gzip limit.
+The native suite has 61 unit tests and 11 observer integration tests. Chat
+coverage includes an independently generated Node HKDF/AES-GCM fixed vector,
+every AAD/inner context field, random nonces, wrong keys, every truncation,
+tampered nonce/ciphertext/tag, the sending gate and imported history keys.
+The wasm smoke test also covers chat and inventory. The browser test uses the
+real delivery service, four device runtimes, IndexedDB and Web Locks, with no
+DM UI or chat.sealed server calls. Remote CI and production were not run.
 
-The production wasm artifact measured with Node **22.23.3** totals **450,867
-bytes gzip**: wasm 447,824, minified loader 2,852, inline JavaScript 191.
-The 480,000-byte budget leaves 29,133 bytes of headroom for message encryption.
-The build uses Rust 1.99.0, wasm-bindgen 0.2.129 and Binaryen 123.0.0.
-On this macOS host, the wasm build needed the installed rustup toolchain's
-`bin` ahead of Homebrew Rust (which lacked the wasm target), plus a local
-linker wrapper setting `DYLD_LIBRARY_PATH` to that same toolchain's `lib`
-directory so `rust-lld` could find `libLLVM.dylib`. These are local environment
-adjustments; CI uses the pinned tools in its Linux job.
-
-The Node smoke test passed creation settlement (won and lost), eviction cleanup,
-commit recovery, Welcome deduplication, matching exporters, history and rollback.
-No live Gwar or TeamSpeak server was contacted; workspace integration tests
-use their own local test services. Remote CI has not been run for these fixes.
-Message seal/open, server delivery and browser storage/UI wiring remain
-outside this task.
+With Rust 1.99.0, Node **22.23.3**, wasm-bindgen 0.2.129 and Binaryen 123.0.0,
+the artifact totals **474,799 bytes gzip**: wasm 471,756, minified loader 2,852,
+inline JavaScript 191; 5,201 bytes below the 480,000-byte limit.
+On this macOS host the wasm build uses the rustup toolchain's `bin` ahead of
+Homebrew Rust and a local rust-lld wrapper setting `DYLD_LIBRARY_PATH` to that
+toolchain's `lib` directory. CI uses the pinned Linux job.
