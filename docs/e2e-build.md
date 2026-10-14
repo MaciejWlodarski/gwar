@@ -90,7 +90,8 @@ the web app.
   are `PublicMessage`, so the server can order commits and see senders, as
   the design requires. Gwar sends no MLS application messages; chat uses
   epoch keys (below).
-- Ratchet tree extension in every GroupInfo and Welcome.
+- Ratchet tree extension in every GroupInfo and Welcome, except GroupInfos
+  of channel and server groups after creation (section 4, "Large groups").
 - `RequiredCapabilities` in every group: extension `0xff00` (descriptor),
   credential type Basic. Every leaf and key package lists `0xff00`.
 
@@ -188,8 +189,8 @@ one blob. `ds` wraps this with Gwar's rules:
   changes certified at its time; an external commit replaces only the
   joiner's own earlier leaf), merges it, and checks the
   uploaded GroupInfo: the observer's new GroupContext and confirmation tag, a
-  ratchet tree extension equal to the observer's tree, and a signature by one
-  of the members. Returns the sender (`Member(index)` or `NewMember`), the
+  ratchet tree extension equal to the observer's tree (none in channel and
+  server groups, section 4), and a signature by one of the members. Returns the sender (`Member(index)` or `NewMember`), the
   leaves added and removed (index, device key, uid), and the device keys the
   Welcome is for, checked against the added leaves' `KeyPackageRef`s.
 - `Observer::propose_remove(server_signer, leaf) -> bytes`: an external
@@ -779,7 +780,9 @@ then channel info says "Messages are end-to-end encrypted", not more.
 - `ServerInfo` gains `teamspeak` (TeamSpeak compatibility is on) and
   `server_chat: {encrypted, history}`, so clients can pick the defaults.
 - With TeamSpeak compatibility the default channel stays plaintext:
-  `server.update` refuses an encrypted `default_channel` (`bad_request`).
+  `server.update` refuses an encrypted `default_channel` (`bad_request`), and
+  the server refuses to start with TeamSpeak compatibility while the stored
+  default channel is encrypted (see "Server-wide chat").
   Channels created by a new server's database setup are encrypted unless
   TeamSpeak compatibility is on.
 - Existing channels keep `encrypted = false`; nothing is converted.
@@ -825,19 +828,38 @@ is driven by the newcomer and routed by the server, instead of every member
 device sharing on its own (section 3, which stays as it is for direct
 messages):
 
-- After joining a channel group whose descriptor says `history = 1`, the new
-  device calls `mls.history.request {group}`. In a group with `history = 0`
-  it calls it only if it had a leaf in the group before (a returning member,
-  by its own pin).
-- The server announces `mls.history.wanted {group, device}` to at most three
-  online sessions of distinct uids whose devices have leaves in the group's
-  current epoch, chosen by the server (the most recently connected), and
-  records them with the request. If none of them
-  stored a chunk for the request within one minute, or one disconnects, it
-  announces it to the next ones. `mls.history.wanted {}` (the request) lists
-  only the requests announced to the calling device.
-- A device answers as in section 3, by its own evidence. The server's quota
-  (three sender uids per recipient and group) is unchanged.
+- After joining a channel or server group, the new device calls
+  `mls.history.request {group}` (whatever the group's `history`, and whether
+  or not it had a leaf before: senders decide by their own evidence), and
+  again, as in section 3, while rows it has fetched stay unopenable after
+  importing what arrived.
+- The server routes each outstanding request by **assignments**. It keeps,
+  per `(group, recipient device)`, the devices it has **asked**: an
+  assignment is announced (`mls.history.wanted {group, device}`) to a member
+  device that has a leaf in the group's current epoch, is online, and has not
+  been asked yet, preferring distinct uids and the most recently connected
+  sessions, at most three assignments active at a time. An assignment ends
+  when that device stores a chunk for the recipient, answers
+  `mls.history.decline {group, device}` (it has nothing to share), disconnects,
+  or after one minute. While the request is outstanding, each ended
+  assignment without a chunk, and each newly connected eligible device, gets
+  the next device announced. Once every eligible device was asked, the
+  request waits for new ones. A stored chunk ends the request as in section
+  2 (and with it the active assignments); a later request continues with
+  devices not asked yet. The asked set is cleared when the recipient's leaf
+  leaves the group, and entries expire after 30 days.
+- `mls.history.wanted {}` (the request) lists only the calling device's
+  active assignments. Direct messages keep section 3's behaviour: every
+  member device shares after an admission and answers every announced
+  request.
+- A device answers an assignment as in section 3, by its own evidence, or
+  declines. The quota (chunks from three sender uids per recipient and group)
+  and acknowledgements are unchanged.
+- Rows from epochs the device still has no key for show, in a group with
+  `history = 1`, "Earlier messages will appear when another member is
+  online"; in a group with `history = 0`, rows from before the device's
+  first epoch are collapsed into one muted line, "Earlier messages aren't
+  shared with new members".
 - **Evidence** is stored per group as intervals instead of per-epoch lists:
   for every uid, the ranges of epochs in which it had a leaf, as the device
   saw them. The agent records it after every merge and join; the rule "only
@@ -872,12 +894,20 @@ The sealed message requests of section 3 apply to `channel:{id}` and to
   `Welcome.conversations` lists channel conversations with unread messages
   too; `Welcome.unread` keeps listing plaintext channels only.
 - **Mentions** are inside the ciphertext. After connecting, for every
-  conversation with unread messages the client fetches the unread rows (at
-  most `UNREAD_CAP`) and opens them to count its mentions, without notifying.
-  Live messages are opened and then notify by the channel's notification
-  setting; a key arriving later never notifies twice (as for direct messages).
+  conversation with unread messages the client pages backwards through the
+  unread rows (`chat.sealed.history`, continuing after byte-short pages) until
+  its read mark, the oldest retained row (at most 1000), or `UNREAD_CAP`
+  verified messages mentioning it, and opens them to count those mentions,
+  without notifying; at most four conversations at a time. A read, edit or
+  removal arriving meanwhile is applied to the count as for direct messages.
   The server cannot check mentions; receiving clients ignore mentions of uids
   that are not members they know.
+- **Notifications** use the existing settings (`mentions`, `allMessages`, own
+  messages and the focused conversation suppressed), decided after the
+  authenticated opening. Only a live original message (revision 0) makes a
+  message eligible; history, edits and deletions never do. Eligibility is
+  consumed once, also when the decision is to stay silent, and survives
+  retries after a missing key without notifying twice.
 
 ### TeamSpeak
 
@@ -894,28 +924,57 @@ chat, direct messages with TeamSpeak users. For text, in this step:
   puppet in an encrypted channel: a Gwar user in an encrypted channel has no
   puppet, except one kept for direct messages with TeamSpeak users, which
   stays in the default channel and carries text only.
-- With TeamSpeak compatibility, server chat is plaintext and bridged as
-  today. Without it, nothing is bridged anyway.
+- Bridge text boundaries (design: "TeamSpeak and plaintext channels"): every
+  queued channel text keeps the Gwar channel it came from, whether that
+  channel is encrypted, and the generation of the puppet or query route it
+  was queued for. Delivery checks them again: channel text is sent only by a
+  puppet whose confirmed TeamSpeak channel is that channel's, and through the
+  query only to that channel's TeamSpeak channel; text queued across a move,
+  a failed move or a reconnect is dropped, never sent into another channel.
+  The same holds from TeamSpeak to Gwar: channel text is attributed to the
+  channel the TeamSpeak user was confirmed in when it arrived. Direct
+  messages and server chat are classified by their own conversation, never
+  by the sender's voice channel.
+- Server chat is bridged only while its stored mode is plaintext (below).
 
 ### Restarts
 
 Incarnations above zero are accepted from this step on, for direct messages,
 channels and server chat:
 
-- A device restarts a conversation when its group cannot continue for it:
-  the server's GroupInfo or log is behind its freshness checkpoint, or forks
-  from it, and stays so after one more fetch a minute later. It creates the
-  next incarnation (`previous_group_id` the live group, same kind,
-  conversation, `private`, `history`, `founding_owner`) and registers it with
-  `mls.group.create`; the server accepts it only as the successor of its live
-  group (as implemented), first wins.
-- Clients accept a successor only if it names the incarnation they pinned (or
-  a successor they accepted), keeps those fields, and its creator may create
-  the conversation. They pin it, keep the old incarnation's keys for reading,
-  stop writing to it, and show a quiet line "This conversation was restarted".
-  A client that missed several restarts follows the chain through
-  `mls.group_history {conversation}`, which lists the conversation's groups by
-  incarnation with their descriptors.
+- **Trigger.** A device considers restarting only its highest accepted
+  incarnation (its live pin). The trigger is an authenticated observation
+  behind its durable freshness checkpoint for that group, or forking from it:
+  a GroupInfo of an earlier epoch or with another GroupContext for the same
+  epoch, or a log whose head is behind it. A second fetch at least a minute
+  later must show the same; any successful catch-up in between cancels the
+  trigger. A server whose live incarnation is older than the device's pin
+  (it lost a restart) never replaces the pin and never leads the device to
+  create a sibling: the device stays blocked in that conversation ("Securing
+  this conversation…") until the server again holds its pinned incarnation
+  or a successor of it.
+- **Creating.** The device persists one restart candidate per predecessor:
+  the next incarnation (`previous_group_id` its pinned live group, the same
+  kind, conversation, `private`, `history` and `founding_owner`), created as
+  a **Creating** group, then registers it with `mls.group.create` and settles
+  as in section 3: the server accepts only the successor of its live group
+  (as implemented), first wins, and a device that lost joins the winner after
+  accepting it below.
+- **Accepting.** `mls.group_history {conversation, after?, limit?}` returns
+  `{groups: [{group, descriptor}], next}`, the conversation's groups by
+  incarnation, each with its complete encoded `SignedDescriptor`, under the
+  conversation's read rule. A device verifies, along the chain: the
+  descriptor's signature and `group_id = SHA256(descriptor)`, server key and
+  conversation, consecutive incarnation numbers, each `previous_group_id`
+  equal to the group before, the unchanged fields above, and that each
+  creator may create the conversation (at its creation time, by the rules of
+  "Who may do what"). An existing device anchors the chain at its highest
+  accepted pin; a new device validates from incarnation zero (the
+  first-contact limit of the design's "Freshness"). The accepted pins and the
+  highest live incarnation are persisted in one write; a predecessor is never
+  live again. Old incarnations keep their keys for reading and nobody writes
+  to them; the conversation shows a quiet line "This conversation was
+  restarted".
 
 ### Encrypted attachments (4b)
 
@@ -930,16 +989,26 @@ channels and server chat:
   2). The plaintext JSON's attachment objects carry the same plus the file id;
   width and height, if present, are unsigned display hints, checked against
   the decoded image.
-- `chat.sealed.send` gains `files: [id]` (at most 10, distinct): uploads of
-  the session's uid that are finished and not attached to any message; they
-  are tied to the message in the same transaction. Edits keep the files (the
-  client checks that every revision but the deletion lists the same
-  attachments);
-  `chat.delete_own`, `chat.sealed.remove`, pruning and channel deletion
-  delete them.
-- Downloads: with `file_access = members`, a session that may read the sealed
-  message's conversation; with `link`, anyone with the link, who gets only
-  ciphertext.
+- The upload's `sealed` flag is stored with the file. `chat.sealed.send`
+  gains `files: [id]` (at most 10, distinct): sealed uploads of the session's
+  uid that are finished and not attached to any message; they are tied to
+  the message in the same transaction. Plaintext `chat.send` accepts only
+  plaintext uploads. A file belongs to at most one message, plaintext
+  (`files.message`) or sealed (a new `files.sealed_message`), never both;
+  sealed and plaintext numeric ids are separate and can coincide, so every
+  lookup names which one. Edits keep the files (the client checks that every
+  revision but the deletion lists the same attachments).
+- Every deletion path deletes a sealed message's files with it, in the same
+  transaction: `chat.delete_own`, `chat.sealed.remove`, pruning past 1000,
+  channel deletion, and member removal or pruning with `delete_messages`
+  (including the CLI). Without `delete_messages`, member removal keeps the
+  files of the messages it keeps. Every predicate that finds unattached or
+  orphaned files (pending-upload cleanup, `expire_unattached`, removal)
+  considers both associations. Bytes are unlinked as today: deferred, after
+  active downloads end, and charged to the uploader until they are gone.
+- Downloads: with `file_access = members`, a session that may read the
+  conversation of the file's sealed message, resolved through that
+  association; with `link`, anyone with the link, who gets only ciphertext.
 - Receiving: download, check the ciphertext's hash and size, decrypt, check
   the plaintext's hash and size, then show (images from a `blob:` URL).
   A failure shows the attachment as "Can't open this file". Direct messages
@@ -947,10 +1016,19 @@ channels and server chat:
 
 ### Server-wide chat (4c)
 
-- The server's mode is chosen when its database is created: encrypted with
-  history, unless TeamSpeak compatibility is on (plaintext). It is stored in
-  `meta` and never changes. Turning TeamSpeak compatibility on later keeps an
-  encrypted server chat, which is then not bridged.
+- The server's mode (`plaintext`, or `encrypted` with history) is stored in
+  `meta` and never changes once set. An existing database is set to
+  `plaintext` by the migration. A new database gets it at the first start of
+  the server itself (`vc-server` serving, not administrative commands such as
+  `admin-token`, which leave it unset): `plaintext` with TeamSpeak
+  compatibility, `encrypted` without. From then on the stored mode decides:
+  server chat is bridged only when it is plaintext, plaintext `chat.send` to
+  the server is refused when it is encrypted, and sealed requests for
+  `server` are refused when it is plaintext.
+- Turning TeamSpeak compatibility on later keeps an encrypted server chat
+  (not bridged). The server refuses to start with TeamSpeak compatibility
+  while the default channel is encrypted, saying to choose a plaintext default
+  channel first (`server.update`, without TeamSpeak compatibility).
 - Encrypted server chat is conversation `server` (kind `server`), stored as
   sealed messages, with the channel rules above (read by every member, joined
   on connect, history routed by the server). Plaintext server chat stays
@@ -964,7 +1042,13 @@ limit (about 300 devices):
 
 - Channel and server groups leave the ratchet tree out of the GroupInfos
   uploaded with commits (no `ratchet_tree` extension); only the creation's
-  GroupInfo, with its single leaf, carries it. Joiners fetch the tree of the current epoch
+  GroupInfo, with its single leaf, carries it. Committers produce that
+  GroupInfo explicitly (OpenMLS `create_group_info(true)` with tree inclusion
+  disabled; disabling tree inclusion alone also stops OpenMLS from producing
+  a GroupInfo). For these groups `Observer::commit` accepts a GroupInfo with
+  exactly the `external_pub` extension and no tree, and keeps every other
+  check (the observer's new GroupContext and confirmation tag, a member's
+  signature). Creation, and direct messages throughout, keep today's checks. Joiners fetch the tree of the current epoch
   over HTTP: `GET /api/mls/{group}/tree`, with the session's file access
   token as `Authorization: Bearer …`, answered with the TLS-encoded ratchet
   tree the observer holds and `x-gwar-epoch`; 404 if the session may not
@@ -977,16 +1061,30 @@ limit (about 300 devices):
 
 ### Tests
 
-- `gwar-mls`: restart acceptance (successor fields, chain, creator),
-  evidence intervals, external join with a tree supplied separately.
+- `gwar-mls`: restart acceptance (successor fields, chain, creator, a new
+  device from incarnation zero, a server behind the pin creating no
+  sibling), evidence intervals, external join with a tree supplied
+  separately, `Observer::commit` with a tree-free GroupInfo in channel groups
+  and refusing one in direct messages.
 - Server: channel options and their refusals (password, update, default
-  channel), group creation rules, plaintext/sealed refusals both ways,
+  channel, starting with TeamSpeak compatibility while the default channel is
+  encrypted), group creation rules, plaintext/sealed refusals both ways,
   `chat.sealed.remove`, channel deletion cleanup, read marks for channels,
-  history routing (three devices, re-announcement), file ties and access,
+  history routing (three assignments, decline, timeout, disconnect, a newly
+  connected device, and a recipient whose first sharer had only recent keys
+  reaching an older one), `mls.group_history` paging and access, file ties
+  and access,
   tree endpoint access and epoch, TeamSpeak text refusal into encrypted
   conversations, no puppet in an encrypted channel, fixed description and
-  join power.
+  join power; queued channel text dropped across a move, a failed move and a
+  reconnect; uploads of the other mode refused, a file reused, plaintext and
+  sealed messages with the same numeric id; member removal with and without
+  `delete_messages` and unattached-file expiry keeping or deleting the right
+  files; server chat mode after migration, after `admin-token` on a new
+  database, and when TeamSpeak compatibility is turned on later.
 - Web (Playwright, two users with two devices each): create an encrypted
   channel, both join, messages, edits, deletions, a newcomer with and without
-  history, mentions counted after opening, an encrypted attachment opened on
-  the other device, server chat in 4c.
+  history, mentions counted after opening (also a mention only in the oldest
+  of 101 unread messages), notifications not repeated after a delayed key or
+  an edit, an encrypted attachment opened on the other device, server chat in
+  4c.
