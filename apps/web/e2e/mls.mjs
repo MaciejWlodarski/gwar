@@ -17,7 +17,8 @@ async function port() {
   const port = server.address().port; await new Promise(resolve => server.close(resolve)); return port;
 }
 function start(command, args, cwd) {
-  const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
+  // Own process group: `pnpm exec` does not reliably pass SIGTERM on to vite.
+  const child = spawn(command, args, { cwd, stdio: ["ignore", "pipe", "pipe"], detached: true });
   child.output = ""; child.stdout.on("data", b => { child.output += b; }); child.stderr.on("data", b => { child.output += b; });
   children.push(child); return child;
 }
@@ -99,7 +100,11 @@ try {
 
 } finally {
   await browser?.close();
-  for (const child of children) child.kill("SIGTERM");
-  await Promise.all(children.map(child => child.exitCode !== null ? undefined : new Promise(resolve => child.once("exit", resolve))));
+  const signal = (child, name) => { try { process.kill(-child.pid, name); } catch { /* already gone */ } };
+  for (const child of children) signal(child, "SIGTERM");
+  await Promise.all(children.map(child => child.exitCode !== null || child.signalCode !== null ? undefined : new Promise(resolve => {
+    const kill = setTimeout(() => signal(child, "SIGKILL"), 5000);
+    child.once("exit", () => { clearTimeout(kill); resolve(); });
+  })));
   await rm(directory, { recursive: true, force: true });
 }

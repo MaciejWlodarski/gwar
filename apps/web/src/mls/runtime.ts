@@ -36,6 +36,9 @@ export interface RuntimeOptions {
   storage?: () => Promise<Persistence>;
   factory?: AgentFactory;
 }
+class GroupChanged extends Error {
+  constructor() { super("MLS group changed; synchronize before sending"); }
+}
 /** UI-independent MLS session. No messages are sent by this class. */
 export class MlsRuntime {
   private server = "";
@@ -412,7 +415,7 @@ export class MlsRuntime {
     if (!this.engine.jobs.has(jobKey(job))) await this.engine.saveJobs([jobChange(job)]);
   }
   private assertGroupSynced(group: string): void {
-    if (this.syncedVersions.get(group) !== (this.groupVersions.get(group) ?? 0)) throw new Error("MLS group changed; synchronize before sending");
+    if (this.syncedVersions.get(group) !== (this.groupVersions.get(group) ?? 0)) throw new GroupChanged();
   }
   private async sendHistory(): Promise<void> {
     jobs: for (const value of [...this.engine.jobs.values()]) {
@@ -442,6 +445,8 @@ export class MlsRuntime {
           if (gate.status !== "active" || gate.rejoin || gate.server_pending || gate.blocked.length || gate.pending_commit) throw new Error("history sharing blocked");
         }); }
         catch (error) {
+          // The group changed while preparing: the next pass syncs it and retries the job.
+          if (error instanceof GroupChanged) continue jobs;
           if (!(error instanceof RequestError)) throw error;
           // A quota/rejection for one recipient must not starve other jobs.
           // Retain the exact bytes; only a success permits deleting this job.

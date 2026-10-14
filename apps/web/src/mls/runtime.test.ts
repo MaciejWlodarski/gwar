@@ -86,7 +86,7 @@ async function fixture(initial = clean(), hasRemoteGroup = true) {
     head: 0, oldest: 0, revocations: [] as Revocation[],
     openError: null as Error | null, openResult: { reason: "no_key" } as { reason: "no_key" | "cannot_open" } | { ok: number[] },
     claimed: [] as { device_key: string; package: string }[],
-    onClaim: () => {},
+    onClaim: () => {}, onDevices: () => {},
     entries: [] as { epoch: number; commit: string; proposals: string[] }[],
     welcomes: [] as { id: string; group: string; welcome: string }[],
     chunks: [] as { id: string; group: string; sender_uid: string; chunk: string }[],
@@ -115,7 +115,7 @@ async function fixture(initial = clean(), hasRemoteGroup = true) {
         case "mls.group_info": return { group_info: b64(8), epoch: world.head };
         case "mls.commit": expect((await durable()).out?.commit).toEqual([4]); if (world.commitError) throw world.commitError; world.entries.push({ epoch: Number(data.epoch), commit: data.commit as string, proposals: [] }); world.head = Number(data.epoch) + 1; return { epoch: world.head };
         case "mls.key_packages.claim": world.onClaim(); return { packages: world.claimed, next: null };
-        case "mls.devices": return { devices: world.devices, next: null };
+        case "mls.devices": world.onDevices(); return { devices: world.devices, next: null };
         case "mls.history.fetch": return { chunks: world.chunks, next: null };
         case "mls.history.ack": expect((await durable()).imports).toBeGreaterThan(0); world.chunks = world.chunks.filter(c => !(data.ids as string[]).includes(c.id)); return {};
         case "mls.history.wanted": return { wanted: world.wanted, next: null };
@@ -132,6 +132,7 @@ async function fixture(initial = clean(), hasRemoteGroup = true) {
   // Initialization has completed, so changes below model subsequent reconnects/events.
   return { runtime, world, calls, operations, durable, state: () => current.state, storage,
     proposal: () => eventHandler({ ev: "mls.proposal", d: { group, epoch: 0, proposal: "AQ" } }),
+    commitEvent: () => eventHandler({ ev: "mls.commit", d: { group, epoch: 1 } } as Event),
     persist: () => storage.write(current.take_changes()),
     reconnect: () => {
       link.isOnline = false; statusHandler({ state: "reconnecting", attempt: 1, retryAt: Date.now() });
@@ -284,6 +285,17 @@ describe("MLS synchronization", () => {
     expect(f.calls.filter(c => c.op === "mls.history.share").map(c => c.data.chunk)).toEqual(["Fg", "Fg", "Fw"]);
     f.world.chunks = [{ id: "h1", group, sender_uid: b64(5,20), chunk: "AQ" }];
     await f.runtime.sync(); expect(f.state().imports).toBe(1); expect(f.world.chunks).toEqual([]);
+  });
+  it("leaves a history job for the next pass when the group changes before sharing", async () => {
+    const f = await fixture({ ...clean(), groups: [summary()] });
+    f.world.head = 1; f.world.entries = [{ epoch: 0, commit: "CQ", proposals: [] }];
+    f.world.devices = [{ uid: b64(5,20), device_key: peer, hpke_key: b64(6), created_at: 1, signature: b64(7,64) }];
+    // Between the job's sync check and its share request (devices are also read while syncing).
+    f.world.onDevices = () => { if (f.calls.at(-2)?.op === "mls.history.wanted") { f.world.onDevices = () => {}; f.commitEvent(); } };
+    await f.runtime.sync();
+    expect(f.calls.some(c => c.op === "mls.history.share")).toBe(false);
+    await f.runtime.sync();
+    expect(f.calls.filter(c => c.op === "mls.history.share").map(c => c.data.chunk)).toEqual(["Fg", "Fw"]);
   });
   it("atomically replaces history for a newer verified HPKE publication and keeps retries stable", async () => {
     const local = summary(); local.members.push({ device_key: peer, uid: b64(5,20) });
