@@ -70,7 +70,8 @@ impl Store {
             "SELECT g.conversation,g.group_id,g.epoch,
             EXISTS(SELECT 1 FROM mls_proposals p WHERE p.group_id=g.group_id)
             FROM mls_groups g WHERE g.conversation>?1
-              AND (substr(g.conversation,1,31)='dm:' || ?2 || ':' OR substr(g.conversation,31)=':' || ?2)
+              AND (substr(g.conversation,1,31)='dm:' || ?2 || ':' OR substr(g.conversation,31)=':' || ?2
+                OR substr(g.conversation,1,8)='channel:')
               AND incarnation=(SELECT MAX(incarnation) FROM mls_groups WHERE conversation=g.conversation)
             ORDER BY g.conversation LIMIT ?3",
         )?;
@@ -359,7 +360,8 @@ impl Store {
             "SELECT w.id,w.group_id,w.welcome FROM mls_welcomes w
             JOIN mls_groups g ON g.group_id=w.group_id
             WHERE w.device_key=?1 AND w.created_at>=?2 AND w.id>?3
-              AND (substr(g.conversation,1,31)='dm:' || ?4 || ':' OR substr(g.conversation,31)=':' || ?4)
+              AND (substr(g.conversation,1,31)='dm:' || ?4 || ':' OR substr(g.conversation,31)=':' || ?4
+                OR substr(g.conversation,1,8)='channel:')
             ORDER BY w.id LIMIT ?5",
         )?;
         let mut rows = stmt.query(params![device, now - RETENTION_MS, after, uid, limit])?;
@@ -384,7 +386,8 @@ impl Store {
             "SELECT h.id,h.group_id,h.sender_uid,h.chunk FROM mls_history h
             JOIN mls_groups g ON g.group_id=h.group_id
             WHERE h.recipient_device=?1 AND h.created_at>=?2 AND h.id>?3 AND (?4 IS NULL OR h.group_id=?4)
-              AND (substr(g.conversation,1,31)='dm:' || ?5 || ':' OR substr(g.conversation,31)=':' || ?5)
+              AND (substr(g.conversation,1,31)='dm:' || ?5 || ':' OR substr(g.conversation,31)=':' || ?5
+                OR substr(g.conversation,1,8)='channel:')
             ORDER BY h.id LIMIT ?6",
         )?;
         let mut rows = stmt.query(params![device, now - RETENTION_MS, paging.0, group, uid, paging.1])?;
@@ -432,6 +435,7 @@ impl Store {
         Ok(true)
     }
 
+    /// Direct messages' outstanding requests; channel groups route theirs by assignment (`core::history`).
     pub fn mls_wanted(
         &self,
         uid: &str,
@@ -451,13 +455,15 @@ impl Store {
         )?;
         let mut rows = stmt.query(params![now - REQUEST_RETENTION_MS, after, uid, device, limit])?;
         while let Some(r) = rows.next()? {
-            if !visit(MlsHistoryWanted { group: r.get(0)?, device: r.get(1)? })? {
+            if !visit(MlsHistoryWanted { group: r.get(0)?, device: r.get(1)?, assignment: None })? {
                 break;
             }
         }
         Ok(())
     }
 
+    /// Stores a chunk; with `ends_request`, a stored chunk also ends the recipient's request.
+    #[allow(clippy::too_many_arguments)]
     pub fn mls_share_history(
         &self,
         group: &str,
@@ -466,6 +472,7 @@ impl Store {
         chunk: &[u8],
         epochs: (u64, u64),
         now: i64,
+        ends_request: bool,
     ) -> Result<ShareHistory> {
         let (sender_uid, sender_device) = sender;
         let (first, last) = epochs;
@@ -504,9 +511,61 @@ impl Store {
             "INSERT INTO mls_history(id,group_id,recipient_device,sender_uid,first_epoch,last_epoch,chunk,created_at,chunk_hash) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             params![id, group, recipient, sender_uid, first, last, chunk, now, hash.as_slice()],
         )?;
-        tx.execute("DELETE FROM mls_history_requests WHERE group_id=?1 AND device_key=?2", params![group, recipient])?;
+        if ends_request {
+            tx.execute(
+                "DELETE FROM mls_history_requests WHERE group_id=?1 AND device_key=?2",
+                params![group, recipient],
+            )?;
+        }
         tx.commit()?;
         Ok(ShareHistory::Stored)
+    }
+
+    /// The devices with a leaf in the group's current epoch, with their uids.
+    pub fn mls_leaf_devices(&self, group: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.db.prepare("SELECT device_key,uid FROM mls_leaves WHERE group_id=?1 ORDER BY leaf")?;
+        Ok(stmt.query_map([group], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn mls_history_requested(&self, group: &str, device: &str, now: i64) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mls_history_requests WHERE group_id=?1 AND device_key=?2 AND requested_at>?3)",
+            params![group, device, now - REQUEST_RETENTION_MS],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn mls_cancel_request(&self, group: &str, device: &str) -> Result<()> {
+        self.db
+            .execute("DELETE FROM mls_history_requests WHERE group_id=?1 AND device_key=?2", params![group, device])?;
+        Ok(())
+    }
+
+    /// Outstanding requests in channel groups that `device` could answer or made, as `(group, recipient)`.
+    pub fn mls_channel_requests(
+        &self,
+        device: Option<&str>,
+        group: Option<&str>,
+        now: i64,
+    ) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.db.prepare(
+            "SELECT r.group_id,r.device_key FROM mls_history_requests r JOIN mls_groups g ON g.group_id=r.group_id
+             WHERE r.requested_at>?1 AND substr(g.conversation,1,8)='channel:' AND (?3 IS NULL OR r.group_id=?3)
+               AND (?2 IS NULL OR r.device_key=?2
+                 OR EXISTS(SELECT 1 FROM mls_leaves l WHERE l.group_id=r.group_id AND l.device_key=?2))
+             ORDER BY r.group_id,r.device_key",
+        )?;
+        Ok(stmt
+            .query_map(params![now - REQUEST_RETENTION_MS, device, group], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// A conversation's groups by incarnation, after `after`.
+    pub fn mls_incarnations(&self, conversation: &str, after: Option<u64>, limit: usize) -> Result<Vec<GroupRow>> {
+        let mut stmt = self.db.prepare(
+            "SELECT * FROM mls_groups WHERE conversation=?1 AND (?2 IS NULL OR incarnation>?2) ORDER BY incarnation LIMIT ?3",
+        )?;
+        Ok(stmt.query_map(params![conversation, after, limit], group_row)?.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn mls_prune(&self, now: i64) -> Result<()> {
@@ -560,7 +619,7 @@ mod tests {
     fn history_sharing_is_atomic_bounded_and_idempotent() {
         let store = store();
         let share = |recipient: &str, sender: &str, chunk: &[u8], last| {
-            store.mls_share_history("g", recipient, (sender, "sender-device"), chunk, (0, last), 100).unwrap()
+            store.mls_share_history("g", recipient, (sender, "sender-device"), chunk, (0, last), 100, true).unwrap()
         };
         store.mls_request_history("g", "recipient", 100).unwrap();
         assert_eq!(share("sender-device", "a", b"own", 0), ShareHistory::OwnDevice);
@@ -572,7 +631,9 @@ mod tests {
         );
         // A failed write must neither store a chunk nor end the request.
         store.db.execute_batch("CREATE TRIGGER fail_history BEFORE INSERT ON mls_history BEGIN SELECT RAISE(ABORT,'test rollback'); END;").unwrap();
-        assert!(store.mls_share_history("g", "recipient", ("a", "sender-device"), b"first", (0, 7), 100).is_err());
+        assert!(
+            store.mls_share_history("g", "recipient", ("a", "sender-device"), b"first", (0, 7), 100, true).is_err()
+        );
         assert_eq!(count(&store), 0);
         assert_eq!(
             store.db.query_row::<u32, _, _>("SELECT COUNT(*) FROM mls_history_requests", [], |r| r.get(0)).unwrap(),

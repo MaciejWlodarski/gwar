@@ -9,6 +9,7 @@
 
 pub mod bridge;
 pub mod files;
+mod history;
 mod messages;
 mod mls;
 mod moderation;
@@ -200,6 +201,8 @@ pub struct CoreConfig {
     pub connect_url: Option<String>,
     pub server_key: String,
     pub server_signer: Arc<ed25519_dalek::SigningKey>,
+    /// TeamSpeak compatibility is on.
+    pub teamspeak: bool,
 }
 
 struct Session {
@@ -228,6 +231,8 @@ struct Session {
     out: Option<OutboundTx>,
     /// Bearer token for file downloads (see [`vc_proto::FileAccess`]); empty for remote sessions.
     file_access: String,
+    /// Connection order: later sessions have larger values.
+    since: u64,
 }
 
 pub struct Core {
@@ -265,6 +270,8 @@ pub struct Core {
     server_key: String,
     server_signer: Arc<ed25519_dalek::SigningKey>,
     mls_commit_clock: i64,
+    connections: u64,
+    history: history::HistoryRouting,
 }
 
 /// Messages with ids at or above this value are delivered live and not stored.
@@ -357,7 +364,8 @@ pub fn spawn(
     });
     tokio::spawn(async move {
         loop {
-            let expiry = core.sessions.values().filter_map(|s| s.device_expires_at).min();
+            let expiry =
+                core.sessions.values().filter_map(|s| s.device_expires_at).chain(core.history.deadline()).min();
             let wait = async {
                 match expiry {
                     Some(at) => {
@@ -368,7 +376,10 @@ pub fn spawn(
             };
             tokio::select! {
                 biased;
-                _ = wait => core.expire_sessions(),
+                _ = wait => {
+                    core.expire_sessions();
+                    core.history_wake();
+                }
                 msg = rx.recv() => match msg {
                     Some(msg) => core.handle(msg),
                     None => break,
@@ -399,6 +410,11 @@ impl Core {
             .filter(|id| channels.contains_key(id))
             .or_else(|| channels.keys().next().copied())
             .ok_or_else(|| anyhow::anyhow!("no channels"))?;
+        anyhow::ensure!(
+            !config.teamspeak || !channels[&default_channel].encrypted,
+            "TeamSpeak compatibility needs a plaintext default channel: start without it and choose one \
+             in the server settings (server.update) first"
+        );
         let info = ServerInfo {
             name: store.meta("name")?.unwrap_or_else(|| "Gwar".into()),
             welcome: store.meta("welcome")?.unwrap_or_default(),
@@ -410,6 +426,7 @@ impl Core {
                 Some("members") => FileAccess::Members,
                 _ => FileAccess::Link,
             },
+            teamspeak: config.teamspeak,
         };
         let groups = store.groups()?.into_iter().map(|g| (g.id, g)).collect();
         let mls_commit_clock = store.meta("mls_commit_clock")?.map(|s| s.parse()).transpose()?.unwrap_or(0);
@@ -442,6 +459,8 @@ impl Core {
             server_key: config.server_key,
             server_signer: config.server_signer,
             mls_commit_clock,
+            connections: 0,
+            history: Default::default(),
         };
         core.mls_reconcile()?;
         Ok(core)
@@ -709,7 +728,7 @@ impl Core {
         if let Some(tags) = tags_before {
             self.announce_tags(tags);
         }
-        let conversations = match self.store.sealed_unread(user.id, &r.uid) {
+        let conversations = match self.conversations_for(user.id, &r.uid) {
             Ok(conversations) => conversations,
             Err(e) => {
                 warn!("store: {e:#}");
@@ -739,6 +758,7 @@ impl Core {
             voice: false,
             out: Some(r.out),
             file_access: files::random_id(32),
+            since: self.next_connection(),
         };
         info!(session = id, uid = %session.uid, platform = ?session.platform, "client connected");
         let joined = client_view(&session);
@@ -767,6 +787,8 @@ impl Core {
         self.reply(id, r.request_id, Ok(Response::Welcome(Box::new(welcome))));
         self.broadcast(Event::ClientJoined(joined), |s| s.id != id);
         self.publish_routing();
+        let device = self.sessions[&id].hello_key.clone();
+        self.history_session_joined(&device);
         Some(id)
     }
 
@@ -867,6 +889,11 @@ impl Core {
         Ok(Response::Empty {})
     }
 
+    fn next_connection(&mut self) -> u64 {
+        self.connections += 1;
+        self.connections
+    }
+
     fn allocate_session(&mut self) -> SessionId {
         loop {
             let id = self.next_session;
@@ -910,6 +937,7 @@ impl Core {
         }
         self.publish_routing();
         self.broadcast(Event::ClientLeft { client: session, reason }, |_| true);
+        self.history_session_left(session);
     }
 
     // ---------------------------------------------------------------- bridge
@@ -971,6 +999,7 @@ impl Core {
                     voice: true,
                     out: None,
                     file_access: String::new(),
+                    since: self.next_connection(),
                 };
                 info!(session = id, uid = %session.uid, platform = ?session.platform, "remote client joined");
                 let joined = client_view(&session);
@@ -1148,6 +1177,9 @@ impl Core {
         if !self.covers(session, &self.permissions(target)) {
             return Err(err(ErrorCode::Forbidden, "this client has permissions you do not have"));
         }
+        if target.out.is_none() && self.is_encrypted(channel) {
+            return Err(err(ErrorCode::BadRequest, "TeamSpeak users cannot join encrypted channels"));
+        }
         self.move_client(client, Some(channel));
         Ok(Response::Empty {})
     }
@@ -1207,6 +1239,20 @@ impl Core {
             || self.permissions(s).contains(&Permission::ChannelJoinLocked)
     }
 
+    /// Whether `channel` exists and has encrypted (sealed) chat.
+    fn is_encrypted(&self, channel: ChannelId) -> bool {
+        self.channels.get(&channel).is_some_and(|c| c.encrypted)
+    }
+
+    /// Plaintext chat requests refuse encrypted channels.
+    fn plaintext_channel(&self, channel: ChannelId) -> Result<(), ErrorBody> {
+        if self.is_encrypted(channel) {
+            return Err(err(ErrorCode::BadRequest, "this channel is end-to-end encrypted; use chat.sealed requests"));
+        }
+        Ok(())
+    }
+
+    /// Plaintext channels only; encrypted ones are in `Welcome.conversations`.
     fn unread_for(&self, s: &Session) -> Vec<Unread> {
         let unread = |channel: ChannelId| -> Result<Unread> {
             let last_read = self.store.read_mark(s.user_id, channel)?;
@@ -1219,9 +1265,18 @@ impl Core {
         };
         self.channels
             .keys()
-            .filter(|c| self.can_read(s, **c))
+            .filter(|c| !self.is_encrypted(**c) && self.can_read(s, **c))
             .filter_map(|c| unread(*c).inspect_err(|e| warn!("store: {e:#}")).ok())
             .collect()
+    }
+
+    /// Unread sealed messages: direct messages, then encrypted channels.
+    fn conversations_for(&self, user: i64, uid: &str) -> Result<Vec<vc_proto::ConversationUnread>> {
+        let mut conversations = self.store.sealed_unread(user, uid)?;
+        for c in self.channels.values().filter(|c| c.encrypted) {
+            conversations.extend(self.store.sealed_conversation_unread(user, &format!("channel:{}", c.id))?);
+        }
+        Ok(conversations)
     }
 
     fn chat_read(&mut self, session: SessionId, channel: ChannelId, message: MessageId) -> Reply {
@@ -1229,6 +1284,7 @@ impl Core {
         if !self.can_read(s, channel) {
             return Err(err(ErrorCode::Forbidden, "no access to this channel"));
         }
+        self.plaintext_channel(channel)?;
         let user = s.user_id;
         let message = self.store.mark_read(user, channel, message).map_err(storage_error)?;
         // Every device of this user follows.
@@ -1311,13 +1367,29 @@ impl Core {
             if let Some(p) = &password {
                 check_password_len(p)?;
             }
-            Ok((name, topic, password))
+            // Plaintext by default until the web app reads encrypted channels (step 4a,
+            // second part); then the default follows TeamSpeak compatibility: `!self.info.teamspeak`.
+            let encrypted = c.encrypted.unwrap_or(false);
+            if encrypted && password.is_some() {
+                return Err(err(ErrorCode::BadRequest, "an encrypted channel has no password"));
+            }
+            Ok((name, topic, password, encrypted))
         })();
-        let (name, topic, password) = match checked {
+        let (name, topic, password, encrypted) = match checked {
             Ok(v) => v,
             Err(e) => return Some(Err(e)),
         };
-        let (parent, max_clients) = (c.parent, c.max_clients);
+        let row = ChannelRow {
+            id: 0,
+            parent: c.parent,
+            name,
+            topic,
+            position: 0,
+            password_hash: None,
+            max_clients: c.max_clients,
+            encrypted,
+            history: encrypted && c.history.unwrap_or(true),
+        };
         let teamspeak = self.is_teamspeak(session);
         let plaintext = self.bridge.is_some().then(|| password.clone()).flatten();
         self.defer(
@@ -1326,34 +1398,24 @@ impl Core {
                 if !core.sessions.contains_key(&session) {
                     return;
                 }
-                let result = core.insert_channel(parent, name, topic, hash, max_clients, plaintext);
+                let result = core.insert_channel(ChannelRow { password_hash: hash, ..row }, plaintext);
                 core.reply(session, id, result);
             },
         )
     }
 
-    fn insert_channel(
-        &mut self,
-        parent: Option<ChannelId>,
-        name: String,
-        topic: String,
-        password_hash: Option<String>,
-        max_clients: Option<u32>,
-        plaintext: Option<String>,
-    ) -> Reply {
+    fn insert_channel(&mut self, mut row: ChannelRow, plaintext: Option<String>) -> Reply {
         // State may have changed while the password was hashed.
+        let parent = row.parent;
         if parent.is_some_and(|p| !self.channels.contains_key(&p)) {
             return Err(err(ErrorCode::NotFound, "no such parent channel"));
         }
-        if self.sibling_name_taken(parent, &name, None) {
+        if self.sibling_name_taken(parent, &row.name, None) {
             return Err(err(ErrorCode::Conflict, "a channel with this name already exists here"));
         }
-        let position = self.channels.values().filter(|c| c.parent == parent).map(|c| c.position + 1).max().unwrap_or(0);
-        let id = self
-            .store
-            .insert_channel(parent, &name, &topic, position, password_hash.as_deref(), max_clients)
-            .map_err(storage_error)?;
-        let row = ChannelRow { id, parent, name, topic, position, password_hash, max_clients };
+        row.position = self.channels.values().filter(|c| c.parent == parent).map(|c| c.position + 1).max().unwrap_or(0);
+        row.id = self.store.create_channel(&row).map_err(storage_error)?;
+        let id = row.id;
         let view = channel_view(&row);
         self.channels.insert(id, row);
         self.notify_bridge(|| BridgeNote::Channel { channel: view.clone(), created: true, password: Some(plaintext) });
@@ -1420,6 +1482,9 @@ impl Core {
             }
             if let Some(p) = &u.password {
                 check_password_len(p)?;
+                if row.encrypted && !p.is_empty() {
+                    return Err(err(ErrorCode::BadRequest, "an encrypted channel has no password"));
+                }
             }
             Ok(row)
         })();
@@ -1488,6 +1553,11 @@ impl Core {
         // Deepest first, so clients never see an orphaned child.
         doomed.sort_by_key(|&c| std::cmp::Reverse(self.depth(c)));
         self.store.delete_channel(channel).map_err(storage_error)?;
+        for group in self.history.groups() {
+            if self.store.mls_group(&group).map_err(storage_error)?.is_none() {
+                self.history.forget_group(&group);
+            }
+        }
         let evicted: Vec<_> = self
             .sessions
             .values()
@@ -1556,6 +1626,7 @@ impl Core {
                 if !self.can_read(author, channel) {
                     return Err(err(ErrorCode::Forbidden, "no access to this channel"));
                 }
+                self.plaintext_channel(channel)?;
                 let mut files = Vec::with_capacity(attachments.len());
                 for id in &attachments {
                     match self.store.pending_file(id, &message.author_uid).map_err(storage_error)? {
@@ -1623,6 +1694,7 @@ impl Core {
         if !self.can_read(&self.sessions[&session], channel) {
             return Err(err(ErrorCode::Forbidden, "join the channel to read its history"));
         }
+        self.plaintext_channel(channel)?;
         let messages = self.store.history(channel, before, limit.unwrap_or(50).clamp(1, 100)).map_err(storage_error)?;
         Ok(Response::History { messages })
     }
@@ -1695,6 +1767,8 @@ fn channel_view(row: &ChannelRow) -> Channel {
         position: row.position,
         has_password: row.password_hash.is_some(),
         max_clients: row.max_clients,
+        encrypted: row.encrypted,
+        history: row.history,
     }
 }
 
@@ -1744,6 +1818,7 @@ pub(crate) mod expiry_tests {
                 connect_url: None,
                 server_key: String::new(),
                 server_signer: Arc::new(crate::server_key::generate()),
+                teamspeak: false,
             },
             Arc::new(ArcSwap::from_pointee(Routing::default())),
             media,
@@ -1873,6 +1948,7 @@ pub(crate) mod expiry_tests {
                 connect_url: None,
                 server_key: String::new(),
                 server_signer: Arc::new(crate::server_key::generate()),
+                teamspeak: false,
             },
             routing.clone(),
             media,

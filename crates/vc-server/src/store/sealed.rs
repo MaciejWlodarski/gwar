@@ -56,6 +56,12 @@ impl Store {
         Ok(())
     }
 
+    /// Removes a stored message body; its identity stays reserved.
+    pub fn sealed_remove(&self, conversation: &str, id: MessageId) -> Result<bool> {
+        Ok(self.db.execute("DELETE FROM sealed_messages WHERE conversation=?1 AND id=?2", params![conversation, id])?
+            > 0)
+    }
+
     pub fn sealed_message(&self, conversation: &str, id: &str) -> Result<Option<SealedMessage>> {
         Ok(self
             .db
@@ -96,6 +102,7 @@ impl Store {
     }
 
     /// Missing DM marks mean nothing has been read. Edits retain the original id.
+    /// Direct messages only; see [`Store::sealed_conversation_unread`] for the rest.
     pub fn sealed_unread(&self, user: i64, uid: &str) -> Result<Vec<ConversationUnread>> {
         let mut stmt = self.db.prepare(
             "SELECT g.conversation,COALESCE(r.message,0),MIN(COUNT(m.id),?3)
@@ -110,6 +117,25 @@ impl Store {
                 Ok(ConversationUnread { conversation: r.get(0)?, last_read: r.get(1)?, count: r.get(2)? })
             })?
             .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// A channel or server conversation's unread messages. A member's missing mark is
+    /// set to the newest message the first time, so newcomers don't inherit the whole history.
+    pub fn sealed_conversation_unread(&self, user: i64, conversation: &str) -> Result<Option<ConversationUnread>> {
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
+            "INSERT OR IGNORE INTO conversation_reads(user_id,conversation,message)
+             SELECT ?1,?2,COALESCE(MAX(id),0) FROM sealed_messages WHERE conversation=?2",
+            params![user, conversation],
+        )?;
+        let unread = tx.query_row(
+            "SELECT r.message,(SELECT COUNT(*) FROM (SELECT 1 FROM sealed_messages m WHERE m.conversation=?2 AND m.id>r.message LIMIT ?3))
+             FROM conversation_reads r WHERE r.user_id=?1 AND r.conversation=?2",
+            params![user, conversation, UNREAD_CAP],
+            |r| Ok(ConversationUnread { conversation: conversation.into(), last_read: r.get(0)?, count: r.get(1)? }),
+        )?;
+        tx.commit()?;
+        Ok(Some(unread).filter(|u| u.count > 0))
     }
 
     pub fn sealed_mark_read(&self, user: i64, conversation: &str, message: MessageId) -> Result<MessageId> {

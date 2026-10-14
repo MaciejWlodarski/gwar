@@ -464,6 +464,12 @@ impl Core {
             if u.default_channel.is_some_and(|c| !self.channels.contains_key(&c)) {
                 return Err(err(ErrorCode::NotFound, "no such channel"));
             }
+            if self.info.teamspeak && u.default_channel.is_some_and(|c| self.is_encrypted(c)) {
+                return Err(err(
+                    ErrorCode::BadRequest,
+                    "with TeamSpeak compatibility the default channel must be plaintext",
+                ));
+            }
             if u.max_clients.is_some_and(|m| m == 0 || m > 100_000) {
                 return Err(err(ErrorCode::BadRequest, "max clients must be 1–100000"));
             }

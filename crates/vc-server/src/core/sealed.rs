@@ -1,9 +1,11 @@
-//! Opaque encrypted DM delivery. The core actor orders validation, storage and broadcasts.
+//! Opaque delivery of encrypted direct messages and channel chat. The core actor
+//! orders validation, storage and broadcasts.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use gwar_mls::descriptor::dm_participants;
 use vc_proto::{
-    ChatReadTarget, ErrorBody, ErrorCode, Event, MessageId, Response, SealedMessage, SealedRequest, SessionId,
+    ChatReadTarget, ErrorBody, ErrorCode, Event, MessageId, Permission, Response, SealedMessage, SealedRequest,
+    SessionId,
 };
 
 use super::{Core, Reply, err, now_ms, storage_error};
@@ -12,13 +14,23 @@ const MAX_CIPHERTEXT: usize = 24 * 1024;
 
 impl Core {
     fn sealed_access(&self, session: SessionId, conversation: &str, write: bool) -> Result<(), ErrorBody> {
-        let participants =
-            dm_participants(conversation).ok_or_else(|| err(ErrorCode::BadRequest, "invalid DM conversation"))?;
+        let participants = dm_participants(conversation);
+        if participants.is_none() {
+            let id = super::mls::channel_id(conversation)
+                .ok_or_else(|| err(ErrorCode::BadRequest, "invalid conversation"))?;
+            match self.channels.get(&id) {
+                None => return Err(err(ErrorCode::NotFound, "no such channel")),
+                Some(c) if !c.encrypted => {
+                    return Err(err(ErrorCode::BadRequest, "this channel is not end-to-end encrypted"));
+                }
+                Some(_) => {}
+            }
+        }
         let s = &self.sessions[&session];
         if s.out.is_none() || !self.mls_can_read(&s.uid, conversation)? {
             return Err(err(ErrorCode::Forbidden, "no access to this conversation"));
         }
-        if write {
+        if write && let Some(participants) = participants {
             for uid in participants {
                 if !self.mls_member(uid)? {
                     return Err(err(ErrorCode::Forbidden, "both participants must be server members to write"));
@@ -38,6 +50,7 @@ impl Core {
                     .map_err(storage_error)?;
                 return Ok(Response::SealedHistory { sealed: messages });
             }
+            SealedRequest::Remove { conversation, id } => return self.sealed_remove(session, &conversation, id),
             SealedRequest::Send { conversation, group, epoch, message_id, ciphertext } => {
                 (conversation, group, epoch, message_id, ciphertext, None)
             }
@@ -121,6 +134,23 @@ impl Core {
         let readers = self.mls_readers(&message.conversation);
         self.broadcast(Event::ChatSealed(message.clone()), |s| readers.contains(&s.id));
         Ok(Response::SealedMessage(Box::new(message)))
+    }
+
+    /// A moderator's removal of a channel message (direct messages have no moderators).
+    fn sealed_remove(&mut self, session: SessionId, conversation: &str, id: MessageId) -> Reply {
+        if dm_participants(conversation).is_some() {
+            return Err(err(ErrorCode::BadRequest, "direct messages are removed by their authors"));
+        }
+        self.sealed_access(session, conversation, false)?;
+        self.require(session, Permission::MessageManage)?;
+        if !self.store.sealed_remove(conversation, id).map_err(storage_error)? {
+            return Err(err(ErrorCode::NotFound, "no such sealed message"));
+        }
+        let readers = self.mls_readers(conversation);
+        self.broadcast(Event::ChatSealedRemoved { conversation: conversation.into(), ids: vec![id] }, |s| {
+            readers.contains(&s.id)
+        });
+        Ok(Response::Empty {})
     }
 
     pub(super) fn sealed_read(&mut self, session: SessionId, conversation: &str, message: MessageId) -> Reply {

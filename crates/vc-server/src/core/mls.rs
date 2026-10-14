@@ -12,12 +12,13 @@ use gwar_mls::{
 };
 use serde::Serialize;
 use vc_proto::{
-    ErrorBody, ErrorCode, Event, MlsDevice, MlsEvent, MlsLogEntry, MlsPackage, MlsPage, MlsRequest, MlsResponse,
-    Response, SessionId,
+    ErrorBody, ErrorCode, Event, MlsDevice, MlsEvent, MlsIncarnation, MlsLogEntry, MlsPackage, MlsPage, MlsRequest,
+    MlsResponse, Response, SessionId,
 };
 
 use super::{Core, Reply, err, now_ms, storage_error};
 use crate::store::mls::{GroupRow, ProposalRow, ShareHistory};
+use vc_proto::ChannelId;
 
 const BLOB_BYTES: usize = 128 * 1024;
 const LIST_BYTES: usize = 640 * 1024 - 4096;
@@ -113,6 +114,12 @@ fn page<T: Serialize>(items: Vec<(String, T)>, paging: MlsPage) -> Result<(Vec<T
     Ok((page.items, page.next))
 }
 
+/// The channel of a canonical `channel:{id}` conversation.
+pub(super) fn channel_id(conversation: &str) -> Option<ChannelId> {
+    let id: ChannelId = conversation.strip_prefix("channel:")?.parse().ok()?;
+    (format!("channel:{id}") == conversation).then_some(id)
+}
+
 fn reply(value: MlsResponse) -> Reply {
     Ok(Response::Mls(value))
 }
@@ -123,8 +130,13 @@ impl Core {
             && !self.store.bans(now_ms()).map_err(storage_error)?.iter().any(|b| b.uid.as_deref() == Some(uid)))
     }
 
+    /// Direct messages: their two participants. Encrypted channels: every member.
     pub(super) fn mls_can_read(&self, uid: &str, conversation: &str) -> Result<bool, ErrorBody> {
-        Ok(dm_participants(conversation).is_some_and(|p| p.contains(&uid)) && self.mls_member(uid)?)
+        let allowed = match dm_participants(conversation) {
+            Some(participants) => participants.contains(&uid),
+            None => channel_id(conversation).is_some_and(|c| self.is_encrypted(c)),
+        };
+        Ok(allowed && self.mls_member(uid)?)
     }
 
     pub(super) fn mls_readers(&self, conversation: &str) -> BTreeSet<SessionId> {
@@ -163,8 +175,9 @@ impl Core {
         let participants = dm_participants(&conversation);
         let mut proposals = Vec::new();
         for leaf in observer.leaves() {
+            // Any member's well-formed device may be in a channel group.
             let allowed = self.mls_member(&leaf.uid).map_err(|e| anyhow::anyhow!(e.message))?
-                && participants.is_some_and(|p| p.contains(&leaf.uid.as_str()))
+                && participants.is_none_or(|p| p.contains(&leaf.uid.as_str()))
                 && !self.store.mls_revoked(&leaf.device_key, &leaf.uid)?;
             if !allowed && !existing.iter().any(|p| p.leaf == leaf.index) {
                 proposals.push(ProposalRow {
@@ -380,8 +393,11 @@ impl Core {
             }
             MlsRequest::WelcomesAck { ids } => self.mls_ack(&device, &ids, false),
             MlsRequest::HistoryAck { ids } => self.mls_ack(&device, &ids, true),
-            MlsRequest::HistoryShare { group, recipient, chunk } => {
+            MlsRequest::HistoryShare { group, recipient, chunk, assignment } => {
                 let row = self.mls_group_for(session, &group)?;
+                // In channel groups only a chunk answering an active assignment ends the request.
+                let routed = channel_id(&row.conversation).is_some();
+                let answers = assignment.filter(|a| routed && self.history.is_active(a, &group, &recipient, &device));
                 let observer = self.mls_observer(&row)?;
                 let leaves = observer.leaves();
                 if !leaves.iter().any(|l| l.device_key == device && l.uid == uid)
@@ -411,10 +427,14 @@ impl Core {
                         &bytes,
                         (chunk.header.first_epoch, chunk.header.last_epoch),
                         now_ms(),
+                        !routed || answers.is_some(),
                     )
                     .map_err(storage_error)?;
                 match outcome {
                     ShareHistory::Stored => {
+                        if let Some(assignment) = answers {
+                            self.history_answered(&assignment);
+                        }
                         self.broadcast(Event::Mls(MlsEvent::History { group }), |s| s.hello_key == recipient)
                     }
                     ShareHistory::Duplicate => {}
@@ -441,22 +461,70 @@ impl Core {
             MlsRequest::HistoryWanted { page: paging } => {
                 let after = cursor(&paging)?;
                 let count = limit(paging.limit)?;
-                let mut page = ListPage::new(count, LIST_BYTES);
+                // Direct messages' stored requests merged with this device's channel assignments.
+                let key = |w: &vc_proto::MlsHistoryWanted| match &w.assignment {
+                    Some(assignment) => format!("{}:{}:{assignment}", w.group, w.device),
+                    None => format!("{}:{}", w.group, w.device),
+                };
+                let mut wanted: Vec<_> = self
+                    .history
+                    .wanted(&device)
+                    .into_iter()
+                    .map(|w| (key(&w), w))
+                    .filter(|(k, _)| *k > after)
+                    .collect();
                 self.store
                     .mls_wanted(&uid, &device, now_ms(), &after, count + 1, |w| {
-                        page.push(format!("{}:{}", w.group, w.device), w)
+                        wanted.push((key(&w), w));
+                        Ok(true)
                     })
                     .map_err(storage_error)?;
+                wanted.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut page = ListPage::new(count, LIST_BYTES);
+                for (key, w) in wanted.into_iter().filter(|(k, _)| *k > after) {
+                    if !page.push(key, w).map_err(storage_error)? {
+                        break;
+                    }
+                }
                 reply(MlsResponse::Wanted { wanted: page.items, next: page.next })
+            }
+            MlsRequest::HistoryDecline { group, device: recipient, assignment } => {
+                self.mls_group_for(session, &group)?;
+                self.history_declined(&assignment, &group, &recipient, &device);
+                Ok(Response::Empty {})
+            }
+            MlsRequest::GroupHistory { conversation, page: paging } => {
+                if !self.mls_can_read(&uid, &conversation)? {
+                    return Err(err(ErrorCode::Forbidden, "no access to this conversation"));
+                }
+                let after = paging
+                    .after
+                    .as_ref()
+                    .map(|_| cursor(&paging)?.parse::<u64>().map_err(|_| bad("invalid cursor")))
+                    .transpose()?;
+                let count = limit(paging.limit)?;
+                let mut page = ListPage::new(count, LIST_BYTES);
+                for row in self.store.mls_incarnations(&conversation, after, count + 1).map_err(storage_error)? {
+                    let descriptor = B64.encode(self.mls_observer(&row)?.descriptor().encode());
+                    let entry = MlsIncarnation { group: row.group, descriptor };
+                    if !page.push(row.incarnation.to_string(), entry).map_err(storage_error)? {
+                        break;
+                    }
+                }
+                reply(MlsResponse::Incarnations { incarnations: page.items, next: page.next })
             }
             MlsRequest::HistoryRequest { group } => {
                 let row = self.mls_group_for(session, &group)?;
                 if !self.store.mls_request_history(&group, &device, now_ms()).map_err(storage_error)? {
                     return Err(err(ErrorCode::RateLimited, "request history at most once a minute"));
                 }
+                if channel_id(&row.conversation).is_some() {
+                    self.history_requested(&group, &device);
+                    return Ok(Response::Empty {});
+                }
                 let leaves = self.mls_observer(&row)?.leaves();
                 let readers = self.mls_readers(&row.conversation);
-                self.broadcast(Event::Mls(MlsEvent::HistoryWanted { group, device }), |s| {
+                self.broadcast(Event::Mls(MlsEvent::HistoryWanted { group, device, assignment: None }), |s| {
                     readers.contains(&s.id) && leaves.iter().any(|l| l.device_key == s.hello_key && l.uid == s.uid)
                 });
                 Ok(Response::Empty {})
@@ -478,9 +546,28 @@ impl Core {
         let signed = observer.descriptor();
         let d = &signed.descriptor;
         let s = &self.sessions[&session];
-        let participants =
-            dm_participants(conversation).ok_or_else(|| bad("only direct message groups are supported"))?;
-        if d.kind != Kind::Dm
+        let kind = match (dm_participants(conversation), channel_id(conversation)) {
+            (Some(participants), _) => {
+                if !participants.contains(&s.uid.as_str())
+                    || !self.mls_member(participants[0])?
+                    || !self.mls_member(participants[1])?
+                {
+                    return Err(err(ErrorCode::Forbidden, "both participants must be server members"));
+                }
+                Kind::Dm
+            }
+            (None, Some(channel)) => {
+                let Some(row) = self.channels.get(&channel).filter(|c| c.encrypted) else {
+                    return Err(err(ErrorCode::NotFound, "no such encrypted channel"));
+                };
+                if d.private || d.history != row.history {
+                    return Err(bad("the descriptor must match the channel"));
+                }
+                Kind::Channel
+            }
+            _ => return Err(bad("only direct message and encrypted channel groups are supported")),
+        };
+        if d.kind != kind
             || d.conversation != conversation
             || d.creator_uid != s.uid
             || signed.creator.device_key() != s.hello_key
@@ -490,12 +577,6 @@ impl Core {
             || observer.leaves()[0].uid != s.uid
         {
             return Err(bad("group must contain only its creator at epoch zero"));
-        }
-        if !participants.contains(&s.uid.as_str())
-            || !self.mls_member(participants[0])?
-            || !self.mls_member(participants[1])?
-        {
-            return Err(err(ErrorCode::Forbidden, "both participants must be server members"));
         }
         if let Some(existing) = self.store.mls_live_group(conversation).map_err(storage_error)? {
             if existing.incarnation >= d.incarnation {
@@ -601,6 +682,11 @@ impl Core {
             });
         }
         self.mls_announce_proposals(&row, &pending);
+        if channel_id(&row.conversation).is_some() {
+            let after: BTreeSet<_> = observer.leaves().into_iter().map(|l| l.device_key).collect();
+            let removed = before.into_iter().map(|l| l.device_key).filter(|d| !after.contains(d)).collect();
+            self.history_members_changed(group, &removed);
+        }
         reply(MlsResponse::Committed { epoch: row.epoch })
     }
 }

@@ -175,6 +175,8 @@ mod tests {
             position,
             has_password: false,
             max_clients: None,
+            encrypted: false,
+            history: false,
         }
     }
 
