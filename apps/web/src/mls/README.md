@@ -2,8 +2,8 @@
 
 `MlsRuntime` owns one unconnected Gwar `Link`, the device Web Lock, the
 in-memory wasm agent and its IndexedDB database. The application controller
-owns its lifecycle and `state/direct-messages.ts` wires it to encrypted DM
-state and the chat UI. TeamSpeak links must not use it.
+owns its lifecycle and `state/sealed.ts` wires it to encrypted direct
+message and channel state and the chat UI. TeamSpeak links must not use it.
 
 ```ts
 const runtime = await MlsRuntime.connect({
@@ -68,6 +68,11 @@ without being asked (docs/e2e-build.md "Groups", "History in channels"):
 - the group of a deleted channel is forgotten: the agent deletes its OpenMLS
   state, every epoch's keys, outbox, evidence and pin, and the runtime's jobs
   for it go in the same write.
+
+`roster(conversation)` reports an active group's devices by uid, its history
+option and the first epoch the device saw its own account in: the chat shows
+"Who can read" from it and collapses rows from before that epoch in a channel
+without shared history.
 
 `sync()` is also public for explicit retries and deterministic tests. Connect
 performs the first synchronization, reconnect Welcomes and MLS events schedule

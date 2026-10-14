@@ -2,6 +2,7 @@ import * as Tooltip from "@radix-ui/react-tooltip";
 import { createRoot } from "react-dom/client";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { ChatArea } from "../src/ui/Chat";
+import { Dialogs } from "../src/ui/Dialogs";
 import { controller } from "../src/state/controller";
 import { useSession, useUi } from "../src/state/stores";
 import { useSettings } from "../src/state/settings";
@@ -32,6 +33,13 @@ export async function connect(account: number, device: number, address: string) 
     close: () => controller.disconnect(),
     rows: (peer: string) => useSession.getState().threads[`dm:${peer}`]?.items ?? [],
     openRaw: (row: SealedMessage) => runtime().openMessage(row),
+    redeem: (token: string) => (controller as unknown as { conn: { request: (op: string, data: object) => Promise<unknown> } }).conn.request("token.redeem", { token }),
+    openCreate() { useUi.getState().openDialog({ kind: "channelEdit", mode: "create", parent: null }); },
+    channelId: (name: string) => Object.values(useSession.getState().channels).find(c => c.name === name)?.id,
+    options(channel: number) { const c = useSession.getState().channels[channel]; return { encrypted: c?.encrypted, history: c?.history }; },
+    select(channel: number) { useSession.getState().dispatch({ type: "selectChannel", channel }); },
+    channel: (channel: number) => useSession.getState().threads[`ch:${channel}`],
+    mention: (text: string, uid: string) => controller.sendChat("channel", text, { mentions: [uid] }),
     groups: () => (controller as unknown as { conn: { request: (op: string, data: object) => Promise<unknown> } }).conn.request("mls.groups", {}),
     async revoke(account: number, device: number) {
       const root = new Uint8Array(32).fill(account), device_key = b64(ed25519.getPublicKey(new Uint8Array(32).fill(device))), account_key = b64(ed25519.getPublicKey(root));
@@ -43,4 +51,4 @@ export async function connect(account: number, device: number, address: string) 
   };
 }
 useSettings.setState({ language: "en" });
-createRoot(document.getElementById("root")!).render(<Tooltip.Provider><ChatArea /></Tooltip.Provider>);
+createRoot(document.getElementById("root")!).render(<Tooltip.Provider><ChatArea /><Dialogs /></Tooltip.Provider>);

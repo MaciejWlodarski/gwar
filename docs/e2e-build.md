@@ -762,8 +762,9 @@ bridge.
 
 Status: 4a server side built (delivery service, history routing, TeamSpeak
 bridge); the agent and the browser runtime keep channel groups (create, join,
-history assignments, leaf updates, deleted channels); the web interface for
-encrypted channels is next. Built as three pull requests, in this order: **4a**
+history assignments, leaf updates, deleted channels); the web client reads and
+writes encrypted channels (create options, sealed chat, gap lines, mention
+scan and accounting, moderator removal, "Who can read"); restarts are next. Built as three pull requests, in this order: **4a**
 channels (options, groups, sealed channel messages, unread counts and
 mentions, TeamSpeak text isolation, restarts); **4b** encrypted attachments,
 in channels and direct messages; **4c** encrypted server-wide chat and large
@@ -918,8 +919,10 @@ The sealed message requests of section 3 apply to `channel:{id}` and to
   unread count (their Welcome), as for plaintext channels, so a newcomer does
   not start with the whole history unread; direct messages keep starting at
   zero.
-  `Welcome.conversations` lists channel conversations with unread messages
-  too; `Welcome.unread` keeps listing plaintext channels only.
+  `Welcome.conversations` also lists every encrypted channel conversation the
+  member can read, with its read mark even when nothing is unread (mention
+  counts are pruned at it); `Welcome.unread` keeps listing plaintext channels
+  only.
 - **Mentions** are inside the ciphertext. After connecting, for every
   conversation with unread messages the client pages backwards through the
   unread rows (`chat.sealed.history`, continuing after byte-short pages) until

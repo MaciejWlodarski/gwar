@@ -60,6 +60,28 @@ try {
     await input.fill(text); await input.press("Enter");
     await page.getByText(text, { exact: true }).waitFor({ timeout: 45000 });
   }
+  async function composer(page) {
+    await page.waitForFunction(() => { const el = document.querySelector("textarea"); return el && !el.disabled; }, null, { timeout: 45000 });
+  }
+  /** Through the create dialog: encryption starts off, then the last choice for this server. */
+  async function createChannel(page, name, { remembered, history }) {
+    await page.evaluate(() => window.dm.openCreate());
+    const dialog = page.getByRole("dialog");
+    await dialog.getByRole("textbox", { name: "Name" }).fill(name);
+    const encrypted = dialog.getByRole("switch", { name: /End-to-end encrypted/ });
+    assert.equal(await encrypted.getAttribute("aria-checked"), String(remembered));
+    if (!remembered) await encrypted.click();
+    // An encrypted channel has no password.
+    assert.equal(await dialog.locator('input[type="password"]').count(), 0);
+    const shared = dialog.getByRole("switch", { name: /New members see earlier messages/ });
+    assert.equal(await shared.getAttribute("aria-checked"), "true");
+    if (!history) await shared.click();
+    await dialog.getByRole("button", { name: "Create", exact: true }).click();
+    await dialog.waitFor({ state: "detached" });
+    const id = await (await page.waitForFunction(name => window.dm.channelId(name), name)).jsonValue();
+    assert.deepEqual(await page.evaluate(id => window.dm.options(id), id), { encrypted: true, history });
+    return id;
+  }
   async function sync(...active) {
     for (let i = 0; i < 3; i++) for (const page of active) await page.evaluate(() => window.dm.sync());
   }
@@ -118,6 +140,54 @@ try {
   await send(a, "channel chat still works");
   await b2.getByText("channel chat still works", { exact: true }).waitFor();
   console.log("PASS plaintext channel chat still works beside encrypted DMs");
+  // Encrypted channels: the creator's group, a member joining it, mentions counted after opening, moderator removal.
+  const token = /redeem this one-time admin token in your client: (\S+)/.exec(service.output)?.[1];
+  assert.ok(token, "admin token in the server log");
+  await a.evaluate(token => window.dm.redeem(token), token);
+  const secret = await createChannel(a, "secret", { remembered: false, history: true });
+  for (const page of [a, b2]) {
+    await page.evaluate(id => window.dm.select(id), secret);
+    await composer(page);
+  }
+  await send(a, "encrypted channel hello");
+  await b2.getByText("encrypted channel hello", { exact: true }).waitFor({ timeout: 45000 });
+  const sealedRow = await a.evaluate(id => window.dm.channel(id).items.find(i => i.msg?.text === "encrypted channel hello").sealed, secret);
+  assert.equal(sealedRow.conversation, `channel:${secret}`);
+  assert.ok(!sealedRow.ciphertext.includes("encrypted channel hello"));
+  await a.getByRole("button", { name: "Who can read", exact: true }).click();
+  const readers = a.getByRole("dialog");
+  await readers.getByText("User21", { exact: true }).waitFor();
+  await readers.getByRole("button", { name: "Close", exact: true }).click();
+  await readers.waitFor({ state: "detached" });
+  console.log("PASS encrypted channel: created, joined, sealed, readers listed");
+  await b2.evaluate(() => window.dm.select(1));
+  await a.evaluate(peer => window.dm.mention("for you", peer), buid);
+  await b2.waitForFunction(id => window.dm.channel(id)?.mentions === 1, secret, { timeout: 45000 });
+  console.log("PASS a mention in an encrypted channel counts after opening");
+  await b2.evaluate(id => window.dm.select(id), secret);
+  await send(b2, "moderate me");
+  await a.getByText("moderate me", { exact: true }).waitFor({ timeout: 45000 });
+  const moderated = await a.evaluate(id => window.dm.channel(id).items.find(i => i.msg?.text === "moderate me").msg.id, secret);
+  const row = a.locator(`[data-message="${moderated}"]`);
+  await row.hover();
+  await row.getByRole("button", { name: "Delete message", exact: true }).click({ modifiers: ["Shift"] });
+  await b2.waitForFunction(([id, msg]) => !window.dm.channel(id).items.some(i => i.msg?.id === msg), [secret, moderated], { timeout: 45000 });
+  console.log("PASS a moderator removes a sealed channel message");
+  // A new account: earlier messages where the channel shares history, one quiet line where it does not.
+  const quiet = await createChannel(a, "quiet", { remembered: true, history: false });
+  await a.evaluate(id => window.dm.select(id), quiet);
+  await composer(a);
+  await send(a, "before you joined");
+  const c = await device(41, 7);
+  await c.evaluate(id => window.dm.select(id), quiet);
+  await c.getByText("Earlier messages aren't shared with new members.", { exact: true }).waitFor({ timeout: 45000 });
+  assert.equal(await c.getByText("Can't open this message on this device", { exact: true }).count(), 0);
+  await c.evaluate(id => window.dm.select(id), secret);
+  await sync(a, c);
+  // History is asked for after joining; the first device asked may be one without the epoch.
+  await c.getByText("encrypted channel hello", { exact: true }).waitFor({ timeout: 90000 });
+  assert.equal(await c.getByText("Earlier messages aren't shared with new members.", { exact: true }).count(), 0);
+  console.log("PASS a new member sees earlier messages only where the channel shares history");
   // A newer tab of the same device takes the session over, as a new window would on the server.
   const tab = await contexts[0].newPage(); pages.push(tab);
   tab.on("pageerror", e => console.error("browser:", e));

@@ -244,7 +244,7 @@ backup remains disabled). Disconnect and logout close the runtime and release
 its device lock; automatic reconnect retains durable MLS state. Certificate
 renewal reconnects with the renewed credential. TeamSpeak links never start MLS.
 
-`state/direct-messages.ts` binds every request and decrypted result to the
+`state/sealed.ts` (direct messages and encrypted channels) binds every request and decrypted result to the
 current connection and welcome generation. It opens groups through the runtime,
 signs v3 plaintext with the current group/epoch, and retries stale/pending writes
 with the same message id, revision and predecessor. Sealed rows have a separate
@@ -256,7 +256,11 @@ History paging continues until an empty page, since byte-limited pages may be
 short. Welcome conversation counts and conversation read events synchronize
 unread state. Plaintext Gwar-to-Gwar DMs are discarded on receipt.
 
-Encrypted channels, server-wide chat, attachments and voice remain later steps.
+Encrypted channels use the same path, keyed by thread (`dm:{uid}` or
+`ch:{id}`): their groups are kept by the runtime, any member may author, and
+mentions are counted after opening (a scan of unread rows after connecting,
+one contribution per signed message identity, pruned at the read mark).
+Server-wide chat, attachments and voice remain later steps.
 
 ## Signed messages (v3)
 

@@ -538,7 +538,8 @@ wire! {
         /// Read state of every channel this user can read.
         #[serde(default)]
         pub unread: Vec<Unread>,
-        /// Direct messages with unread sealed messages, including offline peers.
+        /// Direct messages with unread sealed messages, including offline peers, and
+        /// every readable encrypted channel with its read mark.
         pub conversations: Vec<ConversationUnread>,
         pub ice_servers: Vec<IceServer>,
         /// Sent as `Authorization: Bearer <token>` with file downloads; valid while this session lasts.

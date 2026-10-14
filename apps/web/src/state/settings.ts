@@ -139,6 +139,8 @@ export interface SettingsState {
   lastKind: ServerKind;
   /** This device was already offered the identities of the official TeamSpeak client (asked only once). */
   tsDetectAsked: boolean;
+  /** Per server key, whether my last new channel there was end-to-end encrypted: the next one starts the same. */
+  channelEncryption: Record<string, boolean>;
 
   setTheme(theme: Theme): void;
   setLanguage(language: Language): void;
@@ -160,6 +162,7 @@ export interface SettingsState {
   dropAccountBookmarks(account: string): void;
   setLast(address: string, kind?: ServerKind): void;
   setTsDetectAsked(asked: boolean): void;
+  setChannelEncryption(serverKey: string, encrypted: boolean): void;
 }
 
 export function detectLanguage(): Language {
@@ -201,6 +204,7 @@ export const useSettings = create<SettingsState>()(
       lastAddress: "",
       lastKind: "vc",
       tsDetectAsked: false,
+      channelEncryption: {},
 
       setTheme: (theme) => set({ theme }),
       setLanguage: (language) => set({ language }),
@@ -249,6 +253,7 @@ export const useSettings = create<SettingsState>()(
         })),
       setLast: (lastAddress, lastKind = "vc") => set({ lastAddress, lastKind }),
       setTsDetectAsked: (tsDetectAsked) => set({ tsDetectAsked }),
+      setChannelEncryption: (serverKey, encrypted) => set((s) => ({ channelEncryption: { ...s.channelEncryption, [serverKey]: encrypted } })),
     }),
     {
       name: "vc.settings",
@@ -264,6 +269,7 @@ export const useSettings = create<SettingsState>()(
         const bookmarks = legacy?.map(({ nickname: _nickname, ...bookmark }) => bookmark) ?? current.bookmarks;
         return { ...current, ...p, lastNickname, bookmarks, audio: { ...current.audio, ...(p.audio ?? {}) }, desktop: { ...current.desktop, ...(p.desktop ?? {}) },
           notifications: { ...current.notifications, ...(p.notifications ?? {}) },
+          channelEncryption: typeof p.channelEncryption === "object" && p.channelEncryption !== null ? p.channelEncryption : {},
         };
       },
     },

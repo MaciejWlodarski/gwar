@@ -17,7 +17,8 @@ function usePeople(): Person[] {
  * `@` autocomplete for a textarea: tracks the caret, offers matching people
  * (online first), inserts `@Nickname ` and remembers whom to put in `mentions`.
  */
-export function useMentionAutocomplete(value: string, setValue: (v: string) => void, ref: RefObject<HTMLTextAreaElement | null>, initialMentions: readonly string[] = []) {
+/** `draft` names the draft being edited: picked mentions are kept per draft when the composer switches. */
+export function useMentionAutocomplete(value: string, setValue: (v: string) => void, ref: RefObject<HTMLTextAreaElement | null>, initialMentions: readonly string[] = [], draft = "") {
   const people = usePeople();
   const selfUid = useSession((s) => s.me?.uid);
   const [caret, setCaret] = useState(0);
@@ -26,12 +27,20 @@ export function useMentionAutocomplete(value: string, setValue: (v: string) => v
   const picked = useRef<PickedMention[]>(picksFromMessage(value, people, initialMentions));
   const previous = useRef(value);
   const editSelection = useRef<{ start: number; end: number } | undefined>(undefined);
-  const currentPicks = () => updatePickedMentions(previous.current, value, picked.current, editSelection.current);
+  const drafts = useRef(new Map<string, PickedMention[]>());
+  const currentDraft = useRef(draft);
+  const currentPicks = () => currentDraft.current === draft ? updatePickedMentions(previous.current, value, picked.current, editSelection.current) : drafts.current.get(draft) ?? [];
   useLayoutEffect(() => {
-    picked.current = updatePickedMentions(previous.current, value, picked.current, editSelection.current);
+    if (currentDraft.current !== draft) {
+      // Another draft: keep this one's picks for when it comes back.
+      drafts.current.set(currentDraft.current, picked.current);
+      picked.current = drafts.current.get(draft) ?? [];
+      drafts.current.delete(draft);
+      currentDraft.current = draft;
+    } else picked.current = updatePickedMentions(previous.current, value, picked.current, editSelection.current);
     previous.current = value;
     editSelection.current = undefined;
-  }, [value]);
+  }, [value, draft]);
   // Where the caret goes once the completed text is in the textarea (set before the next paint, so typing is never overtaken).
   const pendingCaret = useRef<number | null>(null);
   useLayoutEffect(() => {

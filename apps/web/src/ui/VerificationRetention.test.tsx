@@ -19,7 +19,7 @@ vi.mock("react", async (get) => {
   } };
 });
 vi.mock("./useVerifiedHandle", () => ({ useVerifiedHandle: () => null }));
-vi.mock("../state/controller", () => ({ controller: { messageServerKey: "S", messageUid: Promise.resolve("me") }, UploadError: class extends Error {} }));
+vi.mock("../state/controller", () => ({ controller: { messageServerKey: "S", messageUid: Promise.resolve("me"), onRoster: () => () => {}, roster: () => null }, UploadError: class extends Error {} }));
 
 it("drops verification results of rows the thread evicted, including late completions", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);

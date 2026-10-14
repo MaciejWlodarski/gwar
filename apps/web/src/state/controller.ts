@@ -1,8 +1,9 @@
 import { attachment as attachmentSchema } from "../net/schema";
-import { DirectMessages } from "./direct-messages";
+import { SealedConversations, type SealedKey } from "./sealed";
 import type { MlsRuntime } from "../mls/runtime";
+import type { Roster } from "../mls/types";
 import { messageStorage, refreshRevocations } from "../net/message-storage";
-import { encryptedDm, dmPeer } from "../lib/chat";
+import { conversationThread, sealedThread, threadConversation } from "../lib/chat";
 import { messageTarget } from "../lib/chat";
 import { uploadAttachment, localAttachmentMetadata } from "../net/attachment";
 import { serverPins, type ServerIdentityChanged } from "../net/server-pins";
@@ -157,8 +158,9 @@ class Controller {
   private runtime: MlsRuntime | null = null;
   private connectionParams: ConnectParams | null = null;
   private runtimeAbort: AbortController | null = null;
-  private dm: DirectMessages | null = null;
-  private dmReady: Promise<void> = Promise.resolve();
+  private sealed: SealedConversations | null = null;
+  private sealedReady: Promise<void> = Promise.resolve();
+  private rosterListeners = new Set<() => void>();
   private revocationTimer: ReturnType<typeof setInterval> | null = null;
   private engine: VoiceEngine;
   private identity: Identity | null = null;
@@ -280,7 +282,7 @@ class Controller {
       const ch = s.viewChannel;
       if (s.phase !== "online" || ch === null) return;
       const inVoice = myChannelId(s) === ch;
-      if (s.threads[channelThreadKey(ch)]?.locked && !inVoice) return;
+      if (s.channels[ch]?.encrypted || (s.threads[channelThreadKey(ch)]?.locked && !inVoice)) return;
       const key = `${s.epoch}:${ch}:${inVoice}`;
       if (this.historyRequested.has(key)) return;
       this.historyRequested.add(key);
@@ -288,11 +290,13 @@ class Controller {
     });
 
     useSession.subscribe(s => {
-      if (s.phase !== "online" || !encryptedDm(s.activeThread, s.kind) || !this.dm) return;
-      const key = `${s.epoch}:${s.activeThread}`;
-      if (s.threads[s.activeThread]?.loaded || this.historyRequested.has(key)) return;
-      this.historyRequested.add(key);
-      void this.dm.open(s.activeThread.slice(3)).catch(() => {}).finally(() => this.historyRequested.delete(key));
+      if (s.phase !== "online" || !this.sealed) return;
+      for (const thread of this.sealedOnScreen(s)) {
+        const key = `${s.epoch}:${thread}`;
+        if (s.threads[thread]?.loaded || this.historyRequested.has(key)) continue;
+        this.historyRequested.add(key);
+        void this.sealed.open(thread).catch(() => {}).finally(() => this.historyRequested.delete(key));
+      }
     });
 
     // Tell the server what I have read.
@@ -393,17 +397,18 @@ class Controller {
           const uid = (await this.uidOn(conn))!;
           if (abort.signal.aborted || this.conn !== conn) { await runtime.close(); throw new ConnectionLostError(); }
           this.runtime = runtime;
-          this.dm = new DirectMessages(runtime, conn, conn.identity, uid,
+          runtime.subscribe(this.rosterChanged); this.rosterChanged();
+          this.sealed = new SealedConversations(runtime, conn, conn.identity, uid,
             () => this.conn === conn && conn.isOnline, msg => this.notificationFor(msg)?.(),
             error => console.warn("Conversation history:", error));
           const refresh = () => { void refreshRevocations().then(() => { if (this.conn === conn) return runtime.sync(); }).catch(() => {}); };
           this.revocationTimer = setInterval(refresh, 60_000);
-          this.dm.refresh();
-          const s = useSession.getState();
-          if (encryptedDm(s.activeThread, s.kind)) void this.dm.open(s.activeThread.slice(3)).catch(() => {});
+          this.sealed.refresh();
+          for (const thread of this.sealedOnScreen(useSession.getState())) void this.sealed.open(thread).catch(() => {});
+          void this.sealed.scanUnread();
         };
-        this.dmReady = start();
-        await this.dmReady;
+        this.sealedReady = start();
+        await this.sealedReady;
       } else await conn.connect();
     } catch (e) {
       if (this.conn !== conn) throw e;
@@ -486,7 +491,11 @@ class Controller {
       this.nativeFiles(useSession.getState().kind === "vc" ? useSession.getState().httpOrigin : null, welcome.server.upload_limit, welcome.file_access);
       session.setSecurity(conn.serverKey ?? null, conn.endpoint ?? null, !!conn.endpoint && isPlaintextRemote(conn.endpoint));
       if (conn.serverKey) channelLifecycle.observe(conn.serverKey, welcome.channels.map((c) => c.id));
+      // A resync rebuilds channel threads: count the encrypted ones' mentions again,
+      // with nothing left from before (the Welcome's view change already recounts).
+      this.sealed?.reset();
       session.dispatch({ type: "welcome", welcome, resync, now: Date.now() });
+      if (this.sealed) { this.sealed.refresh(); void this.sealed.scanUnread(); }
       const myCh = myChannelId(useSession.getState());
       const v = useVoice.getState();
       if (v.muted || v.deafened) void this.pushMuteState();
@@ -503,11 +512,16 @@ class Controller {
     });
     conn.onEvent((event) => {
       if (this.conn !== conn) return;
-      if (event.ev === "chat.sealed.removed") this.dm?.remove(event.d.conversation, event.d.ids);
-      if (event.ev === "chat.sealed") {
+      // Sealed messages and removals keep their order, also while MLS is starting.
+      if (event.ev === "chat.sealed" || event.ev === "chat.sealed.removed") {
         const epoch = useSession.getState().epoch;
-        void this.dmReady.then(() => {
-          if (this.conn === conn && epoch === useSession.getState().epoch) return this.dm?.receive(event.d, true);
+        void this.sealedReady.then(() => {
+          if (this.conn !== conn || epoch !== useSession.getState().epoch) return;
+          if (event.ev === "chat.sealed") return this.sealed?.receive(event.d, true);
+          this.sealed?.remove(event.d.conversation, event.d.ids);
+          session.dispatch({ type: "event", event, now: Date.now() });
+          // Removed rows may never have been loaded here: count again from the server.
+          void this.sealed?.refreshUnread(event.d.conversation, event.d.ids).catch(() => {});
         }).catch(error => console.warn("Conversation message:", error));
         return;
       }
@@ -545,9 +559,7 @@ class Controller {
           if (notificationAllowed(result)) alert?.();
         }).catch(() => {}).finally(() => { this.messagePending--; });
       } else session.dispatch({ type: "event", event, now: Date.now() });
-      if (event.ev === "chat.read" && "conversation" in event.d) void this.dm?.refreshUnread(event.d.conversation).catch(() => {});
-      // Removed rows may never have been loaded here: count again from the server.
-      if (event.ev === "chat.sealed.removed") void this.dm?.refreshUnread(event.d.conversation, event.d.ids).catch(() => {});
+      if (event.ev === "chat.read" && "conversation" in event.d) void this.sealed?.refreshUnread(event.d.conversation).catch(() => {});
       if (event.ev === "voice.closed") {
         useUi.getState().toast("info", tNow("voice.closed"));
         this.scheduleVoiceRetry(1000);
@@ -616,8 +628,9 @@ class Controller {
     // waits; it then owns the state below, so this one stops.
     const generation = this.connections;
     this.runtimeAbort?.abort(); this.runtimeAbort = null;
-    this.dm?.close(); this.dm = null;
+    this.sealed?.close(); this.sealed = null;
     const runtime = this.runtime; this.runtime = null;
+    this.rosterChanged();
     if (this.revocationTimer) clearInterval(this.revocationTimer);
     this.revocationTimer = null;
     await runtime?.close();
@@ -891,8 +904,27 @@ class Controller {
     await this.attempt(this.joinChannel(channel));
   }
 
-  createChannel(c: ChannelCreate | (Partial<ChannelCreate> & { name: string })) {
-    return this.connection.request("channel.create", c);
+  async createChannel(c: ChannelCreate | (Partial<ChannelCreate> & { name: string })) {
+    const runtime = this.runtime;
+    const channel = await this.connection.request("channel.create", c);
+    // The creator makes the group right away instead of after a random wait.
+    if (channel.encrypted && runtime === this.runtime) runtime?.channelCreated(channel.id);
+    return channel;
+  }
+
+  /** Who can read an encrypted conversation, as this device's group sees it; null until it is secured. */
+  roster(thread: SealedKey): Roster | null {
+    const uid = useSession.getState().me?.uid;
+    return uid && this.runtime ? this.runtime.roster(threadConversation(thread, uid)) : null;
+  }
+  /** Calls back when a conversation's readers may have changed. */
+  onRoster(listener: () => void): () => void { this.rosterListeners.add(listener); return () => this.rosterListeners.delete(listener); }
+  private rosterChanged = (): void => { for (const listener of this.rosterListeners) listener(); };
+
+  /** Encrypted threads on screen: the open chat and the channel I am looking at. */
+  private sealedOnScreen(s: SessionSnapshot): SealedKey[] {
+    const keys = new Set([storedKey(s, s.activeThread), s.viewChannel === null ? null : channelThreadKey(s.viewChannel)]);
+    return [...keys].filter(k => sealedThread(k, s.kind, s.channels)) as SealedKey[];
   }
 
   updateChannel(u: Omit<ChannelUpdate, "move_to_root"> & { move_to_root?: boolean }) {
@@ -1034,10 +1066,11 @@ class Controller {
 
   async sendChat(key: ThreadKey, text: string, options: SendOptions = {}): Promise<boolean> {
     const state = useSession.getState();
-    if (encryptedDm(key, state.kind)) {
+    const stored = storedKey(state, key);
+    if (sealedThread(stored, state.kind, state.channels)) {
       try {
-        if (!this.dm || options.attachments?.length) throw new Error(tNow("chat.securing"));
-        await this.dm.send(key.slice(3), text, options.mentions ?? []);
+        if (!this.sealed || options.attachments?.length) throw new Error(tNow("chat.securing"));
+        await this.sealed.send(stored as SealedKey, text, options.mentions ?? []);
         return true;
       } catch (error) { useUi.getState().toast("error", describeRequestError(error)); return false; }
     }
@@ -1114,11 +1147,13 @@ class Controller {
   }
 
   async deleteMessage(message: number): Promise<boolean> {
-    return this.changeMessage(message, async (original, bound) => {
+    return this.changeMessage(message, async (original, bound, sealed) => {
       // My verified message: a signed deletion. Otherwise a moderator's server removal.
       if (useSession.getState().kind === "vc" && (await this.editableOriginal(original, bound.conn))) return this.sendEdit(original, DELETION_TEXT, [], bound);
       bound.check();
-      await bound.conn.request("chat.delete", { message });
+      // The route comes from the snapshot: the view may have moved to another thread meanwhile.
+      if (sealed) await bound.conn.request("chat.sealed.remove", { conversation: sealed, id: message });
+      else await bound.conn.request("chat.delete", { message });
       return true;
     });
   }
@@ -1127,7 +1162,7 @@ class Controller {
   private changing = new WeakMap<Link, Set<number>>();
 
   /** Runs one edit or deletion bound to the connection it started on, over a snapshot of the message. */
-  private async changeMessage(message: number, run: (original: ChatMessage, bound: ReturnType<Controller["bind"]>) => Promise<boolean>): Promise<boolean> {
+  private async changeMessage(message: number, run: (original: ChatMessage, bound: ReturnType<Controller["bind"]>, sealed: string | undefined) => Promise<boolean>): Promise<boolean> {
     let busy: Set<number> | undefined;
     try {
       const bound = this.bind();
@@ -1140,7 +1175,7 @@ class Controller {
       busy.add(message);
       // Sign only what this client authenticated itself: a server could graft
       // attachments onto a genuine envelope and have the edit endorse them.
-      return await run(structuredClone(item.msg), bound);
+      return await run(structuredClone(item.msg), bound, item.sealed?.conversation);
     } catch (e) { useUi.getState().toast("error", describeRequestError(e)); return false; }
     finally { busy?.delete(message); }
   }
@@ -1151,10 +1186,10 @@ class Controller {
     const current = Object.values(useSession.getState().threads).flatMap((t) => t.items).find((i) => i.kind === "msg" && i.msg.id === original.id && i.msg.signature?.conversation === original.signature?.conversation);
     if (current?.kind !== "msg" || current.msg.signature?.revision !== original.signature?.revision) throw new Error(tNow("chat.editChanged"));
     if (original.signature?.group_id !== undefined && original.signature.group_id !== "-") {
-      const peer = dmPeer(original.signature.conversation, await this.uidOn(conn));
+      const thread = conversationThread(original.signature.conversation, await this.uidOn(conn));
       check();
-      if (!peer || !this.dm) throw new ConnectionLostError();
-      await this.dm.send(peer, text, mentions, original.signature);
+      if (!thread || !this.sealed) throw new ConnectionLostError();
+      await this.sealed.send(thread, text, mentions, original.signature);
       return true;
     }
     const signature = await this.signChat(original.target, text, mentions, text === DELETION_TEXT ? [] : original.attachments ?? [], original.signature ?? undefined, conn);
@@ -1255,12 +1290,13 @@ class Controller {
     let thread: "server" | `ch:${number}` | `dm:${string}`;
     if (channel !== undefined) thread = `ch:${channel}`;
     else if (msg.signature?.group_id && msg.signature.group_id !== "-") {
-      const peer = dmPeer(msg.signature.conversation, me);
-      if (!peer) return invalidVerification();
-      const item = state.threads[`dm:${peer}`]?.items.find(i => i.kind === "msg" && i.msg.id === msg.id);
+      const sealed = conversationThread(msg.signature.conversation, me);
+      if (!sealed) return invalidVerification();
+      const item = state.threads[sealed]?.items.find(i => i.kind === "msg" && i.msg.id === msg.id);
       if (item?.kind !== "msg" || !item.sealed) return invalidVerification();
-      return this.verifier.verify(msg, { serverKey: conn?.serverKey ?? "", target: item.sealed.conversation,
-        participants: [me!, peer], sealed: { group: item.sealed.group, epoch: item.sealed.epoch } });
+      const serverKey = conn?.serverKey ?? "", target = item.sealed.conversation;
+      return withChannelLifecycle(await this.verifier.verify(msg, { serverKey, target,
+        participants: sealed.startsWith("dm:") ? [me!, sealed.slice(3)] : undefined, sealed: { group: item.sealed.group, epoch: item.sealed.epoch } }), serverKey, target);
     }
     else if (msg.target === "server") thread = "server";
     else if ("channel" in msg.target) thread = `ch:${msg.target.channel}`;
@@ -1357,9 +1393,10 @@ class Controller {
   private unreadReport(s: SessionSnapshot): { channel: number; message: number } | { conversation: string; message: number } | null {
     // TeamSpeak keeps no read state: unread counts there are purely local.
     if (s.phase !== "online" || s.kind !== "vc" || !s.focused) return null;
-    if (encryptedDm(s.activeThread, s.kind)) {
-      const thread = s.threads[s.activeThread], latest = latestMessageId(thread);
-      const conversation = messageTarget(`dm:${s.activeThread.slice(3)}`, s.me!.uid, s.me!.uid);
+    const active = storedKey(s, s.activeThread);
+    if (sealedThread(active, s.kind, s.channels)) {
+      const thread = s.threads[active!], latest = latestMessageId(thread);
+      const conversation = threadConversation(active!, s.me!.uid);
       return thread && latest > Math.max(thread.lastRead, this.sentRead.get(conversation) ?? 0) ? { conversation, message: latest } : null;
     }
     if (s.activeThread !== "channel" || s.viewChannel === null) return null;
@@ -1389,9 +1426,9 @@ class Controller {
   async loadOlder(): Promise<void> {
     const s = useSession.getState();
     const key = storedKey(s, s.activeThread);
-    if (key && encryptedDm(key, s.kind)) {
-      const thread = s.threads[key], first = thread?.items.find(i => i.kind === "msg");
-      if (thread?.hasMore && first?.kind === "msg") await this.dm?.open(key.slice(3), first.msg.id);
+    if (sealedThread(key, s.kind, s.channels)) {
+      const thread = s.threads[key!], first = thread?.items.find(i => i.kind === "msg");
+      if (thread?.hasMore && first?.kind === "msg") await this.sealed?.open(key as SealedKey, first.msg.id);
       return;
     }
     if (!key?.startsWith("ch:") || this.loadingOlder) return;

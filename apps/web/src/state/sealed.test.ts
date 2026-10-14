@@ -1,6 +1,6 @@
 import "fake-indexeddb/auto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { DirectMessages, type DmRuntime } from "./direct-messages";
+import { SealedConversations, type SealedRuntime } from "./sealed";
 import { useSession } from "./stores";
 import { generateIdentity, uidForPublicKey } from "../net/identity";
 import type { Link } from "../net/connection";
@@ -23,8 +23,8 @@ let opened: Plaintext | undefined;
 let drafts: Plaintext[];
 let status: "ready" | "securing";
 let epoch: number;
-let runtime: DmRuntime;
-let dm: DirectMessages;
+let runtime: SealedRuntime;
+let dm: SealedConversations;
 async function row(text = "hello", original?: Plaintext) {
   const signature = await signMessage(bob, { serverKey: server, target: conversation, sealed: { group, epoch } }, b, text, [], [], original?.signature);
   opened = { text, mentions: [], attachments: [], signature };
@@ -43,7 +43,7 @@ beforeEach(() => {
     }),
     openMessage: vi.fn(async () => opened ? { ok: opened } : { reason: "no_key" as const }),
   };
-  dm = new DirectMessages(runtime, { serverKey: server, request } as unknown as Link, alice, a, () => active, notify, () => {});
+  dm = new SealedConversations(runtime, { serverKey: server, request } as unknown as Link, alice, a, () => active, notify, () => {});
 });
 describe("encrypted DM controller", () => {
   it("keeps message identity, revision and predecessor on stale and pending retries", async () => {
@@ -51,7 +51,7 @@ describe("encrypted DM controller", () => {
     request.mockRejectedValueOnce(new RequestError("stale", "stale"))
       .mockRejectedValueOnce(new RequestError("pending", "pending"))
       .mockImplementation(async () => ({ ...await row(), author_uid: a }));
-    await dm.send(b, "edited", [], old);
+    await dm.send(`dm:${b}`, "edited", [], old);
     expect(request.mock.calls.map(c => c[0])).toEqual(Array(3).fill("chat.sealed.edit"));
     expect(drafts.map(d => d.signature.epoch)).toEqual(["0", "1", "2"]);
     for (const draft of drafts) {
@@ -62,17 +62,17 @@ describe("encrypted DM controller", () => {
   });
   it("sends nothing while securing, including a group blocked after catch-up", async () => {
     status = "securing";
-    await expect(dm.send(b, "hello", [])).rejects.toThrow("Securing");
+    await expect(dm.send(`dm:${b}`, "hello", [])).rejects.toThrow("Securing");
     expect(request).not.toHaveBeenCalled();
     status = "ready";
     request.mockRejectedValue(new RequestError("pending", "pending"));
     runtime.sync = async () => { status = "securing"; };
-    await expect(dm.send(b, "hello", [])).rejects.toThrow("Securing");
+    await expect(dm.send(`dm:${b}`, "hello", [])).rejects.toThrow("Securing");
     expect(request).toHaveBeenCalledTimes(1);
   });
   it("fences a send when the connection is replaced during signing", async () => {
     runtime.sealMessage = async (_c, build) => { await build({ server_key: server, conversation, group_id: group, epoch: "0" }); active = false; return { group, epoch: 0, ciphertext: "x" }; };
-    await expect(dm.send(b, "hello", [])).rejects.toThrow();
+    await expect(dm.send(`dm:${b}`, "hello", [])).rejects.toThrow();
     expect(request).not.toHaveBeenCalled();
   });
   it("opens late keys, counts a row once, and never repeats its notification", async () => {
@@ -118,6 +118,22 @@ describe("encrypted conversation state", () => {
     s = reduce(s, { type: "event", event: { ev: "chat.read", d: { conversation, message: 2 } }, now: 0 });
     expect(s.threads[`dm:${b}`]).toMatchObject({ unread: 9, lastRead: 8 });
   });
+  it("restores encrypted channel conversations and their read marks", () => {
+    const lobby = welcome().channels[0]!;
+    const w = { ...welcome(), uid: a, channels: [lobby, { ...lobby, id: 7, encrypted: true }],
+      conversations: [{ conversation: "channel:7", last_read: 3, count: 4 }, { conversation: "channel:1", last_read: 0, count: 2 }] };
+    let s = reduce({ ...initialState, activeThread: "server" }, { type: "welcome", welcome: w, resync: false, now: 0 });
+    expect(s.threads["ch:7"]).toMatchObject({ unread: 4, lastRead: 3, securing: true });
+    expect(s.threads["ch:1"]?.unread).toBe(0);
+    s = reduce(s, { type: "sealedMentions", thread: "ch:7", count: 2 });
+    expect(s.threads["ch:7"]?.mentions).toBe(2);
+    s = reduce(s, { type: "event", event: { ev: "chat.read", d: { conversation: "channel:7", message: 9 } }, now: 0 });
+    expect(s.threads["ch:7"]).toMatchObject({ lastRead: 9, mentions: 0 });
+    // On screen and focused, nothing counts as a mention.
+    s = reduce({ ...s, focused: true }, { type: "selectChannel", channel: 7 });
+    s = reduce(s, { type: "sealedMentions", thread: "ch:7", count: 1 });
+    expect(s.threads["ch:7"]?.mentions).toBe(0);
+  });
 });
 
 
@@ -142,7 +158,7 @@ it("shows an unopened newer deletion over a previously authenticated row", async
 it("does not apply history fetched by an earlier welcome", async () => {
   const sealed = await row();
   request.mockImplementation(async () => { useSession.setState(s => ({ epoch: s.epoch + 1 })); return { sealed: [sealed] }; });
-  await expect(dm.open(b)).rejects.toThrow();
+  await expect(dm.open(`dm:${b}`)).rejects.toThrow();
   expect(useSession.getState().threads[`dm:${b}`]?.items ?? []).toEqual([]);
 });
 
@@ -151,7 +167,7 @@ it("stops a history page at a reconnect between rows", async () => {
   const first = await row(), second = { ...first, id: 2 };
   request.mockResolvedValue({ sealed: [first, second] });
   runtime.openMessage = vi.fn(async () => { useSession.setState(s => ({ epoch: s.epoch + 1 })); return { reason: "no_key" as const }; });
-  await expect(dm.open(b)).rejects.toThrow();
+  await expect(dm.open(`dm:${b}`)).rejects.toThrow();
   expect(runtime.openMessage).toHaveBeenCalledTimes(1);
   expect(useSession.getState().threads[`dm:${b}`]?.items ?? []).toEqual([]);
 });
@@ -172,7 +188,7 @@ it("does not resurrect a history row removed while an earlier row opens", async 
   const paused = new Promise<void>(resolve => { finish = resolve; });
   let calls = 0;
   runtime.openMessage = vi.fn(async () => { if (calls++ === 0) await paused; return { reason: "no_key" as const }; });
-  const opening = dm.open(b);
+  const opening = dm.open(`dm:${b}`);
   await vi.waitFor(() => expect(runtime.openMessage).toHaveBeenCalledTimes(1));
   dm.remove(conversation, [2]); finish(); await opening;
   expect(useSession.getState().threads[`dm:${b}`]?.items.map(i => i.key)).toEqual(["e1"]);
@@ -191,7 +207,7 @@ it("bounds notification intent to admitted rows and drops it once they are gone"
 });
 it("drops rows removed during a running unread recount", async () => {
   const sealed = await row();
-  useSession.getState().dispatch({ type: "dmStatus", peer: b, securing: false });
+  useSession.getState().dispatch({ type: "sealedStatus", thread: `dm:${b}`, securing: false });
   let finish!: (value: unknown) => void;
   request.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; })).mockResolvedValueOnce({ sealed: [] });
   const running = dm.refreshUnread(conversation);
@@ -202,7 +218,7 @@ it("drops rows removed during a running unread recount", async () => {
 });
 it("finishes an unread recount while removals keep arriving", async () => {
   const sealed = await row();
-  useSession.getState().dispatch({ type: "dmStatus", peer: b, securing: false });
+  useSession.getState().dispatch({ type: "sealedStatus", thread: `dm:${b}`, securing: false });
   let calls = 0;
   request.mockImplementation(async (_method: string, params: { before: number | null }) => {
     // Bounded, so a recount that keeps restarting fails on the call count instead of hanging.
@@ -224,7 +240,7 @@ it("drops notification intent once a page releases a row removed while opening",
   let finish!: () => void;
   const paused = new Promise<void>(resolve => { finish = resolve; });
   runtime.openMessage = vi.fn(async () => { await paused; return { reason: "no_key" as const }; });
-  const opening = dm.open(b);
+  const opening = dm.open(`dm:${b}`);
   await vi.waitFor(() => expect(runtime.openMessage).toHaveBeenCalledTimes(1));
   const live = dm.receive(sealed, true);
   dm.remove(conversation, [sealed.id]); finish(); await Promise.all([opening, live]);
@@ -232,7 +248,7 @@ it("drops notification intent once a page releases a row removed while opening",
 });
 it("refreshes unread counts past byte-limited pages without notifications", async () => {
   const sealed = await row();
-  useSession.getState().dispatch({ type: "dmStatus", peer: b, securing: false });
+  useSession.getState().dispatch({ type: "sealedStatus", thread: `dm:${b}`, securing: false });
   useSession.getState().dispatch({ type: "event", event: { ev: "chat.read", d: { conversation, message: 3 } }, now: 0 });
   request.mockResolvedValueOnce({ sealed: [{ ...sealed, id: 5 }] }).mockResolvedValueOnce({ sealed: [{ ...sealed, id: 3 }, { ...sealed, id: 4 }] });
   await dm.refreshUnread(conversation);
@@ -255,6 +271,209 @@ it("accepts the own edit echo arriving before the request reply", async () => {
       msg: { id: 1, target: { client: 0 }, author: 0, author_uid: a, author_name: "Alice", sent_at: 0, ...opened! }, sealed: edited, authentic: true }] } } }));
     return edited;
   });
-  await expect(dm.send(b, "own echo", [], original)).resolves.toBeUndefined();
+  await expect(dm.send(`dm:${b}`, "own echo", [], original)).resolves.toBeUndefined();
   expect(request).toHaveBeenCalledOnce();
+});
+
+// The channel lifecycle record fails closed without storage.
+const local = new Map<string, string>();
+vi.stubGlobal("localStorage", { getItem: (k: string) => local.get(k) ?? null, setItem: (k: string, v: string) => void local.set(k, v) });
+const carol = await generateIdentity();
+const c = await uidForPublicKey(carol.publicKey);
+describe("encrypted channels", () => {
+  const channel = 7, thread = `ch:${channel}` as const, target = `channel:${channel}`;
+  const lobby = welcome().channels[0]!;
+  let plains: Map<string, Plaintext>;
+  let stored: SealedMessage[];
+  async function post(id: number, mentions: string[] = [a], original?: Plaintext, text = "hi") {
+    const signature = await signMessage(carol, { serverKey: server, target, sealed: { group, epoch } }, c, text, mentions, [], original?.signature);
+    const plain = { text, mentions, attachments: [], signature };
+    plains.set(`${id}:${signature.revision}`, plain);
+    const sealed = { id, conversation: target, group, epoch, author_uid: c, author_name: "Carol", message_id: signature.message_id,
+      revision: signature.revision, ciphertext: "sealed", sent_at: signature.created_at, deleted: text === DELETION_TEXT } satisfies SealedMessage;
+    stored = [...stored.filter(r => r.id !== id), sealed].sort((x, y) => x.id - y.id);
+    return { sealed, plain };
+  }
+  const mentions = () => useSession.getState().threads[thread]?.mentions;
+  beforeEach(() => {
+    plains = new Map(); stored = [];
+    useSession.setState({ channels: { [channel]: { ...lobby, id: channel, encrypted: true, history: true } } });
+    runtime.openMessage = vi.fn(async (r: SealedMessage) => {
+      const plain = plains.get(`${r.id}:${r.revision}`);
+      return plain ? { ok: plain } : { reason: "no_key" as const };
+    });
+    // The server's newest rows before the cursor, oldest first.
+    request.mockImplementation(async (_method: string, params: { before: number | null; limit: number }) =>
+      ({ sealed: stored.filter(r => params.before === null || r.id < params.before).slice(-params.limit) }));
+  });
+  it("opens messages from any member and counts a mention of me once", async () => {
+    const { sealed } = await post(1);
+    await dm.receive(sealed, true); await dm.receive(sealed, true);
+    expect(useSession.getState().threads[thread]?.items[0]).toMatchObject({ msg: { target: { channel }, author_uid: c }, authentic: true, verified: true });
+    expect(mentions()).toBe(1);
+    expect(notify).toHaveBeenCalledTimes(1);
+  });
+  it("replaces a mention on edit and clears it on removal", async () => {
+    const first = await post(1);
+    await dm.receive(first.sealed, true);
+    await dm.receive((await post(1, [], first.plain, "edited")).sealed, true);
+    expect(mentions()).toBe(0);
+    await dm.receive((await post(2)).sealed, true);
+    expect(mentions()).toBe(1);
+    dm.remove(target, [2]);
+    expect(mentions()).toBe(0);
+  });
+  it("keeps the last accepted mention while a newer revision cannot be opened yet", async () => {
+    const first = await post(1);
+    await dm.receive(first.sealed, true);
+    const edit = await post(1, [], first.plain, "edited");
+    plains.delete("1:1");
+    await dm.receive(edit.sealed, true);
+    expect(mentions()).toBe(1);
+  });
+  it("drops mentions at the read mark for good", async () => {
+    const first = await post(5);
+    await dm.receive(first.sealed, true);
+    useSession.getState().dispatch({ type: "event", event: { ev: "chat.read", d: { conversation: target, message: 5 } }, now: 0 });
+    await dm.refreshUnread(target);
+    await dm.receive((await post(5, [a], first.plain, "again")).sealed, false);
+    expect(mentions()).toBe(0);
+  });
+  it("counts mentions among unread rows after connecting, without notifying", async () => {
+    for (let id = 1; id <= 5; id++) await post(id, id >= 4 ? [a] : []);
+    useSession.setState(s => ({ threads: { ...s.threads, [thread]: { items: [], unread: 3, mentions: 0, hasMore: true, loaded: false, lastRead: 2, locked: false } } }));
+    await dm.scanUnread();
+    expect(mentions()).toBe(2);
+    expect(notify).not.toHaveBeenCalled();
+  });
+  const unread = (id = channel, count = 1) => useSession.setState(s => ({ threads: { ...s.threads,
+    [`ch:${id}`]: { items: [], unread: count, mentions: 0, hasMore: true, loaded: false, lastRead: 0, locked: false } } }));
+  it("starts mention accounting over after a resync", async () => {
+    await dm.receive((await post(1)).sealed, true);
+    expect(mentions()).toBe(1);
+    // Removed while disconnected; the Welcome rebuilt the thread.
+    stored = []; await post(2, []);
+    useSession.setState(s => ({ epoch: s.epoch + 1 })); unread();
+    dm.reset(); await dm.scanUnread();
+    expect(mentions()).toBe(0);
+  });
+  it("recounts a view rebuilt by a Welcome from nothing left before it", async () => {
+    await dm.receive((await post(1)).sealed, true);
+    expect(mentions()).toBe(1);
+    // Reconnecting: the controller resets before the Welcome moves the view back here.
+    dm.reset();
+    useSession.setState(s => ({ epoch: s.epoch + 1, threads: {} })); unread(channel, 0);
+    useSession.setState({ activeThread: "channel", viewChannel: channel });
+    expect(mentions()).toBe(0);
+  });
+  it("retries every row waiting for a key, however many wait", async () => {
+    const rows: SealedMessage[] = [];
+    for (let id = 1; id <= 257; id++) rows.push((await post(id, [])).sealed);
+    const waiting = new Map(plains); plains.clear();
+    for (const row of rows) await dm.receive(row, false);
+    expect(useSession.getState().threads[thread]?.items.filter(i => i.kind === "msg" && i.cannotOpen === "no_key")).toHaveLength(257);
+    // Only the newest row's key arrives.
+    plains.set("257:0", waiting.get("257:0")!);
+    dm.refresh();
+    await vi.waitFor(() => expect(useSession.getState().threads[thread]?.items.find(i => i.key === "e257")).toMatchObject({ authentic: true }), { timeout: 10_000 });
+  }, 30_000);
+  /** Rows 1 and 2 wait for keys; the retry of row 1 pauses until released, then row 2's key is there. */
+  async function pausedRetry() {
+    const rows = [(await post(1)).sealed, (await post(2)).sealed];
+    const waiting = new Map(plains); plains.clear();
+    for (const row of rows) await dm.receive(row, false);
+    let release!: () => void;
+    const open = runtime.openMessage;
+    runtime.openMessage = vi.fn(async (r: SealedMessage) => {
+      if (r.id === 1) await new Promise<void>(resolve => { release = resolve; });
+      return open(r);
+    });
+    const pass = (dm as unknown as { retryMissing(): Promise<void> }).retryMissing();
+    await vi.waitFor(() => expect(runtime.openMessage).toHaveBeenCalled());
+    plains.set("2:0", waiting.get("2:0")!);
+    return { pass, release: () => release() };
+  }
+  it("does not bring back a row removed while an earlier row was retried", async () => {
+    const { pass, release } = await pausedRetry();
+    dm.remove(target, [2]);
+    useSession.getState().dispatch({ type: "event", event: { ev: "chat.sealed.removed", d: { conversation: target, ids: [2] } }, now: 0 });
+    release(); await pass;
+    expect(useSession.getState().threads[thread]?.items.map(i => i.key)).toEqual(["e1"]);
+    expect(mentions()).toBe(0);
+  });
+  it("does not carry a retry pass into the threads a Welcome rebuilt", async () => {
+    const { pass, release } = await pausedRetry();
+    useSession.setState(s => ({ epoch: s.epoch + 1, threads: {} })); unread(channel, 0);
+    release(); await pass;
+    expect(useSession.getState().threads[thread]?.items).toEqual([]);
+    expect(mentions()).toBe(0);
+  });
+  it("scans again in a new session while an earlier scan is still waiting", async () => {
+    await post(1); unread();
+    let answer!: (page: unknown) => void;
+    request.mockImplementationOnce(() => new Promise(resolve => { answer = resolve; }));
+    const first = dm.scanUnread();
+    useSession.setState(s => ({ epoch: s.epoch + 1 })); dm.reset(); unread();
+    await dm.scanUnread();
+    // The new session's scan ran (its page, then the end) while the first still waits.
+    expect(request).toHaveBeenCalledTimes(3);
+    expect(mentions()).toBe(1);
+    answer({ sealed: [] }); await first;
+  });
+  it("remembers a removal that arrives while a history page is on its way", async () => {
+    const { sealed } = await post(3);
+    let answer!: (page: unknown) => void;
+    request.mockImplementationOnce(() => new Promise(resolve => { answer = resolve; }));
+    const opening = dm.open(thread);
+    await vi.waitFor(() => expect(request).toHaveBeenCalled());
+    dm.remove(target, [3]);
+    answer({ sealed: [sealed] }); await opening;
+    expect(useSession.getState().threads[thread]?.items).toEqual([]);
+    expect(mentions()).toBe(0);
+  });
+  it("does not bring back a channel deleted while its message was opening", async () => {
+    const { sealed } = await post(1);
+    let release!: () => void;
+    const open = runtime.openMessage;
+    runtime.openMessage = vi.fn(async (r: SealedMessage) => { await new Promise<void>(resolve => { release = resolve; }); return open(r); });
+    const receiving = dm.receive(sealed, true);
+    await vi.waitFor(() => expect(runtime.openMessage).toHaveBeenCalled());
+    useSession.setState({ channels: {}, threads: {} });
+    release(); await receiving;
+    expect(useSession.getState().threads[thread]).toBeUndefined();
+  });
+  it("runs rescans after a cap in the same four scan slots", async () => {
+    const ids = [7, 8, 9, 10, 11];
+    useSession.setState({ channels: Object.fromEntries(ids.map(id => [id, { ...lobby, id, encrypted: true, history: true }])) });
+    for (const id of ids.slice(0, 4)) unread(id);
+    const answers: ((page: unknown) => void)[] = [];
+    request.mockImplementation(() => new Promise(resolve => { answers.push(resolve); }));
+    const scans = dm.scanUnread();
+    await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(4));
+    // A fifth channel's capped count falls below the cap (recounted when it comes on screen).
+    unread(11);
+    (dm as unknown as { capped: Set<string> }).capped.add("ch:11");
+    useSession.setState({ activeThread: "channel", viewChannel: 11 });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(request).toHaveBeenCalledTimes(4);
+    answers.shift()!({ sealed: [] });
+    await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(5));
+    expect(request.mock.calls[4]![1]).toMatchObject({ conversation: "channel:11" });
+    request.mockImplementation(async () => ({ sealed: [] }));
+    for (const answer of answers.splice(0)) answer({ sealed: [] });
+    await scans;
+  });
+  it("scans further back when a count stopped at the cap falls below it", async () => {
+    for (let id = 1; id <= 101; id++) await post(id);
+    useSession.setState(s => ({ threads: { ...s.threads, [thread]: { items: [], unread: 100, mentions: 0, hasMore: true, loaded: false, lastRead: 0, locked: false } } }));
+    await dm.scanUnread();
+    expect(mentions()).toBe(100);
+    expect(request).toHaveBeenCalledOnce();
+    stored = stored.filter(r => r.id !== 101);
+    dm.remove(target, [101]);
+    expect(mentions()).toBe(99);
+    // The rescan reaches the oldest row's mention.
+    await vi.waitFor(() => expect(mentions()).toBe(100));
+    expect(request).toHaveBeenCalledTimes(2);
+  });
 });

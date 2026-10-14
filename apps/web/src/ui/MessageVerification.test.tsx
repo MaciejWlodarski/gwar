@@ -26,10 +26,10 @@ describe("quiet localized message verification", () => {
   afterEach(async () => {
     await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals();
   });
-  const show = async (verification: MessageVerification | undefined, options: { first?: boolean; text?: string; removed?: boolean } = {}) => {
+  const show = async (verification: MessageVerification | undefined, options: { first?: boolean; text?: string; removed?: boolean; cannotOpen?: "no_key" | "cannot_open"; canEdit?: boolean; canDelete?: boolean } = {}) => {
     const row: Extract<Row, { type: "msg" }> = { type: "msg", key: "m1", first: options.first ?? true,
-      item: { kind: "msg", key: "m1", at: msg.sent_at, msg: { ...msg, text: options.text ?? msg.text }, removed: options.removed } };
-    await act(async () => root.render(<TooltipProvider><MessageRow row={row} mine={false} meUid="bob" lang="en" compact={false} canEdit={false} canDelete={false} editing={false} verification={verification} /></TooltipProvider>));
+      item: { kind: "msg", key: "m1", at: msg.sent_at, msg: { ...msg, text: options.text ?? msg.text }, removed: options.removed, cannotOpen: options.cannotOpen } };
+    await act(async () => root.render(<TooltipProvider><MessageRow row={row} mine={false} meUid="bob" lang="en" compact={false} canEdit={options.canEdit ?? false} canDelete={options.canDelete ?? false} editing={false} verification={verification} /></TooltipProvider>));
   };
   for (const first of [true, false]) {
     it(`adds no marker or verification text to a fully verified ${first ? "header" : "grouped line"}`, async () => {
@@ -104,6 +104,14 @@ describe("quiet localized message verification", () => {
     expect(container.querySelector('[data-testid="message-verification-invalid"]')).not.toBeNull();
     expect(container.textContent).toContain("Unverified deletion request");
     expect(container.querySelector('[data-testid="message-server-removed"]')).toBeNull();
+  });
+  it("offers only removal for a row this device cannot open", async () => {
+    const button = (name: string) => container.querySelector(`button[aria-label="${name}"]`);
+    await show(undefined, { text: "", cannotOpen: "cannot_open", canEdit: true, canDelete: true });
+    expect(button("Delete message")).not.toBeNull();
+    expect(button("Edit message")).toBeNull();
+    await show(undefined, { text: "", cannotOpen: "no_key", canEdit: true });
+    expect(button("Delete message")).toBeNull(); expect(button("Edit message")).toBeNull();
   });
   it("keeps server moderation visible with a localized placeholder", async () => {
     await show(valid, { removed: true });

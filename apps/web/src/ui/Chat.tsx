@@ -7,7 +7,7 @@ import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRe
 import { countKey, useLanguage, useT, type TFn } from "../i18n";
 import { cn } from "../lib/cn";
 import { memberName } from "../lib/member-name";
-import { buildRows, messageTarget, encryptedDm, type Row } from "../lib/chat";
+import { buildRows, messageTarget, encryptedDm, sealedThread, type Row } from "../lib/chat";
 import { useIsMobile } from "../lib/media";
 import { checkUpload, formatBytes } from "../lib/files";
 import { splitMentions } from "../lib/mentions";
@@ -17,10 +17,10 @@ import type { ChatMessage } from "../proto/ChatMessage";
 import { controller, UploadError } from "../state/controller";
 import { myChannelId, storedKey } from "../state/reducer";
 import { useOutbox, useSession, useUi } from "../state/stores";
-import type { ThreadKey } from "../state/types";
+import type { ChatItem, ThreadKey } from "../state/types";
 import { AttachmentList } from "./Attachments";
 import { ConnectBadge, MentionBadge, UnreadBadge } from "./badges";
-import { usePermission, useUidColor } from "./hooks";
+import { usePermission, useRoster, useUidColor } from "./hooks";
 import { useMembersPanel } from "./members";
 import { useMentionAutocomplete } from "./MentionInput";
 import { DeafenButton, MicButton } from "./VoicePanel";
@@ -144,7 +144,9 @@ export const MessageRow = memo(function MessageRow({
   const attachments = msg.attachments ?? [];
   const mentionsTrusted = fullyVerified(verification);
   const mentionsMe = mentionsTrusted && !!meUid && (msg.mentions ?? []).includes(meUid);
-  const showActions = (canEdit || canDelete) && !editing && !row.item.removed && !row.item.cannotOpen && msg.text !== DELETION_TEXT;
+  // A row this device cannot open can only be removed (by a moderator in a channel).
+  const editable = canEdit && !row.item.cannotOpen;
+  const showActions = (editable || canDelete) && !editing && !row.item.removed && msg.text !== DELETION_TEXT;
 
   const remove = (e: MouseEvent) => {
     // Shift skips the confirmation.
@@ -232,7 +234,7 @@ export const MessageRow = memo(function MessageRow({
       </div>
       {showActions && (
         <div className="absolute -top-3 right-4 flex rounded-md border border-line-strong bg-raised opacity-0 shadow-pop group-focus-within:opacity-100 group-hover:opacity-100 pointer-coarse:opacity-100">
-          {canEdit && (
+          {editable && (
             <IconButton label={t("chat.edit")} size="sm" onClick={() => useUi.getState().setEditing(msg.id)}>
               <Pencil className="size-3.5" />
             </IconButton>
@@ -358,6 +360,10 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
   const key = useSession((s) => storedKey(s, threadKey));
   const thread = useSession((s) => (key ? s.threads[key] : undefined));
   const hasHistory = useSession((s) => s.kind !== "teamspeak");
+  const roster = useRoster(key);
+  // Without shared history, rows from before my account joined stay unreadable: one muted line stands for them.
+  const unshared = useCallback((i: ChatItem) => i.kind === "msg" && i.cannotOpen === "no_key" && !!i.sealed
+    && roster?.history === false && roster.since !== null && i.sealed.epoch < roster.since, [roster]);
   const allFailed = useOutbox((o) => o.failed);
   const failed = useMemo(() => allFailed.filter((f) => f.thread === key), [allFailed, key]);
   const serverKey = controller.messageServerKey;
@@ -418,10 +424,11 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
     return () => { active = false; clearTimeout(timer); };
   }, [thread?.items, serverKey, key, mineUid, verifier, authTick]);
   const rows = useMemo(() => buildRows((thread?.items ?? []).filter((i) => {
+    if (unshared(i)) return false;
     if (i.kind !== "msg" || i.msg.text !== DELETION_TEXT) return true;
     const entry = verified.get(i.msg.id);
     return entry?.fingerprint !== messageFingerprint(i.msg, { serverKey, target: targetFor(i.msg), sealed: i.sealed ? { group: i.sealed.group, epoch: i.sealed.epoch } : undefined }) || !quietDeletion(entry.state);
-  })), [thread?.items, verified, serverKey, key, signingUid]);
+  })), [thread?.items, verified, serverKey, key, signingUid, unshared]);
   const ref = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const restoreFrom = useRef<number | null>(null);
@@ -529,7 +536,8 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
             )}
           </EmptyState>
         )}
-        {thread?.items.some(i => i.kind === "msg" && i.cannotOpen === "no_key") && <p className="px-4 py-2 text-xs text-subtle" role="status">{t("chat.waitingHistory")}</p>}
+        {thread?.items.some(unshared) && <p className="px-4 py-2 text-center text-xs text-subtle">{t("chat.historyNotShared")}</p>}
+        {thread?.items.some(i => i.kind === "msg" && i.cannotOpen === "no_key" && !unshared(i)) && <p className="px-4 py-2 text-xs text-subtle" role="status">{t("chat.waitingHistory")}</p>}
         {rows.map((row) => {
           if (row.type === "day")
             return (
@@ -557,7 +565,7 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
               lang={lang}
               compact={compact}
               canEdit={stored && own && signable}
-              canDelete={stored && ((own && signable) || (!row.item.sealed && canManageMessages))}
+              canDelete={stored && ((own && signable) || (canManageMessages && (!row.item.sealed || row.item.sealed.conversation.startsWith("channel:"))))}
               editing={editing === m.id}
             />
           );
@@ -701,13 +709,15 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
   const t = useT();
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [pendingByThread, setPendingByThread] = useState<Record<string, PendingFile[]>>({});
-  const text = drafts[threadKey] ?? "";
-  const pending = useMemo(() => pendingByThread[threadKey] ?? [], [pendingByThread, threadKey]);
+  // Each channel keeps its own draft and files: "channel" follows the viewed one.
+  const draftKey = useSession(s => storedKey(s, threadKey) ?? threadKey);
+  const text = drafts[draftKey] ?? "";
+  const pending = useMemo(() => pendingByThread[draftKey] ?? [], [pendingByThread, draftKey]);
   const ref = useRef<HTMLTextAreaElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const online = useSession((s) => s.phase === "online");
-  const encrypted = useSession(s => encryptedDm(threadKey, s.kind));
-  const securing = useSession(s => encrypted && s.threads[threadKey]?.securing !== false);
+  const encrypted = useSession(s => sealedThread(storedKey(s, threadKey), s.kind, s.channels));
+  const securing = useSession(s => encrypted && s.threads[storedKey(s, threadKey) ?? ""]?.securing !== false);
   const peerOnline = useSession((s) => (threadKey.startsWith("dm:") && !encrypted ? Object.values(s.clients).some((c) => c.uid === threadKey.slice(3)) : true));
   const peerName = useSession((s) => (threadKey.startsWith("dm:") ? s.threads[threadKey]?.peer?.name : undefined));
   const channelName = useSession((s) => (s.viewChannel === null ? "" : (s.channels[s.viewChannel]?.name ?? "")));
@@ -715,23 +725,23 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
   const locked = useSession((s) => threadKey === "channel" && s.viewChannel !== null && !!s.threads[`ch:${s.viewChannel}`]?.locked);
   const uploadsOn = useSession((s) => s.kind === "vc" && (s.server?.upload_limit ?? 0) > 0);
   const mayUpload = usePermission("file_upload");
-  // Files travel with channel messages only.
-  const canAttach = threadKey === "channel" && uploadsOn && mayUpload;
+  // Files travel with plaintext channel messages only (encrypted attachments come later).
+  const canAttach = threadKey === "channel" && !encrypted && uploadsOn && mayUpload;
   const disabled = !online || !peerOnline || locked || securing;
   const over = text.length > MAX_MESSAGE_LENGTH;
   const uploading = pending.some((f) => f.status === "uploading");
   const ready = pending.filter((f) => f.status === "done");
   const hasContent = !!text.trim() || ready.length > 0;
 
-  const setText = (value: string) => setDrafts((d) => ({ ...d, [threadKey]: value }));
-  const mention = useMentionAutocomplete(text, setText, ref);
+  const setText = (value: string) => setDrafts((d) => ({ ...d, [draftKey]: value }));
+  const mention = useMentionAutocomplete(text, setText, ref, [], draftKey);
 
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
-  }, [text, threadKey]);
+  }, [text, draftKey]);
 
   // Focus the composer when switching conversations on desktop.
   useEffect(() => {
@@ -746,13 +756,13 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
     (files: File[]) => {
       if (files.length === 0) return;
       if (!canAttach) {
-        useUi.getState().toast("error", t(uploadsOn && mayUpload ? "file.channelOnly" : "file.disabled"));
+        useUi.getState().toast("error", t(threadKey === "channel" && encrypted ? "file.encryptedChannel" : uploadsOn && mayUpload ? "file.channelOnly" : "file.disabled"));
         return;
       }
       const limit = useSession.getState().server?.upload_limit ?? 0;
-      const room = MAX_FILES - (pendingByThread[threadKey]?.length ?? 0);
+      const room = MAX_FILES - (pendingByThread[draftKey]?.length ?? 0);
       if (files.length > room) useUi.getState().toast("error", t("file.tooMany", { max: MAX_FILES }));
-      const key = threadKey;
+      const key = draftKey;
       for (const file of files.slice(0, Math.max(0, room))) {
         const check = checkUpload(file.size, limit);
         if (!check.ok) {
@@ -772,7 +782,7 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
           });
       }
     },
-    [canAttach, mayUpload, uploadsOn, pendingByThread, threadKey, patch, t],
+    [canAttach, encrypted, mayUpload, uploadsOn, pendingByThread, draftKey, threadKey, patch, t],
   );
 
   // The chat area forwards dropped files here.
@@ -785,11 +795,11 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
 
   const remove = (id: number) => {
     setPendingByThread((all) => {
-      const list = all[threadKey] ?? [];
+      const list = all[draftKey] ?? [];
       const f = list.find((x) => x.id === id);
       f?.abort.abort();
       if (f?.preview) URL.revokeObjectURL(f.preview);
-      return { ...all, [threadKey]: list.filter((x) => x.id !== id) };
+      return { ...all, [draftKey]: list.filter((x) => x.id !== id) };
     });
   };
 
@@ -800,16 +810,17 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
     const attachments = ready.map((f) => f.fileId!).filter(Boolean);
     // Clear right away so quick follow-ups are not lost. A failed send shows up
     // in the conversation with a Retry button (see MessageList).
-    setDrafts((d) => ({ ...d, [threadKey]: "" }));
+    const key = draftKey;
+    setDrafts((d) => ({ ...d, [key]: "" }));
     setPendingByThread((all) => {
       // Failed uploads stay for another try; the sent ones go (their previews are no longer needed).
-      for (const f of all[threadKey] ?? []) if (f.status === "done" && f.preview) URL.revokeObjectURL(f.preview);
-      return { ...all, [threadKey]: (all[threadKey] ?? []).filter((f) => f.status !== "done") };
+      for (const f of all[key] ?? []) if (f.status === "done" && f.preview) URL.revokeObjectURL(f.preview);
+      return { ...all, [key]: (all[key] ?? []).filter((f) => f.status !== "done") };
     });
     mention.reset();
     ref.current?.focus();
     const sent = await controller.sendChat(threadKey, value, { mentions, attachments });
-    if (!sent && encrypted) setDrafts(d => ({ ...d, [threadKey]: d[threadKey] ? `${value}\n${d[threadKey]}` : value }));
+    if (!sent && encrypted) setDrafts(d => ({ ...d, [key]: d[key] ? `${value}\n${d[key]}` : value }));
   };
 
   const editLast = () => {
@@ -1003,7 +1014,9 @@ function ChatHeader() {
   const userCount = useSession((s) => Object.values(s.clients).filter((c) => c.channel !== null && c.channel === s.viewChannel).length);
   const inVoice = useSession((s) => myChannelId(s) !== null);
   const members = useMembersPanel();
-  const encrypted = useSession(s => encryptedDm(active, s.kind));
+  const sealed = useSession(s => { const key = storedKey(s, active); return sealedThread(key, s.kind, s.channels) ? key as `dm:${string}` | `ch:${number}` : null; });
+  const encrypted = !!sealed;
+  const vc = useSession(s => s.kind === "vc");
   const dmName = useSession((s) => (active.startsWith("dm:") ? memberName(s.members, active.slice(3), s.threads[active]?.peer?.name ?? "") : undefined));
 
   let title: string;
@@ -1012,6 +1025,7 @@ function ChatHeader() {
   if (active === "channel") {
     title = channel?.name ?? "";
     sub = channel?.topic || t("chat.noTopic");
+    if (encrypted) icon = <Lock className="size-5 text-subtle" />;
   } else if (active === "server") {
     icon = <Megaphone className="size-5 text-subtle" />;
     title = t("chat.server");
@@ -1037,6 +1051,17 @@ function ChatHeader() {
           {sub}
         </p>
       </div>
+      {active === "channel" && vc && !encrypted && (
+        <span className="hidden shrink-0 text-xs text-subtle md:inline">{t("chat.notEncrypted")}</span>
+      )}
+      {sealed && (
+        <Tooltip label={t("chat.messagesEncrypted")}>
+          <button type="button" aria-label={t("channel.readers")} onClick={() => useUi.getState().openDialog({ kind: "readers", thread: sealed })}
+            className="t flex shrink-0 cursor-pointer items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted hover:bg-hover hover:text-fg">
+            <Lock className="size-3.5" /> <span className="hidden sm:inline">{t("channel.readers")}</span>
+          </button>
+        </Tooltip>
+      )}
       {active === "channel" && userCount > 0 && (
         <span className="hidden shrink-0 text-xs text-subtle sm:inline">{t(countKey(lang, "chat.users", userCount), { count: userCount })}</span>
       )}
@@ -1063,6 +1088,8 @@ export function ChatArea() {
   const active = useSession((s) => s.activeThread);
   const phase = useSession((s) => s.phase);
   const storage = useSession((s) => storedKey(s, s.activeThread));
+  // Files travel with plaintext channel messages only: no drop invitation in an encrypted channel.
+  const sealedChannel = useSession(s => s.activeThread === "channel" && !!sealedThread(storedKey(s, s.activeThread), s.kind, s.channels));
   const attachRef = useRef<((files: File[]) => void) | null>(null);
   const [dragging, setDragging] = useState(false);
   const depth = useRef(0);
@@ -1103,7 +1130,7 @@ export function ChatArea() {
       <ThreadTabs />
       <MessageList key={storage ?? active} threadKey={active} />
       <Composer threadKey={active} attachRef={attachRef} />
-      {dragging && (
+      {dragging && !sealedChannel && (
         <div
           aria-hidden
           className="pointer-events-none absolute inset-2 z-30 flex items-center justify-center rounded-xl border-2 border-dashed border-accent bg-surface/85 text-sm font-medium text-accent"

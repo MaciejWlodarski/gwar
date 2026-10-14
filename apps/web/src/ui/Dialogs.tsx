@@ -11,6 +11,7 @@ import { newId, useSettings, type ServerKind } from "../state/settings";
 import { useSession, useUi, type DialogState } from "../state/stores";
 import { Button, Dialog, Field, Input, Segmented, Select, Textarea, Switch } from "./kit";
 import { SettingsDialog } from "./Settings";
+import { ReadersDialog } from "./Readers";
 import { BanDialog } from "./BanDialog";
 import { RemoveMemberDialog } from "./RemoveMemberDialog";
 import { Lightbox } from "./Attachments";
@@ -53,6 +54,8 @@ export function Dialogs() {
       return <CreateTokenDialog />;
     case "serverKey":
       return <ServerKeyDialog />;
+    case "readers":
+      return <ReadersDialog thread={dialog.thread} />;
     case "confirm":
       return <ConfirmDialog {...dialog} />;
     case "tsFirstRun":
@@ -224,6 +227,13 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
   );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Encryption is chosen once, when the channel is created; on Gwar servers only.
+  const serverKey = controller.messageServerKey;
+  const offerEncryption = useSession((s) => s.kind === "vc") && props.mode === "create";
+  const [encrypted, setEncrypted] = useState(() => useSettings.getState().channelEncryption[serverKey] ?? false);
+  const [history, setHistory] = useState(true);
+  // An encrypted channel has no password: its messages are readable only by its group anyway.
+  const sealedChannel = offerEncryption ? encrypted : !!existing?.encrypted;
 
   useEffect(() => {
     if (props.mode === "edit" && !existing) close();
@@ -255,9 +265,11 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
           name: name.trim(),
           parent: parentId,
           topic: topic.trim() || null,
-          password: password || null,
+          password: sealedChannel ? null : password || null,
           max_clients: max,
+          ...(offerEncryption && encrypted ? { encrypted: true, history } : {}),
         });
+        if (offerEncryption) useSettings.getState().setChannelEncryption(serverKey, encrypted);
       } else if (existing) {
         const parentChanged = parentId !== existing.parent;
         await controller.updateChannel({
@@ -265,7 +277,7 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
           name: name.trim(),
           topic: topic.trim(),
           // "" removes the password; absent keeps it.
-          ...(removePassword ? { password: "" } : password ? { password } : {}),
+          ...(sealedChannel ? {} : removePassword ? { password: "" } : password ? { password } : {}),
           // 0 removes the limit (protocol rule for channel.update).
           ...(max !== (existing.max_clients ?? null) ? { max_clients: max ?? 0 } : {}),
           ...(parentChanged ? (parentId === null ? { move_to_root: true } : { parent: parentId }) : {}),
@@ -303,7 +315,7 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
           {(id) => <Select id={id} value={parent} onValueChange={setParent} options={parentOptions} />}
         </Field>
         <div className="grid grid-cols-2 gap-3">
-          <Field
+          {!sealedChannel && <Field
             label={t("channel.password")}
             hint={existing?.has_password ? (removePassword ? t("channel.passwordWillRemove") : t("channel.passwordKeep")) : t("channel.passwordNone")}
           >
@@ -320,12 +332,19 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
                 maxLength={128}
               />
             )}
-          </Field>
+          </Field>}
           <Field label={t("channel.maxClients")} hint={t("channel.maxHint")}>
             {(id) => <Input id={id} inputMode="numeric" value={maxClients} onChange={(e) => setMaxClients(e.target.value.replace(/\D/g, ""))} maxLength={4} />}
           </Field>
         </div>
-        {existing?.has_password && (
+        {offerEncryption && (
+          <div className="flex flex-col gap-1">
+            <Switch checked={encrypted} onCheckedChange={setEncrypted} label={t("channel.encrypted")} description={t("channel.encryptedHint")} />
+            {encrypted && <Switch checked={history} onCheckedChange={setHistory} label={t("channel.history")} description={t("channel.historyHint")} />}
+            <p className="text-xs text-subtle">{t("channel.encryptionPermanent")}</p>
+          </div>
+        )}
+        {existing?.has_password && !sealedChannel && (
           <label className="flex cursor-pointer items-center gap-2 text-sm text-muted">
             <input
               type="checkbox"
