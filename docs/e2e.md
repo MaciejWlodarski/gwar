@@ -66,9 +66,9 @@ post-quantum suites (MLS can add them later); push notifications.
   third-party audit. The audit left out the crypto and storage providers,
   and Wire and XMTP use their own integrations, so the provider Gwar uses
   (`openmls_rust_crypto`) and our storage get their own review before
-  release. The module is loaded on first use, not with the page. Its size
-  budget, first set at 400 KB gzip, is raised to 450 KB, which leaves little
-  room: further size work belongs to the implementation.
+  release. Its size budget, first set at 400 KB gzip, is raised to 480 KB to
+  make room for message encryption. The module is loaded on first use and
+  cached.
 - **Ciphersuite** `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (0x0001):
   Ed25519 matches every Gwar key.
 - **SFrame**: browsers through `RTCRtpScriptTransform` (Chrome/Edge 141+,

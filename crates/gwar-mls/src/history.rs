@@ -2,8 +2,8 @@
 //! key, in chunks (docs/e2e-build.md, "History bundles"). This module is the
 //! envelope; which epochs to share and how imports are kept is the agent's.
 
+use crate::crypto::Crypto;
 use ed25519_dalek::{Signer as _, SigningKey};
-use openmls_rust_crypto::RustCrypto;
 use openmls_traits::{
     crypto::OpenMlsCrypto,
     types::{HpkeAeadType, HpkeCiphertext, HpkeConfig, HpkeKdfType, HpkeKemType},
@@ -36,7 +36,7 @@ pub enum HistoryError {
 
 /// A device's X25519 key pair for history bundles, derived from 32 random bytes.
 pub fn hpke_key_pair(ikm: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
-    let pair = RustCrypto::default().derive_hpke_keypair(HPKE, ikm).expect("X25519 key derivation");
+    let pair = Crypto::default().derive_hpke_keypair(HPKE, ikm).expect("X25519 key derivation");
     let private = pair.private.as_ref().try_into().expect("32-byte X25519 private key");
     let public = pair.public.as_slice().try_into().expect("32-byte X25519 public key");
     (private, public)
@@ -44,7 +44,8 @@ pub fn hpke_key_pair(ikm: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
 
 /// The published device HPKE key, signed by the device key:
 /// `gwar device hpke v1\n{device_key}\n{hpke_key}\n{created_at}`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeviceHpkeKey {
     pub device_key: String,
     pub hpke_key: String,
@@ -171,7 +172,7 @@ impl Chunk {
         let recipient = fixed::<32>(&header.recipient_hpke_key).ok_or(HistoryError::Header)?;
         let plaintext: Vec<u8> =
             entries.iter().flat_map(|(epoch, key)| epoch.to_be_bytes().into_iter().chain(*key)).collect();
-        let sealed = RustCrypto::default()
+        let sealed = Crypto::default()
             .hpke_seal(HPKE, &recipient, &header.info(), text.as_bytes(), &plaintext)
             .map_err(|_| HistoryError::Open)?;
         let (enc, ciphertext) = (sealed.kem_output.as_slice(), sealed.ciphertext.as_slice());
@@ -222,7 +223,7 @@ impl Chunk {
     pub fn open(&self, hpke_private: &[u8; 32]) -> Result<Vec<(u64, [u8; 32])>, HistoryError> {
         let sealed =
             HpkeCiphertext { kem_output: self.enc.to_vec().into(), ciphertext: self.ciphertext.clone().into() };
-        let plaintext = RustCrypto::default()
+        let plaintext = Crypto::default()
             .hpke_open(HPKE, &sealed, hpke_private, &self.header.info(), self.header.encode().as_bytes())
             .map_err(|_| HistoryError::Open)?;
         let (whole, rest) = plaintext.as_chunks::<ENTRY>();
