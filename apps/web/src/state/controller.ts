@@ -493,7 +493,7 @@ class Controller {
       if (conn.serverKey) channelLifecycle.observe(conn.serverKey, welcome.channels.map((c) => c.id));
       session.dispatch({ type: "welcome", welcome, resync, now: Date.now() });
       // A resync rebuilds channel threads: count the encrypted ones' mentions again.
-      if (this.sealed) { this.sealed.refresh(); void this.sealed.scanUnread(); }
+      if (this.sealed) { this.sealed.reset(); this.sealed.refresh(); void this.sealed.scanUnread(); }
       const myCh = myChannelId(useSession.getState());
       const v = useVoice.getState();
       if (v.muted || v.deafened) void this.pushMuteState();
@@ -510,11 +510,16 @@ class Controller {
     });
     conn.onEvent((event) => {
       if (this.conn !== conn) return;
-      if (event.ev === "chat.sealed.removed") this.sealed?.remove(event.d.conversation, event.d.ids);
-      if (event.ev === "chat.sealed") {
+      // Sealed messages and removals keep their order, also while MLS is starting.
+      if (event.ev === "chat.sealed" || event.ev === "chat.sealed.removed") {
         const epoch = useSession.getState().epoch;
         void this.sealedReady.then(() => {
-          if (this.conn === conn && epoch === useSession.getState().epoch) return this.sealed?.receive(event.d, true);
+          if (this.conn !== conn || epoch !== useSession.getState().epoch) return;
+          if (event.ev === "chat.sealed") return this.sealed?.receive(event.d, true);
+          this.sealed?.remove(event.d.conversation, event.d.ids);
+          session.dispatch({ type: "event", event, now: Date.now() });
+          // Removed rows may never have been loaded here: count again from the server.
+          void this.sealed?.refreshUnread(event.d.conversation, event.d.ids).catch(() => {});
         }).catch(error => console.warn("Conversation message:", error));
         return;
       }
@@ -553,8 +558,6 @@ class Controller {
         }).catch(() => {}).finally(() => { this.messagePending--; });
       } else session.dispatch({ type: "event", event, now: Date.now() });
       if (event.ev === "chat.read" && "conversation" in event.d) void this.sealed?.refreshUnread(event.d.conversation).catch(() => {});
-      // Removed rows may never have been loaded here: count again from the server.
-      if (event.ev === "chat.sealed.removed") void this.sealed?.refreshUnread(event.d.conversation, event.d.ids).catch(() => {});
       if (event.ev === "voice.closed") {
         useUi.getState().toast("info", tNow("voice.closed"));
         this.scheduleVoiceRetry(1000);
@@ -1142,13 +1145,12 @@ class Controller {
   }
 
   async deleteMessage(message: number): Promise<boolean> {
-    return this.changeMessage(message, async (original, bound) => {
+    return this.changeMessage(message, async (original, bound, sealed) => {
       // My verified message: a signed deletion. Otherwise a moderator's server removal.
       if (useSession.getState().kind === "vc" && (await this.editableOriginal(original, bound.conn))) return this.sendEdit(original, DELETION_TEXT, [], bound);
       bound.check();
-      const s = useSession.getState(), key = storedKey(s, s.activeThread);
-      const item = (key ? s.threads[key]?.items : [])?.find(i => i.kind === "msg" && i.msg.id === message);
-      if (item?.kind === "msg" && item.sealed) await bound.conn.request("chat.sealed.remove", { conversation: item.sealed.conversation, id: message });
+      // The route comes from the snapshot: the view may have moved to another thread meanwhile.
+      if (sealed) await bound.conn.request("chat.sealed.remove", { conversation: sealed, id: message });
       else await bound.conn.request("chat.delete", { message });
       return true;
     });
@@ -1158,7 +1160,7 @@ class Controller {
   private changing = new WeakMap<Link, Set<number>>();
 
   /** Runs one edit or deletion bound to the connection it started on, over a snapshot of the message. */
-  private async changeMessage(message: number, run: (original: ChatMessage, bound: ReturnType<Controller["bind"]>) => Promise<boolean>): Promise<boolean> {
+  private async changeMessage(message: number, run: (original: ChatMessage, bound: ReturnType<Controller["bind"]>, sealed: string | undefined) => Promise<boolean>): Promise<boolean> {
     let busy: Set<number> | undefined;
     try {
       const bound = this.bind();
@@ -1171,7 +1173,7 @@ class Controller {
       busy.add(message);
       // Sign only what this client authenticated itself: a server could graft
       // attachments onto a genuine envelope and have the edit endorse them.
-      return await run(structuredClone(item.msg), bound);
+      return await run(structuredClone(item.msg), bound, item.sealed?.conversation);
     } catch (e) { useUi.getState().toast("error", describeRequestError(e)); return false; }
     finally { busy?.delete(message); }
   }

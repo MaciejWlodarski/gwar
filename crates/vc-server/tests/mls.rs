@@ -1529,15 +1529,15 @@ async fn channel_groups_follow_the_channel_and_every_member_reads_its_sealed_cha
 
     // A newcomer starts with everything read; later messages count as unread.
     let mut d = connect_device(&server, &Device::new(4, 41)).await;
-    assert!(d.welcome.conversations.is_empty());
+    // Every encrypted channel is listed with its read mark, also with nothing unread.
+    let mark = d.welcome.conversations.iter().find(|u| u.conversation == conversation).unwrap();
+    assert_eq!((mark.last_read, mark.count), (second["id"].as_u64().unwrap() as u32, 0));
     assert!(d.welcome.unread.iter().all(|u| u.channel != secret));
     let third = b.ok("chat.sealed.send", sealed(&conversation, &group, 1, 3)).await;
     d.next_event("chat.sealed").await;
     let d2 = connect_device(&server, &Device::new(4, 42)).await;
-    assert_eq!(d2.welcome.conversations.len(), 1);
-    assert_eq!(d2.welcome.conversations[0].conversation, conversation);
-    assert_eq!(d2.welcome.conversations[0].last_read, second["id"].as_u64().unwrap() as u32);
-    assert_eq!(d2.welcome.conversations[0].count, 1);
+    let mark = d2.welcome.conversations.iter().find(|u| u.conversation == conversation).unwrap();
+    assert_eq!((mark.last_read, mark.count), (second["id"].as_u64().unwrap() as u32, 1));
     d.ok("chat.read", json!({"conversation":conversation,"message":third["id"]})).await;
 
     // Moderators remove without a signature; direct messages have no moderators.
@@ -1559,7 +1559,7 @@ async fn channel_groups_follow_the_channel_and_every_member_reads_its_sealed_cha
     assert_eq!(b.fails("chat.sealed.history", json!({"conversation":conversation})).await, "not_found");
     assert_eq!(c.ok("mls.groups", json!({})).await["groups"].as_array().unwrap().len(), 1);
     let d3 = connect_device(&server, &Device::new(4, 43)).await;
-    assert!(d3.welcome.conversations.is_empty());
+    assert!(d3.welcome.conversations.iter().all(|u| u.conversation != conversation));
 }
 
 #[tokio::test]

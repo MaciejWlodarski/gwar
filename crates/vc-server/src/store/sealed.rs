@@ -119,9 +119,10 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?)
     }
 
-    /// A channel or server conversation's unread messages. A member's missing mark is
+    /// A channel or server conversation's read mark and unread messages, also when none
+    /// are unread: clients prune mention counts at the mark. A member's missing mark is
     /// set to the newest message the first time, so newcomers don't inherit the whole history.
-    pub fn sealed_conversation_unread(&self, user: i64, conversation: &str) -> Result<Option<ConversationUnread>> {
+    pub fn sealed_conversation_unread(&self, user: i64, conversation: &str) -> Result<ConversationUnread> {
         let tx = self.db.unchecked_transaction()?;
         tx.execute(
             "INSERT OR IGNORE INTO conversation_reads(user_id,conversation,message)
@@ -135,7 +136,7 @@ impl Store {
             |r| Ok(ConversationUnread { conversation: conversation.into(), last_read: r.get(0)?, count: r.get(1)? }),
         )?;
         tx.commit()?;
-        Ok(Some(unread).filter(|u| u.count > 0))
+        Ok(unread)
     }
 
     pub fn sealed_mark_read(&self, user: i64, conversation: &str, message: MessageId) -> Result<MessageId> {

@@ -32,10 +32,12 @@ export class SealedConversations {
   private pending = new Set<string>();
   private notified = new Set<string>();
   private loading = new Set<string>();
-  /** Rows of fetched pages and queued or running opens, per `conversation:id`;
-   * removals are only remembered for these. */
+  /** Rows of fetched pages and queued or running opens, per `conversation:id`. */
   private queued = new Map<string, number>();
-  private removed = new Set<string>();
+  /** Fetches and opens running per conversation; while any runs, its removals
+   * are remembered (tombstones), so a response already on its way cannot restore a row. */
+  private busy = new Map<string, number>();
+  private removed = new Map<string, Set<number>>();
   private opening = new Set<string>();
   /** Running unread recounts per thread, with the ids removed since each started. */
   private reading = new Map<string, Set<number>>();
@@ -45,7 +47,10 @@ export class SealedConversations {
   private contributions = new Map<string, Map<string, { id: number; mention: boolean }>>();
   /** Per thread, the newest message that was on screen: read here before the server's mark catches up. */
   private seen = new Map<string, number>();
+  /** Running scans per `epoch:thread`, and threads waiting for one of the SCANS slots. */
   private scanning = new Set<string>();
+  private scans: `ch:${number}`[] = [];
+  private scanners = 0;
   /** Threads whose scan stopped at UNREAD_CAP mentions. */
   private capped = new Set<string>();
   private unsubscribe: () => void;
@@ -63,7 +68,11 @@ export class SealedConversations {
     this.unsubscribe = () => { runtimeChanges(); viewChanges(); };
   }
   remove(conversation: string, ids: number[]): void {
-    for (const id of ids) if (this.queued.has(`${conversation}:${id}`)) this.removed.add(`${conversation}:${id}`);
+    if (this.busy.has(conversation)) {
+      const removed = this.removed.get(conversation) ?? new Set<number>();
+      for (const id of ids) removed.add(id);
+      this.removed.set(conversation, removed);
+    }
     const thread = conversationThread(conversation, this.uid);
     const contributions = thread && this.contributions.get(thread);
     if (!thread || !contributions) return;
@@ -71,6 +80,8 @@ export class SealedConversations {
     this.recount(thread);
   }
   close(): void { this.stopped = true; this.unsubscribe(); this.pending.clear(); }
+  /** A Welcome rebuilt the threads: mention accounting starts over from its read marks. */
+  reset(): void { this.contributions.clear(); this.capped.clear(); this.scans = []; }
   private check(): void { if (this.stopped || !this.current()) throw new ConnectionLostError(); }
   conversation(thread: SealedKey): string { return threadConversation(thread, this.uid); }
   refresh(): void {
@@ -90,9 +101,10 @@ export class SealedConversations {
     const token = `${epoch}:${thread}:${before ?? "latest"}`;
     if (this.loading.has(token)) return;
     this.loading.add(token);
+    const conversation = this.conversation(thread);
+    this.enter(conversation);
     try {
       check();
-      const conversation = this.conversation(thread);
       // A direct message's group is created on first use; the runtime keeps channel groups itself.
       if (thread.startsWith("dm:")) await this.runtime.openConversation(conversation);
       check(); this.refresh();
@@ -102,7 +114,7 @@ export class SealedConversations {
       check();
       // Byte-limited pages may be short; only an empty page proves the end.
       useSession.getState().dispatch({ type: "sealedHistory", thread, hasMore: page.sealed.length > 0 });
-    } finally { this.loading.delete(token); }
+    } finally { this.loading.delete(token); this.leave(conversation); }
   }
   /** Opens one fetched page in order. Its rows are held until processed: a
    * removal arriving meanwhile must not be forgotten. */
@@ -123,11 +135,11 @@ export class SealedConversations {
     const thread = conversationThread(conversation, this.uid);
     if (!thread) return;
     // A running pass may already have counted rows removed since: it drops them before counting.
-    const running = this.reading.get(thread);
+    const epoch = useSession.getState().epoch, pass = `${epoch}:${thread}`;
+    const running = this.reading.get(pass);
     if (running) { for (const id of removed) running.add(id); return; }
     const gone = new Set(removed);
-    this.reading.set(thread, gone);
-    const epoch = useSession.getState().epoch;
+    this.reading.set(pass, gone);
     try {
       let before: number | null = null, through = 0;
       const ids = new Set<number>();
@@ -150,27 +162,34 @@ export class SealedConversations {
         before = oldest;
         await new Promise(resolve => setTimeout(resolve, 100));
       }
-    } finally { this.reading.delete(thread); }
+    } finally { this.reading.delete(pass); }
   }
   /** After connecting: opens the unread messages of every encrypted channel to
    * count those mentioning me, at most SCANS conversations at a time, without notifying. */
-  async scanUnread(): Promise<void> {
+  scanUnread(): Promise<void> {
     const state = useSession.getState();
-    const threads = Object.entries(state.threads)
+    return this.queueScans(Object.entries(state.threads)
       .filter(([key, t]) => key.startsWith("ch:") && t.unread > 0 && sealedThread(key, state.kind, state.channels))
-      .map(([key]) => key as `ch:${number}`);
-    const worker = async (): Promise<void> => {
-      for (let thread = threads.shift(); thread && !this.stopped; thread = threads.shift()) await this.scan(thread).catch(this.error);
-    };
-    await Promise.all(Array.from({ length: SCANS }, worker));
+      .map(([key]) => key as `ch:${number}`));
+  }
+  /** Every scan, also a rescan after a cap, waits for one of SCANS slots. */
+  private async queueScans(threads: `ch:${number}`[]): Promise<void> {
+    for (const thread of threads) if (!this.scans.includes(thread)) this.scans.push(thread);
+    const workers: Promise<void>[] = [];
+    for (; this.scanners < SCANS && this.scans.length; this.scanners++) workers.push((async () => {
+      try { for (let thread = this.scans.shift(); thread && !this.stopped; thread = this.scans.shift()) await this.scan(thread).catch(this.error); }
+      finally { this.scanners--; }
+    })());
+    await Promise.all(workers);
   }
   /** Pages backwards through a channel's unread rows until its read mark, the
    * oldest retained row or UNREAD_CAP mentions, opening them as history. */
   private async scan(thread: `ch:${number}`): Promise<void> {
-    if (this.scanning.has(thread)) return;
-    this.scanning.add(thread);
-    const epoch = useSession.getState().epoch;
+    const epoch = useSession.getState().epoch, pass = `${epoch}:${thread}`;
+    if (this.scanning.has(pass)) return;
+    this.scanning.add(pass);
     const conversation = this.conversation(thread);
+    this.enter(conversation);
     try {
       let before: number | null = null;
       for (let rows = 0; rows < SCAN_ROWS;) {
@@ -184,7 +203,7 @@ export class SealedConversations {
         if (this.mentions(thread) >= UNREAD_CAP) { this.capped.add(thread); return; }
         before = oldest;
       }
-    } finally { this.scanning.delete(thread); }
+    } finally { this.scanning.delete(pass); this.leave(conversation); }
   }
   /** What I have read in a thread: the server's mark, or what has been on screen since. */
   private mark(thread: string): number {
@@ -208,7 +227,7 @@ export class SealedConversations {
     const count = this.mentions(thread);
     useSession.getState().dispatch({ type: "sealedMentions", thread: thread as `ch:${number}`, count: Math.min(UNREAD_CAP, count) });
     // An edit or removal took a capped scan's count below the cap: look further back.
-    if (count < UNREAD_CAP && this.capped.delete(thread)) void this.scan(thread as `ch:${number}`).catch(this.error);
+    if (count < UNREAD_CAP && this.capped.delete(thread)) void this.queueScans([thread as `ch:${number}`]);
   }
   /** Sets a channel message's mention contribution from its newest accepted
    * revision; an unopened or rejected revision leaves the previous one. */
@@ -226,8 +245,13 @@ export class SealedConversations {
   private hold(rowKey: string): void { this.queued.set(rowKey, (this.queued.get(rowKey) ?? 0) + 1); }
   private release(rowKey: string): void {
     const left = this.queued.get(rowKey)! - 1;
-    if (left) this.queued.set(rowKey, left);
-    else { this.queued.delete(rowKey); this.removed.delete(rowKey); }
+    if (left) this.queued.set(rowKey, left); else this.queued.delete(rowKey);
+  }
+  private enter(conversation: string): void { this.busy.set(conversation, (this.busy.get(conversation) ?? 0) + 1); }
+  private leave(conversation: string): void {
+    const left = this.busy.get(conversation)! - 1;
+    if (left) this.busy.set(conversation, left);
+    else { this.busy.delete(conversation); this.removed.delete(conversation); }
   }
   /** Bound session metadata to retained rows and rows still being processed. */
   private prune(): void {
@@ -246,20 +270,22 @@ export class SealedConversations {
     if (duplicate) return this.queue;
     this.opening.add(token);
     const rowKey = `${row.conversation}:${row.id}`;
-    this.hold(rowKey);
-    const wasRemoved = () => this.removed.has(rowKey);
+    this.hold(rowKey); this.enter(row.conversation);
+    const wasRemoved = () => !!this.removed.get(row.conversation)?.has(row.id);
+    const thread = conversationThread(row.conversation, this.uid);
+    // A channel deleted meanwhile keeps no thread.
+    const gone = () => { const s = useSession.getState(); return !thread || !sealedThread(thread, s.kind, s.channels); };
     const run = this.queue.then(async () => {
       this.check(); if (epoch !== useSession.getState().epoch || wasRemoved()) return;
       const state = useSession.getState();
-      const thread = conversationThread(row.conversation, this.uid);
-      if (!thread || !sealedThread(thread, state.kind, state.channels)) return;
+      if (!thread || gone()) return;
       const channel = thread.startsWith("ch:") ? Number(thread.slice(3)) : null;
       const peer = channel === null ? thread.slice(3) : null;
       if (peer && ![peer, this.uid].includes(row.author_uid)) return;
       const old = state.threads[thread]?.items.find(i => i.key === key);
       if (old?.kind === "msg" && (old.sealed?.revision ?? -1) > row.revision) return;
       const result = await this.runtime.openMessage(row);
-      this.check(); if (epoch !== useSession.getState().epoch || wasRemoved()) return;
+      this.check(); if (epoch !== useSession.getState().epoch || wasRemoved() || gone()) return;
       const msg: ChatMessage = { id: row.id, target: channel === null ? { client: 0 } : { channel }, author: 0, author_uid: row.author_uid,
         author_name: row.author_name, sent_at: row.sent_at, edited_at: row.edited_at, text: "" };
       let item: Extract<ChatItem, { kind: "msg" }> = { kind: "msg", key, at: row.sent_at, msg, sealed: row };
@@ -268,7 +294,7 @@ export class SealedConversations {
         const serverKey = this.link.serverKey!;
         const verification = withChannelLifecycle(await this.verifier.verify(msg, { serverKey, target: row.conversation,
           participants: peer ? [this.uid, peer] : undefined, sealed: { group: row.group, epoch: row.epoch } }), serverKey, row.conversation);
-        this.check(); if (epoch !== useSession.getState().epoch || wasRemoved()) return;
+        this.check(); if (epoch !== useSession.getState().epoch || wasRemoved() || gone()) return;
         if (verification.continuity === "fork" || verification.continuity === "rollback") return;
         if (verification.status !== "verified" || row.deleted !== (msg.text === DELETION_TEXT)) {
           item = { ...item, msg: { ...msg, text: "", signature: null, mentions: [], attachments: [] }, cannotOpen: "cannot_open", removed: row.deleted };
@@ -284,7 +310,7 @@ export class SealedConversations {
       useSession.getState().dispatch({ type: "sealed", thread, item, live });
       this.account(thread, row, item);
     });
-    const done = run.finally(() => { this.opening.delete(token); this.release(rowKey); this.prune(); });
+    const done = run.finally(() => { this.opening.delete(token); this.release(rowKey); this.leave(row.conversation); this.prune(); });
     this.queue = done.catch(() => {});
     return done;
   }

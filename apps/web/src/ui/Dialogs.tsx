@@ -232,6 +232,8 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
   const offerEncryption = useSession((s) => s.kind === "vc") && props.mode === "create";
   const [encrypted, setEncrypted] = useState(() => useSettings.getState().channelEncryption[serverKey] ?? false);
   const [history, setHistory] = useState(true);
+  // An encrypted channel has no password: its messages are readable only by its group anyway.
+  const sealedChannel = offerEncryption ? encrypted : !!existing?.encrypted;
 
   useEffect(() => {
     if (props.mode === "edit" && !existing) close();
@@ -263,7 +265,7 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
           name: name.trim(),
           parent: parentId,
           topic: topic.trim() || null,
-          password: password || null,
+          password: sealedChannel ? null : password || null,
           max_clients: max,
           ...(offerEncryption && encrypted ? { encrypted: true, history } : {}),
         });
@@ -275,7 +277,7 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
           name: name.trim(),
           topic: topic.trim(),
           // "" removes the password; absent keeps it.
-          ...(removePassword ? { password: "" } : password ? { password } : {}),
+          ...(sealedChannel ? {} : removePassword ? { password: "" } : password ? { password } : {}),
           // 0 removes the limit (protocol rule for channel.update).
           ...(max !== (existing.max_clients ?? null) ? { max_clients: max ?? 0 } : {}),
           ...(parentChanged ? (parentId === null ? { move_to_root: true } : { parent: parentId }) : {}),
@@ -313,7 +315,7 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
           {(id) => <Select id={id} value={parent} onValueChange={setParent} options={parentOptions} />}
         </Field>
         <div className="grid grid-cols-2 gap-3">
-          <Field
+          {!sealedChannel && <Field
             label={t("channel.password")}
             hint={existing?.has_password ? (removePassword ? t("channel.passwordWillRemove") : t("channel.passwordKeep")) : t("channel.passwordNone")}
           >
@@ -330,7 +332,7 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
                 maxLength={128}
               />
             )}
-          </Field>
+          </Field>}
           <Field label={t("channel.maxClients")} hint={t("channel.maxHint")}>
             {(id) => <Input id={id} inputMode="numeric" value={maxClients} onChange={(e) => setMaxClients(e.target.value.replace(/\D/g, ""))} maxLength={4} />}
           </Field>
@@ -342,7 +344,7 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
             <p className="text-xs text-subtle">{t("channel.encryptionPermanent")}</p>
           </div>
         )}
-        {existing?.has_password && (
+        {existing?.has_password && !sealedChannel && (
           <label className="flex cursor-pointer items-center gap-2 text-sm text-muted">
             <input
               type="checkbox"

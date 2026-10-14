@@ -144,7 +144,9 @@ export const MessageRow = memo(function MessageRow({
   const attachments = msg.attachments ?? [];
   const mentionsTrusted = fullyVerified(verification);
   const mentionsMe = mentionsTrusted && !!meUid && (msg.mentions ?? []).includes(meUid);
-  const showActions = (canEdit || canDelete) && !editing && !row.item.removed && !row.item.cannotOpen && msg.text !== DELETION_TEXT;
+  // A row this device cannot open can only be removed (by a moderator in a channel).
+  const editable = canEdit && !row.item.cannotOpen;
+  const showActions = (editable || canDelete) && !editing && !row.item.removed && msg.text !== DELETION_TEXT;
 
   const remove = (e: MouseEvent) => {
     // Shift skips the confirmation.
@@ -232,7 +234,7 @@ export const MessageRow = memo(function MessageRow({
       </div>
       {showActions && (
         <div className="absolute -top-3 right-4 flex rounded-md border border-line-strong bg-raised opacity-0 shadow-pop group-focus-within:opacity-100 group-hover:opacity-100 pointer-coarse:opacity-100">
-          {canEdit && (
+          {editable && (
             <IconButton label={t("chat.edit")} size="sm" onClick={() => useUi.getState().setEditing(msg.id)}>
               <Pencil className="size-3.5" />
             </IconButton>
@@ -707,8 +709,10 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
   const t = useT();
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [pendingByThread, setPendingByThread] = useState<Record<string, PendingFile[]>>({});
-  const text = drafts[threadKey] ?? "";
-  const pending = useMemo(() => pendingByThread[threadKey] ?? [], [pendingByThread, threadKey]);
+  // Each channel keeps its own draft and files: "channel" follows the viewed one.
+  const draftKey = useSession(s => storedKey(s, threadKey) ?? threadKey);
+  const text = drafts[draftKey] ?? "";
+  const pending = useMemo(() => pendingByThread[draftKey] ?? [], [pendingByThread, draftKey]);
   const ref = useRef<HTMLTextAreaElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const online = useSession((s) => s.phase === "online");
@@ -729,7 +733,7 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
   const ready = pending.filter((f) => f.status === "done");
   const hasContent = !!text.trim() || ready.length > 0;
 
-  const setText = (value: string) => setDrafts((d) => ({ ...d, [threadKey]: value }));
+  const setText = (value: string) => setDrafts((d) => ({ ...d, [draftKey]: value }));
   const mention = useMentionAutocomplete(text, setText, ref);
 
   useLayoutEffect(() => {
@@ -737,7 +741,7 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
     if (!el) return;
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
-  }, [text, threadKey]);
+  }, [text, draftKey]);
 
   // Focus the composer when switching conversations on desktop.
   useEffect(() => {
@@ -756,9 +760,9 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
         return;
       }
       const limit = useSession.getState().server?.upload_limit ?? 0;
-      const room = MAX_FILES - (pendingByThread[threadKey]?.length ?? 0);
+      const room = MAX_FILES - (pendingByThread[draftKey]?.length ?? 0);
       if (files.length > room) useUi.getState().toast("error", t("file.tooMany", { max: MAX_FILES }));
-      const key = threadKey;
+      const key = draftKey;
       for (const file of files.slice(0, Math.max(0, room))) {
         const check = checkUpload(file.size, limit);
         if (!check.ok) {
@@ -778,7 +782,7 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
           });
       }
     },
-    [canAttach, mayUpload, uploadsOn, pendingByThread, threadKey, patch, t],
+    [canAttach, mayUpload, uploadsOn, pendingByThread, draftKey, patch, t],
   );
 
   // The chat area forwards dropped files here.
@@ -791,11 +795,11 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
 
   const remove = (id: number) => {
     setPendingByThread((all) => {
-      const list = all[threadKey] ?? [];
+      const list = all[draftKey] ?? [];
       const f = list.find((x) => x.id === id);
       f?.abort.abort();
       if (f?.preview) URL.revokeObjectURL(f.preview);
-      return { ...all, [threadKey]: list.filter((x) => x.id !== id) };
+      return { ...all, [draftKey]: list.filter((x) => x.id !== id) };
     });
   };
 
@@ -806,16 +810,17 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
     const attachments = ready.map((f) => f.fileId!).filter(Boolean);
     // Clear right away so quick follow-ups are not lost. A failed send shows up
     // in the conversation with a Retry button (see MessageList).
-    setDrafts((d) => ({ ...d, [threadKey]: "" }));
+    const key = draftKey;
+    setDrafts((d) => ({ ...d, [key]: "" }));
     setPendingByThread((all) => {
       // Failed uploads stay for another try; the sent ones go (their previews are no longer needed).
-      for (const f of all[threadKey] ?? []) if (f.status === "done" && f.preview) URL.revokeObjectURL(f.preview);
-      return { ...all, [threadKey]: (all[threadKey] ?? []).filter((f) => f.status !== "done") };
+      for (const f of all[key] ?? []) if (f.status === "done" && f.preview) URL.revokeObjectURL(f.preview);
+      return { ...all, [key]: (all[key] ?? []).filter((f) => f.status !== "done") };
     });
     mention.reset();
     ref.current?.focus();
     const sent = await controller.sendChat(threadKey, value, { mentions, attachments });
-    if (!sent && encrypted) setDrafts(d => ({ ...d, [threadKey]: d[threadKey] ? `${value}\n${d[threadKey]}` : value }));
+    if (!sent && encrypted) setDrafts(d => ({ ...d, [key]: d[key] ? `${value}\n${d[key]}` : value }));
   };
 
   const editLast = () => {
@@ -1051,9 +1056,9 @@ function ChatHeader() {
       )}
       {sealed && (
         <Tooltip label={t("chat.messagesEncrypted")}>
-          <button type="button" onClick={() => useUi.getState().openDialog({ kind: "readers", thread: sealed })}
-            className="t hidden shrink-0 cursor-pointer items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted hover:bg-hover hover:text-fg sm:flex">
-            <Lock className="size-3.5" /> {t("channel.readers")}
+          <button type="button" aria-label={t("channel.readers")} onClick={() => useUi.getState().openDialog({ kind: "readers", thread: sealed })}
+            className="t flex shrink-0 cursor-pointer items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted hover:bg-hover hover:text-fg">
+            <Lock className="size-3.5" /> <span className="hidden sm:inline">{t("channel.readers")}</span>
           </button>
         </Tooltip>
       )}

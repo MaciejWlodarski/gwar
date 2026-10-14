@@ -346,6 +346,72 @@ describe("encrypted channels", () => {
     expect(mentions()).toBe(2);
     expect(notify).not.toHaveBeenCalled();
   });
+  const unread = (id = channel, count = 1) => useSession.setState(s => ({ threads: { ...s.threads,
+    [`ch:${id}`]: { items: [], unread: count, mentions: 0, hasMore: true, loaded: false, lastRead: 0, locked: false } } }));
+  it("starts mention accounting over after a resync", async () => {
+    await dm.receive((await post(1)).sealed, true);
+    expect(mentions()).toBe(1);
+    // Removed while disconnected; the Welcome rebuilt the thread.
+    stored = []; await post(2, []);
+    useSession.setState(s => ({ epoch: s.epoch + 1 })); unread();
+    dm.reset(); await dm.scanUnread();
+    expect(mentions()).toBe(0);
+  });
+  it("scans again in a new session while an earlier scan is still waiting", async () => {
+    await post(1); unread();
+    let answer!: (page: unknown) => void;
+    request.mockImplementationOnce(() => new Promise(resolve => { answer = resolve; }));
+    const first = dm.scanUnread();
+    useSession.setState(s => ({ epoch: s.epoch + 1 })); dm.reset(); unread();
+    await dm.scanUnread();
+    // The new session's scan ran (its page, then the end) while the first still waits.
+    expect(request).toHaveBeenCalledTimes(3);
+    expect(mentions()).toBe(1);
+    answer({ sealed: [] }); await first;
+  });
+  it("remembers a removal that arrives while a history page is on its way", async () => {
+    const { sealed } = await post(3);
+    let answer!: (page: unknown) => void;
+    request.mockImplementationOnce(() => new Promise(resolve => { answer = resolve; }));
+    const opening = dm.open(thread);
+    await vi.waitFor(() => expect(request).toHaveBeenCalled());
+    dm.remove(target, [3]);
+    answer({ sealed: [sealed] }); await opening;
+    expect(useSession.getState().threads[thread]?.items).toEqual([]);
+    expect(mentions()).toBe(0);
+  });
+  it("does not bring back a channel deleted while its message was opening", async () => {
+    const { sealed } = await post(1);
+    let release!: () => void;
+    const open = runtime.openMessage;
+    runtime.openMessage = vi.fn(async (r: SealedMessage) => { await new Promise<void>(resolve => { release = resolve; }); return open(r); });
+    const receiving = dm.receive(sealed, true);
+    await vi.waitFor(() => expect(runtime.openMessage).toHaveBeenCalled());
+    useSession.setState({ channels: {}, threads: {} });
+    release(); await receiving;
+    expect(useSession.getState().threads[thread]).toBeUndefined();
+  });
+  it("runs rescans after a cap in the same four scan slots", async () => {
+    const ids = [7, 8, 9, 10, 11];
+    useSession.setState({ channels: Object.fromEntries(ids.map(id => [id, { ...lobby, id, encrypted: true, history: true }])) });
+    for (const id of ids.slice(0, 4)) unread(id);
+    const answers: ((page: unknown) => void)[] = [];
+    request.mockImplementation(() => new Promise(resolve => { answers.push(resolve); }));
+    const scans = dm.scanUnread();
+    await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(4));
+    // A fifth channel's capped count falls below the cap (recounted when it comes on screen).
+    unread(11);
+    (dm as unknown as { capped: Set<string> }).capped.add("ch:11");
+    useSession.setState({ activeThread: "channel", viewChannel: 11 });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(request).toHaveBeenCalledTimes(4);
+    answers.shift()!({ sealed: [] });
+    await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(5));
+    expect(request.mock.calls[4]![1]).toMatchObject({ conversation: "channel:11" });
+    request.mockImplementation(async () => ({ sealed: [] }));
+    for (const answer of answers.splice(0)) answer({ sealed: [] });
+    await scans;
+  });
   it("scans further back when a count stopped at the cap falls below it", async () => {
     for (let id = 1; id <= 101; id++) await post(id);
     useSession.setState(s => ({ threads: { ...s.threads, [thread]: { items: [], unread: 100, mentions: 0, hasMore: true, loaded: false, lastRead: 0, locked: false } } }));

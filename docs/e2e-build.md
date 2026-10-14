@@ -919,8 +919,10 @@ The sealed message requests of section 3 apply to `channel:{id}` and to
   unread count (their Welcome), as for plaintext channels, so a newcomer does
   not start with the whole history unread; direct messages keep starting at
   zero.
-  `Welcome.conversations` lists channel conversations with unread messages
-  too; `Welcome.unread` keeps listing plaintext channels only.
+  `Welcome.conversations` also lists every encrypted channel conversation the
+  member can read, with its read mark even when nothing is unread (mention
+  counts are pruned at it); `Welcome.unread` keeps listing plaintext channels
+  only.
 - **Mentions** are inside the ciphertext. After connecting, for every
   conversation with unread messages the client pages backwards through the
   unread rows (`chat.sealed.history`, continuing after byte-short pages) until

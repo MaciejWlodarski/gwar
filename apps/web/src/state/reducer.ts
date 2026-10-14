@@ -71,6 +71,11 @@ export function dmKey(uid: string): StoredThreadKey {
 }
 
 /** Maps the UI tab key to the storage key given which channel I am looking at. */
+/** Late sealed results must not bring back a deleted channel's thread. */
+function deletedChannel(state: SessionState, thread: string): boolean {
+  return thread.startsWith("ch:") && !state.channels[Number(thread.slice(3))];
+}
+
 export function storedKey(state: SessionState, key: ThreadKey): StoredThreadKey | null {
   if (key === "server") return "server";
   if (key === "channel") {
@@ -472,12 +477,14 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
 export function reduce(state: SessionState, action: Action): SessionState {
   switch (action.type) {
     case "sealedUnread":
+      if (deletedChannel(state, action.thread)) return state;
       return withThread(state, action.thread, t => ({ ...t, unread: state.focused && isActive(state, action.thread) ? 0 : Math.min(100, action.count
         + t.items.filter(i => i.kind === "msg" && i.msg.id > Math.max(t.lastRead, action.through)).length) }));
     case "sealedStatus":
       if (state.threads[action.thread]?.securing === action.securing) return state;
       return withThread(state, action.thread, t => ({ ...t, securing: action.securing }));
     case "sealedHistory":
+      if (deletedChannel(state, action.thread)) return state;
       return withThread(state, action.thread, t => ({ ...t, loaded: true, hasMore: action.hasMore }));
     case "sealedMentions": {
       const count = state.focused && isActive(state, action.thread) ? 0 : Math.min(100, action.count);
@@ -486,6 +493,7 @@ export function reduce(state: SessionState, action: Action): SessionState {
     }
     case "sealed": {
       const key = action.thread;
+      if (deletedChannel(state, key)) return state;
       const peer = key.startsWith("dm:") ? key.slice(3) : null;
       let item = action.item;
       return withThread(state, key, t => {

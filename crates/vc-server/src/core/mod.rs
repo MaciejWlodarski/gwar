@@ -1282,7 +1282,7 @@ impl Core {
     fn conversations_for(&self, user: i64, uid: &str) -> Result<Vec<vc_proto::ConversationUnread>> {
         let mut conversations = self.store.sealed_unread(user, uid)?;
         for c in self.channels.values().filter(|c| c.encrypted) {
-            conversations.extend(self.store.sealed_conversation_unread(user, &format!("channel:{}", c.id))?);
+            conversations.push(self.store.sealed_conversation_unread(user, &format!("channel:{}", c.id))?);
         }
         Ok(conversations)
     }

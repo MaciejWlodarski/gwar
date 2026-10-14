@@ -880,15 +880,34 @@ describe("ending a session", () => {
 });
 
 
-it("recounts a conversation's unread messages from the server after a removal", () => {
+it("recounts a conversation's unread messages from the server after a removal", async () => {
   connectFake();
   const c = controller as unknown as { sealed: unknown };
   const dm = { remove: vi.fn(), refreshUnread: vi.fn(async () => {}) };
   c.sealed = dm;
-  link.emit({ ev: "chat.sealed.removed", d: { conversation: "dm:x:y", ids: [1] } });
-  expect(dm.remove).toHaveBeenCalledWith("dm:x:y", [1]);
-  expect(dm.refreshUnread).toHaveBeenCalledWith("dm:x:y", [1]);
-  c.sealed = null;
+  try {
+    link.emit({ ev: "chat.sealed.removed", d: { conversation: "dm:x:y", ids: [1] } });
+    await Promise.resolve();
+    expect(dm.remove).toHaveBeenCalledWith("dm:x:y", [1]);
+    expect(dm.refreshUnread).toHaveBeenCalledWith("dm:x:y", [1]);
+  } finally { c.sealed = null; }
+});
+
+it("keeps a removal after a sealed message that arrived while MLS was starting", async () => {
+  connectFake();
+  const c = controller as unknown as { sealed: unknown; sealedReady: Promise<void> };
+  let ready!: () => void;
+  c.sealedReady = new Promise(resolve => { ready = resolve; });
+  const order: string[] = [];
+  c.sealed = { receive: vi.fn(async () => { order.push("receive"); }), remove: vi.fn(() => order.push("remove")), refreshUnread: vi.fn(async () => {}) };
+  try {
+    const row = { id: 1, conversation: "dm:x:y", group: "g", epoch: 0, author_uid: "x", author_name: "x", message_id: "m", revision: 0, ciphertext: "c", sent_at: 1, deleted: false };
+    link.emit({ ev: "chat.sealed", d: row });
+    link.emit({ ev: "chat.sealed.removed", d: { conversation: "dm:x:y", ids: [1] } });
+    expect(order).toEqual([]);
+    ready(); await c.sealedReady; await Promise.resolve();
+    expect(order).toEqual(["receive", "remove"]);
+  } finally { c.sealed = null; c.sealedReady = Promise.resolve(); }
 });
 
 it("a teardown that resumes after a newer connect leaves that connection alone", async () => {
@@ -960,6 +979,18 @@ describe("encrypted channels", () => {
     expect(link.sent("chat.delete")).toEqual([]);
   });
 
+  it("removes the sealed row it started with when the view moves meanwhile", async () => {
+    connectFake({ encrypted: [1] });
+    install(fakeSealed());
+    session().dispatch({ type: "sealed", thread: "ch:1", live: false,
+      item: { kind: "msg", key: "e6", at: 0, msg: { ...message(6, 1), signature: null }, sealed: sealedRow(6), authentic: true } });
+    const removal = controller.deleteMessage(6);
+    session().dispatch({ type: "selectChannel", channel: 2 });
+    expect(await removal).toBe(true);
+    expect(link.sent("chat.sealed.remove")).toEqual([{ op: "chat.sealed.remove", d: { conversation: "channel:1", id: 6 } }]);
+    expect(link.sent("chat.delete")).toEqual([]);
+  });
+
   it("reports reading by conversation", async () => {
     connectFake({ encrypted: [1] });
     session().dispatch({ type: "sealed", thread: "ch:1", live: true,
@@ -970,10 +1001,11 @@ describe("encrypted channels", () => {
 
   it("counts encrypted channels' mentions again after a resync", async () => {
     connectFake({ encrypted: [1] });
-    const sealed = { ...fakeSealed(), refresh: vi.fn(), scanUnread: vi.fn(async () => {}) }; install(sealed);
+    const order: string[] = [];
+    const sealed = { ...fakeSealed(), reset: vi.fn(() => order.push("reset")), refresh: vi.fn(), scanUnread: vi.fn(async () => { order.push("scan"); }) }; install(sealed);
     link.welcomeNow(welcome({ session: 1, uid: "u1", channels: [chan(1, { encrypted: true })], clients: [client(1, null)] }), true);
     expect(sealed.refresh).toHaveBeenCalled();
-    expect(sealed.scanUnread).toHaveBeenCalledOnce();
+    expect(order).toEqual(["reset", "scan"]);
   });
 
   it("lets the creator make an encrypted channel's group right away", async () => {
