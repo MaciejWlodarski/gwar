@@ -377,6 +377,37 @@ describe("encrypted channels", () => {
     dm.refresh();
     await vi.waitFor(() => expect(useSession.getState().threads[thread]?.items.find(i => i.key === "e257")).toMatchObject({ authentic: true }), { timeout: 10_000 });
   }, 30_000);
+  /** Rows 1 and 2 wait for keys; the retry of row 1 pauses until released, then row 2's key is there. */
+  async function pausedRetry() {
+    const rows = [(await post(1)).sealed, (await post(2)).sealed];
+    const waiting = new Map(plains); plains.clear();
+    for (const row of rows) await dm.receive(row, false);
+    let release!: () => void;
+    const open = runtime.openMessage;
+    runtime.openMessage = vi.fn(async (r: SealedMessage) => {
+      if (r.id === 1) await new Promise<void>(resolve => { release = resolve; });
+      return open(r);
+    });
+    const pass = (dm as unknown as { retryMissing(): Promise<void> }).retryMissing();
+    await vi.waitFor(() => expect(runtime.openMessage).toHaveBeenCalled());
+    plains.set("2:0", waiting.get("2:0")!);
+    return { pass, release: () => release() };
+  }
+  it("does not bring back a row removed while an earlier row was retried", async () => {
+    const { pass, release } = await pausedRetry();
+    dm.remove(target, [2]);
+    useSession.getState().dispatch({ type: "event", event: { ev: "chat.sealed.removed", d: { conversation: target, ids: [2] } }, now: 0 });
+    release(); await pass;
+    expect(useSession.getState().threads[thread]?.items.map(i => i.key)).toEqual(["e1"]);
+    expect(mentions()).toBe(0);
+  });
+  it("does not carry a retry pass into the threads a Welcome rebuilt", async () => {
+    const { pass, release } = await pausedRetry();
+    useSession.setState(s => ({ epoch: s.epoch + 1, threads: {} })); unread(channel, 0);
+    release(); await pass;
+    expect(useSession.getState().threads[thread]?.items).toEqual([]);
+    expect(mentions()).toBe(0);
+  });
   it("scans again in a new session while an earlier scan is still waiting", async () => {
     await post(1); unread();
     let answer!: (page: unknown) => void;

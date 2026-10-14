@@ -103,12 +103,17 @@ export class SealedConversations {
     try {
       do {
         this.retryAgain = false;
-        const state = useSession.getState();
+        const state = useSession.getState(), epoch = state.epoch;
         const rows = Object.entries(state.threads).filter(([key]) => sealedThread(key, state.kind, state.channels))
-          .flatMap(([, thread]) => thread.items.flatMap(i => i.kind === "msg" && i.sealed && i.cannotOpen === "no_key" ? [i.sealed] : []));
-        for (const row of rows) {
+          .flatMap(([key, thread]) => thread.items.flatMap(i => i.kind === "msg" && i.sealed && i.cannotOpen === "no_key" ? [[key, i.key, i.sealed.revision] as const] : []));
+        for (const [thread, key, revision] of rows) {
           if (this.stopped || !this.current()) return;
-          await this.receive(row, false).catch(this.error);
+          // A Welcome rebuilt the threads: start a fresh pass over them.
+          if (useSession.getState().epoch !== epoch) { this.retryAgain = true; break; }
+          // Only a row still there and still waiting: it may have been removed or opened meanwhile.
+          const item = useSession.getState().threads[thread]?.items.find(i => i.key === key);
+          if (item?.kind !== "msg" || !item.sealed || item.cannotOpen !== "no_key" || item.sealed.revision !== revision) continue;
+          await this.receive(item.sealed, false, epoch).catch(this.error);
         }
       } while (this.retryAgain);
     } finally { this.retrying = false; }
