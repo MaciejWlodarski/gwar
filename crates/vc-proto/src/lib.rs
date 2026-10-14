@@ -376,7 +376,7 @@ wire! {
         Event(Event),
     }
 
-    #[serde(untagged)]
+    #[serde(untagged, deny_unknown_fields)]
     pub enum Response {
         ServerProof(ServerProof),
         Welcome(Box<Welcome>),

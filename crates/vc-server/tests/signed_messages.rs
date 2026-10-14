@@ -473,3 +473,42 @@ async fn members_only_files_open_for_readers_of_their_channel() {
     admin.ok("server.update", json!({"file_access": "link"})).await;
     assert_eq!(get(&hidden, None).await, 200);
 }
+
+#[tokio::test]
+async fn migrated_v2_history_is_readable_edits_fail_cleanly_and_moderators_can_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("gwar.sqlite");
+    let store = vc_server::store::Store::open(&database).unwrap();
+    let channel = store.channels().unwrap()[0].id;
+    let key = new_key();
+    let id = store.add_message(channel, &uid_of(&key), "legacy", "preserved body", 1).unwrap();
+    drop(store);
+    let db = rusqlite::Connection::open(&database).unwrap();
+    let version: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    // Restore the pre-change schema and populate its old signature format.
+    db.execute_batch("DROP INDEX mls_history_hashes; DROP INDEX mls_history_chunks; DROP INDEX mls_history_group_inbox; ALTER TABLE mls_history DROP COLUMN chunk_hash;").unwrap();
+    db.pragma_update(None, "user_version", version - 2).unwrap();
+    db.execute(
+        "UPDATE messages SET signature=?1 WHERE id=?2",
+        rusqlite::params![json!({"key":public_key(&key),"signature":"v2"}).to_string(), id],
+    )
+    .unwrap();
+    drop(db);
+    let server = TestServer::start_with(|c| {
+        c.database = Some(database.clone());
+        c.data_dir = Some(dir.path().to_path_buf());
+    })
+    .await;
+    let mut author = Client::connect_with(&server, key, |raw, key| raw.hello(key, "legacy", None)).await.unwrap();
+    let history = author.ok("chat.history", json!({"channel":channel})).await;
+    assert_eq!(history["messages"][0]["text"], "preserved body");
+    assert!(history["messages"][0].get("signature").is_none());
+    let signature = author.signature(&format!("channel:{channel}"), "edited", &[], &[]);
+    assert_eq!(
+        author.fails("chat.edit", json!({"message":id,"text":"edited","signature":signature})).await,
+        "bad_request"
+    );
+    author.redeem(&server.admin_token).await;
+    author.ok("chat.delete", json!({"message":id})).await;
+    assert_eq!(author.ok("chat.history", json!({"channel":channel})).await["messages"], json!([]));
+}

@@ -47,7 +47,7 @@ wire! {
         HistoryRequest { group: String },
     }
 
-    #[serde(untagged)]
+    #[serde(untagged, deny_unknown_fields)]
     pub enum MlsResponse {
         Published { count: u32 },
         Created { group: String },
@@ -82,5 +82,49 @@ wire! {
         History { group: String },
         #[serde(rename = "mls.history.wanted")]
         HistoryWanted { group: String, device: String },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn every_mls_response_round_trips_through_the_server_envelope() {
+        let mut replies = vec![
+            json!({"count":0}),
+            json!({"group":"g"}),
+            json!({"group_info":"info","epoch":1}),
+            json!({"epoch":1}),
+            json!({"packages":[{"device_key":"d","package":"p"}],"next":"cursor"}),
+            json!({"devices":[{"uid":"u","device_key":"d","hpke_key":"h","created_at":1,"signature":"s"}],"next":null}),
+            json!({"head":1,"oldest":0,"entries":[{"epoch":0,"proposals":["p"],"commit":"c"}],"pending":["p"],"next":1}),
+            json!({"groups":[{"conversation":"c","group":"g","epoch":1,"pending":false}],"next":null}),
+            json!({"welcomes":[{"id":"i","group":"g","welcome":"w"}],"next":null}),
+            json!({"chunks":[{"id":"i","group":"g","sender_uid":"u","chunk":"c"}],"next":null}),
+            json!({"wanted":[{"group":"g","device":"d"}],"next":null}),
+            json!({"head":0,"oldest":0,"entries":[],"pending":[],"next":null}),
+        ];
+        for field in ["packages", "devices", "groups", "welcomes", "chunks", "wanted"] {
+            for next in [json!(null), json!("cursor")] {
+                let mut reply = json!({"next":next});
+                reply[field] = json!([]);
+                replies.push(reply);
+            }
+        }
+        for value in replies {
+            let mls: MlsResponse = serde_json::from_value(value.clone()).unwrap();
+            let frame = ServerFrame::Ok { re: 7, ok: Response::Mls(mls) };
+            let wire = serde_json::to_vec(&frame).unwrap();
+            let decoded: ServerFrame = serde_json::from_slice(&wire).unwrap();
+            assert_eq!(decoded, frame, "{value}");
+            assert_eq!(serde_json::to_value(decoded).unwrap(), json!({"re":7,"ok":value}));
+        }
+        for groups in [vec![], vec![1, 2]] {
+            let response = Response::Groups { groups };
+            assert_eq!(serde_json::from_value::<Response>(serde_json::to_value(&response).unwrap()).unwrap(), response);
+        }
+        assert_eq!(serde_json::from_str::<Response>("{}").unwrap(), Response::Empty {});
     }
 }

@@ -187,13 +187,27 @@ chunks for 90 days. Outstanding history requests expire after 30 days.
 Only either participant may maintain a direct message group; creating it also
 requires the other participant to be a server member. Group mutations store the
 observer, leaves, removal proposals, log and Welcomes in one SQLite transaction.
+SQLite uses WAL with `synchronous=FULL`; mutation replies and MLS broadcasts
+follow commit, including persisting the commit clock before an `expired` reply.
 Revocations, bans and member removal reconcile durable removal proposals at
 startup and during cleanup. Offline devices fetch them through `mls.log`.
 
 The commit clock is the persisted high-water mark or the system clock, whichever
 is later. Commits outside its five-minute window receive `expired` or `early`;
 competing commits at the same epoch receive `stale`. Every list has a stable
-cursor (`next`), at most 100 entries and a 1 MiB response limit.
+cursor (`next`), at most 100 entries, and a complete response within 640 KiB.
+SQL filters and cursors bound the reads; rows stream until the count or byte
+budget is reached (with at most one eligible lookahead). Device/package scans
+use eight-candidate batches; an empty uid claim reads no packages. Rust response
+objects reject unknown fields, distinguishing MLS `{groups, next}` from the
+role-list `{groups}` even when empty.
+
+History sharing rejects the sender's own device and epochs beyond the group's
+head. One write transaction checks SHA-256 deduplication per group/recipient,
+the 64-chunk quota per group/recipient/sender uid and the three-sender quota,
+then inserts the new chunk and ends the outstanding request. Duplicate uploads
+return `{}` without another row or announcement; excess uploads return
+`quota_exceeded`.
 
 The web app does not yet join MLS groups. Plaintext chat remains available;
 sealed messages and encrypted channel groups are later build steps.
@@ -208,6 +222,10 @@ fields, increment revision exactly once and commit to the stored predecessor.
 Message IDs cannot be reused, even after removal. Uploads check received bytes
 against the declared SHA-256 and size. History keeps the full signature envelope,
 mentions and attachment order; member merges never reattribute signed messages.
+The upgrade migration clears pre-v3 signatures missing `group_id` or `epoch`
+to SQL `NULL`, preserving their content as unsigned Gwar history. There is no
+v2 verification path; signed author edits of unsigned history return
+`bad_request`, while moderator removal remains available.
 
 Exact UTF-8 statement, `\n` separators, no trailing newline:
 
@@ -499,8 +517,12 @@ per-IP connection-attempt and authentication-frame buckets each hold 20 tokens a
 one per second, before identity/password work. The IP table holds 8192 entries;
 inactive entries expire after five minutes. At most four server-password Argon2
 checks run concurrently, with no waiting queue. WebSocket frames and assembled
-messages are capped at 96 KiB before authentication and 640 KiB afterwards; hello, join and idle deadlines
-include ping traffic.
+messages are capped at 96 KiB until join succeeds and 640 KiB afterwards.
+The gateway uses a direct tokio-tungstenite socket with a small transport guard:
+before authentication it withholds each frame header until the declared frame
+and cumulative fragmented-message sizes pass the 96 KiB cap. Oversized frames
+are rejected before reading or reserving the payload. After join, tungstenite's
+640 KiB caps apply. Hello, join and idle deadlines include ping traffic.
 
 Clients validate every incoming event and per-operation response against small
 handwritten schemas checked by TypeScript against generated protocol types.

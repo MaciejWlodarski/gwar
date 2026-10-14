@@ -519,6 +519,10 @@ async fn history_chunks_bind_sender_recipient_key_membership_and_end_requests() 
     assert_eq!(a.ok("mls.history.wanted", json!({})).await["wanted"], json!([]));
     assert_eq!(b.fails("mls.history.request", json!({"group":group})).await, "rate_limited");
     a.ok("mls.history.share", share).await;
+    assert_eq!(b.ok("mls.history.fetch", json!({})).await["chunks"].as_array().unwrap().len(), 1);
+    let different = chunk(&alice, &a, &group, &bob, &public);
+    a.ok("mls.history.share", json!({"group":group,"recipient":public_key(&bob.signer.0),"chunk":b64(&different)}))
+        .await;
     let first = b.ok("mls.history.fetch", json!({"group":group,"limit":1})).await;
     let second = b.ok("mls.history.fetch", json!({"group":group,"limit":1,"after":first["next"]})).await;
     assert_eq!(first["chunks"].as_array().unwrap().len(), 1);
@@ -796,6 +800,7 @@ async fn a_failed_commit_transaction_can_be_retried_without_advancing_the_group(
     assert_eq!(a.fails("mls.commit", update_request(&group, 0, &update)).await, "internal");
     assert_eq!(a.ok("mls.log", json!({"group":group,"since":0})).await["head"], 0);
     assert_eq!(a.ok("mls.group_info", json!({"group":group})).await["epoch"], 0);
+    assert!(a.drain_events("mls.commit").await.is_empty(), "a rolled-back commit must not broadcast");
     db.execute_batch("DROP TRIGGER refuse_log;").unwrap();
     assert_eq!(a.ok("mls.commit", update_request(&group, 0, &update)).await["epoch"], 1);
 }
@@ -884,4 +889,133 @@ async fn commit_and_history_decoded_limits_allow_the_largest_request_through_the
         "bad_request"
     );
     a.ok("ping", json!({})).await;
+}
+
+#[tokio::test]
+async fn history_share_rejects_self_and_future_epochs_and_returns_quota_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("gwar.sqlite");
+    let server = TestServer::start_with(|c| c.database = Some(database.clone())).await;
+    let mut alice = Device::new(1, 11);
+    let mut bob = Device::new(2, 21);
+    let mut a = connect_device(&server, &alice).await;
+    let mut b = connect_device(&server, &bob).await;
+    let group = create(&mut a, &mut alice, 2, 1).await;
+    add(&mut a, &mut alice, &mut bob, &group).await;
+    let own_hpke = hpke(&mut a, &alice, 3).await;
+    let own = chunk(&alice, &a, &group, &alice, &own_hpke);
+    assert_eq!(
+        a.fails("mls.history.share", json!({"group":group,"recipient":public_key(&alice.signer.0),"chunk":b64(&own)}))
+            .await,
+        "bad_request"
+    );
+    let public = hpke(&mut b, &bob, 4).await;
+    let mut future = Chunk::parse(&chunk(&alice, &a, &group, &bob, &public)).unwrap().header;
+    future.first_epoch = 2;
+    future.last_epoch = 2;
+    let future = Chunk::seal(future, &[(2, [7; 32])], &alice.signer.0).unwrap();
+    assert_eq!(
+        a.fails("mls.history.share", json!({"group":group,"recipient":public_key(&bob.signer.0),"chunk":b64(&future)}))
+            .await,
+        "bad_request"
+    );
+    assert_eq!(b.ok("mls.history.fetch", json!({})).await["chunks"], json!([]));
+    let db = rusqlite::Connection::open(&database).unwrap();
+    for i in 0..64u8 {
+        db.execute(
+            "INSERT INTO mls_history VALUES(?1,?2,?3,?4,0,0,X'00',?5,?6)",
+            rusqlite::params![b64(&[i; 16]), group, public_key(&bob.signer.0), uid(1), now(), vec![i; 32]],
+        )
+        .unwrap();
+    }
+    let bytes = chunk(&alice, &a, &group, &bob, &public);
+    assert_eq!(
+        a.fails("mls.history.share", json!({"group":group,"recipient":public_key(&bob.signer.0),"chunk":b64(&bytes)}))
+            .await,
+        "quota_exceeded"
+    );
+    assert!(b.drain_events("mls.history").await.is_empty());
+}
+
+#[tokio::test]
+async fn blob_pages_fit_the_wire_budget_and_resume_without_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("gwar.sqlite");
+    let server = TestServer::start_with(|c| c.database = Some(database.clone())).await;
+    let mut alice = Device::new(1, 11);
+    let bob = Device::new(2, 21);
+    let mut a = connect_device(&server, &alice).await;
+    let mut b = connect_device(&server, &bob).await;
+    let group = create(&mut a, &mut alice, 2, 1).await;
+    let db = rusqlite::Connection::open(database).unwrap();
+    for i in 0..18u8 {
+        let id = b64(&[i; 16]);
+        db.execute(
+            "INSERT INTO mls_history VALUES(?1,?2,?3,?4,0,0,?5,?6,?7)",
+            rusqlite::params![id, group, public_key(&bob.signer.0), uid(1), vec![i; 48 * 1024], now(), vec![i; 32]],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO mls_welcomes VALUES(?1,?2,?3,?4,?5)",
+            rusqlite::params![id, public_key(&bob.signer.0), group, vec![i; 128 * 1024], now()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO mls_log VALUES(?1,?2,'[]',?3,?4)",
+            rusqlite::params![group, i, vec![i; 128 * 1024], now()],
+        )
+        .unwrap();
+    }
+    for (op, field) in [("mls.history.fetch", "chunks"), ("mls.welcomes", "welcomes"), ("mls.log", "entries")] {
+        let mut after = Value::Null;
+        let mut all = Vec::new();
+        loop {
+            let d = if op == "mls.log" {
+                json!({"group":group,"since":after.as_u64().unwrap_or(0)})
+            } else if after.is_null() {
+                json!({"group":group})
+            } else {
+                json!({"group":group,"after":after})
+            };
+            let response = b.ok(op, d).await;
+            assert!(serde_json::to_vec(&json!({"re":u32::MAX,"ok":response})).unwrap().len() <= 640 * 1024);
+            let values = response[field].as_array().unwrap();
+            assert!(!values.is_empty());
+            assert!(values.len() <= if field == "chunks" { 9 } else { 3 });
+            all.extend(values.iter().map(|v| {
+                if field == "entries" { v["epoch"].to_string() } else { v["id"].as_str().unwrap().to_owned() }
+            }));
+            after = response["next"].clone();
+            if after.is_null() {
+                break;
+            }
+        }
+        assert_eq!(all.len(), 18);
+        let unique: std::collections::BTreeSet<_> = all.into_iter().collect();
+        assert_eq!(unique.len(), 18);
+    }
+}
+
+#[tokio::test]
+async fn failed_clock_persistence_does_not_reply_expired_or_announce_a_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("gwar.sqlite");
+    let server = TestServer::start_with(|c| c.database = Some(database.clone())).await;
+    let mut alice = Device::new(1, 11);
+    let bob = Device::new(2, 21);
+    let mut a = connect_device(&server, &alice).await;
+    let _b = connect_device(&server, &bob).await;
+    let group = create(&mut a, &mut alice, 2, 1).await;
+    alice.time = Some(now() - 301_000);
+    let expired = alice.update();
+    let db = rusqlite::Connection::open(database).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_clock BEFORE INSERT ON meta WHEN new.key='mls_commit_clock' BEGIN SELECT RAISE(ABORT,'test clock failure'); END;").unwrap();
+    assert_eq!(a.fails("mls.commit", update_request(&group, 0, &expired)).await, "internal");
+    assert_eq!(a.ok("mls.group_info", json!({"group":group})).await["epoch"], 0);
+    assert!(a.drain_events("mls.commit").await.is_empty());
+    db.execute_batch("DROP TRIGGER fail_clock;").unwrap();
+    assert_eq!(a.fails("mls.commit", update_request(&group, 0, &expired)).await, "expired");
+    let clock: i64 =
+        db.query_row("SELECT CAST(value AS INTEGER) FROM meta WHERE key='mls_commit_clock'", [], |r| r.get(0)).unwrap();
+    assert!(clock >= now() - 1000);
 }

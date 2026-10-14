@@ -49,6 +49,13 @@ async fn hostile(clients: Vec<Client>) -> (Connected, mpsc::Sender<String>, Stri
 async fn start(
     clients: impl FnOnce(&str) -> Value + Send + 'static,
 ) -> (Result<Connected, ClientError>, mpsc::Sender<String>, String) {
+    start_with_reply(clients, None).await
+}
+
+async fn start_with_reply(
+    clients: impl FnOnce(&str) -> Value + Send + 'static,
+    reply: Option<Value>,
+) -> (Result<Connected, ClientError>, mpsc::Sender<String>, String) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/ws", listener.local_addr().unwrap());
     let (frames, mut to_send) = mpsc::channel::<String>(16);
@@ -100,7 +107,13 @@ async fn start(
                     Some(frame) => if ws.send(Message::Text(frame.into())).await.is_err() { break },
                     None => break,
                 },
-                incoming = ws.next() => if incoming.is_none() { break },
+                incoming = ws.next() => {
+                    let Some(Ok(Message::Text(text))) = incoming else { break };
+                    if let Some(reply) = &reply {
+                        let request: Value = serde_json::from_str(&text).unwrap();
+                        ws.send(Message::Text(json!({"re":request["id"],"ok":reply}).to_string().into())).await.unwrap();
+                    }
+                },
             }
         }
     });
@@ -296,4 +309,23 @@ async fn requests_without_replies_are_bounded_and_released() {
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(tokio::time::timeout(Duration::from_millis(300), connected.connection.request(ping())).await.is_err());
+}
+
+#[tokio::test]
+async fn unsigned_gwar_history_is_returned_and_classified_without_rejection() {
+    let alice = SigningKey::from_bytes(&[1; 32]);
+    let mut legacy = signed(&alice, ChatTarget::Channel(1), "channel:1", "migrated history");
+    legacy.signature = None;
+    let (connected, _frames, _) = start_with_reply(|_| json!([]), Some(json!({"messages":[legacy]}))).await;
+    let connected = connected.unwrap();
+    let response: vc_proto::Response = connected
+        .connection
+        .request_as(vc_proto::Request::ChatHistory { channel: 1, before: None, limit: None })
+        .await
+        .unwrap();
+    let vc_proto::Response::History { messages } = response else {
+        panic!("history reply");
+    };
+    assert_eq!(messages[0].text, "migrated history");
+    assert_eq!(connected.connection.verify_message(&messages[0]), MessageCheck::Unsigned);
 }

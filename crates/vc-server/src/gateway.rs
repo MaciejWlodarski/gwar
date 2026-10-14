@@ -1,6 +1,8 @@
 //! WebSocket gateway for the `vc/4` protocol: authentication, framing,
 //! rate limiting and the per-connection write queue.
 
+mod transport;
+
 use std::{
     collections::HashSet,
     net::{IpAddr, SocketAddr},
@@ -9,16 +11,24 @@ use std::{
 };
 
 use axum::{
-    extract::{
-        ConnectInfo, State, WebSocketUpgrade,
-        ws::{Message, Utf8Bytes, WebSocket},
-    },
-    http::{HeaderMap, HeaderName},
-    response::Response,
+    body::Body,
+    extract::{ConnectInfo, Request as HttpRequest, State},
+    http::{HeaderMap, HeaderName, StatusCode},
+    response::{IntoResponse, Response},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer, SigningKey};
-use futures::{SinkExt, StreamExt, stream::SplitStream};
+use futures::{SinkExt, StreamExt};
+use hyper_util::rt::TokioIo;
+use tokio_tungstenite::{
+    WebSocketStream,
+    tungstenite::{
+        Message, Utf8Bytes,
+        handshake::server::create_response_with_body,
+        protocol::{Role, WebSocketConfig},
+    },
+};
+
 use tokio::{sync::mpsc, time::timeout};
 use tracing::debug;
 use vc_proto::{
@@ -44,6 +54,8 @@ pub struct Gateway {
     pub client_ip_header: Option<HeaderName>,
 }
 
+type WebSocket = WebSocketStream<transport::Transport<TokioIo<hyper::upgrade::Upgraded>>>;
+
 const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const PING_INTERVAL: Duration = Duration::from_secs(20);
@@ -56,21 +68,36 @@ const RATE_OVERRUN: u32 = 80;
 const RATE_PER_SEC: f64 = 20.0;
 
 pub async fn upgrade(
-    ws: WebSocketUpgrade,
     State(gateway): State<Gateway>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
+    mut request: HttpRequest,
 ) -> Response {
-    let ip = client_ip(peer, &headers, gateway.client_ip_header.as_ref());
+    let ip = client_ip(peer, request.headers(), gateway.client_ip_header.as_ref());
     let Some(permit) = gateway.preauth.connection(ip) else {
-        return axum::response::IntoResponse::into_response(axum::http::StatusCode::TOO_MANY_REQUESTS);
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
     };
-    ws.max_message_size(AUTHENTICATED_MAX_FRAME).max_frame_size(AUTHENTICATED_MAX_FRAME).on_upgrade(
-        move |socket| async move {
-            let _permit = permit;
-            connection(socket, gateway, ip).await;
-        },
-    )
+    let Ok(response) = create_response_with_body(&request, Body::empty) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(upgrade) = request.extensions_mut().remove::<hyper::upgrade::OnUpgrade>() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    tokio::spawn(async move {
+        let _permit = permit;
+        let Ok(upgraded) = upgrade.await else { return };
+        let config = WebSocketConfig::default()
+            .read_buffer_size(16 * 1024)
+            .max_message_size(Some(AUTHENTICATED_MAX_FRAME))
+            .max_frame_size(Some(AUTHENTICATED_MAX_FRAME));
+        let socket = WebSocketStream::from_raw_socket(
+            transport::Transport::new(TokioIo::new(upgraded)),
+            Role::Server,
+            Some(config),
+        )
+        .await;
+        connection(socket, gateway, ip).await;
+    });
+    response
 }
 
 /// The client's address. Behind a reverse proxy on the same host the TCP peer is
@@ -111,7 +138,10 @@ fn error(re: u32, code: ErrorCode, message: &str) -> Message {
     text(&ServerFrame::Err { re, err: ErrorBody::new(code, message) })
 }
 
-async fn next_text(stream: &mut SplitStream<WebSocket>, wait: Duration, limit: usize) -> Option<Utf8Bytes> {
+async fn next_text<S>(stream: &mut S, wait: Duration, limit: usize) -> Option<Utf8Bytes>
+where
+    S: futures::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
     timeout(wait, async {
         loop {
             match stream.next().await? {
@@ -126,8 +156,7 @@ async fn next_text(stream: &mut SplitStream<WebSocket>, wait: Duration, limit: u
     .flatten()
 }
 
-async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
-    let (mut sink, mut stream) = socket.split();
+async fn connection(mut socket: WebSocket, gateway: Gateway, ip: IpAddr) {
     let Some(server) = gateway.core.info().await else { return };
     let nonce = identity::new_nonce();
     let challenge = Challenge {
@@ -137,44 +166,44 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
         server,
         password_required: gateway.password.load().is_some(),
     };
-    if sink.send(text(&ServerFrame::Event(Event::Challenge(challenge.clone())))).await.is_err() {
+    if socket.send(text(&ServerFrame::Event(Event::Challenge(challenge.clone())))).await.is_err() {
         return;
     }
 
-    let Some(raw) = next_text(&mut stream, HELLO_TIMEOUT, MAX_FRAME).await else { return };
+    let Some(raw) = next_text(&mut socket, HELLO_TIMEOUT, MAX_FRAME).await else { return };
     if !gateway.preauth.hello(ip) {
-        let _ = sink.send(error(0, ErrorCode::RateLimited, "too many hellos")).await;
+        let _ = socket.send(error(0, ErrorCode::RateLimited, "too many hellos")).await;
         return;
     }
     let (id, hello) = match serde_json::from_str::<ClientFrame>(&raw) {
         Ok(ClientFrame { id, request: Request::Hello(hello) }) => (id, hello),
         Ok(frame) => {
-            let _ = sink.send(error(frame.id, ErrorCode::NotAuthenticated, "send hello first")).await;
+            let _ = socket.send(error(frame.id, ErrorCode::NotAuthenticated, "send hello first")).await;
             return;
         }
         Err(_) => {
-            let _ = sink.send(error(0, ErrorCode::BadRequest, "malformed hello")).await;
+            let _ = socket.send(error(0, ErrorCode::BadRequest, "malformed hello")).await;
             return;
         }
     };
     if [&hello.nickname, &hello.client.name, &hello.client.version].iter().any(|field| field.contains(['\r', '\n'])) {
-        let _ = sink.send(error(id, ErrorCode::BadRequest, "invalid hello fields")).await;
+        let _ = socket.send(error(id, ErrorCode::BadRequest, "invalid hello fields")).await;
         return;
     }
     if hello.protocol != PROTOCOL_VERSION {
-        let _ = sink.send(error(id, ErrorCode::BadRequest, "unsupported protocol version")).await;
+        let _ = socket.send(error(id, ErrorCode::BadRequest, "unsupported protocol version")).await;
         return;
     }
     if !gateway.insecure_any_host && !gateway.public_endpoints.contains(&hello.endpoint) {
-        let _ = sink.send(error(id, ErrorCode::NotAuthenticated, "this signature is for another server")).await;
+        let _ = socket.send(error(id, ErrorCode::NotAuthenticated, "this signature is for another server")).await;
         return;
     }
     if hello.expected_server_pk != challenge.server_pk || hello.server_nonce != nonce {
-        let _ = sink.send(error(id, ErrorCode::NotAuthenticated, "wrong server key or nonce")).await;
+        let _ = socket.send(error(id, ErrorCode::NotAuthenticated, "wrong server key or nonce")).await;
         return;
     }
     let Some(mut uid) = identity::verify_hello(&hello) else {
-        let _ = sink.send(error(id, ErrorCode::NotAuthenticated, "invalid identity signature")).await;
+        let _ = socket.send(error(id, ErrorCode::NotAuthenticated, "invalid identity signature")).await;
         return;
     };
     // A Gwar Connect device speaks for its account: the identity is the account key.
@@ -188,7 +217,7 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
                 device = Some(certificate.device_key.clone());
             }
             Err((code, problem)) => {
-                let _ = sink.send(error(id, code, problem)).await;
+                let _ = socket.send(error(id, code, problem)).await;
                 return;
             }
         }
@@ -197,7 +226,7 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
         && !gateway.core.device_authorized(&identity_key, key).await
     {
         let _ =
-            sink.send(error(id, ErrorCode::NotAuthenticated, "this device was signed out of its Gwar account")).await;
+            socket.send(error(id, ErrorCode::NotAuthenticated, "this device was signed out of its Gwar account")).await;
         return;
     }
     let proof = ServerProof {
@@ -205,22 +234,22 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
             gateway.server_key.sign(server_proof_statement(&hello).expect("validated hello").as_bytes()).to_bytes(),
         ),
     };
-    if sink.send(text(&ServerFrame::Ok { re: id, ok: ProtocolResponse::ServerProof(proof) })).await.is_err() {
+    if socket.send(text(&ServerFrame::Ok { re: id, ok: ProtocolResponse::ServerProof(proof) })).await.is_err() {
         return;
     }
-    let Some(raw) = next_text(&mut stream, HELLO_TIMEOUT, MAX_FRAME).await else { return };
+    let Some(raw) = next_text(&mut socket, HELLO_TIMEOUT, MAX_FRAME).await else { return };
     if !gateway.preauth.hello(ip) {
-        let _ = sink.send(error(0, ErrorCode::RateLimited, "too many authentication frames")).await;
+        let _ = socket.send(error(0, ErrorCode::RateLimited, "too many authentication frames")).await;
         return;
     }
     let (id, join) = match serde_json::from_str::<ClientFrame>(&raw) {
         Ok(ClientFrame { id, request: Request::Join(join) }) => (id, join),
         Ok(frame) => {
-            let _ = sink.send(error(frame.id, ErrorCode::NotAuthenticated, "send join after server proof")).await;
+            let _ = socket.send(error(frame.id, ErrorCode::NotAuthenticated, "send join after server proof")).await;
             return;
         }
         Err(_) => {
-            let _ = sink.send(error(0, ErrorCode::BadRequest, "malformed join")).await;
+            let _ = socket.send(error(0, ErrorCode::BadRequest, "malformed join")).await;
             return;
         }
     };
@@ -229,7 +258,7 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
         && let Err((code, problem)) =
             identity::verify_device(certificate, &hello.client_signing_pk, crate::core::now_ms())
     {
-        let _ = sink.send(error(id, code, problem)).await;
+        let _ = socket.send(error(id, code, problem)).await;
         return;
     }
     // Whether the password matched; the core decides what that means (members
@@ -239,7 +268,7 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
         None => true,
         Some(hash) => {
             let Ok(permit) = gateway.preauth.passwords.clone().try_acquire_owned() else {
-                let _ = sink.send(error(id, ErrorCode::RateLimited, "password verification busy")).await;
+                let _ = socket.send(error(id, ErrorCode::RateLimited, "password verification busy")).await;
                 return;
             };
             let password = join.server_password.clone().unwrap_or_default();
@@ -271,6 +300,10 @@ async fn connection(socket: WebSocket, gateway: Gateway, ip: IpAddr) {
     };
     let session = gateway.core.connect(request).await;
 
+    if session.is_some() {
+        socket.get_mut().authenticated = true;
+    }
+    let (mut sink, mut stream) = socket.split();
     let writer = tokio::spawn(async move {
         let mut ping = tokio::time::interval(PING_INTERVAL);
         ping.tick().await;

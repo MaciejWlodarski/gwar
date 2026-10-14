@@ -12,15 +12,15 @@ use gwar_mls::{
 };
 use serde::Serialize;
 use vc_proto::{
-    ErrorBody, ErrorCode, Event, MlsDevice, MlsEvent, MlsGroup, MlsLogEntry, MlsPackage, MlsPage, MlsRequest,
-    MlsResponse, Response, SessionId,
+    ErrorBody, ErrorCode, Event, MlsDevice, MlsEvent, MlsLogEntry, MlsPackage, MlsPage, MlsRequest, MlsResponse,
+    Response, SessionId,
 };
 
 use super::{Core, Reply, err, now_ms, storage_error};
-use crate::store::mls::{GroupRow, ProposalRow};
+use crate::store::mls::{GroupRow, ProposalRow, ShareHistory};
 
 const BLOB_BYTES: usize = 128 * 1024;
-const LIST_BYTES: usize = 1024 * 1024 - 4096;
+const LIST_BYTES: usize = 640 * 1024 - 4096;
 
 fn bad(message: &str) -> ErrorBody {
     err(ErrorCode::BadRequest, message)
@@ -64,31 +64,53 @@ fn uid_filter(uids: Vec<String>) -> Result<BTreeSet<String>, ErrorBody> {
     Ok(uids.into_iter().collect())
 }
 
-fn page<T: Serialize>(items: Vec<(String, T)>, paging: MlsPage) -> Result<(Vec<T>, Option<String>), ErrorBody> {
-    let limit = limit(paging.limit)?;
-    let after = paging
+struct ListPage<T> {
+    items: Vec<T>,
+    count: usize,
+    bytes: usize,
+    last: Option<String>,
+    next: Option<String>,
+}
+
+fn cursor(paging: &MlsPage) -> Result<String, ErrorBody> {
+    paging
         .after
-        .map(|s| {
-            let bytes = blob(&s, 512)?;
-            String::from_utf8(bytes).map_err(|_| bad("invalid cursor"))
-        })
-        .transpose()?;
-    let mut output = Vec::new();
-    let mut last = None;
-    let mut bytes = 0;
-    for (key, value) in items {
-        if after.as_ref().is_some_and(|a| &key <= a) {
-            continue;
-        }
-        let size = serde_json::to_vec(&value).map_err(|e| storage_error(e.into()))?.len() + 1;
-        if output.len() == limit || bytes + size > LIST_BYTES {
-            return Ok((output, last.map(|key: String| B64.encode(key))));
-        }
-        bytes += size;
-        last = Some(key);
-        output.push(value);
+        .as_ref()
+        .map(|s| String::from_utf8(blob(s, 512)?).map_err(|_| bad("invalid cursor")))
+        .transpose()
+        .map(|s| s.unwrap_or_default())
+}
+
+impl<T: Serialize> ListPage<T> {
+    fn new(count: usize, bytes: usize) -> Self {
+        Self { items: Vec::new(), count, bytes, last: None, next: None }
     }
-    Ok((output, None))
+
+    // The SQL cursor reads one row at a time, including at most one lookahead.
+    fn push(&mut self, key: String, value: T) -> anyhow::Result<bool> {
+        let size = serde_json::to_vec(&value)?.len() + 1;
+        if self.items.len() == self.count || size > self.bytes {
+            anyhow::ensure!(!self.items.is_empty(), "MLS entry exceeds response budget");
+            self.next = self.last.as_ref().map(|key| B64.encode(key));
+            return Ok(false);
+        }
+        self.bytes -= size;
+        self.last = Some(key);
+        self.items.push(value);
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+fn page<T: Serialize>(items: Vec<(String, T)>, paging: MlsPage) -> Result<(Vec<T>, Option<String>), ErrorBody> {
+    let after = cursor(&paging)?;
+    let mut page = ListPage::new(limit(paging.limit)?, LIST_BYTES);
+    for (key, value) in items {
+        if key > after && !page.push(key, value).map_err(storage_error)? {
+            break;
+        }
+    }
+    Ok((page.items, page.next))
 }
 
 fn reply(value: MlsResponse) -> Reply {
@@ -236,44 +258,55 @@ impl Core {
             }
             MlsRequest::KeyPackagesClaim { uids, page: paging } => {
                 let uids = uid_filter(uids)?;
-                let mut seen = BTreeSet::new();
-                let mut items = Vec::new();
-                for p in self.store.mls_packages(now_ms()).map_err(storage_error)? {
-                    if p.device_key == device
-                        || !uids.contains(&p.uid)
-                        || self.store.mls_revoked(&p.device_key, &p.uid).map_err(storage_error)?
-                        || !self.mls_member(&p.uid)?
-                        || !seen.insert(p.device_key.clone())
-                    {
-                        continue;
-                    }
-                    items.push((
-                        format!("{}:{}", p.uid, p.device_key),
-                        (
-                            MlsPackage { device_key: p.device_key, package: B64.encode(p.package) },
-                            p.reference,
-                            p.last_resort,
-                        ),
-                    ));
-                }
-                let (selected, next) = page(items, paging)?;
-                let references: Vec<_> = selected.iter().filter(|p| !p.2).map(|p| p.1.clone()).collect();
+                let uids: Vec<_> = uids
+                    .into_iter()
+                    .filter_map(|uid| match self.mls_member(&uid) {
+                        Ok(true) => Some(Ok(uid)),
+                        Ok(false) => None,
+                        Err(e) => Some(Err(e)),
+                    })
+                    .collect::<Result<_, _>>()?;
+                let after = cursor(&paging)?;
+                let mut selected = ListPage::new(limit(paging.limit)?, LIST_BYTES);
+                let mut references = Vec::new();
+                self.store
+                    .mls_packages(now_ms(), &uids, &device, &after, |p| {
+                        if self.store.mls_revoked(&p.device_key, &p.uid)? {
+                            return Ok(true);
+                        }
+                        let key = format!("{}:{}", p.uid, p.device_key);
+                        let accepted = selected
+                            .push(key, MlsPackage { device_key: p.device_key, package: B64.encode(p.package) })?;
+                        if accepted && !p.last_resort {
+                            references.push(p.reference);
+                        }
+                        Ok(accepted)
+                    })
+                    .map_err(storage_error)?;
                 self.store.mls_consume_packages(&references).map_err(storage_error)?;
-                reply(MlsResponse::Packages { packages: selected.into_iter().map(|p| p.0).collect(), next })
+                reply(MlsResponse::Packages { packages: selected.items, next: selected.next })
             }
             MlsRequest::Devices { uids, page: paging } => {
                 let uids = uid_filter(uids)?;
-                let mut items = Vec::new();
-                for d in self.store.mls_devices().map_err(storage_error)? {
-                    if uids.contains(&d.uid)
-                        && self.mls_member(&d.uid)?
-                        && !self.store.mls_revoked(&d.device_key, &d.uid).map_err(storage_error)?
-                    {
-                        items.push((format!("{}:{}", d.uid, d.device_key), d));
-                    }
-                }
-                let (devices, next) = page(items, paging)?;
-                reply(MlsResponse::Devices { devices, next })
+                let uids: Vec<_> = uids
+                    .into_iter()
+                    .filter_map(|uid| match self.mls_member(&uid) {
+                        Ok(true) => Some(Ok(uid)),
+                        Ok(false) => None,
+                        Err(e) => Some(Err(e)),
+                    })
+                    .collect::<Result<_, _>>()?;
+                let after = cursor(&paging)?;
+                let mut page = ListPage::new(limit(paging.limit)?, LIST_BYTES);
+                self.store
+                    .mls_devices(&uids, &after, |d| {
+                        if self.store.mls_revoked(&d.device_key, &d.uid)? {
+                            return Ok(true);
+                        }
+                        page.push(format!("{}:{}", d.uid, d.device_key), d)
+                    })
+                    .map_err(storage_error)?;
+                reply(MlsResponse::Devices { devices: page.items, next: page.next })
             }
             MlsRequest::GroupCreate { conversation, group_info } => {
                 self.mls_create(session, &conversation, &group_info)
@@ -298,48 +331,48 @@ impl Core {
                     .into_iter()
                     .map(|p| B64.encode(p.proposal))
                     .collect();
-                let (oldest, rows) = self.store.mls_log(&group, since, now_ms()).map_err(storage_error)?;
-                let mut bytes = serde_json::to_vec(&pending).map_err(|e| storage_error(e.into()))?.len();
-                let mut entries = Vec::new();
+                let oldest = self.store.mls_oldest(&group, now_ms()).map_err(storage_error)?;
+                let pending_bytes = serde_json::to_vec(&pending).map_err(|e| storage_error(e.into()))?.len();
+                let budget = LIST_BYTES
+                    .checked_sub(pending_bytes)
+                    .ok_or_else(|| err(ErrorCode::TooLarge, "pending proposals exceed response budget"))?;
+                let mut page = ListPage::new(limit, budget);
                 let mut next = None;
-                for entry in rows {
-                    let size = serde_json::to_vec(&entry).map_err(|e| storage_error(e.into()))?.len() + 1;
-                    if entries.len() == limit || bytes + size > LIST_BYTES {
-                        next = Some(entry.epoch);
-                        break;
-                    }
-                    bytes += size;
-                    entries.push(entry);
-                }
-                reply(MlsResponse::Log { head: row.epoch, oldest: oldest.unwrap_or(row.epoch), entries, pending, next })
+                self.store
+                    .mls_log(&group, since, now_ms(), limit + 1, |entry| {
+                        let epoch = entry.epoch;
+                        let accepted = page.push(epoch.to_string(), entry)?;
+                        if !accepted {
+                            next = Some(epoch);
+                        }
+                        Ok(accepted)
+                    })
+                    .map_err(storage_error)?;
+                reply(MlsResponse::Log {
+                    head: row.epoch,
+                    oldest: oldest.unwrap_or(row.epoch),
+                    entries: page.items,
+                    pending,
+                    next,
+                })
             }
             MlsRequest::Groups { page: paging } => {
-                let mut items = Vec::new();
-                for row in self.store.mls_groups().map_err(storage_error)? {
-                    if self.mls_can_read(&uid, &row.conversation)? {
-                        items.push((
-                            row.conversation.clone(),
-                            MlsGroup {
-                                conversation: row.conversation,
-                                group: row.group.clone(),
-                                epoch: row.epoch,
-                                pending: !self.store.mls_proposals(&row.group).map_err(storage_error)?.is_empty(),
-                            },
-                        ));
-                    }
-                }
-                let (groups, next) = page(items, paging)?;
-                reply(MlsResponse::Groups { groups, next })
+                let after = cursor(&paging)?;
+                let count = limit(paging.limit)?;
+                let mut page = ListPage::new(count, LIST_BYTES);
+                self.store
+                    .mls_groups(&uid, &after, count + 1, |g| page.push(g.conversation.clone(), g))
+                    .map_err(storage_error)?;
+                reply(MlsResponse::Groups { groups: page.items, next: page.next })
             }
             MlsRequest::Welcomes { page: paging } => {
-                let mut items = Vec::new();
-                for w in self.store.mls_welcomes(&device, now_ms()).map_err(storage_error)? {
-                    if self.mls_group_for(session, &w.group).is_ok() {
-                        items.push((w.id.clone(), w));
-                    }
-                }
-                let (welcomes, next) = page(items, paging)?;
-                reply(MlsResponse::Welcomes { welcomes, next })
+                let after = cursor(&paging)?;
+                let count = limit(paging.limit)?;
+                let mut page = ListPage::new(count, LIST_BYTES);
+                self.store
+                    .mls_welcomes(&device, &uid, now_ms(), &after, count + 1, |w| page.push(w.id.clone(), w))
+                    .map_err(storage_error)?;
+                reply(MlsResponse::Welcomes { welcomes: page.items, next: page.next })
             }
             MlsRequest::WelcomesAck { ids } => self.mls_ack(&device, &ids, false),
             MlsRequest::HistoryAck { ids } => self.mls_ack(&device, &ids, true),
@@ -365,19 +398,25 @@ impl Core {
                 {
                     return Err(bad("history chunk identity or signature"));
                 }
-                if self
+                let outcome = self
                     .store
                     .mls_share_history(
                         &group,
                         &recipient,
-                        &uid,
+                        (&uid, &device),
                         &bytes,
                         (chunk.header.first_epoch, chunk.header.last_epoch),
                         now_ms(),
                     )
-                    .map_err(storage_error)?
-                {
-                    self.broadcast(Event::Mls(MlsEvent::History { group }), |s| s.hello_key == recipient);
+                    .map_err(storage_error)?;
+                match outcome {
+                    ShareHistory::Stored => {
+                        self.broadcast(Event::Mls(MlsEvent::History { group }), |s| s.hello_key == recipient)
+                    }
+                    ShareHistory::Duplicate => {}
+                    ShareHistory::OwnDevice => return Err(bad("cannot share history with the sender's own device")),
+                    ShareHistory::FutureEpoch => return Err(bad("history extends beyond the group's epoch")),
+                    ShareHistory::Limit => return Err(err(ErrorCode::QuotaExceeded, "history chunk or sender limit")),
                 }
                 Ok(Response::Empty {})
             }
@@ -385,26 +424,26 @@ impl Core {
                 if let Some(group) = &group {
                     self.mls_group_for(session, group)?;
                 }
-                let mut items = Vec::new();
-                for c in self.store.mls_history(&device, now_ms()).map_err(storage_error)? {
-                    if group.as_ref().is_none_or(|g| g == &c.group) && self.mls_group_for(session, &c.group).is_ok() {
-                        items.push((c.id.clone(), c));
-                    }
-                }
-                let (chunks, next) = page(items, paging)?;
-                reply(MlsResponse::Chunks { chunks, next })
+                let after = cursor(&paging)?;
+                let count = limit(paging.limit)?;
+                let mut page = ListPage::new(count, LIST_BYTES);
+                self.store
+                    .mls_history(&device, &uid, group.as_deref(), now_ms(), (&after, count + 1), |c| {
+                        page.push(c.id.clone(), c)
+                    })
+                    .map_err(storage_error)?;
+                reply(MlsResponse::Chunks { chunks: page.items, next: page.next })
             }
             MlsRequest::HistoryWanted { page: paging } => {
-                let mut items = Vec::new();
-                for w in self.store.mls_wanted(now_ms()).map_err(storage_error)? {
-                    if let Ok(row) = self.mls_group_for(session, &w.group)
-                        && self.mls_observer(&row)?.leaves().iter().any(|l| l.device_key == device && l.uid == uid)
-                    {
-                        items.push((format!("{}:{}", w.group, w.device), w));
-                    }
-                }
-                let (wanted, next) = page(items, paging)?;
-                reply(MlsResponse::Wanted { wanted, next })
+                let after = cursor(&paging)?;
+                let count = limit(paging.limit)?;
+                let mut page = ListPage::new(count, LIST_BYTES);
+                self.store
+                    .mls_wanted(&uid, &device, now_ms(), &after, count + 1, |w| {
+                        page.push(format!("{}:{}", w.group, w.device), w)
+                    })
+                    .map_err(storage_error)?;
+                reply(MlsResponse::Wanted { wanted: page.items, next: page.next })
             }
             MlsRequest::HistoryRequest { group } => {
                 let row = self.mls_group_for(session, &group)?;
@@ -584,12 +623,12 @@ mod tests {
                 .collect()
         };
         let (welcomes, next) = page(items(), MlsPage::default()).unwrap();
-        assert_eq!(welcomes.len(), 5);
+        assert_eq!(welcomes.len(), 3);
         let reply = MlsResponse::Welcomes { welcomes, next: next.clone() };
-        assert!(serde_json::to_vec(&reply).unwrap().len() <= 1024 * 1024);
+        assert!(serde_json::to_vec(&reply).unwrap().len() <= 640 * 1024);
         let (rest, end) = page(items(), MlsPage { after: next, limit: None }).unwrap();
-        assert_eq!(rest.len(), 5);
-        assert_eq!(rest[0].id, "05");
-        assert_eq!(end, None);
+        assert_eq!(rest.len(), 3);
+        assert_eq!(rest[0].id, "03");
+        assert!(end.is_some());
     }
 }

@@ -383,7 +383,12 @@ Body v3 adds three netstrings per attachment after today's four: the file
 key, the ciphertext's SHA-256 and the ciphertext size, each `-` for a
 plaintext attachment. `MessageSignature` gains `group_id` and `epoch`
 (strings). The server keeps verifying plaintext conversations as today, with
-v3.
+v3. On upgrade, the store migration sets `messages.signature` to SQL `NULL`
+for every pre-v3 signature (missing `group_id` or `epoch`). Text, mentions,
+attachments and timestamps remain intact and clients display this history as
+unsigned Gwar messages. There is no v2 verification path. Author edits still
+require a signed predecessor and return `bad_request` for unsigned history;
+moderators with `message_manage` can remove it normally.
 
 ### Commit time
 
@@ -407,24 +412,38 @@ Decoded sizes: a key package 4 KiB; a commit, GroupInfo or Welcome 128 KiB
 each; a history bundle chunk 48 KiB. The gateway's limit for one WebSocket
 message from an authenticated session rises to 640 KiB: the largest request,
 `mls.commit` with three 128 KiB blobs, is about 512 KiB in base64, and the rest
-is headroom for JSON; before authentication it stays as it is. Direct messages stay far below
-these limits; groups whose GroupInfo can outgrow them (server-wide chat on a
+is headroom for JSON. Before a successful `join`, frames and assembled messages
+are capped at 96 KiB at the transport layer. A header guard checks declared
+frame lengths and cumulative fragmented-message lengths before passing the
+header to tungstenite, so an oversized frame is rejected without reading its
+body or reserving its declared payload. After join the guard is disabled and
+tungstenite enforces 640 KiB. Direct messages stay far below these limits; groups whose GroupInfo can outgrow them (server-wide chat on a
 large server) are specified with step 4, which moves such blobs to HTTP.
 
 ### Delivery service requests
 
-All binary fields are base64url.
+All binary fields are base64url. Response objects reject unknown fields when
+decoded in Rust; in particular, the required `next` field distinguishes an
+MLS `{groups, next}` page from the non-MLS `{groups}` role list, including
+when both lists are empty. The generated TypeScript wire shapes stay the same.
 
 **Paging.** Every request that returns a list takes `after?` and `limit?`
 (default and maximum 100) and returns its entries in a stable order, at most
-`limit` of them and at most 1 MiB, with `next` set when more follow: pass it
-as `after` to continue. The order is by conversation for `mls.groups`, by
+`limit` of them, with `next` set when more follow: pass it as `after` to
+continue. The complete authenticated response must fit 640 KiB. Lists use a
+640 KiB minus 4 KiB item budget, including the log's pending proposals; the
+remaining space covers the JSON envelope and cursor. Filters, cursors and
+count limits run in SQL. Blob inboxes and logs stream rows and stop at the
+count or byte budget with at most one eligible lookahead row; device and
+package lists scan batches of at most eight candidates, skipping revoked
+devices before counting returned entries. The order is by conversation for `mls.groups`, by
 `(uid, device_key)` for `mls.devices` and `mls.key_packages.claim`, by id for
 Welcomes and history chunks, by `(group, device)` for
 `mls.history.wanted`. `mls.log` pages by epoch instead: `since` is
 inclusive and `next` is the epoch to pass as `since` to continue.
 `mls.devices` and `mls.key_packages.claim` take at most 20 uids; a claim
-consumes only the packages it returns.
+consumes only the packages it returns. An empty uid list returns an empty
+page without scanning key packages.
 
 | Request | Reply | Rule |
 | --- | --- | --- |
@@ -439,7 +458,7 @@ consumes only the packages it returns.
 | `mls.groups {}` | `{groups: [{conversation, group, epoch, pending}]}` | the live group of every conversation the session may read; `pending` whether outstanding proposals exist |
 | `mls.welcomes {}` | `{welcomes: [{id, group, welcome}]}` | for the session's device; repeatable |
 | `mls.welcomes.ack {ids}` | `{}` | after the client stored the joined group durably; deletes them. The client stores the Welcome's id with the joined group in one write, and acknowledges a Welcome whose id it already has without processing it again (its key package is used up) |
-| `mls.history.share {group, recipient, chunk}` | `{}` | the session's device and `recipient` both have leaves in the group's current epoch (observer); the chunk parses (netstrings, header fields canonical) and its header names the server key, `group`, `recipient` with its published HPKE key, and the session's device key as sender; the signature verifies with that key. The server stores it with `sender_uid` = the session's uid (subject to the three-sender limit) and, in the same transaction, ends the recipient's outstanding request for the group |
+| `mls.history.share {group, recipient, chunk}` | `{}` | the session's device and `recipient` both have leaves in the group's current epoch (observer); the chunk parses (netstrings, header fields canonical) and its header names the server key, `group`, `recipient` with its published HPKE key, and the session's device key as sender; the signature verifies with that key. The recipient must differ from the sender's own device, and `last_epoch` must not exceed the group's current epoch. In one write transaction the server checks these rules and the SHA-256 of the chunk bytes: the same hash for the same group and recipient is idempotent (`{}`, no new row or broadcast), even at quota. At most 64 stored chunks per `(group, recipient device, sender_uid)` and three distinct senders per recipient/group are allowed; exceeding either returns `quota_exceeded` without a write. A new chunk is stored with `sender_uid` = the session's uid and ends the recipient's outstanding request in that same transaction |
 | `mls.history.fetch {group?}` | `{chunks: [{id, group, sender_uid, chunk}]}` | chunks for the session's device; repeatable |
 | `mls.history.wanted {}` | `{wanted: [{group, device}]}` | the outstanding requests (below) in groups the session's device is a member of |
 | `mls.history.ack {ids}` | `{}` | after durable import; deletes them |
@@ -451,6 +470,11 @@ epoch, proposal}`, `mls.welcome {group}`, `mls.history {group}`,
 announce that something can be fetched.
 
 ### Commit ordering
+
+SQLite uses WAL with `synchronous=FULL`. Every mutation's success reply and
+MLS broadcast follows its committed transaction; the commit clock is also
+committed before validation can return `expired`. Transaction failures publish
+nothing and leave the stored group available for retry.
 
 `head` is the group's current epoch and `oldest` the epoch of the oldest
 entry the log still has, or `head` when it has none.
