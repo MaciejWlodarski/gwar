@@ -285,8 +285,10 @@ gwar message v3
 
 These are limits of a voice chat relayed through a server:
 
-- **Read everything** on that server: messages, direct messages, files, voice
-  (the SFU terminates DTLS-SRTP). Direct messages are not end-to-end encrypted.
+- **Read plaintext content**: channel and server-wide messages, files, voice
+  (the SFU terminates DTLS-SRTP), and DMs with TeamSpeak users. Gwar-to-Gwar
+  DMs are end-to-end encrypted with MLS epoch keys and authenticated v3 bodies;
+  their participants, timing, sizes, edits, deletions and read marks remain visible.
 - **Lie about presence**: who is online, where, who is talking.
 - **Voice**: inject audio or attribute it to anyone; voice is not signed.
 - **Delivery**: drop, delay, reorder or hide messages. An observed server removal is
@@ -372,5 +374,5 @@ account's devices; revoking a device does not invalidate a copy it already has.
 
 Noise for LAN connections, stronger evidence of signing time, vault
 checkpoints against rollback, non-exportable signing keys, signed server key
-rotation. End-to-end encryption of channels, direct messages, server-wide
-chat and voice is designed in [e2e.md](e2e.md).
+rotation. End-to-end encrypted Gwar direct messages are implemented. Encryption
+of channels, server-wide chat and voice is designed in [e2e.md](e2e.md).

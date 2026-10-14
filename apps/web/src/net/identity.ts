@@ -143,6 +143,14 @@ function isValidConnectRecord(value: unknown): value is ConnectRecord {
   );
 }
 
+const deviceSeeds = new WeakMap<Identity, Uint8Array>();
+/** The device seed for the MLS signer, without allowing a Connect device identity backup. */
+export function identitySeed(identity: Identity): Uint8Array {
+  const seed = deviceSeeds.get(identity);
+  if (!seed) throw new Error("Device signing seed unavailable");
+  return seed.slice();
+}
+
 async function fromBackup(backup: IdentityBackup, device?: DeviceCertificate): Promise<Identity> {
   const subtle = globalThis.crypto?.subtle;
   if (!subtle) throw new IdentityUnsupportedError();
@@ -153,7 +161,7 @@ async function fromBackup(backup: IdentityBackup, device?: DeviceCertificate): P
     throw new IdentityUnsupportedError();
   }
   const publicKey = backup.jwk.x as string;
-  return {
+  const identity: Identity = {
     publicKey,
     nickname: validNickname(backup.nickname) ?? defaultNickname(),
     device,
@@ -167,6 +175,8 @@ async function fromBackup(backup: IdentityBackup, device?: DeviceCertificate): P
       return { ...backup, jwk: { ...backup.jwk } };
     },
   };
+  deviceSeeds.set(identity, decodeBase64Url(backup.jwk.d!));
+  return identity;
 }
 
 /** The identity of a device signed in to Gwar Connect. */

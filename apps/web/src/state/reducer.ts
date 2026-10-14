@@ -1,3 +1,4 @@
+import { dmPeer } from "../lib/chat";
 import { sameMessageIdentity } from "../net/message-signature";
 /**
  * Pure state transitions for one server session. The store applies these;
@@ -36,6 +37,10 @@ export const initialState: SessionState = {
 };
 
 export type Action =
+  | { type: "dmUnread"; peer: string; count: number; through: number }
+  | { type: "dmStatus"; peer: string; securing: boolean }
+  | { type: "sealed"; peer: string; item: Extract<ChatItem, { kind: "msg" }>; live: boolean }
+  | { type: "dmHistory"; peer: string; hasMore: boolean }
   | { type: "phase"; phase: Phase }
   | { type: "welcome"; welcome: Welcome; resync: boolean; now: number }
   | { type: "event"; event: Event; now: number; verified?: boolean; authentic?: boolean }
@@ -344,7 +349,15 @@ function channelNotices(prev: SessionState, next: SessionState, at: number, id: 
 function reduceEvent(state: SessionState, event: Event, now: number, verified = false, authentic = false): SessionState {
   switch (event.ev) {
     case "chat.sealed":
-    case "chat.sealed.removed":
+      return state;
+    case "chat.sealed.removed": {
+      const peer = dmPeer(event.d.conversation, state.me?.uid);
+      if (!peer) return state;
+      return withThread(state, dmKey(peer), t => ({ ...t,
+        unread: Math.max(0, t.unread - t.items.filter(i => i.kind === "msg" && event.d.ids.includes(i.msg.id) && i.msg.id > t.lastRead).length),
+        items: t.items.filter(i => i.kind !== "msg" || !event.d.ids.includes(i.msg.id)),
+      }));
+    }
     case "mls.commit":
     case "mls.proposal":
     case "mls.welcome":
@@ -415,7 +428,14 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
     case "chat.message":
       return onChatMessage(state, event.d, verified, authentic);
     case "chat.read": {
-      if (!("channel" in event.d)) return state;
+      if (!("channel" in event.d)) {
+        const peer = dmPeer(event.d.conversation, state.me?.uid);
+        if (!peer) return state;
+        const message = event.d.message;
+        return withThread(state, dmKey(peer), t => ({ ...t, lastRead: Math.max(t.lastRead, message),
+          unread: t.loaded && message >= latestMessageId(t) ? 0 : Math.max(0, t.unread
+            - t.items.filter(i => i.kind === "msg" && i.msg.id > t.lastRead && i.msg.id <= message).length), mentions: 0 }));
+      }
       const { channel, message } = event.d;
       if (!state.channels[channel]) return state;
       return withThread(state, channelThreadKey(channel), (t) => ({
@@ -446,6 +466,32 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
 
 export function reduce(state: SessionState, action: Action): SessionState {
   switch (action.type) {
+    case "dmUnread":
+      return withThread(state, dmKey(action.peer), t => ({ ...t, unread: state.focused && isActive(state, dmKey(action.peer)) ? 0 : Math.min(100, action.count
+        + t.items.filter(i => i.kind === "msg" && i.msg.id > Math.max(t.lastRead, action.through)).length) }));
+    case "dmStatus":
+      if (state.threads[dmKey(action.peer)]?.securing === action.securing) return state;
+      return withThread(state, dmKey(action.peer), t => ({ ...t, securing: action.securing }));
+    case "dmHistory":
+      return withThread(state, dmKey(action.peer), t => ({ ...t, loaded: true, hasMore: action.hasMore }));
+    case "sealed": {
+      const key = dmKey(action.peer);
+      let item = action.item;
+      return withThread(state, key, t => {
+        const old = t.items.find(i => i.kind === "msg" && (i.msg.id === item.msg.id || i.sealed?.message_id === item.sealed?.message_id));
+        // Keep the last authenticated identity while displaying an unopened newer revision.
+        if (old?.kind === "msg" && old.authentic && !item.authentic && item.cannotOpen
+          && old.sealed?.message_id === item.sealed?.message_id && item.sealed!.revision > old.sealed!.revision) {
+          item = { ...item, msg: old.msg, authentic: true, verified: false };
+        }
+        if (old?.kind === "msg" && (old.authentic && (!item.authentic || !sameMessageIdentity(old.msg, item.msg))
+          || (old.sealed?.revision ?? -1) > item.sealed!.revision)) return t;
+        const items = [...t.items.filter(i => i !== old), item].sort((a, b) => a.kind === "msg" && b.kind === "msg" ? a.msg.id - b.msg.id : a.at - b.at).slice(-MAX_ITEMS);
+        return { ...t, items, peer: { uid: action.peer, name: state.members[action.peer]?.nickname ?? t.peer?.name ?? action.peer },
+          unread: Math.min(100, t.unread + Number(action.live && !old && item.msg.id > t.lastRead && !(state.focused && isActive(state, key)))),
+        };
+      });
+    }
     case "reset":
       // The epoch only grows, so work bound to an earlier session never matches a later one.
       return { ...initialState, focused: state.focused, epoch: state.epoch + 1 };
@@ -484,6 +530,15 @@ export function reduce(state: SessionState, action: Action): SessionState {
       for (const u of w.unread ?? []) {
         if (!channels[u.channel]) continue;
         next = withThread(next, channelThreadKey(u.channel), (t) => ({ ...t, unread: u.count, mentions: 0, lastRead: u.last_read }));
+      }
+      for (const [key, thread] of Object.entries(next.threads)) {
+        if (key.startsWith("dm:") && !key.startsWith("dm:ts:")) next.threads[key] = { ...thread, loaded: false, unread: 0, securing: true };
+      }
+      for (const u of w.conversations ?? []) {
+        const peer = dmPeer(u.conversation, w.uid);
+        if (!peer) continue;
+        next = withThread(next, dmKey(peer), t => ({ ...t, unread: u.count, lastRead: u.last_read, securing: true,
+          peer: { uid: peer, name: members[peer]?.nickname ?? t.peer?.name ?? peer } }));
       }
       // The channel I am looking at is on screen: nothing there is unread.
       if (storedKey(next, next.activeThread) === channelThreadKey(view) && next.focused) {

@@ -35,6 +35,13 @@ export interface RuntimeOptions {
   locks?: LockManager;
   storage?: () => Promise<Persistence>;
   factory?: AgentFactory;
+  /** Another tab of this device asked for the session while this runtime holds
+   * the lock; the caller closes it. Without it, a second tab waits for the lock. */
+  onTakeover?: () => void;
+}
+/** A newer tab of this device asked for the session while this one waited for it. */
+export class DeviceTakenOver extends Error {
+  constructor() { super("This device's session moved to another tab"); }
 }
 class GroupChanged extends Error {
   constructor() { super("MLS group changed; synchronize before sending"); }
@@ -67,13 +74,41 @@ export class MlsRuntime {
     if (options.link.status.state !== "idle") throw new Error("MLS must acquire its lock before connecting");
     const locks = options.locks ?? globalThis.navigator?.locks;
     if (!locks) throw new Error("Web Locks are required for MLS");
-    const release = await acquireDeviceLock(options.identity.publicKey, locks, options.signal);
+    // The newest tab wins, like the server's one session per device.
+    const takeover = options.onTakeover && typeof BroadcastChannel !== "undefined" ? new BroadcastChannel(`gwar-mls:${options.identity.publicKey}`) : undefined;
+    const waiting = new AbortController();
+    const abortWaiting = () => waiting.abort(options.signal!.reason);
+    options.signal?.addEventListener("abort", abortWaiting, { once: true });
+    if (options.signal?.aborted) abortWaiting();
+    // Requests are ordered by time, then a random tie-break: a tab, waiting or
+    // holding, yields only to a newer one, so contenders cannot evict each other.
+    const mine = [performance.timeOrigin + performance.now(), Math.random()] as const;
+    const newer = (other: unknown) => {
+      if (!Array.isArray(other) || other.length !== 2 || !other.every(n => typeof n === "number")) return false;
+      const [at, tie] = other as [number, number];
+      return at > mine[0] || (at === mine[0] && tie > mine[1]);
+    };
+    let holding = false;
+    if (takeover) {
+      takeover.onmessage = event => {
+        if (!newer(event.data)) return; // Older requests have already yielded to this one.
+        if (holding) options.onTakeover!();
+        else waiting.abort(new DeviceTakenOver());
+      };
+      takeover.postMessage(mine);
+    }
+    let release: () => Promise<void>;
+    try { release = await acquireDeviceLock(options.identity.publicKey, locks, waiting.signal); }
+    catch (error) { takeover?.close(); throw waiting.signal.reason instanceof DeviceTakenOver ? waiting.signal.reason : error; }
+    finally { options.signal?.removeEventListener("abort", abortWaiting); }
+    holding = true;
     let runtime: MlsRuntime | undefined;
     let storage: Persistence | undefined;
     try {
       storage = await (options.storage?.() ?? openStorage(options.identity.publicKey));
       const factory = options.factory ?? await loadAgent(options.seed, credential(options.identity), options.now ?? Date.now);
       runtime = new MlsRuntime(options, new Engine(factory, storage), release);
+      if (takeover) runtime.unsubscribers.push(() => takeover.close());
       runtime.uid = await uidForPublicKey(options.identity.device?.account_key ?? options.identity.publicKey);
       await runtime.engine.run(async () => {}); // Initial device record durable before connect.
       if (options.signal) {
@@ -123,7 +158,7 @@ export class MlsRuntime {
       return runtime;
     } catch (error) {
       if (runtime) await runtime.close();
-      else { storage?.close(); await release(); }
+      else { takeover?.close(); storage?.close(); await release(); }
       throw error;
     }
   }
@@ -546,8 +581,12 @@ export class MlsRuntime {
         return plaintext ? { ok: plaintext } : { reason: "cannot_open" };
       }
       if (result.reason === "no_key") {
-        const epochs = this.missing.get(message.group) ?? new Set<string>(); epochs.add(context.epoch); this.missing.set(message.group, epochs);
-        this.schedule();
+        const epochs = this.missing.get(message.group) ?? new Set<string>();
+        const newDemand = !epochs.has(context.epoch);
+        epochs.add(context.epoch); this.missing.set(message.group, epochs);
+        // Subscribers retry unopened rows after sync. Repeated demand must not
+        // turn that notification into an immediate synchronization loop.
+        if (newDemand) this.schedule();
       }
       return result;
     });
@@ -557,7 +596,8 @@ export class MlsRuntime {
     this.stopped = true; this.generation++;
     clearTimeout(this.retry);
     for (const unsubscribe of this.unsubscribers) unsubscribe();
-    this.options.link.close();
+    // A link that never connected stays usable for its owner.
+    if (this.options.link.status.state !== "idle") this.options.link.close();
     this.closePromise = (async () => {
       try { await this.engine.close(); } finally { await this.release(); }
       this.markSecuring();

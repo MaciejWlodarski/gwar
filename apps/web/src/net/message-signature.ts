@@ -18,7 +18,7 @@ export type MessageVerification = {
    *  context) a channel id the server reused after deleting it. */
   authorization: Array<"device-revoked" | "certificate-expired" | "revocations-stale" | "channel-reused" | "channel-history-incomplete">;
 };
-export interface MessageContext { serverKey: string; target: string; participants?: readonly [string, string] }
+export interface MessageContext { serverKey: string; target: string; participants?: readonly [string, string]; sealed?: { group: string; epoch: number } }
 export const invalidVerification = (): MessageVerification => ({ status: "invalid", continuity: "unproven", authorization: [] });
 export function fullyVerified(v?: MessageVerification): boolean {
   return v?.status === "verified" && v.continuity === "proven" && v.authorization.length === 0;
@@ -65,14 +65,14 @@ export function messageStatement(serverKey: string, target: string, authorUid: s
 export function revisionHash(s: MessageSignature): Promise<string> {
   return sha256(enc.encode(`${messageStatement(s.server_key, s.conversation, s.author_uid, s, s.body_hash)}\n${s.signature}`));
 }
-export async function signMessage(identity: Identity, ctx: MessageContext, authorUid: string, text: string, mentions: string[], attachments: Attachment[], original?: MessageSignature): Promise<MessageSignature> {
+export async function signMessage(identity: Identity, ctx: MessageContext, authorUid: string, text: string, mentions: string[], attachments: Attachment[], original?: MessageSignature, retry?: Pick<MessageSignature, "message_id" | "created_at">): Promise<MessageSignature> {
   const now = Date.now();
   const s: MessageSignature = {
-    server_key: ctx.serverKey, conversation: ctx.target, group_id: "-", epoch: "-", author_uid: authorUid,
+    server_key: ctx.serverKey, conversation: ctx.target, group_id: ctx.sealed?.group ?? "-", epoch: ctx.sealed ? String(ctx.sealed.epoch) : "-", author_uid: authorUid,
     key: identity.publicKey, certificate: identity.device ?? null, certificate_hash: await certificateHash(identity.device),
-    message_id: original?.message_id ?? encodeBase64Url(crypto.getRandomValues(new Uint8Array(16))),
+    message_id: original?.message_id ?? retry?.message_id ?? encodeBase64Url(crypto.getRandomValues(new Uint8Array(16))),
     revision: original ? original.revision + 1 : 0, previous_revision_hash: original ? await revisionHash(original) : "-",
-    created_at: original?.created_at ?? now, signed_at: now,
+    created_at: original?.created_at ?? retry?.created_at ?? now, signed_at: original ? now : retry?.created_at ?? now,
     body_hash: await messageBodyHash(text, mentions, attachments), signature: "",
   };
   s.signature = await identity.sign(enc.encode(messageStatement(ctx.serverKey, ctx.target, authorUid, s, s.body_hash)));
@@ -87,7 +87,8 @@ export async function verifyMessage(msg: ChatMessage, ctx: MessageContext, stora
     if (!s) return { ...result, status: msg.author_uid.startsWith("ts:") ? "unsigned-ts" : "unsigned", continuity: "unproven" };
     for (const [v, n] of [[s.server_key, 32], [s.key, 32], [s.author_uid, 20], [s.message_id, 16], [s.body_hash, 32], [s.signature, 64]] as const) decodeFixed(v, n);
     const safe = (v: number) => Number.isSafeInteger(v) && v >= 0;
-    if (s.group_id !== "-" || s.epoch !== "-" || !safe(s.created_at) || !safe(s.signed_at) || s.signed_at < s.created_at || !safe(s.revision) || s.revision > 0xffffffff
+    if (ctx.sealed) { decodeFixed(ctx.sealed.group, 32); if (!safe(ctx.sealed.epoch) || !ctx.target.startsWith("dm:")) return invalidVerification(); }
+    if (s.group_id !== (ctx.sealed?.group ?? "-") || s.epoch !== (ctx.sealed ? String(ctx.sealed.epoch) : "-") || !safe(s.created_at) || !safe(s.signed_at) || s.signed_at < s.created_at || !safe(s.revision) || s.revision > 0xffffffff
         || s.server_key !== ctx.serverKey || s.conversation !== ctx.target || s.author_uid !== msg.author_uid
         || s.certificate_hash !== await certificateHash(s.certificate ?? undefined) || /[\r\n]/.test(ctx.target)) return invalidVerification();
     if (s.revision === 0) { if (s.previous_revision_hash !== "-" || s.signed_at !== s.created_at) return invalidVerification(); }
@@ -137,7 +138,7 @@ export function sameMessageIdentity(a: ChatMessage, b: ChatMessage): boolean {
   return !!x && !!y && x.server_key === y.server_key && x.author_uid === y.author_uid
     && x.message_id === y.message_id && x.conversation === y.conversation && x.created_at === y.created_at;
 }
-export function messageFingerprint(msg: ChatMessage, ctx: MessageContext): string { return JSON.stringify([{ serverKey: ctx.serverKey, target: ctx.target }, msg]); }
+export function messageFingerprint(msg: ChatMessage, ctx: MessageContext): string { return JSON.stringify([{ serverKey: ctx.serverKey, target: ctx.target, sealed: ctx.sealed }, msg]); }
 export class MessageVerifier {
   constructor(private storage: MessageStorage = messageStorage) {}
   async verify(msg: ChatMessage, ctx: MessageContext): Promise<MessageVerification> {

@@ -358,6 +358,15 @@ describe("MLS synchronization", () => {
     expect(f.world.chunks.map(c => c.id)).toEqual(["bad"]);
     expect(f.calls.filter(c => c.op === "mls.history.ack").map(c => c.data.ids)).toEqual([["good"]]);
   });
+  it("does not immediately resynchronize again for the same missing epoch", async () => {
+    const f = await fixture({ ...clean(), groups: [summary()] });
+    const timer = vi.spyOn(globalThis, "setTimeout");
+    try {
+      const message = { conversation, group, epoch: 0, message_id: b64(2,16), revision: 0, ciphertext: "AQ" };
+      await f.runtime.openMessage(message); await f.runtime.openMessage(message);
+      expect(timer.mock.calls.filter(([, delay]) => delay === 0)).toHaveLength(1);
+    } finally { timer.mockRestore(); }
+  });
   it("requests missing keys, throttles repeated requests, and answers wanted history", async () => {
     const local = summary(); local.members.push({ device_key: peer, uid: b64(5,20) });
     const f = await fixture({ ...clean(), groups: [local] });

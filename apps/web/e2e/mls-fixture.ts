@@ -7,7 +7,7 @@ import { certificateHash } from "../src/net/handshake";
 import { messageBodyHash, messageStatement } from "../src/net/message-signature";
 import type { MessageSignature } from "../src/proto/MessageSignature";
 const enc = new TextEncoder();
-export async function connect(account: number, device: number, ws: string) {
+export async function connect(account: number, device: number, ws: string, { takeover = false } = {}) {
   const seed = new Uint8Array(32).fill(device), accountSeed = new Uint8Array(32).fill(account);
   const publicKey = b64(ed25519.getPublicKey(seed)), accountKey = b64(ed25519.getPublicKey(accountSeed));
   const issued_at = Date.now() - 60_000, expires_at = issued_at + 7 * 86400_000;
@@ -15,10 +15,13 @@ export async function connect(account: number, device: number, ws: string) {
   const identity: Identity = { publicKey, nickname: `device${device}`, device: certificate, sign: async bytes => b64(ed25519.sign(bytes, seed)), exportBackup: () => { throw new Error("test device"); } };
   const link = new Connection({ url: ws, identity, nickname: identity.nickname, client: { name: "mls-test", platform: "web", version: "1" }, autoReconnect: false });
   const errors: string[] = [];
-  const runtime = await MlsRuntime.connect({ identity, seed, link, revocations: () => [], onError: error => errors.push(String(error)) });
+  let tookOver = false, held: MlsRuntime | undefined;
+  // The app closes its session when a newer tab of the device asks for it.
+  const onTakeover = takeover ? () => { tookOver = true; void held?.close(); } : undefined;
+  const runtime = held = await MlsRuntime.connect({ identity, seed, link, revocations: () => [], onError: error => errors.push(String(error)), onTakeover });
   const uid = await uidForPublicKey(accountKey);
   return {
-    runtime, uid, publicKey, errors,
+    runtime, uid, publicKey, errors, takenOver: () => tookOver,
     async seal(conversation: string) {
       let signature!: MessageSignature;
       const sealed = await runtime.sealMessage(conversation, async context => {

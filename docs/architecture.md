@@ -238,8 +238,25 @@ then inserts the new chunk and ends the outstanding request. Duplicate uploads
 return `{}` without another row or announcement; excess uploads return
 `quota_exceeded`.
 
-The web app does not yet join MLS groups. Plaintext chat remains available;
-sealed messages and encrypted channel groups are later build steps.
+The web controller starts one browser MLS runtime per Gwar device session,
+using the device signing seed (also for Connect identities, whose portable
+backup remains disabled). Disconnect and logout close the runtime and release
+its device lock; automatic reconnect retains durable MLS state. Certificate
+renewal reconnects with the renewed credential. TeamSpeak links never start MLS.
+
+`state/direct-messages.ts` binds every request and decrypted result to the
+current connection and welcome generation. It opens groups through the runtime,
+signs v3 plaintext with the current group/epoch, and retries stale/pending writes
+with the same message id, revision and predecessor. Sealed rows have a separate
+UI key namespace from plaintext channel rows. MessageVerifier applies revision
+checkpoints and revocations after opening, before rendering or notifying.
+History never notifies; live arrivals waiting for keys notify at most once.
+Missing keys show a muted placeholder and are retried after runtime updates.
+History paging continues until an empty page, since byte-limited pages may be
+short. Welcome conversation counts and conversation read events synchronize
+unread state. Plaintext Gwar-to-Gwar DMs are discarded on receipt.
+
+Encrypted channels, server-wide chat, attachments and voice remain later steps.
 
 ## Signed messages (v3)
 

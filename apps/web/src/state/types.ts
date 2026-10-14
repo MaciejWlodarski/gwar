@@ -1,3 +1,4 @@
+import type { SealedMessage } from "../proto/SealedMessage";
 import type { Channel } from "../proto/Channel";
 import type { ChatMessage } from "../proto/ChatMessage";
 import type { Client } from "../proto/Client";
@@ -22,7 +23,7 @@ export interface SysText {
 export type ChatItem =
   /** verified: fully verified (mentions, notifications); authentic: the signature verified here, so the
    *  row owns its id and signed identity. Unauthenticated rows never block or outlive an authentic one. */
-  | { kind: "msg"; key: string; at: number; msg: ChatMessage; removed?: boolean; verified?: boolean; authentic?: boolean }
+  | { kind: "msg"; key: string; at: number; msg: ChatMessage; removed?: boolean; verified?: boolean; authentic?: boolean; sealed?: SealedMessage; cannotOpen?: "no_key" | "cannot_open" }
   | { kind: "sys"; key: string; at: number; text: SysText };
 
 export interface Thread {
@@ -40,6 +41,7 @@ export interface Thread {
   locked: boolean;
   /** Private conversations: who it is with. */
   peer?: { uid: string; name: string };
+  securing?: boolean;
 }
 
 export type Phase = "idle" | "connecting" | "online" | "reconnecting" | "closed";

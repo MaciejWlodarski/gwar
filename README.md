@@ -30,8 +30,8 @@ use.
   voice: read and write any channel's chat, see who is in which voice channel,
   join voice when you want to talk. Unread counts follow you across devices.
 - **Channels and chat.** Nested channels, passwords, user limits, channel
-  history kept on the server (the latest 1,000 messages per channel), live
-  private and server-wide messages, a member list with online and offline
+  history kept on the server (the latest 1,000 messages per channel), encrypted private messages stored for offline delivery, live
+  server-wide messages, a member list with online and offline
   users.
 - **Chat like you expect.** Mentions with notifications, editing and deleting,
   images, video, audio and files (drag and drop or paste).
@@ -44,6 +44,9 @@ use.
   you are. Your saved servers follow you to every device. Servers verify
   devices themselves and keep working if Connect is down. See
   [docs/connect.md](docs/connect.md).
+- **Encrypted direct messages.** Gwar members exchange end-to-end encrypted
+  messages, edits and deletions. Other devices receive history keys when a
+  member is online. DMs with TeamSpeak users remain plaintext and live-only.
 - **Signed chat.** Gwar clients sign every message, edit, deletion and
   attachment and verify everyone else's, so a server cannot put words in a
   Gwar user's mouth without a warning. See [Security](#security).
@@ -168,11 +171,11 @@ The limits are listed plainly [at the end](#what-gwar-does-not-protect-yet).
 
 Being honest about the limits is part of the design:
 
-- **The server you are on can read its content**: messages, direct messages,
-  files and voice. Nothing is end-to-end encrypted yet; voice goes through the
-  server (an SFU). For private conversations, use a server you trust, or run
-  your own. End-to-end encryption is designed in [docs/e2e.md](docs/e2e.md)
-  and not built yet.
+- **Gwar-to-Gwar direct messages are end-to-end encrypted.** The server stores
+  ciphertext and sees participants, timing, sizes and read marks. Channel and
+  server-wide chat, files, voice, and DMs with TeamSpeak users remain readable
+  by the server. The remaining encryption work is tracked in
+  [docs/e2e-build.md](docs/e2e-build.md).
 - Voice is not signed, and presence, nicknames, channel names and roles are the
   server's word. A server can also hide, delay or reorder messages.
 - **File links are like keys** by default: anyone holding a file's link can
@@ -395,12 +398,16 @@ vc-server --data-dir data members merge [--dry-run] -- <from-uid> <into-uid>
 
 ## Develop
 
-Requirements: Rust (stable), Node 22+, pnpm (the version pinned in
+Requirements: Rust 1.99.0 (including the wasm target), Node 22.23.3 for the wasm budget, pnpm (the version pinned in
 `package.json`), and libopus for the native clients
 (`brew install opus` or `apt install libopus-dev libasound2-dev`).
 
 ```bash
-pnpm install
+pnpm install --frozen-lockfile
+rustup target add wasm32-unknown-unknown
+cargo install wasm-bindgen-cli --version 0.2.129 --locked
+npm install --prefix .build-tools --no-audit --no-fund binaryen@123.0.0
+WASM_OPT=.build-tools/node_modules/.bin/wasm-opt scripts/mls-wasm/build.sh
 cargo run -p vc-server -- --data-dir data --public-endpoint ws://localhost:8790/ws --public-endpoint ws://127.0.0.1:8790/ws --public-endpoint ws://localhost:5173/ws --public-endpoint ws://127.0.0.1:5173/ws
 pnpm --filter web dev                            # web app on http://localhost:5173
 pnpm --filter desktop dev                        # desktop app
@@ -492,14 +499,13 @@ VC_TS3_DIR=/tmp/ts3 cargo test -p vc-client --test teamspeak_mode --test teamspe
   the desktop RNNoise by default, which adds almost no latency, with
   DeepFilterNet as a higher-quality option for loud surroundings; the web
   app starts with the browser's own suppression.
-- **End-to-end encryption**: channel chat, direct messages, server-wide chat
-  and their files with MLS, voice with SFrame. Encrypted direct messages and
-  server-wide chat are stored as ciphertext, so they reach you after you were
-  offline. Encryption is chosen when a channel is created, with or without
+- **More end-to-end encryption**: channel and server-wide chat and files with
+  MLS, voice with SFrame. Gwar direct messages already use encrypted storage
+  and offline delivery. Encryption is chosen when a channel is created, with or without
   history for new members, and your history follows you to your devices
   through Gwar Connect. Channels shared with TeamSpeak users stay unencrypted
   and are labeled as such. Design: [docs/e2e.md](docs/e2e.md); prototypes
-  are in progress.
+  and the remaining build steps are in progress.
 - **Mobile app** (iOS and Android).
 - **Streaming**: screen sharing and video, peer to peer and through the server.
 - **Fully native clients** later, keeping the same protocol.

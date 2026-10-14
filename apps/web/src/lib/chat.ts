@@ -1,5 +1,14 @@
 import type { ChatItem, StoredThreadKey } from "../state/types";
 
+/** Canonical Gwar DM routing uses known fixed-width uids, never ambiguous TS ids. */
+export function dmPeer(conversation: string, me: string | undefined): string | null {
+  if (!me) return null;
+  const parts = /^dm:([A-Za-z0-9_-]{27}):([A-Za-z0-9_-]{27})$/.exec(conversation);
+  if (!parts || parts[1]! >= parts[2]!) return null;
+  return parts[1] === me ? parts[2]! : parts[2] === me ? parts[1]! : null;
+}
+export function encryptedDm(key: string, kind: string): boolean { return kind === "vc" && key.startsWith("dm:") && !key.slice(3).startsWith("ts:"); }
+
 /** A DM binds exactly the two participants of the locally open conversation. */
 export function messageTarget(key: StoredThreadKey | null | undefined, authorUid: string, uid: string | undefined): string {
   if (key?.startsWith("ch:")) return `channel:${key.slice(3)}`;
