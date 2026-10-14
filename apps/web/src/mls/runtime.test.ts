@@ -84,7 +84,8 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
     free() {}
   }
   const factory: AgentFactory = { create: () => new FakeAgent(structuredClone(initial)), load: c => new FakeAgent(JSON.parse(dec.decode(new Uint8Array(c.groups[0]!.value!)))) };
-  const storage = await openStorage(crypto.randomUUID(), new IDBFactory());
+  const name = crypto.randomUUID(), databases = new IDBFactory();
+  let storage = await openStorage(name, databases);
   const durable = async (): Promise<State> => JSON.parse(dec.decode(new Uint8Array((await storage.load()).groups[0]!.value!)));
   const world = {
     groups: initial.groups.length && hasRemoteGroup ? [{ conversation, group, epoch: 0, pending: false }] : [],
@@ -134,14 +135,23 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
   };
   const identity = { publicKey: device, device: undefined, sign: async () => b64(1, 64) } as unknown as Identity;
   const locks = { request: async (_name: string, _options: unknown, fn: () => Promise<void>) => fn() } as unknown as LockManager;
-  const runtime = await MlsRuntime.connect({ identity, seed: new Uint8Array(32), link: link as unknown as Link, revocations: () => world.revocations, locks, storage: async () => storage, factory, now: options.now, onError: error => errors.push(error) });
+  const connectOptions = { identity, seed: new Uint8Array(32), link: link as unknown as Link, revocations: () => world.revocations, locks, storage: async () => storage, factory, now: options.now, onError: (error: unknown) => errors.push(error) };
+  const runtime = await MlsRuntime.connect(connectOptions);
   runtimes.push(runtime);
   // Initialization has completed, so changes below model subsequent reconnects/events.
-  return { runtime, world, calls, operations, errors, durable, state: () => current.state, storage,
+  return { runtime, world, calls, operations, errors, durable, state: () => current.state, get storage() { return storage; },
     event: (event: Event) => eventHandler(event),
     proposal: () => eventHandler({ ev: "mls.proposal", d: { group, epoch: 0, proposal: "AQ" } }),
     commitEvent: () => eventHandler({ ev: "mls.commit", d: { group, epoch: 1 } } as Event),
     persist: () => storage.write(current.take_changes()),
+    // A new page load: the same durable stores, fresh runtime memory.
+    restart: async () => {
+      await runtime.close(); link.status.state = "idle";
+      storage = await openStorage(name, databases);
+      const next = await MlsRuntime.connect(connectOptions);
+      runtimes.push(next);
+      return next;
+    },
     reconnect: () => {
       link.isOnline = false; statusHandler({ state: "reconnecting", attempt: 1, retryAt: Date.now() });
       link.isOnline = true; statusHandler({ state: "online" });
@@ -342,6 +352,27 @@ describe("MLS synchronization", () => {
     expect(f.state().shares).toBe(2);
     expect(f.calls.filter(c => c.op === "mls.history.share").map(c => c.data.chunk)).toEqual(["Fg", "Fw", "Fw", "GA"]);
   }, 20_000);
+  it("backs off a recipient whose history cannot be prepared and still shares with the others", async () => {
+    const other = b64(4), local = summary();
+    local.members.push({ device_key: peer, uid: b64(5,20) }, { device_key: other, uid: b64(6,20) });
+    let now = 1_000_000;
+    const f = await fixture({ ...clean(), groups: [local] }, true, { now: () => now });
+    f.world.devices = [
+      { uid: b64(5,20), device_key: peer, hpke_key: b64(6), created_at: 1, signature: "invalid" },
+      { uid: b64(6,20), device_key: other, hpke_key: b64(7), created_at: 1, signature: b64(7,64) },
+    ];
+    f.world.wanted = [{ group, device: peer }, { group, device: other }];
+    const shared = () => f.calls.filter(c => c.op === "mls.history.share").map(c => c.data.recipient);
+    await f.runtime.sync();
+    expect(String(f.errors.at(-1))).toContain("invalid HPKE signature");
+    expect(shared()).toEqual([other, other]);
+    // Not retried before its backoff, then shared once the publication is valid.
+    f.world.wanted = []; f.world.devices[0]!.signature = b64(8,64);
+    await f.runtime.sync();
+    expect(shared()).toEqual([other, other]);
+    now += 5_000; await f.runtime.sync();
+    expect(shared()).toEqual([other, other, peer, peer]);
+  });
   it("opens through queries without writes and distinguishes operational failures", async () => {
     const f = await fixture({ ...clean(), groups: [summary()] });
     const message = { conversation, group, epoch: 0, message_id: b64(2,16), revision: 0, ciphertext: "AQ" };
@@ -424,6 +455,22 @@ describe("Channel groups", () => {
     now += 1; await f.runtime.sync();
     expect(f.calls.filter(c => c.op === "mls.history.request")).toHaveLength(2);
     expect(await intents()).toEqual([]);
+  });
+  it("asks for history after a restart when the request before it failed", async () => {
+    asChannel();
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
+    const f = await fixture(clean(), true, { channels: [channel()] });
+    f.world.groups = [{ conversation, group, epoch: 0, pending: false }];
+    f.world.requestError = new RequestError("unavailable", "unavailable");
+    await f.runtime.sync(); random.mockRestore();
+    expect(String(f.errors.at(-1))).toContain("unavailable");
+    expect(f.operations.filter(o => o.op === "join_external")).toHaveLength(1);
+    f.world.requestError = null;
+    const runtime = await f.restart();
+    await runtime.sync();
+    expect(f.operations.filter(o => o.op === "join_external")).toHaveLength(1);
+    expect(f.calls.filter(c => c.op === "mls.history.request")).toHaveLength(2);
+    expect((await f.storage.load()).outbox.map(c => dec.decode(new Uint8Array(c.key))).filter(k => k.startsWith("@runtime/request/"))).toEqual([]);
   });
   it("ignores plaintext channels", async () => {
     asChannel();
