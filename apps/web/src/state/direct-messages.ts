@@ -16,9 +16,12 @@ export type DmRuntime = Pick<MlsRuntime, "status" | "subscribe" | "openConversat
 /** One session's sealed chat work. Every asynchronous boundary checks its session fence. */
 export class DirectMessages {
   private queue = Promise.resolve();
-  private pending = new Map<string, boolean>();
+  /** Live rows still to notify once opened (by item key), whichever path opens them. */
+  private pending = new Set<string>();
   private notified = new Set<string>();
   private loading = new Set<string>();
+  /** Opens queued or running per `conversation:id`; removals are only remembered for these. */
+  private queued = new Map<string, number>();
   private removed = new Set<string>();
   private opening = new Set<string>();
   private reading = new Set<string>();
@@ -30,7 +33,9 @@ export class DirectMessages {
     private error: (error: unknown) => void) {
     this.unsubscribe = runtime.subscribe(() => this.refresh());
   }
-  remove(conversation: string, ids: number[]): void { for (const id of ids) this.removed.add(`${conversation}:${id}`); }
+  remove(conversation: string, ids: number[]): void {
+    for (const id of ids) if (this.queued.has(`${conversation}:${id}`)) this.removed.add(`${conversation}:${id}`);
+  }
   close(): void { this.stopped = true; this.unsubscribe(); this.pending.clear(); }
   private check(): void { if (this.stopped || !this.current()) throw new ConnectionLostError(); }
   conversation(peer: string): string { return messageTarget(`dm:${peer}`, this.uid, this.uid); }
@@ -42,7 +47,7 @@ export class DirectMessages {
       const peer = key.slice(3);
       state.dispatch({ type: "dmStatus", peer, securing: this.runtime.status(this.conversation(peer)) !== "ready" });
       for (const item of thread.items) if (item.kind === "msg" && item.sealed && item.cannotOpen === "no_key") {
-        void this.receive(item.sealed, this.pending.get(item.key) ?? false).catch(this.error);
+        void this.receive(item.sealed, false).catch(this.error);
       }
     }
   }
@@ -60,8 +65,9 @@ export class DirectMessages {
       const page = await this.link.request("chat.sealed.history", { conversation, before: before ?? null, limit: 50 });
       check();
       for (const row of page.sealed) {
+        check();
         if (row.conversation !== conversation || (before !== undefined && row.id >= before)) throw new Error("Invalid conversation history cursor");
-        await this.receive(row, false);
+        await this.receive(row, false, epoch);
       }
       check();
       // Byte-limited pages may be short; only an empty page proves the end.
@@ -98,18 +104,21 @@ export class DirectMessages {
       }
     } finally { this.reading.delete(peer); }
   }
-  receive(row: SealedMessage, live: boolean): Promise<void> {
-    const epoch = useSession.getState().epoch;
+  receive(row: SealedMessage, live: boolean, epoch = useSession.getState().epoch): Promise<void> {
+    const key = `e${row.id}`;
+    // Recorded before deduplication: a history open of the same row must still notify.
+    if (live && row.revision === 0) this.pending.add(key);
     const token = `${epoch}:${JSON.stringify(row)}`;
     if (this.opening.has(token)) return this.queue;
     if (this.opening.size >= 256) return Promise.reject(new Error("Conversation verification queue full"));
     this.opening.add(token);
-    const wasRemoved = () => this.removed.has(`${row.conversation}:${row.id}`);
+    const rowKey = `${row.conversation}:${row.id}`;
+    this.queued.set(rowKey, (this.queued.get(rowKey) ?? 0) + 1);
+    const wasRemoved = () => this.removed.has(rowKey);
     const run = this.queue.then(async () => {
       this.check(); if (epoch !== useSession.getState().epoch || wasRemoved()) return;
       const peer = dmPeer(row.conversation, this.uid);
       if (!peer || ![peer, this.uid].includes(row.author_uid)) return;
-      const key = `e${row.id}`;
       const old = useSession.getState().threads[`dm:${peer}`]?.items.find(i => i.key === key);
       if (old?.kind === "msg" && (old.sealed?.revision ?? -1) > row.revision) return;
       const result = await this.runtime.openMessage(row);
@@ -128,20 +137,25 @@ export class DirectMessages {
         } else {
           if (old?.kind === "msg" && old.authentic && !sameMessageIdentity(old.msg, msg)) return;
           item = { ...item, authentic: true, verified: fullyVerified(verification) };
-          if (live && row.revision === 0 && !this.notified.has(key) && notificationAllowed(verification)) this.notify(msg);
+          if (this.pending.has(key) && !this.notified.has(key) && notificationAllowed(verification)) this.notify(msg);
           this.notified.add(key); this.pending.delete(key);
         }
       } else {
         item = { ...item, cannotOpen: result.reason, removed: row.deleted };
-        if (live) this.pending.set(key, true);
       }
       useSession.getState().dispatch({ type: "sealed", peer, item, live });
       // Bound session metadata to retained rows.
       const keys = new Set(Object.values(useSession.getState().threads).flatMap(t => t.items.map(i => i.key)));
-      for (const k of this.pending.keys()) if (!keys.has(k)) this.pending.delete(k);
+      for (const k of this.queued.keys()) keys.add(`e${k.slice(k.lastIndexOf(":") + 1)}`);
+      for (const k of this.pending) if (!keys.has(k)) this.pending.delete(k);
       for (const k of this.notified) if (!keys.has(k)) this.notified.delete(k);
     });
-    const done = run.finally(() => this.opening.delete(token));
+    const done = run.finally(() => {
+      this.opening.delete(token);
+      const left = this.queued.get(rowKey)! - 1;
+      if (left) this.queued.set(rowKey, left);
+      else { this.queued.delete(rowKey); this.removed.delete(rowKey); }
+    });
     this.queue = done.catch(() => {});
     return done;
   }

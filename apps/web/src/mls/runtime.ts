@@ -80,10 +80,21 @@ export class MlsRuntime {
     const abortWaiting = () => waiting.abort(options.signal!.reason);
     options.signal?.addEventListener("abort", abortWaiting, { once: true });
     if (options.signal?.aborted) abortWaiting();
+    // Requests are ordered by time, then a random tie-break: a waiting tab
+    // yields only to a newer one, so concurrent contenders cannot evict each other.
+    const mine = [performance.timeOrigin + performance.now(), Math.random()] as const;
+    const newer = (other: unknown) => {
+      if (!Array.isArray(other) || other.length !== 2 || !other.every(n => typeof n === "number")) return false;
+      const [at, tie] = other as [number, number];
+      return at > mine[0] || (at === mine[0] && tie > mine[1]);
+    };
     let holding = false;
     if (takeover) {
-      takeover.onmessage = () => { if (holding) options.onTakeover!(); else waiting.abort(new DeviceTakenOver()); };
-      takeover.postMessage("takeover");
+      takeover.onmessage = event => {
+        if (holding) options.onTakeover!();
+        else if (newer(event.data)) waiting.abort(new DeviceTakenOver());
+      };
+      takeover.postMessage(mine);
     }
     let release: () => Promise<void>;
     try { release = await acquireDeviceLock(options.identity.publicKey, locks, waiting.signal); }
@@ -584,7 +595,8 @@ export class MlsRuntime {
     this.stopped = true; this.generation++;
     clearTimeout(this.retry);
     for (const unsubscribe of this.unsubscribers) unsubscribe();
-    this.options.link.close();
+    // A link that never connected stays usable for its owner.
+    if (this.options.link.status.state !== "idle") this.options.link.close();
     this.closePromise = (async () => {
       try { await this.engine.close(); } finally { await this.release(); }
       this.markSecuring();

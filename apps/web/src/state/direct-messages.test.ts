@@ -147,6 +147,24 @@ it("does not apply history fetched by an earlier welcome", async () => {
 });
 
 
+it("stops a history page at a reconnect between rows", async () => {
+  const first = await row(), second = { ...first, id: 2 };
+  request.mockResolvedValue({ sealed: [first, second] });
+  runtime.openMessage = vi.fn(async () => { useSession.setState(s => ({ epoch: s.epoch + 1 })); return { reason: "no_key" as const }; });
+  await expect(dm.open(b)).rejects.toThrow();
+  expect(runtime.openMessage).toHaveBeenCalledTimes(1);
+  expect(useSession.getState().threads[`dm:${b}`]?.items ?? []).toEqual([]);
+});
+it("notifies a live message once even when history opens it first", async () => {
+  const sealed = await row(), plain = opened;
+  opened = undefined; await dm.receive(sealed, true);
+  opened = plain; await dm.receive(sealed, false); await dm.receive(sealed, true);
+  expect(notify).toHaveBeenCalledTimes(1);
+});
+it("remembers removals only for rows still being opened", () => {
+  dm.remove(conversation, Array.from({ length: 1000 }, (_, i) => i));
+  expect((dm as unknown as { removed: Set<string> }).removed.size).toBe(0);
+});
 it("refreshes unread counts past byte-limited pages without notifications", async () => {
   const sealed = await row();
   useSession.getState().dispatch({ type: "dmStatus", peer: b, securing: false });

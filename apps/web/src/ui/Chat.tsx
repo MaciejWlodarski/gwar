@@ -444,8 +444,9 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
     if (!el || loadingOlder) return;
     restoreFrom.current = el.scrollHeight - el.scrollTop;
     setLoadingOlder(true);
-    await controller.loadOlder();
-    setLoadingOlder(false);
+    try { await controller.loadOlder(); }
+    catch (error) { console.warn("Older messages:", error); }
+    finally { setLoadingOlder(false); }
   }, [loadingOlder]);
 
   const onScroll = () => {

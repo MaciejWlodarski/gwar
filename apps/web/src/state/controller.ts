@@ -368,9 +368,9 @@ class Controller {
       if (conn instanceof Connection) {
         const abort = new AbortController(); this.runtimeAbort = abort;
         const start = async () => {
-          await messageStorage.loadRevocations();
           let runtime: MlsRuntime;
           try {
+            await messageStorage.loadRevocations();
             const { MlsRuntime, DeviceTakenOver } = await import("../mls/runtime");
             if (abort.signal.aborted || this.conn !== conn) throw new ConnectionLostError();
             runtime = await MlsRuntime.connect({ identity: conn.identity,
@@ -543,6 +543,8 @@ class Controller {
         }).catch(() => {}).finally(() => { this.messagePending--; });
       } else session.dispatch({ type: "event", event, now: Date.now() });
       if (event.ev === "chat.read" && "conversation" in event.d) void this.dm?.refreshUnread(event.d.conversation).catch(() => {});
+      // Removed rows may never have been loaded here: count again from the server.
+      if (event.ev === "chat.sealed.removed") void this.dm?.refreshUnread(event.d.conversation).catch(() => {});
       if (event.ev === "voice.closed") {
         useUi.getState().toast("info", tNow("voice.closed"));
         this.scheduleVoiceRetry(1000);
@@ -607,13 +609,18 @@ class Controller {
   }
 
   private async teardown(): Promise<void> {
+    // A newer connect may finish its own teardown and start while this one
+    // waits; it then owns the state below, so this one stops.
+    const conn = this.conn;
     this.runtimeAbort?.abort(); this.runtimeAbort = null;
     this.dm?.close(); this.dm = null;
     const runtime = this.runtime; this.runtime = null;
     if (this.revocationTimer) clearInterval(this.revocationTimer);
     this.revocationTimer = null;
     await runtime?.close();
+    if (this.conn !== conn) return;
     await this.nativeFiles(null);
+    if (this.conn !== conn) return;
     if (this.voiceRetry) clearTimeout(this.voiceRetry);
     this.voiceRetry = null;
     if (this.readTimer) clearTimeout(this.readTimer);
@@ -623,6 +630,7 @@ class Controller {
     this.historyRequested.clear();
     this.sentRead.clear();
     await this.engine.stop();
+    if (this.conn !== conn) return;
     this.conn = null;
     useUi.getState().setJoining(null);
     useUi.getState().setEditing(null);

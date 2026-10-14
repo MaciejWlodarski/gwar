@@ -26,7 +26,7 @@ export async function connect(account: number, device: number, address: string) 
   await messageStorage.mergeFeed([], undefined, Date.now());
   const uid = await uidForPublicKey(accountKey);
   return { uid, publicKey,
-    debug: () => ({ toasts: useUi.getState().toasts, threads: useSession.getState().threads, phase: useSession.getState().phase }),
+    debug: () => ({ toasts: useUi.getState().toasts, threads: useSession.getState().threads, phase: useSession.getState().phase, closeReason: useSession.getState().closeReason, mls: !!runtime() }),
     open(peer: string) { useSession.getState().dispatch({ type: "openDm", uid: peer, name: "Peer" }); },
     sync: () => runtime().sync(),
     close: () => controller.disconnect(),

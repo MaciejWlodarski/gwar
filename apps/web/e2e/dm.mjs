@@ -118,6 +118,27 @@ try {
   await send(a, "channel chat still works");
   await b2.getByText("channel chat still works", { exact: true }).waitFor();
   console.log("PASS plaintext channel chat still works beside encrypted DMs");
+  // A newer tab of the same device takes the session over, as a new window would on the server.
+  const tab = await contexts[0].newPage(); pages.push(tab);
+  tab.on("pageerror", e => console.error("browser:", e));
+  await tab.goto(`${web}/e2e/dm.html`);
+  await connect(tab, 11, 1);
+  await a.waitForFunction(() => window.dm.debug().closeReason?.reason?.kind === "replaced", null, { timeout: 45000 });
+  assert.equal(await tab.evaluate(() => window.dm.debug().phase), "online");
+  console.log("PASS a newer tab of the device takes the session over");
+  // Without the MLS module (blocked here), the server connection still works; DMs stay securing.
+  const blocked = await browser.newContext(); contexts.push(blocked);
+  await blocked.route("**/*", route => {
+    const url = new URL(route.request().url());
+    return !["127.0.0.1", "localhost"].includes(url.hostname) || url.pathname.endsWith(".wasm") ? route.abort() : route.continue();
+  });
+  const plain = await blocked.newPage(); pages.push(plain);
+  await plain.goto(`${web}/e2e/dm.html`);
+  await connect(plain, 31, 5);
+  assert.deepEqual(await plain.evaluate(() => { const d = window.dm.debug(); return [d.phase, d.mls]; }), ["online", false]);
+  await plain.evaluate(peer => window.dm.open(peer), auid);
+  await plain.getByPlaceholder("Securing this conversation…").waitFor({ timeout: 45000 });
+  console.log("PASS the server connection works when MLS cannot start");
   await Promise.all(pages.map(page => page.evaluate(() => window.dm.close())));
 
 } finally {

@@ -880,6 +880,31 @@ describe("ending a session", () => {
 });
 
 
+it("recounts a conversation's unread messages from the server after a removal", () => {
+  connectFake();
+  const c = controller as unknown as { dm: unknown };
+  const dm = { remove: vi.fn(), refreshUnread: vi.fn(async () => {}) };
+  c.dm = dm;
+  link.emit({ ev: "chat.sealed.removed", d: { conversation: "dm:x:y", ids: [1] } });
+  expect(dm.remove).toHaveBeenCalledWith("dm:x:y", [1]);
+  expect(dm.refreshUnread).toHaveBeenCalledWith("dm:x:y");
+  c.dm = null;
+});
+
+it("a teardown that resumes after a newer connect leaves that connection alone", async () => {
+  connectFake();
+  const c = controller as unknown as { conn: unknown; runtime: unknown; teardown(): Promise<void> };
+  let finish!: () => void;
+  c.runtime = { close: () => new Promise<void>((resolve) => { finish = resolve; }) };
+  const stale = c.teardown();
+  const newer = {};
+  c.conn = newer;
+  finish(); await stale;
+  expect(c.conn).toBe(newer);
+  expect(session().me).not.toBeNull();
+  c.conn = link;
+});
+
 it("drops plaintext Gwar-to-Gwar DMs before state or notifications, retaining TeamSpeak DMs", () => {
   connectFake();
   const msg = { id: 700, target: { client: 1 }, author: 2, author_uid: "u2", author_name: "Peer", text: "plaintext", sent_at: 1 };
