@@ -51,6 +51,8 @@ jobs:
           node-version: 22
       - run: cargo install cargo-audit --locked
       - run: cargo audit
+      - name: libcrux-kem stays out of the build (see .cargo/audit.toml)
+        run: test -z "$(cargo tree -i libcrux-kem --target all 2>/dev/null)"
       - run: pnpm audit --prod
 
   web:
