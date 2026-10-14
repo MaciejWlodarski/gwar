@@ -2,7 +2,7 @@
 
 export type ChannelCreate = { name: string, parent: number | null, topic: string | null, password: string | null, max_clients: number | null, 
 /**
- * Defaults to true without TeamSpeak compatibility, false with it.
+ * Defaults to false: encryption is chosen per channel.
  */
 encrypted?: boolean | null, 
 /**

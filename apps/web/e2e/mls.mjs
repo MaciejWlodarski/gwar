@@ -77,6 +77,37 @@ try {
     assert.deepEqual(key, await pages[0].evaluate(m => window.mls.epochKey(m.group, m.epoch), message));
   }
   console.log("PASS additional devices join and import pre-join message history");
+  // An encrypted channel: its creator makes the group, another member's device
+  // joins it by itself and gets the earlier key through a routed assignment.
+  const token = /redeem this one-time admin token in your client: (\S+)/.exec(service.output)?.[1];
+  assert.ok(token, "admin token in the server log");
+  const channel = await pages[0].evaluate(async token => {
+    await window.mls.link.request("token.redeem", { token });
+    const channel = await window.mls.link.request("channel.create", { name: "Sealed", encrypted: true, history: true });
+    window.mls.runtime.channelCreated(channel.id);
+    return channel;
+  }, token);
+  const sealedChannel = `channel:${channel.id}`;
+  const until = async (what, check, timeout = 30_000) => {
+    for (const started = Date.now(); Date.now() - started < timeout;) {
+      if (await check()) return;
+      for (const page of pages) await page.evaluate(() => window.mls.runtime.sync().catch(() => {}));
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    for (const page of pages) console.error(await page.evaluate(() => window.mls.errors));
+    throw new Error(`timed out: ${what}`);
+  };
+  await until("the creator's channel group", () => pages[0].evaluate(c => window.mls.runtime.status(c) === "ready", sealedChannel));
+  const channelMessage = await pages[0].evaluate(c => window.mls.seal(c), sealedChannel);
+  await until("the other member joins", () => pages[3].evaluate(c => window.mls.runtime.status(c) === "ready", sealedChannel));
+  // The first device the server asks may lack the earlier epoch (it joined
+  // after the message); the next request is allowed a minute later.
+  await until("the earlier key arrives", async () => (await pages[3].evaluate(m => window.mls.runtime.openMessage(m), channelMessage)).ok?.text === "encrypted hello", 90_000);
+  console.log("PASS a member joins an encrypted channel's group and receives its earlier key");
+  // Deleting the channel deletes its group on every device.
+  await pages[0].evaluate(id => window.mls.link.request("channel.delete", { channel: id }), channel.id);
+  await until("the group is forgotten", () => pages[3].evaluate(m => window.mls.epochKey(m.group, m.epoch).then(key => key === null), channelMessage));
+  console.log("PASS deleting an encrypted channel deletes its group state");
   // Restart on the same origin/device: IndexedDB state and Welcome dedupe survive.
   await pages[1].evaluate(() => window.mls.runtime.close());
   await pages[1].reload();
@@ -110,6 +141,10 @@ try {
   await Promise.all(pages.map(page => page.evaluate(() => window.mls.runtime.close())));
   console.log("PASS device restart reloads durable MLS state");
 
+} catch (error) {
+  // The local services' output explains most failures (in CI there is nothing else to look at).
+  for (const child of children) console.error(`--- ${child.spawnargs.join(" ")}\n${child.output}`);
+  throw error;
 } finally {
   await browser?.close();
   await stopProcesses(children);

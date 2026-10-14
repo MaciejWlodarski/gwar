@@ -270,9 +270,9 @@ credential, the OpenMLS provider and Gwar's own per-group records.
   GroupInfo, whose epoch is later than the checkpoint.
 - **Epoch keys**: after every merge and join that leaves the device a member,
   `epoch_key = MLS-Exporter("gwar chat v1", group_id, 32)` is stored with
-  `(group_id, epoch)`, together with the uids that had leaves in that epoch
-  (evidence for history sharing in groups without history, below). Keys stay until the conversation
-  is deleted.
+  `(group_id, epoch)`, and the group's evidence records which uids had leaves
+  in that epoch, as epoch intervals per uid (for history sharing in groups
+  without history, below). Keys stay until the conversation is deleted.
 - **Certificate renewal**: loading an agent with a renewed credential makes
   each subsequent member commit publish it in the committer's path leaf. Do
   this before the old leaf expires; an expired own leaf requires rejoining.
@@ -350,10 +350,10 @@ credential, the OpenMLS provider and Gwar's own per-group records.
   `gwar-mls:{device_key}` is taken before connecting. Before releasing it
   (connection replaced or closed) the tab finishes the operation in progress,
   including its write, and starts no other.
-- One IndexedDB database per device, `gwar-mls-v1-{device_key}`, with stores
+- One IndexedDB database per device, `gwar-mls-v2-{device_key}`, with stores
   `openmls` (the provider's key/value pairs), `groups` (Gwar records per
   group, keyed by server key and group id: conversation, incarnation, pin,
-  freshness), `epochs` (epoch keys with provenance, evidence, conflicts),
+  freshness, evidence), `epochs` (epoch keys with provenance, conflicts),
   `outbox`. The browser adapter reserves UTF-8 `@runtime/` keys in that
   outbox for package publication and history jobs; it filters those keys
   before passing the four-store snapshot to the core. Core commit keys keep
@@ -761,9 +761,9 @@ bridge.
 ## 4. Encrypted channels and server-wide chat
 
 Status: 4a server side built (delivery service, history routing, TeamSpeak
-bridge); the agent and web side of 4a is next. Until it lands, seeded and
-created channels default to plaintext so the current web client keeps working.
-Built as three pull requests, in this order: **4a**
+bridge); the agent and the browser runtime keep channel groups (create, join,
+history assignments, leaf updates, deleted channels); the web interface for
+encrypted channels is next. Built as three pull requests, in this order: **4a**
 channels (options, groups, sealed channel messages, unread counts and
 mentions, TeamSpeak text isolation, restarts); **4b** encrypted attachments,
 in channels and direct messages; **4c** encrypted server-wide chat and large
@@ -773,24 +773,25 @@ then channel info says "Messages are end-to-end encrypted", not more.
 ### Channel options
 
 - `Channel` gains `encrypted` and `history` (booleans), fixed at creation:
-  `channel.create` takes both (`encrypted` defaults to true without TeamSpeak
-  compatibility and false with it; `history` defaults to true and is ignored,
-  stored as false, when `encrypted` is false). `channel.update` cannot change
+  `channel.create` takes both (`encrypted` defaults to false, with or without
+  TeamSpeak compatibility: encryption is chosen per channel; `history`
+  defaults to true and is ignored, stored as false, when `encrypted` is
+  false). `channel.update` cannot change
   them. The server's copy is for display and access; clients take `history`
   only from the descriptor.
 - An encrypted channel has no password: `channel.create` and
   `channel.update` reject `password` for it (`bad_request`). Passwords remain
   for plaintext channels.
 - `ServerInfo` gains `teamspeak` (TeamSpeak compatibility is on) and
-  `server_chat: {encrypted, history}`, so clients can pick the defaults.
+  `server_chat: {encrypted, history}`, so clients know what is bridged and how
+  server chat is kept.
 - With TeamSpeak compatibility the default channel stays plaintext:
   `server.update` refuses an encrypted `default_channel` (`bad_request`), and
   the server refuses to start with TeamSpeak compatibility while the stored
   default channel is encrypted (see "Server-wide chat").
-  Channels created by a new server's database setup are encrypted unless
-  TeamSpeak compatibility is on.
+  Channels created by a new server's database setup are plaintext.
 - Existing channels keep `encrypted = false`; nothing is converted.
-- The create dialog shows "End-to-end encrypted" (default as above, the
+- The create dialog shows "End-to-end encrypted" (off by default, the
   creator's last choice remembered per server) and, when it is on, "New
   members see earlier messages", both marked as permanent. Channel info shows
   "Messages are end-to-end encrypted" with a small lock, or "Not end-to-end

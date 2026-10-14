@@ -210,9 +210,7 @@ pub async fn start(config: Config) -> Result<Running> {
         Some(path) => Store::open(path)?,
         None => Store::in_memory()?,
     };
-    // A new database's channels are plaintext until the web app reads encrypted channels
-    // (step 4a, second part); then they follow TeamSpeak compatibility: `!teamspeak`.
-    store.seed_channels(false)?;
+    store.seed_channels()?;
     let admin_token = core::ensure_first_admin_token(&store)?;
     let connect_seq: i64 = store.meta("connect_seq")?.and_then(|s| s.parse().ok()).unwrap_or(0);
     // A password set in the server settings (even "none") wins over the command line.

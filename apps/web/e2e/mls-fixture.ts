@@ -21,7 +21,7 @@ export async function connect(account: number, device: number, ws: string, { tak
   const runtime = held = await MlsRuntime.connect({ identity, seed, link, revocations: () => [], onError: error => errors.push(String(error)), onTakeover });
   const uid = await uidForPublicKey(accountKey);
   return {
-    runtime, uid, publicKey, errors, takenOver: () => tookOver,
+    runtime, link, uid, publicKey, errors, takenOver: () => tookOver,
     async seal(conversation: string) {
       let signature!: MessageSignature;
       const sealed = await runtime.sealMessage(conversation, async context => {
@@ -35,7 +35,7 @@ export async function connect(account: number, device: number, ws: string, { tak
     // Read the same durable epoch record the runtime just committed. Test-only;
     // production API deliberately does not expose key material to the UI.
     async epochKey(group: string, epoch: number) {
-      const db = await new Promise<IDBDatabase>((resolve, reject) => { const r = indexedDB.open(`gwar-mls-v1-${publicKey}`); r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
+      const db = await new Promise<IDBDatabase>((resolve, reject) => { const r = indexedDB.open(`gwar-mls-v2-${publicKey}`); r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
       try {
         return await new Promise<number[] | null>((resolve, reject) => {
           const tx = db.transaction("epochs", "readonly");

@@ -2,7 +2,7 @@ import { certificateHash, decodeFixed } from "../net/handshake";
 import { uidForPublicKey } from "../net/identity";
 import { deviceStatement } from "../connect/crypto";
 import { DELETION_TEXT, messageBodyHash, messageStatement, strictVerify } from "../net/message-signature";
-import { participants } from "./descriptor";
+import { channelOf, participants } from "./descriptor";
 import type { Plaintext } from "./types";
 
 interface Context { server_key: string; conversation: string; group_id: string; epoch: string; message_id: string; revision: number }
@@ -35,7 +35,7 @@ function uniqueKeys(json: string): boolean {
   return true;
 }
 
-/** Parse the complete DM plaintext and authenticate v3 without storage or network
+/** Parse the complete sealed plaintext and authenticate v3 without storage or network
  * access. Malformed content returns null; operational crypto failures propagate. */
 export async function authenticatePlaintext(bytes: Uint8Array, context: Context): Promise<Plaintext | null> {
   let p: Plaintext;
@@ -53,7 +53,8 @@ export async function authenticatePlaintext(bytes: Uint8Array, context: Context)
     for (const k of ["server_key", "conversation", "group_id", "epoch", "message_id", "revision"] as const) if (s[k] !== context[k]) return null;
     for (const [k, n] of [["server_key", 32], ["group_id", 32], ["author_uid", 20], ["key", 32], ["message_id", 16], ["body_hash", 32], ["signature", 64]] as const) decodeFixed(s[k] as string, n);
     for (const uid of value.mentions) decodeFixed(uid, 20);
-    if (!participants(context.conversation).includes(s.author_uid as string)) return null;
+    // A direct message's author is a participant; in a channel any member may write.
+    if (context.conversation.startsWith("dm:") ? !participants(context.conversation).includes(s.author_uid as string) : channelOf(context.conversation) === undefined) return null;
     if (s.revision === 0) { if (s.previous_revision_hash !== "-" || s.created_at !== s.signed_at) return null; }
     else decodeFixed(s.previous_revision_hash as string, 32);
     if (value.text === DELETION_TEXT && (s.revision === 0 || value.mentions.length)) return null;

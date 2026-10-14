@@ -258,7 +258,7 @@ wire! {
         pub password: Option<String>,
         #[serde(default)]
         pub max_clients: Option<u32>,
-        /// Defaults to true without TeamSpeak compatibility, false with it.
+        /// Defaults to false: encryption is chosen per channel.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub encrypted: Option<bool>,
         /// Defaults to true; only for encrypted channels.

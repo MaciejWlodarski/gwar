@@ -102,7 +102,7 @@ when an accepted transition admits devices without parsing OpenMLS records.
 ## Operation and persistence contract
 
 Acquire `gwar-mls:{device_key}` with Web Locks before opening the connection.
-Load all four stores from `gwar-mls-v1-{device_key}` in one transaction, then
+Load all four stores from `gwar-mls-v2-{device_key}` in one transaction, then
 construct the agent. A new agent instead creates its HPKE key: persist its
 initial `take_changes()` before its first operation.
 
@@ -124,9 +124,9 @@ callers and tests. Finish the current write before releasing the Web Lock.
 | Store | Key | Value |
 | --- | --- | --- |
 | `openmls` | Opaque binary OpenMLS label, encoded key, storage version | Opaque OpenMLS record |
-| `groups` | UTF-8 `{server_key}/{group_id_base64url}` | Descriptor bytes, status, checkpoint, Welcome ids, outstanding-proposal flag |
+| `groups` | UTF-8 `{server_key}/{group_id_base64url}` | Descriptor bytes, status, checkpoint, Welcome ids, outstanding-proposal flag, evidence intervals per uid, own last commit time |
 | `groups` | UTF-8 `@device` | Version 1, device key, HPKE private/public key and statement creation time |
-| `epochs` | UTF-8 `{server_key}/{group_id_base64url}/{epoch:020}` | Derived key and UID evidence, imported key and sender UIDs, or conflicted |
+| `epochs` | UTF-8 `{server_key}/{group_id_base64url}/{epoch:020}` | Derived key, imported key and sender UIDs, or conflicted |
 | `outbox` | Same key as group | Pending commit and its delivery artifacts |
 
 The web runtime also owns `@runtime/` outbox keys for package publication and
@@ -140,7 +140,10 @@ outbox keys without an exact known group prefix, and malformed epoch suffixes.
 The device record must contain a matching X25519 private/public key pair and
 a positive safe-integer creation time, also used in the wasm HPKE statement.
 Byte fields are arrays. Epoch provenance uses externally tagged variants:
-`{"derived":{"key":[...],"uids":[...]}}`, `{"imported":{...}}`, or `"conflicted"`.
+`{"derived":{"key":[...]}}`, `{"imported":{...}}`, or `"conflicted"`. Evidence
+maps each uid to sorted, disjoint, non-adjacent inclusive epoch ranges
+`[{"first":"0","last":"3"}]` in which it had a leaf, as this device saw them;
+loading rejects any other shape.
 Sets are sorted. Group descriptors retain conversation/incarnation and the
 first accepted group id, including after eviction, so they also implement pins.
 Checkpoints hash the TLS GroupContext. The device seed and current credential
@@ -220,9 +223,19 @@ and the outbox while retaining old application epoch keys. Persist the derived
 Welcome epoch and delivery id before acknowledging. Invalid Welcomes expose no
 changes; reload durable state before retrying or falling back to external rejoin.
 
+`forget` deletes everything held for a group whose conversation no longer
+exists (a deleted channel): its OpenMLS state with every epoch's encryption key
+pairs, outbox, epoch keys, evidence and pin. Forgetting an unknown group does
+nothing.
+
+`own_commit_at` in a group record is the commit time of this device's last own
+commit there that the log accepted (a creation counts at its descriptor time);
+it is `None` after a Welcome. Channel groups use it for weekly leaf updates.
+
 History sharing verifies the recipient's signed HPKE statement and membership.
 History-on shares all nonconflicted held keys. History-off shares only locally
-derived keys whose UID evidence contains the recipient. Chunks span at most
+derived keys of epochs in which the recipient's uid had a leaf, by the group's
+evidence intervals. Chunks span at most
 1000 epochs. Imports require a sender in the recipient's current tree; derived
 keys always win, equal imports accumulate sender provenance, and conflicting
 imports permanently remove that imported key regardless of arrival order.

@@ -8,12 +8,12 @@ import { messageBodyHash, messageStatement } from "../net/message-signature";
 import { deviceStatement } from "../connect/crypto";
 import type { Plaintext } from "./types";
 const enc = new TextEncoder();
-async function fixture(certified = false, text = "hello 👋") {
+async function fixture(certified = false, text = "hello 👋", conversation?: string) {
   const seed = new Uint8Array(32).fill(1), account = new Uint8Array(32).fill(2);
   const key = b64(ed25519.getPublicKey(seed)), accountKey = b64(ed25519.getPublicKey(account));
   const uid = await uidForPublicKey(certified ? accountKey : key);
   const other = await uidForPublicKey(b64(ed25519.getPublicKey(new Uint8Array(32).fill(3))));
-  const context = { server_key: b64(new Uint8Array(32).fill(9)), conversation: `dm:${[uid, other].sort().join(":")}`, group_id: b64(new Uint8Array(32).fill(4)), epoch: "7", message_id: b64(new Uint8Array(16).fill(5)), revision: 0 };
+  const context = { server_key: b64(new Uint8Array(32).fill(9)), conversation: conversation ?? `dm:${[uid, other].sort().join(":")}`, group_id: b64(new Uint8Array(32).fill(4)), epoch: "7", message_id: b64(new Uint8Array(16).fill(5)), revision: 0 };
   const certificate = certified ? { account_key: accountKey, device_key: key, issued_at: 1, expires_at: 10000, signature: b64(ed25519.sign(enc.encode(deviceStatement(accountKey, key, 1, 10000)), account)) } : null;
   const p: Plaintext = { text, mentions: [other], attachments: [], signature: { ...context, author_uid: uid, key, certificate, certificate_hash: await certificateHash(certificate ?? undefined), created_at: 2, signed_at: 2, previous_revision_hash: "-", body_hash: await messageBodyHash(text, [other], []), signature: "" } };
   p.signature.signature = b64(ed25519.sign(enc.encode(messageStatement(context.server_key, context.conversation, uid, p.signature, p.signature.body_hash)), seed));
@@ -24,6 +24,15 @@ describe("MLS plaintext authentication", () => {
   it.each([false, true])("authenticates complete v3 plaintext (certificate: %s)", async certified => {
     const { p, context } = await fixture(certified);
     expect(await authenticatePlaintext(bytes(p), context)).toEqual(p);
+  });
+  it("accepts any author in a channel and only participants in a direct message", async () => {
+    const channel = await fixture(false, "hello", "channel:7");
+    expect(await authenticatePlaintext(bytes(channel.p), channel.context)).toEqual(channel.p);
+    const others = `dm:${[b64(new Uint8Array(20).fill(6)), b64(new Uint8Array(20).fill(7))].sort().join(":")}`;
+    const dm = await fixture(false, "hello", others);
+    expect(await authenticatePlaintext(bytes(dm.p), dm.context)).toBeNull();
+    const voice = await fixture(false, "hello", "voice:7");
+    expect(await authenticatePlaintext(bytes(voice.p), voice.context)).toBeNull();
   });
   it("checks all six inner context fields independently", async () => {
     const { p, context } = await fixture();

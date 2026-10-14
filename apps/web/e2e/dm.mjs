@@ -141,6 +141,10 @@ try {
   console.log("PASS the server connection works when MLS cannot start");
   await Promise.all(pages.map(page => page.evaluate(() => window.dm.close())));
 
+} catch (error) {
+  // The local services' output explains most failures (in CI there is nothing else to look at).
+  for (const child of children) console.error(`--- ${child.spawnargs.join(" ")}\n${child.output}`);
+  throw error;
 } finally {
   await browser?.close();
   await stopProcesses(children);

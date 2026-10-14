@@ -493,7 +493,7 @@ async fn migrated_v2_history_is_readable_edits_fail_cleanly_and_moderators_can_d
     let dir = tempfile::tempdir().unwrap();
     let database = dir.path().join("gwar.sqlite");
     let store = vc_server::store::Store::open(&database).unwrap();
-    store.seed_channels(false).unwrap();
+    store.seed_channels().unwrap();
     let channel = store.channels().unwrap()[0].id;
     let key = new_key();
     let id = store.add_message(channel, &uid_of(&key), "legacy", "preserved body", 1).unwrap();

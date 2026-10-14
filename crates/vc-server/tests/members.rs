@@ -26,7 +26,7 @@ impl Seeded {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("vc.sqlite3")).unwrap();
         // The channels a first start would create.
-        store.seed_channels(false).unwrap();
+        store.seed_channels().unwrap();
         Self { dir, store }
     }
 

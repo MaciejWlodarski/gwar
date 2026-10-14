@@ -8,11 +8,11 @@ import type { Op, RequestInput, ResponseMap } from "../net/protocol";
 import type { MlsGroup } from "../proto/MlsGroup";
 import type { MlsDevice } from "../proto/MlsDevice";
 import { authenticatePlaintext } from "./plaintext";
-import { credential, descriptor, participants } from "./descriptor";
+import { channelOf, credential, descriptor, participants } from "./descriptor";
 import { AgentOperationError, Engine, acquireDeviceLock, jobChange, jobKey } from "./engine";
 import { openStorage, type Persistence } from "./storage";
 import { loadAgent } from "./wasm";
-import type { AgentFactory, Change, CommitOutbox, ConversationStatus, Gate, GroupSummary, HistoryJob, OpenResult, PackageJob, Plaintext, Resolution, Revocation, SealedFields } from "./types";
+import type { AgentFactory, Change, CommitOutbox, ConversationStatus, Gate, GroupSummary, HistoryJob, OpenResult, PackageJob, Plaintext, RequestJob, Resolution, Revocation, SealedFields } from "./types";
 const bytes = (value: string): number[] => [...decodeBase64Url(value)];
 const encoded = (value: number[]): string => encodeBase64Url(new Uint8Array(value));
 /** The DS protocol currently uses safe JSON integers; core epochs remain u64 strings. */
@@ -22,6 +22,10 @@ function wireEpoch(value: string | number): number {
   return n;
 }
 export interface SealContext { server_key: string; conversation: string; group_id: string; epoch: string }
+const DAY = 86400_000;
+/** A device updates its own leaf in a channel group after this long without an own commit there. */
+const LEAF_UPDATE_AFTER = 7 * DAY;
+interface Backoff { at: number; delay: number }
 export interface RuntimeOptions {
   identity: Identity;
   /** Ed25519 JWK d, supplied by the identity owner; never stored again here. */
@@ -67,6 +71,14 @@ export class MlsRuntime {
   private readonly listeners = new Set<() => void>();
   private readonly missing = new Map<string, Set<string>>();
   private readonly lastRequest = new Map<string, number>();
+  /** Encrypted channels by id with their `history`, from the latest Welcome and channel events. */
+  private channels: Map<number, boolean> | undefined;
+  /** When a channel group may next be created or joined, per conversation. */
+  private readonly channelDue = new Map<string, Backoff>();
+  /** When a history job whose preparation failed may be tried again, per job key. */
+  private readonly historyDue = new Map<string, { at: number; delay: number }>();
+  private nextJoin = 0;
+  private wakeAt: number | undefined;
   private readonly now: () => number;
   private constructor(private readonly options: RuntimeOptions, private readonly engine: Engine, private readonly release: () => Promise<void>) { this.now = options.now ?? Date.now; }
 
@@ -126,16 +138,19 @@ export class MlsRuntime {
           if (status.state === "closed") void runtime!.close();
         }
       }));
-      runtime.unsubscribers.push(options.link.onWelcome(() => {
+      runtime.unsubscribers.push(options.link.onWelcome(welcome => {
         const server = options.link.serverKey;
         if (!server || (runtime!.server && runtime!.server !== server)) {
           options.onError?.(new Error("MLS pinned server changed"));
           void runtime!.close(); return;
         }
         runtime!.server = server;
+        runtime!.channels = new Map(welcome.channels.filter(c => c.encrypted).map(c => [c.id, c.history]));
         runtime!.schedule();
       }));
       runtime.unsubscribers.push(options.link.onEvent(event => {
+        if (event.ev === "channel.created" && event.d.encrypted) { runtime!.channels?.set(event.d.id, event.d.history); runtime!.schedule(); }
+        if (event.ev === "channel.deleted" && runtime!.channels?.delete(event.d.channel)) runtime!.schedule();
         if (!event.ev.startsWith("mls.")) return;
         if (event.ev === "mls.commit" || event.ev === "mls.proposal") {
           const group = event.d.group;
@@ -196,15 +211,17 @@ export class MlsRuntime {
     let failed = false;
     this.syncing = this.engine.run(async () => {
       // Bound each pass; events arriving during it request one subsequent pass.
-      this.dirty = false;
+      this.dirty = false; this.wakeAt = undefined;
       this.activeGeneration = this.generation;
       this.assertCurrent(this.generation);
       await this.synchronize();
       this.updateStatuses();
     }).catch(error => { failed = true; this.markSecuring(); throw error; }).finally(() => {
       this.syncing = undefined;
-      // Periodic refill, revocation/expiry checks and missing history retries.
-      this.schedule(!failed && this.dirty ? 200 : 15_000);
+      // Periodic refill, revocation/expiry checks and missing history retries;
+      // sooner for a channel group whose create or join comes due.
+      const wake = this.wakeAt === undefined ? 15_000 : Math.max(200, Math.min(15_000, this.wakeAt - this.now()));
+      this.schedule(!failed && this.dirty ? 200 : wake);
     });
     return this.syncing;
   }
@@ -223,7 +240,8 @@ export class MlsRuntime {
   private historyIntents(before: GroupSummary[]): Change[] {
     const changes: Change[] = [];
     for (const g of this.inventory()) {
-      if (!g.history || g.record.status !== "active") continue;
+      // Channel groups share history by the server's assignments instead.
+      if (!g.history || g.record.status !== "active" || !g.conversation.startsWith("dm:")) continue;
       const old = before.find(b => encoded(b.group) === encoded(g.group) && b.record.status === "active");
       for (const member of g.members) {
         if (member.device_key === this.options.identity.publicKey || old?.members.some(m => m.device_key === member.device_key)) continue;
@@ -240,7 +258,7 @@ export class MlsRuntime {
   private async groups(): Promise<MlsGroup[]> {
     const all: MlsGroup[] = []; let after: string | null = null;
     do { const page: ResponseMap["mls.groups"] = await this.request("mls.groups", { after }); all.push(...page.groups); after = page.next; } while (after);
-    return all.filter(g => g.conversation.startsWith("dm:"));
+    return all.filter(g => g.conversation.startsWith("dm:") || channelOf(g.conversation) !== undefined);
   }
   private async publish(): Promise<void> {
     if (this.now() - this.lastPublish < 60_000 && !this.engine.jobs.has(`@runtime/packages/${this.server}`)) return;
@@ -303,22 +321,116 @@ export class MlsRuntime {
       await this.transition({ settle: { ...this.args(encoded(g.group)), winner: winner ? bytes(winner.group) : null } });
     }
     await this.welcomes();
-    for (const g of groups) await this.syncGroup(g.group, g.pending);
+    for (const g of groups) if (g.conversation.startsWith("dm:")) await this.syncGroup(g.group, g.pending);
+    await this.syncChannels(groups);
     await this.importHistory();
     let after: string | null = null;
     do {
       const page: ResponseMap["mls.history.wanted"] = await this.request("mls.history.wanted", { after });
-      for (const wanted of page.wanted) await this.queueHistory(wanted.group, wanted.device);
+      for (const wanted of page.wanted) await this.queueHistory(wanted.group, wanted.device, wanted.assignment ?? null);
       after = page.next;
     } while (after);
     await this.sendHistory();
     await this.requestMissing();
   }
+  private due(conversation: string): boolean {
+    const at = this.channelDue.get(conversation)?.at ?? 0;
+    if (at <= this.now()) return true;
+    this.wakeAt = Math.min(this.wakeAt ?? Infinity, at); return false;
+  }
+  private failed(conversation: string, error: unknown): void {
+    const delay = Math.min(10 * 60_000, 2 * (this.channelDue.get(conversation)?.delay ?? 5_000));
+    this.channelDue.set(conversation, { at: this.now() + delay * (0.5 + Math.random() / 2), delay });
+    this.options.onError?.(error);
+  }
+  /** Channel groups (docs/e2e-build.md "Groups"): forget deleted channels'
+   * groups, keep joined ones current, join the rest one at a time with jitter,
+   * create missing ones after a random delay, and update stale own leaves. A
+   * failing channel backs off without blocking direct messages. */
+  private async syncChannels(groups: MlsGroup[]): Promise<void> {
+    const channels = this.channels;
+    if (!channels) return;
+    for (const g of this.inventory()) {
+      const id = channelOf(g.conversation);
+      if (id === undefined || channels.has(id)) continue;
+      const group = encoded(g.group);
+      // The group's runtime jobs go with it, in the same write.
+      const jobs = [...this.engine.jobs.values()].filter(job => job.kind !== "packages" && job.server === this.server && job.group === group);
+      await this.engine.op({ forget: this.args(group) }, () => jobs.map(job => jobChange(job, true)));
+      for (const job of jobs) this.historyDue.delete(jobKey(job));
+      this.missing.delete(group); this.statuses.delete(g.conversation);
+      this.syncedVersions.delete(group); this.groupVersions.delete(group);
+    }
+    let leafUpdated = false;
+    for (const [id, history] of channels) {
+      const conversation = `channel:${id}`;
+      const remote = groups.find(g => g.conversation === conversation);
+      const local = remote && this.summary(remote.group);
+      const member = local && ["active", "joining"].includes(local.record.status);
+      if (!this.due(conversation)) continue;
+      try {
+        if (!remote) {
+          if (this.inventory().some(g => g.conversation === conversation && g.record.status === "creating")) continue;
+          // Every member's device may find the group missing: one random wait
+          // lets the first creation reach the others before they try.
+          if (!this.channelDue.has(conversation)) { this.channelDue.set(conversation, { at: this.now() + Math.random() * 5_000, delay: 5_000 }); this.due(conversation); continue; }
+          await this.createGroup(conversation, history);
+        } else if (member) {
+          if (!this.current(remote)) await this.syncGroup(remote.group, remote.pending);
+          const own = this.summary(remote.group)?.record.own_commit_at ?? 0;
+          if (!leafUpdated && this.now() - own > LEAF_UPDATE_AFTER && !this.outbox(remote.group)) {
+            leafUpdated = true; // One group at a time.
+            await this.engine.op({ commit: { ...this.args(remote.group), adds: [], removes: [], now: this.now(), revocations: this.options.revocations() } });
+            await this.syncGroup(remote.group);
+          }
+        } else {
+          if (this.nextJoin > this.now()) { this.wakeAt = Math.min(this.wakeAt ?? Infinity, this.nextJoin); continue; }
+          this.nextJoin = this.now() + Math.random() * 2_000;
+          await this.syncGroup(remote.group, remote.pending);
+        }
+        this.channelDue.delete(conversation);
+        if (remote) await this.requestHistory(remote.group);
+      } catch (error) {
+        this.assertCurrent(this.activeGeneration);
+        // Durable state is authoritative: drop whatever the failure left in memory.
+        await this.engine.reload();
+        this.failed(conversation, error);
+      }
+    }
+  }
+  /** Nothing to do for this group: no event since its last synchronization,
+   * the server's epoch is this device's, and nothing waits to be committed. */
+  private current(remote: MlsGroup): boolean {
+    const local = this.summary(remote.group), gate = this.gate(remote.group);
+    return !remote.pending && local?.record.checkpoint?.epoch === String(remote.epoch) && gate.status === "active"
+      && !gate.rejoin && !gate.server_pending && !gate.blocked.length && !gate.pending_commit
+      && this.syncedVersions.has(remote.group) && this.syncedVersions.get(remote.group) === (this.groupVersions.get(remote.group) ?? 0);
+  }
+  /** After joining, ask the server to route history to this device; senders
+   * decide by their evidence. The intent is durable (written with the join)
+   * and is kept until a request succeeds. */
+  private async requestHistory(group: string): Promise<void> {
+    const job: RequestJob = { kind: "request", server: this.server, group };
+    if (!this.engine.jobs.has(jobKey(job)) || this.summary(group)?.record.status !== "active") return;
+    const next = (this.lastRequest.get(group) ?? -Infinity) + 60_000;
+    if (next > this.now()) { this.wakeAt = Math.min(this.wakeAt ?? Infinity, next); return; }
+    try { await this.request("mls.history.request", { group }); }
+    catch (error) {
+      if (!(error instanceof RequestError) || error.code !== "rate_limited") throw error;
+      this.lastRequest.set(group, this.now()); return;
+    }
+    this.lastRequest.set(group, this.now());
+    await this.engine.saveJobs([jobChange(job, true)]);
+  }
+  /** Lets this client create its own new channel's group right away. */
+  channelCreated(id: number): void {
+    this.channelDue.set(`channel:${id}`, { at: 0, delay: 5_000 }); this.schedule();
+  }
   private async join(group: string): Promise<void> {
     const info = await this.request("mls.group_info", { group });
     await this.engine.op<CommitOutbox>({ join_external: { server: this.server, bytes: bytes(info.group_info), now: this.now(), revocations: this.options.revocations() } }, out => {
       if (encoded(out.group) !== group) throw new Error("GroupInfo group mismatch");
-      return [];
+      return channelOf(this.summary(group)?.conversation ?? "") === undefined ? [] : [jobChange({ kind: "request", server: this.server, group })];
     });
   }
   private async syncGroup(group: string, pending = false, beforeWelcome = false): Promise<boolean | "pruned"> {
@@ -408,16 +520,18 @@ export class MlsRuntime {
         await this.engine.op({ commit: { ...this.args(group), adds: [], removes: [], now: this.now(), revocations: this.options.revocations() } });
         continue;
       }
-      if (await this.admitMissing(group)) continue;
+      if (local.conversation.startsWith("dm:") && await this.admitMissing(group)) continue;
       if (version !== (this.groupVersions.get(group) ?? 0)) continue;
       this.syncedVersions.set(group, version);
       return true;
     }
     throw new Error("MLS group is still securing; retrying");
   }
-  private async devices(conversation: string): Promise<MlsDevice[]> {
+  /** A direct message's participants' devices, or one uid's devices in a channel. */
+  private async devices(conversation: string, uid?: string): Promise<MlsDevice[]> {
+    const uids = conversation.startsWith("dm:") ? participants(conversation) : [uid!];
     const all: MlsDevice[] = []; let after: string | null = null;
-    do { const page: ResponseMap["mls.devices"] = await this.request("mls.devices", { uids: participants(conversation), after }); all.push(...page.devices); after = page.next; } while (after);
+    do { const page: ResponseMap["mls.devices"] = await this.request("mls.devices", { uids, after }); all.push(...page.devices); after = page.next; } while (after);
     return all;
   }
   private async currentDevices(devices: MlsDevice[]): Promise<MlsDevice[]> {
@@ -443,11 +557,14 @@ export class MlsRuntime {
     await this.engine.op({ commit: { ...this.args(group), adds, removes: [], now: this.now(), revocations: this.options.revocations() } });
     return true;
   }
-  private async queueHistory(group: string, recipient: string): Promise<void> {
+  private async queueHistory(group: string, recipient: string, assignment: string | null): Promise<void> {
     const local = this.summary(group);
     if (!local || !local.members.some(m => m.device_key === recipient) || recipient === this.options.identity.publicKey) return;
-    const job: HistoryJob = { kind: "history", server: this.server, group, recipient, publication: null, chunks: null };
-    if (!this.engine.jobs.has(jobKey(job))) await this.engine.saveJobs([jobChange(job)]);
+    const job: HistoryJob = { kind: "history", server: this.server, group, recipient, publication: null, chunks: null, assignment };
+    const queued = this.engine.jobs.get(jobKey(job)) as HistoryJob | undefined;
+    // A queued answer takes the newest assignment; its chunks stay as they are.
+    if (!queued) await this.engine.saveJobs([jobChange(job)]);
+    else if (assignment && queued.assignment !== assignment) await this.engine.saveJobs([jobChange({ ...queued, assignment })]);
   }
   private assertGroupSynced(group: string): void {
     if (this.syncedVersions.get(group) !== (this.groupVersions.get(group) ?? 0)) throw new GroupChanged();
@@ -463,18 +580,36 @@ export class MlsRuntime {
       }
       const gate = this.gate(job.group);
       if (gate.status !== "active" || gate.rejoin || gate.server_pending || gate.blocked.length || gate.pending_commit) continue;
-      const recipient = (await this.devices(local.conversation)).find(d => d.device_key === job.recipient);
-      if (!recipient) continue;
-      if (job.chunks === null || (job.publication && recipient.created_at > job.publication.created_at)) {
-        const publication = { device_key: recipient.device_key, hpke_key: recipient.hpke_key, created_at: recipient.created_at, signature: recipient.signature };
-        await this.engine.op<number[][]>({ share_history: { ...this.args(job.group), recipient: { device_key: recipient.device_key, hpke_key: recipient.hpke_key, created_at: recipient.created_at, signature: recipient.signature }, now: this.now(), revocations: this.options.revocations() } }, chunks => {
-          job = { ...job, publication, chunks: chunks.map(encoded) }; return [jobChange(job)];
-        });
+      const due = this.historyDue.get(jobKey(job));
+      if (due && due.at > this.now()) { this.wakeAt = Math.min(this.wakeAt ?? Infinity, due.at); continue; }
+      try {
+        const uid = local.members.find(m => m.device_key === job.recipient)!.uid;
+        const recipient = (await this.devices(local.conversation, uid)).find(d => d.device_key === job.recipient && d.uid === uid);
+        if (!recipient) continue;
+        if (job.chunks === null || (job.publication && recipient.created_at > job.publication.created_at)) {
+          const publication = { device_key: recipient.device_key, hpke_key: recipient.hpke_key, created_at: recipient.created_at, signature: recipient.signature };
+          await this.engine.op<number[][]>({ share_history: { ...this.args(job.group), recipient: publication, now: this.now(), revocations: this.options.revocations() } }, chunks => {
+            job = { ...job, publication, chunks: chunks.map(encoded) }; return [jobChange(job)];
+          });
+        }
+      } catch (error) {
+        // One recipient's bad publication or a failed lookup must not starve
+        // the other jobs: this one backs off (5 seconds doubling to 10 minutes).
+        if (!(error instanceof RequestError) && !(error instanceof AgentOperationError)) throw error;
+        await this.engine.reload(); this.options.onError?.(error);
+        const delay = Math.min(10 * 60_000, 2 * (due?.delay ?? 2_500));
+        this.historyDue.set(jobKey(job), { at: this.now() + delay, delay }); continue;
+      }
+      this.historyDue.delete(jobKey(job));
+      if (!job.chunks!.length && job.assignment) {
+        // Nothing this device may share: let the server ask another.
+        try { await this.request("mls.history.decline", { group: job.group, device: job.recipient, assignment: job.assignment }); }
+        catch (error) { if (!(error instanceof RequestError)) throw error; this.options.onError?.(error); }
       }
       for (const chunk of job.chunks!) {
         const current = this.gate(job.group);
         if (current.status !== "active" || current.rejoin || current.server_pending || current.blocked.length || current.pending_commit) continue jobs;
-        try { await this.request("mls.history.share", { group: job.group, recipient: job.recipient, chunk, assignment: null }, () => {
+        try { await this.request("mls.history.share", { group: job.group, recipient: job.recipient, chunk, assignment: job.assignment ?? null }, () => {
           this.assertGroupSynced(job.group);
           const gate = this.gate(job.group);
           if (gate.status !== "active" || gate.rejoin || gate.server_pending || gate.blocked.length || gate.pending_commit) throw new Error("history sharing blocked");
@@ -518,7 +653,9 @@ export class MlsRuntime {
       if (!epochs.size) { this.missing.delete(group); continue; }
       if (this.now() - (this.lastRequest.get(group) ?? -Infinity) < 60_000) continue;
       if (this.summary(group)?.record.status !== "active") continue;
-      await this.request("mls.history.request", { group }); this.lastRequest.set(group, this.now());
+      try { await this.request("mls.history.request", { group }); }
+      catch (error) { if (!(error instanceof RequestError) || error.code !== "rate_limited") throw error; }
+      this.lastRequest.set(group, this.now());
     }
   }
   async openConversation(conversation: string): Promise<void> {
@@ -531,22 +668,26 @@ export class MlsRuntime {
         await this.transition({ settle: { ...this.args(encoded(g.group)), winner: known ? bytes(known.group) : null } });
       }
       if (known) { await this.syncGroup(known.group, known.pending); this.updateStatuses(); return; }
-      const d = await descriptor(this.options.identity, this.uid, this.server, conversation, this.now());
-      const info = await this.engine.op<number[]>({ create: { descriptor: d.bytes } });
-      let winner: string;
-      try { winner = (await this.request("mls.group.create", { conversation, group_info: encoded(info) })).group; }
-      catch (error) {
-        if (!(error instanceof RequestError) || error.code !== "conflict") throw error;
-        // Conflict text is not a typed protocol field. Resolve through groups.
-        const found = (await this.groups()).find(g => g.conversation === conversation);
-        if (!found) throw error;
-        winner = found.group;
-      }
-      await this.transition({ settle: { ...this.args(d.group), winner: bytes(winner) } });
-      await this.syncGroup(winner);
+      await this.createGroup(conversation, true);
       await this.sendHistory();
       this.updateStatuses();
     }).catch(error => { this.markSecuring(); this.schedule(1000); throw error; });
+  }
+  /** Creates the conversation's group and settles with the server's first creation. */
+  private async createGroup(conversation: string, history: boolean): Promise<void> {
+    const d = await descriptor(this.options.identity, this.uid, this.server, conversation, this.now(), history);
+    const info = await this.engine.op<number[]>({ create: { descriptor: d.bytes } });
+    let winner: string;
+    try { winner = (await this.request("mls.group.create", { conversation, group_info: encoded(info) })).group; }
+    catch (error) {
+      if (!(error instanceof RequestError) || error.code !== "conflict") throw error;
+      // Conflict text is not a typed protocol field. Resolve through groups.
+      const found = (await this.groups()).find(g => g.conversation === conversation);
+      if (!found) throw error;
+      winner = found.group;
+    }
+    await this.transition({ settle: { ...this.args(d.group), winner: bytes(winner) } });
+    await this.syncGroup(winner);
   }
   /** Signing runs inside the queue, with the exact current group/epoch. The
    * builder may await WebCrypto; close waits for it and its write to finish. */

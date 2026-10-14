@@ -144,11 +144,43 @@ pub struct GroupRecord {
     pub checkpoint: Option<Checkpoint>,
     pub welcome_ids: BTreeSet<String>,
     pub server_pending: bool,
+    /// For every uid, the epochs in which it had a leaf, as this device saw
+    /// them: sorted, disjoint, non-adjacent inclusive ranges.
+    pub evidence: BTreeMap<String, Vec<Interval>>,
+    /// When this device's own last commit in the group was accepted; `None`
+    /// after a Welcome, whose leaf came from a key package.
+    pub own_commit_at: Option<i64>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Interval {
+    #[serde(with = "epoch_number")]
+    pub first: u64,
+    #[serde(with = "epoch_number")]
+    pub last: u64,
+}
+fn witness(intervals: &mut Vec<Interval>, epoch: u64) {
+    match intervals.last_mut() {
+        Some(i) if i.last >= epoch => {}
+        Some(i) if i.last + 1 == epoch => i.last = epoch,
+        _ => intervals.push(Interval { first: epoch, last: epoch }),
+    }
+}
+fn witnessed(intervals: &[Interval], epoch: u64) -> bool {
+    intervals.iter().any(|i| (i.first..=i.last).contains(&epoch))
+}
+fn valid_evidence(evidence: &BTreeMap<String, Vec<Interval>>) -> bool {
+    evidence.iter().all(|(uid, intervals)| {
+        crate::encoding::fixed::<20>(uid).is_some()
+            && !intervals.is_empty()
+            && intervals.iter().all(|i| i.first <= i.last)
+            && intervals.windows(2).all(|w| w[0].last.checked_add(1).is_some_and(|end| end < w[1].first))
+    })
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum EpochRecord {
-    Derived { key: [u8; 32], uids: BTreeSet<String> },
+    Derived { key: [u8; 32] },
     Imported { key: [u8; 32], sender_uids: BTreeSet<String> },
     Conflicted,
 }
@@ -170,6 +202,7 @@ pub struct Outbox {
     pub commit: Vec<u8>,
     pub welcome: Option<Vec<u8>>,
     pub group_info: Vec<u8>,
+    pub committed_at: i64,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -354,6 +387,9 @@ impl Agent {
             let descriptor = SignedDescriptor::parse(&record.descriptor).ok_or(Invalid("stored descriptor"))?;
             if *key != group_key(&descriptor.descriptor.server_key, &descriptor.group_id()) {
                 return Err(Invalid("group key"));
+            }
+            if !valid_evidence(&record.evidence) {
+                return Err(Invalid("stored evidence"));
             }
             if matches!(record.status, Status::Creating | Status::Active | Status::Joining) {
                 let group = agent.mls(key)?;
@@ -572,6 +608,8 @@ impl Agent {
             checkpoint: None,
             welcome_ids: BTreeSet::new(),
             server_pending: false,
+            evidence: BTreeMap::new(),
+            own_commit_at: None,
         });
         record.status = status;
         record.server_pending = false;
@@ -583,17 +621,15 @@ impl Agent {
         let exported = group
             .export_secret(self.provider.crypto(), "gwar chat v1", group.group_id().as_slice(), 32)
             .map_err(err("exporter"))?;
-        let uids = group
-            .public_group()
-            .treesync()
-            .full_leaves()
-            .map(|(_, l)| leaf_credential(l).expect("validated leaf").uid())
-            .collect();
+        let epoch = group.epoch().as_u64();
         self.epochs.insert(
-            epoch_key(key, group.epoch().as_u64()),
-            EpochRecord::Derived { key: exported.try_into().map_err(err("exporter length"))?, uids },
+            epoch_key(key, epoch),
+            EpochRecord::Derived { key: exported.try_into().map_err(err("exporter length"))? },
         );
         let record = self.groups.get_mut(key).ok_or(Invalid("group record"))?;
+        for (_, leaf) in group.public_group().treesync().full_leaves() {
+            witness(record.evidence.entry(leaf_credential(leaf).expect("validated leaf").uid()).or_default(), epoch);
+        }
         record.status = Status::Active;
         record.checkpoint = Some(checkpoint(context)?);
         record.server_pending = false;
@@ -661,6 +697,10 @@ impl Agent {
             let mut group = a.mls(&key)?;
             if winner == Some(id) {
                 a.derived(&key, &group)?;
+                let record = a.groups.get_mut(&key).ok_or(Invalid("record"))?;
+                let created_at =
+                    SignedDescriptor::parse(&record.descriptor).ok_or(Invalid("descriptor"))?.descriptor.created_at;
+                record.own_commit_at = Some(created_at);
                 return Ok(true);
             }
             // A creating group has no epoch keys, outbox or other members.
@@ -855,12 +895,12 @@ impl Agent {
                 &CommitSender::Member(group.own_leaf_index().u32()),
                 now,
             )?;
-            let out = a.bundle(id, group.epoch().as_u64(), bundle)?;
+            let out = a.bundle(id, group.epoch().as_u64(), bundle, now)?;
             a.outbox.insert(key, out.clone());
             Ok(out)
         })
     }
-    fn bundle(&self, id: &[u8; 32], epoch: u64, bundle: CommitMessageBundle) -> Result<Outbox> {
+    fn bundle(&self, id: &[u8; 32], epoch: u64, bundle: CommitMessageBundle, now: i64) -> Result<Outbox> {
         let (commit, welcome, info) = bundle.into_messages();
         let commit = wire(commit)?;
         Ok(Outbox {
@@ -870,6 +910,7 @@ impl Agent {
             commit,
             welcome: welcome.map(wire).transpose()?,
             group_info: wire(info.ok_or(Invalid("missing group info"))?)?,
+            committed_at: now,
         })
     }
     pub fn receive(&mut self, server: &str, id: &[u8; 32], commit: &[u8], proposals: &[Vec<u8>]) -> Result<()> {
@@ -931,6 +972,7 @@ impl Agent {
                         }
                         a.derived(&key, &group)?;
                         a.outbox.remove(&key);
+                        a.groups.get_mut(&key).ok_or(Invalid("record"))?.own_commit_at = Some(out.committed_at);
                         Ok(Resolution::Accepted)
                     } else if joining {
                         a.drop_mls(&key)?;
@@ -973,6 +1015,26 @@ impl Agent {
                 }
                 Reconcile::Rejected { .. } => Ok(Resolution::Retry),
             }
+        })
+    }
+    /// Deletes everything this device holds for a group whose conversation
+    /// no longer exists (a deleted channel): its MLS state with every epoch's
+    /// keys, its outbox, epoch keys, evidence and pin.
+    pub fn forget(&mut self, server: &str, id: &[u8; 32]) -> Result<()> {
+        self.operation(|a| {
+            let key = group_key(server, id);
+            if !a.groups.contains_key(&key) {
+                return Ok(());
+            }
+            let group_id = GroupId::from_slice(id);
+            if let Some(mut group) = MlsGroup::load(a.provider.storage(), &group_id).map_err(err("load group"))? {
+                group.delete(a.provider.storage()).map_err(err("delete group"))?;
+            }
+            a.provider.storage().purge_epoch_key_pairs(&group_id).map_err(err("delete keys"))?;
+            a.outbox.remove(&key);
+            a.epochs.retain(|k, _| !k.starts_with(&format!("{key}/")));
+            a.groups.remove(&key);
+            Ok(())
         })
     }
     fn drop_mls(&mut self, key: &str) -> Result<()> {
@@ -1052,7 +1114,7 @@ impl Agent {
             rules::tree(&descriptor, group.public_group().treesync().full_leaves().map(|(_, l)| l))?;
             a.record(&descriptor, Status::Joining);
             a.groups.get_mut(&key).ok_or(Invalid("record"))?.checkpoint = Some(old_checkpoint.clone());
-            let out = a.bundle(&id, old_checkpoint.epoch, bundle)?;
+            let out = a.bundle(&id, old_checkpoint.epoch, bundle, now)?;
             a.outbox.insert(key, out.clone());
             Ok(out)
         })
@@ -1084,7 +1146,9 @@ impl Agent {
                 .filter_map(|(_, l)| leaf_credential(l))
                 .find(|c| c.device_key() == recipient.device_key)
                 .ok_or(Invalid("recipient is not a member"))?;
-            let descriptor = SignedDescriptor::parse(&a.groups[&key].descriptor).ok_or(Invalid("descriptor"))?;
+            let record = &a.groups[&key];
+            let descriptor = SignedDescriptor::parse(&record.descriptor).ok_or(Invalid("descriptor"))?;
+            let evidence = record.evidence.get(&member.uid()).map(Vec::as_slice).unwrap_or_default();
             let prefix = format!("{key}/");
             let entries: Vec<(u64, [u8; 32])> = a
                 .epochs
@@ -1092,7 +1156,7 @@ impl Agent {
                 .filter_map(|(k, v)| {
                     let epoch = k.strip_prefix(&prefix)?.parse().ok()?;
                     if !descriptor.descriptor.history
-                        && !matches!(v,EpochRecord::Derived{uids,..} if uids.contains(&member.uid()))
+                        && !(matches!(v, EpochRecord::Derived { .. }) && witnessed(evidence, epoch))
                     {
                         return None;
                     }
@@ -1268,7 +1332,10 @@ impl Agent {
             rules::tree(&descriptor, group.public_group().treesync().full_leaves().map(|(_, l)| l))?;
             a.record(&descriptor, Status::Active);
             a.derived(&key, &group)?;
-            a.groups.get_mut(&key).ok_or(Invalid("record"))?.welcome_ids.insert(id.into());
+            let record = a.groups.get_mut(&key).ok_or(Invalid("record"))?;
+            record.welcome_ids.insert(id.into());
+            // The leaf came from a key package: no own commit made it, also on readmission.
+            record.own_commit_at = None;
             Ok(WelcomeResult { group: descriptor.group_id(), duplicate: false })
         })
     }
