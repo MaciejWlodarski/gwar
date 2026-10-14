@@ -20,11 +20,13 @@ export class DirectMessages {
   private pending = new Set<string>();
   private notified = new Set<string>();
   private loading = new Set<string>();
-  /** Opens queued or running per `conversation:id`; removals are only remembered for these. */
+  /** Rows of fetched pages and queued or running opens, per `conversation:id`;
+   * removals are only remembered for these. */
   private queued = new Map<string, number>();
   private removed = new Set<string>();
   private opening = new Set<string>();
-  private reading = new Set<string>();
+  /** Running unread recounts per peer; true when a removal asked for a fresh pass. */
+  private reading = new Map<string, boolean>();
   private unsubscribe: () => void;
   private stopped = false;
   private verifier = new MessageVerifier();
@@ -64,11 +66,16 @@ export class DirectMessages {
       check(); this.refresh();
       const page = await this.link.request("chat.sealed.history", { conversation, before: before ?? null, limit: 50 });
       check();
-      for (const row of page.sealed) {
-        check();
-        if (row.conversation !== conversation || (before !== undefined && row.id >= before)) throw new Error("Invalid conversation history cursor");
-        await this.receive(row, false, epoch);
-      }
+      // Held until processed: a removal arriving meanwhile must not be forgotten.
+      const held = page.sealed.map(row => `${row.conversation}:${row.id}`);
+      for (const k of held) this.hold(k);
+      try {
+        for (const row of page.sealed) {
+          check();
+          if (row.conversation !== conversation || (before !== undefined && row.id >= before)) throw new Error("Invalid conversation history cursor");
+          await this.receive(row, false, epoch);
+        }
+      } finally { for (const k of held) this.release(k); }
       check();
       // Byte-limited pages may be short; only an empty page proves the end.
       useSession.getState().dispatch({ type: "dmHistory", peer, hasMore: page.sealed.length > 0 });
@@ -78,13 +85,16 @@ export class DirectMessages {
    * ciphertext metadata in bounded pages, without opening or notifying. */
   async refreshUnread(conversation: string): Promise<void> {
     const peer = dmPeer(conversation, this.uid);
-    if (!peer || this.reading.has(peer)) return;
-    this.reading.add(peer);
+    if (!peer) return;
+    // A running pass may already have counted rows removed since: start it over.
+    if (this.reading.has(peer)) { this.reading.set(peer, true); return; }
+    this.reading.set(peer, false);
     const epoch = useSession.getState().epoch;
     try {
       let before: number | null = null, through = 0;
       const ids = new Set<number>();
       for (;;) {
+        if (this.reading.get(peer)) { this.reading.set(peer, false); before = null; through = 0; ids.clear(); }
         this.check(); if (epoch !== useSession.getState().epoch) return;
         const page: { sealed: SealedMessage[] } = await this.link.request("chat.sealed.history", { conversation, before, limit: 100 });
         this.check(); if (epoch !== useSession.getState().epoch) return;
@@ -95,6 +105,7 @@ export class DirectMessages {
         }
         const unread = [...ids].filter(id => id > mark).length;
         const oldest = page.sealed.length ? Math.min(...page.sealed.map(row => row.id)) : 0;
+        if (this.reading.get(peer)) continue;
         if (unread >= 100 || !oldest || oldest <= mark) {
           useSession.getState().dispatch({ type: "dmUnread", peer, count: Math.min(100, unread), through });
           return;
@@ -104,16 +115,30 @@ export class DirectMessages {
       }
     } finally { this.reading.delete(peer); }
   }
+  private hold(rowKey: string): void { this.queued.set(rowKey, (this.queued.get(rowKey) ?? 0) + 1); }
+  private release(rowKey: string): void {
+    const left = this.queued.get(rowKey)! - 1;
+    if (left) this.queued.set(rowKey, left);
+    else { this.queued.delete(rowKey); this.removed.delete(rowKey); }
+  }
+  /** Bound session metadata to retained rows and rows still being processed. */
+  private prune(): void {
+    const keys = new Set(Object.values(useSession.getState().threads).flatMap(t => t.items.map(i => i.key)));
+    for (const k of this.queued.keys()) keys.add(`e${k.slice(k.lastIndexOf(":") + 1)}`);
+    for (const k of this.pending) if (!keys.has(k)) this.pending.delete(k);
+    for (const k of this.notified) if (!keys.has(k)) this.notified.delete(k);
+  }
   receive(row: SealedMessage, live: boolean, epoch = useSession.getState().epoch): Promise<void> {
     const key = `e${row.id}`;
+    const token = `${epoch}:${JSON.stringify(row)}`;
+    const duplicate = this.opening.has(token);
+    if (!duplicate && this.opening.size >= 256) return Promise.reject(new Error("Conversation verification queue full"));
     // Recorded before deduplication: a history open of the same row must still notify.
     if (live && row.revision === 0) this.pending.add(key);
-    const token = `${epoch}:${JSON.stringify(row)}`;
-    if (this.opening.has(token)) return this.queue;
-    if (this.opening.size >= 256) return Promise.reject(new Error("Conversation verification queue full"));
+    if (duplicate) return this.queue;
     this.opening.add(token);
     const rowKey = `${row.conversation}:${row.id}`;
-    this.queued.set(rowKey, (this.queued.get(rowKey) ?? 0) + 1);
+    this.hold(rowKey);
     const wasRemoved = () => this.removed.has(rowKey);
     const run = this.queue.then(async () => {
       this.check(); if (epoch !== useSession.getState().epoch || wasRemoved()) return;
@@ -144,18 +169,8 @@ export class DirectMessages {
         item = { ...item, cannotOpen: result.reason, removed: row.deleted };
       }
       useSession.getState().dispatch({ type: "sealed", peer, item, live });
-      // Bound session metadata to retained rows.
-      const keys = new Set(Object.values(useSession.getState().threads).flatMap(t => t.items.map(i => i.key)));
-      for (const k of this.queued.keys()) keys.add(`e${k.slice(k.lastIndexOf(":") + 1)}`);
-      for (const k of this.pending) if (!keys.has(k)) this.pending.delete(k);
-      for (const k of this.notified) if (!keys.has(k)) this.notified.delete(k);
     });
-    const done = run.finally(() => {
-      this.opening.delete(token);
-      const left = this.queued.get(rowKey)! - 1;
-      if (left) this.queued.set(rowKey, left);
-      else { this.queued.delete(rowKey); this.removed.delete(rowKey); }
-    });
+    const done = run.finally(() => { this.opening.delete(token); this.release(rowKey); this.prune(); });
     this.queue = done.catch(() => {});
     return done;
   }

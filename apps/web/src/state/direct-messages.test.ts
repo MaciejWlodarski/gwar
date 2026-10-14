@@ -165,6 +165,41 @@ it("remembers removals only for rows still being opened", () => {
   dm.remove(conversation, Array.from({ length: 1000 }, (_, i) => i));
   expect((dm as unknown as { removed: Set<string> }).removed.size).toBe(0);
 });
+it("does not resurrect a history row removed while an earlier row opens", async () => {
+  const first = await row(), second = { ...first, id: 2, message_id: b64(16, 7) };
+  request.mockResolvedValue({ sealed: [first, second] });
+  let finish!: () => void;
+  const paused = new Promise<void>(resolve => { finish = resolve; });
+  let calls = 0;
+  runtime.openMessage = vi.fn(async () => { if (calls++ === 0) await paused; return { reason: "no_key" as const }; });
+  const opening = dm.open(b);
+  await vi.waitFor(() => expect(runtime.openMessage).toHaveBeenCalledTimes(1));
+  dm.remove(conversation, [2]); finish(); await opening;
+  expect(useSession.getState().threads[`dm:${b}`]?.items.map(i => i.key)).toEqual(["e1"]);
+});
+it("bounds notification intent to admitted rows and drops it once they are gone", async () => {
+  let finish!: () => void;
+  const paused = new Promise<void>(resolve => { finish = resolve; });
+  runtime.openMessage = vi.fn(async () => { await paused; return { reason: "no_key" as const }; });
+  const base = await row();
+  const rows = Array.from({ length: 300 }, (_, i) => ({ ...base, id: i + 1 }));
+  const results = rows.map(r => dm.receive(r, true).catch(() => "full"));
+  const pending = () => (dm as unknown as { pending: Set<string> }).pending;
+  expect(pending().size).toBe(256);
+  dm.remove(conversation, rows.map(r => r.id)); finish(); await Promise.all(results);
+  expect(pending().size).toBe(0);
+});
+it("starts a running unread recount over after a removal", async () => {
+  const sealed = await row();
+  useSession.getState().dispatch({ type: "dmStatus", peer: b, securing: false });
+  let finish!: (value: unknown) => void;
+  request.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; })).mockResolvedValueOnce({ sealed: [] });
+  const running = dm.refreshUnread(conversation);
+  void dm.refreshUnread(conversation);
+  finish({ sealed: [{ ...sealed, id: 5 }] });
+  await running;
+  expect(useSession.getState().threads[`dm:${b}`]?.unread ?? 0).toBe(0);
+});
 it("refreshes unread counts past byte-limited pages without notifications", async () => {
   const sealed = await row();
   useSession.getState().dispatch({ type: "dmStatus", peer: b, securing: false });
