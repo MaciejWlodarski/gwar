@@ -2,8 +2,9 @@
 //! `PublicGroup` (docs/e2e-build.md, "What the server uses").
 //!
 //! The observer holds no secret. It verifies each `PublicMessage` handshake,
-//! merges commits, and applies Gwar's structural rules; certificate currency
-//! (expiry, revocation) is left to clients.
+//! merges commits, and applies Gwar's structural rules, the same ones clients
+//! apply: leaves a commit introduces or changes are certified at the commit's
+//! time; expiry and revocation later on are handled by removal.
 
 use std::collections::BTreeSet;
 
@@ -305,10 +306,11 @@ impl Observer {
         {
             return Err(Invalid("update changes identity"));
         }
-        // Members update their leaf in the commit's path; proposals other than the
-        // server's removals are inline, and an Update proposal cannot be.
-        if staged.update_proposals().next().is_some() {
-            return Err(Invalid("update proposal"));
+        // Members update their leaf in the commit's path, so the only proposals
+        // are adds, removals and an external join's init.
+        let allowed = [ProposalType::Add, ProposalType::Remove, ProposalType::ExternalInit];
+        if staged.queued_proposals().any(|p| !allowed.contains(&p.proposal().proposal_type())) {
+            return Err(Invalid("proposal type"));
         }
         let removed: Vec<Leaf> =
             staged.remove_proposals().filter_map(|r| self.leaf(r.remove_proposal().removed())).collect();
@@ -326,6 +328,25 @@ impl Observer {
             ),
             CommitSender::Member(_) => None,
         };
+        // A joining device may only replace its own earlier leaf.
+        if let Some(joiner) = &external
+            && (removed.len() > 1
+                || removed.iter().any(|l| l.device_key != joiner.device_key() || l.uid != joiner.uid()))
+        {
+            return Err(Invalid("external removal"));
+        }
+        // Every leaf the commit introduces or changes is certified at its time;
+        // later expiry or revocation is handled by removal, not here.
+        let path = match sender {
+            CommitSender::Member(_) => staged.update_path_leaf_node().map(leaf_credential),
+            CommitSender::NewMember => None,
+        };
+        let mut introduced = added_devices.iter().chain(&external);
+        if path.as_ref().is_some_and(|c| !c.as_ref().is_some_and(|c| c.is_current(committed_at, &())))
+            || introduced.any(|c| !c.is_current(committed_at, &()))
+        {
+            return Err(Invalid("certificate at commit time"));
+        }
         self.group.merge_commit(&self.storage, *staged).map_err(invalid("merge"))?;
         self.check_tree()?;
 

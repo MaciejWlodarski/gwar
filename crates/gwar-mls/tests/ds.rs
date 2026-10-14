@@ -37,12 +37,18 @@ fn server_key() -> String {
     b64(server().0.verifying_key().as_bytes())
 }
 
+const DAY: i64 = 86_400_000;
+
 fn certified(account: u8, device: u8) -> Credential {
+    certified_until(account, device, NOW + 29 * DAY)
+}
+
+fn certified_until(account: u8, device: u8, expires_at: i64) -> Credential {
     let mut c = DeviceCertificate {
         account_key: b64(key(account).verifying_key().as_bytes()),
         device_key: b64(key(device).verifying_key().as_bytes()),
-        issued_at: 1_000,
-        expires_at: 1_000 + 30 * 86_400_000,
+        issued_at: expires_at - 30 * DAY,
+        expires_at,
         signature: String::new(),
     };
     c.signature = b64(&key(account).sign(vc_proto::device_statement(&c).as_bytes()).to_bytes());
@@ -380,4 +386,42 @@ fn commit_times_follow_the_server_clock_and_never_go_back() {
     let (_, accepted) = load().commit(&commit, &info, None, NOW + skew, NOW).unwrap();
     assert_eq!(accepted.committed_at, NOW);
     assert_eq!(ds::commit_time(b"gwar commit v1\n01"), None);
+}
+
+#[test]
+fn introduced_leaves_must_be_certified_at_the_commit_time() {
+    let (mut alice, observer) = dm();
+    let mut bob = Device::new(2, 21);
+    bob.credential = certified_until(2, 21, NOW);
+    let (commit, welcome, info) = alice.add(&[bob.key_package()]);
+    assert_eq!(
+        observer.commit(&commit, &info, Some(&welcome), NOW, 0).err(),
+        Some(DsError::Invalid("certificate at commit time"))
+    );
+}
+
+#[test]
+fn an_external_join_replaces_only_the_joiners_own_leaf() {
+    let (mut alice, observer) = dm();
+    let mut phone = Device::new(2, 22);
+    let (commit, info) = phone.join_external(&alice.group_info());
+    let (observer, _) = observer.commit(&commit, &info, None, NOW, 0).unwrap();
+    alice.process(&commit);
+    let saved = observer.save();
+
+    // The phone lost its state and joins again: its old leaf goes.
+    let mut again = Device::new(2, 22);
+    let (commit, info) = again.join_external(&alice.group_info());
+    let (observer, accepted) = observer.commit(&commit, &info, None, NOW, 0).unwrap();
+    assert_eq!(accepted.removed.len(), 1);
+    assert_eq!(accepted.removed[0].device_key, phone.credential.device_key());
+    assert_eq!(observer.leaves().len(), 2);
+
+    // Alice's account certifying the same device key cannot take Bob's leaf.
+    let mut impostor = Device::new(1, 22);
+    let (commit, info) = impostor.join_external(&alice.group_info());
+    assert_eq!(
+        Observer::load(&saved, &server_key()).unwrap().commit(&commit, &info, None, NOW, 0).err(),
+        Some(DsError::Invalid("external removal"))
+    );
 }
