@@ -39,6 +39,54 @@ async fn channel_permissions(query: &Query, cid: &str) -> Vec<(String, String)> 
     perms.iter().filter_map(|p| Some((p.get("permsid")?.to_owned(), p.get("permvalue")?.to_owned()))).collect()
 }
 
+async fn find_channel(query: &Query, name: &str) -> String {
+    within("mirrored channel", async {
+        loop {
+            let channels = query.call(Cmd::new("channellist")).await.unwrap();
+            let mirrored = channels.iter().find(|c| c.get("channel_name").is_some_and(|n| n == name));
+            if let Some(cid) = mirrored.and_then(|c| c.get("cid")) {
+                return cid.to_owned();
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+}
+
+async fn wait_for_permission(query: &Query, cid: &str, perm: (&str, &str)) -> Vec<(String, String)> {
+    within("the channel permission", async {
+        loop {
+            let perms = channel_permissions(query, cid).await;
+            if perms.contains(&(perm.0.into(), perm.1.into())) {
+                return perms;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+}
+
+/// A TeamSpeak client's `channeladdperm` of the channel's needed join power.
+async fn set_join_power(ts: &mut tsclientlib::Connection, cid: &str, power: &str) -> Result<(), tsclientlib::CommandError> {
+    let mut command = OutCommand::new(Direction::C2S, Flags::empty(), PacketType::Command, "channeladdperm");
+    command.write_arg("cid", &cid);
+    command.write_arg("permsid", &"i_channel_needed_join_power");
+    command.write_arg("permvalue", &power);
+    let handle = command.send_with_result(ts).unwrap();
+    within("channeladdperm answer", async {
+        let mut stream = ts.events();
+        while let Some(item) = stream.next().await {
+            if let StreamItem::MessageResult(h, result) = item.unwrap()
+                && h == handle
+            {
+                return result;
+            }
+        }
+        panic!("TeamSpeak connection closed");
+    })
+    .await
+}
+
 #[tokio::test]
 #[ignore]
 async fn teamspeak_server_admins_manage_permissions_of_mirrored_channels() {
@@ -70,28 +118,10 @@ async fn teamspeak_server_admins_manage_permissions_of_mirrored_channels() {
 
     let mut admin = admin(&server, "root").await;
     admin.create_channel(json!({"name": "Mirrored"})).await;
-    let cid = within("mirrored channel", async {
-        loop {
-            let channels = query.call(Cmd::new("channellist")).await.unwrap();
-            let mirrored = channels.iter().find(|c| c.get("channel_name").is_some_and(|n| n == "Mirrored"));
-            if let Some(cid) = mirrored.and_then(|c| c.get("cid")) {
-                return cid.to_owned();
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await;
+    admin.create_channel(json!({"name": "Sealed", "encrypted": true})).await;
+    let cid = find_channel(&query, "Mirrored").await;
     // The bridge sets the power right after creating the channel.
-    let perms = within("the Server Admin permission power", async {
-        loop {
-            let perms = channel_permissions(&query, &cid).await;
-            if perms.contains(&("i_channel_needed_permission_modify_power".into(), "75".into())) {
-                return perms;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await;
+    let perms = wait_for_permission(&query, &cid, ("i_channel_needed_permission_modify_power", "75")).await;
     // Deleting stays out of reach: the bridge would only bring the channel back.
     assert!(perms.contains(&("i_channel_needed_delete_power".into(), "100".into())), "{perms:?}");
 
@@ -111,24 +141,18 @@ async fn teamspeak_server_admins_manage_permissions_of_mirrored_channels() {
     let cldbid = me.get("client_database_id").unwrap().to_owned();
     query.call(Cmd::new("servergroupaddclient").arg("sgid", 6).arg("cldbid", &cldbid)).await.unwrap();
 
-    let mut command = OutCommand::new(Direction::C2S, Flags::empty(), PacketType::Command, "channeladdperm");
-    command.write_arg("cid", &cid);
-    command.write_arg("permsid", &"i_channel_needed_join_power");
-    command.write_arg("permvalue", &"10");
-    let handle = command.send_with_result(&mut ts).unwrap();
-    let result = within("channeladdperm answer", async {
-        let mut stream = ts.events();
-        while let Some(item) = stream.next().await {
-            if let StreamItem::MessageResult(h, result) = item.unwrap()
-                && h == handle
-            {
-                return result;
-            }
-        }
-        panic!("TeamSpeak connection closed");
-    })
-    .await;
+    let result = set_join_power(&mut ts, &cid, "10").await;
     assert!(result.is_ok(), "Server Admin was refused: {result:?}");
     let perms = channel_permissions(&query, &cid).await;
     assert!(perms.contains(&("i_channel_needed_join_power".into(), "10".into())), "{perms:?}");
+
+    // An encrypted channel is locked, and only ServerQuery could open it.
+    let sealed = find_channel(&query, "Sealed").await;
+    wait_for_permission(&query, &sealed, ("i_channel_needed_join_power", "1000000")).await;
+    let perms = wait_for_permission(&query, &sealed, ("i_channel_needed_permission_modify_power", "100")).await;
+    assert!(perms.contains(&("i_channel_needed_join_power".into(), "1000000".into())), "{perms:?}");
+    let result = set_join_power(&mut ts, &sealed, "10").await;
+    assert!(result.is_err(), "Server Admin lowered the lock");
+    let perms = channel_permissions(&query, &sealed).await;
+    assert!(perms.contains(&("i_channel_needed_join_power".into(), "1000000".into())), "{perms:?}");
 }
