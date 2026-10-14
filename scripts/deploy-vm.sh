@@ -80,10 +80,6 @@ ssh $SSH_OPTS -T "$HOST" MEDIA_BIND="$MEDIA_BIND" PUBLIC_IP="$PUBLIC_IP" EXTRA_A
 set -euo pipefail
 export PATH=$HOME/.cargo/bin:$PATH
 cd ~/vc/src
-if [[ "$PUBLISH_WEB" == 1 && -n "$WEB_DIR" ]]; then
-  rsync -a --delete apps/web/dist/ "$WEB_DIR/"
-  echo "web app published to $WEB_DIR"
-fi
 PACKAGES="-p vc-server"
 [[ "$CONNECT" == 1 ]] && PACKAGES="$PACKAGES -p gwar-connect"
 CARGO_TARGET_DIR=$HOME/vc/target nice cargo build --release $PACKAGES
@@ -164,6 +160,11 @@ Persistent=true
 WantedBy=timers.target
 UNIT
 
+# Only now: a web app published before a failed server build would face the old server.
+if [[ "$PUBLISH_WEB" == 1 && -n "$WEB_DIR" ]]; then
+  rsync -a --delete apps/web/dist/ "$WEB_DIR/"
+  echo "web app published to $WEB_DIR"
+fi
 systemctl --user daemon-reload
 systemctl --user enable --now gwar-backup.timer
 systemctl --user enable --now vc-server.service
