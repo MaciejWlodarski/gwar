@@ -28,6 +28,10 @@ pub enum DsError {
     /// Not for the observer's current epoch: someone else's commit came first.
     #[error("stale epoch")]
     Stale,
+    /// The commit's time is too far behind the server's clock: it can never
+    /// be accepted, so its sender builds a new one.
+    #[error("commit expired")]
+    Expired,
     #[error("invalid: {0}")]
     Invalid(&'static str),
 }
@@ -273,7 +277,10 @@ impl Observer {
         let crypto = RustCrypto::default();
         let processed = self.group.process_message(&crypto, message).map_err(invalid("commit"))?;
         let committed_at = commit_time(processed.aad()).ok_or(Invalid("commit time"))?;
-        if committed_at.abs_diff(now) > MAX_CLOCK_SKEW_MS || committed_at < previous {
+        if now.saturating_sub(committed_at) > MAX_CLOCK_SKEW_MS {
+            return Err(DsError::Expired);
+        }
+        if committed_at.saturating_sub(now) > MAX_CLOCK_SKEW_MS || committed_at < previous {
             return Err(Invalid("commit time"));
         }
         let sender = match processed.sender() {
@@ -439,7 +446,7 @@ impl Observer {
 }
 
 /// How far a commit's signed time may be from the server's clock.
-pub const MAX_CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
+pub const MAX_CLOCK_SKEW_MS: i64 = 5 * 60 * 1000;
 
 const COMMIT_TIME_HEADER: &str = "gwar commit v1\n";
 
