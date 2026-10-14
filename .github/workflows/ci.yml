@@ -56,6 +56,7 @@ jobs:
       - run: pnpm audit --prod
 
   web:
+    needs: mls-wasm
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -64,6 +65,10 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: mls-wasm
+          path: crates/gwar-mls-wasm/pkg/
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter web lint
       - run: pnpm --filter web test
@@ -72,6 +77,7 @@ jobs:
       - run: pnpm --filter web e2e:images
 
   desktop:
+    needs: mls-wasm
     strategy:
       matrix:
         os: [macos-14, windows-2022, ubuntu-24.04]
@@ -93,6 +99,10 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: mls-wasm
+          path: crates/gwar-mls-wasm/pkg/
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter web build
       - name: Build desktop
@@ -131,3 +141,10 @@ jobs:
           cargo build -p vc-server --no-default-features
           pnpm --filter web exec playwright install --with-deps chromium
           pnpm --filter web e2e:mls
+          pnpm --filter web e2e:dm
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: mls-wasm
+          path: crates/gwar-mls-wasm/pkg/
+          if-no-files-found: error
+          retention-days: 7

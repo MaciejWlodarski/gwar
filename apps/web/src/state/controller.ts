@@ -146,6 +146,10 @@ export function describeVoiceError(e: VoiceError): string {
   return tNow(`err.voice.${e.kind}` as Key);
 }
 
+class SessionMoved extends Error {
+  constructor() { super(tNow("close.replaced")); }
+}
+
 class Controller {
   private conn: Link | null = null;
   private runtime: MlsRuntime | null = null;
@@ -365,13 +369,23 @@ class Controller {
         const abort = new AbortController(); this.runtimeAbort = abort;
         const start = async () => {
           await messageStorage.loadRevocations();
-          const { MlsRuntime } = await import("../mls/runtime");
-          if (abort.signal.aborted || this.conn !== conn) throw new ConnectionLostError();
-          const runtime = await MlsRuntime.connect({ identity: conn.identity,
-            seed: identitySeed(conn.identity), link: conn,
-            revocations: messageStorage.currentRevocations, signal: abort.signal,
-            onError: error => console.warn("Conversation synchronization:", error),
-          });
+          let runtime: MlsRuntime;
+          try {
+            const { MlsRuntime, DeviceTakenOver } = await import("../mls/runtime");
+            if (abort.signal.aborted || this.conn !== conn) throw new ConnectionLostError();
+            runtime = await MlsRuntime.connect({ identity: conn.identity,
+              seed: identitySeed(conn.identity), link: conn,
+              revocations: messageStorage.currentRevocations, signal: abort.signal,
+              onError: error => console.warn("Conversation synchronization:", error),
+              onTakeover: () => void this.sessionMoved(conn),
+            }).catch((error: unknown) => { throw error instanceof DeviceTakenOver ? new SessionMoved() : error; });
+          } catch (error) {
+            // Voice and channels do not depend on MLS: if it cannot start before
+            // connecting, encrypted conversations stay "securing" for this session.
+            if (error instanceof SessionMoved || abort.signal.aborted || this.conn !== conn || conn.status.state !== "idle") throw error;
+            console.warn("Conversation encryption unavailable:", error);
+            await conn.connect(); return;
+          }
           if (abort.signal.aborted || this.conn !== conn) { await runtime.close(); throw new ConnectionLostError(); }
           const uid = (await this.uidOn(conn))!;
           if (abort.signal.aborted || this.conn !== conn) { await runtime.close(); throw new ConnectionLostError(); }
@@ -393,6 +407,7 @@ class Controller {
       this.runtimeAbort?.abort(); this.runtimeAbort = null;
       this.conn = null;
       session.dispatch({ type: "reset" });
+      if (e instanceof SessionMoved) { session.setClose({ kind: "server", reason: { kind: "replaced" } }); throw e; }
       const err = e instanceof ConnectError ? e : new ConnectError("unreachable", String(e));
       throw new ConnectFailure(err.kind, err.message, err.serverName, err.ban, err.identityChange);
     }
@@ -567,6 +582,13 @@ class Controller {
           break;
       }
     });
+  }
+
+  /** Another tab of this device took the session over, as a newer window would on the server. */
+  private async sessionMoved(conn: Link): Promise<void> {
+    if (this.conn !== conn) return;
+    await this.disconnect(true);
+    useSession.getState().setClose({ kind: "server", reason: { kind: "replaced" } });
   }
 
   async disconnect(silent = false): Promise<void> {

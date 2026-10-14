@@ -54,6 +54,12 @@ if [[ "${1:-}" == "--web" ]]; then
     exit 1
   fi
   commit=$(git rev-parse HEAD)
+  # The app embeds the MLS wasm of this commit. Use the tools CI pins: wasm-bindgen-cli 0.2.129
+  # and binaryen 123.0.0 (WASM_BINDGEN / WASM_OPT, or on PATH).
+  if ! scripts/mls-wasm/build.sh; then
+    echo "refusing to publish the web app: the MLS wasm did not build (see scripts/mls-wasm/build.sh)" >&2
+    exit 1
+  fi
   # shellcheck disable=SC2046
   env $(env | grep -o '^VITE_[A-Za-z0-9_]*' | sed 's/^/-u /') pnpm --filter web build
   if [[ "$(git rev-parse HEAD)" != "$commit" ]] || ! web_tree_clean; then

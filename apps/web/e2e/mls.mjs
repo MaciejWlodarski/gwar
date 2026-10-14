@@ -96,6 +96,17 @@ try {
   assert.equal((await waiting.evaluate(m => window.mls.runtime.openMessage(m), message)).ok?.text, "encrypted hello");
   pages.push(waiting);
   console.log("PASS second tab waits for the device lock, then reloads durable state");
+  // With takeover enabled, as in the app, the newest tab wins instead of waiting.
+  await waiting.evaluate(() => window.mls.runtime.close());
+  const older = await context.newPage(), newer = await context.newPage();
+  for (const page of [older, newer]) {
+    await page.goto(`${web}/e2e/mls.html`);
+    await page.evaluate(async ws => { const { connect } = await import("/e2e/mls-fixture.ts"); window.mls = await connect(21, 2, ws, { takeover: true }); }, ws);
+  }
+  assert.equal(await older.evaluate(() => window.mls.takenOver()), true);
+  assert.equal((await newer.evaluate(m => window.mls.runtime.openMessage(m), message)).ok?.text, "encrypted hello");
+  pages.push(older, newer);
+  console.log("PASS a newer tab of the same device takes the session over");
   await Promise.all(pages.map(page => page.evaluate(() => window.mls.runtime.close())));
   console.log("PASS device restart reloads durable MLS state");
 
