@@ -223,7 +223,9 @@ credential, the OpenMLS provider and Gwar's own per-group records.
   left if another commit wins first.
 - **Sending gate**: whether the group is blocked is computed again before
   every send and history share, at the current time and with the current
-  revocation view, not only after merges.
+  revocation view, not only after merges. A group with an outstanding server
+  proposal (`mls.proposal`, `pending`) is blocked too, until a commit
+  includes it.
 - **Freshness**: per group the highest epoch seen and the SHA-256 of its
   GroupContext (public; it commits to the tree and the transcript). A
   GroupInfo behind that epoch, or with another GroupContext for the same
@@ -296,8 +298,10 @@ credential, the OpenMLS provider and Gwar's own per-group records.
   says `history = 1`, every epoch key it holds; for a returning member, only
   epochs whose evidence lists that uid; in a group with `history = 0`, only
   the latter. A uid is **returning** if the evidence of any epoch the sender
-  derived lists it, or if the log entry of the commit that admitted it says
-  so (`returning`, from the server's record of every uid that ever had a
+  derived **before** the admitting commit lists it, or if that commit's
+  `returning` (in the log entry and the `mls.commit` event) says so; the
+  sender records the classification in the share's outbox entry when it
+  processes the commit (`returning`, from the server's record of every uid that ever had a
   leaf in the group, which survives any client's state loss). Evidence exists
   only for derived epochs, so imported epochs go only to newcomers.
 
@@ -330,8 +334,9 @@ credential, the OpenMLS provider and Gwar's own per-group records.
     commit again if still needed;
   - no entry at that epoch yet (the log's head is still that epoch): nothing
     won, so send the same bytes again. Only when the server answers
-    `expired` (the commit's time is more than five minutes behind its clock,
-    which only grows, so no earlier copy can be accepted any more) is the
+    `expired` (the commit's time is more than five minutes behind its commit
+    clock, which never goes back, so no earlier copy can be accepted any
+    more) is the
     pending commit discarded and a new one built (fresh time, current
     rules);
   - the log no longer reaches that epoch (its oldest retained epoch is
@@ -377,8 +382,11 @@ v3.
 Every commit carries its time in the `PublicMessage` authenticated data,
 signed with the commit by its sender: `gwar commit v1\n{committed_at}` (Unix
 ms). The server rejects a commit whose time is more than five minutes behind
-its own clock with `expired`, and one more than five minutes ahead of it, or
-earlier than the previous commit's time of that group, with `bad_request`. The
+its commit clock with `expired`, and one more than five minutes ahead of it, or
+earlier than the previous commit's time of that group, with `bad_request`.
+The commit clock is the larger of the system clock and the highest value it
+returned before, which is persisted (table `meta`) before any `expired`
+reply, so a system clock set back never revives an expired commit. The
 time of epoch 0 is the descriptor's `created_at`. Clients use a commit's time
 only to check the certificates of the leaves it introduces or changes (see
 "Acceptance"); they never compare it with their own clock, so devices with
@@ -403,7 +411,8 @@ All binary fields are base64url.
 `limit` of them and at most 1 MiB, with `next` set when more follow: pass it
 as `after` to continue. The order is by conversation for `mls.groups`, by
 `(uid, device_key)` for `mls.devices` and `mls.key_packages.claim`, by id for
-Welcomes and history chunks. `mls.log` pages by epoch instead: `since` is
+Welcomes and history chunks, by `(group, device)` for
+`mls.history.wanted`. `mls.log` pages by epoch instead: `since` is
 inclusive and `next` is the epoch to pass as `since` to continue.
 `mls.devices` and `mls.key_packages.claim` take at most 20 uids; a claim
 consumes only the packages it returns.
@@ -422,11 +431,12 @@ consumes only the packages it returns.
 | `mls.welcomes {}` | `{welcomes: [{id, group, welcome}]}` | for the session's device; repeatable |
 | `mls.welcomes.ack {ids}` | `{}` | after the client stored the joined group durably; deletes them. The client stores the Welcome's id with the joined group in one write, and acknowledges a Welcome whose id it already has without processing it again (its key package is used up) |
 | `mls.history.share {group, recipient, chunk}` | `{}` | below |
-| `mls.history.fetch {group?}` | `{chunks: [{id, group, sender_uid, chunk}], wanted: [{group, device}]}` | chunks for the session's device, repeatable; `wanted` the outstanding requests (below) of groups the device is a member of |
+| `mls.history.fetch {group?}` | `{chunks: [{id, group, sender_uid, chunk}]}` | chunks for the session's device; repeatable |
+| `mls.history.wanted {}` | `{wanted: [{group, device}]}` | the outstanding requests (below) in groups the session's device is a member of |
 | `mls.history.ack {ids}` | `{}` | after durable import; deletes them |
 | `mls.history.request {group}` | `{}` | stores an outstanding request of the session's device for the group and announces it to the group's online member devices (event `mls.history.wanted {group, device}`); at most once a minute per device and group. A request ends when a chunk for that device and group is stored after it, or after 30 days |
 
-Events: `mls.commit {group, epoch, proposals, commit}`, `mls.proposal {group,
+Events: `mls.commit {group, epoch, proposals, commit, returning}`, `mls.proposal {group,
 epoch, proposal}`, `mls.welcome {group}`, `mls.history {group}`,
 `mls.history.wanted {group, device}`; `mls.welcome` and `mls.history` only
 announce that something can be fetched.
@@ -453,10 +463,14 @@ The server proposes `Remove` (signed by its key, via
 `Observer::propose_remove`) for every leaf of a device that: was revoked
 (Connect feed), belongs to a member who was removed from the server or banned,
 or (direct messages) does not belong to a participant. A proposal is stored
-(`mls_proposals`) before it is sent as `mls.proposal` to sessions that may
-read the conversation, and stays outstanding until a commit advances the
-epoch; the transaction that stores that commit issues and stores new
-proposals for every such leaf still in the tree. Reconnecting devices find
+in `mls_proposals` together with the observer state that holds it (one
+transaction, so a later commit can reference it) before it is sent as
+`mls.proposal` to sessions that may read the conversation, and stays
+outstanding until a commit advances the epoch; the transaction that stores
+that commit issues and stores new proposals for every such leaf still in the
+tree. The server also reconciles every group at startup and after each
+revocation, member removal or ban (including from the CLI while it was
+stopped), proposing what is missing. Reconnecting devices find
 outstanding proposals through `pending` in `mls.groups` and `mls.log`. Any
 member commits them; the server only checks that a commit is valid and in
 order. A proposal a commit references is stored with that commit's log
@@ -464,6 +478,7 @@ entry.
 
 ### Who may do what
 
+- A **member** here is a server member who is not banned.
 - Direct message `dm:{a}:{b}`: a session of `a` or `b` that is a member of
   the server may read the conversation and maintain its group (GroupInfo,
   log, commits including external joins, Welcomes, history, sealed history,
@@ -518,8 +533,10 @@ messages: like signed messages, their author is inside the signature.
 - Direct messages between two Gwar members are always end-to-end encrypted.
   Direct messages with TeamSpeak users stay plaintext, live-only and labeled
   "Not end-to-end encrypted", as today. The server rejects a plaintext
-  `chat.send` to a client that is not a TeamSpeak user, and clients drop a
-  plaintext direct message from one.
+  direct message unless its sender or its recipient is a TeamSpeak user
+  (messages from TeamSpeak arrive through the bridge), and clients drop a
+  plaintext direct message unless one of its two participants is a
+  TeamSpeak user.
 - Opening a conversation: `mls.groups` already lists it, or the client creates
   it: a descriptor (kind `dm`, incarnation 0, history 1), a group with its own
   leaf, registered with `mls.group.create`; then
@@ -536,8 +553,8 @@ messages: like signed messages, their author is inside the signature.
   it. The server keeps chunks from at most three sender uids per (group,
   recipient) and drops further senders. A device missing epoch keys after
   importing what it received calls `mls.history.request`; member devices
-  answer `mls.history.wanted`, live or from `wanted` in `mls.history.fetch`
-  after connecting, by sharing again (by their own evidence, see "History
+  answer the `mls.history.wanted` event, live, or the `mls.history.wanted`
+  request after connecting, by sharing again (by their own evidence, see "History
   bundles"); a request ends when any share for that device is stored, and the
   device asks again if keys are still missing. Until keys arrive, a message the device cannot open
   says "Earlier messages will appear when another member is online."
@@ -546,16 +563,19 @@ messages: like signed messages, their author is inside the signature.
 
 | Request | Reply | Rule |
 | --- | --- | --- |
-| `chat.sealed.send {conversation, group, epoch, message_id, ciphertext}` | `SealedMessage` | the session may write the conversation; `group` is its live group and `epoch` its current epoch, else `stale`; `message_id` unique in it; ciphertext at most 24 KiB |
-| `chat.sealed.edit {conversation, group, epoch, message_id, revision, ciphertext}` | `SealedMessage` | only the author's uid; `group` live and `epoch` current, else `stale`; `revision` above the stored one |
-| `chat.delete_own {conversation, group, epoch, message_id, revision, ciphertext}` | `SealedMessage` | the signed deletion revision, with the same `stale` rule; stored with `deleted`, no further edits |
-
-On `stale` the client catches up (`mls.log`), checks that the group is not
-blocked, and encrypts the same message again with the new epoch's key and the
-same `message_id` and revision. A write is never accepted under an epoch a
-removed device still knows.
+| `chat.sealed.send {conversation, group, epoch, message_id, ciphertext}` | `SealedMessage` | the session may write the conversation; `group` is its live group and `epoch` its current epoch, else `stale`; no outstanding server proposal, else `pending`; `message_id` unique in it; ciphertext at most 24 KiB |
+| `chat.sealed.edit {conversation, group, epoch, message_id, revision, ciphertext}` | `SealedMessage` | only the author's uid; the same `stale` and `pending` rules; `revision` above the stored one |
+| `chat.delete_own {conversation, group, epoch, message_id, revision, ciphertext}` | `SealedMessage` | the signed deletion revision, with the same rules; stored with `deleted`, no further edits |
 | `chat.sealed.history {conversation, before?, limit?}` | `{messages}` | as channel history |
 | `chat.read {conversation, message}` | `{}` | read marks per conversation |
+
+Sealed writes are also refused with `pending` while the group has an
+outstanding server proposal (see "Removal proposals"). On `stale` or
+`pending` the client catches up (`mls.log`), commits outstanding proposals
+if needed, checks that the group is not blocked, then signs the message again
+with the new `group` and `epoch` (same `message_id`, revision and predecessor
+hash) and encrypts it with the new epoch's key. A write is never accepted
+under an epoch a removed device still knows.
 
 `SealedMessage {id, conversation, group, epoch, author_uid, author_name,
 message_id, revision, ciphertext, sent_at, edited_at?, deleted}`; event
