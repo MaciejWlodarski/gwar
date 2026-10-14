@@ -96,7 +96,7 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
     welcomes: [] as { id: string; group: string; welcome: string }[],
     chunks: [] as { id: string; group: string; sender_uid: string; chunk: string }[],
     wanted: [] as { group: string; device: string; assignment?: string }[], nothingToShare: false,
-    commitError: null as RequestError | null, shareError: false, ackError: false,
+    commitError: null as RequestError | null, requestError: null as RequestError | null, shareError: false, ackError: false,
     beforeLog: null as null | (() => Promise<void>),
     packages: 5, devices: [] as { uid: string; device_key: string; hpke_key: string; created_at: number; signature: string }[],
   };
@@ -124,7 +124,7 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
         case "mls.history.fetch": return { chunks: world.chunks, next: null };
         case "mls.history.ack": expect((await durable()).imports).toBeGreaterThan(0); world.chunks = world.chunks.filter(c => !(data.ids as string[]).includes(c.id)); return {};
         case "mls.history.wanted": return { wanted: world.wanted, next: null };
-        case "mls.history.request": return {};
+        case "mls.history.request": if (world.requestError) throw world.requestError; return {};
         case "mls.group.create": world.groups = [{ conversation, group, epoch: 0, pending: false }]; return { group };
         case "mls.history.decline": return {};
         case "mls.history.share": expect((await storage.load()).outbox.length).toBeGreaterThan(0); if (world.shareError) throw new Error("lost share response"); return {};
@@ -307,16 +307,22 @@ describe("MLS synchronization", () => {
   });
   it("atomically replaces history for a newer verified HPKE publication and keeps retries stable", async () => {
     const local = summary(); local.members.push({ device_key: peer, uid: b64(5,20) });
-    const f = await fixture({ ...clean(), groups: [local] });
+    let now = 1_000_000;
+    const f = await fixture({ ...clean(), groups: [local] }, true, { now: () => now });
     const recipient = { uid: b64(5,20), device_key: peer, hpke_key: b64(6), created_at: 1, signature: b64(7,64) };
     f.world.devices = [recipient]; f.world.wanted = [{ group, device: peer }]; f.world.shareError = true;
     const jobs = async () => (await f.storage.load()).outbox.map(c => JSON.parse(dec.decode(new Uint8Array(c.value!))));
     await expect(f.runtime.sync()).rejects.toThrow("lost share response");
     const original = await jobs();
     f.world.devices = [{ ...recipient, created_at: 2, hpke_key: b64(8), signature: "invalid" }];
-    await expect(f.runtime.sync()).rejects.toThrow("invalid HPKE signature");
+    // A bad publication backs this job off without failing the pass.
+    await f.runtime.sync();
+    expect(String(f.errors.at(-1))).toContain("invalid HPKE signature");
     expect(await jobs()).toEqual(original);
     f.world.devices[0]!.signature = b64(8,64);
+    await f.runtime.sync();
+    expect(f.calls.filter(c => c.op === "mls.history.share")).toHaveLength(1);
+    now += 5_000;
     const write = f.storage.write.bind(f.storage);
     const spy = vi.spyOn(f.storage, "write").mockImplementation(async changes => {
       if (changes.outbox.some(c => c.value && dec.decode(new Uint8Array(c.value)).includes('"created_at":2'))) throw new Error("replacement write aborted");
@@ -400,6 +406,25 @@ describe("Channel groups", () => {
     await f.runtime.sync();
     expect(f.calls.filter(c => c.op === "mls.history.request")).toHaveLength(1);
   });
+  it("keeps the history request intent durably until a request succeeds", async () => {
+    asChannel();
+    let now = 1_000_000;
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
+    const f = await fixture(clean(), true, { channels: [channel()], now: () => now });
+    const intents = async () => (await f.storage.load()).outbox.map(c => dec.decode(new Uint8Array(c.key))).filter(k => k.startsWith("@runtime/request/"));
+    f.world.groups = [{ conversation, group, epoch: 0, pending: false }];
+    f.world.requestError = new RequestError("rate_limited", "rate_limited");
+    await f.runtime.sync(); random.mockRestore();
+    expect(f.calls.filter(c => c.op === "mls.history.request")).toHaveLength(1);
+    expect(await intents()).toHaveLength(1);
+    // Asked again only after the server's one-minute limit.
+    f.world.requestError = null;
+    now += 59_999; await f.runtime.sync();
+    expect(f.calls.filter(c => c.op === "mls.history.request")).toHaveLength(1);
+    now += 1; await f.runtime.sync();
+    expect(f.calls.filter(c => c.op === "mls.history.request")).toHaveLength(2);
+    expect(await intents()).toEqual([]);
+  });
   it("ignores plaintext channels", async () => {
     asChannel();
     const f = await fixture(clean(), true, { channels: [{ ...channel(), encrypted: false }] });
@@ -437,6 +462,20 @@ describe("Channel groups", () => {
     await f.runtime.sync();
     expect(f.operations.find(o => o.op === "forget")).toMatchObject({ group: Array(32).fill(2) });
     expect((await f.durable()).groups).toEqual([]);
+  });
+  it("forgets a deleted channel's history jobs with its group", async () => {
+    asChannel();
+    const local = summary(); local.members.push({ device_key: peer, uid: b64(5,20) });
+    const f = await fixture({ ...clean(), groups: [local] }, true, { channels: [channel()] });
+    const jobs = async () => (await f.storage.load()).outbox.map(c => dec.decode(new Uint8Array(c.key))).filter(k => k.startsWith("@runtime/history/"));
+    f.world.devices = [{ uid: b64(5,20), device_key: peer, hpke_key: b64(6), created_at: 1, signature: b64(7,64) }];
+    f.world.wanted = [{ group, device: peer, assignment: b64(1,16) }]; f.world.shareError = true;
+    await expect(f.runtime.sync()).rejects.toThrow("lost share response");
+    expect(await jobs()).toHaveLength(1);
+    f.world.wanted = [];
+    f.event({ ev: "channel.deleted", d: { channel: 1 } } as Event);
+    await f.runtime.sync();
+    expect(await jobs()).toEqual([]);
   });
   it("answers an assignment with its chunks, or declines it with nothing to share", async () => {
     asChannel();

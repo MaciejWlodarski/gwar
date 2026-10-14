@@ -22,6 +22,9 @@ export default defineConfig(({ command, mode }) => ({
     },
   },
   build: { target: "es2022", sourcemap: true },
+  // The browser e2e fixtures are imported at run time: scanning them up front
+  // keeps Vite from reloading the pages when it finds their dependencies.
+  optimizeDeps: { entries: ["index.html", "e2e/*.html", "e2e/*-fixture.{ts,tsx}"] },
   test: {
     environment: "node",
     include: ["src/**/*.test.{ts,tsx}"],

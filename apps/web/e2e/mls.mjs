@@ -88,8 +88,8 @@ try {
     return channel;
   }, token);
   const sealedChannel = `channel:${channel.id}`;
-  const until = async (what, check) => {
-    for (const started = Date.now(); Date.now() - started < 30_000;) {
+  const until = async (what, check, timeout = 30_000) => {
+    for (const started = Date.now(); Date.now() - started < timeout;) {
       if (await check()) return;
       for (const page of pages) await page.evaluate(() => window.mls.runtime.sync().catch(() => {}));
       await new Promise(resolve => setTimeout(resolve, 250));
@@ -100,7 +100,9 @@ try {
   await until("the creator's channel group", () => pages[0].evaluate(c => window.mls.runtime.status(c) === "ready", sealedChannel));
   const channelMessage = await pages[0].evaluate(c => window.mls.seal(c), sealedChannel);
   await until("the other member joins", () => pages[3].evaluate(c => window.mls.runtime.status(c) === "ready", sealedChannel));
-  await until("the earlier key arrives", async () => (await pages[3].evaluate(m => window.mls.runtime.openMessage(m), channelMessage)).ok?.text === "encrypted hello");
+  // The first device the server asks may lack the earlier epoch (it joined
+  // after the message); the next request is allowed a minute later.
+  await until("the earlier key arrives", async () => (await pages[3].evaluate(m => window.mls.runtime.openMessage(m), channelMessage)).ok?.text === "encrypted hello", 90_000);
   console.log("PASS a member joins an encrypted channel's group and receives its earlier key");
   // Deleting the channel deletes its group on every device.
   await pages[0].evaluate(id => window.mls.link.request("channel.delete", { channel: id }), channel.id);
@@ -139,6 +141,10 @@ try {
   await Promise.all(pages.map(page => page.evaluate(() => window.mls.runtime.close())));
   console.log("PASS device restart reloads durable MLS state");
 
+} catch (error) {
+  // The local services' output explains most failures (in CI there is nothing else to look at).
+  for (const child of children) console.error(`--- ${child.spawnargs.join(" ")}\n${child.output}`);
+  throw error;
 } finally {
   await browser?.close();
   await stopProcesses(children);

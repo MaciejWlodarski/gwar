@@ -12,7 +12,7 @@ import { channelOf, credential, descriptor, participants } from "./descriptor";
 import { AgentOperationError, Engine, acquireDeviceLock, jobChange, jobKey } from "./engine";
 import { openStorage, type Persistence } from "./storage";
 import { loadAgent } from "./wasm";
-import type { AgentFactory, Change, CommitOutbox, ConversationStatus, Gate, GroupSummary, HistoryJob, OpenResult, PackageJob, Plaintext, Resolution, Revocation, SealedFields } from "./types";
+import type { AgentFactory, Change, CommitOutbox, ConversationStatus, Gate, GroupSummary, HistoryJob, OpenResult, PackageJob, Plaintext, RequestJob, Resolution, Revocation, SealedFields } from "./types";
 const bytes = (value: string): number[] => [...decodeBase64Url(value)];
 const encoded = (value: number[]): string => encodeBase64Url(new Uint8Array(value));
 /** The DS protocol currently uses safe JSON integers; core epochs remain u64 strings. */
@@ -75,8 +75,8 @@ export class MlsRuntime {
   private channels: Map<number, boolean> | undefined;
   /** When a channel group may next be created or joined, per conversation. */
   private readonly channelDue = new Map<string, Backoff>();
-  /** Groups joined by external commit that still owe `mls.history.request`. */
-  private readonly joined = new Set<string>();
+  /** When a history job whose preparation failed may be tried again, per job key. */
+  private readonly historyDue = new Map<string, { at: number; delay: number }>();
   private nextJoin = 0;
   private wakeAt: number | undefined;
   private readonly now: () => number;
@@ -353,8 +353,13 @@ export class MlsRuntime {
     for (const g of this.inventory()) {
       const id = channelOf(g.conversation);
       if (id === undefined || channels.has(id)) continue;
-      await this.engine.op({ forget: this.args(encoded(g.group)) });
-      this.missing.delete(encoded(g.group));
+      const group = encoded(g.group);
+      // The group's runtime jobs go with it, in the same write.
+      const jobs = [...this.engine.jobs.values()].filter(job => job.kind !== "packages" && job.server === this.server && job.group === group);
+      await this.engine.op({ forget: this.args(group) }, () => jobs.map(job => jobChange(job, true)));
+      for (const job of jobs) this.historyDue.delete(jobKey(job));
+      this.missing.delete(group); this.statuses.delete(g.conversation);
+      this.syncedVersions.delete(group); this.groupVersions.delete(group);
     }
     let leafUpdated = false;
     for (const [id, history] of channels) {
@@ -384,7 +389,7 @@ export class MlsRuntime {
           await this.syncGroup(remote.group, remote.pending);
         }
         this.channelDue.delete(conversation);
-        if (remote && this.joined.has(remote.group)) await this.requestHistory(remote.group);
+        if (remote) await this.requestHistory(remote.group);
       } catch (error) {
         this.assertCurrent(this.activeGeneration);
         // Durable state is authoritative: drop whatever the failure left in memory.
@@ -401,11 +406,21 @@ export class MlsRuntime {
       && !gate.rejoin && !gate.server_pending && !gate.blocked.length && !gate.pending_commit
       && this.syncedVersions.has(remote.group) && this.syncedVersions.get(remote.group) === (this.groupVersions.get(remote.group) ?? 0);
   }
-  /** After joining, ask the server to route history to this device; senders decide by their evidence. */
+  /** After joining, ask the server to route history to this device; senders
+   * decide by their evidence. The intent is durable (written with the join)
+   * and is kept until a request succeeds. */
   private async requestHistory(group: string): Promise<void> {
+    const job: RequestJob = { kind: "request", server: this.server, group };
+    if (!this.engine.jobs.has(jobKey(job)) || this.summary(group)?.record.status !== "active") return;
+    const next = (this.lastRequest.get(group) ?? -Infinity) + 60_000;
+    if (next > this.now()) { this.wakeAt = Math.min(this.wakeAt ?? Infinity, next); return; }
     try { await this.request("mls.history.request", { group }); }
-    catch (error) { if (!(error instanceof RequestError) || error.code !== "rate_limited") throw error; }
-    this.joined.delete(group); this.lastRequest.set(group, this.now());
+    catch (error) {
+      if (!(error instanceof RequestError) || error.code !== "rate_limited") throw error;
+      this.lastRequest.set(group, this.now()); return;
+    }
+    this.lastRequest.set(group, this.now());
+    await this.engine.saveJobs([jobChange(job, true)]);
   }
   /** Lets this client create its own new channel's group right away. */
   channelCreated(id: number): void {
@@ -415,9 +430,8 @@ export class MlsRuntime {
     const info = await this.request("mls.group_info", { group });
     await this.engine.op<CommitOutbox>({ join_external: { server: this.server, bytes: bytes(info.group_info), now: this.now(), revocations: this.options.revocations() } }, out => {
       if (encoded(out.group) !== group) throw new Error("GroupInfo group mismatch");
-      return [];
+      return channelOf(this.summary(group)?.conversation ?? "") === undefined ? [] : [jobChange({ kind: "request", server: this.server, group })];
     });
-    if (channelOf(this.summary(group)?.conversation ?? "") !== undefined) this.joined.add(group);
   }
   private async syncGroup(group: string, pending = false, beforeWelcome = false): Promise<boolean | "pruned"> {
     // Concurrent joins can lose. Bounded retries yield to backoff instead of
@@ -566,15 +580,27 @@ export class MlsRuntime {
       }
       const gate = this.gate(job.group);
       if (gate.status !== "active" || gate.rejoin || gate.server_pending || gate.blocked.length || gate.pending_commit) continue;
-      const uid = local.members.find(m => m.device_key === job.recipient)!.uid;
-      const recipient = (await this.devices(local.conversation, uid)).find(d => d.device_key === job.recipient && d.uid === uid);
-      if (!recipient) continue;
-      if (job.chunks === null || (job.publication && recipient.created_at > job.publication.created_at)) {
-        const publication = { device_key: recipient.device_key, hpke_key: recipient.hpke_key, created_at: recipient.created_at, signature: recipient.signature };
-        await this.engine.op<number[][]>({ share_history: { ...this.args(job.group), recipient: { device_key: recipient.device_key, hpke_key: recipient.hpke_key, created_at: recipient.created_at, signature: recipient.signature }, now: this.now(), revocations: this.options.revocations() } }, chunks => {
-          job = { ...job, publication, chunks: chunks.map(encoded) }; return [jobChange(job)];
-        });
+      const due = this.historyDue.get(jobKey(job));
+      if (due && due.at > this.now()) { this.wakeAt = Math.min(this.wakeAt ?? Infinity, due.at); continue; }
+      try {
+        const uid = local.members.find(m => m.device_key === job.recipient)!.uid;
+        const recipient = (await this.devices(local.conversation, uid)).find(d => d.device_key === job.recipient && d.uid === uid);
+        if (!recipient) continue;
+        if (job.chunks === null || (job.publication && recipient.created_at > job.publication.created_at)) {
+          const publication = { device_key: recipient.device_key, hpke_key: recipient.hpke_key, created_at: recipient.created_at, signature: recipient.signature };
+          await this.engine.op<number[][]>({ share_history: { ...this.args(job.group), recipient: publication, now: this.now(), revocations: this.options.revocations() } }, chunks => {
+            job = { ...job, publication, chunks: chunks.map(encoded) }; return [jobChange(job)];
+          });
+        }
+      } catch (error) {
+        // One recipient's bad publication or a failed lookup must not starve
+        // the other jobs: this one backs off (5 seconds doubling to 10 minutes).
+        if (!(error instanceof RequestError) && !(error instanceof AgentOperationError)) throw error;
+        await this.engine.reload(); this.options.onError?.(error);
+        const delay = Math.min(10 * 60_000, 2 * (due?.delay ?? 2_500));
+        this.historyDue.set(jobKey(job), { at: this.now() + delay, delay }); continue;
       }
+      this.historyDue.delete(jobKey(job));
       if (!job.chunks!.length && job.assignment) {
         // Nothing this device may share: let the server ask another.
         try { await this.request("mls.history.decline", { group: job.group, device: job.recipient, assignment: job.assignment }); }
@@ -627,7 +653,9 @@ export class MlsRuntime {
       if (!epochs.size) { this.missing.delete(group); continue; }
       if (this.now() - (this.lastRequest.get(group) ?? -Infinity) < 60_000) continue;
       if (this.summary(group)?.record.status !== "active") continue;
-      await this.request("mls.history.request", { group }); this.lastRequest.set(group, this.now());
+      try { await this.request("mls.history.request", { group }); }
+      catch (error) { if (!(error instanceof RequestError) || error.code !== "rate_limited") throw error; }
+      this.lastRequest.set(group, this.now());
     }
   }
   async openConversation(conversation: string): Promise<void> {

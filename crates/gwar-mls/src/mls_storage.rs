@@ -837,3 +837,28 @@ impl From<serde_json::Error> for StorageError {
         Self::SerializationError
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openmls::prelude::{GroupEpoch, GroupId};
+
+    #[test]
+    fn purging_a_groups_epoch_key_pairs_keeps_other_groups() {
+        let storage = Storage::default();
+        let (target, other) = (GroupId::from_slice(&[1; 32]), GroupId::from_slice(&[2; 32]));
+        for (group, epoch) in [(&target, 3), (&target, 4), (&other, 3)] {
+            let key = epoch_key_pairs_id(group, &GroupEpoch::from(epoch), 0).unwrap();
+            storage.write::<CURRENT_VERSION>(EPOCH_KEY_PAIRS_LABEL, &key, vec![epoch as u8]).unwrap();
+        }
+        storage.purge_epoch_key_pairs(&target).unwrap();
+        let left: Vec<_> = storage.values.read().unwrap().keys().cloned().collect();
+        assert_eq!(
+            left,
+            vec![build_key_from_vec::<CURRENT_VERSION>(
+                EPOCH_KEY_PAIRS_LABEL,
+                epoch_key_pairs_id(&other, &GroupEpoch::from(3), 0).unwrap()
+            )]
+        );
+    }
+}

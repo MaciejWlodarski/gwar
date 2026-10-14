@@ -51,4 +51,6 @@ export interface HpkePublication { device_key: string; hpke_key: string; created
 /** `assignment` answers the server's routing in channel groups (none in direct messages). */
 export interface HistoryJob { publication: HpkePublication | null; kind: "history"; server: string; group: string; recipient: string; chunks: string[] | null; assignment?: string | null }
 export interface PackageJob { kind: "packages"; server: string; packages: string[]; last_resort: string; expires_at: number }
-export type Job = HistoryJob | PackageJob;
+/** A channel group joined by external commit still owes `mls.history.request`. */
+export interface RequestJob { kind: "request"; server: string; group: string }
+export type Job = HistoryJob | PackageJob | RequestJob;

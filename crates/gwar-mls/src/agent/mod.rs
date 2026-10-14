@@ -1332,7 +1332,10 @@ impl Agent {
             rules::tree(&descriptor, group.public_group().treesync().full_leaves().map(|(_, l)| l))?;
             a.record(&descriptor, Status::Active);
             a.derived(&key, &group)?;
-            a.groups.get_mut(&key).ok_or(Invalid("record"))?.welcome_ids.insert(id.into());
+            let record = a.groups.get_mut(&key).ok_or(Invalid("record"))?;
+            record.welcome_ids.insert(id.into());
+            // The leaf came from a key package: no own commit made it, also on readmission.
+            record.own_commit_at = None;
             Ok(WelcomeResult { group: descriptor.group_id(), duplicate: false })
         })
     }

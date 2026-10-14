@@ -1,7 +1,8 @@
 import { emptyChanges, type AgentFactory, type Change, type Changes, type Job, type WasmAgent } from "./types";
 import type { Persistence } from "./storage";
 const enc = new TextEncoder(), dec = new TextDecoder("utf-8", { fatal: true });
-export const jobKey = (job: Job): string => job.kind === "packages" ? `@runtime/packages/${job.server}` : `@runtime/history/${job.server}/${job.group}/${job.recipient}`;
+export const jobKey = (job: Job): string => job.kind === "packages" ? `@runtime/packages/${job.server}`
+  : job.kind === "request" ? `@runtime/request/${job.server}/${job.group}` : `@runtime/history/${job.server}/${job.group}/${job.recipient}`;
 export const jobChange = (job: Job, remove = false): Change => ({ key: [...enc.encode(jobKey(job))], value: remove ? null : [...enc.encode(JSON.stringify(job))] });
 export class AgentOperationError extends Error {
   constructor(cause: unknown) { super(String(cause), { cause }); this.name = "AgentOperationError"; }
@@ -21,7 +22,7 @@ export class Engine {
       const key = dec.decode(new Uint8Array(record.key));
       if (!key.startsWith("@runtime/")) return true;
       const job = JSON.parse(dec.decode(new Uint8Array(record.value!))) as Job;
-      if ((job.kind !== "history" && job.kind !== "packages") || jobKey(job) !== key) throw new Error("invalid MLS runtime outbox");
+      if (!["history", "packages", "request"].includes(job.kind) || jobKey(job) !== key) throw new Error("invalid MLS runtime outbox");
       this.jobs.set(key, job);
       return false;
     });

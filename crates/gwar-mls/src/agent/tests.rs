@@ -1416,22 +1416,89 @@ fn own_commit_time_follows_accepted_own_commits_only() {
     assert_eq!(own(&c, &f.id), None);
 }
 #[test]
+fn welcome_readmission_clears_own_commit_time() {
+    let own = |a: &Agent, id| a.group(&server(), id).unwrap().own_commit_at;
+    // Removed, then readmitted by an ordinary Welcome.
+    let mut f = joined();
+    assert_eq!(own(&f.b, &f.id), Some(f.t));
+    let packages = f.b.key_packages(1, f.t).unwrap();
+    f.b.take_changes();
+    let removal = f.a.commit(&server(), &f.id, &[], &[1], f.t, &()).unwrap();
+    f.a.take_changes();
+    acknowledge(&mut f.a, &f.id, &removal);
+    f.b.receive(&server(), &f.id, &removal.commit, &[]).unwrap();
+    f.b.take_changes();
+    let add = f.a.commit(&server(), &f.id, &packages, &[], f.t, &()).unwrap();
+    f.a.take_changes();
+    acknowledge(&mut f.a, &f.id, &add);
+    assert!(!f.b.welcome(&server(), "back", add.welcome.as_ref().unwrap()).unwrap().duplicate);
+    f.b.take_changes();
+    let b = Agent::load([21; 32], f.b.credential.clone(), f.b.durable.clone()).unwrap();
+    assert_eq!(own(&b, &f.id), None);
+    // Readmitted while the device missed the removal.
+    let (mut f, welcome) = offline_readmission();
+    assert_eq!(own(&f.b, &f.id), Some(f.t));
+    f.b.replace_stale_welcome(&server(), &f.id, "readmission", &welcome).unwrap();
+    f.b.take_changes();
+    let b = Agent::load([21; 32], f.b.credential.clone(), f.b.durable.clone()).unwrap();
+    assert_eq!(own(&b, &f.id), None);
+}
+#[test]
 fn forgetting_a_group_leaves_nothing_of_it() {
     let mut f = joined();
+    let target = f.a.durable.openmls.clone();
+    // Another group of the same device and its key packages must survive.
+    let d = descriptor(&f.a, &f.b, f.t, false, true);
+    let other = d.group_id();
+    f.a.create(d).unwrap();
+    f.a.take_changes();
+    assert!(f.a.settle(&server(), &other, Some(&other)).unwrap());
+    f.a.take_changes();
+    f.a.key_packages(2, f.t).unwrap();
+    f.a.take_changes();
+    let unrelated: Store =
+        f.a.durable
+            .openmls
+            .iter()
+            .filter(|(k, _)| !target.contains_key(*k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+    let other_key = group_key(&server(), &other);
+    let kept = |stores: &Stores| {
+        (
+            stores.groups.keys().filter(|k| k.starts_with(other_key.as_bytes())).count(),
+            stores.epochs.keys().filter(|k| k.starts_with(other_key.as_bytes())).count(),
+        )
+    };
+    let other_records = kept(&f.a.durable);
+    // The target holds a stored proposal and an unacknowledged own commit in the outbox.
+    let proposal = f.observer.propose_remove(&Ed25519Signer(key(200)), 1).unwrap();
+    f.a.proposal(&server(), &f.id, &proposal).unwrap();
+    f.a.take_changes();
     let out = f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
     f.a.take_changes();
-    acknowledge(&mut f.a, &f.id, &out);
+    assert!(f.a.outbox(&server(), &f.id).is_some());
+    let mut stores = f.a.durable.clone();
     f.a.forget(&server(), &f.id).unwrap();
-    f.a.take_changes();
-    assert!(f.a.group(&server(), &f.id).is_none());
-    let stores = f.a.durable.clone();
-    let contains = |haystack: &[u8]| haystack.windows(32).any(|w| w == f.id);
-    assert!(!stores.openmls.keys().any(|k| contains(k)), "no OpenMLS record of the group");
-    assert!(stores.epochs.is_empty() && stores.outbox.is_empty());
-    assert_eq!(stores.groups.len(), 1, "only the device record");
+    f.a.take_changes().apply(&mut stores);
+    assert_eq!(stores, f.a.durable);
+    let a = Agent::load([11; 32], f.a.credential.clone(), stores.clone()).unwrap();
+    assert!(a.group(&server(), &f.id).is_none() && a.outbox(&server(), &f.id).is_none());
+    assert_eq!(stores.openmls, unrelated, "only the other group's and the device's OpenMLS records");
+    let target_key = group_key(&server(), &f.id);
+    assert!(
+        !stores
+            .groups
+            .keys()
+            .chain(stores.epochs.keys())
+            .chain(stores.outbox.keys())
+            .any(|k| k.starts_with(target_key.as_bytes()))
+    );
+    assert_eq!(kept(&stores), other_records);
+    assert!(a.sending_key(&server(), &other, f.t, &()).is_ok());
     // Forgetting is idempotent and the device can join again later.
     f.a.forget(&server(), &f.id).unwrap();
-    f.a.take_changes();
+    assert!(f.a.take_changes().is_empty());
     let again = f.a.join_external(&server(), &out.group_info, f.t, &()).unwrap();
     assert_eq!(again.group, f.id);
 }

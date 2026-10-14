@@ -54,16 +54,20 @@ without being asked (docs/e2e-build.md "Groups", "History in channels"):
   that created the channel calls;
 - the device joins every other channel's group by external commit, one at a
   time with up to two seconds of jitter between joins, and then calls
-  `mls.history.request`; it never shares on its own after an admission, but
+  `mls.history.request`: the intent is written with the join and kept until a
+  request succeeds (a `rate_limited` one is retried after a minute); it never
+  shares on its own after an admission, but
   answers the server's assignments (`mls.history.wanted` with `assignment`)
   with chunks that carry the assignment, or `mls.history.decline` when it has
   nothing the recipient may receive;
 - a failing channel backs off (5 seconds doubling up to 10 minutes) without
-  holding up direct messages;
+  holding up direct messages, and so does a history job whose recipient
+  lookup or chunks fail, without holding up the other jobs;
 - it commits an update of its own leaf in a channel group whose last own
   commit is older than seven days, one group per pass;
 - the group of a deleted channel is forgotten: the agent deletes its OpenMLS
-  state, every epoch's keys, outbox, evidence and pin.
+  state, every epoch's keys, outbox, evidence and pin, and the runtime's jobs
+  for it go in the same write.
 
 `sync()` is also public for explicit retries and deterministic tests. Connect
 performs the first synchronization, reconnect Welcomes and MLS events schedule
