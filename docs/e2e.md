@@ -382,7 +382,9 @@ changes with every update and whose old private halves OpenMLS deletes). The
 sender's device key signs the whole bundle: server key, group id, recipient
 device key and HPKE key, the HPKE encapsulation and the ciphertext. The newcomer accepts
 it only from a device that is a member of the group in its current epoch.
-Any member device that is online sends one.
+In a direct message any member device that is online sends one; in channels
+and server chat, which can have many devices online, the server asks a few
+member devices at a time and moves on to others until the keys arrive.
 The server keeps bundles from up to three different uids and drops the rest.
 The newcomer merges what they cover, asks again for epochs still missing,
 and on a conflict keeps the key it derived itself, or else drops that epoch.
@@ -619,7 +621,9 @@ Local identities have one device and no archive.
 
 - On a server with TeamSpeak compatibility, new channels default to
   plaintext, server-wide chat (bridged to TeamSpeak server chat) is
-  plaintext, and the default channel is always plaintext.
+  plaintext when the server is set up with it (a server set up without
+  TeamSpeak keeps its encrypted server chat, unbridged), and the default
+  channel is always plaintext.
 - An encrypted channel still appears on TeamSpeak, so the channel tree stays
   the same, but TeamSpeak users cannot join it (join power above any
   TeamSpeak group); its description says it is end-to-end encrypted and
