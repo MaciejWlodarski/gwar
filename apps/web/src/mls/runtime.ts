@@ -474,7 +474,7 @@ export class MlsRuntime {
       for (const chunk of job.chunks!) {
         const current = this.gate(job.group);
         if (current.status !== "active" || current.rejoin || current.server_pending || current.blocked.length || current.pending_commit) continue jobs;
-        try { await this.request("mls.history.share", { group: job.group, recipient: job.recipient, chunk }, () => {
+        try { await this.request("mls.history.share", { group: job.group, recipient: job.recipient, chunk, assignment: null }, () => {
           this.assertGroupSynced(job.group);
           const gate = this.gate(job.group);
           if (gate.status !== "active" || gate.rejoin || gate.server_pending || gate.blocked.length || gate.pending_commit) throw new Error("history sharing blocked");

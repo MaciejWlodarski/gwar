@@ -5,4 +5,8 @@ export type ServerInfo = { name: string, welcome: string, version: string, defau
 /**
  * Largest accepted upload in bytes (0: uploads disabled).
  */
-upload_limit: number, file_access: FileAccess, };
+upload_limit: number, file_access: FileAccess, 
+/**
+ * TeamSpeak compatibility is on (new channels default to plaintext).
+ */
+teamspeak: boolean, };
