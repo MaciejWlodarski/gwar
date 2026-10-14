@@ -132,22 +132,39 @@ compare it with the server key they pinned for the endpoint.
 
 ### What the server uses (`gwar_mls::ds`)
 
-Parsing and validation of public data only; no group state:
+The server follows every group as an OpenMLS **`PublicGroup`**: an observer
+that holds the public ratchet tree and GroupContext, verifies every
+`PublicMessage` handshake (signatures, tree, proposals) and merges commits,
+without any secret. Its state per group is the observer's storage, saved as
+one blob. `ds` wraps this with Gwar's rules:
 
 - `key_package(bytes) -> KeyPackageInfo`: verifies the key package (signature,
   lifetime, suite, capabilities include `0xff00`), parses its credential
   (well-formed), returns device key, uid, `KeyPackageRef`, `not_after`, and
   whether it is a last-resort package.
-- `group_info(bytes) -> GroupInfoInfo`: group id, epoch, the parsed descriptor,
-  the external senders, and every leaf of the ratchet tree (index, device key,
-  uid). Verifies the GroupInfo signature against the signer's leaf in the
-  enclosed tree.
-- `handshake(bytes) -> Handshake`: a `PublicMessage` commit or proposal; its
-  group id, epoch, content type and sender (`Member(index)`,
-  `NewMemberCommit`, `External(index)`).
-- `welcome_recipients(bytes) -> Vec<KeyPackageRef>`.
-- `remove_proposal(server_signer, group_id, epoch, leaf) -> bytes`: an
-  external `Remove` proposal signed by the server key.
+- `Observer::create(group_info) -> Observer`: from a GroupInfo with the ratchet
+  tree extension (`PublicGroup::from_external`, which verifies the tree and
+  the GroupInfo signature); checks the descriptor extension parses
+  (`SignedDescriptor::parse`), `group_id` is its hash, the external senders
+  hold exactly the server key, and every leaf credential is well-formed.
+- `Observer::commit(commit, group_info) -> Accepted`: processes a commit at the
+  observer's epoch, checks Gwar's structural rules on the resulting tree
+  (well-formed credentials, one leaf per device key, an update keeps uid and
+  device key, the descriptor and external senders unchanged, the membership
+  rule of the kind), merges it, and checks that the uploaded GroupInfo has
+  the new epoch, the observer's new GroupContext and a valid signature.
+  Returns the sender (`Member(index)` or `NewMember`), the leaves added and
+  removed (index, device key, uid), and Welcome recipients are checked
+  against the added leaves' `KeyPackageRef`s.
+- `Observer::propose_remove(server_signer, leaf) -> bytes`: an external
+  `Remove` proposal signed by the server key, also stored in the observer so
+  that a commit may include it by reference. Commits may reference only the
+  server's own proposals of that epoch; all other proposals are inline.
+- `Observer::leaves()`: index, device key and uid of every member.
+
+Certificate currency (expiry, revocation) is the clients' job; the server
+checks only that credentials are well-formed, plus the rules under "Who may do
+what".
 
 ### The client agent (`gwar_mls::Agent`)
 
@@ -293,23 +310,18 @@ announce that `mls.welcomes` or `mls.history.fetch` has something.
 
 ### Commit ordering
 
-The core actor handles `mls.commit` atomically: `ds::handshake` must be a
-commit of `group` at exactly the stored epoch, else `stale`. A
-`NewMemberCommit` (external join) is allowed only for a session whose uid may
-read the conversation, and its new leaf must be that session's device.
-`ds::group_info` of the new GroupInfo must have epoch `+1`, the same group
-and descriptor. The commit, GroupInfo, Welcome recipients and the new leaf
-map are stored in one transaction; then `mls.commit` goes to every session
-that may read the conversation, and each Welcome to its recipients.
-
-The server never processes a commit: it cannot tell whether the GroupInfo
-matches it. A member could upload a GroupInfo that does not match its
-commit; newcomers would then fail to join, which only denies service and is
-seen by every member.
+The core actor handles `mls.commit` atomically. The commit must be for
+`group` at exactly the stored epoch, else `stale`; then
+`Observer::commit` must accept it, else `bad_request`. An external join
+(`NewMember`) is allowed only for a session whose uid may read the
+conversation, and its new leaf must be that session's device. The commit, the
+new GroupInfo, the observer state, the leaf map and the Welcome are stored in
+one transaction; then `mls.commit` goes to every session that may read the
+conversation, and the Welcome to its recipients.
 
 ### Removal proposals
 
-The server proposes `Remove` (signed by its key, via `ds::remove_proposal`)
+The server proposes `Remove` (signed by its key, via `Observer::propose_remove`)
 for every leaf of a device that: was revoked (Connect feed), belongs to a
 member who was removed from the server or banned, or (direct messages) does
 not belong to a participant. Proposals are re-issued for the new epoch after
@@ -329,7 +341,7 @@ server only checks that a commit is well-formed and in order.
 New tables (migration in `store.rs`): `mls_devices(device_key, uid,
 hpke_key, created_at, signature)`, `mls_key_packages(ref, device_key, uid,
 package, last_resort, not_after)`, `mls_groups(group_id, conversation,
-incarnation, epoch, group_info, created_at)`, `mls_log(group_id, epoch,
+incarnation, epoch, group_info, observer, created_at)`, `mls_log(group_id, epoch,
 commit, created_at)`, `mls_leaves(group_id, leaf, device_key, uid)`,
 `mls_welcomes(device_key, group_id, welcome, created_at)`,
 `mls_history(group_id, recipient_device, sender_uid, bundle, created_at)`.
