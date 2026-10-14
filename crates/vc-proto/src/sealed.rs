@@ -13,6 +13,9 @@ wire! {
         DeleteOwn { conversation: String, group: String, #[cfg_attr(feature = "ts", ts(type = "number"))] epoch: u64, message_id: String, revision: u32, ciphertext: String },
         #[serde(rename = "chat.sealed.history")]
         History { conversation: String, #[serde(default)] before: Option<MessageId>, #[serde(default)] limit: Option<u32> },
+        /// A moderator's unsigned removal of a channel or server chat message.
+        #[serde(rename = "chat.sealed.remove")]
+        Remove { conversation: String, id: MessageId },
     }
 
     /// Exactly one read target, shared by requests and events.

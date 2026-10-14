@@ -3,8 +3,9 @@ import type { MlsDevice } from "./MlsDevice";
 import type { MlsGroup } from "./MlsGroup";
 import type { MlsHistoryChunk } from "./MlsHistoryChunk";
 import type { MlsHistoryWanted } from "./MlsHistoryWanted";
+import type { MlsIncarnation } from "./MlsIncarnation";
 import type { MlsLogEntry } from "./MlsLogEntry";
 import type { MlsPackage } from "./MlsPackage";
 import type { MlsWelcome } from "./MlsWelcome";
 
-export type MlsResponse = { count: number, } | { group: string, } | { group_info: string, epoch: number, } | { epoch: number, } | { packages: Array<MlsPackage>, next: string | null, } | { devices: Array<MlsDevice>, next: string | null, } | { head: number, oldest: number, entries: Array<MlsLogEntry>, pending: Array<string>, next: number | null, } | { groups: Array<MlsGroup>, next: string | null, } | { welcomes: Array<MlsWelcome>, next: string | null, } | { chunks: Array<MlsHistoryChunk>, next: string | null, } | { wanted: Array<MlsHistoryWanted>, next: string | null, };
+export type MlsResponse = { count: number, } | { group: string, } | { group_info: string, epoch: number, } | { epoch: number, } | { packages: Array<MlsPackage>, next: string | null, } | { devices: Array<MlsDevice>, next: string | null, } | { head: number, oldest: number, entries: Array<MlsLogEntry>, pending: Array<string>, next: number | null, } | { groups: Array<MlsGroup>, next: string | null, } | { welcomes: Array<MlsWelcome>, next: string | null, } | { chunks: Array<MlsHistoryChunk>, next: string | null, } | { wanted: Array<MlsHistoryWanted>, next: string | null, } | { incarnations: Array<MlsIncarnation>, next: string | null, };

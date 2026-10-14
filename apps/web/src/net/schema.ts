@@ -57,7 +57,7 @@ const path = (put = false): Rule<string> => (v): v is string => {
   if (!str(2048)(v)) return false;
   try { filePath(v, put ? "PUT" : "GET"); return true; } catch { return false; }
 };
-const server = shape<ServerInfo>({ name: str(256), welcome: text, version: str(64), default_channel: id, max_clients: int(65535), upload_limit: int(Number.MAX_SAFE_INTEGER), file_access: literal<FileAccess>(["link", "members"]) });
+const server = shape<ServerInfo>({ name: str(256), welcome: text, version: str(64), default_channel: id, max_clients: int(65535), upload_limit: int(Number.MAX_SAFE_INTEGER), file_access: literal<FileAccess>(["link", "members"]), teamspeak: bool });
 /** A download bearer token: empty, or URL-safe characters only, so it is always a valid header value. */
 const bearer: Rule<string> = (v): v is string => str(128)(v) && /^[A-Za-z0-9_-]*$/.test(v);
 const fixed = (bytes: number): Rule<string> => (v): v is string => {
@@ -66,7 +66,7 @@ const fixed = (bytes: number): Rule<string> => (v): v is string => {
 };
 const challenge = shape<Challenge>({ protocol: int(255), server_pk: fixed(32), server_nonce: fixed(32), server, password_required: bool });
 const serverProof = shape<ServerProof>({ server_proof: fixed(64) });
-const channel = shape<Channel>({ id, parent: nullable(id), name: str(256), topic: text, position: int(2147483647, -2147483648), has_password: bool, max_clients: nullable(int(65535)) });
+const channel = shape<Channel>({ id, parent: nullable(id), name: str(256), topic: text, position: int(2147483647, -2147483648), has_password: bool, max_clients: nullable(int(65535)), encrypted: bool, history: bool });
 const client = shape<Client>({ id, uid, nickname: str(256), channel: nullable(id), groups: ids, platform, muted: bool, deafened: bool, away: nullable(text), talking: bool, voice: bool });
 const color: Rule<string> = (v): v is string => typeof v === "string" && /^#[0-9a-f]{6}$/i.test(v);
 const group = shape<Group>({ id, name: str(256), permissions: array(permissions, 32), color: optional(nullable(color)) });
@@ -104,7 +104,7 @@ const mlsBlob = str(175000);
 const mlsChunk = str(65536);
 const mlsGroupId = fixed(32);
 const mlsProposals = array(mlsBlob, 1024);
-const mlsWanted = shape({ group: mlsGroupId, device: fixed(32) });
+const mlsWanted = shape({ group: mlsGroupId, device: fixed(32), assignment: optional(fixed(16)) });
 const mlsLogEntry = shape({ epoch: id, proposals: mlsProposals, commit: mlsBlob });
 const cursor = nullable(str(1024));
 
@@ -135,12 +135,13 @@ export const responses: { [K in Op]: Rule<ResponseMap[K]> } = {
   "mls.welcomes.ack": empty, "mls.history.share": empty,
   "mls.history.fetch": shape({ chunks: array(shape({ id: fixed(16), group: mlsGroupId, sender_uid: fixed(20), chunk: mlsChunk }), 100), next: cursor }),
   "mls.history.wanted": shape({ wanted: array(mlsWanted, 100), next: cursor }),
-  "mls.history.ack": empty, "mls.history.request": empty,
+  "mls.history.ack": empty, "mls.history.request": empty, "mls.history.decline": empty,
+  "mls.group_history": shape({ incarnations: array(shape({ group: mlsGroupId, descriptor: str(16384) }), 100), next: cursor }),
 
   hello: serverProof, join: welcome, ping: empty, "client.update": empty, "client.move": empty, "client.kick": empty,
   "channel.join": empty, "channel.leave": empty, "channel.create": channel, "channel.update": channel, "channel.delete": empty,
   "chat.sealed.send": sealedMessage, "chat.sealed.edit": sealedMessage, "chat.delete_own": sealedMessage,
-  "chat.sealed.history": shape({ sealed: array(sealedMessage, 100) }),
+  "chat.sealed.history": shape({ sealed: array(sealedMessage, 100) }), "chat.sealed.remove": empty,
   "chat.send": message, "chat.edit": message, "chat.delete": empty, "chat.read": empty,
   "chat.history": shape({ messages: array(message, 100) }), "server.update": empty,
   "token.create": shape({ token: str(256) }), "token.redeem": shape({ groups: ids }),

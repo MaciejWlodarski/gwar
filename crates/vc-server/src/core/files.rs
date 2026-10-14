@@ -460,6 +460,7 @@ impl Core {
         self.remove_files();
         self.sweep_files();
         self.touch_online();
+        self.history_prune();
         if let Err(e) = self.store.mls_prune(now_ms()).and_then(|_| self.mls_reconcile()) {
             warn!("MLS cleanup: {e:#}");
         }

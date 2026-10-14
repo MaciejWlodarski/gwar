@@ -117,7 +117,7 @@ const client = (id: number, channel: number | null, extra: Partial<Client> = {})
   ...extra,
 });
 
-const chan = (id: number, extra: object = {}) => ({ id, parent: null, name: `c${id}`, topic: "", position: id, has_password: false, max_clients: null, ...extra });
+const chan = (id: number, extra: object = {}) => ({ id, parent: null, name: `c${id}`, topic: "", position: id, has_password: false, max_clients: null, encrypted: false, history: false, ...extra });
 
 const message = (id: number, channel: number, extra: Partial<ChatMessage> = {}): ChatMessage => ({
   id,

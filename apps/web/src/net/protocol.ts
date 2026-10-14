@@ -5,6 +5,7 @@ import type { MlsGroup } from "../proto/MlsGroup";
 import type { MlsWelcome } from "../proto/MlsWelcome";
 import type { MlsHistoryChunk } from "../proto/MlsHistoryChunk";
 import type { MlsHistoryWanted } from "../proto/MlsHistoryWanted";
+import type { MlsIncarnation } from "../proto/MlsIncarnation";
 /**
  * Typed view over the generated `vc/4` types: which response each request
  * produces and the payload type of each event. The generated unions describe
@@ -49,6 +50,8 @@ export interface ResponseMap {
   "mls.history.wanted": { wanted: MlsHistoryWanted[]; next: string | null };
   "mls.history.ack": Empty;
   "mls.history.request": Empty;
+  "mls.history.decline": Empty;
+  "mls.group_history": { incarnations: MlsIncarnation[]; next: string | null };
 
   hello: { server_proof: string };
   join: Welcome;
@@ -65,6 +68,7 @@ export interface ResponseMap {
   "chat.sealed.edit": SealedMessage;
   "chat.delete_own": SealedMessage;
   "chat.sealed.history": { sealed: SealedMessage[] };
+  "chat.sealed.remove": Empty;
   "chat.send": ChatMessage;
   "chat.edit": ChatMessage;
   "chat.delete": Empty;

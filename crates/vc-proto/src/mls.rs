@@ -35,8 +35,12 @@ wire! {
         Welcomes { #[serde(flatten)] page: MlsPage },
         #[serde(rename = "mls.welcomes.ack")]
         WelcomesAck { ids: Vec<String> },
+        #[serde(rename = "mls.group_history")]
+        GroupHistory { conversation: String, #[serde(flatten)] page: MlsPage },
         #[serde(rename = "mls.history.share")]
-        HistoryShare { group: String, recipient: String, chunk: String },
+        HistoryShare { group: String, recipient: String, chunk: String, #[serde(default)] assignment: Option<String> },
+        #[serde(rename = "mls.history.decline")]
+        HistoryDecline { group: String, device: String, assignment: String },
         #[serde(rename = "mls.history.fetch")]
         HistoryFetch { #[serde(default)] group: Option<String>, #[serde(flatten)] page: MlsPage },
         #[serde(rename = "mls.history.wanted")]
@@ -60,6 +64,7 @@ wire! {
         Welcomes { welcomes: Vec<MlsWelcome>, next: Option<String> },
         Chunks { chunks: Vec<MlsHistoryChunk>, next: Option<String> },
         Wanted { wanted: Vec<MlsHistoryWanted>, next: Option<String> },
+        Incarnations { incarnations: Vec<MlsIncarnation>, next: Option<String> },
     }
 
     pub struct MlsPackage { pub device_key: String, pub package: String }
@@ -68,7 +73,9 @@ wire! {
     pub struct MlsLogEntry { #[cfg_attr(feature = "ts", ts(type = "number"))] pub epoch: u64, pub proposals: Vec<String>, pub commit: String }
     pub struct MlsWelcome { pub id: String, pub group: String, pub welcome: String }
     pub struct MlsHistoryChunk { pub id: String, pub group: String, pub sender_uid: Uid, pub chunk: String }
-    pub struct MlsHistoryWanted { pub group: String, pub device: String }
+    pub struct MlsHistoryWanted { pub group: String, pub device: String, #[serde(default, skip_serializing_if = "Option::is_none")] pub assignment: Option<String> }
+    /// A conversation's group of one incarnation, with its encoded `SignedDescriptor`.
+    pub struct MlsIncarnation { pub group: String, pub descriptor: String }
 
     #[serde(tag = "ev", content = "d")]
     pub enum MlsEvent {
@@ -81,7 +88,7 @@ wire! {
         #[serde(rename = "mls.history")]
         History { group: String },
         #[serde(rename = "mls.history.wanted")]
-        HistoryWanted { group: String, device: String },
+        HistoryWanted { group: String, device: String, #[serde(default, skip_serializing_if = "Option::is_none")] assignment: Option<String> },
     }
 }
 
@@ -104,9 +111,11 @@ mod tests {
             json!({"welcomes":[{"id":"i","group":"g","welcome":"w"}],"next":null}),
             json!({"chunks":[{"id":"i","group":"g","sender_uid":"u","chunk":"c"}],"next":null}),
             json!({"wanted":[{"group":"g","device":"d"}],"next":null}),
+            json!({"wanted":[{"group":"g","device":"d","assignment":"a"}],"next":null}),
+            json!({"incarnations":[{"group":"g","descriptor":"d"}],"next":null}),
             json!({"head":0,"oldest":0,"entries":[],"pending":[],"next":null}),
         ];
-        for field in ["packages", "devices", "groups", "welcomes", "chunks", "wanted"] {
+        for field in ["packages", "devices", "groups", "welcomes", "chunks", "wanted", "incarnations"] {
             for next in [json!(null), json!("cursor")] {
                 let mut reply = json!({"next":next});
                 reply[field] = json!([]);

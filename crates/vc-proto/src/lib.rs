@@ -258,6 +258,12 @@ wire! {
         pub password: Option<String>,
         #[serde(default)]
         pub max_clients: Option<u32>,
+        /// Defaults to true without TeamSpeak compatibility, false with it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub encrypted: Option<bool>,
+        /// Defaults to true; only for encrypted channels.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub history: Option<bool>,
     }
 
     /// Absent fields stay unchanged. `password: ""` removes the password,
@@ -591,6 +597,9 @@ wire! {
         pub upload_limit: u64,
         #[serde(default)]
         pub file_access: FileAccess,
+        /// TeamSpeak compatibility is on (new channels default to plaintext).
+        #[serde(default)]
+        pub teamspeak: bool,
     }
 
     /// Who may download a file (`GET /files/…`).
@@ -613,6 +622,12 @@ wire! {
         pub position: i32,
         pub has_password: bool,
         pub max_clients: Option<u32>,
+        /// End-to-end encrypted, fixed at creation (docs/e2e-build.md, section 4).
+        #[serde(default)]
+        pub encrypted: bool,
+        /// New members see earlier messages; for display only, clients trust the group's descriptor.
+        #[serde(default)]
+        pub history: bool,
     }
 
     pub struct Client {

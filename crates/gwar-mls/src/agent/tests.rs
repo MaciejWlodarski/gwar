@@ -665,14 +665,15 @@ fn external_join_and_welcome_skip_expired_leaf_lifetimes() {
     let mut f = fixture();
     let sec = f.t as u64 / 1000;
     let package = KeyPackage::builder()
-        .key_package_lifetime(Lifetime::init(sec - 1, sec + 2))
+        // Valid for the commit even on a slow machine, expired for the welcome below.
+        .key_package_lifetime(Lifetime::init(sec - 1, sec + 6))
         .leaf_node_capabilities(capabilities())
         .build(SUITE, &f.b.provider, &f.b.signer, f.b.with_key())
         .unwrap()
         .into_key_package();
     let out = raw_commit(&mut f.a, &f.id, f.t, vec![package], LeafNodeParameters::default(), None);
     f.observer = accept(f.observer, &out, f.t);
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    std::thread::sleep(std::time::Duration::from_secs(7));
     f.b.welcome(&server(), "delayed", out.welcome.as_ref().unwrap()).unwrap();
     f.b.take_changes();
     let mut c = device(1, 12, f.t);

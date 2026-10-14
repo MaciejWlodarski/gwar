@@ -56,6 +56,12 @@ impl Store {
         Ok(())
     }
 
+    /// Removes a stored message body; its identity stays reserved.
+    pub fn sealed_remove(&self, conversation: &str, id: MessageId) -> Result<bool> {
+        Ok(self.db.execute("DELETE FROM sealed_messages WHERE conversation=?1 AND id=?2", params![conversation, id])?
+            > 0)
+    }
+
     pub fn sealed_message(&self, conversation: &str, id: &str) -> Result<Option<SealedMessage>> {
         Ok(self
             .db
@@ -96,6 +102,7 @@ impl Store {
     }
 
     /// Missing DM marks mean nothing has been read. Edits retain the original id.
+    /// Direct messages only; see [`Store::sealed_conversation_unread`] for the rest.
     pub fn sealed_unread(&self, user: i64, uid: &str) -> Result<Vec<ConversationUnread>> {
         let mut stmt = self.db.prepare(
             "SELECT g.conversation,COALESCE(r.message,0),MIN(COUNT(m.id),?3)
@@ -112,6 +119,25 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?)
     }
 
+    /// A channel or server conversation's unread messages. A member's missing mark is
+    /// set to the newest message the first time, so newcomers don't inherit the whole history.
+    pub fn sealed_conversation_unread(&self, user: i64, conversation: &str) -> Result<Option<ConversationUnread>> {
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
+            "INSERT OR IGNORE INTO conversation_reads(user_id,conversation,message)
+             SELECT ?1,?2,COALESCE(MAX(id),0) FROM sealed_messages WHERE conversation=?2",
+            params![user, conversation],
+        )?;
+        let unread = tx.query_row(
+            "SELECT r.message,(SELECT COUNT(*) FROM (SELECT 1 FROM sealed_messages m WHERE m.conversation=?2 AND m.id>r.message LIMIT ?3))
+             FROM conversation_reads r WHERE r.user_id=?1 AND r.conversation=?2",
+            params![user, conversation, UNREAD_CAP],
+            |r| Ok(ConversationUnread { conversation: conversation.into(), last_read: r.get(0)?, count: r.get(1)? }),
+        )?;
+        tx.commit()?;
+        Ok(Some(unread).filter(|u| u.count > 0))
+    }
+
     pub fn sealed_mark_read(&self, user: i64, conversation: &str, message: MessageId) -> Result<MessageId> {
         Ok(self.db.query_row(
             "INSERT INTO conversation_reads(user_id,conversation,message) VALUES(?1,?2,?3)
@@ -125,7 +151,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::mls::GroupRow;
+    use crate::store::{ChannelRow, mls::GroupRow};
 
     fn group(store: &Store, id: &str, conversation: &str) {
         store
@@ -144,6 +170,7 @@ mod tests {
                 &[],
                 None,
                 None,
+                &[],
             )
             .unwrap();
     }
@@ -216,6 +243,61 @@ mod tests {
             store.db.query_row("SELECT COUNT(*) FROM conversation_reads", [], |r| r.get::<_, i64>(0)).unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn deleting_a_channel_removes_the_encrypted_state_of_its_whole_subtree_or_nothing() {
+        let store = Store::in_memory().unwrap();
+        let user = store.touch_user("a", "key", "A", 1).unwrap().id;
+        let channel = |parent, name: &str| {
+            store
+                .create_channel(&ChannelRow {
+                    id: 0,
+                    parent,
+                    name: name.into(),
+                    topic: String::new(),
+                    position: 0,
+                    password_hash: None,
+                    max_clients: None,
+                    encrypted: true,
+                    history: true,
+                })
+                .unwrap()
+        };
+        let parent = channel(None, "parent");
+        let child = channel(Some(parent), "child");
+        let kept = channel(None, "kept");
+        for id in [parent, child, kept] {
+            let conversation = format!("channel:{id}");
+            let group_id = format!("g{id}");
+            group(&store, &group_id, &conversation);
+            let message = store.sealed_insert(&row(&conversation, &group_id, "a", "id"), b"opaque").unwrap().unwrap();
+            store.sealed_mark_read(user, &conversation, message).unwrap();
+            store.mls_request_history(&group_id, "recipient", 1).unwrap();
+        }
+        let count = |table: &str| -> i64 {
+            store.db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap()
+        };
+        let tables = [
+            "sealed_messages",
+            "sealed_message_identities",
+            "conversation_reads",
+            "mls_groups",
+            "mls_history_requests",
+        ];
+        store.db.execute_batch("CREATE TRIGGER fail_delete BEFORE DELETE ON channels BEGIN SELECT RAISE(ABORT,'injected deletion failure'); END;").unwrap();
+        assert!(store.delete_channel(parent).is_err());
+        for table in tables {
+            assert_eq!(count(table), 3, "{table} untouched after a failed deletion");
+        }
+        store.db.execute_batch("DROP TRIGGER fail_delete").unwrap();
+        store.delete_channel(parent).unwrap();
+        for table in tables {
+            assert_eq!(count(table), 1, "{table} keeps only the unrelated channel");
+        }
+        let left = format!("channel:{kept}");
+        assert!(store.sealed_message(&left, "id").unwrap().is_some());
+        assert!(store.channels().unwrap().iter().all(|c| c.id != parent && c.id != child));
     }
 
     #[test]

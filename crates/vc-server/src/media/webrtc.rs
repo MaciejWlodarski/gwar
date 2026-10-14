@@ -227,7 +227,7 @@ pub async fn run(
             let now = Instant::now();
             for packet in forwards.drain(..) {
                 // The uplink first: it has a whole extra hop ahead of it.
-                uplinks.send(packet.from, &packet);
+                uplinks.uplink(&routing, &packet);
                 deliver_local(&mut peers, &routing, &packet, now);
                 sinks.fan_out(&routing, &packet);
             }

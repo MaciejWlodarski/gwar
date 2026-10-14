@@ -251,6 +251,8 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>) -> Option<View> 
                         Some(tsclientlib::MaxClients::Limited(n)) => Some(u32::from(n)),
                         _ => None,
                     },
+                    encrypted: false,
+                    history: false,
                 },
             );
             previous = c.id.0;
@@ -295,6 +297,7 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>) -> Option<View> 
         // TeamSpeak chats carry text only.
         upload_limit: 0,
         file_access: Default::default(),
+        teamspeak: true,
     };
     Some(View { server: Some(server), channels, clients })
 }

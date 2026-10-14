@@ -87,6 +87,7 @@ async fn start_with_reply(
                 max_clients: 8,
                 upload_limit: 0,
                 file_access: Default::default(),
+                teamspeak: false,
             },
             permissions: vec![],
             groups: vec![],

@@ -148,6 +148,7 @@ impl Core {
         if !self.can_read(s, channel) {
             return Err(err(ErrorCode::Forbidden, "no access to this channel"));
         }
+        self.plaintext_channel(channel)?;
         if (text.trim().is_empty() && stored.attachments.is_empty()) || text.chars().count() > MAX_MESSAGE {
             return Err(err(ErrorCode::BadRequest, "message must be 1–4000 characters"));
         }

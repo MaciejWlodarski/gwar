@@ -31,7 +31,7 @@ use super::{
     install,
     listeners::{self, ChannelListeners},
     process::{ProcessConfig, TsProcess},
-    puppet::{self, PuppetCmd, PuppetEvent, PuppetHandle, PuppetSpec, Shared},
+    puppet::{self, ChannelText, PuppetCmd, PuppetEvent, PuppetHandle, PuppetSpec, Shared},
     query::{Cmd, Query, QueryError, Record},
 };
 use crate::{
@@ -54,6 +54,12 @@ const PUPPET_IP_BLOCK: u32 = 2500;
 const PUPPET_CLONES: u32 = 100;
 /// Powers of TeamSpeak's stock Server Admin group (ServerQuery has 100).
 const SERVER_ADMIN_POWER: u32 = 75;
+/// ServerQuery's own powers.
+const QUERY_POWER: u32 = 100;
+/// Join power needed for an encrypted channel: above every TeamSpeak group's.
+const ENCRYPTED_JOIN_POWER: u32 = 1_000_000;
+/// The fixed description of an encrypted channel on TeamSpeak (never who is in it).
+const ENCRYPTED_DESCRIPTION: &str = "End-to-end encrypted. Join from Gwar.";
 
 /// Installs, runs and bridges the TeamSpeak server for as long as the process
 /// lives. `ready` is true while the bridge is fully in sync.
@@ -189,6 +195,8 @@ struct Local {
     puppet: Option<PuppetHandle>,
     /// Bumped per puppet, so events of a puppet being torn down are ignored.
     generation: u64,
+    /// Bumped per puppet and per move: channel text is queued for one route.
+    route: u64,
     clid: Option<u16>,
     retry_at: Option<Instant>,
     /// Since when the puppet has had nothing to do (see [`LINGER`]).
@@ -249,26 +257,59 @@ struct Bridge<'a> {
     descriptions: HashMap<u64, String>,
     /// Our own ServerQuery client id, once looked up.
     query_clid: Option<u64>,
+    /// Encrypted channels whose join power was set since the bridge started.
+    locked: HashSet<u64>,
 }
 
 /// Runs `channelcreate` and lets the stock Server Admin power manage the
 /// channel's permissions. A channel takes its creator's powers as the ones
 /// needed to manage it, and ServerQuery's 100 would lock out every TeamSpeak
 /// admin, so this sets what one of them would have; deleting stays ours (it
-/// would only come back), so its needed power remains. A channel whose power
+/// would only come back), so its needed power remains. An encrypted channel's
+/// permissions stay ServerQuery's (see [`lock_encrypted`]). A channel whose power
 /// cannot be set is deleted again, and the next sync creates it anew.
-async fn create_channel(query: &Query, create: Cmd) -> Result<u64> {
+async fn create_channel(query: &Query, create: Cmd, encrypted: bool) -> Result<u64> {
     let created = query.call(create).await?;
     let cid = created.first().and_then(|r| r.get("cid")?.parse().ok()).context("channelcreate returned no cid")?;
+    let result = if encrypted {
+        lock_encrypted(query, cid).await
+    } else {
+        let perm = Cmd::new("channeladdperm")
+            .arg("cid", cid)
+            .arg("permsid", "i_channel_needed_permission_modify_power")
+            .arg("permvalue", SERVER_ADMIN_POWER);
+        query.call(perm).await.map(drop).context("set the permission power of a new TeamSpeak channel")
+    };
+    if let Err(e) = result {
+        let _ = query.call(Cmd::new("channeldelete").arg("cid", cid).arg("force", 1)).await;
+        return Err(e);
+    }
+    Ok(cid)
+}
+
+/// A puppet's TeamSpeak channel and whether it speaks, from the user's channel
+/// (encrypted, its TeamSpeak channel) and the default channel's.
+fn target_of(own: Option<(bool, Option<u64>)>, default: Option<u64>) -> (u64, bool) {
+    match own {
+        Some((false, Some(cid))) => (cid, true),
+        _ => (default.unwrap_or(0), false),
+    }
+}
+
+/// Keeps TeamSpeak users out of an encrypted channel: its chat is not bridged.
+/// Only ServerQuery may change its permissions, so no TeamSpeak admin can lower the lock.
+async fn lock_encrypted(query: &Query, cid: u64) -> Result<()> {
     let perm = Cmd::new("channeladdperm")
         .arg("cid", cid)
         .arg("permsid", "i_channel_needed_permission_modify_power")
-        .arg("permvalue", SERVER_ADMIN_POWER);
-    if let Err(e) = query.call(perm).await {
-        let _ = query.call(Cmd::new("channeldelete").arg("cid", cid).arg("force", 1)).await;
-        return Err(e.context("set the permission power of a new TeamSpeak channel"));
-    }
-    Ok(cid)
+        .arg("permvalue", QUERY_POWER);
+    query.call(perm).await.context("keep the permissions of an encrypted TeamSpeak channel to ServerQuery")?;
+    let perm = Cmd::new("channeladdperm")
+        .arg("cid", cid)
+        .arg("permsid", "i_channel_needed_join_power")
+        .arg("permvalue", ENCRYPTED_JOIN_POWER);
+    query.call(perm).await.context("set the join power of an encrypted TeamSpeak channel")?;
+    Ok(())
 }
 
 impl<'a> Bridge<'a> {
@@ -303,6 +344,7 @@ impl<'a> Bridge<'a> {
             listeners: ChannelListeners::new(link.query, link.password.clone(), listener_events),
             descriptions: HashMap::new(),
             query_clid: None,
+            locked: HashSet::new(),
         };
         let result = bridge.serve(&mut notifications, &mut puppet_rx, &mut listener_rx, ready).await;
         // Hand the TeamSpeak users back; the next attach starts from scratch.
@@ -522,7 +564,7 @@ impl<'a> Bridge<'a> {
             if let Some(Some(p)) = &password {
                 cmd = cmd.arg("channel_password", p);
             }
-            let cid = create_channel(&self.query, cmd).await?;
+            let cid = create_channel(&self.query, cmd, channel.encrypted).await?;
             want.cid = cid;
             want.password = matches!(password, Some(Some(_)));
             self.ts.insert(cid, want);
@@ -531,6 +573,10 @@ impl<'a> Bridge<'a> {
         };
 
         let current = self.ts.get(&cid).cloned().unwrap_or_default();
+        if channel.encrypted && !self.locked.contains(&cid) {
+            lock_encrypted(&self.query, cid).await?;
+            self.locked.insert(cid);
+        }
         let mut args = channels::edits(&current, &want);
         if let Some(p) = &password {
             args.push(("channel_password", p.clone().unwrap_or_default()));
@@ -690,6 +736,7 @@ impl<'a> Bridge<'a> {
             ts_uid,
             puppet: None,
             generation: 0,
+            route: 0,
             clid: None,
             retry_at: None,
             idle_since: None,
@@ -700,12 +747,11 @@ impl<'a> Bridge<'a> {
 
     fn presence(&self, local: &Local, now: Instant) -> Presence {
         let chatting = local.chatting_until.is_some_and(|until| until > now);
-        let Some(channel) = local.client.channel else {
-            // A private conversation still needs a puppet (in the default channel).
-            return if chatting { Presence::Puppet } else { Presence::Absent };
-        };
-        let shares_channel = self.remotes.values().any(|r| self.our_channel(r.cid) == channel);
-        if shares_channel || chatting { Presence::Puppet } else { Presence::Listed }
+        let channel = local
+            .client
+            .channel
+            .map(|c| (self.is_encrypted(c), self.remotes.values().any(|r| self.our_channel(r.cid) == c)));
+        presence_of(channel, chatting)
     }
 
     /// Keeps listeners in occupied channels and starts or retires puppets.
@@ -737,18 +783,50 @@ impl<'a> Bridge<'a> {
         }
     }
 
+    fn is_encrypted(&self, channel: ChannelId) -> bool {
+        self.channels.get(&channel).is_some_and(|c| c.encrypted)
+    }
+
+    /// The TeamSpeak channel of a user's puppet and whether their voice goes there:
+    /// their own channel, or (silent) the default one when they are not in voice or
+    /// in an encrypted channel (a puppet for direct messages only).
+    fn puppet_target(&self, client: &Client) -> (u64, bool) {
+        let own = client.channel.map(|c| (self.is_encrypted(c), self.map.ts(c)));
+        target_of(own, self.server.as_ref().and_then(|s| self.map.ts(s.default_channel)))
+    }
+
+    /// Moves the user's puppet where it belongs, starting a new text route. A puppet
+    /// whose queue cannot take the move starts over there instead, so it never keeps
+    /// speaking or routing text for the old channel.
+    fn move_puppet(&mut self, session: SessionId) {
+        let Some(local) = self.locals.get(&session) else { return };
+        let (cid, voice) = self.puppet_target(&local.client);
+        let Some(local) = self.locals.get_mut(&session) else { return };
+        let Some(puppet) = &local.puppet else { return };
+        local.route += 1;
+        if !puppet.send(PuppetCmd::Move { cid, route: local.route, voice }) {
+            warn!(session, "puppet busy; reconnecting it in its new channel");
+            self.retire_puppet(session);
+            self.spawn_puppet(session, Duration::ZERO);
+        }
+    }
+
     fn spawn_puppet(&mut self, session: SessionId, delay: Duration) {
         let Some(local) = self.locals.get(&session) else { return };
         let Ok(identity) = self.identities.get(&local.client.uid) else { return };
+        let (channel, voice) = self.puppet_target(&local.client);
         let Some(local) = self.locals.get_mut(&session) else { return };
         local.generation += 1;
+        local.route += 1;
         let c = &local.client;
         let spec = PuppetSpec {
             session,
             generation: local.generation,
             nickname: c.nickname.clone(),
             identity,
-            channel: c.channel.and_then(|c| self.map.ts(c)).unwrap_or(0),
+            channel,
+            route: local.route,
+            voice,
             muted: c.muted,
             deafened: c.deafened,
             away: c.away.clone(),
@@ -778,14 +856,16 @@ impl<'a> Bridge<'a> {
     async fn describe_channels(&mut self) {
         let mut listed: BTreeMap<u64, Vec<String>> = self.ts.keys().map(|cid| (*cid, Vec::new())).collect();
         for local in self.locals.values().filter(|l| l.clid.is_none()) {
-            if let Some(names) = local.client.channel.and_then(|c| self.map.ts(c)).and_then(|cid| listed.get_mut(&cid))
-            {
+            let channel = local.client.channel.filter(|c| !self.is_encrypted(*c));
+            if let Some(names) = channel.and_then(|c| self.map.ts(c)).and_then(|cid| listed.get_mut(&cid)) {
                 names.push(local.client.nickname.clone());
             }
         }
         for (cid, mut names) in listed {
             names.sort_by_key(|n| n.to_lowercase());
-            let text = describe(&names);
+            let encrypted = self.map.ours(cid).is_some_and(|c| self.is_encrypted(c));
+            let text = if encrypted { ENCRYPTED_DESCRIPTION.to_owned() } else { describe(&names) };
+            debug_assert!(!encrypted || names.is_empty(), "nobody is listed in an encrypted channel");
             if self.descriptions.get(&cid) == Some(&text) {
                 continue;
             }
@@ -807,13 +887,12 @@ impl<'a> Bridge<'a> {
             self.reconcile(Duration::ZERO);
         }
         let Some(local) = self.locals.get(&session) else { return };
+        if before.channel != local.client.channel && self.puppet_target(&before) != self.puppet_target(&local.client) {
+            self.move_puppet(session);
+        }
+        let Some(local) = self.locals.get(&session) else { return };
         let Some(puppet) = &local.puppet else { return };
         let after = &local.client;
-        if before.channel != after.channel
-            && let Some(cid) = after.channel.and_then(|c| self.map.ts(c))
-        {
-            puppet.send(PuppetCmd::Move(cid));
-        }
         if (before.muted, before.deafened) != (after.muted, after.deafened) {
             puppet.send(PuppetCmd::Flags { muted: after.muted, deafened: after.deafened });
         }
@@ -904,6 +983,11 @@ impl<'a> Bridge<'a> {
 
     /// A message written on our side, delivered to TeamSpeak.
     async fn relay_chat(&mut self, m: ChatMessage) {
+        if let ChatTarget::Channel(channel) = m.target
+            && self.is_encrypted(channel)
+        {
+            return;
+        }
         let (mode, target) = match m.target {
             ChatTarget::Channel(_) => (2, 0),
             ChatTarget::Server => (3, 0),
@@ -921,17 +1005,23 @@ impl<'a> Bridge<'a> {
         }
         let author = self.locals.get(&m.author);
         // A puppet writes in its own channel only; a starting one queues the
-        // message until it is connected.
-        let puppet = author.and_then(|l| l.puppet.as_ref()).filter(|_| match m.target {
-            ChatTarget::Channel(channel) => author.is_some_and(|l| l.client.channel == Some(channel)),
-            _ => true,
-        });
+        // message until it is connected. Channel text keeps its channel and the
+        // puppet's current route, so the puppet drops it after any move.
+        let channel_text = match m.target {
+            ChatTarget::Channel(channel) => author
+                .filter(|l| l.client.channel == Some(channel))
+                .and_then(|l| Some(ChannelText { cid: self.map.ts(channel)?, encrypted: false, route: l.route })),
+            _ => None,
+        };
+        let puppet = author
+            .and_then(|l| l.puppet.as_ref())
+            .filter(|_| !matches!(m.target, ChatTarget::Channel(_)) || channel_text.is_some());
         // Links open only for Gwar members on a members-only server: TeamSpeak users get the names.
         let links = self.server.as_ref().is_none_or(|s| s.file_access == FileAccess::Link);
         let body = ts_text(&m, self.public_url.as_deref().filter(|_| links));
         if let Some(puppet) = puppet {
             for text in split_for_teamspeak(&body) {
-                puppet.send(PuppetCmd::Text { mode, target, text });
+                puppet.send(PuppetCmd::Text { mode, target, text, channel: channel_text });
             }
             return;
         }
@@ -1043,13 +1133,10 @@ impl<'a> Bridge<'a> {
             let update = RemoteUpdate { channel: Some(channel), ..Default::default() };
             self.core.bridge(BridgeMsg::Update(session, update)).await;
             self.reconcile(Duration::ZERO);
-        } else if let Some(local) = self.puppet_clids.get(&clid).and_then(|s| self.locals.get(s)) {
+        } else if let Some(&session) = self.puppet_clids.get(&clid) {
             // Someone moved a puppet on TeamSpeak; our user decides where they are.
-            if let (Some(want), Some(puppet)) = (local.client.channel.and_then(|c| self.map.ts(c)), &local.puppet)
-                && want != cid
-            {
-                puppet.send(PuppetCmd::Move(want));
-            }
+            // Either way, text queued before is not sent in the new channel.
+            self.move_puppet(session);
         }
     }
 
@@ -1061,9 +1148,7 @@ impl<'a> Bridge<'a> {
                 self.puppet_clids.insert(clid, session);
                 let ts_uid = local.ts_uid.clone();
                 // The channel may have changed while connecting.
-                if let (Some(cid), Some(puppet)) = (local.client.channel.and_then(|c| self.map.ts(c)), &local.puppet) {
-                    puppet.send(PuppetCmd::Move(cid));
-                }
+                self.move_puppet(session);
                 if let Err(e) = self.join_puppet_group(&ts_uid).await {
                     debug!(session, "puppet group: {e:#}");
                 }
@@ -1118,6 +1203,19 @@ impl<'a> Bridge<'a> {
         {
             self.core.bridge(message).await;
         }
+    }
+}
+
+/// How a user appears on TeamSpeak, from their voice channel (`(encrypted, shared
+/// with a TeamSpeak user)`) and whether they talk privately to a TeamSpeak user.
+/// Nobody has a puppet in an encrypted channel: a private conversation keeps one
+/// in the default channel, for text only.
+fn presence_of(channel: Option<(bool, bool)>, chatting: bool) -> Presence {
+    match channel {
+        Some((false, shared)) if shared || chatting => Presence::Puppet,
+        Some((false, _)) => Presence::Listed,
+        _ if chatting => Presence::Puppet,
+        _ => Presence::Absent,
     }
 }
 
@@ -1308,15 +1406,32 @@ mod tests {
     #[tokio::test]
     async fn new_channels_get_the_server_admin_permission_power_or_go() {
         let (query, commands) = channel_query(false).await;
-        assert_eq!(create_channel(&query, Cmd::new("channelcreate").arg("channel_name", "A")).await.unwrap(), 42);
+        assert_eq!(
+            create_channel(&query, Cmd::new("channelcreate").arg("channel_name", "A"), false).await.unwrap(),
+            42
+        );
         let sent = commands.lock().unwrap().clone();
         assert!(sent.contains(
             &"channeladdperm cid=42 permsid=i_channel_needed_permission_modify_power permvalue=75".to_owned()
         ));
+        assert!(!sent.iter().any(|c| c.contains("i_channel_needed_join_power")), "{sent:?}");
         assert!(!sent.iter().any(|c| c.starts_with("channeldelete")), "{sent:?}");
 
+        // An encrypted channel is closed to every TeamSpeak group, and only ServerQuery may reopen it.
+        let (query, commands) = channel_query(false).await;
+        assert_eq!(create_channel(&query, Cmd::new("channelcreate").arg("channel_name", "E"), true).await.unwrap(), 42);
+        let sent = commands.lock().unwrap().clone();
+        assert_eq!(
+            sent[3..],
+            [
+                "channeladdperm cid=42 permsid=i_channel_needed_permission_modify_power permvalue=100",
+                "channeladdperm cid=42 permsid=i_channel_needed_join_power permvalue=1000000"
+            ],
+            "{sent:?}"
+        );
+
         let (query, commands) = channel_query(true).await;
-        assert!(create_channel(&query, Cmd::new("channelcreate").arg("channel_name", "A")).await.is_err());
+        assert!(create_channel(&query, Cmd::new("channelcreate").arg("channel_name", "A"), false).await.is_err());
         let sent = commands.lock().unwrap().clone();
         assert_eq!(sent.last().unwrap(), "channeldelete cid=42 force=1", "{sent:?}");
     }
@@ -1438,6 +1553,29 @@ mod tests {
         let parts = split_for_teamspeak(&m.text);
         assert_eq!(parts.len(), 3);
         assert!(parts.iter().all(|p| p.chars().count() <= 1000));
+    }
+
+    #[test]
+    fn nobody_has_a_puppet_in_an_encrypted_channel_unless_chatting_privately() {
+        assert_eq!(presence_of(Some((false, true)), false), Presence::Puppet);
+        assert_eq!(presence_of(Some((false, false)), false), Presence::Listed);
+        assert_eq!(presence_of(Some((false, false)), true), Presence::Puppet);
+        // Encrypted, even with a TeamSpeak user there (who could not have joined): no puppet, not listed.
+        assert_eq!(presence_of(Some((true, true)), false), Presence::Absent);
+        assert_eq!(presence_of(Some((true, false)), true), Presence::Puppet);
+        assert_eq!(presence_of(None, true), Presence::Puppet);
+        assert_eq!(presence_of(None, false), Presence::Absent);
+    }
+
+    #[test]
+    fn a_puppet_speaks_only_in_its_users_plaintext_channel() {
+        assert_eq!(target_of(Some((false, Some(5))), Some(1)), (5, true));
+        // In an encrypted channel or out of voice: silent, in the default channel.
+        assert_eq!(target_of(Some((true, Some(7))), Some(1)), (1, false));
+        assert_eq!(target_of(None, Some(1)), (1, false));
+        // Moving from the default channel into an encrypted one keeps the TeamSpeak
+        // channel but still changes the target, so the puppet is told to fall silent.
+        assert_ne!(target_of(Some((false, Some(1))), Some(1)), target_of(Some((true, Some(7))), Some(1)));
     }
 
     #[test]

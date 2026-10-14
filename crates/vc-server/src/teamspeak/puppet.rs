@@ -38,6 +38,8 @@ use crate::{
 /// A remote speaker counts as talking this long after its last frame.
 const TALKING: Duration = Duration::from_millis(300);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// A move TeamSpeak has not answered by then is given up: text waiting for it is dropped.
+const MOVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What the puppet tasks share with the bridge.
 pub struct Shared {
@@ -218,6 +220,11 @@ pub struct PuppetSpec {
     pub nickname: String,
     pub identity: Identity,
     pub channel: u64,
+    /// The route generation of `channel` (see [`PuppetCmd::Move`]).
+    pub route: u64,
+    /// Whether the user's voice goes to `channel`: false for a puppet kept only for
+    /// direct messages (its user is not in voice, or in an encrypted channel).
+    pub voice: bool,
     pub muted: bool,
     pub deafened: bool,
     pub away: Option<String>,
@@ -225,9 +232,25 @@ pub struct PuppetSpec {
     pub delay: Duration,
 }
 
+/// Where channel text belongs: the TeamSpeak channel of the Gwar channel it was
+/// written in, whether that channel is encrypted, and the route it was queued for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChannelText {
+    pub cid: u64,
+    pub encrypted: bool,
+    pub route: u64,
+}
+
 #[derive(Debug)]
 pub enum PuppetCmd {
-    Move(u64),
+    /// Moves to a TeamSpeak channel; every move starts a new route, and channel
+    /// text queued for an earlier route is dropped, never sent elsewhere. `voice`
+    /// as in [`PuppetSpec`], from now on.
+    Move {
+        cid: u64,
+        route: u64,
+        voice: bool,
+    },
     Flags {
         muted: bool,
         deafened: bool,
@@ -235,10 +258,12 @@ pub enum PuppetCmd {
     Nickname(String),
     Away(Option<String>),
     /// TeamSpeak `sendtextmessage`: mode 1 = client, 2 = channel, 3 = server.
+    /// Channel text (`channel`) is sent only from that confirmed channel.
     Text {
         mode: u8,
         target: u16,
         text: String,
+        channel: Option<ChannelText>,
     },
     Quit,
 }
@@ -256,8 +281,9 @@ pub struct PuppetHandle {
 }
 
 impl PuppetHandle {
-    pub fn send(&self, cmd: PuppetCmd) {
-        let _ = self.cmds.try_send(cmd);
+    /// Queues a command; false when the puppet's queue is full or it is gone.
+    pub fn send(&self, cmd: PuppetCmd) -> bool {
+        self.cmds.try_send(cmd).is_ok()
     }
 }
 
@@ -358,9 +384,16 @@ async fn run(
     // after connecting; if its name is not the one asked for, continue with
     // our next variant.
     let mut admitted_as = Some(requested);
+    // Channel text goes out only in the channel it was written for: from the
+    // current route, once a move to that channel is confirmed.
+    let mut route = spec.route;
+    let mut voice = spec.voice;
+    let mut moving: Option<Moving> = None;
+    let mut waiting: Vec<(u64, String)> = Vec::new();
     enum Step {
         Uplink(AudioPacket),
         Flush,
+        MoveTimeout,
         Item(Option<Result<StreamItem, tsclientlib::Error>>),
         Cmd(Option<PuppetCmd>),
     }
@@ -375,12 +408,20 @@ async fn run(
                         None => std::future::pending().await,
                     }
                 } => Step::Flush,
+                _ = async {
+                    match &moving {
+                        Some(m) => tokio::time::sleep_until(m.deadline.into()).await,
+                        None => std::future::pending().await,
+                    }
+                } => Step::MoveTimeout,
                 Some(packet) = uplink.recv() => Step::Uplink(packet),
                 item = stream.next() => Step::Item(item),
                 cmd = cmds.recv() => Step::Cmd(cmd),
             }
         };
         match step {
+            // A puppet kept only for direct messages never speaks.
+            Step::Uplink(_) if !voice => {}
             Step::Uplink(packet) => {
                 for data in packetizer.push(&packet.opus, Instant::now()) {
                     send_audio(&mut con, &mut packet_id, &data);
@@ -390,6 +431,11 @@ async fn run(
                 if let Some(data) = packetizer.flush() {
                     send_audio(&mut con, &mut packet_id, &data);
                 }
+            }
+            Step::MoveTimeout => {
+                warn!(session = spec.session, "puppet move unanswered; its channel text is dropped");
+                moving = None;
+                waiting.clear();
             }
             Step::Item(None) => return Err(anyhow!("connection closed")),
             Step::Item(Some(Err(e))) => return Err(anyhow!("{e}")),
@@ -413,6 +459,7 @@ async fn run(
                     {
                         queue_nickname(&mut con, &mut pending, spec.nickname.clone(), variant + 1, 0)?;
                     }
+                    flush_channel_text(&mut con, &mut pending, moving.is_some(), &mut waiting);
                     for event in book {
                         if let BookEvent::Message { target, invoker, message } = event {
                             let text = PuppetEvent::Text {
@@ -426,6 +473,18 @@ async fn run(
                     }
                 }
                 StreamItem::MessageResult(handle, result) => {
+                    if moving.as_ref().is_some_and(|m| m.handle == handle) {
+                        moving = None;
+                        match result {
+                            // Already there counts as arrived.
+                            Err(e) if !format!("{e:?}").contains("AlreadyIn") => {
+                                warn!(session = spec.session, "puppet move failed: {e}");
+                                waiting.clear();
+                            }
+                            _ => flush_channel_text(&mut con, &mut pending, false, &mut waiting),
+                        }
+                        continue;
+                    }
                     match pending.remove(&handle) {
                         Some(Pending::Nickname { base, variant, generation }) if generation == nickname_generation => {
                             match result {
@@ -464,8 +523,26 @@ async fn run(
                     continue;
                 }
                 // A held half-packet was captured in the old channel; end it there.
-                if let PuppetCmd::Move(_) = cmd {
+                if let PuppetCmd::Move { cid, route: next, voice: speaks } = cmd {
                     end_spurt(&mut con, &mut packet_id, &mut packetizer);
+                    route = next;
+                    voice = speaks;
+                    waiting.clear();
+                    moving = command("clientmove", &[("clid", clid.to_string()), ("cid", cid.to_string())])
+                        .send_with_result(&mut con)
+                        .ok()
+                        .map(|handle| Moving { handle, cid, deadline: Instant::now() + MOVE_TIMEOUT });
+                    continue;
+                }
+                if let PuppetCmd::Text { channel: Some(target), text, .. } = cmd {
+                    match channel_text(own_channel(&con), moving.as_ref().map(|m| m.cid), route, target) {
+                        TextNow::Send => send_channel_text(&mut con, &mut pending, text),
+                        TextNow::Wait if waiting.len() < 64 => waiting.push((target.cid, text)),
+                        TextNow::Wait | TextNow::Drop => {
+                            debug!(session = spec.session, "channel text dropped across a move")
+                        }
+                    }
+                    continue;
                 }
                 let label = format!("{cmd:?}").split([' ', '(']).next().unwrap_or_default().to_owned();
                 if let Some(command) = command_for(clid, cmd)
@@ -475,6 +552,62 @@ async fn run(
                 }
             }
         }
+    }
+}
+
+/// A move awaiting TeamSpeak's answer.
+struct Moving {
+    handle: tsclientlib::MessageHandle,
+    cid: u64,
+    deadline: Instant,
+}
+
+/// What to do with channel text now.
+#[derive(Debug, PartialEq, Eq)]
+enum TextNow {
+    Send,
+    Wait,
+    Drop,
+}
+
+/// Channel text is sent in its confirmed channel, waits while the puppet moves
+/// there, and is otherwise dropped (an older route, an encrypted channel, a move elsewhere).
+fn channel_text(confirmed: Option<u64>, moving: Option<u64>, route: u64, text: ChannelText) -> TextNow {
+    if text.encrypted || text.route != route {
+        TextNow::Drop
+    } else if moving == Some(text.cid) {
+        TextNow::Wait
+    } else if moving.is_none() && confirmed == Some(text.cid) {
+        TextNow::Send
+    } else {
+        TextNow::Drop
+    }
+}
+
+fn own_channel(con: &Connection) -> Option<u64> {
+    let state = con.get_state().ok()?;
+    Some(state.clients.get(&state.own_client)?.channel.0)
+}
+
+fn send_channel_text(con: &mut Connection, pending: &mut HashMap<tsclientlib::MessageHandle, Pending>, text: String) {
+    if let Ok(handle) = command("sendtextmessage", &[("targetmode", "2".into()), ("msg", text)]).send_with_result(con) {
+        pending.insert(handle, Pending::Command("Text".into()));
+    }
+}
+
+/// Sends waiting channel text once the move is answered and the puppet is listed there.
+fn flush_channel_text(
+    con: &mut Connection,
+    pending: &mut HashMap<tsclientlib::MessageHandle, Pending>,
+    moving: bool,
+    waiting: &mut Vec<(u64, String)>,
+) {
+    let Some(&(cid, _)) = waiting.first() else { return };
+    if moving || own_channel(con) != Some(cid) {
+        return;
+    }
+    for (_, text) in std::mem::take(waiting) {
+        send_channel_text(con, pending, text);
     }
 }
 
@@ -535,7 +668,7 @@ fn queue_nickname(
 fn command_for(clid: u16, cmd: PuppetCmd) -> Option<OutCommand> {
     let flag = |b: bool| if b { "1" } else { "0" }.to_owned();
     Some(match cmd {
-        PuppetCmd::Move(cid) => command("clientmove", &[("clid", clid.to_string()), ("cid", cid.to_string())]),
+        PuppetCmd::Move { cid, .. } => command("clientmove", &[("clid", clid.to_string()), ("cid", cid.to_string())]),
         PuppetCmd::Flags { muted, deafened } => {
             command("clientupdate", &[("client_input_muted", flag(muted)), ("client_output_muted", flag(deafened))])
         }
@@ -544,7 +677,7 @@ fn command_for(clid: u16, cmd: PuppetCmd) -> Option<OutCommand> {
             "clientupdate",
             &[("client_away", flag(away.is_some())), ("client_away_message", away.unwrap_or_default())],
         ),
-        PuppetCmd::Text { mode, target, text } => {
+        PuppetCmd::Text { mode, target, text, .. } => {
             // Only private messages name a target; channel and server ones must not.
             let mut args = vec![("targetmode", mode.to_string()), ("msg", text)];
             if mode == 1 {
@@ -567,6 +700,14 @@ fn command(name: &str, args: &[(&str, String)]) -> OutCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_full_queue_refuses_commands_so_the_bridge_can_start_over() {
+        let (cmds, _rx) = mpsc::channel(1);
+        let handle = PuppetHandle { cmds, task: tokio::spawn(std::future::pending()) };
+        assert!(handle.send(PuppetCmd::Quit));
+        assert!(!handle.send(PuppetCmd::Move { cid: 1, route: 2, voice: false }));
+    }
 
     #[test]
     fn nickname_variants_start_at_two_and_fit_the_limit() {
@@ -604,7 +745,7 @@ mod tests {
         let (webrtc, mut rx) = mpsc::channel(64);
         let mut routing = Routing::default();
         for session in [100, 200] {
-            routing.members.insert(session, Member { channel: 1, muted: false, deafened: false });
+            routing.members.insert(session, Member { channel: 1, muted: false, deafened: false, bridged: true });
         }
         let plane = MediaPlane {
             routing: Arc::new(arc_swap::ArcSwap::from_pointee(routing)),
@@ -633,6 +774,21 @@ mod tests {
             assert_eq!(whisper, again);
             assert!(new > old, "spurt {new} does not follow {old}");
         }
+    }
+
+    #[test]
+    fn channel_text_is_sent_only_in_its_confirmed_channel_and_route() {
+        let text = |cid, route| ChannelText { cid, encrypted: false, route };
+        assert_eq!(channel_text(Some(5), None, 2, text(5, 2)), TextNow::Send);
+        // Queued before a move: an older route.
+        assert_eq!(channel_text(Some(5), None, 3, text(5, 2)), TextNow::Drop);
+        // While moving to its channel it waits; while moving elsewhere it is dropped.
+        assert_eq!(channel_text(Some(4), Some(5), 2, text(5, 2)), TextNow::Wait);
+        assert_eq!(channel_text(Some(5), Some(6), 2, text(5, 2)), TextNow::Drop);
+        // A failed move leaves the puppet elsewhere.
+        assert_eq!(channel_text(Some(4), None, 2, text(5, 2)), TextNow::Drop);
+        assert_eq!(channel_text(None, None, 2, text(5, 2)), TextNow::Drop);
+        assert_eq!(channel_text(Some(5), None, 2, ChannelText { cid: 5, encrypted: true, route: 2 }), TextNow::Drop);
     }
 
     #[test]

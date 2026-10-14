@@ -41,6 +41,10 @@ pub struct ChannelRow {
     /// Argon2 hash of the password's TeamSpeak wire form (see `core::passwords`).
     pub password_hash: Option<String>,
     pub max_clients: Option<u32>,
+    /// End-to-end encrypted chat (sealed messages), fixed at creation.
+    pub encrypted: bool,
+    /// New members see earlier messages; always false for plaintext channels.
+    pub history: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -307,6 +311,10 @@ const MIGRATIONS: &[&str] = &[
         conversation TEXT NOT NULL, message INTEGER NOT NULL,PRIMARY KEY(user_id,conversation)
     );
     "#,
+    r#"
+    ALTER TABLE channels ADD COLUMN encrypted INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE channels ADD COLUMN history INTEGER NOT NULL DEFAULT 0;
+    "#,
 ];
 
 /// References reassigned by a member merge (including ones already held by the target).
@@ -323,13 +331,18 @@ pub struct MergeReport {
 const HISTORY_KEEP: i64 = 1000;
 
 impl Store {
+    /// Opens (and migrates) a database. A new one gets its channels only when
+    /// the server first starts ([`Store::seed_channels`]), not from administrative commands.
     pub fn open(path: &Path) -> Result<Self> {
         let db = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         Self::init(db)
     }
 
+    /// A database for tests and memory-only servers, with plaintext channels.
     pub fn in_memory() -> Result<Self> {
-        Self::init(Connection::open_in_memory()?)
+        let store = Self::init(Connection::open_in_memory()?)?;
+        store.seed_channels(false)?;
+        Ok(store)
     }
 
     fn init(db: Connection) -> Result<Self> {
@@ -389,11 +402,29 @@ impl Store {
             }
             self.set_meta("member_defaults", "1")?;
         }
+        Ok(())
+    }
+
+    /// A new database's channels, at the server's first start.
+    pub fn seed_channels(&self, encrypted: bool) -> Result<()> {
         let has_channels: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM channels)", [], |r| r.get(0))?;
         if !has_channels {
-            let lobby = self.insert_channel(None, "Lobby", "", 0, None, None)?;
-            self.insert_channel(None, "General", "", 1, None, None)?;
-            self.insert_channel(None, "AFK", "", 2, None, None)?;
+            let channel = |name: &str, position| {
+                self.create_channel(&ChannelRow {
+                    id: 0,
+                    parent: None,
+                    name: name.into(),
+                    topic: String::new(),
+                    position,
+                    password_hash: None,
+                    max_clients: None,
+                    encrypted,
+                    history: encrypted,
+                })
+            };
+            let lobby = channel("Lobby", 0)?;
+            channel("General", 1)?;
+            channel("AFK", 2)?;
             self.set_meta("default_channel", &lobby.to_string())?;
         }
         Ok(())
@@ -419,7 +450,7 @@ impl Store {
 
     pub fn channels(&self) -> Result<Vec<ChannelRow>> {
         let mut stmt = self.db.prepare(
-            "SELECT id,parent,name,topic,position,password_hash,max_clients FROM channels ORDER BY position,id",
+            "SELECT id,parent,name,topic,position,password_hash,max_clients,encrypted,history FROM channels ORDER BY position,id",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(ChannelRow {
@@ -430,6 +461,8 @@ impl Store {
                 position: r.get(4)?,
                 password_hash: r.get(5)?,
                 max_clients: r.get(6)?,
+                encrypted: r.get(7)?,
+                history: r.get(8)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -458,10 +491,25 @@ impl Store {
         password_hash: Option<&str>,
         max_clients: Option<u32>,
     ) -> Result<ChannelId> {
+        self.create_channel(&ChannelRow {
+            id: 0,
+            parent,
+            name: name.into(),
+            topic: topic.into(),
+            position,
+            password_hash: password_hash.map(Into::into),
+            max_clients,
+            encrypted: false,
+            history: false,
+        })
+    }
+
+    /// Inserts `row` under a new id (its own `id` is ignored).
+    pub fn create_channel(&self, row: &ChannelRow) -> Result<ChannelId> {
         let id = self.next_id("channel_counter")?;
         self.db.execute(
-            "INSERT INTO channels(id,parent,name,topic,position,password_hash,max_clients) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            params![id, parent, name, topic, position, password_hash, max_clients],
+            "INSERT INTO channels(id,parent,name,topic,position,password_hash,max_clients,encrypted,history) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![id, row.parent, row.name, row.topic, row.position, row.password_hash, row.max_clients, row.encrypted, row.history && row.encrypted],
         )?;
         Ok(id)
     }
@@ -474,9 +522,26 @@ impl Store {
         Ok(())
     }
 
-    /// Deletes the channel and, through the foreign key cascade, its subtree and history.
+    /// Deletes the channel and, through the foreign key cascade, its subtree and history,
+    /// with the encrypted conversations of every deleted channel in the same transaction:
+    /// their MLS groups (with log, Welcomes, requests and history chunks), sealed messages and read marks.
     pub fn delete_channel(&self, id: ChannelId) -> Result<()> {
-        self.db.execute("DELETE FROM channels WHERE id=?1", [id])?;
+        let tx = self.db.unchecked_transaction()?;
+        let conversations: Vec<String> = tx
+            .prepare(
+                "WITH RECURSIVE doomed(id) AS (SELECT ?1 UNION SELECT c.id FROM channels c JOIN doomed d ON c.parent=d.id)
+                 SELECT 'channel:' || id FROM doomed",
+            )?
+            .query_map([id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for conversation in &conversations {
+            tx.execute("DELETE FROM sealed_messages WHERE conversation=?1", [conversation])?;
+            tx.execute("DELETE FROM sealed_message_identities WHERE conversation=?1", [conversation])?;
+            tx.execute("DELETE FROM conversation_reads WHERE conversation=?1", [conversation])?;
+            tx.execute("DELETE FROM mls_groups WHERE conversation=?1", [conversation])?;
+        }
+        tx.execute("DELETE FROM channels WHERE id=?1", [id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1378,7 +1443,7 @@ mod tests {
             store.db.query_row("SELECT chunk_hash FROM mls_history WHERE id='one'", [], |r| r.get(0)).unwrap();
         assert_eq!(hash, Sha256::digest([1]).as_slice());
         assert_eq!(
-            store.mls_share_history("g", "recipient", ("sender", "device"), &[1], (0, 0), 2).unwrap(),
+            store.mls_share_history("g", "recipient", ("sender", "device"), &[1], (0, 0), 2, true).unwrap(),
             mls::ShareHistory::Duplicate
         );
     }

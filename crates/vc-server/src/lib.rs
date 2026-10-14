@@ -210,6 +210,9 @@ pub async fn start(config: Config) -> Result<Running> {
         Some(path) => Store::open(path)?,
         None => Store::in_memory()?,
     };
+    // A new database's channels are plaintext until the web app reads encrypted channels
+    // (step 4a, second part); then they follow TeamSpeak compatibility: `!teamspeak`.
+    store.seed_channels(false)?;
     let admin_token = core::ensure_first_admin_token(&store)?;
     let connect_seq: i64 = store.meta("connect_seq")?.and_then(|s| s.parse().ok()).unwrap_or(0);
     // A password set in the server settings (even "none") wins over the command line.
@@ -241,6 +244,7 @@ pub async fn start(config: Config) -> Result<Running> {
             connect_url: config.connect_url.clone(),
             server_signer: server_key.clone(),
             server_key: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(server_key.verifying_key().as_bytes()),
+            teamspeak: config.teamspeak.is_some(),
         },
         routing.clone(),
         media_tx.clone(),

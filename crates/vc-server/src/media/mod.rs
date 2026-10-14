@@ -92,6 +92,9 @@ pub struct Member {
     pub channel: ChannelId,
     pub muted: bool,
     pub deafened: bool,
+    /// Whether what this session says may leave our server (to its TeamSpeak stand-in):
+    /// false in an end-to-end encrypted channel.
+    pub bridged: bool,
 }
 
 /// Who is where, as seen by the media plane.
@@ -150,6 +153,14 @@ impl Sinks {
         }
     }
 
+    /// Delivers what a session said to its uplink, unless it may not leave our server
+    /// (see [`Member::bridged`]); the end of speech always goes, so talking stops.
+    pub fn uplink(&self, routing: &Routing, packet: &AudioPacket) {
+        if packet.is_end() || routing.members.get(&packet.from).is_some_and(|m| m.bridged) {
+            self.send(packet.from, packet);
+        }
+    }
+
     /// Delivers to every external recipient of `packet`; returns nothing
     /// because real-time audio is dropped rather than queued when a sink lags.
     pub fn fan_out(&self, routing: &Routing, packet: &AudioPacket) {
@@ -201,7 +212,7 @@ mod tests {
     #[test]
     fn recipients_follow_channel_and_flags() {
         let mut routing = Routing::default();
-        let m = |channel, muted, deafened| Member { channel, muted, deafened };
+        let m = |channel, muted, deafened| Member { channel, muted, deafened, bridged: true };
         routing.members.insert(1, m(10, false, false));
         routing.members.insert(2, m(10, false, false));
         routing.members.insert(3, m(10, false, true));
@@ -217,7 +228,7 @@ mod tests {
     #[test]
     fn whispers_cross_channels_but_not_deafness() {
         let mut routing = Routing::default();
-        let m = |channel, muted, deafened| Member { channel, muted, deafened };
+        let m = |channel, muted, deafened| Member { channel, muted, deafened, bridged: true };
         routing.members.insert(1, m(10, false, false));
         routing.members.insert(2, m(11, false, false));
         routing.members.insert(3, m(11, false, true));
@@ -227,5 +238,26 @@ mod tests {
         assert!(!routing.can_whisper(1, 9));
         routing.members.insert(1, m(10, true, false));
         assert!(!routing.can_whisper(1, 2));
+    }
+
+    #[test]
+    fn nothing_said_in_an_encrypted_channel_reaches_the_uplink() {
+        let uplinks = Sinks::default();
+        let (tx, mut rx) = mpsc::channel(8);
+        uplinks.register(1, tx);
+        let mut routing = Routing::default();
+        let member = |bridged| Member { channel: 10, muted: false, deafened: false, bridged };
+        let frame = AudioPacket { opus: Arc::from([0xf8, 1]), samples: 960, ..AudioPacket::end_of_speech(1) };
+        routing.members.insert(1, member(false));
+        uplinks.uplink(&routing, &frame);
+        assert!(rx.try_recv().is_err());
+        uplinks.uplink(&routing, &AudioPacket::end_of_speech(1));
+        assert!(rx.try_recv().unwrap().is_end());
+        routing.members.insert(1, member(true));
+        uplinks.uplink(&routing, &frame);
+        assert!(!rx.try_recv().unwrap().is_end());
+        routing.members.remove(&1);
+        uplinks.uplink(&routing, &frame);
+        assert!(rx.try_recv().is_err());
     }
 }
