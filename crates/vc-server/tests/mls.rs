@@ -1019,3 +1019,387 @@ async fn failed_clock_persistence_does_not_reply_expired_or_announce_a_commit() 
         db.query_row("SELECT CAST(value AS INTEGER) FROM meta WHERE key='mls_commit_clock'", [], |r| r.get(0)).unwrap();
     assert!(clock >= now() - 1000);
 }
+
+// ---------------------------------------------------------------- sealed direct messages
+
+fn sealed(conversation: &str, group: &str, epoch: u64, id: u32) -> Value {
+    json!({"conversation":conversation,"group":group,"epoch":epoch,"message_id":b64(&id.to_be_bytes().repeat(4)),"ciphertext":b64(b"opaque ciphertext")})
+}
+
+#[tokio::test]
+async fn sealed_revisions_reach_every_participant_session_and_keep_only_the_latest() {
+    use vc_server::core::bridge::{BridgeMsg, BridgeNote};
+    let server = TestServer::start().await;
+    let mut alice = Device::new(1, 11);
+    let mut a = connect_device(&server, &alice).await;
+    let mut a2 = connect_device(&server, &Device::new(1, 12)).await;
+    let mut b = connect_device(&server, &Device::new(2, 21)).await;
+    let mut b2 = connect_device(&server, &Device::new(2, 22)).await;
+    let mut outsider = connect_device(&server, &Device::new(3, 31)).await;
+    let conversation = vc_proto::dm_conversation(&uid(1), &uid(2));
+    let group = create(&mut a, &mut alice, 2, 1).await;
+    let (bridge, mut notes) = tokio::sync::mpsc::unbounded_channel();
+    server.running.core.bridge(BridgeMsg::Attach(bridge)).await;
+    a.sync().await;
+    while notes.try_recv().is_ok() {}
+    let request = sealed(&conversation, &group, 0, 1);
+    let sent = a.ok("chat.sealed.send", request.clone()).await;
+    assert_eq!(sent["revision"], 0);
+    assert_eq!(sent["deleted"], false);
+    for client in [&mut a, &mut a2, &mut b, &mut b2] {
+        assert_eq!(client.next_event("chat.sealed").await, sent);
+    }
+    assert!(outsider.drain_events("chat.sealed").await.is_empty());
+    assert_eq!(a.fails("chat.sealed.send", request.clone()).await, "conflict");
+    assert_eq!(
+        b.fails("chat.sealed.send", request.clone()).await,
+        "conflict",
+        "identity is per conversation, not per author"
+    );
+    assert_eq!(outsider.fails("chat.sealed.send", request.clone()).await, "forbidden");
+    assert_eq!(outsider.fails("chat.sealed.history", json!({"conversation":conversation})).await, "forbidden");
+    assert_eq!(
+        outsider.fails("chat.read", json!({"conversation":conversation,"message":sent["id"]})).await,
+        "forbidden"
+    );
+
+    let mut revision = request.clone();
+    revision["revision"] = json!(3);
+    revision["ciphertext"] = json!(b64(b"edited ciphertext"));
+    assert_eq!(b.fails("chat.sealed.edit", revision.clone()).await, "forbidden");
+    assert_eq!(b.fails("chat.delete_own", revision.clone()).await, "forbidden");
+    let edited = a2.ok("chat.sealed.edit", revision.clone()).await;
+    assert_eq!(edited["id"], sent["id"]);
+    assert_eq!(edited["sent_at"], sent["sent_at"]);
+    assert!(edited["edited_at"].is_i64());
+    assert_eq!(a.fails("chat.sealed.edit", revision.clone()).await, "bad_request");
+    revision["revision"] = json!(2);
+    assert_eq!(a.fails("chat.delete_own", revision.clone()).await, "bad_request");
+    revision["revision"] = json!(4);
+    revision["ciphertext"] = json!(b64(b"signed deletion ciphertext"));
+    let deleted = a.ok("chat.delete_own", revision.clone()).await;
+    assert_eq!(deleted["deleted"], true);
+    assert_eq!(deleted["revision"], 4);
+    revision["revision"] = json!(5);
+    for op in ["chat.sealed.edit", "chat.delete_own"] {
+        assert_eq!(a.fails(op, revision.clone()).await, "bad_request");
+    }
+    for client in [&mut a, &mut a2, &mut b, &mut b2] {
+        assert_eq!(client.next_event("chat.sealed").await, edited);
+        assert_eq!(client.next_event("chat.sealed").await, deleted);
+    }
+    assert_eq!(b.ok("chat.sealed.history", json!({"conversation":conversation})).await["messages"], json!([deleted]));
+    assert!(
+        b.ok("chat.sealed.history", json!({"conversation":conversation,"before":sent["id"]})).await["messages"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(outsider.drain_events("chat.sealed").await.is_empty());
+    while let Ok(note) = notes.try_recv() {
+        assert!(
+            !matches!(note, BridgeNote::Event(e) if matches!(*e, vc_proto::Event::ChatSealed(_) | vc_proto::Event::ChatSealedRemoved { .. }))
+        );
+    }
+
+    // The same client id is independent in a different conversation.
+    let mut other = Device::new(1, 11);
+    let other_group = create(&mut a, &mut other, 3, 2).await;
+    a.ok("chat.sealed.send", sealed(&vc_proto::dm_conversation(&uid(1), &uid(3)), &other_group, 0, 1)).await;
+    let b3 = connect_device(&server, &Device::new(2, 23)).await;
+    assert_eq!(b3.welcome.conversations.len(), 1);
+    assert_eq!(b3.welcome.conversations[0].conversation, conversation);
+}
+
+#[tokio::test]
+async fn sealed_writes_require_the_live_epoch_and_no_pending_removal() {
+    let server = TestServer::start().await;
+    let mut alice = Device::new(1, 11);
+    let mut bob = Device::new(2, 21);
+    let mut a = connect_device(&server, &alice).await;
+    let _b = connect_device(&server, &bob).await;
+    let conversation = vc_proto::dm_conversation(&uid(1), &uid(2));
+    let group = create(&mut a, &mut alice, 2, 1).await;
+    let original = sealed(&conversation, &group, 0, 1);
+    a.ok("chat.sealed.send", original.clone()).await;
+    add(&mut a, &mut alice, &mut bob, &group).await;
+    for op in ["chat.sealed.send", "chat.sealed.edit", "chat.delete_own"] {
+        let mut request = original.clone();
+        if op == "chat.sealed.send" {
+            request["message_id"] = sealed(&conversation, &group, 0, 2)["message_id"].clone();
+        } else {
+            request["revision"] = json!(1);
+        }
+        assert_eq!(a.fails(op, request.clone()).await, "stale");
+        request["epoch"] = json!(2);
+        assert_eq!(a.fails(op, request.clone()).await, "stale");
+        request["epoch"] = json!(1);
+        request["group"] = json!(b64(&[9; 32]));
+        assert_eq!(a.fails(op, request).await, "stale");
+    }
+    revoke(&server, 2, 21).await;
+    for op in ["chat.sealed.send", "chat.sealed.edit", "chat.delete_own"] {
+        let mut request = original.clone();
+        request["epoch"] = json!(1);
+        request["revision"] = json!(1);
+        assert_eq!(a.fails(op, request).await, "pending");
+    }
+    assert_eq!(
+        a.ok("chat.sealed.history", json!({"conversation":conversation})).await["messages"].as_array().unwrap().len(),
+        1
+    );
+    let log = a.ok("mls.log", json!({"group":group,"since":1})).await;
+    for proposal in log["pending"].as_array().unwrap() {
+        alice.process(&B64.decode(proposal.as_str().unwrap()).unwrap());
+    }
+    let commit = alice.commit_pending();
+    a.ok("mls.commit", update_request(&group, 1, &commit)).await;
+    let mut request = original;
+    request["epoch"] = json!(2);
+    request["revision"] = json!(2);
+    let edited = a.ok("chat.sealed.edit", request.clone()).await;
+    assert_eq!(edited["epoch"], 2);
+    request["revision"] = json!(3);
+    assert_eq!(a.ok("chat.delete_own", request).await["deleted"], true);
+    a.ok("chat.sealed.send", sealed(&conversation, &group, 2, 2)).await;
+}
+
+#[tokio::test]
+async fn sealed_size_encoding_and_history_byte_budget() {
+    let server = TestServer::start().await;
+    let mut alice = Device::new(1, 11);
+    let mut a = connect_device(&server, &alice).await;
+    let _b = connect_device(&server, &Device::new(2, 21)).await;
+    let conversation = vc_proto::dm_conversation(&uid(1), &uid(2));
+    let group = create(&mut a, &mut alice, 2, 1).await;
+    let mut request = sealed(&conversation, &group, 0, 1);
+    request["ciphertext"] = json!(b64(&vec![0; 24 * 1024 + 1]));
+    for op in ["chat.sealed.send", "chat.sealed.edit", "chat.delete_own"] {
+        request["revision"] = json!(1);
+        assert_eq!(a.fails(op, request.clone()).await, "too_large");
+    }
+    for ciphertext in ["=", "AA=", "AB", "+/"] {
+        request["ciphertext"] = json!(ciphertext);
+        assert_eq!(a.fails("chat.sealed.send", request.clone()).await, "bad_request");
+    }
+    request["ciphertext"] = json!(b64(b"valid"));
+    request["message_id"] = json!("not-an-id");
+    assert_eq!(a.fails("chat.sealed.send", request.clone()).await, "bad_request");
+    request["message_id"] = sealed(&conversation, &group, 0, 1)["message_id"].clone();
+    request["conversation"] = json!("server");
+    assert_eq!(a.fails("chat.sealed.send", request).await, "bad_request");
+    // Fill large messages through the actor (gateway throttling is tested separately).
+    for id in 1..=24 {
+        let mut request = sealed(&conversation, &group, 0, id);
+        request["ciphertext"] = json!(b64(&vec![0; 24 * 1024]));
+        server
+            .running
+            .core
+            .request(a.id(), 10000 + id, serde_json::from_value(json!({"op":"chat.sealed.send","d":request})).unwrap())
+            .await;
+        assert_eq!(a.reply(10000 + id).await.unwrap()["ciphertext"].as_str().unwrap().len(), 32768);
+    }
+    let page = a.ok("chat.sealed.history", json!({"conversation":conversation,"limit":100})).await;
+    assert!(serde_json::to_vec(&page).unwrap().len() < 640 * 1024);
+    let messages = page["messages"].as_array().unwrap();
+    assert!(messages.len() < 24 && !messages.is_empty());
+    let rest =
+        a.ok("chat.sealed.history", json!({"conversation":conversation,"before":messages[0]["id"],"limit":100})).await;
+    assert_eq!(rest["messages"].as_array().unwrap().len() + messages.len(), 24);
+}
+
+#[tokio::test]
+async fn sealed_cap_paging_unread_and_persistence() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("db.sqlite3");
+    let server = TestServer::start_with(|c| {
+        c.database = Some(database.clone());
+        c.data_dir = Some(directory.path().into());
+    })
+    .await;
+    let mut alice = Device::new(1, 11);
+    let mut a = connect_device(&server, &alice).await;
+    let b = connect_device(&server, &Device::new(2, 21)).await;
+    let conversation = vc_proto::dm_conversation(&uid(1), &uid(2));
+    let group = create(&mut a, &mut alice, 2, 1).await;
+    assert!(b.welcome.conversations.is_empty());
+    b.close().await;
+    let mut last = Value::Null;
+    for id in 1..=1001 {
+        let request = sealed(&conversation, &group, 0, id);
+        server
+            .running
+            .core
+            .request(a.id(), 10000 + id, serde_json::from_value(json!({"op":"chat.sealed.send","d":request})).unwrap())
+            .await;
+        last = a.reply(10000 + id).await.unwrap();
+    }
+    let store = vc_server::store::Store::open(&database).unwrap();
+    assert!(
+        store
+            .sealed_message(&conversation, sealed(&conversation, &group, 0, 1)["message_id"].as_str().unwrap())
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(a.fails("chat.sealed.send", sealed(&conversation, &group, 0, 1)).await, "conflict");
+    let mut before = Value::Null;
+    let mut ids = Vec::new();
+    loop {
+        let page = a.ok("chat.sealed.history", json!({"conversation":conversation,"before":before,"limit":100})).await;
+        let messages = page["messages"].as_array().unwrap();
+        if messages.is_empty() {
+            break;
+        }
+        assert!(messages.windows(2).all(|m| m[0]["id"].as_u64() < m[1]["id"].as_u64()));
+        before = messages[0]["id"].clone();
+        ids.extend(messages.iter().map(|m| m["id"].as_u64().unwrap()));
+    }
+    assert_eq!(ids.len(), 1000);
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 1000);
+    let mut b = connect_device(&server, &Device::new(2, 22)).await;
+    assert_eq!(b.welcome.conversations[0].last_read, 0);
+    assert_eq!(b.welcome.conversations[0].count, vc_proto::UNREAD_CAP);
+    let mut b2 = connect_device(&server, &Device::new(2, 23)).await;
+    let mark = last["id"].as_u64().unwrap() - 5;
+    b.ok("chat.read", json!({"conversation":conversation,"message":mark})).await;
+    assert_eq!(b2.next_event("chat.read").await, json!({"conversation":conversation,"message":mark}));
+    b.ok("chat.read", json!({"conversation":conversation,"message":1})).await;
+    assert_eq!(b2.next_event("chat.read").await["message"], mark);
+    let b3 = connect_device(&server, &Device::new(2, 24)).await;
+    assert_eq!(b3.welcome.conversations[0].last_read, u32::try_from(mark).unwrap());
+    assert_eq!(b3.welcome.conversations[0].count, 5);
+    let default = a.ok("chat.sealed.history", json!({"conversation":conversation})).await;
+    assert_eq!(default["messages"].as_array().unwrap().len(), 50);
+    assert_eq!(
+        a.ok("chat.sealed.history", json!({"conversation":conversation,"limit":0})).await["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        a.ok("chat.sealed.history", json!({"conversation":conversation,"limit":1000})).await["messages"]
+            .as_array()
+            .unwrap()
+            .len(),
+        100
+    );
+    b.ok("chat.read", json!({"conversation":conversation,"message":last["id"]})).await;
+    assert!(connect_device(&server, &Device::new(2, 25)).await.welcome.conversations.is_empty());
+    store.mls_prune(now() + 100 * 86_400_000).unwrap();
+    assert!(store.mls_group(&group).unwrap().is_some());
+    assert_eq!(store.sealed_history(&conversation, None, 100).unwrap().len(), 100);
+    // A real restart retains ciphertexts and read state.
+    drop(server);
+    let mut config = base_config();
+    config.database = Some(database.clone());
+    config.data_dir = Some(directory.path().into());
+    let restarted = TestServer { running: vc_server::start(config).await.unwrap(), admin_token: String::new() };
+    let mut b = connect_device(&restarted, &Device::new(2, 26)).await;
+    assert!(b.welcome.conversations.is_empty());
+    assert_eq!(
+        b.ok("chat.sealed.history", json!({"conversation":conversation})).await["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap(),
+        &last
+    );
+}
+
+#[tokio::test]
+async fn sealed_member_removal_and_pruning_clear_marks_and_optionally_erase_authored_messages() {
+    for (delete_messages, prune) in [(false, false), (true, false), (true, true)] {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("db.sqlite3");
+        let server = TestServer::start_with(|c| c.database = Some(database.clone())).await;
+        let mut alice = Device::new(1, 11);
+        let mut bob = Device::new(2, 21);
+        let mut a = connect_device(&server, &alice).await;
+        a.redeem(&server.admin_token).await;
+        let mut b = connect_device(&server, &bob).await;
+        let mut outsider = connect_device(&server, &Device::new(3, 31)).await;
+        let conversation = vc_proto::dm_conversation(&uid(1), &uid(2));
+        let group = create(&mut a, &mut alice, 2, 1).await;
+        add(&mut a, &mut alice, &mut bob, &group).await;
+        let own = a.ok("chat.sealed.send", sealed(&conversation, &group, 1, 1)).await;
+        let peer = b.ok("chat.sealed.send", sealed(&conversation, &group, 1, 2)).await;
+        b.ok("chat.read", json!({"conversation":conversation,"message":peer["id"]})).await;
+        let peer_session = b.id();
+        b.close().await;
+        a.next_event_where("client.left", |e| e["client"] == peer_session).await;
+        let db = rusqlite::Connection::open(&database).unwrap();
+        if prune {
+            db.execute("UPDATE users SET last_seen=?1 WHERE uid=?2", rusqlite::params![now() - 3 * 86_400_000, uid(2)])
+                .unwrap();
+            a.ok(
+                "member.prune",
+                json!({"inactive_days":1,"without_groups_only":false,"delete_messages":true,"dry_run":false}),
+            )
+            .await;
+        } else {
+            a.ok("member.remove", json!({"uid":uid(2),"delete_messages":delete_messages})).await;
+        }
+        let marks: i64 = db.query_row("SELECT COUNT(*) FROM conversation_reads", [], |r| r.get(0)).unwrap();
+        assert_eq!(marks, 0);
+        let history = a.ok("chat.sealed.history", json!({"conversation":conversation})).await;
+        assert_eq!(
+            history["messages"],
+            if delete_messages { json!([own.clone()]) } else { json!([own.clone(), peer.clone()]) }
+        );
+        for op in ["chat.sealed.send", "chat.sealed.edit", "chat.delete_own"] {
+            let mut request = sealed(&conversation, &group, 1, 1);
+            request["revision"] = json!(1);
+            assert_eq!(a.fails(op, request).await, "forbidden");
+        }
+        a.ok("chat.read", json!({"conversation":conversation,"message":own["id"]})).await;
+        assert_eq!(a.ok("mls.log", json!({"group":group,"since":1})).await["pending"].as_array().unwrap().len(), 1);
+        if delete_messages {
+            assert_eq!(
+                a.next_event("chat.sealed.removed").await,
+                json!({"conversation":conversation,"ids":[peer["id"]]})
+            );
+        } else {
+            assert!(a.drain_events("chat.sealed.removed").await.is_empty());
+        }
+        assert!(outsider.drain_events("chat.sealed.removed").await.is_empty());
+        let mut b = connect_device(&server, &Device::new(2, 22)).await;
+        assert_eq!(b.welcome.conversations[0].last_read, 0);
+        assert_eq!(b.welcome.conversations[0].count, if delete_messages { 1 } else { 2 });
+        assert_eq!(b.ok("chat.sealed.history", json!({"conversation":conversation})).await, history);
+        if delete_messages {
+            assert_eq!(b.fails("chat.sealed.send", sealed(&conversation, &group, 1, 2)).await, "pending");
+        }
+    }
+}
+
+#[tokio::test]
+async fn sealed_writes_fail_closed_after_proposal_storage_failure_and_retry_reconciliation() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("db.sqlite3");
+    let server = TestServer::start_with(|c| c.database = Some(database.clone())).await;
+    let mut alice = Device::new(1, 11);
+    let mut bob = Device::new(2, 21);
+    let mut a = connect_device(&server, &alice).await;
+    let _b = connect_device(&server, &bob).await;
+    let conversation = vc_proto::dm_conversation(&uid(1), &uid(2));
+    let group = create(&mut a, &mut alice, 2, 1).await;
+    add(&mut a, &mut alice, &mut bob, &group).await;
+    let original = a.ok("chat.sealed.send", sealed(&conversation, &group, 1, 1)).await;
+    a.drain_events("chat.sealed").await;
+    let db = rusqlite::Connection::open(&database).unwrap();
+    db.execute_batch("CREATE TRIGGER fail_proposal BEFORE INSERT ON mls_proposals BEGIN SELECT RAISE(ABORT,'injected proposal failure'); END;").unwrap();
+    revoke(&server, 2, 21).await;
+    for op in ["chat.sealed.send", "chat.sealed.edit", "chat.delete_own"] {
+        let mut request = sealed(&conversation, &group, 1, 1);
+        request["revision"] = json!(1);
+        assert_eq!(a.fails(op, request).await, "internal");
+    }
+    assert!(a.drain_events("chat.sealed").await.is_empty());
+    assert_eq!(a.ok("chat.sealed.history", json!({"conversation":conversation})).await["messages"], json!([original]));
+    db.execute_batch("DROP TRIGGER fail_proposal").unwrap();
+    assert_eq!(a.fails("chat.sealed.send", sealed(&conversation, &group, 1, 2)).await, "pending");
+    assert_eq!(a.next_event("mls.proposal").await["group"], group);
+}

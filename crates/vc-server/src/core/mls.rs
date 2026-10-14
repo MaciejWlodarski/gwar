@@ -118,16 +118,16 @@ fn reply(value: MlsResponse) -> Reply {
 }
 
 impl Core {
-    fn mls_member(&self, uid: &str) -> Result<bool, ErrorBody> {
+    pub(super) fn mls_member(&self, uid: &str) -> Result<bool, ErrorBody> {
         Ok(self.store.user_by_uid(uid).map_err(storage_error)?.is_some()
             && !self.store.bans(now_ms()).map_err(storage_error)?.iter().any(|b| b.uid.as_deref() == Some(uid)))
     }
 
-    fn mls_can_read(&self, uid: &str, conversation: &str) -> Result<bool, ErrorBody> {
+    pub(super) fn mls_can_read(&self, uid: &str, conversation: &str) -> Result<bool, ErrorBody> {
         Ok(dm_participants(conversation).is_some_and(|p| p.contains(&uid)) && self.mls_member(uid)?)
     }
 
-    fn mls_readers(&self, conversation: &str) -> BTreeSet<SessionId> {
+    pub(super) fn mls_readers(&self, conversation: &str) -> BTreeSet<SessionId> {
         self.sessions
             .values()
             .filter(|s| s.out.is_some() && self.mls_can_read(&s.uid, conversation).unwrap_or(false))
@@ -190,18 +190,22 @@ impl Core {
         }
     }
 
-    pub(super) fn mls_reconcile(&mut self) -> anyhow::Result<()> {
-        for mut row in self.store.mls_all_groups()? {
-            let mut observer = Observer::load(&row.observer, &self.server_key)?;
-            let mut existing = self.store.mls_proposals(&row.group)?;
-            let added = self.mls_missing_proposals(&mut observer, &existing)?;
-            if added.is_empty() {
-                continue;
-            }
+    pub(super) fn mls_reconcile_group(&mut self, mut row: GroupRow) -> anyhow::Result<()> {
+        let mut observer = Observer::load(&row.observer, &self.server_key)?;
+        let mut existing = self.store.mls_proposals(&row.group)?;
+        let added = self.mls_missing_proposals(&mut observer, &existing)?;
+        if !added.is_empty() {
             row.observer = observer.save();
             existing.extend(added.iter().map(|p| ProposalRow { leaf: p.leaf, proposal: p.proposal.clone() }));
             self.store.mls_write_group(&row, &observer.leaves(), &existing, None, None)?;
             self.mls_announce_proposals(&row, &added);
+        }
+        Ok(())
+    }
+
+    pub(super) fn mls_reconcile(&mut self) -> anyhow::Result<()> {
+        for row in self.store.mls_all_groups()? {
+            self.mls_reconcile_group(row)?;
         }
         Ok(())
     }

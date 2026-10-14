@@ -13,6 +13,7 @@ mod messages;
 mod mls;
 mod moderation;
 mod passwords;
+mod sealed;
 
 use moderation::ban_message;
 use vc_proto::BanNotice;
@@ -541,7 +542,15 @@ impl Core {
     }
 
     fn broadcast(&mut self, event: Event, filter: impl Fn(&Session) -> bool) {
-        if !self.applying_remote && !matches!(event, Event::VoiceTalking { .. }) {
+        if !self.applying_remote
+            && !matches!(
+                event,
+                Event::VoiceTalking { .. }
+                    | Event::ChatSealed(_)
+                    | Event::ChatSealedRemoved { .. }
+                    | Event::ChatRead { target: vc_proto::ChatReadTarget::Conversation { .. }, .. }
+            )
+        {
             self.notify_bridge(|| BridgeNote::Event(Box::new(event.clone())));
         }
         let frame = encode(&ServerFrame::Event(event));
@@ -700,6 +709,13 @@ impl Core {
         if let Some(tags) = tags_before {
             self.announce_tags(tags);
         }
+        let conversations = match self.store.sealed_unread(user.id, &r.uid) {
+            Ok(conversations) => conversations,
+            Err(e) => {
+                warn!("store: {e:#}");
+                return fail(ErrorCode::Internal, "storage error");
+            }
+        };
         let id = self.allocate_session();
         let session = Session {
             hello_key: r.hello_key,
@@ -744,6 +760,7 @@ impl Core {
             clients: self.sessions.values().map(client_view).collect(),
             members,
             unread,
+            conversations,
             ice_servers: self.ice_servers.clone(),
             file_access: self.sessions[&id].file_access.clone(),
         };
@@ -1046,7 +1063,13 @@ impl Core {
             Request::ClientKick { client, reason } => self.client_kick(session, client, reason),
             Request::ChannelJoin { channel, password } => return self.channel_join(session, id, channel, password),
             Request::ChannelLeave {} => self.channel_leave(session),
-            Request::ChatRead { channel, message } => self.chat_read(session, channel, message),
+            Request::ChatRead { target, message } => match target {
+                vc_proto::ChatReadTarget::Channel { channel } => self.chat_read(session, channel, message),
+                vc_proto::ChatReadTarget::Conversation { conversation } => {
+                    self.sealed_read(session, &conversation, message)
+                }
+            },
+            Request::Sealed(request) => self.sealed_request(session, request),
             Request::ChannelCreate(create) => return self.channel_create(session, id, create),
             Request::ChannelUpdate(update) => return self.channel_update(session, id, update),
             Request::ChannelDelete { channel } => self.channel_delete(session, channel),
@@ -1209,7 +1232,9 @@ impl Core {
         let user = s.user_id;
         let message = self.store.mark_read(user, channel, message).map_err(storage_error)?;
         // Every device of this user follows.
-        self.broadcast(Event::ChatRead { channel, message }, |s| s.user_id == user && s.out.is_some());
+        self.broadcast(Event::ChatRead { target: vc_proto::ChatReadTarget::Channel { channel }, message }, |s| {
+            s.user_id == user && s.out.is_some()
+        });
         Ok(Response::Empty {})
     }
 
@@ -1557,6 +1582,12 @@ impl Core {
             ChatTarget::Client(to) => {
                 if !self.sessions.contains_key(&to) {
                     return Err(err(ErrorCode::NotFound, "no such client"));
+                }
+                if !author.uid.starts_with("ts:") && !self.sessions[&to].uid.starts_with("ts:") {
+                    return Err(err(
+                        ErrorCode::Forbidden,
+                        "direct messages between Gwar members require chat.sealed.send",
+                    ));
                 }
                 self.verify_message(session, &message, false)?;
                 self.reserve_message_identity(&message)?;

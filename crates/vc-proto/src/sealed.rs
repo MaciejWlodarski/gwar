@@ -1,0 +1,93 @@
+//! Stored encrypted direct messages. Binary fields use canonical unpadded base64url.
+
+use super::*;
+
+wire! {
+    #[serde(tag = "op", content = "d")]
+    pub enum SealedRequest {
+        #[serde(rename = "chat.sealed.send")]
+        Send { conversation: String, group: String, #[cfg_attr(feature = "ts", ts(type = "number"))] epoch: u64, message_id: String, ciphertext: String },
+        #[serde(rename = "chat.sealed.edit")]
+        Edit { conversation: String, group: String, #[cfg_attr(feature = "ts", ts(type = "number"))] epoch: u64, message_id: String, revision: u32, ciphertext: String },
+        #[serde(rename = "chat.delete_own")]
+        DeleteOwn { conversation: String, group: String, #[cfg_attr(feature = "ts", ts(type = "number"))] epoch: u64, message_id: String, revision: u32, ciphertext: String },
+        #[serde(rename = "chat.sealed.history")]
+        History { conversation: String, #[serde(default)] before: Option<MessageId>, #[serde(default)] limit: Option<u32> },
+    }
+
+    /// Exactly one read target, shared by requests and events.
+    #[serde(untagged, deny_unknown_fields)]
+    pub enum ChatReadTarget {
+        Channel { channel: ChannelId },
+        Conversation { conversation: String },
+    }
+
+    pub struct SealedMessage {
+        pub id: MessageId,
+        pub conversation: String,
+        pub group: String,
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        pub epoch: u64,
+        pub author_uid: Uid,
+        pub author_name: String,
+        pub message_id: String,
+        pub revision: u32,
+        pub ciphertext: String,
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        pub sent_at: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(type = "number | null"))]
+        pub edited_at: Option<i64>,
+        pub deleted: bool,
+    }
+
+    pub struct ConversationUnread {
+        pub conversation: String,
+        pub last_read: MessageId,
+        /// Messages after last_read, capped at UNREAD_CAP, as for channels.
+        pub count: u32,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn read_targets_have_exactly_one_address() {
+        for d in [json!({"channel":1,"message":2}), json!({"conversation":"dm:a:b","message":2})] {
+            let frame = json!({"id":7,"op":"chat.read","d":d});
+            let request: ClientFrame = serde_json::from_value(frame.clone()).unwrap();
+            assert_eq!(serde_json::to_value(request).unwrap(), frame);
+            let frame = json!({"ev":"chat.read","d":d});
+            let event: Event = serde_json::from_value(frame.clone()).unwrap();
+            assert_eq!(serde_json::to_value(event).unwrap(), frame);
+        }
+        for d in [json!({"message":2}), json!({"channel":1,"conversation":"dm:a:b","message":2})] {
+            assert!(serde_json::from_value::<ClientFrame>(json!({"id":7,"op":"chat.read","d":d})).is_err());
+        }
+    }
+
+    #[test]
+    fn sealed_rows_are_not_plaintext_messages() {
+        let m = SealedMessage {
+            id: 1,
+            conversation: "dm:a:b".into(),
+            group: "g".into(),
+            epoch: 3,
+            author_uid: "a".into(),
+            author_name: "A".into(),
+            message_id: "m".into(),
+            revision: 2,
+            ciphertext: "AA".into(),
+            sent_at: 1,
+            edited_at: Some(2),
+            deleted: true,
+        };
+        let reply = Response::SealedMessage(Box::new(m.clone()));
+        assert_eq!(serde_json::from_value::<Response>(serde_json::to_value(&reply).unwrap()).unwrap(), reply);
+        let history = Response::SealedHistory { messages: vec![m] };
+        assert_eq!(serde_json::from_value::<Response>(serde_json::to_value(&history).unwrap()).unwrap(), history);
+    }
+}

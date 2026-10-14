@@ -6,7 +6,8 @@ import type { Group } from "./Group";
 import type { Invite } from "./Invite";
 import type { Member } from "./Member";
 import type { MlsResponse } from "./MlsResponse";
+import type { SealedMessage } from "./SealedMessage";
 import type { ServerProof } from "./ServerProof";
 import type { Welcome } from "./Welcome";
 
-export type Response = ServerProof | Welcome | Channel | ChatMessage | { messages: Array<ChatMessage>, } | { token: string, } | { groups: Array<number>, } | { sdp: string, } | { group: Group, } | { ban: Ban, } | { bans: Array<Ban>, } | { invite: Invite, } | { invites: Array<Invite>, } | { file: string, upload_url: string, } | { uids: Array<string>, count: number, members: Array<Member>, } | MlsResponse | Record<symbol, never>;
+export type Response = ServerProof | Welcome | Channel | ChatMessage | { messages: Array<ChatMessage>, } | SealedMessage | { messages: Array<SealedMessage>, } | { token: string, } | { groups: Array<number>, } | { sdp: string, } | { group: Group, } | { ban: Ban, } | { bans: Array<Ban>, } | { invite: Invite, } | { invites: Array<Invite>, } | { file: string, upload_url: string, } | { uids: Array<string>, count: number, members: Array<Member>, } | MlsResponse | Record<symbol, never>;

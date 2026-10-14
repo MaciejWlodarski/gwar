@@ -343,6 +343,8 @@ function channelNotices(prev: SessionState, next: SessionState, at: number, id: 
 
 function reduceEvent(state: SessionState, event: Event, now: number, verified = false, authentic = false): SessionState {
   switch (event.ev) {
+    case "chat.sealed":
+    case "chat.sealed.removed":
     case "mls.commit":
     case "mls.proposal":
     case "mls.welcome":
@@ -413,6 +415,7 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
     case "chat.message":
       return onChatMessage(state, event.d, verified, authentic);
     case "chat.read": {
+      if (!("channel" in event.d)) return state;
       const { channel, message } = event.d;
       if (!state.channels[channel]) return state;
       return withThread(state, channelThreadKey(channel), (t) => ({

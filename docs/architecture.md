@@ -177,6 +177,33 @@ Joins and removals announce affected tags through
 `member.updated`. Tags may grow or shrink. `Member.connect` is a public handle
 confirmed asynchronously by Connect (see [connect.md](connect.md)).
 
+Encrypted Gwar-to-Gwar DMs use `chat.sealed.send`, `chat.sealed.edit`,
+`chat.delete_own` and `chat.sealed.history`; `chat.sealed` carries the newest
+opaque revision to every session of both participants. Writes require both
+participants to be members, the live MLS group and epoch (`stale` otherwise),
+and no outstanding removal proposal (`pending` otherwise). Only the author uid
+may revise a message; revisions increase, and deletion is terminal. The server
+cannot verify the encrypted signature; clients verify it after decryption.
+
+SQLite stores the newest 1000 bodies per DM in `sealed_messages`, with permanent
+per-conversation message-id reservations and non-repeating numeric ids. The
+24 KiB decoded ciphertext limit applies to all writes. History pages use the
+channel `before` cursor (oldest returned id), default 50, at most 100 rows and
+a 640 KiB response budget. Conversation `chat.read {conversation, message}`
+marks live in `conversation_reads`, only move forward, and missing marks mean
+nothing read. `Welcome.conversations` lists unread DMs with counts capped at
+100. Remaining participants retain history and group access after peer removal;
+removal deletes the peer's marks and, with `delete_messages`, their sealed
+bodies in the same transaction. `chat.sealed.removed {conversation, ids}`
+announces those removals to the remaining participant. Member merges preserve
+sealed author identities; sealed groups and bodies have no age expiry.
+
+Plaintext `chat.send` DMs require a TeamSpeak participant (`ts:…`), stay live-only,
+and remain signed for Gwar authors and unsigned from the bridge. Other native
+plaintext DM sends return `forbidden` with an instruction to use
+`chat.sealed.send`. Sealed messages and conversation read events bypass the
+plaintext TeamSpeak bridge.
+
 ## MLS delivery service
 
 The vc/4 delivery service follows direct message groups as public OpenMLS

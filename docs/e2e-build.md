@@ -572,7 +572,13 @@ New tables (migration in `store.rs`):
   message_id, revision, epoch, ciphertext, sent_at, edited_at, deleted)`, with
   the server's numeric message id as today, unique `(conversation,
   message_id)`;
-- `conversation_reads(user_id, conversation, message)`.
+- `conversation_reads(user_id, conversation, message)`;
+- `sealed_message_identities(conversation, message_id)`: permanent replay
+  reservations, as for plaintext message identities, retained when a body is
+  pruned or its author removed. Reserving an id, inserting the sealed body and
+  pruning to 1000 happen in one transaction. Numeric sealed ids never repeat,
+  including after all bodies have been deleted, so existing read marks remain
+  meaningful.
 
 Expired key packages, and log entries, Welcomes and history chunks older than
 90 days are pruned with the existing periodic cleanup. Groups of a direct
@@ -640,7 +646,9 @@ messages: like signed messages, their author is inside the signature.
 | `chat.sealed.history {conversation, before?, limit?}` | `{messages}` | as channel history |
 | `chat.read {conversation, message}` | `{}` | read marks per conversation |
 
-Sealed writes are also refused with `pending` while the group has an
+Before writing, the server reconciles that group's removal proposals; a
+storage failure refuses the write rather than using an epoch still known to a
+revoked device. Sealed writes are also refused with `pending` while the group has an
 outstanding server proposal (see "Removal proposals"). On `stale` or
 `pending` the client catches up (`mls.log`), commits outstanding proposals
 if needed (a device whose own leaf an outstanding proposal removes cannot
@@ -660,8 +668,25 @@ conversation for each participant (no mentions: they are inside the
 ciphertext). A participant without a read mark has read nothing in that
 conversation (unlike channels, where a missing mark starts at the newest
 message). `Welcome` gains `conversations: [{conversation, last_read, count}]`
-for every direct message with unread messages, and the `chat.read` event gains
-the conversation form, for the user's other sessions.
+for every direct message with unread messages (counts capped at `UNREAD_CAP`,
+100, as for channels), and the `chat.read` event gains
+the conversation form, for the user's other sessions. A read request or event
+has exactly one of `channel` and `conversation`, plus `message`. Marks only
+move forward. Sending and editing do not advance a mark; retained deletion
+rows count until read, and an edit keeps the original numeric id.
+
+Message ids are canonical base64url encodings of 16 bytes, and ciphertext is
+canonical unpadded base64url. The 24 KiB limit applies to decoded ciphertext,
+including edits and deletions. The server treats it as opaque: the encrypted
+signature, inner revision and deletion body are verified by receiving clients.
+It enforces the outer author uid, increasing revision, and terminal `deleted`
+state. Timestamps are server receipt times, with `sent_at` unchanged by edits.
+
+Sealed history uses channel history's `before` cursor and oldest-first order,
+default 50 and a limit clamped to 1–100. It can return fewer rows to keep the
+complete response within 640 KiB; continue using the oldest returned id as
+`before`. Sealed events and conversation read events never go to the TeamSpeak
+bridge.
 
 ### Client
 
