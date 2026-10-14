@@ -74,19 +74,21 @@ and a `duplicate` flag; acknowledge both results after persistence.
 
 ## Chat envelope
 
-`chat::seal(&Agent, &Context, &Plaintext, now, revocations)` returns nonce,
+`chat::seal(&Agent, &Context, plaintext: &[u8], now, revocations)` returns nonce,
 ciphertext and tag bytes. It obtains the key through `sending_key`, checks
 that the context names the descriptor's conversation and current epoch, then
 uses HKDF-SHA256 with the raw 16-byte message id and big-endian u32 revision,
 and AES-256-GCM with a fresh random 96-bit nonce. The AAD is exactly the
 versioned statement in the build spec.
 
-`chat::open(&Agent, &Context, ciphertext)` returns `Plaintext` or `ChatError`.
-It uses derived or imported epoch keys and checks the inner signature's
-server, conversation, group, epoch, message id and revision. Missing groups
+`chat::open(&Agent, &Context, ciphertext)` returns `Vec<u8>` or `ChatError`.
+Seal encrypts the input JSON bytes unchanged; open returns those exact bytes.
+Both parse only the six signature context fields, avoiding the full protocol
+message/attachment/certificate types in wasm. Open uses derived or imported
+epoch keys and checks the inner signature's server, conversation, group, epoch, message id and revision. Missing groups
 or keys return `NoKey`; authentication/JSON errors cannot yield plaintext.
-The caller **must verify the returned v3 MessageSignature**, including
-revision and revocation rules. This module does not assert author authenticity.
+The caller **must parse/validate the full plaintext and verify its v3
+MessageSignature**, including revision and revocation rules. This module does not assert author authenticity.
 
 `inventory(server)` returns each group's id, conversation, history policy,
 record and current member device keys/uids, including Creating groups. It
@@ -250,7 +252,7 @@ cargo build -p vc-server --no-default-features
 pnpm --filter web e2e:mls
 ```
 
-The native suite has 61 unit tests and 11 observer integration tests. Chat
+The native suite has 62 unit tests and 11 observer integration tests. Chat
 coverage includes an independently generated Node HKDF/AES-GCM fixed vector,
 every AAD/inner context field, random nonces, wrong keys, every truncation,
 tampered nonce/ciphertext/tag, the sending gate and imported history keys.
@@ -259,8 +261,8 @@ real delivery service, four device runtimes, IndexedDB and Web Locks, with no
 DM UI or chat.sealed server calls. Remote CI and production were not run.
 
 With Rust 1.99.0, Node **22.23.3**, wasm-bindgen 0.2.129 and Binaryen 123.0.0,
-the artifact totals **474,799 bytes gzip**: wasm 471,756, minified loader 2,852,
-inline JavaScript 191; 5,201 bytes below the 480,000-byte limit.
+the artifact totals **463,780 bytes gzip**: wasm 460,737, minified loader 2,852,
+inline JavaScript 191; 16,220 bytes below the 480,000-byte limit.
 On this macOS host the wasm build uses the rustup toolchain's `bin` ahead of
 Homebrew Rust and a local rust-lld wrapper setting `DYLD_LIBRARY_PATH` to that
 toolchain's `lib` directory. CI uses the pinned Linux job.

@@ -73,8 +73,8 @@ const plaintext = { text: 'sealed hello', mentions: [], attachments: [], signatu
   message_id: Buffer.from(context.message_id).toString('base64url'), revision: 0, previous_revision_hash: '-',
   created_at: now, signed_at: now, body_hash: Buffer.alloc(32).toString('base64url'), signature: '',
 } };
-const sealed = a.agent.execute({ op: 'seal_message', context, plaintext, now, revocations: [] }); persist(a);
-assert.deepEqual(b.agent.execute({ op: 'open_message', context, ciphertext: sealed }), { ok: plaintext }); persist(b);
+const sealed = a.agent.execute({ op: 'seal_message', context, plaintext: [...Buffer.from(JSON.stringify(plaintext, null, 2))], now, revocations: [] }); persist(a);
+assert.deepEqual(b.agent.execute({ op: 'open_message', context, ciphertext: sealed }), { ok: [...Buffer.from(JSON.stringify(plaintext, null, 2))] }); persist(b);
 assert.deepEqual(b.agent.execute({ op: 'open_message', context: { ...context, revision: 1 }, ciphertext: sealed }), { reason: 'cannot_open' }); persist(b);
 assert.deepEqual(b.agent.execute({ op: 'open_message', context: { ...context, epoch: '0' }, ciphertext: sealed }), { reason: 'no_key' }); persist(b);
 assert.equal(a.agent.execute({ op: 'inventory', server })[0].members.length, 2);

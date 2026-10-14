@@ -291,9 +291,16 @@ credential, the OpenMLS provider and Gwar's own per-group records.
 - AES-256-GCM, a random 96-bit nonce; `ciphertext = nonce ‖ sealed ‖ tag`.
 - AAD (UTF-8): `gwar chat ciphertext v1\n{server_key}\n{conversation}\n{group_id}\n{epoch}\n{message_id}\n{revision}`.
 - The plaintext is JSON `{"text", "mentions", "attachments", "signature"}`
-  with a v3 signature (step 2). Opening checks that `conversation`,
-  `group_id`, `epoch`, `message_id` and `revision` inside the signature equal
-  those outside; the caller then verifies the signature as for any message.
+  with a v3 signature (step 2). `chat::seal` takes the plaintext JSON bytes
+  and encrypts them unchanged; `chat::open` returns the decrypted bytes.
+  Both parse only `server_key`, `conversation`, `group_id`, `epoch`,
+  `message_id` and `revision` from `signature` and require them to equal the
+  outer context. The web caller parses and validates the full plaintext,
+  checks the certificate, body hash and v3 author signature before returning
+  it; the UI additionally applies revision continuity and revocation rules.
+  Opening uses a read-only agent query, with no persistence transaction.
+  Missing keys return `no_key`, invalid envelopes/authentication return
+  `cannot_open`, and operational failures propagate to the caller.
 
 ### History bundles (`gwar_mls::history`)
 
@@ -352,11 +359,15 @@ credential, the OpenMLS provider and Gwar's own per-group records.
   their server/group form and strict validation. History intents for newly
   admitted devices are written in the same transaction as the accepted
   group transition; sealed chunk bytes are persisted before sending and
-  reused on retry for server deduplication.
+  reused on retry for server deduplication. Each sealed history job also stores
+  the recipient's signed device HPKE publication. Before retries the runtime
+  fetches publications again; a strictly newer publication is verified by the
+  core and resealed chunks replace the old job in one durable write before
+  sending. Older or unchanged publications do not regenerate chunks.
 - Loading validates canonical group keys and requires epoch and outbox keys
   to name a known group exactly. Epoch suffixes are exactly 20 decimal digits
   encoding a u64; history chunk spans use checked arithmetic.
-- Agent operations run one at a time. Each ends with `take_changes()`: the
+- Agent operations run one at a time. Mutations end with `take_changes()`: the
   changed and deleted keys of all stores, written by the caller in **one**
   IndexedDB transaction before anything is sent and before the next
   operation starts. If the operation fails (an OpenMLS error or a Gwar rule;
@@ -627,8 +638,16 @@ messages: like signed messages, their author is inside the signature.
   registering it with `mls.group.create`, then `settle` with the group of the
   reply `{group}` or of `conflict`. If it won: `mls.key_packages.claim {uids:
   [peer, self]}` and one `mls.commit` adding every claimed device not yet in
-  the group, with its Welcome; if not, join the winner by Welcome or external commit. A group
+  the group and current in the local revocation view, with its Welcome. Apply
+  this filter both to advertised admission candidates and to claimed packages,
+  since the local view may be ahead of the server's. If creation lost, join the
+  winner by Welcome or external commit. A group
   still **Creating** after a restart is settled with `mls.groups`.
+- Before treating an unfamiliar Welcome as superseded by local active
+  membership, catch up through the authoritative log, stopping at eviction.
+  A device removed and readmitted while offline imports the readmission
+  Welcome before external rejoin, then acknowledges only after the joined state
+  and delivery id are durable. An already recorded id is deduplicated.
 - Devices without a key package (never online since the update), and new
   devices, join on connect by external commit, in the background (design:
   "Joining").

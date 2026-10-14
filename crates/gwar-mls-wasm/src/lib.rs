@@ -31,6 +31,19 @@ fn credential(bytes: &[u8]) -> Result<Credential, JsValue> {
     Credential::parse(bytes).ok_or_else(|| error("invalid credential"))
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OpenResult {
+    Ok(Vec<u8>),
+    Reason(OpenFailure),
+}
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OpenFailure {
+    NoKey,
+    CannotOpen,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Revoked {
@@ -54,7 +67,7 @@ enum Request {
     },
     SealMessage {
         context: gwar_mls::chat::Context,
-        plaintext: Box<gwar_mls::chat::Plaintext>,
+        plaintext: Vec<u8>,
         now: i64,
         revocations: View,
     },
@@ -192,9 +205,12 @@ impl Agent {
             Request::OpenMessage { context, ciphertext } => {
                 // Missing keys are an expected read result, not a poisoned mutation.
                 match gwar_mls::chat::open(a, &context, &ciphertext) {
-                    Ok(plaintext) => output(serde_json::json!({"ok": plaintext})),
-                    Err(gwar_mls::chat::ChatError::NoKey) => output(serde_json::json!({"reason": "no_key"})),
-                    Err(_) => output(serde_json::json!({"reason": "cannot_open"})),
+                    Ok(plaintext) => output(OpenResult::Ok(plaintext)),
+                    Err(gwar_mls::chat::ChatError::NoKey) => output(OpenResult::Reason(OpenFailure::NoKey)),
+                    Err(gwar_mls::chat::ChatError::CannotOpen | gwar_mls::chat::ChatError::Context) => {
+                        output(OpenResult::Reason(OpenFailure::CannotOpen))
+                    }
+                    Err(e) => Err(error(e)),
                 }
             }
             Request::KeyPackages { count, now } => output(a.key_packages(count, now).map_err(error)?),

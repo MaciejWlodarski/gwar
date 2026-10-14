@@ -24,8 +24,8 @@ logging is disabled. CI builds this exact target, runs the smoke test, and
 fails if all emitted wasm and JavaScript files exceed **480,000 bytes gzip**
 (level 9, each file compressed separately). Load the module on first use and cache it. Including chat encryption and
 runtime inventory, the build measured with Rust 1.99.0 and Node 22.23.3 is
-**474,799 bytes gzip** (wasm 471,756; minified loader 2,852; inline JavaScript
-191), leaving 5,201 bytes of headroom. Generated files in `pkg` are
+**463,780 bytes gzip** (wasm 460,737; minified loader 2,852; inline JavaScript
+191), leaving 16,220 bytes of headroom. Generated files in `pkg` are
 ignored; Cargo metadata resolves the artifact directory, including custom
 `CARGO_TARGET_DIR` values, and a missing artifact fails the build. The loader
 is minified with the existing locked frontend Vite/Rolldown dependency; no
@@ -105,21 +105,24 @@ const context = {
   epoch: '1', message_id: messageIdBytes16, revision: 0,
 };
 const ciphertext = agent.execute({ seal_message: {
-  context, plaintext: {text, mentions, attachments, signature},
+  context, plaintext: new TextEncoder().encode(JSON.stringify({text, mentions, attachments, signature})),
   now: Date.now(), revocations: [],
 } });
 // Persist take_changes() before returning ciphertext to the sender.
 const result = agent.execute({ open_message: { context, ciphertext } });
-// {ok: {text, mentions, attachments, signature}} or
+// {ok: number[]} (the exact decrypted JSON bytes) or
 // {reason: 'no_key' | 'cannot_open'}
-// Verify the returned v3 signature before displaying or notifying.
+// Parse/validate the full JSON and verify its v3 signature before use.
 ```
 
 Sealing checks the sending gate again and requires the signature's context
 to match the current group and epoch. Opening checks every inner context
-field, but author signature verification remains the caller's job. Missing
-keys and authentication failures are typed read results; malformed wrapper
-requests still throw. The serial queue also persists after these queries.
+field by parsing only the six fields inside `signature`; both operations
+preserve the plaintext bytes unchanged. Full plaintext validation and author
+signature verification remain the caller's job (implemented by the web runtime).
+Missing keys and authentication failures are typed read results; malformed wrapper
+requests and operational failures still throw. Opening is a read-only query;
+it does not call `take_changes()` or create a persistence transaction.
 
 [The web runtime](../../apps/web/src/mls/README.md) supplies lazy loading,
 Web Locks, atomic IndexedDB persistence, connection-driven sync, outbox

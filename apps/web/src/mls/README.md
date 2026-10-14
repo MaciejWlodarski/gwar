@@ -32,10 +32,15 @@ unsubscribe();
 await runtime.close();
 ```
 
-`openMessage` authenticates the envelope and checks the inner context; it does
-**not** verify the v3 author's signature, revision continuity or revocations.
-The UI step must extend/use `MessageVerifier` for encrypted message contexts
-before rendering or notifying. Today's plaintext verifier rejects non-dash
+`openMessage` authenticates the envelope, checks all six inner context fields,
+parses the full plaintext and verifies its body hash, device certificate and
+v3 author signature. Step 3 rejects attachments. It uses the agent query path
+without an IndexedDB write. Invalid envelopes/plaintext/authentication return
+`cannot_open`; absent keys return `no_key`; storage, runtime, closed-session
+and operational crypto failures reject the promise. The UI step must
+extend/use `MessageVerifier` for encrypted message contexts to apply revision
+continuity and revocation rules before rendering or notifying. Today's
+plaintext verifier rejects non-dash
 group/epoch fields. The runtime sends only MLS protocol requests, never chat
 messages. No existing plaintext message send path changes here.
 
@@ -85,17 +90,26 @@ keys retain their exact server/group form. Runtime entries are JSON bytes:
   comparing the accepted membership before/after a mutation. Their intents
   are committed in the **same transaction** as the accepted state, including
   commits accepted through outbox reconciliation. Chunk generation and its
-  outbox write precede sending; retries reuse identical chunks for server
-  deduplication. A job is deleted only after all chunks were accepted, or its
-  recipient ceased to be a member. The gate is checked again before retries.
+  outbox write precede sending. Sealed jobs include `publication`, the verified
+  recipient `{device_key, hpke_key, created_at, signature}` (`null` for an
+  intent). Every retry fetches the recipient's current publication: a strictly
+  newer one is verified by the core and resealed chunks replace the whole job
+  atomically before sending. Failed validation or storage preserves the old
+  job. Unchanged/older publications reuse identical bytes for server
+  deduplication, including when another `wanted` request arrives. A job is
+  deleted only after all chunks were accepted, or its recipient ceased to be a member. The gate is checked again before retries.
 
 Creating groups settle against the complete paginated `mls.groups` snapshot.
 Welcomes are acknowledged only after durable membership: known delivery ids
-use core deduplication, and an already active membership supersedes a late
-Welcome for that group without replacing its epoch. Pending external commits
-are reconciled first. Log pages process their referenced proposals before
-commits, then the head's pending proposal set. Noncurrent leaves are removed
-by a member commit; an own removal requires external rejoin.
+use core deduplication. Before declaring an unfamiliar Welcome superseded,
+the runtime replays the log (and reconciles pending commits), stopping at
+eviction. A readmission Welcome is imported and persisted before acknowledgement
+or external rejoin. Only membership caught up to the log head supersedes a
+late Welcome without replacing its epoch. Log pages process their referenced
+proposals before commits, then the head's pending proposal set. Noncurrent leaves are removed
+by a member commit; admission candidates and claimed adds are filtered against
+the local revocation view even if the server still advertises them. An own
+removal requires a readmission Welcome or external rejoin.
 
 History fetches are acknowledged after import. Missing message epochs remain
 in an in-memory demand set; requests are limited to once a minute per group
@@ -110,7 +124,11 @@ Tests use fake-indexeddb, an injectable agent/connection and real IndexedDB
 transaction aborts. `pnpm --filter web e2e:mls` additionally starts its own
 loopback-only `vc-server --no-connect` with disposable data and Vite, then
 uses Chromium with the real wasm. It checks two users, four devices, equal
-epoch keys, message opening, history import, restart and device-lock handoff.
+epoch keys, authenticated message opening, history import, restart and device-lock
+handoff. Unit regressions also cover offline readmission and failed Welcome
+writes, locally revoked admission and a feed advancing during claims, HPKE
+rotation with failed atomic replacement, identical history retries, read-only
+opening and operational failure propagation, and full v3 plaintext validation.
 Build `cargo build -p vc-server --no-default-features` and the wasm first;
 install Chromium using `pnpm --filter web exec playwright install chromium`.
 The `mls-wasm` CI job runs this test. No production or TeamSpeak service is used.

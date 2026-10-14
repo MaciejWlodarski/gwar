@@ -9,7 +9,6 @@ use openmls_rust_crypto::RustCrypto;
 use openmls_traits::{crypto::OpenMlsCrypto, random::OpenMlsRand, types::AeadType};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use vc_proto::{Attachment, MessageSignature};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,13 +21,20 @@ pub struct Context {
     pub message_id: [u8; 16],
     pub revision: u32,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Plaintext {
-    pub text: String,
-    pub mentions: Vec<String>,
-    pub attachments: Vec<Attachment>,
-    pub signature: MessageSignature,
+// Only the authenticated context belongs in the crypto layer. The caller parses
+// and validates the full plaintext and verifies the author's v3 signature.
+#[derive(Deserialize)]
+struct PlaintextContext {
+    signature: SignatureContext,
+}
+#[derive(Deserialize)]
+struct SignatureContext {
+    server_key: String,
+    conversation: String,
+    group_id: String,
+    epoch: String,
+    message_id: String,
+    revision: u32,
 }
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ChatError {
@@ -56,7 +62,8 @@ impl Context {
             self.revision
         ))
     }
-    fn matches(&self, p: &Plaintext) -> bool {
+    fn matches(&self, bytes: &[u8]) -> bool {
+        let Ok(p) = serde_json::from_slice::<PlaintextContext>(bytes) else { return false };
         let s = &p.signature;
         s.server_key == self.server_key
             && s.conversation == self.conversation
@@ -78,7 +85,7 @@ impl Context {
 pub fn seal(
     agent: &Agent,
     context: &Context,
-    plaintext: &Plaintext,
+    plaintext: &[u8],
     now: i64,
     revocations: &dyn Revocations,
 ) -> Result<Vec<u8>, ChatError> {
@@ -87,7 +94,7 @@ pub fn seal(
         return Err(ChatError::Context);
     }
     let nonce = RustCrypto::default().random_array().map_err(|_| ChatError::CannotOpen)?;
-    seal_bytes(context, &key, &serde_json::to_vec(plaintext).map_err(|_| ChatError::Context)?, &nonce)
+    seal_bytes(context, &key, plaintext, &nonce)
 }
 fn group_matches(agent: &Agent, c: &Context) -> bool {
     agent
@@ -103,7 +110,7 @@ fn seal_bytes(c: &Context, key: &[u8; 32], plaintext: &[u8], nonce: &[u8; 12]) -
     bytes.extend(sealed);
     Ok(bytes)
 }
-pub fn open(agent: &Agent, context: &Context, ciphertext: &[u8]) -> Result<Plaintext, ChatError> {
+pub fn open(agent: &Agent, context: &Context, ciphertext: &[u8]) -> Result<Vec<u8>, ChatError> {
     if agent.group(&context.server_key, &context.group_id).is_none() {
         return Err(ChatError::NoKey);
     }
@@ -116,23 +123,30 @@ pub fn open(agent: &Agent, context: &Context, ciphertext: &[u8]) -> Result<Plain
         .ok_or(ChatError::NoKey)?;
     open_bytes(context, key, ciphertext)
 }
-fn open_bytes(c: &Context, key: &[u8; 32], ciphertext: &[u8]) -> Result<Plaintext, ChatError> {
+fn open_bytes(c: &Context, key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>, ChatError> {
     if ciphertext.len() < 28 {
         return Err(ChatError::CannotOpen);
     }
     let bytes = RustCrypto::default()
         .aead_decrypt(AeadType::Aes256Gcm, &c.key(key), &ciphertext[12..], &ciphertext[..12], c.aad()?.as_bytes())
         .map_err(|_| ChatError::CannotOpen)?;
-    let plaintext = serde_json::from_slice(&bytes).map_err(|_| ChatError::CannotOpen)?;
-    if !c.matches(&plaintext) {
+    if !c.matches(&bytes) {
         return Err(ChatError::Context);
     }
-    Ok(plaintext)
+    Ok(bytes)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vc_proto::{Attachment, MessageSignature};
+    #[derive(Clone, Serialize)]
+    struct Plaintext {
+        text: String,
+        mentions: Vec<String>,
+        attachments: Vec<Attachment>,
+        signature: MessageSignature,
+    }
     fn fixture() -> (Context, Plaintext) {
         let c = Context {
             server_key: b64(&[1; 32]),
@@ -162,7 +176,7 @@ mod tests {
     fn envelope_and_all_aad_fields() {
         let (c, p) = fixture();
         let bytes = seal_bytes(&c, &[4; 32], &serde_json::to_vec(&p).unwrap(), &[5; 12]).unwrap();
-        assert_eq!(open_bytes(&c, &[4; 32], &bytes).unwrap().text, "hello");
+        assert_eq!(open_bytes(&c, &[4; 32], &bytes).unwrap(), serde_json::to_vec(&p).unwrap());
         for mutate in [
             (|c: &mut Context| c.server_key = b64(&[9; 32])) as fn(&mut Context),
             |c| c.conversation.push('x'),
@@ -203,6 +217,22 @@ mod tests {
         }
     }
     #[test]
+    fn preserves_plaintext_json_bytes_and_only_parses_signature_context() {
+        let (c, p) = fixture();
+        let mut value = serde_json::to_value(p).unwrap();
+        value["text"] = serde_json::json!("hello 👋");
+        value["future_field"] = serde_json::json!({"opaque": [1, 2, 3]});
+        let bytes = serde_json::to_vec_pretty(&value).unwrap();
+        assert!(c.matches(&bytes));
+        let sealed = seal_bytes(&c, &[4; 32], &bytes, &[5; 12]).unwrap();
+        assert_eq!(open_bytes(&c, &[4; 32], &sealed).unwrap(), bytes);
+        for invalid in [b"{}".as_slice(), b"{invalid", b"null", b"[]"] {
+            assert!(!c.matches(invalid));
+            let sealed = seal_bytes(&c, &[4; 32], invalid, &[5; 12]).unwrap();
+            assert_eq!(open_bytes(&c, &[4; 32], &sealed).unwrap_err(), ChatError::Context);
+        }
+    }
+    #[test]
     fn fixed_vector() {
         // Independently generated using Node HKDF-SHA256 and AES-256-GCM.
         let (c, p) = fixture();
@@ -211,6 +241,6 @@ mod tests {
         assert_eq!(b64(&seal_bytes(&c, &[4; 32], &serde_json::to_vec(&p).unwrap(), &[5; 12]).unwrap()), VECTOR);
         use base64::Engine as _;
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(VECTOR).unwrap();
-        assert_eq!(open_bytes(&c, &[4; 32], &bytes).unwrap().text, "hello");
+        assert_eq!(open_bytes(&c, &[4; 32], &bytes).unwrap(), serde_json::to_vec(&p).unwrap());
     }
 }

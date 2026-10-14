@@ -1178,7 +1178,7 @@ fn after_a_restart_a_creation_is_settled_with_the_servers_group_list() {
 
 #[test]
 fn chat_uses_sending_gate_and_derived_or_imported_epoch_keys() {
-    use crate::chat::{self, ChatError, Context, Plaintext};
+    use crate::chat::{self, ChatError, Context};
     let mut f = fixture();
     let d = SignedDescriptor::parse(&f.a.group(&server(), &f.id).unwrap().descriptor).unwrap();
     let c = Context {
@@ -1189,22 +1189,18 @@ fn chat_uses_sending_gate_and_derived_or_imported_epoch_keys() {
         message_id: [7; 16],
         revision: 0,
     };
-    let p = Plaintext {
-        text: "hello".into(),
-        mentions: vec![],
-        attachments: vec![],
-        signature: vc_proto::MessageSignature {
-            server_key: server(),
-            conversation: c.conversation.clone(),
-            group_id: b64(&f.id),
-            epoch: "0".into(),
-            message_id: b64(&c.message_id),
-            ..Default::default()
-        },
-    };
+    let p = serde_json::to_vec(&serde_json::json!({
+        "text": "hello", "mentions": [], "attachments": [],
+        "signature": {
+            "server_key": server(), "conversation": c.conversation,
+            "group_id": b64(&f.id), "epoch": "0",
+            "message_id": b64(&c.message_id), "revision": 0
+        }
+    }))
+    .unwrap();
     let ciphertext = chat::seal(&f.a, &c, &p, f.t, &()).unwrap();
     assert_ne!(ciphertext, chat::seal(&f.a, &c, &p, f.t, &()).unwrap());
-    assert_eq!(chat::open(&f.a, &c, &ciphertext).unwrap().text, "hello");
+    assert_eq!(chat::open(&f.a, &c, &ciphertext).unwrap(), p);
     f.a.pending(&server(), &f.id, true).unwrap();
     f.a.take_changes();
     assert_eq!(chat::seal(&f.a, &c, &p, f.t, &()).unwrap_err(), ChatError::Agent(AgentError::Blocked));
@@ -1224,7 +1220,7 @@ fn chat_uses_sending_gate_and_derived_or_imported_epoch_keys() {
         f.b.import_history(&server(), &f.id, &chunk).unwrap();
         f.b.take_changes();
     }
-    assert_eq!(chat::open(&f.b, &c, &ciphertext).unwrap().text, "hello");
+    assert_eq!(chat::open(&f.b, &c, &ciphertext).unwrap(), p);
     let mut wrong = c.clone();
     wrong.conversation.push('x');
     assert_eq!(chat::open(&f.b, &wrong, &ciphertext).unwrap_err(), ChatError::Context);

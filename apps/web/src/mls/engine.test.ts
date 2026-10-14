@@ -89,7 +89,7 @@ describe("MLS durable queue", () => {
   });
   it("commits runtime history jobs atomically with MLS and filters them on reload", async () => {
     const storage = await openStorage("jobs", new IDBFactory()); const f = fakeFactory(); const engine = new Engine(f.factory, storage);
-    await engine.run(() => engine.op("increment", () => [jobChange({ kind: "history", server: "s", group: "g", recipient: "r", chunks: null })]));
+    await engine.run(() => engine.op("increment", () => [jobChange({ kind: "history", server: "s", group: "g", recipient: "r", publication: null, chunks: null })]));
     await engine.reload(); expect(engine.query("read")).toBe(1); expect(engine.jobs.size).toBe(1);
     await engine.close();
   });

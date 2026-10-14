@@ -4,9 +4,10 @@ import { MlsRuntime } from "./runtime";
 import { RequestError, type Link, type ConnectionStatus } from "../net/connection";
 import { encodeBase64Url } from "../net/base64url";
 import type { Event } from "../proto/Event";
+import { uidForPublicKey } from "../net/identity";
 import type { Identity } from "../net/identity";
 import { openStorage } from "./storage";
-import { emptyChanges, type AgentFactory, type CommitOutbox, type GroupSummary, type WasmAgent, type Plaintext } from "./types";
+import { emptyChanges, type AgentFactory, type CommitOutbox, type GroupSummary, type WasmAgent, type Plaintext, type Revocation } from "./types";
 vi.mock("./wasm", () => ({ loadAgent: vi.fn() }));
 const enc = new TextEncoder(), dec = new TextDecoder();
 const b64 = (n: number, length = 32) => encodeBase64Url(new Uint8Array(length).fill(n));
@@ -34,7 +35,7 @@ async function fixture(initial = clean(), hasRemoteGroup = true) {
       switch (op) {
         case "inventory": return structuredClone(this.state.groups);
         case "device_hpke_key": return { hpke_key: b64(7), created_at: 1, signature: b64(8,64) };
-        case "gate": return { status: g?.record.status, rejoin: false, pending_commit: !!this.state.out, server_pending: g?.record.server_pending, blocked: [] };
+        case "gate": return { status: g?.record.status, rejoin: false, pending_commit: !!this.state.out, server_pending: g?.record.server_pending, blocked: g?.members.filter(m => world.revocations.some(r => r.device_key === m.device_key)).map((_, i) => i) ?? [] };
         case "outbox": return this.state.out;
         case "sending_key": return [g!.record.checkpoint!.epoch, Array(32).fill(1)];
         case "seal_message": return [9];
@@ -42,7 +43,7 @@ async function fixture(initial = clean(), hasRemoteGroup = true) {
         case "settle": if (d!.winner) g!.record = summary().record; else this.state.groups = []; return !!d!.winner;
         case "welcome": {
           const duplicate = this.state.welcomes.includes(d!.id as string);
-          if (!duplicate) { this.state.groups = [summary("active", "1")]; this.state.welcomes.push(d!.id as string); this.state.groups[0]!.record.welcome_ids = [...this.state.welcomes]; }
+          if (!duplicate) { this.state.groups = [summary("active", String((d!.bytes as number[])[0]))]; this.state.welcomes.push(d!.id as string); this.state.groups[0]!.record.welcome_ids = [...this.state.welcomes]; }
           return { group: Array(32).fill(2), duplicate };
         }
         case "reconcile": {
@@ -54,15 +55,17 @@ async function fixture(initial = clean(), hasRemoteGroup = true) {
           if (result.case === "rejected") return "rebuild";
           g!.record.checkpoint!.epoch = epoch;
           g!.record.status = "active";
+          g!.members = g!.members.filter(m => !world.revocations.some(r => r.device_key === m.device_key));
           return result.commit?.[0] === 4 ? "accepted" : "rebuild";
         }
-        case "receive": g!.record.checkpoint!.epoch = String(Number(g!.record.checkpoint!.epoch) + 1); g!.members.push({ device_key: peer, uid: b64(5,20) }); return null;
+        case "commit": this.state.out = { ...pending(), epoch: g!.record.checkpoint!.epoch }; return this.state.out;
+        case "receive": if ((d!.commit as number[])[0] === 99) { g!.record.status = "removed"; g!.members = []; return null; } g!.record.checkpoint!.epoch = String(Number(g!.record.checkpoint!.epoch) + 1); g!.members.push({ device_key: peer, uid: b64(5,20) }); return null;
         case "join_external": this.state.groups = [summary("joining", "1")]; this.state.out = { ...pending(), epoch: "1" }; return this.state.out;
         case "key_packages": return [[1], [2], [3], [4], [5]];
         case "last_resort_key_package": return [6];
-        case "share_history": this.state.shares++; return [[22], [23]];
+        case "share_history": if ((d!.recipient as { signature: string }).signature === "invalid") throw new Error("invalid HPKE signature"); this.state.shares++; return [[21 + this.state.shares], [22 + this.state.shares]];
         case "import_history": this.state.imports++; if ((d!.bytes as number[])[0] === 255) throw new Error("invalid history"); return null;
-        case "open_message": return { reason: "no_key" };
+        case "open_message": if (world.openError) throw world.openError; return world.openResult;
         case "epoch": return null;
         default: throw new Error(`unexpected fake agent op ${op}`);
       }
@@ -75,7 +78,10 @@ async function fixture(initial = clean(), hasRemoteGroup = true) {
   const durable = async (): Promise<State> => JSON.parse(dec.decode(new Uint8Array((await storage.load()).groups[0]!.value!)));
   const world = {
     groups: initial.groups.length && hasRemoteGroup ? [{ conversation, group, epoch: 0, pending: false }] : [],
-    head: 0, oldest: 0,
+    head: 0, oldest: 0, revocations: [] as Revocation[],
+    openError: null as Error | null, openResult: { reason: "no_key" } as { reason: "no_key" | "cannot_open" } | { ok: number[] },
+    claimed: [] as { device_key: string; package: string }[],
+    onClaim: () => {},
     entries: [] as { epoch: number; commit: string; proposals: string[] }[],
     welcomes: [] as { id: string; group: string; welcome: string }[],
     chunks: [] as { id: string; group: string; sender_uid: string; chunk: string }[],
@@ -103,6 +109,7 @@ async function fixture(initial = clean(), hasRemoteGroup = true) {
         case "mls.log": await world.beforeLog?.(); return { head: world.head, oldest: world.oldest, entries: world.entries.filter(e => e.epoch >= Number(data.since)), pending: [], next: null };
         case "mls.group_info": return { group_info: b64(8), epoch: world.head };
         case "mls.commit": expect((await durable()).out?.commit).toEqual([4]); if (world.commitError) throw world.commitError; world.entries.push({ epoch: Number(data.epoch), commit: data.commit as string, proposals: [] }); world.head = Number(data.epoch) + 1; return { epoch: world.head };
+        case "mls.key_packages.claim": world.onClaim(); return { packages: world.claimed, next: null };
         case "mls.devices": return { devices: world.devices, next: null };
         case "mls.history.fetch": return { chunks: world.chunks, next: null };
         case "mls.history.ack": expect((await durable()).imports).toBeGreaterThan(0); world.chunks = world.chunks.filter(c => !(data.ids as string[]).includes(c.id)); return {};
@@ -115,7 +122,7 @@ async function fixture(initial = clean(), hasRemoteGroup = true) {
   };
   const identity = { publicKey: device, device: undefined } as unknown as Identity;
   const locks = { request: async (_name: string, _options: unknown, fn: () => Promise<void>) => fn() } as unknown as LockManager;
-  const runtime = await MlsRuntime.connect({ identity, seed: new Uint8Array(32), link: link as unknown as Link, revocations: () => [], locks, storage: async () => storage, factory });
+  const runtime = await MlsRuntime.connect({ identity, seed: new Uint8Array(32), link: link as unknown as Link, revocations: () => world.revocations, locks, storage: async () => storage, factory });
   runtimes.push(runtime);
   // Initialization has completed, so changes below model subsequent reconnects/events.
   return { runtime, world, calls, operations, durable, state: () => current.state, storage,
@@ -144,6 +151,49 @@ describe("MLS synchronization", () => {
     expect((await f.durable()).welcomes).toEqual(["w1"]);
     await f.runtime.sync(); expect(f.state().welcomes).toEqual(["w1"]);
     expect(f.calls.filter(c => c.op === "mls.welcomes.ack")).toHaveLength(2);
+  });
+  it.each([false, true])("imports an offline readmission before ack (failed write: %s)", async failWrite => {
+    const f = await fixture({ ...clean(), groups: [summary()] });
+    f.world.head = 3;
+    f.world.entries = [{ epoch: 0, commit: "CQ", proposals: [] }, { epoch: 1, commit: "Yw", proposals: [] }, { epoch: 2, commit: "CQ", proposals: [] }];
+    f.world.welcomes = [{ id: "readmission", group, welcome: "Aw" }];
+    if (failWrite) {
+      const write = f.storage.write.bind(f.storage);
+      const spy = vi.spyOn(f.storage, "write").mockImplementation(async changes => {
+        if (changes.groups.some(c => c.value && dec.decode(new Uint8Array(c.value)).includes('"readmission"'))) throw new Error("Welcome write aborted");
+        await write(changes);
+      });
+      await expect(f.runtime.sync()).rejects.toThrow("Welcome write aborted");
+      expect((await f.durable()).groups[0]!.record.status).toBe("removed");
+      expect(f.calls.some(c => c.op === "mls.welcomes.ack")).toBe(false);
+      spy.mockRestore();
+    }
+    await f.runtime.sync();
+    expect((await f.durable()).groups[0]!.record.checkpoint!.epoch).toBe("3");
+    expect((await f.durable()).welcomes).toEqual(["readmission"]);
+    expect(f.operations.some(o => o.op === "join_external")).toBe(false);
+    expect(f.calls.filter(c => c.op === "mls.welcomes.ack")).toHaveLength(1);
+  });
+  it("removes a locally revoked leaf without admitting its advertised package again", async () => {
+    const local = summary(); local.members.push({ device_key: peer, uid: await uidForPublicKey(b64(8)) });
+    const f = await fixture({ ...clean(), groups: [local] });
+    f.world.revocations = [{ account_key: b64(8), device_key: peer, revoked_at: 1 }];
+    f.world.devices = [{ uid: await uidForPublicKey(b64(8)), device_key: peer, hpke_key: b64(6), created_at: 1, signature: b64(7,64) }];
+    f.world.claimed = [{ device_key: peer, package: "AQ" }];
+    await f.runtime.sync(); await f.runtime.sync();
+    expect(f.runtime.status(conversation)).toBe("ready");
+    expect(f.calls.some(c => c.op === "mls.key_packages.claim")).toBe(false);
+    expect(f.operations.filter(o => o.op === "commit").map(o => o.adds)).toEqual([[]]);
+  });
+  it("filters claimed adds again when revocations advance during the request", async () => {
+    const f = await fixture({ ...clean(), groups: [summary()] });
+    f.world.devices = [{ uid: await uidForPublicKey(b64(8)), device_key: peer, hpke_key: b64(6), created_at: 1, signature: b64(7,64) }];
+    f.world.claimed = [{ device_key: peer, package: "AQ" }, { device_key: b64(10), package: "Ag" }];
+    f.world.onClaim = () => { f.world.revocations = [{ account_key: b64(8), device_key: peer, revoked_at: 1 }]; };
+    await f.runtime.sync();
+    expect(f.calls.some(c => c.op === "mls.key_packages.claim")).toBe(true);
+    expect(f.operations.some(o => o.op === "commit")).toBe(false);
+    expect(f.runtime.status(conversation)).toBe("ready");
   });
   it("replays identical outbox bytes when the log head has not advanced", async () => {
     const f = await fixture({ ...clean(), groups: [summary()], out: pending() });
@@ -207,6 +257,56 @@ describe("MLS synchronization", () => {
     expect(f.calls.filter(c => c.op === "mls.history.share").map(c => c.data.chunk)).toEqual(["Fg", "Fg", "Fw"]);
     f.world.chunks = [{ id: "h1", group, sender_uid: b64(5,20), chunk: "AQ" }];
     await f.runtime.sync(); expect(f.state().imports).toBe(1); expect(f.world.chunks).toEqual([]);
+  });
+  it("atomically replaces history for a newer verified HPKE publication and keeps retries stable", async () => {
+    const local = summary(); local.members.push({ device_key: peer, uid: b64(5,20) });
+    const f = await fixture({ ...clean(), groups: [local] });
+    const recipient = { uid: b64(5,20), device_key: peer, hpke_key: b64(6), created_at: 1, signature: b64(7,64) };
+    f.world.devices = [recipient]; f.world.wanted = [{ group, device: peer }]; f.world.shareError = true;
+    const jobs = async () => (await f.storage.load()).outbox.map(c => JSON.parse(dec.decode(new Uint8Array(c.value!))));
+    await expect(f.runtime.sync()).rejects.toThrow("lost share response");
+    const original = await jobs();
+    f.world.devices = [{ ...recipient, created_at: 2, hpke_key: b64(8), signature: "invalid" }];
+    await expect(f.runtime.sync()).rejects.toThrow("invalid HPKE signature");
+    expect(await jobs()).toEqual(original);
+    f.world.devices[0]!.signature = b64(8,64);
+    const write = f.storage.write.bind(f.storage);
+    const spy = vi.spyOn(f.storage, "write").mockImplementation(async changes => {
+      if (changes.outbox.some(c => c.value && dec.decode(new Uint8Array(c.value)).includes('"created_at":2'))) throw new Error("replacement write aborted");
+      await write(changes);
+    });
+    await expect(f.runtime.sync()).rejects.toThrow("replacement write aborted");
+    expect(await jobs()).toEqual(original);
+    expect(f.calls.filter(c => c.op === "mls.history.share")).toHaveLength(1);
+    spy.mockRestore();
+    await expect(f.runtime.sync()).rejects.toThrow("lost share response");
+    const replacement = await jobs();
+    expect(replacement[0].publication).toMatchObject({ created_at: 2, hpke_key: b64(8) });
+    expect(replacement[0].chunks).not.toEqual(original[0].chunks);
+    // An older advertisement must not roll the job back; retries reuse bytes.
+    f.world.devices = [recipient]; f.world.shareError = false;
+    await f.runtime.sync();
+    expect(f.state().shares).toBe(2);
+    expect(f.calls.filter(c => c.op === "mls.history.share").map(c => c.data.chunk)).toEqual(["Fg", "Fw", "Fw", "GA"]);
+  }, 20_000);
+  it("opens through queries without writes and distinguishes operational failures", async () => {
+    const f = await fixture({ ...clean(), groups: [summary()] });
+    const message = { conversation, group, epoch: 0, message_id: b64(2,16), revision: 0, ciphertext: "AQ" };
+    const write = vi.spyOn(f.storage, "write").mockRejectedValue(new Error("disk unavailable"));
+    f.world.openResult = { reason: "cannot_open" };
+    expect(await f.runtime.openMessage(message)).toEqual({ reason: "cannot_open" });
+    expect(await f.runtime.openMessage({ ...message, revision: -1 })).toEqual({ reason: "cannot_open" });
+    expect(await f.runtime.openMessage({ ...message, group: "bad" })).toEqual({ reason: "cannot_open" });
+    f.world.openResult = { reason: "no_key" };
+    expect(await f.runtime.openMessage(message)).toEqual({ reason: "no_key" });
+    expect(write).not.toHaveBeenCalled();
+    f.world.openError = new Error("wasm runtime failed");
+    await expect(f.runtime.openMessage(message)).rejects.toThrow("wasm runtime failed");
+    const load = vi.spyOn(f.storage, "load").mockRejectedValue(new Error("database unavailable"));
+    await expect(f.runtime.openMessage(message)).rejects.toThrow("database unavailable");
+    load.mockRestore(); write.mockRestore();
+    await f.runtime.close();
+    await expect(f.runtime.openMessage(message)).rejects.toThrow("runtime closed");
   });
   it("reloads after invalid history and imports other chunks without acknowledging the bad one", async () => {
     const f = await fixture({ ...clean(), groups: [summary()] });
