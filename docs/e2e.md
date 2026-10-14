@@ -201,9 +201,10 @@ that only keeps them apart, since only their devices can be in either.
 
 ### Freshness
 
-Clients remember, per group, the highest epoch they saw and its epoch
-authenticator, and never accept a GroupInfo or tree behind it, or a
-different authenticator for the same epoch (a fork). After a gap they catch
+Clients remember, per group, the highest epoch they saw and the hash of its
+GroupContext (which commits to the tree and the transcript), and never accept
+a GroupInfo or tree behind it, or a different GroupContext for the same epoch
+(a fork). After a gap they catch
 up through the handshake log, which proves the chain; a GroupInfo alone does
 not, so a device that rejoins by external commit after a gap treats it as a
 first contact. A new device has no such memory: a

@@ -45,6 +45,11 @@ Pinned while specifying; [e2e.md](e2e.md) is updated in the same pull request.
   same key the archive design already needs). The signature binds it to the
   device key, which is the leaf signature key the group validates, so the
   bundle still reaches only that member device.
+- **Freshness uses the GroupContext, not the epoch authenticator.** The
+  authenticator comes from epoch secrets and is not in a GroupInfo, so a
+  client could not compare it for a GroupInfo it did not process. Clients
+  checkpoint the SHA-256 of each epoch's GroupContext, which is public and
+  commits to the tree and the transcript.
 - **Encrypted direct messages carry no attachments** in step 3, as today's
   direct messages carry none. Encrypted attachments arrive with channels in
   step 4, for direct messages as well.
@@ -99,11 +104,12 @@ All keys and signatures are canonical unpadded base64url. The uid is
 A credential is **well-formed** when it parses canonically (re-encoding gives
 the same bytes), the leaf's signature key equals `device_key`, and for an
 account: the certificate verifies as `gwar device v1` (vc-proto's
-`device_statement`), `expires_at - issued_at` is at most 90 days.
+`device_statement`), both times are safe integers and
+`0 < expires_at - issued_at <= 90 days`.
 
-Whether it is **current** is judged separately, against a time and a
-revocation view supplied by the caller (`Authority` below): not expired, and
-not revoked at or before that time.
+Whether it is **current** at a time `t` is judged separately, against a
+revocation view supplied by the caller (`Authority` below):
+`issued_at <= t < expires_at`, and not revoked at or before `t`.
 
 ### Descriptor
 
@@ -187,21 +193,26 @@ what".
 One per device, holding the device's Ed25519 seed (the JWK `d` value) and
 credential, the OpenMLS provider and Gwar's own per-group records.
 
-- **Authority**: before processing, the caller supplies the time and the
-  device's revocation view (account key, device key, revoked at) from its
-  Connect feed. Leaf validation (design: "Identities in MLS") runs on every
-  Welcome, external join, and staged commit before merge, with these rules:
-  well-formed credential; current at the commit's time (see "Commit time");
-  one leaf per device key; an update keeps uid and device key; the membership rule of
-  the descriptor's kind (direct message: only devices of its two uids;
-  channel and server: any well-formed device, the server's word); the
-  descriptor unchanged; the external senders unchanged and equal to the
-  pinned server key. External proposals other than `Remove` are rejected.
-- **Catching up vs. sending**: processing judges each commit by the rules as
-  they stood at that epoch (credential validity at the commit's time). After
-  merging, the agent reports leaves that are *not current now*; while any
-  exist the group is **blocked**: no sending, no history sharing, and the
-  caller commits their removal.
+- **Acceptance**: every Welcome, external join and staged commit (before
+  merge) must satisfy the **structural rules**, the same ones the server
+  checks: well-formed credentials; one leaf per device key; an update keeps
+  uid and device key; an external commit removes at most one leaf, and only
+  the joining device's own earlier leaf (same device key and uid); the
+  membership rule of the descriptor's kind (direct message: only devices of
+  its two uids; channel and server: any well-formed device, the server's
+  word); the descriptor, required capabilities and external senders
+  unchanged, the latter equal to the pinned server key; external proposals
+  only `Remove`. In addition, every leaf a commit **introduces or changes**
+  (adds, the committer's path leaf, an external joiner) must have a
+  certificate covering the commit's time (see "Commit time"). That is all:
+  revocations and certificates that ran out later never make a client reject
+  a commit, because clients with different revocation feeds must still
+  follow the same chain (design: "Removal").
+- **Catching up vs. sending**: after every merge or join the agent reports
+  the leaves that are **not current now** (at the caller's time, with its
+  revocation view); while any exist the group is **blocked**: no sending, no
+  history sharing, and the caller commits their removal, recomputing what is
+  left if another commit wins first.
 - **Sending gate**: whether the group is blocked is computed again before
   every send and history share, at the current time and with the current
   revocation view, not only after merges.
@@ -217,7 +228,10 @@ credential, the OpenMLS provider and Gwar's own per-group records.
   (evidence for returning members, step 3). Keys stay until the conversation
   is deleted.
 - **Commits** never merge locally before the server accepted them (write-ahead
-  outbox, below). An external join creates no usable group until accepted.
+  outbox, below). An external join is different: OpenMLS merges it when it is
+  built, so the agent keeps that group as **joining**, persisted but not
+  used (no sending, no epoch keys exported for use) until the server accepts
+  the commit; if another commit wins, the joining group is deleted.
 - **Key packages**: `key_packages(n)` and `last_resort_key_package()`, with a
   lifetime ending no later than the device certificate.
 
@@ -283,12 +297,15 @@ credential, the OpenMLS provider and Gwar's own per-group records.
   - the same commit hash there: merge the pending commit;
   - another commit there: discard the pending commit, process the log, and
     commit again if still needed;
-  - no entry at that epoch yet: nothing won, so send the same bytes again;
-  - the log no longer reaches that epoch (pruned): drop the group state and
-    rejoin by external commit.
-  An external join has no group to fall back to: if another commit wins, the
-  half-joined state is deleted and the join is built again from the newest
-  GroupInfo.
+  - no entry at that epoch yet (the log's head is still that epoch): nothing
+    won. If the commit's time is less than four minutes old, send the same
+    bytes again; otherwise discard it and build a new one (fresh time,
+    current rules);
+  - the log no longer reaches that epoch (its oldest retained epoch is
+    later): drop the group state and rejoin by external commit.
+  A joining group (external join) has no older state to fall back to: if
+  another commit wins, or its time is too old, it is deleted and the join is
+  built again from the newest GroupInfo.
 
 ## 2. Protocol `vc/4` and the delivery service
 
@@ -327,12 +344,11 @@ v3.
 Every commit carries its time in the `PublicMessage` authenticated data,
 signed with the commit by its sender: `gwar commit v1\n{committed_at}` (Unix
 ms). The server rejects a commit whose time is more than five minutes from
-its own clock, or earlier than the previous commit's time of that group.
-Clients judge a commit's credentials **at that time** (expiry and revocation),
-the same live and on replay, and also reject a live commit (received through
-`mls.commit` and processed at once) more than five minutes from their clock.
-Whether a leaf may stay is then judged separately at the current time (see
-"Catching up vs. sending").
+its own clock, or earlier than the previous commit's time of that group. The
+time of epoch 0 is the descriptor's `created_at`. Clients use a commit's time
+only to check the certificates of the leaves it introduces or changes (see
+"Acceptance"); they never compare it with their own clock, so devices with
+different clocks follow the same chain.
 
 ### Size limits
 
@@ -357,7 +373,7 @@ All binary fields are base64url.
 | `mls.group.create {conversation, group_info}` | `{group}` | the GroupInfo of epoch 0, holding only the creator's device; `Observer::create` accepts it; the session may create it (below); first wins per `(conversation, incarnation)`, later attempts get `conflict` with the existing group id |
 | `mls.group_info {group}` | `{group_info, epoch}` | the session may read the conversation |
 | `mls.commit {group, epoch, commit, group_info, welcome?}` | `{epoch}` or error `stale` | below |
-| `mls.log {group, since, limit?}` | `{entries: [{epoch, proposals, commit}]}` | from epoch `since`; `proposals` are the server proposals the commit references, to be processed before it; 90 days kept |
+| `mls.log {group, since, limit?}` | `{head, oldest, entries: [{epoch, proposals, commit}]}` | from epoch `since`; `proposals` are the server proposals the commit references, to be processed before it; 90 days kept |
 | `mls.groups {}` | `{groups: [{conversation, group, epoch}]}` | the live group of every conversation the session may read |
 | `mls.welcomes {}` | `{welcomes: [{id, group, welcome}]}` | for the session's device; repeatable |
 | `mls.welcomes.ack {ids}` | `{}` | after the client stored the joined group durably; deletes them |
@@ -372,6 +388,9 @@ epoch, proposal}`, `mls.welcome {group}`, `mls.history {group}`,
 announce that something can be fetched.
 
 ### Commit ordering
+
+`head` is the group's current epoch and `oldest` the first epoch the log
+still has a commit for.
 
 The core actor handles `mls.commit` atomically. The commit must be for
 `group` at exactly the stored epoch, else `stale`; then `Observer::commit`
