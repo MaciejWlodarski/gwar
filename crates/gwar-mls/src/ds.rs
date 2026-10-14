@@ -274,6 +274,13 @@ impl Observer {
         if message.epoch() != self.group.group_context().epoch() {
             return Err(DsError::Stale);
         }
+        // A commit too old for the clock can never be accepted, whatever else
+        // OpenMLS would reject it for now (such as an Add whose key package ran
+        // out meanwhile), so its sender learns to build a new one. The time is
+        // read before the signature is checked; it is checked again below.
+        if peek_commit_time(commit).is_some_and(|t| now.saturating_sub(t) > MAX_CLOCK_SKEW_MS) {
+            return Err(DsError::Expired);
+        }
         let crypto = RustCrypto::default();
         let processed = self.group.process_message(&crypto, message).map_err(invalid("commit"))?;
         let committed_at = commit_time(processed.aad()).ok_or(Invalid("commit time"))?;
@@ -453,6 +460,31 @@ const COMMIT_TIME_HEADER: &str = "gwar commit v1\n";
 /// The authenticated data a committer puts on every commit.
 pub fn commit_aad(committed_at: i64) -> Vec<u8> {
     format!("{COMMIT_TIME_HEADER}{committed_at}").into_bytes()
+}
+
+/// The commit time of a serialized `PublicMessage`, read from its framing
+/// (RFC 9420 6.1) without verifying it.
+fn peek_commit_time(message: &[u8]) -> Option<i64> {
+    // MLS variable-length integer (RFC 9420 2.1.2).
+    fn varint(input: &mut &[u8]) -> Option<usize> {
+        let first = *input.first()?;
+        let size = [1, 2, 4].get(usize::from(first >> 6)).copied()?;
+        let bytes = input.get(..size)?;
+        let value = bytes[1..].iter().fold(usize::from(first & 0x3f), |v, &b| v << 8 | usize::from(b));
+        *input = &input[size..];
+        Some(value)
+    }
+    let mut input = message.get(4..)?; // version, wire format
+    let group_id = varint(&mut input)?;
+    input = input.get(group_id + 8..)?; // group id, epoch
+    let sender = match input.first()? {
+        1 | 2 => 5, // member or external: type and u32 index
+        3 | 4 => 1, // new member: type only
+        _ => return None,
+    };
+    input = input.get(sender..)?;
+    let len = varint(&mut input)?;
+    commit_time(input.get(..len)?)
 }
 
 /// The time in a commit's authenticated data (`gwar commit v1\n{unix ms}`).

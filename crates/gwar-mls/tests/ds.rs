@@ -102,7 +102,12 @@ impl Device {
     }
 
     fn key_package(&self) -> Vec<u8> {
+        self.key_package_for(Lifetime::default())
+    }
+
+    fn key_package_for(&self, lifetime: Lifetime) -> Vec<u8> {
         let bundle = KeyPackage::builder()
+            .key_package_lifetime(lifetime)
             .leaf_node_capabilities(capabilities())
             .build(SUITE, &self.provider, &self.signer, self.with_key())
             .unwrap();
@@ -386,6 +391,19 @@ fn commit_times_follow_the_server_clock_and_never_go_back() {
     let (_, accepted) = load().commit(&commit, &info, None, NOW + skew, NOW).unwrap();
     assert_eq!(accepted.committed_at, NOW);
     assert_eq!(ds::commit_time(b"gwar commit v1\n01"), None);
+}
+
+#[test]
+fn an_old_commit_is_expired_even_when_its_key_packages_ran_out() {
+    let (mut alice, observer) = dm();
+    let saved = observer.save();
+    let bob = Device::new(2, 21);
+    let (commit, welcome, info) = alice.add(&[bob.key_package_for(Lifetime::new(1))]);
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    let load = || Observer::load(&saved, &server_key()).unwrap();
+    assert_eq!(load().commit(&commit, &info, Some(&welcome), NOW, 0).err(), Some(DsError::Invalid("commit")));
+    let late = NOW + ds::MAX_CLOCK_SKEW_MS + 1;
+    assert_eq!(load().commit(&commit, &info, Some(&welcome), late, 0).err(), Some(DsError::Expired));
 }
 
 #[test]
