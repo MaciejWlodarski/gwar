@@ -728,13 +728,11 @@ impl<'a> Bridge<'a> {
 
     fn presence(&self, local: &Local, now: Instant) -> Presence {
         let chatting = local.chatting_until.is_some_and(|until| until > now);
-        // Nobody has a puppet in an encrypted channel.
-        let Some(channel) = local.client.channel.filter(|c| !self.is_encrypted(*c)) else {
-            // A private conversation still needs a puppet (in the default channel).
-            return if chatting { Presence::Puppet } else { Presence::Absent };
-        };
-        let shares_channel = self.remotes.values().any(|r| self.our_channel(r.cid) == channel);
-        if shares_channel || chatting { Presence::Puppet } else { Presence::Listed }
+        let channel = local
+            .client
+            .channel
+            .map(|c| (self.is_encrypted(c), self.remotes.values().any(|r| self.our_channel(r.cid) == c)));
+        presence_of(channel, chatting)
     }
 
     /// Keeps listeners in occupied channels and starts or retires puppets.
@@ -842,6 +840,7 @@ impl<'a> Bridge<'a> {
             names.sort_by_key(|n| n.to_lowercase());
             let encrypted = self.map.ours(cid).is_some_and(|c| self.is_encrypted(c));
             let text = if encrypted { ENCRYPTED_DESCRIPTION.to_owned() } else { describe(&names) };
+            debug_assert!(!encrypted || names.is_empty(), "nobody is listed in an encrypted channel");
             if self.descriptions.get(&cid) == Some(&text) {
                 continue;
             }
@@ -1186,6 +1185,19 @@ impl<'a> Bridge<'a> {
     }
 }
 
+/// How a user appears on TeamSpeak, from their voice channel (`(encrypted, shared
+/// with a TeamSpeak user)`) and whether they talk privately to a TeamSpeak user.
+/// Nobody has a puppet in an encrypted channel: a private conversation keeps one
+/// in the default channel, for text only.
+fn presence_of(channel: Option<(bool, bool)>, chatting: bool) -> Presence {
+    match channel {
+        Some((false, shared)) if shared || chatting => Presence::Puppet,
+        Some((false, _)) => Presence::Listed,
+        _ if chatting => Presence::Puppet,
+        _ => Presence::Absent,
+    }
+}
+
 fn listener_channels(remotes: &HashMap<u16, Remote>, map: &ChannelMap) -> BTreeSet<u64> {
     remotes.values().filter(|r| map.ours(r.cid).is_some()).map(|r| r.cid).collect()
 }
@@ -1515,6 +1527,18 @@ mod tests {
         let parts = split_for_teamspeak(&m.text);
         assert_eq!(parts.len(), 3);
         assert!(parts.iter().all(|p| p.chars().count() <= 1000));
+    }
+
+    #[test]
+    fn nobody_has_a_puppet_in_an_encrypted_channel_unless_chatting_privately() {
+        assert_eq!(presence_of(Some((false, true)), false), Presence::Puppet);
+        assert_eq!(presence_of(Some((false, false)), false), Presence::Listed);
+        assert_eq!(presence_of(Some((false, false)), true), Presence::Puppet);
+        // Encrypted, even with a TeamSpeak user there (who could not have joined): no puppet, not listed.
+        assert_eq!(presence_of(Some((true, true)), false), Presence::Absent);
+        assert_eq!(presence_of(Some((true, false)), true), Presence::Puppet);
+        assert_eq!(presence_of(None, true), Presence::Puppet);
+        assert_eq!(presence_of(None, false), Presence::Absent);
     }
 
     #[test]

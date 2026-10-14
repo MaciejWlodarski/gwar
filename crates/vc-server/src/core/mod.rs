@@ -1803,6 +1803,21 @@ pub(crate) mod expiry_tests {
         files_dir: PathBuf,
         upload_limit: u64,
     ) -> CoreHandle {
+        spawn_test_core(store, password, files_dir, upload_limit, false).unwrap()
+    }
+
+    /// A core with TeamSpeak compatibility on (without a bridge).
+    pub(crate) fn test_core_teamspeak(store: Store) -> Result<CoreHandle> {
+        spawn_test_core(store, None, PathBuf::new(), 0, true)
+    }
+
+    fn spawn_test_core(
+        store: Store,
+        password: Option<&str>,
+        files_dir: PathBuf,
+        upload_limit: u64,
+        teamspeak: bool,
+    ) -> Result<CoreHandle> {
         let (media, _commands) = mpsc::channel(8);
         spawn(
             store,
@@ -1818,12 +1833,11 @@ pub(crate) mod expiry_tests {
                 connect_url: None,
                 server_key: String::new(),
                 server_signer: Arc::new(crate::server_key::generate()),
-                teamspeak: false,
+                teamspeak,
             },
             Arc::new(ArcSwap::from_pointee(Routing::default())),
             media,
         )
-        .unwrap()
     }
 
     /// Runs `f` on the actor, between any other messages.
@@ -1834,6 +1848,64 @@ pub(crate) mod expiry_tests {
         let (tx, rx) = oneshot::channel();
         core.tx.send(CoreMsg::Resume(Box::new(move |core| drop(tx.send(f(core)))))).await.unwrap();
         rx.await.unwrap()
+    }
+
+    fn encrypted_channel(store: &Store, name: &str) -> ChannelId {
+        store
+            .create_channel(&ChannelRow {
+                id: 0,
+                parent: None,
+                name: name.into(),
+                topic: String::new(),
+                position: 5,
+                password_hash: None,
+                max_clients: None,
+                encrypted: true,
+                history: true,
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn teamspeak_compatibility_keeps_the_default_channel_plaintext() {
+        // Refused at start while the stored default channel is encrypted.
+        let store = Store::in_memory().unwrap();
+        let secret = encrypted_channel(&store, "secret");
+        store.set_meta("default_channel", &secret.to_string()).unwrap();
+        let error = test_core_teamspeak(store).err().expect("refused").to_string();
+        assert!(error.contains("plaintext default channel"), "{error}");
+
+        let store = Store::in_memory().unwrap();
+        let secret = encrypted_channel(&store, "secret");
+        let core = test_core_teamspeak(store).unwrap();
+        let (out, _frames) = mpsc::channel(OUTBOUND_QUEUE);
+        let session = core
+            .connect(ConnectRequest {
+                request_id: 1,
+                hello_key: String::new(),
+                certificate: None,
+                uid: crate::identity::uid_for_key(&[1; 32]),
+                public_key: URL_SAFE_NO_PAD.encode([1; 32]),
+                nickname: "admin".into(),
+                platform: Platform::Web,
+                out,
+                ip: None,
+                device: None,
+                device_expires_at: None,
+                invite: None,
+                password_ok: true,
+            })
+            .await
+            .unwrap();
+        let (refused, info) = on_core(&core, move |core| {
+            core.sessions.get_mut(&session).unwrap().groups = vec![crate::store::ADMIN_GROUP];
+            let update = vc_proto::ServerUpdate { default_channel: Some(secret), ..Default::default() };
+            (core.server_update(session, 2, update).expect("checked on the actor"), core.info.clone())
+        })
+        .await;
+        assert_eq!(refused.unwrap_err().code, ErrorCode::BadRequest);
+        assert!(info.teamspeak);
+        assert_ne!(info.default_channel, secret);
     }
 
     #[tokio::test]

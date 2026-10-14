@@ -1407,3 +1407,199 @@ async fn sealed_writes_fail_closed_after_proposal_storage_failure_and_retry_reco
     assert_eq!(a.fails("chat.sealed.send", sealed(&conversation, &group, 1, 2)).await, "pending");
     assert_eq!(a.next_event("mls.proposal").await["group"], group);
 }
+
+fn channel_descriptor(device: &Device, channel: u32, history: bool, server: &str, nonce: u8) -> SignedDescriptor {
+    SignedDescriptor::sign(
+        Descriptor {
+            server_key: server.into(),
+            conversation: format!("channel:{channel}"),
+            kind: Kind::Channel,
+            incarnation: 0,
+            previous_group_id: None,
+            private: false,
+            history,
+            founding_owner: None,
+            channel_group_id: None,
+            creator_uid: device.credential.uid(),
+            created_at: now() - 500,
+            creation_nonce: b64(&[nonce; 16]),
+        },
+        device.credential.clone(),
+        &device.signer.0,
+    )
+}
+
+/// Registers a new channel group made by `device`; returns the reply or the error code.
+async fn create_channel_group(
+    client: &mut Client,
+    device: &mut Device,
+    channel: u32,
+    history: bool,
+    nonce: u8,
+) -> Result<String, String> {
+    let d = channel_descriptor(device, channel, history, &client.server_key, nonce);
+    device.create(&d, &client.server_key);
+    client
+        .request(
+            "mls.group.create",
+            json!({"conversation":d.descriptor.conversation,"group_info":b64(&device.group_info())}),
+        )
+        .await
+        .map(|reply| reply["group"].as_str().unwrap().to_owned())
+        .map_err(|e| serde_json::to_value(e.code).unwrap().as_str().unwrap().to_owned())
+}
+
+/// Joins `group` by external commit.
+async fn join_channel(client: &mut Client, device: &mut Device, group: &str) {
+    let info = client.ok("mls.group_info", json!({"group":group})).await;
+    let epoch = info["epoch"].as_u64().unwrap();
+    let joined = device.join_external(&B64.decode(info["group_info"].as_str().unwrap()).unwrap());
+    client.ok("mls.commit", update_request(group, epoch, &joined)).await;
+}
+
+#[tokio::test]
+async fn channel_groups_follow_the_channel_and_every_member_reads_its_sealed_chat() {
+    let server = TestServer::start().await;
+    let mut alice = Device::new(1, 11);
+    let mut bob = Device::new(2, 21);
+    let mut a = connect_device(&server, &alice).await;
+    a.redeem(&server.admin_token).await;
+    let mut b = connect_device(&server, &bob).await;
+    let mut c = connect_device(&server, &Device::new(3, 31)).await;
+
+    // Options are fixed at creation; an encrypted channel has no password.
+    let secret = a.create_channel(json!({"name":"secret","encrypted":true})).await;
+    assert_eq!((secret["encrypted"].clone(), secret["history"].clone()), (json!(true), json!(true)));
+    let quiet = a.create_channel(json!({"name":"quiet","encrypted":true,"history":false})).await;
+    assert_eq!(quiet["history"], false);
+    let open = a.create_channel(json!({"name":"open","history":true})).await;
+    assert_eq!((open["encrypted"].clone(), open["history"].clone()), (json!(false), json!(false)));
+    assert_eq!(a.fails("channel.create", json!({"name":"x","encrypted":true,"password":"pw"})).await, "bad_request");
+    let (secret, quiet, open) = (channel_id(&secret), channel_id(&quiet), channel_id(&open));
+    assert_eq!(a.fails("channel.update", json!({"channel":secret,"password":"pw"})).await, "bad_request");
+    a.ok("channel.update", json!({"channel":secret,"topic":"t","encrypted":false})).await;
+    assert!(b.ok("mls.groups", json!({})).await["groups"].as_array().unwrap().is_empty());
+
+    // Creation rules: the channel's options, an encrypted channel that exists, first wins.
+    assert_eq!(
+        create_channel_group(&mut a, &mut Device::new(1, 11), secret, false, 1).await,
+        Err("bad_request".into())
+    );
+    assert_eq!(create_channel_group(&mut a, &mut Device::new(1, 11), open, false, 2).await, Err("not_found".into()));
+    assert_eq!(create_channel_group(&mut a, &mut Device::new(1, 11), 999, true, 3).await, Err("not_found".into()));
+    let group = create_channel_group(&mut b, &mut bob, secret, true, 4).await.unwrap();
+    assert_eq!(create_channel_group(&mut a, &mut alice, secret, true, 5).await, Err("conflict".into()));
+    create_channel_group(&mut b, &mut Device::new(2, 21), quiet, false, 6).await.unwrap();
+    let conversation = format!("channel:{secret}");
+    let listed = c.ok("mls.groups", json!({})).await;
+    assert_eq!(listed["groups"].as_array().unwrap().len(), 2);
+    alice = Device::new(1, 11);
+    join_channel(&mut a, &mut alice, &group).await;
+
+    // The conversation's incarnations, under its read rule.
+    let history = c.ok("mls.group_history", json!({"conversation":conversation,"limit":1})).await;
+    assert_eq!(history["incarnations"][0]["group"], group);
+    let descriptor = B64.decode(history["incarnations"][0]["descriptor"].as_str().unwrap()).unwrap();
+    let descriptor = SignedDescriptor::parse(&descriptor).unwrap();
+    assert_eq!(b64(&descriptor.group_id()), group);
+    assert_eq!(descriptor.descriptor.creator_uid, uid(2));
+    assert!(history["next"].is_null());
+    let dm = vc_proto::dm_conversation(&uid(1), &uid(2));
+    assert_eq!(c.fails("mls.group_history", json!({"conversation":dm})).await, "forbidden");
+
+    // Plaintext requests refuse encrypted channels, and sealed ones plaintext channels.
+    let text = json!({"target":{"channel":secret},"text":"hi"});
+    assert_eq!(a.fails("chat.send", text).await, "bad_request");
+    assert_eq!(a.fails("chat.history", json!({"channel":secret})).await, "bad_request");
+    assert_eq!(a.fails("chat.read", json!({"channel":secret,"message":1})).await, "bad_request");
+    assert_eq!(a.fails("chat.sealed.send", sealed(&format!("channel:{open}"), &group, 1, 1)).await, "bad_request");
+    assert_eq!(a.fails("chat.sealed.history", json!({"conversation":"channel:999"})).await, "not_found");
+    assert_eq!(a.fails("chat.sealed.history", json!({"conversation":"channel:01"})).await, "bad_request");
+
+    // Every member reads it, in the group or not.
+    let sent = b.ok("chat.sealed.send", sealed(&conversation, &group, 1, 1)).await;
+    for client in [&mut a, &mut b, &mut c] {
+        assert_eq!(client.next_event("chat.sealed").await, sent);
+    }
+    let second = a.ok("chat.sealed.send", sealed(&conversation, &group, 1, 2)).await;
+    assert_eq!(
+        c.ok("chat.sealed.history", json!({"conversation":conversation})).await["sealed"].as_array().unwrap().len(),
+        2
+    );
+
+    // A newcomer starts with everything read; later messages count as unread.
+    let mut d = connect_device(&server, &Device::new(4, 41)).await;
+    assert!(d.welcome.conversations.is_empty());
+    assert!(d.welcome.unread.iter().all(|u| u.channel != secret));
+    let third = b.ok("chat.sealed.send", sealed(&conversation, &group, 1, 3)).await;
+    d.next_event("chat.sealed").await;
+    let d2 = connect_device(&server, &Device::new(4, 42)).await;
+    assert_eq!(d2.welcome.conversations.len(), 1);
+    assert_eq!(d2.welcome.conversations[0].conversation, conversation);
+    assert_eq!(d2.welcome.conversations[0].last_read, second["id"].as_u64().unwrap() as u32);
+    assert_eq!(d2.welcome.conversations[0].count, 1);
+    d.ok("chat.read", json!({"conversation":conversation,"message":third["id"]})).await;
+
+    // Moderators remove without a signature; direct messages have no moderators.
+    let remove = json!({"conversation":conversation,"id":sent["id"]});
+    assert_eq!(c.fails("chat.sealed.remove", remove.clone()).await, "forbidden");
+    a.ok("chat.sealed.remove", remove.clone()).await;
+    let removed = json!({"conversation":conversation,"ids":[sent["id"]]});
+    for client in [&mut b, &mut c] {
+        assert_eq!(client.next_event("chat.sealed.removed").await, removed);
+    }
+    assert_eq!(a.fails("chat.sealed.remove", remove).await, "not_found");
+    assert_eq!(a.fails("chat.sealed.remove", json!({"conversation":dm,"id":1})).await, "bad_request");
+    // The removed identity cannot be sent again.
+    assert_eq!(b.fails("chat.sealed.send", sealed(&conversation, &group, 1, 1)).await, "conflict");
+
+    // Deleting the channel deletes its groups and messages.
+    a.ok("channel.delete", json!({"channel":secret})).await;
+    assert_eq!(b.fails("mls.group_info", json!({"group":group})).await, "not_found");
+    assert_eq!(b.fails("chat.sealed.history", json!({"conversation":conversation})).await, "not_found");
+    assert_eq!(c.ok("mls.groups", json!({})).await["groups"].as_array().unwrap().len(), 1);
+    let d3 = connect_device(&server, &Device::new(4, 43)).await;
+    assert!(d3.welcome.conversations.is_empty());
+}
+
+#[tokio::test]
+async fn channel_history_requests_end_only_through_a_chunk_naming_their_assignment() {
+    let server = TestServer::start().await;
+    let mut alice = Device::new(1, 11);
+    let mut bob = Device::new(2, 21);
+    let mut a = connect_device(&server, &alice).await;
+    a.redeem(&server.admin_token).await;
+    let mut b = connect_device(&server, &bob).await;
+    let secret = channel_id(&a.create_channel(json!({"name":"secret","encrypted":true})).await);
+    let group = create_channel_group(&mut a, &mut alice, secret, true, 1).await.unwrap();
+    join_channel(&mut b, &mut bob, &group).await;
+    a.next_event("mls.commit").await;
+    let public = hpke(&mut b, &bob, 4).await;
+    let recipient = public_key(&bob.signer.0);
+    b.ok("mls.history.request", json!({"group":group})).await;
+    let wanted = a.next_event("mls.history.wanted").await;
+    assert_eq!((wanted["group"].clone(), wanted["device"].clone()), (json!(group), json!(recipient)));
+    let assignment = wanted["assignment"].as_str().unwrap().to_owned();
+    let listed = a.ok("mls.history.wanted", json!({})).await;
+    assert_eq!(listed["wanted"], json!([wanted]));
+    assert_eq!(b.ok("mls.history.wanted", json!({})).await["wanted"], json!([]));
+
+    // A chunk naming no assignment (or a stale one) is stored but ends nothing.
+    for named in [None, Some("stale")] {
+        let bytes = chunk(&alice, &a, &group, &bob, &public);
+        a.ok("mls.history.share", json!({"group":group,"recipient":recipient,"chunk":b64(&bytes),"assignment":named}))
+            .await;
+        assert_eq!(b.next_event("mls.history").await["group"], group);
+        assert_eq!(a.ok("mls.history.wanted", json!({})).await["wanted"], json!([wanted]));
+    }
+    // So does a decline by another device or for another assignment.
+    b.ok("mls.history.decline", json!({"group":group,"device":recipient,"assignment":assignment})).await;
+    a.ok("mls.history.decline", json!({"group":group,"device":recipient,"assignment":"stale"})).await;
+    assert_eq!(a.ok("mls.history.wanted", json!({})).await["wanted"], json!([wanted]));
+
+    let bytes = chunk(&alice, &a, &group, &bob, &public);
+    a.ok("mls.history.share", json!({"group":group,"recipient":recipient,"chunk":b64(&bytes),"assignment":assignment}))
+        .await;
+    assert_eq!(a.ok("mls.history.wanted", json!({})).await["wanted"], json!([]));
+    assert_eq!(b.ok("mls.history.fetch", json!({})).await["chunks"].as_array().unwrap().len(), 3);
+}

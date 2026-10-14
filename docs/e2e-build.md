@@ -760,7 +760,10 @@ bridge.
 
 ## 4. Encrypted channels and server-wide chat
 
-Status: specified. Built as three pull requests, in this order: **4a**
+Status: 4a server side built (delivery service, history routing, TeamSpeak
+bridge); the agent and web side of 4a is next. Until it lands, seeded and
+created channels default to plaintext so the current web client keeps working.
+Built as three pull requests, in this order: **4a**
 channels (options, groups, sealed channel messages, unread counts and
 mentions, TeamSpeak text isolation, restarts); **4b** encrypted attachments,
 in channels and direct messages; **4c** encrypted server-wide chat and large

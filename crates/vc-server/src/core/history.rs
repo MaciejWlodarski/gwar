@@ -334,3 +334,317 @@ impl Core {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use gwar_mls::ds::Leaf;
+    use tokio::sync::mpsc;
+    use vc_proto::Platform;
+
+    use super::*;
+    use crate::{
+        core::{
+            ConnectRequest, CoreHandle, OUTBOUND_QUEUE, Outbound,
+            expiry_tests::{on_core, test_core},
+        },
+        store::{ChannelRow, Store, mls::GroupRow},
+    };
+
+    const GROUP: &str = "group";
+
+    fn device(seed: u8) -> String {
+        URL_SAFE_NO_PAD.encode([seed; 32])
+    }
+
+    fn uid(seed: u8) -> String {
+        crate::identity::uid_for_key(&[seed; 32])
+    }
+
+    /// An encrypted channel whose group holds `leaves` as (account seed, device seed),
+    /// written after the core started (its observer is a stand-in that only routing tolerates).
+    async fn store(leaves: &[(u8, u8)]) -> CoreHandle {
+        let store = Store::in_memory().unwrap();
+        let channel = store
+            .create_channel(&ChannelRow {
+                id: 0,
+                parent: None,
+                name: "secret".into(),
+                topic: String::new(),
+                position: 9,
+                password_hash: None,
+                max_clients: None,
+                encrypted: true,
+                history: true,
+            })
+            .unwrap();
+        let leaves: Vec<_> = leaves
+            .iter()
+            .enumerate()
+            .map(|(index, (account, d))| Leaf { index: index as u32, device_key: device(*d), uid: uid(*account) })
+            .collect();
+        let row = GroupRow {
+            group: GROUP.into(),
+            conversation: format!("channel:{channel}"),
+            incarnation: 0,
+            epoch: 3,
+            committed_at: 1,
+            group_info: vec![],
+            observer: vec![],
+            created_at: 1,
+        };
+        let core = test_core(store, None);
+        on_core(&core, move |core| core.store.mls_write_group(&row, &leaves, &[], None, None).unwrap()).await;
+        core
+    }
+
+    struct Device {
+        session: SessionId,
+        frames: mpsc::Receiver<Outbound>,
+    }
+
+    impl Device {
+        /// Assignments announced to this device since the last call.
+        fn wanted(&mut self) -> Vec<String> {
+            let mut ids = Vec::new();
+            while let Ok(frame) = self.frames.try_recv() {
+                let Outbound::Frame(frame) = frame else { continue };
+                let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                if frame["ev"] == "mls.history.wanted" {
+                    assert_eq!(frame["d"]["group"], GROUP);
+                    ids.push(frame["d"]["assignment"].as_str().unwrap().to_owned());
+                }
+            }
+            ids
+        }
+    }
+
+    async fn connect(core: &CoreHandle, account: u8, d: u8) -> Device {
+        let (out, frames) = mpsc::channel(OUTBOUND_QUEUE);
+        let session = core
+            .connect(ConnectRequest {
+                request_id: 1,
+                hello_key: device(d),
+                certificate: None,
+                uid: uid(account),
+                public_key: URL_SAFE_NO_PAD.encode([account; 32]),
+                nickname: format!("user{account}"),
+                platform: Platform::Web,
+                out,
+                ip: None,
+                device: None,
+                device_expires_at: None,
+                invite: None,
+                password_ok: true,
+            })
+            .await
+            .unwrap();
+        Device { session, frames }
+    }
+
+    async fn request(core: &CoreHandle, recipient: u8) {
+        on_core(core, move |core| {
+            assert!(core.store.mls_request_history(GROUP, &device(recipient), now_ms()).unwrap());
+            core.history_requested(GROUP, &device(recipient));
+        })
+        .await;
+    }
+
+    /// The active assignments as (id, device seed).
+    async fn active(core: &CoreHandle) -> BTreeMap<String, String> {
+        on_core(core, |core| core.history.assignments.iter().map(|(id, a)| (id.clone(), a.device.clone())).collect())
+            .await
+    }
+
+    async fn net(leaves: &[(u8, u8)], order: &[(u8, u8)]) -> (CoreHandle, HashMap<u8, Device>) {
+        let core = store(leaves).await;
+        let mut devices = HashMap::new();
+        for (account, d) in order {
+            devices.insert(*d, connect(&core, *account, *d).await);
+        }
+        for device in devices.values_mut() {
+            device.wanted();
+        }
+        (core, devices)
+    }
+
+    #[tokio::test]
+    async fn three_assignments_prefer_distinct_uids_and_recent_sessions() {
+        // Recipient 10 (account 1); senders 20 (account 2), 30 (3), 40 and 41 (both account 4).
+        let leaves = [(1, 10), (2, 20), (3, 30), (4, 40), (4, 41)];
+        let (core, mut d) = net(&leaves, &[(2, 20), (3, 30), (4, 40), (4, 41), (1, 10)]).await;
+        request(&core, 10).await;
+        let first: BTreeSet<_> = active(&core).await.into_values().collect();
+        assert_eq!(first, BTreeSet::from([device(41), device(30), device(20)]));
+        for seed in [41, 30, 20] {
+            assert_eq!(d.get_mut(&seed).unwrap().wanted().len(), 1, "device {seed}");
+        }
+        assert!(d.get_mut(&40).unwrap().wanted().is_empty());
+        assert!(d.get_mut(&10).unwrap().wanted().is_empty(), "never the recipient");
+        // Each device lists only its own assignment.
+        let listed = on_core(&core, |core| core.history.wanted(&device(30))).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].device, device(10));
+    }
+
+    #[tokio::test]
+    async fn decline_timeout_and_disconnect_pass_the_request_on_and_stale_answers_end_nothing() {
+        let leaves = [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50), (6, 60), (7, 70)];
+        let (core, mut d) = net(&leaves, &[(2, 20), (3, 30), (4, 40), (5, 50), (6, 60), (1, 10)]).await;
+        request(&core, 10).await;
+        let assigned = active(&core).await;
+        assert_eq!(assigned.len(), 3);
+        let by_device: HashMap<_, _> = assigned.iter().map(|(id, dev)| (dev.clone(), id.clone())).collect();
+
+        // A decline from another device, or for another recipient, ends nothing.
+        let id60 = by_device[&device(60)].clone();
+        on_core(&core, {
+            let id = id60.clone();
+            move |core| {
+                core.history_declined(&id, GROUP, &device(10), &device(50));
+                core.history_declined(&id, GROUP, &device(20), &device(60));
+            }
+        })
+        .await;
+        assert_eq!(active(&core).await, assigned);
+
+        // A decline uses the device's turn; the next one is asked.
+        on_core(&core, {
+            let id = id60.clone();
+            move |core| core.history_declined(&id, GROUP, &device(10), &device(60))
+        })
+        .await;
+        assert_eq!(d.get_mut(&30).unwrap().wanted().len(), 1);
+        // The same decline again is stale.
+        let before = active(&core).await;
+        on_core(&core, move |core| core.history_declined(&id60, GROUP, &device(10), &device(60))).await;
+        assert_eq!(active(&core).await, before);
+
+        // A timeout, too.
+        let id50 = by_device[&device(50)].clone();
+        on_core(&core, move |core| {
+            core.history.assignments.get_mut(&id50).unwrap().expires_at = 0;
+            core.history_wake();
+        })
+        .await;
+        assert_eq!(d.get_mut(&20).unwrap().wanted().len(), 1);
+
+        // And a disconnect: no device is left to ask, so two stay active.
+        let gone = d.remove(&40).unwrap().session;
+        core.disconnect(gone, vc_proto::LeaveReason::Quit).await;
+        let left: BTreeSet<_> = active(&core).await.into_values().collect();
+        assert_eq!(left, BTreeSet::from([device(30), device(20)]));
+
+        // A newly connected device with a leaf is asked right away.
+        let mut late = connect(&core, 7, 70).await;
+        assert_eq!(late.wanted().len(), 1);
+        assert_eq!(active(&core).await.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_chunk_ends_the_request_and_the_next_request_reaches_devices_not_yet_asked() {
+        let leaves = [(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)];
+        let (core, mut d) = net(&leaves, &[(2, 20), (3, 30), (4, 40), (5, 50), (1, 10)]).await;
+        request(&core, 10).await;
+        let assigned = active(&core).await;
+        let answered = assigned.iter().find(|(_, dev)| **dev == device(50)).unwrap().0.clone();
+        // What a stored chunk naming the assignment does (see `mls.history.share`).
+        on_core(&core, move |core| {
+            core.store.mls_cancel_request(GROUP, &device(10)).unwrap();
+            core.history_answered(&answered);
+        })
+        .await;
+        assert!(active(&core).await.is_empty());
+        for dev in d.values_mut() {
+            dev.wanted();
+        }
+        // The cancelled devices may be asked again, and the one with no turn yet; not the sharer.
+        // A minute later (requests are limited to one a minute).
+        on_core(&core, |core| {
+            core.store.set_meta(&format!("mls_history_request:{GROUP}:{}", device(10)), "0").unwrap()
+        })
+        .await;
+        request(&core, 10).await;
+        let next: BTreeSet<_> = active(&core).await.into_values().collect();
+        assert_eq!(next, BTreeSet::from([device(20), device(30), device(40)]));
+        assert!(d.get_mut(&50).unwrap().wanted().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unresponsive_rounds_back_off_and_a_removed_recipient_drops_everything() {
+        let leaves = [(1, 10), (2, 20)];
+        let (core, mut d) = net(&leaves, &[(2, 20), (1, 10)]).await;
+        request(&core, 10).await;
+        assert_eq!(d.get_mut(&20).unwrap().wanted().len(), 1);
+        // The only device times out: everyone was asked, the rotation waits for its backoff.
+        let waiting = on_core(&core, |core| {
+            core.history.assignments.values_mut().for_each(|a| a.expires_at = 0);
+            core.history_wake();
+            let rotation = core.history.rotations.values().next().unwrap();
+            (rotation.waiting_until, rotation.started_at + rotation.backoff, core.history.deadline())
+        })
+        .await;
+        assert_eq!(waiting.0, Some(waiting.1));
+        assert_eq!(waiting.2, waiting.0);
+        assert!(active(&core).await.is_empty());
+        assert!(d.get_mut(&20).unwrap().wanted().is_empty());
+        // After the backoff it starts over, and the next backoff doubles.
+        let backoff = on_core(&core, |core| {
+            let rotation = core.history.rotations.values_mut().next().unwrap();
+            rotation.started_at -= FIRST_BACKOFF_MS;
+            rotation.waiting_until = Some(0);
+            core.history_wake();
+            core.history.rotations.values().next().unwrap().backoff
+        })
+        .await;
+        assert_eq!(backoff, 2 * FIRST_BACKOFF_MS);
+        let ids = d.get_mut(&20).unwrap().wanted();
+        assert_eq!(ids.len(), 1);
+        // A decline round backs off the same way, capped at an hour.
+        let capped = on_core(&core, move |core| {
+            for _ in 0..10 {
+                let ids: Vec<_> = core.history.assignments.keys().cloned().collect();
+                for id in ids {
+                    core.history_declined(&id, GROUP, &device(10), &device(20));
+                }
+                let rotation = core.history.rotations.values_mut().next().unwrap();
+                rotation.started_at = 0;
+                rotation.waiting_until = Some(0);
+                core.history_wake();
+            }
+            core.history.rotations.values().next().unwrap().backoff
+        })
+        .await;
+        assert_eq!(capped, MAX_BACKOFF_MS);
+        assert_eq!(active(&core).await.len(), 1);
+        // Removing the recipient's leaf cancels its request, assignments and rotation at once.
+        on_core(&core, |core| core.history_members_changed(GROUP, &BTreeSet::from([device(10)]))).await;
+        assert!(active(&core).await.is_empty());
+        let state = on_core(&core, |core| {
+            (core.history.rotations.len(), core.store.mls_history_requested(GROUP, &device(10), now_ms()).unwrap())
+        })
+        .await;
+        assert_eq!(state, (0, false));
+    }
+
+    #[tokio::test]
+    async fn a_device_that_keeps_timing_out_is_asked_again_only_in_a_later_rotation() {
+        let leaves = [(1, 10), (2, 20), (3, 30)];
+        let (core, mut d) = net(&leaves, &[(2, 20), (1, 10)]).await;
+        request(&core, 10).await;
+        assert_eq!(d.get_mut(&20).unwrap().wanted().len(), 1);
+        // 20 times out and reconnects: its turn is used, so it waits for the next rotation,
+        // while a device not yet asked gets the request at once.
+        on_core(&core, |core| {
+            core.history.assignments.values_mut().for_each(|a| a.expires_at = 0);
+            core.history_wake();
+        })
+        .await;
+        let mut again = connect(&core, 2, 20).await;
+        assert!(again.wanted().is_empty());
+        let mut fresh = connect(&core, 3, 30).await;
+        assert_eq!(fresh.wanted().len(), 1);
+    }
+}
