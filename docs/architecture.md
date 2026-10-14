@@ -187,7 +187,9 @@ cannot verify the encrypted signature; clients verify it after decryption.
 
 SQLite stores the newest 1000 bodies per DM in `sealed_messages`, with permanent
 per-conversation message-id reservations and non-repeating numeric ids. The
-24 KiB decoded ciphertext limit applies to all writes. History pages use the
+24 KiB decoded ciphertext limit applies to all writes. Sealed history replies
+use `{sealed: [SealedMessage]}`, including `{sealed: []}` for an empty page,
+distinct from plaintext history's `{messages}`. History pages use the
 channel `before` cursor (oldest returned id), default 50, at most 100 rows and
 a 640 KiB response budget. Conversation `chat.read {conversation, message}`
 marks live in `conversation_reads`, only move forward, and missing marks mean

@@ -643,7 +643,7 @@ messages: like signed messages, their author is inside the signature.
 | `chat.sealed.send {conversation, group, epoch, message_id, ciphertext}` | `SealedMessage` | the session may write the conversation; `group` is its live group and `epoch` its current epoch, else `stale`; no outstanding server proposal, else `pending`; `message_id` unique in it; ciphertext at most 24 KiB |
 | `chat.sealed.edit {conversation, group, epoch, message_id, revision, ciphertext}` | `SealedMessage` | only the author's uid; the same `stale` and `pending` rules; `revision` above the stored one |
 | `chat.delete_own {conversation, group, epoch, message_id, revision, ciphertext}` | `SealedMessage` | the signed deletion revision, with the same rules; stored with `deleted`, no further edits |
-| `chat.sealed.history {conversation, before?, limit?}` | `{messages}` | as channel history |
+| `chat.sealed.history {conversation, before?, limit?}` | `{sealed: [SealedMessage]}` | as channel history |
 | `chat.read {conversation, message}` | `{}` | read marks per conversation |
 
 Before writing, the server reconciles that group's removal proposals; a

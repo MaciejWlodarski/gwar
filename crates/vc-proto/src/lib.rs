@@ -388,7 +388,7 @@ wire! {
         Message(Box<ChatMessage>),
         History { messages: Vec<ChatMessage> },
         SealedMessage(Box<SealedMessage>),
-        SealedHistory { messages: Vec<SealedMessage> },
+        SealedHistory { sealed: Vec<SealedMessage> },
         Token { token: String },
         Groups { groups: Vec<GroupId> },
         Answer { sdp: String },

@@ -64,7 +64,7 @@ export interface ResponseMap {
   "chat.sealed.send": SealedMessage;
   "chat.sealed.edit": SealedMessage;
   "chat.delete_own": SealedMessage;
-  "chat.sealed.history": { messages: SealedMessage[] };
+  "chat.sealed.history": { sealed: SealedMessage[] };
   "chat.send": ChatMessage;
   "chat.edit": ChatMessage;
   "chat.delete": Empty;

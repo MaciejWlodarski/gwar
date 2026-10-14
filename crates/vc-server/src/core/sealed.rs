@@ -36,7 +36,7 @@ impl Core {
                     .store
                     .sealed_history(&conversation, before, limit.unwrap_or(50).clamp(1, 100))
                     .map_err(storage_error)?;
-                return Ok(Response::SealedHistory { messages });
+                return Ok(Response::SealedHistory { sealed: messages });
             }
             SealedRequest::Send { conversation, group, epoch, message_id, ciphertext } => {
                 (conversation, group, epoch, message_id, ciphertext, None)

@@ -1088,9 +1088,9 @@ async fn sealed_revisions_reach_every_participant_session_and_keep_only_the_late
         assert_eq!(client.next_event("chat.sealed").await, edited);
         assert_eq!(client.next_event("chat.sealed").await, deleted);
     }
-    assert_eq!(b.ok("chat.sealed.history", json!({"conversation":conversation})).await["messages"], json!([deleted]));
+    assert_eq!(b.ok("chat.sealed.history", json!({"conversation":conversation})).await["sealed"], json!([deleted]));
     assert!(
-        b.ok("chat.sealed.history", json!({"conversation":conversation,"before":sent["id"]})).await["messages"]
+        b.ok("chat.sealed.history", json!({"conversation":conversation,"before":sent["id"]})).await["sealed"]
             .as_array()
             .unwrap()
             .is_empty()
@@ -1145,7 +1145,7 @@ async fn sealed_writes_require_the_live_epoch_and_no_pending_removal() {
         assert_eq!(a.fails(op, request).await, "pending");
     }
     assert_eq!(
-        a.ok("chat.sealed.history", json!({"conversation":conversation})).await["messages"].as_array().unwrap().len(),
+        a.ok("chat.sealed.history", json!({"conversation":conversation})).await["sealed"].as_array().unwrap().len(),
         1
     );
     let log = a.ok("mls.log", json!({"group":group,"since":1})).await;
@@ -1201,11 +1201,11 @@ async fn sealed_size_encoding_and_history_byte_budget() {
     }
     let page = a.ok("chat.sealed.history", json!({"conversation":conversation,"limit":100})).await;
     assert!(serde_json::to_vec(&page).unwrap().len() < 640 * 1024);
-    let messages = page["messages"].as_array().unwrap();
+    let messages = page["sealed"].as_array().unwrap();
     assert!(messages.len() < 24 && !messages.is_empty());
     let rest =
         a.ok("chat.sealed.history", json!({"conversation":conversation,"before":messages[0]["id"],"limit":100})).await;
-    assert_eq!(rest["messages"].as_array().unwrap().len() + messages.len(), 24);
+    assert_eq!(rest["sealed"].as_array().unwrap().len() + messages.len(), 24);
 }
 
 #[tokio::test]
@@ -1246,7 +1246,7 @@ async fn sealed_cap_paging_unread_and_persistence() {
     let mut ids = Vec::new();
     loop {
         let page = a.ok("chat.sealed.history", json!({"conversation":conversation,"before":before,"limit":100})).await;
-        let messages = page["messages"].as_array().unwrap();
+        let messages = page["sealed"].as_array().unwrap();
         if messages.is_empty() {
             break;
         }
@@ -1271,16 +1271,16 @@ async fn sealed_cap_paging_unread_and_persistence() {
     assert_eq!(b3.welcome.conversations[0].last_read, u32::try_from(mark).unwrap());
     assert_eq!(b3.welcome.conversations[0].count, 5);
     let default = a.ok("chat.sealed.history", json!({"conversation":conversation})).await;
-    assert_eq!(default["messages"].as_array().unwrap().len(), 50);
+    assert_eq!(default["sealed"].as_array().unwrap().len(), 50);
     assert_eq!(
-        a.ok("chat.sealed.history", json!({"conversation":conversation,"limit":0})).await["messages"]
+        a.ok("chat.sealed.history", json!({"conversation":conversation,"limit":0})).await["sealed"]
             .as_array()
             .unwrap()
             .len(),
         1
     );
     assert_eq!(
-        a.ok("chat.sealed.history", json!({"conversation":conversation,"limit":1000})).await["messages"]
+        a.ok("chat.sealed.history", json!({"conversation":conversation,"limit":1000})).await["sealed"]
             .as_array()
             .unwrap()
             .len(),
@@ -1300,7 +1300,7 @@ async fn sealed_cap_paging_unread_and_persistence() {
     let mut b = connect_device(&restarted, &Device::new(2, 26)).await;
     assert!(b.welcome.conversations.is_empty());
     assert_eq!(
-        b.ok("chat.sealed.history", json!({"conversation":conversation})).await["messages"]
+        b.ok("chat.sealed.history", json!({"conversation":conversation})).await["sealed"]
             .as_array()
             .unwrap()
             .last()
@@ -1346,7 +1346,7 @@ async fn sealed_member_removal_and_pruning_clear_marks_and_optionally_erase_auth
         assert_eq!(marks, 0);
         let history = a.ok("chat.sealed.history", json!({"conversation":conversation})).await;
         assert_eq!(
-            history["messages"],
+            history["sealed"],
             if delete_messages { json!([own.clone()]) } else { json!([own.clone(), peer.clone()]) }
         );
         for op in ["chat.sealed.send", "chat.sealed.edit", "chat.delete_own"] {
@@ -1398,7 +1398,7 @@ async fn sealed_writes_fail_closed_after_proposal_storage_failure_and_retry_reco
         assert_eq!(a.fails(op, request).await, "internal");
     }
     assert!(a.drain_events("chat.sealed").await.is_empty());
-    assert_eq!(a.ok("chat.sealed.history", json!({"conversation":conversation})).await["messages"], json!([original]));
+    assert_eq!(a.ok("chat.sealed.history", json!({"conversation":conversation})).await["sealed"], json!([original]));
     db.execute_batch("DROP TRIGGER fail_proposal").unwrap();
     assert_eq!(a.fails("chat.sealed.send", sealed(&conversation, &group, 1, 2)).await, "pending");
     assert_eq!(a.next_event("mls.proposal").await["group"], group);

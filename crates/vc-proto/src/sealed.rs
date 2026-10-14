@@ -61,17 +61,19 @@ mod tests {
             let request: ClientFrame = serde_json::from_value(frame.clone()).unwrap();
             assert_eq!(serde_json::to_value(request).unwrap(), frame);
             let frame = json!({"ev":"chat.read","d":d});
-            let event: Event = serde_json::from_value(frame.clone()).unwrap();
-            assert_eq!(serde_json::to_value(event).unwrap(), frame);
+            let event: ServerFrame = serde_json::from_value(frame.clone()).unwrap();
+            assert!(matches!(event, ServerFrame::Event(Event::ChatRead { .. })));
+            assert_eq!(serde_json::to_value(&event).unwrap(), frame);
+            let wire = serde_json::to_vec(&event).unwrap();
+            assert_eq!(serde_json::from_slice::<ServerFrame>(&wire).unwrap(), event);
         }
         for d in [json!({"message":2}), json!({"channel":1,"conversation":"dm:a:b","message":2})] {
             assert!(serde_json::from_value::<ClientFrame>(json!({"id":7,"op":"chat.read","d":d})).is_err());
         }
     }
 
-    #[test]
-    fn sealed_rows_are_not_plaintext_messages() {
-        let m = SealedMessage {
+    fn sealed_message() -> SealedMessage {
+        SealedMessage {
             id: 1,
             conversation: "dm:a:b".into(),
             group: "g".into(),
@@ -84,10 +86,51 @@ mod tests {
             sent_at: 1,
             edited_at: Some(2),
             deleted: true,
-        };
-        let reply = Response::SealedMessage(Box::new(m.clone()));
-        assert_eq!(serde_json::from_value::<Response>(serde_json::to_value(&reply).unwrap()).unwrap(), reply);
-        let history = Response::SealedHistory { messages: vec![m] };
-        assert_eq!(serde_json::from_value::<Response>(serde_json::to_value(&history).unwrap()).unwrap(), history);
+        }
+    }
+
+    #[test]
+    fn sealed_rows_are_not_plaintext_messages() {
+        for edited_at in [None, Some(2)] {
+            let m = SealedMessage { edited_at, ..sealed_message() };
+            for frame in [
+                ServerFrame::Ok { re: 7, ok: Response::SealedMessage(Box::new(m.clone())) },
+                ServerFrame::Event(Event::ChatSealed(m)),
+            ] {
+                let wire = serde_json::to_vec(&frame).unwrap();
+                assert_eq!(serde_json::from_slice::<ServerFrame>(&wire).unwrap(), frame);
+            }
+        }
+    }
+
+    #[test]
+    fn sealed_history_round_trips_empty_and_populated_through_server_frame() {
+        for sealed in [vec![], vec![sealed_message()]] {
+            let frame = ServerFrame::Ok { re: 7, ok: Response::SealedHistory { sealed: sealed.clone() } };
+            let wire = serde_json::to_vec(&frame).unwrap();
+            assert_eq!(serde_json::from_slice::<ServerFrame>(&wire).unwrap(), frame);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&wire).unwrap(),
+                json!({"re":7,"ok":{"sealed":sealed}})
+            );
+        }
+        let plaintext = ServerFrame::Ok { re: 7, ok: Response::History { messages: vec![] } };
+        let wire = serde_json::to_vec(&plaintext).unwrap();
+        assert_eq!(serde_json::from_slice::<ServerFrame>(&wire).unwrap(), plaintext);
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&wire).unwrap(), json!({"re":7,"ok":{"messages":[]}}));
+    }
+
+    #[test]
+    fn sealed_removal_events_round_trip_empty_and_populated_through_server_frame() {
+        for ids in [vec![], vec![1, 2]] {
+            let frame =
+                ServerFrame::Event(Event::ChatSealedRemoved { conversation: "dm:a:b".into(), ids: ids.clone() });
+            let wire = serde_json::to_vec(&frame).unwrap();
+            assert_eq!(serde_json::from_slice::<ServerFrame>(&wire).unwrap(), frame);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&wire).unwrap(),
+                json!({"ev":"chat.sealed.removed","d":{"conversation":"dm:a:b","ids":ids}})
+            );
+        }
     }
 }

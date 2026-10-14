@@ -17,6 +17,24 @@ describe("bounded server frames", () => {
     expect(responseFor("chat.send", message)).toBe(true);
     expect(responseFor("chat.history", { messages: [message] })).toBe(true);
   });
+  it("distinguishes sealed history from plaintext history, including empty pages", () => {
+    const sealedMessage = {
+      id: 1, conversation: `dm:${"A".repeat(27)}:${"B".repeat(27)}`,
+      group: "A".repeat(43), epoch: 0, author_uid: "A".repeat(27), author_name: "Name",
+      message_id: "A".repeat(22), revision: 0, ciphertext: "AA", sent_at: 1, deleted: false,
+    };
+    for (const sealed of [[], [sealedMessage]]) {
+      const ok = { sealed };
+      expect(parseFrame(JSON.stringify({ re: 1, ok }))).toEqual({ kind: "ok", re: 1, ok });
+      expect(responseFor("chat.sealed.history", ok)).toBe(true);
+      expect(responseFor("chat.history", ok)).toBe(false);
+      expect(responseFor("chat.sealed.history", { messages: sealed })).toBe(false);
+    }
+    for (const messages of [[], [message]]) {
+      expect(responseFor("chat.history", { messages })).toBe(true);
+      expect(responseFor("chat.sealed.history", { messages })).toBe(false);
+    }
+  });
   it("drops huge strings, arrays, nesting, invalid types and unsafe integers without throwing", () => {
     let deep: unknown = {};
     for (let i = 0; i < 1000; i++) deep = { child: deep };

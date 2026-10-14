@@ -140,7 +140,7 @@ export const responses: { [K in Op]: Rule<ResponseMap[K]> } = {
   hello: serverProof, join: welcome, ping: empty, "client.update": empty, "client.move": empty, "client.kick": empty,
   "channel.join": empty, "channel.leave": empty, "channel.create": channel, "channel.update": channel, "channel.delete": empty,
   "chat.sealed.send": sealedMessage, "chat.sealed.edit": sealedMessage, "chat.delete_own": sealedMessage,
-  "chat.sealed.history": shape({ messages: array(sealedMessage, 100) }),
+  "chat.sealed.history": shape({ sealed: array(sealedMessage, 100) }),
   "chat.send": message, "chat.edit": message, "chat.delete": empty, "chat.read": empty,
   "chat.history": shape({ messages: array(message, 100) }), "server.update": empty,
   "token.create": shape({ token: str(256) }), "token.redeem": shape({ groups: ids }),
