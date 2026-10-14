@@ -63,7 +63,8 @@ impl Context {
         ))
     }
     fn matches(&self, bytes: &[u8]) -> bool {
-        let Ok(p) = serde_json::from_slice::<PlaintextContext>(bytes) else { return false };
+        let Ok(text) = std::str::from_utf8(bytes) else { return false };
+        let Ok(p) = serde_json::from_str::<PlaintextContext>(text) else { return false };
         let s = &p.signature;
         s.server_key == self.server_key
             && s.conversation == self.conversation
@@ -231,6 +232,17 @@ mod tests {
             let sealed = seal_bytes(&c, &[4; 32], invalid, &[5; 12]).unwrap();
             assert_eq!(open_bytes(&c, &[4; 32], &sealed).unwrap_err(), ChatError::Context);
         }
+    }
+    #[test]
+    fn rejects_invalid_utf8_even_in_ignored_fields() {
+        let (c, p) = fixture();
+        let mut bytes = serde_json::to_vec(&p).unwrap();
+        let text = bytes.windows(5).position(|w| w == b"hello").unwrap();
+        bytes[text] = 0xff;
+        assert!(!c.matches(&bytes));
+        // Simulate a peer encrypting invalid UTF-8 with an authentic AEAD tag.
+        let sealed = seal_bytes(&c, &[4; 32], &bytes, &[5; 12]).unwrap();
+        assert_eq!(open_bytes(&c, &[4; 32], &sealed), Err(ChatError::Context));
     }
     #[test]
     fn fixed_vector() {

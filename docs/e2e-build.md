@@ -645,9 +645,13 @@ messages: like signed messages, their author is inside the signature.
   still **Creating** after a restart is settled with `mls.groups`.
 - Before treating an unfamiliar Welcome as superseded by local active
   membership, catch up through the authoritative log, stopping at eviction.
-  A device removed and readmitted while offline imports the readmission
-  Welcome before external rejoin, then acknowledges only after the joined state
-  and delivery id are durable. An already recorded id is deduplicated.
+  If pruning prevents replay to eviction, try the readmission Welcome before
+  external rejoin: it may replace stale active/joining membership only when it
+  authenticates the same group at a strictly newer epoch and passes the shared
+  Welcome acceptance rules. A successful import is acknowledged only after the
+  joined state and delivery id are durable. If no usable Welcome exists, fall
+  back to external rejoin; skipped epoch keys may require history sharing.
+  An already recorded id is deduplicated.
 - Devices without a key package (never online since the update), and new
   devices, join on connect by external commit, in the background (design:
   "Joining").

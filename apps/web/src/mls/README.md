@@ -103,8 +103,13 @@ Creating groups settle against the complete paginated `mls.groups` snapshot.
 Welcomes are acknowledged only after durable membership: known delivery ids
 use core deduplication. Before declaring an unfamiliar Welcome superseded,
 the runtime replays the log (and reconciles pending commits), stopping at
-eviction. A readmission Welcome is imported and persisted before acknowledgement
-or external rejoin. Only membership caught up to the log head supersedes a
+eviction. If the log was pruned before local membership could catch up, a
+readmission Welcome can replace stale active/joining membership only for the
+same group at a strictly newer epoch, using the core's shared Welcome acceptance
+rules. Successful imports and their delivery ids are persisted before
+acknowledgement. If no usable Welcome is available, synchronization falls back
+to external rejoin; skipped epoch keys may then require history sharing.
+Only membership caught up to the log head supersedes a
 late Welcome without replacing its epoch. Log pages process their referenced
 proposals before commits, then the head's pending proposal set. Noncurrent leaves are removed
 by a member commit; admission candidates and claimed adds are filtered against

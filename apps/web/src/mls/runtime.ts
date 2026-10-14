@@ -237,12 +237,15 @@ export class MlsRuntime {
         // Replay stale membership first, stopping at eviction. A readmission
         // Welcome must be imported before an external rejoin can skip its epoch.
         const known = this.summary(welcome.group)?.record.welcome_ids?.includes(welcome.id);
-        if (!known && await this.syncGroup(welcome.group, false, true)) {
+        const caughtUp = known ? false : await this.syncGroup(welcome.group, false, true);
+        if (caughtUp === true) {
           await this.request("mls.welcomes.ack", { ids: [welcome.id] });
           continue;
         }
         try {
-          await this.transition<{ group: number[]; duplicate: boolean }>({ welcome: { server: this.server, id: welcome.id, bytes: bytes(welcome.welcome) } }, result => {
+          const input = { server: this.server, id: welcome.id, bytes: bytes(welcome.welcome) };
+          const request = caughtUp === "pruned" ? { replace_stale_welcome: { ...input, group: bytes(welcome.group) } } : { welcome: input };
+          await this.transition<{ group: number[]; duplicate: boolean }>(request, result => {
             if (encoded(result.group) !== welcome.group) throw new Error("Welcome group mismatch");
           });
         } catch (error) {
@@ -280,7 +283,7 @@ export class MlsRuntime {
       return [];
     });
   }
-  private async syncGroup(group: string, pending = false, beforeWelcome = false): Promise<boolean> {
+  private async syncGroup(group: string, pending = false, beforeWelcome = false): Promise<boolean | "pruned"> {
     // Concurrent joins can lose. Bounded retries yield to backoff instead of
     // holding the device's queue forever on an adversarial/busy server.
     let pages = 0;
@@ -297,7 +300,7 @@ export class MlsRuntime {
       const since = wireEpoch(out?.epoch ?? local.record.checkpoint!.epoch);
       const log = await this.request("mls.log", { group, since, limit: 100 });
       if (log.oldest > since) {
-        if (beforeWelcome) return false;
+        if (beforeWelcome) return "pruned";
         if (out) await this.transition({ reconcile: { ...this.args(group), result: { case: "pruned", oldest: String(log.oldest) } } });
         else await this.join(group); // Validated newer GroupInfo replaces pruned membership.
         continue;

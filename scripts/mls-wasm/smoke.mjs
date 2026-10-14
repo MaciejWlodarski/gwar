@@ -104,11 +104,24 @@ for (const time of [1, Number.MAX_SAFE_INTEGER]) {
   assert.throws(() => Agent.load(d.seed, d.credential, records), /device record/);
   d.agent.free();
 }
+const beforePackages = new Set(b.stores.openmls.keys());
+const readmissionPackages = b.agent.execute({ op: 'key_packages', count: 1, now }); persist(b);
+const retainedPackages = [...b.stores.openmls].filter(([key]) => !beforePackages.has(key));
+const staleStores = structuredClone(b.stores);
 const heldEpochs = [...b.stores.epochs];
 const removal = a.agent.execute({ op: 'commit', server, group, adds: [], removes: [1], now, revocations: [] }); persist(a);
 b.agent.execute({ op: 'receive', server, group, commit: removal.commit, proposals: [] }); persist(b); reload(b);
-assert.equal(b.stores.openmls.size, 0);
+assert.deepEqual([...b.stores.openmls], retainedPackages);
 assert.deepEqual([...b.stores.epochs], heldEpochs);
 assert.equal(b.agent.execute({ op: 'group', server, group }).status, 'removed');
+a.agent.execute({ op: 'reconcile', server, group, result: { case: 'entry', epoch: removal.epoch, commit: removal.commit, proposals: [] } }); persist(a);
+const readmission = a.agent.execute({ op: 'commit', server, group, adds: readmissionPackages, removes: [], now, revocations: [] }); persist(a);
+a.agent.execute({ op: 'reconcile', server, group, result: { case: 'entry', epoch: readmission.epoch, commit: readmission.commit, proposals: [] } }); persist(a);
+// The offline device never saw the removal, which the DS log has since pruned.
+b.stores = staleStores; reload(b);
+assert.equal(b.agent.execute({ op: 'replace_stale_welcome', server, group, id: 'readmission', bytes: readmission.welcome }).duplicate, false); persist(b); reload(b);
+assert.equal(b.agent.execute({ op: 'epoch', server, group, epoch: '3' }).derived !== undefined, true);
+assert.deepEqual(a.agent.execute({ op: 'sending_key', server, group, now, revocations: [] }), b.agent.execute({ op: 'sending_key', server, group, now, revocations: [] }));
+assert.equal(b.agent.execute({ op: 'welcome', server, id: 'readmission', bytes: [] }).duplicate, true); persist(b);
 a.agent.free(); b.agent.free();
-console.log('Wasm smoke passed: typed bytes, plain objects, creation acceptance, settlement, eviction cleanup, safe device times, HPKE validation, commit recovery, Welcome dedupe, exporter, history, chat seal/open, inventory, rollback.');
+console.log('Wasm smoke passed: typed bytes, plain objects, creation acceptance, settlement, eviction cleanup, safe device times, HPKE validation, commit recovery, Welcome dedupe, pruned readmission, exporter, history, chat seal/open, inventory, rollback.');

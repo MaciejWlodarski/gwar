@@ -95,6 +95,12 @@ enum Request {
         id: String,
         bytes: Vec<u8>,
     },
+    ReplaceStaleWelcome {
+        server: String,
+        group: [u8; 32],
+        id: String,
+        bytes: Vec<u8>,
+    },
     JoinExternal {
         server: String,
         bytes: Vec<u8>,
@@ -223,6 +229,9 @@ impl Agent {
                 output(a.settle(&server, &group, winner.as_ref()).map_err(error)?)
             }
             Request::Welcome { server, id, bytes } => output(a.welcome(&server, &id, &bytes).map_err(error)?),
+            Request::ReplaceStaleWelcome { server, group, id, bytes } => {
+                output(a.replace_stale_welcome(&server, &group, &id, &bytes).map_err(error)?)
+            }
             Request::JoinExternal { server, bytes, now, revocations } => {
                 output(a.join_external(&server, &bytes, now, &revocations).map_err(error)?)
             }

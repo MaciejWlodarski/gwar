@@ -26,6 +26,8 @@ last_resort_key_package(now: i64) -> Result<Vec<u8>>
 create(descriptor: SignedDescriptor) -> Result<Vec<u8>> // GroupInfo; Creating
 settle(server: &str, id: &[u8; 32], winner: Option<&[u8; 32]>) -> Result<bool>
 welcome(server: &str, id: &str, bytes: &[u8]) -> Result<WelcomeResult>
+replace_stale_welcome(server: &str, group: &[u8; 32], id: &str,
+                      bytes: &[u8]) -> Result<WelcomeResult>
 join_external(server: &str, bytes: &[u8], now: i64,
               revocations: &dyn Revocations) -> Result<Outbox>
 commit(server: &str, id: &[u8; 32], adds: &[Vec<u8>], removes: &[u32],
@@ -83,10 +85,12 @@ versioned statement in the build spec.
 
 `chat::open(&Agent, &Context, ciphertext)` returns `Vec<u8>` or `ChatError`.
 Seal encrypts the input JSON bytes unchanged; open returns those exact bytes.
-Both parse only the six signature context fields, avoiding the full protocol
+Both validate the entire input as UTF-8 and parse only the six signature context fields, avoiding the full protocol
 message/attachment/certificate types in wasm. Open uses derived or imported
 epoch keys and checks the inner signature's server, conversation, group, epoch, message id and revision. Missing groups
-or keys return `NoKey`; authentication/JSON errors cannot yield plaintext.
+or keys return `NoKey`. Open rejects AEAD authentication failures, invalid UTF-8,
+JSON syntax errors and missing, malformed or mismatched signature context fields.
+Other plaintext fields are skipped by this parser.
 The caller **must parse/validate the full plaintext and verify its v3
 MessageSignature**, including revision and revocation rules. This module does not assert author authenticity.
 
@@ -207,6 +211,14 @@ source epoch**. Equal/older heads cannot discard the outbox. Invalid newer
 GroupInfos poison the operation without exposing changes, so reload retains
 the pending bytes. A successful recovery is still Joining with no new sending
 key until its external commit is accepted.
+
+If a pruned log prevents replay of stale active/joining membership, the caller
+can first try `replace_stale_welcome`. This shares normal Welcome acceptance
+rules, requires the expected group and an epoch strictly newer than the local
+checkpoint and pending commit source, and atomically replaces OpenMLS membership
+and the outbox while retaining old application epoch keys. Persist the derived
+Welcome epoch and delivery id before acknowledging. Invalid Welcomes expose no
+changes; reload durable state before retrying or falling back to external rejoin.
 
 History sharing verifies the recipient's signed HPKE statement and membership.
 History-on shares all nonconflicted held keys. History-off shares only locally

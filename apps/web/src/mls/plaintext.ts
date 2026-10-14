@@ -10,13 +10,39 @@ const safe = (n: unknown): n is number => typeof n === "number" && Number.isSafe
 const object = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
 const fields = (v: Record<string, unknown>, names: string[]) => Object.keys(v).length === names.length && names.every(k => Object.hasOwn(v, k));
 
+/** JSON.parse has already checked syntax. Track each object's decoded keys,
+ * ignoring string values and allowing the same key in separate objects. */
+function uniqueKeys(json: string): boolean {
+  const stack: (Set<string> | null)[] = [];
+  for (let i = 0; i < json.length; i++) {
+    const c = json[i];
+    if (c === "{") stack.push(new Set());
+    else if (c === "[") stack.push(null);
+    else if (c === "}" || c === "]") stack.pop();
+    else if (c === '"') {
+      const start = i++;
+      while (json[i] !== '"') { if (json[i] === "\\") i++; i++; }
+      let next = i + 1;
+      while (/\s/.test(json[next] ?? "")) next++;
+      if (json[next] === ":") {
+        const key = JSON.parse(json.slice(start, i + 1)) as string;
+        const keys = stack[stack.length - 1]!;
+        if (keys.has(key)) return false;
+        keys.add(key);
+      }
+    }
+  }
+  return true;
+}
+
 /** Parse the complete DM plaintext and authenticate v3 without storage or network
  * access. Malformed content returns null; operational crypto failures propagate. */
 export async function authenticatePlaintext(bytes: Uint8Array, context: Context): Promise<Plaintext | null> {
   let p: Plaintext;
   try {
-    const value: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
-    if (!object(value) || !fields(value, ["text", "mentions", "attachments", "signature"]) || typeof value.text !== "string"
+    const json = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    const value: unknown = JSON.parse(json);
+    if (!uniqueKeys(json) || !object(value) || !fields(value, ["text", "mentions", "attachments", "signature"]) || typeof value.text !== "string"
         || !Array.isArray(value.mentions) || !value.mentions.every(m => typeof m === "string")
         // Step 3 direct messages cannot carry attachments.
         || !Array.isArray(value.attachments) || value.attachments.length !== 0 || !object(value.signature)) return null;

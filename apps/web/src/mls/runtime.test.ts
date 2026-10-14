@@ -41,9 +41,14 @@ async function fixture(initial = clean(), hasRemoteGroup = true) {
         case "seal_message": return [9];
         case "pending": g!.record.server_pending = d!.pending as boolean; return null;
         case "settle": if (d!.winner) g!.record = summary().record; else this.state.groups = []; return !!d!.winner;
-        case "welcome": {
+        case "welcome":
+        case "replace_stale_welcome": {
           const duplicate = this.state.welcomes.includes(d!.id as string);
-          if (!duplicate) { this.state.groups = [summary("active", String((d!.bytes as number[])[0]))]; this.state.welcomes.push(d!.id as string); this.state.groups[0]!.record.welcome_ids = [...this.state.welcomes]; }
+          if (!duplicate && g && ["active", "joining", "creating"].includes(g.record.status)) {
+            if (op === "welcome") throw new Error("group already joined");
+            if (Number((d!.bytes as number[])[0]) <= Number(g.record.checkpoint!.epoch)) throw new Error("stale Welcome");
+          }
+          if (!duplicate) { this.state.out = null; this.state.groups = [summary("active", String((d!.bytes as number[])[0]))]; this.state.welcomes.push(d!.id as string); this.state.groups[0]!.record.welcome_ids = [...this.state.welcomes]; }
           return { group: Array(32).fill(2), duplicate };
         }
         case "reconcile": {
@@ -60,7 +65,7 @@ async function fixture(initial = clean(), hasRemoteGroup = true) {
         }
         case "commit": this.state.out = { ...pending(), epoch: g!.record.checkpoint!.epoch }; return this.state.out;
         case "receive": if ((d!.commit as number[])[0] === 99) { g!.record.status = "removed"; g!.members = []; return null; } g!.record.checkpoint!.epoch = String(Number(g!.record.checkpoint!.epoch) + 1); g!.members.push({ device_key: peer, uid: b64(5,20) }); return null;
-        case "join_external": this.state.groups = [summary("joining", "1")]; this.state.out = { ...pending(), epoch: "1" }; return this.state.out;
+        case "join_external": this.state.groups = [summary("joining", String(world.head))]; this.state.out = { ...pending(), epoch: String(world.head) }; return this.state.out;
         case "key_packages": return [[1], [2], [3], [4], [5]];
         case "last_resort_key_package": return [6];
         case "share_history": if ((d!.recipient as { signature: string }).signature === "invalid") throw new Error("invalid HPKE signature"); this.state.shares++; return [[21 + this.state.shares], [22 + this.state.shares]];
@@ -152,10 +157,11 @@ describe("MLS synchronization", () => {
     await f.runtime.sync(); expect(f.state().welcomes).toEqual(["w1"]);
     expect(f.calls.filter(c => c.op === "mls.welcomes.ack")).toHaveLength(2);
   });
-  it.each([false, true])("imports an offline readmission before ack (failed write: %s)", async failWrite => {
+  it.each([{ pruned: false, failWrite: false }, { pruned: false, failWrite: true }, { pruned: true, failWrite: false }, { pruned: true, failWrite: true }])("imports an offline readmission before ack (%j)", async ({ pruned, failWrite }) => {
     const f = await fixture({ ...clean(), groups: [summary()] });
     f.world.head = 3;
     f.world.entries = [{ epoch: 0, commit: "CQ", proposals: [] }, { epoch: 1, commit: "Yw", proposals: [] }, { epoch: 2, commit: "CQ", proposals: [] }];
+    if (pruned) { f.world.oldest = 2; f.world.entries = f.world.entries.slice(2); }
     f.world.welcomes = [{ id: "readmission", group, welcome: "Aw" }];
     if (failWrite) {
       const write = f.storage.write.bind(f.storage);
@@ -164,15 +170,36 @@ describe("MLS synchronization", () => {
         await write(changes);
       });
       await expect(f.runtime.sync()).rejects.toThrow("Welcome write aborted");
-      expect((await f.durable()).groups[0]!.record.status).toBe("removed");
+      expect((await f.durable()).groups[0]!.record.status).toBe(pruned ? "active" : "removed");
       expect(f.calls.some(c => c.op === "mls.welcomes.ack")).toBe(false);
       spy.mockRestore();
     }
     await f.runtime.sync();
     expect((await f.durable()).groups[0]!.record.checkpoint!.epoch).toBe("3");
     expect((await f.durable()).welcomes).toEqual(["readmission"]);
+    expect(f.operations.some(o => o.op === "replace_stale_welcome")).toBe(pruned);
     expect(f.operations.some(o => o.op === "join_external")).toBe(false);
     expect(f.calls.filter(c => c.op === "mls.welcomes.ack")).toHaveLength(1);
+  });
+  it("deduplicates a pruned-log replacement after a lost ack", async () => {
+    const f = await fixture({ ...clean(), groups: [summary()] });
+    f.world.head = 3; f.world.oldest = 3;
+    f.world.welcomes = [{ id: "readmission", group, welcome: "Aw" }]; f.world.ackError = true;
+    await expect(f.runtime.sync()).rejects.toThrow("lost ack");
+    expect((await f.durable()).groups[0]!.record.checkpoint!.epoch).toBe("3");
+    await f.runtime.sync();
+    expect(f.operations.filter(o => o.op === "replace_stale_welcome")).toHaveLength(1);
+    expect(f.operations.some(o => o.op === "join_external")).toBe(false);
+    expect(f.world.welcomes).toEqual([]);
+  });
+  it.each([false, true])("externally rejoins a pruned log only without a usable Welcome (unusable: %s)", async unusable => {
+    const f = await fixture({ ...clean(), groups: [summary()] });
+    f.world.head = 3; f.world.oldest = 3;
+    if (unusable) f.world.welcomes = [{ id: "stale", group, welcome: "AA" }];
+    await f.runtime.sync();
+    expect(f.operations.some(o => o.op === "join_external")).toBe(true);
+    expect(f.calls.some(c => c.op === "mls.welcomes.ack")).toBe(false);
+    expect((await f.durable()).groups[0]!.record.checkpoint!.epoch).toBe("4");
   });
   it("removes a locally revoked leaf without admitting its advertised package again", async () => {
     const local = summary(); local.members.push({ device_key: peer, uid: await uidForPublicKey(b64(8)) });

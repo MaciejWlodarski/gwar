@@ -24,8 +24,8 @@ logging is disabled. CI builds this exact target, runs the smoke test, and
 fails if all emitted wasm and JavaScript files exceed **480,000 bytes gzip**
 (level 9, each file compressed separately). Load the module on first use and cache it. Including chat encryption and
 runtime inventory, the build measured with Rust 1.99.0 and Node 22.23.3 is
-**463,780 bytes gzip** (wasm 460,737; minified loader 2,852; inline JavaScript
-191), leaving 16,220 bytes of headroom. Generated files in `pkg` are
+**467,108 bytes gzip** (wasm 464,065; minified loader 2,852; inline JavaScript
+191), leaving 12,892 bytes of headroom. Generated files in `pkg` are
 ignored; Cargo metadata resolves the artifact directory, including custom
 `CARGO_TARGET_DIR` values, and a missing artifact fails the build. The loader
 is minified with the existing locked frontend Vite/Rolldown dependency; no
@@ -73,7 +73,7 @@ agent.execute({ reconcile: {
 ```
 
 Operations are `key_packages`, `last_resort_key_package`, `create`, `settle`, `welcome`,
-`join_external`, `commit`, `receive`, `proposal`, `pending`, `reconcile`, `gate`,
+`replace_stale_welcome`, `join_external`, `commit`, `receive`, `proposal`, `pending`, `reconcile`, `gate`,
 `sending_key`, `share_history`, `import_history`, `device_hpke_key`, `group`,
 `epoch`, `outbox`, `inventory`, `seal_message`, and `open_message`. Their native signatures and recovery contract are in
 [the core README](../gwar-mls/README.md). `sending_key` returns `[epoch, key]`.
@@ -84,6 +84,12 @@ Unknown fields are rejected. `create` leaves `group.status` and `gate.status`
 at `creating`, with no sending key, commits or history sharing, until `settle`
 activates or deletes it; its changes must be persisted. Eviction deletes all OpenMLS records for that group while retaining
 application epoch keys, its pin and last member checkpoint.
+`replace_stale_welcome: {server, group, id, bytes}` is for a log gap that
+prevents replay of stale active/joining membership. It shares Welcome validation,
+requires the expected group and a strictly newer epoch than the local checkpoint
+and pending commit source, and replaces membership plus any pending outbox.
+Persist its changes and delivery id atomically before acknowledging; on failure,
+reload durable state, including the unconsumed key package.
 Revocations are `{account_key, device_key, revoked_at}` entries, using the
 earliest timestamp if repeated. Missing records return `null`.
 

@@ -8,14 +8,14 @@ import { messageBodyHash, messageStatement } from "../net/message-signature";
 import { deviceStatement } from "../connect/crypto";
 import type { Plaintext } from "./types";
 const enc = new TextEncoder();
-async function fixture(certified = false) {
+async function fixture(certified = false, text = "hello 👋") {
   const seed = new Uint8Array(32).fill(1), account = new Uint8Array(32).fill(2);
   const key = b64(ed25519.getPublicKey(seed)), accountKey = b64(ed25519.getPublicKey(account));
   const uid = await uidForPublicKey(certified ? accountKey : key);
   const other = await uidForPublicKey(b64(ed25519.getPublicKey(new Uint8Array(32).fill(3))));
   const context = { server_key: b64(new Uint8Array(32).fill(9)), conversation: `dm:${[uid, other].sort().join(":")}`, group_id: b64(new Uint8Array(32).fill(4)), epoch: "7", message_id: b64(new Uint8Array(16).fill(5)), revision: 0 };
   const certificate = certified ? { account_key: accountKey, device_key: key, issued_at: 1, expires_at: 10000, signature: b64(ed25519.sign(enc.encode(deviceStatement(accountKey, key, 1, 10000)), account)) } : null;
-  const p: Plaintext = { text: "hello 👋", mentions: [other], attachments: [], signature: { ...context, author_uid: uid, key, certificate, certificate_hash: await certificateHash(certificate ?? undefined), created_at: 2, signed_at: 2, previous_revision_hash: "-", body_hash: await messageBodyHash("hello 👋", [other], []), signature: "" } };
+  const p: Plaintext = { text, mentions: [other], attachments: [], signature: { ...context, author_uid: uid, key, certificate, certificate_hash: await certificateHash(certificate ?? undefined), created_at: 2, signed_at: 2, previous_revision_hash: "-", body_hash: await messageBodyHash(text, [other], []), signature: "" } };
   p.signature.signature = b64(ed25519.sign(enc.encode(messageStatement(context.server_key, context.conversation, uid, p.signature, p.signature.body_hash)), seed));
   return { p, context };
 }
@@ -40,6 +40,20 @@ describe("MLS plaintext authentication", () => {
     }
     expect(await authenticatePlaintext(new Uint8Array([255]), context)).toBeNull();
     expect(await authenticatePlaintext(enc.encode("{invalid"), context)).toBeNull();
+  });
+  it("rejects duplicate decoded keys at the root, signature and certificate", async () => {
+    const { p, context } = await fixture(true);
+    const json = JSON.stringify(p);
+    for (const [key, duplicate] of [["text", "text"], ["text", "te\\u0078t"], ["epoch", "epoch"], ["device_key", "device_\\u006bey"], ["signature", "signature"]]) {
+      const malformed = json.replace(`"${key}":`, `"${duplicate}":"discarded","${key}":`);
+      expect(JSON.parse(malformed)).toEqual(p); // Last-wins parsing would authenticate.
+      expect(await authenticatePlaintext(enc.encode(malformed), context)).toBeNull();
+    }
+  });
+  it("allows keys repeated in separate objects and punctuation/escapes inside strings", async () => {
+    const { p, context } = await fixture(true, 'quoted "text": { "nested": [ ] }, slash \\ and emoji 👋');
+    const json = JSON.stringify(p).replace('"text":', '"te\\u0078t":');
+    expect(await authenticatePlaintext(enc.encode(json), context)).toEqual(p);
   });
   it("propagates operational crypto failures", async () => {
     const { p, context } = await fixture(true);

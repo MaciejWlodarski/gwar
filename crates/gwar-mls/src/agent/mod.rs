@@ -1178,6 +1178,27 @@ pub struct WelcomeResult {
 impl Agent {
     /// Persist before acknowledging. A duplicate never consumes its key package again.
     pub fn welcome(&mut self, server: &str, id: &str, bytes: &[u8]) -> Result<WelcomeResult> {
+        self.accept_welcome(server, id, bytes, None)
+    }
+    /// Recover membership whose log cannot be replayed. The caller establishes
+    /// the log gap; the Welcome must authenticate this group at a newer epoch.
+    /// Persist the entire result before acknowledging, as for `welcome`.
+    pub fn replace_stale_welcome(
+        &mut self,
+        server: &str,
+        group: &[u8; 32],
+        id: &str,
+        bytes: &[u8],
+    ) -> Result<WelcomeResult> {
+        self.accept_welcome(server, id, bytes, Some(group))
+    }
+    fn accept_welcome(
+        &mut self,
+        server: &str,
+        id: &str,
+        bytes: &[u8],
+        replace: Option<&[u8; 32]>,
+    ) -> Result<WelcomeResult> {
         self.operation(|a| {
             if id.is_empty() {
                 return Err(Invalid("welcome id"));
@@ -1185,6 +1206,9 @@ impl Agent {
             for (key, record) in &a.groups {
                 if key.starts_with(&format!("{server}/")) && record.welcome_ids.contains(id) {
                     let descriptor = SignedDescriptor::parse(&record.descriptor).ok_or(Invalid("descriptor"))?;
+                    if replace.is_some_and(|group| *group != descriptor.group_id()) {
+                        return Err(Invalid("welcome replacement group"));
+                    }
                     return Ok(WelcomeResult { group: descriptor.group_id(), duplicate: true });
                 }
             }
@@ -1197,16 +1221,28 @@ impl Agent {
             if welcome.ciphersuite() != SUITE {
                 return Err(Invalid("ciphersuite"));
             }
-            let staged = StagedWelcome::build_from_welcome(&a.provider, &join_config(), welcome)
+            let builder = StagedWelcome::build_from_welcome(&a.provider, &join_config(), welcome)
                 .map_err(err("welcome"))?
-                .skip_lifetime_validation()
-                .build()
-                .map_err(err("staged welcome"))?;
+                .skip_lifetime_validation();
+            let builder = if replace.is_some() { builder.replace_old_group() } else { builder };
+            let staged = builder.build().map_err(err("staged welcome"))?;
             let descriptor = client_context(staged.group_context(), server)?;
             a.check_pin(&descriptor)?;
             let key = group_key(server, &descriptor.group_id());
             a.fresh(&key, staged.group_context())?;
-            if a.groups
+            if let Some(expected) = replace {
+                if *expected != descriptor.group_id() {
+                    return Err(Invalid("welcome replacement group"));
+                }
+                let old = a.groups.get(&key).ok_or(Invalid("welcome replacement membership"))?;
+                if !matches!(old.status, Status::Active | Status::Joining)
+                    || old.checkpoint.as_ref().is_none_or(|c| staged.group_context().epoch().as_u64() <= c.epoch)
+                    || a.outbox.get(&key).is_some_and(|out| staged.group_context().epoch().as_u64() <= out.epoch)
+                {
+                    return Err(Invalid("welcome replacement epoch or status"));
+                }
+            } else if a
+                .groups
                 .get(&key)
                 .is_some_and(|r| matches!(r.status, Status::Creating | Status::Active | Status::Joining))
             {
@@ -1224,6 +1260,9 @@ impl Agent {
                 .is_some_and(|c| c.device_key() == a.credential.device_key() && c.uid() == a.credential.uid())
             {
                 return Err(Invalid("welcome identity"));
+            }
+            if replace.is_some() {
+                a.drop_mls(&key)?;
             }
             let group = staged.into_group(&a.provider).map_err(err("welcome group"))?;
             rules::tree(&descriptor, group.public_group().treesync().full_leaves().map(|(_, l)| l))?;
