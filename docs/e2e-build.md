@@ -995,9 +995,11 @@ channels and server chat:
   a GroupInfo of an earlier epoch or with another GroupContext for the same
   epoch, or a log whose head is behind it. It takes two such failed checks
   against the same live pin and checkpoint, at least one minute apart. Any
-  validated response at that checkpoint or continuing from it cancels the
-  trigger, also when there was nothing to merge, and a later failure starts
-  the wait again; a changed pin or checkpoint discards pending checks. A server whose live incarnation is older than the device's pin
+  validated response at that checkpoint or continuing from it (a verified
+  GroupInfo at that GroupContext or later, also when there was nothing to
+  merge, or a log entry merged from it) cancels the trigger, and a later
+  failure starts the wait again; a log that only reports its head at the
+  checkpoint proves nothing and decides nothing; a changed pin or checkpoint discards pending checks. A server whose live incarnation is older than the device's pin
   (it lost a restart) never replaces the pin and never leads the device to
   create a sibling: the device stays blocked in that conversation ("Securing
   this conversation…") until the server again holds its pinned incarnation
@@ -1018,8 +1020,11 @@ channels and server chat:
   section 1, not of the signed envelope), server key and
   conversation, consecutive incarnation numbers, each `previous_group_id`
   equal to the group before, the unchanged fields above, and that each
-  creator may create the conversation (at its creation time, by the rules of
-  "Who may do what"). An existing device anchors the chain at its highest
+  creator was certified at its creation time and, for a direct message, is
+  one of its participants. That the creator could then create the
+  conversation ("Who may do what": a member, who can read the channel) is
+  the server's check at `mls.group.create`, as for incarnation zero: a
+  device has no record of past server membership. An existing device anchors the chain at its highest
   accepted pin; a new device validates from incarnation zero (the
   first-contact limit of the design's "Freshness"). The accepted pins and the
   highest live incarnation are persisted in one write; a predecessor is never
@@ -1034,15 +1039,17 @@ channels and server chat:
   the live pin, one candidate per predecessor. `accept_chain(server,
   conversation, [(group, descriptor)])` verifies the chain from the live pin
   (or from incarnation zero) and records the new incarnations (the last one
-  to be joined, as **Rejoin**); `settle` of a won restart and `accept_chain`
+  to be joined, as **Rejoin**, or settled as won when it is this device's
+  own creation); `settle` of a won restart and `accept_chain`
   turn every earlier incarnation **Superseded**: its OpenMLS state, private
   epoch key pairs and outbox are deleted, its epoch keys and evidence kept,
-  and the runtime's jobs for it go in the same write. `behind(server,
-  group_info)` verifies a GroupInfo as a newcomer would (tree, a member's
-  signature, the rules) and reports whether it is behind the group's
+  and the runtime's jobs for it go in the same write. `behind(server, group,
+  group_info)` verifies a GroupInfo of that group as an external joiner would
+  (tree, a member's signature, the rules; leaf lifetimes skipped) and reports whether it is behind the group's
   checkpoint or forks it. The browser runtime counts a log head behind the
   checkpoint, or such a GroupInfo when rejoining, as a failed check; pending
-  checks live in memory, so a reload starts the wait again. A Welcome to a
+  checks live in memory, so a reload starts the wait again. A held
+  conversation also shares no history and requests no keys. A Welcome to a
   superseded group is acknowledged without importing it. The chat shows the
   restarted line when the live incarnation is above zero, and rows of earlier
   incarnations that this device cannot open do not wait for history.

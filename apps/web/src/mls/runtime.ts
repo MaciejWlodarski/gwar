@@ -228,7 +228,12 @@ export class MlsRuntime {
       this.assertCurrent(this.generation);
       await this.synchronize();
       this.updateStatuses();
-    }).catch(error => { failed = true; this.markSecuring(); throw error; }).finally(() => {
+    }).catch(error => {
+      failed = true; this.markSecuring();
+      // Rosters follow the durable state the failed pass left (a restart accepted before a join failed).
+      void this.engine.run(async () => this.updateStatuses(true)).catch(() => {});
+      throw error;
+    }).finally(() => {
       this.syncing = undefined;
       // Periodic refill, revocation/expiry checks and missing history retries;
       // sooner for a channel group whose create or join comes due.
@@ -242,7 +247,7 @@ export class MlsRuntime {
   private args(group: string) { return { server: this.server, group: [...decodeFixed(group, 32)] }; }
   private gate(group: string): Gate { return this.engine.query({ gate: { ...this.args(group), now: this.now(), revocations: this.options.revocations() } }); }
   private outbox(group: string): CommitOutbox | null { return this.engine.query({ outbox: this.args(group) }); }
-  private updateStatuses(): void {
+  private updateStatuses(securing = false): void {
     this.rosters.clear();
     // A conversation is its live pin; a first creation stands for it until settled.
     const shown = new Map<string, GroupSummary>();
@@ -252,9 +257,10 @@ export class MlsRuntime {
     for (const [conversation, g] of shown) {
       const gate = this.gate(encoded(g.group));
       const ready = gate.status === "active" && !gate.rejoin && !gate.server_pending && !gate.blocked.length && !gate.pending_commit && !this.held.has(conversation);
-      this.statuses.set(conversation, gate.status === "creating" ? "creating" : ready ? "ready" : "securing");
+      this.statuses.set(conversation, gate.status === "creating" ? "creating" : ready && !securing ? "ready" : "securing");
       const first = g.record.evidence?.[this.uid]?.[0]?.first;
-      if (g.record.status === "active") this.rosters.set(conversation, { group: encoded(g.group), restarted: g.incarnation !== "0", history: g.history, members: g.members, since: first === undefined ? null : Number(first) });
+      // A live pin still to be joined (a restart just accepted) already names the conversation's group.
+      if (g.live) this.rosters.set(conversation, { group: encoded(g.group), restarted: g.incarnation !== "0", history: g.history, members: g.members, since: first === undefined ? null : Number(first) });
     }
     this.notify();
   }
@@ -518,9 +524,13 @@ export class MlsRuntime {
   private async join(group: string): Promise<void> {
     const info = await this.request("mls.group_info", { group });
     const local = this.summary(group);
-    if (local?.live && local.record.checkpoint && this.engine.query<boolean>({ behind: { server: this.server, bytes: bytes(info.group_info) } })) {
-      await this.observeBehind(local);
-      throw new Error("The server is behind this device in this conversation");
+    if (local?.live && local.record.checkpoint) {
+      if (this.engine.query<boolean>({ behind: { server: this.server, group: bytes(group), bytes: bytes(info.group_info) } })) {
+        await this.observeBehind(local);
+        throw new Error("The server is behind this device in this conversation");
+      }
+      // A verified GroupInfo at or past the checkpoint: no restart is due.
+      this.triggers.delete(local.conversation);
     }
     await this.engine.op<CommitOutbox>({ join_external: { server: this.server, bytes: bytes(info.group_info), now: this.now(), revocations: this.options.revocations() } }, out => {
       if (encoded(out.group) !== group) throw new Error("GroupInfo group mismatch");
@@ -548,8 +558,6 @@ export class MlsRuntime {
         await this.observeBehind(local);
         throw new Error("The server is behind this device in this conversation");
       }
-      // The server is at or past the checkpoint: no restart is due.
-      this.triggers.delete(local.conversation);
       if (log.oldest > since) {
         if (beforeWelcome) return "pruned";
         if (out) await this.transition({ reconcile: { ...this.args(group), result: { case: "pruned", oldest: String(log.oldest) } } });
@@ -561,6 +569,8 @@ export class MlsRuntime {
         if (entry) {
           try {
             await this.transition<Resolution>({ reconcile: { ...this.args(group), result: { case: "entry", epoch: String(entry.epoch), commit: bytes(entry.commit), proposals: entry.proposals.map(bytes) } } });
+            // A validated entry continuing from the checkpoint: no restart is due.
+            this.triggers.delete(local.conversation);
           } catch (error) {
             if (!(error instanceof AgentOperationError)) throw error;
             await this.engine.reload();
@@ -601,6 +611,7 @@ export class MlsRuntime {
           continue groupLoop;
         }
         expected++;
+        this.triggers.delete(local.conversation);
         if (this.summary(group)?.record.status !== "active") break;
       }
       if (this.summary(group)?.record.status !== "active") continue;
@@ -670,6 +681,13 @@ export class MlsRuntime {
   private assertGroupSynced(group: string): void {
     if (this.syncedVersions.get(group) !== (this.groupVersions.get(group) ?? 0)) throw new GroupChanged();
   }
+  /** Whether this device may share a group's history now: its gate is clear
+   * and its conversation is not held for a restart. */
+  private mayShare(group: string): boolean {
+    const gate = this.gate(group), conversation = this.summary(group)?.conversation;
+    return gate.status === "active" && !gate.rejoin && !gate.server_pending && !gate.blocked.length && !gate.pending_commit
+      && conversation !== undefined && !this.held.has(conversation);
+  }
   private async sendHistory(): Promise<void> {
     jobs: for (const value of [...this.engine.jobs.values()]) {
       if (value.kind !== "history" || value.server !== this.server) continue;
@@ -679,8 +697,7 @@ export class MlsRuntime {
       if (!local?.members.some(m => m.device_key === job.recipient)) {
         await this.engine.saveJobs([jobChange(job, true)]); continue;
       }
-      const gate = this.gate(job.group);
-      if (gate.status !== "active" || gate.rejoin || gate.server_pending || gate.blocked.length || gate.pending_commit) continue;
+      if (!this.mayShare(job.group)) continue;
       const due = this.historyDue.get(jobKey(job));
       if (due && due.at > this.now()) { this.wakeAt = Math.min(this.wakeAt ?? Infinity, due.at); continue; }
       try {
@@ -708,12 +725,10 @@ export class MlsRuntime {
         catch (error) { if (!(error instanceof RequestError)) throw error; this.options.onError?.(error); }
       }
       for (const chunk of job.chunks!) {
-        const current = this.gate(job.group);
-        if (current.status !== "active" || current.rejoin || current.server_pending || current.blocked.length || current.pending_commit) continue jobs;
+        if (!this.mayShare(job.group)) continue jobs;
         try { await this.request("mls.history.share", { group: job.group, recipient: job.recipient, chunk, assignment: job.assignment ?? null }, () => {
           this.assertGroupSynced(job.group);
-          const gate = this.gate(job.group);
-          if (gate.status !== "active" || gate.rejoin || gate.server_pending || gate.blocked.length || gate.pending_commit) throw new Error("history sharing blocked");
+          if (!this.mayShare(job.group)) throw new Error("history sharing blocked");
         }); }
         catch (error) {
           // The group changed while preparing: the next pass syncs it and retries the job.
@@ -753,7 +768,8 @@ export class MlsRuntime {
       }
       if (!epochs.size) { this.missing.delete(group); continue; }
       if (this.now() - (this.lastRequest.get(group) ?? -Infinity) < 60_000) continue;
-      if (this.summary(group)?.record.status !== "active") continue;
+      const local = this.summary(group);
+      if (local?.record.status !== "active" || this.held.has(local.conversation)) continue;
       try { await this.request("mls.history.request", { group }); }
       catch (error) { if (!(error instanceof RequestError) || error.code !== "rate_limited") throw error; }
       this.lastRequest.set(group, this.now());

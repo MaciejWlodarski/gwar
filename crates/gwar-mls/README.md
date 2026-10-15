@@ -53,7 +53,7 @@ gate(server: &str, id: &[u8; 32], now: i64,
      revocations: &dyn Revocations) -> Result<Gate>
 sending_key(server: &str, id: &[u8; 32], now: i64,
             revocations: &dyn Revocations) -> Result<(u64, [u8; 32])>
-behind(server: &str, group_info: &[u8]) -> Result<bool>
+behind(server: &str, id: &[u8; 32], group_info: &[u8]) -> Result<bool>
 ```
 
 `create` returns a TLS MLS GroupInfo message in persisted `Creating` state.
@@ -175,14 +175,15 @@ names its group, server and conversation, has a creator certified at its
 creation time, and continues the one before (next incarnation, its group as
 `previous_group_id`, the same kind, `private`, `history`, owner and channel
 group). It records every new incarnation (the last as `Rejoin`, to be
-joined) and supersedes the earlier ones in the same operation. `create`
+joined; this device's own creation there is settled as won) and supersedes
+the earlier ones in the same operation. `create`
 also takes a restart candidate: the next incarnation of the live pin, one per
 predecessor; settling it as the winner supersedes the predecessor.
 **Superseded** groups keep their epoch keys and evidence for reading; their
 OpenMLS state, private epoch key pairs and outbox are gone, and nothing can
-be sent, committed or imported there. `behind` verifies a GroupInfo as a
-newcomer would and reports whether it is behind the group's checkpoint or
-forks it, a restart trigger. Member
+be sent, committed or imported there. `behind` verifies a GroupInfo of the
+named group as an external joiner would (leaf lifetimes skipped) and reports
+whether it is behind the group's checkpoint or forks it, a restart trigger. Member
 staged commits additionally check introduced/changed certificates at the time
 in signed `ds::commit_aad`. Later revocation or expiry never rejects an otherwise
 valid commit. Joins skip OpenMLS leaf lifetime checks; key packages expire no
@@ -295,7 +296,7 @@ cargo build -p vc-server --no-default-features
 pnpm --filter web e2e:mls
 ```
 
-The native suite has 77 unit tests and 11 observer integration tests. Chat
+The native suite has 78 unit tests and 11 observer integration tests. Chat
 coverage includes an independently generated Node HKDF/AES-GCM fixed vector,
 every AAD/inner context field, random nonces, wrong keys, every truncation,
 tampered nonce/ciphertext/tag, the sending gate and imported history keys.
@@ -304,8 +305,8 @@ real delivery service, four device runtimes, IndexedDB and Web Locks, with no
 DM UI or chat.sealed server calls. Remote CI and production were not run.
 
 With Rust 1.99.0, Node **22.23.3**, wasm-bindgen 0.2.129 and Binaryen 123.0.0,
-the artifact totals **476,657 bytes gzip**: wasm 473,609, minified loader 2,856,
-inline JavaScript 192; 3,343 bytes below the 480,000-byte limit.
+the artifact totals **476,253 bytes gzip**: wasm 473,205, minified loader 2,856,
+inline JavaScript 192; 3,747 bytes below the 480,000-byte limit.
 On this macOS host the wasm build uses the rustup toolchain's `bin` ahead of
 Homebrew Rust and a local rust-lld wrapper setting `DYLD_LIBRARY_PATH` to that
 toolchain's `lib` directory. CI uses the pinned Linux job.

@@ -644,6 +644,10 @@ impl Agent {
     fn check_pin(&self, descriptor: &SignedDescriptor) -> Result<()> {
         self.check_incarnation(descriptor)?;
         let d = &descriptor.descriptor;
+        let key = group_key(&d.server_key, &descriptor.group_id());
+        if self.groups.get(&key).is_some_and(|r| r.status == Status::Superseded) {
+            return Err(Invalid("superseded"));
+        }
         match self.live(&d.server_key, &d.conversation)?.map(|live| live.descriptor.incarnation) {
             Some(live) if d.incarnation < live => Err(Invalid("superseded")),
             Some(live) if d.incarnation > live => Err(Invalid("restart chain")),
@@ -786,21 +790,28 @@ impl Agent {
             if a.groups.get(&key).is_none_or(|r| r.status != Status::Creating) {
                 return Err(Invalid("not creating"));
             }
-            let mut group = a.mls(&key)?;
             if winner == Some(id) {
-                a.derived(&key, &group)?;
-                let record = a.groups.get_mut(&key).ok_or(Invalid("record"))?;
-                let d = SignedDescriptor::parse(&record.descriptor).ok_or(Invalid("descriptor"))?.descriptor;
-                record.own_commit_at = Some(d.created_at);
-                // A won restart is live at once; its predecessor never is again.
-                a.supersede(server, &d.conversation, d.incarnation)?;
+                a.won(server, &key)?;
                 return Ok(true);
             }
             // A creating group has no epoch keys, outbox or other members.
+            let mut group = a.mls(&key)?;
             group.delete(a.provider.storage()).map_err(err("delete group"))?;
             a.groups.remove(&key);
             Ok(false)
         })
+    }
+
+    /// This device's creation is the group the server holds: it is active at
+    /// epoch zero, and a won restart is live at once while its predecessor
+    /// never is again.
+    fn won(&mut self, server: &str, key: &str) -> Result<()> {
+        let group = self.mls(key)?;
+        self.derived(key, &group)?;
+        let record = self.groups.get_mut(key).ok_or(Invalid("record"))?;
+        let d = SignedDescriptor::parse(&record.descriptor).ok_or(Invalid("descriptor"))?.descriptor;
+        record.own_commit_at = Some(d.created_at);
+        self.supersede(server, &d.conversation, d.incarnation)
     }
 
     pub fn gate(&self, server: &str, id: &[u8; 32], now: i64, revocations: &dyn Revocations) -> Result<Gate> {
@@ -1184,27 +1195,47 @@ impl Agent {
                 });
             }
             let live = chain.last().expect("checked above");
+            let key = group_key(server, &live.group_id());
+            if a.groups[&key].status == Status::Creating {
+                // This device's own creation, which the server holds: it won.
+                a.won(server, &key)?;
+            }
+            // Earlier links, including a creation of this device the chain
+            // continued past, are never live again.
             a.supersede(server, conversation, live.descriptor.incarnation)?;
             Ok(live.group_id())
         })
     }
-    /// Whether a GroupInfo, verified as a newcomer would (tree, a member's
-    /// signature, Gwar's rules), is behind this device's checkpoint of its
-    /// group: an earlier epoch, or another GroupContext for the same epoch.
-    /// One of the observations that trigger a restart.
-    pub fn behind(&self, server: &str, bytes: &[u8]) -> Result<bool> {
+    /// Whether a GroupInfo of `id`, verified as an external joiner would
+    /// (tree, a member's signature, Gwar's rules; leaf lifetimes are skipped,
+    /// as when joining, since an older GroupInfo may hold expired packages),
+    /// is behind this device's checkpoint of that group: an earlier epoch, or
+    /// another GroupContext for the same epoch. One of the observations that
+    /// trigger a restart.
+    pub fn behind(&self, server: &str, id: &[u8; 32], bytes: &[u8]) -> Result<bool> {
         let info = info(bytes)?;
-        let tree = info.extensions().ratchet_tree().ok_or(Invalid("no ratchet tree"))?.ratchet_tree().clone();
-        let storage = crate::mls_storage::Storage::default();
-        let (group, _) = PublicGroup::from_external(self.provider.crypto(), &storage, tree, info, ProposalStore::new())
+        let descriptor = client_context(info.group_context(), server)?;
+        if descriptor.group_id() != *id {
+            return Err(Invalid("group info group"));
+        }
+        let tree = info
+            .extensions()
+            .ratchet_tree()
+            .ok_or(Invalid("no ratchet tree"))?
+            .ratchet_tree()
+            .clone()
+            .into_verified(SUITE, self.provider.crypto(), info.group_id())
+            .map_err(err("ratchet tree"))?;
+        rules::tree(&descriptor, tree.leaves())?;
+        let next = checkpoint(info.group_context())?;
+        // Verification only: a throwaway provider, and nothing is committed.
+        MlsGroup::external_commit_builder()
+            .skip_lifetime_validation()
+            .build_group(&Provider::default(), info, self.with_key())
             .map_err(err("group info"))?;
-        let descriptor = client_context(group.group_context(), server)?;
-        rules::tree(&descriptor, group.treesync().full_leaves().map(|(_, l)| l))?;
-        let key = group_key(server, &descriptor.group_id());
-        let Some(old) = self.groups.get(&key).and_then(|r| r.checkpoint.as_ref()) else {
+        let Some(old) = self.groups.get(&group_key(server, id)).and_then(|r| r.checkpoint.as_ref()) else {
             return Ok(false);
         };
-        let next = checkpoint(group.group_context())?;
         Ok(next.epoch < old.epoch || next.epoch == old.epoch && next.hash != old.hash)
     }
     fn drop_mls(&mut self, key: &str) -> Result<()> {

@@ -678,6 +678,7 @@ fn external_join_and_welcome_skip_expired_leaf_lifetimes() {
     f.b.take_changes();
     let mut c = device(1, 12, f.t);
     c.join_external(&server(), &out.group_info, f.t, &()).unwrap();
+    assert_eq!(f.b.behind(&server(), &f.id, &out.group_info), Ok(false), "observed despite the expired leaf");
 }
 #[test]
 fn renewal_after_key_package_does_not_reject_welcome() {
@@ -1071,11 +1072,47 @@ fn group_infos_behind_the_checkpoint_or_forking_it_are_observed() {
     let theirs = f.b.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
     f.b.take_changes();
     acknowledge(&mut f.a, &f.id, &ours);
-    assert_eq!(f.a.behind(&server(), &f.info), Ok(true), "an earlier epoch");
-    assert_eq!(f.a.behind(&server(), &theirs.group_info), Ok(true), "the same epoch, another context");
-    assert_eq!(f.a.behind(&server(), &ours.group_info), Ok(false));
-    assert_eq!(f.b.behind(&server(), &f.info), Ok(false), "b has not moved past it");
-    assert!(f.a.behind(&server(), &ours.commit).is_err());
+    assert_eq!(f.a.behind(&server(), &f.id, &f.info), Ok(true), "an earlier epoch");
+    assert_eq!(f.a.behind(&server(), &f.id, &theirs.group_info), Ok(true), "the same epoch, another context");
+    assert_eq!(f.a.behind(&server(), &f.id, &ours.group_info), Ok(false));
+    assert_eq!(f.b.behind(&server(), &f.id, &f.info), Ok(false), "b has not moved past it");
+    assert!(f.a.behind(&server(), &f.id, &ours.commit).is_err());
+    // An observation counts only for the group it was asked for.
+    assert_eq!(f.a.behind(&server(), &[9; 32], &f.info), Err(Invalid("group info group")));
+}
+#[test]
+fn accepting_a_chain_through_this_devices_own_creation_settles_it() {
+    let mut f = joined();
+    let first = descriptor(&f.a, &f.b, f.t, true, true);
+    let conversation = first.descriptor.conversation.clone();
+    let next = restart(&f.a, &first, 2);
+    f.a.create(next.clone()).unwrap();
+    f.a.take_changes();
+    // The server holds the creation, but its reply was lost.
+    assert_eq!(f.a.accept_chain(&server(), &conversation, &[link(&first), link(&next)]), Ok(next.group_id()));
+    f.a.take_changes();
+    assert_eq!(f.a.group(&server(), &first.group_id()).unwrap().status, Status::Superseded);
+    assert_eq!(f.a.group(&server(), &next.group_id()).unwrap().status, Status::Active);
+    assert!(f.a.sending_key(&server(), &next.group_id(), f.t, &()).is_ok());
+    assert_eq!(f.a.join_external(&server(), &f.info, f.t, &()), Err(Invalid("superseded")));
+    let mut a = Agent::load([11; 32], f.a.credential.clone(), f.a.durable.clone()).unwrap();
+    assert_eq!(a.settle(&server(), &next.group_id(), None), Err(Invalid("not creating")));
+
+    // A creation the chain continued past is superseded with its MLS state.
+    let mut f = joined();
+    let first = descriptor(&f.a, &f.b, f.t, true, true);
+    let next = restart(&f.a, &first, 2);
+    f.a.create(next.clone()).unwrap();
+    f.a.take_changes();
+    let after = restart(&f.b, &next, 3);
+    let chain = [link(&first), link(&next), link(&after)];
+    assert_eq!(f.a.accept_chain(&server(), &conversation, &chain), Ok(after.group_id()));
+    f.a.take_changes();
+    assert_eq!(f.a.group(&server(), &next.group_id()).unwrap().status, Status::Superseded);
+    assert!(f.a.mls(&group_key(&server(), &next.group_id())).is_err());
+    assert_eq!(f.a.group(&server(), &after.group_id()).unwrap().status, Status::Rejoin);
+    let live: Vec<_> = f.a.inventory(&server()).unwrap().into_iter().filter(|g| g.live).map(|g| g.group).collect();
+    assert_eq!(live, vec![after.group_id()]);
 }
 
 #[test]

@@ -186,6 +186,7 @@ enum Request {
     },
     Behind {
         server: String,
+        group: [u8; 32],
         bytes: Vec<u8>,
     },
 }
@@ -288,7 +289,7 @@ impl Agent {
                 let chain: Vec<_> = chain.into_iter().map(|i| (i.group, i.descriptor)).collect();
                 output(a.accept_chain(&server, &conversation, &chain).map_err(error)?)
             }
-            Request::Behind { server, bytes } => output(a.behind(&server, &bytes).map_err(error)?),
+            Request::Behind { server, group, bytes } => output(a.behind(&server, &group, &bytes).map_err(error)?),
         }
     }
 }
