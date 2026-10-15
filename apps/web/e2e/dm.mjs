@@ -290,11 +290,11 @@ try {
   await e.locator("textarea").click();
   await e.waitForFunction(id => window.dm.server().lastRead >= id, serverRow.sealed.id, { timeout: 45000 });
   for (const page of [d, e]) await page.evaluate(async () => {
-    const { messageStorage, refreshRevocations } = await import("/src/net/message-storage.ts");
-    await messageStorage.mergeFeed([], undefined, Date.now() - 61_000);
+    const { messageStorage, refreshRevocations, REVOCATION_FRESH_MS } = await import("/src/net/message-storage.ts");
+    await messageStorage.mergeFeed([], undefined, Date.now() - REVOCATION_FRESH_MS - 1);
+    if ((await messageStorage.revocation("unused", "unused")).fresh) throw new Error("Local revocation feed did not expire");
     await refreshRevocations(undefined, undefined, true);
-    const state = await messageStorage.revocation("unused", "unused");
-    if (!state.fresh) throw new Error("Local revocation feed did not refresh");
+    if (!(await messageStorage.revocation("unused", "unused")).fresh) throw new Error("Local revocation feed did not refresh");
   });
   await e.evaluate(() => window.dm.select(1));
   await composer(d);
