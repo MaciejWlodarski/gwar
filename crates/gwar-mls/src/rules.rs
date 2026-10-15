@@ -124,7 +124,7 @@ pub(crate) fn staged(
         .and_then(|ext| SignedDescriptor::parse(&ext.0))
         .ok_or(Invalid("descriptor"))?;
     if descriptor.descriptor.kind.separate_tree() && staged.add_proposals().next().is_some() {
-        return Err(Invalid("channel and server devices join externally"));
+        return Err(Invalid("separate-tree groups join externally"));
     }
     let mut welcome_for = BTreeSet::new();
     let mut added_devices = Vec::new();

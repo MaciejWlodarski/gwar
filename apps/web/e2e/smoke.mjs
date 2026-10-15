@@ -368,6 +368,11 @@ async function main() {
   };
   const newCtx = async (opts = {}) => {
     const ctx = await browser.newContext({ viewport: { width: 1280, height: 800 }, locale: "en-US", permissions: ["microphone"], colorScheme: "dark", ...opts });
+    // Keep this regression suite entirely on local services.
+    await ctx.route("**/*", route => {
+      const host = new URL(route.request().url()).hostname;
+      return ["127.0.0.1", "localhost", "[::1]"].includes(host) ? route.continue() : route.abort();
+    });
     await ctx.addInitScript(spy);
     return ctx;
   };

@@ -257,6 +257,7 @@ export const en = {
   "voice.notIn": "Not in voice",
   "voice.notInHint": "Double-click a channel to talk",
   "voice.pttHint": "Push to talk: hold {key}",
+  "voice.encryptedPending": "Encrypted voice is being added. Chat is available.",
   "voice.closed": "The voice connection was closed. Reconnecting…",
 
   "chat.today": "Today",

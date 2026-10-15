@@ -104,6 +104,7 @@ type Pending = oneshot::Sender<Result<Value, ErrorBody>>;
 #[derive(Clone)]
 pub struct Connection {
     outgoing: mpsc::Sender<(Request, Pending)>,
+    voice_run: Arc<std::sync::atomic::AtomicU64>,
     /// Verified identity epoch for this server connection.
     pub server_key: String,
     identity: Identity,
@@ -303,6 +304,7 @@ pub async fn connect(options: ConnectOptions) -> Result<Connected, ClientError> 
 
     Ok(Connected {
         connection: Connection {
+            voice_run: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             outgoing,
             server_key: challenge.server_pk,
             identity: options.identity,
@@ -448,7 +450,31 @@ impl Connection {
 
     /// Exchanges a WebRTC offer for the server's answer SDP.
     pub async fn voice_offer(&self, sdp: String) -> Result<String, ClientError> {
-        let value = self.request(Request::VoiceOffer { sdp }).await?;
+        let state = self.request(Request::VoiceState {}).await?;
+        let voice: vc_proto::VoiceState =
+            serde_json::from_value(state["voice"].clone()).map_err(|_| ClientError::Protocol("not in voice".into()))?;
+        if voice.encrypted {
+            return Err(ClientError::Protocol("Encrypted voice is being added. Chat is available.".into()));
+        }
+        let ssrc = sdp
+            .lines()
+            .find_map(|l| l.strip_prefix("a=ssrc:").and_then(|s| s.split_whitespace().next()?.parse().ok()))
+            .ok_or_else(|| ClientError::Protocol("offer without microphone SSRC".into()))?;
+        let run = self.voice_run.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let value = self
+            .request(Request::VoiceOffer(vc_proto::VoiceOffer {
+                channel: voice.channel,
+                call: voice.call.clone(),
+                participation: voice.participation.clone(),
+                run,
+                group: None,
+                ssrc,
+                sdp,
+            }))
+            .await?;
+        if value["call"] != voice.call || value["participation"] != voice.participation || value["run"] != run {
+            return Err(ClientError::Protocol("stale voice answer".into()));
+        }
         value["sdp"].as_str().map(str::to_owned).ok_or_else(|| ClientError::Protocol("answer without sdp".into()))
     }
 }

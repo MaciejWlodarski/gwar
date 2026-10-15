@@ -22,6 +22,7 @@ fn server_pk() -> String {
 
 fn client(id: u32, uid: &str) -> Client {
     Client {
+        voice_binding: None,
         id,
         uid: uid.into(),
         nickname: format!("c{id}"),
@@ -257,9 +258,10 @@ async fn oversized_frames_end_the_connection() {
 async fn a_welcome_with_too_many_clients_is_refused() {
     // Clients as arrays, so that many fit in one frame.
     let (connected, _frames, _) = start(|me| {
-        let mut clients = vec![json!([1, me, "me", null, [], "desktop", false, false, null, false, false])];
+        let mut clients = vec![json!([1, me, "me", null, [], "desktop", false, false, null, false, false, null])];
         clients.extend(
-            (10..10 + 65_535).map(|id| json!([id, "u", "c", null, [], "desktop", false, false, null, false, false])),
+            (10..10 + 65_535)
+                .map(|id| json!([id, "u", "c", null, [], "desktop", false, false, null, false, false, null])),
         );
         json!(clients)
     })

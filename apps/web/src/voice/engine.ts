@@ -35,7 +35,10 @@ export class VoiceError extends Error {
 }
 
 /** Exchanges an SDP offer for the server's SDP answer (`voice.offer`). */
-export type OfferFn = (sdp: string) => Promise<string>;
+export type OfferFn = (sdp: string, run: number) => Promise<string>;
+let mediaRun = Date.now() * 1000;
+export const nextMediaRun = () => ++mediaRun;
+export interface VoiceStartBinding { server_key: string | null; session: number; channel: number; call: string | null; participation: string | null; group: null }
 
 export interface AudioDevice {
   id: string;
@@ -74,6 +77,8 @@ export interface VoiceEngine {
    */
   start(params: {
     offer: OfferFn;
+    mode: "plaintext" | "encrypted";
+    binding: VoiceStartBinding;
     iceServers: IceServer[];
     /** Host of the voice server; the native engine resolves it to send media there. */
     serverHost?: string;

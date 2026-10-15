@@ -730,7 +730,7 @@ async fn read_state_follows_the_user_across_devices() {
             .as_u64()
             .unwrap();
     }
-    let laptop = Client::connect_as(&server, key.clone(), "alice", None).await.unwrap();
+    let laptop = Client::connect_account(&server, &key, "alice").await.unwrap();
     let unread = |c: &Client| c.welcome.unread.iter().find(|u| u.channel == default).unwrap().count;
     assert_eq!(unread(&laptop), 3);
 
@@ -740,7 +740,7 @@ async fn read_state_follows_the_user_across_devices() {
     let read = laptop.next_event("chat.read").await;
     assert_eq!(read, json!({"channel": default, "message": last}));
     assert!(b.drain_events("chat.read").await.is_empty(), "other users are not told");
-    let tablet = Client::connect_as(&server, key, "alice", None).await.unwrap();
+    let tablet = Client::connect_account(&server, &key, "alice").await.unwrap();
     assert_eq!(unread(&tablet), 0);
 }
 

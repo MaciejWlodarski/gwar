@@ -1,4 +1,4 @@
-import type { IceServer } from "../proto/IceServer";
+import { nextMediaRun } from "./engine";
 import { AUDIO_SLOTS } from "../net/protocol";
 import { tauri, type TauriBridge, type Unlisten } from "../platform";
 import {
@@ -7,7 +7,6 @@ import {
   type CaptureOptions,
   type DeviceList,
   type InputMode,
-  type OfferFn,
   type VoiceEngine,
   type VoiceEvents,
   type VoiceState,
@@ -29,19 +28,12 @@ export function micErrorKind(kind: IssuePayload["kind"]): "no_mic" | "mic_denied
   return kind === "no_device" ? "no_mic" : kind === "permission_denied" ? "mic_denied" : "mic_failed";
 }
 
-/** Run ids make stale events from a superseded session harmless. */
-let runCounter = 0;
-
 /** dBFS (RMS) -> 0..1 over a 60 dB range, same shaping as the browser meter. */
 export function dbToLevel(db: number): number {
   return Math.min(1, Math.max(0, (db + 60) / 60));
 }
 
-interface StartParams {
-  offer: OfferFn;
-  iceServers: IceServer[];
-  serverHost?: string;
-}
+type StartParams = Parameters<VoiceEngine["start"]>[0];
 
 /**
  * Desktop voice engine. Audio, Opus and WebRTC live in Rust (`vc-client`);
@@ -143,7 +135,7 @@ export class NativeVoiceEngine implements VoiceEngine {
     const params = this.params;
     if (run !== this.runId || !params) return;
     try {
-      const answer = await params.offer(sdp);
+      const answer = await params.offer(sdp, run);
       this.send("voice_answer", { run, sdp: answer });
     } catch (e) {
       this.send("voice_answer", { run, error: e instanceof Error ? e.message : String(e) });
@@ -158,7 +150,8 @@ export class NativeVoiceEngine implements VoiceEngine {
   // ------------------------------------------------------------- lifecycle
 
   async start(params: StartParams): Promise<void> {
-    const run = (this.runId = ++runCounter);
+    if (params.mode !== "plaintext") throw new VoiceError("unsupported", "Encrypted voice is being added. Chat is available.");
+    const run = (this.runId = nextMediaRun());
     this.params = params;
     this.clearConnectTimer();
     this.setState("starting");
@@ -168,7 +161,7 @@ export class NativeVoiceEngine implements VoiceEngine {
     if (run !== this.runId) return;
     this.sentGain.fill(null);
     try {
-      await api.invoke("voice_start", { run, serverHost: params.serverHost ?? "" });
+      await api.invoke("voice_start", { run, serverHost: params.serverHost ?? "", mode: params.mode, binding: params.binding });
     } catch (e) {
       if (run !== this.runId) return;
       this.setState("failed");
@@ -186,7 +179,8 @@ export class NativeVoiceEngine implements VoiceEngine {
   }
 
   async stop(): Promise<void> {
-    this.runId = ++runCounter;
+    const stoppedRun = this.runId;
+    this.runId = nextMediaRun();
     this.params = null;
     this.clearConnectTimer();
     if (this.restartTimer) clearTimeout(this.restartTimer);
@@ -195,7 +189,7 @@ export class NativeVoiceEngine implements VoiceEngine {
     this.smoothed = 0;
     this.emit("level", 0);
     this.setState("idle");
-    this.send("voice_stop");
+    this.send("voice_stop", { run: stoppedRun });
   }
 
   /** Re-opens the audio devices (and renegotiates), e.g. after plugging in a microphone. */

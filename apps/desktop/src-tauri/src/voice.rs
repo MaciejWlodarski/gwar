@@ -254,19 +254,70 @@ async fn resolve(host: &str) -> Result<IpAddr, String> {
 
 // -------------------------------------------------------------------- commands
 
-fn stop_inner(voice: &Voice) {
-    voice.run.fetch_add(1, Ordering::SeqCst);
+// Claim/retire under the same lock as pending answers and the media handle.
+// Concurrent IPC must never let an old stop clear a newer run.
+fn claim_run(voice: &Voice, run: u64) -> Result<(), String> {
     let mut inner = voice.lock();
-    inner.handle = None; // drops the engine, which stops audio
-    inner.pending_answer = None; // wakes a signal() that is waiting
+    if run <= voice.run.load(Ordering::SeqCst) {
+        return Err("superseded".into());
+    }
+    voice.run.store(run, Ordering::SeqCst);
+    inner.handle = None;
+    inner.pending_answer = None;
+    Ok(())
+}
+fn retire_run(voice: &Voice, run: u64) {
+    let mut inner = voice.lock();
+    if voice.run.load(Ordering::SeqCst) != run {
+        return;
+    }
+    voice.run.fetch_add(1, Ordering::SeqCst);
+    inner.handle = None;
+    inner.pending_answer = None;
 }
 
 /// Starts (or restarts) voice against `server_host`. Resolves when the SDP
 /// exchange is done and audio runs; ICE completion arrives as `voice://state`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartBinding {
+    server_key: Option<String>,
+    session: u32,
+    channel: u32,
+    call: Option<String>,
+    participation: Option<String>,
+    group: Option<String>,
+}
+impl StartBinding {
+    fn valid(&self, direct: bool) -> bool {
+        let _ = (self.session, self.channel);
+        self.group.is_none()
+            && if direct {
+                self.server_key.is_none() && self.call.is_none() && self.participation.is_none()
+            } else {
+                self.server_key.as_deref().and_then(vc_proto::decode_fixed::<32>).is_some()
+                    && self.call.as_deref().and_then(vc_proto::decode_fixed::<16>).is_some()
+                    && self.participation.as_deref().and_then(vc_proto::decode_fixed::<16>).is_some()
+            }
+    }
+}
+
 #[tauri::command]
-pub async fn voice_start(app: AppHandle, voice: State<'_, Voice>, run: u64, server_host: String) -> Result<(), String> {
-    stop_inner(&voice);
-    voice.run.store(run, Ordering::SeqCst);
+pub async fn voice_start(
+    app: AppHandle,
+    voice: State<'_, Voice>,
+    run: u64,
+    server_host: String,
+    mode: String,
+    binding: StartBinding,
+) -> Result<(), String> {
+    if mode != "plaintext" {
+        return Err("Encrypted voice is being added. Chat is available.".into());
+    }
+    if run == 0 || run > vc_proto::MAX_SAFE_INTEGER as u64 || !binding.valid(app.state::<Ts>().has_voice_connection()) {
+        return Err("invalid voice binding".into());
+    }
+    claim_run(&voice, run)?;
     let (input, output) = {
         let inner = voice.lock();
         (inner.prefs.input.clone(), inner.prefs.output.clone())
@@ -341,9 +392,8 @@ pub fn voice_answer(voice: State<'_, Voice>, run: u64, sdp: Option<String>, erro
 }
 
 #[tauri::command]
-pub fn voice_stop(voice: State<'_, Voice>) {
-    tracing::info!("voice_stop");
-    stop_inner(&voice);
+pub fn voice_stop(voice: State<'_, Voice>, run: u64) {
+    retire_run(&voice, run);
 }
 
 /// Polls the engine at ~20 Hz: meter level and link state changes.
@@ -557,4 +607,25 @@ pub fn open_mic_privacy_settings() -> Result<(), String> {
         return Err("this system has no microphone privacy settings".into());
     };
     open::that(url).map_err(|e| format!("cannot open {url}: {e}"))
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::*;
+    #[test]
+    fn old_stop_and_start_preserve_the_current_pending_answer() {
+        let voice = Voice::default();
+        claim_run(&voice, 10).unwrap();
+        claim_run(&voice, 12).unwrap();
+        let (tx, mut rx) = oneshot::channel();
+        voice.lock().pending_answer = Some((12, tx));
+        retire_run(&voice, 10);
+        assert!(claim_run(&voice, 11).is_err());
+        assert_eq!(voice.run.load(Ordering::SeqCst), 12);
+        assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+        retire_run(&voice, 12);
+        assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Closed)));
+        assert!(claim_run(&voice, 12).is_err());
+        claim_run(&voice, 14).unwrap();
+    }
 }

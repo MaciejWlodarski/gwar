@@ -1192,14 +1192,16 @@ limit (about 300 devices):
 
 ## 5. Encrypted voice
 
-Status: **specified, not built**. Step 4's channel groups, restart handling,
-separate ratchet trees and TeamSpeak exclusion are prerequisites. `Kind::Voice`
-and the descriptor's `channel_group_id` exist; voice admission, exporter keys,
-SFrame and epoch acknowledgements do not. RTP ingest already carries SSRC,
-extended sequence and timestamp, but still inspects Opus and forgets retired
-SSRCs. Native capture positions and variable-duration playout already exist;
-native WebRTC keeps its 10 ms packets in plaintext and encrypted calls;
-browsers keep 20 ms. This step does not change packetization.
+Status: **5a built; 5b–5d specified, not built**. Voice MLS rules, volatile
+calls, session takeover, bound negotiation and epoch acknowledgements are
+implemented. Encrypted audio remains unavailable with the calm notice below;
+plaintext voice and TeamSpeak keep their existing media formats. See
+[the 5a implementation report](voice-calls-5a.md) for coverage and validation.
+
+RTP ingest still inspects Opus and forgets retired SSRCs. Native capture
+positions and variable-duration playout already exist. Native WebRTC keeps
+10 ms packets; browsers keep 20 ms. The remaining steps add SFrame and opaque
+forwarding without changing packetization.
 
 Four pull requests, in order:
 

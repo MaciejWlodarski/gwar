@@ -2038,3 +2038,310 @@ async fn server_chat_history_routing_resumes_after_restart_and_a_rejoin_cancels_
             .is_empty()
     );
 }
+
+fn voice_descriptor(device: &Device, channel: u32, parent: &str, server: &str, nonce: u8) -> SignedDescriptor {
+    let mut d = channel_descriptor(device, channel, false, server, nonce).descriptor;
+    d.kind = Kind::Voice;
+    d.conversation = format!("voice:{channel}");
+    d.channel_group_id = Some(parent.into());
+    SignedDescriptor::sign(d, device.credential.clone(), &device.signer.0)
+}
+async fn participation(client: &mut Client, channel: u32) -> Value {
+    client.ok("channel.join", json!({"channel":channel})).await;
+    client.ok("voice.state", json!({})).await["voice"].clone()
+}
+fn voice_binding(state: &Value) -> Value {
+    json!({"call":state["call"],"participation":state["participation"]})
+}
+async fn join_voice(
+    server: &TestServer,
+    client: &mut Client,
+    device: &mut Device,
+    group: &str,
+    state: &Value,
+) -> (Vec<u8>, Vec<u8>) {
+    let info = client.ok("mls.group_info", json!({"group":group})).await;
+    let tree = reqwest::Client::new()
+        .get(format!("{}/api/mls/{group}/tree", server.http()))
+        .bearer_auth(&client.welcome.file_access)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tree.status(), 200);
+    let joined = device
+        .join_external(&B64.decode(info["group_info"].as_str().unwrap()).unwrap(), Some(&tree.bytes().await.unwrap()));
+    let mut request = update_request(group, info["epoch"].as_u64().unwrap(), &joined);
+    request["voice"] = voice_binding(state);
+    client.ok("mls.commit", request).await;
+    joined
+}
+
+#[tokio::test]
+async fn voice_four_devices_creation_join_takeover_removal_and_new_call() {
+    let server = TestServer::start_with(|c| c.max_clients = 4).await;
+    let mut parent = Device::new(1, 11);
+    let mut devices = [Device::new(1, 11), Device::new(1, 12), Device::new(2, 21), Device::new(2, 22)];
+    let mut clients = Vec::new();
+    for device in &devices {
+        clients.push(connect_device(&server, device).await);
+    }
+    clients[0].ok("token.redeem", json!({"token":server.admin_token})).await;
+    let channel = channel_id(&clients[0].create_channel(json!({"name":"voice","encrypted":true})).await);
+    assert_eq!(clients[0].fails("channel.join", json!({"channel":channel})).await, "forbidden");
+    assert!(clients[0].ok("voice.state", json!({})).await["voice"].is_null());
+    let parent_id = create_channel_group(&mut clients[0], &mut parent, channel, true, 60).await.unwrap();
+    for (i, client) in clients.iter_mut().enumerate().skip(1) {
+        let mut parent_device = Device::new(if i == 1 { 1 } else { 2 }, [11, 12, 21, 22][i]);
+        join_channel(&server, client, &mut parent_device, &parent_id).await;
+    }
+    let mut states = Vec::new();
+    for client in &mut clients {
+        states.push(participation(client, channel).await);
+    }
+    assert!(states.iter().all(|s| s["call"] == states[0]["call"]));
+    assert_eq!(participation(&mut clients[0], channel).await, states[0], "duplicate entry is stable");
+    let d = voice_descriptor(&devices[0], channel, &parent_id, &clients[0].server_key, 61);
+    devices[0].create(&d, &clients[0].server_key);
+    let create = json!({"conversation":d.descriptor.conversation,"group_info":b64(&devices[0].group_info()),"voice":voice_binding(&states[0])});
+    assert_eq!(clients[1].fails("mls.group.create", create.clone()).await, "stale");
+    let group = clients[0].ok("mls.group.create", create.clone()).await["group"].as_str().unwrap().to_owned();
+    assert_eq!(
+        clients[0].ok("mls.group.create", create).await["group"],
+        group,
+        "lost creation reply retries identically"
+    );
+    let alternate = voice_descriptor(&devices[1], channel, &parent_id, &clients[1].server_key, 62);
+    devices[1].create(&alternate, &clients[1].server_key);
+    assert_eq!(clients[1].fails("mls.group.create",json!({"conversation":alternate.descriptor.conversation,"group_info":b64(&devices[1].group_info()),"voice":voice_binding(&states[1])})).await,"conflict");
+    for i in 1..4 {
+        devices[i] = Device::new(if i == 1 { 1 } else { 2 }, [11, 12, 21, 22][i]);
+        let joined = join_voice(&server, &mut clients[i], &mut devices[i], &group, &states[i]).await;
+        devices[0].process(&joined.0);
+    }
+    let listed = clients[0].ok("mls.groups", json!({})).await;
+    assert!(listed["groups"].as_array().unwrap().iter().all(|g| g["group"] != group));
+    assert_eq!(clients[0].fails("mls.history.request", json!({"group":group})).await, "bad_request");
+    assert_eq!(
+        clients[0].fails("mls.group_history", json!({"conversation":format!("voice:{channel}")})).await,
+        "bad_request"
+    );
+    // Full-server replacement succeeds only after authentication and detaches the old leaf.
+    let mut replacement = connect_device(&server, &devices[1]).await;
+    let replaced = clients[1].next_event("disconnected").await;
+    assert_eq!(replaced["reason"]["kind"], "replaced");
+    let state = participation(&mut replacement, channel).await;
+    assert_eq!(state["call"], states[1]["call"]);
+    assert_ne!(state["participation"], states[1]["participation"]);
+    let pending = clients[0].ok("mls.log", json!({"group":group,"since":3})).await;
+    assert_eq!(pending["pending"].as_array().unwrap().len(), 1);
+    let mut fresh = Device::new(1, 12);
+    let joined = join_voice(&server, &mut replacement, &mut fresh, &group, &state).await;
+    devices[0].process(&joined.0);
+    // A member update from the wrong participation cannot submit a valid signature.
+    let update = devices[0].update();
+    let mut request = update_request(&group, 4, &update);
+    request["voice"] = voice_binding(&states[2]);
+    assert_eq!(clients[2].fails("mls.commit", request.clone()).await, "forbidden");
+    request["voice"] = voice_binding(&states[0]);
+    clients[0].ok("mls.commit", request).await;
+    // Leaving creates a proposal; a log replay carries the accepted commit bytes.
+    clients[2].ok("channel.leave", json!({})).await;
+    let log = clients[0].ok("mls.log", json!({"group":group,"since":4})).await;
+    assert_eq!(log["entries"][0]["commit"], b64(&update.0));
+    assert_eq!(log["pending"].as_array().unwrap().len(), 1);
+    let outsider = reqwest::Client::new()
+        .get(format!("{}/api/mls/{group}/tree", server.http()))
+        .bearer_auth(&clients[2].welcome.file_access)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(outsider.status(), 404);
+    // A competing update leaves the detached device in the tree: removal is reissued at the new epoch.
+    let previous_proposal = log["pending"][0].clone();
+    let competing = devices[0].update();
+    let mut request = update_request(&group, 5, &competing);
+    request["voice"] = voice_binding(&states[0]);
+    clients[0].ok("mls.commit", request).await;
+    let pending = clients[0].ok("mls.log", json!({"group":group,"since":6})).await;
+    assert_ne!(pending["pending"][0], previous_proposal);
+    devices[0].process(&B64.decode(pending["pending"][0].as_str().unwrap()).unwrap());
+    let removed = devices[0].commit_pending();
+    let mut request = update_request(&group, 6, &removed);
+    request["voice"] = voice_binding(&states[0]);
+    clients[0].ok("mls.commit", request).await;
+    assert!(clients[0].ok("mls.log", json!({"group":group,"since":7})).await["pending"].as_array().unwrap().is_empty());
+    // A device that discarded/pruned its old state replaces its own leaf in this same group.
+    let mut pruned = Device::new(2, 22);
+    let rejoined = join_voice(&server, &mut clients[3], &mut pruned, &group, &states[3]).await;
+    devices[0].process(&rejoined.0);
+    assert_eq!(clients[3].ok("voice.state", json!({})).await["voice"]["group"], group);
+    // Catch up the parent, then remove this device there. Its voice mapping is cut off immediately.
+    let parent_log = clients[0].ok("mls.log", json!({"group":parent_id,"since":0})).await;
+    for entry in parent_log["entries"].as_array().unwrap() {
+        parent.process(&B64.decode(entry["commit"].as_str().unwrap()).unwrap());
+    }
+    let leaf = parent
+        .group
+        .as_ref()
+        .unwrap()
+        .members()
+        .find(|m| m.signature_key == key(22).verifying_key().as_bytes())
+        .unwrap()
+        .index;
+    let pg = parent.group.as_mut().unwrap();
+    pg.set_aad(commit_aad(now()));
+    let (commit, _, _) = pg.remove_members(&parent.provider, &parent.signer, &[leaf]).unwrap();
+    pg.merge_pending_commit(&parent.provider).unwrap();
+    let removed = (wire(commit), parent.group_info());
+    clients[0].ok("mls.commit", update_request(&parent_id, 3, &removed)).await;
+    assert!(clients[3].ok("voice.state", json!({})).await["voice"].is_null());
+    assert_eq!(clients[3].fails("channel.join", json!({"channel":channel})).await, "forbidden");
+    assert_eq!(
+        clients[0].ok("mls.log", json!({"group":group,"since":8})).await["pending"].as_array().unwrap().len(),
+        1
+    );
+    for i in [0, 3] {
+        clients[i].ok("channel.leave", json!({})).await;
+    }
+    replacement.ok("channel.leave", json!({})).await;
+    let next = participation(&mut clients[0], channel).await;
+    assert_ne!(next["call"], states[0]["call"]);
+    assert!(next["group"].is_null());
+    assert_eq!(clients[0].fails("mls.group_info", json!({"group":group})).await, "not_found");
+    // Channel deletion closes the exact participation and requires a new entry.
+    clients[0].ok("channel.delete", json!({"channel":channel})).await;
+    let closed = clients[0].next_event("voice.closed").await;
+    assert_eq!(closed["reason"], "channel_deleted");
+    assert_eq!(closed["participation"], next["participation"]);
+    assert!(clients[0].ok("voice.state", json!({})).await["voice"].is_null());
+}
+
+#[tokio::test]
+async fn voice_parent_restart_and_process_restart_require_fresh_participation() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("vc.sqlite3");
+    let server = TestServer::start_with(|c| {
+        c.database = Some(database.clone());
+        c.data_dir = Some(dir.path().into());
+    })
+    .await;
+    let mut parent = Device::new(1, 11);
+    let mut a = connect_device(&server, &parent).await;
+    a.ok("token.redeem", json!({"token":server.admin_token})).await;
+    let channel = channel_id(&a.create_channel(json!({"name":"voice-restart","encrypted":true})).await);
+    let parent_id = create_channel_group(&mut a, &mut parent, channel, true, 70).await.unwrap();
+    let state = participation(&mut a, channel).await;
+    let mut voice = Device::new(1, 11);
+    let d = voice_descriptor(&voice, channel, &parent_id, &a.server_key, 71);
+    voice.create(&d, &a.server_key);
+    let group=a.ok("mls.group.create",json!({"conversation":d.descriptor.conversation,"group_info":b64(&voice.group_info()),"voice":voice_binding(&state)})).await["group"].clone();
+    // A valid successor to the parent ends the call, rather than modifying its descriptor.
+    let mut successor = channel_descriptor(&parent, channel, true, &a.server_key, 72).descriptor;
+    successor.incarnation = 1;
+    successor.previous_group_id = Some(parent_id);
+    let successor = SignedDescriptor::sign(successor, parent.credential.clone(), &parent.signer.0);
+    let mut restarted = Device::new(1, 11);
+    restarted.create(&successor, &a.server_key);
+    a.ok(
+        "mls.group.create",
+        json!({"conversation":successor.descriptor.conversation,"group_info":b64(&restarted.group_info())}),
+    )
+    .await;
+    let closed = a.next_event("voice.closed").await;
+    assert_eq!(closed["reason"], "channel_restarted");
+    assert_eq!(closed["call"], state["call"]);
+    assert!(a.ok("voice.state", json!({})).await["voice"].is_null());
+    let fresh = participation(&mut a, channel).await;
+    assert_ne!(fresh["call"], state["call"]);
+    assert_eq!(fresh["channel_group"], b64(&successor.group_id()));
+    // Abrupt core shutdown while still in voice never restores its call state.
+    drop(a);
+    drop(server);
+    let mut config = base_config();
+    config.database = Some(database);
+    config.data_dir = Some(dir.path().into());
+    let server = TestServer { running: vc_server::start(config).await.unwrap(), admin_token: String::new() };
+    let mut a = connect_device(&server, &restarted).await;
+    assert!(a.ok("voice.state", json!({})).await["voice"].is_null());
+    let after = participation(&mut a, channel).await;
+    assert_ne!(after["call"], fresh["call"]);
+    assert!(after["group"].is_null());
+    assert_eq!(a.fails("mls.group_info", json!({"group":group})).await, "not_found");
+}
+
+#[tokio::test]
+async fn rejected_same_device_authentication_does_not_evict_the_current_participation() {
+    let server = TestServer::start_with(|c| c.max_clients = 1).await;
+    let device = Device::new(1, 11);
+    let mut a = connect_device(&server, &device).await;
+    let state = participation(&mut a, 1).await;
+    let expired = certificate(&key(1), &key(11), now() - 86_400_000, now() - 1);
+    let attempt = Client::connect_with(&server, key(11), |raw, key| {
+        let mut hello = raw.hello(key, "expired", None);
+        set_certificate(&mut hello, expired, key);
+        hello
+    })
+    .await;
+    assert!(attempt.is_err());
+    assert_eq!(a.ok("voice.state", json!({})).await["voice"], state);
+}
+
+#[tokio::test]
+async fn voice_parent_leaf_expiry_ends_an_idle_participation_without_expiring_the_connection() {
+    let server = TestServer::start().await;
+    let mut parent = Device::new(1, 11);
+    let mut a = connect_device(&server, &parent).await;
+    a.ok("token.redeem", json!({"token":server.admin_token})).await;
+    let channel = channel_id(&a.create_channel(json!({"name":"voice-expiry","encrypted":true})).await);
+    parent.credential = Credential::Account(
+        serde_json::from_value(certificate(&key(1), &key(11), now() - 1000, now() + 2000)).unwrap(),
+    );
+    create_channel_group(&mut a, &mut parent, channel, true, 81).await.unwrap();
+    participation(&mut a, channel).await;
+    // No new request wakes the core: its certificate deadline must emit the exit itself.
+    loop {
+        if a.next_event("voice.state").await["voice"].is_null() {
+            break;
+        }
+    }
+    assert!(a.ok("voice.state", json!({})).await["voice"].is_null());
+    assert_eq!(a.fails("channel.join", json!({"channel":channel})).await, "forbidden");
+    // This connection's newer certificate is still valid, so plaintext voice remains usable.
+    assert!(!participation(&mut a, 1).await["encrypted"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn voice_leaf_expiry_detaches_only_that_mapping_and_proposes_removal() {
+    let server = TestServer::start().await;
+    let mut parent = Device::new(1, 11);
+    let mut other_parent = Device::new(2, 21);
+    let mut a = connect_device(&server, &parent).await;
+    let mut b = connect_device(&server, &other_parent).await;
+    a.ok("token.redeem", json!({"token":server.admin_token})).await;
+    let channel = channel_id(&a.create_channel(json!({"name":"voice-leaf-expiry","encrypted":true})).await);
+    let parent_id = create_channel_group(&mut a, &mut parent, channel, true, 82).await.unwrap();
+    join_channel(&server, &mut b, &mut other_parent, &parent_id).await;
+    let a_state = participation(&mut a, channel).await;
+    let b_state = participation(&mut b, channel).await;
+    let mut voice = Device::new(1, 11);
+    voice.credential = Credential::Account(
+        serde_json::from_value(certificate(&key(1), &key(11), now() - 1000, now() + 2000)).unwrap(),
+    );
+    let d = voice_descriptor(&voice, channel, &parent_id, &a.server_key, 83);
+    voice.create(&d, &a.server_key);
+    let group = a.ok("mls.group.create", json!({"conversation":d.descriptor.conversation,"group_info":b64(&voice.group_info()),"voice":voice_binding(&a_state)})).await["group"].as_str().unwrap().to_owned();
+    let mut listener = Device::new(2, 21);
+    join_voice(&server, &mut b, &mut listener, &group, &b_state).await;
+    loop {
+        if a.next_event("voice.state").await["voice"].is_null() {
+            break;
+        }
+    }
+    let state = b.ok("voice.state", json!({})).await["voice"].clone();
+    assert_eq!(state["call"], b_state["call"]);
+    assert_eq!(state["group"], group);
+    assert_eq!(b.ok("mls.log", json!({"group":group,"since":1})).await["pending"].as_array().unwrap().len(), 1);
+    // The parent and connection certificates remain current: fresh participation is allowed.
+    let fresh = participation(&mut a, channel).await;
+    assert_ne!(fresh["participation"], a_state["participation"]);
+}

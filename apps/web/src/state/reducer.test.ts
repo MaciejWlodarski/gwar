@@ -24,6 +24,7 @@ const cl = (id: number, channel: number | null = 1, extra: Partial<Client> = {})
   uid: `u${id}`,
   nickname: `n${id}`,
   channel,
+  voice_binding: channel === null ? null : { call: "AAAAAAAAAAAAAAAAAAAAAA", participation: "AQEBAQEBAQEBAQEBAQEBAQ", run: 1 },
   groups: [2],
   platform: "web",
   muted: false,
@@ -177,13 +178,13 @@ describe("clients and channels", () => {
 
   it("updates talking flag and slots; clears a slot when its user leaves", () => {
     let s = online();
-    s = ev(s, { ev: "voice.talking", d: { client: 2, talking: true } });
+    s = ev(s, { ev: "voice.talking", d: { call: "AAAAAAAAAAAAAAAAAAAAAA", participation: "AQEBAQEBAQEBAQEBAQEBAQ", run: 1, client: 2, talking: true } });
     expect(s.clients[2]?.talking).toBe(true);
-    s = ev(s, { ev: "voice.slot", d: { slot: 3, client: 2 } });
+    s = ev(s, { ev: "voice.slot", d: { call: "AAAAAAAAAAAAAAAAAAAAAA", participation: "AQEBAQEBAQEBAQEBAQEBAQ", run: 1, slot: 3, client: 2 } });
     expect(s.slots[3]).toBe(2);
     s = ev(s, { ev: "client.left", d: { client: 2, reason: { kind: "quit" } } });
     expect(s.slots[3]).toBeNull();
-    s = ev(s, { ev: "voice.slot", d: { slot: 99, client: 2 } });
+    s = ev(s, { ev: "voice.slot", d: { call: "AAAAAAAAAAAAAAAAAAAAAA", participation: "AQEBAQEBAQEBAQEBAQEBAQ", run: 1, slot: 99, client: 2 } });
     expect(s.slots).toHaveLength(8);
   });
 });

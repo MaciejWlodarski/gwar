@@ -735,7 +735,10 @@ async fn cross_account_revocations_do_not_poison_login_or_live_sessions() {
     server.running.core.revoked(vec![signed_revocation(&attacker, &device, 1)], 1).await;
     other.expect_disconnect().await;
     live.ok("ping", json!({})).await;
-    as_device(&server, &device, certificate(&victim, &device, now(), now() + 86400000)).await.unwrap().close().await;
+    let replacement =
+        as_device(&server, &device, certificate(&victim, &device, now(), now() + 86400000)).await.unwrap();
+    assert_eq!(live.expect_disconnect().await["kind"], "replaced");
+    live = replacement;
     let store = vc_server::store::Store::open(&database).unwrap();
     assert!(store.device_revoked(&public_key(&attacker), &public_key(&device)).unwrap());
     assert!(!store.device_revoked(&public_key(&victim), &public_key(&device)).unwrap());

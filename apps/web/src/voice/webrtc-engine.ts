@@ -1,4 +1,4 @@
-import type { IceServer } from "../proto/IceServer";
+import { nextMediaRun } from "./engine";
 import { AUDIO_SLOTS } from "../net/protocol";
 import {
   rmsToLevel,
@@ -7,7 +7,6 @@ import {
   type CaptureOptions,
   type DeviceList,
   type InputMode,
-  type OfferFn,
   type VoiceEngine,
   type VoiceEvents,
   type VoiceState,
@@ -108,7 +107,9 @@ export class WebRtcVoiceEngine implements VoiceEngine {
 
   // ------------------------------------------------------------- lifecycle
 
-  async start({ offer, iceServers }: { offer: OfferFn; iceServers: IceServer[] }): Promise<void> {
+  async start({ offer, iceServers, mode }: Parameters<VoiceEngine["start"]>[0]): Promise<void> {
+    if (mode !== "plaintext") throw new VoiceError("unsupported", "Encrypted voice is being added. Chat is available.");
+    const mediaRun = nextMediaRun();
     const run = ++this.runId;
     this.teardownPeer();
     this.setState("starting");
@@ -154,7 +155,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       };
 
       await pc.setLocalDescription(await pc.createOffer());
-      const answer = await offer(pc.localDescription?.sdp ?? "");
+      const answer = await offer(pc.localDescription?.sdp ?? "", mediaRun);
       if (run !== this.runId) return;
       await pc.setRemoteDescription({ type: "answer", sdp: answer });
       this.applyTrackEnabled();

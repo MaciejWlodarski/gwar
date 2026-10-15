@@ -20,7 +20,7 @@ pub enum Kind {
 
 impl Kind {
     pub(crate) fn separate_tree(self) -> bool {
-        matches!(self, Self::Channel | Self::Server)
+        matches!(self, Self::Channel | Self::Server | Self::Voice)
     }
 
     fn as_str(self) -> &'static str {
@@ -166,6 +166,7 @@ impl Descriptor {
             && d.founding_owner.as_deref().is_none_or(|uid| fixed::<20>(uid).is_some())
             && (!d.private || d.kind == Kind::Channel)
             && (d.kind != Kind::Dm || d.history)
+            && (d.kind != Kind::Voice || (!d.history && d.incarnation == 0))
             && fixed::<20>(&d.creator_uid).is_some()
             && dm_participants(&d.conversation).is_none_or(|uids| uids.contains(&d.creator_uid.as_str()))
             && fixed::<16>(&d.creation_nonce).is_some();
@@ -294,6 +295,7 @@ mod tests {
         voice.conversation = "voice:4".into();
         assert!(Descriptor::parse(&voice.statement()).is_none(), "a voice call names its channel group");
         voice.channel_group_id = Some(b64(&[2; 32]));
+        voice.history = false;
         assert!(Descriptor::parse(&voice.statement()).is_some());
     }
 

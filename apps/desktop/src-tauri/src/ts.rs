@@ -59,6 +59,10 @@ impl Ts {
 
     /// Hands voice a fresh audio channel and the microphone sender. A voice
     /// restart (device change) just calls this again; the pump keeps running.
+    pub fn has_voice_connection(&self) -> bool {
+        self.lock().is_some()
+    }
+
     pub fn voice_link(&self) -> Option<VoiceLink> {
         let active = self.lock();
         let active = active.as_ref()?;

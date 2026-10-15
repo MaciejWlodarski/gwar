@@ -55,15 +55,15 @@ describe("bounded server frames", () => {
   it("rejects prototype-pollution keys at every payload level", () => {
     for (const key of ["__proto__", "constructor", "prototype"]) {
       expect(parseFrame(`{"re":1,"ok":{"${key}":{}}}`)).toBeNull();
-      expect(parseFrame(`{"ev":"voice.talking","d":{"client":1,"talking":true,"${key}":{}}}`)).toBeNull();
+      expect(parseFrame(`{"ev":"voice.talking","d":{"call":"AAAAAAAAAAAAAAAAAAAAAA","participation":"AQEBAQEBAQEBAQEBAQEBAQ","run":1,"client":1,"talking":true,"${key}":{}}}`)).toBeNull();
       expect(parseFrame(frame({ ...message, target: JSON.parse(`{"channel":1,"${key}":{}}`) }))).toBeNull();
     }
     for (const uid of ["__proto__", "constructor", "toString", "prototype"]) expect(parseFrame(frame({ ...message, author_uid: uid }))).toBeNull();
     expect(({} as { polluted?: boolean }).polluted).toBeUndefined();
   });
   it("bounds all envelopes and voice slots", () => {
-    expect(parseFrame('{"ev":"voice.slot","d":{"slot":8,"client":1}}')).toBeNull();
-    expect(parseFrame('{"ev":"voice.slot","d":{"slot":7,"client":null}}')?.kind).toBe("event");
+    expect(parseFrame('{"ev":"voice.slot","d":{"call":"AAAAAAAAAAAAAAAAAAAAAA","participation":"AQEBAQEBAQEBAQEBAQEBAQ","run":1,"slot":8,"client":1}}')).toBeNull();
+    expect(parseFrame('{"ev":"voice.slot","d":{"call":"AAAAAAAAAAAAAAAAAAAAAA","participation":"AQEBAQEBAQEBAQEBAQEBAQ","run":1,"slot":7,"client":null}}')?.kind).toBe("event");
     expect(parseFrame('{"ev":"disconnected","d":{"reason":{"kind":"kicked","by":"x","reason":null}}}')?.kind).toBe("event");
     expect(responseFor("ban.list", { bans: Array(4097).fill({}) })).toBe(false);
     expect(responseFor("file.upload", { file: "a", upload_url: "/files/a/b" })).toBe(false);
@@ -112,5 +112,33 @@ describe("vc/4 runtime schemas", () => {
       expect(responseFor("hello", value)).toBe(false);
       expect(parseFrame(JSON.stringify({ re: 1, ok: value }))).toBeNull();
     }
+  });
+});
+
+
+describe("voice wire bindings", () => {
+  const call = "AAAAAAAAAAAAAAAAAAAAAA";
+  const group = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+  it("requires the complete offer answer and exact, safe binding integers", () => {
+    const answer = { call, participation: call, run: 1, sdp: "answer" };
+    expect(responseFor("voice.offer", answer)).toBe(true);
+    for (const run of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(responseFor("voice.offer", { ...answer, run })).toBe(false);
+    }
+    expect(responseFor("voice.offer", { ...answer, sdp: "x".repeat(65537) })).toBe(false);
+    expect(responseFor("voice.offer", { sdp: "answer" })).toBe(false);
+    expect(responseFor("voice.offer", { ...answer, call: `${call}=` })).toBe(false);
+  });
+  it("validates voice state modes and nullable group/epoch as a pair", () => {
+    const voice = { channel: 1, call, participation: call, encrypted: true, channel_group: group, group: null, epoch: null };
+    expect(responseFor("voice.state", { voice })).toBe(true);
+    expect(responseFor("voice.state", { voice: null })).toBe(true);
+    for (const invalid of [{ ...voice, encrypted: false }, { ...voice, channel_group: null }, { ...voice, group }, { ...voice, group, epoch: Number.MAX_SAFE_INTEGER + 1 }]) {
+      expect(responseFor("voice.state", { voice: invalid })).toBe(false);
+    }
+    const event = { ev: "voice.epoch.ack", d: { call, group, epoch: 1, device: group } };
+    expect(parseFrame(JSON.stringify(event))?.kind).toBe("event");
+    expect(parseFrame(JSON.stringify({ ...event, d: { ...event.d, epoch: 1.5 } }))).toBeNull();
+    expect(parseFrame(JSON.stringify({ ...event, d: { ...event.d, session: 1 } }))).toBeNull();
   });
 });

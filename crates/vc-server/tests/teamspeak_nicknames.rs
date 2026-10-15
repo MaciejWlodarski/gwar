@@ -91,7 +91,7 @@ async fn puppet_nicknames_follow_members_and_resolve_collisions() {
     names(&query, &[base.clone(), format!("{} (2)", "n".repeat(26)), format!("{} (3)", "n".repeat(26))]).await;
 
     // A second device of the first member gets the same stored name and its own puppet.
-    let mut other_device = Client::connect_as(&server, key, "Ignored", None).await.unwrap();
+    let mut other_device = Client::connect_account(&server, &key, "Ignored").await.unwrap();
     other_device.ok("channel.join", json!({"channel": other_device.default_channel()})).await;
     names(&query, &[format!("{} (4)", "n".repeat(26))]).await;
     first.ok("member.nickname", json!({"uid": first.welcome.uid, "nickname": "Renamed"})).await;

@@ -61,7 +61,7 @@ class FakeLink implements Link {
   async request(op: Op, d: unknown): Promise<never> {
     this.requests.push({ op, d });
     if (this.failing.has(op)) throw new Error("boom");
-    return {} as never;
+    return (op === "voice.offer" ? {...d as object,sdp:"answer"} : {}) as never;
   }
   retryNow() {}
   close() {}
@@ -108,6 +108,7 @@ const client = (id: number, channel: number | null, extra: Partial<Client> = {})
   uid: `u${id}`,
   nickname: `n${id}`,
   channel,
+  voice_binding: channel === null ? null : { call: "AAAAAAAAAAAAAAAAAAAAAA", participation: "AQEBAQEBAQEBAQEBAQEBAQ", run: 1 },
   groups: [],
   platform: "web",
   muted: false,
@@ -203,9 +204,31 @@ describe("staying on the server without voice", () => {
     link.emit({ ev: "client.updated", d: client(1, 2) });
     await vi.advanceTimersByTimeAsync(10);
     expect(engine.start).toHaveBeenCalledTimes(1);
-    const params = (engine.start.mock.calls[0] as unknown as [{ offer(sdp: string): Promise<string> }])[0];
-    await params.offer("v=0");
-    expect(link.sent("voice.offer")[0]?.d).toEqual({ sdp: "v=0" });
+    const params = (engine.start.mock.calls[0] as unknown as [{ offer(sdp: string,run:number): Promise<string> }])[0];
+    await params.offer("v=0\r\na=ssrc:123 cname:mic\r\n", 1);
+    expect(link.sent("voice.offer")[0]?.d).toMatchObject({channel:2,ssrc:123,run:1,group:null,call:"AAAAAAAAAAAAAAAAAAAAAA",participation:"AQEBAQEBAQEBAQEBAQEBAQ"});
+  });
+
+  it("refuses encrypted voice before joining or opening the microphone", async () => {
+    connectFake({ encrypted: [2] });
+    await controller.joinChannel(2);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(link.sent("channel.join")).toHaveLength(0);
+    expect(engine.start).not.toHaveBeenCalled();
+  });
+
+  it("leaves an unconfirmed call replacement and ignores an old-run closure", async () => {
+    connectFake({ channel: 1 });
+    await vi.advanceTimersByTimeAsync(10);
+    engine.stop.mockClear();
+    link.emit({ ev: "voice.closed", d: { call: "AAAAAAAAAAAAAAAAAAAAAA", participation: "AQEBAQEBAQEBAQEBAQEBAQ", run: 2, reason: "transport_failed" } });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(engine.stop).not.toHaveBeenCalled();
+    link.emit({ ev: "client.updated", d: client(1, 1, { voice_binding: { call: "AgICAgICAgICAgICAgICAg", participation: "AQEBAQEBAQEBAQEBAQEBAQ", run: 1 } }) });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(engine.stop).toHaveBeenCalled();
+    expect(link.sent("channel.leave")).toHaveLength(1);
+    expect(engine.start).toHaveBeenCalledTimes(1);
   });
 
   it("leaving voice sends channel.leave, stops the engine and stays online", async () => {
@@ -235,7 +258,7 @@ describe("staying on the server without voice", () => {
 
   it("does not retry voice while I am not in a channel", async () => {
     connectFake();
-    link.emit({ ev: "voice.closed", d: { reason: "x" } });
+    link.emit({ ev: "voice.closed", d: { call: "AAAAAAAAAAAAAAAAAAAAAA", participation: "AQEBAQEBAQEBAQEBAQEBAQ", run: 1, reason: "transport_failed" } });
     await vi.advanceTimersByTimeAsync(30_000);
     expect(engine.start).not.toHaveBeenCalled();
   });

@@ -22,13 +22,13 @@ wire! {
         #[serde(rename = "mls.devices")]
         Devices { uids: Vec<Uid>, #[serde(flatten)] page: MlsPage },
         #[serde(rename = "mls.group.create")]
-        GroupCreate { conversation: String, group_info: String },
+        GroupCreate { conversation: String, group_info: String, #[serde(default, skip_serializing_if = "Option::is_none")] voice: Option<VoiceParticipation> },
         #[serde(rename = "mls.group_info")]
         GroupInfo { group: String },
         #[serde(rename = "mls.commit")]
-        Commit { group: String, #[cfg_attr(feature = "ts", ts(type = "number"))] epoch: u64, commit: String, group_info: String, #[serde(default)] welcome: Option<String> },
+        Commit { group: String, #[serde(deserialize_with = "voice::safe_u64")] #[cfg_attr(feature = "ts", ts(type = "number"))] epoch: u64, commit: String, group_info: String, #[serde(default)] welcome: Option<String>, #[serde(default, skip_serializing_if = "Option::is_none")] voice: Option<VoiceParticipation> },
         #[serde(rename = "mls.log")]
-        Log { group: String, #[cfg_attr(feature = "ts", ts(type = "number"))] since: u64, #[serde(default)] limit: Option<u32> },
+        Log { group: String, #[serde(deserialize_with = "voice::safe_u64")] #[cfg_attr(feature = "ts", ts(type = "number"))] since: u64, #[serde(default)] limit: Option<u32> },
         #[serde(rename = "mls.groups")]
         Groups { #[serde(flatten)] page: MlsPage },
         #[serde(rename = "mls.welcomes")]
@@ -55,11 +55,11 @@ wire! {
     pub enum MlsResponse {
         Published { count: u32 },
         Created { group: String },
-        GroupInfo { group_info: String, #[cfg_attr(feature = "ts", ts(type = "number"))] epoch: u64 },
-        Committed { #[cfg_attr(feature = "ts", ts(type = "number"))] epoch: u64 },
+        GroupInfo { group_info: String, #[serde(deserialize_with = "voice::safe_u64")] #[cfg_attr(feature = "ts", ts(type = "number"))] epoch: u64 },
+        Committed { #[serde(deserialize_with = "voice::safe_u64")] #[cfg_attr(feature = "ts", ts(type = "number"))] epoch: u64 },
         Packages { packages: Vec<MlsPackage>, next: Option<String> },
         Devices { devices: Vec<MlsDevice>, next: Option<String> },
-        Log { #[cfg_attr(feature = "ts", ts(type = "number"))] head: u64, #[cfg_attr(feature = "ts", ts(type = "number"))] oldest: u64, entries: Vec<MlsLogEntry>, pending: Vec<String>, #[cfg_attr(feature = "ts", ts(type = "number | null"))] next: Option<u64> },
+        Log { #[serde(deserialize_with = "voice::safe_u64")] #[cfg_attr(feature = "ts", ts(type = "number"))] head: u64, #[serde(deserialize_with = "voice::safe_u64")] #[cfg_attr(feature = "ts", ts(type = "number"))] oldest: u64, entries: Vec<MlsLogEntry>, pending: Vec<String>, #[serde(deserialize_with = "voice::optional_safe_u64")] #[cfg_attr(feature = "ts", ts(type = "number | null"))] next: Option<u64> },
         Groups { groups: Vec<MlsGroup>, next: Option<String> },
         Welcomes { welcomes: Vec<MlsWelcome>, next: Option<String> },
         Chunks { chunks: Vec<MlsHistoryChunk>, next: Option<String> },
@@ -69,8 +69,8 @@ wire! {
 
     pub struct MlsPackage { pub device_key: String, pub package: String }
     pub struct MlsDevice { pub uid: Uid, pub device_key: String, pub hpke_key: String, #[cfg_attr(feature = "ts", ts(type = "number"))] pub created_at: i64, pub signature: String }
-    pub struct MlsGroup { pub conversation: String, pub group: String, #[cfg_attr(feature = "ts", ts(type = "number"))] pub incarnation: u64, #[cfg_attr(feature = "ts", ts(type = "number"))] pub epoch: u64, pub pending: bool }
-    pub struct MlsLogEntry { #[cfg_attr(feature = "ts", ts(type = "number"))] pub epoch: u64, pub proposals: Vec<String>, pub commit: String }
+    pub struct MlsGroup { pub conversation: String, pub group: String, #[serde(deserialize_with = "voice::safe_u64")] #[cfg_attr(feature = "ts", ts(type = "number"))] pub incarnation: u64, #[serde(deserialize_with = "voice::safe_u64")] #[cfg_attr(feature = "ts", ts(type = "number"))] pub epoch: u64, pub pending: bool }
+    pub struct MlsLogEntry { #[serde(deserialize_with = "voice::safe_u64")] #[cfg_attr(feature = "ts", ts(type = "number"))] pub epoch: u64, pub proposals: Vec<String>, pub commit: String }
     pub struct MlsWelcome { pub id: String, pub group: String, pub welcome: String }
     pub struct MlsHistoryChunk { pub id: String, pub group: String, pub sender_uid: Uid, pub chunk: String }
     pub struct MlsHistoryWanted { pub group: String, pub device: String, #[serde(default, skip_serializing_if = "Option::is_none")] pub assignment: Option<String> }
@@ -80,9 +80,9 @@ wire! {
     #[serde(tag = "ev", content = "d")]
     pub enum MlsEvent {
         #[serde(rename = "mls.commit")]
-        Commit { group: String, #[cfg_attr(feature = "ts", ts(type = "number"))] epoch: u64, proposals: Vec<String>, commit: String },
+        Commit { group: String, #[serde(deserialize_with = "voice::safe_u64")] #[cfg_attr(feature = "ts", ts(type = "number"))] epoch: u64, proposals: Vec<String>, commit: String },
         #[serde(rename = "mls.proposal")]
-        Proposal { group: String, #[cfg_attr(feature = "ts", ts(type = "number"))] epoch: u64, proposal: String },
+        Proposal { group: String, #[serde(deserialize_with = "voice::safe_u64")] #[cfg_attr(feature = "ts", ts(type = "number"))] epoch: u64, proposal: String },
         #[serde(rename = "mls.welcome")]
         Welcome { group: String },
         #[serde(rename = "mls.history")]

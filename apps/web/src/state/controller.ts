@@ -270,11 +270,18 @@ class Controller {
       if (s.phase !== "online" || s.epoch !== prev.epoch) return;
       const now = myChannelId(s);
       const before = myChannelId(prev);
+      const oldBinding = prev.me ? prev.clients[prev.me.session]?.voice_binding : null;
+      const newBinding = s.me ? s.clients[s.me.session]?.voice_binding : null;
+      if (now !== null && now === before && oldBinding && newBinding && (oldBinding.call !== newBinding.call || oldBinding.participation !== newBinding.participation)) {
+        void this.stopVoice();
+        void this.conn?.request("channel.leave", {}).catch(() => {});
+        return;
+      }
       if (before === null && now !== null) {
         this.voiceRetries = 0;
         void this.startVoice();
-      } else if (before !== null && now === null) {
-        void this.stopVoice();
+      } else if (before !== now) {
+        void this.stopVoice().then(() => { if (now !== null && myChannelId(useSession.getState()) === now) return this.startVoice(); });
       }
     });
 
@@ -561,9 +568,14 @@ class Controller {
         }).catch(() => {}).finally(() => { this.messagePending--; });
       } else session.dispatch({ type: "event", event, now: Date.now() });
       if (event.ev === "chat.read" && "conversation" in event.d) void this.sealed?.refreshUnread(event.d.conversation).catch(() => {});
-      if (event.ev === "voice.closed") {
+      if (event.ev === "voice.closed" && (() => {
+        const state = useSession.getState();
+        const b = state.me === null ? null : state.clients[state.me.session]?.voice_binding;
+        return b && b.call === event.d.call && b.participation === event.d.participation && b.run === event.d.run;
+      })()) {
         useUi.getState().toast("info", tNow("voice.closed"));
-        this.scheduleVoiceRetry(1000);
+        if (event.d.reason === "transport_failed") this.scheduleVoiceRetry(1000);
+        else void this.stopVoice();
       }
       if (event.ev === "channel.deleted") {
         const ui = useUi.getState();
@@ -668,15 +680,33 @@ class Controller {
     const conn = this.conn;
     // Nothing to do (and no microphone prompt) while I am only on the server.
     if (!conn || myChannelId(useSession.getState()) === null) return;
-    const { iceServers } = useSession.getState();
+    const state = useSession.getState();
+    const channel = myChannelId(state)!;
+    if (state.channels[channel]?.encrypted) { await this.stopVoice(); useUi.getState().toast("info", tNow("voice.encryptedPending")); return; }
+    const { iceServers } = state;
+    const own = state.me === null ? null : state.clients[state.me.session];
+    if (!own || (state.kind === "vc" && !own.voice_binding)) return;
+    const participation = own.voice_binding;
+    const binding = { server_key: conn.serverKey ?? null, session: own.id, channel, call: state.kind === "vc" ? participation!.call : null, participation: state.kind === "vc" ? participation!.participation : null, group: null };
+    const current = () => {
+      const s = useSession.getState(); const b = s.me === null ? null : s.clients[s.me.session]?.voice_binding;
+      return this.conn === conn && myChannelId(s) === channel && (state.kind !== "vc" || (b?.call === participation?.call && b?.participation === participation?.participation));
+    };
     this.engine.setMuted(useVoice.getState().muted);
     this.engine.setDeafened(useVoice.getState().deafened);
     try {
       await this.engine.start({
-        iceServers,
+        iceServers, mode: "plaintext", binding,
         serverHost: this.serverHost(),
         // On TeamSpeak servers the native engine sends frames over the TS connection and never asks for an offer.
-        offer: async (sdp) => (await conn.request("voice.offer", { sdp }, { timeoutMs: 15_000 })).sdp,
+        offer: async (sdp, run) => {
+          if (!current()) throw new Error("Stale voice participation");
+          const sources = [...new Set([...sdp.matchAll(/^a=ssrc:(\d+) /gm)].map(m => Number(m[1])))];
+          if (sources.length !== 1 || !sources[0]) throw new Error("Expected one microphone SSRC");
+          const answer = await conn.request("voice.offer", {channel,call:participation!.call,participation:participation!.participation,run,group:null,ssrc:sources[0],sdp}, {timeoutMs:15_000});
+          if (!current() || answer.call !== participation!.call || answer.participation !== participation!.participation || answer.run !== run) throw new Error("Stale voice answer");
+          return answer.sdp;
+        },
       });
     } catch (e) {
       if (this.conn !== conn) return;
@@ -863,6 +893,7 @@ class Controller {
    * answered, so the composer does not send into a channel we are not in yet.
    */
   async joinChannel(channel: number, password?: string): Promise<void> {
+    if (useSession.getState().channels[channel]?.encrypted) { useUi.getState().toast("info", tNow("voice.encryptedPending")); return; }
     const ui = useUi.getState();
     ui.setJoining(channel);
     try {

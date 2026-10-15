@@ -264,6 +264,19 @@ impl Client {
         Self::connect_with(server, key, hello).await
     }
 
+    /// A distinct authenticated device of this account, rather than a takeover.
+    pub async fn connect_account(server: &TestServer, account: &SigningKey, nickname: &str) -> Result<Self, ErrorBody> {
+        let device = new_key();
+        let now = vc_server::core::now_ms();
+        let cert = certificate(account, &device, now - 1000, now + 86_400_000);
+        Self::connect_with(server, device, |raw, key| {
+            let mut hello = raw.hello(key, nickname, None);
+            set_certificate(&mut hello, cert, key);
+            hello
+        })
+        .await
+    }
+
     /// Connects with a hello body built by `hello` (e.g. to add an invite).
     pub async fn connect_with(
         server: &TestServer,

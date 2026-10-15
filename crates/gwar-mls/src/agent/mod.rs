@@ -3,7 +3,9 @@
 
 pub mod epoch_number;
 mod storage;
+mod voice;
 pub use storage::{Change, Changes, Store, Stores};
+pub use voice::{VoiceKey, VoiceKeys, voice_kid};
 
 use crate::crypto::Provider;
 use crate::{
@@ -324,9 +326,18 @@ pub struct Agent {
     durable: Stores,
     ready: bool,
     poisoned: bool,
+    voice_only: bool,
 }
 
 impl Agent {
+    /// A separate provider for a call. Its changes/outbox belong only in memory,
+    /// under the same device lease as the durable chat agent.
+    pub fn new_voice(seed: [u8; 32], credential: Credential, now: i64) -> Result<Self> {
+        let mut agent = Self::new(seed, credential, now)?;
+        agent.voice_only = true;
+        Ok(agent)
+    }
+
     pub fn new(seed: [u8; 32], credential: Credential, now: i64) -> Result<Self> {
         let signer = Self::signer(seed, &credential)?;
         if !(1..=vc_proto::MAX_SAFE_INTEGER).contains(&now) {
@@ -352,6 +363,7 @@ impl Agent {
             durable: Stores::default(),
             ready: true,
             poisoned: false,
+            voice_only: false,
         })
     }
 
@@ -366,6 +378,14 @@ impl Agent {
     }
 
     pub fn load(seed: [u8; 32], credential: Credential, stores: Stores) -> Result<Self> {
+        Self::load_store(seed, credential, stores, false)
+    }
+    /// Reload only the call's volatile checkpoint after a rejected operation.
+    /// A process/worker restart must discard it and rejoin, never restore it.
+    pub fn load_voice(seed: [u8; 32], credential: Credential, stores: Stores) -> Result<Self> {
+        Self::load_store(seed, credential, stores, true)
+    }
+    fn load_store(seed: [u8; 32], credential: Credential, stores: Stores, voice_only: bool) -> Result<Self> {
         let signer = Self::signer(seed, &credential)?;
         let device: DeviceRecord =
             parse(stores.groups.get(b"@device".as_slice()).ok_or(Invalid("missing device record"))?)?;
@@ -397,6 +417,7 @@ impl Agent {
             durable: stores,
             ready: false,
             poisoned: false,
+            voice_only,
         };
         for key in agent.epochs.keys() {
             let (group, epoch) = key.rsplit_once('/').ok_or(Invalid("epoch key"))?;
@@ -415,6 +436,9 @@ impl Agent {
         }
         for (key, record) in &agent.groups {
             let descriptor = SignedDescriptor::parse(&record.descriptor).ok_or(Invalid("stored descriptor"))?;
+            if (descriptor.descriptor.kind == crate::Kind::Voice) != voice_only {
+                return Err(Invalid("agent store kind"));
+            }
             if *key != group_key(&descriptor.descriptor.server_key, &descriptor.group_id()) {
                 return Err(Invalid("group key"));
             }
@@ -541,6 +565,9 @@ impl Agent {
         Ok(Lifetime::init(start, end))
     }
     pub fn key_packages(&mut self, n: usize, now: i64) -> Result<Vec<Vec<u8>>> {
+        if self.voice_only {
+            return Err(Invalid("voice has no key packages"));
+        }
         self.operation(|a| {
             if n > 20 {
                 return Err(Invalid("key package count"));
@@ -549,6 +576,9 @@ impl Agent {
         })
     }
     pub fn last_resort_key_package(&mut self, now: i64) -> Result<Vec<u8>> {
+        if self.voice_only {
+            return Err(Invalid("voice has no key packages"));
+        }
         self.operation(|a| a.package(now, true))
     }
     fn package(&self, now: i64, last_resort: bool) -> Result<Vec<u8>> {
@@ -715,6 +745,13 @@ impl Agent {
     fn derived(&mut self, key: &str, group: &MlsGroup) -> Result<()> {
         let context = group.public_group().group_context();
         self.fresh(key, context)?;
+        if self.voice_only {
+            let record = self.groups.get_mut(key).ok_or(Invalid("group record"))?;
+            record.status = Status::Active;
+            record.checkpoint = Some(checkpoint(context)?);
+            record.server_pending = false;
+            return Ok(());
+        }
         let exported = group
             .export_secret(self.provider.crypto(), "gwar chat v1", group.group_id().as_slice(), 32)
             .map_err(err("exporter"))?;
@@ -739,6 +776,9 @@ impl Agent {
                 return Err(Invalid("creator"));
             }
             let d = &descriptor.descriptor;
+            if (d.kind == crate::Kind::Voice) != a.voice_only {
+                return Err(Invalid("agent store kind"));
+            }
             if d.incarnation == 0 {
                 a.check_pin(&descriptor)?;
             } else {
@@ -868,6 +908,9 @@ impl Agent {
         now: i64,
         revocations: &dyn Revocations,
     ) -> Result<(u64, [u8; 32])> {
+        if self.voice_only {
+            return Err(Invalid("voice has no chat keys"));
+        }
         if self.ready {
             return Err(AgentError::Unpersisted);
         }
@@ -975,7 +1018,7 @@ impl Agent {
             let descriptor = client_context(group.public_group().group_context(), server)?;
             let kind = descriptor.descriptor.kind;
             if kind.separate_tree() && !adds.is_empty() {
-                return Err(Invalid("channel and server devices join externally"));
+                return Err(Invalid("separate-tree groups join externally"));
             }
             group.set_configuration(a.provider.storage(), &join_config(kind)).map_err(err("group config"))?;
             let packages: Vec<KeyPackage> = adds
@@ -1177,6 +1220,9 @@ impl Agent {
         chain: &[([u8; 32], Vec<u8>)],
     ) -> Result<[u8; 32]> {
         self.operation(|a| {
+            if a.voice_only || conversation.starts_with("voice:") {
+                return Err(Invalid("voice has no incarnation chain"));
+            }
             let chain = chain
                 .iter()
                 .map(|(group, bytes)| {
@@ -1277,6 +1323,9 @@ impl Agent {
             current_time(now)?;
             let info = info(bytes)?;
             let descriptor = client_context(info.group_context(), server)?;
+            if (descriptor.descriptor.kind == crate::Kind::Voice) != a.voice_only {
+                return Err(Invalid("agent store kind"));
+            }
             a.check_pin(&descriptor)?;
             let id = descriptor.group_id();
             let key = group_key(server, &id);
@@ -1356,6 +1405,9 @@ impl Agent {
         now: i64,
         revocations: &dyn Revocations,
     ) -> Result<Vec<Vec<u8>>> {
+        if self.voice_only {
+            return Err(Invalid("voice has no history"));
+        }
         self.operation(|a| {
             if !a.gate(server, id, now, revocations)?.can_send() {
                 return Err(AgentError::Blocked);
@@ -1420,6 +1472,9 @@ impl Agent {
         })
     }
     pub fn import_history(&mut self, server: &str, id: &[u8; 32], bytes: &[u8]) -> Result<()> {
+        if self.voice_only {
+            return Err(Invalid("voice has no history"));
+        }
         self.operation(|a| {
             let key = group_key(server, id);
             if a.groups.get(&key).is_none_or(|r| r.status != Status::Active) {
@@ -1468,6 +1523,9 @@ pub struct WelcomeResult {
 impl Agent {
     /// Persist before acknowledging. A duplicate never consumes its key package again.
     pub fn welcome(&mut self, server: &str, id: &str, bytes: &[u8]) -> Result<WelcomeResult> {
+        if self.voice_only {
+            return Err(Invalid("voice has no Welcome"));
+        }
         self.accept_welcome(server, id, bytes, None)
     }
     /// Recover membership whose log cannot be replayed. The caller establishes
@@ -1489,6 +1547,9 @@ impl Agent {
         bytes: &[u8],
         replace: Option<&[u8; 32]>,
     ) -> Result<WelcomeResult> {
+        if self.voice_only {
+            return Err(Invalid("voice has no Welcome"));
+        }
         self.operation(|a| {
             if id.is_empty() {
                 return Err(Invalid("welcome id"));
@@ -1518,7 +1579,7 @@ impl Agent {
             let staged = builder.build().map_err(err("staged welcome"))?;
             let descriptor = client_context(staged.group_context(), server)?;
             if descriptor.descriptor.kind.separate_tree() {
-                return Err(Invalid("channel and server devices join externally"));
+                return Err(Invalid("separate-tree groups join externally"));
             }
             a.check_pin(&descriptor)?;
             let key = group_key(server, &descriptor.group_id());

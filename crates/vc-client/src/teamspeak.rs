@@ -223,7 +223,13 @@ struct View {
     clients: BTreeMap<u32, Client>,
 }
 
-fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>) -> Option<View> {
+// Direct TS has local adapter tokens only; it has no Gwar call or MLS group.
+fn local_slot_binding(view: &View, own: u16) -> vc_proto::VoiceTransportBinding {
+    let b = view.clients[&u32::from(own)].voice_binding.as_ref().expect("TS participation");
+    vc_proto::VoiceTransportBinding { call: b.call.clone(), participation: b.participation.clone(), run: 1 }
+}
+
+fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>, previous: &View) -> Option<View> {
     let state = con.get_state().ok()?;
     let mut channels = BTreeMap::new();
     // TS orders siblings by "previous sibling id"; walk the chains for positions.
@@ -259,6 +265,10 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>) -> Option<View> 
             position += 1;
         }
     }
+    // These are local display fences for the direct TeamSpeak adapter, not MLS
+    // authority. Share a call token across each occupied channel snapshot.
+    let mut calls: BTreeMap<_, _> =
+        previous.clients.values().filter_map(|c| Some((c.channel?, c.voice_binding.as_ref()?.call.clone()))).collect();
     let clients = state
         .clients
         .values()
@@ -277,6 +287,28 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>) -> Option<View> 
                     away: c.away_message.clone(),
                     talking: talking.contains_key(&c.id.0),
                     voice: true,
+                    voice_binding: Some(
+                        previous
+                            .clients
+                            .get(&u32::from(c.id.0))
+                            .filter(|old| old.channel == Some(c.channel.0 as u32))
+                            .and_then(|old| old.voice_binding.clone())
+                            .unwrap_or_else(|| {
+                                use rand::RngCore;
+                                let mut bytes = [0; 16];
+                                rand::rng().fill_bytes(&mut bytes);
+                                let call = calls
+                                    .entry(c.channel.0 as u32)
+                                    .or_insert_with(|| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+                                    .clone();
+                                rand::rng().fill_bytes(&mut bytes);
+                                vc_proto::VoiceBinding {
+                                    call,
+                                    participation: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes),
+                                    run: None,
+                                }
+                            }),
+                    ),
                 },
             )
         })
@@ -322,13 +354,17 @@ fn diff(old: &View, new: &View, out: &mut Vec<Event>) {
         match old.clients.get(id) {
             None => out.push(Event::ClientJoined(client.clone())),
             Some(previous) if previous != client => {
-                if previous.talking != client.talking {
-                    out.push(Event::VoiceTalking { client: *id, talking: client.talking });
-                }
                 let mut a = previous.clone();
                 a.talking = client.talking;
                 if a != *client {
                     out.push(Event::ClientUpdated(client.clone()));
+                }
+                if previous.talking != client.talking {
+                    out.push(Event::VoiceTalking {
+                        binding: client.voice_binding.clone().expect("TS participation"),
+                        client: *id,
+                        talking: client.talking,
+                    });
                 }
             }
             _ => {}
@@ -500,7 +536,9 @@ fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Option<Out
         | Request::InviteCreate(_)
         | Request::InviteList {}
         | Request::InviteDelete { .. } => return Err(refused("manage this server in the TeamSpeak client")),
-        Request::VoiceOffer { .. } => return Err(refused("voice on TeamSpeak servers is native")),
+        Request::VoiceOffer(_) | Request::VoiceState {} | Request::VoiceEpochAck(_) | Request::VoiceEpochRepeat(_) => {
+            return Err(refused("voice on TeamSpeak servers is native"));
+        }
         Request::Sealed(_) => return Err(refused("encrypted direct messages require a Gwar server")),
         Request::Mls(_) => return Err(refused("MLS requires a Gwar server")),
         Request::Hello(_) | Request::Join(_) => return Err(refused("already connected")),
@@ -558,7 +596,7 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
     // Like the official client: see everyone, not just the people in our channel.
     let _ = command("channelsubscribeall", &[]).send(&mut con);
     let mut talking: HashMap<u16, Instant> = HashMap::new();
-    let Some(mut view) = view_of(&con, &talking) else {
+    let Some(mut view) = view_of(&con, &talking, &View::default()) else {
         let _ = ready.send(Err(anyhow!("no server state")));
         return;
     };
@@ -658,7 +696,11 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                             }
                             if let Some((slot, rtp_time, fresh)) = slots.place(*from, *id) {
                                 if fresh {
-                                    out.push(Event::VoiceSlot { slot: slot as u32, client: Some(u32::from(*from)) });
+                                    out.push(Event::VoiceSlot {
+                                        binding: local_slot_binding(&view, own),
+                                        slot: slot as u32,
+                                        client: Some(u32::from(*from)),
+                                    });
                                 }
                                 let _ = audio_tx.try_send(TsAudio {
                                     from: u32::from(*from),
@@ -721,7 +763,7 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
             }
         }
         if book_changed {
-            if let Some(next) = view_of(&con, &talking) {
+            if let Some(next) = view_of(&con, &talking, &view) {
                 diff(&view, &next, &mut out);
                 view = next;
             }
@@ -734,7 +776,11 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                 .collect();
             for speaker in left {
                 if let Some(slot) = slots.remove(speaker) {
-                    out.push(Event::VoiceSlot { slot: slot as u32, client: None });
+                    out.push(Event::VoiceSlot {
+                        binding: local_slot_binding(&view, own),
+                        slot: slot as u32,
+                        client: None,
+                    });
                 }
             }
         }

@@ -58,6 +58,8 @@ macro_rules! wire {
     )*};
 }
 
+mod voice;
+pub use voice::*;
 mod mls;
 pub use mls::*;
 mod sealed;
@@ -177,7 +179,13 @@ wire! {
         #[serde(rename = "token.redeem")]
         TokenRedeem { token: String },
         #[serde(rename = "voice.offer")]
-        VoiceOffer { sdp: String },
+        VoiceOffer(VoiceOffer),
+        #[serde(rename = "voice.state")]
+        VoiceState {},
+        #[serde(rename = "voice.epoch.ack")]
+        VoiceEpochAck(VoiceEpoch),
+        #[serde(rename = "voice.epoch.repeat")]
+        VoiceEpochRepeat(VoiceEpoch),
         #[serde(untagged)]
         Mls(MlsRequest),
         #[serde(untagged)]
@@ -400,7 +408,8 @@ wire! {
         SealedHistory { sealed: Vec<SealedMessage> },
         Token { token: String },
         Groups { groups: Vec<GroupId> },
-        Answer { sdp: String },
+        Answer { #[serde(flatten)] binding: VoiceTransportBinding, sdp: String },
+        VoiceState { #[serde(deserialize_with = "voice::required_option")] voice: Option<VoiceState> },
         Group { group: Group },
         Ban { ban: Ban },
         Bans { bans: Vec<Ban> },
@@ -502,12 +511,18 @@ wire! {
         #[serde(rename = "member.removed")]
         MemberRemoved { uid: Uid },
         #[serde(rename = "voice.talking")]
-        VoiceTalking { client: SessionId, talking: bool },
+        VoiceTalking { #[serde(flatten)] binding: VoiceBinding, client: SessionId, talking: bool },
         /// The given receive slot now carries audio of `client` (or nothing).
         #[serde(rename = "voice.slot")]
-        VoiceSlot { slot: u32, client: Option<SessionId> },
+        VoiceSlot { #[serde(flatten)] binding: VoiceTransportBinding, slot: u32, client: Option<SessionId> },
         #[serde(rename = "voice.closed")]
-        VoiceClosed { reason: String },
+        VoiceClosed { #[serde(flatten)] binding: VoiceBinding, reason: VoiceClosedReason },
+        #[serde(rename = "voice.state")]
+        VoiceState { #[serde(deserialize_with = "voice::required_option")] voice: Option<VoiceState> },
+        #[serde(rename = "voice.epoch.ack")]
+        VoiceEpochAck { call: String, group: String, #[serde(deserialize_with = "voice::safe_u64")] #[cfg_attr(feature = "ts", ts(type = "number"))] epoch: u64, device: String },
+        #[serde(rename = "voice.epoch.request")]
+        VoiceEpochRequest { call: String, group: String, #[serde(deserialize_with = "voice::safe_u64")] #[cfg_attr(feature = "ts", ts(type = "number"))] epoch: u64 },
         /// This user read a channel or conversation up to `message` on another device.
         #[serde(rename = "chat.read")]
         ChatRead { #[serde(flatten)] target: ChatReadTarget, message: MessageId },
@@ -656,6 +671,7 @@ wire! {
         pub talking: bool,
         /// Whether the client currently has a connected audio transport.
         pub voice: bool,
+        pub voice_binding: Option<VoiceBinding>,
     }
 
     pub struct Group {
@@ -1625,10 +1641,14 @@ mod tests {
             json!({"re": 3, "err": {"code": "forbidden", "message": "no"}})
         );
 
-        let ev = ServerFrame::Event(Event::VoiceTalking { client: 2, talking: true });
+        let ev = ServerFrame::Event(Event::VoiceTalking {
+            binding: VoiceBinding { call: "c".into(), participation: "p".into(), run: Some(1) },
+            client: 2,
+            talking: true,
+        });
         assert_eq!(
             serde_json::to_value(&ev).unwrap(),
-            json!({"ev": "voice.talking", "d": {"client": 2, "talking": true}})
+            json!({"ev": "voice.talking", "d": {"call":"c","participation":"p","run":1,"client": 2, "talking": true}})
         );
 
         let target = serde_json::to_value(ChatTarget::Channel(9)).unwrap();
