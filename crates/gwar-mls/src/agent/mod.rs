@@ -174,13 +174,29 @@ pub struct GroupRecord {
     pub server_pending: bool,
     /// Voice-only holds survive proposal-queue clearing on competing commits.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    voice_removals: BTreeMap<u32, String>,
+    voice_removals: BTreeMap<u32, VoiceRemoval>,
     /// For every uid, the epochs in which it had a leaf, as this device saw
     /// them: sorted, disjoint, non-adjacent inclusive ranges.
     pub evidence: BTreeMap<String, Vec<Interval>>,
     /// When this device's own last commit in the group was accepted; `None`
     /// after a Welcome, whose leaf came from a key package.
     pub own_commit_at: Option<i64>,
+}
+/// The concrete authenticated leaf held by a server Remove. A same-device
+/// external replacement can reuse the index and credential, but not this leaf.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VoiceRemoval {
+    device: String,
+    leaf_hash: [u8; 32],
+}
+impl VoiceRemoval {
+    fn new(leaf: &LeafNode) -> Result<Self> {
+        Ok(Self {
+            device: leaf_credential(leaf).ok_or(Invalid("removal target"))?.device_key().to_owned(),
+            leaf_hash: hash(&leaf.tls_serialize_detached().map_err(err("leaf encoding"))?),
+        })
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -751,16 +767,23 @@ impl Agent {
         self.fresh(key, context)?;
         if self.voice_only {
             let record = self.groups.get_mut(key).ok_or(Invalid("group record"))?;
+            let recovering = record.status == Status::Joining;
+            let mut holds = BTreeMap::new();
+            for (index, held) in &record.voice_removals {
+                let Some(leaf) = group.public_group().leaf(LeafNodeIndex::new(*index)) else { continue };
+                let current = VoiceRemoval::new(leaf)?;
+                // Observed non-removal commits keep the hold, including a target's
+                // self-update. Recovery instead compares the authenticated snapshot
+                // with the last observed leaf, so a missed same-index replacement
+                // cannot leave an orphaned hold after its join is accepted.
+                if held.device == current.device && (!recovering || held.leaf_hash == current.leaf_hash) {
+                    holds.insert(*index, current);
+                }
+            }
+            record.voice_removals = holds;
             record.status = Status::Active;
             record.checkpoint = Some(checkpoint(context)?);
             record.server_pending = false;
-            record.voice_removals.retain(|index, device| {
-                group
-                    .public_group()
-                    .leaf(LeafNodeIndex::new(*index))
-                    .and_then(leaf_credential)
-                    .is_some_and(|c| c.device_key() == device)
-            });
             return Ok(());
         }
         let exported = group
@@ -960,17 +983,11 @@ impl Agent {
         }
         let Proposal::Remove(remove) = proposal.proposal() else { unreachable!() };
         let target = remove.removed();
-        let device = group
-            .public_group()
-            .leaf(target)
-            .and_then(leaf_credential)
-            .ok_or(Invalid("removal target"))?
-            .device_key()
-            .to_owned();
-        group.store_pending_proposal(self.provider.storage(), *proposal).map_err(err("store proposal"))?;
         if self.voice_only {
-            self.groups.get_mut(key).ok_or(Invalid("group record"))?.voice_removals.insert(target.u32(), device);
+            let removal = VoiceRemoval::new(group.public_group().leaf(target).ok_or(Invalid("removal target"))?)?;
+            self.groups.get_mut(key).ok_or(Invalid("group record"))?.voice_removals.insert(target.u32(), removal);
         }
+        group.store_pending_proposal(self.provider.storage(), *proposal).map_err(err("store proposal"))?;
         Ok(())
     }
     fn resolve_voice_removals(&mut self, key: &str, staged: &StagedCommit) {
