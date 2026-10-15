@@ -27,7 +27,7 @@ settle(server: &str, id: &[u8; 32], winner: Option<&[u8; 32]>) -> Result<bool>
 welcome(server: &str, id: &str, bytes: &[u8]) -> Result<WelcomeResult>
 replace_stale_welcome(server: &str, group: &[u8; 32], id: &str,
                       bytes: &[u8]) -> Result<WelcomeResult>
-join_external(server: &str, bytes: &[u8], now: i64,
+join_external(server: &str, bytes: &[u8], tree: Option<&[u8]>, now: i64,
               revocations: &dyn Revocations) -> Result<Outbox>
 commit(server: &str, id: &[u8; 32], adds: &[Vec<u8>], removes: &[u32],
        now: i64, revocations: &dyn Revocations) -> Result<Outbox>
@@ -53,7 +53,7 @@ gate(server: &str, id: &[u8; 32], now: i64,
      revocations: &dyn Revocations) -> Result<Gate>
 sending_key(server: &str, id: &[u8; 32], now: i64,
             revocations: &dyn Revocations) -> Result<(u64, [u8; 32])>
-behind(server: &str, id: &[u8; 32], group_info: &[u8]) -> Result<bool>
+behind(server: &str, id: &[u8; 32], group_info: &[u8], tree: Option<&[u8]>) -> Result<bool>
 ```
 
 `create` returns a TLS MLS GroupInfo message in persisted `Creating` state.

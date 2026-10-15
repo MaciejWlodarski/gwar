@@ -117,6 +117,15 @@ pub(crate) fn staged(
     }
     let removed: Vec<Leaf> =
         staged.remove_proposals().filter_map(|r| leaf(group, r.remove_proposal().removed())).collect();
+    let descriptor = group
+        .group_context()
+        .extensions()
+        .unknown(DESCRIPTOR_EXTENSION)
+        .and_then(|ext| SignedDescriptor::parse(&ext.0))
+        .ok_or(Invalid("descriptor"))?;
+    if descriptor.descriptor.kind.separate_tree() && staged.add_proposals().next().is_some() {
+        return Err(Invalid("channel and server devices join externally"));
+    }
     let mut welcome_for = BTreeSet::new();
     let mut added_devices = Vec::new();
     for add in staged.add_proposals() {

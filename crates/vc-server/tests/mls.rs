@@ -1733,3 +1733,72 @@ async fn a_restart_continues_the_live_group_and_retires_its_predecessor() {
 
 #[path = "common/sealed_attachments.rs"]
 mod attachments;
+
+#[tokio::test]
+async fn tree_endpoint_checks_session_conversation_and_exports_current_epoch() {
+    let server = TestServer::start().await;
+    let mut alice = Device::new(1, 11);
+    let mut a = connect_device(&server, &alice).await;
+    a.redeem(&server.admin_token).await;
+    let bob = Device::new(2, 21);
+    let b = connect_device(&server, &bob).await;
+    let c = connect_device(&server, &Device::new(3, 31)).await;
+    let channel = a.create_channel(json!({"name":"encrypted", "encrypted":true})).await;
+    let group = create_channel_group(&mut a, &mut alice, channel_id(&channel), true, 1).await.unwrap();
+    let http = reqwest::Client::new();
+    let url = format!("{}/api/mls/{group}/tree", server.http());
+    assert_eq!(http.get(&url).send().await.unwrap().status(), 404);
+    for token in ["wrong", ""] {
+        assert_eq!(http.get(&url).bearer_auth(token).send().await.unwrap().status(), 404);
+    }
+    let response = http.get(&url).bearer_auth(&b.welcome.file_access).send().await.unwrap();
+    assert_eq!(response.status(), 200, "a reader need not have joined the MLS group");
+    assert_eq!(response.headers()["content-type"], "application/octet-stream");
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(response.headers()["x-gwar-epoch"], "0");
+    assert_eq!(response.headers()["access-control-expose-headers"], "x-gwar-epoch");
+    let old = response.bytes().await.unwrap();
+    let (epoch, expected) = Observer::create(&alice.group_info(), &a.server_key).unwrap().tree().unwrap();
+    assert_eq!(epoch, 0);
+    assert_eq!(old.as_ref(), expected);
+    let (commit, _) = alice.update();
+    let tree_free_info =
+        wire(alice.group.as_ref().unwrap().export_group_info(alice.provider.crypto(), &alice.signer, false).unwrap());
+    a.ok("mls.commit", update_request(&group, 0, &(commit, tree_free_info))).await;
+    let response = http.get(&url).bearer_auth(&a.welcome.file_access).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-gwar-epoch"], "1");
+    let tree = response.bytes().await.unwrap();
+    assert_ne!(tree, old);
+    assert_eq!(tree.as_ref(), alice.group.as_ref().unwrap().export_ratchet_tree().tls_serialize_detached().unwrap());
+    let head = a.ok("mls.group_info", json!({"group":group})).await;
+    assert_eq!(head["epoch"], 1);
+    let mut joiner = gwar_mls::agent::Agent::new([21; 32], bob.credential.clone(), now()).unwrap();
+    joiner.take_changes();
+    let out = joiner
+        .join_external(
+            &a.server_key,
+            &B64.decode(head["group_info"].as_str().unwrap()).unwrap(),
+            Some(&tree),
+            now(),
+            &(),
+        )
+        .unwrap();
+    let mut b = b;
+    b.ok("mls.commit", update_request(&group, 1, &(out.commit, out.group_info))).await;
+
+    // The same token is scoped by the conversation's read rule, including DMs.
+    let dm = create(&mut a, &mut Device::new(1, 11), 2, 2).await;
+    let dm_url = format!("{}/api/mls/{dm}/tree", server.http());
+    assert_eq!(http.get(&dm_url).bearer_auth(&c.welcome.file_access).send().await.unwrap().status(), 404);
+    assert_eq!(http.get(&dm_url).bearer_auth(&a.welcome.file_access).send().await.unwrap().status(), 200);
+    assert_eq!(
+        http.get(format!("{}/api/mls/{}/tree", server.http(), b64(&[99; 32])))
+            .bearer_auth(&a.welcome.file_access)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+}

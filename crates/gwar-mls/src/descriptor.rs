@@ -19,6 +19,10 @@ pub enum Kind {
 }
 
 impl Kind {
+    pub(crate) fn separate_tree(self) -> bool {
+        matches!(self, Self::Channel | Self::Server)
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Kind::Dm => "dm",

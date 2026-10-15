@@ -104,6 +104,7 @@ enum Request {
     JoinExternal {
         server: String,
         bytes: Vec<u8>,
+        tree: Option<Vec<u8>>,
         now: i64,
         revocations: View,
     },
@@ -188,6 +189,7 @@ enum Request {
         server: String,
         group: [u8; 32],
         bytes: Vec<u8>,
+        tree: Option<Vec<u8>>,
     },
 }
 #[derive(Deserialize)]
@@ -252,8 +254,8 @@ impl Agent {
             Request::ReplaceStaleWelcome { server, group, id, bytes } => {
                 output(a.replace_stale_welcome(&server, &group, &id, &bytes).map_err(error)?)
             }
-            Request::JoinExternal { server, bytes, now, revocations } => {
-                output(a.join_external(&server, &bytes, now, &revocations).map_err(error)?)
+            Request::JoinExternal { server, bytes, tree, now, revocations } => {
+                output(a.join_external(&server, &bytes, tree.as_deref(), now, &revocations).map_err(error)?)
             }
             Request::Commit { server, group, adds, removes, now, revocations } => {
                 output(a.commit(&server, &group, &adds, &removes, now, &revocations).map_err(error)?)
@@ -289,7 +291,39 @@ impl Agent {
                 let chain: Vec<_> = chain.into_iter().map(|i| (i.group, i.descriptor)).collect();
                 output(a.accept_chain(&server, &conversation, &chain).map_err(error)?)
             }
-            Request::Behind { server, group, bytes } => output(a.behind(&server, &group, &bytes).map_err(error)?),
+            Request::Behind { server, group, bytes, tree } => {
+                output(a.behind(&server, &group, &bytes, tree.as_deref()).map_err(error)?)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn optional_tree_uses_the_existing_byte_array_shape() {
+        for operation in ["join_external", "behind"] {
+            for tree in [None, Some(serde_json::Value::Null), Some(json!([1, 2, 255]))] {
+                let mut fields = json!({"server":"s", "bytes":[3,4]});
+                if operation == "behind" {
+                    fields["group"] = json!(vec![0; 32]);
+                } else {
+                    fields["now"] = json!(123);
+                    fields["revocations"] = json!([]);
+                }
+                if let Some(tree) = &tree {
+                    fields["tree"] = tree.clone();
+                }
+                let request: Request = serde_json::from_value(json!({operation:fields})).unwrap();
+                let parsed = match request {
+                    Request::JoinExternal { tree, .. } | Request::Behind { tree, .. } => tree,
+                    _ => unreachable!(),
+                };
+                assert_eq!(parsed, tree.filter(|v| !v.is_null()).map(|_| vec![1, 2, 255]));
+            }
         }
     }
 }

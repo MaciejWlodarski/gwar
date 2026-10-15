@@ -14,6 +14,7 @@ pub mod gateway;
 pub mod identity;
 pub mod media;
 pub mod members;
+mod mls;
 mod preauth;
 pub mod server_key;
 use base64::Engine;
@@ -299,15 +300,17 @@ pub async fn start(config: Config) -> Result<Running> {
             .context("--client-ip-header is not a valid header name")?,
     };
     // The web app runs on another origin than this server: let it upload and
-    // fetch files. Uploads are authorized by one-time tokens and downloads by
-    // the session's bearer token (if the server needs one), never by cookies.
+    // fetch files and MLS trees. Uploads use one-time tokens; downloads use
+    // the session's bearer token (if required), never cookies.
     let origins: Vec<HeaderValue> = config.web_origins.iter().filter_map(|o| o.parse().ok()).collect();
     let cors = CorsLayer::new()
         .allow_origin(AllowOrigin::list(origins))
         .allow_methods([Method::GET, Method::PUT])
         .allow_headers([header::CONTENT_TYPE, header::RANGE, header::AUTHORIZATION])
+        .expose_headers([axum::http::HeaderName::from_static("x-gwar-epoch")])
         .max_age(std::time::Duration::from_secs(3600));
     let files_routes = Router::new()
+        .route("/api/mls/{group}/tree", get(mls::tree))
         // Uploads enforce their own reserved size.
         .route("/api/files/{id}", put(files::upload).layer(DefaultBodyLimit::disable()))
         .route("/files/{id}/{name}", get(files::download))

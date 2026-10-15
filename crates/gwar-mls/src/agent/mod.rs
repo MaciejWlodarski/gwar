@@ -104,9 +104,9 @@ fn capabilities() -> Capabilities {
         Some(&[CredentialType::Basic]),
     )
 }
-fn join_config() -> MlsGroupJoinConfig {
+fn join_config(kind: crate::Kind) -> MlsGroupJoinConfig {
     MlsGroupJoinConfig::builder()
-        .use_ratchet_tree_extension(true)
+        .use_ratchet_tree_extension(!kind.separate_tree())
         .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
         .build()
 }
@@ -116,6 +116,20 @@ fn info(bytes: &[u8]) -> Result<openmls::messages::group_info::VerifiableGroupIn
         MlsMessageBodyIn::GroupInfo(info) => Ok(info),
         _ => Err(Invalid("not a group info")),
     }
+}
+// An embedded tree wins; separate trees are ignored for DMs and creation.
+fn info_tree(
+    info: &openmls::messages::group_info::VerifiableGroupInfo,
+    kind: crate::Kind,
+    tree: Option<&[u8]>,
+) -> Result<RatchetTreeIn> {
+    if let Some(extension) = info.extensions().ratchet_tree() {
+        return Ok(extension.ratchet_tree().clone());
+    }
+    if !kind.separate_tree() {
+        return Err(Invalid("no ratchet tree"));
+    }
+    RatchetTreeIn::tls_deserialize_exact(tree.ok_or(Invalid("no ratchet tree"))?).map_err(err("ratchet tree encoding"))
 }
 fn protocol(bytes: &[u8]) -> Result<PublicMessageIn> {
     handshake_size(bytes)?;
@@ -759,7 +773,7 @@ impl Agent {
                 .ciphersuite(SUITE)
                 .capabilities(capabilities())
                 .lifetime(a.lifetime(descriptor.descriptor.created_at)?)
-                .use_ratchet_tree_extension(true)
+                .use_ratchet_tree_extension(!d.kind.separate_tree())
                 .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
                 .with_group_context_extensions(extensions)
                 .build();
@@ -958,6 +972,12 @@ impl Agent {
                 return Err(Invalid("fetch outstanding proposals first"));
             }
             let mut group = a.mls(&key)?;
+            let descriptor = client_context(group.public_group().group_context(), server)?;
+            let kind = descriptor.descriptor.kind;
+            if kind.separate_tree() && !adds.is_empty() {
+                return Err(Invalid("channel and server devices join externally"));
+            }
+            group.set_configuration(a.provider.storage(), &join_config(kind)).map_err(err("group config"))?;
             let packages: Vec<KeyPackage> = adds
                 .iter()
                 .map(|bytes| {
@@ -989,6 +1009,7 @@ impl Agent {
                 .leaf_node_parameters(LeafNodeParameters::builder().with_credential_with_key(a.with_key()).build())
                 .load_psks(a.provider.storage())
                 .map_err(err("commit PSKs"))?
+                .create_group_info(true)
                 .build(a.provider.rand(), a.provider.crypto(), &a.signer, |_| true)
                 .map_err(err("build commit"))?
                 .stage_commit(&a.provider)
@@ -1211,18 +1232,15 @@ impl Agent {
     /// as when joining, since an older GroupInfo may hold expired packages),
     /// is behind this device's checkpoint of that group: an earlier epoch, or
     /// another GroupContext for the same epoch. One of the observations that
-    /// trigger a restart.
-    pub fn behind(&self, server: &str, id: &[u8; 32], bytes: &[u8]) -> Result<bool> {
+    /// trigger a restart. `tree` is TLS-encoded; DMs ignore it and require an embedded tree.
+    pub fn behind(&self, server: &str, id: &[u8; 32], bytes: &[u8], tree: Option<&[u8]>) -> Result<bool> {
         let info = info(bytes)?;
         let descriptor = client_context(info.group_context(), server)?;
         if descriptor.group_id() != *id {
             return Err(Invalid("group info group"));
         }
-        let tree = info
-            .extensions()
-            .ratchet_tree()
-            .ok_or(Invalid("no ratchet tree"))?
-            .ratchet_tree()
+        let tree_in = info_tree(&info, descriptor.descriptor.kind, tree)?;
+        let tree = tree_in
             .clone()
             .into_verified(SUITE, self.provider.crypto(), info.group_id())
             .map_err(err("ratchet tree"))?;
@@ -1230,6 +1248,7 @@ impl Agent {
         let next = checkpoint(info.group_context())?;
         // Verification only: a throwaway provider, and nothing is committed.
         MlsGroup::external_commit_builder()
+            .with_ratchet_tree(tree_in)
             .skip_lifetime_validation()
             .build_group(&Provider::default(), info, self.with_key())
             .map_err(err("group info"))?;
@@ -1244,10 +1263,13 @@ impl Agent {
         self.groups.get_mut(key).ok_or(Invalid("record"))?.status = Status::Rejoin;
         Ok(())
     }
+    /// Joins using the embedded tree, or a separate TLS tree for channels/server chat.
+    /// DMs ignore `tree` and require the embedded tree.
     pub fn join_external(
         &mut self,
         server: &str,
         bytes: &[u8],
+        tree: Option<&[u8]>,
         now: i64,
         revocations: &dyn Revocations,
     ) -> Result<Outbox> {
@@ -1278,11 +1300,8 @@ impl Agent {
                 return Err(Invalid("removed checkpoint"));
             }
             let old_checkpoint = checkpoint(info.group_context())?;
-            let old_tree = info
-                .extensions()
-                .ratchet_tree()
-                .ok_or(Invalid("no ratchet tree"))?
-                .ratchet_tree()
+            let tree_in = info_tree(&info, descriptor.descriptor.kind, tree)?;
+            let old_tree = tree_in
                 .clone()
                 .into_verified(SUITE, a.provider.crypto(), info.group_id())
                 .map_err(err("ratchet tree"))?;
@@ -1298,8 +1317,9 @@ impl Agent {
             if a.groups.get(&key).is_some_and(|r| matches!(r.status, Status::Active | Status::Joining)) {
                 a.drop_mls(&key)?;
             }
-            let (group, bundle) = MlsGroup::external_commit_builder()
-                .with_config(join_config())
+            let (mut group, bundle) = MlsGroup::external_commit_builder()
+                .with_config(join_config(descriptor.descriptor.kind))
+                .with_ratchet_tree(tree_in)
                 .with_aad(ds::commit_aad(now))
                 .skip_lifetime_validation()
                 .build_group(&a.provider, info, a.with_key())
@@ -1307,12 +1327,17 @@ impl Agent {
                 .leaf_node_parameters(LeafNodeParameters::builder().with_capabilities(capabilities()).build())
                 .load_psks(a.provider.storage())
                 .map_err(err("external PSKs"))?
+                .use_ratchet_tree_extension(!descriptor.descriptor.kind.separate_tree())
+                .create_group_info(true)
                 .build(a.provider.rand(), a.provider.crypto(), &a.signer, |_| true)
                 .map_err(err("external commit"))?
                 .finalize(&a.provider)
                 .map_err(err("external finalize"))?;
             client_context(group.public_group().group_context(), server)?;
             rules::tree(&descriptor, group.public_group().treesync().full_leaves().map(|(_, l)| l))?;
+            group
+                .set_configuration(a.provider.storage(), &join_config(descriptor.descriptor.kind))
+                .map_err(err("group config"))?;
             a.record(&descriptor, Status::Joining);
             a.groups.get_mut(&key).ok_or(Invalid("record"))?.checkpoint = Some(old_checkpoint.clone());
             let out = a.bundle(&id, old_checkpoint.epoch, bundle, now)?;
@@ -1486,12 +1511,15 @@ impl Agent {
             if welcome.ciphersuite() != SUITE {
                 return Err(Invalid("ciphersuite"));
             }
-            let builder = StagedWelcome::build_from_welcome(&a.provider, &join_config(), welcome)
+            let builder = StagedWelcome::build_from_welcome(&a.provider, &join_config(crate::Kind::Dm), welcome)
                 .map_err(err("welcome"))?
                 .skip_lifetime_validation();
             let builder = if replace.is_some() { builder.replace_old_group() } else { builder };
             let staged = builder.build().map_err(err("staged welcome"))?;
             let descriptor = client_context(staged.group_context(), server)?;
+            if descriptor.descriptor.kind.separate_tree() {
+                return Err(Invalid("channel and server devices join externally"));
+            }
             a.check_pin(&descriptor)?;
             let key = group_key(server, &descriptor.group_id());
             a.fresh(&key, staged.group_context())?;

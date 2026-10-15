@@ -125,6 +125,11 @@ pub enum CoreMsg {
     DeviceAuthorized(String, String, oneshot::Sender<bool>),
     Bridge(BridgeMsg),
     Files(files::FileMsg),
+    MlsTree {
+        group: String,
+        access: String,
+        reply: oneshot::Sender<Option<(u64, Vec<u8>)>>,
+    },
     /// Devices revoked on Gwar Connect, and the feed position after them.
     Revoked(Vec<RevokedDevice>, i64),
     /// Periodic housekeeping (expired uploads).
@@ -514,6 +519,9 @@ impl Core {
                 self.applying_remote = false;
             }
             CoreMsg::Files(msg) => self.file_msg(msg),
+            CoreMsg::MlsTree { group, access, reply } => {
+                let _ = reply.send(self.mls_tree(&group, &access));
+            }
             CoreMsg::Tick => self.tick(),
             CoreMsg::Revoked(devices, seq) => self.revoked(devices, seq),
             CoreMsg::Resume(resume) => resume(self),

@@ -16,9 +16,17 @@ use vc_proto::{
     MlsResponse, Response, SessionId,
 };
 
-use super::{Core, Reply, err, now_ms, storage_error};
+use super::{Core, CoreHandle, CoreMsg, Reply, err, now_ms, storage_error};
 use crate::store::mls::{GroupRow, ProposalRow, ShareHistory};
 use vc_proto::ChannelId;
+
+impl CoreHandle {
+    pub async fn mls_tree(&self, group: String, access: String) -> Option<(u64, Vec<u8>)> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx.send(CoreMsg::MlsTree { group, access, reply }).await.ok()?;
+        rx.await.ok().flatten()
+    }
+}
 
 const BLOB_BYTES: usize = 128 * 1024;
 const LIST_BYTES: usize = 640 * 1024 - 4096;
@@ -145,6 +153,12 @@ impl Core {
             .filter(|s| s.out.is_some() && self.mls_can_read(&s.uid, conversation).unwrap_or(false))
             .map(|s| s.id)
             .collect()
+    }
+
+    pub(super) fn mls_tree(&self, group: &str, access: &str) -> Option<(u64, Vec<u8>)> {
+        let session = self.sessions.values().find(|s| s.out.is_some() && s.file_access == access)?;
+        let row = self.mls_group_for(session.id, group).ok()?;
+        self.mls_observer(&row).ok()?.tree().ok()
     }
 
     fn mls_group_for(&self, session: SessionId, group: &str) -> Result<GroupRow, ErrorBody> {
