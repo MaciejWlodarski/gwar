@@ -1,22 +1,27 @@
 //! Native voice: Tauri commands around `vc_client::voice`.
 //!
 //! The web UI owns the WebSocket and signalling. For the SDP exchange this
-//! module emits `voice://offer {run, sdp}`; the UI sends it as `voice.offer`
+//! module emits `voice://offer {owner, run, sdp}`; the UI sends it as `voice.offer`
 //! and hands the reply back with `voice_answer`.
 //!
+//! Ownership: `voice_bootstrap` retires the previous web-view and returns a
+//! native owner generation. Every mutating voice/microphone command requires
+//! it; a retired engine must never bootstrap again. See `../VOICE-IPC.md`.
+//!
 //! Events emitted to the UI:
-//! - `voice://offer`   `{run, sdp}`            (see above)
-//! - `voice://state`   `{run, state}`          `connected` | `failed`
-//! - `voice://level`   `{db, transmitting}`    ~20 Hz while the window is visible
-//! - `voice://issue`   `{side, kind, message}` device problems (`input`/`output`)
+//! - `voice://offer`   `{owner, run, sdp}`            (see above)
+//! - `voice://state`   `{owner, run, state}`          `connected` | `failed`
+//! - `voice://level`   `{owner, db, transmitting}`    ~20 Hz while the window is visible
+//! - `voice://issue`   `{owner, side, kind, message}` device problems (`input`/`output`)
 //!   with `kind` = `no_device` | `permission_denied` (input only) | `failed`
-//! - `voice://test-level {db}`                 microphone test in settings
+//! - `voice://test-level {owner, db}`                 microphone test in settings
 
 use std::{
+    future::Future,
     net::IpAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     thread,
     time::Duration,
@@ -24,10 +29,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use vc_client::voice::{
     InputMode, LinkState, VoiceHandle,
-    io::{AudioIo, DeviceIo, DeviceIssue, IssueSink},
+    io::{AudioIo, AudioPorts, DeviceIo, DeviceIssue, IssueSink},
     permission, start_teamspeak, start_with,
 };
 use vc_proto::AUDIO_SLOTS;
@@ -68,6 +73,9 @@ impl Prefs {
 }
 
 struct Inner {
+    owner: u64,
+    startup: Option<Arc<NativeRun>>,
+    mic_test: Option<Arc<NativeRun>>,
     prefs: Prefs,
     handle: Option<VoiceHandle>,
     pending_answer: Option<(u64, oneshot::Sender<Result<String, String>>)>,
@@ -79,7 +87,6 @@ pub struct Voice {
     inner: Mutex<Inner>,
     /// Id of the active `voice_start`; zero after retirement.
     run: AtomicU64,
-    mic_test: Mutex<Option<Arc<AtomicBool>>>,
     /// What the fake speaker heard (only with `VC_FAKE_AUDIO`).
     pub heard: Arc<Heard>,
 }
@@ -88,6 +95,9 @@ impl Default for Voice {
     fn default() -> Self {
         Self {
             inner: Mutex::new(Inner {
+                owner: 0,
+                startup: None,
+                mic_test: None,
                 prefs: Prefs {
                     input: None,
                     output: None,
@@ -104,7 +114,6 @@ impl Default for Voice {
                 ts_sink: None,
             }),
             run: AtomicU64::new(0),
-            mic_test: Mutex::new(None),
             heard: Arc::default(),
         }
     }
@@ -157,34 +166,108 @@ pub struct Snapshot {
     speaker_loud_samples: u64,
 }
 
+/// A startup can outlive its async caller inside `spawn_blocking`. Keep the
+/// device guard here so retirement closes capture even during SDP negotiation;
+/// a blocking open that finishes after retirement drops its ports immediately.
+struct NativeRun {
+    cancelled: watch::Sender<bool>,
+    audio: Mutex<Option<Box<dyn Send>>>,
+}
+
+impl NativeRun {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { cancelled: watch::channel(false).0, audio: Mutex::new(None) })
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if *self.cancelled.borrow() { Err("superseded".into()) } else { Ok(()) }
+    }
+
+    fn retire(&self) {
+        let mut audio = self.audio.lock().unwrap_or_else(|e| e.into_inner());
+        self.cancelled.send_replace(true);
+        *audio = None;
+    }
+
+    async fn until_retired<T>(&self, future: impl Future<Output = Result<T, String>>) -> Result<T, String> {
+        let mut cancelled = self.cancelled.subscribe();
+        self.check()?;
+        tokio::select! {
+            biased;
+            _ = cancelled.changed() => Err("superseded".into()),
+            result = future => {
+                self.check()?;
+                result
+            }
+        }
+    }
+}
+
+struct RunAudioGuard(Arc<NativeRun>);
+impl Drop for RunAudioGuard {
+    fn drop(&mut self) {
+        *self.0.audio.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+struct RunIo {
+    run: Arc<NativeRun>,
+    io: Box<dyn AudioIo>,
+}
+impl AudioIo for RunIo {
+    fn open(self: Box<Self>) -> anyhow::Result<AudioPorts> {
+        self.run.check().map_err(anyhow::Error::msg)?;
+        let mut ports = self.io.open()?;
+        let mut audio = self.run.audio.lock().unwrap_or_else(|e| e.into_inner());
+        self.run.check().map_err(anyhow::Error::msg)?;
+        *audio = Some(std::mem::replace(&mut ports._guard, Box::new(RunAudioGuard(self.run.clone()))));
+        Ok(ports)
+    }
+}
+
+/// DNS is injected so the retirement boundary can be tested without networking.
+async fn start_resolved<T, F: Future<Output = Result<T, String>>>(
+    startup: &NativeRun,
+    dns: impl Future<Output = Result<IpAddr, String>>,
+    start: impl FnOnce(IpAddr) -> F,
+) -> Result<T, String> {
+    let ip = dns.await?;
+    startup.check()?;
+    start(ip).await
+}
+
 // --------------------------------------------------------------------- events
 
 #[derive(Clone, Serialize)]
 struct OfferPayload {
+    owner: u64,
     run: u64,
     sdp: String,
 }
 
 #[derive(Clone, Serialize)]
 struct StatePayload {
+    owner: u64,
     run: u64,
     state: &'static str,
 }
 
 #[derive(Clone, Serialize)]
 struct LevelPayload {
+    owner: u64,
     db: f32,
     transmitting: bool,
 }
 
 #[derive(Clone, Serialize)]
 struct IssuePayload {
+    owner: u64,
     side: &'static str,
     kind: &'static str,
     message: String,
 }
 
-fn issue_sink(app: &AppHandle) -> IssueSink {
+fn issue_sink(app: &AppHandle, owner: u64) -> IssueSink {
     let app = app.clone();
     Arc::new(move |issue| {
         let denied = matches!(issue, DeviceIssue::InputDenied(_));
@@ -200,7 +283,7 @@ fn issue_sink(app: &AppHandle) -> IssueSink {
             "failed"
         };
         tracing::warn!("audio {side} problem: {message}");
-        let _ = app.emit("voice://issue", IssuePayload { side, kind, message });
+        let _ = app.emit("voice://issue", IssuePayload { owner, side, kind, message });
     })
 }
 
@@ -258,26 +341,13 @@ async fn resolve(host: &str) -> Result<IpAddr, String> {
 
 // -------------------------------------------------------------------- commands
 
-// Claim/retire under the same lock as pending answers and the media handle.
-// Concurrent IPC must never let an old stop clear a newer run.
-fn claim_run(voice: &Voice, run: u64) -> Result<(), String> {
-    let mut inner = voice.lock();
-    if run <= voice.run.load(Ordering::SeqCst) || run <= inner.cancelled_through {
-        return Err("superseded".into());
-    }
-    voice.run.store(run, Ordering::SeqCst);
-    inner.handle = None;
-    inner.pending_answer = None;
-    inner.ts_sink = None;
-    Ok(())
+fn check_owner(inner: &Inner, owner: u64) -> Result<(), String> {
+    if owner == 0 || inner.owner != owner { Err("superseded owner".into()) } else { Ok(()) }
 }
-fn retire_run(voice: &Voice, run: u64) {
-    let mut inner = voice.lock();
-    // IPC handlers can be scheduled out of order: remember cancellation even
-    // when the matching start has not claimed its run yet.
-    inner.cancelled_through = inner.cancelled_through.max(run);
-    if voice.run.load(Ordering::SeqCst) > run {
-        return;
+
+fn clear_run(voice: &Voice, inner: &mut Inner) {
+    if let Some(startup) = inner.startup.take() {
+        startup.retire();
     }
     voice.run.store(0, Ordering::SeqCst);
     inner.handle = None;
@@ -285,12 +355,60 @@ fn retire_run(voice: &Voice, run: u64) {
     inner.ts_sink = None;
 }
 
+fn bootstrap_owner(voice: &Voice) -> u64 {
+    let mut inner = voice.lock();
+    clear_run(voice, &mut inner);
+    if let Some(test) = inner.mic_test.take() {
+        test.retire();
+    }
+    inner.owner += 1;
+    inner.cancelled_through = 0;
+    // A held key belongs to the old view; never carry it into a new owner.
+    inner.prefs.ptt = false;
+    inner.owner
+}
+
+/// The engine calls this exactly once on construction, before other commands.
+/// Owner generations are native-issued and independent of timestamp-seeded runs.
+#[tauri::command]
+pub fn voice_bootstrap(voice: State<'_, Voice>) -> u64 {
+    bootstrap_owner(&voice)
+}
+
+// Claim/retire under the same lock as ownership, answers and the media handle.
+fn claim_run(voice: &Voice, owner: u64, run: u64) -> Result<Arc<NativeRun>, String> {
+    let mut inner = voice.lock();
+    check_owner(&inner, owner)?;
+    if run <= voice.run.load(Ordering::SeqCst) || run <= inner.cancelled_through {
+        return Err("superseded".into());
+    }
+    inner.cancelled_through = inner.cancelled_through.max(voice.run.load(Ordering::SeqCst));
+    clear_run(voice, &mut inner);
+    let startup = NativeRun::new();
+    inner.startup = Some(startup.clone());
+    voice.run.store(run, Ordering::SeqCst);
+    Ok(startup)
+}
+fn retire_run(voice: &Voice, owner: u64, run: u64) -> Result<(), String> {
+    let mut inner = voice.lock();
+    check_owner(&inner, owner)?;
+    // IPC handlers can be scheduled out of order: remember cancellation even
+    // when the matching start has not claimed its run yet.
+    inner.cancelled_through = inner.cancelled_through.max(run);
+    if voice.run.load(Ordering::SeqCst) <= run {
+        clear_run(voice, &mut inner);
+    }
+    Ok(())
+}
+
 fn link_teamspeak(
     voice: &Voice,
+    owner: u64,
     run: u64,
     link: impl FnOnce() -> Option<(VoiceLink, VoiceSinkLease)>,
 ) -> Result<Option<VoiceLink>, String> {
     let mut inner = voice.lock();
+    check_owner(&inner, owner)?;
     if voice.run.load(Ordering::SeqCst) != run {
         return Err("superseded".into());
     }
@@ -332,6 +450,7 @@ impl StartBinding {
 pub async fn voice_start(
     app: AppHandle,
     voice: State<'_, Voice>,
+    owner: u64,
     run: u64,
     server_host: String,
     mode: String,
@@ -343,50 +462,65 @@ pub async fn voice_start(
     if run == 0 || run > vc_proto::MAX_SAFE_INTEGER as u64 || !binding.valid(app.state::<Ts>().has_voice_connection()) {
         return Err("invalid voice binding".into());
     }
-    claim_run(&voice, run)?;
+    let startup = claim_run(&voice, owner, run)?;
     let (input, output) = {
         let inner = voice.lock();
         (inner.prefs.input.clone(), inner.prefs.output.clone())
     };
-    let io = make_io(&voice, input, output, issue_sink(&app));
+    let io: Box<dyn AudioIo> =
+        Box::new(RunIo { run: startup.clone(), io: make_io(&voice, input, output, issue_sink(&app, owner)) });
 
-    let handle = if let Some(link) = link_teamspeak(&voice, run, || app.state::<Ts>().voice_link(run))? {
-        // TeamSpeak server: frames travel over the TS connection, no SDP exchange.
-        tracing::info!("voice_start run={run} (TeamSpeak)");
-        start_teamspeak(io, link.audio_in, link.audio_out).await.map_err(|e| format!("{e:#}"))?
-    } else {
-        let ip = resolve(&server_host).await?;
-        tracing::info!("voice_start run={run} host={server_host} ip={ip}");
-        start_vc(&app, io, ip, run).await?
-    };
+    let handle = startup
+        .until_retired(async {
+            if let Some(link) = link_teamspeak(&voice, owner, run, || app.state::<Ts>().voice_link(run))? {
+                tracing::info!("voice_start run={run} (TeamSpeak)");
+                startup.check()?;
+                start_teamspeak(io, link.audio_in, link.audio_out).await.map_err(|e| format!("{e:#}"))
+            } else {
+                start_resolved(&startup, resolve(&server_host), |ip| {
+                    tracing::info!("voice_start run={run} host={server_host} ip={ip}");
+                    start_vc(&app, io, ip, owner, run)
+                })
+                .await
+            }
+        })
+        .await?;
 
     {
         let mut inner = voice.lock();
+        check_owner(&inner, owner)?;
         if voice.run.load(Ordering::SeqCst) != run {
             return Err("superseded".into()); // `handle` drops here
         }
         inner.prefs.apply(&handle);
         inner.handle = Some(handle);
     }
-    tauri::async_runtime::spawn(monitor(app, run));
+    tauri::async_runtime::spawn(monitor(app, owner, run));
     Ok(())
 }
 
 /// Negotiates WebRTC with a vc server through the UI's WebSocket.
-async fn start_vc(app: &AppHandle, io: Box<dyn AudioIo>, ip: IpAddr, run: u64) -> Result<VoiceHandle, String> {
+async fn start_vc(
+    app: &AppHandle,
+    io: Box<dyn AudioIo>,
+    ip: IpAddr,
+    owner: u64,
+    run: u64,
+) -> Result<VoiceHandle, String> {
     let signal_app = app.clone();
     start_with(io, ip, move |sdp| async move {
         let (tx, rx) = oneshot::channel();
         {
             let voice = signal_app.state::<Voice>();
             let mut inner = voice.lock();
+            check_owner(&inner, owner).map_err(anyhow::Error::msg)?;
             if voice.run.load(Ordering::SeqCst) != run {
                 anyhow::bail!("superseded");
             }
             inner.pending_answer = Some((run, tx));
         }
         tracing::info!("offer ready ({} bytes), asking the UI to send voice.offer", sdp.len());
-        signal_app.emit("voice://offer", OfferPayload { run, sdp }).map_err(|e| anyhow::anyhow!("emit: {e}"))?;
+        signal_app.emit("voice://offer", OfferPayload { owner, run, sdp }).map_err(|e| anyhow::anyhow!("emit: {e}"))?;
         match tokio::time::timeout(ANSWER_TIMEOUT, rx).await {
             Err(_) => anyhow::bail!("timed out waiting for the server's answer"),
             Ok(Err(_)) => anyhow::bail!("negotiation cancelled"),
@@ -403,8 +537,19 @@ async fn start_vc(app: &AppHandle, io: Box<dyn AudioIo>, ip: IpAddr, run: u64) -
 
 /// Delivers the server's answer (or a failure) for the offer of `run`.
 #[tauri::command]
-pub fn voice_answer(voice: State<'_, Voice>, run: u64, sdp: Option<String>, error: Option<String>) {
+pub fn voice_answer(
+    voice: State<'_, Voice>,
+    owner: u64,
+    run: u64,
+    sdp: Option<String>,
+    error: Option<String>,
+) -> Result<(), String> {
+    answer_run(&voice, owner, run, sdp, error)
+}
+
+fn answer_run(voice: &Voice, owner: u64, run: u64, sdp: Option<String>, error: Option<String>) -> Result<(), String> {
     let mut inner = voice.lock();
+    check_owner(&inner, owner)?;
     if let Some((r, tx)) = inner.pending_answer.take() {
         if r == run {
             let _ = tx.send(match (sdp, error) {
@@ -415,15 +560,16 @@ pub fn voice_answer(voice: State<'_, Voice>, run: u64, sdp: Option<String>, erro
             inner.pending_answer = Some((r, tx));
         }
     }
+    Ok(())
 }
 
 #[tauri::command]
-pub fn voice_stop(voice: State<'_, Voice>, run: u64) {
-    retire_run(&voice, run);
+pub fn voice_stop(voice: State<'_, Voice>, owner: u64, run: u64) -> Result<(), String> {
+    retire_run(&voice, owner, run)
 }
 
 /// Polls the engine at ~20 Hz: meter level and link state changes.
-async fn monitor(app: AppHandle, run: u64) {
+async fn monitor(app: AppHandle, owner: u64, run: u64) {
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     let mut last_link = None;
     let mut ticks = 0u32;
@@ -437,6 +583,9 @@ async fn monitor(app: AppHandle, run: u64) {
         }
         let (db, transmitting, stats) = {
             let inner = voice.lock();
+            if check_owner(&inner, owner).is_err() {
+                return;
+            }
             let Some(h) = &inner.handle else { return };
             (h.input_level_db(), h.transmitting(), h.stats())
         };
@@ -449,7 +598,7 @@ async fn monitor(app: AppHandle, run: u64) {
                 LinkState::Lost => Some("failed"),
             };
             if let Some(state) = state {
-                let _ = app.emit("voice://state", StatePayload { run, state });
+                let _ = app.emit("voice://state", StatePayload { owner, run, state });
             }
             if stats.link == LinkState::Lost {
                 return;
@@ -457,7 +606,7 @@ async fn monitor(app: AppHandle, run: u64) {
         }
         let visible = app.get_webview_window("main").is_some_and(|w| w.is_visible().unwrap_or(true));
         if visible {
-            let _ = app.emit("voice://level", LevelPayload { db, transmitting });
+            let _ = app.emit("voice://level", LevelPayload { owner, db, transmitting });
         }
         if log_stats && ticks.is_multiple_of(20) {
             let s = voice.snapshot();
@@ -478,26 +627,36 @@ async fn monitor(app: AppHandle, run: u64) {
 // ------------------------------------------------------------------- controls
 
 #[tauri::command]
-pub fn voice_set_muted(voice: State<'_, Voice>, muted: bool) {
+pub fn voice_set_muted(voice: State<'_, Voice>, owner: u64, muted: bool) -> Result<(), String> {
     let mut inner = voice.lock();
+    check_owner(&inner, owner)?;
     inner.prefs.muted = muted;
     if let Some(h) = &inner.handle {
         h.set_muted(muted);
     }
+    Ok(())
 }
 
 #[tauri::command]
-pub fn voice_set_deafened(voice: State<'_, Voice>, deafened: bool) {
+pub fn voice_set_deafened(voice: State<'_, Voice>, owner: u64, deafened: bool) -> Result<(), String> {
     let mut inner = voice.lock();
+    check_owner(&inner, owner)?;
     inner.prefs.deafened = deafened;
     if let Some(h) = &inner.handle {
         h.set_deafened(deafened);
     }
+    Ok(())
 }
 
 #[tauri::command]
-pub fn voice_set_ptt(voice: State<'_, Voice>, active: bool) {
-    voice.set_ptt(active);
+pub fn voice_set_ptt(voice: State<'_, Voice>, owner: u64, active: bool) -> Result<(), String> {
+    let mut inner = voice.lock();
+    check_owner(&inner, owner)?;
+    inner.prefs.ptt = active;
+    if let Some(h) = &inner.handle {
+        h.set_ptt(active);
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -508,8 +667,14 @@ pub enum Mode {
 }
 
 #[tauri::command]
-pub fn voice_set_input_mode(voice: State<'_, Voice>, mode: Mode, threshold_db: Option<f32>) {
+pub fn voice_set_input_mode(
+    voice: State<'_, Voice>,
+    owner: u64,
+    mode: Mode,
+    threshold_db: Option<f32>,
+) -> Result<(), String> {
     let mut inner = voice.lock();
+    check_owner(&inner, owner)?;
     inner.prefs.mode = match mode {
         Mode::Vad => InputMode::VoiceActivity { threshold_db: threshold_db.unwrap_or(DEFAULT_THRESHOLD_DB) },
         Mode::Ptt => InputMode::PushToTalk,
@@ -517,35 +682,47 @@ pub fn voice_set_input_mode(voice: State<'_, Voice>, mode: Mode, threshold_db: O
     if let Some(h) = &inner.handle {
         h.set_input_mode(inner.prefs.mode);
     }
+    Ok(())
 }
 
 #[tauri::command]
-pub fn voice_set_master_gain(voice: State<'_, Voice>, gain: f32) {
+pub fn voice_set_master_gain(voice: State<'_, Voice>, owner: u64, gain: f32) -> Result<(), String> {
     let mut inner = voice.lock();
+    check_owner(&inner, owner)?;
     inner.prefs.master = gain.clamp(0.0, 2.0);
     if let Some(h) = &inner.handle {
         h.set_master_gain(inner.prefs.master);
     }
+    Ok(())
 }
 
 #[tauri::command]
-pub fn voice_set_slot_gain(voice: State<'_, Voice>, slot: usize, gain: f32) {
+pub fn voice_set_slot_gain(voice: State<'_, Voice>, owner: u64, slot: usize, gain: f32) -> Result<(), String> {
     let mut inner = voice.lock();
+    check_owner(&inner, owner)?;
     if let Some(g) = inner.prefs.slot_gain.get_mut(slot) {
         *g = gain.clamp(0.0, 2.0);
     }
     if let Some(h) = &inner.handle {
         h.set_slot_gain(slot, gain);
     }
+    Ok(())
 }
 
 /// Chooses devices by name (`null` = system default). Takes effect the next
 /// time voice starts; the UI restarts voice when it changes while connected.
 #[tauri::command]
-pub fn voice_set_devices(voice: State<'_, Voice>, input: Option<String>, output: Option<String>) {
+pub fn voice_set_devices(
+    voice: State<'_, Voice>,
+    owner: u64,
+    input: Option<String>,
+    output: Option<String>,
+) -> Result<(), String> {
     let mut inner = voice.lock();
+    check_owner(&inner, owner)?;
     inner.prefs.input = input;
     inner.prefs.output = output;
+    Ok(())
 }
 
 // -------------------------------------------------------------------- devices
@@ -574,35 +751,51 @@ pub async fn audio_devices() -> Result<Devices, String> {
 
 #[derive(Clone, Serialize)]
 struct TestLevel {
+    owner: u64,
     db: f32,
 }
 
 /// Opens the microphone on its own and reports `voice://test-level` until
 /// `mic_test_stop`. Independent of the voice session.
 #[tauri::command]
-pub async fn mic_test_start(app: AppHandle, voice: State<'_, Voice>, input: Option<String>) -> Result<(), String> {
-    mic_test_stop(voice.clone());
-    let sink = issue_sink(&app);
-    let io = make_io(&voice, input, None, sink.clone());
-    let ports = tokio::task::spawn_blocking(move || io.open())
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| format!("{e:#}"))?;
-    let stop = Arc::new(AtomicBool::new(false));
-    *voice.mic_test.lock().unwrap_or_else(|e| e.into_inner()) = Some(stop.clone());
+pub async fn mic_test_start(
+    app: AppHandle,
+    voice: State<'_, Voice>,
+    owner: u64,
+    input: Option<String>,
+) -> Result<(), String> {
+    let test = {
+        let mut inner = voice.lock();
+        check_owner(&inner, owner)?;
+        if let Some(test) = inner.mic_test.take() {
+            test.retire();
+        }
+        let test = NativeRun::new();
+        inner.mic_test = Some(test.clone());
+        test
+    };
+    let io = Box::new(RunIo { run: test.clone(), io: make_io(&voice, input, None, issue_sink(&app, owner)) });
+    let ports = test
+        .until_retired(async {
+            tokio::task::spawn_blocking(move || io.open())
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("{e:#}"))
+        })
+        .await?;
     thread::Builder::new()
         .name("vc-mic-test".into())
         .spawn(move || {
-            let vc_client::voice::io::AudioPorts { mut mic, speaker: _speaker, _guard, .. } = ports;
+            let AudioPorts { mut mic, speaker: _speaker, _guard, .. } = ports;
             let mut acc = (0f32, 0usize);
-            while !stop.load(Ordering::Relaxed) {
+            while test.check().is_ok() {
                 while let Ok(s) = mic.pop() {
                     acc.0 += s.value * s.value;
                     acc.1 += 1;
                 }
                 if acc.1 > 0 {
                     let rms = (acc.0 / acc.1 as f32).sqrt();
-                    let _ = app.emit("voice://test-level", TestLevel { db: 20.0 * rms.max(1e-5).log10() });
+                    let _ = app.emit("voice://test-level", TestLevel { owner, db: 20.0 * rms.max(1e-5).log10() });
                     acc = (0.0, 0);
                 }
                 thread::sleep(Duration::from_millis(50));
@@ -613,10 +806,13 @@ pub async fn mic_test_start(app: AppHandle, voice: State<'_, Voice>, input: Opti
 }
 
 #[tauri::command]
-pub fn mic_test_stop(voice: State<'_, Voice>) {
-    if let Some(stop) = voice.mic_test.lock().unwrap_or_else(|e| e.into_inner()).take() {
-        stop.store(true, Ordering::Relaxed);
+pub fn mic_test_stop(voice: State<'_, Voice>, owner: u64) -> Result<(), String> {
+    let mut inner = voice.lock();
+    check_owner(&inner, owner)?;
+    if let Some(test) = inner.mic_test.take() {
+        test.retire();
     }
+    Ok(())
 }
 
 // ------------------------------------------------------------ privacy settings
@@ -638,22 +834,211 @@ pub fn open_mic_privacy_settings() -> Result<(), String> {
 #[cfg(test)]
 mod run_tests {
     use super::*;
+    use std::{
+        sync::atomic::{AtomicBool, AtomicUsize},
+        task::Poll,
+    };
+
+    struct Closed(Arc<AtomicBool>);
+    impl Drop for Closed {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct TrackedIo {
+        opened: Arc<AtomicUsize>,
+        closed: Arc<AtomicBool>,
+        gate: Option<(oneshot::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    }
+    impl AudioIo for TrackedIo {
+        fn open(self: Box<Self>) -> anyhow::Result<AudioPorts> {
+            self.opened.fetch_add(1, Ordering::SeqCst);
+            if let Some((entered, release)) = self.gate {
+                let _ = entered.send(());
+                release.recv_timeout(Duration::from_secs(2))?;
+            }
+            let mut ports = Box::new(NullIo).open()?;
+            ports._guard = Box::new(Closed(self.closed));
+            Ok(ports)
+        }
+    }
+
+    fn tracked(run: &Arc<NativeRun>) -> (Box<RunIo>, Arc<AtomicUsize>, Arc<AtomicBool>) {
+        let opened = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicBool::new(false));
+        let io = Box::new(RunIo {
+            run: run.clone(),
+            io: Box::new(TrackedIo { opened: opened.clone(), closed: closed.clone(), gate: None }),
+        });
+        (io, opened, closed)
+    }
+
+    #[tokio::test]
+    async fn retirement_cancels_deferred_dns_without_opening_media() {
+        let voice = Voice::default();
+        let owner = bootstrap_owner(&voice);
+        let startup = claim_run(&voice, owner, 10).unwrap();
+        let (dns, resolved) = oneshot::channel();
+        let (io, opened, _) = tracked(&startup);
+        let future = startup.until_retired(start_resolved(
+            &startup,
+            async { resolved.await.map_err(|e| e.to_string()) },
+            |_| async {
+                io.open().map_err(|e| e.to_string())?;
+                Ok(())
+            },
+        ));
+        tokio::pin!(future);
+        assert!(std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await.is_pending());
+        retire_run(&voice, owner, 10).unwrap();
+        assert_eq!(tokio::time::timeout(Duration::from_secs(1), future).await.unwrap(), Err("superseded".into()));
+        assert!(dns.is_closed(), "retirement must drop the pending DNS future");
+        assert_eq!(opened.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dns_completion_rechecks_ownership_before_starting_media() {
+        let voice = Voice::default();
+        let owner = bootstrap_owner(&voice);
+        let startup = claim_run(&voice, owner, 10).unwrap();
+        let started = AtomicBool::new(false);
+        let result = start_resolved(
+            &startup,
+            async {
+                retire_run(&voice, owner, 10).unwrap();
+                Ok("127.0.0.1".parse().unwrap())
+            },
+            |_| async {
+                started.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .await;
+        assert_eq!(result, Err("superseded".into()));
+        assert!(!started.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn queued_device_open_is_rejected_after_retirement() {
+        let startup = NativeRun::new();
+        let (io, opened, _) = tracked(&startup);
+        startup.retire();
+        assert!(io.open().is_err());
+        assert_eq!(opened.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn blocking_device_open_finishing_after_retirement_closes_capture() {
+        let voice = Voice::default();
+        let owner = bootstrap_owner(&voice);
+        let startup = claim_run(&voice, owner, 10).unwrap();
+        let opened = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicBool::new(false));
+        let (entered, opening) = oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let io = Box::new(RunIo {
+            run: startup,
+            io: Box::new(TrackedIo { opened: opened.clone(), closed: closed.clone(), gate: Some((entered, wait)) }),
+        });
+        let opening_task = tokio::task::spawn_blocking(move || io.open());
+        opening.await.unwrap();
+        retire_run(&voice, owner, 10).unwrap();
+        release.send(()).unwrap();
+        assert!(opening_task.await.unwrap().is_err());
+        assert_eq!(opened.load(Ordering::SeqCst), 1);
+        assert!(closed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn retirement_closes_capture_while_negotiation_still_holds_ports() {
+        let voice = Voice::default();
+        let owner = bootstrap_owner(&voice);
+        let startup = claim_run(&voice, owner, 10).unwrap();
+        let (io, _, closed) = tracked(&startup);
+        let ports = io.open().unwrap();
+        assert!(!closed.load(Ordering::SeqCst));
+        retire_run(&voice, owner, 10).unwrap();
+        assert!(closed.load(Ordering::SeqCst));
+        drop(ports);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_retires_previous_views_audio_and_teamspeak_transmit() {
+        let voice = Voice::default();
+        let old_owner = bootstrap_owner(&voice);
+        // Deliberately use a timestamp-sized run; the next view starts at zero.
+        let old_run = 1_800_000_000_000_123;
+        let startup = claim_run(&voice, old_owner, old_run).unwrap();
+        let (io, _, closed) = tracked(&startup);
+        let sink = Arc::new(crate::ts::VoiceSink::default());
+        let (audio_out, mut outgoing) = tokio::sync::mpsc::channel(1);
+        let link = link_teamspeak(&voice, old_owner, old_run, || Some(sink.link(old_run, audio_out))).unwrap().unwrap();
+        let handle = start_teamspeak(io, link.audio_in, link.audio_out).await.unwrap();
+        let (tx, mut answer) = oneshot::channel();
+        {
+            let mut inner = voice.lock();
+            inner.handle = Some(handle);
+            inner.pending_answer = Some((old_run, tx));
+            inner.prefs.ptt = true;
+        }
+        assert!(voice.snapshot().running);
+        let owner = bootstrap_owner(&voice);
+        assert!(closed.load(Ordering::SeqCst));
+        assert!(startup.check().is_err());
+        assert!(!voice.snapshot().running);
+        assert_eq!(voice.run.load(Ordering::SeqCst), 0);
+        assert!(voice.lock().ts_sink.is_none());
+        assert_eq!(tokio::time::timeout(Duration::from_secs(1), outgoing.recv()).await.unwrap(), None);
+        assert!(!voice.lock().prefs.ptt);
+        assert!(matches!(answer.try_recv(), Err(oneshot::error::TryRecvError::Closed)));
+        retire_run(&voice, owner, 0).unwrap();
+        // Owner generation is independent of wall-clock ordering and run values.
+        claim_run(&voice, owner, 1).unwrap();
+        let (tx, mut answer) = oneshot::channel();
+        voice.lock().pending_answer = Some((1, tx));
+        assert!(claim_run(&voice, old_owner, old_run + 1).is_err());
+        assert!(retire_run(&voice, old_owner, u64::MAX).is_err());
+        assert!(answer_run(&voice, old_owner, 1, Some("stale".into()), None).is_err());
+        assert!(link_teamspeak(&voice, old_owner, 1, || panic!("stale link")).is_err());
+        assert_eq!(voice.run.load(Ordering::SeqCst), 1);
+        assert!(matches!(answer.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+        answer_run(&voice, owner, 1, Some("current".into()), None).unwrap();
+        assert_eq!(answer.try_recv().unwrap(), Ok("current".into()));
+    }
+
+    #[test]
+    fn bootstrap_also_retires_pending_microphone_tests() {
+        let voice = Voice::default();
+        bootstrap_owner(&voice);
+        let test = NativeRun::new();
+        voice.lock().mic_test = Some(test.clone());
+        let (io, _, closed) = tracked(&test);
+        let ports = io.open().unwrap();
+        bootstrap_owner(&voice);
+        assert!(test.check().is_err());
+        assert!(closed.load(Ordering::SeqCst));
+        assert!(voice.lock().mic_test.is_none());
+        drop(ports);
+    }
+
     #[test]
     fn stop_before_start_cancels_delayed_runs_and_retires_older_media() {
         let voice = Voice::default();
-        retire_run(&voice, 10);
-        assert!(claim_run(&voice, 10).is_err());
-        claim_run(&voice, 11).unwrap();
+        let owner = bootstrap_owner(&voice);
+        retire_run(&voice, owner, 10).unwrap();
+        assert!(claim_run(&voice, owner, 10).is_err());
+        claim_run(&voice, owner, 11).unwrap();
         let (tx, mut rx) = oneshot::channel();
         voice.lock().pending_answer = Some((11, tx));
-        retire_run(&voice, 12);
-        assert!(claim_run(&voice, 12).is_err());
+        retire_run(&voice, owner, 12).unwrap();
+        assert!(claim_run(&voice, owner, 12).is_err());
         assert_eq!(voice.run.load(Ordering::SeqCst), 0);
         assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Closed)));
-        claim_run(&voice, 13).unwrap();
+        claim_run(&voice, owner, 13).unwrap();
         let (tx, mut rx) = oneshot::channel();
         voice.lock().pending_answer = Some((13, tx));
-        retire_run(&voice, 12);
+        retire_run(&voice, owner, 12).unwrap();
         assert_eq!(voice.run.load(Ordering::SeqCst), 13);
         assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
     }
@@ -661,35 +1046,38 @@ mod run_tests {
     #[test]
     fn obsolete_start_cannot_replace_the_current_teamspeak_sink() {
         let voice = Voice::default();
+        let owner = bootstrap_owner(&voice);
         let sink = Arc::new(crate::ts::VoiceSink::default());
         let (audio_out, _audio_rx) = tokio::sync::mpsc::channel(1);
-        claim_run(&voice, 10).unwrap();
+        claim_run(&voice, owner, 10).unwrap();
         // A pauses before linking; B claims and installs its sink first.
-        claim_run(&voice, 12).unwrap();
-        let mut current = link_teamspeak(&voice, 12, || Some(sink.link(12, audio_out.clone()))).unwrap().unwrap();
-        assert!(link_teamspeak(&voice, 10, || Some(sink.link(10, audio_out))).is_err());
+        claim_run(&voice, owner, 12).unwrap();
+        let mut current =
+            link_teamspeak(&voice, owner, 12, || Some(sink.link(12, audio_out.clone()))).unwrap().unwrap();
+        assert!(link_teamspeak(&voice, owner, 10, || Some(sink.link(10, audio_out))).is_err());
         assert!(matches!(current.audio_in.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
         // Stopping A preserves B's receiver; stopping B releases its sink.
-        retire_run(&voice, 10);
+        retire_run(&voice, owner, 10).unwrap();
         assert!(matches!(current.audio_in.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
-        retire_run(&voice, 12);
+        retire_run(&voice, owner, 12).unwrap();
         assert!(matches!(current.audio_in.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)));
     }
 
     #[test]
     fn old_stop_and_start_preserve_the_current_pending_answer() {
         let voice = Voice::default();
-        claim_run(&voice, 10).unwrap();
-        claim_run(&voice, 12).unwrap();
+        let owner = bootstrap_owner(&voice);
+        claim_run(&voice, owner, 10).unwrap();
+        claim_run(&voice, owner, 12).unwrap();
         let (tx, mut rx) = oneshot::channel();
         voice.lock().pending_answer = Some((12, tx));
-        retire_run(&voice, 10);
-        assert!(claim_run(&voice, 11).is_err());
+        retire_run(&voice, owner, 10).unwrap();
+        assert!(claim_run(&voice, owner, 11).is_err());
         assert_eq!(voice.run.load(Ordering::SeqCst), 12);
         assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
-        retire_run(&voice, 12);
+        retire_run(&voice, owner, 12).unwrap();
         assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Closed)));
-        assert!(claim_run(&voice, 12).is_err());
-        claim_run(&voice, 14).unwrap();
+        assert!(claim_run(&voice, owner, 12).is_err());
+        claim_run(&voice, owner, 14).unwrap();
     }
 }

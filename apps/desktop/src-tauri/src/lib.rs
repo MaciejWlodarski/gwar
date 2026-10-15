@@ -69,6 +69,7 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            voice::voice_bootstrap,
             voice::voice_start,
             voice::voice_answer,
             voice::voice_stop,
