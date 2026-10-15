@@ -27,7 +27,7 @@ settle(server: &str, id: &[u8; 32], winner: Option<&[u8; 32]>) -> Result<bool>
 welcome(server: &str, id: &str, bytes: &[u8]) -> Result<WelcomeResult>
 replace_stale_welcome(server: &str, group: &[u8; 32], id: &str,
                       bytes: &[u8]) -> Result<WelcomeResult>
-join_external(server: &str, bytes: &[u8], now: i64,
+join_external(server: &str, bytes: &[u8], tree: Option<&[u8]>, now: i64,
               revocations: &dyn Revocations) -> Result<Outbox>
 commit(server: &str, id: &[u8; 32], adds: &[Vec<u8>], removes: &[u32],
        now: i64, revocations: &dyn Revocations) -> Result<Outbox>
@@ -53,7 +53,7 @@ gate(server: &str, id: &[u8; 32], now: i64,
      revocations: &dyn Revocations) -> Result<Gate>
 sending_key(server: &str, id: &[u8; 32], now: i64,
             revocations: &dyn Revocations) -> Result<(u64, [u8; 32])>
-behind(server: &str, id: &[u8; 32], group_info: &[u8]) -> Result<bool>
+behind(server: &str, id: &[u8; 32], group_info: &[u8], tree: Option<&[u8]>) -> Result<bool>
 ```
 
 `create` returns a TLS MLS GroupInfo message in persisted `Creating` state.
@@ -306,7 +306,8 @@ DM UI or chat.sealed server calls. Remote CI and production were not run.
 
 With Rust 1.99.0, Node **22.23.3**, wasm-bindgen 0.2.129 and Binaryen 123.0.0,
 the artifact totals **476,253 bytes gzip**: wasm 473,205, minified loader 2,856,
-inline JavaScript 192; 3,747 bytes below the 480,000-byte limit.
+inline JavaScript 192; 3,747 bytes below the limit of that time (480,000
+bytes; 500,000 since large groups).
 On this macOS host the wasm build uses the rustup toolchain's `bin` ahead of
 Homebrew Rust and a local rust-lld wrapper setting `DYLD_LIBRARY_PATH` to that
 toolchain's `lib` directory. CI uses the pinned Linux job.

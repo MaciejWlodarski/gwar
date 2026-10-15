@@ -345,7 +345,7 @@ credential, the OpenMLS provider and Gwar's own per-group records.
 ### Web app storage and concurrency
 
 - MLS runs in the page's main thread, in the wasm module loaded on first use
-  (gzip budget 480 KB, checked in CI).
+  (gzip budget 500 KB, checked in CI).
 - Only one tab per device runs MLS: the Web Locks API lock
   `gwar-mls:{device_key}` is taken before connecting. Before releasing it
   (connection replaced or closed) the tab finishes the operation in progress,
@@ -766,7 +766,9 @@ history assignments, leaf updates, deleted channels); the web client reads and
 writes encrypted channels (create options, sealed chat, gap lines, mention
 scan and accounting, moderator removal, "Who can read"); restarts are built,
 for direct messages and channels; encrypted attachments are built (4b), in
-channels and direct messages. Built as three pull requests, in this order: **4a**
+channels and direct messages; large groups are built (4c, first part: channel
+GroupInfos without the tree, the tree endpoint, joining with it). Built as
+three pull requests, in this order: **4a**
 channels (options, groups, sealed channel messages, unread counts and
 mentions, TeamSpeak text isolation, restarts); **4b** encrypted attachments,
 in channels and direct messages; **4c** encrypted server-wide chat and large
@@ -1135,10 +1137,15 @@ limit (about 300 devices):
   over HTTP: `GET /api/mls/{group}/tree`, with the session's file access
   token as `Authorization: Bearer …`, answered with the TLS-encoded ratchet
   tree the observer holds and `x-gwar-epoch`; 404 if the session may not
-  read the conversation. The client builds the external commit with that
+  read the conversation; 429 past 30 requests a minute from one session (the
+  server exports each group's tree once per epoch). The client reads at most
+  8 MiB within 30 s and builds the external commit with that
   tree, whose hash OpenMLS checks against the GroupInfo; if the epoch
   changed meanwhile, it fetches both again.
-- Direct messages keep the tree in GroupInfos and Welcomes.
+- Direct messages keep the tree in GroupInfos and Welcomes; agents ignore
+  separately supplied trees for them. Channel/server devices join externally;
+  key-package Adds and Welcomes are refused. The tree endpoint also serves
+  direct messages to their authorized readers, with `Cache-Control: no-store`.
 - Commits stay small (a path, not the tree), so the WebSocket limits of
   section 2 stay as they are.
 

@@ -13,5 +13,5 @@ for (const file of files) {
   console.log(`${file}: ${bytes.length} bytes, ${gzip} bytes gzip`);
   total += gzip;
 }
-console.log(`Total gzip: ${total} / 480000 bytes`);
-if (total > 480_000) process.exitCode = 1;
+console.log(`Total gzip: ${total} / 500000 bytes`);
+if (total > 500_000) process.exitCode = 1;

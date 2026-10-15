@@ -180,6 +180,11 @@ impl Observer {
         self.group.group_context().epoch().as_u64()
     }
 
+    /// The current epoch and its TLS-encoded public ratchet tree.
+    pub fn tree(&self) -> Result<(u64, Vec<u8>), DsError> {
+        Ok((self.epoch(), self.group.export_ratchet_tree().tls_serialize_detached().map_err(invalid("tree encoding"))?))
+    }
+
     pub fn descriptor(&self) -> &SignedDescriptor {
         &self.descriptor
     }
@@ -287,6 +292,9 @@ impl Observer {
         self.check_tree()?;
 
         self.check_group_info(group_info)?;
+        if welcome.is_some() && self.descriptor.descriptor.kind.separate_tree() {
+            return Err(Invalid("channel and server groups take no Welcome"));
+        }
 
         let welcome_recipients = match welcome {
             None if welcome_for.is_empty() => Vec::new(),
@@ -314,17 +322,24 @@ impl Observer {
     }
 
     /// The GroupInfo a committer uploads for the new epoch must describe exactly
-    /// the merged state: GroupContext, confirmation tag and tree, signed by a
-    /// member. Leaf lifetimes are not checked again (docs/e2e-build.md, "Lifetimes").
+    /// the merged state: GroupContext, confirmation tag and, in direct messages,
+    /// the tree (channel and server groups leave it out), signed by a member.
+    /// Leaf lifetimes are not checked again (docs/e2e-build.md, "Lifetimes").
     fn check_group_info(&self, bytes: &[u8]) -> Result<(), DsError> {
         let info = group_info_in(bytes)?;
         let mismatch = Invalid("group info does not match the commit");
         let extensions = info.extensions();
-        let tree = extensions.ratchet_tree().ok_or(Invalid("no ratchet tree"))?.ratchet_tree();
-        if extensions.external_pub().is_none()
-            || extensions.iter().count() != 2
-            || tree.tls_serialize_detached().ok() != self.group.export_ratchet_tree().tls_serialize_detached().ok()
-        {
+        let tree = extensions.ratchet_tree();
+        match tree {
+            None if self.descriptor.descriptor.kind.separate_tree() => {}
+            None => return Err(Invalid("no ratchet tree")),
+            Some(_) if self.descriptor.descriptor.kind.separate_tree() => return Err(mismatch),
+            Some(tree)
+                if tree.ratchet_tree().tls_serialize_detached().ok()
+                    == self.group.export_ratchet_tree().tls_serialize_detached().ok() => {}
+            _ => return Err(mismatch),
+        }
+        if extensions.external_pub().is_none() || extensions.iter().count() != 1 + usize::from(tree.is_some()) {
             return Err(mismatch);
         }
         // GroupInfoTBS = group_context ‖ extensions ‖ confirmation_tag ‖ signer (u32).

@@ -120,15 +120,19 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
     wanted: [] as { group: string; device: string; assignment?: string }[], nothingToShare: false,
     commitError: null as RequestError | null, requestError: null as RequestError | null, shareError: false, ackError: false,
     beforeLog: null as null | (() => Promise<void>),
+    /** Epochs the tree endpoint answers with, in order; then the log head. */
+    treeEpochs: [] as number[],
+    /** Replaces the tree endpoint's answer. */
+    treeResponse: null as null | ((signal: AbortSignal) => Promise<Response>),
     packages: 5, devices: [] as { uid: string; device_key: string; hpke_key: string; created_at: number; signature: string }[],
   };
   let welcomeHandler = (_welcome: { channels: unknown[] }) => {};
   let eventHandler = (_event: Event) => {};
   let statusHandler = (_status: ConnectionStatus) => {};
   const link = {
-    status: { state: "idle" }, isOnline: false, serverKey: server,
+    status: { state: "idle" }, isOnline: false, serverKey: server, endpoint: "ws://gwar.test/ws",
     onStatus: (fn: (status: ConnectionStatus) => void) => { statusHandler = fn; return () => {}; }, onEvent: (fn: (event: Event) => void) => { eventHandler = fn; return () => {}; }, onWelcome: (fn: (welcome: { channels: unknown[] }) => void) => { welcomeHandler = fn; return () => {}; },
-    connect: async () => { link.status.state = "online"; link.isOnline = true; welcomeHandler({ channels: options.channels ?? [] }); return {} as never; },
+    connect: async () => { link.status.state = "online"; link.isOnline = true; welcomeHandler({ channels: options.channels ?? [], file_access: "access" } as never); return {} as never; },
     close: () => { link.isOnline = false; },
     request: async (op: string, data: Record<string, unknown>) => {
       calls.push({ op, data });
@@ -161,7 +165,12 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
   };
   const identity = { publicKey: device, device: undefined, sign: async () => b64(1, 64) } as unknown as Identity;
   const locks = { request: async (_name: string, _options: unknown, fn: () => Promise<void>) => fn() } as unknown as LockManager;
-  const connectOptions = { identity, seed: new Uint8Array(32), link: link as unknown as Link, revocations: () => world.revocations, locks, storage: async () => storage, factory, now: options.now, onError: (error: unknown) => errors.push(error) };
+  const fetchTree = async (url: string | URL | Request, init?: RequestInit) => {
+    calls.push({ op: "tree", data: { url: String(url), authorization: (init?.headers as Record<string, string>).Authorization } });
+    if (world.treeResponse) return world.treeResponse(init!.signal!);
+    return new Response(new Uint8Array([3, 3]), { headers: { "x-gwar-epoch": String(world.treeEpochs.shift() ?? world.head) } });
+  };
+  const connectOptions = { identity, seed: new Uint8Array(32), link: link as unknown as Link, revocations: () => world.revocations, locks, storage: async () => storage, factory, now: options.now, onError: (error: unknown) => errors.push(error), fetch: fetchTree as typeof fetch };
   const runtime = await MlsRuntime.connect(connectOptions);
   runtimes.push(runtime);
   // Initialization has completed, so changes below model subsequent reconnects/events.
@@ -514,6 +523,15 @@ describe("Restarts", () => {
     await f.runtime.sync().catch(() => {});
     expect(f.operations.some(o => o.op === "create")).toBe(true);
   });
+  it("rejoins a direct message from its GroupInfo alone", async () => {
+    await asParticipant();
+    const f = await fixture({ ...clean(), groups: [summary("rejoin", "5")] });
+    f.state().groups = [summary("rejoin", "5")]; f.state().out = null; await f.persist(); f.world.head = 5;
+    await f.runtime.sync().catch(() => {});
+    expect(f.calls.some(c => c.op === "tree")).toBe(false);
+    expect(f.operations.find(o => o.op === "behind")?.tree).toBeNull();
+    expect(f.operations.find(o => o.op === "join_external")?.tree).toBeNull();
+  });
   it("counts a GroupInfo behind the checkpoint when rejoining", async () => {
     await asParticipant();
     let now = 1_000_000;
@@ -633,6 +651,75 @@ describe("Channel groups", () => {
     expect(f.calls.filter(c => c.op === "mls.history.request")).toEqual([{ op: "mls.history.request", data: { group } }]);
     await f.runtime.sync();
     expect(f.calls.filter(c => c.op === "mls.history.request")).toHaveLength(1);
+  });
+  it("joins with the ratchet tree of the GroupInfo's epoch, fetched over HTTP", async () => {
+    asChannel();
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
+    const f = await fixture(clean(), true, { channels: [channel()] });
+    f.world.groups = [{ conversation, group, incarnation: 0, epoch: 0, pending: false }];
+    f.world.head = 4; f.world.treeEpochs = [3];
+    await f.runtime.sync(); random.mockRestore();
+    // The first tree was of an older epoch: both are asked for again.
+    expect(f.calls.filter(c => c.op === "mls.group_info")).toHaveLength(2);
+    expect(f.calls.filter(c => c.op === "tree").map(c => c.data)).toEqual(Array(2).fill({ url: `http://gwar.test/api/mls/${group}/tree`, authorization: "Bearer access" }));
+    expect(f.operations.find(o => o.op === "join_external")?.tree).toEqual([3, 3]);
+  });
+  it("stops reading a tree past the size limit", async () => {
+    asChannel();
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
+    const f = await fixture(clean(), true, { channels: [channel()] });
+    f.world.groups = [{ conversation, group, incarnation: 0, epoch: 0, pending: false }];
+    let sent = 0, cancelled = false;
+    // No content length: the body streams 1 MiB chunks without end.
+    f.world.treeResponse = async () => new Response(new ReadableStream({
+      pull: controller => { sent++; controller.enqueue(new Uint8Array(1024 * 1024)); },
+      cancel: () => { cancelled = true; },
+    }), { headers: { "x-gwar-epoch": "0" } });
+    await f.runtime.sync(); random.mockRestore();
+    expect(String(f.errors.at(-1))).toContain("MLS tree too large");
+    expect(cancelled).toBe(true);
+    expect(sent).toBeLessThanOrEqual(10);
+    expect(f.operations.some(o => o.op === "join_external")).toBe(false);
+  });
+  it.each([
+    ["a failed status", { status: 503, headers: { "x-gwar-epoch": "0" } }, "(503)"],
+    ["no epoch", { headers: {} }, "MLS tree epoch"],
+  ])("ends a refused tree response with %s without reading it", async (_, init, message) => {
+    asChannel();
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
+    const f = await fixture(clean(), true, { channels: [channel()] });
+    f.world.groups = [{ conversation, group, incarnation: 0, epoch: 0, pending: false }];
+    const signals: AbortSignal[] = [];
+    f.world.treeResponse = async signal => { signals.push(signal); return new Response(new ReadableStream({ pull: () => new Promise(() => {}) }), init); };
+    await f.runtime.sync(); random.mockRestore();
+    expect(String(f.errors.at(-1))).toContain(message);
+    expect(signals.length).toBeGreaterThan(0);
+    expect(signals.every(signal => signal.aborted)).toBe(true);
+    expect(f.operations.some(o => o.op === "join_external")).toBe(false);
+  });
+  it("ends a stalled tree download when the connection drops", async () => {
+    asChannel();
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
+    const f = await fixture(clean(), true, { channels: [channel()] });
+    f.world.groups = [{ conversation, group, incarnation: 0, epoch: 0, pending: false }];
+    let started!: () => void;
+    const fetching = new Promise<void>(resolve => { started = resolve; });
+    f.world.treeResponse = signal => new Promise((_, reject) => { started(); signal.addEventListener("abort", () => reject(signal.reason)); });
+    const pass = f.runtime.sync();
+    await fetching; random.mockRestore();
+    f.reconnect();
+    await pass.catch(() => {});
+    expect(f.operations.some(o => o.op === "join_external")).toBe(false);
+  });
+  it("gives up a join while the group keeps changing", async () => {
+    asChannel();
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
+    const f = await fixture(clean(), true, { channels: [channel()] });
+    f.world.groups = [{ conversation, group, incarnation: 0, epoch: 0, pending: false }];
+    f.world.head = 4; f.world.treeEpochs = [1, 2, 3];
+    await f.runtime.sync(); random.mockRestore();
+    expect(String(f.errors.at(-1))).toContain("changed while joining");
+    expect(f.operations.some(o => o.op === "join_external")).toBe(false);
   });
   it("keeps the history request intent durably until a request succeeds", async () => {
     asChannel();

@@ -16,9 +16,30 @@ use vc_proto::{
     MlsResponse, Response, SessionId,
 };
 
-use super::{Core, Reply, err, now_ms, storage_error};
+use super::{Core, CoreHandle, CoreMsg, Reply, err, now_ms, storage_error};
 use crate::store::mls::{GroupRow, ProposalRow, ShareHistory};
 use vc_proto::ChannelId;
+
+/// Why a ratchet tree is not served.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TreeRefusal {
+    /// No such group, or the session may not read it (answered alike).
+    NotFound,
+    TooManyRequests,
+}
+
+/// Tree requests a session may make per minute; joining takes one to three.
+const TREE_REQUESTS_PER_MINUTE: u32 = 30;
+/// Exported trees kept; the cache is emptied when it would grow past this.
+const CACHED_TREES: usize = 64;
+
+impl CoreHandle {
+    pub async fn mls_tree(&self, group: String, access: String) -> Result<(u64, axum::body::Bytes), TreeRefusal> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.tx.send(CoreMsg::MlsTree { group, access, reply }).await.map_err(|_| TreeRefusal::NotFound)?;
+        rx.await.unwrap_or(Err(TreeRefusal::NotFound))
+    }
+}
 
 const BLOB_BYTES: usize = 128 * 1024;
 const LIST_BYTES: usize = 640 * 1024 - 4096;
@@ -145,6 +166,41 @@ impl Core {
             .filter(|s| s.out.is_some() && self.mls_can_read(&s.uid, conversation).unwrap_or(false))
             .map(|s| s.id)
             .collect()
+    }
+
+    /// The current ratchet tree of a group the session may read, exported once
+    /// per epoch; requests are limited per session.
+    pub(super) fn mls_tree(&mut self, group: &str, access: &str) -> Result<(u64, axum::body::Bytes), TreeRefusal> {
+        if access.is_empty() {
+            return Err(TreeRefusal::NotFound);
+        }
+        let session = self
+            .sessions
+            .values()
+            .find(|s| s.out.is_some() && s.file_access == access)
+            .ok_or(TreeRefusal::NotFound)?
+            .id;
+        let now = now_ms();
+        let (start, count) = self.mls_tree_requests.entry(session).or_insert((now, 0));
+        if now - *start >= 60_000 {
+            (*start, *count) = (now, 0);
+        }
+        *count += 1;
+        if *count > TREE_REQUESTS_PER_MINUTE {
+            return Err(TreeRefusal::TooManyRequests);
+        }
+        let row = self.mls_group_for(session, group).map_err(|_| TreeRefusal::NotFound)?;
+        if let Some((epoch, tree)) = self.mls_trees.get(group).filter(|(epoch, _)| *epoch == row.epoch) {
+            return Ok((*epoch, tree.clone()));
+        }
+        let (epoch, tree) =
+            self.mls_observer(&row).and_then(|o| o.tree().map_err(ds_error)).map_err(|_| TreeRefusal::NotFound)?;
+        let tree = axum::body::Bytes::from(tree);
+        if self.mls_trees.len() >= CACHED_TREES && !self.mls_trees.contains_key(group) {
+            self.mls_trees.clear();
+        }
+        self.mls_trees.insert(group.to_owned(), (epoch, tree.clone()));
+        Ok((epoch, tree))
     }
 
     fn mls_group_for(&self, session: SessionId, group: &str) -> Result<GroupRow, ErrorBody> {

@@ -12,6 +12,7 @@ pub mod files;
 mod history;
 mod messages;
 mod mls;
+pub use mls::TreeRefusal;
 mod moderation;
 mod passwords;
 mod sealed;
@@ -125,6 +126,11 @@ pub enum CoreMsg {
     DeviceAuthorized(String, String, oneshot::Sender<bool>),
     Bridge(BridgeMsg),
     Files(files::FileMsg),
+    MlsTree {
+        group: String,
+        access: String,
+        reply: oneshot::Sender<Result<(u64, axum::body::Bytes), mls::TreeRefusal>>,
+    },
     /// Devices revoked on Gwar Connect, and the feed position after them.
     Revoked(Vec<RevokedDevice>, i64),
     /// Periodic housekeeping (expired uploads).
@@ -270,6 +276,10 @@ pub struct Core {
     server_key: String,
     server_signer: Arc<ed25519_dalek::SigningKey>,
     mls_commit_clock: i64,
+    /// Exported ratchet trees by group, with their epoch: one export per epoch.
+    mls_trees: HashMap<String, (u64, axum::body::Bytes)>,
+    /// Tree requests per session in the current minute (start, count).
+    mls_tree_requests: HashMap<SessionId, (i64, u32)>,
     connections: u64,
     history: history::HistoryRouting,
 }
@@ -459,6 +469,8 @@ impl Core {
             server_key: config.server_key,
             server_signer: config.server_signer,
             mls_commit_clock,
+            mls_trees: HashMap::new(),
+            mls_tree_requests: HashMap::new(),
             connections: 0,
             history: Default::default(),
         };
@@ -514,6 +526,9 @@ impl Core {
                 self.applying_remote = false;
             }
             CoreMsg::Files(msg) => self.file_msg(msg),
+            CoreMsg::MlsTree { group, access, reply } => {
+                let _ = reply.send(self.mls_tree(&group, &access));
+            }
             CoreMsg::Tick => self.tick(),
             CoreMsg::Revoked(devices, seq) => self.revoked(devices, seq),
             CoreMsg::Resume(resume) => resume(self),
@@ -928,6 +943,7 @@ impl Core {
 
     fn remove(&mut self, session: SessionId, reason: LeaveReason) {
         let Some(s) = self.sessions.remove(&session) else { return };
+        self.mls_tree_requests.remove(&session);
         info!(session, uid = %s.uid, ?reason, "client left");
         if let Some(out) = &s.out {
             let _ = out.try_send(Outbound::Close(reason.clone()));

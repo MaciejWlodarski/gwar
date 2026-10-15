@@ -21,11 +21,11 @@ abort-on-panic and stripped symbols, followed by Binaryen `-Oz --converge`
 (repeat optimization passes while binary size decreases). OpenMLS's
 `js` feature and getrandom 0.2's `js` feature are enabled. Production wasm
 logging is disabled. CI builds this exact target, runs the smoke test, and
-fails if all emitted wasm and JavaScript files exceed **480,000 bytes gzip**
-(level 9, each file compressed separately). Load the module on first use and cache it. Including chat encryption and
-runtime inventory, the build measured with Rust 1.99.0 and Node 22.23.3 is
-**467,108 bytes gzip** (wasm 464,065; minified loader 2,852; inline JavaScript
-191), leaving 12,892 bytes of headroom. Generated files in `pkg` are
+fails if all emitted wasm and JavaScript files exceed **500,000 bytes gzip**
+(level 9, each file compressed separately). Load the module on first use and cache it. With large groups (joining
+with a separately fetched ratchet tree), CI's build measures **480,434 bytes
+gzip** (wasm 477,391; minified loader 2,852; inline JavaScript 191), leaving
+19,566 bytes of headroom. Generated files in `pkg` are
 ignored; Cargo metadata resolves the artifact directory, including custom
 `CARGO_TARGET_DIR` values, and a missing artifact fails the build. The loader
 is minified with the existing locked frontend Vite/Rolldown dependency; no

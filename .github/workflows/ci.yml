@@ -134,7 +134,7 @@ jobs:
           npm install --prefix .build-tools --no-audit --no-fund binaryen@123.0.0
       - name: Build artifact path regression
         run: node scripts/mls-wasm/test-build.mjs
-      - name: Production wasm and 480 KB gzip budget
+      - name: Production wasm and 500 KB gzip budget
         env:
           WASM_OPT: .build-tools/node_modules/.bin/wasm-opt
         run: scripts/mls-wasm/build.sh

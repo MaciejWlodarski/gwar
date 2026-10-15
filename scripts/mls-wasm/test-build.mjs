@@ -47,11 +47,11 @@ exit 23
   const inline = join(pkg, 'snippets/inline.js');
   const size = () => spawnSync(process.execPath, [resolve('scripts/mls-wasm/size.mjs'), pkg], { encoding: 'utf8' });
   // Incompressible bytes exercise the new headroom and aggregate nested JS.
-  const payload = randomBytes(470_000);
+  const payload = randomBytes(490_000);
   await writeFile(wasm, payload);
   result = size();
   assert.equal(result.status, 0, result.stdout + result.stderr);
-  assert.ok(result.stdout.includes(`Total gzip: ${gzipSync(payload, { level: 9 }).length} / 480000 bytes`));
+  assert.ok(result.stdout.includes(`Total gzip: ${gzipSync(payload, { level: 9 }).length} / 500000 bytes`));
   await writeFile(inline, randomBytes(20_000));
   result = size();
   assert.equal(result.status, 1, result.stdout + result.stderr);
@@ -59,7 +59,7 @@ exit 23
   result = size();
   assert.notEqual(result.status, 0);
   assert.ok(result.stderr.includes('No wasm artifact'), result.stderr);
-  console.log('Size checks passed: 470 KB accepted; aggregate wasm + nested JS over 480 KB rejected; missing wasm rejected.');
+  console.log('Size checks passed: 490 KB accepted; aggregate wasm + nested JS over 500 KB rejected; missing wasm rejected.');
 } finally {
   await rm(root, { recursive: true, force: true });
 }

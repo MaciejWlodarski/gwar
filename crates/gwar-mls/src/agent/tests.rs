@@ -73,7 +73,7 @@ fn acknowledge(a: &mut Agent, id: &[u8; 32], out: &Outbox) {
 }
 fn joined() -> Fixture {
     let mut f = fixture();
-    let out = f.b.join_external(&server(), &f.info, f.t, &()).unwrap();
+    let out = f.b.join_external(&server(), &f.info, None, f.t, &()).unwrap();
     f.b.take_changes();
     f.observer = accept(f.observer, &out, f.t);
     acknowledge(&mut f.b, &f.id, &out);
@@ -85,7 +85,7 @@ fn joined() -> Fixture {
 #[test]
 fn external_join_waits_for_acceptance_and_exports_matching_keys() {
     let mut f = fixture();
-    let out = f.b.join_external(&server(), &f.info, f.t, &()).unwrap();
+    let out = f.b.join_external(&server(), &f.info, None, f.t, &()).unwrap();
     assert_eq!(f.b.group(&server(), &f.id).unwrap().status, Status::Joining);
     assert!(f.b.epoch(&server(), &f.id, 1).is_none());
     f.b.take_changes();
@@ -184,7 +184,7 @@ fn losing_expired_or_pruned_external_join_is_deleted() {
         // Cases 3..6 replace an existing membership via drop_mls first.
         let mut f = if case < 3 { fixture() } else { joined() };
         let epochs = f.b.durable.epochs.clone();
-        let out = f.b.join_external(&server(), &f.info, f.t, &()).unwrap();
+        let out = f.b.join_external(&server(), &f.info, None, f.t, &()).unwrap();
         f.b.take_changes();
         let winner = f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
         f.a.take_changes();
@@ -198,7 +198,7 @@ fn losing_expired_or_pruned_external_join_is_deleted() {
         assert!(f.b.mls(&group_key(&server(), &f.id)).is_err());
         assert_eq!(f.b.durable.epochs, epochs);
         assert!(f.b.durable.openmls.is_empty());
-        f.b.join_external(&server(), &winner.group_info, f.t, &()).unwrap();
+        f.b.join_external(&server(), &winner.group_info, None, f.t, &()).unwrap();
     }
 }
 struct Revoked(String, i64);
@@ -236,7 +236,7 @@ fn revocation_blocks_sending_but_not_acceptance_and_removal_restores_it() {
     assert_eq!(f.b.group(&server(), &f.id).unwrap().checkpoint, checkpoint);
     assert!(f.b.epoch(&server(), &f.id, 3).is_none());
     assert!(f.a.gate(&server(), &f.id, f.t, &revoked).unwrap().can_send());
-    let rejoin = f.b.join_external(&server(), &out.group_info, f.t, &()).unwrap();
+    let rejoin = f.b.join_external(&server(), &out.group_info, None, f.t, &()).unwrap();
     f.b.take_changes();
     f.observer = accept(f.observer, &rejoin, f.t);
     acknowledge(&mut f.b, &f.id, &rejoin);
@@ -253,7 +253,7 @@ fn own_server_proposal_requires_rejoin() {
     assert_eq!(f.b.commit(&server(), &f.id, &[], &[], f.t, &()), Err(AgentError::Rejoin));
     assert!(f.b.take_changes().is_empty());
     let mut b = Agent::load([21; 32], f.b.credential.clone(), f.b.durable.clone()).unwrap();
-    let out = b.join_external(&server(), &f.info, f.t, &()).unwrap();
+    let out = b.join_external(&server(), &f.info, None, f.t, &()).unwrap();
     b.take_changes();
     f.observer = accept(f.observer, &out, f.t);
     acknowledge(&mut b, &f.id, &out);
@@ -301,10 +301,10 @@ fn freshness_rejects_rollback_and_same_epoch_fork() {
     let mut fork = Agent::load([11; 32], f.a.credential.clone(), snapshot).unwrap();
     let y = fork.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
     let durable = f.a.durable.clone();
-    assert_eq!(f.a.join_external(&server(), &y.group_info, f.t, &()), Err(Invalid("freshness")));
+    assert_eq!(f.a.join_external(&server(), &y.group_info, None, f.t, &()), Err(Invalid("freshness")));
     assert!(f.a.take_changes().is_empty());
     let mut a = Agent::load([11; 32], f.a.credential.clone(), durable).unwrap();
-    assert_eq!(a.join_external(&server(), &original, f.t, &()), Err(Invalid("freshness")));
+    assert_eq!(a.join_external(&server(), &original, None, f.t, &()), Err(Invalid("freshness")));
 }
 #[test]
 fn history_import_conflicts_are_order_independent_and_derived_wins() {
@@ -436,7 +436,7 @@ fn history_off_shares_only_derived_epochs_with_recipient_evidence() {
     let observer = Observer::create(&info, &server()).unwrap();
     assert!(a.settle(&server(), &id, Some(&id)).unwrap());
     a.take_changes();
-    let join = b.join_external(&server(), &info, t, &()).unwrap();
+    let join = b.join_external(&server(), &info, None, t, &()).unwrap();
     b.take_changes();
     let observer = accept(observer, &join, t);
     acknowledge(&mut b, &id, &join);
@@ -614,7 +614,7 @@ fn pin_rejects_a_second_group_for_the_same_incarnation() {
     d.descriptor.creation_nonce = b64(&[9; 16]);
     let d = SignedDescriptor::sign(d.descriptor, a.credential.clone(), &a.signer.0);
     let info = a.create(d).unwrap();
-    assert_eq!(f.b.join_external(&server(), &info, f.t, &()), Err(Invalid("group pin")));
+    assert_eq!(f.b.join_external(&server(), &info, None, f.t, &()), Err(Invalid("group pin")));
 }
 #[test]
 fn creation_change_set_restores_the_device_hpke_key() {
@@ -677,8 +677,8 @@ fn external_join_and_welcome_skip_expired_leaf_lifetimes() {
     f.b.welcome(&server(), "delayed", out.welcome.as_ref().unwrap()).unwrap();
     f.b.take_changes();
     let mut c = device(1, 12, f.t);
-    c.join_external(&server(), &out.group_info, f.t, &()).unwrap();
-    assert_eq!(f.b.behind(&server(), &f.id, &out.group_info), Ok(false), "observed despite the expired leaf");
+    c.join_external(&server(), &out.group_info, None, f.t, &()).unwrap();
+    assert_eq!(f.b.behind(&server(), &f.id, &out.group_info, None), Ok(false), "observed despite the expired leaf");
 }
 #[test]
 fn renewal_after_key_package_does_not_reject_welcome() {
@@ -699,7 +699,7 @@ fn removing_a_leaf_leaves_no_new_key_and_rejects_its_old_group_info() {
     f.a.take_changes();
     f.b.receive(&server(), &f.id, &out.commit, &[]).unwrap();
     f.b.take_changes();
-    assert_eq!(f.b.join_external(&server(), &old, f.t, &()), Err(Invalid("removed checkpoint")));
+    assert_eq!(f.b.join_external(&server(), &old, None, f.t, &()), Err(Invalid("removed checkpoint")));
 }
 #[test]
 fn pending_flag_blocks_even_before_the_proposals_are_fetched() {
@@ -720,11 +720,11 @@ fn ordinary_member_proposals_cannot_be_stored_for_reference() {
 fn joining_state_and_failed_storage_write_reload_round_trip() {
     let mut f = fixture();
     let before = f.b.durable.clone();
-    let out = f.b.join_external(&server(), &f.info, f.t, &()).unwrap();
+    let out = f.b.join_external(&server(), &f.info, None, f.t, &()).unwrap();
     let changes = f.b.take_changes();
     let mut rolled_back = Agent::load([21; 32], f.b.credential.clone(), before.clone()).unwrap();
     assert!(rolled_back.group(&server(), &f.id).is_none());
-    rolled_back.join_external(&server(), &f.info, f.t, &()).unwrap();
+    rolled_back.join_external(&server(), &f.info, None, f.t, &()).unwrap();
     let mut after = before;
     changes.apply(&mut after);
     let mut recovered = Agent::load([21; 32], f.b.credential.clone(), after).unwrap();
@@ -779,7 +779,7 @@ fn external_replacement_cannot_change_uid() {
     let mut f = joined();
     f.a.credential = certified(&key(2), &key(11), f.t - 1000);
     let (_, bundle) = MlsGroup::external_commit_builder()
-        .with_config(join_config())
+        .with_config(join_config(Kind::Dm))
         .with_aad(ds::commit_aad(f.t))
         .skip_lifetime_validation()
         .build_group(&f.a.provider, info(&f.info).unwrap(), f.a.with_key())
@@ -816,7 +816,7 @@ fn a_losing_creation_is_settled_away_then_joins_the_winner() {
         f.b.create(losing).unwrap();
         f.b.take_changes();
         let saved = f.b.durable.clone();
-        assert_eq!(f.b.join_external(&server(), &f.info, f.t, &()), Err(Invalid("group pin")));
+        assert_eq!(f.b.join_external(&server(), &f.info, None, f.t, &()), Err(Invalid("group pin")));
         f.b = Agent::load([21; 32], f.b.credential.clone(), saved).unwrap();
         assert!(!f.b.settle(&server(), &losing_id, Some(&f.id)).unwrap());
         f.b.take_changes();
@@ -831,7 +831,7 @@ fn a_losing_creation_is_settled_away_then_joins_the_winner() {
             f.b.welcome(&server(), "winner", out.welcome.as_ref().unwrap()).unwrap();
             f.b.take_changes();
         } else {
-            let out = f.b.join_external(&server(), &f.info, f.t, &()).unwrap();
+            let out = f.b.join_external(&server(), &f.info, None, f.t, &()).unwrap();
             f.b.take_changes();
             f.observer = accept(f.observer, &out, f.t);
             acknowledge(&mut f.b, &f.id, &out);
@@ -857,7 +857,7 @@ fn settle_rejects_groups_that_are_not_creating_without_changes() {
             3 => &mut f.b, // Joined by this device, created by another.
             4 => &mut f.a, // Accepted creation at epoch zero without an outbox.
             _ => {
-                f.b.join_external(&server(), &f.info, f.t, &()).unwrap();
+                f.b.join_external(&server(), &f.info, None, f.t, &()).unwrap();
                 f.b.take_changes();
                 &mut f.b // Unaccepted external join.
             }
@@ -941,7 +941,7 @@ fn a_won_restart_is_live_and_supersedes_its_predecessor() {
 #[test]
 fn a_restart_is_joined_only_after_its_chain_is_accepted() {
     let (mut f, first, next, info) = restarted();
-    assert_eq!(f.b.join_external(&server(), &info, f.t, &()), Err(Invalid("restart chain")));
+    assert_eq!(f.b.join_external(&server(), &info, None, f.t, &()), Err(Invalid("restart chain")));
     let mut b = Agent::load([21; 32], f.b.credential.clone(), f.b.durable.clone()).unwrap();
     assert_eq!(
         b.accept_chain(&server(), &first.descriptor.conversation, &[link(&first), link(&next)]),
@@ -951,7 +951,7 @@ fn a_restart_is_joined_only_after_its_chain_is_accepted() {
     assert_eq!(b.group(&server(), &first.group_id()).unwrap().status, Status::Superseded);
     assert_eq!(b.group(&server(), &next.group_id()).unwrap().status, Status::Rejoin);
     assert!(b.epoch(&server(), &first.group_id(), 1).is_some());
-    let out = b.join_external(&server(), &info, f.t, &()).unwrap();
+    let out = b.join_external(&server(), &info, None, f.t, &()).unwrap();
     b.take_changes();
     acknowledge(&mut b, &next.group_id(), &out);
     f.a.receive(&server(), &next.group_id(), &out.commit, &[]).unwrap();
@@ -961,7 +961,7 @@ fn a_restart_is_joined_only_after_its_chain_is_accepted() {
         f.a.sending_key(&server(), &next.group_id(), f.t, &()).unwrap()
     );
     // The predecessor is never live again, and no sibling of the live pin can be made.
-    assert_eq!(b.join_external(&server(), &f.info, f.t, &()), Err(Invalid("superseded")));
+    assert_eq!(b.join_external(&server(), &f.info, None, f.t, &()), Err(Invalid("superseded")));
     let mut b = Agent::load([21; 32], b.credential.clone(), b.durable.clone()).unwrap();
     assert_eq!(b.create(restart(&b, &first, 3)), Err(Invalid("group pin")));
     let mut b = Agent::load([21; 32], b.credential.clone(), b.durable.clone()).unwrap();
@@ -1001,7 +1001,7 @@ fn a_new_device_accepts_a_chain_only_from_incarnation_zero() {
     assert_eq!(c.accept_chain(&server(), &conversation, &[link(&first), link(&next)]), Ok(next.group_id()));
     c.take_changes();
     assert_eq!(c.group(&server(), &first.group_id()).unwrap().status, Status::Superseded);
-    c.join_external(&server(), &info, f.t, &()).unwrap();
+    c.join_external(&server(), &info, None, f.t, &()).unwrap();
 }
 #[test]
 fn chain_links_must_verify() {
@@ -1072,13 +1072,13 @@ fn group_infos_behind_the_checkpoint_or_forking_it_are_observed() {
     let theirs = f.b.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
     f.b.take_changes();
     acknowledge(&mut f.a, &f.id, &ours);
-    assert_eq!(f.a.behind(&server(), &f.id, &f.info), Ok(true), "an earlier epoch");
-    assert_eq!(f.a.behind(&server(), &f.id, &theirs.group_info), Ok(true), "the same epoch, another context");
-    assert_eq!(f.a.behind(&server(), &f.id, &ours.group_info), Ok(false));
-    assert_eq!(f.b.behind(&server(), &f.id, &f.info), Ok(false), "b has not moved past it");
-    assert!(f.a.behind(&server(), &f.id, &ours.commit).is_err());
+    assert_eq!(f.a.behind(&server(), &f.id, &f.info, None), Ok(true), "an earlier epoch");
+    assert_eq!(f.a.behind(&server(), &f.id, &theirs.group_info, None), Ok(true), "the same epoch, another context");
+    assert_eq!(f.a.behind(&server(), &f.id, &ours.group_info, None), Ok(false));
+    assert_eq!(f.b.behind(&server(), &f.id, &f.info, None), Ok(false), "b has not moved past it");
+    assert!(f.a.behind(&server(), &f.id, &ours.commit, None).is_err());
     // An observation counts only for the group it was asked for.
-    assert_eq!(f.a.behind(&server(), &[9; 32], &f.info), Err(Invalid("group info group")));
+    assert_eq!(f.a.behind(&server(), &[9; 32], &f.info, None), Err(Invalid("group info group")));
 }
 #[test]
 fn accepting_a_chain_through_this_devices_own_creation_settles_it() {
@@ -1094,7 +1094,7 @@ fn accepting_a_chain_through_this_devices_own_creation_settles_it() {
     assert_eq!(f.a.group(&server(), &first.group_id()).unwrap().status, Status::Superseded);
     assert_eq!(f.a.group(&server(), &next.group_id()).unwrap().status, Status::Active);
     assert!(f.a.sending_key(&server(), &next.group_id(), f.t, &()).is_ok());
-    assert_eq!(f.a.join_external(&server(), &f.info, f.t, &()), Err(Invalid("superseded")));
+    assert_eq!(f.a.join_external(&server(), &f.info, None, f.t, &()), Err(Invalid("superseded")));
     let mut a = Agent::load([11; 32], f.a.credential.clone(), f.a.durable.clone()).unwrap();
     assert_eq!(a.settle(&server(), &next.group_id(), None), Err(Invalid("not creating")));
 
@@ -1128,7 +1128,7 @@ fn self_update_publishes_loaded_renewal_and_keeps_peer_gate_open_after_old_expir
     let observer = Observer::create(&info, &server()).unwrap();
     assert!(a.settle(&server(), &id, Some(&id)).unwrap());
     a.take_changes();
-    let out = b.join_external(&server(), &info, t, &()).unwrap();
+    let out = b.join_external(&server(), &info, None, t, &()).unwrap();
     b.take_changes();
     let observer = accept(observer, &out, t);
     acknowledge(&mut b, &id, &out);
@@ -1261,7 +1261,7 @@ fn creation_waits_for_persisted_server_acceptance() {
     a = load();
     assert_eq!(a.proposal(&server(), &id, &[]), Err(AgentError::Blocked));
     a = load();
-    assert_eq!(a.join_external(&server(), &info, t, &()), Err(AgentError::Blocked));
+    assert_eq!(a.join_external(&server(), &info, None, t, &()), Err(AgentError::Blocked));
     a = load();
     assert_eq!(a.settle(&server(), &[0; 32], None), Err(Invalid("not creating")));
     assert!(a.take_changes().is_empty());
@@ -1348,7 +1348,7 @@ fn after_a_restart_a_creation_is_settled_with_the_servers_group_list() {
     // Accepted, but the reply was lost and the peer joined meanwhile:
     // `mls.groups` lists this group, so the creation won.
     let observer = Observer::create(&info, &server()).unwrap();
-    let join = b.join_external(&server(), &info, t, &()).unwrap();
+    let join = b.join_external(&server(), &info, None, t, &()).unwrap();
     b.take_changes();
     accept(observer, &join, t);
     acknowledge(&mut b, &id, &join);
@@ -1394,7 +1394,7 @@ fn chat_uses_sending_gate_and_derived_or_imported_epoch_keys() {
     assert_eq!(chat::seal(&f.a, &c, &p, f.t, &()).unwrap_err(), ChatError::Agent(AgentError::Blocked));
     f.a.pending(&server(), &f.id, false).unwrap();
     f.a.take_changes();
-    let out = f.b.join_external(&server(), &f.info, f.t, &()).unwrap();
+    let out = f.b.join_external(&server(), &f.info, None, f.t, &()).unwrap();
     f.b.take_changes();
     f.observer = accept(f.observer, &out, f.t);
     acknowledge(&mut f.b, &f.id, &out);
@@ -1419,7 +1419,7 @@ fn pending_commit_recovery_requires_a_valid_strictly_newer_group_info() {
     for external in [false, true] {
         let mut f = joined();
         let pending = if external {
-            f.a.join_external(&server(), &f.info, f.t, &()).unwrap()
+            f.a.join_external(&server(), &f.info, None, f.t, &()).unwrap()
         } else {
             f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap()
         };
@@ -1427,7 +1427,7 @@ fn pending_commit_recovery_requires_a_valid_strictly_newer_group_info() {
         f.a.take_changes().apply(&mut durable);
         let reload = |stores| Agent::load([11; 32], f.a.credential.clone(), stores).unwrap();
         let mut a = reload(durable.clone());
-        assert!(a.join_external(&server(), &f.info, f.t, &()).is_err());
+        assert!(a.join_external(&server(), &f.info, None, f.t, &()).is_err());
         assert!(a.take_changes().is_empty());
         let mut a = reload(durable.clone());
         assert_eq!(a.outbox(&server(), &f.id).unwrap().hash, pending.hash);
@@ -1437,10 +1437,10 @@ fn pending_commit_recovery_requires_a_valid_strictly_newer_group_info() {
         let mut invalid = winner.group_info.clone();
         let last = invalid.len() - 1;
         invalid[last] ^= 1;
-        assert!(a.join_external(&server(), &invalid, f.t, &()).is_err());
+        assert!(a.join_external(&server(), &invalid, None, f.t, &()).is_err());
         assert!(a.take_changes().is_empty());
         let mut a = reload(durable);
-        let recovery = a.join_external(&server(), &winner.group_info, f.t, &()).unwrap();
+        let recovery = a.join_external(&server(), &winner.group_info, None, f.t, &()).unwrap();
         a.take_changes();
         assert_eq!(recovery.epoch, pending.epoch + 1);
         assert_eq!(a.group(&server(), &f.id).unwrap().status, Status::Joining);
@@ -1535,7 +1535,7 @@ fn evidence_records_epoch_ranges_per_uid_and_limits_history_off_sharing() {
     let mut observer = Observer::create(&info, &server()).unwrap();
     assert!(a.settle(&server(), &id, Some(&id)).unwrap());
     a.take_changes();
-    let join = b.join_external(&server(), &info, t, &()).unwrap();
+    let join = b.join_external(&server(), &info, None, t, &()).unwrap();
     b.take_changes();
     observer = accept(observer, &join, t);
     acknowledge(&mut b, &id, &join);
@@ -1546,7 +1546,7 @@ fn evidence_records_epoch_ranges_per_uid_and_limits_history_off_sharing() {
     a.take_changes();
     observer = accept(observer, &remove, t);
     acknowledge(&mut a, &id, &remove);
-    let rejoin = b.join_external(&server(), &remove.group_info, t, &()).unwrap();
+    let rejoin = b.join_external(&server(), &remove.group_info, Some(&observer.tree().unwrap().1), t, &()).unwrap();
     b.take_changes();
     accept(observer, &rejoin, t);
     acknowledge(&mut b, &id, &rejoin);
@@ -1681,6 +1681,169 @@ fn forgetting_a_group_leaves_nothing_of_it() {
     // Forgetting is idempotent and the device can join again later.
     f.a.forget(&server(), &f.id).unwrap();
     assert!(f.a.take_changes().is_empty());
-    let again = f.a.join_external(&server(), &out.group_info, f.t, &()).unwrap();
+    let again = f.a.join_external(&server(), &out.group_info, None, f.t, &()).unwrap();
     assert_eq!(again.group, f.id);
+}
+
+fn channel_fixture(kind: Kind) -> Fixture {
+    let t = now();
+    let mut a = device(1, 11, t);
+    let b = device(2, 21, t);
+    let mut d = descriptor(&a, &b, t, false, true).descriptor;
+    d.kind = kind;
+    if kind == Kind::Server {
+        d.conversation = "server".into();
+    }
+    let d = SignedDescriptor::sign(d, a.credential.clone(), &a.signer.0);
+    let id = d.group_id();
+    let info = a.create(d).unwrap();
+    a.take_changes();
+    let observer = Observer::create(&info, &server()).unwrap();
+    a.settle(&server(), &id, Some(&id)).unwrap();
+    a.take_changes();
+    Fixture { a, b, observer, id, info, t }
+}
+
+#[test]
+fn separate_tree_join_updates_removal_and_behind() {
+    for kind in [Kind::Channel, Kind::Server] {
+        let mut f = channel_fixture(kind);
+        assert!(info(&f.info).unwrap().extensions().ratchet_tree().is_some());
+        let old_tree = f.observer.tree().unwrap().1;
+        let out = f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+        f.a.take_changes();
+        let parsed = info(&out.group_info).unwrap();
+        assert_eq!(parsed.extensions().iter().count(), 1);
+        assert!(parsed.extensions().external_pub().is_some());
+        let mut forged = out.group_info.clone();
+        *forged.last_mut().unwrap() ^= 1;
+        let observer = Observer::load(&f.observer.save(), &server()).unwrap();
+        assert!(matches!(
+            observer.commit(&out.commit, &forged, None, f.t, f.t),
+            Err(ds::DsError::Invalid("group info signature"))
+        ));
+        let before = f.observer.save();
+        f.observer = accept(f.observer, &out, f.t);
+        acknowledge(&mut f.a, &f.id, &out);
+        // The same epoch's GroupInfo with the tree in it is refused: these groups leave it out.
+        let group = f.a.mls(&group_key(&server(), &f.id)).unwrap();
+        let with_tree = wire(group.export_group_info(f.a.provider.crypto(), &f.a.signer, true).unwrap()).unwrap();
+        assert!(matches!(
+            Observer::load(&before, &server()).unwrap().commit(&out.commit, &with_tree, None, f.t, f.t),
+            Err(ds::DsError::Invalid("group info does not match the commit"))
+        ));
+        let (epoch, tree) = f.observer.tree().unwrap();
+        assert_eq!(epoch, 1);
+        assert_ne!(tree, old_tree);
+        assert_eq!(f.a.behind(&server(), &f.id, &out.group_info, Some(&tree)), Ok(false));
+        assert_eq!(f.a.behind(&server(), &f.id, &f.info, None), Ok(true));
+        assert!(f.a.behind(&server(), &f.id, &out.group_info, Some(&old_tree)).is_err());
+        let other_tree = channel_fixture(kind).observer.tree().unwrap().1;
+        for supplied in [None, Some(old_tree.as_slice()), Some(other_tree.as_slice()), Some(&[0][..])] {
+            let mut b = device(2, 21, f.t);
+            assert!(b.join_external(&server(), &out.group_info, supplied, f.t, &()).is_err());
+        }
+        let mut forged = out.group_info.clone();
+        *forged.last_mut().unwrap() ^= 1;
+        assert!(f.a.behind(&server(), &f.id, &forged, Some(&tree)).is_err());
+        let join = f.b.join_external(&server(), &out.group_info, Some(&tree), f.t, &()).unwrap();
+        f.b.take_changes();
+        assert!(info(&join.group_info).unwrap().extensions().ratchet_tree().is_none());
+        f.observer = accept(f.observer, &join, f.t);
+        acknowledge(&mut f.b, &f.id, &join);
+        f.a.receive(&server(), &f.id, &join.commit, &[]).unwrap();
+        f.a.take_changes();
+        assert_eq!(f.a.behind(&server(), &f.id, &out.group_info, Some(&tree)), Ok(true));
+        let update = f.b.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+        f.b.take_changes();
+        assert!(info(&update.group_info).unwrap().extensions().ratchet_tree().is_none());
+        f.observer = accept(f.observer, &update, f.t);
+        acknowledge(&mut f.b, &f.id, &update);
+        f.a.receive(&server(), &f.id, &update.commit, &[]).unwrap();
+        f.a.take_changes();
+        let remove = f.a.commit(&server(), &f.id, &[], &[1], f.t, &()).unwrap();
+        assert!(info(&remove.group_info).unwrap().extensions().ratchet_tree().is_none());
+        accept(f.observer, &remove, f.t);
+    }
+}
+
+#[test]
+fn dm_requires_embedded_tree_and_ignores_supplied_tree() {
+    let mut f = fixture();
+    let out = f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+    f.a.take_changes();
+    acknowledge(&mut f.a, &f.id, &out);
+    let group = f.a.mls(&group_key(&server(), &f.id)).unwrap();
+    let without = wire(group.export_group_info(f.a.provider.crypto(), &f.a.signer, false).unwrap()).unwrap();
+    let tree = group.export_ratchet_tree().tls_serialize_detached().unwrap();
+    assert!(Observer::create(&without, &server()).is_err());
+    assert_eq!(f.a.behind(&server(), &f.id, &without, Some(&tree)), Err(Invalid("no ratchet tree")));
+    assert!(f.observer.commit(&out.commit, &without, None, f.t, f.t).is_err());
+    assert_eq!(f.a.behind(&server(), &f.id, &out.group_info, Some(&[0])), Ok(false));
+    assert!(f.b.join_external(&server(), &out.group_info, Some(&[0]), f.t, &()).is_ok());
+    let mut b = device(2, 21, f.t);
+    assert_eq!(b.join_external(&server(), &without, Some(&tree), f.t, &()), Err(Invalid("no ratchet tree")));
+}
+
+#[test]
+fn channel_key_package_adds_are_refused_by_agent_and_observer() {
+    let mut f = channel_fixture(Kind::Channel);
+    let package = f.b.key_packages(1, f.t).unwrap().remove(0);
+    assert!(f.a.commit(&server(), &f.id, std::slice::from_ref(&package), &[], f.t, &()).is_err());
+    // A nonconforming client can still construct an Add; shared rules must refuse it.
+    let mut a = Agent::load([11; 32], f.a.credential.clone(), f.a.durable.clone()).unwrap();
+    let mut group = a.mls(&group_key(&server(), &f.id)).unwrap();
+    let package = KeyPackageIn::tls_deserialize_exact(&package)
+        .unwrap()
+        .validate(a.provider.crypto(), ProtocolVersion::Mls10)
+        .unwrap();
+    group.set_configuration(a.provider.storage(), &join_config(Kind::Dm)).unwrap();
+    group.set_aad(ds::commit_aad(f.t));
+    let (commit, welcome, _) = group.add_members(&a.provider, &a.signer, &[package]).unwrap();
+    group.merge_pending_commit(&a.provider).unwrap();
+    // Without the tree, as these groups' GroupInfos are: only the Add itself is wrong.
+    let gi = wire(group.export_group_info(a.provider.crypto(), &a.signer, false).unwrap()).unwrap();
+    let welcome = wire(welcome).unwrap();
+    assert!(matches!(
+        f.observer.commit(&wire(commit).unwrap(), &gi, Some(&welcome), f.t, f.t),
+        Err(ds::DsError::Invalid("channel and server devices join externally"))
+    ));
+    // A Welcome beside a commit that adds nobody is refused too.
+    let mut f2 = channel_fixture(Kind::Channel);
+    let update = f2.a.commit(&server(), &f2.id, &[], &[], f2.t, &()).unwrap();
+    f2.a.take_changes();
+    assert!(matches!(
+        f2.observer.commit(&update.commit, &update.group_info, Some(&welcome), f2.t, f2.t),
+        Err(ds::DsError::Invalid("channel and server groups take no Welcome"))
+    ));
+    f.b.take_changes();
+    assert!(f.b.welcome(&server(), "channel", &welcome).is_err());
+    a.take_changes();
+}
+
+#[test]
+// About seven minutes in debug: each join verifies the growing tree.
+#[ignore = "350-device stress test"]
+fn channel_tree_larger_than_handshake_limit() {
+    let started = std::time::Instant::now();
+    let mut f = channel_fixture(Kind::Channel);
+    for i in 0..350u32 {
+        let seed = hash(&i.to_be_bytes());
+        let credential = certified(&key(2), &SigningKey::from_bytes(&seed), f.t - 86_400_000);
+        let mut joiner = Agent::new(seed, credential, f.t).unwrap();
+        joiner.take_changes();
+        let (epoch, tree) = f.observer.tree().unwrap();
+        assert_eq!(epoch, i as u64);
+        if i == 349 {
+            assert!(tree.len() > MAX_HANDSHAKE_BYTES, "{} bytes", tree.len());
+        }
+        let out = joiner.join_external(&server(), &f.info, Some(&tree), f.t, &()).unwrap();
+        assert!(out.commit.len() < MAX_HANDSHAKE_BYTES);
+        assert!(out.group_info.len() < MAX_HANDSHAKE_BYTES);
+        assert!(out.welcome.is_none());
+        f.observer = accept(f.observer, &out, f.t);
+        f.info = out.group_info;
+    }
+    assert_eq!(f.observer.leaves().len(), 351);
+    eprintln!("350 external joins: {:?}", started.elapsed());
 }

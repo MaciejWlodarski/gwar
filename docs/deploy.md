@@ -5,7 +5,7 @@ How the official services run. A self-hosted server needs none of this:
 
 | Address | What | DNS |
 | --- | --- | --- |
-| `gwar.app` | the web app (static), Gwar Connect under `/connect/` and the project's public Gwar server (`/health`, `/ws`, `/api/files/`, `/files/`) | DNS only |
+| `gwar.app` | the web app (static), Gwar Connect under `/connect/` and the project's public Gwar server (`/health`, `/ws`, `/api/files/`, `/files/`, `/api/mls/`) | DNS only |
 | `www.gwar.app` | redirects to `gwar.app` (nginx, below) | CNAME to `gwar.app` |
 | `voice.gwar.app` | the same Gwar server under its own name; TeamSpeak voice (UDP) and file transfer (TCP 30033) | DNS only: voice is UDP straight to the host |
 | `_ts3._udp.gwar.app` | SRV record to `voice.gwar.app` port 9987, so TeamSpeak clients can type `gwar.app` | — |
@@ -105,6 +105,7 @@ server {
         include snippets/gwar-server-proxy.conf;
     }
     location /files/ { include snippets/gwar-server-proxy.conf; }
+    location /api/mls/ { include snippets/gwar-server-proxy.conf; }
     location /assets/ {
         include snippets/gwar-security-headers.conf;
         add_header Cache-Control "public, max-age=31536000, immutable";
