@@ -1109,9 +1109,9 @@ channels and server chat:
   `admin-token`, which leave it unset): `plaintext`, with or without
   TeamSpeak compatibility, unless that start passes
   `--encrypted-server-chat` (`VC_ENCRYPTED_SERVER_CHAT`), which makes it
-  `encrypted`. The option is read only while the mode is unset; when it
-  disagrees with the stored mode later, the server logs a warning and keeps
-  the stored mode. From then on the stored mode decides:
+  `encrypted`. The option is read only while the mode is unset; given
+  later on a server whose stored mode is `plaintext`, it logs a warning and
+  the mode stays (without the option, an encrypted server stays encrypted). From then on the stored mode decides:
   server chat is bridged only when it is plaintext, plaintext `chat.send` to
   the server is refused when it is encrypted, and sealed requests for
   `server` are refused when it is plaintext.
