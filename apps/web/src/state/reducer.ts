@@ -1,4 +1,4 @@
-import { conversationThread } from "../lib/chat";
+import { conversationThread, sealedThread } from "../lib/chat";
 import { sameMessageIdentity } from "../net/message-signature";
 /**
  * Pure state transitions for one server session. The store applies these;
@@ -41,8 +41,8 @@ export type Action =
   | { type: "sealedStatus"; thread: SealedThreadKey; securing: boolean }
   | { type: "sealed"; thread: SealedThreadKey; item: Extract<ChatItem, { kind: "msg" }>; live: boolean }
   | { type: "sealedHistory"; thread: SealedThreadKey; hasMore: boolean }
-  /** Unread messages of an encrypted channel mentioning me, counted after opening them. */
-  | { type: "sealedMentions"; thread: `ch:${number}`; count: number }
+  /** Unread messages of a public encrypted conversation mentioning me, counted after opening them. */
+  | { type: "sealedMentions"; thread: "server" | `ch:${number}`; count: number }
   | { type: "phase"; phase: Phase }
   | { type: "welcome"; welcome: Welcome; resync: boolean; now: number }
   | { type: "event"; event: Event; now: number; verified?: boolean; authentic?: boolean }
@@ -59,8 +59,8 @@ export type Action =
 
 const emptyThread = (): Thread => ({ items: [], unread: 0, mentions: 0, hasMore: true, loaded: false, lastRead: 0, locked: false });
 
-/** A thread whose messages are sealed: a Gwar direct message or an encrypted channel. */
-export type SealedThreadKey = `dm:${string}` | `ch:${number}`;
+/** A thread whose messages are sealed: a Gwar direct message, encrypted channel or server chat. */
+export type SealedThreadKey = StoredThreadKey;
 
 export function channelThreadKey(channel: number): StoredThreadKey {
   return `ch:${channel}`;
@@ -70,12 +70,13 @@ export function dmKey(uid: string): StoredThreadKey {
   return `dm:${uid}`;
 }
 
-/** Maps the UI tab key to the storage key given which channel I am looking at. */
-/** Late sealed results must not bring back a deleted channel's thread. */
-function deletedChannel(state: SessionState, thread: string): boolean {
-  return thread.startsWith("ch:") && !state.channels[Number(thread.slice(3))];
+/** Late sealed results must not bring back an unavailable conversation. */
+function unavailableSealed(state: SessionState, thread: string): boolean {
+  return thread === "server" ? !sealedThread(thread, "vc", state.channels, state.server?.server_chat)
+    : thread.startsWith("ch:") && !state.channels[Number(thread.slice(3))];
 }
 
+/** Maps the UI tab key to the storage key given which channel I am looking at. */
 export function storedKey(state: SessionState, key: ThreadKey): StoredThreadKey | null {
   if (key === "server") return "server";
   if (key === "channel") {
@@ -362,7 +363,7 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
       return state;
     case "chat.sealed.removed": {
       const key = conversationThread(event.d.conversation, state.me?.uid);
-      if (!key || !state.threads[key]) return state;
+      if (!key || unavailableSealed(state, key) || !state.threads[key]) return state;
       return withThread(state, key, t => ({ ...t,
         unread: Math.max(0, t.unread - t.items.filter(i => i.kind === "msg" && event.d.ids.includes(i.msg.id) && i.msg.id > t.lastRead).length),
         items: t.items.filter(i => i.kind !== "msg" || !event.d.ids.includes(i.msg.id)),
@@ -440,7 +441,7 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
     case "chat.read": {
       if (!("channel" in event.d)) {
         const key = conversationThread(event.d.conversation, state.me?.uid);
-        if (!key || (key.startsWith("ch:") && !state.channels[Number(key.slice(3))])) return state;
+        if (!key || unavailableSealed(state, key)) return state;
         const message = event.d.message;
         return withThread(state, key, t => ({ ...t, lastRead: Math.max(t.lastRead, message),
           unread: t.loaded && message >= latestMessageId(t) ? 0 : Math.max(0, t.unread
@@ -477,23 +478,25 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
 export function reduce(state: SessionState, action: Action): SessionState {
   switch (action.type) {
     case "sealedUnread":
-      if (deletedChannel(state, action.thread)) return state;
+      if (unavailableSealed(state, action.thread)) return state;
       return withThread(state, action.thread, t => ({ ...t, unread: state.focused && isActive(state, action.thread) ? 0 : Math.min(100, action.count
         + t.items.filter(i => i.kind === "msg" && i.msg.id > Math.max(t.lastRead, action.through)).length) }));
     case "sealedStatus":
+      if (unavailableSealed(state, action.thread)) return state;
       if (state.threads[action.thread]?.securing === action.securing) return state;
       return withThread(state, action.thread, t => ({ ...t, securing: action.securing }));
     case "sealedHistory":
-      if (deletedChannel(state, action.thread)) return state;
+      if (unavailableSealed(state, action.thread)) return state;
       return withThread(state, action.thread, t => ({ ...t, loaded: true, hasMore: action.hasMore }));
     case "sealedMentions": {
+      if (unavailableSealed(state, action.thread)) return state;
       const count = state.focused && isActive(state, action.thread) ? 0 : Math.min(100, action.count);
       if (!state.threads[action.thread] || state.threads[action.thread]!.mentions === count) return state;
       return withThread(state, action.thread, t => ({ ...t, mentions: count }));
     }
     case "sealed": {
       const key = action.thread;
-      if (deletedChannel(state, key)) return state;
+      if (unavailableSealed(state, key)) return state;
       const peer = key.startsWith("dm:") ? key.slice(3) : null;
       let item = action.item;
       return withThread(state, key, t => {
@@ -551,18 +554,19 @@ export function reduce(state: SessionState, action: Action): SessionState {
         next = withThread(next, channelThreadKey(u.channel), (t) => ({ ...t, unread: u.count, mentions: 0, lastRead: u.last_read }));
       }
       for (const [key, thread] of Object.entries(next.threads)) {
-        if (key.startsWith("dm:") && !key.startsWith("dm:ts:")) next.threads[key] = { ...thread, loaded: false, unread: 0, securing: true };
+        if (sealedThread(key, "vc", channels, w.server.server_chat)) next.threads[key] = { ...thread, loaded: false, unread: 0, mentions: 0, securing: true };
       }
       for (const u of w.conversations ?? []) {
         const key = conversationThread(u.conversation, w.uid);
-        if (!key || (key.startsWith("ch:") && !channels[Number(key.slice(3))]?.encrypted)) continue;
+        if (!key || !sealedThread(key, "vc", channels, w.server.server_chat)) continue;
         const peer = key.startsWith("dm:") ? key.slice(3) : null;
         next = withThread(next, key, t => ({ ...t, unread: u.count, lastRead: u.last_read, securing: true,
           ...(peer ? { peer: { uid: peer, name: members[peer]?.nickname ?? t.peer?.name ?? peer } } : {}) }));
       }
-      // The channel I am looking at is on screen: nothing there is unread.
-      if (storedKey(next, next.activeThread) === channelThreadKey(view) && next.focused) {
-        next = withThread(next, channelThreadKey(view), (t) => ({ ...t, unread: 0, mentions: 0 }));
+      // The open conversation is on screen: nothing there is unread.
+      const active = storedKey(next, next.activeThread);
+      if (active && next.focused) {
+        next = withThread(next, active, (t) => ({ ...t, unread: 0, mentions: 0 }));
       }
       if (action.resync) {
         next = withThread(next, "server", (t) => pushItem(t, sysItem(action.now, { key: "sys.reconnected" }, "re"), false));

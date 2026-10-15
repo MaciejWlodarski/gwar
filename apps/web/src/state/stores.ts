@@ -7,7 +7,7 @@ import type { CloseReason } from "../net/connection";
 import type { InviteTarget } from "../net/invite";
 import type { DeviceList, VoiceError, VoiceState } from "../voice/engine";
 import type { ServerKind } from "./settings";
-import { initialState, reduce, type Action } from "./reducer";
+import { initialState, reduce, type Action, type SealedThreadKey } from "./reducer";
 import type { SessionState } from "./types";
 
 // ------------------------------------------------------------------ session
@@ -114,7 +114,7 @@ export type DialogState =
   | { kind: "redeem" }
   | { kind: "createToken" }
   | { kind: "serverKey" }
-  | { kind: "readers"; thread: `dm:${string}` | `ch:${number}` }
+  | { kind: "readers"; thread: SealedThreadKey }
   | { kind: "confirm"; title: string; memberTitle?: { uid: string; fallback: string; key: Key }; body: string; confirmLabel: string; danger?: boolean; serverIdentity?: boolean; onConfirm: () => void }
   /** First TeamSpeak connection on a device: offers the official client's identities. Resolves with the chosen ones, or null. */
   | { kind: "tsFirstRun"; found: TsFound[]; resolve: (chosen: TsFound[] | null) => void };

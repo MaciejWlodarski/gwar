@@ -267,6 +267,7 @@ export const en = {
   "chat.emptyChannel": "Say hello to everyone in this channel. Messages here are saved.",
   "chat.emptyChannelNoHistory": "Say hi to everyone in this channel. TeamSpeak servers don't keep message history, so messages are only visible while you are connected.",
   "chat.emptyServer": "Messages here go to everyone on the server and are not saved.",
+  "chat.emptyServerHistory": "Messages here go to everyone on the server and are saved.",
   "chat.emptyDm": "Private messages are only visible to you two and are not saved.",
   "chat.jump": "Jump to latest",
   "chat.compose": "Message",

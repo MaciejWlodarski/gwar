@@ -8,18 +8,21 @@ export function dmPeer(conversation: string, me: string | undefined): string | n
   return parts[1] === me ? parts[2]! : parts[2] === me ? parts[1]! : null;
 }
 export function encryptedDm(key: string, kind: string): boolean { return kind === "vc" && key.startsWith("dm:") && !key.slice(3).startsWith("ts:"); }
-/** A stored thread whose messages are sealed: a Gwar direct message or an encrypted channel. */
-export function sealedThread(key: string | null | undefined, kind: string, channels: Record<number, { encrypted: boolean }>): boolean {
+/** A stored thread whose messages are sealed: a Gwar direct message, encrypted channel or server chat. */
+export function sealedThread(key: string | null | undefined, kind: string, channels: Record<number, { encrypted: boolean }>, serverChat?: { encrypted: boolean }): boolean {
   if (!key || kind !== "vc") return false;
+  if (key === "server") return !!serverChat?.encrypted;
   if (key.startsWith("ch:")) return !!channels[Number(key.slice(3))]?.encrypted;
   return encryptedDm(key, kind);
 }
-/** The sealed conversation of a stored thread (`dm:{peer}` or `ch:{id}`). */
+/** The sealed conversation of a stored thread (`dm:{peer}`, `ch:{id}` or `server`). */
 export function threadConversation(key: string, uid: string): string {
+  if (key === "server") return "server";
   return key.startsWith("ch:") ? `channel:${key.slice(3)}` : `dm:${[uid, key.slice(3)].sort().join(":")}`;
 }
 /** The stored thread of a sealed conversation, or null when it is not one of mine. */
-export function conversationThread(conversation: string, uid: string | undefined): `dm:${string}` | `ch:${number}` | null {
+export function conversationThread(conversation: string, uid: string | undefined): StoredThreadKey | null {
+  if (conversation === "server") return "server";
   const channel = /^channel:(0|[1-9][0-9]{0,9})$/.exec(conversation);
   if (channel) return `ch:${Number(channel[1])}`;
   const peer = dmPeer(conversation, uid);

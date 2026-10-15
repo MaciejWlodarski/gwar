@@ -248,3 +248,13 @@ describe("message view verification cache", () => {
     expect((await cache.verify(f.msg, f.ctx)).authorization).toContain("revocations-stale");
   });
 });
+
+
+it("verifies a sealed server signature only in its bound group and epoch", async () => {
+  const f = await fixture();
+  const ctx = { ...f.ctx, target: "server", sealed: { group: encodeBase64Url(new Uint8Array(32).fill(8)), epoch: 3 } };
+  const msg = { ...f.msg, target: "server" as const, signature: await signMessage(f.identity, ctx, f.msg.author_uid, f.msg.text, [], []) };
+  expect((await verifyMessage(msg, ctx)).status).toBe("verified");
+  expect((await verifyMessage(msg, { ...ctx, sealed: { ...ctx.sealed, epoch: 4 } })).status).toBe("invalid");
+  expect((await verifyMessage(msg, f.ctx)).status).toBe("invalid");
+});

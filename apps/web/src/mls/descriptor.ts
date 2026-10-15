@@ -21,8 +21,9 @@ export function channelOf(conversation: string): number | undefined {
 /** A restart's place in its conversation's chain: the next incarnation and the group it replaces. */
 export interface Successor { incarnation: number; previous: string }
 export async function descriptor(identity: Identity, uid: string, server: string, conversation: string, now: number, history = true, successor?: Successor): Promise<{ bytes: number[]; group: string }> {
-  const kind = conversation.startsWith("dm:") ? "dm" : channelOf(conversation) !== undefined ? "channel" : undefined;
+  const kind = conversation === "server" ? "server" : conversation.startsWith("dm:") ? "dm" : channelOf(conversation) !== undefined ? "channel" : undefined;
   if (kind === "dm" && (!participants(conversation).includes(uid) || !history)) throw new Error("not a participant");
+  if (kind === "server" && !history) throw new Error("server chat requires history");
   if (!kind) throw new Error("unsupported conversation");
   decodeFixed(server, 32);
   if (successor) decodeFixed(successor.previous, 32);

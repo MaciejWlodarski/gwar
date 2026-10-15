@@ -623,3 +623,39 @@ describe("direct message routing", () => {
     expect(mine.threads["dm:u2"]?.items.some((i) => i.key === "m10")).toBe(true);
   });
 });
+
+
+describe("encrypted server chat", () => {
+  const server = { ...welcome().server, server_chat: { encrypted: true, history: true } };
+  const row = { id: 8, conversation: "server", group: "g", epoch: 0, author_uid: "u2", author_name: "n2", message_id: "m8", revision: 0, ciphertext: "x", sent_at: 1008, deleted: false };
+  const item = { kind: "msg" as const, key: "e8", at: 1008, msg: msg(8, { target: "server" }), sealed: row, authentic: true };
+  const connect = (state = initialState, resync = false) => reduce(state, { type: "welcome", now: 1, resync,
+    welcome: welcome({ server, conversations: [{ conversation: "server", count: 3, last_read: 5 }] }) });
+  it("loads conversation read marks and resets sealed scrollback on resync", () => {
+    let s = connect();
+    expect(s.threads.server).toMatchObject({ unread: 3, lastRead: 5, securing: true });
+    s = reduce(s, { type: "sealedHistory", thread: "server", hasMore: false });
+    s = reduce(s, { type: "sealedMentions", thread: "server", count: 2 });
+    s = connect(s, true);
+    expect(s.threads.server).toMatchObject({ loaded: false, hasMore: false, unread: 3, mentions: 0, lastRead: 5, securing: true });
+    const active = connect({ ...s, activeThread: "server" }, true);
+    expect(active.threads.server?.unread).toBe(0);
+  });
+  it("counts a live sealed row once and applies server reads and moderator removal", () => {
+    let s = connect();
+    s = reduce(s, { type: "sealed", thread: "server", item, live: true });
+    s = reduce(s, { type: "sealed", thread: "server", item, live: true });
+    expect(s.threads.server?.unread).toBe(4);
+    s = ev(s, { ev: "chat.read", d: { conversation: "server", message: 7 } });
+    expect(s.threads.server?.lastRead).toBe(7);
+    s = ev(s, { ev: "chat.sealed.removed", d: { conversation: "server", ids: [8] } });
+    expect(s.threads.server?.items.some(i => i.key === "e8")).toBe(false);
+    expect(s.threads.server?.unread).toBe(3);
+  });
+  it("ignores sealed server state while server chat is plaintext", () => {
+    const s = online();
+    expect(reduce(s, { type: "sealed", thread: "server", item, live: true })).toBe(s);
+    expect(reduce(s, { type: "sealedHistory", thread: "server", hasMore: false })).toBe(s);
+    expect(reduce(s, { type: "sealedStatus", thread: "server", securing: true })).toBe(s);
+  });
+});

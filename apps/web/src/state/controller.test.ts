@@ -137,7 +137,7 @@ let link: FakeLink;
 const session = () => stores.useSession.getState();
 
 /** Connects a fake link; vc servers start users outside voice. */
-function connectFake(opts: { channel?: number | null; kind?: "vc" | "teamspeak"; resync?: boolean; encrypted?: number[] } = {}) {
+function connectFake(opts: { channel?: number | null; kind?: "vc" | "teamspeak"; resync?: boolean; encrypted?: number[]; serverChat?: boolean } = {}) {
   const c = controller as unknown as { conn: Link | null; wire(l: Link): void };
   c.conn = link;
   c.wire(link);
@@ -146,6 +146,7 @@ function connectFake(opts: { channel?: number | null; kind?: "vc" | "teamspeak";
     welcome({
       session: 1,
       uid: "u1",
+      server: { ...welcome().server, server_chat: { encrypted: opts.serverChat ?? false, history: opts.serverChat ?? false } },
       channels: [chan(1), chan(2), chan(3, { has_password: true })].map(c => opts.encrypted?.includes(c.id) ? { ...c, encrypted: true } : c),
       clients: [client(1, opts.channel ?? null), client(2, 2)],
     }),
@@ -978,8 +979,10 @@ it("drops plaintext Gwar-to-Gwar DMs before state or notifications, retaining Te
   expect(session().threads["dm:ts:peer"]?.items).toHaveLength(1);
 });
 
-describe("encrypted channels", () => {
-  const sealedRow = (id: number) => ({ id, conversation: "channel:1", group: "g", epoch: 0, author_uid: "u2", author_name: "n2",
+describe.each(["channel", "server"] as const)("encrypted %s chat", kind => {
+  const thread = kind === "server" ? "server" : "ch:1", target = kind === "server" ? "server" : "channel:1";
+  const connectPublic = () => { connectFake({ encrypted: [1], serverChat: kind === "server" }); if (kind === "server") session().dispatch({ type: "setActive", key: "server" }); };
+  const sealedRow = (id: number) => ({ id, conversation: target, group: "g", epoch: 0, author_uid: "u2", author_name: "n2",
     message_id: `m${id}`, revision: 0, ciphertext: "x", sent_at: 1000 + id, deleted: false });
   const fakeSealed = () => ({ open: vi.fn(async () => {}), send: vi.fn(async () => {}), close: vi.fn() });
   const install = (sealed: unknown) => { (controller as unknown as { sealed: unknown }).sealed = sealed; };
@@ -987,71 +990,73 @@ describe("encrypted channels", () => {
   afterEach(() => install(null));
 
   it("reads an encrypted channel through sealed history only", async () => {
-    connectFake({ encrypted: [1] });
+    connectPublic();
     const sealed = fakeSealed(); install(sealed);
     // Any change after the runtime is up opens what is on screen.
     session().dispatch({ type: "focus", focused: false });
     await vi.advanceTimersByTimeAsync(10);
     expect(link.sent("chat.history").filter(r => (r.d as { channel: number }).channel === 1)).toEqual([]);
-    expect(sealed.open).toHaveBeenCalledWith("ch:1");
+    expect(sealed.open).toHaveBeenCalledWith(thread);
   });
 
   it("sends sealed and asks moderators' removals by conversation", async () => {
-    connectFake({ encrypted: [1] });
+    connectPublic();
     const sealed = fakeSealed(); install(sealed);
-    expect(await controller.sendChat("channel", "hi", { mentions: ["u2"] })).toBe(true);
-    expect(sealed.send).toHaveBeenCalledWith("ch:1", "hi", ["u2"], undefined, []);
+    expect(await controller.sendChat(kind === "server" ? "server" : "channel", "hi", { mentions: ["u2"] })).toBe(true);
+    expect(sealed.send).toHaveBeenCalledWith(thread, "hi", ["u2"], undefined, []);
     expect(link.sent("chat.send")).toEqual([]);
     const row = sealedRow(5);
-    session().dispatch({ type: "sealed", thread: "ch:1", live: false,
-      item: { kind: "msg", key: "e5", at: 0, msg: { ...message(5, 1), signature: null }, sealed: row, authentic: true } });
+    session().dispatch({ type: "sealed", thread, live: false,
+      item: { kind: "msg", key: "e5", at: 0, msg: { ...message(5, 1, { target: kind === "server" ? "server" : { channel: 1 } }), signature: null }, sealed: row, authentic: true } });
     expect(await controller.deleteMessage(5)).toBe(true);
-    expect(link.sent("chat.sealed.remove")).toEqual([{ op: "chat.sealed.remove", d: { conversation: "channel:1", id: 5 } }]);
+    expect(link.sent("chat.sealed.remove")).toEqual([{ op: "chat.sealed.remove", d: { conversation: target, id: 5 } }]);
     expect(link.sent("chat.delete")).toEqual([]);
+    await controller.loadOlder();
+    expect(sealed.open).toHaveBeenCalledWith(thread, 5);
   });
 
   it("sends only this connection's encrypted uploads with a sealed message, and keeps them on edits", async () => {
-    connectFake({ encrypted: [1] });
+    connectPublic();
     const sealed = fakeSealed(); install(sealed);
     const uploaded = (controller as unknown as { uploaded: Map<string, { conn: unknown; att: Attachment }> }).uploaded;
     const att = { id: "f1", name: "a.png", mime: "image/png", size: 5, url: "/files/f1/file", sha256: "s", sealed: { key: "k", sha256: "c", size: 33 } };
     uploaded.set("plain", { conn: link, att: { ...att, id: "plain", sealed: undefined } });
     uploaded.set("other", { conn: {}, att: { ...att, id: "other" } });
-    for (const id of ["plain", "other", "missing"]) expect(await controller.sendChat("channel", "hi", { attachments: [id] })).toBe(false);
+    for (const id of ["plain", "other", "missing"]) expect(await controller.sendChat(kind === "server" ? "server" : "channel", "hi", { attachments: [id] })).toBe(false);
     expect(sealed.send).not.toHaveBeenCalled();
     uploaded.set("f1", { conn: link, att });
-    expect(await controller.sendChat("channel", "hi", { attachments: ["f1"] })).toBe(true);
-    expect(sealed.send).toHaveBeenCalledWith("ch:1", "hi", [], undefined, [att]);
+    expect(await controller.sendChat(kind === "server" ? "server" : "channel", "hi", { attachments: ["f1"] })).toBe(true);
+    expect(sealed.send).toHaveBeenCalledWith(thread, "hi", [], undefined, [att]);
     expect(uploaded.has("f1")).toBe(false);
   });
 
   it("removes the sealed row it started with when the view moves meanwhile", async () => {
-    connectFake({ encrypted: [1] });
+    connectPublic();
     install(fakeSealed());
-    session().dispatch({ type: "sealed", thread: "ch:1", live: false,
-      item: { kind: "msg", key: "e6", at: 0, msg: { ...message(6, 1), signature: null }, sealed: sealedRow(6), authentic: true } });
+    session().dispatch({ type: "sealed", thread, live: false,
+      item: { kind: "msg", key: "e6", at: 0, msg: { ...message(6, 1, { target: kind === "server" ? "server" : { channel: 1 } }), signature: null }, sealed: sealedRow(6), authentic: true } });
     const removal = controller.deleteMessage(6);
     session().dispatch({ type: "selectChannel", channel: 2 });
     expect(await removal).toBe(true);
-    expect(link.sent("chat.sealed.remove")).toEqual([{ op: "chat.sealed.remove", d: { conversation: "channel:1", id: 6 } }]);
+    expect(link.sent("chat.sealed.remove")).toEqual([{ op: "chat.sealed.remove", d: { conversation: target, id: 6 } }]);
     expect(link.sent("chat.delete")).toEqual([]);
   });
 
   it("reports reading by conversation", async () => {
-    connectFake({ encrypted: [1] });
-    session().dispatch({ type: "sealed", thread: "ch:1", live: true,
+    connectPublic();
+    session().dispatch({ type: "sealed", thread, live: true,
       item: { kind: "msg", key: "e7", at: 0, msg: message(7, 1), sealed: sealedRow(7), authentic: true } });
     await vi.advanceTimersByTimeAsync(1001);
-    expect(link.sent("chat.read")).toEqual([{ op: "chat.read", d: { conversation: "channel:1", message: 7 } }]);
+    expect(link.sent("chat.read")).toEqual([{ op: "chat.read", d: { conversation: target, message: 7 } }]);
   });
 
   it("counts encrypted channels' mentions again after a resync", async () => {
-    connectFake({ encrypted: [1] });
+    connectPublic();
     const order: string[] = [];
     const epoch = session().epoch;
     // Reset before the Welcome: its view change recounts at once.
     const sealed = { ...fakeSealed(), reset: vi.fn(() => order.push(`reset ${session().epoch - epoch}`)), refresh: vi.fn(), scanUnread: vi.fn(async () => { order.push(`scan ${session().epoch - epoch}`); }) }; install(sealed);
-    link.welcomeNow(welcome({ session: 1, uid: "u1", channels: [chan(1, { encrypted: true })], clients: [client(1, null)] }), true);
+    link.welcomeNow(welcome({ session: 1, uid: "u1", server: { ...welcome().server, server_chat: { encrypted: kind === "server", history: kind === "server" } }, channels: [chan(1, { encrypted: true })], clients: [client(1, null)] }), true);
     expect(sealed.refresh).toHaveBeenCalled();
     expect(order).toEqual(["reset 0", "scan 1"]);
   });
@@ -1065,4 +1070,12 @@ describe("encrypted channels", () => {
     expect(runtime.channelCreated).toHaveBeenCalledWith(9);
     (controller as unknown as { runtime: unknown }).runtime = null;
   });
+});
+
+
+it.each(["vc", "teamspeak"] as const)("keeps default server chat plaintext in %s sessions", async kind => {
+  connectFake({ kind });
+  expect(await controller.sendChat("server", "plain server hello")).toBe(true);
+  expect(link.sent("chat.send").at(-1)?.d).toMatchObject({ target: "server", text: "plain server hello", signature: expect.any(Object) });
+  expect(link.sent("chat.sealed.send")).toEqual([]);
 });

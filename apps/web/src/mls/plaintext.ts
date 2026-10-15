@@ -69,7 +69,7 @@ export async function authenticatePlaintext(bytes: Uint8Array, context: Context)
     for (const [k, n] of [["server_key", 32], ["group_id", 32], ["author_uid", 20], ["key", 32], ["message_id", 16], ["body_hash", 32], ["signature", 64]] as const) decodeFixed(s[k] as string, n);
     for (const uid of value.mentions) decodeFixed(uid, 20);
     // A direct message's author is a participant; in a channel any member may write.
-    if (context.conversation.startsWith("dm:") ? !participants(context.conversation).includes(s.author_uid as string) : channelOf(context.conversation) === undefined) return null;
+    if (context.conversation.startsWith("dm:") ? !participants(context.conversation).includes(s.author_uid as string) : context.conversation !== "server" && channelOf(context.conversation) === undefined) return null;
     if (s.revision === 0) { if (s.previous_revision_hash !== "-" || s.created_at !== s.signed_at) return null; }
     else decodeFixed(s.previous_revision_hash as string, 32);
     if (value.text === DELETION_TEXT && (s.revision === 0 || value.mentions.length || value.attachments.length)) return null;

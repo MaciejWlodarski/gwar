@@ -25,7 +25,7 @@ function wireEpoch(value: string | number): number {
 }
 export interface SealContext { server_key: string; conversation: string; group_id: string; epoch: string }
 const DAY = 86400_000;
-/** A device updates its own leaf in a channel group after this long without an own commit there. */
+/** A device updates its own leaf in a public group after this long without an own commit there. */
 const LEAF_UPDATE_AFTER = 7 * DAY;
 /** Two checks finding the server behind a live pin, this far apart, restart the conversation. */
 const RESTART_AFTER = 60_000;
@@ -46,7 +46,7 @@ export interface RuntimeOptions {
   /** Another tab of this device asked for the session while this runtime holds
    * the lock; the caller closes it. Without it, a second tab waits for the lock. */
   onTakeover?: () => void;
-  /** Fetches channel groups' ratchet trees over HTTP; the global fetch by default. */
+  /** Fetches public groups' ratchet trees over HTTP; the global fetch by default. */
   fetch?: typeof fetch;
 }
 /** A ratchet tree larger than this is refused (about 15 000 devices). */
@@ -91,14 +91,15 @@ export class MlsRuntime {
   private readonly lastRequest = new Map<string, number>();
   /** Encrypted channels by id with their `history`, from the latest Welcome and channel events. */
   private channels: Map<number, boolean> | undefined;
+  private serverChat = false;
   /** This session's file access token: the bearer for the tree endpoint. */
   private fileAccess: string | null = null;
   /** The conversation of every group the server listed, for groups not joined yet. */
   private readonly conversations = new Map<string, string>();
   /** Tree downloads in flight, ended when the connection drops or the runtime closes. */
   private readonly downloads = new Set<AbortController>();
-  /** When a channel group may next be created or joined, per conversation. */
-  private readonly channelDue = new Map<string, Backoff>();
+  /** When a public group may next be created or joined, per conversation. */
+  private readonly groupDue = new Map<string, Backoff>();
   /** When a history job whose preparation failed may be tried again, per job key. */
   private readonly historyDue = new Map<string, { at: number; delay: number }>();
   private nextJoin = 0;
@@ -177,6 +178,7 @@ export class MlsRuntime {
         }
         runtime!.server = server;
         runtime!.fileAccess = welcome.file_access;
+        runtime!.serverChat = welcome.server.server_chat.encrypted;
         runtime!.channels = new Map(welcome.channels.filter(c => c.encrypted).map(c => [c.id, c.history]));
         runtime!.schedule();
       }));
@@ -291,7 +293,7 @@ export class MlsRuntime {
   private historyIntents(before: GroupSummary[]): Change[] {
     const changes: Change[] = [];
     for (const g of this.inventory()) {
-      // Channel groups share history by the server's assignments instead.
+      // Public groups share history by the server's assignments instead.
       if (!g.history || g.record.status !== "active" || !g.conversation.startsWith("dm:")) continue;
       const old = before.find(b => encoded(b.group) === encoded(g.group) && b.record.status === "active");
       for (const member of g.members) {
@@ -315,7 +317,7 @@ export class MlsRuntime {
     const all: MlsGroup[] = []; let after: string | null = null;
     do { const page: ResponseMap["mls.groups"] = await this.request("mls.groups", { after }); all.push(...page.groups); after = page.next; } while (after);
     for (const g of all) this.conversations.set(g.group, g.conversation);
-    return all.filter(g => g.conversation.startsWith("dm:") || channelOf(g.conversation) !== undefined);
+    return all.filter(g => g.conversation.startsWith("dm:") || channelOf(g.conversation) !== undefined || (g.conversation === "server" && this.serverChat));
   }
   private async publish(): Promise<void> {
     if (this.now() - this.lastPublish < 60_000 && !this.engine.jobs.has(`@runtime/packages/${this.server}`)) return;
@@ -394,7 +396,7 @@ export class MlsRuntime {
       try { await this.syncGroup(g.group, g.pending); }
       catch (error) { if (!(error instanceof Restarted)) throw error; }
     }
-    await this.syncChannels(groups);
+    await this.syncPublicGroups(groups);
     await this.importHistory();
     let after: string | null = null;
     do {
@@ -457,26 +459,26 @@ export class MlsRuntime {
       this.triggers.delete(local.conversation);
       await this.createGroup(local.conversation, local.history, { incarnation: Number(local.incarnation) + 1, previous: encoded(local.group) });
       // Not a failure, whichever call made it: no backoff leaves the new group behind.
-      this.channelDue.delete(local.conversation);
+      this.groupDue.delete(local.conversation);
       throw new Restarted();
     }
     this.wakeAt = Math.min(this.wakeAt ?? Infinity, this.triggers.get(local.conversation)!.at + RESTART_AFTER);
   }
   private due(conversation: string): boolean {
-    const at = this.channelDue.get(conversation)?.at ?? 0;
+    const at = this.groupDue.get(conversation)?.at ?? 0;
     if (at <= this.now()) return true;
     this.wakeAt = Math.min(this.wakeAt ?? Infinity, at); return false;
   }
   private failed(conversation: string, error: unknown): void {
-    const delay = Math.min(10 * 60_000, 2 * (this.channelDue.get(conversation)?.delay ?? 5_000));
-    this.channelDue.set(conversation, { at: this.now() + delay * (0.5 + Math.random() / 2), delay });
+    const delay = Math.min(10 * 60_000, 2 * (this.groupDue.get(conversation)?.delay ?? 5_000));
+    this.groupDue.set(conversation, { at: this.now() + delay * (0.5 + Math.random() / 2), delay });
     this.options.onError?.(error);
   }
-  /** Channel groups (docs/e2e-build.md "Groups"): forget deleted channels'
+  /** Public groups (docs/e2e-build.md "Groups"): forget deleted channels'
    * groups, keep joined ones current, join the rest one at a time with jitter,
    * create missing ones after a random delay, and update stale own leaves. A
-   * failing channel backs off without blocking direct messages. */
-  private async syncChannels(groups: MlsGroup[]): Promise<void> {
+   * failing group backs off without blocking direct messages. */
+  private async syncPublicGroups(groups: MlsGroup[]): Promise<void> {
     const channels = this.channels;
     if (!channels) return;
     for (const g of this.inventory()) {
@@ -491,8 +493,9 @@ export class MlsRuntime {
       this.syncedVersions.delete(group); this.groupVersions.delete(group);
     }
     let leafUpdated = false;
-    for (const [id, history] of channels) {
-      const conversation = `channel:${id}`;
+    const conversations = [...channels].map(([id, history]) => [`channel:${id}`, history] as [string, boolean]);
+    if (this.serverChat) conversations.push(["server", true]);
+    for (const [conversation, history] of conversations) {
       if (this.held.has(conversation)) continue;
       const remote = groups.find(g => g.conversation === conversation);
       const local = remote && this.summary(remote.group);
@@ -503,7 +506,7 @@ export class MlsRuntime {
           if (this.inventory().some(g => g.conversation === conversation && g.record.status === "creating")) continue;
           // Every member's device may find the group missing: one random wait
           // lets the first creation reach the others before they try.
-          if (!this.channelDue.has(conversation)) { this.channelDue.set(conversation, { at: this.now() + Math.random() * 5_000, delay: 5_000 }); this.due(conversation); continue; }
+          if (!this.groupDue.has(conversation)) { this.groupDue.set(conversation, { at: this.now() + Math.random() * 5_000, delay: 5_000 }); this.due(conversation); continue; }
           await this.createGroup(conversation, history);
         } else if (member) {
           if (!this.current(remote)) await this.syncGroup(remote.group, remote.pending);
@@ -518,7 +521,7 @@ export class MlsRuntime {
           this.nextJoin = this.now() + Math.random() * 2_000;
           await this.syncGroup(remote.group, remote.pending);
         }
-        this.channelDue.delete(conversation);
+        this.groupDue.delete(conversation);
         if (remote) await this.requestHistory(remote.group);
       } catch (error) {
         this.assertCurrent(this.activeGeneration);
@@ -555,9 +558,9 @@ export class MlsRuntime {
   }
   /** Lets this client create its own new channel's group right away. */
   channelCreated(id: number): void {
-    this.channelDue.set(`channel:${id}`, { at: 0, delay: 5_000 }); this.schedule();
+    this.groupDue.set(`channel:${id}`, { at: 0, delay: 5_000 }); this.schedule();
   }
-  /** The ratchet tree of a channel group's current epoch, which its GroupInfos
+  /** The ratchet tree of a public group's current epoch, which its GroupInfos
    * leave out (docs/e2e-build.md "Large groups"). */
   private async tree(group: string): Promise<{ epoch: number; tree: number[] }> {
     const origin = this.options.link.endpoint ? httpOriginFromWsUrl(this.options.link.endpoint) : null;
@@ -591,7 +594,7 @@ export class MlsRuntime {
       this.options.signal?.removeEventListener("abort", stop);
     }
   }
-  /** A group's GroupInfo, with the tree of the same epoch for channel groups. */
+  /** A group's GroupInfo, with the tree of the same epoch for public groups. */
   private async groupInfo(group: string): Promise<{ info: number[]; tree: number[] | null }> {
     const conversation = this.summary(group)?.conversation ?? this.conversations.get(group);
     // A commit between the two requests changes the epoch: ask again.
@@ -616,7 +619,8 @@ export class MlsRuntime {
     }
     await this.engine.op<CommitOutbox>({ join_external: { server: this.server, bytes: info, tree, now: this.now(), revocations: this.options.revocations() } }, out => {
       if (encoded(out.group) !== group) throw new Error("GroupInfo group mismatch");
-      return channelOf(this.summary(group)?.conversation ?? "") === undefined ? [] : [jobChange({ kind: "request", server: this.server, group })];
+      const conversation = this.summary(group)?.conversation ?? "";
+      return conversation === "server" || channelOf(conversation) !== undefined ? [jobChange({ kind: "request", server: this.server, group })] : [];
     });
   }
   private async syncGroup(group: string, pending = false, beforeWelcome = false): Promise<boolean | "pruned"> {

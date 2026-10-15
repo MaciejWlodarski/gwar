@@ -20,7 +20,7 @@ const pending = (): CommitOutbox => ({ group: Array(32).fill(2), epoch: "0", has
 const clean = (): State => ({ groups: [], out: null, welcomes: [], imports: 0, shares: 0 });
 const runtimes: MlsRuntime[] = [];
 afterEach(async () => { conversation = dm; await Promise.all(runtimes.splice(0).map(r => r.close())); });
-interface Options { channels?: { id: number; encrypted: boolean; history: boolean }[]; now?: () => number }
+interface Options { serverChat?: boolean; channels?: { id: number; encrypted: boolean; history: boolean }[]; now?: () => number }
 async function fixture(initial = clean(), hasRemoteGroup = true, options: Options = {}) {
   const errors: unknown[] = [];
   const operations: Record<string, unknown>[] = [], calls: { op: string; data: Record<string, unknown> }[] = [];
@@ -132,7 +132,7 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
   const link = {
     status: { state: "idle" }, isOnline: false, serverKey: server, endpoint: "ws://gwar.test/ws",
     onStatus: (fn: (status: ConnectionStatus) => void) => { statusHandler = fn; return () => {}; }, onEvent: (fn: (event: Event) => void) => { eventHandler = fn; return () => {}; }, onWelcome: (fn: (welcome: { channels: unknown[] }) => void) => { welcomeHandler = fn; return () => {}; },
-    connect: async () => { link.status.state = "online"; link.isOnline = true; welcomeHandler({ channels: options.channels ?? [], file_access: "access" } as never); return {} as never; },
+    connect: async () => { link.status.state = "online"; link.isOnline = true; welcomeHandler({ channels: options.channels ?? [], server: { server_chat: { encrypted: options.serverChat ?? false, history: options.serverChat ?? false } }, file_access: "access" } as never); return {} as never; },
     close: () => { link.isOnline = false; },
     request: async (op: string, data: Record<string, unknown>) => {
       calls.push({ op, data });
@@ -543,8 +543,9 @@ describe("Restarts", () => {
     expect(f.operations.filter(o => o.op === "join_external")).toHaveLength(1); // only the one before the server fell behind
     expect(f.operations.some(o => o.op === "create")).toBe(true);
   });
-  it("accepts the server's restart from the live pin and joins it", async () => {
-    const f = await fixture({ ...clean(), groups: [summary()] });
+  it.each(["dm", "server"])("accepts the server's restart from the live pin and joins it (%s)", async kind => {
+    if (kind === "server") conversation = "server";
+    const f = await fixture({ ...clean(), groups: [summary()] }, true, { serverChat: kind === "server" });
     f.world.groups = [{ conversation, group: restartedGroup, incarnation: 1, epoch: 0, pending: false }];
     f.world.chain = [{ group, descriptor: "AQ" }, { group: restartedGroup, descriptor: "Ag" }];
     await f.runtime.sync();
@@ -638,13 +639,14 @@ describe("Restarts", () => {
     expect(f.operations.some(o => o.op === "welcome")).toBe(false);
   });
 });
-describe("Channel groups", () => {
+describe("Public groups", () => {
   const channel = (history = true) => ({ id: 1, encrypted: true, history });
+  const publicOptions = (target: string, history = true) => target === "server" ? { serverChat: true, channels: [] } : { channels: [channel(history)] };
   const asChannel = () => { conversation = "channel:1"; };
-  it("joins an encrypted channel's group and then asks for its history", async () => {
-    asChannel();
+  it.each(["channel:1", "server"])("joins an encrypted channel's group and then asks for its history (%s)", async target => {
+    conversation = target;
     const random = vi.spyOn(Math, "random").mockReturnValue(0);
-    const f = await fixture(clean(), true, { channels: [channel()] });
+    const f = await fixture(clean(), true, { ...publicOptions(target) });
     f.world.groups = [{ conversation, group, incarnation: 0, epoch: 0, pending: false }];
     await f.runtime.sync(); random.mockRestore();
     expect(f.operations.some(o => o.op === "join_external")).toBe(true);
@@ -652,10 +654,10 @@ describe("Channel groups", () => {
     await f.runtime.sync();
     expect(f.calls.filter(c => c.op === "mls.history.request")).toHaveLength(1);
   });
-  it("joins with the ratchet tree of the GroupInfo's epoch, fetched over HTTP", async () => {
-    asChannel();
+  it.each(["channel:1", "server"])("joins with the ratchet tree of the GroupInfo's epoch, fetched over HTTP (%s)", async target => {
+    conversation = target;
     const random = vi.spyOn(Math, "random").mockReturnValue(0);
-    const f = await fixture(clean(), true, { channels: [channel()] });
+    const f = await fixture(clean(), true, { ...publicOptions(target) });
     f.world.groups = [{ conversation, group, incarnation: 0, epoch: 0, pending: false }];
     f.world.head = 4; f.world.treeEpochs = [3];
     await f.runtime.sync(); random.mockRestore();
@@ -721,11 +723,11 @@ describe("Channel groups", () => {
     expect(String(f.errors.at(-1))).toContain("changed while joining");
     expect(f.operations.some(o => o.op === "join_external")).toBe(false);
   });
-  it("keeps the history request intent durably until a request succeeds", async () => {
-    asChannel();
+  it.each(["channel:1", "server"])("keeps the history request intent durably until a request succeeds (%s)", async target => {
+    conversation = target;
     let now = 1_000_000;
     const random = vi.spyOn(Math, "random").mockReturnValue(0);
-    const f = await fixture(clean(), true, { channels: [channel()], now: () => now });
+    const f = await fixture(clean(), true, { ...publicOptions(target), now: () => now });
     const intents = async () => (await f.storage.load()).outbox.map(c => dec.decode(new Uint8Array(c.key))).filter(k => k.startsWith("@runtime/request/"));
     f.world.groups = [{ conversation, group, incarnation: 0, epoch: 0, pending: false }];
     f.world.requestError = new RequestError("rate_limited", "rate_limited");
@@ -740,10 +742,10 @@ describe("Channel groups", () => {
     expect(f.calls.filter(c => c.op === "mls.history.request")).toHaveLength(2);
     expect(await intents()).toEqual([]);
   });
-  it("does not back off a channel this device restarted", async () => {
-    asChannel();
+  it.each(["channel:1", "server"])("does not back off a channel this device restarted (%s)", async target => {
+    conversation = target;
     let now = 1_000_000;
-    const f = await fixture({ ...clean(), groups: [summary("active", "5")] }, true, { channels: [channel()], now: () => now });
+    const f = await fixture({ ...clean(), groups: [summary("active", "5")] }, true, { ...publicOptions(target), now: () => now });
     f.world.head = 3;
     await f.runtime.sync();
     expect(String(f.errors.at(-1))).toContain("behind");
@@ -775,10 +777,10 @@ describe("Channel groups", () => {
     f.commitEvent(); await f.runtime.sync();
     expect(f.calls.filter(c => c.op === "mls.log").length).toBeGreaterThan(logs);
   });
-  it("asks for history after a restart when the request before it failed", async () => {
-    asChannel();
+  it.each(["channel:1", "server"])("asks for history after a restart when the request before it failed (%s)", async target => {
+    conversation = target;
     const random = vi.spyOn(Math, "random").mockReturnValue(0);
-    const f = await fixture(clean(), true, { channels: [channel()] });
+    const f = await fixture(clean(), true, { ...publicOptions(target) });
     f.world.groups = [{ conversation, group, incarnation: 0, epoch: 0, pending: false }];
     f.world.requestError = new RequestError("unavailable", "unavailable");
     await f.runtime.sync(); random.mockRestore();
@@ -791,19 +793,20 @@ describe("Channel groups", () => {
     expect(f.calls.filter(c => c.op === "mls.history.request")).toHaveLength(2);
     expect((await f.storage.load()).outbox.map(c => dec.decode(new Uint8Array(c.key))).filter(k => k.startsWith("@runtime/request/"))).toEqual([]);
   });
-  it("ignores plaintext channels", async () => {
-    asChannel();
-    const f = await fixture(clean(), true, { channels: [{ ...channel(), encrypted: false }] });
+  it.each(["channel:1", "server"])("ignores plaintext channels (%s)", async target => {
+    conversation = target;
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
+    const f = await fixture(clean(), true, { serverChat: false, channels: [{ ...channel(), encrypted: false }] });
     f.world.groups = [{ conversation, group, incarnation: 0, epoch: 0, pending: false }];
-    await f.runtime.sync();
+    await f.runtime.sync(); random.mockRestore();
     expect(f.operations.some(o => o.op === "join_external" || o.op === "create")).toBe(false);
   });
-  it("creates a missing channel group only after a random delay", async () => {
-    asChannel();
+  it.each(["channel:1", "server"])("creates a missing channel group only after a random delay (%s)", async target => {
+    conversation = target;
     let now = 1_000_000;
     const random = vi.spyOn(Math, "random").mockReturnValue(0.5);
     try {
-      const f = await fixture(clean(), false, { channels: [channel(false)], now: () => now });
+      const f = await fixture(clean(), false, { ...publicOptions(target, false), now: () => now });
       expect(f.operations.some(o => o.op === "create")).toBe(false);
       now += 2_499; await f.runtime.sync();
       expect(f.operations.some(o => o.op === "create")).toBe(false);
@@ -843,10 +846,10 @@ describe("Channel groups", () => {
     await f.runtime.sync();
     expect(await jobs()).toEqual([]);
   });
-  it("answers an assignment with its chunks, or declines it with nothing to share", async () => {
-    asChannel();
+  it.each(["channel:1", "server"])("answers an assignment with its chunks, or declines it with nothing to share (%s)", async target => {
+    conversation = target;
     const local = summary(); local.members.push({ device_key: peer, uid: b64(5,20) });
-    const f = await fixture({ ...clean(), groups: [local] }, true, { channels: [channel()] });
+    const f = await fixture({ ...clean(), groups: [local] }, true, { ...publicOptions(target) });
     f.world.devices = [{ uid: b64(5,20), device_key: peer, hpke_key: b64(6), created_at: 1, signature: b64(7,64) }];
     f.world.wanted = [{ group, device: peer, assignment: b64(1,16) }];
     await f.runtime.sync();
@@ -859,11 +862,11 @@ describe("Channel groups", () => {
     expect(f.calls.filter(c => c.op === "mls.history.decline")).toEqual([{ op: "mls.history.decline", data: { group, device: peer, assignment: b64(2,16) } }]);
     expect(f.calls.filter(c => c.op === "mls.history.share")).toHaveLength(2);
   });
-  it("updates its own leaf after seven days without an own commit, one group at a time", async () => {
-    asChannel();
+  it.each(["channel:1", "server"])("updates its own leaf after seven days without an own commit, one group at a time (%s)", async target => {
+    conversation = target;
     const now = 100 * 86400_000;
     const local = summary(); local.record.own_commit_at = now - 7 * 86400_000 + 1;
-    const f = await fixture({ ...clean(), groups: [local] }, true, { channels: [channel()], now: () => now });
+    const f = await fixture({ ...clean(), groups: [local] }, true, { ...publicOptions(target), now: () => now });
     expect(f.operations.some(o => o.op === "commit")).toBe(false);
     f.state().groups[0]!.record.own_commit_at = now - 7 * 86400_000 - 1; await f.persist();
     await f.runtime.sync();

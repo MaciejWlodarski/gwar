@@ -7,7 +7,7 @@ import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRe
 import { countKey, useLanguage, useT, type TFn } from "../i18n";
 import { cn } from "../lib/cn";
 import { memberName } from "../lib/member-name";
-import { buildRows, messageTarget, encryptedDm, sealedThread, type Row } from "../lib/chat";
+import { buildRows, messageTarget, sealedThread, type Row } from "../lib/chat";
 import { useIsMobile } from "../lib/media";
 import { checkUpload, formatBytes } from "../lib/files";
 import { splitMentions } from "../lib/mentions";
@@ -18,7 +18,7 @@ import type { ChatMessage } from "../proto/ChatMessage";
 import { controller, UploadError } from "../state/controller";
 import { myChannelId, storedKey } from "../state/reducer";
 import { useOutbox, useSession, useUi } from "../state/stores";
-import type { ChatItem, ThreadKey } from "../state/types";
+import type { ChatItem, ThreadKey, StoredThreadKey } from "../state/types";
 import { AttachmentList } from "./Attachments";
 import { ConnectBadge, MentionBadge, UnreadBadge } from "./badges";
 import { usePermission, useRoster, useUidColor } from "./hooks";
@@ -439,7 +439,8 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
   const [showJump, setShowJump] = useState(false);
   const firstKey = thread?.items[0]?.key;
   const lastKey = thread?.items.at(-1)?.key;
-  const isChannel = threadKey === "channel" || (hasHistory && encryptedDm(threadKey, "vc"));
+  const encrypted = useSession(s => sealedThread(key, s.kind, s.channels, s.server?.server_chat));
+  const isChannel = threadKey === "channel" || encrypted;
   const locked = isChannel && !!thread?.locked;
   const viewChannel = useSession((s) => s.viewChannel);
   const vc = useSession((s) => s.kind === "vc");
@@ -530,7 +531,7 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
           <EmptyState icon={<MessageSquare className="size-5" />} title={t("chat.empty")}>
             {t(
               threadKey === "server"
-                ? "chat.emptyServer"
+                ? encrypted ? "chat.emptyServerHistory" : "chat.emptyServer"
                 : threadKey === "channel"
                   ? hasHistory
                     ? "chat.emptyChannel"
@@ -553,7 +554,7 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
             );
           if (row.type === "sys") return <SysRow key={row.key} row={row} t={t} />;
           const m = row.item.msg;
-          // Only channel messages (stored on the server) can be edited or deleted.
+          // Stored messages can be edited or deleted.
           const stored = vc && (!!row.item.sealed || (typeof m.target === "object" && "channel" in m.target));
           const own = m.author_uid === mineUid;
           const verification = verified.get(m.id)?.fingerprint === messageFingerprint(m, { serverKey, target: targetFor(m), sealed: row.item.sealed ? { group: row.item.sealed.group, epoch: row.item.sealed.epoch } : undefined }) ? verified.get(m.id)?.state : undefined;
@@ -569,7 +570,7 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
               lang={lang}
               compact={compact}
               canEdit={stored && own && signable}
-              canDelete={stored && ((own && signable) || (canManageMessages && (!row.item.sealed || row.item.sealed.conversation.startsWith("channel:"))))}
+              canDelete={stored && ((own && signable) || (canManageMessages && (!row.item.sealed || !row.item.sealed.conversation.startsWith("dm:"))))}
               editing={editing === m.id}
             />
           );
@@ -729,7 +730,7 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
   const ref = useRef<HTMLTextAreaElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const online = useSession((s) => s.phase === "online");
-  const encrypted = useSession(s => sealedThread(storedKey(s, threadKey), s.kind, s.channels));
+  const encrypted = useSession(s => sealedThread(storedKey(s, threadKey), s.kind, s.channels, s.server?.server_chat));
   const securing = useSession(s => encrypted && s.threads[storedKey(s, threadKey) ?? ""]?.securing !== false);
   const peerOnline = useSession((s) => (threadKey.startsWith("dm:") && !encrypted ? Object.values(s.clients).some((c) => c.uid === threadKey.slice(3)) : true));
   const peerName = useSession((s) => (threadKey.startsWith("dm:") ? s.threads[threadKey]?.peer?.name : undefined));
@@ -844,7 +845,7 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
     const items = (key && s.threads[key]?.items) || [];
     for (let i = items.length - 1; i >= 0; i--) {
       const item = items[i];
-      if (item?.kind === "msg" && item.msg.author_uid === s.me?.uid && typeof item.msg.target === "object" && "channel" in item.msg.target) {
+      if (item?.kind === "msg" && item.msg.author_uid === s.me?.uid && (item.sealed || (typeof item.msg.target === "object" && "channel" in item.msg.target))) {
         useUi.getState().setEditing(item.msg.id);
         return true;
       }
@@ -857,7 +858,7 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
       void send();
-    } else if (e.key === "ArrowUp" && !text && pending.length === 0 && useSession.getState().kind === "vc" && threadKey === "channel") {
+    } else if (e.key === "ArrowUp" && !text && pending.length === 0 && useSession.getState().kind === "vc" && (threadKey === "channel" || encrypted)) {
       if (editLast()) e.preventDefault();
     }
   };
@@ -1029,7 +1030,7 @@ function ChatHeader() {
   const userCount = useSession((s) => Object.values(s.clients).filter((c) => c.channel !== null && c.channel === s.viewChannel).length);
   const inVoice = useSession((s) => myChannelId(s) !== null);
   const members = useMembersPanel();
-  const sealed = useSession(s => { const key = storedKey(s, active); return sealedThread(key, s.kind, s.channels) ? key as `dm:${string}` | `ch:${number}` : null; });
+  const sealed = useSession(s => { const key = storedKey(s, active); return sealedThread(key, s.kind, s.channels, s.server?.server_chat) ? key as StoredThreadKey : null; });
   const encrypted = !!sealed;
   const vc = useSession(s => s.kind === "vc");
   const dmName = useSession((s) => (active.startsWith("dm:") ? memberName(s.members, active.slice(3), s.threads[active]?.peer?.name ?? "") : undefined));
@@ -1104,7 +1105,7 @@ export function ChatArea() {
   const phase = useSession((s) => s.phase);
   const storage = useSession((s) => storedKey(s, s.activeThread));
   // Files travel with plaintext channel messages only: no drop invitation in an encrypted channel.
-  const sealedChannel = useSession(s => s.activeThread === "channel" && !!sealedThread(storedKey(s, s.activeThread), s.kind, s.channels));
+  const sealedChannel = useSession(s => s.activeThread === "channel" && !!sealedThread(storedKey(s, s.activeThread), s.kind, s.channels, s.server?.server_chat));
   const attachRef = useRef<((files: File[]) => void) | null>(null);
   const [dragging, setDragging] = useState(false);
   const depth = useRef(0);

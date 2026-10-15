@@ -322,8 +322,8 @@ const local = new Map<string, string>();
 vi.stubGlobal("localStorage", { getItem: (k: string) => local.get(k) ?? null, setItem: (k: string, v: string) => void local.set(k, v) });
 const carol = await generateIdentity();
 const c = await uidForPublicKey(carol.publicKey);
-describe("encrypted channels", () => {
-  const channel = 7, thread = `ch:${channel}` as const, target = `channel:${channel}`;
+describe.each(["channel", "server"] as const)("encrypted %s chat", kind => {
+  const channel = 7, thread = kind === "server" ? "server" : `ch:${channel}` as const, target = kind === "server" ? "server" : `channel:${channel}`;
   const lobby = welcome().channels[0]!;
   let plains: Map<string, Plaintext>;
   let stored: SealedMessage[];
@@ -339,7 +339,7 @@ describe("encrypted channels", () => {
   const mentions = () => useSession.getState().threads[thread]?.mentions;
   beforeEach(() => {
     plains = new Map(); stored = [];
-    useSession.setState({ channels: { [channel]: { ...lobby, id: channel, encrypted: true, history: true } } });
+    useSession.setState({ server: { ...welcome().server, server_chat: { encrypted: kind === "server", history: kind === "server" } }, channels: { [channel]: { ...lobby, id: channel, encrypted: true, history: true } } });
     runtime.openMessage = vi.fn(async (r: SealedMessage) => {
       const plain = plains.get(`${r.id}:${r.revision}`);
       return plain ? { ok: plain } : { reason: "no_key" as const };
@@ -351,7 +351,7 @@ describe("encrypted channels", () => {
   it("opens messages from any member and counts a mention of me once", async () => {
     const { sealed } = await post(1);
     await dm.receive(sealed, true); await dm.receive(sealed, true);
-    expect(useSession.getState().threads[thread]?.items[0]).toMatchObject({ msg: { target: { channel }, author_uid: c }, authentic: true, verified: true });
+    expect(useSession.getState().threads[thread]?.items[0]).toMatchObject({ msg: { target: kind === "server" ? "server" : { channel }, author_uid: c }, authentic: true, verified: true });
     expect(mentions()).toBe(1);
     expect(notify).toHaveBeenCalledTimes(1);
   });
@@ -389,7 +389,7 @@ describe("encrypted channels", () => {
     expect(notify).not.toHaveBeenCalled();
   });
   const unread = (id = channel, count = 1) => useSession.setState(s => ({ threads: { ...s.threads,
-    [`ch:${id}`]: { items: [], unread: count, mentions: 0, hasMore: true, loaded: false, lastRead: 0, locked: false } } }));
+    [kind === "server" && id === channel ? "server" : `ch:${id}`]: { items: [], unread: count, mentions: 0, hasMore: true, loaded: false, lastRead: 0, locked: false } } }));
   it("starts mention accounting over after a resync", async () => {
     await dm.receive((await post(1)).sealed, true);
     expect(mentions()).toBe(1);
@@ -405,7 +405,7 @@ describe("encrypted channels", () => {
     // Reconnecting: the controller resets before the Welcome moves the view back here.
     dm.reset();
     useSession.setState(s => ({ epoch: s.epoch + 1, threads: {} })); unread(channel, 0);
-    useSession.setState({ activeThread: "channel", viewChannel: channel });
+    useSession.setState({ activeThread: kind === "server" ? "server" : "channel", viewChannel: channel });
     expect(mentions()).toBe(0);
   });
   it("retries every row waiting for a key, however many wait", async () => {
@@ -473,14 +473,14 @@ describe("encrypted channels", () => {
     expect(useSession.getState().threads[thread]?.items).toEqual([]);
     expect(mentions()).toBe(0);
   });
-  it("does not bring back a channel deleted while its message was opening", async () => {
+  it("does not bring back an unavailable conversation while its message was opening", async () => {
     const { sealed } = await post(1);
     let release!: () => void;
     const open = runtime.openMessage;
     runtime.openMessage = vi.fn(async (r: SealedMessage) => { await new Promise<void>(resolve => { release = resolve; }); return open(r); });
     const receiving = dm.receive(sealed, true);
     await vi.waitFor(() => expect(runtime.openMessage).toHaveBeenCalled());
-    useSession.setState({ channels: {}, threads: {} });
+    useSession.setState({ server: welcome().server, channels: {}, threads: {} });
     release(); await receiving;
     expect(useSession.getState().threads[thread]).toBeUndefined();
   });
@@ -518,4 +518,14 @@ describe("encrypted channels", () => {
     await vi.waitFor(() => expect(mentions()).toBe(100));
     expect(request).toHaveBeenCalledTimes(2);
   });
+});
+
+
+it("leaves plaintext server mentions to the plaintext accounting", () => {
+  const dispatch = vi.spyOn(useSession.getState(), "dispatch");
+  useSession.setState({ activeThread: "server", server: welcome().server,
+    threads: { server: { items: [], unread: 1, mentions: 1, hasMore: true, loaded: false, lastRead: 0, locked: false } } });
+  expect(useSession.getState().threads.server?.mentions).toBe(1);
+  expect(dispatch.mock.calls.some(([action]) => action.type === "sealedMentions")).toBe(false);
+  dispatch.mockRestore();
 });

@@ -269,6 +269,7 @@ export const pl: Record<Key, string> = {
   "chat.emptyChannel": "Przywitaj się z wszystkimi na tym kanale. Wiadomości tutaj są zapisywane.",
   "chat.emptyChannelNoHistory": "Przywitaj się z wszystkimi na tym kanale. Serwery TeamSpeak nie przechowują historii wiadomości, więc widać je tylko, gdy jesteś połączony.",
   "chat.emptyServer": "Wiadomości tutaj trafiają do wszystkich na serwerze i nie są zapisywane.",
+  "chat.emptyServerHistory": "Wiadomości tutaj trafiają do wszystkich na serwerze i są zapisywane.",
   "chat.emptyDm": "Prywatne wiadomości widzicie tylko wy dwoje i nie są zapisywane.",
   "chat.jump": "Przejdź do najnowszych",
   "chat.compose": "Wiadomość",
