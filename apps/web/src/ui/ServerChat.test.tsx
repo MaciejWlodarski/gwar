@@ -3,6 +3,9 @@ import "fake-indexeddb/auto";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { DELETION_TEXT } from "../net/message-signature";
+import { MessageVerificationCache } from "../net/message-verification-cache";
+import type { ChatItem } from "../state/types";
 import { controller } from "../state/controller";
 import { initialState } from "../state/reducer";
 import { useSession, useUi } from "../state/stores";
@@ -19,6 +22,10 @@ let root: Root, container: HTMLDivElement;
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   request.mockClear(); send.mockClear();
+  vi.spyOn(MessageVerificationCache.prototype, "verify").mockImplementation(async msg => ({
+    status: msg.text === "unverified" ? "invalid" : "verified", continuity: "proven",
+    authorization: msg.text === "revoked" ? ["device-revoked"] : [],
+  }));
   useSettings.setState({ language: "en" });
   useUi.setState({ editing: null, dialog: { kind: "none" } });
   useSession.setState({ ...initialState, kind: "vc", phase: "online", activeThread: "server", me: { uid: "me", session: 1 },
@@ -89,6 +96,47 @@ it("edits the latest own sealed server message from the empty composer", async (
     msg: { id: 2, target: "server", author: 1, author_uid: "me", author_name: "Me", text: "own", sent_at: 2 },
     sealed: { id: 2, conversation: "server", group: "g", epoch: 0, author_uid: "me", author_name: "Me", message_id: "m", revision: 0, ciphertext: "x", sent_at: 2, deleted: false } }] } } }));
   await show();
-  await act(async () => container.querySelector("textarea")!.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true })));
+  await waitForEditButton();
+  await arrowUp();
   expect(useUi.getState().editing).toBe(2);
+});
+
+const arrowUp = () => act(async () => container.querySelector("textarea")!.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowUp", bubbles: true })));
+const waitForEditButton = () => vi.waitFor(async () => {
+  await act(async () => { await new Promise(resolve => setTimeout(resolve, 20)); });
+  expect(button("Edit message")).not.toBeNull();
+});
+const ownRow = (id: number, extra: Partial<Extract<ChatItem, { kind: "msg" }>> = {}): Extract<ChatItem, { kind: "msg" }> => ({
+  kind: "msg", key: `e${id}`, at: id,
+  msg: { id, target: "server", author: 1, author_uid: "me", author_name: "Me", text: "editable", sent_at: id },
+  sealed: { id, conversation: "server", group: "g", epoch: 0, author_uid: "me", author_name: "Me", message_id: `m${id}`, revision: 0, ciphertext: "x", sent_at: id, deleted: false },
+  ...extra,
+});
+
+it.each(["deleted", "removed", "no_key", "cannot_open", "unverified", "revoked", "pending"] as const)("ArrowUp skips the latest %s server row", async reason => {
+  let latest = ownRow(2);
+  if (reason === "deleted") latest = { ...latest, msg: { ...latest.msg, text: DELETION_TEXT }, sealed: { ...latest.sealed!, deleted: true } };
+  else if (reason === "removed") latest.removed = true;
+  else if (reason === "no_key" || reason === "cannot_open") latest = { ...latest, cannotOpen: reason, msg: { ...latest.msg, text: "" } };
+  else latest.msg = { ...latest.msg, text: reason };
+  if (reason === "pending") vi.mocked(MessageVerificationCache.prototype.verify).mockImplementation(async msg => msg.id === 2
+    ? new Promise(() => {}) : { status: "verified", continuity: "proven", authorization: [] });
+  useSession.setState(s => ({ threads: { server: { ...s.threads.server!, items: [ownRow(1), latest] } } }));
+  await show(); await waitForEditButton();
+  expect(container.querySelector('[data-message="2"] button[aria-label="Edit message"]')).toBeNull();
+  await arrowUp();
+  expect(useUi.getState().editing).toBe(1);
+});
+
+it.each([false, true])("ArrowUp leaves live-only plaintext server rows alone (encrypted=%s)", async encrypted => {
+  useSession.setState(s => ({ server: { ...s.server!, server_chat: { encrypted, history: encrypted } },
+    threads: { server: { ...s.threads.server!, items: [ownRow(1, { sealed: undefined })] } } }));
+  await show();
+  await vi.waitFor(async () => {
+    await act(async () => { await new Promise(resolve => setTimeout(resolve, 20)); });
+    expect(container.querySelector('[data-message-verification="verified"]')).not.toBeNull();
+  });
+  expect(button("Edit message")).toBeNull();
+  await arrowUp();
+  expect(useUi.getState().editing).toBeNull();
 });

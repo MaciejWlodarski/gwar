@@ -212,6 +212,8 @@ export const pl: Record<Key, string> = {
   "channel.historyHint": "Urządzenia członków udostępniają wcześniejsze wiadomości osobom, które dołączą później.",
   "channel.encryptionPermanent": "Tych opcji nie da się zmienić po utworzeniu kanału.",
   "channel.readers": "Kto może czytać",
+  "chat.serverReadersHint": "Urządzenia w grupie tej rozmowy, tak jak widzi ją to urządzenie.",
+  "chat.serverReadersPending": "Ta rozmowa jest jeszcze zabezpieczana na tym urządzeniu.",
   "channel.readersHint": "Urządzenia w grupie tego kanału, tak jak widzi ją to urządzenie.",
   "channel.readersPending": "Ten kanał jest jeszcze zabezpieczany na tym urządzeniu.",
   "channel.devices.one": "{count} urządzenie",

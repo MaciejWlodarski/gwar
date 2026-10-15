@@ -21,7 +21,7 @@ export function ReadersDialog({ thread }: { thread: SealedKey }) {
   return (
     <Dialog open onOpenChange={(o) => !o && close()} title={t("channel.readers")} width="max-w-sm">
       <p className="mb-3 text-sm text-muted">
-        {t("chat.messagesEncrypted")}. {roster && !securing ? t("channel.readersHint") : t("channel.readersPending")}
+        {t("chat.messagesEncrypted")}. {roster && !securing ? t(thread === "server" ? "chat.serverReadersHint" : "channel.readersHint") : t(thread === "server" ? "chat.serverReadersPending" : "channel.readersPending")}
       </p>
       <ul className="flex max-h-80 flex-col gap-1 overflow-y-auto">
         {byUid.map(([uid, devices]) => (

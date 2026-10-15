@@ -38,3 +38,21 @@ it("lists the group's devices per member and says when the view may be out of da
   await securing(false);
   expect(text()).toContain("as this device sees it");
 });
+
+it.each([
+  ["en", "Devices in this conversation’s group, as this device sees it.", "This conversation is still being secured on this device."],
+  ["pl", "Urządzenia w grupie tej rozmowy, tak jak widzi ją to urządzenie.", "Ta rozmowa jest jeszcze zabezpieczana na tym urządzeniu."],
+] as const)("uses conversation wording for server chat in %s", async (language, hint, pending) => {
+  useSettings.setState({ language });
+  useSession.setState({ server: { ...welcome().server, server_chat: { encrypted: true, history: true } } });
+  const state = (value: boolean) => act(async () => useSession.setState({ threads: {
+    server: { items: [], unread: 0, mentions: 0, hasMore: false, loaded: true, lastRead: 0, locked: false, securing: value },
+  } }));
+  await state(false);
+  await act(async () => root.render(<TooltipProvider><ReadersDialog thread="server" /></TooltipProvider>));
+  expect(document.body.textContent).toContain(hint);
+  expect(document.body.textContent).not.toContain(pending);
+  await state(true);
+  expect(document.body.textContent).toContain(pending);
+  expect(document.body.textContent).not.toContain(hint);
+});
