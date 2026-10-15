@@ -1724,10 +1724,12 @@ cannot relax key provenance, removal cutoff or the no-plaintext rule.
   stream's last positive in-order ordinary timestamp step, clamped to
   960–5760 ticks, or 960 before any step. A step measures the previous
   packet plus any gap, so the 960 floor (the longest duration either client
-  sends) covers a 10 → 20 ms change; only a sender exceeding 20 ms right
-  before a re-anchor can lose that one packet, already counted as
-  `unexpected_duration` at the sender. Update it before gating; zero or
-  reset-sized deltas leave it unchanged. Only a new run/SSRC starts afresh.
+  sends) covers configured 10/20 ms packets. A packet over 20 ms (counted
+  as `unexpected_duration` at the sender) can leave the span underestimated:
+  a re-anchor right after it, without a receiver reset, may drop following
+  packets overlapping it, at most 4800 ticks (100 ms) per isolated event.
+  Update it before gating; zero or reset-sized deltas leave it unchanged.
+  Only a new run/SSRC starts afresh.
 - At every re-anchor (speaker/run/SSRC change, new source-clock generation,
   reset-sized slot delta or TeamSpeak spurt/clock change), advance the slot
   clock from its last write by `max(ceil_480(elapsed), span)`, where
@@ -1896,9 +1898,12 @@ physical audio or official-server acceptance.
   sources (learned 480 clamped to 960, initial 960, and a 10 ms packet
   followed by a 20 ms one, then a reset within 10 ms), 60 ms TeamSpeak packets
   batched across spurt changes (floor 2880), and every re-anchor cause.
-  Assert each new anchor is outside the previous packet's span, including
-  zero elapsed time and switching 10/20 ms speakers. Separately check
-  estimate clamping and that zero/reset/old packets cannot change it.
+  Assert each new anchor is outside the previous packet's span for
+  configured encrypted durations and parsed plaintext/TeamSpeak durations,
+  including zero elapsed time and switching 10/20 ms speakers; an encrypted
+  120 ms packet followed by a reset documents the bounded exception.
+  Separately check estimate clamping and that zero/reset/old packets
+  cannot change it.
   Through native decoded playout, reset the same source after a 20 ms
   packet with unchanged slot generation: require the post-reset tone in
   output and no late drop, not just increasing RTP timestamps. In 5b use

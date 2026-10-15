@@ -622,8 +622,9 @@ Local identities have one device and no archive.
     Plaintext RTP and TeamSpeak use parsed Opus duration; encrypted RTP
     uses that stream's last positive in-order ordinary timestamp step,
     clamped to 960–5760 ticks (20 ms, the longest packet either client
-    sends, covers a step that measured a shorter previous packet), or 960
-    before any step. Learn before gating;
+    sends, covers a step that measured a shorter previous packet; a sender
+    exceeding 20 ms can lose up to 100 ms after an immediate re-anchor), or
+    960 before any step. Learn before gating;
     zero/reset deltas leave the estimate unchanged. Keep the previous span
     across reassignment/reset until the next packet is forwarded, including
     batched TeamSpeak spurt transitions. An over-estimate inserts a short
