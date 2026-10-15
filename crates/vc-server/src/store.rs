@@ -1365,6 +1365,7 @@ fn attachment_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attachment> {
         width: r.get(4)?,
         height: r.get(5)?,
         sha256: r.get(6)?,
+        sealed: None,
     })
 }
 

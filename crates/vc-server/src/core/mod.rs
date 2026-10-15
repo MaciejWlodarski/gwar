@@ -1117,7 +1117,8 @@ impl Core {
                 self.chat_edit(session, message, text, mentions, signature)
             }
             Request::ChatDelete { message } => self.chat_delete(session, message),
-            Request::FileUpload { name, size, mime, sha256 } => self.file_upload(session, name, size, mime, sha256),
+            Request::FileUpload { sealed: true, .. } => Err(err(ErrorCode::BadRequest, "sealed uploads are not supported yet")),
+            Request::FileUpload { name, size, mime, sha256, sealed: false } => self.file_upload(session, name, size, mime, sha256),
             Request::GroupCreate(create) => self.group_create(session, create),
             Request::GroupUpdate(update) => self.group_update(session, update),
             Request::GroupDelete { group } => self.group_delete(session, group),

@@ -363,7 +363,7 @@ export class SealedConversations {
       try {
         const row = original
           ? await this.link.request(text === DELETION_TEXT ? "chat.delete_own" : "chat.sealed.edit", { conversation, ...sealed, message_id: retry.message_id, revision: signature.revision })
-          : await this.link.request("chat.sealed.send", { conversation, ...sealed, message_id: retry.message_id });
+          : await this.link.request("chat.sealed.send", { conversation, ...sealed, message_id: retry.message_id, files: [] });
         checkSession(); await this.receive(row, false); return;
       } catch (error) {
         checkSession();

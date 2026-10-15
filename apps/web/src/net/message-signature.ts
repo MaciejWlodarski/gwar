@@ -42,7 +42,7 @@ export function canonicalMessageBody(text: string, mentions: string[], attachmen
     return x.length - y.length;
   });
   const fields = [text, String(uids.length), ...uids, String(attachments.length)];
-  for (const a of attachments) fields.push(a.sha256, String(a.size), a.mime, a.name, "-", "-", "-");
+  for (const a of attachments) fields.push(a.sha256, String(a.size), a.mime, a.name, a.sealed?.key ?? "-", a.sealed?.sha256 ?? "-", a.sealed ? String(a.sealed.size) : "-");
   const chunks = fields.map((field) => { const bytes = enc.encode(field); return [enc.encode(`${bytes.length}:`), bytes, enc.encode(",")]; }).flat();
   const out = new Uint8Array(chunks.reduce((n, c) => n + c.length, 0));
   let at = 0;

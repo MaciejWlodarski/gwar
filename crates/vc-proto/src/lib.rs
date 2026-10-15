@@ -136,9 +136,12 @@ wire! {
         ServerUpdate(ServerUpdate),
         #[serde(rename = "token.create")]
         TokenCreate { group: GroupId },
-        /// Reserves an upload; the reply says where to `PUT` the bytes.
+        /// Reserves an upload; the reply says where to `PUT` the bytes. A `sealed`
+        /// upload is an encrypted attachment's ciphertext: `name`, `mime`, `size` and
+        /// `sha256` describe that ciphertext, and the server stores it as `file`,
+        /// `application/octet-stream`, without looking inside.
         #[serde(rename = "file.upload")]
-        FileUpload { name: String, size: u64, mime: String, sha256: String },
+        FileUpload { name: String, size: u64, mime: String, sha256: String, #[serde(default)] sealed: bool },
         #[serde(rename = "group.create")]
         GroupCreate(GroupCreate),
         #[serde(rename = "group.update")]
@@ -704,6 +707,21 @@ wire! {
         pub height: Option<u32>,
         // Base64url (no padding) SHA-256 of the file bytes.
         pub sha256: String,
+        /// An encrypted attachment: what opens its upload. Only inside sealed messages.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub sealed: Option<SealedFile>,
+    }
+
+    /// The upload of an encrypted attachment holds `nonce ‖ AES-256-GCM(file) ‖ tag`
+    /// under `key`, with AAD `gwar file v1`.
+    pub struct SealedFile {
+        /// Base64url (no padding) 32-byte file key.
+        pub key: String,
+        /// Base64url (no padding) SHA-256 of the ciphertext.
+        pub sha256: String,
+        /// The ciphertext's size in bytes.
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        pub size: u64,
     }
 
     #[derive(Copy, Eq, Hash, PartialOrd, Ord)]
@@ -841,7 +859,11 @@ pub fn canonical_message_body(text: &str, mentions: &[Uid], attachments: &[Attac
     }
     append(&mut out, &attachments.len().to_string());
     for a in attachments {
-        for value in [&a.sha256, &a.size.to_string(), &a.mime, &a.name, "-", "-", "-"] {
+        let (key, sha256, size) = match &a.sealed {
+            Some(s) => (s.key.as_str(), s.sha256.as_str(), s.size.to_string()),
+            None => ("-", "-", "-".to_string()),
+        };
+        for value in [&a.sha256, &a.size.to_string(), &a.mime, &a.name, key, sha256, &size] {
             append(&mut out, value);
         }
     }
@@ -1144,6 +1166,17 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn sealed_attachments_enter_the_body() {
+        use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+        let vectors: serde_json::Value = serde_json::from_str(include_str!("../tests/attachment-body.json")).unwrap();
+        for v in vectors.as_array().unwrap() {
+            let files = serde_json::from_value::<Vec<Attachment>>(v["attachments"].clone()).unwrap();
+            let body = canonical_message_body(v["text"].as_str().unwrap(), &[], &files);
+            assert_eq!(URL_SAFE_NO_PAD.encode(&body), v["canonical_body"]);
+        }
+    }
+
+    #[test]
     fn message_v3_shared_vectors() {
         use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
         use ed25519_dalek::{Signature, VerifyingKey};
@@ -1343,6 +1376,7 @@ mod tests {
                 url: "/files/f/f".into(),
                 width: None,
                 height: None,
+                sealed: None,
             }];
             let s = huge.signature.as_mut().unwrap();
             s.body_hash = message_body_hash("hi", &[], &huge.attachments);

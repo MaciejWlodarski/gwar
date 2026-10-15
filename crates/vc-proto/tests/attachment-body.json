@@ -1,0 +1,22 @@
+[
+  {
+    "text": "sealed",
+    "mentions": [],
+    "attachments": [
+      {
+        "id": "f",
+        "url": "/files/f/file",
+        "sha256": "LPJNul-wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ",
+        "size": 5,
+        "mime": "text/plain",
+        "name": "a.txt",
+        "sealed": {
+          "key": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+          "sha256": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI",
+          "size": 33
+        }
+      }
+    ],
+    "canonical_body": "NjpzZWFsZWQsMTowLDE6MSw0MzpMUEpOdWwtd293NG02RHNxeGJuaW5oc1dIbHdmcDBKZWN3UXpZcE9MbUNRLDE6NSwxMDp0ZXh0L3BsYWluLDU6YS50eHQsNDM6QVFFQkFRRUJBUUVCQVFFQkFRRUJBUUVCQVFFQkFRRUJBUUVCQVFFQkFRRSw0MzpBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnSUNBZ0lDQWdJLDI6MzMs"
+  }
+]

@@ -1532,6 +1532,7 @@ mod tests {
                 url: "/files/f1/cat.png".into(),
                 width: None,
                 height: None,
+                sealed: None,
             }],
             edited_at: None,
         };

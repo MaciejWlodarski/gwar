@@ -51,7 +51,10 @@ impl Core {
                 return Ok(Response::SealedHistory { sealed: messages });
             }
             SealedRequest::Remove { conversation, id } => return self.sealed_remove(session, &conversation, id),
-            SealedRequest::Send { conversation, group, epoch, message_id, ciphertext } => {
+            SealedRequest::Send { conversation, group, epoch, message_id, ciphertext, files } => {
+                if !files.is_empty() {
+                    return Err(err(ErrorCode::BadRequest, "sealed attachments are not supported yet"));
+                }
                 (conversation, group, epoch, message_id, ciphertext, None)
             }
             SealedRequest::Edit { conversation, group, epoch, message_id, revision, ciphertext } => {
