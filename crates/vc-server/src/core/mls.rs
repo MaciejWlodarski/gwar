@@ -291,6 +291,7 @@ impl Core {
             row.observer = observer.save();
             existing.extend(added.iter().map(|p| ProposalRow { leaf: p.leaf, proposal: p.proposal.clone() }));
             self.store.mls_write_group(&row, &observer.leaves(), &existing, None, None, &[])?;
+            self.voice_dirty |= channel_id(&row.conversation).is_some_and(|c| self.calls.contains_key(&c));
             self.mls_announce_proposals(&row, &added);
         }
         Ok(())
@@ -723,6 +724,7 @@ impl Core {
         let proposals = self.mls_missing_proposals(&mut observer, &[]).map_err(storage_error)?;
         row.observer = observer.save();
         self.store.mls_write_group(&row, &observer.leaves(), &proposals, None, None, &[]).map_err(storage_error)?;
+        self.voice_dirty |= channel_id(&row.conversation).is_some_and(|c| self.calls.contains_key(&c));
         self.mls_announce_proposals(&row, &proposals);
         reply(MlsResponse::Created { group: row.group })
     }
@@ -799,6 +801,7 @@ impl Core {
                 &removed,
             )
             .map_err(storage_error)?;
+        self.voice_dirty |= channel_id(&row.conversation).is_some_and(|c| self.calls.contains_key(&c));
         let readers = self.mls_readers(&row.conversation);
         self.broadcast(
             Event::Mls(MlsEvent::Commit { group: group.into(), epoch, proposals, commit: entry.commit }),

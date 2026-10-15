@@ -20,6 +20,31 @@ const LOG_BYTES: usize = 16 * 1024 * 1024;
 const LOG_ENTRIES: usize = 4096;
 const RETENTION_MS: i64 = 90 * 86_400_000;
 
+/// A single admission decision, consumed without another clock-sensitive check.
+pub(super) struct Admission {
+    pub channel: ChannelId,
+    parent: Option<String>,
+}
+#[derive(Clone, Copy)]
+pub(super) struct Limits {
+    members: usize,
+    observer_bytes: usize,
+    tree_bytes: usize,
+    proposal_count: usize,
+    proposal_bytes: usize,
+}
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            members: MEMBERS,
+            observer_bytes: TREE_BYTES,
+            tree_bytes: TREE_BYTES,
+            proposal_count: MEMBERS,
+            proposal_bytes: PROPOSAL_BYTES,
+        }
+    }
+}
+
 pub(super) struct Call {
     token: String,
     parent: Option<String>,
@@ -87,30 +112,32 @@ fn stale() -> ErrorBody {
     err(ErrorCode::Stale, "stale voice binding")
 }
 fn state_limits(
+    limits: Limits,
     observer_bytes: usize,
     tree_bytes: usize,
     leaves: usize,
     proposal_count: usize,
     proposal_bytes: usize,
 ) -> Result<(), ErrorBody> {
-    if observer_bytes > TREE_BYTES
-        || tree_bytes > TREE_BYTES
-        || proposal_count > MEMBERS
-        || proposal_bytes > PROPOSAL_BYTES
+    if observer_bytes > limits.observer_bytes
+        || tree_bytes > limits.tree_bytes
+        || proposal_count > limits.proposal_count
+        || proposal_bytes > limits.proposal_bytes
     {
         return Err(err(ErrorCode::TooLarge, "voice state limit"));
     }
-    if leaves > MEMBERS {
+    if leaves > limits.members {
         return Err(err(ErrorCode::ChannelFull, "voice leaf limit"));
     }
     Ok(())
 }
-fn admission_fits(sessions: usize, occupied: usize, pending: usize, replaces_own: bool) -> bool {
-    sessions < MEMBERS && occupied + pending + usize::from(!replaces_own) <= MEMBERS
+fn admission_fits(limits: Limits, sessions: usize, occupied: usize, pending: usize, replaces_own: bool) -> bool {
+    sessions < limits.members && occupied + pending + usize::from(!replaces_own) <= limits.members
 }
-fn bounded(observer: &Observer, proposals: &BTreeMap<u32, Vec<u8>>) -> Result<Vec<u8>, ErrorBody> {
+fn bounded(limits: Limits, observer: &Observer, proposals: &BTreeMap<u32, Vec<u8>>) -> Result<Vec<u8>, ErrorBody> {
     let state = observer.save();
     state_limits(
+        limits,
         state.len(),
         observer.tree().map_err(ds_error)?.1.len(),
         observer.leaves().len(),
@@ -119,8 +146,15 @@ fn bounded(observer: &Observer, proposals: &BTreeMap<u32, Vec<u8>>) -> Result<Ve
     )?;
     Ok(state)
 }
+fn include_expiry(deadline: &mut Option<i64>, c: &gwar_mls::Credential) {
+    if let gwar_mls::Credential::Account(c) = c {
+        *deadline = Some(deadline.map_or(c.expires_at, |old| old.min(c.expires_at)));
+    }
+}
 impl Core {
     fn parent_observer(&self, channel: ChannelId) -> Result<Observer, ErrorBody> {
+        #[cfg(test)]
+        self.voice_parent_loads.set(self.voice_parent_loads.get() + 1);
         let row = self
             .store
             .mls_live_group(&format!("channel:{channel}"))
@@ -143,14 +177,14 @@ impl Core {
         if !parent
             .credentials()
             .iter()
-            .any(|(_, c)| c.uid() == s.uid && c.device_key() == s.hello_key && c.is_current(now_ms(), &()))
+            .any(|(_, c)| c.uid() == s.uid && c.device_key() == s.hello_key && c.is_current((self.voice_clock)(), &()))
         {
             return Err(err(ErrorCode::Forbidden, "device is not in the current channel tree"));
         }
         Ok(Some(URL_SAFE_NO_PAD.encode(parent.group_id())))
     }
-    pub(super) fn voice_admission(&self, session: SessionId, channel: ChannelId) -> Result<(), ErrorBody> {
-        self.parent_admits(channel, session)?;
+    pub(super) fn voice_admission(&self, session: SessionId, channel: ChannelId) -> Result<Admission, ErrorBody> {
+        let parent = self.parent_admits(channel, session)?;
         if self.is_encrypted(channel) && self.sessions[&session].channel != Some(channel) {
             let sessions = self.sessions.values().filter(|s| s.channel == Some(channel)).count();
             if self.channels[&channel].max_clients.is_some_and(|max| sessions >= max as usize) {
@@ -160,29 +194,31 @@ impl Core {
             // Detached leaves still occupy space. A rejoin may replace only its own leaf.
             let occupied =
                 group.map(|g| Observer::load(&g.observer, &self.server_key)).transpose().map_err(ds_error)?;
+            let occupied_members: BTreeSet<_> = occupied
+                .as_ref()
+                .map(|o| o.leaves())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|l| (l.uid, l.device_key))
+                .collect();
             let pending = self
                 .sessions
                 .values()
                 .filter(|s| {
-                    s.channel == Some(channel)
-                        && occupied
-                            .as_ref()
-                            .is_none_or(|o| !o.leaves().iter().any(|l| l.uid == s.uid && l.device_key == s.hello_key))
+                    s.channel == Some(channel) && !occupied_members.contains(&(s.uid.clone(), s.hello_key.clone()))
                 })
                 .count();
-            let own = occupied.as_ref().is_some_and(|o| {
-                o.leaves()
-                    .iter()
-                    .any(|l| l.uid == self.sessions[&session].uid && l.device_key == self.sessions[&session].hello_key)
-            });
-            if !admission_fits(sessions, occupied.as_ref().map_or(0, |o| o.leaves().len()), pending, own) {
+            let s = &self.sessions[&session];
+            let own = occupied_members.contains(&(s.uid.clone(), s.hello_key.clone()));
+            if !admission_fits(self.voice_limits, sessions, occupied_members.len(), pending, own) {
                 return Err(err(ErrorCode::ChannelFull, "voice participation limit"));
             }
         }
-        Ok(())
+        Ok(Admission { channel, parent })
     }
-    pub(super) fn voice_allocate(&mut self, session: SessionId, channel: ChannelId) {
-        let parent = self.parent_admits(channel, session).expect("admission checked before allocation");
+    pub(super) fn voice_allocate(&mut self, session: SessionId, admission: Admission) {
+        let Admission { channel, parent } = admission;
+        self.voice_dirty = true;
         let call = self.calls.entry(channel).or_insert_with(|| Call {
             token: token(),
             parent,
@@ -225,7 +261,11 @@ impl Core {
             task.abort();
         }
         s.talking = false;
-        s.voice = false;
+        // TeamSpeak's transport belongs to the bridge, not the local WebRTC run.
+        if s.out.is_some() {
+            s.voice = false;
+        }
+        self.voice_dirty = true;
         let channel = s.channel.expect("participation channel");
         if let Some(group) = self.calls.get_mut(&channel).and_then(|c| c.group.as_mut()) {
             group.leaves.retain(|_, l| l.session != session || l.participation != p.binding.participation);
@@ -241,12 +281,14 @@ impl Core {
     }
     pub(super) fn voice_close_call(&mut self, channel: ChannelId, reason: VoiceClosedReason) {
         let ids: Vec<_> = self.sessions.values().filter(|s| s.channel == Some(channel)).map(|s| s.id).collect();
-        for id in ids {
+        for &id in &ids {
             if let Some(p) = self.sessions[&id].participation.as_ref() {
                 let binding = p.binding.clone();
                 self.broadcast(Event::VoiceClosed { binding, reason }, |s| s.id == id);
             }
-            self.move_client(id, None);
+        }
+        for id in ids {
+            let _ = self.move_client(id, None);
         }
     }
     pub(super) fn voice_group_channel(&self, group: &str) -> Option<ChannelId> {
@@ -358,7 +400,7 @@ impl Core {
                 Err(err(ErrorCode::Conflict, &g.id))
             };
         }
-        let state = bounded(&observer, &BTreeMap::new())?;
+        let state = bounded(self.voice_limits, &observer, &BTreeMap::new())?;
         let leaf = observer.leaves()[0].index;
         let g = VoiceGroup {
             id: id.clone(),
@@ -380,6 +422,7 @@ impl Core {
             acks: BTreeMap::new(),
         };
         self.calls.get_mut(&channel).unwrap().group = Some(g);
+        self.voice_dirty = true;
         let ids: Vec<_> = self.sessions.values().filter(|s| s.channel == Some(channel)).map(|s| s.id).collect();
         for id in ids {
             self.voice_snapshot(id);
@@ -462,7 +505,7 @@ impl Core {
         }
         next.proposals.clear();
         self.voice_missing(&mut observer, &next.leaves, &mut next.proposals)?;
-        next.observer = bounded(&observer, &next.proposals)?;
+        next.observer = bounded(self.voice_limits, &observer, &next.proposals)?;
         next.epoch = accepted.epoch;
         next.committed_at = accepted.committed_at;
         next.info = info;
@@ -473,13 +516,14 @@ impl Core {
         prune(&mut next);
         self.mls_trees.remove(group);
         self.calls.get_mut(&channel).unwrap().group = Some(next);
+        self.voice_dirty = true;
         self.broadcast(
             Event::Mls(MlsEvent::Commit { group: group.into(), epoch, proposals, commit: entry.commit }),
             |s| s.channel == Some(channel),
         );
         self.voice_announce(channel);
         for id in evicted {
-            self.move_client(id, None);
+            let _ = self.move_client(id, None);
         }
         Ok(Response::Mls(MlsResponse::Committed { epoch: accepted.epoch }))
     }
@@ -519,6 +563,17 @@ impl Core {
         }
     }
     pub(super) fn voice_reconcile(&mut self) {
+        let now = (self.voice_clock)();
+        if !self.voice_dirty && self.voice_expiry.is_none_or(|at| at > now) {
+            return;
+        }
+        // No callbacks reconcile recursively: all detachments complete before
+        // proposals are rebuilt, and logs are never copied here.
+        #[cfg(test)]
+        {
+            self.voice_passes += 1;
+        }
+        let mut deadline = None;
         let channels: Vec<_> = self.calls.keys().copied().collect();
         for channel in channels {
             if self.calls.get(&channel).is_none_or(|c| c.parent.is_none()) {
@@ -530,81 +585,93 @@ impl Core {
                 self.voice_close_call(channel, VoiceClosedReason::ChannelRestarted);
                 continue;
             }
-            let invalid: Vec<_> = self
-                .sessions
-                .values()
-                .filter(|s| s.channel == Some(channel) && self.parent_admits(channel, s.id).is_err())
-                .map(|s| s.id)
+            // Parse/verify each parent credential once, then do indexed lookups.
+            let members: BTreeMap<_, _> = parent
+                .as_ref()
+                .ok()
+                .map(|o| o.credentials())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, c)| ((c.uid(), c.device_key().to_owned()), c))
                 .collect();
-            for id in invalid {
-                self.move_client(id, None);
+            let mut invalid = BTreeSet::new();
+            for s in self.sessions.values().filter(|s| s.channel == Some(channel)) {
+                let credential = members.get(&(s.uid.clone(), s.hello_key.clone()));
+                if s.out.is_none()
+                    || !self.mls_member(&s.uid).unwrap_or(false)
+                    || self.store.mls_revoked(&s.hello_key, &s.uid).unwrap_or(true)
+                    || credential.is_none_or(|c| !c.is_current(now, &()))
+                {
+                    invalid.insert(s.id);
+                }
             }
-            let Some(mut g) = self.calls.get(&channel).and_then(|c| c.group.clone()) else { continue };
-            let result = (|| {
-                let mut o = Observer::load(&g.observer, &self.server_key).map_err(ds_error)?;
-                let expired: Vec<_> = o
-                    .credentials()
-                    .into_iter()
-                    .filter(|(_, c)| {
-                        !c.is_current(now_ms(), &()) || self.store.mls_revoked(c.device_key(), &c.uid()).unwrap_or(true)
-                    })
-                    .map(|(i, _)| i)
-                    .collect();
-                for i in expired {
-                    if let Some(l) = g.leaves.remove(&i) {
-                        g.acks.remove(&l.device);
-                        self.move_client(l.session, None);
+            let mut observer = match self.calls.get(&channel).and_then(|c| c.group.as_ref()) {
+                Some(g) => match Observer::load(&g.observer, &self.server_key) {
+                    Ok(o) => Some(o),
+                    Err(_) => {
+                        self.voice_close_call(channel, VoiceClosedReason::StateLimit);
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            let credentials = observer.as_ref().map(|o| o.credentials()).unwrap_or_default();
+            if let Some(g) = self.calls.get(&channel).and_then(|c| c.group.as_ref()) {
+                for (i, c) in &credentials {
+                    if (!c.is_current(now, &()) || self.store.mls_revoked(c.device_key(), &c.uid()).unwrap_or(true))
+                        && let Some(l) = g.leaves.get(i)
+                    {
+                        invalid.insert(l.session);
                     }
                 }
-                let before = g.proposals.len();
-                self.voice_missing(&mut o, &g.leaves, &mut g.proposals)?;
-                g.observer = bounded(&o, &g.proposals)?;
-                Ok::<_, ErrorBody>(g.proposals.len() != before)
-            })();
-            match result {
-                Ok(changed) => {
-                    if let Some(c) = self.calls.get_mut(&channel) {
-                        c.group = Some(g);
-                        if changed {
-                            self.voice_announce(channel);
-                        }
+            }
+            for id in invalid {
+                let _ = self.move_client(id, None);
+            }
+            // Detachment may end the call; never put an earlier candidate back.
+            let Some(call) = self.calls.get(&channel) else { continue };
+            let update = if let (Some(o), Some(g)) = (observer.as_mut(), call.group.as_ref()) {
+                let mut proposals = g.proposals.clone();
+                let result = self
+                    .voice_missing(o, &g.leaves, &mut proposals)
+                    .and_then(|()| bounded(self.voice_limits, o, &proposals));
+                match result {
+                    Ok(state) => Some((state, proposals, g.proposals.len())),
+                    Err(_) => {
+                        self.voice_close_call(channel, VoiceClosedReason::StateLimit);
+                        continue;
                     }
                 }
-                Err(_) => self.voice_close_call(channel, VoiceClosedReason::StateLimit),
+            } else {
+                None
+            };
+            if let Some((state, proposals, before)) = update {
+                let g = self.calls.get_mut(&channel).unwrap().group.as_mut().unwrap();
+                g.observer = state;
+                let changed = proposals.len() != before;
+                g.proposals = proposals;
+                if changed {
+                    self.voice_announce(channel);
+                }
+            }
+            for s in self.sessions.values().filter(|s| s.channel == Some(channel)) {
+                if let Some(c) = members.get(&(s.uid.clone(), s.hello_key.clone())) {
+                    include_expiry(&mut deadline, c);
+                }
+            }
+            if let Some(g) = self.calls.get(&channel).and_then(|c| c.group.as_ref()) {
+                for (i, c) in &credentials {
+                    if g.leaves.contains_key(i) {
+                        include_expiry(&mut deadline, c);
+                    }
+                }
             }
         }
+        self.voice_expiry = deadline;
+        self.voice_dirty = false;
     }
     pub(super) fn voice_deadline(&self) -> Option<i64> {
-        let expiry = |c: gwar_mls::Credential| match c {
-            gwar_mls::Credential::Account(c) => Some(c.expires_at),
-            _ => None,
-        };
-        let mut times = Vec::new();
-        for (channel, call) in &self.calls {
-            if let Some(g) = &call.group
-                && let Ok(o) = Observer::load(&g.observer, &self.server_key)
-            {
-                times.extend(
-                    o.credentials()
-                        .into_iter()
-                        .filter(|(i, _)| g.leaves.contains_key(i))
-                        .filter_map(|(_, c)| expiry(c)),
-                );
-            }
-            if call.parent.is_some()
-                && let Ok(o) = self.parent_observer(*channel)
-            {
-                times.extend(
-                    o.credentials()
-                        .into_iter()
-                        .filter(|(_, c)| {
-                            self.sessions.values().any(|s| s.channel == Some(*channel) && s.hello_key == c.device_key())
-                        })
-                        .filter_map(|(_, c)| expiry(c)),
-                );
-            }
-        }
-        times.into_iter().min()
+        self.voice_expiry
     }
     pub(super) fn voice_clear_ack(&mut self, session: SessionId) {
         let s = &self.sessions[&session];
@@ -777,7 +844,7 @@ impl Core {
                     self.broadcast(Event::VoiceClosed { binding, reason: VoiceClosedReason::StreamLimit }, |s| {
                         s.id == session
                     });
-                    self.move_client(session, None);
+                    let _ = self.move_client(session, None);
                 }
                 return Some(Err(e));
             }
@@ -904,6 +971,14 @@ mod tests {
         (core, session, frames, commands)
     }
     fn encrypted(core: &mut Core, session: SessionId) -> (ChannelId, String) {
+        let (channel, group, _, _) = encrypted_agents(core, session, None);
+        (channel, group)
+    }
+    fn encrypted_agents(
+        core: &mut Core,
+        session: SessionId,
+        expires: Option<i64>,
+    ) -> (ChannelId, String, Agent, Agent) {
         let channel = core
             .store
             .create_channel(&ChannelRow {
@@ -920,7 +995,7 @@ mod tests {
             .unwrap();
         core.channels = core.store.channels().unwrap().into_iter().map(|c| (c.id, c)).collect();
         let key = SigningKey::from_bytes(&[11; 32]);
-        let credential = Credential::Local { device_key: core.sessions[&session].hello_key.clone() };
+        let credential = test_credential(11, expires);
         let descriptor = |kind, conversation, parent, nonce| {
             SignedDescriptor::sign(
                 Descriptor {
@@ -954,6 +1029,10 @@ mod tests {
             },
         )
         .unwrap();
+        agent.take_changes();
+        agent.settle(&core.server_key, &parent.group_id(), Some(&parent.group_id())).unwrap();
+        agent.take_changes();
+        let parent_agent = agent;
         core.enter_channel(session, channel).unwrap();
         let voice = SignedDescriptor::sign(
             Descriptor {
@@ -986,13 +1065,344 @@ mod tests {
             )
             .unwrap();
         let Response::Mls(MlsResponse::Created { group }) = reply else { panic!() };
-        (channel, group)
+        agent.take_changes();
+        let id = vc_proto::decode_fixed::<32>(&group).unwrap();
+        agent.settle(&core.server_key, &id, Some(&id)).unwrap();
+        agent.take_changes();
+        (channel, group, parent_agent, agent)
     }
+    fn test_credential(seed: u8, expires: Option<i64>) -> Credential {
+        use ed25519_dalek::Signer;
+        let signer = SigningKey::from_bytes(&[seed; 32]);
+        let public = URL_SAFE_NO_PAD.encode(signer.verifying_key().as_bytes());
+        match expires {
+            None => Credential::Local { device_key: public },
+            Some(expires_at) => {
+                let mut c = vc_proto::DeviceCertificate {
+                    account_key: public.clone(),
+                    device_key: public,
+                    issued_at: expires_at - 86_400_000,
+                    expires_at,
+                    signature: String::new(),
+                };
+                c.signature = URL_SAFE_NO_PAD.encode(signer.sign(vc_proto::device_statement(&c).as_bytes()).to_bytes());
+                Credential::Account(c)
+            }
+        }
+    }
+    fn settle_commit(agent: &mut Agent, server: &str, group: &str, out: &gwar_mls::agent::Outbox) {
+        let id = vc_proto::decode_fixed::<32>(group).unwrap();
+        agent.take_changes();
+        agent
+            .reconcile(
+                server,
+                &id,
+                gwar_mls::agent::Reconcile::Entry { epoch: out.epoch, commit: out.commit.clone(), proposals: vec![] },
+            )
+            .unwrap();
+        agent.take_changes();
+    }
+    struct TestCall {
+        core: Core,
+        channel: ChannelId,
+        group: String,
+        sessions: Vec<SessionId>,
+        frames: Vec<mpsc::Receiver<Outbound>>,
+        voices: Vec<Agent>,
+        _commands: mpsc::Receiver<MediaCmd>,
+    }
+    impl TestCall {
+        fn new() -> Self {
+            let (mut core, session, frames, commands) = fixture();
+            core.info.max_clients = 1000;
+            let (channel, group, _, voice) = encrypted_agents(&mut core, session, None);
+            Self {
+                core,
+                channel,
+                group,
+                sessions: vec![session],
+                frames: vec![frames],
+                voices: vec![voice],
+                _commands: commands,
+            }
+        }
+        fn add(&mut self, parent_expiry: Option<i64>, voice_expiry: Option<i64>, enter: bool, join: bool) {
+            let seed = 11 + self.sessions.len() as u8;
+            let credential = test_credential(seed, parent_expiry);
+            let (out, frames) = mpsc::channel(16384);
+            let session = self
+                .core
+                .connect(ConnectRequest {
+                    request_id: 1,
+                    hello_key: credential.device_key().into(),
+                    certificate: None,
+                    uid: credential.uid(),
+                    public_key: credential.device_key().into(),
+                    nickname: format!("device-{seed}"),
+                    platform: Platform::Web,
+                    ip: None,
+                    device: None,
+                    device_expires_at: None,
+                    password_ok: true,
+                    invite: None,
+                    out,
+                })
+                .unwrap();
+            let parent = self.core.store.mls_live_group(&format!("channel:{}", self.channel)).unwrap().unwrap();
+            let tree = Observer::load(&parent.observer, &self.core.server_key).unwrap().tree().unwrap().1;
+            let mut agent = Agent::new([seed; 32], credential, now_ms()).unwrap();
+            agent.take_changes();
+            let out =
+                agent.join_external(&self.core.server_key, &parent.group_info, Some(&tree), now_ms(), &()).unwrap();
+            self.core
+                .mls_request(
+                    session,
+                    vc_proto::MlsRequest::Commit {
+                        group: parent.group,
+                        epoch: out.epoch,
+                        commit: URL_SAFE_NO_PAD.encode(out.commit),
+                        group_info: URL_SAFE_NO_PAD.encode(out.group_info),
+                        welcome: None,
+                        voice: None,
+                    },
+                )
+                .unwrap();
+            self.sessions.push(session);
+            self.frames.push(frames);
+            let mut voice = Agent::new_voice([seed; 32], test_credential(seed, voice_expiry), now_ms()).unwrap();
+            voice.take_changes();
+            self.voices.push(voice);
+            if enter {
+                self.core.enter_channel(session, self.channel).unwrap();
+            }
+            if join {
+                self.join(self.sessions.len() - 1);
+            }
+            self.drain();
+        }
+        fn binding(&self, index: usize) -> VoiceParticipation {
+            let state = self.core.voice_state(self.sessions[index]).unwrap();
+            VoiceParticipation { call: state.call, participation: state.participation }
+        }
+        fn join(&mut self, index: usize) {
+            let g = self.core.calls[&self.channel].group.as_ref().unwrap();
+            let tree = Observer::load(&g.observer, &self.core.server_key).unwrap().tree().unwrap().1;
+            let out =
+                self.voices[index].join_external(&self.core.server_key, &g.info, Some(&tree), now_ms(), &()).unwrap();
+            self.submit(index, &out).unwrap();
+            settle_commit(&mut self.voices[index], &self.core.server_key, &self.group, &out);
+            let id = vc_proto::decode_fixed::<32>(&self.group).unwrap();
+            self.voices[0].receive(&self.core.server_key, &id, &out.commit, &[]).unwrap();
+            self.voices[0].take_changes();
+        }
+        fn submit(&mut self, index: usize, out: &gwar_mls::agent::Outbox) -> Reply {
+            self.core.voice_commit(
+                self.sessions[index],
+                &self.group,
+                out.epoch,
+                &URL_SAFE_NO_PAD.encode(&out.commit),
+                &URL_SAFE_NO_PAD.encode(&out.group_info),
+                self.binding(index),
+            )
+        }
+        fn drain(&mut self) {
+            for frames in &mut self.frames {
+                while frames.try_recv().is_ok() {}
+            }
+        }
+        fn no_events(&mut self) {
+            for frames in &mut self.frames {
+                assert!(frames.try_recv().is_err());
+            }
+        }
+        fn snapshot(&self) -> serde_json::Value {
+            let g = self.core.calls[&self.channel].group.as_ref().unwrap();
+            serde_json::json!({ "observer": g.observer, "info": g.info, "epoch": g.epoch,
+                "committed_at": g.committed_at, "proposals": g.proposals, "log": g.log, "acks": g.acks,
+                "leaves": g.leaves.iter().map(|(i,l)| (i, &l.uid, &l.device, l.session, &l.participation)).collect::<Vec<_>>(),
+                "states": self.sessions.iter().map(|s| self.core.voice_state(*s)).collect::<Vec<_>>() })
+        }
+    }
+    thread_local! { static VOICE_TIME: std::cell::Cell<i64> = const { std::cell::Cell::new(0) }; }
+    fn test_clock() -> i64 {
+        VOICE_TIME.get()
+    }
+
+    #[test]
+    fn simultaneous_voice_expiry_batches_detachments_and_reuses_parent_view() {
+        let mut f = TestCall::new();
+        let expiry = now_ms() + 3_600_000;
+        for _ in 0..32 {
+            f.add(None, Some(expiry), true, true);
+        }
+        f.core.voice_clock = test_clock;
+        VOICE_TIME.set(expiry - 1);
+        f.core.voice_reconcile();
+        assert_eq!(f.core.voice_deadline(), Some(expiry));
+        let passes = f.core.voice_passes;
+        let loads = f.core.voice_parent_loads.get();
+        let g = f.core.calls[&f.channel].group.as_ref().unwrap();
+        let log_pointer = g.log.front().unwrap().1.commit.as_ptr();
+        // Unrelated actor traffic and deadline reads never reload the trees.
+        for _ in 0..8 {
+            f.core.handle(CoreMsg::Talking { session: f.sessions[0], talking: false, binding: None });
+            assert_eq!(f.core.voice_deadline(), Some(expiry));
+        }
+        assert_eq!(f.core.voice_passes, passes);
+        assert_eq!(f.core.voice_parent_loads.get(), loads);
+        assert!(
+            f.core
+                .mls_request(
+                    f.sessions[0],
+                    vc_proto::MlsRequest::GroupCreate {
+                        conversation: format!("channel:{}", f.channel),
+                        group_info: String::new(),
+                        voice: None,
+                    }
+                )
+                .is_err()
+        );
+        f.core.voice_reconcile();
+        assert_eq!(f.core.voice_passes, passes, "rejected requests do not invalidate call membership");
+        assert_eq!(f.core.voice_parent_loads.get(), loads);
+        VOICE_TIME.set(expiry);
+        f.core.voice_reconcile();
+        assert_eq!(f.core.voice_passes, passes + 1, "no recursive reconciliation per expired leaf");
+        assert_eq!(f.core.voice_parent_loads.get(), loads + 1, "one parent load for the entire call");
+        let g = f.core.calls[&f.channel].group.as_ref().unwrap();
+        assert_eq!(g.log.front().unwrap().1.commit.as_ptr(), log_pointer, "no log clone during reconciliation");
+        assert_eq!(g.leaves.len(), 1);
+        assert_eq!(g.proposals.len(), 32);
+        assert!(f.sessions.iter().skip(1).all(|s| f.core.voice_state(*s).is_none()));
+        assert_eq!(f.core.voice_deadline(), None);
+        f.core.voice_reconcile();
+        assert_eq!(f.core.voice_passes, passes + 1);
+    }
+
+    fn advancing_clock() -> i64 {
+        let now = VOICE_TIME.get();
+        VOICE_TIME.set(now + 1);
+        now
+    }
+
+    #[test]
+    fn admission_consumes_validation_before_clock_expiry_and_rejects_before_detach() {
+        let mut f = TestCall::new();
+        let expiry = now_ms() + 3_600_000;
+        f.add(Some(expiry), None, false, false);
+        let session = f.sessions[1];
+        f.core.enter_channel(session, 1).unwrap();
+        f.core.voice_clock = test_clock;
+        VOICE_TIME.set(expiry - 1);
+        // Time crosses expiry immediately after the admission check, before allocation.
+        f.core.voice_clock = advancing_clock;
+        f.core.enter_channel(session, f.channel).unwrap();
+        assert_eq!(VOICE_TIME.get(), expiry, "exactly one admission clock read");
+        f.core.voice_clock = test_clock;
+        assert_eq!(f.core.voice_state(session).unwrap().channel, f.channel);
+        f.core.voice_reconcile();
+        assert!(f.core.voice_state(session).is_none());
+        f.core.enter_channel(session, 1).unwrap();
+        let old = f.core.voice_state(session).unwrap();
+        f.drain();
+        assert_eq!(f.core.enter_channel(session, f.channel).unwrap_err().code, ErrorCode::Forbidden);
+        assert_eq!(f.core.voice_state(session).unwrap(), old);
+        f.no_events();
+    }
+
+    #[test]
+    fn admission_handlers_count_detached_leaves_and_pending_reservations_atomically() {
+        let mut f = TestCall::new();
+        f.add(None, None, true, true);
+        f.add(None, None, false, false);
+        f.core.voice_limits.members = 2;
+        f.core.move_client(f.sessions[1], None).unwrap();
+        f.core.voice_reconcile();
+        f.core.enter_channel(f.sessions[2], 1).unwrap();
+        let old = f.core.voice_state(f.sessions[2]).unwrap();
+        let before = f.snapshot();
+        f.drain();
+        assert_eq!(f.core.enter_channel(f.sessions[2], f.channel).unwrap_err().code, ErrorCode::ChannelFull);
+        assert_eq!(f.snapshot(), before);
+        assert_eq!(f.core.voice_state(f.sessions[2]).unwrap(), old);
+        f.no_events();
+        // Replacing one's own detached leaf consumes no extra leaf slot.
+        f.core.enter_channel(f.sessions[1], f.channel).unwrap();
+        assert!(f.core.voice_state(f.sessions[1]).is_some());
+        f.core.move_client(f.sessions[1], None).unwrap();
+        let id = vc_proto::decode_fixed::<32>(&f.group).unwrap();
+        let out = f.voices[0].commit(&f.core.server_key, &id, &[], &[1], now_ms(), &()).unwrap();
+        f.submit(0, &out).unwrap();
+        settle_commit(&mut f.voices[0], &f.core.server_key, &f.group, &out);
+        // One occupied leaf plus the new participant's pending admission fills the call.
+        f.core.enter_channel(f.sessions[2], f.channel).unwrap();
+        let before = f.snapshot();
+        f.drain();
+        assert_eq!(f.core.enter_channel(f.sessions[1], f.channel).unwrap_err().code, ErrorCode::ChannelFull);
+        assert_eq!(f.snapshot(), before);
+        f.no_events();
+    }
+
+    #[test]
+    fn commit_handlers_enforce_each_state_limit_without_partial_acceptance() {
+        let mut f = TestCall::new();
+        f.add(None, None, true, true);
+        f.core.move_client(f.sessions[1], None).unwrap();
+        f.core.voice_reconcile();
+        let id = vc_proto::decode_fixed::<32>(&f.group).unwrap();
+        // A valid competing update must reissue the detached leaf's removal.
+        let out = f.voices[0].commit(&f.core.server_key, &id, &[], &[], now_ms(), &()).unwrap();
+        f.voices[0].take_changes();
+        let g = f.core.calls[&f.channel].group.as_ref().unwrap();
+        let (mut candidate, _) = Observer::load(&g.observer, &f.core.server_key)
+            .unwrap()
+            .commit(&out.commit, &out.group_info, None, now_ms(), g.committed_at)
+            .unwrap();
+        let mut proposals = BTreeMap::new();
+        f.core.voice_missing(&mut candidate, &g.leaves, &mut proposals).unwrap();
+        let exact = Limits {
+            members: candidate.leaves().len(),
+            observer_bytes: candidate.save().len(),
+            tree_bytes: candidate.tree().unwrap().1.len(),
+            proposal_count: proposals.len(),
+            proposal_bytes: proposals.values().map(Vec::len).sum(),
+        };
+        let device = f.core.sessions[&f.sessions[0]].hello_key.clone();
+        f.core.calls.get_mut(&f.channel).unwrap().group.as_mut().unwrap().acks.insert(device, 1);
+        let before = f.snapshot();
+        f.drain();
+        let mut limits = [exact; 5];
+        limits[0].observer_bytes -= 1;
+        limits[1].tree_bytes -= 1;
+        limits[2].proposal_count -= 1;
+        limits[3].proposal_bytes -= 1;
+        limits[4].members -= 1;
+        for (i, limit) in limits.into_iter().enumerate() {
+            f.core.voice_limits = limit;
+            assert_eq!(
+                f.submit(0, &out).unwrap_err().code,
+                if i == 4 { ErrorCode::ChannelFull } else { ErrorCode::TooLarge }
+            );
+            assert_eq!(f.snapshot(), before, "limit {i} must preserve all call state");
+            f.no_events();
+        }
+        f.core.voice_limits = exact;
+        f.submit(0, &out).unwrap();
+        let g = f.core.calls[&f.channel].group.as_ref().unwrap();
+        assert_eq!(g.epoch, out.epoch + 1);
+        assert!(g.acks.is_empty());
+        assert_eq!(g.proposals.len(), 1);
+    }
+
     #[test]
     fn acknowledgements_are_bound_rate_limited_and_coalesced() {
         let (mut core, session, mut frames, _commands) = fixture();
         let (channel, group) = encrypted(&mut core, session);
-        core.sessions.get_mut(&session).unwrap().participation.as_mut().unwrap().binding.run = Some(1);
+        let p = core.sessions.get_mut(&session).unwrap().participation.as_mut().unwrap();
+        p.binding.run = Some(1);
+        // Exercise burst limits without CPU contention refilling tokens mid-test.
+        p.ack_bucket.rate = 0.0;
+        p.repeat_bucket.rate = 0.0;
         while frames.try_recv().is_ok() {}
         let state = core.voice_state(session).unwrap();
         let request = VoiceEpoch { call: state.call, participation: state.participation, run: 1, group, epoch: 0 };
@@ -1026,7 +1436,7 @@ mod tests {
         }
         assert_eq!(core.voice_epoch(session, request, true).unwrap_err().code, ErrorCode::RateLimited);
         assert_eq!(core.calls[&channel].group.as_ref().unwrap().acks.len(), 1);
-        core.move_client(session, None);
+        core.move_client(session, None).unwrap();
         assert!(core.calls.is_empty());
         assert!(core.routing.load().members.is_empty());
     }
@@ -1052,6 +1462,21 @@ mod tests {
         prune(g);
         assert_eq!(g.log.len(), 1);
         assert_eq!(g.log.front().unwrap().1.epoch, 3);
+    }
+    #[test]
+    fn logs_prune_by_age_below_count_and_byte_limits() {
+        let (mut core, session, _frames, _commands) = fixture();
+        let (channel, _) = encrypted(&mut core, session);
+        let g = core.calls.get_mut(&channel).unwrap().group.as_mut().unwrap();
+        g.log.push_back((
+            now_ms() - RETENTION_MS - 1,
+            MlsLogEntry { epoch: 1, proposals: vec![], commit: "old".into() },
+            3,
+        ));
+        g.log.push_back((now_ms(), MlsLogEntry { epoch: 2, proposals: vec![], commit: "recent".into() }, 6));
+        prune(g);
+        assert_eq!(g.log.len(), 1);
+        assert_eq!(g.log.front().unwrap().1.epoch, 2);
     }
     #[test]
     fn microphone_ssrc_is_bound_to_the_single_sending_audio_section() {
@@ -1112,6 +1537,11 @@ mod tests {
         assert_eq!(core.calls.len(), 1);
         assert_eq!(core.voice_state(local).unwrap().call, core.voice_state(remote).unwrap().call);
         assert_ne!(core.voice_state(remote).unwrap().participation, original.participation);
+        assert!(core.sessions[&remote].voice, "bridge move retains remote transport");
+        core.client_move(local, remote, 1).unwrap();
+        assert!(core.sessions[&remote].voice, "forced move retains remote transport");
+        core.client_move(local, remote, other.id).unwrap();
+        assert!(core.sessions[&remote].voice);
         while frames.try_recv().is_ok() {}
         core.handle(CoreMsg::Talking { session: local, talking: true, binding: Some(previous) });
         assert!(!core.sessions[&local].talking);
@@ -1123,7 +1553,7 @@ mod tests {
         let Outbound::Frame(talking) = frames.try_recv().unwrap() else { panic!() };
         assert!(roster.contains("client.updated"));
         assert!(talking.contains("voice.talking"));
-        core.move_client(local, None);
+        core.move_client(local, None).unwrap();
         assert_eq!(core.calls.len(), 1);
         core.remove(remote, LeaveReason::Quit);
         assert!(core.calls.is_empty());
@@ -1212,7 +1642,7 @@ mod tests {
         let MediaCmd::Offer { reply, .. } = commands.recv().await.unwrap() else { panic!() };
         reply.send(Ok("moved answer".into())).unwrap();
         let late = rx.recv().await.unwrap();
-        core.move_client(session, None);
+        core.move_client(session, None).unwrap();
         core.enter_channel(session, 1).unwrap();
         let current = core.voice_state(session).unwrap();
         core.handle(late);
@@ -1280,20 +1710,6 @@ mod tests {
         );
     }
     #[test]
-    fn limits_count_detached_leaves_pending_admissions_and_both_tree_encodings() {
-        assert!(admission_fits(999, 1000, 0, true)); // replacing only this device's detached leaf
-        assert!(!admission_fits(999, 1000, 0, false));
-        assert!(!admission_fits(1, 999, 1, false)); // occupied + pending, not only mappings
-        assert!(!admission_fits(1000, 0, 0, true));
-        assert!(state_limits(8_388_608, 8_388_608, 1000, 1000, 262_144).is_ok());
-        for (observer, tree, proposals, bytes) in
-            [(8_388_609, 1, 0, 0), (1, 8_388_609, 0, 0), (1, 1, 1001, 0), (1, 1, 1, 262_145)]
-        {
-            assert_eq!(state_limits(observer, tree, 1, proposals, bytes).unwrap_err().code, ErrorCode::TooLarge);
-        }
-        assert_eq!(state_limits(1, 1, 1001, 0, 0).unwrap_err().code, ErrorCode::ChannelFull);
-    }
-    #[test]
     fn log_pages_include_pending_bytes_and_tree_cache_keeps_only_the_latest_bounded_set() {
         let (mut core, session, _frames, _commands) = fixture();
         let (channel, group) = encrypted(&mut core, session);
@@ -1318,14 +1734,14 @@ mod tests {
         let access = core.sessions[&session].file_access.clone();
         core.mls_tree(&group, &access).unwrap();
         assert_eq!(core.mls_trees.len(), 1);
-        core.move_client(session, None);
+        core.move_client(session, None).unwrap();
         assert!(core.mls_trees.is_empty());
     }
     #[test]
     fn forced_encrypted_entry_cannot_bypass_channel_capacity() {
         let (mut core, session, _frames, _commands) = fixture();
         let (channel, _) = encrypted(&mut core, session);
-        core.move_client(session, None);
+        core.move_client(session, None).unwrap();
         core.channels.get_mut(&channel).unwrap().max_clients = Some(0);
         core.sessions.get_mut(&session).unwrap().groups = vec![ADMIN_GROUP];
         assert_eq!(core.client_move(session, session, channel).unwrap_err().code, ErrorCode::ChannelFull);

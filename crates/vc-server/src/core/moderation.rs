@@ -544,7 +544,9 @@ impl Core {
             })
             .collect();
         match self.store.apply_revocations(&devices, seq) {
-            Ok(true) => {}
+            Ok(true) => {
+                self.voice_dirty = true;
+            }
             Ok(false) => return,
             Err(e) => {
                 tracing::warn!("store: {e:#}");

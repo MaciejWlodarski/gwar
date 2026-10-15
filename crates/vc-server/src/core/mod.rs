@@ -306,6 +306,14 @@ pub struct Core {
     connections: u64,
     history: history::HistoryRouting,
     calls: BTreeMap<ChannelId, voice::Call>,
+    voice_dirty: bool,
+    voice_expiry: Option<i64>,
+    voice_clock: fn() -> i64,
+    voice_limits: voice::Limits,
+    #[cfg(test)]
+    voice_passes: usize,
+    #[cfg(test)]
+    voice_parent_loads: std::cell::Cell<usize>,
     voice_bindings: Arc<ArcSwap<HashMap<SessionId, vc_proto::VoiceBinding>>>,
 }
 
@@ -507,6 +515,14 @@ impl Core {
             connections: 0,
             history: Default::default(),
             calls: BTreeMap::new(),
+            voice_dirty: true,
+            voice_expiry: None,
+            voice_clock: now_ms,
+            voice_limits: voice::Limits::default(),
+            #[cfg(test)]
+            voice_passes: 0,
+            #[cfg(test)]
+            voice_parent_loads: std::cell::Cell::new(0),
             voice_bindings: Arc::new(ArcSwap::from_pointee(HashMap::new())),
         };
         core.mls_reconcile()?;
@@ -688,7 +704,6 @@ impl Core {
         if let Some(client) = self.sessions.get(&session).map(client_view) {
             self.broadcast(Event::ClientUpdated(client), |_| true);
         }
-        self.voice_reconcile();
     }
 
     fn publish_routing(&self) {
@@ -1038,7 +1053,7 @@ impl Core {
         if !self.sessions.contains_key(&session) {
             return;
         }
-        self.move_client(session, None);
+        let _ = self.move_client(session, None);
         let Some(s) = self.sessions.remove(&session) else { return };
         self.mls_tree_requests.remove(&session);
         info!(session, uid = %s.uid, ?reason, "client left");
@@ -1128,8 +1143,11 @@ impl Core {
                 info!(session = id, uid = %session.uid, platform = ?session.platform, "remote client joined");
                 self.sessions.insert(id, session);
                 if let Some(channel) = channel {
-                    self.voice_allocate(id, channel);
-                    self.sessions.get_mut(&id).unwrap().channel = Some(channel);
+                    // Bridge entries are restricted to existing plaintext channels.
+                    if let Ok(admission) = self.voice_admission(id, channel) {
+                        self.voice_allocate(id, admission);
+                        self.sessions.get_mut(&id).unwrap().channel = Some(channel);
+                    }
                 }
                 let joined = client_view(&self.sessions[&id]);
                 self.broadcast(Event::ClientJoined(joined), |s| s.id != id);
@@ -1158,7 +1176,7 @@ impl Core {
                     s.away = away;
                 }
                 if let Some(channel) = u.channel.filter(|c| self.channels.contains_key(c) && !self.is_encrypted(*c)) {
-                    self.move_client(session, Some(channel));
+                    let _ = self.move_client(session, Some(channel));
                 }
                 if routing_changed {
                     self.publish_routing();
@@ -1285,14 +1303,23 @@ impl Core {
         Ok(Response::Empty {})
     }
 
-    fn move_client(&mut self, session: SessionId, channel: Option<ChannelId>) {
-        let Some(s) = self.sessions.get_mut(&session) else { return };
-        if s.channel == channel {
+    fn move_client(&mut self, session: SessionId, channel: Option<ChannelId>) -> Result<(), ErrorBody> {
+        if self.sessions.get(&session).is_none_or(|s| s.channel == channel) {
+            return Ok(());
+        }
+        let admission = channel.map(|channel| self.voice_admission(session, channel)).transpose()?;
+        self.move_admitted(session, admission);
+        Ok(())
+    }
+
+    fn move_admitted(&mut self, session: SessionId, admission: Option<voice::Admission>) {
+        let channel = admission.as_ref().map(|a| a.channel);
+        if self.sessions[&session].channel == channel {
             return;
         }
         self.voice_detach(session);
-        if let Some(channel) = channel {
-            self.voice_allocate(session, channel);
+        if let Some(admission) = admission {
+            self.voice_allocate(session, admission);
         }
         let s = self.sessions.get_mut(&session).unwrap();
         s.channel = channel;
@@ -1316,8 +1343,7 @@ impl Core {
         if target.out.is_none() && self.is_encrypted(channel) {
             return Err(err(ErrorCode::BadRequest, "TeamSpeak users cannot join encrypted channels"));
         }
-        self.voice_admission(client, channel)?;
-        self.move_client(client, Some(channel));
+        self.move_client(client, Some(channel))?;
         Ok(Response::Empty {})
     }
 
@@ -1343,7 +1369,7 @@ impl Core {
         let Some(row) = self.channels.get(&channel) else {
             return Err(err(ErrorCode::NotFound, "no such channel"));
         };
-        self.voice_admission(session, channel)?;
+        let admission = self.voice_admission(session, channel)?;
         if self.sessions[&session].channel == Some(channel) {
             return Ok(Response::Empty {});
         }
@@ -1358,13 +1384,13 @@ impl Core {
         {
             s.unlocked.insert(channel);
         }
-        self.move_client(session, Some(channel));
+        self.move_admitted(session, Some(admission));
         Ok(Response::Empty {})
     }
 
     fn channel_leave(&mut self, session: SessionId) -> Reply {
         if self.sessions[&session].channel.is_some() {
-            self.move_client(session, None);
+            let _ = self.move_client(session, None);
             let _ = self.media.try_send(MediaCmd::Remove { session });
         }
         Ok(Response::Empty {})
@@ -1709,7 +1735,7 @@ impl Core {
             .map(|s| (s.id, s.out.is_none()))
             .collect();
         let fallback = self.info.default_channel;
-        for (s, remote) in evicted {
+        for &(s, remote) in &evicted {
             if !remote && let Some(p) = self.sessions[&s].participation.as_ref() {
                 let binding = p.binding.clone();
                 self.broadcast(
@@ -1717,8 +1743,10 @@ impl Core {
                     |target| target.id == s,
                 );
             }
+        }
+        for (s, remote) in evicted {
             // Our users drop out of voice; TeamSpeak moves its users to the default channel.
-            self.move_client(s, remote.then_some(fallback));
+            let _ = self.move_client(s, remote.then_some(fallback));
         }
         for c in doomed {
             self.channels.remove(&c);

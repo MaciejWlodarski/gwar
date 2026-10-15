@@ -2208,11 +2208,20 @@ async fn voice_four_devices_creation_join_takeover_removal_and_new_call() {
     assert_ne!(next["call"], states[0]["call"]);
     assert!(next["group"].is_null());
     assert_eq!(clients[0].fails("mls.group_info", json!({"group":group})).await, "not_found");
-    // Channel deletion closes the exact participation and requires a new entry.
+    // Every participant receives its own bound closure, even after parent deletion.
+    let second = participation(&mut replacement, channel).await;
+    let third = participation(&mut clients[2], channel).await;
     clients[0].ok("channel.delete", json!({"channel":channel})).await;
     let closed = clients[0].next_event("voice.closed").await;
     assert_eq!(closed["reason"], "channel_deleted");
     assert_eq!(closed["participation"], next["participation"]);
+    for (client, state) in [(&mut replacement, second), (&mut clients[2], third)] {
+        let closed = client.next_event("voice.closed").await;
+        assert_eq!(closed["reason"], "channel_deleted");
+        assert_eq!(closed["call"], state["call"]);
+        assert_eq!(closed["participation"], state["participation"]);
+        assert!(client.ok("voice.state", json!({})).await["voice"].is_null());
+    }
     assert!(clients[0].ok("voice.state", json!({})).await["voice"].is_null());
 }
 
