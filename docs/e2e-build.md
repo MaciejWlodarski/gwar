@@ -1105,8 +1105,12 @@ channels and server chat:
   `meta` and never changes once set. An existing database is set to
   `plaintext` by the migration. A new database gets it at the first start of
   the server itself (`vc-server` serving, not administrative commands such as
-  `admin-token`, which leave it unset): `plaintext` with TeamSpeak
-  compatibility, `encrypted` without. From then on the stored mode decides:
+  `admin-token`, which leave it unset): `plaintext`, with or without
+  TeamSpeak compatibility, unless that start passes
+  `--encrypted-server-chat` (`VC_ENCRYPTED_SERVER_CHAT`), which makes it
+  `encrypted`. The option is read only while the mode is unset; when it
+  disagrees with the stored mode later, the server logs a warning and keeps
+  the stored mode. From then on the stored mode decides:
   server chat is bridged only when it is plaintext, plaintext `chat.send` to
   the server is refused when it is encrypted, and sealed requests for
   `server` are refused when it is plaintext.
