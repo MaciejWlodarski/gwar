@@ -1137,7 +1137,9 @@ limit (about 300 devices):
   over HTTP: `GET /api/mls/{group}/tree`, with the session's file access
   token as `Authorization: Bearer …`, answered with the TLS-encoded ratchet
   tree the observer holds and `x-gwar-epoch`; 404 if the session may not
-  read the conversation. The client builds the external commit with that
+  read the conversation; 429 past 30 requests a minute from one session (the
+  server exports each group's tree once per epoch). The client reads at most
+  8 MiB within 30 s and builds the external commit with that
   tree, whose hash OpenMLS checks against the GroupInfo; if the epoch
   changed meanwhile, it fetches both again.
 - Direct messages keep the tree in GroupInfos and Welcomes; agents ignore
