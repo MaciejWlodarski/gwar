@@ -581,7 +581,7 @@ export class MlsRuntime {
             const resolution = await this.transition<Resolution>({ reconcile: { ...this.args(group), result: { case: "entry", epoch: String(entry.epoch), commit: bytes(entry.commit), proposals: entry.proposals.map(bytes) } } });
             // A validated entry continuing from the checkpoint: no restart is
             // due. A pending join that lost is dropped without validating it.
-            if (resolution !== "rejoin") this.triggers.delete(local.conversation);
+            if (resolution !== "rejoin" || local.record.status !== "joining") this.triggers.delete(local.conversation);
           } catch (error) {
             if (!(error instanceof AgentOperationError)) throw error;
             await this.engine.reload();

@@ -63,6 +63,8 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
           this.state.out = null;
           if (result.case === "pruned") { g!.record.status = "rejoin"; return "rejoin"; }
           if (result.case === "rejected") return "rebuild";
+          // A member's pending commit that lost to its removal.
+          if (g!.record.status === "active" && result.commit?.[0] === 99) { g!.record.status = "removed"; g!.members = []; return "rejoin"; }
           // A pending join that lost is dropped, the winning entry unprocessed.
           if (g!.record.status === "joining" && result.commit?.[0] !== 4) { g!.record.status = "rejoin"; return "rejoin"; }
           g!.record.checkpoint!.epoch = epoch;
@@ -591,6 +593,20 @@ describe("Restarts", () => {
     f.world.entries = [{ epoch: 5, commit: "BQ", proposals: [] }];
     await f.runtime.sync().catch(() => {});
     expect(f.operations.filter(o => o.op === "reconcile")).toHaveLength(1);
+    expect(f.operations.some(o => o.op === "create")).toBe(true);
+  });
+  it("starts the wait again when a pending commit loses to a validated removal", async () => {
+    await asParticipant();
+    let now = 1_000_000;
+    const f = await fixture({ ...clean(), groups: [summary("active", "5")], out: { ...pending(), epoch: "5" } }, true, { now: () => now });
+    f.world.head = 3;
+    await expect(f.runtime.sync()).rejects.toThrow("behind");
+    now += 60_000; f.world.head = 6; f.world.behind = true;
+    f.world.entries = [{ epoch: 5, commit: "Yw", proposals: [] }];
+    await expect(f.runtime.sync()).rejects.toThrow("behind");
+    expect(f.operations.some(o => o.op === "create")).toBe(false);
+    now += 60_000;
+    await f.runtime.sync().catch(() => {});
     expect(f.operations.some(o => o.op === "create")).toBe(true);
   });
   it("acknowledges a Welcome to a superseded group without importing it", async () => {
