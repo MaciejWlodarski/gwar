@@ -765,7 +765,8 @@ bridge); the agent and the browser runtime keep channel groups (create, join,
 history assignments, leaf updates, deleted channels); the web client reads and
 writes encrypted channels (create options, sealed chat, gap lines, mention
 scan and accounting, moderator removal, "Who can read"); restarts are built,
-for direct messages and channels. Built as three pull requests, in this order: **4a**
+for direct messages and channels; encrypted attachments are built (4b), in
+channels and direct messages. Built as three pull requests, in this order: **4a**
 channels (options, groups, sealed channel messages, unread counts and
 mentions, TeamSpeak text isolation, restarts); **4b** encrypted attachments,
 in channels and direct messages; **4c** encrypted server-wide chat and large

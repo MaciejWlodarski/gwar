@@ -44,9 +44,10 @@ use.
   you are. Your saved servers follow you to every device. Servers verify
   devices themselves and keep working if Connect is down. See
   [docs/connect.md](docs/connect.md).
-- **Encrypted direct messages.** Gwar members exchange end-to-end encrypted
-  messages, edits and deletions. Other devices receive history keys when a
-  member is online. DMs with TeamSpeak users remain plaintext and live-only.
+- **Encrypted direct messages and channels.** Gwar members exchange end-to-end
+  encrypted messages, edits, deletions and files, in direct messages and in
+  channels created encrypted (channels are unencrypted by default). Other
+  devices receive history keys when a member is online. DMs with TeamSpeak users remain plaintext and live-only.
 - **Signed chat.** Gwar clients sign every message, edit, deletion and
   attachment and verify everyone else's, so a server cannot put words in a
   Gwar user's mouth without a warning. See [Security](#security).
@@ -124,7 +125,9 @@ The limits are listed plainly [at the end](#what-gwar-does-not-protect-yet).
   device, cleared storage or a checkpoint that was evicted has nothing to
   compare against.
 - Attachments are **checked against their signed hash** before they are shown
-  or saved; one that fails or has no signature loads only when you ask.
+  or saved; one that fails or has no signature loads only when you ask. A file
+  in an encrypted conversation is encrypted with its own key, which travels
+  only inside the signed message; one that fails a check cannot be opened.
 - Until its signature is checked a message is visibly pending; anything that
   fails or cannot be fully verified carries a warning. Notifications and
   mention highlights for Gwar messages need a verified signature. TeamSpeak
@@ -171,10 +174,11 @@ The limits are listed plainly [at the end](#what-gwar-does-not-protect-yet).
 
 Being honest about the limits is part of the design:
 
-- **Gwar-to-Gwar direct messages are end-to-end encrypted.** The server stores
-  ciphertext and sees participants, timing, sizes and read marks. Channel and
-  server-wide chat, files, voice, and DMs with TeamSpeak users remain readable
-  by the server. The remaining encryption work is tracked in
+- **Gwar-to-Gwar direct messages and encrypted channels are end-to-end
+  encrypted, with their files.** The server stores ciphertext and sees
+  participants, timing, sizes and read marks. Unencrypted channels (the
+  default), server-wide chat, their files, voice, and DMs with TeamSpeak users
+  remain readable by the server. The remaining encryption work is tracked in
   [docs/e2e-build.md](docs/e2e-build.md).
 - Voice is not signed, and presence, nicknames, channel names and roles are the
   server's word. A server can also hide, delay or reorder messages.
@@ -499,9 +503,9 @@ VC_TS3_DIR=/tmp/ts3 cargo test -p vc-client --test teamspeak_mode --test teamspe
   the desktop RNNoise by default, which adds almost no latency, with
   DeepFilterNet as a higher-quality option for loud surroundings; the web
   app starts with the browser's own suppression.
-- **More end-to-end encryption**: channel and server-wide chat and files with
-  MLS, voice with SFrame. Gwar direct messages already use encrypted storage
-  and offline delivery. Encryption is chosen when a channel is created, with or without
+- **More end-to-end encryption**: server-wide chat with MLS, voice with
+  SFrame. Gwar direct messages and encrypted channels, with their files,
+  already use encrypted storage and offline delivery. Encryption is chosen when a channel is created, with or without
   history for new members, and your history follows you to your devices
   through Gwar Connect. Channels shared with TeamSpeak users stay unencrypted
   and are labeled as such. Design: [docs/e2e.md](docs/e2e.md); prototypes
