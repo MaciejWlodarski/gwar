@@ -6,6 +6,8 @@ import type { Identity } from "../net/identity";
 import { encodeBase64Url } from "../net/base64url";
 import { DELETION_TEXT, MessageVerifier, fullyVerified, notificationAllowed, sameMessageIdentity, signMessage } from "../net/message-signature";
 import { withChannelLifecycle } from "../net/channel-lifecycle";
+import { sameAttachments } from "../net/sealed-file";
+import type { Attachment } from "../proto/Attachment";
 import type { MessageSignature } from "../proto/MessageSignature";
 import type { SealedMessage } from "../proto/SealedMessage";
 import type { ChatMessage } from "../proto/ChatMessage";
@@ -323,6 +325,8 @@ export class SealedConversations {
           item = { ...item, msg: { ...msg, text: "", signature: null, mentions: [], attachments: [] }, cannotOpen: "cannot_open", removed: row.deleted };
         } else {
           if (old?.kind === "msg" && old.authentic && !sameMessageIdentity(old.msg, msg)) return;
+          // An edit cannot swap the files its message was sent with: such a revision is ignored, like a fork.
+          if (old?.kind === "msg" && old.authentic && msg.text !== DELETION_TEXT && !sameAttachments(old.msg.attachments ?? [], msg.attachments ?? [])) return;
           item = { ...item, authentic: true, verified: fullyVerified(verification) };
           if (this.pending.has(key) && !this.notified.has(key) && notificationAllowed(verification)) this.notify(msg);
           this.notified.add(key); this.pending.delete(key);
@@ -337,7 +341,9 @@ export class SealedConversations {
     this.queue = done.catch(() => {});
     return done;
   }
-  async send(thread: SealedKey, text: string, mentions: string[], original?: MessageSignature): Promise<void> {
+  /** Sends a message, or a revision of `original`. Its encrypted attachments are
+   * tied to it when it is sent and stay its own through every edit; a deletion lists none. */
+  async send(thread: SealedKey, text: string, mentions: string[], original?: MessageSignature, attachments: Attachment[] = []): Promise<void> {
     this.check();
     const epoch = useSession.getState().epoch;
     const checkSession = () => { this.check(); if (epoch !== useSession.getState().epoch) throw new ConnectionLostError(); };
@@ -350,20 +356,22 @@ export class SealedConversations {
     };
     const conversation = this.conversation(thread);
     const retry = { message_id: original?.message_id ?? encodeBase64Url(crypto.getRandomValues(new Uint8Array(16))), created_at: original?.created_at ?? Date.now() };
+    if (text === DELETION_TEXT) attachments = [];
+    if (attachments.some(a => !a.sealed)) throw new Error("Unencrypted attachment in an encrypted conversation");
     if (this.runtime.status(conversation) !== "ready") throw new Error(tNow("chat.securing"));
     for (let attempt = 0; attempt < 3; attempt++) {
       let signature!: MessageSignature;
       const sealed = await this.runtime.sealMessage(conversation, async ctx => {
         check();
         signature = await signMessage(this.identity, { serverKey: ctx.server_key, target: conversation,
-          sealed: { group: ctx.group_id, epoch: Number(ctx.epoch) } }, this.uid, text, mentions, [], original, retry);
-        check(); return { text, mentions, attachments: [], signature };
+          sealed: { group: ctx.group_id, epoch: Number(ctx.epoch) } }, this.uid, text, mentions, attachments, original, retry);
+        check(); return { text, mentions, attachments, signature };
       });
       check();
       try {
         const row = original
           ? await this.link.request(text === DELETION_TEXT ? "chat.delete_own" : "chat.sealed.edit", { conversation, ...sealed, message_id: retry.message_id, revision: signature.revision })
-          : await this.link.request("chat.sealed.send", { conversation, ...sealed, message_id: retry.message_id, files: [] });
+          : await this.link.request("chat.sealed.send", { conversation, ...sealed, message_id: retry.message_id, files: attachments.map(a => a.id) });
         checkSession(); await this.receive(row, false); return;
       } catch (error) {
         checkSession();

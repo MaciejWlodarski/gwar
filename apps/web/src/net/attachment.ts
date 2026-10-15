@@ -2,11 +2,24 @@ import { attachment as attachmentSchema } from "./schema";
 import type { Attachment } from "../proto/Attachment";
 import { fetchFileBytes, type FileOptions } from "../platform/download";
 import { sha256 } from "./message-signature";
+import { openFile } from "./sealed-file";
+import { isInlineImage } from "../lib/files";
 
-/** Nothing is displayed or saved from a signed attachment until its complete bytes hash correctly. */
+/** Nothing is displayed or saved from a signed attachment until its complete bytes hash correctly. An
+ * encrypted one is checked as downloaded, decrypted, and checked again as the file its sender signed. */
 export async function verifiedAttachmentBlob(att: Attachment, path: string, fetchBytes = fetchFileBytes, opts: FileOptions = { origin: null, size: att.size, uploadLimit: 30 * 1024 * 1024 }): Promise<Blob> {
-  const bytes = await fetchBytes(path, opts);
+  let bytes: Uint8Array<ArrayBuffer>;
+  if (att.sealed) {
+    const ciphertext = await fetchBytes(path, { ...opts, size: att.sealed.size });
+    if (ciphertext.byteLength !== att.sealed.size || await sha256(ciphertext as BufferSource) !== att.sealed.sha256) throw new Error("Attachment hash mismatch");
+    bytes = await openFile(ciphertext, att.sealed.key);
+  } else bytes = await fetchBytes(path, opts);
   if (bytes.byteLength !== att.size || await sha256(bytes as BufferSource) !== att.sha256) throw new Error("Attachment hash mismatch");
+  // The sender's size hints must describe the image it encrypted.
+  if (att.sealed && (att.width || att.height)) {
+    const [width, height] = imageDimensions(bytes);
+    if (width !== att.width || height !== att.height) throw new Error("Attachment dimensions mismatch");
+  }
   return new Blob([bytes as BlobPart], { type: att.mime });
 }
 export async function verifiedAttachmentUrl(att: Attachment, path: string, fetchBytes = fetchFileBytes, opts?: FileOptions): Promise<string> {
@@ -96,6 +109,16 @@ function jpegDimensions(bytes: Uint8Array, v: DataView): [number, number] {
   }
   if (!found) throw malformed();
   return found;
+}
+/** An encrypted image's size, which only its sender can measure: unsigned display hints,
+ * checked against the decrypted image before it is shown. */
+export function imageHints(mime: string, bytes: Uint8Array): { width?: number; height?: number } {
+  if (!isInlineImage(mime)) return {};
+  try {
+    const [width, height] = imageDimensions(bytes);
+    checkImageDimensions(width, height);
+    return { width, height };
+  } catch { return {}; }
 }
 /** Convert the bounded decoded first frame to a static PNG, including explicitly loaded unsigned images. */
 export async function boundedImageBlob(blob: Blob, beforeDecode?: (width: number, height: number) => Promise<void>): Promise<Blob> {

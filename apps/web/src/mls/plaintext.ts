@@ -4,6 +4,10 @@ import { deviceStatement } from "../connect/crypto";
 import { DELETION_TEXT, messageBodyHash, messageStatement, strictVerify } from "../net/message-signature";
 import { channelOf, participants } from "./descriptor";
 import type { Plaintext } from "./types";
+import { attachment } from "../net/schema";
+import { SEALED_FILE_OVERHEAD } from "../net/sealed-file";
+
+const MAX_ATTACHMENTS = 10;
 
 interface Context { server_key: string; conversation: string; group_id: string; epoch: string; message_id: string; revision: number }
 const safe = (n: unknown): n is number => typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
@@ -35,6 +39,18 @@ function uniqueKeys(json: string): boolean {
   return true;
 }
 
+/** At most ten distinct encrypted files, each at the address the server gives an
+ * encrypted upload, its ciphertext exactly the nonce and tag longer than it. */
+function sealedAttachments(list: unknown[]): boolean {
+  const ids = new Set<string>();
+  return list.length <= MAX_ATTACHMENTS && list.every(a => {
+    if (!attachment(a) || !a.sealed || !/^[A-Za-z0-9_-]{1,64}$/.test(a.id) || ids.has(a.id) || a.url !== `/files/${a.id}/file`
+        || a.sha256.length === 0 || a.sealed.size !== a.size + SEALED_FILE_OVERHEAD) return false;
+    if ((a.width == null) !== (a.height == null) || a.width === 0 || a.height === 0) return false;
+    ids.add(a.id); return true;
+  });
+}
+
 /** Parse the complete sealed plaintext and authenticate v3 without storage or network
  * access. Malformed content returns null; operational crypto failures propagate. */
 export async function authenticatePlaintext(bytes: Uint8Array, context: Context): Promise<Plaintext | null> {
@@ -44,8 +60,7 @@ export async function authenticatePlaintext(bytes: Uint8Array, context: Context)
     const value: unknown = JSON.parse(json);
     if (!uniqueKeys(json) || !object(value) || !fields(value, ["text", "mentions", "attachments", "signature"]) || typeof value.text !== "string"
         || !Array.isArray(value.mentions) || !value.mentions.every(m => typeof m === "string")
-        // Step 3 direct messages cannot carry attachments.
-        || !Array.isArray(value.attachments) || value.attachments.length !== 0 || !object(value.signature)) return null;
+        || !Array.isArray(value.attachments) || !sealedAttachments(value.attachments) || !object(value.signature)) return null;
     const s = value.signature;
     const strings = ["server_key", "conversation", "group_id", "epoch", "author_uid", "key", "certificate_hash", "message_id", "previous_revision_hash", "body_hash", "signature"];
     if (!fields(s, [...strings, "certificate", "revision", "created_at", "signed_at"]) || !strings.every(k => typeof s[k] === "string")
@@ -57,7 +72,7 @@ export async function authenticatePlaintext(bytes: Uint8Array, context: Context)
     if (context.conversation.startsWith("dm:") ? !participants(context.conversation).includes(s.author_uid as string) : channelOf(context.conversation) === undefined) return null;
     if (s.revision === 0) { if (s.previous_revision_hash !== "-" || s.created_at !== s.signed_at) return null; }
     else decodeFixed(s.previous_revision_hash as string, 32);
-    if (value.text === DELETION_TEXT && (s.revision === 0 || value.mentions.length)) return null;
+    if (value.text === DELETION_TEXT && (s.revision === 0 || value.mentions.length || value.attachments.length)) return null;
     if (s.certificate !== null) {
       const c = s.certificate;
       if (!object(c) || !fields(c, ["account_key", "device_key", "issued_at", "expires_at", "signature"])

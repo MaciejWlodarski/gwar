@@ -115,5 +115,5 @@ export type RequestInput<O extends Op> = O extends "channel.create"
           : O extends "ban.create"
             ? Partial<RequestData<O>>
             : O extends "file.upload"
-              ? { name: string; size: number; mime: string; sha256: string } // generated as bigint, which JSON cannot carry
+              ? { name: string; size: number; mime: string; sha256: string; sealed?: boolean } // generated as bigint, which JSON cannot carry
               : RequestData<O>;

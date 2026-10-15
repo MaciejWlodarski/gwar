@@ -19,6 +19,60 @@ describe("attachment bytes", () => {
   });
 });
 
+describe("encrypted attachments", () => {
+  const png = (width: number, height: number) => {
+    const bytes = new Uint8Array(24); bytes.set([137, 80, 78, 71]); bytes.set([73, 72, 68, 82], 12);
+    const view = new DataView(bytes.buffer); view.setUint32(16, width); view.setUint32(20, height);
+    return bytes;
+  };
+  async function sealed(bytes: Uint8Array<ArrayBuffer>, hints: { width?: number; height?: number } = {}) {
+    const { sealFile } = await import("./sealed-file");
+    const { key, ciphertext } = await sealFile(bytes);
+    const att = { id: "f", name: "a.png", mime: "image/png", size: bytes.length, url: "/files/f/file", sha256: await sha256(bytes), ...hints,
+      sealed: { key, sha256: await sha256(ciphertext), size: ciphertext.length } };
+    return { att, ciphertext };
+  }
+  it("round-trips, and refuses a wrong key, a changed byte or a short ciphertext", async () => {
+    const { sealFile, openFile, SEALED_FILE_OVERHEAD } = await import("./sealed-file");
+    const plain = new TextEncoder().encode("secret");
+    const a = await sealFile(plain), b = await sealFile(plain);
+    expect(a.ciphertext).toHaveLength(plain.length + SEALED_FILE_OVERHEAD);
+    expect(a.key).not.toBe(b.key); expect(a.ciphertext).not.toEqual(b.ciphertext);
+    expect(new TextDecoder().decode(await openFile(a.ciphertext, a.key))).toBe("secret");
+    await expect(openFile(a.ciphertext, b.key)).rejects.toThrow();
+    const changed = a.ciphertext.slice(); changed[changed.length - 1]! ^= 1;
+    await expect(openFile(changed, a.key)).rejects.toThrow();
+    await expect(openFile(a.ciphertext.subarray(0, SEALED_FILE_OVERHEAD - 1), a.key)).rejects.toThrow();
+  });
+  it("fetches the ciphertext, checks it, decrypts it and checks the file it signs", async () => {
+    const image = png(2, 3);
+    const { att, ciphertext } = await sealed(image, { width: 2, height: 3 });
+    const fetch = vi.fn(async () => ciphertext);
+    const blob = await verifiedAttachmentBlob(att, att.url, fetch);
+    expect(new Uint8Array(await blob.arrayBuffer())).toEqual(image); expect(blob.type).toBe("image/png");
+    expect(fetch).toHaveBeenCalledWith(att.url, expect.objectContaining({ size: ciphertext.length }));
+  });
+  it("can't open a file whose ciphertext, contents or size hints are not what was signed", async () => {
+    const image = png(2, 3);
+    const { att, ciphertext } = await sealed(image, { width: 2, height: 3 });
+    const other = await sealed(png(2, 3));
+    for (const [changed, bytes] of [
+      [att, other.ciphertext], // another encryption of the same file
+      [{ ...att, sealed: { ...att.sealed, key: other.att.sealed.key } }, ciphertext],
+      [{ ...att, sealed: other.att.sealed }, other.ciphertext.slice(0, -1)],
+      [{ ...att, sha256: await sha256(png(2, 4)) }, ciphertext],
+      [{ ...att, size: 25 }, ciphertext],
+      [{ ...att, width: 4 }, ciphertext],
+    ] as const) await expect(verifiedAttachmentBlob(changed, att.url, async () => bytes)).rejects.toThrow();
+    // Ciphertext other than the one signed is not even decrypted.
+    const decrypt = vi.spyOn(crypto.subtle, "decrypt");
+    await expect(verifiedAttachmentBlob(att, att.url, async () => other.ciphertext)).rejects.toThrow("hash mismatch");
+    expect(decrypt).not.toHaveBeenCalled();
+    // A matching hint-less image is fine; the hints are only display hints.
+    await expect(verifiedAttachmentBlob({ ...att, width: undefined, height: undefined }, att.url, async () => ciphertext)).resolves.toBeInstanceOf(Blob);
+  });
+});
+
 it("bounds header and decoded image dimensions before creating a preview", async () => {
   const { imageDimensions, checkImageDimensions, boundedImageBlob } = await import("./attachment");
   const bytes = new Uint8Array(24); bytes.set([137, 80, 78, 71]); bytes.set([73, 72, 68, 82], 12);
