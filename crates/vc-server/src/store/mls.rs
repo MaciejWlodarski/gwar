@@ -71,7 +71,7 @@ impl Store {
             EXISTS(SELECT 1 FROM mls_proposals p WHERE p.group_id=g.group_id)
             FROM mls_groups g WHERE g.conversation>?1
               AND (substr(g.conversation,1,31)='dm:' || ?2 || ':' OR substr(g.conversation,31)=':' || ?2
-                OR substr(g.conversation,1,8)='channel:')
+                OR substr(g.conversation,1,8)='channel:' OR g.conversation='server')
               AND incarnation=(SELECT MAX(incarnation) FROM mls_groups WHERE conversation=g.conversation)
             ORDER BY g.conversation LIMIT ?3",
         )?;
@@ -377,7 +377,7 @@ impl Store {
             JOIN mls_groups g ON g.group_id=w.group_id
             WHERE w.device_key=?1 AND w.created_at>=?2 AND w.id>?3
               AND (substr(g.conversation,1,31)='dm:' || ?4 || ':' OR substr(g.conversation,31)=':' || ?4
-                OR substr(g.conversation,1,8)='channel:')
+                OR substr(g.conversation,1,8)='channel:' OR g.conversation='server')
             ORDER BY w.id LIMIT ?5",
         )?;
         let mut rows = stmt.query(params![device, now - RETENTION_MS, after, uid, limit])?;
@@ -403,7 +403,7 @@ impl Store {
             JOIN mls_groups g ON g.group_id=h.group_id
             WHERE h.recipient_device=?1 AND h.created_at>=?2 AND h.id>?3 AND (?4 IS NULL OR h.group_id=?4)
               AND (substr(g.conversation,1,31)='dm:' || ?5 || ':' OR substr(g.conversation,31)=':' || ?5
-                OR substr(g.conversation,1,8)='channel:')
+                OR substr(g.conversation,1,8)='channel:' OR g.conversation='server')
             ORDER BY h.id LIMIT ?6",
         )?;
         let mut rows = stmt.query(params![device, now - RETENTION_MS, paging.0, group, uid, paging.1])?;
@@ -558,7 +558,7 @@ impl Store {
         Ok(())
     }
 
-    /// Outstanding requests in channel groups that `device` could answer or made, as `(group, recipient)`.
+    /// Outstanding requests in channel and server groups that `device` could answer or made, as `(group, recipient)`.
     pub fn mls_channel_requests(
         &self,
         device: Option<&str>,
@@ -567,7 +567,8 @@ impl Store {
     ) -> Result<Vec<(String, String)>> {
         let mut stmt = self.db.prepare(
             "SELECT r.group_id,r.device_key FROM mls_history_requests r JOIN mls_groups g ON g.group_id=r.group_id
-             WHERE r.requested_at>?1 AND substr(g.conversation,1,8)='channel:' AND (?3 IS NULL OR r.group_id=?3)
+             WHERE r.requested_at>?1 AND (substr(g.conversation,1,8)='channel:' OR g.conversation='server')
+               AND (?3 IS NULL OR r.group_id=?3)
                AND (?2 IS NULL OR r.device_key=?2
                  OR EXISTS(SELECT 1 FROM mls_leaves l WHERE l.group_id=r.group_id AND l.device_key=?2))
              ORDER BY r.group_id,r.device_key",

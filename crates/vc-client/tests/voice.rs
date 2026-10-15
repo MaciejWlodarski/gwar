@@ -84,6 +84,7 @@ async fn tone_travels_between_native_clients() {
         media_bind: any,
         media_advertise: any,
         max_clients: 8,
+        encrypted_server_chat: false,
         server_password: None,
         web_root: None,
         ice_servers: vec![],

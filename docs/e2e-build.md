@@ -767,7 +767,8 @@ writes encrypted channels (create options, sealed chat, gap lines, mention
 scan and accounting, moderator removal, "Who can read"); restarts are built,
 for direct messages and channels; encrypted attachments are built (4b), in
 channels and direct messages; large groups are built (4c, first part: channel
-GroupInfos without the tree, the tree endpoint, joining with it). Built as
+GroupInfos without the tree, the tree endpoint, joining with it); encrypted
+server chat is built on the server (4c, second part, server). Built as
 three pull requests, in this order: **4a**
 channels (options, groups, sealed channel messages, unread counts and
 mentions, TeamSpeak text isolation, restarts); **4b** encrypted attachments,

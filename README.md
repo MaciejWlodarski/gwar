@@ -362,6 +362,15 @@ key clients see a new server and have to confirm the change with you.
 Back up the database while the server runs with
 `vc-server --data-dir data backup copy.sqlite3`.
 
+### Server-wide chat
+
+Server-wide chat is plaintext and live-only by default. On the first serving
+start of a new server, `--encrypted-server-chat` (`VC_ENCRYPTED_SERVER_CHAT`)
+chooses encrypted server chat with history permanently. Administrative commands
+such as `admin-token` do not choose its mode. Existing servers stay plaintext;
+a conflicting flag warns and keeps the stored mode. Encrypted server chat stays
+unbridged even if TeamSpeak compatibility is enabled later.
+
 ### Gwar Connect
 
 Servers accept Gwar Connect devices out of the box. Every five minutes they

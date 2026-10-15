@@ -58,7 +58,7 @@ const path = (put = false): Rule<string> => (v): v is string => {
   if (!str(2048)(v)) return false;
   try { filePath(v, put ? "PUT" : "GET"); return true; } catch { return false; }
 };
-const server = shape<ServerInfo>({ name: str(256), welcome: text, version: str(64), default_channel: id, max_clients: int(65535), upload_limit: int(Number.MAX_SAFE_INTEGER), file_access: literal<FileAccess>(["link", "members"]), teamspeak: bool });
+const server = shape<ServerInfo>({ name: str(256), welcome: text, version: str(64), default_channel: id, max_clients: int(65535), upload_limit: int(Number.MAX_SAFE_INTEGER), file_access: literal<FileAccess>(["link", "members"]), teamspeak: bool, server_chat: shape({ encrypted: bool, history: bool }) });
 /** A download bearer token: empty, or URL-safe characters only, so it is always a valid header value. */
 const bearer: Rule<string> = (v): v is string => str(128)(v) && /^[A-Za-z0-9_-]*$/.test(v);
 const fixed = (bytes: number): Rule<string> => (v): v is string => {

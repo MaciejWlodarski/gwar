@@ -64,6 +64,8 @@ pub struct Config {
     /// Address advertised to WebRTC clients. Port 0 means "use the bound port".
     pub media_advertise: SocketAddr,
     pub max_clients: u32,
+    /// Encrypt server chat only when its permanent mode has not been set yet.
+    pub encrypted_server_chat: bool,
     pub server_password: Option<String>,
     pub web_root: Option<PathBuf>,
     pub ice_servers: Vec<IceServer>,
@@ -211,6 +213,7 @@ pub async fn start(config: Config) -> Result<Running> {
         Some(path) => Store::open(path)?,
         None => Store::in_memory()?,
     };
+    store.init_server_chat(config.encrypted_server_chat)?;
     store.seed_channels()?;
     let admin_token = core::ensure_first_admin_token(&store)?;
     let connect_seq: i64 = store.meta("connect_seq")?.and_then(|s| s.parse().ok()).unwrap_or(0);

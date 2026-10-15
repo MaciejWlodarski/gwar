@@ -1,4 +1,4 @@
-//! Opaque delivery of encrypted direct messages and channel chat. The core actor
+//! Opaque delivery of encrypted direct messages, channel and server chat. The core actor
 //! orders validation, storage and broadcasts.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as B64};
@@ -15,7 +15,11 @@ const MAX_CIPHERTEXT: usize = 24 * 1024;
 impl Core {
     fn sealed_access(&self, session: SessionId, conversation: &str, write: bool) -> Result<(), ErrorBody> {
         let participants = dm_participants(conversation);
-        if participants.is_none() {
+        if conversation == "server" {
+            if !self.info.server_chat.encrypted {
+                return Err(err(ErrorCode::BadRequest, "server chat is not end-to-end encrypted"));
+            }
+        } else if participants.is_none() {
             let id = super::mls::channel_id(conversation)
                 .ok_or_else(|| err(ErrorCode::BadRequest, "invalid conversation"))?;
             match self.channels.get(&id) {
@@ -143,7 +147,7 @@ impl Core {
         Ok(Response::SealedMessage(Box::new(message)))
     }
 
-    /// A moderator's removal of a channel message (direct messages have no moderators).
+    /// A moderator's removal of a channel or server message (direct messages have no moderators).
     fn sealed_remove(&mut self, session: SessionId, conversation: &str, id: MessageId) -> Reply {
         if dm_participants(conversation).is_some() {
             return Err(err(ErrorCode::BadRequest, "direct messages are removed by their authors"));

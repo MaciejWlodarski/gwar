@@ -88,6 +88,7 @@ async fn start_with_reply(
                 upload_limit: 0,
                 file_access: Default::default(),
                 teamspeak: false,
+                server_chat: Default::default(),
             },
             permissions: vec![],
             groups: vec![],

@@ -20,7 +20,7 @@ members: Array<Member>,
 unread: Array<Unread>,
 /**
  * Direct messages with unread sealed messages, including offline peers, and
- * every readable encrypted channel with its read mark.
+ * every readable encrypted channel and server chat with its read mark.
  */
 conversations: Array<ConversationUnread>, ice_servers: Array<IceServer>,
 /**

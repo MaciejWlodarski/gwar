@@ -321,6 +321,7 @@ async fn main() -> anyhow::Result<()> {
         media_bind: any,
         media_advertise: advertise,
         max_clients: 8,
+        encrypted_server_chat: false,
         server_password: None,
         web_root: None,
         ice_servers: vec![],

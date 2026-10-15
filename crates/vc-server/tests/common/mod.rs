@@ -41,6 +41,7 @@ pub fn base_config() -> Config {
         media_bind: "127.0.0.1:0".parse().unwrap(),
         media_advertise: "127.0.0.1:0".parse().unwrap(),
         max_clients: 64,
+        encrypted_server_chat: false,
         server_password: None,
         web_root: None,
         ice_servers: Vec::new(),

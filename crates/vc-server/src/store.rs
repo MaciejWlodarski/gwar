@@ -334,6 +334,11 @@ const MIGRATIONS: &[&str] = &[
         DELETE FROM files WHERE sealed_message=NEW.id;
     END;
     "#,
+    r#"
+    INSERT INTO meta(key,value) SELECT 'server_chat','plaintext'
+    WHERE EXISTS(SELECT 1 FROM groups) OR EXISTS(SELECT 1 FROM channels)
+       OR EXISTS(SELECT 1 FROM users) OR EXISTS(SELECT 1 FROM meta);
+    "#,
 ];
 
 /// References reassigned by a member merge (including ones already held by the target).
@@ -458,6 +463,30 @@ impl Store {
 
     pub fn meta(&self, key: &str) -> Result<Option<String>> {
         Ok(self.db.query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0)).optional()?)
+    }
+
+    /// Serving startup alone fixes the permanent mode; opening the store does not.
+    pub fn init_server_chat(&self, encrypted: bool) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO meta(key,value) VALUES('server_chat',?1) ON CONFLICT(key) DO NOTHING",
+            [if encrypted { "encrypted" } else { "plaintext" }],
+        )?;
+        let stored = self.server_chat()?;
+        if encrypted && !stored.encrypted {
+            tracing::warn!(
+                "--encrypted-server-chat only applies to a new server; keeping stored plaintext server chat"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn server_chat(&self) -> Result<vc_proto::ServerChat> {
+        let encrypted = match self.meta("server_chat")?.as_deref() {
+            None | Some("plaintext") => false,
+            Some("encrypted") => true,
+            Some(mode) => anyhow::bail!("invalid server chat mode: {mode}"),
+        };
+        Ok(vc_proto::ServerChat { encrypted, history: encrypted })
     }
 
     pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
@@ -1424,6 +1453,50 @@ fn urlencode(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_chat_migration_distinguishes_existing_data_from_a_new_database() {
+        for data in [
+            "",
+            "INSERT INTO groups(id,name,permissions) VALUES(1,'Admin','[]');",
+            "INSERT INTO channels(id,name) VALUES(1,'Lobby');",
+            "INSERT INTO users(uid,public_key,nickname,created_at,last_seen) VALUES('u','k','U',0,0);",
+            "INSERT INTO meta VALUES('name','Existing');",
+        ] {
+            let db = Connection::open_in_memory().unwrap();
+            let before = migration_adding("SELECT 'server_chat','plaintext'");
+            for migration in &MIGRATIONS[..before] {
+                db.execute_batch(migration).unwrap();
+            }
+            db.pragma_update(None, "user_version", before).unwrap();
+            db.execute_batch(data).unwrap();
+            let store = Store::init(db).unwrap();
+            assert_eq!(
+                store.meta("server_chat").unwrap().as_deref(),
+                if data.is_empty() { None } else { Some("plaintext") },
+                "{data}"
+            );
+        }
+    }
+
+    #[test]
+    fn serving_fixes_server_chat_once_and_rejects_unknown_modes() {
+        for encrypted in [false, true] {
+            let store = Store::in_memory().unwrap();
+            assert_eq!(store.meta("server_chat").unwrap(), None);
+            store.init_server_chat(encrypted).unwrap();
+            store.init_server_chat(!encrypted).unwrap();
+            let mode = store.server_chat().unwrap();
+            assert_eq!((mode.encrypted, mode.history), (encrypted, encrypted));
+            assert_eq!(
+                store.meta("server_chat").unwrap().as_deref(),
+                Some(if encrypted { "encrypted" } else { "plaintext" })
+            );
+        }
+        let store = Store::in_memory().unwrap();
+        store.set_meta("server_chat", "invalid").unwrap();
+        assert!(store.init_server_chat(false).is_err());
+    }
 
     #[test]
     fn encrypted_attachment_migration_keeps_existing_plaintext_files() {

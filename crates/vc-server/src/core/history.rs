@@ -1,4 +1,4 @@
-//! History requests in channel groups, routed by assignment (docs/e2e-build.md,
+//! History requests in channel and server groups, routed by assignment (docs/e2e-build.md,
 //! section 4, "History in channels"). Assignments and rotations live in memory;
 //! outstanding requests are stored, so a restarted server routes them afresh.
 
@@ -105,7 +105,7 @@ impl HistoryRouting {
 }
 
 impl Core {
-    /// A device asked for history in a channel group (the request is stored).
+    /// A device asked for history in a channel or server group (the request is stored).
     pub(super) fn history_requested(&mut self, group: &str, recipient: &str) {
         let now = now_ms();
         let key = (group.to_owned(), recipient.to_owned());

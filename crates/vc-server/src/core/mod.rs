@@ -437,6 +437,7 @@ impl Core {
                 _ => FileAccess::Link,
             },
             teamspeak: config.teamspeak,
+            server_chat: store.server_chat()?,
         };
         let groups = store.groups()?.into_iter().map(|g| (g.id, g)).collect();
         let mls_commit_clock = store.meta("mls_commit_clock")?.map(|s| s.parse()).transpose()?.unwrap_or(0);
@@ -1296,11 +1297,14 @@ impl Core {
             .collect()
     }
 
-    /// Unread sealed messages: direct messages, then encrypted channels.
+    /// Unread sealed messages: direct messages, encrypted channels and server chat.
     fn conversations_for(&self, user: i64, uid: &str) -> Result<Vec<vc_proto::ConversationUnread>> {
         let mut conversations = self.store.sealed_unread(user, uid)?;
         for c in self.channels.values().filter(|c| c.encrypted) {
             conversations.push(self.store.sealed_conversation_unread(user, &format!("channel:{}", c.id))?);
+        }
+        if self.info.server_chat.encrypted {
+            conversations.push(self.store.sealed_conversation_unread(user, "server")?);
         }
         Ok(conversations)
     }
@@ -1692,6 +1696,9 @@ impl Core {
                 self.broadcast(Event::ChatMessage(message.clone()), |s| s.id == to || s.id == session);
             }
             ChatTarget::Server => {
+                if self.info.server_chat.encrypted {
+                    return Err(err(ErrorCode::BadRequest, "server chat requires chat.sealed requests"));
+                }
                 self.verify_message(session, &message, false)?;
                 self.reserve_message_identity(&message)?;
                 message.id = self.ephemeral_id();
@@ -1894,6 +1901,55 @@ pub(crate) mod expiry_tests {
 
     async fn bridged(core: &CoreHandle, session: SessionId) -> Option<(ChannelId, bool)> {
         on_core(core, move |core| core.routing.load().members.get(&session).map(|m| (m.channel, m.bridged))).await
+    }
+
+    #[tokio::test]
+    async fn enabling_teamspeak_later_preserves_server_chat_and_refuses_encrypted_remote_text() {
+        for encrypted in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("vc.sqlite3");
+            let store = Store::open(&path).unwrap();
+            store.seed_channels().unwrap();
+            store.init_server_chat(encrypted).unwrap();
+            drop(store);
+            let core = test_core_teamspeak(Store::open(&path).unwrap()).unwrap();
+            let (notes, mut bridge) = mpsc::unbounded_channel();
+            core.bridge(BridgeMsg::Attach(notes)).await;
+            let BridgeNote::Snapshot { server, .. } = bridge.recv().await.unwrap() else { panic!("snapshot") };
+            assert!(server.teamspeak);
+            assert_eq!((server.server_chat.encrypted, server.server_chat.history), (encrypted, encrypted));
+            let (joined, session) = oneshot::channel();
+            core.bridge(BridgeMsg::Join(
+                RemoteClient {
+                    uid: "ts:remote".into(),
+                    nickname: "remote".into(),
+                    channel: server.default_channel,
+                    platform: Platform::Ts3,
+                    muted: false,
+                    deafened: false,
+                    away: None,
+                },
+                joined,
+            ))
+            .await;
+            let session = session.await.unwrap().unwrap();
+            let (result, next_id) = on_core(&core, move |core| {
+                let before = core.next_ephemeral;
+                let result = core.chat_send(session, ChatTarget::Server, "hello".into(), vec![], vec![], None);
+                (result, (before, core.next_ephemeral))
+            })
+            .await;
+            if encrypted {
+                assert_eq!(result.unwrap_err().code, ErrorCode::BadRequest);
+                assert_eq!(next_id.0, next_id.1, "refused text is never delivered");
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(next_id.0 + 1, next_id.1);
+            }
+            // The bridge input goes through the same guard and is dropped by the core.
+            core.bridge(BridgeMsg::Chat(session, ChatTarget::Server, "from TeamSpeak".into())).await;
+            assert_eq!(on_core(&core, |core| core.next_ephemeral).await, next_id.1 + u32::from(!encrypted));
+        }
     }
 
     #[tokio::test]
