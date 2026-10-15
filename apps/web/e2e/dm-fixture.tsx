@@ -34,7 +34,6 @@ export async function connect(account: number, device: number, address: string) 
     selectServer() { useSession.getState().dispatch({ type: "setActive", key: "server" }); },
     server: () => useSession.getState().threads.server,
     serverReady: () => runtime().status("server") === "ready",
-    freshRevocations: () => messageStorage.mergeFeed([], undefined, Date.now()),
     rows: (peer: string) => useSession.getState().threads[`dm:${peer}`]?.items ?? [],
     openRaw: (row: SealedMessage) => runtime().openMessage(row),
     redeem: (token: string) => (controller as unknown as { conn: { request: (op: string, data: object) => Promise<unknown> } }).conn.request("token.redeem", { token }),

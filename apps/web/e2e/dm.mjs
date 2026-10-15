@@ -41,7 +41,13 @@ try {
   const contexts = [], pages = [];
   async function device(account, device, address = ws) {
     const context = await browser.newContext(); contexts.push(context);
-    await context.route("**/*", route => ["127.0.0.1", "localhost"].includes(new URL(route.request().url()).hostname) ? route.continue() : route.abort());
+    await context.route("**/*", route => {
+      const url = new URL(route.request().url());
+      if (address !== ws && url.pathname.endsWith("/v1/revocations")) {
+        return route.fulfill({ json: { revocations: [] }, headers: { "access-control-allow-origin": "*" } });
+      }
+      return ["127.0.0.1", "localhost"].includes(url.hostname) ? route.continue() : route.abort();
+    });
     const page = await context.newPage(); pages.push(page);
     page.on("pageerror", e => console.error("browser:", e));
     await page.goto(`${web}/e2e/dm.html`);
@@ -96,7 +102,7 @@ try {
   await open(b, auid); await sync(a, b);
   await b.getByText("offline encrypted hello", { exact: true }).waitFor({ timeout: 45000 });
   const original = await a.evaluate(peer => window.dm.rows(peer).find(i => i.sealed).sealed, buid);
-  assert.ok(!original.ciphertext.includes("offline encrypted hello"));
+  assert.ok(!Buffer.from(original.ciphertext, "base64url").includes(Buffer.from("offline encrypted hello")));
   console.log("PASS offline recipient connects and opens stored ciphertext");
   // UI edit and own deletion use sealed revisions, not plaintext channel endpoints.
   await a.getByRole("button", { name: "Edit message", exact: true }).click();
@@ -118,7 +124,7 @@ try {
   const picture = b.getByRole("button", { name: "Open dot.png", exact: true }).locator("img");
   await picture.waitFor({ timeout: 45000 });
   assert.match(await picture.getAttribute("src"), /^blob:/);
-  assert.equal(await picture.evaluate(img => img.complete && img.naturalWidth), 1);
+  await b.waitForFunction(() => { const img = document.querySelector('button[aria-label="Open dot.png"] img'); return img?.complete && img.naturalWidth === 1; }, null, { timeout: 45000 });
   const [attached] = await b.evaluate(peer => window.dm.rows(peer).find(i => i.msg?.text === "a picture").msg.attachments, auid);
   assert.equal(attached.url, `/files/${attached.id}/file`);
   assert.equal(attached.sealed.size, dot.length + 28);
@@ -190,7 +196,7 @@ try {
   await b2.getByText("encrypted channel hello", { exact: true }).waitFor({ timeout: 45000 });
   const sealedRow = await a.evaluate(id => window.dm.channel(id).items.find(i => i.msg?.text === "encrypted channel hello").sealed, secret);
   assert.equal(sealedRow.conversation, `channel:${secret}`);
-  assert.ok(!sealedRow.ciphertext.includes("encrypted channel hello"));
+  assert.ok(!Buffer.from(sealedRow.ciphertext, "base64url").includes(Buffer.from("encrypted channel hello")));
   await a.getByRole("button", { name: "Who can read", exact: true }).click();
   const readers = a.getByRole("dialog");
   await readers.getByText("User21", { exact: true }).waitFor();
@@ -260,7 +266,7 @@ try {
   await e.getByText("encrypted server hello", { exact: true }).waitFor({ timeout: 45000 });
   const serverRow = await d.evaluate(() => window.dm.server().items.find(i => i.msg?.text === "encrypted server hello"));
   assert.equal(serverRow.sealed.conversation, "server");
-  assert.ok(!serverRow.sealed.ciphertext.includes("encrypted server hello"));
+  assert.ok(!Buffer.from(serverRow.sealed.ciphertext, "base64url").includes(Buffer.from("encrypted server hello")));
   assert.equal(serverRow.authentic, true);
   await d.getByRole("button", { name: "Who can read", exact: true }).click();
   await d.getByRole("dialog").getByText("Messages are end-to-end encrypted.", { exact: false }).waitFor();
@@ -283,8 +289,13 @@ try {
   await e.bringToFront();
   await e.locator("textarea").click();
   await e.waitForFunction(id => window.dm.server().lastRead >= id, serverRow.sealed.id, { timeout: 45000 });
-  // The first message completed the deliberately blocked feed fetch; restore the local fake feed.
-  await e.evaluate(() => window.dm.freshRevocations());
+  for (const page of [d, e]) await page.evaluate(async () => {
+    const { messageStorage, refreshRevocations } = await import("/src/net/message-storage.ts");
+    await messageStorage.mergeFeed([], undefined, Date.now() - 61_000);
+    await refreshRevocations(undefined, undefined, true);
+    const state = await messageStorage.revocation("unused", "unused");
+    if (!state.fresh) throw new Error("Local revocation feed did not refresh");
+  });
   await e.evaluate(() => window.dm.select(1));
   await composer(d);
   assert.equal(await d.evaluate(uid => window.dm.mention("server mention", uid, "server"), await e.evaluate(() => window.dm.uid)), true);
@@ -311,7 +322,7 @@ try {
   await send(d, "server picture");
   const serverPicture = e.getByRole("button", { name: "Open dot.png", exact: true }).locator("img");
   await serverPicture.waitFor({ timeout: 45000 });
-  assert.equal(await serverPicture.evaluate(img => img.complete && img.naturalWidth), 1);
+  await e.waitForFunction(() => { const img = document.querySelector('button[aria-label="Open dot.png"] img'); return img?.complete && img.naturalWidth === 1; }, null, { timeout: 45000 });
   const serverFile = await e.evaluate(() => window.dm.server().items.find(i => i.msg?.text === "server picture").msg.attachments[0]);
   const serverBytes = Buffer.from(await (await fetch(`http://127.0.0.1:${encryptedPort}${serverFile.url}`)).arrayBuffer());
   assert.equal(serverBytes.length, dot.length + 28);
