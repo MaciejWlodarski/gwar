@@ -1948,6 +1948,153 @@ fn voice_uses_external_joins_parent_gates_and_no_durable_chat_keys() {
     assert_eq!(voice_kid(u64::MAX, u32::MAX), u64::MAX);
 }
 
+/// A parent and a voice tree containing A, B and C, all at the same accepted head.
+fn voice_fixture() -> (Fixture, Agent, Agent) {
+    let mut parent = channel_fixture(Kind::Channel);
+    let t = parent.t;
+    let mut pc = device(3, 31, t);
+    for joining in [&mut parent.b, &mut pc] {
+        let out =
+            joining.join_external(&server(), &parent.info, Some(&parent.observer.tree().unwrap().1), t, &()).unwrap();
+        joining.take_changes();
+        parent.observer = accept(parent.observer, &out, t);
+        acknowledge(joining, &parent.id, &out);
+        parent.a.receive(&server(), &parent.id, &out.commit, &[]).unwrap();
+        parent.a.take_changes();
+        parent.info = out.group_info;
+    }
+    let mut f = channel_fixture(Kind::Voice);
+    // Recreate with the actual pinned parent.
+    let mut d = SignedDescriptor::parse(&f.a.group(&server(), &f.id).unwrap().descriptor).unwrap().descriptor;
+    d.channel_group_id = Some(b64(&parent.id));
+    f.a.forget(&server(), &f.id).unwrap();
+    f.a.take_changes();
+    let signed = SignedDescriptor::sign(d, f.a.credential.clone(), &f.a.signer.0);
+    f.id = signed.group_id();
+    f.info = f.a.create(signed).unwrap();
+    f.a.take_changes();
+    f.a.settle(&server(), &f.id, Some(&f.id)).unwrap();
+    f.a.take_changes();
+    f.observer = Observer::create(&f.info, &server()).unwrap();
+    let mut c = Agent::new_voice([31; 32], pc.credential.clone(), t).unwrap();
+    c.take_changes();
+    for joining in [&mut f.b, &mut c] {
+        let out = joining.join_external(&server(), &f.info, Some(&f.observer.tree().unwrap().1), t, &()).unwrap();
+        joining.take_changes();
+        f.observer = accept(f.observer, &out, t);
+        acknowledge(joining, &f.id, &out);
+        f.a.receive(&server(), &f.id, &out.commit, &[]).unwrap();
+        f.a.take_changes();
+        f.info = out.group_info;
+    }
+    assert!(f.a.voice_keys(&server(), &f.id, &parent.a, t, &()).is_ok());
+    (f, parent.a, c)
+}
+
+#[test]
+fn voice_removal_hold_survives_competing_update_and_volatile_reload() {
+    let (mut f, parent, mut c) = voice_fixture();
+    let target = f.observer.leaves().iter().find(|l| l.device_key == f.b.credential.device_key()).unwrap().index;
+    let proposal = f.observer.propose_remove(&Ed25519Signer(key(200)), target).unwrap();
+    f.a.proposal(&server(), &f.id, &proposal).unwrap();
+    f.a.take_changes();
+    assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    // C has not seen the server's Remove and wins with an ordinary update.
+    let update = c.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+    c.take_changes();
+    f.observer = accept(f.observer, &update, f.t);
+    acknowledge(&mut c, &f.id, &update);
+    f.a.receive(&server(), &f.id, &update.commit, &[]).unwrap();
+    f.a.take_changes();
+    assert!(f.a.mls(&group_key(&server(), &f.id)).unwrap().pending_proposals().next().is_none());
+    f.a = Agent::load_voice([11; 32], f.a.credential.clone(), f.a.durable.clone()).unwrap();
+    f.a.pending(&server(), &f.id, false).unwrap();
+    f.a.take_changes();
+    assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    let proposal = f.observer.propose_remove(&Ed25519Signer(key(200)), target).unwrap();
+    f.a.proposal(&server(), &f.id, &proposal).unwrap();
+    f.a.take_changes();
+    let remove = f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+    f.a.take_changes();
+    f.observer = accept(f.observer, &remove, f.t);
+    acknowledge(&mut f.a, &f.id, &remove);
+    assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()).unwrap().members.len(), 2);
+}
+
+#[test]
+fn voice_own_pending_removal_blocks_export_but_chat_stays_available() {
+    let (mut f, parent, _) = voice_fixture();
+    let target = f.observer.leaves().iter().find(|l| l.device_key == f.b.credential.device_key()).unwrap().index;
+    let out = f.a.commit(&server(), &f.id, &[], &[target], f.t, &()).unwrap();
+    f.a.take_changes();
+    assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    f.observer = accept(f.observer, &out, f.t);
+    acknowledge(&mut f.a, &f.id, &out);
+    assert!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()).is_ok());
+    let mut chat = joined();
+    chat.a.commit(&server(), &chat.id, &[], &[1], chat.t, &()).unwrap();
+    chat.a.take_changes();
+    assert!(chat.a.sending_key(&server(), &chat.id, chat.t, &()).is_ok());
+}
+
+#[test]
+fn queued_parent_removal_blocks_voice_export_and_parent_removal_planning() {
+    let (f, mut parent, _) = voice_fixture();
+    let parent_id = fixed::<32>(
+        SignedDescriptor::parse(&f.a.group(&server(), &f.id).unwrap().descriptor)
+            .unwrap()
+            .descriptor
+            .channel_group_id
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    let group = parent.mls(&group_key(&server(), &parent_id)).unwrap();
+    let info = wire(group.export_group_info(parent.provider.crypto(), &parent.signer, true).unwrap()).unwrap();
+    // Channel observers may start from a current snapshot.
+    let mut observer = Observer::create(&info, &server()).unwrap();
+    let target = observer.leaves().iter().find(|l| l.device_key == f.b.credential.device_key()).unwrap().index;
+    let proposal = observer.propose_remove(&Ed25519Signer(key(200)), target).unwrap();
+    parent.proposal(&server(), &parent_id, &proposal).unwrap();
+    parent.take_changes();
+    assert!(!parent.group(&server(), &parent_id).unwrap().server_pending);
+    assert_eq!(f.a.voice_parent_removals(&server(), &f.id, &parent, true), Err(AgentError::Blocked));
+    assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    let remove = parent.commit(&server(), &parent_id, &[], &[], f.t, &()).unwrap();
+    parent.take_changes();
+    acknowledge(&mut parent, &parent_id, &remove);
+    assert_eq!(f.a.voice_parent_removals(&server(), &f.id, &parent, true).unwrap().len(), 1);
+}
+
+#[test]
+fn voice_external_join_rejects_another_members_epoch_zero_singleton() {
+    let f = channel_fixture(Kind::Voice);
+    let signed = SignedDescriptor::parse(&f.a.group(&server(), &f.id).unwrap().descriptor).unwrap();
+    // B copies A's authentic context, but signs a fresh epoch-zero singleton of B.
+    let config = MlsGroupCreateConfig::builder()
+        .ciphersuite(SUITE)
+        .capabilities(capabilities())
+        .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+        .with_group_context_extensions(
+            f.a.mls(&group_key(&server(), &f.id)).unwrap().public_group().group_context().extensions().clone(),
+        )
+        .build();
+    let group = MlsGroup::new_with_group_id(
+        &f.b.provider,
+        &f.b.signer,
+        &config,
+        GroupId::from_slice(&signed.group_id()),
+        f.b.with_key(),
+    )
+    .unwrap();
+    let forged = wire(group.export_group_info(f.b.provider.crypto(), &f.b.signer, true).unwrap()).unwrap();
+    assert!(Observer::create(&forged, &server()).is_err());
+    let mut joiner = Agent::new_voice([31; 32], device(3, 31, f.t).credential, f.t).unwrap();
+    joiner.take_changes();
+    assert!(joiner.join_external(&server(), &forged, None, f.t, &()).is_err());
+    // separate_tree_join_updates_removal_and_behind covers valid later-epoch snapshots.
+}
+
 #[test]
 fn voice_rejects_add_chain_and_wrong_parent_binding() {
     let t = now();

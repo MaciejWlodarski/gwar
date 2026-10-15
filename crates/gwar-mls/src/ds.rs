@@ -139,16 +139,14 @@ impl Observer {
         let (storage, group) = verified_group_info(group_info)?;
         let observer = Self::from_parts(storage, group, server_key)?;
         observer.check_tree()?;
-        if observer.descriptor.descriptor.kind == crate::Kind::Voice {
-            let leaves = observer.leaves();
-            if observer.epoch() != 0
-                || leaves.len() != 1
-                || leaves[0].device_key != observer.descriptor.creator.device_key()
-                || leaves[0].uid != observer.descriptor.descriptor.creator_uid
-            {
-                return Err(Invalid("voice creator"));
-            }
+        if observer.descriptor.descriptor.kind == crate::Kind::Voice && observer.epoch() != 0 {
+            return Err(Invalid("voice creator"));
         }
+        crate::rules::voice_initial_tree(
+            &observer.descriptor,
+            observer.epoch(),
+            observer.group.treesync().full_leaves().map(|(_, leaf)| leaf),
+        )?;
         Ok(observer)
     }
 

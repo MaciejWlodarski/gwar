@@ -39,6 +39,9 @@ impl Agent {
             return Err(AgentError::Blocked);
         }
         let channel = parent.mls(&key)?;
+        if channel.pending_proposals().next().is_some() {
+            return Err(AgentError::Blocked);
+        }
         let p = client_context(channel.public_group().group_context(), server)?;
         if p.descriptor.kind != crate::Kind::Channel
             || p.descriptor.private
@@ -89,7 +92,8 @@ impl Agent {
         now: i64,
         revocations: &dyn Revocations,
     ) -> Result<VoiceKeys> {
-        if !self.gate(server, id, now, revocations)?.can_send() {
+        let gate = self.gate(server, id, now, revocations)?;
+        if !gate.can_send() || gate.pending_commit {
             return Err(AgentError::Blocked);
         }
         let (voice, channel) = self.voice_parent(server, id, parent)?;

@@ -172,6 +172,9 @@ pub struct GroupRecord {
     pub checkpoint: Option<Checkpoint>,
     pub welcome_ids: BTreeSet<String>,
     pub server_pending: bool,
+    /// Voice-only holds survive proposal-queue clearing on competing commits.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    voice_removals: BTreeMap<u32, String>,
     /// For every uid, the epochs in which it had a leaf, as this device saw
     /// them: sorted, disjoint, non-adjacent inclusive ranges.
     pub evidence: BTreeMap<String, Vec<Interval>>,
@@ -735,6 +738,7 @@ impl Agent {
             checkpoint: None,
             welcome_ids: BTreeSet::new(),
             server_pending: false,
+            voice_removals: BTreeMap::new(),
             evidence: BTreeMap::new(),
             own_commit_at: None,
         });
@@ -750,6 +754,13 @@ impl Agent {
             record.status = Status::Active;
             record.checkpoint = Some(checkpoint(context)?);
             record.server_pending = false;
+            record.voice_removals.retain(|index, device| {
+                group
+                    .public_group()
+                    .leaf(LeafNodeIndex::new(*index))
+                    .and_then(leaf_credential)
+                    .is_some_and(|c| c.device_key() == device)
+            });
             return Ok(());
         }
         let exported = group
@@ -877,7 +888,7 @@ impl Agent {
         let record = self.groups.get(&key).ok_or(Invalid("unknown group"))?;
         let mut gate = Gate {
             blocked: Vec::new(),
-            server_pending: record.server_pending,
+            server_pending: record.server_pending || !record.voice_removals.is_empty(),
             pending_commit: self.outbox.contains_key(&key),
             rejoin: false,
             status: record.status,
@@ -933,10 +944,10 @@ impl Agent {
                 return Err(AgentError::Blocked);
             }
             let mut group = a.mls(&key)?;
-            a.process_proposal(&mut group, bytes)
+            a.process_proposal(&key, &mut group, bytes)
         })
     }
-    fn process_proposal(&self, group: &mut MlsGroup, bytes: &[u8]) -> Result<()> {
+    fn process_proposal(&mut self, key: &str, group: &mut MlsGroup, bytes: &[u8]) -> Result<()> {
         let processed = group.process_message(&self.provider, protocol(bytes)?).map_err(err("proposal"))?;
         if !matches!(processed.sender(),Sender::External(index) if *index==SenderExtensionIndex::new(0)) {
             return Err(Invalid("proposal sender"));
@@ -947,7 +958,27 @@ impl Agent {
         if !matches!(proposal.proposal(), Proposal::Remove(_)) {
             return Err(Invalid("external proposal type"));
         }
-        group.store_pending_proposal(self.provider.storage(), *proposal).map_err(err("store proposal"))
+        let Proposal::Remove(remove) = proposal.proposal() else { unreachable!() };
+        let target = remove.removed();
+        let device = group
+            .public_group()
+            .leaf(target)
+            .and_then(leaf_credential)
+            .ok_or(Invalid("removal target"))?
+            .device_key()
+            .to_owned();
+        group.store_pending_proposal(self.provider.storage(), *proposal).map_err(err("store proposal"))?;
+        if self.voice_only {
+            self.groups.get_mut(key).ok_or(Invalid("group record"))?.voice_removals.insert(target.u32(), device);
+        }
+        Ok(())
+    }
+    fn resolve_voice_removals(&mut self, key: &str, staged: &StagedCommit) {
+        if let Some(record) = self.groups.get_mut(key) {
+            for removal in staged.remove_proposals() {
+                record.voice_removals.remove(&removal.remove_proposal().removed().u32());
+            }
+        }
     }
     fn check_staged(&self, group: &MlsGroup, staged: &StagedCommit, sender: &CommitSender, time: i64) -> Result<()> {
         rules::staged(group.public_group(), staged, sender, time, self.provider.crypto())?;
@@ -1096,7 +1127,7 @@ impl Agent {
         }
         let mut group = self.mls(key)?;
         for p in proposals {
-            self.process_proposal(&mut group, p)?;
+            self.process_proposal(key, &mut group, p)?;
         }
         let processed = group.process_message(&self.provider, protocol(commit)?).map_err(err("commit"))?;
         let time = ds::commit_time(processed.aad()).ok_or(Invalid("commit time"))?;
@@ -1109,6 +1140,7 @@ impl Agent {
             return Err(Invalid("not a commit"));
         };
         self.check_staged(&group, &staged, &sender, time)?;
+        self.resolve_voice_removals(key, &staged);
         let removed = staged.self_removed();
         if removed {
             // Validation is complete. Delete before advancing: OpenMLS's delete
@@ -1136,6 +1168,7 @@ impl Agent {
                     if hash(&commit) == out.hash {
                         let mut group = a.mls(&key)?;
                         if !joining {
+                            a.resolve_voice_removals(&key, group.pending_commit().ok_or(Invalid("pending commit"))?);
                             group.merge_pending_commit(&a.provider).map_err(err("merge pending"))?;
                         }
                         a.derived(&key, &group)?;
@@ -1257,6 +1290,7 @@ impl Agent {
                     checkpoint: None,
                     welcome_ids: BTreeSet::new(),
                     server_pending: false,
+                    voice_removals: BTreeMap::new(),
                     evidence: BTreeMap::new(),
                     own_commit_at: None,
                 });
@@ -1291,6 +1325,7 @@ impl Agent {
             .into_verified(SUITE, self.provider.crypto(), info.group_id())
             .map_err(err("ratchet tree"))?;
         rules::tree(&descriptor, tree.leaves())?;
+        rules::voice_initial_tree(&descriptor, info.epoch().as_u64(), tree.leaves())?;
         let next = checkpoint(info.group_context())?;
         // Verification only: a throwaway provider, and nothing is committed.
         MlsGroup::external_commit_builder()
@@ -1355,6 +1390,7 @@ impl Agent {
                 .into_verified(SUITE, a.provider.crypto(), info.group_id())
                 .map_err(err("ratchet tree"))?;
             rules::tree(&descriptor, old_tree.leaves())?;
+            rules::voice_initial_tree(&descriptor, info.epoch().as_u64(), old_tree.leaves())?;
             if old_tree
                 .leaves()
                 .filter_map(leaf_credential)
