@@ -1553,7 +1553,7 @@ this exact tagged body, with `binding` and `serial` on every variant:
 | `action` | Other fields | Meaning |
 | --- | --- | --- |
 | `hold` | `epoch`, `removed: [device]` | stop sender, invalidate outstanding encryption work, purge these removed devices; used before processing a removal or blocking the MLS gate |
-| `supersede` | `epoch` | processing barrier for epoch T: record the engine's monotonic time once for every retained/staged E < T without a supersession time; advance the processed-epoch floor before any import of T |
+| `supersede` | `epoch` | supersession barrier for processed epoch T: record its first application time on the engine's monotonic clock for every retained/staged E < T without a supersession time; advance the processed-epoch floor before any import of T |
 | `install` | `epoch`, `own_leaf`, `members: [{leaf, device, key}]`, `removed: [device]` | install the complete validated epoch: own key encryption-only and inactive, other keys decryption-only; `key` is the 32-byte exporter |
 | `activate` | `epoch`, `send_until` | select the installed own-leaf sender for this epoch, if the controller's activation rule permits it; `send_until` is the earliest certificate expiry among current voice leaves, Unix milliseconds, or null if all are local identities |
 
@@ -1582,10 +1582,13 @@ call this contract, never server events directly.
   the engine (`key_conflict`), for `supersede` too. A superseded install is
   ignored; different keys/membership at the current installed epoch stops
   the engine. Invalid structure returns `bad_keys`, without mutation.
-- First processing of T includes an acknowledged `supersede(T)` barrier,
-  after any removal `hold` and before publishing T or importing its keys.
-  Its application defines the processing instant; E's deadline is 10 s later.
-  Repeating it, even with a newer serial, preserves the earliest deadline;
+- The processing instant is the controller's monotonic time when it marks
+  T processed, after validation and any required removal `hold`. It then
+  waits for `supersede(T)` to apply before publishing T or importing its keys.
+  Since controller and engine clocks are separate, E's 10 s retention starts
+  when the engine first applies a barrier superseding E; barrier delay can
+  only lengthen retention by that delay. Retries, even with a newer serial,
+  and later epochs in a pending chain preserve E's earliest supersession time;
   skipped/superseded imports cannot postpone it. Keep the processed-epoch
   floor even without installed keys; ignore older barriers and installs.
   Install requires that processed epoch; a future epoch returns `bad_keys`.
@@ -1605,8 +1608,8 @@ call this contract, never server events directly.
   frame or another MLS commit to close the gate.
 - The controller sends a `hold` barrier before marking a removal commit
   processed; the engine retires affected receive keys and old sender work
-  before acknowledging that barrier. Validation may run beforehand, but
-  that barrier and publication of the processed epoch form the cutoff.
+  before acknowledging that barrier. Validation may run beforehand; marking
+  the commit processed after that acknowledgement is the cutoff.
   An async encrypt/decrypt completion checks binding, control generation,
   retained key identity and current removal state again before output.
   Queued output from another call is discarded. Frames encrypted before the
@@ -1624,15 +1627,16 @@ Controller states are **Securing**, **Active(E)** and **Pending(E, target,
 started, removal)**; all clocks below are monotonic:
 
 1. Enter/create/join in **Securing**, no sending. After accepted and locally
-   validated membership, apply its processing barrier, then install keys
-   with the directions above. Record its device-key set, including self;
-   only actual install completion sends `voice.epoch.ack`. A joiner has no
-   preceding sender key.
-2. From **Active(E)** when processing a newer epoch T, record `started = now`,
-   apply `supersede(T)` and enter **Pending** with whether a leaf was removed.
-   Another commit replaces T, keeps the earliest `started` and ORs removal
-   across the pending chain. Import keys only after the barrier; import
-   latency cannot restart the two-second wait or supersession deadlines.
+   validated membership, mark its epoch processed, apply its supersession
+   barrier, then install keys with the directions above. Record its device-key
+   set, including self; only actual install completion sends `voice.epoch.ack`.
+   A joiner has no preceding sender key.
+2. From **Active(E)**, mark validated T processed and enter **Pending** with
+   `started = processing instant` and whether a leaf was removed, then
+   await `supersede(T)`. Another commit replaces T, keeps the earliest
+   `started` and ORs removal across the pending chain. Import keys only after
+   the barrier; neither barrier nor installation latency restarts the
+   two-second wait, and import latency cannot restart supersession deadlines.
    Initial **Securing** uses the same rule with no preceding E.
 3. Any removal performs the hold barrier at once; so does a blocked MLS
    gate (pending server proposal, invalid current membership or revocation).
@@ -1670,15 +1674,15 @@ started, removal)**; all clocks below are monotonic:
    does not satisfy this own-update requirement.
 
 The 2 s bound is on waiting for acknowledgements after a sender processes a
-commit, not network delivery, crypto installation, a suspended event loop or
-playout. Tests distinguish those intervals. Forged or missing relay acks can
-make audio switch early or at the deadline, but cannot relax key provenance,
-removal cutoff or the no-plaintext rule.
+commit, not network delivery, barrier application, crypto installation, a
+suspended event loop or playout. Tests distinguish those intervals. Forged
+or missing relay acks can make audio switch early or at the deadline, but
+cannot relax key provenance, removal cutoff or the no-plaintext rule.
 
 ### SFU, plaintext and TeamSpeak (5b)
 
 - Replace `AudioPacket`'s assumption that every payload is inspectable Opus:
-  carry opaque `payload`, explicit `Audio`/`EndOfSpeech`, original clock,
+  carry opaque `payload`, explicit `Audio`/`EndOfSpeech`, clock, span estimate,
   `{channel, encrypted, call, source_session, participation, run}` and route
   generation, captured at admission. TeamSpeak packets carry their confirmed
   origin and connection/route generation instead of an RTP run. An empty or
@@ -1716,14 +1720,23 @@ removal cutoff or the no-plaintext rule.
   gated. Carry it with each admitted packet. A slot keeps its last forwarded
   generation: only within the same source/generation use the difference
   from its last forwarded source timestamp, preserving omitted time;
-  a reset-sized slot delta also re-anchors.
-- On first packet, speaker/run/SSRC change, new source-clock generation or
-  reset-sized slot delta, advance the slot clock from its last write by
-  `max(1, ceil(elapsed_ns / 10000000)) * 480`; the first packet without a
-  prior write starts at 48000 ticks. Keep a u64 slot clock, write low u32;
-  retain output sequence and slot-generation semantics. Forward immediately,
-  with no packet-duration lookahead or new buffering. The SFU uses the same
-  timing for encrypted and plaintext RTP. `rtp_unknown_ssrc`,
+  a reset-sized slot delta also re-anchors. For encrypted RTP, retain the
+  stream's last positive in-order ordinary timestamp step, clamped to
+  120–5760 ticks, or 960 before any step. Update it before gating; zero or
+  reset-sized deltas leave it unchanged. Only a new run/SSRC starts afresh.
+- At every re-anchor (speaker/run/SSRC change, new source-clock generation,
+  reset-sized slot delta or TeamSpeak spurt/clock change), advance the slot
+  clock from its last write by `max(ceil_480(elapsed), span)`, where
+  `ceil_480(elapsed) = max(1, ceil(elapsed_ns / 10000000)) * 480`. The first
+  packet without a prior write starts at 48000 ticks. `span` is saved with
+  the slot's last forwarded packet: its parsed Opus duration for plaintext
+  RTP and TeamSpeak, the source stream's estimate above for encrypted RTP.
+  Preserve it across reassignment/reset and replace it only after forwarding
+  the next packet; batched TeamSpeak spurt transitions use the same floor.
+  An over-estimate inserts a short gap receivers conceal; an under-estimate
+  makes them drop audio. Keep a u64 slot clock, write low u32; retain output
+  sequence and slot-generation semantics. Forward immediately, with no
+  packet-duration lookahead or new buffering. `rtp_unknown_ssrc`,
   `rtp_retired_ssrc`, `rtp_old_sequence`, `rtp_source_reset` and
   `rtp_zero_delta` are separate counters.
 - **Packetization.** Keep Opus/48000 and current SDP negotiation: native
@@ -1754,8 +1767,7 @@ removal cutoff or the no-plaintext rule.
   mode at start, without trying SFrame then falling back. Existing
   direct TeamSpeak transport remains plaintext with its u16 packet-id and
   talk-spurt clock. Preserve its variable-duration packetizer and ordering;
-  the SFU's speaker-change estimate uses the 10 ms rounding rule above
-  for both 10 and 20 ms senders.
+  all SFU re-anchors use the 10 ms rounding and previous-span floor above.
 - **Bridge boundaries.** `Member.bridged` remains an early gate but is not
   enough for a queued packet. SFU fan-out, `Forward`/`ForwardTo`, sinks,
   puppet uplink queue, puppet socket and incoming voice/whisper each check
@@ -1874,9 +1886,21 @@ physical audio or official-server acceptance.
   mute/PTT gaps, bursts, source/slot changes, late old-call packets before
   and after routing. Unknown-SSRC churn with valid SRTP and negotiated MID
   must not grow transport state or disturb the admitted stream; RTCP still
-  works. Verify 480-tick rounding after 10/20/60 ms packets. With increasing
-  sequences and timestamps `100000 -> 100960 -> 100000 -> 100960`, gate the
-  middle packets: forwarding again after 60 ms advances 2880, not 960 ticks.
+  works. Verify 480-tick rounding with the previous-span floor: forward a
+  20 ms browser packet at 48000, then reset/change source within 10 ms; the
+  next timestamp must be at least 48960, never 48480. Cover 10 ms native
+  sources (learned 480 and initial 960 estimates), 60 ms TeamSpeak packets
+  batched across spurt changes (floor 2880), and every re-anchor cause.
+  Assert each new anchor is outside the previous packet's span, including
+  zero elapsed time and switching 10/20 ms speakers. Separately check
+  estimate clamping and that zero/reset/old packets cannot change it.
+  Through native decoded playout, reset the same source after a 20 ms
+  packet with unchanged slot generation: require the post-reset tone in
+  output and no late drop, not just increasing RTP timestamps. In 5b use
+  plaintext Opus with the encrypted-clock estimator; repeat through SFrame
+  in 5d. With increasing sequences and timestamps
+  `100000 -> 100960 -> 100000 -> 100960`, gate the middle packets: forwarding
+  again after 60 ms advances 2880, not 960 ticks.
   Require monotonic output and no extra buffer in plaintext/encrypted modes,
   plus TeamSpeak's independent packet-id/spurt clock and unchanged pairing.
 - **5b, official TeamSpeak in CI:** extend the existing
@@ -1902,13 +1926,20 @@ physical audio or official-server acceptance.
   across slots; no plaintext output or replay state mutation on failed auth.
   Test overlapping async decrypts, 128-packet window boundaries, epoch
   low-half wrap/collision, leaf reuse, own-kid rejection without decrypt or
-  receive-state mutation, silent sender retention, 10 s expiry measured from
-  processing despite delayed/skipped imports and barrier/install retries,
+  receive-state mutation, silent sender retention, 10 s expiry from first
+  engine barrier application despite delayed/skipped imports and retries,
   ninth-epoch eviction, old frames after newer authentication, key conflict,
   stale/duplicate installs, certificate expiry during uninterrupted speech,
   revocation while encryption is in flight, clock rollback and lost install
   acknowledgements. Count zero repeated `(base key, counter)` across all
-  transitions and restarts.
+  transitions and restarts. With independent controller/engine clock origins
+  and a missing ack, process a non-removal at test time 0: delay only its
+  barrier to 1 s and install promptly; activation is at 2 s and E's
+  retention deadline at 11 s. Separately apply the barrier at 0 and delay
+  import to 3 s: activate on installation, with E's deadline still at 10 s.
+  Use E with no last-authenticated retention and fewer than eight epochs;
+  sweep at the deadline. Retry barriers/installs and replace pending targets
+  without moving either original deadline.
 - **5c, browser e2e in Chromium and WebKit:** two users, two devices per user,
   real server and synthetic mic tones observed at the receiving WebAudio
   output. Join/leave/rejoin, a newcomer, eight speakers/slot reuse, lost and

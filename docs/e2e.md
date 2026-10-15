@@ -528,10 +528,12 @@ Local identities have one device and no archive.
   in the pending chain keeps it immediate. "At once" means the sender stops
   using the old key the moment it processes the commit, even while the new
   keys are still being installed; it stays silent until they are.
-- The two seconds count from when the sender processed the commit. They
-  bound the wait for acknowledgements, not delivery or key installation: a
-  commit the server withholds delays the change until it arrives (see
-  "Freshness").
+- The processing instant is the controller's monotonic time when it marks
+  a validated commit processed, after any required removal hold. The
+  two-second wait starts there and never restarts for barrier or key
+  installation delays. It bounds waiting for acknowledgements, not delivery
+  or installation: a withheld commit delays the change until it arrives
+  (see "Freshness").
 - A removed participant gets nothing under keys it does not have, whatever
   the SFU does; the SFU also stops forwarding to it. It can still decrypt a
   sender who has not processed its removal yet, until that sender does; that
@@ -541,8 +543,11 @@ Local identities have one device and no archive.
 - Receivers keep an epoch's keys while it is the newest epoch in which some
   current device's frame authenticated (silent senders included, through
   their last frame; a late frame from an older epoch never moves this back),
-  or for ten seconds after the receiver processed the first commit that
-  superseded it, whichever is longer; keys of removed senders go at once.
+  or for ten seconds after the receiver's engine first applies a barrier
+  superseding it, whichever is longer; keys of removed senders go at once.
+  Controller and engine clocks are separate, so barrier delay can only
+  lengthen retention from processing by that delay; retries and later
+  pending commits preserve the earliest deadline.
   At most eight epochs are kept per call; past that the oldest goes, and a
   sender that far behind stays silent to that receiver until it catches up
   and sends in a newer epoch.
@@ -590,8 +595,8 @@ Local identities have one device and no archive.
   them (retired ones are bounded per microphone, refusing new ones past the
   limit). So a frame delayed from an earlier call or run never enters
   another one, and a sequence number only restarts with a new SSRC.
-- **Timing**: today a slot's RTP time advances by the previous packet's
-  duration, read from the Opus header, which is now encrypted. Instead:
+- **Timing**: a slot follows source timestamps; re-anchoring also needs the
+  span of its last packet, whose Opus header is encrypted:
   - senders stamp each packet with the capture position of its first sample
     (48 kHz), which also advances over frames not sent (silence, mute,
     push-to-talk, dropped frames). Browsers do this already; the native
@@ -610,9 +615,18 @@ Local identities have one device and no archive.
     difference of zero (one frame per packet, so a sender fault) drops the
     packet and is counted. Track resets even on muted/gated packets; a slot
     re-anchors on its next packet from that source-clock generation;
-  - on a speaker change or a source reset, the forwarded time advances by
-    elapsed wall-clock time rounded up to whole 10 ms units (480 ticks), at
-    least one, for both 10 and 20 ms senders.
+  - at every re-anchor (speaker/run/SSRC change, source-clock generation
+    change, reset-sized slot delta or TeamSpeak spurt/clock change), advance
+    by the greater of elapsed time rounded up to 10 ms (480 ticks, at
+    least one) and the saved span of the slot's last forwarded packet.
+    Plaintext RTP and TeamSpeak use parsed Opus duration; encrypted RTP
+    uses that stream's last positive in-order ordinary timestamp step,
+    clamped to 120–5760 ticks, or 960 before any step. Learn before gating;
+    zero/reset deltas leave the estimate unchanged. Keep the previous span
+    across reassignment/reset until the next packet is forwarded, including
+    batched TeamSpeak spurt transitions. An over-estimate inserts a short
+    gap receivers conceal; an under-estimate drops audio. Forward at once,
+    without lookahead or buffering.
 - **Frame duration**: native Gwar keeps 10 ms, browsers 20 ms, with each
   client's current `ptime` negotiation unchanged. Direct TeamSpeak keeps
   20 ms and its puppet keeps pairing 10 ms packets. Before encryption the
