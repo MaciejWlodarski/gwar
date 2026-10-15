@@ -71,7 +71,7 @@ impl Store {
             EXISTS(SELECT 1 FROM mls_proposals p WHERE p.group_id=g.group_id)
             FROM mls_groups g WHERE g.conversation>?1
               AND (substr(g.conversation,1,31)='dm:' || ?2 || ':' OR substr(g.conversation,31)=':' || ?2
-                OR substr(g.conversation,1,8)='channel:' OR g.conversation='server')
+                OR substr(g.conversation,1,8)='channel:' OR (g.conversation='server' AND EXISTS(SELECT 1 FROM meta WHERE key='server_chat' AND value='encrypted')))
               AND incarnation=(SELECT MAX(incarnation) FROM mls_groups WHERE conversation=g.conversation)
             ORDER BY g.conversation LIMIT ?3",
         )?;
@@ -377,7 +377,7 @@ impl Store {
             JOIN mls_groups g ON g.group_id=w.group_id
             WHERE w.device_key=?1 AND w.created_at>=?2 AND w.id>?3
               AND (substr(g.conversation,1,31)='dm:' || ?4 || ':' OR substr(g.conversation,31)=':' || ?4
-                OR substr(g.conversation,1,8)='channel:' OR g.conversation='server')
+                OR substr(g.conversation,1,8)='channel:' OR (g.conversation='server' AND EXISTS(SELECT 1 FROM meta WHERE key='server_chat' AND value='encrypted')))
             ORDER BY w.id LIMIT ?5",
         )?;
         let mut rows = stmt.query(params![device, now - RETENTION_MS, after, uid, limit])?;
@@ -403,7 +403,7 @@ impl Store {
             JOIN mls_groups g ON g.group_id=h.group_id
             WHERE h.recipient_device=?1 AND h.created_at>=?2 AND h.id>?3 AND (?4 IS NULL OR h.group_id=?4)
               AND (substr(g.conversation,1,31)='dm:' || ?5 || ':' OR substr(g.conversation,31)=':' || ?5
-                OR substr(g.conversation,1,8)='channel:' OR g.conversation='server')
+                OR substr(g.conversation,1,8)='channel:' OR (g.conversation='server' AND EXISTS(SELECT 1 FROM meta WHERE key='server_chat' AND value='encrypted')))
             ORDER BY h.id LIMIT ?6",
         )?;
         let mut rows = stmt.query(params![device, now - RETENTION_MS, paging.0, group, uid, paging.1])?;
@@ -567,7 +567,7 @@ impl Store {
     ) -> Result<Vec<(String, String)>> {
         let mut stmt = self.db.prepare(
             "SELECT r.group_id,r.device_key FROM mls_history_requests r JOIN mls_groups g ON g.group_id=r.group_id
-             WHERE r.requested_at>?1 AND (substr(g.conversation,1,8)='channel:' OR g.conversation='server')
+             WHERE r.requested_at>?1 AND (substr(g.conversation,1,8)='channel:' OR (g.conversation='server' AND EXISTS(SELECT 1 FROM meta WHERE key='server_chat' AND value='encrypted')))
                AND (?3 IS NULL OR r.group_id=?3)
                AND (?2 IS NULL OR r.device_key=?2
                  OR EXISTS(SELECT 1 FROM mls_leaves l WHERE l.group_id=r.group_id AND l.device_key=?2))
@@ -690,6 +690,61 @@ mod tests {
         store.mls_write_group(&row, &[], &[], None, None, &["removed".into()]).unwrap();
         assert!(!store.mls_history_requested("g", "removed", 100).unwrap());
         assert!(store.mls_history_requested("g", "kept", 100).unwrap());
+    }
+
+    #[test]
+    fn server_chat_rows_are_listed_only_while_server_chat_is_encrypted() {
+        let store = store();
+        let row = GroupRow {
+            group: "s".into(),
+            conversation: "server".into(),
+            incarnation: 0,
+            epoch: 0,
+            committed_at: 1,
+            group_info: vec![],
+            observer: vec![],
+            created_at: 1,
+        };
+        store.mls_write_group(&row, &[], &[], None, Some((b"welcome", &["device".into()])), &[]).unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO mls_history(id,group_id,recipient_device,sender_uid,first_epoch,last_epoch,chunk,created_at,chunk_hash)
+                 VALUES('h','s','device','u',0,0,x'00',1,x'00')",
+                [],
+            )
+            .unwrap();
+        store.mls_request_history("s", "device", 1).unwrap();
+        let listed = |store: &Store| {
+            let mut groups = Vec::new();
+            store
+                .mls_groups("u", "", 10, |g| {
+                    groups.push(g.conversation);
+                    Ok(true)
+                })
+                .unwrap();
+            let mut welcomes = 0;
+            store
+                .mls_welcomes("device", "u", 1, "", 10, |_| {
+                    welcomes += 1;
+                    Ok(true)
+                })
+                .unwrap();
+            let mut chunks = 0;
+            store
+                .mls_history("device", "u", None, 1, ("", 10), |_| {
+                    chunks += 1;
+                    Ok(true)
+                })
+                .unwrap();
+            let requests = store.mls_channel_requests(None, None, 0).unwrap().len();
+            (groups.len(), welcomes, chunks, requests)
+        };
+        // Rows left in a plaintext database are never served.
+        store.set_meta("server_chat", "plaintext").unwrap();
+        assert_eq!(listed(&store), (0, 0, 0, 0));
+        store.set_meta("server_chat", "encrypted").unwrap();
+        assert_eq!(listed(&store), (1, 1, 1, 1));
     }
 
     #[test]
