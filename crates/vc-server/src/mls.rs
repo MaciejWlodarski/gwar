@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::gateway::Gateway;
+use crate::{core::TreeRefusal, gateway::Gateway};
 
 pub async fn tree(State(gateway): State<Gateway>, Path(group): Path<String>, headers: HeaderMap) -> Response {
     let Some(access) =
@@ -14,8 +14,10 @@ pub async fn tree(State(gateway): State<Gateway>, Path(group): Path<String>, hea
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some((epoch, tree)) = gateway.core.mls_tree(group, access.to_owned()).await else {
-        return StatusCode::NOT_FOUND.into_response();
+    let (epoch, tree) = match gateway.core.mls_tree(group, access.to_owned()).await {
+        Ok(found) => found,
+        Err(TreeRefusal::TooManyRequests) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+        Err(TreeRefusal::NotFound) => return StatusCode::NOT_FOUND.into_response(),
     };
     (
         [

@@ -1820,4 +1820,12 @@ async fn tree_endpoint_checks_session_conversation_and_exports_current_epoch() {
             .status(),
         404
     );
+
+    // A session asks for at most 30 trees a minute; the cached tree is served until then.
+    let d = connect_device(&server, &Device::new(4, 41)).await;
+    for _ in 0..30 {
+        assert_eq!(http.get(&url).bearer_auth(&d.welcome.file_access).send().await.unwrap().status(), 200);
+    }
+    assert_eq!(http.get(&url).bearer_auth(&d.welcome.file_access).send().await.unwrap().status(), 429);
+    assert_eq!(http.get(&url).bearer_auth(&a.welcome.file_access).send().await.unwrap().status(), 200);
 }

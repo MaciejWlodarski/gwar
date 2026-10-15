@@ -122,6 +122,8 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
     beforeLog: null as null | (() => Promise<void>),
     /** Epochs the tree endpoint answers with, in order; then the log head. */
     treeEpochs: [] as number[],
+    /** Replaces the tree endpoint's answer. */
+    treeResponse: null as null | ((signal: AbortSignal) => Promise<Response>),
     packages: 5, devices: [] as { uid: string; device_key: string; hpke_key: string; created_at: number; signature: string }[],
   };
   let welcomeHandler = (_welcome: { channels: unknown[] }) => {};
@@ -165,6 +167,7 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
   const locks = { request: async (_name: string, _options: unknown, fn: () => Promise<void>) => fn() } as unknown as LockManager;
   const fetchTree = async (url: string | URL | Request, init?: RequestInit) => {
     calls.push({ op: "tree", data: { url: String(url), authorization: (init?.headers as Record<string, string>).Authorization } });
+    if (world.treeResponse) return world.treeResponse(init!.signal!);
     return new Response(new Uint8Array([3, 3]), { headers: { "x-gwar-epoch": String(world.treeEpochs.shift() ?? world.head) } });
   };
   const connectOptions = { identity, seed: new Uint8Array(32), link: link as unknown as Link, revocations: () => world.revocations, locks, storage: async () => storage, factory, now: options.now, onError: (error: unknown) => errors.push(error), fetch: fetchTree as typeof fetch };
@@ -660,6 +663,37 @@ describe("Channel groups", () => {
     expect(f.calls.filter(c => c.op === "mls.group_info")).toHaveLength(2);
     expect(f.calls.filter(c => c.op === "tree").map(c => c.data)).toEqual(Array(2).fill({ url: `http://gwar.test/api/mls/${group}/tree`, authorization: "Bearer access" }));
     expect(f.operations.find(o => o.op === "join_external")?.tree).toEqual([3, 3]);
+  });
+  it("stops reading a tree past the size limit", async () => {
+    asChannel();
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
+    const f = await fixture(clean(), true, { channels: [channel()] });
+    f.world.groups = [{ conversation, group, incarnation: 0, epoch: 0, pending: false }];
+    let sent = 0, cancelled = false;
+    // No content length: the body streams 1 MiB chunks without end.
+    f.world.treeResponse = async () => new Response(new ReadableStream({
+      pull: controller => { sent++; controller.enqueue(new Uint8Array(1024 * 1024)); },
+      cancel: () => { cancelled = true; },
+    }), { headers: { "x-gwar-epoch": "0" } });
+    await f.runtime.sync(); random.mockRestore();
+    expect(String(f.errors.at(-1))).toContain("MLS tree too large");
+    expect(cancelled).toBe(true);
+    expect(sent).toBeLessThanOrEqual(10);
+    expect(f.operations.some(o => o.op === "join_external")).toBe(false);
+  });
+  it("ends a stalled tree download when the connection drops", async () => {
+    asChannel();
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
+    const f = await fixture(clean(), true, { channels: [channel()] });
+    f.world.groups = [{ conversation, group, incarnation: 0, epoch: 0, pending: false }];
+    let started!: () => void;
+    const fetching = new Promise<void>(resolve => { started = resolve; });
+    f.world.treeResponse = signal => new Promise((_, reject) => { started(); signal.addEventListener("abort", () => reject(signal.reason)); });
+    const pass = f.runtime.sync();
+    await fetching; random.mockRestore();
+    f.reconnect();
+    await pass.catch(() => {});
+    expect(f.operations.some(o => o.op === "join_external")).toBe(false);
   });
   it("gives up a join while the group keeps changing", async () => {
     asChannel();

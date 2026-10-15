@@ -51,6 +51,8 @@ export interface RuntimeOptions {
 }
 /** A ratchet tree larger than this is refused (about 15 000 devices). */
 const MAX_TREE_BYTES = 8 * 1024 * 1024;
+/** A tree download, headers and body, ends after this. */
+const TREE_TIMEOUT_MS = 30_000;
 /** A newer tab of this device asked for the session while this one waited for it. */
 export class DeviceTakenOver extends Error {
   constructor() { super("This device's session moved to another tab"); }
@@ -93,6 +95,8 @@ export class MlsRuntime {
   private fileAccess: string | null = null;
   /** The conversation of every group the server listed, for groups not joined yet. */
   private readonly conversations = new Map<string, string>();
+  /** Tree downloads in flight, ended when the connection drops or the runtime closes. */
+  private readonly downloads = new Set<AbortController>();
   /** When a channel group may next be created or joined, per conversation. */
   private readonly channelDue = new Map<string, Backoff>();
   /** When a history job whose preparation failed may be tried again, per job key. */
@@ -157,6 +161,7 @@ export class MlsRuntime {
       }
       runtime.unsubscribers.push(options.link.onStatus(status => {
         if (status.state !== "online") {
+          for (const download of runtime!.downloads) download.abort();
           runtime!.generation++;
           runtime!.lastPublish = -Infinity;
           runtime!.syncedVersions.clear();
@@ -557,14 +562,33 @@ export class MlsRuntime {
   private async tree(group: string): Promise<{ epoch: number; tree: number[] }> {
     const origin = this.options.link.endpoint ? httpOriginFromWsUrl(this.options.link.endpoint) : null;
     if (!origin || !this.fileAccess) throw new Error("MLS tree unavailable");
-    const response = await (this.options.fetch ?? fetch)(`${origin}/api/mls/${group}/tree`, { headers: { Authorization: `Bearer ${this.fileAccess}` }, cache: "no-store", signal: this.options.signal });
-    if (!response.ok) throw new Error(`MLS tree request failed (${response.status})`);
-    const epoch = Number(response.headers.get("x-gwar-epoch") ?? NaN);
-    if (!Number.isSafeInteger(epoch) || epoch < 0) throw new Error("MLS tree epoch");
-    if (Number(response.headers.get("content-length") ?? 0) > MAX_TREE_BYTES) throw new Error("MLS tree too large");
-    const body = new Uint8Array(await response.arrayBuffer());
-    if (body.byteLength > MAX_TREE_BYTES) throw new Error("MLS tree too large");
-    return { epoch, tree: Array.from(body) };
+    const generation = this.generation, download = new AbortController();
+    const timeout = setTimeout(() => download.abort(new Error("MLS tree request timed out")), TREE_TIMEOUT_MS);
+    const stop = () => download.abort(this.options.signal?.reason);
+    this.options.signal?.addEventListener("abort", stop, { once: true });
+    this.downloads.add(download);
+    try {
+      const response = await (this.options.fetch ?? fetch)(`${origin}/api/mls/${group}/tree`, { headers: { Authorization: `Bearer ${this.fileAccess}` }, cache: "no-store", signal: download.signal });
+      if (!response.ok) throw new Error(`MLS tree request failed (${response.status})`);
+      const epoch = Number(response.headers.get("x-gwar-epoch") ?? NaN);
+      if (!Number.isSafeInteger(epoch) || epoch < 0) throw new Error("MLS tree epoch");
+      if (Number(response.headers.get("content-length") ?? 0) > MAX_TREE_BYTES) throw new Error("MLS tree too large");
+      // Read up to the limit, never more.
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("MLS tree response has no body");
+      const tree: number[] = [];
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (tree.length + value.byteLength > MAX_TREE_BYTES) { await reader.cancel(); throw new Error("MLS tree too large"); }
+        for (const byte of value) tree.push(byte);
+      }
+      this.assertCurrent(generation);
+      return { epoch, tree };
+    } finally {
+      clearTimeout(timeout); this.downloads.delete(download);
+      this.options.signal?.removeEventListener("abort", stop);
+    }
   }
   /** A group's GroupInfo, with the tree of the same epoch for channel groups. */
   private async groupInfo(group: string): Promise<{ info: number[]; tree: number[] | null }> {
@@ -916,6 +940,7 @@ export class MlsRuntime {
     if (this.closePromise) return this.closePromise;
     this.stopped = true; this.generation++;
     clearTimeout(this.retry);
+    for (const download of this.downloads) download.abort();
     for (const unsubscribe of this.unsubscribers) unsubscribe();
     // A link that never connected stays usable for its owner.
     if (this.options.link.status.state !== "idle") this.options.link.close();
