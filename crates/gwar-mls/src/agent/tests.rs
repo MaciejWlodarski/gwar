@@ -1722,8 +1722,16 @@ fn separate_tree_join_updates_removal_and_behind() {
             observer.commit(&out.commit, &forged, None, f.t, f.t),
             Err(ds::DsError::Invalid("group info signature"))
         ));
+        let before = f.observer.save();
         f.observer = accept(f.observer, &out, f.t);
         acknowledge(&mut f.a, &f.id, &out);
+        // The same epoch's GroupInfo with the tree in it is refused: these groups leave it out.
+        let group = f.a.mls(&group_key(&server(), &f.id)).unwrap();
+        let with_tree = wire(group.export_group_info(f.a.provider.crypto(), &f.a.signer, true).unwrap()).unwrap();
+        assert!(matches!(
+            Observer::load(&before, &server()).unwrap().commit(&out.commit, &with_tree, None, f.t, f.t),
+            Err(ds::DsError::Invalid("group info does not match the commit"))
+        ));
         let (epoch, tree) = f.observer.tree().unwrap();
         assert_eq!(epoch, 1);
         assert_ne!(tree, old_tree);

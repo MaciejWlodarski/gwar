@@ -319,19 +319,21 @@ impl Observer {
     }
 
     /// The GroupInfo a committer uploads for the new epoch must describe exactly
-    /// the merged state: GroupContext, confirmation tag and any supplied tree, signed by a
-    /// member. Leaf lifetimes are not checked again (docs/e2e-build.md, "Lifetimes").
+    /// the merged state: GroupContext, confirmation tag and, in direct messages,
+    /// the tree (channel and server groups leave it out), signed by a member.
+    /// Leaf lifetimes are not checked again (docs/e2e-build.md, "Lifetimes").
     fn check_group_info(&self, bytes: &[u8]) -> Result<(), DsError> {
         let info = group_info_in(bytes)?;
         let mismatch = Invalid("group info does not match the commit");
         let extensions = info.extensions();
         let tree = extensions.ratchet_tree();
         match tree {
+            None if self.descriptor.descriptor.kind.separate_tree() => {}
+            None => return Err(Invalid("no ratchet tree")),
+            Some(_) if self.descriptor.descriptor.kind.separate_tree() => return Err(mismatch),
             Some(tree)
                 if tree.ratchet_tree().tls_serialize_detached().ok()
                     == self.group.export_ratchet_tree().tls_serialize_detached().ok() => {}
-            None if self.descriptor.descriptor.kind.separate_tree() => {}
-            None => return Err(Invalid("no ratchet tree")),
             _ => return Err(mismatch),
         }
         if extensions.external_pub().is_none() || extensions.iter().count() != 1 + usize::from(tree.is_some()) {

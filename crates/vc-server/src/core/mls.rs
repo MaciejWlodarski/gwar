@@ -156,6 +156,9 @@ impl Core {
     }
 
     pub(super) fn mls_tree(&self, group: &str, access: &str) -> Option<(u64, Vec<u8>)> {
+        if access.is_empty() {
+            return None;
+        }
         let session = self.sessions.values().find(|s| s.out.is_some() && s.file_access == access)?;
         let row = self.mls_group_for(session.id, group).ok()?;
         self.mls_observer(&row).ok()?.tree().ok()
