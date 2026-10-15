@@ -67,7 +67,7 @@ impl Store {
         mut visit: impl FnMut(MlsGroup) -> Result<bool>,
     ) -> Result<()> {
         let mut stmt = self.db.prepare(
-            "SELECT g.conversation,g.group_id,g.epoch,
+            "SELECT g.conversation,g.group_id,g.incarnation,g.epoch,
             EXISTS(SELECT 1 FROM mls_proposals p WHERE p.group_id=g.group_id)
             FROM mls_groups g WHERE g.conversation>?1
               AND (substr(g.conversation,1,31)='dm:' || ?2 || ':' OR substr(g.conversation,31)=':' || ?2
@@ -77,7 +77,14 @@ impl Store {
         )?;
         let mut rows = stmt.query(params![after, uid, limit])?;
         while let Some(r) = rows.next()? {
-            if !visit(MlsGroup { conversation: r.get(0)?, group: r.get(1)?, epoch: r.get(2)?, pending: r.get(3)? })? {
+            let group = MlsGroup {
+                conversation: r.get(0)?,
+                group: r.get(1)?,
+                incarnation: r.get(2)?,
+                epoch: r.get(3)?,
+                pending: r.get(4)?,
+            };
+            if !visit(group)? {
                 break;
             }
         }

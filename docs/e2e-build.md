@@ -152,9 +152,9 @@ direct message `private` is 0 and `history` is 1, and both uids are distinct
 and sorted), the creator credential is well-formed with uid `creator_uid`, and
 the signature verifies with its `device_key`.
 
-Restarts are rejected until step 4 specifies the predecessor chain with
-channels: the shared context rules return `Invalid("restart")` for every
-`incarnation != 0`, on the observer and all client creation/join paths.
+The shared context rules accept any incarnation; the server checks a
+restart's predecessor at creation, and clients accept one only along its
+chain (section 4, "Restarts").
 
 ### External sender
 
@@ -502,7 +502,7 @@ page without scanning key packages.
 | `mls.group_info {group}` | `{group_info, epoch}` | the session may read the conversation |
 | `mls.commit {group, epoch, commit, group_info, welcome?}` | `{epoch}`, or error `stale`, `expired`, `early` or `bad_request` | below |
 | `mls.log {group, since, limit?}` | `{head, oldest, entries: [{epoch, proposals, commit}], pending}` | entries from epoch `since`, each keyed by the epoch its commit was made in (it moved the group to `epoch + 1`); `proposals` are the server proposals the commit references, to be processed before it; `pending` the server's outstanding proposals for the head epoch (see "Removal proposals"); 90 days kept |
-| `mls.groups {}` | `{groups: [{conversation, group, epoch, pending}]}` | the live group of every conversation the session may read; `pending` whether outstanding proposals exist |
+| `mls.groups {}` | `{groups: [{conversation, group, incarnation, epoch, pending}]}` | the live group of every conversation the session may read; `pending` whether outstanding proposals exist |
 | `mls.welcomes {}` | `{welcomes: [{id, group, welcome}]}` | for the session's device; repeatable |
 | `mls.welcomes.ack {ids}` | `{}` | after the client stored the joined group durably; deletes them. The client stores the Welcome's id with the joined group in one write, and acknowledges a Welcome whose id it already has without processing it again (its key package is used up) |
 | `mls.history.share {group, recipient, chunk, assignment?}` | `{}` | the session's device and `recipient` both have leaves in the group's current epoch (observer); the chunk parses (netstrings, header fields canonical) and its header names the server key, `group`, `recipient` with its published HPKE key, and the session's device key as sender; the signature verifies with that key. The recipient must differ from the sender's own device, and `last_epoch` must not exceed the group's current epoch. In one write transaction the server checks these rules and the SHA-256 of the chunk bytes: the same hash for the same group and recipient is idempotent (`{}`, no new row or broadcast), even at quota. At most 64 stored chunks per `(group, recipient device, sender_uid)` and three distinct senders per recipient/group are allowed; exceeding either returns `quota_exceeded` without a write. A new chunk is stored with `sender_uid` = the session's uid and ends the recipient's outstanding request in that same transaction (in channel and server groups only when it names an active assignment of that request, section 4) |
@@ -764,7 +764,8 @@ Status: 4a server side built (delivery service, history routing, TeamSpeak
 bridge); the agent and the browser runtime keep channel groups (create, join,
 history assignments, leaf updates, deleted channels); the web client reads and
 writes encrypted channels (create options, sealed chat, gap lines, mention
-scan and accounting, moderator removal, "Who can read"); restarts are next. Built as three pull requests, in this order: **4a**
+scan and accounting, moderator removal, "Who can read"); restarts are built,
+for direct messages and channels. Built as three pull requests, in this order: **4a**
 channels (options, groups, sealed channel messages, unread counts and
 mentions, TeamSpeak text isolation, restarts); **4b** encrypted attachments,
 in channels and direct messages; **4c** encrypted server-wide chat and large
@@ -1025,6 +1026,26 @@ channels and server chat:
   live again. Old incarnations keep their keys for reading and nobody writes
   to them; the conversation shows a quiet line "This conversation was
   restarted".
+- **In the code.** `mls.groups` names each live group's `incarnation`. The
+  agent keeps one record per accepted incarnation: the live pin is the
+  highest that is not a creation still to settle. `check_pin` lets a device
+  join or accept a Welcome only for its live pin, or for incarnation zero
+  without any pin; `create` takes incarnation zero or the next incarnation of
+  the live pin, one candidate per predecessor. `accept_chain(server,
+  conversation, [(group, descriptor)])` verifies the chain from the live pin
+  (or from incarnation zero) and records the new incarnations (the last one
+  to be joined, as **Rejoin**); `settle` of a won restart and `accept_chain`
+  turn every earlier incarnation **Superseded**: its OpenMLS state, private
+  epoch key pairs and outbox are deleted, its epoch keys and evidence kept,
+  and the runtime's jobs for it go in the same write. `behind(server,
+  group_info)` verifies a GroupInfo as a newcomer would (tree, a member's
+  signature, the rules) and reports whether it is behind the group's
+  checkpoint or forks it. The browser runtime counts a log head behind the
+  checkpoint, or such a GroupInfo when rejoining, as a failed check; pending
+  checks live in memory, so a reload starts the wait again. A Welcome to a
+  superseded group is acknowledged without importing it. The chat shows the
+  restarted line when the live incarnation is above zero, and rows of earlier
+  incarnations that this device cannot open do not wait for history.
 
 ### Encrypted attachments (4b)
 

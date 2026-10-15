@@ -69,7 +69,7 @@ wire! {
 
     pub struct MlsPackage { pub device_key: String, pub package: String }
     pub struct MlsDevice { pub uid: Uid, pub device_key: String, pub hpke_key: String, #[cfg_attr(feature = "ts", ts(type = "number"))] pub created_at: i64, pub signature: String }
-    pub struct MlsGroup { pub conversation: String, pub group: String, #[cfg_attr(feature = "ts", ts(type = "number"))] pub epoch: u64, pub pending: bool }
+    pub struct MlsGroup { pub conversation: String, pub group: String, #[cfg_attr(feature = "ts", ts(type = "number"))] pub incarnation: u64, #[cfg_attr(feature = "ts", ts(type = "number"))] pub epoch: u64, pub pending: bool }
     pub struct MlsLogEntry { #[cfg_attr(feature = "ts", ts(type = "number"))] pub epoch: u64, pub proposals: Vec<String>, pub commit: String }
     pub struct MlsWelcome { pub id: String, pub group: String, pub welcome: String }
     pub struct MlsHistoryChunk { pub id: String, pub group: String, pub sender_uid: Uid, pub chunk: String }
@@ -107,7 +107,7 @@ mod tests {
             json!({"packages":[{"device_key":"d","package":"p"}],"next":"cursor"}),
             json!({"devices":[{"uid":"u","device_key":"d","hpke_key":"h","created_at":1,"signature":"s"}],"next":null}),
             json!({"head":1,"oldest":0,"entries":[{"epoch":0,"proposals":["p"],"commit":"c"}],"pending":["p"],"next":1}),
-            json!({"groups":[{"conversation":"c","group":"g","epoch":1,"pending":false}],"next":null}),
+            json!({"groups":[{"conversation":"c","group":"g","incarnation":0,"epoch":1,"pending":false}],"next":null}),
             json!({"welcomes":[{"id":"i","group":"g","welcome":"w"}],"next":null}),
             json!({"chunks":[{"id":"i","group":"g","sender_uid":"u","chunk":"c"}],"next":null}),
             json!({"wanted":[{"group":"g","device":"d"}],"next":null}),

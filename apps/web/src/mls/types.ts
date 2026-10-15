@@ -17,9 +17,13 @@ export interface AgentFactory {
 export interface GroupSummary {
   group: number[];
   conversation: string;
+  /** Decimal; 0, then one more per restart. */
+  incarnation: string;
+  /** The conversation's live pin: its highest accepted incarnation. */
+  live: boolean;
   history: boolean;
   record: {
-    status: "creating" | "active" | "joining" | "removed" | "rejoin";
+    status: "creating" | "active" | "joining" | "removed" | "rejoin" | "superseded";
     checkpoint: { epoch: string; hash: number[] } | null;
     server_pending: boolean;
     welcome_ids?: string[];
@@ -50,6 +54,10 @@ export interface SealedFields {
 export type OpenResult = { ok: Plaintext } | { reason: "no_key" | "cannot_open" };
 export type ConversationStatus = "ready" | "securing" | "creating";
 export interface Roster {
+  /** The live group; rows of earlier incarnations belong to other groups. */
+  group: string;
+  /** The conversation was restarted at least once. */
+  restarted: boolean;
   history: boolean;
   members: GroupSummary["members"];
   /** The first epoch my account had a leaf in, as this device saw it. */

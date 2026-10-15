@@ -2,8 +2,8 @@
 /** Real local DS + browser IndexedDB/Web Locks/wasm, no UI. Never reuses a server. */
 import { stopProcesses } from "./processes.mjs";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
+import { execFileSync, spawn } from "node:child_process";
+import { copyFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import net from "node:net";
@@ -34,15 +34,27 @@ async function ready(url, child) {
 try {
   const webPort = await port(), serverPort = await port();
   const web = `http://127.0.0.1:${webPort}`, ws = `ws://127.0.0.1:${serverPort}/ws`;
-  const service = start(process.env.VC_SERVER_BIN ?? path.join(root, "target/debug/vc-server"), ["--data-dir", directory, "--http", `127.0.0.1:${serverPort}`, "--media", `127.0.0.1:${serverPort}`, "--public-ip", "127.0.0.1", "--public-endpoint", ws, "--web-origin", web, "--no-connect"], root);
+  const binary = process.env.VC_SERVER_BIN ?? path.join(root, "target/debug/vc-server");
+  const startServer = () => start(binary, ["--data-dir", directory, "--http", `127.0.0.1:${serverPort}`, "--media", `127.0.0.1:${serverPort}`, "--public-ip", "127.0.0.1", "--public-endpoint", ws, "--web-origin", web, "--no-connect"], root);
+  let service = startServer();
   const vite = start("pnpm", ["--filter", "web", "exec", "vite", "--host", "127.0.0.1", "--port", String(webPort), "--strictPort"], root);
   await Promise.all([ready(`${web}/`, vite), ready(`http://127.0.0.1:${serverPort}/health`, service)]);
+  const until = async (what, check, timeout = 30_000) => {
+    for (const started = Date.now(); Date.now() - started < timeout;) {
+      if (await check()) return;
+      for (const page of pages) await page.evaluate(() => window.mls.runtime.sync().catch(() => {}));
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    for (const page of pages) console.error(await page.evaluate(() => window.mls.errors));
+    throw new Error(`timed out: ${what}`);
+  };
+  const snapshot = path.join(directory, "before-joins.sqlite3");
   browser = await chromium.launch({ headless: true });
   const context = await browser.newContext();
   // Block every non-local request, including page-level Connect UI effects.
   await context.route("**/*", route => { const host = new URL(route.request().url()).hostname; return ["127.0.0.1", "localhost"].includes(host) ? route.continue() : route.abort(); });
-  const pages = [];
-  for (const [account, device] of [[11, 1], [21, 2], [11, 3], [21, 4]]) {
+  const pages = [], devices = [[11, 1], [21, 2], [11, 3], [21, 4]];
+  for (const [account, device] of devices) {
     const page = await context.newPage(); pages.push(page);
     page.on("pageerror", e => console.error("browser:", e));
     // Vite serves a blank fixture; the application controller never connects.
@@ -64,6 +76,8 @@ try {
       assert.ok(keys[0]?.length === 32); assert.deepEqual(keys[0], keys[1]);
       await pages[0].evaluate(m => { window.firstMessage = m; }, message);
       console.log("PASS two users derive identical epoch keys and open a sealed message");
+      // The server's state before the other devices join, to lose it later.
+      execFileSync(binary, ["--data-dir", directory, "backup", snapshot]);
     }
 
   }
@@ -77,9 +91,31 @@ try {
     assert.deepEqual(key, await pages[0].evaluate(m => window.mls.epochKey(m.group, m.epoch), message));
   }
   console.log("PASS additional devices join and import pre-join message history");
+  // The server loses the joins (restored from the earlier backup): every device
+  // is now ahead of it, and after two checks a minute apart one of them
+  // restarts the conversation; the others accept the chain and join.
+  const conversation = message.conversation;
+  await Promise.all(pages.map(page => page.evaluate(() => window.mls.runtime.close())));
+  await stopProcesses([service]);
+  await copyFile(snapshot, path.join(directory, "vc.sqlite3"));
+  for (const suffix of ["-wal", "-shm"]) await rm(path.join(directory, `vc.sqlite3${suffix}`), { force: true });
+  service = startServer();
+  await ready(`http://127.0.0.1:${serverPort}/health`, service);
+  for (const [i, page] of pages.entries()) {
+    await page.reload();
+    await page.evaluate(async ({ account, device, ws }) => { const { connect } = await import("/e2e/mls-fixture.ts"); window.mls = await connect(account, device, ws); }, { account: devices[i][0], device: devices[i][1], ws });
+  }
+  await until("the conversation is restarted", async () => (await Promise.all(pages.map(page => page.evaluate(c => window.mls.runtime.status(c) === "ready" && window.mls.runtime.roster(c)?.restarted === true, conversation)))).every(Boolean), 150_000);
+  const groups = new Set(await Promise.all(pages.map(page => page.evaluate(c => window.mls.runtime.roster(c).group, conversation))));
+  assert.equal(groups.size, 1); assert.ok(!groups.has(message.group));
+  const restarted = await pages[2].evaluate(c => window.mls.seal(c), conversation);
+  await until("the restarted group's message opens", async () => (await Promise.all(pages.map(page => page.evaluate(m => window.mls.runtime.openMessage(m).then(r => r.ok?.text), restarted)))).every(text => text === "encrypted hello"));
+  for (const page of pages) assert.equal((await page.evaluate(m => window.mls.runtime.openMessage(m), message)).ok?.text, "encrypted hello");
+  console.log("PASS a server behind every device leads to one restart that all devices follow, keeping earlier keys");
   // An encrypted channel: its creator makes the group, another member's device
   // joins it by itself and gets the earlier key through a routed assignment.
-  const token = /redeem this one-time admin token in your client: (\S+)/.exec(service.output)?.[1];
+  // Printed once, by the server's first start.
+  const token = /redeem this one-time admin token in your client: (\S+)/.exec(children.map(child => child.output).join("\n"))?.[1];
   assert.ok(token, "admin token in the server log");
   const channel = await pages[0].evaluate(async token => {
     await window.mls.link.request("token.redeem", { token });
@@ -88,15 +124,6 @@ try {
     return channel;
   }, token);
   const sealedChannel = `channel:${channel.id}`;
-  const until = async (what, check, timeout = 30_000) => {
-    for (const started = Date.now(); Date.now() - started < timeout;) {
-      if (await check()) return;
-      for (const page of pages) await page.evaluate(() => window.mls.runtime.sync().catch(() => {}));
-      await new Promise(resolve => setTimeout(resolve, 250));
-    }
-    for (const page of pages) console.error(await page.evaluate(() => window.mls.errors));
-    throw new Error(`timed out: ${what}`);
-  };
   await until("the creator's channel group", () => pages[0].evaluate(c => window.mls.runtime.status(c) === "ready", sealedChannel));
   const channelMessage = await pages[0].evaluate(c => window.mls.seal(c), sealedChannel);
   await until("the other member joins", () => pages[3].evaluate(c => window.mls.runtime.status(c) === "ready", sealedChannel));

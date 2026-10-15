@@ -899,38 +899,183 @@ fn raw_create(a: &Agent, descriptor: &SignedDescriptor) -> MlsGroup {
     .unwrap()
 }
 
+fn restart(a: &Agent, previous: &SignedDescriptor, nonce: u8) -> SignedDescriptor {
+    let mut d = previous.descriptor.clone();
+    d.incarnation += 1;
+    d.previous_group_id = Some(b64(&previous.group_id()));
+    d.creator_uid = a.credential.uid();
+    d.creation_nonce = b64(&[nonce; 16]);
+    SignedDescriptor::sign(d, a.credential.clone(), &a.signer.0)
+}
+fn link(d: &SignedDescriptor) -> ([u8; 32], Vec<u8>) {
+    (d.group_id(), d.encode())
+}
+/// `a` restarts the joined fixture's group and wins; returns both descriptors and the successor's GroupInfo.
+fn restarted() -> (Fixture, SignedDescriptor, SignedDescriptor, Vec<u8>) {
+    let mut f = joined();
+    let first = descriptor(&f.a, &f.b, f.t, true, true);
+    let next = restart(&f.a, &first, 2);
+    let info = f.a.create(next.clone()).unwrap();
+    f.a.take_changes();
+    Observer::create(&info, &server()).unwrap();
+    assert!(f.a.settle(&server(), &next.group_id(), Some(&next.group_id())).unwrap());
+    f.a.take_changes();
+    (f, first, next, info)
+}
 #[test]
-fn restarts_are_rejected_by_observer_create_and_all_agent_join_paths() {
-    let t = now();
-    let mut a = device(1, 11, t);
-    let mut b = device(2, 21, t);
-    let mut d = descriptor(&a, &b, t, true, true).descriptor;
-    d.incarnation = 1;
-    d.previous_group_id = Some(b64(&[9; 32]));
-    let d = SignedDescriptor::sign(d, a.credential.clone(), &a.signer.0);
-    let mut group = raw_create(&a, &d);
-    let info = wire(group.export_group_info(a.provider.crypto(), &a.signer, true).unwrap()).unwrap();
-    assert!(matches!(Observer::create(&info, &server()), Err(ds::DsError::Invalid("restart"))));
-    let rejected = Err(AgentError::Rule(ds::DsError::Invalid("restart")));
-    assert_eq!(b.join_external(&server(), &info, t, &()), rejected);
-    assert!(b.take_changes().is_empty());
-    b = Agent::load([21; 32], b.credential.clone(), b.durable.clone()).unwrap();
-    let packages = b.key_packages(1, t).unwrap();
+fn a_won_restart_is_live_and_supersedes_its_predecessor() {
+    let (f, first, next, _) = restarted();
+    let old = f.a.group(&server(), &first.group_id()).unwrap();
+    assert_eq!(old.status, Status::Superseded);
+    assert!(f.a.mls(&group_key(&server(), &first.group_id())).is_err(), "no MLS state is kept");
+    assert!(f.a.epoch(&server(), &first.group_id(), 1).is_some(), "keys stay for reading");
+    assert!(!f.a.gate(&server(), &first.group_id(), f.t, &()).unwrap().can_send());
+    let inventory = f.a.inventory(&server()).unwrap();
+    let live: Vec<_> = inventory.iter().map(|g| (g.group, g.incarnation, g.live)).collect();
+    assert!(live.contains(&(first.group_id(), 0, false)) && live.contains(&(next.group_id(), 1, true)));
+    assert!(f.a.sending_key(&server(), &next.group_id(), f.t, &()).is_ok());
+    let loaded = Agent::load([11; 32], f.a.credential.clone(), f.a.durable.clone()).unwrap();
+    assert_eq!(loaded.snapshot(), f.a.snapshot());
+}
+#[test]
+fn a_restart_is_joined_only_after_its_chain_is_accepted() {
+    let (mut f, first, next, info) = restarted();
+    assert_eq!(f.b.join_external(&server(), &info, f.t, &()), Err(Invalid("restart chain")));
+    let mut b = Agent::load([21; 32], f.b.credential.clone(), f.b.durable.clone()).unwrap();
+    assert_eq!(
+        b.accept_chain(&server(), &first.descriptor.conversation, &[link(&first), link(&next)]),
+        Ok(next.group_id())
+    );
+    b.take_changes();
+    assert_eq!(b.group(&server(), &first.group_id()).unwrap().status, Status::Superseded);
+    assert_eq!(b.group(&server(), &next.group_id()).unwrap().status, Status::Rejoin);
+    assert!(b.epoch(&server(), &first.group_id(), 1).is_some());
+    let out = b.join_external(&server(), &info, f.t, &()).unwrap();
+    b.take_changes();
+    acknowledge(&mut b, &next.group_id(), &out);
+    f.a.receive(&server(), &next.group_id(), &out.commit, &[]).unwrap();
+    f.a.take_changes();
+    assert_eq!(
+        b.sending_key(&server(), &next.group_id(), f.t, &()).unwrap(),
+        f.a.sending_key(&server(), &next.group_id(), f.t, &()).unwrap()
+    );
+    // The predecessor is never live again, and no sibling of the live pin can be made.
+    assert_eq!(b.join_external(&server(), &f.info, f.t, &()), Err(Invalid("superseded")));
+    let mut b = Agent::load([21; 32], b.credential.clone(), b.durable.clone()).unwrap();
+    assert_eq!(b.create(restart(&b, &first, 3)), Err(Invalid("group pin")));
+    let mut b = Agent::load([21; 32], b.credential.clone(), b.durable.clone()).unwrap();
+    let mut fresh = descriptor(&b, &f.a, f.t, true, true).descriptor;
+    fresh.creation_nonce = b64(&[4; 16]);
+    assert_eq!(b.create(SignedDescriptor::sign(fresh, b.credential.clone(), &b.signer.0)), Err(Invalid("group pin")));
+}
+#[test]
+fn a_welcome_into_a_restart_needs_its_chain() {
+    let (f, first, next, _) = restarted();
+    let creator = device(1, 11, f.t);
+    let mut group = raw_create(&creator, &next);
+    let mut b = Agent::load([21; 32], f.b.credential.clone(), f.b.durable.clone()).unwrap();
+    let packages = b.key_packages(1, f.t).unwrap();
     b.take_changes();
     let package = KeyPackageIn::tls_deserialize_exact(&packages[0])
         .unwrap()
-        .validate(a.provider.crypto(), ProtocolVersion::Mls10)
+        .validate(b.provider.crypto(), ProtocolVersion::Mls10)
         .unwrap();
-    let (_, welcome, _) = group.add_members(&a.provider, &a.signer, &[package]).unwrap();
+    let (_, welcome, _) = group.add_members(&creator.provider, &creator.signer, &[package]).unwrap();
+    let welcome = wire(welcome).unwrap();
+    assert_eq!(b.welcome(&server(), "w", &welcome), Err(Invalid("restart chain")));
+    let mut b = Agent::load([21; 32], b.credential.clone(), b.durable.clone()).unwrap();
+    b.accept_chain(&server(), &first.descriptor.conversation, &[link(&first), link(&next)]).unwrap();
+    b.take_changes();
+    assert!(!b.welcome(&server(), "w", &welcome).unwrap().duplicate);
+    b.take_changes();
+    assert_eq!(b.group(&server(), &next.group_id()).unwrap().status, Status::Active);
+}
+#[test]
+fn a_new_device_accepts_a_chain_only_from_incarnation_zero() {
+    let (f, first, next, info) = restarted();
+    let mut c = device(2, 22, f.t);
+    let conversation = first.descriptor.conversation.clone();
+    assert_eq!(c.accept_chain(&server(), &conversation, &[link(&next)]), Err(Invalid("chain anchor")));
+    let mut c = device(2, 22, f.t);
+    assert_eq!(c.accept_chain(&server(), &conversation, &[link(&first), link(&next)]), Ok(next.group_id()));
+    c.take_changes();
+    assert_eq!(c.group(&server(), &first.group_id()).unwrap().status, Status::Superseded);
+    c.join_external(&server(), &info, f.t, &()).unwrap();
+}
+#[test]
+fn chain_links_must_verify() {
+    let (f, first, next, _) = restarted();
+    let conversation = first.descriptor.conversation.clone();
+    let reject = |chain: Vec<([u8; 32], Vec<u8>)>, reason: &'static str| {
+        let mut b = Agent::load([21; 32], f.b.credential.clone(), f.b.durable.clone()).unwrap();
+        assert_eq!(b.accept_chain(&server(), &conversation, &chain), Err(Invalid(reason)));
+        assert!(b.take_changes().is_empty());
+    };
+    let changed = |change: &dyn Fn(&mut Descriptor)| {
+        let mut d = next.descriptor.clone();
+        change(&mut d);
+        link(&SignedDescriptor::sign(d, f.a.credential.clone(), &f.a.signer.0))
+    };
+    reject(vec![], "chain anchor");
+    reject(vec![link(&next)], "chain anchor");
+    reject(vec![link(&first), (first.group_id(), next.encode())], "chain descriptor");
+    reject(vec![link(&first), changed(&|d| d.incarnation = 2)], "chain link");
+    reject(vec![link(&first), changed(&|d| d.previous_group_id = Some(b64(&[9; 32])))], "chain link");
+    reject(vec![link(&first), changed(&|d| d.server_key = public(&key(201)))], "chain descriptor");
+    // A creator whose certificate did not cover the creation time.
+    reject(vec![link(&first), changed(&|d| d.created_at = f.t - 2 * 86_400_000)], "chain descriptor");
+    // Two restarts in a row, followed from the device's live pin.
+    let third = restart(&f.a, &next, 5);
+    let mut b = Agent::load([21; 32], f.b.credential.clone(), f.b.durable.clone()).unwrap();
     assert_eq!(
-        b.welcome(&server(), "restart", &wire(welcome).unwrap()),
-        Err(AgentError::Rule(ds::DsError::Invalid("restart")))
+        b.accept_chain(&server(), &conversation, &[link(&first), link(&next), link(&third)]),
+        Ok(third.group_id())
     );
-    assert!(b.take_changes().is_empty());
-    // Reload the clean creator so its create path is tested independently of raw storage.
-    a = Agent::load([11; 32], a.credential.clone(), a.durable.clone()).unwrap();
-    assert_eq!(a.create(d), Err(AgentError::Rule(ds::DsError::Invalid("restart"))));
-    assert!(a.take_changes().is_empty());
+    b.take_changes();
+    assert_eq!(b.accept_chain(&server(), &conversation, &[link(&next), link(&third)]), Err(Invalid("chain anchor")));
+}
+#[test]
+fn a_successor_keeps_the_conversations_fields() {
+    let t = now();
+    let (a, b) = (device(1, 11, t), device(2, 21, t));
+    let channel = descriptor(&a, &b, t, false, true);
+    assert!(successor(&channel, &restart(&b, &channel, 2)));
+    let mut other = restart(&b, &channel, 2).descriptor;
+    other.history = false;
+    assert!(!successor(&channel, &SignedDescriptor::sign(other, b.credential.clone(), &b.signer.0)));
+}
+#[test]
+fn a_creation_continues_only_the_live_pin_once() {
+    let mut f = joined();
+    let first = descriptor(&f.a, &f.b, f.t, true, true);
+    let mut skipped = restart(&f.a, &first, 2).descriptor;
+    skipped.incarnation = 2;
+    assert_eq!(
+        f.a.create(SignedDescriptor::sign(skipped, f.a.credential.clone(), &f.a.signer.0)),
+        Err(Invalid("restart predecessor"))
+    );
+    let mut a = Agent::load([11; 32], f.a.credential.clone(), f.a.durable.clone()).unwrap();
+    let next = restart(&a, &first, 2);
+    a.create(next).unwrap();
+    a.take_changes();
+    // One candidate per predecessor, and the predecessor stays live until it is settled.
+    assert_eq!(a.create(restart(&a, &first, 3)), Err(Invalid("group pin")));
+    let a = Agent::load([11; 32], a.credential.clone(), a.durable.clone()).unwrap();
+    assert!(a.sending_key(&server(), &f.id, f.t, &()).is_ok());
+}
+#[test]
+fn group_infos_behind_the_checkpoint_or_forking_it_are_observed() {
+    let mut f = joined();
+    let ours = f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+    f.a.take_changes();
+    let theirs = f.b.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+    f.b.take_changes();
+    acknowledge(&mut f.a, &f.id, &ours);
+    assert_eq!(f.a.behind(&server(), &f.info), Ok(true), "an earlier epoch");
+    assert_eq!(f.a.behind(&server(), &theirs.group_info), Ok(true), "the same epoch, another context");
+    assert_eq!(f.a.behind(&server(), &ours.group_info), Ok(false));
+    assert_eq!(f.b.behind(&server(), &f.info), Ok(false), "b has not moved past it");
+    assert!(f.a.behind(&server(), &ours.commit).is_err());
 }
 
 #[test]

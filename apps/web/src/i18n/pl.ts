@@ -220,6 +220,7 @@ export const pl: Record<Key, string> = {
   "channel.devices.many": "{count} urządzeń",
   "chat.messagesEncrypted": "Wiadomości są szyfrowane end-to-end",
   "chat.historyNotShared": "Wcześniejsze wiadomości nie są udostępniane nowym członkom.",
+  "chat.restarted": "Ta rozmowa została uruchomiona od nowa.",
   "channel.removePassword": "Usuń hasło",
   "channel.maxClients": "Maks. użytkowników",
   "channel.maxHint": "Puste = bez limitu.",
