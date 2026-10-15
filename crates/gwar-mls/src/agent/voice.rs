@@ -22,6 +22,40 @@ pub fn voice_kid(epoch: u64, leaf: u32) -> u64 {
 }
 
 impl Agent {
+    /// Reconcile the complete `pending` set from `mls.log` at its `head` epoch.
+    /// First accept the join and catch up every commit through that head. An
+    /// individual proposal, commit acceptance or `pending(false)` cannot prove
+    /// that the server's current removal state has been processed.
+    ///
+    /// The caller must supply the entire set from one response, including an
+    /// empty set, and retry synchronization if the local epoch has advanced.
+    /// This trusts the server to report detached leaves, just like proposal
+    /// delivery during uninterrupted participation; it cannot detect withholding.
+    pub fn voice_pending(&mut self, server: &str, id: &[u8; 32], epoch: u64, proposals: &[Vec<u8>]) -> Result<()> {
+        self.operation(|a| {
+            let key = group_key(server, id);
+            if !a.voice_only {
+                return Err(Invalid("not a voice agent"));
+            }
+            if a.groups.get(&key).is_none_or(|r| r.status != Status::Active) || a.outbox.contains_key(&key) {
+                return Err(AgentError::Blocked);
+            }
+            let mut group = a.mls(&key)?;
+            if group.epoch().as_u64() != epoch {
+                return Err(Invalid("voice pending epoch"));
+            }
+            for proposal in proposals {
+                a.process_proposal(&key, &mut group, proposal)?;
+            }
+            let record = a.groups.get_mut(&key).ok_or(Invalid("group record"))?;
+            // Never discard holds learned in this membership, including ones
+            // whose proposal was cleared by a competing non-removal commit.
+            record.voice_needs_sync = false;
+            record.server_pending = false;
+            Ok(())
+        })
+    }
+
     fn voice_parent(&self, server: &str, id: &[u8; 32], parent: &Agent) -> Result<(MlsGroup, MlsGroup)> {
         if !self.voice_only || parent.voice_only {
             return Err(Invalid("voice and parent stores"));

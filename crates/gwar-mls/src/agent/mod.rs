@@ -173,30 +173,17 @@ pub struct GroupRecord {
     pub welcome_ids: BTreeSet<String>,
     pub server_pending: bool,
     /// Voice-only holds survive proposal-queue clearing on competing commits.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    voice_removals: BTreeMap<u32, VoiceRemoval>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    voice_removals: BTreeSet<u32>,
+    /// A joined voice snapshot needs the current epoch's complete pending set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    voice_needs_sync: bool,
     /// For every uid, the epochs in which it had a leaf, as this device saw
     /// them: sorted, disjoint, non-adjacent inclusive ranges.
     pub evidence: BTreeMap<String, Vec<Interval>>,
     /// When this device's own last commit in the group was accepted; `None`
     /// after a Welcome, whose leaf came from a key package.
     pub own_commit_at: Option<i64>,
-}
-/// The concrete authenticated leaf held by a server Remove. A same-device
-/// external replacement can reuse the index and credential, but not this leaf.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct VoiceRemoval {
-    device: String,
-    leaf_hash: [u8; 32],
-}
-impl VoiceRemoval {
-    fn new(leaf: &LeafNode) -> Result<Self> {
-        Ok(Self {
-            device: leaf_credential(leaf).ok_or(Invalid("removal target"))?.device_key().to_owned(),
-            leaf_hash: hash(&leaf.tls_serialize_detached().map_err(err("leaf encoding"))?),
-        })
-    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -754,7 +741,8 @@ impl Agent {
             checkpoint: None,
             welcome_ids: BTreeSet::new(),
             server_pending: false,
-            voice_removals: BTreeMap::new(),
+            voice_removals: BTreeSet::new(),
+            voice_needs_sync: false,
             evidence: BTreeMap::new(),
             own_commit_at: None,
         });
@@ -767,20 +755,6 @@ impl Agent {
         self.fresh(key, context)?;
         if self.voice_only {
             let record = self.groups.get_mut(key).ok_or(Invalid("group record"))?;
-            let recovering = record.status == Status::Joining;
-            let mut holds = BTreeMap::new();
-            for (index, held) in &record.voice_removals {
-                let Some(leaf) = group.public_group().leaf(LeafNodeIndex::new(*index)) else { continue };
-                let current = VoiceRemoval::new(leaf)?;
-                // Observed non-removal commits keep the hold, including a target's
-                // self-update. Recovery instead compares the authenticated snapshot
-                // with the last observed leaf, so a missed same-index replacement
-                // cannot leave an orphaned hold after its join is accepted.
-                if held.device == current.device && (!recovering || held.leaf_hash == current.leaf_hash) {
-                    holds.insert(*index, current);
-                }
-            }
-            record.voice_removals = holds;
             record.status = Status::Active;
             record.checkpoint = Some(checkpoint(context)?);
             record.server_pending = false;
@@ -911,7 +885,7 @@ impl Agent {
         let record = self.groups.get(&key).ok_or(Invalid("unknown group"))?;
         let mut gate = Gate {
             blocked: Vec::new(),
-            server_pending: record.server_pending || !record.voice_removals.is_empty(),
+            server_pending: record.server_pending || record.voice_needs_sync || !record.voice_removals.is_empty(),
             pending_commit: self.outbox.contains_key(&key),
             rejoin: false,
             status: record.status,
@@ -984,8 +958,10 @@ impl Agent {
         let Proposal::Remove(remove) = proposal.proposal() else { unreachable!() };
         let target = remove.removed();
         if self.voice_only {
-            let removal = VoiceRemoval::new(group.public_group().leaf(target).ok_or(Invalid("removal target"))?)?;
-            self.groups.get_mut(key).ok_or(Invalid("group record"))?.voice_removals.insert(target.u32(), removal);
+            if group.public_group().leaf(target).is_none() {
+                return Err(Invalid("removal target"));
+            }
+            self.groups.get_mut(key).ok_or(Invalid("group record"))?.voice_removals.insert(target.u32());
         }
         group.store_pending_proposal(self.provider.storage(), *proposal).map_err(err("store proposal"))?;
         Ok(())
@@ -1307,7 +1283,8 @@ impl Agent {
                     checkpoint: None,
                     welcome_ids: BTreeSet::new(),
                     server_pending: false,
-                    voice_removals: BTreeMap::new(),
+                    voice_removals: BTreeSet::new(),
+                    voice_needs_sync: false,
                     evidence: BTreeMap::new(),
                     own_commit_at: None,
                 });
@@ -1441,7 +1418,15 @@ impl Agent {
                 .set_configuration(a.provider.storage(), &join_config(descriptor.descriptor.kind))
                 .map_err(err("group config"))?;
             a.record(&descriptor, Status::Joining);
-            a.groups.get_mut(&key).ok_or(Invalid("record"))?.checkpoint = Some(old_checkpoint.clone());
+            let record = a.groups.get_mut(&key).ok_or(Invalid("record"))?;
+            record.checkpoint = Some(old_checkpoint.clone());
+            if a.voice_only {
+                // A snapshot cannot distinguish missed removal/rejoin from a
+                // self-update. Start a fresh membership trust interval, but do
+                // not export until its complete current removal state is known.
+                record.voice_removals.clear();
+                record.voice_needs_sync = true;
+            }
             let out = a.bundle(&id, old_checkpoint.epoch, bundle, now)?;
             a.outbox.insert(key, out.clone());
             Ok(out)

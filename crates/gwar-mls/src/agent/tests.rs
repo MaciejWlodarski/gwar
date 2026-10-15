@@ -1911,6 +1911,8 @@ fn voice_uses_external_joins_parent_gates_and_no_durable_chat_keys() {
     acknowledge(&mut b, &id, &join);
     a.receive(&server(), &id, &join.commit, &[]).unwrap();
     a.take_changes();
+    b.voice_pending(&server(), &id, observer.epoch(), &[]).unwrap();
+    b.take_changes();
     // Historical voice acceptance is independent of the parent's current sync.
     assert_eq!(a.voice_keys(&server(), &id, &parent, t, &()), Err(AgentError::Blocked));
     assert_eq!(a.voice_parent_removals(&server(), &id, &parent, false), Err(AgentError::Blocked));
@@ -2011,7 +2013,7 @@ fn voice_removal_hold_survives_competing_update_and_volatile_reload() {
     f.a.pending(&server(), &f.id, false).unwrap();
     f.a.take_changes();
     assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
-    // The hold follows that observed update even through snapshot recovery.
+    // Snapshot recovery replaces the hold with a pending-state barrier.
     let recovery =
         f.a.join_external(&server(), &update.group_info, Some(&f.observer.tree().unwrap().1), f.t, &()).unwrap();
     f.a.take_changes();
@@ -2020,7 +2022,7 @@ fn voice_removal_hold_survives_competing_update_and_volatile_reload() {
     f.a = Agent::load_voice([11; 32], f.a.credential.clone(), f.a.durable.clone()).unwrap();
     assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
     let proposal = f.observer.propose_remove(&Ed25519Signer(key(200)), target).unwrap();
-    f.a.proposal(&server(), &f.id, &proposal).unwrap();
+    f.a.voice_pending(&server(), &f.id, f.observer.epoch(), &[proposal]).unwrap();
     f.a.take_changes();
     let remove = f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
     f.a.take_changes();
@@ -2029,63 +2031,163 @@ fn voice_removal_hold_survives_competing_update_and_volatile_reload() {
     assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()).unwrap().members.len(), 2);
 }
 
-#[test]
-fn voice_recovery_reconciles_same_index_removal_holds_after_log_gap_and_reload() {
-    for replaced in [false, true] {
-        let (mut f, parent, mut c) = voice_fixture();
-        let target = f.observer.leaves().iter().find(|l| l.device_key == f.b.credential.device_key()).unwrap().index;
-        let proposal = f.observer.propose_remove(&Ed25519Signer(key(200)), target).unwrap();
-        f.a.proposal(&server(), &f.id, &proposal).unwrap();
+fn voice_recovery_pending_state(replaced: bool, reload: bool) {
+    let (mut f, parent, mut c) = voice_fixture();
+    let target = f.observer.leaves().iter().find(|l| l.device_key == c.credential.device_key()).unwrap().index;
+    let old_leaf =
+        f.a.mls(&group_key(&server(), &f.id)).unwrap().public_group().leaf(LeafNodeIndex::new(target)).unwrap().clone();
+    let proposal = f.observer.propose_remove(&Ed25519Signer(key(200)), target).unwrap();
+    f.a.proposal(&server(), &f.id, &proposal).unwrap();
+    f.a.take_changes();
+    let pending = f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+    f.a.take_changes();
+    // A misses either the held device's legitimate same-index external rejoin
+    // or its ordinary self-update. Both change the authenticated fingerprint.
+    let winner = if replaced {
+        c.join_external(&server(), &f.info, Some(&f.observer.tree().unwrap().1), f.t, &()).unwrap()
+    } else {
+        c.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap()
+    };
+    c.take_changes();
+    f.observer = accept(f.observer, &winner, f.t);
+    acknowledge(&mut c, &f.id, &winner);
+    let current = c.mls(&group_key(&server(), &f.id)).unwrap();
+    assert_ne!(current.public_group().leaf(LeafNodeIndex::new(target)).unwrap(), &old_leaf);
+    assert_eq!(f.observer.leaves().iter().find(|l| l.device_key == c.credential.device_key()).unwrap().index, target);
+    assert_eq!(
+        f.a.reconcile(&server(), &f.id, Reconcile::Pruned { oldest: pending.epoch + 1 }).unwrap(),
+        Resolution::Rejoin
+    );
+    f.a.take_changes();
+    let reload_a = |a: &mut Agent| {
+        if reload {
+            *a = Agent::load_voice([11; 32], a.credential.clone(), a.durable.clone()).unwrap();
+        }
+    };
+    reload_a(&mut f.a);
+    let recovery =
+        f.a.join_external(&server(), &winner.group_info, Some(&f.observer.tree().unwrap().1), f.t, &()).unwrap();
+    f.a.take_changes();
+    reload_a(&mut f.a);
+    assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    f.observer = accept(f.observer, &recovery, f.t);
+    acknowledge(&mut f.a, &f.id, &recovery);
+    reload_a(&mut f.a);
+    f.a.pending(&server(), &f.id, false).unwrap();
+    f.a.take_changes();
+    reload_a(&mut f.a);
+    assert_eq!(
+        f.a.voice_keys(&server(), &f.id, &parent, f.t, &()),
+        Err(AgentError::Blocked),
+        "join acceptance and an unbound notification cannot reconcile removals"
+    );
+    // Even a subsequent accepted commit must not silently clear the barrier.
+    let update = f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+    f.a.take_changes();
+    f.observer = accept(f.observer, &update, f.t);
+    acknowledge(&mut f.a, &f.id, &update);
+    reload_a(&mut f.a);
+    assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    let proposals =
+        if replaced { vec![] } else { vec![f.observer.propose_remove(&Ed25519Signer(key(200)), target).unwrap()] };
+    // A delivered proposal is not a complete pending-state response.
+    for p in &proposals {
+        f.a.proposal(&server(), &f.id, p).unwrap();
         f.a.take_changes();
-        let pending = f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
-        f.a.take_changes();
-        // A misses either B's same-index replacement or C's unrelated update.
-        let winner = if replaced {
-            f.b.join_external(&server(), &f.info, Some(&f.observer.tree().unwrap().1), f.t, &()).unwrap()
-        } else {
-            c.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap()
-        };
-        let winning_agent = if replaced { &mut f.b } else { &mut c };
-        winning_agent.take_changes();
-        f.observer = accept(f.observer, &winner, f.t);
-        acknowledge(winning_agent, &f.id, &winner);
-        assert_eq!(
-            f.observer.leaves().iter().find(|l| l.device_key == f.b.credential.device_key()).unwrap().index,
-            target,
-            "the device and leaf index alone cannot distinguish replacement"
-        );
-        assert_eq!(
-            f.a.reconcile(&server(), &f.id, Reconcile::Pruned { oldest: pending.epoch + 1 }).unwrap(),
-            Resolution::Rejoin
-        );
-        f.a.take_changes();
-        let recovery =
-            f.a.join_external(&server(), &winner.group_info, Some(&f.observer.tree().unwrap().1), f.t, &()).unwrap();
-        f.a.take_changes();
-        f.a = Agent::load_voice([11; 32], f.a.credential.clone(), f.a.durable.clone()).unwrap();
+    }
+    reload_a(&mut f.a);
+    assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    f.a.voice_pending(&server(), &f.id, f.observer.epoch(), &proposals).unwrap();
+    f.a.take_changes();
+    reload_a(&mut f.a);
+    if replaced {
+        let keys = f.a.voice_keys(&server(), &f.id, &parent, f.t, &()).unwrap();
+        assert_eq!(keys.epoch, f.observer.epoch());
+        assert_eq!(keys.members.len(), 3);
+    } else {
         assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
-        f.observer = accept(f.observer, &recovery, f.t);
-        acknowledge(&mut f.a, &f.id, &recovery);
-        f.a = Agent::load_voice([11; 32], f.a.credential.clone(), f.a.durable.clone()).unwrap();
+        // Neither an empty replay nor the notification API cancels a learned hold.
+        f.a.voice_pending(&server(), &f.id, f.observer.epoch(), &[]).unwrap();
+        f.a.take_changes();
         f.a.pending(&server(), &f.id, false).unwrap();
         f.a.take_changes();
-        if replaced {
-            let keys = f.a.voice_keys(&server(), &f.id, &parent, f.t, &()).unwrap();
-            assert_eq!(keys.epoch, f.observer.epoch());
-            assert_eq!(keys.members.len(), 3);
-        } else {
-            // An unchanged target is still held, and a reissued Remove resolves it.
-            assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
-            let proposal = f.observer.propose_remove(&Ed25519Signer(key(200)), target).unwrap();
-            f.a.proposal(&server(), &f.id, &proposal).unwrap();
-            f.a.take_changes();
-            let remove = f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
-            f.a.take_changes();
-            f.observer = accept(f.observer, &remove, f.t);
-            acknowledge(&mut f.a, &f.id, &remove);
-            assert!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()).is_ok());
-        }
+        reload_a(&mut f.a);
+        assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+        let remove = f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+        f.a.take_changes();
+        f.observer = accept(f.observer, &remove, f.t);
+        acknowledge(&mut f.a, &f.id, &remove);
+        reload_a(&mut f.a);
+        assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()).unwrap().members.len(), 2);
     }
+}
+
+#[test]
+fn voice_recovery_missed_self_update_waits_for_pending_state() {
+    voice_recovery_pending_state(false, false);
+}
+#[test]
+fn voice_recovery_missed_self_update_waits_for_pending_state_after_reload() {
+    voice_recovery_pending_state(false, true);
+}
+#[test]
+fn voice_recovery_same_index_rejoin_waits_for_pending_state() {
+    voice_recovery_pending_state(true, false);
+}
+#[test]
+fn voice_recovery_same_index_rejoin_waits_for_pending_state_after_reload() {
+    voice_recovery_pending_state(true, true);
+}
+
+#[test]
+fn voice_pending_rejects_unaccepted_stale_and_partial_sync_after_reload() {
+    let (mut f, parent, _) = voice_fixture();
+    let recovery = f.a.join_external(&server(), &f.info, Some(&f.observer.tree().unwrap().1), f.t, &()).unwrap();
+    f.a.take_changes();
+    assert_eq!(f.a.voice_pending(&server(), &f.id, recovery.epoch + 1, &[]), Err(AgentError::Blocked));
+    assert!(f.a.take_changes().is_empty());
+    f.a = Agent::load_voice([11; 32], f.a.credential.clone(), f.a.durable.clone()).unwrap();
+    f.observer = accept(f.observer, &recovery, f.t);
+    acknowledge(&mut f.a, &f.id, &recovery);
+    let epoch = f.observer.epoch();
+    let target = f.observer.leaves().iter().find(|l| l.device_key == f.b.credential.device_key()).unwrap().index;
+    let proposal = f.observer.propose_remove(&Ed25519Signer(key(200)), target).unwrap();
+    for (head, proposals) in [(epoch - 1, vec![]), (epoch + 1, vec![]), (epoch, vec![proposal, vec![0]])] {
+        let before = f.a.durable.clone();
+        assert!(f.a.voice_pending(&server(), &f.id, head, &proposals).is_err());
+        assert!(f.a.take_changes().is_empty());
+        assert_eq!(f.a.durable, before);
+        f.a = Agent::load_voice([11; 32], f.a.credential.clone(), before).unwrap();
+        assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    }
+    // No partially processed proposal survived the failed atomic operation.
+    f.a.voice_pending(&server(), &f.id, epoch, &[]).unwrap();
+    f.a.take_changes();
+    assert!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()).is_ok());
+}
+
+#[test]
+fn voice_recovery_barrier_survives_a_removal_commit_without_complete_sync() {
+    let (mut f, parent, _) = voice_fixture();
+    let recovery = f.a.join_external(&server(), &f.info, Some(&f.observer.tree().unwrap().1), f.t, &()).unwrap();
+    f.a.take_changes();
+    f.observer = accept(f.observer, &recovery, f.t);
+    acknowledge(&mut f.a, &f.id, &recovery);
+    let target = f.observer.leaves().iter().find(|l| l.device_key == f.b.credential.device_key()).unwrap().index;
+    let proposal = f.observer.propose_remove(&Ed25519Signer(key(200)), target).unwrap();
+    f.a.proposal(&server(), &f.id, &proposal).unwrap();
+    f.a.take_changes();
+    let remove = f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+    f.a.take_changes();
+    assert_eq!(f.a.voice_pending(&server(), &f.id, f.observer.epoch(), &[]), Err(AgentError::Blocked));
+    f.a = Agent::load_voice([11; 32], f.a.credential.clone(), f.a.durable.clone()).unwrap();
+    f.observer = accept(f.observer, &remove, f.t);
+    acknowledge(&mut f.a, &f.id, &remove);
+    f.a = Agent::load_voice([11; 32], f.a.credential.clone(), f.a.durable.clone()).unwrap();
+    assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    f.a.voice_pending(&server(), &f.id, f.observer.epoch(), &[]).unwrap();
+    f.a.take_changes();
+    assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()).unwrap().members.len(), 2);
 }
 
 #[test]

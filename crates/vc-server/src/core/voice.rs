@@ -1117,13 +1117,14 @@ mod tests {
         sessions: Vec<SessionId>,
         frames: Vec<mpsc::Receiver<Outbound>>,
         voices: Vec<Agent>,
+        parent: Agent,
         _commands: mpsc::Receiver<MediaCmd>,
     }
     impl TestCall {
         fn new() -> Self {
             let (mut core, session, frames, commands) = fixture();
             core.info.max_clients = 1000;
-            let (channel, group, _, voice) = encrypted_agents(&mut core, session, None);
+            let (channel, group, parent, voice) = encrypted_agents(&mut core, session, None);
             Self {
                 core,
                 channel,
@@ -1131,6 +1132,7 @@ mod tests {
                 sessions: vec![session],
                 frames: vec![frames],
                 voices: vec![voice],
+                parent,
                 _commands: commands,
             }
         }
@@ -1162,6 +1164,10 @@ mod tests {
             agent.take_changes();
             let out =
                 agent.join_external(&self.core.server_key, &parent.group_info, Some(&tree), now_ms(), &()).unwrap();
+            self.parent
+                .receive(&self.core.server_key, &vc_proto::decode_fixed::<32>(&parent.group).unwrap(), &out.commit, &[])
+                .unwrap();
+            self.parent.take_changes();
             self.core
                 .mls_request(
                     session,
@@ -1231,6 +1237,86 @@ mod tests {
                 "states": self.sessions.iter().map(|s| self.core.voice_state(*s)).collect::<Vec<_>>() })
         }
     }
+    #[test]
+    fn recovery_log_reissues_detached_removals_and_releases_rejoined_leaves() {
+        use gwar_mls::agent::{AgentError, Reconcile, Resolution};
+        for rejoined in [false, true] {
+            let mut f = TestCall::new();
+            f.add(None, None, true, true);
+            f.add(None, None, true, true);
+            let server = f.core.server_key.clone();
+            let id = vc_proto::decode_fixed::<32>(&f.group).unwrap();
+            let target = f.core.calls[&f.channel]
+                .group
+                .as_ref()
+                .unwrap()
+                .leaves
+                .iter()
+                .find(|(_, l)| l.session == f.sessions[1])
+                .map(|(index, _)| *index)
+                .unwrap();
+            f.core.move_client(f.sessions[1], None).unwrap();
+            f.core.voice_reconcile();
+            let old_proposal = f.core.calls[&f.channel].group.as_ref().unwrap().proposals[&target].clone();
+            f.voices[0].proposal(&server, &id, &old_proposal).unwrap();
+            f.voices[0].take_changes();
+            let pending = f.voices[0].commit(&server, &id, &[], &[], now_ms(), &()).unwrap();
+            f.voices[0].take_changes();
+            // C wins before A can commit the removal. A misses that commit.
+            let update = f.voices[2].commit(&server, &id, &[], &[], now_ms(), &()).unwrap();
+            f.submit(2, &update).unwrap();
+            settle_commit(&mut f.voices[2], &server, &f.group, &update);
+            if rejoined {
+                f.core.enter_channel(f.sessions[1], f.channel).unwrap();
+                let g = f.core.calls[&f.channel].group.as_ref().unwrap();
+                let tree = Observer::load(&g.observer, &server).unwrap().tree().unwrap().1;
+                let join = f.voices[1].join_external(&server, &g.info, Some(&tree), now_ms(), &()).unwrap();
+                f.submit(1, &join).unwrap();
+                settle_commit(&mut f.voices[1], &server, &f.group, &join);
+                let g = f.core.calls[&f.channel].group.as_ref().unwrap();
+                assert_eq!(g.leaves[&target].session, f.sessions[1]);
+                assert!(g.proposals.is_empty());
+            }
+            // Force a genuine log gap, retaining the current pending set.
+            f.core.calls.get_mut(&f.channel).unwrap().group.as_mut().unwrap().log.clear();
+            let Response::Mls(MlsResponse::Log { oldest, .. }) =
+                f.core.voice_log(f.sessions[0], f.channel, pending.epoch, None).unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(f.voices[0].reconcile(&server, &id, Reconcile::Pruned { oldest }).unwrap(), Resolution::Rejoin);
+            f.voices[0].take_changes();
+            let g = f.core.calls[&f.channel].group.as_ref().unwrap();
+            let tree = Observer::load(&g.observer, &server).unwrap().tree().unwrap().1;
+            let recovery = f.voices[0].join_external(&server, &g.info, Some(&tree), now_ms(), &()).unwrap();
+            f.voices[0].take_changes();
+            f.submit(0, &recovery).unwrap();
+            settle_commit(&mut f.voices[0], &server, &f.group, &recovery);
+            assert_eq!(f.voices[0].voice_keys(&server, &id, &f.parent, now_ms(), &()), Err(AgentError::Blocked));
+            let Response::Mls(MlsResponse::Log { head, pending, .. }) =
+                f.core.voice_log(f.sessions[0], f.channel, recovery.epoch, None).unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(pending.len(), usize::from(!rejoined));
+            let pending: Vec<_> = pending.iter().map(|p| URL_SAFE_NO_PAD.decode(p).unwrap()).collect();
+            if !rejoined {
+                assert_ne!(pending[0], old_proposal, "the server reissues Remove at the recovery epoch");
+            }
+            f.voices[0].voice_pending(&server, &id, head, &pending).unwrap();
+            f.voices[0].take_changes();
+            if rejoined {
+                assert_eq!(f.voices[0].voice_keys(&server, &id, &f.parent, now_ms(), &()).unwrap().members.len(), 3);
+            } else {
+                assert_eq!(f.voices[0].voice_keys(&server, &id, &f.parent, now_ms(), &()), Err(AgentError::Blocked));
+                let remove = f.voices[0].commit(&server, &id, &[], &[], now_ms(), &()).unwrap();
+                f.submit(0, &remove).unwrap();
+                settle_commit(&mut f.voices[0], &server, &f.group, &remove);
+                assert_eq!(f.voices[0].voice_keys(&server, &id, &f.parent, now_ms(), &()).unwrap().members.len(), 2);
+            }
+        }
+    }
+
     thread_local! { static VOICE_TIME: std::cell::Cell<i64> = const { std::cell::Cell::new(0) }; }
     fn test_clock() -> i64 {
         VOICE_TIME.get()
