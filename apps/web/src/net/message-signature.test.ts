@@ -1,6 +1,7 @@
 import "fake-indexeddb/auto";
 import { describe, expect, it, vi } from "vitest";
 import vectors from "../../../../crates/vc-proto/tests/message-signing.json";
+import attachmentVectors from "../../../../crates/vc-proto/tests/attachment-body.json";
 import { CONNECT_URL } from "../lib/official";
 import { messageTarget } from "../lib/chat";
 import { certifyDevice, keyFromSeed, signText, revokeStatement } from "../connect/crypto";
@@ -52,6 +53,10 @@ it("verifies signed Gwar messages from both TeamSpeak DM views and leaves replie
     expect((await verifyMessage(reply, ctx)).status).toBe("unsigned-ts");
     expect((await verifyMessage(f.msg, { ...ctx, participants: [author, "ts:other"] })).status).toBe("invalid");
   }
+});
+
+it("puts a sealed attachment's key and ciphertext into the body, as the server does", () => {
+  for (const v of attachmentVectors) expect(encodeBase64Url(canonicalMessageBody(v.text, v.mentions, v.attachments))).toBe(v.canonical_body);
 });
 
 describe("v2 shared vectors", () => {

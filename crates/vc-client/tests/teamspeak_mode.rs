@@ -209,6 +209,7 @@ async fn teamspeak_users_get_attachment_links_and_can_be_banned() {
             size: 5,
             mime: "text/plain".into(),
             sha256: "LPJNul-wow4m6DsqxbninhsWHlwfp0JecwQzYpOLmCQ".into(),
+            sealed: false,
         })
         .await
         .unwrap();

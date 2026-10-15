@@ -1117,7 +1117,9 @@ impl Core {
                 self.chat_edit(session, message, text, mentions, signature)
             }
             Request::ChatDelete { message } => self.chat_delete(session, message),
-            Request::FileUpload { name, size, mime, sha256 } => self.file_upload(session, name, size, mime, sha256),
+            Request::FileUpload { name, size, mime, sha256, sealed } => {
+                self.file_upload(session, name, size, mime, sha256, sealed)
+            }
             Request::GroupCreate(create) => self.group_create(session, create),
             Request::GroupUpdate(update) => self.group_update(session, update),
             Request::GroupDelete { group } => self.group_delete(session, group),
@@ -1560,6 +1562,7 @@ impl Core {
         // Deepest first, so clients never see an orphaned child.
         doomed.sort_by_key(|&c| std::cmp::Reverse(self.depth(c)));
         self.store.delete_channel(channel).map_err(storage_error)?;
+        self.remove_files();
         for group in self.history.groups() {
             if self.store.mls_group(&group).map_err(storage_error)?.is_none() {
                 self.history.forget_group(&group);

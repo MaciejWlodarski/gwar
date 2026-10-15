@@ -361,7 +361,7 @@ fn the_command_line_lists_and_prunes_members() {
     let lobby = seeded.store.channels().unwrap()[0].id;
     seeded.store.add_message(lobby, "stale", "stale", "ancient", now_ms() - 100 * DAY).unwrap();
     std::fs::create_dir_all(seeded.files()).unwrap();
-    seeded.store.insert_file("f1", "stale", "a.txt", "text/plain", 3, "hash", None, now_ms()).unwrap();
+    seeded.store.insert_file("f1", "stale", "a.txt", "text/plain", 3, "hash", None, now_ms(), false).unwrap();
     let message = seeded.store.add_message(lobby, "stale", "stale", "with file", now_ms() - 99 * DAY).unwrap();
     seeded.store.attach_file("f1", message).unwrap();
     std::fs::write(seeded.files().join("f1"), "abc").unwrap();
@@ -448,9 +448,9 @@ fn merging_members_moves_all_identity_references_transactionally() {
         ..Default::default()
     }));
     Store::open(&seeded.database()).unwrap().save_message_body(&signed).unwrap();
-    store.insert_file("attached", "-legacy", "a.txt", "text/plain", 3, "hash", None, 1).unwrap();
+    store.insert_file("attached", "-legacy", "a.txt", "text/plain", 3, "hash", None, 1, false).unwrap();
     store.attach_file("attached", first).unwrap();
-    store.insert_file("pending", "-legacy", "p.txt", "text/plain", 3, "hash", None, 1).unwrap();
+    store.insert_file("pending", "-legacy", "p.txt", "text/plain", 3, "hash", None, 1, false).unwrap();
     std::fs::create_dir_all(seeded.files()).unwrap();
     std::fs::write(seeded.files().join("attached"), b"abc").unwrap();
     std::fs::write(seeded.files().join("pending"), b"def").unwrap();

@@ -6,7 +6,9 @@ wire! {
     #[serde(tag = "op", content = "d")]
     pub enum SealedRequest {
         #[serde(rename = "chat.sealed.send")]
-        Send { conversation: String, group: String, #[cfg_attr(feature = "ts", ts(type = "number"))] epoch: u64, message_id: String, ciphertext: String },
+        /// `files`: at most 10 distinct finished sealed uploads of the sender, not yet
+        /// attached, tied to this message.
+        Send { conversation: String, group: String, #[cfg_attr(feature = "ts", ts(type = "number"))] epoch: u64, message_id: String, ciphertext: String, #[serde(default)] files: Vec<FileId> },
         #[serde(rename = "chat.sealed.edit")]
         Edit { conversation: String, group: String, #[cfg_attr(feature = "ts", ts(type = "number"))] epoch: u64, message_id: String, revision: u32, ciphertext: String },
         #[serde(rename = "chat.delete_own")]

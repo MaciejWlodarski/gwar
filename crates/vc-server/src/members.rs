@@ -188,7 +188,7 @@ mod tests {
         let store = Store::in_memory().unwrap();
         for (uid, file, size) in [("u", "a", 3), ("v", "b", 5)] {
             store.touch_user(uid, uid, uid, 0).unwrap();
-            store.insert_file(file, uid, "f", "x", size, "h", None, 0).unwrap();
+            store.insert_file(file, uid, "f", "x", size, "h", None, 0, false).unwrap();
             std::fs::write(dir.path().join(file), "x").unwrap();
         }
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();

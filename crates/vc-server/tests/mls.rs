@@ -1315,10 +1315,14 @@ async fn sealed_cap_paging_unread_and_persistence() {
 
 #[tokio::test]
 async fn sealed_member_removal_and_pruning_clear_marks_and_optionally_erase_authored_messages() {
-    for (delete_messages, prune) in [(false, false), (true, false), (true, true)] {
+    for (delete_messages, prune) in [(false, false), (true, false), (false, true), (true, true)] {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("db.sqlite3");
-        let server = TestServer::start_with(|c| c.database = Some(database.clone())).await;
+        let server = TestServer::start_with(|c| {
+            c.database = Some(database.clone());
+            c.files_dir = Some(directory.path().join("files"));
+        })
+        .await;
         let mut alice = Device::new(1, 11);
         let mut bob = Device::new(2, 21);
         let mut a = connect_device(&server, &alice).await;
@@ -1328,8 +1332,15 @@ async fn sealed_member_removal_and_pruning_clear_marks_and_optionally_erase_auth
         let conversation = vc_proto::dm_conversation(&uid(1), &uid(2));
         let group = create(&mut a, &mut alice, 2, 1).await;
         add(&mut a, &mut alice, &mut bob, &group).await;
-        let own = a.ok("chat.sealed.send", sealed(&conversation, &group, 1, 1)).await;
-        let peer = b.ok("chat.sealed.send", sealed(&conversation, &group, 1, 2)).await;
+        let own_file = attachments::upload(&server, &mut a, true).await;
+        let peer_file = attachments::upload(&server, &mut b, true).await;
+        let pending = attachments::upload(&server, &mut b, true).await;
+        let mut own_request = sealed(&conversation, &group, 1, 1);
+        own_request["files"] = json!([own_file.id]);
+        let mut peer_request = sealed(&conversation, &group, 1, 2);
+        peer_request["files"] = json!([peer_file.id]);
+        let own = a.ok("chat.sealed.send", own_request).await;
+        let peer = b.ok("chat.sealed.send", peer_request).await;
         b.ok("chat.read", json!({"conversation":conversation,"message":peer["id"]})).await;
         let peer_session = b.id();
         b.close().await;
@@ -1340,12 +1351,29 @@ async fn sealed_member_removal_and_pruning_clear_marks_and_optionally_erase_auth
                 .unwrap();
             a.ok(
                 "member.prune",
-                json!({"inactive_days":1,"without_groups_only":false,"delete_messages":true,"dry_run":false}),
+                json!({"inactive_days":1,"without_groups_only":false,"delete_messages":delete_messages,"dry_run":false}),
             )
             .await;
         } else {
             a.ok("member.remove", json!({"uid":uid(2),"delete_messages":delete_messages})).await;
         }
+        let store = vc_server::store::Store::open(&database).unwrap();
+        assert!(store.file(&own_file.id).unwrap().is_some());
+        assert_eq!(store.file(&peer_file.id).unwrap().is_some(), !delete_messages);
+        assert!(store.file(&pending.id).unwrap().is_none());
+        assert!(store.expire_unattached(i64::MAX).unwrap().is_empty());
+        assert!(store.expire_orphans().unwrap().is_empty());
+        assert_eq!(store.file(&peer_file.id).unwrap().is_some(), !delete_messages);
+        let files = directory.path().join("files");
+        attachments::released(
+            &files.join(&pending.id),
+            &database,
+            &uid(2),
+            if delete_messages { 0 } else { peer_file.size },
+        )
+        .await;
+        assert_eq!(files.join(&peer_file.id).exists(), !delete_messages);
+        assert!(files.join(&own_file.id).exists());
         let marks: i64 = db.query_row("SELECT COUNT(*) FROM conversation_reads", [], |r| r.get(0)).unwrap();
         assert_eq!(marks, 0);
         let history = a.ok("chat.sealed.history", json!({"conversation":conversation})).await;
@@ -1702,3 +1730,6 @@ async fn a_restart_continues_the_live_group_and_retires_its_predecessor() {
     let groups: Vec<_> = history["sealed"].as_array().unwrap().iter().map(|m| m["group"].clone()).collect();
     assert_eq!(groups, [json!(old), json!(next)]);
 }
+
+#[path = "common/sealed_attachments.rs"]
+mod attachments;
