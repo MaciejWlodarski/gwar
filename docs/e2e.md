@@ -571,10 +571,10 @@ Local identities have one device and no archive.
   different keys for the same binding stop the engine. An install overtaken
   by a newer one is ignored, and no install brings back keys that were
   purged or replay windows that were reset.
-- **Frame size**: Opus frames are kept small (20 ms at the current bitrates
-  is about 120–200 bytes, plus at most 33 bytes of SFrame). Clients drop,
-  never truncate, an encoded frame over 1000 bytes before encryption, so a
-  frame always fits one RTP packet (str0m 0.24 leaves about 1120 bytes).
+- **Frame size**: Opus packets stay small: native 10 ms, browsers 20 ms,
+  plus at most 33 bytes of SFrame. Clients drop, never truncate, an encoded
+  frame over 1000 bytes before encryption, so it always fits one RTP packet
+  (str0m 0.24 leaves about 1120 bytes).
 
 ### SFU
 
@@ -599,7 +599,7 @@ Local identities have one device and no archive.
     frame instead of using wall-clock time, and discards a partial frame
     across a gap in capture;
   - per sender stream (SSRC), the SFU orders packets by extended RTP
-    sequence number: duplicates and packets older than the last forwarded
+    sequence number: duplicates and packets older than the last accepted
     are dropped. A new SSRC starts a new baseline;
   - for a newer packet from the same speaker on a slot, the forwarded time
     advances by the sender's timestamp difference (modulo 2^32) and the
@@ -608,15 +608,16 @@ Local identities have one device and no archive.
     real silence longer than five seconds, harmless when packets arrive on
     time); a
     difference of zero (one frame per packet, so a sender fault) drops the
-    packet and is counted;
+    packet and is counted. Track resets even on muted/gated packets; a slot
+    re-anchors on its next packet from that source-clock generation;
   - on a speaker change or a source reset, the forwarded time advances by
-    the elapsed wall-clock time rounded up to whole 20 ms frames, at least
-    one.
-- **Frame duration**: clients ask for 20 ms frames (`ptime`/`maxptime` 20;
-  the native engine always uses 20 ms). The sender checks each frame's Opus
-  duration before encrypting and counts other durations; they are still
-  sent, because timing rests on the sender's timestamps and only the
-  speaker-change estimate assumes 20 ms. In S2 all three browsers kept 20 ms.
+    elapsed wall-clock time rounded up to whole 10 ms units (480 ticks), at
+    least one, for both 10 and 20 ms senders.
+- **Frame duration**: native Gwar keeps 10 ms, browsers 20 ms, with each
+  client's current `ptime` negotiation unchanged. Direct TeamSpeak keeps
+  20 ms and its puppet keeps pairing 10 ms packets. Before encryption the
+  sender counts durations differing from its configuration but still sends
+  them; timing rests on capture timestamps. In S2 all browsers kept 20 ms.
 - **Speech gate**: unchanged, from the RFC 6464 audio level header extension,
   which stays in the clear. Who talks, and when, remains visible to the
   server, as it is today. Rewritten RTP headers are not part of SFrame's
