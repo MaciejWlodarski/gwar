@@ -138,9 +138,14 @@ impl Device {
         );
     }
 
+    /// The GroupInfo of the current epoch; channel groups leave the tree out after creation.
     fn group_info(&self) -> Vec<u8> {
         let group = self.group.as_ref().unwrap();
-        wire(group.export_group_info(self.provider.crypto(), &self.signer, true).unwrap())
+        let context = group.public_group().group_context();
+        let descriptor =
+            SignedDescriptor::parse(&context.extensions().unknown(DESCRIPTOR_EXTENSION).unwrap().0).unwrap();
+        let tree = descriptor.descriptor.kind == Kind::Dm || context.epoch().as_u64() == 0;
+        wire(group.export_group_info(self.provider.crypto(), &self.signer, tree).unwrap())
     }
 
     /// Adds devices by key package; returns (commit, welcome, group info) and merges.
@@ -172,12 +177,18 @@ impl Device {
         (wire(commit), self.group_info())
     }
 
-    fn join_external(&mut self, group_info: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    /// Joins from a GroupInfo, with the tree separately when it leaves the tree out.
+    fn join_external(&mut self, group_info: &[u8], tree: Option<&[u8]>) -> (Vec<u8>, Vec<u8>) {
         let MlsMessageBodyIn::GroupInfo(info) = MlsMessageIn::tls_deserialize_exact(group_info).unwrap().extract()
         else {
             panic!("not a group info")
         };
-        let (mut group, bundle) = MlsGroup::external_commit_builder()
+        let builder = MlsGroup::external_commit_builder();
+        let builder = match tree {
+            Some(tree) => builder.with_ratchet_tree(RatchetTreeIn::tls_deserialize_exact(tree).unwrap()),
+            None => builder,
+        };
+        let (mut group, bundle) = builder
             .with_config(join_config())
             .with_aad(commit_aad(self.time.unwrap_or_else(now)))
             .build_group(&self.provider, info, self.with_key())
@@ -405,10 +416,10 @@ async fn creation_is_first_wins_and_commits_are_ordered_with_replayable_welcomes
     assert_eq!(conflict.code, vc_proto::ErrorCode::Conflict);
     assert_eq!(conflict.message, group);
     assert_eq!(c.fails("mls.group_info", json!({"group":group})).await, "forbidden");
-    let stranger = carol.join_external(&alice.group_info());
+    let stranger = carol.join_external(&alice.group_info(), None);
     assert_eq!(c.fails("mls.commit", update_request(&group, 0, &stranger)).await, "forbidden");
     assert_eq!(a.fails("mls.commit", update_request(&group, 0, &stranger)).await, "bad_request");
-    let join = bob.join_external(&alice.group_info());
+    let join = bob.join_external(&alice.group_info(), None);
     assert_eq!(a.fails("mls.commit", update_request(&group, 0, &join)).await, "forbidden");
     assert_eq!(b.ok("mls.commit", update_request(&group, 0, &join)).await["epoch"], 1);
     alice.process(&join.0);
@@ -1477,11 +1488,19 @@ async fn create_channel_group(
         .map_err(|e| serde_json::to_value(e.code).unwrap().as_str().unwrap().to_owned())
 }
 
-/// Joins `group` by external commit.
-async fn join_channel(client: &mut Client, device: &mut Device, group: &str) {
+/// Joins `group` by external commit, with the tree from the tree endpoint.
+async fn join_channel(server: &TestServer, client: &mut Client, device: &mut Device, group: &str) {
     let info = client.ok("mls.group_info", json!({"group":group})).await;
     let epoch = info["epoch"].as_u64().unwrap();
-    let joined = device.join_external(&B64.decode(info["group_info"].as_str().unwrap()).unwrap());
+    let tree = reqwest::Client::new()
+        .get(format!("{}/api/mls/{group}/tree", server.http()))
+        .bearer_auth(&client.welcome.file_access)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(tree.headers()["x-gwar-epoch"], epoch.to_string().as_str());
+    let tree = tree.bytes().await.unwrap();
+    let joined = device.join_external(&B64.decode(info["group_info"].as_str().unwrap()).unwrap(), Some(&tree));
     client.ok("mls.commit", update_request(group, epoch, &joined)).await;
 }
 
@@ -1522,7 +1541,7 @@ async fn channel_groups_follow_the_channel_and_every_member_reads_its_sealed_cha
     let listed = c.ok("mls.groups", json!({})).await;
     assert_eq!(listed["groups"].as_array().unwrap().len(), 2);
     alice = Device::new(1, 11);
-    join_channel(&mut a, &mut alice, &group).await;
+    join_channel(&server, &mut a, &mut alice, &group).await;
 
     // The conversation's incarnations, under its read rule.
     let history = c.ok("mls.group_history", json!({"conversation":conversation,"limit":1})).await;
@@ -1600,7 +1619,7 @@ async fn channel_history_requests_end_only_through_a_chunk_naming_their_assignme
     let mut b = connect_device(&server, &bob).await;
     let secret = channel_id(&a.create_channel(json!({"name":"secret","encrypted":true})).await);
     let group = create_channel_group(&mut a, &mut alice, secret, true, 1).await.unwrap();
-    join_channel(&mut b, &mut bob, &group).await;
+    join_channel(&server, &mut b, &mut bob, &group).await;
     a.next_event("mls.commit").await;
     let public = hpke(&mut b, &bob, 4).await;
     let recipient = public_key(&bob.signer.0);
@@ -1642,7 +1661,7 @@ async fn a_device_rejoining_a_channel_group_ends_its_history_request_and_assignm
     let mut b = connect_device(&server, &bob).await;
     let secret = channel_id(&a.create_channel(json!({"name":"secret","encrypted":true})).await);
     let group = create_channel_group(&mut a, &mut alice, secret, true, 1).await.unwrap();
-    join_channel(&mut b, &mut bob, &group).await;
+    join_channel(&server, &mut b, &mut bob, &group).await;
     a.next_event("mls.commit").await;
     let public = hpke(&mut b, &bob, 4).await;
     let recipient = public_key(&bob.signer.0);
@@ -1651,7 +1670,7 @@ async fn a_device_rejoining_a_channel_group_ends_its_history_request_and_assignm
 
     // The same device joins again by external commit, which removes its old leaf:
     // the request was for that leaf, so it ends with its assignment and is not routed again.
-    join_channel(&mut b, &mut bob, &group).await;
+    join_channel(&server, &mut b, &mut bob, &group).await;
     a.next_event("mls.commit").await;
     assert_eq!(a.ok("mls.history.wanted", json!({})).await["wanted"], json!([]));
     let bytes = chunk(&alice, &a, &group, &bob, &public);
