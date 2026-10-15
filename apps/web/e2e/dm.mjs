@@ -107,6 +107,34 @@ try {
   await b.waitForFunction(peer => window.dm.rows(peer).some(i => i.sealed?.deleted && i.authentic), auid);
   assert.equal(await b.getByText("edited encrypted hello", { exact: false }).count(), 0);
   console.log("PASS encrypted edit and authenticated own deletion");
+  // A picture in the encrypted conversation: the server stores and serves only ciphertext.
+  const dot = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==", "base64");
+  await a.locator('input[type="file"]').setInputFiles({ name: "dot.png", mimeType: "image/png", buffer: dot });
+  // Uploaded: the pending file shows its size instead of its progress.
+  await a.getByText(`${dot.length} B`, { exact: true }).waitFor({ timeout: 45000 });
+  await send(a, "a picture");
+  // Without Connect here, revocation status is unknown, so loading waits for a click; it still decrypts and checks.
+  await b.getByRole("button", { name: "Load unverified attachment", exact: true }).click({ timeout: 45000 });
+  const picture = b.getByRole("button", { name: "Open dot.png", exact: true }).locator("img");
+  await picture.waitFor({ timeout: 45000 });
+  assert.match(await picture.getAttribute("src"), /^blob:/);
+  assert.equal(await picture.evaluate(img => img.complete && img.naturalWidth), 1);
+  const [attached] = await b.evaluate(peer => window.dm.rows(peer).find(i => i.msg?.text === "a picture").msg.attachments, auid);
+  assert.equal(attached.url, `/files/${attached.id}/file`);
+  assert.equal(attached.sealed.size, dot.length + 28);
+  const stored = await fetch(`http://127.0.0.1:${serverPort}${attached.url}`);
+  assert.equal(stored.status, 200);
+  const ciphertext = Buffer.from(await stored.arrayBuffer());
+  assert.equal(ciphertext.length, dot.length + 28);
+  assert.ok(!ciphertext.includes(dot.subarray(0, 16)));
+  assert.notEqual(stored.headers.get("content-type"), "image/png");
+  console.log("PASS an encrypted attachment opened on the other device");
+  const pictureRow = a.locator(`[data-message="${await a.evaluate(peer => window.dm.rows(peer).find(i => i.msg?.text === "a picture").msg.id, buid)}"]`);
+  await pictureRow.hover();
+  await pictureRow.getByRole("button", { name: "Delete message", exact: true }).click({ modifiers: ["Shift"] });
+  await b.getByRole("button", { name: "Open dot.png", exact: true }).waitFor({ state: "detached", timeout: 45000 });
+  assert.equal((await fetch(`http://127.0.0.1:${serverPort}${attached.url}`)).status, 404);
+  console.log("PASS deleting an encrypted message deletes its file");
   await send(a, "history for a second device");
   const a2 = await device(11, 3); await open(a2, buid); await sync(a, b, a2);
   await a2.getByText("history for a second device", { exact: true }).waitFor({ timeout: 45000 });
@@ -115,7 +143,7 @@ try {
   const b2 = await device(21, 4); await open(b2, auid);
   await b2.getByText("Can't open this message on this device", { exact: true }).first().waitFor({ timeout: 45000 });
   await b2.getByText("Earlier messages will appear when another member is online.", { exact: true }).waitFor();
-  await b2.getByText("Deleted", { exact: true }).waitFor();
+  await b2.getByText("Deleted", { exact: true }).first().waitFor();
   console.log("PASS missing keys and unopened deletion have muted UI states");
   await connect(a, 11, 1); await open(a, buid); await sync(a, b2);
   await b2.getByText("history for a second device", { exact: true }).waitFor({ timeout: 45000 });

@@ -9,6 +9,7 @@ import { signMessage, revisionHash, DELETION_TEXT } from "../net/message-signatu
 import { encodeBase64Url } from "../net/base64url";
 import type { Plaintext } from "../mls/types";
 import type { SealedMessage } from "../proto/SealedMessage";
+import type { Attachment } from "../proto/Attachment";
 import { welcome } from "../net/testing";
 import { reduce, initialState } from "./reducer";
 const b64 = (size: number, n: number) => encodeBase64Url(new Uint8Array(size).fill(n));
@@ -25,9 +26,9 @@ let status: "ready" | "securing";
 let epoch: number;
 let runtime: SealedRuntime;
 let dm: SealedConversations;
-async function row(text = "hello", original?: Plaintext) {
-  const signature = await signMessage(bob, { serverKey: server, target: conversation, sealed: { group, epoch } }, b, text, [], [], original?.signature);
-  opened = { text, mentions: [], attachments: [], signature };
+async function row(text = "hello", original?: Plaintext, attachments: Attachment[] = []) {
+  const signature = await signMessage(bob, { serverKey: server, target: conversation, sealed: { group, epoch } }, b, text, [], attachments, original?.signature);
+  opened = { text, mentions: [], attachments, signature };
   return { id: 1, conversation, group, epoch, author_uid: b, author_name: "Bob", message_id: signature.message_id,
     revision: signature.revision, ciphertext: "sealed", sent_at: signature.created_at, deleted: text === DELETION_TEXT } satisfies SealedMessage;
 }
@@ -107,6 +108,47 @@ describe("encrypted DM controller", () => {
     const forged = { ...first, id: 2, author_uid: a };
     await dm.receive(forged, true);
     expect(notify).not.toHaveBeenCalled();
+  });
+});
+describe("encrypted attachments", () => {
+  const file = (id: string, hint = 2): Attachment => ({ id, name: "a.png", mime: "image/png", size: 5, sha256: b64(32, 1), url: `/files/${id}/file`, width: hint, height: hint,
+    sealed: { key: b64(32, 2), sha256: b64(32, 3), size: 33 } });
+  it("ties the files to a new message only, and keeps them signed on edits but not on the deletion", async () => {
+    request.mockImplementation(async () => ({ ...await row(), author_uid: a }));
+    await dm.send(`dm:${b}`, "files", [], undefined, [file("f1"), file("f2")]);
+    expect(request.mock.calls[0]![1]).toMatchObject({ files: ["f1", "f2"] });
+    expect(drafts[0]).toMatchObject({ attachments: [file("f1"), file("f2")] });
+    const original = drafts[0]!.signature;
+    await dm.send(`dm:${b}`, "edited", [], original, [file("f1"), file("f2")]);
+    expect(request.mock.calls[1]![0]).toBe("chat.sealed.edit"); expect(request.mock.calls[1]![1]).not.toHaveProperty("files");
+    expect(drafts[1]).toMatchObject({ attachments: [file("f1"), file("f2")] });
+    await dm.send(`dm:${b}`, DELETION_TEXT, [], original, [file("f1")]);
+    expect(request.mock.calls[2]![0]).toBe("chat.delete_own"); expect(drafts[2]).toMatchObject({ attachments: [] });
+    await expect(dm.send(`dm:${b}`, "plain", [], undefined, [{ ...file("f3"), sealed: undefined }])).rejects.toThrow("Unencrypted");
+    expect(request).toHaveBeenCalledTimes(3);
+  });
+  it("ignores an edit that swaps the files, but takes new size hints and the deletion", async () => {
+    const thread = (id: number) => useSession.getState().threads[`dm:${b}`]?.items.find(i => i.key === `e${id}`);
+    const sent = async (id: number) => { await dm.receive({ ...await row("files", undefined, [file("f1")]), id }, false); return opened!; };
+    let id = 1;
+    for (const swapped of [[], [file("f2")], [file("f1"), file("f2")], [{ ...file("f1"), name: "b.png" }], [{ ...file("f1"), sealed: { ...file("f1").sealed!, key: b64(32, 4) } }]]) {
+      const original = await sent(++id);
+      await dm.receive({ ...await row("swapped", original, swapped), id }, true);
+      expect(thread(id)).toMatchObject({ msg: { text: "files" }, authentic: true });
+    }
+    // Not after a reconnect either, nor under another row id: the checkpoint remembers the files.
+    // (An id alone is not signed: the files must differ in what is.)
+    const original = await sent(++id), swapped = await row("swapped", original, [{ ...file("f2"), sha256: b64(32, 5) }]), plain = opened;
+    await dm.receive({ ...swapped, id }, true);
+    useSession.setState({ ...initialState, me: { uid: a, session: 1 }, focused: false, kind: "vc" });
+    dm = new SealedConversations(runtime, { serverKey: server, request } as unknown as Link, alice, a, () => active, notify, () => {});
+    opened = plain;
+    await dm.receive({ ...swapped, id: 99 }, true);
+    expect(useSession.getState().threads[`dm:${b}`]?.items.find(i => i.key === "e99")).toBeUndefined();
+    await dm.receive({ ...await row("edited", await sent(++id), [file("f1", 3)]), id }, true);
+    expect(thread(id)).toMatchObject({ msg: { text: "edited", attachments: [file("f1", 3)] } });
+    await dm.receive({ ...await row(DELETION_TEXT, opened), id }, true);
+    expect(thread(id)).toMatchObject({ msg: { text: DELETION_TEXT } });
   });
 });
 describe("encrypted conversation state", () => {

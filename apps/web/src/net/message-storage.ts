@@ -9,7 +9,8 @@ export const MAX_CHECKPOINTS = 10_000;
 export const MAX_REVOCATIONS = 20_000;
 export const REVOCATION_FRESH_MS = 5 * 60_000;
 export interface Revocation { seq: number; account_key: string; device_key: string; revoked_at: number; signature: string }
-interface Checkpoint { revision: number; hash: string; created: number; conversation: string; at: number; proven?: boolean; deleted?: boolean }
+/** `files` fingerprints the signed attachments the message was first seen with; only its deletion may list others. */
+interface Checkpoint { revision: number; hash: string; created: number; conversation: string; at: number; proven?: boolean; deleted?: boolean; files?: string }
 interface Feed { cursor: number; checked: number; available?: boolean }
 export interface RevocationState { revokedAt?: number; fresh: boolean }
 const pair = (account: string, device: string) => `${account}:${device}`;
@@ -60,6 +61,7 @@ export class MessageStorage {
         if (old.deleted && next.revision > old.revision) return { continuity: "fork", duplicate: false };
         if (next.revision < old.revision) return { continuity: "rollback", duplicate: false };
         if (next.created !== old.created || next.conversation !== old.conversation) return { continuity: "fork", duplicate: false };
+        if (!next.deleted && old.files !== undefined && next.files !== old.files) return { continuity: "fork", duplicate: false };
         if (next.revision === old.revision) return { continuity: next.hash === old.hash ? (old.proven ? "proven" : "unproven") : "fork", duplicate: next.hash === old.hash };
         if (next.revision === old.revision + 1 && predecessor !== old.hash) return { continuity: "fork", duplicate: false };
       }

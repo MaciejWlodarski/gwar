@@ -13,6 +13,7 @@ import { checkUpload, formatBytes } from "../lib/files";
 import { splitMentions } from "../lib/mentions";
 import { tokenizeText } from "../lib/text";
 import { MAX_MESSAGE_LENGTH } from "../net/protocol";
+import { SEALED_FILE_OVERHEAD } from "../net/sealed-file";
 import type { ChatMessage } from "../proto/ChatMessage";
 import { controller, UploadError } from "../state/controller";
 import { myChannelId, storedKey } from "../state/reducer";
@@ -712,6 +713,15 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
   const t = useT();
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [pendingByThread, setPendingByThread] = useState<Record<string, PendingFile[]>>({});
+  // Every live preview URL, so leaving the composer (or a disconnect) releases them all.
+  const previews = useRef(new Set<string>());
+  const mounted = useRef(true);
+  const release = (url?: string) => { if (url && previews.current.delete(url)) URL.revokeObjectURL(url); };
+  useEffect(() => {
+    const live = previews.current;
+    mounted.current = true;
+    return () => { mounted.current = false; for (const url of live) URL.revokeObjectURL(url); live.clear(); };
+  }, []);
   // Each channel keeps its own draft and files: "channel" follows the viewed one.
   const draftKey = useSession(s => storedKey(s, threadKey) ?? threadKey);
   const text = drafts[draftKey] ?? "";
@@ -728,8 +738,8 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
   const locked = useSession((s) => threadKey === "channel" && s.viewChannel !== null && !!s.threads[`ch:${s.viewChannel}`]?.locked);
   const uploadsOn = useSession((s) => s.kind === "vc" && (s.server?.upload_limit ?? 0) > 0);
   const mayUpload = usePermission("file_upload");
-  // Files travel with plaintext channel messages only (encrypted attachments come later).
-  const canAttach = threadKey === "channel" && !encrypted && uploadsOn && mayUpload;
+  // Files travel with channel messages and encrypted conversations, where they are encrypted too.
+  const canAttach = (threadKey === "channel" || encrypted) && uploadsOn && mayUpload;
   const disabled = !online || !peerOnline || locked || securing;
   const over = text.length > MAX_MESSAGE_LENGTH;
   const uploading = pending.some((f) => f.status === "uploading");
@@ -759,7 +769,7 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
     (files: File[]) => {
       if (files.length === 0) return;
       if (!canAttach) {
-        useUi.getState().toast("error", t(threadKey === "channel" && encrypted ? "file.encryptedChannel" : uploadsOn && mayUpload ? "file.channelOnly" : "file.disabled"));
+        useUi.getState().toast("error", t(uploadsOn && mayUpload ? "file.channelOnly" : "file.disabled"));
         return;
       }
       const limit = useSession.getState().server?.upload_limit ?? 0;
@@ -767,7 +777,7 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
       if (files.length > room) useUi.getState().toast("error", t("file.tooMany", { max: MAX_FILES }));
       const key = draftKey;
       for (const file of files.slice(0, Math.max(0, room))) {
-        const check = checkUpload(file.size, limit);
+        const check = checkUpload(file.size, limit, encrypted ? SEALED_FILE_OVERHEAD : 0);
         if (!check.ok) {
           useUi.getState().toast("error", `${file.name}: ${uploadErrorText(new UploadError(check.reason), t)}`);
           continue;
@@ -775,9 +785,10 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
         const id = pendingId++;
         const abort = new AbortController();
         const preview = /^image\/(png|jpeg|gif|webp)$/.test(file.type) ? URL.createObjectURL(file) : undefined;
+        if (preview) previews.current.add(preview);
         setPendingByThread((all) => ({ ...all, [key]: [...(all[key] ?? []), { id, file, status: "uploading", progress: 0, preview, abort }] }));
         controller
-          .uploadFile(file, { signal: abort.signal, onProgress: (p) => patch(key, id, { progress: p }) })
+          .uploadFile(file, { sealed: encrypted, signal: abort.signal, onProgress: (p) => patch(key, id, { progress: p }) })
           .then((fileId) => patch(key, id, { status: "done", progress: 1, fileId }))
           .catch((e: unknown) => {
             if (e instanceof UploadError && e.kind === "aborted") return;
@@ -785,7 +796,7 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
           });
       }
     },
-    [canAttach, encrypted, mayUpload, uploadsOn, pendingByThread, draftKey, threadKey, patch, t],
+    [canAttach, encrypted, mayUpload, uploadsOn, pendingByThread, draftKey, patch, t],
   );
 
   // The chat area forwards dropped files here.
@@ -801,7 +812,7 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
       const list = all[draftKey] ?? [];
       const f = list.find((x) => x.id === id);
       f?.abort.abort();
-      if (f?.preview) URL.revokeObjectURL(f.preview);
+      release(f?.preview);
       return { ...all, [draftKey]: list.filter((x) => x.id !== id) };
     });
   };
@@ -815,15 +826,16 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
     // in the conversation with a Retry button (see MessageList).
     const key = draftKey;
     setDrafts((d) => ({ ...d, [key]: "" }));
-    setPendingByThread((all) => {
-      // Failed uploads stay for another try; the sent ones go (their previews are no longer needed).
-      for (const f of all[key] ?? []) if (f.status === "done" && f.preview) URL.revokeObjectURL(f.preview);
-      return { ...all, [key]: (all[key] ?? []).filter((f) => f.status !== "done") };
-    });
+    // Failed uploads stay for another try; the sent ones go (their previews are no longer needed).
+    setPendingByThread((all) => ({ ...all, [key]: (all[key] ?? []).filter((f) => f.status !== "done") }));
     mention.reset();
     ref.current?.focus();
     const sent = await controller.sendChat(threadKey, value, { mentions, attachments });
-    if (!sent && encrypted) setDrafts(d => ({ ...d, [key]: d[key] ? `${value}\n${d[key]}` : value }));
+    // A failed plaintext send waits in the outbox; a failed encrypted one comes back to the composer, files too.
+    if (!sent && encrypted && mounted.current) {
+      setDrafts(d => ({ ...d, [key]: d[key] ? `${value}\n${d[key]}` : value }));
+      setPendingByThread((all) => ({ ...all, [key]: [...ready, ...(all[key] ?? [])] }));
+    } else for (const f of ready) release(f.preview);
   };
 
   const editLast = () => {

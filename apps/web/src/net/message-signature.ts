@@ -148,6 +148,8 @@ export class MessageVerifier {
     try {
       const checkpoint = await this.storage.checkpoint(`${ctx.serverKey}:${s.author_uid}:${s.message_id}`, {
         revision: s.revision, hash: await revisionHash(s), created: s.created_at, conversation: s.conversation, at: Date.now(), deleted: snapshot.text === DELETION_TEXT,
+        // Edits keep a message's files: a revision signing other ones is a fork.
+        files: snapshot.text === DELETION_TEXT ? undefined : await messageBodyHash("", [], snapshot.attachments ?? []),
       }, s.previous_revision_hash);
       result.continuity = checkpoint.continuity;
       result.duplicate = checkpoint.duplicate;

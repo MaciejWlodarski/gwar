@@ -1,3 +1,4 @@
+import type { Attachment } from "../proto/Attachment";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Client } from "../proto/Client";
 import type { ChatMessage } from "../proto/ChatMessage";
@@ -541,11 +542,41 @@ describe("uploads", () => {
       expect(await controller.uploadFile(file)).toBe("file");
     } finally { request.mockRestore(); }
   });
+  it("encrypts a sealed upload and keeps what it decrypts to for the message", async () => {
+    connectFake(); stores.useSession.setState({ httpOrigin: "http://localhost:8799", server: { ...session().server!, upload_limit: 100 } });
+    const request = vi.spyOn(link, "request").mockResolvedValue({ file: "file", upload_url: "/api/files/file?token=x" } as never);
+    const { sha256 } = await import("../net/message-signature");
+    const { openFile } = await import("../net/sealed-file");
+    const plain = new TextEncoder().encode("hello");
+    let sent!: Uint8Array<ArrayBuffer>;
+    const reply = async (changed: object = {}) => ({ id: "file", name: "file", mime: "application/octet-stream", size: sent.length, url: "/files/file/file", sha256: await sha256(sent), ...changed });
+    const put = vi.spyOn(globalThis, "fetch");
+    try {
+      // The server is told neither the name nor the type, and must not claim them back.
+      for (const changed of [{ name: "notes.txt" }, { mime: "text/plain" }, { size: 5 }, {}]) {
+        put.mockImplementationOnce(async (_url, init) => { sent = init!.body as Uint8Array<ArrayBuffer>; return new Response(JSON.stringify(await reply(changed))); });
+        const upload = controller.uploadFile(new File([plain], "notes.txt", { type: "text/plain" }), { sealed: true });
+        if (Object.keys(changed).length) await expect(upload).rejects.toMatchObject({ kind: "network" });
+        else expect(await upload).toBe("file");
+      }
+      expect(request).toHaveBeenCalledWith("file.upload", { name: "file", size: 33, mime: "application/octet-stream", sha256: await sha256(sent), sealed: true });
+      expect(sent).toHaveLength(5 + 28);
+      const att = (controller as unknown as { uploaded: Map<string, { att: Attachment }> }).uploaded.get("file")!.att;
+      expect(att).toMatchObject({ id: "file", name: "notes.txt", mime: "text/plain", size: 5, url: "/files/file/file", sha256: await sha256(plain), sealed: { sha256: await sha256(sent), size: 33 } });
+      expect(new TextDecoder().decode(await openFile(sent, att.sealed!.key))).toBe("hello");
+      // It is never attached to a plaintext message.
+      request.mockClear();
+      expect(await controller.sendChat("channel", "hi", { attachments: ["file"] })).toBe(false);
+      expect(request).not.toHaveBeenCalledWith("chat.send", expect.anything());
+    } finally { put.mockRestore(); }
+  });
   it("refuses files over the server limit before asking the server", async () => {
     connectFake();
     stores.useSession.setState({ server: { ...session().server!, upload_limit: 100 } });
     await expect(controller.uploadFile({ name: "big.bin", size: 101, type: "" } as File)).rejects.toMatchObject({ kind: "too_large" });
     await expect(controller.uploadFile({ name: "e.bin", size: 0, type: "" } as File)).rejects.toMatchObject({ kind: "empty" });
+    await expect(controller.uploadFile({ name: "e.bin", size: 0, type: "" } as File, { sealed: true })).rejects.toMatchObject({ kind: "empty" });
+    await expect(controller.uploadFile({ name: "b.bin", size: 73, type: "" } as File, { sealed: true })).rejects.toMatchObject({ kind: "too_large" });
     expect(link.sent("file.upload")).toHaveLength(0);
   });
 
@@ -969,7 +1000,7 @@ describe("encrypted channels", () => {
     connectFake({ encrypted: [1] });
     const sealed = fakeSealed(); install(sealed);
     expect(await controller.sendChat("channel", "hi", { mentions: ["u2"] })).toBe(true);
-    expect(sealed.send).toHaveBeenCalledWith("ch:1", "hi", ["u2"]);
+    expect(sealed.send).toHaveBeenCalledWith("ch:1", "hi", ["u2"], undefined, []);
     expect(link.sent("chat.send")).toEqual([]);
     const row = sealedRow(5);
     session().dispatch({ type: "sealed", thread: "ch:1", live: false,
@@ -977,6 +1008,21 @@ describe("encrypted channels", () => {
     expect(await controller.deleteMessage(5)).toBe(true);
     expect(link.sent("chat.sealed.remove")).toEqual([{ op: "chat.sealed.remove", d: { conversation: "channel:1", id: 5 } }]);
     expect(link.sent("chat.delete")).toEqual([]);
+  });
+
+  it("sends only this connection's encrypted uploads with a sealed message, and keeps them on edits", async () => {
+    connectFake({ encrypted: [1] });
+    const sealed = fakeSealed(); install(sealed);
+    const uploaded = (controller as unknown as { uploaded: Map<string, { conn: unknown; att: Attachment }> }).uploaded;
+    const att = { id: "f1", name: "a.png", mime: "image/png", size: 5, url: "/files/f1/file", sha256: "s", sealed: { key: "k", sha256: "c", size: 33 } };
+    uploaded.set("plain", { conn: link, att: { ...att, id: "plain", sealed: undefined } });
+    uploaded.set("other", { conn: {}, att: { ...att, id: "other" } });
+    for (const id of ["plain", "other", "missing"]) expect(await controller.sendChat("channel", "hi", { attachments: [id] })).toBe(false);
+    expect(sealed.send).not.toHaveBeenCalled();
+    uploaded.set("f1", { conn: link, att });
+    expect(await controller.sendChat("channel", "hi", { attachments: ["f1"] })).toBe(true);
+    expect(sealed.send).toHaveBeenCalledWith("ch:1", "hi", [], undefined, [att]);
+    expect(uploaded.has("f1")).toBe(false);
   });
 
   it("removes the sealed row it started with when the view moves meanwhile", async () => {

@@ -7,15 +7,16 @@ import { uidForPublicKey } from "../net/identity";
 import { messageBodyHash, messageStatement } from "../net/message-signature";
 import { deviceStatement } from "../connect/crypto";
 import type { Plaintext } from "./types";
+import type { Attachment } from "../proto/Attachment";
 const enc = new TextEncoder();
-async function fixture(certified = false, text = "hello 👋", conversation?: string) {
+async function fixture(certified = false, text = "hello 👋", conversation?: string, attachments: Attachment[] = []) {
   const seed = new Uint8Array(32).fill(1), account = new Uint8Array(32).fill(2);
   const key = b64(ed25519.getPublicKey(seed)), accountKey = b64(ed25519.getPublicKey(account));
   const uid = await uidForPublicKey(certified ? accountKey : key);
   const other = await uidForPublicKey(b64(ed25519.getPublicKey(new Uint8Array(32).fill(3))));
   const context = { server_key: b64(new Uint8Array(32).fill(9)), conversation: conversation ?? `dm:${[uid, other].sort().join(":")}`, group_id: b64(new Uint8Array(32).fill(4)), epoch: "7", message_id: b64(new Uint8Array(16).fill(5)), revision: 0 };
   const certificate = certified ? { account_key: accountKey, device_key: key, issued_at: 1, expires_at: 10000, signature: b64(ed25519.sign(enc.encode(deviceStatement(accountKey, key, 1, 10000)), account)) } : null;
-  const p: Plaintext = { text, mentions: [other], attachments: [], signature: { ...context, author_uid: uid, key, certificate, certificate_hash: await certificateHash(certificate ?? undefined), created_at: 2, signed_at: 2, previous_revision_hash: "-", body_hash: await messageBodyHash(text, [other], []), signature: "" } };
+  const p: Plaintext = { text, mentions: [other], attachments, signature: { ...context, author_uid: uid, key, certificate, certificate_hash: await certificateHash(certificate ?? undefined), created_at: 2, signed_at: 2, previous_revision_hash: "-", body_hash: await messageBodyHash(text, [other], attachments), signature: "" } };
   p.signature.signature = b64(ed25519.sign(enc.encode(messageStatement(context.server_key, context.conversation, uid, p.signature, p.signature.body_hash)), seed));
   return { p, context };
 }
@@ -49,6 +50,19 @@ describe("MLS plaintext authentication", () => {
     }
     expect(await authenticatePlaintext(new Uint8Array([255]), context)).toBeNull();
     expect(await authenticatePlaintext(enc.encode("{invalid"), context)).toBeNull();
+  });
+  it("accepts signed encrypted attachments only in the shape their uploads have", async () => {
+    const file = (id: string): Attachment => ({ id, name: "a.png", mime: "image/png", size: 5, sha256: b64(new Uint8Array(32).fill(1)), url: `/files/${id}/file`,
+      width: 2, height: 3, sealed: { key: b64(new Uint8Array(32).fill(2)), sha256: b64(new Uint8Array(32).fill(3)), size: 33 } });
+    const ok = await fixture(false, "files", undefined, [file("f1"), { ...file("f2"), width: undefined, height: undefined }]);
+    expect(await authenticatePlaintext(bytes(ok.p), ok.context)).toEqual(JSON.parse(JSON.stringify(ok.p)));
+    const { sealed: _, ...plain } = file("f1");
+    for (const attachments of [[plain], [{ ...file("f1"), url: "/files/f1/a.png" }], [{ ...file("f1"), url: "/files/f2/file" }], [{ ...file("f1"), size: 6 }],
+      [file("f1"), file("f1")], Array.from({ length: 11 }, (_, i) => file(`f${i}`)), [{ ...file("f1"), height: undefined }], [{ ...file("f1"), width: 0, height: 0 }],
+      [{ ...file("f1"), sha256: "" }], [{ ...file("f1"), extra: 1 }], [{ ...file("f1"), sealed: { ...file("f1").sealed!, extra: 1 } }], [{ ...file("f1"), id: "a/b", url: "/files/a/b/file" }]]) {
+      const bad = await fixture(false, "files", undefined, attachments as Attachment[]);
+      expect(await authenticatePlaintext(bytes(bad.p), bad.context)).toBeNull();
+    }
   });
   it("rejects duplicate decoded keys at the root, signature and certificate", async () => {
     const { p, context } = await fixture(true);

@@ -5,7 +5,8 @@ import type { Roster } from "../mls/types";
 import { messageStorage, refreshRevocations } from "../net/message-storage";
 import { conversationThread, sealedThread, threadConversation } from "../lib/chat";
 import { messageTarget } from "../lib/chat";
-import { uploadAttachment, localAttachmentMetadata } from "../net/attachment";
+import { uploadAttachment, localAttachmentMetadata, imageHints } from "../net/attachment";
+import { sealFile, SEALED_FILE_OVERHEAD, SEALED_MIME, SEALED_NAME } from "../net/sealed-file";
 import { serverPins, type ServerIdentityChanged } from "../net/server-pins";
 import { channels as channelLifecycle, withChannelLifecycle } from "../net/channel-lifecycle";
 import { signMessage, sha256, MessageVerifier, fullyVerified, DELETION_TEXT, invalidVerification, sameMessageIdentity, notificationAllowed } from "../net/message-signature";
@@ -1069,8 +1070,15 @@ class Controller {
     const stored = storedKey(state, key);
     if (sealedThread(stored, state.kind, state.channels)) {
       try {
-        if (!this.sealed || options.attachments?.length) throw new Error(tNow("chat.securing"));
-        await this.sealed.send(stored as SealedKey, text, options.mentions ?? []);
+        if (!this.sealed) throw new Error(tNow("chat.securing"));
+        const conn = this.conn;
+        const attachments = (options.attachments ?? []).map(id => {
+          const upload = this.uploaded.get(id);
+          if (!upload || upload.conn !== conn || !upload.att.sealed) throw new Error("unknown upload");
+          return upload.att;
+        });
+        await this.sealed.send(stored as SealedKey, text, options.mentions ?? [], undefined, attachments);
+        for (const id of options.attachments ?? []) this.uploaded.delete(id);
         return true;
       } catch (error) { useUi.getState().toast("error", describeRequestError(error)); return false; }
     }
@@ -1098,7 +1106,7 @@ class Controller {
       const conn = bound.conn;
       const attachments = (m.attachments ?? []).map((id) => {
         const upload = this.uploaded.get(id);
-        if (upload?.conn !== conn && conn instanceof Connection) throw new Error("unknown upload");
+        if ((upload?.conn !== conn && conn instanceof Connection) || upload?.att.sealed) throw new Error("unknown upload");
         return upload?.att as Attachment;
       });
       const signature = await this.signChat(m.target, m.text, m.mentions ?? [], attachments, undefined, conn);
@@ -1189,7 +1197,7 @@ class Controller {
       const thread = conversationThread(original.signature.conversation, await this.uidOn(conn));
       check();
       if (!thread || !this.sealed) throw new ConnectionLostError();
-      await this.sealed.send(thread, text, mentions, original.signature);
+      await this.sealed.send(thread, text, mentions, original.signature, original.attachments ?? []);
       return true;
     }
     const signature = await this.signChat(original.target, text, mentions, text === DELETION_TEXT ? [] : original.attachments ?? [], original.signature ?? undefined, conn);
@@ -1210,12 +1218,14 @@ class Controller {
 
   /**
    * Reserves an upload, sends the bytes with progress and resolves to the file
-   * id to attach to a message. Rejects with {@link UploadError}.
+   * id to attach to a message. Rejects with {@link UploadError}. A `sealed` file
+   * (for an encrypted conversation) is encrypted first: the server gets only its
+   * ciphertext, under a placeholder name and type.
    */
-  async uploadFile(file: File, opts: { onProgress?: (fraction: number) => void; signal?: AbortSignal } = {}): Promise<string> {
+  async uploadFile(file: File, opts: { onProgress?: (fraction: number) => void; signal?: AbortSignal; sealed?: boolean } = {}): Promise<string> {
     const s = useSession.getState();
     if (s.kind !== "vc") throw new UploadError("unsupported");
-    const check = checkUpload(file.size, s.server?.upload_limit ?? 0);
+    const check = checkUpload(file.size, s.server?.upload_limit ?? 0, opts.sealed ? SEALED_FILE_OVERHEAD : 0);
     if (!check.ok) throw new UploadError(check.reason);
     // The file goes only to the server it was chosen on.
     let bound: ReturnType<Controller["bind"]>;
@@ -1224,10 +1234,15 @@ class Controller {
     const bytes = new Uint8Array(await file.arrayBuffer());
     const hash = await sha256(bytes);
     const expected = localAttachmentMetadata(file.name, file.type || "application/octet-stream", bytes);
+    const sealed = opts.sealed ? await sealFile(bytes) : undefined;
+    const body = sealed?.ciphertext ?? bytes;
+    const bodyHash = sealed ? await sha256(sealed.ciphertext) : hash;
     let reserved: { file: string; upload_url: string };
     stillHere();
     try {
-      reserved = await bound.conn.request("file.upload", { name: file.name, size: file.size, mime: file.type || "application/octet-stream", sha256: hash });
+      reserved = await bound.conn.request("file.upload", sealed
+        ? { name: SEALED_NAME, size: body.length, mime: SEALED_MIME, sha256: bodyHash, sealed: true }
+        : { name: file.name, size: file.size, mime: file.type || "application/octet-stream", sha256: hash });
     } catch (e) {
       if (e instanceof RequestError && (e.code === "too_large" || e.code === "forbidden")) throw new UploadError(e.code === "too_large" ? "too_large" : "forbidden");
       if (e instanceof RequestError && e.code === "quota_exceeded") throw new UploadError("quota");
@@ -1235,9 +1250,14 @@ class Controller {
     }
     const url = absoluteUrl(s.httpOrigin, reserved.upload_url, "PUT");
     const remember = (att: Attachment): string => {
-      if (!attachmentSchema(att) || att.id !== reserved.file || att.sha256 !== hash || att.size !== file.size || att.name !== expected.name || att.mime !== expected.mime) throw new UploadError("network");
+      if (!attachmentSchema(att) || att.id !== reserved.file || att.sha256 !== bodyHash || att.size !== body.length || att.sealed
+        || att.name !== (sealed ? SEALED_NAME : expected.name) || att.mime !== (sealed ? SEALED_MIME : expected.mime)) throw new UploadError("network");
       stillHere();
-      this.uploaded.set(att.id, { conn: bound.conn, att: { ...att, sha256: hash } });
+      // The server only stored ciphertext; the message signs and carries what it decrypts to.
+      const signed: Attachment = sealed
+        ? { id: att.id, name: expected.name, mime: expected.mime, size: file.size, sha256: hash, url: att.url, ...imageHints(expected.mime, bytes), sealed: { key: sealed.key, sha256: bodyHash, size: body.length } }
+        : { ...att, sha256: hash };
+      this.uploaded.set(att.id, { conn: bound.conn, att: signed });
       // Uploads waiting to be sent are few; the oldest unsent ones are forgotten first.
       while (this.uploaded.size > MAX_PENDING_UPLOADS) this.uploaded.delete(this.uploaded.keys().next().value!);
       return att.id;
@@ -1249,7 +1269,7 @@ class Controller {
       let att: Attachment;
       try {
         if (!s.fileSession) throw new UploadError("network");
-        att = await uploadFromApp(reserved.upload_url, bytes, s.server?.upload_limit ?? 0, s.fileSession, stillHere);
+        att = await uploadFromApp(reserved.upload_url, body, s.server?.upload_limit ?? 0, s.fileSession, stillHere);
       } catch {
         throw new UploadError("network");
       }
@@ -1260,7 +1280,7 @@ class Controller {
     let att: Attachment;
     try {
       const signal = AbortSignal.any([AbortSignal.timeout(FILE_TIMEOUT_MS), ...(opts.signal ? [opts.signal] : [])]);
-      const response = await fetch(url, { method: "PUT", body: file, redirect: "error", credentials: "omit", signal });
+      const response = await fetch(url, { method: "PUT", body: sealed ? body : file, redirect: "error", credentials: "omit", signal });
       if (!response.ok) throw new UploadError(response.status === 413 ? "too_large" : response.status === 403 ? "forbidden" : "network");
       att = await uploadAttachment(response);
     } catch (e) {
