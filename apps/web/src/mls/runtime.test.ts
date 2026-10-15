@@ -681,6 +681,22 @@ describe("Channel groups", () => {
     expect(sent).toBeLessThanOrEqual(10);
     expect(f.operations.some(o => o.op === "join_external")).toBe(false);
   });
+  it.each([
+    ["a failed status", { status: 503, headers: { "x-gwar-epoch": "0" } }, "(503)"],
+    ["no epoch", { headers: {} }, "MLS tree epoch"],
+  ])("ends a refused tree response with %s without reading it", async (_, init, message) => {
+    asChannel();
+    const random = vi.spyOn(Math, "random").mockReturnValue(0);
+    const f = await fixture(clean(), true, { channels: [channel()] });
+    f.world.groups = [{ conversation, group, incarnation: 0, epoch: 0, pending: false }];
+    const signals: AbortSignal[] = [];
+    f.world.treeResponse = async signal => { signals.push(signal); return new Response(new ReadableStream({ pull: () => new Promise(() => {}) }), init); };
+    await f.runtime.sync(); random.mockRestore();
+    expect(String(f.errors.at(-1))).toContain(message);
+    expect(signals.length).toBeGreaterThan(0);
+    expect(signals.every(signal => signal.aborted)).toBe(true);
+    expect(f.operations.some(o => o.op === "join_external")).toBe(false);
+  });
   it("ends a stalled tree download when the connection drops", async () => {
     asChannel();
     const random = vi.spyOn(Math, "random").mockReturnValue(0);

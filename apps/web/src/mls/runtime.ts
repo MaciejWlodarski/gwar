@@ -586,7 +586,8 @@ export class MlsRuntime {
       this.assertCurrent(generation);
       return { epoch, tree };
     } finally {
-      clearTimeout(timeout); this.downloads.delete(download);
+      // Also ends a body left unread when the headers were refused.
+      clearTimeout(timeout); download.abort(); this.downloads.delete(download);
       this.options.signal?.removeEventListener("abort", stop);
     }
   }
