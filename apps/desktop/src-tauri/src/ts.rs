@@ -38,11 +38,42 @@ pub struct VoiceLink {
     pub audio_out: mpsc::Sender<Vec<u8>>,
 }
 
+#[derive(Default)]
+pub(crate) struct VoiceSink {
+    target: Mutex<Option<(u64, mpsc::Sender<TsAudio>)>>,
+}
+
+impl VoiceSink {
+    pub(crate) fn link(self: &Arc<Self>, run: u64, audio_out: mpsc::Sender<Vec<u8>>) -> (VoiceLink, VoiceSinkLease) {
+        let (tx, rx) = mpsc::channel(256);
+        *self.target.lock().unwrap_or_else(|e| e.into_inner()) = Some((run, tx));
+        (VoiceLink { audio_in: rx, audio_out }, VoiceSinkLease { sink: self.clone(), run })
+    }
+
+    fn sender(&self) -> Option<mpsc::Sender<TsAudio>> {
+        self.target.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(_, sender)| sender.clone())
+    }
+}
+
+pub(crate) struct VoiceSinkLease {
+    sink: Arc<VoiceSink>,
+    run: u64,
+}
+
+impl Drop for VoiceSinkLease {
+    fn drop(&mut self) {
+        let mut target = self.sink.target.lock().unwrap_or_else(|e| e.into_inner());
+        if target.as_ref().is_some_and(|(run, _)| *run == self.run) {
+            *target = None;
+        }
+    }
+}
+
 struct Active {
     session: u64,
     handle: TsHandle,
     /// Where the audio pump delivers frames; replaced on every voice (re)start.
-    sink: Arc<Mutex<Option<mpsc::Sender<TsAudio>>>>,
+    sink: Arc<VoiceSink>,
 }
 
 #[derive(Default)]
@@ -63,12 +94,10 @@ impl Ts {
         self.lock().is_some()
     }
 
-    pub fn voice_link(&self) -> Option<VoiceLink> {
+    pub(crate) fn voice_link(&self, run: u64) -> Option<(VoiceLink, VoiceSinkLease)> {
         let active = self.lock();
         let active = active.as_ref()?;
-        let (tx, rx) = mpsc::channel(256);
-        *active.sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
-        Some(VoiceLink { audio_in: rx, audio_out: active.handle.audio_out.clone() })
+        Some(active.sink.link(run, active.handle.audio_out.clone()))
     }
 
     /// Leaves the TeamSpeak server politely before the process exits.
@@ -127,7 +156,7 @@ pub async fn ts_connect(
     let teamspeak::TsConnected { handle, welcome, mut events, mut audio_in } = connected;
     let welcome = serde_json::to_value(&welcome).map_err(|e| e.to_string())?;
 
-    let sink: Arc<Mutex<Option<mpsc::Sender<TsAudio>>>> = Arc::default();
+    let sink: Arc<VoiceSink> = Arc::default();
     let generation = ts.generation.fetch_add(1, Ordering::SeqCst) + 1;
     *ts.lock() = Some(Active { session, handle, sink: sink.clone() });
 
@@ -161,13 +190,34 @@ pub async fn ts_connect(
             if pump_app.state::<Ts>().generation.load(Ordering::SeqCst) != generation {
                 return;
             }
-            let target = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let target = sink.sender();
             if let Some(target) = target {
                 let _ = target.try_send(frame);
             }
         }
     });
     Ok(welcome)
+}
+
+#[cfg(test)]
+mod voice_sink_tests {
+    use super::*;
+
+    #[test]
+    fn dropping_an_old_sink_lease_preserves_the_replacement() {
+        let sink = Arc::new(VoiceSink::default());
+        let (audio_out, _rx) = mpsc::channel(1);
+        let (_old, old_lease) = sink.link(1, audio_out.clone());
+        let (mut current, current_lease) = sink.link(2, audio_out);
+        drop(old_lease);
+        sink.sender()
+            .unwrap()
+            .try_send(TsAudio { from: 1, slot: 0, rtp_time: 0, generation: 0, opus: vec![1] })
+            .unwrap();
+        assert_eq!(current.audio_in.try_recv().unwrap().opus, vec![1]);
+        drop(current_lease);
+        assert!(sink.sender().is_none());
+    }
 }
 
 fn error_body(e: ClientError) -> ErrorBody {

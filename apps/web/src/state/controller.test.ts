@@ -209,6 +209,52 @@ describe("staying on the server without voice", () => {
     expect(link.sent("voice.offer")[0]?.d).toMatchObject({channel:2,ssrc:123,run:1,group:null,call:"AAAAAAAAAAAAAAAAAAAAAA",participation:"AQEBAQEBAQEBAQEBAQEBAQ"});
   });
 
+  it.each(["move", "retry", "stop"])("does not toast an obsolete start failure after a %s", async (action) => {
+    let reject!: (error: Error) => void;
+    engine.start.mockImplementationOnce(() => new Promise<void>((_resolve, no) => { reject = no; }));
+    connectFake({ channel: 1 });
+    await vi.advanceTimersByTimeAsync(10);
+    if (action === "move") link.emit({ ev: "client.updated", d: client(1, 2) });
+    else if (action === "retry") controller.retryVoice();
+    else await controller.leaveVoice();
+    await vi.advanceTimersByTimeAsync(10);
+    const starts = action === "stop" ? 1 : 2;
+    expect(engine.start).toHaveBeenCalledTimes(starts);
+    reject(new Error("obsolete negotiation"));
+    await vi.advanceTimersByTimeAsync(10);
+    expect(stores.useUi.getState().toasts.filter(t => t.kind === "error")).toEqual([]);
+    expect(engine.start).toHaveBeenCalledTimes(starts);
+  });
+
+  it("stops pending plaintext voice on a forced encrypted move without starting encrypted capture", async () => {
+    let finish!: () => void;
+    engine.start.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }));
+    connectFake({ channel: 1, encrypted: [2] });
+    await vi.advanceTimersByTimeAsync(10);
+    engine.stop.mockClear();
+    link.emit({ ev: "client.updated", d: client(1, 2) });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(engine.stop).toHaveBeenCalled();
+    expect(engine.start).toHaveBeenCalledTimes(1);
+    finish();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(stores.useVoice.getState().state).toBe("idle");
+  });
+
+  it("does not clear replacement voice state when an older stop finishes", async () => {
+    connectFake({ channel: 1 });
+    await vi.advanceTimersByTimeAsync(10);
+    let finish!: () => void;
+    engine.stop.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }));
+    link.emit({ ev: "client.updated", d: client(1, 2) });
+    controller.retryVoice();
+    stores.useVoice.getState().set({ state: "connected" });
+    finish();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(stores.useVoice.getState().state).toBe("connected");
+    expect(engine.start).toHaveBeenCalledTimes(2);
+  });
+
   it("refuses encrypted voice before joining or opening the microphone", async () => {
     connectFake({ encrypted: [2] });
     await controller.joinChannel(2);

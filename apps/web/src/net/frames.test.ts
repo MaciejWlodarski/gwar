@@ -129,6 +129,22 @@ describe("voice wire bindings", () => {
     expect(responseFor("voice.offer", { sdp: "answer" })).toBe(false);
     expect(responseFor("voice.offer", { ...answer, call: `${call}=` })).toBe(false);
   });
+  it("requires nullable voice fields in server states and roster entries", () => {
+    const voice = { channel: 1, call, participation: call, encrypted: false, channel_group: null, group: null, epoch: null };
+    expect(responseFor("voice.state", { voice })).toBe(true);
+    for (const field of ["channel_group", "group"]) {
+      const missing: Record<string, unknown> = { ...voice };
+      delete missing[field];
+      expect(responseFor("voice.state", { voice: missing })).toBe(false);
+      expect(parseFrame(JSON.stringify({ ev: "voice.state", d: { voice: missing } }))).toBeNull();
+    }
+    const client = { id: 1, uid: "user", nickname: "User", channel: null, groups: [], platform: "web", muted: false, deafened: false, away: null, talking: false, voice: false, voice_binding: null };
+    expect(parseFrame(JSON.stringify({ ev: "client.updated", d: client }))?.kind).toBe("event");
+    const missing: Record<string, unknown> = { ...client };
+    delete missing.voice_binding;
+    expect(parseFrame(JSON.stringify({ ev: "client.updated", d: missing }))).toBeNull();
+  });
+
   it("validates voice state modes and nullable group/epoch as a pair", () => {
     const voice = { channel: 1, call, participation: call, encrypted: true, channel_group: group, group: null, epoch: null };
     expect(responseFor("voice.state", { voice })).toBe(true);

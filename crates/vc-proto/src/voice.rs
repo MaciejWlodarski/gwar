@@ -60,7 +60,9 @@ wire! {
         pub call: String,
         pub participation: String,
         pub encrypted: bool,
+        #[serde(deserialize_with = "required_option")]
         pub channel_group: Option<String>,
+        #[serde(deserialize_with = "required_option")]
         pub group: Option<String>,
         #[serde(deserialize_with = "optional_safe_u64")]
         #[cfg_attr(feature = "ts", ts(type = "number | null"))]
@@ -74,6 +76,7 @@ wire! {
         #[serde(deserialize_with = "run")]
         #[cfg_attr(feature = "ts", ts(type = "number"))]
         pub run: u64,
+        #[serde(deserialize_with = "required_option")]
         pub group: Option<String>,
         pub ssrc: u32,
         pub sdp: String,
@@ -111,6 +114,39 @@ impl From<&VoiceTransportBinding> for VoiceBinding {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn required_nullable_voice_fields_reject_omission() {
+        let offer =
+            json!({"channel":1,"call":"call","participation":"entry","run":1,"group":null,"ssrc":1,"sdp":"offer"});
+        assert!(serde_json::from_value::<VoiceOffer>(offer.clone()).is_ok());
+        let mut populated_offer = offer.clone();
+        populated_offer["group"] = json!("group");
+        assert!(serde_json::from_value::<VoiceOffer>(populated_offer).is_ok());
+        let mut missing_offer = offer;
+        missing_offer.as_object_mut().unwrap().remove("group");
+        assert!(serde_json::from_value::<VoiceOffer>(missing_offer).is_err());
+
+        let state = json!({"channel":1,"call":"call","participation":"entry","encrypted":false,"channel_group":null,"group":null,"epoch":null});
+        assert!(serde_json::from_value::<VoiceState>(state.clone()).is_ok());
+        for field in ["channel_group", "group"] {
+            let mut populated = state.clone();
+            populated[field] = json!("group");
+            assert!(serde_json::from_value::<VoiceState>(populated).is_ok());
+            let mut missing = state.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<VoiceState>(missing).is_err(), "missing {field}");
+        }
+
+        let client = json!({"id":1,"uid":"user","nickname":"User","channel":null,"groups":[],"platform":"web","muted":false,"deafened":false,"away":null,"talking":false,"voice":false,"voice_binding":null});
+        assert!(serde_json::from_value::<Client>(client.clone()).is_ok());
+        let mut populated = client.clone();
+        populated["voice_binding"] = json!({"call":"call","participation":"entry","run":null});
+        assert!(serde_json::from_value::<Client>(populated).is_ok());
+        let mut missing = client;
+        missing.as_object_mut().unwrap().remove("voice_binding");
+        assert!(serde_json::from_value::<Client>(missing).is_err());
+    }
+
     #[test]
     fn rejects_unsafe_fractional_negative_and_forged_ack_fields() {
         let valid = json!({"id":1,"op":"voice.epoch.ack","d":{"call":"AAAAAAAAAAAAAAAAAAAAAA","participation":"AAAAAAAAAAAAAAAAAAAAAA","run":1,"group":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","epoch":0}});

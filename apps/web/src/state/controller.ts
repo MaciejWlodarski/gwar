@@ -173,6 +173,7 @@ class Controller {
   private identityLoading: Promise<Identity> | null = null;
   private voiceRetry: ReturnType<typeof setTimeout> | null = null;
   private voiceRetries = 0;
+  private voiceRun = 0;
   private initialised = false;
   private loadingOlder = false;
   /** Password channels I have entered during this session: their chat is readable. */
@@ -281,7 +282,12 @@ class Controller {
         this.voiceRetries = 0;
         void this.startVoice();
       } else if (before !== now) {
-        void this.stopVoice().then(() => { if (now !== null && myChannelId(useSession.getState()) === now) return this.startVoice(); });
+        const conn = this.conn;
+        const stopped = this.stopVoice();
+        const run = this.voiceRun;
+        void stopped.then(() => {
+          if (run === this.voiceRun && this.conn === conn && now !== null && myChannelId(useSession.getState()) === now) return this.startVoice();
+        });
       }
     });
 
@@ -599,7 +605,7 @@ class Controller {
           // A new session starts outside voice: remember where to go back to.
           this.rejoin ??= useSession.getState().kind === "vc" ? myChannelId(useSession.getState()) : null;
           session.dispatch({ type: "phase", phase: "reconnecting" });
-          void this.engine.stop();
+          void this.stopVoice();
           break;
         case "closed":
           if (this.conn !== conn) break;
@@ -658,6 +664,7 @@ class Controller {
     this.entered.clear();
     this.historyRequested.clear();
     this.sentRead.clear();
+    this.voiceRun++;
     await this.engine.stop();
     if (this.connections !== generation) return;
     this.conn = null;
@@ -686,11 +693,12 @@ class Controller {
     const { iceServers } = state;
     const own = state.me === null ? null : state.clients[state.me.session];
     if (!own || (state.kind === "vc" && !own.voice_binding)) return;
+    const run = ++this.voiceRun;
     const participation = own.voice_binding;
     const binding = { server_key: conn.serverKey ?? null, session: own.id, channel, call: state.kind === "vc" ? participation!.call : null, participation: state.kind === "vc" ? participation!.participation : null, group: null };
     const current = () => {
       const s = useSession.getState(); const b = s.me === null ? null : s.clients[s.me.session]?.voice_binding;
-      return this.conn === conn && myChannelId(s) === channel && (state.kind !== "vc" || (b?.call === participation?.call && b?.participation === participation?.participation));
+      return this.voiceRun === run && this.conn === conn && s.phase === "online" && myChannelId(s) === channel && (state.kind !== "vc" || (b?.call === participation?.call && b?.participation === participation?.participation));
     };
     this.engine.setMuted(useVoice.getState().muted);
     this.engine.setDeafened(useVoice.getState().deafened);
@@ -709,7 +717,7 @@ class Controller {
         },
       });
     } catch (e) {
-      if (this.conn !== conn) return;
+      if (!current()) return;
       const msg = e instanceof VoiceError ? describeVoiceError(e) : describeRequestError(e);
       useUi.getState().toast("error", msg);
     }
@@ -717,10 +725,12 @@ class Controller {
 
   /** Stops audio and releases the microphone; I stay on the server. */
   private async stopVoice(): Promise<void> {
+    const run = ++this.voiceRun;
     if (this.voiceRetry) clearTimeout(this.voiceRetry);
     this.voiceRetry = null;
     this.voiceRetries = 0;
     await this.engine.stop();
+    if (run !== this.voiceRun) return;
     useVoice.getState().set({ state: "idle", level: 0, pttActive: false, micError: null });
   }
 

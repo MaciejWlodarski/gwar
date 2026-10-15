@@ -34,7 +34,7 @@ use vc_proto::AUDIO_SLOTS;
 
 use crate::{
     fake_audio::{self, FakeIo, Heard, NullIo},
-    ts::Ts,
+    ts::{Ts, VoiceLink, VoiceSinkLease},
 };
 
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(20);
@@ -71,11 +71,13 @@ struct Inner {
     prefs: Prefs,
     handle: Option<VoiceHandle>,
     pending_answer: Option<(u64, oneshot::Sender<Result<String, String>>)>,
+    cancelled_through: u64,
+    ts_sink: Option<VoiceSinkLease>,
 }
 
 pub struct Voice {
     inner: Mutex<Inner>,
-    /// Id of the most recent `voice_start`; older runs abandon themselves.
+    /// Id of the active `voice_start`; zero after retirement.
     run: AtomicU64,
     mic_test: Mutex<Option<Arc<AtomicBool>>>,
     /// What the fake speaker heard (only with `VC_FAKE_AUDIO`).
@@ -98,6 +100,8 @@ impl Default for Voice {
                 },
                 handle: None,
                 pending_answer: None,
+                cancelled_through: 0,
+                ts_sink: None,
             }),
             run: AtomicU64::new(0),
             mic_test: Mutex::new(None),
@@ -258,22 +262,44 @@ async fn resolve(host: &str) -> Result<IpAddr, String> {
 // Concurrent IPC must never let an old stop clear a newer run.
 fn claim_run(voice: &Voice, run: u64) -> Result<(), String> {
     let mut inner = voice.lock();
-    if run <= voice.run.load(Ordering::SeqCst) {
+    if run <= voice.run.load(Ordering::SeqCst) || run <= inner.cancelled_through {
         return Err("superseded".into());
     }
     voice.run.store(run, Ordering::SeqCst);
     inner.handle = None;
     inner.pending_answer = None;
+    inner.ts_sink = None;
     Ok(())
 }
 fn retire_run(voice: &Voice, run: u64) {
     let mut inner = voice.lock();
-    if voice.run.load(Ordering::SeqCst) != run {
+    // IPC handlers can be scheduled out of order: remember cancellation even
+    // when the matching start has not claimed its run yet.
+    inner.cancelled_through = inner.cancelled_through.max(run);
+    if voice.run.load(Ordering::SeqCst) > run {
         return;
     }
-    voice.run.fetch_add(1, Ordering::SeqCst);
+    voice.run.store(0, Ordering::SeqCst);
     inner.handle = None;
     inner.pending_answer = None;
+    inner.ts_sink = None;
+}
+
+fn link_teamspeak(
+    voice: &Voice,
+    run: u64,
+    link: impl FnOnce() -> Option<(VoiceLink, VoiceSinkLease)>,
+) -> Result<Option<VoiceLink>, String> {
+    let mut inner = voice.lock();
+    if voice.run.load(Ordering::SeqCst) != run {
+        return Err("superseded".into());
+    }
+    // Claim, retirement and sink replacement share this lock. The lease clears
+    // only its own run's sink when a newer run claims or this run stops.
+    Ok(link().map(|(link, lease)| {
+        inner.ts_sink = Some(lease);
+        link
+    }))
 }
 
 /// Starts (or restarts) voice against `server_host`. Resolves when the SDP
@@ -324,7 +350,7 @@ pub async fn voice_start(
     };
     let io = make_io(&voice, input, output, issue_sink(&app));
 
-    let handle = if let Some(link) = app.state::<Ts>().voice_link() {
+    let handle = if let Some(link) = link_teamspeak(&voice, run, || app.state::<Ts>().voice_link(run))? {
         // TeamSpeak server: frames travel over the TS connection, no SDP exchange.
         tracing::info!("voice_start run={run} (TeamSpeak)");
         start_teamspeak(io, link.audio_in, link.audio_out).await.map_err(|e| format!("{e:#}"))?
@@ -612,6 +638,44 @@ pub fn open_mic_privacy_settings() -> Result<(), String> {
 #[cfg(test)]
 mod run_tests {
     use super::*;
+    #[test]
+    fn stop_before_start_cancels_delayed_runs_and_retires_older_media() {
+        let voice = Voice::default();
+        retire_run(&voice, 10);
+        assert!(claim_run(&voice, 10).is_err());
+        claim_run(&voice, 11).unwrap();
+        let (tx, mut rx) = oneshot::channel();
+        voice.lock().pending_answer = Some((11, tx));
+        retire_run(&voice, 12);
+        assert!(claim_run(&voice, 12).is_err());
+        assert_eq!(voice.run.load(Ordering::SeqCst), 0);
+        assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Closed)));
+        claim_run(&voice, 13).unwrap();
+        let (tx, mut rx) = oneshot::channel();
+        voice.lock().pending_answer = Some((13, tx));
+        retire_run(&voice, 12);
+        assert_eq!(voice.run.load(Ordering::SeqCst), 13);
+        assert!(matches!(rx.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn obsolete_start_cannot_replace_the_current_teamspeak_sink() {
+        let voice = Voice::default();
+        let sink = Arc::new(crate::ts::VoiceSink::default());
+        let (audio_out, _audio_rx) = tokio::sync::mpsc::channel(1);
+        claim_run(&voice, 10).unwrap();
+        // A pauses before linking; B claims and installs its sink first.
+        claim_run(&voice, 12).unwrap();
+        let mut current = link_teamspeak(&voice, 12, || Some(sink.link(12, audio_out.clone()))).unwrap().unwrap();
+        assert!(link_teamspeak(&voice, 10, || Some(sink.link(10, audio_out))).is_err());
+        assert!(matches!(current.audio_in.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
+        // Stopping A preserves B's receiver; stopping B releases its sink.
+        retire_run(&voice, 10);
+        assert!(matches!(current.audio_in.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
+        retire_run(&voice, 12);
+        assert!(matches!(current.audio_in.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)));
+    }
+
     #[test]
     fn old_stop_and_start_preserve_the_current_pending_answer() {
         let voice = Voice::default();

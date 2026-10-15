@@ -671,6 +671,7 @@ wire! {
         pub talking: bool,
         /// Whether the client currently has a connected audio transport.
         pub voice: bool,
+        #[serde(deserialize_with = "voice::required_option")]
         pub voice_binding: Option<VoiceBinding>,
     }
 
