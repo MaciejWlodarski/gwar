@@ -542,7 +542,7 @@ wire! {
         #[serde(default)]
         pub unread: Vec<Unread>,
         /// Direct messages with unread sealed messages, including offline peers, and
-        /// every readable encrypted channel with its read mark.
+        /// every readable encrypted channel and server chat with its read mark.
         pub conversations: Vec<ConversationUnread>,
         pub ice_servers: Vec<IceServer>,
         /// Sent as `Authorization: Bearer <token>` with file downloads; valid while this session lasts.
@@ -604,6 +604,14 @@ wire! {
         /// TeamSpeak compatibility is on (new channels default to plaintext).
         #[serde(default)]
         pub teamspeak: bool,
+        pub server_chat: ServerChat,
+    }
+
+    /// Permanent server-wide chat options, chosen at the first serving start.
+    #[derive(Copy, Eq, Default)]
+    pub struct ServerChat {
+        pub encrypted: bool,
+        pub history: bool,
     }
 
     /// Who may download a file (`GET /files/…`).

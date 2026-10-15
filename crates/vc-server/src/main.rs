@@ -74,6 +74,9 @@ struct Cli {
     /// slots) is for non-commercial use only; you are responsible for complying.
     #[arg(long, env = "VC_TEAMSPEAK", value_parser = clap::builder::BoolishValueParser::new())]
     teamspeak: bool,
+    /// Encrypt server-wide chat with history, only when setting up a new server.
+    #[arg(long, env = "VC_ENCRYPTED_SERVER_CHAT", value_parser = clap::builder::BoolishValueParser::new())]
+    encrypted_server_chat: bool,
     /// Confirms you accept the TeamSpeak server license (teamspeak.com; also the
     /// LICENSE file in <data-dir>/teamspeak/server-*/ once installed).
     #[arg(long, env = "VC_ACCEPT_TEAMSPEAK_LICENSE", value_parser = clap::builder::BoolishValueParser::new())]
@@ -313,6 +316,7 @@ async fn main() -> Result<()> {
         media_bind: media,
         media_advertise: SocketAddr::new(ip, media.port()),
         max_clients: cli.max_clients,
+        encrypted_server_chat: cli.encrypted_server_chat,
         server_password: cli.server_password,
         web_root: cli.web_root,
         ice_servers,

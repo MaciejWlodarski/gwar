@@ -620,11 +620,12 @@ Local identities have one device and no archive.
 
 ## TeamSpeak and plaintext channels
 
-- On a server with TeamSpeak compatibility, new channels default to
-  plaintext, server-wide chat (bridged to TeamSpeak server chat) is
-  plaintext when the server is set up with it (a server set up without
-  TeamSpeak keeps its encrypted server chat, unbridged), and the default
-  channel is always plaintext.
+- New channels default to plaintext, with or without TeamSpeak
+  compatibility. Server-wide chat is plaintext (bridged to TeamSpeak server
+  chat when compatibility is on) unless the operator chooses encrypted
+  server chat when setting up a new server (then it stays encrypted and
+  unbridged, also if TeamSpeak compatibility is turned on later). With
+  TeamSpeak compatibility the default channel is always plaintext.
 - An encrypted channel still appears on TeamSpeak, so the channel tree stays
   the same, but TeamSpeak users cannot join it (join power above any
   TeamSpeak group); its description says it is end-to-end encrypted and

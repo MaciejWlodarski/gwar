@@ -298,6 +298,7 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>) -> Option<View> 
         upload_limit: 0,
         file_access: Default::default(),
         teamspeak: true,
+        server_chat: Default::default(),
     };
     Some(View { server: Some(server), channels, clients })
 }

@@ -42,6 +42,7 @@ async fn server_advertising(advertise: Option<SocketAddr>) -> Running {
         media_bind: any,
         media_advertise: advertise.unwrap_or(any),
         max_clients: 16,
+        encrypted_server_chat: false,
         server_password: None,
         web_root: None,
         ice_servers: vec![],

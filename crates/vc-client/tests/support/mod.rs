@@ -62,6 +62,7 @@ pub async fn start() -> Option<Bridged> {
         media_bind: media,
         media_advertise: media,
         max_clients: 8,
+        encrypted_server_chat: false,
         server_password: None,
         web_root: None,
         ice_servers: vec![],

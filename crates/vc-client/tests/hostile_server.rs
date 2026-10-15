@@ -65,7 +65,7 @@ async fn start_with_reply(
         let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
         let challenge = json!({"ev":"challenge","d":{
             "protocol":4,"server_pk":server_pk(),"server_nonce":B64.encode([4;32]),"password_required":false,
-            "server":{"name":"test","welcome":"","version":"0","default_channel":1,"max_clients":8,"upload_limit":0}
+            "server":{"name":"test","welcome":"","version":"0","default_channel":1,"max_clients":8,"upload_limit":0,"server_chat":{"encrypted":false,"history":false}}
         }});
         ws.send(Message::Text(challenge.to_string().into())).await.unwrap();
         let Some(Ok(Message::Text(text))) = ws.next().await else { panic!("no hello") };
@@ -88,6 +88,7 @@ async fn start_with_reply(
                 upload_limit: 0,
                 file_access: Default::default(),
                 teamspeak: false,
+                server_chat: Default::default(),
             },
             permissions: vec![],
             groups: vec![],

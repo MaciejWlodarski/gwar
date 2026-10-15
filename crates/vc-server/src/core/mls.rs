@@ -141,6 +141,11 @@ pub(super) fn channel_id(conversation: &str) -> Option<ChannelId> {
     (format!("channel:{id}") == conversation).then_some(id)
 }
 
+/// Channel and server groups share server-routed history assignments.
+fn routed_history(conversation: &str) -> bool {
+    conversation == "server" || channel_id(conversation).is_some()
+}
+
 fn reply(value: MlsResponse) -> Reply {
     Ok(Response::Mls(value))
 }
@@ -151,11 +156,14 @@ impl Core {
             && !self.store.bans(now_ms()).map_err(storage_error)?.iter().any(|b| b.uid.as_deref() == Some(uid)))
     }
 
-    /// Direct messages: their two participants. Encrypted channels: every member.
+    /// Direct messages: their two participants. Encrypted channels and server chat: every member.
     pub(super) fn mls_can_read(&self, uid: &str, conversation: &str) -> Result<bool, ErrorBody> {
         let allowed = match dm_participants(conversation) {
             Some(participants) => participants.contains(&uid),
-            None => channel_id(conversation).is_some_and(|c| self.is_encrypted(c)),
+            None => {
+                (conversation == "server" && self.info.server_chat.encrypted)
+                    || channel_id(conversation).is_some_and(|c| self.is_encrypted(c))
+            }
         };
         Ok(allowed && self.mls_member(uid)?)
     }
@@ -451,8 +459,8 @@ impl Core {
             MlsRequest::HistoryAck { ids } => self.mls_ack(&device, &ids, true),
             MlsRequest::HistoryShare { group, recipient, chunk, assignment } => {
                 let row = self.mls_group_for(session, &group)?;
-                // In channel groups only a chunk answering an active assignment ends the request.
-                let routed = channel_id(&row.conversation).is_some();
+                // In channel and server groups only a chunk answering an active assignment ends the request.
+                let routed = routed_history(&row.conversation);
                 let answers = assignment.filter(|a| routed && self.history.is_active(a, &group, &recipient, &device));
                 let observer = self.mls_observer(&row)?;
                 let leaves = observer.leaves();
@@ -574,7 +582,7 @@ impl Core {
                 if !self.store.mls_request_history(&group, &device, now_ms()).map_err(storage_error)? {
                     return Err(err(ErrorCode::RateLimited, "request history at most once a minute"));
                 }
-                if channel_id(&row.conversation).is_some() {
+                if routed_history(&row.conversation) {
                     self.history_requested(&group, &device);
                     return Ok(Response::Empty {});
                 }
@@ -621,7 +629,13 @@ impl Core {
                 }
                 Kind::Channel
             }
-            _ => return Err(bad("only direct message and encrypted channel groups are supported")),
+            (None, None) if conversation == "server" && self.info.server_chat.encrypted => {
+                if d.private || !d.history {
+                    return Err(bad("server chat must be public with history"));
+                }
+                Kind::Server
+            }
+            _ => return Err(bad("only direct message, encrypted channel and encrypted server groups are supported")),
         };
         if d.kind != kind
             || d.conversation != conversation
@@ -720,7 +734,7 @@ impl Core {
         row.observer = observer.save();
         // A removed leaf ends its device's history routing, even when the same device
         // rejoins in this commit: its request was for the old leaf.
-        let routed = channel_id(&row.conversation).is_some();
+        let routed = routed_history(&row.conversation);
         let removed: Vec<String> =
             if routed { accepted.removed.iter().map(|l| l.device_key.clone()).collect() } else { Vec::new() };
         self.store

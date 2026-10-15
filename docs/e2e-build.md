@@ -767,7 +767,8 @@ writes encrypted channels (create options, sealed chat, gap lines, mention
 scan and accounting, moderator removal, "Who can read"); restarts are built,
 for direct messages and channels; encrypted attachments are built (4b), in
 channels and direct messages; large groups are built (4c, first part: channel
-GroupInfos without the tree, the tree endpoint, joining with it). Built as
+GroupInfos without the tree, the tree endpoint, joining with it); encrypted
+server chat is built on the server (4c, second part, server). Built as
 three pull requests, in this order: **4a**
 channels (options, groups, sealed channel messages, unread counts and
 mentions, TeamSpeak text isolation, restarts); **4b** encrypted attachments,
@@ -1105,8 +1106,12 @@ channels and server chat:
   `meta` and never changes once set. An existing database is set to
   `plaintext` by the migration. A new database gets it at the first start of
   the server itself (`vc-server` serving, not administrative commands such as
-  `admin-token`, which leave it unset): `plaintext` with TeamSpeak
-  compatibility, `encrypted` without. From then on the stored mode decides:
+  `admin-token`, which leave it unset): `plaintext`, with or without
+  TeamSpeak compatibility, unless that start passes
+  `--encrypted-server-chat` (`VC_ENCRYPTED_SERVER_CHAT`), which makes it
+  `encrypted`. The option is read only while the mode is unset; given
+  later on a server whose stored mode is `plaintext`, it logs a warning and
+  the mode stays (without the option, an encrypted server stays encrypted). From then on the stored mode decides:
   server chat is bridged only when it is plaintext, plaintext `chat.send` to
   the server is refused when it is encrypted, and sealed requests for
   `server` are refused when it is plaintext.

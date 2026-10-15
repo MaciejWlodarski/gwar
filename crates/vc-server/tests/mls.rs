@@ -1829,3 +1829,212 @@ async fn tree_endpoint_checks_session_conversation_and_exports_current_epoch() {
     assert_eq!(http.get(&url).bearer_auth(&d.welcome.file_access).send().await.unwrap().status(), 429);
     assert_eq!(http.get(&url).bearer_auth(&a.welcome.file_access).send().await.unwrap().status(), 200);
 }
+
+fn server_descriptor(device: &Device, server: &str, history: bool, nonce: u8) -> SignedDescriptor {
+    let mut d = channel_descriptor(device, 1, history, server, nonce).descriptor;
+    d.conversation = "server".into();
+    d.kind = Kind::Server;
+    SignedDescriptor::sign(d, device.credential.clone(), &device.signer.0)
+}
+
+async fn create_server_group(client: &mut Client, device: &mut Device, history: bool, nonce: u8) -> Value {
+    let d = server_descriptor(device, &client.server_key, history, nonce);
+    device.create(&d, &client.server_key);
+    json!({"conversation":"server", "group_info":b64(&device.group_info())})
+}
+
+#[tokio::test]
+async fn encrypted_server_chat_reaches_all_members_and_routes_history_to_later_devices() {
+    let server = TestServer::start_with(|c| c.encrypted_server_chat = true).await;
+    let mut alice = Device::new(1, 11);
+    let mut bob = Device::new(2, 21);
+    let mut a = connect_device(&server, &alice).await;
+    let mut b = connect_device(&server, &bob).await;
+    assert_eq!(serde_json::to_value(a.welcome.server.server_chat).unwrap(), json!({"encrypted":true,"history":true}));
+    assert_eq!(a.challenge["server"]["server_chat"], json!({"encrypted":true,"history":true}));
+    assert_eq!(a.welcome.conversations.iter().find(|c| c.conversation == "server").unwrap().count, 0);
+    assert_eq!(a.fails("chat.send", json!({"target":"server","text":"plaintext"})).await, "bad_request");
+    assert!(b.drain_events("chat.message").await.is_empty());
+
+    let invalid = create_server_group(&mut a, &mut alice, false, 1).await;
+    assert_eq!(a.fails("mls.group.create", invalid).await, "bad_request");
+    let request = create_server_group(&mut a, &mut alice, true, 2).await;
+    let group = a.ok("mls.group.create", request).await["group"].as_str().unwrap().to_owned();
+    assert_eq!(b.ok("mls.groups", json!({})).await["groups"][0]["conversation"], "server");
+    let (notes, mut bridge) = tokio::sync::mpsc::unbounded_channel();
+    server.running.core.bridge(vc_server::core::bridge::BridgeMsg::Attach(notes)).await;
+    let vc_server::core::bridge::BridgeNote::Snapshot { server: info, .. } = bridge.recv().await.unwrap() else {
+        panic!("snapshot")
+    };
+    assert!(info.server_chat.encrypted);
+    let first = a.ok("chat.sealed.send", sealed("server", &group, 0, 1)).await;
+    assert!(bridge.try_recv().is_err(), "sealed server messages never reach the bridge");
+    assert_eq!(b.next_event("chat.sealed").await, first);
+    join_channel(&server, &mut b, &mut bob, &group).await;
+    alice.process(&B64.decode(a.next_event("mls.commit").await["commit"].as_str().unwrap()).unwrap());
+    assert_eq!(b.ok("chat.sealed.history", json!({"conversation":"server"})).await["sealed"], json!([first]));
+
+    let mut carol = Device::new(3, 31);
+    let mut c = connect_device(&server, &carol).await;
+    let mark = c.welcome.conversations.iter().find(|c| c.conversation == "server").unwrap();
+    assert_eq!((mark.last_read, mark.count), (first["id"].as_u64().unwrap() as u32, 0));
+    join_channel(&server, &mut c, &mut carol, &group).await;
+    let commit = a.next_event("mls.commit").await;
+    alice.process(&B64.decode(commit["commit"].as_str().unwrap()).unwrap());
+    bob.process(&B64.decode(commit["commit"].as_str().unwrap()).unwrap());
+    assert_eq!(c.ok("chat.sealed.history", json!({"conversation":"server"})).await["sealed"], json!([first]));
+    let hpke = hpke(&mut c, &carol, 7).await;
+    let recipient = public_key(&carol.signer.0);
+    c.ok("mls.history.request", json!({"group":group})).await;
+    let wanted = a.next_event("mls.history.wanted").await;
+    assert_eq!(wanted["device"], recipient);
+    assert!(wanted["assignment"].is_string(), "server groups use channel history assignments");
+    assert_eq!(a.ok("mls.history.wanted", json!({})).await["wanted"], json!([wanted]));
+    let bytes = chunk(&alice, &a, &group, &carol, &hpke);
+    a.ok(
+        "mls.history.share",
+        json!({"group":group,"recipient":recipient,"chunk":b64(&bytes),"assignment":wanted["assignment"]}),
+    )
+    .await;
+    assert_eq!(c.next_event("mls.history").await["group"], group);
+    assert_eq!(c.ok("mls.history.fetch", json!({"group":group})).await["chunks"][0]["chunk"], b64(&bytes));
+    assert_eq!(a.ok("mls.history.wanted", json!({})).await["wanted"], json!([]));
+    assert_eq!(b.ok("mls.history.wanted", json!({})).await["wanted"], json!([]));
+    let second = b.ok("chat.sealed.send", sealed("server", &group, 2, 2)).await;
+    assert_eq!(c.next_event("chat.sealed").await, second);
+    c.ok("chat.read", json!({"conversation":"server","message":second["id"]})).await;
+    let c2 = connect_device(&server, &Device::new(3, 32)).await;
+    let mark = c2.welcome.conversations.iter().find(|c| c.conversation == "server").unwrap();
+    assert_eq!((mark.last_read, mark.count), (second["id"].as_u64().unwrap() as u32, 0));
+
+    // Only moderators with message_manage may remove another member's sealed text.
+    let remove = json!({"conversation":"server","id":first["id"]});
+    assert_eq!(c.fails("chat.sealed.remove", remove.clone()).await, "forbidden");
+    a.redeem(&server.admin_token).await;
+    a.ok("chat.sealed.remove", remove).await;
+    for client in [&mut b, &mut c] {
+        assert_eq!(
+            client.next_event("chat.sealed.removed").await,
+            json!({"conversation":"server","ids":[first["id"]]})
+        );
+    }
+    assert_eq!(c.ok("chat.sealed.history", json!({"conversation":"server"})).await["sealed"], json!([second]));
+    while let Ok(note) = bridge.try_recv() {
+        if let vc_server::core::bridge::BridgeNote::Event(event) = note {
+            assert!(!matches!(*event, vc_proto::Event::ChatSealed(_) | vc_proto::Event::ChatSealedRemoved { .. }));
+        }
+    }
+}
+
+#[tokio::test]
+async fn plaintext_server_chat_stays_live_only_and_refuses_sealed_conversations() {
+    let server = TestServer::start().await;
+    let mut alice = Device::new(1, 11);
+    let mut a = connect_device(&server, &alice).await;
+    let mut b = connect_device(&server, &Device::new(2, 21)).await;
+    assert_eq!(serde_json::to_value(a.welcome.server.server_chat).unwrap(), json!({"encrypted":false,"history":false}));
+    assert!(a.welcome.conversations.iter().all(|c| c.conversation != "server"));
+    let request = create_server_group(&mut a, &mut alice, true, 1).await;
+    assert_eq!(a.fails("mls.group.create", request).await, "bad_request");
+    assert_eq!(a.fails("mls.group_history", json!({"conversation":"server"})).await, "forbidden");
+    for op in ["chat.sealed.send", "chat.sealed.edit", "chat.delete_own"] {
+        let mut request = sealed("server", &b64(&[9; 32]), 0, 1);
+        request["revision"] = json!(1);
+        assert_eq!(a.fails(op, request).await, "bad_request");
+    }
+    for (op, request) in [
+        ("chat.sealed.history", json!({"conversation":"server"})),
+        ("chat.sealed.remove", json!({"conversation":"server","id":1})),
+        ("chat.read", json!({"conversation":"server","message":1})),
+    ] {
+        assert_eq!(a.fails(op, request).await, "bad_request");
+    }
+    let sent = a.ok("chat.send", json!({"target":"server","text":"hello everyone"})).await;
+    assert_eq!(b.next_event("chat.message").await, sent);
+    let mut later = connect_device(&server, &Device::new(3, 31)).await;
+    assert!(later.welcome.conversations.iter().all(|c| c.conversation != "server"));
+    assert!(later.drain_events("chat.message").await.is_empty());
+}
+
+#[tokio::test]
+async fn encrypted_server_chat_restarts_under_the_channel_rules() {
+    let server = TestServer::start_with(|c| c.encrypted_server_chat = true).await;
+    let mut alice = Device::new(1, 11);
+    let mut bob = Device::new(2, 21);
+    let mut a = connect_device(&server, &alice).await;
+    let mut b = connect_device(&server, &bob).await;
+    let request = create_server_group(&mut a, &mut alice, true, 1).await;
+    let old = a.ok("mls.group.create", request).await["group"].as_str().unwrap().to_owned();
+    let descriptor = server_descriptor(&alice, &a.server_key, true, 1);
+    join_channel(&server, &mut b, &mut bob, &old).await;
+    a.ok("chat.sealed.send", sealed("server", &old, 1, 1)).await;
+    let mut restarted = Device::new(1, 11);
+    let d = successor(&restarted, &descriptor, 1, &old, 2);
+    restarted.create(&d, &a.server_key);
+    let next = a
+        .ok("mls.group.create", json!({"conversation":"server","group_info":b64(&restarted.group_info())}))
+        .await["group"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(a.fails("chat.sealed.send", sealed("server", &old, 1, 2)).await, "stale");
+    a.ok("chat.sealed.send", sealed("server", &next, 0, 3)).await;
+    let groups = b.ok("mls.groups", json!({})).await;
+    assert_eq!(
+        (groups["groups"][0]["group"].clone(), groups["groups"][0]["incarnation"].clone()),
+        (json!(next), json!(1))
+    );
+    let chain = b.ok("mls.group_history", json!({"conversation":"server"})).await;
+    assert_eq!(chain["incarnations"].as_array().unwrap().len(), 2);
+    let history = b.ok("chat.sealed.history", json!({"conversation":"server"})).await;
+    assert_eq!(history["sealed"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn server_chat_history_routing_resumes_after_restart_and_a_rejoin_cancels_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("vc.sqlite3");
+    let server = TestServer::start_with(|c| {
+        c.database = Some(database.clone());
+        c.data_dir = Some(dir.path().into());
+        c.encrypted_server_chat = true;
+    })
+    .await;
+    let mut alice = Device::new(1, 11);
+    let mut bob = Device::new(2, 21);
+    let mut a = connect_device(&server, &alice).await;
+    let mut b = connect_device(&server, &bob).await;
+    let request = create_server_group(&mut a, &mut alice, true, 1).await;
+    let group = a.ok("mls.group.create", request).await["group"].as_str().unwrap().to_owned();
+    join_channel(&server, &mut b, &mut bob, &group).await;
+    let message = b.ok("chat.sealed.send", sealed("server", &group, 1, 1)).await;
+    b.ok("mls.history.request", json!({"group":group})).await;
+    let previous = a.next_event("mls.history.wanted").await;
+    a.close().await;
+    b.close().await;
+    drop(server);
+
+    let mut config = base_config();
+    config.database = Some(database.clone());
+    config.data_dir = Some(dir.path().into());
+    let server = TestServer { running: vc_server::start(config).await.unwrap(), admin_token: String::new() };
+    let mut a = connect_device(&server, &alice).await;
+    let mut b = connect_device(&server, &bob).await;
+    assert!(a.welcome.server.server_chat.encrypted);
+    let wanted = a.next_event("mls.history.wanted").await;
+    assert_eq!(wanted["group"], group);
+    assert!(wanted["assignment"].is_string());
+    assert_ne!(wanted["assignment"], previous["assignment"]);
+    assert_eq!(b.ok("chat.sealed.history", json!({"conversation":"server"})).await["sealed"], json!([message]));
+
+    // Replacing the recipient's leaf cancels its old request and assignments durably.
+    join_channel(&server, &mut b, &mut bob, &group).await;
+    assert_eq!(a.ok("mls.history.wanted", json!({})).await["wanted"], json!([]));
+    assert!(
+        vc_server::store::Store::open(&database)
+            .unwrap()
+            .mls_channel_requests(None, Some(&group), now())
+            .unwrap()
+            .is_empty()
+    );
+}

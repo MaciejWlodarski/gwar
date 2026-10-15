@@ -983,6 +983,9 @@ impl<'a> Bridge<'a> {
 
     /// A message written on our side, delivered to TeamSpeak.
     async fn relay_chat(&mut self, m: ChatMessage) {
+        if m.target == ChatTarget::Server && self.server.as_ref().is_some_and(|s| s.server_chat.encrypted) {
+            return;
+        }
         if let ChatTarget::Channel(channel) = m.target
             && self.is_encrypted(channel)
         {
@@ -1401,6 +1404,77 @@ mod tests {
         });
         let (query, _notes) = Query::connect(addr, "serveradmin", "p", 1).await.unwrap();
         (query, commands)
+    }
+
+    #[tokio::test]
+    async fn relay_server_chat_checks_its_permanent_mode_before_sending_to_query() {
+        use crate::{
+            core::expiry_tests::test_core_teamspeak,
+            media::{MediaPlane, Routing},
+            store::Store,
+        };
+
+        let store = Store::in_memory().unwrap();
+        store.init_server_chat(true).unwrap();
+        let core = test_core_teamspeak(store).unwrap();
+        let (notes, mut receiver) = mpsc::unbounded_channel();
+        core.bridge(BridgeMsg::Attach(notes)).await;
+        let BridgeNote::Snapshot { server, .. } = receiver.recv().await.unwrap() else { panic!("snapshot") };
+        let (webrtc, _media) = mpsc::channel(8);
+        let plane = MediaPlane {
+            routing: Arc::new(arc_swap::ArcSwap::from_pointee(Routing::default())),
+            sinks: Arc::default(),
+            uplinks: Arc::default(),
+            webrtc,
+        };
+        let (query, commands) = channel_query(false).await;
+        commands.lock().unwrap().clear();
+        let dir = tempfile::tempdir().unwrap();
+        let mut identities = Identities::load(&dir.path().join("identities.json")).unwrap();
+        let (puppet_events, _puppets) = mpsc::channel(8);
+        let (listener_events, _listeners) = mpsc::channel(8);
+        let mut bridge = Bridge {
+            query,
+            core: core.clone(),
+            shared: Arc::new(Shared::new(core, plane)),
+            voice: "127.0.0.1:1".parse().unwrap(),
+            public_url: None,
+            identities: &mut identities,
+            puppet_uids: HashSet::new(),
+            map: ChannelMap::load(&dir.path().join("channels.json")).unwrap(),
+            ts: HashMap::new(),
+            channels: BTreeMap::new(),
+            server: Some(server),
+            locals: HashMap::new(),
+            remotes: HashMap::new(),
+            puppet_clids: HashMap::new(),
+            puppet_events,
+            puppet_group: None,
+            listeners: ChannelListeners::new("127.0.0.1:1".parse().unwrap(), "p".into(), listener_events),
+            descriptions: HashMap::new(),
+            query_clid: None,
+            locked: HashSet::new(),
+        };
+        let message = ChatMessage {
+            id: 1,
+            target: ChatTarget::Server,
+            author: 1,
+            author_uid: "u".into(),
+            author_name: "Ann".into(),
+            text: "server text".into(),
+            sent_at: 0,
+            mentions: vec![],
+            attachments: vec![],
+            edited_at: None,
+            signature: None,
+        };
+        bridge.relay_chat(message.clone()).await;
+        assert!(commands.lock().unwrap().is_empty(), "encrypted server chat must never reach TeamSpeak");
+        bridge.server.as_mut().unwrap().server_chat = Default::default();
+        bridge.relay_chat(message).await;
+        let commands = commands.lock().unwrap();
+        assert_eq!(commands.len(), 1);
+        assert!(commands[0].starts_with("sendtextmessage targetmode=3 target=1 "), "{commands:?}");
     }
 
     #[tokio::test]
