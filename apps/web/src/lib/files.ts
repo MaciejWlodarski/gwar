@@ -31,10 +31,11 @@ export function fileKind(mime: string, name: string): FileKind {
 export type UploadCheck = { ok: true } | { ok: false; reason: "disabled" | "too_large" | "empty" };
 
 /** `limit` is the server's `upload_limit` (0: uploads are off). */
-export function checkUpload(size: number, limit: number): UploadCheck {
+/** `overhead`: what encryption adds to the uploaded size (the file itself must not be empty). */
+export function checkUpload(size: number, limit: number, overhead = 0): UploadCheck {
   if (limit <= 0) return { ok: false, reason: "disabled" };
   if (size <= 0) return { ok: false, reason: "empty" };
-  if (size > limit) return { ok: false, reason: "too_large" };
+  if (size + overhead > limit) return { ok: false, reason: "too_large" };
   return { ok: true };
 }
 

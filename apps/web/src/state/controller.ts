@@ -1225,7 +1225,7 @@ class Controller {
   async uploadFile(file: File, opts: { onProgress?: (fraction: number) => void; signal?: AbortSignal; sealed?: boolean } = {}): Promise<string> {
     const s = useSession.getState();
     if (s.kind !== "vc") throw new UploadError("unsupported");
-    const check = checkUpload(file.size + (opts.sealed ? SEALED_FILE_OVERHEAD : 0), s.server?.upload_limit ?? 0);
+    const check = checkUpload(file.size, s.server?.upload_limit ?? 0, opts.sealed ? SEALED_FILE_OVERHEAD : 0);
     if (!check.ok) throw new UploadError(check.reason);
     // The file goes only to the server it was chosen on.
     let bound: ReturnType<Controller["bind"]>;

@@ -111,7 +111,9 @@ function jpegDimensions(bytes: Uint8Array, v: DataView): [number, number] {
   return found;
 }
 /** An encrypted image's size, which only its sender can measure: unsigned display hints,
- * checked against the decrypted image before it is shown. */
+ * checked against the decrypted image before it is shown. Like the server's for a plaintext
+ * image they are the header's dimensions, before any EXIF rotation; the box only sizes a
+ * placeholder, and the decoded image is fitted into it. */
 export function imageHints(mime: string, bytes: Uint8Array): { width?: number; height?: number } {
   if (!isInlineImage(mime)) return {};
   try {

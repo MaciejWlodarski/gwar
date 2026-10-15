@@ -23,6 +23,10 @@ describe("files", () => {
   it("checks the server's upload limit", () => {
     expect(checkUpload(10, 0)).toEqual({ ok: false, reason: "disabled" });
     expect(checkUpload(0, 100)).toEqual({ ok: false, reason: "empty" });
+    // Encryption's overhead counts against the limit, but an empty file stays empty.
+    expect(checkUpload(0, 100, 28)).toEqual({ ok: false, reason: "empty" });
+    expect(checkUpload(73, 100, 28)).toEqual({ ok: false, reason: "too_large" });
+    expect(checkUpload(72, 100, 28)).toEqual({ ok: true });
     expect(checkUpload(101, 100)).toEqual({ ok: false, reason: "too_large" });
     expect(checkUpload(100, 100)).toEqual({ ok: true });
   });

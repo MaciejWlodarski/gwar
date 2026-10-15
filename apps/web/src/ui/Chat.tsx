@@ -713,6 +713,15 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
   const t = useT();
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [pendingByThread, setPendingByThread] = useState<Record<string, PendingFile[]>>({});
+  // Every live preview URL, so leaving the composer (or a disconnect) releases them all.
+  const previews = useRef(new Set<string>());
+  const mounted = useRef(true);
+  const release = (url?: string) => { if (url && previews.current.delete(url)) URL.revokeObjectURL(url); };
+  useEffect(() => {
+    const live = previews.current;
+    mounted.current = true;
+    return () => { mounted.current = false; for (const url of live) URL.revokeObjectURL(url); live.clear(); };
+  }, []);
   // Each channel keeps its own draft and files: "channel" follows the viewed one.
   const draftKey = useSession(s => storedKey(s, threadKey) ?? threadKey);
   const text = drafts[draftKey] ?? "";
@@ -768,7 +777,7 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
       if (files.length > room) useUi.getState().toast("error", t("file.tooMany", { max: MAX_FILES }));
       const key = draftKey;
       for (const file of files.slice(0, Math.max(0, room))) {
-        const check = checkUpload(file.size + (encrypted ? SEALED_FILE_OVERHEAD : 0), limit);
+        const check = checkUpload(file.size, limit, encrypted ? SEALED_FILE_OVERHEAD : 0);
         if (!check.ok) {
           useUi.getState().toast("error", `${file.name}: ${uploadErrorText(new UploadError(check.reason), t)}`);
           continue;
@@ -776,6 +785,7 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
         const id = pendingId++;
         const abort = new AbortController();
         const preview = /^image\/(png|jpeg|gif|webp)$/.test(file.type) ? URL.createObjectURL(file) : undefined;
+        if (preview) previews.current.add(preview);
         setPendingByThread((all) => ({ ...all, [key]: [...(all[key] ?? []), { id, file, status: "uploading", progress: 0, preview, abort }] }));
         controller
           .uploadFile(file, { sealed: encrypted, signal: abort.signal, onProgress: (p) => patch(key, id, { progress: p }) })
@@ -802,7 +812,7 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
       const list = all[draftKey] ?? [];
       const f = list.find((x) => x.id === id);
       f?.abort.abort();
-      if (f?.preview) URL.revokeObjectURL(f.preview);
+      release(f?.preview);
       return { ...all, [draftKey]: list.filter((x) => x.id !== id) };
     });
   };
@@ -822,10 +832,10 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
     ref.current?.focus();
     const sent = await controller.sendChat(threadKey, value, { mentions, attachments });
     // A failed plaintext send waits in the outbox; a failed encrypted one comes back to the composer, files too.
-    if (!sent && encrypted) {
+    if (!sent && encrypted && mounted.current) {
       setDrafts(d => ({ ...d, [key]: d[key] ? `${value}\n${d[key]}` : value }));
       setPendingByThread((all) => ({ ...all, [key]: [...ready, ...(all[key] ?? [])] }));
-    } else for (const f of ready) if (f.preview) URL.revokeObjectURL(f.preview);
+    } else for (const f of ready) release(f.preview);
   };
 
   const editLast = () => {

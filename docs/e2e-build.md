@@ -1067,8 +1067,9 @@ channels and server chat:
 - The signed body v3 carries per attachment the plaintext SHA-256, size,
   type and name, the file key, and the ciphertext's SHA-256 and size (section
   2). The plaintext JSON's attachment objects carry the same plus the file id;
-  width and height, if present, are unsigned display hints, checked against
-  the decoded image.
+  width and height, if present, are unsigned display hints: the image
+  header's dimensions (what the server measures for a plaintext image,
+  before any EXIF rotation), checked against the decrypted file's header.
 - The upload's `sealed` flag is stored with the file. `chat.sealed.send`
   gains `files: [id]` (at most 10, distinct): sealed uploads of the session's
   uid that are finished and not attached to any message; they are tied to

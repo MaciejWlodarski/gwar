@@ -575,6 +575,8 @@ describe("uploads", () => {
     stores.useSession.setState({ server: { ...session().server!, upload_limit: 100 } });
     await expect(controller.uploadFile({ name: "big.bin", size: 101, type: "" } as File)).rejects.toMatchObject({ kind: "too_large" });
     await expect(controller.uploadFile({ name: "e.bin", size: 0, type: "" } as File)).rejects.toMatchObject({ kind: "empty" });
+    await expect(controller.uploadFile({ name: "e.bin", size: 0, type: "" } as File, { sealed: true })).rejects.toMatchObject({ kind: "empty" });
+    await expect(controller.uploadFile({ name: "b.bin", size: 73, type: "" } as File, { sealed: true })).rejects.toMatchObject({ kind: "too_large" });
     expect(link.sent("file.upload")).toHaveLength(0);
   });
 

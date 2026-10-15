@@ -128,7 +128,7 @@ describe("encrypted attachments", () => {
     expect(request).toHaveBeenCalledTimes(3);
   });
   it("ignores an edit that swaps the files, but takes new size hints and the deletion", async () => {
-    const thread = (id: number) => useSession.getState().threads[`dm:${b}`]!.items.find(i => i.key === `e${id}`);
+    const thread = (id: number) => useSession.getState().threads[`dm:${b}`]?.items.find(i => i.key === `e${id}`);
     const sent = async (id: number) => { await dm.receive({ ...await row("files", undefined, [file("f1")]), id }, false); return opened!; };
     let id = 1;
     for (const swapped of [[], [file("f2")], [file("f1"), file("f2")], [{ ...file("f1"), name: "b.png" }], [{ ...file("f1"), sealed: { ...file("f1").sealed!, key: b64(32, 4) } }]]) {
@@ -136,6 +136,15 @@ describe("encrypted attachments", () => {
       await dm.receive({ ...await row("swapped", original, swapped), id }, true);
       expect(thread(id)).toMatchObject({ msg: { text: "files" }, authentic: true });
     }
+    // Not after a reconnect either, nor under another row id: the checkpoint remembers the files.
+    // (An id alone is not signed: the files must differ in what is.)
+    const original = await sent(++id), swapped = await row("swapped", original, [{ ...file("f2"), sha256: b64(32, 5) }]), plain = opened;
+    await dm.receive({ ...swapped, id }, true);
+    useSession.setState({ ...initialState, me: { uid: a, session: 1 }, focused: false, kind: "vc" });
+    dm = new SealedConversations(runtime, { serverKey: server, request } as unknown as Link, alice, a, () => active, notify, () => {});
+    opened = plain;
+    await dm.receive({ ...swapped, id: 99 }, true);
+    expect(useSession.getState().threads[`dm:${b}`]?.items.find(i => i.key === "e99")).toBeUndefined();
     await dm.receive({ ...await row("edited", await sent(++id), [file("f1", 3)]), id }, true);
     expect(thread(id)).toMatchObject({ msg: { text: "edited", attachments: [file("f1", 3)] } });
     await dm.receive({ ...await row(DELETION_TEXT, opened), id }, true);
