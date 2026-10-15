@@ -91,7 +91,10 @@ export interface ResponseMap {
   "invite.create": { invite: Invite };
   "invite.list": { invites: Invite[] };
   "invite.delete": Empty;
-  "voice.offer": { sdp: string };
+  "voice.offer": import("../proto/VoiceTransportBinding").VoiceTransportBinding & { sdp: string };
+  "voice.state": { voice: import("../proto/VoiceState").VoiceState | null };
+  "voice.epoch.ack": Empty;
+  "voice.epoch.repeat": Empty;
 }
 
 export type EventName = Event["ev"];

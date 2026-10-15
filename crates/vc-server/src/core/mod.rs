@@ -16,6 +16,7 @@ pub use mls::TreeRefusal;
 mod moderation;
 mod passwords;
 mod sealed;
+mod voice;
 
 use moderation::ban_message;
 use vc_proto::BanNotice;
@@ -27,7 +28,7 @@ use std::{
     net::IpAddr,
     path::PathBuf,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use arc_swap::ArcSwap;
@@ -117,10 +118,13 @@ pub enum CoreMsg {
     Talking {
         session: SessionId,
         talking: bool,
+        binding: Option<vc_proto::VoiceBinding>,
     },
     Voice {
         session: SessionId,
         connected: bool,
+        binding: vc_proto::VoiceTransportBinding,
+        failed: bool,
     },
     Info(oneshot::Sender<ServerInfo>),
     DeviceAuthorized(String, String, oneshot::Sender<bool>),
@@ -141,6 +145,7 @@ pub enum CoreMsg {
 #[derive(Clone)]
 pub struct CoreHandle {
     tx: mpsc::Sender<CoreMsg>,
+    voice_bindings: Arc<ArcSwap<HashMap<SessionId, vc_proto::VoiceBinding>>>,
 }
 
 impl CoreHandle {
@@ -174,11 +179,27 @@ impl CoreHandle {
 
     /// Media-plane notifications must never block the media loop.
     pub fn talking(&self, session: SessionId, talking: bool) {
-        let _ = self.tx.try_send(CoreMsg::Talking { session, talking });
+        let Some(binding) = self.voice_bindings.load().get(&session).cloned() else {
+            return;
+        };
+        let _ = self.tx.try_send(CoreMsg::Talking { session, talking, binding: Some(binding) });
     }
 
-    pub fn voice(&self, session: SessionId, connected: bool) {
-        let _ = self.tx.try_send(CoreMsg::Voice { session, connected });
+    pub fn voice_binding_matches(&self, session: SessionId, binding: &vc_proto::VoiceTransportBinding) -> bool {
+        self.voice_bindings.load().get(&session) == Some(&binding.into())
+    }
+
+    pub fn talking_bound(&self, session: SessionId, talking: bool, binding: &vc_proto::VoiceTransportBinding) {
+        let _ = self.tx.try_send(CoreMsg::Talking { session, talking, binding: Some(binding.into()) });
+    }
+    pub fn voice_bound(
+        &self,
+        session: SessionId,
+        connected: bool,
+        binding: &vc_proto::VoiceTransportBinding,
+        failed: bool,
+    ) {
+        let _ = self.tx.try_send(CoreMsg::Voice { session, connected, binding: binding.clone(), failed });
     }
 
     pub async fn bridge(&self, msg: BridgeMsg) {
@@ -233,6 +254,8 @@ struct Session {
     away: Option<String>,
     talking: bool,
     voice: bool,
+    participation: Option<voice::Participation>,
+    used_ssrcs: BTreeSet<u32>,
     /// `None` for remote sessions, which live on a bridged server.
     out: Option<OutboundTx>,
     /// Bearer token for file downloads (see [`vc_proto::FileAccess`]); empty for remote sessions.
@@ -282,6 +305,17 @@ pub struct Core {
     mls_tree_requests: HashMap<SessionId, (i64, u32)>,
     connections: u64,
     history: history::HistoryRouting,
+    calls: BTreeMap<ChannelId, voice::Call>,
+    voice_dirty: bool,
+    voice_valid_from: Option<i64>,
+    voice_expiry: Option<i64>,
+    voice_clock: fn() -> i64,
+    voice_limits: voice::Limits,
+    #[cfg(test)]
+    voice_passes: usize,
+    #[cfg(test)]
+    voice_parent_loads: std::cell::Cell<usize>,
+    voice_bindings: Arc<ArcSwap<HashMap<SessionId, vc_proto::VoiceBinding>>>,
 }
 
 /// Messages with ids at or above this value are delivered live and not stored.
@@ -363,6 +397,7 @@ pub fn spawn(
 ) -> Result<CoreHandle> {
     let (tx, mut rx) = mpsc::channel(4096);
     let mut core = Core::new(store, config, routing, media, tx.downgrade())?;
+    let voice_bindings = core.voice_bindings.clone();
     let ticker = tx.downgrade();
     tokio::spawn(async move {
         let mut every = tokio::time::interval(Duration::from_secs(600));
@@ -374,8 +409,13 @@ pub fn spawn(
     });
     tokio::spawn(async move {
         loop {
-            let expiry =
-                core.sessions.values().filter_map(|s| s.device_expires_at).chain(core.history.deadline()).min();
+            let expiry = core
+                .sessions
+                .values()
+                .filter_map(|s| s.device_expires_at)
+                .chain(core.history.deadline())
+                .chain(core.voice_deadline())
+                .min();
             let wait = async {
                 match expiry {
                     Some(at) => {
@@ -388,6 +428,7 @@ pub fn spawn(
                 biased;
                 _ = wait => {
                     core.expire_sessions();
+                    core.voice_reconcile();
                     core.history_wake();
                 }
                 msg = rx.recv() => match msg {
@@ -398,7 +439,7 @@ pub fn spawn(
         }
         core.shutdown();
     });
-    Ok(CoreHandle { tx })
+    Ok(CoreHandle { tx, voice_bindings })
 }
 
 impl Core {
@@ -474,6 +515,17 @@ impl Core {
             mls_tree_requests: HashMap::new(),
             connections: 0,
             history: Default::default(),
+            calls: BTreeMap::new(),
+            voice_dirty: true,
+            voice_valid_from: None,
+            voice_expiry: None,
+            voice_clock: now_ms,
+            voice_limits: voice::Limits::default(),
+            #[cfg(test)]
+            voice_passes: 0,
+            #[cfg(test)]
+            voice_parent_loads: std::cell::Cell::new(0),
+            voice_bindings: Arc::new(ArcSwap::from_pointee(HashMap::new())),
         };
         core.mls_reconcile()?;
         Ok(core)
@@ -481,6 +533,7 @@ impl Core {
 
     fn handle(&mut self, msg: CoreMsg) {
         self.expire_sessions();
+        self.voice_reconcile();
         // A busy queue can keep the loop's timer from firing; deadlines must not wait for it.
         if self.history.deadline().is_some_and(|at| at <= now_ms()) {
             self.history_wake();
@@ -500,13 +553,46 @@ impl Core {
                 }
             }
             CoreMsg::Disconnect { session, reason } => self.remove(session, reason),
-            CoreMsg::Talking { session, talking } => {
+            CoreMsg::Talking { session, talking, binding } => {
+                if binding.as_ref().is_some_and(|b| {
+                    self.sessions.get(&session).and_then(|s| s.participation.as_ref()).is_none_or(|p| &p.binding != b)
+                }) {
+                    return;
+                }
                 if let Some(s) = self.sessions.get_mut(&session).filter(|s| s.talking != talking) {
                     s.talking = talking;
-                    self.broadcast(Event::VoiceTalking { client: session, talking }, |_| true);
+                    if let Some(binding) = s.participation.as_ref().map(|p| p.binding.clone()) {
+                        self.broadcast(Event::VoiceTalking { binding, client: session, talking }, |_| true);
+                    }
                 }
             }
-            CoreMsg::Voice { session, connected } => {
+            CoreMsg::Voice { session, connected, binding, failed } => {
+                if self
+                    .sessions
+                    .get(&session)
+                    .and_then(|s| s.participation.as_ref())
+                    .is_none_or(|p| p.binding != (&binding).into())
+                {
+                    return;
+                }
+                if failed {
+                    self.broadcast(
+                        Event::VoiceClosed {
+                            binding: (&binding).into(),
+                            reason: vc_proto::VoiceClosedReason::TransportFailed,
+                        },
+                        |s| s.id == session,
+                    );
+                    let s = self.sessions.get_mut(&session).unwrap();
+                    if let Some(p) = s.participation.as_mut() {
+                        p.binding.run = None;
+                    }
+                    s.talking = false;
+                    s.voice = false;
+                    self.voice_clear_ack(session);
+                    self.publish_routing();
+                    self.client_updated(session);
+                }
                 if let Some(s) = self.sessions.get_mut(&session).filter(|s| s.voice != connected) {
                     s.voice = connected;
                     if !connected {
@@ -534,9 +620,11 @@ impl Core {
             CoreMsg::Revoked(devices, seq) => self.revoked(devices, seq),
             CoreMsg::Resume(resume) => resume(self),
         }
+        self.voice_reconcile();
         while let Some(session) = self.stalled.pop_first() {
             warn!(session, "outbound queue overflow; dropping client");
             self.remove(session, LeaveReason::Timeout);
+            self.voice_reconcile();
         }
     }
 
@@ -621,11 +709,20 @@ impl Core {
     }
 
     fn publish_routing(&self) {
+        self.voice_bindings.store(Arc::new(
+            self.sessions
+                .values()
+                .filter_map(|s| s.participation.as_ref().map(|p| (s.id, p.binding.clone())))
+                .collect(),
+        ));
         let members = self
             .sessions
             .values()
             .filter_map(|s| {
                 let channel = s.channel?;
+                if self.is_encrypted(channel) {
+                    return None;
+                }
                 let bridged = !self.is_encrypted(channel);
                 Some((s.id, Member { channel, muted: s.muted, deafened: s.deafened, bridged }))
             })
@@ -663,7 +760,14 @@ impl Core {
             None
         };
         // Remote sessions occupy the bridged server's slots, not ours.
-        if self.sessions.values().filter(|s| s.out.is_some()).count() >= self.info.max_clients as usize {
+        let replaced: Vec<_> = self
+            .sessions
+            .values()
+            .filter(|s| s.out.is_some() && s.uid == r.uid && s.hello_key == r.hello_key)
+            .map(|s| s.id)
+            .collect();
+        if self.sessions.values().filter(|s| s.out.is_some()).count() - replaced.len() >= self.info.max_clients as usize
+        {
             return fail(ErrorCode::Unavailable, "server is full");
         }
         if r.device.is_some() && r.device_expires_at.is_none_or(|at| at <= now_ms()) {
@@ -759,6 +863,9 @@ impl Core {
                 return fail(ErrorCode::Internal, "storage error");
             }
         };
+        for old in replaced {
+            self.remove(old, LeaveReason::Replaced);
+        }
         let id = self.allocate_session();
         let session = Session {
             hello_key: r.hello_key,
@@ -780,6 +887,8 @@ impl Core {
             away: None,
             talking: false,
             voice: false,
+            participation: None,
+            used_ssrcs: BTreeSet::new(),
             out: Some(r.out),
             file_access: files::random_id(32),
             since: self.next_connection(),
@@ -943,6 +1052,10 @@ impl Core {
     }
 
     fn remove(&mut self, session: SessionId, reason: LeaveReason) {
+        if !self.sessions.contains_key(&session) {
+            return;
+        }
+        let _ = self.move_client(session, None);
         let Some(s) = self.sessions.remove(&session) else { return };
         self.mls_tree_requests.remove(&session);
         info!(session, uid = %s.uid, ?reason, "client left");
@@ -1000,8 +1113,9 @@ impl Core {
                 };
                 let id = self.allocate_session();
                 // TeamSpeak users are always in some channel.
-                let channel =
-                    Some(client.channel).filter(|c| self.channels.contains_key(c)).or(Some(self.info.default_channel));
+                let channel = Some(client.channel)
+                    .filter(|c| self.channels.contains_key(c) && !self.is_encrypted(*c))
+                    .or(Some(self.info.default_channel));
                 let session = Session {
                     hello_key: String::new(),
                     certificate: None,
@@ -1009,7 +1123,7 @@ impl Core {
                     user_id,
                     uid: client.uid,
                     nickname,
-                    channel,
+                    channel: None,
                     unlocked: BTreeSet::new(),
                     groups,
                     platform: client.platform,
@@ -1022,13 +1136,22 @@ impl Core {
                     away: client.away,
                     talking: false,
                     voice: true,
+                    participation: None,
+                    used_ssrcs: BTreeSet::new(),
                     out: None,
                     file_access: String::new(),
                     since: self.next_connection(),
                 };
                 info!(session = id, uid = %session.uid, platform = ?session.platform, "remote client joined");
-                let joined = client_view(&session);
                 self.sessions.insert(id, session);
+                if let Some(channel) = channel {
+                    // Bridge entries are restricted to existing plaintext channels.
+                    if let Ok(admission) = self.voice_admission(id, channel) {
+                        self.voice_allocate(id, admission);
+                        self.sessions.get_mut(&id).unwrap().channel = Some(channel);
+                    }
+                }
+                let joined = client_view(&self.sessions[&id]);
                 self.broadcast(Event::ClientJoined(joined), |s| s.id != id);
                 self.publish_routing();
                 let _ = reply.send(Some(id));
@@ -1049,16 +1172,13 @@ impl Core {
                         }
                     }
                 }
-                if let Some(channel) = u.channel.filter(|c| self.channels.contains_key(c)) {
-                    if Some(channel) != s.channel {
-                        s.talking = false;
-                    }
-                    s.channel = Some(channel);
-                }
                 s.muted = u.muted.unwrap_or(s.muted);
                 s.deafened = u.deafened.unwrap_or(s.deafened);
                 if let Some(away) = u.away {
                     s.away = away;
+                }
+                if let Some(channel) = u.channel.filter(|c| self.channels.contains_key(c) && !self.is_encrypted(*c)) {
+                    let _ = self.move_client(session, Some(channel));
                 }
                 if routing_changed {
                     self.publish_routing();
@@ -1154,7 +1274,10 @@ impl Core {
             Request::ServerUpdate(update) => return self.server_update(session, id, update),
             Request::TokenCreate { group } => self.token_create(session, group),
             Request::TokenRedeem { token } => self.token_redeem(session, &token),
-            Request::VoiceOffer { sdp } => return self.voice_offer(session, id, sdp),
+            Request::VoiceOffer(offer) => return self.voice_offer(session, id, offer),
+            Request::VoiceState {} => Ok(Response::VoiceState { voice: self.voice_state(session) }),
+            Request::VoiceEpochAck(r) => self.voice_epoch(session, r, false),
+            Request::VoiceEpochRepeat(r) => self.voice_epoch(session, r, true),
         };
         Some(result)
     }
@@ -1182,15 +1305,30 @@ impl Core {
         Ok(Response::Empty {})
     }
 
-    fn move_client(&mut self, session: SessionId, channel: Option<ChannelId>) {
-        let Some(s) = self.sessions.get_mut(&session) else { return };
-        if s.channel == channel {
+    fn move_client(&mut self, session: SessionId, channel: Option<ChannelId>) -> Result<(), ErrorBody> {
+        if self.sessions.get(&session).is_none_or(|s| s.channel == channel) {
+            return Ok(());
+        }
+        let admission = channel.map(|channel| self.voice_admission(session, channel)).transpose()?;
+        self.move_admitted(session, admission);
+        Ok(())
+    }
+
+    fn move_admitted(&mut self, session: SessionId, admission: Option<voice::Admission>) {
+        let channel = admission.as_ref().map(|a| a.channel);
+        if self.sessions[&session].channel == channel {
             return;
         }
+        self.voice_detach(session);
+        if let Some(admission) = admission {
+            self.voice_allocate(session, admission);
+        }
+        let s = self.sessions.get_mut(&session).unwrap();
         s.channel = channel;
         s.talking = false;
         self.publish_routing();
         self.client_updated(session);
+        self.voice_snapshot(session);
     }
 
     fn client_move(&mut self, session: SessionId, client: SessionId, channel: ChannelId) -> Reply {
@@ -1207,7 +1345,7 @@ impl Core {
         if target.out.is_none() && self.is_encrypted(channel) {
             return Err(err(ErrorCode::BadRequest, "TeamSpeak users cannot join encrypted channels"));
         }
-        self.move_client(client, Some(channel));
+        self.move_client(client, Some(channel))?;
         Ok(Response::Empty {})
     }
 
@@ -1233,6 +1371,10 @@ impl Core {
         let Some(row) = self.channels.get(&channel) else {
             return Err(err(ErrorCode::NotFound, "no such channel"));
         };
+        let admission = self.voice_admission(session, channel)?;
+        if self.sessions[&session].channel == Some(channel) {
+            return Ok(Response::Empty {});
+        }
         if let Some(max) = row.max_clients {
             let inside = self.sessions.values().filter(|s| s.channel == Some(channel)).count();
             if inside >= max as usize && !self.has(session, Permission::ClientMove) {
@@ -1244,13 +1386,13 @@ impl Core {
         {
             s.unlocked.insert(channel);
         }
-        self.move_client(session, Some(channel));
+        self.move_admitted(session, Some(admission));
         Ok(Response::Empty {})
     }
 
     fn channel_leave(&mut self, session: SessionId) -> Reply {
         if self.sessions[&session].channel.is_some() {
-            self.move_client(session, None);
+            let _ = self.move_client(session, None);
             let _ = self.media.try_send(MediaCmd::Remove { session });
         }
         Ok(Response::Empty {})
@@ -1595,9 +1737,18 @@ impl Core {
             .map(|s| (s.id, s.out.is_none()))
             .collect();
         let fallback = self.info.default_channel;
+        for &(s, remote) in &evicted {
+            if !remote && let Some(p) = self.sessions[&s].participation.as_ref() {
+                let binding = p.binding.clone();
+                self.broadcast(
+                    Event::VoiceClosed { binding, reason: vc_proto::VoiceClosedReason::ChannelDeleted },
+                    |target| target.id == s,
+                );
+            }
+        }
         for (s, remote) in evicted {
             // Our users drop out of voice; TeamSpeak moves its users to the default channel.
-            self.move_client(s, remote.then_some(fallback));
+            let _ = self.move_client(s, remote.then_some(fallback));
         }
         for c in doomed {
             self.channels.remove(&c);
@@ -1767,19 +1918,6 @@ impl Core {
         }
         Ok(Response::Groups { groups })
     }
-
-    fn voice_offer(&mut self, session: SessionId, id: u32, sdp: String) -> Option<Reply> {
-        if sdp.len() > 64 * 1024 {
-            return Some(Err(err(ErrorCode::BadRequest, "offer too large")));
-        }
-        let Some(out) = self.sessions[&session].out.clone() else {
-            return Some(Err(err(ErrorCode::BadRequest, "remote sessions have no voice transport")));
-        };
-        if self.media.try_send(MediaCmd::Offer { session, id, sdp, out }).is_err() {
-            return Some(Err(err(ErrorCode::Unavailable, "media engine busy")));
-        }
-        None
-    }
 }
 
 fn storage_error(e: anyhow::Error) -> ErrorBody {
@@ -1818,6 +1956,7 @@ fn client_view(s: &Session) -> Client {
         away: s.away.clone(),
         talking: s.talking,
         voice: s.voice,
+        voice_binding: s.participation.as_ref().map(|p| p.binding.clone()),
     }
 }
 
@@ -1993,9 +2132,9 @@ pub(crate) mod expiry_tests {
         assert!(info.teamspeak);
         assert_ne!(info.default_channel, secret);
 
-        // The media plane knows at once that what is said in an encrypted channel stays here.
+        // Before joining the parent MLS group, encrypted voice admission is refused.
         core.request(session, 3, Request::ChannelJoin { channel: secret, password: None }).await;
-        assert_eq!(bridged(&core, session).await, Some((secret, false)));
+        assert_eq!(bridged(&core, session).await, None);
         core.request(session, 4, Request::ChannelJoin { channel: info.default_channel, password: None }).await;
         assert_eq!(bridged(&core, session).await, Some((info.default_channel, true)));
     }

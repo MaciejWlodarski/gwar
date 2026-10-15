@@ -1688,11 +1688,20 @@ fn forgetting_a_group_leaves_nothing_of_it() {
 fn channel_fixture(kind: Kind) -> Fixture {
     let t = now();
     let mut a = device(1, 11, t);
-    let b = device(2, 21, t);
-    let mut d = descriptor(&a, &b, t, false, true).descriptor;
+    let mut b = device(2, 21, t);
+    if kind == Kind::Voice {
+        a = Agent::new_voice([11; 32], a.credential.clone(), t).unwrap();
+        b = Agent::new_voice([21; 32], b.credential.clone(), t).unwrap();
+        a.take_changes();
+        b.take_changes();
+    }
+    let mut d = descriptor(&a, &b, t, false, kind != Kind::Voice).descriptor;
     d.kind = kind;
     if kind == Kind::Server {
         d.conversation = "server".into();
+    } else if kind == Kind::Voice {
+        d.conversation = "voice:1".into();
+        d.channel_group_id = Some(b64(&[9; 32]));
     }
     let d = SignedDescriptor::sign(d, a.credential.clone(), &a.signer.0);
     let id = d.group_id();
@@ -1706,7 +1715,7 @@ fn channel_fixture(kind: Kind) -> Fixture {
 
 #[test]
 fn separate_tree_join_updates_removal_and_behind() {
-    for kind in [Kind::Channel, Kind::Server] {
+    for kind in [Kind::Channel, Kind::Server, Kind::Voice] {
         let mut f = channel_fixture(kind);
         assert!(info(&f.info).unwrap().extensions().ratchet_tree().is_some());
         let old_tree = f.observer.tree().unwrap().1;
@@ -1787,38 +1796,41 @@ fn dm_requires_embedded_tree_and_ignores_supplied_tree() {
 
 #[test]
 fn channel_key_package_adds_are_refused_by_agent_and_observer() {
-    let mut f = channel_fixture(Kind::Channel);
-    let package = f.b.key_packages(1, f.t).unwrap().remove(0);
-    assert!(f.a.commit(&server(), &f.id, std::slice::from_ref(&package), &[], f.t, &()).is_err());
-    // A nonconforming client can still construct an Add; shared rules must refuse it.
-    let mut a = Agent::load([11; 32], f.a.credential.clone(), f.a.durable.clone()).unwrap();
-    let mut group = a.mls(&group_key(&server(), &f.id)).unwrap();
-    let package = KeyPackageIn::tls_deserialize_exact(&package)
-        .unwrap()
-        .validate(a.provider.crypto(), ProtocolVersion::Mls10)
-        .unwrap();
-    group.set_configuration(a.provider.storage(), &join_config(Kind::Dm)).unwrap();
-    group.set_aad(ds::commit_aad(f.t));
-    let (commit, welcome, _) = group.add_members(&a.provider, &a.signer, &[package]).unwrap();
-    group.merge_pending_commit(&a.provider).unwrap();
-    // Without the tree, as these groups' GroupInfos are: only the Add itself is wrong.
-    let gi = wire(group.export_group_info(a.provider.crypto(), &a.signer, false).unwrap()).unwrap();
-    let welcome = wire(welcome).unwrap();
-    assert!(matches!(
-        f.observer.commit(&wire(commit).unwrap(), &gi, Some(&welcome), f.t, f.t),
-        Err(ds::DsError::Invalid("channel and server devices join externally"))
-    ));
-    // A Welcome beside a commit that adds nobody is refused too.
-    let mut f2 = channel_fixture(Kind::Channel);
-    let update = f2.a.commit(&server(), &f2.id, &[], &[], f2.t, &()).unwrap();
-    f2.a.take_changes();
-    assert!(matches!(
-        f2.observer.commit(&update.commit, &update.group_info, Some(&welcome), f2.t, f2.t),
-        Err(ds::DsError::Invalid("channel and server groups take no Welcome"))
-    ));
-    f.b.take_changes();
-    assert!(f.b.welcome(&server(), "channel", &welcome).is_err());
-    a.take_changes();
+    for kind in [Kind::Channel, Kind::Voice] {
+        let mut f = channel_fixture(kind);
+        let package = device(2, 21, f.t).key_packages(1, f.t).unwrap().remove(0);
+        assert!(f.a.commit(&server(), &f.id, std::slice::from_ref(&package), &[], f.t, &()).is_err());
+        // A nonconforming client can still construct an Add; shared rules must refuse it.
+        let mut a =
+            Agent::load_store([11; 32], f.a.credential.clone(), f.a.durable.clone(), kind == Kind::Voice).unwrap();
+        let mut group = a.mls(&group_key(&server(), &f.id)).unwrap();
+        let package = KeyPackageIn::tls_deserialize_exact(&package)
+            .unwrap()
+            .validate(a.provider.crypto(), ProtocolVersion::Mls10)
+            .unwrap();
+        group.set_configuration(a.provider.storage(), &join_config(Kind::Dm)).unwrap();
+        group.set_aad(ds::commit_aad(f.t));
+        let (commit, welcome, _) = group.add_members(&a.provider, &a.signer, &[package]).unwrap();
+        group.merge_pending_commit(&a.provider).unwrap();
+        // Without the tree, as these groups' GroupInfos are: only the Add itself is wrong.
+        let gi = wire(group.export_group_info(a.provider.crypto(), &a.signer, false).unwrap()).unwrap();
+        let welcome = wire(welcome).unwrap();
+        assert!(matches!(
+            f.observer.commit(&wire(commit).unwrap(), &gi, Some(&welcome), f.t, f.t),
+            Err(ds::DsError::Invalid("separate-tree groups join externally"))
+        ));
+        // A Welcome beside a commit that adds nobody is refused too.
+        let mut f2 = channel_fixture(kind);
+        let update = f2.a.commit(&server(), &f2.id, &[], &[], f2.t, &()).unwrap();
+        f2.a.take_changes();
+        assert!(matches!(
+            f2.observer.commit(&update.commit, &update.group_info, Some(&welcome), f2.t, f2.t),
+            Err(ds::DsError::Invalid("channel and server groups take no Welcome"))
+        ));
+        f.b.take_changes();
+        assert!(f.b.welcome(&server(), "channel", &welcome).is_err());
+        a.take_changes();
+    }
 }
 
 #[test]
@@ -1846,4 +1858,439 @@ fn channel_tree_larger_than_handshake_limit() {
     }
     assert_eq!(f.observer.leaves().len(), 351);
     eprintln!("350 external joins: {:?}", started.elapsed());
+}
+
+#[test]
+fn voice_uses_external_joins_parent_gates_and_no_durable_chat_keys() {
+    let t = now();
+    let mut parent = device(1, 11, t);
+    let mut other_parent = device(2, 21, t);
+    let d = descriptor(&parent, &other_parent, t, false, true);
+    let parent_id = d.group_id();
+    let parent_info = parent.create(d).unwrap();
+    parent.take_changes();
+    parent.settle(&server(), &parent_id, Some(&parent_id)).unwrap();
+    parent.take_changes();
+    let mut parent_observer = Observer::create(&parent_info, &server()).unwrap();
+    let make_voice = |seed, credential| {
+        let mut a = Agent::new_voice([seed; 32], credential, t).unwrap();
+        a.take_changes();
+        a
+    };
+    let mut a = make_voice(11, parent.credential.clone());
+    let mut b = make_voice(21, other_parent.credential.clone());
+    let mut desc = descriptor(&a, &b, t, false, false).descriptor;
+    desc.kind = Kind::Voice;
+    desc.conversation = "voice:1".into();
+    desc.channel_group_id = Some(b64(&parent_id));
+    let signed = SignedDescriptor::sign(desc, a.credential.clone(), &a.signer.0);
+    let id = signed.group_id();
+    let info = a.create(signed.clone()).unwrap();
+    a.take_changes();
+    assert_eq!(a.voice_keys(&server(), &id, &parent, t, &()), Err(AgentError::Blocked));
+    let mut observer = Observer::create(&info, &server()).unwrap();
+    let mut memory = a.durable.clone();
+    assert!(Agent::load([11; 32], a.credential.clone(), memory.clone()).is_err());
+    a = Agent::load_voice([11; 32], a.credential.clone(), memory.clone()).unwrap();
+    a.settle(&server(), &id, Some(&id)).unwrap();
+    a.take_changes().apply(&mut memory);
+    let keys = a.voice_keys(&server(), &id, &parent, t, &()).unwrap();
+    assert_eq!(keys.epoch, 0);
+    assert_eq!(keys.members.len(), 1);
+    assert!(a.epoch(&server(), &id, 0).is_none());
+    assert!(a.group(&server(), &id).unwrap().evidence.is_empty());
+    assert!(a.sending_key(&server(), &id, t, &()).is_err());
+    assert!(a.share_history(&server(), &id, &b.device_hpke_key(), t, &()).is_err());
+    assert!(a.import_history(&server(), &id, b"not history").is_err());
+    assert!(a.key_packages(1, t).is_err());
+    assert!(a.welcome(&server(), "delivery", b"not Welcome").is_err());
+    let join = b.join_external(&server(), &info, None, t, &()).unwrap();
+    b.take_changes();
+    assert_eq!(b.voice_keys(&server(), &id, &other_parent, t, &()), Err(AgentError::Blocked));
+    observer = accept(observer, &join, t);
+    acknowledge(&mut b, &id, &join);
+    a.receive(&server(), &id, &join.commit, &[]).unwrap();
+    a.take_changes();
+    b.voice_pending(&server(), &id, observer.epoch(), &[]).unwrap();
+    b.take_changes();
+    // Historical voice acceptance is independent of the parent's current sync.
+    assert_eq!(a.voice_keys(&server(), &id, &parent, t, &()), Err(AgentError::Blocked));
+    assert_eq!(a.voice_parent_removals(&server(), &id, &parent, false), Err(AgentError::Blocked));
+    let pj = other_parent.join_external(&server(), &parent_info, None, t, &()).unwrap();
+    other_parent.take_changes();
+    parent_observer = accept(parent_observer, &pj, t);
+    acknowledge(&mut other_parent, &parent_id, &pj);
+    parent.receive(&server(), &parent_id, &pj.commit, &[]).unwrap();
+    parent.take_changes();
+    assert!(a.voice_parent_removals(&server(), &id, &parent, true).unwrap().is_empty());
+    assert_eq!(
+        a.voice_keys(&server(), &id, &parent, t, &()).unwrap().members,
+        b.voice_keys(&server(), &id, &other_parent, t, &()).unwrap().members
+    );
+    assert_eq!(observer.leaves().len(), 2);
+    // A lost commit reply is settled from its exact bytes, keeping all old keys out of stores.
+    let update = a.commit(&server(), &id, &[], &[], t, &()).unwrap();
+    a.take_changes();
+    observer = accept(observer, &update, t);
+    let stored = a.durable.clone();
+    a = Agent::load_voice([11; 32], a.credential.clone(), stored).unwrap();
+    acknowledge(&mut a, &id, &update);
+    assert_eq!(a.voice_keys(&server(), &id, &parent, t, &()).unwrap().epoch, observer.epoch());
+    assert!(a.epochs.is_empty());
+    // A parent removal gates current sending, without invalidating historical voice commits.
+    let own = other_parent.mls(&group_key(&server(), &parent_id)).unwrap().own_leaf_index().u32();
+    let remove = parent.commit(&server(), &parent_id, &[], &[own], t, &()).unwrap();
+    parent.take_changes();
+    parent_observer = accept(parent_observer, &remove, t);
+    acknowledge(&mut parent, &parent_id, &remove);
+    assert_eq!(parent_observer.leaves().len(), 1);
+    assert_eq!(a.voice_keys(&server(), &id, &parent, t, &()), Err(AgentError::Blocked));
+    assert_eq!(a.voice_parent_removals(&server(), &id, &parent, true).unwrap().len(), 1);
+    assert_eq!(voice_kid(0x1_0000_0001, 7), 0x1_0000_0007);
+    assert_eq!(voice_kid(u64::MAX, u32::MAX), u64::MAX);
+}
+
+/// A parent and a voice tree containing A, B and C, all at the same accepted head.
+fn voice_fixture() -> (Fixture, Agent, Agent) {
+    let mut parent = channel_fixture(Kind::Channel);
+    let t = parent.t;
+    let mut pc = device(3, 31, t);
+    for joining in [&mut parent.b, &mut pc] {
+        let out =
+            joining.join_external(&server(), &parent.info, Some(&parent.observer.tree().unwrap().1), t, &()).unwrap();
+        joining.take_changes();
+        parent.observer = accept(parent.observer, &out, t);
+        acknowledge(joining, &parent.id, &out);
+        parent.a.receive(&server(), &parent.id, &out.commit, &[]).unwrap();
+        parent.a.take_changes();
+        parent.info = out.group_info;
+    }
+    let mut f = channel_fixture(Kind::Voice);
+    // Recreate with the actual pinned parent.
+    let mut d = SignedDescriptor::parse(&f.a.group(&server(), &f.id).unwrap().descriptor).unwrap().descriptor;
+    d.channel_group_id = Some(b64(&parent.id));
+    f.a.forget(&server(), &f.id).unwrap();
+    f.a.take_changes();
+    let signed = SignedDescriptor::sign(d, f.a.credential.clone(), &f.a.signer.0);
+    f.id = signed.group_id();
+    f.info = f.a.create(signed).unwrap();
+    f.a.take_changes();
+    f.a.settle(&server(), &f.id, Some(&f.id)).unwrap();
+    f.a.take_changes();
+    f.observer = Observer::create(&f.info, &server()).unwrap();
+    let mut c = Agent::new_voice([31; 32], pc.credential.clone(), t).unwrap();
+    c.take_changes();
+    for joining in [&mut f.b, &mut c] {
+        let out = joining.join_external(&server(), &f.info, Some(&f.observer.tree().unwrap().1), t, &()).unwrap();
+        joining.take_changes();
+        f.observer = accept(f.observer, &out, t);
+        acknowledge(joining, &f.id, &out);
+        f.a.receive(&server(), &f.id, &out.commit, &[]).unwrap();
+        f.a.take_changes();
+        f.info = out.group_info;
+    }
+    assert!(f.a.voice_keys(&server(), &f.id, &parent.a, t, &()).is_ok());
+    (f, parent.a, c)
+}
+
+#[test]
+fn voice_removal_hold_survives_competing_update_and_volatile_reload() {
+    let (mut f, parent, mut c) = voice_fixture();
+    let target = f.observer.leaves().iter().find(|l| l.device_key == c.credential.device_key()).unwrap().index;
+    let proposal = f.observer.propose_remove(&Ed25519Signer(key(200)), target).unwrap();
+    f.a.proposal(&server(), &f.id, &proposal).unwrap();
+    f.a.take_changes();
+    assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    // C has not seen its own server Remove and wins with an ordinary update.
+    let update = c.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+    c.take_changes();
+    f.observer = accept(f.observer, &update, f.t);
+    acknowledge(&mut c, &f.id, &update);
+    f.a.receive(&server(), &f.id, &update.commit, &[]).unwrap();
+    f.a.take_changes();
+    assert!(f.a.mls(&group_key(&server(), &f.id)).unwrap().pending_proposals().next().is_none());
+    f.a = Agent::load_voice([11; 32], f.a.credential.clone(), f.a.durable.clone()).unwrap();
+    f.a.pending(&server(), &f.id, false).unwrap();
+    f.a.take_changes();
+    assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    // Snapshot recovery replaces the hold with a pending-state barrier.
+    let recovery =
+        f.a.join_external(&server(), &update.group_info, Some(&f.observer.tree().unwrap().1), f.t, &()).unwrap();
+    f.a.take_changes();
+    f.observer = accept(f.observer, &recovery, f.t);
+    acknowledge(&mut f.a, &f.id, &recovery);
+    f.a = Agent::load_voice([11; 32], f.a.credential.clone(), f.a.durable.clone()).unwrap();
+    assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    let proposal = f.observer.propose_remove(&Ed25519Signer(key(200)), target).unwrap();
+    f.a.voice_pending(&server(), &f.id, f.observer.epoch(), &[proposal]).unwrap();
+    f.a.take_changes();
+    let remove = f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+    f.a.take_changes();
+    f.observer = accept(f.observer, &remove, f.t);
+    acknowledge(&mut f.a, &f.id, &remove);
+    assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()).unwrap().members.len(), 2);
+}
+
+fn voice_recovery_pending_state(replaced: bool, reload: bool) {
+    let (mut f, parent, mut c) = voice_fixture();
+    let target = f.observer.leaves().iter().find(|l| l.device_key == c.credential.device_key()).unwrap().index;
+    let old_leaf =
+        f.a.mls(&group_key(&server(), &f.id)).unwrap().public_group().leaf(LeafNodeIndex::new(target)).unwrap().clone();
+    let proposal = f.observer.propose_remove(&Ed25519Signer(key(200)), target).unwrap();
+    f.a.proposal(&server(), &f.id, &proposal).unwrap();
+    f.a.take_changes();
+    let pending = f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+    f.a.take_changes();
+    // A misses either the held device's legitimate same-index external rejoin
+    // or its ordinary self-update. Both change the authenticated fingerprint.
+    let winner = if replaced {
+        c.join_external(&server(), &f.info, Some(&f.observer.tree().unwrap().1), f.t, &()).unwrap()
+    } else {
+        c.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap()
+    };
+    c.take_changes();
+    f.observer = accept(f.observer, &winner, f.t);
+    acknowledge(&mut c, &f.id, &winner);
+    let current = c.mls(&group_key(&server(), &f.id)).unwrap();
+    assert_ne!(current.public_group().leaf(LeafNodeIndex::new(target)).unwrap(), &old_leaf);
+    assert_eq!(f.observer.leaves().iter().find(|l| l.device_key == c.credential.device_key()).unwrap().index, target);
+    assert_eq!(
+        f.a.reconcile(&server(), &f.id, Reconcile::Pruned { oldest: pending.epoch + 1 }).unwrap(),
+        Resolution::Rejoin
+    );
+    f.a.take_changes();
+    let reload_a = |a: &mut Agent| {
+        if reload {
+            *a = Agent::load_voice([11; 32], a.credential.clone(), a.durable.clone()).unwrap();
+        }
+    };
+    reload_a(&mut f.a);
+    let recovery =
+        f.a.join_external(&server(), &winner.group_info, Some(&f.observer.tree().unwrap().1), f.t, &()).unwrap();
+    f.a.take_changes();
+    reload_a(&mut f.a);
+    assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    f.observer = accept(f.observer, &recovery, f.t);
+    acknowledge(&mut f.a, &f.id, &recovery);
+    reload_a(&mut f.a);
+    f.a.pending(&server(), &f.id, false).unwrap();
+    f.a.take_changes();
+    reload_a(&mut f.a);
+    assert_eq!(
+        f.a.voice_keys(&server(), &f.id, &parent, f.t, &()),
+        Err(AgentError::Blocked),
+        "join acceptance and an unbound notification cannot reconcile removals"
+    );
+    // Even a subsequent accepted commit must not silently clear the barrier.
+    let update = f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+    f.a.take_changes();
+    f.observer = accept(f.observer, &update, f.t);
+    acknowledge(&mut f.a, &f.id, &update);
+    reload_a(&mut f.a);
+    assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    let proposals =
+        if replaced { vec![] } else { vec![f.observer.propose_remove(&Ed25519Signer(key(200)), target).unwrap()] };
+    // A delivered proposal is not a complete pending-state response.
+    for p in &proposals {
+        f.a.proposal(&server(), &f.id, p).unwrap();
+        f.a.take_changes();
+    }
+    reload_a(&mut f.a);
+    assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    f.a.voice_pending(&server(), &f.id, f.observer.epoch(), &proposals).unwrap();
+    f.a.take_changes();
+    reload_a(&mut f.a);
+    if replaced {
+        let keys = f.a.voice_keys(&server(), &f.id, &parent, f.t, &()).unwrap();
+        assert_eq!(keys.epoch, f.observer.epoch());
+        assert_eq!(keys.members.len(), 3);
+    } else {
+        assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+        // Neither an empty replay nor the notification API cancels a learned hold.
+        f.a.voice_pending(&server(), &f.id, f.observer.epoch(), &[]).unwrap();
+        f.a.take_changes();
+        f.a.pending(&server(), &f.id, false).unwrap();
+        f.a.take_changes();
+        reload_a(&mut f.a);
+        assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+        let remove = f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+        f.a.take_changes();
+        f.observer = accept(f.observer, &remove, f.t);
+        acknowledge(&mut f.a, &f.id, &remove);
+        reload_a(&mut f.a);
+        assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()).unwrap().members.len(), 2);
+    }
+}
+
+#[test]
+fn voice_recovery_missed_self_update_waits_for_pending_state() {
+    voice_recovery_pending_state(false, false);
+}
+#[test]
+fn voice_recovery_missed_self_update_waits_for_pending_state_after_reload() {
+    voice_recovery_pending_state(false, true);
+}
+#[test]
+fn voice_recovery_same_index_rejoin_waits_for_pending_state() {
+    voice_recovery_pending_state(true, false);
+}
+#[test]
+fn voice_recovery_same_index_rejoin_waits_for_pending_state_after_reload() {
+    voice_recovery_pending_state(true, true);
+}
+
+#[test]
+fn voice_pending_rejects_unaccepted_stale_and_partial_sync_after_reload() {
+    let (mut f, parent, _) = voice_fixture();
+    let recovery = f.a.join_external(&server(), &f.info, Some(&f.observer.tree().unwrap().1), f.t, &()).unwrap();
+    f.a.take_changes();
+    assert_eq!(f.a.voice_pending(&server(), &f.id, recovery.epoch + 1, &[]), Err(AgentError::Blocked));
+    assert!(f.a.take_changes().is_empty());
+    f.a = Agent::load_voice([11; 32], f.a.credential.clone(), f.a.durable.clone()).unwrap();
+    f.observer = accept(f.observer, &recovery, f.t);
+    acknowledge(&mut f.a, &f.id, &recovery);
+    let epoch = f.observer.epoch();
+    let target = f.observer.leaves().iter().find(|l| l.device_key == f.b.credential.device_key()).unwrap().index;
+    let proposal = f.observer.propose_remove(&Ed25519Signer(key(200)), target).unwrap();
+    for (head, proposals) in [(epoch - 1, vec![]), (epoch + 1, vec![]), (epoch, vec![proposal, vec![0]])] {
+        let before = f.a.durable.clone();
+        assert!(f.a.voice_pending(&server(), &f.id, head, &proposals).is_err());
+        assert!(f.a.take_changes().is_empty());
+        assert_eq!(f.a.durable, before);
+        f.a = Agent::load_voice([11; 32], f.a.credential.clone(), before).unwrap();
+        assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    }
+    // No partially processed proposal survived the failed atomic operation.
+    f.a.voice_pending(&server(), &f.id, epoch, &[]).unwrap();
+    f.a.take_changes();
+    assert!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()).is_ok());
+}
+
+#[test]
+fn voice_recovery_barrier_survives_a_removal_commit_without_complete_sync() {
+    let (mut f, parent, _) = voice_fixture();
+    let recovery = f.a.join_external(&server(), &f.info, Some(&f.observer.tree().unwrap().1), f.t, &()).unwrap();
+    f.a.take_changes();
+    f.observer = accept(f.observer, &recovery, f.t);
+    acknowledge(&mut f.a, &f.id, &recovery);
+    let target = f.observer.leaves().iter().find(|l| l.device_key == f.b.credential.device_key()).unwrap().index;
+    let proposal = f.observer.propose_remove(&Ed25519Signer(key(200)), target).unwrap();
+    f.a.proposal(&server(), &f.id, &proposal).unwrap();
+    f.a.take_changes();
+    let remove = f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+    f.a.take_changes();
+    assert_eq!(f.a.voice_pending(&server(), &f.id, f.observer.epoch(), &[]), Err(AgentError::Blocked));
+    f.a = Agent::load_voice([11; 32], f.a.credential.clone(), f.a.durable.clone()).unwrap();
+    f.observer = accept(f.observer, &remove, f.t);
+    acknowledge(&mut f.a, &f.id, &remove);
+    f.a = Agent::load_voice([11; 32], f.a.credential.clone(), f.a.durable.clone()).unwrap();
+    assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    f.a.voice_pending(&server(), &f.id, f.observer.epoch(), &[]).unwrap();
+    f.a.take_changes();
+    assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()).unwrap().members.len(), 2);
+}
+
+#[test]
+fn voice_own_pending_removal_blocks_export_but_chat_stays_available() {
+    let (mut f, parent, _) = voice_fixture();
+    let target = f.observer.leaves().iter().find(|l| l.device_key == f.b.credential.device_key()).unwrap().index;
+    let out = f.a.commit(&server(), &f.id, &[], &[target], f.t, &()).unwrap();
+    f.a.take_changes();
+    assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    f.observer = accept(f.observer, &out, f.t);
+    acknowledge(&mut f.a, &f.id, &out);
+    assert!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()).is_ok());
+    let mut chat = joined();
+    chat.a.commit(&server(), &chat.id, &[], &[1], chat.t, &()).unwrap();
+    chat.a.take_changes();
+    assert!(chat.a.sending_key(&server(), &chat.id, chat.t, &()).is_ok());
+}
+
+#[test]
+fn queued_parent_removal_blocks_voice_export_and_parent_removal_planning() {
+    let (f, mut parent, _) = voice_fixture();
+    let parent_id = fixed::<32>(
+        SignedDescriptor::parse(&f.a.group(&server(), &f.id).unwrap().descriptor)
+            .unwrap()
+            .descriptor
+            .channel_group_id
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    let group = parent.mls(&group_key(&server(), &parent_id)).unwrap();
+    let info = wire(group.export_group_info(parent.provider.crypto(), &parent.signer, true).unwrap()).unwrap();
+    // Channel observers may start from a current snapshot.
+    let mut observer = Observer::create(&info, &server()).unwrap();
+    let target = observer.leaves().iter().find(|l| l.device_key == f.b.credential.device_key()).unwrap().index;
+    let proposal = observer.propose_remove(&Ed25519Signer(key(200)), target).unwrap();
+    parent.proposal(&server(), &parent_id, &proposal).unwrap();
+    parent.take_changes();
+    assert!(!parent.group(&server(), &parent_id).unwrap().server_pending);
+    assert_eq!(f.a.voice_parent_removals(&server(), &f.id, &parent, true), Err(AgentError::Blocked));
+    assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    let remove = parent.commit(&server(), &parent_id, &[], &[], f.t, &()).unwrap();
+    parent.take_changes();
+    acknowledge(&mut parent, &parent_id, &remove);
+    assert_eq!(f.a.voice_parent_removals(&server(), &f.id, &parent, true).unwrap().len(), 1);
+}
+
+#[test]
+fn voice_external_join_rejects_another_members_epoch_zero_singleton() {
+    let f = channel_fixture(Kind::Voice);
+    let signed = SignedDescriptor::parse(&f.a.group(&server(), &f.id).unwrap().descriptor).unwrap();
+    // B copies A's authentic context, but signs a fresh epoch-zero singleton of B.
+    let config = MlsGroupCreateConfig::builder()
+        .ciphersuite(SUITE)
+        .capabilities(capabilities())
+        .wire_format_policy(PURE_PLAINTEXT_WIRE_FORMAT_POLICY)
+        .with_group_context_extensions(
+            f.a.mls(&group_key(&server(), &f.id)).unwrap().public_group().group_context().extensions().clone(),
+        )
+        .build();
+    let group = MlsGroup::new_with_group_id(
+        &f.b.provider,
+        &f.b.signer,
+        &config,
+        GroupId::from_slice(&signed.group_id()),
+        f.b.with_key(),
+    )
+    .unwrap();
+    let forged = wire(group.export_group_info(f.b.provider.crypto(), &f.b.signer, true).unwrap()).unwrap();
+    assert!(Observer::create(&forged, &server()).is_err());
+    let mut joiner = Agent::new_voice([31; 32], device(3, 31, f.t).credential, f.t).unwrap();
+    joiner.take_changes();
+    assert!(joiner.join_external(&server(), &forged, None, f.t, &()).is_err());
+    // separate_tree_join_updates_removal_and_behind covers valid later-epoch snapshots.
+}
+
+#[test]
+fn voice_rejects_add_chain_and_wrong_parent_binding() {
+    let t = now();
+    let parent = device(1, 11, t);
+    let other = device(2, 21, t);
+    let mut a = Agent::new_voice([11; 32], parent.credential.clone(), t).unwrap();
+    a.take_changes();
+    let mut d = descriptor(&a, &other, t, false, false).descriptor;
+    d.kind = Kind::Voice;
+    d.conversation = "voice:1".into();
+    d.channel_group_id = Some(b64(&[9; 32]));
+    let signed = SignedDescriptor::sign(d, a.credential.clone(), &a.signer.0);
+    let id = signed.group_id();
+    a.create(signed.clone()).unwrap();
+    a.take_changes();
+    a.settle(&server(), &id, Some(&id)).unwrap();
+    a.take_changes();
+    assert!(a.voice_keys(&server(), &id, &parent, t, &()).is_err());
+    let snapshot = a.durable.clone();
+    assert!(a.commit(&server(), &id, &[vec![0]], &[], t, &()).is_err());
+    a = Agent::load_voice([11; 32], parent.credential.clone(), snapshot).unwrap();
+    assert!(a.accept_chain(&server(), "voice:1", &[(id, signed.encode())]).is_err());
+    let mut d = signed.descriptor;
+    d.history = true;
+    assert!(Descriptor::parse(&d.statement()).is_none());
+    d.history = false;
+    d.incarnation = 1;
+    d.previous_group_id = Some(b64(&[3; 32]));
+    assert!(Descriptor::parse(&d.statement()).is_none());
 }

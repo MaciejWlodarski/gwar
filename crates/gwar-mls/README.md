@@ -207,6 +207,25 @@ proposals themselves continue blocking sends until the epoch advances.
 Commit creation refuses to proceed while the notification latch is set.
 Referenced proposals supplied with a logged commit are processed before it.
 
+Voice uses a separate volatile agent (`new_voice` / `load_voice`). Every external
+join, including snapshot recovery after a log gap, starts a fresh membership trust
+interval: old removal holds are discarded, but export remains blocked after join
+acceptance. Catch up through `mls.log.head`, then pass that head and the **complete**
+`mls.log.pending` set to `voice_pending(server, id, head, proposals)`, even when it
+is empty. This atomically validates/stores proposals and clears the recovery
+barrier only at the matching active epoch with no outstanding own commit. Persist
+its changes to the volatile checkpoint before export. Retry a stale response;
+individual proposal events, `pending(false)`, and later commits cannot clear this
+barrier. Reissued removals create new holds that survive competing commits and
+clear only on an observed removal or another reconciled external join.
+
+An authenticated leaf fingerprint change cannot prove a removal: an ordinary
+self-update changes it too. Pending-state reconciliation instead trusts the server
+to report every detached leaf, as uninterrupted participation already trusts
+server proposal delivery. It does not detect a server withholding removals. The
+existing server reissues them after each voice commit and includes the complete
+current set in every log response; no new wire message is needed.
+
 Feed authoritative log information to `reconcile`:
 
 | Result | Action |

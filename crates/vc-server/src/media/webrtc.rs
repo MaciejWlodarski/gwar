@@ -24,7 +24,7 @@ use str0m::{
 };
 use tokio::{net::UdpSocket, sync::mpsc, time::sleep_until};
 use tracing::{debug, info, warn};
-use vc_proto::{AUDIO_SLOTS, ErrorBody, ErrorCode, Event, Response, ServerFrame, SessionId};
+use vc_proto::{AUDIO_SLOTS, Event, ServerFrame, SessionId, VoiceTransportBinding};
 
 use vc_proto::rtp::{SLOT_GENERATION_ID, SlotGeneration, slot_generation_extension};
 
@@ -34,9 +34,10 @@ use crate::core::{CoreHandle, Outbound, OutboundTx, encode};
 pub enum MediaCmd {
     Offer {
         session: SessionId,
-        id: u32,
+        binding: VoiceTransportBinding,
         sdp: String,
         out: OutboundTx,
+        reply: tokio::sync::oneshot::Sender<Result<String, &'static str>>,
     },
     Remove {
         session: SessionId,
@@ -104,6 +105,8 @@ impl Slot {
 
 struct Peer {
     session: SessionId,
+    binding: VoiceTransportBinding,
+    core: CoreHandle,
     rtc: Rtc,
     out: OutboundTx,
     mic: Option<Mid>,
@@ -132,13 +135,13 @@ impl Peer {
             })
             .collect();
         for slot in freed {
-            self.notify(Event::VoiceSlot { slot, client: None });
+            self.notify(Event::VoiceSlot { binding: self.binding.clone(), slot, client: None });
         }
     }
 
     /// Writes one frame from `from` into a receive slot, assigning one if needed.
     fn forward(&mut self, packet: &AudioPacket, now: Instant) {
-        if packet.is_end() {
+        if !self.core.voice_binding_matches(self.session, &self.binding) || packet.is_end() {
             return;
         }
         let index = match self.slots.iter().position(|s| s.source == Some(packet.from)) {
@@ -153,7 +156,11 @@ impl Peer {
                     .map(|(i, _)| i);
                 let Some(i) = candidate else { return };
                 self.slots[i].assign(packet.from);
-                self.notify(Event::VoiceSlot { slot: i as u32, client: Some(packet.from) });
+                self.notify(Event::VoiceSlot {
+                    binding: self.binding.clone(),
+                    slot: i as u32,
+                    client: Some(packet.from),
+                });
                 i
             }
         };
@@ -242,7 +249,7 @@ pub async fn run(
         for peer in peers.values_mut() {
             if peer.talking && now.duration_since(peer.last_voice) > HANGOVER {
                 peer.talking = false;
-                core.talking(peer.session, false);
+                core.talking_bound(peer.session, false, &peer.binding);
                 // Other transports (TeamSpeak) end the talk state explicitly.
                 let end = AudioPacket::end_of_speech(peer.session);
                 uplinks.send(peer.session, &end);
@@ -252,17 +259,14 @@ pub async fn run(
 
         tokio::select! {
             command = commands.recv() => match command {
-                Some(MediaCmd::Offer { session, id, sdp, out }) => {
+                Some(MediaCmd::Offer { session, binding, sdp, out, reply }) => {
+                    if reply.is_closed() || !core.voice_binding_matches(session, &binding) {
+                        continue;
+                    }
                     close_peer(&mut peers, session, &core, None);
-                    match accept(session, &sdp, advertise, out.clone()) {
-                        Ok((peer, answer)) => {
-                            peers.insert(session, peer);
-                            let _ = out.try_send(Outbound::Frame(encode(&ServerFrame::Ok { re: id, ok: Response::Answer { sdp: answer } })));
-                        }
-                        Err(message) => {
-                            let err = ErrorBody::new(ErrorCode::BadRequest, message);
-                            let _ = out.try_send(Outbound::Frame(encode(&ServerFrame::Err { re: id, err })));
-                        }
+                    match accept(session, binding, core.clone(), &sdp, advertise, out) {
+                        Ok((peer, answer)) => {peers.insert(session, peer); let _ = reply.send(Ok(answer));}
+                        Err(message) => {let _ = reply.send(Err(message));}
                     }
                 }
                 Some(MediaCmd::Remove { session }) => close_peer(&mut peers, session, &core, None),
@@ -312,6 +316,8 @@ fn deliver_local(peers: &mut HashMap<SessionId, Peer>, routing: &super::Routing,
 
 fn accept(
     session: SessionId,
+    binding: VoiceTransportBinding,
+    core: CoreHandle,
     sdp: &str,
     advertise: SocketAddr,
     out: OutboundTx,
@@ -329,6 +335,8 @@ fn accept(
     let answer = rtc.sdp_api().accept_offer(offer).map_err(|_| "offer not acceptable")?;
     let peer = Peer {
         session,
+        binding,
+        core,
         rtc,
         out,
         mic: None,
@@ -345,14 +353,7 @@ fn accept(
 fn close_peer(peers: &mut HashMap<SessionId, Peer>, session: SessionId, core: &CoreHandle, reason: Option<&str>) {
     let Some(mut peer) = peers.remove(&session) else { return };
     peer.rtc.disconnect();
-    if let Some(reason) = reason {
-        peer.notify(Event::VoiceClosed { reason: reason.into() });
-    }
-    if peer.connected {
-        core.voice(session, false);
-    } else if peer.talking {
-        core.talking(session, false);
-    }
+    core.voice_bound(session, false, &peer.binding, reason.is_some());
     for other in peers.values_mut() {
         other.release_source(session);
     }
@@ -387,7 +388,7 @@ fn drive(
             Output::Event(event) => match event {
                 RtcEvent::Connected => {
                     peer.connected = true;
-                    core.voice(peer.session, true);
+                    core.voice_bound(peer.session, true, &peer.binding, false);
                 }
                 RtcEvent::IceConnectionStateChange(IceConnectionState::Disconnected) => peer.rtc.disconnect(),
                 RtcEvent::MediaAdded(added) if added.kind == MediaKind::Audio => {
@@ -420,6 +421,9 @@ fn drive(
 
 /// Applies the speech gate to one microphone frame.
 fn ingest(peer: &mut Peer, data: &RtpPacket, routing: &SharedRouting, core: &CoreHandle) -> Option<AudioPacket> {
+    if !core.voice_binding_matches(peer.session, &peer.binding) || !routing.load().members.contains_key(&peer.session) {
+        return None;
+    }
     let mid = peer.rtc.direct_api().stream_rx(&data.header.ssrc)?.mid();
     if Some(mid) != peer.mic {
         return None;
@@ -449,7 +453,7 @@ fn ingest(peer: &mut Peer, data: &RtpPacket, routing: &SharedRouting, core: &Cor
     if !routing.load().can_speak(peer.session) {
         if peer.talking {
             peer.talking = false;
-            core.talking(peer.session, false);
+            core.talking_bound(peer.session, false, &peer.binding);
         }
         return None;
     }
@@ -457,7 +461,7 @@ fn ingest(peer: &mut Peer, data: &RtpPacket, routing: &SharedRouting, core: &Cor
         peer.last_voice = now;
         if !peer.talking {
             peer.talking = true;
-            core.talking(peer.session, true);
+            core.talking_bound(peer.session, true, &peer.binding);
         }
     }
     if !peer.talking {

@@ -60,7 +60,7 @@ describe("framing", () => {
       re: 3,
       err: { code: "forbidden", message: "no" },
     });
-    expect(parseFrame('{"ev":"voice.talking","d":{"client":2,"talking":true}}')).toMatchObject({ kind: "event" });
+    expect(parseFrame('{"ev":"voice.talking","d":{"call":"AAAAAAAAAAAAAAAAAAAAAA","participation":"AQEBAQEBAQEBAQEBAQEBAQ","run":1,"client":2,"talking":true}}')).toMatchObject({ kind: "event" });
     expect(parseFrame("nope")).toBeNull();
     expect(parseFrame('{"x":1}')).toBeNull();
   });
@@ -236,9 +236,9 @@ describe("requests", () => {
     const s = await handshake(conn);
     const seen: number[] = [];
     const off = conn.on("voice.talking", (d) => seen.push(d.client));
-    s.push({ ev: "voice.talking", d: { client: 4, talking: true } });
+    s.push({ ev: "voice.talking", d: { call: "AAAAAAAAAAAAAAAAAAAAAA", participation: "AQEBAQEBAQEBAQEBAQEBAQ", run: 1, client: 4, talking: true } });
     off();
-    s.push({ ev: "voice.talking", d: { client: 5, talking: true } });
+    s.push({ ev: "voice.talking", d: { call: "AAAAAAAAAAAAAAAAAAAAAA", participation: "AQEBAQEBAQEBAQEBAQEBAQ", run: 1, client: 5, talking: true } });
     expect(seen).toEqual([4]);
   });
 });

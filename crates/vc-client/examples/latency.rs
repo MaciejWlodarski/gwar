@@ -528,10 +528,10 @@ async fn run(
     let mut voice_events = Vec::new();
     while let Ok(event) = b.events.try_recv() {
         match event {
-            vc_proto::Event::VoiceSlot { slot, client } => voice_events.push(
+            vc_proto::Event::VoiceSlot { slot, client, .. } => voice_events.push(
                 serde_json::json!({"type":"slot","slot":slot,"speaker_is_sender":client==Some(a.welcome.session)}),
             ),
-            vc_proto::Event::VoiceTalking { client, talking } => voice_events.push(
+            vc_proto::Event::VoiceTalking { client, talking, .. } => voice_events.push(
                 serde_json::json!({"type":"talking","speaker_is_sender":client==a.welcome.session,"talking":talking}),
             ),
             _ => {}

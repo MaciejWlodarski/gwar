@@ -166,18 +166,20 @@ function AudioTab() {
     let cancelled = false;
     let stop: (() => void) | undefined;
     engine
-      .startMicTest(setTestLevel)
+      .startMicTest((level) => { if (!cancelled) setTestLevel(level); })
       .then((fn) => {
         if (cancelled) fn();
         else stop = fn;
       })
       .catch((e: unknown) => {
+        if (cancelled) return;
         setTestError(e instanceof VoiceError ? describeVoiceError(e) : String(e));
         setTesting(false);
       });
     return () => {
       cancelled = true;
       stop?.();
+      setTestLevel(0);
     };
   }, [engine, testing, audio.inputDeviceId, audio.noiseSuppression, audio.echoCancellation, audio.autoGainControl]);
 

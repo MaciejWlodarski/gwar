@@ -139,6 +139,14 @@ impl Observer {
         let (storage, group) = verified_group_info(group_info)?;
         let observer = Self::from_parts(storage, group, server_key)?;
         observer.check_tree()?;
+        if observer.descriptor.descriptor.kind == crate::Kind::Voice && observer.epoch() != 0 {
+            return Err(Invalid("voice creator"));
+        }
+        crate::rules::voice_initial_tree(
+            &observer.descriptor,
+            observer.epoch(),
+            observer.group.treesync().full_leaves().map(|(_, leaf)| leaf),
+        )?;
         Ok(observer)
     }
 
@@ -199,6 +207,15 @@ impl Observer {
                 .expect("checked on every commit");
                 Leaf { index: m.index.u32(), device_key: credential.device_key().to_owned(), uid: credential.uid() }
             })
+            .collect()
+    }
+
+    /// Current credentials are a live admission/sending gate, never a historical commit rule.
+    pub fn credentials(&self) -> Vec<(u32, Credential)> {
+        self.group
+            .treesync()
+            .full_leaves()
+            .map(|(i, l)| (i.u32(), leaf_credential(l).expect("validated leaf")))
             .collect()
     }
 

@@ -65,10 +65,15 @@ const fixed = (bytes: number): Rule<string> => (v): v is string => {
   if (typeof v !== "string" || v.length !== Math.ceil(bytes * 4 / 3)) return false;
   try { decodeFixed(v, bytes); return true; } catch { return false; }
 };
+const voiceFields = { call: fixed(16), participation: fixed(16), run: nullable(int(Number.MAX_SAFE_INTEGER, 1)) };
+const transportFields = { ...voiceFields, run: int(Number.MAX_SAFE_INTEGER, 1) };
+const voiceBinding = shape(voiceFields);
+const voiceStateShape = shape<import("../proto/VoiceState").VoiceState>({ channel: int(4294967295), call: fixed(16), participation: fixed(16), encrypted: bool, channel_group: nullable(fixed(32)), group: nullable(fixed(32)), epoch: nullable(id) });
+const voiceState: Rule<import("../proto/VoiceState").VoiceState> = (v): v is import("../proto/VoiceState").VoiceState => voiceStateShape(v) && (v.encrypted ? v.channel_group !== null && ((v.group === null) === (v.epoch === null)) : v.channel_group === null && v.group === null && v.epoch === null);
 const challenge = shape<Challenge>({ protocol: int(255), server_pk: fixed(32), server_nonce: fixed(32), server, password_required: bool });
 const serverProof = shape<ServerProof>({ server_proof: fixed(64) });
 const channel = shape<Channel>({ id, parent: nullable(id), name: str(256), topic: text, position: int(2147483647, -2147483648), has_password: bool, max_clients: nullable(int(65535)), encrypted: bool, history: bool });
-const client = shape<Client>({ id, uid, nickname: str(256), channel: nullable(id), groups: ids, platform, muted: bool, deafened: bool, away: nullable(text), talking: bool, voice: bool });
+const client = shape<Client>({ id, uid, nickname: str(256), channel: nullable(id), groups: ids, platform, muted: bool, deafened: bool, away: nullable(text), talking: bool, voice: bool, voice_binding: nullable(voiceBinding) });
 const color: Rule<string> = (v): v is string => typeof v === "string" && /^#[0-9a-f]{6}$/i.test(v);
 const group = shape<Group>({ id, name: str(256), permissions: array(permissions, 32), color: optional(nullable(color)) });
 const attestation = shape<HandleAttestation>({ account_key: str(128), handle: str(64), issued_at: id, expires_at: id, signature: str(128) });
@@ -122,8 +127,11 @@ export const events: { [K in EventName]: Rule<EventData<K>> } = {
   "client.left": shape({ client: id, reason: leave }), "chat.message": message, "chat.edited": message,
   "chat.deleted": shape({ channel: id, message: id }), "group.created": group, "group.updated": group,
   "group.deleted": shape({ group: id }), "member.updated": member, "member.removed": shape({ uid }),
-  "voice.talking": shape({ client: id, talking: bool }), "voice.slot": shape({ slot: int(7), client: nullable(id) }),
-  "voice.closed": shape({ reason: text }), "chat.read": (v): v is EventData<"chat.read"> => shape({ channel: id, message: id })(v) || shape({ conversation, message: id })(v), "disconnected": shape({ reason: leave }),
+  "voice.talking": shape({ ...voiceFields, client: int(4294967295), talking: bool }), "voice.slot": shape({ ...transportFields, slot: int(7), client: nullable(int(4294967295)) }),
+  "voice.state": shape({ voice: nullable(voiceState) }),
+  "voice.epoch.ack": shape({call:fixed(16),group:fixed(32),epoch:id,device:fixed(32)}),
+  "voice.epoch.request": shape({call:fixed(16),group:fixed(32),epoch:id}),
+  "voice.closed": shape({ ...voiceFields, reason: literal(["transport_failed", "channel_restarted", "channel_deleted", "epoch_exhausted", "stream_limit", "state_limit"]) }), "chat.read": (v): v is EventData<"chat.read"> => shape({ channel: id, message: id })(v) || shape({ conversation, message: id })(v), "disconnected": shape({ reason: leave }),
 };
 export const responses: { [K in Op]: Rule<ResponseMap[K]> } = {
   "mls.device.publish": empty, "mls.key_packages.publish": shape({ count: int(20) }),
@@ -153,7 +161,9 @@ export const responses: { [K in Op]: Rule<ResponseMap[K]> } = {
   "member.prune": shape({ uids: array(uid, 500), count: int(4294967295), members: array(member, 500) }),
   "ban.create": shape({ ban }), "ban.list": shape({ bans: array(ban, 4096) }), "ban.delete": empty,
   "invite.create": shape({ invite }), "invite.list": shape({ invites: array(invite, 4096) }), "invite.delete": empty,
-  "voice.offer": shape({ sdp: str(65536) }),
+  "voice.offer": shape({ ...transportFields, sdp: str(65536) }),
+  "voice.state": shape({voice:nullable(voiceState)}),
+  "voice.epoch.ack": empty, "voice.epoch.repeat": empty,
 };
 export const responseFor = (op: Op, value: unknown): boolean => responses[op](value);
 export const anyResponse = (value: unknown): boolean => Object.values(responses).some((rule) => rule(value));

@@ -1,4 +1,4 @@
-import type { IceServer } from "../proto/IceServer";
+import { nextMediaRun } from "./engine";
 import { AUDIO_SLOTS } from "../net/protocol";
 import { tauri, type TauriBridge, type Unlisten } from "../platform";
 import {
@@ -7,7 +7,6 @@ import {
   type CaptureOptions,
   type DeviceList,
   type InputMode,
-  type OfferFn,
   type VoiceEngine,
   type VoiceEvents,
   type VoiceState,
@@ -20,6 +19,7 @@ const DEVICE_POLL_MS = 4_000;
 
 /** `voice://issue`: a device problem reported by the Rust engine. */
 interface IssuePayload {
+  owner: number;
   side: "input" | "output";
   kind: "no_device" | "permission_denied" | "failed";
   message: string;
@@ -29,19 +29,12 @@ export function micErrorKind(kind: IssuePayload["kind"]): "no_mic" | "mic_denied
   return kind === "no_device" ? "no_mic" : kind === "permission_denied" ? "mic_denied" : "mic_failed";
 }
 
-/** Run ids make stale events from a superseded session harmless. */
-let runCounter = 0;
-
 /** dBFS (RMS) -> 0..1 over a 60 dB range, same shaping as the browser meter. */
 export function dbToLevel(db: number): number {
   return Math.min(1, Math.max(0, (db + 60) / 60));
 }
 
-interface StartParams {
-  offer: OfferFn;
-  iceServers: IceServer[];
-  serverHost?: string;
-}
+type StartParams = Parameters<VoiceEngine["start"]>[0];
 
 /**
  * Desktop voice engine. Audio, Opus and WebRTC live in Rust (`vc-client`);
@@ -53,10 +46,12 @@ export class NativeVoiceEngine implements VoiceEngine {
   readonly capabilities: VoiceEngine["capabilities"] = { outputDeviceSelection: true, captureProcessing: false };
 
   private handlers = new Map<string, Set<Handler>>();
-  private api: TauriBridge | null = null;
+  // Bootstrap once per engine: a fresh view retires native audio left by the
+  // previous view. Never acquire another token after this owner is superseded.
+  private readonly ready = tauri().then(async (api) => ({ api, owner: await api.invoke<number>("voice_bootstrap") }));
   private listening: Promise<void> | null = null;
   private unlisten: Unlisten[] = [];
-  private queue: Promise<unknown> = Promise.resolve();
+  private queue: Promise<void> = Promise.resolve();
 
   private runId = 0;
   private params: StartParams | null = null;
@@ -66,12 +61,17 @@ export class NativeVoiceEngine implements VoiceEngine {
   private lastDevices = "";
   private restartTimer: ReturnType<typeof setTimeout> | null = null;
   private smoothed = 0;
+  private micTestId = 0;
 
   private inputDevice: string | null = null;
   private outputDevice: string | null = null;
   private userVolumes = new Map<string, number>();
   private slotOwners: Array<string | null> = Array.from({ length: AUDIO_SLOTS }, () => null);
   private sentGain: Array<number | null> = Array.from({ length: AUDIO_SLOTS }, () => null);
+
+  constructor() {
+    void this.ready.catch((e: unknown) => console.warn("[native voice] bootstrap failed:", e));
+  }
 
   // ---------------------------------------------------------------- events
 
@@ -94,21 +94,26 @@ export class NativeVoiceEngine implements VoiceEngine {
 
   // ------------------------------------------------------------------ plumbing
 
-  /** Fire-and-forget command; commands run in the order they were issued. */
-  private send(command: string, args?: Record<string, unknown>): void {
+  private async invoke<T = void>(command: string, args?: Record<string, unknown>): Promise<T> {
+    const { api, owner } = await this.ready;
+    return api.invoke<T>(command, { ...args, owner });
+  }
+
+  /** Commands run in issue order after the one-time ownership bootstrap. */
+  private send(command: string, args?: Record<string, unknown>): Promise<void> {
     this.queue = this.queue
-      .then(async () => (this.api ??= await tauri()).invoke(command, args))
+      .then(() => this.invoke(command, args))
       .catch((e: unknown) => console.warn(`[native voice] ${command} failed:`, e));
+    return this.queue;
   }
 
   private async ensureListeners(): Promise<TauriBridge> {
-    this.api ??= await tauri();
-    const api = this.api;
+    const { api, owner } = await this.ready;
     this.listening ??= (async () => {
       this.unlisten.push(
-        await api.listen<{ run: number; sdp: string }>("voice://offer", (p) => void this.onOffer(p.run, p.sdp)),
-        await api.listen<{ run: number; state: "connected" | "failed" }>("voice://state", (p) => {
-          if (p.run !== this.runId) return;
+        await api.listen<{ owner: number; run: number; sdp: string }>("voice://offer", (p) => { if (p.owner === owner) void this.onOffer(p.run, p.sdp); }),
+        await api.listen<{ owner: number; run: number; state: "connected" | "failed" }>("voice://state", (p) => {
+          if (p.owner !== owner || p.run !== this.runId) return;
           if (p.state === "connected") {
             this.clearConnectTimer();
             this.setState("connected");
@@ -116,11 +121,12 @@ export class NativeVoiceEngine implements VoiceEngine {
             this.setState("failed");
           }
         }),
-        await api.listen<{ db: number; transmitting: boolean }>("voice://level", (p) => {
-          if (this.state === "idle") return;
+        await api.listen<{ owner: number; db: number; transmitting: boolean }>("voice://level", (p) => {
+          if (p.owner !== owner || this.state === "idle") return;
           this.emit("level", this.shape(dbToLevel(p.db)));
         }),
         await api.listen<IssuePayload>("voice://issue", (p) => {
+          if (p.owner !== owner) return;
           if (p.side === "input") {
             this.emit("micError", new VoiceError(micErrorKind(p.kind), p.message));
           } else {
@@ -143,7 +149,7 @@ export class NativeVoiceEngine implements VoiceEngine {
     const params = this.params;
     if (run !== this.runId || !params) return;
     try {
-      const answer = await params.offer(sdp);
+      const answer = await params.offer(sdp, run);
       this.send("voice_answer", { run, sdp: answer });
     } catch (e) {
       this.send("voice_answer", { run, error: e instanceof Error ? e.message : String(e) });
@@ -158,17 +164,18 @@ export class NativeVoiceEngine implements VoiceEngine {
   // ------------------------------------------------------------- lifecycle
 
   async start(params: StartParams): Promise<void> {
-    const run = (this.runId = ++runCounter);
+    if (params.mode !== "plaintext") throw new VoiceError("unsupported", "Encrypted voice is being added. Chat is available.");
+    const run = (this.runId = nextMediaRun());
     this.params = params;
     this.clearConnectTimer();
     this.setState("starting");
     this.emit("micError", null);
     this.emit("outputError", null);
-    const api = await this.ensureListeners();
+    await this.ensureListeners();
     if (run !== this.runId) return;
     this.sentGain.fill(null);
     try {
-      await api.invoke("voice_start", { run, serverHost: params.serverHost ?? "" });
+      await this.invoke("voice_start", { run, serverHost: params.serverHost ?? "", mode: params.mode, binding: params.binding });
     } catch (e) {
       if (run !== this.runId) return;
       this.setState("failed");
@@ -186,7 +193,8 @@ export class NativeVoiceEngine implements VoiceEngine {
   }
 
   async stop(): Promise<void> {
-    this.runId = ++runCounter;
+    const stoppedRun = this.runId;
+    this.runId = nextMediaRun();
     this.params = null;
     this.clearConnectTimer();
     if (this.restartTimer) clearTimeout(this.restartTimer);
@@ -195,7 +203,7 @@ export class NativeVoiceEngine implements VoiceEngine {
     this.smoothed = 0;
     this.emit("level", 0);
     this.setState("idle");
-    this.send("voice_stop");
+    await this.send("voice_stop", { run: stoppedRun });
   }
 
   /** Re-opens the audio devices (and renegotiates), e.g. after plugging in a microphone. */
@@ -291,7 +299,7 @@ export class NativeVoiceEngine implements VoiceEngine {
 
   async listDevices(): Promise<DeviceList> {
     try {
-      const api = (this.api ??= await tauri());
+      const { api } = await this.ready;
       const d = await api.invoke<{ inputs: string[]; outputs: string[] }>("audio_devices");
       const map = (names: string[]): AudioDevice[] => names.map((n) => ({ id: n, label: n }));
       return { inputs: map(d.inputs), outputs: map(d.outputs) };
@@ -320,15 +328,23 @@ export class NativeVoiceEngine implements VoiceEngine {
   }
 
   async startMicTest(onLevel: (level: number) => void): Promise<() => void> {
+    const test = ++this.micTestId;
     const api = await this.ensureListeners();
+    const { owner } = await this.ready;
     let smooth = 0;
-    const off = await api.listen<{ db: number }>("voice://test-level", (p) => {
+    const off = await api.listen<{ owner: number; db: number }>("voice://test-level", (p) => {
+      if (p.owner !== owner || test !== this.micTestId) return;
       const target = dbToLevel(p.db);
       smooth = target > smooth ? target : smooth * 0.8 + target * 0.2;
       onLevel(smooth < 0.01 ? 0 : smooth);
     });
+    // Listener setup can finish after a newer test has already opened capture.
+    if (test !== this.micTestId) {
+      off();
+      return () => {};
+    }
     try {
-      await api.invoke("mic_test_start", { input: this.inputDevice });
+      await this.invoke("mic_test_start", { input: this.inputDevice });
     } catch (e) {
       off();
       throw new VoiceError("mic_failed", typeof e === "string" ? e : String(e));
@@ -336,6 +352,9 @@ export class NativeVoiceEngine implements VoiceEngine {
     void this.listDevices().then((d) => this.emit("devices", d));
     return () => {
       off();
+      // A late result belongs to its own test, never the replacement's capture.
+      if (test !== this.micTestId) return;
+      ++this.micTestId;
       this.send("mic_test_stop");
       onLevel(0);
     };

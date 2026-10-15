@@ -128,6 +128,15 @@ impl Ws {
         }
     }
 
+    async fn offer(&mut self, sdp: String) -> Value {
+        let voice = self.request("voice.state", json!({})).await["voice"].clone();
+        let ssrc: u32 = sdp
+            .lines()
+            .find_map(|l| l.strip_prefix("a=ssrc:").and_then(|s| s.split_whitespace().next()?.parse().ok()))
+            .unwrap();
+        self.request("voice.offer",json!({"channel":voice["channel"],"call":voice["call"],"participation":voice["participation"],"run":self.next_id,"group":null,"ssrc":ssrc,"sdp":sdp})).await
+    }
+
     async fn event(&mut self, matches: impl Fn(&Value) -> bool) -> Value {
         if let Some(i) = self.events.iter().position(&matches) {
             return self.events.remove(i).unwrap();
@@ -178,7 +187,7 @@ async fn rtc_client(ws: &mut Ws) -> RtcClient {
     let slots: Vec<Mid> =
         (0..AUDIO_SLOTS).map(|_| api.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None)).collect();
     let (offer, pending) = api.apply().unwrap();
-    let answer = ws.request("voice.offer", json!({"sdp": offer.to_sdp_string()})).await;
+    let answer = ws.offer(offer.to_sdp_string()).await;
     let answer = SdpAnswer::from_sdp_string(answer["sdp"].as_str().unwrap()).unwrap();
     rtc.sdp_api().accept_answer(pending, answer).unwrap();
 
@@ -299,10 +308,14 @@ async fn opus_is_forwarded_unchanged_within_channel_only() {
     speak(&a, 10, 10, -20).await;
     assert!(drain(&mut b, 200).await.is_empty(), "audio crossed channels");
 
-    // Back together: audio flows again.
+    // Returning cannot revive the old participation's peer. A fresh run is required.
     bob.request("channel.join", json!({"channel": 1})).await;
     speak(&a, 11, 10, -20).await;
-    assert!(drain(&mut b, 300).await.iter().any(|(_, p, _, _)| p[1] == 11));
+    assert!(drain(&mut b, 200).await.is_empty(), "old peer revived after re-entry");
+    b = rtc_client(&mut bob).await;
+    timeout(WAIT, b.connected.recv()).await.expect("bob re-entry ICE/DTLS");
+    speak(&a, 12, 10, -20).await;
+    assert!(drain(&mut b, 300).await.iter().any(|(_, p, _, _)| p[1] == 12));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -382,7 +395,7 @@ async fn advertised_media_port_can_differ_from_bound_port() {
     let mut api = rtc.sdp_api();
     api.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
     let (offer, _) = api.apply().unwrap();
-    let answer = ws.request("voice.offer", json!({"sdp": offer.to_sdp_string()})).await;
+    let answer = ws.offer(offer.to_sdp_string()).await;
     let candidates: Vec<_> =
         answer["sdp"].as_str().unwrap().lines().filter(|line| line.starts_with("a=candidate:")).collect();
     assert!(!candidates.is_empty());

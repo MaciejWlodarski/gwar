@@ -18,7 +18,7 @@ async fn every_session_uses_the_stored_member_name() {
     let server = TestServer::start_with(|c| c.database = Some(path.clone())).await;
     let key = new_key();
     let first = Client::connect_as(&server, key.clone(), "  Alice  ", None).await.unwrap();
-    let second = Client::connect_as(&server, key.clone(), "Web name", None).await.unwrap();
+    let second = Client::connect_account(&server, &key, "Web name").await.unwrap();
     assert_eq!(first.welcome.uid, second.welcome.uid);
     let sessions: Vec<_> = second.welcome.clients.iter().filter(|c| c.uid == first.welcome.uid).collect();
     assert_eq!(sessions.len(), 2);
@@ -35,7 +35,7 @@ async fn renaming_self_updates_all_sessions_and_current_chat_names() {
     let server = TestServer::start().await;
     let key = new_key();
     let mut laptop = Client::connect_as(&server, key.clone(), "Alice", None).await.unwrap();
-    let mut phone = Client::connect_as(&server, key.clone(), "Other", None).await.unwrap();
+    let mut phone = Client::connect_account(&server, &key, "Other").await.unwrap();
     let mut observer = Client::connect(&server, "Bob").await;
     let uid = laptop.welcome.uid.clone();
     let channel = laptop.default_channel();

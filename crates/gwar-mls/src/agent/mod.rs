@@ -3,7 +3,9 @@
 
 pub mod epoch_number;
 mod storage;
+mod voice;
 pub use storage::{Change, Changes, Store, Stores};
+pub use voice::{VoiceKey, VoiceKeys, voice_kid};
 
 use crate::crypto::Provider;
 use crate::{
@@ -170,6 +172,12 @@ pub struct GroupRecord {
     pub checkpoint: Option<Checkpoint>,
     pub welcome_ids: BTreeSet<String>,
     pub server_pending: bool,
+    /// Voice-only holds survive proposal-queue clearing on competing commits.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    voice_removals: BTreeSet<u32>,
+    /// A joined voice snapshot needs the current epoch's complete pending set.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    voice_needs_sync: bool,
     /// For every uid, the epochs in which it had a leaf, as this device saw
     /// them: sorted, disjoint, non-adjacent inclusive ranges.
     pub evidence: BTreeMap<String, Vec<Interval>>,
@@ -324,9 +332,18 @@ pub struct Agent {
     durable: Stores,
     ready: bool,
     poisoned: bool,
+    voice_only: bool,
 }
 
 impl Agent {
+    /// A separate provider for a call. Its changes/outbox belong only in memory,
+    /// under the same device lease as the durable chat agent.
+    pub fn new_voice(seed: [u8; 32], credential: Credential, now: i64) -> Result<Self> {
+        let mut agent = Self::new(seed, credential, now)?;
+        agent.voice_only = true;
+        Ok(agent)
+    }
+
     pub fn new(seed: [u8; 32], credential: Credential, now: i64) -> Result<Self> {
         let signer = Self::signer(seed, &credential)?;
         if !(1..=vc_proto::MAX_SAFE_INTEGER).contains(&now) {
@@ -352,6 +369,7 @@ impl Agent {
             durable: Stores::default(),
             ready: true,
             poisoned: false,
+            voice_only: false,
         })
     }
 
@@ -366,6 +384,14 @@ impl Agent {
     }
 
     pub fn load(seed: [u8; 32], credential: Credential, stores: Stores) -> Result<Self> {
+        Self::load_store(seed, credential, stores, false)
+    }
+    /// Reload only the call's volatile checkpoint after a rejected operation.
+    /// A process/worker restart must discard it and rejoin, never restore it.
+    pub fn load_voice(seed: [u8; 32], credential: Credential, stores: Stores) -> Result<Self> {
+        Self::load_store(seed, credential, stores, true)
+    }
+    fn load_store(seed: [u8; 32], credential: Credential, stores: Stores, voice_only: bool) -> Result<Self> {
         let signer = Self::signer(seed, &credential)?;
         let device: DeviceRecord =
             parse(stores.groups.get(b"@device".as_slice()).ok_or(Invalid("missing device record"))?)?;
@@ -397,6 +423,7 @@ impl Agent {
             durable: stores,
             ready: false,
             poisoned: false,
+            voice_only,
         };
         for key in agent.epochs.keys() {
             let (group, epoch) = key.rsplit_once('/').ok_or(Invalid("epoch key"))?;
@@ -415,6 +442,9 @@ impl Agent {
         }
         for (key, record) in &agent.groups {
             let descriptor = SignedDescriptor::parse(&record.descriptor).ok_or(Invalid("stored descriptor"))?;
+            if (descriptor.descriptor.kind == crate::Kind::Voice) != voice_only {
+                return Err(Invalid("agent store kind"));
+            }
             if *key != group_key(&descriptor.descriptor.server_key, &descriptor.group_id()) {
                 return Err(Invalid("group key"));
             }
@@ -541,6 +571,9 @@ impl Agent {
         Ok(Lifetime::init(start, end))
     }
     pub fn key_packages(&mut self, n: usize, now: i64) -> Result<Vec<Vec<u8>>> {
+        if self.voice_only {
+            return Err(Invalid("voice has no key packages"));
+        }
         self.operation(|a| {
             if n > 20 {
                 return Err(Invalid("key package count"));
@@ -549,6 +582,9 @@ impl Agent {
         })
     }
     pub fn last_resort_key_package(&mut self, now: i64) -> Result<Vec<u8>> {
+        if self.voice_only {
+            return Err(Invalid("voice has no key packages"));
+        }
         self.operation(|a| a.package(now, true))
     }
     fn package(&self, now: i64, last_resort: bool) -> Result<Vec<u8>> {
@@ -705,6 +741,8 @@ impl Agent {
             checkpoint: None,
             welcome_ids: BTreeSet::new(),
             server_pending: false,
+            voice_removals: BTreeSet::new(),
+            voice_needs_sync: false,
             evidence: BTreeMap::new(),
             own_commit_at: None,
         });
@@ -715,6 +753,13 @@ impl Agent {
     fn derived(&mut self, key: &str, group: &MlsGroup) -> Result<()> {
         let context = group.public_group().group_context();
         self.fresh(key, context)?;
+        if self.voice_only {
+            let record = self.groups.get_mut(key).ok_or(Invalid("group record"))?;
+            record.status = Status::Active;
+            record.checkpoint = Some(checkpoint(context)?);
+            record.server_pending = false;
+            return Ok(());
+        }
         let exported = group
             .export_secret(self.provider.crypto(), "gwar chat v1", group.group_id().as_slice(), 32)
             .map_err(err("exporter"))?;
@@ -739,6 +784,9 @@ impl Agent {
                 return Err(Invalid("creator"));
             }
             let d = &descriptor.descriptor;
+            if (d.kind == crate::Kind::Voice) != a.voice_only {
+                return Err(Invalid("agent store kind"));
+            }
             if d.incarnation == 0 {
                 a.check_pin(&descriptor)?;
             } else {
@@ -837,7 +885,7 @@ impl Agent {
         let record = self.groups.get(&key).ok_or(Invalid("unknown group"))?;
         let mut gate = Gate {
             blocked: Vec::new(),
-            server_pending: record.server_pending,
+            server_pending: record.server_pending || record.voice_needs_sync || !record.voice_removals.is_empty(),
             pending_commit: self.outbox.contains_key(&key),
             rejoin: false,
             status: record.status,
@@ -868,6 +916,9 @@ impl Agent {
         now: i64,
         revocations: &dyn Revocations,
     ) -> Result<(u64, [u8; 32])> {
+        if self.voice_only {
+            return Err(Invalid("voice has no chat keys"));
+        }
         if self.ready {
             return Err(AgentError::Unpersisted);
         }
@@ -890,10 +941,10 @@ impl Agent {
                 return Err(AgentError::Blocked);
             }
             let mut group = a.mls(&key)?;
-            a.process_proposal(&mut group, bytes)
+            a.process_proposal(&key, &mut group, bytes)
         })
     }
-    fn process_proposal(&self, group: &mut MlsGroup, bytes: &[u8]) -> Result<()> {
+    fn process_proposal(&mut self, key: &str, group: &mut MlsGroup, bytes: &[u8]) -> Result<()> {
         let processed = group.process_message(&self.provider, protocol(bytes)?).map_err(err("proposal"))?;
         if !matches!(processed.sender(),Sender::External(index) if *index==SenderExtensionIndex::new(0)) {
             return Err(Invalid("proposal sender"));
@@ -904,7 +955,23 @@ impl Agent {
         if !matches!(proposal.proposal(), Proposal::Remove(_)) {
             return Err(Invalid("external proposal type"));
         }
-        group.store_pending_proposal(self.provider.storage(), *proposal).map_err(err("store proposal"))
+        let Proposal::Remove(remove) = proposal.proposal() else { unreachable!() };
+        let target = remove.removed();
+        if self.voice_only {
+            if group.public_group().leaf(target).is_none() {
+                return Err(Invalid("removal target"));
+            }
+            self.groups.get_mut(key).ok_or(Invalid("group record"))?.voice_removals.insert(target.u32());
+        }
+        group.store_pending_proposal(self.provider.storage(), *proposal).map_err(err("store proposal"))?;
+        Ok(())
+    }
+    fn resolve_voice_removals(&mut self, key: &str, staged: &StagedCommit) {
+        if let Some(record) = self.groups.get_mut(key) {
+            for removal in staged.remove_proposals() {
+                record.voice_removals.remove(&removal.remove_proposal().removed().u32());
+            }
+        }
     }
     fn check_staged(&self, group: &MlsGroup, staged: &StagedCommit, sender: &CommitSender, time: i64) -> Result<()> {
         rules::staged(group.public_group(), staged, sender, time, self.provider.crypto())?;
@@ -975,7 +1042,7 @@ impl Agent {
             let descriptor = client_context(group.public_group().group_context(), server)?;
             let kind = descriptor.descriptor.kind;
             if kind.separate_tree() && !adds.is_empty() {
-                return Err(Invalid("channel and server devices join externally"));
+                return Err(Invalid("separate-tree groups join externally"));
             }
             group.set_configuration(a.provider.storage(), &join_config(kind)).map_err(err("group config"))?;
             let packages: Vec<KeyPackage> = adds
@@ -1053,7 +1120,7 @@ impl Agent {
         }
         let mut group = self.mls(key)?;
         for p in proposals {
-            self.process_proposal(&mut group, p)?;
+            self.process_proposal(key, &mut group, p)?;
         }
         let processed = group.process_message(&self.provider, protocol(commit)?).map_err(err("commit"))?;
         let time = ds::commit_time(processed.aad()).ok_or(Invalid("commit time"))?;
@@ -1066,6 +1133,7 @@ impl Agent {
             return Err(Invalid("not a commit"));
         };
         self.check_staged(&group, &staged, &sender, time)?;
+        self.resolve_voice_removals(key, &staged);
         let removed = staged.self_removed();
         if removed {
             // Validation is complete. Delete before advancing: OpenMLS's delete
@@ -1093,6 +1161,7 @@ impl Agent {
                     if hash(&commit) == out.hash {
                         let mut group = a.mls(&key)?;
                         if !joining {
+                            a.resolve_voice_removals(&key, group.pending_commit().ok_or(Invalid("pending commit"))?);
                             group.merge_pending_commit(&a.provider).map_err(err("merge pending"))?;
                         }
                         a.derived(&key, &group)?;
@@ -1177,6 +1246,9 @@ impl Agent {
         chain: &[([u8; 32], Vec<u8>)],
     ) -> Result<[u8; 32]> {
         self.operation(|a| {
+            if a.voice_only || conversation.starts_with("voice:") {
+                return Err(Invalid("voice has no incarnation chain"));
+            }
             let chain = chain
                 .iter()
                 .map(|(group, bytes)| {
@@ -1211,6 +1283,8 @@ impl Agent {
                     checkpoint: None,
                     welcome_ids: BTreeSet::new(),
                     server_pending: false,
+                    voice_removals: BTreeSet::new(),
+                    voice_needs_sync: false,
                     evidence: BTreeMap::new(),
                     own_commit_at: None,
                 });
@@ -1245,6 +1319,7 @@ impl Agent {
             .into_verified(SUITE, self.provider.crypto(), info.group_id())
             .map_err(err("ratchet tree"))?;
         rules::tree(&descriptor, tree.leaves())?;
+        rules::voice_initial_tree(&descriptor, info.epoch().as_u64(), tree.leaves())?;
         let next = checkpoint(info.group_context())?;
         // Verification only: a throwaway provider, and nothing is committed.
         MlsGroup::external_commit_builder()
@@ -1277,6 +1352,9 @@ impl Agent {
             current_time(now)?;
             let info = info(bytes)?;
             let descriptor = client_context(info.group_context(), server)?;
+            if (descriptor.descriptor.kind == crate::Kind::Voice) != a.voice_only {
+                return Err(Invalid("agent store kind"));
+            }
             a.check_pin(&descriptor)?;
             let id = descriptor.group_id();
             let key = group_key(server, &id);
@@ -1306,6 +1384,7 @@ impl Agent {
                 .into_verified(SUITE, a.provider.crypto(), info.group_id())
                 .map_err(err("ratchet tree"))?;
             rules::tree(&descriptor, old_tree.leaves())?;
+            rules::voice_initial_tree(&descriptor, info.epoch().as_u64(), old_tree.leaves())?;
             if old_tree
                 .leaves()
                 .filter_map(leaf_credential)
@@ -1339,7 +1418,15 @@ impl Agent {
                 .set_configuration(a.provider.storage(), &join_config(descriptor.descriptor.kind))
                 .map_err(err("group config"))?;
             a.record(&descriptor, Status::Joining);
-            a.groups.get_mut(&key).ok_or(Invalid("record"))?.checkpoint = Some(old_checkpoint.clone());
+            let record = a.groups.get_mut(&key).ok_or(Invalid("record"))?;
+            record.checkpoint = Some(old_checkpoint.clone());
+            if a.voice_only {
+                // A snapshot cannot distinguish missed removal/rejoin from a
+                // self-update. Start a fresh membership trust interval, but do
+                // not export until its complete current removal state is known.
+                record.voice_removals.clear();
+                record.voice_needs_sync = true;
+            }
             let out = a.bundle(&id, old_checkpoint.epoch, bundle, now)?;
             a.outbox.insert(key, out.clone());
             Ok(out)
@@ -1356,6 +1443,9 @@ impl Agent {
         now: i64,
         revocations: &dyn Revocations,
     ) -> Result<Vec<Vec<u8>>> {
+        if self.voice_only {
+            return Err(Invalid("voice has no history"));
+        }
         self.operation(|a| {
             if !a.gate(server, id, now, revocations)?.can_send() {
                 return Err(AgentError::Blocked);
@@ -1420,6 +1510,9 @@ impl Agent {
         })
     }
     pub fn import_history(&mut self, server: &str, id: &[u8; 32], bytes: &[u8]) -> Result<()> {
+        if self.voice_only {
+            return Err(Invalid("voice has no history"));
+        }
         self.operation(|a| {
             let key = group_key(server, id);
             if a.groups.get(&key).is_none_or(|r| r.status != Status::Active) {
@@ -1468,6 +1561,9 @@ pub struct WelcomeResult {
 impl Agent {
     /// Persist before acknowledging. A duplicate never consumes its key package again.
     pub fn welcome(&mut self, server: &str, id: &str, bytes: &[u8]) -> Result<WelcomeResult> {
+        if self.voice_only {
+            return Err(Invalid("voice has no Welcome"));
+        }
         self.accept_welcome(server, id, bytes, None)
     }
     /// Recover membership whose log cannot be replayed. The caller establishes
@@ -1489,6 +1585,9 @@ impl Agent {
         bytes: &[u8],
         replace: Option<&[u8; 32]>,
     ) -> Result<WelcomeResult> {
+        if self.voice_only {
+            return Err(Invalid("voice has no Welcome"));
+        }
         self.operation(|a| {
             if id.is_empty() {
                 return Err(Invalid("welcome id"));
@@ -1518,7 +1617,7 @@ impl Agent {
             let staged = builder.build().map_err(err("staged welcome"))?;
             let descriptor = client_context(staged.group_context(), server)?;
             if descriptor.descriptor.kind.separate_tree() {
-                return Err(Invalid("channel and server devices join externally"));
+                return Err(Invalid("separate-tree groups join externally"));
             }
             a.check_pin(&descriptor)?;
             let key = group_key(server, &descriptor.group_id());

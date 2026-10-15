@@ -68,6 +68,25 @@ pub(crate) fn tree<'a>(
     Ok(())
 }
 
+/// Epoch-zero voice snapshots must actually be the descriptor creator's singleton.
+/// Later snapshots can have any structurally valid membership.
+pub(crate) fn voice_initial_tree<'a>(
+    descriptor: &SignedDescriptor,
+    epoch: u64,
+    mut leaves: impl Iterator<Item = &'a LeafNode>,
+) -> Result<(), DsError> {
+    if descriptor.descriptor.kind == Kind::Voice && epoch == 0 {
+        let creator = leaves.next().and_then(leaf_credential).ok_or(Invalid("voice creator"))?;
+        if leaves.next().is_some()
+            || creator.device_key() != descriptor.creator.device_key()
+            || creator.uid() != descriptor.descriptor.creator_uid
+        {
+            return Err(Invalid("voice creator"));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn leaf(group: &PublicGroup, index: LeafNodeIndex) -> Option<Leaf> {
     let c = leaf_credential(group.leaf(index)?)?;
     Some(Leaf { index: index.u32(), device_key: c.device_key().into(), uid: c.uid() })
@@ -124,7 +143,7 @@ pub(crate) fn staged(
         .and_then(|ext| SignedDescriptor::parse(&ext.0))
         .ok_or(Invalid("descriptor"))?;
     if descriptor.descriptor.kind.separate_tree() && staged.add_proposals().next().is_some() {
-        return Err(Invalid("channel and server devices join externally"));
+        return Err(Invalid("separate-tree groups join externally"));
     }
     let mut welcome_for = BTreeSet::new();
     let mut added_devices = Vec::new();

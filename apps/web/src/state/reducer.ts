@@ -458,17 +458,23 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
     }
     case "voice.talking": {
       const c = state.clients[event.d.client];
-      if (!c || c.talking === event.d.talking) return state;
+      if (!c || c.channel === null || !c.voice_binding || c.voice_binding.call !== event.d.call || c.voice_binding.participation !== event.d.participation || c.voice_binding.run !== event.d.run || c.talking === event.d.talking) return state;
       return { ...state, clients: { ...state.clients, [c.id]: { ...c, talking: event.d.talking } } };
     }
     case "voice.slot": {
+      const binding = state.me === null ? null : state.clients[state.me.session]?.voice_binding;
+      if ((!binding || binding.call !== event.d.call || binding.participation !== event.d.participation || (binding.run !== event.d.run && !(state.me && ["ts3","ts6"].includes(state.clients[state.me.session]?.platform ?? ""))))) return state;
       if (event.d.slot < 0 || event.d.slot >= AUDIO_SLOTS) return state;
       const slots = state.slots.slice();
       slots[event.d.slot] = event.d.client;
       return { ...state, slots };
     }
-    case "voice.closed":
+    case "voice.closed": {
+      const binding = state.me === null ? null : state.clients[state.me.session]?.voice_binding;
+      if (!binding || binding.call !== event.d.call || binding.participation !== event.d.participation || binding.run !== event.d.run) return state;
       return { ...state, slots: state.slots.map(() => null) };
+    }
+    case "voice.state": case "voice.epoch.ack": case "voice.epoch.request": return state;
     case "challenge":
     case "disconnected":
       return state;

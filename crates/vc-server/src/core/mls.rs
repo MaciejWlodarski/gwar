@@ -47,7 +47,7 @@ const LIST_BYTES: usize = 640 * 1024 - 4096;
 fn bad(message: &str) -> ErrorBody {
     err(ErrorCode::BadRequest, message)
 }
-fn ds_error(error: DsError) -> ErrorBody {
+pub(super) fn ds_error(error: DsError) -> ErrorBody {
     let code = match error {
         DsError::Stale => ErrorCode::Stale,
         DsError::Expired => ErrorCode::Expired,
@@ -57,7 +57,7 @@ fn ds_error(error: DsError) -> ErrorBody {
     err(code, &error.to_string())
 }
 
-fn blob(value: &str, limit: usize) -> Result<Vec<u8>, ErrorBody> {
+pub(super) fn blob(value: &str, limit: usize) -> Result<Vec<u8>, ErrorBody> {
     if value.len() > limit.div_ceil(3) * 4 {
         return Err(err(ErrorCode::TooLarge, "MLS blob too large"));
     }
@@ -197,6 +197,19 @@ impl Core {
         if *count > TREE_REQUESTS_PER_MINUTE {
             return Err(TreeRefusal::TooManyRequests);
         }
+        if let Some(channel) = self.voice_group_channel(group) {
+            self.voice_info(session, channel).map_err(|_| TreeRefusal::NotFound)?;
+            if let Some((epoch, tree)) = self.mls_trees.get(group) {
+                return Ok((*epoch, tree.clone()));
+            }
+            let (epoch, tree) = self.voice_tree(session, channel).map_err(|_| TreeRefusal::NotFound)?;
+            if self.mls_trees.len() >= CACHED_TREES && !self.mls_trees.contains_key(group) {
+                self.mls_trees.clear();
+            }
+            let tree = axum::body::Bytes::from(tree);
+            self.mls_trees.insert(group.into(), (epoch, tree.clone()));
+            return Ok((epoch, tree));
+        }
         let row = self.mls_group_for(session, group).map_err(|_| TreeRefusal::NotFound)?;
         if let Some((epoch, tree)) = self.mls_trees.get(group).filter(|(epoch, _)| *epoch == row.epoch) {
             return Ok((*epoch, tree.clone()));
@@ -212,6 +225,9 @@ impl Core {
     }
 
     fn mls_group_for(&self, session: SessionId, group: &str) -> Result<GroupRow, ErrorBody> {
+        if self.voice_group_channel(group).is_some() {
+            return Err(bad("voice has no chat or history"));
+        }
         if vc_proto::decode_fixed::<32>(group).is_none() {
             return Err(bad("invalid group id"));
         }
@@ -275,6 +291,7 @@ impl Core {
             row.observer = observer.save();
             existing.extend(added.iter().map(|p| ProposalRow { leaf: p.leaf, proposal: p.proposal.clone() }));
             self.store.mls_write_group(&row, &observer.leaves(), &existing, None, None, &[])?;
+            self.voice_dirty |= channel_id(&row.conversation).is_some_and(|c| self.calls.contains_key(&c));
             self.mls_announce_proposals(&row, &added);
         }
         Ok(())
@@ -389,17 +406,50 @@ impl Core {
                     .map_err(storage_error)?;
                 reply(MlsResponse::Devices { devices: page.items, next: page.next })
             }
-            MlsRequest::GroupCreate { conversation, group_info } => {
+            MlsRequest::GroupCreate { conversation, group_info, voice } => {
+                if conversation.starts_with("voice:") {
+                    return self.voice_create(
+                        session,
+                        &conversation,
+                        &group_info,
+                        voice.ok_or_else(|| bad("voice binding required"))?,
+                    );
+                }
+                if voice.is_some() {
+                    return Err(bad("voice binding on chat group"));
+                }
                 self.mls_create(session, &conversation, &group_info)
             }
             MlsRequest::GroupInfo { group } => {
+                if let Some(channel) = self.voice_group_channel(&group) {
+                    return self.voice_info(session, channel);
+                }
                 let row = self.mls_group_for(session, &group)?;
                 reply(MlsResponse::GroupInfo { group_info: B64.encode(row.group_info), epoch: row.epoch })
             }
-            MlsRequest::Commit { group, epoch, commit, group_info, welcome } => {
+            MlsRequest::Commit { group, epoch, commit, group_info, welcome, voice } => {
+                if voice.is_some() && self.store.mls_group(&group).map_err(storage_error)?.is_some() {
+                    return Err(bad("voice binding on chat group"));
+                }
+                if self.voice_group_channel(&group).is_some() || voice.is_some() {
+                    if welcome.is_some() {
+                        return Err(bad("voice takes no Welcome"));
+                    }
+                    return self.voice_commit(
+                        session,
+                        &group,
+                        epoch,
+                        &commit,
+                        &group_info,
+                        voice.ok_or_else(|| bad("voice binding required"))?,
+                    );
+                }
                 self.mls_commit(session, &group, epoch, &commit, &group_info, welcome.as_deref())
             }
             MlsRequest::Log { group, since, limit: requested } => {
+                if let Some(channel) = self.voice_group_channel(&group) {
+                    return self.voice_log(session, channel, since, requested);
+                }
                 let row = self.mls_group_for(session, &group)?;
                 if since > vc_proto::MAX_SAFE_INTEGER as u64 {
                     return Err(bad("invalid epoch"));
@@ -558,6 +608,9 @@ impl Core {
                 Ok(Response::Empty {})
             }
             MlsRequest::GroupHistory { conversation, page: paging } => {
+                if conversation.starts_with("voice:") {
+                    return Err(bad("voice has no incarnation history"));
+                }
                 if !self.mls_can_read(&uid, &conversation)? {
                     return Err(err(ErrorCode::Forbidden, "no access to this conversation"));
                 }
@@ -671,6 +724,7 @@ impl Core {
         let proposals = self.mls_missing_proposals(&mut observer, &[]).map_err(storage_error)?;
         row.observer = observer.save();
         self.store.mls_write_group(&row, &observer.leaves(), &proposals, None, None, &[]).map_err(storage_error)?;
+        self.voice_dirty |= channel_id(&row.conversation).is_some_and(|c| self.calls.contains_key(&c));
         self.mls_announce_proposals(&row, &proposals);
         reply(MlsResponse::Created { group: row.group })
     }
@@ -747,6 +801,7 @@ impl Core {
                 &removed,
             )
             .map_err(storage_error)?;
+        self.voice_dirty |= channel_id(&row.conversation).is_some_and(|c| self.calls.contains_key(&c));
         let readers = self.mls_readers(&row.conversation);
         self.broadcast(
             Event::Mls(MlsEvent::Commit { group: group.into(), epoch, proposals, commit: entry.commit }),

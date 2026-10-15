@@ -1,4 +1,4 @@
-import type { IceServer } from "../proto/IceServer";
+import { nextMediaRun } from "./engine";
 import { AUDIO_SLOTS } from "../net/protocol";
 import {
   rmsToLevel,
@@ -7,7 +7,6 @@ import {
   type CaptureOptions,
   type DeviceList,
   type InputMode,
-  type OfferFn,
   type VoiceEngine,
   type VoiceEvents,
   type VoiceState,
@@ -72,6 +71,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   private capture: CaptureOptions = { noiseSuppression: true, echoCancellation: true, autoGainControl: true };
   private state: VoiceState = "idle";
   private runId = 0;
+  private micGeneration = 0;
   private resumeBound = false;
 
   constructor() {
@@ -108,12 +108,15 @@ export class WebRtcVoiceEngine implements VoiceEngine {
 
   // ------------------------------------------------------------- lifecycle
 
-  async start({ offer, iceServers }: { offer: OfferFn; iceServers: IceServer[] }): Promise<void> {
+  async start({ offer, iceServers, mode }: Parameters<VoiceEngine["start"]>[0]): Promise<void> {
+    if (mode !== "plaintext") throw new VoiceError("unsupported", "Encrypted voice is being added. Chat is available.");
+    const mediaRun = nextMediaRun();
     const run = ++this.runId;
     this.teardownPeer();
     this.setState("starting");
     this.ensureContext();
     await this.ctx?.resume().catch(() => {});
+    if (run !== this.runId) return;
 
     if (!this.stream) await this.openMic();
     if (run !== this.runId) return;
@@ -139,7 +142,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
 
       pc.ontrack = (ev) => {
         const slot = slotTransceivers.indexOf(ev.transceiver);
-        if (slot >= 0) this.attachSlot(slot, ev.track);
+        if (this.pc === pc && slot >= 0) this.attachSlot(slot, ev.track);
       };
       pc.onconnectionstatechange = () => {
         if (this.pc !== pc) return;
@@ -153,16 +156,21 @@ export class WebRtcVoiceEngine implements VoiceEngine {
         }
       };
 
-      await pc.setLocalDescription(await pc.createOffer());
-      const answer = await offer(pc.localDescription?.sdp ?? "");
+      const localOffer = await pc.createOffer();
+      if (run !== this.runId) return;
+      await pc.setLocalDescription(localOffer);
+      if (run !== this.runId) return;
+      const answer = await offer(pc.localDescription?.sdp ?? "", mediaRun);
       if (run !== this.runId) return;
       await pc.setRemoteDescription({ type: "answer", sdp: answer });
+      if (run !== this.runId) return;
       this.applyTrackEnabled();
 
       setTimeout(() => {
         if (this.pc === pc && this.state === "starting") this.setState("failed");
       }, CONNECT_TIMEOUT_MS);
     } catch (e) {
+      if (run !== this.runId) return;
       this.teardownPeer();
       this.setState("failed");
       throw new VoiceError("negotiation", e instanceof Error ? e.message : String(e));
@@ -200,7 +208,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     };
   }
 
-  private async getStream(): Promise<MediaStream> {
+  private async getStream(current = () => true): Promise<MediaStream> {
     if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
       throw new VoiceError("insecure", "microphone requires a secure context (https or localhost)");
     }
@@ -208,17 +216,24 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       return await navigator.mediaDevices.getUserMedia({ audio: this.audioConstraints(true) });
     } catch (e) {
       // A remembered device may have been unplugged: fall back to the default one.
-      if (this.inputDeviceId && e instanceof DOMException && (e.name === "OverconstrainedError" || e.name === "NotFoundError")) {
+      if (current() && this.inputDeviceId && e instanceof DOMException && (e.name === "OverconstrainedError" || e.name === "NotFoundError")) {
         return await navigator.mediaDevices.getUserMedia({ audio: { ...this.audioConstraints(false), deviceId: undefined } });
       }
       throw errorFromGum(e);
     }
   }
 
-  private async openMic(): Promise<void> {
+  private async openMic(): Promise<MediaStream | null> {
     this.closeMic();
+    const generation = this.micGeneration;
+    const run = this.runId;
+    const current = () => generation === this.micGeneration && run === this.runId;
     try {
-      const stream = await this.getStream();
+      const stream = await this.getStream(current);
+      if (!current()) {
+        stream.getTracks().forEach((track) => track.stop());
+        return null;
+      }
       this.stream = stream;
       this.startMeter(stream);
       this.emit("micError", null);
@@ -231,21 +246,25 @@ export class WebRtcVoiceEngine implements VoiceEngine {
         }
       });
       // Labels become available only after permission was granted.
-      void this.listDevices().then((d) => this.emit("devices", d));
+      void this.listDevices().then((d) => { if (current()) this.emit("devices", d); });
+      return stream;
     } catch (e) {
-      this.emit("micError", e instanceof VoiceError ? e : errorFromGum(e));
+      if (current()) this.emit("micError", e instanceof VoiceError ? e : errorFromGum(e));
+      return null;
     }
   }
 
   private closeMic(): void {
+    this.micGeneration++;
     this.stopMeter();
     this.stream?.getTracks().forEach((t) => t.stop());
     this.stream = null;
   }
 
   async retryMic(): Promise<void> {
-    await this.openMic();
-    const track = this.stream?.getAudioTracks()[0] ?? null;
+    const stream = await this.openMic();
+    if (!stream || this.stream !== stream) return;
+    const track = stream.getAudioTracks()[0] ?? null;
     if (track && this.micSender) await this.micSender.replaceTrack(track);
     this.applyTrackEnabled();
   }
