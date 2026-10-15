@@ -32,10 +32,10 @@ post-quantum suites (MLS can add them later); push notifications.
   channel chat, direct messages and server-wide chat; **SFrame**
   ([RFC 9605](https://www.rfc-editor.org/rfc/rfc9605.html)) for voice.
 - A channel is **encrypted or not from its creation, for good**. Existing
-  channels are never converted. The default is encrypted when the server has
-  TeamSpeak compatibility off and plaintext when it is on; the client
-  remembers the creator's last choice. Plaintext channels carry a visible
-  "not end-to-end encrypted" label.
+  channels are never converted. New channels default to plaintext, with or
+  without TeamSpeak compatibility; encryption is chosen per channel, as in
+  build step 4. The client remembers the creator's last choice. Plaintext
+  channels carry a visible "not end-to-end encrypted" label.
 - Per channel, also fixed at creation: **new members see history** (or not).
 - Newcomers **join on their own** (MLS external join) and can write
   immediately. History keys arrive when any member's device is online. There
@@ -76,12 +76,16 @@ post-quantum suites (MLS can add them later); push notifications.
   Firefox 117+, Safari 15.4+) with a small RFC 9605 implementation on
   WebCrypto in the worker, not audited, which gets its own review before
   release; the
-  desktop's native engine through the Rust `sframe` crate (2.0). They
-  interoperate (S3). SFrame application metadata is always empty: `sframe`
-  2.0 authenticates metadata before the header, the reverse of RFC 9605,
-  which only differs when metadata is present. Clients reject non-empty
-  metadata, and a test keeps the RFC vector that fails today until it is
-  fixed upstream ([sframe-rs#124](https://github.com/TobTheRock/sframe-rs/issues/124)).
+  desktop's native engine through the Rust `sframe` crate. They interoperate
+  (S3). SFrame application metadata is always empty. Version 2.0.0
+  authenticates metadata before the header, the reverse of RFC 9605;
+  [sframe-rs#125](https://github.com/TobTheRock/sframe-rs/pull/125) fixes
+  [#124](https://github.com/TobTheRock/sframe-rs/issues/124). Build step 5
+  requires a release containing that fix, or its pinned merged revision
+  until a release exists, replaced before step 8. Clients reject non-empty
+  metadata; both implementations must pass the RFC vectors, including the
+  metadata vector at the primitive level. S3 below records the earlier
+  2.0.0 measurement, not the dependency to ship.
 
 All new statements follow the existing rules: UTF-8, `\n` separators, no
 trailing newline, canonical unpadded base64url for binary fields, decimal
@@ -524,10 +528,12 @@ Local identities have one device and no archive.
   in the pending chain keeps it immediate. "At once" means the sender stops
   using the old key the moment it processes the commit, even while the new
   keys are still being installed; it stays silent until they are.
-- The two seconds count from when the sender processed the commit. They
-  bound the wait for acknowledgements, not delivery or key installation: a
-  commit the server withholds delays the change until it arrives (see
-  "Freshness").
+- The processing instant is the controller's monotonic time when it marks
+  a validated commit processed, after any required removal hold. The
+  two-second wait starts there and never restarts for barrier or key
+  installation delays. It bounds waiting for acknowledgements, not delivery
+  or installation: a withheld commit delays the change until it arrives
+  (see "Freshness").
 - A removed participant gets nothing under keys it does not have, whatever
   the SFU does; the SFU also stops forwarding to it. It can still decrypt a
   sender who has not processed its removal yet, until that sender does; that
@@ -537,8 +543,11 @@ Local identities have one device and no archive.
 - Receivers keep an epoch's keys while it is the newest epoch in which some
   current device's frame authenticated (silent senders included, through
   their last frame; a late frame from an older epoch never moves this back),
-  or for ten seconds after the receiver processed the first commit that
-  superseded it, whichever is longer; keys of removed senders go at once.
+  or for ten seconds after the receiver's engine first applies a barrier
+  superseding it, whichever is longer; keys of removed senders go at once.
+  Controller and engine clocks are separate, so barrier delay can only
+  lengthen retention from processing by that delay; retries and later
+  pending commits preserve the earliest deadline.
   At most eight epochs are kept per call; past that the oldest goes, and a
   sender that far behind stays silent to that receiver until it catches up
   and sends in a newer epoch.
@@ -567,10 +576,10 @@ Local identities have one device and no archive.
   different keys for the same binding stop the engine. An install overtaken
   by a newer one is ignored, and no install brings back keys that were
   purged or replay windows that were reset.
-- **Frame size**: Opus frames are kept small (20 ms at the current bitrates
-  is about 120–200 bytes, plus at most 33 bytes of SFrame). Clients drop,
-  never truncate, an encoded frame over 1000 bytes before encryption, so a
-  frame always fits one RTP packet (str0m 0.24 leaves about 1120 bytes).
+- **Frame size**: Opus packets stay small: native 10 ms, browsers 20 ms,
+  plus at most 33 bytes of SFrame. Clients drop, never truncate, an encoded
+  frame over 1000 bytes before encryption, so it always fits one RTP packet
+  (str0m 0.24 leaves about 1120 bytes).
 
 ### SFU
 
@@ -586,8 +595,8 @@ Local identities have one device and no archive.
   them (retired ones are bounded per microphone, refusing new ones past the
   limit). So a frame delayed from an earlier call or run never enters
   another one, and a sequence number only restarts with a new SSRC.
-- **Timing**: today a slot's RTP time advances by the previous packet's
-  duration, read from the Opus header, which is now encrypted. Instead:
+- **Timing**: a slot follows source timestamps; re-anchoring also needs the
+  span of its last packet, whose Opus header is encrypted:
   - senders stamp each packet with the capture position of its first sample
     (48 kHz), which also advances over frames not sent (silence, mute,
     push-to-talk, dropped frames). Browsers do this already; the native
@@ -595,7 +604,7 @@ Local identities have one device and no archive.
     frame instead of using wall-clock time, and discards a partial frame
     across a gap in capture;
   - per sender stream (SSRC), the SFU orders packets by extended RTP
-    sequence number: duplicates and packets older than the last forwarded
+    sequence number: duplicates and packets older than the last accepted
     are dropped. A new SSRC starts a new baseline;
   - for a newer packet from the same speaker on a slot, the forwarded time
     advances by the sender's timestamp difference (modulo 2^32) and the
@@ -604,15 +613,28 @@ Local identities have one device and no archive.
     real silence longer than five seconds, harmless when packets arrive on
     time); a
     difference of zero (one frame per packet, so a sender fault) drops the
-    packet and is counted;
-  - on a speaker change or a source reset, the forwarded time advances by
-    the elapsed wall-clock time rounded up to whole 20 ms frames, at least
-    one.
-- **Frame duration**: clients ask for 20 ms frames (`ptime`/`maxptime` 20;
-  the native engine always uses 20 ms). The sender checks each frame's Opus
-  duration before encrypting and counts other durations; they are still
-  sent, because timing rests on the sender's timestamps and only the
-  speaker-change estimate assumes 20 ms. In S2 all three browsers kept 20 ms.
+    packet and is counted. Track resets even on muted/gated packets; a slot
+    re-anchors on its next packet from that source-clock generation;
+  - at every re-anchor (speaker/run/SSRC change, source-clock generation
+    change, reset-sized slot delta or TeamSpeak spurt/clock change), advance
+    by the greater of elapsed time rounded up to 10 ms (480 ticks, at
+    least one) and the saved span of the slot's last forwarded packet.
+    Plaintext RTP and TeamSpeak use parsed Opus duration; encrypted RTP
+    uses that stream's last positive in-order ordinary timestamp step,
+    clamped to 960–5760 ticks (20 ms, the longest packet either client
+    sends, covers a step that measured a shorter previous packet; a sender
+    exceeding 20 ms can lose up to 100 ms after an immediate re-anchor), or
+    960 before any step. Learn before gating;
+    zero/reset deltas leave the estimate unchanged. Keep the previous span
+    across reassignment/reset until the next packet is forwarded, including
+    batched TeamSpeak spurt transitions. An over-estimate inserts a short
+    gap receivers conceal; an under-estimate drops audio. Forward at once,
+    without lookahead or buffering.
+- **Frame duration**: native Gwar keeps 10 ms, browsers 20 ms, with each
+  client's current `ptime` negotiation unchanged. Direct TeamSpeak keeps
+  20 ms and its puppet keeps pairing 10 ms packets. Before encryption the
+  sender counts durations differing from its configuration but still sends
+  them; timing rests on capture timestamps. In S2 all browsers kept 20 ms.
 - **Speech gate**: unchanged, from the RFC 6464 audio level header extension,
   which stays in the clear. Who talks, and when, remains visible to the
   server, as it is today. Rewritten RTP headers are not part of SFrame's
