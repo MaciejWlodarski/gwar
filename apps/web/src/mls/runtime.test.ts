@@ -187,6 +187,7 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
       runtimes.push(next);
       return next;
     },
+    welcome: (serverChat: boolean) => welcomeHandler({ channels: options.channels ?? [], server: { server_chat: { encrypted: serverChat, history: serverChat } }, file_access: "access" } as never),
     reconnect: () => {
       link.isOnline = false; statusHandler({ state: "reconnecting", attempt: 1, retryAt: Date.now() });
       link.isOnline = true; statusHandler({ state: "online" });
@@ -446,6 +447,31 @@ describe("MLS synchronization", () => {
       await f.runtime.openMessage(message); await f.runtime.openMessage(message);
       expect(timer.mock.calls.filter(([, delay]) => delay === 0)).toHaveLength(1);
     } finally { timer.mockRestore(); }
+  });
+  it.each(["active", "creating"] as const)("leaves the %s server group alone after a plaintext Welcome", async status => {
+    conversation = "server";
+    let now = Date.now();
+    const f = await fixture({ ...clean(), groups: [summary()] }, true, { serverChat: true, now: () => now });
+    expect(await f.runtime.openMessage({ conversation, group, epoch: 0, message_id: b64(2,16), revision: 0, ciphertext: "AQ" })).toEqual({ reason: "no_key" });
+    await f.runtime.sync();
+    expect(f.calls.some(c => c.op === "mls.history.request")).toBe(true);
+    f.state().groups[0]!.record.status = status;
+    f.state().groups[0]!.record.own_commit_at = 0;
+    await f.persist();
+    const before = await f.durable();
+    f.reconnect(); f.welcome(false);
+    now += 8 * 86400_000;
+    f.world.requestError = new RequestError("forbidden", "server chat is plaintext");
+    // Late server work must stay dormant too; unrelated encrypted chat remains usable.
+    f.world.welcomes = [{ id: "late", group, welcome: "AQ" }];
+    f.world.chunks = [{ id: "late", group, sender_uid: b64(5,20), chunk: "AQ" }];
+    f.world.wanted = [{ group, device: peer }];
+    f.calls.length = 0; f.operations.length = 0;
+    await expect(f.runtime.sync()).resolves.toBeUndefined();
+    expect(f.calls.filter(c => c.data.group === group || c.data.conversation === "server")).toEqual([]);
+    expect(f.operations.filter(o => !["inventory", "device_hpke_key"].includes(String(o.op)))).toEqual([]);
+    expect(await f.durable()).toEqual(before);
+    expect(f.runtime.roster("server")).toBeNull();
   });
   it("requests missing keys, throttles repeated requests, and answers wanted history", async () => {
     const local = summary(); local.members.push({ device_key: peer, uid: b64(5,20) });

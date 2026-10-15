@@ -539,8 +539,8 @@ export function reduce(state: SessionState, action: Action): SessionState {
         permissions: w.permissions,
         iceServers: w.ice_servers,
         slots: initialState.slots,
-        // Private/server history survives a resync; channel threads are reloaded.
-        threads: action.resync ? Object.fromEntries(Object.entries(state.threads).filter(([k]) => !k.startsWith("ch:"))) : {},
+        // Private and plaintext server history survives a resync; encrypted scrollback is reloaded.
+        threads: action.resync ? Object.fromEntries(Object.entries(state.threads).filter(([k]) => !k.startsWith("ch:") && !(k === "server" && w.server.server_chat.encrypted))) : {},
         epoch: state.epoch + 1,
       };
       next.permissions = computePermissions(next, w.permissions);

@@ -637,7 +637,7 @@ describe("encrypted server chat", () => {
     s = reduce(s, { type: "sealedHistory", thread: "server", hasMore: false });
     s = reduce(s, { type: "sealedMentions", thread: "server", count: 2 });
     s = connect(s, true);
-    expect(s.threads.server).toMatchObject({ loaded: false, hasMore: false, unread: 3, mentions: 0, lastRead: 5, securing: true });
+    expect(s.threads.server).toMatchObject({ loaded: false, hasMore: true, unread: 3, mentions: 0, lastRead: 5, securing: true });
     const active = connect({ ...s, activeThread: "server" }, true);
     expect(active.threads.server?.unread).toBe(0);
   });

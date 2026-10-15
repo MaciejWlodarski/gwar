@@ -390,6 +390,23 @@ describe.each(["channel", "server"] as const)("encrypted %s chat", kind => {
   });
   const unread = (id = channel, count = 1) => useSession.setState(s => ({ threads: { ...s.threads,
     [kind === "server" && id === channel ? "server" : `ch:${id}`]: { items: [], unread: count, mentions: 0, hasMore: true, loaded: false, lastRead: 0, locked: false } } }));
+  it("rebuilds scrollback through the Welcome reducer after an offline removal", async () => {
+    const w = welcome({ uid: a, server: useSession.getState().server!, channels: Object.values(useSession.getState().channels),
+      conversations: [{ conversation: target, count: 1, last_read: 0 }] });
+    useSession.getState().dispatch({ type: "welcome", welcome: w, resync: false, now: 0 });
+    await post(1); await post(2, [], undefined, "kept");
+    await dm.open(thread);
+    expect(useSession.getState().threads[thread]?.items.filter(i => i.kind === "msg")).toHaveLength(2);
+    stored = stored.filter(r => r.id !== 1);
+    dm.reset();
+    useSession.getState().dispatch({ type: "welcome", welcome: w, resync: true, now: 10 });
+    await dm.open(thread);
+    expect(useSession.getState().threads[thread]?.items.filter(i => i.kind === "msg").map(i => i.msg.id)).toEqual([2]);
+    expect(useSession.getState().threads[thread]).toMatchObject({ loaded: true, mentions: 0 });
+    if (kind === "server") expect(useSession.getState().threads.server?.items.filter(i => i.kind === "sys")).toEqual([
+      expect.objectContaining({ text: { key: "sys.reconnected" } }),
+    ]);
+  });
   it("starts mention accounting over after a resync", async () => {
     await dm.receive((await post(1)).sealed, true);
     expect(mentions()).toBe(1);

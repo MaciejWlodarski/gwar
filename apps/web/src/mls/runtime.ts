@@ -179,6 +179,7 @@ export class MlsRuntime {
         runtime!.server = server;
         runtime!.fileAccess = welcome.file_access;
         runtime!.serverChat = welcome.server.server_chat.encrypted;
+        if (!runtime!.serverChat) { runtime!.statuses.delete("server"); runtime!.rosters.delete("server"); }
         runtime!.channels = new Map(welcome.channels.filter(c => c.encrypted).map(c => [c.id, c.history]));
         runtime!.schedule();
       }));
@@ -267,6 +268,8 @@ export class MlsRuntime {
     });
     return this.syncing;
   }
+  /** A plaintext Welcome leaves persisted server groups and jobs dormant. */
+  private enabled(conversation: string | undefined): boolean { return conversation !== "server" || this.serverChat; }
   private inventory(): GroupSummary[] { return this.engine.query({ inventory: { server: this.server } }); }
   private summary(group: string): GroupSummary | undefined { return this.inventory().find(g => encoded(g.group) === group); }
   private args(group: string) { return { server: this.server, group: [...decodeFixed(group, 32)] }; }
@@ -277,6 +280,7 @@ export class MlsRuntime {
     // A conversation is its live pin; a first creation stands for it until settled.
     const shown = new Map<string, GroupSummary>();
     for (const g of this.inventory()) {
+      if (!this.enabled(g.conversation)) continue;
       if (g.live || (g.record.status === "creating" && !shown.get(g.conversation)?.live)) shown.set(g.conversation, g);
     }
     for (const [conversation, g] of shown) {
@@ -351,6 +355,7 @@ export class MlsRuntime {
         this.lastPublish = -Infinity;
         // Nobody writes to an earlier incarnation: its Welcome has nothing to give.
         const local = this.summary(welcome.group);
+        if (!this.enabled(local?.conversation ?? this.conversations.get(welcome.group))) continue;
         if (local?.record.status === "superseded") {
           await this.request("mls.welcomes.ack", { ids: [welcome.id] });
           continue;
@@ -386,7 +391,7 @@ export class MlsRuntime {
   private async synchronize(): Promise<void> {
     await this.publish();
     const groups = await this.groups();
-    for (const g of this.inventory()) if (g.record.status === "creating") {
+    for (const g of this.inventory()) if (g.record.status === "creating" && this.enabled(g.conversation)) {
       const winner = groups.find(remote => remote.conversation === g.conversation);
       await this.transition({ settle: { ...this.args(encoded(g.group)), winner: winner ? bytes(winner.group) : null } });
     }
@@ -758,7 +763,7 @@ export class MlsRuntime {
   }
   private async queueHistory(group: string, recipient: string, assignment: string | null): Promise<void> {
     const local = this.summary(group);
-    if (!local || !local.members.some(m => m.device_key === recipient) || recipient === this.options.identity.publicKey) return;
+    if (!local || !this.enabled(local.conversation) || !local.members.some(m => m.device_key === recipient) || recipient === this.options.identity.publicKey) return;
     const job: HistoryJob = { kind: "history", server: this.server, group, recipient, publication: null, chunks: null, assignment };
     const queued = this.engine.jobs.get(jobKey(job)) as HistoryJob | undefined;
     // A queued answer takes the newest assignment; its chunks stay as they are.
@@ -771,7 +776,9 @@ export class MlsRuntime {
   /** Whether this device may share a group's history now: its gate is clear
    * and its conversation is not held for a restart. */
   private mayShare(group: string): boolean {
-    const gate = this.gate(group), conversation = this.summary(group)?.conversation;
+    const conversation = this.summary(group)?.conversation;
+    if (!this.enabled(conversation)) return false;
+    const gate = this.gate(group);
     return gate.status === "active" && !gate.rejoin && !gate.server_pending && !gate.blocked.length && !gate.pending_commit
       && conversation !== undefined && !this.held.has(conversation);
   }
@@ -781,6 +788,7 @@ export class MlsRuntime {
       let job = value;
       if (this.syncedVersions.get(job.group) !== (this.groupVersions.get(job.group) ?? 0)) continue;
       const local = this.summary(job.group);
+      if (!this.enabled(local?.conversation)) continue;
       if (!local?.members.some(m => m.device_key === job.recipient)) {
         await this.engine.saveJobs([jobChange(job, true)]); continue;
       }
@@ -834,7 +842,8 @@ export class MlsRuntime {
     do {
       const page: ResponseMap["mls.history.fetch"] = await this.request("mls.history.fetch", { group: null, after });
       for (const chunk of page.chunks) {
-        if (this.summary(chunk.group)?.record.status !== "active") continue;
+        const local = this.summary(chunk.group);
+        if (local?.record.status !== "active" || !this.enabled(local.conversation)) continue;
         try { await this.engine.op({ import_history: { ...this.args(chunk.group), bytes: bytes(chunk.chunk) } }); }
         catch (error) {
           if (!(error instanceof AgentOperationError)) throw error;
@@ -849,13 +858,14 @@ export class MlsRuntime {
   }
   private async requestMissing(): Promise<void> {
     for (const [group, epochs] of this.missing) {
+      const local = this.summary(group);
+      if (!this.enabled(local?.conversation)) continue;
       for (const epoch of epochs) {
         const record = this.engine.query<null | string | { derived?: unknown; imported?: unknown }>({ epoch: { ...this.args(group), epoch } });
         if (record && record !== "conflicted") epochs.delete(epoch);
       }
       if (!epochs.size) { this.missing.delete(group); continue; }
       if (this.now() - (this.lastRequest.get(group) ?? -Infinity) < 60_000) continue;
-      const local = this.summary(group);
       if (local?.record.status !== "active" || this.held.has(local.conversation)) continue;
       try { await this.request("mls.history.request", { group }); }
       catch (error) { if (!(error instanceof RequestError) || error.code !== "rate_limited") throw error; }
@@ -903,6 +913,7 @@ export class MlsRuntime {
   async sealMessage(conversation: string, build: (context: SealContext) => Promise<Plaintext>): Promise<{ group: string; epoch: number; ciphertext: string }> {
     return this.engine.run(async () => {
       const generation = this.generation; this.activeGeneration = generation; this.assertCurrent(generation);
+      if (!this.enabled(conversation)) throw new Error("Server chat is not encrypted");
       const local = this.livePin(conversation);
       if (!local || this.held.has(conversation)) throw new Error("open the conversation first");
       const group = encoded(local.group);
@@ -919,6 +930,7 @@ export class MlsRuntime {
    * revocation policy remain the caller's responsibility. */
   async openMessage(message: SealedFields): Promise<OpenResult> {
     return this.engine.run(async () => {
+      if (!this.enabled(message.conversation)) return { reason: "cannot_open" };
       let context, ciphertext;
       try {
         if (!Number.isInteger(message.revision) || message.revision < 0 || message.revision > 0xffffffff || typeof message.conversation !== "string" || /[\r\n]/.test(message.conversation)) return { reason: "cannot_open" };
