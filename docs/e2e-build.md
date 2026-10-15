@@ -1722,7 +1722,11 @@ cannot relax key provenance, removal cutoff or the no-plaintext rule.
   from its last forwarded source timestamp, preserving omitted time;
   a reset-sized slot delta also re-anchors. For encrypted RTP, retain the
   stream's last positive in-order ordinary timestamp step, clamped to
-  120–5760 ticks, or 960 before any step. Update it before gating; zero or
+  960–5760 ticks, or 960 before any step. A step measures the previous
+  packet plus any gap, so the 960 floor (the longest duration either client
+  sends) covers a 10 → 20 ms change; only a sender exceeding 20 ms right
+  before a re-anchor can lose that one packet, already counted as
+  `unexpected_duration` at the sender. Update it before gating; zero or
   reset-sized deltas leave it unchanged. Only a new run/SSRC starts afresh.
 - At every re-anchor (speaker/run/SSRC change, new source-clock generation,
   reset-sized slot delta or TeamSpeak spurt/clock change), advance the slot
@@ -1889,7 +1893,8 @@ physical audio or official-server acceptance.
   works. Verify 480-tick rounding with the previous-span floor: forward a
   20 ms browser packet at 48000, then reset/change source within 10 ms; the
   next timestamp must be at least 48960, never 48480. Cover 10 ms native
-  sources (learned 480 and initial 960 estimates), 60 ms TeamSpeak packets
+  sources (learned 480 clamped to 960, initial 960, and a 10 ms packet
+  followed by a 20 ms one, then a reset within 10 ms), 60 ms TeamSpeak packets
   batched across spurt changes (floor 2880), and every re-anchor cause.
   Assert each new anchor is outside the previous packet's span, including
   zero elapsed time and switching 10/20 ms speakers. Separately check
