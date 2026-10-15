@@ -95,16 +95,22 @@ try {
   // is now ahead of it, and after two checks a minute apart one of them
   // restarts the conversation; the others accept the chain and join.
   const conversation = message.conversation;
-  await Promise.all(pages.map(page => page.evaluate(() => window.mls.runtime.close())));
-  await stopProcesses([service]);
-  await copyFile(snapshot, path.join(directory, "vc.sqlite3"));
-  for (const suffix of ["-wal", "-shm"]) await rm(path.join(directory, `vc.sqlite3${suffix}`), { force: true });
-  service = startServer();
-  await ready(`http://127.0.0.1:${serverPort}/health`, service);
-  for (const [i, page] of pages.entries()) {
-    await page.reload();
-    await page.evaluate(async ({ account, device, ws }) => { const { connect } = await import("/e2e/mls-fixture.ts"); window.mls = await connect(account, device, ws); }, { account: devices[i][0], device: devices[i][1], ws });
-  }
+  /** A fresh page load of device `i`, connected again with its durable state. */
+  const reconnect = async i => {
+    await pages[i].reload();
+    await pages[i].evaluate(async ({ account, device, ws }) => { const { connect } = await import("/e2e/mls-fixture.ts"); window.mls = await connect(account, device, ws); }, { account: devices[i][0], device: devices[i][1], ws });
+  };
+  /** The server comes back from an earlier backup; every device reconnects to it. */
+  const restore = async backup => {
+    await Promise.all(pages.map(page => page.evaluate(() => window.mls.runtime.close())));
+    await stopProcesses([service]);
+    await copyFile(backup, path.join(directory, "vc.sqlite3"));
+    for (const suffix of ["-wal", "-shm"]) await rm(path.join(directory, `vc.sqlite3${suffix}`), { force: true });
+    service = startServer();
+    await ready(`http://127.0.0.1:${serverPort}/health`, service);
+    for (const i of pages.keys()) await reconnect(i);
+  };
+  await restore(snapshot);
   await until("the conversation is restarted", async () => (await Promise.all(pages.map(page => page.evaluate(c => window.mls.runtime.status(c) === "ready" && window.mls.runtime.roster(c)?.restarted === true, conversation)))).every(Boolean), 150_000);
   const groups = new Set(await Promise.all(pages.map(page => page.evaluate(c => window.mls.runtime.roster(c).group, conversation))));
   assert.equal(groups.size, 1); assert.ok(!groups.has(message.group));
@@ -115,6 +121,9 @@ try {
   // An encrypted channel: its creator makes the group, another member's device
   // joins it by itself and gets the earlier key through a routed assignment.
   // Printed once, by the server's first start.
+  // Only the creator is online until the backup below, so no other device
+  // can join before it (every member's device joins by itself).
+  for (const page of pages.slice(1)) await page.evaluate(() => window.mls.runtime.close());
   const token = /redeem this one-time admin token in your client: (\S+)/.exec(children.map(child => child.output).join("\n"))?.[1];
   assert.ok(token, "admin token in the server log");
   const channel = await pages[0].evaluate(async token => {
@@ -126,14 +135,34 @@ try {
   const sealedChannel = `channel:${channel.id}`;
   await until("the creator's channel group", () => pages[0].evaluate(c => window.mls.runtime.status(c) === "ready", sealedChannel));
   const channelMessage = await pages[0].evaluate(c => window.mls.seal(c), sealedChannel);
+  // The channel's server state before anyone else joins, to lose it later.
+  const beforeJoin = path.join(directory, "before-channel-join.sqlite3");
+  execFileSync(binary, ["--data-dir", directory, "backup", beforeJoin]);
+  for (const i of [1, 2, 3]) await reconnect(i);
   await until("the other member joins", () => pages[3].evaluate(c => window.mls.runtime.status(c) === "ready", sealedChannel));
   // The first device the server asks may lack the earlier epoch (it joined
   // after the message); the next request is allowed a minute later.
   await until("the earlier key arrives", async () => (await pages[3].evaluate(m => window.mls.runtime.openMessage(m), channelMessage)).ok?.text === "encrypted hello", 90_000);
   console.log("PASS a member joins an encrypted channel's group and receives its earlier key");
+  // The server loses those joins too (every device of both members is in the
+  // group by now): the channel restarts like a direct message, its members
+  // follow the one new group and keep the earlier key.
+  await until("every device joins", async () => (await Promise.all(pages.map(page => page.evaluate(c => window.mls.runtime.status(c) === "ready", sealedChannel)))).every(Boolean));
+  for (const page of pages) assert.deepEqual(await page.evaluate(c => { const r = window.mls.runtime.roster(c); return { group: r.group, restarted: r.restarted }; }, sealedChannel), { group: channelMessage.group, restarted: false });
+  // Every device holds the earlier key before its group is superseded.
+  await until("every device has the earlier key", async () => (await Promise.all(pages.map(page => page.evaluate(m => window.mls.runtime.openMessage(m).then(r => r.ok?.text), channelMessage)))).every(text => text === "encrypted hello"), 150_000);
+  await restore(beforeJoin);
+  await until("the channel is restarted", async () => (await Promise.all(pages.map(page => page.evaluate(c => window.mls.runtime.status(c) === "ready" && window.mls.runtime.roster(c)?.restarted === true, sealedChannel)))).every(Boolean), 150_000);
+  const channelGroups = new Set(await Promise.all(pages.map(page => page.evaluate(c => window.mls.runtime.roster(c).group, sealedChannel))));
+  assert.equal(channelGroups.size, 1); assert.ok(!channelGroups.has(channelMessage.group));
+  const afterRestart = await pages[3].evaluate(c => window.mls.seal(c), sealedChannel);
+  await until("the restarted channel's message opens", async () => (await Promise.all(pages.map(page => page.evaluate(m => window.mls.runtime.openMessage(m).then(r => r.ok?.text), afterRestart)))).every(text => text === "encrypted hello"));
+  for (const page of pages) assert.equal((await page.evaluate(m => window.mls.runtime.openMessage(m), channelMessage)).ok?.text, "encrypted hello");
+  console.log("PASS a server behind an encrypted channel's members leads to one restart they all follow, keeping earlier keys");
   // Deleting the channel deletes its group on every device.
   await pages[0].evaluate(id => window.mls.link.request("channel.delete", { channel: id }), channel.id);
-  await until("the group is forgotten", () => pages[3].evaluate(m => window.mls.epochKey(m.group, m.epoch).then(key => key === null), channelMessage));
+  // Both the restarted group and the one before it, on both members' devices.
+  await until("the groups are forgotten", async () => (await Promise.all([pages[0], pages[3]].flatMap(page => [channelMessage, afterRestart].map(m => page.evaluate(m => window.mls.epochKey(m.group, m.epoch).then(key => key === null), m))))).every(Boolean));
   console.log("PASS deleting an encrypted channel deletes its group state");
   // Restart on the same origin/device: IndexedDB state and Welcome dedupe survive.
   await pages[1].evaluate(() => window.mls.runtime.close());

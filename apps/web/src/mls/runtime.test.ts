@@ -464,7 +464,10 @@ describe("Restarts", () => {
     await expect(f.runtime.sync()).rejects.toThrow("behind");
     expect(f.operations.some(o => o.op === "create")).toBe(false);
     now += 1_000;
-    await f.runtime.sync().catch(() => {});
+    // The server holds the new group from its first epoch.
+    f.world.beforeLog = async () => { if (f.operations.some(o => o.op === "create")) f.world.head = 0; };
+    // Restarting is not a failure of the pass.
+    await f.runtime.sync();
     const create = f.operations.find(o => o.op === "create");
     // The next incarnation, naming the pinned group.
     expect(statement(create).split("\n").slice(4, 6)).toEqual(["1", group]);
@@ -649,6 +652,41 @@ describe("Channel groups", () => {
     now += 1; await f.runtime.sync();
     expect(f.calls.filter(c => c.op === "mls.history.request")).toHaveLength(2);
     expect(await intents()).toEqual([]);
+  });
+  it("does not back off a channel this device restarted", async () => {
+    asChannel();
+    let now = 1_000_000;
+    const f = await fixture({ ...clean(), groups: [summary("active", "5")] }, true, { channels: [channel()], now: () => now });
+    f.world.head = 3;
+    await f.runtime.sync();
+    expect(String(f.errors.at(-1))).toContain("behind");
+    now += 60_000;
+    f.world.beforeLog = async () => { if (f.operations.some(o => o.op === "create")) f.world.head = 0; };
+    const errors = f.errors.length;
+    await f.runtime.sync();
+    expect(f.calls.some(c => c.op === "mls.group.create")).toBe(true);
+    expect(f.errors).toHaveLength(errors);
+    // The new group's next change is synchronized right away.
+    const logs = f.calls.filter(c => c.op === "mls.log").length;
+    f.commitEvent(); await f.runtime.sync();
+    expect(f.calls.filter(c => c.op === "mls.log").length).toBeGreaterThan(logs);
+  });
+  it("does not back off a channel restarted while sending", async () => {
+    asChannel();
+    let now = 1_000_000;
+    const random = vi.spyOn(Math, "random").mockReturnValue(1);
+    const f = await fixture({ ...clean(), groups: [summary("active", "5")] }, true, { channels: [channel()], now: () => now });
+    f.world.head = 3;
+    // Three failed passes: the next one is due 70 s after the first.
+    await f.runtime.sync(); now += 10_000; await f.runtime.sync(); now += 20_000; await f.runtime.sync();
+    random.mockRestore();
+    now += 30_000;
+    f.world.beforeLog = async () => { if (f.operations.some(o => o.op === "create")) f.world.head = 0; };
+    await expect(f.runtime.sealMessage(conversation, async () => { throw new Error("not reached"); })).rejects.toThrow("restarted");
+    expect(f.calls.some(c => c.op === "mls.group.create")).toBe(true);
+    const logs = f.calls.filter(c => c.op === "mls.log").length;
+    f.commitEvent(); await f.runtime.sync();
+    expect(f.calls.filter(c => c.op === "mls.log").length).toBeGreaterThan(logs);
   });
   it("asks for history after a restart when the request before it failed", async () => {
     asChannel();

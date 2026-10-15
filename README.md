@@ -490,14 +490,15 @@ VC_TS3_DIR=/tmp/ts3 cargo test -p vc-client --test teamspeak_mode --test teamspe
 
 ## Roadmap
 
-- **Steadier connections and even lower latency**, the next focus. The goal
-  is lower mouth-to-ear latency than TeamSpeak on the same network, measured
-  on both. The default becomes a balanced low-latency mode: 10 ms Opus
-  frames that keep its speech codec and loss recovery, a jitter buffer that
-  starts at one frame and grows only when the network needs it, and a
-  smaller playout buffer. Each step is measured for latency and for audio
-  lost on lossy links, so lower latency never costs choppy voice. An extreme
-  mode for very good connections may follow as an option.
+- **Even lower latency, measured against TeamSpeak.** The desktop app
+  already runs the balanced low-latency mode: 10 ms Opus frames that keep
+  its speech codec and loss recovery, and adaptive playout that grows only
+  when the network needs it (see [docs/latency.md](docs/latency.md)). Next
+  is a head-to-head measurement with TeamSpeak on the same network, then
+  real devices, lossy internet links and the web app's path. Each step is
+  measured for latency and for audio lost on lossy links, so lower latency
+  never costs choppy voice. An extreme mode for very good connections may
+  follow as an option.
 - **Clean audio**: noise suppression and echo cancellation, applied on your
   device before encoding (so they also work with end-to-end encryption). On
   the desktop RNNoise by default, which adds almost no latency, with

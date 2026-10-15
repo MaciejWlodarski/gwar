@@ -818,6 +818,8 @@ then channel info says "Messages are end-to-end encrypted", not more.
 - **Joining**: after connecting, a device joins, by external commit, the
   group of every encrypted channel it is not in, at most two at a time, with
   a random delay of up to two seconds between joins and backoff on failure.
+  A restart the device itself makes is not a failure: it keeps its new
+  group current without waiting.
 - **Leaving the server** removes the member's devices from every channel
   group by server proposals, as for direct messages ("Removal proposals").
   Deleting a channel deletes its groups, log, Welcomes, history chunks and
