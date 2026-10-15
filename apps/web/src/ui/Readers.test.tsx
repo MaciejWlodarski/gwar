@@ -8,7 +8,7 @@ import { welcome } from "../net/testing";
 import { ReadersDialog } from "./Readers";
 import { TooltipProvider } from "./kit";
 
-const roster = { history: true, since: 0, members: [{ uid: "alice", device_key: "a1" }, { uid: "alice", device_key: "a2" }, { uid: "bob", device_key: "b1" }] };
+const roster = { group: "g", restarted: false, history: true, since: 0, members: [{ uid: "alice", device_key: "a1" }, { uid: "alice", device_key: "a2" }, { uid: "bob", device_key: "b1" }] };
 vi.mock("../state/controller", () => ({ controller: { roster: () => roster, onRoster: () => () => {} }, UploadError: class extends Error {} }));
 
 let container: HTMLDivElement, root: Root;

@@ -363,7 +363,9 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
   const roster = useRoster(key);
   // Without shared history, rows from before my account joined stay unreadable: one muted line stands for them.
   const unshared = useCallback((i: ChatItem) => i.kind === "msg" && i.cannotOpen === "no_key" && !!i.sealed
-    && roster?.history === false && roster.since !== null && i.sealed.epoch < roster.since, [roster]);
+    && roster?.history === false && roster.since !== null && i.sealed.group === roster.group && i.sealed.epoch < roster.since, [roster]);
+  // Nobody shares keys of an earlier incarnation any more: those rows wait for nothing.
+  const superseded = useCallback((i: ChatItem) => i.kind === "msg" && !!i.sealed && !!roster && i.sealed.group !== roster.group, [roster]);
   const allFailed = useOutbox((o) => o.failed);
   const failed = useMemo(() => allFailed.filter((f) => f.thread === key), [allFailed, key]);
   const serverKey = controller.messageServerKey;
@@ -536,8 +538,9 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
             )}
           </EmptyState>
         )}
+        {roster?.restarted && <p className="px-4 py-2 text-center text-xs text-subtle">{t("chat.restarted")}</p>}
         {thread?.items.some(unshared) && <p className="px-4 py-2 text-center text-xs text-subtle">{t("chat.historyNotShared")}</p>}
-        {thread?.items.some(i => i.kind === "msg" && i.cannotOpen === "no_key" && !unshared(i)) && <p className="px-4 py-2 text-xs text-subtle" role="status">{t("chat.waitingHistory")}</p>}
+        {thread?.items.some(i => i.kind === "msg" && i.cannotOpen === "no_key" && !unshared(i) && !superseded(i)) && <p className="px-4 py-2 text-xs text-subtle" role="status">{t("chat.waitingHistory")}</p>}
         {rows.map((row) => {
           if (row.type === "day")
             return (

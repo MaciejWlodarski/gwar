@@ -152,9 +152,9 @@ direct message `private` is 0 and `history` is 1, and both uids are distinct
 and sorted), the creator credential is well-formed with uid `creator_uid`, and
 the signature verifies with its `device_key`.
 
-Restarts are rejected until step 4 specifies the predecessor chain with
-channels: the shared context rules return `Invalid("restart")` for every
-`incarnation != 0`, on the observer and all client creation/join paths.
+The shared context rules accept any incarnation; the server checks a
+restart's predecessor at creation, and clients accept one only along its
+chain (section 4, "Restarts").
 
 ### External sender
 
@@ -502,7 +502,7 @@ page without scanning key packages.
 | `mls.group_info {group}` | `{group_info, epoch}` | the session may read the conversation |
 | `mls.commit {group, epoch, commit, group_info, welcome?}` | `{epoch}`, or error `stale`, `expired`, `early` or `bad_request` | below |
 | `mls.log {group, since, limit?}` | `{head, oldest, entries: [{epoch, proposals, commit}], pending}` | entries from epoch `since`, each keyed by the epoch its commit was made in (it moved the group to `epoch + 1`); `proposals` are the server proposals the commit references, to be processed before it; `pending` the server's outstanding proposals for the head epoch (see "Removal proposals"); 90 days kept |
-| `mls.groups {}` | `{groups: [{conversation, group, epoch, pending}]}` | the live group of every conversation the session may read; `pending` whether outstanding proposals exist |
+| `mls.groups {}` | `{groups: [{conversation, group, incarnation, epoch, pending}]}` | the live group of every conversation the session may read; `pending` whether outstanding proposals exist |
 | `mls.welcomes {}` | `{welcomes: [{id, group, welcome}]}` | for the session's device; repeatable |
 | `mls.welcomes.ack {ids}` | `{}` | after the client stored the joined group durably; deletes them. The client stores the Welcome's id with the joined group in one write, and acknowledges a Welcome whose id it already has without processing it again (its key package is used up) |
 | `mls.history.share {group, recipient, chunk, assignment?}` | `{}` | the session's device and `recipient` both have leaves in the group's current epoch (observer); the chunk parses (netstrings, header fields canonical) and its header names the server key, `group`, `recipient` with its published HPKE key, and the session's device key as sender; the signature verifies with that key. The recipient must differ from the sender's own device, and `last_epoch` must not exceed the group's current epoch. In one write transaction the server checks these rules and the SHA-256 of the chunk bytes: the same hash for the same group and recipient is idempotent (`{}`, no new row or broadcast), even at quota. At most 64 stored chunks per `(group, recipient device, sender_uid)` and three distinct senders per recipient/group are allowed; exceeding either returns `quota_exceeded` without a write. A new chunk is stored with `sender_uid` = the session's uid and ends the recipient's outstanding request in that same transaction (in channel and server groups only when it names an active assignment of that request, section 4) |
@@ -764,7 +764,8 @@ Status: 4a server side built (delivery service, history routing, TeamSpeak
 bridge); the agent and the browser runtime keep channel groups (create, join,
 history assignments, leaf updates, deleted channels); the web client reads and
 writes encrypted channels (create options, sealed chat, gap lines, mention
-scan and accounting, moderator removal, "Who can read"); restarts are next. Built as three pull requests, in this order: **4a**
+scan and accounting, moderator removal, "Who can read"); restarts are built,
+for direct messages and channels. Built as three pull requests, in this order: **4a**
 channels (options, groups, sealed channel messages, unread counts and
 mentions, TeamSpeak text isolation, restarts); **4b** encrypted attachments,
 in channels and direct messages; **4c** encrypted server-wide chat and large
@@ -994,9 +995,11 @@ channels and server chat:
   a GroupInfo of an earlier epoch or with another GroupContext for the same
   epoch, or a log whose head is behind it. It takes two such failed checks
   against the same live pin and checkpoint, at least one minute apart. Any
-  validated response at that checkpoint or continuing from it cancels the
-  trigger, also when there was nothing to merge, and a later failure starts
-  the wait again; a changed pin or checkpoint discards pending checks. A server whose live incarnation is older than the device's pin
+  validated response at that checkpoint or continuing from it (a verified
+  GroupInfo at that GroupContext or later, also when there was nothing to
+  merge, or a log entry merged from it) cancels the trigger, and a later
+  failure starts the wait again; a log that only reports its head at the
+  checkpoint proves nothing and decides nothing; a changed pin or checkpoint discards pending checks. A server whose live incarnation is older than the device's pin
   (it lost a restart) never replaces the pin and never leads the device to
   create a sibling: the device stays blocked in that conversation ("Securing
   this conversation…") until the server again holds its pinned incarnation
@@ -1017,14 +1020,40 @@ channels and server chat:
   section 1, not of the signed envelope), server key and
   conversation, consecutive incarnation numbers, each `previous_group_id`
   equal to the group before, the unchanged fields above, and that each
-  creator may create the conversation (at its creation time, by the rules of
-  "Who may do what"). An existing device anchors the chain at its highest
+  creator was certified at its creation time and, for a direct message, is
+  one of its participants. That the creator could then create the
+  conversation ("Who may do what": a member, who can read the channel) is
+  the server's check at `mls.group.create`, as for incarnation zero: a
+  device has no record of past server membership. An existing device anchors the chain at its highest
   accepted pin; a new device validates from incarnation zero (the
   first-contact limit of the design's "Freshness"). The accepted pins and the
   highest live incarnation are persisted in one write; a predecessor is never
   live again. Old incarnations keep their keys for reading and nobody writes
   to them; the conversation shows a quiet line "This conversation was
   restarted".
+- **In the code.** `mls.groups` names each live group's `incarnation`. The
+  agent keeps one record per accepted incarnation: the live pin is the
+  highest that is not a creation still to settle. `check_pin` lets a device
+  join or accept a Welcome only for its live pin, or for incarnation zero
+  without any pin; `create` takes incarnation zero or the next incarnation of
+  the live pin, one candidate per predecessor. `accept_chain(server,
+  conversation, [(group, descriptor)])` verifies the chain from the live pin
+  (or from incarnation zero) and records the new incarnations (the last one
+  to be joined, as **Rejoin**, or settled as won when it is this device's
+  own creation); `settle` of a won restart and `accept_chain`
+  turn every earlier incarnation **Superseded**: its OpenMLS state, private
+  epoch key pairs and outbox are deleted, its epoch keys and evidence kept,
+  and the runtime's jobs for it go in the same write. `behind(server, group,
+  group_info)` verifies a GroupInfo of that group as an external joiner would
+  (tree, a member's signature, the rules; leaf lifetimes skipped) and reports whether it is behind the group's
+  checkpoint or forks it. The browser runtime counts a log head behind the
+  checkpoint, or such a GroupInfo when rejoining, as a failed check; pending
+  checks live in memory, so a reload starts the wait again. A held
+  conversation also imports no Welcome, shares no history and requests no
+  keys. A Welcome to a
+  superseded group is acknowledged without importing it. The chat shows the
+  restarted line when the live incarnation is above zero, and rows of earlier
+  incarnations that this device cannot open do not wait for history.
 
 ### Encrypted attachments (4b)
 

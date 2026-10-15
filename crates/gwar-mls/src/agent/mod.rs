@@ -74,6 +74,15 @@ fn checkpoint(context: &GroupContext) -> Result<Checkpoint> {
         hash: hash(&context.tls_serialize_detached().map_err(err("context encoding"))?),
     })
 }
+/// `next` restarts `previous`: the next incarnation, naming it, with the same
+/// server, conversation, kind, `private`, `history` and owner.
+fn successor(previous: &SignedDescriptor, next: &SignedDescriptor) -> bool {
+    let (p, n) = (&previous.descriptor, &next.descriptor);
+    p.incarnation.checked_add(1) == Some(n.incarnation)
+        && n.previous_group_id.as_deref() == Some(b64(&previous.group_id()).as_str())
+        && (&p.server_key, &p.conversation, p.kind, p.private, p.history, &p.founding_owner, &p.channel_group_id)
+            == (&n.server_key, &n.conversation, n.kind, n.private, n.history, &n.founding_owner, &n.channel_group_id)
+}
 fn json<T: Serialize>(value: &T) -> Vec<u8> {
     serde_json::to_vec(value).expect("record serialization")
 }
@@ -135,6 +144,9 @@ pub enum Status {
     Joining,
     Removed,
     Rejoin,
+    /// An earlier incarnation of a conversation that was restarted: no MLS
+    /// state, never live again; its epoch keys stay for reading.
+    Superseded,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -278,6 +290,10 @@ pub struct Member {
 pub struct GroupSummary {
     pub group: [u8; 32],
     pub conversation: String,
+    #[serde(with = "epoch_number")]
+    pub incarnation: u64,
+    /// The conversation's live pin: its highest accepted incarnation.
+    pub live: bool,
     pub history: bool,
     pub record: GroupRecord,
     pub members: Vec<Member>,
@@ -536,6 +552,14 @@ impl Agent {
     }
     /// Browser synchronization inventory, including tentative creations and pins.
     pub fn inventory(&self, server: &str) -> Result<Vec<GroupSummary>> {
+        let mut live = BTreeMap::new();
+        for (_, record) in
+            self.groups.iter().filter(|(k, r)| k.starts_with(&format!("{server}/")) && r.status != Status::Creating)
+        {
+            let d = SignedDescriptor::parse(&record.descriptor).ok_or(Invalid("descriptor"))?;
+            let top = live.entry(d.descriptor.conversation.clone()).or_insert(d.descriptor.incarnation);
+            *top = (*top).max(d.descriptor.incarnation);
+        }
         self.groups
             .iter()
             .filter(|(key, _)| key.starts_with(&format!("{server}/")))
@@ -556,6 +580,9 @@ impl Agent {
                 };
                 Ok(GroupSummary {
                     group: d.group_id(),
+                    live: record.status != Status::Creating
+                        && live.get(&d.descriptor.conversation) == Some(&d.descriptor.incarnation),
+                    incarnation: d.descriptor.incarnation,
                     conversation: d.descriptor.conversation,
                     history: d.descriptor.history,
                     record: record.clone(),
@@ -577,17 +604,73 @@ impl Agent {
         self.outbox.get(&group_key(server, id))
     }
 
-    fn check_pin(&self, descriptor: &SignedDescriptor) -> Result<()> {
-        let d = &descriptor.descriptor;
-        for record in self.groups.values() {
-            let old = SignedDescriptor::parse(&record.descriptor).ok_or(Invalid("descriptor"))?;
-            let o = &old.descriptor;
-            if (o.server_key.as_str(), o.conversation.as_str(), o.incarnation)
-                == (d.server_key.as_str(), d.conversation.as_str(), d.incarnation)
-                && old.group_id() != descriptor.group_id()
-            {
-                return Err(Invalid("group pin"));
+    /// This device's groups of one conversation: key, descriptor and status.
+    fn pins(&self, server: &str, conversation: &str) -> Result<Vec<(String, SignedDescriptor, Status)>> {
+        let prefix = format!("{server}/");
+        let mut pins = Vec::new();
+        for (key, record) in self.groups.iter().filter(|(k, _)| k.starts_with(&prefix)) {
+            let d = SignedDescriptor::parse(&record.descriptor).ok_or(Invalid("descriptor"))?;
+            if d.descriptor.conversation == conversation {
+                pins.push((key.clone(), d, record.status));
             }
+        }
+        Ok(pins)
+    }
+    /// The live pin: the highest accepted incarnation (a creation is not
+    /// accepted until it is settled).
+    fn live(&self, server: &str, conversation: &str) -> Result<Option<SignedDescriptor>> {
+        Ok(self
+            .pins(server, conversation)?
+            .into_iter()
+            .filter(|(_, _, status)| *status != Status::Creating)
+            .map(|(_, d, _)| d)
+            .max_by_key(|d| d.descriptor.incarnation))
+    }
+    /// One group per conversation and incarnation.
+    fn check_incarnation(&self, descriptor: &SignedDescriptor) -> Result<()> {
+        let d = &descriptor.descriptor;
+        if self
+            .pins(&d.server_key, &d.conversation)?
+            .iter()
+            .any(|(_, old, _)| old.descriptor.incarnation == d.incarnation && old.group_id() != descriptor.group_id())
+        {
+            return Err(Invalid("group pin"));
+        }
+        Ok(())
+    }
+    /// Only the live pin may be joined. A later incarnation needs its chain
+    /// accepted first, and without any pin only incarnation zero is a first
+    /// contact.
+    fn check_pin(&self, descriptor: &SignedDescriptor) -> Result<()> {
+        self.check_incarnation(descriptor)?;
+        let d = &descriptor.descriptor;
+        let key = group_key(&d.server_key, &descriptor.group_id());
+        if self.groups.get(&key).is_some_and(|r| r.status == Status::Superseded) {
+            return Err(Invalid("superseded"));
+        }
+        match self.live(&d.server_key, &d.conversation)?.map(|live| live.descriptor.incarnation) {
+            Some(live) if d.incarnation < live => Err(Invalid("superseded")),
+            Some(live) if d.incarnation > live => Err(Invalid("restart chain")),
+            None if d.incarnation > 0 => Err(Invalid("restart chain")),
+            _ => Ok(()),
+        }
+    }
+    /// Earlier incarnations are never live again: their MLS state, with every
+    /// epoch's private keys, and outbox go; epoch keys and evidence stay.
+    fn supersede(&mut self, server: &str, conversation: &str, live: u64) -> Result<()> {
+        for (key, d, status) in self.pins(server, conversation)? {
+            if d.descriptor.incarnation >= live || status == Status::Superseded {
+                continue;
+            }
+            let group_id = GroupId::from_slice(&d.group_id());
+            if let Some(mut group) = MlsGroup::load(self.provider.storage(), &group_id).map_err(err("load group"))? {
+                group.delete(self.provider.storage()).map_err(err("delete group"))?;
+            }
+            self.provider.storage().purge_epoch_key_pairs(&group_id).map_err(err("delete keys"))?;
+            self.outbox.remove(&key);
+            let record = self.groups.get_mut(&key).ok_or(Invalid("record"))?;
+            record.status = Status::Superseded;
+            record.server_pending = false;
         }
         Ok(())
     }
@@ -641,7 +724,20 @@ impl Agent {
             if descriptor.creator != a.credential || !a.credential.is_current(descriptor.descriptor.created_at, &()) {
                 return Err(Invalid("creator"));
             }
-            a.check_pin(&descriptor)?;
+            let d = &descriptor.descriptor;
+            if d.incarnation == 0 {
+                a.check_pin(&descriptor)?;
+            } else {
+                // A restart candidate continues this device's live pin, one per predecessor.
+                a.check_incarnation(&descriptor)?;
+                if a.pins(&d.server_key, &d.conversation)?
+                    .iter()
+                    .any(|(_, p, _)| p.descriptor.incarnation == d.incarnation)
+                    || !a.live(&d.server_key, &d.conversation)?.is_some_and(|live| successor(&live, &descriptor))
+                {
+                    return Err(Invalid("restart predecessor"));
+                }
+            }
             let key = group_key(&descriptor.descriptor.server_key, &descriptor.group_id());
             if a.groups.contains_key(&key) {
                 return Err(Invalid("group already known"));
@@ -694,20 +790,28 @@ impl Agent {
             if a.groups.get(&key).is_none_or(|r| r.status != Status::Creating) {
                 return Err(Invalid("not creating"));
             }
-            let mut group = a.mls(&key)?;
             if winner == Some(id) {
-                a.derived(&key, &group)?;
-                let record = a.groups.get_mut(&key).ok_or(Invalid("record"))?;
-                let created_at =
-                    SignedDescriptor::parse(&record.descriptor).ok_or(Invalid("descriptor"))?.descriptor.created_at;
-                record.own_commit_at = Some(created_at);
+                a.won(server, &key)?;
                 return Ok(true);
             }
             // A creating group has no epoch keys, outbox or other members.
+            let mut group = a.mls(&key)?;
             group.delete(a.provider.storage()).map_err(err("delete group"))?;
             a.groups.remove(&key);
             Ok(false)
         })
+    }
+
+    /// This device's creation is the group the server holds: it is active at
+    /// epoch zero, and a won restart is live at once while its predecessor
+    /// never is again.
+    fn won(&mut self, server: &str, key: &str) -> Result<()> {
+        let group = self.mls(key)?;
+        self.derived(key, &group)?;
+        let record = self.groups.get_mut(key).ok_or(Invalid("record"))?;
+        let d = SignedDescriptor::parse(&record.descriptor).ok_or(Invalid("descriptor"))?.descriptor;
+        record.own_commit_at = Some(d.created_at);
+        self.supersede(server, &d.conversation, d.incarnation)
     }
 
     pub fn gate(&self, server: &str, id: &[u8; 32], now: i64, revocations: &dyn Revocations) -> Result<Gate> {
@@ -1036,6 +1140,103 @@ impl Agent {
             a.groups.remove(&key);
             Ok(())
         })
+    }
+    /// Accepts a conversation's restarts (`mls.group_history`): each group
+    /// with its encoded `SignedDescriptor`, by incarnation, starting at this
+    /// device's live pin, or at incarnation zero without one. Every link must
+    /// verify (signature, group id, server, conversation, consecutive
+    /// incarnations naming their predecessor, unchanged fields, a creator
+    /// certified at its creation time). New incarnations are pinned, the last
+    /// becomes live, to be joined, and the earlier ones are superseded, all in
+    /// this one operation. Returns the live group.
+    pub fn accept_chain(
+        &mut self,
+        server: &str,
+        conversation: &str,
+        chain: &[([u8; 32], Vec<u8>)],
+    ) -> Result<[u8; 32]> {
+        self.operation(|a| {
+            let chain = chain
+                .iter()
+                .map(|(group, bytes)| {
+                    let d = SignedDescriptor::parse(bytes).ok_or(Invalid("chain descriptor"))?;
+                    let x = &d.descriptor;
+                    if d.group_id() != *group
+                        || x.server_key != server
+                        || x.conversation != conversation
+                        || !d.creator.is_current(x.created_at, &())
+                    {
+                        return Err(Invalid("chain descriptor"));
+                    }
+                    Ok(d)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let first = chain.first().ok_or(Invalid("chain anchor"))?;
+            let anchored = match a.live(server, conversation)? {
+                Some(live) => live.group_id() == first.group_id(),
+                None => first.descriptor.incarnation == 0,
+            };
+            if !anchored {
+                return Err(Invalid("chain anchor"));
+            }
+            if chain.windows(2).any(|w| !successor(&w[0], &w[1])) {
+                return Err(Invalid("chain link"));
+            }
+            for d in &chain {
+                a.check_incarnation(d)?;
+                a.groups.entry(group_key(server, &d.group_id())).or_insert_with(|| GroupRecord {
+                    descriptor: d.encode(),
+                    status: Status::Rejoin,
+                    checkpoint: None,
+                    welcome_ids: BTreeSet::new(),
+                    server_pending: false,
+                    evidence: BTreeMap::new(),
+                    own_commit_at: None,
+                });
+            }
+            let live = chain.last().expect("checked above");
+            let key = group_key(server, &live.group_id());
+            if a.groups[&key].status == Status::Creating {
+                // This device's own creation, which the server holds: it won.
+                a.won(server, &key)?;
+            }
+            // Earlier links, including a creation of this device the chain
+            // continued past, are never live again.
+            a.supersede(server, conversation, live.descriptor.incarnation)?;
+            Ok(live.group_id())
+        })
+    }
+    /// Whether a GroupInfo of `id`, verified as an external joiner would
+    /// (tree, a member's signature, Gwar's rules; leaf lifetimes are skipped,
+    /// as when joining, since an older GroupInfo may hold expired packages),
+    /// is behind this device's checkpoint of that group: an earlier epoch, or
+    /// another GroupContext for the same epoch. One of the observations that
+    /// trigger a restart.
+    pub fn behind(&self, server: &str, id: &[u8; 32], bytes: &[u8]) -> Result<bool> {
+        let info = info(bytes)?;
+        let descriptor = client_context(info.group_context(), server)?;
+        if descriptor.group_id() != *id {
+            return Err(Invalid("group info group"));
+        }
+        let tree = info
+            .extensions()
+            .ratchet_tree()
+            .ok_or(Invalid("no ratchet tree"))?
+            .ratchet_tree()
+            .clone()
+            .into_verified(SUITE, self.provider.crypto(), info.group_id())
+            .map_err(err("ratchet tree"))?;
+        rules::tree(&descriptor, tree.leaves())?;
+        let next = checkpoint(info.group_context())?;
+        // Verification only: a throwaway provider, and nothing is committed.
+        MlsGroup::external_commit_builder()
+            .skip_lifetime_validation()
+            .build_group(&Provider::default(), info, self.with_key())
+            .map_err(err("group info"))?;
+        let Some(old) = self.groups.get(&group_key(server, id)).and_then(|r| r.checkpoint.as_ref()) else {
+            return Ok(false);
+        };
+        Ok(next.epoch < old.epoch || next.epoch == old.epoch && next.hash != old.hash)
     }
     fn drop_mls(&mut self, key: &str) -> Result<()> {
         self.mls(key)?.delete(self.provider.storage()).map_err(err("delete group"))?;

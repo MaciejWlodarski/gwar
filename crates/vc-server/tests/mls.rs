@@ -1631,3 +1631,74 @@ async fn a_device_rejoining_a_channel_group_ends_its_history_request_and_assignm
         .await;
     assert_eq!(a.ok("mls.history.wanted", json!({})).await["wanted"], json!([]));
 }
+
+/// The next incarnation of `previous`, made by `device`.
+fn successor(
+    device: &Device,
+    previous: &SignedDescriptor,
+    incarnation: u64,
+    after: &str,
+    nonce: u8,
+) -> SignedDescriptor {
+    let mut d = previous.descriptor.clone();
+    d.incarnation = incarnation;
+    d.previous_group_id = Some(after.into());
+    d.creator_uid = device.credential.uid();
+    d.creation_nonce = b64(&[nonce; 16]);
+    SignedDescriptor::sign(d, device.credential.clone(), &device.signer.0)
+}
+
+#[tokio::test]
+async fn a_restart_continues_the_live_group_and_retires_its_predecessor() {
+    let server = TestServer::start().await;
+    let mut alice = Device::new(1, 11);
+    let mut a = connect_device(&server, &alice).await;
+    let mut b = connect_device(&server, &Device::new(2, 21)).await;
+    let conversation = vc_proto::dm_conversation(&uid(1), &uid(2));
+    let server_key = a.server_key.clone();
+    let first = descriptor(&alice, 2, &server_key, 1);
+    let old = create(&mut a, &mut alice, 2, 1).await;
+    a.ok("chat.sealed.send", sealed(&conversation, &old, 0, 1)).await;
+    let mut register = async |d: SignedDescriptor| {
+        let mut device = Device::new(1, 11);
+        device.create(&d, &server_key);
+        let request = json!({"conversation":conversation,"group_info":b64(&device.group_info())});
+        a.request("mls.group.create", request)
+            .await
+            .map(|r| r["group"].as_str().unwrap().to_owned())
+            .map_err(|e| e.code)
+    };
+
+    // Only the next incarnation, naming the live group, is accepted.
+    for (incarnation, previous) in [(2, old.clone()), (1, b64(&[9; 32]))] {
+        let d = successor(&alice, &first, incarnation, &previous, 2);
+        assert_eq!(register(d).await, Err(vc_proto::ErrorCode::BadRequest));
+    }
+    let next = register(successor(&alice, &first, 1, &old, 3)).await.unwrap();
+    assert_eq!(register(successor(&alice, &first, 1, &old, 4)).await, Err(vc_proto::ErrorCode::Conflict));
+    assert_eq!(register(descriptor(&alice, 2, &server_key, 5)).await, Err(vc_proto::ErrorCode::Conflict));
+
+    // The live group is listed with its incarnation; the chain is kept in order.
+    let listed = b.ok("mls.groups", json!({})).await;
+    assert_eq!(
+        listed["groups"],
+        json!([{"conversation":conversation,"group":next,"incarnation":1,"epoch":0,"pending":false}])
+    );
+    let chain = b.ok("mls.group_history", json!({"conversation":conversation})).await;
+    assert_eq!(
+        chain["incarnations"].as_array().unwrap().iter().map(|i| i["group"].clone()).collect::<Vec<_>>(),
+        [json!(old), json!(next)]
+    );
+    let after = B64.encode("0");
+    let chain = b.ok("mls.group_history", json!({"conversation":conversation,"after":after})).await;
+    assert_eq!(chain["incarnations"][0]["group"], next);
+
+    // Nobody writes to the predecessor any more; its messages stay readable.
+    let update = alice.update();
+    assert_eq!(a.fails("mls.commit", update_request(&old, 0, &update)).await, "stale");
+    assert_eq!(a.fails("chat.sealed.send", sealed(&conversation, &old, 0, 2)).await, "stale");
+    a.ok("chat.sealed.send", sealed(&conversation, &next, 0, 3)).await;
+    let history = b.ok("chat.sealed.history", json!({"conversation":conversation})).await;
+    let groups: Vec<_> = history["sealed"].as_array().unwrap().iter().map(|m| m["group"].clone()).collect();
+    assert_eq!(groups, [json!(old), json!(next)]);
+}

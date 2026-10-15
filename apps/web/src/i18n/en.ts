@@ -218,6 +218,7 @@ export const en = {
   "channel.devices.many": "{count} devices",
   "chat.messagesEncrypted": "Messages are end-to-end encrypted",
   "chat.historyNotShared": "Earlier messages aren't shared with new members.",
+  "chat.restarted": "This conversation was restarted.",
   "channel.removePassword": "Remove the password",
   "channel.maxClients": "Max users",
   "channel.maxHint": "Empty = unlimited.",

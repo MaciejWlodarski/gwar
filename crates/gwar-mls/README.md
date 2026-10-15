@@ -2,8 +2,7 @@
 
 `gwar_mls::Agent` implements the client part of MLS core. It has no wasm
 or networking dependency. The observer and agent share structural validation
-in `rules.rs`; both reject restart descriptors until the channels step specifies
-the predecessor chain.
+in `rules.rs`; restarts are accepted along their chain (below).
 Message encryption is in `chat`. The browser delivery, IndexedDB and Web Locks
 adapter is documented in [the web runtime](../../apps/web/src/mls/README.md).
 The DM UI integration remains a separate step.
@@ -40,6 +39,9 @@ reconcile(server: &str, id: &[u8; 32], result: Reconcile) -> Result<Resolution>
 share_history(server: &str, id: &[u8; 32], recipient: &DeviceHpkeKey,
               now: i64, revocations: &dyn Revocations) -> Result<Vec<Vec<u8>>>
 import_history(server: &str, id: &[u8; 32], bytes: &[u8]) -> Result<()>
+forget(server: &str, id: &[u8; 32]) -> Result<()>
+accept_chain(server: &str, conversation: &str,
+             chain: &[([u8; 32], Vec<u8>)]) -> Result<[u8; 32]>
 
 // Queries on &Agent:
 inventory(server: &str) -> Result<Vec<GroupSummary>>
@@ -51,6 +53,7 @@ gate(server: &str, id: &[u8; 32], now: i64,
      revocations: &dyn Revocations) -> Result<Gate>
 sending_key(server: &str, id: &[u8; 32], now: i64,
             revocations: &dyn Revocations) -> Result<(u64, [u8; 32])>
+behind(server: &str, id: &[u8; 32], group_info: &[u8]) -> Result<bool>
 ```
 
 `create` returns a TLS MLS GroupInfo message in persisted `Creating` state.
@@ -94,8 +97,9 @@ Other plaintext fields are skipped by this parser.
 The caller **must parse/validate the full plaintext and verify its v3
 MessageSignature**, including revision and revocation rules. This module does not assert author authenticity.
 
-`inventory(server)` returns each group's id, conversation, history policy,
-record and current member device keys/uids, including Creating groups. It
+`inventory(server)` returns each group's id, conversation, incarnation,
+whether it is the live pin, history policy, record and current member device
+keys/uids, including Creating and Superseded groups. It
 allows the runtime to settle creations and atomically queue history intents
 when an accepted transition admits devices without parsing OpenMLS records.
 
@@ -162,9 +166,24 @@ and comparing the device's stores per mutation.
 ## Acceptance, sending and recovery
 
 Welcome and external joins validate the resulting tree structurally, with
-pins and freshness. All group contexts must have incarnation zero; restarts
-return `Invalid("restart")` through the shared rule error until step 4. They
-require no admission proof or server time. Member
+pins and freshness, and require no admission proof or server time. Only the
+live pin, the highest accepted incarnation of a conversation, may be joined
+(`superseded` below it, `restart chain` above it or, without a pin, above
+zero). `accept_chain` verifies a conversation's restarts from the live pin,
+or from incarnation zero without one: each descriptor parses and verifies,
+names its group, server and conversation, has a creator certified at its
+creation time, and continues the one before (next incarnation, its group as
+`previous_group_id`, the same kind, `private`, `history`, owner and channel
+group). It records every new incarnation (the last as `Rejoin`, to be
+joined; this device's own creation there is settled as won) and supersedes
+the earlier ones in the same operation. `create`
+also takes a restart candidate: the next incarnation of the live pin, one per
+predecessor; settling it as the winner supersedes the predecessor.
+**Superseded** groups keep their epoch keys and evidence for reading; their
+OpenMLS state, private epoch key pairs and outbox are gone, and nothing can
+be sent, committed or imported there. `behind` verifies a GroupInfo of the
+named group as an external joiner would (leaf lifetimes skipped) and reports
+whether it is behind the group's checkpoint or forks it, a restart trigger. Member
 staged commits additionally check introduced/changed certificates at the time
 in signed `ds::commit_aad`. Later revocation or expiry never rejects an otherwise
 valid commit. Joins skip OpenMLS leaf lifetime checks; key packages expire no
@@ -277,7 +296,7 @@ cargo build -p vc-server --no-default-features
 pnpm --filter web e2e:mls
 ```
 
-The native suite has 62 unit tests and 11 observer integration tests. Chat
+The native suite has 78 unit tests and 11 observer integration tests. Chat
 coverage includes an independently generated Node HKDF/AES-GCM fixed vector,
 every AAD/inner context field, random nonces, wrong keys, every truncation,
 tampered nonce/ciphertext/tag, the sending gate and imported history keys.
@@ -286,8 +305,8 @@ real delivery service, four device runtimes, IndexedDB and Web Locks, with no
 DM UI or chat.sealed server calls. Remote CI and production were not run.
 
 With Rust 1.99.0, Node **22.23.3**, wasm-bindgen 0.2.129 and Binaryen 123.0.0,
-the artifact totals **463,780 bytes gzip**: wasm 460,737, minified loader 2,852,
-inline JavaScript 191; 16,220 bytes below the 480,000-byte limit.
+the artifact totals **476,253 bytes gzip**: wasm 473,205, minified loader 2,856,
+inline JavaScript 192; 3,747 bytes below the 480,000-byte limit.
 On this macOS host the wasm build uses the rustup toolchain's `bin` ahead of
 Homebrew Rust and a local rust-lld wrapper setting `DYLD_LIBRARY_PATH` to that
 toolchain's `lib` directory. CI uses the pinned Linux job.

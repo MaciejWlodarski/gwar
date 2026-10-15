@@ -67,12 +67,22 @@ without being asked (docs/e2e-build.md "Groups", "History in channels"):
   commit is older than seven days, one group per pass;
 - the group of a deleted channel is forgotten: the agent deletes its OpenMLS
   state, every epoch's keys, outbox, evidence and pin, and the runtime's jobs
-  for it go in the same write.
+  for it go in the same write;
+- restarts (docs/e2e-build.md, "Restarts"): a live group the server lists at
+  a higher incarnation is accepted through `mls.group_history` from the live
+  pin before it is joined; a conversation whose server holds an older
+  incarnation or a sibling of the pin is left alone (no sync, Welcome
+  import, history sharing or key requests) and stays "securing"; two checks at least a
+  minute apart that find the server behind the pin's checkpoint (a log head
+  behind it, or a GroupInfo behind or forking it when rejoining) create the
+  next incarnation, and a verified GroupInfo at or past the checkpoint, or a
+  log entry merged from it, cancels them.
 
-`roster(conversation)` reports an active group's devices by uid, its history
-option and the first epoch the device saw its own account in: the chat shows
-"Who can read" from it and collapses rows from before that epoch in a channel
-without shared history.
+`roster(conversation)` reports the live group (its id and whether it was
+restarted), its devices by uid, its history option and the first epoch the
+device saw its own account in: the chat shows "Who can read" from it,
+collapses rows from before that epoch in a channel without shared history,
+and says quietly when the conversation was restarted.
 
 `sync()` is also public for explicit retries and deterministic tests. Connect
 performs the first synchronization, reconnect Welcomes and MLS events schedule

@@ -130,7 +130,7 @@ export const responses: { [K in Op]: Rule<ResponseMap[K]> } = {
   "mls.group.create": shape({ group: mlsGroupId }), "mls.group_info": shape({ group_info: mlsBlob, epoch: id }),
   "mls.commit": shape({ epoch: id }),
   "mls.log": shape({ head: id, oldest: id, entries: array(mlsLogEntry, 100), pending: mlsProposals, next: nullable(id) }),
-  "mls.groups": shape({ groups: array(shape({ conversation, group: mlsGroupId, epoch: id, pending: bool }), 100), next: cursor }),
+  "mls.groups": shape({ groups: array(shape({ conversation, group: mlsGroupId, incarnation: id, epoch: id, pending: bool }), 100), next: cursor }),
   "mls.welcomes": shape({ welcomes: array(shape({ id: fixed(16), group: mlsGroupId, welcome: mlsBlob }), 100), next: cursor }),
   "mls.welcomes.ack": empty, "mls.history.share": empty,
   "mls.history.fetch": shape({ chunks: array(shape({ id: fixed(16), group: mlsGroupId, sender_uid: fixed(20), chunk: mlsChunk }), 100), next: cursor }),

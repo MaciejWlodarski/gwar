@@ -179,6 +179,22 @@ enum Request {
         server: String,
         group: [u8; 32],
     },
+    AcceptChain {
+        server: String,
+        conversation: String,
+        chain: Vec<Incarnation>,
+    },
+    Behind {
+        server: String,
+        group: [u8; 32],
+        bytes: Vec<u8>,
+    },
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Incarnation {
+    group: [u8; 32],
+    descriptor: Vec<u8>,
 }
 
 #[wasm_bindgen]
@@ -269,6 +285,11 @@ impl Agent {
             Request::Epoch { server, group, epoch } => output(a.epoch(&server, &group, epoch)),
             Request::Outbox { server, group } => output(a.outbox(&server, &group)),
             Request::Forget { server, group } => output(a.forget(&server, &group).map_err(error)?),
+            Request::AcceptChain { server, conversation, chain } => {
+                let chain: Vec<_> = chain.into_iter().map(|i| (i.group, i.descriptor)).collect();
+                output(a.accept_chain(&server, &conversation, &chain).map_err(error)?)
+            }
+            Request::Behind { server, group, bytes } => output(a.behind(&server, &group, &bytes).map_err(error)?),
         }
     }
 }
