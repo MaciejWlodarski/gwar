@@ -61,6 +61,7 @@ export class NativeVoiceEngine implements VoiceEngine {
   private lastDevices = "";
   private restartTimer: ReturnType<typeof setTimeout> | null = null;
   private smoothed = 0;
+  private micTestId = 0;
 
   private inputDevice: string | null = null;
   private outputDevice: string | null = null;
@@ -327,15 +328,21 @@ export class NativeVoiceEngine implements VoiceEngine {
   }
 
   async startMicTest(onLevel: (level: number) => void): Promise<() => void> {
+    const test = ++this.micTestId;
     const api = await this.ensureListeners();
     const { owner } = await this.ready;
     let smooth = 0;
     const off = await api.listen<{ owner: number; db: number }>("voice://test-level", (p) => {
-      if (p.owner !== owner) return;
+      if (p.owner !== owner || test !== this.micTestId) return;
       const target = dbToLevel(p.db);
       smooth = target > smooth ? target : smooth * 0.8 + target * 0.2;
       onLevel(smooth < 0.01 ? 0 : smooth);
     });
+    // Listener setup can finish after a newer test has already opened capture.
+    if (test !== this.micTestId) {
+      off();
+      return () => {};
+    }
     try {
       await this.invoke("mic_test_start", { input: this.inputDevice });
     } catch (e) {
@@ -345,6 +352,9 @@ export class NativeVoiceEngine implements VoiceEngine {
     void this.listDevices().then((d) => this.emit("devices", d));
     return () => {
       off();
+      // A late result belongs to its own test, never the replacement's capture.
+      if (test !== this.micTestId) return;
+      ++this.micTestId;
       this.send("mic_test_stop");
       onLevel(0);
     };

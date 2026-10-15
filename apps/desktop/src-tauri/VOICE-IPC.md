@@ -2,7 +2,10 @@
 
 The main window can call these app-owned Tauri commands. They are registered
 in `src/lib.rs`; `capabilities/default.json` grants event listening. App-owned
-commands do not need additional plugin permission entries.
+commands do not need additional plugin permission entries. Every command below
+checks the injected calling webview window and rejects any label other than
+`main` before accessing voice state or opening devices/settings. The capability's
+`windows` list alone does not restrict app-owned commands.
 
 | Command | Ownership and effect |
 | --- | --- |

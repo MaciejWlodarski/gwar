@@ -137,3 +137,66 @@ describe("native web-view ownership", () => {
     expect(state).toHaveBeenCalledWith("connected");
   });
 });
+
+describe("native microphone test replacement", () => {
+  it("keeps late startup cleanup and levels from stopping or updating the replacement", async () => {
+    const opening = deferred<void>();
+    const entered = deferred<void>();
+    const invoke = bridge.invoke.getMockImplementation()!;
+    let first = true;
+    bridge.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "mic_test_start" && first) {
+        first = false;
+        entered.resolve();
+        await opening.promise;
+      }
+      return invoke(command, args);
+    });
+    const view = engine();
+    const oldLevel = vi.fn();
+    const currentLevel = vi.fn();
+    const oldTest = view.startMicTest(oldLevel);
+    await entered.promise;
+    const stopCurrent = await view.startMicTest(currentLevel);
+    emit("voice://test-level", { owner: 1, db: -30 });
+    expect(oldLevel).not.toHaveBeenCalled();
+    expect(currentLevel).toHaveBeenCalledWith(0.5);
+    opening.resolve();
+    const stopOld = await oldTest;
+    stopOld();
+    await view.stop(); // Drain queued commands before asserting no stale mic stop was sent.
+    expect(bridge.invoke.mock.calls.filter(([command]) => command === "mic_test_stop")).toHaveLength(0);
+    emit("voice://test-level", { owner: 1, db: -30 });
+    expect(oldLevel).not.toHaveBeenCalled();
+    expect(currentLevel).toHaveBeenCalledWith(0.5);
+    stopCurrent();
+    await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("mic_test_stop", { owner: 1 }));
+  });
+
+  it("does not start an obsolete test whose event listener setup finishes after the replacement", async () => {
+    const listening = deferred<void>();
+    const entered = deferred<void>();
+    const listen = bridge.listen.getMockImplementation()!;
+    let first = true;
+    bridge.listen.mockImplementation(async (event: string, handler: (payload: never) => void) => {
+      if (event === "voice://test-level" && first) {
+        first = false;
+        entered.resolve();
+        await listening.promise;
+      }
+      return listen(event, handler);
+    });
+    const view = engine();
+    const oldTest = view.startMicTest(vi.fn());
+    await entered.promise;
+    const stopCurrent = await view.startMicTest(vi.fn());
+    listening.resolve();
+    const stopOld = await oldTest;
+    stopOld();
+    await view.stop(); // Drain queued commands before asserting no stale mic stop was sent.
+    expect(bridge.invoke.mock.calls.filter(([command]) => command === "mic_test_start")).toHaveLength(1);
+    expect(bridge.invoke.mock.calls.filter(([command]) => command === "mic_test_stop")).toHaveLength(0);
+    stopCurrent();
+    await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("mic_test_stop", { owner: 1 }));
+  });
+});

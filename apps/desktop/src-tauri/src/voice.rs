@@ -28,7 +28,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use tokio::sync::{oneshot, watch};
 use vc_client::voice::{
     InputMode, LinkState, VoiceHandle,
@@ -341,6 +341,11 @@ async fn resolve(host: &str) -> Result<IpAddr, String> {
 
 // -------------------------------------------------------------------- commands
 
+// Capabilities scope plugin permissions, not these app-owned commands.
+fn check_main_window(label: &str) -> Result<(), String> {
+    if label == "main" { Ok(()) } else { Err("voice commands require the main window".into()) }
+}
+
 fn check_owner(inner: &Inner, owner: u64) -> Result<(), String> {
     if owner == 0 || inner.owner != owner { Err("superseded owner".into()) } else { Ok(()) }
 }
@@ -371,8 +376,9 @@ fn bootstrap_owner(voice: &Voice) -> u64 {
 /// The engine calls this exactly once on construction, before other commands.
 /// Owner generations are native-issued and independent of timestamp-seeded runs.
 #[tauri::command]
-pub fn voice_bootstrap(voice: State<'_, Voice>) -> u64 {
-    bootstrap_owner(&voice)
+pub fn voice_bootstrap(window: WebviewWindow, voice: State<'_, Voice>) -> Result<u64, String> {
+    check_main_window(window.label())?;
+    Ok(bootstrap_owner(&voice))
 }
 
 // Claim/retire under the same lock as ownership, answers and the media handle.
@@ -448,7 +454,7 @@ impl StartBinding {
 
 #[tauri::command]
 pub async fn voice_start(
-    app: AppHandle,
+    window: WebviewWindow,
     voice: State<'_, Voice>,
     owner: u64,
     run: u64,
@@ -456,6 +462,8 @@ pub async fn voice_start(
     mode: String,
     binding: StartBinding,
 ) -> Result<(), String> {
+    check_main_window(window.label())?;
+    let app = window.app_handle().clone();
     if mode != "plaintext" {
         return Err("Encrypted voice is being added. Chat is available.".into());
     }
@@ -538,12 +546,14 @@ async fn start_vc(
 /// Delivers the server's answer (or a failure) for the offer of `run`.
 #[tauri::command]
 pub fn voice_answer(
+    window: WebviewWindow,
     voice: State<'_, Voice>,
     owner: u64,
     run: u64,
     sdp: Option<String>,
     error: Option<String>,
 ) -> Result<(), String> {
+    check_main_window(window.label())?;
     answer_run(&voice, owner, run, sdp, error)
 }
 
@@ -564,7 +574,8 @@ fn answer_run(voice: &Voice, owner: u64, run: u64, sdp: Option<String>, error: O
 }
 
 #[tauri::command]
-pub fn voice_stop(voice: State<'_, Voice>, owner: u64, run: u64) -> Result<(), String> {
+pub fn voice_stop(window: WebviewWindow, voice: State<'_, Voice>, owner: u64, run: u64) -> Result<(), String> {
+    check_main_window(window.label())?;
     retire_run(&voice, owner, run)
 }
 
@@ -627,7 +638,8 @@ async fn monitor(app: AppHandle, owner: u64, run: u64) {
 // ------------------------------------------------------------------- controls
 
 #[tauri::command]
-pub fn voice_set_muted(voice: State<'_, Voice>, owner: u64, muted: bool) -> Result<(), String> {
+pub fn voice_set_muted(window: WebviewWindow, voice: State<'_, Voice>, owner: u64, muted: bool) -> Result<(), String> {
+    check_main_window(window.label())?;
     let mut inner = voice.lock();
     check_owner(&inner, owner)?;
     inner.prefs.muted = muted;
@@ -638,7 +650,13 @@ pub fn voice_set_muted(voice: State<'_, Voice>, owner: u64, muted: bool) -> Resu
 }
 
 #[tauri::command]
-pub fn voice_set_deafened(voice: State<'_, Voice>, owner: u64, deafened: bool) -> Result<(), String> {
+pub fn voice_set_deafened(
+    window: WebviewWindow,
+    voice: State<'_, Voice>,
+    owner: u64,
+    deafened: bool,
+) -> Result<(), String> {
+    check_main_window(window.label())?;
     let mut inner = voice.lock();
     check_owner(&inner, owner)?;
     inner.prefs.deafened = deafened;
@@ -649,7 +667,8 @@ pub fn voice_set_deafened(voice: State<'_, Voice>, owner: u64, deafened: bool) -
 }
 
 #[tauri::command]
-pub fn voice_set_ptt(voice: State<'_, Voice>, owner: u64, active: bool) -> Result<(), String> {
+pub fn voice_set_ptt(window: WebviewWindow, voice: State<'_, Voice>, owner: u64, active: bool) -> Result<(), String> {
+    check_main_window(window.label())?;
     let mut inner = voice.lock();
     check_owner(&inner, owner)?;
     inner.prefs.ptt = active;
@@ -668,11 +687,13 @@ pub enum Mode {
 
 #[tauri::command]
 pub fn voice_set_input_mode(
+    window: WebviewWindow,
     voice: State<'_, Voice>,
     owner: u64,
     mode: Mode,
     threshold_db: Option<f32>,
 ) -> Result<(), String> {
+    check_main_window(window.label())?;
     let mut inner = voice.lock();
     check_owner(&inner, owner)?;
     inner.prefs.mode = match mode {
@@ -686,7 +707,13 @@ pub fn voice_set_input_mode(
 }
 
 #[tauri::command]
-pub fn voice_set_master_gain(voice: State<'_, Voice>, owner: u64, gain: f32) -> Result<(), String> {
+pub fn voice_set_master_gain(
+    window: WebviewWindow,
+    voice: State<'_, Voice>,
+    owner: u64,
+    gain: f32,
+) -> Result<(), String> {
+    check_main_window(window.label())?;
     let mut inner = voice.lock();
     check_owner(&inner, owner)?;
     inner.prefs.master = gain.clamp(0.0, 2.0);
@@ -697,7 +724,14 @@ pub fn voice_set_master_gain(voice: State<'_, Voice>, owner: u64, gain: f32) -> 
 }
 
 #[tauri::command]
-pub fn voice_set_slot_gain(voice: State<'_, Voice>, owner: u64, slot: usize, gain: f32) -> Result<(), String> {
+pub fn voice_set_slot_gain(
+    window: WebviewWindow,
+    voice: State<'_, Voice>,
+    owner: u64,
+    slot: usize,
+    gain: f32,
+) -> Result<(), String> {
+    check_main_window(window.label())?;
     let mut inner = voice.lock();
     check_owner(&inner, owner)?;
     if let Some(g) = inner.prefs.slot_gain.get_mut(slot) {
@@ -713,11 +747,13 @@ pub fn voice_set_slot_gain(voice: State<'_, Voice>, owner: u64, slot: usize, gai
 /// time voice starts; the UI restarts voice when it changes while connected.
 #[tauri::command]
 pub fn voice_set_devices(
+    window: WebviewWindow,
     voice: State<'_, Voice>,
     owner: u64,
     input: Option<String>,
     output: Option<String>,
 ) -> Result<(), String> {
+    check_main_window(window.label())?;
     let mut inner = voice.lock();
     check_owner(&inner, owner)?;
     inner.prefs.input = input;
@@ -740,7 +776,8 @@ fn dedupe(mut names: Vec<String>) -> Vec<String> {
 }
 
 #[tauri::command]
-pub async fn audio_devices() -> Result<Devices, String> {
+pub async fn audio_devices(window: WebviewWindow) -> Result<Devices, String> {
+    check_main_window(window.label())?;
     // Enumeration talks to the OS audio stack and can block for a moment.
     let (inputs, outputs) =
         tokio::task::spawn_blocking(vc_client::voice::io::devices).await.map_err(|e| e.to_string())?;
@@ -759,11 +796,13 @@ struct TestLevel {
 /// `mic_test_stop`. Independent of the voice session.
 #[tauri::command]
 pub async fn mic_test_start(
-    app: AppHandle,
+    window: WebviewWindow,
     voice: State<'_, Voice>,
     owner: u64,
     input: Option<String>,
 ) -> Result<(), String> {
+    check_main_window(window.label())?;
+    let app = window.app_handle().clone();
     let test = {
         let mut inner = voice.lock();
         check_owner(&inner, owner)?;
@@ -806,7 +845,8 @@ pub async fn mic_test_start(
 }
 
 #[tauri::command]
-pub fn mic_test_stop(voice: State<'_, Voice>, owner: u64) -> Result<(), String> {
+pub fn mic_test_stop(window: WebviewWindow, voice: State<'_, Voice>, owner: u64) -> Result<(), String> {
+    check_main_window(window.label())?;
     let mut inner = voice.lock();
     check_owner(&inner, owner)?;
     if let Some(test) = inner.mic_test.take() {
@@ -820,7 +860,8 @@ pub fn mic_test_stop(voice: State<'_, Voice>, owner: u64) -> Result<(), String> 
 /// Opens the operating system's microphone privacy page, so the user can allow
 /// Gwar after refusing the prompt. Errors on platforms without such a page.
 #[tauri::command]
-pub fn open_mic_privacy_settings() -> Result<(), String> {
+pub fn open_mic_privacy_settings(window: WebviewWindow) -> Result<(), String> {
+    check_main_window(window.label())?;
     let url = if cfg!(target_os = "macos") {
         "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
     } else if cfg!(target_os = "windows") {
@@ -838,6 +879,14 @@ mod run_tests {
         sync::atomic::{AtomicBool, AtomicUsize},
         task::Poll,
     };
+
+    #[test]
+    fn voice_commands_require_the_main_window_label() {
+        assert_eq!(check_main_window("main"), Ok(()));
+        for label in ["", "secondary", "Main", "main-popup"] {
+            assert_eq!(check_main_window(label), Err("voice commands require the main window".into()));
+        }
+    }
 
     struct Closed(Arc<AtomicBool>);
     impl Drop for Closed {
