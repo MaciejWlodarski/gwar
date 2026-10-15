@@ -56,6 +56,10 @@ class GroupChanged extends Error {
 class HeldWelcome extends Error {
   constructor() { super("The Welcome's conversation is held for a restart"); }
 }
+/** This device just restarted the conversation: the old group's sync stops, without failing. */
+class Restarted extends Error {
+  constructor() { super("The conversation was restarted"); }
+}
 /** UI-independent MLS session. No messages are sent by this class. */
 export class MlsRuntime {
   private server = "";
@@ -370,7 +374,10 @@ export class MlsRuntime {
     }
     this.held = await this.acceptRestarts(groups);
     await this.welcomes();
-    for (const g of groups) if (g.conversation.startsWith("dm:") && !this.held.has(g.conversation)) await this.syncGroup(g.group, g.pending);
+    for (const g of groups) if (g.conversation.startsWith("dm:") && !this.held.has(g.conversation)) {
+      try { await this.syncGroup(g.group, g.pending); }
+      catch (error) { if (!(error instanceof Restarted)) throw error; }
+    }
     await this.syncChannels(groups);
     await this.importHistory();
     let after: string | null = null;
@@ -422,8 +429,8 @@ export class MlsRuntime {
   }
   /** The server showed this device's live pin behind its durable checkpoint.
    * Two such checks against the same pin and checkpoint, at least a minute
-   * apart, restart the conversation; a response at or after the checkpoint
-   * cancels them. */
+   * apart, restart the conversation (and throw Restarted); a response at or
+   * after the checkpoint cancels them. */
   private async observeBehind(local: GroupSummary): Promise<void> {
     const checkpoint = local.record.checkpoint;
     if (!local.live || !checkpoint) return;
@@ -433,7 +440,7 @@ export class MlsRuntime {
     else if (this.now() - first.at >= RESTART_AFTER) {
       this.triggers.delete(local.conversation);
       await this.createGroup(local.conversation, local.history, { incarnation: Number(local.incarnation) + 1, previous: encoded(local.group) });
-      return;
+      throw new Restarted();
     }
     this.wakeAt = Math.min(this.wakeAt ?? Infinity, this.triggers.get(local.conversation)!.at + RESTART_AFTER);
   }
@@ -497,6 +504,8 @@ export class MlsRuntime {
         if (remote) await this.requestHistory(remote.group);
       } catch (error) {
         this.assertCurrent(this.activeGeneration);
+        // The new group is synchronized; backing off would leave it behind.
+        if (error instanceof Restarted) { this.channelDue.delete(conversation); continue; }
         // Durable state is authoritative: drop whatever the failure left in memory.
         await this.engine.reload();
         this.failed(conversation, error);
