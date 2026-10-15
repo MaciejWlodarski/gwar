@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ChatItem } from "../state/types";
-import { buildRows, messageTarget, unreadLabel } from "./chat";
+import { buildRows, messageTarget, unreadLabel, sealedThread, threadConversation, conversationThread } from "./chat";
 
 const base = new Date(2026, 5, 10, 12, 0, 0).getTime();
 const m = (id: number, uid: string, at: number): ChatItem => ({
@@ -55,5 +55,19 @@ describe("messageTarget", () => {
   it("uses the stored channel or server target", () => {
     expect(messageTarget("ch:7", "alice", "alice")).toBe("channel:7");
     expect(messageTarget("server", "bob", "alice")).toBe("server");
+  });
+});
+
+
+describe("sealed server routing", () => {
+  it("maps the server thread and conversation without DM participants", () => {
+    expect(threadConversation("server", "alice")).toBe("server");
+    expect(conversationThread("server", undefined)).toBe("server");
+  });
+  it("seals server chat only for encrypted Gwar sessions", () => {
+    expect(sealedThread("server", "vc", {}, { encrypted: true })).toBe(true);
+    expect(sealedThread("server", "vc", {}, { encrypted: false })).toBe(false);
+    expect(sealedThread("server", "vc", {})).toBe(false);
+    expect(sealedThread("server", "teamspeak", {}, { encrypted: true })).toBe(false);
   });
 });

@@ -925,7 +925,7 @@ class Controller {
   /** Encrypted threads on screen: the open chat and the channel I am looking at. */
   private sealedOnScreen(s: SessionSnapshot): SealedKey[] {
     const keys = new Set([storedKey(s, s.activeThread), s.viewChannel === null ? null : channelThreadKey(s.viewChannel)]);
-    return [...keys].filter(k => sealedThread(k, s.kind, s.channels)) as SealedKey[];
+    return [...keys].filter(k => sealedThread(k, s.kind, s.channels, s.server?.server_chat)) as SealedKey[];
   }
 
   updateChannel(u: Omit<ChannelUpdate, "move_to_root"> & { move_to_root?: boolean }) {
@@ -1068,7 +1068,7 @@ class Controller {
   async sendChat(key: ThreadKey, text: string, options: SendOptions = {}): Promise<boolean> {
     const state = useSession.getState();
     const stored = storedKey(state, key);
-    if (sealedThread(stored, state.kind, state.channels)) {
+    if (sealedThread(stored, state.kind, state.channels, state.server?.server_chat)) {
       try {
         if (!this.sealed) throw new Error(tNow("chat.securing"));
         const conn = this.conn;
@@ -1414,7 +1414,7 @@ class Controller {
     // TeamSpeak keeps no read state: unread counts there are purely local.
     if (s.phase !== "online" || s.kind !== "vc" || !s.focused) return null;
     const active = storedKey(s, s.activeThread);
-    if (sealedThread(active, s.kind, s.channels)) {
+    if (sealedThread(active, s.kind, s.channels, s.server?.server_chat)) {
       const thread = s.threads[active!], latest = latestMessageId(thread);
       const conversation = threadConversation(active!, s.me!.uid);
       return thread && latest > Math.max(thread.lastRead, this.sentRead.get(conversation) ?? 0) ? { conversation, message: latest } : null;
@@ -1446,7 +1446,7 @@ class Controller {
   async loadOlder(): Promise<void> {
     const s = useSession.getState();
     const key = storedKey(s, s.activeThread);
-    if (sealedThread(key, s.kind, s.channels)) {
+    if (sealedThread(key, s.kind, s.channels, s.server?.server_chat)) {
       const thread = s.threads[key!], first = thread?.items.find(i => i.kind === "msg");
       if (thread?.hasMore && first?.kind === "msg") await this.sealed?.open(key as SealedKey, first.msg.id);
       return;

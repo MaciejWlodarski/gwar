@@ -7,7 +7,7 @@ import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRe
 import { countKey, useLanguage, useT, type TFn } from "../i18n";
 import { cn } from "../lib/cn";
 import { memberName } from "../lib/member-name";
-import { buildRows, messageTarget, encryptedDm, sealedThread, type Row } from "../lib/chat";
+import { buildRows, messageTarget, sealedThread, type Row } from "../lib/chat";
 import { useIsMobile } from "../lib/media";
 import { checkUpload, formatBytes } from "../lib/files";
 import { splitMentions } from "../lib/mentions";
@@ -18,7 +18,7 @@ import type { ChatMessage } from "../proto/ChatMessage";
 import { controller, UploadError } from "../state/controller";
 import { myChannelId, storedKey } from "../state/reducer";
 import { useOutbox, useSession, useUi } from "../state/stores";
-import type { ChatItem, ThreadKey } from "../state/types";
+import type { ChatItem, ThreadKey, StoredThreadKey } from "../state/types";
 import { AttachmentList } from "./Attachments";
 import { ConnectBadge, MentionBadge, UnreadBadge } from "./badges";
 import { usePermission, useRoster, useUidColor } from "./hooks";
@@ -105,6 +105,14 @@ function formatDay(at: number, lang: string, t: TFn): string {
 function quietDeletion(v: MessageVerification): boolean {
   return v.status === "verified" && v.authorization.length === 0 && v.continuity !== "rollback" && v.continuity !== "fork";
 }
+
+function editableMessage(item: Extract<ChatItem, { kind: "msg" }>, vc: boolean, uid: string | undefined, verification?: MessageVerification): boolean {
+  const stored = vc && (!!item.sealed || (typeof item.msg.target === "object" && "channel" in item.msg.target));
+  return stored && item.msg.author_uid === uid && verification?.status === "verified" && !verification.authorization.includes("device-revoked")
+    && !item.cannotOpen && !item.removed && item.msg.text !== DELETION_TEXT;
+}
+
+type EditLastRef = { current: (() => boolean) | null };
 
 export const MessageRow = memo(function MessageRow({
   row,
@@ -353,7 +361,7 @@ function SysRow({ row, t }: { row: Extract<Row, { type: "sys" }>; t: TFn }) {
   );
 }
 
-export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
+export function MessageList({ threadKey, editLastRef }: { threadKey: ThreadKey; editLastRef?: EditLastRef }) {
   const t = useT();
   const lang = useLanguage();
   const mineUid = useSession((s) => s.me?.uid);
@@ -439,12 +447,31 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
   const [showJump, setShowJump] = useState(false);
   const firstKey = thread?.items[0]?.key;
   const lastKey = thread?.items.at(-1)?.key;
-  const isChannel = threadKey === "channel" || (hasHistory && encryptedDm(threadKey, "vc"));
+  const encrypted = useSession(s => sealedThread(key, s.kind, s.channels, s.server?.server_chat));
+  const isChannel = threadKey === "channel" || encrypted;
   const locked = isChannel && !!thread?.locked;
   const viewChannel = useSession((s) => s.viewChannel);
   const vc = useSession((s) => s.kind === "vc");
   const canManageMessages = usePermission("message_manage");
   const editing = useUi((s) => s.editing);
+
+  const verificationFor = useCallback((item: Extract<ChatItem, { kind: "msg" }>) => {
+    const entry = verified.get(item.msg.id);
+    const ctx = { serverKey, target: messageTarget(key, item.msg.author_uid, signingUid), sealed: item.sealed ? { group: item.sealed.group, epoch: item.sealed.epoch } : undefined };
+    return entry?.fingerprint === messageFingerprint(item.msg, ctx) ? entry.state : undefined;
+  }, [verified, serverKey, key, signingUid]);
+  useLayoutEffect(() => {
+    if (!editLastRef) return;
+    editLastRef.current = () => {
+      const s = useSession.getState();
+      if (!key || storedKey(s, s.activeThread) !== key || s.threads[key]?.items !== thread?.items) return false;
+      const item = thread?.items.findLast(i => i.kind === "msg" && editableMessage(i, s.kind === "vc", s.me?.uid, verificationFor(i)));
+      if (item?.kind !== "msg") return false;
+      useUi.getState().setEditing(item.msg.id);
+      return true;
+    };
+    return () => { editLastRef.current = null; };
+  }, [editLastRef, key, thread?.items, verificationFor]);
 
   // The editor belongs to this conversation.
   useEffect(() => () => useUi.getState().setEditing(null), []);
@@ -530,7 +557,7 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
           <EmptyState icon={<MessageSquare className="size-5" />} title={t("chat.empty")}>
             {t(
               threadKey === "server"
-                ? "chat.emptyServer"
+                ? encrypted ? "chat.emptyServerHistory" : "chat.emptyServer"
                 : threadKey === "channel"
                   ? hasHistory
                     ? "chat.emptyChannel"
@@ -553,10 +580,10 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
             );
           if (row.type === "sys") return <SysRow key={row.key} row={row} t={t} />;
           const m = row.item.msg;
-          // Only channel messages (stored on the server) can be edited or deleted.
+          // Stored messages can be edited or deleted.
           const stored = vc && (!!row.item.sealed || (typeof m.target === "object" && "channel" in m.target));
           const own = m.author_uid === mineUid;
-          const verification = verified.get(m.id)?.fingerprint === messageFingerprint(m, { serverKey, target: targetFor(m), sealed: row.item.sealed ? { group: row.item.sealed.group, epoch: row.item.sealed.epoch } : undefined }) ? verified.get(m.id)?.state : undefined;
+          const verification = verificationFor(row.item);
           // My signature may only extend a message this client verified (the controller checks again).
           const signable = !vc || (verification?.status === "verified" && !verification.authorization.includes("device-revoked"));
           return (
@@ -568,8 +595,8 @@ export function MessageList({ threadKey }: { threadKey: ThreadKey }) {
               meUid={mineUid}
               lang={lang}
               compact={compact}
-              canEdit={stored && own && signable}
-              canDelete={stored && ((own && signable) || (canManageMessages && (!row.item.sealed || row.item.sealed.conversation.startsWith("channel:"))))}
+              canEdit={editableMessage(row.item, vc, mineUid, verification)}
+              canDelete={stored && ((own && signable) || (canManageMessages && (!row.item.sealed || !row.item.sealed.conversation.startsWith("dm:"))))}
               editing={editing === m.id}
             />
           );
@@ -709,7 +736,7 @@ function PendingFiles({ files, onRemove }: { files: PendingFile[]; onRemove: (id
   );
 }
 
-function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: { current: ((files: File[]) => void) | null } }) {
+function Composer({ threadKey, attachRef, editLastRef }: { threadKey: ThreadKey; attachRef: { current: ((files: File[]) => void) | null }; editLastRef: EditLastRef }) {
   const t = useT();
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [pendingByThread, setPendingByThread] = useState<Record<string, PendingFile[]>>({});
@@ -729,7 +756,7 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
   const ref = useRef<HTMLTextAreaElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const online = useSession((s) => s.phase === "online");
-  const encrypted = useSession(s => sealedThread(storedKey(s, threadKey), s.kind, s.channels));
+  const encrypted = useSession(s => sealedThread(storedKey(s, threadKey), s.kind, s.channels, s.server?.server_chat));
   const securing = useSession(s => encrypted && s.threads[storedKey(s, threadKey) ?? ""]?.securing !== false);
   const peerOnline = useSession((s) => (threadKey.startsWith("dm:") && !encrypted ? Object.values(s.clients).some((c) => c.uid === threadKey.slice(3)) : true));
   const peerName = useSession((s) => (threadKey.startsWith("dm:") ? s.threads[threadKey]?.peer?.name : undefined));
@@ -838,27 +865,13 @@ function Composer({ threadKey, attachRef }: { threadKey: ThreadKey; attachRef: {
     } else for (const f of ready) release(f.preview);
   };
 
-  const editLast = () => {
-    const s = useSession.getState();
-    const key = storedKey(s, threadKey);
-    const items = (key && s.threads[key]?.items) || [];
-    for (let i = items.length - 1; i >= 0; i--) {
-      const item = items[i];
-      if (item?.kind === "msg" && item.msg.author_uid === s.me?.uid && typeof item.msg.target === "object" && "channel" in item.msg.target) {
-        useUi.getState().setEditing(item.msg.id);
-        return true;
-      }
-    }
-    return false;
-  };
-
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (mention.onKeyDown(e)) return;
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
       void send();
-    } else if (e.key === "ArrowUp" && !text && pending.length === 0 && useSession.getState().kind === "vc" && threadKey === "channel") {
-      if (editLast()) e.preventDefault();
+    } else if (e.key === "ArrowUp" && !text && pending.length === 0 && useSession.getState().kind === "vc" && (threadKey === "channel" || encrypted)) {
+      if (editLastRef.current?.()) e.preventDefault();
     }
   };
 
@@ -1029,7 +1042,7 @@ function ChatHeader() {
   const userCount = useSession((s) => Object.values(s.clients).filter((c) => c.channel !== null && c.channel === s.viewChannel).length);
   const inVoice = useSession((s) => myChannelId(s) !== null);
   const members = useMembersPanel();
-  const sealed = useSession(s => { const key = storedKey(s, active); return sealedThread(key, s.kind, s.channels) ? key as `dm:${string}` | `ch:${number}` : null; });
+  const sealed = useSession(s => { const key = storedKey(s, active); return sealedThread(key, s.kind, s.channels, s.server?.server_chat) ? key as StoredThreadKey : null; });
   const encrypted = !!sealed;
   const vc = useSession(s => s.kind === "vc");
   const dmName = useSession((s) => (active.startsWith("dm:") ? memberName(s.members, active.slice(3), s.threads[active]?.peer?.name ?? "") : undefined));
@@ -1104,8 +1117,9 @@ export function ChatArea() {
   const phase = useSession((s) => s.phase);
   const storage = useSession((s) => storedKey(s, s.activeThread));
   // Files travel with plaintext channel messages only: no drop invitation in an encrypted channel.
-  const sealedChannel = useSession(s => s.activeThread === "channel" && !!sealedThread(storedKey(s, s.activeThread), s.kind, s.channels));
+  const sealedChannel = useSession(s => s.activeThread === "channel" && !!sealedThread(storedKey(s, s.activeThread), s.kind, s.channels, s.server?.server_chat));
   const attachRef = useRef<((files: File[]) => void) | null>(null);
+  const editLastRef = useRef<(() => boolean) | null>(null);
   const [dragging, setDragging] = useState(false);
   const depth = useRef(0);
 
@@ -1143,8 +1157,8 @@ export function ChatArea() {
         </div>
       )}
       <ThreadTabs />
-      <MessageList key={storage ?? active} threadKey={active} />
-      <Composer threadKey={active} attachRef={attachRef} />
+      <MessageList key={storage ?? active} threadKey={active} editLastRef={editLastRef} />
+      <Composer threadKey={active} attachRef={attachRef} editLastRef={editLastRef} />
       {dragging && !sealedChannel && (
         <div
           aria-hidden

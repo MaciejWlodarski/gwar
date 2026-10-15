@@ -87,7 +87,7 @@ export async function verifyMessage(msg: ChatMessage, ctx: MessageContext, stora
     if (!s) return { ...result, status: msg.author_uid.startsWith("ts:") ? "unsigned-ts" : "unsigned", continuity: "unproven" };
     for (const [v, n] of [[s.server_key, 32], [s.key, 32], [s.author_uid, 20], [s.message_id, 16], [s.body_hash, 32], [s.signature, 64]] as const) decodeFixed(v, n);
     const safe = (v: number) => Number.isSafeInteger(v) && v >= 0;
-    if (ctx.sealed) { decodeFixed(ctx.sealed.group, 32); if (!safe(ctx.sealed.epoch) || !/^(dm|channel):/.test(ctx.target)) return invalidVerification(); }
+    if (ctx.sealed) { decodeFixed(ctx.sealed.group, 32); if (!safe(ctx.sealed.epoch) || (ctx.target !== "server" && !/^(dm|channel):/.test(ctx.target))) return invalidVerification(); }
     if (s.group_id !== (ctx.sealed?.group ?? "-") || s.epoch !== (ctx.sealed ? String(ctx.sealed.epoch) : "-") || !safe(s.created_at) || !safe(s.signed_at) || s.signed_at < s.created_at || !safe(s.revision) || s.revision > 0xffffffff
         || s.server_key !== ctx.serverKey || s.conversation !== ctx.target || s.author_uid !== msg.author_uid
         || s.certificate_hash !== await certificateHash(s.certificate ?? undefined) || /[\r\n]/.test(ctx.target)) return invalidVerification();

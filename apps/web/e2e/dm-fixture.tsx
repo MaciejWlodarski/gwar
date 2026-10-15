@@ -31,6 +31,9 @@ export async function connect(account: number, device: number, address: string) 
     open(peer: string) { useSession.getState().dispatch({ type: "openDm", uid: peer, name: "Peer" }); },
     sync: () => runtime().sync(),
     close: () => controller.disconnect(),
+    selectServer() { useSession.getState().dispatch({ type: "setActive", key: "server" }); },
+    server: () => useSession.getState().threads.server,
+    serverReady: () => runtime().status("server") === "ready",
     rows: (peer: string) => useSession.getState().threads[`dm:${peer}`]?.items ?? [],
     openRaw: (row: SealedMessage) => runtime().openMessage(row),
     redeem: (token: string) => (controller as unknown as { conn: { request: (op: string, data: object) => Promise<unknown> } }).conn.request("token.redeem", { token }),
@@ -39,7 +42,7 @@ export async function connect(account: number, device: number, address: string) 
     options(channel: number) { const c = useSession.getState().channels[channel]; return { encrypted: c?.encrypted, history: c?.history }; },
     select(channel: number) { useSession.getState().dispatch({ type: "selectChannel", channel }); },
     channel: (channel: number) => useSession.getState().threads[`ch:${channel}`],
-    mention: (text: string, uid: string) => controller.sendChat("channel", text, { mentions: [uid] }),
+    mention: (text: string, uid: string, thread: "channel" | "server" = "channel") => controller.sendChat(thread, text, { mentions: [uid] }),
     groups: () => (controller as unknown as { conn: { request: (op: string, data: object) => Promise<unknown> } }).conn.request("mls.groups", {}),
     async revoke(account: number, device: number) {
       const root = new Uint8Array(32).fill(account), device_key = b64(ed25519.getPublicKey(new Uint8Array(32).fill(device))), account_key = b64(ed25519.getPublicKey(root));

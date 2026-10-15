@@ -12,21 +12,22 @@ import type { MessageSignature } from "../proto/MessageSignature";
 import type { SealedMessage } from "../proto/SealedMessage";
 import type { ChatMessage } from "../proto/ChatMessage";
 import { conversationThread, sealedThread, threadConversation } from "../lib/chat";
-import { latestMessageId, storedKey } from "./reducer";
+import { latestMessageId, storedKey, type SealedThreadKey } from "./reducer";
 import { useSession } from "./stores";
 import type { ChatItem } from "./types";
 
 export type SealedRuntime = Pick<MlsRuntime, "status" | "subscribe" | "openConversation" | "sync" | "sealMessage" | "openMessage">;
-/** A sealed thread: a Gwar direct message or an encrypted channel. */
-export type SealedKey = `dm:${string}` | `ch:${number}`;
+/** A sealed thread: a Gwar direct message, encrypted channel or server chat. */
+export type SealedKey = SealedThreadKey;
+type PublicKey = Exclude<SealedKey, `dm:${string}`>;
 /** The server caps unread counts at this; mention scans stop there too. */
 export const UNREAD_CAP = 100;
-/** Channel conversations scanned for mentions at the same time. */
+/** Public conversations scanned for mentions at the same time. */
 const SCANS = 4;
 /** Rows a mention scan reads at most: the server keeps this many per conversation. */
 const SCAN_ROWS = 1000;
 
-/** One session's sealed chat work, for direct messages and encrypted channels.
+/** One session's sealed chat work, for direct messages and public encrypted chat.
  * Every asynchronous boundary checks its session fence. */
 export class SealedConversations {
   private queue = Promise.resolve();
@@ -43,7 +44,7 @@ export class SealedConversations {
   private opening = new Set<string>();
   /** Running unread recounts per thread, with the ids removed since each started. */
   private reading = new Map<string, Set<number>>();
-  /** Per channel thread and signed message identity (`author_uid:message_id`),
+  /** Per public thread and signed message identity (`author_uid:message_id`),
    * the newest accepted revision's numeric id and whether it mentions me
    * (docs/e2e-build.md, "Mention accounting"). Pruned at the read mark. */
   private contributions = new Map<string, Map<string, { id: number; mention: boolean }>>();
@@ -51,7 +52,7 @@ export class SealedConversations {
   private seen = new Map<string, number>();
   /** Running scans per `epoch:thread`, and threads waiting for one of the SCANS slots. */
   private scanning = new Set<string>();
-  private scans: `ch:${number}`[] = [];
+  private scans: PublicKey[] = [];
   private scanners = 0;
   /** Threads whose scan stopped at UNREAD_CAP mentions. */
   private capped = new Set<string>();
@@ -65,7 +66,7 @@ export class SealedConversations {
     const viewChanges = useSession.subscribe((s, prev) => {
       if (s.activeThread === prev.activeThread && s.viewChannel === prev.viewChannel && s.focused === prev.focused) return;
       const key = storedKey(s, s.activeThread);
-      if (key?.startsWith("ch:")) this.recount(key);
+      if (key === "server" || key?.startsWith("ch:")) this.recount(key);
     });
     this.unsubscribe = () => { runtimeChanges(); viewChanges(); };
   }
@@ -90,7 +91,7 @@ export class SealedConversations {
     if (this.stopped || !this.current()) return;
     const state = useSession.getState();
     for (const key of Object.keys(state.threads)) {
-      if (!sealedThread(key, state.kind, state.channels)) continue;
+      if (!sealedThread(key, state.kind, state.channels, state.server?.server_chat)) continue;
       state.dispatch({ type: "sealedStatus", thread: key as SealedKey, securing: this.runtime.status(this.conversation(key as SealedKey)) !== "ready" });
     }
     void this.retryMissing();
@@ -106,7 +107,7 @@ export class SealedConversations {
       do {
         this.retryAgain = false;
         const state = useSession.getState(), epoch = state.epoch;
-        const rows = Object.entries(state.threads).filter(([key]) => sealedThread(key, state.kind, state.channels))
+        const rows = Object.entries(state.threads).filter(([key]) => sealedThread(key, state.kind, state.channels, state.server?.server_chat))
           .flatMap(([key, thread]) => thread.items.flatMap(i => i.kind === "msg" && i.sealed && i.cannotOpen === "no_key" ? [[key, i.key, i.sealed.revision] as const] : []));
         for (const [thread, key, revision] of rows) {
           if (this.stopped || !this.current()) return;
@@ -130,7 +131,7 @@ export class SealedConversations {
     this.enter(conversation);
     try {
       check();
-      // A direct message's group is created on first use; the runtime keeps channel groups itself.
+      // A direct message's group is created on first use; the runtime keeps public groups itself.
       if (thread.startsWith("dm:")) await this.runtime.openConversation(conversation);
       check(); this.refresh();
       const page = await this.link.request("chat.sealed.history", { conversation, before: before ?? null, limit: 50 });
@@ -189,16 +190,16 @@ export class SealedConversations {
       }
     } finally { this.reading.delete(pass); }
   }
-  /** After connecting: opens the unread messages of every encrypted channel to
+  /** After connecting: opens the unread messages of every public encrypted conversation to
    * count those mentioning me, at most SCANS conversations at a time, without notifying. */
   scanUnread(): Promise<void> {
     const state = useSession.getState();
     return this.queueScans(Object.entries(state.threads)
-      .filter(([key, t]) => key.startsWith("ch:") && t.unread > 0 && sealedThread(key, state.kind, state.channels))
-      .map(([key]) => key as `ch:${number}`));
+      .filter(([key, t]) => (key === "server" || key.startsWith("ch:")) && t.unread > 0 && sealedThread(key, state.kind, state.channels, state.server?.server_chat))
+      .map(([key]) => key as PublicKey));
   }
   /** Every scan, also a rescan after a cap, waits for one of SCANS slots. */
-  private async queueScans(threads: `ch:${number}`[]): Promise<void> {
+  private async queueScans(threads: PublicKey[]): Promise<void> {
     for (const thread of threads) if (!this.scans.includes(thread)) this.scans.push(thread);
     const workers: Promise<void>[] = [];
     for (; this.scanners < SCANS && this.scans.length; this.scanners++) workers.push((async () => {
@@ -207,9 +208,9 @@ export class SealedConversations {
     })());
     await Promise.all(workers);
   }
-  /** Pages backwards through a channel's unread rows until its read mark, the
+  /** Pages backwards through a public conversation's unread rows until its read mark, the
    * oldest retained row or UNREAD_CAP mentions, opening them as history. */
-  private async scan(thread: `ch:${number}`): Promise<void> {
+  private async scan(thread: PublicKey): Promise<void> {
     const epoch = useSession.getState().epoch, pass = `${epoch}:${thread}`;
     if (this.scanning.has(pass)) return;
     this.scanning.add(pass);
@@ -248,16 +249,18 @@ export class SealedConversations {
     return count;
   }
   private recount(thread: string): void {
-    if (this.stopped || !thread.startsWith("ch:") || !useSession.getState().threads[thread]) return;
+    const state = useSession.getState();
+    if (this.stopped || (thread !== "server" && !thread.startsWith("ch:")) || !state.threads[thread]
+      || !sealedThread(thread, state.kind, state.channels, state.server?.server_chat)) return;
     const count = this.mentions(thread);
-    useSession.getState().dispatch({ type: "sealedMentions", thread: thread as `ch:${number}`, count: Math.min(UNREAD_CAP, count) });
+    useSession.getState().dispatch({ type: "sealedMentions", thread: thread as PublicKey, count: Math.min(UNREAD_CAP, count) });
     // An edit or removal took a capped scan's count below the cap: look further back.
-    if (count < UNREAD_CAP && this.capped.delete(thread)) void this.queueScans([thread as `ch:${number}`]);
+    if (count < UNREAD_CAP && this.capped.delete(thread)) void this.queueScans([thread as PublicKey]);
   }
-  /** Sets a channel message's mention contribution from its newest accepted
+  /** Sets a public message's mention contribution from its newest accepted
    * revision; an unopened or rejected revision leaves the previous one. */
   private account(thread: SealedKey, row: SealedMessage, item: Extract<ChatItem, { kind: "msg" }>): void {
-    if (!thread.startsWith("ch:")) return;
+    if (thread.startsWith("dm:")) return;
     const contributions = this.contributions.get(thread) ?? new Map<string, { id: number; mention: boolean }>();
     this.contributions.set(thread, contributions);
     const identity = `${row.author_uid}:${row.message_id}`;
@@ -299,19 +302,19 @@ export class SealedConversations {
     const wasRemoved = () => !!this.removed.get(row.conversation)?.has(row.id);
     const thread = conversationThread(row.conversation, this.uid);
     // A channel deleted meanwhile keeps no thread.
-    const gone = () => { const s = useSession.getState(); return !thread || !sealedThread(thread, s.kind, s.channels); };
+    const gone = () => { const s = useSession.getState(); return !thread || !sealedThread(thread, s.kind, s.channels, s.server?.server_chat); };
     const run = this.queue.then(async () => {
       this.check(); if (epoch !== useSession.getState().epoch || wasRemoved()) return;
       const state = useSession.getState();
       if (!thread || gone()) return;
       const channel = thread.startsWith("ch:") ? Number(thread.slice(3)) : null;
-      const peer = channel === null ? thread.slice(3) : null;
+      const peer = thread.startsWith("dm:") ? thread.slice(3) : null;
       if (peer && ![peer, this.uid].includes(row.author_uid)) return;
       const old = state.threads[thread]?.items.find(i => i.key === key);
       if (old?.kind === "msg" && (old.sealed?.revision ?? -1) > row.revision) return;
       const result = await this.runtime.openMessage(row);
       this.check(); if (epoch !== useSession.getState().epoch || wasRemoved() || gone()) return;
-      const msg: ChatMessage = { id: row.id, target: channel === null ? { client: 0 } : { channel }, author: 0, author_uid: row.author_uid,
+      const msg: ChatMessage = { id: row.id, target: thread === "server" ? "server" : channel === null ? { client: 0 } : { channel }, author: 0, author_uid: row.author_uid,
         author_name: row.author_name, sent_at: row.sent_at, edited_at: row.edited_at, text: "" };
       let item: Extract<ChatItem, { kind: "msg" }> = { kind: "msg", key, at: row.sent_at, msg, sealed: row };
       if ("ok" in result) {

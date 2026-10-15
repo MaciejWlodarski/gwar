@@ -39,17 +39,23 @@ try {
   await Promise.all([ready(`${web}/`, vite), ready(`http://127.0.0.1:${serverPort}/health`, service)]);
   browser = await chromium.launch({ headless: true });
   const contexts = [], pages = [];
-  async function device(account, device) {
+  async function device(account, device, address = ws) {
     const context = await browser.newContext(); contexts.push(context);
-    await context.route("**/*", route => ["127.0.0.1", "localhost"].includes(new URL(route.request().url()).hostname) ? route.continue() : route.abort());
+    await context.route("**/*", route => {
+      const url = new URL(route.request().url());
+      if (address !== ws && url.pathname.endsWith("/v1/revocations")) {
+        return route.fulfill({ json: { revocations: [] }, headers: { "access-control-allow-origin": "*" } });
+      }
+      return ["127.0.0.1", "localhost"].includes(url.hostname) ? route.continue() : route.abort();
+    });
     const page = await context.newPage(); pages.push(page);
     page.on("pageerror", e => console.error("browser:", e));
     await page.goto(`${web}/e2e/dm.html`);
-    await connect(page, account, device);
+    await connect(page, account, device, address);
     return page;
   }
-  async function connect(page, account, device) {
-    await page.evaluate(async ({ account, device, ws }) => { const fixture = await import("/e2e/dm-fixture.tsx"); window.dm = await fixture.connect(account, device, ws); }, { account, device, ws });
+  async function connect(page, account, device, address = ws) {
+    await page.evaluate(async ({ account, device, ws }) => { const fixture = await import("/e2e/dm-fixture.tsx"); window.dm = await fixture.connect(account, device, ws); }, { account, device, ws: address });
   }
   async function open(page, peer) {
     await page.evaluate(peer => window.dm.open(peer), peer);
@@ -96,7 +102,7 @@ try {
   await open(b, auid); await sync(a, b);
   await b.getByText("offline encrypted hello", { exact: true }).waitFor({ timeout: 45000 });
   const original = await a.evaluate(peer => window.dm.rows(peer).find(i => i.sealed).sealed, buid);
-  assert.ok(!original.ciphertext.includes("offline encrypted hello"));
+  assert.ok(!Buffer.from(original.ciphertext, "base64url").includes(Buffer.from("offline encrypted hello")));
   console.log("PASS offline recipient connects and opens stored ciphertext");
   // UI edit and own deletion use sealed revisions, not plaintext channel endpoints.
   await a.getByRole("button", { name: "Edit message", exact: true }).click();
@@ -118,7 +124,7 @@ try {
   const picture = b.getByRole("button", { name: "Open dot.png", exact: true }).locator("img");
   await picture.waitFor({ timeout: 45000 });
   assert.match(await picture.getAttribute("src"), /^blob:/);
-  assert.equal(await picture.evaluate(img => img.complete && img.naturalWidth), 1);
+  await b.waitForFunction(() => { const img = document.querySelector('button[aria-label="Open dot.png"] img'); return img?.complete && img.naturalWidth === 1; }, null, { timeout: 45000 });
   const [attached] = await b.evaluate(peer => window.dm.rows(peer).find(i => i.msg?.text === "a picture").msg.attachments, auid);
   assert.equal(attached.url, `/files/${attached.id}/file`);
   assert.equal(attached.sealed.size, dot.length + 28);
@@ -168,6 +174,15 @@ try {
   await send(a, "channel chat still works");
   await b2.getByText("channel chat still works", { exact: true }).waitFor();
   console.log("PASS plaintext channel chat still works beside encrypted DMs");
+  for (const page of [a, b2]) await page.evaluate(() => window.dm.selectServer());
+  await send(a, "plaintext server hello");
+  await b2.getByText("plaintext server hello", { exact: true }).waitFor();
+  const plainServerRow = await b2.evaluate(() => window.dm.server().items.find(i => i.msg?.text === "plaintext server hello"));
+  assert.equal(plainServerRow.msg.target, "server");
+  assert.equal(plainServerRow.msg.signature.group_id, "-");
+  assert.equal(plainServerRow.sealed, undefined);
+  assert.equal(await b2.getByRole("button", { name: "Who can read", exact: true }).count(), 0);
+  console.log("PASS default server chat remains signed plaintext and live-only");
   // Encrypted channels: the creator's group, a member joining it, mentions counted after opening, moderator removal.
   const token = /redeem this one-time admin token in your client: (\S+)/.exec(service.output)?.[1];
   assert.ok(token, "admin token in the server log");
@@ -181,7 +196,7 @@ try {
   await b2.getByText("encrypted channel hello", { exact: true }).waitFor({ timeout: 45000 });
   const sealedRow = await a.evaluate(id => window.dm.channel(id).items.find(i => i.msg?.text === "encrypted channel hello").sealed, secret);
   assert.equal(sealedRow.conversation, `channel:${secret}`);
-  assert.ok(!sealedRow.ciphertext.includes("encrypted channel hello"));
+  assert.ok(!Buffer.from(sealedRow.ciphertext, "base64url").includes(Buffer.from("encrypted channel hello")));
   await a.getByRole("button", { name: "Who can read", exact: true }).click();
   const readers = a.getByRole("dialog");
   await readers.getByText("User21", { exact: true }).waitFor();
@@ -207,6 +222,8 @@ try {
   await composer(a);
   await send(a, "before you joined");
   const c = await device(41, 7);
+  await c.evaluate(() => window.dm.selectServer());
+  assert.equal(await c.getByText("plaintext server hello", { exact: true }).count(), 0);
   await c.evaluate(id => window.dm.select(id), quiet);
   await c.getByText("Earlier messages aren't shared with new members.", { exact: true }).waitFor({ timeout: 45000 });
   assert.equal(await c.getByText("Can't open this message on this device", { exact: true }).count(), 0);
@@ -237,6 +254,80 @@ try {
   await plain.evaluate(peer => window.dm.open(peer), auid);
   await plain.getByPlaceholder("Securing this conversation…").waitFor({ timeout: 45000 });
   console.log("PASS the server connection works when MLS cannot start");
+  // A separate new database opts into encrypted server chat; all devices join on connect.
+  const encryptedPort = await port(), encryptedWs = `ws://127.0.0.1:${encryptedPort}/ws`;
+  const encryptedService = start(process.env.VC_SERVER_BIN ?? path.join(root, "target/debug/vc-server"), ["--data-dir", path.join(directory, "encrypted"), "--http", `127.0.0.1:${encryptedPort}`, "--media", `127.0.0.1:${encryptedPort}`, "--public-ip", "127.0.0.1", "--public-endpoint", encryptedWs, "--web-origin", web, "--no-connect", "--encrypted-server-chat"], root);
+  await ready(`http://127.0.0.1:${encryptedPort}/health`, encryptedService);
+  const d = await device(61, 10, encryptedWs), e = await device(71, 11, encryptedWs);
+  // Neither device has opened server chat yet.
+  for (const page of [d, e]) await page.waitForFunction(() => window.dm.serverReady(), null, { timeout: 45000 });
+  for (const page of [d, e]) { await page.evaluate(() => window.dm.selectServer()); await composer(page); }
+  await send(d, "encrypted server hello");
+  await e.getByText("encrypted server hello", { exact: true }).waitFor({ timeout: 45000 });
+  const serverRow = await d.evaluate(() => window.dm.server().items.find(i => i.msg?.text === "encrypted server hello"));
+  assert.equal(serverRow.sealed.conversation, "server");
+  assert.ok(!Buffer.from(serverRow.sealed.ciphertext, "base64url").includes(Buffer.from("encrypted server hello")));
+  assert.equal(serverRow.authentic, true);
+  await d.getByRole("button", { name: "Who can read", exact: true }).click();
+  await d.getByRole("dialog").getByText("Messages are end-to-end encrypted.", { exact: false }).waitFor();
+  await d.getByRole("dialog").getByText("User71", { exact: true }).waitFor();
+  await d.getByRole("dialog").getByRole("button", { name: "Close", exact: true }).click();
+  console.log("PASS encrypted server groups join on connect, seal messages and list readers");
+  const d2 = await device(61, 12, encryptedWs);
+  await d2.evaluate(() => window.dm.selectServer()); await composer(d2); await sync(d, e, d2);
+  await d2.getByText("encrypted server hello", { exact: true }).waitFor({ timeout: 90000 });
+  assert.equal(await d2.evaluate(() => window.dm.server().items.find(i => i.msg?.text === "encrypted server hello").authentic), true);
+  console.log("PASS a later server-chat device receives earlier messages through history");
+  await d.getByRole("button", { name: "Edit message", exact: true }).click();
+  await d.getByRole("textbox", { name: "Edit message" }).fill("edited server hello");
+  await d.getByRole("button", { name: "Save", exact: true }).click();
+  await e.getByText("edited server hello", { exact: false }).waitFor({ timeout: 45000 });
+  await d.getByRole("button", { name: "Delete message", exact: true }).click({ modifiers: ["Shift"] });
+  await e.waitForFunction(() => window.dm.server().items.some(i => i.sealed?.deleted && i.authentic), null, { timeout: 45000 });
+  console.log("PASS sealed server edits and authenticated own deletion");
+  // Confirm the recipient read the earlier row before testing one new unread message.
+  await e.bringToFront();
+  await e.locator("textarea").click();
+  await e.waitForFunction(id => window.dm.server().lastRead >= id, serverRow.sealed.id, { timeout: 45000 });
+  for (const page of [d, e]) await page.evaluate(async () => {
+    const { messageStorage, refreshRevocations, REVOCATION_FRESH_MS } = await import("/src/net/message-storage.ts");
+    await messageStorage.mergeFeed([], undefined, Date.now() - REVOCATION_FRESH_MS - 1);
+    if ((await messageStorage.revocation("unused", "unused")).fresh) throw new Error("Local revocation feed did not expire");
+    await refreshRevocations(undefined, undefined, true);
+    if (!(await messageStorage.revocation("unused", "unused")).fresh) throw new Error("Local revocation feed did not refresh");
+  });
+  await e.evaluate(() => window.dm.select(1));
+  await composer(d);
+  assert.equal(await d.evaluate(uid => window.dm.mention("server mention", uid, "server"), await e.evaluate(() => window.dm.uid)), true);
+  await e.waitForFunction(() => window.dm.server()?.mentions === 1 && window.dm.server()?.unread === 1, null, { timeout: 45000 }).catch(async error => {
+    console.error("server mention state", await e.evaluate(() => { const t = window.dm.server(); return { unread: t.unread, mentions: t.mentions, lastRead: t.lastRead,
+      rows: t.items.filter(i => i.kind === "msg").map(i => ({ id: i.msg.id, text: i.msg.text, mentions: i.msg.mentions, verified: i.verified, authentic: i.authentic, cannotOpen: i.cannotOpen })) }; }));
+    throw error;
+  });
+  await e.evaluate(() => window.dm.selectServer());
+  console.log("PASS server mentions and unread counts follow the sealed conversation");
+  const encryptedToken = /redeem this one-time admin token in your client: (\S+)/.exec(encryptedService.output)?.[1];
+  assert.ok(encryptedToken);
+  await d.evaluate(token => window.dm.redeem(token), encryptedToken);
+  await send(e, "remove server message");
+  await d.getByText("remove server message", { exact: true }).waitFor({ timeout: 45000 });
+  const removalId = await d.evaluate(() => window.dm.server().items.find(i => i.msg?.text === "remove server message").msg.id);
+  const removalRow = d.locator(`[data-message="${removalId}"]`);
+  await removalRow.hover();
+  await removalRow.getByRole("button", { name: "Delete message", exact: true }).click({ modifiers: ["Shift"] });
+  await e.waitForFunction(id => !window.dm.server().items.some(i => i.msg?.id === id), removalId, { timeout: 45000 });
+  console.log("PASS moderator removal routes by the server conversation");
+  await d.locator('input[type="file"]').setInputFiles({ name: "dot.png", mimeType: "image/png", buffer: dot });
+  await d.getByText(`${dot.length} B`, { exact: true }).waitFor({ timeout: 45000 });
+  await send(d, "server picture");
+  const serverPicture = e.getByRole("button", { name: "Open dot.png", exact: true }).locator("img");
+  await serverPicture.waitFor({ timeout: 45000 });
+  await e.waitForFunction(() => { const img = document.querySelector('button[aria-label="Open dot.png"] img'); return img?.complete && img.naturalWidth === 1; }, null, { timeout: 45000 });
+  const serverFile = await e.evaluate(() => window.dm.server().items.find(i => i.msg?.text === "server picture").msg.attachments[0]);
+  const serverBytes = Buffer.from(await (await fetch(`http://127.0.0.1:${encryptedPort}${serverFile.url}`)).arrayBuffer());
+  assert.equal(serverBytes.length, dot.length + 28);
+  assert.ok(!serverBytes.includes(dot.subarray(0, 16)));
+  console.log("PASS encrypted server attachments open on another member's device");
   await Promise.all(pages.map(page => page.evaluate(() => window.dm.close())));
 
 } catch (error) {

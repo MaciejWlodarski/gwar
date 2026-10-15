@@ -16,7 +16,7 @@ import type { StoredThreadKey } from "../state/types";
 const subscribeRoster = (listener: () => void) => controller.onRoster(listener);
 /** Who can read an encrypted thread, once this device has secured it. */
 export function useRoster(key: StoredThreadKey | null | undefined): Roster | null {
-  const sealed = useSession(s => sealedThread(key, s.kind, s.channels));
+  const sealed = useSession(s => sealedThread(key, s.kind, s.channels, s.server?.server_chat));
   return useSyncExternalStore(subscribeRoster, () => (sealed ? controller.roster(key as SealedKey) : null));
 }
 

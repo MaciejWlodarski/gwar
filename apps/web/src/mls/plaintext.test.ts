@@ -26,6 +26,11 @@ describe("MLS plaintext authentication", () => {
     const { p, context } = await fixture(certified);
     expect(await authenticatePlaintext(bytes(p), context)).toEqual(p);
   });
+  it("authenticates sealed server plaintext with its exact conversation binding", async () => {
+    const { p, context } = await fixture(false, "server hello", "server");
+    expect(await authenticatePlaintext(bytes(p), context)).toEqual(p);
+    expect(await authenticatePlaintext(bytes(p), { ...context, conversation: "channel:7" })).toBeNull();
+  });
   it("accepts any author in a channel and only participants in a direct message", async () => {
     const channel = await fixture(false, "hello", "channel:7");
     expect(await authenticatePlaintext(bytes(channel.p), channel.context)).toEqual(channel.p);
