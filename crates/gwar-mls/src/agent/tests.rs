@@ -1801,9 +1801,21 @@ fn channel_key_package_adds_are_refused_by_agent_and_observer() {
     group.set_aad(ds::commit_aad(f.t));
     let (commit, welcome, _) = group.add_members(&a.provider, &a.signer, &[package]).unwrap();
     group.merge_pending_commit(&a.provider).unwrap();
-    let gi = wire(group.export_group_info(a.provider.crypto(), &a.signer, true).unwrap()).unwrap();
+    // Without the tree, as these groups' GroupInfos are: only the Add itself is wrong.
+    let gi = wire(group.export_group_info(a.provider.crypto(), &a.signer, false).unwrap()).unwrap();
     let welcome = wire(welcome).unwrap();
-    assert!(f.observer.commit(&wire(commit).unwrap(), &gi, Some(&welcome), f.t, f.t).is_err());
+    assert!(matches!(
+        f.observer.commit(&wire(commit).unwrap(), &gi, Some(&welcome), f.t, f.t),
+        Err(ds::DsError::Invalid("channel and server devices join externally"))
+    ));
+    // A Welcome beside a commit that adds nobody is refused too.
+    let mut f2 = channel_fixture(Kind::Channel);
+    let update = f2.a.commit(&server(), &f2.id, &[], &[], f2.t, &()).unwrap();
+    f2.a.take_changes();
+    assert!(matches!(
+        f2.observer.commit(&update.commit, &update.group_info, Some(&welcome), f2.t, f2.t),
+        Err(ds::DsError::Invalid("channel and server groups take no Welcome"))
+    ));
     f.b.take_changes();
     assert!(f.b.welcome(&server(), "channel", &welcome).is_err());
     a.take_changes();

@@ -292,6 +292,9 @@ impl Observer {
         self.check_tree()?;
 
         self.check_group_info(group_info)?;
+        if welcome.is_some() && self.descriptor.descriptor.kind.separate_tree() {
+            return Err(Invalid("channel and server groups take no Welcome"));
+        }
 
         let welcome_recipients = match welcome {
             None if welcome_for.is_empty() => Vec::new(),
