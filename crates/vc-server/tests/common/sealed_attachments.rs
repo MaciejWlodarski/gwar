@@ -21,6 +21,18 @@ pub(super) async fn upload(server: &TestServer, client: &mut Client, sealed: boo
     response.json().await.unwrap()
 }
 
+/// Waits until a deleted file's bytes are unlinked and `uploader` is charged `charged` bytes again.
+pub(super) async fn released(path: &std::path::Path, database: &std::path::Path, uploader: &str, charged: u64) {
+    let store = vc_server::store::Store::open(database).unwrap();
+    for _ in 0..200 {
+        if !path.exists() && store.stored_bytes(Some(uploader)).unwrap() == charged {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("{} still on disk or still charged", path.display());
+}
+
 async fn get(server: &TestServer, file: &Attachment, token: Option<&str>) -> reqwest::Response {
     let request = reqwest::Client::new().get(format!("{}/files/{}/file", server.http(), file.id));
     let request = if let Some(token) = token { request.bearer_auth(token) } else { request };
@@ -176,7 +188,12 @@ async fn sealed_files_use_conversation_access_and_wait_for_active_downloads_on_d
 #[tokio::test]
 async fn sealed_channel_files_follow_read_access_moderator_removal_and_channel_deletion() {
     let directory = tempfile::tempdir().unwrap();
-    let server = TestServer::start_with(|c| c.files_dir = Some(directory.path().into())).await;
+    let database = directory.path().join("db");
+    let server = TestServer::start_with(|c| {
+        c.database = Some(database.clone());
+        c.files_dir = Some(directory.path().join("files"));
+    })
+    .await;
     let mut alice = Device::new(1, 11);
     let mut a = connect_device(&server, &alice).await;
     a.redeem(&server.admin_token).await;
@@ -200,6 +217,7 @@ async fn sealed_channel_files_follow_read_access_moderator_removal_and_channel_d
             a.ok("channel.delete", json!({"channel":channel})).await;
         }
         assert_eq!(get(&server, &file, Some(&b.welcome.file_access)).await.status(), 404);
-        assert!(server.running.core.file_info(file.id).await.is_none());
+        assert!(server.running.core.file_info(file.id.clone()).await.is_none());
+        released(&directory.path().join("files").join(&file.id), &database, &uid(1), 0).await;
     }
 }

@@ -1364,6 +1364,16 @@ async fn sealed_member_removal_and_pruning_clear_marks_and_optionally_erase_auth
         assert!(store.expire_unattached(i64::MAX).unwrap().is_empty());
         assert!(store.expire_orphans().unwrap().is_empty());
         assert_eq!(store.file(&peer_file.id).unwrap().is_some(), !delete_messages);
+        let files = directory.path().join("files");
+        attachments::released(
+            &files.join(&pending.id),
+            &database,
+            &uid(2),
+            if delete_messages { 0 } else { peer_file.size },
+        )
+        .await;
+        assert_eq!(files.join(&peer_file.id).exists(), !delete_messages);
+        assert!(files.join(&own_file.id).exists());
         let marks: i64 = db.query_row("SELECT COUNT(*) FROM conversation_reads", [], |r| r.get(0)).unwrap();
         assert_eq!(marks, 0);
         let history = a.ok("chat.sealed.history", json!({"conversation":conversation})).await;
