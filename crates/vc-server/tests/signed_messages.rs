@@ -501,8 +501,8 @@ async fn migrated_v2_history_is_readable_edits_fail_cleanly_and_moderators_can_d
     let db = rusqlite::Connection::open(&database).unwrap();
     let version: u32 = db.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
     // Restore the pre-change schema and populate its old signature format.
-    db.execute_batch("DROP TABLE conversation_reads; DROP TABLE sealed_message_identities; DROP TABLE sealed_messages; DROP INDEX mls_history_hashes; DROP INDEX mls_history_chunks; DROP INDEX mls_history_group_inbox; ALTER TABLE mls_history DROP COLUMN chunk_hash; ALTER TABLE channels DROP COLUMN encrypted; ALTER TABLE channels DROP COLUMN history;").unwrap();
-    db.pragma_update(None, "user_version", version - 4).unwrap();
+    db.execute_batch("DROP TRIGGER sealed_files_removed; DROP TRIGGER sealed_files_deleted; DROP INDEX files_by_sealed_message; ALTER TABLE files DROP COLUMN sealed_message; ALTER TABLE files DROP COLUMN sealed; DROP TABLE conversation_reads; DROP TABLE sealed_message_identities; DROP TABLE sealed_messages; DROP INDEX mls_history_hashes; DROP INDEX mls_history_chunks; DROP INDEX mls_history_group_inbox; ALTER TABLE mls_history DROP COLUMN chunk_hash; ALTER TABLE channels DROP COLUMN encrypted; ALTER TABLE channels DROP COLUMN history;").unwrap();
+    db.pragma_update(None, "user_version", version - 5).unwrap();
     db.execute(
         "UPDATE messages SET signature=?1 WHERE id=?2",
         rusqlite::params![json!({"key":public_key(&key),"signature":"v2"}).to_string(), id],

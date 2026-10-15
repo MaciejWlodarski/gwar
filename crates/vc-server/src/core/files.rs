@@ -1,6 +1,6 @@
 //! Uploads, in three steps: `file.upload` reserves an id and a one-time
 //! token; the client `PUT`s the bytes over HTTP (see `crate::files`); the
-//! finished file is attached to a message by `chat.send`. Files never
+//! finished file is attached by `chat.send` or `chat.sealed.send`. Files never
 //! attached are removed after a day; files go when their message goes.
 
 use std::{
@@ -32,6 +32,7 @@ pub(super) struct PendingUpload {
     size: u64,
     token: String,
     sha256: String,
+    sealed: bool,
     until: Instant,
     state: UploadState,
 }
@@ -78,6 +79,7 @@ pub struct UploadSlot {
     pub path: PathBuf,
     pub size: u64,
     pub sha256: String,
+    pub sealed: bool,
     /// When the bytes must be complete.
     pub deadline: Instant,
 }
@@ -196,6 +198,7 @@ impl Core {
         self.files_dir.join(id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn file_upload(
         &mut self,
         session: SessionId,
@@ -203,6 +206,7 @@ impl Core {
         size: u64,
         mime: String,
         sha256: String,
+        sealed: bool,
     ) -> Reply {
         self.require(session, Permission::FileUpload)?;
         if self.info.upload_limit == 0 {
@@ -248,8 +252,9 @@ impl Core {
             id.clone(),
             PendingUpload {
                 uploader,
-                name: clean_name(&name),
-                mime,
+                name: if sealed { "file".into() } else { clean_name(&name) },
+                mime: if sealed { "application/octet-stream".into() } else { mime },
+                sealed,
                 size,
                 token,
                 sha256,
@@ -272,9 +277,15 @@ impl Core {
                     .map(|u| {
                         // The token works once; the upload stays reserved until it finishes or is given up.
                         u.state = UploadState::Writing { attempt };
-                        (u.size, u.sha256.clone())
+                        (u.size, u.sha256.clone(), u.sealed)
                     })
-                    .map(|(size, sha256)| UploadSlot { path: self.files_dir.join(&id), size, sha256, deadline });
+                    .map(|(size, sha256, sealed)| UploadSlot {
+                        path: self.files_dir.join(&id),
+                        size,
+                        sha256,
+                        sealed,
+                        deadline,
+                    });
                 let _ = reply.send(slot);
             }
             FileMsg::Finish { upload, reply } => {
@@ -300,6 +311,7 @@ impl Core {
                     &upload.sha256,
                     upload.dimensions,
                     now_ms(),
+                    pending.sealed,
                 );
                 match &stored {
                     Ok(()) => drop(self.uploads.remove(&upload.id)),
@@ -345,9 +357,9 @@ impl Core {
         }
     }
 
-    /// With [`FileAccess::Members`], only a client connected here that can read the channel the
-    /// file is posted in may download it. A file in no message (not posted yet, or its message or
-    /// channel deleted) is for nobody: its uploader has the bytes.
+    /// With [`FileAccess::Members`], only a client connected here that can read the channel or
+    /// sealed conversation the file is posted in may download it. A file in no message (not posted
+    /// yet, or its message or channel deleted) is for nobody: its uploader has the bytes.
     fn may_download(&self, id: &str, access: Option<&str>) -> bool {
         if self.info.file_access == FileAccess::Link {
             return true;
@@ -358,6 +370,14 @@ impl Core {
         else {
             return false;
         };
+        match self.store.file_conversation(id) {
+            Ok(Some(conversation)) => return self.mls_can_read(&session.uid, &conversation).unwrap_or(false),
+            Ok(None) => {}
+            Err(e) => {
+                warn!("store: {e:#}");
+                return false;
+            }
+        }
         match self.store.file_channel(id) {
             Ok(Some(channel)) => self.can_read(session, channel),
             Ok(None) => false,
@@ -521,6 +541,7 @@ pub(crate) mod tests {
             size: 3,
             token: "t".into(),
             sha256: "h".into(),
+            sealed: false,
             until: Instant::now() + UPLOAD_WINDOW,
             state: if started { UploadState::Writing { attempt: 1 } } else { UploadState::Waiting },
         }
@@ -653,7 +674,7 @@ pub(crate) mod tests {
         std::fs::create_dir(&files).unwrap();
         std::fs::write(files.join("old"), "abc").unwrap();
         let store = Store::in_memory().unwrap();
-        store.insert_file("old", "u", "f", "x", 3, "h", None, 0).unwrap();
+        store.insert_file("old", "u", "f", "x", 3, "h", None, 0, false).unwrap();
         std::fs::set_permissions(&files, std::fs::Permissions::from_mode(0o555)).unwrap();
         // (Root may delete there anyway; then only the freeing is tested.)
         let stuck = std::fs::write(files.join("probe"), "").is_err();
@@ -678,7 +699,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::in_memory().unwrap();
         for id in ["stored", "removed"] {
-            store.insert_file(id, "u", "f", "x", 3, "h", None, now_ms()).unwrap();
+            store.insert_file(id, "u", "f", "x", 3, "h", None, now_ms(), false).unwrap();
         }
         let core = test_core_storing(store, None, dir.path().into(), 100);
         // The state first, then the bytes, so that the tick at startup cannot see one without the other.
@@ -721,7 +742,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::in_memory().unwrap();
         for id in ["f", "g"] {
-            store.insert_file(id, "u", "f", "x", 3, "h", None, now_ms()).unwrap();
+            store.insert_file(id, "u", "f", "x", 3, "h", None, now_ms(), false).unwrap();
             std::fs::write(dir.path().join(id), "abc").unwrap();
         }
         let core = test_core_storing(store, None, dir.path().into(), 100);

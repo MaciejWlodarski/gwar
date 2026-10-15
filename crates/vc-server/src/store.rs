@@ -81,6 +81,10 @@ pub struct Removal {
     pub files: Vec<FileId>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("files must be distinct, finished, unattached sealed uploads of this author (at most 10)")]
+pub struct InvalidFiles;
+
 pub struct Store {
     db: Connection,
 }
@@ -314,6 +318,21 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE channels ADD COLUMN encrypted INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE channels ADD COLUMN history INTEGER NOT NULL DEFAULT 0;
+    "#,
+    // Both hard deletion and author tombstones remove files inside the message's transaction,
+    // including pruning and CLI maintenance. The existing files_removed trigger holds their charge.
+    r#"
+    ALTER TABLE files ADD COLUMN sealed INTEGER NOT NULL DEFAULT 0
+        CHECK(sealed IN (0,1) AND (sealed=0 OR message IS NULL));
+    ALTER TABLE files ADD COLUMN sealed_message INTEGER REFERENCES sealed_messages(id)
+        CHECK(sealed_message IS NULL OR (message IS NULL AND sealed=1));
+    CREATE INDEX files_by_sealed_message ON files(sealed_message);
+    CREATE TRIGGER sealed_files_removed BEFORE DELETE ON sealed_messages BEGIN
+        DELETE FROM files WHERE sealed_message=OLD.id;
+    END;
+    CREATE TRIGGER sealed_files_deleted AFTER UPDATE OF deleted ON sealed_messages WHEN NEW.deleted=1 BEGIN
+        DELETE FROM files WHERE sealed_message=NEW.id;
+    END;
     "#,
 ];
 
@@ -788,6 +807,10 @@ impl Store {
         let tx = self.db.unchecked_transaction()?;
         let mut removal = Removal::default();
         if delete_messages {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM files WHERE sealed_message IN (SELECT id FROM sealed_messages WHERE author_uid=?1)",
+            )?;
+            removal.files = stmt.query_map([uid], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
             let mut stmt = tx.prepare("DELETE FROM sealed_messages WHERE author_uid=?1 RETURNING conversation,id")?;
             let rows = stmt.query_map([uid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, MessageId>(1)?)))?;
             for row in rows {
@@ -804,7 +827,9 @@ impl Store {
                 removal.files.extend(self.delete_message(*message)?);
             }
         }
-        let mut stmt = self.db.prepare("DELETE FROM files WHERE uploader=?1 AND message IS NULL RETURNING id")?;
+        let mut stmt = self.db.prepare(
+            "DELETE FROM files WHERE uploader=?1 AND message IS NULL AND sealed_message IS NULL RETURNING id",
+        )?;
         let pending = stmt.query_map([uid], |r| r.get::<_, FileId>(0))?;
         removal.files.extend(pending.collect::<rusqlite::Result<Vec<_>>>()?);
         self.db.execute("DELETE FROM message_mentions WHERE uid=?1 AND message IN (SELECT id FROM messages WHERE signature IS NULL)", [uid])?;
@@ -1061,10 +1086,13 @@ impl Store {
         sha256: &str,
         dimensions: Option<(u32, u32)>,
         now: i64,
+        sealed: bool,
     ) -> Result<()> {
+        let (name, mime, dimensions) =
+            if sealed { ("file", "application/octet-stream", None) } else { (name, mime, dimensions) };
         self.db.execute(
-            "INSERT INTO files(id,uploader,name,mime,size,width,height,created_at,sha256) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            params![id, uploader, name, mime, size as i64, dimensions.map(|d| d.0), dimensions.map(|d| d.1), now, sha256],
+            "INSERT INTO files(id,uploader,name,mime,size,width,height,created_at,sha256,sealed) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![id, uploader, name, mime, size as i64, dimensions.map(|d| d.0), dimensions.map(|d| d.1), now, sha256, sealed],
         )?;
         Ok(())
     }
@@ -1107,12 +1135,12 @@ impl Store {
         Ok(())
     }
 
-    /// An uploaded file not yet attached to a message, if `uploader` owns it.
+    /// A plaintext upload not yet attached to either kind of message, if `uploader` owns it.
     pub fn pending_file(&self, id: &str, uploader: &str) -> Result<Option<Attachment>> {
         Ok(self
             .db
             .query_row(
-                "SELECT id,name,mime,size,width,height,sha256 FROM files WHERE id=?1 AND uploader=?2 AND message IS NULL",
+                "SELECT id,name,mime,size,width,height,sha256 FROM files WHERE id=?1 AND uploader=?2 AND message IS NULL AND sealed_message IS NULL AND sealed=0",
                 params![id, uploader],
                 attachment_row,
             )
@@ -1141,6 +1169,18 @@ impl Store {
             .optional()?)
     }
 
+    /// The sealed conversation, resolved only through the sealed association.
+    pub fn file_conversation(&self, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT m.conversation FROM files f JOIN sealed_messages m ON m.id=f.sealed_message WHERE f.id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     fn attachments(&self, message: MessageId) -> Result<Vec<Attachment>> {
         let mut stmt = self
             .db
@@ -1151,7 +1191,9 @@ impl Store {
 
     /// Uploads never attached to a message within `before` (ms); returns their ids.
     pub fn expire_unattached(&self, before: i64) -> Result<Vec<FileId>> {
-        let mut stmt = self.db.prepare("DELETE FROM files WHERE message IS NULL AND created_at < ?1 RETURNING id")?;
+        let mut stmt = self.db.prepare(
+            "DELETE FROM files WHERE message IS NULL AND sealed_message IS NULL AND created_at < ?1 RETURNING id",
+        )?;
         let rows = stmt.query_map([before], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -1159,7 +1201,7 @@ impl Store {
     /// Files whose message is gone (history trimming); returns their ids.
     pub fn expire_orphans(&self) -> Result<Vec<FileId>> {
         let mut stmt = self.db.prepare(
-            "DELETE FROM files WHERE message IS NOT NULL AND message NOT IN (SELECT id FROM messages) RETURNING id",
+            "DELETE FROM files WHERE (message IS NOT NULL AND message NOT IN (SELECT id FROM messages)) OR (sealed_message IS NOT NULL AND sealed_message NOT IN (SELECT id FROM sealed_messages)) RETURNING id",
         )?;
         let rows = stmt.query_map([], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1382,6 +1424,32 @@ fn urlencode(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encrypted_attachment_migration_keeps_existing_plaintext_files() {
+        let db = Connection::open_in_memory().unwrap();
+        let before = migration_adding("ALTER TABLE files ADD COLUMN sealed INTEGER");
+        for migration in &MIGRATIONS[..before] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.pragma_update(None, "user_version", before).unwrap();
+        db.execute_batch(
+            "INSERT INTO channels(id,name) VALUES(1,'legacy');
+            INSERT INTO messages(id,channel,author_uid,author_name,text,sent_at) VALUES(1,1,'a','A','body',1);
+            INSERT INTO files(id,uploader,name,mime,size,width,height,created_at,message,sha256)
+            VALUES('file','a','photo.png','image/png',3,10,20,1,1,'hash');",
+        )
+        .unwrap();
+        let store = Store::init(db).unwrap();
+        let file = store.file("file").unwrap().unwrap();
+        assert_eq!(
+            (file.name.as_str(), file.mime.as_str(), file.width, file.height),
+            ("photo.png", "image/png", Some(10), Some(20))
+        );
+        assert_eq!(store.file_channel("file").unwrap(), Some(1));
+        assert_eq!(store.file_conversation("file").unwrap(), None);
+        assert!(!store.db.query_row("SELECT sealed FROM files WHERE id='file'", [], |r| r.get::<_, bool>(0)).unwrap());
+    }
 
     #[test]
     fn upgrading_v2_history_preserves_bodies_and_makes_them_unsigned() {
@@ -1792,10 +1860,10 @@ mod tests {
         let theirs = store.add_message(channel, "gone", "gone", "bye", 2).unwrap();
         let mine = store.add_message(channel, "other", "other", "hi @gone", 3).unwrap();
         store.set_mentions(mine, &["gone".to_owned()]).unwrap();
-        store.insert_file("attached", "gone", "a", "x", 1, "hash", None, 2).unwrap();
+        store.insert_file("attached", "gone", "a", "x", 1, "hash", None, 2, false).unwrap();
         store.attach_file("attached", theirs).unwrap();
-        store.insert_file("pending", "gone", "p", "x", 1, "hash", None, 2).unwrap();
-        store.insert_file("other-file", "other", "o", "x", 1, "hash", None, 2).unwrap();
+        store.insert_file("pending", "gone", "p", "x", 1, "hash", None, 2, false).unwrap();
+        store.insert_file("other-file", "other", "o", "x", 1, "hash", None, 2, false).unwrap();
 
         // Without deleting messages: the record, its pending upload and mentions go.
         let kept = store.remove_member(gone, "gone", false).unwrap();
@@ -1826,7 +1894,7 @@ mod tests {
         for (id, uploader, size, created_at) in
             [("kept", "u", 1, 100), ("old", "u", 2, 0), ("sent", "u", 4, 0), ("theirs", "v", 8, 0)]
         {
-            store.insert_file(id, uploader, "f", "x", size, "h", None, created_at).unwrap();
+            store.insert_file(id, uploader, "f", "x", size, "h", None, created_at, false).unwrap();
         }
         store.attach_file("sent", message).unwrap();
         assert_eq!(store.expire_unattached(50).unwrap().len(), 2);

@@ -41,7 +41,7 @@ impl Core {
     }
 
     pub(super) fn sealed_request(&mut self, session: SessionId, request: SealedRequest) -> Reply {
-        let (conversation, group, epoch, message_id, ciphertext, change) = match request {
+        let (conversation, group, epoch, message_id, ciphertext, change, files) = match request {
             SealedRequest::History { conversation, before, limit } => {
                 self.sealed_access(session, &conversation, false)?;
                 let messages = self
@@ -52,16 +52,13 @@ impl Core {
             }
             SealedRequest::Remove { conversation, id } => return self.sealed_remove(session, &conversation, id),
             SealedRequest::Send { conversation, group, epoch, message_id, ciphertext, files } => {
-                if !files.is_empty() {
-                    return Err(err(ErrorCode::BadRequest, "sealed attachments are not supported yet"));
-                }
-                (conversation, group, epoch, message_id, ciphertext, None)
+                (conversation, group, epoch, message_id, ciphertext, None, files)
             }
             SealedRequest::Edit { conversation, group, epoch, message_id, revision, ciphertext } => {
-                (conversation, group, epoch, message_id, ciphertext, Some((revision, false)))
+                (conversation, group, epoch, message_id, ciphertext, Some((revision, false)), Vec::new())
             }
             SealedRequest::DeleteOwn { conversation, group, epoch, message_id, revision, ciphertext } => {
-                (conversation, group, epoch, message_id, ciphertext, Some((revision, true)))
+                (conversation, group, epoch, message_id, ciphertext, Some((revision, true)), Vec::new())
             }
         };
         self.sealed_access(session, &conversation, true)?;
@@ -129,11 +126,18 @@ impl Core {
             };
             message.id = self
                 .store
-                .sealed_insert(&message, &bytes)
-                .map_err(storage_error)?
+                .sealed_insert(&message, &bytes, &files)
+                .map_err(|e| {
+                    if e.is::<crate::store::InvalidFiles>() {
+                        err(ErrorCode::BadRequest, &e.to_string())
+                    } else {
+                        storage_error(e)
+                    }
+                })?
                 .ok_or_else(|| err(ErrorCode::Conflict, "message_id already used in this conversation"))?;
             message
         };
+        self.remove_files();
         let readers = self.mls_readers(&message.conversation);
         self.broadcast(Event::ChatSealed(message.clone()), |s| readers.contains(&s.id));
         Ok(Response::SealedMessage(Box::new(message)))
@@ -149,6 +153,7 @@ impl Core {
         if !self.store.sealed_remove(conversation, id).map_err(storage_error)? {
             return Err(err(ErrorCode::NotFound, "no such sealed message"));
         }
+        self.remove_files();
         let readers = self.mls_readers(conversation);
         self.broadcast(Event::ChatSealedRemoved { conversation: conversation.into(), ids: vec![id] }, |s| {
             readers.contains(&s.id)

@@ -168,7 +168,7 @@ async fn receive(core: CoreHandle, id: String, token: String, body: Body) -> Res
             if written > slot.size {
                 return Ok(Err(StatusCode::PAYLOAD_TOO_LARGE));
             }
-            if header.len() < SNIFF {
+            if !slot.sealed && header.len() < SNIFF {
                 header.extend_from_slice(&chunk[..chunk.len().min(SNIFF - header.len())]);
             }
             hash.update(&chunk);
@@ -180,7 +180,7 @@ async fn receive(core: CoreHandle, id: String, token: String, body: Body) -> Res
             return Ok(Err(StatusCode::BAD_REQUEST));
         }
         tokio::fs::rename(&part, &slot.path).await?;
-        let media = media_type(&header);
+        let media = if slot.sealed { None } else { media_type(&header) };
         let dimensions = media
             .filter(|m| m.starts_with("image/"))
             .and_then(|_| imagesize::blob_size(&header).ok())
