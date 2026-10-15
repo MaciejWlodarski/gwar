@@ -146,8 +146,9 @@ fn bounded(limits: Limits, observer: &Observer, proposals: &BTreeMap<u32, Vec<u8
     )?;
     Ok(state)
 }
-fn include_expiry(deadline: &mut Option<i64>, c: &gwar_mls::Credential) {
+fn include_validity(valid_from: &mut Option<i64>, deadline: &mut Option<i64>, c: &gwar_mls::Credential) {
     if let gwar_mls::Credential::Account(c) = c {
+        *valid_from = Some(valid_from.map_or(c.issued_at, |old| old.max(c.issued_at)));
         *deadline = Some(deadline.map_or(c.expires_at, |old| old.min(c.expires_at)));
     }
 }
@@ -564,7 +565,12 @@ impl Core {
     }
     pub(super) fn voice_reconcile(&mut self) {
         let now = (self.voice_clock)();
-        if !self.voice_dirty && self.voice_expiry.is_none_or(|at| at > now) {
+        // Cache the intersection of certificate validity intervals. A rollback
+        // below any issued_at must detach its participant just like expiry does.
+        if !self.voice_dirty
+            && self.voice_valid_from.is_none_or(|at| at <= now)
+            && self.voice_expiry.is_none_or(|at| at > now)
+        {
             return;
         }
         // No callbacks reconcile recursively: all detachments complete before
@@ -573,6 +579,7 @@ impl Core {
         {
             self.voice_passes += 1;
         }
+        let mut valid_from = None;
         let mut deadline = None;
         let channels: Vec<_> = self.calls.keys().copied().collect();
         for channel in channels {
@@ -656,17 +663,18 @@ impl Core {
             }
             for s in self.sessions.values().filter(|s| s.channel == Some(channel)) {
                 if let Some(c) = members.get(&(s.uid.clone(), s.hello_key.clone())) {
-                    include_expiry(&mut deadline, c);
+                    include_validity(&mut valid_from, &mut deadline, c);
                 }
             }
             if let Some(g) = self.calls.get(&channel).and_then(|c| c.group.as_ref()) {
                 for (i, c) in &credentials {
                     if g.leaves.contains_key(i) {
-                        include_expiry(&mut deadline, c);
+                        include_validity(&mut valid_from, &mut deadline, c);
                     }
                 }
             }
         }
+        self.voice_valid_from = valid_from;
         self.voice_expiry = deadline;
         self.voice_dirty = false;
     }
@@ -1279,6 +1287,34 @@ mod tests {
         assert_eq!(f.core.voice_passes, passes + 1);
     }
 
+    #[test]
+    fn clock_rollback_before_parent_or_voice_certificate_issuance_detaches_participant() {
+        for parent_certificate in [false, true] {
+            let mut f = TestCall::new();
+            let expiry = now_ms() + 3_600_000;
+            let issued_at = expiry - 86_400_000;
+            f.add(parent_certificate.then_some(expiry), (!parent_certificate).then_some(expiry), true, true);
+            let binding = f.binding(1);
+            f.core.voice_clock = test_clock;
+            VOICE_TIME.set(issued_at);
+            f.core.voice_reconcile();
+            assert_eq!(f.core.voice_deadline(), Some(expiry));
+            assert_eq!(f.core.voice_check(f.sessions[1], &binding).unwrap(), f.channel);
+            assert!(!f.core.voice_dirty);
+            let passes = f.core.voice_passes;
+            VOICE_TIME.set(issued_at - 1);
+            // Ordinary actor traffic must invalidate a previously clean cache.
+            f.core.handle(CoreMsg::Talking { session: f.sessions[0], talking: false, binding: None });
+            assert_eq!(f.core.voice_passes, passes + 1);
+            assert!(f.core.voice_state(f.sessions[1]).is_none());
+            assert_eq!(f.core.voice_check(f.sessions[1], &binding).unwrap_err().code, ErrorCode::Stale);
+            let group = f.core.calls[&f.channel].group.as_ref().unwrap();
+            assert_eq!(group.leaves.len(), 1);
+            assert_eq!(group.proposals.len(), 1);
+            assert_eq!(f.core.voice_deadline(), None);
+        }
+    }
+
     fn advancing_clock() -> i64 {
         let now = VOICE_TIME.get();
         VOICE_TIME.set(now + 1);
@@ -1330,15 +1366,19 @@ mod tests {
         f.core.enter_channel(f.sessions[1], f.channel).unwrap();
         assert!(f.core.voice_state(f.sessions[1]).is_some());
         f.core.move_client(f.sessions[1], None).unwrap();
-        let id = vc_proto::decode_fixed::<32>(&f.group).unwrap();
-        let out = f.voices[0].commit(&f.core.server_key, &id, &[], &[1], now_ms(), &()).unwrap();
-        f.submit(0, &out).unwrap();
-        settle_commit(&mut f.voices[0], &f.core.server_key, &f.group, &out);
-        // One occupied leaf plus the new participant's pending admission fills the call.
+        f.add(None, None, false, false);
+        f.core.voice_limits.members = 3;
+        // Two occupied leaves (one detached) plus a pending admission fill the
+        // leaf budget, while only two sessions occupy this three-session call.
         f.core.enter_channel(f.sessions[2], f.channel).unwrap();
+        let group = f.core.calls[&f.channel].group.as_ref().unwrap();
+        assert_eq!(Observer::load(&group.observer, &f.core.server_key).unwrap().leaves().len(), 2);
+        assert_eq!(group.leaves.len(), 1);
+        assert_eq!(f.core.sessions.values().filter(|s| s.channel == Some(f.channel)).count(), 2);
+        assert!(f.core.voice_state(f.sessions[3]).is_none());
         let before = f.snapshot();
         f.drain();
-        assert_eq!(f.core.enter_channel(f.sessions[1], f.channel).unwrap_err().code, ErrorCode::ChannelFull);
+        assert_eq!(f.core.enter_channel(f.sessions[3], f.channel).unwrap_err().code, ErrorCode::ChannelFull);
         assert_eq!(f.snapshot(), before);
         f.no_events();
     }
