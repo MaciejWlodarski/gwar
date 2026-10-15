@@ -32,10 +32,10 @@ post-quantum suites (MLS can add them later); push notifications.
   channel chat, direct messages and server-wide chat; **SFrame**
   ([RFC 9605](https://www.rfc-editor.org/rfc/rfc9605.html)) for voice.
 - A channel is **encrypted or not from its creation, for good**. Existing
-  channels are never converted. The default is encrypted when the server has
-  TeamSpeak compatibility off and plaintext when it is on; the client
-  remembers the creator's last choice. Plaintext channels carry a visible
-  "not end-to-end encrypted" label.
+  channels are never converted. New channels default to plaintext, with or
+  without TeamSpeak compatibility; encryption is chosen per channel, as in
+  build step 4. The client remembers the creator's last choice. Plaintext
+  channels carry a visible "not end-to-end encrypted" label.
 - Per channel, also fixed at creation: **new members see history** (or not).
 - Newcomers **join on their own** (MLS external join) and can write
   immediately. History keys arrive when any member's device is online. There
@@ -76,12 +76,16 @@ post-quantum suites (MLS can add them later); push notifications.
   Firefox 117+, Safari 15.4+) with a small RFC 9605 implementation on
   WebCrypto in the worker, not audited, which gets its own review before
   release; the
-  desktop's native engine through the Rust `sframe` crate (2.0). They
-  interoperate (S3). SFrame application metadata is always empty: `sframe`
-  2.0 authenticates metadata before the header, the reverse of RFC 9605,
-  which only differs when metadata is present. Clients reject non-empty
-  metadata, and a test keeps the RFC vector that fails today until it is
-  fixed upstream ([sframe-rs#124](https://github.com/TobTheRock/sframe-rs/issues/124)).
+  desktop's native engine through the Rust `sframe` crate. They interoperate
+  (S3). SFrame application metadata is always empty. Version 2.0.0
+  authenticates metadata before the header, the reverse of RFC 9605;
+  [sframe-rs#125](https://github.com/TobTheRock/sframe-rs/pull/125) fixes
+  [#124](https://github.com/TobTheRock/sframe-rs/issues/124). Build step 5
+  requires a release containing that fix, or its pinned merged revision
+  until a release exists, replaced before step 8. Clients reject non-empty
+  metadata; both implementations must pass the RFC vectors, including the
+  metadata vector at the primitive level. S3 below records the earlier
+  2.0.0 measurement, not the dependency to ship.
 
 All new statements follow the existing rules: UTF-8, `\n` separators, no
 trailing newline, canonical unpadded base64url for binary fields, decimal

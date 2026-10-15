@@ -21,15 +21,16 @@ and the web client working after every merge.
 4. **Encrypted channels and server-wide chat**: channel creation options,
    encrypted attachments, mentions and unread counts after decryption,
    TeamSpeak text isolation.
-5. **Encrypted voice**: voice groups, SFrame in the browser worker and the
-   native engine, epoch acknowledgements, per-call SSRCs, TeamSpeak audio
-   isolation, S6 with the official TeamSpeak server in CI.
+5. **Encrypted voice**: **5a** call-scoped MLS groups, protocol and server;
+   **5b** opaque SFU payloads, bound SSRCs and sender clocks; **5c** the web
+   SFrame worker and interface; **5d** the native engine. TeamSpeak audio
+   isolation and S6 with the official server run in CI.
 6. **Private channels**: owner chain, manager list, access lists.
 7. **Key archive** on Gwar Connect.
 8. **Pre-release reviews**: the WebCrypto SFrame worker; `openmls_rust_crypto`
    and our storage.
 
-Parts 1–4 are specified below. Voice comes before private channels and the
+Parts 1–5 are specified below. Voice comes before private channels and the
 archive because it is the product's core and needs only public channel
 groups.
 
@@ -1188,3 +1189,731 @@ limit (about 300 devices):
   opening; an edit or removal after stopping at 100 of 101 mentions), notifications not repeated after a delayed key or
   an edit, an encrypted attachment opened on the other device, server chat in
   4c.
+
+## 5. Encrypted voice
+
+Status: **specified, not built**. Step 4's channel groups, restart handling,
+separate ratchet trees and TeamSpeak exclusion are prerequisites. `Kind::Voice`
+and the descriptor's `channel_group_id` exist; voice admission, exporter keys,
+SFrame and epoch acknowledgements do not. RTP ingest already carries SSRC,
+extended sequence and timestamp, but still inspects Opus and forgets retired
+SSRCs. Native capture positions and variable-duration playout already exist;
+native WebRTC currently sends 10 ms packets. This step uses the design's 20 ms
+packets, independently of the existing 10 ms output scheduling quantum.
+
+Four pull requests, in order:
+
+- **5a:** voice rules in `gwar-mls` (agent and observer), volatile call state,
+  protocol, session admission and removal, acknowledgements and restart rules.
+  Include the small web/native adapter changes for the new bindings and
+  plaintext negotiation. Encrypted channels refuse audio until their client
+  has SFrame; show "Encrypted voice is being added. Chat is available."
+  Keep plaintext voice and TeamSpeak working. There is no temporary plaintext
+  fallback in an encrypted channel.
+- **5b:** SFU stream admission, opaque packets, timestamp forwarding, 20 ms
+  negotiation in both clients, and TeamSpeak audio boundaries. Enable neither
+  client to send encrypted voice yet. Run the official-server isolation tests.
+- **5c:** web worker, MLS-to-media controller, activation/retention rules,
+  browser tests and "Who can hear". Enable encrypted voice for web engines
+  that pass the transform capability check; desktop stays on the preceding
+  calm unavailable state until 5d.
+- **5d:** Rust SFrame, native key-install command, native/browser interop and
+  latency acceptance. Enable encrypted voice in the desktop engine.
+
+The adapter work in 5a/5b is deliberate: a server-only wire or SSRC change
+would break the clients between merges. Each PR retains plaintext and
+TeamSpeak regression coverage. This section pins down the voice installation,
+retirement, per-SSRC transport state, variable-duration native playback and
+origin-preserving bridge queues listed under the design's "Left for the
+implementation spec"; that list remains in the design.
+
+### Calls and membership (5a)
+
+- **Lifetime.** A call starts on the first successful `channel.join` into an
+  empty channel and ends when its last session leaves, moves, disconnects,
+  is removed, or the channel is deleted. Muting, deafening and an engine
+  restart do not leave the call. Server-forced moves use the same path.
+  Allocate a cryptographically random 16-byte `call` token per lifetime,
+  also for plaintext channels. A session entering gets a separate random
+  16-byte `participation` token; leaving invalidates it before publishing
+  routing changes. Re-entering the same still-active call gets a new token.
+  Repeated `channel.join` while already there changes neither token.
+- **Voice group.** An encrypted call has at most one MLS group, conversation
+  `voice:{channel_id}`, kind `voice`, incarnation 0, no predecessor,
+  `private = 0`, `history = 0`, no founding owner. `channel_group_id` is the
+  live, locally accepted channel group; `creation_nonce` is a fresh random
+  16-byte client nonce for this creation candidate, independent of the call
+  token (two devices of one uid can create in the same millisecond). The
+  request binds the candidate to the call. The creator signs this descriptor
+  normally. No voice
+  incarnation chain is created: the next call has a fresh nonce and group.
+  Plaintext calls have no MLS group, keys or acknowledgements.
+- **Admission.** Before entering encrypted voice the device joins and catches
+  up its channel group. The server requires an unbanned Gwar session, channel
+  join permission, and that exact `(uid, device_key)` in the channel group's
+  current observer tree; TeamSpeak sessions cannot enter. Channel capacity
+  still applies. The encrypted-call limit is 1000 sessions and 1000 occupied
+  leaves, including pending admissions; `client_move` does not bypass it.
+  Plaintext retains its existing channel and server capacity rules.
+  A listener without a microphone is a participant and has a leaf too.
+- **Creation and join.** Get `voice.state`, create the epoch-zero singleton
+  with the descriptor above if `group` is null, and submit
+  `mls.group.create`. First creation wins; identical retries return its id,
+  another candidate gets `conflict` with that id in the existing error
+  message field. A creator settles **Creating** against `voice.state` before
+  exporting anything. A loser discards only its tentative candidate and
+  joins the winner. Join by `mls.group_info`, the tree endpoint and external
+  `mls.commit`; never by a key-package Add or Welcome. A joining group stays
+  non-send-capable until acceptance is reconciled through the reply/log.
+- **Pin.** Keep one group pin per `(server_key, channel, call)` in memory.
+  Once settled, another group id for that call is refused, even if the server
+  calls it a restart. A different `call` for the same channel/participation
+  without a confirmed leave or move stops the engine and leaves voice; it
+  never silently replaces the pin. On a confirmed leave, move or disconnect
+  the pin and all call state are discarded; a new participation can then
+  accept the next call. A lost creation reply is resolved by
+  `voice.state`; a lost commit reply by its hash in `mls.log`, as in section 2.
+- **Leaf mapping.** The core owns `leaf -> {uid, device_key, session,
+  participation}`. Creation and external commit bind the new leaf to their
+  authenticated requesting session, never to a supplied uid/session. A member
+  commit must come from that leaf's bound participation. One current leaf per
+  device, one participation per session, one media run per participation.
+  The existing one-session-per-device takeover disconnects the old session
+  first. An external rejoin may replace only its own earlier leaf, under
+  section 1's rule; it installs a fresh mapping and counts as a removal.
+- **Leave and removal.** Retire that participation's stream, stop routing to
+  and from it, clear its acknowledgements and detach its leaf mapping in one
+  actor transition. Propose `Remove` for every detached leaf while any
+  participants remain. Revocation, expiry, ban, removal from the server or
+  channel group use the same path. Reconcile proposals after each voice or
+  parent-channel commit, on revocation updates, at the next leaf certificate
+  expiry (a core timer), and before admitting a voice operation; reissue at
+  the new epoch if a competing commit left the leaf in the tree. Remaining
+  devices commit removals using the existing ordered flow. No server-held
+  media key or server-generated member commit is introduced.
+- **Parent changes.** Ordinary parent epochs do not rekey voice by themselves.
+  A client blocks sending while a voice leaf is absent from its current
+  validated parent tree, has a non-current certificate, or a server removal
+  is pending, then commits the required removals. Catch-up still accepts
+  structurally valid historical voice commits; present-day parent membership
+  is a sending gate, not grounds to reject that history. Creation/join may
+  expose no media keys until this gate passes. If the channel group is
+  restarted, close its call (`channel_restarted`), move its sessions out of
+  voice and require a fresh join tied to the successor. Do not mutate the
+  voice descriptor or accept two parent groups for one call.
+- **Rules and state separation.** Add explicit voice paths in `rules.rs`,
+  `Agent` and `ds::Observer`: the descriptor fields above; ordinary credential,
+  immutable-context, external-sender and commit-time checks; external joins
+  only; no Add/Welcome, chat, history sharing/import, evidence archive or
+  `accept_chain` for voice. Use the parent's validated channel rules (public
+  in step 5; step 6 adds private admission). Check current parent membership
+  on the client and server, without treating a server roster as proof. Voice
+  uses a separate in-memory agent/provider store under the same device lease;
+  it never enters IndexedDB, the chat outbox, Gwar Connect or key packages.
+  Serialize its tentative state and commit-hash outbox in that store before
+  emitting requests. Runtime/worker loss forces rejoin/update as below;
+  chat's durable state and locks are unchanged.
+
+### Wire and delivery (5a)
+
+All new operations use the existing authenticated `vc/4` request/reply/event
+envelopes and generated Rust/TypeScript types. Binary fields are canonical
+unpadded base64url: `call` and `participation` 16 bytes; `group`,
+`channel_group` and `device` 32 bytes. `channel`, `leaf` and `ssrc` are u32
+(`ssrc` nonzero); `session` uses `SessionId`; `run` is an integer 1 through
+`2^53 - 1`, increasing within a participation. Epochs in these wire messages
+and reused MLS operations remain exact JSON integers, 0 through `2^53 - 1`;
+reject fractions, negative or unsafe values, never truncate. Full epochs are
+u64/BigInt internally. A call that would advance beyond this wire limit is
+closed with `epoch_exhausted`, not wrapped. The low-32-bit SFrame epoch wraps
+normally and is tested independently of this unreachable-in-practice limit.
+
+`VoiceState` is `{channel, call, participation, encrypted, channel_group,
+group, epoch}`. The last three fields are nullable: all null in plaintext;
+in encrypted voice `channel_group` is required, and `group`/`epoch` are both
+null until creation, then both present. It describes only the caller's
+current participation, not authority to derive keys.
+
+| Request | Reply | Rule |
+| --- | --- | --- |
+| `voice.state {}` | `{voice: VoiceState or null}` | current participation, or null when outside voice; read-only, also used after a lost reply |
+| `mls.group.create {conversation, group_info, voice: {call, participation}}` | `{group}` | `voice` required only for voice creation and rejected for other kinds; current participation, descriptor channel/parent match, creator is its device; one group per call |
+| `mls.commit {group, epoch, commit, group_info, voice: {call, participation}}` | `{epoch}` | `voice` required only for voice commits; no `welcome`; mapped member or same-device external join; existing `stale`, `expired`, `early` and validation rules |
+| `voice.offer {channel, call, participation, run, group, ssrc, sdp}` | `{call, participation, run, sdp}` | replaces the existing offer shape; `group` null only in plaintext, otherwise the pinned live voice group and the caller's mapped leaf required; SDP at most 64 KiB; exactly one offered microphone SSRC, equal to `ssrc` |
+| `voice.epoch.ack {call, participation, run, group, epoch}` | `{}` | current run of the mapped device, epoch exactly the observer head; emitted only after decryptor installation |
+| `voice.epoch.repeat {call, participation, run, group, epoch}` | `{}` | same binding and epoch check; requests another ack from each participant, including self |
+
+Events below go only to the relevant call's Gwar sessions, except the
+existing server-wide talking display event as specified below:
+
+- `voice.state {voice: VoiceState or null}`: per-session snapshot on enter,
+  leave or group creation. Epoch advances still use `mls.commit`; do not
+  broadcast 1000 individual state snapshots per commit.
+- `voice.epoch.ack {call, group, epoch, device}`: device is filled from the
+  session and checked against the observer; a client cannot nominate it.
+- `voice.epoch.request {call, group, epoch}`: participants whose actual
+  decryptor has this epoch installed repeat their ack. Others catch up and
+  ack only after installation. This never installs or activates a key.
+- `voice.closed {call, participation, run, reason}` replaces the unbound
+  event; `run` is null if no transport was negotiated. Defined reasons:
+  `transport_failed`, `channel_restarted`, `channel_deleted`,
+  `epoch_exhausted`, `stream_limit`, `state_limit`. A transport failure
+  retires the run but keeps the participation for retry; the other reasons
+  end it. Late answers and closures cannot affect another binding.
+- `voice.slot {call, participation, run, slot, client}`: recipient's current
+  binding, `slot` 0–7, source `SessionId` or null. The existing RTP
+  slot-generation extension remains separate. `voice.talking {call,
+  participation, run, client, talking}` instead names the **source** binding
+  and source session, and keeps its existing server-wide display audience;
+  outside the call it is unverified activity metadata, not a crypto input.
+  For a TeamSpeak source, `run` is null. Discard talking events for a source
+  whose current channel/call no longer matches; never use either event to
+  install a key or choose a decryptor.
+
+`voice.offer` is idempotent for the current run and identical fields/SDP;
+return the cached answer, without replacing the peer. The same run with other
+fields returns `conflict`; an older run or ended participation returns
+`stale`. An SSRC already used by another run of this session returns
+`conflict` with message `ssrc_reused`. A greater run retires the old stream
+before negotiating its new one; failure leaves no fallback peer. Keep one
+pending negotiation and one cached answer per participation, each SDP at most
+64 KiB; a newer run cancels the old negotiation. Check bindings again when
+async negotiation completes. A retry after a successful offer must not restart
+SFrame counters. Raw UDP SSRC discovery never creates a binding.
+
+Use existing `bad_request` for malformed fields, wrong mode/descriptor,
+Add/Welcome or voice history requests; `too_large` for byte limits;
+`forbidden` for failed membership/session binding; `not_found` for a missing
+channel/group; `stale` for a no-longer-current call, participation, run or
+epoch; `conflict` for another live group or reused run; `channel_full` for
+1000 participants/leaves; `rate_limited` for the rates below; `unavailable`
+for a full media command queue or the retired-stream limit. No failure may
+partly admit a leaf or activate a stream. Existing authentication and the
+connection's 20 requests/s bucket remain in force.
+
+- Reuse `mls.group_info`, `mls.log` and `mls.proposal`/`mls.commit` events,
+  including commit-hash reconciliation and proposal replay. Access is the
+  current participation whose device is in the parent group; being a channel
+  chat reader alone is insufficient. Events reach admitted and joining call
+  sessions. `mls.groups` and `mls.group_history` exclude voice; discovery and
+  creation settlement use `voice.state`. No voice `mls.history.*` or sealed
+  chat request is accepted, even if a client guesses a group id.
+- Extend the separate-tree path to `Kind::Voice`: singleton creation carries
+  its tree; subsequent GroupInfos have `external_pub` and no ratchet tree.
+  `GET /api/mls/{group}/tree` uses the same participation check through the
+  bearer session, 30 requests/minute, no-store response, `x-gwar-epoch`, 8 MiB
+  and 30 s client bounds as section 4. Retry GroupInfo and tree together if
+  the epoch changed; no oversized WebSocket tree workaround.
+- Existing 128 KiB decoded MLS blob and 640 KiB complete envelope limits
+  apply. List/log paging is section 2's 1–100 items and byte budget, including
+  pending proposals. A voice log gap forces same-group external rejoin,
+  replacing the device's old leaf; it never creates a second call group.
+- Store call state in the core, not SQLite: tokens/parent/group, observer and
+  latest GroupInfo, leaf map, pending removals (one per leaf), log, and current
+  epoch ack set. Bound each tree/serialized observer to 8 MiB, GroupInfo to
+  128 KiB, occupied leaves and pending proposals to 1000, total pending
+  proposal bytes to 256 KiB; log to the newest 4096 entries, 16 MiB or 90 days,
+  whichever prunes first. Prune complete oldest entries. Overflow of observer
+  or proposals refuses the mutation with `too_large`; admission overflow
+  uses `channel_full`. Exit/removal is never refused for lack of space:
+  retire routing first; if required removal state cannot fit, end the call
+  with `state_limit` rather than retain a send-capable inconsistent tree.
+  Calls are at most the number of nonempty channels and
+  the configured session limit; no call is allocated for an unauthenticated
+  or rejected join. Cache only the latest exported tree, using the existing
+  global 64-tree cache; invalidate it on commit/end.
+- Apply a voice commit to a copy, validate all limits and the session/parent
+  checks, then atomically swap observer, leaf map, log, proposals and ack
+  epoch before replying/broadcasting. Volatile voice acceptance is explicitly
+  different from durable chat acceptance: process restart ends every call.
+  Clear all call/transport state on server restart; reconnecting sessions
+  join fresh calls. No voice group is restored from the database or allowed
+  to refer to an old session. Client connection loss immediately closes its
+  engine and forgets voice secrets; it never resumes a counter after reload.
+- Server acks: one bit per current device at the head epoch (at most 1000),
+  cleared on epoch advance, departure or run replacement. Ack requests have
+  a per-participation bucket of 10/s, burst 20. Repeats have a bucket of
+  10/minute per participation; coalesce call-wide repeat requests to one
+  event/second. An identical ack succeeds without another broadcast except
+  once in response to a new repeat round (internal round counter, not a wire
+  field). No unbounded acknowledgement history or per-packet key traffic.
+
+### SFrame and receiver state (5c/5d)
+
+The suite is **`AES_128_GCM_SHA256_128`**, with a 16-byte authentication tag;
+no shorter-tag negotiation. Application metadata is always empty. Encrypt
+the entire encoded Opus packet, including its TOC; only the SFrame header
+remains clear inside the RTP payload. RTP headers, slot, SSRC, timestamp and
+audio level are not SFrame AAD. Use RFC 9605's header encoding, suite-specific
+HKDF-SHA256 key/salt derivation, counter-to-nonce construction and authenticated
+header bytes without a Gwar variant.
+
+For each validated voice epoch E and occupied leaf L:
+
+```text
+base_key(E, L) = MLS-Exporter("gwar voice v1", u32be(L), 32)
+kid(E, L)      = ((E & 0xffffffff) << 32) | L
+```
+
+The label is those ASCII bytes, without NUL or newline; the context is exactly
+four binary big-endian bytes, not decimal text or base64. The group and full
+epoch are already bound by MLS; do not add the channel id, call token or run
+to this exporter. Feed its 32 bytes as SFrame's base key, not directly as the
+AES key. Encode the unsigned 64-bit `kid` and counter with RFC 9605's variable
+header, using BigInt in JavaScript; never use JS bitwise operators on Numbers.
+
+- One encryptor per `(server, call, group, full epoch, own leaf)`, shared by
+  all local sending paths. Counter starts at zero, is reserved/incremented
+  before each encryption attempt, and is never reused after failure, queue
+  drop, mute or activation retry. At `2^32` attempts under that base key,
+  stop sending and perform an own-leaf update before another frame; never
+  wrap the RFC's u64 counter. Tests still exercise the full u64 header range.
+  Sending activation is monotonic in full epoch and cannot return to an old
+  key; receiver reinstall cannot construct a new sender encryptor.
+- Receiver table: `BTreeMap<full_epoch, EpochKeys>` (JS ordered Map), maximum
+  eight. Each entry holds `superseded_at: monotonic time or null` and
+  `leaf -> {device_key, base_key, derived AEAD key/salt, Replay}`; at most
+  1000 leaves per epoch. `Replay` is `{highest: u64 or none, bitmap: 128 bits}`.
+  Bit 0 denotes highest; reject an already-set bit or a counter at least 128
+  behind, shift/mark for a newer authenticated counter. Windows belong to the
+  full `(group, epoch, leaf)` across all eight receive slots, not to an RTP
+  SSRC, slot generation or current active sending epoch.
+- A header's low epoch/leaf finds at most eight candidates, newest full epoch
+  first. Reject malformed headers and frames outside 17–1033 bytes before
+  cryptography; after opening require 1–1000 bytes of valid Opus. Try matching
+  keys without changing their replay windows. Only successful authentication
+  and a final atomic replay check admit a frame. A failed attempt cannot
+  advance a replay window, retire keys, change a device's last epoch or reset
+  a decoder. Concurrent decryptions of the same counter admit it once.
+- Keep `last_authenticated[device_key] = max(full epochs authenticated)` for
+  devices still in the latest validated voice tree. When first processing a
+  commit above E, set E's `superseded_at` once. Keep E while it is current, or
+  for 10 seconds from that time, or while some current device's
+  `last_authenticated` equals E. A sender silent since its last frame thus
+  keeps E; a sender never heard has no such entry. A late older frame cannot
+  move this pointer back. Sweep after installation, successful receive and
+  once/second; if there are over eight epochs, evict the oldest regardless
+  of either retention condition. Evicted keys/windows are not reconstructed
+  from saved exporters. An inactive pointer to an evicted epoch holds nothing.
+- Every removal purges that device's keys/windows from **all** kept epochs,
+  clears its last-authenticated entry and discards pending decrypt results
+  for it, before a reused leaf index is installed. A Remove plus re-add of the same device
+  is still a purge of its prior membership. Preserve the epoch monotonicity
+  guard so old install messages cannot restore those keys. New membership
+  gets keys only from the new validated epoch. Retention after a successful
+  frame never overrides a membership removal or the eight-epoch cap.
+- Per-key nonce counters and key material are never logged, persisted or
+  archived. Expose aggregate counters only: `encrypted`, `decrypted`, `no_key`, `auth_failed`,
+  `replay_dropped`, `oversize_dropped`, `non_20ms`, `stale_install`,
+  `counter_exhausted`; count a malformed frame once, not once per attempted
+  epoch. Zeroize Rust keys and drop WebCrypto keys/buffers when retired/end.
+
+### Installation and activation (5c/5d)
+
+The worker and native engine implement the same serialized control contract.
+The web MLS controller owns membership validation and the activation timer;
+the decryptor owns key retention, replay windows and the sender counter.
+
+`binding = {server_key, session, channel, call, participation, run, group}` is
+fixed at encrypted engine creation, before any frame can pass. Native
+`voice_start` gains that binding, `mode: "encrypted" | "plaintext"`, and
+`resume_after: epoch or null`; plaintext has a null group and resume floor.
+The worker's start message has the same fields. On a restart the floor is
+its controller's highest processed epoch before the required own update;
+refuse installs at or below it. A first creation/join has a null floor.
+Direct TeamSpeak starts keep their local session/run binding, have no Gwar
+call/group and reject encrypted mode. Local command `voice_set_keys` (High risk
+class, never exposed to a remote web origin) and worker control messages have
+this exact tagged body, with `binding` and `serial` on every variant:
+
+| `action` | Other fields | Meaning |
+| --- | --- | --- |
+| `hold` | `epoch`, `removed: [device]` | stop sender, invalidate outstanding encryption work, purge these removed devices; used before processing a removal or blocking the MLS gate |
+| `install` | `epoch`, `own_leaf`, `members: [{leaf, device, key}]`, `removed: [device]` | install receive keys for the complete validated epoch; `key` is the 32-byte exporter; does not select a sending key |
+| `activate` | `epoch`, `send_until` | select the installed own-leaf sender for this epoch, if the controller's activation rule permits it; `send_until` is the earliest certificate expiry among current voice leaves, Unix milliseconds, or null if all are local identities |
+
+Here epochs and `serial` use canonical decimal u64 **strings**, including at
+the Tauri boundary (the agent already has this encoding); they are never
+rounded through a JS Number. Serial starts at 1 and increases per binding;
+`resume_after` uses the same epoch-string encoding; run/session follow the
+wire's safe-integer bounds. `send_until` is a safe-integer Unix millisecond
+timestamp or null. `members` is sorted by leaf, unique by leaf and device,
+nonempty and at most 1000; `own_leaf` must
+occur exactly once; `removed` is distinct and at most 1000. A control body is
+at most 256 KiB. `removed` is the union of device identities removed since
+the previous delivered installation, including own-device replacement; it
+may also occur in `members` only as a fresh membership in this epoch.
+Validate canonical keys and all bounds before enqueueing; no media key
+crosses the server connection. Only the trusted local MLS controller can
+call this contract, never server events directly.
+
+- Return `{serial, epoch, result: "applied" | "unchanged" | "ignored"}`
+  **after the media thread/worker actually applies it**, not when IPC posts
+  it. No ack is sent for `ignored` or a mere transport/worker-ready signal.
+  Unknown/ended binding, lower serial or superseded install epoch is ignored
+  before comparing keys. Otherwise same serial and bytewise canonical body
+  returns `unchanged`; different body at the same serial, or different
+  keys/membership at the current installed epoch, stops this engine
+  (`key_conflict`). Invalid structure returns `bad_keys`, without mutation.
+- Installs advance full epochs only; same-epoch identical keys are a no-op
+  preserving sender counter and every replay window, even with a newer
+  serial. Keep the latest accepted install digest, highest installed epoch
+  and per-retained-epoch key identity; a lower install is ignored. A duplicate
+  does not recreate a purged leaf or evicted epoch, reset a retention time,
+  undo `hold`, or activate a sender. `activate` below the latest processed
+  epoch is ignored. Activation of a not-yet-installed epoch returns
+  `not_installed` and remains silent; retries use a new serial. Each encrypt
+  checks the active gate and expiry; convert `send_until` to a monotonic
+  deadline at activation and do not extend it on a clock rollback or duplicate
+  install. The controller checks current membership/revocations at activation,
+  on feed/parent/proposal changes and at certificate expiry, issuing `hold`
+  before publishing a blocked state. A feed update never waits for an audio
+  frame or another MLS commit to close the gate.
+- The controller sends a `hold` barrier before marking a removal commit
+  processed; the engine retires affected receive keys and old sender work
+  before acknowledging that barrier. Validation may run beforehand, but
+  that barrier and publication of the processed epoch form the cutoff.
+  An async encrypt/decrypt completion checks binding, control generation,
+  retained key identity and current removal state again before output.
+  Queued output from another call is discarded. Frames encrypted before the
+  cutoff are subject to the design's stated removal limit; no encryption
+  after it uses the old key.
+- Never await key import on the audio callback. Bound control queue to eight
+  entries and fail/close the run on overflow (`key_queue_full`), without
+  losing a hold. Serialize control operations; a superseded crypto import
+  cannot publish keys or acknowledge installation. On stop, invalidate the
+  binding first, drop all queued/in-flight results, keys and replay state.
+
+Controller states are **Securing**, **Active(E)** and **Pending(E, target,
+started, removal)**; all clocks below are monotonic:
+
+1. Enter/create/join in **Securing**, no sending. After accepted and locally
+   validated membership, process the epoch and install its receive keys.
+   Record its device-key set, including self; only the actual install
+   completion sends `voice.epoch.ack`. A joiner has no preceding sender key.
+2. From **Active(E)** on a newer processed epoch T, start **Pending** with
+   `started = now` and whether a leaf was removed. Another commit replaces T,
+   keeps the earliest `started` and ORs removal across the entire pending
+   chain. Processing time is recorded before importing the new keys; import
+   latency cannot restart the two-second clock. Initial **Securing** uses
+   the same pending rule with no preceding E.
+3. Any removal performs the hold barrier at once; so does a blocked MLS
+   gate (pending server proposal, invalid current membership or revocation).
+   Until valid latest keys are installed, send nothing. A non-removal
+   transition may keep using E only while the current gate remains valid.
+4. Activate only the **newest processed** epoch, once its keys are installed
+   and the gate is valid, if `removal`, or every device in that epoch has
+   acknowledged it, or `now >= started + 2 seconds`. Include muted, deafened
+   and receive-only devices and every device of one uid separately. On
+   activation become **Active(T)**. Timer expiry never substitutes for keys
+   or membership checks. Recheck elapsed time on every wake; suspension
+   cannot start a fresh wait. A newer pending epoch never revives E after a
+   removal. Initial singleton creation can activate on its own install/ack.
+5. Acks are not signatures or authority: accept only the pinned call/group,
+   deduplicate by `(full epoch, device_key)` and count only devices in that
+   locally validated epoch. Ignore older epochs. Before processing an epoch,
+   hold future acks for at most eight epochs, 1000 devices per epoch, 10 s,
+   and no more than 64 epochs beyond the local head; discard oldest first.
+   They cannot create keys. On catching up, request a repeat for the newest
+   epoch after installation, also after losing buffered acks. Respond only
+   from an installed decryptor. No ack from a removed leaf is counted for a
+   different device that later uses its index.
+6. If an engine/worker restarts or cannot prove continuity of its sender
+   counter, enter **Securing** with a fresh run and SSRC. The retained MLS
+   controller makes an own-leaf update accepted **after** this restart;
+   counter exhaustion does the same, closing the old run. If MLS state was
+   lost, externally rejoin the same call group instead. Until acceptance,
+   refuse every older sender key and, if replay state was lost, every older
+   receive key too.
+   The controller releases its first install only for the epoch of that
+   exact post-restart own-update/join commit (reconciled by commit hash), or
+   a subsequently validated epoch. The engine's floor and monotonic install
+   guard exclude older keys. Then follow normal installation/activation.
+   Another device's intervening commit, or a pre-restart pending own commit,
+   does not satisfy this own-update requirement.
+
+The 2 s bound is on waiting for acknowledgements after a sender processes a
+commit, not network delivery, crypto installation, a suspended event loop or
+playout. Tests distinguish those intervals. Forged or missing relay acks can
+make audio switch early or at the deadline, but cannot relax key provenance,
+removal cutoff or the no-plaintext rule.
+
+### SFU, plaintext and TeamSpeak (5b)
+
+- Replace `AudioPacket`'s assumption that every payload is inspectable Opus:
+  carry opaque `payload`, explicit `Audio`/`EndOfSpeech`, original clock,
+  `{channel, encrypted, call, source_session, participation, run}` and route
+  generation, captured at admission. TeamSpeak packets carry their confirmed
+  origin and connection/route generation instead of an RTP run. An empty or
+  malformed encrypted payload is not an end marker. No encrypted payload
+  reaches `media::opus::packet_samples`, decoder or TeamSpeak packetizer.
+- A successful offer binds one microphone SSRC to the authenticated session,
+  participation, call, run and mode. Validate the SSRC against the negotiated
+  microphone section, not a first arriving packet. Each engine restart and
+  call/move constructs a new transport and fresh nonzero SSRC in plaintext
+  too. RTP sequence may restart only with that stream. Keep retired SSRCs
+  per WebSocket session/microphone, across peer replacements: maximum 32,
+  never evict to admit another. Retire before replacement; when 32 have been
+  retired refuse another offer (`unavailable`, message `stream_limit`) and
+  close voice with `stream_limit`. Reconnecting obtains a new session and
+  DTLS transport; old UDP cannot authenticate into it.
+- In `ingest`, drop unknown/retired SSRCs before speech state, slot allocation
+  or routing. Copy SSRC, str0m's **extended** sequence and raw u32 timestamp
+  into `SourceClock::Rtp`; do not reconstruct ordering from arrival time or
+  MediaData. Keep ordering state only for the one admitted active source.
+  Drop duplicates/older sequences before routing, even after long silence;
+  the TeamSpeak one-second out-of-order reset exception never applies to RTP.
+- For a newer sequence, compute wrapping u32 timestamp difference against
+  the last accepted timestamp of that SSRC. Difference zero drops and
+  increments `rtp_zero_delta`; consume its sequence high-water mark but do
+  not change the timestamp baseline or speech/slot state. Otherwise update
+  source ordering even for packets subsequently gated as silence/mute.
+  On a slot retaining the same source stream, map the difference from that
+  slot's last forwarded source timestamp, preserving all omitted time.
+  Positive deltas through 240000 ticks are used directly. Backward
+  half-range deltas or larger forward deltas reset the source clock.
+- On first packet, speaker/run/SSRC change or reset, advance the slot clock
+  by `max(1, ceil(elapsed_ns / 20000000)) * 960`; the first packet without a
+  prior write starts at 48000 ticks. Keep a u64 slot clock, write low u32;
+  retain output sequence and slot-generation semantics. Forward immediately,
+  with no packet-duration lookahead or new buffering. The SFU uses the same
+  timing for encrypted and plaintext RTP. `rtp_unknown_ssrc`,
+  `rtp_retired_ssrc`, `rtp_old_sequence`, `rtp_source_reset` and
+  `rtp_zero_delta` are separate counters.
+- **Packetization.** Both clients request Opus/48000 with `a=ptime:20` and
+  `a=maxptime:20`; the answer preserves that request. One complete encoded
+  audio packet per RTP packet, no aggregation/fragmentation. Native capture
+  uses 960-sample packets for Gwar and direct TeamSpeak; keep the existing
+  480-sample scheduling/output callback quantum independent of capture size.
+  Browsers keep their capture-position timestamps. Native sends each frame's
+  first captured 48 kHz sample position (plus a fixed per-run RTP offset,
+  wrapping to u32), not wall time or a count of transmitted packets. Capture
+  advances through silence, mute, PTT and every queue drop; discard partial
+  frames across missing positions. A non-increasing faulty position drops
+  and counts the frame instead of inventing media time. Preserve the current
+  `CaptureSample`/`CaptureFrame` continuity checks.
+- Parse Opus duration at the **sender before encryption**, count valid
+  non-20 ms packets but send them. Drop malformed Opus and encoded packets
+  over 1000 bytes, never truncate. SFrame adds at most 33 bytes; cap incoming
+  encrypted payload at 1033 before work/allocation. Plaintext RTP also has
+  the 1000-byte encoded cap. Receivers decrypt before duration inspection,
+  jitter insertion, decoder reset or playback. The SFU never needs a frame's
+  encrypted duration. Keep RFC 6464 audio-level speech gating unchanged.
+- **Plaintext** channels remain unencrypted and, with compatibility enabled,
+  bridged. They get call/run fencing, fresh SSRCs, capture timestamps and
+  20 ms negotiation too; their worker/native pipeline explicitly selects
+  plaintext mode at start, without trying SFrame then falling back. Existing
+  direct TeamSpeak transport remains plaintext with its u16 packet-id and
+  talk-spurt clock. Preserve its variable-duration packetizer and ordering;
+  the SFU's speaker-change estimate uses the fixed 20 ms rule above.
+- **Bridge boundaries.** `Member.bridged` remains an early gate but is not
+  enough for a queued packet. SFU fan-out, `Forward`/`ForwardTo`, sinks,
+  puppet uplink queue, puppet socket and incoming voice/whisper each check
+  the packet's fixed origin/mode and the current route generation. Require
+  plaintext origin, a still-current source participation/route and a
+  confirmed matching TeamSpeak channel before sending. Capture origin at the
+  TeamSpeak receive callback, not later from mutable `Remote.cid`. Recheck
+  target mode for whispers. Pending/refused moves, reconnect, a retained
+  direct-message puppet and grace periods cannot bypass the checks.
+  Increment route generation on every move attempt and transport replacement;
+  drop queued audio from the previous route, including plaintext across moves.
+  Explicit local end-of-speech control may clear old talking state, but sends
+  no payload into a new channel. Never relabel queued packets with the
+  sender's later channel. Keep section 4's analogous text boundaries.
+
+### Web and desktop (5c/5d)
+
+- `apps/web/src/voice/webrtc-engine.ts` creates one dedicated SFrame worker
+  per encrypted run. Attach `RTCRtpScriptTransform` to the mic sender and all
+  `AUDIO_SLOTS` receivers immediately when creating their transceivers,
+  before attaching a live track or setting descriptions. Create the mic
+  transceiver without a track, attach its transform, then `replaceTrack`.
+  Worker starts closed, drops without keys, encrypts/decrypts one frame at a
+  time per transform and never passes plaintext through an encrypted path.
+  Share receiver key/replay state across slots. Async output uses the
+  installation/removal fences above. Keep at most one in-flight and one
+  waiting frame per transform; drop excess rather than add a latency queue.
+- Probe `RTCRtpScriptTransform`, worker transform events and WebCrypto in the
+  actual engine. A failed probe or worker failure prevents encrypted voice;
+  it does not change the channel's mode. Unsupported browsers show
+  "Update your browser or use the desktop app to join encrypted voice."
+  Check before microphone permission or `channel.join`. Browser settings
+  and device changes that recreate the engine follow the own-update rule.
+- Extend `apps/web/src/mls/runtime.ts` with the volatile voice controller and
+  cancellation under its device lease. All tree downloads, commits, timers,
+  installs, promises and acknowledgements capture the full binding. A move
+  synchronously closes the old media gate and discards captured, encoded,
+  queued and decoded old-call audio before starting the new run. A Web Lock
+  takeover closes voice before releasing the old tab's lease. Post key
+  material only on installation, never per frame or in React state/logs.
+- `apps/web/src/voice/native-engine.ts` relays the same contract to
+  `apps/desktop/src-tauri/src/voice.rs`; Rust `vc-client::voice` is the actual
+  encryptor/decryptor. Bind `voice_start`, `voice_answer`, `voice_stop`, key
+  commands and asynchronous events to the current run; stale stop/answer
+  cannot cancel a new run. Validate in both Tauri and the engine; return
+  `voice_set_keys` completion from a media-thread acknowledgement. Attach
+  crypto before starting the RTC send/receive loops. Gate encoded sending
+  immediately before encryption/RTP write and decrypt before producing an
+  `Incoming` Opus packet. Worker status and native `voice://crypto` emit
+  `{binding, state: "securing" | "failed", reason}`; reasons are
+  `counter_exhausted`, `key_expired`, `key_conflict`, `key_queue_full` or
+  `worker_failed` (web only). Exhaustion/expiry closes sending and wakes MLS
+  reconciliation (including rejoin for an expired own leaf); a failed state
+  closes the run. No status event counts as
+  an installation acknowledgement. Keep native input/output diagnostics.
+- Rust uses a **crates.io `sframe` release containing the RFC 9605 AAD-order
+  fix** (upstream issue [#124](https://github.com/TobTheRock/sframe-rs/issues/124),
+  merged PR [#125](https://github.com/TobTheRock/sframe-rs/pull/125)). If no
+  such release exists when 5d is built, pin the full 40-hex merge revision of
+  #125 from `https://github.com/TobTheRock/sframe-rs`, record it in
+  `Cargo.toml` and `Cargo.lock`, and replace it with the fixed crates.io
+  release **before step 8**. Resolve that exact merged-fix revision when
+  adding the dependency; a branch, moving tag or unpatched 2.0.0 is not
+  acceptable. The merge/release is not fetched by this documentation task.
+  Use explicit counter/replay ownership around the library; do not rely on
+  a constructor that silently resets state on reinstallation.
+- Native playout accepts every valid Opus packet duration from 2.5 through
+  120 ms (120–5760 samples), within the encoded-size cap. Use the actual
+  decoded length, retain unused PCM across output callbacks, and use the
+  packet's real duration for jitter/PLC accounting. Never pad/truncate a
+  decoded packet to 960 samples. Reset decoder, packet queue and PCM tail
+  for a **validated** new source/slot generation; preserve the existing
+  variable-duration tests and extend them through SFrame.
+- **Interface.** Until a sending key is active, show "Securing voice…" in
+  the voice status, in the existing muted style; receiving may already work.
+  Use "Voice unavailable" and "Retry" for a stopped engine, no alarm banner
+  or red encryption warning. Channel info shows "End-to-end encrypted" and
+  a separate "Who can hear" list from the locally validated voice tree,
+  grouped by uid with each device visible; do not derive it from slots,
+  talking flags or relay acks. Pending removal remains listed until the MLS
+  commit removes it. A client outside the call says "Join voice to see who
+  can hear" instead of presenting server metadata as a verified roster.
+  Plaintext channels keep "Not end-to-end encrypted". Chat's "Who can read"
+  stays a separate list. Strings go through the existing i18n mechanism.
+
+### Tests and acceptance
+
+Each PR runs its affected unit/integration suites plus the existing plaintext
+web and TeamSpeak regressions. Test results name the commit, platform and
+what actually ran; compilation, fakes and simulation are not live browser,
+physical audio or official-server acceptance.
+
+- **5a, `gwar-mls`/protocol:** descriptor and parent bindings; wrong creator,
+  duplicate device, forbidden Add/Welcome/history; no export while Creating
+  or Joining; lost create/commit reply, competing creates/commits, stale
+  participation; parent removals vs historical catch-up; safe-integer wire
+  rejection and full-epoch key ids. Agent and observer agree on every tree
+  and staged transition. Verify voice never appears in durable chat storage,
+  key archives, history requests or the channel auto-join loop.
+- **5a, server integration:** two users with two devices each; create, join,
+  leave, rejoin, disconnect, same-device takeover, own-leaf replacement,
+  last leave, new call, deleted/restarted parent, server restart mid-call.
+  Assert leaf-to-session mapping, proposals on every exit, first-wins group
+  settlement and immediate routing cutoff. Inject duplicate/future/stale
+  acks, forged device fields, lost repeat requests, expired pending state,
+  offer completion after move and old-run close/stop. Exercise every cap,
+  log/tree paging and a pruned participant's same-group rejoin; plaintext
+  remains usable throughout. Rejected operations publish no partial state.
+- **5b, SFU units/integration:** arbitrary non-Opus ciphertext passes byte for
+  byte; header inspection cannot drop it. Unknown, retired and reused SSRC,
+  retirement saturation, sequence and timestamp wraps, duplicates,
+  reordering, zero-difference counter, backward/reset and >5 s silence,
+  mute/PTT gaps, bursts, source/slot changes, late old-call packets before
+  and after routing. Verify the fixed 960-tick fallback even after 10/60 ms
+  packets, monotonic output and no extra buffer. Repeat in plaintext and
+  with TeamSpeak's independent packet-id/spurt clock.
+- **5b, official TeamSpeak in CI:** extend the existing
+  `cargo test -p vc-server --test teamspeak_channels -- --ignored --test-threads=1`
+  job using its checksum-verified official server and `VC_TS3_DIR`. The
+  current permissions/locked-channel check is retained; add S6 audio/text
+  probes with a working plaintext control for **each** route: moves during
+  speech, delayed packets from before classification, grace-period and
+  direct-message puppets, refused moves, voice/whispers both directions,
+  queued packets/text across reconnect and query/listener routes. Count zero
+  encrypted-channel payload bytes at the TeamSpeak egress and zero admitted
+  TeamSpeak payloads in encrypted voice; channel permissions alone do not
+  pass this test. Use real SFrame endpoints again in 5c/5d. Do not mark the
+  design's official-server S6 measurement complete merely because the job
+  exists or fake boundary tests pass.
+- **5c/5d, shared crypto and state-machine fixtures:** RFC 9605 header,
+  KDF/AEAD and ciphertext vectors, including **non-empty metadata** to prove
+  the upstream AAD-order fix in the low-level primitive, are mandatory CI
+  checks for both Rust and WebCrypto. Production accepts empty metadata only.
+  Cross-decrypt Rust/browser frames at short and widest kid/counter encodings,
+  and 1000-byte packets plus full overhead through the real SFU. Tamper every
+  header/ciphertext/tag field, inject plaintext, unknown keys and replays
+  across slots; no plaintext output or replay state mutation on failed auth.
+  Test overlapping async decrypts, 128-packet window boundaries, epoch
+  low-half wrap/collision, leaf reuse, silent sender retention, 10 s expiry,
+  ninth-epoch eviction, old frames after newer authentication, key conflict,
+  stale/duplicate installs, certificate expiry during uninterrupted speech,
+  revocation while encryption is in flight, clock rollback and lost install
+  acknowledgements. Count zero repeated `(base key, counter)` across all
+  transitions and restarts.
+- **5c, browser e2e in Chromium and WebKit:** two users, two devices per user,
+  real server and synthetic mic tones observed at the receiving WebAudio
+  output. Join/leave/rejoin, a newcomer, eight speakers/slot reuse, lost and
+  duplicate acks, overlap of adds and removals, worker/engine restart, device
+  switch, server restart, missing keys, background tab and plaintext control.
+  Timestamp sender commit processing, decryptor installation, activation,
+  first authenticated new-epoch packet and first decoded tone separately.
+  With commits delivered and keys installed, activation waits at most 2 s
+  (test-clock assertion); audible newcomer delay is bounded by that wait
+  plus the measured unchanged transport/playout delay. With prompt acks it
+  must not wait for the timer. Keep the removed device's keys in the test:
+  it opens no frame **encrypted after** each sender's removal cutoff, even
+  when the SFU deliberately delivers one. Withheld commits and stalled
+  installation stay non-send-capable when no valid sender remains, with
+  Securing shown instead of a misleading 2 s delivery guarantee.
+  A missing browser engine/transform is an unrun acceptance check, not a pass.
+- **5d, native:** actual media-thread key-install completion; delayed,
+  duplicate and reordered IPC; retired run, post-stop command, conflict,
+  same-epoch counter/window preservation and reset requiring own update;
+  capture position through mute/PTT/ring overflow/outgoing drops; 20 ms
+  packets with independent 10 ms scheduling. Decrypt/decode every valid
+  Opus duration, mix fractional tails, packet loss/PLC, and reset a slot
+  only after authentication. Native-to-native and native-to-Chromium/WebKit
+  tones both ways must reach decoded playout, with all eight slots exercised.
+  Extend `apps/web/e2e/native-audio.mjs` beyond its current plaintext
+  Chromium case. Physical microphone/speaker acceptance is recorded
+  separately from virtual-I/O tests.
+
+**Latency:** encryption adds no measurable buffering or packetization delay.
+Use [latency.md](latency.md)'s native `latency` example, separate target
+folders and `scripts/latency/run_local.py` alternating baseline/candidate
+runs (`--markers 100 --runs 4`, at least 400 markers per variant). In 5b
+compare timestamp/bridge changes with equal 20 ms packetization; in 5d extend
+the harness to join a real voice MLS group and use the production key-install
+path, then compare plaintext and SFrame at the same 20 ms, bitrate, callbacks
+and jitter settings. Keep a separate pre-step 10 ms native baseline and
+report the packetization delta; do not attribute it to encryption or hide it
+by changing the control. Do not change playout tuning in the SFrame PR.
+
+Record median/p95/p99, marker matches/loss, concealments, active underruns,
+queue/PCM-tail sizes and worker/crypto time; keep raw CSV/JSON, versions,
+hardware and load conditions. Warm up as the tool does, use balanced order,
+and run no concurrent builds/tests. Repeat with its documented loss,
+reordering, burst and callback-jitter profiles, then controlled CPU load.
+Require at least 95% matched markers, no below-floor/aliased match, and an
+added mouth-to-ear p95 of at most 2 ms in the equal-packetization comparison;
+a noisy run that cannot resolve 2 ms is inconclusive, never a pass. Also
+require no added sustained queue, unexplained marker loss or active underruns.
+
+Measure browser/native interop with the same marker identity method at real
+WebAudio/native decoded output; worker timings alone cannot see upstream and
+downstream browser queues. The S2 gate is added transform time including
+observable queueing p99 below 2 ms, foreground and genuinely backgrounded
+Chromium/WebKit under normal browser policy, plus end-to-end comparison.
+Report unavailable timestamps explicitly and use end-to-end measurements to
+cover them; minimized/covered-window results do not stand in for hidden tabs.
+Remote VM S4 and physical-device measurements remain separate acceptance
+runs under the owner's environment authorization; this documentation task
+connects to no remote hosts and claims none of those measurements.
+
+**Step 8:** independent review of the WebCrypto SFrame worker (RFC encoding,
+key derivation, counter uniqueness, replay/retention, asynchronous control and
+fail-closed boundaries), and the existing OpenMLS provider/storage reviews.
+Check the native wrapper/IPC binding and cross-implementation vectors as
+part of that review. Replace the temporary upstream git pin with the fixed
+crates.io release before step 8; a green interop test does not substitute
+for the worker review.
