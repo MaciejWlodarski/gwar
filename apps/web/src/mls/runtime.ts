@@ -53,6 +53,9 @@ export class DeviceTakenOver extends Error {
 class GroupChanged extends Error {
   constructor() { super("MLS group changed; synchronize before sending"); }
 }
+class HeldWelcome extends Error {
+  constructor() { super("The Welcome's conversation is held for a restart"); }
+}
 /** UI-independent MLS session. No messages are sent by this class. */
 export class MlsRuntime {
   private server = "";
@@ -226,14 +229,15 @@ export class MlsRuntime {
       this.dirty = false; this.wakeAt = undefined;
       this.activeGeneration = this.generation;
       this.assertCurrent(this.generation);
-      await this.synchronize();
+      try { await this.synchronize(); }
+      catch (error) {
+        // Rosters follow the durable state the failed pass left (a restart
+        // accepted before a join failed), before any later operation runs.
+        await this.engine.reload().then(() => this.updateStatuses(true), () => {});
+        throw error;
+      }
       this.updateStatuses();
-    }).catch(error => {
-      failed = true; this.markSecuring();
-      // Rosters follow the durable state the failed pass left (a restart accepted before a join failed).
-      void this.engine.run(async () => this.updateStatuses(true)).catch(() => {});
-      throw error;
-    }).finally(() => {
+    }).catch(error => { failed = true; this.markSecuring(); throw error; }).finally(() => {
       this.syncing = undefined;
       // Periodic refill, revocation/expiry checks and missing history retries;
       // sooner for a channel group whose create or join comes due.
@@ -324,13 +328,16 @@ export class MlsRuntime {
       for (const welcome of page.welcomes) {
         this.lastPublish = -Infinity;
         // Nobody writes to an earlier incarnation: its Welcome has nothing to give.
-        if (this.summary(welcome.group)?.record.status === "superseded") {
+        const local = this.summary(welcome.group);
+        if (local?.record.status === "superseded") {
           await this.request("mls.welcomes.ack", { ids: [welcome.id] });
           continue;
         }
+        // A held conversation imports nothing; the Welcome waits on the server.
+        if (local && this.held.has(local.conversation)) continue;
         // Replay stale membership first, stopping at eviction. A readmission
         // Welcome must be imported before an external rejoin can skip its epoch.
-        const known = this.summary(welcome.group)?.record.welcome_ids?.includes(welcome.id);
+        const known = local?.record.welcome_ids?.includes(welcome.id);
         const caughtUp = known ? false : await this.syncGroup(welcome.group, false, true);
         if (caughtUp === true) {
           await this.request("mls.welcomes.ack", { ids: [welcome.id] });
@@ -341,8 +348,11 @@ export class MlsRuntime {
           const request = caughtUp === "pruned" ? { replace_stale_welcome: { ...input, group: bytes(welcome.group) } } : { welcome: input };
           await this.transition<{ group: number[]; duplicate: boolean }>(request, result => {
             if (encoded(result.group) !== welcome.group) throw new Error("Welcome group mismatch");
+            // A first Welcome into a held conversation is not persisted either.
+            if (this.held.has(this.summary(welcome.group)?.conversation ?? "")) throw new HeldWelcome();
           });
         } catch (error) {
+          if (error instanceof HeldWelcome) { await this.engine.reload(); continue; }
           if (!(error instanceof AgentOperationError)) throw error;
           await this.engine.reload(); this.options.onError?.(error); continue;
         }
@@ -568,9 +578,10 @@ export class MlsRuntime {
         const entry = log.entries.find(e => e.epoch === since);
         if (entry) {
           try {
-            await this.transition<Resolution>({ reconcile: { ...this.args(group), result: { case: "entry", epoch: String(entry.epoch), commit: bytes(entry.commit), proposals: entry.proposals.map(bytes) } } });
-            // A validated entry continuing from the checkpoint: no restart is due.
-            this.triggers.delete(local.conversation);
+            const resolution = await this.transition<Resolution>({ reconcile: { ...this.args(group), result: { case: "entry", epoch: String(entry.epoch), commit: bytes(entry.commit), proposals: entry.proposals.map(bytes) } } });
+            // A validated entry continuing from the checkpoint: no restart is
+            // due. A pending join that lost is dropped without validating it.
+            if (resolution !== "rejoin") this.triggers.delete(local.conversation);
           } catch (error) {
             if (!(error instanceof AgentOperationError)) throw error;
             await this.engine.reload();

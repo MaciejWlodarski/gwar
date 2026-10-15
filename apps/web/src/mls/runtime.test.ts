@@ -63,6 +63,8 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
           this.state.out = null;
           if (result.case === "pruned") { g!.record.status = "rejoin"; return "rejoin"; }
           if (result.case === "rejected") return "rebuild";
+          // A pending join that lost is dropped, the winning entry unprocessed.
+          if (g!.record.status === "joining" && result.commit?.[0] !== 4) { g!.record.status = "rejoin"; return "rejoin"; }
           g!.record.checkpoint!.epoch = epoch;
           g!.record.status = "active";
           g!.members = g!.members.filter(m => !world.revocations.some(r => r.device_key === m.device_key));
@@ -556,11 +558,40 @@ describe("Restarts", () => {
     // Neither history for a peer nor missing keys go out while it is held.
     f.world.devices = [{ uid: b64(5,20), device_key: peer, hpke_key: b64(6), created_at: 1, signature: b64(7,64) }];
     f.world.wanted = [{ group, device: peer }];
+    f.world.welcomes = [{ id: "readmission", group, welcome: "AQ" }];
     await f.runtime.openMessage({ conversation, group, epoch: 4, message_id: b64(2,16), revision: 0, ciphertext: "AQ" });
     for (let i = 0; i < 3; i++) { await f.runtime.sync(); now += 60_000; }
-    expect(f.calls.some(c => ["mls.log", "mls.group_history", "mls.group_info", "mls.group.create", "mls.history.share", "mls.history.request"].includes(c.op))).toBe(false);
+    expect(f.calls.some(c => ["mls.log", "mls.group_history", "mls.group_info", "mls.group.create", "mls.history.share", "mls.history.request", "mls.welcomes.ack"].includes(c.op))).toBe(false);
+    expect(f.operations.some(o => o.op === "welcome")).toBe(false);
     expect(f.runtime.status(conversation)).toBe("securing");
     await expect(f.runtime.sealMessage(conversation, async () => ({}) as Plaintext)).rejects.toThrow();
+  });
+  it("shares no queued history once a synchronized conversation is held", async () => {
+    const pin = { ...summary(), incarnation: "1" };
+    pin.members.push({ device_key: peer, uid: b64(5,20) });
+    const f = await fixture({ ...clean(), groups: [pin] });
+    await f.runtime.sync();
+    f.world.groups = [{ conversation, group: restartedGroup, incarnation: 1, epoch: 0, pending: false }];
+    f.world.devices = [{ uid: b64(5,20), device_key: peer, hpke_key: b64(6), created_at: 1, signature: b64(7,64) }];
+    f.world.wanted = [{ group, device: peer }];
+    await f.runtime.sync();
+    expect([...(await f.storage.load()).outbox].some(c => dec.decode(new Uint8Array(c.key)).startsWith("@runtime/history/"))).toBe(true);
+    expect(f.calls.some(c => c.op === "mls.history.share")).toBe(false);
+    f.world.groups = [{ conversation, group, incarnation: 1, epoch: 0, pending: false }];
+    await f.runtime.sync();
+    expect(f.calls.some(c => c.op === "mls.history.share")).toBe(true);
+  });
+  it("keeps the trigger when a pending join loses to an entry it did not validate", async () => {
+    await asParticipant();
+    let now = 1_000_000;
+    const f = await fixture({ ...clean(), groups: [summary("joining", "5")], out: { ...pending(), epoch: "5" } }, true, { now: () => now });
+    f.world.head = 3;
+    await expect(f.runtime.sync()).rejects.toThrow("behind");
+    now += 60_000; f.world.head = 6; f.world.behind = true;
+    f.world.entries = [{ epoch: 5, commit: "BQ", proposals: [] }];
+    await f.runtime.sync().catch(() => {});
+    expect(f.operations.filter(o => o.op === "reconcile")).toHaveLength(1);
+    expect(f.operations.some(o => o.op === "create")).toBe(true);
   });
   it("acknowledges a Welcome to a superseded group without importing it", async () => {
     const f = await fixture({ ...clean(), groups: [{ ...summary("superseded"), live: false }] }, false);

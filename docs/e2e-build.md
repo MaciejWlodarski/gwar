@@ -1049,7 +1049,8 @@ channels and server chat:
   checkpoint or forks it. The browser runtime counts a log head behind the
   checkpoint, or such a GroupInfo when rejoining, as a failed check; pending
   checks live in memory, so a reload starts the wait again. A held
-  conversation also shares no history and requests no keys. A Welcome to a
+  conversation also imports no Welcome, shares no history and requests no
+  keys. A Welcome to a
   superseded group is acknowledged without importing it. The chat shows the
   restarted line when the live incarnation is above zero, and rows of earlier
   incarnations that this device cannot open do not wait for history.

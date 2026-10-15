@@ -71,8 +71,8 @@ without being asked (docs/e2e-build.md "Groups", "History in channels"):
 - restarts (docs/e2e-build.md, "Restarts"): a live group the server lists at
   a higher incarnation is accepted through `mls.group_history` from the live
   pin before it is joined; a conversation whose server holds an older
-  incarnation or a sibling of the pin is left alone (no sync, history
-  sharing or key requests) and stays "securing"; two checks at least a
+  incarnation or a sibling of the pin is left alone (no sync, Welcome
+  import, history sharing or key requests) and stays "securing"; two checks at least a
   minute apart that find the server behind the pin's checkpoint (a log head
   behind it, or a GroupInfo behind or forking it when rejoining) create the
   next incarnation, and a verified GroupInfo at or past the checkpoint, or a
