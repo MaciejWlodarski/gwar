@@ -440,6 +440,8 @@ export class MlsRuntime {
     else if (this.now() - first.at >= RESTART_AFTER) {
       this.triggers.delete(local.conversation);
       await this.createGroup(local.conversation, local.history, { incarnation: Number(local.incarnation) + 1, previous: encoded(local.group) });
+      // Not a failure, whichever call made it: no backoff leaves the new group behind.
+      this.channelDue.delete(local.conversation);
       throw new Restarted();
     }
     this.wakeAt = Math.min(this.wakeAt ?? Infinity, this.triggers.get(local.conversation)!.at + RESTART_AFTER);
@@ -504,8 +506,7 @@ export class MlsRuntime {
         if (remote) await this.requestHistory(remote.group);
       } catch (error) {
         this.assertCurrent(this.activeGeneration);
-        // The new group is synchronized; backing off would leave it behind.
-        if (error instanceof Restarted) { this.channelDue.delete(conversation); continue; }
+        if (error instanceof Restarted) continue;
         // Durable state is authoritative: drop whatever the failure left in memory.
         await this.engine.reload();
         this.failed(conversation, error);

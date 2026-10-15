@@ -149,6 +149,8 @@ try {
   // follow the one new group and keep the earlier key.
   await until("every device joins", async () => (await Promise.all(pages.map(page => page.evaluate(c => window.mls.runtime.status(c) === "ready", sealedChannel)))).every(Boolean));
   for (const page of pages) assert.deepEqual(await page.evaluate(c => { const r = window.mls.runtime.roster(c); return { group: r.group, restarted: r.restarted }; }, sealedChannel), { group: channelMessage.group, restarted: false });
+  // Every device holds the earlier key before its group is superseded.
+  await until("every device has the earlier key", async () => (await Promise.all(pages.map(page => page.evaluate(m => window.mls.runtime.openMessage(m).then(r => r.ok?.text), channelMessage)))).every(text => text === "encrypted hello"), 150_000);
   await restore(beforeJoin);
   await until("the channel is restarted", async () => (await Promise.all(pages.map(page => page.evaluate(c => window.mls.runtime.status(c) === "ready" && window.mls.runtime.roster(c)?.restarted === true, sealedChannel)))).every(Boolean), 150_000);
   const channelGroups = new Set(await Promise.all(pages.map(page => page.evaluate(c => window.mls.runtime.roster(c).group, sealedChannel))));

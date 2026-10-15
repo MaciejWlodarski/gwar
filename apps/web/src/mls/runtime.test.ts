@@ -671,6 +671,23 @@ describe("Channel groups", () => {
     f.commitEvent(); await f.runtime.sync();
     expect(f.calls.filter(c => c.op === "mls.log").length).toBeGreaterThan(logs);
   });
+  it("does not back off a channel restarted while sending", async () => {
+    asChannel();
+    let now = 1_000_000;
+    const random = vi.spyOn(Math, "random").mockReturnValue(1);
+    const f = await fixture({ ...clean(), groups: [summary("active", "5")] }, true, { channels: [channel()], now: () => now });
+    f.world.head = 3;
+    // Three failed passes: the next one is due 70 s after the first.
+    await f.runtime.sync(); now += 10_000; await f.runtime.sync(); now += 20_000; await f.runtime.sync();
+    random.mockRestore();
+    now += 30_000;
+    f.world.beforeLog = async () => { if (f.operations.some(o => o.op === "create")) f.world.head = 0; };
+    await expect(f.runtime.sealMessage(conversation, async () => { throw new Error("not reached"); })).rejects.toThrow("restarted");
+    expect(f.calls.some(c => c.op === "mls.group.create")).toBe(true);
+    const logs = f.calls.filter(c => c.op === "mls.log").length;
+    f.commitEvent(); await f.runtime.sync();
+    expect(f.calls.filter(c => c.op === "mls.log").length).toBeGreaterThan(logs);
+  });
   it("asks for history after a restart when the request before it failed", async () => {
     asChannel();
     const random = vi.spyOn(Math, "random").mockReturnValue(0);
