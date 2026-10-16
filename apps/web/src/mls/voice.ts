@@ -495,7 +495,7 @@ export class VoiceCall {
           const before = this.members();
           let resolution: Resolution;
           try { resolution = await this.engine.op<Resolution>({ reconcile: { ...this.args(), result: { case: "entry", epoch: String(entry.epoch), commit: bytes(entry.commit), proposals: entry.proposals.map(bytes) } } }); }
-          catch (error) { if (!(error instanceof AgentOperationError)) throw error; await this.loseContinuity(this.summary()); await this.join(); continue; }
+          catch (error) { if (!(error instanceof AgentOperationError)) throw error; await this.recover(); continue; }
           if (resolution === "accepted") {
             this.markJoined();
             await this.transition(before, encoded(out.hash));
@@ -524,7 +524,7 @@ export class VoiceCall {
         if (entry.epoch !== expected) throw new Error("noncontiguous voice log");
         const before = this.members();
         try { await this.engine.op({ receive: { ...this.args(), commit: bytes(entry.commit), proposals: entry.proposals.map(bytes) } }); }
-        catch (error) { if (!(error instanceof AgentOperationError)) throw error; await this.loseContinuity(this.summary()); await this.join(); attempt = -1; break; }
+        catch (error) { if (!(error instanceof AgentOperationError)) throw error; await this.recover(); attempt = -1; break; }
         expected++;
         await this.transition(before, null);
         if (this.summary()?.record.status !== "active") break;
@@ -609,12 +609,22 @@ export class VoiceCall {
     this.schedule(true, 1_000);
   }
 
+  /** A failed operation poisoned the agent: reload its last good state, then
+   * distrust that membership and rejoin from a validated newer GroupInfo. */
+  private async recover(): Promise<void> {
+    await this.engine.reload();
+    await this.loseContinuity(this.summary());
+    await this.join();
+  }
+
   /** Continuity is lost (log gap, rejoin): stop sending and purge every other
    * prior member's keys, since removals inside the gap cannot be seen. */
   private async loseContinuity(local: GroupSummary | undefined): Promise<void> {
     // A first join has no prior membership to distrust.
-    if (!local || local.record.status === "creating" || this.processed === null) return;
-    const others = local.members.map(m => m.device_key).filter(d => d !== this.host.identity.publicKey);
+    if (this.processed === null) return;
+    // The retained processed membership too: a removed state lists no members.
+    const prior = [...this.processedDevices, ...(local?.members ?? []).map(m => m.device_key)];
+    const others = [...new Set(prior)].filter(d => d !== this.host.identity.publicKey);
     await this.hold(others);
     this.forceRemoval = true;
   }

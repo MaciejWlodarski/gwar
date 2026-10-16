@@ -36,7 +36,7 @@ class FakeServer {
   requests: string[] = [];
   get head() { return this.log.length; }
   /** Another device's commit: the new member list and the devices it removed. */
-  commit(members: Member[], removed: string[] = []) { this.log.push({ epoch: this.head, commit: encodeBase64Url(new Uint8Array(enc({ members, removed }))), proposals: [] }); this.members = members; }
+  commit(members: Member[], removed: string[] = [], bad = false) { this.log.push({ epoch: this.head, commit: encodeBase64Url(new Uint8Array(enc({ members, removed, bad }))), proposals: [] }); this.members = members; }
 }
 
 /** The voice agent's observable state, driven by the fake server's commit bytes. */
@@ -57,8 +57,14 @@ class FakeVoiceAgent implements WasmAgent {
     if (!this.status) return [];
     return [{ group: this.group, conversation: "voice:7", incarnation: "0", live: this.status !== "creating", history: false, channel_group: this.parent, record: { status: this.status, checkpoint: this.status === "creating" ? null : { epoch: String(this.epoch), hash: [] }, server_pending: this.serverPending, voice_removed: this.removed }, members: structuredClone(this.members) }];
   }
+  /** Rust poisons an agent after a failed operation until it is reloaded. */
+  poisoned = false;
   execute(request: unknown): unknown {
     const [op, d] = Object.entries(request as Record<string, Record<string, unknown>>)[0]!;
+    if (this.poisoned && !["inventory", "gate", "outbox"].includes(op)) throw new Error("agent must be reloaded");
+    try { return this.run(op, d); } catch (error) { if (!["inventory", "gate", "outbox"].includes(op)) this.poisoned = true; throw error; }
+  }
+  private run(op: string, d: Record<string, unknown> | undefined): unknown {
     switch (op) {
       case "inventory": return this.summary();
       case "gate": return { status: this.status, blocked: [], server_pending: this.serverPending, rejoin: false, pending_commit: !!this.out };
@@ -113,10 +119,13 @@ class FakeVoiceAgent implements WasmAgent {
     }
   }
   private apply(commit: number[]): void {
-    const c = dec<{ members: Member[]; removed?: string[] }>(commit);
+    const c = dec<{ members: Member[]; removed?: string[]; bad?: boolean }>(commit);
+    if (c.bad) throw new Error("commit");
     const after = new Set(c.members.map(m => `${m.leaf}/${m.device_key}`));
     this.removed = [...new Set([...(c.removed ?? []), ...this.members.filter(m => !after.has(`${m.leaf}/${m.device_key}`)).map(m => m.device_key)])];
     this.members = c.members; this.epoch++;
+    // Removed: Rust keeps no tree and lists no members.
+    if (!c.members.some(m => m.device_key === DEVICES.self)) { this.status = "removed"; this.members = []; }
   }
   removed: string[] = [];
   execute_with_parent(request: unknown): unknown {
@@ -137,7 +146,7 @@ function fixture(options: { group?: boolean } = {}) {
   const world: { agent?: FakeVoiceAgent } = {};
   // The agent survives engine reloads: memory-only state of one call.
   let agent: FakeVoiceAgent | undefined;
-  const factory: AgentFactory = { create: () => (agent ??= new FakeVoiceAgent(world)), load: () => agent! };
+  const factory: AgentFactory = { create: () => { agent ??= new FakeVoiceAgent(world); agent.poisoned = false; return agent; }, load: () => { agent!.poisoned = false; return agent!; } };
   const parent = new Engine({ create: () => parentAgent, load: () => parentAgent }, memoryStorage());
   void parent.run(async () => {});
   if (options.group) { server.group = b64(9); server.members = [member(0, "bob")]; server.commit([member(0, "bob")]); }
@@ -506,6 +515,31 @@ describe("VoiceCall", () => {
     await settle(500);
     expect(f.server.log.length).toBe(commits);
     expect(f.call.status()).toBe("securing");
+  });
+
+  it("recovers from an unprocessable commit by reloading, purging and rejoining", async () => {
+    const f = fixture({ group: true });
+    f.call.start(); await settle(); f.media();
+    f.call.event({ ev: "voice.epoch.ack", d: { call: CALL, group: f.server.group, epoch: 2, device: DEVICES.bob } });
+    await settle();
+    f.controls.length = 0;
+    f.server.commit([member(0, "bob"), member(1, "self")], [], true);
+    f.call.event({ ev: "mls.commit", d: { group: f.server.group } });
+    await settle(500);
+    expect(f.controls[0]).toMatchObject({ action: "hold", removed: [DEVICES.bob] });
+    expect(actions(f.controls)).toContain("activate:4"); // the rejoin's epoch, as a removal
+  });
+
+  it("purges the retained membership when this device was removed", async () => {
+    const f = fixture({ group: true });
+    f.call.start(); await settle(); f.media();
+    f.call.event({ ev: "voice.epoch.ack", d: { call: CALL, group: f.server.group, epoch: 2, device: DEVICES.bob } });
+    await settle();
+    f.controls.length = 0;
+    f.server.commit([member(0, "bob")], [DEVICES.self]); // this device's leaf was removed
+    f.call.event({ ev: "mls.commit", d: { group: f.server.group } });
+    await settle(500);
+    expect(f.controls[0]).toMatchObject({ action: "hold", removed: [DEVICES.bob] });
   });
 
   it("closes without further requests or controls", async () => {

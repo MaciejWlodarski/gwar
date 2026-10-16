@@ -647,6 +647,8 @@ export class MlsRuntime {
       const conversation = this.summary(group)?.conversation ?? "";
       return conversation === "server" || channelOf(conversation) !== undefined ? [jobChange({ kind: "request", server: this.server, group })] : [];
     });
+    // A rejoined parent may lack devices the voice call still shares keys with.
+    this.voiceGate(group);
   }
   private async syncGroup(group: string, pending = false, beforeWelcome = false): Promise<boolean | "pruned"> {
     // Concurrent joins can lose. Bounded retries yield to backoff instead of
@@ -671,7 +673,7 @@ export class MlsRuntime {
       }
       if (log.oldest > since) {
         if (beforeWelcome) return "pruned";
-        if (out) await this.transition({ reconcile: { ...this.args(group), result: { case: "pruned", oldest: String(log.oldest) } } });
+        if (out) { await this.transition({ reconcile: { ...this.args(group), result: { case: "pruned", oldest: String(log.oldest) } } }); this.voiceGate(group); }
         else await this.join(group); // Validated newer GroupInfo replaces pruned membership.
         continue;
       }
@@ -998,7 +1000,9 @@ export class MlsRuntime {
       },
       parentClean: group => {
         const gate = this.gate(group);
-        return gate.status === "active" && !gate.rejoin && !gate.server_pending && !gate.blocked.length && !gate.pending_commit && !this.outbox(group);
+        // An event announced a parent change this device has not processed yet.
+        const unseen = this.syncedVersions.get(group) !== (this.groupVersions.get(group) ?? 0);
+        return !unseen && gate.status === "active" && !gate.rejoin && !gate.server_pending && !gate.blocked.length && !gate.pending_commit && !this.outbox(group);
       },
       syncParent: group => this.engine.run(async () => {
         this.activeGeneration = this.generation; this.assertCurrent(this.activeGeneration);
