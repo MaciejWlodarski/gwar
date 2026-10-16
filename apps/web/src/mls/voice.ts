@@ -30,6 +30,7 @@ function wireEpoch(value: bigint | string): number {
 export const ACK_WAIT_MS = 2_000;
 const FUTURE_ACK_EPOCHS = 8, FUTURE_ACK_DEVICES = 1000, FUTURE_ACK_MS = 10_000, FUTURE_ACK_AHEAD = 64n;
 const REPEAT_EVERY_MS = 6_000;
+const RECHECK_MS = 10_000;
 
 export type VoiceCallStatus = "securing" | "active" | "failed";
 /** One media run's engine: it applies controls and reports its status. */
@@ -225,7 +226,7 @@ export class VoiceCall {
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    clearTimeout(this.timer); clearTimeout(this.activation); clearTimeout(this.retry);
+    clearTimeout(this.timer); clearTimeout(this.activation); clearTimeout(this.retry); clearInterval(this.recheck);
     this.media = null;
     this.acks.clear(); this.futureAcks.clear();
     this.joinedReject(new Closed());
@@ -233,7 +234,13 @@ export class VoiceCall {
     this.listeners.clear();
   }
 
-  start(): void { this.schedule(true); }
+  /** Membership, revocations and certificate expiry are rechecked on every
+   * pass; this timer also runs one without any event (a feed update). */
+  start(): void {
+    this.schedule(true);
+    this.recheck ??= setInterval(() => this.schedule(false), RECHECK_MS);
+  }
+  private recheck: ReturnType<typeof setInterval> | undefined;
 
   /** Runs a pass now (or right after the current one), or after `delay`. */
   private schedule(log: boolean, delay = 0): void {
@@ -347,7 +354,7 @@ export class VoiceCall {
     if (this.processed !== null && epoch <= this.processed) return;
     const after = new Set(summary.members.map(m => `${m.leaf}/${m.device_key}`));
     const removed = before.filter(m => !after.has(`${m.leaf}/${m.device_key}`)).map(m => m.device_key);
-    if (removed.length) await this.hold(removed);
+    if (removed.length) await this.hold(removed, epoch);
     this.assertOpen();
     const now = this.host.now();
     this.pending = { started: this.pending?.started ?? now, removal: (this.pending?.removal ?? false) || removed.length > 0 };
@@ -373,14 +380,15 @@ export class VoiceCall {
   }
 
   /** Stop sending at once; removed devices' keys go before anything else. */
-  private async hold(removed: string[]): Promise<void> {
+  /** `epoch` is the epoch about to be processed, or the current one for a blocked gate. */
+  private async hold(removed: string[], epoch = this.processed ?? 0n): Promise<void> {
     const media = this.media;
     if (!media) return;
     for (const device of removed) media.removed.add(device);
     if (media.activated !== null || removed.length) {
       media.activated = null;
       this.setStatus("securing");
-      await this.control(media, { action: "hold", epoch: String(this.processed ?? 0n), removed });
+      await this.control(media, { action: "hold", epoch: String(epoch), removed });
     }
   }
 
@@ -551,7 +559,9 @@ export class VoiceCall {
         // Revocation, expiry or a parent change since installation closes the gate.
         this.gateBlocked = true;
         await this.hold([]);
-        if (!(await this.parentRemovals())) this.schedule(true, 5_000);
+        // A committed removal makes a newer epoch: deliver that one instead.
+        if (await this.parentRemovals()) return this.deliver();
+        this.schedule(true, 5_000);
         const again = this.exportKeys();
         if (again === null || again === "blocked") return;
         this.gateBlocked = false;

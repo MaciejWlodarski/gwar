@@ -251,7 +251,9 @@ impl Agent {
         if !now.is_finite() || now.fract() != 0.0 || !(1.0..=9_007_199_254_740_991.0).contains(&now) {
             return Err(error("invalid time"));
         }
-        Ok(Self { inner: Core::new_voice(seed(seed_bytes)?, credential(credential_bytes)?, now as i64).map_err(error)? })
+        Ok(Self {
+            inner: Core::new_voice(seed(seed_bytes)?, credential(credential_bytes)?, now as i64).map_err(error)?,
+        })
     }
     pub fn load_voice(seed_bytes: &[u8], credential_bytes: &[u8], records: JsValue) -> Result<Agent, JsValue> {
         let records: Changes = input(records)?;

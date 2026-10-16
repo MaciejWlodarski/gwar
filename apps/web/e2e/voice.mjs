@@ -102,9 +102,6 @@ async function tone(page, frequency) {
 }
 const hears = async (page, frequency) => (await tone(page, frequency)) > 0.05;
 
-async function app(page, module) {
-  return page.evaluateHandle(name => window.__gwarE2eImport(name), module);
-}
 const voice = page => page.evaluate(async () => {
   const { useVoice } = await window.__gwarE2eImport("/src/state/stores.ts");
   const { controller } = await window.__gwarE2eImport("/src/state/controller.ts");
