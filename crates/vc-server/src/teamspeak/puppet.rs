@@ -14,7 +14,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -32,7 +32,7 @@ use vc_proto::SessionId;
 
 use crate::{
     core::CoreHandle,
-    media::{AudioPacket, MediaPlane, SourceClock, opus},
+    media::{AudioKind, AudioOrigin, AudioPacket, AudioRoute, MediaPlane, SourceClock, opus},
 };
 
 /// A remote speaker counts as talking this long after its last frame.
@@ -46,7 +46,8 @@ pub struct Shared {
     pub core: CoreHandle,
     pub plane: MediaPlane,
     /// TeamSpeak client id → remote session, for TeamSpeak users only (never puppets).
-    pub mirrors: RwLock<HashMap<u16, SessionId>>,
+    pub mirrors: RwLock<HashMap<u16, Arc<AudioRoute>>>,
+    routes: AtomicU64,
     heard: Mutex<HashMap<u16, Heard>>,
     /// Whisper streams, per TeamSpeak speaker and targeted user.
     whispers: Mutex<HashMap<(u16, SessionId), Whisper>>,
@@ -57,7 +58,8 @@ pub struct Shared {
 
 /// Recent frames of one TeamSpeak speaker, shared across receiving puppets.
 struct Heard {
-    session: SessionId,
+    origin: Arc<AudioOrigin>,
+    route: Arc<AudioRoute>,
     recent: [u64; 8],
     next: usize,
     at: Instant,
@@ -67,6 +69,7 @@ struct Heard {
 }
 
 struct Whisper {
+    route: Arc<AudioRoute>,
     at: Instant,
     talking: bool,
     clock: Option<SourceClock>,
@@ -91,10 +94,30 @@ impl Shared {
             core,
             plane,
             mirrors: RwLock::default(),
+            routes: AtomicU64::new(0),
             heard: Mutex::default(),
             whispers: Mutex::default(),
             spurts: AtomicU32::new(0),
         }
+    }
+
+    pub fn mirror(&self, clid: u16, cid: u64, origin: Arc<AudioOrigin>) {
+        self.forget(clid);
+        let route = AudioRoute::new(self.routes.fetch_add(1, Ordering::Relaxed) + 1, cid, Some(origin));
+        route.confirm(Some(cid));
+        self.mirrors.write().expect("mirrors lock").insert(clid, route);
+    }
+
+    fn capture(&self, from: u16, cid: u64) -> Option<(Arc<AudioOrigin>, Arc<AudioRoute>)> {
+        let route = self.mirrors.read().expect("mirrors lock").get(&from)?.clone();
+        let origin = route.origin.as_ref()?.clone();
+        if cid != route.cid
+            || !route.permits(&origin)
+            || self.plane.routing.load().origin(origin.session).as_deref() != Some(&origin)
+        {
+            return None;
+        }
+        Some((origin, route))
     }
 
     fn next_spurt(&self) -> u32 {
@@ -103,13 +126,14 @@ impl Shared {
 
     /// Publishes one frame from TeamSpeak client `from` unless another
     /// puppet already delivered it.
-    fn heard(&self, from: u16, id: u16, opus: &[u8]) {
-        let Some(session) = self.mirrors.read().expect("mirrors lock").get(&from).copied() else { return };
+    fn heard(&self, from: u16, cid: u64, id: u16, opus: &[u8], ingress: Option<Arc<AudioRoute>>) {
+        let Some((origin, route)) = self.capture(from, cid) else { return };
         let now = Instant::now();
         let hash = digest(opus) ^ u64::from(id);
         let mut heard = self.heard.lock().expect("heard lock");
         let entry = heard.entry(from).or_insert(Heard {
-            session,
+            origin: origin.clone(),
+            route: route.clone(),
             recent: [!hash; 8],
             next: 0,
             at: now,
@@ -117,14 +141,15 @@ impl Shared {
             clock: None,
             spurt: 0,
         });
-        if entry.session != session {
+        if entry.origin != origin {
             entry.clock = None;
         }
         if out_of_order(entry.clock, entry.at, id, now) {
             return;
         }
-        if entry.session != session || now.duration_since(entry.at) > Duration::from_secs(1) {
-            entry.session = session;
+        if entry.origin != origin || now.duration_since(entry.at) > Duration::from_secs(1) {
+            entry.origin = origin.clone();
+            entry.route = route.clone();
             entry.recent = [!hash; 8];
         } else if entry.recent.contains(&hash) {
             return;
@@ -136,8 +161,8 @@ impl Shared {
         if opus.is_empty() {
             if entry.talking {
                 entry.talking = false;
-                self.core.talking(session, false);
-                self.plane.publish(AudioPacket::end_of_speech(session));
+                self.core.talking_origin(&origin, false);
+                self.plane.publish(AudioPacket::end_of_speech(origin.clone(), Some(route.clone())));
             }
             return;
         }
@@ -145,20 +170,39 @@ impl Shared {
         if !entry.talking {
             entry.talking = true;
             entry.spurt = self.next_spurt();
-            self.core.talking(session, true);
+            self.core.talking_origin(&origin, true);
         }
         let clock = SourceClock::TeamSpeak { id, whisper: false, spurt: entry.spurt };
         entry.clock = Some(clock);
-        self.plane.publish(AudioPacket { from: session, opus: Arc::from(opus), samples, clock });
+        self.plane.publish(AudioPacket {
+            origin: origin.clone(),
+            payload: Arc::from(opus),
+            kind: AudioKind::Audio,
+            span: samples,
+            clock,
+            route: Some(route.clone()),
+            target: None,
+            ingress,
+            egress: None,
+        });
     }
 
     /// Delivers a whisper from TeamSpeak client `from` to the user behind the
     /// puppet that received it. Each targeted puppet gets its own copy.
-    fn whispered(&self, from: u16, to: SessionId, id: u16, opus: &[u8]) {
-        let Some(session) = self.mirrors.read().expect("mirrors lock").get(&from).copied() else { return };
+    fn whispered(&self, from: u16, cid: u64, to: SessionId, id: u16, opus: &[u8], ingress: Option<Arc<AudioRoute>>) {
+        let Some((origin, route)) = self.capture(from, cid) else { return };
         let now = Instant::now();
         let mut whispers = self.whispers.lock().expect("whispers lock");
-        let stream = whispers.entry((from, to)).or_insert(Whisper { at: now, talking: false, clock: None, spurt: 0 });
+        let stream = whispers.entry((from, to)).or_insert(Whisper {
+            route: route.clone(),
+            at: now,
+            talking: false,
+            clock: None,
+            spurt: 0,
+        });
+        if !Arc::ptr_eq(&stream.route, &route) {
+            *stream = Whisper { route: route.clone(), at: now, talking: false, clock: None, spurt: 0 };
+        }
         if out_of_order(stream.clock, stream.at, id, now) {
             return;
         }
@@ -166,7 +210,7 @@ impl Shared {
         let packet = if opus.is_empty() {
             stream.talking = false;
             stream.clock = Some(SourceClock::TeamSpeak { id, whisper: true, spurt: stream.spurt });
-            AudioPacket::end_of_speech(session)
+            AudioPacket::end_of_speech(origin.clone(), Some(route.clone()))
         } else {
             let Some(samples) = opus::packet_samples(opus) else { return };
             if !stream.talking {
@@ -175,7 +219,17 @@ impl Shared {
             }
             let clock = SourceClock::TeamSpeak { id, whisper: true, spurt: stream.spurt };
             stream.clock = Some(clock);
-            AudioPacket { from: session, opus: Arc::from(opus), samples, clock }
+            AudioPacket {
+                origin: origin.clone(),
+                payload: Arc::from(opus),
+                kind: AudioKind::Audio,
+                span: samples,
+                clock,
+                route: Some(route.clone()),
+                target: None,
+                ingress,
+                egress: None,
+            }
         };
         drop(whispers);
         self.plane.deliver(to, packet);
@@ -188,8 +242,8 @@ impl Shared {
         heard.retain(|_, h| {
             if h.talking && now.duration_since(h.at) > TALKING {
                 h.talking = false;
-                self.core.talking(h.session, false);
-                self.plane.publish(AudioPacket::end_of_speech(h.session));
+                self.core.talking_origin(&h.origin, false);
+                self.plane.publish(AudioPacket::end_of_speech(h.origin.clone(), Some(h.route.clone())));
             }
             now.duration_since(h.at) < Duration::from_secs(60)
         });
@@ -203,12 +257,14 @@ impl Shared {
     }
 
     pub fn forget(&self, clid: u16) {
-        self.mirrors.write().expect("mirrors lock").remove(&clid);
+        if let Some(route) = self.mirrors.write().expect("mirrors lock").remove(&clid) {
+            route.invalidate();
+        }
         self.whispers.lock().expect("whispers lock").retain(|(from, _), _| *from != clid);
         if let Some(h) = self.heard.lock().expect("heard lock").remove(&clid)
             && h.talking
         {
-            self.core.talking(h.session, false);
+            self.core.talking_origin(&h.origin, false);
         }
     }
 }
@@ -222,6 +278,7 @@ pub struct PuppetSpec {
     pub channel: u64,
     /// The route generation of `channel` (see [`PuppetCmd::Move`]).
     pub route: u64,
+    pub audio: Arc<AudioRoute>,
     /// Whether the user's voice goes to `channel`: false for a puppet kept only for
     /// direct messages (its user is not in voice, or in an encrypted channel).
     pub voice: bool,
@@ -249,6 +306,7 @@ pub enum PuppetCmd {
     Move {
         cid: u64,
         route: u64,
+        audio: Arc<AudioRoute>,
         voice: bool,
     },
     Flags {
@@ -270,25 +328,48 @@ pub enum PuppetCmd {
 
 #[derive(Debug)]
 pub enum PuppetEvent {
-    Connected { session: SessionId, generation: u64, clid: u16 },
-    Text { session: SessionId, invoker: u16, target: MessageTarget, text: String },
-    Gone { session: SessionId, generation: u64, error: Option<String> },
+    Connected {
+        session: SessionId,
+        generation: u64,
+        clid: u16,
+    },
+    Text {
+        session: SessionId,
+        generation: u64,
+        origin: Arc<AudioOrigin>,
+        source_route: Arc<AudioRoute>,
+        receiver_route: Arc<AudioRoute>,
+        target: MessageTarget,
+        text: String,
+    },
+    Gone {
+        session: SessionId,
+        generation: u64,
+        error: Option<String>,
+    },
 }
 
 pub struct PuppetHandle {
     pub cmds: mpsc::Sender<PuppetCmd>,
+    audio: RwLock<Arc<AudioRoute>>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl PuppetHandle {
     /// Queues a command; false when the puppet's queue is full or it is gone.
     pub fn send(&self, cmd: PuppetCmd) -> bool {
+        if let PuppetCmd::Move { audio, .. } = &cmd {
+            let mut current = self.audio.write().expect("puppet route lock");
+            current.invalidate();
+            *current = audio.clone();
+        }
         self.cmds.try_send(cmd).is_ok()
     }
 }
 
 impl Drop for PuppetHandle {
     fn drop(&mut self) {
+        self.audio.read().expect("puppet route lock").invalidate();
         // A graceful `Quit` lets the task disconnect cleanly; otherwise stop it.
         if self.cmds.try_send(PuppetCmd::Quit).is_err() {
             self.task.abort();
@@ -304,6 +385,7 @@ pub fn spawn(
 ) -> PuppetHandle {
     let (cmds, rx) = mpsc::channel(64);
     let (session, generation) = (spec.session, spec.generation);
+    let audio = RwLock::new(spec.audio.clone());
     let task = tokio::spawn(async move {
         let (uplink_tx, uplink) = mpsc::channel::<AudioPacket>(64);
         let error =
@@ -311,7 +393,7 @@ pub fn spawn(
         shared.plane.uplinks.unregister_sink(session, &uplink_tx);
         let _ = events.send(PuppetEvent::Gone { session, generation, error }).await;
     });
-    PuppetHandle { cmds, task }
+    PuppetHandle { cmds, task, audio }
 }
 
 async fn connect(server: SocketAddr, spec: &PuppetSpec, nickname: String) -> Result<Connection> {
@@ -374,6 +456,7 @@ async fn run(
     let _ = events.send(PuppetEvent::Connected { session: spec.session, generation: spec.generation, clid }).await;
 
     shared.plane.uplinks.register(spec.session, uplink_tx);
+    shared.plane.uplinks.set_route(spec.session, spec.audio.clone());
     let mut packet_id: u16 = 0;
     let mut packetizer = super::packetizer::Packetizer::default();
     // Commands awaiting TeamSpeak's answer, to name the one that failed.
@@ -387,6 +470,9 @@ async fn run(
     // Channel text goes out only in the channel it was written for: from the
     // current route, once a move to that channel is confirmed.
     let mut route = spec.route;
+    let mut audio = spec.audio.clone();
+    audio.confirm(own_channel(&con));
+    let mut held: Option<AudioPacket> = None;
     let mut voice = spec.voice;
     let mut moving: Option<Moving> = None;
     let mut waiting: Vec<(u64, String)> = Vec::new();
@@ -423,31 +509,59 @@ async fn run(
             // A puppet kept only for direct messages never speaks.
             Step::Uplink(_) if !voice => {}
             Step::Uplink(packet) => {
-                for data in packetizer.push(&packet.opus, Instant::now()) {
-                    send_audio(&mut con, &mut packet_id, &data);
+                if !audio_allowed(&con, shared, &packet, &audio) {
+                    continue;
                 }
+                for data in packetizer.push(&packet.payload, Instant::now()) {
+                    send_audio(&mut con, &mut packet_id, &data, shared, &packet, &audio);
+                }
+                held = Some(packet);
             }
             Step::Flush => {
-                if let Some(data) = packetizer.flush() {
-                    send_audio(&mut con, &mut packet_id, &data);
+                if let Some(data) = packetizer.flush()
+                    && let Some(packet) = &held
+                {
+                    send_audio(&mut con, &mut packet_id, &data, shared, packet, &audio);
                 }
             }
             Step::MoveTimeout => {
                 warn!(session = spec.session, "puppet move unanswered; its channel text is dropped");
                 moving = None;
+                audio.invalidate();
                 waiting.clear();
             }
             Step::Item(None) => return Err(anyhow!("connection closed")),
             Step::Item(Some(Err(e))) => return Err(anyhow!("{e}")),
             Step::Item(Some(Ok(item))) => match item {
-                StreamItem::Audio(packet) => match packet.data().data() {
-                    AudioData::S2C { from, id, codec, data } if is_opus(*codec) => shared.heard(*from, *id, data),
-                    AudioData::S2CWhisper { from, id, codec, data, .. } if is_opus(*codec) => {
-                        shared.whispered(*from, spec.session, *id, data)
+                StreamItem::Audio(packet) => {
+                    let own = shared.plane.routing.load().origin(spec.session);
+                    if !voice
+                        || moving.is_some()
+                        || !own.as_ref().is_some_and(|o| audio.permits(o))
+                        || own_channel(&con) != Some(audio.cid)
+                    {
+                        continue;
                     }
-                    _ => {}
-                },
+                    // Capture the source's confirmed channel in the receive callback.
+                    // A later ServerQuery Remote.cid is never used to relabel audio.
+                    match packet.data().data() {
+                        AudioData::S2C { from, id, codec, data } if is_opus(*codec) => {
+                            if let Some(cid) = source_channel(&con, *from).filter(|cid| *cid == audio.cid) {
+                                shared.heard(*from, cid, *id, data, Some(audio.clone()));
+                            }
+                        }
+                        AudioData::S2CWhisper { from, id, codec, data, .. } if is_opus(*codec) => {
+                            if let Some(cid) = source_channel(&con, *from) {
+                                shared.whispered(*from, cid, spec.session, *id, data, Some(audio.clone()));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 StreamItem::BookEvents(book) => {
+                    if moving.is_none() {
+                        audio.confirm(own_channel(&con));
+                    }
                     let listed = admitted_as.as_ref().and_then(|_| {
                         let state = con.get_state().ok()?;
                         Some(state.clients.get(&state.own_client)?.name.clone())
@@ -459,12 +573,24 @@ async fn run(
                     {
                         queue_nickname(&mut con, &mut pending, spec.nickname.clone(), variant + 1, 0)?;
                     }
-                    flush_channel_text(&mut con, &mut pending, moving.is_some(), &mut waiting);
+                    if audio.is_current() {
+                        flush_channel_text(&mut con, &mut pending, moving.is_some(), &mut waiting);
+                    } else {
+                        waiting.clear();
+                    }
                     for event in book {
                         if let BookEvent::Message { target, invoker, message } = event {
+                            let Some((origin, source_route)) =
+                                source_channel(&con, invoker.id.0).and_then(|cid| shared.capture(invoker.id.0, cid))
+                            else {
+                                continue;
+                            };
                             let text = PuppetEvent::Text {
                                 session: spec.session,
-                                invoker: invoker.id.0,
+                                generation: spec.generation,
+                                origin,
+                                source_route,
+                                receiver_route: audio.clone(),
                                 target,
                                 text: message,
                             };
@@ -479,9 +605,13 @@ async fn run(
                             // Already there counts as arrived.
                             Err(e) if !format!("{e:?}").contains("AlreadyIn") => {
                                 warn!(session = spec.session, "puppet move failed: {e}");
+                                audio.invalidate();
                                 waiting.clear();
                             }
-                            _ => flush_channel_text(&mut con, &mut pending, false, &mut waiting),
+                            _ => {
+                                audio.confirm(own_channel(&con));
+                                flush_channel_text(&mut con, &mut pending, false, &mut waiting);
+                            }
                         }
                         continue;
                     }
@@ -509,7 +639,12 @@ async fn run(
                 _ => {}
             },
             Step::Cmd(None) | Step::Cmd(Some(PuppetCmd::Quit)) => {
-                end_spurt(&mut con, &mut packet_id, &mut packetizer);
+                if let Some(packet) = &held {
+                    if let Some(data) = packetizer.flush() {
+                        send_audio(&mut con, &mut packet_id, &data, shared, packet, &audio);
+                    }
+                    send_audio(&mut con, &mut packet_id, &[], shared, packet, &audio);
+                }
                 let _ = con.disconnect(DisconnectOptions::new());
                 // Let the disconnect packet go out (and be acknowledged) before dropping.
                 let _ = tokio::time::timeout(Duration::from_secs(2), con.events().for_each(|_| async {})).await;
@@ -523,8 +658,12 @@ async fn run(
                     continue;
                 }
                 // A held half-packet was captured in the old channel; end it there.
-                if let PuppetCmd::Move { cid, route: next, voice: speaks } = cmd {
-                    end_spurt(&mut con, &mut packet_id, &mut packetizer);
+                if let PuppetCmd::Move { cid, route: next, audio: next_audio, voice: speaks } = cmd {
+                    packetizer = super::packetizer::Packetizer::default();
+                    held = None;
+                    audio.invalidate();
+                    audio = next_audio;
+                    shared.plane.uplinks.set_route(spec.session, audio.clone());
                     route = next;
                     voice = speaks;
                     waiting.clear();
@@ -532,6 +671,12 @@ async fn run(
                         .send_with_result(&mut con)
                         .ok()
                         .map(|handle| Moving { handle, cid, deadline: Instant::now() + MOVE_TIMEOUT });
+                    if moving.is_none() {
+                        audio.invalidate();
+                    }
+                    continue;
+                }
+                if matches!(cmd, PuppetCmd::Text { .. }) && !audio.is_current() {
                     continue;
                 }
                 if let PuppetCmd::Text { channel: Some(target), text, .. } = cmd {
@@ -611,15 +756,28 @@ fn flush_channel_text(
     }
 }
 
-fn end_spurt(con: &mut Connection, packet_id: &mut u16, packetizer: &mut super::packetizer::Packetizer) {
-    if let Some(data) = packetizer.flush() {
-        send_audio(con, packet_id, &data);
-        send_audio(con, packet_id, &[]);
-    }
+fn source_channel(con: &Connection, from: u16) -> Option<u64> {
+    Some(con.get_state().ok()?.clients.get(&tsclientlib::ClientId(from))?.channel.0)
 }
 
-fn send_audio(con: &mut Connection, packet_id: &mut u16, data: &[u8]) {
-    // TOC bit 2 marks stereo, which TeamSpeak carries as "Opus Music".
+fn audio_allowed(con: &Connection, shared: &Shared, packet: &AudioPacket, route: &Arc<AudioRoute>) -> bool {
+    shared.plane.routing.load().accepts(packet)
+        && route.permits(&packet.origin)
+        && packet.route.as_ref().is_some_and(|r| Arc::ptr_eq(r, route))
+        && own_channel(con) == Some(route.cid)
+}
+
+fn send_audio(
+    con: &mut Connection,
+    packet_id: &mut u16,
+    data: &[u8],
+    shared: &Shared,
+    packet: &AudioPacket,
+    route: &Arc<AudioRoute>,
+) {
+    if !audio_allowed(con, shared, packet, route) {
+        return;
+    }
     let codec =
         if data.first().is_some_and(|toc| toc & 0x04 != 0) { CodecType::OpusMusic } else { CodecType::OpusVoice };
     let out = OutAudio::new(&AudioData::C2S { id: *packet_id, codec, data });
@@ -704,9 +862,15 @@ mod tests {
     #[tokio::test]
     async fn a_full_queue_refuses_commands_so_the_bridge_can_start_over() {
         let (cmds, _rx) = mpsc::channel(1);
-        let handle = PuppetHandle { cmds, task: tokio::spawn(std::future::pending()) };
+        let handle = PuppetHandle {
+            cmds,
+            task: tokio::spawn(std::future::pending()),
+            audio: RwLock::new(AudioRoute::new(1, 1, None)),
+        };
+        let previous = handle.audio.read().unwrap().clone();
         assert!(handle.send(PuppetCmd::Quit));
-        assert!(!handle.send(PuppetCmd::Move { cid: 1, route: 2, voice: false }));
+        assert!(!handle.send(PuppetCmd::Move { cid: 1, route: 2, voice: false, audio: AudioRoute::new(2, 1, None) }));
+        assert!(!previous.is_current(), "a refused queue must retire the route before retry");
     }
 
     #[test]
@@ -740,12 +904,12 @@ mod tests {
 
     #[tokio::test]
     async fn spurt_numbers_never_repeat_after_the_stream_is_forgotten() {
-        use crate::media::{MediaPlane, Member, Routing};
+        use crate::media::{MediaPlane, Routing};
         let core = crate::core::expiry_tests::test_core(crate::store::Store::in_memory().unwrap(), None);
         let (webrtc, mut rx) = mpsc::channel(64);
         let mut routing = Routing::default();
         for session in [100, 200] {
-            routing.members.insert(session, Member { channel: 1, muted: false, deafened: false, bridged: true });
+            routing.members.insert(session, crate::media::tests::member(session, 1, false));
         }
         let plane = MediaPlane {
             routing: Arc::new(arc_swap::ArcSwap::from_pointee(routing)),
@@ -754,19 +918,19 @@ mod tests {
             webrtc,
         };
         let shared = Shared::new(core, plane);
-        shared.mirrors.write().unwrap().insert(7, 100);
+        shared.mirror(7, 1, shared.plane.routing.load().origin(100).unwrap());
         let frame = [0xf8, 1, 2, 3];
-        shared.heard(7, 10, &frame);
-        shared.whispered(7, 200, 10, &frame);
-        shared.heard(7, 11, &[]);
-        shared.whispered(7, 200, 11, &[]);
+        shared.heard(7, 1, 10, &frame, None);
+        shared.whispered(7, 1, 200, 10, &frame, None);
+        shared.heard(7, 1, 11, &[], None);
+        shared.whispered(7, 1, 200, 11, &[], None);
         let first = spurts(&mut rx);
         // What sweep() does to streams silent for a minute, while an SFU slot
         // still holds the old clock: the next spurt must not reuse its number.
         shared.heard.lock().unwrap().clear();
         shared.whispers.lock().unwrap().clear();
-        shared.heard(7, 12, &[0xf8, 4, 5, 6]);
-        shared.whispered(7, 200, 12, &[0xf8, 4, 5, 6]);
+        shared.heard(7, 1, 12, &[0xf8, 4, 5, 6], None);
+        shared.whispered(7, 1, 200, 12, &[0xf8, 4, 5, 6], None);
         let second = spurts(&mut rx);
         assert_eq!(first.iter().map(|(whisper, _)| *whisper).collect::<Vec<_>>(), [false, true]);
         assert_eq!(second.len(), 2);

@@ -101,6 +101,10 @@ pub enum LinkState {
 pub(crate) struct Counters {
     frames_sent: AtomicU64,
     frames_received: AtomicU64,
+    unexpected_duration: AtomicU64,
+    oversize_dropped: AtomicU64,
+    malformed_dropped: AtomicU64,
+    capture_position_dropped: AtomicU64,
     /// 0 connecting, 1 connected, 2 lost.
     link: AtomicU8,
     slots: [SlotCounters; AUDIO_SLOTS],
@@ -159,6 +163,10 @@ pub struct VoiceStats {
     pub frames_sent: u64,
     /// Opus frames received from the server (all slots).
     pub frames_received: u64,
+    pub unexpected_duration: u64,
+    pub oversize_dropped: u64,
+    pub malformed_dropped: u64,
+    pub capture_position_dropped: u64,
     pub link: LinkState,
     pub slots: [SlotStats; AUDIO_SLOTS],
     pub speaker_samples: u64,
@@ -219,6 +227,10 @@ impl VoiceHandle {
         VoiceStats {
             frames_sent: c.frames_sent.load(Ordering::Relaxed),
             frames_received: c.frames_received.load(Ordering::Relaxed),
+            unexpected_duration: c.unexpected_duration.load(Ordering::Relaxed),
+            oversize_dropped: c.oversize_dropped.load(Ordering::Relaxed),
+            malformed_dropped: c.malformed_dropped.load(Ordering::Relaxed),
+            capture_position_dropped: c.capture_position_dropped.load(Ordering::Relaxed),
             slots: std::array::from_fn(|i| {
                 let s = &c.slots[i];
                 SlotStats {
@@ -413,6 +425,21 @@ fn voice_encoder() -> Result<Encoder> {
     Ok(encoder)
 }
 
+fn validate_encoded(packet: &[u8], expected: u32, counters: &Counters) -> bool {
+    if packet.len() > 1000 {
+        counters.oversize_dropped.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    let Some(samples) = opus_samples(packet) else {
+        counters.malformed_dropped.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    if samples != expected {
+        counters.unexpected_duration.fetch_add(1, Ordering::Relaxed);
+    }
+    true
+}
+
 struct CaptureFrame {
     samples: Vec<f32>,
     filled: usize,
@@ -484,6 +511,9 @@ fn pipeline<const CAPTURE: usize>(
             controls.transmitting.store(send, Ordering::Relaxed);
             if send {
                 let n = encoder.encode_float(frame, &mut packet[..])?;
+                if !validate_encoded(&packet[..n], CAPTURE as u32, &counters) {
+                    continue;
+                }
                 let level = (-db.clamp(-127.0, 0.0)).round() as i8;
                 // Tell the server's speech gate the truth about voice activity.
                 if out
@@ -571,6 +601,19 @@ pub fn opus_samples(packet: &[u8]) -> Option<u32> {
 mod codec_tests {
     use super::*;
     use audiopus::{Bandwidth, MutSignals, coder::Decoder, packet::Packet};
+
+    #[test]
+    fn encoded_sender_bounds_count_unexpected_duration_without_dropping_it() {
+        let counters = Counters::default();
+        assert!(validate_encoded(&[0xf0, 1], 480, &counters));
+        assert!(validate_encoded(&[0xf8, 1], 480, &counters));
+        assert_eq!(counters.unexpected_duration.load(Ordering::Relaxed), 1);
+        assert!(!validate_encoded(&[0xff, 0], 480, &counters));
+        assert!(!validate_encoded(&vec![0xf0; 1001], 480, &counters));
+        assert!(validate_encoded(&vec![0xf0; 1000], 480, &counters));
+        assert_eq!(counters.malformed_dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(counters.oversize_dropped.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn capture_frames_keep_positions_across_batches_and_ring_overflow() {

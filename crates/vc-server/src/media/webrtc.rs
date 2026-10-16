@@ -28,13 +28,32 @@ use vc_proto::{AUDIO_SLOTS, Event, ServerFrame, SessionId, VoiceTransportBinding
 
 use vc_proto::rtp::{SLOT_GENERATION_ID, SlotGeneration, slot_generation_extension};
 
-use super::{AudioPacket, SharedRouting, Sinks, SourceClock, opus};
+use super::{
+    AudioKind, AudioOrigin, AudioPacket, SharedRouting, Sinks, SourceClock,
+    admission::{MAX_SOURCE_DELTA, RtpAdmission},
+};
 use crate::core::{CoreHandle, Outbound, OutboundTx, encode};
 
+/// On-demand, bounded transport diagnostics. No per-packet map or history.
+#[derive(Debug)]
+pub struct MediaSnapshot {
+    pub counters: super::RtpCounters,
+    pub registered_probe_ssrcs: usize,
+    pub rtcp_reports: u64,
+}
+
 pub enum MediaCmd {
+    Inspect {
+        session: SessionId,
+        probe_ssrcs: Vec<u32>,
+        reply: tokio::sync::oneshot::Sender<Option<MediaSnapshot>>,
+    },
     Offer {
         session: SessionId,
         binding: VoiceTransportBinding,
+        origin: Arc<AudioOrigin>,
+        ssrc: u32,
+        retired: Vec<u32>,
         sdp: String,
         out: OutboundTx,
         reply: tokio::sync::oneshot::Sender<Result<String, &'static str>>,
@@ -55,9 +74,6 @@ const SLOT_REUSE: Duration = Duration::from_millis(800);
 /// RFC 6464 level (negative dBov) above which a frame counts as speech.
 const SPEECH_LEVEL: i8 = -50;
 const SAMPLE_RATE: u64 = 48_000;
-const MAX_SOURCE_DELTA: u32 = 5 * SAMPLE_RATE as u32;
-/// Late packets from these SSRCs are dropped; the oldest is forgotten first.
-const RETIRED_SSRCS: usize = 32;
 /// An out-of-order source time this long after the last write is a new clock:
 /// TeamSpeak's u16 ids cannot tell a reordered packet from a far-ahead one.
 const STALE_CLOCK: Duration = Duration::from_secs(1);
@@ -84,15 +100,15 @@ impl Slot {
     fn advance(&mut self, now: Instant, samples: u32, clock: SourceClock) -> bool {
         let stale = self.last_write.is_none_or(|last| now.saturating_duration_since(last) > STALE_CLOCK);
         let delta = match self.clock.map(|old| clock.delta(old)).transpose() {
-            Err(()) if stale => None,
+            Err(()) if stale && matches!(clock, SourceClock::TeamSpeak { .. }) => None,
             Err(()) => return false,
             Ok(delta) => delta.flatten().filter(|delta| *delta <= MAX_SOURCE_DELTA),
         };
         self.ticks += delta.map(u64::from).unwrap_or_else(|| match self.last_write {
             Some(last) => {
-                let elapsed = now.duration_since(last).as_nanos() * u128::from(SAMPLE_RATE);
-                let frame = u128::from(self.last_samples);
-                (elapsed.div_ceil(1_000_000_000 * frame).max(1) * frame) as u64
+                let elapsed = now.saturating_duration_since(last).as_nanos();
+                let rounded = elapsed.div_ceil(10_000_000).max(1) * 480;
+                rounded.max(u128::from(self.last_samples)) as u64
             }
             None => SAMPLE_RATE,
         });
@@ -114,8 +130,9 @@ struct Peer {
     talking: bool,
     last_voice: Instant,
     connected: bool,
-    clock: Option<SourceClock>,
-    retired_ssrcs: Vec<u32>,
+    origin: Arc<AudioOrigin>,
+    admission: RtpAdmission,
+    rtcp_reports: u64,
 }
 
 impl Peer {
@@ -141,10 +158,21 @@ impl Peer {
 
     /// Writes one frame from `from` into a receive slot, assigning one if needed.
     fn forward(&mut self, packet: &AudioPacket, now: Instant) {
-        if !self.core.voice_binding_matches(self.session, &self.binding) || packet.is_end() {
+        if !self.core.voice_binding_matches(self.session, &self.binding)
+            || !self.core.audio_binding_matches(&packet.origin)
+            || packet.origin.encrypted != self.origin.encrypted
+            || packet.route.as_ref().is_some_and(|r| !r.permits(&packet.origin))
+            || packet.ingress.as_ref().is_some_and(|route| {
+                route
+                    .origin
+                    .as_ref()
+                    .is_none_or(|origin| !route.permits(origin) || !self.core.audio_binding_matches(origin))
+            })
+            || packet.is_end()
+        {
             return;
         }
-        let index = match self.slots.iter().position(|s| s.source == Some(packet.from)) {
+        let index = match self.slots.iter().position(|s| s.source == Some(packet.from())) {
             Some(i) => i,
             None => {
                 let candidate = self
@@ -155,11 +183,11 @@ impl Peer {
                     .min_by_key(|(_, s)| (s.source.is_some(), s.last_used))
                     .map(|(i, _)| i);
                 let Some(i) = candidate else { return };
-                self.slots[i].assign(packet.from);
+                self.slots[i].assign(packet.from());
                 self.notify(Event::VoiceSlot {
                     binding: self.binding.clone(),
                     slot: i as u32,
-                    client: Some(packet.from),
+                    client: Some(packet.from()),
                 });
                 i
             }
@@ -177,14 +205,15 @@ impl Peer {
         };
         let mut direct = self.rtc.direct_api();
         let Some(stream) = direct.stream_tx_by_mid(slot.mid, None) else { return };
-        if !slot.advance(now, packet.samples, packet.clock) {
+        if !slot.advance(now, packet.span, packet.clock) {
             return;
         }
         slot.last_used = now;
         let mut extensions = ExtensionValues::default();
         extensions.user_values.set(SlotGeneration(slot.generation));
         stream.write_rtp(
-            RtpWrite::new(pt, slot.sequence.into(), slot.ticks as u32, now, packet.opus.clone()).ext_vals(extensions),
+            RtpWrite::new(pt, slot.sequence.into(), slot.ticks as u32, now, packet.payload.clone())
+                .ext_vals(extensions),
         );
         slot.sequence += 1;
     }
@@ -225,7 +254,7 @@ pub async fn run(
         let mut deadline = Instant::now() + Duration::from_millis(50);
         loop {
             for peer in peers.values_mut() {
-                deadline = deadline.min(drive(peer, &socket, &routing, &core, &mut forwards));
+                deadline = deadline.min(drive(peer, &socket, &routing, &uplinks, &core, &mut forwards));
             }
             if forwards.is_empty() {
                 break;
@@ -251,30 +280,40 @@ pub async fn run(
                 peer.talking = false;
                 core.talking_bound(peer.session, false, &peer.binding);
                 // Other transports (TeamSpeak) end the talk state explicitly.
-                let end = AudioPacket::end_of_speech(peer.session);
-                uplinks.send(peer.session, &end);
+                let mut end = AudioPacket::end_of_speech(peer.origin.clone(), None);
+                end.egress = uplinks.route(peer.session);
+                uplinks.uplink(&routing.load(), &end);
                 sinks.fan_out(&routing.load(), &end);
             }
         }
 
         tokio::select! {
             command = commands.recv() => match command {
-                Some(MediaCmd::Offer { session, binding, sdp, out, reply }) => {
+                Some(MediaCmd::Offer { session, binding, origin, ssrc, retired, sdp, out, reply }) => {
                     if reply.is_closed() || !core.voice_binding_matches(session, &binding) {
                         continue;
                     }
                     close_peer(&mut peers, session, &core, None);
-                    match accept(session, binding, core.clone(), &sdp, advertise, out) {
+                    match accept(session, binding, origin, RtpAdmission::new(ssrc, retired), core.clone(), &sdp, advertise, out) {
                         Ok((peer, answer)) => {peers.insert(session, peer); let _ = reply.send(Ok(answer));}
                         Err(message) => {let _ = reply.send(Err(message));}
                     }
+                }
+                Some(MediaCmd::Inspect { session, probe_ssrcs, reply }) => {
+                    let snapshot = peers.get_mut(&session).map(|peer| MediaSnapshot {
+                        counters: peer.admission.counters,
+                        registered_probe_ssrcs: probe_ssrcs.into_iter().take(512)
+                            .filter(|ssrc| peer.rtc.direct_api().stream_rx(&(*ssrc).into()).is_some()).count(),
+                        rtcp_reports: peer.rtcp_reports,
+                    });
+                    let _ = reply.send(snapshot);
                 }
                 Some(MediaCmd::Remove { session }) => close_peer(&mut peers, session, &core, None),
                 Some(MediaCmd::Forward(packet)) => {
                     deliver_local(&mut peers, &routing.load(), &packet, Instant::now());
                 }
                 Some(MediaCmd::ForwardTo(to, packet)) => {
-                    if routing.load().can_whisper(packet.from, to)
+                    if routing.load().accepts_whisper(&packet, to)
                         && let Some(peer) = peers.get_mut(&to)
                     {
                         peer.forward(&packet, Instant::now());
@@ -287,6 +326,7 @@ pub async fn run(
                     let Ok(contents) = buf[..n].try_into() else { continue };
                     let input = Input::Receive(Instant::now(), Receive { proto: Protocol::Udp, source, destination: advertise, contents });
                     if let Some(peer) = peers.values_mut().find(|p| p.rtc.accepts(&input))
+                        && peer.admission.admits_datagram(&buf[..n])
                         && let Err(e) = peer.rtc.handle_input(input) {
                             debug!(session = peer.session, "rtc input: {e}");
                             peer.rtc.disconnect();
@@ -307,16 +347,22 @@ pub async fn run(
 }
 
 fn deliver_local(peers: &mut HashMap<SessionId, Peer>, routing: &super::Routing, packet: &AudioPacket, now: Instant) {
-    for to in routing.recipients(packet.from) {
+    if !routing.accepts(packet) {
+        return;
+    }
+    for to in routing.recipients(packet.from()) {
         if let Some(peer) = peers.get_mut(&to) {
             peer.forward(packet, now);
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn accept(
     session: SessionId,
     binding: VoiceTransportBinding,
+    origin: Arc<AudioOrigin>,
+    admission: RtpAdmission,
     core: CoreHandle,
     sdp: &str,
     advertise: SocketAddr,
@@ -333,19 +379,28 @@ fn accept(
     let candidate = Candidate::host(advertise, "udp").map_err(|_| "bad media address")?;
     rtc.add_local_candidate(candidate);
     let answer = rtc.sdp_api().accept_offer(offer).map_err(|_| "offer not acceptable")?;
+    let mic = rtc
+        .direct_api()
+        .stream_rx(&admission.ssrc.into())
+        .map(|stream| stream.mid())
+        .ok_or("microphone SSRC was not negotiated")?;
+    if rtc.media(mic).is_none_or(|m| m.kind() != MediaKind::Audio || !m.direction().is_receiving()) {
+        return Err("microphone media was not negotiated");
+    }
     let peer = Peer {
         session,
         binding,
         core,
         rtc,
         out,
-        mic: None,
+        mic: Some(mic),
         slots: Vec::with_capacity(AUDIO_SLOTS),
         talking: false,
         last_voice: Instant::now(),
         connected: false,
-        clock: None,
-        retired_ssrcs: Vec::new(),
+        origin,
+        admission,
+        rtcp_reports: 0,
     };
     Ok((peer, answer.to_sdp_string()))
 }
@@ -353,6 +408,7 @@ fn accept(
 fn close_peer(peers: &mut HashMap<SessionId, Peer>, session: SessionId, core: &CoreHandle, reason: Option<&str>) {
     let Some(mut peer) = peers.remove(&session) else { return };
     peer.rtc.disconnect();
+    debug!(session, counters = ?peer.admission.counters, "retired media stream");
     core.voice_bound(session, false, &peer.binding, reason.is_some());
     for other in peers.values_mut() {
         other.release_source(session);
@@ -364,6 +420,7 @@ fn drive(
     peer: &mut Peer,
     socket: &UdpSocket,
     routing: &SharedRouting,
+    uplinks: &Sinks,
     core: &CoreHandle,
     forwards: &mut Vec<AudioPacket>,
 ) -> Instant {
@@ -392,9 +449,7 @@ fn drive(
                 }
                 RtcEvent::IceConnectionStateChange(IceConnectionState::Disconnected) => peer.rtc.disconnect(),
                 RtcEvent::MediaAdded(added) if added.kind == MediaKind::Audio => {
-                    if added.direction.is_receiving() && peer.mic.is_none() {
-                        peer.mic = Some(added.mid);
-                    } else if added.direction.is_sending() && peer.slots.len() < AUDIO_SLOTS {
+                    if Some(added.mid) != peer.mic && added.direction.is_sending() && peer.slots.len() < AUDIO_SLOTS {
                         peer.slots.push(Slot {
                             mid: added.mid,
                             source: None,
@@ -408,8 +463,9 @@ fn drive(
                         });
                     }
                 }
+                RtcEvent::SenderFeedback(_) => peer.rtcp_reports += 1,
                 RtcEvent::RtpPacket(data) => {
-                    if let Some(packet) = ingest(peer, &data, routing, core) {
+                    if let Some(packet) = ingest(peer, &data, routing, uplinks, core) {
                         forwards.push(packet);
                     }
                 }
@@ -420,35 +476,32 @@ fn drive(
 }
 
 /// Applies the speech gate to one microphone frame.
-fn ingest(peer: &mut Peer, data: &RtpPacket, routing: &SharedRouting, core: &CoreHandle) -> Option<AudioPacket> {
-    if !core.voice_binding_matches(peer.session, &peer.binding) || !routing.load().members.contains_key(&peer.session) {
+fn ingest(
+    peer: &mut Peer,
+    data: &RtpPacket,
+    routing: &SharedRouting,
+    uplinks: &Sinks,
+    core: &CoreHandle,
+) -> Option<AudioPacket> {
+    if !core.voice_binding_matches(peer.session, &peer.binding)
+        || routing.load().origin(peer.session).as_deref() != Some(&peer.origin)
+    {
+        return None;
+    }
+    if !peer.admission.admits_ssrc(*data.header.ssrc) {
         return None;
     }
     let mid = peer.rtc.direct_api().stream_rx(&data.header.ssrc)?.mid();
     if Some(mid) != peer.mic {
         return None;
     }
-    let samples = opus::packet_samples(&data.payload)?;
-    let clock = SourceClock::Rtp { ssrc: *data.header.ssrc, sequence: *data.seq_no, ticks: data.header.timestamp };
-    if let Some(old) = peer.clock {
-        match clock.delta(old) {
-            Err(()) => return None,
-            Ok(None) => {
-                if peer.retired_ssrcs.contains(&*data.header.ssrc) {
-                    return None;
-                }
-                if let SourceClock::Rtp { ssrc, .. } = old {
-                    if peer.retired_ssrcs.len() == RETIRED_SSRCS {
-                        peer.retired_ssrcs.remove(0);
-                    }
-                    peer.retired_ssrcs.push(ssrc);
-                }
-            }
-            Ok(Some(_)) => {}
-        }
-    }
-    // Order before touching speech state, including gated packets.
-    peer.clock = Some(clock);
+    let (clock, span) = peer.admission.admit(
+        *data.header.ssrc,
+        *data.seq_no,
+        data.header.timestamp,
+        peer.origin.encrypted,
+        &data.payload,
+    )?;
     let now = Instant::now();
     if !routing.load().can_speak(peer.session) {
         if peer.talking {
@@ -467,7 +520,17 @@ fn ingest(peer: &mut Peer, data: &RtpPacket, routing: &SharedRouting, core: &Cor
     if !peer.talking {
         return None;
     }
-    Some(AudioPacket { from: peer.session, opus: Arc::clone(&data.payload), samples, clock })
+    Some(AudioPacket {
+        origin: peer.origin.clone(),
+        payload: Arc::clone(&data.payload),
+        kind: AudioKind::Audio,
+        span,
+        clock,
+        route: None,
+        target: None,
+        ingress: None,
+        egress: uplinks.route(peer.session),
+    })
 }
 
 #[cfg(test)]
@@ -489,7 +552,7 @@ mod clock_tests {
     }
 
     fn rtp(sequence: u64, ticks: u32) -> SourceClock {
-        SourceClock::Rtp { ssrc: 42, sequence, ticks }
+        SourceClock::Rtp { ssrc: 42, sequence, ticks, generation: 0 }
     }
 
     #[test]
@@ -524,9 +587,9 @@ mod clock_tests {
         slot.assign(2);
         assert_eq!(slot.generation, 2);
         assert!(slot.advance(now + Duration::from_millis(801), 480, rtp(0, 0)));
-        assert_eq!(slot.ticks, SAMPLE_RATE + 41 * 960);
+        assert_eq!(slot.ticks, SAMPLE_RATE + 81 * 480);
         assert!(slot.advance(now + Duration::from_millis(801), 480, rtp(1, 480)));
-        assert_eq!(slot.ticks, SAMPLE_RATE + 41 * 960 + 480);
+        assert_eq!(slot.ticks, SAMPLE_RATE + 81 * 480 + 480);
     }
 
     #[test]
@@ -615,8 +678,109 @@ mod clock_tests {
         assert!(slot.advance(
             now + Duration::from_millis(41),
             480,
-            SourceClock::Rtp { ssrc: 43, sequence: 0, ticks: 0 }
+            SourceClock::Rtp { ssrc: 43, sequence: 0, ticks: 0, generation: 0 }
         ));
         assert_eq!(slot.ticks, SAMPLE_RATE + 240000 + 1440 + 960 + 960);
+    }
+    #[test]
+    fn all_reanchors_round_to_480_and_keep_previous_span() {
+        let now = Instant::now();
+        for previous in [480, 960, 2880, 5760] {
+            for elapsed_ms in [0, 1, 9, 10, 11, 21, 61, 6001] {
+                for cause in 0..5 {
+                    let mut slot = slot(now);
+                    assert!(slot.advance(now, previous, rtp(1, 100_000)));
+                    let next = match cause {
+                        0 => {
+                            slot.assign(2);
+                            rtp(2, 100_480)
+                        }
+                        1 => SourceClock::Rtp { ssrc: 43, sequence: 1, ticks: 0, generation: 0 },
+                        2 => SourceClock::Rtp { ssrc: 42, sequence: 2, ticks: 100_480, generation: 1 },
+                        3 => rtp(2, 340_001),
+                        _ => SourceClock::TeamSpeak { id: 5, whisper: false, spurt: 2 },
+                    };
+                    assert!(slot.advance(now + Duration::from_millis(elapsed_ms), 480, next));
+                    let floor = (elapsed_ms.div_ceil(10).max(1) * 480).max(u64::from(previous));
+                    assert_eq!(slot.ticks, 48_000 + floor, "span {previous}, elapsed {elapsed_ms}, cause {cause}");
+                }
+            }
+        }
+        let mut batched = slot(now);
+        for spurt in 1..=3 {
+            assert!(batched.advance(now, 2880, SourceClock::TeamSpeak { id: spurt as u16, whisper: false, spurt }));
+            assert_eq!(batched.ticks, 48_000 + u64::from(spurt - 1) * 2880);
+        }
+        let mut source = RtpAdmission::new(42, vec![]);
+        let mut output = slot(now);
+        // A gated reset is carried in the source generation even if its next
+        // timestamp happens to look continuous with the last forwarded one.
+        for (seq, ticks) in [100_000, 100_960, 100_000, 100_960].into_iter().enumerate() {
+            let (clock, span) = source.admit(42, seq as u64, ticks, true, &[0xff, 0]).unwrap();
+            if seq == 0 || seq == 3 {
+                assert!(output.advance(now + Duration::from_millis(seq as u64 * 20), span, clock));
+            }
+        }
+        assert_eq!(output.ticks, 50_880);
+        // Learned 10 ms steps still reserve 20 ms for the next mixed packet.
+        for ticks in [101_440, 101_920] {
+            let (clock, span) = source.admit(42, ticks as u64, ticks, true, &[0xff, 0]).unwrap();
+            assert_eq!(span, 960);
+            output.advance(now + Duration::from_millis(60), span, clock);
+        }
+        let before = output.ticks;
+        let (clock, span) = source.admit(42, 101_921, 0, true, &[0xff, 0]).unwrap();
+        output.advance(now + Duration::from_millis(60), span, clock);
+        assert_eq!(output.ticks - before, 960);
+        // Documented isolated 120 ms encrypted exception: estimate stays 960,
+        // so an immediate reset can overlap by at most 5760-960 = 4800 ticks.
+        assert_eq!(5760 - span, 4800);
+        assert!(!output.advance(now + Duration::from_secs(10), span, rtp(1, 0)));
+    }
+    #[test]
+    fn encrypted_clock_reset_preserves_post_reset_native_decoded_tone() {
+        use audiopus::{
+            Application, Channels, MutSignals, SampleRate,
+            coder::{Decoder, Encoder},
+            packet::Packet,
+        };
+        use vc_client::voice::jitter::{JitterBuffer, Playout};
+        let now = Instant::now();
+        let mut source = RtpAdmission::new(42, vec![]);
+        let mut output = slot(now);
+        let mut jitter = JitterBuffer::new();
+        let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio).unwrap();
+        let mut decoder = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
+        let mut energy = Vec::new();
+        for (seq, ticks) in [100_000, 0, 960, 1920, 2880].into_iter().enumerate() {
+            let pcm: Vec<_> = (0..960)
+                .map(|i| (std::f32::consts::TAU * 1500.0 * (seq * 960 + i) as f32 / 48_000.0).sin() * 0.4)
+                .collect();
+            let mut bytes = vec![0; 1000];
+            let n = encoder.encode_float(&pcm, &mut bytes).unwrap();
+            bytes.truncate(n);
+            // Plaintext Opus through the production encrypted-clock estimator.
+            let (clock, span) = source.admit(42, seq as u64, ticks, true, &bytes).unwrap();
+            assert!(output.advance(now, span, clock));
+            assert_eq!(output.generation, 1); // no decoder reset hides overlaps
+            jitter.push(output.ticks, 960, bytes);
+            let Playout::Packet { data, .. } = jitter.pop() else { panic!("post-reset audio was late or missing") };
+            let packet = Packet::try_from(data.as_slice()).unwrap();
+            let mut decoded = [0.0f32; 5760];
+            let n = decoder.decode_float(Some(packet), MutSignals::try_from(&mut decoded[..]).unwrap(), false).unwrap();
+            assert_eq!(n, 960);
+            let component = |cosine: bool| {
+                (0..n)
+                    .map(|i| {
+                        let phase = std::f64::consts::TAU * 1500.0 * i as f64 / 48_000.0;
+                        f64::from(decoded[i]) * if cosine { phase.cos() } else { phase.sin() }
+                    })
+                    .sum::<f64>()
+                    / n as f64
+            };
+            let amplitude = component(false).hypot(component(true));
+            energy.push(amplitude);
+        }
+        assert!(energy[1..].iter().all(|amplitude| *amplitude > 0.05), "post-reset tone: {energy:?}");
     }
 }

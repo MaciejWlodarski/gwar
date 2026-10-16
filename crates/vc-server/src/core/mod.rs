@@ -48,7 +48,7 @@ use vc_proto::{
 
 use self::bridge::{BridgeMsg, BridgeNote, RemoteClient};
 use crate::{
-    media::{Member, Routing, SharedRouting, webrtc::MediaCmd},
+    media::{AudioOrigin, Member, Routing, SharedRouting, webrtc::MediaCmd},
     store::{ADMIN_GROUP, ChannelRow, MEMBER_GROUP, Store},
 };
 
@@ -185,8 +185,31 @@ impl CoreHandle {
         let _ = self.tx.try_send(CoreMsg::Talking { session, talking, binding: Some(binding) });
     }
 
+    pub fn audio_binding_matches(&self, origin: &AudioOrigin) -> bool {
+        self.voice_bindings.load().get(&origin.session) == Some(&origin.binding)
+    }
+    pub fn talking_origin(&self, origin: &AudioOrigin, talking: bool) {
+        let _ = self.tx.try_send(CoreMsg::Talking {
+            session: origin.session,
+            talking,
+            binding: Some(origin.binding.clone()),
+        });
+    }
+
     pub fn voice_binding_matches(&self, session: SessionId, binding: &vc_proto::VoiceTransportBinding) -> bool {
         self.voice_bindings.load().get(&session) == Some(&binding.into())
+    }
+
+    /// FIFO barrier after bridge updates, returning the actor's admitted origin.
+    pub async fn audio_origin(&self, session: SessionId) -> Option<Arc<AudioOrigin>> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(CoreMsg::Resume(Box::new(move |core| {
+                let _ = tx.send(core.routing.load().origin(session));
+            })))
+            .await
+            .ok()?;
+        rx.await.ok().flatten()
     }
 
     pub fn talking_bound(&self, session: SessionId, talking: bool, binding: &vc_proto::VoiceTransportBinding) {
@@ -720,11 +743,10 @@ impl Core {
             .values()
             .filter_map(|s| {
                 let channel = s.channel?;
-                if self.is_encrypted(channel) {
-                    return None;
-                }
-                let bridged = !self.is_encrypted(channel);
-                Some((s.id, Member { channel, muted: s.muted, deafened: s.deafened, bridged }))
+                let encrypted = self.is_encrypted(channel);
+                let binding = s.participation.as_ref()?.binding.clone();
+                let origin = Arc::new(AudioOrigin { channel, encrypted, session: s.id, binding });
+                Some((s.id, Member { channel, muted: s.muted, deafened: s.deafened, bridged: !encrypted, origin }))
             })
             .collect();
         self.routing.store(Arc::new(Routing { members }));

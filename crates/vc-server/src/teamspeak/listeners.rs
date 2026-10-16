@@ -4,6 +4,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -19,12 +23,14 @@ const RETRY: Duration = Duration::from_secs(5);
 pub(super) struct Text {
     pub cid: u64,
     pub generation: u64,
+    pub connection: u64,
     pub invoker: u16,
     pub text: String,
 }
 
 struct Listener {
     generation: u64,
+    connection: Arc<AtomicU64>,
     task: JoinHandle<()>,
 }
 
@@ -66,21 +72,27 @@ impl ChannelListeners {
             self.generation += 1;
             let generation = self.generation;
             let (addr, password, events) = (self.addr, self.password.clone(), self.events.clone());
+            let connection = Arc::new(AtomicU64::new(0));
+            let attempt = connection.clone();
             let task = tokio::spawn(async move {
                 loop {
-                    if let Err(e) = listen(addr, &password, cid, generation, &events).await {
+                    let connection = attempt.fetch_add(1, Ordering::AcqRel) + 1;
+                    if let Err(e) = listen(addr, &password, cid, generation, connection, &events).await {
                         warn!(cid, "TeamSpeak channel chat listener: {e:#}; retrying in {RETRY:?}");
                     }
+                    attempt.fetch_add(1, Ordering::AcqRel); // retire queued text immediately
                     tokio::time::sleep(RETRY).await;
                 }
             });
-            self.listeners.insert(cid, Listener { generation, task });
+            self.listeners.insert(cid, Listener { generation, connection, task });
         }
     }
 
     /// Ignore queued events from a listener whose channel was released.
     pub fn accepts(&self, text: &Text) -> bool {
-        self.listeners.get(&text.cid).is_some_and(|l| l.generation == text.generation)
+        self.listeners
+            .get(&text.cid)
+            .is_some_and(|l| l.generation == text.generation && l.connection.load(Ordering::Acquire) == text.connection)
     }
 }
 
@@ -89,6 +101,7 @@ async fn listen(
     password: &str,
     cid: u64,
     generation: u64,
+    connection: u64,
     events: &mpsc::Sender<Text>,
 ) -> Result<()> {
     let (_query, mut notes) = Query::listen_channel(addr, password, cid).await?;
@@ -102,7 +115,7 @@ async fn listen(
             }
             let Some(invoker) = record.get("invokerid").and_then(|v| v.parse().ok()) else { continue };
             let text = record.get("msg").cloned().unwrap_or_default();
-            if events.send(Text { cid, generation, invoker, text }).await.is_err() {
+            if events.send(Text { cid, generation, connection, invoker, text }).await.is_err() {
                 return Ok(());
             }
         }
@@ -150,9 +163,13 @@ mod tests {
         let mut pool = ChannelListeners::new(server.addr, "p ss".into(), tx);
         pool.reconcile([10]);
         assert!(matches!(server.event().await, ChannelEvent::Ready { cid: 10, .. }));
+        server.message(10, 2, 7, "queued before disconnect");
+        let old = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await.unwrap().unwrap();
+        assert!(pool.accepts(&old));
         server.disconnect(10);
         assert!(matches!(server.event().await, ChannelEvent::Closed(10)));
         assert!(matches!(server.event().await, ChannelEvent::Ready { cid: 10, .. }));
+        assert!(!pool.accepts(&old));
         server.message(10, 1, 7, "private");
         server.message(10, 3, 7, "server");
         server.message(10, 2, 7, "channel");

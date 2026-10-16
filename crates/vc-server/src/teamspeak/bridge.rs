@@ -41,7 +41,7 @@ use crate::{
         bridge::{BridgeMsg, BridgeNote, RemoteClient, RemoteUpdate},
         now_ms,
     },
-    media::MediaPlane,
+    media::{AudioRoute, MediaPlane},
 };
 
 /// Name of the TeamSpeak server group that exempts puppets from flood limits.
@@ -654,7 +654,9 @@ impl<'a> Bridge<'a> {
             let _ = self.query.call(cmd).await;
             return;
         };
-        self.shared.mirrors.write().expect("mirrors lock").insert(clid, session);
+        if let Some(origin) = self.core.audio_origin(session).await {
+            self.shared.mirror(clid, cid, origin);
+        }
         self.remotes.insert(clid, Remote { session, ..remote });
         self.reconcile(Duration::ZERO);
     }
@@ -804,7 +806,9 @@ impl<'a> Bridge<'a> {
         let Some(local) = self.locals.get_mut(&session) else { return };
         let Some(puppet) = &local.puppet else { return };
         local.route += 1;
-        if !puppet.send(PuppetCmd::Move { cid, route: local.route, voice }) {
+        let origin = voice.then(|| self.shared.plane.routing.load().origin(session)).flatten();
+        let audio = AudioRoute::new(local.route, cid, origin);
+        if !puppet.send(PuppetCmd::Move { cid, route: local.route, audio, voice }) {
             warn!(session, "puppet busy; reconnecting it in its new channel");
             self.retire_puppet(session);
             self.spawn_puppet(session, Duration::ZERO);
@@ -826,6 +830,11 @@ impl<'a> Bridge<'a> {
             identity,
             channel,
             route: local.route,
+            audio: AudioRoute::new(
+                local.route,
+                channel,
+                voice.then(|| self.shared.plane.routing.load().origin(session)).flatten(),
+            ),
             voice,
             muted: c.muted,
             deafened: c.deafened,
@@ -887,7 +896,7 @@ impl<'a> Bridge<'a> {
             self.reconcile(Duration::ZERO);
         }
         let Some(local) = self.locals.get(&session) else { return };
-        if before.channel != local.client.channel && self.puppet_target(&before) != self.puppet_target(&local.client) {
+        if before.channel != local.client.channel || before.voice_binding != local.client.voice_binding {
             self.move_puppet(session);
         }
         let Some(local) = self.locals.get(&session) else { return };
@@ -944,6 +953,7 @@ impl<'a> Bridge<'a> {
                 let Some(cid) = client.channel.and_then(|c| self.map.ts(c)).filter(|cid| *cid != remote.cid) else {
                     return;
                 };
+                self.shared.forget(clid);
                 if let Err(e) = self.query.call(Cmd::new("clientmove").arg("clid", clid).arg("cid", cid)).await {
                     warn!(clid, "TeamSpeak move: {e:#}");
                 }
@@ -1130,11 +1140,15 @@ impl<'a> Bridge<'a> {
 
     async fn client_moved(&mut self, clid: u16, cid: u64) {
         if let Some(remote) = self.remotes.get_mut(&clid) {
+            self.shared.forget(clid);
             remote.cid = cid;
             let session = remote.session;
             let channel = self.our_channel(cid);
             let update = RemoteUpdate { channel: Some(channel), ..Default::default() };
             self.core.bridge(BridgeMsg::Update(session, update)).await;
+            if let Some(origin) = self.core.audio_origin(session).await {
+                self.shared.mirror(clid, cid, origin);
+            }
             self.reconcile(Duration::ZERO);
         } else if let Some(&session) = self.puppet_clids.get(&clid) {
             // Someone moved a puppet on TeamSpeak; our user decides where they are.
@@ -1161,14 +1175,20 @@ impl<'a> Bridge<'a> {
                     debug!(session, "puppet description: {e:#}");
                 }
             }
-            PuppetEvent::Text { session, invoker, target, text } => {
-                let Some(remote) = self.remotes.get(&invoker) else { return };
+            PuppetEvent::Text { session, generation, origin, source_route, receiver_route, target, text } => {
+                if !source_route.permits(&origin)
+                    || !receiver_route.is_current()
+                    || !self.core.audio_binding_matches(&origin)
+                    || self.locals.get(&session).is_none_or(|local| local.generation != generation)
+                {
+                    return;
+                }
                 if matches!(target, MessageTarget::Client(_) | MessageTarget::Poke(_))
                     && let Some(local) = self.locals.get_mut(&session)
                 {
                     local.chatting_until = Some(Instant::now() + CHAT_KEEP);
                 }
-                let author = remote.session;
+                let author = origin.session;
                 let Some(target) = puppet_chat_target(session, target) else { return };
                 self.core.bridge(BridgeMsg::Chat(author, target, text)).await;
             }
