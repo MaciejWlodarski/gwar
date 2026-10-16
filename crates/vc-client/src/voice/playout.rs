@@ -13,7 +13,9 @@ use super::{
 const STEP: usize = 240; // 5 ms at 48 kHz.
 const MAX_HEADROOM: usize = 1920; // 40 ms, unless one device callback itself needs more.
 const CALLBACK_HOLD: Duration = Duration::from_secs(5);
-const HEADROOM_QUIET: Duration = Duration::from_secs(30);
+// Leaky event budget: +5 ms per underrun, -5 ms per elapsed second.
+// Occasional misses (<1/s) release headroom; sustained misses still grow it.
+const HEADROOM_RELEASE: Duration = Duration::from_secs(1);
 
 /// Pipeline-owned policy; the realtime callback only publishes atomic measurements.
 pub(super) struct SpeakerBuffer {
@@ -43,13 +45,18 @@ impl SpeakerBuffer {
         }
         let base = self.callback.max(STEP);
         self.headroom = self.headroom.max(base);
+        let elapsed = now.saturating_duration_since(self.headroom_changed);
+        let steps = elapsed.as_nanos() / HEADROOM_RELEASE.as_nanos();
+        if steps > 0 {
+            let decay = steps.min(usize::MAX as u128) as usize;
+            self.headroom = self.headroom.saturating_sub(decay.saturating_mul(STEP)).max(base);
+            // Preserve the fractional interval; underruns never restart this clock.
+            self.headroom_changed =
+                now - Duration::from_nanos((elapsed.as_nanos() % HEADROOM_RELEASE.as_nanos()) as u64);
+        }
         if underruns > self.underruns {
             let events = (underruns - self.underruns).min((MAX_HEADROOM / STEP) as u64) as usize;
             self.headroom = self.headroom.saturating_add(events * STEP).min(MAX_HEADROOM).max(self.headroom);
-            self.headroom_changed = now;
-        } else if now.duration_since(self.headroom_changed) >= HEADROOM_QUIET {
-            self.headroom = self.headroom.saturating_sub(STEP).max(base);
-            self.headroom_changed = now;
         }
         self.underruns = underruns;
     }
@@ -282,26 +289,29 @@ mod tests {
     }
 
     #[test]
-    fn underruns_grow_headroom_and_quiet_time_decays_without_sleeping() {
+    fn occasional_underruns_release_headroom_but_frequent_ones_grow_it() {
         let now = Instant::now();
         let mut buffer = SpeakerBuffer::new(now);
         buffer.update(now, 480, 480, 1);
         assert_eq!(buffer.headroom, 720);
-        buffer.update(now, 480, 480, 3); // retain multiple events between wakeups
-        assert_eq!(buffer.headroom, 1200);
+        buffer.update(now, 480, 480, 3);
+        assert_eq!(buffer.headroom, 1200); // Count every event between updates.
         buffer.update(now, 480, 480, 100);
         assert_eq!(buffer.headroom, MAX_HEADROOM);
-        buffer.update(now + Duration::from_secs(29), 480, 480, 101);
-        buffer.update(now + Duration::from_secs(58), 480, 480, 101);
-        assert_eq!(buffer.headroom, MAX_HEADROOM);
-        for step in 1..=8 {
-            buffer.update(now + Duration::from_secs(29 + step * 30), 480, 480, 101);
-            assert_eq!(buffer.headroom, MAX_HEADROOM.saturating_sub(step as usize * STEP).max(480));
+        for second in 1..=20 {
+            buffer.update(now + Duration::from_secs(second), 480, 480, 100 + second / 3);
         }
-        buffer.update(now + Duration::from_secs(300), 2400, 2400, 102);
-        assert_eq!(buffer.headroom, 2400); // never less than a whole callback
-        buffer.update(now + Duration::from_secs(305), 480, 480, 103);
-        assert_eq!(buffer.headroom, 2400); // an underrun must not shrink a formerly large callback's headroom
+        assert_eq!(buffer.headroom, 480); // A miss every 3 s cannot pin 40 ms.
+        for tick in 1..=20 {
+            buffer.update(now + Duration::from_millis(20_000 + tick * 100), 480, 480, 106 + tick);
+        }
+        assert_eq!(buffer.headroom, MAX_HEADROOM); // 10 misses/s still attacks fast.
+        buffer.update(now + Duration::from_secs(23), 2400, 2400, 127);
+        assert_eq!(buffer.headroom, 2400); // Never less than one whole callback.
+        buffer.update(now + Duration::from_secs(28), 480, 480, 128);
+        // Release now runs even with an underrun; the decaying callback maximum
+        // remains the floor, including when it exceeds MAX_HEADROOM.
+        assert_eq!(buffer.headroom, 2160);
     }
 
     #[test]
@@ -540,6 +550,71 @@ mod tests {
     }
 
     #[test]
+    fn recurring_loss_rtp_drains_surplus_and_retains_jitter() {
+        recurring_loss_and_jitter(super::super::jitter::Clock::Rtp);
+    }
+
+    #[test]
+    fn recurring_loss_sequence_drains_surplus_and_retains_jitter() {
+        recurring_loss_and_jitter(super::super::jitter::Clock::Sequence);
+    }
+
+    fn recurring_loss_and_jitter(clock: super::super::jitter::Clock) {
+        use super::super::jitter::Clock;
+        for frame in [480u64, 960] {
+            // Exercise genuine sparse jitter first, then the same clock and
+            // packet duration with a 100 ms burst backlog and one loss/s.
+            for excess in [0u64, 4800] {
+                let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
+                let mut slot = Slot::new().unwrap();
+                let now = Instant::now();
+                if excess == 0 {
+                    slot.end = 480; // Needed for a 5 ms delay every three seconds.
+                }
+                let mut packet = 0;
+                let mut lost = 0;
+                for tick in (0..20 * 48_000u64).step_by(480) {
+                    let at = now + Duration::from_secs_f64(tick as f64 / 48_000.0);
+                    loop {
+                        let scheduled = (packet * frame).saturating_sub(excess);
+                        let jitter = excess == 0 && scheduled > 0 && scheduled.is_multiple_of(3 * 48_000);
+                        let arrival = scheduled + if jitter { 240 } else { 0 };
+                        if arrival > tick {
+                            break;
+                        }
+                        let loss = excess > 0 && scheduled > 0 && scheduled.is_multiple_of(48_000);
+                        if loss {
+                            lost += 1;
+                        } else {
+                            slot.buffer.push_at(
+                                packet * if clock == Clock::Sequence { 960 } else { frame },
+                                frame,
+                                encode_n(&encoder, false, frame as usize),
+                                now + Duration::from_secs_f64(arrival as f64 / 48_000.0),
+                                clock,
+                            );
+                        }
+                        packet += 1;
+                    }
+                    slot.mix_refill(&mut [0.0; 480], 1.0, at, 480).unwrap();
+                }
+                let label = format!("{clock:?}, frame={frame}, excess={excess}");
+                if excess == 0 {
+                    assert_eq!(slot.buffer.shrink_samples, 0, "{label}");
+                    assert_eq!(slot.buffer.concealments, 0, "{label}");
+                } else {
+                    let tail = slot.buffer.depth().1 + slot.staged_samples() as u64;
+                    // Safety plus the minimum 120-sample correction quantum.
+                    assert!(tail <= slot.buffer.target_samples() + 240, "{label}: tail={tail}");
+                    assert!(slot.buffer.shrink_samples >= 4800 - frame - 240, "{label}");
+                    assert_eq!(lost, 19);
+                    assert_eq!(slot.buffer.concealments, lost, "{label}: shrink must not introduce loss");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn fractional_staged_surplus_converges_with_bounded_periodic_corrections() {
         use super::super::jitter::Clock;
         for clock in [Clock::Rtp, Clock::Sequence] {
@@ -571,7 +646,9 @@ mod tests {
                             assert!(total <= excess as u64);
                             assert!(tick >= 5 * 48_000, "correction before the full observation window");
                             if let Some(previous) = last_correction {
-                                assert!(tick - previous >= 5 * 48_000, "corrections less than five seconds apart");
+                                // Historical margins are debited after a cut; another full
+                                // five-second window is no longer required.
+                                assert!(tick - previous >= 24_000, "corrections less than 500 ms apart");
                             }
                             last_correction = Some(tick);
                             corrected = total;

@@ -59,6 +59,8 @@ pub struct Shared {
     pub ingress: IngressCounters,
     /// Immediate voice writes dropped because the UDP socket was not writable.
     pub voice_socket_pressure: AtomicU64,
+    /// Uplink packets / held tails dropped after exceeding local queue age.
+    pub voice_stale_dropped: AtomicU64,
     #[cfg(feature = "test-hooks")]
     observations: Mutex<HashMap<IngressKey, tokio::sync::oneshot::Sender<IngressObservation>>>,
     #[cfg(feature = "test-hooks")]
@@ -184,6 +186,7 @@ impl Shared {
             spurts: AtomicU32::new(0),
             ingress: IngressCounters::default(),
             voice_socket_pressure: AtomicU64::new(0),
+            voice_stale_dropped: AtomicU64::new(0),
             #[cfg(feature = "test-hooks")]
             observations: Mutex::default(),
             #[cfg(feature = "test-hooks")]
@@ -314,6 +317,7 @@ impl Shared {
         entry.clock = Some(clock);
         self.ingress.voice_admitted.fetch_add(1, Ordering::Relaxed);
         self.plane.publish(AudioPacket {
+            admitted_at: std::time::Instant::now(),
             origin: origin.clone(),
             payload: Arc::from(opus),
             kind: AudioKind::Audio,
@@ -368,6 +372,7 @@ impl Shared {
             let clock = SourceClock::TeamSpeak { id, whisper: true, spurt: stream.spurt };
             stream.clock = Some(clock);
             AudioPacket {
+                admitted_at: std::time::Instant::now(),
                 origin: origin.clone(),
                 payload: Arc::from(opus),
                 kind: AudioKind::Audio,
@@ -694,7 +699,12 @@ async fn run(
                 if !audio_allowed(&con, shared, &packet, &audio) {
                     continue;
                 }
-                for data in packetizer.push(&packet.payload, Instant::now()) {
+                let now = Instant::now();
+                expire_uplink_tail(&mut packetizer, now, &shared.voice_stale_dropped);
+                if !fresh_uplink(packet.admitted_at, now, &shared.voice_stale_dropped) {
+                    continue;
+                }
+                for data in packetizer.push(&packet.payload, packet.admitted_at) {
                     send_audio(&mut con, &mut packet_id, &data, shared, &packet, &audio);
                 }
                 held = Some(packet);
@@ -707,6 +717,7 @@ async fn run(
                 }
             }
             Step::Flush => {
+                expire_uplink_tail(&mut packetizer, Instant::now(), &shared.voice_stale_dropped);
                 if let Some(data) = packetizer.flush()
                     && let Some(packet) = &held
                 {
@@ -880,7 +891,8 @@ async fn run(
                     if let Some(data) = packetizer.flush() {
                         send_audio(&mut con, &mut packet_id, &data, shared, packet, &audio);
                     }
-                    send_audio(&mut con, &mut packet_id, &[], shared, packet, &audio);
+                    let end = super::packetizer::Packetized { data: Vec::new(), admitted_at: Instant::now() };
+                    send_audio(&mut con, &mut packet_id, &end, shared, packet, &audio);
                 }
                 let _ = con.disconnect(DisconnectOptions::new());
                 // Let the disconnect packet go out (and be acknowledged) before dropping.
@@ -1015,17 +1027,38 @@ fn audio_allowed(con: &Connection, shared: &Shared, packet: &AudioPacket, route:
         && own_channel(con) == Some(route.cid)
 }
 
+// Local queue residence only; remote capture age cannot be inferred from RTP.
+// Allows the packetizer's 40 ms tail wait, but not a stalled 64-packet replay.
+const MAX_UPLINK_AGE: Duration = Duration::from_millis(50);
+
+fn fresh_uplink(admitted_at: Instant, now: Instant, dropped: &AtomicU64) -> bool {
+    if now.saturating_duration_since(admitted_at) > MAX_UPLINK_AGE {
+        dropped.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
+    true
+}
+
+fn expire_uplink_tail(packetizer: &mut super::packetizer::Packetizer, now: Instant, dropped: &AtomicU64) {
+    if packetizer.pending_since().is_some_and(|at| !fresh_uplink(at, now, dropped)) {
+        packetizer.discard_pending();
+    }
+}
+
 fn send_audio(
     con: &mut Connection,
     packet_id: &mut u16,
-    data: &[u8],
+    data: &super::packetizer::Packetized,
     shared: &Shared,
     packet: &AudioPacket,
     route: &Arc<AudioRoute>,
 ) {
-    if !audio_allowed(con, shared, packet, route) {
+    if !audio_allowed(con, shared, packet, route)
+        || !fresh_uplink(data.admitted_at, Instant::now(), &shared.voice_stale_dropped)
+    {
         return;
     }
+    let data = data.data.as_slice();
     #[cfg(feature = "test-hooks")]
     if data.is_empty() {
         shared.sent_end_route.store(route.generation, Ordering::Release);
@@ -1283,6 +1316,48 @@ mod transport_tests {
             Ok("127.0.0.1:1".parse().unwrap())
         }
     }
+    #[test]
+    fn stalled_uplink_discards_queued_audio_and_held_tail_by_original_age() {
+        let now = Instant::now();
+        let resumed = now + Duration::from_millis(200);
+        let dropped = AtomicU64::new(0);
+        let mut packetizer = super::super::packetizer::Packetizer::default();
+        let old = vec![0x70, 1]; // Valid 10 ms frame layout for repacketization.
+        assert!(packetizer.push(&old, now).is_empty());
+        let (tx, mut rx) = mpsc::channel(4);
+        for (at, data) in [(now, old.clone()), (now, old.clone()), (resumed, vec![0x70, 9])] {
+            tx.try_send((at, data)).unwrap();
+        }
+        let mut output = Vec::new();
+        while let Ok((at, data)) = rx.try_recv() {
+            expire_uplink_tail(&mut packetizer, resumed, &dropped);
+            if fresh_uplink(at, resumed, &dropped) {
+                output.extend(packetizer.push(&data, at));
+            }
+        }
+        assert!(output.is_empty(), "stale packets must not pair or flush as a burst");
+        assert_eq!(dropped.load(Ordering::Relaxed), 3); // Two queued packets + held tail.
+        assert_eq!(packetizer.flush().map(|p| (p.data, p.admitted_at)), Some((vec![0x72, 1, 9], resumed))); // Only the fresh half remains.
+        assert!(fresh_uplink(resumed, resumed + MAX_UPLINK_AGE, &dropped));
+        assert!(!fresh_uplink(resumed, resumed + MAX_UPLINK_AGE + Duration::from_nanos(1), &dropped));
+        assert_eq!(dropped.load(Ordering::Relaxed), 4);
+        // A delayed tail timer uses original admission age, not its dequeue time.
+        packetizer.push(&old, resumed);
+        expire_uplink_tail(&mut packetizer, resumed + Duration::from_millis(100), &dropped);
+        assert!(packetizer.flush().is_none());
+        assert_eq!(dropped.load(Ordering::Relaxed), 5);
+        // A pair inherits the first half; a separately emitted fresh packet
+        // must not inherit an older tail's deadline.
+        packetizer.push(&old, now);
+        let paired = packetizer.push(&old, now + Duration::from_millis(10));
+        assert_eq!(paired[0].admitted_at, now);
+        packetizer.push(&old, now);
+        let split = packetizer.push(&[0xf8, 1, 0], now + Duration::from_millis(40));
+        assert_eq!(split.len(), 2);
+        assert_eq!(split[0].admitted_at, now);
+        assert_eq!(split[1].admitted_at, now + Duration::from_millis(40));
+    }
+
     #[tokio::test]
     async fn writable_voice_ignores_exhausted_cooperative_budget() {
         let pressure = AtomicU64::new(0);

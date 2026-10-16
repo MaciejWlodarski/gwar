@@ -10,12 +10,27 @@ use crate::media::opus::packet_samples;
 
 const TAIL_WAIT: Duration = Duration::from_millis(40);
 
+/// A pair keeps its oldest half's age; independently flushed packets keep theirs.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct Packetized {
+    pub data: Vec<u8>,
+    pub admitted_at: Instant,
+}
+
 #[derive(Default)]
 pub(super) struct Packetizer {
     pending: Option<(Vec<u8>, Instant)>,
 }
 
 impl Packetizer {
+    pub fn pending_since(&self) -> Option<Instant> {
+        self.pending.as_ref().map(|(_, at)| *at)
+    }
+
+    pub fn discard_pending(&mut self) {
+        self.pending = None;
+    }
+
     pub fn deadline(&self) -> Option<Instant> {
         self.pending.as_ref().map(|(_, at)| *at + TAIL_WAIT)
     }
@@ -23,11 +38,11 @@ impl Packetizer {
     /// A missing second half must not strand the final 10 ms of a talk spurt.
     /// A zero-byte Opus frame requests concealment (RFC 6716 §3.2.1), so the
     /// tail still occupies one whole 20 ms TeamSpeak packet-counter step.
-    pub fn flush(&mut self) -> Option<Vec<u8>> {
-        self.pending.take().map(|(first, _)| pair(&first, &[]))
+    pub fn flush(&mut self) -> Option<Packetized> {
+        self.pending.take().map(|(first, admitted_at)| Packetized { data: pair(&first, &[]), admitted_at })
     }
 
-    pub fn push(&mut self, data: &[u8], now: Instant) -> Vec<Vec<u8>> {
+    pub fn push(&mut self, data: &[u8], now: Instant) -> Vec<Packetized> {
         let mut out = Vec::with_capacity(2);
         if self.deadline().is_some_and(|at| now >= at)
             && let Some(tail) = self.flush()
@@ -36,14 +51,14 @@ impl Packetizer {
         }
         let native_ten = packet_samples(data) == Some(480) && data[0] & 3 == 0;
         if native_ten && data.len() <= 1276 {
-            if let Some((first, _)) = self.pending.take() {
+            if let Some((first, admitted_at)) = self.pending.take() {
                 // Config + stereo must match. Different modes/bandwidths cannot
                 // share an Opus TOC; finish the old packet before holding the new.
                 if first[0] == data[0] {
-                    out.push(pair(&first, &data[1..]));
+                    out.push(Packetized { data: pair(&first, &data[1..]), admitted_at: admitted_at.min(now) });
                     return out;
                 }
-                out.push(pair(&first, &[]));
+                out.push(Packetized { data: pair(&first, &[]), admitted_at });
             }
             self.pending = Some((data.to_vec(), now));
         } else {
@@ -53,7 +68,7 @@ impl Packetizer {
             // Existing browser/TS durations and end markers pass through unchanged.
             // Reject oversized single frames rather than writing an invalid length.
             if !native_ten {
-                out.push(data.to_vec());
+                out.push(Packetized { data: data.to_vec(), admitted_at: now });
             }
         }
         out
@@ -120,14 +135,14 @@ mod tests {
             assert!(packetizer.push(&a, now).is_empty());
             let packets = packetizer.push(&b, now + Duration::from_millis(10));
             assert_eq!(packets.len(), 1);
-            assert_eq!(packet_samples(&packets[0]), Some(960));
+            assert_eq!(packet_samples(&packets[0].data), Some(960));
             let mut expected = decode(&mut reference, &a);
             expected.extend(decode(&mut reference, &b));
-            assert_eq!(decode(&mut receiver, &packets[0]), expected);
+            assert_eq!(decode(&mut receiver, &packets[0].data), expected);
         }
         let twenty = encode(&encoder, 960, 0);
-        assert_eq!(packetizer.push(&twenty, now), vec![twenty]);
-        assert_eq!(packetizer.push(&[], now), vec![Vec::<u8>::new()]);
+        assert_eq!(packetizer.push(&twenty, now), vec![Packetized { data: twenty, admitted_at: now }]);
+        assert_eq!(packetizer.push(&[], now), vec![Packetized { data: Vec::new(), admitted_at: now }]);
     }
 
     #[test]
@@ -139,22 +154,22 @@ mod tests {
             let mut p = Packetizer::default();
             assert!(p.push(&first, now).is_empty());
             let packets = p.push(&ending, now + Duration::from_millis(10));
-            assert_eq!(packet_samples(&packets[0]), Some(960));
+            assert_eq!(packet_samples(&packets[0].data), Some(960));
             let mut d = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
             let mut r = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
-            assert_eq!(&decode(&mut d, &packets[0])[..480], decode(&mut r, &first));
+            assert_eq!(&decode(&mut d, &packets[0].data)[..480], decode(&mut r, &first));
             if ending == [0x90, 0] {
                 assert_eq!(packets.len(), 1);
-                assert_eq!(packet_samples(&p.flush().unwrap()), Some(960));
+                assert_eq!(packet_samples(&p.flush().unwrap().data), Some(960));
             } else {
-                assert_eq!(packets[1], ending);
+                assert_eq!(packets[1].data, ending);
                 assert!(p.flush().is_none());
             }
         }
         let mut p = Packetizer::default();
         p.push(&first, now);
         assert_eq!(p.deadline(), Some(now + TAIL_WAIT));
-        assert_eq!(packet_samples(&p.flush().unwrap()), Some(960));
+        assert_eq!(packet_samples(&p.flush().unwrap().data), Some(960));
         assert!(p.deadline().is_none());
         p.push(&first, now);
         let packets = p.push(&first, now + TAIL_WAIT);

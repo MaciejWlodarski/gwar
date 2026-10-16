@@ -311,9 +311,15 @@ before refills over a full trailing five seconds. This retains sparse low-water
 evidence such as a 5 ms packet delay every three seconds. The margin excludes
 the pending refill, adaptive jitter reserve beyond packet batching, and 120 samples (2.5 ms)
 of safety. Arrival phase contributes no credit. Each correction proposes at most
-720 samples (15 ms), then rebuilds the observation window after the actual cut.
-Every concealment also requires a fresh full window. Surplus below 120 samples
-is not corrected.
+720 samples (15 ms). Each committed cut is subtracted from every historical
+margin, so later corrections cannot spend the same surplus twice. Concealment
+samples actual queued depth with the pending refill demand; an empty queue
+vetoes shrinking for the full window, while isolated packet loss need not erase
+still-supported surplus. Corrections are at least 500 ms apart (at most 10 ms/s
+for quiet audio or 30 ms/s for a correlated 15 ms period). Surplus below 120
+samples is not corrected. Startup, observation gaps and stall recovery still
+require a fresh window. The post-trim concealment counter retains its one-second
+window independently of the correction interval.
 
 Voiced corrections search 120--720 sample lags within the available budget,
 using mean-centered normalized correlation (>0.98) and similar window energies.
@@ -356,6 +362,31 @@ comparison demonstrates no latency improvement attributable to TSM. These are
 single pairs on a shared Mac, not controlled idle-host measurements. Synthetic
 splice tests did show 39.5--99.98% less normalized magnitude-spectrum error than
 the equal-count skip/fade baseline across all 36 tone/vibrato/phase cases.
+
+Receiver recovery follow-up (2026-10-16; measurement pending). Low-water
+observations now survive isolated PLC and are debited after each cut, retaining
+the five-second jitter protection without repeatedly restarting it. Deterministic
+10/20 ms tests in RTP and TS sequence clocks recover a 100 ms burst backlog
+within 20 seconds despite one loss per second, to at most the target plus 5 ms
+(safety and minimum correction quantum), with no extra concealments. Sparse
+5 ms jitter every three seconds still receives no cuts. This quiet-audio bound
+is not a bound for uncorrelated speech: the decoder can still decline a cut.
+Speaker headroom keeps its 5 ms/event attack and 40 ms cap but releases 5 ms per
+elapsed second, including intervals with underruns: rates below one event/s
+can recover instead of requiring 30 seconds of complete silence.
+
+Native PCM and encoded queues retain callback capture time and discard audio
+older than 50 ms; partial PCM frames cannot refresh their age after a stall.
+Direct TS carries this time through its second queue and uses immediate UDP
+writes. Puppet uplinks retain local transport-admission time across fanout and
+the 40 ms packetizer tail; queued packets, held tails and final writes expire
+after 50 ms. This bounds local residence, not unknown remote capture/network
+age. Puppet socket-pressure dropping was already immediate and is unchanged.
+Diagnostics add native `capture_stale_samples`, `capture_stale_frames`,
+`capture_overflow_samples`, `outgoing_full_dropped`, direct-TS handle
+`audio_stale_dropped` / `audio_socket_pressure`, and puppet `voice_stale_dropped`.
+Quiet-machine latency and real TeamSpeak measurements remain pending; the
+latency harness was not run for this follow-up.
 
 Local loss investigation (2026-10-16). The original harness reproduced
 `seed=42;down:loss=2%` at 777/782 ms median/p95 on `21ee239`, versus 47/50 ms

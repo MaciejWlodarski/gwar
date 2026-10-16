@@ -72,6 +72,8 @@ pub enum AudioKind {
 /// encrypted payload is never an end-of-speech control.
 #[derive(Debug, Clone)]
 pub struct AudioPacket {
+    /// Local transport admission, preserved through fanout and puppet queues.
+    pub admitted_at: std::time::Instant,
     pub origin: Arc<AudioOrigin>,
     pub payload: Arc<[u8]>,
     pub kind: AudioKind,
@@ -144,6 +146,7 @@ impl SourceClock {
 impl AudioPacket {
     pub fn end_of_speech(origin: Arc<AudioOrigin>, route: Option<Arc<AudioRoute>>) -> Self {
         Self {
+            admitted_at: std::time::Instant::now(),
             origin,
             route,
             target: None,
@@ -353,6 +356,7 @@ pub(crate) mod tests {
 
     fn frame(m: &Member) -> AudioPacket {
         AudioPacket {
+            admitted_at: std::time::Instant::now(),
             origin: m.origin.clone(),
             payload: Arc::from([0xf8, 1]),
             kind: AudioKind::Audio,

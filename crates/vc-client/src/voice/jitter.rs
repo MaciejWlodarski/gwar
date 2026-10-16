@@ -78,7 +78,10 @@ const DEPTH_WINDOW: Duration = Duration::from_secs(5);
 const SAFETY: u64 = 120; // Retain 2.5 ms beyond the observed refill low-water mark.
 const FORCE_SHRINK: Duration = Duration::from_secs(2);
 const SHRINK_STEP: u64 = 720; // Allow one low-pitched period (15 ms); the decoder commits the actual cut.
-const SHRINK_INTERVAL: Duration = Duration::from_secs(1);
+// Debited low-water evidence supports bounded recovery: at most 10 ms/s in
+// quiet PCM (5 ms cuts), or 30 ms/s for a correlated 15 ms period.
+const SHRINK_INTERVAL: Duration = Duration::from_millis(500);
+const TRIM_DIAGNOSTIC_WINDOW: Duration = Duration::from_secs(1);
 // A declined proposal (noise, onset) costs a pitch search; retry at most 5 times a second.
 const SHRINK_RETRY: Duration = Duration::from_millis(200);
 
@@ -234,9 +237,13 @@ impl JitterBuffer {
             self.shrink_samples += samples as u64;
             self.trim_events += 1;
             self.last_shrink = Some(now);
-            // The old minimum describes audio we just removed. Rebuild the
-            // window before allowing another correction. Keep the speech deadline.
-            self.clear_depth();
+            // Debit every historical margin: the same audio cannot authorize
+            // another cut. New low-water samples can still veto immediately;
+            // supported surplus need not wait another full window after each cut.
+            for (_, margin) in &mut self.low_water {
+                *margin = margin.saturating_sub(samples as u64);
+            }
+            self.surplus = self.surplus.saturating_sub(samples as u64);
         }
     }
 
@@ -378,12 +385,13 @@ impl JitterBuffer {
         };
         self.missing = self.missing.saturating_add(samples);
         self.concealments += 1;
-        if self.last_shrink.is_some_and(|at| now.saturating_duration_since(at) <= SHRINK_INTERVAL) {
+        if self.last_shrink.is_some_and(|at| now.saturating_duration_since(at) <= TRIM_DIAGNOSTIC_WINDOW) {
             self.concealments_after_trim += 1;
         }
-        // PLC is not surplus evidence: require a fresh full window after any loss.
-        self.clear_depth();
-        self.above_since = None;
+        // A missing packet is not an empty queue. Sample only real queued audio
+        // (never PLC) with the remaining refill demand. An empty/low queue vetoes
+        // shrinking for the full window; isolated loss with surplus preserves it.
+        self.observe_depth(now, 0, demand);
         Playout::Conceal(samples as usize)
     }
 }
@@ -496,41 +504,36 @@ mod tests {
     }
 
     #[test]
-    fn shrink_requires_a_full_window_after_each_correction_or_concealment() {
+    fn shrink_requires_a_full_window_after_startup_or_starvation() {
         let mut jb = JitterBuffer::new();
         let now = Instant::now();
-        // Continuous surplus observations cannot bypass the window, even after
-        // the nonquiet deadline. Repeat after a correction and then after PLC.
-        for (round, start_ms) in [(0, 0), (1, 5000), (2, 15020)] {
-            if round == 2 {
-                // Rebuild mature evidence before the loss so PLC must discard it.
-                for ms in (10020..=15020).step_by(20) {
-                    jb.observe_depth(now + Duration::from_millis(ms), 0, FRAME as usize);
-                }
-                jb.packets.clear();
-                assert_eq!(jb.pop_for(now + Duration::from_millis(start_ms), FRAME as usize), Playout::Conceal(960));
-            }
-            // Isolate depth policy from arrival-stall recovery in this fixture.
-            jb.arrival = None;
-            let next = jb.next.unwrap_or(0);
-            for i in 0..10 {
-                jb.push_at(next + i * FRAME, FRAME, vec![1], now + Duration::from_millis(start_ms), Clock::Rtp);
-            }
-            for ms in (start_ms..start_ms + 5000).step_by(20) {
-                let at = now + Duration::from_millis(ms);
-                jb.observe_depth(at, 0, FRAME as usize);
-                if ms == start_ms + 4980 {
-                    assert_eq!(pop_at(&mut jb, at, false), packet(1));
-                }
-            }
-            assert_eq!(
-                pop_at(&mut jb, now + Duration::from_millis(start_ms + 5000), false),
-                Playout::Packet { data: vec![1], skip: 720, quiet_only: true, fade: false }
-            );
-            assert_eq!(pop_at(&mut jb, now + Duration::from_millis(start_ms + 5000), true), packet(1));
-            assert_eq!(jb.trim_events, round + 1);
+        for i in 0..10 {
+            jb.push_at(i * FRAME, FRAME, vec![1], now, Clock::Rtp);
         }
+        for ms in (0..5000).step_by(20) {
+            jb.observe_depth(now + Duration::from_millis(ms), 0, FRAME as usize);
+            assert_eq!(jb.surplus, 0);
+        }
+        assert!(matches!(pop_at(&mut jb, now + DEPTH_WINDOW, false), Playout::Packet { skip: 720, .. }));
+        jb.packets.clear();
+        let loss = now + DEPTH_WINDOW;
+        assert_eq!(jb.pop_for(loss, FRAME as usize), Playout::Conceal(960));
+        jb.arrival = None;
+        let next = jb.next.unwrap();
+        for i in 0..10 {
+            jb.push_at(next + i * FRAME, FRAME, vec![1], loss, Clock::Rtp);
+        }
+        // The zero low-water sample stays in the entire trailing window.
+        for ms in (20..=5000).step_by(20) {
+            jb.observe_depth(loss + Duration::from_millis(ms), 0, FRAME as usize);
+            assert_eq!(jb.surplus, 0);
+        }
+        for ms in (5020..6020).step_by(20) {
+            jb.observe_depth(loss + Duration::from_millis(ms), 0, FRAME as usize);
+        }
+        assert!(matches!(pop_at(&mut jb, loss + Duration::from_millis(6020), true), Playout::Packet { skip: 720, .. }));
         assert_eq!(jb.concealments, 1);
+        assert_eq!(jb.trim_events, 2);
     }
 
     #[test]

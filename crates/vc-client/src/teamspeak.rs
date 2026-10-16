@@ -8,6 +8,10 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -159,12 +163,57 @@ impl SlotMap {
     }
 }
 
+/// Voice must not enter tsproto's pending ACK queue on socket pressure.
+fn send_audio_now(
+    con: &mut tsproto::connection::Connection,
+    packet: tsproto_packets::packets::OutPacket,
+    pressure: &AtomicU64,
+) {
+    use std::{
+        future::{Future, poll_fn},
+        pin::pin,
+        task::{Context, Poll, Waker},
+    };
+    con.send_event(&tsproto::connection::Event::SendPacket(&packet));
+    let Ok(packets) = tsproto::packet_codec::PacketCodec::encode_packet(con, packet) else { return };
+    let mut cx = Context::from_waker(Waker::noop());
+    for packet in packets {
+        let write = tokio::task::coop::unconstrained(poll_fn(|cx| con.poll_send_udp_packet(cx, &packet)));
+        match pin!(write).poll(&mut cx) {
+            Poll::Ready(Ok(())) => con.resender.handle_loss_outgoing(&packet),
+            Poll::Pending => {
+                pressure.fetch_add(1, Ordering::Relaxed);
+            }
+            Poll::Ready(Err(error)) => tracing::debug!(%error, "TeamSpeak voice UDP write failed"),
+        }
+    }
+}
+
+/// Encoded microphone audio retains its original capture time across both queues.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TsMicrophone {
+    pub captured_at: std::time::Instant,
+    pub opus: Vec<u8>,
+}
+
+impl TsMicrophone {
+    fn fresh_at(&self, now: std::time::Instant, dropped: &AtomicU64) -> bool {
+        if now.saturating_duration_since(self.captured_at) > crate::voice::io::MAX_CAPTURE_AGE {
+            dropped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+}
+
 /// Cloneable request handle, mirroring [`crate::Connection::request`].
 #[derive(Clone)]
 pub struct TsHandle {
     requests: mpsc::Sender<(Request, oneshot::Sender<Result<Value, ErrorBody>>)>,
     /// Encoded microphone frames; an empty frame ends the talk spurt.
-    pub audio_out: mpsc::Sender<Vec<u8>>,
+    pub audio_out: mpsc::Sender<TsMicrophone>,
+    pub audio_stale_dropped: Arc<AtomicU64>,
+    pub audio_socket_pressure: Arc<AtomicU64>,
 }
 
 pub struct TsConnected {
@@ -620,10 +669,17 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
     };
 
     let (request_tx, mut requests) = mpsc::channel(64);
-    let (audio_out, mut mic) = mpsc::channel::<Vec<u8>>(64);
+    let (audio_out, mut mic) = mpsc::channel::<TsMicrophone>(64);
     let (events_tx, events) = mpsc::channel(1024);
     let (audio_tx, audio_in) = mpsc::channel(512);
-    let handle = TsHandle { requests: request_tx, audio_out };
+    let audio_stale_dropped = Arc::new(AtomicU64::new(0));
+    let audio_socket_pressure = Arc::new(AtomicU64::new(0));
+    let handle = TsHandle {
+        requests: request_tx,
+        audio_out,
+        audio_stale_dropped: audio_stale_dropped.clone(),
+        audio_socket_pressure: audio_socket_pressure.clone(),
+    };
     if ready.send(Ok(TsConnected { handle, welcome, events, audio_in })).is_err() {
         return;
     }
@@ -637,7 +693,7 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
     enum Step {
         Item(Option<Result<StreamItem, tsclientlib::Error>>),
         Request(Option<PendingRequest>),
-        Mic(Option<Vec<u8>>),
+        Mic(Option<TsMicrophone>),
         Tick,
     }
     loop {
@@ -751,10 +807,15 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
             }
             Step::Mic(None) => break,
             Step::Mic(Some(frame)) => {
+                if !frame.fresh_at(std::time::Instant::now(), &audio_stale_dropped) {
+                    continue;
+                }
                 let packet =
-                    OutAudio::new(&AudioData::C2S { id: mic_packet, codec: CodecType::OpusVoice, data: &frame });
+                    OutAudio::new(&AudioData::C2S { id: mic_packet, codec: CodecType::OpusVoice, data: &frame.opus });
                 mic_packet = mic_packet.wrapping_add(1);
-                let _ = con.send_audio(packet);
+                if let Ok(transport) = con.get_tsproto_client_mut() {
+                    send_audio_now(transport, packet, &audio_socket_pressure);
+                }
             }
             Step::Tick => {
                 let before = talking.len();
@@ -864,5 +925,80 @@ mod tests {
         };
         assert!(matches!(translate(&request, 1, 4), Err(e) if e.code == ErrorCode::Forbidden));
         assert!(matches!(translate(&Request::Ping {}, 1, 4), Ok(None)));
+    }
+}
+
+#[cfg(test)]
+mod capture_age_tests {
+    use super::*;
+    use futures::FutureExt;
+    use std::{
+        io,
+        sync::atomic::{AtomicBool, AtomicUsize},
+        task::{Context, Poll},
+    };
+
+    struct Socket {
+        blocked: Arc<AtomicBool>,
+        sent: Arc<AtomicUsize>,
+    }
+    impl tsproto::connection::Socket for Socket {
+        fn poll_recv_from(
+            &self,
+            _: &mut Context,
+            _: &mut tokio::io::ReadBuf,
+        ) -> Poll<io::Result<std::net::SocketAddr>> {
+            Poll::Pending
+        }
+        fn poll_send_to(&self, _: &mut Context, bytes: &[u8], _: std::net::SocketAddr) -> Poll<io::Result<usize>> {
+            if self.blocked.load(Ordering::Relaxed) {
+                return Poll::Pending;
+            }
+            self.sent.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Ok(bytes.len()))
+        }
+        fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
+            Ok("127.0.0.1:1".parse().unwrap())
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_ts_stall_and_socket_pressure_cannot_replay_old_capture() {
+        let now = std::time::Instant::now();
+        let resumed = now + Duration::from_millis(200);
+        let dropped = AtomicU64::new(0);
+        let pressure = AtomicU64::new(0);
+        let blocked = Arc::new(AtomicBool::new(false));
+        let sent = Arc::new(AtomicUsize::new(0));
+        let mut con = tsproto::connection::Connection::new(
+            true,
+            "127.0.0.1:2".parse().unwrap(),
+            Box::new(Socket { blocked: blocked.clone(), sent: sent.clone() }),
+        );
+        let (tx, mut rx) = mpsc::channel(4);
+        for captured_at in [now, now, resumed] {
+            tx.try_send(TsMicrophone { captured_at, opus: vec![0xf8, 1, 0] }).unwrap();
+        }
+        while let Ok(frame) = rx.try_recv() {
+            if frame.fresh_at(resumed, &dropped) {
+                send_audio_now(
+                    &mut con,
+                    OutAudio::new(&AudioData::C2S { id: 0, codec: CodecType::OpusVoice, data: &frame.opus }),
+                    &pressure,
+                );
+            }
+        }
+        assert_eq!(dropped.load(Ordering::Relaxed), 2);
+        assert_eq!(sent.load(Ordering::Relaxed), 1);
+        blocked.store(true, Ordering::Relaxed);
+        send_audio_now(
+            &mut con,
+            OutAudio::new(&AudioData::C2S { id: 1, codec: CodecType::OpusVoice, data: &[0xf8, 1, 0] }),
+            &pressure,
+        );
+        assert_eq!(pressure.load(Ordering::Relaxed), 1);
+        blocked.store(false, Ordering::Relaxed);
+        let _ = con.next().now_or_never();
+        assert_eq!(sent.load(Ordering::Relaxed), 1, "socket recovery must not flush old audio");
     }
 }

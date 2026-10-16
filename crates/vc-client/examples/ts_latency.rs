@@ -29,7 +29,11 @@ async fn main() -> anyhow::Result<()> {
     let mut samples = Vec::new();
     for _ in 0..frames {
         let sent = Instant::now();
-        speaker.handle.audio_out.send(frame.clone()).await?;
+        speaker
+            .handle
+            .audio_out
+            .send(vc_client::teamspeak::TsMicrophone { captured_at: std::time::Instant::now(), opus: frame.clone() })
+            .await?;
         match tokio::time::timeout(Duration::from_millis(500), listener.audio_in.recv()).await {
             Ok(Some(_)) => samples.push(sent.elapsed()),
             _ => println!("frame lost"),

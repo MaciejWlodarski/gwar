@@ -428,6 +428,7 @@ async fn s6_payload_boundaries(
 
     let origin = server.running.core.audio_origin(admin.welcome.session).await.unwrap();
     let frame = AudioPacket {
+        admitted_at: std::time::Instant::now(),
         origin: origin.clone(),
         payload: Arc::from([0xf8, 21, 1]),
         kind: AudioKind::Audio,
@@ -558,6 +559,7 @@ async fn s6_controlled_routes(
     assert_eq!(peer.receive().await.payload[1], 47);
     let ssrc = peer.ssrc;
     let packet = |marker, egress: Arc<AudioRoute>| AudioPacket {
+        admitted_at: std::time::Instant::now(),
         origin: origin.clone(),
         payload: Arc::from([0xf8, marker, 1]),
         kind: AudioKind::Audio,
