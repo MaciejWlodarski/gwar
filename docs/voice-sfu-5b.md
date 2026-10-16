@@ -625,7 +625,10 @@ crossing +2 ms is also INCONCLUSIVE.
 
 ## Latency results and decision
 
-**Overall: INCONCLUSIVE — the latency acceptance gate is not passed.**
+> **Superseded by the [quiet-machine re-run](#quiet-machine-re-run-2026-10-16-evening)
+> below.** The morning series is kept as recorded.
+
+**Overall (morning series): INCONCLUSIVE — the latency acceptance gate is not passed.**
 Every condition is inconclusive: eight lack the required uncontended pairs;
 mixed has four pairs but its interval still reaches +3.60 ms. No condition
 can be promoted to PASS from a favorable pooled point estimate.
@@ -801,3 +804,105 @@ absent. The temporary baseline worktree and its separate target were removed
 after measurement; the temporary candidate target was also removed after
 archiving the executables. Existing processes were left alone. Only this
 results document was committed, with no push or production-code change.
+
+## Quiet-machine re-run (2026-10-16 evening)
+
+The owner asked for the gate again on a quiet Mac. Each run below uses the
+same method and guard policy as the morning series above, with three
+differences:
+
+- Every slot is guarded from the first one.
+- The total cap is 180 minutes.
+- The archived morning executables `/tmp/gwar-5b-gate/binaries/latency-{baseline,candidate}`
+  are reused unchanged; their SHA-256 hashes match the ones recorded above.
+
+Raw data:
+
+- full series (17:16–18:28 UTC): `/tmp/gwar-5b-gate2/`;
+- CPU repeat (18:30–18:40 UTC): `/tmp/gwar-5b-gate2-cpu/`;
+- `main` comparison (20:15–20:35 UTC): `/tmp/gwar-main-gate/`.
+
+### Full series: 5b against the pre-step baseline
+
+All 140 attempts ran uncontended and every one matched at least 95/100
+markers. B is `b0c6e6b` plus the #54 fix; C is the 5b head `2c03f3f`.
+
+| Condition | Pairs | Matched B / C | p95 B / C (ms) | Added p95; paired 95% interval | PLC B / C | Underruns B / C | Decision |
+| --- | ---: | --- | --- | --- | --- | --- | --- |
+| idle | 20 | 2000 / 2000 | 47.49 / 51.42 | +3.93; [−0.24, +6.86] | 3 / 7 | 0 / 0 | INCONCLUSIVE |
+| loss | 4 | 400 / 400 | 47.34 / 42.62 | −4.72; [−7.59, +0.38] | 244 / 245 | 0 / 0 | PASS |
+| reorder | 4 | 400 / 400 | 50.01 / 48.94 | −1.07; [−2.02, +0.16] | 64 / 68 | 0 / 0 | PASS |
+| burst | 4 | 398 / 396 | 47.71 / 48.01 | +0.30; [−1.34, +8.79] | 194 / 195 | 0 / 0 | INCONCLUSIVE |
+| stall | 4 | 396 / 396 | 54.50 / 48.81 | −5.69; [−6.29, +1.07] | 43 / 42 | 0 / 0 | PASS |
+| jitter | 10 | 1000 / 1000 | 49.60 / 49.77 | +0.17; [−0.14, +0.50] | 8 / 2 | 0 / 0 | PASS |
+| callbacks | 10 | 1000 / 1000 | 80.00 / 79.56 | −0.44; [−0.77, +0.26] | 17 / 12 | 0 / 0 | PASS |
+| mixed | 4 | 385 / 385 | 78.78 / 70.65 | −8.13; [−8.46, +0.39] | 409 / 424 | 0 / 0 | PASS |
+| cpu | 10 | 1000 / 1000 | 52.09 / 113.95 | +61.86; [−4.65, +69.93] | 5 / 14 | 0 / 4 | FAIL (rule) |
+
+**Idle.** Per-run p95 values cluster around ≈40, ≈47 and 50–55 ms in both
+variants, and the cluster correlates with how much startup depth the receiver
+trimmed (mostly 0, 360 or 600 samples; candidate runs also show 262, 480 and
+720). `jitter.rs`/`playout.rs` are identical in both builds. Candidate runs
+fell in the top cluster 4 of 20 times, baseline runs 1 of 20, which accounts
+for the +3.93 ms. With paired per-run p95 differences ranging from −8.59 to
++15.54 ms, 20 pairs cannot resolve a 2 ms bound in either direction.
+
+**CPU.** The four candidate underruns occurred in two adjacent runs (slots 14
+and 15, three and one) spanning about one minute (18:24:12–18:25:13 UTC); the
+neighbouring baseline slot 13 also shows queue growth and PLC. In the repeat
+(10 pairs, uncontended) the candidate had no underruns but the comparison was
+again inconclusive: added p95 +18.80 ms, interval [−8.58, +29.89], with two
+candidate runs ending with large packet queues (1920 and 2400 samples).
+
+### Diagnosis of the CPU-load queues
+
+Temporary gap counters at the sender's RTP write, SFU ingest, SFU forward and
+receiver arrival were added to both builds; they are not committed. Each build
+then ran 12 times under the six busy loops. The counters are aggregates per
+run (count of gaps above 25/40/80 ms and the maximum); they cannot follow an
+individual gap through the path. Receive gaps above 25 ms (six in total) mostly
+coincide with send gaps of 25–45 ms in the same run (four in total). Two runs
+had receive gaps without a send gap above 25 ms: `run-18-cand` (send max
+18.6 ms, receive 27.2 ms) and `run-08-base` (send max 23.0 ms, ingest/forward
+27.7 ms, receive 29.1 ms). At the receiver a late packet starves playout, PLC
+holds the timeline, and the extra depth stays until trimmed. In this sample the
+baseline had the worst run (p95 79.49 ms, final queue 1920 samples, PLC 3).
+
+Capture/send-thread starvation shared by both builds is therefore a plausible
+mechanism for the CPU-profile queues. These measurements do not exclude a 5b
+scheduling contribution: the 5b-only CPU comparisons remain FAIL (by rule) and
+INCONCLUSIVE. #55 (`fbdf23c`) targets this mechanism by dropping capture older
+than 50 ms and recovering receiver surplus under recurring PLC.
+
+### Current main against the pre-step baseline
+
+C is now `main` at `83b7db4` (5b, #55 and 5c), with 10 pairs per condition.
+"Max final queue" is the largest end-of-run packet queue snapshot, not a
+within-run high-water mark.
+
+| Condition | Pairs | p95 B / C (ms) | Added p95; paired 95% interval | PLC B / C | Underruns | Max final queue B / C (samples) | Decision |
+| --- | ---: | --- | --- | --- | --- | --- | --- |
+| idle | 9 | 49.85 / 49.34 | −0.51; [−4.50, +4.74] | 4 / 4 | 0 / 0 | 960 / 480 | INCONCLUSIVE |
+| cpu | 10 | 62.35 / 50.05 | −12.31; [−17.77, +1.26] | 11 / 14 | 0 / 0 | 960 / 960 | PASS |
+
+One idle slot was marked contended, which leaves nine idle pairs.
+
+### Decision
+
+**The 5b latency gate is still not passed.**
+
+- **5b alone, pass:** loss, reorder, stall, jitter, callback jitter and mixed
+  PASS on a quiet machine.
+- **5b alone, inconclusive or failed:** idle and burst are INCONCLUSIVE. CPU
+  load is FAIL by the underrun rule in the full series and INCONCLUSIVE in the
+  repeat.
+- **What the data does and does not show:** no condition shows a resolved
+  latency addition by 5b, but the idle and CPU data cannot exclude one either.
+- **Current `main`:** it passes the CPU-load comparison against the pre-step
+  baseline (−12.3 ms, upper bound +1.26 ms), with no underruns and no large
+  final queues. Idle remains INCONCLUSIVE (−0.51 ms, [−4.50, +4.74]).
+
+Resolving idle within 2 ms needs one of two things: a method that controls the
+startup-depth level (for example, markers only after the receiver's initial
+trims settle), or a receiver that converges to one level. The 5d latency gate
+inherits this; record it there before measuring SFrame.
