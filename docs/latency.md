@@ -58,6 +58,16 @@ runner clears inherited `LATENCY_*` and `VC_*` settings itself. Both runners
 accept `--minimum-latency-ms` (default 5) and `--extra-delay-ms` (default 0),
 passing these settings explicitly to the client.
 
+`LATENCY_WAIT_CONNECTED=1` waits (at most 30 seconds) for both native transports
+before arming the two-second marker warmup. Carrier audio, capture clocks and
+network impairments still start at the original epoch; no voice queues are
+reset. This separates connected playout loss from audio captured while ICE/DTLS
+is unavailable. JSON records `wait_connected` and `connected_s`; capture and
+playout timestamps retain the original epoch. The default remains the original
+fixed warmup, which includes connection-setup losses. Use the same mode and
+harness source in both builds. The runners clear this variable too, so set it
+in executable wrappers when comparing variants.
+
 To check latency beyond one marker period, delay the audio itself in the fake
 receiver output device:
 
@@ -346,6 +356,83 @@ comparison demonstrates no latency improvement attributable to TSM. These are
 single pairs on a shared Mac, not controlled idle-host measurements. Synthetic
 splice tests did show 39.5--99.98% less normalized magnitude-spectrum error than
 the equal-count skip/fade baseline across all 36 tone/vibrato/phase cases.
+
+Local loss investigation (2026-10-16). The original harness reproduced
+`seed=42;down:loss=2%` at 777/782 ms median/p95 on `21ee239`, versus 47/50 ms
+with seed 1. The older `bdaac83` endpoint also measured 777/783 ms with seed 42,
+so the failure already existed at the October 14 baseline. The earlier runner
+used the same detector, callbacks, 100 markers and environment clearing; its
+seed-1 loss setting explains the healthy result.
+
+The relay impairs handshake packets as well as RTP. A diagnostic seed-42 trace
+dropped downlink flow 0 datagram 3, a DTLS flight, and the native sender wrote
+80 captured frames into str0m before its delayed `Connected` event. Burst loss
+also dropped the next STUN reply and DTLS retry; that trace queued 297 frames.
+The receiver then got about a second of audio in a few milliseconds before its
+first playout. Its 64-packet cap retained old audio and dropped fresh arrivals;
+recurring PLC kept restarting the five-second surplus observation window.
+The target remained 10 ms while the queue stuck near 640 ms.
+
+`f58a0f7` drops native capture while ICE/DTLS/SRTP is unavailable and discards a
+bounded snapshot of pending capture on connection, preserving capture-clock
+timestamps. A real-transport regression sends 100 old frames before allowing
+the handshake: the first received payload must be the fresh frame at timestamp
+48000. It fails before the fix and when the production fix is reverted, then
+passes when restored. A delayed SFU-listener control already passes unchanged.
+The fix changes no jitter/PLC/trim policy or latency constants.
+
+Connection retries can exceed the original two-second marker warmup. An
+original-harness fixed burst run had 37/40 ms median/p95 and a 10 ms final queue,
+but only 81/100 matches, including 17 missing leading markers. The paired
+playout measurements use `LATENCY_WAIT_CONNECTED=1` for both variants: carrier
+and impairments continue through setup, then markers start after connection
+and the normal two-second warmup. Existing queued audio is retained, so the
+baseline failure remains observable. Connection time is recorded separately;
+these matching results measure connected playout, not connection availability.
+
+Paired check: production baseline `21ee239` and candidate `f58a0f7`, both
+with the identical optional harness change, 100 markers × four runs per
+variant in ABBAABBA order for each profile. Apple M5, macOS 27.0, Rust 1.99.0,
+Opus 1.6.1; sequential loopback runs on a shared interactive host, with no
+concurrent task builds/tests. Seed 42 is used except the explicit seed-1 row
+and the documented unseeded upstream stall. Values are baseline / candidate.
+Quantiles pool all matched markers, including failed runs; PLC and underruns
+sum four runs, and final packet-queue sizes show the four-run range.
+
+| Profile | Median ms | p95 ms | p99 ms | Matched /400 | PLC | Underruns | Final queue ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Idle | 42.46 / 41.80 | 47.82 / 47.44 | 49.77 / 48.64 | 400 / 400 | 0 / 0 | 0 / 0 | 0 / 0–10 |
+| Loss 2%, seed 42 | 777.19 / 37.87 | 781.87 / 118.03 | 784.72 / 118.97 | 381 / 400 | 1695 / 250 | 0 / 3 | 620–640 / 0–60 |
+| Loss 2%, seed 1 | 37.60 / 37.49 | 67.29 / 57.65 | 68.32 / 67.22 | 400 / 400 | 256 / 253 | 1 / 1 | 10–30 / 10–20 |
+| Burst 3@0.5% | 866.58 / 38.72 | 872.29 / 48.26 | 872.98 / 49.22 | 344 / 396 | 2757 / 193 | 0 / 0 | 630–640 / 10 |
+| Reorder 0.5% | 37.33 / 37.33 | 46.73 / 39.26 | 48.96 / 47.34 | 400 / 400 | 64 / 66 | 0 / 0 | 0–20 / 10–20 |
+| Jitter 10 ms | 47.40 / 47.32 | 59.17 / 48.91 | 67.98 / 49.45 | 400 / 400 | 8 / 4 | 0 / 0 | 20–30 / 10–20 |
+| Upstream stall 270 ms | 42.33 / 38.17 | 47.73 / 47.74 | 48.89 / 49.29 | 396 / 396 | 40 / 43 | 0 / 0 | 0–10 / 10–20 |
+| Mixed (documented spec) | 68.69 / 67.44 | 797.23 / 77.39 | 799.31 / 78.73 | 371 / 386 | 759 / 410 | 0 / 0 | 10–20 / 10 |
+
+All 32 candidate runs passed the ≥95% matching gate (3178/3200 markers);
+24/32 baseline runs passed (3092/3200). The runner's fail-fast errors were kept,
+then each unattempted slot in the original order was run once and validated
+with the same gate. Nothing was retried or excluded. One seed-42 candidate
+run measured 117 ms median with three output underruns, 25 ms speaker
+headroom, 60 ms queued packets and 5 ms staged PCM. It contributes the 118 ms
+pooled tail. Whether that residual reflects shared-host scheduling alone or
+also warrants a separate recovery-policy change remains open; the fix does
+not establish an unconditional tens-of-ms bound after scheduling misses.
+Other final staged tails were 0–7.5 ms, and speaker queues were 20 ms except
+underrun cases (25–35 ms). These are virtual-device results.
+
+Raw CSV/JSON, logs, exact per-profile commands, wrapper environment settings,
+binary/source hashes, original-harness reproductions, handshake traces and the
+common baseline harness patch are retained in
+`/private/tmp/gwar-playout-loss-latency/`; `matrix.py` invokes `run_local.py`
+with `--markers 100 --runs 4`, and `analysis.json` retains every run's counters
+and final queue/staged/speaker sizes. The two temporary historical/baseline
+worktrees and their targets were removed. Formatting and workspace Clippy
+with `-D warnings` passed; workspace tests: 641 passed, 0 failed, 7 ignored
+(TeamSpeak fixtures disabled); latency-example tests: 16 passed. The native
+regression passed after restoration and failed on both the original code and
+the explicit revert-fix mutation.
 
 For a variable output device, invoke the example directly with
 `LATENCY_CALLBACK_JITTER=1 target/release/examples/latency output.csv 100`.

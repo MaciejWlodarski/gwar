@@ -176,6 +176,10 @@ struct RtcClient {
 }
 
 async fn rtc_client(ws: &mut Ws) -> RtcClient {
+    rtc_client_after(ws, None).await
+}
+
+async fn rtc_client_after(ws: &mut Ws, wait: Option<tokio::sync::oneshot::Receiver<()>>) -> RtcClient {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let local = socket.local_addr().unwrap();
     let mut rtc = Rtc::builder()
@@ -197,6 +201,9 @@ async fn rtc_client(ws: &mut Ws) -> RtcClient {
     let (received_tx, received) = mpsc::channel(256);
     let (connected_tx, connected) = mpsc::channel(1);
     tokio::spawn(async move {
+        if let Some(wait) = wait {
+            wait.await.unwrap();
+        }
         let mut buf = vec![0u8; 2048];
         loop {
             let deadline = loop {
@@ -264,6 +271,50 @@ async fn drain(client: &mut RtcClient, for_ms: u64) -> Vec<Received> {
         out.push(item);
     }
     out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connecting_listener_does_not_receive_a_backlog_after_the_handshake() {
+    let running = server().await;
+    let mut alice = Ws::connect(running.http, "alice").await;
+    let mut bob = Ws::connect(running.http, "bob").await;
+    let mut carol = Ws::connect(running.http, "carol").await;
+    alice.request("channel.join", json!({"channel": 1})).await;
+    bob.request("channel.join", json!({"channel": 1})).await;
+    carol.request("channel.join", json!({"channel": 1})).await;
+    let mut a = rtc_client(&mut alice).await;
+    timeout(WAIT, a.connected.recv()).await.unwrap().unwrap();
+    let mut c = rtc_client(&mut carol).await;
+    timeout(WAIT, c.connected.recv()).await.unwrap().unwrap();
+    let (release, wait) = tokio::sync::oneshot::channel();
+    let mut b = rtc_client_after(&mut bob, Some(wait)).await;
+
+    // Negotiate Bob's slots but hold ICE/DTLS while Alice speaks. These frames
+    // cannot be played live and must not be queued in the SFU's SRTP writer.
+    // Carol, already connected, proves the SFU forwarded the last old frame
+    // before Bob's handshake is released.
+    speak(&a, 1, 20, -10).await;
+    timeout(WAIT, async {
+        while let Some((_, payload, _, _)) = c.received.recv().await {
+            if payload[1] == 1 && payload[2] == 19 {
+                return;
+            }
+        }
+        panic!("observer stopped receiving");
+    })
+    .await
+    .unwrap();
+    release.send(()).unwrap();
+    timeout(WAIT, b.connected.recv()).await.unwrap().unwrap();
+    for i in 20..23 {
+        a.commands
+            .send(Cmd::Send { payload: vec![0xf8, 2, i as u8, 0x55, 0xaa], ticks: i * 960, level: -10 })
+            .await
+            .unwrap();
+    }
+    let (_, payload, _, generation) = timeout(WAIT, b.received.recv()).await.unwrap().unwrap();
+    assert_eq!(payload[1], 2, "listener received audio captured before its transport connected");
+    assert_eq!(generation, Some(1));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

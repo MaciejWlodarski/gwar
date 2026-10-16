@@ -52,6 +52,8 @@ struct Settings {
     extra_delay_ms: usize,
     /// Receiver callbacks cycle through 10/20/5 ms (`LATENCY_CALLBACK_JITTER=1`).
     callback_jitter: bool,
+    /// Arm markers after both transports connect; keep carrier/impairments running.
+    wait_connected: bool,
 }
 impl Settings {
     fn from_env() -> anyhow::Result<Self> {
@@ -78,7 +80,13 @@ impl Settings {
             Err(std::env::VarError::NotPresent) => false,
             _ => anyhow::bail!("LATENCY_CALLBACK_JITTER must be 0 or 1"),
         };
-        Ok(Self { minimum_ms, extra_delay_ms, callback_jitter })
+        let wait_connected = match std::env::var("LATENCY_WAIT_CONNECTED") {
+            Ok(value) if value == "1" => true,
+            Ok(value) if value == "0" => false,
+            Err(std::env::VarError::NotPresent) => false,
+            _ => anyhow::bail!("LATENCY_WAIT_CONNECTED must be 0 or 1"),
+        };
+        Ok(Self { minimum_ms, extra_delay_ms, callback_jitter, wait_connected })
     }
 }
 
@@ -227,6 +235,7 @@ struct Measurements {
     underflows: usize,
 }
 struct FakeIo {
+    markers_ready: Arc<AtomicBool>,
     data: Arc<Mutex<Measurements>>,
     tone: bool,
     epoch: Instant,
@@ -268,26 +277,31 @@ impl AudioIo for FakeIo {
             // Capture/playout timestamps always remain the actual callback times.
             let mut delay = DelayLine::new(self.delay_samples);
             let mut callback = 0;
+            let mut marker_start = None;
             while !thread_stop.load(Ordering::Relaxed) {
                 let block = if self.callback_jitter { [480, 960, 240][callback % 3] } else { BLOCK };
                 let mut missing = 0;
                 let now = Instant::now();
+                if marker_start.is_none() && self.markers_ready.load(Ordering::Acquire) {
+                    marker_start = Some(position + WARMUP);
+                }
+                let warmup = marker_start.unwrap_or(usize::MAX);
                 let mut data = self.data.lock().unwrap();
                 for i in 0..block {
                     let at = position + i;
                     let in_marker =
-                        at >= WARMUP && (at - WARMUP) / PERIOD < self.count && (at - WARMUP) % PERIOD < MARKER;
+                        at >= warmup && (at - warmup) / PERIOD < self.count && (at - warmup) % PERIOD < MARKER;
                     if self.tone
-                        && at >= WARMUP
-                        && (at - WARMUP).is_multiple_of(PERIOD)
+                        && at >= warmup
+                        && (at - warmup).is_multiple_of(PERIOD)
                         && data.captures.len() < self.count
                     {
                         data.captures.push(Marker {
                             capture_s: (now - self.epoch).as_secs_f64() + i as f64 / RATE as f64,
-                            identity: (at - WARMUP) / PERIOD % TONES.len(),
+                            identity: (at - warmup) / PERIOD % TONES.len(),
                         });
                     }
-                    let frequency = if in_marker { TONES[(at - WARMUP) / PERIOD % TONES.len()] } else { 400.0 };
+                    let frequency = if in_marker { TONES[(at - warmup) / PERIOD % TONES.len()] } else { 400.0 };
                     let amplitude = if in_marker { 0.6 } else { 0.08 };
                     let value = if self.tone {
                         (at as f64 * frequency * std::f64::consts::TAU / RATE as f64).sin() as f32 * amplitude
@@ -489,11 +503,13 @@ async fn run(
     } else {
         server_addr
     };
+    let markers_ready = Arc::new(AtomicBool::new(!settings.wait_connected));
     let sent = Arc::new(Mutex::new(Measurements::default()));
     let heard = Arc::new(Mutex::new(Measurements::default()));
     let va = voice::start(
         &a.connection,
         Box::new(FakeIo {
+            markers_ready: markers_ready.clone(),
             data: sent.clone(),
             tone: true,
             epoch,
@@ -508,6 +524,7 @@ async fn run(
     let vb = voice::start(
         &b.connection,
         Box::new(FakeIo {
+            markers_ready: markers_ready.clone(),
             data: heard.clone(),
             tone: false,
             epoch,
@@ -519,6 +536,25 @@ async fn run(
         media_addr,
     )
     .await?;
+    let connected_s = if settings.wait_connected {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let links = [va.stats().link, vb.stats().link];
+                anyhow::ensure!(!links.contains(&voice::LinkState::Lost), "voice lost while waiting to arm markers");
+                if links.iter().all(|link| *link == voice::LinkState::Connected) {
+                    return Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("voice did not connect within 30 seconds")??;
+        let at = epoch.elapsed().as_secs_f64();
+        markers_ready.store(true, Ordering::Release);
+        Some(at)
+    } else {
+        None
+    };
     tokio::time::sleep(Duration::from_secs_f64(
         3.0 + count as f64 * PERIOD as f64 / RATE as f64 + MATCH_WINDOW_MS / 1000.0,
     ))
@@ -594,6 +630,8 @@ async fn run(
         .collect::<Vec<_>>();
     let metadata = serde_json::json!({
         "network": network,
+        "wait_connected": settings.wait_connected,
+        "connected_s": connected_s,
         "voice_events": voice_events,
         "markers": marker_count,
         "n": count,
