@@ -281,6 +281,21 @@ describe("staying on the server without voice", () => {
     expect(link.sent("channel.join")).toHaveLength(0);
   });
 
+  it("an older move completing does not cancel a newer encrypted join", async () => {
+    connectFake({ channel: 1, encrypted: [3] });
+    await vi.advanceTimersByTimeAsync(10);
+    let finish!: (ok: boolean) => void;
+    engine.capabilities.encryptedVoice = () => new Promise<boolean>(resolve => { finish = resolve; });
+    const joining = controller.joinChannel(3);
+    // The earlier move to plaintext channel 2 completes meanwhile.
+    link.emit({ ev: "client.updated", d: client(1, 2) });
+    await vi.advanceTimersByTimeAsync(10);
+    finish(true);
+    await joining;
+    await vi.advanceTimersByTimeAsync(10);
+    expect(link.sent("channel.join").at(-1)?.d).toMatchObject({ channel: 3 });
+  });
+
   it("a refused forced move into an encrypted channel offers Retry", async () => {
     connectFake({ channel: 1, encrypted: [2] });
     await vi.advanceTimersByTimeAsync(10);

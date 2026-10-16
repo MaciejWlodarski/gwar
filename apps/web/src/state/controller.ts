@@ -802,7 +802,8 @@ class Controller {
 
   /** Stops audio and releases the microphone; I stay on the server. */
   private async stopVoice(): Promise<void> {
-    this.joinAttempt++;
+    // Media teardown only: an older move finishing must not cancel a newer
+    // join intent (user actions bump joinAttempt themselves).
     const run = ++this.voiceRun;
     if (this.voiceRetry) clearTimeout(this.voiceRetry);
     this.voiceRetry = null;
