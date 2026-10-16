@@ -11,6 +11,7 @@
 //! travels over the WebSocket: `voice.offer` negotiates a WebRTC session whose
 //! receive transceivers are fixed "speaker slots" announced through `voice.slot`.
 
+pub mod opus;
 #[cfg(feature = "rtp")]
 pub mod rtp;
 

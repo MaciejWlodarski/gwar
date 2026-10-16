@@ -2354,3 +2354,156 @@ async fn voice_leaf_expiry_detaches_only_that_mapping_and_proposes_removal() {
     let fresh = participation(&mut a, channel).await;
     assert_ne!(fresh["participation"], a_state["participation"]);
 }
+
+#[tokio::test]
+async fn voice_opaque_srtp_and_unknown_ssrc_churn_preserve_the_admitted_stream() {
+    let server = TestServer::start().await;
+    let mut first = Device::new(1, 11);
+    let mut second = Device::new(2, 21);
+    let mut a = connect_device(&server, &first).await;
+    let mut b = connect_device(&server, &second).await;
+    a.ok("token.redeem", json!({"token":server.admin_token})).await;
+    let channel = channel_id(&a.create_channel(json!({"name":"opaque","encrypted":true})).await);
+    let parent = create_channel_group(&mut a, &mut first, channel, true, 91).await.unwrap();
+    join_channel(&server, &mut b, &mut second, &parent).await;
+    let a_state = participation(&mut a, channel).await;
+    let b_state = participation(&mut b, channel).await;
+    first = Device::new(1, 11);
+    second = Device::new(2, 21);
+    let d = voice_descriptor(&first, channel, &parent, &a.server_key, 92);
+    first.create(&d, &a.server_key);
+    let group=a.ok("mls.group.create",json!({"conversation":d.descriptor.conversation,"group_info":b64(&first.group_info()),"voice":voice_binding(&a_state)})).await["group"].as_str().unwrap().to_owned();
+    let joined = join_voice(&server, &mut b, &mut second, &group, &b_state).await;
+    first.process(&joined.0);
+    let source = common::rtc::Peer::start(&mut a, 1).await;
+    let mut receiver = common::rtc::Peer::start(&mut b, 1).await;
+    let ciphertext = vec![0xff; 1033];
+    source.send(65535, u32::MAX - 959, ciphertext.clone()).await;
+    let initial = receiver.receive().await;
+    assert_eq!(initial.payload, ciphertext);
+    assert_eq!(initial.ticks, 48_000);
+    // Each unknown stream has valid SRTP and the negotiated mic MID. A first
+    // packet must never choose the admitted SSRC or allocate its ordering state.
+    for ssrc in 100..356u32 {
+        if ssrc == source.ssrc {
+            continue;
+        }
+        source
+            .tx
+            .send(common::rtc::Send { ssrc, sequence: 1, ticks: 0, payload: vec![0xf8, 77], level: -20 })
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    }
+    receiver.silent().await;
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    server
+        .running
+        .plane
+        .webrtc
+        .send(vc_server::media::webrtc::MediaCmd::Inspect {
+            session: a.welcome.session,
+            probe_ssrcs: (100..356).collect(),
+            reply,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        rx.await.unwrap().unwrap().registered_probe_ssrcs,
+        0,
+        "unknown SSRC replaced negotiated transport state"
+    );
+    source.send(65536, 0, ciphertext.clone()).await;
+    let next = receiver.receive().await;
+    assert_eq!(next.payload, ciphertext);
+    assert_eq!(next.ticks, 48_960);
+    assert_eq!(next.generation, initial.generation);
+    // Inspect actual str0m receive state, not just what survived the post-SRTP gate.
+    let snapshot = async {
+        loop {
+            let (reply, rx) = tokio::sync::oneshot::channel();
+            server
+                .running
+                .plane
+                .webrtc
+                .send(vc_server::media::webrtc::MediaCmd::Inspect {
+                    session: a.welcome.session,
+                    probe_ssrcs: (100..356).collect(),
+                    reply,
+                })
+                .await
+                .unwrap();
+            let state = rx.await.unwrap().unwrap();
+            if state.counters.rtp_unknown_ssrc > 0 && state.rtcp_reports > 0 {
+                break state;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(5), snapshot)
+        .await
+        .expect("unknown churn and SRTCP sender report");
+    assert_eq!(snapshot.registered_probe_ssrcs, 0, "unknown SRTP allocated str0m transport state");
+
+    source.send(65537, 960, vec![0xff; 1034]).await;
+    receiver.silent().await;
+    source.send(65538, 960, vec![]).await;
+    receiver.silent().await;
+    source.send(65539, 960, vec![0xff, 0]).await;
+    assert_eq!(receiver.receive().await.payload, [0xff, 0]);
+    // Gross oversize input must be rejected before str0m allocates its payload.
+    let (reply, before) = tokio::sync::oneshot::channel();
+    server
+        .running
+        .plane
+        .webrtc
+        .send(vc_server::media::webrtc::MediaCmd::Inspect { session: a.welcome.session, probe_ssrcs: vec![], reply })
+        .await
+        .unwrap();
+    let before = before.await.unwrap().unwrap().counters.rtp_oversize_datagram;
+    source.send(65540, 1920, vec![0xff; 1500]).await;
+    receiver.silent().await;
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    server
+        .running
+        .plane
+        .webrtc
+        .send(vc_server::media::webrtc::MediaCmd::Inspect { session: a.welcome.session, probe_ssrcs: vec![], reply })
+        .await
+        .unwrap();
+    assert_eq!(rx.await.unwrap().unwrap().counters.rtp_oversize_datagram, before + 1);
+
+    #[cfg(feature = "test-hooks")]
+    {
+        use vc_server::media::webrtc::MediaCmd;
+        let (reply, held) = tokio::sync::oneshot::channel();
+        server.running.plane.webrtc.send(MediaCmd::HoldNext { session: a.welcome.session, reply }).await.unwrap();
+        // Inspect is an actor barrier: the hold is installed before sending RTP.
+        let (reply, barrier) = tokio::sync::oneshot::channel();
+        server
+            .running
+            .plane
+            .webrtc
+            .send(MediaCmd::Inspect { session: a.welcome.session, probe_ssrcs: vec![], reply })
+            .await
+            .unwrap();
+        barrier.await.unwrap();
+        source.send(65541, 2880, vec![0xff, 71]).await;
+        let queued = tokio::time::timeout(std::time::Duration::from_secs(3), held).await.unwrap().unwrap();
+        assert_eq!(&*queued.payload, &[0xff, 71]);
+        receiver.silent().await;
+        a.ok("channel.join", json!({"channel":1})).await;
+        let fresh_state = participation(&mut a, channel).await;
+        let mut rejoining = Device::new(1, 11);
+        join_voice(&server, &mut a, &mut rejoining, &group, &fresh_state).await;
+        let fresh = common::rtc::Peer::start(&mut a, 2).await;
+        assert_ne!(
+            queued.origin.binding.participation,
+            server.running.core.audio_origin(a.welcome.session).await.unwrap().binding.participation
+        );
+        server.running.plane.webrtc.send(MediaCmd::Forward(queued)).await.unwrap();
+        receiver.silent().await;
+        fresh.send(0, 0, vec![0xff, 72]).await;
+        assert_eq!(receiver.receive().await.payload, [0xff, 72]);
+    }
+}

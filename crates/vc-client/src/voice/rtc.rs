@@ -85,6 +85,7 @@ where
         let _lost = LostOnDrop(counters.clone());
         let mut buf = vec![0u8; 2048];
         let mut last_ticks = None;
+        let offset = rand::random::<u32>();
         let mut sequence = u64::from(rand::random::<u16>()); // RFC 3550 §5.1
         loop {
             let deadline = loop {
@@ -149,11 +150,14 @@ where
                     if !rtc.is_connected() {
                         continue;
                     }
-                    let ticks = send_ticks(frame.capture_position, last_ticks);
+                    let Some(ticks) = send_ticks(frame.capture_position, last_ticks) else {
+                        counters.capture_position_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    };
                     last_ticks = Some(ticks);
                     if let Some(stream) = rtc.direct_api().stream_tx_by_mid(mic, None) {
                         let ext_vals = ExtensionValues { audio_level: Some(frame.level), voice_activity: Some(frame.speech), ..Default::default() };
-                        let write = RtpWrite::new(pt, sequence.into(), ticks as u32, Instant::now(), frame.opus);
+                        let write = RtpWrite::new(pt, sequence.into(), (ticks as u32).wrapping_add(offset), Instant::now(), frame.opus);
                         stream.write_rtp(write.ext_vals(ext_vals));
                         sequence += 1;
                     }
@@ -177,8 +181,8 @@ where
 }
 
 // Capture advances through gates and queue drops. Defend against faulty custom I/O.
-fn send_ticks(capture_position: u64, last: Option<u64>) -> u64 {
-    capture_position.max(last.map_or(0, |ticks| ticks + super::FRAME as u64))
+fn send_ticks(capture_position: u64, last: Option<u64>) -> Option<u64> {
+    last.is_none_or(|previous| capture_position > previous).then_some(capture_position)
 }
 
 // str0m discards extmap directions. Read the answerer's (server's) direction
@@ -292,21 +296,31 @@ mod tests {
                 .send(Outgoing { capture_position: 48_000, opus: vec![0xf0, 2], level: -10, speech: true })
                 .await
                 .unwrap();
-            received.recv().await.unwrap()
+            let first = received.recv().await.unwrap();
+            outgoing
+                .send(Outgoing { capture_position: 48_960, opus: vec![0xf0, 3], level: -10, speech: true })
+                .await
+                .unwrap();
+            (first, received.recv().await.unwrap())
         })
         .await;
         task.abort();
         let _ = task.await;
-        assert_eq!(result.unwrap(), (48_000, vec![0xf0, 2]), "pre-connection capture must never enter SRTP");
+        let (first, next) = result.unwrap();
+        assert_eq!(first.1, vec![0xf0, 2], "pre-connection capture must never enter SRTP");
+        assert_eq!(next.1, vec![0xf0, 3]);
+        // 5b adds a random run offset; capture-clock deltas remain exact.
+        assert_eq!(next.0.wrapping_sub(first.0), 960);
     }
 
     #[test]
     fn timestamp_quantum_tracks_capture_and_batches_do_not_reuse_ticks() {
         let frame = super::super::FRAME as u64;
-        assert_eq!(send_ticks(0, None), 0);
-        assert_eq!(send_ticks(0, Some(0)), frame);
-        assert_eq!(send_ticks(960, Some(frame)), 960.max(2 * frame));
-        assert_eq!(send_ticks(48_000, Some(960)), 48_000);
+        assert_eq!(send_ticks(0, None), Some(0));
+        assert_eq!(send_ticks(0, Some(0)), None);
+        assert_eq!(send_ticks(100, Some(480)), None);
+        assert_eq!(send_ticks(960, Some(frame)), Some(960));
+        assert_eq!(send_ticks(48_000, Some(960)), Some(48_000));
     }
 
     #[test]

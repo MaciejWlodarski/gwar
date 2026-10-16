@@ -1192,16 +1192,19 @@ limit (about 300 devices):
 
 ## 5. Encrypted voice
 
-Status: **5a built; 5b–5d specified, not built**. Voice MLS rules, volatile
-calls, session takeover, bound negotiation and epoch acknowledgements are
-implemented. Encrypted audio remains unavailable with the calm notice below;
-plaintext voice and TeamSpeak keep their existing media formats. See
-[the 5a implementation report](voice-calls-5a.md) for coverage and validation.
+Status: **5a–5b built; 5c–5d specified, not built**. Voice MLS rules, volatile
+calls, bound negotiation, opaque SFU forwarding and origin-preserving
+TeamSpeak queues are implemented. Encrypted audio remains unavailable in
+both clients with the calm notice below. Plaintext voice and TeamSpeak keep
+their existing media formats. See the [5a report](voice-calls-5a.md) and
+[5b report](voice-sfu-5b.md) for coverage, validation and acceptance still pending.
 
-RTP ingest still inspects Opus and forgets retired SSRCs. Native capture
-positions and variable-duration playout already exist. Native WebRTC keeps
-10 ms packets; browsers keep 20 ms. The remaining steps add SFrame and opaque
-forwarding without changing packetization.
+RTP admission binds the negotiated microphone SSRC and retains retired SSRCs.
+Native capture positions drive RTP time; per-source generations and previous
+packet spans protect SFU re-anchors. Native WebRTC keeps 10 ms packets and
+browsers keep 20 ms. The remaining steps add client SFrame without changing
+packetization. Official-server isolation execution belongs to CI; compilation
+and local boundary tests alone do not establish that acceptance.
 
 Four pull requests, in order:
 

@@ -805,8 +805,6 @@ impl Core {
                 return Err(bad("remote session has no WebRTC transport"));
             }
             if c.parent.is_some() {
-                // The control plane can negotiate, but encrypted calls are
-                // excluded from audio routing until the opaque SFU step.
                 if c.group.as_ref().is_none_or(|g| Some(&g.id) != offer.group.as_ref()) {
                     return Err(bad("voice group mismatch"));
                 }
@@ -840,7 +838,9 @@ impl Core {
             if s.used_ssrcs.contains(&offer.ssrc) {
                 return Err(err(ErrorCode::Conflict, "ssrc_reused"));
             }
-            if s.used_ssrcs.len() >= 33 {
+            // Replacement retires the active run too. Reserve room for the new
+            // SSRC to retire on failure, stop or move; never retain a 33rd.
+            if s.used_ssrcs.len() >= 32 {
                 return Err(err(ErrorCode::Unavailable, "stream_limit"));
             }
             Ok(None)
@@ -885,7 +885,18 @@ impl Core {
         self.publish_routing();
         self.client_updated(session);
         let (reply, rx) = oneshot::channel();
-        permit.send(MediaCmd::Offer { session, binding: binding.clone(), sdp: offer.sdp, out, reply });
+        let origin = self.routing.load().origin(session).expect("admitted participation");
+        let retired = self.sessions[&session].used_ssrcs.iter().copied().filter(|ssrc| *ssrc != offer.ssrc).collect();
+        permit.send(MediaCmd::Offer {
+            session,
+            binding: binding.clone(),
+            origin,
+            ssrc: offer.ssrc,
+            retired,
+            sdp: offer.sdp,
+            out,
+            reply,
+        });
         let tx = self.me.upgrade()?;
         let task = tokio::spawn(async move {
             let answer = tokio::time::timeout(Duration::from_secs(30), rx)
@@ -1803,11 +1814,43 @@ mod tests {
         assert_eq!(core.voice_offer(session, 5, second).unwrap().unwrap_err().code, ErrorCode::Unavailable);
         assert_eq!(core.sessions[&session].used_ssrcs.len(), 1);
         while commands.try_recv().is_ok() {}
-        core.sessions.get_mut(&session).unwrap().used_ssrcs = (1..=33).collect();
+        core.sessions.get_mut(&session).unwrap().used_ssrcs = (1..=32).collect();
         let exhausted = offer(&core, session, 34);
         assert_eq!(core.voice_offer(session, 6, exhausted).unwrap().unwrap_err().message, "stream_limit");
         assert!(core.voice_state(session).is_none());
         assert!(core.calls.is_empty());
+    }
+    #[tokio::test]
+    async fn active_replacements_reserve_their_eventual_retirement() {
+        for failure in [false, true] {
+            let (mut core, session, mut frames, mut commands) = fixture();
+            let (tx, mut rx) = mpsc::channel(16);
+            core.me = tx.downgrade();
+            core.enter_channel(session, 1).unwrap();
+            for run in 1..=32 {
+                let request = offer(&core, session, run);
+                assert!(core.voice_offer(session, run as u32, request).is_none());
+                let MediaCmd::Offer { reply, retired, .. } = commands.recv().await.unwrap() else { panic!() };
+                assert_eq!(retired.len(), run as usize - 1);
+                let answer = if failure && run == 32 { Err("negotiation failed") } else { Ok("answer".into()) };
+                complete(&mut core, &mut rx, reply, answer).await;
+                assert!(core.sessions[&session].used_ssrcs.len() <= 32);
+                while frames.try_recv().is_ok() {}
+            }
+            let request = offer(&core, session, 33);
+            assert_eq!(core.voice_offer(session, 33, request).unwrap().unwrap_err().message, "stream_limit");
+            assert!(core.voice_state(session).is_none());
+            assert_eq!(core.sessions[&session].used_ssrcs.len(), 32);
+            assert!(!core.sessions[&session].used_ssrcs.contains(&33));
+            assert!(
+                std::iter::from_fn(|| frames.try_recv().ok())
+                    .any(|f| matches!(f, Outbound::Frame(s) if s.contains("stream_limit")))
+            );
+            core.enter_channel(session, 1).unwrap();
+            let request = offer(&core, session, 34);
+            assert_eq!(core.voice_offer(session, 34, request).unwrap().unwrap_err().message, "stream_limit");
+            assert_eq!(core.sessions[&session].used_ssrcs.len(), 32);
+        }
     }
     #[test]
     fn wire_epoch_exhaustion_closes_the_call_without_wrapping() {

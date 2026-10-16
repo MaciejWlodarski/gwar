@@ -4,8 +4,10 @@ Native WebRTC capture uses `voice::FRAME = 480` at 48 kHz. This is the single
 switch back to 960/20 ms; direct TeamSpeak uses a separate fixed 960-sample
 capture quantum. Both paths retain `Application::Voip`, 48 kbps, in-band FEC,
 a 5% packet-loss hint and automatic signal/bandwidth selection. RTP timestamps
-use the native capture quantum, retain wall-clock pauses, and advance at least
-one quantum when a device or transport wakeup batches several packets.
+use the first captured 48 kHz sample position plus a fixed per-run offset.
+Capture positions advance through mute, PTT, silence and dropped queues;
+non-increasing positions are counted and dropped instead of inventing time.
+Batched wakeups retain the original capture spacing.
 
 ## Compatibility and receive policy
 
@@ -17,6 +19,8 @@ one quantum when a device or transport wakeup batches several packets.
   TS-to-Gwar is unchanged; other existing browser/TS packetizations pass through.
 - An odd tail is flushed before an end marker, after 40 ms without its partner,
   before another packet duration or TOC, and on graceful puppet shutdown.
+  Route changes discard a held tail: old-route audio never flushes into the
+  new channel or replacement transport.
   A zero-length second frame requests 10 ms of Opus concealment, completing a
   20 ms TS packet-counter step without losing the real tail. TOC changes cannot
   be merged; the old tail is completed and the new one held separately. This
@@ -29,11 +33,13 @@ one quantum when a device or transport wakeup batches several packets.
   code-1/code-2 writer. Tests feed it into libopus's packet parser and decoder,
   checking boundary lengths and sample-for-sample equality against separately
   decoded frames. No production codec dependency was added to the server.
-- SFU slot time already advances by the previous packet's actual duration.
-  Pause detection retains at least the old 40 ms scheduling tolerance, so a
-  delayed 10 ms callback batch does not invent lost RTP media. Regressions cover
-  that case, 10/20/10 ms changes and a one-second pause. Source-generation changes still reset decoder, queued
-  packets and staged PCM at native receivers.
+- SFU slots preserve source timestamp deltas within one source-clock
+  generation. Every re-anchor uses elapsed time rounded up to 480 ticks with
+  the previous packet's span as a floor; batched delivery adds no buffering.
+  Regressions cover stalls, mixed 10/20 ms sources, pauses and resets. Speaker
+  slot-generation changes still reset decoder, queued packets and staged PCM
+  at native receivers; an RTP source-clock reset alone does not change that
+  receiver generation. See [the 5b report](voice-sfu-5b.md).
 - Receive target minimum and RTP loss concealment follow packet duration:
   480 samples for 10 ms, 960 for 20 ms. Starvation uses a 100 ms concealed-audio budget, checked at packet boundaries
   (ten 10 ms or five 20 ms frames); the timeline survives starvation.

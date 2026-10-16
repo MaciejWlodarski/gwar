@@ -41,7 +41,7 @@ use crate::{
         bridge::{BridgeMsg, BridgeNote, RemoteClient, RemoteUpdate},
         now_ms,
     },
-    media::MediaPlane,
+    media::{AudioRoute, MediaPlane},
 };
 
 /// Name of the TeamSpeak server group that exempts puppets from flood limits.
@@ -654,7 +654,9 @@ impl<'a> Bridge<'a> {
             let _ = self.query.call(cmd).await;
             return;
         };
-        self.shared.mirrors.write().expect("mirrors lock").insert(clid, session);
+        if let Some(origin) = self.core.audio_origin(session).await {
+            self.shared.mirror(clid, cid, origin);
+        }
         self.remotes.insert(clid, Remote { session, ..remote });
         self.reconcile(Duration::ZERO);
     }
@@ -804,7 +806,9 @@ impl<'a> Bridge<'a> {
         let Some(local) = self.locals.get_mut(&session) else { return };
         let Some(puppet) = &local.puppet else { return };
         local.route += 1;
-        if !puppet.send(PuppetCmd::Move { cid, route: local.route, voice }) {
+        let origin = voice.then(|| self.shared.plane.routing.load().origin(session)).flatten();
+        let audio = AudioRoute::new(local.route, cid, origin);
+        if !puppet.send(PuppetCmd::Move { cid, route: local.route, audio, voice }) {
             warn!(session, "puppet busy; reconnecting it in its new channel");
             self.retire_puppet(session);
             self.spawn_puppet(session, Duration::ZERO);
@@ -826,6 +830,11 @@ impl<'a> Bridge<'a> {
             identity,
             channel,
             route: local.route,
+            audio: AudioRoute::new(
+                local.route,
+                channel,
+                voice.then(|| self.shared.plane.routing.load().origin(session)).flatten(),
+            ),
             voice,
             muted: c.muted,
             deafened: c.deafened,
@@ -887,7 +896,7 @@ impl<'a> Bridge<'a> {
             self.reconcile(Duration::ZERO);
         }
         let Some(local) = self.locals.get(&session) else { return };
-        if before.channel != local.client.channel && self.puppet_target(&before) != self.puppet_target(&local.client) {
+        if before.channel != local.client.channel || before.voice_binding != local.client.voice_binding {
             self.move_puppet(session);
         }
         let Some(local) = self.locals.get(&session) else { return };
@@ -944,8 +953,20 @@ impl<'a> Bridge<'a> {
                 let Some(cid) = client.channel.and_then(|c| self.map.ts(c)).filter(|cid| *cid != remote.cid) else {
                     return;
                 };
+                self.shared.forget(clid);
                 if let Err(e) = self.query.call(Cmd::new("clientmove").arg("clid", clid).arg("cid", cid)).await {
                     warn!(clid, "TeamSpeak move: {e:#}");
+                    // A refusal emits no notifyclientmoved. Read the confirmed
+                    // location (it may have changed remotely while we waited),
+                    // reconcile core participation and mint a fresh mirror route.
+                    match self.query.call(Cmd::new("clientinfo").arg("clid", clid)).await {
+                        Ok(records) => {
+                            if let Some(cid) = records.first().and_then(|r| r.get("cid")).and_then(|v| v.parse().ok()) {
+                                self.client_moved(clid, cid).await;
+                            }
+                        }
+                        Err(e) => warn!(clid, "TeamSpeak refused move reconciliation: {e:#}"),
+                    }
                 }
             }
             Event::ClientLeft { client, reason } => {
@@ -1130,11 +1151,15 @@ impl<'a> Bridge<'a> {
 
     async fn client_moved(&mut self, clid: u16, cid: u64) {
         if let Some(remote) = self.remotes.get_mut(&clid) {
+            self.shared.forget(clid);
             remote.cid = cid;
             let session = remote.session;
             let channel = self.our_channel(cid);
             let update = RemoteUpdate { channel: Some(channel), ..Default::default() };
             self.core.bridge(BridgeMsg::Update(session, update)).await;
+            if let Some(origin) = self.core.audio_origin(session).await {
+                self.shared.mirror(clid, cid, origin);
+            }
             self.reconcile(Duration::ZERO);
         } else if let Some(&session) = self.puppet_clids.get(&clid) {
             // Someone moved a puppet on TeamSpeak; our user decides where they are.
@@ -1161,14 +1186,20 @@ impl<'a> Bridge<'a> {
                     debug!(session, "puppet description: {e:#}");
                 }
             }
-            PuppetEvent::Text { session, invoker, target, text } => {
-                let Some(remote) = self.remotes.get(&invoker) else { return };
+            PuppetEvent::Text { session, generation, origin, source_route, receiver_route, target, text } => {
+                if !source_route.permits(&origin)
+                    || !receiver_route.is_current()
+                    || !self.core.audio_binding_matches(&origin)
+                    || self.locals.get(&session).is_none_or(|local| local.generation != generation)
+                {
+                    return;
+                }
                 if matches!(target, MessageTarget::Client(_) | MessageTarget::Poke(_))
                     && let Some(local) = self.locals.get_mut(&session)
                 {
                     local.chatting_until = Some(Instant::now() + CHAT_KEEP);
                 }
-                let author = remote.session;
+                let author = origin.session;
                 let Some(target) = puppet_chat_target(session, target) else { return };
                 self.core.bridge(BridgeMsg::Chat(author, target, text)).await;
             }
@@ -1395,6 +1426,8 @@ mod tests {
                 let name = line.split(' ').next().unwrap_or_default().to_owned();
                 seen.lock().unwrap().push(line);
                 let reply = match name.as_str() {
+                    "clientmove" if refuse => "error id=2568 msg=insufficient\\sclient\\spermissions\n\r",
+                    "clientinfo" => "cid=10\n\rerror id=0 msg=ok\n\r",
                     "channelcreate" => "cid=42\n\rerror id=0 msg=ok\n\r",
                     "channeladdperm" if refuse => "error id=2568 msg=insufficient\\sclient\\spermissions\n\r",
                     _ => "error id=0 msg=ok\n\r",
@@ -1404,6 +1437,105 @@ mod tests {
         });
         let (query, _notes) = Query::connect(addr, "serveradmin", "p", 1).await.unwrap();
         (query, commands)
+    }
+
+    #[tokio::test]
+    async fn refused_remote_move_restores_confirmed_source_route() {
+        use crate::{
+            core::expiry_tests::test_core_teamspeak,
+            media::{MediaPlane, Routing},
+            store::Store,
+        };
+
+        let store = Store::in_memory().unwrap();
+        store.init_server_chat(false).unwrap();
+        let core = test_core_teamspeak(store).unwrap();
+        let (notes, mut receiver) = mpsc::unbounded_channel();
+        core.bridge(BridgeMsg::Attach(notes)).await;
+        let BridgeNote::Snapshot { server, .. } = receiver.recv().await.unwrap() else { panic!("snapshot") };
+        let (webrtc, _media) = mpsc::channel(8);
+        let plane = MediaPlane {
+            routing: Arc::new(arc_swap::ArcSwap::from_pointee(Routing::default())),
+            sinks: Arc::default(),
+            uplinks: Arc::default(),
+            webrtc,
+        };
+        let (query, commands) = channel_query(true).await;
+        commands.lock().unwrap().clear();
+        let dir = tempfile::tempdir().unwrap();
+        let mut identities = Identities::load(&dir.path().join("identities.json")).unwrap();
+        let (puppet_events, _puppets) = mpsc::channel(8);
+        let (listener_events, _listeners) = mpsc::channel(8);
+        let mut bridge = Bridge {
+            query,
+            core: core.clone(),
+            shared: Arc::new(Shared::new(core.clone(), plane)),
+            voice: "127.0.0.1:1".parse().unwrap(),
+            public_url: None,
+            identities: &mut identities,
+            puppet_uids: HashSet::new(),
+            map: ChannelMap::load(&dir.path().join("channels.json")).unwrap(),
+            ts: HashMap::new(),
+            channels: BTreeMap::new(),
+            server: Some(server),
+            locals: HashMap::new(),
+            remotes: HashMap::new(),
+            puppet_clids: HashMap::new(),
+            puppet_events,
+            puppet_group: None,
+            listeners: ChannelListeners::new("127.0.0.1:1".parse().unwrap(), "p".into(), listener_events),
+            descriptions: HashMap::new(),
+            query_clid: None,
+            locked: HashSet::new(),
+        };
+        bridge.map.link(1, 10);
+        bridge.map.link(2, 20);
+        let session = core
+            .remote_join(RemoteClient {
+                uid: "ts:refused".into(),
+                nickname: "remote".into(),
+                channel: 1,
+                platform: Platform::Desktop,
+                muted: false,
+                deafened: false,
+                away: None,
+            })
+            .await
+            .unwrap();
+        bridge.remotes.insert(7, remote(session, 10));
+        let original = core.audio_origin(session).await.unwrap();
+        bridge.shared.mirror(7, 10, original.clone());
+        let old = bridge.shared.mirrors.read().unwrap()[&7].clone();
+        core.bridge(BridgeMsg::Update(session, RemoteUpdate { channel: Some(2), ..Default::default() })).await;
+        let moved = core.audio_origin(session).await.unwrap(); // actor barrier
+        assert_eq!(moved.channel, 2);
+        // Bridge-origin updates suppress echo; supply the same administrative
+        // event a local move would produce, without replacing the bridge.
+        bridge
+            .on_event(Event::ClientUpdated(Client {
+                id: session,
+                uid: "ts:refused".into(),
+                nickname: "remote".into(),
+                channel: Some(2),
+                groups: vec![],
+                platform: Platform::Desktop,
+                muted: false,
+                deafened: false,
+                away: None,
+                talking: false,
+                voice: true,
+                voice_binding: Some(moved.binding.clone()),
+            }))
+            .await;
+        let restored = core.audio_origin(session).await.unwrap();
+        assert_eq!(restored.channel, 1);
+        assert_ne!(restored.binding, original.binding);
+        assert!(!old.is_current());
+        let fresh = bridge.shared.mirrors.read().unwrap()[&7].clone();
+        assert!(fresh.generation > old.generation);
+        assert!(fresh.permits(&restored));
+        assert_eq!(bridge.remotes[&7].cid, 10);
+        assert!(commands.lock().unwrap().iter().any(|c| c.starts_with("clientinfo clid=7")));
     }
 
     #[tokio::test]

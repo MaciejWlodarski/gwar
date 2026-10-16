@@ -1,6 +1,8 @@
 //! Test harness: an in-process server and a small `vc/4` WebSocket client.
 #![allow(dead_code)]
 
+pub mod rtc;
+
 use std::{collections::HashMap, collections::VecDeque, future::Future, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};

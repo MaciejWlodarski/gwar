@@ -8000,6 +8000,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tsclientlib",
+ "tsproto",
  "tsproto-packets",
  "vc-client",
  "vc-proto",
