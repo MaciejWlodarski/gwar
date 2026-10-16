@@ -61,16 +61,15 @@ impl SpeakerBuffer {
         let base = self.callback.max(STEP);
         self.headroom = self.headroom.max(base);
         let missed = underruns > self.underruns;
-        match self.released {
-            Some(at) if missed && now.saturating_duration_since(at) <= RELEASE_PROBE => {
-                self.release_every = (self.release_every * 2).min(MAX_RELEASE);
-                self.released = None;
-            }
-            Some(at) if now.saturating_duration_since(at) > RELEASE_PROBE => {
-                self.release_every = HEADROOM_RELEASE;
-                self.released = None;
-            }
-            _ => {}
+        let induced = self.released.is_some_and(|at| now.saturating_duration_since(at) <= RELEASE_PROBE);
+        if missed && induced {
+            self.release_every = (self.release_every * 2).min(MAX_RELEASE);
+            self.released = None;
+        } else if missed || self.released.is_some_and(|at| now.saturating_duration_since(at) > RELEASE_PROBE) {
+            // A clean release, or a miss no release caused (headroom did not
+            // prevent it): back to the base interval, so it cannot pin headroom.
+            self.release_every = HEADROOM_RELEASE;
+            self.released = None;
         }
         let elapsed = now.saturating_duration_since(self.headroom_changed);
         let steps = elapsed.as_nanos() / self.release_every.as_nanos();
@@ -335,6 +334,24 @@ mod tests {
         // A fixed 5 s release would glitch after every release below 20 ms (about 60 times).
         assert!(underruns <= 10, "{underruns} underruns in five minutes");
         assert_eq!(buffer.release_every, MAX_RELEASE);
+    }
+
+    #[test]
+    fn misses_that_headroom_cannot_prevent_reset_the_backoff() {
+        // Start fully backed off at 40 ms; stalls every 40 s happen whatever the headroom.
+        let start = Instant::now();
+        let mut buffer = SpeakerBuffer::new(start);
+        buffer.headroom = MAX_HEADROOM;
+        buffer.release_every = MAX_RELEASE;
+        let mut underruns = 0;
+        for second in 1..=600 {
+            if second % 40 == 1 {
+                // one second after each 80 s release
+                underruns += 1;
+            }
+            buffer.update(start + Duration::from_secs(second), 480, 480, underruns);
+        }
+        assert!(buffer.headroom <= 480 + 2 * STEP, "{}", buffer.headroom);
     }
 
     #[test]

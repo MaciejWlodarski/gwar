@@ -731,6 +731,8 @@ async fn run(
                 if let Some(data) = packetizer.flush()
                     && let Some(packet) = &held
                 {
+                    // A timer-flushed tail is speech too: its spurt still needs an end.
+                    spurt_open = !data.data.is_empty();
                     send_audio(&mut con, &mut packet_id, &data, shared, packet, &audio);
                 }
             }

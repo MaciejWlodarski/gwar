@@ -375,8 +375,9 @@ Speaker headroom keeps its 5 ms/event attack and 40 ms cap but releases 5 ms per
 release interval, including intervals with underruns, instead of requiring 30
 seconds of complete silence per step. The interval starts at 5 s and doubles (up
 to 80 s) whenever an underrun follows a release within 5 s, so a periodic stall
-that needs the margin costs ever rarer glitches; a release without an underrun
-resets it to 5 s. Rare misses therefore cannot pin 40 ms.
+that needs the margin costs ever rarer glitches; a release without an underrun,
+or an underrun no release caused (headroom did not prevent it), resets it to
+5 s. Rare misses therefore cannot pin 40 ms.
 
 Native PCM and encoded queues retain callback capture time and discard audio
 older than 50 ms. PCM age is residence in the ring, so device callbacks longer
