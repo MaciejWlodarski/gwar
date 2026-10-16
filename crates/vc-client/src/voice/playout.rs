@@ -13,9 +13,10 @@ use super::{
 const STEP: usize = 240; // 5 ms at 48 kHz.
 const MAX_HEADROOM: usize = 1920; // 40 ms, unless one device callback itself needs more.
 const CALLBACK_HOLD: Duration = Duration::from_secs(5);
-// Leaky event budget: +5 ms per underrun, -5 ms per elapsed second.
-// Occasional misses (<1/s) release headroom; sustained misses still grow it.
-const HEADROOM_RELEASE: Duration = Duration::from_secs(1);
+// Leaky event budget: +5 ms per underrun, -5 ms per five elapsed seconds.
+// Each underrun is an audible glitch, so headroom settles where they are rarer
+// than one per 5 s; misses that headroom cannot prevent still release 40 ms in 35 s.
+const HEADROOM_RELEASE: Duration = Duration::from_secs(5);
 
 /// Pipeline-owned policy; the realtime callback only publishes atomic measurements.
 pub(super) struct SpeakerBuffer {
@@ -298,18 +299,24 @@ mod tests {
         assert_eq!(buffer.headroom, 1200); // Count every event between updates.
         buffer.update(now, 480, 480, 100);
         assert_eq!(buffer.headroom, MAX_HEADROOM);
-        for second in 1..=20 {
-            buffer.update(now + Duration::from_secs(second), 480, 480, 100 + second / 3);
+        for second in 1..=60 {
+            buffer.update(now + Duration::from_secs(second), 480, 480, 100 + second / 10);
         }
-        assert_eq!(buffer.headroom, 480); // A miss every 3 s cannot pin 40 ms.
+        assert_eq!(buffer.headroom, 480 + STEP); // A miss every 10 s cannot pin 40 ms (one just landed).
         for tick in 1..=20 {
-            buffer.update(now + Duration::from_millis(20_000 + tick * 100), 480, 480, 106 + tick);
+            buffer.update(now + Duration::from_millis(60_000 + tick * 100), 480, 480, 106 + tick);
         }
         assert_eq!(buffer.headroom, MAX_HEADROOM); // 10 misses/s still attacks fast.
-        buffer.update(now + Duration::from_secs(23), 2400, 2400, 127);
+        for second in 61..=90 {
+            buffer.update(now + Duration::from_secs(second), 480, 480, 126 + second / 3 - 20);
+        }
+        // A miss every 3 s outpaces the 5 s release: glitches that headroom
+        // can prevent keep it instead of settling at an audible rate.
+        assert_eq!(buffer.headroom, MAX_HEADROOM);
+        buffer.update(now + Duration::from_secs(93), 2400, 2400, 137);
         assert_eq!(buffer.headroom, 2400); // Never less than one whole callback.
-        buffer.update(now + Duration::from_secs(28), 480, 480, 128);
-        // Release now runs even with an underrun; the decaying callback maximum
+        buffer.update(now + Duration::from_secs(98), 480, 480, 138);
+        // Release runs even with an underrun; the decaying callback maximum
         // remains the floor, including when it exceeds MAX_HEADROOM.
         assert_eq!(buffer.headroom, 2160);
     }

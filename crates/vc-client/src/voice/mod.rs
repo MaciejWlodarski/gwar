@@ -408,7 +408,8 @@ pub async fn start_teamspeak(
                     Ok(None) => break,
                     Err(_) => {
                         talking = false;
-                        let _ = audio_out.try_send(crate::teamspeak::TsMicrophone { captured_at: Instant::now(), opus: Vec::new() });
+                        // The end marker is never age-dropped: losing it leaves TS showing speech.
+                        if audio_out.send(crate::teamspeak::TsMicrophone { captured_at: Instant::now(), opus: Vec::new() }).await.is_err() { break; }
                     }
                 },
             }
@@ -482,11 +483,9 @@ impl CaptureFrame {
     }
 
     fn push_at(&mut self, sample: CaptureSample, now: Instant, counters: &Counters) -> Option<u64> {
-        // Expire a partial frame too: a fresh last sample cannot renew its age.
-        if self.filled > 0 && now.saturating_duration_since(self.captured_at) > io::MAX_CAPTURE_AGE {
-            counters.capture_stale_samples.fetch_add(self.filled as u64, Ordering::Relaxed);
-            self.filled = 0;
-        }
+        // Age is residence in the ring, not the device callback period: a
+        // stalled consumer finds old samples here and the position gap resets
+        // any partial frame, while large callbacks still complete their frames.
         if now.saturating_duration_since(sample.captured_at) > io::MAX_CAPTURE_AGE {
             counters.capture_stale_samples.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -496,8 +495,9 @@ impl CaptureFrame {
         }
         if self.filled == 0 {
             self.start = sample.position;
-            self.captured_at = sample.captured_at;
         }
+        // A frame becomes sendable with its last sample; later queues measure from there.
+        self.captured_at = sample.captured_at;
         self.samples[self.filled] = sample.value;
         self.filled += 1;
         if self.filled == self.samples.len() {
@@ -680,7 +680,8 @@ mod codec_tests {
             for _ in 0..rx.slots() {
                 assert!(capture.push_at(rx.pop().unwrap(), resumed, &counters).is_none());
             }
-            assert_eq!(counters.capture_stale_samples.load(Ordering::Relaxed), (size * 3) as u64);
+            // Only the ring backlog is stale; its position gap discards the partial frame.
+            assert_eq!(counters.capture_stale_samples.load(Ordering::Relaxed), (size * 3 - size / 2) as u64);
             let mut positions = Vec::new();
             for position in size * 3..size * 4 {
                 positions.extend(capture.push_at(
@@ -716,6 +717,25 @@ mod codec_tests {
             assert!(!frame.fresh_at(resumed + io::MAX_CAPTURE_AGE + Duration::from_nanos(1), &counters));
             assert_eq!(counters.capture_stale_frames.load(Ordering::Relaxed), 3);
         }
+    }
+
+    #[test]
+    fn device_callbacks_longer_than_the_age_limit_still_complete_frames() {
+        // Some devices deliver 100 ms per callback: a frame split across two
+        // callbacks is not stale, and its age starts when it becomes complete.
+        let counters = Counters::default();
+        let mut capture = CaptureFrame::new(FRAME);
+        let first = Instant::now();
+        let second = first + Duration::from_millis(100);
+        let split = FRAME as u64 * 5 / 4;
+        let mut positions = Vec::new();
+        for position in 0..FRAME as u64 * 2 {
+            let at = if position < split { first } else { second };
+            positions.extend(capture.push_at(CaptureSample { position, captured_at: at, value: 0.1 }, at, &counters));
+        }
+        assert_eq!(positions, [0, FRAME as u64]);
+        assert_eq!(capture.captured_at, second);
+        assert_eq!(counters.capture_stale_samples.load(Ordering::Relaxed), 0);
     }
 
     #[test]

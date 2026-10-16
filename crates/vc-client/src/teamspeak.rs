@@ -198,7 +198,9 @@ pub struct TsMicrophone {
 
 impl TsMicrophone {
     fn fresh_at(&self, now: std::time::Instant, dropped: &AtomicU64) -> bool {
-        if now.saturating_duration_since(self.captured_at) > crate::voice::io::MAX_CAPTURE_AGE {
+        // An empty frame ends the talk spurt and must arrive however late.
+        if !self.opus.is_empty() && now.saturating_duration_since(self.captured_at) > crate::voice::io::MAX_CAPTURE_AGE
+        {
             dropped.fetch_add(1, Ordering::Relaxed);
             return false;
         }
@@ -990,6 +992,9 @@ mod capture_age_tests {
         }
         assert_eq!(dropped.load(Ordering::Relaxed), 2);
         assert_eq!(sent.load(Ordering::Relaxed), 1);
+        // A late end-of-speech marker still ends the TS talk spurt.
+        assert!(TsMicrophone { captured_at: now, opus: Vec::new() }.fresh_at(resumed, &dropped));
+        assert_eq!(dropped.load(Ordering::Relaxed), 2);
         blocked.store(true, Ordering::Relaxed);
         send_audio_now(
             &mut con,

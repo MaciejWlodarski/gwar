@@ -701,7 +701,7 @@ async fn run(
                 }
                 let now = Instant::now();
                 expire_uplink_tail(&mut packetizer, now, &shared.voice_stale_dropped);
-                if !fresh_uplink(packet.admitted_at, now, &shared.voice_stale_dropped) {
+                if !fresh_uplink(&packet.payload, packet.admitted_at, now, &shared.voice_stale_dropped) {
                     continue;
                 }
                 for data in packetizer.push(&packet.payload, packet.admitted_at) {
@@ -1031,8 +1031,9 @@ fn audio_allowed(con: &Connection, shared: &Shared, packet: &AudioPacket, route:
 // Allows the packetizer's 40 ms tail wait, but not a stalled 64-packet replay.
 const MAX_UPLINK_AGE: Duration = Duration::from_millis(50);
 
-fn fresh_uplink(admitted_at: Instant, now: Instant, dropped: &AtomicU64) -> bool {
-    if now.saturating_duration_since(admitted_at) > MAX_UPLINK_AGE {
+/// End-of-speech markers (empty) are never stale: losing one leaves TS showing speech.
+fn fresh_uplink(data: &[u8], admitted_at: Instant, now: Instant, dropped: &AtomicU64) -> bool {
+    if !data.is_empty() && now.saturating_duration_since(admitted_at) > MAX_UPLINK_AGE {
         dropped.fetch_add(1, Ordering::Relaxed);
         return false;
     }
@@ -1040,7 +1041,7 @@ fn fresh_uplink(admitted_at: Instant, now: Instant, dropped: &AtomicU64) -> bool
 }
 
 fn expire_uplink_tail(packetizer: &mut super::packetizer::Packetizer, now: Instant, dropped: &AtomicU64) {
-    if packetizer.pending_since().is_some_and(|at| !fresh_uplink(at, now, dropped)) {
+    if packetizer.pending_since().is_some_and(|at| !fresh_uplink(&[0], at, now, dropped)) {
         packetizer.discard_pending();
     }
 }
@@ -1054,7 +1055,7 @@ fn send_audio(
     route: &Arc<AudioRoute>,
 ) {
     if !audio_allowed(con, shared, packet, route)
-        || !fresh_uplink(data.admitted_at, Instant::now(), &shared.voice_stale_dropped)
+        || !fresh_uplink(&data.data, data.admitted_at, Instant::now(), &shared.voice_stale_dropped)
     {
         return;
     }
@@ -1331,15 +1332,17 @@ mod transport_tests {
         let mut output = Vec::new();
         while let Ok((at, data)) = rx.try_recv() {
             expire_uplink_tail(&mut packetizer, resumed, &dropped);
-            if fresh_uplink(at, resumed, &dropped) {
+            if fresh_uplink(&data, at, resumed, &dropped) {
                 output.extend(packetizer.push(&data, at));
             }
         }
         assert!(output.is_empty(), "stale packets must not pair or flush as a burst");
         assert_eq!(dropped.load(Ordering::Relaxed), 3); // Two queued packets + held tail.
         assert_eq!(packetizer.flush().map(|p| (p.data, p.admitted_at)), Some((vec![0x72, 1, 9], resumed))); // Only the fresh half remains.
-        assert!(fresh_uplink(resumed, resumed + MAX_UPLINK_AGE, &dropped));
-        assert!(!fresh_uplink(resumed, resumed + MAX_UPLINK_AGE + Duration::from_nanos(1), &dropped));
+        assert!(fresh_uplink(&old, resumed, resumed + MAX_UPLINK_AGE, &dropped));
+        assert!(!fresh_uplink(&old, resumed, resumed + MAX_UPLINK_AGE + Duration::from_nanos(1), &dropped));
+        // A late end-of-speech marker still ends the TS talk spurt.
+        assert!(fresh_uplink(&[], now, resumed, &dropped));
         assert_eq!(dropped.load(Ordering::Relaxed), 4);
         // A delayed tail timer uses original admission age, not its dequeue time.
         packetizer.push(&old, resumed);
