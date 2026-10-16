@@ -512,146 +512,292 @@ in ignored `target-5b-*.log` files. Screenshot changes were restored with
 
 ## Latency method
 
-Baseline: `b0c6e6b16c3fbff75b15d1a85b58061af775965f` (pre-step 5).
-Candidate: `47f96dfa7062ceeb447247d030b85f551fa7afe8`. Separate release targets
-were used: baseline in `/private/tmp/gwar-5b-baseline/target`, candidate in
-this worktree's `target`. Hardware: Apple M5 / Mac17,3, 10 physical/logical
-CPUs, macOS 27.0 build 26A428, Rust 1.99.0 (Homebrew), libopus 1.6.1.
+This rerun measures candidate `2c03f3ff23584c66101a1475e22c6aa56404047b`
+on `e2e-5b-sfu`. Baseline is the pinned pre-step-5
+`b0c6e6b16c3fbff75b15d1a85b58061af775965f` plus the unmodified cherry-pick of
+`dadda0fae90b88bbc2709da96c134afd987fc8a7` (#54, discard pre-connection capture).
+The cherry-pick applied without conflicts:
 
-Both variants use 48 kHz mono, 48 kbps Opus, native 480-sample/10 ms packets,
-the existing warmup and matching detector, and the same playout settings.
-Callbacks are 480 samples except the explicitly varied callback condition.
-Each condition schedules 100 markers per run, four runs per variant, in order
-baseline/candidate/candidate/baseline/baseline/candidate/candidate/baseline.
-No task builds or tests run concurrently. This is a shared interactive Mac;
-background system activity is not controlled. The CPU condition runs six
-owned Python busy-loop processes; only those processes are stopped afterward.
+- Baseline commit: `b4f4627050bfa416a98798989e91413b520440db`.
+- **Exact baseline tree: `a61b0f401ee61748c4a6b4ae5ff8c4127670de0c`.**
+- Candidate tree: `bb0087bf65aaba891025aa2b738cb9ec54ce5d4b`.
 
-For each condition the command is:
+Both locked release builds finished before measurement:
 
 ```sh
-python3 scripts/latency/run_local.py \
-  --variant baseline=<baseline-binary-or-profile-wrapper> \
-  --variant candidate=<candidate-binary-or-profile-wrapper> \
-  --markers 100 --runs 4 --out /private/tmp/gwar-5b-latency/<condition>
+git -C /Users/zireael/dev/projects/gwar worktree add --detach /tmp/gwar-5b-gate-baseline b0c6e6b
+git -C /tmp/gwar-5b-gate-baseline cherry-pick dadda0f
+# In the baseline worktree:
+cargo build --locked --release -p vc-client --example latency --target-dir /tmp/gwar-5b-gate-target-baseline
+# In the candidate worktree:
+cargo build --locked --release -p vc-client --example latency --target-dir /tmp/gwar-5b-gate-target-candidate
 ```
 
-The runner intentionally clears inherited `LATENCY_*` variables. Tiny local
-wrappers therefore set the declared profile and exec the already-built binary.
-Exact commands, wrapper contents, binary SHA-256, versions and timestamps are
-in `conditions.json`, per-condition manifests and `run.py` in the raw folder.
-If the runner rejects an attempt, its failure and raw data are retained; only
-not-yet-attempted scheduled runs are completed afterward, in the same order.
-No failing run is retried or excluded from the table.
+Hardware: Apple M5 / Mac17,3, 10 physical/logical CPUs, 16 GiB RAM;
+macOS 27.0 (26A428), Homebrew Rust/Cargo 1.99.0, libopus 1.6.1,
+Python 3.9.6. Measurements ran on 2026-10-16 from 10:26:15 to 11:53:31 UTC
+(87 minutes 16 seconds), on the shared interactive Mac. No task-owned builds,
+tests or other heavy analysis ran during measurements. Existing applications
+and foreign work were left running; no production service, SSH or TeamSpeak
+server was used.
 
-| Condition | Environment / load |
-| --- | --- |
-| idle | Default virtual callbacks, no injected load |
-| loss | `LATENCY_NET='seed=42;down:loss=2%'` |
-| reorder | `LATENCY_NET='seed=42;down:reorder=0.5%'` |
-| burst | `LATENCY_NET='seed=42;down:burst=3@0.5%'` |
-| stall | `LATENCY_NET='up:stall=270ms@12s'` |
-| jitter | `LATENCY_NET='seed=42;down:jitter=10ms'` |
-| callbacks | `LATENCY_CALLBACK_JITTER=1` (10/20/5 ms) |
-| mixed | `LATENCY_NET='seed=42;up:delay=20ms,jitter=5ms,keep_order,stall=270ms@12s,every=10s;down:loss=1%,burst=3@0.5%,reorder=0.5%'` |
-| cpu | Default callbacks, six CPU workers |
+Both variants use native 480-sample / 10 ms Opus, 48 kHz mono, 48 kbps,
+identical detector, two-second warmup and playout tuning. All wrappers set
+`LATENCY_WAIT_CONNECTED=1` **after** the runner clears inherited `LATENCY_*`
+and `VC_*`: carrier/impairments start normally, but markers wait for both
+transports to connect plus warmup. Harness source differs only in two event
+patterns adding `..` for candidate protocol fields; timing and detector logic
+are identical. Capture callbacks are 480 samples. Receiver callbacks are 480
+except the explicit 480/960/240-sample callback-jitter profile.
+
+Each attempt requests 100 markers. Idle schedules 20 attempts per variant;
+jitter, callbacks and CPU schedule 10; each other profile schedules four.
+Each condition uses the original adjacent B/C pairs in ABBA order. Initial
+execution used `scripts/latency/run_local.py --variant baseline=<wrapper>
+--variant candidate=<wrapper> --markers 100 --runs <N> --out <condition>`.
+After the contention policy below was requested, `resume_guarded.py` called
+that same module's `run_client`, `environment` and `Results.accept` functions
+with a guard before every remaining slot. It did not alter the checkout,
+harness, binaries or original order. Every attempted slot was run once;
+errors are recorded and unattempted slots continue without retry/exclusion.
+
+| Condition | Wrapper setting, in addition to `LATENCY_WAIT_CONNECTED=1` | Runs per variant |
+| --- | --- | ---: |
+| idle | No injected impairment/load | 20 |
+| loss | `LATENCY_NET='seed=42;down:loss=2%'` | 4 |
+| reorder | `LATENCY_NET='seed=42;down:reorder=0.5%'` | 4 |
+| burst | `LATENCY_NET='seed=42;down:burst=3@0.5%'` | 4 |
+| stall | `LATENCY_NET='up:stall=270ms@12s'` | 4 |
+| jitter | `LATENCY_NET='seed=42;down:jitter=10ms'` | 10 |
+| callbacks | `LATENCY_CALLBACK_JITTER=1` | 10 |
+| mixed | `LATENCY_NET='seed=42;up:delay=20ms,jitter=5ms,keep_order,stall=270ms@12s,every=10s;down:loss=1%,burst=3@0.5%,reorder=0.5%'` | 4 |
+| cpu | Six owned Python busy-loop processes | 10 |
+
+### Contention policy and uncertainty
+
+A foreign Lumina release build and later foreign builds/high-CPU applications
+appeared after the clean process preflight. The owner explicitly required
+leaving that work running, retaining affected attempts, waiting before each
+remaining slot, and deciding only on uncontended original pairs. The first
+11 idle attempts lacked the new guard and are conservatively classified as
+**contended/uncontrolled**, including attempts without a sampled compiler.
+The original CLI runner was paused after its in-flight child finished and
+stopped with recorded `signal 15`; guarded execution resumed at slot 12.
+This orchestration interruption is not a failed measurement or a retry.
+
+Before each remaining slot, and every five seconds during a run, record
+processes and one-minute load. Block on foreign Rust/C/C++ compilers, linkers,
+Cargo build/test/check/clippy/bench/run and build tools, a non-owned process
+at ≥100% CPU, or load >8. The CPU profile explicitly exempts its six owned
+workers and uses load >14, preserving the same eight-unit allowance for other
+activity. Wait in 30-second increments, at most 20 minutes per wait, with a
+100-minute total measurement cap. All 140 slots finished within the cap.
+A foreign process starting during a run marks that run contended; it is kept.
+Five-second sampling cannot prove an absence of every shorter scheduling spike.
+"Uncontended" below means no contention detected under this policy.
+
+Only an original adjacent pair whose **both** runs are uncontended contributes
+to the gate; a clean orphan is not paired with another run. Filtering leaves
+54 contended attempts, 60 paired uncontended attempts (30 pairs), and 26 clean
+orphans. No selection uses latency, losses or underruns. Original ABBA timing
+is retained, but surviving BC/CB counts can differ; exact pair ids and order
+are in `analysis-guarded.json`. The complete series and all subsets remain in
+raw analysis. The final load observation also marks the last reorder run
+contended, leaving three pairs rather than the provisional four.
+
+Quantiles use nearest rank over all matched markers in the stated subset.
+The added p95 is pooled candidate p95 minus pooled baseline p95. Resample
+**whole adjacent pairs**, pool their markers again, and recompute that
+quantity. For 2–4 pairs enumerate every `k^k` draw; for 6–7 pairs use 100000
+seeded draws (`530016 + k`). Report the 2.5th–97.5th percentiles. These are
+descriptive paired-run bootstrap intervals, not marker-independent intervals
+or simultaneous confidence bounds across nine conditions. A one-pair resample
+is degenerate and cannot estimate uncertainty; its interval is reported as
+not estimable rather than pretending its repeated point value is precise.
+
+Require at least ten uncontended pairs for idle/jitter/callbacks/CPU and four
+for the other profiles, ≥95/100 matched in every included run, an upper
+added-p95 interval bound ≤2 ms, and no added sustained queue, unexplained
+marker loss or active underruns. Per the owner's revised rule, insufficient
+uncontended pairs yield **INCONCLUSIVE**, even when retained runs show serious
+anomalies; those anomalies are not dismissed. A sufficiently sampled interval
+crossing +2 ms is also INCONCLUSIVE.
 
 ## Latency results and decision
 
-**The latency acceptance gate is not passed.** Idle comparison is inconclusive
-at 2 ms resolution. Loss, burst and mixed conditions have failed matching
-attempts in both builds; the burst pooled candidate p95 also exceeds baseline
-by 2.21 ms. No failing attempt was discarded or rerun. Playout tuning was not
-changed to improve these results.
+**Overall: INCONCLUSIVE — the latency acceptance gate is not passed.**
+Every condition is inconclusive: eight lack the required uncontended pairs;
+mixed has four pairs but its interval still reaches +3.60 ms. No condition
+can be promoted to PASS from a favorable pooled point estimate.
 
-All 72 scheduled attempts produced CSV/JSON: 3600 requested markers per
-variant across nine conditions, 400 per variant per condition. Offline artifact
-validation passed 72/72 identity/consistency checks: every accepted match had
-the expected identity and a unique onset within the 5–2000 ms matching window;
-there were zero rejected below-floor onsets. The 95% matching gate passed 55
-attempts and failed 17. Total matches were 3470/3600 baseline and 3435/3600
-candidate; aggregate totals do not rescue a failed condition or attempt.
+The superseded attempt compared unfixed `b0c6e6b` with `47f96df`: four runs per
+variant, a wide idle interval (−8.65 to +8.71 ms), and handshake-loss queues
+near 640 ms made its impairment results uninterpretable. #54 fixes the
+pre-connection capture backlog; this rerun applies it to the pinned baseline
+and uses connected-start markers in both builds, with larger samples and
+explicit contention handling. Earlier raw evidence remains at
+`/private/tmp/gwar-5b-latency/`.
 
-Values below are **baseline / candidate**, in milliseconds unless noted.
-Quantiles pool matched markers from all four attempts, including the successful
-markers of failed attempts. Their latency statistics do not account for the
-unheard markers and cannot establish audio acceptance on their own.
+All **140/140 attempts** passed marker identity, unique-onset, timestamp,
+positive-floor, connected-warmup and callback-setting checks, and each matched
+at least 95% of its markers. Total matches, including contention, were
+**6975/7000 B and 6977/7000 C**; there were zero rejected below-floor onsets.
+Matched latencies ranged from 30.25 to 247.92 ms within the 5–2000 ms identity
+window. No measurement was retried or excluded from the retained full-series
+results. Missing markers occur only in injected loss/burst/stall/mixed profiles;
+all stall attempts lose marker 40, and mixed attempts lose 3–4 markers near
+recurrent stall/loss positions. This is consistent with the impairments;
+without per-packet identity traces it is not a proof of the cause of each loss.
 
-| Condition | Matched / 400 (B / C) | Median B / C | p95 B / C | Added p95 | p99 B / C | Failed matching runs B / C |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| idle | 400 / 400 | 37.34 / 37.38 | 47.18 / 45.87 | -1.31 | 47.66 / 47.60 | 0 / 0 |
-| loss | 387 / 385 | 678.87 / 708.92 | 781.69 / 779.46 | -2.23 | 784.19 / 783.32 | 2 / 1 |
-| reorder | 400 / 400 | 38.35 / 37.41 | 57.09 / 55.65 | -1.43 | 57.99 / 57.73 | 0 / 0 |
-| burst | 318 / 276 | 838.43 / 867.10 | 869.27 / 871.48 | +2.21 | 873.46 / 874.46 | 4 / 4 |
-| stall | 396 / 396 | 39.26 / 42.35 | 47.67 / 48.29 | +0.62 | 49.84 / 52.39 | 0 / 0 |
-| jitter | 400 / 400 | 47.40 / 47.28 | 67.08 / 48.63 | -18.45 | 68.74 / 49.24 | 0 / 0 |
-| callbacks | 400 / 400 | 67.48 / 67.57 | 86.50 / 76.60 | -9.90 | 88.31 / 78.50 | 0 / 0 |
-| mixed | 369 / 378 | 77.62 / 79.65 | 797.35 / 797.26 | -0.09 | 800.28 / 801.34 | 4 / 2 |
-| cpu | 400 / 400 | 39.56 / 37.36 | 66.26 / 41.21 | -25.05 | 69.52 / 56.76 | 0 / 0 |
+### Gate subset: complete uncontended original pairs
 
-Counters are cumulative across four runs including warmup. Queue and PCM
-columns are the maximum of four **final snapshots**, not continuous high-water
-measurements; they cannot prove the absence of sustained buildup. All sample
-counts are converted at 48 samples/ms.
+B / C denotes baseline / candidate; times are milliseconds. Matched counts
+use the per-variant denominator in the same row. Each row includes all
+successful markers of its eligible runs. The clean-pair requirement is shown
+explicitly so a small, favorable sample cannot pass.
 
-| Condition | Concealments B / C | Active underruns B / C | Final speaker max ms B / C | Final slot queue max ms B / C | Final staged PCM max ms B / C |
+| Condition | Pairs / required | Matched B / C (each requested) | Median B / C | p95 B / C | p99 B / C | Added p95 [95% paired interval] | Decision |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| idle | 7 / 10 | 700 / 700 (700) | 38.54 / 42.33 | 64.84 / 139.77 | 67.53 / 142.94 | +74.93; [-18.79, +94.25] | INCONCLUSIVE |
+| loss | 1 / 4 | 100 / 100 (100) | 47.33 / 37.29 | 48.93 / 38.53 | 53.34 / 39.41 | -10.40; not estimable (one pair) | INCONCLUSIVE |
+| reorder | 3 / 4 | 300 / 300 (300) | 37.50 / 37.78 | 47.72 / 57.36 | 48.98 / 58.36 | +9.64; [-0.17, +9.64] | INCONCLUSIVE |
+| burst | 3 / 4 | 296 / 297 (300) | 37.60 / 46.09 | 47.89 / 48.74 | 49.23 / 49.41 | +0.85; [-0.85, +10.27] | INCONCLUSIVE |
+| stall | 2 / 4 | 198 / 198 (200) | 37.38 / 43.20 | 47.29 / 48.04 | 48.30 / 48.84 | +0.75; [+0.28, +9.42] | INCONCLUSIVE |
+| jitter | 1 / 10 | 100 / 100 (100) | 47.35 / 47.39 | 48.92 / 66.29 | 49.36 / 68.14 | +17.36; not estimable (one pair) | INCONCLUSIVE |
+| callbacks | 3 / 10 | 300 / 300 (300) | 67.54 / 67.52 | 76.04 / 71.58 | 78.02 / 77.69 | -4.46; [-7.64, +7.44] | INCONCLUSIVE |
+| mixed | 4 / 4 | 385 / 385 (400) | 67.47 / 67.35 | 77.60 / 69.40 | 78.84 / 87.67 | -8.20; [-9.27, +3.60] | INCONCLUSIVE |
+| cpu | 6 / 10 | 600 / 600 (600) | 50.42 / 47.06 | 101.09 / 89.89 | 109.79 / 142.01 | -11.20; [-27.24, +76.68] | INCONCLUSIVE |
+
+Counters sum the same eligible runs and include warmup. Queue columns show
+**ranges of final snapshots**, not continuous high-water marks. Samples are
+converted at 48 samples/ms; speaker queue, encoded slot queue and staged
+decoded PCM are separate. These endpoint observations alone cannot establish
+absence of sustained buffering.
+
+| Condition | PLC B / C | Active underruns B / C | Final speaker ms B / C | Final packet queue ms B / C | Final PCM tail ms B / C |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| idle | 1 / 1 | 0 / 0 | 20.00 / 20.00 | 10.00 / 10.00 | 5.00 / 2.50 |
-| loss | 1020 / 1119 | 0 / 0 | 20.00 / 20.00 | 640.00 / 640.00 | 0.00 / 0.00 |
-| reorder | 68 / 65 | 0 / 0 | 20.00 / 20.00 | 20.00 / 20.00 | 7.50 / 5.00 |
-| burst | 2030 / 2116 | 0 / 0 | 20.00 / 20.00 | 640.00 / 640.00 | 0.00 / 0.00 |
-| stall | 43 / 43 | 0 / 0 | 20.00 / 20.00 | 20.00 / 20.00 | 5.00 / 2.50 |
-| jitter | 8 / 4 | 1 / 0 | 25.00 / 20.00 | 20.00 / 20.00 | 0.00 / 0.00 |
-| callbacks | 15 / 13 | 0 / 0 | 40.00 / 40.00 | 30.00 / 20.00 | 7.50 / 4.83 |
-| mixed | 763 / 768 | 0 / 0 | 20.00 / 20.00 | 30.00 / 30.00 | 0.00 / 0.00 |
-| cpu | 8 / 5 | 0 / 0 | 20.00 / 20.00 | 30.00 / 30.00 | 7.50 / 0.00 |
+| idle | 10 / 17 | 0 / 6 | 20.00 / 20.00–50.00 | 10.00–30.00 / 10.00–70.00 | 0.00–7.50 / 0.00–7.50 |
+| loss | 62 / 61 | 0 / 0 | 20.00 / 20.00 | 10.00 / 10.00 | 0.00 / 0.00 |
+| reorder | 50 / 44 | 0 / 0 | 20.00 / 20.00 | 10.00 / 10.00–20.00 | 0.00 / 0.00–5.00 |
+| burst | 145 / 148 | 0 / 0 | 20.00 / 20.00 | 10.00 / 10.00–20.00 | 0.00–5.00 / 0.00–7.50 |
+| stall | 21 / 20 | 0 / 0 | 20.00 / 20.00 | 0.00 / 10.00 | 0.00–2.50 / 2.50–7.50 |
+| jitter | 1 / 3 | 0 / 1 | 20.00 / 25.00 | 10.00 / 20.00 | 0.00 / 5.00 |
+| callbacks | 11 / 11 | 0 / 0 | 40.00 / 40.00 | 10.00–20.00 / 10.00–20.00 | 0.00–7.50 / 0.00–7.50 |
+| mixed | 406 / 425 | 0 / 0 | 20.00 / 20.00 | 10.00–20.00 / 20.00–30.00 | 0.00 / 0.00 |
+| cpu | 26 / 30 | 29 / 11 | 20.00–50.00 / 20.00–45.00 | 10.00–180.00 / 0.00–80.00 | 0.00–7.50 / 0.00–7.04 |
 
-The baseline jitter underrun was one event / 480 samples; candidate recorded
-zero active underruns across all conditions. Late drops were 63/61 (reorder),
-3/0 (jitter) and 23/35 (mixed), zero elsewhere. Loss and burst reached a final
-640 ms queue in both builds, with hundreds of milliseconds of measured delay.
-The baseline failures prevent attributing all impairment behavior to 5b, but
-the additional candidate losses/concealments under burst remain unresolved.
-This is not evidence of the required no-added-loss/no-sustained-queue gate.
+### Contended and unpaired results retained separately
 
-To expose run-to-run uncertainty, `summarize.py` resamples the four adjacent
-balanced baseline/candidate pairs (all 4^4 draws), repools each selection and
-computes its p95 difference. These are descriptive 2.5th–97.5th percentile
-intervals from only four pairs, not a certification of a shared-host 2 ms
-resolution.
+These tables are descriptive only; they do not contribute to the gate.
+Rows may contain unequal B/C run counts, so their pooled differences are not
+paired treatment estimates. The first table contains all 54 contended or
+initially uncontrolled runs. `—` means no runs in that subset.
 
-| Condition | Paired-run resampling interval for added p95 (ms) |
-| --- | ---: |
-| idle | -8.65 to +8.71 |
-| loss | -73.87 to +104.07 |
-| reorder | -9.98 to +9.89 |
-| burst | -3.24 to +29.26 |
-| stall | -0.54 to +4.47 |
-| jitter | -19.56 to -0.17 |
-| callbacks | -18.15 to +8.25 |
-| mixed | -19.92 to +13.04 |
-| cpu | -27.97 to -0.70 |
+| Condition | Runs B / C | Matched / requested B ; C | Median B / C | p95 B / C | p99 B / C | PLC B / C | Underruns B / C | Final packet queue ms B / C |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| idle | 9 / 12 | 900/900 ; 1200/1200 | 46.60 / 42.37 | 72.04 / 62.78 | 75.41 / 66.36 | 19 / 28 | 3 / 7 | 0.00–30.00 / 0.00–40.00 |
+| loss | 3 / 1 | 299/300 ; 100/100 | 47.38 / 97.32 | 88.32 / 98.85 | 103.15 / 99.57 | 205 / 74 | 9 / 6 | 20.00–40.00 / 50.00 |
+| reorder | 1 / 0 | 100/100 ; 0/0 | 37.69 / — | 47.52 / — | 48.69 / — | 17 / 0 | 0 / 0 | 20.00 / — |
+| burst | 1 / 1 | 99/100 ; 99/100 | 46.81 / 37.29 | 48.52 / 38.69 | 52.76 / 39.27 | 49 / 48 | 0 / 0 | 10.00 / 10.00 |
+| stall | 2 / 0 | 198/200 ; 0/0 | 44.51 / — | 48.05 / — | 48.91 / — | 21 / 0 | 0 / 0 | 10.00 / — |
+| jitter | 6 / 6 | 600/600 ; 600/600 | 47.50 / 47.37 | 75.48 / 57.73 | 77.66 / 59.08 | 13 / 11 | 3 / 0 | 10.00–40.00 / 10.00–30.00 |
+| callbacks | 1 / 6 | 100/100 ; 600/600 | 67.42 / 72.71 | 77.56 / 78.55 | 77.80 / 81.61 | 4 / 27 | 0 / 0 | 30.00 / 10.00–50.00 |
+| mixed | 0 / 0 | 0/0 ; 0/0 | — / — | — / — | — / — | 0 / 0 | 0 / 0 | — / — |
+| cpu | 3 / 2 | 300/300 ; 200/200 | 57.23 / 55.46 | 107.06 / 117.50 | 108.60 / 118.48 | 9 / 10 | 4 / 4 | 10.00–50.00 / 30.00–40.00 |
 
-In particular, the idle interval spans -8.65 to +8.71 ms despite its favorable
-pooled difference. Stall also spans the +2 ms boundary. Network jitter and CPU
-load showed lower candidate p95 in this sample; they do not override the
-failed or inconclusive conditions. Worker/crypto time is **not applicable**
-to this plaintext 5b comparison: no SFrame worker/crypto path exists yet.
-Per-stage timestamps and continuous queue traces are unavailable in the
-current native example; end-to-end decoded-output measurements are retained.
+The following table contains the 26 uncontended orphan runs whose original
+partner was contended. Together with the 60-run gate table, it accounts for
+**all 86 uncontended attempts**, without dropping inconvenient results.
 
-Raw data, wrapper/run scripts, binary hashes, conditions, artifact validation
-and analysis are retained at `/private/tmp/gwar-5b-latency/` (ignored symlink
-`target/5b-latency`). The six owned CPU workers were verified stopped. The
-temporary baseline checkout and its target were removed after measurement:
+| Condition | Runs B / C | Matched / requested B ; C | Median B / C | p95 B / C | p99 B / C | PLC B / C | Underruns B / C | Final packet queue ms B / C |
+| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| idle | 4 / 1 | 400/400 ; 100/100 | 37.94 / 37.28 | 50.32 / 38.38 | 52.89 / 38.88 | 4 / 0 | 0 / 0 | 10.00–20.00 / 10.00 |
+| loss | 0 / 2 | 0/0 ; 200/200 | — / 47.64 | — / 57.84 | — / 58.86 | 0 / 123 | 0 / 0 | — / 20.00–30.00 |
+| reorder | 0 / 1 | 0/0 ; 100/100 | — / 45.95 | — / 48.87 | — / 49.27 | 0 / 17 | 0 / 0 | — / 10.00 |
+| burst | 0 / 0 | 0/0 ; 0/0 | — / — | — / — | — / — | 0 / 0 | 0 / 0 | — / — |
+| stall | 0 / 2 | 0/0 ; 198/200 | — / 44.60 | — / 47.92 | — / 49.12 | 0 / 21 | 0 / 0 | — / 10.00 |
+| jitter | 3 / 3 | 300/300 ; 300/300 | 47.29 / 47.78 | 65.58 / 67.04 | 68.70 / 68.62 | 6 / 6 | 0 / 0 | 10.00–20.00 / 10.00–30.00 |
+| callbacks | 6 / 1 | 600/600 ; 100/100 | 72.14 / 72.67 | 78.03 / 81.80 | 79.52 / 83.37 | 26 / 5 | 0 / 0 | 10.00–30.00 / 20.00 |
+| mixed | 0 / 0 | 0/0 ; 0/0 | — / — | — / — | — / — | 0 / 0 | 0 / 0 | — / — |
+| cpu | 1 / 2 | 100/100 ; 200/200 | 102.03 / 97.91 | 107.36 / 117.35 | 108.27 / 118.45 | 7 / 7 | 1 / 6 | 60.00 / 40.00–50.00 |
 
-```sh
-git worktree add --detach /private/tmp/gwar-5b-baseline b0c6e6b
-# Separate baseline build shown above; all measurements finish before cleanup.
-git worktree remove --force /private/tmp/gwar-5b-baseline
-```
+### Anomalies and interpretation of the code differences
 
-Before calling 5b accepted, CI must execute the official-server probes, and
-latency acceptance needs a follow-up that resolves the impairment failures
-and measures the 2 ms limit without this run-to-run uncertainty. Real SFrame
-endpoints remain the 5c/5d acceptance work.
+- **Idle candidate regression:** clean candidate run 18 has p95 143.28 ms,
+  versus 38.41 ms in its paired baseline run 17. Its quarter-run medians are
+  37.18, 37.34, 142.25 and 139.02 ms: this is sustained late-run delay, not
+  just a single tail observation. It records six active underruns, 40 ms
+  output headroom, a 50 ms final speaker queue and a 70 ms packet queue.
+  It drives the clean pooled added p95 to +74.93 ms, with a wide
+  [−18.79, +94.25] ms interval. Insufficient clean pairs require the formal
+  INCONCLUSIVE decision, but this is adverse evidence requiring follow-up.
+- **Jitter:** the only complete clean pair adds 17.36 ms p95, and candidate
+  run 2 records one active underrun, 15 ms headroom and a 20 ms packet queue.
+  One pair cannot establish a repeatable regression or a precision interval.
+- **Reorder:** three clean pairs add 9.64 ms pooled p95, with
+  [−0.17, +9.64] ms uncertainty and no underruns. The candidate's final
+  packet queue reaches 20 ms versus 10 ms baseline. This does not meet the
+  2 ms evidence requirement.
+- **CPU:** eligible runs record 29/11 active underruns B/C. Baseline run 4
+  reaches 185.36 ms p95, 26 underruns and a 180 ms final packet queue;
+  candidate run 18 reaches 142.01 ms p95, five underruns and an 80 ms queue.
+  Thus severe queue/headroom recovery also occurs in the fixed baseline.
+  The favorable pooled candidate p95 does not establish stable behavior.
+- **Mixed:** all four pairs are clean, with 385/400 matches in each build and
+  no underruns. Added p95 is −8.20 ms but its interval is [−9.27, +3.60] ms;
+  candidate p99 is higher (87.67 versus 78.84 ms), PLC is 425 versus 406,
+  and final packet queues are 20–30 versus 10–20 ms. These prevent treating
+  its favorable p95 point estimate as proof of no added tail/queue cost.
+
+Inspection of `git diff b0c6e6b..2c03f3f -- crates/vc-client
+crates/vc-server/src/media` shows native Opus validation/counters,
+strictly increasing capture positions and a random RTP clock offset, plus
+SFU admission, source-generation/previous-span handling and synchronous
+binding/route checks. The native jitter buffer, decoded playout policy,
+packetization and thread-priority implementation are unchanged. Both measured
+variants contain the same #54 pre-connection discard. Valid continuous 10 ms
+capture preserves 480-tick source deltas; a random additive timestamp offset
+does not itself insert a queue, and the new previous-span floor acts on
+re-anchors rather than every continuous packet. No native validation/drop
+counter is nonzero in any of the 70 candidate logs. TeamSpeak-specific
+forwarding changes are not exercised by this local native-only harness.
+
+The best-supported mechanism for the large discontinuities is scheduling
+misses followed by the **existing** adaptive output headroom and packet-queue
+recovery: `voice/playout.rs` adds 5 ms headroom per underrun, retains it until
+30 seconds of quiet, and `voice/jitter.rs` requires a fresh five-second surplus
+window after PLC before shrinking. The measured headroom, queues and late-run
+marker plateaus fit that mechanism, including in baseline CPU runs. This is
+an explanation of how latency persists, **not a demonstrated root cause of
+why the candidate missed a deadline**. The candidate's extra synchronous hot
+path checks may affect scheduling/phase; short host stalls between five-second
+samples are also unobserved. There are no per-stage timing or continuous queue
+traces to separate those causes, and the candidate cannot be exonerated by
+unchanged buffering constants. No production code or tuning was modified.
+
+The old approximately 640 ms handshake-backlog state did not recur: across
+all new runs the largest final packet queue was 180 ms, in the CPU baseline.
+This supports using the fixed baseline, but does not resolve the remaining
+latency/underrun gate. Worker/crypto time is not applicable to this plaintext
+5b comparison; SFrame, browser, physical-device, WAN and TeamSpeak acceptance
+remain separate measurements.
+
+### Retained evidence and cleanup
+
+Raw CSV/JSON and logs are outside git at **`/tmp/gwar-5b-gate/`**
+(`/private/tmp/gwar-5b-gate/` on macOS). They include all 140 attempts,
+`conditions.json`, original and guarded manifests, `host-load.jsonl`,
+`guard-load.jsonl`, `interruptions.jsonl`, wrapper/run/analysis scripts,
+`analysis-guarded.json`, `validation-guarded.json`, native counter validation,
+the requested code diff, baseline patch/tree record, build logs and archived
+release executables in `binaries/`. Binary hashes were checked again after
+measurement and are unchanged:
+
+- B SHA-256: `3186f8a3e1c489fb6e342431b4e1c24bf85539db3f253c2012539265632198e0`.
+- C SHA-256: `1ae232443809f461bda8693b6f437410dd6c20a5b72a5112f901125ffa5f24a1`.
+
+The six owned CPU workers (8491–8496) exited on task cleanup and were verified
+absent. The temporary baseline worktree and its separate target were removed
+after measurement; the temporary candidate target was also removed after
+archiving the executables. Existing processes were left alone. Only this
+results document was committed, with no push or production-code change.
