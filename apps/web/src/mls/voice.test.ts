@@ -194,6 +194,7 @@ function fixture(options: { group?: boolean } = {}) {
   };
   const state = { channel: 7, call: CALL, participation: PART, encrypted: true, channel_group: PARENT, group: server.group, epoch: server.group ? server.head : null };
   const call = new VoiceCall(host, state);
+  activeCall = call;
   const controls: Control[] = [];
   let run = 0, closed = 0;
   let slowActivate: Promise<void> | null = null;
@@ -205,7 +206,8 @@ function fixture(options: { group?: boolean } = {}) {
     const control = async (body: Control) => {
       controls.push(body);
       // The engine applies at once; only the reply to an activation is delayed.
-      const result = await engine.control({ ...body, binding: { ...body.binding } });
+      inflight++;
+      const result = await engine.control({ ...body, binding: { ...body.binding } }).finally(() => { inflight--; });
       if (body.action === "activate" && slowActivate) await slowActivate;
       return result;
     };
@@ -216,11 +218,22 @@ function fixture(options: { group?: boolean } = {}) {
   return { server, world, call, controls, media, errors, agent: () => world.agent!, restarts: () => restarts, closed: () => closed, setParentClean: (v: boolean) => { parentClean = v; }, delayActivation: (p: Promise<void> | null) => { slowActivate = p; }, engines };
 }
 
-/** Advances fake time while letting real WebCrypto work (thread pool) complete. */
+/** Controls whose real WebCrypto work (thread pool) has not completed. */
+let inflight = 0;
+/** The fixture's call: a pass may await real WebCrypto too (descriptor digests). */
+let activeCall: VoiceCall | null = null;
+/** Advances fake time; after each step, waits (real time, bounded) until no
+ * engine control or controller pass is still waiting on real WebCrypto work,
+ * so slow CI machines see the same ordering as fast ones. */
 const settle = async (ms = 50) => {
   for (let i = 0; i < 10; i++) {
     await vi.advanceTimersByTimeAsync(ms / 10);
-    for (let j = 0; j < 20; j++) await new Promise(resolve => setImmediate(resolve));
+    const until = performance.now() + 200;
+    let quiet = 0;
+    while (quiet < 20 && performance.now() < until) {
+      await new Promise(resolve => setImmediate(resolve));
+      quiet = inflight > 0 || activeCall?.debug().running ? 0 : quiet + 1;
+    }
   }
 };
 const actions = (controls: Control[]) => controls.map(c => `${c.action}:${c.epoch}`);
