@@ -8,6 +8,37 @@ and cannot start encrypted voice. There is no SFrame dependency, key-install
 path or encrypted-to-plaintext fallback in this PR. Server-side encrypted
 routing is exercised by authenticated test peers, ready for 5c/5d.
 
+## Review round 3: wait for puppet bookkeeping before ingress probes
+
+Implementation: `be83d2e`. `Connected` follows `initserver`, before startup
+client notifications populate the puppet's client map. A one-shot receive probe
+could therefore finish with unknown own/source channels, correctly rejecting
+the packet but failing its readiness assertions.
+
+A `test-hooks`-only rendezvous now runs on the specific puppet task. It waits
+for its own confirmed channel, current receiver binding, and the source channel
+and identity matching the current mirror/routing snapshot. These checks are
+independent of plaintext admission. Classified voice/whisper probes await this
+before arming their exact-packet callback-exit observation and sending once.
+The initial controlled plaintext and replacement probes also wait; unclassified
+probes establish readiness before deliberately removing the source mirror.
+No production behavior changes with `test-hooks` disabled.
+
+The virtual-time hook regression delays the modeled startup client notifications
+for eight seconds, exercises plaintext and both encrypted boundaries, and keeps
+the probe unarmed through missing clients, wrong channels, a stale source binding
+and an unfinished receiver move. Removing the rendezvous wait fails at
+`probe armed before readiness` (exit 101); the wait was restored.
+
+Local verification: format, workspace clippy/tests (659 passed), full server
+`test-hooks` tests (368 passed), all 55 bridge hook tests, hook-enabled clippy,
+`voice_opaque_srtp`, and official `teamspeak_channels --no-run` passed.
+Logs: `target/5b-round3/`. Official TeamSpeak execution remains CI-only.
+Implementation CI: [38882082979](https://github.com/MaciejWlodarski/gwar/actions/runs/38882082979)
+passed all seven jobs: Rust (including official TeamSpeak bridge/channel suites),
+web, desktop on all three platforms, mls-wasm and audit. The final documentation
+commit's CI run and result are recorded in the implementation handoff.
+
 ## Review round 2: deterministic TeamSpeak probes and immediate sends
 
 Implementation: `56aef87`; main merge: `62791e1`; permanent hook CI coverage:
