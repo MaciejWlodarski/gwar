@@ -12,6 +12,7 @@ for name, expected in [
     ("source_voice", "forbidden TS admission, marker=52"),
     ("source_whisper", "forbidden TS admission, marker=53"),
     ("listener_generation", "queued text survived its listener connection"),
+    ("command_barrier", "official probe command acknowledgement"),
 ]:
     try:
         if name.startswith("source_"):
@@ -23,6 +24,10 @@ for name, expected in [
                 line = "    ingress_attempt(probe, &shared, client.welcome.session, ts_clid, clid, false, 52).await;\n"
                 assert line in originals[probe]
                 probe.write_text(originals[probe].replace(line, ""))
+        elif name == "command_barrier":
+            changed = originals[probe].replace('"clientupdate",\n                        );', '"clientgetconnectioninfo",\n                        );').replace('cmd.write_arg("client_input_muted", &0);', 'cmd.write_arg("clid", &con.get_state().unwrap().own_client.0);')
+            assert changed != originals[probe]
+            probe.write_text(changed)
         else:
             changed = originals[listeners].replace(" && l.connection.load(Ordering::Acquire) == text.connection", "")
             assert changed != originals[listeners]
