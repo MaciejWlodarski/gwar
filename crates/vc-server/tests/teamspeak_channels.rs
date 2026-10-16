@@ -176,11 +176,14 @@ async fn teamspeak_server_admins_manage_permissions_of_mirrored_channels() {
         ts_clid,
     )
     .await;
+    #[cfg(feature = "test-hooks")]
+    queued_listener_reconnect(&query, query_port, password.trim(), cid.parse().unwrap()).await;
 }
 
 /// A real official-server endpoint. Commands and received bytes stay on its
 /// transport task, so every positive control also proves the socket is driven.
 enum ProbeCmd {
+    Barrier(tokio::sync::oneshot::Sender<()>),
     Voice(Vec<u8>),
     Whisper(u16, Vec<u8>),
     Text(u8, u16, String),
@@ -190,11 +193,17 @@ enum ProbeEvent {
     Audio(Vec<u8>),
     Text(String),
 }
+#[path = "common/probe_support.rs"]
+mod probe_support;
+
 struct Probe {
     tx: tokio::sync::mpsc::Sender<ProbeCmd>,
     rx: tokio::sync::mpsc::Receiver<ProbeEvent>,
     task: tokio::task::JoinHandle<()>,
     forbidden_text: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    audio_counts: std::sync::Arc<probe_support::AudioCounts>,
+    allowed: [u64; 256],
+    forbidden: std::collections::BTreeSet<u8>,
 }
 impl Drop for Probe {
     fn drop(&mut self) {
@@ -208,8 +217,12 @@ impl Probe {
         let (events, rx) = tokio::sync::mpsc::channel(1024);
         let forbidden_text = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let text_count = forbidden_text.clone();
+        let audio_counts = std::sync::Arc::new(probe_support::AudioCounts::default());
+        let received_audio = audio_counts.clone();
         let task = tokio::spawn(async move {
             let mut id = 0u16;
+            let mut barriers: std::collections::HashMap<tsclientlib::MessageHandle, tokio::sync::oneshot::Sender<()>> =
+                std::collections::HashMap::new();
             loop {
                 let command = {
                     let mut stream = con.events();
@@ -221,15 +234,21 @@ impl Probe {
                                     let data=match p.data().data() {
                                         AudioData::S2C{data,..}|AudioData::S2CWhisper{data,..}=>Some(data.to_vec()), _=>None
                                     };
-                                    if let Some(data)=data { events.send(ProbeEvent::Audio(data)).await.unwrap(); }
+                                    if let Some(data)=data {
+                                        received_audio.record(&data);
+                                        let _ = events.try_send(ProbeEvent::Audio(data));
+                                    }
                                 },
                                 StreamItem::BookEvents(book)=> for event in book {
                                     if let tsclientlib::events::Event::Message{message,..}=event {
                                         if message.contains("S6-STALE-TEXT") || message.contains("S6-SEALED-TEXT") {
                                             text_count.fetch_add(message.len(),std::sync::atomic::Ordering::Relaxed);
                                         }
-                                        events.send(ProbeEvent::Text(message)).await.unwrap();
+                                        let _ = events.try_send(ProbeEvent::Text(message));
                                     }
+                                },
+                                StreamItem::MessageResult(handle, _) => {
+                                    if let Some(reply) = barriers.remove(&handle) { let _ = reply.send(()); }
                                 },
                                 _=>{}
                             }
@@ -238,6 +257,17 @@ impl Probe {
                     }
                 };
                 match command {
+                    Some(ProbeCmd::Barrier(reply)) => {
+                        let mut cmd = OutCommand::new(
+                            Direction::C2S,
+                            Flags::empty(),
+                            PacketType::Command,
+                            "clientgetconnectioninfo",
+                        );
+                        cmd.write_arg("clid", &con.get_state().unwrap().own_client.0);
+                        let handle = cmd.send_with_result(&mut con).unwrap();
+                        barriers.insert(handle, reply);
+                    }
                     Some(ProbeCmd::Voice(data)) => {
                         con.send_audio(OutAudio::new(&AudioData::C2S { id, codec: CodecType::OpusVoice, data: &data }))
                             .unwrap();
@@ -268,12 +298,12 @@ impl Probe {
                 }
             }
         });
-        Self { tx, rx, task, forbidden_text }
+        Self { tx, rx, task, forbidden_text, audio_counts, allowed: [0; 256], forbidden: Default::default() }
     }
     async fn audio(&mut self, marker: u8) {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if let Some(ProbeEvent::Audio(bytes)) = self.rx.recv().await
+                if let ProbeEvent::Audio(bytes) = self.rx.recv().await.expect("official probe ended")
                     && bytes.get(1) == Some(&marker)
                 {
                     return;
@@ -286,7 +316,7 @@ impl Probe {
     async fn text(&mut self, wanted: &str) {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if let Some(ProbeEvent::Text(text)) = self.rx.recv().await
+                if let ProbeEvent::Text(text) = self.rx.recv().await.expect("official probe ended")
                     && text.contains(wanted)
                 {
                     return;
@@ -296,17 +326,34 @@ impl Probe {
         .await
         .expect("working plaintext TeamSpeak text control");
     }
-    async fn forbidden_bytes(&mut self, marker: u8) -> usize {
-        let end = tokio::time::Instant::now() + Duration::from_millis(300);
-        let mut bytes = 0;
-        while let Ok(Some(event)) = tokio::time::timeout_at(end, self.rx.recv()).await {
-            if let ProbeEvent::Audio(data) = event
-                && data.get(1) == Some(&marker)
-            {
-                bytes += data.len();
-            }
+    async fn barrier(&self) {
+        let (reply, done) = tokio::sync::oneshot::channel();
+        self.tx.send(ProbeCmd::Barrier(reply)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), done).await.unwrap().unwrap();
+    }
+    async fn forbidden_bytes(&mut self, marker: u8) -> u64 {
+        self.forbidden.insert(marker);
+        self.barrier().await;
+        self.audio_counts.bytes(marker) - self.allowed[usize::from(marker)]
+    }
+    async fn assert_forbidden_totals(&self) {
+        self.barrier().await;
+        for &marker in &self.forbidden {
+            assert_eq!(
+                self.audio_counts.bytes(marker),
+                self.allowed[usize::from(marker)],
+                "cumulative forbidden marker {marker}"
+            );
         }
-        bytes
+    }
+    async fn control(&self, peer: &common::rtc::Peer, marker: u8, sequence: &mut u64) {
+        let before = self.audio_counts.bytes(marker);
+        probe_support::control(
+            |seq| peer.send(seq, seq as u32 * 960, vec![0xf8, marker, seq as u8]),
+            || self.audio_counts.bytes(marker) > before,
+            sequence,
+        )
+        .await;
     }
 }
 
@@ -347,12 +394,9 @@ async fn s6_payload_boundaries(
     admin.ok("channel.join", json!({"channel":1})).await;
     let mut peer = common::rtc::Peer::start(admin, 1).await;
     let puppet = puppet_id(query, "root").await;
-    // Wait for the initial move acknowledgement using an actual audio control.
-    for sequence in 0..20 {
-        peer.send(sequence, sequence as u32 * 960, vec![0xf8, 11, sequence as u8]).await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    probe.audio(11).await;
+    let mut sequence = 0;
+    // Send fresh packets until route confirmation and actual delivery.
+    probe.control(&peer, 11, &mut sequence).await;
     probe.tx.send(ProbeCmd::Voice(vec![0xf8, 12, 1])).await.unwrap();
     assert_eq!(peer.receive().await.payload[1], 12);
     probe.tx.send(ProbeCmd::Whisper(puppet, vec![0xf8, 13, 1])).await.unwrap();
@@ -394,11 +438,11 @@ async fn s6_payload_boundaries(
     probe.tx.send(ProbeCmd::Text(2, 0, "s6 listener after reconnect".into())).await.unwrap();
     admin.next_event_where("chat.message", |m| m["text"] == "s6 listener after reconnect").await;
 
-    // Keep the puppet for direct messages while leaving voice (also covers its
-    // grace-period existence). Direct text remains a working independent route.
-    let ts_session = admin.welcome.clients.iter().find(|c| c.nickname == "ts-admin").expect("mirrored TS user").id;
-    admin.ok("chat.send", json!({"target":{"client":ts_session},"text":"s6 private plaintext"})).await;
-    probe.text("s6 private plaintext").await;
+    // No private conversation has retained this puppet yet.
+    let ts_session = admin.next_event_where("client.joined", |c| c["nickname"] == "ts-admin").await["id"]
+        .as_u64()
+        .expect("mirrored TS user") as u32;
+
     let origin = server.running.core.audio_origin(admin.welcome.session).await.unwrap();
     let frame = AudioPacket {
         origin: origin.clone(),
@@ -414,12 +458,13 @@ async fn s6_payload_boundaries(
     // Positive control for direct fanout/uplink injection before classification.
     server.running.plane.uplinks.uplink(&server.running.plane.routing.load(), &frame);
     probe.audio(21).await;
+    probe.allowed[21] = probe.audio_counts.bytes(21);
     let mut encrypted = frame.clone();
     let mut fixed = (*origin).clone();
     fixed.encrypted = true;
     fixed.channel = sealed;
     encrypted.origin = Arc::new(fixed);
-    encrypted.payload = Arc::from([0xff, 99, 0]);
+    encrypted.payload = Arc::from([0xf8, 99, 0]);
     let attempt = |packet: AudioPacket| {
         let plane = &server.running.plane;
         plane.uplinks.uplink(&plane.routing.load(), &packet);
@@ -433,6 +478,9 @@ async fn s6_payload_boundaries(
     assert_eq!(probe.forbidden_bytes(99).await, 0, "encrypted egress bytes");
     // Voice move invalidates previously admitted plaintext as well as ciphertext.
     admin.ok("channel.join", json!({"channel":2})).await;
+    // Channel 2 has no TS remote and no private chat retention: this is the
+    // actual 20-second grace-only puppet, not a DM puppet described as grace.
+    assert_eq!(puppet_id(query, "root").await, puppet);
     server.running.plane.uplinks.uplink(&server.running.plane.routing.load(), &frame);
     assert_eq!(probe.forbidden_bytes(21).await, 0, "queued old-route bytes");
     // A refused encrypted entry cannot authorize a route or relabel its queue.
@@ -446,11 +494,8 @@ async fn s6_payload_boundaries(
     // Return creates a fresh participation and transport; the old frame stays old.
     admin.ok("channel.join", json!({"channel":1})).await;
     peer = common::rtc::Peer::start(admin, 2).await;
-    for seq in 0..20 {
-        peer.send(seq, seq as u32 * 960, vec![0xf8, 32, 1]).await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    probe.audio(32).await;
+    let mut sequence = 0;
+    probe.control(&peer, 32, &mut sequence).await;
     server.running.plane.uplinks.uplink(&server.running.plane.routing.load(), &frame);
     assert_eq!(probe.forbidden_bytes(21).await, 0);
     // Official transport replacement: queue old-origin packets, kick only our
@@ -470,17 +515,18 @@ async fn s6_payload_boundaries(
     })
     .await
     .expect("replacement puppet");
-    for seq in 20..40 {
-        peer.send(seq, seq as u32 * 960, vec![0xf8, 33, 1]).await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    probe.audio(33).await;
+    probe.control(&peer, 33, &mut sequence).await;
     server.running.plane.uplinks.uplink(&server.running.plane.routing.load(), &encrypted);
+    // This traverses the actual source puppet after the injections. Its audio
+    // queue has priority over commands; receiving this text proves queue progress.
+    admin.ok("chat.send", json!({"target":{"client":ts_session},"text":"s6 final source barrier"})).await;
+    probe.text("s6 final source barrier").await;
     assert_eq!(probe.forbidden_bytes(99).await, 0);
     eprintln!(
         "S6: official plaintext voice/whisper, puppet/query/listener/private text, move/re-entry/refused-entry/reconnect controls; encrypted egress bytes=0"
     );
     s6_controlled_routes(&mut probe, voice, default_cid, sealed_cid, ts_clid).await;
+    probe.assert_forbidden_totals().await;
 }
 
 /// Control the actual puppet's command/route boundary against the same official
@@ -540,11 +586,8 @@ async fn s6_controlled_routes(
     let handle = puppet::spawn(voice, spec(1, route.clone()), shared.clone(), events.clone());
     let connected = tokio::time::timeout(Duration::from_secs(20), event_rx.recv()).await.unwrap().unwrap();
     let PuppetEvent::Connected { clid, .. } = connected else { panic!("controlled puppet did not connect") };
-    for seq in 0..20 {
-        peer.send(seq, seq as u32 * 960, vec![0xf8, 40, 1]).await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    probe.audio(40).await;
+    let mut sequence = 0;
+    probe.control(&peer, 40, &mut sequence).await;
     // Both actual incoming audio routes have plaintext controls.
     probe.tx.send(ProbeCmd::Voice(vec![0xf8, 46, 1])).await.unwrap();
     assert_eq!(peer.receive().await.payload[1], 46);
@@ -580,21 +623,53 @@ async fn s6_controlled_routes(
     .expect("official refusal retires route");
     shared.plane.uplinks.uplink(&shared.plane.routing.load(), &packet(42, refused.clone()));
     assert_eq!(probe.forbidden_bytes(42).await, 0, "refused-route egress");
-    let restored = AudioRoute::new(3, default_cid, Some(origin.clone()));
+    #[allow(unused_mut)]
+    let mut restored = AudioRoute::new(3, default_cid, Some(origin.clone()));
     assert!(handle.send(PuppetCmd::Move { cid: default_cid, route: 3, audio: restored.clone(), voice: true }));
-    for seq in 20..40 {
-        peer.send(seq, seq as u32 * 960, vec![0xf8, 43, 1]).await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    probe.control(&peer, 43, &mut sequence).await;
+    #[cfg(feature = "test-hooks")]
+    {
+        let (armed, arm) = tokio::sync::oneshot::channel();
+        let (held, tail) = tokio::sync::oneshot::channel();
+        let (release, resume) = tokio::sync::oneshot::channel();
+        assert!(handle.send(PuppetCmd::HoldTail { armed, held, release: resume }));
+        arm.await.unwrap();
+        shared.sent_end_route.store(0, std::sync::atomic::Ordering::Release);
+        let mut half = packet(60, restored.clone());
+        half.payload = Arc::from([0xf0, 60, 1]);
+        half.span = 480;
+        shared.plane.uplinks.uplink(&shared.plane.routing.load(), &half);
+        tokio::time::timeout(Duration::from_secs(5), tail).await.unwrap().unwrap();
+        let mut end = AudioPacket::end_of_speech(origin.clone(), None);
+        end.egress = Some(restored.clone());
+        shared.plane.uplinks.uplink(&shared.plane.routing.load(), &end);
+        let next = AudioRoute::new(30, default_cid, Some(origin.clone()));
+        assert!(handle.send(PuppetCmd::Move { cid: default_cid, route: 30, audio: next.clone(), voice: true }));
+        release.send(()).unwrap();
+        probe.control(&peer, 61, &mut sequence).await;
+        assert_eq!(probe.forbidden_bytes(60).await, 0, "held native tail crossed retirement");
+        assert_ne!(
+            shared.sent_end_route.load(std::sync::atomic::Ordering::Acquire),
+            restored.generation,
+            "queued old end marker reached transport"
+        );
+        restored = next;
     }
-    probe.audio(43).await;
-    // Fixed source classification at the TS callback: both voice and whispers
-    // are dropped before Opus inspection when the classified origin is sealed.
+
+    // Delayed classification: observe and discard now, then classify. These
+    // packets cannot be retrospectively assigned a newer source route.
+    shared.forget(ts_clid);
+    ingress_attempt(probe, &shared, clid, false, 50).await;
+    ingress_attempt(probe, &shared, clid, true, 51).await;
+    shared.mirror(ts_clid, default_cid, remote_origin.clone());
+    peer.silent().await;
+    // Independently exercise source-mode rejection with valid Opus framing.
     let mut sealed_origin = (*remote_origin).clone();
     sealed_origin.encrypted = true;
     shared.mirror(ts_clid, default_cid, Arc::new(sealed_origin));
-    probe.tx.send(ProbeCmd::Voice(vec![0xff, 99, 0])).await.unwrap();
-    probe.tx.send(ProbeCmd::Whisper(clid, vec![0xff, 99, 0])).await.unwrap();
-    peer.silent().await; // zero admitted TeamSpeak ciphertext payload bytes
+    ingress_attempt(probe, &shared, clid, false, 52).await;
+    ingress_attempt(probe, &shared, clid, true, 53).await;
+    peer.silent().await;
     shared.mirror(ts_clid, default_cid, isolated.running.core.audio_origin(remote).await.unwrap());
     probe.tx.send(ProbeCmd::Voice(vec![0xf8, 48, 1])).await.unwrap();
     assert_eq!(peer.receive().await.payload[1], 48);
@@ -614,6 +689,7 @@ async fn s6_controlled_routes(
     assert!(handle.send(PuppetCmd::Text { mode: 1, target: ts_clid, text: "S6-STALE-TEXT".into(), channel: None }));
     drop(handle);
     let replacement = AudioRoute::new(5, default_cid, Some(origin.clone()));
+    let events_for_encrypted = events.clone();
     let fresh = puppet::spawn(voice, spec(2, replacement.clone()), shared.clone(), events);
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
@@ -624,11 +700,7 @@ async fn s6_controlled_routes(
     })
     .await
     .unwrap();
-    for seq in 40..60 {
-        peer.send(seq, seq as u32 * 960, vec![0xf8, 45, 1]).await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    probe.audio(45).await;
+    probe.control(&peer, 45, &mut sequence).await;
     shared.plane.uplinks.uplink(&shared.plane.routing.load(), &packet(44, restored));
     assert_eq!(probe.forbidden_bytes(44).await, 0, "old transport egress");
     assert!(fresh.send(PuppetCmd::Text {
@@ -650,7 +722,118 @@ async fn s6_controlled_routes(
         "queued or sealed text bytes at official egress"
     );
     drop(fresh);
+    let (sealed_client, mut sealed_peer) = common::rtc::encrypted_peer(&isolated).await;
+    let sealed_origin = isolated.running.core.audio_origin(sealed_client.welcome.session).await.unwrap();
+    assert!(sealed_origin.encrypted);
+    let sealed_route = AudioRoute::new(6, default_cid, Some(sealed_origin));
+    let encrypted_handle = puppet::spawn(
+        voice,
+        PuppetSpec {
+            session: sealed_client.welcome.session,
+            nickname: "s6-encrypted-target".into(),
+            ..spec(3, sealed_route)
+        },
+        shared.clone(),
+        events_for_encrypted,
+    );
+    let encrypted_clid = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Some(PuppetEvent::Connected { generation: 3, clid, .. }) = event_rx.recv().await {
+                break clid;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    // A normal bridge would never authorize this puppet for encrypted voice.
+    // Force a real TS receive callback against an admitted encrypted SRTP peer:
+    // each valid Opus route must be observed, with zero admission independently.
+    ingress_attempt(probe, &shared, encrypted_clid, false, 54).await;
+    sealed_peer.silent().await;
+    ingress_attempt(probe, &shared, encrypted_clid, true, 55).await;
+    sealed_peer.silent().await;
+    drop(encrypted_handle);
     eprintln!(
         "S6 controlled official routes: queued/move/refusal/reconnect payload bytes=0; sealed incoming voice+whisper payload bytes=0"
     );
+}
+
+/// Sending is not evidence of arrival. Wait until the actual puppet callback
+/// sees this route, then assert its admission count has not changed.
+async fn ingress_attempt(
+    probe: &Probe,
+    shared: &vc_server::teamspeak::puppet::Shared,
+    clid: u16,
+    whisper: bool,
+    marker: u8,
+) {
+    use std::sync::atomic::Ordering;
+    let (received, admitted, classified) = if whisper {
+        (&shared.ingress.whisper_received, &shared.ingress.whisper_admitted, &shared.ingress.whisper_classified)
+    } else {
+        (&shared.ingress.voice_received, &shared.ingress.voice_admitted, &shared.ingress.voice_classified)
+    };
+    let before = received.load(Ordering::Acquire);
+    let known = classified.load(Ordering::Relaxed);
+    let allowed = admitted.load(Ordering::Relaxed);
+    let packet = vec![0xf8, marker, 1];
+    assert_eq!(vc_proto::opus::packet_samples(&packet), Some(960));
+    // The encrypted receiver probes must also prove a recognized plaintext
+    // source and confirmed TS channel, excluding a startup-classification drop.
+    let require_classified = matches!(marker, 54 | 55);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            probe
+                .tx
+                .send(if whisper { ProbeCmd::Whisper(clid, packet.clone()) } else { ProbeCmd::Voice(packet.clone()) })
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if received.load(Ordering::Acquire) > before
+                && (!require_classified || classified.load(Ordering::Relaxed) > known)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("injected packet reached the classified TS admission callback");
+    assert_eq!(admitted.load(Ordering::Relaxed), allowed, "forbidden TS admission, whisper={whisper}");
+}
+
+#[cfg(feature = "test-hooks")]
+async fn queued_listener_reconnect(query: &Query, port: u16, password: &str, cid: u64) {
+    use vc_server::teamspeak::listeners::ChannelListeners;
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let mut listeners = ChannelListeners::new(format!("127.0.0.1:{port}").parse().unwrap(), password.into(), tx);
+    listeners.reconcile([cid]);
+    let name = format!("Gwar chat {cid}");
+    let first = puppet_id(query, &name).await;
+    let me = query.call(Cmd::new("whoami")).await.unwrap()[0]["client_id"].clone();
+    query.call(Cmd::new("clientmove").arg("clid", me).arg("cid", cid)).await.unwrap();
+    query
+        .call(Cmd::new("sendtextmessage").arg("targetmode", 2).arg("target", cid).arg("msg", "queued listener old"))
+        .await
+        .unwrap();
+    let old = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+    assert!(listeners.accepts(&old));
+    query
+        .call(Cmd::new("clientkick").arg("clid", first).arg("reasonid", 5).arg("reasonmsg", "queued listener probe"))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while puppet_id(query, &name).await == first {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!listeners.accepts(&old), "queued text survived its listener connection");
+    query
+        .call(Cmd::new("sendtextmessage").arg("targetmode", 2).arg("target", cid).arg("msg", "queued listener fresh"))
+        .await
+        .unwrap();
+    let fresh = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap().unwrap();
+    assert!(listeners.accepts(&fresh));
+    assert_eq!(fresh.text, "queued listener fresh");
 }

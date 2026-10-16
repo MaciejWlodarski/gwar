@@ -20,7 +20,7 @@ use super::query::Query;
 const MAX_LISTENERS: usize = 128;
 const RETRY: Duration = Duration::from_secs(5);
 
-pub(super) struct Text {
+pub struct Text {
     pub cid: u64,
     pub generation: u64,
     pub connection: u64,
@@ -40,7 +40,7 @@ impl Drop for Listener {
     }
 }
 
-pub(super) struct ChannelListeners {
+pub struct ChannelListeners {
     addr: SocketAddr,
     password: String,
     listeners: BTreeMap<u64, Listener>,

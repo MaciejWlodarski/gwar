@@ -956,6 +956,17 @@ impl<'a> Bridge<'a> {
                 self.shared.forget(clid);
                 if let Err(e) = self.query.call(Cmd::new("clientmove").arg("clid", clid).arg("cid", cid)).await {
                     warn!(clid, "TeamSpeak move: {e:#}");
+                    // A refusal emits no notifyclientmoved. Read the confirmed
+                    // location (it may have changed remotely while we waited),
+                    // reconcile core participation and mint a fresh mirror route.
+                    match self.query.call(Cmd::new("clientinfo").arg("clid", clid)).await {
+                        Ok(records) => {
+                            if let Some(cid) = records.first().and_then(|r| r.get("cid")).and_then(|v| v.parse().ok()) {
+                                self.client_moved(clid, cid).await;
+                            }
+                        }
+                        Err(e) => warn!(clid, "TeamSpeak refused move reconciliation: {e:#}"),
+                    }
                 }
             }
             Event::ClientLeft { client, reason } => {
@@ -1415,6 +1426,8 @@ mod tests {
                 let name = line.split(' ').next().unwrap_or_default().to_owned();
                 seen.lock().unwrap().push(line);
                 let reply = match name.as_str() {
+                    "clientmove" if refuse => "error id=2568 msg=insufficient\\sclient\\spermissions\n\r",
+                    "clientinfo" => "cid=10\n\rerror id=0 msg=ok\n\r",
                     "channelcreate" => "cid=42\n\rerror id=0 msg=ok\n\r",
                     "channeladdperm" if refuse => "error id=2568 msg=insufficient\\sclient\\spermissions\n\r",
                     _ => "error id=0 msg=ok\n\r",
@@ -1424,6 +1437,105 @@ mod tests {
         });
         let (query, _notes) = Query::connect(addr, "serveradmin", "p", 1).await.unwrap();
         (query, commands)
+    }
+
+    #[tokio::test]
+    async fn refused_remote_move_restores_confirmed_source_route() {
+        use crate::{
+            core::expiry_tests::test_core_teamspeak,
+            media::{MediaPlane, Routing},
+            store::Store,
+        };
+
+        let store = Store::in_memory().unwrap();
+        store.init_server_chat(false).unwrap();
+        let core = test_core_teamspeak(store).unwrap();
+        let (notes, mut receiver) = mpsc::unbounded_channel();
+        core.bridge(BridgeMsg::Attach(notes)).await;
+        let BridgeNote::Snapshot { server, .. } = receiver.recv().await.unwrap() else { panic!("snapshot") };
+        let (webrtc, _media) = mpsc::channel(8);
+        let plane = MediaPlane {
+            routing: Arc::new(arc_swap::ArcSwap::from_pointee(Routing::default())),
+            sinks: Arc::default(),
+            uplinks: Arc::default(),
+            webrtc,
+        };
+        let (query, commands) = channel_query(true).await;
+        commands.lock().unwrap().clear();
+        let dir = tempfile::tempdir().unwrap();
+        let mut identities = Identities::load(&dir.path().join("identities.json")).unwrap();
+        let (puppet_events, _puppets) = mpsc::channel(8);
+        let (listener_events, _listeners) = mpsc::channel(8);
+        let mut bridge = Bridge {
+            query,
+            core: core.clone(),
+            shared: Arc::new(Shared::new(core.clone(), plane)),
+            voice: "127.0.0.1:1".parse().unwrap(),
+            public_url: None,
+            identities: &mut identities,
+            puppet_uids: HashSet::new(),
+            map: ChannelMap::load(&dir.path().join("channels.json")).unwrap(),
+            ts: HashMap::new(),
+            channels: BTreeMap::new(),
+            server: Some(server),
+            locals: HashMap::new(),
+            remotes: HashMap::new(),
+            puppet_clids: HashMap::new(),
+            puppet_events,
+            puppet_group: None,
+            listeners: ChannelListeners::new("127.0.0.1:1".parse().unwrap(), "p".into(), listener_events),
+            descriptions: HashMap::new(),
+            query_clid: None,
+            locked: HashSet::new(),
+        };
+        bridge.map.link(1, 10);
+        bridge.map.link(2, 20);
+        let session = core
+            .remote_join(RemoteClient {
+                uid: "ts:refused".into(),
+                nickname: "remote".into(),
+                channel: 1,
+                platform: Platform::Desktop,
+                muted: false,
+                deafened: false,
+                away: None,
+            })
+            .await
+            .unwrap();
+        bridge.remotes.insert(7, remote(session, 10));
+        let original = core.audio_origin(session).await.unwrap();
+        bridge.shared.mirror(7, 10, original.clone());
+        let old = bridge.shared.mirrors.read().unwrap()[&7].clone();
+        core.bridge(BridgeMsg::Update(session, RemoteUpdate { channel: Some(2), ..Default::default() })).await;
+        let moved = core.audio_origin(session).await.unwrap(); // actor barrier
+        assert_eq!(moved.channel, 2);
+        // Bridge-origin updates suppress echo; supply the same administrative
+        // event a local move would produce, without replacing the bridge.
+        bridge
+            .on_event(Event::ClientUpdated(Client {
+                id: session,
+                uid: "ts:refused".into(),
+                nickname: "remote".into(),
+                channel: Some(2),
+                groups: vec![],
+                platform: Platform::Desktop,
+                muted: false,
+                deafened: false,
+                away: None,
+                talking: false,
+                voice: true,
+                voice_binding: Some(moved.binding.clone()),
+            }))
+            .await;
+        let restored = core.audio_origin(session).await.unwrap();
+        assert_eq!(restored.channel, 1);
+        assert_ne!(restored.binding, original.binding);
+        assert!(!old.is_current());
+        let fresh = bridge.shared.mirrors.read().unwrap()[&7].clone();
+        assert!(fresh.generation > old.generation);
+        assert!(fresh.permits(&restored));
+        assert_eq!(bridge.remotes[&7].cid, 10);
+        assert!(commands.lock().unwrap().iter().any(|c| c.starts_with("clientinfo clid=7")));
     }
 
     #[tokio::test]

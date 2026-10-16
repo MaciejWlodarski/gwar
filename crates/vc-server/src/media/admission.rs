@@ -14,6 +14,7 @@ pub struct RtpCounters {
     pub rtp_source_reset: u64,
     pub rtp_zero_delta: u64,
     pub oversize_dropped: u64,
+    pub rtp_oversize_datagram: u64,
     pub malformed_dropped: u64,
 }
 
@@ -44,7 +45,7 @@ impl RtpAdmission {
         false
     }
 
-    pub fn admits_datagram(&mut self, data: &[u8]) -> bool {
+    pub fn admits_datagram(&mut self, data: &[u8], encrypted: bool) -> bool {
         // Same demultiplexing as str0m 0.24.1 MultiplexKind: RTP version range
         // and the RTCP payload-type escape range (64..96 after masking marker).
         if data.first().is_some_and(|b| (128..192).contains(b)) {
@@ -55,7 +56,34 @@ impl RtpAdmission {
                 self.counters.malformed_dropped += 1;
                 return false;
             }
-            return self.admits_ssrc(u32::from_be_bytes(data[8..12].try_into().unwrap()));
+            if !self.admits_ssrc(u32::from_be_bytes(data[8..12].try_into().unwrap())) {
+                return false;
+            }
+            // CSRCs and the extension length are clear even with SRTP. Validate
+            // their bounds before str0m can materialise an authenticated payload.
+            let mut header = 12 + 4 * usize::from(data[0] & 0x0f);
+            if data[0] & 0x10 != 0 {
+                let Some(ext) = data.get(header..header + 4) else {
+                    self.counters.malformed_dropped += 1;
+                    return false;
+                };
+                header += 4 + 4 * usize::from(u16::from_be_bytes([ext[2], ext[3]]));
+            }
+            let Some(remaining) = data.len().checked_sub(header) else {
+                self.counters.malformed_dropped += 1;
+                return false;
+            };
+            // str0m negotiates 10-byte AES-CM or 16-byte AEAD SRTP tags.
+            // RTP padding has an encrypted one-byte count: allow at most 255
+            // bytes, and only with P set. Ingest retains the exact payload cap.
+            let padding = if data[0] & 0x20 != 0 { 255 } else { 0 };
+            let cap = if encrypted { MAX_ENCRYPTED } else { MAX_PLAINTEXT };
+            if remaining > cap + 16 + padding {
+                self.counters.oversize_dropped += 1;
+                self.counters.rtp_oversize_datagram += 1;
+                return false;
+            }
+            return true;
         }
         true // STUN/DTLS/invalid input: str0m owns validation and authentication.
     }
@@ -156,6 +184,49 @@ mod tests {
     }
 
     #[test]
+    fn early_payload_cap_accounts_for_csrc_extensions_tags_and_padding() {
+        for encrypted in [false, true] {
+            for (cc, extension, padding) in [(0, false, false), (15, false, false), (3, true, false), (15, true, true)]
+            {
+                let cap = if encrypted { MAX_ENCRYPTED } else { MAX_PLAINTEXT };
+                let header = 12 + cc * 4 + if extension { 12 } else { 0 };
+                let mut packet = vec![0; header + cap + 16 + if padding { 255 } else { 0 }];
+                packet[0] = 0x80 | cc as u8 | if extension { 0x10 } else { 0 } | if padding { 0x20 } else { 0 };
+                packet[1] = 111;
+                packet[8..12].copy_from_slice(&42u32.to_be_bytes());
+                if extension {
+                    packet[12 + cc * 4 + 3] = 2;
+                }
+                let mut stream = RtpAdmission::new(42, vec![]);
+                assert!(stream.admits_datagram(&packet, encrypted));
+                packet.push(0);
+                assert!(!stream.admits_datagram(&packet, encrypted));
+                assert_eq!(stream.counters.rtp_oversize_datagram, 1);
+                assert_eq!(stream.counters.oversize_dropped, 1);
+                assert!(stream.last.is_none());
+                if extension || cc != 0 {
+                    assert!(!stream.admits_datagram(&packet[..header - 1], encrypted));
+                    assert_eq!(stream.counters.malformed_dropped, 1);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_opus_framing_is_counted_but_ciphertext_remains_opaque() {
+        let mut plain = RtpAdmission::new(42, vec![]);
+        let mut encrypted = RtpAdmission::new(42, vec![]);
+        for (i, packet) in [&[0xf2][..], &[0xf1, 1], &[0xf3, 0x82], &[0xf3, 0x41, 255]].into_iter().enumerate() {
+            assert!(plain.admit(42, i as u64, i as u32 * 960, false, packet).is_none());
+            assert!(encrypted.admit(42, i as u64, i as u32 * 960, true, packet).is_some());
+        }
+        assert_eq!(plain.counters.malformed_dropped, 4);
+        for (i, packet) in [&[0xf0, 1][..], &[0xf1, 1, 2], &[0xf2, 1, 1, 2], &[0xf3, 2, 1, 2]].into_iter().enumerate() {
+            assert!(plain.admit(42, i as u64, i as u32 * 960, false, packet).is_some());
+        }
+    }
+
+    #[test]
     fn clear_ssrc_filter_keeps_rtcp_and_bounds_unknown_churn() {
         let mut stream = RtpAdmission::new(42, vec![41]);
         let mut rtp = [0u8; 12];
@@ -163,20 +234,20 @@ mod tests {
         rtp[1] = 111;
         for ssrc in 100..10_100u32 {
             rtp[8..12].copy_from_slice(&ssrc.to_be_bytes());
-            assert!(!stream.admits_datagram(&rtp));
+            assert!(!stream.admits_datagram(&rtp, false));
         }
         assert!(stream.last.is_none());
         assert_eq!(stream.retired, [41]);
         rtp[8..12].copy_from_slice(&41u32.to_be_bytes());
-        assert!(!stream.admits_datagram(&rtp));
+        assert!(!stream.admits_datagram(&rtp, false));
         rtp[8..12].copy_from_slice(&42u32.to_be_bytes());
-        assert!(stream.admits_datagram(&rtp));
-        assert!(!stream.admits_datagram(&rtp[..11]));
+        assert!(stream.admits_datagram(&rtp, false));
+        assert!(!stream.admits_datagram(&rtp[..11], false));
         rtp[1] = 200; // SRTCP SR: the reporter SSRC is unrestricted.
         rtp[8..12].copy_from_slice(&999u32.to_be_bytes());
-        assert!(stream.admits_datagram(&rtp));
-        assert!(stream.admits_datagram(&[0; 20])); // STUN
-        assert!(stream.admits_datagram(&[22; 20])); // DTLS
+        assert!(stream.admits_datagram(&rtp, false));
+        assert!(stream.admits_datagram(&[0; 20], false)); // STUN
+        assert!(stream.admits_datagram(&[22; 20], false)); // DTLS
         assert_eq!(stream.counters.rtp_unknown_ssrc, 10_000);
         assert_eq!(stream.counters.rtp_retired_ssrc, 1);
     }

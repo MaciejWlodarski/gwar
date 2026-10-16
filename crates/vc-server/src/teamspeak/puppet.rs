@@ -54,6 +54,31 @@ pub struct Shared {
     /// Spurt numbers, shared so a stream recreated after eviction never
     /// repeats one an SFU slot still remembers.
     spurts: AtomicU32,
+    /// Counts at the TS receive callback and after plaintext admission, before
+    /// publication. Kept separate for voice and whispers, including rejections.
+    pub ingress: IngressCounters,
+    #[cfg(feature = "test-hooks")]
+    pub sent_end_route: AtomicU64,
+}
+
+#[derive(Default)]
+pub struct IngressCounters {
+    pub voice_received: AtomicU64,
+    pub voice_admitted: AtomicU64,
+    pub voice_classified: AtomicU64,
+    pub whisper_received: AtomicU64,
+    pub whisper_admitted: AtomicU64,
+    pub whisper_classified: AtomicU64,
+}
+
+// Release publishes callback completion, including all admission decisions.
+struct Observed<'a>(Option<&'a AtomicU64>);
+impl Drop for Observed<'_> {
+    fn drop(&mut self) {
+        if let Some(counter) = self.0 {
+            counter.fetch_add(1, Ordering::Release);
+        }
+    }
 }
 
 /// Recent frames of one TeamSpeak speaker, shared across receiving puppets.
@@ -98,6 +123,9 @@ impl Shared {
             heard: Mutex::default(),
             whispers: Mutex::default(),
             spurts: AtomicU32::new(0),
+            ingress: IngressCounters::default(),
+            #[cfg(feature = "test-hooks")]
+            sent_end_route: AtomicU64::new(0),
         }
     }
 
@@ -174,6 +202,7 @@ impl Shared {
         }
         let clock = SourceClock::TeamSpeak { id, whisper: false, spurt: entry.spurt };
         entry.clock = Some(clock);
+        self.ingress.voice_admitted.fetch_add(1, Ordering::Relaxed);
         self.plane.publish(AudioPacket {
             origin: origin.clone(),
             payload: Arc::from(opus),
@@ -232,6 +261,9 @@ impl Shared {
             }
         };
         drop(whispers);
+        if !packet.is_end() {
+            self.ingress.whisper_admitted.fetch_add(1, Ordering::Relaxed);
+        }
         self.plane.deliver(to, packet);
     }
 
@@ -300,6 +332,12 @@ pub struct ChannelText {
 
 #[derive(Debug)]
 pub enum PuppetCmd {
+    #[cfg(feature = "test-hooks")]
+    HoldTail {
+        armed: tokio::sync::oneshot::Sender<()>,
+        held: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    },
     /// Moves to a TeamSpeak channel; every move starts a new route, and channel
     /// text queued for an earlier route is dropped, never sent elsewhere. `voice`
     /// as in [`PuppetSpec`], from now on.
@@ -473,6 +511,8 @@ async fn run(
     let mut audio = spec.audio.clone();
     audio.confirm(own_channel(&con));
     let mut held: Option<AudioPacket> = None;
+    #[cfg(feature = "test-hooks")]
+    let mut hold_tail: Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)> = None;
     let mut voice = spec.voice;
     let mut moving: Option<Moving> = None;
     let mut waiting: Vec<(u64, String)> = Vec::new();
@@ -516,6 +556,13 @@ async fn run(
                     send_audio(&mut con, &mut packet_id, &data, shared, &packet, &audio);
                 }
                 held = Some(packet);
+                #[cfg(feature = "test-hooks")]
+                if packetizer.deadline().is_some()
+                    && let Some((ready, release)) = hold_tail.take()
+                {
+                    let _ = ready.send(());
+                    let _ = release.await;
+                }
             }
             Step::Flush => {
                 if let Some(data) = packetizer.flush()
@@ -534,6 +581,22 @@ async fn run(
             Step::Item(Some(Err(e))) => return Err(anyhow!("{e}")),
             Step::Item(Some(Ok(item))) => match item {
                 StreamItem::Audio(packet) => {
+                    let _observed = Observed(match packet.data().data() {
+                        AudioData::S2C { .. } => Some(&shared.ingress.voice_received),
+                        AudioData::S2CWhisper { .. } => Some(&shared.ingress.whisper_received),
+                        _ => None,
+                    });
+                    let classified = match packet.data().data() {
+                        AudioData::S2C { from, .. } => Some((*from, &shared.ingress.voice_classified)),
+                        AudioData::S2CWhisper { from, .. } => Some((*from, &shared.ingress.whisper_classified)),
+                        _ => None,
+                    };
+                    if let Some((from, count)) = classified
+                        && source_channel(&con, from).and_then(|cid| shared.capture(from, cid)).is_some()
+                        && own_channel(&con) == Some(audio.cid)
+                    {
+                        count.fetch_add(1, Ordering::Relaxed);
+                    }
                     let own = shared.plane.routing.load().origin(spec.session);
                     if !voice
                         || moving.is_some()
@@ -652,6 +715,12 @@ async fn run(
             }
             Step::Cmd(Some(cmd)) => {
                 debug!(session = spec.session, ?cmd, "puppet command");
+                #[cfg(feature = "test-hooks")]
+                if let PuppetCmd::HoldTail { armed, held, release } = cmd {
+                    hold_tail = Some((held, release));
+                    let _ = armed.send(());
+                    continue;
+                }
                 if let PuppetCmd::Nickname(base) = cmd {
                     nickname_generation += 1;
                     queue_nickname(&mut con, &mut pending, base, 1, nickname_generation)?;
@@ -778,11 +847,35 @@ fn send_audio(
     if !audio_allowed(con, shared, packet, route) {
         return;
     }
+    #[cfg(feature = "test-hooks")]
+    if data.is_empty() {
+        shared.sent_end_route.store(route.generation, Ordering::Release);
+    }
     let codec =
         if data.first().is_some_and(|toc| toc & 0x04 != 0) { CodecType::OpusMusic } else { CodecType::OpusVoice };
     let out = OutAudio::new(&AudioData::C2S { id: *packet_id, codec, data });
     *packet_id = packet_id.wrapping_add(1);
-    let _ = con.send_audio(out);
+    if let Ok(transport) = con.get_tsproto_client_mut() {
+        send_audio_now(transport, out);
+    }
+}
+
+/// Pinned tsproto ee3bc6f queues voice in `acks_to_send`, commands in the
+/// resender. `poll_send_acks` can stop on Pending and still poll commands, so
+/// clientmove can overtake voice. Voice is not retransmitted, but that pending
+/// queue can outlive its route. Encode with tsproto, then attempt the UDP write
+/// once while this route is checked; drop on pressure instead of queueing.
+/// Nothing remains to flush after retirement, an end marker or replacement.
+fn send_audio_now(con: &mut tsproto::connection::Connection, packet: tsproto_packets::packets::OutPacket) {
+    use std::task::{Context, Poll, Waker};
+    con.send_event(&tsproto::connection::Event::SendPacket(&packet));
+    let Ok(packets) = tsproto::packet_codec::PacketCodec::encode_packet(con, packet) else { return };
+    let mut cx = Context::from_waker(Waker::noop());
+    for packet in packets {
+        if let Poll::Ready(Ok(())) = con.poll_send_udp_packet(&mut cx, &packet) {
+            con.resender.handle_loss_outgoing(&packet);
+        }
+    }
 }
 
 fn is_opus(codec: CodecType) -> bool {
@@ -826,6 +919,8 @@ fn queue_nickname(
 fn command_for(clid: u16, cmd: PuppetCmd) -> Option<OutCommand> {
     let flag = |b: bool| if b { "1" } else { "0" }.to_owned();
     Some(match cmd {
+        #[cfg(feature = "test-hooks")]
+        PuppetCmd::HoldTail { .. } => return None,
         PuppetCmd::Move { cid, .. } => command("clientmove", &[("clid", clid.to_string()), ("cid", cid.to_string())]),
         PuppetCmd::Flags { muted, deafened } => {
             command("clientupdate", &[("client_input_muted", flag(muted)), ("client_output_muted", flag(deafened))])
@@ -959,5 +1054,58 @@ mod tests {
     fn only_name_collisions_are_retried() {
         assert!(nickname_taken(&tsclientlib::Error::ConnectTs(TsError::ClientNicknameInuse)));
         assert!(!nickname_taken(&tsclientlib::Error::ConnectionGone));
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use futures::FutureExt;
+    use std::{
+        io,
+        sync::atomic::{AtomicBool, AtomicUsize},
+        task::{Context, Poll},
+    };
+    struct Socket {
+        blocked: Arc<AtomicBool>,
+        sent: Arc<AtomicUsize>,
+    }
+    impl tsproto::connection::Socket for Socket {
+        fn poll_recv_from(&self, _: &mut Context, _: &mut tokio::io::ReadBuf) -> Poll<io::Result<SocketAddr>> {
+            Poll::Pending
+        }
+        fn poll_send_to(&self, _: &mut Context, bytes: &[u8], _: SocketAddr) -> Poll<io::Result<usize>> {
+            if self.blocked.load(Ordering::Relaxed) {
+                return Poll::Pending;
+            }
+            self.sent.fetch_add(1, Ordering::Relaxed);
+            Poll::Ready(Ok(bytes.len()))
+        }
+        fn local_addr(&self) -> io::Result<SocketAddr> {
+            Ok("127.0.0.1:1".parse().unwrap())
+        }
+    }
+    #[tokio::test]
+    async fn pending_transport_audio_cannot_flush_after_route_change() {
+        let blocked = Arc::new(AtomicBool::new(false));
+        let sent = Arc::new(AtomicUsize::new(0));
+        let mut con = tsproto::connection::Connection::new(
+            true,
+            "127.0.0.1:2".parse().unwrap(),
+            Box::new(Socket { blocked: blocked.clone(), sent: sent.clone() }),
+        );
+        let packet = || OutAudio::new(&AudioData::C2S { id: 0, codec: CodecType::OpusVoice, data: &[0xf8, 1, 0] });
+        send_audio_now(&mut con, packet());
+        let _ = con.next().now_or_never();
+        assert_eq!(sent.load(Ordering::Relaxed), 1, "positive UDP control");
+        blocked.store(true, Ordering::Relaxed);
+        send_audio_now(&mut con, packet());
+        // Retirement/change happens while the socket is blocked. Later polling
+        // must never send the old voice, even once it becomes writable again.
+        blocked.store(false, Ordering::Relaxed);
+        let _ = con.next().now_or_never();
+        assert_eq!(sent.load(Ordering::Relaxed), 1, "old-route transport audio survived");
+        send_audio_now(&mut con, packet());
+        assert_eq!(sent.load(Ordering::Relaxed), 2, "fresh route can send");
     }
 }

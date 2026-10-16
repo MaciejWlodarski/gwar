@@ -580,22 +580,7 @@ fn pipeline<const CAPTURE: usize>(
     Ok(())
 }
 
-/// Samples per channel at 48 kHz in an Opus packet (RFC 6716 §3.1).
-pub fn opus_samples(packet: &[u8]) -> Option<u32> {
-    let toc = *packet.first()?;
-    let config = toc >> 3;
-    let frame = match config {
-        0..=11 => [480, 960, 1920, 2880][(config & 3) as usize],
-        12..=15 => [480, 960][(config & 1) as usize],
-        _ => [120, 240, 480, 960][(config & 3) as usize],
-    };
-    let frames = match toc & 3 {
-        0 => 1,
-        1 | 2 => 2,
-        _ => u32::from(*packet.get(1)? & 0x3f),
-    };
-    (frames > 0 && frame * frames <= 5760).then_some(frame * frames)
-}
+pub use vc_proto::opus::packet_samples as opus_samples;
 
 #[cfg(test)]
 mod codec_tests {
@@ -611,7 +596,13 @@ mod codec_tests {
         assert!(!validate_encoded(&[0xff, 0], 480, &counters));
         assert!(!validate_encoded(&vec![0xf0; 1001], 480, &counters));
         assert!(validate_encoded(&vec![0xf0; 1000], 480, &counters));
-        assert_eq!(counters.malformed_dropped.load(Ordering::Relaxed), 1);
+        for packet in [&[0xf2][..], &[0xf1, 1], &[0xf3, 0x82], &[0xf3, 0x41, 255]] {
+            assert!(!validate_encoded(packet, 480, &counters));
+        }
+        for packet in [&[0xf1, 1, 2][..], &[0xf2, 1, 1, 2], &[0xf3, 2, 1, 2]] {
+            assert!(validate_encoded(packet, 960, &counters));
+        }
+        assert_eq!(counters.malformed_dropped.load(Ordering::Relaxed), 5);
         assert_eq!(counters.oversize_dropped.load(Ordering::Relaxed), 1);
     }
 

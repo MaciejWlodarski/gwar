@@ -43,6 +43,12 @@ pub struct MediaSnapshot {
 }
 
 pub enum MediaCmd {
+    /// Test-only rendezvous after SRTP authentication/admission, before forwarding.
+    #[cfg(feature = "test-hooks")]
+    HoldNext {
+        session: SessionId,
+        reply: tokio::sync::oneshot::Sender<AudioPacket>,
+    },
     Inspect {
         session: SessionId,
         probe_ssrcs: Vec<u32>,
@@ -133,6 +139,8 @@ struct Peer {
     origin: Arc<AudioOrigin>,
     admission: RtpAdmission,
     rtcp_reports: u64,
+    #[cfg(feature = "test-hooks")]
+    hold_next: Option<tokio::sync::oneshot::Sender<AudioPacket>>,
 }
 
 impl Peer {
@@ -299,6 +307,10 @@ pub async fn run(
                         Err(message) => {let _ = reply.send(Err(message));}
                     }
                 }
+                #[cfg(feature = "test-hooks")]
+                Some(MediaCmd::HoldNext { session, reply }) => {
+                    peers.get_mut(&session).expect("hold admitted peer").hold_next = Some(reply);
+                }
                 Some(MediaCmd::Inspect { session, probe_ssrcs, reply }) => {
                     let snapshot = peers.get_mut(&session).map(|peer| MediaSnapshot {
                         counters: peer.admission.counters,
@@ -326,7 +338,7 @@ pub async fn run(
                     let Ok(contents) = buf[..n].try_into() else { continue };
                     let input = Input::Receive(Instant::now(), Receive { proto: Protocol::Udp, source, destination: advertise, contents });
                     if let Some(peer) = peers.values_mut().find(|p| p.rtc.accepts(&input))
-                        && peer.admission.admits_datagram(&buf[..n])
+                        && peer.admission.admits_datagram(&buf[..n], peer.origin.encrypted)
                         && let Err(e) = peer.rtc.handle_input(input) {
                             debug!(session = peer.session, "rtc input: {e}");
                             peer.rtc.disconnect();
@@ -401,6 +413,8 @@ fn accept(
         origin,
         admission,
         rtcp_reports: 0,
+        #[cfg(feature = "test-hooks")]
+        hold_next: None,
     };
     Ok((peer, answer.to_sdp_string()))
 }
@@ -466,6 +480,11 @@ fn drive(
                 RtcEvent::SenderFeedback(_) => peer.rtcp_reports += 1,
                 RtcEvent::RtpPacket(data) => {
                     if let Some(packet) = ingest(peer, &data, routing, uplinks, core) {
+                        #[cfg(feature = "test-hooks")]
+                        if let Some(reply) = peer.hold_next.take() {
+                            let _ = reply.send(packet);
+                            continue;
+                        }
                         forwards.push(packet);
                     }
                 }

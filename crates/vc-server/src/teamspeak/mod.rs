@@ -9,7 +9,10 @@
 pub mod bridge;
 pub mod channels;
 pub mod install;
+#[cfg(not(feature = "test-hooks"))]
 mod listeners;
+#[cfg(feature = "test-hooks")]
+pub mod listeners;
 mod packetizer;
 pub mod process;
 pub mod puppet;
