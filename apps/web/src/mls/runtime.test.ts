@@ -15,7 +15,7 @@ const server = b64(9), group = b64(2), device = b64(1), peer = b64(3);
 const dm = `dm:${[b64(4,20), b64(5,20)].sort().join(":")}`;
 let conversation = dm;
 interface State { groups: GroupSummary[]; out: CommitOutbox | null; welcomes: string[]; imports: number; shares: number }
-const summary = (status: GroupSummary["record"]["status"] = "active", epoch = "0"): GroupSummary => ({ group: Array(32).fill(2), conversation, incarnation: "0", live: status !== "creating", history: true, record: { status, checkpoint: status === "creating" ? null : { epoch, hash: [] }, server_pending: false, own_commit_at: Date.now() }, members: [{ device_key: device, uid: b64(4,20) }] });
+const summary = (status: GroupSummary["record"]["status"] = "active", epoch = "0"): GroupSummary => ({ group: Array(32).fill(2), conversation, incarnation: "0", live: status !== "creating", history: true, record: { status, checkpoint: status === "creating" ? null : { epoch, hash: [] }, server_pending: false, own_commit_at: Date.now() }, members: [{ leaf: 0, device_key: device, uid: b64(4,20) }] });
 const pending = (): CommitOutbox => ({ group: Array(32).fill(2), epoch: "0", hash: [4], commit: [4], group_info: [5], welcome: [6] });
 const clean = (): State => ({ groups: [], out: null, welcomes: [], imports: 0, shares: 0 });
 const runtimes: MlsRuntime[] = [];
@@ -73,7 +73,7 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
           return result.commit?.[0] === 4 ? "accepted" : "rebuild";
         }
         case "commit": this.state.out = { ...pending(), epoch: g!.record.checkpoint!.epoch }; return this.state.out;
-        case "receive": if ((d!.commit as number[])[0] === 99) { g!.record.status = "removed"; g!.members = []; return null; } g!.record.checkpoint!.epoch = String(Number(g!.record.checkpoint!.epoch) + 1); g!.members.push({ device_key: peer, uid: b64(5,20) }); return null;
+        case "receive": if ((d!.commit as number[])[0] === 99) { g!.record.status = "removed"; g!.members = []; return null; } g!.record.checkpoint!.epoch = String(Number(g!.record.checkpoint!.epoch) + 1); g!.members.push({ leaf: g!.members.length, device_key: peer, uid: b64(5,20) }); return null;
         case "join_external": {
           if (world.joinError) throw new Error("join failed");
           // The live pin still to be joined after a restart, or the fixture's group.
@@ -257,7 +257,7 @@ describe("MLS synchronization", () => {
     expect((await f.durable()).groups[0]!.record.checkpoint!.epoch).toBe("4");
   });
   it("removes a locally revoked leaf without admitting its advertised package again", async () => {
-    const local = summary(); local.members.push({ device_key: peer, uid: await uidForPublicKey(b64(8)) });
+    const local = summary(); local.members.push({ leaf: 1, device_key: peer, uid: await uidForPublicKey(b64(8)) });
     const f = await fixture({ ...clean(), groups: [local] });
     f.world.revocations = [{ account_key: b64(8), device_key: peer, revoked_at: 1 }];
     f.world.devices = [{ uid: await uidForPublicKey(b64(8)), device_key: peer, hpke_key: b64(6), created_at: 1, signature: b64(7,64) }];
@@ -352,7 +352,7 @@ describe("MLS synchronization", () => {
     expect(f.calls.filter(c => c.op === "mls.history.share").map(c => c.data.chunk)).toEqual(["Fg", "Fw"]);
   });
   it("atomically replaces history for a newer verified HPKE publication and keeps retries stable", async () => {
-    const local = summary(); local.members.push({ device_key: peer, uid: b64(5,20) });
+    const local = summary(); local.members.push({ leaf: 1, device_key: peer, uid: b64(5,20) });
     let now = 1_000_000;
     const f = await fixture({ ...clean(), groups: [local] }, true, { now: () => now });
     const recipient = { uid: b64(5,20), device_key: peer, hpke_key: b64(6), created_at: 1, signature: b64(7,64) };
@@ -390,7 +390,7 @@ describe("MLS synchronization", () => {
   }, 20_000);
   it("backs off a recipient whose history cannot be prepared and still shares with the others", async () => {
     const other = b64(4), local = summary();
-    local.members.push({ device_key: peer, uid: b64(5,20) }, { device_key: other, uid: b64(6,20) });
+    local.members.push({ leaf: 1, device_key: peer, uid: b64(5,20) }, { leaf: 2, device_key: other, uid: b64(6,20) });
     let now = 1_000_000;
     const f = await fixture({ ...clean(), groups: [local] }, true, { now: () => now });
     f.world.devices = [
@@ -474,7 +474,7 @@ describe("MLS synchronization", () => {
     expect(f.runtime.roster("server")).toBeNull();
   });
   it("requests missing keys, throttles repeated requests, and answers wanted history", async () => {
-    const local = summary(); local.members.push({ device_key: peer, uid: b64(5,20) });
+    const local = summary(); local.members.push({ leaf: 1, device_key: peer, uid: b64(5,20) });
     const f = await fixture({ ...clean(), groups: [local] });
     f.world.devices = [{ uid: b64(5,20), device_key: peer, hpke_key: b64(6), created_at: 1, signature: b64(7,64) }];
     f.world.wanted = [{ group, device: peer }];
@@ -602,7 +602,7 @@ describe("Restarts", () => {
   it.each([0, 1])("stays blocked when the server holds incarnation %i below or beside the live pin", async incarnation => {
     let now = 1_000_000;
     const pin = { ...summary("active", "5"), incarnation: "1" };
-    pin.members.push({ device_key: peer, uid: b64(5,20) });
+    pin.members.push({ leaf: 1, device_key: peer, uid: b64(5,20) });
     const f = await fixture({ ...clean(), groups: [pin] }, false, { now: () => now });
     f.world.groups = [{ conversation, group: restartedGroup, incarnation, epoch: 0, pending: false }];
     // Neither history for a peer nor missing keys go out while it is held.
@@ -618,7 +618,7 @@ describe("Restarts", () => {
   });
   it("shares no queued history once a synchronized conversation is held", async () => {
     const pin = { ...summary(), incarnation: "1" };
-    pin.members.push({ device_key: peer, uid: b64(5,20) });
+    pin.members.push({ leaf: 1, device_key: peer, uid: b64(5,20) });
     const f = await fixture({ ...clean(), groups: [pin] });
     await f.runtime.sync();
     f.world.groups = [{ conversation, group: restartedGroup, incarnation: 1, epoch: 0, pending: false }];
@@ -860,7 +860,7 @@ describe("Public groups", () => {
   });
   it("forgets a deleted channel's history jobs with its group", async () => {
     asChannel();
-    const local = summary(); local.members.push({ device_key: peer, uid: b64(5,20) });
+    const local = summary(); local.members.push({ leaf: 1, device_key: peer, uid: b64(5,20) });
     const f = await fixture({ ...clean(), groups: [local] }, true, { channels: [channel()] });
     const jobs = async () => (await f.storage.load()).outbox.map(c => dec.decode(new Uint8Array(c.key))).filter(k => k.startsWith("@runtime/history/"));
     f.world.devices = [{ uid: b64(5,20), device_key: peer, hpke_key: b64(6), created_at: 1, signature: b64(7,64) }];
@@ -874,7 +874,7 @@ describe("Public groups", () => {
   });
   it.each(["channel:1", "server"])("answers an assignment with its chunks, or declines it with nothing to share (%s)", async target => {
     conversation = target;
-    const local = summary(); local.members.push({ device_key: peer, uid: b64(5,20) });
+    const local = summary(); local.members.push({ leaf: 1, device_key: peer, uid: b64(5,20) });
     const f = await fixture({ ...clean(), groups: [local] }, true, { ...publicOptions(target) });
     f.world.devices = [{ uid: b64(5,20), device_key: peer, hpke_key: b64(6), created_at: 1, signature: b64(7,64) }];
     f.world.wanted = [{ group, device: peer, assignment: b64(1,16) }];

@@ -191,6 +191,33 @@ enum Request {
         bytes: Vec<u8>,
         tree: Option<Vec<u8>>,
     },
+    VoicePending {
+        server: String,
+        group: [u8; 32],
+        #[serde(with = "gwar_mls::agent::epoch_number")]
+        epoch: u64,
+        proposals: Vec<Vec<u8>>,
+    },
+}
+/// Voice queries that read the separately validated parent channel agent.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+enum ParentRequest {
+    VoiceKeys { server: String, group: [u8; 32], now: i64, revocations: View },
+    VoiceParentRemovals { server: String, group: [u8; 32], synchronized: bool },
+}
+#[derive(Serialize)]
+struct VoiceKey {
+    leaf: u32,
+    device: String,
+    key: Vec<u8>,
+}
+#[derive(Serialize)]
+struct VoiceKeys {
+    epoch: String,
+    own_leaf: u32,
+    members: Vec<VoiceKey>,
+    send_until: Option<i64>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -218,6 +245,43 @@ impl Agent {
         let mut stores = Stores::default();
         records.apply(&mut stores);
         Ok(Self { inner: Core::load(seed(seed_bytes)?, credential(credential_bytes)?, stores).map_err(error)? })
+    }
+    /// A volatile voice agent: its store lives only in the caller's memory.
+    pub fn new_voice(seed_bytes: &[u8], credential_bytes: &[u8], now: f64) -> Result<Agent, JsValue> {
+        if !now.is_finite() || now.fract() != 0.0 || !(1.0..=9_007_199_254_740_991.0).contains(&now) {
+            return Err(error("invalid time"));
+        }
+        Ok(Self {
+            inner: Core::new_voice(seed(seed_bytes)?, credential(credential_bytes)?, now as i64).map_err(error)?,
+        })
+    }
+    pub fn load_voice(seed_bytes: &[u8], credential_bytes: &[u8], records: JsValue) -> Result<Agent, JsValue> {
+        let records: Changes = input(records)?;
+        let mut stores = Stores::default();
+        records.apply(&mut stores);
+        Ok(Self { inner: Core::load_voice(seed(seed_bytes)?, credential(credential_bytes)?, stores).map_err(error)? })
+    }
+    /// Exporter keys are returned only to the trusted local controller; never log them.
+    pub fn execute_with_parent(&self, request: JsValue, parent: &Agent) -> Result<JsValue, JsValue> {
+        let text = encode(&request)?;
+        match serde_json::from_slice(text.as_bytes()).map_err(error)? {
+            ParentRequest::VoiceKeys { server, group, now, revocations } => {
+                let keys = self.inner.voice_keys(&server, &group, &parent.inner, now, &revocations).map_err(error)?;
+                output(VoiceKeys {
+                    epoch: keys.epoch.to_string(),
+                    own_leaf: keys.own_leaf,
+                    members: keys
+                        .members
+                        .into_iter()
+                        .map(|m| VoiceKey { leaf: m.leaf, device: m.device, key: m.key.to_vec() })
+                        .collect(),
+                    send_until: keys.send_until,
+                })
+            }
+            ParentRequest::VoiceParentRemovals { server, group, synchronized } => {
+                output(self.inner.voice_parent_removals(&server, &group, &parent.inner, synchronized).map_err(error)?)
+            }
+        }
     }
     pub fn take_changes(&mut self) -> Result<JsValue, JsValue> {
         output(self.inner.take_changes())
@@ -293,6 +357,9 @@ impl Agent {
             }
             Request::Behind { server, group, bytes, tree } => {
                 output(a.behind(&server, &group, &bytes, tree.as_deref()).map_err(error)?)
+            }
+            Request::VoicePending { server, group, epoch, proposals } => {
+                output(a.voice_pending(&server, &group, epoch, &proposals).map_err(error)?)
             }
         }
     }

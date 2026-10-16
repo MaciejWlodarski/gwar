@@ -49,3 +49,23 @@ export async function openStorage(device: string, factory: IDBFactory = indexedD
     close: () => db.close(),
   };
 }
+/** The voice agent's store: memory only, gone with its call (docs/e2e-build.md
+ * "Rules and state separation"). Tentative state and outbox are written here
+ * before requests are emitted, like the durable store. */
+export function memoryStorage(): Persistence {
+  const stored = new Map<string, Map<string, number[]>>(stores.map(name => [name, new Map()]));
+  return {
+    load: async () => {
+      const result = emptyChanges();
+      for (const name of stores) for (const [key, value] of stored.get(name)!) result[name].push({ key: JSON.parse(key) as number[], value: [...value] });
+      return result;
+    },
+    write: async changes => {
+      for (const name of stores) for (const { key, value } of changes[name]) {
+        if (value === null) stored.get(name)!.delete(JSON.stringify(key));
+        else stored.get(name)!.set(JSON.stringify(key), [...value]);
+      }
+    },
+    close: () => { for (const store of stored.values()) store.clear(); },
+  };
+}

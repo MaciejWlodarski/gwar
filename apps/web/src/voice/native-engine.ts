@@ -43,7 +43,8 @@ type StartParams = Parameters<VoiceEngine["start"]>[0];
  * and return the answer with `voice_answer`.
  */
 export class NativeVoiceEngine implements VoiceEngine {
-  readonly capabilities: VoiceEngine["capabilities"] = { outputDeviceSelection: true, captureProcessing: false };
+  // Native SFrame arrives in 5d; until then encrypted channels show the calm unavailable state.
+  readonly capabilities: VoiceEngine["capabilities"] = { outputDeviceSelection: true, captureProcessing: false, encryptedVoice: async () => false };
 
   private handlers = new Map<string, Set<Handler>>();
   // Bootstrap once per engine: a fresh view retires native audio left by the

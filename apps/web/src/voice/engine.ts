@@ -4,6 +4,7 @@
  * native implementation of the same interface (`native-engine.ts`).
  */
 import type { IceServer } from "../proto/IceServer";
+import type { Control, ControlResult, CryptoStatus } from "./sframe/state";
 
 export type InputMode = "vad" | "ptt";
 
@@ -38,7 +39,15 @@ export class VoiceError extends Error {
 export type OfferFn = (sdp: string, run: number) => Promise<string>;
 let mediaRun = Date.now() * 1000;
 export const nextMediaRun = () => ++mediaRun;
-export interface VoiceStartBinding { server_key: string | null; session: number; channel: number; call: string | null; participation: string | null; group: null }
+export interface VoiceStartBinding { server_key: string | null; session: number; channel: number; call: string | null; participation: string | null; group: string | null }
+/** The MLS controller of an encrypted call, as an engine sees it. */
+export interface VoiceKeySource {
+  /** For a new engine: the epoch it must never install at or below, or null on a first run. */
+  resumeAfter(): string | null;
+  /** The run's engine is negotiated: it accepts controls from now on. */
+  attach(media: { run: number; control(body: Control): Promise<ControlResult>; close(): void }): void;
+  engineStatus(status: CryptoStatus): void;
+}
 
 export interface AudioDevice {
   id: string;
@@ -68,6 +77,8 @@ export interface VoiceEngine {
     outputDeviceSelection: boolean;
     /** Noise suppression / echo cancellation / AGC are available (default true). */
     captureProcessing?: boolean;
+    /** Whether this engine can join encrypted voice; checked before the microphone and `channel.join`. */
+    encryptedVoice(): Promise<boolean>;
   };
 
   /**
@@ -79,6 +90,8 @@ export interface VoiceEngine {
     offer: OfferFn;
     mode: "plaintext" | "encrypted";
     binding: VoiceStartBinding;
+    /** Required in encrypted mode; there is never a plaintext fallback. */
+    keys?: VoiceKeySource;
     iceServers: IceServer[];
     /** Host of the voice server; the native engine resolves it to send media there. */
     serverHost?: string;
@@ -104,6 +117,8 @@ export interface VoiceEngine {
   setSlotOwner(slot: number, uid: string | null): void;
 
   listDevices(): Promise<DeviceList>;
+  /** Aggregate SFrame counters of the current encrypted run (never keys), or null. */
+  cryptoCounters?(): Promise<Record<string, number> | null>;
   /** Independent capture for the settings level meter. Returns a stop function. */
   startMicTest(onLevel: (level: number) => void): Promise<() => void>;
 

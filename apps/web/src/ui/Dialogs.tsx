@@ -11,7 +11,7 @@ import { newId, useSettings, type ServerKind } from "../state/settings";
 import { useSession, useUi, type DialogState } from "../state/stores";
 import { Button, Dialog, Field, Input, Segmented, Select, Textarea, Switch } from "./kit";
 import { SettingsDialog } from "./Settings";
-import { ReadersDialog } from "./Readers";
+import { HearersDialog, ReadersDialog } from "./Readers";
 import { BanDialog } from "./BanDialog";
 import { RemoveMemberDialog } from "./RemoveMemberDialog";
 import { Lightbox } from "./Attachments";
@@ -56,6 +56,8 @@ export function Dialogs() {
       return <ServerKeyDialog />;
     case "readers":
       return <ReadersDialog thread={dialog.thread} />;
+    case "hearers":
+      return <HearersDialog channel={dialog.channel} />;
     case "confirm":
       return <ConfirmDialog {...dialog} />;
     case "tsFirstRun":

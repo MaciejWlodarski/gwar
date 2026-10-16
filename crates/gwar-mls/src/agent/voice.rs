@@ -14,6 +14,9 @@ pub struct VoiceKeys {
     pub epoch: u64,
     pub own_leaf: u32,
     pub members: Vec<VoiceKey>,
+    /// The earliest certificate expiry among the voice leaves (Unix ms), or
+    /// None when every leaf is a local identity: sending stops at this time.
+    pub send_until: Option<i64>,
 }
 
 /// SFrame carries the low 32 bits of the epoch; all state uses the full epoch.
@@ -141,8 +144,12 @@ impl Agent {
             .collect();
         let epoch = voice.epoch().as_u64();
         let mut keys = Vec::new();
+        let mut send_until: Option<i64> = None;
         for (i, l) in voice.public_group().treesync().full_leaves() {
             let c = leaf_credential(l).ok_or(Invalid("voice credential"))?;
+            if let crate::Credential::Account(certificate) = &c {
+                send_until = Some(send_until.map_or(certificate.expires_at, |t| t.min(certificate.expires_at)));
+            }
             if !members.contains(&(c.uid(), c.device_key().to_owned())) {
                 return Err(AgentError::Blocked);
             }
@@ -153,6 +160,6 @@ impl Agent {
                 .map_err(err("voice key length"))?;
             keys.push(VoiceKey { leaf: i.u32(), device: c.device_key().into(), key, kid: voice_kid(epoch, i.u32()) });
         }
-        Ok(VoiceKeys { epoch, own_leaf: voice.own_leaf_index().u32(), members: keys })
+        Ok(VoiceKeys { epoch, own_leaf: voice.own_leaf_index().u32(), members: keys, send_until })
     }
 }

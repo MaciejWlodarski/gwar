@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import { countKey, useLanguage, useT } from "../i18n";
 import type { SealedKey } from "../state/sealed";
-import { useSession, useUi } from "../state/stores";
+import { useSession, useUi, useVoice } from "../state/stores";
 import { useMemberName, useRoster } from "./hooks";
 import { Avatar, Dialog } from "./kit";
 
@@ -39,6 +39,44 @@ function Reader({ uid, devices }: { uid: string; devices: string }) {
       <Avatar name={name} seed={uid} size={28} />
       <span className="min-w-0 flex-1 truncate text-sm">{name}</span>
       <span className="shrink-0 text-xs text-subtle">{devices}</span>
+    </li>
+  );
+}
+
+/** Who can hear an encrypted call: the locally validated voice tree, grouped by
+ * member with each device listed. Never derived from slots, talking flags or
+ * acknowledgements; outside the call there is no verified list to show. */
+export function HearersDialog({ channel }: { channel: number }) {
+  const t = useT();
+  const close = useUi((s) => s.closeDialog);
+  const inCall = useSession((s) => s.me !== null && s.clients[s.me.session]?.channel === channel);
+  const hearers = useVoice((s) => (s.hearers?.channel === channel ? s.hearers.members : null));
+  const securing = useVoice((s) => s.encryption !== "active");
+  return (
+    <Dialog open onOpenChange={(o) => !o && close()} title={t("channel.hearers")} width="max-w-sm">
+      <p className="mb-3 text-sm text-muted">
+        {!inCall ? t("channel.hearersJoin") : hearers && !securing ? t("channel.hearersHint") : t("channel.hearersPending")}
+      </p>
+      {inCall && hearers && (
+        <ul className="flex max-h-80 flex-col gap-1 overflow-y-auto">
+          {hearers.map(({ uid, devices }) => <Hearer key={uid} uid={uid} devices={devices} />)}
+        </ul>
+      )}
+    </Dialog>
+  );
+}
+
+function Hearer({ uid, devices }: { uid: string; devices: string[] }) {
+  const name = useMemberName(uid, uid.slice(0, 8));
+  return (
+    <li className="flex items-start gap-3 rounded-md px-1 py-1.5">
+      <Avatar name={name} seed={uid} size={28} />
+      <div className="min-w-0 flex-1">
+        <div className="truncate text-sm">{name}</div>
+        {devices.map((device) => (
+          <div key={device} className="truncate font-mono text-xs text-subtle" title={device}>{device.slice(0, 16)}</div>
+        ))}
+      </div>
     </li>
   );
 }

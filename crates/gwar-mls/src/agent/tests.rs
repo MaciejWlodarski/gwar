@@ -2294,3 +2294,24 @@ fn voice_rejects_add_chain_and_wrong_parent_binding() {
     d.previous_group_id = Some(b64(&[3; 32]));
     assert!(Descriptor::parse(&d.statement()).is_none());
 }
+
+#[test]
+fn voice_records_removed_devices_including_a_same_device_rejoin() {
+    let (mut f, _parent, c) = voice_fixture();
+    let device = c.credential.device_key().to_owned();
+    // C lost its state and rejoins with the same credential: remove-prior replaces its leaf.
+    let mut again = Agent::new_voice([31; 32], c.credential.clone(), f.t).unwrap();
+    again.take_changes();
+    let out = again.join_external(&server(), &f.info, Some(&f.observer.tree().unwrap().1), f.t, &()).unwrap();
+    again.take_changes();
+    f.observer = accept(f.observer, &out, f.t);
+    f.a.receive(&server(), &f.id, &out.commit, &[]).unwrap();
+    f.a.take_changes();
+    assert_eq!(f.a.group(&server(), &f.id).unwrap().voice_removed, vec![device]);
+    // This device's own accepted update removes nobody.
+    let update = f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
+    f.a.take_changes();
+    f.observer = accept(f.observer, &update, f.t);
+    acknowledge(&mut f.a, &f.id, &update);
+    assert!(f.a.group(&server(), &f.id).unwrap().voice_removed.is_empty());
+}

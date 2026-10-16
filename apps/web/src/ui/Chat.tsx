@@ -2,7 +2,7 @@ import { MessageVerificationCache } from "../net/message-verification-cache";
 import { withChannelLifecycle } from "../net/channel-lifecycle";
 import { MessageVerificationIndicator, MessageVerificationPending } from "./MessageVerification";
 import { messageFingerprint, fullyVerified, DELETION_TEXT, type MessageVerification } from "../net/message-signature";
-import { AlertCircle, ArrowDown, Check, Hash, Loader2, Lock, Menu, Megaphone, MessageSquare, Paperclip, Pencil, RotateCw, Send, Trash2, Users, X } from "lucide-react";
+import { AlertCircle, ArrowDown, Check, Hash, Headphones, Loader2, Lock, Menu, Megaphone, MessageSquare, Paperclip, Pencil, RotateCw, Send, Trash2, Users, X } from "lucide-react";
 import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type KeyboardEvent, type MouseEvent } from "react";
 import { countKey, useLanguage, useT, type TFn } from "../i18n";
 import { cn } from "../lib/cn";
@@ -1037,6 +1037,7 @@ function ChatHeader() {
   const setDrawer = useUi((s) => s.setDrawer);
   const server = useSession((s) => s.server);
   const phase = useSession((s) => s.phase);
+  const viewChannel = useSession((s) => s.viewChannel);
   const channel = useSession((s) => (s.viewChannel === null ? undefined : s.channels[s.viewChannel]));
   // People talking in the channel whose chat is open.
   const userCount = useSession((s) => Object.values(s.clients).filter((c) => c.channel !== null && c.channel === s.viewChannel).length);
@@ -1089,6 +1090,12 @@ function ChatHeader() {
             <Lock className="size-3.5" /> <span className="hidden sm:inline">{t("channel.readers")}</span>
           </button>
         </Tooltip>
+      )}
+      {active === "channel" && vc && channel?.encrypted && viewChannel !== null && (
+        <button type="button" aria-label={t("channel.hearers")} onClick={() => useUi.getState().openDialog({ kind: "hearers", channel: viewChannel })}
+          className="t flex shrink-0 cursor-pointer items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted hover:bg-hover hover:text-fg">
+          <Headphones className="size-3.5" /> <span className="hidden sm:inline">{t("channel.hearers")}</span>
+        </button>
       )}
       {active === "channel" && userCount > 0 && (
         <span className="hidden shrink-0 text-xs text-subtle sm:inline">{t(countKey(lang, "chat.users", userCount), { count: userCount })}</span>

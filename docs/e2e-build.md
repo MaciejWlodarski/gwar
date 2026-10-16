@@ -1192,12 +1192,13 @@ limit (about 300 devices):
 
 ## 5. Encrypted voice
 
-Status: **5a–5b built; 5c–5d specified, not built**. Voice MLS rules, volatile
-calls, bound negotiation, opaque SFU forwarding and origin-preserving
-TeamSpeak queues are implemented. Encrypted audio remains unavailable in
-both clients with the calm notice below. Plaintext voice and TeamSpeak keep
-their existing media formats. See the [5a report](voice-calls-5a.md) and
-[5b report](voice-sfu-5b.md) for coverage, validation and acceptance still pending.
+Status: **5a–5c built; 5d specified, not built**. Voice MLS rules, volatile
+calls, bound negotiation, opaque SFU forwarding, origin-preserving TeamSpeak
+queues and browser SFrame are implemented. Browsers that pass the transform
+capability check join encrypted voice; the desktop keeps the calm notice below
+until 5d. Plaintext voice and TeamSpeak keep their existing media formats. See
+the [5a report](voice-calls-5a.md), [5b report](voice-sfu-5b.md) and
+[5c report](voice-web-5c.md) for coverage, validation and acceptance still pending.
 
 RTP admission binds the negotiated microphone SSRC and retains retired SSRCs.
 Native capture positions drive RTP time; per-source generations and previous
