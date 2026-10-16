@@ -276,16 +276,32 @@ async fn connecting_listener_does_not_receive_a_backlog_after_the_handshake() {
     let running = server().await;
     let mut alice = Ws::connect(running.http, "alice").await;
     let mut bob = Ws::connect(running.http, "bob").await;
+    let mut carol = Ws::connect(running.http, "carol").await;
     alice.request("channel.join", json!({"channel": 1})).await;
     bob.request("channel.join", json!({"channel": 1})).await;
+    carol.request("channel.join", json!({"channel": 1})).await;
     let mut a = rtc_client(&mut alice).await;
     timeout(WAIT, a.connected.recv()).await.unwrap().unwrap();
+    let mut c = rtc_client(&mut carol).await;
+    timeout(WAIT, c.connected.recv()).await.unwrap().unwrap();
     let (release, wait) = tokio::sync::oneshot::channel();
     let mut b = rtc_client_after(&mut bob, Some(wait)).await;
 
     // Negotiate Bob's slots but hold ICE/DTLS while Alice speaks. These frames
     // cannot be played live and must not be queued in the SFU's SRTP writer.
+    // Carol, already connected, proves the SFU forwarded the last old frame
+    // before Bob's handshake is released.
     speak(&a, 1, 20, -10).await;
+    timeout(WAIT, async {
+        while let Some((_, payload, _, _)) = c.received.recv().await {
+            if payload[1] == 1 && payload[2] == 19 {
+                return;
+            }
+        }
+        panic!("observer stopped receiving");
+    })
+    .await
+    .unwrap();
     release.send(()).unwrap();
     timeout(WAIT, b.connected.recv()).await.unwrap().unwrap();
     for i in 20..23 {
