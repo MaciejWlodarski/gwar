@@ -815,7 +815,10 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                 let packet =
                     OutAudio::new(&AudioData::C2S { id: mic_packet, codec: CodecType::OpusVoice, data: &frame.opus });
                 mic_packet = mic_packet.wrapping_add(1);
-                if let Ok(transport) = con.get_tsproto_client_mut() {
+                if frame.opus.is_empty() {
+                    // The end marker must arrive even under socket pressure: queue it.
+                    let _ = con.send_audio(packet);
+                } else if let Ok(transport) = con.get_tsproto_client_mut() {
                     send_audio_now(transport, packet, &audio_socket_pressure);
                 }
             }

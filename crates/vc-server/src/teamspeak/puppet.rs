@@ -651,6 +651,8 @@ async fn run(
     let mut audio = spec.audio.clone();
     audio.confirm(own_channel(&con));
     let mut held: Option<AudioPacket> = None;
+    // Audio was sent since the last end marker: a stall may still owe one.
+    let mut spurt_open = false;
     #[cfg(feature = "test-hooks")]
     let mut hold_tail: Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)> = None;
     #[cfg(feature = "test-hooks")]
@@ -702,9 +704,17 @@ async fn run(
                 let now = Instant::now();
                 expire_uplink_tail(&mut packetizer, now, &shared.voice_stale_dropped);
                 if !fresh_uplink(&packet.payload, packet.admitted_at, now, &shared.voice_stale_dropped) {
+                    // A full uplink drops the spurt's one end marker; once the stale
+                    // backlog is drained, end the spurt here instead.
+                    if spurt_open && uplink.is_empty() {
+                        let end = super::packetizer::Packetized { data: Vec::new(), admitted_at: now };
+                        send_audio(&mut con, &mut packet_id, &end, shared, &packet, &audio);
+                        spurt_open = false;
+                    }
                     continue;
                 }
                 for data in packetizer.push(&packet.payload, packet.admitted_at) {
+                    spurt_open = !data.data.is_empty();
                     send_audio(&mut con, &mut packet_id, &data, shared, &packet, &audio);
                 }
                 held = Some(packet);
@@ -1068,7 +1078,11 @@ fn send_audio(
         if data.first().is_some_and(|toc| toc & 0x04 != 0) { CodecType::OpusMusic } else { CodecType::OpusVoice };
     let out = OutAudio::new(&AudioData::C2S { id: *packet_id, codec, data });
     *packet_id = packet_id.wrapping_add(1);
-    if let Ok(transport) = con.get_tsproto_client_mut() {
+    if data.is_empty() {
+        // An end marker carries no payload and must survive socket pressure:
+        // it is queued (the route was checked above), never dropped.
+        let _ = con.send_audio(out);
+    } else if let Ok(transport) = con.get_tsproto_client_mut() {
         send_audio_now(transport, out, &shared.voice_socket_pressure);
     }
 }

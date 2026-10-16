@@ -487,7 +487,9 @@ impl CaptureFrame {
         // stalled consumer finds old samples here and the position gap resets
         // any partial frame, while large callbacks still complete their frames.
         if now.saturating_duration_since(sample.captured_at) > io::MAX_CAPTURE_AGE {
-            counters.capture_stale_samples.fetch_add(1, Ordering::Relaxed);
+            // A stale backlog also invalidates the partial frame it interrupts.
+            counters.capture_stale_samples.fetch_add(1 + self.filled as u64, Ordering::Relaxed);
+            self.filled = 0;
             return None;
         }
         if sample.position != self.start + self.filled as u64 {
@@ -680,8 +682,8 @@ mod codec_tests {
             for _ in 0..rx.slots() {
                 assert!(capture.push_at(rx.pop().unwrap(), resumed, &counters).is_none());
             }
-            // Only the ring backlog is stale; its position gap discards the partial frame.
-            assert_eq!(counters.capture_stale_samples.load(Ordering::Relaxed), (size * 3 - size / 2) as u64);
+            // The ring backlog and the partial frame it interrupted.
+            assert_eq!(counters.capture_stale_samples.load(Ordering::Relaxed), (size * 3) as u64);
             let mut positions = Vec::new();
             for position in size * 3..size * 4 {
                 positions.extend(capture.push_at(

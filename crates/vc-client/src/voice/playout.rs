@@ -13,10 +13,13 @@ use super::{
 const STEP: usize = 240; // 5 ms at 48 kHz.
 const MAX_HEADROOM: usize = 1920; // 40 ms, unless one device callback itself needs more.
 const CALLBACK_HOLD: Duration = Duration::from_secs(5);
-// Leaky event budget: +5 ms per underrun, -5 ms per five elapsed seconds.
-// Each underrun is an audible glitch, so headroom settles where they are rarer
-// than one per 5 s; misses that headroom cannot prevent still release 40 ms in 35 s.
+// Leaky event budget: +5 ms per underrun, -5 ms per release interval, so rare
+// misses cannot pin 40 ms. A release followed by an underrun within
+// RELEASE_PROBE was needed margin: the interval doubles (up to 80 s), so a
+// periodic stall costs ever rarer glitches; a clean release resets it to 5 s.
 const HEADROOM_RELEASE: Duration = Duration::from_secs(5);
+const MAX_RELEASE: Duration = Duration::from_secs(80);
+const RELEASE_PROBE: Duration = Duration::from_secs(5);
 
 /// Pipeline-owned policy; the realtime callback only publishes atomic measurements.
 pub(super) struct SpeakerBuffer {
@@ -25,11 +28,22 @@ pub(super) struct SpeakerBuffer {
     callback_changed: Instant,
     headroom_changed: Instant,
     underruns: u64,
+    release_every: Duration,
+    /// When the last release happened, until it is proven needed or not.
+    released: Option<Instant>,
 }
 
 impl SpeakerBuffer {
     pub fn new(now: Instant) -> Self {
-        Self { callback: 480, headroom: 480, callback_changed: now, headroom_changed: now, underruns: 0 }
+        Self {
+            callback: 480,
+            headroom: 480,
+            callback_changed: now,
+            headroom_changed: now,
+            underruns: 0,
+            release_every: HEADROOM_RELEASE,
+            released: None,
+        }
     }
 
     /// `peak` is the largest callback since the previous update, never just the last one.
@@ -46,16 +60,32 @@ impl SpeakerBuffer {
         }
         let base = self.callback.max(STEP);
         self.headroom = self.headroom.max(base);
+        let missed = underruns > self.underruns;
+        match self.released {
+            Some(at) if missed && now.saturating_duration_since(at) <= RELEASE_PROBE => {
+                self.release_every = (self.release_every * 2).min(MAX_RELEASE);
+                self.released = None;
+            }
+            Some(at) if now.saturating_duration_since(at) > RELEASE_PROBE => {
+                self.release_every = HEADROOM_RELEASE;
+                self.released = None;
+            }
+            _ => {}
+        }
         let elapsed = now.saturating_duration_since(self.headroom_changed);
-        let steps = elapsed.as_nanos() / HEADROOM_RELEASE.as_nanos();
+        let steps = elapsed.as_nanos() / self.release_every.as_nanos();
         if steps > 0 {
             let decay = steps.min(usize::MAX as u128) as usize;
+            let before = self.headroom;
             self.headroom = self.headroom.saturating_sub(decay.saturating_mul(STEP)).max(base);
+            if self.headroom < before {
+                self.released = Some(now);
+            }
             // Preserve the fractional interval; underruns never restart this clock.
             self.headroom_changed =
-                now - Duration::from_nanos((elapsed.as_nanos() % HEADROOM_RELEASE.as_nanos()) as u64);
+                now - Duration::from_nanos((elapsed.as_nanos() % self.release_every.as_nanos()) as u64);
         }
-        if underruns > self.underruns {
+        if missed {
             let events = (underruns - self.underruns).min((MAX_HEADROOM / STEP) as u64) as usize;
             self.headroom = self.headroom.saturating_add(events * STEP).min(MAX_HEADROOM).max(self.headroom);
         }
@@ -290,6 +320,24 @@ mod tests {
     }
 
     #[test]
+    fn a_periodic_stall_backs_off_releases_instead_of_glitching_each_time() {
+        // Each second a 31 ms scheduling stall right after a refill needs 20 ms of
+        // headroom (10 ms callbacks); less underruns. Underruns follow occupancy.
+        let start = Instant::now();
+        let mut buffer = SpeakerBuffer::new(start);
+        let mut underruns = 0;
+        for second in 1..=300 {
+            if buffer.headroom < 960 {
+                underruns += 1;
+            }
+            buffer.update(start + Duration::from_secs(second), 480, 480, underruns);
+        }
+        // A fixed 5 s release would glitch after every release below 20 ms (about 60 times).
+        assert!(underruns <= 10, "{underruns} underruns in five minutes");
+        assert_eq!(buffer.release_every, MAX_RELEASE);
+    }
+
+    #[test]
     fn occasional_underruns_release_headroom_but_frequent_ones_grow_it() {
         let now = Instant::now();
         let mut buffer = SpeakerBuffer::new(now);
@@ -299,23 +347,24 @@ mod tests {
         assert_eq!(buffer.headroom, 1200); // Count every event between updates.
         buffer.update(now, 480, 480, 100);
         assert_eq!(buffer.headroom, MAX_HEADROOM);
-        for second in 1..=60 {
-            buffer.update(now + Duration::from_secs(second), 480, 480, 100 + second / 10);
+        for second in 1..=120 {
+            buffer.update(now + Duration::from_secs(second), 480, 480, 100 + second / 30);
         }
-        assert_eq!(buffer.headroom, 480 + STEP); // A miss every 10 s cannot pin 40 ms (one just landed).
+        assert!(buffer.headroom <= 480 + STEP, "{}", buffer.headroom); // A miss every 30 s cannot pin 40 ms.
         for tick in 1..=20 {
-            buffer.update(now + Duration::from_millis(60_000 + tick * 100), 480, 480, 106 + tick);
+            buffer.update(now + Duration::from_millis(120_000 + tick * 100), 480, 480, 104 + tick);
         }
         assert_eq!(buffer.headroom, MAX_HEADROOM); // 10 misses/s still attacks fast.
-        for second in 61..=90 {
-            buffer.update(now + Duration::from_secs(second), 480, 480, 126 + second / 3 - 20);
+        for second in 123..=150 {
+            buffer.update(now + Duration::from_secs(second), 480, 480, 124 + (second - 120) / 3);
         }
         // A miss every 3 s outpaces the 5 s release: glitches that headroom
         // can prevent keep it instead of settling at an audible rate.
         assert_eq!(buffer.headroom, MAX_HEADROOM);
-        buffer.update(now + Duration::from_secs(93), 2400, 2400, 137);
+        let mut buffer = SpeakerBuffer::new(now);
+        buffer.update(now, 2400, 2400, 0);
         assert_eq!(buffer.headroom, 2400); // Never less than one whole callback.
-        buffer.update(now + Duration::from_secs(98), 480, 480, 138);
+        buffer.update(now + Duration::from_secs(5), 480, 480, 1);
         // Release runs even with an underrun; the decaying callback maximum
         // remains the floor, including when it exceeds MAX_HEADROOM.
         assert_eq!(buffer.headroom, 2160);

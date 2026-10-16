@@ -372,16 +372,19 @@ within 20 seconds despite one loss per second, to at most the target plus 5 ms
 5 ms jitter every three seconds still receives no cuts. This quiet-audio bound
 is not a bound for uncorrelated speech: the decoder can still decline a cut.
 Speaker headroom keeps its 5 ms/event attack and 40 ms cap but releases 5 ms per
-five elapsed seconds, including intervals with underruns: it settles where
-underruns (audible glitches) are rarer than one per five seconds, and misses that
-headroom cannot prevent release 40 ms in 35 seconds instead of pinning it until
-30 seconds of complete silence per step.
+release interval, including intervals with underruns, instead of requiring 30
+seconds of complete silence per step. The interval starts at 5 s and doubles (up
+to 80 s) whenever an underrun follows a release within 5 s, so a periodic stall
+that needs the margin costs ever rarer glitches; a release without an underrun
+resets it to 5 s. Rare misses therefore cannot pin 40 ms.
 
 Native PCM and encoded queues retain callback capture time and discard audio
 older than 50 ms. PCM age is residence in the ring, so device callbacks longer
 than 50 ms still complete their frames; a frame's age starts with its last
-sample. End-of-speech markers are never age-dropped (direct TS and puppets),
-so a late marker still ends the TS talk spurt.
+sample. End-of-speech markers are never age-dropped and are queued rather than
+dropped under socket pressure (direct TS and puppets), so a late marker still
+ends the TS talk spurt. A puppet whose full uplink dropped the marker ends the
+spurt itself once the stale backlog is drained.
 Direct TS carries this time through its second queue and uses immediate UDP
 writes. Puppet uplinks retain local transport-admission time across fanout and
 the 40 ms packetizer tail; queued packets, held tails and final writes expire
