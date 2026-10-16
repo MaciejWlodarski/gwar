@@ -58,6 +58,16 @@ runner clears inherited `LATENCY_*` and `VC_*` settings itself. Both runners
 accept `--minimum-latency-ms` (default 5) and `--extra-delay-ms` (default 0),
 passing these settings explicitly to the client.
 
+`LATENCY_WAIT_CONNECTED=1` waits (at most 30 seconds) for both native transports
+before arming the two-second marker warmup. Carrier audio, capture clocks and
+network impairments still start at the original epoch; no voice queues are
+reset. This separates connected playout loss from audio captured while ICE/DTLS
+is unavailable. JSON records `wait_connected` and `connected_s`; capture and
+playout timestamps retain the original epoch. The default remains the original
+fixed warmup, which includes connection-setup losses. Use the same mode and
+harness source in both builds. The runners clear this variable too, so set it
+in executable wrappers when comparing variants.
+
 To check latency beyond one marker period, delay the audio itself in the fake
 receiver output device:
 
