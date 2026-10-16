@@ -261,8 +261,8 @@ impl Probe {
                     Some(ProbeCmd::Barrier(reply)) => {
                         let mut cmd =
                             OutCommand::new(Direction::C2S, Flags::empty(), PacketType::Command, "clientupdate");
-                        // Native clientgetconnectioninfo is an asynchronous info
-                        // request, not a return_code acknowledgement barrier.
+                        // The official server did not acknowledge the native
+                        // clientgetconnectioninfo request with a return_code.
                         cmd.write_arg("client_input_muted", &0);
                         let handle = cmd.send_with_result(&mut con).unwrap();
                         barriers.insert(handle, reply);

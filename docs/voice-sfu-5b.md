@@ -8,6 +8,143 @@ and cannot start encrypted voice. There is no SFrame dependency, key-install
 path or encrypted-to-plaintext fallback in this PR. Server-side encrypted
 routing is exercised by authenticated test peers, ready for 5c/5d.
 
+## Review round 2: deterministic TeamSpeak probes and immediate sends
+
+Implementation: `56aef87`; main merge: `62791e1`; permanent hook CI coverage:
+`bc0a483`; native command barrier: `f0ffcd5`. This round fixes the remaining TeamSpeak review findings and the
+ServerQuery reconnect failure. The earlier sections below are historical.
+
+- **Listener reconnect and readiness (1, 2c).** `Query::reconnect_listener`
+  closes the actual registered query transport using a `test-hooks` registry
+  of weak connections, then waits for a different connection whose
+  `servernotifyregister` response has succeeded. Both official reconnect
+  controls use it; neither kicks a ServerQuery client nor treats its nickname
+  or client id as readiness. The standalone listener probe holds old text
+  across this actual socket reconnect, rejects its old connection generation,
+  and immediately delivers fresh text after registration. Fake-query tests
+  exercise reconnect and deliberately hold the registration response after
+  nickname/whoami/move have completed. Hooks are absent from production builds.
+- **Admitted encrypted sources (2a).** The source fixture creates channel and
+  voice MLS groups, enters the encrypted channel, and negotiates a bound SRTP
+  run through the protocol. Its origin matches current routing and the mirror's
+  binding. Official voice and whisper probes observe admission at the receiving
+  puppet's callback, before downstream filters can mask a missing source guard.
+  The same admitted fixture tests `Sinks::send` directly with a plaintext
+  receiver and no downstream route filter, plus a current, confirmed
+  `AudioRoute` with the exact source binding. A plaintext send proves the
+  external queue works. These direct boundary assertions replace the fabricated
+  encrypted packet whose identity previously mismatched its plaintext session.
+- **Delayed classification (2b).** Each probe arms an observation keyed by
+  source TS client, receiving Gwar puppet session, voice/whisper mode and full
+  payload, then sends exactly once. A callback-exit guard reports that packet's
+  admission result. It also reports source identity/channel agreement and
+  receiver readiness independently of the mode guard. The probe awaits every
+  completion before changing the mirror. There are no outstanding retries and
+  unrelated callbacks cannot satisfy the wait. A unit regression checks the
+  receiver and payload keys and withholds acknowledgement until callback exit.
+- **Cooperative budget (3).** The pinned `ee3bc6f` transport exposes a socket
+  trait with `poll_send_to`, not a usable `try_send_to`. The single immediate
+  poll is wrapped in `tokio::task::coop::unconstrained`. Encoding and writing
+  remain synchronous after the route check; no voice is put in tsproto's queue.
+  Real socket pressure increments public `Shared::voice_socket_pressure` and
+  logs at debug, following the existing shared ingress-counter pattern. A real
+  loopback UDP test exhausts the task budget and still receives the packet;
+  the fake pressure test checks one drop, zero later flushing, and fresh sends.
+
+`main` advanced to `dadda0f` during this work. GitHub reported the PR
+`CONFLICTING` and did not schedule the `56aef87` push. The merge preserves both
+main's pre-connection capture discard and 5b's capture-position validation.
+The imported startup regression now checks fresh payloads and a 960-tick
+capture delta, accounting for 5b's random run offset. Removing the startup
+fix still fails that regression. No unrelated PR was edited.
+
+### Round-2 local mutation evidence
+
+Logs: `target/5b-round2/mutation-*.log`. Every row below exited 101 with an
+actual test assertion failure, not a build failure, and was restored afterward.
+
+| Mutation | Failing regression |
+| --- | --- |
+| Remove the unconstrained poll | `writable_voice_ignores_exhausted_cooperative_budget` (real UDP) |
+| Suppress the socket-pressure counter | `pending_transport_audio_cannot_flush_after_route_change` |
+| Remove `Sinks::send`'s source-mode check | `admitted_encrypted_source_is_rejected_at_each_external_boundary` |
+| Remove `AudioRoute::permits`'s source-mode check | Same admitted-source integration |
+| Ignore the listener connection generation | `reconnect_hook_closes_transport_and_waits_for_registration` |
+| Publish listener readiness before registration acknowledgement | `listener_readiness_waits_for_registration_ack` |
+| Acknowledge ingress at callback entry | `ingress_completion_matches_packet_receiver_and_finishes_after_decision` |
+| Ignore the receiving puppet when matching an observation | Same callback regression |
+| Remove the merged startup capture discard | `connecting_capture_is_not_replayed_after_the_handshake` |
+
+### Round-2 local verification
+
+Against the merged implementation, all requested commands passed:
+
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all --check` | Pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Pass |
+| `cargo test --workspace` | 659 passed, 0 failed, 6 ignored |
+| `cargo test -p vc-server --features test-hooks --test mls voice_opaque_srtp` | 1 passed |
+| `cargo test -p vc-server --features test-hooks --test teamspeak_channels --no-run` | Compiles |
+| `cargo test -p vc-server --features test-hooks --lib teamspeak` | 54 passed |
+| `cargo clippy -p vc-server --features test-hooks --all-targets -- -D warnings` | Pass |
+
+The official suite now requires both `teamspeak` and `test-hooks`; default
+workspace tests exclude that suite rather than counting it as an ignored test.
+CI runs it explicitly with both features. Logs are under `target/5b-round2/`.
+During development, the new plaintext fixture initially omitted channel entry
+and failed `voice.offer`; it was corrected before the passing integration.
+The imported startup test initially assumed absolute RTP timestamp 48000 and
+failed against 5b's random offset; the fresh-payload/delta regression above
+replaces that assumption. Neither failure is counted as a passing check.
+
+### Round-2 official execution
+
+Original CI runs `38860453236` (`db36cd8`) and `38868947448` (`24b692b`)
+failed at `clientkick` with ServerQuery error 516, `invalid client type`.
+Run `38872712607` (`62791e1`) passed the original reconnect point but exposed
+a second probe defect: `clientgetconnectioninfo` did not produce the awaited
+native `return_code` acknowledgement. `f0ffcd5` uses a no-op native
+`clientupdate client_input_muted=0` instead. All six non-Rust jobs in that run
+passed. Run `38873348985` was cancelled once this shared barrier failure was
+known; it did not establish any mutation results.
+
+Temporary commits `f2ab6ce`, `7830a2c` and `11e8595` added the mutation driver,
+moved the long workspace tests after the official probes, and corrected the
+driver's match for rustfmt's command layout. Superseded run `38874483760`
+was cancelled before collecting evidence. No workflow was blindly rerun.
+
+**Official-server acceptance:** run
+[38874582356](https://github.com/MaciejWlodarski/gwar/actions/runs/38874582356)
+(`11e8595`) passed all of these Rust steps: deterministic bridge hooks,
+TeamSpeak bridge end-to-end, the complete `teamspeak_channels --ignored`
+suite, and the official mutation driver. The normal official suite passed at
+08:38:01 UTC; the four independent mutation executions completed successfully
+at 08:40:28 UTC on 2026-10-16. Each ran the complete official test and exited
+101 at its required assertion, with restoration between mutations:
+
+| Official mutation | Required failure |
+| --- | --- |
+| Remove the route's plaintext-only check, voice source | `forbidden TS admission, marker=52` |
+| Same guard removal, independently exercise whisper source | `forbidden TS admission, marker=53` |
+| Ignore the listener connection generation | `queued text survived its listener connection` |
+| Restore the unacknowledged native command | `official probe command acknowledgement` |
+
+This establishes actual official-server arrival and completed rejection for
+unclassified/encrypted-source/encrypted-receiver voice and whispers, real
+listener socket reconnect with old-text rejection and fresh registration,
+queued/held audio retirement, refused-move, retained-private-puppet and
+replacement controls. The external encrypted-source queue boundary is also
+covered by the locally mutation-checked admitted fixture. Cumulative forbidden
+payload totals remain zero in the unmutated official run. This does not claim
+SFrame interoperability, physical audio acceptance, or a new latency result.
+
+The temporary workflow ordering and mutation driver are reverted after this
+evidence; the permanent hook regression step remains. Only `e2e-5b-sfu` was
+pushed, without force. No local TeamSpeak server, production service, SSH,
+stash or PR edit/comment was used. The final post-revert workflow is reported
+with its commit and run id in the implementation handoff.
+
 ## Review fixes on PR 53
 
 Implementation commit: `15b0ece50d71d3f7d0cec36b8f9090be652752d5`.
