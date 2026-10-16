@@ -857,8 +857,9 @@ large-queue runs (1920 and 2400 samples).
 
 Temporary gap counters at the sender's RTP write, SFU ingest, SFU forward and
 receiver arrival were added to both builds; they are not committed. Each build
-then ran 12 times under the six busy loops. Every receiver gap above 25 ms
-started as a sender-side gap (25–45 ms) and passed unchanged through the SFU.
+then ran 12 times under the six busy loops. Nearly every receiver gap above
+25 ms started as a sender-side gap (25–45 ms) and passed unchanged through the
+SFU; the one exception was a 27 ms receive gap whose largest send gap was 19 ms.
 At the receiver the late packet starves playout, PLC holds the timeline, and
 the extra depth stays until trimmed. In this sample the **baseline** was worse
 (p95 up to 79 ms, queue 1920 samples, PLC 3). The CPU-profile differences
