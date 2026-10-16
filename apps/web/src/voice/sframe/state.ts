@@ -145,6 +145,8 @@ export interface StateOptions {
   wallNow: () => number;
   onStatus: (status: CryptoStatus) => void;
   subtle?: SubtleCrypto;
+  /** This client's configured packet duration in 48 kHz samples (browser: 20 ms). */
+  frameSamples?: number;
 }
 
 export class SframeState {
@@ -356,6 +358,11 @@ export class SframeState {
     const keys = this.sender;
     if (this.ended || !keys) return null;
     if (plaintext.length < 1 || plaintext.length > MAX_OPUS) { this.counters.oversize_dropped++; return null; }
+    // Duration is parsed before encryption: malformed Opus never leaves; a
+    // valid packet of another duration is counted but sent.
+    const samples = packetSamples(plaintext);
+    if (samples === null) { this.counters.unexpected_duration++; return null; }
+    if (samples !== (this.options.frameSamples ?? 960)) this.counters.unexpected_duration++;
     if (this.options.now() >= keys.deadline) { this.closeSending("key_expired"); return null; }
     if (keys.counter >= COUNTER_LIMIT) { this.counters.counter_exhausted++; this.closeSending("counter_exhausted"); return null; }
     const ctr = keys.counter++;

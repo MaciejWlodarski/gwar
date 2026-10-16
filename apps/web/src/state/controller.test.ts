@@ -268,6 +268,28 @@ describe("staying on the server without voice", () => {
     expect(stores.useUi.getState().toasts.at(-1)?.text).toBe("Update your browser or use the desktop app to join encrypted voice.");
   });
 
+  it("a newer voice action cancels an encrypted join still waiting for its probe", async () => {
+    connectFake({ channel: 1, encrypted: [2] });
+    await vi.advanceTimersByTimeAsync(10);
+    let finish!: (ok: boolean) => void;
+    engine.capabilities.encryptedVoice = () => new Promise<boolean>(resolve => { finish = resolve; });
+    const joining = controller.joinChannel(2);
+    await controller.leaveVoice();
+    finish(true);
+    await joining;
+    await vi.advanceTimersByTimeAsync(10);
+    expect(link.sent("channel.join")).toHaveLength(0);
+  });
+
+  it("a refused forced move into an encrypted channel offers Retry", async () => {
+    connectFake({ channel: 1, encrypted: [2] });
+    await vi.advanceTimersByTimeAsync(10);
+    engine.capabilities.encryptedVoice = async () => false;
+    link.emit({ ev: "client.updated", d: client(1, 2) });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(stores.useVoice.getState().state).toBe("failed");
+  });
+
   it("joins an encrypted channel when the engine can encrypt", async () => {
     connectFake({ encrypted: [2] });
     await controller.joinChannel(2);

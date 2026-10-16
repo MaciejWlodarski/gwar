@@ -101,12 +101,19 @@ describe("SframeState", () => {
     expect(a.state.counters.oversize_dropped).toBe(1);
     expect(await b.state.decrypt(new Uint8Array(1034))).toBeNull();
     expect(b.state.counters.oversize_dropped).toBe(1);
-    const invalid = (await a.state.encrypt(new Uint8Array([0xf1, 1])))!; // CBR two frames, odd body
-    expect(await b.state.decrypt(invalid)).toBeNull();
-    expect(b.state.counters.unexpected_duration).toBe(1);
+    // The sender drops malformed Opus before encryption and counts other durations.
+    expect(await a.state.encrypt(new Uint8Array([0xf1, 1]))).toBeNull(); // CBR two frames, odd body
+    expect(a.state.counters.unexpected_duration).toBe(1);
+    expect(await a.state.encrypt(new Uint8Array([0xf0, 1]))).not.toBeNull(); // valid 10 ms: counted, sent
+    expect(a.state.counters.unexpected_duration).toBe(2);
     const widest = (await a.state.encrypt(new Uint8Array([0xf8, ...new Array<number>(999).fill(7)])))!;
     expect(widest.length).toBeLessThanOrEqual(1033);
     expect((await b.state.decrypt(widest))?.length).toBe(1000);
+    // A malformed packet from another sender's key is dropped after opening.
+    const enc = await deriveKey(voiceKid(1n, 0), new Uint8Array(Buffer.from(all[0]!.key, "base64url")), "encrypt");
+    const invalid = await seal(enc, voiceKid(1n, 0), 1000n, new Uint8Array(), new Uint8Array([0xf1, 1]));
+    expect(await b.state.decrypt(invalid)).toBeNull();
+    expect(b.state.counters.unexpected_duration).toBe(1);
   });
 
   it("follows the 128-counter window and the widest header encodings", async () => {

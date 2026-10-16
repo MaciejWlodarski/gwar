@@ -87,6 +87,8 @@ export function VoicePanel() {
   const encryption = useVoice((s) => s.encryption);
   const micError = useVoice((s) => s.micError);
   const me = useMe();
+  // Encrypted channels never show an alarm, even when the engine refused them.
+  const encryptedChannel = useSession((s) => (me?.channel != null ? !!s.channels[me.channel]?.encrypted : false));
   const channelName = useSession((s) => (me?.channel != null ? s.channels[me.channel]?.name : undefined));
   const phase = useSession((s) => s.phase);
   // TeamSpeak servers always keep you in a channel: there is nothing to leave.
@@ -125,7 +127,7 @@ export function VoicePanel() {
           : voiceState === "connected"
             ? { tone: "ok", text: t("voice.connected") }
             : voiceState === "failed"
-              ? { tone: encryption ? "muted" : "danger", text: t("voice.failed") }
+              ? { tone: encryption || encryptedChannel ? "muted" : "danger", text: t("voice.failed") }
               : { tone: "warn", text: t("voice.connecting") };
   const unavailable = voiceState === "failed" || encryption === "failed";
 

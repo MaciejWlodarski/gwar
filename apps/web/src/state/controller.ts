@@ -724,8 +724,11 @@ class Controller {
     const state = (await conn.request("voice.state", {})).voice;
     if (!current()) throw new Error("Stale voice participation");
     if (!state || !state.encrypted || state.channel !== channel || state.call !== participation.call || state.participation !== participation.participation) throw new Error("voice.state does not match this participation");
-    // Counter exhaustion closes the run: start a fresh one (new run and SSRC).
-    const call = await runtime.voiceCall(state, session, () => { if (current()) void this.startVoice(); });
+    // Counter exhaustion closes the run: start a fresh one (new run and SSRC),
+    // for as long as this call is still the current one (any run of it).
+    const created: { call?: VoiceCall } = {};
+    const call = await runtime.voiceCall(state, session, () => { if (created.call && this.voiceCall?.call === created.call && this.conn === conn) void this.startVoice(); });
+    created.call = call;
     if (!current() || this.runtime !== runtime) { runtime.endVoiceCall(call); throw new Error("Stale voice participation"); }
     const publish = () => useVoice.getState().set({ encryption: call.status(), hearers: (() => { const members = call.roster(); return members ? { channel, members } : null; })() });
     this.voiceCall = { call, runtime, unsubscribe: call.subscribe(publish) };
@@ -799,6 +802,7 @@ class Controller {
 
   /** Stops audio and releases the microphone; I stay on the server. */
   private async stopVoice(): Promise<void> {
+    this.joinAttempt++;
     const run = ++this.voiceRun;
     if (this.voiceRetry) clearTimeout(this.voiceRetry);
     this.voiceRetry = null;
@@ -817,6 +821,7 @@ class Controller {
 
   /** Leaves voice but stays on the server (and keeps reading chat). */
   async leaveVoice(): Promise<void> {
+    this.joinAttempt++; // a pending encrypted join gives up
     if (!this.canLeaveVoice || myChannelId(useSession.getState()) === null) return;
     const ok = await this.attempt(this.connection.request("channel.leave", {}));
     // The server's client.updated follows; do not wait for it to release the microphone.
@@ -1025,7 +1030,10 @@ class Controller {
     this.selectChannel(channel); // opens the password dialog for locked channels
     // Already there, unless a move elsewhere is still in flight (then this is a move back).
     const pending = useUi.getState().joining;
-    if ((myChannelId(useSession.getState()) === channel && (pending === null || pending === channel)) || this.isLockedForMe(channel)) return;
+    if ((myChannelId(useSession.getState()) === channel && (pending === null || pending === channel)) || this.isLockedForMe(channel)) {
+      this.joinAttempt++; // staying where I am supersedes a pending encrypted join
+      return;
+    }
     await this.attempt(this.joinChannel(channel));
   }
 
@@ -1063,6 +1071,7 @@ class Controller {
   async moveClient(client: number, channel: number) {
     // Moving myself into an encrypted channel enters its voice: same check as a join.
     const s = useSession.getState();
+    if (s.me?.session === client && !s.channels[channel]?.encrypted) this.joinAttempt++;
     if (s.me?.session === client && s.channels[channel]?.encrypted) {
       const conn = this.conn, attempt = ++this.joinAttempt;
       const refusal = await this.encryptedVoiceRefusal();
