@@ -13,7 +13,9 @@ import { authenticatePlaintext } from "./plaintext";
 import { channelOf, credential, descriptor, participants, type Successor } from "./descriptor";
 import { AgentOperationError, Engine, acquireDeviceLock, jobChange, jobKey } from "./engine";
 import { openStorage, type Persistence } from "./storage";
-import { loadAgent } from "./wasm";
+import { loadAgent, loadVoiceAgent } from "./wasm";
+import { VoiceCall } from "./voice";
+import type { VoiceState } from "../proto/VoiceState";
 import type { AgentFactory, Change, CommitOutbox, ConversationStatus, Gate, GroupSummary, HistoryJob, OpenResult, PackageJob, Plaintext, RequestJob, Resolution, Revocation, Roster, SealedFields } from "./types";
 const bytes = (value: string): number[] => [...decodeBase64Url(value)];
 const encoded = (value: number[]): string => encodeBase64Url(new Uint8Array(value));
@@ -110,6 +112,8 @@ export class MlsRuntime {
    * first found behind, and when (docs/e2e-build.md "Restarts"). */
   private readonly triggers = new Map<string, { key: string; at: number }>();
   private wakeAt: number | undefined;
+  /** Volatile voice calls under this device lease, closed with it. */
+  private readonly calls = new Set<VoiceCall>();
   private readonly now: () => number;
   private constructor(private readonly options: RuntimeOptions, private readonly engine: Engine, private readonly release: () => Promise<void>) { this.now = options.now ?? Date.now; }
 
@@ -167,6 +171,9 @@ export class MlsRuntime {
           runtime!.lastPublish = -Infinity;
           runtime!.syncedVersions.clear();
           runtime!.markSecuring();
+          // Connection loss closes voice and forgets its secrets; no counter resumes.
+          for (const call of runtime!.calls) call.close();
+          runtime!.calls.clear();
           if (status.state === "closed") void runtime!.close();
         }
       }));
@@ -184,6 +191,7 @@ export class MlsRuntime {
         runtime!.schedule();
       }));
       runtime.unsubscribers.push(options.link.onEvent(event => {
+        for (const call of runtime!.calls) call.event(event);
         if (event.ev === "channel.created" && event.d.encrypted) { runtime!.channels?.set(event.d.id, event.d.history); runtime!.schedule(); }
         if (event.ev === "channel.deleted" && runtime!.channels?.delete(event.d.channel)) runtime!.schedule();
         if (!event.ev.startsWith("mls.")) return;
@@ -221,8 +229,8 @@ export class MlsRuntime {
   private assertCurrent(generation: number): void {
     if (this.stopped || generation !== this.generation || !this.options.link.isOnline || this.options.link.serverKey !== this.server) throw new Error("MLS connection changed");
   }
-  private async request<O extends Op>(op: O, data: RequestInput<O>, guard?: () => void): Promise<ResponseMap[O]> {
-    const generation = this.activeGeneration; this.assertCurrent(generation);
+  private async request<O extends Op>(op: O, data: RequestInput<O>, guard?: () => void, generation = this.activeGeneration): Promise<ResponseMap[O]> {
+    this.assertCurrent(generation);
     // Leave room for chat/voice/control traffic in the connection's 20/s bucket.
     const now = performance.now();
     this.requestTokens = Math.min(12, this.requestTokens + (now - this.refilled) / 100);
@@ -953,8 +961,47 @@ export class MlsRuntime {
       return result;
     });
   }
+  /** Starts the controller of an encrypted call this session just entered.
+   * The caller closes it on leave, move or a different call. */
+  async voiceCall(state: VoiceState, session: number): Promise<VoiceCall> {
+    if (this.stopped || !this.options.link.isOnline) throw new Error("MLS runtime unavailable");
+    // A reconnect makes every capture of this call stale.
+    const generation = this.generation;
+    const factory = await loadVoiceAgent(this.options.seed, credential(this.options.identity), this.now);
+    this.assertCurrent(generation);
+    const call: VoiceCall = new VoiceCall({
+      server: this.server, uid: this.uid, session, identity: this.options.identity,
+      request: (op, data) => this.request(op, data, undefined, generation),
+      tree: group => { this.assertCurrent(generation); return this.tree(group); },
+      revocations: () => this.options.revocations(),
+      now: () => this.now(),
+      parent: this.engine,
+      parentGroup: channel => {
+        const pin = this.livePin(`channel:${channel}`);
+        return pin && pin.record.status === "active" ? encoded(pin.group) : null;
+      },
+      syncParent: group => this.engine.run(async () => {
+        this.activeGeneration = this.generation; this.assertCurrent(this.activeGeneration);
+        await this.syncGroup(group);
+        const gate = this.gate(group);
+        return gate.status === "active" && !gate.rejoin && !gate.server_pending && !gate.blocked.length && !gate.pending_commit && !this.outbox(group);
+      }),
+      factory,
+      onError: error => this.options.onError?.(error),
+    }, state);
+    this.calls.add(call);
+    call.start();
+    return call;
+  }
+  /** Ends a call's controller: its pin, agent, timers and pending results. */
+  endVoiceCall(call: VoiceCall): void {
+    call.close(); this.calls.delete(call);
+  }
   close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
+    // Voice closes before the lease is released (a takeover included).
+    for (const call of this.calls) call.close();
+    this.calls.clear();
     this.stopped = true; this.generation++;
     clearTimeout(this.retry);
     for (const download of this.downloads) download.abort();

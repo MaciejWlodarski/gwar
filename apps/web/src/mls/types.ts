@@ -7,6 +7,8 @@ export type Changes = Record<Store, Change[]>;
 export const emptyChanges = (): Changes => ({ openmls: [], groups: [], epochs: [], outbox: [] });
 export interface WasmAgent {
   execute(request: unknown): unknown;
+  /** Voice agents only: queries that read the parent channel agent. */
+  execute_with_parent?(request: unknown, parent: WasmAgent): unknown;
   take_changes(): Changes;
   free(): void;
 }
@@ -31,7 +33,7 @@ export interface GroupSummary {
     /** Per uid, the epoch ranges in which it had a leaf, as this device saw them. */
     evidence?: Record<string, { first: string; last: string }[]>;
   };
-  members: { device_key: string; uid: string }[];
+  members: { leaf: number; device_key: string; uid: string }[];
 }
 export interface Gate {
   status: GroupSummary["record"]["status"];

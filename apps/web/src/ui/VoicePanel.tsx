@@ -84,6 +84,7 @@ function SelfName({ nickname }: { nickname?: string }) {
 export function VoicePanel() {
   const t = useT();
   const voiceState = useVoice((s) => s.state);
+  const encryption = useVoice((s) => s.encryption);
   const micError = useVoice((s) => s.micError);
   const me = useMe();
   const channelName = useSession((s) => (me?.channel != null ? s.channels[me.channel]?.name : undefined));
@@ -112,14 +113,21 @@ export function VoicePanel() {
     );
   }
 
+  // Encrypted calls: "Securing voice…" until a sending key is active, in the
+  // muted style; a stopped engine is "Voice unavailable" with Retry, no alarm.
   const status =
     phase === "reconnecting"
       ? { tone: "warn", text: t("voice.reconnecting") }
-      : voiceState === "connected"
-        ? { tone: "ok", text: t("voice.connected") }
-        : voiceState === "failed"
-          ? { tone: "danger", text: t("voice.failed") }
-          : { tone: "warn", text: t("voice.connecting") };
+      : encryption === "failed"
+        ? { tone: "muted", text: t("voice.failed") }
+        : voiceState === "connected" && encryption === "securing"
+          ? { tone: "muted", text: t("voice.securing") }
+          : voiceState === "connected"
+            ? { tone: "ok", text: t("voice.connected") }
+            : voiceState === "failed"
+              ? { tone: encryption ? "muted" : "danger", text: t("voice.failed") }
+              : { tone: "warn", text: t("voice.connecting") };
+  const unavailable = voiceState === "failed" || encryption === "failed";
 
   return (
     <div className="border-t border-line bg-side">
@@ -130,6 +138,7 @@ export function VoicePanel() {
             status.tone === "ok" && "text-ok",
             status.tone === "warn" && "animate-pulse text-warn",
             status.tone === "danger" && "text-danger",
+            status.tone === "muted" && "text-muted",
           )}
         />
         <div className="min-w-0 flex-1 leading-tight">
@@ -139,13 +148,14 @@ export function VoicePanel() {
               status.tone === "ok" && "text-ok",
               status.tone === "warn" && "text-warn",
               status.tone === "danger" && "text-danger",
+              status.tone === "muted" && "text-muted",
             )}
           >
             {status.text}
           </div>
           {channelName && <div className="truncate text-xs text-muted">{channelName}</div>}
         </div>
-        {voiceState === "failed" && phase === "online" && (
+        {unavailable && phase === "online" && (
           <Button size="sm" variant="secondary" onClick={() => controller.retryVoice()}>
             {t("voice.retry")}
           </Button>

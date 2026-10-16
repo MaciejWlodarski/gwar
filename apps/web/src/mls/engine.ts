@@ -50,6 +50,12 @@ export class Engine {
     this.tail = result.catch(() => {});
     return result;
   }
+  /** Synchronous access for a query that also reads another agent (voice
+   * keys against the parent channel). Throws while the agent is reloading. */
+  withAgent<T>(read: (agent: WasmAgent) => T): T {
+    if (!this.agent) throw new Error("MLS agent not loaded");
+    return read(this.agent);
+  }
   query<T>(request: unknown): T {
     if (!this.agent) throw new Error("MLS agent not loaded");
     return this.agent.execute(request) as T;

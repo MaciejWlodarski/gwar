@@ -305,6 +305,7 @@ struct DeviceRecord {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Member {
+    pub leaf: u32,
     pub device_key: String,
     pub uid: String,
 }
@@ -620,9 +621,9 @@ impl Agent {
                         .public_group()
                         .treesync()
                         .full_leaves()
-                        .map(|(_, leaf)| {
+                        .map(|(index, leaf)| {
                             let c = leaf_credential(leaf).ok_or(Invalid("credential"))?;
-                            Ok(Member { device_key: c.device_key().into(), uid: c.uid() })
+                            Ok(Member { leaf: index.u32(), device_key: c.device_key().into(), uid: c.uid() })
                         })
                         .collect::<Result<Vec<_>>>()?
                 } else {

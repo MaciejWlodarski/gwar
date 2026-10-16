@@ -55,7 +55,12 @@ export const useSession = create<SessionStore>()((set) => ({
 
 // -------------------------------------------------------------------- voice
 
+/** Encrypted voice, from the MLS call controller: never key material. */
+export type VoiceEncryption = "securing" | "active" | "failed" | null;
 interface VoiceStore {
+  encryption: VoiceEncryption;
+  /** Who can hear: the call's validated voice tree, by uid with every device. */
+  hearers: { channel: number; members: { uid: string; devices: string[] }[] } | null;
   muted: boolean;
   deafened: boolean;
   level: number;
@@ -67,6 +72,8 @@ interface VoiceStore {
 }
 
 export const useVoice = create<VoiceStore>()((set) => ({
+  encryption: null,
+  hearers: null,
   muted: false,
   deafened: false,
   level: 0,
@@ -115,6 +122,7 @@ export type DialogState =
   | { kind: "createToken" }
   | { kind: "serverKey" }
   | { kind: "readers"; thread: SealedThreadKey }
+  | { kind: "hearers"; channel: number }
   | { kind: "confirm"; title: string; memberTitle?: { uid: string; fallback: string; key: Key }; body: string; confirmLabel: string; danger?: boolean; serverIdentity?: boolean; onConfirm: () => void }
   /** First TeamSpeak connection on a device: offers the official client's identities. Resolves with the chosen ones, or null. */
   | { kind: "tsFirstRun"; found: TsFound[]; resolve: (chosen: TsFound[] | null) => void };

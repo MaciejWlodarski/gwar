@@ -34,3 +34,14 @@ export async function descriptor(identity: Identity, uid: string, server: string
   const bytes = fields.flatMap(field => [...enc.encode(`${field.length}:`), ...field, 44]);
   return { bytes, group: encodeBase64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", statement))) };
 }
+/** The voice group of one call: `voice:{channel}`, incarnation 0, no history,
+ * bound to the live channel group, with a fresh creation nonce per candidate. */
+export async function voiceDescriptor(identity: Identity, uid: string, server: string, channel: number, channelGroup: string, now: number): Promise<{ bytes: number[]; group: string }> {
+  decodeFixed(server, 32); decodeFixed(channelGroup, 32);
+  if (!Number.isInteger(channel) || channel < 0 || channel > 0xffffffff) throw new Error("invalid channel");
+  const statement = enc.encode(["gwar conversation v1", server, `voice:${channel}`, "voice", "0", "-", "0", "0", "-", channelGroup, uid, now, encodeBase64Url(crypto.getRandomValues(new Uint8Array(16)))].join("\n"));
+  const fields = [statement, credential(identity), decodeFixed(await identity.sign(statement), 64)];
+  fields[2] = enc.encode(encodeBase64Url(fields[2]!));
+  const bytes = fields.flatMap(field => [...enc.encode(`${field.length}:`), ...field, 44]);
+  return { bytes, group: encodeBase64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", statement))) };
+}

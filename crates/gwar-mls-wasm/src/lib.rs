@@ -217,6 +217,7 @@ struct VoiceKeys {
     epoch: String,
     own_leaf: u32,
     members: Vec<VoiceKey>,
+    send_until: Option<i64>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -272,6 +273,7 @@ impl Agent {
                         .into_iter()
                         .map(|m| VoiceKey { leaf: m.leaf, device: m.device, key: m.key.to_vec() })
                         .collect(),
+                    send_until: keys.send_until,
                 })
             }
             ParentRequest::VoiceParentRemovals { server, group, synchronized } => {

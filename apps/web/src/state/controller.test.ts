@@ -82,7 +82,7 @@ class FakeLink implements Link {
 
 function fakeEngine() {
   const engine = {
-    capabilities: { outputDeviceSelection: false },
+    capabilities: { outputDeviceSelection: false, encryptedVoice: async () => true },
     start: vi.fn(async () => {}),
     stop: vi.fn(async () => {}),
     retryMic: vi.fn(async () => {}),
@@ -178,6 +178,7 @@ beforeAll(async () => {
 beforeEach(() => {
   vi.useFakeTimers();
   vi.clearAllMocks();
+  engine.capabilities.encryptedVoice = async () => true;
   link = new FakeLink();
   session().dispatch({ type: "reset" });
   stores.useUi.setState({ dialog: { kind: "none" }, joining: null, toasts: [] });
@@ -238,7 +239,9 @@ describe("staying on the server without voice", () => {
     expect(engine.start).toHaveBeenCalledTimes(1);
     finish();
     await vi.advanceTimersByTimeAsync(10);
-    expect(stores.useVoice.getState().state).toBe("idle");
+    // Without an MLS call controller there is no encrypted start and no plaintext fallback.
+    expect(engine.start).toHaveBeenCalledTimes(1);
+    expect(stores.useVoice.getState().state).not.toBe("connected");
   });
 
   it("does not clear replacement voice state when an older stop finishes", async () => {
@@ -255,12 +258,21 @@ describe("staying on the server without voice", () => {
     expect(engine.start).toHaveBeenCalledTimes(2);
   });
 
-  it("refuses encrypted voice before joining or opening the microphone", async () => {
+  it("refuses encrypted voice before joining or opening the microphone when the engine cannot", async () => {
     connectFake({ encrypted: [2] });
+    engine.capabilities.encryptedVoice = async () => false;
     await controller.joinChannel(2);
     await vi.advanceTimersByTimeAsync(10);
     expect(link.sent("channel.join")).toHaveLength(0);
     expect(engine.start).not.toHaveBeenCalled();
+    expect(stores.useUi.getState().toasts.at(-1)?.text).toBe("Update your browser or use the desktop app to join encrypted voice.");
+  });
+
+  it("joins an encrypted channel when the engine can encrypt", async () => {
+    connectFake({ encrypted: [2] });
+    await controller.joinChannel(2);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(link.sent("channel.join")).toHaveLength(1);
   });
 
   it("leaves an unconfirmed call replacement and ignores an old-run closure", async () => {

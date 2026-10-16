@@ -1,4 +1,5 @@
 import { nextMediaRun } from "./engine";
+import { encryptedVoiceSupported, SframeWorker } from "./sframe/client";
 import { AUDIO_SLOTS } from "../net/protocol";
 import {
   rmsToLevel,
@@ -46,6 +47,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
 
   private handlers = new Map<string, Set<Handler>>();
   private pc: RTCPeerConnection | null = null;
+  private sframe: SframeWorker | null = null;
   private micSender: RTCRtpSender | null = null;
   private stream: MediaStream | null = null;
   private ctx: SinkAudioContext | null = null;
@@ -76,6 +78,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
 
   constructor() {
     this.capabilities = {
+      encryptedVoice: () => encryptedVoiceSupported(),
       outputDeviceSelection:
         typeof AudioContext !== "undefined" &&
         ("setSinkId" in AudioContext.prototype || (typeof HTMLMediaElement !== "undefined" && "setSinkId" in HTMLMediaElement.prototype)),
@@ -108,11 +111,19 @@ export class WebRtcVoiceEngine implements VoiceEngine {
 
   // ------------------------------------------------------------- lifecycle
 
-  async start({ offer, iceServers, mode }: Parameters<VoiceEngine["start"]>[0]): Promise<void> {
-    if (mode !== "plaintext") throw new VoiceError("unsupported", "Encrypted voice is being added. Chat is available.");
+  async start({ offer, iceServers, mode, binding, keys }: Parameters<VoiceEngine["start"]>[0]): Promise<void> {
+    const encrypted = mode === "encrypted";
+    const { server_key, call, participation, group } = binding;
+    if (encrypted && (!keys || !server_key || !call || !participation || !group)) throw new VoiceError("unsupported", "encrypted voice needs its call binding and keys");
     const mediaRun = nextMediaRun();
     const run = ++this.runId;
+    // Closes the old gate and drops its queued audio before the new run starts.
     this.teardownPeer();
+    if (encrypted && !(await encryptedVoiceSupported())) {
+      this.setState("failed");
+      throw new VoiceError("unsupported", "Update your browser or use the desktop app to join encrypted voice.");
+    }
+    if (run !== this.runId) return;
     this.setState("starting");
     this.ensureContext();
     await this.ctx?.resume().catch(() => {});
@@ -131,14 +142,27 @@ export class WebRtcVoiceEngine implements VoiceEngine {
         bundlePolicy: "max-bundle",
       });
       this.pc = pc;
+      // One dedicated worker per encrypted run; it starts closed.
+      const sframe = encrypted ? new SframeWorker({ server_key: server_key!, session: binding.session, channel: binding.channel, call: call!, participation: participation!, run: mediaRun, group: group! }, keys!.resumeAfter(), status => {
+        if (this.sframe !== sframe) return;
+        keys!.engineStatus(status);
+        if (status.state === "failed") { this.teardownPeer(); this.setState("failed"); }
+      }) : null;
+      this.sframe = sframe;
       const track = this.stream?.getAudioTracks()[0] ?? null;
-      // Transceiver 0 = microphone. Added even without a track so the server's
-      // "first sendonly section is the mic" rule holds; the track can be
-      // attached later with replaceTrack.
-      const mic = track ? pc.addTransceiver(track, { direction: "sendonly" }) : pc.addTransceiver("audio", { direction: "sendonly" });
+      // Transceiver 0 = microphone, created without a track so its transform is
+      // attached before any audio; the track follows with replaceTrack.
+      const mic = pc.addTransceiver("audio", { direction: "sendonly" });
+      if (sframe) mic.sender.transform = sframe.transform({ side: "send" });
+      if (track) await mic.sender.replaceTrack(track);
+      if (run !== this.runId) return;
       this.micSender = mic.sender;
       const slotTransceivers: RTCRtpTransceiver[] = [];
-      for (let i = 0; i < AUDIO_SLOTS; i++) slotTransceivers.push(pc.addTransceiver("audio", { direction: "recvonly" }));
+      for (let i = 0; i < AUDIO_SLOTS; i++) {
+        const slot = pc.addTransceiver("audio", { direction: "recvonly" });
+        if (sframe) slot.receiver.transform = sframe.transform({ side: "receive", slot: i });
+        slotTransceivers.push(slot);
+      }
 
       pc.ontrack = (ev) => {
         const slot = slotTransceivers.indexOf(ev.transceiver);
@@ -164,6 +188,8 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       if (run !== this.runId) return;
       await pc.setRemoteDescription({ type: "answer", sdp: answer });
       if (run !== this.runId) return;
+      // Controls only after the server bound this run: acks name it.
+      if (sframe) keys!.attach({ run: mediaRun, control: body => sframe.control(body) });
       this.applyTrackEnabled();
 
       setTimeout(() => {
@@ -185,6 +211,9 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   }
 
   private teardownPeer(): void {
+    // Invalidate the run's keys first, then the transport.
+    this.sframe?.stop();
+    this.sframe = null;
     const pc = this.pc;
     this.pc = null;
     this.micSender = null;
@@ -489,6 +518,10 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     const pipe = this.pipes[slot];
     if (pipe) pipe.owner = uid;
     this.applySlotGain(slot);
+  }
+
+  async cryptoCounters(): Promise<Record<string, number> | null> {
+    return (await this.sframe?.counters()) ?? null;
   }
 
   async listDevices(): Promise<DeviceList> {
