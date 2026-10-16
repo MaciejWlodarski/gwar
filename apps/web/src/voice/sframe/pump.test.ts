@@ -9,7 +9,7 @@ describe("pump", () => {
     const writable = new WritableStream<EncodedFrame>({ write(f) { written.push(new Uint8Array(f.data)[0]!); } });
     const releases: (() => void)[] = [];
     let dropped = 0;
-    const done = pump({ readable, writable, options: {} }, async data => { await new Promise<void>(r => releases.push(r)); return data[0] === 3 ? null : new Uint8Array([data[0]! + 100]); }, () => { dropped++; });
+    const done = pump({ readable, writable, options: {} }, async data => { await new Promise<void>(r => releases.push(r)); return data[0] === 3 ? null : new Uint8Array([data[0]! + 100]); }, () => { dropped++; }, error => { throw error; });
     const frame = (n: number): EncodedFrame => ({ data: new Uint8Array([n]).buffer });
     for (const n of [1, 2, 3, 4]) push(frame(n));
     await new Promise(r => setTimeout(r, 0));
@@ -28,5 +28,15 @@ describe("pump", () => {
     await done;
     await new Promise(r => setTimeout(r, 0));
     expect(written).toEqual([101, 104, 105]); // frame 3 was dropped by processing
+  });
+
+  it("reports a processing failure instead of silently dropping every frame", async () => {
+    let push!: (f: EncodedFrame) => void;
+    const readable = new ReadableStream<EncodedFrame>({ start(c) { push = f => c.enqueue(f); } });
+    const failures: unknown[] = [];
+    void pump({ readable, writable: new WritableStream(), options: {} }, async () => { throw new Error("crypto failed"); }, () => {}, e => failures.push(e));
+    push({ data: new Uint8Array([1]).buffer });
+    await new Promise(r => setTimeout(r, 0));
+    expect(String(failures[0])).toContain("crypto failed");
   });
 });

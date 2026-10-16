@@ -8,12 +8,14 @@ import { SframeState } from "./state";
 import { pump, type Transformer } from "./pump";
 
 /** The worker's global scope, without the webworker lib (it would retype the app's globals). */
-interface WorkerScope { onmessage: ((event: MessageEvent<ToWorker>) => void) | null; onrtctransform: ((event: { transformer: Transformer }) => void) | null; postMessage(message: FromWorker): void }
+interface WorkerScope { onmessage: ((event: MessageEvent<ToWorker>) => void) | null; onrtctransform: ((event: { transformer: Transformer }) => void) | null; onunhandledrejection: (() => void) | null; postMessage(message: FromWorker): void }
 const self = globalThis as unknown as WorkerScope;
 let state: SframeState | null = null;
 let sweep: ReturnType<typeof setInterval> | undefined;
 let queueDropped = 0;
 const post = (message: FromWorker) => self.postMessage(message);
+/** Any unexpected failure stops the keys and reports `worker_failed`. */
+const fail = () => { clearInterval(sweep); state?.stop("worker_failed"); };
 
 async function cryptoWorks(): Promise<boolean> {
   try {
@@ -42,7 +44,10 @@ self.onmessage = event => {
       return;
     case "control":
       if (!state) return;
-      void state.control(m.body, m.bytes).then(result => post({ type: "result", id: m.id, result }));
+      void state.control(m.body, m.bytes).then(result => post({ type: "result", id: m.id, result }), () => {
+        fail();
+        post({ type: "result", id: m.id, result: { serial: "0", epoch: "0", result: "ignored" } });
+      });
       return;
     case "stats":
       if (state) post({ type: "stats", id: m.id, counters: { ...state.counters, queue_dropped: queueDropped } });
@@ -54,9 +59,11 @@ self.onmessage = event => {
   }
 };
 
+self.onunhandledrejection = fail;
+
 self.onrtctransform = event => {
   const { side } = event.transformer.options as TransformOptions;
   post({ type: "transform", side });
   const process = side === "send" ? (data: Uint8Array<ArrayBuffer>) => state?.encrypt(data) ?? Promise.resolve(null) : (data: Uint8Array<ArrayBuffer>) => state?.decrypt(data) ?? Promise.resolve(null);
-  void pump(event.transformer, process, () => { queueDropped++; }).catch(() => {});
+  void pump(event.transformer, process, () => { queueDropped++; }, fail).catch(fail);
 };

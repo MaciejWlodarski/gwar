@@ -352,6 +352,45 @@ describe("SframeState", () => {
     for (const w of await Promise.all(waits)) expect(w).toMatchObject({ result: "ignored" });
   });
 
+  it("compares installs by normalized members and keeps no raw exporter key", async () => {
+    const b = engine();
+    const all = members(1n, [[0, 0], [1, 1]]);
+    await b.enter(1n, 1, all);
+    const reordered = all.map(m => ({ key: m.key, device: m.device, leaf: m.leaf }));
+    expect(await b.send({ action: "install", epoch: "1", own_leaf: 1, members: reordered, removed: [] })).toMatchObject({ result: "unchanged" });
+    expect(b.state.stopped).toBe(false);
+    const internals = JSON.stringify(b.state, (_, v) => (typeof v === "bigint" ? v.toString() : v instanceof Map ? [...v] : v));
+    for (const m of all) expect(internals).not.toContain(m.key);
+  });
+
+  it("drops an encryption that completes after the certificate deadline", async () => {
+    const clock = new Clock();
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const slow: SubtleCrypto = new Proxy(crypto.subtle, { get: (t, p) => p === "encrypt" ? async (...args: unknown[]) => { await gate; return (t.encrypt as (...a: unknown[]) => unknown).apply(t, args); } : ((t as unknown as Record<string | symbol, unknown>)[p] as (...a: unknown[]) => unknown).bind(t) });
+    const statuses: CryptoStatus[] = [];
+    const s = new SframeState({ binding, resumeAfter: null, now: clock.now, wallNow: clock.wallNow, onStatus: x => statuses.push(x), subtle: slow });
+    await s.control({ binding, serial: "1", action: "supersede", epoch: "1" });
+    await s.control({ binding, serial: "2", action: "install", epoch: "1", own_leaf: 0, members: members(1n, [[0, 0], [1, 1]]), removed: [] });
+    await s.control({ binding, serial: "3", action: "activate", epoch: "1", send_until: clock.wall + 1_000 });
+    const pending = s.encrypt(OPUS.slice());
+    clock.t += 1_000;
+    release();
+    expect(await pending).toBeNull();
+    expect(statuses).toEqual([{ binding, state: "securing", reason: "key_expired" }]);
+  });
+
+  it("closes the run when a key import fails", async () => {
+    const broken: SubtleCrypto = new Proxy(crypto.subtle, { get: (t, p) => p === "importKey" ? async () => { throw new Error("import failed"); } : ((t as unknown as Record<string | symbol, unknown>)[p] as (...a: unknown[]) => unknown).bind(t) });
+    const statuses: CryptoStatus[] = [];
+    const clock = new Clock();
+    const s = new SframeState({ binding, resumeAfter: null, now: clock.now, wallNow: clock.wallNow, onStatus: x => statuses.push(x), subtle: broken });
+    await s.control({ binding, serial: "1", action: "supersede", epoch: "1" });
+    expect(await s.control({ binding, serial: "2", action: "install", epoch: "1", own_leaf: 0, members: members(1n, [[0, 0], [1, 1]]), removed: [] })).toMatchObject({ result: "ignored" });
+    expect(statuses).toEqual([{ binding, state: "failed", reason: "worker_failed" }]);
+    expect(s.stopped).toBe(true);
+  });
+
   it("encrypts with exactly the RFC header for its kid and counter", async () => {
     const a = engine();
     await a.enter(3n, 4, members(3n, [[0, 0], [4, 1]]));

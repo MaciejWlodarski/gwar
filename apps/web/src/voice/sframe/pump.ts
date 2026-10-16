@@ -5,7 +5,7 @@ export interface Transformer { readonly readable: ReadableStream; readonly writa
 /** At most one frame in flight and one waiting per transform: a newer frame
  * replaces the waiting one instead of queueing, so encryption adds no buffering.
  * Output stays in order; a null result drops the frame. */
-export async function pump(transformer: Transformer, process: (data: Uint8Array<ArrayBuffer>) => Promise<Uint8Array<ArrayBuffer> | null>, dropped: () => void): Promise<void> {
+export async function pump(transformer: Transformer, process: (data: Uint8Array<ArrayBuffer>) => Promise<Uint8Array<ArrayBuffer> | null>, dropped: () => void, failed: (error: unknown) => void): Promise<void> {
   const reader = transformer.readable.getReader() as ReadableStreamDefaultReader<EncodedFrame>;
   const writer = transformer.writable.getWriter();
   let waiting: EncodedFrame | null = null, busy = false;
@@ -21,7 +21,8 @@ export async function pump(transformer: Transformer, process: (data: Uint8Array<
   for (;;) {
     const { value, done } = await reader.read();
     if (done) return;
-    if (!busy) void run(value).catch(() => {});
+    // A processing or write failure is not a dropped frame: it ends the run.
+    if (!busy) void run(value).catch(failed);
     else { if (waiting) dropped(); waiting = value; }
   }
 }

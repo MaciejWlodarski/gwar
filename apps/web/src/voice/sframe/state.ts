@@ -4,6 +4,7 @@
  * owns one instance; the native engine implements the same control contract.
  * Key material never leaves this object: no logs, persistence or archives.
  */
+import { sha256 } from "@noble/hashes/sha2.js";
 import { decodeBase64Url, encodeBase64Url } from "../../net/base64url";
 import { decodeHeader } from "./header";
 import { packetSamples } from "./opus";
@@ -105,6 +106,9 @@ export function parseControl(value: unknown): Control | null {
   }
 }
 
+/** A non-secret fingerprint of a key-bearing text; the text itself is not kept. */
+const fingerprint = (text: string): string => encodeBase64Url(sha256(new TextEncoder().encode(text)));
+
 /** Fixed field order: bytewise comparison of duplicate serials. */
 export function canonical(c: Control): string {
   const b = c.binding;
@@ -179,7 +183,7 @@ export class SframeState {
     if (!c) return Promise.resolve({ ...tag, error: "bad_keys" });
     const ignored = (): ControlResult => ({ serial: c.serial, epoch: c.epoch, result: "ignored" });
     if (this.ended || bindingKey(c.binding) !== this.binding) return Promise.resolve(ignored());
-    const serial = BigInt(c.serial), text = canonical(c);
+    const serial = BigInt(c.serial), text = fingerprint(canonical(c));
     if (serial < this.serial) return Promise.resolve(ignored());
     if (serial === this.serial && this.last) {
       if (this.last.body !== text) return Promise.resolve(this.fail("key_conflict", c));
@@ -198,7 +202,16 @@ export class SframeState {
     return { serial: c.serial, epoch: c.epoch, error: reason };
   }
 
+  /** An unexpected failure (a rejected import, a WebCrypto error) closes the run. */
   private async apply(c: Control): Promise<ControlResult> {
+    try { return await this.applyControl(c); }
+    catch {
+      this.stop("worker_failed");
+      return { serial: c.serial, epoch: c.epoch, result: "ignored" };
+    }
+  }
+
+  private async applyControl(c: Control): Promise<ControlResult> {
     const epoch = BigInt(c.epoch);
     const result = (result: "applied" | "unchanged" | "ignored"): ControlResult => ({ serial: c.serial, epoch: c.epoch, result });
     switch (c.action) {
@@ -236,7 +249,8 @@ export class SframeState {
     if (this.options.resumeAfter !== null && epoch <= this.options.resumeAfter) return stale();
     if (this.floor === null || epoch > this.floor) return { serial: c.serial, epoch: c.epoch, error: "bad_keys" };
     if (epoch < this.floor) return stale();
-    const digest = JSON.stringify([c.own_leaf, c.members]);
+    // Normalized member fields, fingerprinted: no raw exporter key is retained.
+    const digest = fingerprint(JSON.stringify([c.own_leaf, c.members.map(m => [m.leaf, m.device, m.key])]));
     const same = (other: string) => {
       if (other === digest) return result("unchanged");
       this.stop("key_conflict");
@@ -333,6 +347,7 @@ export class SframeState {
     this.epochs.clear();
     this.lastAuthenticated.clear();
     this.latest = null;
+    this.last = null;
     if (reason !== "stopped") this.status("failed", reason);
   }
 
@@ -347,6 +362,8 @@ export class SframeState {
     const generation = this.sendGeneration;
     const ciphertext = await seal(keys.own, voiceKid(keys.epoch, keys.ownLeaf), ctr, new Uint8Array(), plaintext, this.options.subtle);
     if (this.ended || generation !== this.sendGeneration || this.sender !== keys) return null;
+    // A completion after the certificate deadline is dropped too.
+    if (this.options.now() >= keys.deadline) { this.closeSending("key_expired"); return null; }
     this.counters.encrypted++;
     return ciphertext;
   }
