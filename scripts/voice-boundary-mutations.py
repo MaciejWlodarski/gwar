@@ -25,7 +25,7 @@ for name, expected in [
                 assert line in originals[probe]
                 probe.write_text(originals[probe].replace(line, ""))
         elif name == "command_barrier":
-            changed = originals[probe].replace('"clientupdate",\n                        );', '"clientgetconnectioninfo",\n                        );').replace('cmd.write_arg("client_input_muted", &0);', 'cmd.write_arg("clid", &con.get_state().unwrap().own_client.0);')
+            changed = originals[probe].replace('PacketType::Command, "clientupdate");', 'PacketType::Command, "clientgetconnectioninfo");').replace('cmd.write_arg("client_input_muted", &0);', 'cmd.write_arg("clid", &con.get_state().unwrap().own_client.0);')
             assert changed != originals[probe]
             probe.write_text(changed)
         else:
