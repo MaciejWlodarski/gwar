@@ -556,6 +556,13 @@ describe("VoiceCall", () => {
     await settle();
     expect(actions(f.controls)).not.toContain("install:3");
     expect(f.restarts()).toBe(1);
+    // Wakes while the replacement negotiates (12 s) do not cancel it again.
+    for (let i = 0; i < 3; i++) { f.call.recheck(); f.call.event({ ev: "mls.commit", d: { group: f.server.group } }); }
+    await settle(12_000);
+    expect(f.restarts()).toBe(1);
+    f.media(); // the replacement attaches: own update, then installs
+    await settle(ACK_WAIT_MS + 1_000);
+    expect(f.call.status()).toBe("active");
   });
 
   it("closes without further requests or controls", async () => {

@@ -189,6 +189,7 @@ export class VoiceCall {
   attach(media: VoiceMedia): void {
     if (this.closed) return;
     const restart = this.runs++ > 0;
+    this.restartPending = false;
     this.media = { ...media, serial: 0n, barrier: null, installed: null, removed: new Set(), floor: null, activated: null, sendUntil: null, activating: null, eligible: null };
     this.setStatus("securing");
     if (restart) { this.needUpdate = true; this.updateHash = null; }
@@ -203,7 +204,7 @@ export class VoiceCall {
     this.media.activated = null;
     this.setStatus("securing");
     // Exhaustion closes the run: a fresh run then installs from an own update.
-    if (status.reason === "counter_exhausted") { this.host.restartMedia(); return; }
+    if (status.reason === "counter_exhausted") { this.requestRestart(); return; }
     // An expired key needs a fresh own leaf before sending again.
     this.needUpdate = true; this.updateHash = null;
     this.schedule(true);
@@ -644,9 +645,17 @@ export class VoiceCall {
   }
 
   /** Barrier, installation, acknowledgement and activation for the newest processed epoch. */
+  /** One replacement run at a time: later wakes wait for it to attach. */
+  private requestRestart(): void {
+    if (this.restartPending) return;
+    this.restartPending = true;
+    this.host.restartMedia();
+  }
+  private restartPending = false;
+
   private async deliver(): Promise<void> {
     const media = this.media;
-    if (!media || this.processed === null) return;
+    if (!media || this.processed === null || this.restartPending) return;
     await this.barrier();
     const epoch = this.processed;
     if (media.floor === null && this.needUpdate) return; // waiting for the restart's own update
@@ -665,7 +674,7 @@ export class VoiceCall {
       this.gateBlocked = false;
       // More removals since the last install than one control may carry: this
       // run's keys are not worth patching; a fresh run starts with none.
-      if (media.removed.size > MAX_REMOVED) { for (const m of keys.members) m.key.fill(0); this.host.restartMedia(); return; }
+      if (media.removed.size > MAX_REMOVED) { for (const m of keys.members) m.key.fill(0); this.requestRestart(); return; }
       const members = keys.members.map(m => ({ leaf: m.leaf, device: m.device, key: encodeBase64Url(new Uint8Array(m.key)) }));
       for (const m of keys.members) m.key.fill(0);
       const result = await this.control(media, { action: "install", epoch: keys.epoch, own_leaf: keys.own_leaf, members, removed: [...media.removed] });
