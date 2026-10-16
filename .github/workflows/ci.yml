@@ -27,6 +27,8 @@ jobs:
         run: cargo clippy --workspace --exclude vc-desktop --all-targets -- -D warnings
       - name: Tests
         run: cargo test --workspace --exclude vc-desktop
+      - name: Deterministic TeamSpeak hook regressions
+        run: cargo test -p vc-server --features test-hooks --lib teamspeak
       - name: Queued encrypted voice
         run: cargo test -p vc-server --features test-hooks --test mls voice_opaque_srtp
       - name: Server without TeamSpeak support
