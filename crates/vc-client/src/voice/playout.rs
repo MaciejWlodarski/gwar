@@ -62,6 +62,7 @@ impl SpeakerBuffer {
         self.headroom = self.headroom.max(base);
         let missed = underruns > self.underruns;
         let induced = self.released.is_some_and(|at| now.saturating_duration_since(at) <= RELEASE_PROBE);
+        let every = self.release_every;
         if missed && induced {
             self.release_every = (self.release_every * 2).min(MAX_RELEASE);
             self.released = None;
@@ -70,6 +71,10 @@ impl SpeakerBuffer {
             // prevent it): back to the base interval, so it cannot pin headroom.
             self.release_every = HEADROOM_RELEASE;
             self.released = None;
+        }
+        if self.release_every != every {
+            // A new interval starts now: never release retroactively under it.
+            self.headroom_changed = now;
         }
         let elapsed = now.saturating_duration_since(self.headroom_changed);
         let steps = elapsed.as_nanos() / self.release_every.as_nanos();
@@ -352,6 +357,20 @@ mod tests {
             buffer.update(start + Duration::from_secs(second), 480, 480, underruns);
         }
         assert!(buffer.headroom <= 480 + 2 * STEP, "{}", buffer.headroom);
+    }
+
+    #[test]
+    fn a_backoff_reset_does_not_release_retroactively() {
+        let start = Instant::now();
+        let mut buffer = SpeakerBuffer::new(start);
+        buffer.headroom = MAX_HEADROOM;
+        buffer.release_every = MAX_RELEASE;
+        // An unrelated miss 60 s after the last release resets the interval.
+        buffer.update(start + Duration::from_secs(60), 480, 480, 1);
+        assert_eq!(buffer.release_every, HEADROOM_RELEASE);
+        assert_eq!(buffer.headroom, MAX_HEADROOM, "the shorter interval starts now");
+        buffer.update(start + Duration::from_secs(65), 480, 480, 1);
+        assert_eq!(buffer.headroom, MAX_HEADROOM - STEP);
     }
 
     #[test]
