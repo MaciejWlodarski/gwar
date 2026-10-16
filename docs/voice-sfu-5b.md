@@ -839,39 +839,48 @@ markers. B is `b0c6e6b` plus the #54 fix; C is the 5b head `2c03f3f`.
 | mixed | 4 | 385 / 385 | 78.78 / 70.65 | −8.13; [−8.46, +0.39] | 409 / 424 | 0 / 0 | PASS |
 | cpu | 10 | 1000 / 1000 | 52.09 / 113.95 | +61.86; [−4.65, +69.93] | 5 / 14 | 0 / 4 | FAIL (rule) |
 
-**Idle.** Every run settles into one of three latency levels: p95 ≈ 40, ≈ 47
-or 50–55 ms. The level follows how much startup depth the receiver trimmed
-(0, 360 or 600 samples), and both variants show all three levels.
-`jitter.rs`/`playout.rs` are identical in both builds. C landed on the top
-level in 4 of 20 runs, B in 1 of 20; that difference produces the +3.93 ms. A
-run-level spread of about ±8 ms cannot resolve a 2 ms bound with 20 pairs.
-This is not evidence that 5b adds latency.
+**Idle.** Per-run p95 values cluster around ≈40, ≈47 and 50–55 ms in both
+variants, and the cluster correlates with how much startup depth the receiver
+trimmed (mostly 0, 360 or 600 samples; candidate runs also show 262, 480 and
+720). `jitter.rs`/`playout.rs` are identical in both builds. Candidate runs
+fell in the top cluster 4 of 20 times, baseline runs 1 of 20, which accounts
+for the +3.93 ms. With run-level differences of about ±8 ms, 20 pairs cannot
+resolve a 2 ms bound in either direction.
 
-**CPU.** All four C underruns came from two adjacent slots (14–15) inside the
-same minute; B's neighbouring slot 13 also shows queue growth and PLC. In the
-repeat (10 pairs, uncontended) C had no underruns, but the result was again
-inconclusive: added p95 +18.80 ms, interval [−8.58, +29.89], and C showed two
-large-queue runs (1920 and 2400 samples).
+**CPU.** The four candidate underruns occurred in two adjacent runs (slots 14
+and 15, three and one) spanning about one minute (18:24:12–18:25:13 UTC); the
+neighbouring baseline slot 13 also shows queue growth and PLC. In the repeat
+(10 pairs, uncontended) the candidate had no underruns but the comparison was
+again inconclusive: added p95 +18.80 ms, interval [−8.58, +29.89], with two
+candidate runs ending with large packet queues (1920 and 2400 samples).
 
 ### Diagnosis of the CPU-load queues
 
 Temporary gap counters at the sender's RTP write, SFU ingest, SFU forward and
 receiver arrival were added to both builds; they are not committed. Each build
-then ran 12 times under the six busy loops. Nearly every receiver gap above
-25 ms started as a sender-side gap (25–45 ms) and passed unchanged through the
-SFU; the one exception was a 27 ms receive gap whose largest send gap was 19 ms.
-At the receiver the late packet starves playout, PLC holds the timeline, and
-the extra depth stays until trimmed. In this sample the **baseline** was worse
-(p95 up to 79 ms, queue 1920 samples, PLC 3). The CPU-profile differences
-therefore come from capture/send-thread starvation that both builds share,
-not from 5b. It is the behaviour that #55 (`fbdf23c`) targets: it drops
-capture older than 50 ms and recovers receiver surplus under recurring PLC.
+then ran 12 times under the six busy loops. The counters are aggregates per
+run (count of gaps above 25/40/80 ms and the maximum); they cannot follow an
+individual gap through the path. Receive gaps above 25 ms (six in total) mostly
+coincide with send gaps of 25–45 ms in the same run (four in total). Two runs
+had receive gaps without a send gap above 25 ms: `run-18-cand` (send max
+18.6 ms, receive 27.2 ms) and `run-08-base` (send max 23.0 ms, ingest/forward
+27.7 ms, receive 29.1 ms). At the receiver a late packet starves playout, PLC
+holds the timeline, and the extra depth stays until trimmed. In this sample the
+baseline had the worst run (p95 79.49 ms, final queue 1920 samples, PLC 3).
+
+Capture/send-thread starvation shared by both builds is therefore a plausible
+mechanism for the CPU-profile queues. These measurements do not exclude a 5b
+scheduling contribution: the 5b-only CPU comparisons remain FAIL (by rule) and
+INCONCLUSIVE. #55 (`fbdf23c`) targets this mechanism by dropping capture older
+than 50 ms and recovering receiver surplus under recurring PLC.
 
 ### Current main against the pre-step baseline
 
 C is now `main` at `83b7db4` (5b, #55 and 5c), with 10 pairs per condition.
+"Max final queue" is the largest end-of-run packet queue snapshot, not a
+within-run high-water mark.
 
-| Condition | Pairs | p95 B / C (ms) | Added p95; paired 95% interval | PLC B / C | Underruns | Max queue B / C (samples) | Decision |
+| Condition | Pairs | p95 B / C (ms) | Added p95; paired 95% interval | PLC B / C | Underruns | Max final queue B / C (samples) | Decision |
 | --- | ---: | --- | --- | --- | --- | --- | --- |
 | idle | 9 | 49.85 / 49.34 | −0.51; [−4.50, +4.74] | 4 / 4 | 0 / 0 | 960 / 480 | INCONCLUSIVE |
 | cpu | 10 | 62.35 / 50.05 | −12.31; [−17.77, +1.26] | 11 / 14 | 0 / 0 | 960 / 960 | PASS |
@@ -880,14 +889,18 @@ One idle slot was marked contended, which leaves nine idle pairs.
 
 ### Decision
 
-- **No measured condition shows latency added by 5b.**
-- **Impairment profiles pass.** Loss, reorder, stall, jitter, callback jitter
-  and mixed pass on a quiet machine.
-- **CPU load.** It fails against 5b alone by the underrun rule. Diagnosis shows
-  shared sender starvation. Current `main` passes it (−12.3 ms) with no large
-  queues or underruns.
-- **Idle and burst stay INCONCLUSIVE.** Run-level startup-depth levels exceed
-  the 2 ms resolution of a run-paired interval at these sample sizes.
+**The 5b latency gate is still not passed.**
+
+- **5b alone, pass:** loss, reorder, stall, jitter, callback jitter and mixed
+  PASS on a quiet machine.
+- **5b alone, inconclusive or failed:** idle and burst are INCONCLUSIVE. CPU
+  load is FAIL by the underrun rule in the full series and INCONCLUSIVE in the
+  repeat.
+- **What the data does and does not show:** no condition shows a resolved
+  latency addition by 5b, but the idle and CPU data cannot exclude one either.
+- **Current `main`:** it passes the CPU-load comparison against the pre-step
+  baseline (−12.3 ms, upper bound +1.26 ms), with no underruns and no large
+  final queues. Idle remains INCONCLUSIVE (−0.51 ms, [−4.50, +4.74]).
 
 Resolving idle within 2 ms needs one of two things: a method that controls the
 startup-depth level (for example, markers only after the receiver's initial
