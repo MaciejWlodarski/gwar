@@ -82,7 +82,11 @@ impl AudioIo for ToneIo {
                     let phase = (position + i as u64) as f64 * std::f64::consts::TAU / RATE as f64;
                     let value = (phase * self.frequency).sin() as f32 * 0.25;
                     // Match physical capture: position advances even if the ring is full.
-                    let _ = mic_tx.push(CaptureSample { position: position + i as u64, value });
+                    let _ = mic_tx.push(CaptureSample {
+                        captured_at: std::time::Instant::now(),
+                        position: position + i as u64,
+                        value,
+                    });
                     let played = f64::from(speaker_rx.pop().unwrap_or_else(|_| {
                         missing += 1;
                         0.0

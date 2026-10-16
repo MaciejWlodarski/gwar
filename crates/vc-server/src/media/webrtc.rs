@@ -540,6 +540,7 @@ fn ingest(
         return None;
     }
     Some(AudioPacket {
+        admitted_at: std::time::Instant::now(),
         origin: peer.origin.clone(),
         payload: Arc::clone(&data.payload),
         kind: AudioKind::Audio,

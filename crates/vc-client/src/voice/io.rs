@@ -8,6 +8,7 @@ use std::{
         mpsc as std_mpsc,
     },
     thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -18,10 +19,16 @@ use super::permission::{self, MicPermission, MicPermissionDenied};
 
 pub const RATE: u32 = 48_000;
 
+/// Maximum local capture residence, shared by the PCM and encoded queues.
+/// Allows normal 10/20 ms batching without replaying a stalled consumer's backlog.
+pub const MAX_CAPTURE_AGE: Duration = Duration::from_millis(50);
+
 /// One resampled microphone sample; position advances even when the ring is full.
 #[derive(Debug, Clone, Copy)]
 pub struct CaptureSample {
     pub position: u64,
+    /// Monotonic time when this sample entered the capture callback.
+    pub captured_at: Instant,
     pub value: f32,
 }
 
@@ -44,6 +51,7 @@ pub struct OutputTiming {
     pub(crate) headroom_samples: AtomicUsize,
     pub(crate) playing: AtomicBool,
     pub(crate) underruns: AtomicU64,
+    pub(crate) capture_overflow_samples: AtomicU64,
     pub(crate) underrun_samples: AtomicU64,
 }
 
@@ -189,8 +197,11 @@ fn open_input(
         move |data: &[f32], _| {
             mono.clear();
             mono.extend(data.chunks(channels).map(|frame| frame.iter().sum::<f32>() / frame.len() as f32));
+            let captured_at = Instant::now();
             to_engine.process(&mono, |s| {
-                let _ = mic_tx.push(CaptureSample { position, value: s });
+                if mic_tx.push(CaptureSample { position, captured_at, value: s }).is_err() {
+                    timing.capture_overflow_samples.fetch_add(1, Ordering::Relaxed);
+                }
                 position += 1;
             });
             timing.wake();

@@ -308,7 +308,10 @@ impl AudioIo for FakeIo {
                     } else {
                         0.0
                     };
-                    if mic_tx.push(CaptureSample { position: at as u64, value }).is_err() {
+                    if mic_tx
+                        .push(CaptureSample { captured_at: std::time::Instant::now(), position: at as u64, value })
+                        .is_err()
+                    {
                         return;
                     }
                     let value = speaker_rx.pop().unwrap_or_else(|_| {
