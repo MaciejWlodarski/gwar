@@ -118,6 +118,12 @@ where
                         }
                     }
                     Ok(Output::Event(Event::Connected)) => {
+                        // Capture queued while ICE/DTLS was pending is already old.
+                        // Bound the drain to this snapshot so a live producer cannot
+                        // starve the transport, then resume at its capture clock.
+                        for _ in 0..outgoing.len() {
+                            let _ = outgoing.try_recv();
+                        }
                         tracing::info!("voice transport connected");
                         counters.set_link(LinkState::Connected);
                     }
@@ -138,6 +144,11 @@ where
             tokio::select! {
                 frame = outgoing.recv() => {
                     let Some(frame) = frame else { return };
+                    // str0m buffers writes before SRTP is ready. Replaying that
+                    // capture after a handshake retry creates permanent playout lag.
+                    if !rtc.is_connected() {
+                        continue;
+                    }
                     let ticks = send_ticks(frame.capture_position, last_ticks);
                     last_ticks = Some(ticks);
                     if let Some(stream) = rtc.direct_api().stream_tx_by_mid(mic, None) {
@@ -196,6 +207,98 @@ fn answer_sends_generation(answer: &str, mid: Mid, id: u8) -> bool {
 mod tests {
     use super::*;
     use str0m::change::SdpOffer;
+
+    #[tokio::test]
+    async fn connecting_capture_is_not_replayed_after_the_handshake() {
+        use std::sync::atomic::Ordering;
+        use tokio::time::{Duration, timeout};
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local = socket.local_addr().unwrap();
+        let mut remote = Rtc::builder()
+            .set_extension(SLOT_GENERATION_ID, slot_generation_extension())
+            .set_rtp_mode(true)
+            .clear_codecs()
+            .enable_opus(true, false)
+            .build(Instant::now());
+        remote.add_local_candidate(Candidate::host(local, "udp").unwrap());
+        let (outgoing, outgoing_rx) = mpsc::channel(1);
+        let (incoming, _incoming_rx) = std::sync::mpsc::sync_channel(16);
+        let counters = Arc::new(Counters::default());
+        start(
+            |offer| {
+                let answer = remote.sdp_api().accept_offer(SdpOffer::from_sdp_string(&offer).unwrap()).unwrap();
+                std::future::ready(Ok(answer.to_sdp_string()))
+            },
+            local.ip(),
+            outgoing_rx,
+            incoming,
+            counters.clone(),
+            Arc::new(OutputTiming::default()),
+        )
+        .await
+        .unwrap();
+
+        // Do not service the remote handshake yet. The bounded channel plus the
+        // final permit proves the native transport consumed every old frame.
+        timeout(Duration::from_secs(5), async {
+            for i in 0..100 {
+                outgoing
+                    .send(Outgoing { capture_position: i * 480, opus: vec![0xf0, 1], level: -10, speech: true })
+                    .await
+                    .unwrap();
+            }
+            drop(outgoing.reserve().await.unwrap());
+        })
+        .await
+        .unwrap();
+        assert_eq!(counters.link.load(Ordering::Relaxed), 0);
+
+        let (received_tx, mut received) = mpsc::channel(256);
+        let task = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            loop {
+                let deadline = loop {
+                    match remote.poll_output().unwrap() {
+                        Output::Timeout(at) => break at,
+                        Output::Transmit(packet) => {
+                            socket.send_to(&packet.contents, packet.destination).await.unwrap();
+                        }
+                        Output::Event(Event::RtpPacket(packet)) => {
+                            received_tx.send((packet.header.timestamp, packet.payload.to_vec())).await.unwrap();
+                        }
+                        _ => {}
+                    }
+                };
+                tokio::select! {
+                    packet = socket.recv_from(&mut buf) => {
+                        let (n, source) = packet.unwrap();
+                        remote.handle_input(Input::Receive(Instant::now(), Receive {
+                            proto: Protocol::Udp, source, destination: local,
+                            contents: buf[..n].try_into().unwrap(),
+                        })).unwrap();
+                    }
+                    _ = sleep_until(deadline.into()) => {}
+                }
+                remote.handle_input(Input::Timeout(Instant::now())).unwrap();
+            }
+        });
+        let result = timeout(Duration::from_secs(5), async {
+            while counters.link.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert_eq!(counters.link.load(Ordering::Relaxed), 1);
+            outgoing
+                .send(Outgoing { capture_position: 48_000, opus: vec![0xf0, 2], level: -10, speech: true })
+                .await
+                .unwrap();
+            received.recv().await.unwrap()
+        })
+        .await;
+        task.abort();
+        let _ = task.await;
+        assert_eq!(result.unwrap(), (48_000, vec![0xf0, 2]), "pre-connection capture must never enter SRTP");
+    }
 
     #[test]
     fn timestamp_quantum_tracks_capture_and_batches_do_not_reuse_ticks() {
