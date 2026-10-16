@@ -259,13 +259,11 @@ impl Probe {
                 };
                 match command {
                     Some(ProbeCmd::Barrier(reply)) => {
-                        let mut cmd = OutCommand::new(
-                            Direction::C2S,
-                            Flags::empty(),
-                            PacketType::Command,
-                            "clientgetconnectioninfo",
-                        );
-                        cmd.write_arg("clid", &con.get_state().unwrap().own_client.0);
+                        let mut cmd =
+                            OutCommand::new(Direction::C2S, Flags::empty(), PacketType::Command, "clientupdate");
+                        // Native clientgetconnectioninfo is an asynchronous info
+                        // request, not a return_code acknowledgement barrier.
+                        cmd.write_arg("client_input_muted", &0);
                         let handle = cmd.send_with_result(&mut con).unwrap();
                         barriers.insert(handle, reply);
                     }
@@ -330,7 +328,10 @@ impl Probe {
     async fn barrier(&self) {
         let (reply, done) = tokio::sync::oneshot::channel();
         self.tx.send(ProbeCmd::Barrier(reply)).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(10), done).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(10), done)
+            .await
+            .expect("official probe command acknowledgement")
+            .unwrap();
     }
     async fn forbidden_bytes(&mut self, marker: u8) -> u64 {
         self.forbidden.insert(marker);
