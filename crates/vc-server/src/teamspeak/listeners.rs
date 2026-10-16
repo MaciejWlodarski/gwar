@@ -179,6 +179,45 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test]
+    async fn listener_readiness_waits_for_registration_ack() {
+        use futures::FutureExt;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut server = crate::teamspeak::query::tests::channel_server_with_gate(Some(gate.clone())).await;
+        let (tx, _rx) = mpsc::channel(8);
+        let mut pool = ChannelListeners::new(server.addr, "p ss".into(), tx);
+        pool.reconcile([10]);
+        assert!(matches!(server.event().await, ChannelEvent::Ready { cid: 10, .. }));
+        // The nickname, whoami and move have completed, but registration has
+        // no response yet. This observable state must not count as ready.
+        assert!(Query::listener_ready(server.addr, 10).now_or_never().is_none());
+        gate.add_permits(1);
+        Query::listener_ready(server.addr, 10).await;
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[tokio::test]
+    async fn reconnect_hook_closes_transport_and_waits_for_registration() {
+        let mut server = channel_server().await;
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut pool = ChannelListeners::new(server.addr, "p ss".into(), tx);
+        pool.reconcile([10]);
+        Query::listener_ready(server.addr, 10).await;
+        assert!(matches!(server.event().await, ChannelEvent::Ready { cid: 10, .. }));
+        server.message(10, 2, 7, "old");
+        let old = rx.recv().await.unwrap();
+        assert!(pool.accepts(&old));
+        Query::reconnect_listener(server.addr, 10).await;
+        assert!(matches!(server.event().await, ChannelEvent::Closed(10)));
+        assert!(matches!(server.event().await, ChannelEvent::Ready { cid: 10, .. }));
+        assert!(!pool.accepts(&old));
+        server.message(10, 2, 7, "fresh");
+        let fresh = rx.recv().await.unwrap();
+        assert!(pool.accepts(&fresh));
+        assert_eq!(fresh.text, "fresh");
+    }
+
     #[tokio::test]
     async fn listener_pool_is_bounded_and_freed_capacity_is_reused() {
         let (tx, _rx) = mpsc::channel(16);

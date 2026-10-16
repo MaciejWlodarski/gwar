@@ -421,3 +421,18 @@ async fn official_probe_fixture_has_an_admitted_encrypted_transport() {
     assert_eq!(origin.binding.run, Some(1));
     assert_ne!(peer.ssrc, 0);
 }
+
+#[tokio::test]
+async fn admitted_encrypted_source_is_rejected_at_each_external_boundary() {
+    let server = common::TestServer::start().await;
+    let mut plain = common::Client::connect(&server, "plaintext-boundary-receiver").await;
+    plain.ok("channel.join", json!({"channel": 1})).await;
+    let _plain_peer = common::rtc::Peer::start(&mut plain, 1).await;
+    let (encrypted, peer) = common::rtc::encrypted_peer(&server).await;
+    common::rtc::assert_encrypted_source_boundaries(
+        &server,
+        encrypted.welcome.session,
+        plain.welcome.session,
+        peer.ssrc,
+    );
+}

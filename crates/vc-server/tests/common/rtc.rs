@@ -201,3 +201,51 @@ pub async fn encrypted_peer(server: &super::TestServer) -> (Client, Peer) {
     let peer = Peer::start(&mut client, 1).await;
     (client, peer)
 }
+
+/// Observe each external boundary directly so a later route check cannot hide
+/// a missing source-mode check. Both identities come from protocol admission.
+pub fn assert_encrypted_source_boundaries(
+    server: &super::TestServer,
+    source: vc_proto::SessionId,
+    receiver: vc_proto::SessionId,
+    ssrc: u32,
+) {
+    use std::sync::Arc;
+    use vc_server::media::{AudioKind, AudioPacket, AudioRoute, Sinks, SourceClock};
+    let plane = &server.running.plane;
+    let routing = plane.routing.load();
+    let origin = routing.origin(source).unwrap();
+    assert!(origin.encrypted);
+    assert!(origin.binding.run.is_some());
+    let route = AudioRoute::new(123, 1, Some(origin.clone()));
+    route.confirm(Some(1));
+    let packet = AudioPacket {
+        origin,
+        payload: Arc::from([0xf8, 99, 1]),
+        kind: AudioKind::Audio,
+        span: 960,
+        clock: SourceClock::Rtp { ssrc, sequence: 1, ticks: 960, generation: 0 },
+        route: None,
+        target: None,
+        ingress: None,
+        egress: Some(route.clone()),
+    };
+    assert!(routing.accepts(&packet), "fixture must pass source identity admission");
+    assert!(routing.can_speak(source));
+    assert!(routing.members[&receiver].bridged);
+    assert!(!routing.members[&receiver].origin.encrypted);
+    let sinks = Sinks::default();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    sinks.register(receiver, tx);
+    // No downstream route/filter: removing Sinks::send's source mode check
+    // must put ciphertext into this queue and fail this assertion.
+    sinks.send(&routing, receiver, &packet);
+    assert!(rx.try_recv().is_err(), "external sink admitted an encrypted source");
+    // Matching binding, current route and confirmed TS channel: only mode
+    // rejects this route (the ingress source probe exercises the same guard).
+    assert!(!route.permits(&packet.origin), "TS route admitted an encrypted source");
+    let mut plaintext = packet;
+    plaintext.origin = routing.origin(receiver).unwrap();
+    sinks.send(&routing, receiver, &plaintext);
+    assert_eq!(rx.try_recv().unwrap().payload.as_ref(), &[0xf8, 99, 1], "plaintext boundary control");
+}

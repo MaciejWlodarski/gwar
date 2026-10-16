@@ -57,6 +57,10 @@ pub struct Shared {
     /// Counts at the TS receive callback and after plaintext admission, before
     /// publication. Kept separate for voice and whispers, including rejections.
     pub ingress: IngressCounters,
+    /// Immediate voice writes dropped because the UDP socket was not writable.
+    pub voice_socket_pressure: AtomicU64,
+    #[cfg(feature = "test-hooks")]
+    observations: Mutex<HashMap<IngressKey, tokio::sync::oneshot::Sender<IngressObservation>>>,
     #[cfg(feature = "test-hooks")]
     pub sent_end_route: AtomicU64,
 }
@@ -77,6 +81,37 @@ impl Drop for Observed<'_> {
     fn drop(&mut self) {
         if let Some(counter) = self.0 {
             counter.fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
+/// One exact official-server injection, including its receiving puppet.
+#[cfg(feature = "test-hooks")]
+#[derive(Hash, PartialEq, Eq)]
+pub struct IngressKey {
+    pub receiver: SessionId,
+    pub from: u16,
+    pub whisper: bool,
+    pub payload: Vec<u8>,
+}
+
+#[cfg(feature = "test-hooks")]
+struct IngressCompletion {
+    reply: Option<tokio::sync::oneshot::Sender<IngressObservation>>,
+    observation: IngressObservation,
+}
+#[cfg(feature = "test-hooks")]
+#[derive(Default, Debug)]
+pub struct IngressObservation {
+    pub admitted: bool,
+    pub source_matches: bool,
+    pub receiver_ready: bool,
+}
+#[cfg(feature = "test-hooks")]
+impl Drop for IngressCompletion {
+    fn drop(&mut self) {
+        if let Some(reply) = self.reply.take() {
+            let _ = reply.send(std::mem::take(&mut self.observation));
         }
     }
 }
@@ -124,8 +159,28 @@ impl Shared {
             whispers: Mutex::default(),
             spurts: AtomicU32::new(0),
             ingress: IngressCounters::default(),
+            voice_socket_pressure: AtomicU64::new(0),
+            #[cfg(feature = "test-hooks")]
+            observations: Mutex::default(),
             #[cfg(feature = "test-hooks")]
             sent_end_route: AtomicU64::new(0),
+        }
+    }
+
+    /// Arm before sending exactly one packet. Completion is published only at
+    /// callback exit, after its admission/publication decision, including drops.
+    #[cfg(feature = "test-hooks")]
+    pub fn observe_ingress(&self, key: IngressKey) -> tokio::sync::oneshot::Receiver<IngressObservation> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        assert!(self.observations.lock().unwrap().insert(key, tx).is_none());
+        rx
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn ingress_completion(&self, key: &IngressKey) -> IngressCompletion {
+        IngressCompletion {
+            reply: self.observations.lock().unwrap().remove(key),
+            observation: IngressObservation::default(),
         }
     }
 
@@ -154,8 +209,8 @@ impl Shared {
 
     /// Publishes one frame from TeamSpeak client `from` unless another
     /// puppet already delivered it.
-    fn heard(&self, from: u16, cid: u64, id: u16, opus: &[u8], ingress: Option<Arc<AudioRoute>>) {
-        let Some((origin, route)) = self.capture(from, cid) else { return };
+    fn heard(&self, from: u16, cid: u64, id: u16, opus: &[u8], ingress: Option<Arc<AudioRoute>>) -> bool {
+        let Some((origin, route)) = self.capture(from, cid) else { return false };
         let now = Instant::now();
         let hash = digest(opus) ^ u64::from(id);
         let mut heard = self.heard.lock().expect("heard lock");
@@ -173,14 +228,14 @@ impl Shared {
             entry.clock = None;
         }
         if out_of_order(entry.clock, entry.at, id, now) {
-            return;
+            return false;
         }
         if entry.origin != origin || now.duration_since(entry.at) > Duration::from_secs(1) {
             entry.origin = origin.clone();
             entry.route = route.clone();
             entry.recent = [!hash; 8];
         } else if entry.recent.contains(&hash) {
-            return;
+            return false;
         }
         entry.recent[entry.next] = hash;
         entry.next = (entry.next + 1) % entry.recent.len();
@@ -192,9 +247,9 @@ impl Shared {
                 self.core.talking_origin(&origin, false);
                 self.plane.publish(AudioPacket::end_of_speech(origin.clone(), Some(route.clone())));
             }
-            return;
+            return false;
         }
-        let Some(samples) = opus::packet_samples(opus) else { return };
+        let Some(samples) = opus::packet_samples(opus) else { return false };
         if !entry.talking {
             entry.talking = true;
             entry.spurt = self.next_spurt();
@@ -214,12 +269,21 @@ impl Shared {
             ingress,
             egress: None,
         });
+        true
     }
 
     /// Delivers a whisper from TeamSpeak client `from` to the user behind the
     /// puppet that received it. Each targeted puppet gets its own copy.
-    fn whispered(&self, from: u16, cid: u64, to: SessionId, id: u16, opus: &[u8], ingress: Option<Arc<AudioRoute>>) {
-        let Some((origin, route)) = self.capture(from, cid) else { return };
+    fn whispered(
+        &self,
+        from: u16,
+        cid: u64,
+        to: SessionId,
+        id: u16,
+        opus: &[u8],
+        ingress: Option<Arc<AudioRoute>>,
+    ) -> bool {
+        let Some((origin, route)) = self.capture(from, cid) else { return false };
         let now = Instant::now();
         let mut whispers = self.whispers.lock().expect("whispers lock");
         let stream = whispers.entry((from, to)).or_insert(Whisper {
@@ -233,7 +297,7 @@ impl Shared {
             *stream = Whisper { route: route.clone(), at: now, talking: false, clock: None, spurt: 0 };
         }
         if out_of_order(stream.clock, stream.at, id, now) {
-            return;
+            return false;
         }
         stream.at = now;
         let packet = if opus.is_empty() {
@@ -241,7 +305,7 @@ impl Shared {
             stream.clock = Some(SourceClock::TeamSpeak { id, whisper: true, spurt: stream.spurt });
             AudioPacket::end_of_speech(origin.clone(), Some(route.clone()))
         } else {
-            let Some(samples) = opus::packet_samples(opus) else { return };
+            let Some(samples) = opus::packet_samples(opus) else { return false };
             if !stream.talking {
                 stream.talking = true;
                 stream.spurt = self.next_spurt();
@@ -265,6 +329,7 @@ impl Shared {
             self.ingress.whisper_admitted.fetch_add(1, Ordering::Relaxed);
         }
         self.plane.deliver(to, packet);
+        true
     }
 
     /// Ends talk spurts whose end-of-speech packet was lost.
@@ -581,6 +646,34 @@ async fn run(
             Step::Item(Some(Err(e))) => return Err(anyhow!("{e}")),
             Step::Item(Some(Ok(item))) => match item {
                 StreamItem::Audio(packet) => {
+                    #[cfg(feature = "test-hooks")]
+                    let mut completion = match packet.data().data() {
+                        AudioData::S2C { from, data, .. } | AudioData::S2CWhisper { from, data, .. } => {
+                            let mut completion = shared.ingress_completion(&IngressKey {
+                                receiver: spec.session,
+                                from: *from,
+                                whisper: matches!(packet.data().data(), AudioData::S2CWhisper { .. }),
+                                payload: data.to_vec(),
+                            });
+                            // Prove identities and confirmed transport channels separately
+                            // from the plaintext-only guard being tested.
+                            completion.observation.source_matches =
+                                shared.mirrors.read().unwrap().get(from).is_some_and(|route| {
+                                    route.is_current()
+                                        && source_channel(&con, *from) == Some(route.cid)
+                                        && route.origin.as_ref().is_some_and(|o| {
+                                            shared.plane.routing.load().origin(o.session).as_ref() == Some(o)
+                                        })
+                                });
+                            completion.observation.receiver_ready = voice
+                                && moving.is_none()
+                                && audio.is_current()
+                                && own_channel(&con) == Some(audio.cid)
+                                && shared.plane.routing.load().origin(spec.session) == audio.origin;
+                            Some(completion)
+                        }
+                        _ => None,
+                    };
                     let _observed = Observed(match packet.data().data() {
                         AudioData::S2C { .. } => Some(&shared.ingress.voice_received),
                         AudioData::S2CWhisper { .. } => Some(&shared.ingress.whisper_received),
@@ -610,12 +703,25 @@ async fn run(
                     match packet.data().data() {
                         AudioData::S2C { from, id, codec, data } if is_opus(*codec) => {
                             if let Some(cid) = source_channel(&con, *from).filter(|cid| *cid == audio.cid) {
-                                shared.heard(*from, cid, *id, data, Some(audio.clone()));
+                                let admitted = shared.heard(*from, cid, *id, data, Some(audio.clone()));
+                                #[cfg(feature = "test-hooks")]
+                                if let Some(completion) = &mut completion {
+                                    completion.observation.admitted = admitted;
+                                }
+                                #[cfg(not(feature = "test-hooks"))]
+                                let _ = admitted;
                             }
                         }
                         AudioData::S2CWhisper { from, id, codec, data, .. } if is_opus(*codec) => {
                             if let Some(cid) = source_channel(&con, *from) {
-                                shared.whispered(*from, cid, spec.session, *id, data, Some(audio.clone()));
+                                let admitted =
+                                    shared.whispered(*from, cid, spec.session, *id, data, Some(audio.clone()));
+                                #[cfg(feature = "test-hooks")]
+                                if let Some(completion) = &mut completion {
+                                    completion.observation.admitted = admitted;
+                                }
+                                #[cfg(not(feature = "test-hooks"))]
+                                let _ = admitted;
                             }
                         }
                         _ => {}
@@ -856,7 +962,7 @@ fn send_audio(
     let out = OutAudio::new(&AudioData::C2S { id: *packet_id, codec, data });
     *packet_id = packet_id.wrapping_add(1);
     if let Ok(transport) = con.get_tsproto_client_mut() {
-        send_audio_now(transport, out);
+        send_audio_now(transport, out, &shared.voice_socket_pressure);
     }
 }
 
@@ -866,14 +972,31 @@ fn send_audio(
 /// queue can outlive its route. Encode with tsproto, then attempt the UDP write
 /// once while this route is checked; drop on pressure instead of queueing.
 /// Nothing remains to flush after retirement, an end marker or replacement.
-fn send_audio_now(con: &mut tsproto::connection::Connection, packet: tsproto_packets::packets::OutPacket) {
-    use std::task::{Context, Poll, Waker};
+fn send_audio_now(
+    con: &mut tsproto::connection::Connection,
+    packet: tsproto_packets::packets::OutPacket,
+    pressure: &AtomicU64,
+) {
+    use std::{
+        future::{Future, poll_fn},
+        pin::pin,
+        task::{Context, Poll, Waker},
+    };
     con.send_event(&tsproto::connection::Event::SendPacket(&packet));
     let Ok(packets) = tsproto::packet_codec::PacketCodec::encode_packet(con, packet) else { return };
     let mut cx = Context::from_waker(Waker::noop());
     for packet in packets {
-        if let Poll::Ready(Ok(())) = con.poll_send_udp_packet(&mut cx, &packet) {
-            con.resender.handle_loss_outgoing(&packet);
+        // Poll exactly once, without charging the caller's cooperative budget.
+        // A budget yield must never be mistaken for socket backpressure.
+        let write = tokio::task::coop::unconstrained(poll_fn(|cx| con.poll_send_udp_packet(cx, &packet)));
+        let result = pin!(write).poll(&mut cx);
+        match result {
+            Poll::Ready(Ok(())) => con.resender.handle_loss_outgoing(&packet),
+            Poll::Pending => {
+                pressure.fetch_add(1, Ordering::Relaxed);
+                debug!("dropping TeamSpeak voice packet on UDP socket pressure");
+            }
+            Poll::Ready(Err(error)) => debug!(%error, "TeamSpeak voice UDP write failed"),
         }
     }
 }
@@ -1074,10 +1197,12 @@ mod transport_tests {
         fn poll_recv_from(&self, _: &mut Context, _: &mut tokio::io::ReadBuf) -> Poll<io::Result<SocketAddr>> {
             Poll::Pending
         }
-        fn poll_send_to(&self, _: &mut Context, bytes: &[u8], _: SocketAddr) -> Poll<io::Result<usize>> {
+        fn poll_send_to(&self, cx: &mut Context, bytes: &[u8], _: SocketAddr) -> Poll<io::Result<usize>> {
+            let budget = std::task::ready!(tokio::task::coop::poll_proceed(cx));
             if self.blocked.load(Ordering::Relaxed) {
                 return Poll::Pending;
             }
+            budget.made_progress();
             self.sent.fetch_add(1, Ordering::Relaxed);
             Poll::Ready(Ok(bytes.len()))
         }
@@ -1086,7 +1211,33 @@ mod transport_tests {
         }
     }
     #[tokio::test]
+    async fn writable_voice_ignores_exhausted_cooperative_budget() {
+        let pressure = AtomicU64::new(0);
+        let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket.writable().await.unwrap();
+        let mut con = tsproto::connection::Connection::new(true, receiver.local_addr().unwrap(), Box::new(socket));
+        while tokio::task::coop::has_budget_remaining() {
+            tokio::task::coop::consume_budget().await;
+        }
+        assert!(!tokio::task::coop::has_budget_remaining());
+        send_audio_now(
+            &mut con,
+            OutAudio::new(&AudioData::C2S { id: 0, codec: CodecType::OpusVoice, data: &[0xf8, 1, 0] }),
+            &pressure,
+        );
+        assert_eq!(pressure.load(Ordering::Relaxed), 0, "budget exhaustion is not socket pressure");
+        let mut bytes = [0; 1500];
+        let n = tokio::time::timeout(Duration::from_secs(1), receiver.recv(&mut bytes))
+            .await
+            .expect("writable UDP socket lost voice to a budget yield")
+            .unwrap();
+        assert!(n > 3);
+    }
+
+    #[tokio::test]
     async fn pending_transport_audio_cannot_flush_after_route_change() {
+        let pressure = AtomicU64::new(0);
         let blocked = Arc::new(AtomicBool::new(false));
         let sent = Arc::new(AtomicUsize::new(0));
         let mut con = tsproto::connection::Connection::new(
@@ -1095,17 +1246,46 @@ mod transport_tests {
             Box::new(Socket { blocked: blocked.clone(), sent: sent.clone() }),
         );
         let packet = || OutAudio::new(&AudioData::C2S { id: 0, codec: CodecType::OpusVoice, data: &[0xf8, 1, 0] });
-        send_audio_now(&mut con, packet());
+        send_audio_now(&mut con, packet(), &pressure);
         let _ = con.next().now_or_never();
         assert_eq!(sent.load(Ordering::Relaxed), 1, "positive UDP control");
         blocked.store(true, Ordering::Relaxed);
-        send_audio_now(&mut con, packet());
+        send_audio_now(&mut con, packet(), &pressure);
         // Retirement/change happens while the socket is blocked. Later polling
         // must never send the old voice, even once it becomes writable again.
+        assert_eq!(pressure.load(Ordering::Relaxed), 1);
         blocked.store(false, Ordering::Relaxed);
         let _ = con.next().now_or_never();
         assert_eq!(sent.load(Ordering::Relaxed), 1, "old-route transport audio survived");
-        send_audio_now(&mut con, packet());
+        send_audio_now(&mut con, packet(), &pressure);
         assert_eq!(sent.load(Ordering::Relaxed), 2, "fresh route can send");
+        assert_eq!(pressure.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[cfg(all(test, feature = "test-hooks"))]
+mod observation_tests {
+    use super::*;
+    #[tokio::test]
+    async fn ingress_completion_matches_packet_receiver_and_finishes_after_decision() {
+        let server = crate::core::expiry_tests::test_core(crate::store::Store::in_memory().unwrap(), None);
+        let (webrtc, _) = mpsc::channel(1);
+        let plane = MediaPlane {
+            routing: Arc::new(arc_swap::ArcSwap::from_pointee(crate::media::Routing::default())),
+            sinks: Arc::default(),
+            uplinks: Arc::default(),
+            webrtc,
+        };
+        let shared = Shared::new(server, plane);
+        let key = |receiver, marker| IngressKey { receiver, from: 7, whisper: false, payload: vec![0xf8, marker, 1] };
+        let mut done = shared.observe_ingress(key(1, 50));
+        drop(shared.ingress_completion(&key(2, 50)));
+        drop(shared.ingress_completion(&key(1, 51)));
+        assert!(matches!(done.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        let mut completion = shared.ingress_completion(&key(1, 50));
+        assert!(matches!(done.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        completion.observation.admitted = true;
+        drop(completion);
+        assert!(done.await.unwrap().admitted);
     }
 }

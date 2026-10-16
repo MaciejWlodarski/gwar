@@ -217,6 +217,17 @@ pub struct Query {
     connection: Arc<Connection>,
 }
 
+#[cfg(feature = "test-hooks")]
+mod listener_hooks {
+    use super::*;
+    use std::sync::{Mutex, OnceLock, Weak};
+    type Registry = Mutex<BTreeMap<(SocketAddr, u64), Weak<Connection>>>;
+    pub(super) fn registry() -> &'static Registry {
+        static REGISTRY: OnceLock<Registry> = OnceLock::new();
+        REGISTRY.get_or_init(Mutex::default)
+    }
+}
+
 impl Query {
     /// Connect, log in and select virtual server `server_id`. The notification receiver closes when the connection
     /// dies. Dropping the last query handle closes the socket and its reader task.
@@ -273,7 +284,43 @@ impl Query {
             return Err(e.context("move channel listener"));
         }
         query.call(Cmd::new("servernotifyregister").arg("event", "textchannel")).await?;
+        #[cfg(feature = "test-hooks")]
+        listener_hooks::registry().lock().unwrap().insert((addr, cid), Arc::downgrade(&query.connection));
         Ok((query, notes))
+    }
+
+    /// Wait for acknowledged notification registration, not the early nickname.
+    #[cfg(feature = "test-hooks")]
+    pub async fn listener_ready(addr: SocketAddr, cid: u64) {
+        Self::registered_listener(addr, cid, None).await;
+    }
+
+    /// Close the actual query transport and wait for a different, fully
+    /// registered connection. ServerQuery clients cannot be clientkicked.
+    #[cfg(feature = "test-hooks")]
+    pub async fn reconnect_listener(addr: SocketAddr, cid: u64) {
+        let old = Self::registered_listener(addr, cid, None).await;
+        old.task.abort();
+        Self::registered_listener(addr, cid, Some(&old)).await;
+    }
+
+    #[cfg(feature = "test-hooks")]
+    async fn registered_listener(addr: SocketAddr, cid: u64, old: Option<&Arc<Connection>>) -> Arc<Connection> {
+        timeout(Duration::from_secs(20), async {
+            loop {
+                let current =
+                    listener_hooks::registry().lock().unwrap().get(&(addr, cid)).and_then(std::sync::Weak::upgrade);
+                if let Some(current) = current
+                    && !current.task.is_finished()
+                    && old.is_none_or(|old| !Arc::ptr_eq(old, &current))
+                {
+                    return current;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("registered TeamSpeak channel listener")
     }
 
     /// Run a command. A non-zero error id comes back as a [`QueryError`] inside the `anyhow::Error`.
@@ -524,6 +571,10 @@ pub(super) mod tests {
 
     /// Each fake query client hears text only in its current channel after registration.
     pub(crate) async fn channel_server() -> ChannelServer {
+        channel_server_with_gate(None).await
+    }
+
+    pub(crate) async fn channel_server_with_gate(gate: Option<Arc<tokio::sync::Semaphore>>) -> ChannelServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (input, _) = tokio::sync::broadcast::channel(256);
@@ -536,7 +587,7 @@ pub(super) mod tests {
                 tokio::select! {
                     accepted = listener.accept() => {
                         let (sock, _) = accepted.unwrap();
-                        clients.spawn(channel_client(sock, clid, server_input.subscribe(), events.clone()));
+                        clients.spawn(channel_client(sock, clid, server_input.subscribe(), events.clone(), gate.clone()));
                         clid += 1;
                     }
                     _ = clients.join_next(), if !clients.is_empty() => {}
@@ -551,6 +602,7 @@ pub(super) mod tests {
         clid: u16,
         mut input: tokio::sync::broadcast::Receiver<ChannelInput>,
         events: mpsc::UnboundedSender<ChannelEvent>,
+        gate: Option<Arc<tokio::sync::Semaphore>>,
     ) {
         let (read, mut write) = sock.into_split();
         let mut lines = BufReader::new(read).lines();
@@ -589,6 +641,7 @@ pub(super) mod tests {
                     commands.push(line);
                     if registered && commands.last().unwrap().starts_with("servernotifyregister") {
                         let _ = events.send(ChannelEvent::Ready { cid, commands: commands.clone() });
+                        if let Some(gate) = &gate { gate.acquire().await.unwrap().forget(); }
                     }
                     reply.push_str(&format!("error id={error} msg=ok\n\r"));
                     if write.write_all(reply.as_bytes()).await.is_err() { break; }
