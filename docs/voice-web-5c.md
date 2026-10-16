@@ -121,6 +121,25 @@ Mutating six of the seven controller rules made a test fail. The seventh, the
 device check on incoming acknowledgements, is redundant: activation counts
 only the epoch's devices anyway.
 
+Review round 1 added the following, with tests:
+
+- The joined group's validated descriptor must name this channel and parent
+  before the external commit is sent.
+- A competing commit that wins (`rebuild`) is processed like any other.
+- Removals come from the validated commit (`voice_removed`), so a same-index
+  replacement counts as a removal.
+- The gate is rechecked synchronously before activation and on parent,
+  revocation and membership events.
+- Closing a call stops its media synchronously, before the lease is released.
+- A lost creation reply is settled against `voice.state`.
+- A lost restart update is replaced.
+- Counter exhaustion requests a fresh run.
+- Controller deadlines use a monotonic clock.
+- Chat and voice share serialized request tokens.
+- The SFrame state keeps only fingerprints of key-bearing bodies, rechecks the
+  deadline after encryption, and turns import or pump failures into
+  `worker_failed`.
+
 ## Not yet run (acceptance still pending)
 
 Not run, so neither recorded as a pass:
@@ -133,8 +152,9 @@ Not run, so neither recorded as a pass:
   activation, first authenticated packet and first decoded tone in the
   browser. The 2 s bound is checked in the controller tests on a fake clock.
 - **Removal cutoff.** A removed device that keeps its keys must open no frame
-  encrypted after the cutoff, even when the SFU delivers one. The engine
-  purge is unit-tested, not end to end.
+  encrypted after the cutoff, even when the SFU delivers one. This is tested
+  at the engine level (a retained-key decryptor gets `no_key` for every
+  post-cutoff frame), not end to end through the SFU.
 - **Latency.** The S2 measurement (transform time including queueing,
   p99 < 2 ms) and the browser/native interop latency belong with 5d's harness.
 - **Official TeamSpeak.** The S6 isolation probes still use fake endpoints;
