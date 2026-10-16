@@ -548,6 +548,7 @@ async fn s6_controlled_routes(
     let handle = puppet::spawn(voice, spec(1, route.clone()), shared.clone(), events.clone());
     let connected = tokio::time::timeout(Duration::from_secs(20), event_rx.recv()).await.unwrap().unwrap();
     let PuppetEvent::Connected { clid, .. } = connected else { panic!("controlled puppet did not connect") };
+    tokio::time::timeout(Duration::from_secs(20), handle.wait_ingress_ready(ts_clid)).await.unwrap().unwrap();
     let mut sequence = 0;
     probe.control(&peer, 40, &mut sequence).await;
     // Both actual incoming audio routes have plaintext controls.
@@ -620,9 +621,10 @@ async fn s6_controlled_routes(
 
     // Delayed classification: observe and discard now, then classify. These
     // packets cannot be retrospectively assigned a newer source route.
+    tokio::time::timeout(Duration::from_secs(20), handle.wait_ingress_ready(ts_clid)).await.unwrap().unwrap();
     shared.forget(ts_clid);
-    ingress_attempt(probe, &shared, client.welcome.session, ts_clid, clid, false, 50).await;
-    ingress_attempt(probe, &shared, client.welcome.session, ts_clid, clid, true, 51).await;
+    ingress_attempt(probe, &shared, &handle, client.welcome.session, ts_clid, clid, false, 50).await;
+    ingress_attempt(probe, &shared, &handle, client.welcome.session, ts_clid, clid, true, 51).await;
     shared.mirror(ts_clid, default_cid, remote_origin.clone());
     peer.silent().await;
     // Source identity is admitted by MLS and SRTP, and matches both routing
@@ -635,8 +637,8 @@ async fn s6_controlled_routes(
     let source_route = shared.mirrors.read().unwrap()[&ts_clid].clone();
     assert_eq!(source_route.origin, Some(sealed_origin.clone()));
     assert!(source_route.is_current());
-    ingress_attempt(probe, &shared, client.welcome.session, ts_clid, clid, false, 52).await;
-    ingress_attempt(probe, &shared, client.welcome.session, ts_clid, clid, true, 53).await;
+    ingress_attempt(probe, &shared, &handle, client.welcome.session, ts_clid, clid, false, 52).await;
+    ingress_attempt(probe, &shared, &handle, client.welcome.session, ts_clid, clid, true, 53).await;
     common::rtc::assert_encrypted_source_boundaries(
         &isolated,
         sealed_client.welcome.session,
@@ -674,6 +676,7 @@ async fn s6_controlled_routes(
     })
     .await
     .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), fresh.wait_ingress_ready(ts_clid)).await.unwrap().unwrap();
     probe.control(&peer, 45, &mut sequence).await;
     shared.plane.uplinks.uplink(&shared.plane.routing.load(), &packet(44, restored));
     assert_eq!(probe.forbidden_bytes(44).await, 0, "old transport egress");
@@ -719,9 +722,29 @@ async fn s6_controlled_routes(
     // A normal bridge would never authorize this puppet for encrypted voice.
     // Force a real TS receive callback against an admitted encrypted SRTP peer:
     // each valid Opus route must be observed, with zero admission independently.
-    ingress_attempt(probe, &shared, sealed_client.welcome.session, ts_clid, encrypted_clid, false, 54).await;
+    ingress_attempt(
+        probe,
+        &shared,
+        &encrypted_handle,
+        sealed_client.welcome.session,
+        ts_clid,
+        encrypted_clid,
+        false,
+        54,
+    )
+    .await;
     sealed_peer.silent().await;
-    ingress_attempt(probe, &shared, sealed_client.welcome.session, ts_clid, encrypted_clid, true, 55).await;
+    ingress_attempt(
+        probe,
+        &shared,
+        &encrypted_handle,
+        sealed_client.welcome.session,
+        ts_clid,
+        encrypted_clid,
+        true,
+        55,
+    )
+    .await;
     sealed_peer.silent().await;
     drop(encrypted_handle);
     eprintln!(
@@ -732,15 +755,23 @@ async fn s6_controlled_routes(
 /// Exactly one injection is outstanding. A matching callback must finish on
 /// the specified puppet before classification can change; no aggregate counter
 /// or earlier retry can satisfy this acknowledgement.
+#[allow(clippy::too_many_arguments)]
 async fn ingress_attempt(
     probe: &Probe,
     shared: &vc_server::teamspeak::puppet::Shared,
+    handle: &vc_server::teamspeak::puppet::PuppetHandle,
     receiver: u32,
     from: u16,
     clid: u16,
     whisper: bool,
     marker: u8,
 ) {
+    if marker >= 52 {
+        tokio::time::timeout(Duration::from_secs(20), handle.wait_ingress_ready(from))
+            .await
+            .expect("receiving puppet knows its own channel and the matching source")
+            .unwrap();
+    }
     let packet = vec![0xf8, marker, 1];
     assert_eq!(vc_proto::opus::packet_samples(&packet), Some(960));
     let done = shared.observe_ingress(vc_server::teamspeak::puppet::IngressKey {

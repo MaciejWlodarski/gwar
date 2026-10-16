@@ -116,6 +116,30 @@ impl Drop for IngressCompletion {
     }
 }
 
+/// Pending probes belong to this exact puppet task, never a replacement's
+/// session. Keep polling the transport while startup client notifications arrive.
+#[cfg(feature = "test-hooks")]
+#[derive(Default)]
+struct IngressWaiters(Vec<(u16, tokio::sync::oneshot::Sender<()>)>);
+
+#[cfg(feature = "test-hooks")]
+impl IngressWaiters {
+    fn notify(&mut self, receiver_ready: bool, source_matches: impl Fn(u16) -> bool) {
+        let mut pending = Vec::new();
+        for (from, reply) in self.0.drain(..) {
+            if reply.is_closed() {
+                continue;
+            }
+            if receiver_ready && source_matches(from) {
+                let _ = reply.send(());
+            } else {
+                pending.push((from, reply));
+            }
+        }
+        self.0 = pending;
+    }
+}
+
 /// Recent frames of one TeamSpeak speaker, shared across receiving puppets.
 struct Heard {
     origin: Arc<AudioOrigin>,
@@ -182,6 +206,37 @@ impl Shared {
             reply: self.observations.lock().unwrap().remove(key),
             observation: IngressObservation::default(),
         }
+    }
+
+    // These predicates deliberately do not call AudioRoute::permits: encrypted
+    // source/receiver probes must reach the plaintext guard with known identities.
+    #[cfg(feature = "test-hooks")]
+    fn source_matches(&self, from: u16, channel: Option<u64>) -> bool {
+        self.mirrors.read().unwrap().get(&from).is_some_and(|route| {
+            route.is_current()
+                && channel == Some(route.cid)
+                && route
+                    .origin
+                    .as_ref()
+                    .is_some_and(|o| self.plane.routing.load().origin(o.session).as_ref() == Some(o))
+        })
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn receiver_ready(
+        &self,
+        receiver: SessionId,
+        audio: &AudioRoute,
+        channel: Option<u64>,
+        voice: bool,
+        moving: bool,
+    ) -> bool {
+        voice
+            && !moving
+            && audio.is_current()
+            && channel == Some(audio.cid)
+            && audio.origin.is_some()
+            && self.plane.routing.load().origin(receiver) == audio.origin
     }
 
     pub fn mirror(&self, clid: u16, cid: u64, origin: Arc<AudioOrigin>) {
@@ -398,6 +453,11 @@ pub struct ChannelText {
 #[derive(Debug)]
 pub enum PuppetCmd {
     #[cfg(feature = "test-hooks")]
+    IngressReady {
+        from: u16,
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
+    #[cfg(feature = "test-hooks")]
     HoldTail {
         armed: tokio::sync::oneshot::Sender<()>,
         held: tokio::sync::oneshot::Sender<()>,
@@ -459,6 +519,16 @@ pub struct PuppetHandle {
 }
 
 impl PuppetHandle {
+    /// Wait for this puppet's confirmed channel and the source's current identity
+    /// and channel, independently of plaintext admission. Connected alone is too
+    /// early: initserver precedes startup client notifications.
+    #[cfg(feature = "test-hooks")]
+    pub async fn wait_ingress_ready(&self, from: u16) -> Result<()> {
+        let (reply, done) = tokio::sync::oneshot::channel();
+        self.cmds.send(PuppetCmd::IngressReady { from, reply }).await.map_err(|_| anyhow!("puppet ended"))?;
+        done.await.map_err(|_| anyhow!("puppet ended before ingress readiness"))
+    }
+
     /// Queues a command; false when the puppet's queue is full or it is gone.
     pub fn send(&self, cmd: PuppetCmd) -> bool {
         if let PuppetCmd::Move { audio, .. } = &cmd {
@@ -578,6 +648,8 @@ async fn run(
     let mut held: Option<AudioPacket> = None;
     #[cfg(feature = "test-hooks")]
     let mut hold_tail: Option<(tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)> = None;
+    #[cfg(feature = "test-hooks")]
+    let mut ingress_waiters = IngressWaiters::default();
     let mut voice = spec.voice;
     let mut moving: Option<Moving> = None;
     let mut waiting: Vec<(u64, String)> = Vec::new();
@@ -589,6 +661,11 @@ async fn run(
         Cmd(Option<PuppetCmd>),
     }
     loop {
+        #[cfg(feature = "test-hooks")]
+        ingress_waiters
+            .notify(shared.receiver_ready(spec.session, &audio, own_channel(&con), voice, moving.is_some()), |from| {
+                shared.source_matches(from, source_channel(&con, from))
+            });
         let step = {
             let mut stream = con.events();
             tokio::select! {
@@ -658,18 +735,9 @@ async fn run(
                             // Prove identities and confirmed transport channels separately
                             // from the plaintext-only guard being tested.
                             completion.observation.source_matches =
-                                shared.mirrors.read().unwrap().get(from).is_some_and(|route| {
-                                    route.is_current()
-                                        && source_channel(&con, *from) == Some(route.cid)
-                                        && route.origin.as_ref().is_some_and(|o| {
-                                            shared.plane.routing.load().origin(o.session).as_ref() == Some(o)
-                                        })
-                                });
-                            completion.observation.receiver_ready = voice
-                                && moving.is_none()
-                                && audio.is_current()
-                                && own_channel(&con) == Some(audio.cid)
-                                && shared.plane.routing.load().origin(spec.session) == audio.origin;
+                                shared.source_matches(*from, source_channel(&con, *from));
+                            completion.observation.receiver_ready =
+                                shared.receiver_ready(spec.session, &audio, own_channel(&con), voice, moving.is_some());
                             Some(completion)
                         }
                         _ => None,
@@ -821,6 +889,11 @@ async fn run(
             }
             Step::Cmd(Some(cmd)) => {
                 debug!(session = spec.session, ?cmd, "puppet command");
+                #[cfg(feature = "test-hooks")]
+                if let PuppetCmd::IngressReady { from, reply } = cmd {
+                    ingress_waiters.0.push((from, reply));
+                    continue;
+                }
                 #[cfg(feature = "test-hooks")]
                 if let PuppetCmd::HoldTail { armed, held, release } = cmd {
                     hold_tail = Some((held, release));
@@ -1043,7 +1116,7 @@ fn command_for(clid: u16, cmd: PuppetCmd) -> Option<OutCommand> {
     let flag = |b: bool| if b { "1" } else { "0" }.to_owned();
     Some(match cmd {
         #[cfg(feature = "test-hooks")]
-        PuppetCmd::HoldTail { .. } => return None,
+        PuppetCmd::HoldTail { .. } | PuppetCmd::IngressReady { .. } => return None,
         PuppetCmd::Move { cid, .. } => command("clientmove", &[("clid", clid.to_string()), ("cid", cid.to_string())]),
         PuppetCmd::Flags { muted, deafened } => {
             command("clientupdate", &[("client_input_muted", flag(muted)), ("client_output_muted", flag(deafened))])
@@ -1266,6 +1339,100 @@ mod transport_tests {
 #[cfg(all(test, feature = "test-hooks"))]
 mod observation_tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn ingress_probe_waits_for_delayed_startup_client_notifications() {
+        use futures::FutureExt;
+
+        // Exercise plaintext controls and both encrypted boundary probes. The
+        // hook must wait for bookkeeping, never for plaintext admission itself.
+        for (encrypted_receiver, encrypted_source) in [(false, false), (true, false), (false, true)] {
+            let core = crate::core::expiry_tests::test_core(crate::store::Store::in_memory().unwrap(), None);
+            let (webrtc, _) = mpsc::channel(1);
+            let mut routing = crate::media::Routing::default();
+            routing.members.insert(1, crate::media::tests::member(1, 1, encrypted_receiver));
+            routing.members.insert(2, crate::media::tests::member(2, 1, encrypted_source));
+            let plane = MediaPlane {
+                routing: Arc::new(arc_swap::ArcSwap::from_pointee(routing)),
+                sinks: Arc::default(),
+                uplinks: Arc::default(),
+                webrtc,
+            };
+            let shared = Shared::new(core, plane);
+            let source = shared.plane.routing.load().origin(2).unwrap();
+            shared.mirror(7, 10, source.clone());
+            let audio = AudioRoute::new(1, 10, shared.plane.routing.load().origin(1));
+            let (cmds, mut commands) = mpsc::channel(1);
+            let handle =
+                PuppetHandle { cmds, audio: RwLock::new(audio.clone()), task: tokio::spawn(std::future::pending()) };
+            let key = || IngressKey { receiver: 1, from: 7, whisper: false, payload: vec![0xf8, 54, 1] };
+            let mut probe = std::pin::pin!(async {
+                handle.wait_ingress_ready(7).await.unwrap();
+                shared.observe_ingress(key()).await.unwrap()
+            });
+            assert!(probe.as_mut().now_or_never().is_none());
+            assert!(shared.observations.lock().unwrap().is_empty(), "probe armed before readiness");
+            let PuppetCmd::IngressReady { from, reply } = commands.try_recv().unwrap() else {
+                panic!("missing readiness request");
+            };
+            let mut waiters = IngressWaiters(vec![(from, reply)]);
+
+            // Model the puppet-local client/channel view: initserver supplies
+            // its own id (9), but no clients. Delay each startup notification
+            // separately, including an unrelated client and a wrong channel.
+            let mut clients = HashMap::new();
+            for notification in [None, Some((8, 10)), Some((9, 10)), Some((7, 11))] {
+                if let Some((clid, cid)) = notification {
+                    clients.insert(clid, cid);
+                }
+                let own = clients.get(&9).copied();
+                audio.confirm(own);
+                waiters.notify(shared.receiver_ready(1, &audio, own, true, false), |from| {
+                    shared.source_matches(from, clients.get(&from).copied())
+                });
+                tokio::time::advance(Duration::from_secs(2)).await;
+                assert!(probe.as_mut().now_or_never().is_none(), "probe did not wait for both client notifications");
+                assert!(shared.observations.lock().unwrap().is_empty(), "single injection armed too early");
+            }
+            clients.insert(7, 10);
+            // Correct channels alone do not prove the source binding still
+            // matches, or that a receiver move has finished.
+            let stale = Arc::new(AudioOrigin {
+                binding: vc_proto::VoiceBinding { run: Some(2), ..source.binding.clone() },
+                ..(*source).clone()
+            });
+            shared.mirror(7, 10, stale);
+            waiters.notify(true, |from| shared.source_matches(from, clients.get(&from).copied()));
+            assert!(probe.as_mut().now_or_never().is_none(), "stale source identity passed readiness");
+            shared.mirror(7, 10, source.clone());
+            waiters.notify(shared.receiver_ready(1, &audio, Some(10), true, true), |_| true);
+            assert!(probe.as_mut().now_or_never().is_none(), "moving receiver passed readiness");
+
+            // Another puppet's readiness cannot release this task's request.
+            IngressWaiters::default().notify(true, |_| true);
+            assert!(probe.as_mut().now_or_never().is_none());
+            waiters.notify(shared.receiver_ready(1, &audio, Some(10), true, false), |from| {
+                shared.source_matches(from, clients.get(&from).copied())
+            });
+            assert!(probe.as_mut().now_or_never().is_none());
+            assert_eq!(shared.observations.lock().unwrap().len(), 1);
+            let mut completion = shared.ingress_completion(&key());
+            assert!(probe.as_mut().now_or_never().is_none(), "callback entry completed the probe");
+            completion.observation.receiver_ready = shared.receiver_ready(1, &audio, Some(10), true, false);
+            completion.observation.source_matches = shared.source_matches(7, Some(10));
+            drop(completion);
+            let observation = tokio::time::timeout(Duration::from_secs(1), probe).await.expect("ready probe completes");
+            assert!(observation.receiver_ready && observation.source_matches);
+            assert!(!observation.admitted);
+            if encrypted_receiver {
+                assert!(!audio.permits(audio.origin.as_ref().unwrap()));
+            }
+            if encrypted_source {
+                assert!(shared.capture(7, 10).is_none());
+            }
+            handle.task.abort();
+        }
+    }
     #[tokio::test]
     async fn ingress_completion_matches_packet_receiver_and_finishes_after_decision() {
         let server = crate::core::expiry_tests::test_core(crate::store::Store::in_memory().unwrap(), None);
