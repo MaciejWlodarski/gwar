@@ -466,8 +466,8 @@ A ring overflow discards any partial frame spanning the missing samples.
 The SFU uses RTP events for the actual SSRC, extended sequence number and raw
 32-bit timestamp (MediaData has no SSRC). Timestamp wrap uses wrapping subtraction.
 Duplicate timestamps and older sequences drop before speech-state updates;
-a sequence restart requires a fresh SSRC or voice session. The last 32 retired
-SSRCs cannot return.
+a sequence restart requires a fresh SSRC or voice session. At most 32 retired
+SSRCs are retained without eviction; exhaustion closes voice with `stream_limit`.
 TeamSpeak uses its wrapping u16 packet id times 960 as a synthetic clock,
 with half-range ordering and separate voice/whisper identities; every listener
 sees the same ids (checked against the official server in CI). The ids do not
@@ -476,11 +476,16 @@ per speaker and target for whispers) and a new spurt re-anchors the slot on wall
 time, even for a listener that missed the end marker. An out-of-order id more
 than a second after the last write starts a new clock instead of being dropped. Both bridge directions retain Opus durations.
 
-First packets, speaker/SSRC changes, backward timestamps and deltas over five
-seconds use elapsed wall time rounded up to the previous packet's duration,
-at least one frame. Speaker reassignment also increments the existing slot
-generation. Zero deltas drop: forwarding the same media instant would duplicate
-playout. Dropping reordered packets keeps each output clock monotonic and lets
+First packets start at 48000 ticks. Speaker/run/SSRC changes, source-clock
+generation changes and deltas over five seconds advance by elapsed wall time
+rounded up to 480 ticks (at least 480), with the previous forwarded packet's
+span as a floor. Plaintext and TeamSpeak use parsed duration; opaque encrypted
+RTP uses the source's last positive in-order step clamped to 960–5760 ticks,
+initially 960. Source resets are recorded before mute/speech gating, so omitted
+reset packets cannot hide a discontinuity from a slot. The slot clock remains
+u64 internally and emits low u32 ticks. Speaker reassignment also increments
+the existing slot generation. See [the 5b report](voice-sfu-5b.md). Zero deltas
+drop: forwarding the same media instant would duplicate playout. Dropping reordered packets keeps each output clock monotonic and lets
 the receiver conceal loss without replaying stale audio. Very long genuine
 pauses use the same wall-time fallback as a clock reset.
 
