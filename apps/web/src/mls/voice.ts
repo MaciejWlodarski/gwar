@@ -47,7 +47,8 @@ export interface VoiceHost {
   uid: string;
   session: number;
   identity: Identity;
-  request<O extends Op>(op: O, data: RequestInput<O>): Promise<ResponseMap[O]>;
+  /** `guard` runs after the request budget is acquired, right before sending. */
+  request<O extends Op>(op: O, data: RequestInput<O>, guard?: () => void): Promise<ResponseMap[O]>;
   tree(group: string): Promise<{ epoch: number; tree: number[] }>;
   revocations(): Revocation[];
   /** Unix milliseconds: credentials and revocations. */
@@ -58,6 +59,8 @@ export interface VoiceHost {
   parent: Engine;
   /** The live, locally accepted group of `channel:{id}`, or null. */
   parentGroup(channel: number): string | null;
+  /** Without network: the parent has no outstanding changes right now. */
+  parentClean(group: string): boolean;
   /** Synchronizes the parent group; true when it has no outstanding changes. */
   syncParent(group: string): Promise<boolean>;
   factory: AgentFactory;
@@ -77,12 +80,19 @@ interface Media extends VoiceMedia {
   activated: bigint | null;
   /** The earliest certificate expiry among the installed epoch's leaves. */
   sendUntil: number | null;
+  /** An activation in flight to the engine. */
+  activating: bigint | null;
+  /** The epoch that already met the activation rule: a hold that clears
+   * without a new epoch reactivates it without another wait. */
+  eligible: bigint | null;
 }
 interface VoiceKeys { epoch: string; own_leaf: number; members: { leaf: number; device: string; key: number[] }[]; send_until: number | null }
 
 class Closed extends Error { constructor() { super("voice call closed"); } }
 /** The server offered a group of another call: never send into it. */
 class WrongGroup extends Error { constructor() { super("voice group is bound to another channel or parent"); } }
+/** A prepared parent-derived removal no longer holds: it is not transmitted. */
+class StaleRemoval extends Error { constructor() { super("parent-derived removal is no longer valid"); } }
 
 export class VoiceCall {
   readonly channel: number;
@@ -110,6 +120,12 @@ export class VoiceCall {
   private lostAcks = false;
   private lastRepeat = -Infinity;
   private gateBlocked = false;
+  /** Every hold supersedes activations still in flight. */
+  private holds = 0;
+  /** The next processed epoch counts as a removal (continuity was lost). */
+  private forceRemoval = false;
+  /** The pending outbox is a parent-derived removal of these leaves. */
+  private removalOutbox: { hash: string; leaves: number[] } | null = null;
   private lastExportError = "";
   private lastControl: { action: string; result: ControlResult } | null = null;
   private media: Media | null = null;
@@ -171,7 +187,7 @@ export class VoiceCall {
   attach(media: VoiceMedia): void {
     if (this.closed) return;
     const restart = this.runs++ > 0;
-    this.media = { ...media, serial: 0n, barrier: null, installed: null, removed: new Set(), floor: null, activated: null, sendUntil: null };
+    this.media = { ...media, serial: 0n, barrier: null, installed: null, removed: new Set(), floor: null, activated: null, sendUntil: null, activating: null, eligible: null };
     this.setStatus("securing");
     if (restart) { this.needUpdate = true; this.updateHash = null; }
     this.schedule(true);
@@ -246,7 +262,8 @@ export class VoiceCall {
    * without waiting for a pass that may be blocked on the network. */
   recheck(): void {
     if (this.closed) return;
-    if (this.media?.activated != null && this.exportKeys() === "blocked") { this.gateBlocked = true; void this.hold([]); }
+    const m = this.media;
+    if (m && (m.activated !== null || m.activating !== null) && this.exportKeys() === "blocked") { this.gateBlocked = true; void this.hold([]); }
     this.schedule(false);
   }
 
@@ -405,7 +422,8 @@ export class VoiceCall {
     if (removed.length) await this.hold(removed, epoch);
     this.assertOpen();
     const now = this.host.monotonic();
-    this.pending = { started: this.pending?.started ?? now, removal: (this.pending?.removal ?? false) || removed.length > 0 };
+    this.pending = { started: this.pending?.started ?? now, removal: (this.pending?.removal ?? false) || removed.length > 0 || this.forceRemoval };
+    this.forceRemoval = false;
     this.processed = epoch;
     this.processedDevices = new Set(summary.members.map(m => m.device_key));
     this.notify();
@@ -433,8 +451,9 @@ export class VoiceCall {
     const media = this.media;
     if (!media) return;
     for (const device of removed) media.removed.add(device);
-    if (media.activated !== null || removed.length) {
-      media.activated = null;
+    this.holds++;
+    if (media.activated !== null || media.activating !== null || removed.length) {
+      media.activated = null; media.activating = null;
       this.setStatus("securing");
       await this.control(media, { action: "hold", epoch: String(epoch), removed });
     }
@@ -455,6 +474,7 @@ export class VoiceCall {
       if (++pages > 128) throw new Error("voice catch-up continues on the next pass");
       let local = this.summary();
       if (!local || local.record.status === "removed" || local.record.status === "rejoin") {
+        await this.loseContinuity(local);
         await this.join(); local = this.summary()!;
       }
       const out = this.outbox();
@@ -463,6 +483,8 @@ export class VoiceCall {
       this.assertOpen();
       if (log.head < since) throw new Error("the server is behind this voice group");
       if (log.oldest > since) {
+        // A log gap: removals in it cannot be seen. Hold and purge first.
+        await this.loseContinuity(local);
         if (out) await this.engine.op({ reconcile: { ...this.args(), result: { case: "pruned", oldest: String(log.oldest) } } });
         else await this.join();
         continue;
@@ -473,7 +495,7 @@ export class VoiceCall {
           const before = this.members();
           let resolution: Resolution;
           try { resolution = await this.engine.op<Resolution>({ reconcile: { ...this.args(), result: { case: "entry", epoch: String(entry.epoch), commit: bytes(entry.commit), proposals: entry.proposals.map(bytes) } } }); }
-          catch (error) { if (!(error instanceof AgentOperationError)) throw error; await this.join(); continue; }
+          catch (error) { if (!(error instanceof AgentOperationError)) throw error; await this.loseContinuity(this.summary()); await this.join(); continue; }
           if (resolution === "accepted") {
             this.markJoined();
             await this.transition(before, encoded(out.hash));
@@ -487,8 +509,9 @@ export class VoiceCall {
         await this.engine.op({ reconcile: { ...this.args(), result: { case: "head", epoch: String(log.head) } } });
         try {
           // Never merge a success reply by itself: the log entry is authoritative.
-          await this.host.request("mls.commit", { group: this.group!, epoch: since, commit: encoded(out.commit), group_info: encoded(out.group_info), welcome: null, voice: this.binding() });
+          await this.host.request("mls.commit", { group: this.group!, epoch: since, commit: encoded(out.commit), group_info: encoded(out.group_info), welcome: null, voice: this.binding() }, this.removalGuard(out));
         } catch (error) {
+          if (error instanceof StaleRemoval) { await this.discardRemoval(); continue; }
           if (!(error instanceof RequestError)) throw error;
           const reason = error.code === "expired" ? "expired" : error.code === "early" ? "early" : error.code === "stale" ? "stale" : error.code === "bad_request" ? "bad_request" : "other";
           const resolution = await this.engine.op<Resolution>({ reconcile: { ...this.args(), result: { case: "rejected", reason } } });
@@ -501,7 +524,7 @@ export class VoiceCall {
         if (entry.epoch !== expected) throw new Error("noncontiguous voice log");
         const before = this.members();
         try { await this.engine.op({ receive: { ...this.args(), commit: bytes(entry.commit), proposals: entry.proposals.map(bytes) } }); }
-        catch (error) { if (!(error instanceof AgentOperationError)) throw error; await this.join(); attempt = -1; break; }
+        catch (error) { if (!(error instanceof AgentOperationError)) throw error; await this.loseContinuity(this.summary()); await this.join(); attempt = -1; break; }
         expected++;
         await this.transition(before, null);
         if (this.summary()?.record.status !== "active") break;
@@ -514,7 +537,7 @@ export class VoiceCall {
       // The complete pending set of this head, including an empty one.
       await this.engine.op({ voice_pending: { ...this.args(), epoch: String(log.head), proposals: log.pending.map(bytes) } });
       const gate = this.gate();
-      if (gate.rejoin) { await this.join(); continue; }
+      if (gate.rejoin) { await this.loseContinuity(this.summary()); await this.join(); continue; }
       if (gate.server_pending || gate.blocked.length) {
         // A pending server removal blocks sending at once; commit it.
         await this.hold([]);
@@ -556,11 +579,44 @@ export class VoiceCall {
     if (!leaves.length) return false;
     await this.hold([]);
     const out = await this.engine.op<CommitOutbox>({ commit: { ...this.args(), adds: [], removes: leaves, now: this.host.now(), revocations: this.host.revocations() } });
-    try { await this.host.request("mls.commit", { group: this.group!, epoch: wireEpoch(out.epoch), commit: encoded(out.commit), group_info: encoded(out.group_info), welcome: null, voice: this.binding() }); }
-    catch (error) { if (!(error instanceof RequestError)) throw error; }
+    this.removalOutbox = { hash: encoded(out.hash), leaves };
+    try { await this.host.request("mls.commit", { group: this.group!, epoch: wireEpoch(out.epoch), commit: encoded(out.commit), group_info: encoded(out.group_info), welcome: null, voice: this.binding() }, this.removalGuard(out)); }
+    catch (error) {
+      if (error instanceof StaleRemoval) { await this.discardRemoval(); return false; }
+      if (!(error instanceof RequestError)) throw error;
+    }
     this.logDirty = true;
     await this.synchronize();
     return true;
+  }
+
+  /** Revalidated after the request budget is acquired, immediately before a
+   * parent-derived Remove is transmitted (retries included). */
+  private removalGuard(out: CommitOutbox): (() => void) | undefined {
+    const removal = this.removalOutbox;
+    if (!removal || removal.hash !== encoded(out.hash)) return undefined;
+    return () => {
+      if (!this.host.parentClean(this.channelGroup)) throw new StaleRemoval();
+      const missing = this.engine.withAgent(v => this.host.parent.withAgent(p => v.execute_with_parent!({ voice_parent_removals: { ...this.args(), synchronized: true } }, p))) as number[];
+      if (!removal.leaves.every(leaf => missing.includes(leaf))) throw new StaleRemoval();
+    };
+  }
+
+  /** Drops a prepared removal locally (the agent rebuilds its next commit). */
+  private async discardRemoval(): Promise<void> {
+    this.removalOutbox = null;
+    await this.engine.op({ reconcile: { ...this.args(), result: { case: "rejected", reason: "expired" } } });
+    this.schedule(true, 1_000);
+  }
+
+  /** Continuity is lost (log gap, rejoin): stop sending and purge every other
+   * prior member's keys, since removals inside the gap cannot be seen. */
+  private async loseContinuity(local: GroupSummary | undefined): Promise<void> {
+    // A first join has no prior membership to distrust.
+    if (!local || local.record.status === "creating" || this.processed === null) return;
+    const others = local.members.map(m => m.device_key).filter(d => d !== this.host.identity.publicKey);
+    await this.hold(others);
+    this.forceRemoval = true;
   }
 
   /** The current epoch's keys, "blocked" when the gate refuses them, or
@@ -641,7 +697,7 @@ export class VoiceCall {
     const now = this.host.monotonic();
     const started = this.pending?.started ?? now;
     const due = started + ACK_WAIT_MS;
-    if (!(this.pending?.removal || everyone || now >= due)) {
+    if (!(this.pending?.removal || everyone || now >= due || media.eligible === epoch)) {
       // Recheck elapsed time on every wake; suspension cannot restart the wait.
       clearTimeout(this.activation);
       this.activation = setTimeout(() => this.schedule(false), Math.max(0, due - now));
@@ -651,8 +707,13 @@ export class VoiceCall {
     // the gate is checked again with no await before the activation is sent.
     const keys = this.exportKeys();
     if (keys === null || keys === "blocked" || BigInt(keys.epoch) !== epoch) { this.schedule(true, keys === null ? 500 : 0); return; }
+    const holds = this.holds;
+    media.activating = epoch; media.eligible = epoch;
     const result = await this.control(media, { action: "activate", epoch: String(epoch), send_until: keys.send_until });
+    if (media.activating === epoch) media.activating = null;
     if (!result) return;
+    // A hold sent after this activation stopped the engine's sender again.
+    if (holds !== this.holds) { this.schedule(false); return; }
     if ("result" in result && result.result !== "ignored") {
       media.activated = epoch; this.pending = null;
       this.setStatus("active");
