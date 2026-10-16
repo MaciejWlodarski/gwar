@@ -844,8 +844,8 @@ variants, and the cluster correlates with how much startup depth the receiver
 trimmed (mostly 0, 360 or 600 samples; candidate runs also show 262, 480 and
 720). `jitter.rs`/`playout.rs` are identical in both builds. Candidate runs
 fell in the top cluster 4 of 20 times, baseline runs 1 of 20, which accounts
-for the +3.93 ms. With run-level differences of about ±8 ms, 20 pairs cannot
-resolve a 2 ms bound in either direction.
+for the +3.93 ms. With paired per-run p95 differences ranging from −8.59 to
++15.54 ms, 20 pairs cannot resolve a 2 ms bound in either direction.
 
 **CPU.** The four candidate underruns occurred in two adjacent runs (slots 14
 and 15, three and one) spanning about one minute (18:24:12–18:25:13 UTC); the
