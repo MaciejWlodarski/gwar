@@ -178,6 +178,10 @@ pub struct GroupRecord {
     /// A joined voice snapshot needs the current epoch's complete pending set.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     voice_needs_sync: bool,
+    /// Voice only: the devices whose leaves the last merged commit removed
+    /// (including a same-index replacement), from the validated staged commit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub voice_removed: Vec<String>,
     /// For every uid, the epochs in which it had a leaf, as this device saw
     /// them: sorted, disjoint, non-adjacent inclusive ranges.
     pub evidence: BTreeMap<String, Vec<Interval>>,
@@ -318,6 +322,9 @@ pub struct GroupSummary {
     /// The conversation's live pin: its highest accepted incarnation.
     pub live: bool,
     pub history: bool,
+    /// A voice group's parent channel group, from its validated descriptor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_group: Option<String>,
     pub record: GroupRecord,
     pub members: Vec<Member>,
 }
@@ -636,6 +643,7 @@ impl Agent {
                     incarnation: d.descriptor.incarnation,
                     conversation: d.descriptor.conversation,
                     history: d.descriptor.history,
+                    channel_group: d.descriptor.channel_group_id.clone(),
                     record: record.clone(),
                     members,
                 })
@@ -744,6 +752,7 @@ impl Agent {
             server_pending: false,
             voice_removals: BTreeSet::new(),
             voice_needs_sync: false,
+            voice_removed: Vec::new(),
             evidence: BTreeMap::new(),
             own_commit_at: None,
         });
@@ -967,10 +976,21 @@ impl Agent {
         group.store_pending_proposal(self.provider.storage(), *proposal).map_err(err("store proposal"))?;
         Ok(())
     }
-    fn resolve_voice_removals(&mut self, key: &str, staged: &StagedCommit) {
+    /// `group` is the state before merging `staged`: it names the removed leaves' devices.
+    fn resolve_voice_removals(&mut self, key: &str, group: &MlsGroup, staged: &StagedCommit) {
+        let devices: Vec<String> = staged
+            .remove_proposals()
+            .filter_map(|r| group.public_group().leaf(r.remove_proposal().removed()))
+            .filter_map(leaf_credential)
+            .map(|c| c.device_key().to_owned())
+            .collect();
+        let voice = self.voice_only;
         if let Some(record) = self.groups.get_mut(key) {
             for removal in staged.remove_proposals() {
                 record.voice_removals.remove(&removal.remove_proposal().removed().u32());
+            }
+            if voice {
+                record.voice_removed = devices;
             }
         }
     }
@@ -1134,7 +1154,7 @@ impl Agent {
             return Err(Invalid("not a commit"));
         };
         self.check_staged(&group, &staged, &sender, time)?;
-        self.resolve_voice_removals(key, &staged);
+        self.resolve_voice_removals(key, &group, &staged);
         let removed = staged.self_removed();
         if removed {
             // Validation is complete. Delete before advancing: OpenMLS's delete
@@ -1162,7 +1182,8 @@ impl Agent {
                     if hash(&commit) == out.hash {
                         let mut group = a.mls(&key)?;
                         if !joining {
-                            a.resolve_voice_removals(&key, group.pending_commit().ok_or(Invalid("pending commit"))?);
+                            let staged = group.pending_commit().ok_or(Invalid("pending commit"))?;
+                            a.resolve_voice_removals(&key, &group, staged);
                             group.merge_pending_commit(&a.provider).map_err(err("merge pending"))?;
                         }
                         a.derived(&key, &group)?;
@@ -1286,6 +1307,7 @@ impl Agent {
                     server_pending: false,
                     voice_removals: BTreeSet::new(),
                     voice_needs_sync: false,
+                    voice_removed: Vec::new(),
                     evidence: BTreeMap::new(),
                     own_commit_at: None,
                 });

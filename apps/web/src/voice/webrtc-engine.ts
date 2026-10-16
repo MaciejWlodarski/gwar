@@ -189,7 +189,8 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       await pc.setRemoteDescription({ type: "answer", sdp: answer });
       if (run !== this.runId) return;
       // Controls only after the server bound this run: acks name it.
-      if (sframe) keys!.attach({ run: mediaRun, control: body => sframe.control(body) });
+      // Closing the call controller stops this run's media synchronously.
+      if (sframe) keys!.attach({ run: mediaRun, control: body => sframe.control(body), close: () => { if (this.sframe === sframe) { this.runId++; this.teardownPeer(); this.setState("idle"); } } });
       this.applyTrackEnabled();
 
       setTimeout(() => {

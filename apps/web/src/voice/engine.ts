@@ -45,7 +45,7 @@ export interface VoiceKeySource {
   /** For a new engine: the epoch it must never install at or below, or null on a first run. */
   resumeAfter(): string | null;
   /** The run's engine is negotiated: it accepts controls from now on. */
-  attach(media: { run: number; control(body: Control): Promise<ControlResult> }): void;
+  attach(media: { run: number; control(body: Control): Promise<ControlResult>; close(): void }): void;
   engineStatus(status: CryptoStatus): void;
 }
 

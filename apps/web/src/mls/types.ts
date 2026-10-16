@@ -24,12 +24,16 @@ export interface GroupSummary {
   /** The conversation's live pin: its highest accepted incarnation. */
   live: boolean;
   history: boolean;
+  /** A voice group's parent channel group, from its validated descriptor. */
+  channel_group?: string;
   record: {
     status: "creating" | "active" | "joining" | "removed" | "rejoin" | "superseded";
     checkpoint: { epoch: string; hash: number[] } | null;
     server_pending: boolean;
     welcome_ids?: string[];
     own_commit_at?: number | null;
+    /** Voice only: devices whose leaves the last merged commit removed. */
+    voice_removed?: string[];
     /** Per uid, the epoch ranges in which it had a leaf, as this device saw them. */
     evidence?: Record<string, { first: string; last: string }[]>;
   };

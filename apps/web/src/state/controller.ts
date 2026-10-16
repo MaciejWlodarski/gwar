@@ -160,6 +160,8 @@ class Controller {
   private runtime: MlsRuntime | null = null;
   /** The MLS controller of the encrypted call I am in, pinned to its call. */
   private voiceCall: { call: VoiceCall; runtime: MlsRuntime; unsubscribe: () => void } | null = null;
+  /** The latest voice entry attempt; an older one awaiting a probe gives up. */
+  private joinAttempt = 0;
   private connectionParams: ConnectParams | null = null;
   private runtimeAbort: AbortController | null = null;
   private sealed: SealedConversations | null = null;
@@ -649,13 +651,18 @@ class Controller {
     // A newer connect may finish its own teardown and start while this one
     // waits; it then owns the state below, so this one stops.
     const generation = this.connections;
+    // Media and the call's keys stop first, synchronously: never after the
+    // device lease is released by the runtime's close below.
+    this.voiceRun++;
+    this.endVoiceCall();
+    const stopped = this.engine.stop();
     this.runtimeAbort?.abort(); this.runtimeAbort = null;
     this.sealed?.close(); this.sealed = null;
     const runtime = this.runtime; this.runtime = null;
     this.rosterChanged();
     if (this.revocationTimer) clearInterval(this.revocationTimer);
     this.revocationTimer = null;
-    await runtime?.close();
+    await Promise.all([runtime?.close(), stopped]);
     if (this.connections !== generation) return;
     await this.nativeFiles(null);
     if (this.connections !== generation) return;
@@ -717,7 +724,8 @@ class Controller {
     const state = (await conn.request("voice.state", {})).voice;
     if (!current()) throw new Error("Stale voice participation");
     if (!state || !state.encrypted || state.channel !== channel || state.call !== participation.call || state.participation !== participation.participation) throw new Error("voice.state does not match this participation");
-    const call = await runtime.voiceCall(state, session);
+    // Counter exhaustion closes the run: start a fresh one (new run and SSRC).
+    const call = await runtime.voiceCall(state, session, () => { if (current()) void this.startVoice(); });
     if (!current() || this.runtime !== runtime) { runtime.endVoiceCall(call); throw new Error("Stale voice participation"); }
     const publish = () => useVoice.getState().set({ encryption: call.status(), hearers: (() => { const members = call.roster(); return members ? { channel, members } : null; })() });
     this.voiceCall = { call, runtime, unsubscribe: call.subscribe(publish) };
@@ -747,7 +755,13 @@ class Controller {
       // There is never a plaintext fallback in an encrypted channel.
       const refusal = state.kind === "vc" && participation ? await this.encryptedVoiceRefusal() : tNow("voice.encryptedUnsupported");
       if (!current()) return;
-      if (refusal) { this.endVoiceCall(); await this.engine.stop(); useUi.getState().toast("info", refusal); return; }
+      if (refusal) {
+        this.endVoiceCall(); await this.engine.stop();
+        if (!current()) return;
+        // "Voice unavailable" with Retry: a transient probe failure can be retried.
+        useVoice.getState().set({ state: "failed" });
+        useUi.getState().toast("info", refusal); return;
+      }
       try {
         keys = await this.encryptedCall(conn, channel, participation!, own.id, current);
         group = await keys.joined;
@@ -967,9 +981,12 @@ class Controller {
   async joinChannel(channel: number, password?: string): Promise<void> {
     // Checked before the microphone prompt and before entering the channel.
     if (useSession.getState().channels[channel]?.encrypted) {
+      const conn = this.conn, attempt = ++this.joinAttempt;
       const refusal = await this.encryptedVoiceRefusal();
+      // A newer join, move or connection makes this one obsolete.
+      if (this.conn !== conn || attempt !== this.joinAttempt) return;
       if (refusal) { useUi.getState().toast("info", refusal); return; }
-    }
+    } else this.joinAttempt++;
     const ui = useUi.getState();
     ui.setJoining(channel);
     try {
@@ -1043,7 +1060,15 @@ class Controller {
     return this.connection.request("channel.delete", { channel });
   }
 
-  moveClient(client: number, channel: number) {
+  async moveClient(client: number, channel: number) {
+    // Moving myself into an encrypted channel enters its voice: same check as a join.
+    const s = useSession.getState();
+    if (s.me?.session === client && s.channels[channel]?.encrypted) {
+      const conn = this.conn, attempt = ++this.joinAttempt;
+      const refusal = await this.encryptedVoiceRefusal();
+      if (this.conn !== conn || attempt !== this.joinAttempt) return undefined;
+      if (refusal) { useUi.getState().toast("info", refusal); return undefined; }
+    }
     return this.attempt(this.connection.request("client.move", { client, channel }));
   }
 

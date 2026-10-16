@@ -34,7 +34,12 @@ const RECHECK_MS = 10_000;
 
 export type VoiceCallStatus = "securing" | "active" | "failed";
 /** One media run's engine: it applies controls and reports its status. */
-export interface VoiceMedia { run: number; control(body: Control): Promise<ControlResult> }
+export interface VoiceMedia {
+  run: number;
+  control(body: Control): Promise<ControlResult>;
+  /** Synchronously stops this run's media and keys (the controller closed). */
+  close(): void;
+}
 export interface VoiceRosterEntry { uid: string; devices: string[] }
 
 export interface VoiceHost {
@@ -45,7 +50,10 @@ export interface VoiceHost {
   request<O extends Op>(op: O, data: RequestInput<O>): Promise<ResponseMap[O]>;
   tree(group: string): Promise<{ epoch: number; tree: number[] }>;
   revocations(): Revocation[];
+  /** Unix milliseconds: credentials and revocations. */
   now(): number;
+  /** Monotonic milliseconds: the controller's own waits and deadlines. */
+  monotonic(): number;
   /** The chat agent, holding the call's parent channel group. */
   parent: Engine;
   /** The live, locally accepted group of `channel:{id}`, or null. */
@@ -54,6 +62,8 @@ export interface VoiceHost {
   syncParent(group: string): Promise<boolean>;
   factory: AgentFactory;
   onError(error: unknown): void;
+  /** Replaces the media run with a fresh one (new run and SSRC), e.g. after counter exhaustion. */
+  restartMedia(): void;
 }
 
 interface Media extends VoiceMedia {
@@ -71,6 +81,8 @@ interface Media extends VoiceMedia {
 interface VoiceKeys { epoch: string; own_leaf: number; members: { leaf: number; device: string; key: number[] }[]; send_until: number | null }
 
 class Closed extends Error { constructor() { super("voice call closed"); } }
+/** The server offered a group of another call: never send into it. */
+class WrongGroup extends Error { constructor() { super("voice group is bound to another channel or parent"); } }
 
 export class VoiceCall {
   readonly channel: number;
@@ -172,7 +184,9 @@ export class VoiceCall {
     if (status.state === "failed") { this.media = null; this.setStatus("failed"); this.failure = status.reason; return; }
     this.media.activated = null;
     this.setStatus("securing");
-    // A fresh own leaf (update; an expired credential rejoins) reopens sending.
+    // Exhaustion closes the run: a fresh run then installs from an own update.
+    if (status.reason === "counter_exhausted") { this.host.restartMedia(); return; }
+    // An expired key needs a fresh own leaf before sending again.
     this.needUpdate = true; this.updateHash = null;
     this.schedule(true);
   }
@@ -182,8 +196,8 @@ export class VoiceCall {
     if (this.closed) return;
     const d = event.d as Record<string, unknown>;
     if (event.ev === "mls.commit" || event.ev === "mls.proposal") {
-      if (d.group === this.group) this.schedule(true);
-      else if (d.group === this.channelGroup) this.schedule(true);
+      if (d.group === this.channelGroup) this.recheck();
+      if (d.group === this.group || d.group === this.channelGroup) this.schedule(true);
       return;
     }
     if (event.ev === "voice.epoch.ack") {
@@ -193,8 +207,10 @@ export class VoiceCall {
     }
     if (event.ev === "voice.epoch.request") {
       if (d.call !== this.call || d.group !== this.group || typeof d.epoch !== "number") return;
-      // Only an actually installed decryptor answers.
-      if (this.media?.installed === BigInt(d.epoch)) void this.sendAck(this.media, BigInt(d.epoch));
+      // Only an actually installed decryptor answers; a newer epoch means catching up first.
+      const epoch = BigInt(d.epoch);
+      if (this.media?.installed === epoch) void this.sendAck(this.media, epoch);
+      else if (this.processed === null || epoch > this.processed) { this.lostAcks = true; this.schedule(true); }
     }
   }
 
@@ -205,8 +221,8 @@ export class VoiceCall {
       return;
     }
     // Before processing: hold, bounded, never creating keys.
-    const now = this.host.now();
-    for (const [old, entry] of this.futureAcks) if (now - entry.at > FUTURE_ACK_MS) { this.futureAcks.delete(old); this.lostAcks = true; }
+    const now = this.host.monotonic();
+    this.expireAcks(now);
     const head = this.processed ?? 0n;
     if (epoch > head + FUTURE_ACK_AHEAD) return;
     let entry = this.futureAcks.get(epoch);
@@ -222,12 +238,27 @@ export class VoiceCall {
     entry.devices.add(device);
   }
 
-  /** Leaving, moving or losing the connection discards the pin and all state. */
+  private expireAcks(now: number): void {
+    for (const [old, entry] of this.futureAcks) if (now - entry.at > FUTURE_ACK_MS) { this.futureAcks.delete(old); this.lostAcks = true; }
+  }
+
+  /** A membership, parent or revocation change: close the sending gate at once,
+   * without waiting for a pass that may be blocked on the network. */
+  recheck(): void {
+    if (this.closed) return;
+    if (this.media?.activated != null && this.exportKeys() === "blocked") { this.gateBlocked = true; void this.hold([]); }
+    this.schedule(false);
+  }
+
+  /** Leaving, moving or losing the connection discards the pin and all state,
+   * and synchronously stops the run's media before anything else. */
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    clearTimeout(this.timer); clearTimeout(this.activation); clearTimeout(this.retry); clearInterval(this.recheck);
+    clearTimeout(this.timer); clearTimeout(this.activation); clearTimeout(this.retry); clearInterval(this.recheckTimer);
+    const media = this.media;
     this.media = null;
+    media?.close();
     this.acks.clear(); this.futureAcks.clear();
     this.joinedReject(new Closed());
     void this.engine.close().catch(() => {});
@@ -238,16 +269,16 @@ export class VoiceCall {
    * pass; this timer also runs one without any event (a feed update). */
   start(): void {
     this.schedule(true);
-    this.recheck ??= setInterval(() => this.schedule(false), RECHECK_MS);
+    this.recheckTimer ??= setInterval(() => this.recheck(), RECHECK_MS);
   }
-  private recheck: ReturnType<typeof setInterval> | undefined;
+  private recheckTimer: ReturnType<typeof setInterval> | undefined;
 
   /** Runs a pass now (or right after the current one), or after `delay`. */
   private schedule(log: boolean, delay = 0): void {
     if (this.closed) return;
     if (log) this.logDirty = true;
     if (delay > 0) {
-      const at = this.host.now() + delay;
+      const at = this.host.monotonic() + delay;
       if (this.retryAt !== undefined && this.retryAt <= at) return;
       clearTimeout(this.retry);
       this.retryAt = at;
@@ -271,6 +302,7 @@ export class VoiceCall {
       catch (error) {
         if (error instanceof Closed || this.closed) return;
         this.host.onError(error);
+        if (error instanceof WrongGroup) { this.failure = "wrong_group"; this.setStatus("failed"); this.close(); return; }
         this.schedule(true, 2_000);
         return;
       }
@@ -305,6 +337,16 @@ export class VoiceCall {
   private async enter(): Promise<void> {
     this.checkParent();
     let group = this.initialGroup;
+    // A creation whose reply (or the following voice.state) was lost is
+    // settled against voice.state, never replaced by a second candidate.
+    const candidate = this.engine.query<GroupSummary[]>({ inventory: { server: this.host.server } }).find(g => g.record.status === "creating");
+    if (candidate) {
+      const state = (await this.host.request("voice.state", {})).voice;
+      this.assertOpen();
+      if (!state || state.call !== this.call || state.participation !== this.participation) throw new Error("voice call changed while creating its group");
+      await this.engine.op({ settle: { server: this.host.server, group: candidate.group, winner: state.group ? bytes(state.group) : null } });
+      group = state.group;
+    }
     if (group === null) {
       const d = await voiceDescriptor(this.host.identity, this.host.uid, this.host.server, this.channel, this.channelGroup, this.host.now());
       const info = await this.engine.op<number[]>({ create: { descriptor: d.bytes } });
@@ -339,6 +381,10 @@ export class VoiceCall {
     const { info, tree } = await this.groupInfo();
     await this.engine.op<CommitOutbox>({ join_external: { server: this.host.server, bytes: info, tree, now: this.host.now(), revocations: this.host.revocations() } }, out => {
       if (encoded(out.group) !== this.group) throw new Error("GroupInfo group mismatch");
+      // The validated descriptor must name this call's channel and parent;
+      // nothing is persisted or sent otherwise.
+      const joined = this.summary();
+      if (joined?.conversation !== `voice:${this.channel}` || joined.channel_group !== this.channelGroup) throw new WrongGroup();
       return [];
     });
   }
@@ -352,11 +398,13 @@ export class VoiceCall {
     if (summary?.record.status !== "active" || !summary.record.checkpoint) return;
     const epoch = BigInt(summary.record.checkpoint.epoch);
     if (this.processed !== null && epoch <= this.processed) return;
+    // The validated commit's removals (a same-index replacement included),
+    // plus any leaf that disappeared.
     const after = new Set(summary.members.map(m => `${m.leaf}/${m.device_key}`));
-    const removed = before.filter(m => !after.has(`${m.leaf}/${m.device_key}`)).map(m => m.device_key);
+    const removed = [...new Set([...(summary.record.voice_removed ?? []), ...before.filter(m => !after.has(`${m.leaf}/${m.device_key}`)).map(m => m.device_key)])];
     if (removed.length) await this.hold(removed, epoch);
     this.assertOpen();
-    const now = this.host.now();
+    const now = this.host.monotonic();
     this.pending = { started: this.pending?.started ?? now, removal: (this.pending?.removal ?? false) || removed.length > 0 };
     this.processed = epoch;
     this.processedDevices = new Set(summary.members.map(m => m.device_key));
@@ -429,6 +477,9 @@ export class VoiceCall {
           if (resolution === "accepted") {
             this.markJoined();
             await this.transition(before, encoded(out.hash));
+          } else if (resolution === "rebuild") {
+            // The winning commit was merged instead: it is processed like any other.
+            await this.transition(before, null);
           }
           continue;
         }
@@ -482,22 +533,31 @@ export class VoiceCall {
   /** After a restart (or counter exhaustion/expiry) commit an own update; its
    * accepted epoch is the first one the new run may install. */
   private async ownUpdate(): Promise<void> {
-    if (!this.needUpdate || !this.media || this.updateHash !== null || this.outbox()) return;
-    const out = await this.engine.op<CommitOutbox>({ commit: { ...this.args(), adds: [], removes: [], now: this.host.now(), revocations: this.host.revocations() } });
-    this.updateHash = encoded(out.hash);
-    await this.synchronize();
+    // A lost, expired or pruned attempt leaves no outbox: build another one.
+    for (let attempt = 0; attempt < 3 && this.needUpdate && this.media && !this.outbox(); attempt++) {
+      const out = await this.engine.op<CommitOutbox>({ commit: { ...this.args(), adds: [], removes: [], now: this.host.now(), revocations: this.host.revocations() } });
+      this.updateHash = encoded(out.hash);
+      await this.synchronize();
+    }
+    if (this.needUpdate && this.media) this.schedule(true, 1_000);
   }
 
   /** Current parent membership gates sending; a missing leaf becomes a
    * removal only after the parent is synchronized with nothing outstanding. */
   private async parentRemovals(): Promise<boolean> {
+    if (this.outbox()) return false;
+    // Voice log first, then the parent, then the decision: nothing awaits
+    // between the final parent check and transmitting the Remove.
+    await this.synchronize();
     const synchronized = await this.host.syncParent(this.channelGroup);
     this.assertOpen();
-    if (!synchronized) return false;
+    if (!synchronized || this.outbox()) return false;
     const leaves = this.engine.withAgent(v => this.host.parent.withAgent(p => v.execute_with_parent!({ voice_parent_removals: { ...this.args(), synchronized: true } }, p))) as number[];
     if (!leaves.length) return false;
     await this.hold([]);
-    await this.engine.op({ commit: { ...this.args(), adds: [], removes: leaves, now: this.host.now(), revocations: this.host.revocations() } });
+    const out = await this.engine.op<CommitOutbox>({ commit: { ...this.args(), adds: [], removes: leaves, now: this.host.now(), revocations: this.host.revocations() } });
+    try { await this.host.request("mls.commit", { group: this.group!, epoch: wireEpoch(out.epoch), commit: encoded(out.commit), group_info: encoded(out.group_info), welcome: null, voice: this.binding() }); }
+    catch (error) { if (!(error instanceof RequestError)) throw error; }
     this.logDirty = true;
     await this.synchronize();
     return true;
@@ -541,6 +601,7 @@ export class VoiceCall {
       if (!result) return;
       if ("error" in result || result.result === "ignored") { this.logDirty = true; this.schedule(true, 1_000); return; }
       media.installed = epoch; media.removed.clear(); media.sendUntil = keys.send_until;
+      this.expireAcks(this.host.monotonic());
       const buffered = this.futureAcks.get(epoch);
       const acked = this.acks.get(epoch) ?? new Set<string>();
       for (const device of buffered?.devices ?? []) if (this.processedDevices.has(device)) acked.add(device);
@@ -548,13 +609,15 @@ export class VoiceCall {
       this.acks.set(epoch, acked);
       for (const old of [...this.futureAcks.keys()]) if (old <= epoch) this.futureAcks.delete(old);
       await this.sendAck(media, epoch);
-      if (this.lostAcks && this.host.now() - this.lastRepeat >= REPEAT_EVERY_MS) {
-        this.lostAcks = false; this.lastRepeat = this.host.now();
+      if (this.lostAcks && this.host.monotonic() - this.lastRepeat >= REPEAT_EVERY_MS) {
+        this.lostAcks = false; this.lastRepeat = this.host.monotonic();
         await this.request("voice.epoch.repeat", { ...this.binding(), run: media.run, group: this.group!, epoch: wireEpoch(epoch) });
       }
     } else {
       const keys = this.exportKeys();
       if (keys === null) { this.schedule(false, 500); return; }
+      // Keys of another epoch: the agent moved on; process that epoch first.
+      if (keys !== "blocked" && BigInt(keys.epoch) !== epoch) { this.schedule(true); return; }
       if (this.gateBlocked || keys === "blocked") {
         // Revocation, expiry or a parent change since installation closes the gate.
         this.gateBlocked = true;
@@ -563,7 +626,7 @@ export class VoiceCall {
         if (await this.parentRemovals()) return this.deliver();
         this.schedule(true, 5_000);
         const again = this.exportKeys();
-        if (again === null || again === "blocked") return;
+        if (again === null || again === "blocked" || BigInt(again.epoch) !== epoch) return;
         this.gateBlocked = false;
         media.sendUntil = again.send_until;
       } else media.sendUntil = keys.send_until;
@@ -575,15 +638,20 @@ export class VoiceCall {
     if (media.activated === epoch || media.installed !== epoch || !this.pending && media.activated !== null) return;
     const acked = this.acks.get(epoch) ?? new Set();
     const everyone = [...this.processedDevices].every(device => acked.has(device));
-    const started = this.pending?.started ?? this.host.now();
+    const now = this.host.monotonic();
+    const started = this.pending?.started ?? now;
     const due = started + ACK_WAIT_MS;
-    if (!(this.pending?.removal || everyone || this.host.now() >= due)) {
+    if (!(this.pending?.removal || everyone || now >= due)) {
       // Recheck elapsed time on every wake; suspension cannot restart the wait.
       clearTimeout(this.activation);
-      this.activation = setTimeout(() => this.schedule(false), Math.max(0, due - this.host.now()));
+      this.activation = setTimeout(() => this.schedule(false), Math.max(0, due - now));
       return;
     }
-    const result = await this.control(media, { action: "activate", epoch: String(epoch), send_until: media.sendUntil });
+    // Membership or revocations may have changed while installing or acking:
+    // the gate is checked again with no await before the activation is sent.
+    const keys = this.exportKeys();
+    if (keys === null || keys === "blocked" || BigInt(keys.epoch) !== epoch) { this.schedule(true, keys === null ? 500 : 0); return; }
+    const result = await this.control(media, { action: "activate", epoch: String(epoch), send_until: keys.send_until });
     if (!result) return;
     if ("result" in result && result.result !== "ignored") {
       media.activated = epoch; this.pending = null;

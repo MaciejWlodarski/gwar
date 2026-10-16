@@ -120,7 +120,7 @@ export function VoicePanel() {
       ? { tone: "warn", text: t("voice.reconnecting") }
       : encryption === "failed"
         ? { tone: "muted", text: t("voice.failed") }
-        : voiceState === "connected" && encryption === "securing"
+        : encryption === "securing" && voiceState !== "failed"
           ? { tone: "muted", text: t("voice.securing") }
           : voiceState === "connected"
             ? { tone: "ok", text: t("voice.connected") }

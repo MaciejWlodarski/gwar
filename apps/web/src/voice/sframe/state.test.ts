@@ -391,6 +391,21 @@ describe("SframeState", () => {
     expect(s.stopped).toBe(true);
   });
 
+  it("a removed device that keeps its keys opens nothing encrypted after the sender's cutoff", async () => {
+    const a = engine(), c = engine();
+    const one = members(1n, [[0, 0], [1, 1], [2, 2]]);
+    await a.enter(1n, 0, one); await c.enter(1n, 2, one);
+    const before = (await a.state.encrypt(OPUS.slice()))!;
+    expect(await c.state.decrypt(before)).toEqual(OPUS); // the design's stated removal limit
+    // Carol is removed: the sender holds, then moves to epoch 2 without her.
+    await a.ok({ action: "hold", epoch: "2", removed: [DEVICES[2]!] });
+    expect(await a.state.encrypt(OPUS.slice())).toBeNull(); // nothing is encrypted between hold and activation
+    await a.enter(2n, 0, members(2n, [[0, 0], [1, 1]]), [DEVICES[2]!]);
+    for (let i = 0; i < 5; i++) expect(await c.state.decrypt((await a.state.encrypt(OPUS.slice()))!)).toBeNull();
+    expect(c.state.counters.no_key).toBe(5);
+    expect(c.state.counters.decrypted).toBe(1);
+  });
+
   it("encrypts with exactly the RFC header for its kid and counter", async () => {
     const a = engine();
     await a.enter(3n, 4, members(3n, [[0, 0], [4, 1]]));

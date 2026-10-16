@@ -25,10 +25,16 @@ class FakeServer {
   pending: string[] = [];
   acks: number[] = [];
   repeats = 0;
+  /** Runs when a commit arrives, before it is accepted (a competing commit). */
+  beforeCommit: (() => void) | null = null;
+  /** The parent named by the group's descriptor. */
+  parent = PARENT;
+  /** The next creation reply is lost after the server accepted it. */
+  loseCreateReply = false;
   requests: string[] = [];
   get head() { return this.log.length; }
-  /** Another device's commit: the new member list. */
-  commit(members: Member[]) { this.log.push({ epoch: this.head, commit: encodeBase64Url(new Uint8Array(enc({ members }))), proposals: [] }); this.members = members; }
+  /** Another device's commit: the new member list and the devices it removed. */
+  commit(members: Member[], removed: string[] = []) { this.log.push({ epoch: this.head, commit: encodeBase64Url(new Uint8Array(enc({ members, removed }))), proposals: [] }); this.members = members; }
 }
 
 /** The voice agent's observable state, driven by the fake server's commit bytes. */
@@ -42,10 +48,12 @@ class FakeVoiceAgent implements WasmAgent {
   blocked = false;
   parentMissing: number[] = [];
   serverPending = false;
+  /** The parent named in the joined group's descriptor. */
+  parent = PARENT;
   constructor(world: { agent?: FakeVoiceAgent }) { world.agent = this; }
   private summary(): GroupSummary[] {
     if (!this.status) return [];
-    return [{ group: this.group, conversation: "voice:7", incarnation: "0", live: this.status !== "creating", history: false, record: { status: this.status, checkpoint: this.status === "creating" ? null : { epoch: String(this.epoch), hash: [] }, server_pending: this.serverPending }, members: structuredClone(this.members) }];
+    return [{ group: this.group, conversation: "voice:7", incarnation: "0", live: this.status !== "creating", history: false, channel_group: this.parent, record: { status: this.status, checkpoint: this.status === "creating" ? null : { epoch: String(this.epoch), hash: [] }, server_pending: this.serverPending, voice_removed: this.removed }, members: structuredClone(this.members) }];
   }
   execute(request: unknown): unknown {
     const [op, d] = Object.entries(request as Record<string, Record<string, unknown>>)[0]!;
@@ -68,8 +76,9 @@ class FakeVoiceAgent implements WasmAgent {
         return true;
       }
       case "join_external": {
-        const info = dec<{ epoch: number; members: Member[]; group: string }>(d!.bytes as number[]);
+        const info = dec<{ epoch: number; members: Member[]; group: string; parent?: string }>(d!.bytes as number[]);
         this.group = [...decodeBase64Url(info.group)];
+        this.parent = info.parent ?? PARENT;
         const members = [...info.members, member(Math.max(-1, ...info.members.map(m => m.leaf)) + 1, "self")];
         this.status = "joining"; this.epoch = info.epoch; this.members = info.members;
         this.out = { epoch: String(info.epoch), hash: [7, info.epoch], commit: enc({ members }), group_info: [1], welcome: null };
@@ -79,12 +88,15 @@ class FakeVoiceAgent implements WasmAgent {
         const result = d!.result as { case: string; commit?: number[] };
         if (result.case === "head") return "retry";
         if (result.case === "entry" && result.commit!.join() === this.out?.commit.join()) {
-          this.members = dec<{ members: Member[] }>(this.out.commit).members; this.epoch++; this.status = "active"; this.out = null;
+          this.apply(this.out.commit); this.status = "active"; this.out = null;
           return "accepted";
         }
-        this.out = null; return "rebuild";
+        // A competing commit won: it is merged instead (Rust's `rebuild`).
+        this.out = null;
+        if (result.case === "entry") this.apply(result.commit!);
+        return "rebuild";
       }
-      case "receive": this.members = dec<{ members: Member[] }>(d!.commit as number[]).members; this.epoch++; return null;
+      case "receive": this.apply(d!.commit as number[]); return null;
       case "commit": {
         const removes = d!.removes as number[];
         const members = this.members.filter(m => !removes.includes(m.leaf));
@@ -97,8 +109,16 @@ class FakeVoiceAgent implements WasmAgent {
       default: throw new Error(`unexpected ${op}`);
     }
   }
+  private apply(commit: number[]): void {
+    const c = dec<{ members: Member[]; removed?: string[] }>(commit);
+    const after = new Set(c.members.map(m => `${m.leaf}/${m.device_key}`));
+    this.removed = [...new Set([...(c.removed ?? []), ...this.members.filter(m => !after.has(`${m.leaf}/${m.device_key}`)).map(m => m.device_key)])];
+    this.members = c.members; this.epoch++;
+  }
+  removed: string[] = [];
   execute_with_parent(request: unknown): unknown {
     const [op] = Object.keys(request as object);
+    this.parentMissing = this.parentMissing.filter(leaf => this.members.some(m => m.leaf === leaf));
     if (op === "voice_parent_removals") return this.parentMissing;
     if (this.blocked || this.parentMissing.length) throw new Error("group cannot send");
     return { epoch: String(this.epoch), own_leaf: this.members.find(m => m.device_key === DEVICES.self)!.leaf, members: this.members.map(m => ({ leaf: m.leaf, device: m.device_key, key: Array(32).fill(m.leaf + this.epoch * 10 + 1) })), send_until: null };
@@ -119,6 +139,7 @@ function fixture(options: { group?: boolean } = {}) {
   void parent.run(async () => {});
   if (options.group) { server.group = b64(9); server.members = [member(0, "bob")]; server.commit([member(0, "bob")]); }
   const errors: unknown[] = [];
+  let restarts = 0;
   const host: VoiceHost = {
     server: SERVER, uid: "self-uid", session: 5,
     identity: { nickname: "self", publicKey: DEVICES.self, sign: async () => encodeBase64Url(new Uint8Array(64)) } as unknown as Identity,
@@ -129,14 +150,16 @@ function fixture(options: { group?: boolean } = {}) {
         case "mls.group.create": {
           if (server.group) throw new RequestError("conflict", server.group);
           server.group = dec<{ create: string }>([...decodeBase64Url(data.group_info as string)]).create; server.members = [member(0, "self")];
+          if (server.loseCreateReply) { server.loseCreateReply = false; throw new Error("request timed out"); }
           return { group: server.group };
         }
-        case "mls.group_info": return { group_info: encodeBase64Url(new Uint8Array(enc({ epoch: server.head, members: server.members, group: server.group }))), epoch: server.head };
+        case "mls.group_info": return { group_info: encodeBase64Url(new Uint8Array(enc({ epoch: server.head, members: server.members, group: server.group, parent: server.parent }))), epoch: server.head };
         case "mls.log": {
           const since = data.since as number;
           return { head: server.head, oldest: 0, entries: server.log.filter(e => e.epoch >= since), pending: server.pending, next: null };
         }
         case "mls.commit": {
+          const race = server.beforeCommit; server.beforeCommit = null; race?.();
           if (data.epoch !== server.head) throw new RequestError("stale", "stale");
           // Committing by reference clears the server's pending removals.
           server.log.push({ epoch: server.head, commit: data.commit as string, proposals: server.pending });
@@ -150,7 +173,7 @@ function fixture(options: { group?: boolean } = {}) {
       }
     }) as VoiceHost["request"],
     tree: async () => ({ epoch: server.head, tree: [] }),
-    revocations: () => [], now: () => Date.now(),
+    revocations: () => [], now: () => Date.now(), monotonic: () => Date.now(), restartMedia: () => { restarts++; },
     parent, parentGroup: () => PARENT,
     syncParent: async () => true,
     factory, onError: e => errors.push(e),
@@ -158,16 +181,16 @@ function fixture(options: { group?: boolean } = {}) {
   const state = { channel: 7, call: CALL, participation: PART, encrypted: true, channel_group: PARENT, group: server.group, epoch: server.group ? server.head : null };
   const call = new VoiceCall(host, state);
   const controls: Control[] = [];
-  let run = 0;
+  let run = 0, closed = 0;
   const media = (resumeAfter: string | null = call.resumeAfter()) => {
     run++;
     const engine = new SframeState({ binding: { server_key: SERVER, session: 5, channel: 7, call: CALL, participation: PART, run, group: server.group ?? b64(0) }, resumeAfter: resumeAfter === null ? null : BigInt(resumeAfter), now: () => performance.now(), wallNow: () => Date.now(), onStatus: s => call.engineStatus(s) });
     // The engine's binding names the group the controller settled on.
     const control = (body: Control) => { controls.push(body); return engine.control({ ...body, binding: { ...body.binding } }); };
-    call.attach({ run, control });
+    call.attach({ run, control, close: () => { closed++; engine.stop(); } });
     return engine;
   };
-  return { server, world, call, controls, media, errors, agent: () => world.agent! };
+  return { server, world, call, controls, media, errors, agent: () => world.agent!, restarts: () => restarts, closed: () => closed };
 }
 
 /** Advances fake time while letting real WebCrypto work (thread pool) complete. */
@@ -333,6 +356,84 @@ describe("VoiceCall", () => {
     expect(f.call.status()).toBe("securing");
   });
 
+  it("refuses a group whose descriptor names another channel's parent", async () => {
+    const f = fixture({ group: true });
+    // The server's GroupInfo carries a genuine group bound to another parent.
+    f.server.parent = b64(66);
+    f.call.start(); await settle();
+    expect(f.call.status()).toBe("failed");
+    expect(f.server.requests).not.toContain("mls.commit");
+    expect(f.controls).toEqual([]);
+  });
+
+  it("processes a competing commit that wins over this device's own (rebuild)", async () => {
+    const f = fixture({ group: true });
+    f.server.commit([member(0, "bob"), member(2, "carol")]);
+    f.call.start(); await settle(); f.media();
+    for (const who of ["bob", "carol"] as const) f.call.event({ ev: "voice.epoch.ack", d: { call: CALL, group: f.server.group, epoch: 3, device: DEVICES[who] } });
+    await settle();
+    expect(f.call.status()).toBe("active");
+    f.controls.length = 0;
+    // This device removes a parent-missing Carol; Bob's removal of Carol wins the race.
+    f.server.beforeCommit = () => f.server.commit([member(0, "bob"), member(3, "self")]);
+    f.agent().parentMissing = [2];
+    f.call.event({ ev: "mls.commit", d: { group: PARENT } });
+    await settle(500);
+    expect(actions(f.controls)).toContain("hold:4");
+    expect(f.controls.find(c => c.action === "hold" && c.epoch === "4")).toMatchObject({ removed: [DEVICES.carol] });
+    expect(actions(f.controls).slice(-3)).toEqual(["supersede:4", "install:4", "activate:4"]);
+  });
+
+  it("treats a same-index replacement as a removal", async () => {
+    const f = fixture({ group: true });
+    f.call.start(); await settle(); f.media();
+    f.call.event({ ev: "voice.epoch.ack", d: { call: CALL, group: f.server.group, epoch: 2, device: DEVICES.bob } });
+    await settle();
+    f.controls.length = 0;
+    // Bob lost his state and rejoined at the same leaf index.
+    f.server.commit([member(0, "bob"), member(1, "self")], [DEVICES.bob]);
+    f.call.event({ ev: "mls.commit", d: { group: f.server.group } });
+    await settle();
+    expect(actions(f.controls)[0]).toBe("hold:3");
+    expect(f.controls[0]).toMatchObject({ removed: [DEVICES.bob] });
+  });
+
+  it("rechecks the gate right before activating", async () => {
+    const g = fixture({ group: true });
+    g.call.start(); await settle(); g.media(); await settle();
+    expect(actions(g.controls)).toEqual(["supersede:2", "install:2"]);
+    g.agent().blocked = true; // revoked while waiting for acknowledgements
+    await settle(ACK_WAIT_MS + 500);
+    expect(actions(g.controls)).not.toContain("activate:2");
+    expect(g.call.status()).toBe("securing");
+  });
+
+  it("settles a creation whose reply was lost instead of creating another candidate", async () => {
+    const f = fixture();
+    f.server.loseCreateReply = true;
+    f.call.start(); await settle(2_500);
+    expect(await f.call.joined).toBe(f.server.group);
+    expect(f.server.requests.filter(r => r === "mls.group.create")).toHaveLength(1);
+    expect(f.errors.map(String)).toEqual(["Error: request timed out"]);
+  });
+
+  it("replaces a restart update that lost, and asks for a fresh run on counter exhaustion", async () => {
+    const f = fixture({ group: true });
+    f.call.start(); await settle(); f.media();
+    f.call.event({ ev: "voice.epoch.ack", d: { call: CALL, group: f.server.group, epoch: 2, device: DEVICES.bob } });
+    await settle();
+    f.controls.length = 0;
+    f.server.beforeCommit = () => f.server.commit([member(0, "bob"), member(1, "self")]);
+    const engine = f.media("2");
+    await settle(ACK_WAIT_MS + 3_000);
+    // Bob's commit 3 won (a barrier only: nothing at or below the floor is
+    // installed); this device's replacement update makes epoch 4.
+    expect(actions(f.controls)).toEqual(["supersede:3", "supersede:4", "install:4", "activate:4"]);
+    expect(engine.sending).toBe(true);
+    f.call.engineStatus({ binding: f.controls[0]!.binding, state: "securing", reason: "counter_exhausted" });
+    expect(f.restarts()).toBe(1);
+  });
+
   it("closes without further requests or controls", async () => {
     const f = fixture({ group: true });
     f.call.start(); await settle(); f.media(); await settle();
@@ -343,5 +444,6 @@ describe("VoiceCall", () => {
     expect(f.server.requests.length).toBe(requests);
     expect(f.controls.length).toBe(controls);
     expect(f.call.roster()).toBeNull();
+    expect(f.closed()).toBe(1); // the run's media stopped synchronously
   });
 });

@@ -229,18 +229,28 @@ export class MlsRuntime {
   private assertCurrent(generation: number): void {
     if (this.stopped || generation !== this.generation || !this.options.link.isOnline || this.options.link.serverKey !== this.server) throw new Error("MLS connection changed");
   }
+  /** One shared budget for chat and voice: acquisitions are serialized, so
+   * concurrent waiters cannot each reset an empty bucket. */
+  private token(): Promise<void> {
+    const next = this.tokens.then(async () => {
+      const now = performance.now();
+      this.requestTokens = Math.min(12, this.requestTokens + (now - this.refilled) / 100);
+      this.refilled = now;
+      if (this.requestTokens < 1) {
+        await new Promise(resolve => setTimeout(resolve, (1 - this.requestTokens) * 100));
+        this.refilled = performance.now(); this.requestTokens = 1;
+      }
+      this.requestTokens--;
+    });
+    this.tokens = next.catch(() => {});
+    return next;
+  }
+  private tokens: Promise<void> = Promise.resolve();
   private async request<O extends Op>(op: O, data: RequestInput<O>, guard?: () => void, generation = this.activeGeneration): Promise<ResponseMap[O]> {
     this.assertCurrent(generation);
     // Leave room for chat/voice/control traffic in the connection's 20/s bucket.
-    const now = performance.now();
-    this.requestTokens = Math.min(12, this.requestTokens + (now - this.refilled) / 100);
-    this.refilled = now;
-    if (this.requestTokens < 1) {
-      await new Promise(resolve => setTimeout(resolve, (1 - this.requestTokens) * 100));
-      this.assertCurrent(generation);
-      this.refilled = performance.now(); this.requestTokens = 1;
-    }
-    this.requestTokens--;
+    await this.token();
+    this.assertCurrent(generation);
     guard?.();
     const result = await this.options.link.request(op, data);
     this.assertCurrent(generation); return result;
@@ -252,6 +262,8 @@ export class MlsRuntime {
     this.retry = setTimeout(() => { this.retry = undefined; void this.sync().catch(error => this.options.onError?.(error)); }, delay);
   }
   sync(): Promise<void> {
+    // Revocation refreshes and membership events reach voice gates at once.
+    for (const call of this.calls) call.recheck();
     if (this.syncing) { this.dirty = true; return this.syncing; }
     let failed = false;
     this.syncing = this.engine.run(async () => {
@@ -963,7 +975,7 @@ export class MlsRuntime {
   }
   /** Starts the controller of an encrypted call this session just entered.
    * The caller closes it on leave, move or a different call. */
-  async voiceCall(state: VoiceState, session: number): Promise<VoiceCall> {
+  async voiceCall(state: VoiceState, session: number, restartMedia: () => void): Promise<VoiceCall> {
     if (this.stopped || !this.options.link.isOnline) throw new Error("MLS runtime unavailable");
     // A reconnect makes every capture of this call stale.
     const generation = this.generation;
@@ -975,6 +987,8 @@ export class MlsRuntime {
       tree: group => { this.assertCurrent(generation); return this.tree(group); },
       revocations: () => this.options.revocations(),
       now: () => this.now(),
+      monotonic: () => performance.now(),
+      restartMedia,
       parent: this.engine,
       parentGroup: channel => {
         const pin = this.livePin(`channel:${channel}`);
