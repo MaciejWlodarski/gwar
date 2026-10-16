@@ -51,7 +51,10 @@ impl AudioIo for FakeIo {
                 for _ in 0..480 {
                     let s = if with_tone { tone(t) } else { 0.0 };
                     t += 1;
-                    if mic_tx.push(CaptureSample { position: t - 1, value: s }).is_err() {
+                    if mic_tx
+                        .push(CaptureSample { captured_at: std::time::Instant::now(), position: t - 1, value: s })
+                        .is_err()
+                    {
                         return;
                     }
                 }

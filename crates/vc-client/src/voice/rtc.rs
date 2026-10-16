@@ -150,6 +150,9 @@ where
                     if !rtc.is_connected() {
                         continue;
                     }
+                    if !frame.fresh_at(Instant::now(), &counters) {
+                        continue;
+                    }
                     let Some(ticks) = send_ticks(frame.capture_position, last_ticks) else {
                         counters.capture_position_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         continue;
@@ -248,7 +251,13 @@ mod tests {
         timeout(Duration::from_secs(5), async {
             for i in 0..100 {
                 outgoing
-                    .send(Outgoing { capture_position: i * 480, opus: vec![0xf0, 1], level: -10, speech: true })
+                    .send(Outgoing {
+                        captured_at: Instant::now(),
+                        capture_position: i * 480,
+                        opus: vec![0xf0, 1],
+                        level: -10,
+                        speech: true,
+                    })
                     .await
                     .unwrap();
             }
@@ -292,13 +301,39 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
             assert_eq!(counters.link.load(Ordering::Relaxed), 1);
+            // A connected consumer stall must use the same age bound as PCM.
+            // Inject time instead of sleeping to create stale encoded frames.
+            for position in [46_080, 47_040] {
+                outgoing
+                    .send(Outgoing {
+                        captured_at: Instant::now() - Duration::from_millis(200),
+                        capture_position: position,
+                        opus: vec![0xf0, 9],
+                        level: -10,
+                        speech: true,
+                    })
+                    .await
+                    .unwrap();
+            }
             outgoing
-                .send(Outgoing { capture_position: 48_000, opus: vec![0xf0, 2], level: -10, speech: true })
+                .send(Outgoing {
+                    captured_at: Instant::now(),
+                    capture_position: 48_000,
+                    opus: vec![0xf0, 2],
+                    level: -10,
+                    speech: true,
+                })
                 .await
                 .unwrap();
             let first = received.recv().await.unwrap();
             outgoing
-                .send(Outgoing { capture_position: 48_960, opus: vec![0xf0, 3], level: -10, speech: true })
+                .send(Outgoing {
+                    captured_at: Instant::now(),
+                    capture_position: 48_960,
+                    opus: vec![0xf0, 3],
+                    level: -10,
+                    speech: true,
+                })
                 .await
                 .unwrap();
             (first, received.recv().await.unwrap())
@@ -309,6 +344,7 @@ mod tests {
         let (first, next) = result.unwrap();
         assert_eq!(first.1, vec![0xf0, 2], "pre-connection capture must never enter SRTP");
         assert_eq!(next.1, vec![0xf0, 3]);
+        assert_eq!(counters.capture_stale_frames.load(Ordering::Relaxed), 2);
         // 5b adds a random run offset; capture-clock deltas remain exact.
         assert_eq!(next.0.wrapping_sub(first.0), 960);
     }

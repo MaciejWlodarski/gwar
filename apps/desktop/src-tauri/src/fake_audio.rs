@@ -76,7 +76,11 @@ impl AudioIo for FakeIo {
                 for _ in 0..480 {
                     let s = if tone { (t as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.3 } else { 0.0 };
                     t += 1;
-                    let _ = mic_tx.push(CaptureSample { position: t - 1, value: s });
+                    let _ = mic_tx.push(CaptureSample {
+                        captured_at: std::time::Instant::now(),
+                        position: t - 1,
+                        value: s,
+                    });
                 }
                 let missing = 480usize.saturating_sub(speaker_rx.slots());
                 for _ in 0..480 {

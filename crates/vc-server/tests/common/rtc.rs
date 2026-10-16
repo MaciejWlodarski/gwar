@@ -220,6 +220,7 @@ pub fn assert_encrypted_source_boundaries(
     let route = AudioRoute::new(123, 1, Some(origin.clone()));
     route.confirm(Some(1));
     let packet = AudioPacket {
+        admitted_at: std::time::Instant::now(),
         origin,
         payload: Arc::from([0xf8, 99, 1]),
         kind: AudioKind::Audio,

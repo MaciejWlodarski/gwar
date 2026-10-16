@@ -35,7 +35,7 @@ use crate::ts_identity;
 /// What voice needs from the active TS connection.
 pub struct VoiceLink {
     pub audio_in: mpsc::Receiver<TsAudio>,
-    pub audio_out: mpsc::Sender<Vec<u8>>,
+    pub audio_out: mpsc::Sender<vc_client::teamspeak::TsMicrophone>,
 }
 
 #[derive(Default)]
@@ -44,7 +44,11 @@ pub(crate) struct VoiceSink {
 }
 
 impl VoiceSink {
-    pub(crate) fn link(self: &Arc<Self>, run: u64, audio_out: mpsc::Sender<Vec<u8>>) -> (VoiceLink, VoiceSinkLease) {
+    pub(crate) fn link(
+        self: &Arc<Self>,
+        run: u64,
+        audio_out: mpsc::Sender<vc_client::teamspeak::TsMicrophone>,
+    ) -> (VoiceLink, VoiceSinkLease) {
         let (tx, rx) = mpsc::channel(256);
         *self.target.lock().unwrap_or_else(|e| e.into_inner()) = Some((run, tx));
         (VoiceLink { audio_in: rx, audio_out }, VoiceSinkLease { sink: self.clone(), run })

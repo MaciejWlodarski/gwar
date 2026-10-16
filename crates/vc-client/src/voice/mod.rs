@@ -105,6 +105,9 @@ pub(crate) struct Counters {
     oversize_dropped: AtomicU64,
     malformed_dropped: AtomicU64,
     capture_position_dropped: AtomicU64,
+    capture_stale_samples: AtomicU64,
+    capture_stale_frames: AtomicU64,
+    outgoing_full_dropped: AtomicU64,
     /// 0 connecting, 1 connected, 2 lost.
     link: AtomicU8,
     slots: [SlotCounters; AUDIO_SLOTS],
@@ -167,6 +170,12 @@ pub struct VoiceStats {
     pub oversize_dropped: u64,
     pub malformed_dropped: u64,
     pub capture_position_dropped: u64,
+    /// PCM discarded by age, including partial frames invalidated by a stall.
+    pub capture_stale_samples: u64,
+    /// Encoded frames discarded by age before transport admission.
+    pub capture_stale_frames: u64,
+    pub capture_overflow_samples: u64,
+    pub outgoing_full_dropped: u64,
     pub link: LinkState,
     pub slots: [SlotStats; AUDIO_SLOTS],
     pub speaker_samples: u64,
@@ -231,6 +240,10 @@ impl VoiceHandle {
             oversize_dropped: c.oversize_dropped.load(Ordering::Relaxed),
             malformed_dropped: c.malformed_dropped.load(Ordering::Relaxed),
             capture_position_dropped: c.capture_position_dropped.load(Ordering::Relaxed),
+            capture_stale_samples: c.capture_stale_samples.load(Ordering::Relaxed),
+            capture_stale_frames: c.capture_stale_frames.load(Ordering::Relaxed),
+            capture_overflow_samples: self.output.capture_overflow_samples.load(Ordering::Relaxed),
+            outgoing_full_dropped: c.outgoing_full_dropped.load(Ordering::Relaxed),
             slots: std::array::from_fn(|i| {
                 let s = &c.slots[i];
                 SlotStats {
@@ -270,11 +283,22 @@ impl Drop for VoiceHandle {
 
 /// An encoded microphone frame on its way to the network.
 pub(crate) struct Outgoing {
+    pub captured_at: Instant,
     pub capture_position: u64,
     pub opus: Vec<u8>,
     /// RFC 6464 level, negative dBov.
     pub level: i8,
     pub speech: bool,
+}
+
+impl Outgoing {
+    fn fresh_at(&self, now: Instant, counters: &Counters) -> bool {
+        if now.saturating_duration_since(self.captured_at) > io::MAX_CAPTURE_AGE {
+            counters.capture_stale_frames.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -345,7 +369,7 @@ where
 pub async fn start_teamspeak(
     io: Box<dyn AudioIo>,
     mut audio_in: mpsc::Receiver<crate::teamspeak::TsAudio>,
-    audio_out: mpsc::Sender<Vec<u8>>,
+    audio_out: mpsc::Sender<crate::teamspeak::TsMicrophone>,
 ) -> Result<VoiceHandle> {
     let ports = tokio::task::spawn_blocking(move || io.open()).await??;
     let (out_tx, mut out_rx) = mpsc::channel::<Outgoing>(64);
@@ -373,13 +397,19 @@ pub async fn start_teamspeak(
                     }
                 } => match outgoing {
                     Ok(Some(frame)) => {
+                        if !frame.fresh_at(Instant::now(), &link) { continue; }
                         talking = true;
-                        if audio_out.send(frame.opus).await.is_err() { break; }
+                        match audio_out.try_send(crate::teamspeak::TsMicrophone { captured_at: frame.captured_at, opus: frame.opus }) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => { link.outgoing_full_dropped.fetch_add(1, Ordering::Relaxed); }
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        }
                     }
                     Ok(None) => break,
                     Err(_) => {
                         talking = false;
-                        let _ = audio_out.send(Vec::new()).await;
+                        // The end marker is never age-dropped: losing it leaves TS showing speech.
+                        if audio_out.send(crate::teamspeak::TsMicrophone { captured_at: Instant::now(), opus: Vec::new() }).await.is_err() { break; }
                     }
                 },
             }
@@ -444,20 +474,32 @@ struct CaptureFrame {
     samples: Vec<f32>,
     filled: usize,
     start: u64,
+    captured_at: Instant,
 }
 
 impl CaptureFrame {
     fn new(size: usize) -> Self {
-        Self { samples: vec![0.0; size], filled: 0, start: 0 }
+        Self { samples: vec![0.0; size], filled: 0, start: 0, captured_at: Instant::now() }
     }
 
-    fn push(&mut self, sample: CaptureSample) -> Option<u64> {
+    fn push_at(&mut self, sample: CaptureSample, now: Instant, counters: &Counters) -> Option<u64> {
+        // Age is residence in the ring, not the device callback period: a
+        // stalled consumer finds old samples here and the position gap resets
+        // any partial frame, while large callbacks still complete their frames.
+        if now.saturating_duration_since(sample.captured_at) > io::MAX_CAPTURE_AGE {
+            // A stale backlog also invalidates the partial frame it interrupts.
+            counters.capture_stale_samples.fetch_add(1 + self.filled as u64, Ordering::Relaxed);
+            self.filled = 0;
+            return None;
+        }
         if sample.position != self.start + self.filled as u64 {
             self.filled = 0;
         }
         if self.filled == 0 {
             self.start = sample.position;
         }
+        // A frame becomes sendable with its last sample; later queues measure from there.
+        self.captured_at = sample.captured_at;
         self.samples[self.filled] = sample.value;
         self.filled += 1;
         if self.filled == self.samples.len() {
@@ -494,7 +536,7 @@ fn pipeline<const CAPTURE: usize>(
         // always-ready device) must not keep a promoted thread from playback.
         for _ in 0..mic.slots() {
             let Ok(sample) = mic.pop() else { break };
-            let Some(capture_position) = capture.push(sample) else { continue };
+            let Some(capture_position) = capture.push_at(sample, Instant::now(), &counters) else { continue };
             let frame = &capture.samples;
             let db = level_db(frame);
             set_f(&controls.input_level, db);
@@ -517,10 +559,18 @@ fn pipeline<const CAPTURE: usize>(
                 let level = (-db.clamp(-127.0, 0.0)).round() as i8;
                 // Tell the server's speech gate the truth about voice activity.
                 if out
-                    .try_send(Outgoing { capture_position, opus: packet[..n].to_vec(), level: -level, speech: true })
+                    .try_send(Outgoing {
+                        captured_at: capture.captured_at,
+                        capture_position,
+                        opus: packet[..n].to_vec(),
+                        level: -level,
+                        speech: true,
+                    })
                     .is_ok()
                 {
                     counters.frames_sent.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    counters.outgoing_full_dropped.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -607,27 +657,116 @@ mod codec_tests {
     }
 
     #[test]
+    fn stalled_capture_and_encoded_consumers_drop_old_audio_without_a_late_burst() {
+        let now = Instant::now();
+        for size in [FRAME, TS_FRAME] {
+            let counters = Counters::default();
+            let (mut tx, mut rx) = rtrb::RingBuffer::new(size * 4);
+            let mut capture = CaptureFrame::new(size);
+            // Retain a partial frame, then stall while the mic fills its ring.
+            for position in 0..size / 2 {
+                assert!(
+                    capture
+                        .push_at(
+                            CaptureSample { position: position as u64, captured_at: now, value: 0.5 },
+                            now,
+                            &counters
+                        )
+                        .is_none()
+                );
+            }
+            for position in size / 2..size * 3 {
+                tx.push(CaptureSample { position: position as u64, captured_at: now, value: 0.5 }).unwrap();
+            }
+            let resumed = now + Duration::from_millis(200);
+            for _ in 0..rx.slots() {
+                assert!(capture.push_at(rx.pop().unwrap(), resumed, &counters).is_none());
+            }
+            // The ring backlog and the partial frame it interrupted.
+            assert_eq!(counters.capture_stale_samples.load(Ordering::Relaxed), (size * 3) as u64);
+            let mut positions = Vec::new();
+            for position in size * 3..size * 4 {
+                positions.extend(capture.push_at(
+                    CaptureSample { position: position as u64, captured_at: resumed, value: 0.5 },
+                    resumed,
+                    &counters,
+                ));
+            }
+            assert_eq!(positions, [(size * 3) as u64]);
+
+            let (tx, mut rx) = mpsc::channel(4);
+            for (position, captured_at) in [(0, now), (size, now), (size * 3, resumed)] {
+                tx.try_send(Outgoing {
+                    captured_at,
+                    capture_position: position as u64,
+                    opus: vec![1],
+                    level: -10,
+                    speech: true,
+                })
+                .unwrap();
+            }
+            let mut sent = Vec::new();
+            while let Ok(frame) = rx.try_recv() {
+                if frame.fresh_at(resumed, &counters) {
+                    sent.push(frame.capture_position);
+                }
+            }
+            assert_eq!(sent, [(size * 3) as u64]);
+            assert_eq!(counters.capture_stale_frames.load(Ordering::Relaxed), 2);
+            // Encode can itself cross the deadline after PCM passed admission.
+            let frame = Outgoing { captured_at: resumed, capture_position: 0, opus: vec![1], level: -10, speech: true };
+            assert!(frame.fresh_at(resumed + io::MAX_CAPTURE_AGE, &counters));
+            assert!(!frame.fresh_at(resumed + io::MAX_CAPTURE_AGE + Duration::from_nanos(1), &counters));
+            assert_eq!(counters.capture_stale_frames.load(Ordering::Relaxed), 3);
+        }
+    }
+
+    #[test]
+    fn device_callbacks_longer_than_the_age_limit_still_complete_frames() {
+        // Some devices deliver 100 ms per callback: a frame split across two
+        // callbacks is not stale, and its age starts when it becomes complete.
+        let counters = Counters::default();
+        let mut capture = CaptureFrame::new(FRAME);
+        let first = Instant::now();
+        let second = first + Duration::from_millis(100);
+        let split = FRAME as u64 * 5 / 4;
+        let mut positions = Vec::new();
+        for position in 0..FRAME as u64 * 2 {
+            let at = if position < split { first } else { second };
+            positions.extend(capture.push_at(CaptureSample { position, captured_at: at, value: 0.1 }, at, &counters));
+        }
+        assert_eq!(positions, [0, FRAME as u64]);
+        assert_eq!(capture.captured_at, second);
+        assert_eq!(counters.capture_stale_samples.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn capture_frames_keep_positions_across_batches_and_ring_overflow() {
         let (mut tx, mut rx) = rtrb::RingBuffer::new(4);
         let mut frame = CaptureFrame::new(3);
         for position in 0..7 {
-            let _ = tx.push(CaptureSample { position, value: position as f32 });
+            let _ = tx.push(CaptureSample { captured_at: std::time::Instant::now(), position, value: position as f32 });
         }
         let mut positions = Vec::new();
         while let Ok(sample) = rx.pop() {
-            positions.extend(frame.push(sample));
+            positions.extend(frame.push_at(sample, Instant::now(), &Counters::default()));
         }
         assert_eq!(positions, vec![0]);
         for position in 7..10 {
-            tx.push(CaptureSample { position, value: position as f32 }).unwrap();
+            tx.push(CaptureSample { captured_at: std::time::Instant::now(), position, value: position as f32 })
+                .unwrap();
         }
         while let Ok(sample) = rx.pop() {
-            positions.extend(frame.push(sample));
+            positions.extend(frame.push_at(sample, Instant::now(), &Counters::default()));
         }
         assert_eq!(positions, vec![0, 7]);
         assert_eq!(frame.samples, vec![7.0, 8.0, 9.0]);
         for position in 10..19 {
-            positions.extend(frame.push(CaptureSample { position, value: 0.0 }));
+            positions.extend(frame.push_at(
+                CaptureSample { captured_at: Instant::now(), position, value: 0.0 },
+                Instant::now(),
+                &Counters::default(),
+            ));
         }
         assert_eq!(positions, vec![0, 7, 10, 13, 16]);
     }
@@ -648,7 +787,8 @@ mod codec_tests {
             let worker = thread::spawn(move || pipeline::<FRAME>(c, Arc::default(), mic, speaker, t, out, input));
             let mut feed = |start: usize, count: usize, value: f32| {
                 for position in start..start + count {
-                    tx.push(CaptureSample { position: position as u64, value }).unwrap();
+                    tx.push(CaptureSample { captured_at: std::time::Instant::now(), position: position as u64, value })
+                        .unwrap();
                 }
                 timing.wake();
                 let deadline = Instant::now() + Duration::from_secs(2);
@@ -682,7 +822,12 @@ mod codec_tests {
                 let (mut tx, mic) = rtrb::RingBuffer::new(1920);
                 let (speaker, rx) = rtrb::RingBuffer::new(1920);
                 for i in 0..960 {
-                    tx.push(CaptureSample { position: i, value: (i as f32 * 0.04).sin() * 0.3 }).unwrap();
+                    tx.push(CaptureSample {
+                        captured_at: std::time::Instant::now(),
+                        position: i,
+                        value: (i as f32 * 0.04).sin() * 0.3,
+                    })
+                    .unwrap();
                 }
                 Ok(AudioPorts { mic, speaker, output: Arc::new(OutputTiming::default()), _guard: Box::new((tx, rx)) })
             }
@@ -691,7 +836,7 @@ mod codec_tests {
         let (output, mut outgoing) = mpsc::channel(4);
         let _handle = start_teamspeak(Box::new(Capture), input, output).await.unwrap();
         let packet = tokio::time::timeout(Duration::from_secs(2), outgoing.recv()).await.unwrap().unwrap();
-        assert_eq!(opus_samples(&packet), Some(960));
+        assert_eq!(opus_samples(&packet.opus), Some(960));
     }
 
     #[test]

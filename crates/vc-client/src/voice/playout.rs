@@ -13,7 +13,13 @@ use super::{
 const STEP: usize = 240; // 5 ms at 48 kHz.
 const MAX_HEADROOM: usize = 1920; // 40 ms, unless one device callback itself needs more.
 const CALLBACK_HOLD: Duration = Duration::from_secs(5);
-const HEADROOM_QUIET: Duration = Duration::from_secs(30);
+// Leaky event budget: +5 ms per underrun, -5 ms per release interval, so rare
+// misses cannot pin 40 ms. A release followed by an underrun within
+// RELEASE_PROBE was needed margin: the interval doubles (up to 80 s), so a
+// periodic stall costs ever rarer glitches; a clean release resets it to 5 s.
+const HEADROOM_RELEASE: Duration = Duration::from_secs(5);
+const MAX_RELEASE: Duration = Duration::from_secs(80);
+const RELEASE_PROBE: Duration = Duration::from_secs(5);
 
 /// Pipeline-owned policy; the realtime callback only publishes atomic measurements.
 pub(super) struct SpeakerBuffer {
@@ -22,11 +28,22 @@ pub(super) struct SpeakerBuffer {
     callback_changed: Instant,
     headroom_changed: Instant,
     underruns: u64,
+    release_every: Duration,
+    /// When the last release happened, until it is proven needed or not.
+    released: Option<Instant>,
 }
 
 impl SpeakerBuffer {
     pub fn new(now: Instant) -> Self {
-        Self { callback: 480, headroom: 480, callback_changed: now, headroom_changed: now, underruns: 0 }
+        Self {
+            callback: 480,
+            headroom: 480,
+            callback_changed: now,
+            headroom_changed: now,
+            underruns: 0,
+            release_every: HEADROOM_RELEASE,
+            released: None,
+        }
     }
 
     /// `peak` is the largest callback since the previous update, never just the last one.
@@ -43,13 +60,38 @@ impl SpeakerBuffer {
         }
         let base = self.callback.max(STEP);
         self.headroom = self.headroom.max(base);
-        if underruns > self.underruns {
+        let missed = underruns > self.underruns;
+        let induced = self.released.is_some_and(|at| now.saturating_duration_since(at) <= RELEASE_PROBE);
+        let every = self.release_every;
+        if missed && induced {
+            self.release_every = (self.release_every * 2).min(MAX_RELEASE);
+            self.released = None;
+        } else if missed || self.released.is_some_and(|at| now.saturating_duration_since(at) > RELEASE_PROBE) {
+            // A clean release, or a miss no release caused (headroom did not
+            // prevent it): back to the base interval, so it cannot pin headroom.
+            self.release_every = HEADROOM_RELEASE;
+            self.released = None;
+        }
+        if self.release_every != every {
+            // A new interval starts now: never release retroactively under it.
+            self.headroom_changed = now;
+        }
+        let elapsed = now.saturating_duration_since(self.headroom_changed);
+        let steps = elapsed.as_nanos() / self.release_every.as_nanos();
+        if steps > 0 {
+            let decay = steps.min(usize::MAX as u128) as usize;
+            let before = self.headroom;
+            self.headroom = self.headroom.saturating_sub(decay.saturating_mul(STEP)).max(base);
+            if self.headroom < before {
+                self.released = Some(now);
+            }
+            // Preserve the fractional interval; underruns never restart this clock.
+            self.headroom_changed =
+                now - Duration::from_nanos((elapsed.as_nanos() % self.release_every.as_nanos()) as u64);
+        }
+        if missed {
             let events = (underruns - self.underruns).min((MAX_HEADROOM / STEP) as u64) as usize;
             self.headroom = self.headroom.saturating_add(events * STEP).min(MAX_HEADROOM).max(self.headroom);
-            self.headroom_changed = now;
-        } else if now.duration_since(self.headroom_changed) >= HEADROOM_QUIET {
-            self.headroom = self.headroom.saturating_sub(STEP).max(base);
-            self.headroom_changed = now;
         }
         self.underruns = underruns;
     }
@@ -282,26 +324,86 @@ mod tests {
     }
 
     #[test]
-    fn underruns_grow_headroom_and_quiet_time_decays_without_sleeping() {
+    fn a_periodic_stall_backs_off_releases_instead_of_glitching_each_time() {
+        // Each second a 31 ms scheduling stall right after a refill needs 20 ms of
+        // headroom (10 ms callbacks); less underruns. Underruns follow occupancy.
+        let start = Instant::now();
+        let mut buffer = SpeakerBuffer::new(start);
+        let mut underruns = 0;
+        for second in 1..=300 {
+            if buffer.headroom < 960 {
+                underruns += 1;
+            }
+            buffer.update(start + Duration::from_secs(second), 480, 480, underruns);
+        }
+        // A fixed 5 s release would glitch after every release below 20 ms (about 60 times).
+        assert!(underruns <= 10, "{underruns} underruns in five minutes");
+        assert_eq!(buffer.release_every, MAX_RELEASE);
+    }
+
+    #[test]
+    fn misses_that_headroom_cannot_prevent_reset_the_backoff() {
+        // Start fully backed off at 40 ms; stalls every 40 s happen whatever the headroom.
+        let start = Instant::now();
+        let mut buffer = SpeakerBuffer::new(start);
+        buffer.headroom = MAX_HEADROOM;
+        buffer.release_every = MAX_RELEASE;
+        let mut underruns = 0;
+        for second in 1..=600 {
+            if second % 40 == 1 {
+                // one second after each 80 s release
+                underruns += 1;
+            }
+            buffer.update(start + Duration::from_secs(second), 480, 480, underruns);
+        }
+        assert!(buffer.headroom <= 480 + 2 * STEP, "{}", buffer.headroom);
+    }
+
+    #[test]
+    fn a_backoff_reset_does_not_release_retroactively() {
+        let start = Instant::now();
+        let mut buffer = SpeakerBuffer::new(start);
+        buffer.headroom = MAX_HEADROOM;
+        buffer.release_every = MAX_RELEASE;
+        // An unrelated miss 60 s after the last release resets the interval.
+        buffer.update(start + Duration::from_secs(60), 480, 480, 1);
+        assert_eq!(buffer.release_every, HEADROOM_RELEASE);
+        assert_eq!(buffer.headroom, MAX_HEADROOM, "the shorter interval starts now");
+        buffer.update(start + Duration::from_secs(65), 480, 480, 1);
+        assert_eq!(buffer.headroom, MAX_HEADROOM - STEP);
+    }
+
+    #[test]
+    fn occasional_underruns_release_headroom_but_frequent_ones_grow_it() {
         let now = Instant::now();
         let mut buffer = SpeakerBuffer::new(now);
         buffer.update(now, 480, 480, 1);
         assert_eq!(buffer.headroom, 720);
-        buffer.update(now, 480, 480, 3); // retain multiple events between wakeups
-        assert_eq!(buffer.headroom, 1200);
+        buffer.update(now, 480, 480, 3);
+        assert_eq!(buffer.headroom, 1200); // Count every event between updates.
         buffer.update(now, 480, 480, 100);
         assert_eq!(buffer.headroom, MAX_HEADROOM);
-        buffer.update(now + Duration::from_secs(29), 480, 480, 101);
-        buffer.update(now + Duration::from_secs(58), 480, 480, 101);
-        assert_eq!(buffer.headroom, MAX_HEADROOM);
-        for step in 1..=8 {
-            buffer.update(now + Duration::from_secs(29 + step * 30), 480, 480, 101);
-            assert_eq!(buffer.headroom, MAX_HEADROOM.saturating_sub(step as usize * STEP).max(480));
+        for second in 1..=120 {
+            buffer.update(now + Duration::from_secs(second), 480, 480, 100 + second / 30);
         }
-        buffer.update(now + Duration::from_secs(300), 2400, 2400, 102);
-        assert_eq!(buffer.headroom, 2400); // never less than a whole callback
-        buffer.update(now + Duration::from_secs(305), 480, 480, 103);
-        assert_eq!(buffer.headroom, 2400); // an underrun must not shrink a formerly large callback's headroom
+        assert!(buffer.headroom <= 480 + STEP, "{}", buffer.headroom); // A miss every 30 s cannot pin 40 ms.
+        for tick in 1..=20 {
+            buffer.update(now + Duration::from_millis(120_000 + tick * 100), 480, 480, 104 + tick);
+        }
+        assert_eq!(buffer.headroom, MAX_HEADROOM); // 10 misses/s still attacks fast.
+        for second in 123..=150 {
+            buffer.update(now + Duration::from_secs(second), 480, 480, 124 + (second - 120) / 3);
+        }
+        // A miss every 3 s outpaces the 5 s release: glitches that headroom
+        // can prevent keep it instead of settling at an audible rate.
+        assert_eq!(buffer.headroom, MAX_HEADROOM);
+        let mut buffer = SpeakerBuffer::new(now);
+        buffer.update(now, 2400, 2400, 0);
+        assert_eq!(buffer.headroom, 2400); // Never less than one whole callback.
+        buffer.update(now + Duration::from_secs(5), 480, 480, 1);
+        // Release runs even with an underrun; the decaying callback maximum
+        // remains the floor, including when it exceeds MAX_HEADROOM.
+        assert_eq!(buffer.headroom, 2160);
     }
 
     #[test]
@@ -540,6 +642,71 @@ mod tests {
     }
 
     #[test]
+    fn recurring_loss_rtp_drains_surplus_and_retains_jitter() {
+        recurring_loss_and_jitter(super::super::jitter::Clock::Rtp);
+    }
+
+    #[test]
+    fn recurring_loss_sequence_drains_surplus_and_retains_jitter() {
+        recurring_loss_and_jitter(super::super::jitter::Clock::Sequence);
+    }
+
+    fn recurring_loss_and_jitter(clock: super::super::jitter::Clock) {
+        use super::super::jitter::Clock;
+        for frame in [480u64, 960] {
+            // Exercise genuine sparse jitter first, then the same clock and
+            // packet duration with a 100 ms burst backlog and one loss/s.
+            for excess in [0u64, 4800] {
+                let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
+                let mut slot = Slot::new().unwrap();
+                let now = Instant::now();
+                if excess == 0 {
+                    slot.end = 480; // Needed for a 5 ms delay every three seconds.
+                }
+                let mut packet = 0;
+                let mut lost = 0;
+                for tick in (0..20 * 48_000u64).step_by(480) {
+                    let at = now + Duration::from_secs_f64(tick as f64 / 48_000.0);
+                    loop {
+                        let scheduled = (packet * frame).saturating_sub(excess);
+                        let jitter = excess == 0 && scheduled > 0 && scheduled.is_multiple_of(3 * 48_000);
+                        let arrival = scheduled + if jitter { 240 } else { 0 };
+                        if arrival > tick {
+                            break;
+                        }
+                        let loss = excess > 0 && scheduled > 0 && scheduled.is_multiple_of(48_000);
+                        if loss {
+                            lost += 1;
+                        } else {
+                            slot.buffer.push_at(
+                                packet * if clock == Clock::Sequence { 960 } else { frame },
+                                frame,
+                                encode_n(&encoder, false, frame as usize),
+                                now + Duration::from_secs_f64(arrival as f64 / 48_000.0),
+                                clock,
+                            );
+                        }
+                        packet += 1;
+                    }
+                    slot.mix_refill(&mut [0.0; 480], 1.0, at, 480).unwrap();
+                }
+                let label = format!("{clock:?}, frame={frame}, excess={excess}");
+                if excess == 0 {
+                    assert_eq!(slot.buffer.shrink_samples, 0, "{label}");
+                    assert_eq!(slot.buffer.concealments, 0, "{label}");
+                } else {
+                    let tail = slot.buffer.depth().1 + slot.staged_samples() as u64;
+                    // Safety plus the minimum 120-sample correction quantum.
+                    assert!(tail <= slot.buffer.target_samples() + 240, "{label}: tail={tail}");
+                    assert!(slot.buffer.shrink_samples >= 4800 - frame - 240, "{label}");
+                    assert_eq!(lost, 19);
+                    assert_eq!(slot.buffer.concealments, lost, "{label}: shrink must not introduce loss");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn fractional_staged_surplus_converges_with_bounded_periodic_corrections() {
         use super::super::jitter::Clock;
         for clock in [Clock::Rtp, Clock::Sequence] {
@@ -571,7 +738,9 @@ mod tests {
                             assert!(total <= excess as u64);
                             assert!(tick >= 5 * 48_000, "correction before the full observation window");
                             if let Some(previous) = last_correction {
-                                assert!(tick - previous >= 5 * 48_000, "corrections less than five seconds apart");
+                                // Historical margins are debited after a cut; another full
+                                // five-second window is no longer required.
+                                assert!(tick - previous >= 24_000, "corrections less than 500 ms apart");
                             }
                             last_correction = Some(tick);
                             corrected = total;
