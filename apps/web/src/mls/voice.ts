@@ -31,6 +31,8 @@ export const ACK_WAIT_MS = 2_000;
 const FUTURE_ACK_EPOCHS = 8, FUTURE_ACK_DEVICES = 1000, FUTURE_ACK_MS = 10_000, FUTURE_ACK_AHEAD = 64n;
 const REPEAT_EVERY_MS = 6_000;
 const RECHECK_MS = 10_000;
+/** The control contract's bound on `removed` per installation. */
+const MAX_REMOVED = 1000;
 
 export type VoiceCallStatus = "securing" | "active" | "failed";
 /** One media run's engine: it applies controls and reports its status. */
@@ -661,6 +663,9 @@ export class VoiceCall {
       if (keys === "blocked" || keys === null) { this.schedule(true, keys === null ? 500 : 5_000); return; }
       if (BigInt(keys.epoch) !== epoch) { this.logDirty = true; this.dirty = true; return; }
       this.gateBlocked = false;
+      // More removals since the last install than one control may carry: this
+      // run's keys are not worth patching; a fresh run starts with none.
+      if (media.removed.size > MAX_REMOVED) { for (const m of keys.members) m.key.fill(0); this.host.restartMedia(); return; }
       const members = keys.members.map(m => ({ leaf: m.leaf, device: m.device, key: encodeBase64Url(new Uint8Array(m.key)) }));
       for (const m of keys.members) m.key.fill(0);
       const result = await this.control(media, { action: "install", epoch: keys.epoch, own_leaf: keys.own_leaf, members, removed: [...media.removed] });

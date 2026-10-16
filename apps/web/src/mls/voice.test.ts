@@ -542,6 +542,22 @@ describe("VoiceCall", () => {
     expect(f.controls[0]).toMatchObject({ action: "hold", removed: [DEVICES.bob] });
   });
 
+  it("starts a fresh run when more removals accumulated than one install may carry", async () => {
+    const f = fixture({ group: true });
+    f.call.start(); await settle(); f.media();
+    f.call.event({ ev: "voice.epoch.ack", d: { call: CALL, group: f.server.group, epoch: 2, device: DEVICES.bob } });
+    await settle();
+    // A long catch-up removed over a thousand devices since the last install.
+    const media = (f.call as unknown as { media: { removed: Set<string> } }).media;
+    for (let i = 0; i < 1001; i++) media.removed.add(b64(i % 250, 32) + i);
+    f.controls.length = 0;
+    f.server.commit([member(0, "bob"), member(1, "self")]);
+    f.call.event({ ev: "mls.commit", d: { group: f.server.group } });
+    await settle();
+    expect(actions(f.controls)).not.toContain("install:3");
+    expect(f.restarts()).toBe(1);
+  });
+
   it("closes without further requests or controls", async () => {
     const f = fixture({ group: true });
     f.call.start(); await settle(); f.media(); await settle();
