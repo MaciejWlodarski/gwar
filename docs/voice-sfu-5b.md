@@ -8,6 +8,152 @@ and cannot start encrypted voice. There is no SFrame dependency, key-install
 path or encrypted-to-plaintext fallback in this PR. Server-side encrypted
 routing is exercised by authenticated test peers, ready for 5c/5d.
 
+## Review fixes on PR 53
+
+Implementation commit: `15b0ece50d71d3f7d0cec36b8f9090be652752d5`.
+This follow-up addresses A1/A2/A3, B1 and C1–C5 from the three 5b reviews.
+The validation and mutation results for this follow-up are recorded below;
+the original implementation and latency measurements remain historical evidence.
+
+- A1: count the active SSRC's impending retirement. Thirty-two total reserved
+  SSRCs exhaust the session even while one is active. The regression replaces
+  all 32 runs, tests successful/failed final negotiation, closes voice on the
+  next offer and verifies that moving back cannot consume a 33rd SSRC.
+- A2: before str0m, parse the fixed RTP header, CSRC count and extension length.
+  The remaining datagram is bounded by the mode's payload cap plus at most
+  16 SRTP tag bytes and, only with P set, 255 RTP padding bytes. The exact
+  authenticated payload cap remains at ingest. `rtp_oversize_datagram` proves
+  early rejection; unit vectors cover extensions, CSRCs and padding, and the
+  real-SRTP probe checks the early counter.
+- A3: `test-hooks` can hold one authenticated, admitted packet before any
+  forwarding. The MLS integration moves out and back, establishes a fresh
+  run, releases the old packet into the production forwarding queue, rejects
+  it and delivers the fresh run's ciphertext.
+- B1: both native sender and plaintext SFU use `vc_proto::opus::packet_samples`.
+  It validates [RFC 6716 §3.2](https://www.rfc-editor.org/rfc/rfc6716.html#section-3.2)
+  codes 0–3, frame length bytes, CBR divisibility, VBR frame
+  boundaries, padding, the 1275-byte frame limit and 120 ms duration before
+  returning samples. Empty frames remain legal; opaque encrypted payloads
+  never enter this validator. Sender and admission tests assert malformed
+  counters; shared vectors cover all packet codes and size boundaries.
+- C1: **the pinned transport does not provide the proposed ordering guarantee**.
+  At tsclientlib `ee3bc6f`, `tsproto/src/connection.rs::send_udp_packet` puts
+  Voice/VoiceWhisper in `acks_to_send` and commands in the resender.
+  `poll_send_acks` breaks on socket Pending, after which `poll_next` still
+  calls `Resender::poll_resend`; commands can overtake pending voice. The codec
+  assigns voice ids independently; voice is not retransmitted. The puppet now
+  uses the same pinned codec and immediate UDP send while its route is checked,
+  dropping on socket pressure. No voice remains in the transport queue to
+  flush after retirement or into a replacement connection. A fake socket
+  regression blocks a write, changes the route interval, resumes polling and
+  requires zero old audio while fresh sends still work. This is a queue-safety
+  test, not a guarantee of UDP network ordering or physical audio acceptance.
+- C2: a refused administrative **remote-user** move reads `clientinfo`, applies
+  the confirmed TS channel to core state and establishes a fresh mirror route.
+  The fake ServerQuery regression proves the old route is retired, the Gwar
+  channel reconciles and the fresh generation authorizes audio again. An
+  unavailable confirmation remains fail-closed.
+- C3: official probes use valid Opus markers and observe voice/whisper callback,
+  classification and admission counts independently. An MLS-authorized SRTP
+  receiver really participates in encrypted voice; the controlled fixture
+  deliberately exposes a TS puppet to that receiver and checks rejection.
+  This is opaque-media boundary coverage, not SFrame interoperability. Probes
+  also cover classification after arrival, a real grace-only puppet before
+  private-chat retention, a held 10 ms tail plus queued end marker, and old
+  listener text held across an actual ServerQuery reconnect. CI enables
+  `test-hooks`; those hooks are absent from default/production builds.
+- C4: cumulative per-marker payload bytes are recorded in the receive callback,
+  before bounded helper queues or unrelated event consumption. Transport command
+  acknowledgements and subsequent positive controls synchronize injection and
+  queue progress; totals are checked again after all phases. No 300 ms absence
+  window is treated as proof. Pure helper tests require late and consumed
+  forbidden payloads to remain counted.
+- C5: each plaintext egress control keeps sending fresh sequence/timestamp
+  packets until delivery or a ten-second deadline. A virtual-time regression
+  delays route readiness for two seconds, beyond the old 400 ms send window.
+
+Official-server execution and mutations of its new probes cannot run locally
+under this task's no-local-TeamSpeak-server rule. The existing official CI job
+now uses `--features test-hooks`; compiling it is not runtime S6 acceptance.
+
+### Follow-up verification
+
+Raw logs and exact command/result records: `target/5b-review/`. Each heavy
+command checked `pgrep -fl 'run_local.py|examples/latency|target/release/examples/latency'`
+first; detected latency work deferred the command, with two-minute polling.
+
+Ten follow-up mutation executions each produced one failing test (exit 101),
+with no compile failure. Every mutation was restored before final checks:
+
+| Finding | Reverted behavior | Exact failing command |
+| --- | --- | --- |
+| A1 | Subtract active run from reserved SSRC count | `cargo test -p vc-server --lib active_replacements_reserve` |
+| A2 | Disable early datagram size rejection | `cargo test -p vc-server --lib early_payload_cap` |
+| A3 | Relabel held packet with the current origin at queued forwarding | `cargo test -p vc-server --features test-hooks --test mls voice_opaque_srtp` |
+| B1 | Restore duration-only parsing | `cargo test -p vc-proto opus::tests::malformed` |
+| B1 | Same parser mutation at plaintext admission | `cargo test -p vc-server --lib malformed_opus_framing` |
+| B1 | Same parser mutation at native sender | `cargo test -p vc-client --lib encoded_sender_bounds` |
+| C1 | Restore tsproto queued audio send | `cargo test -p vc-server --lib pending_transport_audio` |
+| C2 | Remove refused remote-move reconciliation | `cargo test -p vc-server --lib refused_remote_move` |
+| C4 | Suppress cumulative receive-byte accounting | `cargo test -p vc-server --test teamspeak_probe_helpers forbidden_counts` |
+| C5 | Stop sending after 20 packets | `cargo test -p vc-server --test teamspeak_probe_helpers plaintext_control` |
+
+C4/C5 mutations exercise the shared probe helpers without an official server.
+C3's official ingress, grace, tail/end and reconnect probes are compiled here;
+their runtime/mutation execution remains CI acceptance. The separate local
+MLS fixture test proves that the encrypted receiver can actually be admitted.
+
+Focused final checks: server units 165 passed; client units 88 passed/1 ignored;
+shared Opus vectors 2 passed; held-packet MLS integration 1 passed; encrypted
+probe fixture 1 passed; pure probe helpers 2 passed. The official probe with
+`--features test-hooks --no-run` compiles. CI explicitly runs the held-packet
+MLS test as well as the official test with hooks enabled.
+
+During development, the fake remote-move fixture first waited on a deliberately
+suppressed bridge echo, then incorrectly tried a bridge reattachment that removes
+remote sessions; both fixture mistakes were corrected. The early-size integration
+assertion was changed to a counter delta because the preceding 1034-byte AEAD
+packet is also rejected early. Missing test-module/type annotations were corrected
+before the focused final passes. These attempts are not reported as passing checks.
+
+Final verification on macOS arm64, Rust 1.99.0 (Homebrew), pnpm 12.10.1,
+Node 26.11.1; browser commands used the existing Node 22.23.3 binary. These
+checks ran against the implementation file contents committed as `15b0ece`.
+The last changes were limited to the ignored official probe (read its queued
+join event instead of a stale welcome snapshot, and acknowledge final source
+puppet queue progress); formatting, workspace Clippy and both compile-only
+commands passed again afterward.
+
+| Exact command | Result |
+| --- | --- |
+| `cargo fmt --all --check` | Pass |
+| `cargo clippy --workspace --all-targets -- -D warnings` | Pass, no warnings |
+| `cargo test --workspace` | 655 passed, 0 failed, 7 ignored |
+| `cargo test -p vc-server --test teamspeak_channels --no-run` | Pass; compile only |
+| `cargo test -p vc-server --features test-hooks --test teamspeak_channels --no-run` | Pass; compile only |
+| `cargo test -p vc-server --features test-hooks --test mls voice_opaque_srtp` | 1 passed, 0 failed |
+| `cargo test -p vc-server --test media official_probe_fixture` | 1 passed, 0 failed |
+| `cargo test -p vc-server --test teamspeak_probe_helpers` | 2 passed, 0 failed |
+| `cargo test -p vc-server --lib --no-fail-fast` | 165 passed, 0 failed |
+| `cargo test -p vc-client --lib` | 88 passed, 0 failed, 1 ignored |
+| `cargo test -p vc-proto opus -- --nocapture` | 2 passed, 0 failed |
+| `pnpm --filter web typecheck` | Pass |
+| `pnpm --filter web test` | 73 files, 890 passed, 0 failed |
+| `cargo build -p vc-server --no-default-features` | Pass |
+| `cargo build -p gwar-connect -p vc-client --example web_audio` | Pass; browser fixture prerequisites |
+| `PATH=/private/tmp/node-v22.23.3-darwin-arm64/bin:$PATH pnpm e2e` (in `apps/web`) | 65/65 passed |
+| `PATH=/private/tmp/node-v22.23.3-darwin-arm64/bin:$PATH pnpm e2e:native-audio` (in `apps/web`) | Pass; 2 tone/slot-reuse phases |
+
+Native/browser virtual audio received 1008 packets in each phase, zero lost
+packets, zero concealed samples and zero active native underruns. This verifies
+plaintext synthetic I/O, not physical devices or SFrame interoperation. Evidence:
+`target/web-audio/2026-10-16T07-38-54.955Z-18090/`.
+
+Generated screenshots were restored with `git checkout -- apps/web/e2e/screenshots`.
+No tsbuildinfo, test logs, measurements or generated assets are committed.
+No local TeamSpeak server, production service, SSH, stash or push was used.
+The original latency acceptance limitation below is unchanged by these fixes.
+
 ## Implementation map
 
 | Files | Behavior |
@@ -18,7 +164,7 @@ routing is exercised by authenticated test peers, ready for 5c/5d.
 | `crates/vc-server/src/core/{mod,voice}.rs` | Publish mode and exact call/participation/run authority, provide an actor barrier for bridge origin capture, and enforce 32 retired SSRCs even after failed offers or a move with no active run. |
 | `crates/vc-server/src/teamspeak/{bridge,puppet}.rs` | Capture source origin at the receive callback; source and receiving-puppet routes survive every queue. Retire routes before enqueueing moves, on refusal and on replacement. Recheck current bindings, mode and confirmed TS channel at the socket; discard old packetizer tails. Incoming text also carries captured source and receiver routes. |
 | `crates/vc-server/src/teamspeak/listeners.rs` | Distinguish every ServerQuery listener connection generation, including reconnects of the same logical listener; reject old queued text. |
-| `crates/vc-client/src/voice/{mod,rtc}.rs` | Native sender checks encoded duration/1000-byte cap, exposes separate counters, uses capture positions plus a fixed run offset and drops non-increasing positions. Native Gwar remains 480 samples; direct TS remains 960. |
+| `crates/vc-client/src/voice/{mod,rtc}.rs` | Native sender checks complete encoded framing, duration and the 1000-byte cap, exposes separate counters, uses capture positions plus a fixed run offset and drops non-increasing positions. Native Gwar remains 480 samples; direct TS remains 960. |
 | `apps/desktop/src-tauri/src/voice.rs` | Expose sender duration, malformed/oversize and capture-position counters in existing diagnostics. |
 | `crates/vc-server/tests/common/rtc.rs`, `tests/mls.rs` | Real str0m/SRTP fixture and MLS-authorized opaque stream integration, unknown-SSRC churn and live RTCP control. |
 | `crates/vc-server/tests/teamspeak_channels.rs` | Extend the existing ignored official-server permissions test with S6 transport, audio and text probes. No second TS process is started. |
@@ -33,7 +179,7 @@ The browser's SDP is passed unchanged. No web source change was needed.
 
 The clear RTP filter is only a rejection filter; SRTP still authenticates
 accepted packets. STUN, DTLS and SRTCP retain str0m's demultiplexing and
-validation. The fixed-header check reads no payload. Unknown SSRCs cannot
+validation. The clear-header check reads no payload. Unknown SSRCs cannot
 allocate str0m receive streams before rejection. Only one active source has
 ordering state; at most 32 retired SSRCs remain associated with the WebSocket
 session. They are never evicted to admit more streams. A failed negotiation
@@ -88,8 +234,8 @@ The official fixture uses the same checksum-verified server selected by
 that same official TS process. Fixed-origin injection and opaque marker bytes
 exercise S6 boundaries before client SFrame exists; they are not real SFrame
 endpoints. Assertions require zero forbidden payload bytes at egress and no
-received forbidden audio, following working plaintext controls. Tests also
-track forbidden text markers even when another receive helper consumes them.
+received forbidden audio, following working plaintext controls. Receive callbacks now track cumulative forbidden audio bytes and text markers
+even when another helper consumes their events; see the review follow-up above.
 
 ## Mutation checks
 
