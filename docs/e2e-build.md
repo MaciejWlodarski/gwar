@@ -2602,7 +2602,8 @@ gwar managers v1
   - pending and stale reporting, excluding the owner and confirmers.
 - **6c:**
   - extension parsing and the tree rule;
-  - GCE commits: only `0xff01` changes; seqs monotonic; signer authority;
+  - GCE commits: only `0xff01` changes; the list bound to the group; signer
+    authority; seqs checked only against checkpoints;
     removals in the same commit; certificates at commit time; never in an
     external commit;
   - the observer and the agent agree;
