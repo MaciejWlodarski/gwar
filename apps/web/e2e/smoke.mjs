@@ -984,6 +984,41 @@ async function main() {
     await b.keyboard.press("Escape");
   });
 
+  const CREW = `Crew-${rid}`;
+  const PRIVATE = `Private-${rid}`;
+  await check("a private channel for a role is shown to its holders only, live as the role is given and taken away", async () => {
+    await openSettings(a, "Roles");
+    await a.getByRole("button", { name: "Create role" }).click();
+    await a.getByLabel("Role name").fill(CREW);
+    await a.getByRole("button", { name: "Create", exact: true }).click();
+    await a.getByRole("button", { name: CREW }).waitFor();
+    await a.keyboard.press("Escape");
+    await a.getByRole("button", { name: "Server menu" }).click();
+    await a.getByRole("menuitem", { name: "Create channel" }).click();
+    await a.getByLabel("Name").fill(PRIVATE);
+    await a.getByRole("switch", { name: /^Private/ }).click();
+    await a.getByRole("checkbox", { name: CREW }).check();
+    await a.getByRole("button", { name: "Create" }).click();
+    await treeItem(a, PRIVATE).waitFor();
+    await sleep(500);
+    if ((await treeItem(b, PRIVATE).count()) !== 0) throw new Error("Bob sees a private channel without its role");
+    const setCrew = async (on) => {
+      await openSettings(a, "Members");
+      await a.getByLabel("Search members").fill("Bob");
+      await a.getByRole("button", { name: "Change roles of Bob" }).click();
+      await a.getByRole("menuitemcheckbox", { name: CREW }).click();
+      await a.getByRole("menuitemcheckbox", { name: CREW, checked: on }).waitFor();
+      await a.keyboard.press("Escape");
+      await a.keyboard.press("Escape");
+    };
+    await setCrew(true);
+    await treeItem(b, PRIVATE).waitFor();
+    await shot(b, "20b-private-channel-dark");
+    await setCrew(false);
+    await treeItem(b, PRIVATE).waitFor({ state: "detached" });
+    await treeItem(a, PRIVATE).waitFor();
+  });
+
   const hello = `hey @Bob mention ${rid}`;
   await check("mention: autocomplete in the composer, a badge and a highlight for the mentioned user", async () => {
     await treeItem(b, GAMES).click(); // Bob looks at another chat, so Talk counts as unread
@@ -1683,7 +1718,7 @@ async function main() {
   });
 
   await check("test channels are cleaned up", async () => {
-    for (const name of [GAMES, TALK, SECRET, BULK]) {
+    for (const name of [GAMES, TALK, SECRET, BULK, PRIVATE]) {
       await treeItem(a, name).click({ button: "right" });
       await a.getByRole("menuitem", { name: "Delete" }).click();
       await a.getByRole("dialog").getByRole("button", { name: "Delete" }).click();

@@ -32,6 +32,9 @@ jobs:
       - name: Queued encrypted voice
         run: cargo test -p vc-server --features test-hooks --test mls voice_opaque_srtp
       - name: Eight native SFrame senders, alone (nine real-time engines)
+        # Nine devices join one MLS group in a debug build: single frames can take longer than 3 s here.
+        env:
+          VC_TEST_FRAME_TIMEOUT_SECS: "30"
         run: cargo test -p vc-server --test mls native_sframe_receiver_decodes_eight_senders_on_all_slots -- --ignored
       - name: Server without TeamSpeak support
         run: cargo build -p vc-server --no-default-features
