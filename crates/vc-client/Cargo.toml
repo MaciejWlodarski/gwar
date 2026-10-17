@@ -38,6 +38,9 @@ zeroize = "1"
 [dev-dependencies]
 vc-server = { path = "../vc-server" }
 reqwest = { version = "0.13", default-features = false }
+openmls = "=0.9.1"
+openmls_rust_crypto = "=0.6.0"
+gwar-mls = { path = "../gwar-mls" }
 tracing-subscriber.workspace = true
 
 # Microphone permission (TCC) on macOS.

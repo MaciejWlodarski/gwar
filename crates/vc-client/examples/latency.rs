@@ -7,7 +7,11 @@
 //! LATENCY_NET adds a local-only seeded UDP relay; see docs/latency.md.
 //! LATENCY_MIN_MS defaults to 5; below-floor matches fail the run.
 //! LATENCY_EXTRA_DELAY_MS adds a sample delay line to the fake output device.
+//! LATENCY_SFRAME=1 measures an encrypted call (local server only): a real voice
+//! MLS group, exporter keys installed through the engine's key channel, SFrame.
 //! Exits with an error if more than 5% of markers are unmatched.
+#[path = "latency/mls.rs"]
+mod mls;
 #[path = "latency/netem.rs"]
 mod netem;
 
@@ -65,6 +69,8 @@ struct Settings {
     /// Arm markers after both transports connect; keep carrier/impairments running.
     wait_connected: bool,
     warmup_samples: usize,
+    /// Encrypted call with SFrame (`LATENCY_SFRAME=1`).
+    sframe: bool,
 }
 impl Settings {
     fn from_env() -> anyhow::Result<Self> {
@@ -103,7 +109,13 @@ impl Settings {
             Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!("LATENCY_WARMUP_MS must be valid UTF-8"),
         };
         let warmup_samples = warmup_samples(warmup.as_deref())?;
-        Ok(Self { minimum_ms, extra_delay_ms, callback_jitter, wait_connected, warmup_samples })
+        let sframe = match std::env::var("LATENCY_SFRAME") {
+            Ok(value) if value == "1" => true,
+            Ok(value) if value == "0" => false,
+            Err(std::env::VarError::NotPresent) => false,
+            _ => anyhow::bail!("LATENCY_SFRAME must be 0 or 1"),
+        };
+        Ok(Self { minimum_ms, extra_delay_ms, callback_jitter, wait_connected, warmup_samples, sframe })
     }
 }
 
@@ -355,6 +367,38 @@ impl AudioIo for FakeIo {
         Ok(AudioPorts { mic, speaker, output, _guard: Box::new(Guard { stop, thread: Some(thread) }) })
     }
 }
+/// Starts an encrypted native run; the offer names the call's voice group.
+async fn encrypted_start(
+    client: &vc_client::Connected,
+    state: &serde_json::Value,
+    io: Box<FakeIo>,
+    server: std::net::SocketAddr,
+) -> anyhow::Result<(voice::VoiceHandle, serde_json::Value)> {
+    const RUN: u64 = 1;
+    let binding = serde_json::json!({
+        "server_key": client.connection.server_key, "session": client.welcome.session, "channel": state["channel"],
+        "call": state["call"], "participation": state["participation"], "run": RUN, "group": state["group"],
+    });
+    let start = voice::keys::EncryptedStart {
+        binding: voice::sframe::Binding::parse(&binding).context("binding")?,
+        resume_after: None,
+    };
+    let connection = client.connection.clone();
+    let offer = state.clone();
+    let signal = move |sdp: String| async move {
+        let ssrc: u32 = sdp
+            .lines()
+            .find_map(|l| l.strip_prefix("a=ssrc:").and_then(|s| s.split_whitespace().next()?.parse().ok()))
+            .context("offer without microphone SSRC")?;
+        let request: vc_proto::Request = serde_json::from_value(serde_json::json!({ "op": "voice.offer", "d": {
+            "channel": offer["channel"], "call": offer["call"], "participation": offer["participation"],
+            "run": RUN, "group": offer["group"], "ssrc": ssrc, "sdp": sdp } }))?;
+        let answer = connection.request(request).await?;
+        answer["sdp"].as_str().map(str::to_owned).context("answer without sdp")
+    };
+    Ok((voice::start_encrypted(io, server.ip(), signal, start).await?, binding))
+}
+
 fn options(url: &str, name: &str) -> ConnectOptions {
     ConnectOptions {
         url: url.into(),
@@ -451,7 +495,8 @@ async fn measure(
     net: Option<netem::Spec>,
 ) -> anyhow::Result<()> {
     if let Some((url, addr)) = remote {
-        return run(output, count, &url, addr, settings, None).await;
+        anyhow::ensure!(!settings.sframe, "LATENCY_SFRAME needs the fresh local server");
+        return run(output, count, &url, addr, settings, None, None).await;
     }
     // Keep transient server files beside the output, and never reuse state.
     let data_path = PathBuf::from(format!("{output}.data-{}", std::process::id()));
@@ -495,7 +540,8 @@ async fn measure(
     tasks.tasks = server.tasks;
     tasks.data_dir = Some(data);
     let net = relay.zip(net).map(|(relay, spec)| (relay, spec, server.media_bind));
-    let result = run(output, count, &url, server.media, settings, net).await;
+    let admin = server.admin_token.clone().map(|token| (server.http, token));
+    let result = run(output, count, &url, server.media, settings, net, admin).await;
     drop(server.core);
     drop(server.plane);
     tasks.shutdown().await;
@@ -509,13 +555,27 @@ async fn run(
     server_addr: std::net::SocketAddr,
     settings: Settings,
     mut net: Option<(netem::Relay, netem::Spec, std::net::SocketAddr)>,
+    admin: Option<(std::net::SocketAddr, String)>,
 ) -> anyhow::Result<()> {
     let url = url.to_string();
-    let a = connect(options(&url, "latency sender")).await?;
-    let mut b = connect(options(&url, "latency receiver")).await?;
-    for client in [&a, &b] {
-        client.connection.join(client.welcome.server.default_channel, None).await?;
-    }
+    let (mut sender, mut receiver) = (mls::Device::new(), mls::Device::new());
+    let with = |options: ConnectOptions, device: &mls::Device| {
+        if !settings.sframe {
+            return options;
+        }
+        ConnectOptions { identity: device.identity.clone(), certificate: Some(device.certificate.clone()), ..options }
+    };
+    let a = connect(with(options(&url, "latency sender"), &sender)).await?;
+    let mut b = connect(with(options(&url, "latency receiver"), &receiver)).await?;
+    let calls = if settings.sframe {
+        let (http, token) = admin.context("LATENCY_SFRAME needs the local server's admin token")?;
+        Some(mls::encrypted_call(http, &token, (&a, &mut sender), (&b, &mut receiver)).await?)
+    } else {
+        for client in [&a, &b] {
+            client.connection.join(client.welcome.server.default_channel, None).await?;
+        }
+        None
+    };
     let epoch = Instant::now();
     let media_addr = if let Some((relay, spec, server)) = &mut net {
         relay.start(*server, spec.clone(), epoch);
@@ -527,38 +587,33 @@ async fn run(
     let markers_ready = Arc::new(AtomicBool::new(!settings.wait_connected));
     let sent = Arc::new(Mutex::new(Measurements::default()));
     let heard = Arc::new(Mutex::new(Measurements::default()));
-    let va = voice::start(
-        &a.connection,
+    let io = |data: &Arc<Mutex<Measurements>>, tone: bool, delay_samples: usize, callback_jitter: bool| {
         Box::new(FakeIo {
             markers_ready: markers_ready.clone(),
-            data: sent.clone(),
-            tone: true,
+            data: data.clone(),
+            tone,
             epoch,
             stop: Arc::new(AtomicBool::new(false)),
             count,
-            delay_samples: 0,
-            callback_jitter: false,
+            delay_samples,
+            callback_jitter,
             warmup_samples: settings.warmup_samples,
-        }),
-        media_addr,
-    )
-    .await?;
-    let vb = voice::start(
-        &b.connection,
-        Box::new(FakeIo {
-            markers_ready: markers_ready.clone(),
-            data: heard.clone(),
-            tone: false,
-            epoch,
-            stop: Arc::new(AtomicBool::new(false)),
-            count,
-            delay_samples: settings.extra_delay_ms * RATE / 1000,
-            callback_jitter: settings.callback_jitter,
-            warmup_samples: settings.warmup_samples,
-        }),
-        media_addr,
-    )
-    .await?;
+        })
+    };
+    let receiver_io = io(&heard, false, settings.extra_delay_ms * RATE / 1000, settings.callback_jitter);
+    let (va, vb) = match &calls {
+        None => (
+            voice::start(&a.connection, io(&sent, true, 0, false), media_addr).await?,
+            voice::start(&b.connection, receiver_io, media_addr).await?,
+        ),
+        Some((a_state, b_state)) => {
+            let (va, a_binding) = encrypted_start(&a, a_state, io(&sent, true, 0, false), media_addr).await?;
+            let (vb, b_binding) = encrypted_start(&b, b_state, receiver_io, media_addr).await?;
+            mls::activate(va.keys().context("sender keys")?, &sender, &a_binding).await?;
+            mls::activate(vb.keys().context("receiver keys")?, &receiver, &b_binding).await?;
+            (va, vb)
+        }
+    };
     let connected_s = if settings.wait_connected {
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
@@ -585,6 +640,7 @@ async fn run(
     ))
     .await;
     let receiver_stats = vb.stats();
+    let crypto = vb.keys().map(|keys| keys.counters());
     println!("sender={:?} receiver={receiver_stats:?}", va.stats());
     let mut voice_events = Vec::new();
     while let Ok(event) = b.events.try_recv() {
@@ -653,7 +709,7 @@ async fn run(
             })
         })
         .collect::<Vec<_>>();
-    let metadata = serde_json::json!({
+    let mut metadata = serde_json::json!({
         "network": network,
         "wait_connected": settings.wait_connected,
         "connected_s": connected_s,
@@ -703,6 +759,8 @@ async fn run(
         "marker_interval_samples": PERIOD,
         "warmup_samples": settings.warmup_samples,
     });
+    metadata["sframe"] = serde_json::json!(settings.sframe);
+    metadata["receiver_sframe"] = serde_json::to_value(crypto)?;
     std::fs::write(format!("{output}.json"), serde_json::to_string_pretty(&metadata)?)?;
     anyhow::ensure!(
         matching.rejected.is_empty(),
