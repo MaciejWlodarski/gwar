@@ -35,6 +35,11 @@ export function usePermission(p: Permission): boolean {
   return useSession((s) => s.permissions.includes(p));
 }
 
+/** The server's owner and the managers of private channels as this device verified them (6b). */
+export function useOwnerView(): import("../mls/types").OwnerView | null {
+  return useSyncExternalStore(controller.onRoster.bind(controller), () => controller.ownerView());
+}
+
 const NO_GROUPS: readonly number[] = [];
 
 /** The roles of my own session. */

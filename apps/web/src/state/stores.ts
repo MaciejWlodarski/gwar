@@ -94,7 +94,7 @@ export interface Toast {
 }
 
 export type SettingsTab = "audio" | "notifications" | "appearance" | "identity" | "account" | "language";
-export type ServerSettingsTab = "overview" | "roles" | "members" | "cleanup" | "bans" | "invites";
+export type ServerSettingsTab = "overview" | "roles" | "members" | "ownership" | "cleanup" | "bans" | "invites";
 
 /** Whom a moderation dialog is about: an online session and/or a known member. */
 export interface PersonRef {

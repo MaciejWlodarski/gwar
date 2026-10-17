@@ -2,7 +2,7 @@ import { attachment as attachmentSchema } from "../net/schema";
 import { SealedConversations, type SealedKey } from "./sealed";
 import type { MlsRuntime } from "../mls/runtime";
 import type { VoiceCall } from "../mls/voice";
-import type { Roster } from "../mls/types";
+import type { OwnerView, Roster } from "../mls/types";
 import { messageStorage, refreshRevocations } from "../net/message-storage";
 import { conversationThread, sealedThread, threadConversation } from "../lib/chat";
 import { messageTarget } from "../lib/chat";
@@ -1078,9 +1078,108 @@ class Controller {
     const uid = useSession.getState().me?.uid;
     return uid && this.runtime ? this.runtime.roster(threadConversation(thread, uid)) : null;
   }
+  /** The server's owner and the managers of private channels as this device verified them (6b). */
+  ownerView(): OwnerView | null { return this.runtime?.ownerView() ?? null; }
+
+  /** True when this identity signs owner statements with a Gwar Connect account (needs the password). */
+  ownerSigningNeedsPassword(): boolean { return !!(this.conn instanceof Connection && this.conn.identity.device); }
+
+  /** Signs a statement with the account key: the local identity's own key, or the Connect account's. */
+  private async signAsAccount(statement: string, password?: string): Promise<{ accountKey: string; signature: string }> {
+    const conn = this.conn;
+    if (!(conn instanceof Connection)) throw new Error("not connected to a Gwar server");
+    if (conn.identity.device) {
+      if (!password) throw new Error("the password is needed");
+      const { accountActions } = await import("./account");
+      return accountActions.signStatement(statement, password);
+    }
+    return { accountKey: accountKeyOf(conn.identity), signature: await conn.identity.sign(new TextEncoder().encode(statement)) };
+  }
+
+  /**
+   * The owner names the confirmers (who may maintain the manager list): signs a new anchor with the
+   * account key and a list under it with the managers that remain (docs/e2e-build.md, section 6).
+   */
+  async setConfirmers(confirmers: string[], password?: string, managers?: string[]): Promise<void> {
+    const runtime = this.runtime;
+    if (!runtime) throw new Error("encryption is not ready");
+    const statement = await runtime.nextAnchor(confirmers);
+    const { accountKey, signature } = await this.signAsAccount(statement, password);
+    const { anchorEnvelope } = await import("../mls/wasm");
+    const anchor = await anchorEnvelope(statement, accountKey, signature);
+    const keep = (managers ?? runtime.ownerView()?.managers ?? []).filter((m) => !confirmers.includes(m));
+    await runtime.publishManagers(keep, anchor);
+  }
+
+  /** The owner or a confirmer sets the plain managers. The first list needs the owner's anchor. */
+  async setManagers(managers: string[], password?: string): Promise<void> {
+    const runtime = this.runtime;
+    if (!runtime) throw new Error("encryption is not ready");
+    if (useSession.getState().managers?.anchor) await runtime.publishManagers(managers);
+    else await this.setConfirmers([], password, managers);
+  }
+
+  /** Moves ownership to another member, signed with the owner's account key. */
+  async transferOwnership(newOwner: string, password?: string): Promise<void> {
+    const runtime = this.runtime, conn = this.conn;
+    if (!runtime || !(conn instanceof Connection)) throw new Error("encryption is not ready");
+    let accountKey = accountKeyOf(conn.identity);
+    if (conn.identity.device) {
+      const { useAccount } = await import("./account");
+      accountKey = useAccount.getState().account?.accountKey ?? accountKey;
+    }
+    const statement = await runtime.transferStatement(accountKey, newOwner);
+    const { signature } = await this.signAsAccount(statement, password);
+    await runtime.transferOwnership(statement, signature);
+  }
+
   /** Calls back when a conversation's readers may have changed. */
   onRoster(listener: () => void): () => void { this.rosterListeners.add(listener); return () => this.rosterListeners.delete(listener); }
-  private rosterChanged = (): void => { for (const listener of this.rosterListeners) listener(); };
+  private rosterChanged = (): void => {
+    for (const listener of this.rosterListeners) listener();
+    this.maintainManagers();
+  };
+
+  /** Uids this session gave roles to: added as managers without a prompt when they become pending. */
+  private grantedByMe = new Set<string>();
+  /** Pending managers already asked about in this session. */
+  private askedManagers = new Set<string>();
+  private maintaining: Promise<void> | null = null;
+
+  /**
+   * The owner's and confirmers' clients keep the manager list mirroring `channel_edit`
+   * (docs/e2e-build.md, section 6, "Who signs" and "Renewal"): stale managers go, people I gave the
+   * role join, others after "Allow @name to manage private channels?", and an old list is re-signed.
+   */
+  private maintainManagers(): void {
+    const runtime = this.runtime, view = runtime?.ownerView(), state = useSession.getState();
+    const me = state.me?.uid, server = state.managers;
+    if (!runtime || !view || !me || !server?.anchor || this.maintaining) return;
+    if (view.owner !== me && !view.confirmers.includes(me)) return;
+    const stale = view.managers.filter((m) => server.stale.includes(m));
+    const mine = server.pending.filter((u) => this.grantedByMe.has(u));
+    const now = Date.now();
+    const old = view.list_signed_at !== null && now - view.list_signed_at > 60 * 86_400_000;
+    const expiring = view.list_signer_expires_at !== null && view.list_signer_expires_at - now < 7 * 86_400_000;
+    if (stale.length || mine.length || old || expiring) {
+      const next = [...view.managers.filter((m) => !stale.includes(m)), ...mine];
+      this.maintaining = runtime.publishManagers(next).catch((error) => console.warn("Manager list:", error)).finally(() => { this.maintaining = null; });
+      return;
+    }
+    for (const uid of server.pending) {
+      if (this.askedManagers.has(uid)) continue;
+      this.askedManagers.add(uid);
+      const name = state.members[uid]?.nickname ?? uid;
+      useUi.getState().openDialog({
+        kind: "confirm", title: tNow("own.allowTitle"), body: tNow("own.allowBody", { name }), confirmLabel: tNow("own.allow"),
+        onConfirm: () => {
+          const current = this.runtime?.ownerView()?.managers ?? [];
+          void this.runtime?.publishManagers([...current, uid]).catch((error) => useUi.getState().toast("error", String(error)));
+        },
+      });
+      return;
+    }
+  }
 
   /** Encrypted threads on screen: the open chat and the channel I am looking at. */
   private sealedOnScreen(s: SessionSnapshot): SealedKey[] {
@@ -1128,6 +1227,8 @@ class Controller {
   }
 
   setMemberGroups(uid: string, groups: number[]) {
+    // Whoever I give `channel_edit` becomes a manager without asking me again (6b).
+    this.grantedByMe.add(uid);
     return this.connection.request("member.groups", { uid, groups });
   }
 
