@@ -276,6 +276,19 @@ wire! {
         /// Defaults to true; only for encrypted channels.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub history: Option<bool>,
+        /// Hidden from everyone it does not admit (docs/e2e-build.md, section 6); fixed at creation.
+        #[serde(default)]
+        pub private: bool,
+        /// Who a private channel admits; defaults to the creator.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub access: Option<ChannelAccess>,
+    }
+
+    /// Who a private channel admits besides admins: members of these roles and these users.
+    #[derive(Default, Eq)]
+    pub struct ChannelAccess {
+        pub roles: Vec<GroupId>,
+        pub users: Vec<Uid>,
     }
 
     /// Absent fields stay unchanged. `password: ""` removes the password,
@@ -299,6 +312,9 @@ wire! {
         /// Sort key among siblings; lower comes first.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub position: Option<i32>,
+        /// Replaces a private channel's access (needs `channel_edit`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub access: Option<ChannelAccess>,
     }
 
     /// Absent fields stay unchanged; `password: ""` removes the server password.
@@ -483,6 +499,9 @@ wire! {
         ChannelUpdated(Channel),
         #[serde(rename = "channel.deleted")]
         ChannelDeleted { channel: ChannelId },
+        /// This session is no longer admitted to a private channel; it still exists.
+        #[serde(rename = "channel.hidden")]
+        ChannelHidden { channel: ChannelId },
         #[serde(rename = "client.joined")]
         ClientJoined(Client),
         #[serde(rename = "client.updated")]
@@ -656,6 +675,12 @@ wire! {
         /// New members see earlier messages; for display only, clients trust the group's descriptor.
         #[serde(default)]
         pub history: bool,
+        /// Hidden from everyone it does not admit; fixed at creation.
+        #[serde(default)]
+        pub private: bool,
+        /// A private channel's access, sent only to sessions it admits.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub access: Option<ChannelAccess>,
     }
 
     pub struct Client {

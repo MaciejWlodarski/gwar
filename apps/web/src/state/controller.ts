@@ -569,6 +569,9 @@ class Controller {
           if (this.conn !== conn || epoch !== useSession.getState().epoch || key !== conn.serverKey) return;
           const result = await this.verifyIncoming(event.d);
           if (this.conn !== conn || epoch !== useSession.getState().epoch || key !== conn.serverKey) return;
+          // A channel hidden meanwhile keeps nothing: not the message, not its notification.
+          const target = event.d.target;
+          if (typeof target === "object" && "channel" in target && !useSession.getState().channels[target.channel]) return;
           const existing = Object.values(useSession.getState().threads).flatMap((t) => t.items).find((i) => i.kind === "msg" && !i.sealed && i.msg.id === event.d.id);
           // Only an authentic row is protected; a forged first claim must not keep out the genuine message.
           if ((existing?.kind === "msg" && existing.authentic && (result.status !== "verified" || !sameMessageIdentity(existing.msg, event.d))) || result.continuity === "rollback" || result.continuity === "fork") {
@@ -589,9 +592,17 @@ class Controller {
         if (event.d.reason === "transport_failed") this.scheduleVoiceRetry(1000);
         else void this.stopVoice();
       }
-      if (event.ev === "channel.deleted") {
-        const ui = useUi.getState();
-        if (ui.dialog.kind === "channelEdit" && ui.dialog.mode === "edit" && ui.dialog.channel === event.d.channel) ui.closeDialog();
+      if (event.ev === "channel.deleted" || event.ev === "channel.hidden") {
+        const ui = useUi.getState(), ch = event.d.channel, state = useSession.getState();
+        if (ui.dialog.kind === "channelEdit" && ui.dialog.mode === "edit" && ui.dialog.channel === ch) ui.closeDialog();
+        // An image from a channel that is gone (its messages were dropped) is no longer shown.
+        if (ui.dialog.kind === "lightbox" && !ui.dialog.attachment.sealed) {
+          const id = ui.dialog.attachment.id;
+          const shown = Object.values(state.threads).some((t) => t.items.some((i) => i.kind === "msg" && !i.sealed && (i.msg.attachments ?? []).some((a) => a.id === id)));
+          if (!shown) ui.closeDialog();
+        }
+        // Shown again later, its history loads again.
+        for (const inVoice of [true, false]) this.historyRequested.delete(`${state.epoch}:${ch}:${inVoice}`);
       }
     });
     conn.onStatus((status: ConnectionStatus) => {

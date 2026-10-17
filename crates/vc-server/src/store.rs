@@ -45,6 +45,10 @@ pub struct ChannelRow {
     pub encrypted: bool,
     /// New members see earlier messages; always false for plaintext channels.
     pub history: bool,
+    /// Hidden from everyone it does not admit (docs/e2e-build.md, section 6).
+    pub private: bool,
+    /// Who a private channel admits besides admins; `None` for public channels.
+    pub access: Option<vc_proto::ChannelAccess>,
 }
 
 #[derive(Debug, Clone)]
@@ -340,7 +344,16 @@ const MIGRATIONS: &[&str] = &[
     INSERT INTO meta(key,value) SELECT 'server_chat','plaintext'
     WHERE EXISTS(SELECT 1 FROM channels) OR EXISTS(SELECT 1 FROM users);
     "#,
+    // Private channels: hidden from everyone their access (JSON roles and users) does not admit.
+    r#"
+    ALTER TABLE channels ADD COLUMN private INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE channels ADD COLUMN access TEXT;
+    "#,
 ];
+
+fn access_json(row: &ChannelRow) -> Result<Option<String>> {
+    Ok(row.access.as_ref().map(serde_json::to_string).transpose()?)
+}
 
 /// References reassigned by a member merge (including ones already held by the target).
 #[derive(Debug, Default)]
@@ -446,6 +459,8 @@ impl Store {
                     max_clients: None,
                     encrypted: false,
                     history: false,
+                    private: false,
+                    access: None,
                 })
             };
             let lobby = channel("Lobby", 0)?;
@@ -500,7 +515,7 @@ impl Store {
 
     pub fn channels(&self) -> Result<Vec<ChannelRow>> {
         let mut stmt = self.db.prepare(
-            "SELECT id,parent,name,topic,position,password_hash,max_clients,encrypted,history FROM channels ORDER BY position,id",
+            "SELECT id,parent,name,topic,position,password_hash,max_clients,encrypted,history,private,access FROM channels ORDER BY position,id",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(ChannelRow {
@@ -513,6 +528,10 @@ impl Store {
                 max_clients: r.get(6)?,
                 encrypted: r.get(7)?,
                 history: r.get(8)?,
+                private: r.get(9)?,
+                access: r.get::<_, Option<String>>(10)?.map(|json| serde_json::from_str(&json)).transpose().map_err(
+                    |e| rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e)),
+                )?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -551,6 +570,8 @@ impl Store {
             max_clients,
             encrypted: false,
             history: false,
+            private: false,
+            access: None,
         })
     }
 
@@ -558,16 +579,16 @@ impl Store {
     pub fn create_channel(&self, row: &ChannelRow) -> Result<ChannelId> {
         let id = self.next_id("channel_counter")?;
         self.db.execute(
-            "INSERT INTO channels(id,parent,name,topic,position,password_hash,max_clients,encrypted,history) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-            params![id, row.parent, row.name, row.topic, row.position, row.password_hash, row.max_clients, row.encrypted, row.history && row.encrypted],
+            "INSERT INTO channels(id,parent,name,topic,position,password_hash,max_clients,encrypted,history,private,access) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![id, row.parent, row.name, row.topic, row.position, row.password_hash, row.max_clients, row.encrypted, row.history && row.encrypted, row.private, access_json(row)?],
         )?;
         Ok(id)
     }
 
     pub fn update_channel(&self, row: &ChannelRow) -> Result<()> {
         self.db.execute(
-            "UPDATE channels SET parent=?2,name=?3,topic=?4,position=?5,password_hash=?6,max_clients=?7 WHERE id=?1",
-            params![row.id, row.parent, row.name, row.topic, row.position, row.password_hash, row.max_clients],
+            "UPDATE channels SET parent=?2,name=?3,topic=?4,position=?5,password_hash=?6,max_clients=?7,access=?8 WHERE id=?1",
+            params![row.id, row.parent, row.name, row.topic, row.position, row.password_hash, row.max_clients, access_json(row)?],
         )?;
         Ok(())
     }

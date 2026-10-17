@@ -4,6 +4,9 @@ import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { useT } from "../i18n";
 import { RequestError } from "../net/connection";
 import type { Channel } from "../proto/Channel";
+import type { ChannelAccess } from "../proto/ChannelAccess";
+import { AccessPicker } from "./ChannelAccess";
+import { rebaseAccess, sameAccess } from "../lib/access";
 import { controller, describeRequestError } from "../state/controller";
 import { sortedChannels } from "../state/reducer";
 import { isDesktop } from "../platform";
@@ -18,7 +21,8 @@ import { Lightbox } from "./Attachments";
 import { InvitesDialog, ServerSettingsDialog } from "./ServerSettings";
 import { FirstRunDialog } from "./TeamspeakFound";
 import { IdentityPicker } from "./IdentityPicker";
-import { useMemberName, useTsIdentities } from "./hooks";
+import { useMemberName, useMyGroups, useTsIdentities } from "./hooks";
+import { canGiveGroup } from "../lib/permissions";
 import { resolveIdentity } from "../connect/ts-list";
 
 export function Dialogs() {
@@ -234,8 +238,15 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
   const offerEncryption = useSession((s) => s.kind === "vc") && props.mode === "create";
   const [encrypted, setEncrypted] = useState(() => useSettings.getState().channelEncryption[serverKey] ?? false);
   const [history, setHistory] = useState(true);
+  // A private channel is hidden from everyone its access does not admit (fixed at creation).
+  const me = useSession((s) => s.me?.uid ?? "");
+  const [privateChannel, setPrivateChannel] = useState(false);
+  const isPrivate = props.mode === "create" ? privateChannel : !!existing?.private;
+  const [access, setAccess] = useState<ChannelAccess>(() => existing?.access ?? { roles: [], users: me ? [me] : [] });
+  // What the dialog opened with: saving sends only the changes made here, on top of the current access.
+  const [openedAccess] = useState(access);
   // An encrypted channel has no password: its messages are readable only by its group anyway.
-  const sealedChannel = offerEncryption ? encrypted : !!existing?.encrypted;
+  const sealedChannel = (offerEncryption ? encrypted && !privateChannel : !!existing?.encrypted) || isPrivate;
 
   useEffect(() => {
     if (props.mode === "edit" && !existing) close();
@@ -246,7 +257,8 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
     const blocked = props.mode === "edit" ? descendants(all, props.channel) : new Set<number>();
     return [
       { value: NONE, label: t("channel.noParent") },
-      ...all.filter((c) => !blocked.has(c.id)).map((c) => ({ value: String(c.id), label: c.name })),
+      // A private channel has no child channels.
+      ...all.filter((c) => !blocked.has(c.id) && !c.private).map((c) => ({ value: String(c.id), label: c.name })),
     ];
   }, [channels, props, t]);
 
@@ -269,7 +281,8 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
           topic: topic.trim() || null,
           password: sealedChannel ? null : password || null,
           max_clients: max,
-          ...(offerEncryption && encrypted ? { encrypted: true, history } : {}),
+          ...(offerEncryption && encrypted && !privateChannel ? { encrypted: true, history } : {}),
+          ...(privateChannel ? { private: true, access } : {}),
         });
         if (offerEncryption) useSettings.getState().setChannelEncryption(serverKey, encrypted);
       } else if (existing) {
@@ -283,6 +296,7 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
           // 0 removes the limit (protocol rule for channel.update).
           ...(max !== (existing.max_clients ?? null) ? { max_clients: max ?? 0 } : {}),
           ...(parentChanged ? (parentId === null ? { move_to_root: true } : { parent: parentId }) : {}),
+          ...(existing.private && !sameAccess(openedAccess, access) ? { access: rebaseAccess(openedAccess, access, existing.access) } : {}),
         });
       }
       close();
@@ -340,6 +354,10 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
           </Field>
         </div>
         {offerEncryption && (
+          <Switch checked={privateChannel} onCheckedChange={setPrivateChannel} label={t("channel.private")} description={t("channel.privateHint")} />
+        )}
+        {isPrivate && <AccessPicker value={access} onChange={setAccess} />}
+        {offerEncryption && !privateChannel && (
           <div className="flex flex-col gap-1">
             <Switch checked={encrypted} onCheckedChange={setEncrypted} label={t("channel.encrypted")} description={t("channel.encryptedHint")} />
             {encrypted && <Switch checked={history} onCheckedChange={setHistory} label={t("channel.history")} description={t("channel.historyHint")} />}
@@ -517,11 +535,9 @@ function CreateTokenDialog() {
   const close = useClose();
   const groups = useSession((s) => s.groups);
   const permissions = useSession((s) => s.permissions);
-  // A token can only grant what its creator already has.
-  const eligible = useMemo(
-    () => Object.values(groups).filter((g) => g.permissions.every((p) => permissions.includes(p))),
-    [groups, permissions],
-  );
+  const myGroups = useMyGroups();
+  // A token can only grant a role its creator holds, within their permissions.
+  const eligible = useMemo(() => Object.values(groups).filter((g) => canGiveGroup(permissions, myGroups, g)), [groups, permissions, myGroups]);
   const [group, setGroup] = useState(String(eligible.find((g) => g.permissions.length > 0)?.id ?? eligible[0]?.id ?? ""));
   const [token, setToken] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);

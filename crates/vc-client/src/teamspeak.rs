@@ -310,6 +310,8 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>, previous: &View)
                     },
                     encrypted: false,
                     history: false,
+                    private: false,
+                    access: None,
                 },
             );
             previous = c.id.0;

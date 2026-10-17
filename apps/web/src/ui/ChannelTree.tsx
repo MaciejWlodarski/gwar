@@ -1,6 +1,7 @@
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import {
   ChevronRight,
+  EyeOff,
   Hash,
   HeadphoneOff,
   Headphones,
@@ -183,6 +184,7 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
           <span className="min-w-0 flex-1 truncate">{channel.name}</span>
           {current && <span className="sr-only">({t("tree.inVoice")})</span>}
           {channel.has_password && <Lock aria-label={t("tree.locked")} className="size-3.5 shrink-0 text-subtle" />}
+          {channel.private && <EyeOff aria-label={t("tree.private")} className="size-3.5 shrink-0 text-subtle" />}
           {(count > 0 || channel.max_clients) && !collapsed && (
             <span className="shrink-0 text-xs tabular-nums text-subtle">
               {channel.max_clients ? `${count}/${channel.max_clients}` : count}

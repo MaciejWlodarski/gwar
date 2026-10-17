@@ -35,6 +35,13 @@ export function usePermission(p: Permission): boolean {
   return useSession((s) => s.permissions.includes(p));
 }
 
+const NO_GROUPS: readonly number[] = [];
+
+/** The roles of my own session. */
+export function useMyGroups(): readonly number[] {
+  return useSession((s) => (s.me ? s.clients[s.me.session]?.groups : undefined) ?? NO_GROUPS);
+}
+
 /** Name colour from the highest role with a colour (undefined: default text). */
 export function useGroupsColor(groupIds: readonly number[]): string | undefined {
   return useSession((s) => nameColor(groupIds, s.groups));

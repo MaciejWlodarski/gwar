@@ -73,7 +73,8 @@ impl Core {
         let Some(groups) = self.store.groups_of(uid)? else { return Ok(false) };
         let theirs = self.group_permissions(&groups);
         let granted = group.map(|g| self.group_permissions(&[g])).unwrap_or_default();
-        Ok(theirs.contains(&kind) && granted.is_subset(&theirs))
+        let delegates = group.is_none_or(|g| Self::may_delegate(&groups, &[g]));
+        Ok(theirs.contains(&kind) && granted.is_subset(&theirs) && delegates)
     }
 
     /// Whether everything `permissions` allows is also allowed to `session`.
@@ -146,8 +147,13 @@ impl Core {
         if !self.covers(session, &group.permissions.iter().copied().collect()) {
             return Err(err(ErrorCode::Forbidden, "this group has permissions you do not have"));
         }
+        // Deleting a role takes it away from everyone, so it follows the rule for taking it away.
+        if !Self::may_delegate(&self.sessions[&session].groups, &[id]) {
+            return Err(err(ErrorCode::Forbidden, "you can only give out or take away roles you hold"));
+        }
         self.store.delete_group(id).map_err(storage_error)?;
         self.groups.remove(&id);
+        let before = self.admissions();
         let affected: Vec<_> = self.sessions.values().filter(|s| s.groups.contains(&id)).map(|s| s.id).collect();
         for s in affected {
             if let Some(session) = self.sessions.get_mut(&s) {
@@ -155,7 +161,25 @@ impl Core {
             }
             self.client_updated(s);
         }
+        // Private channels stop listing the deleted role.
+        let listing: Vec<_> = self
+            .channels
+            .values()
+            .filter(|c| c.access.as_ref().is_some_and(|a| a.roles.contains(&id)))
+            .map(|c| c.id)
+            .collect();
+        for channel in listing {
+            let mut row = self.channels[&channel].clone();
+            if let Some(access) = row.access.as_mut() {
+                access.roles.retain(|r| *r != id);
+            }
+            self.store.update_channel(&row).map_err(storage_error)?;
+            let view = super::channel_view(&row);
+            self.channels.insert(channel, row);
+            self.broadcast_channel(Event::ChannelUpdated(view));
+        }
         self.broadcast(Event::GroupDeleted { group: id }, |_| true);
+        self.reconcile_admissions(before);
         Ok(Response::Empty {})
     }
 
@@ -185,11 +209,15 @@ impl Core {
         if !self.covers(session, &self.group_permissions(&changed)) {
             return Err(err(ErrorCode::Forbidden, "cannot grant or remove permissions you do not have"));
         }
+        if !Self::may_delegate(&me.groups, &changed) {
+            return Err(err(ErrorCode::Forbidden, "you can only give out or take away roles you hold"));
+        }
         if me.uid == uid && member.groups.contains(&ADMIN_GROUP) && !wanted.contains(&ADMIN_GROUP) {
             return Err(err(ErrorCode::BadRequest, "you cannot remove your own Admin group"));
         }
         self.store.set_user_groups(user_id, &wanted).map_err(storage_error)?;
         member.groups = wanted.clone();
+        let before = self.admissions();
         let online: Vec<_> = self.sessions.values().filter(|s| s.user_id == user_id).map(|s| s.id).collect();
         for s in online {
             if let Some(session) = self.sessions.get_mut(&s) {
@@ -198,6 +226,7 @@ impl Core {
             self.client_updated(s);
         }
         self.broadcast(Event::MemberUpdated(member), |_| true);
+        self.reconcile_admissions(before);
         Ok(Response::Groups { groups: wanted })
     }
 
@@ -415,6 +444,9 @@ impl Core {
             if !self.covers(session, &g.permissions.iter().copied().collect()) {
                 return Err(err(ErrorCode::Forbidden, "cannot grant permissions you do not have"));
             }
+            if !Self::may_delegate(&self.sessions[&session].groups, &[group]) {
+                return Err(err(ErrorCode::Forbidden, "you can only give out roles you hold"));
+            }
         }
         let now = now_ms();
         let invite = Invite {
@@ -463,6 +495,9 @@ impl Core {
             }
             if u.default_channel.is_some_and(|c| !self.channels.contains_key(&c)) {
                 return Err(err(ErrorCode::NotFound, "no such channel"));
+            }
+            if u.default_channel.is_some_and(|c| self.channels.get(&c).is_some_and(|c| c.private)) {
+                return Err(err(ErrorCode::BadRequest, "a private channel cannot be the default channel"));
             }
             if self.info.teamspeak && u.default_channel.is_some_and(|c| self.is_encrypted(c)) {
                 return Err(err(

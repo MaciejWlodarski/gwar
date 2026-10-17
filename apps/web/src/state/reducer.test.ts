@@ -18,6 +18,7 @@ const ch = (id: number, parent: number | null = null, position = 0, name = `c${i
   max_clients: null,
   encrypted: false,
   history: false,
+  private: false,
 });
 const cl = (id: number, channel: number | null = 1, extra: Partial<Client> = {}): Client => ({
   id,
@@ -174,6 +175,16 @@ describe("clients and channels", () => {
     let s = online();
     s = ev(s, { ev: "channel.deleted", d: { channel: 2 } });
     expect(s.channels[2]).toBeUndefined();
+  });
+
+  it("removes a channel hidden from me like a deleted one, and shows it again when admitted", () => {
+    let s = online();
+    s = reduce(s, { type: "selectChannel", channel: 2 });
+    s = ev(s, { ev: "channel.hidden", d: { channel: 2 } });
+    expect(s.channels[2]).toBeUndefined();
+    expect(s.viewChannel).toBe(1);
+    s = ev(s, { ev: "channel.created", d: { ...ch(2), private: true, access: { roles: [], users: ["u1"] } } });
+    expect(s.channels[2]?.private).toBe(true);
   });
 
   it("updates talking flag and slots; clears a slot when its user leaves", () => {
