@@ -219,6 +219,86 @@ impl Agent {
         })
     }
 
+    /// The next confirmer anchor's statement under the pinned head, for the owner's account key
+    /// to sign. Sorted, deduplicated confirmers; the owner is never one.
+    pub fn next_anchor(&self, server: &str, confirmers: &[Uid], signed_at: i64) -> Result<String> {
+        let record = self.servers.get(server).ok_or(Invalid("no owner pin"))?;
+        let chain = record.chain(server)?;
+        let mut confirmers = confirmers.to_vec();
+        confirmers.sort();
+        confirmers.dedup();
+        if confirmers.contains(&chain.owner()) || confirmers.len() > crate::owner::MAX_CONFIRMERS {
+            return Err(Invalid("confirmers"));
+        }
+        let seq = record.pair()?.map_or(0, |(a, _)| a.anchor().anchor_seq) + 1;
+        Ok(crate::owner::Anchor {
+            server_key: server.to_owned(),
+            generation: chain.generation(),
+            owner_head: chain.head(),
+            anchor_seq: seq,
+            confirmers,
+            signed_at,
+        }
+        .statement())
+    }
+
+    /// The next manager list's statement under `anchor` (the accepted one when `None`), signed
+    /// by this device ([`Agent::sign_manager_list`]).
+    pub fn next_list(&self, server: &str, anchor: Option<&[u8]>, managers: &[Uid], signed_at: i64) -> Result<String> {
+        let record = self.servers.get(server).ok_or(Invalid("no owner pin"))?;
+        let chain = record.chain(server)?;
+        let pair = record.pair()?;
+        let anchor = match anchor {
+            Some(bytes) => SignedAnchor::parse(bytes).ok_or(Invalid("anchor"))?,
+            None => pair.as_ref().map(|(a, _)| a.clone()).ok_or(Invalid("no anchor"))?,
+        };
+        let mut managers = managers.to_vec();
+        managers.sort();
+        managers.dedup();
+        managers.retain(|m| !anchor.anchor().confirmers.contains(m) && *m != chain.owner());
+        let seq = pair.map_or(0, |(_, l)| l.list().seq) + 1;
+        Ok(ManagerList {
+            server_key: server.to_owned(),
+            generation: chain.generation(),
+            anchor_hash: anchor.hash(),
+            seq,
+            managers,
+            signer_uid: self.credential.uid(),
+            signed_at,
+        }
+        .statement())
+    }
+
+    /// The statement of a link moving ownership to `new_owner`, for the current owner's account key
+    /// (`account_key`) to sign, handing over the server's current anchor (`server_anchor`).
+    pub fn transfer_statement(
+        &self,
+        server: &str,
+        account_key: &str,
+        new_owner: &str,
+        server_anchor: Option<&[u8]>,
+        signed_at: i64,
+    ) -> Result<String> {
+        let chain = self.servers.get(server).ok_or(Invalid("no owner pin"))?.chain(server)?;
+        let anchor_hash = match server_anchor {
+            Some(bytes) => Some(SignedAnchor::parse(bytes).ok_or(Invalid("anchor"))?.hash()),
+            None => None,
+        };
+        let link = crate::owner::OwnerLink {
+            server_key: server.to_owned(),
+            generation: chain.generation(),
+            seq: chain.seq() + 1,
+            previous_link_hash: chain.head(),
+            previous_owner_account_key: account_key.to_owned(),
+            new_owner_uid: new_owner.to_owned(),
+            anchor_hash,
+            signed_at,
+        };
+        let statement = link.statement();
+        crate::owner::OwnerLink::parse(&statement).ok_or(Invalid("owner link"))?;
+        Ok(statement)
+    }
+
     /// Signs a manager list with this device; its signer must be this device's uid.
     pub fn sign_manager_list(&self, list: ManagerList) -> Result<Vec<u8>> {
         if list.signer_uid != self.credential.uid() {
@@ -382,5 +462,35 @@ mod tests {
             signed_at: NOW,
         };
         assert!(confirmer.sign_manager_list(foreign).is_err());
+    }
+
+    #[test]
+    fn the_agent_builds_the_statements_its_owner_and_devices_sign() {
+        let mut owner = agent(1);
+        let chain = OwnerChain::new(genesis(1, 1));
+        check(&mut owner, &chain, None);
+        // The owner's browser signs the anchor with the account key; the device signs the list.
+        let statement = owner.next_anchor(&server(), &[uid(5), uid(5)], NOW).unwrap();
+        let signature = crate::encoding::b64(&ed25519_dalek::Signer::sign(&key(1), statement.as_bytes()).to_bytes());
+        let anchor = SignedAnchor::from_parts(&statement, &public(&key(1)), &signature).unwrap();
+        assert_eq!(anchor.anchor().confirmers, vec![uid(5)]);
+        assert!(owner.next_anchor(&server(), &[uid(1)], NOW).is_err(), "the owner is no confirmer");
+        let list_statement = owner.next_list(&server(), Some(&anchor.encode()), &[uid(5), uid(7)], NOW).unwrap();
+        let list = owner.sign_manager_list(ManagerList::parse(&list_statement).unwrap()).unwrap();
+        assert_eq!(SignedList::parse(&list).unwrap().list().managers, vec![uid(7)], "confirmers are not repeated");
+        assert_eq!(
+            owner.accept_managers(&server(), &anchor.encode(), &list, NOW, &()).unwrap(),
+            ManagersCheck::Accepted
+        );
+        owner.take_changes();
+        // The next list continues the sequence under the accepted anchor.
+        let next = ManagerList::parse(&owner.next_list(&server(), None, &[], NOW).unwrap()).unwrap();
+        assert_eq!((next.seq, next.anchor_hash), (2, anchor.hash()));
+        // A transfer link the chain accepts, handing over the anchor.
+        let link = owner.transfer_statement(&server(), &public(&key(1)), &uid(9), Some(&anchor.encode()), NOW).unwrap();
+        let signature = crate::encoding::b64(&ed25519_dalek::Signer::sign(&key(1), link.as_bytes()).to_bytes());
+        let mut moved = chain.clone();
+        moved.push(SignedLink::parse(&link, &signature).unwrap()).unwrap();
+        assert!(moved.anchor_current(&anchor));
     }
 }

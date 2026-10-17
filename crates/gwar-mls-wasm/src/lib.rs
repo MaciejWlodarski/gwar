@@ -321,6 +321,33 @@ impl Agent {
     pub fn owner_view(&self, server: &str) -> Result<JsValue, JsValue> {
         output(self.inner.owner_view(server).map_err(error)?)
     }
+    /// The next confirmer anchor's statement, for the owner's account key to sign.
+    pub fn next_anchor(&self, server: &str, confirmers: Vec<String>, signed_at: f64) -> Result<String, JsValue> {
+        self.inner.next_anchor(server, &confirmers, signed_at as i64).map_err(error)
+    }
+    /// The next manager list's statement, under `anchor` or the accepted anchor.
+    pub fn next_list(
+        &self,
+        server: &str,
+        anchor: Option<Vec<u8>>,
+        managers: Vec<String>,
+        signed_at: f64,
+    ) -> Result<String, JsValue> {
+        self.inner.next_list(server, anchor.as_deref(), &managers, signed_at as i64).map_err(error)
+    }
+    /// The statement of a link moving ownership, for the owner's account key to sign.
+    pub fn transfer_statement(
+        &self,
+        server: &str,
+        account_key: &str,
+        new_owner: &str,
+        server_anchor: Option<Vec<u8>>,
+        signed_at: f64,
+    ) -> Result<String, JsValue> {
+        self.inner
+            .transfer_statement(server, account_key, new_owner, server_anchor.as_deref(), signed_at as i64)
+            .map_err(error)
+    }
     /// Signs a `gwar managers v1` statement with this device.
     pub fn sign_manager_list(&self, statement: &str) -> Result<Vec<u8>, JsValue> {
         let list = gwar_mls::owner::ManagerList::parse(statement).ok_or_else(|| error("invalid manager list"))?;
@@ -436,4 +463,12 @@ mod tests {
             }
         }
     }
+}
+
+/// The envelope of a confirmer anchor signed by the owner's account key, verified.
+#[wasm_bindgen]
+pub fn anchor_envelope(statement: &str, account_key: &str, signature: &str) -> Result<Vec<u8>, JsValue> {
+    gwar_mls::owner::SignedAnchor::from_parts(statement, account_key, signature)
+        .map(|a| a.encode())
+        .ok_or_else(|| error("invalid confirmer anchor"))
 }
