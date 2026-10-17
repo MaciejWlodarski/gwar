@@ -61,6 +61,3 @@ export function AccessPicker({ value, onChange }: { value: ChannelAccess; onChan
     </div>
   );
 }
-
-export const sameAccess = (a: ChannelAccess | null | undefined, b: ChannelAccess) =>
-  !!a && [...a.roles].sort().join() === [...b.roles].sort().join() && [...a.users].sort().join() === [...b.users].sort().join();
