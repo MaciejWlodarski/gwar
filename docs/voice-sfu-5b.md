@@ -936,7 +936,7 @@ Both builds carry the same harness source.
 | A | loss | 4 | 40.17 / 40.58 | +0.41; [−0.23, +0.94] | 361 / 362 | 0 / 0 | PASS |
 | A | reorder | 4 | 52.83 / 52.42 | −0.41; [−5.91, +0.52] | 93 / 91 | 0 / 0 | PASS |
 | A | burst | 4 | 40.11 / 40.27 | +0.16; [−0.41, +0.47] | 277 / 275 | 0 / 0 | PASS |
-| A | stall | 4 | 46.25 / 46.46 | +0.22; [−2.45, +5.83] | 40 / 40 | 0 / 0 | INCONCLUSIVE |
+| A | stall @12 s (before markers) | 4 | 46.25 / 46.46 | +0.22; [−2.45, +5.83] | 40 / 40 | 0 / 0 | INCONCLUSIVE |
 | B | jitter | 8 | 58.20 / 49.66 | −8.55; [−9.63, +0.09] | 5 / 7 | 0 / 0 | INCONCLUSIVE (pairs) |
 | B | callbacks | 9 | 71.89 / 75.41 | +3.52; [−2.43, +8.90] | 26 / 31 | 0 / 0 | INCONCLUSIVE (pairs) |
 | B | mixed | 4 | 87.14 / 96.72 | +9.57; [−0.19, +28.68] | 668 / 668 | 0 / 0 | INCONCLUSIVE |
@@ -945,6 +945,7 @@ Both builds carry the same harness source.
 | D | callbacks | 10 | 78.86 / 79.84 | +0.99; [−3.37, +2.83] | 13 / 30 | 0 / 0 | INCONCLUSIVE |
 | D | mixed | 4 | 78.01 / 97.35 | +19.34; [−0.79, +19.79] | 651 / 664 | 0 / 0 | INCONCLUSIVE |
 | D | cpu | 10 | 57.17 / 62.02 | +4.85; [−7.46, +24.37] | 13 / 26 | 0 / 1 | FAIL (rule) |
+| F | stall @27 s | 4 | 47.50 / 47.25 | −0.25; [−7.29, +0.67] | 40 / 41 | 0 / 0 | PASS |
 
 Run times (UTC):
 
@@ -954,8 +955,16 @@ Run times (UTC):
 | B | 09:03–09:52 | 9 | Chrome and the ChatGPT app went above 100% CPU. |
 | C | | | Stopped after jitter and part of callbacks. Not used. |
 | D | 10:15–11:04 | 0 | Fresh series on a quiet machine. |
+| E | 11:40–11:46 | 1 | Stall @27 s; T3 Code went above 100% CPU, three pairs left. Not used. |
+| F | 11:46–11:52 | 0 | Fresh stall @27 s series. |
 
 Every run matched at least 95/100 markers.
+
+**Stall.** The stall condition `up:stall=270ms@12s` fires once, 12 s into the
+measurement clock. With a 15 s warmup that is before the first marker, so
+series A measures only lingering recovery, not the stall itself. Series F moves
+the stall to 27 s, inside the marker window; every run lost the one marker
+inside the stall (99/100 matched), and it passes.
 
 **Idle.** All 40 runs settle at run-level p95 values of about 42–45 ms. The
 earlier 40/47/50–55 ms clusters are gone, and the comparison resolves.
@@ -1024,9 +1033,12 @@ G ms deeper.
   or at the first marker and played the whole marker period 20–65 ms above
   the usual ≈38–40 ms.
 
-So the episodes are scheduler starvation of the sender's encoder thread or RTP
-task under six busy loops, and that starvation occurs in both builds. The CPU
-result swings between series:
+The episodes are therefore consistent with scheduler starvation of the
+sender's encoder thread or RTP task under six busy loops. The stage timestamps
+localize the gaps to the sender, but they cannot tell starvation from blocking
+or backpressure inside the sender, and one 28 ms receive-only gap (B) remains
+unexplained. Episodes occur in both builds; that does not exclude a smaller
+contribution by the candidate. The CPU result swings between series:
 
 | Series | Pairs | Added p95 (ms) |
 | --- | ---: | --- |
@@ -1036,23 +1048,29 @@ result swings between series:
 | Instrumented | 8 | −42.29 |
 
 Per-run p95 depends on whether a run has zero, one or two starvation episodes,
-and how large they are. Ten pairs cannot bound that at 2 ms.
+and how large they are. The ten pairs of series D did not establish the
+≤2 ms bound, while the ten pairs of the 2 s series did.
 
 ### Decision
 
 **The 5b latency gate is still not formally passed.**
 
-- **Pass:** idle, loss, reorder, burst and jitter pass for current `main`
-  against the pre-step baseline.
-- **Inconclusive:** stall, callbacks and mixed. Neither the per-run data nor
+- **Pass:** idle, loss, reorder, burst, jitter and stall (inside the marker
+  window) pass for current `main` against the pre-step baseline.
+- **Inconclusive:** callbacks and mixed. Neither the per-run data nor
   the stage timestamps show a mechanism specific to 5b, #55 or 5c behind the
   mixed or CPU differences.
 - **Fail:** CPU, by the underrun rule in series D.
 
-Recommendation for the 5d gate:
+Proposed for the 5d gate (an acceptance-policy change, not a statistical
+necessity):
 
 - Keep the 15 s warmup.
-- Gate the network and callback conditions as before.
+- Place impairment events inside the marker window. With a 15 s warmup the
+  markers span about 15.2–40 s on the measurement clock, so the stall
+  condition becomes `up:stall=270ms@27s`. Mixed already repeats its stall at
+  22 and 32 s.
+- Gate the other network conditions and callbacks as before.
 - Make CPU and mixed diagnostic: report the p95 comparison and underruns, and
   attribute each episode with stage timestamps. One extra candidate underrun
-  or a single post-stall level step then no longer decides the outcome.
+  or a single post-stall level step would then no longer decide the outcome.
