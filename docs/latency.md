@@ -68,6 +68,20 @@ fixed warmup, which includes connection-setup losses. Use the same mode and
 harness source in both builds. The runners clear this variable too, so set it
 in executable wrappers when comparing variants.
 
+`LATENCY_WARMUP_MS` replaces the two-second marker warmup (the run is extended
+by the same amount; JSON `warmup_samples` records it). Without it, the receiver
+is still trimming its startup depth while markers play. Idle runs then settle
+at run-level p95 values around 40, 47 or 50–55 ms, depending on how much was
+trimmed, which a 2 ms paired gate cannot resolve. With
+`LATENCY_WAIT_CONNECTED=1 LATENCY_WARMUP_MS=15000`, idle runs cluster at about
+42–45 ms, and the idle comparison resolves (docs/voice-sfu-5b.md). Gates use
+15 s. Set it in the wrappers of both variants. The value is whole milliseconds,
+at most 30000 (the runners' client deadline allows for that); anything else
+fails the run. Impairment times such as
+`stall=…@12s` stay on the measurement clock, so a longer warmup can move them
+before the first marker: with 15 s the markers span about 15.2–40 s, and a
+stall belongs at for example `@27s`.
+
 To check latency beyond one marker period, delay the audio itself in the fake
 receiver output device:
 

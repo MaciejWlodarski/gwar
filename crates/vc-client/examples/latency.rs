@@ -36,7 +36,17 @@ use vc_proto::{ClientSoftware, Platform};
 const RATE: usize = 48_000;
 const BLOCK: usize = 480;
 const PERIOD: usize = 12_000; // 250 ms
-const WARMUP: usize = RATE * 2;
+// scripts/latency/run_local.py budgets its client deadline for this maximum.
+const MAX_WARMUP_MS: usize = 30_000;
+/// Marker start after connection: 2 s, or `LATENCY_WARMUP_MS` (whole ms, at most
+/// 30 s). A gate uses a longer warmup so the receiver's startup trims
+/// finish before the markers.
+fn warmup_samples(value: Option<&str>) -> anyhow::Result<usize> {
+    let Some(value) = value else { return Ok(RATE * 2) };
+    let ms = value.parse::<usize>().ok().filter(|ms| *ms <= MAX_WARMUP_MS);
+    let ms = ms.with_context(|| format!("LATENCY_WARMUP_MS must be whole milliseconds from 0 to {MAX_WARMUP_MS}"))?;
+    Ok(ms * (RATE / 1000))
+}
 const MARKER: usize = 960; // 20 ms
 // At least 200 Hz apart, and 100 Hz away from the 400 Hz carrier's harmonics.
 const TONES: [f64; 8] = [900.0, 1100.0, 1300.0, 1500.0, 1700.0, 1900.0, 2300.0, 2700.0];
@@ -54,6 +64,7 @@ struct Settings {
     callback_jitter: bool,
     /// Arm markers after both transports connect; keep carrier/impairments running.
     wait_connected: bool,
+    warmup_samples: usize,
 }
 impl Settings {
     fn from_env() -> anyhow::Result<Self> {
@@ -86,7 +97,13 @@ impl Settings {
             Err(std::env::VarError::NotPresent) => false,
             _ => anyhow::bail!("LATENCY_WAIT_CONNECTED must be 0 or 1"),
         };
-        Ok(Self { minimum_ms, extra_delay_ms, callback_jitter, wait_connected })
+        let warmup = match std::env::var("LATENCY_WARMUP_MS") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!("LATENCY_WARMUP_MS must be valid UTF-8"),
+        };
+        let warmup_samples = warmup_samples(warmup.as_deref())?;
+        Ok(Self { minimum_ms, extra_delay_ms, callback_jitter, wait_connected, warmup_samples })
     }
 }
 
@@ -243,6 +260,7 @@ struct FakeIo {
     count: usize,
     delay_samples: usize,
     callback_jitter: bool,
+    warmup_samples: usize,
 }
 struct Guard {
     stop: Arc<AtomicBool>,
@@ -283,7 +301,7 @@ impl AudioIo for FakeIo {
                 let mut missing = 0;
                 let now = Instant::now();
                 if marker_start.is_none() && self.markers_ready.load(Ordering::Acquire) {
-                    marker_start = Some(position + WARMUP);
+                    marker_start = Some(position + self.warmup_samples);
                 }
                 let warmup = marker_start.unwrap_or(usize::MAX);
                 let mut data = self.data.lock().unwrap();
@@ -520,6 +538,7 @@ async fn run(
             count,
             delay_samples: 0,
             callback_jitter: false,
+            warmup_samples: settings.warmup_samples,
         }),
         media_addr,
     )
@@ -535,6 +554,7 @@ async fn run(
             count,
             delay_samples: settings.extra_delay_ms * RATE / 1000,
             callback_jitter: settings.callback_jitter,
+            warmup_samples: settings.warmup_samples,
         }),
         media_addr,
     )
@@ -559,7 +579,9 @@ async fn run(
         None
     };
     tokio::time::sleep(Duration::from_secs_f64(
-        3.0 + count as f64 * PERIOD as f64 / RATE as f64 + MATCH_WINDOW_MS / 1000.0,
+        1.0 + settings.warmup_samples as f64 / RATE as f64
+            + count as f64 * PERIOD as f64 / RATE as f64
+            + MATCH_WINDOW_MS / 1000.0,
     ))
     .await;
     let receiver_stats = vb.stats();
@@ -679,7 +701,7 @@ async fn run(
         "rms_off_threshold": 0.11,
         "marker_samples": MARKER,
         "marker_interval_samples": PERIOD,
-        "warmup_samples": WARMUP,
+        "warmup_samples": settings.warmup_samples,
     });
     std::fs::write(format!("{output}.json"), serde_json::to_string_pretty(&metadata)?)?;
     anyhow::ensure!(
@@ -725,6 +747,17 @@ mod tests {
             })
             .collect();
         (markers, onsets)
+    }
+
+    #[test]
+    fn warmup_defaults_to_two_seconds_and_rejects_bad_values() {
+        assert_eq!(warmup_samples(None).unwrap(), 96_000);
+        assert_eq!(warmup_samples(Some("0")).unwrap(), 0);
+        assert_eq!(warmup_samples(Some("15000")).unwrap(), 720_000);
+        assert_eq!(warmup_samples(Some("30000")).unwrap(), 1_440_000);
+        for bad in ["", "-1", "1.5", "15s", "30001", "144115188075855872"] {
+            assert!(warmup_samples(Some(bad)).is_err(), "{bad:?}");
+        }
     }
 
     #[test]
