@@ -283,6 +283,49 @@ impl Agent {
             }
         }
     }
+    /// The server's owner chain against this device's pin (docs/e2e-build.md, section 6, 6b).
+    /// Plain parameters, not a `Request` variant: each serde variant costs bundle size.
+    pub fn check_owner(
+        &mut self,
+        server: &str,
+        genesis: &str,
+        statements: Vec<String>,
+        signatures: Vec<String>,
+        invite_owner: Option<String>,
+    ) -> Result<JsValue, JsValue> {
+        let links = statements.into_iter().zip(signatures).collect();
+        output(self.inner.check_owner(server, genesis, links, invite_owner.as_deref()).map_err(error)?)
+    }
+    /// Accepts an owner reset the user confirmed; clears the old generation's checkpoints.
+    pub fn accept_generation(
+        &mut self,
+        server: &str,
+        genesis: &str,
+        statements: Vec<String>,
+        signatures: Vec<String>,
+    ) -> Result<(), JsValue> {
+        let links = statements.into_iter().zip(signatures).collect();
+        self.inner.accept_generation(server, genesis, links).map_err(error)
+    }
+    pub fn accept_managers(
+        &mut self,
+        server: &str,
+        anchor: &[u8],
+        list: &[u8],
+        now: f64,
+        revocations: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        let revocations: View = input(revocations)?;
+        output(self.inner.accept_managers(server, anchor, list, now as i64, &revocations).map_err(error)?)
+    }
+    pub fn owner_view(&self, server: &str) -> Result<JsValue, JsValue> {
+        output(self.inner.owner_view(server).map_err(error)?)
+    }
+    /// Signs a `gwar managers v1` statement with this device.
+    pub fn sign_manager_list(&self, statement: &str) -> Result<Vec<u8>, JsValue> {
+        let list = gwar_mls::owner::ManagerList::parse(statement).ok_or_else(|| error("invalid manager list"))?;
+        self.inner.sign_manager_list(list).map_err(error)
+    }
     pub fn take_changes(&mut self) -> Result<JsValue, JsValue> {
         output(self.inner.take_changes())
     }
