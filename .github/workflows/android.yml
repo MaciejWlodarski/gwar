@@ -1,0 +1,50 @@
+name: android
+
+# The Android app is an independent track for now (docs/mobile.md): it builds
+# only when its code or the client crates it is built on change.
+on:
+  push:
+    branches: [main]
+    paths:
+      - apps/android/**
+      - crates/gwar-app/**
+      - crates/vc-client/**
+      - crates/vc-proto/**
+      - Cargo.lock
+      - .github/workflows/android.yml
+  pull_request:
+    paths:
+      - apps/android/**
+      - crates/gwar-app/**
+      - crates/vc-client/**
+      - crates/vc-proto/**
+      - Cargo.lock
+      - .github/workflows/android.yml
+
+# Actions are pinned to commits: a moved tag cannot change what runs here.
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-24.04
+    env:
+      GWAR_ANDROID_ABIS: arm64-v8a x86_64
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android, x86_64-linux-android
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Host libraries (the binding generator builds the core for the runner too)
+        run: sudo apt-get update && sudo apt-get install -y libopus-dev libasound2-dev pkg-config
+      - name: Tools (cargo-ndk, Android platform 37, JDK 21 from the runner image)
+        run: |
+          cargo install cargo-ndk --locked
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.0" > /dev/null
+          echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_LATEST_HOME" >> "$GITHUB_ENV"
+      - name: Build the debug APK (Rust core for both ABIs, then Kotlin)
+        working-directory: apps/android
+        run: ./gradlew --no-daemon :app:assembleDebug
