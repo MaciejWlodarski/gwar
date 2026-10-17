@@ -36,9 +36,10 @@ use vc_proto::{ClientSoftware, Platform};
 const RATE: usize = 48_000;
 const BLOCK: usize = 480;
 const PERIOD: usize = 12_000; // 250 ms
-const MAX_WARMUP_MS: usize = 600_000;
+// scripts/latency/run_local.py budgets its client deadline for this maximum.
+const MAX_WARMUP_MS: usize = 30_000;
 /// Marker start after connection: 2 s, or `LATENCY_WARMUP_MS` (whole ms, at most
-/// ten minutes). A gate uses a longer warmup so the receiver's startup trims
+/// 30 s). A gate uses a longer warmup so the receiver's startup trims
 /// finish before the markers.
 fn warmup_samples(value: Option<&str>) -> anyhow::Result<usize> {
     let Some(value) = value else { return Ok(RATE * 2) };
@@ -96,7 +97,11 @@ impl Settings {
             Err(std::env::VarError::NotPresent) => false,
             _ => anyhow::bail!("LATENCY_WAIT_CONNECTED must be 0 or 1"),
         };
-        let warmup = std::env::var("LATENCY_WARMUP_MS").ok();
+        let warmup = match std::env::var("LATENCY_WARMUP_MS") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => anyhow::bail!("LATENCY_WARMUP_MS must be valid UTF-8"),
+        };
         let warmup_samples = warmup_samples(warmup.as_deref())?;
         Ok(Self { minimum_ms, extra_delay_ms, callback_jitter, wait_connected, warmup_samples })
     }
@@ -749,8 +754,8 @@ mod tests {
         assert_eq!(warmup_samples(None).unwrap(), 96_000);
         assert_eq!(warmup_samples(Some("0")).unwrap(), 0);
         assert_eq!(warmup_samples(Some("15000")).unwrap(), 720_000);
-        assert_eq!(warmup_samples(Some("600000")).unwrap(), 28_800_000);
-        for bad in ["", "-1", "1.5", "15s", "600001", "144115188075855872"] {
+        assert_eq!(warmup_samples(Some("30000")).unwrap(), 1_440_000);
+        for bad in ["", "-1", "1.5", "15s", "30001", "144115188075855872"] {
             assert!(warmup_samples(Some(bad)).is_err(), "{bad:?}");
         }
     }

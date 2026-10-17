@@ -90,7 +90,9 @@ def run_client(binary, csv_path, markers, env):
             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
         )
         try:
-            result = process.wait(timeout=60 + markers * 0.25)
+            # Connection wait (<= 30 s), the longest accepted LATENCY_WARMUP_MS
+            # (30 s, set by variant wrappers), markers and the match window.
+            result = process.wait(timeout=90 + markers * 0.25)
         finally:
             stop_process(process)
     if result:

@@ -76,7 +76,8 @@ trimmed, which a 2 ms paired gate cannot resolve. With
 `LATENCY_WAIT_CONNECTED=1 LATENCY_WARMUP_MS=15000`, idle runs cluster at about
 42–45 ms, and the idle comparison resolves (docs/voice-sfu-5b.md). Gates use
 15 s. Set it in the wrappers of both variants. The value is whole milliseconds,
-at most 600000; anything else fails the run. Impairment times such as
+at most 30000 (the runners' client deadline allows for that); anything else
+fails the run. Impairment times such as
 `stall=…@12s` stay on the measurement clock, so a longer warmup can move them
 before the first marker: with 15 s the markers span about 15.2–40 s, and a
 stall belongs at for example `@27s`.
