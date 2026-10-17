@@ -252,3 +252,83 @@ async fn a_hidden_sibling_is_no_name_oracle() {
     );
     assert!(visible > 0);
 }
+
+#[tokio::test]
+async fn a_hidden_channel_answers_exactly_as_a_missing_one() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let managers = root
+        .ok("group.create", json!({"name": "Managers", "permissions": ["server_manage", "channel_edit"]}))
+        .await["group"]["id"]
+        .clone();
+    let mut bob = Client::connect(&server, "bob").await;
+    let mut eve = Client::connect(&server, "eve").await;
+    root.ok("member.groups", json!({"uid": eve.welcome.uid, "groups": [2, managers]})).await;
+    let hidden = channel_id(&root.create_channel(json!({"name": "p", "private": true})).await);
+    let missing = hidden + 100;
+    for client in [&mut bob, &mut eve] {
+        for (op, d) in [
+            ("chat.read", json!({"channel": "{}", "message": 1})),
+            ("channel.delete", json!({"channel": "{}"})),
+            ("channel.update", json!({"channel": "{}", "topic": "x"})),
+            ("channel.join", json!({"channel": "{}"})),
+            ("chat.history", json!({"channel": "{}"})),
+            ("server.update", json!({"default_channel": "{}"})),
+        ] {
+            let with = |id: u32| {
+                let mut d = d.clone();
+                for v in d.as_object_mut().unwrap().values_mut() {
+                    if v == "{}" {
+                        *v = json!(id);
+                    }
+                }
+                d
+            };
+            let (a, b) = (client.fails(op, with(hidden)).await, client.fails(op, with(missing)).await);
+            assert_eq!(a, b, "{op}: hidden and missing differ");
+        }
+    }
+}
+
+#[tokio::test]
+async fn deleting_a_role_needs_holding_it() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let mut mallory = Client::connect(&server, "mallory").await;
+    let all = vc_proto::Permission::ALL.iter().map(|p| json!(p)).collect::<Vec<_>>();
+    let boss = root.ok("group.create", json!({"name": "Boss", "permissions": all})).await["group"]["id"].clone();
+    let crew = root.ok("group.create", json!({"name": "Crew", "permissions": []})).await["group"]["id"].clone();
+    root.ok("member.groups", json!({"uid": mallory.welcome.uid, "groups": [2, boss]})).await;
+    assert_eq!(mallory.fails("group.delete", json!({"group": crew})).await, "forbidden");
+    root.ok("member.groups", json!({"uid": mallory.welcome.uid, "groups": [2, boss, crew]})).await;
+    mallory.ok("group.delete", json!({"group": crew})).await;
+}
+
+#[tokio::test]
+async fn an_invite_redeemed_on_another_device_admits_the_devices_already_connected() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let crew = root.ok("group.create", json!({"name": "Crew", "permissions": []})).await["group"]["id"].clone();
+    let private = channel_id(
+        &root.create_channel(json!({"name": "crew", "private": true, "access": {"roles": [crew], "users": []}})).await,
+    );
+    let code = root.ok("invite.create", json!({"group": crew})).await["invite"]["code"].as_str().unwrap().to_owned();
+    let account = new_key();
+    let connect = |device: ed25519_dalek::SigningKey, invite: Option<String>| {
+        let now = vc_server::core::now_ms();
+        let cert = certificate(&account, &device, now, now + 24 * 3600 * 1000);
+        Client::connect_with(&server, device, move |raw, key| {
+            let mut hello = raw.hello(key, "alice", None);
+            set_certificate(&mut hello, cert, key);
+            if let Some(code) = invite {
+                hello["join"]["invite"] = json!(code);
+            }
+            hello
+        })
+    };
+    let mut first = connect(new_key(), None).await.unwrap();
+    assert!(!sees(&first, private));
+    let second = connect(new_key(), Some(code)).await.unwrap();
+    assert!(sees(&second, private));
+    assert_eq!(first.next_event("channel.created").await["id"], private);
+}

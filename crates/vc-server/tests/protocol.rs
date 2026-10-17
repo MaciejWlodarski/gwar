@@ -625,7 +625,8 @@ async fn channel_chat_reaches_everyone_who_can_read_it() {
     assert_eq!(b.next_event("chat.message").await, sent);
     assert_eq!(a.next_event("chat.message").await, sent, "the author gets the broadcast too");
     assert_eq!(c.next_event("chat.message").await, sent);
-    assert_eq!(a.fails("chat.send", json!({"target": {"channel": 9999}, "text": "x"})).await, "forbidden");
+    // A missing channel answers as a hidden one does (docs/e2e-build.md, section 6).
+    assert_eq!(a.fails("chat.send", json!({"target": {"channel": 9999}, "text": "x"})).await, "not_found");
 }
 
 #[tokio::test]

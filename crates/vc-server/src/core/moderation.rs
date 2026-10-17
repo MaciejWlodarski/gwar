@@ -147,6 +147,10 @@ impl Core {
         if !self.covers(session, &group.permissions.iter().copied().collect()) {
             return Err(err(ErrorCode::Forbidden, "this group has permissions you do not have"));
         }
+        // Deleting a role takes it away from everyone, so it follows the rule for taking it away.
+        if !Self::may_delegate(&self.sessions[&session].groups, &[id]) {
+            return Err(err(ErrorCode::Forbidden, "you can only give out or take away roles you hold"));
+        }
         self.store.delete_group(id).map_err(storage_error)?;
         self.groups.remove(&id);
         let before = self.admissions();

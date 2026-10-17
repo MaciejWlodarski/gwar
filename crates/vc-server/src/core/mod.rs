@@ -985,6 +985,7 @@ impl Core {
             }
         };
         let mut groups = user.groups;
+        let mut invited_to = false;
         if let Some(Some(group)) = invited
             && self.groups.contains_key(&group)
             && !groups.contains(&group)
@@ -993,6 +994,7 @@ impl Core {
                 warn!("store: {e:#}");
             }
             groups.push(group);
+            invited_to = true;
         }
         if groups.is_empty() {
             if let Err(e) = self.store.add_user_group(user.id, MEMBER_GROUP) {
@@ -1055,6 +1057,19 @@ impl Core {
             .members(now_ms() - MEMBER_HORIZON_MS, MAX_MEMBERS)
             .inspect_err(|e| warn!("store: {e:#}"))
             .unwrap_or_default();
+        // The person's other devices gain the invite's role too, with what it admits.
+        if invited_to {
+            let before = self.admissions();
+            let others: Vec<_> =
+                self.sessions.values().filter(|s| s.user_id == session.user_id).map(|s| s.id).collect();
+            for other in others {
+                if let Some(s) = self.sessions.get_mut(&other) {
+                    s.groups = session.groups.clone();
+                }
+                self.client_updated(other);
+            }
+            self.reconcile_admissions(before);
+        }
         self.sessions.insert(id, session);
         let welcome = Welcome {
             session: id,
@@ -1381,8 +1396,12 @@ impl Core {
     // -------------------------------------------------------------- requests
 
     fn request(&mut self, session: SessionId, id: u32, request: Request) -> Option<Reply> {
-        // A channel that is hidden from this session does not exist for it.
-        if named_channels(&request).into_iter().any(|c| !self.admitted(Some(&self.sessions[&session]), c)) {
+        // A channel that is hidden from this session does not exist for it, and answers exactly as
+        // one that does not exist, before any other check.
+        if named_channels(&request)
+            .into_iter()
+            .any(|c| !self.channels.contains_key(&c) || !self.admitted(Some(&self.sessions[&session]), c))
+        {
             return Some(Err(err(ErrorCode::NotFound, "no such channel")));
         }
         let result = match request {
@@ -1784,7 +1803,14 @@ impl Core {
         if self.sibling_name_taken(self.sessions.get(&session), parent, &row.name, None) {
             return Err(err(ErrorCode::Conflict, "a channel with this name already exists here"));
         }
-        row.position = self.channels.values().filter(|c| c.parent == parent).map(|c| c.position + 1).max().unwrap_or(0);
+        // A public channel's place counts only the siblings everyone sees, so hidden ones leave no trace.
+        row.position = self
+            .channels
+            .values()
+            .filter(|c| c.parent == parent && (row.private || !c.private))
+            .map(|c| c.position + 1)
+            .max()
+            .unwrap_or(0);
         row.id = self.store.create_channel(&row).map_err(storage_error)?;
         let id = row.id;
         let view = channel_view(&row);
@@ -1814,82 +1840,16 @@ impl Core {
     }
 
     fn channel_update(&mut self, session: SessionId, id: u32, u: ChannelUpdate) -> Option<Reply> {
-        if let Err(e) = self.require(session, Permission::ChannelEdit) {
+        if let Err(e) = self.checked_channel_update(session, &u) {
             return Some(Err(e));
         }
-        let Some(current) = self.channels.get(&u.channel).cloned() else {
-            return Some(Err(err(ErrorCode::NotFound, "no such channel")));
-        };
-        let checked = (|| {
-            let mut row = current.clone();
-            if let Some(name) = &u.name {
-                row.name = clean(name, MAX_CHANNEL_NAME, "channel name")?;
-            }
-            if let Some(topic) = &u.topic {
-                let topic = topic.trim();
-                if topic.chars().count() > MAX_TOPIC {
-                    return Err(err(ErrorCode::BadRequest, "topic too long"));
-                }
-                row.topic = topic.to_owned();
-            }
-            if u.move_to_root {
-                row.parent = None;
-            } else if let Some(parent) = u.parent {
-                if !self.channels.contains_key(&parent) {
-                    return Err(err(ErrorCode::NotFound, "no such parent channel"));
-                }
-                if self.is_descendant(parent, row.id) {
-                    return Err(err(ErrorCode::BadRequest, "cannot move a channel into itself"));
-                }
-                if self.channels[&parent].private {
-                    return Err(err(ErrorCode::BadRequest, "a private channel has no child channels"));
-                }
-                row.parent = Some(parent);
-            }
-            if let Some(access) = &u.access {
-                if !row.private {
-                    return Err(err(ErrorCode::BadRequest, "only a private channel has access"));
-                }
-                let before = row.access.as_ref().map(|a| a.roles.clone()).unwrap_or_default();
-                self.may_list_roles(session, &access.roles, &before)?;
-                row.access = Some(self.checked_access(access.clone())?);
-            }
-            match u.max_clients {
-                // 0 removes the limit.
-                Some(0) => row.max_clients = None,
-                Some(max) => {
-                    Self::validate_max_clients(Some(max))?;
-                    row.max_clients = Some(max);
-                }
-                None => {}
-            }
-            if let Some(position) = u.position {
-                row.position = position;
-            }
-            if self.sibling_name_taken(Some(&self.sessions[&session]), row.parent, &row.name, Some(row.id)) {
-                return Err(err(ErrorCode::Conflict, "a channel with this name already exists here"));
-            }
-            if let Some(p) = &u.password {
-                check_password_len(p)?;
-                if row.encrypted && !p.is_empty() {
-                    return Err(err(ErrorCode::BadRequest, "an encrypted channel has no password"));
-                }
-                if row.private && !p.is_empty() {
-                    return Err(err(ErrorCode::BadRequest, "a private channel has no password"));
-                }
-            }
-            Ok(row)
-        })();
-        let row = match checked {
-            Ok(row) => row,
-            Err(e) => return Some(Err(e)),
-        };
         let channel = u.channel;
         let teamspeak = self.is_teamspeak(session);
         let plaintext =
             self.bridge.is_some().then(|| u.password.clone().map(|p| Some(p).filter(|p| !p.is_empty()))).flatten();
+        let password = u.password.clone();
         self.defer(
-            move || match u.password {
+            move || match password {
                 Some(p) if p.is_empty() => Some(None),
                 Some(p) => Some(Some(passwords::hash_secret(&p, teamspeak))),
                 None => None,
@@ -1898,10 +1858,81 @@ impl Core {
                 if !core.sessions.contains_key(&session) {
                     return;
                 }
-                let result = core.apply_channel_update(channel, row, password, plaintext);
+                // Access, permissions or the channel may have changed while the password was hashed:
+                // the update applies to the current state, checked again, or not at all.
+                let result = core
+                    .checked_channel_update(session, &u)
+                    .and_then(|row| core.apply_channel_update(channel, row, password, plaintext));
                 core.reply(session, id, result);
             },
         )
+    }
+
+    /// The channel as `u` would leave it, if `session` may make that change now.
+    fn checked_channel_update(&self, session: SessionId, u: &ChannelUpdate) -> Result<ChannelRow, ErrorBody> {
+        self.require(session, Permission::ChannelEdit)?;
+        let viewer = Some(&self.sessions[&session]);
+        let Some(current) = self.channels.get(&u.channel).filter(|_| self.admitted(viewer, u.channel)) else {
+            return Err(err(ErrorCode::NotFound, "no such channel"));
+        };
+        let mut row = current.clone();
+        if let Some(name) = &u.name {
+            row.name = clean(name, MAX_CHANNEL_NAME, "channel name")?;
+        }
+        if let Some(topic) = &u.topic {
+            let topic = topic.trim();
+            if topic.chars().count() > MAX_TOPIC {
+                return Err(err(ErrorCode::BadRequest, "topic too long"));
+            }
+            row.topic = topic.to_owned();
+        }
+        if u.move_to_root {
+            row.parent = None;
+        } else if let Some(parent) = u.parent {
+            if !self.channels.contains_key(&parent) || !self.admitted(viewer, parent) {
+                return Err(err(ErrorCode::NotFound, "no such parent channel"));
+            }
+            if self.is_descendant(parent, row.id) {
+                return Err(err(ErrorCode::BadRequest, "cannot move a channel into itself"));
+            }
+            if self.channels[&parent].private {
+                return Err(err(ErrorCode::BadRequest, "a private channel has no child channels"));
+            }
+            row.parent = Some(parent);
+        }
+        if let Some(access) = &u.access {
+            if !row.private {
+                return Err(err(ErrorCode::BadRequest, "only a private channel has access"));
+            }
+            let before = row.access.as_ref().map(|a| a.roles.clone()).unwrap_or_default();
+            self.may_list_roles(session, &access.roles, &before)?;
+            row.access = Some(self.checked_access(access.clone())?);
+        }
+        match u.max_clients {
+            // 0 removes the limit.
+            Some(0) => row.max_clients = None,
+            Some(max) => {
+                Self::validate_max_clients(Some(max))?;
+                row.max_clients = Some(max);
+            }
+            None => {}
+        }
+        if let Some(position) = u.position {
+            row.position = position;
+        }
+        if self.sibling_name_taken(Some(&self.sessions[&session]), row.parent, &row.name, Some(row.id)) {
+            return Err(err(ErrorCode::Conflict, "a channel with this name already exists here"));
+        }
+        if let Some(p) = &u.password {
+            check_password_len(p)?;
+            if row.encrypted && !p.is_empty() {
+                return Err(err(ErrorCode::BadRequest, "an encrypted channel has no password"));
+            }
+            if row.private && !p.is_empty() {
+                return Err(err(ErrorCode::BadRequest, "a private channel has no password"));
+            }
+        }
+        Ok(row)
     }
 
     fn apply_channel_update(
@@ -2226,6 +2257,7 @@ fn named_channels(request: &Request) -> Vec<ChannelId> {
         | Request::ChatSend { target: ChatTarget::Channel(channel), .. } => vec![*channel],
         Request::ChannelCreate(c) => c.parent.into_iter().collect(),
         Request::ChannelUpdate(u) => [Some(u.channel), u.parent].into_iter().flatten().collect(),
+        Request::ServerUpdate(u) => u.default_channel.into_iter().collect(),
         _ => vec![],
     }
 }
@@ -2549,6 +2581,69 @@ pub(crate) mod expiry_tests {
                 .await;
         assert_ne!(channel, Some(locked));
         assert!(unlocked.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_channel_update_finishing_after_access_is_revoked_changes_nothing() {
+        let store = Store::in_memory().unwrap();
+        let editors = store.insert_group("Editors", &[Permission::ChannelEdit], None).unwrap();
+        let uid = crate::identity::uid_for_key(&[1; 32]);
+        let private = store
+            .create_channel(&ChannelRow {
+                id: 0,
+                parent: None,
+                name: "p".into(),
+                topic: "old".into(),
+                position: 0,
+                password_hash: None,
+                max_clients: None,
+                encrypted: false,
+                history: true,
+                private: true,
+                access: Some(vc_proto::ChannelAccess { roles: vec![], users: vec![uid.clone()] }),
+            })
+            .unwrap();
+        let core = test_core(store, None);
+        let (out, mut frames) = mpsc::channel(OUTBOUND_QUEUE);
+        let session = core
+            .connect(ConnectRequest {
+                request_id: 1,
+                hello_key: String::new(),
+                certificate: None,
+                uid,
+                public_key: URL_SAFE_NO_PAD.encode([1; 32]),
+                nickname: "editor".into(),
+                platform: Platform::Web,
+                out,
+                ip: None,
+                device: None,
+                device_expires_at: None,
+                invite: None,
+                password_ok: true,
+            })
+            .await
+            .unwrap();
+        // The update was checked while admitted; access is revoked before it finishes.
+        on_core(&core, move |core| {
+            core.sessions.get_mut(&session).unwrap().groups = vec![MEMBER_GROUP, editors];
+            let update = ChannelUpdate { channel: private, topic: Some("new".into()), ..Default::default() };
+            assert!(core.channel_update(session, 7, update).is_none(), "deferred");
+            let mut row = core.channels[&private].clone();
+            row.access = Some(vc_proto::ChannelAccess { roles: vec![], users: vec![] });
+            core.apply_channel_update(private, row, None, None).unwrap();
+        })
+        .await;
+        let reply = loop {
+            let Some(Outbound::Frame(frame)) = frames.recv().await else { continue };
+            let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            if frame["re"] == 7 {
+                break frame;
+            }
+        };
+        assert_eq!(reply["err"]["code"], "not_found", "{reply}");
+        let row = on_core(&core, move |core| core.channels[&private].clone()).await;
+        assert_eq!(row.topic, "old");
+        assert!(row.access.unwrap().users.is_empty(), "the revocation stands");
     }
 
     #[tokio::test]
