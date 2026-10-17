@@ -676,3 +676,21 @@ fn interop_frames_match_the_shared_fixture() {
         assert_eq!(b.decrypt(&hex(f["frame"].as_str().unwrap())), Some(hex(f["pt"].as_str().unwrap())), "{f}");
     }
 }
+
+#[test]
+fn every_valid_opus_duration_passes_through_sframe() {
+    let (mut a, mut b) = (Engine { state: SframeState::new(binding(), None, 480), ..Engine::new() }, Engine::new());
+    let all = members(1, &[(0, 0), (1, 1)]);
+    a.enter(1, 0, &all, &[]);
+    b.enter(1, 1, &all, &[]);
+    // CELT 2.5/5/10/20 ms, SILK 10-60 ms, and a code-3 packet of six 20 ms frames (120 ms).
+    let packets: [&[u8]; 6] =
+        [&[0x80, 1], &[0x88, 1], &[0xf0, 1], &[0xf8, 1], &[0x18, 1], &[0xfb, 0x06, 1, 1, 1, 1, 1, 1]];
+    for packet in packets {
+        let frame = a.encrypt(packet).expect("valid Opus is sent");
+        assert_eq!(b.decrypt(&frame).as_deref(), Some(packet), "{packet:02x?}");
+    }
+    // Only the 10 ms packet matches the native duration; the others are counted, not dropped.
+    assert_eq!(a.state.counters.unexpected_duration, 5);
+    assert_eq!(b.state.counters.unexpected_duration, 0);
+}
