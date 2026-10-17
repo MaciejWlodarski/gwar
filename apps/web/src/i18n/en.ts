@@ -143,6 +143,10 @@ export const en = {
 
   "security.fingerprint": "Server key fingerprint",
   "security.fingerprintHelp": "Compare it with the server owner to make sure you are connected to the right server.",
+  "owner.changed": "This server’s owner record changed in a way it cannot. Disconnected: it may not be the server you know.",
+  "owner.newTitle": "The server has a new owner",
+  "owner.newBody": "The server’s operator made {name} its new owner, for example after the old owner lost their account. Accept the change? Private channels then need the new owner’s confirmation.",
+  "owner.accept": "Accept",
   "security.changedTitle": "Server identity changed",
   "security.changedBody": "This server’s identity changed. This can mean a different server or an attack. Check the fingerprint with the server owner before trusting the new key.",
   "security.inviteMismatch": "The server key does not match this invite. The connection is blocked. Obtain a trusted invite from the server owner.",

@@ -145,6 +145,10 @@ export const pl: Record<Key, string> = {
 
   "security.fingerprint": "Odcisk klucza serwera",
   "security.fingerprintHelp": "Porównaj go z właścicielem serwera, aby upewnić się, że łączysz się z właściwym serwerem.",
+  "owner.changed": "Zapis właściciela tego serwera zmienił się w sposób, który nie jest możliwy. Rozłączono: to może nie być serwer, który znasz.",
+  "owner.newTitle": "Serwer ma nowego właściciela",
+  "owner.newBody": "Operator serwera ustanowił {name} nowym właścicielem, na przykład po utracie konta przez poprzedniego. Zaakceptować zmianę? Prywatne kanały będą wtedy wymagać potwierdzenia nowego właściciela.",
+  "owner.accept": "Akceptuj",
   "security.changedTitle": "Tożsamość serwera się zmieniła",
   "security.changedBody": "Tożsamość tego serwera się zmieniła. Może to oznaczać inny serwer lub atak. Przed zaufaniem nowemu kluczowi sprawdź odcisk u właściciela serwera.",
   "security.inviteMismatch": "Klucz serwera nie pasuje do zaproszenia. Połączenie jest zablokowane. Uzyskaj zaufane zaproszenie od właściciela serwera.",

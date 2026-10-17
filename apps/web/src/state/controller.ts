@@ -405,6 +405,21 @@ class Controller {
               revocations: messageStorage.currentRevocations, signal: abort.signal,
               onError: error => console.warn("Conversation synchronization:", error),
               onTakeover: () => void this.sessionMoved(conn),
+              // docs/e2e-build.md, section 6, 6b: a changed owner record is not this server any more.
+              onOwnerChanged: () => {
+                if (this.conn !== conn) return;
+                useUi.getState().toast("error", tNow("owner.changed"));
+                void this.disconnect();
+              },
+              onOwnerGeneration: (notice) => {
+                if (this.conn !== conn) return;
+                const name = useSession.getState().members[notice.owner]?.nickname ?? notice.owner;
+                useUi.getState().openDialog({
+                  kind: "confirm", title: tNow("owner.newTitle"), body: tNow("owner.newBody", { name }),
+                  confirmLabel: tNow("owner.accept"),
+                  onConfirm: () => { void notice.accept().catch((error) => console.warn("Owner change:", error)); },
+                });
+              },
             }).catch((error: unknown) => { throw error instanceof DeviceTakenOver ? new SessionMoved() : error; });
           } catch (error) {
             // Voice and channels do not depend on MLS: if it cannot start before
