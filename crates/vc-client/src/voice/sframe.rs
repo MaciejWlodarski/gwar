@@ -78,8 +78,14 @@ fn object<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Map<String, Value>>
 /// Canonical unpadded base64url of exactly `len` bytes.
 fn decode_fixed(value: &Value, len: usize) -> Option<Zeroizing<Vec<u8>>> {
     let text = value.as_str()?;
-    let bytes = Zeroizing::new(URL_SAFE_NO_PAD.decode(text).ok()?);
-    (bytes.len() == len && *Zeroizing::new(URL_SAFE_NO_PAD.encode(&*bytes)) == text).then_some(bytes)
+    if text.len() != len.div_ceil(3) * 4 - (3 - len % 3) % 3 {
+        return None;
+    }
+    // Decode into wiping storage: even a rejected key leaves no plain copy behind.
+    let mut bytes = Zeroizing::new(vec![0; len + 3]);
+    let n = URL_SAFE_NO_PAD.decode_slice(text, &mut bytes[..]).ok()?;
+    bytes.truncate(n);
+    (n == len && *Zeroizing::new(URL_SAFE_NO_PAD.encode(&*bytes)) == text).then_some(bytes)
 }
 
 fn fixed(value: &Value, len: usize) -> Option<String> {
@@ -244,6 +250,15 @@ pub fn parse_control(value: &Value) -> Option<Control> {
         }
     }
     Some(Control { binding, serial, epoch, action, body: f.finish() })
+}
+
+/// A control body that wipes its exporter keys however it is dropped.
+pub struct ScrubOnDrop(pub Value);
+
+impl Drop for ScrubOnDrop {
+    fn drop(&mut self) {
+        scrub(&mut self.0);
+    }
 }
 
 /// Wipes the exporter keys of a control body once it was parsed.

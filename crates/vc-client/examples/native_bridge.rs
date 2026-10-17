@@ -175,6 +175,7 @@ impl Bridge {
                 if number(&args, "run")? >= state.run {
                     state.run = 0;
                     state.handle = None;
+                    self.played.lock().unwrap().clear();
                 }
                 Ok(Value::Null)
             }
@@ -218,6 +219,8 @@ impl Bridge {
             anyhow::ensure!(owner == state.owner && run > state.run, "superseded");
             state.run = run;
             state.handle = None;
+            // Only this run's playout counts: an earlier run's tone cannot pass a later check.
+            self.played.lock().unwrap().clear();
         }
         let (answer, answered) = oneshot::channel();
         self.state.lock().unwrap().answers.insert(run, answer);
@@ -251,6 +254,7 @@ impl Bridge {
                     if failed && state.owner == owner && state.run == run {
                         state.run = 0;
                         state.handle = None;
+                        bridge.played.lock().unwrap().clear();
                     }
                 }
             });

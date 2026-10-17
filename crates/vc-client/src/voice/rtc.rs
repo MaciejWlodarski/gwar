@@ -116,6 +116,8 @@ where
                 match rtc.poll_output() {
                     Ok(Output::Timeout(t)) => break t,
                     Ok(Output::Transmit(t)) => {
+                        // Every datagram leaves under the gate: nothing queued is sent after retirement.
+                        let Some(_open) = gate.enter() else { return };
                         let _ = socket.try_send_to(&t.contents, t.destination);
                     }
                     Ok(Output::Event(Event::RtpPacket(packet))) => {
@@ -278,6 +280,59 @@ fn answer_sends_generation(answer: &str, mid: Mid, id: u8) -> bool {
 mod tests {
     use super::*;
     use str0m::change::SdpOffer;
+
+    #[tokio::test]
+    async fn a_retired_run_sends_no_datagram() {
+        use tokio::time::{Duration, timeout};
+        let remote_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut remote = Rtc::builder()
+            .set_extension(SLOT_GENERATION_ID, slot_generation_extension())
+            .clear_codecs()
+            .enable_opus(true, false)
+            .build(Instant::now());
+        remote.add_local_candidate(Candidate::host(remote_socket.local_addr().unwrap(), "udp").unwrap());
+        let (outgoing, outgoing_rx) = mpsc::channel(8);
+        let (incoming, _incoming_rx) = std::sync::mpsc::sync_channel(16);
+        let gate = RunGate::new();
+        let start_rtc = |gate: RunGate| {
+            start(
+                move |offer| {
+                    let answer = remote.sdp_api().accept_offer(SdpOffer::from_sdp_string(&offer).unwrap()).unwrap();
+                    std::future::ready(Ok(answer.to_sdp_string()))
+                },
+                remote_socket.local_addr().unwrap().ip(),
+                outgoing_rx,
+                incoming,
+                Arc::new(Counters::default()),
+                Arc::new(OutputTiming::default()),
+                None,
+                gate,
+            )
+        };
+        start_rtc(gate.clone()).await.unwrap();
+        // The live run sends ICE checks to the remote candidate.
+        let mut buf = [0u8; 2048];
+        timeout(Duration::from_secs(3), remote_socket.recv_from(&mut buf))
+            .await
+            .expect("a live run transmits")
+            .unwrap();
+        gate.close();
+        // Drain anything sent before the close completed, then expect silence.
+        while timeout(Duration::from_millis(50), remote_socket.recv_from(&mut buf)).await.is_ok() {}
+        for i in 0..4 {
+            let _ = outgoing.try_send(Outgoing {
+                captured_at: Instant::now(),
+                capture_position: i * 480,
+                opus: vec![0xf0, 1],
+                level: -10,
+                speech: true,
+            });
+        }
+        assert!(
+            timeout(Duration::from_millis(1500), remote_socket.recv_from(&mut buf)).await.is_err(),
+            "a retired run transmitted"
+        );
+    }
 
     #[tokio::test]
     async fn connecting_capture_is_not_replayed_after_the_handshake() {

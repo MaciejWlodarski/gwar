@@ -649,10 +649,12 @@ pub async fn voice_set_keys(
     run: u64,
     body: serde_json::Value,
 ) -> Result<ControlReply, String> {
+    // Wipe the body's exporter keys on every exit, including refusals.
+    let mut body = vc_client::voice::sframe::ScrubOnDrop(body);
     check_main_window(window.label())?;
     match run_keys(&voice, owner, run)? {
-        Some(keys) => Ok(keys.control(body).await),
-        None => Ok(ControlReply::ignored(&body)),
+        Some(keys) => Ok(keys.control(std::mem::take(&mut body.0)).await),
+        None => Ok(ControlReply::ignored(&body.0)),
     }
 }
 

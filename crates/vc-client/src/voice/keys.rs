@@ -94,7 +94,8 @@ impl KeyChannel {
     /// body is validated before admission and its exporter keys are wiped. A
     /// retired or failed run answers `ignored`.
     pub async fn control(&self, mut body: Value) -> ControlReply {
-        let size = serde_json::to_vec(&body).map(zeroize::Zeroizing::new).map_or(usize::MAX, |b| b.len());
+        // Count the serialized size without materializing key-bearing JSON.
+        let size = serialized_len(&body);
         let parsed = (size <= MAX_CONTROL_BYTES).then(|| parse_control(&body)).flatten();
         let ignored = ControlReply::ignored(&body);
         let bad = ControlReply::bad(&body, ControlError::BadKeys);
@@ -164,6 +165,28 @@ pub(crate) fn channel(
     };
     let keys = KeyChannel { tx, pending, overflowed: Arc::new(AtomicBool::new(false)), gate, counters };
     (Crypto { run, commands }, keys, statuses)
+}
+
+/// Serialized JSON length, stopping just past the control limit.
+fn serialized_len(body: &Value) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            if self.0 > MAX_CONTROL_BYTES {
+                return Err(std::io::Error::other("control too large"));
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    match serde_json::to_writer(&mut count, body) {
+        Ok(()) => count.0,
+        Err(_) => usize::MAX,
+    }
 }
 
 pub(crate) fn wall_ms() -> u64 {
