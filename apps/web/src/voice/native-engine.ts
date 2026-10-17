@@ -50,7 +50,7 @@ export class NativeVoiceEngine implements VoiceEngine {
   private handlers = new Map<string, Set<Handler>>();
   // Bootstrap once per engine: a fresh view retires native audio left by the
   // previous view. Never acquire another token after this owner is superseded.
-  private readonly ready = tauri().then(async (api) => ({ api, owner: await api.invoke<number>("voice_bootstrap") }));
+  private readonly ready: Promise<{ api: TauriBridge; owner: number }>;
   private listening: Promise<void> | null = null;
   private unlisten: Unlisten[] = [];
   private queue: Promise<void> = Promise.resolve();
@@ -71,7 +71,9 @@ export class NativeVoiceEngine implements VoiceEngine {
   private slotOwners: Array<string | null> = Array.from({ length: AUDIO_SLOTS }, () => null);
   private sentGain: Array<number | null> = Array.from({ length: AUDIO_SLOTS }, () => null);
 
-  constructor() {
+  /** `bridge` is the desktop shell; the e2e suite substitutes a native fixture process. */
+  constructor(bridge: () => Promise<TauriBridge> = tauri) {
+    this.ready = bridge().then(async (api) => ({ api, owner: await api.invoke<number>("voice_bootstrap") }));
     void this.ready.catch((e: unknown) => console.warn("[native voice] bootstrap failed:", e));
   }
 
