@@ -16,7 +16,9 @@ import { openStorage, type Persistence } from "./storage";
 import { loadAgent, loadVoiceAgent } from "./wasm";
 import { VoiceCall } from "./voice";
 import type { VoiceState } from "../proto/VoiceState";
-import type { AgentFactory, Change, CommitOutbox, ConversationStatus, Gate, GroupSummary, HistoryJob, OpenResult, PackageJob, Plaintext, RequestJob, Resolution, Revocation, Roster, SealedFields } from "./types";
+import type { Managers } from "../proto/Managers";
+import type { OwnerInfo } from "../proto/OwnerInfo";
+import type { AgentFactory, Change, OwnerCheck, OwnerGeneration, OwnerView, CommitOutbox, ConversationStatus, Gate, GroupSummary, HistoryJob, OpenResult, PackageJob, Plaintext, RequestJob, Resolution, Revocation, Roster, SealedFields } from "./types";
 const bytes = (value: string): number[] => [...decodeBase64Url(value)];
 const encoded = (value: number[]): string => encodeBase64Url(new Uint8Array(value));
 /** The DS protocol currently uses safe JSON integers; core epochs remain u64 strings. */
@@ -50,6 +52,12 @@ export interface RuntimeOptions {
   onTakeover?: () => void;
   /** Fetches public groups' ratchet trees over HTTP; the global fetch by default. */
   fetch?: typeof fetch;
+  /** The owner an invite link named (`owner={uid}`), checked on first contact. */
+  inviteOwner?: string;
+  /** The server's owner record is no extension of this device's pin: the caller disconnects. */
+  onOwnerChanged?: () => void;
+  /** An owner reset: a neutral notice the user may accept (docs/e2e-build.md, section 6, 6b). */
+  onOwnerGeneration?: (notice: OwnerGeneration) => void;
 }
 /** A ratchet tree larger than this is refused (about 15 000 devices). */
 const MAX_TREE_BYTES = 8 * 1024 * 1024;
@@ -94,6 +102,10 @@ export class MlsRuntime {
   /** Encrypted channels by id with their `history`, from the latest Welcome and channel events. */
   private channels: Map<number, boolean> | undefined;
   private serverChat = false;
+  /** The owner and managers this device verified, and the server's latest managers' view. */
+  private owner: OwnerView | null = null;
+  private managers: Managers | null = null;
+  private ownerChecks: Promise<void> = Promise.resolve();
   /** This session's file access token: the bearer for the tree endpoint. */
   private fileAccess: string | null = null;
   /** The conversation of every group the server listed, for groups not joined yet. */
@@ -188,12 +200,16 @@ export class MlsRuntime {
         runtime!.serverChat = welcome.server.server_chat.encrypted;
         if (!runtime!.serverChat) { runtime!.statuses.delete("server"); runtime!.rosters.delete("server"); }
         runtime!.channels = new Map(welcome.channels.filter(c => c.encrypted).map(c => [c.id, c.history]));
+        runtime!.managers = welcome.managers ?? null;
+        runtime!.checkOwner(welcome.owner ?? null);
         runtime!.schedule();
       }));
       runtime.unsubscribers.push(options.link.onEvent(event => {
         for (const call of runtime!.calls) call.event(event);
         if (event.ev === "channel.created" && event.d.encrypted) { runtime!.channels?.set(event.d.id, event.d.history); runtime!.schedule(); }
         if (event.ev === "channel.deleted" && runtime!.channels?.delete(event.d.channel)) runtime!.schedule();
+        if (event.ev === "owner.updated") runtime!.checkOwner(event.d);
+        if (event.ev === "managers.updated") { runtime!.managers = event.d; runtime!.checkOwner(undefined); }
         if (!event.ev.startsWith("mls.")) return;
         if (event.ev === "mls.commit" || event.ev === "mls.proposal") {
           const group = event.d.group;
@@ -221,6 +237,61 @@ export class MlsRuntime {
     }
   }
   status(conversation: string): ConversationStatus { return this.statuses.get(conversation) ?? "securing"; }
+  /** The server's owner and the managers of private channels as this device verified them. */
+  ownerView(): OwnerView | null { return this.owner; }
+  /**
+   * Checks the server's owner chain against this device's pin, then its newest managers
+   * (docs/e2e-build.md, section 6, 6b). `owner` undefined re-checks only the managers.
+   * Checks run one after another.
+   */
+  private checkOwner(owner: OwnerInfo | null | undefined): void {
+    const generation = this.generation;
+    this.ownerChecks = this.ownerChecks
+      .then(() => owner === undefined ? this.acceptManagers() : this.followOwner(owner, generation))
+      .catch(error => { if (!this.stopped) this.options.onError?.(error); });
+  }
+  private async followOwner(owner: OwnerInfo | null, generation: number): Promise<void> {
+    const server = this.server;
+    if (!owner) {
+      // A server that dropped the owner this device pinned is not its server any more.
+      const pinned = await this.engine.run(async () => this.engine.withAgent(a => a.owner_view?.(server) ?? null));
+      if (pinned) this.options.onOwnerChanged?.();
+      return;
+    }
+    let after = 0, genesis = "";
+    const statements: string[] = [], signatures: string[] = [];
+    for (;;) {
+      const page = await this.request("owner.chain", { generation: owner.generation, after }, undefined, generation);
+      genesis = page.genesis;
+      for (const link of page.links) { statements.push(link.statement); signatures.push(link.signature); }
+      if (page.next === null || page.links.length === 0) break;
+      after = page.next;
+    }
+    this.assertCurrent(generation);
+    const check = await this.engine.run(() => this.engine.call(a => a.check_owner!(server, genesis, statements, signatures, this.options.inviteOwner))) as OwnerCheck;
+    if (check.kind === "changed") { this.options.onOwnerChanged?.(); return; }
+    if (check.kind === "new_generation") {
+      this.options.onOwnerGeneration?.({
+        generation: check.generation, owner: check.owner,
+        accept: async () => {
+          await this.engine.run(() => this.engine.call(a => a.accept_generation!(server, genesis, statements, signatures)));
+          this.checkOwner(undefined);
+        },
+      });
+      return;
+    }
+    await this.acceptManagers();
+  }
+  private async acceptManagers(): Promise<void> {
+    const server = this.server, managers = this.managers;
+    if (!server) return;
+    if (managers?.anchor && managers.list) {
+      const anchor = decodeBase64Url(managers.anchor), list = decodeBase64Url(managers.list);
+      await this.engine.run(() => this.engine.call(a => a.accept_managers?.(server, anchor, list, this.now(), this.options.revocations())));
+    }
+    this.owner = await this.engine.run(async () => this.engine.withAgent(a => a.owner_view?.(server) ?? null));
+    this.notify();
+  }
   /** Who can read an active conversation (devices by uid) and whether new members get earlier messages. */
   roster(conversation: string): Roster | null { return this.rosters.get(conversation) ?? null; }
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
