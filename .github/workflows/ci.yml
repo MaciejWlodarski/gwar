@@ -31,6 +31,8 @@ jobs:
         run: cargo test -p vc-server --features test-hooks --lib teamspeak
       - name: Queued encrypted voice
         run: cargo test -p vc-server --features test-hooks --test mls voice_opaque_srtp
+      - name: Eight native SFrame senders, alone (nine real-time engines)
+        run: cargo test -p vc-server --test mls native_sframe_receiver_decodes_eight_senders_on_all_slots -- --ignored
       - name: Server without TeamSpeak support
         run: cargo build -p vc-server --no-default-features
       # Runs the official TeamSpeak server (downloaded and checksum-verified),

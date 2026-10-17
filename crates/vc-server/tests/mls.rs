@@ -2687,7 +2687,9 @@ async fn native_sframe_tone_travels_between_engines_through_the_sfu() {
     assert_eq!(retained.control(late).await.result, Some(vc_client::voice::sframe::Outcome::Ignored));
 }
 
+// Nine real-time engines: CI runs it alone (`-- --ignored`), not among the parallel MLS tests.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real-time load; run alone"]
 async fn native_sframe_receiver_decodes_eight_senders_on_all_slots() {
     let server = TestServer::start_with(|c| c.max_clients = 16).await;
     let ids: Vec<(u8, u8)> = (0..9).map(|i| (101 + i, 201 + i)).collect();
