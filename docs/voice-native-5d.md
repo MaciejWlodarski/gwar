@@ -76,7 +76,17 @@ the first SSRC, which is why its own tests never hit the check.
 
 ## Validation
 
-<!-- RESULTS -->
+| Command | Result |
+| --- | --- |
+| `cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace` | Pass: 715 |
+| `pnpm --filter web typecheck`, `eslint .` | Pass (four pre-existing warnings) |
+| `pnpm --filter web test` | Pass: 962 |
+| `pnpm --filter web e2e` | Pass: 65/65 |
+| `e2e:mls`, `e2e:dm`, `e2e:voice` (Chromium, WebKit), `e2e:native-audio` | Pass |
+| `e2e:native-voice` (Chromium, WebKit) | Pass |
+
+Run on `92cd238` (later commits change only docs and add an ignored timing
+test), macOS on Apple M5, Chromium and WebKit from Playwright 1.63.
 
 Tests added by 5d:
 
@@ -122,7 +132,56 @@ Tests added by 5d:
 
 ## Latency
 
-<!-- LATENCY -->
+The 5b method (docs/voice-sfu-5b.md "Latency method", 15 s marker warmup,
+stall inside the marker window) compares plaintext and SFrame in one build: the release `latency` example from `92cd238` (SHA-256
+`4de7e47e97abb0af4ae768f0bb7b3230f402312ea743be88c21ff22900ff0007`), run
+through wrappers that only set `LATENCY_SFRAME=0` or `1`. Native 10 ms
+packets, bitrate, callbacks and jitter settings are identical; SFrame runs use
+a real voice MLS group and the production key path. Every SFrame run matched
+at least 95/100 markers, its JSON reports `sframe: true`, every plaintext run
+`false`, and no SFrame run counted an authentication, replay, own-kid or
+duration failure (at least 4,188 decrypted packets per run). Raw data:
+`~/dev/projects/gwar-latency-runs/sframe-{a,b,c,d}/` on the measurement Mac
+(series A 13:12–14:09, B 14:09–14:58, C 15:00–16:17, D 16:18–16:29 UTC on
+2026-10-17; C and D are fresh series for the conditions A and B left
+unresolved, not top-ups).
+
+| Series | Condition | Pairs | p95 plain / SFrame (ms) | Added p95; paired 95% interval | PLC | Underruns | Decision |
+| --- | --- | ---: | --- | --- | --- | --- | --- |
+| A | idle | 16 | 42.25 / 42.15 | -0.10; [-4.30, +3.36] | 4 / 4 | 0 / 0 | INCONCLUSIVE |
+| A | loss | 4 | 39.98 / 39.98 | -0.00; [-0.17, +0.39] | 364 / 362 | 0 / 0 | PASS |
+| A | reorder | 4 | 46.32 / 47.01 | +0.69; [-0.36, +2.51] | 91 / 92 | 0 / 0 | INCONCLUSIVE |
+| A | burst | 4 | 40.08 / 39.30 | -0.78; [-1.44, +0.35] | 277 / 275 | 0 / 0 | PASS |
+| A | stall @27 s | 4 | 47.52 / 47.50 | -0.02; [-0.69, +2.11] | 40 / 42 | 0 / 0 | INCONCLUSIVE |
+| B | jitter | 9 | 49.28 / 49.21 | -0.06; [-0.32, +0.34] | 2 / 5 | 0 / 0 | INCONCLUSIVE (pairs) |
+| B | callbacks | 9 | 81.27 / 81.31 | +0.04; [-1.89, +1.33] | 29 / 24 | 0 / 0 | INCONCLUSIVE (pairs) |
+| B | mixed | 4 | 79.81 / 78.63 | -1.19; [-3.19, +1.57] | 641 / 657 | 0 / 0 | PASS |
+| B | cpu | 10 | 48.83 / 42.78 | -6.05; [-22.73, +0.40] | 12 / 6 | 0 / 0 | PASS |
+| C | idle | 11 | 49.84 / 43.13 | -6.71; [-9.31, +1.14] | 13 / 7 | 0 / 0 | PASS |
+| C | reorder | 1 | 49.61 / 39.66 | -9.95; [-9.95, -9.95] | 22 / 23 | 0 / 0 | INCONCLUSIVE (pairs) |
+| C | stall @27 s | 3 | 47.50 / 47.57 | +0.07; [-1.07, +5.90] | 32 / 31 | 0 / 0 | INCONCLUSIVE (pairs) |
+| C | jitter | 10 | 49.73 / 49.55 | -0.18; [-0.71, +0.37] | 12 / 8 | 0 / 0 | PASS |
+| C | callbacks | 10 | 81.10 / 81.15 | +0.04; [-1.89, +1.93] | 37 / 22 | 0 / 0 | PASS |
+| D | reorder | 4 | 51.79 / 53.88 | +2.09; [-9.95, +7.46] | 93 / 93 | 0 / 0 | INCONCLUSIVE |
+| D | stall @27 s | 4 | 47.50 / 51.70 | +4.20; [-2.21, +4.93] | 41 / 41 | 0 / 0 | INCONCLUSIVE |
+
+Contended slots: A 6 (foreign `rustc`/`cargo` and a foreign release binary
+at 13:24–13:28), B 2 and C 16 (`node`, a Homebrew binary and the T3 Code
+renderer), D 0; only uncontended adjacent pairs count.
+
+Measured cost of the crypto itself (`sframe_cost`, release, 160-byte 10 ms
+packets): 0.32 µs to encrypt and 0.43 µs to decrypt a packet. SFrame adds no
+queue or buffer: each packet is encrypted right before its RTP write and
+decrypted on arrival, on the RTC task.
+
+**Decision.** loss, burst, mixed, CPU, idle, jitter and callbacks PASS. No
+condition shows an added sustained queue, candidate underruns or more
+concealment (callbacks PLC 24 and 22 against 29 and 37). reorder and the stall
+condition stay INCONCLUSIVE: with four pairs their interval is decided by
+run-level latency steps of ±5–15 ms that occur in both modes, and their sign
+flips between series (A +0.69 and −0.02 ms, D +2.09 and +4.20 ms, with single
+pairs from −14.92 to +7.46 ms). The 5b callbacks question (more concealment in
+the candidate) does not reappear here.
 
 ## Not yet run (acceptance still pending)
 

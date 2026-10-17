@@ -761,3 +761,31 @@ fn every_valid_opus_duration_passes_through_sframe() {
     assert_eq!(a.state.counters.unexpected_duration, 5);
     assert_eq!(b.state.counters.unexpected_duration, 0);
 }
+
+/// Per-packet SFrame cost for docs/voice-native-5d.md:
+/// `cargo test --release -p vc-client --lib sframe_cost -- --ignored --nocapture`.
+#[test]
+#[ignore = "timing measurement, run in release"]
+fn sframe_cost() {
+    let (mut a, mut b) = (Engine { state: SframeState::new(binding(), None, 480), ..Engine::new() }, Engine::new());
+    let all = members(1, &[(0, 0), (1, 1)]);
+    a.enter(1, 0, &all, &[]);
+    b.enter(1, 1, &all, &[]);
+    let mut packet = vec![0x55; 160]; // ~64 kbit/s, 10 ms Opus
+    packet[0] = 0xf0;
+    let n = 200_000;
+    let started = std::time::Instant::now();
+    let frames: Vec<Vec<u8>> = (0..n).map(|_| a.encrypt(&packet).unwrap()).collect();
+    let encrypt = started.elapsed();
+    let started = std::time::Instant::now();
+    for frame in &frames {
+        assert!(b.decrypt(frame).is_some());
+    }
+    let decrypt = started.elapsed();
+    println!(
+        "encrypt {:.2} us/packet, decrypt {:.2} us/packet ({n} packets of {} bytes)",
+        encrypt.as_secs_f64() * 1e6 / n as f64,
+        decrypt.as_secs_f64() * 1e6 / n as f64,
+        packet.len()
+    );
+}
