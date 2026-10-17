@@ -25,12 +25,15 @@ and the web client working after every merge.
    **5b** opaque SFU payloads, bound SSRCs and sender clocks; **5c** the web
    SFrame worker and interface; **5d** the native engine. TeamSpeak audio
    isolation and S6 with the official server run in CI.
-6. **Private channels**: owner chain, manager list, access lists.
+6. **Private channels**: **6a** hidden channels with server-enforced access
+   (roles and members); **6b** the server owner chain and the signed manager
+   list; **6c** encrypted private channels whose member list is signed and
+   enforced by the group.
 7. **Key archive** on Gwar Connect.
 8. **Pre-release reviews**: the WebCrypto SFrame worker; `openmls_rust_crypto`
    and our storage.
 
-Parts 1–5 are specified below. Voice comes before private channels and the
+Parts 1–6 are specified below. Voice comes before private channels and the
 archive because it is the product's core and needs only public channel
 groups.
 
@@ -60,6 +63,18 @@ Pinned while specifying; [e2e.md](e2e.md) is updated in the same pull request.
 - **Encrypted direct messages carry no attachments** in step 3, as today's
   direct messages carry none. Encrypted attachments arrive with channels in
   step 4, for direct messages as well.
+- **Private channels can also be plaintext** (step 6). A private channel is
+  hidden from everyone it does not admit. Plaintext private channels admit
+  by roles and listed members, on the server's word; encrypted ones admit
+  only a signed member list kept in the group. The bridge does not mirror
+  private channels to TeamSpeak.
+- **Confirmers.** The owner may mark managers who may confirm other
+  managers. A manager added by any admin then waits for the owner or a
+  confirmer, not for the owner alone (answers the open question in
+  [e2e.md](e2e.md)).
+- **The owner chain's genesis is unsigned**: the first owner is the server's
+  word, pinned on first contact like the server key. Every later link is
+  signed by the previous owner's account key.
 
 ## 1. MLS core: `crates/gwar-mls`
 
@@ -2017,6 +2032,351 @@ connects to no remote hosts and claims none of those measurements.
 key derivation, counter uniqueness, replay/retention, asynchronous control and
 fail-closed boundaries), and the existing OpenMLS provider/storage reviews.
 Check the native wrapper/IPC binding and cross-implementation vectors as
-part of that review. Replace the temporary upstream git pin with the fixed
-crates.io release before step 8; a green interop test does not substitute
-for the worker review.
+part of that review. Native SFrame already uses the fixed crates.io release
+(sframe 2.1.0); a green interop test does not substitute for the worker
+review.
+
+## 6. Private channels
+
+Status: **specified, not built**. A private channel is hidden from everyone
+it does not admit. It can be plaintext or encrypted, chosen at creation as
+today:
+
+- In a **plaintext private channel** the server alone decides who is
+  admitted, from roles and listed members (6a). This is the server's word,
+  like everything else in a plaintext channel.
+- In an **encrypted private channel** the admitted members are a list signed
+  by the server's owner or one of its managers, kept in the channel's MLS
+  group, so a dishonest server cannot add a reader (6c). Its authority comes
+  from the owner chain and the manager list (6b).
+
+Three pull requests, in this order:
+
+- **6a:** `private` and `access` on channels, hiding, entry and moves, plaintext
+  chat and files, TeamSpeak (not mirrored), and the web interface. Encrypted
+  private channels are refused until 6c.
+- **6b:** the server owner, the owner chain, the signed manager list and its
+  checkpoints, pending managers, and the web interface (owner pin, transfer,
+  "Allow @name to manage private channels?").
+- **6c:** the access extension `0xff01`, the agent's and observer's rules, the
+  server's read rule from the group, joining, list changes and re-signing,
+  restarts, voice under a private parent, and the web interface.
+
+### Private and access (6a)
+
+- `Channel` gains `private: bool`, fixed at creation (`channel.create` takes
+  it; `channel.update` cannot change it). Only a holder of the Admin group or
+  of `channel_create` may create a private channel.
+- A private channel has an **access** set:
+  `access: {roles: [group id], users: [uid]}`, at most 64 roles and 1000
+  users. `channel.create` takes it, and `channel.update` changes it, which
+  needs `channel_edit`. Only admitted sessions receive it. Listing a role
+  admits the members who hold it at that moment; role changes take effect at
+  once.
+- **Admitted** sessions:
+  - for a plaintext private channel: holders of the Admin group, members of
+    a listed role, and listed uids. The server owner is admitted from 6b on.
+  - for an encrypted private channel (6c): the uids the channel's group
+    admits. Its `access` is read-only, `users` reflects the current signed
+    list, and `roles` is empty.
+- A private channel has **no password** (`bad_request`), **no children**
+  (`channel.create` and `channel.update` refuse a private parent) and is
+  **never the default channel** (`server.update` refuses it). It may itself
+  sit under a public channel.
+- **Hiding.** For a session that is not admitted, the channel does not exist:
+  - `Welcome.channels` omits it, and channel events are not sent;
+  - a client inside it is reported with `channel: null`, `voice_binding:
+    null`, and `talking` and `voice` false (on the server, not in voice);
+  - read marks, unread counts, mentions, `Welcome.conversations` and
+    `mls.groups` leave it out;
+  - requests naming it answer `not_found`, as for a deleted channel.
+- **Admission changes.** When a session stops being admitted (access edited,
+  role removed, channel made encrypted-private with a list that leaves it
+  out), the server:
+  - takes it out of the channel (it stays on the server, not in voice), and
+  - sends it `channel.deleted`.
+
+  A session that becomes admitted receives `channel.created`. Clients treat
+  a channel that disappeared and later appears again as new: nothing is
+  carried over. The web channel lifecycle accepts such an id as a fresh
+  channel, not as a reused one.
+- **Entry and moves.** `channel.join` and moderator moves into a private
+  channel require admission (`not_found` otherwise). `ChannelJoinLocked`
+  does not bypass it.
+- **Plaintext chat and files** in a private channel follow admission:
+  `can_read` requires it (history, read marks, file downloads in Members
+  mode).
+- **TeamSpeak.** The bridge does not mirror private channels at all. A Gwar
+  user inside one keeps no puppet in any TeamSpeak channel while there; the
+  puppet returns when the user leaves. TeamSpeak users are never admitted.
+- **Interface:**
+  - Create dialog: "Private" (for those who may create one), with "Who can
+    see this channel": roles and members, defaulting to the creator.
+  - Channel settings: an "Access" tab for `channel_edit` holders.
+  - Private channels show a small closed-eye icon. Nothing else changes for
+    the people admitted.
+
+### Owner chain (6b)
+
+- The **owner** is the uid that redeems the server's **first** admin token.
+  The server records it when that token is redeemed: meta `owner_genesis`
+  holds the uid, and later admin tokens (`vc-server admin-token`) never make
+  an owner. A database without an owner (one created before 6b) gets one
+  when a holder of the Admin group runs `vc-server owner set {uid}` once.
+  This is the dev stage, so no migration is attempted.
+- **Genesis** is the server's word, pinned on first contact as the server key
+  is:
+
+  ```text
+  gwar owner genesis v1
+  {server_key}
+  {owner_uid}
+  ```
+
+  Its hash `H0 = SHA-256(genesis)` is link 0. **Ownership moves** by links,
+  each signed by the previous owner's **account key**:
+
+  ```text
+  gwar owner v1
+  {server_key}
+  {seq}                   decimal, 1 for the first move
+  {previous_link_hash}    base64url SHA-256 of the previous link's statement (H0 for seq 1)
+  {previous_owner_account_key}   base64url Ed25519
+  {new_owner_uid}
+  {signed_at}             Unix ms
+  ```
+
+  - The link is valid when the account key's uid (`uid_for_key`) is the
+    previous owner's uid and the raw Ed25519 signature over the statement
+    verifies with that key.
+  - The new owner is then `new_owner_uid`, and the head is
+    `(seq, SHA-256(statement))`.
+  - Account keys sign only with the password (Connect) or the local identity,
+    as revoking a device does.
+- **Protocol:**
+  - `Welcome.owner = {uid, seq, head}`.
+  - `owner.chain {after: seq}` returns `{genesis, links: [{statement,
+    signature}]}` after `after`, at most 64 per page with `next`.
+  - `owner.transfer {statement, signature}` checks the link, appends it, and
+    gives the new owner the Admin group (the old owner keeps their roles).
+    It broadcasts `owner.updated {uid, seq, head}`.
+- **Client pins**, per server key, beside the server key pin:
+  - `{seq, head}` and the owner uid.
+  - On connect, a client with a pin fetches the chain after its seq and
+    accepts it only if it extends the pin link by link; otherwise it
+    disconnects with "The server's owner record changed". A client without a
+    pin takes the server's genesis (trust on first use), or the owner named
+    by an invite link.
+  - Invite links carry `owner={uid}` next to `server_key`.
+  - If the owner's account is lost for good there is no link. Accepting a new
+    owner is then the same neutral notice as a changed handle, with explicit
+    acceptance, which re-pins from the server's current genesis and chain.
+
+### Manager list (6b)
+
+The managers of encrypted private channels are a signed list. Each entry is
+a uid, marked `+` when that manager may confirm other managers (a
+**confirmer**):
+
+```text
+gwar managers v1
+{server_key}
+{seq}                    decimal, 1 first
+{owner_uid}
+{owner_head}             base64url hash of the owner chain head
+{entries}                comma-separated, sorted by uid: uid or uid+ ; - when empty
+{signer_uid}
+{signed_at}              Unix ms
+```
+
+Stored and sent as three netstrings: the statement, the signer's credential,
+and its device's Ed25519 signature (as for the descriptor).
+
+- **Validity:**
+  - the credential is well-formed with uid `signer_uid` and the signature
+    verifies;
+  - `owner_head` is the head the reader pinned, so an ownership move
+    invalidates every manager list until the new owner signs one;
+  - the owner never appears in `{entries}`.
+- **Who may sign seq n:**
+  - The owner may sign any list.
+  - A confirmer on list n−1 may sign list n when list n changes only entries
+    without `+` (it adds or removes plain managers) and does not add itself.
+  - `seq` grows by exactly 1.
+- **Current**: the signer's certificate is current (not expired, not revoked)
+  now. Readers keep the newest list they accepted, which must have been
+  current when they first saw it. Authority comes only from the newest list,
+  and only while it is current.
+- **Mirroring `channel_edit`.** The intended managers are the holders of
+  `channel_edit`. The server reports the difference in `Welcome.managers =
+  {list, pending: [uid], stale: [uid]}` and in `managers.updated`:
+  - `pending`: holders of `channel_edit` not on the list;
+  - `stale`: entries that lost it.
+- **Who signs, from the clients of the owner and of confirmers:**
+  - Stale entries are removed automatically.
+  - A pending uid is added automatically when this client's own role change
+    granted it `channel_edit`. Otherwise its owner or confirmer sees "Allow
+    @name to manage private channels?" (Allow / Not now). "Not now" is
+    remembered per list seq.
+  - The owner may mark or unmark confirmers in server settings ("Can approve
+    managers").
+  - Plain managers sign nothing.
+- **Re-signing.** The owner's client re-signs the unchanged list (seq + 1) when
+  the newest list is older than 60 days, or when its signer's certificate
+  expires within 7 days or was revoked. A confirmer's client does the same
+  when the owner has not done it within 7 days of that point. If no current
+  list exists, encrypted private channels admit no newcomers (6c) until one
+  is signed.
+- **Protocol:**
+  - `managers.update {list}`: the server checks validity, seq and the
+    signer's authority against its newest list, stores it and broadcasts
+    `managers.updated`.
+  - The server keeps only the newest list. Clients fetch the list with the
+    Welcome.
+- **Client checkpoints**, per server key: `(seq, hash)` of the newest
+  accepted list. A lower seq is rejected; the same seq is accepted only with
+  the same hash.
+- **Storage:**
+  - The web agent keeps these server records (owner pin, manager checkpoint)
+    in the existing `groups` store under the key `{server}/@server`, written
+    atomically with the group records that depend on them.
+  - The server keeps `owner_chain(seq, statement, signature)` and
+    `managers(seq, blob)`.
+
+### Encrypted private channel groups (6c)
+
+- **Descriptor:** `private = 1`, `founding_owner` = the owner uid at creation
+  (history only; current authority comes from the lists). The creator must
+  be the owner or a manager on the creator's current manager list. The
+  server and every client check this.
+- **The access extension `0xff01`** in the GroupContext holds two netstrings:
+  1. the **manager list** blob, as above;
+  2. the **member list**: three netstrings (statement, signer credential,
+     signature) of
+
+     ```text
+     gwar channel members v1
+     {server_key}
+     {group_id}              base64url: the list is bound to this group
+     {seq}                   decimal, 1 first
+     {manager_list_hash}     base64url SHA-256 of the manager statement it was signed under
+     {member uids}           comma-separated, sorted; - when empty
+     {signer_uid}
+     {signed_at}             Unix ms
+     ```
+
+     signed by the owner or a manager on that manager list.
+- **Capabilities.** From 6c on every key package and leaf advertises `0xff01`
+  as well as `0xff00`. A private channel's group requires both in its
+  RequiredCapabilities. Other groups require only `0xff00`, as today. Old key
+  packages are replaced, as this is the dev stage.
+- **Membership rule** (the agent's and the observer's tree rule): every
+  leaf's uid is the owner, a manager on the extension's manager list, or a
+  member on its member list.
+- **Changes.** Any member may commit a `GroupContextExtensions` proposal that
+  replaces `0xff01` only; `0xff00`, the external senders and the required
+  capabilities stay byte-identical.
+  - **The new lists:**
+    - both parse and verify;
+    - the manager list's seq is at least the previous one's;
+    - the member list's seq is greater, or equal with the same hash;
+    - the member list's signer is the owner or a manager of the new manager
+      list;
+    - both signers' certificates are current at the commit's time (the
+      certificate window, as for leaves).
+  - **The same commit** removes every leaf the new lists no longer admit.
+  - **A list change is not a proposal type of its own:** the allowlist gains
+    `GroupContextExtensions` for private channel groups only.
+- **Who commits.** The owner and managers are always admitted, so their
+  devices join every private channel's group, which lets them change it.
+  - Editing access in the interface signs a new member list (roles are
+    expanded to their current members at signing time) and commits it with
+    the removals.
+  - When a new manager list is accepted, owner and manager clients carry it
+    into every private group they are in, one group at a time. A newer
+    manager list that drops the member list's signer requires a re-signed
+    member list in the same commit.
+- **Currency and newcomers:**
+  - A device that is not yet a member joins only if both lists in the
+    current GroupInfo are current now. Otherwise it shows "Waiting for a
+    channel manager to confirm access" and retries after `managers.updated`
+    or every hour.
+  - Members keep the lists they accepted.
+  - The owner's and managers' clients re-sign a member list (seq + 1, same
+    members) when it is older than 60 days or its signer's certificate
+    expires within 7 days or was revoked.
+- **Checkpoints.** Per group, the agent keeps `(seq, hash)` of the newest
+  accepted member list. It rejects a lower seq and the same seq with another
+  hash, also across a restart chain.
+- **Server:**
+  - the observer parses `0xff01` after every commit;
+  - `mls_can_read` for a private channel's conversation is the extension's
+    admitted set;
+  - channel visibility (6a) follows the same set;
+  - `mls_missing_proposals` proposes removing leaves the current set does
+    not admit (with the existing reasons: not a member, banned, revoked);
+  - `mls.group.create` for a private channel checks the creator against the
+    server's newest manager list.
+- **Restarts.**
+  - Only the owner or a manager may create a successor of a private channel's
+    group (descriptor creator check).
+  - The successor's initial `0xff01` carries the newest manager list and a
+    member list bound to the successor's group id, with the predecessor's
+    members unless edited (seq starts at 1 for the new group).
+  - Clients accept the successor along the chain as in section 4 and check
+    the creator's authority against their manager checkpoint.
+- **Voice.**
+  - A private channel's voice group binds to its parent as in 5a. The agent
+    no longer refuses a private parent.
+  - Voice membership is the parent's current tree, so it follows access.
+- **History** is unchanged: it is shared among the group's members, who are
+  exactly the admitted devices.
+- **Interface:**
+  - The access tab of an encrypted private channel lists members by uid and
+    offers "Add everyone with role…" (expanded when signed).
+  - It shows who signed the current list and when.
+  - "Who can read" is unchanged: the group's devices.
+
+### Tests and acceptance
+
+- **6a, server:**
+  - hiding in the Welcome, in events and in `Client.channel` for every
+    admission path (role, user, admin);
+  - entry and moderator moves refused;
+  - admission loss while inside (moved out, `channel.deleted`), and
+    admission gained (`channel.created`);
+  - plaintext chat, history and files refused;
+  - no password, no children, never the default channel;
+  - TeamSpeak: not mirrored, no puppet while inside, with the official
+    server in CI (S6-style probe that a TeamSpeak client sees no trace).
+  - Web e2e: a role-based private channel visible to role members only;
+    removing the role hides it live.
+- **6b:**
+  - statement encodings (golden vectors in `gwar-mls`);
+  - chain extension and refusal (wrong key, wrong previous hash, gaps,
+    forks);
+  - genesis at the first token only;
+  - transfer with the Admin grant;
+  - manager list signing rules (owner, confirmer limits, seq), currency with
+    revocations, checkpoints;
+  - pending and stale reporting after role changes;
+  - automatic and confirmed signing;
+  - re-signing deadlines;
+  - client pins: an extended chain is accepted; a forked or rewound one
+    disconnects; invite links name the owner.
+- **6c:**
+  - extension parsing, and the tree rule with uids outside the lists;
+  - GCE commits: only `0xff01` changes; seq monotonic; signer authority;
+    removals in the same commit; current certificates at commit time;
+  - the observer and the agent agree;
+  - a newcomer refused with non-current lists;
+  - a manager list change carried into groups;
+  - a dropped signer forcing re-signing;
+  - restart authority and the successor's list bound to the new group id;
+  - voice under a private parent, and access removal cutting voice;
+  - a dishonest-server test: the server cannot get a non-listed device's
+    external commit accepted by members, nor hide a newer list from a
+    member;
+  - web e2e: owner and manager create a private encrypted channel, add a
+    member by role expansion, remove them (removed from the group and the
+    view), and the member list survives restart.

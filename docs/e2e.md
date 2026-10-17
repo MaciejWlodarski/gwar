@@ -319,6 +319,15 @@ with signed statements that newcomers can check without any history:
   newcomers comes from the current access list.
 - The owner and the managers are always allowed readers, as admins see every
   channel on Discord.
+- **Confirmers.** The owner may mark managers as confirmers: a confirmer may
+  sign a manager list that adds or removes plain managers, so a manager added
+  by another admin need not wait for the owner alone. Only the owner changes
+  who is a confirmer.
+- **Hidden, and plaintext too.** A private channel is hidden from everyone it
+  does not admit (its name, its existence and who is in it). Private channels
+  may also be plaintext: those admit by roles and listed members on the
+  server's word, as a role-based channel on Discord. The guarantees above are
+  for encrypted private channels. TeamSpeak never sees private channels.
 
 ## Messages
 
@@ -855,9 +864,6 @@ Still to measure before building: S6 with the official TeamSpeak server.
 
 ## Open questions
 
-- A manager added by an admin other than the owner waits for the owner's
-  client. Is that acceptable on servers whose owner is rarely online, or
-  should the owner be able to delegate that confirmation?
 - History bundles grow with every epoch (about 40 bytes each). If channels
   reach many thousands of epochs, a key tree can replace the flat list.
 - SFrame suite for voice: `AES_128_GCM_SHA256_128` (16-byte tag) by default;
