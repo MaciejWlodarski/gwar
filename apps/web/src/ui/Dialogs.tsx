@@ -6,7 +6,7 @@ import { RequestError } from "../net/connection";
 import type { Channel } from "../proto/Channel";
 import type { ChannelAccess } from "../proto/ChannelAccess";
 import { AccessPicker } from "./ChannelAccess";
-import { sameAccess } from "../lib/access";
+import { rebaseAccess, sameAccess } from "../lib/access";
 import { controller, describeRequestError } from "../state/controller";
 import { sortedChannels } from "../state/reducer";
 import { isDesktop } from "../platform";
@@ -243,6 +243,8 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
   const [privateChannel, setPrivateChannel] = useState(false);
   const isPrivate = props.mode === "create" ? privateChannel : !!existing?.private;
   const [access, setAccess] = useState<ChannelAccess>(() => existing?.access ?? { roles: [], users: me ? [me] : [] });
+  // What the dialog opened with: saving sends only the changes made here, on top of the current access.
+  const [openedAccess] = useState(access);
   // An encrypted channel has no password: its messages are readable only by its group anyway.
   const sealedChannel = (offerEncryption ? encrypted && !privateChannel : !!existing?.encrypted) || isPrivate;
 
@@ -294,7 +296,7 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
           // 0 removes the limit (protocol rule for channel.update).
           ...(max !== (existing.max_clients ?? null) ? { max_clients: max ?? 0 } : {}),
           ...(parentChanged ? (parentId === null ? { move_to_root: true } : { parent: parentId }) : {}),
-          ...(existing.private && !sameAccess(existing.access, access) ? { access } : {}),
+          ...(existing.private && !sameAccess(openedAccess, access) ? { access: rebaseAccess(openedAccess, access, existing.access) } : {}),
         });
       }
       close();

@@ -423,6 +423,27 @@ describe("opening channel chats", () => {
   });
 });
 
+describe("a channel hidden from me", () => {
+  it("closes its open image and loads its history again when it is shown again", async () => {
+    connectFake();
+    await vi.advanceTimersByTimeAsync(10);
+    const att = { id: "f1", name: "a.png", mime: "image/png", size: 1, url: "/files/f1", sha256: "x" } as never;
+    link.emit({ ev: "chat.message", d: message(40, 2, { attachments: [att] }) });
+    controller.selectChannel(2);
+    await vi.advanceTimersByTimeAsync(10);
+    const loads = () => link.sent("chat.history").filter((f) => (f.d as { channel: number }).channel === 2).length;
+    const before = loads();
+    expect(before).toBeGreaterThan(0);
+    stores.useUi.getState().openDialog({ kind: "lightbox", attachment: att, verified: true });
+    link.emit({ ev: "channel.hidden", d: { channel: 2 } });
+    expect(stores.useUi.getState().dialog.kind).toBe("none");
+    link.emit({ ev: "channel.created", d: chan(2) });
+    controller.selectChannel(2);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(loads()).toBe(before + 1);
+  });
+});
+
 describe("telling the server what I have read", () => {
   it("reports the newest message of the open chat once, after a pause", async () => {
     connectFake();

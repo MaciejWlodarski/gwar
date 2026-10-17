@@ -3,6 +3,7 @@ import { useT } from "../i18n";
 import { ADMIN_GROUP } from "../lib/permissions";
 import type { ChannelAccess } from "../proto/ChannelAccess";
 import { useSession } from "../state/stores";
+import { useMyGroups } from "./hooks";
 import { Input } from "./kit";
 
 /** Who a private channel admits besides admins: roles and members (docs/e2e-build.md, section 6). */
@@ -10,12 +11,21 @@ export function AccessPicker({ value, onChange }: { value: ChannelAccess; onChan
   const t = useT();
   const groups = useSession((s) => s.groups);
   const members = useSession((s) => s.members);
+  const myGroups = useMyGroups();
   const [filter, setFilter] = useState("");
-  const roles = useMemo(() => Object.values(groups).filter((g) => g.id !== ADMIN_GROUP).sort((a, b) => a.name.localeCompare(b.name)), [groups]);
+  // A role is listed only by someone holding it or Admin; one already listed can always be removed.
+  const roles = useMemo(
+    () =>
+      Object.values(groups)
+        .filter((g) => g.id !== ADMIN_GROUP && (myGroups.includes(ADMIN_GROUP) || myGroups.includes(g.id) || value.roles.includes(g.id)))
+        .sort((a, b) => a.name.localeCompare(b.name)),
+    [groups, myGroups, value.roles],
+  );
   const people = useMemo(() => {
     const needle = filter.trim().toLowerCase();
     return Object.values(members)
-      .filter((m) => !needle || m.nickname.toLowerCase().includes(needle))
+      // TeamSpeak users are never admitted to a private channel.
+      .filter((m) => !m.uid.startsWith("ts:") && (!needle || m.nickname.toLowerCase().includes(needle)))
       .sort((a, b) => Number(value.users.includes(b.uid)) - Number(value.users.includes(a.uid)) || a.nickname.localeCompare(b.nickname))
       .slice(0, 200);
   }, [members, filter, value.users]);

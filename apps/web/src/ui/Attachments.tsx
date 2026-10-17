@@ -54,8 +54,11 @@ function useNearView<T extends Element>(): [RefCallback<T>, boolean] {
   return [setNode, near || !observable];
 }
 
-/** The download token, sent only to a server whose files are for members (a link needs no credential). */
-const fileAccess = (s: ReturnType<typeof useSession.getState>) => (s.server?.file_access === "members" ? s.fileAccess : null);
+/**
+ * The download token, always sent to the server's own origin: files of a private channel need an
+ * admitted session even where a link is otherwise enough (docs/e2e-build.md, section 6).
+ */
+const fileAccess = (s: ReturnType<typeof useSession.getState>) => s.fileAccess;
 
 type UrlOptions = { autoLoad?: boolean; active?: boolean; budget?: ImageBudget };
 function useAttachmentUrl(att: Attachment, verified: boolean, { autoLoad = true, active = true, budget }: UrlOptions = {}) {

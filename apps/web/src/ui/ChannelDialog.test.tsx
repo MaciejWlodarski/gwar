@@ -7,14 +7,15 @@ import { useSession, useUi } from "../state/stores";
 import { Dialogs } from "./Dialogs";
 import { TooltipProvider } from "./kit";
 
-const mock = vi.hoisted(() => ({ create: vi.fn(async (_: object) => ({ id: 9 })) }));
-vi.mock("../state/controller", () => ({ controller: { messageServerKey: "server-a", createChannel: mock.create }, describeRequestError: String, UploadError: class extends Error {} }));
+const mock = vi.hoisted(() => ({ create: vi.fn(async (_: object) => ({ id: 9 })), update: vi.fn(async (_: object) => ({})) }));
+vi.mock("../state/controller", () => ({ controller: { messageServerKey: "server-a", createChannel: mock.create, updateChannel: mock.update }, describeRequestError: String, UploadError: class extends Error {} }));
 
 describe("creating a channel", () => {
   let container: HTMLDivElement, root: Root;
   beforeEach(() => {
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
     mock.create.mockClear();
+    mock.update.mockClear();
     useSettings.setState({ language: "en", channelEncryption: {} });
     useSession.setState({ kind: "vc", channels: {} });
     container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
@@ -75,5 +76,33 @@ describe("creating a channel", () => {
     await create("hidden");
     expect(mock.create).toHaveBeenCalledWith(expect.objectContaining({ name: "hidden", password: null, private: true, access: { roles: [], users: ["me-uid"] } }));
     expect(mock.create.mock.calls[0]![0]).not.toHaveProperty("encrypted");
+  });
+  it("offers only roles I hold and no TeamSpeak users in the access picker", async () => {
+    const role = (id: number, name: string) => ({ id, name, permissions: [], color: null });
+    useSession.setState({
+      me: { session: 1, uid: "me-uid" } as never,
+      clients: { 1: { id: 1, uid: "me-uid", groups: [2, 5] } as never },
+      groups: { 1: role(1, "Admin"), 2: role(2, "Member"), 5: role(5, "Crew"), 6: role(6, "Elsewhere") },
+      members: { "ts:abc": { uid: "ts:abc", nickname: "Bridged", groups: [] } as never, alice: { uid: "alice", nickname: "Alice", groups: [] } as never },
+    });
+    await open();
+    await act(async () => switchFor("Private")!.click());
+    const text = document.querySelector('[role="dialog"]')!.textContent!;
+    expect(text).toContain("Crew");
+    expect(text).not.toContain("Elsewhere");
+    expect(text).toContain("Alice");
+    expect(text).not.toContain("Bridged");
+  });
+  it("saving other settings never resends an access list changed meanwhile", async () => {
+    const channel = { id: 4, parent: null, name: "p", topic: "", position: 0, has_password: false, max_clients: null, encrypted: false, history: false, private: true, access: { roles: [], users: ["me-uid", "bob"] } };
+    useSession.setState({ me: { session: 1, uid: "me-uid" } as never, clients: {}, groups: {}, members: {}, channels: { 4: channel } });
+    useUi.getState().openDialog({ kind: "channelEdit", mode: "edit", channel: 4 });
+    await act(async () => root.render(<TooltipProvider><Dialogs /></TooltipProvider>));
+    // Another admin removes Bob while the dialog is open.
+    await act(async () => useSession.setState({ channels: { 4: { ...channel, access: { roles: [], users: ["me-uid"] } } } }));
+    const button = [...document.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')].find(b => b.textContent === "Save")!;
+    await act(async () => button.click());
+    expect(mock.update).toHaveBeenCalledTimes(1);
+    expect(mock.update.mock.calls[0]![0]).not.toHaveProperty("access");
   });
 });
