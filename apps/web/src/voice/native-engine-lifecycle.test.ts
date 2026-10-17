@@ -200,3 +200,70 @@ describe("native microphone test replacement", () => {
     await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("mic_test_stop", { owner: 1 }));
   });
 });
+
+describe("native encrypted runs", () => {
+  const b64 = (n: number, v: number) => btoa(String.fromCharCode(...new Array<number>(n).fill(v))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const binding = { server_key: b64(32, 1), session: 7, channel: 3, call: b64(16, 2), participation: b64(16, 3), group: b64(32, 4) };
+  function keySource(resume: string | null = null) {
+    const attached: { run: number; control: (body: never) => Promise<unknown>; close(): void }[] = [];
+    const statuses: unknown[] = [];
+    return {
+      attached, statuses,
+      source: { resumeAfter: () => resume, attach: (media: never) => { attached.push(media); }, engineStatus: (s: unknown) => { statuses.push(s); } },
+    };
+  }
+
+  it("binds the run before negotiation, attaches after it and relays controls with that run", async () => {
+    const view = engine();
+    const keys = keySource("41");
+    await view.start({ ...params(), mode: "encrypted", binding, keys: keys.source as never });
+    const start = bridge.invoke.mock.calls.find(([command]) => command === "voice_start")!;
+    expect(start[1]).toMatchObject({ mode: "encrypted", binding, resumeAfter: "41" });
+    const run = start[1].run as number;
+    expect(keys.attached.map(a => a.run)).toEqual([run]);
+    const original = bridge.invoke.getMockImplementation()!;
+    bridge.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) =>
+      command === "voice_set_keys" ? { serial: "1", epoch: "5", result: "applied" } : original(command, args));
+    const body = { action: "supersede", serial: "1", epoch: "5" };
+    await expect(keys.attached[0]!.control(body as never)).resolves.toEqual({ serial: "1", epoch: "5", result: "applied" });
+    expect(bridge.invoke).toHaveBeenCalledWith("voice_set_keys", { owner: 1, run, body });
+    expect(await view.capabilities.encryptedVoice()).toBe(true);
+  });
+
+  it("refuses encrypted mode without keys or a full binding", async () => {
+    const view = engine();
+    await expect(view.start({ ...params(), mode: "encrypted", binding })).rejects.toMatchObject({ kind: "unsupported" });
+    await expect(view.start({ ...params(), mode: "encrypted", binding: { ...binding, group: null }, keys: keySource().source as never })).rejects.toMatchObject({ kind: "unsupported" });
+    expect(bridge.invoke.mock.calls.some(([command]) => command === "voice_start")).toBe(false);
+  });
+
+  it("forwards crypto statuses of the current run only; failed closes the engine state", async () => {
+    const view = engine();
+    const keys = keySource();
+    const states: string[] = [];
+    view.on("state", s => states.push(s));
+    await view.start({ ...params(), mode: "encrypted", binding, keys: keys.source as never });
+    const run = keys.attached[0]!.run;
+    const status = { binding: { ...binding, run }, state: "securing", reason: "key_expired" };
+    emit("voice://crypto", { owner: 1, run: run - 1, ...status });
+    emit("voice://crypto", { owner: 2, run, ...status });
+    expect(keys.statuses).toEqual([]);
+    emit("voice://crypto", { owner: 1, run, ...status });
+    expect(keys.statuses).toEqual([status]);
+    emit("voice://crypto", { owner: 1, run, ...status, state: "failed", reason: "key_conflict" });
+    expect(states.at(-1)).toBe("failed");
+  });
+
+  it("closing the call controller stops this run, not a newer one", async () => {
+    const view = engine();
+    const first = keySource(), second = keySource();
+    await view.start({ ...params(), mode: "encrypted", binding, keys: first.source as never });
+    await view.start({ ...params(), mode: "encrypted", binding, keys: second.source as never });
+    const stops = () => bridge.invoke.mock.calls.filter(([command]) => command === "voice_stop").length;
+    const before = stops();
+    first.attached[0]!.close();
+    expect(stops()).toBe(before);
+    second.attached[0]!.close();
+    await vi.waitFor(() => expect(stops()).toBe(before + 1));
+  });
+});

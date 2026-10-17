@@ -73,6 +73,8 @@ pub fn run() {
             voice::voice_start,
             voice::voice_answer,
             voice::voice_stop,
+            voice::voice_set_keys,
+            voice::voice_crypto_counters,
             voice::voice_set_muted,
             voice::voice_set_deafened,
             voice::voice_set_ptt,

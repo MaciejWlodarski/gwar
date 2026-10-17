@@ -702,7 +702,7 @@ class Controller {
   /** Why this engine cannot join encrypted voice, or null when it can. */
   private async encryptedVoiceRefusal(): Promise<string | null> {
     if (await this.engine.capabilities.encryptedVoice()) return null;
-    return tNow(isDesktop() ? "voice.encryptedPending" : "voice.encryptedUnsupported");
+    return tNow("voice.encryptedUnsupported");
   }
 
   private endVoiceCall(): void {
