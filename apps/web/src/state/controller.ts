@@ -51,6 +51,7 @@ import type { pruneRequest } from "../lib/prune";
 import { identitySeed, uidForPublicKey, accountKeyOf, importIdentity, loadActiveIdentity, IdentityUnsupportedError, type Identity } from "../net/identity";
 import { isDesktop } from "../platform";
 import { createVoiceEngine } from "../voice";
+import { microphoneSsrc } from "../voice/sdp";
 import { VoiceError, type VoiceEngine } from "../voice/engine";
 import { channelThreadKey, latestMessageId, myChannelId, storedKey } from "./reducer";
 import { inAccount, newId, useSettings, type ServerKind } from "./settings";
@@ -786,9 +787,9 @@ class Controller {
         // On TeamSpeak servers the native engine sends frames over the TS connection and never asks for an offer.
         offer: async (sdp, run) => {
           if (!current()) throw new Error("Stale voice participation");
-          const sources = [...new Set([...sdp.matchAll(/^a=ssrc:(\d+) /gm)].map(m => Number(m[1])))];
-          if (sources.length !== 1 || !sources[0]) throw new Error("Expected one microphone SSRC");
-          const answer = await conn.request("voice.offer", {channel,call:participation!.call,participation:participation!.participation,run,group,ssrc:sources[0],sdp}, {timeoutMs:15_000});
+          const ssrc = microphoneSsrc(sdp);
+          if (ssrc === null) throw new Error("Expected one microphone SSRC");
+          const answer = await conn.request("voice.offer", {channel,call:participation!.call,participation:participation!.participation,run,group,ssrc,sdp}, {timeoutMs:15_000});
           if (!current() || answer.call !== participation!.call || answer.participation !== participation!.participation || answer.run !== run) throw new Error("Stale voice answer");
           return answer.sdp;
         },
