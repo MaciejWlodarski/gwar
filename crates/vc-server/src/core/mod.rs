@@ -40,10 +40,10 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use vc_proto::{
-    Channel, ChannelAccess, ChannelCreate, ChannelId, ChannelUpdate, ChatMessage, ChatTarget, Client, ClientUpdate, DeviceCertificate,
-    ErrorBody, ErrorCode, Event, FileAccess, Group, GroupId, IceServer, LeaveReason, MessageId, MessageSignature,
-    NICKNAME_MAX_LEN, Permission, Platform, Request, Response, ServerFrame, ServerInfo, SessionId, Uid, Unread,
-    Welcome,
+    Channel, ChannelAccess, ChannelCreate, ChannelId, ChannelUpdate, ChatMessage, ChatTarget, Client, ClientUpdate,
+    DeviceCertificate, ErrorBody, ErrorCode, Event, FileAccess, Group, GroupId, IceServer, LeaveReason, MessageId,
+    MessageSignature, NICKNAME_MAX_LEN, Permission, Platform, Request, Response, ServerFrame, ServerInfo, SessionId,
+    Uid, Unread, Welcome,
 };
 
 use self::bridge::{BridgeMsg, BridgeNote, RemoteClient};
@@ -731,9 +731,7 @@ impl Core {
         match event {
             Event::ChannelCreated(c) | Event::ChannelUpdated(c) if hidden(c.id) => EventView::Hidden,
             Event::ChannelDeleted { channel } if hidden(*channel) => EventView::Hidden,
-            Event::ChatMessage(m) | Event::ChatEdited(m)
-                if matches!(m.target, ChatTarget::Channel(c) if hidden(c)) =>
-            {
+            Event::ChatMessage(m) | Event::ChatEdited(m) if matches!(m.target, ChatTarget::Channel(c) if hidden(c)) => {
                 EventView::Hidden
             }
             Event::ChatDeleted { channel, .. } if hidden(*channel) => EventView::Hidden,
@@ -760,16 +758,32 @@ impl Core {
     /// Whether `viewer` may see `channel`: every public channel; a private one for
     /// admins, its roles and its users. The bridge (`None`) sees no private channel.
     fn admitted(&self, viewer: Option<&Session>, channel: ChannelId) -> bool {
+        // TeamSpeak users (sessions without our transport) are never admitted.
+        let viewer = viewer.filter(|s| s.out.is_some());
+        self.uid_admitted(viewer.map(|s| (s.uid.as_str(), s.groups.as_slice())), channel)
+    }
+
+    /// Admission of a member with these groups, online or not; `None` is nobody.
+    fn uid_admitted(&self, member: Option<(&str, &[GroupId])>, channel: ChannelId) -> bool {
         let Some(row) = self.channels.get(&channel) else { return true };
         if !row.private {
             return true;
         }
-        // TeamSpeak users (sessions without our transport) are never admitted.
-        let Some(s) = viewer.filter(|s| s.out.is_some()) else { return false };
-        if s.groups.contains(&ADMIN_GROUP) {
-            return true;
-        }
-        row.access.as_ref().is_some_and(|a| a.users.contains(&s.uid) || a.roles.iter().any(|r| s.groups.contains(r)))
+        let Some((uid, groups)) = member else { return false };
+        groups.contains(&ADMIN_GROUP)
+            || row
+                .access
+                .as_ref()
+                .is_some_and(|a| a.users.iter().any(|u| u == uid) || a.roles.iter().any(|r| groups.contains(r)))
+    }
+
+    /// Granting access is delegation: whoever gives out or changes `roles` must be admitted to every
+    /// private channel those roles admit (docs/e2e-build.md, section 6).
+    fn may_delegate(&self, granter: (&str, &[GroupId]), roles: &[GroupId]) -> bool {
+        self.channels
+            .values()
+            .filter(|c| c.private && c.access.as_ref().is_some_and(|a| a.roles.iter().any(|r| roles.contains(r))))
+            .all(|c| self.uid_admitted(Some(granter), c.id))
     }
 
     /// `viewer`'s copy of a channel, or `None` when it is hidden from them.
@@ -803,9 +817,13 @@ impl Core {
             if self.sessions[&session].channel == Some(channel) {
                 let _ = self.channel_leave(session);
             }
-            let inside: Vec<_> =
-                self.sessions.values().filter(|s| s.channel == Some(channel)).map(|s| masked_client(client_view(s))).collect();
-            self.send_event(session, Event::ChannelDeleted { channel });
+            let inside: Vec<_> = self
+                .sessions
+                .values()
+                .filter(|s| s.channel == Some(channel))
+                .map(|s| masked_client(client_view(s)))
+                .collect();
+            self.send_event(session, Event::ChannelHidden { channel });
             for client in inside {
                 self.send_event(session, Event::ClientUpdated(client));
             }
@@ -1657,8 +1675,20 @@ impl Core {
         )
     }
 
-    fn sibling_name_taken(&self, parent: Option<ChannelId>, name: &str, except: Option<ChannelId>) -> bool {
-        self.channels.values().any(|c| c.parent == parent && Some(c.id) != except && c.name.eq_ignore_ascii_case(name))
+    /// Names are unique among the siblings `viewer` can see, so a hidden sibling is no name oracle.
+    fn sibling_name_taken(
+        &self,
+        viewer: Option<&Session>,
+        parent: Option<ChannelId>,
+        name: &str,
+        except: Option<ChannelId>,
+    ) -> bool {
+        self.channels.values().any(|c| {
+            c.parent == parent
+                && Some(c.id) != except
+                && c.name.eq_ignore_ascii_case(name)
+                && (viewer.is_none() || self.admitted(viewer, c.id))
+        })
     }
 
     fn validate_max_clients(max: Option<u32>) -> Result<(), ErrorBody> {
@@ -1679,7 +1709,7 @@ impl Core {
             if c.parent.is_some_and(|p| !self.channels.contains_key(&p)) {
                 return Err(err(ErrorCode::NotFound, "no such parent channel"));
             }
-            if self.sibling_name_taken(c.parent, &name, None) {
+            if self.sibling_name_taken(Some(&self.sessions[&session]), c.parent, &name, None) {
                 return Err(err(ErrorCode::Conflict, "a channel with this name already exists here"));
             }
             Self::validate_max_clients(c.max_clients)?;
@@ -1703,7 +1733,9 @@ impl Core {
                     return Err(err(ErrorCode::BadRequest, "a private channel has no password"));
                 }
                 let uid = self.sessions[&session].uid.clone();
-                Some(self.checked_access(c.access.clone().unwrap_or(ChannelAccess { roles: vec![], users: vec![uid] }))?)
+                let access = c.access.clone().unwrap_or(ChannelAccess { roles: vec![], users: vec![uid] });
+                self.may_list_roles(session, &access.roles, &[])?;
+                Some(self.checked_access(access)?)
             } else if c.access.is_some() {
                 return Err(err(ErrorCode::BadRequest, "only a private channel has access"));
             } else {
@@ -1736,13 +1768,13 @@ impl Core {
                 if !core.sessions.contains_key(&session) {
                     return;
                 }
-                let result = core.insert_channel(ChannelRow { password_hash: hash, ..row }, plaintext);
+                let result = core.insert_channel(session, ChannelRow { password_hash: hash, ..row }, plaintext);
                 core.reply(session, id, result);
             },
         )
     }
 
-    fn insert_channel(&mut self, mut row: ChannelRow, plaintext: Option<String>) -> Reply {
+    fn insert_channel(&mut self, session: SessionId, mut row: ChannelRow, plaintext: Option<String>) -> Reply {
         // State may have changed while the password was hashed.
         let parent = row.parent;
         if parent.is_some_and(|p| !self.channels.contains_key(&p)) {
@@ -1751,7 +1783,7 @@ impl Core {
         if parent.is_some_and(|p| self.channels[&p].private) {
             return Err(err(ErrorCode::BadRequest, "a private channel has no child channels"));
         }
-        if self.sibling_name_taken(parent, &row.name, None) {
+        if self.sibling_name_taken(self.sessions.get(&session), parent, &row.name, None) {
             return Err(err(ErrorCode::Conflict, "a channel with this name already exists here"));
         }
         row.position = self.channels.values().filter(|c| c.parent == parent).map(|c| c.position + 1).max().unwrap_or(0);
@@ -1761,7 +1793,11 @@ impl Core {
         let private = row.private;
         self.channels.insert(id, row);
         if !private {
-            self.notify_bridge(|| BridgeNote::Channel { channel: view.clone(), created: true, password: Some(plaintext) });
+            self.notify_bridge(|| BridgeNote::Channel {
+                channel: view.clone(),
+                created: true,
+                password: Some(plaintext),
+            });
         }
         self.broadcast_channel(Event::ChannelCreated(view.clone()));
         Ok(Response::Channel(view))
@@ -1816,6 +1852,8 @@ impl Core {
                 if !row.private {
                     return Err(err(ErrorCode::BadRequest, "only a private channel has access"));
                 }
+                let before = row.access.as_ref().map(|a| a.roles.clone()).unwrap_or_default();
+                self.may_list_roles(session, &access.roles, &before)?;
                 row.access = Some(self.checked_access(access.clone())?);
             }
             match u.max_clients {
@@ -1830,7 +1868,7 @@ impl Core {
             if let Some(position) = u.position {
                 row.position = position;
             }
-            if self.sibling_name_taken(row.parent, &row.name, Some(row.id)) {
+            if self.sibling_name_taken(Some(&self.sessions[&session]), row.parent, &row.name, Some(row.id)) {
                 return Err(err(ErrorCode::Conflict, "a channel with this name already exists here"));
             }
             if let Some(p) = &u.password {
@@ -1878,7 +1916,9 @@ impl Core {
         let Some(current) = self.channels.get(&channel) else {
             return Err(err(ErrorCode::NotFound, "no such channel"));
         };
-        if row.parent.is_some_and(|p| !self.channels.contains_key(&p) || self.is_descendant(p, channel) || self.channels[&p].private) {
+        if row.parent.is_some_and(|p| {
+            !self.channels.contains_key(&p) || self.is_descendant(p, channel) || self.channels[&p].private
+        }) {
             return Err(err(ErrorCode::Conflict, "channel tree changed; try again"));
         }
         let new_password = matches!(password_hash, Some(Some(_)));
@@ -1942,8 +1982,7 @@ impl Core {
         }
         for c in doomed {
             // Only those who could see a private channel learn it is gone.
-            let audience: Vec<_> =
-                self.sessions.values().filter(|s| self.admitted(Some(s), c)).map(|s| s.id).collect();
+            let audience: Vec<_> = self.sessions.values().filter(|s| self.admitted(Some(s), c)).map(|s| s.id).collect();
             let private = self.channels.remove(&c).is_some_and(|row| row.private);
             let applying = self.applying_remote;
             self.applying_remote = applying || private;
@@ -2089,6 +2128,10 @@ impl Core {
         if !g.permissions.iter().all(|p| mine.contains(p)) {
             return Err(err(ErrorCode::Forbidden, "cannot grant permissions you do not have"));
         }
+        let me = &self.sessions[&session];
+        if !self.may_delegate((&me.uid, &me.groups), &[group]) {
+            return Err(err(ErrorCode::Forbidden, "cannot grant access to private channels you cannot see"));
+        }
         let token = issue_token(&self.store, group, Some(&self.sessions[&session].uid)).map_err(storage_error)?;
         Ok(Response::Token { token })
     }
@@ -2129,6 +2172,16 @@ pub fn encode(frame: &ServerFrame) -> Arc<str> {
 
 /// Validates a private channel's access: known roles, well-formed uids, bounds; sorted and deduplicated.
 impl Core {
+    /// Listing a role in an access set needs that role or the Admin group.
+    fn may_list_roles(&self, session: SessionId, roles: &[GroupId], already: &[GroupId]) -> Result<(), ErrorBody> {
+        let me = &self.sessions[&session];
+        if me.groups.contains(&ADMIN_GROUP) || roles.iter().all(|r| already.contains(r) || me.groups.contains(r)) {
+            Ok(())
+        } else {
+            Err(err(ErrorCode::Forbidden, "you can only admit roles you hold"))
+        }
+    }
+
     fn checked_access(&self, mut access: ChannelAccess) -> Result<ChannelAccess, ErrorBody> {
         access.roles.sort_unstable();
         access.roles.dedup();

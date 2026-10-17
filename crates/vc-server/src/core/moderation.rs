@@ -73,7 +73,8 @@ impl Core {
         let Some(groups) = self.store.groups_of(uid)? else { return Ok(false) };
         let theirs = self.group_permissions(&groups);
         let granted = group.map(|g| self.group_permissions(&[g])).unwrap_or_default();
-        Ok(theirs.contains(&kind) && granted.is_subset(&theirs))
+        let delegates = group.is_none_or(|g| self.may_delegate((uid, &groups), &[g]));
+        Ok(theirs.contains(&kind) && granted.is_subset(&theirs) && delegates)
     }
 
     /// Whether everything `permissions` allows is also allowed to `session`.
@@ -203,6 +204,9 @@ impl Core {
             .collect();
         if !self.covers(session, &self.group_permissions(&changed)) {
             return Err(err(ErrorCode::Forbidden, "cannot grant or remove permissions you do not have"));
+        }
+        if !self.may_delegate((&me.uid, &me.groups), &changed) {
+            return Err(err(ErrorCode::Forbidden, "cannot change access to private channels you cannot see"));
         }
         if me.uid == uid && member.groups.contains(&ADMIN_GROUP) && !wanted.contains(&ADMIN_GROUP) {
             return Err(err(ErrorCode::BadRequest, "you cannot remove your own Admin group"));
@@ -435,6 +439,10 @@ impl Core {
             };
             if !self.covers(session, &g.permissions.iter().copied().collect()) {
                 return Err(err(ErrorCode::Forbidden, "cannot grant permissions you do not have"));
+            }
+            let me = &self.sessions[&session];
+            if !self.may_delegate((&me.uid, &me.groups), &[group]) {
+                return Err(err(ErrorCode::Forbidden, "cannot grant access to private channels you cannot see"));
             }
         }
         let now = now_ms();

@@ -2,12 +2,15 @@ import type { MessageVerification } from "./message-signature";
 
 /** Channel ids this client has seen on a server (by server key) and seen deleted. An honest server never reuses
  *  a deleted id, so a reused one means the server may be showing a deleted channel's messages as another
- *  channel's. Only observed lifecycles count: a fresh client, or a deletion the server hid, leaves no record.
+ *  channel's. Only explicit `channel.deleted` events count: a channel missing from a welcome, or announced
+ *  with `channel.hidden`, may be a private channel this session is no longer admitted to and may return as the
+ *  same channel (docs/e2e-build.md, section 6). So a fresh client, a deletion while away, or a deletion the
+ *  server hid leaves no record.
  *
  *  The record fails closed: when it cannot be kept complete (storage unreadable or full, or more ids than it
  *  holds) the server's record is marked incomplete for good, and every channel message there stays qualified. */
 export interface ChannelLifecycle {
-  /** A full channel list (welcome): known ids missing from it were deleted. */
+  /** A full channel list (welcome). Ids missing from it may be hidden, not deleted: they are kept. */
   observe(serverKey: string, ids: number[]): void;
   created(serverKey: string, id: number): void;
   deleted(serverKey: string, id: number): void;
@@ -87,9 +90,8 @@ export function channelLifecycle(given?: Store): ChannelLifecycle {
   };
   return {
     observe(serverKey, current) {
-      const r = load(serverKey), now = new Set(current);
-      for (const id of r.known) if (!now.has(id)) r.deleted.add(id);
-      r.known = new Set(current.filter((id) => !r.deleted.has(id)));
+      const r = load(serverKey);
+      for (const id of current) if (!r.deleted.has(id)) r.known.add(id);
       save(serverKey, r);
     },
     created(serverKey, id) {

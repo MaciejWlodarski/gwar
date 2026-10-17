@@ -125,7 +125,7 @@ export const events: { [K in EventName]: Rule<EventData<K>> } = {
 
   "chat.sealed": sealedMessage, "chat.sealed.removed": shape({ conversation, ids: array(id, 1000) }),
   challenge, "server.updated": server, "channel.created": channel, "channel.updated": channel,
-  "channel.deleted": shape({ channel: id }), "client.joined": client, "client.updated": client,
+  "channel.deleted": shape({ channel: id }), "channel.hidden": shape({ channel: id }), "client.joined": client, "client.updated": client,
   "client.left": shape({ client: id, reason: leave }), "chat.message": message, "chat.edited": message,
   "chat.deleted": shape({ channel: id, message: id }), "group.created": group, "group.updated": group,
   "group.deleted": shape({ group: id }), "member.updated": member, "member.removed": shape({ uid }),

@@ -589,7 +589,7 @@ class Controller {
         if (event.d.reason === "transport_failed") this.scheduleVoiceRetry(1000);
         else void this.stopVoice();
       }
-      if (event.ev === "channel.deleted") {
+      if (event.ev === "channel.deleted" || event.ev === "channel.hidden") {
         const ui = useUi.getState();
         if (ui.dialog.kind === "channelEdit" && ui.dialog.mode === "edit" && ui.dialog.channel === event.d.channel) ui.closeDialog();
       }

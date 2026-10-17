@@ -361,7 +361,15 @@ impl Core {
     /// sealed conversation the file is posted in may download it. A file in no message (not posted
     /// yet, or its message or channel deleted) is for nobody: its uploader has the bytes.
     fn may_download(&self, id: &str, access: Option<&str>) -> bool {
-        if self.info.file_access == FileAccess::Link {
+        // Attachments of a private channel need an admitted session in every mode.
+        let private = match self.store.file_channel(id) {
+            Ok(channel) => channel.is_some_and(|c| self.channels.get(&c).is_some_and(|c| c.private)),
+            Err(e) => {
+                warn!("store: {e:#}");
+                return false;
+            }
+        };
+        if self.info.file_access == FileAccess::Link && !private {
             return true;
         }
         let Some(session) = access

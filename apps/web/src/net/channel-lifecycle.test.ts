@@ -21,12 +21,17 @@ describe("channel lifecycle", () => {
     expect([c.check("A", 1), c.check("A", 2), c.check("B", 1)]).toEqual(["reused", "ok", "ok"]);
     expect(channelLifecycle(store).check("A", 1)).toBe("reused");
   });
-  it("counts a channel missing from a later welcome as deleted", () => {
+  it("keeps a channel missing from a later welcome as hidden: it may return as the same channel", () => {
     const c = channelLifecycle(memory());
     c.observe("A", [1, 2, 3]);
     c.created("A", 4);
     c.observe("A", [1, 3]);
-    expect([1, 2, 3, 4].map((id) => c.check("A", id))).toEqual(["ok", "reused", "ok", "reused"]);
+    c.observe("A", [1, 2, 3, 4]);
+    expect([1, 2, 3, 4].map((id) => c.check("A", id))).toEqual(["ok", "ok", "ok", "ok"]);
+    // Only an explicit deletion marks an id that must never return.
+    c.deleted("A", 2);
+    c.observe("A", [1, 2]);
+    expect(c.check("A", 2)).toBe("reused");
   });
   it("keeps an observed deletion in memory when storage is full, and stays incomplete after reload (Astra r3 probe, inverted)", () => {
     const store = memory(), c = channelLifecycle(store);

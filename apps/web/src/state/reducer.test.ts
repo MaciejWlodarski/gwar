@@ -177,6 +177,16 @@ describe("clients and channels", () => {
     expect(s.channels[2]).toBeUndefined();
   });
 
+  it("removes a channel hidden from me like a deleted one, and shows it again when admitted", () => {
+    let s = online();
+    s = reduce(s, { type: "selectChannel", channel: 2 });
+    s = ev(s, { ev: "channel.hidden", d: { channel: 2 } });
+    expect(s.channels[2]).toBeUndefined();
+    expect(s.viewChannel).toBe(1);
+    s = ev(s, { ev: "channel.created", d: { ...ch(2), private: true, access: { roles: [], users: ["u1"] } } });
+    expect(s.channels[2]?.private).toBe(true);
+  });
+
   it("updates talking flag and slots; clears a slot when its user leaves", () => {
     let s = online();
     s = ev(s, { ev: "voice.talking", d: { call: "AAAAAAAAAAAAAAAAAAAAAA", participation: "AQEBAQEBAQEBAQEBAQEBAQ", run: 1, client: 2, talking: true } });

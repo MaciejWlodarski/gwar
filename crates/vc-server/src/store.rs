@@ -529,11 +529,9 @@ impl Store {
                 encrypted: r.get(7)?,
                 history: r.get(8)?,
                 private: r.get(9)?,
-                access: r
-                    .get::<_, Option<String>>(10)?
-                    .map(|json| serde_json::from_str(&json))
-                    .transpose()
-                    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e)))?,
+                access: r.get::<_, Option<String>>(10)?.map(|json| serde_json::from_str(&json)).transpose().map_err(
+                    |e| rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e)),
+                )?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)

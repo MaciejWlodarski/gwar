@@ -396,6 +396,8 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
     case "channel.created":
     case "channel.updated":
       return { ...state, channels: { ...state.channels, [event.d.id]: event.d } };
+    // Hidden (no longer admitted to a private channel) looks the same here; only the lifecycle record differs.
+    case "channel.hidden":
     case "channel.deleted": {
       const { [event.d.channel]: _gone, ...channels } = state.channels;
       const { [`ch:${event.d.channel}`]: _thread, ...threads } = state.threads;

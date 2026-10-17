@@ -499,6 +499,9 @@ wire! {
         ChannelUpdated(Channel),
         #[serde(rename = "channel.deleted")]
         ChannelDeleted { channel: ChannelId },
+        /// This session is no longer admitted to a private channel; it still exists.
+        #[serde(rename = "channel.hidden")]
+        ChannelHidden { channel: ChannelId },
         #[serde(rename = "client.joined")]
         ClientJoined(Client),
         #[serde(rename = "client.updated")]
