@@ -777,13 +777,11 @@ impl Core {
                 .is_some_and(|a| a.users.iter().any(|u| u == uid) || a.roles.iter().any(|r| groups.contains(r)))
     }
 
-    /// Granting access is delegation: whoever gives out or changes `roles` must be admitted to every
-    /// private channel those roles admit (docs/e2e-build.md, section 6).
-    fn may_delegate(&self, granter: (&str, &[GroupId]), roles: &[GroupId]) -> bool {
-        self.channels
-            .values()
-            .filter(|c| c.private && c.access.as_ref().is_some_and(|a| a.roles.iter().any(|r| roles.contains(r))))
-            .all(|c| self.uid_admitted(Some(granter), c.id))
+    /// Granting a role is delegation: a role, and every private channel it admits, is given out or
+    /// taken away only by someone holding it or Admin. The rule is the same for every role, so the
+    /// outcome never depends on hidden channels (docs/e2e-build.md, section 6).
+    fn may_delegate(granter: &[GroupId], roles: &[GroupId]) -> bool {
+        granter.contains(&ADMIN_GROUP) || roles.iter().all(|r| granter.contains(r))
     }
 
     /// `viewer`'s copy of a channel, or `None` when it is hidden from them.
@@ -2128,9 +2126,8 @@ impl Core {
         if !g.permissions.iter().all(|p| mine.contains(p)) {
             return Err(err(ErrorCode::Forbidden, "cannot grant permissions you do not have"));
         }
-        let me = &self.sessions[&session];
-        if !self.may_delegate((&me.uid, &me.groups), &[group]) {
-            return Err(err(ErrorCode::Forbidden, "cannot grant access to private channels you cannot see"));
+        if !Self::may_delegate(&self.sessions[&session].groups, &[group]) {
+            return Err(err(ErrorCode::Forbidden, "you can only give out roles you hold"));
         }
         let token = issue_token(&self.store, group, Some(&self.sessions[&session].uid)).map_err(storage_error)?;
         Ok(Response::Token { token })

@@ -13,6 +13,7 @@ import {
   PERMISSION_SECTIONS,
   canActOn,
   canAssignGroup,
+  canGiveGroup,
   isBuiltinGroup,
   isHexColor,
   nameColor,
@@ -30,7 +31,7 @@ import type { Permission } from "../proto/Permission";
 import { controller, describeRequestError } from "../state/controller";
 import { sortedChannels } from "../state/reducer";
 import { useSession, useUi, type ServerSettingsTab } from "../state/stores";
-import { usePermission } from "./hooks";
+import { useMyGroups, usePermission } from "./hooks";
 import { Avatar, Button, Dialog, EmptyState, Field, IconButton, Input, Select, Spinner, Switch, Textarea, menuContent, menuItem } from "./kit";
 
 // ------------------------------------------------------------------ helpers
@@ -726,6 +727,7 @@ function RoleMenu({
 }) {
   const t = useT();
   const mine = useSession((s) => s.permissions);
+  const myGroups = useMyGroups();
   return (
     <Dropdown.Root>
       <Dropdown.Trigger asChild>
@@ -741,7 +743,7 @@ function RoleMenu({
         <Dropdown.Content align="end" sideOffset={4} className={cn(menuContent, "w-56")}>
           {roles.map((g) => {
             const on = groups.includes(g.id);
-            const blocked = stronger || !canAssignGroup(mine, g) || (isMe && g.id === ADMIN_GROUP && on);
+            const blocked = stronger || !canGiveGroup(mine, myGroups, g) || (isMe && g.id === ADMIN_GROUP && on);
             return (
               <Dropdown.CheckboxItem
                 key={g.id}
@@ -833,6 +835,7 @@ export function InvitesPanel() {
   const copy = useCopy();
   const defs = useSession((s) => s.groups);
   const mine = useSession((s) => s.permissions);
+  const myGroups = useMyGroups();
   const address = useSession((s) => s.address);
 
   const [invites, setInvites] = useState<Invite[] | null>(null);
@@ -844,7 +847,7 @@ export function InvitesPanel() {
   const [copied, setCopied] = useState<string | null>(null);
   const [now] = useState(() => Date.now());
 
-  const assignable = useMemo(() => orderedGroups(defs).filter((g) => g.id !== MEMBER_GROUP && g.id !== ADMIN_GROUP && canAssignGroup(mine, g)), [defs, mine]);
+  const assignable = useMemo(() => orderedGroups(defs).filter((g) => g.id !== MEMBER_GROUP && g.id !== ADMIN_GROUP && canGiveGroup(mine, myGroups, g)), [defs, mine, myGroups]);
 
   useEffect(() => {
     let alive = true;

@@ -21,7 +21,8 @@ import { Lightbox } from "./Attachments";
 import { InvitesDialog, ServerSettingsDialog } from "./ServerSettings";
 import { FirstRunDialog } from "./TeamspeakFound";
 import { IdentityPicker } from "./IdentityPicker";
-import { useMemberName, useTsIdentities } from "./hooks";
+import { useMemberName, useMyGroups, useTsIdentities } from "./hooks";
+import { canGiveGroup } from "../lib/permissions";
 import { resolveIdentity } from "../connect/ts-list";
 
 export function Dialogs() {
@@ -532,11 +533,9 @@ function CreateTokenDialog() {
   const close = useClose();
   const groups = useSession((s) => s.groups);
   const permissions = useSession((s) => s.permissions);
-  // A token can only grant what its creator already has.
-  const eligible = useMemo(
-    () => Object.values(groups).filter((g) => g.permissions.every((p) => permissions.includes(p))),
-    [groups, permissions],
-  );
+  const myGroups = useMyGroups();
+  // A token can only grant a role its creator holds, within their permissions.
+  const eligible = useMemo(() => Object.values(groups).filter((g) => canGiveGroup(permissions, myGroups, g)), [groups, permissions, myGroups]);
   const [group, setGroup] = useState(String(eligible.find((g) => g.permissions.length > 0)?.id ?? eligible[0]?.id ?? ""));
   const [token, setToken] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);

@@ -191,30 +191,41 @@ async fn private_attachments_need_an_admitted_session_even_in_link_mode() {
 }
 
 #[tokio::test]
-async fn access_bearing_roles_are_given_out_only_by_those_admitted() {
+async fn roles_are_given_out_only_by_those_holding_them() {
     let server = TestServer::start().await;
     let mut root = admin(&server, "root").await;
     let mut mallory = Client::connect(&server, "mallory").await;
     let bystander = Client::connect(&server, "bystander").await;
-    // A role without permissions that admits to a private channel; mallory may manage groups and invite.
+    // Mallory holds every permission through a custom role, but neither Admin nor Crew.
+    let all = vc_proto::Permission::ALL.iter().map(|p| json!(p)).collect::<Vec<_>>();
+    let boss = root.ok("group.create", json!({"name": "Boss", "permissions": all})).await["group"]["id"].clone();
     let crew = root.ok("group.create", json!({"name": "Crew", "permissions": []})).await["group"]["id"].clone();
-    let mods = root
-        .ok("group.create", json!({"name": "Mods", "permissions": ["group_manage", "invite_create", "token_create"]}))
-        .await["group"]["id"]
-        .clone();
-    root.ok("member.groups", json!({"uid": mallory.welcome.uid, "groups": [2, mods]})).await;
+    root.ok("member.groups", json!({"uid": mallory.welcome.uid, "groups": [2, boss]})).await;
+    let (me, them) = (mallory.welcome.uid.clone(), bystander.welcome.uid.clone());
+    let refused = |role: &Value| {
+        [
+            ("member.groups", json!({"uid": me, "groups": [2, boss, role]})),
+            ("member.groups", json!({"uid": them, "groups": [2, role]})),
+            ("invite.create", json!({"group": role})),
+            ("token.create", json!({"group": role})),
+        ]
+    };
+    for (op, d) in refused(&json!(1)) {
+        assert_eq!(mallory.fails(op, d.clone()).await, "forbidden", "Admin: {op} {d}");
+    }
+    // The outcome is the same before and after Crew starts admitting a hidden channel.
+    for (op, d) in refused(&crew) {
+        assert_eq!(mallory.fails(op, d.clone()).await, "forbidden", "before: {op} {d}");
+    }
     let private = channel_id(
         &root.create_channel(json!({"name": "p", "private": true, "access": {"roles": [crew], "users": []}})).await,
     );
-    for (op, d) in [
-        ("member.groups", json!({"uid": mallory.welcome.uid, "groups": [2, mods, crew]})),
-        ("member.groups", json!({"uid": bystander.welcome.uid, "groups": [2, crew]})),
-        ("invite.create", json!({"group": crew})),
-        ("token.create", json!({"group": crew})),
-    ] {
-        assert_eq!(mallory.fails(op, d.clone()).await, "forbidden", "{op} {d}");
+    for (op, d) in refused(&crew) {
+        assert_eq!(mallory.fails(op, d.clone()).await, "forbidden", "after: {op} {d}");
     }
-    // A token root made is refused at redemption once root no longer could give it out... (still admitted: works)
+    // A role you hold you may give out; a token from an Admin works.
+    let invite = mallory.ok("invite.create", json!({"group": boss})).await;
+    assert!(invite.get("invite").is_some() || invite.get("code").is_some(), "{invite}");
     let token = root.ok("token.create", json!({"group": crew})).await["token"].as_str().unwrap().to_owned();
     mallory.ok("token.redeem", json!({"token": token})).await;
     assert_eq!(mallory.next_event("channel.created").await["id"], private);

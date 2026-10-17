@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Group } from "../proto/Group";
-import { ALL_PERMISSIONS, canActOn, canAssignGroup, nameColor, orderedGroups, permissionsOf, toggleGroup } from "./permissions";
+import { ALL_PERMISSIONS, canActOn, canAssignGroup, canGiveGroup, nameColor, orderedGroups, permissionsOf, toggleGroup } from "./permissions";
 
 const g = (id: number, permissions: Group["permissions"], color?: string): Group => ({ id, name: `g${id}`, permissions, color });
 const groups = Object.fromEntries(
@@ -34,6 +34,13 @@ describe("moderation rules", () => {
     expect(canAssignGroup(mod, groups[4]!)).toBe(false);
     expect(canAssignGroup(mod, groups[1]!)).toBe(false);
     expect(canAssignGroup(permissionsOf([1], groups), groups[1]!)).toBe(true);
+  });
+  it("lets me give out or take away only roles I hold, unless I am Admin", () => {
+    expect(canGiveGroup(mod, [2, 3], groups[3]!)).toBe(true);
+    expect(canGiveGroup(mod, [2], groups[3]!)).toBe(false);
+    // Every permission through other roles is not Admin.
+    expect(canGiveGroup([...ALL_PERMISSIONS], [2, 3, 4], groups[1]!)).toBe(false);
+    expect(canGiveGroup(permissionsOf([1], groups), [1], groups[4]!)).toBe(true);
   });
   it("lets me act on equals and weaker, not stronger", () => {
     expect(canActOn(mod, [2], groups)).toBe(true);

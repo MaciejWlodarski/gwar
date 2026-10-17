@@ -2,10 +2,10 @@ import * as ContextMenu from "@radix-ui/react-context-menu";
 import { Ban, Pencil, ChevronRight, ShieldCheck, UserMinus, UserX } from "lucide-react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
-import { canActOn, canAssignGroup, ADMIN_GROUP, MEMBER_GROUP, orderedGroups, toggleGroup } from "../lib/permissions";
+import { canActOn, canGiveGroup, ADMIN_GROUP, MEMBER_GROUP, orderedGroups, toggleGroup } from "../lib/permissions";
 import { controller } from "../state/controller";
 import { useSession, useUi, type PersonRef } from "../state/stores";
-import { usePermission } from "./hooks";
+import { useMyGroups, usePermission } from "./hooks";
 import { menuContent, menuItem, menuItemDanger, menuSeparator } from "./kit";
 
 /**
@@ -19,6 +19,7 @@ export function ModerationItems({ person, groups }: { person: PersonRef; groups:
   const kind = useSession((s) => s.kind);
   const permissions = useSession((s) => s.permissions);
   const defs = useSession((s) => s.groups);
+  const myGroups = useMyGroups();
   const canKick = usePermission("client_kick");
   const canBan = usePermission("client_ban");
   const canGroups = usePermission("group_manage");
@@ -57,8 +58,8 @@ export function ModerationItems({ person, groups }: { person: PersonRef; groups:
               {roles.length === 0 && <div className="px-2 py-1.5 text-xs text-subtle">{t("mod.noRoles")}</div>}
               {roles.map((g) => {
                 const on = groups.includes(g.id);
-                // I may only hand out what I hold myself, and not act on someone stronger than me.
-                const blocked = stronger || !canAssignGroup(permissions, g);
+                // I may only hand out roles I hold myself, and not act on someone stronger than me.
+                const blocked = stronger || !canGiveGroup(permissions, myGroups, g);
                 return (
                   <ContextMenu.CheckboxItem
                     key={g.id}

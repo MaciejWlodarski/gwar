@@ -61,6 +61,14 @@ export function canAssignGroup(mine: readonly Permission[], group: Group): boole
   return covers(mine, group.permissions);
 }
 
+/**
+ * Roles I may hand out or take away: those I hold myself (or any, as Admin), within my own
+ * permissions. The server applies the same rule to every role (docs/e2e-build.md, section 6).
+ */
+export function canGiveGroup(mine: readonly Permission[], myGroups: readonly number[], group: Group): boolean {
+  return canAssignGroup(mine, group) && (myGroups.includes(ADMIN_GROUP) || myGroups.includes(group.id));
+}
+
 /** Whether I may moderate (kick, ban, change roles of) someone with these groups. */
 export function canActOn(mine: readonly Permission[], targetGroups: readonly number[], groups: Record<number, Group>): boolean {
   return covers(mine, permissionsOf(targetGroups, groups));

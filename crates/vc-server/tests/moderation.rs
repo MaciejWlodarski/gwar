@@ -237,6 +237,8 @@ async fn invites_and_tokens_lapse_with_their_makers_rights() {
         );
     }
     let plain = group_id(&root.ok("group.create", json!({"name": "Plain", "permissions": []})).await);
+    // Roles are given out only by those who hold them.
+    with_groups(&mut root, &alice, json!([2, mods, plain])).await;
     let mut token =
         async |group| alice.ok("token.create", json!({"group": group})).await["token"].as_str().unwrap().to_owned();
     let (first_token, second_token, plain_token) = (token(mods).await, token(mods).await, token(plain).await);
