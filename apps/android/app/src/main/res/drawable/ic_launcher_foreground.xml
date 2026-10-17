@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Gwar mark (apps/web/public/favicon.svg) in the adaptive icon's 108 dp canvas. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group
+        android:scaleX="1.6"
+        android:scaleY="1.6"
+        android:translateX="28.4"
+        android:translateY="28.4">
+        <path
+            android:pathData="M9,13v6M13.5,9v14M18.5,11.5v9M23,14v4"
+            android:strokeWidth="2.4"
+            android:strokeColor="#FFFFFFFF"
+            android:strokeLineCap="round" />
+    </group>
+</vector>

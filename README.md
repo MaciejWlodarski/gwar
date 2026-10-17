@@ -480,6 +480,8 @@ feature (`teamspeak`, on by default); build without it with
 | `crates/gwar-connect` | Gwar Connect, the optional account service |
 | `apps/web` | The shared UI (React): the hosted web app and the desktop app's UI |
 | `apps/desktop` | Tauri 2 desktop app: native voice, global push-to-talk, tray |
+| `crates/gwar-app` | Shared Rust core of the native apps, with Kotlin bindings (UniFFI) |
+| `apps/android` | Native Android app (Kotlin, Jetpack Compose), early: [docs/mobile.md](docs/mobile.md) |
 | `scripts/deploy-vm.sh` | Deploys the server and Connect to a Linux host over SSH |
 
 More in [docs/architecture.md](docs/architecture.md), [docs/connect.md](docs/connect.md),
@@ -520,9 +522,12 @@ VC_TS3_DIR=/tmp/ts3 cargo test -p vc-client --test teamspeak_mode --test teamspe
   through Gwar Connect. Channels shared with TeamSpeak users stay unencrypted
   and are labeled as such. Design: [docs/e2e.md](docs/e2e.md); prototypes
   and the remaining build steps are in progress.
-- **Mobile app** (iOS and Android).
+- **Native mobile apps**: Android first, then iOS. A shared Rust core with
+  native UIs; an early Android app connects, shows the channel tree and does
+  plaintext channel chat ([docs/mobile.md](docs/mobile.md)).
 - **Streaming**: screen sharing and video, peer to peer and through the server.
-- **Fully native clients** later, keeping the same protocol.
+- **A native desktop app** later, on the same Rust core as the mobile apps
+  and the same protocol.
 - **More TeamSpeak options**: bring your own TeamSpeak license for more slots,
   and a mixed stand-in so Gwar users can still talk when the free slots run out.
 
