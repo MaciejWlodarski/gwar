@@ -179,6 +179,23 @@ wire! {
         InviteDelete { code: String },
         #[serde(rename = "token.redeem")]
         TokenRedeem { token: String },
+        /// The owner chain of `generation`: its genesis and the links after seq `after`
+        /// (docs/e2e-build.md, section 6, "Owner chain (6b)").
+        #[serde(rename = "owner.chain")]
+        OwnerChain {
+            #[serde(deserialize_with = "voice::safe_u64")]
+            #[cfg_attr(feature = "ts", ts(type = "number"))]
+            generation: u64,
+            #[serde(default, deserialize_with = "voice::safe_u64")]
+            #[cfg_attr(feature = "ts", ts(type = "number"))]
+            after: u64,
+        },
+        /// Moves ownership: a `gwar owner v1` link signed by the current owner's account key.
+        #[serde(rename = "owner.transfer")]
+        OwnerTransfer { statement: String, signature: String },
+        /// Installs a newer confirmer anchor and manager list (base64url of their envelopes).
+        #[serde(rename = "managers.update")]
+        ManagersUpdate { anchor: String, list: String },
         #[serde(rename = "voice.offer")]
         VoiceOffer(VoiceOffer),
         #[serde(rename = "voice.state")]
@@ -440,6 +457,14 @@ wire! {
         /// repeat it while `count` exceeds `uids.len()`. `members` are the same people
         /// as they were stored (nickname, groups, last seen), in the same order.
         Pruned { uids: Vec<Uid>, count: u32, members: Vec<Member> },
+        /// A page of the owner chain: the genesis statement and links; `next` is the `after`
+        /// of the following page.
+        OwnerChain {
+            genesis: String,
+            links: Vec<OwnerLinkStatement>,
+            #[cfg_attr(feature = "ts", ts(type = "number | null"))]
+            next: Option<u64>,
+        },
         Mls(MlsResponse),
         Empty {},
     }
@@ -502,6 +527,10 @@ wire! {
         /// This session is no longer admitted to a private channel; it still exists.
         #[serde(rename = "channel.hidden")]
         ChannelHidden { channel: ChannelId },
+        #[serde(rename = "owner.updated")]
+        OwnerUpdated(OwnerInfo),
+        #[serde(rename = "managers.updated")]
+        ManagersUpdated(Managers),
         #[serde(rename = "client.joined")]
         ClientJoined(Client),
         #[serde(rename = "client.updated")]
@@ -583,6 +612,42 @@ wire! {
         /// Sent as `Authorization: Bearer <token>` with file downloads; valid while this session lasts.
         #[serde(default)]
         pub file_access: String,
+        /// The server's owner, once it has one (docs/e2e-build.md, section 6, 6b).
+        #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
+        pub owner: Option<OwnerInfo>,
+        /// The managers of private channels, once the server has an owner.
+        #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
+        pub managers: Option<Managers>,
+    }
+
+    /// The head of the server's owner chain.
+    pub struct OwnerInfo {
+        pub uid: Uid,
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        pub generation: u64,
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        pub seq: u64,
+        /// The hash of the newest link (of the genesis when ownership never moved).
+        pub head: String,
+    }
+
+    /// One `gwar owner v1` link and its signature.
+    pub struct OwnerLinkStatement {
+        pub statement: String,
+        pub signature: String,
+    }
+
+    /// The newest confirmer anchor and manager list (base64url of their envelopes), and the
+    /// holders of `channel_edit` the list does not yet mirror.
+    pub struct Managers {
+        pub anchor: Option<String>,
+        pub list: Option<String>,
+        /// Hold `channel_edit`, are neither owner nor confirmer, and are not on the list.
+        pub pending: Vec<Uid>,
+        /// On the list or the anchor without `channel_edit` any more.
+        pub stale: Vec<Uid>,
     }
 
     /// Connect service signature binding a handle to an account identity.

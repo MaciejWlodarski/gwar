@@ -95,6 +95,9 @@ export interface ResponseMap {
   "voice.state": { voice: import("../proto/VoiceState").VoiceState | null };
   "voice.epoch.ack": Empty;
   "voice.epoch.repeat": Empty;
+  "owner.chain": { genesis: string; links: import("../proto/OwnerLinkStatement").OwnerLinkStatement[]; next: number | null };
+  "owner.transfer": Empty;
+  "managers.update": Empty;
 }
 
 export type EventName = Event["ev"];

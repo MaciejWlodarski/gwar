@@ -6,6 +6,7 @@ pub mod chat;
 pub mod credential;
 pub mod descriptor;
 mod encoding;
+pub mod owner;
 
 pub use credential::{Credential, Revocations};
 pub use descriptor::{Descriptor, Kind, SignedDescriptor};

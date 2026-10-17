@@ -14,6 +14,7 @@ mod messages;
 mod mls;
 pub use mls::TreeRefusal;
 mod moderation;
+mod owner;
 mod passwords;
 mod sealed;
 mod voice;
@@ -289,6 +290,8 @@ struct Session {
 
 pub struct Core {
     store: Store,
+    /// The owner chain and manager pair, once the server has an owner (6b).
+    owner: Option<owner::OwnerState>,
     info: ServerInfo,
     ice_servers: Vec<IceServer>,
     channels: BTreeMap<ChannelId, ChannelRow>,
@@ -407,6 +410,8 @@ pub fn ensure_first_admin_token(store: &Store) -> Result<Option<String>> {
         return Ok(None);
     }
     let token = issue_token(store, ADMIN_GROUP, None)?;
+    // Its redeemer becomes the owner while the server has none (docs/e2e-build.md, section 6, 6b).
+    store.mark_first_token(&token_hash(&token))?;
     store.set_meta("admin_token_issued", "1")?;
     warn!("first start: redeem this one-time admin token in your client: {token}");
     Ok(Some(token))
@@ -505,8 +510,10 @@ impl Core {
         };
         let groups = store.groups()?.into_iter().map(|g| (g.id, g)).collect();
         let mls_commit_clock = store.meta("mls_commit_clock")?.map(|s| s.parse()).transpose()?.unwrap_or(0);
+        let owner = owner::load(&store, &config.server_key)?;
         let mut core = Self {
             store,
+            owner,
             info,
             ice_servers: config.ice_servers,
             channels,
@@ -1073,6 +1080,7 @@ impl Core {
             }
             self.reconcile_admissions(before);
         }
+        let invited_editor = invited_to && self.owner.is_some();
         self.sessions.insert(id, session);
         let welcome = Welcome {
             session: id,
@@ -1087,12 +1095,18 @@ impl Core {
             conversations,
             ice_servers: self.ice_servers.clone(),
             file_access: self.sessions[&id].file_access.clone(),
+            owner: self.owner_info(),
+            managers: self.managers_view(),
         };
         self.reply(id, r.request_id, Ok(Response::Welcome(Box::new(welcome))));
         self.broadcast(Event::ClientJoined(joined), |s| s.id != id);
         self.publish_routing();
         let device = self.sessions[&id].hello_key.clone();
         self.history_session_joined(&device);
+        // An invite's role may have made them a holder of `channel_edit`.
+        if invited_editor && let Some(view) = self.managers_view() {
+            self.broadcast(Event::ManagersUpdated(view), |_| true);
+        }
         Some(id)
     }
 
@@ -1407,8 +1421,22 @@ impl Core {
         {
             return Some(Err(err(ErrorCode::NotFound, "no such channel")));
         }
+        // Role changes can change who holds `channel_edit`, and so the managers' view.
+        let managers_before = matches!(
+            request,
+            Request::MemberGroups { .. }
+                | Request::GroupUpdate(_)
+                | Request::GroupDelete { .. }
+                | Request::MemberRemove { .. }
+                | Request::MemberPrune(_)
+                | Request::TokenRedeem { .. }
+        )
+        .then(|| self.managers_view());
         let result = match request {
             Request::Hello(_) | Request::Join(_) => Err(err(ErrorCode::BadRequest, "already authenticated")),
+            Request::OwnerChain { generation, after } => self.owner_chain(generation, after),
+            Request::OwnerTransfer { statement, signature } => self.owner_transfer(&statement, &signature),
+            Request::ManagersUpdate { anchor, list } => self.managers_update(&anchor, &list),
             Request::Mls(request) => self.mls_request(session, request),
             Request::Ping {} => Ok(Response::Empty {}),
             Request::ClientUpdate(update) => self.client_update(session, update),
@@ -1458,6 +1486,9 @@ impl Core {
             Request::VoiceEpochAck(r) => self.voice_epoch(session, r, false),
             Request::VoiceEpochRepeat(r) => self.voice_epoch(session, r, true),
         };
+        if let Some(before) = managers_before {
+            self.reconcile_managers(before);
+        }
         Some(result)
     }
 
@@ -2181,7 +2212,9 @@ impl Core {
     }
 
     fn token_redeem(&mut self, session: SessionId, token: &str) -> Reply {
-        let Some((group, creator)) = self.store.redeem_token(&token_hash(token.trim())).map_err(storage_error)? else {
+        let Some((group, creator, first)) =
+            self.store.redeem_token_marked(&token_hash(token.trim())).map_err(storage_error)?
+        else {
             return Err(err(ErrorCode::NotFound, "invalid or used token"));
         };
         if let Some(creator) = creator
@@ -2189,8 +2222,15 @@ impl Core {
         {
             return Err(err(ErrorCode::Forbidden, "whoever made this token can no longer grant its group"));
         }
-        let user_id = self.sessions[&session].user_id;
-        self.store.add_user_group(user_id, group).map_err(storage_error)?;
+        let (user_id, uid) = (self.sessions[&session].user_id, self.sessions[&session].uid.clone());
+        // The first admin token also makes its redeemer the owner, while there is none (6b).
+        if self.store.grant_token_group(user_id, &uid, group, first).map_err(storage_error)? {
+            let genesis =
+                gwar_mls::owner::Genesis { server_key: self.server_key.clone(), generation: 1, owner_uid: uid };
+            self.owner = Some(owner::OwnerState { chain: gwar_mls::owner::OwnerChain::new(genesis), pair: None });
+            let info = self.owner_info().expect("just set");
+            self.broadcast(Event::OwnerUpdated(info), |_| true);
+        }
         let groups = self.store.user_groups(user_id).map_err(storage_error)?;
         let affected: Vec<_> = self.sessions.values().filter(|s| s.user_id == user_id).map(|s| s.id).collect();
         let before = self.admissions();

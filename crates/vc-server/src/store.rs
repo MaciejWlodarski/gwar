@@ -349,7 +349,31 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE channels ADD COLUMN private INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE channels ADD COLUMN access TEXT;
     "#,
+    // The owner chain and the managers (docs/e2e-build.md, section 6, 6b). The genesis is
+    // meta `owner_generation` and `owner_uid`; the first admin token is marked `first`.
+    r#"
+    ALTER TABLE tokens ADD COLUMN first INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE owner_links (
+        generation INTEGER NOT NULL,
+        seq INTEGER NOT NULL,
+        statement TEXT NOT NULL,
+        signature TEXT NOT NULL,
+        PRIMARY KEY (generation, seq)
+    );
+    CREATE TABLE manager_pair (
+        generation INTEGER PRIMARY KEY,
+        anchor BLOB NOT NULL,
+        list BLOB NOT NULL
+    );
+    "#,
 ];
+
+/// The stored genesis of the current owner generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerGenesis {
+    pub generation: u64,
+    pub owner_uid: Uid,
+}
 
 fn access_json(row: &ChannelRow) -> Result<Option<String>> {
     Ok(row.access.as_ref().map(serde_json::to_string).transpose()?)
@@ -717,12 +741,141 @@ impl Store {
 
     /// Consumes a single-use token, returning the group it grants and who made it.
     pub fn redeem_token(&self, token_hash: &str) -> Result<Option<(GroupId, Option<String>)>> {
+        Ok(self.redeem_token_marked(token_hash)?.map(|(group, creator, _)| (group, creator)))
+    }
+
+    /// Like [`Store::redeem_token`], also telling whether it was the first admin token.
+    pub fn redeem_token_marked(&self, token_hash: &str) -> Result<Option<(GroupId, Option<String>, bool)>> {
         Ok(self
             .db
-            .query_row("DELETE FROM tokens WHERE token_hash=?1 RETURNING group_id,creator_uid", [token_hash], |r| {
+            .query_row(
+                "DELETE FROM tokens WHERE token_hash=?1 RETURNING group_id,creator_uid,first",
+                [token_hash],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    /// Marks the first admin token: its redeemer becomes the owner while there is none.
+    pub fn mark_first_token(&self, token_hash: &str) -> Result<()> {
+        self.db.execute("UPDATE tokens SET first=1 WHERE token_hash=?1", [token_hash])?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------ owner
+
+    pub fn owner_genesis(&self) -> Result<Option<OwnerGenesis>> {
+        let (Some(generation), Some(owner_uid)) = (self.meta("owner_generation")?, self.meta("owner_uid")?) else {
+            return Ok(None);
+        };
+        Ok(Some(OwnerGenesis { generation: generation.parse()?, owner_uid }))
+    }
+
+    /// Grants `group` and, for the first admin token while there is no owner, makes the user the
+    /// owner (generation 1) in the same transaction. Returns whether they became the owner.
+    pub fn grant_token_group(&self, user_id: i64, uid: &str, group: GroupId, first: bool) -> Result<bool> {
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute("INSERT OR IGNORE INTO user_groups(user_id,group_id) VALUES(?1,?2)", params![user_id, group])?;
+        let owned = tx.query_row("SELECT 1 FROM meta WHERE key='owner_generation'", [], |_| Ok(())).optional()?;
+        let becomes = first && group == ADMIN_GROUP && owned.is_none();
+        if becomes {
+            tx.execute("INSERT INTO meta(key,value) VALUES('owner_generation','1')", [])?;
+            tx.execute("INSERT INTO meta(key,value) VALUES('owner_uid',?1)", [uid])?;
+        }
+        tx.commit()?;
+        Ok(becomes)
+    }
+
+    /// `vc-server owner set`: the genesis of generation 1, only while there is no owner, for a
+    /// stored member.
+    pub fn set_owner(&self, uid: &str) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        if tx.query_row("SELECT 1 FROM meta WHERE key='owner_generation'", [], |_| Ok(())).optional()?.is_some() {
+            anyhow::bail!("this server already has an owner; use `owner reset` for a lost owner account");
+        }
+        let user: i64 = tx
+            .query_row("SELECT id FROM users WHERE uid=?1", [uid], |r| r.get(0))
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("no member with uid {uid}"))?;
+        tx.execute("INSERT INTO meta(key,value) VALUES('owner_generation','1')", [])?;
+        tx.execute("INSERT INTO meta(key,value) VALUES('owner_uid',?1)", [uid])?;
+        tx.execute("INSERT OR IGNORE INTO user_groups(user_id,group_id) VALUES(?1,?2)", params![user, ADMIN_GROUP])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `vc-server owner reset`: a new generation with `uid` as its genesis owner; drops the old
+    /// generation's chain, anchor and list. Returns the new generation.
+    pub fn reset_owner(&self, uid: &str) -> Result<u64> {
+        let tx = self.db.unchecked_transaction()?;
+        let user: i64 = tx
+            .query_row("SELECT id FROM users WHERE uid=?1", [uid], |r| r.get(0))
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("no member with uid {uid}"))?;
+        let current: Option<String> =
+            tx.query_row("SELECT value FROM meta WHERE key='owner_generation'", [], |r| r.get(0)).optional()?;
+        let generation = current.map(|g| g.parse::<u64>()).transpose()?.unwrap_or(0) + 1;
+        let set = "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value";
+        tx.execute(set, params!["owner_generation", generation.to_string()])?;
+        tx.execute(set, params!["owner_uid", uid])?;
+        tx.execute("DELETE FROM owner_links WHERE generation<?1", [generation as i64])?;
+        tx.execute("DELETE FROM manager_pair WHERE generation<?1", [generation as i64])?;
+        tx.execute("INSERT OR IGNORE INTO user_groups(user_id,group_id) VALUES(?1,?2)", params![user, ADMIN_GROUP])?;
+        tx.commit()?;
+        Ok(generation)
+    }
+
+    /// The links of `generation`, by seq: `(statement, signature)`.
+    pub fn owner_links(&self, generation: u64) -> Result<Vec<(String, String)>> {
+        let mut stmt =
+            self.db.prepare("SELECT statement,signature FROM owner_links WHERE generation=?1 ORDER BY seq")?;
+        let rows = stmt.query_map([generation as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Appends a link and gives the new owner the Admin group, in one transaction.
+    pub fn append_owner_link(
+        &self,
+        generation: u64,
+        seq: u64,
+        statement: &str,
+        signature: &str,
+        new_owner: &str,
+    ) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO owner_links(generation,seq,statement,signature) VALUES(?1,?2,?3,?4)",
+            params![generation as i64, seq as i64, statement, signature],
+        )?;
+        if let Some(user) =
+            tx.query_row("SELECT id FROM users WHERE uid=?1", [new_owner], |r| r.get::<_, i64>(0)).optional()?
+        {
+            tx.execute(
+                "INSERT OR IGNORE INTO user_groups(user_id,group_id) VALUES(?1,?2)",
+                params![user, ADMIN_GROUP],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The newest anchor and list of `generation`.
+    pub fn manager_pair(&self, generation: u64) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        Ok(self
+            .db
+            .query_row("SELECT anchor,list FROM manager_pair WHERE generation=?1", [generation as i64], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })
             .optional()?)
+    }
+
+    pub fn set_manager_pair(&self, generation: u64, anchor: &[u8], list: &[u8]) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO manager_pair(generation,anchor,list) VALUES(?1,?2,?3)
+             ON CONFLICT(generation) DO UPDATE SET anchor=excluded.anchor, list=excluded.list",
+            params![generation as i64, anchor, list],
+        )?;
+        Ok(())
     }
 
     pub fn add_message(
@@ -1316,6 +1469,31 @@ impl Store {
         Ok(true)
     }
 
+    /// When the account revoked this device, if the server learned that it did.
+    pub fn device_revoked_at(&self, account_key: &str, device_key: &str) -> Result<Option<i64>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT revoked_at FROM revoked_devices WHERE account_key=?1 AND device_key=?2",
+                [account_key, device_key],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The uids of members holding any of `groups`, sorted.
+    pub fn uids_in_groups(&self, groups: &[GroupId]) -> Result<Vec<Uid>> {
+        if groups.is_empty() {
+            return Ok(Vec::new());
+        }
+        let list = groups.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(",");
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT DISTINCT u.uid FROM users u JOIN user_groups g ON g.user_id=u.id WHERE g.group_id IN ({list}) ORDER BY u.uid"
+        ))?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     pub fn device_revoked(&self, account_key: &str, device_key: &str) -> Result<bool> {
         Ok(self.db.query_row(
             "SELECT EXISTS(SELECT 1 FROM revoked_devices WHERE account_key=?1 AND device_key=?2)",
@@ -1475,6 +1653,40 @@ fn urlencode(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_commands_and_the_first_token() {
+        let store = Store::in_memory().unwrap();
+        let a = store.touch_user("a", "ka", "A", 1).unwrap().id;
+        let b = store.touch_user("b", "kb", "B", 1).unwrap().id;
+        store.insert_token("first", ADMIN_GROUP, None, 0).unwrap();
+        store.mark_first_token("first").unwrap();
+        assert!(store.set_owner("missing").is_err(), "only a stored member");
+        store.set_owner("a").unwrap();
+        assert!(store.user_groups(a).unwrap().contains(&ADMIN_GROUP));
+        assert!(store.set_owner("b").is_err(), "only while there is no owner");
+        // An unused first token now grants Admin only.
+        let (group, _, first) = store.redeem_token_marked("first").unwrap().unwrap();
+        assert!(first);
+        assert!(!store.grant_token_group(b, "b", group, first).unwrap());
+        assert!(store.user_groups(b).unwrap().contains(&ADMIN_GROUP));
+        assert_eq!(store.owner_genesis().unwrap(), Some(OwnerGenesis { generation: 1, owner_uid: "a".into() }));
+        // A reset starts a new generation and drops the old one's chain and pair.
+        store.append_owner_link(1, 1, "statement", "signature", "b").unwrap();
+        store.set_manager_pair(1, b"anchor", b"list").unwrap();
+        assert_eq!(store.reset_owner("b").unwrap(), 2);
+        assert_eq!(store.owner_genesis().unwrap(), Some(OwnerGenesis { generation: 2, owner_uid: "b".into() }));
+        assert!(store.owner_links(1).unwrap().is_empty() && store.manager_pair(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn the_first_token_makes_an_owner_only_once() {
+        let store = Store::in_memory().unwrap();
+        let a = store.touch_user("a", "ka", "A", 1).unwrap().id;
+        assert!(store.grant_token_group(a, "a", ADMIN_GROUP, true).unwrap());
+        assert!(!store.grant_token_group(a, "a", ADMIN_GROUP, true).unwrap(), "never a second genesis");
+        assert!(!store.grant_token_group(a, "a", MEMBER_GROUP, false).unwrap());
+    }
 
     #[test]
     fn server_chat_migration_distinguishes_existing_data_from_a_new_database() {

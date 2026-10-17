@@ -1,3 +1,5 @@
+import type { Managers } from "../proto/Managers";
+import type { OwnerInfo } from "../proto/OwnerInfo";
 import type { SealedMessage } from "../proto/SealedMessage";
 import type { Channel } from "../proto/Channel";
 import type { ChatMessage } from "../proto/ChatMessage";
@@ -56,6 +58,9 @@ export interface SessionState {
   /** Known users (online and offline) by uid, kept current from client events. */
   members: Record<string, Member>;
   permissions: Permission[];
+  /** The server's owner and the managers of private channels (docs/e2e-build.md, section 6, 6b). */
+  owner: OwnerInfo | null;
+  managers: Managers | null;
   iceServers: IceServer[];
   /** Which user's audio currently arrives on each receive slot. */
   slots: Array<number | null>;

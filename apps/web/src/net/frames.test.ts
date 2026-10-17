@@ -82,6 +82,17 @@ describe("bounded server frames", () => {
 });
 
 describe("vc/4 runtime schemas", () => {
+  it("accepts the owner and the managers in the welcome and their events (6b)", () => {
+    const owner = { uid: "A".repeat(27), generation: 1, seq: 0, head: "A".repeat(42) + "E" };
+    const managers = { anchor: "QQ", list: "QQ", pending: ["C".repeat(27)], stale: [] };
+    expect(responseFor("join", { ...welcome(), owner, managers })).toBe(true);
+    expect(responseFor("join", { ...welcome(), owner: null, managers: null })).toBe(true);
+    expect(responseFor("join", { ...welcome(), owner: { ...owner, generation: 0 } })).toBe(false);
+    expect(parseFrame(JSON.stringify({ ev: "owner.updated", d: owner }))?.kind).toBe("event");
+    expect(parseFrame(JSON.stringify({ ev: "managers.updated", d: managers }))?.kind).toBe("event");
+    expect(responseFor("owner.chain", { genesis: "g", links: [{ statement: "s", signature: "A".repeat(86) }], next: null })).toBe(true);
+    expect(responseFor("owner.transfer", {})).toBe(true);
+  });
   it("validates challenge keys and nonces with exact fields and canonical encodings", () => {
     const valid = challenge();
     expect(parseFrame(JSON.stringify(valid))?.kind).toBe("event");
