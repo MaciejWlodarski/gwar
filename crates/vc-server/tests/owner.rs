@@ -40,7 +40,7 @@ fn link(chain: &OwnerChain, from: &Client, to: &str, anchor: Option<&SignedAncho
 }
 
 fn transfer(link: &SignedLink) -> Value {
-    json!({"statement": link.link.statement(), "signature": link.signature})
+    json!({"statement": link.link().statement(), "signature": link.signature()})
 }
 
 fn anchor(chain: &OwnerChain, owner: &Client, seq: u64, confirmers: &[&str]) -> SignedAnchor {
@@ -167,7 +167,7 @@ async fn managers_update_accepts_only_current_newer_pairs_and_reports_pending_an
     let a = SignedAnchor::parse(&B64.decode(m.anchor.unwrap()).unwrap()).unwrap();
     let l = SignedList::parse(&B64.decode(m.list.unwrap()).unwrap()).unwrap();
     assert!(c.list_current(&a, &l, now(), &()));
-    assert_eq!(l.list.seq, 2);
+    assert_eq!(l.list().seq, 2);
 }
 
 #[tokio::test]

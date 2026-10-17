@@ -204,6 +204,35 @@ fn lists_are_history_or_current_by_their_signer_and_anchor() {
 }
 
 #[test]
+fn a_listed_manager_becoming_owner_keeps_the_list_valid_as_history() {
+    let mut chain = OwnerChain::new(genesis(1));
+    let x = anchor(1, &chain.head(), 1, &[5]);
+    let l = list(&x, 1, &[7], 1);
+    assert!(chain.list_current(&x, &l, NOW, &()));
+    // Manager 7 becomes the owner and inherits X.
+    transfer(&mut chain, 1, 7, Some(&x));
+    assert!(chain.list_valid(&x, &l), "past lists stay verifiable");
+    assert!(!chain.list_current(&x, &l, NOW, &()), "the owner is no manager of a current list");
+    assert!(chain.list_current(&x, &list(&x, 2, &[], 7), NOW, &()));
+    // Neither does the new owner stay a confirmer of a current anchor.
+    let mut chain = OwnerChain::new(genesis(1));
+    transfer(&mut chain, 1, 5, Some(&x));
+    assert!(chain.anchor_valid(&x) && !chain.list_current(&x, &list(&x, 2, &[], 5), NOW, &()));
+}
+
+#[test]
+fn tampered_envelopes_do_not_parse() {
+    let chain = OwnerChain::new(genesis(1));
+    let x = anchor(1, &chain.head(), 1, &[5]);
+    let l = list(&x, 1, &[7], 5);
+    let swap = |bytes: Vec<u8>, from: &str, to: &str| String::from_utf8(bytes).unwrap().replace(from, to).into_bytes();
+    // Another confirmer, another signer or another manager than what was signed.
+    assert!(SignedAnchor::parse(&swap(x.encode(), &uid(5), &uid(6))).is_none());
+    assert!(SignedList::parse(&swap(l.encode(), &format!("\n{}\n", uid(5)), &format!("\n{}\n", uid(1)))).is_none());
+    assert!(SignedList::parse(&swap(l.encode(), &uid(7), &uid(8))).is_none());
+}
+
+#[test]
 fn bounds_and_certificates_limit_lists() {
     let chain = OwnerChain::new(genesis(1));
     let x = anchor(1, &chain.head(), 1, &[5]);

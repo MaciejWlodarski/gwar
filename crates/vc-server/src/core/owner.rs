@@ -76,7 +76,7 @@ impl Core {
         let owner = self.owner.as_ref()?;
         let editors = self.channel_editors().inspect_err(|e| tracing::warn!("store: {e:#}")).unwrap_or_default();
         let (confirmers, managers): (&[Uid], &[Uid]) = match &owner.pair {
-            Some((a, l)) => (&a.anchor.confirmers, &l.list.managers),
+            Some((a, l)) => (&a.anchor().confirmers, &l.list().managers),
             None => (&[], &[]),
         };
         let me = owner.chain.owner();
@@ -111,9 +111,9 @@ impl Core {
             genesis: owner.chain.genesis().statement(),
             links: links
                 .iter()
-                .map(|l| OwnerLinkStatement { statement: l.link.statement(), signature: l.signature.clone() })
+                .map(|l| OwnerLinkStatement { statement: l.link().statement(), signature: l.signature().to_owned() })
                 .collect(),
-            next: more.then(|| links.last().map_or(after, |l| l.link.seq)),
+            next: more.then(|| links.last().map_or(after, |l| l.link().seq)),
         })
     }
 
@@ -123,12 +123,12 @@ impl Core {
             SignedLink::parse(statement, signature).ok_or_else(|| err(ErrorCode::BadRequest, "invalid owner link"))?;
         // The client signed against a head and an anchor; if either moved, it re-signs.
         let anchor = owner.pair.as_ref().map(|(a, _)| a.hash());
-        if link.link.previous_link_hash != owner.chain.head() || link.link.anchor_hash != anchor {
+        if link.link().previous_link_hash != owner.chain.head() || link.link().anchor_hash != anchor {
             return Err(err(ErrorCode::Conflict, "the owner record changed; sign again"));
         }
         let mut chain = owner.chain.clone();
         chain.push(link.clone()).ok_or_else(|| err(ErrorCode::BadRequest, "the link is not signed by the owner"))?;
-        let new_owner = link.link.new_owner_uid.clone();
+        let new_owner = link.link().new_owner_uid.clone();
         let Some((user_id, _)) = self.store.user_by_uid(&new_owner).map_err(storage_error)? else {
             return Err(err(ErrorCode::NotFound, "the new owner is not a member of this server"));
         };
@@ -170,13 +170,14 @@ impl Core {
             return Err(err(ErrorCode::BadRequest, "the anchor and list are not current under this server's owner"));
         }
         if let Some((a, l)) = &owner.pair {
-            let anchor_ok = anchor.anchor.anchor_seq > a.anchor.anchor_seq
-                || (anchor.anchor.anchor_seq == a.anchor.anchor_seq && anchor.hash() == a.hash());
-            let list_ok = list.list.seq > l.list.seq || (list.list.seq == l.list.seq && list.hash() == l.hash());
+            let anchor_ok = anchor.anchor().anchor_seq > a.anchor().anchor_seq
+                || (anchor.anchor().anchor_seq == a.anchor().anchor_seq && anchor.hash() == a.hash());
+            let list_ok =
+                list.list().seq > l.list().seq || (list.list().seq == l.list().seq && list.hash() == l.hash());
             if !anchor_ok || !list_ok {
                 return Err(err(ErrorCode::Conflict, "a newer anchor or list is already in place"));
             }
-            if list.list.seq == l.list.seq {
+            if list.list().seq == l.list().seq {
                 return Ok(Response::Empty {});
             }
         }

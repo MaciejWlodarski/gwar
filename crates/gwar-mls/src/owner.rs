@@ -147,14 +147,23 @@ impl OwnerLink {
     }
 }
 
-/// A link with the previous owner's raw Ed25519 signature (base64url).
+/// A link with the previous owner's raw Ed25519 signature (base64url). Built only by
+/// [`SignedLink::sign`] and [`SignedLink::parse`], so its signature always matches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedLink {
-    pub link: OwnerLink,
-    pub signature: String,
+    link: OwnerLink,
+    signature: String,
 }
 
 impl SignedLink {
+    pub fn link(&self) -> &OwnerLink {
+        &self.link
+    }
+
+    pub fn signature(&self) -> &str {
+        &self.signature
+    }
+
     /// Signs with the previous owner's account key, which the link must name.
     pub fn sign(link: OwnerLink, account: &SigningKey) -> Self {
         assert_eq!(link.previous_owner_account_key, b64(account.verifying_key().as_bytes()));
@@ -275,10 +284,13 @@ impl OwnerChain {
         Some(start..=start + handed)
     }
 
-    /// Valid as history: it names a link of this chain and that link's owner signed it.
+    /// Valid as history: it names a link of this chain and that link's owner signed it, naming
+    /// at most 32 confirmers and not themselves.
     pub fn anchor_valid(&self, anchor: &SignedAnchor) -> bool {
         self.names(anchor)
-            && self.owner_at(&anchor.anchor.owner_head).is_some_and(|owner| key_uid(&anchor.account_key) == Some(owner))
+            && self.owner_at(&anchor.anchor.owner_head).is_some_and(|owner| {
+                key_uid(&anchor.account_key).as_ref() == Some(&owner) && !anchor.anchor.confirmers.contains(&owner)
+            })
             && anchor.anchor.confirmers.len() <= MAX_CONFIRMERS
     }
 
@@ -302,7 +314,7 @@ impl OwnerChain {
             && l.generation == self.genesis.generation
             && l.anchor_hash == anchor.hash()
             && (anchor.anchor.confirmers.contains(&l.signer_uid) || owners.contains(&l.signer_uid))
-            && pair_within_bounds(anchor, list, &owners)
+            && pair_within_bounds(anchor, list, owners.first().map(std::slice::from_ref).unwrap_or_default())
     }
 
     /// May be accepted as current now: valid, its anchor current, signed by the current owner or
@@ -324,7 +336,9 @@ impl OwnerChain {
     }
 }
 
-/// At most 32 confirmers and 100 managers, never an owner, no one both, at most 16 KiB.
+/// At most 32 confirmers and 100 managers, never the anchor's signing owner (`owners`; a later
+/// owner is excluded only from current pairs, so history stays valid after a move), no one
+/// both, at most 16 KiB.
 fn pair_within_bounds(anchor: &SignedAnchor, list: &SignedList, owners: &[Uid]) -> bool {
     let (confirmers, managers) = (&anchor.anchor.confirmers, &list.list.managers);
     confirmers.len() <= MAX_CONFIRMERS
@@ -384,15 +398,24 @@ impl Anchor {
     }
 }
 
-/// An anchor with the signing owner's account key and its signature.
+/// An anchor with the signing owner's account key and its signature. Built only by
+/// [`SignedAnchor::sign`] and [`SignedAnchor::parse`], so the signature always matches the key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedAnchor {
-    pub anchor: Anchor,
-    pub account_key: String,
-    pub signature: String,
+    anchor: Anchor,
+    account_key: String,
+    signature: String,
 }
 
 impl SignedAnchor {
+    pub fn anchor(&self) -> &Anchor {
+        &self.anchor
+    }
+
+    pub fn account_key(&self) -> &str {
+        &self.account_key
+    }
+
     pub fn sign(anchor: Anchor, account: &SigningKey) -> Self {
         let signature = b64(&account.sign(anchor.statement().as_bytes()).to_bytes());
         Self { anchor, account_key: b64(account.verifying_key().as_bytes()), signature }
@@ -472,15 +495,24 @@ impl ManagerList {
     }
 }
 
-/// A list with its signer's credential and device signature.
+/// A list with its signer's credential and device signature. Built only by [`SignedList::sign`]
+/// and [`SignedList::parse`], so the credential is the signer's and the signature matches.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SignedList {
-    pub list: ManagerList,
-    pub signer: Credential,
-    pub signature: String,
+    list: ManagerList,
+    signer: Credential,
+    signature: String,
 }
 
 impl SignedList {
+    pub fn list(&self) -> &ManagerList {
+        &self.list
+    }
+
+    pub fn signer(&self) -> &Credential {
+        &self.signer
+    }
+
     /// Signs with the signer's device key, which must be the credential's.
     pub fn sign(list: ManagerList, signer: Credential, device: &SigningKey) -> Self {
         assert_eq!(signer.device_key(), b64(device.verifying_key().as_bytes()));
