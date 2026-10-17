@@ -282,6 +282,33 @@ export class MlsRuntime {
     }
     await this.acceptManagers();
   }
+  /** The server's current anchor envelope, if it has one. */
+  private serverAnchor(): Uint8Array | undefined {
+    return this.managers?.anchor ? decodeBase64Url(this.managers.anchor) : undefined;
+  }
+  /** The next confirmer anchor's statement, for the owner's account key to sign. */
+  nextAnchor(confirmers: string[]): Promise<string> {
+    const server = this.server;
+    return this.engine.run(async () => this.engine.withAgent(a => a.next_anchor!(server, confirmers, this.now())));
+  }
+  /** The statement moving ownership to `newOwner`, for the owner's account key to sign. */
+  transferStatement(accountKey: string, newOwner: string): Promise<string> {
+    const server = this.server, anchor = this.serverAnchor();
+    return this.engine.run(async () => this.engine.withAgent(a => a.transfer_statement!(server, accountKey, newOwner, anchor, this.now())));
+  }
+  async transferOwnership(statement: string, signature: string): Promise<void> {
+    await this.request("owner.transfer", { statement, signature }, undefined, this.generation);
+  }
+  /**
+   * Signs the next manager list with this device and installs it with `anchor` (a newly signed
+   * anchor envelope) or the server's current anchor.
+   */
+  async publishManagers(managers: string[], anchor?: Uint8Array): Promise<void> {
+    const server = this.server, under = anchor ?? this.serverAnchor();
+    if (!under) throw new Error("no confirmer anchor yet");
+    const list = await this.engine.run(async () => this.engine.withAgent(a => a.sign_manager_list!(a.next_list!(server, under, managers, this.now()))));
+    await this.request("managers.update", { anchor: encodeBase64Url(under), list: encodeBase64Url(list) }, undefined, this.generation);
+  }
   private async acceptManagers(): Promise<void> {
     const server = this.server, managers = this.managers;
     if (!server) return;

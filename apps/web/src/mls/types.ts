@@ -17,6 +17,9 @@ export interface WasmAgent {
   accept_managers?(server: string, anchor: Uint8Array, list: Uint8Array, now: number, revocations: Revocation[]): ManagersCheck;
   owner_view?(server: string): OwnerView | null;
   sign_manager_list?(statement: string): Uint8Array;
+  next_anchor?(server: string, confirmers: string[], signedAt: number): string;
+  next_list?(server: string, anchor: Uint8Array | undefined, managers: string[], signedAt: number): string;
+  transfer_statement?(server: string, accountKey: string, newOwner: string, serverAnchor: Uint8Array | undefined, signedAt: number): string;
 }
 export type OwnerCheck =
   | { kind: "pinned" } | { kind: "unchanged" } | { kind: "extended" } | { kind: "changed" }
