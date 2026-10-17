@@ -906,3 +906,153 @@ Resolving idle within 2 ms needs one of two things: a method that controls the
 startup-depth level (for example, markers only after the receiver's initial
 trims settle), or a receiver that converges to one level. The 5d latency gate
 inherits this; record it there before measuring SFrame.
+
+## Re-run with a 15 s marker warmup (2026-10-17)
+
+The Mac rebooted on 2026-10-17 and `/tmp` was wiped. The raw data under `/tmp`
+cited in the sections above is gone; only the tables in this document remain.
+The data for this section is kept outside the repository in
+`~/dev/projects/gwar-latency-runs/` on the measurement Mac.
+
+The idle section above traced the unresolved idle result to startup trims
+that are still running while the markers play. The harness now takes
+`LATENCY_WARMUP_MS` (docs/latency.md). Every run below uses
+`LATENCY_WAIT_CONNECTED=1 LATENCY_WARMUP_MS=15000`. Markers start 15 s after
+the transport connects. Pairing, guard, minimum pairs, the bootstrap and the
+decision rules are unchanged.
+
+- B: `b4f4627` (`b0c6e6b` plus the #54 fix), SHA-256
+  `0c0ab4534ba948a856af5acf72f2d9982f4f4cc9190b235cdf1ee4bdfdf48ac4`.
+- C: `main` at `fb454d1` (5b, #55 and 5c), SHA-256
+  `1d6d01455dfddb897babfe615e33083e7fade011f357ffb810134400ab710bfd`.
+
+Both builds carry the same harness source.
+
+### Current main against the pre-step baseline
+
+| Series | Condition | Pairs | p95 B / C (ms) | Added p95; paired 95% interval | PLC B / C | Underruns B / C | Decision |
+| --- | --- | ---: | --- | --- | --- | --- | --- |
+| A | idle | 20 | 45.46 / 42.65 | −2.81; [−7.42, +0.15] | 7 / 4 | 0 / 0 | PASS |
+| A | loss | 4 | 40.17 / 40.58 | +0.41; [−0.23, +0.94] | 361 / 362 | 0 / 0 | PASS |
+| A | reorder | 4 | 52.83 / 52.42 | −0.41; [−5.91, +0.52] | 93 / 91 | 0 / 0 | PASS |
+| A | burst | 4 | 40.11 / 40.27 | +0.16; [−0.41, +0.47] | 277 / 275 | 0 / 0 | PASS |
+| A | stall | 4 | 46.25 / 46.46 | +0.22; [−2.45, +5.83] | 40 / 40 | 0 / 0 | INCONCLUSIVE |
+| B | jitter | 8 | 58.20 / 49.66 | −8.55; [−9.63, +0.09] | 5 / 7 | 0 / 0 | INCONCLUSIVE (pairs) |
+| B | callbacks | 9 | 71.89 / 75.41 | +3.52; [−2.43, +8.90] | 26 / 31 | 0 / 0 | INCONCLUSIVE (pairs) |
+| B | mixed | 4 | 87.14 / 96.72 | +9.57; [−0.19, +28.68] | 668 / 668 | 0 / 0 | INCONCLUSIVE |
+| B | cpu | 5 | 74.87 / 72.71 | −2.16; [−16.91, +6.09] | 20 / 23 | 4 / 1 | INCONCLUSIVE (pairs) |
+| D | jitter | 10 | 57.35 / 49.13 | −8.22; [−9.60, −0.15] | 11 / 12 | 0 / 0 | PASS |
+| D | callbacks | 10 | 78.86 / 79.84 | +0.99; [−3.37, +2.83] | 13 / 30 | 0 / 0 | INCONCLUSIVE |
+| D | mixed | 4 | 78.01 / 97.35 | +19.34; [−0.79, +19.79] | 651 / 664 | 0 / 0 | INCONCLUSIVE |
+| D | cpu | 10 | 57.17 / 62.02 | +4.85; [−7.46, +24.37] | 13 / 26 | 0 / 1 | FAIL (rule) |
+
+Run times (UTC):
+
+| Series | Time | Contended runs | Notes |
+| --- | --- | --- | --- |
+| A | 08:10–09:02 | 0 | |
+| B | 09:03–09:52 | 9 | Chrome and the ChatGPT app went above 100% CPU. |
+| C | | | Stopped after jitter and part of callbacks. Not used. |
+| D | 10:15–11:04 | 0 | Fresh series on a quiet machine. |
+
+Every run matched at least 95/100 markers.
+
+**Idle.** All 40 runs settle at run-level p95 values of about 42–45 ms. The
+earlier 40/47/50–55 ms clusters are gone, and the comparison resolves.
+
+**Mixed.** Each 270 ms uplink stall shifts the latency level of the rest of
+the run by 0, ±10, ±20 or ±30 ms. The shift depends on where the refill lands
+after the stall. A shift holds until the next stall 10 s later and occurs in
+both builds:
+
+| Run | Level after the stall |
+| --- | --- |
+| Baseline B04 | 87–89 ms |
+| Candidate B07 | 94–102 ms |
+| Candidate D02 | 96–102 ms |
+
+With four pairs, one +30 ms step decides the p95 comparison.
+
+An instrumented mixed series showed the same steps in both builds. It ran four
+slots per build (11:28–11:34 UTC) with the stage timestamps described in the
+CPU diagnosis below; two slots were contended, which affects only the pair
+count. Shifts after the 22 s and 32 s stalls, over all eight runs:
+
+| Build | +10 ms | 0 | −10 ms |
+| --- | ---: | ---: | ---: |
+| B | 4 | 3 | 1 |
+| C | 3 | 2 | 3 |
+
+**Callbacks.** In series D the added p95 is +0.99 ms, and the upper bound of
++2.83 ms misses the gate by 0.83 ms. The candidate concealed more often
+(PLC 30 against 13). This is worth checking again in the 5d gate.
+
+### Diagnosis of the CPU-load episodes
+
+The aggregate counters used in the earlier diagnosis are replaced by
+temporary, uncommitted stage timestamps in both builds. The stages are:
+
+- encoder output,
+- the sender's RTP write,
+- SFU ingest,
+- SFU forward,
+- receiver RTP arrival,
+- jitter-buffer push,
+- receiver queue depth at every refill.
+
+One instrumented CPU series ran 10 slots per build (11:12–11:27 UTC; two
+slots contended, eight pairs). It gave added p95 −42.29 ms, [−63.23, −2.31],
+INCONCLUSIVE by pairs, with underruns 5 / 2.
+
+Receive gaps above 25 ms after startup:
+
+| Origin | B | C |
+| --- | ---: | ---: |
+| Sender RTP-write gap of about the same length, with an encoder-thread gap | 6 | 1 |
+| Sender RTP-write gap of about the same length, no encoder-thread gap | 3 | 2 |
+| Receive side only (28 ms) | 1 | 0 |
+
+SFU ingest never gapped without a matching send gap, and the SFU forwarded
+every gap unchanged. The largest gaps were 126 ms (B) and 61 ms (C).
+
+A send gap of G ms arrives as a burst. Afterwards the receiver queue sits about
+G ms deeper.
+
+- C holds that depth for the five-second depth window plus one second, then
+  trims about 10 ms/s.
+- B can keep it until the end of the run. Three baseline runs starved before
+  or at the first marker and played the whole marker period 20–65 ms above
+  the usual ≈38–40 ms.
+
+So the episodes are scheduler starvation of the sender's encoder thread or RTP
+task under six busy loops, and that starvation occurs in both builds. The CPU
+result swings between series:
+
+| Series | Pairs | Added p95 (ms) |
+| --- | ---: | --- |
+| 2 s warmup, above | 10 | −12.31 |
+| B | 5 | −2.16 |
+| D | 10 | +4.85 |
+| Instrumented | 8 | −42.29 |
+
+Per-run p95 depends on whether a run has zero, one or two starvation episodes,
+and how large they are. Ten pairs cannot bound that at 2 ms.
+
+### Decision
+
+**The 5b latency gate is still not formally passed.**
+
+- **Pass:** idle, loss, reorder, burst and jitter pass for current `main`
+  against the pre-step baseline.
+- **Inconclusive:** stall, callbacks and mixed. Neither the per-run data nor
+  the stage timestamps show a mechanism specific to 5b, #55 or 5c behind the
+  mixed or CPU differences.
+- **Fail:** CPU, by the underrun rule in series D.
+
+Recommendation for the 5d gate:
+
+- Keep the 15 s warmup.
+- Gate the network and callback conditions as before.
+- Make CPU and mixed diagnostic: report the p95 comparison and underruns, and
+  attribute each episode with stage timestamps. One extra candidate underrun
+  or a single post-stall level step then no longer decides the outcome.

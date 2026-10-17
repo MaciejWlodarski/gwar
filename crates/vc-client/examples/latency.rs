@@ -36,7 +36,17 @@ use vc_proto::{ClientSoftware, Platform};
 const RATE: usize = 48_000;
 const BLOCK: usize = 480;
 const PERIOD: usize = 12_000; // 250 ms
-const WARMUP: usize = RATE * 2;
+/// Marker start after connection: 2 s, or `LATENCY_WARMUP_MS`. A gate uses a
+/// longer warmup so the receiver's startup trims finish before the markers.
+fn warmup_samples() -> usize {
+    static W: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("LATENCY_WARMUP_MS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map_or(RATE * 2, |ms| RATE * ms / 1000)
+    })
+}
 const MARKER: usize = 960; // 20 ms
 // At least 200 Hz apart, and 100 Hz away from the 400 Hz carrier's harmonics.
 const TONES: [f64; 8] = [900.0, 1100.0, 1300.0, 1500.0, 1700.0, 1900.0, 2300.0, 2700.0];
@@ -283,7 +293,7 @@ impl AudioIo for FakeIo {
                 let mut missing = 0;
                 let now = Instant::now();
                 if marker_start.is_none() && self.markers_ready.load(Ordering::Acquire) {
-                    marker_start = Some(position + WARMUP);
+                    marker_start = Some(position + warmup_samples());
                 }
                 let warmup = marker_start.unwrap_or(usize::MAX);
                 let mut data = self.data.lock().unwrap();
@@ -559,7 +569,9 @@ async fn run(
         None
     };
     tokio::time::sleep(Duration::from_secs_f64(
-        3.0 + count as f64 * PERIOD as f64 / RATE as f64 + MATCH_WINDOW_MS / 1000.0,
+        1.0 + warmup_samples() as f64 / RATE as f64
+            + count as f64 * PERIOD as f64 / RATE as f64
+            + MATCH_WINDOW_MS / 1000.0,
     ))
     .await;
     let receiver_stats = vb.stats();
@@ -679,7 +691,7 @@ async fn run(
         "rms_off_threshold": 0.11,
         "marker_samples": MARKER,
         "marker_interval_samples": PERIOD,
-        "warmup_samples": WARMUP,
+        "warmup_samples": warmup_samples(),
     });
     std::fs::write(format!("{output}.json"), serde_json::to_string_pretty(&metadata)?)?;
     anyhow::ensure!(
