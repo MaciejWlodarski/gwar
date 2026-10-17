@@ -2408,10 +2408,14 @@ gwar managers v1
     including replay):
     - the new extension parses, and every signature verifies (its anchor
       valid as history; it need not be current);
-    - the anchor's and the list's seqs are at least the previous ones', and
-      the member list's seq is greater, or equal with the same bytes;
+    - the member list names this group;
     - the member list's signer is authorized by the new manager list;
     - every signer's certificate covers the commit's time.
+    - Seqs are **not** compared here. A commit carrying older or never-current
+      lists is valid MLS history, but it cannot satisfy (a)–(b), so members
+      block and repair. Rollback protection lives only in the checkpoints,
+      which only current lists advance, so no commit can raise a floor that
+      a later honest repair must exceed.
   - **The same commit** removes every leaf the new lists no longer admit.
   - The allowlist gains `GroupContextExtensions` for private channel groups
     only, never in an external commit.
@@ -2475,8 +2479,11 @@ gwar managers v1
   - `mls.group.create` for a private channel checks the creator against the
     server's newest manager pair.
 - **Restarts.**
-  - Only the owner, a confirmer or a manager may create a successor of a
-    private channel's group (the descriptor creator check).
+  - The server accepts a successor of a private channel's group only from
+    the owner, a confirmer or a manager on its newest pair (at
+    `mls.group.create`). Clients do not check the creator: a successor is
+    usable only with a member list bound to its own group id and signed by
+    a currently authorized signer, which carries that authority.
   - The successor's initial `0xff01` carries the newest manager pair and a
     member list **bound to the successor's group id, seq 1**, with the
     predecessor's members unless edited.
@@ -2490,14 +2497,23 @@ gwar managers v1
     used. The chain is fixed by the signed `previous_group_id` links, so a
     fabricated intermediate is reachable only from a final successor that
     names it.
-  - **Staged adoption.** For a private conversation `accept_chain` verifies
-    the chain but changes nothing until the final successor passes: its
-    current GroupInfo satisfies (a)–(c) as of now, and its creator is the
-    owner, a confirmer or a manager on the reader's current pair. Only then
-    are the pins, the live incarnation and the superseding written, in one
-    write. Otherwise the predecessor's state, outbox and pins stay as they
-    were, and the client shows "Waiting for a channel manager to confirm
-    access" and retries as a newcomer does.
+  - **Staged adoption.** For a private conversation, **every** path that
+    supersedes a predecessor (`accept_chain`, and `settle` of a won
+    creation, including crash recovery and a late creation reply) verifies
+    first and changes nothing until the final successor passes: its current
+    GroupInfo satisfies (a)–(c) as of now. Only then are the pins, the live
+    incarnation and the superseding written, in one write. Otherwise the
+    predecessor's state, outbox and pins stay as they were, the verified
+    chain is kept as **pending**, and the client shows "Waiting for a
+    channel manager to confirm access" and retries as a newcomer does.
+  - **Recovery of a pending tip.** A manager repairs a pending tip as any
+    group: by an `mls.access.offer` that a member of the tip commits. If no
+    member can commit (all state lost, or every list expired), the owner, a
+    confirmer or a manager creates a successor **of the pending tip** (the
+    agent's `create` accepts a verified pending tip of a private
+    conversation as predecessor, without adopting it). The chain through
+    the new successor is adopted when that successor passes, which it does
+    for its creator at once.
 - **Voice.**
   - A private channel's voice group binds to its parent as in 5a. The agent
     no longer refuses a private parent.
@@ -2599,7 +2615,14 @@ gwar managers v1
   - restart authority, with the successor's seq 1 accepted, and catch-up
     G0 → G1 (created by a manager removed later) → G2 (by the owner);
   - a removed manager's backdated successor rejected with the predecessor's
-    state, outbox and pins unchanged;
+    state, outbox and pins unchanged, also through `settle` when authority
+    changes between creation and settlement;
+  - recovery of a pending tip whose group state is lost and whose lists
+    expired, by a successor of the pending tip; a tip whose creator was
+    removed later is adopted once its lists are current;
+  - a never-current anchor committed by a former owner's remaining leaf
+    with inflated seqs: members block, and a repair with the current pair
+    succeeds;
   - a hidden-then-shown channel cannot roll back its member list;
   - extension size limits at 1000 members and 100 managers;
   - voice under a private parent, and access removal cutting voice;
