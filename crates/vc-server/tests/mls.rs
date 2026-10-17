@@ -2686,3 +2686,61 @@ async fn native_sframe_tone_travels_between_engines_through_the_sfu() {
     late["binding"] = a_binding.clone();
     assert_eq!(retained.control(late).await.result, Some(vc_client::voice::sframe::Outcome::Ignored));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_sframe_receiver_decodes_eight_senders_on_all_slots() {
+    let server = TestServer::start_with(|c| c.max_clients = 16).await;
+    let ids: Vec<(u8, u8)> = (0..9).map(|i| (101 + i, 201 + i)).collect();
+    let mut clients = Vec::new();
+    for &(account, device) in &ids {
+        clients.push(connect_device(&server, &Device::new(account, device)).await);
+    }
+    clients[0].ok("token.redeem", json!({"token":server.admin_token})).await;
+    let channel = channel_id(&clients[0].create_channel(json!({"name":"eight","encrypted":true})).await);
+    let mut parent = Device::new(ids[0].0, ids[0].1);
+    let parent_id = create_channel_group(&mut clients[0], &mut parent, channel, true, 95).await.unwrap();
+    for (i, client) in clients.iter_mut().enumerate().skip(1) {
+        join_channel(&server, client, &mut Device::new(ids[i].0, ids[i].1), &parent_id).await;
+    }
+    let mut states = Vec::new();
+    for client in &mut clients {
+        states.push(participation(client, channel).await);
+    }
+    // One voice group of nine; every member processes the joins after its own.
+    let mut devices: Vec<Device> = ids.iter().map(|&(a, d)| Device::new(a, d)).collect();
+    let d = voice_descriptor(&devices[0], channel, &parent_id, &clients[0].server_key, 96);
+    devices[0].create(&d, &clients[0].server_key);
+    let group=clients[0].ok("mls.group.create",json!({"conversation":d.descriptor.conversation,"group_info":b64(&devices[0].group_info()),"voice":voice_binding(&states[0])})).await["group"].as_str().unwrap().to_owned();
+    for i in 1..9 {
+        let joined = join_voice(&server, &mut clients[i], &mut devices[i], &group, &states[i]).await;
+        for member in devices.iter_mut().take(i) {
+            member.process(&joined.0);
+        }
+    }
+    let epoch = devices[0].group.as_ref().unwrap().epoch();
+    assert!(devices.iter().all(|d| d.group.as_ref().unwrap().epoch() == epoch));
+
+    let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut engines = Vec::new();
+    for (i, client) in clients.iter_mut().enumerate() {
+        let io = ToneIo { heard: if i == 0 { heard.clone() } else { std::sync::Arc::default() }, tone: i > 0 };
+        engines.push(native_encrypted(client, io, 1, None).await);
+    }
+    for ((engine, binding), device) in engines.iter().zip(&devices) {
+        install_and_activate(engine, binding, device).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    let receiver = &engines[0].0;
+    let stats = receiver.stats();
+    assert!(stats.slots.iter().all(|slot| slot.generation > 0), "every slot carried a sender: {stats:?}");
+    let got = receiver.keys().unwrap().counters();
+    assert!(got.decrypted > 8 * 150, "{got:?}");
+    assert_eq!((got.auth_failed, got.replay_dropped, got.own_kid_dropped), (0, 0, 0), "{got:?}");
+    for (engine, _) in &engines[1..] {
+        assert!(engine.keys().unwrap().counters().encrypted > 150);
+    }
+    let samples = heard.lock().unwrap().clone();
+    let tail = &samples[samples.len().saturating_sub(48_000)..];
+    let level = (tail.iter().map(|s| s * s).sum::<f32>() / tail.len().max(1) as f32).sqrt();
+    assert!(level > 0.05, "the receiver played the mixed senders: rms {level}");
+}
