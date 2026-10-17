@@ -2402,6 +2402,15 @@ gwar managers v1
 - **Signer of the member list:** the owner, a confirmer or a manager on the
   extension's own manager list. It does not name a manager list: as long as
   its signer stays on the manager list, a new manager list keeps it valid.
+- **Which owner.** Wherever this section says "the owner":
+  - in **history** (validation of a commit, the tree rule on replay), it is
+    any owner of the extension's anchor span (see "Validity of a list"):
+    the owner at the anchor's `owner_head` or at any later link that
+    hands the anchor over by hash. The reader first fetches any extension
+    of its owner pin, so the span is the same for every reader;
+  - in **current authority** (a)–(d), it is the current owner at the
+    reader's pinned head only. A former owner's leaf or list then fails
+    (b) or (d), and members repair.
 - **Capabilities.** From 6c on every key package and leaf advertises `0xff01`
   as well as `0xff00`. A private channel's group requires both in its
   RequiredCapabilities, set at creation. Other groups require only
@@ -2481,6 +2490,16 @@ gwar managers v1
   roll its list back.
 - **Server:**
   - the observer parses `0xff01` after every commit;
+  - **live commits are held to checkpoints.** The server keeps, durably,
+    per private group the `(seq, hash)` of the newest member list it
+    accepted, beside its newest manager pair. It accepts a commit that
+    changes `0xff01` only if the new manager pair is its newest pair and the
+    member list is current (signer authorized by that pair, certificate
+    current now) with a greater seq, or the same seq and bytes. It then
+    advances the checkpoint. A member recommitting an older list, or a
+    never-current one, is refused (`conflict`), so an honest server never
+    rolls access back or serves such a GroupInfo to newcomers. Replay and
+    the agents' history validation stay permissive as above;
   - `mls_can_read` for a private channel's conversation is the extension's
     admitted set;
   - channel visibility (6a) follows the same set;
@@ -2634,6 +2653,12 @@ gwar managers v1
   - a never-current anchor committed by a former owner's remaining leaf
     with inflated seqs: members block, and a repair with the current pair
     succeeds;
+  - an honest server refuses a member's recommit of an older member list
+    (L2 → L1) and of a never-current pair; its checkpoints survive a
+    restart;
+  - replay before and after a transfer that hands over the anchor: the
+    former owner's leaf and member list verify as history, and fail current
+    authority until repaired;
   - a hidden-then-shown channel cannot roll back its member list;
   - extension size limits at 1000 members and 100 managers;
   - voice under a private parent, and access removal cutting voice;
