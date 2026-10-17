@@ -1192,13 +1192,14 @@ limit (about 300 devices):
 
 ## 5. Encrypted voice
 
-Status: **5a–5c built; 5d specified, not built**. Voice MLS rules, volatile
-calls, bound negotiation, opaque SFU forwarding, origin-preserving TeamSpeak
-queues and browser SFrame are implemented. Browsers that pass the transform
-capability check join encrypted voice; the desktop keeps the calm notice below
-until 5d. Plaintext voice and TeamSpeak keep their existing media formats. See
-the [5a report](voice-calls-5a.md), [5b report](voice-sfu-5b.md) and
-[5c report](voice-web-5c.md) for coverage, validation and acceptance still pending.
+Status: **5a–5d built**. Voice MLS rules, volatile calls, bound negotiation,
+opaque SFU forwarding, origin-preserving TeamSpeak queues, browser SFrame and
+native SFrame are implemented. Browsers that pass the transform capability
+check and the desktop app join encrypted voice. Plaintext voice and TeamSpeak
+keep their existing media formats. See the [5a report](voice-calls-5a.md),
+[5b report](voice-sfu-5b.md), [5c report](voice-web-5c.md) and
+[5d report](voice-native-5d.md) for coverage, validation and acceptance still
+pending.
 
 RTP admission binds the negotiated microphone SSRC and retains retired SSRCs.
 Native capture positions drive RTP time; per-source generations and previous
@@ -1835,15 +1836,11 @@ cannot relax key provenance, removal cutoff or the no-plaintext rule.
   reconciliation (including rejoin for an expired own leaf); a failed state
   closes the run. No status event counts as
   an installation acknowledgement. Keep native input/output diagnostics.
-- Rust uses a **crates.io `sframe` release containing the RFC 9605 AAD-order
-  fix** (upstream issue [#124](https://github.com/TobTheRock/sframe-rs/issues/124),
-  merged PR [#125](https://github.com/TobTheRock/sframe-rs/pull/125)). If no
-  such release exists when 5d is built, pin the full 40-hex merge revision of
-  #125 from `https://github.com/TobTheRock/sframe-rs`, record it in
-  `Cargo.toml` and `Cargo.lock`, and replace it with the fixed crates.io
-  release **before step 8**. Resolve that exact merged-fix revision when
-  adding the dependency; a branch, moving tag or unpatched 2.0.0 is not
-  acceptable. The merge/release is not fetched by this documentation task.
+- Rust uses the **crates.io `sframe` 2.1.0 release**, which contains the RFC
+  9605 AAD-order fix (upstream issue
+  [#124](https://github.com/TobTheRock/sframe-rs/issues/124), merged PR
+  [#125](https://github.com/TobTheRock/sframe-rs/pull/125)); an unpatched
+  2.0.0 is not acceptable. The shared metadata vector proves the order.
   Use explicit counter/replay ownership around the library; do not rely on
   a constructor that silently resets state on reinstallation.
 - Native playout accepts every valid Opus packet duration from 2.5 through

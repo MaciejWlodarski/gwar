@@ -18,7 +18,12 @@ use vc_proto::{
     rtp::{SLOT_GENERATION_ID, SlotGeneration, slot_generation_extension},
 };
 
-use super::{Counters, Incoming, LinkState, Outgoing, io::OutputTiming, jitter::Clock};
+use super::{
+    Counters, Incoming, LinkState, Outgoing,
+    io::OutputTiming,
+    jitter::Clock,
+    keys::{Crypto, RunGate},
+};
 use std::sync::Arc;
 
 /// Marks the link lost however the transport task ends.
@@ -29,6 +34,8 @@ impl Drop for LostOnDrop {
     }
 }
 
+// The session channels, counters, crypto and the retirement gate are independent inputs.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start<F, Fut>(
     signal: F,
     local_ip: IpAddr,
@@ -36,6 +43,8 @@ pub(crate) async fn start<F, Fut>(
     incoming: std::sync::mpsc::SyncSender<Incoming>,
     counters: Arc<Counters>,
     wake: Arc<OutputTiming>,
+    crypto: Option<Crypto>,
+    gate: RunGate,
 ) -> Result<()>
 where
     F: FnOnce(String) -> Fut,
@@ -81,8 +90,23 @@ where
         .map(|p| p.pt())
         .context("native voice answer lacks Opus on the microphone")?;
 
+    // Crypto is attached before either loop runs: no frame passes unencrypted.
+    let (mut crypto, mut commands) = match crypto {
+        Some(Crypto { run, commands }) => (Some(run), Some(commands)),
+        None => (None, None),
+    };
     tokio::spawn(async move {
         let _lost = LostOnDrop(counters.clone());
+        // Stops the keys however the task ends.
+        struct StopKeys<'a>(&'a mut Option<super::keys::RunCrypto>);
+        impl Drop for StopKeys<'_> {
+            fn drop(&mut self) {
+                if let Some(crypto) = self.0.as_mut() {
+                    crypto.stop();
+                }
+            }
+        }
+        let crypto = StopKeys(&mut crypto);
         let mut buf = vec![0u8; 2048];
         let mut last_ticks = None;
         let offset = rand::random::<u32>();
@@ -92,6 +116,8 @@ where
                 match rtc.poll_output() {
                     Ok(Output::Timeout(t)) => break t,
                     Ok(Output::Transmit(t)) => {
+                        // Every datagram leaves under the gate: nothing queued is sent after retirement.
+                        let Some(_open) = gate.enter() else { return };
                         let _ = socket.try_send_to(&t.contents, t.destination);
                     }
                     Ok(Output::Event(Event::RtpPacket(packet))) => {
@@ -105,13 +131,24 @@ where
                                 .get::<SlotGeneration>()
                                 .copied()
                                 .map(super::Generation::Rtp);
+                            // A retired run plays nothing; only an authenticated packet can
+                            // reach playout or reset a slot.
+                            let Some(_open) = gate.enter() else { return };
+                            let opus = match crypto.0.as_mut() {
+                                Some(keys) => match keys.decrypt(&packet.payload) {
+                                    (Some(opus), _) => opus,
+                                    (None, true) => continue,
+                                    (None, false) => return,
+                                },
+                                None => packet.payload.to_vec(),
+                            };
                             let item = Incoming {
                                 slot,
                                 arrived: Instant::now(),
                                 clock: Clock::Rtp,
                                 rtp_time,
                                 generation,
-                                opus: packet.payload.to_vec(),
+                                opus,
                             };
                             counters.frame_received();
                             let _ = incoming.try_send(item);
@@ -142,7 +179,22 @@ where
             if !rtc.is_alive() {
                 return;
             }
+            let deadline = match crypto.0.as_mut() {
+                Some(keys) => deadline.min(keys.tick(Instant::now())),
+                None => deadline,
+            };
             tokio::select! {
+                () = gate.closed() => return,
+                command = async { match commands.as_mut() { Some(c) => c.recv().await, None => std::future::pending().await } } => {
+                    let (Some(command), Some(keys)) = (command, crypto.0.as_mut()) else { return };
+                    let Some(_open) = gate.enter() else {
+                        keys.refuse(command);
+                        return;
+                    };
+                    if !keys.command(command) {
+                        return;
+                    }
+                }
                 frame = outgoing.recv() => {
                     let Some(frame) = frame else { return };
                     // str0m buffers writes before SRTP is ready. Replaying that
@@ -158,9 +210,23 @@ where
                         continue;
                     };
                     last_ticks = Some(ticks);
+                    if rtc.direct_api().stream_tx_by_mid(mic, None).is_none() {
+                        continue;
+                    }
+                    // Nothing queued is encrypted or sent after retirement.
+                    let Some(_open) = gate.enter() else { return };
+                    // The send gate and counter reservation sit right before the RTP write.
+                    let payload = match crypto.0.as_mut() {
+                        Some(keys) => match keys.encrypt(&frame.opus) {
+                            (Some(sealed), _) => sealed,
+                            (None, true) => continue,
+                            (None, false) => return,
+                        },
+                        None => frame.opus,
+                    };
+                    let ext_vals = ExtensionValues { audio_level: Some(frame.level), voice_activity: Some(frame.speech), ..Default::default() };
+                    let write = RtpWrite::new(pt, sequence.into(), (ticks as u32).wrapping_add(offset), Instant::now(), payload);
                     if let Some(stream) = rtc.direct_api().stream_tx_by_mid(mic, None) {
-                        let ext_vals = ExtensionValues { audio_level: Some(frame.level), voice_activity: Some(frame.speech), ..Default::default() };
-                        let write = RtpWrite::new(pt, sequence.into(), (ticks as u32).wrapping_add(offset), Instant::now(), frame.opus);
                         stream.write_rtp(write.ext_vals(ext_vals));
                         sequence += 1;
                     }
@@ -216,6 +282,59 @@ mod tests {
     use str0m::change::SdpOffer;
 
     #[tokio::test]
+    async fn a_retired_run_sends_no_datagram() {
+        use tokio::time::{Duration, timeout};
+        let remote_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut remote = Rtc::builder()
+            .set_extension(SLOT_GENERATION_ID, slot_generation_extension())
+            .clear_codecs()
+            .enable_opus(true, false)
+            .build(Instant::now());
+        remote.add_local_candidate(Candidate::host(remote_socket.local_addr().unwrap(), "udp").unwrap());
+        let (outgoing, outgoing_rx) = mpsc::channel(8);
+        let (incoming, _incoming_rx) = std::sync::mpsc::sync_channel(16);
+        let gate = RunGate::new();
+        let start_rtc = |gate: RunGate| {
+            start(
+                move |offer| {
+                    let answer = remote.sdp_api().accept_offer(SdpOffer::from_sdp_string(&offer).unwrap()).unwrap();
+                    std::future::ready(Ok(answer.to_sdp_string()))
+                },
+                remote_socket.local_addr().unwrap().ip(),
+                outgoing_rx,
+                incoming,
+                Arc::new(Counters::default()),
+                Arc::new(OutputTiming::default()),
+                None,
+                gate,
+            )
+        };
+        start_rtc(gate.clone()).await.unwrap();
+        // The live run sends ICE checks to the remote candidate.
+        let mut buf = [0u8; 2048];
+        timeout(Duration::from_secs(3), remote_socket.recv_from(&mut buf))
+            .await
+            .expect("a live run transmits")
+            .unwrap();
+        gate.close();
+        // Drain anything sent before the close completed, then expect silence.
+        while timeout(Duration::from_millis(50), remote_socket.recv_from(&mut buf)).await.is_ok() {}
+        for i in 0..4 {
+            let _ = outgoing.try_send(Outgoing {
+                captured_at: Instant::now(),
+                capture_position: i * 480,
+                opus: vec![0xf0, 1],
+                level: -10,
+                speech: true,
+            });
+        }
+        assert!(
+            timeout(Duration::from_millis(1500), remote_socket.recv_from(&mut buf)).await.is_err(),
+            "a retired run transmitted"
+        );
+    }
+
+    #[tokio::test]
     async fn connecting_capture_is_not_replayed_after_the_handshake() {
         use std::sync::atomic::Ordering;
         use tokio::time::{Duration, timeout};
@@ -242,6 +361,8 @@ mod tests {
             incoming,
             counters.clone(),
             Arc::new(OutputTiming::default()),
+            None,
+            RunGate::new(),
         )
         .await
         .unwrap();
@@ -425,6 +546,8 @@ mod tests {
                 incoming,
                 Arc::new(Counters::default()),
                 Arc::new(OutputTiming::default()),
+                None,
+                RunGate::new(),
             )
             .await;
             if omitted.is_some_and(|i| i > 0) {
@@ -477,6 +600,8 @@ mod tests {
                     incoming,
                     Arc::new(Counters::default()),
                     Arc::new(OutputTiming::default()),
+                    None,
+                    RunGate::new(),
                 )
                 .await;
                 if changed > 0 && matches!(direction, Some("inactive" | "recvonly")) {

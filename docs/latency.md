@@ -82,6 +82,14 @@ fails the run. Impairment times such as
 before the first marker: with 15 s the markers span about 15.2–40 s, and a
 stall belongs at for example `@27s`.
 
+`LATENCY_SFRAME=1` measures an encrypted call on the fresh local server. The
+sender creates an encrypted channel, its channel MLS group and the call's
+voice group, and the receiver joins both by external commit. Both native
+engines start encrypted and install the epoch's MLS exporter keys through the
+engine's key channel, the production path. The JSON records `sframe` and the
+receiver's SFrame counters. Plaintext and SFrame then compare in one build:
+set `LATENCY_SFRAME` to 0 in one variant's wrapper and to 1 in the other's.
+
 To check latency beyond one marker period, delay the audio itself in the fake
 receiver output device:
 

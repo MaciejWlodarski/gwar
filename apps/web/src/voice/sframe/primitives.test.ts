@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import vectors from "../../../../../crates/vc-client/tests/sframe-vectors.json";
+import interop from "../../../../../crates/vc-client/tests/sframe-interop.json";
 import { decodeHeader, encodeHeader } from "./header";
 import { Replay } from "./replay";
+import { voiceKid } from "./state";
 import { deriveKey, nonce, open, seal, SUITE } from "./suite";
 
 const hex = (s: string) => new Uint8Array(s.match(/../g)!.map(b => parseInt(b, 16)));
@@ -64,6 +66,21 @@ describe("AES_128_GCM_SHA256_128 (RFC 9605 C.3, non-empty metadata)", () => {
     await expect(seal(dec, 1n, 10n, new Uint8Array(), new Uint8Array([1]))).rejects.toThrow();
     expect(await open(enc, ct.subarray(0, 2), 9n, new Uint8Array(), ct.slice(2))).toBeNull();
     expect(await open(dec, ct.subarray(0, 2), 9n, new Uint8Array(), ct.slice(2))).toEqual(new Uint8Array([1, 2, 3]));
+  });
+});
+
+describe("Native interop (crates/vc-client/tests/sframe-interop.json)", () => {
+  it("seals the same bytes as the Rust engine and opens its frames", async () => {
+    expect(interop.frames.length).toBe(4);
+    for (const f of interop.frames) {
+      const kid = voiceKid(BigInt(f.epoch), f.leaf), ctr = BigInt(f.ctr);
+      const enc = await deriveKey(kid, hex(f.base_key), "encrypt");
+      expect(toHex(await seal(enc, kid, ctr, new Uint8Array(), hex(f.pt))), f.epoch).toBe(f.frame);
+      const dec = await deriveKey(kid, hex(f.base_key), "decrypt");
+      const frame = hex(f.frame), header = decodeHeader(frame)!;
+      expect(header).toMatchObject({ kid, ctr });
+      expect(toHex((await open(dec, frame.subarray(0, header.length), header.ctr, new Uint8Array(), frame.slice(header.length)))!)).toBe(f.pt);
+    }
   });
 });
 

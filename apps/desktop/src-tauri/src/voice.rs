@@ -15,6 +15,12 @@
 //! - `voice://issue`   `{owner, side, kind, message}` device problems (`input`/`output`)
 //!   with `kind` = `no_device` | `permission_denied` (input only) | `failed`
 //! - `voice://test-level {owner, db}`                 microphone test in settings
+//! - `voice://crypto`  `{owner, run, binding, state, reason}` encrypted-run status
+//!   (`securing` | `failed`); never an installation acknowledgement
+//!
+//! Encrypted runs: `voice_start` with `mode: "encrypted"` binds the run before
+//! negotiation; `voice_set_keys` (main window only, never a remote origin)
+//! returns after the RTC task applied the control.
 
 use std::{
     future::Future,
@@ -33,7 +39,10 @@ use tokio::sync::{oneshot, watch};
 use vc_client::voice::{
     InputMode, LinkState, VoiceHandle,
     io::{AudioIo, AudioPorts, DeviceIo, DeviceIssue, IssueSink},
-    permission, start_teamspeak, start_with,
+    keys::EncryptedStart,
+    permission,
+    sframe::{Binding, ControlReply, Counters, CryptoStatus},
+    start_encrypted, start_teamspeak, start_with,
 };
 use vc_proto::AUDIO_SLOTS;
 
@@ -261,6 +270,14 @@ struct StatePayload {
 }
 
 #[derive(Clone, Serialize)]
+struct CryptoPayload {
+    owner: u64,
+    run: u64,
+    #[serde(flatten)]
+    status: CryptoStatus,
+}
+
+#[derive(Clone, Serialize)]
 struct LevelPayload {
     owner: u64,
     db: f32,
@@ -458,8 +475,32 @@ impl StartBinding {
                     && self.participation.as_deref().and_then(vc_proto::decode_fixed::<16>).is_some()
             }
     }
+
+    /// The SFrame binding of an encrypted Gwar call; direct TeamSpeak has none.
+    fn encrypted(&self, run: u64, direct: bool) -> Option<Binding> {
+        if direct {
+            return None;
+        }
+        Binding::parse(&serde_json::json!({
+            "server_key": self.server_key, "session": self.session, "channel": self.channel, "call": self.call,
+            "participation": self.participation, "run": run, "group": self.group,
+        }))
+    }
 }
 
+/// `resume_after` is a canonical decimal epoch string, or absent on a first run.
+fn resume_floor(value: Option<&str>) -> Result<Option<u64>, String> {
+    value
+        .map(|text| {
+            let canonical = !text.is_empty() && (text == "0" || !text.starts_with('0')) && text.len() <= 20;
+            text.parse::<u64>().ok().filter(|_| canonical && text.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .map(|epoch| epoch.ok_or_else(|| "invalid resume_after".to_owned()))
+        .transpose()
+}
+
+// Tauri passes each IPC field as its own argument.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn voice_start(
     window: WebviewWindow,
@@ -469,15 +510,23 @@ pub async fn voice_start(
     server_host: String,
     mode: String,
     binding: StartBinding,
+    resume_after: Option<String>,
 ) -> Result<(), String> {
     check_main_window(window.label())?;
     let app = window.app_handle().clone();
-    if mode != "plaintext" {
-        return Err("Encrypted voice is being added. Chat is available.".into());
-    }
-    if run == 0 || run > vc_proto::MAX_SAFE_INTEGER as u64 || !binding.valid(app.state::<Ts>().has_voice_connection()) {
+    if run == 0 || run > vc_proto::MAX_SAFE_INTEGER as u64 {
         return Err("invalid voice binding".into());
     }
+    let direct = app.state::<Ts>().has_voice_connection();
+    let crypto = match mode.as_str() {
+        "plaintext" if binding.valid(direct) && resume_after.is_none() => None,
+        // Direct TeamSpeak keeps its local binding and rejects encrypted mode.
+        "encrypted" => Some(EncryptedStart {
+            binding: binding.encrypted(run, direct).ok_or("invalid voice binding")?,
+            resume_after: resume_floor(resume_after.as_deref())?,
+        }),
+        _ => return Err("invalid voice binding".into()),
+    };
     let startup = claim_run(&voice, owner, run)?;
     let (input, output) = {
         let inner = voice.lock();
@@ -490,12 +539,15 @@ pub async fn voice_start(
         .until_retired(async {
             if let Some(link) = link_teamspeak(&voice, owner, run, || app.state::<Ts>().voice_link(run))? {
                 tracing::info!("voice_start run={run} (TeamSpeak)");
+                if crypto.is_some() {
+                    return Err("TeamSpeak voice cannot be encrypted".into());
+                }
                 startup.check()?;
                 start_teamspeak(io, link.audio_in, link.audio_out).await.map_err(|e| format!("{e:#}"))
             } else {
                 start_resolved(&startup, resolve(&server_host), |ip| {
                     tracing::info!("voice_start run={run} host={server_host} ip={ip}");
-                    start_vc(&app, io, ip, owner, run)
+                    start_vc(&app, io, ip, owner, run, crypto)
                 })
                 .await
             }
@@ -509,6 +561,9 @@ pub async fn voice_start(
             return Err("superseded".into()); // `handle` drops here
         }
         inner.prefs.apply(&handle);
+        if let Some(events) = handle.take_crypto_events() {
+            tauri::async_runtime::spawn(forward_crypto(app.clone(), owner, run, events));
+        }
         inner.handle = Some(handle);
     }
     tauri::async_runtime::spawn(monitor(app, owner, run));
@@ -522,9 +577,10 @@ async fn start_vc(
     ip: IpAddr,
     owner: u64,
     run: u64,
+    crypto: Option<EncryptedStart>,
 ) -> Result<VoiceHandle, String> {
     let signal_app = app.clone();
-    start_with(io, ip, move |sdp| async move {
+    let signal = move |sdp: String| async move {
         let (tx, rx) = oneshot::channel();
         {
             let voice = signal_app.state::<Voice>();
@@ -546,9 +602,72 @@ async fn start_vc(
                 Ok(answer)
             }
         }
-    })
-    .await
+    };
+    match crypto {
+        Some(crypto) => start_encrypted(io, ip, signal, crypto).await,
+        None => start_with(io, ip, signal).await,
+    }
     .map_err(|e| format!("{e:#}"))
+}
+
+/// Relays `voice://crypto` for one run until its engine ends.
+async fn forward_crypto(
+    app: AppHandle,
+    owner: u64,
+    run: u64,
+    mut events: tokio::sync::mpsc::UnboundedReceiver<CryptoStatus>,
+) {
+    while let Some(status) = events.recv().await {
+        let failed = status.state == vc_client::voice::sframe::CryptoState::Failed;
+        let _ = app.emit("voice://crypto", CryptoPayload { owner, run, status });
+        if failed {
+            // A failed run is retired at once: transport, pipeline and devices close.
+            let _ = retire_run(&app.state::<Voice>(), owner, run);
+            return;
+        }
+    }
+}
+
+/// The current encrypted run's key channel, without holding the lock across awaits.
+fn run_keys(voice: &Voice, owner: u64, run: u64) -> Result<Option<vc_client::voice::keys::KeyChannel>, String> {
+    let inner = voice.lock();
+    check_owner(&inner, owner)?;
+    if voice.run.load(Ordering::SeqCst) != run {
+        return Ok(None);
+    }
+    Ok(inner.handle.as_ref().and_then(|h| h.keys().cloned()))
+}
+
+/// Applies one key control to the current encrypted run (docs/e2e-build.md
+/// "Installation and activation"). Returns after the RTC task applied it; a
+/// retired or plaintext run answers `ignored`. High-risk: main window only.
+#[tauri::command]
+pub async fn voice_set_keys(
+    window: WebviewWindow,
+    voice: State<'_, Voice>,
+    owner: u64,
+    run: u64,
+    body: serde_json::Value,
+) -> Result<ControlReply, String> {
+    // Wipe the body's exporter keys on every exit, including refusals.
+    let mut body = vc_client::voice::sframe::ScrubOnDrop(body);
+    check_main_window(window.label())?;
+    match run_keys(&voice, owner, run)? {
+        Some(keys) => Ok(keys.control(std::mem::take(&mut body.0)).await),
+        None => Ok(ControlReply::ignored(&body.0)),
+    }
+}
+
+/// Aggregate SFrame counters of the current encrypted run (never keys).
+#[tauri::command]
+pub fn voice_crypto_counters(
+    window: WebviewWindow,
+    voice: State<'_, Voice>,
+    owner: u64,
+    run: u64,
+) -> Result<Option<Counters>, String> {
+    check_main_window(window.label())?;
+    Ok(run_keys(&voice, owner, run)?.map(|keys| keys.counters()))
 }
 
 /// Delivers the server's answer (or a failure) for the offer of `run`.
@@ -1077,6 +1196,63 @@ mod run_tests {
         assert!(closed.load(Ordering::SeqCst));
         assert!(voice.lock().mic_test.is_none());
         drop(ports);
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    fn start_binding(group: Option<&str>) -> StartBinding {
+        let b = |n: usize, v: u8| b64(&vec![v; n]);
+        StartBinding {
+            server_key: Some(b(32, 1)),
+            session: 7,
+            channel: 3,
+            call: Some(b(16, 2)),
+            participation: Some(b(16, 3)),
+            group: group.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn encrypted_runs_need_a_full_binding_and_never_use_direct_teamspeak() {
+        let group = b64(&[4; 32]);
+        let binding = start_binding(Some(&group)).encrypted(9, false).expect("complete binding");
+        assert_eq!((binding.run, binding.session, binding.channel), (9, 7, 3));
+        assert!(start_binding(Some(&group)).encrypted(9, true).is_none(), "direct TeamSpeak");
+        assert!(start_binding(None).encrypted(9, false).is_none(), "no group");
+        assert!(start_binding(Some("short")).encrypted(9, false).is_none(), "bad group");
+        // Plaintext keeps refusing a group.
+        assert!(!start_binding(Some(&group)).valid(false));
+        assert!(start_binding(None).valid(false));
+    }
+
+    #[test]
+    fn resume_floor_accepts_only_canonical_epochs() {
+        assert_eq!(resume_floor(None), Ok(None));
+        assert_eq!(resume_floor(Some("0")), Ok(Some(0)));
+        assert_eq!(resume_floor(Some("18446744073709551615")), Ok(Some(u64::MAX)));
+        for bad in ["", "01", "-1", "1.0", "18446744073709551616", " 1"] {
+            assert!(resume_floor(Some(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn key_controls_reach_only_the_current_runs_engine() {
+        let voice = Voice::default();
+        let owner = bootstrap_owner(&voice);
+        claim_run(&voice, owner, 5).unwrap();
+        // Negotiating, plaintext or retired: no key channel, so a control is ignored.
+        assert!(run_keys(&voice, owner, 5).unwrap().is_none());
+        assert!(run_keys(&voice, owner, 4).unwrap().is_none());
+        assert!(run_keys(&voice, owner + 1, 5).is_err(), "superseded owner");
+        let body = serde_json::json!({ "serial": "3", "epoch": "2" });
+        let reply = ControlReply::ignored(&body);
+        assert_eq!(
+            serde_json::to_value(reply).unwrap(),
+            serde_json::json!({ "serial": "3", "epoch": "2", "result": "ignored" })
+        );
     }
 
     #[test]

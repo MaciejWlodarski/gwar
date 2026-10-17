@@ -32,13 +32,22 @@ mod debug {
     }
 }
 
+/// The sframe crate traces per-key counters and headers; key material and
+/// nonce counters are never logged (docs/e2e-build.md), whatever RUST_LOG says.
+fn loggable_target(target: &str) -> bool {
+    target != "sframe" && !target.starts_with("sframe::")
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    use tracing_subscriber::EnvFilter;
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("warn,vc_desktop_lib=info,vc_client=info,ui=info")),
+    use tracing_subscriber::{EnvFilter, filter::filter_fn, prelude::*};
+    let env = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("warn,vc_desktop_lib=info,vc_client=info,ui=info"));
+    let _ = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_filter(env)
+                .with_filter(filter_fn(|meta| loggable_target(meta.target()))),
         )
         .try_init();
 
@@ -73,6 +82,8 @@ pub fn run() {
             voice::voice_start,
             voice::voice_answer,
             voice::voice_stop,
+            voice::voice_set_keys,
+            voice::voice_crypto_counters,
             voice::voice_set_muted,
             voice::voice_set_deafened,
             voice::voice_set_ptt,
@@ -116,4 +127,17 @@ pub fn run() {
             app.state::<ts::Ts>().shutdown();
         }
     });
+}
+
+#[cfg(test)]
+mod log_tests {
+    #[test]
+    fn sframe_records_are_never_logged() {
+        for target in ["sframe", "sframe::frame::encrypted_frame", "sframe::header"] {
+            assert!(!super::loggable_target(target), "{target}");
+        }
+        for target in ["vc_client::voice::sframe", "vc_desktop_lib", "sframes", "ui"] {
+            assert!(super::loggable_target(target), "{target}");
+        }
+    }
 }

@@ -7,10 +7,12 @@
 
 pub mod io;
 pub mod jitter;
+pub mod keys;
 pub mod permission;
 mod playout;
 mod priority;
 mod rtc;
+pub mod sframe;
 
 use std::{
     net::{IpAddr, SocketAddr},
@@ -193,11 +195,22 @@ pub struct VoiceStats {
 pub struct VoiceHandle {
     controls: Arc<Controls>,
     counters: Arc<Counters>,
+    keys: Option<keys::KeyChannel>,
+    gate: Option<keys::RunGate>,
+    crypto_events: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<sframe::CryptoStatus>>>,
     _ports_guard: Box<dyn Send>,
     output: Arc<OutputTiming>,
 }
 
 impl VoiceHandle {
+    /// The key channel of an encrypted run; `None` in plaintext and TeamSpeak.
+    pub fn keys(&self) -> Option<&keys::KeyChannel> {
+        self.keys.as_ref()
+    }
+    /// `voice://crypto` statuses of an encrypted run; taken once.
+    pub fn take_crypto_events(&self) -> Option<tokio::sync::mpsc::UnboundedReceiver<sframe::CryptoStatus>> {
+        self.crypto_events.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
     pub fn set_muted(&self, muted: bool) {
         self.controls.muted.store(muted, Ordering::Relaxed);
     }
@@ -276,6 +289,10 @@ impl VoiceHandle {
 
 impl Drop for VoiceHandle {
     fn drop(&mut self) {
+        // Retire the RTC run first: after this no control applies and no packet is sent or played.
+        if let Some(gate) = &self.gate {
+            gate.close();
+        }
         self.controls.stop.store(true, Ordering::Relaxed);
         self.output.wake();
     }
@@ -345,12 +362,50 @@ where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = Result<String>>,
 {
+    start_session(io, server, signal, None).await
+}
+
+/// Like [`start_with`], for an encrypted call: every microphone packet is
+/// SFrame-encrypted right before its RTP write and every received payload must
+/// authenticate before playout. The run starts closed; keys arrive through
+/// [`VoiceHandle::keys`] from the MLS controller.
+pub async fn start_encrypted<F, Fut>(
+    io: Box<dyn AudioIo>,
+    server: IpAddr,
+    signal: F,
+    crypto: keys::EncryptedStart,
+) -> Result<VoiceHandle>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    start_session(io, server, signal, Some(crypto)).await
+}
+
+async fn start_session<F, Fut>(
+    io: Box<dyn AudioIo>,
+    server: IpAddr,
+    signal: F,
+    crypto: Option<keys::EncryptedStart>,
+) -> Result<VoiceHandle>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
     let local_ip = route_ip(server).context("no route to server")?;
     let ports = tokio::task::spawn_blocking(move || io.open()).await??;
     let (out_tx, out_rx) = mpsc::channel::<Outgoing>(64);
     let (in_tx, in_rx) = std::sync::mpsc::sync_channel::<Incoming>(512);
     let counters = Arc::new(Counters::default());
-    rtc::start(signal, local_ip, out_rx, in_tx, counters.clone(), ports.output.clone()).await?;
+    let gate = keys::RunGate::new();
+    let (crypto, keys, crypto_events) = match crypto {
+        Some(start) => {
+            let (crypto, keys, events) = keys::channel(start, FRAME as u32, gate.clone());
+            (Some(crypto), Some(keys), Some(events))
+        }
+        None => (None, None, None),
+    };
+    rtc::start(signal, local_ip, out_rx, in_tx, counters.clone(), ports.output.clone(), crypto, gate.clone()).await?;
     let controls = Arc::new(Controls::default());
     let AudioPorts { mic, speaker, output, _guard } = ports;
     let timing = output.clone();
@@ -361,7 +416,15 @@ where
             tracing::warn!("voice pipeline stopped: {e:#}");
         }
     })?;
-    Ok(VoiceHandle { controls, counters, output, _ports_guard: _guard })
+    Ok(VoiceHandle {
+        controls,
+        counters,
+        output,
+        keys,
+        gate: Some(gate),
+        crypto_events: std::sync::Mutex::new(crypto_events),
+        _ports_guard: _guard,
+    })
 }
 
 /// Voice on a TeamSpeak server (see [`crate::teamspeak`]): frames travel
@@ -427,7 +490,15 @@ pub async fn start_teamspeak(
             tracing::warn!("voice pipeline stopped: {e:#}");
         }
     })?;
-    Ok(VoiceHandle { controls, counters, output, _ports_guard: _guard })
+    Ok(VoiceHandle {
+        controls,
+        counters,
+        output,
+        keys: None,
+        gate: None,
+        crypto_events: std::sync::Mutex::new(None),
+        _ports_guard: _guard,
+    })
 }
 
 /// The local address the OS uses to reach `server` (no packets are sent).
@@ -915,5 +986,27 @@ mod codec_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod handle_tests {
+    use super::*;
+
+    #[test]
+    fn dropping_the_handle_closes_the_run_gate_before_returning() {
+        let gate = keys::RunGate::new();
+        let handle = VoiceHandle {
+            controls: Arc::new(Controls::default()),
+            counters: Arc::new(Counters::default()),
+            output: Arc::new(OutputTiming::default()),
+            keys: None,
+            gate: Some(gate.clone()),
+            crypto_events: std::sync::Mutex::new(None),
+            _ports_guard: Box::new(()),
+        };
+        assert!(gate.enter().is_some());
+        drop(handle);
+        assert!(gate.enter().is_none(), "no control, packet write or playout after retirement");
     }
 }

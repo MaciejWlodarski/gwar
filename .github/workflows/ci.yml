@@ -31,6 +31,8 @@ jobs:
         run: cargo test -p vc-server --features test-hooks --lib teamspeak
       - name: Queued encrypted voice
         run: cargo test -p vc-server --features test-hooks --test mls voice_opaque_srtp
+      - name: Eight native SFrame senders, alone (nine real-time engines)
+        run: cargo test -p vc-server --test mls native_sframe_receiver_decodes_eight_senders_on_all_slots -- --ignored
       - name: Server without TeamSpeak support
         run: cargo build -p vc-server --no-default-features
       # Runs the official TeamSpeak server (downloaded and checksum-verified),
@@ -150,6 +152,15 @@ jobs:
           pnpm --filter web exec playwright install --with-deps chromium
           pnpm --filter web e2e:mls
           pnpm --filter web e2e:dm
+      - name: Desktop engine encrypted voice (native engine driven by the web MLS controller)
+        run: |
+          sudo apt-get update && sudo apt-get install -y libasound2-dev libopus-dev pulseaudio
+          # Headless Chromium needs an audio output for the browser device's WebAudio tap.
+          pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=e2e
+          pactl set-default-sink e2e
+          cargo build -p vc-client --example native_bridge
+          pnpm --filter web e2e:native-voice
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: mls-wasm

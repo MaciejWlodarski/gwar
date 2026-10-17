@@ -263,7 +263,6 @@ export const pl: Record<Key, string> = {
   "voice.notIn": "Poza kanałem głosowym",
   "voice.notInHint": "Kliknij kanał dwukrotnie, aby rozmawiać",
   "voice.pttHint": "Naciśnij i mów: przytrzymaj {key}",
-  "voice.encryptedPending": "Szyfrowane rozmowy głosowe są w przygotowaniu. Czat jest dostępny.",
   "voice.encryptedUnsupported": "Zaktualizuj przeglądarkę albo użyj aplikacji na komputer, żeby dołączyć do szyfrowanej rozmowy.",
   "voice.securing": "Zabezpieczanie głosu…",
   "voice.closed": "Połączenie głosowe zostało zamknięte. Łączenie ponownie…",

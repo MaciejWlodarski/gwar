@@ -11,6 +11,7 @@ import {
   type VoiceEvents,
   type VoiceState,
 } from "./engine";
+import type { ControlResult, CryptoStatus } from "./sframe/state";
 
 type Handler = (value: never) => void;
 
@@ -43,13 +44,13 @@ type StartParams = Parameters<VoiceEngine["start"]>[0];
  * and return the answer with `voice_answer`.
  */
 export class NativeVoiceEngine implements VoiceEngine {
-  // Native SFrame arrives in 5d; until then encrypted channels show the calm unavailable state.
-  readonly capabilities: VoiceEngine["capabilities"] = { outputDeviceSelection: true, captureProcessing: false, encryptedVoice: async () => false };
+  // SFrame runs in Rust (`vc_client::voice::sframe`); keys arrive through `voice_set_keys`.
+  readonly capabilities: VoiceEngine["capabilities"] = { outputDeviceSelection: true, captureProcessing: false, encryptedVoice: async () => true };
 
   private handlers = new Map<string, Set<Handler>>();
   // Bootstrap once per engine: a fresh view retires native audio left by the
   // previous view. Never acquire another token after this owner is superseded.
-  private readonly ready = tauri().then(async (api) => ({ api, owner: await api.invoke<number>("voice_bootstrap") }));
+  private readonly ready: Promise<{ api: TauriBridge; owner: number }>;
   private listening: Promise<void> | null = null;
   private unlisten: Unlisten[] = [];
   private queue: Promise<void> = Promise.resolve();
@@ -70,7 +71,9 @@ export class NativeVoiceEngine implements VoiceEngine {
   private slotOwners: Array<string | null> = Array.from({ length: AUDIO_SLOTS }, () => null);
   private sentGain: Array<number | null> = Array.from({ length: AUDIO_SLOTS }, () => null);
 
-  constructor() {
+  /** `bridge` is the desktop shell; the e2e suite substitutes a native fixture process. */
+  constructor(bridge: () => Promise<TauriBridge> = tauri) {
+    this.ready = bridge().then(async (api) => ({ api, owner: await api.invoke<number>("voice_bootstrap") }));
     void this.ready.catch((e: unknown) => console.warn("[native voice] bootstrap failed:", e));
   }
 
@@ -126,6 +129,15 @@ export class NativeVoiceEngine implements VoiceEngine {
           if (p.owner !== owner || this.state === "idle") return;
           this.emit("level", this.shape(dbToLevel(p.db)));
         }),
+        await api.listen<{ owner: number; run: number } & CryptoStatus>("voice://crypto", (p) => {
+          if (p.owner !== owner || p.run !== this.runId) return;
+          // A status is never an installation acknowledgement.
+          this.params?.keys?.engineStatus({ binding: p.binding, state: p.state, reason: p.reason });
+          if (p.state === "failed") {
+            this.clearConnectTimer();
+            this.setState("failed");
+          }
+        }),
         await api.listen<IssuePayload>("voice://issue", (p) => {
           if (p.owner !== owner) return;
           if (p.side === "input") {
@@ -165,7 +177,9 @@ export class NativeVoiceEngine implements VoiceEngine {
   // ------------------------------------------------------------- lifecycle
 
   async start(params: StartParams): Promise<void> {
-    if (params.mode !== "plaintext") throw new VoiceError("unsupported", "Encrypted voice is being added. Chat is available.");
+    const encrypted = params.mode === "encrypted";
+    const { server_key, call, participation, group } = params.binding;
+    if (encrypted && (!params.keys || !server_key || !call || !participation || !group)) throw new VoiceError("unsupported", "encrypted voice needs its call binding and keys");
     const run = (this.runId = nextMediaRun());
     this.params = params;
     this.clearConnectTimer();
@@ -176,13 +190,24 @@ export class NativeVoiceEngine implements VoiceEngine {
     if (run !== this.runId) return;
     this.sentGain.fill(null);
     try {
-      await this.invoke("voice_start", { run, serverHost: params.serverHost ?? "", mode: params.mode, binding: params.binding });
+      // The engine is bound to this run before negotiation and starts closed.
+      const resumeAfter = encrypted ? params.keys!.resumeAfter() : null;
+      await this.invoke("voice_start", { run, serverHost: params.serverHost ?? "", mode: params.mode, binding: params.binding, resumeAfter });
     } catch (e) {
       if (run !== this.runId) return;
       this.setState("failed");
       throw new VoiceError("negotiation", typeof e === "string" ? e : e instanceof Error ? e.message : String(e));
     }
     if (run !== this.runId) return;
+    // Controls only after the server bound this run: acks name it. Replies
+    // arrive after the native RTC task applied each control.
+    if (encrypted) {
+      params.keys!.attach({
+        run,
+        control: body => this.invoke<ControlResult>("voice_set_keys", { run, body }),
+        close: () => { if (this.runId === run) void this.stop(); },
+      });
+    }
     this.applyAllSlotGains();
     this.startDevicePoll();
     // `voice://state connected` may already have arrived while we awaited.
@@ -205,6 +230,11 @@ export class NativeVoiceEngine implements VoiceEngine {
     this.emit("level", 0);
     this.setState("idle");
     await this.send("voice_stop", { run: stoppedRun });
+  }
+
+  async cryptoCounters(): Promise<Record<string, number> | null> {
+    if (this.params?.mode !== "encrypted") return null;
+    return this.invoke<Record<string, number> | null>("voice_crypto_counters", { run: this.runId });
   }
 
   /** Re-opens the audio devices (and renegotiates), e.g. after plugging in a microphone. */
