@@ -2507,3 +2507,163 @@ async fn voice_opaque_srtp_and_unknown_ssrc_churn_preserve_the_admitted_stream()
         assert_eq!(receiver.receive().await.payload, [0xff, 72]);
     }
 }
+
+/// Fake 10 ms audio devices: A plays a 440 Hz tone into its microphone, B's
+/// speaker output is recorded for the test.
+struct ToneIo {
+    heard: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
+    tone: bool,
+}
+
+impl vc_client::voice::io::AudioIo for ToneIo {
+    fn open(self: Box<Self>) -> anyhow::Result<vc_client::voice::io::AudioPorts> {
+        use vc_client::voice::io::{AudioPorts, CaptureSample, OutputTiming};
+        let (mut mic_tx, mic) = rtrb::RingBuffer::new(48_000);
+        let (speaker, mut speaker_rx) = rtrb::RingBuffer::new(24_000);
+        let output = std::sync::Arc::new(OutputTiming::default());
+        let timing = output.clone();
+        let (heard, tone) = (self.heard, self.tone);
+        std::thread::spawn(move || {
+            let mut t = 0u64;
+            loop {
+                for _ in 0..480 {
+                    let s = if tone { (t as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.3 } else { 0.0 };
+                    t += 1;
+                    let sample = CaptureSample { captured_at: std::time::Instant::now(), position: t - 1, value: s };
+                    if mic_tx.push(sample).is_err() {
+                        return;
+                    }
+                }
+                let missing = 480usize.saturating_sub(speaker_rx.slots());
+                let mut out = heard.lock().unwrap();
+                out.extend((0..480).map(|_| speaker_rx.pop().unwrap_or(0.0)));
+                drop(out);
+                timing.report(480, missing);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
+        Ok(AudioPorts { mic, speaker, output, _guard: Box::new(()) })
+    }
+}
+
+/// Starts a native encrypted engine; the offer travels over `client`'s socket.
+async fn native_encrypted(
+    client: &mut Client,
+    io: ToneIo,
+    run: u64,
+    resume_after: Option<u64>,
+) -> (vc_client::voice::VoiceHandle, Value) {
+    let state = client.ok("voice.state", json!({})).await["voice"].clone();
+    let json = json!({
+        "server_key": client.server_key, "session": client.welcome.session, "channel": state["channel"],
+        "call": state["call"], "participation": state["participation"], "run": run, "group": state["group"],
+    });
+    let binding = vc_client::voice::sframe::Binding::parse(&json).expect("binding");
+    let (offers, mut offered) = tokio::sync::mpsc::channel::<(String, tokio::sync::oneshot::Sender<String>)>(1);
+    let signal = move |sdp: String| async move {
+        let (answer, answered) = tokio::sync::oneshot::channel();
+        offers.send((sdp, answer)).await?;
+        Ok(answered.await?)
+    };
+    let start = vc_client::voice::start_encrypted(
+        Box::new(io),
+        "127.0.0.1".parse().unwrap(),
+        signal,
+        vc_client::voice::keys::EncryptedStart { binding, resume_after },
+    );
+    let exchange = async {
+        let (sdp, answer) = offered.recv().await.unwrap();
+        let ssrc: u32 =
+            sdp.lines().find_map(|line| line.strip_prefix("a=ssrc:")?.split_whitespace().next()?.parse().ok()).unwrap();
+        let reply = client
+            .ok(
+                "voice.offer",
+                json!({"channel":state["channel"],"call":state["call"],"participation":state["participation"],
+                    "run":run,"group":state["group"],"ssrc":ssrc,"sdp":sdp}),
+            )
+            .await;
+        answer.send(reply["sdp"].as_str().unwrap().to_owned()).unwrap();
+    };
+    let (handle, ()) = tokio::join!(start, exchange);
+    (handle.expect("native encrypted start"), json)
+}
+
+/// The exporter values of every voice leaf, as each member computes them.
+fn voice_members(device: &Device) -> Value {
+    let group = device.group.as_ref().unwrap();
+    group
+        .members()
+        .map(|m| {
+            let leaf = m.index.u32();
+            let key = group.export_secret(device.provider.crypto(), "gwar voice v1", &leaf.to_be_bytes(), 32).unwrap();
+            let credential = Credential::parse(m.credential.serialized_content()).unwrap();
+            json!({ "leaf": leaf, "device": credential.device_key(), "key": b64(&key) })
+        })
+        .collect()
+}
+
+async fn install_and_activate(handle: &vc_client::voice::VoiceHandle, binding: &Value, device: &Device) {
+    let keys = handle.keys().expect("encrypted run");
+    let group = device.group.as_ref().unwrap();
+    let epoch = group.epoch().as_u64().to_string();
+    let own = group.own_leaf_index().u32();
+    for (serial, body) in [
+        json!({ "action": "supersede" }),
+        json!({ "action": "install", "own_leaf": own, "members": voice_members(device), "removed": [] }),
+        json!({ "action": "activate", "send_until": null }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut body = body;
+        body["binding"] = binding.clone();
+        body["serial"] = json!((serial + 1).to_string());
+        body["epoch"] = json!(epoch);
+        let reply = keys.control(body).await;
+        assert_eq!(reply.result, Some(vc_client::voice::sframe::Outcome::Applied), "{reply:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_sframe_tone_travels_between_engines_through_the_sfu() {
+    let server = TestServer::start().await;
+    let mut first = Device::new(1, 11);
+    let mut second = Device::new(2, 21);
+    let mut a = connect_device(&server, &first).await;
+    let mut b = connect_device(&server, &second).await;
+    a.ok("token.redeem", json!({"token":server.admin_token})).await;
+    let channel = channel_id(&a.create_channel(json!({"name":"native","encrypted":true})).await);
+    let parent = create_channel_group(&mut a, &mut first, channel, true, 93).await.unwrap();
+    join_channel(&server, &mut b, &mut second, &parent).await;
+    let a_state = participation(&mut a, channel).await;
+    let b_state = participation(&mut b, channel).await;
+    first = Device::new(1, 11);
+    second = Device::new(2, 21);
+    let d = voice_descriptor(&first, channel, &parent, &a.server_key, 94);
+    first.create(&d, &a.server_key);
+    let group=a.ok("mls.group.create",json!({"conversation":d.descriptor.conversation,"group_info":b64(&first.group_info()),"voice":voice_binding(&a_state)})).await["group"].as_str().unwrap().to_owned();
+    let joined = join_voice(&server, &mut b, &mut second, &group, &b_state).await;
+    first.process(&joined.0);
+    assert_eq!(first.group.as_ref().unwrap().epoch(), second.group.as_ref().unwrap().epoch());
+
+    let silent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let heard = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (va, a_binding) = native_encrypted(&mut a, ToneIo { heard: silent, tone: true }, 1, None).await;
+    let (vb, b_binding) = native_encrypted(&mut b, ToneIo { heard: heard.clone(), tone: false }, 1, None).await;
+    // Both engines start closed: nothing is sent or played before keys.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(va.keys().unwrap().counters().encrypted, 0);
+    assert_eq!(vb.keys().unwrap().counters().decrypted, 0);
+    install_and_activate(&va, &a_binding, &first).await;
+    install_and_activate(&vb, &b_binding, &second).await;
+
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let (sent, got) = (va.keys().unwrap().counters(), vb.keys().unwrap().counters());
+    assert!(sent.encrypted > 100, "{sent:?}");
+    assert!(got.decrypted > 100, "{got:?}");
+    assert_eq!((got.auth_failed, got.replay_dropped, got.unexpected_duration), (0, 0, 0), "{got:?}");
+    let samples = heard.lock().unwrap().clone();
+    let tail = &samples[samples.len().saturating_sub(48_000)..];
+    let level = (tail.iter().map(|s| s * s).sum::<f32>() / tail.len().max(1) as f32).sqrt();
+    assert!(level > 0.05, "B heard rms {level} over the last second");
+}

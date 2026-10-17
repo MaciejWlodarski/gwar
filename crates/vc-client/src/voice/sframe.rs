@@ -268,8 +268,12 @@ impl ControlReply {
     }
     /// Echoes the body's serial/epoch strings, "0" when absent.
     pub fn bad(body: &Value, error: ControlError) -> Self {
+        Self { result: None, error: Some(error), ..Self::ignored(body) }
+    }
+    /// For a run that already ended.
+    pub fn ignored(body: &Value) -> Self {
         let tag = |k: &str| body.get(k).and_then(Value::as_str).unwrap_or("0").to_owned();
-        Self { serial: tag("serial"), epoch: tag("epoch"), result: None, error: Some(error) }
+        Self { serial: tag("serial"), epoch: tag("epoch"), result: Some(Outcome::Ignored), error: None }
     }
 }
 
@@ -484,6 +488,12 @@ impl SframeState {
         let reply = self.apply(&c, now, wall_ms);
         self.last = (self.ended.is_none()).then(|| (c.body, reply.clone()));
         reply
+    }
+
+    /// The engine's control queue overflowed: the run fails without applying `body`.
+    pub fn overflow(&mut self, body: &Value) -> ControlReply {
+        self.stop_with(StatusReason::KeyQueueFull);
+        ControlReply::bad(body, ControlError::KeyQueueFull)
     }
 
     fn fail(&mut self, reason: StatusReason, c: &Control) -> ControlReply {

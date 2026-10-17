@@ -18,7 +18,7 @@ use vc_proto::{
     rtp::{SLOT_GENERATION_ID, SlotGeneration, slot_generation_extension},
 };
 
-use super::{Counters, Incoming, LinkState, Outgoing, io::OutputTiming, jitter::Clock};
+use super::{Counters, Incoming, LinkState, Outgoing, io::OutputTiming, jitter::Clock, keys::Crypto};
 use std::sync::Arc;
 
 /// Marks the link lost however the transport task ends.
@@ -36,6 +36,7 @@ pub(crate) async fn start<F, Fut>(
     incoming: std::sync::mpsc::SyncSender<Incoming>,
     counters: Arc<Counters>,
     wake: Arc<OutputTiming>,
+    crypto: Option<Crypto>,
 ) -> Result<()>
 where
     F: FnOnce(String) -> Fut,
@@ -81,8 +82,23 @@ where
         .map(|p| p.pt())
         .context("native voice answer lacks Opus on the microphone")?;
 
+    // Crypto is attached before either loop runs: no frame passes unencrypted.
+    let (mut crypto, mut commands) = match crypto {
+        Some(Crypto { run, commands }) => (Some(run), Some(commands)),
+        None => (None, None),
+    };
     tokio::spawn(async move {
         let _lost = LostOnDrop(counters.clone());
+        // Stops the keys however the task ends.
+        struct StopKeys<'a>(&'a mut Option<super::keys::RunCrypto>);
+        impl Drop for StopKeys<'_> {
+            fn drop(&mut self) {
+                if let Some(crypto) = self.0.as_mut() {
+                    crypto.stop();
+                }
+            }
+        }
+        let crypto = StopKeys(&mut crypto);
         let mut buf = vec![0u8; 2048];
         let mut last_ticks = None;
         let offset = rand::random::<u32>();
@@ -105,13 +121,22 @@ where
                                 .get::<SlotGeneration>()
                                 .copied()
                                 .map(super::Generation::Rtp);
+                            // Only an authenticated packet can reach playout or reset a slot.
+                            let opus = match crypto.0.as_mut() {
+                                Some(keys) => match keys.decrypt(&packet.payload) {
+                                    (Some(opus), _) => opus,
+                                    (None, true) => continue,
+                                    (None, false) => return,
+                                },
+                                None => packet.payload.to_vec(),
+                            };
                             let item = Incoming {
                                 slot,
                                 arrived: Instant::now(),
                                 clock: Clock::Rtp,
                                 rtp_time,
                                 generation,
-                                opus: packet.payload.to_vec(),
+                                opus,
                             };
                             counters.frame_received();
                             let _ = incoming.try_send(item);
@@ -142,7 +167,17 @@ where
             if !rtc.is_alive() {
                 return;
             }
+            let deadline = match crypto.0.as_mut() {
+                Some(keys) => deadline.min(keys.tick(Instant::now())),
+                None => deadline,
+            };
             tokio::select! {
+                command = async { match commands.as_mut() { Some(c) => c.recv().await, None => std::future::pending().await } } => {
+                    match (command, crypto.0.as_mut()) {
+                        (Some(command), Some(keys)) => if !keys.command(command) { return },
+                        _ => return,
+                    }
+                }
                 frame = outgoing.recv() => {
                     let Some(frame) = frame else { return };
                     // str0m buffers writes before SRTP is ready. Replaying that
@@ -158,9 +193,21 @@ where
                         continue;
                     };
                     last_ticks = Some(ticks);
+                    if rtc.direct_api().stream_tx_by_mid(mic, None).is_none() {
+                        continue;
+                    }
+                    // The send gate and counter reservation sit right before the RTP write.
+                    let payload = match crypto.0.as_mut() {
+                        Some(keys) => match keys.encrypt(&frame.opus) {
+                            (Some(sealed), _) => sealed,
+                            (None, true) => continue,
+                            (None, false) => return,
+                        },
+                        None => frame.opus,
+                    };
+                    let ext_vals = ExtensionValues { audio_level: Some(frame.level), voice_activity: Some(frame.speech), ..Default::default() };
+                    let write = RtpWrite::new(pt, sequence.into(), (ticks as u32).wrapping_add(offset), Instant::now(), payload);
                     if let Some(stream) = rtc.direct_api().stream_tx_by_mid(mic, None) {
-                        let ext_vals = ExtensionValues { audio_level: Some(frame.level), voice_activity: Some(frame.speech), ..Default::default() };
-                        let write = RtpWrite::new(pt, sequence.into(), (ticks as u32).wrapping_add(offset), Instant::now(), frame.opus);
                         stream.write_rtp(write.ext_vals(ext_vals));
                         sequence += 1;
                     }
@@ -242,6 +289,7 @@ mod tests {
             incoming,
             counters.clone(),
             Arc::new(OutputTiming::default()),
+            None,
         )
         .await
         .unwrap();
@@ -425,6 +473,7 @@ mod tests {
                 incoming,
                 Arc::new(Counters::default()),
                 Arc::new(OutputTiming::default()),
+                None,
             )
             .await;
             if omitted.is_some_and(|i| i > 0) {
@@ -477,6 +526,7 @@ mod tests {
                     incoming,
                     Arc::new(Counters::default()),
                     Arc::new(OutputTiming::default()),
+                    None,
                 )
                 .await;
                 if changed > 0 && matches!(direction, Some("inactive" | "recvonly")) {

@@ -8022,6 +8022,7 @@ dependencies = [
  "rand 0.9.5",
  "rcgen 0.13.2",
  "reqwest",
+ "rtrb",
  "rusqlite",
  "rustls-acme",
  "serde",
