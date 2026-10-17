@@ -152,7 +152,11 @@ jobs:
           pnpm --filter web e2e:dm
       - name: Desktop engine encrypted voice (native engine driven by the web MLS controller)
         run: |
-          sudo apt-get update && sudo apt-get install -y libasound2-dev libopus-dev
+          sudo apt-get update && sudo apt-get install -y libasound2-dev libopus-dev pulseaudio
+          # Headless Chromium needs an audio output for the browser device's WebAudio tap.
+          pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=e2e
+          pactl set-default-sink e2e
           cargo build -p vc-client --example native_bridge
           pnpm --filter web e2e:native-voice
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

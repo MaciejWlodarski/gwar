@@ -21,6 +21,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 [profile.release]
 lto = "thin"
 
+# Debug tests run real-time Opus (several engines at once in the voice tests):
+# build the C codec optimized even in the dev profile.
+[profile.dev.package.audiopus_sys]
+opt-level = 3
+
 [profile.wasm-release]
 inherits = "release"
 opt-level = "z"
