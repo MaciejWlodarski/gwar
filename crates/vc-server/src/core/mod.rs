@@ -1716,53 +1716,76 @@ impl Core {
     }
 
     fn channel_create(&mut self, session: SessionId, id: u32, c: ChannelCreate) -> Option<Reply> {
-        let checked = (|| {
-            self.require(session, Permission::ChannelCreate)?;
-            let name = clean(&c.name, MAX_CHANNEL_NAME, "channel name")?;
-            let topic = c.topic.as_deref().map(str::trim).unwrap_or("").to_owned();
-            if topic.chars().count() > MAX_TOPIC {
-                return Err(err(ErrorCode::BadRequest, "topic too long"));
-            }
-            if c.parent.is_some_and(|p| !self.channels.contains_key(&p)) {
-                return Err(err(ErrorCode::NotFound, "no such parent channel"));
-            }
-            if self.sibling_name_taken(Some(&self.sessions[&session]), c.parent, &name, None) {
-                return Err(err(ErrorCode::Conflict, "a channel with this name already exists here"));
-            }
-            Self::validate_max_clients(c.max_clients)?;
-            let password = c.password.filter(|p| !p.is_empty());
-            if let Some(p) = &password {
-                check_password_len(p)?;
-            }
-            // Encryption is chosen at creation; without a choice a channel is plaintext.
-            let encrypted = c.encrypted.unwrap_or(false);
-            if encrypted && password.is_some() {
-                return Err(err(ErrorCode::BadRequest, "an encrypted channel has no password"));
-            }
-            if c.parent.is_some_and(|p| self.channels.get(&p).is_some_and(|p| p.private)) {
-                return Err(err(ErrorCode::BadRequest, "a private channel has no child channels"));
-            }
-            let access = if c.private {
-                if encrypted {
-                    return Err(err(ErrorCode::BadRequest, "encrypted private channels are not available yet"));
-                }
-                if password.is_some() {
-                    return Err(err(ErrorCode::BadRequest, "a private channel has no password"));
-                }
-                let uid = self.sessions[&session].uid.clone();
-                let access = c.access.clone().unwrap_or(ChannelAccess { roles: vec![], users: vec![uid] });
-                self.may_list_roles(session, &access.roles, &[])?;
-                Some(self.checked_access(access)?)
-            } else if c.access.is_some() {
-                return Err(err(ErrorCode::BadRequest, "only a private channel has access"));
-            } else {
-                None
-            };
-            Ok((name, topic, password, encrypted, access))
-        })();
-        let (name, topic, password, encrypted, access) = match checked {
+        let (_, password) = match self.checked_channel_create(session, &c) {
             Ok(v) => v,
             Err(e) => return Some(Err(e)),
+        };
+        let teamspeak = self.is_teamspeak(session);
+        let plaintext = self.bridge.is_some().then(|| password.clone()).flatten();
+        self.defer(
+            move || password.map(|p| passwords::hash_secret(&p, teamspeak)),
+            move |core, hash| {
+                if !core.sessions.contains_key(&session) {
+                    return;
+                }
+                // Permissions, roles or the tree may have changed while the password was hashed:
+                // the channel is checked again against the current state.
+                let result = core.checked_channel_create(session, &c).and_then(|(row, _)| {
+                    core.insert_channel(session, ChannelRow { password_hash: hash, ..row }, plaintext)
+                });
+                core.reply(session, id, result);
+            },
+        )
+    }
+
+    /// The channel `c` would create (without its password hash), and its password, if `session`
+    /// may create it now.
+    fn checked_channel_create(
+        &self,
+        session: SessionId,
+        c: &ChannelCreate,
+    ) -> Result<(ChannelRow, Option<String>), ErrorBody> {
+        self.require(session, Permission::ChannelCreate)?;
+        let name = clean(&c.name, MAX_CHANNEL_NAME, "channel name")?;
+        let topic = c.topic.as_deref().map(str::trim).unwrap_or("").to_owned();
+        if topic.chars().count() > MAX_TOPIC {
+            return Err(err(ErrorCode::BadRequest, "topic too long"));
+        }
+        let viewer = Some(&self.sessions[&session]);
+        if c.parent.is_some_and(|p| !self.channels.contains_key(&p) || !self.admitted(viewer, p)) {
+            return Err(err(ErrorCode::NotFound, "no such parent channel"));
+        }
+        if self.sibling_name_taken(Some(&self.sessions[&session]), c.parent, &name, None) {
+            return Err(err(ErrorCode::Conflict, "a channel with this name already exists here"));
+        }
+        Self::validate_max_clients(c.max_clients)?;
+        let password = c.password.clone().filter(|p| !p.is_empty());
+        if let Some(p) = &password {
+            check_password_len(p)?;
+        }
+        // Encryption is chosen at creation; without a choice a channel is plaintext.
+        let encrypted = c.encrypted.unwrap_or(false);
+        if encrypted && password.is_some() {
+            return Err(err(ErrorCode::BadRequest, "an encrypted channel has no password"));
+        }
+        if c.parent.is_some_and(|p| self.channels.get(&p).is_some_and(|p| p.private)) {
+            return Err(err(ErrorCode::BadRequest, "a private channel has no child channels"));
+        }
+        let access = if c.private {
+            if encrypted {
+                return Err(err(ErrorCode::BadRequest, "encrypted private channels are not available yet"));
+            }
+            if password.is_some() {
+                return Err(err(ErrorCode::BadRequest, "a private channel has no password"));
+            }
+            let uid = self.sessions[&session].uid.clone();
+            let access = c.access.clone().unwrap_or(ChannelAccess { roles: vec![], users: vec![uid] });
+            self.may_list_roles(session, &access.roles, &[])?;
+            Some(self.checked_access(access)?)
+        } else if c.access.is_some() {
+            return Err(err(ErrorCode::BadRequest, "only a private channel has access"));
+        } else {
+            None
         };
         let row = ChannelRow {
             id: 0,
@@ -1777,18 +1800,7 @@ impl Core {
             private: c.private,
             access,
         };
-        let teamspeak = self.is_teamspeak(session);
-        let plaintext = self.bridge.is_some().then(|| password.clone()).flatten();
-        self.defer(
-            move || password.map(|p| passwords::hash_secret(&p, teamspeak)),
-            move |core, hash| {
-                if !core.sessions.contains_key(&session) {
-                    return;
-                }
-                let result = core.insert_channel(session, ChannelRow { password_hash: hash, ..row }, plaintext);
-                core.reply(session, id, result);
-            },
-        )
+        Ok((row, password))
     }
 
     fn insert_channel(&mut self, session: SessionId, mut row: ChannelRow, plaintext: Option<String>) -> Reply {
@@ -1803,11 +1815,12 @@ impl Core {
         if self.sibling_name_taken(self.sessions.get(&session), parent, &row.name, None) {
             return Err(err(ErrorCode::Conflict, "a channel with this name already exists here"));
         }
-        // A public channel's place counts only the siblings everyone sees, so hidden ones leave no trace.
+        // A new channel's place counts only the siblings everyone sees, so hidden ones leave no trace
+        // (ties are ordered by id).
         row.position = self
             .channels
             .values()
-            .filter(|c| c.parent == parent && (row.private || !c.private))
+            .filter(|c| c.parent == parent && !c.private)
             .map(|c| c.position + 1)
             .max()
             .unwrap_or(0);
@@ -2258,6 +2271,18 @@ fn named_channels(request: &Request) -> Vec<ChannelId> {
         Request::ChannelCreate(c) => c.parent.into_iter().collect(),
         Request::ChannelUpdate(u) => [Some(u.channel), u.parent].into_iter().flatten().collect(),
         Request::ServerUpdate(u) => u.default_channel.into_iter().collect(),
+        Request::ChatRead { target: vc_proto::ChatReadTarget::Conversation { conversation }, .. }
+        | Request::Mls(
+            vc_proto::MlsRequest::GroupCreate { conversation, .. }
+            | vc_proto::MlsRequest::GroupHistory { conversation, .. },
+        )
+        | Request::Sealed(
+            vc_proto::SealedRequest::Send { conversation, .. }
+            | vc_proto::SealedRequest::Edit { conversation, .. }
+            | vc_proto::SealedRequest::DeleteOwn { conversation, .. }
+            | vc_proto::SealedRequest::History { conversation, .. }
+            | vc_proto::SealedRequest::Remove { conversation, .. },
+        ) => mls::channel_id(conversation).into_iter().collect(),
         _ => vec![],
     }
 }
@@ -2644,6 +2669,49 @@ pub(crate) mod expiry_tests {
         let row = on_core(&core, move |core| core.channels[&private].clone()).await;
         assert_eq!(row.topic, "old");
         assert!(row.access.unwrap().users.is_empty(), "the revocation stands");
+    }
+
+    #[tokio::test]
+    async fn a_channel_create_finishing_after_losing_the_permission_creates_nothing() {
+        let store = Store::in_memory().unwrap();
+        let creators = store.insert_group("Creators", &[Permission::ChannelCreate], None).unwrap();
+        let core = test_core(store, None);
+        let (out, mut frames) = mpsc::channel(OUTBOUND_QUEUE);
+        let session = core
+            .connect(ConnectRequest {
+                request_id: 1,
+                hello_key: String::new(),
+                certificate: None,
+                uid: crate::identity::uid_for_key(&[1; 32]),
+                public_key: URL_SAFE_NO_PAD.encode([1; 32]),
+                nickname: "creator".into(),
+                platform: Platform::Web,
+                out,
+                ip: None,
+                device: None,
+                device_expires_at: None,
+                invite: None,
+                password_ok: true,
+            })
+            .await
+            .unwrap();
+        let before = on_core(&core, move |core| {
+            core.sessions.get_mut(&session).unwrap().groups = vec![MEMBER_GROUP, creators];
+            let create = ChannelCreate { name: "p".into(), private: true, ..Default::default() };
+            assert!(core.channel_create(session, 7, create).is_none(), "deferred");
+            core.sessions.get_mut(&session).unwrap().groups = vec![MEMBER_GROUP];
+            core.channels.len()
+        })
+        .await;
+        let reply = loop {
+            let Some(Outbound::Frame(frame)) = frames.recv().await else { continue };
+            let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            if frame["re"] == 7 {
+                break frame;
+            }
+        };
+        assert_eq!(reply["err"]["code"], "forbidden", "{reply}");
+        assert_eq!(on_core(&core, move |core| core.channels.len()).await, before);
     }
 
     #[tokio::test]

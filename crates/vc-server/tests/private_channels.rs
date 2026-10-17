@@ -251,6 +251,10 @@ async fn a_hidden_sibling_is_no_name_oracle() {
         "visible siblings still clash"
     );
     assert!(visible > 0);
+    // A new channel's position counts only public siblings, private or not.
+    let hidden_position = root.create_channel(json!({"name": "Later", "private": true})).await["position"].clone();
+    let mine = eve.create_channel(json!({"name": "Mine", "private": true})).await;
+    assert_eq!(mine["position"], hidden_position);
 }
 
 #[tokio::test]
@@ -274,12 +278,18 @@ async fn a_hidden_channel_answers_exactly_as_a_missing_one() {
             ("channel.join", json!({"channel": "{}"})),
             ("chat.history", json!({"channel": "{}"})),
             ("server.update", json!({"default_channel": "{}"})),
+            ("chat.read", json!({"conversation": "channel:{}", "message": 1})),
+            ("chat.sealed.history", json!({"conversation": "channel:{}"})),
+            ("chat.sealed.remove", json!({"conversation": "channel:{}", "id": 1})),
+            ("mls.group_history", json!({"conversation": "channel:{}"})),
         ] {
             let with = |id: u32| {
                 let mut d = d.clone();
                 for v in d.as_object_mut().unwrap().values_mut() {
                     if v == "{}" {
                         *v = json!(id);
+                    } else if v == "channel:{}" {
+                        *v = json!(format!("channel:{id}"));
                     }
                 }
                 d
