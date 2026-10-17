@@ -1652,6 +1652,7 @@ mod tests {
         assert_eq!(core.voice_state(remote).unwrap(), original);
         let Response::Channel(other) = core
             .insert_channel(
+                local,
                 ChannelRow {
                     id: 0,
                     parent: None,

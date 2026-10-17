@@ -185,6 +185,8 @@ fn sealed_channel_subtree_deletion_and_member_removal_are_atomic() {
                 max_clients: None,
                 encrypted: true,
                 history: true,
+                private: false,
+                access: None,
             })
             .unwrap();
         parent = if id == "parent" { Some(channel) } else { None };
