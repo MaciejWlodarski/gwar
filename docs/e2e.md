@@ -260,7 +260,9 @@ any more (all their state lost), the conversation is restarted (above).
 ## Private channels
 
 Today a server has an Admin group but no owner identity. This design adds one,
-with signed statements that newcomers can check without any history:
+with signed statements that newcomers can check without any history. The
+exact encodings are normative in [e2e-build.md](e2e-build.md), section 6; the
+statements below are summaries:
 
 - The **owner** is the uid that redeemed the first admin token. `Welcome`
   names it; the client pins it per server key (not per endpoint), next to the
@@ -270,26 +272,29 @@ with signed statements that newcomers can check without any history:
   own key.
 - **Ownership moves** only by a chain of statements, each signed by the
   previous owner's **account key** (a local identity's own key) and naming
-  the hash of the previous link:
-  `gwar owner v1\n{server_key}\n{seq}\n{previous_link_hash}\n{previous_owner_uid}\n{new_owner_uid}\n{signed_at}`.
+  the hash of the previous link (`gwar owner v1`, naming the previous owner's
+  account key, the new owner and the owner generation).
   Moving ownership asks for the password, as revoking a device does, so a
   lost or revoked device cannot sign a link, and a link is checked by its
   signature alone. The server serves the chain; a client accepts a chain
   only if it extends the head it pinned. If the owner's account is lost for
   good (password and recovery code) there is no link, and a new owner shows
   the same neutral notice as a changed handle, which the user can accept.
-- The **managers** of the server's private channels are a list signed by a
-  device of the current owner:
-  `gwar managers v1\n{server_key}\n{seq}\n{owner_uid}\n{manager uids}\n{signed_at}`.
-  Managers mirror `channel_edit`: when the owner gives a role with
-  `channel_edit`, the owner's client signs a new list. When another admin
-  does it, the server reports a pending manager, and the list waits until the
-  owner's client confirms it ("Allow @name to manage private channels?").
-- Each private channel's GroupContext holds the **access list**: the owner
-  chain head, the manager list, and the members:
-  `gwar channel members v1\n{group_id}\n{seq}\n{member uids}\n{signer_uid}\n{signed_at}`,
-  signed by a device of the current owner or of a manager on that manager
-  list. When the owner removes a manager or ownership moves, the owner's
+- The **managers** of the server's private channels are a list (`gwar
+  managers v1`) signed by a device of the owner or of a **confirmer**. The
+  confirmers are named in an anchor (`gwar confirmers v1`) signed by the
+  owner's account key, which never expires; every list is checked together
+  with its anchor, so a newcomer needs no history. Only the current owner
+  signs a new anchor; an ownership move hands the anchor in force over by
+  naming its hash, so a former owner cannot appoint confirmers afterwards. Managers mirror
+  `channel_edit`: when the owner or a confirmer gives a role with
+  `channel_edit`, their client signs a new list. When another admin does it,
+  the server reports a pending manager, and the list waits until the owner or
+  a confirmer confirms it ("Allow @name to manage private channels?").
+- Each private channel's GroupContext holds the **access list**: the
+  confirmer anchor, the manager list, and the members (`gwar channel members
+  v1`, bound to the group id), signed by a device of the owner, a confirmer
+  or a manager on that manager list. When the owner removes a manager or ownership moves, the owner's
   client re-signs the member lists that no longer qualify, in the same
   commits.
 - Clients **checkpoint** `(seq, statement hash)` for the owner chain head and
@@ -319,6 +324,15 @@ with signed statements that newcomers can check without any history:
   newcomers comes from the current access list.
 - The owner and the managers are always allowed readers, as admins see every
   channel on Discord.
+- **Confirmers.** The owner may mark managers as confirmers: a confirmer may
+  sign a manager list that adds or removes plain managers, so a manager added
+  by another admin need not wait for the owner alone. Only the owner changes
+  who is a confirmer.
+- **Hidden, and plaintext too.** A private channel is hidden from everyone it
+  does not admit (its name, its existence and who is in it). Private channels
+  may also be plaintext: those admit by roles and listed members on the
+  server's word, as a role-based channel on Discord. The guarantees above are
+  for encrypted private channels. TeamSpeak never sees private channels.
 
 ## Messages
 
@@ -855,9 +869,6 @@ Still to measure before building: S6 with the official TeamSpeak server.
 
 ## Open questions
 
-- A manager added by an admin other than the owner waits for the owner's
-  client. Is that acceptable on servers whose owner is rarely online, or
-  should the owner be able to delegate that confirmation?
 - History bundles grow with every epoch (about 40 bytes each). If channels
   reach many thousands of epochs, a key tree can replace the flat list.
 - SFrame suite for voice: `AES_128_GCM_SHA256_128` (16-byte tag) by default;
