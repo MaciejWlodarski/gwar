@@ -35,6 +35,8 @@ export interface OwnerView {
   managers: string[];
   list_signer: string | null;
   list_signed_at: number | null;
+  /** When the list signer's device certificate expires (null: a local identity, or no list). */
+  list_signer_expires_at: number | null;
   anchor_seq: number | null;
   list_seq: number | null;
 }

@@ -65,6 +65,8 @@ pub struct OwnerView {
     /// Who signed the accepted list, and when.
     pub list_signer: Option<Uid>,
     pub list_signed_at: Option<i64>,
+    /// When the list signer's device certificate expires (`None`: a local identity, or no list).
+    pub list_signer_expires_at: Option<i64>,
     pub anchor_seq: Option<u64>,
     pub list_seq: Option<u64>,
 }
@@ -118,6 +120,10 @@ impl Agent {
             managers: pair.as_ref().map(|(_, l)| l.list().managers.clone()).unwrap_or_default(),
             list_signer: pair.as_ref().map(|(_, l)| l.list().signer_uid.clone()),
             list_signed_at: pair.as_ref().map(|(_, l)| l.list().signed_at),
+            list_signer_expires_at: pair.as_ref().and_then(|(_, l)| match l.signer() {
+                crate::Credential::Account(c) => Some(c.expires_at),
+                crate::Credential::Local { .. } => None,
+            }),
             anchor_seq: pair.as_ref().map(|(a, _)| a.anchor().anchor_seq),
             list_seq: pair.as_ref().map(|(_, l)| l.list().seq),
         }))
