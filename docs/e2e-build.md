@@ -2093,7 +2093,8 @@ Three pull requests, in this order:
   role, so whether a grant succeeds never depends on hidden channels, and
   only an Admin grants Admin (which admits every plaintext private channel).
   It applies to:
-  - `member.groups` (both the roles added and the roles removed);
+  - `member.groups` (both the roles added and the roles removed), and
+    `group.delete`, which takes the role away from everyone;
   - `token.create` and invite creation, and again at redemption, as
     `could_grant` already does for permissions;
   - any other role assignment.
@@ -2110,12 +2111,21 @@ Three pull requests, in this order:
     sessions;
   - read marks, unread counts, mentions, `Welcome.conversations` and
     `mls.groups` leave it out;
-  - a request naming it, directly or through a message id, answers
-    `not_found`, as for a deleted channel;
+  - a request naming it, directly or through a message id (including
+    `server.update`'s `default_channel`), answers `not_found` before any
+    other check, exactly as for a channel that does not exist;
+  - a change checked before slow work (password hashing) is checked again
+    against the current state when it finishes;
+  - a new public channel's position counts only public siblings;
   - **sibling names** are unique only among the channels the requester can
     see: creating or renaming a channel never fails because of a hidden
     sibling, so two siblings may share a name when one is hidden from the
     other's creator.
+  - **Not covered:** channel and message ids are server-wide counters, so a
+    gap between ids a session sees shows that something was created or
+    deleted somewhere it cannot see. Gaps also come from deletions, and they
+    reveal no name, place, member or content. Separate counters per
+    audience are not worth their cost at this stage.
 - **Admission changes.** On every change (access edited, role granted or
   removed, role deleted, Admin group changed), the server compares each
   session's admissions before and after:
