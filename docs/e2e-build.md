@@ -2417,8 +2417,8 @@ gwar managers v1
   `0xff00`, as today. Old key packages are replaced, as this is the dev
   stage.
 - **Membership rule** (the agent's and the observer's tree rule): every
-  leaf's uid is the owner (of the extension's generation), a confirmer, a
-  manager, or a member on the extension's lists.
+  leaf's uid is the owner (as in "Which owner"), a confirmer, a manager, or a
+  member on the extension's lists.
 - **Changes.** Any member may commit a `GroupContextExtensions` proposal that
   replaces `0xff01` only. `0xff00`, the external senders and the required
   capabilities stay byte-identical: the proposal carries the whole set, and
