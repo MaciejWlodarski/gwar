@@ -244,3 +244,20 @@ async fn the_owner_is_admitted_to_private_channels_whatever_their_roles() {
     root.ok("channel.join", json!({"channel": private})).await;
     assert!(root.drain_events("channel.hidden").await.is_empty());
 }
+
+#[tokio::test]
+async fn the_first_token_owner_sees_private_channels_made_before_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("vc.sqlite3");
+    let server = TestServer::start_with(|c| c.database = Some(database.clone())).await;
+    // Another admin, by a later token, makes a private channel while the first token is unused.
+    let store = vc_server::store::Store::open(&database).unwrap();
+    let later = vc_server::core::issue_token(&store, vc_server::store::ADMIN_GROUP, None).unwrap();
+    let mut other = Client::connect(&server, "other").await;
+    other.redeem(&later).await;
+    let private = channel_id(&other.create_channel(json!({"name": "p", "private": true})).await);
+    let mut root = Client::connect(&server, "root").await;
+    assert!(root.welcome.channels.iter().all(|c| c.id != private));
+    root.redeem(&server.admin_token).await;
+    assert_eq!(root.next_event("channel.created").await["id"], private);
+}

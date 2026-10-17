@@ -2223,6 +2223,8 @@ impl Core {
             return Err(err(ErrorCode::Forbidden, "whoever made this token can no longer grant its group"));
         }
         let (user_id, uid) = (self.sessions[&session].user_id, self.sessions[&session].uid.clone());
+        // Before the owner or the roles change, both of which admit to private channels.
+        let before = self.admissions();
         // The first admin token also makes its redeemer the owner, while there is none (6b).
         if self.store.grant_token_group(user_id, &uid, group, first).map_err(storage_error)? {
             let genesis =
@@ -2233,7 +2235,6 @@ impl Core {
         }
         let groups = self.store.user_groups(user_id).map_err(storage_error)?;
         let affected: Vec<_> = self.sessions.values().filter(|s| s.user_id == user_id).map(|s| s.id).collect();
-        let before = self.admissions();
         for id in affected {
             if let Some(s) = self.sessions.get_mut(&id) {
                 s.groups = groups.clone();
