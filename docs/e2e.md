@@ -284,12 +284,14 @@ statements below are summaries:
   managers v1`) signed by a device of the owner or of a **confirmer**. The
   confirmers are named in an anchor (`gwar confirmers v1`) signed by the
   owner's account key, which never expires; every list is checked together
-  with its anchor, so a newcomer needs no history. Managers mirror
+  with its anchor, so a newcomer needs no history. Only the current owner
+  signs a new anchor; an ownership move hands the anchor in force over by
+  naming its hash, so a former owner cannot appoint confirmers afterwards. Managers mirror
   `channel_edit`: when the owner or a confirmer gives a role with
   `channel_edit`, their client signs a new list. When another admin does it,
   the server reports a pending manager, and the list waits until the owner or
   a confirmer confirms it ("Allow @name to manage private channels?").
-- Each private channel's GroupContext holds the **access list**: the owner
+- Each private channel's GroupContext holds the **access list**: the
   confirmer anchor, the manager list, and the members (`gwar channel members
   v1`, bound to the group id), signed by a device of the owner, a confirmer
   or a manager on that manager list. When the owner removes a manager or ownership moves, the owner's

@@ -2086,16 +2086,20 @@ Three pull requests, in this order:
   (`channel.create` and `channel.update` refuse a private parent) and is
   **never the default channel** (`server.update` refuses it). It may itself
   sit under a public channel.
-- **Granting access is delegation.** A role listed in a private channel's
-  access is an *access-bearing* role. Anyone who assigns or gives out such a
-  role must be admitted to every private channel it admits. This applies to:
-  - `member.groups`;
-  - `token.create` and invite creation (and again at redemption, as
-    `could_grant` already does for permissions);
+- **Granting a role is delegation.** A role, and with it every private
+  channel it admits, is given out only by someone who **holds that role or
+  the Admin group**, on top of the existing permission check (the role's
+  permissions are a subset of the granter's). The rule is the same for every
+  role, so whether a grant succeeds never depends on hidden channels, and
+  only an Admin grants Admin (which admits every plaintext private channel).
+  It applies to:
+  - `member.groups` (both the roles added and the roles removed);
+  - `token.create` and invite creation, and again at redemption, as
+    `could_grant` already does for permissions;
   - any other role assignment.
 
-  Adding a role to an access set requires the editor to hold that role or
-  the Admin group.
+  Adding a role to an access set likewise requires the editor to hold that
+  role or the Admin group.
 - **Hiding.** For a session that is not admitted, the channel does not exist:
   - `Welcome.channels` omits it, and channel events are not sent;
   - a client inside it is reported with `channel: null`, `voice_binding:
@@ -2171,7 +2175,10 @@ Three pull requests, in this order:
   - The first admin token is marked durably when issued (`tokens.first`).
   - Redeeming it makes the redeemer's uid the owner, in one transaction with
     the Admin grant and the genesis (meta `owner_generation = 1`, the genesis
-    below).
+    below), **only while the server still has no owner**, checked inside that
+    transaction. Once there is an owner (`owner set`, or an earlier
+    redemption), the first token grants Admin only and never writes a
+    genesis or a generation.
   - Other admin tokens never make an owner.
 - **Operator commands** run locally on the database, like the other
   `vc-server` admin commands, with the server stopped:
@@ -2206,6 +2213,7 @@ Three pull requests, in this order:
   {previous_link_hash}    hash of the previous link's statement (H0 for seq 1)
   {previous_owner_account_key}
   {new_owner_uid}
+  {anchor_hash}           hash of the confirmer anchor handed over, or -
   {signed_at}             Unix ms
   ```
 
@@ -2266,19 +2274,28 @@ gwar managers v1
 ```
 
 - **Envelopes.**
-  - The anchor is two netstrings: the statement and the account key's raw
-    signature (base64url). The account key is carried in the owner chain.
+  - The anchor is three netstrings: the statement, the signing owner's
+    **account public key** (base64url), and that key's raw signature
+    (base64url). Neither the genesis nor a link carries the current owner's
+    key, so the anchor must.
   - The list is three netstrings: the statement, the signer's credential, and
     its device's raw Ed25519 signature.
 - **Bounds:** at most 32 confirmers and 100 managers, never including the
   owner, and a manager is never also a confirmer. An encoded anchor plus list
   is at most 16 KiB.
 - **Validity of an anchor:**
-  - the owner whose head it names, under that generation, signed it with
-    their account key;
-  - `owner_head` is the reader's pinned head or an earlier link of the same
-    chain (an ownership move does not invalidate the anchor until the new
-    owner replaces it).
+  - `uid_for_key(key)` is the owner at `owner_head` (the genesis owner, or
+    the `new_owner_uid` of that link), and the signature verifies;
+  - **a new anchor** is accepted only when `owner_head` is the head of the
+    reader's pinned chain (after fetching any extension of the pin): only
+    the current owner mints anchors;
+  - **an inherited anchor** survives ownership moves only by hash: the
+    owner link gains a line `{anchor_hash}` (the hash of the anchor in force
+    when the link was signed, or `-`), so the previous owner hands over that
+    exact anchor and nothing newer. An anchor naming an earlier head is
+    valid only if every link after that head names its hash.
+  - A former owner can therefore never sign an anchor that a reader of the
+    newer chain accepts, whatever its `anchor_seq`.
 - **Validity of a list:**
   - the anchor it names is valid;
   - its signer is the owner or a confirmer on that anchor;
@@ -2447,13 +2464,25 @@ gwar managers v1
   - Member-list checkpoints are per group: the successor's do not compare
     with the predecessor's. The incarnation pins (section 4, "Restarts")
     prevent rollback to an earlier group.
-  - Clients accept the successor along the chain and check the creator's
-    authority against their manager checkpoint.
+  - **Intermediate incarnations are history.** A client catching up along
+    the chain checks each successor's creator against the manager pair in
+    that successor's own initial `0xff01` (valid, signed by a certificate
+    that covered the creation time, its seqs not below the predecessor's),
+    as "Validation as history" does; it does not check it against its
+    current checkpoint, so a manager removed later does not break the
+    chain. Such pairs never lower or replace a checkpoint.
+  - **The live incarnation** is then subject to current authority (a)–(d)
+    like any private group.
 - **Voice.**
   - A private channel's voice group binds to its parent as in 5a. The agent
     no longer refuses a private parent.
-  - Voice membership is the parent's current tree, and joining needs the
-    current-authority conditions above.
+  - Voice membership is the parent's current tree. Joining, **and every
+    voice key export and sender activation for the whole call**, need the
+    parent's current-authority conditions (a)–(d) above.
+  - Accepting a newer manager pair or member list that the parent does not
+    yet carry is a blocked MLS gate: the agent issues the `hold` barrier at
+    once (section 5d) and transmits nothing until the parent carries the
+    accepted lists and its tree holds no excluded leaf.
 - **History** is unchanged: it is shared among the group's members.
 - **What the server can still do**, recorded in [e2e.md](e2e.md)'s first-contact
   and delivery limits:
@@ -2483,9 +2512,11 @@ gwar managers v1
     sibling);
   - attachments of a private channel refused without admission in Link and
     Members modes, including a retained URL after losing admission;
-  - role grants: an access-bearing role cannot be given out through invites,
-    tokens or `member.groups` by someone not admitted, at issuance or at
-    redemption;
+  - role grants: a role the granter does not hold (Admin included) cannot
+    be given out through invites, tokens or `member.groups`, at issuance or
+    at redemption, by a member holding every permission through other
+    roles; the outcome of a grant is the same before and after the role
+    starts admitting a hidden channel;
   - no password, no children, never the default channel;
   - TeamSpeak: the bridge sees nothing (unit test on bridge notes), plus the
     official-server CI probe.
@@ -2499,11 +2530,18 @@ gwar managers v1
   - golden and rejection vectors for every statement;
   - chain extension and refusal (wrong key, wrong previous hash, gaps,
     forks, a lower seq);
-  - the first-token genesis only, atomic with the Admin grant;
+  - the first-token genesis only, atomic with the Admin grant, and only
+    while there is no owner (an unused first token after `owner set` or
+    `owner reset` grants Admin only);
   - `owner set` only while there is no owner;
   - `owner reset` as a new generation with checkpoints cleared on
     acceptance;
   - anchor and list validity, bounds, and confirmer and manager authority;
+  - the anchor's key: a fresh reader verifies a confirmer-signed list at
+    genesis and right after a transfer from the proof objects alone;
+  - a former owner's anchor with a higher `anchor_seq`, signed after the
+    transfer and after the reader accepted the new owner's anchor, is
+    rejected, and an anchor handed over by hash in the link is accepted;
   - a fresh reader and one that missed many updates verifying the newest
     pair;
   - currency and renewal through another confirmer after the signer's
@@ -2521,10 +2559,13 @@ gwar managers v1
   - offers committed by an ordinary member, and repair after expiry with the
     manager's group state kept and lost;
   - a newcomer refused with non-current lists;
-  - restart authority, with the successor's seq 1 accepted;
+  - restart authority, with the successor's seq 1 accepted, and catch-up
+    G0 → G1 (created by a manager removed later) → G2 (by the owner);
   - a hidden-then-shown channel cannot roll back its member list;
   - extension size limits at 1000 members and 100 managers;
   - voice under a private parent, and access removal cutting voice;
+  - an active call held at once when a newer manager pair is accepted while
+    its propagation into the parent is withheld and repair awaits a manager;
   - web e2e: the owner and a manager create a private encrypted channel, add
     a member by role expansion, remove them (removed from the group and the
     view), and the member list survives a restart.
