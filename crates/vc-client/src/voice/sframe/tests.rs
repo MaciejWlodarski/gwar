@@ -94,7 +94,7 @@ impl Engine {
         self.ok("activate", epoch, json!({ "send_until": null }));
     }
     fn encrypt(&mut self, pt: &[u8]) -> Option<Vec<u8>> {
-        self.state.encrypt(pt, self.now)
+        self.state.encrypt(pt, self.now, self.wall)
     }
     fn decrypt(&mut self, frame: &[u8]) -> Option<Vec<u8>> {
         self.state.decrypt(frame, self.now)
@@ -523,8 +523,75 @@ fn refuses_future_malformed_and_unbound_controls_without_mutation() {
 fn refuses_installs_at_or_below_a_restarts_resume_floor() {
     let mut b = Engine::resuming(Some(4));
     assert_eq!(b.send("supersede", 4, json!({})).result, Some(Outcome::Ignored));
+    for epoch in [3, 4] {
+        assert_eq!(b.install(epoch, 1, &members(epoch, &[(0, 0), (1, 1)]), &[]).result, Some(Outcome::Ignored));
+    }
+    assert_eq!(b.state.counters.stale_install, 2);
+    assert!(b.state.retained().is_empty());
     b.ok("supersede", 5, json!({}));
     assert_eq!(b.install(5, 1, &members(5, &[(0, 0), (1, 1)]), &[]).result, Some(Outcome::Applied));
+}
+
+#[test]
+fn an_identical_reinstall_keeps_the_replay_window() {
+    let (mut a, mut b) = (Engine::new(), Engine::new());
+    let all = members(1, &[(0, 0), (1, 1)]);
+    a.enter(1, 0, &all, &[]);
+    b.enter(1, 1, &all, &[]);
+    let frame = a.encrypt(&OPUS).unwrap();
+    assert!(b.decrypt(&frame).is_some());
+    assert_eq!(b.install(1, 1, &all, &[]).result, Some(Outcome::Unchanged));
+    assert_eq!(b.decrypt(&frame), None, "the replayed counter stays rejected");
+    assert_eq!(b.state.counters.replay_dropped, 1);
+}
+
+#[test]
+fn an_older_frame_cannot_move_the_authenticated_pointer_back() {
+    let (mut a, mut b) = (Engine::new(), Engine::new());
+    let one = members(1, &[(0, 0), (1, 1)]);
+    let two = members(2, &[(0, 0), (1, 1)]);
+    a.enter(1, 0, &one, &[]);
+    b.enter(1, 1, &one, &[]);
+    let old = a.encrypt(&OPUS).unwrap();
+    let older = a.encrypt(&OPUS).unwrap();
+    assert!(b.decrypt(&old).is_some());
+    a.enter(2, 0, &two, &[]);
+    b.enter(2, 1, &two, &[]);
+    assert!(b.decrypt(&a.encrypt(&OPUS).unwrap()).is_some());
+    // Epoch 1 is still retained (10 s) and an unseen older counter authenticates there...
+    assert_eq!(b.decrypt(&older).as_deref(), Some(&OPUS[..]));
+    // ...but device 0's latest authenticated epoch stays 2, so epoch 1 expires on schedule.
+    b.now += RETAIN;
+    b.sweep();
+    assert_eq!(b.state.retained(), vec![2]);
+}
+
+#[test]
+fn certificate_expiry_holds_while_the_monotonic_clock_is_stopped() {
+    let mut a = Engine::new();
+    a.ok("supersede", 1, json!({}));
+    a.install(1, 0, &members(1, &[(0, 0), (1, 1)]), &[]);
+    a.ok("activate", 1, json!({ "send_until": a.wall + 500 }));
+    assert!(a.encrypt(&OPUS).is_some());
+    // The machine slept two seconds: wall time moved, the uptime clock did not.
+    a.wall += 2_000;
+    assert_eq!(a.encrypt(&OPUS), None);
+    assert!(!a.state.sending());
+}
+
+#[test]
+fn parsing_wipes_nothing_but_scrub_wipes_the_body_keys() {
+    let all = members(1, &[(0, 0), (1, 1)]);
+    let mut body = json!({ "binding": binding_json(), "serial": "2", "action": "install", "epoch": "1", "own_leaf": 1, "members": all, "removed": [] });
+    let parsed = parse_control(&body).unwrap();
+    scrub(&mut body);
+    for m in body["members"].as_array().unwrap() {
+        assert!(m["key"].as_str().unwrap().is_empty());
+    }
+    // The parsed control still installs: it holds its own zeroizing copies.
+    let mut b = Engine::new();
+    b.ok("supersede", 1, json!({}));
+    assert_eq!(b.state.control_parsed(parsed, b.now, b.wall).result, Some(Outcome::Applied));
 }
 
 #[test]

@@ -2651,9 +2651,21 @@ async fn native_sframe_tone_travels_between_engines_through_the_sfu() {
     let (va, a_binding) = native_encrypted(&mut a, ToneIo { heard: silent, tone: true }, 1, None).await;
     let (vb, b_binding) = native_encrypted(&mut b, ToneIo { heard: heard.clone(), tone: false }, 1, None).await;
     // Both engines start closed: nothing is sent or played before keys.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
     assert_eq!(va.keys().unwrap().counters().encrypted, 0);
     assert_eq!(vb.keys().unwrap().counters().decrypted, 0);
+    // Any packet on the wire would reach B's decryptor and be counted (no key, auth or size).
+    let early = vb.keys().unwrap().counters();
+    assert_eq!(
+        (early.no_key, early.auth_failed, early.oversize_dropped),
+        (0, 0, 0),
+        "nothing crossed the SFU: {early:?}"
+    );
+    {
+        let samples = heard.lock().unwrap();
+        let level = (samples.iter().map(|s| s * s).sum::<f32>() / samples.len().max(1) as f32).sqrt();
+        assert!(level < 0.001, "B played audio before keys: rms {level}");
+    }
     install_and_activate(&va, &a_binding, &first).await;
     install_and_activate(&vb, &b_binding, &second).await;
 
@@ -2666,4 +2678,11 @@ async fn native_sframe_tone_travels_between_engines_through_the_sfu() {
     let tail = &samples[samples.len().saturating_sub(48_000)..];
     let level = (tail.iter().map(|s| s * s).sum::<f32>() / tail.len().max(1) as f32).sqrt();
     assert!(level > 0.05, "B heard rms {level} over the last second");
+
+    // Retiring the run (dropping its handle) fences a retained key channel.
+    let retained = va.keys().unwrap().clone();
+    drop(va);
+    let mut late = json!({ "action": "supersede", "serial": "9", "epoch": "99" });
+    late["binding"] = a_binding.clone();
+    assert_eq!(retained.control(late).await.result, Some(vc_client::voice::sframe::Outcome::Ignored));
 }

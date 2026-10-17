@@ -18,7 +18,12 @@ use vc_proto::{
     rtp::{SLOT_GENERATION_ID, SlotGeneration, slot_generation_extension},
 };
 
-use super::{Counters, Incoming, LinkState, Outgoing, io::OutputTiming, jitter::Clock, keys::Crypto};
+use super::{
+    Counters, Incoming, LinkState, Outgoing,
+    io::OutputTiming,
+    jitter::Clock,
+    keys::{Crypto, RunGate},
+};
 use std::sync::Arc;
 
 /// Marks the link lost however the transport task ends.
@@ -29,6 +34,8 @@ impl Drop for LostOnDrop {
     }
 }
 
+// The session channels, counters, crypto and the retirement gate are independent inputs.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn start<F, Fut>(
     signal: F,
     local_ip: IpAddr,
@@ -37,6 +44,7 @@ pub(crate) async fn start<F, Fut>(
     counters: Arc<Counters>,
     wake: Arc<OutputTiming>,
     crypto: Option<Crypto>,
+    gate: RunGate,
 ) -> Result<()>
 where
     F: FnOnce(String) -> Fut,
@@ -121,7 +129,9 @@ where
                                 .get::<SlotGeneration>()
                                 .copied()
                                 .map(super::Generation::Rtp);
-                            // Only an authenticated packet can reach playout or reset a slot.
+                            // A retired run plays nothing; only an authenticated packet can
+                            // reach playout or reset a slot.
+                            let Some(_open) = gate.enter() else { return };
                             let opus = match crypto.0.as_mut() {
                                 Some(keys) => match keys.decrypt(&packet.payload) {
                                     (Some(opus), _) => opus,
@@ -172,10 +182,15 @@ where
                 None => deadline,
             };
             tokio::select! {
+                () = gate.closed() => return,
                 command = async { match commands.as_mut() { Some(c) => c.recv().await, None => std::future::pending().await } } => {
-                    match (command, crypto.0.as_mut()) {
-                        (Some(command), Some(keys)) => if !keys.command(command) { return },
-                        _ => return,
+                    let (Some(command), Some(keys)) = (command, crypto.0.as_mut()) else { return };
+                    let Some(_open) = gate.enter() else {
+                        keys.refuse(command);
+                        return;
+                    };
+                    if !keys.command(command) {
+                        return;
                     }
                 }
                 frame = outgoing.recv() => {
@@ -196,6 +211,8 @@ where
                     if rtc.direct_api().stream_tx_by_mid(mic, None).is_none() {
                         continue;
                     }
+                    // Nothing queued is encrypted or sent after retirement.
+                    let Some(_open) = gate.enter() else { return };
                     // The send gate and counter reservation sit right before the RTP write.
                     let payload = match crypto.0.as_mut() {
                         Some(keys) => match keys.encrypt(&frame.opus) {
@@ -290,6 +307,7 @@ mod tests {
             counters.clone(),
             Arc::new(OutputTiming::default()),
             None,
+            RunGate::new(),
         )
         .await
         .unwrap();
@@ -474,6 +492,7 @@ mod tests {
                 Arc::new(Counters::default()),
                 Arc::new(OutputTiming::default()),
                 None,
+                RunGate::new(),
             )
             .await;
             if omitted.is_some_and(|i| i > 0) {
@@ -527,6 +546,7 @@ mod tests {
                     Arc::new(Counters::default()),
                     Arc::new(OutputTiming::default()),
                     None,
+                    RunGate::new(),
                 )
                 .await;
                 if changed > 0 && matches!(direction, Some("inactive" | "recvonly")) {

@@ -283,6 +283,18 @@ describe("SframeState", () => {
     expect(a.state.sending).toBe(false);
   });
 
+  it("holds certificate expiry while the monotonic clock is stopped (sleep)", async () => {
+    const clock = new Clock();
+    const a = engine(clock);
+    await a.ok({ action: "supersede", epoch: "1" });
+    await a.ok({ action: "install", epoch: "1", own_leaf: 0, members: members(1n, [[0, 0], [1, 1]]), removed: [] });
+    await a.ok({ action: "activate", epoch: "1", send_until: clock.wall + 500 });
+    expect(await a.state.encrypt(OPUS.slice())).not.toBeNull();
+    clock.wall += 2_000; // the machine slept: wall time moved, the monotonic clock did not
+    expect(await a.state.encrypt(OPUS.slice())).toBeNull();
+    expect(a.statuses).toEqual([{ binding, state: "securing", reason: "key_expired" }]);
+  });
+
   it("drops encryption in flight when a hold arrives and never reuses a counter", async () => {
     const a = engine();
     const all = members(1n, [[0, 0], [1, 1]]);

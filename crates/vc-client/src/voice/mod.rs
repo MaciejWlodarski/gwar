@@ -196,6 +196,7 @@ pub struct VoiceHandle {
     controls: Arc<Controls>,
     counters: Arc<Counters>,
     keys: Option<keys::KeyChannel>,
+    gate: Option<keys::RunGate>,
     crypto_events: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<sframe::CryptoStatus>>>,
     _ports_guard: Box<dyn Send>,
     output: Arc<OutputTiming>,
@@ -288,6 +289,10 @@ impl VoiceHandle {
 
 impl Drop for VoiceHandle {
     fn drop(&mut self) {
+        // Retire the RTC run first: after this no control applies and no packet is sent or played.
+        if let Some(gate) = &self.gate {
+            gate.close();
+        }
         self.controls.stop.store(true, Ordering::Relaxed);
         self.output.wake();
     }
@@ -392,14 +397,15 @@ where
     let (out_tx, out_rx) = mpsc::channel::<Outgoing>(64);
     let (in_tx, in_rx) = std::sync::mpsc::sync_channel::<Incoming>(512);
     let counters = Arc::new(Counters::default());
+    let gate = keys::RunGate::new();
     let (crypto, keys, crypto_events) = match crypto {
         Some(start) => {
-            let (crypto, keys, events) = keys::channel(start, FRAME as u32);
+            let (crypto, keys, events) = keys::channel(start, FRAME as u32, gate.clone());
             (Some(crypto), Some(keys), Some(events))
         }
         None => (None, None, None),
     };
-    rtc::start(signal, local_ip, out_rx, in_tx, counters.clone(), ports.output.clone(), crypto).await?;
+    rtc::start(signal, local_ip, out_rx, in_tx, counters.clone(), ports.output.clone(), crypto, gate.clone()).await?;
     let controls = Arc::new(Controls::default());
     let AudioPorts { mic, speaker, output, _guard } = ports;
     let timing = output.clone();
@@ -415,6 +421,7 @@ where
         counters,
         output,
         keys,
+        gate: Some(gate),
         crypto_events: std::sync::Mutex::new(crypto_events),
         _ports_guard: _guard,
     })
@@ -488,6 +495,7 @@ pub async fn start_teamspeak(
         counters,
         output,
         keys: None,
+        gate: None,
         crypto_events: std::sync::Mutex::new(None),
         _ports_guard: _guard,
     })
@@ -978,5 +986,27 @@ mod codec_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod handle_tests {
+    use super::*;
+
+    #[test]
+    fn dropping_the_handle_closes_the_run_gate_before_returning() {
+        let gate = keys::RunGate::new();
+        let handle = VoiceHandle {
+            controls: Arc::new(Controls::default()),
+            counters: Arc::new(Counters::default()),
+            output: Arc::new(OutputTiming::default()),
+            keys: None,
+            gate: Some(gate.clone()),
+            crypto_events: std::sync::Mutex::new(None),
+            _ports_guard: Box::new(()),
+        };
+        assert!(gate.enter().is_some());
+        drop(handle);
+        assert!(gate.enter().is_none(), "no control, packet write or playout after retirement");
     }
 }

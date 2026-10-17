@@ -75,7 +75,11 @@ impl AudioIo for ToneIo {
                 for i in 0..BLOCK {
                     let phase = (position + i as u64) as f64 * std::f64::consts::TAU / RATE as f64;
                     let value = (phase * self.frequency).sin() as f32 * 0.25;
-                    let _ = mic_tx.push(CaptureSample { captured_at: Instant::now(), position: position + i as u64, value });
+                    let _ = mic_tx.push(CaptureSample {
+                        captured_at: Instant::now(),
+                        position: position + i as u64,
+                        value,
+                    });
                     block.push(speaker_rx.pop().unwrap_or_else(|_| {
                         missing += 1;
                         0.0
@@ -234,12 +238,20 @@ impl Bridge {
             state.handle = Some(handle);
         }
         if let Some(mut events) = events {
+            let bridge = self.clone();
             tokio::spawn(async move {
                 while let Some(status) = events.recv().await {
+                    let failed = status.state == vc_client::voice::sframe::CryptoState::Failed;
                     let mut payload = serde_json::to_value(status).unwrap();
                     payload["owner"] = json!(owner);
                     payload["run"] = json!(run);
                     emit("voice://crypto", payload);
+                    // Like the desktop shell: a failed run is retired at once.
+                    let mut state = bridge.state.lock().unwrap();
+                    if failed && state.owner == owner && state.run == run {
+                        state.run = 0;
+                        state.handle = None;
+                    }
                 }
             });
         }

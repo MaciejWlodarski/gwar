@@ -131,6 +131,8 @@ interface EpochKeys {
   counter: bigint;
   /** Monotonic send deadline; activation can only shorten it. */
   deadline: number;
+  /** The absolute expiry (Unix ms), also checked: the monotonic clock may stop while the machine sleeps. */
+  expiresAt: number;
   receivers: Map<number, Receiver>;
   digest: string;
 }
@@ -237,6 +239,7 @@ export class SframeState {
         if (this.sender && this.sender.epoch > epoch) return result("ignored");
         const deadline = c.send_until === null ? Infinity : this.options.now() + (c.send_until - this.options.wallNow());
         keys.deadline = Math.min(keys.deadline, deadline);
+        if (c.send_until !== null) keys.expiresAt = Math.min(keys.expiresAt, c.send_until);
         const unchanged = this.sender === keys;
         this.sender = keys;
         this.securing = null;
@@ -290,7 +293,7 @@ export class SframeState {
       // A device removed while this import ran stays purged.
       else if ((this.removals.get(m.device) ?? 0) === fences.get(m.device)) receivers.set(m.leaf, { device: m.device, key: keys[i]!, replay: new Replay() });
     });
-    this.epochs.set(epoch, { epoch, supersededAt: null, ownLeaf: c.own_leaf, own: own!, counter: 0n, deadline: Infinity, receivers, digest });
+    this.epochs.set(epoch, { epoch, supersededAt: null, ownLeaf: c.own_leaf, own: own!, counter: 0n, deadline: Infinity, expiresAt: Infinity, receivers, digest });
     this.latest = { epoch, digest, devices: new Set(c.members.filter(m => m.leaf !== c.own_leaf).map(m => m.device)) };
     for (const device of this.lastAuthenticated.keys()) if (!this.latest.devices.has(device)) this.lastAuthenticated.delete(device);
     this.sweep();
@@ -363,14 +366,15 @@ export class SframeState {
     const samples = packetSamples(plaintext);
     if (samples === null) { this.counters.unexpected_duration++; return null; }
     if (samples !== (this.options.frameSamples ?? 960)) this.counters.unexpected_duration++;
-    if (this.options.now() >= keys.deadline) { this.closeSending("key_expired"); return null; }
+    const expired = () => this.options.now() >= keys.deadline || this.options.wallNow() >= keys.expiresAt;
+    if (expired()) { this.closeSending("key_expired"); return null; }
     if (keys.counter >= COUNTER_LIMIT) { this.counters.counter_exhausted++; this.closeSending("counter_exhausted"); return null; }
     const ctr = keys.counter++;
     const generation = this.sendGeneration;
     const ciphertext = await seal(keys.own, voiceKid(keys.epoch, keys.ownLeaf), ctr, new Uint8Array(), plaintext, this.options.subtle);
     if (this.ended || generation !== this.sendGeneration || this.sender !== keys) return null;
     // A completion after the certificate deadline is dropped too.
-    if (this.options.now() >= keys.deadline) { this.closeSending("key_expired"); return null; }
+    if (expired()) { this.closeSending("key_expired"); return null; }
     this.counters.encrypted++;
     return ciphertext;
   }

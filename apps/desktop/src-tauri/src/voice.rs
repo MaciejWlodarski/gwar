@@ -618,7 +618,13 @@ async fn forward_crypto(
     mut events: tokio::sync::mpsc::UnboundedReceiver<CryptoStatus>,
 ) {
     while let Some(status) = events.recv().await {
+        let failed = status.state == vc_client::voice::sframe::CryptoState::Failed;
         let _ = app.emit("voice://crypto", CryptoPayload { owner, run, status });
+        if failed {
+            // A failed run is retired at once: transport, pipeline and devices close.
+            let _ = retire_run(&app.state::<Voice>(), owner, run);
+            return;
+        }
     }
 }
 

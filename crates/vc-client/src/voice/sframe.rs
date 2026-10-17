@@ -130,15 +130,43 @@ pub struct Control {
     pub serial: u64,
     pub epoch: u64,
     pub action: Action,
-    /// Fingerprint of the canonical body; the body itself is not kept.
+    /// Fingerprint of the parsed body; neither the body nor a key-bearing copy is kept.
     body: [u8; 32],
 }
 
-fn fingerprint(text: &str) -> [u8; 32] {
-    Sha256::digest(text.as_bytes()).into()
+/// Length-prefixed fields hashed straight from the parsed values (and the
+/// decoded, zeroizing key bytes): no key-bearing text is ever allocated.
+struct Fingerprint(Sha256);
+
+impl Fingerprint {
+    fn new(tag: &[u8]) -> Self {
+        let mut f = Self(Sha256::new());
+        f.bytes(tag);
+        f
+    }
+    fn bytes(&mut self, bytes: &[u8]) -> &mut Self {
+        self.0.update((bytes.len() as u64).to_be_bytes());
+        self.0.update(bytes);
+        self
+    }
+    fn number(&mut self, value: u64) -> &mut Self {
+        self.0.update(value.to_be_bytes());
+        self
+    }
+    fn members(&mut self, own_leaf: u32, members: &[Member]) -> &mut Self {
+        self.number(own_leaf.into()).number(members.len() as u64);
+        for m in members {
+            self.number(m.leaf.into()).bytes(m.device.as_bytes()).bytes(&m.key);
+        }
+        self
+    }
+    fn finish(self) -> [u8; 32] {
+        self.0.finalize().into()
+    }
 }
 
 /// Validates the exact tagged control body; `None` for any structural error.
+/// Parsing is canonical, so equal bodies are exactly equal parsed fields.
 pub fn parse_control(value: &Value) -> Option<Control> {
     let c = value.as_object()?;
     let binding = Binding::parse(c.get("binding")?)?;
@@ -178,56 +206,55 @@ pub fn parse_control(value: &Value) -> Option<Control> {
             if members.iter().filter(|m| m.leaf == own_leaf).count() != 1 {
                 return None;
             }
-            // Normalized member fields, fingerprinted: no raw exporter key is retained.
-            let normalized = Zeroizing::new(
-                serde_json::to_string(&(
-                    own_leaf,
-                    members.iter().map(|m| (m.leaf, &m.device, URL_SAFE_NO_PAD.encode(&*m.key))).collect::<Vec<_>>(),
-                ))
-                .ok()?,
-            );
-            Action::Install { own_leaf, members, removed, digest: fingerprint(&normalized) }
+            // Normalized member fields: the install identity, without a raw exporter key.
+            let mut digest = Fingerprint::new(b"install members");
+            digest.members(own_leaf, &members);
+            let digest = digest.finish();
+            Action::Install { own_leaf, members, removed, digest }
         }
         _ => return None,
     };
-    let body = Zeroizing::new(canonical(&binding, value)?);
-    Some(Control { binding, serial, epoch, action, body: fingerprint(&body) })
+    let mut f = Fingerprint::new(b"control");
+    f.bytes(binding.server_key.as_bytes())
+        .number(binding.session)
+        .number(binding.channel.into())
+        .bytes(binding.call.as_bytes())
+        .bytes(binding.participation.as_bytes())
+        .number(binding.run)
+        .bytes(binding.group.as_bytes())
+        .number(serial)
+        .number(epoch);
+    let removed_of = |f: &mut Fingerprint, removed: &[String]| {
+        f.number(removed.len() as u64);
+        for d in removed {
+            f.bytes(d.as_bytes());
+        }
+    };
+    match &action {
+        Action::Hold { removed } => removed_of(f.bytes(b"hold"), removed),
+        Action::Supersede => {
+            f.bytes(b"supersede");
+        }
+        Action::Activate { send_until } => {
+            f.bytes(b"activate").number(send_until.map_or(0, |u| u + 1));
+        }
+        Action::Install { own_leaf, members, removed, .. } => {
+            f.bytes(b"install").members(*own_leaf, members);
+            removed_of(&mut f, removed);
+        }
+    }
+    Some(Control { binding, serial, epoch, action, body: f.finish() })
 }
 
-/// Fixed field order, the same text as the browser's `canonical`: bytewise
-/// comparison of duplicate serials.
-fn canonical(binding: &Binding, value: &Value) -> Option<String> {
-    let c = value.as_object()?;
-    let b = serde_json::json!({
-        "server_key": binding.server_key, "session": binding.session, "channel": binding.channel,
-        "call": binding.call, "participation": binding.participation, "run": binding.run, "group": binding.group,
-    });
-    let mut out = Map::new();
-    let order: &[&str] = match c["action"].as_str()? {
-        "hold" => &["removed"],
-        "supersede" => &[],
-        "activate" => &["send_until"],
-        _ => &["own_leaf", "members", "removed"],
-    };
-    out.insert("action".into(), c["action"].clone());
-    out.insert("binding".into(), b);
-    out.insert("serial".into(), c["serial"].clone());
-    out.insert("epoch".into(), c["epoch"].clone());
-    for key in order {
-        let field = if *key == "members" {
-            Value::Array(
-                c["members"]
-                    .as_array()?
-                    .iter()
-                    .map(|m| serde_json::json!({ "leaf": m["leaf"], "device": m["device"], "key": m["key"] }))
-                    .collect(),
-            )
-        } else {
-            c[*key].clone()
-        };
-        out.insert((*key).into(), field);
+/// Wipes the exporter keys of a control body once it was parsed.
+pub fn scrub(body: &mut Value) {
+    if let Some(members) = body.get_mut("members").and_then(Value::as_array_mut) {
+        for m in members {
+            if let Some(Value::String(key)) = m.get_mut("key") {
+                zeroize::Zeroize::zeroize(key);
+            }
+        }
     }
-    serde_json::to_string(&Value::Object(out)).ok()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -269,6 +296,12 @@ impl ControlReply {
     /// Echoes the body's serial/epoch strings, "0" when absent.
     pub fn bad(body: &Value, error: ControlError) -> Self {
         Self { result: None, error: Some(error), ..Self::ignored(body) }
+    }
+    pub fn error_for(c: &Control, error: ControlError) -> Self {
+        Self::error(c, error)
+    }
+    pub fn ignored_for(c: &Control) -> Self {
+        Self::result(c, Outcome::Ignored)
     }
     /// For a run that already ended.
     pub fn ignored(body: &Value) -> Self {
@@ -385,6 +418,9 @@ struct EpochKeys {
     counter: u64,
     /// Monotonic send deadline; activation can only shorten it.
     deadline: Option<Instant>,
+    /// The absolute certificate expiry (Unix ms), also checked: the monotonic
+    /// clock may stop while the machine sleeps.
+    expires_ms: Option<u64>,
     receivers: HashMap<u32, Receiver>,
 }
 
@@ -466,9 +502,14 @@ impl SframeState {
     /// `now` is the engine's monotonic clock; `wall_ms` Unix milliseconds,
     /// used only to convert `send_until`.
     pub fn control(&mut self, body: &Value, bytes: usize, now: Instant, wall_ms: u64) -> ControlReply {
-        let Some(c) = (bytes <= MAX_CONTROL_BYTES).then(|| parse_control(body)).flatten() else {
-            return ControlReply::bad(body, ControlError::BadKeys);
-        };
+        match (bytes <= MAX_CONTROL_BYTES).then(|| parse_control(body)).flatten() {
+            Some(c) => self.control_parsed(c, now, wall_ms),
+            None => ControlReply::bad(body, ControlError::BadKeys),
+        }
+    }
+
+    /// Applies one control validated by [`parse_control`].
+    pub fn control_parsed(&mut self, c: Control, now: Instant, wall_ms: u64) -> ControlReply {
         if self.ended.is_some() || c.binding != self.binding || c.serial < self.serial {
             return ControlReply::result(&c, Outcome::Ignored);
         }
@@ -490,10 +531,9 @@ impl SframeState {
         reply
     }
 
-    /// The engine's control queue overflowed: the run fails without applying `body`.
-    pub fn overflow(&mut self, body: &Value) -> ControlReply {
+    /// The engine's control queue overflowed: the run fails.
+    pub fn fail_queue_full(&mut self) {
         self.stop_with(StatusReason::KeyQueueFull);
-        ControlReply::bad(body, ControlError::KeyQueueFull)
     }
 
     fn fail(&mut self, reason: StatusReason, c: &Control) -> ControlReply {
@@ -542,6 +582,7 @@ impl SframeState {
                 if let Some(until) = send_until {
                     let deadline = now + Duration::from_millis(until.saturating_sub(wall_ms));
                     keys.deadline = Some(keys.deadline.map_or(deadline, |d| d.min(deadline)));
+                    keys.expires_ms = Some(keys.expires_ms.map_or(*until, |e| e.min(*until)));
                 }
                 let unchanged = self.sender == Some(epoch);
                 self.sender = Some(epoch);
@@ -607,8 +648,10 @@ impl SframeState {
         // Removed devices go first: a reused leaf index must not inherit them.
         self.purge(removed);
         let own = own.expect("own leaf validated");
-        self.epochs
-            .insert(epoch, EpochKeys { superseded_at: None, own_leaf, own, counter: 0, deadline: None, receivers });
+        self.epochs.insert(
+            epoch,
+            EpochKeys { superseded_at: None, own_leaf, own, counter: 0, deadline: None, expires_ms: None, receivers },
+        );
         let devices: HashSet<String> =
             members.iter().filter(|m| m.leaf != own_leaf).map(|m| m.device.clone()).collect();
         self.last_authenticated.retain(|device, _| devices.contains(device));
@@ -698,7 +741,7 @@ impl SframeState {
     }
 
     /// One Opus packet in, one SFrame ciphertext out, or `None` to drop it.
-    pub fn encrypt(&mut self, plaintext: &[u8], now: Instant) -> Option<Vec<u8>> {
+    pub fn encrypt(&mut self, plaintext: &[u8], now: Instant, wall_ms: u64) -> Option<Vec<u8>> {
         if self.ended.is_some() {
             return None;
         }
@@ -716,7 +759,7 @@ impl SframeState {
             self.counters.unexpected_duration += 1;
         }
         let keys = self.epochs.get_mut(&epoch)?;
-        if keys.deadline.is_some_and(|deadline| now >= deadline) {
+        if keys.deadline.is_some_and(|deadline| now >= deadline) || keys.expires_ms.is_some_and(|e| wall_ms >= e) {
             self.close_sending(StatusReason::KeyExpired);
             return None;
         }
