@@ -206,7 +206,8 @@ describe("staying on the server without voice", () => {
     await vi.advanceTimersByTimeAsync(10);
     expect(engine.start).toHaveBeenCalledTimes(1);
     const params = (engine.start.mock.calls[0] as unknown as [{ offer(sdp: string,run:number): Promise<string> }])[0];
-    await params.offer("v=0\r\na=ssrc:123 cname:mic\r\n", 1);
+    // A native offer: the receive section announces its own SSRC; only the microphone's is sent.
+    await params.offer("v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=sendonly\r\na=ssrc:123 cname:mic\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=recvonly\r\na=ssrc:456 cname:slot\r\n", 1);
     expect(link.sent("voice.offer")[0]?.d).toMatchObject({channel:2,ssrc:123,run:1,group:null,call:"AAAAAAAAAAAAAAAAAAAAAA",participation:"AQEBAQEBAQEBAQEBAQEBAQ"});
   });
 
