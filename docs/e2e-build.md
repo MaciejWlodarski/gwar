@@ -2303,11 +2303,18 @@ gwar managers v1
     head is current only if every link after that head names its hash.
   - A former owner can therefore never sign an anchor that a reader of the
     newer chain accepts as current, whatever its `anchor_seq`.
-- **Validity of a list:**
+- **Validity of a list** (as history):
   - the anchor it names is valid;
-  - its signer is the owner or a confirmer on that anchor;
+  - its signer is a confirmer on that anchor, or an owner of the anchor's
+    span: the owner at its `owner_head`, or at any later link while every
+    link up to it names the anchor's hash;
   - the credential is well-formed with uid `signer_uid`, and the signature
     verifies.
+- **A list may be accepted as current** only when, in addition, its anchor
+  is current and its signer is the **current owner** (at the reader's pinned
+  head) or a confirmer on that anchor. A new owner therefore renews an
+  inherited anchor's list, and a former owner's list signed after the move
+  is history at most.
 
   Every list is self-contained with its anchor, so a reader that missed any
   number of updates verifies the newest pair without history.
@@ -2347,8 +2354,12 @@ gwar managers v1
   device is current, newcomers cannot join encrypted private channels (6c)
   until one is.
 - **Protocol:**
-  - `managers.update {anchor, list}`: the server checks validity, seqs and
-    authority against its newest pair, stores it and broadcasts
+  - `managers.update {anchor, list}`: the server checks validity, seqs,
+    that the anchor and list are current under **its current owner head**
+    (as a reader would accept them), and the signer's current authority, in
+    the same transaction that stores the pair; `owner.transfer` and
+    `managers.update` are serialized, so neither order installs a pair
+    readers of the new chain would refuse. It then broadcasts
     `managers.updated`.
   - The server keeps the newest anchor and list of the current generation.
 
@@ -2561,7 +2572,13 @@ gwar managers v1
     replaced by Y, or a first anchor published, between signing and
     submission) answers `conflict`;
   - history after anchor rotation followed by a transfer (X → Y → transfer
-    naming Y) still verifies commits signed under X;
+    naming Y) still verifies commits and owner-signed lists under X;
+  - the new owner renews an inherited anchor's list; the former owner's list
+    after the move is refused as current, by readers and by
+    `managers.update`;
+  - `managers.update` racing `owner.transfer` in both orders (validated
+    before the transfer, stored after it) never installs a pair that is not
+    current under the new head;
   - a fresh reader and one that missed many updates verifying the newest
     pair;
   - currency and renewal through another confirmer after the signer's
