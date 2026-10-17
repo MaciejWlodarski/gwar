@@ -189,3 +189,43 @@ async fn a_transfer_hands_over_only_the_current_anchor_and_a_former_owner_mints_
     assert_eq!(root.fails("managers.update", update(&x, &list(&c, &x, 2, &[], &root))).await, "bad_request");
     alice.ok("managers.update", update(&x, &list(&c, &x, 2, &[], &alice))).await;
 }
+
+#[tokio::test]
+async fn a_transfer_to_a_listed_manager_survives_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (database, data_dir) = (dir.path().join("vc.sqlite3"), dir.path().to_path_buf());
+    let config = || vc_server::Config {
+        database: Some(database.clone()),
+        data_dir: Some(data_dir.clone()),
+        ..common::base_config()
+    };
+    let mut running = vc_server::start(config()).await.unwrap();
+    let admin_token = running.admin_token.take().unwrap();
+    let server = TestServer { running, admin_token };
+    let mut root = admin(&server, "root").await;
+    let dave = Client::connect(&server, "dave").await;
+    let c = chain(&mut root).await;
+    let x = anchor(&c, &root, 1, &[]);
+    root.ok("managers.update", update(&x, &list(&c, &x, 1, &[&dave.welcome.uid], &root))).await;
+    root.ok("owner.transfer", transfer(&link(&c, &root, &dave.welcome.uid, Some(&x)))).await;
+    let uid = dave.welcome.uid.clone();
+    root.close().await;
+    dave.close().await;
+    drop(server);
+    // The stored chain and pair still verify: the server starts, with Dave as the owner.
+    let server = TestServer { running: vc_server::start(config()).await.unwrap(), admin_token: String::new() };
+    let fresh = Client::connect(&server, "fresh").await;
+    assert_eq!(fresh.welcome.owner.unwrap().uid, uid);
+    assert!(fresh.welcome.managers.unwrap().list.is_some());
+}
+
+#[tokio::test]
+async fn a_newcomer_given_channel_edit_by_default_is_reported_pending() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    // The default Member role may edit channels.
+    root.ok("group.update", json!({"group": 2, "permissions": ["channel_edit"]})).await;
+    let newcomer = Client::connect(&server, "newcomer").await;
+    let uid = newcomer.welcome.uid.clone();
+    root.next_event_where("managers.updated", |m| m["pending"].as_array().unwrap().contains(&json!(uid))).await;
+}

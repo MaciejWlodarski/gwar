@@ -987,6 +987,8 @@ impl Core {
         if !r.password_ok && invited.is_none() && known.is_none() {
             return fail(ErrorCode::WrongPassword, "wrong server password or invalid invite");
         }
+        // Joining can add roles (an invite's, or the default one): who holds `channel_edit` may change.
+        let managers_before = self.managers_view();
         let user = match self.store.touch_user(&r.uid, &r.public_key, &nickname, now_ms()) {
             Ok(user) => user,
             Err(e) => {
@@ -1080,7 +1082,6 @@ impl Core {
             }
             self.reconcile_admissions(before);
         }
-        let invited_editor = invited_to && self.owner.is_some();
         self.sessions.insert(id, session);
         let welcome = Welcome {
             session: id,
@@ -1103,10 +1104,7 @@ impl Core {
         self.publish_routing();
         let device = self.sessions[&id].hello_key.clone();
         self.history_session_joined(&device);
-        // An invite's role may have made them a holder of `channel_edit`.
-        if invited_editor && let Some(view) = self.managers_view() {
-            self.broadcast(Event::ManagersUpdated(view), |_| true);
-        }
+        self.reconcile_managers(managers_before);
         Some(id)
     }
 
