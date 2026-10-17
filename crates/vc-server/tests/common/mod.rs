@@ -17,12 +17,17 @@ use vc_proto::{
 use vc_server::{Config, Running};
 
 /// Upper bound for any single wait so a broken test fails instead of hanging.
-pub const TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a test waits for one frame or reply; `VC_TEST_FRAME_TIMEOUT_SECS` lengthens it for
+/// heavy tests on slow machines (CI's eight-sender run).
+pub fn frame_timeout() -> Duration {
+    let secs = std::env::var("VC_TEST_FRAME_TIMEOUT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    Duration::from_secs(secs)
+}
 
 pub type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 pub async fn within<T>(what: &str, fut: impl Future<Output = T>) -> T {
-    match timeout(TIMEOUT, fut).await {
+    match timeout(frame_timeout(), fut).await {
         Ok(v) => v,
         Err(_) => panic!("timed out waiting for {what}"),
     }
