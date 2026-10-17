@@ -777,7 +777,9 @@ impl Core {
             return true;
         }
         let Some((uid, groups)) = member else { return false };
+        // The server's owner is admitted whatever their roles (6b).
         groups.contains(&ADMIN_GROUP)
+            || self.owner.as_ref().is_some_and(|o| o.chain.owner() == uid)
             || row
                 .access
                 .as_ref()

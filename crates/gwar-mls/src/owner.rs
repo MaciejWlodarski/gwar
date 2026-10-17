@@ -515,6 +515,8 @@ impl SignedList {
 
     /// Signs with the signer's device key, which must be the credential's.
     pub fn sign(list: ManagerList, signer: Credential, device: &SigningKey) -> Self {
+        // Only a well-formed credential with a valid certificate signs, as `parse` would accept it.
+        assert_eq!(Credential::parse(signer.encode().as_bytes()).as_ref(), Some(&signer), "a verified credential");
         assert_eq!(signer.device_key(), b64(device.verifying_key().as_bytes()));
         assert_eq!(signer.uid(), list.signer_uid);
         let signature = b64(&device.sign(list.statement().as_bytes()).to_bytes());

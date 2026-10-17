@@ -229,3 +229,18 @@ async fn a_newcomer_given_channel_edit_by_default_is_reported_pending() {
     let uid = newcomer.welcome.uid.clone();
     root.next_event_where("managers.updated", |m| m["pending"].as_array().unwrap().contains(&json!(uid))).await;
 }
+
+#[tokio::test]
+async fn the_owner_is_admitted_to_private_channels_whatever_their_roles() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let mut other = Client::connect(&server, "other").await;
+    root.ok("member.groups", json!({"uid": other.welcome.uid, "groups": [1, 2]})).await;
+    let private = channel_id(&other.create_channel(json!({"name": "p", "private": true})).await);
+    // Another Admin takes the owner's Admin role away: the owner still sees the channel.
+    other.ok("member.groups", json!({"uid": root.welcome.uid, "groups": [2]})).await;
+    let late = Client::connect_as(&server, new_key(), "probe", None).await.unwrap();
+    assert!(late.welcome.channels.iter().all(|c| c.id != private), "others do not");
+    root.ok("channel.join", json!({"channel": private})).await;
+    assert!(root.drain_events("channel.hidden").await.is_empty());
+}

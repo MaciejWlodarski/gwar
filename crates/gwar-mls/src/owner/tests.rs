@@ -276,3 +276,25 @@ fn chain_pages_are_bounded() {
     assert_eq!((page.len(), more, page[0].link.seq), (6, false, 65));
     assert!(chain.page(70).0.is_empty());
 }
+
+#[test]
+#[should_panic(expected = "a verified credential")]
+fn a_forged_certificate_cannot_sign_a_list() {
+    let chain = OwnerChain::new(genesis(1));
+    let x = anchor(1, &chain.head(), 1, &[]);
+    // The owner's account key with an attacker's device, the certificate not signed by the account.
+    let mut forged = certified(&key(1), &key(66), NOW - 1);
+    if let Credential::Account(c) = &mut forged {
+        c.signature = b64(&key(66).sign(b"not the certificate").to_bytes());
+    }
+    let l = ManagerList {
+        server_key: server(),
+        generation: 1,
+        anchor_hash: x.hash(),
+        seq: 1,
+        managers: vec![],
+        signer_uid: uid(1),
+        signed_at: NOW,
+    };
+    SignedList::sign(l, forged, &key(66));
+}
