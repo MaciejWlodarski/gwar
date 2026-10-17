@@ -2225,9 +2225,12 @@ Three pull requests, in this order:
   - `Welcome.owner = {uid, generation, seq, head}` or `null`.
   - `owner.chain {generation, after}` returns the genesis and the links after
     `after`, at most 64 per page with `next`.
-  - `owner.transfer {statement, signature}` checks the link, appends it and
-    gives the new owner the Admin group (the old owner keeps their roles). It
-    broadcasts `owner.updated`.
+  - `owner.transfer {statement, signature}` checks the link and, in one
+    transaction, that its previous link hash is the current head **and** its
+    `anchor_hash` is the hash of the server's current anchor (`-` only while
+    there is none); otherwise it answers `conflict` and the owner's client
+    re-signs. It then appends the link and gives the new owner the Admin
+    group (the old owner keeps their roles), and broadcasts `owner.updated`.
 - **Client pins**, per server key: `(generation, seq, head)` and the owner
   uid.
   - **With a pin:** on connect, the client fetches the chain of its
@@ -2283,19 +2286,23 @@ gwar managers v1
 - **Bounds:** at most 32 confirmers and 100 managers, never including the
   owner, and a manager is never also a confirmer. An encoded anchor plus list
   is at most 16 KiB.
-- **Validity of an anchor:**
-  - `uid_for_key(key)` is the owner at `owner_head` (the genesis owner, or
-    the `new_owner_uid` of that link), and the signature verifies;
-  - **a new anchor** is accepted only when `owner_head` is the head of the
-    reader's pinned chain (after fetching any extension of the pin): only
-    the current owner mints anchors;
-  - **an inherited anchor** survives ownership moves only by hash: the
-    owner link gains a line `{anchor_hash}` (the hash of the anchor in force
-    when the link was signed, or `-`), so the previous owner hands over that
-    exact anchor and nothing newer. An anchor naming an earlier head is
-    valid only if every link after that head names its hash.
+- **An anchor is valid** (as history) when `owner_head` is a link of the
+  reader's pinned chain of that generation, `uid_for_key(key)` is the owner
+  at that link (the genesis owner, or the `new_owner_uid` of that link), and
+  the signature verifies. Superseded anchors stay valid in this sense, so
+  past commits and lists still verify after anchors rotate and ownership
+  moves.
+- **An anchor is current** (may be accepted at a checkpoint and confer
+  authority) when it is valid and also:
+  - **new:** `owner_head` is the head of the reader's pinned chain (after
+    fetching any extension of the pin): only the current owner mints
+    anchors; or
+  - **inherited:** ownership moves hand over one anchor by hash. The owner
+    link has a line `{anchor_hash}` (the server's anchor when the link is
+    accepted, see `owner.transfer`, or `-`). An anchor naming an earlier
+    head is current only if every link after that head names its hash.
   - A former owner can therefore never sign an anchor that a reader of the
-    newer chain accepts, whatever its `anchor_seq`.
+    newer chain accepts as current, whatever its `anchor_seq`.
 - **Validity of a list:**
   - the anchor it names is valid;
   - its signer is the owner or a confirmer on that anchor;
@@ -2309,7 +2316,7 @@ gwar managers v1
   - Authority comes only from the newest accepted list, and only while it is
     current.
   - A reader accepts a newer list only if it is current when the reader first
-    sees it.
+    sees it and its anchor is current (above).
 - **Checkpoints**, per server key and generation:
   - `(anchor_seq, hash)` and `(seq, hash)`;
   - a lower seq is rejected, and the same seq is accepted only with the same
@@ -2388,7 +2395,8 @@ gwar managers v1
   the agent copies the others.
   - **Validation as history** (the agent and the observer, for every commit,
     including replay):
-    - the new extension parses, and every signature verifies;
+    - the new extension parses, and every signature verifies (its anchor
+      valid as history; it need not be current);
     - the anchor's and the list's seqs are at least the previous ones', and
       the member list's seq is greater, or equal with the same bytes;
     - the member list's signer is authorized by the new manager list;
@@ -2464,15 +2472,21 @@ gwar managers v1
   - Member-list checkpoints are per group: the successor's do not compare
     with the predecessor's. The incarnation pins (section 4, "Restarts")
     prevent rollback to an earlier group.
-  - **Intermediate incarnations are history.** A client catching up along
-    the chain checks each successor's creator against the manager pair in
-    that successor's own initial `0xff01` (valid, signed by a certificate
-    that covered the creation time, its seqs not below the predecessor's),
-    as "Validation as history" does; it does not check it against its
-    current checkpoint, so a manager removed later does not break the
-    chain. Such pairs never lower or replace a checkpoint.
-  - **The live incarnation** is then subject to current authority (a)–(d)
-    like any private group.
+  - **Only the final successor carries authority.** Catching up along the
+    chain checks intermediate incarnations exactly as section 4 does
+    (descriptors, signatures, certified creators), with no manager check:
+    their creators may have lost authority since, and nothing about them is
+    used. The chain is fixed by the signed `previous_group_id` links, so a
+    fabricated intermediate is reachable only from a final successor that
+    names it.
+  - **Staged adoption.** For a private conversation `accept_chain` verifies
+    the chain but changes nothing until the final successor passes: its
+    current GroupInfo satisfies (a)–(c) as of now, and its creator is the
+    owner, a confirmer or a manager on the reader's current pair. Only then
+    are the pins, the live incarnation and the superseding written, in one
+    write. Otherwise the predecessor's state, outbox and pins stay as they
+    were, and the client shows "Waiting for a channel manager to confirm
+    access" and retries as a newcomer does.
 - **Voice.**
   - A private channel's voice group binds to its parent as in 5a. The agent
     no longer refuses a private parent.
@@ -2541,7 +2555,13 @@ gwar managers v1
     genesis and right after a transfer from the proof objects alone;
   - a former owner's anchor with a higher `anchor_seq`, signed after the
     transfer and after the reader accepted the new owner's anchor, is
-    rejected, and an anchor handed over by hash in the link is accepted;
+    rejected as current, and an anchor handed over by hash in the link is
+    accepted;
+  - a transfer whose `anchor_hash` is no longer the server's anchor (X
+    replaced by Y, or a first anchor published, between signing and
+    submission) answers `conflict`;
+  - history after anchor rotation followed by a transfer (X → Y → transfer
+    naming Y) still verifies commits signed under X;
   - a fresh reader and one that missed many updates verifying the newest
     pair;
   - currency and renewal through another confirmer after the signer's
@@ -2561,6 +2581,8 @@ gwar managers v1
   - a newcomer refused with non-current lists;
   - restart authority, with the successor's seq 1 accepted, and catch-up
     G0 → G1 (created by a manager removed later) → G2 (by the owner);
+  - a removed manager's backdated successor rejected with the predecessor's
+    state, outbox and pins unchanged;
   - a hidden-then-shown channel cannot roll back its member list;
   - extension size limits at 1000 members and 100 managers;
   - voice under a private parent, and access removal cutting voice;
