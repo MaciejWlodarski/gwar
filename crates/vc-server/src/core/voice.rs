@@ -1010,6 +1010,8 @@ mod tests {
                 max_clients: None,
                 encrypted: true,
                 history: true,
+                private: false,
+                access: None,
             })
             .unwrap();
         core.channels = core.store.channels().unwrap().into_iter().map(|c| (c.id, c)).collect();
@@ -1660,6 +1662,8 @@ mod tests {
                     max_clients: None,
                     encrypted: false,
                     history: false,
+                    private: false,
+                    access: None,
                 },
                 None,
             )

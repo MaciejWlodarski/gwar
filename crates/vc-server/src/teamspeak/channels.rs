@@ -177,6 +177,8 @@ mod tests {
             max_clients: None,
             encrypted: false,
             history: false,
+            private: false,
+            access: None,
         }
     }
 

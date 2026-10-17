@@ -7,6 +7,7 @@ import type { Ban } from "../proto/Ban";
 import type { BanNotice } from "../proto/BanNotice";
 import type { Challenge } from "../proto/Challenge";
 import type { Channel } from "../proto/Channel";
+import type { ChannelAccess } from "../proto/ChannelAccess";
 import type { SealedMessage } from "../proto/SealedMessage";
 import type { ConversationUnread } from "../proto/ConversationUnread";
 import type { ChatMessage } from "../proto/ChatMessage";
@@ -72,7 +73,8 @@ const voiceStateShape = shape<import("../proto/VoiceState").VoiceState>({ channe
 const voiceState: Rule<import("../proto/VoiceState").VoiceState> = (v): v is import("../proto/VoiceState").VoiceState => voiceStateShape(v) && (v.encrypted ? v.channel_group !== null && ((v.group === null) === (v.epoch === null)) : v.channel_group === null && v.group === null && v.epoch === null);
 const challenge = shape<Challenge>({ protocol: int(255), server_pk: fixed(32), server_nonce: fixed(32), server, password_required: bool });
 const serverProof = shape<ServerProof>({ server_proof: fixed(64) });
-const channel = shape<Channel>({ id, parent: nullable(id), name: str(256), topic: text, position: int(2147483647, -2147483648), has_password: bool, max_clients: nullable(int(65535)), encrypted: bool, history: bool });
+const channelAccess = shape<ChannelAccess>({ roles: array(id, 64), users: array(uid, 1000) });
+const channel = shape<Channel>({ id, parent: nullable(id), name: str(256), topic: text, position: int(2147483647, -2147483648), has_password: bool, max_clients: nullable(int(65535)), encrypted: bool, history: bool, private: bool, access: optional(nullable(channelAccess)) });
 const client = shape<Client>({ id, uid, nickname: str(256), channel: nullable(id), groups: ids, platform, muted: bool, deafened: bool, away: nullable(text), talking: bool, voice: bool, voice_binding: nullable(voiceBinding) });
 const color: Rule<string> = (v): v is string => typeof v === "string" && /^#[0-9a-f]{6}$/i.test(v);
 const group = shape<Group>({ id, name: str(256), permissions: array(permissions, 32), color: optional(nullable(color)) });

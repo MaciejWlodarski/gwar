@@ -40,7 +40,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use vc_proto::{
-    Channel, ChannelCreate, ChannelId, ChannelUpdate, ChatMessage, ChatTarget, Client, ClientUpdate, DeviceCertificate,
+    Channel, ChannelAccess, ChannelCreate, ChannelId, ChannelUpdate, ChatMessage, ChatTarget, Client, ClientUpdate, DeviceCertificate,
     ErrorBody, ErrorCode, Event, FileAccess, Group, GroupId, IceServer, LeaveReason, MessageId, MessageSignature,
     NICKNAME_MAX_LEN, Permission, Platform, Request, Response, ServerFrame, ServerInfo, SessionId, Uid, Unread,
     Welcome,
@@ -701,13 +701,128 @@ impl Core {
                     | Event::ChatRead { target: vc_proto::ChatReadTarget::Conversation { .. }, .. }
             )
         {
-            self.notify_bridge(|| BridgeNote::Event(Box::new(event.clone())));
+            // The bridge is never admitted to a private channel.
+            match self.event_view(&event, None) {
+                EventView::Same => self.notify_bridge(|| BridgeNote::Event(Box::new(event.clone()))),
+                EventView::Masked(masked) => self.notify_bridge(|| BridgeNote::Event(Box::new(masked))),
+                EventView::Hidden => {}
+            }
         }
-        let frame = encode(&ServerFrame::Event(event));
+        let frame = encode(&ServerFrame::Event(event.clone()));
+        let mut masked_frame = None;
         let targets: Vec<_> = self.sessions.values().filter(|s| filter(s)).map(|s| s.id).collect();
         for id in targets {
-            self.push(id, frame.clone());
+            match self.event_view(&event, Some(&self.sessions[&id])) {
+                EventView::Same => self.push(id, frame.clone()),
+                EventView::Masked(masked) => {
+                    let masked = masked_frame.get_or_insert_with(|| encode(&ServerFrame::Event(masked))).clone();
+                    self.push(id, masked);
+                }
+                EventView::Hidden => {}
+            }
         }
+    }
+
+    /// What `viewer` (the TeamSpeak bridge when `None`) may learn from `event`
+    /// (docs/e2e-build.md, section 6): nothing about a private channel it is not
+    /// admitted to, and a client inside one only as "on the server, not in voice".
+    fn event_view(&self, event: &Event, viewer: Option<&Session>) -> EventView {
+        let hidden = |channel: ChannelId| !self.admitted(viewer, channel);
+        match event {
+            Event::ChannelCreated(c) | Event::ChannelUpdated(c) if hidden(c.id) => EventView::Hidden,
+            Event::ChannelDeleted { channel } if hidden(*channel) => EventView::Hidden,
+            Event::ChatMessage(m) | Event::ChatEdited(m)
+                if matches!(m.target, ChatTarget::Channel(c) if hidden(c)) =>
+            {
+                EventView::Hidden
+            }
+            Event::ChatDeleted { channel, .. } if hidden(*channel) => EventView::Hidden,
+            Event::ChatRead { target: vc_proto::ChatReadTarget::Channel { channel }, .. } if hidden(*channel) => {
+                EventView::Hidden
+            }
+            Event::VoiceTalking { client, .. }
+                if self.sessions.get(client).and_then(|s| s.channel).is_some_and(hidden) =>
+            {
+                EventView::Hidden
+            }
+            Event::ClientJoined(c) | Event::ClientUpdated(c) if c.channel.is_some_and(hidden) => {
+                let masked = masked_client(c.clone());
+                EventView::Masked(if matches!(event, Event::ClientJoined(_)) {
+                    Event::ClientJoined(masked)
+                } else {
+                    Event::ClientUpdated(masked)
+                })
+            }
+            _ => EventView::Same,
+        }
+    }
+
+    /// Whether `viewer` may see `channel`: every public channel; a private one for
+    /// admins, its roles and its users. The bridge (`None`) sees no private channel.
+    fn admitted(&self, viewer: Option<&Session>, channel: ChannelId) -> bool {
+        let Some(row) = self.channels.get(&channel) else { return true };
+        if !row.private {
+            return true;
+        }
+        // TeamSpeak users (sessions without our transport) are never admitted.
+        let Some(s) = viewer.filter(|s| s.out.is_some()) else { return false };
+        if s.groups.contains(&ADMIN_GROUP) {
+            return true;
+        }
+        row.access.as_ref().is_some_and(|a| a.users.contains(&s.uid) || a.roles.iter().any(|r| s.groups.contains(r)))
+    }
+
+    /// `viewer`'s copy of a channel, or `None` when it is hidden from them.
+    fn channel_for(&self, row: &ChannelRow, viewer: Option<&Session>) -> Option<Channel> {
+        self.admitted(viewer, row.id).then(|| channel_view(row))
+    }
+
+    /// `viewer`'s copy of a client: one inside a hidden channel is on the server, not in voice.
+    fn client_for(&self, target: &Session, viewer: Option<&Session>) -> Client {
+        let client = client_view(target);
+        if client.channel.is_some_and(|c| !self.admitted(viewer, c)) { masked_client(client) } else { client }
+    }
+
+    /// Every (session, private channel) admission, to diff around a change.
+    fn admissions(&self) -> std::collections::HashSet<(SessionId, ChannelId)> {
+        let private: Vec<_> = self.channels.values().filter(|c| c.private).map(|c| c.id).collect();
+        self.sessions
+            .values()
+            .flat_map(|s| private.iter().filter(|&&c| self.admitted(Some(s), c)).map(move |&c| (s.id, c)))
+            .collect()
+    }
+
+    /// Applies admission changes since `before`: a session that lost a private
+    /// channel leaves it and sees it deleted (with its occupants masked); one
+    /// that gained it sees it created (with its occupants).
+    fn reconcile_admissions(&mut self, before: std::collections::HashSet<(SessionId, ChannelId)>) {
+        let after = self.admissions();
+        let lost: Vec<_> = before.difference(&after).copied().filter(|(s, _)| self.sessions.contains_key(s)).collect();
+        let gained: Vec<_> = after.difference(&before).copied().collect();
+        for (session, channel) in lost {
+            if self.sessions[&session].channel == Some(channel) {
+                let _ = self.channel_leave(session);
+            }
+            let inside: Vec<_> =
+                self.sessions.values().filter(|s| s.channel == Some(channel)).map(|s| masked_client(client_view(s))).collect();
+            self.send_event(session, Event::ChannelDeleted { channel });
+            for client in inside {
+                self.send_event(session, Event::ClientUpdated(client));
+            }
+        }
+        for (session, channel) in gained {
+            let Some(view) = self.channels.get(&channel).map(channel_view) else { continue };
+            let inside: Vec<_> =
+                self.sessions.values().filter(|s| s.channel == Some(channel)).map(client_view).collect();
+            self.send_event(session, Event::ChannelCreated(view));
+            for client in inside {
+                self.send_event(session, Event::ClientUpdated(client));
+            }
+        }
+    }
+
+    fn send_event(&mut self, session: SessionId, event: Event) {
+        self.push(session, encode(&ServerFrame::Event(event)));
     }
 
     fn notify_bridge(&mut self, note: impl FnOnce() -> BridgeNote) {
@@ -931,8 +1046,8 @@ impl Core {
             server: self.info.clone(),
             permissions,
             groups: self.groups.values().cloned().collect(),
-            channels: self.channels.values().map(channel_view).collect(),
-            clients: self.sessions.values().map(client_view).collect(),
+            channels: self.channels.values().filter_map(|c| self.channel_for(c, Some(&self.sessions[&id]))).collect(),
+            clients: self.sessions.values().map(|s| self.client_for(s, Some(&self.sessions[&id]))).collect(),
             members,
             unread,
             conversations,
@@ -1111,8 +1226,8 @@ impl Core {
                 }
                 let _ = bridge.send(BridgeNote::Snapshot {
                     server: self.info.clone(),
-                    channels: self.channels.values().map(channel_view).collect(),
-                    clients: self.sessions.values().map(client_view).collect(),
+                    channels: self.channels.values().filter_map(|c| self.channel_for(c, None)).collect(),
+                    clients: self.sessions.values().map(|s| self.client_for(s, None)).collect(),
                 });
                 self.bridge = Some(bridge);
             }
@@ -1250,6 +1365,10 @@ impl Core {
     // -------------------------------------------------------------- requests
 
     fn request(&mut self, session: SessionId, id: u32, request: Request) -> Option<Reply> {
+        // A channel that is hidden from this session does not exist for it.
+        if named_channels(&request).into_iter().any(|c| !self.admitted(Some(&self.sessions[&session]), c)) {
+            return Some(Err(err(ErrorCode::NotFound, "no such channel")));
+        }
         let result = match request {
             Request::Hello(_) | Request::Join(_) => Err(err(ErrorCode::BadRequest, "already authenticated")),
             Request::Mls(request) => self.mls_request(session, request),
@@ -1367,6 +1486,9 @@ impl Core {
         if target.out.is_none() && self.is_encrypted(channel) {
             return Err(err(ErrorCode::BadRequest, "TeamSpeak users cannot join encrypted channels"));
         }
+        if !self.admitted(Some(target), channel) {
+            return Err(err(ErrorCode::BadRequest, "this client cannot see that channel"));
+        }
         self.move_client(client, Some(channel))?;
         Ok(Response::Empty {})
     }
@@ -1390,7 +1512,8 @@ impl Core {
 
     /// Enters `channel` unless it is full; the caller has already handled the password.
     fn enter_channel(&mut self, session: SessionId, channel: ChannelId) -> Reply {
-        let Some(row) = self.channels.get(&channel) else {
+        let Some(row) = self.channels.get(&channel).filter(|_| self.admitted(Some(&self.sessions[&session]), channel))
+        else {
             return Err(err(ErrorCode::NotFound, "no such channel"));
         };
         let admission = self.voice_admission(session, channel)?;
@@ -1424,6 +1547,9 @@ impl Core {
     /// everyone, password channels once entered (or with the permission).
     fn can_read(&self, s: &Session, channel: ChannelId) -> bool {
         let Some(row) = self.channels.get(&channel) else { return false };
+        if !self.admitted(Some(s), channel) {
+            return false;
+        }
         row.password_hash.is_none()
             || s.channel == Some(channel)
             || s.unlocked.contains(&channel)
@@ -1566,9 +1692,26 @@ impl Core {
             if encrypted && password.is_some() {
                 return Err(err(ErrorCode::BadRequest, "an encrypted channel has no password"));
             }
-            Ok((name, topic, password, encrypted))
+            if c.parent.is_some_and(|p| self.channels.get(&p).is_some_and(|p| p.private)) {
+                return Err(err(ErrorCode::BadRequest, "a private channel has no child channels"));
+            }
+            let access = if c.private {
+                if encrypted {
+                    return Err(err(ErrorCode::BadRequest, "encrypted private channels are not available yet"));
+                }
+                if password.is_some() {
+                    return Err(err(ErrorCode::BadRequest, "a private channel has no password"));
+                }
+                let uid = self.sessions[&session].uid.clone();
+                Some(self.checked_access(c.access.clone().unwrap_or(ChannelAccess { roles: vec![], users: vec![uid] }))?)
+            } else if c.access.is_some() {
+                return Err(err(ErrorCode::BadRequest, "only a private channel has access"));
+            } else {
+                None
+            };
+            Ok((name, topic, password, encrypted, access))
         })();
-        let (name, topic, password, encrypted) = match checked {
+        let (name, topic, password, encrypted, access) = match checked {
             Ok(v) => v,
             Err(e) => return Some(Err(e)),
         };
@@ -1582,6 +1725,8 @@ impl Core {
             max_clients: c.max_clients,
             encrypted,
             history: encrypted && c.history.unwrap_or(true),
+            private: c.private,
+            access,
         };
         let teamspeak = self.is_teamspeak(session);
         let plaintext = self.bridge.is_some().then(|| password.clone()).flatten();
@@ -1603,6 +1748,9 @@ impl Core {
         if parent.is_some_and(|p| !self.channels.contains_key(&p)) {
             return Err(err(ErrorCode::NotFound, "no such parent channel"));
         }
+        if parent.is_some_and(|p| self.channels[&p].private) {
+            return Err(err(ErrorCode::BadRequest, "a private channel has no child channels"));
+        }
         if self.sibling_name_taken(parent, &row.name, None) {
             return Err(err(ErrorCode::Conflict, "a channel with this name already exists here"));
         }
@@ -1610,8 +1758,11 @@ impl Core {
         row.id = self.store.create_channel(&row).map_err(storage_error)?;
         let id = row.id;
         let view = channel_view(&row);
+        let private = row.private;
         self.channels.insert(id, row);
-        self.notify_bridge(|| BridgeNote::Channel { channel: view.clone(), created: true, password: Some(plaintext) });
+        if !private {
+            self.notify_bridge(|| BridgeNote::Channel { channel: view.clone(), created: true, password: Some(plaintext) });
+        }
         self.broadcast_channel(Event::ChannelCreated(view.clone()));
         Ok(Response::Channel(view))
     }
@@ -1656,7 +1807,16 @@ impl Core {
                 if self.is_descendant(parent, row.id) {
                     return Err(err(ErrorCode::BadRequest, "cannot move a channel into itself"));
                 }
+                if self.channels[&parent].private {
+                    return Err(err(ErrorCode::BadRequest, "a private channel has no child channels"));
+                }
                 row.parent = Some(parent);
+            }
+            if let Some(access) = &u.access {
+                if !row.private {
+                    return Err(err(ErrorCode::BadRequest, "only a private channel has access"));
+                }
+                row.access = Some(self.checked_access(access.clone())?);
             }
             match u.max_clients {
                 // 0 removes the limit.
@@ -1677,6 +1837,9 @@ impl Core {
                 check_password_len(p)?;
                 if row.encrypted && !p.is_empty() {
                     return Err(err(ErrorCode::BadRequest, "an encrypted channel has no password"));
+                }
+                if row.private && !p.is_empty() {
+                    return Err(err(ErrorCode::BadRequest, "a private channel has no password"));
                 }
             }
             Ok(row)
@@ -1715,7 +1878,7 @@ impl Core {
         let Some(current) = self.channels.get(&channel) else {
             return Err(err(ErrorCode::NotFound, "no such channel"));
         };
-        if row.parent.is_some_and(|p| !self.channels.contains_key(&p) || self.is_descendant(p, channel)) {
+        if row.parent.is_some_and(|p| !self.channels.contains_key(&p) || self.is_descendant(p, channel) || self.channels[&p].private) {
             return Err(err(ErrorCode::Conflict, "channel tree changed; try again"));
         }
         let new_password = matches!(password_hash, Some(Some(_)));
@@ -1728,9 +1891,14 @@ impl Core {
             }
         }
         let view = channel_view(&row);
+        let private = row.private;
+        let before = self.admissions();
         self.channels.insert(channel, row);
-        self.notify_bridge(|| BridgeNote::Channel { channel: view.clone(), created: false, password: plaintext });
+        if !private {
+            self.notify_bridge(|| BridgeNote::Channel { channel: view.clone(), created: false, password: plaintext });
+        }
         self.broadcast_channel(Event::ChannelUpdated(view.clone()));
+        self.reconcile_admissions(before);
         Ok(Response::Channel(view))
     }
 
@@ -1773,8 +1941,14 @@ impl Core {
             let _ = self.move_client(s, remote.then_some(fallback));
         }
         for c in doomed {
-            self.channels.remove(&c);
-            self.broadcast(Event::ChannelDeleted { channel: c }, |_| true);
+            // Only those who could see a private channel learn it is gone.
+            let audience: Vec<_> =
+                self.sessions.values().filter(|s| self.admitted(Some(s), c)).map(|s| s.id).collect();
+            let private = self.channels.remove(&c).is_some_and(|row| row.private);
+            let applying = self.applying_remote;
+            self.applying_remote = applying || private;
+            self.broadcast(Event::ChannelDeleted { channel: c }, |s| audience.contains(&s.id));
+            self.applying_remote = applying;
         }
         Ok(Response::Empty {})
     }
@@ -1932,12 +2106,14 @@ impl Core {
         self.store.add_user_group(user_id, group).map_err(storage_error)?;
         let groups = self.store.user_groups(user_id).map_err(storage_error)?;
         let affected: Vec<_> = self.sessions.values().filter(|s| s.user_id == user_id).map(|s| s.id).collect();
+        let before = self.admissions();
         for id in affected {
             if let Some(s) = self.sessions.get_mut(&id) {
                 s.groups = groups.clone();
             }
             self.client_updated(id);
         }
+        self.reconcile_admissions(before);
         Ok(Response::Groups { groups })
     }
 }
@@ -1951,6 +2127,59 @@ pub fn encode(frame: &ServerFrame) -> Arc<str> {
     serde_json::to_string(frame).expect("protocol types always serialize").into()
 }
 
+/// Validates a private channel's access: known roles, well-formed uids, bounds; sorted and deduplicated.
+impl Core {
+    fn checked_access(&self, mut access: ChannelAccess) -> Result<ChannelAccess, ErrorBody> {
+        access.roles.sort_unstable();
+        access.roles.dedup();
+        access.users.sort();
+        access.users.dedup();
+        if access.roles.len() > MAX_ACCESS_ROLES || access.users.len() > MAX_ACCESS_USERS {
+            return Err(err(ErrorCode::BadRequest, "a private channel lists at most 64 roles and 1000 users"));
+        }
+        if access.roles.iter().any(|r| !self.groups.contains_key(r)) {
+            return Err(err(ErrorCode::NotFound, "no such role"));
+        }
+        if access.users.iter().any(|u| vc_proto::decode_fixed::<20>(u).is_none()) {
+            return Err(err(ErrorCode::BadRequest, "malformed uid"));
+        }
+        Ok(access)
+    }
+}
+
+const MAX_ACCESS_ROLES: usize = 64;
+const MAX_ACCESS_USERS: usize = 1000;
+
+enum EventView {
+    Same,
+    Masked(Event),
+    Hidden,
+}
+
+/// On the server, not in voice: how a client inside a hidden channel appears.
+fn masked_client(mut client: Client) -> Client {
+    client.channel = None;
+    client.voice_binding = None;
+    client.talking = false;
+    client.voice = false;
+    client
+}
+
+/// The channels a request names, checked against admission before it runs.
+fn named_channels(request: &Request) -> Vec<ChannelId> {
+    match request {
+        Request::ClientMove { channel, .. }
+        | Request::ChannelJoin { channel, .. }
+        | Request::ChannelDelete { channel }
+        | Request::ChatHistory { channel, .. }
+        | Request::ChatRead { target: vc_proto::ChatReadTarget::Channel { channel }, .. }
+        | Request::ChatSend { target: ChatTarget::Channel(channel), .. } => vec![*channel],
+        Request::ChannelCreate(c) => c.parent.into_iter().collect(),
+        Request::ChannelUpdate(u) => [Some(u.channel), u.parent].into_iter().flatten().collect(),
+        _ => vec![],
+    }
+}
+
 fn channel_view(row: &ChannelRow) -> Channel {
     Channel {
         id: row.id,
@@ -1962,6 +2191,8 @@ fn channel_view(row: &ChannelRow) -> Channel {
         max_clients: row.max_clients,
         encrypted: row.encrypted,
         history: row.history,
+        private: row.private,
+        access: row.access.clone(),
     }
 }
 
@@ -2056,8 +2287,69 @@ pub(crate) mod expiry_tests {
                 max_clients: None,
                 encrypted: true,
                 history: true,
+                private: false,
+                access: None,
             })
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_bridge_never_learns_of_a_private_channel_or_who_is_inside() {
+        let store = Store::in_memory().unwrap();
+        store.seed_channels().unwrap();
+        let uid = crate::identity::uid_for_key(&[7; 32]);
+        let private = store
+            .create_channel(&ChannelRow {
+                id: 0,
+                parent: None,
+                name: "hidden".into(),
+                topic: String::new(),
+                position: 9,
+                password_hash: None,
+                max_clients: None,
+                encrypted: false,
+                history: false,
+                private: true,
+                access: Some(ChannelAccess { roles: vec![], users: vec![uid.clone()] }),
+            })
+            .unwrap();
+        let core = test_core_teamspeak(store).unwrap();
+        let (notes, mut bridge) = mpsc::unbounded_channel();
+        core.bridge(BridgeMsg::Attach(notes)).await;
+        let BridgeNote::Snapshot { channels, .. } = bridge.recv().await.unwrap() else { panic!("snapshot") };
+        assert!(channels.iter().all(|c| c.id != private), "not mirrored");
+        let (out, _frames) = mpsc::channel(OUTBOUND_QUEUE);
+        let session = core
+            .connect(ConnectRequest {
+                request_id: 1,
+                hello_key: String::new(),
+                certificate: None,
+                uid,
+                public_key: URL_SAFE_NO_PAD.encode([7; 32]),
+                nickname: "inside".into(),
+                platform: Platform::Web,
+                out,
+                ip: None,
+                device: None,
+                device_expires_at: None,
+                invite: None,
+                password_ok: true,
+            })
+            .await
+            .unwrap();
+        let entered = on_core(&core, move |core| core.enter_channel(session, private)).await;
+        assert!(entered.is_ok(), "{entered:?}");
+        // Whatever reached the bridge names no private channel; the client is outside voice.
+        on_core(&core, |_| ()).await;
+        while let Ok(note) = bridge.try_recv() {
+            let text = format!("{note:?}");
+            assert!(!text.contains("hidden"), "{text}");
+            if let BridgeNote::Event(event) = note
+                && let Event::ClientJoined(c) | Event::ClientUpdated(c) = *event
+            {
+                assert_eq!(c.channel, None, "masked for the bridge");
+            }
+        }
     }
 
     async fn bridged(core: &CoreHandle, session: SessionId) -> Option<(ChannelId, bool)> {

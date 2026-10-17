@@ -375,6 +375,8 @@ mod tests {
                 max_clients: None,
                 encrypted: true,
                 history: true,
+                private: false,
+                access: None,
             })
             .unwrap();
         let leaves: Vec<_> = leaves

@@ -18,6 +18,7 @@ const ch = (id: number, parent: number | null = null, position = 0, name = `c${i
   max_clients: null,
   encrypted: false,
   history: false,
+  private: false,
 });
 const cl = (id: number, channel: number | null = 1, extra: Partial<Client> = {}): Client => ({
   id,

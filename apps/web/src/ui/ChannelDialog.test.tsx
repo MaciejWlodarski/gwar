@@ -58,10 +58,22 @@ describe("creating a channel", () => {
     expect(mock.create.mock.calls[0]![0]).not.toHaveProperty("encrypted");
     expect(useSettings.getState().channelEncryption).toEqual({ "server-a": false });
   });
-  it("offers no encryption on TeamSpeak servers", async () => {
+  it("offers no encryption or private channels on TeamSpeak servers", async () => {
     useSession.setState({ kind: "teamspeak" });
     await open();
     expect(switchFor("End-to-end encrypted")).toBeUndefined();
+    expect(switchFor("Private")).toBeUndefined();
     expect(password()).not.toBeNull();
+  });
+  it("creates a private channel admitting the creator, without password or encryption", async () => {
+    useSession.setState({ me: { session: 1, uid: "me-uid" } as never, groups: {}, members: {} });
+    await open();
+    await act(async () => switchFor("Private")!.click());
+    expect(password()).toBeNull();
+    expect(switchFor("End-to-end encrypted")).toBeUndefined();
+    expect(document.body.textContent).toContain("Who can see this channel");
+    await create("hidden");
+    expect(mock.create).toHaveBeenCalledWith(expect.objectContaining({ name: "hidden", password: null, private: true, access: { roles: [], users: ["me-uid"] } }));
+    expect(mock.create.mock.calls[0]![0]).not.toHaveProperty("encrypted");
   });
 });

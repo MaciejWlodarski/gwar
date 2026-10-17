@@ -142,6 +142,10 @@ impl Core {
         };
         let ChatTarget::Channel(channel) = stored.target else { unreachable!("stored messages are channel messages") };
         let s = &self.sessions[&session];
+        // A message in a hidden channel does not exist for this session.
+        if !self.admitted(Some(s), channel) {
+            return Err(err(ErrorCode::NotFound, "no such message"));
+        }
         if stored.author_uid != s.uid {
             return Err(err(ErrorCode::Forbidden, "you can only edit your own messages"));
         }
@@ -201,6 +205,9 @@ impl Core {
         };
         let ChatTarget::Channel(channel) = stored.target else { unreachable!("stored messages are channel messages") };
         let s = &self.sessions[&session];
+        if !self.admitted(Some(s), channel) {
+            return Err(err(ErrorCode::NotFound, "no such message"));
+        }
         if !self.can_read(s, channel) || !self.has(session, Permission::MessageManage) {
             return Err(err(
                 ErrorCode::Forbidden,
