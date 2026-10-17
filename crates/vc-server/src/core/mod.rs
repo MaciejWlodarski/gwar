@@ -875,9 +875,12 @@ impl Core {
             .filter_map(|s| {
                 let channel = s.channel?;
                 let encrypted = self.is_encrypted(channel);
+                let private = self.channels.get(&channel).is_some_and(|c| c.private);
                 let binding = s.participation.as_ref()?.binding.clone();
-                let origin = Arc::new(AudioOrigin { channel, encrypted, session: s.id, binding });
-                Some((s.id, Member { channel, muted: s.muted, deafened: s.deafened, bridged: !encrypted, origin }))
+                let origin = Arc::new(AudioOrigin { channel, encrypted, private, session: s.id, binding });
+                // TeamSpeak never hears an encrypted or a private channel.
+                let bridged = origin.bridgeable();
+                Some((s.id, Member { channel, muted: s.muted, deafened: s.deafened, bridged, origin }))
             })
             .collect();
         self.routing.store(Arc::new(Routing { members }));
@@ -2457,6 +2460,10 @@ pub(crate) mod expiry_tests {
                 assert_eq!(c.channel, None, "masked for the bridge");
             }
         }
+        // Its audio is not routed toward TeamSpeak either.
+        assert_eq!(bridged(&core, session).await, Some((private, false)));
+        let origin = on_core(&core, move |core| core.routing.load().origin(session)).await.unwrap();
+        assert!(origin.private && !origin.bridgeable());
     }
 
     async fn bridged(core: &CoreHandle, session: SessionId) -> Option<(ChannelId, bool)> {

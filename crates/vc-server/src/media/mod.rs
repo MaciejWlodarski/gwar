@@ -26,8 +26,17 @@ use vc_proto::{ChannelId, SessionId, VoiceBinding};
 pub struct AudioOrigin {
     pub channel: ChannelId,
     pub encrypted: bool,
+    /// From a private channel, which TeamSpeak never sees (docs/e2e-build.md, section 6).
+    pub private: bool,
     pub session: SessionId,
     pub binding: VoiceBinding,
+}
+
+impl AudioOrigin {
+    /// Whether this audio may cross to TeamSpeak: plaintext, from a channel it sees.
+    pub fn bridgeable(&self) -> bool {
+        !self.encrypted && !self.private
+    }
 }
 
 /// One confirmed TeamSpeak route. Replacement invalidates queued packets before
@@ -55,7 +64,7 @@ impl AudioRoute {
         self.confirmed.store(cid == Some(self.cid), Ordering::Release);
     }
     pub fn permits(&self, origin: &AudioOrigin) -> bool {
-        !origin.encrypted
+        origin.bridgeable()
             && self.current.load(Ordering::Acquire)
             && self.confirmed.load(Ordering::Acquire)
             && self.origin.as_deref() == Some(origin)
@@ -262,8 +271,8 @@ impl Sinks {
     /// External sinks are plaintext boundaries, including targeted whispers.
     pub fn send(&self, routing: &Routing, session: SessionId, packet: &AudioPacket) {
         if !routing.accepts(packet)
-            || packet.origin.encrypted
-            || !routing.members.get(&session).is_some_and(|m| m.bridged && !m.origin.encrypted)
+            || !packet.origin.bridgeable()
+            || !routing.members.get(&session).is_some_and(|m| m.bridged && m.origin.bridgeable())
         {
             return;
         }
@@ -289,7 +298,7 @@ impl Sinks {
     }
 
     pub fn fan_out(&self, routing: &Routing, packet: &AudioPacket) {
-        if !routing.accepts(packet) || packet.origin.encrypted {
+        if !routing.accepts(packet) || !packet.origin.bridgeable() {
             return;
         }
         for to in routing.recipients(packet.from()) {
@@ -344,6 +353,7 @@ pub(crate) mod tests {
             origin: Arc::new(AudioOrigin {
                 channel,
                 encrypted,
+                private: false,
                 session,
                 binding: VoiceBinding {
                     call: format!("call-{channel}"),
@@ -367,6 +377,19 @@ pub(crate) mod tests {
             ingress: None,
             egress: None,
         }
+    }
+
+    #[test]
+    fn private_audio_never_crosses_to_teamspeak() {
+        let public = member(1, 10, false).origin;
+        let private = Arc::new(AudioOrigin { private: true, ..(*public).clone() });
+        // Even a route that a lagging snapshot bound to a private origin refuses it.
+        let route = AudioRoute::new(1, 5, Some(private.clone()));
+        route.confirm(Some(5));
+        assert!(!route.permits(&private));
+        let route = AudioRoute::new(2, 5, Some(public.clone()));
+        route.confirm(Some(5));
+        assert!(route.permits(&public));
     }
 
     #[test]

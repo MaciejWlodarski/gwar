@@ -807,6 +807,7 @@ impl<'a> Bridge<'a> {
         let Some(puppet) = &local.puppet else { return };
         local.route += 1;
         let origin = voice.then(|| self.shared.plane.routing.load().origin(session)).flatten();
+        let origin = origin.filter(|o| o.bridgeable() && Some(o.channel) == local.client.channel);
         let audio = AudioRoute::new(local.route, cid, origin);
         if !puppet.send(PuppetCmd::Move { cid, route: local.route, audio, voice }) {
             warn!(session, "puppet busy; reconnecting it in its new channel");
@@ -830,10 +831,15 @@ impl<'a> Bridge<'a> {
             identity,
             channel,
             route: local.route,
+            // Only audio from the channel this snapshot places the puppet for: a lagging snapshot
+            // never pairs a public destination with a current private (or other) origin.
             audio: AudioRoute::new(
                 local.route,
                 channel,
-                voice.then(|| self.shared.plane.routing.load().origin(session)).flatten(),
+                voice
+                    .then(|| self.shared.plane.routing.load().origin(session))
+                    .flatten()
+                    .filter(|o| o.bridgeable() && Some(o.channel) == c.channel),
             ),
             voice,
             muted: c.muted,
