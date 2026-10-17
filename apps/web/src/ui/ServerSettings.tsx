@@ -869,7 +869,7 @@ export function InvitesPanel() {
   }, []);
 
   const link = (code: string) =>
-    buildInviteLink({ webOrigin: webOrigin(), serverEndpoint: useSession.getState().endpoint!, serverKey: useSession.getState().serverKey!, code });
+    buildInviteLink({ webOrigin: webOrigin(), serverEndpoint: useSession.getState().endpoint!, serverKey: useSession.getState().serverKey!, code, owner: controller.ownerView()?.owner });
 
   const create = async (e?: FormEvent) => {
     e?.preventDefault();

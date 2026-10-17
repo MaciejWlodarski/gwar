@@ -105,6 +105,7 @@ export function ConnectScreen() {
         password,
         invite: kind === "vc" ? invite?.code : undefined,
         inviteServerKey: kind === "vc" ? invite?.serverKey : undefined,
+        inviteOwner: kind === "vc" ? invite?.owner : undefined,
         insecureLan: desktop && kind === "vc" && insecureLan,
         identity: pickIdentity ? (resolveIdentity(tsList, identity) ?? undefined) : undefined,
       },

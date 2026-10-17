@@ -7,6 +7,13 @@ describe("vc/4 invites", () => {
     expect(parseInviteLink(link)).toEqual({ code: "abc123", server: "wss://voice.example:8443/custom/ws", serverKey: key });
     expect(readInviteFromSearch(new URL(link).search)).toEqual({ target: parseInviteLink(link), rest: "" });
   });
+  it("carries the verified owner, and refuses a malformed one", () => {
+    const owner = "B".repeat(26) + "A";
+    const link = buildInviteLink({ webOrigin: "https://web.example.com", serverEndpoint: "wss://voice.example/ws", serverKey: key, code: "abc123", owner });
+    expect(parseInviteLink(link)?.owner).toBe(owner);
+    expect(readInviteFromSearch(new URL(link).search).rest).toBe("");
+    expect(readInviteFromSearch(`?invite=abc&server_key=${key}&owner=bad`).target).toBeNull();
+  });
   it("retains unrelated query parameters and strips invite secrets and the key", () => {
     expect(readInviteFromSearch(`?x=1&invite=abc&server_key=${key}`)).toEqual({ target: { code: "abc", serverKey: key }, rest: "?x=1" });
   });

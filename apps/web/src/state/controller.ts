@@ -87,6 +87,8 @@ export interface ConnectParams {
   /** Invite code from a link: admits without the server password. */
   invite?: string;
   inviteServerKey?: string;
+  /** The owner an invite link named: checked on first contact with its server. */
+  inviteOwner?: string;
   insecureLan?: boolean;
   /** TeamSpeak only: the uid of the identity to connect with (default: the default one). */
   identity?: string;
@@ -405,6 +407,7 @@ class Controller {
               revocations: messageStorage.currentRevocations, signal: abort.signal,
               onError: error => console.warn("Conversation synchronization:", error),
               onTakeover: () => void this.sessionMoved(conn),
+              inviteOwner: params.inviteOwner,
               // docs/e2e-build.md, section 6, 6b: a changed owner record is not this server any more.
               onOwnerChanged: () => {
                 if (this.conn !== conn) return;
