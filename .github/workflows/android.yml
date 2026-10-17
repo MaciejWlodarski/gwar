@@ -37,6 +37,8 @@ jobs:
           toolchain: stable
           targets: aarch64-linux-android, x86_64-linux-android
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Host libraries (the binding generator builds the core for the runner too)
+        run: sudo apt-get update && sudo apt-get install -y libopus-dev libasound2-dev pkg-config
       - name: Tools (cargo-ndk, Android platform 37, JDK 21 from the runner image)
         run: |
           cargo install cargo-ndk --locked
