@@ -498,13 +498,26 @@ impl Agent {
         for (server, record) in &servers {
             record.validate(server)?;
         }
+        let archive = stores
+            .groups
+            .get(archive::KEY)
+            .map(|v| {
+                archive::parse_record(
+                    v,
+                    match &credential {
+                        crate::Credential::Account(c) => Some(c.account_key.as_str()),
+                        crate::Credential::Local { .. } => None,
+                    },
+                )
+            })
+            .transpose()?;
         let agent = Self {
             signer,
             credential,
             provider,
             device,
             groups: records(&stores.groups, true)?,
-            archive: stores.groups.get(archive::KEY).map(|v| archive::parse_record(v)).transpose()?,
+            archive,
             servers,
             epochs: records(&stores.epochs, false)?,
             outbox: records(&stores.outbox, false)?,
@@ -634,6 +647,7 @@ impl Agent {
         }
         match f(self) {
             Ok(value) => {
+                self.settle_held();
                 self.ready = true;
                 Ok(value)
             }

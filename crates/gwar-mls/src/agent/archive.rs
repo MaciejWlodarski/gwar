@@ -20,7 +20,7 @@ pub(super) const KEY: &[u8] = b"@archive";
 #[serde(deny_unknown_fields)]
 pub struct ArchiveRecord {
     pub account_key: String,
-    /// `(generation, manifest hash)` of every generation it accepted.
+    /// `(generation, manifest hash)` of every generation it accepted (1 to the newest).
     pub checkpoints: BTreeMap<u64, String>,
     /// The accepted manifests, for the safe-generation rule and transfers.
     manifests: BTreeMap<u64, Vec<u8>>,
@@ -28,14 +28,33 @@ pub struct ArchiveRecord {
     keys: BTreeMap<u64, [u8; 32]>,
     /// Every revocation of the account it learned (from Connect's feed and manifests).
     revocations: BTreeMap<String, (i64, String)>,
-    /// Current devices of the account with their archive keys, as of the last sync.
-    current: BTreeMap<String, [u8; 32]>,
+    /// The account's devices: the first archive key statement it verified per device key (a
+    /// later, different one is ignored) and the certificate Connect showed at the last sync.
+    devices: BTreeMap<String, KnownDevice>,
     /// The newest recovery archive key it verified (statement, signature).
     recovery: Option<(String, String)>,
-    /// Keys of groups this device holds no record of yet: epoch key → key.
-    held: BTreeMap<String, [u8; 32]>,
-    /// Transfers sent, as `generation/recipient`.
+    /// Keys of groups this device holds no record of yet, by epoch key.
+    held: BTreeMap<String, Held>,
+    /// Transfers sent or seen on Connect, as `generation/recipient`.
     sent: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KnownDevice {
+    statement: String,
+    signature: String,
+    x25519: [u8; 32],
+    certificate: Option<ArchiveCertificate>,
+}
+
+/// An archive key kept for a group this device holds no record of yet.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Held {
+    Key([u8; 32]),
+    /// The archive held different keys for the epoch.
+    Conflicted,
 }
 
 /// A device entry of `GET /v1/archive/devices`.
@@ -46,7 +65,8 @@ pub struct ArchiveDevice {
     /// Its current certificate (`issued_at`, `expires_at`, `signature`), if Connect has one.
     pub certificate: Option<ArchiveCertificate>,
 }
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArchiveCertificate {
     pub issued_at: i64,
     pub expires_at: i64,
@@ -69,8 +89,9 @@ pub struct ArchiveState {
     pub safe: Option<u64>,
     /// Generations it can open.
     pub opened: Vec<u64>,
-    /// Current devices without any generation they can read yet (they need transfers).
-    pub waiting_devices: Vec<String>,
+    /// Recipients this device owes transfers of generations it opened: current devices of the
+    /// account (device keys) and the current recovery key (`recovery:{version}`).
+    pub waiting: Vec<String>,
     /// The current recovery version, if any.
     pub recovery_version: Option<u64>,
 }
@@ -98,6 +119,19 @@ fn certificate_current(account_key: &str, device_key: &str, c: &ArchiveCertifica
 }
 
 impl ArchiveRecord {
+    fn empty(account_key: String) -> Self {
+        Self {
+            account_key,
+            checkpoints: BTreeMap::new(),
+            manifests: BTreeMap::new(),
+            keys: BTreeMap::new(),
+            revocations: BTreeMap::new(),
+            devices: BTreeMap::new(),
+            recovery: None,
+            held: BTreeMap::new(),
+            sent: BTreeSet::new(),
+        }
+    }
     fn revoked(&self) -> BTreeMap<String, i64> {
         self.revocations.iter().map(|(d, (at, _))| (d.clone(), *at)).collect()
     }
@@ -110,22 +144,108 @@ impl ArchiveRecord {
     fn newest(&self) -> Option<u64> {
         self.checkpoints.keys().next_back().copied()
     }
-    /// The newest generation safe for uploads by what this device knows now.
-    fn safe(&self, me: &str) -> Result<Option<u64>> {
+    fn manifest(&self, generation: u64) -> Result<Manifest> {
+        let bytes = self.manifests.get(&generation).ok_or(Invalid("stored manifest"))?;
+        Manifest::parse(bytes, &self.account_key).map_err(|_| Invalid("stored manifest"))
+    }
+    /// Devices usable as recipients now: a certificate current at `now`, no known revocation.
+    fn current(&self, now: i64) -> BTreeMap<String, [u8; 32]> {
+        self.devices
+            .iter()
+            .filter(|(d, k)| {
+                !self.revocations.contains_key(*d)
+                    && k.certificate.as_ref().is_some_and(|c| certificate_current(&self.account_key, d, c, now))
+            })
+            .map(|(d, k)| (d.clone(), k.x25519))
+            .collect()
+    }
+    /// The newest generation safe for uploads by what this device knows at `now`.
+    fn safe(&self, me: &str, now: i64) -> Result<Option<u64>> {
         let revocations = self.revoked();
+        let current = self.current(now);
         let k = Knowledge {
             revocations: &revocations,
-            current: &self.current,
+            current: &current,
             recovery_version: self.recovery_key().map(|r| r.version),
             me,
         };
-        for (generation, bytes) in self.manifests.iter().rev() {
-            let m = Manifest::parse(bytes, &self.account_key).map_err(|_| Invalid("stored manifest"))?;
-            if self.keys.contains_key(generation) && m.safe(&k) {
+        for generation in self.manifests.keys().rev() {
+            if self.keys.contains_key(generation) && self.manifest(*generation)?.safe(&k) {
                 return Ok(Some(*generation));
             }
         }
         Ok(None)
+    }
+    /// Recipients owed transfers by this device at `now`, with the generations each lacks.
+    fn owed(&self, me: &str, now: i64) -> Result<BTreeMap<String, Vec<u64>>> {
+        let current = self.current(now);
+        let mut owed = BTreeMap::new();
+        if !current.contains_key(me) {
+            return Ok(owed);
+        }
+        let recovery = self.recovery_key().map(|k| k.version);
+        for generation in self.keys.keys() {
+            let m = self.manifest(*generation)?;
+            let mut lacking: Vec<String> = current
+                .keys()
+                .filter(|d| d.as_str() != me && !m.recipients.iter().any(|r| r.device_key == **d))
+                .cloned()
+                .collect();
+            if let Some(version) = recovery.filter(|v| m.recovery_version != Some(*v)) {
+                lacking.push(format!("recovery:{version}"));
+            }
+            for recipient in lacking {
+                if !self.sent.contains(&format!("{generation}/{recipient}")) {
+                    owed.entry(recipient).or_insert_with(Vec::new).push(*generation);
+                }
+            }
+        }
+        Ok(owed)
+    }
+    /// Checks a stored record: this account; a chain of manifests from generation 1 matching
+    /// the checkpoints; keys, transfers and held keys referring to what it holds; every stored
+    /// statement verifying.
+    fn validate(&self, account_key: &str) -> Result<()> {
+        let bad = || Invalid("stored archive record");
+        if self.account_key != account_key
+            || !self.checkpoints.keys().copied().eq(1..=self.checkpoints.len() as u64)
+            || !self.manifests.keys().eq(self.checkpoints.keys())
+            || !self.keys.keys().all(|g| self.manifests.contains_key(g))
+        {
+            return Err(bad());
+        }
+        for (generation, hash) in &self.checkpoints {
+            let m = self.manifest(*generation)?;
+            let previous = generation.checked_sub(1).and_then(|g| self.checkpoints.get(&g));
+            if m.generation != *generation || m.hash() != *hash || m.previous_hash.as_ref() != previous {
+                return Err(bad());
+            }
+        }
+        for (device_key, (revoked_at, signature)) in &self.revocations {
+            let r =
+                Revocation { device_key: device_key.clone(), revoked_at: *revoked_at, signature: signature.clone() };
+            if !r.verify(account_key) {
+                return Err(bad());
+            }
+        }
+        for (device_key, d) in &self.devices {
+            let k = DeviceArchiveKey::parse(&d.statement, &d.signature).ok_or_else(bad)?;
+            if k.account_key != account_key || k.device_key != *device_key || k.x25519 != d.x25519 {
+                return Err(bad());
+            }
+        }
+        if self.recovery.is_some() && self.recovery_key().is_none_or(|k| k.account_key != account_key) {
+            return Err(bad());
+        }
+        let sent = |tag: &String| {
+            tag.split_once('/')
+                .and_then(|(g, _)| g.parse::<u64>().ok())
+                .is_some_and(|g| self.manifests.contains_key(&g))
+        };
+        if !self.sent.iter().all(sent) || !self.held.keys().all(|k| k.rsplit_once('/').is_some()) {
+            return Err(bad());
+        }
+        Ok(())
     }
 }
 
@@ -148,9 +268,11 @@ impl Agent {
     /// Takes in what Connect shows of the archive: the account's devices (archive keys and
     /// current certificates), recovery keys, revocations, manifests (ascending, from the
     /// generation after this device's newest checkpoint, or from 1) and transfers. Manifests are
-    /// checked as a reader must (signature, certificate, body, chain, recipients' archive keys);
-    /// a different manifest for a generation it saw is refused. With `recovery_code`, the recovery
-    /// archive key opens what is sealed or transferred to its version (account recovery).
+    /// checked as a reader must (signature, certificate, body, chain, recipients' archive keys,
+    /// the creator against the revocations it knows and those the manifest carries); a different
+    /// manifest for a generation it saw is refused. It then opens every accepted generation it
+    /// can: as a recipient, by a transfer, or with `recovery_code` (account recovery) the
+    /// generations sealed or transferred to the current recovery version.
     #[allow(clippy::too_many_arguments)]
     pub fn archive_sync(
         &mut self,
@@ -166,17 +288,7 @@ impl Agent {
             super::current_time(now)?;
             let account_key = a.account_certificate()?.account_key.clone();
             let me = a.credential.device_key().to_owned();
-            let mut record = a.archive.clone().unwrap_or(ArchiveRecord {
-                account_key: account_key.clone(),
-                checkpoints: BTreeMap::new(),
-                manifests: BTreeMap::new(),
-                keys: BTreeMap::new(),
-                revocations: BTreeMap::new(),
-                current: BTreeMap::new(),
-                recovery: None,
-                held: BTreeMap::new(),
-                sent: BTreeSet::new(),
-            });
+            let mut record = a.archive.clone().unwrap_or_else(|| ArchiveRecord::empty(account_key.clone()));
             if record.account_key != account_key {
                 return Err(Invalid("another account's archive"));
             }
@@ -206,35 +318,28 @@ impl Agent {
                 }
             }
             record.recovery = newest_recovery.as_ref().map(|k| (k.statement(), k.signature.clone()));
-            // Devices: archive keys signed by themselves; current with a valid certificate and no
-            // known revocation.
-            let mut archive_keys = BTreeMap::new();
+            // Devices: the first archive key statement per device key stays; certificates are
+            // what Connect shows now (none for a device it no longer lists).
+            for d in record.devices.values_mut() {
+                d.certificate = None;
+            }
             for d in devices {
                 let Some(k) =
                     DeviceArchiveKey::parse(&d.statement, &d.signature).filter(|k| k.account_key == account_key)
                 else {
                     continue;
                 };
-                archive_keys.entry(k.device_key.clone()).or_insert(k.x25519);
+                let known = record.devices.entry(k.device_key.clone()).or_insert_with(|| KnownDevice {
+                    statement: d.statement.clone(),
+                    signature: d.signature.clone(),
+                    x25519: k.x25519,
+                    certificate: None,
+                });
+                if known.x25519 == k.x25519 {
+                    known.certificate = d.certificate.clone();
+                }
             }
-            let revoked = record.revoked();
-            record.current = devices
-                .iter()
-                .filter_map(|d| {
-                    let k = DeviceArchiveKey::parse(&d.statement, &d.signature)?;
-                    let current = d
-                        .certificate
-                        .as_ref()
-                        .is_some_and(|c| certificate_current(&account_key, &k.device_key, c, now))
-                        && !revoked.contains_key(&k.device_key);
-                    (current && archive_keys.get(&k.device_key) == Some(&k.x25519)).then_some((k.device_key, k.x25519))
-                })
-                .collect();
             // Manifests, in order.
-            let recovery_secret = recovery_code.map(|code| {
-                let account = fixed::<32>(&account_key).expect("account key");
-                archive::recovery_key_pair(code, &account).0
-            });
             for bytes in manifests {
                 let m = Manifest::parse(bytes, &account_key).map_err(|_| Invalid("manifest"))?;
                 let hash = m.hash();
@@ -251,10 +356,12 @@ impl Agent {
                 if !chained {
                     return Err(Invalid("manifest chain"));
                 }
-                if m.creator_revoked(&record.revoked()) {
+                let carried: BTreeMap<String, i64> =
+                    m.revocations.iter().map(|r| (r.device_key.clone(), r.revoked_at)).collect();
+                if m.creator_revoked(&record.revoked()) || m.creator_revoked(&carried) {
                     return Err(Invalid("a manifest by a revoked device"));
                 }
-                if m.recipients.iter().any(|r| archive_keys.get(&r.device_key) != Some(&r.x25519)) {
+                if m.recipients.iter().any(|r| record.devices.get(&r.device_key).map(|d| d.x25519) != Some(r.x25519)) {
                     return Err(Invalid("a manifest recipient's archive key"));
                 }
                 for r in &m.revocations {
@@ -262,21 +369,45 @@ impl Agent {
                 }
                 record.checkpoints.insert(m.generation, hash);
                 record.manifests.insert(m.generation, bytes.clone());
+            }
+            // Opening: every accepted generation it has no key for (a recovery code given later
+            // opens generations accepted before).
+            let recovery_secret = recovery_code.map(|code| {
+                let account = fixed::<32>(&account_key).expect("account key");
+                archive::recovery_key_pair(code, &account).0
+            });
+            let unopened: Vec<u64> =
+                record.manifests.keys().filter(|g| !record.keys.contains_key(g)).copied().collect();
+            for generation in unopened {
+                let m = record.manifest(generation)?;
                 let opened = m
                     .open(Seat::Device(&me), &a.device.hpke_private)
                     .ok()
                     .or_else(|| recovery_secret.as_ref().and_then(|s| m.open(Seat::Recovery, s).ok()));
                 if let Some(key) = opened {
-                    record.keys.insert(m.generation, key);
+                    record.keys.insert(generation, key);
                 }
             }
-            // Transfers to this device (or, recovering, to the recovery key's version).
+            // Transfers: those to this device (or, recovering, to the recovery key's version)
+            // open generations; every valid one counts as sent, whoever sent it.
             for bytes in transfers {
                 let Ok(t) = Transfer::parse(bytes, &account_key) else { continue };
                 if record.checkpoints.get(&t.generation) != Some(&t.manifest_hash)
                     || record.revoked().get(&t.sender).is_some_and(|&at| at <= t.created_at)
-                    || record.keys.contains_key(&t.generation)
                 {
+                    continue;
+                }
+                let to = match &t.recipient {
+                    TransferRecipient::Device { device_key, x25519 } => {
+                        if record.devices.get(device_key).map(|d| d.x25519) != Some(*x25519) {
+                            continue;
+                        }
+                        device_key.clone()
+                    }
+                    TransferRecipient::Recovery { version } => format!("recovery:{version}"),
+                };
+                record.sent.insert(format!("{}/{to}", t.generation));
+                if record.keys.contains_key(&t.generation) {
                     continue;
                 }
                 let secret = match &t.recipient {
@@ -296,46 +427,32 @@ impl Agent {
                     record.keys.insert(t.generation, key);
                 }
             }
-            // Devices that some accepted generation names can read the archive already.
-            let readable: BTreeSet<String> = record
-                .manifests
-                .values()
-                .filter_map(|b| Manifest::parse(b, &account_key).ok())
-                .flat_map(|m| m.recipients.into_iter().map(|r| r.device_key))
-                .collect();
-            let waiting_devices: Vec<String> = record
-                .current
-                .keys()
-                .filter(|d| !readable.contains(*d) && !record.sent.iter().any(|s| s.ends_with(&format!("/{d}"))))
-                .cloned()
-                .collect();
             let state = ArchiveState {
                 newest: record.newest(),
-                safe: record.safe(&me)?,
+                safe: record.safe(&me, now)?,
                 opened: record.keys.keys().copied().collect(),
-                waiting_devices,
+                waiting: record.owed(&me, now)?.into_keys().collect(),
                 recovery_version: record.recovery_key().map(|k| k.version),
             };
             a.archive = Some(record);
-            a.settle_held();
             Ok(state)
         })
     }
 
-    /// The next generation's manifest, sealed to every current device of the account with an
-    /// archive key and to the current recovery key, carrying every revocation this device knows.
-    /// Posted to Connect, then taken in by the next [`Agent::archive_sync`].
+    /// The next generation's manifest, sealed to every device of the account current at `now`
+    /// with an archive key and to the current recovery key, carrying every revocation this
+    /// device knows. Posted to Connect, then taken in by the next [`Agent::archive_sync`].
     pub fn archive_create_manifest(&self, now: i64) -> Result<Vec<u8>> {
         let record = self.archive.as_ref().ok_or(Invalid("archive not synced"))?;
         let certificate = self.account_certificate()?;
-        let me = self.credential.device_key();
-        if !record.current.contains_key(me) {
+        let current = record.current(now);
+        if !current.contains_key(self.credential.device_key()) {
             return Err(Invalid("this device is not a current archive device"));
         }
         let generation = record.newest().map_or(1, |g| g + 1);
         let previous = record.newest().and_then(|g| record.checkpoints.get(&g)).cloned();
         let recipients: Vec<Recipient> =
-            record.current.iter().map(|(d, x)| Recipient { device_key: d.clone(), x25519: *x }).collect();
+            current.iter().map(|(d, x)| Recipient { device_key: d.clone(), x25519: *x }).collect();
         let revocations: Vec<Revocation> = record
             .revocations
             .iter()
@@ -358,10 +475,10 @@ impl Agent {
 
     /// Up to `limit` epoch keys not yet in the archive (derived ones and those imported from
     /// history bundles; never `Conflicted` ones or those from the archive), sealed under the
-    /// newest safe generation; `None` without a safe generation (create one first).
-    pub fn archive_seal(&self, limit: usize) -> Result<Option<ArchiveUpload>> {
+    /// newest generation safe at `now`; `None` without one (create one first).
+    pub fn archive_seal(&self, limit: usize, now: i64) -> Result<Option<ArchiveUpload>> {
         let record = self.archive.as_ref().ok_or(Invalid("archive not synced"))?;
-        let Some(generation) = record.safe(self.credential.device_key())? else { return Ok(None) };
+        let Some(generation) = record.safe(self.credential.device_key(), now)? else { return Ok(None) };
         let key = record.keys.get(&generation).ok_or(Invalid("generation key"))?;
         let mut upload = ArchiveUpload { generation, records: Vec::new(), epochs: Vec::new() };
         for (epoch_key_text, value) in &self.epochs {
@@ -405,7 +522,8 @@ impl Agent {
 
     /// Imports records of generations this device can open: an `Imported` epoch key attributed to
     /// this account, never overwriting (a different key makes the epoch `Conflicted`); a key of a
-    /// group it holds no record of is kept until it does. Returns how many keys it imported.
+    /// group it holds no record of is kept until it does (with the conflict, if the archive holds
+    /// different keys for the epoch). Returns how many records it opened.
     pub fn archive_import(&mut self, records: &[(u64, String, String)]) -> Result<usize> {
         self.operation(|a| {
             let record = a.archive.as_mut().ok_or(Invalid("archive not synced"))?;
@@ -420,16 +538,25 @@ impl Agent {
                     continue;
                 };
                 let k = epoch_key(&group_key(&entry.server, &entry.group), entry.epoch);
-                record.held.entry(k).or_insert(entry.key);
+                match record.held.get(&k) {
+                    None => {
+                        record.held.insert(k, Held::Key(entry.key));
+                    }
+                    Some(Held::Key(existing)) if *existing != entry.key => {
+                        record.held.insert(k, Held::Conflicted);
+                    }
+                    Some(_) => {}
+                }
                 imported += 1;
             }
-            a.settle_held();
             Ok(imported)
         })
     }
 
-    /// Moves held archive keys into the epochs of groups this device now holds.
-    fn settle_held(&mut self) {
+    /// Moves held archive keys into the epochs of groups this device now holds; run at the end
+    /// of every operation, so a group it adopts (a join, a rejoin, a restart chain) gets them in
+    /// the same change.
+    pub(super) fn settle_held(&mut self) {
         let Some(record) = self.archive.as_mut() else { return };
         let uid = self.credential.uid();
         let ready: Vec<String> = record
@@ -439,7 +566,11 @@ impl Agent {
             .cloned()
             .collect();
         for k in ready {
-            let value = record.held.remove(&k).expect("listed");
+            let held = record.held.remove(&k).expect("listed");
+            let Held::Key(value) = held else {
+                self.epochs.insert(k, EpochRecord::Conflicted);
+                continue;
+            };
             let entry = self.epochs.entry(k).or_insert_with(|| EpochRecord::Imported {
                 key: value,
                 sender_uids: [uid.clone()].into(),
@@ -451,12 +582,17 @@ impl Agent {
         }
     }
 
-    /// Transfers of every generation key this device holds to a current device of the account
-    /// that cannot read them yet (or to the recovery key's `version`), once per generation and
-    /// recipient. Posted to Connect; then [`Agent::archive_transfers_sent`].
+    /// Transfers of the generation keys this device holds that `recipient` (a device of the
+    /// account current at `now`, or `recovery:{version}` for the current recovery key) lacks and
+    /// was not sent yet, by generation. This device must be current itself. Posted to Connect;
+    /// then [`Agent::archive_transfers_sent`].
     pub fn archive_transfers_for(&self, recipient: &str, now: i64) -> Result<Vec<(String, Vec<u8>)>> {
         let record = self.archive.as_ref().ok_or(Invalid("archive not synced"))?;
         let certificate = self.account_certificate()?;
+        let current = record.current(now);
+        if !current.contains_key(self.credential.device_key()) {
+            return Err(Invalid("this device is not a current archive device"));
+        }
         let (to, x25519) = if let Some(version) = recipient.strip_prefix("recovery:") {
             let k = record
                 .recovery_key()
@@ -464,23 +600,17 @@ impl Agent {
                 .ok_or(Invalid("recovery version"))?;
             (TransferRecipient::Recovery { version: k.version }, k.x25519)
         } else {
-            let x = *record.current.get(recipient).ok_or(Invalid("not a current device"))?;
+            let x = *current.get(recipient).ok_or(Invalid("not a current device"))?;
             (TransferRecipient::Device { device_key: recipient.into(), x25519: x }, x)
         };
+        let owed = record.owed(self.credential.device_key(), now)?;
         let mut out = Vec::new();
-        for (generation, key) in &record.keys {
-            let tag = format!("{generation}/{recipient}");
-            if record.sent.contains(&tag) {
-                continue;
-            }
-            let m = Manifest::parse(&record.manifests[generation], &record.account_key)
-                .map_err(|_| Invalid("stored manifest"))?;
-            if m.recipients.iter().any(|r| r.device_key == recipient) {
-                continue;
-            }
+        for generation in owed.get(recipient).into_iter().flatten() {
+            let m = record.manifest(*generation)?;
+            let key = record.keys.get(generation).ok_or(Invalid("generation key"))?;
             let t = Transfer::create(&m, key, &self.signer.0, certificate, to.clone(), &x25519, now)
                 .map_err(|_| Invalid("transfer"))?;
-            out.push((tag, t));
+            out.push((format!("{generation}/{recipient}"), t));
         }
         Ok(out)
     }
@@ -488,15 +618,24 @@ impl Agent {
     pub fn archive_transfers_sent(&mut self, tags: &[String]) -> Result<()> {
         self.operation(|a| {
             let record = a.archive.as_mut().ok_or(Invalid("archive not synced"))?;
-            record.sent.extend(tags.iter().cloned());
+            for tag in tags {
+                let generation = tag.split_once('/').and_then(|(g, _)| g.parse::<u64>().ok());
+                if !generation.is_some_and(|g| record.manifests.contains_key(&g)) {
+                    return Err(Invalid("transfer tag"));
+                }
+                record.sent.insert(tag.clone());
+            }
             Ok(())
         })
     }
 }
 
-/// Whether `bytes` are a stored archive record.
-pub(super) fn parse_record(bytes: &[u8]) -> Result<ArchiveRecord> {
-    serde_json::from_slice(bytes).map_err(|_| AgentError::Invalid("stored archive record"))
+/// A stored archive record of `account_key`'s device, checked.
+pub(super) fn parse_record(bytes: &[u8], account_key: Option<&str>) -> Result<ArchiveRecord> {
+    let record: ArchiveRecord =
+        serde_json::from_slice(bytes).map_err(|_| AgentError::Invalid("stored archive record"))?;
+    record.validate(account_key.ok_or(Invalid("local identities have no archive"))?)?;
+    Ok(record)
 }
 
 #[cfg(test)]

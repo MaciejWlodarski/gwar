@@ -241,6 +241,7 @@ enum Request {
     },
     ArchiveSeal {
         limit: usize,
+        now: i64,
     },
     ArchiveUploaded {
         epochs: Vec<String>,
@@ -574,7 +575,7 @@ impl Agent {
                 )
             }
             Request::ArchiveCreateManifest { now } => output(a.archive_create_manifest(now).map_err(error)?),
-            Request::ArchiveSeal { limit } => output(a.archive_seal(limit).map_err(error)?),
+            Request::ArchiveSeal { limit, now } => output(a.archive_seal(limit, now).map_err(error)?),
             Request::ArchiveUploaded { epochs } => output(a.archive_uploaded(&epochs).map_err(error)?),
             Request::ArchiveImport { records } => output(a.archive_import(&records).map_err(error)?),
             Request::ArchiveTransfersFor { recipient, now } => {
