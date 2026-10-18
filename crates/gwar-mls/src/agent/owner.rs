@@ -306,6 +306,7 @@ impl Agent {
     /// verifies as history under a trusted anchor and is no older than the accepted list), else the
     /// accepted one. Its seq follows both. Trusted anchors are the signing and the accepted one; the
     /// server's own (`server_anchor`) only on a device without a checkpoint, which inherits it.
+    #[allow(clippy::too_many_arguments)]
     pub fn next_list(
         &self,
         server: &str,

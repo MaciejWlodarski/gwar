@@ -333,6 +333,7 @@ impl Agent {
     }
     /// The next manager list's statement, under `anchor` or the accepted anchor.
     /// `managers` `None` renews the server's (verified) or the accepted list.
+    #[allow(clippy::too_many_arguments)]
     pub fn next_list(
         &self,
         server: &str,
