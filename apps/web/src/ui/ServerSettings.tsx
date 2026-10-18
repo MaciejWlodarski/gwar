@@ -581,7 +581,8 @@ function MembersTab() {
             const color = nameColor(m.groups, defs);
             const isMe = m.uid === meUid;
             const session = online.get(m.uid);
-            const stronger = !canActOn(me, { groups: m.groups, owner: m.uid === ownerUid }, defs);
+            // My own roles are mine to change within my rank; others only below me.
+            const stronger = !isMe && !canActOn(me, { groups: m.groups, owner: m.uid === ownerUid }, defs);
             const assigned = m.groups.map((g) => defs[g]).filter((g): g is Group => !!g && g.id !== MEMBER_GROUP);
             return (
               <li key={m.uid} data-member={m.nickname} className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2">

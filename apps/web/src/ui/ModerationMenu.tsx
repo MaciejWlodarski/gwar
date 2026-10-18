@@ -29,7 +29,7 @@ export function ModerationItems({ person, groups }: { person: PersonRef; groups:
   const vc = kind === "vc";
   // Only someone ranked below me (docs/roles.md).
   const stronger = vc && !canActOn(me, target, defs);
-  const showRename = vc && (isMe || canRename);
+  const showRename = vc && (isMe || (canRename && !stronger));
   const showKick = !isMe && canKick && person.session !== undefined;
   const showBan = !isMe && vc && canBan;
   const showRoles = !isMe && vc && canGroups;

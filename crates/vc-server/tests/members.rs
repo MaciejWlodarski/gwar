@@ -463,16 +463,19 @@ fn merging_members_moves_all_identity_references_transactionally() {
     std::fs::write(seeded.files().join("attached"), b"abc").unwrap();
     std::fs::write(seeded.files().join("pending"), b"def").unwrap();
     store
-        .insert_ban(&vc_proto::Ban {
-            id: 0,
-            uid: Some("-legacy".into()),
-            ip: None,
-            nickname: "Original".into(),
-            reason: None,
-            by: "-legacy".into(),
-            created_at: 1,
-            expires_at: None,
-        })
+        .insert_ban(
+            &vc_proto::Ban {
+                id: 0,
+                uid: Some("-legacy".into()),
+                ip: None,
+                nickname: "Original".into(),
+                reason: None,
+                by: "-legacy".into(),
+                created_at: 1,
+                expires_at: None,
+            },
+            None,
+        )
         .unwrap();
     store
         .insert_invite(

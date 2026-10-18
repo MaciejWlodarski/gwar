@@ -242,6 +242,31 @@ async fn roles_and_the_channels_they_open_are_given_out_by_rank() {
 }
 
 #[tokio::test]
+async fn a_private_channels_roles_change_only_below_ones_rank_or_for_ones_own() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let mut mallory = Client::connect(&server, "mallory").await;
+    let seniors = root.ok("group.create", json!({"name": "Seniors", "permissions": []})).await["group"]["id"].clone();
+    let editors =
+        root.ok("group.create", json!({"name": "Editors", "permissions": ["manage_channels"]})).await["group"]["id"]
+            .clone();
+    let crew = root.ok("group.create", json!({"name": "Crew", "permissions": []})).await["group"]["id"].clone();
+    root.ok("member.groups", json!({"uid": mallory.welcome.uid, "groups": [2, editors]})).await;
+    // She is listed by name, so she sees the channel.
+    let me = mallory.welcome.uid.clone();
+    let access = |roles: Value| json!({"roles": roles, "users": [me]});
+    let private = channel_id(
+        &root.create_channel(json!({"name": "p", "private": true, "access": access(json!([seniors]))})).await,
+    );
+    mallory.next_event("channel.created").await;
+    let update = |roles: Value| json!({"channel": private, "access": access(roles)});
+    // Not taking away a higher role, not adding one.
+    assert_eq!(mallory.fails("channel.update", update(json!([]))).await, "forbidden");
+    // Her own role and a lower one, keeping the higher one listed.
+    mallory.ok("channel.update", update(json!([seniors, editors, crew]))).await;
+}
+
+#[tokio::test]
 async fn a_hidden_sibling_is_no_name_oracle() {
     let server = TestServer::start().await;
     let mut root = admin(&server, "root").await;

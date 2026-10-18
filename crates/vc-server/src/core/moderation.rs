@@ -159,6 +159,10 @@ impl Core {
 
     pub(super) fn group_create(&mut self, session: SessionId, c: GroupCreate) -> Reply {
         self.require(session, Permission::ManageRoles)?;
+        // A new role goes right above Member, so it must still be below the creator.
+        if self.session_rank(session) >= self.position(MEMBER_GROUP) {
+            return Err(err(ErrorCode::Forbidden, "only a role above Member can create roles"));
+        }
         let name = clean(&c.name, MAX_GROUP_NAME, "group name")?;
         let permissions: BTreeSet<_> = c.permissions.into_iter().collect();
         if !self.covers(session, &permissions) {
@@ -220,9 +224,12 @@ impl Core {
         if let Some(mentionable) = u.mentionable {
             group.mentionable = mentionable;
         }
+        // `administrator` admits to private channels: what changes it changes admissions.
+        let before = self.admissions();
         self.store.update_group(&group).map_err(storage_error)?;
         self.groups.insert(group.id, group.clone());
         self.broadcast(Event::GroupUpdated(group.clone()), |_| true);
+        self.reconcile_admissions(before);
         Ok(Response::Group { group })
     }
 
@@ -238,11 +245,11 @@ impl Core {
         if !self.below(session, id) {
             return Err(err(ErrorCode::Forbidden, "this role is not below your rank"));
         }
+        let before = self.admissions();
         self.store.delete_group(id).map_err(storage_error)?;
         self.groups.remove(&id);
         self.renumber_groups();
         self.broadcast_order();
-        let before = self.admissions();
         let affected: Vec<_> = self.sessions.values().filter(|s| s.groups.contains(&id)).map(|s| s.id).collect();
         for s in affected {
             if let Some(session) = self.sessions.get_mut(&s) {
@@ -438,7 +445,25 @@ impl Core {
 
     /// The ban in force for this identity or address, if any.
     pub(super) fn ban_for(&self, uid: Option<&str>, ip: Option<IpAddr>) -> Option<Ban> {
-        self.store.bans(now_ms()).ok()?.into_iter().find(|b| bans(b, uid, ip))
+        self.store.bans(now_ms()).ok()?.into_iter().find(|b| {
+            let named = uid.is_some() && b.uid.as_deref() == uid;
+            named || (bans(b, None, ip) && self.ip_ban_reaches(b, uid))
+        })
+    }
+
+    /// An IP ban keeps out others behind the banned address only if they rank below its issuer
+    /// (newcomers always do). A ban without a recorded issuer spares only the owner.
+    fn ip_ban_reaches(&self, ban: &Ban, uid: Option<&str>) -> bool {
+        let Some(uid) = uid else { return true };
+        let Ok(Some(groups)) = self.store.groups_of(uid) else { return true };
+        let target = self.rank_of(uid, &groups);
+        match self.store.ban_issuer(ban.id).ok().flatten() {
+            Some(issuer) => {
+                let theirs = self.store.groups_of(&issuer).ok().flatten().unwrap_or_default();
+                self.rank_of(&issuer, &theirs) < target
+            }
+            None => target >= 0,
+        }
     }
 
     pub(super) fn ban_create(&mut self, session: SessionId, b: BanCreate) -> Reply {
@@ -481,13 +506,16 @@ impl Core {
             created_at: now,
             expires_at: b.duration.map(|d| now + (d as i64) * 1000),
         };
-        ban.id = self.store.insert_ban(&ban).map_err(storage_error)?;
-        // Everyone the ban covers leaves now.
+        ban.id = self.store.insert_ban(&ban, Some(&me.uid)).map_err(storage_error)?;
+        // Everyone the ban covers leaves now: behind the address, only those ranked below the issuer.
         let range = ip.map(subscriber);
         let banned: Vec<_> = self
             .sessions
             .values()
-            .filter(|s| s.uid == uid || (range.is_some() && s.ip.map(subscriber) == range))
+            .filter(|s| {
+                s.uid == uid
+                    || (range.is_some() && s.ip.map(subscriber) == range && self.outranks(session, &s.uid, &s.groups))
+            })
             .map(|s| s.id)
             .collect();
         let reason = LeaveReason::Banned { by: ban.by.clone(), reason: ban.reason.clone(), until: ban.expires_at };

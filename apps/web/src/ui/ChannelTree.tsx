@@ -27,7 +27,8 @@ import { useSettings } from "../state/settings";
 import { useSession, useUi } from "../state/stores";
 import { buildTree, descendantsCount, type ChannelNode } from "../state/tree";
 import { MentionBadge, UnreadBadge } from "./badges";
-import { useGroupsColor, usePermission } from "./hooks";
+import { useGroupsColor, useMyWho, usePermission, useWhoOf } from "./hooks";
+import { canActOn } from "../lib/permissions";
 import { ModerationItems } from "./ModerationMenu";
 import { EmptyState, TalkingAvatar, Slider, menuContent, menuItem, menuItemDanger, menuLabel, menuSeparator } from "./kit";
 
@@ -261,7 +262,12 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
   const client = { ...sessionClient, nickname: member?.nickname ?? sessionClient.nickname };
   const isMe = useSession((s) => s.me?.uid === client.uid);
   const myChannel = useSession(myChannelId);
-  const canMove = usePermission("move_members");
+  const mayMove = usePermission("move_members");
+  const me = useMyWho();
+  const target = useWhoOf(client.uid, client.groups);
+  const groups = useSession((s) => s.groups);
+  // Myself, or someone ranked below me (docs/roles.md).
+  const canMove = mayMove && (isMe || canActOn(me, target, groups));
   const color = useGroupsColor(client.groups);
   const openDm = () => {
     if (isMe) return;

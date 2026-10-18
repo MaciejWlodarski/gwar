@@ -2295,13 +2295,16 @@ pub fn encode(frame: &ServerFrame) -> Arc<str> {
 
 /// Validates a private channel's access: known roles, well-formed uids, bounds; sorted and deduplicated.
 impl Core {
-    /// Listing a role in an access set needs that role or a rank above it.
+    /// Adding a role to an access set, or taking one away, needs that role or a rank above it.
     fn may_list_roles(&self, session: SessionId, roles: &[GroupId], already: &[GroupId]) -> Result<(), ErrorBody> {
         let me = &self.sessions[&session];
-        if roles.iter().all(|r| already.contains(r) || me.groups.contains(r) || self.below(session, *r)) {
+        // Every role added or taken away: one held, or one below one's rank. Unchanged ones stay.
+        let changed =
+            roles.iter().filter(|r| !already.contains(r)).chain(already.iter().filter(|r| !roles.contains(r)));
+        if changed.into_iter().all(|r| me.groups.contains(r) || self.below(session, *r)) {
             Ok(())
         } else {
-            Err(err(ErrorCode::Forbidden, "you can only admit roles you hold or below your rank"))
+            Err(err(ErrorCode::Forbidden, "you can only admit or remove roles you hold or below your rank"))
         }
     }
 

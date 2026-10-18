@@ -17,6 +17,58 @@ async fn with_groups(admin: &mut Client, member: &Client, groups: Value) {
 // ---------------------------------------------------------------- roles
 
 #[tokio::test]
+async fn an_ip_ban_reaches_only_those_ranked_below_its_issuer() {
+    let server = TestServer::start().await;
+    // Everyone here connects from 127.0.0.1: one address.
+    let root_key = new_key();
+    let mut root = Client::connect_as(&server, root_key.clone(), "root", None).await.unwrap();
+    root.redeem(&server.admin_token).await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let mut bob = Client::connect(&server, "bob").await;
+    let carol_key = new_key();
+    let mut carol = Client::connect_as(&server, carol_key.clone(), "carol", None).await.unwrap();
+    let mods = group_id(&root.ok("group.create", json!({"name": "Mods", "permissions": ["ban_members"]})).await);
+    with_groups(&mut root, &alice, json!([2, mods])).await;
+    alice.ok("ban.create", json!({"client": bob.id(), "ip": true})).await;
+    bob.expect_disconnect().await;
+    // A member behind the address goes; the owner and the issuer stay.
+    carol.expect_disconnect().await;
+    root.ok("ping", json!({})).await;
+    alice.ok("ping", json!({})).await;
+    // And the same holds when connecting again.
+    Client::connect_as(&server, root_key, "root", None).await.expect("the owner is not reached");
+    let refused = Client::connect_as(&server, carol_key, "carol", None).await.err().expect("carol is reached");
+    assert_eq!(refused.code, vc_proto::ErrorCode::Banned);
+}
+
+#[tokio::test]
+async fn only_a_role_above_member_creates_roles() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let mut alice = Client::connect(&server, "alice").await;
+    root.ok("group.update", json!({"group": 2, "permissions": ["manage_roles", "create_invites", "attach_files"]}))
+        .await;
+    assert_eq!(alice.fails("group.create", json!({"name": "Above me"})).await, "forbidden");
+}
+
+#[tokio::test]
+async fn taking_administrator_away_takes_the_private_channels_it_opened() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let boss = group_id(&root.ok("group.create", json!({"name": "Boss", "permissions": ["administrator"]})).await);
+    let private = root.create_channel(json!({"name": "p", "private": true})).await["id"].clone();
+    with_groups(&mut root, &alice, json!([2, boss])).await;
+    assert_eq!(alice.next_event("channel.created").await["id"], private);
+    root.ok("group.update", json!({"group": boss, "permissions": []})).await;
+    assert_eq!(alice.next_event("channel.hidden").await["channel"], private);
+    root.ok("group.update", json!({"group": boss, "permissions": ["administrator"]})).await;
+    assert_eq!(alice.next_event("channel.created").await["id"], private);
+    root.ok("group.delete", json!({"group": boss})).await;
+    assert_eq!(alice.next_event("channel.hidden").await["channel"], private);
+}
+
+#[tokio::test]
 async fn roles_are_ordered_and_only_those_below_ones_rank_move() {
     let server = TestServer::start().await;
     let mut root = admin(&server, "root").await;

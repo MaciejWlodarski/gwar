@@ -382,6 +382,7 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE groups ADD COLUMN hoist INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE groups ADD COLUMN mentionable INTEGER NOT NULL DEFAULT 0;
     UPDATE groups SET position = id;
+    ALTER TABLE bans ADD COLUMN by_uid TEXT;
     "#,
 ];
 
@@ -1516,12 +1517,18 @@ impl Store {
 
     // ----------------------------------------------------------------- bans
 
-    pub fn insert_ban(&self, ban: &Ban) -> Result<BanId> {
+    /// `by_uid`: who issued it, so an IP ban reaches only those ranked below them.
+    pub fn insert_ban(&self, ban: &Ban, by_uid: Option<&str>) -> Result<BanId> {
         self.db.execute(
-            "INSERT INTO bans(uid,ip,nickname,reason,by,created_at,expires_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            params![ban.uid, ban.ip, ban.nickname, ban.reason, ban.by, ban.created_at, ban.expires_at],
+            "INSERT INTO bans(uid,ip,nickname,reason,by,created_at,expires_at,by_uid) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![ban.uid, ban.ip, ban.nickname, ban.reason, ban.by, ban.created_at, ban.expires_at, by_uid],
         )?;
         Ok(self.db.last_insert_rowid() as BanId)
+    }
+
+    /// Who issued a ban, when it was recorded.
+    pub fn ban_issuer(&self, id: BanId) -> Result<Option<String>> {
+        Ok(self.db.query_row("SELECT by_uid FROM bans WHERE id=?1", [id], |r| r.get(0)).optional()?.flatten())
     }
 
     /// Bans in force at `now`.
