@@ -22,7 +22,9 @@ impl Core {
         } else if participants.is_none() {
             let id = super::mls::channel_id(conversation)
                 .ok_or_else(|| err(ErrorCode::BadRequest, "invalid conversation"))?;
-            match self.channels.get(&id) {
+            // A channel hidden from this session answers like a missing one (6a, 6c).
+            let s = &self.sessions[&session];
+            match self.channels.get(&id).filter(|_| self.admitted(Some(s), id)) {
                 None => return Err(err(ErrorCode::NotFound, "no such channel")),
                 Some(c) if !c.encrypted => {
                     return Err(err(ErrorCode::BadRequest, "this channel is not end-to-end encrypted"));

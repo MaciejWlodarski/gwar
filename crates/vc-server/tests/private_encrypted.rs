@@ -277,6 +277,11 @@ async fn an_encrypted_private_channel_admits_only_its_signed_members_and_never_g
     let listed =
         |groups: &Value| groups["groups"].as_array().unwrap().iter().any(|g| g["conversation"] == conversation);
     assert!(listed(&owner.ok("mls.groups", json!({})).await) && !listed(&eve.ok("mls.groups", json!({})).await));
+    // Its sealed history answers like a channel that does not exist.
+    assert_eq!(
+        eve.fails("chat.sealed.history", json!({"conversation": conversation})).await,
+        eve.fails("chat.sealed.history", json!({"conversation": "channel:999999"})).await
+    );
     let eve_again = connect(&server, &Device::new(3, 34)).await;
     assert!(eve_again.welcome.conversations.iter().all(|c| c.conversation != conversation));
     let owner_again = connect(&server, &Device::new(1, 12)).await;

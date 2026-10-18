@@ -453,7 +453,12 @@ impl Core {
                 reply(MlsResponse::GroupInfo { group_info: B64.encode(row.group_info), epoch: row.epoch })
             }
             MlsRequest::Commit { group, epoch, commit, group_info, welcome, voice } => {
-                if voice.is_some() && self.store.mls_group(&group).map_err(storage_error)?.is_some() {
+                // Only a reader learns that the id is a chat group; to anyone else it is like a
+                // missing group (validated as voice below).
+                if voice.is_some()
+                    && let Some(row) = self.store.mls_group(&group).map_err(storage_error)?
+                    && self.mls_can_read(&uid, &row.conversation)?
+                {
                     return Err(bad("voice binding on chat group"));
                 }
                 if self.voice_group_channel(&group).is_some() || voice.is_some() {
@@ -714,7 +719,9 @@ impl Core {
                 Kind::Dm
             }
             (None, Some(channel)) => {
-                let Some(row) = self.channels.get(&channel).filter(|c| c.encrypted) else {
+                // A channel hidden from this session answers like a missing one (6a, 6c).
+                let Some(row) = self.channels.get(&channel).filter(|c| c.encrypted && self.admitted(Some(s), channel))
+                else {
                     return Err(err(ErrorCode::NotFound, "no such encrypted channel"));
                 };
                 if d.private != row.private || d.history != row.history {
