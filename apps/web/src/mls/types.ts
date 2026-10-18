@@ -25,7 +25,8 @@ export interface WasmAgent {
 export type OwnerCheck =
   | { kind: "pinned" } | { kind: "unchanged" } | { kind: "extended" } | { kind: "changed" }
   | { kind: "new_generation"; generation: number; owner: string };
-export type ManagersCheck = { kind: "accepted" | "unchanged" | "not_current" | "rollback" };
+/** `renewable`: not current, but this device may renew it (its anchor is current and names it). */
+export type ManagersCheck = { kind: "accepted" | "unchanged" | "not_current" | "renewable" | "rollback" };
 /** The pinned owner and the managers this device accepted. */
 export interface OwnerView {
   generation: number;

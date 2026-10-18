@@ -49,6 +49,9 @@ pub enum ManagersCheck {
     Unchanged,
     /// Not current under the pinned chain (a former owner, an expired signer, not a confirmer).
     NotCurrent,
+    /// Not current, but its anchor is, and names this device's user owner or confirmer: this
+    /// device may renew the list ([`Agent::next_list`] with `managers` `None`).
+    Renewable,
     /// Older than, or different at the same seq from, what this device accepted.
     Rollback,
 }
@@ -216,14 +219,14 @@ impl Agent {
                     return Ok(ManagersCheck::Rollback);
                 }
                 if !current {
-                    return Ok(ManagersCheck::NotCurrent);
+                    return Ok(lapsed(a, &chain, &new_anchor));
                 }
                 if l_seq == old_list.list().seq {
                     return Ok(ManagersCheck::Unchanged);
                 }
             }
             if !current {
-                return Ok(ManagersCheck::NotCurrent);
+                return Ok(lapsed(a, &chain, &new_anchor));
             }
             let record = a.servers.get_mut(server).expect("present");
             record.anchor = Some(anchor.to_vec());
@@ -324,9 +327,18 @@ impl Agent {
         let shown = server_anchor.and_then(SignedAnchor::parse).filter(|a| pair.is_none() && chain.anchor_valid(a));
         let trusted: Vec<&SignedAnchor> =
             [Some(&anchor), pair.as_ref().map(|(a, _)| a), shown.as_ref()].into_iter().flatten().collect();
+        // With a checkpoint, a newer list counts only when its signer still holds authority under
+        // its anchor (the current owner or a confirmer): a former owner's later list does not.
         let verified = server_list
             .and_then(SignedList::parse)
-            .filter(|l| trusted.iter().any(|a| a.hash() == l.list().anchor_hash && chain.list_valid(a, l)))
+            .filter(|l| {
+                trusted.iter().any(|a| {
+                    let signer = &l.list().signer_uid;
+                    a.hash() == l.list().anchor_hash
+                        && chain.list_valid(a, l)
+                        && (pair.is_none() || *signer == chain.owner() || a.anchor().confirmers.contains(signer))
+                })
+            })
             .filter(|l| {
                 pair.as_ref().is_none_or(|(_, old)| {
                     let (seq, old_seq) = (l.list().seq, old.list().seq);
@@ -401,6 +413,21 @@ impl Agent {
             return Err(Invalid("list signer"));
         }
         Ok(SignedList::sign(list, self.credential.clone(), &self.signer.0).encode())
+    }
+}
+
+/// A pair that is not current: renewable by this device when its anchor is current and names this
+/// device's user the owner or a confirmer. An inherited anchor naming the new owner a confirmer
+/// needs a new anchor instead: a list under it would not be current either.
+fn lapsed(agent: &Agent, chain: &OwnerChain, anchor: &SignedAnchor) -> ManagersCheck {
+    let (me, confirmers) = (agent.credential.uid(), &anchor.anchor().confirmers);
+    if chain.anchor_current(anchor)
+        && !confirmers.contains(&chain.owner())
+        && (me == chain.owner() || confirmers.contains(&me))
+    {
+        ManagersCheck::Renewable
+    } else {
+        ManagersCheck::NotCurrent
     }
 }
 
@@ -628,6 +655,13 @@ mod tests {
         }
         assert_eq!(
             owner.accept_managers(&server(), &a1.encode(), &l1, NOW, &Revoked).unwrap(),
+            ManagersCheck::Renewable,
+            "not current, and the owner may renew it"
+        );
+        let mut member = agent(7);
+        check(&mut member, &chain, None);
+        assert_eq!(
+            member.accept_managers(&server(), &a1.encode(), &l1, NOW, &Revoked).unwrap(),
             ManagersCheck::NotCurrent
         );
         owner.take_changes();
@@ -716,6 +750,52 @@ mod tests {
             .is_err(),
             "beyond the protocol's bound"
         );
+    }
+
+    #[test]
+    fn a_former_owner_cannot_steer_the_new_owners_renewal() {
+        // 1 hands anchor X (no confirmers) over to 2; 1's list under X is no longer current.
+        let former = agent(1);
+        let chain = OwnerChain::new(genesis(1, 1));
+        let x = anchor(&chain, &key(1), 1, &[]);
+        let l1 = list(&chain, &x, 1, &former);
+        let moved = moved(&chain, 1, 2, Some(&x));
+        let mut new_owner = agent(2);
+        check(&mut new_owner, &moved, None);
+        assert_eq!(new_owner.accept_managers(&server(), &x.encode(), &l1, NOW, &()).unwrap(), ManagersCheck::Renewable);
+        new_owner.take_changes();
+        let renewed = new_owner
+            .sign_manager_list(
+                ManagerList::parse(
+                    &new_owner
+                        .next_list(&server(), Some(&x.encode()), None, NOW, Some(&x.encode()), Some(&l1))
+                        .unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            new_owner.accept_managers(&server(), &x.encode(), &renewed, NOW, &()).unwrap(),
+            ManagersCheck::Accepted
+        );
+        new_owner.take_changes();
+        // 1 signs a later list under X (valid as history): renewal keeps the accepted membership.
+        let injected = former
+            .sign_manager_list(ManagerList {
+                server_key: server(),
+                generation: 1,
+                anchor_hash: x.hash(),
+                seq: 7,
+                managers: vec![uid(8)],
+                signer_uid: uid(1),
+                signed_at: NOW,
+            })
+            .unwrap();
+        let next = ManagerList::parse(
+            &new_owner.next_list(&server(), None, None, NOW, Some(&x.encode()), Some(&injected)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!((next.seq, next.managers), (3, vec![]));
     }
 
     #[test]

@@ -8,7 +8,7 @@ const view = (over: Partial<OwnerView> = {}): OwnerView => ({
   list_signer: "owner", list_signed_at: NOW - DAY, list_signer_expires_at: null, anchor_seq: 1, list_seq: 3, ...over,
 });
 const input = (over: Partial<UpkeepInput> = {}): UpkeepInput => ({
-  me: "owner", view: view(), server: { anchor: "A", list: "L", pending: [], stale: [] }, current: true, settled: true,
+  me: "owner", view: view(), server: { anchor: "A", list: "L", pending: [], stale: [] }, current: true, renewable: false, settled: true,
   granted: new Set(), asked: new Set(), now: NOW, ownExpiry: Infinity, lastRenewal: 0, ...over,
 });
 
@@ -27,10 +27,14 @@ describe("manager list upkeep (6b)", () => {
   it("renews an old, expiring or lapsed list, at most every ten minutes", () => {
     expect(managerUpkeep(input({ view: view({ list_signed_at: NOW - 61 * DAY }) })).kind).toBe("publish");
     expect(managerUpkeep(input({ view: view({ list_signer_expires_at: NOW + 3 * DAY }) })).kind).toBe("publish");
-    expect(managerUpkeep(input({ current: false }))).toEqual({ kind: "publish", managers: null, renewal: true, consumed: [] });
+    expect(managerUpkeep(input({ current: false, renewable: true }))).toEqual({ kind: "publish", managers: null, renewal: true, consumed: [] });
+    // Only when the agent says this device may renew it ...
+    expect(managerUpkeep(input({ current: false }))).toEqual({ kind: "none" });
+    // ... which a fresh confirmer's device may, without an accepted checkpoint naming it.
+    expect(managerUpkeep(input({ me: "fresh", view: view({ confirmers: [], managers: [] }), current: false, renewable: true })).kind).toBe("publish");
     // Not current: no change is made against this device's possibly older checkpoint.
-    expect(managerUpkeep(input({ current: false, lastRenewal: NOW - 60_000, server: { anchor: "A", list: "L", pending: [], stale: ["m2"] } }))).toEqual({ kind: "none" });
-    expect(managerUpkeep(input({ current: false, lastRenewal: NOW - 60_000 }))).toEqual({ kind: "none" });
+    expect(managerUpkeep(input({ current: false, renewable: true, lastRenewal: NOW - 60_000, server: { anchor: "A", list: "L", pending: [], stale: ["m2"] } }))).toEqual({ kind: "none" });
+    expect(managerUpkeep(input({ current: false, renewable: true, lastRenewal: NOW - 60_000 }))).toEqual({ kind: "none" });
   });
   it("does not renew for expiry with a device that expires as soon", () => {
     expect(managerUpkeep(input({ view: view({ list_signer_expires_at: NOW + 3 * DAY }), ownExpiry: NOW + 2 * DAY }))).toEqual({ kind: "none" });
@@ -41,7 +45,8 @@ describe("manager list upkeep (6b)", () => {
     expect(managerUpkeep(input({ server, asked: new Set(["@confirmers"]) })).kind).toBe("none");
     expect(managerUpkeep(input({ me: "conf", server })).kind).toBe("none");
     // A lapsed pair is renewed (keeping the server's membership) before any confirmer change.
-    expect(managerUpkeep(input({ server, current: false }))).toEqual({ kind: "publish", managers: null, renewal: true, consumed: [] });
+    expect(managerUpkeep(input({ server, current: false, renewable: true }))).toEqual({ kind: "publish", managers: null, renewal: true, consumed: [] });
+    expect(managerUpkeep(input({ server, current: false })).kind).toBe("none");
   });
   it("does nothing until the server's newest list has been checked", () => {
     const server = { anchor: "A", list: "L2", pending: ["p"], stale: ["m2", "conf"] };

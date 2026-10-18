@@ -107,6 +107,7 @@ export class MlsRuntime {
   private managers: Managers | null = null;
   /** Whether the server's manager pair is current for this device (false: it needs renewing). */
   private managersCurrent = true;
+  private managersRenewable = false;
   /** The server list `managersCurrent` and `ownerView()` were last checked against. */
   private verifiedList: string | null = null;
   private ownerChecks: Promise<void> = Promise.resolve();
@@ -247,6 +248,8 @@ export class MlsRuntime {
   /** False when the server shows a manager pair that is no longer current (an expired, revoked or
    * former signer): the owner or a confirmer renews it. */
   serverManagersCurrent(): boolean { return this.managersCurrent; }
+  /** The server's pair is not current and this device may renew it (checked by the agent). */
+  serverManagersRenewable(): boolean { return this.managersRenewable; }
   /** True once the server's newest list has been checked: until then the view describes an older one. */
   managersSettled(): boolean { return !this.managers?.list || this.verifiedList === this.managers.list; }
   /**
@@ -343,7 +346,8 @@ export class MlsRuntime {
     if (managers?.anchor && managers.list) {
       const anchor = decodeBase64Url(managers.anchor), list = decodeBase64Url(managers.list);
       const check = await this.engine.run(() => this.engine.call(a => a.accept_managers?.(server, anchor, list, this.now(), this.options.revocations())));
-      this.managersCurrent = check?.kind !== "not_current";
+      this.managersCurrent = check?.kind !== "not_current" && check?.kind !== "renewable";
+      this.managersRenewable = check?.kind === "renewable";
     }
     this.owner = await this.engine.run(async () => this.engine.withAgent(a => a.owner_view?.(server) ?? null));
     this.verifiedList = managers?.list ?? null;

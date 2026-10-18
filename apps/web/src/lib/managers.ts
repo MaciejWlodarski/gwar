@@ -22,6 +22,9 @@ export interface UpkeepInput {
   server: Managers;
   /** Whether the server's pair is current for this device. */
   current: boolean;
+  /** Whether the agent found a pair that is not current renewable by this device (its anchor is
+   * current and names this user owner or confirmer, even without an accepted checkpoint). */
+  renewable: boolean;
   /** Whether `view` and `current` describe the server's newest pair (its check has finished). */
   settled: boolean;
   /** People this client just gave `channel_edit` on this connection. */
@@ -44,11 +47,12 @@ export interface UpkeepInput {
 export function managerUpkeep(i: UpkeepInput): Upkeep {
   const { view, server } = i;
   const isOwner = view.owner === i.me;
-  if ((!isOwner && !view.confirmers.includes(i.me)) || !i.settled) return { kind: "none" };
+  if (!i.settled) return { kind: "none" };
   // A pair that is no longer current is renewed first, keeping the server's verified membership:
   // this device's own checkpoint may be older (changes are made against a current list only).
   const renewable = i.now - i.lastRenewal > 10 * 60_000;
-  if (server.anchor && !i.current) return renewable ? { kind: "publish", managers: null, renewal: true, consumed: [] } : { kind: "none" };
+  if (server.anchor && !i.current) return i.renewable && renewable ? { kind: "publish", managers: null, renewal: true, consumed: [] } : { kind: "none" };
+  if (!isOwner && !view.confirmers.includes(i.me)) return { kind: "none" };
   const staleConfirmers = view.confirmers.filter((c) => server.stale.includes(c));
   if (isOwner && staleConfirmers.length && !i.asked.has("@confirmers")) {
     return { kind: "staleConfirmers", keep: view.confirmers.filter((c) => !staleConfirmers.includes(c)), stale: staleConfirmers };

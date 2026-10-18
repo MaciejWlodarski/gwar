@@ -1175,7 +1175,7 @@ class Controller {
     // One prompt at a time: an unanswered one is never replaced; the next comes after it closes.
     const idle = useUi.getState().dialog.kind === "none";
     const action = managerUpkeep({
-      me, view, server, current: runtime.serverManagersCurrent(), settled: runtime.managersSettled(), granted: this.grantedByMe, asked: this.askedManagers,
+      me, view, server, current: runtime.serverManagersCurrent(), renewable: runtime.serverManagersRenewable(), settled: runtime.managersSettled(), granted: this.grantedByMe, asked: this.askedManagers,
       now: Date.now(), ownExpiry: conn.identity.device?.expires_at ?? Infinity, lastRenewal: this.lastRenewal,
     });
     const settle = (work: Promise<void>, what: string) => {
@@ -1190,7 +1190,16 @@ class Controller {
         settle(runtime.publishManagers(action.managers), "Manager list:");
         return;
       case "staleConfirmers": {
-        if (!this.ownerSigningNeedsPassword()) { this.askedManagers.add("@confirmers"); settle(this.setConfirmers(action.keep), "Confirmers:"); return; }
+        if (!this.ownerSigningNeedsPassword()) {
+          // Done once per connection when it succeeds; a failure (e.g. the list changed meanwhile)
+          // is tried again against fresh state a minute later.
+          this.askedManagers.add("@confirmers");
+          settle(this.setConfirmers(action.keep).catch((error) => {
+            setTimeout(() => { if (this.conn === conn) { this.askedManagers.delete("@confirmers"); this.maintainManagers(); } }, 60_000);
+            throw error;
+          }), "Confirmers:");
+          return;
+        }
         if (!idle) return;
         this.askedManagers.add("@confirmers");
         const names = action.stale.map((u) => state.members[u]?.nickname ?? u).join(", ");
