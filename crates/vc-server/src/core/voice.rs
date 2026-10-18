@@ -295,6 +295,11 @@ impl Core {
     pub(super) fn voice_group_channel(&self, group: &str) -> Option<ChannelId> {
         self.calls.iter().find(|(_, c)| c.group.as_ref().is_some_and(|g| g.id == group)).map(|(id, _)| *id)
     }
+    /// The call of `group` as `session` may know it: a hidden channel's voice group is unknown to
+    /// it, like a missing one (6a, 6c).
+    pub(super) fn voice_group_visible(&self, session: SessionId, group: &str) -> Option<ChannelId> {
+        self.voice_group_channel(group).filter(|&c| self.admitted(self.sessions.get(&session), c))
+    }
     fn voice_access(&self, session: SessionId, channel: ChannelId) -> Result<(), ErrorBody> {
         let s = self.sessions.get(&session).ok_or_else(stale)?;
         if s.channel != Some(channel) || s.participation.is_none() {

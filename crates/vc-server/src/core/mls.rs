@@ -217,7 +217,7 @@ impl Core {
         if *count > TREE_REQUESTS_PER_MINUTE {
             return Err(TreeRefusal::TooManyRequests);
         }
-        if let Some(channel) = self.voice_group_channel(group) {
+        if let Some(channel) = self.voice_group_visible(session, group) {
             self.voice_info(session, channel).map_err(|_| TreeRefusal::NotFound)?;
             if let Some((epoch, tree)) = self.mls_trees.get(group) {
                 return Ok((*epoch, tree.clone()));
@@ -245,7 +245,7 @@ impl Core {
     }
 
     fn mls_group_for(&self, session: SessionId, group: &str) -> Result<GroupRow, ErrorBody> {
-        if self.voice_group_channel(group).is_some() {
+        if self.voice_group_visible(session, group).is_some() {
             return Err(bad("voice has no chat or history"));
         }
         if vc_proto::decode_fixed::<32>(group).is_none() {
@@ -446,7 +446,7 @@ impl Core {
                 self.mls_create(session, &conversation, &group_info)
             }
             MlsRequest::GroupInfo { group } => {
-                if let Some(channel) = self.voice_group_channel(&group) {
+                if let Some(channel) = self.voice_group_visible(session, &group) {
                     return self.voice_info(session, channel);
                 }
                 let row = self.mls_group_for(session, &group)?;
@@ -461,7 +461,7 @@ impl Core {
                 {
                     return Err(bad("voice binding on chat group"));
                 }
-                if self.voice_group_channel(&group).is_some() || voice.is_some() {
+                if self.voice_group_visible(session, &group).is_some() || voice.is_some() {
                     if welcome.is_some() {
                         return Err(bad("voice takes no Welcome"));
                     }
@@ -477,7 +477,7 @@ impl Core {
                 self.mls_commit(session, &group, epoch, &commit, &group_info, welcome.as_deref())
             }
             MlsRequest::Log { group, since, limit: requested } => {
-                if let Some(channel) = self.voice_group_channel(&group) {
+                if let Some(channel) = self.voice_group_visible(session, &group) {
                     return self.voice_log(session, channel, since, requested);
                 }
                 let row = self.mls_group_for(session, &group)?;
