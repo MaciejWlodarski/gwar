@@ -308,6 +308,11 @@ export const accountActions = {
     await refresh(await flows.changePassword(await current(), p, deps()));
   },
 
+  /** Sets a recovery code the person already kept (shown by `newRecoveryCode`); the old one stops working. */
+  async changeRecoveryCode(password: string, code: string): Promise<void> {
+    await refresh(await flows.changeRecoveryCode(await current(), password, code, deps()));
+  },
+
   /** Signs a statement with the account key (owner links, confirmer anchors). */
   async signStatement(statement: string, password: string): Promise<{ accountKey: string; signature: string }> {
     return flows.signStatement(await current(), statement, password, deps());
