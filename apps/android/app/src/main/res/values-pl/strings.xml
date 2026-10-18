@@ -20,8 +20,6 @@
     <string name="server_disconnect">Rozłącz z serwerem</string>
     <string name="server_join">Dołącz do %1$s</string>
     <string name="server_leave">Wyjdź</string>
-    <string name="server_in_channel">Na kanale %1$s</string>
-    <string name="server_no_audio_yet">Głos nie jest jeszcze dostępny w aplikacji na Androida</string>
     <string name="server_lobby">Na serwerze (%1$d)</string>
     <string name="server_you">%1$s (ty)</string>
     <string name="server_away">nieobecny</string>
@@ -62,4 +60,22 @@
     <string name="closed_removed">%1$s usunął(ęła) Cię z serwera.</string>
     <string name="closed_shutdown">Serwer został wyłączony.</string>
     <string name="closed_replaced">Połączono z tym serwerem z innego miejsca.</string>
+
+    <string name="voice_off">Na kanale, bez głosu</string>
+    <string name="voice_connecting">Łączenie głosu…</string>
+    <string name="voice_connected">Głos połączony</string>
+    <string name="voice_reconnecting">Utracono głos, łączenie ponownie…</string>
+    <string name="voice_mute">Wycisz mikrofon</string>
+    <string name="voice_unmute">Włącz mikrofon</string>
+    <string name="voice_deafen">Wycisz dźwięk</string>
+    <string name="voice_undeafen">Włącz dźwięk</string>
+    <string name="voice_notification_channel">Rozmowy głosowe</string>
+    <string name="voice_notification_title">Na kanale %1$s</string>
+    <string name="voice_notification_text">Głos w Gwarze jest włączony. Dotknij, aby otworzyć.</string>
+    <string name="notice_microphone_needed">Dołączono bez głosu: Gwar potrzebuje uprawnienia do mikrofonu.</string>
+    <string name="error_not_in_channel">Najpierw dołącz do kanału.</string>
+    <string name="error_encrypted_voice">Głos na tym kanale jest szyfrowany end-to-end, czego aplikacja na Androida jeszcze nie obsługuje. Jesteś na kanale bez głosu.</string>
+    <string name="error_microphone_denied">Gwar nie ma dostępu do mikrofonu. Zezwól na niego w ustawieniach systemu.</string>
+    <string name="error_voice">Nie udało się uruchomić głosu: %1$s</string>
+    <string name="voice_details">wysłane %1$d · odebrane %2$d · luki %3$d · mikrofon %4$d dB</string>
 </resources>

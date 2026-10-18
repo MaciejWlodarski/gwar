@@ -20,6 +20,8 @@ required-features = ["bindgen"]
 bindgen = ["uniffi/cli"]
 
 [dependencies]
+anyhow.workspace = true
+rtrb = "0.4"
 vc-client = { path = "../vc-client" }
 vc-proto = { path = "../vc-proto" }
 serde.workspace = true
@@ -29,5 +31,10 @@ tokio.workspace = true
 tracing.workspace = true
 uniffi = "0.32"
 
+# AAudio input presets and usages need API level 28 (the app's minSdk).
+[target.'cfg(target_os = "android")'.dependencies]
+ndk = { version = "0.9", default-features = false, features = ["audio", "api-level-28"] }
+
 [dev-dependencies]
 vc-server = { path = "../vc-server" }
+url = "2"

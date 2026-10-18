@@ -21,7 +21,10 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.Login
 import androidx.compose.material.icons.automirrored.outlined.Logout
 import androidx.compose.material.icons.outlined.EnhancedEncryption
+import androidx.compose.material.icons.outlined.CallEnd
+import androidx.compose.material.icons.outlined.Headset
 import androidx.compose.material.icons.outlined.HeadsetOff
+import androidx.compose.material.icons.outlined.Mic
 import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.MicOff
 import androidx.compose.material.icons.outlined.Tag
@@ -30,7 +33,9 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -58,7 +63,9 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import app.gwar.android.R
-import app.gwar.core.AppException
+import app.gwar.android.Notice
+import app.gwar.android.VoiceState
+import app.gwar.core.VoiceLink
 import app.gwar.core.ChannelView
 import app.gwar.core.ClientPlatform
 import app.gwar.core.ClientView
@@ -70,10 +77,13 @@ private const val INDENT = 18
 @Composable
 fun ServerScreen(
     view: ServerView,
-    notice: AppException?,
+    voice: VoiceState?,
+    notice: Notice?,
     onOpenChat: (UInt) -> Unit,
     onJoin: (UInt, String?) -> Unit,
     onLeave: () -> Unit,
+    onToggleMute: () -> Unit,
+    onToggleDeafen: () -> Unit,
     onDisconnect: () -> Unit,
     onDismissNotice: () -> Unit,
 ) {
@@ -105,28 +115,7 @@ fun ServerScreen(
         },
         bottomBar = {
             if (myChannel != null) {
-                Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh) {
-                    Row(
-                        Modifier.fillMaxWidth().navigationBarsPadding().padding(start = 16.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Column(Modifier.weight(1f)) {
-                            Text(
-                                stringResource(R.string.server_in_channel, myChannel.name),
-                                style = MaterialTheme.typography.bodyMedium,
-                                fontWeight = FontWeight.Medium,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            Text(
-                                stringResource(R.string.server_no_audio_yet),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                        TextButton(onClick = onLeave) { Text(stringResource(R.string.server_leave)) }
-                    }
-                }
+                VoiceBar(myChannel.name, voice, onToggleMute, onToggleDeafen, onLeave)
             }
         },
         snackbarHost = { SnackbarHost(snackbar) },
@@ -333,9 +322,9 @@ private fun PasswordDialog(channelName: String, onJoin: (String) -> Unit, onDism
     )
 }
 
-/** Shows a failed action once in the snackbar. */
+/** Shows a notice once in the snackbar. */
 @Composable
-fun NoticeEffect(notice: AppException?, snackbar: SnackbarHostState, onShown: () -> Unit) {
+fun NoticeEffect(notice: Notice?, snackbar: SnackbarHostState, onShown: () -> Unit) {
     val text = notice?.let { describe(it) }
     LaunchedEffect(notice) {
         if (text != null) {
@@ -345,3 +334,86 @@ fun NoticeEffect(notice: AppException?, snackbar: SnackbarHostState, onShown: ()
     }
 }
 
+
+/** The channel I am in, the call's state and its controls. */
+@Composable
+private fun VoiceBar(
+    channelName: String,
+    voice: VoiceState?,
+    onToggleMute: () -> Unit,
+    onToggleDeafen: () -> Unit,
+    onLeave: () -> Unit,
+) {
+    Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh) {
+        Row(
+            Modifier.fillMaxWidth().navigationBarsPadding().padding(start = 16.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            // Tapping the status shows the engine's counters, for trying the app on real phones.
+            var details by rememberSaveable { mutableStateOf(false) }
+            Column(Modifier.weight(1f).clickable(enabled = voice?.status != null) { details = !details }) {
+                Text(
+                    channelName,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                val link = voice?.status?.link
+                val (text, color) = when {
+                    voice == null -> stringResource(R.string.voice_off) to MaterialTheme.colorScheme.onSurfaceVariant
+                    link == VoiceLink.CONNECTED -> stringResource(R.string.voice_connected) to GwarColors.talking
+                    link == VoiceLink.LOST -> stringResource(R.string.voice_reconnecting) to GwarColors.warn
+                    else -> stringResource(R.string.voice_connecting) to MaterialTheme.colorScheme.onSurfaceVariant
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (voice?.status?.transmitting == true) {
+                        Box(Modifier.size(8.dp).background(GwarColors.talking, CircleShape))
+                        Spacer(Modifier.size(6.dp))
+                    }
+                    Text(text, style = MaterialTheme.typography.bodySmall, color = color, maxLines = 1)
+                }
+                val status = voice?.status
+                if (details && status != null) {
+                    Text(
+                        stringResource(
+                            R.string.voice_details,
+                            status.framesSent.toLong(),
+                            status.framesReceived.toLong(),
+                            status.underruns.toLong(),
+                            status.inputLevelDb.toInt(),
+                        ),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            if (voice != null) {
+                val off = MaterialTheme.colorScheme.error
+                IconButton(onClick = onToggleMute) {
+                    if (voice.muted || voice.deafened) {
+                        Icon(Icons.Outlined.MicOff, stringResource(R.string.voice_unmute), tint = off)
+                    } else {
+                        Icon(Icons.Outlined.Mic, stringResource(R.string.voice_mute))
+                    }
+                }
+                IconButton(onClick = onToggleDeafen) {
+                    if (voice.deafened) {
+                        Icon(Icons.Outlined.HeadsetOff, stringResource(R.string.voice_undeafen), tint = off)
+                    } else {
+                        Icon(Icons.Outlined.Headset, stringResource(R.string.voice_deafen))
+                    }
+                }
+            }
+            FilledIconButton(
+                onClick = onLeave,
+                colors = IconButtonDefaults.filledIconButtonColors(
+                    containerColor = MaterialTheme.colorScheme.error,
+                    contentColor = MaterialTheme.colorScheme.onError,
+                ),
+            ) {
+                Icon(Icons.Outlined.CallEnd, stringResource(R.string.server_leave))
+            }
+        }
+    }
+}

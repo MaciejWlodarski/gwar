@@ -6,6 +6,7 @@ import app.gwar.android.R
 import app.gwar.core.AddressError
 import app.gwar.core.AppException
 import app.gwar.core.CloseReason
+import app.gwar.android.Notice
 
 @Composable
 fun describe(error: AppException): String = when (error) {
@@ -25,6 +26,10 @@ fun describe(error: AppException): String = when (error) {
         else -> stringResource(R.string.error_refused, error.detail)
     }
     is AppException.Timeout -> stringResource(R.string.error_timeout)
+    is AppException.NotInChannel -> stringResource(R.string.error_not_in_channel)
+    is AppException.EncryptedVoice -> stringResource(R.string.error_encrypted_voice)
+    is AppException.MicrophoneDenied -> stringResource(R.string.error_microphone_denied)
+    is AppException.Voice -> stringResource(R.string.error_voice, error.detail)
     is AppException.NotConnected -> stringResource(R.string.error_not_connected)
     is AppException.Network -> stringResource(R.string.error_network, error.detail)
     is AppException.Protocol -> stringResource(R.string.error_protocol, error.detail)
@@ -42,4 +47,10 @@ fun describe(reason: CloseReason): String = when (reason) {
     is CloseReason.Removed -> stringResource(R.string.closed_removed, reason.by)
     CloseReason.ServerShutdown -> stringResource(R.string.closed_shutdown)
     CloseReason.Replaced -> stringResource(R.string.closed_replaced)
+}
+
+@Composable
+fun describe(notice: Notice): String = when (notice) {
+    is Notice.Failed -> describe(notice.error)
+    Notice.MicrophoneNeeded -> stringResource(R.string.notice_microphone_needed)
 }

@@ -21,8 +21,6 @@
     <string name="server_disconnect">Disconnect from server</string>
     <string name="server_join">Join %1$s</string>
     <string name="server_leave">Leave</string>
-    <string name="server_in_channel">In %1$s</string>
-    <string name="server_no_audio_yet">Voice is not available in the Android app yet</string>
     <string name="server_lobby">On the server (%1$d)</string>
     <string name="server_you">%1$s (you)</string>
     <string name="server_away">away</string>
@@ -63,4 +61,22 @@
     <string name="closed_removed">%1$s removed you from the server.</string>
     <string name="closed_shutdown">The server shut down.</string>
     <string name="closed_replaced">You connected to this server from somewhere else.</string>
+
+    <string name="voice_off">In the channel, without voice</string>
+    <string name="voice_connecting">Connecting voice…</string>
+    <string name="voice_connected">Voice connected</string>
+    <string name="voice_reconnecting">Voice lost, reconnecting…</string>
+    <string name="voice_mute">Mute microphone</string>
+    <string name="voice_unmute">Unmute microphone</string>
+    <string name="voice_deafen">Deafen</string>
+    <string name="voice_undeafen">Undeafen</string>
+    <string name="voice_notification_channel">Voice calls</string>
+    <string name="voice_notification_title">In %1$s</string>
+    <string name="voice_notification_text">Gwar voice is on. Tap to open.</string>
+    <string name="notice_microphone_needed">Joined without voice: Gwar needs the microphone permission for voice.</string>
+    <string name="error_not_in_channel">Join a channel first.</string>
+    <string name="error_encrypted_voice">Voice in this channel is end-to-end encrypted, which the Android app does not support yet. You are in the channel without voice.</string>
+    <string name="error_microphone_denied">Gwar is not allowed to use the microphone. Allow it in the system settings.</string>
+    <string name="error_voice">Voice could not start: %1$s</string>
+    <string name="voice_details">sent %1$d · received %2$d · gaps %3$d · mic %4$d dB</string>
 </resources>

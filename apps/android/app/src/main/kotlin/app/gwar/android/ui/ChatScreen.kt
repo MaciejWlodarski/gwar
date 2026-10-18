@@ -48,7 +48,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import app.gwar.android.ChatState
 import app.gwar.android.R
-import app.gwar.core.AppException
+import app.gwar.android.Notice
 import app.gwar.core.ChannelView
 import app.gwar.core.ChatLine
 import app.gwar.core.Verification
@@ -60,7 +60,7 @@ import java.util.Date
 fun ChatScreen(
     channel: ChannelView,
     chat: ChatState?,
-    notice: AppException?,
+    notice: Notice?,
     onBack: () -> Unit,
     onSend: (String) -> Unit,
     onLoadOlder: () -> Unit,

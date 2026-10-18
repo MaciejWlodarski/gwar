@@ -139,6 +139,11 @@ impl ServerState {
         &self.uid
     }
 
+    /// The voice channel I am in.
+    pub fn my_channel(&self) -> Option<ChannelId> {
+        self.clients.get(&self.session).and_then(|c| c.channel)
+    }
+
     pub fn channel(&self, id: ChannelId) -> Option<&Channel> {
         self.channels.get(&id)
     }
@@ -304,7 +309,7 @@ impl ServerState {
             server_key: self.server_key.clone(),
             my_session: self.session,
             my_uid: self.uid.clone(),
-            my_channel: self.clients.get(&self.session).and_then(|c| c.channel),
+            my_channel: self.my_channel(),
             channels,
             lobby,
         }

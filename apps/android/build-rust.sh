@@ -13,7 +13,7 @@ root="$(cd "$here/../.." && pwd)"
 out="$here/app/build/rust"
 abis="${GWAR_ANDROID_ABIS:-arm64-v8a}"
 profile="${GWAR_RUST_PROFILE:-release}"
-min_sdk=26
+min_sdk=28
 
 # A rustup toolchain, not a system Rust that lacks the Android targets.
 if command -v rustup >/dev/null; then

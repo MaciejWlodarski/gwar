@@ -1,14 +1,18 @@
 //! The FFI surface against a real in-process server, as the Android app drives it.
 
 use std::{
-    sync::{Arc, Mutex, mpsc},
-    time::Duration,
+    sync::{Arc, Mutex, atomic::AtomicBool, mpsc},
+    thread,
+    time::{Duration, Instant},
 };
 
 use gwar_app::{
     AppError, CloseReason, ConnectRequest, GwarApp, SessionListener,
     state::{ChatLine, ServerView, Verification},
+    voice::VoiceLink,
 };
+use rtrb::RingBuffer;
+use vc_client::voice::io::{AudioIo, AudioPorts, CaptureSample, OutputTiming};
 
 #[derive(Debug)]
 #[allow(dead_code)] // fields show in failure output
@@ -191,5 +195,117 @@ async fn a_different_server_key_at_a_pinned_address_is_refused() {
     app.forget_server(other_endpoint).unwrap();
     let (l, _rx) = listener();
     app.connect(request(&format!("ws://{}", other.http), "ania"), l).await.unwrap().disconnect();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A 10 ms device: a 440 Hz microphone (or silence) and a recorded speaker.
+struct FakeIo {
+    heard: Arc<Mutex<Vec<f32>>>,
+    tone: bool,
+}
+
+impl AudioIo for FakeIo {
+    fn open(self: Box<Self>) -> anyhow::Result<AudioPorts> {
+        let (mut mic_tx, mic) = RingBuffer::new(48_000);
+        let (speaker, mut speaker_rx) = RingBuffer::new(24_000);
+        let output = Arc::new(OutputTiming::default());
+        let timing = output.clone();
+        let (heard, tone) = (self.heard, self.tone);
+        thread::spawn(move || {
+            let mut t = 0u64;
+            loop {
+                for _ in 0..480 {
+                    let s = if tone { (t as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.3 } else { 0.0 };
+                    if mic_tx.push(CaptureSample { captured_at: Instant::now(), position: t, value: s }).is_err() {
+                        return;
+                    }
+                    t += 1;
+                }
+                let missing = 480usize.saturating_sub(speaker_rx.slots());
+                let mut out = heard.lock().unwrap();
+                for _ in 0..480 {
+                    out.push(speaker_rx.pop().unwrap_or(0.0));
+                }
+                drop(out);
+                timing.report(480, missing);
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        Ok(AudioPorts { mic, speaker, output, _guard: Box::new(()) })
+    }
+}
+
+fn rms_of_last_second(heard: &Mutex<Vec<f32>>) -> f32 {
+    let samples = heard.lock().unwrap();
+    let tail = &samples[samples.len().saturating_sub(48_000)..];
+    (tail.iter().map(|s| s * s).sum::<f32>() / tail.len().max(1) as f32).sqrt()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn voice_reaches_the_other_app_and_mute_stops_it() {
+    let server = server().await;
+    let address = format!("ws://{}", server.http);
+    let (a_dir, b_dir) = (data_dir("voice-a"), data_dir("voice-b"));
+    let (l, _a_rx) = listener();
+    let a = GwarApp::new(a_dir.clone()).unwrap().connect(request(&address, "ania"), l).await.unwrap();
+    let (l, b_rx) = listener();
+    let b = GwarApp::new(b_dir.clone()).unwrap().connect(request(&address, "bartek"), l).await.unwrap();
+
+    let silent = Arc::new(AtomicBool::new(false));
+    assert!(matches!(
+        a.start_voice_with(Box::new(FakeIo { heard: Default::default(), tone: true }), silent.clone()).await,
+        Err(AppError::NotInChannel)
+    ));
+    let lobby = a.view().channels.iter().find(|c| c.is_default).unwrap().id;
+    a.join_channel(lobby, None).await.unwrap();
+    b.join_channel(lobby, None).await.unwrap();
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    a.start_voice_with(Box::new(FakeIo { heard: Default::default(), tone: true }), silent.clone()).await.unwrap();
+    b.start_voice_with(Box::new(FakeIo { heard: heard.clone(), tone: false }), silent.clone()).await.unwrap();
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let status = b.voice_status().unwrap();
+    assert_eq!(status.link, VoiceLink::Connected);
+    assert!(status.frames_received > 0, "{status:?}");
+    assert!(a.voice_status().unwrap().transmitting);
+    let level = rms_of_last_second(&heard);
+    assert!(level > 0.05, "B heard rms {level} over the last second");
+
+    // Muting stops the tone, and the server tells the others.
+    a.set_muted(true).await.unwrap();
+    wait(&b_rx, |h| match h {
+        Heard::View(v) => {
+            v.channels.iter().flat_map(|c| &c.clients).any(|c| c.nickname == "ania" && c.muted).then_some(())
+        }
+        _ => None,
+    });
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let level = rms_of_last_second(&heard);
+    assert!(level < 0.01, "B still heard rms {level} after A muted");
+
+    // Unmuting while deafened also undeafens.
+    a.set_deafened(true).await.unwrap();
+    a.set_muted(false).await.unwrap();
+    assert!(!a.deafened());
+
+    // Leaving the channel stops voice.
+    a.leave_channel().await.unwrap();
+    assert!(a.voice_status().is_none());
+    std::fs::remove_dir_all(a_dir).unwrap();
+    std::fs::remove_dir_all(b_dir).unwrap();
+}
+
+/// The server drops a connection that sends nothing for 60 s; the session pings.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "takes 75 s"]
+async fn an_idle_session_stays_connected() {
+    let server = server().await;
+    let dir = data_dir("idle");
+    let (l, rx) = listener();
+    let session =
+        GwarApp::new(dir.clone()).unwrap().connect(request(&format!("ws://{}", server.http), "ania"), l).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(75)).await;
+    assert!(!rx.try_iter().any(|h| matches!(h, Heard::Closed(_))), "the server closed an idle session");
+    session.history(session.view().channels[0].id, None).await.unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }

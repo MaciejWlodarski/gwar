@@ -2765,12 +2765,16 @@ dependencies = [
 name = "gwar-app"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "ndk",
+ "rtrb",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
  "uniffi",
+ "url",
  "vc-client",
  "vc-proto",
  "vc-server",

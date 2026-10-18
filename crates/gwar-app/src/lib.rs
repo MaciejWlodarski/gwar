@@ -2,16 +2,22 @@
 //! through UniFFI-generated Kotlin; the UI stays native, the logic stays here.
 //!
 //! Scope today: device identity, server address and key pinning, the server's
-//! channel tree and presence, joining channels and plaintext channel chat.
-//! Encrypted chat, direct messages and voice come later (docs/mobile.md).
+//! channel tree and presence, joining channels, voice and plaintext channel
+//! chat. Encrypted chat and voice, and direct messages come later (docs/mobile.md).
 
+#[cfg(target_os = "android")]
+mod aaudio;
 pub mod address;
 pub mod state;
 pub mod store;
+pub mod voice;
 
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 use address::{AddressError, ServerAddress};
@@ -19,6 +25,8 @@ use serde::Deserialize;
 use state::{Change, ChatLine, ServerState, ServerView};
 use store::{LastServer, Store, StoreError};
 use tokio::{runtime::Runtime, task::AbortHandle};
+use vc_client::voice::io::AudioIo;
+use voice::{Voice, VoiceStatus};
 
 /// The core's own tokio runtime. Dropped without waiting, so the last
 /// reference may go from any thread, a runtime's own included.
@@ -40,12 +48,17 @@ impl Drop for Core {
     }
 }
 use vc_client::{ClientError, ConnectOptions, Connection};
-use vc_proto::{ChatMessage, ChatReadTarget, ChatTarget, ClientSoftware, LeaveReason, Platform, Request};
+use vc_proto::{ChatMessage, ChatReadTarget, ChatTarget, ClientSoftware, ClientUpdate, LeaveReason, Platform, Request};
 
 uniffi::setup_scaffolding!();
 
 /// Messages per history page.
 const HISTORY_PAGE: u32 = 50;
+/// The server drops a connection silent for 60 s; the web app pings as often.
+const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+const PING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Up to 2 s, in 20 ms steps, for the event of my own channel join.
+const JOIN_SETTLE_POLLS: u32 = 100;
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum AppError {
@@ -59,6 +72,17 @@ pub enum AppError {
     Refused { code: String, detail: String },
     #[error("timed out")]
     Timeout,
+    /// Voice needs to be in a channel first.
+    #[error("not in a voice channel")]
+    NotInChannel,
+    /// Encrypted voice is not in the native apps yet.
+    #[error("encrypted voice is not supported here yet")]
+    EncryptedVoice,
+    #[error("microphone permission denied")]
+    MicrophoneDenied,
+    /// Voice could not start: the audio device or the media connection failed.
+    #[error("{detail}")]
+    Voice { detail: String },
     #[error("not connected")]
     NotConnected,
     #[error("{detail}")]
@@ -249,55 +273,117 @@ impl GwarApp {
             state,
             runtime: self.runtime.clone(),
             events: events.abort_handle(),
+            endpoint,
+            voice: Mutex::new(None),
+            voice_run: AtomicU64::new(0),
+            muted: AtomicBool::new(false),
+            deafened: AtomicBool::new(false),
         }))
     }
+}
+
+/// `host:port` of a `ws(s)://host[:port]/path` endpoint, for name resolution.
+fn server_host(endpoint: &str) -> Option<String> {
+    let (scheme, rest) = endpoint.split_once("://")?;
+    let authority = rest.split('/').next()?;
+    // `[v6]:port` or `host:port`; a bare `[v6]` has its colons inside the brackets.
+    let port_given = authority.rsplit_once(']').map_or(authority, |(_, after)| after).contains(':');
+    let default_port = if scheme == "wss" { 443 } else { 80 };
+    Some(if port_given { authority.to_owned() } else { format!("{authority}:{default_port}") })
 }
 
 fn join_error(e: tokio::task::JoinError) -> AppError {
     AppError::Protocol { detail: e.to_string() }
 }
 
+/// Delivers server events to the listener and keeps the connection alive: the
+/// server drops a client that sends nothing for a minute, and an unanswered ping
+/// means the link is dead (a phone that changed networks or slept).
 async fn run_events(
     mut events: tokio::sync::mpsc::Receiver<vc_proto::Event>,
     connection: Connection,
     state: Arc<Mutex<ServerState>>,
     listener: Arc<dyn SessionListener>,
 ) {
+    let (dead_tx, mut dead) = tokio::sync::mpsc::channel::<()>(1);
+    let mut ping = tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
     let mut reason = CloseReason::ConnectionLost;
-    while let Some(event) = events.recv().await {
-        let mut state = state.lock().unwrap();
-        match state.apply(event) {
-            Change::Nothing => {}
-            Change::View => {
-                let view = state.view();
-                drop(state);
-                listener.on_view(view);
-            }
-            Change::Chat(m) => {
-                let line = state.chat_line(&m, connection.verify_message(&m));
-                let read = state.read_on_arrival(&m);
-                let view = state.view();
-                drop(state);
-                if let (Some(message), ChatTarget::Channel(channel)) = (read, m.target) {
-                    let connection = connection.clone();
-                    tokio::spawn(async move {
-                        let target = ChatReadTarget::Channel { channel };
-                        let _ = connection.request(Request::ChatRead { target, message }).await;
-                    });
+    loop {
+        tokio::select! {
+            event = events.recv() => match event {
+                Some(event) => {
+                    if let Some(closed) = deliver(event, &connection, &state, listener.as_ref()) {
+                        reason = closed;
+                    }
                 }
-                if let Some(line) = line {
-                    listener.on_chat(line);
-                }
-                listener.on_view(view);
+                None => break,
+            },
+            _ = ping.tick() => {
+                let (connection, dead) = (connection.clone(), dead_tx.clone());
+                tokio::spawn(async move {
+                    let answered = tokio::time::timeout(PING_TIMEOUT, connection.request(Request::Ping {})).await;
+                    if !matches!(answered, Ok(Ok(_))) {
+                        let _ = dead.try_send(());
+                    }
+                });
             }
-            Change::ChatDeleted { channel, message } => {
-                drop(state);
-                listener.on_chat_deleted(channel, message);
-            }
-            Change::Disconnected(r) => reason = r.into(),
+            _ = dead.recv() => break,
         }
     }
     listener.on_closed(reason);
+}
+
+/// Applies one event and tells the listener; returns why the server is about to close, if it says.
+fn deliver(
+    event: vc_proto::Event,
+    connection: &Connection,
+    state: &Mutex<ServerState>,
+    listener: &dyn SessionListener,
+) -> Option<CloseReason> {
+    let mut state = state.lock().unwrap();
+    match state.apply(event) {
+        Change::Nothing => {}
+        Change::View => {
+            let view = state.view();
+            drop(state);
+            listener.on_view(view);
+        }
+        Change::Chat(m) => {
+            let line = state.chat_line(&m, connection.verify_message(&m));
+            let read = state.read_on_arrival(&m);
+            let view = state.view();
+            drop(state);
+            if let (Some(message), ChatTarget::Channel(channel)) = (read, m.target) {
+                let connection = connection.clone();
+                tokio::spawn(async move {
+                    let target = ChatReadTarget::Channel { channel };
+                    let _ = connection.request(Request::ChatRead { target, message }).await;
+                });
+            }
+            if let Some(line) = line {
+                listener.on_chat(line);
+            }
+            listener.on_view(view);
+        }
+        Change::ChatDeleted { channel, message } => {
+            drop(state);
+            listener.on_chat_deleted(channel, message);
+        }
+        Change::Disconnected(reason) => return Some(reason.into()),
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn server_host_adds_the_default_port() {
+        use super::server_host;
+        assert_eq!(server_host("wss://voice.example.com/ws").unwrap(), "voice.example.com:443");
+        assert_eq!(server_host("ws://10.0.2.2:8790/ws").unwrap(), "10.0.2.2:8790");
+        assert_eq!(server_host("ws://[::1]:8790/ws").unwrap(), "[::1]:8790");
+        assert_eq!(server_host("wss://[::1]/ws").unwrap(), "[::1]:443");
+    }
 }
 
 #[derive(Deserialize)]
@@ -311,6 +397,12 @@ pub struct Session {
     state: Arc<Mutex<ServerState>>,
     runtime: Arc<Core>,
     events: AbortHandle,
+    endpoint: String,
+    voice: Mutex<Option<Voice>>,
+    /// Bumped by every start and stop, so a start that finishes after a stop is dropped.
+    voice_run: AtomicU64,
+    muted: AtomicBool,
+    deafened: AtomicBool,
 }
 
 impl Session {
@@ -321,6 +413,65 @@ impl Session {
     async fn request(&self, request: Request) -> Result<serde_json::Value, AppError> {
         let connection = self.connection()?;
         Ok(self.runtime.spawn(async move { connection.request(request).await }).await.map_err(join_error)??)
+    }
+
+    /// Starts voice in the current channel on `io`; the app uses this device's audio.
+    #[doc(hidden)]
+    pub async fn start_voice_with(&self, io: Box<dyn AudioIo>, audio_lost: Arc<AtomicBool>) -> Result<(), AppError> {
+        let encrypted = {
+            let state = self.state.lock().unwrap();
+            let channel = state.my_channel().ok_or(AppError::NotInChannel)?;
+            state.channel(channel).is_some_and(|c| c.encrypted)
+        };
+        if encrypted {
+            return Err(AppError::EncryptedVoice);
+        }
+        let run = self.voice_run.fetch_add(1, Ordering::SeqCst) + 1;
+        self.voice.lock().unwrap().take();
+        let connection = self.connection()?;
+        let host = server_host(&self.endpoint).ok_or_else(|| AppError::Voice { detail: "invalid endpoint".into() })?;
+        let handle = self
+            .runtime
+            .spawn(async move {
+                let server = tokio::net::lookup_host(host)
+                    .await?
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("the server's name resolves to nothing"))?;
+                vc_client::voice::start(&connection, io, server).await
+            })
+            .await
+            .map_err(join_error)?
+            .map_err(|e| {
+                if vc_client::voice::permission::is_denied(&e) {
+                    AppError::MicrophoneDenied
+                } else {
+                    AppError::Voice { detail: format!("{e:#}") }
+                }
+            })?;
+        let mut voice = self.voice.lock().unwrap();
+        // A stop or a newer start came first: this run is stale (dropping it stops it).
+        if self.voice_run.load(Ordering::SeqCst) == run {
+            let (muted, deafened) = (self.muted.load(Ordering::SeqCst), self.deafened.load(Ordering::SeqCst));
+            *voice = Some(Voice::new(handle, audio_lost, muted, deafened));
+        }
+        Ok(())
+    }
+
+    /// Tells the server, so others see it; the local engine already applied it.
+    async fn push_mute_state(&self) -> Result<(), AppError> {
+        let update = ClientUpdate {
+            muted: Some(self.muted.load(Ordering::SeqCst)),
+            deafened: Some(self.deafened.load(Ordering::SeqCst)),
+            ..Default::default()
+        };
+        self.request(Request::ClientUpdate(update)).await.map(drop)
+    }
+
+    fn apply_mute_state(&self) {
+        if let Some(voice) = self.voice.lock().unwrap().as_ref() {
+            voice.set_muted(self.muted.load(Ordering::SeqCst));
+            voice.set_deafened(self.deafened.load(Ordering::SeqCst));
+        }
     }
 
     fn mark_read(&self, channel: u32, message: Option<u32>) {
@@ -340,12 +491,68 @@ impl Session {
 
     /// Joins a channel; `password` for a channel that has one.
     pub async fn join_channel(&self, channel: u32, password: Option<String>) -> Result<(), AppError> {
-        self.request(Request::ChannelJoin { channel, password: password.filter(|p| !p.is_empty()) }).await.map(drop)
+        self.request(Request::ChannelJoin { channel, password: password.filter(|p| !p.is_empty()) }).await?;
+        // The reply can overtake the event that moves me; voice, started next, needs the move.
+        let state = self.state.clone();
+        self.runtime
+            .spawn(async move {
+                for _ in 0..JOIN_SETTLE_POLLS {
+                    if state.lock().unwrap().my_channel() == Some(channel) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .map_err(join_error)
     }
 
     /// Leaves the voice channel, staying on the server.
     pub async fn leave_channel(&self) -> Result<(), AppError> {
+        self.stop_voice();
         self.request(Request::ChannelLeave {}).await.map(drop)
+    }
+
+    /// Starts voice in the channel I am in, on this device's microphone and speaker.
+    /// Starting again replaces the running engine (after a lost link or a new channel).
+    pub async fn start_voice(&self) -> Result<(), AppError> {
+        let (io, lost) = voice::device_io();
+        self.start_voice_with(io, lost).await
+    }
+
+    pub fn stop_voice(&self) {
+        self.voice_run.fetch_add(1, Ordering::SeqCst);
+        self.voice.lock().unwrap().take();
+    }
+
+    /// `None` without voice.
+    pub fn voice_status(&self) -> Option<VoiceStatus> {
+        self.voice.lock().unwrap().as_ref().map(Voice::status)
+    }
+
+    pub fn muted(&self) -> bool {
+        self.muted.load(Ordering::SeqCst)
+    }
+
+    pub fn deafened(&self) -> bool {
+        self.deafened.load(Ordering::SeqCst)
+    }
+
+    /// Unmuting while deafened also undeafens, like the other Gwar apps.
+    pub async fn set_muted(&self, muted: bool) -> Result<(), AppError> {
+        self.muted.store(muted, Ordering::SeqCst);
+        if !muted {
+            self.deafened.store(false, Ordering::SeqCst);
+        }
+        self.apply_mute_state();
+        self.push_mute_state().await
+    }
+
+    /// Deafened also keeps the microphone closed.
+    pub async fn set_deafened(&self, deafened: bool) -> Result<(), AppError> {
+        self.deafened.store(deafened, Ordering::SeqCst);
+        self.apply_mute_state();
+        self.push_mute_state().await
     }
 
     /// Marks which channel's chat is on screen (or none); opening one marks it read.
@@ -390,6 +597,7 @@ impl Session {
 
     /// Closes the connection. The listener hears nothing more.
     pub fn disconnect(&self) {
+        self.stop_voice();
         self.events.abort();
         self.connection.lock().unwrap().take();
     }

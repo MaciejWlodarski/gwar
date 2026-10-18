@@ -1,6 +1,7 @@
 # Native mobile apps
 
-Status: **early, Android first.** iOS follows once Android has voice.
+Status: **early, Android first.** iOS follows once Android voice has been
+tried on real phones.
 
 ## An independent track, for now
 
@@ -45,7 +46,10 @@ apps/android (Kotlin, Compose)        apps/ios (Swift, later)
 `gwar-app` is the shared core of the native apps. It turns server events into
 a view (the channel tree with occupants, the people online but not in a
 channel, unread counts) and exposes a small API: connect, join or leave a
-channel, read and send channel chat. Kotlin gets a fresh `ServerView` on every
+channel, start and stop voice, mute and deafen, read and send channel chat.
+It also keeps the connection alive: the server drops a client that sends
+nothing for a minute, so the session pings every 20 s, as the web app does,
+and an unanswered ping ends the session. Kotlin gets a fresh `ServerView` on every
 change and renders it, so the app holds no protocol logic. Today the
 equivalent logic for the web and desktop apps is TypeScript in `apps/web`;
 the native desktop app will use `gwar-app` instead.
@@ -62,8 +66,17 @@ the native desktop app will use `gwar-app` instead.
 - The channel tree with who is where (muted, deafened, talking, away,
   TeamSpeak users), the people on the server who are in no channel, and unread
   counts that stay in sync with your other devices.
-- Joining and leaving channels (presence only, no audio yet), including
-  channels with a password.
+- Joining and leaving channels, including channels with a password.
+- Voice in plaintext channels, on the same native engine as the desktop app
+  (`vc-client`: 10 ms Opus, adaptive playout, WebRTC to the server's SFU).
+  The microphone and speaker are opened through AAudio as a voice call
+  (`VoiceCommunication` input preset and usage), so the phone's own echo
+  cancellation and noise suppression apply. While voice runs, the phone is in
+  communication mode with call audio focus, sound goes to a connected headset
+  or else the loudspeaker, and a foreground service with an ongoing
+  notification (with a Leave action) keeps the call going with the screen off.
+  Mute and deafen are shown to everyone; a lost link or audio device restarts
+  voice by itself. Tapping the voice status shows the engine's counters.
 - Plaintext channel chat: history with paging, live messages, sending. Every
   message is checked against its author's signature, as on the desktop.
   Messages from TeamSpeak are labeled.
@@ -73,13 +86,13 @@ the native desktop app will use `gwar-app` instead.
 
 Roughly in this order:
 
-1. **Voice.** The `vc-client` engine already cross-compiles for Android
-   (cpal uses AAudio there). Missing: the microphone permission, a foreground
-   service so calls survive the screen turning off, audio focus, routing to
-   Bluetooth and the earpiece, and latency measurements on real phones.
+1. **Voice on real phones**: latency and loss measurements like the desktop's
+   ([latency.md](latency.md)), Bluetooth headsets (needs the Bluetooth
+   permission for routing), an earpiece/loudspeaker switch, push-to-talk,
+   reconnecting the whole session after a network change.
 2. **Identity storage hardening.** Wrap the identity seed with a key from the
    Android Keystore.
-3. **Encrypted chat and direct messages.** These need the MLS client logic
+3. **Encrypted chat, encrypted voice and direct messages.** These need the MLS client logic
    that today lives in `apps/web` (TypeScript over `gwar-mls-wasm`), moved
    into the Rust core so every native app shares it. This waits until the
    main roadmap's encryption stages are finished.
@@ -88,6 +101,9 @@ Roughly in this order:
 5. iOS.
 
 ## Build and run
+
+The app needs Android 9 (API 28) or newer: AAudio's voice call presets start
+there.
 
 Prerequisites: Android SDK with platform 37 and an NDK, JDK 17 or newer,
 rustup with the Android target, `cargo-ndk` and CMake:
@@ -112,15 +128,25 @@ cd apps/android
 `GWAR_RUST_PROFILE=dev` builds the core unoptimized.
 
 Against a local server: the emulator reaches the host machine as `10.0.2.2`.
+For voice, the server must announce a media address both the emulator and
+the host can reach, such as the host's LAN address (`$LAN` below):
 
 ```bash
-cargo run -p vc-server -- --data-dir /tmp/gwar-dev --http 127.0.0.1:8790 --insecure-any-host --no-connect
-cargo run -p gwar-app --example peer -- ws://127.0.0.1:8790 Ola   # someone to talk to
+cargo run -p vc-server -- --data-dir /tmp/gwar-dev --http 127.0.0.1:8790 \
+  --media $LAN:9997 --public-ip $LAN --insecure-any-host --no-connect
+cargo run -p gwar-app --example peer -- ws://127.0.0.1:8790 Ola voice   # someone to talk to
 ```
 
 In the app, enter `10.0.2.2` as the address and turn on "Allow unencrypted
-LAN connection" under "More options".
+LAN connection" under "More options". The peer answers chat messages; with
+`voice` it also joins voice with a quiet 440 Hz tone and prints what it
+hears. Start the emulator with audio (no `-no-audio`); its microphone is
+silent unless host audio input is enabled, so the app receives but does not
+send.
 
 Tests of the core run with the rest of the workspace
-(`cargo test -p gwar-app`), including a session against a real in-process
-server that drives the same API the app uses.
+(`cargo test -p gwar-app`), including sessions against a real in-process
+server that drive the same API the app uses, voice included (a tone from one
+session must reach the other, and muting must stop it).
+`cargo test -p gwar-app -- --ignored` adds a 75 s check that an idle session
+stays connected.
