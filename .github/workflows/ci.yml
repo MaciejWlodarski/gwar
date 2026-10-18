@@ -44,6 +44,10 @@ jobs:
         env:
           VC_TS3_DIR: ${{ runner.temp }}/ts3
         run: cargo test -p vc-client --test teamspeak_mode --test teamspeak_interop -- --test-threads=1
+      - name: SPIKE TeamSpeak password hash
+        env:
+          VC_TS3_DIR: ${{ runner.temp }}/ts3
+        run: cargo test -p vc-server --features test-hooks --test teamspeak_password_spike -- --ignored --nocapture --test-threads=1
       - name: TeamSpeak channel permissions
         env:
           VC_TS3_DIR: ${{ runner.temp }}/ts3
