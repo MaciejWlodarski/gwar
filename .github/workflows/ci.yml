@@ -155,6 +155,7 @@ jobs:
           cargo build -p gwar-connect
           pnpm --filter web exec playwright install --with-deps chromium
           pnpm --filter web e2e:mls
+          pnpm --filter web e2e:private
           pnpm --filter web e2e:dm
           pnpm --filter web e2e:archive
       - name: Desktop engine encrypted voice (native engine driven by the web MLS controller)
