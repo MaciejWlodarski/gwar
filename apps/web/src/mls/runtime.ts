@@ -807,6 +807,9 @@ export class MlsRuntime {
     this.voiceGate(group);
   }
   private async syncGroup(group: string, pending = false, beforeWelcome = false): Promise<boolean | "pruned"> {
+    // Every path that replays a private group first records the access it holds (an interrupted
+    // observation included); a failure to persist it aborts the replay.
+    await this.observeAccess(group);
     // Concurrent joins can lose. Bounded retries yield to backoff instead of
     // holding the device's queue forever on an adversarial/busy server.
     let pages = 0;
