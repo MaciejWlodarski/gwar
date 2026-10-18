@@ -18,7 +18,7 @@ export interface WasmAgent {
   owner_view?(server: string): OwnerView | null;
   sign_manager_list?(statement: string): Uint8Array;
   next_anchor?(server: string, confirmers: string[], signedAt: number): string;
-  next_list?(server: string, anchor: Uint8Array | undefined, managers: string[], signedAt: number): string;
+  next_list?(server: string, anchor: Uint8Array | undefined, managers: string[], signedAt: number, serverList: Uint8Array | undefined): string;
   transfer_statement?(server: string, accountKey: string, newOwner: string, serverAnchor: Uint8Array | undefined, signedAt: number): string;
 }
 export type OwnerCheck =

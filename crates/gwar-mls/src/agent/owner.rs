@@ -140,7 +140,8 @@ impl Agent {
         invite_owner: Option<&str>,
     ) -> Result<OwnerCheck> {
         self.operation(|a| {
-            let chain = chain_of(server, genesis, &links).ok_or(Invalid("owner chain"))?;
+            // A chain that does not verify is no owner record of this server: the caller disconnects.
+            let Some(chain) = chain_of(server, genesis, &links) else { return Ok(OwnerCheck::Changed) };
             let Some(record) = a.servers.get(server) else {
                 if invite_owner.is_some_and(|owner| owner != chain.owner()) {
                     return Ok(OwnerCheck::Changed);
@@ -197,11 +198,14 @@ impl Agent {
         revocations: &dyn Revocations,
     ) -> Result<ManagersCheck> {
         self.operation(|a| {
-            let record = a.servers.get(server).ok_or(Invalid("no owner pin"))?;
+            let Some(record) = a.servers.get(server) else { return Ok(ManagersCheck::NotCurrent) };
             let chain = record.chain(server)?;
             let (Some(new_anchor), Some(new_list)) = (SignedAnchor::parse(anchor), SignedList::parse(list)) else {
                 return Ok(ManagersCheck::NotCurrent);
             };
+            // Current now, even when it is the pair already accepted: a replayed pair whose signer
+            // expired, was revoked or lost authority confers nothing (the checkpoint stays).
+            let current = chain.list_current(&new_anchor, &new_list, now, revocations);
             if let Some((old_anchor, old_list)) = record.pair()? {
                 let (a_seq, l_seq) = (new_anchor.anchor().anchor_seq, new_list.list().seq);
                 let anchor_ok = a_seq > old_anchor.anchor().anchor_seq
@@ -211,11 +215,14 @@ impl Agent {
                 if !anchor_ok || !list_ok {
                     return Ok(ManagersCheck::Rollback);
                 }
+                if !current {
+                    return Ok(ManagersCheck::NotCurrent);
+                }
                 if l_seq == old_list.list().seq {
                     return Ok(ManagersCheck::Unchanged);
                 }
             }
-            if !chain.list_current(&new_anchor, &new_list, now, revocations) {
+            if !current {
                 return Ok(ManagersCheck::NotCurrent);
             }
             let record = a.servers.get_mut(server).expect("present");
@@ -248,35 +255,82 @@ impl Agent {
         .statement())
     }
 
-    /// The next manager list's statement under `anchor` (the accepted one when `None`), signed
-    /// by this device ([`Agent::sign_manager_list`]).
-    pub fn next_list(&self, server: &str, anchor: Option<&[u8]>, managers: &[Uid], signed_at: i64) -> Result<String> {
+    /// The anchor a new statement may be signed under: `supplied` when it is current under the pin
+    /// and no older than the accepted one (same seq only with the same statement), else the
+    /// accepted anchor.
+    fn signing_anchor(&self, server: &str, supplied: Option<&[u8]>) -> Result<(OwnerChain, SignedAnchor)> {
         let record = self.servers.get(server).ok_or(Invalid("no owner pin"))?;
         let chain = record.chain(server)?;
-        let pair = record.pair()?;
-        let anchor = match anchor {
-            Some(bytes) => SignedAnchor::parse(bytes).ok_or(Invalid("anchor"))?,
-            None => pair.as_ref().map(|(a, _)| a.clone()).ok_or(Invalid("no anchor"))?,
+        let accepted = record.pair()?.map(|(a, _)| a);
+        let anchor = match supplied {
+            Some(bytes) => {
+                let anchor = SignedAnchor::parse(bytes).ok_or(Invalid("anchor"))?;
+                if let Some(old) = &accepted {
+                    let seq = anchor.anchor().anchor_seq;
+                    if seq < old.anchor().anchor_seq || (seq == old.anchor().anchor_seq && anchor.hash() != old.hash())
+                    {
+                        return Err(Invalid("an anchor older than the accepted one"));
+                    }
+                }
+                anchor
+            }
+            None => accepted.ok_or(Invalid("no anchor"))?,
         };
+        if !chain.anchor_current(&anchor) {
+            return Err(Invalid("anchor not current"));
+        }
+        Ok((chain, anchor))
+    }
+
+    /// The next manager list's statement under `anchor` (the accepted one when `None`), signed
+    /// by this device ([`Agent::sign_manager_list`]), which must be the current owner's or a
+    /// confirmer's. Its seq follows the accepted list and `server_list` (the server's newest, when
+    /// valid as history), so a device that never accepted a current list can still renew one.
+    pub fn next_list(
+        &self,
+        server: &str,
+        anchor: Option<&[u8]>,
+        managers: &[Uid],
+        signed_at: i64,
+        server_list: Option<&[u8]>,
+    ) -> Result<String> {
+        let (chain, anchor) = self.signing_anchor(server, anchor)?;
+        let me = self.credential.uid();
+        if me != chain.owner() && !anchor.anchor().confirmers.contains(&me) {
+            return Err(Invalid("only the owner or a confirmer signs the list"));
+        }
+        let record = self.servers.get(server).expect("checked by signing_anchor");
+        let pair = record.pair()?;
+        let accepted_seq = pair.as_ref().map_or(0, |(_, l)| l.list().seq);
+        // The server's list counts only when it verifies as history under an anchor we trust.
+        let server_seq = server_list
+            .and_then(SignedList::parse)
+            .filter(|l| {
+                [Some(&anchor), pair.as_ref().map(|(a, _)| a)]
+                    .into_iter()
+                    .flatten()
+                    .any(|a| a.hash() == l.list().anchor_hash && chain.list_valid(a, l))
+            })
+            .map_or(0, |l| l.list().seq);
         let mut managers = managers.to_vec();
         managers.sort();
         managers.dedup();
         managers.retain(|m| !anchor.anchor().confirmers.contains(m) && *m != chain.owner());
-        let seq = pair.map_or(0, |(_, l)| l.list().seq) + 1;
         Ok(ManagerList {
             server_key: server.to_owned(),
             generation: chain.generation(),
             anchor_hash: anchor.hash(),
-            seq,
+            seq: accepted_seq.max(server_seq) + 1,
             managers,
-            signer_uid: self.credential.uid(),
+            signer_uid: me,
             signed_at,
         }
         .statement())
     }
 
     /// The statement of a link moving ownership to `new_owner`, for the current owner's account key
-    /// (`account_key`) to sign, handing over the server's current anchor (`server_anchor`).
+    /// (`account_key`) to sign. It hands over the anchor this device accepted, which must be the
+    /// server's current one (`server_anchor`): a server showing another anchor is refused.
     pub fn transfer_statement(
         &self,
         server: &str,
@@ -285,10 +339,16 @@ impl Agent {
         server_anchor: Option<&[u8]>,
         signed_at: i64,
     ) -> Result<String> {
-        let chain = self.servers.get(server).ok_or(Invalid("no owner pin"))?.chain(server)?;
-        let anchor_hash = match server_anchor {
-            Some(bytes) => Some(SignedAnchor::parse(bytes).ok_or(Invalid("anchor"))?.hash()),
-            None => None,
+        let record = self.servers.get(server).ok_or(Invalid("no owner pin"))?;
+        let chain = record.chain(server)?;
+        let accepted = record.pair()?.map(|(a, _)| a);
+        let shown = server_anchor.map(|b| SignedAnchor::parse(b).ok_or(Invalid("anchor"))).transpose()?;
+        let anchor_hash = match (accepted, shown) {
+            (Some(accepted), Some(shown)) if accepted.hash() == shown.hash() => Some(accepted.hash()),
+            (Some(_), _) => return Err(Invalid("the server's anchor is not the one this device accepted")),
+            (None, Some(shown)) if chain.anchor_current(&shown) => Some(shown.hash()),
+            (None, Some(_)) => return Err(Invalid("anchor not current")),
+            (None, None) => None,
         };
         let link = crate::owner::OwnerLink {
             server_key: server.to_owned(),
@@ -481,7 +541,7 @@ mod tests {
         let anchor = SignedAnchor::from_parts(&statement, &public(&key(1)), &signature).unwrap();
         assert_eq!(anchor.anchor().confirmers, vec![uid(5)]);
         assert!(owner.next_anchor(&server(), &[uid(1)], NOW).is_err(), "the owner is no confirmer");
-        let list_statement = owner.next_list(&server(), Some(&anchor.encode()), &[uid(5), uid(7)], NOW).unwrap();
+        let list_statement = owner.next_list(&server(), Some(&anchor.encode()), &[uid(5), uid(7)], NOW, None).unwrap();
         let list = owner.sign_manager_list(ManagerList::parse(&list_statement).unwrap()).unwrap();
         assert_eq!(SignedList::parse(&list).unwrap().list().managers, vec![uid(7)], "confirmers are not repeated");
         assert_eq!(
@@ -490,7 +550,7 @@ mod tests {
         );
         owner.take_changes();
         // The next list continues the sequence under the accepted anchor.
-        let next = ManagerList::parse(&owner.next_list(&server(), None, &[], NOW).unwrap()).unwrap();
+        let next = ManagerList::parse(&owner.next_list(&server(), None, &[], NOW, None).unwrap()).unwrap();
         assert_eq!((next.seq, next.anchor_hash), (2, anchor.hash()));
         // A transfer link the chain accepts, handing over the anchor.
         let link = owner.transfer_statement(&server(), &public(&key(1)), &uid(9), Some(&anchor.encode()), NOW).unwrap();
@@ -498,5 +558,68 @@ mod tests {
         let mut moved = chain.clone();
         moved.push(SignedLink::parse(&link, &signature).unwrap()).unwrap();
         assert!(moved.anchor_current(&anchor));
+    }
+
+    #[test]
+    fn replays_builders_and_renewal_hold_against_a_dishonest_server() {
+        let mut owner = agent(1);
+        let chain = OwnerChain::new(genesis(1, 1));
+        check(&mut owner, &chain, None);
+        let sign = |statement: &str| {
+            crate::encoding::b64(&ed25519_dalek::Signer::sign(&key(1), statement.as_bytes()).to_bytes())
+        };
+        let anchor_at = |owner: &Agent, confirmers: &[Uid]| {
+            let statement = owner.next_anchor(&server(), confirmers, NOW).unwrap();
+            SignedAnchor::from_parts(&statement, &public(&key(1)), &sign(&statement)).unwrap()
+        };
+        let a1 = anchor_at(&owner, &[uid(5)]);
+        let l1 = owner
+            .sign_manager_list(
+                ManagerList::parse(&owner.next_list(&server(), Some(&a1.encode()), &[], NOW, None).unwrap()).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(owner.accept_managers(&server(), &a1.encode(), &l1, NOW, &()).unwrap(), ManagersCheck::Accepted);
+        owner.take_changes();
+        // The same pair, replayed once its signer's device is revoked, confers nothing.
+        struct Revoked;
+        impl Revocations for Revoked {
+            fn revoked_at(&self, _: &str, _: &str) -> Option<i64> {
+                Some(NOW - 1)
+            }
+        }
+        assert_eq!(
+            owner.accept_managers(&server(), &a1.encode(), &l1, NOW, &Revoked).unwrap(),
+            ManagersCheck::NotCurrent
+        );
+        owner.take_changes();
+        // A2 removes the confirmer; afterwards the server's replayed A1 signs nothing.
+        let a2 = anchor_at(&owner, &[]);
+        let l2 = owner
+            .sign_manager_list(
+                ManagerList::parse(&owner.next_list(&server(), Some(&a2.encode()), &[], NOW, None).unwrap()).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(owner.accept_managers(&server(), &a2.encode(), &l2, NOW, &()).unwrap(), ManagersCheck::Accepted);
+        owner.take_changes();
+        assert!(owner.next_list(&server(), Some(&a1.encode()), &[], NOW, None).is_err(), "an older anchor");
+        assert!(owner.transfer_statement(&server(), &public(&key(1)), &uid(9), Some(&a1.encode()), NOW).is_err());
+        assert!(
+            owner.transfer_statement(&server(), &public(&key(1)), &uid(9), None, NOW).is_err(),
+            "the anchor hidden"
+        );
+        assert!(owner.transfer_statement(&server(), &public(&key(1)), &uid(9), Some(&a2.encode()), NOW).is_ok());
+        // A confirmer no longer on the anchor cannot sign a list.
+        let mut former = agent(5);
+        check(&mut former, &chain, None);
+        former.accept_managers(&server(), &a2.encode(), &l2, NOW, &()).unwrap();
+        former.take_changes();
+        assert!(former.next_list(&server(), None, &[], NOW, None).is_err());
+        // A fresh device of the owner renews from the server's list, beyond its seq.
+        let mut fresh = Agent::new([90; 32], certified(&key(1), &key(90), NOW - 1), NOW).unwrap();
+        fresh.take_changes();
+        check(&mut fresh, &chain, None);
+        let next =
+            ManagerList::parse(&fresh.next_list(&server(), Some(&a2.encode()), &[], NOW, Some(&l2)).unwrap()).unwrap();
+        assert_eq!(next.seq, 3);
     }
 }

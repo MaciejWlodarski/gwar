@@ -105,7 +105,10 @@ export class MlsRuntime {
   /** The owner and managers this device verified, and the server's latest managers' view. */
   private owner: OwnerView | null = null;
   private managers: Managers | null = null;
+  /** Whether the server's manager pair is current for this device (false: it needs renewing). */
+  private managersCurrent = true;
   private ownerChecks: Promise<void> = Promise.resolve();
+  private ownerRetries = 0;
   /** This session's file access token: the bearer for the tree endpoint. */
   private fileAccess: string | null = null;
   /** The conversation of every group the server listed, for groups not joined yet. */
@@ -239,6 +242,9 @@ export class MlsRuntime {
   status(conversation: string): ConversationStatus { return this.statuses.get(conversation) ?? "securing"; }
   /** The server's owner and the managers of private channels as this device verified them. */
   ownerView(): OwnerView | null { return this.owner; }
+  /** False when the server shows a manager pair that is no longer current (an expired, revoked or
+   * former signer): the owner or a confirmer renews it. */
+  serverManagersCurrent(): boolean { return this.managersCurrent; }
   /**
    * Checks the server's owner chain against this device's pin, then its newest managers
    * (docs/e2e-build.md, section 6, 6b). `owner` undefined re-checks only the managers.
@@ -253,20 +259,28 @@ export class MlsRuntime {
   private async followOwner(owner: OwnerInfo | null, generation: number): Promise<void> {
     const server = this.server;
     if (!owner) {
-      // A server that dropped the owner this device pinned is not its server any more.
+      // A server that dropped the owner this device pinned, or that an invite said has one, is
+      // not the server the device knows.
       const pinned = await this.engine.run(async () => this.engine.withAgent(a => a.owner_view?.(server) ?? null));
-      if (pinned) this.options.onOwnerChanged?.();
+      if (pinned || this.options.inviteOwner) this.options.onOwnerChanged?.();
       return;
     }
     let after = 0, genesis = "";
     const statements: string[] = [], signatures: string[] = [];
-    for (;;) {
-      const page = await this.request("owner.chain", { generation: owner.generation, after }, undefined, generation);
-      genesis = page.genesis;
-      for (const link of page.links) { statements.push(link.statement); signatures.push(link.signature); }
-      if (page.next === null || page.links.length === 0) break;
-      after = page.next;
+    try {
+      for (;;) {
+        const page = await this.request("owner.chain", { generation: owner.generation, after }, undefined, generation);
+        genesis = page.genesis;
+        for (const link of page.links) { statements.push(link.statement); signatures.push(link.signature); }
+        if (page.next === null || page.links.length === 0) break;
+        after = page.next;
+      }
+    } catch (error) {
+      // A transient failure (not a verdict on the chain): check again a few times, then report.
+      if (this.ownerRetries++ < 5 && !this.stopped) setTimeout(() => { if (this.generation === generation) this.checkOwner(owner); }, 2000 * this.ownerRetries);
+      throw error;
     }
+    this.ownerRetries = 0;
     this.assertCurrent(generation);
     const check = await this.engine.run(() => this.engine.call(a => a.check_owner!(server, genesis, statements, signatures, this.options.inviteOwner))) as OwnerCheck;
     if (check.kind === "changed") { this.options.onOwnerChanged?.(); return; }
@@ -306,7 +320,8 @@ export class MlsRuntime {
   async publishManagers(managers: string[], anchor?: Uint8Array): Promise<void> {
     const server = this.server, under = anchor ?? this.serverAnchor();
     if (!under) throw new Error("no confirmer anchor yet");
-    const list = await this.engine.run(async () => this.engine.withAgent(a => a.sign_manager_list!(a.next_list!(server, under, managers, this.now()))));
+    const floor = this.managers?.list ? decodeBase64Url(this.managers.list) : undefined;
+    const list = await this.engine.run(async () => this.engine.withAgent(a => a.sign_manager_list!(a.next_list!(server, under, managers, this.now(), floor))));
     await this.request("managers.update", { anchor: encodeBase64Url(under), list: encodeBase64Url(list) }, undefined, this.generation);
   }
   private async acceptManagers(): Promise<void> {
@@ -314,7 +329,8 @@ export class MlsRuntime {
     if (!server) return;
     if (managers?.anchor && managers.list) {
       const anchor = decodeBase64Url(managers.anchor), list = decodeBase64Url(managers.list);
-      await this.engine.run(() => this.engine.call(a => a.accept_managers?.(server, anchor, list, this.now(), this.options.revocations())));
+      const check = await this.engine.run(() => this.engine.call(a => a.accept_managers?.(server, anchor, list, this.now(), this.options.revocations())));
+      this.managersCurrent = check?.kind !== "not_current";
     }
     this.owner = await this.engine.run(async () => this.engine.withAgent(a => a.owner_view?.(server) ?? null));
     this.notify();

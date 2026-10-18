@@ -3,6 +3,7 @@ import { SealedConversations, type SealedKey } from "./sealed";
 import type { MlsRuntime } from "../mls/runtime";
 import type { VoiceCall } from "../mls/voice";
 import type { OwnerView, Roster } from "../mls/types";
+import { managerUpkeep } from "../lib/managers";
 import { messageStorage, refreshRevocations } from "../net/message-storage";
 import { conversationThread, sealedThread, threadConversation } from "../lib/chat";
 import { messageTarget } from "../lib/chat";
@@ -678,6 +679,8 @@ class Controller {
   }
 
   private async teardown(): Promise<void> {
+    // Approvals and prompts of the manager list belong to one connection to one server.
+    this.grantedByMe.clear(); this.askedManagers.clear(); this.lastRenewal = 0;
     // A newer connect may finish its own teardown and start while this one
     // waits; it then owns the state below, so this one stops.
     const generation = this.connections;
@@ -1149,38 +1152,58 @@ class Controller {
   private askedManagers = new Set<string>();
   private maintaining: Promise<void> | null = null;
 
+  /** When this client last re-signed a list only to renew it (not for a change). */
+  private lastRenewal = 0;
+
   /**
    * The owner's and confirmers' clients keep the manager list mirroring `channel_edit`
-   * (docs/e2e-build.md, section 6, "Who signs" and "Renewal"): stale managers go, people I gave the
-   * role join, others after "Allow @name to manage private channels?", and an old list is re-signed.
+   * (docs/e2e-build.md, section 6, "Who signs" and "Renewal"): stale managers go, people I just
+   * gave the role join, others after "Allow @name to manage private channels?", and the list is
+   * re-signed when it is old, its signer's certificate is about to expire, or it is no longer
+   * current (its signer was revoked or lost authority). The owner removes stale confirmers.
    */
   private maintainManagers(): void {
-    const runtime = this.runtime, view = runtime?.ownerView(), state = useSession.getState();
+    const runtime = this.runtime, view = runtime?.ownerView(), state = useSession.getState(), conn = this.conn;
     const me = state.me?.uid, server = state.managers;
-    if (!runtime || !view || !me || !server?.anchor || this.maintaining) return;
-    if (view.owner !== me && !view.confirmers.includes(me)) return;
-    const stale = view.managers.filter((m) => server.stale.includes(m));
-    const mine = server.pending.filter((u) => this.grantedByMe.has(u));
-    const now = Date.now();
-    const old = view.list_signed_at !== null && now - view.list_signed_at > 60 * 86_400_000;
-    const expiring = view.list_signer_expires_at !== null && view.list_signer_expires_at - now < 7 * 86_400_000;
-    if (stale.length || mine.length || old || expiring) {
-      const next = [...view.managers.filter((m) => !stale.includes(m)), ...mine];
-      this.maintaining = runtime.publishManagers(next).catch((error) => console.warn("Manager list:", error)).finally(() => { this.maintaining = null; });
-      return;
-    }
-    for (const uid of server.pending) {
-      if (this.askedManagers.has(uid)) continue;
-      this.askedManagers.add(uid);
-      const name = state.members[uid]?.nickname ?? uid;
-      useUi.getState().openDialog({
-        kind: "confirm", title: tNow("own.allowTitle"), body: tNow("own.allowBody", { name }), confirmLabel: tNow("own.allow"),
-        onConfirm: () => {
-          const current = this.runtime?.ownerView()?.managers ?? [];
-          void this.runtime?.publishManagers([...current, uid]).catch((error) => useUi.getState().toast("error", String(error)));
-        },
-      });
-      return;
+    if (!runtime || !view || !me || !server || this.maintaining || !(conn instanceof Connection)) return;
+    const action = managerUpkeep({
+      me, view, server, current: runtime.serverManagersCurrent(), granted: this.grantedByMe, asked: this.askedManagers,
+      now: Date.now(), ownExpiry: conn.identity.device?.expires_at ?? Infinity, lastRenewal: this.lastRenewal,
+    });
+    const settle = (work: Promise<void>, what: string) => {
+      this.maintaining = work.catch((error) => console.warn(what, error)).finally(() => { this.maintaining = null; });
+    };
+    switch (action.kind) {
+      case "none":
+        return;
+      case "publish":
+        if (action.renewal) this.lastRenewal = Date.now();
+        for (const u of action.consumed) this.grantedByMe.delete(u);
+        settle(runtime.publishManagers(action.managers), "Manager list:");
+        return;
+      case "staleConfirmers": {
+        this.askedManagers.add("@confirmers");
+        if (!this.ownerSigningNeedsPassword()) { settle(this.setConfirmers(action.keep), "Confirmers:"); return; }
+        const names = action.stale.map((u) => state.members[u]?.nickname ?? u).join(", ");
+        useUi.getState().openDialog({
+          kind: "confirm", title: tNow("own.staleTitle"), body: tNow("own.staleBody", { names }), confirmLabel: tNow("own.open"),
+          onConfirm: () => useUi.getState().openDialog({ kind: "serverSettings", tab: "ownership" }),
+        });
+        return;
+      }
+      case "ask": {
+        const uid = action.uid;
+        this.askedManagers.add(uid);
+        const name = state.members[uid]?.nickname ?? uid;
+        useUi.getState().openDialog({
+          kind: "confirm", title: tNow("own.allowTitle"), body: tNow("own.allowBody", { name }), confirmLabel: tNow("own.allow"),
+          onConfirm: () => {
+            const current = this.runtime?.ownerView()?.managers ?? [];
+            void this.runtime?.publishManagers([...current, uid]).catch((error) => useUi.getState().toast("error", String(error)));
+          },
+        });
+        return;
+      }
     }
   }
 
@@ -1229,10 +1252,14 @@ class Controller {
     return this.connection.request("group.delete", { group });
   }
 
-  setMemberGroups(uid: string, groups: number[]) {
-    // Whoever I give `channel_edit` becomes a manager without asking me again (6b).
-    this.grantedByMe.add(uid);
-    return this.connection.request("member.groups", { uid, groups });
+  async setMemberGroups(uid: string, groups: number[]) {
+    const conn = this.conn;
+    const result = await this.connection.request("member.groups", { uid, groups });
+    // Whoever I just gave `channel_edit` on this connection becomes a manager without asking me
+    // again (6b): only a successful grant that carries the permission counts.
+    const defs = useSession.getState().groups;
+    if (this.conn === conn && groups.some((g) => g === 1 || defs[g]?.permissions.includes("channel_edit"))) this.grantedByMe.add(uid);
+    return result;
   }
 
   removeMember(uid: string, deleteMessages: boolean) {

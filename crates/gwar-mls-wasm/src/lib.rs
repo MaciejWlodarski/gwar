@@ -332,8 +332,11 @@ impl Agent {
         anchor: Option<Vec<u8>>,
         managers: Vec<String>,
         signed_at: f64,
+        server_list: Option<Vec<u8>>,
     ) -> Result<String, JsValue> {
-        self.inner.next_list(server, anchor.as_deref(), &managers, signed_at as i64).map_err(error)
+        self.inner
+            .next_list(server, anchor.as_deref(), &managers, signed_at as i64, server_list.as_deref())
+            .map_err(error)
     }
     /// The statement of a link moving ownership, for the owner's account key to sign.
     pub fn transfer_statement(
