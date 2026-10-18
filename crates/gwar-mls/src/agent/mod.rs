@@ -347,6 +347,8 @@ pub struct GroupSummary {
     /// The conversation's live pin: its highest accepted incarnation.
     pub live: bool,
     pub history: bool,
+    /// A private channel's group (6c): its access checkpoint must follow every transition.
+    pub private: bool,
     /// A voice group's parent channel group, from its validated descriptor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel_group: Option<String>,
@@ -681,6 +683,7 @@ impl Agent {
                     Vec::new()
                 };
                 Ok(GroupSummary {
+                    private: rules::is_private(&d),
                     group: d.group_id(),
                     live: record.status != Status::Creating
                         && live.get(&d.descriptor.conversation) == Some(&d.descriptor.incarnation),

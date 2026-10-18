@@ -56,6 +56,8 @@ export interface GroupSummary {
   /** The conversation's live pin: its highest accepted incarnation. */
   live: boolean;
   history: boolean;
+  /** A private channel's group (6c): its access checkpoint follows every transition. */
+  private: boolean;
   /** A voice group's parent channel group, from its validated descriptor. */
   channel_group?: string;
   record: {

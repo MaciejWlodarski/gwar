@@ -15,7 +15,7 @@ const server = b64(9), group = b64(2), device = b64(1), peer = b64(3);
 const dm = `dm:${[b64(4,20), b64(5,20)].sort().join(":")}`;
 let conversation = dm;
 interface State { groups: GroupSummary[]; out: CommitOutbox | null; welcomes: string[]; imports: number; shares: number }
-const summary = (status: GroupSummary["record"]["status"] = "active", epoch = "0"): GroupSummary => ({ group: Array(32).fill(2), conversation, incarnation: "0", live: status !== "creating", history: true, record: { status, checkpoint: status === "creating" ? null : { epoch, hash: [] }, server_pending: false, own_commit_at: Date.now() }, members: [{ leaf: 0, device_key: device, uid: b64(4,20) }] });
+const summary = (status: GroupSummary["record"]["status"] = "active", epoch = "0"): GroupSummary => ({ group: Array(32).fill(2), conversation, incarnation: "0", live: status !== "creating", private: false, history: true, record: { status, checkpoint: status === "creating" ? null : { epoch, hash: [] }, server_pending: false, own_commit_at: Date.now() }, members: [{ leaf: 0, device_key: device, uid: b64(4,20) }] });
 const pending = (): CommitOutbox => ({ group: Array(32).fill(2), epoch: "0", hash: [4], commit: [4], group_info: [5], welcome: [6] });
 const clean = (): State => ({ groups: [], out: null, welcomes: [], imports: 0, shares: 0 });
 const runtimes: MlsRuntime[] = [];
@@ -867,6 +867,13 @@ describe("Public groups", () => {
     await f.runtime.sync();
     expect(f.operations.find(o => o.op === "forget")).toMatchObject({ group: Array(32).fill(2) });
     expect((await f.durable()).groups).toEqual([]);
+  });
+  it("forgets the group of a channel hidden from this session", async () => {
+    asChannel();
+    const f = await fixture({ ...clean(), groups: [summary()] }, true, { channels: [channel()] });
+    f.event({ ev: "channel.hidden", d: { channel: 1 } } as Event);
+    await f.runtime.sync();
+    expect(f.operations.find(o => o.op === "forget")).toMatchObject({ group: Array(32).fill(2) });
   });
   it("forgets a deleted channel's history jobs with its group", async () => {
     asChannel();

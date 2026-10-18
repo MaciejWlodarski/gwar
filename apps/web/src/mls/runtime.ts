@@ -214,7 +214,9 @@ export class MlsRuntime {
       runtime.unsubscribers.push(options.link.onEvent(event => {
         for (const call of runtime!.calls) call.event(event);
         if (event.ev === "channel.created" && event.d.encrypted) { runtime!.channels?.set(event.d.id, event.d.history); runtime!.schedule(); }
-        if (event.ev === "channel.deleted" && runtime!.channels?.delete(event.d.channel)) runtime!.schedule();
+        // A hidden channel's group is forgotten like a deleted one's; its tombstone keeps the
+        // checkpoints for when it is shown again (6c).
+        if ((event.ev === "channel.deleted" || event.ev === "channel.hidden") && runtime!.channels?.delete(event.d.channel)) runtime!.schedule();
         if (event.ev === "owner.updated") runtime!.checkOwner(event.d);
         if (event.ev === "managers.updated") { runtime!.managers = event.d; runtime!.checkOwner(undefined); }
         if (!event.ev.startsWith("mls.")) return;
@@ -475,6 +477,12 @@ export class MlsRuntime {
   private async transition<T>(request: unknown, validate?: (result: T) => void): Promise<T> {
     const before = this.inventory();
     return this.engine.op<T>(request, result => { validate?.(result); return [...this.historyIntents(before), ...this.supersededJobs()]; });
+  }
+  /** After every transition of a private channel's group, before the next one: records a member
+   * list current on first sight as the newest accepted, so a later commit cannot roll it back. */
+  private async observeAccess(group: string): Promise<void> {
+    if (!this.summary(group)?.private) return;
+    await this.engine.op({ observe_access: { ...this.args(group), now: this.now(), revocations: this.options.revocations() } });
   }
   private async groups(): Promise<MlsGroup[]> {
     const all: MlsGroup[] = []; let after: string | null = null;
@@ -814,7 +822,7 @@ export class MlsRuntime {
       }
       if (log.oldest > since) {
         if (beforeWelcome) return "pruned";
-        if (out) { await this.transition({ reconcile: { ...this.args(group), result: { case: "pruned", oldest: String(log.oldest) } } }); this.voiceGate(group); }
+        if (out) { await this.transition({ reconcile: { ...this.args(group), result: { case: "pruned", oldest: String(log.oldest) } } }); await this.observeAccess(group); this.voiceGate(group); }
         else await this.join(group); // Validated newer GroupInfo replaces pruned membership.
         continue;
       }
@@ -823,6 +831,7 @@ export class MlsRuntime {
         if (entry) {
           try {
             const resolution = await this.transition<Resolution>({ reconcile: { ...this.args(group), result: { case: "entry", epoch: String(entry.epoch), commit: bytes(entry.commit), proposals: entry.proposals.map(bytes) } } });
+            await this.observeAccess(group);
             this.voiceGate(group);
             // A validated entry continuing from the checkpoint: no restart is
             // due. A pending join that lost is dropped without validating it.
@@ -857,6 +866,7 @@ export class MlsRuntime {
         if (entry.epoch !== expected) throw new Error("noncontiguous MLS log");
         try {
           await this.transition({ receive: { ...this.args(group), commit: bytes(entry.commit), proposals: entry.proposals.map(bytes) } });
+          await this.observeAccess(group);
           this.voiceGate(group);
         } catch (error) {
           if (!(error instanceof AgentOperationError)) throw error;
