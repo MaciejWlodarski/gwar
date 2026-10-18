@@ -351,6 +351,8 @@ export class MlsRuntime {
       const check = await this.engine.run(() => this.engine.call(a => a.accept_managers?.(server, anchor, list, this.now(), this.options.revocations())));
       this.managersCurrent = check?.kind !== "not_current" && check?.kind !== "renewable";
       this.managersRenewable = check?.kind === "renewable";
+      // A newly accepted pair may make private groups' lists recordable: a pass observes them.
+      if (check?.kind === "accepted") this.schedule();
     }
     this.owner = await this.engine.run(async () => this.engine.withAgent(a => a.owner_view?.(server) ?? null));
     this.verifiedList = managers?.list ?? null;
@@ -412,7 +414,7 @@ export class MlsRuntime {
       this.dirty = false; this.wakeAt = undefined;
       this.activeGeneration = this.generation;
       this.assertCurrent(this.generation);
-      try { await this.synchronize(); }
+      try { await this.observePrivateGroups(); await this.synchronize(); }
       catch (error) {
         // Rosters follow the durable state the failed pass left (a restart
         // accepted before a join failed), before any later operation runs.
@@ -477,6 +479,11 @@ export class MlsRuntime {
   private async transition<T>(request: unknown, validate?: (result: T) => void): Promise<T> {
     const before = this.inventory();
     return this.engine.op<T>(request, result => { validate?.(result); return [...this.historyIntents(before), ...this.supersededJobs()]; });
+  }
+  /** At the start of every pass, before any replay: records access an interrupted pass, or a
+   * manager pair accepted since, left unobserved. */
+  private async observePrivateGroups(): Promise<void> {
+    for (const g of this.inventory()) if (g.private && g.record.status === "active") await this.observeAccess(encoded(g.group));
   }
   /** After every transition of a private channel's group, before the next one: records a member
    * list current on first sight as the newest accepted, so a later commit cannot roll it back. */

@@ -91,6 +91,7 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
         case "share_history": if ((d!.recipient as { signature: string }).signature === "invalid") throw new Error("invalid HPKE signature"); this.state.shares++; return world.nothingToShare ? [] : [[21 + this.state.shares], [22 + this.state.shares]];
         case "create": this.state.groups = [summary("creating")]; return [7];
         case "forget": this.state.groups = []; this.state.out = null; return null;
+        case "observe_access": return { kind: "current" };
         case "import_history": this.state.imports++; if ((d!.bytes as number[])[0] === 255) throw new Error("invalid history"); return null;
         case "open_message": if (world.openError) throw world.openError; return world.openResult;
         case "epoch": return null;
@@ -867,6 +868,14 @@ describe("Public groups", () => {
     await f.runtime.sync();
     expect(f.operations.find(o => o.op === "forget")).toMatchObject({ group: Array(32).fill(2) });
     expect((await f.durable()).groups).toEqual([]);
+  });
+  it("records a private group's access at the start of every pass", async () => {
+    asChannel();
+    const f = await fixture({ ...clean(), groups: [{ ...summary(), private: true }] }, true, { channels: [channel()] });
+    const before = f.operations.filter(o => o.op === "observe_access").length;
+    await f.runtime.sync();
+    expect(f.operations.filter(o => o.op === "observe_access").length).toBeGreaterThan(before);
+    expect(f.operations.find(o => o.op === "observe_access")).toMatchObject({ group: Array(32).fill(2) });
   });
   it("forgets the group of a channel hidden from this session", async () => {
     asChannel();
