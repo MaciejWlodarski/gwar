@@ -10,7 +10,7 @@
 import { decodeBase64Url, encodeBase64Url } from "../net/base64url";
 import type { ConnectRecord, ConnectStore } from "../net/identity";
 import { ConnectApi, ConnectApiError, type ArchiveStatement, type DeviceCertBody, type RegisterBody, type CredentialAuthorization } from "./api";
-import { recoveryArchiveKey, recoveryVersion, signedRecoveryKey } from "./archive";
+import { recoveryArchiveKey, recoveryArchiveStatement, recoveryVersion, signedRecoveryKey } from "./archive";
 import {
   certifyDevice,
   checkChallenge,
@@ -89,14 +89,39 @@ async function withAccountKey(
   token: string,
   deps: FlowDeps,
   self: ConnectRecord,
-): Promise<{ token: string; vaultKey: string; certificate: Certificate }> {
+  /** False when the flow replaces the pending recovery archive key itself. */
+  settleRecovery = true,
+): Promise<{ token: string; vaultKey: string; certificate: Certificate; archiveRecovery?: ConnectRecord["archiveRecovery"] }> {
   const device = await keyFromSeed(seedOfJwk(self.deviceJwk));
   if (device.publicKey !== self.certificate.device_key || self.accountKey !== account.publicKey) {
     throw new ConnectApiError("server", "the local device key does not match the account");
   }
   const cert = await certifyDevice(account, device.publicKey);
   await deps.api.addDevice(token, certBody(cert, self.deviceName));
-  return { token: await sessionToken(deps.api, token, account.publicKey, device, cert), vaultKey: await vaultKeyOf(account), certificate: certificateOf(account.publicKey, cert) };
+  const session = await sessionToken(deps.api, token, account.publicKey, device, cert);
+  const opened = { token: session, vaultKey: await vaultKeyOf(account), certificate: certificateOf(account.publicKey, cert) };
+  return self.archiveRecovery && settleRecovery ? { ...opened, archiveRecovery: await settleRecoveryKey(deps.api, session, account, self.archiveRecovery) } : opened;
+}
+
+/**
+ * With the account key at hand, a recovery archive key this device could not publish (see
+ * `KeyArchive.publishRecovery`): published, or signed again at the next version when another
+ * device took its version for an older code. Returns what is still pending (nothing once done).
+ */
+async function settleRecoveryKey(api: ConnectApi, token: string, account: KeyPairJwk, pending: ArchiveStatement): Promise<ArchiveStatement | undefined> {
+  try {
+    const newest = (await api.archiveRecovery(token)).at(-1);
+    if (newest?.statement === pending.statement) return undefined;
+    const [, , , x25519, createdAt] = pending.statement.split("\n");
+    // A newer code's key holds that version: this one is obsolete.
+    if (newest && Number(newest.statement.split("\n")[4]) > Number(createdAt)) return undefined;
+    const statement = recoveryArchiveStatement(account.publicKey, recoveryVersion(newest?.statement ?? "") + 1, x25519!, Date.now());
+    const key = { statement, signature: await signText(account.jwk, statement) };
+    await api.putArchiveRecovery(token, key);
+    return undefined;
+  } catch {
+    return pending; // The key archive or the next unlocked flow tries again.
+  }
 }
 
 function recordOf(
@@ -348,10 +373,14 @@ export async function changeRecoveryCode(record: ConnectRecord, password: string
   const bytes = parseRecoveryCode(code);
   if (!bytes) throw new ConnectApiError("bad_request", "invalid recovery code");
   const { token, account } = await unlock(deps.api, record.handle, password);
-  const opened = await withAccountKey(account, token, deps, record);
+  const opened = await withAccountKey(account, token, deps, record, false);
   const secrets = await recoverySecrets(bytes, decodeBase64Url(account.publicKey));
   const auth = encodeBase64Url(secrets.authKey);
   const blob = await sealKey(secrets.encKey, seedOfJwk(account.jwk), account.publicKey);
+  // The new code's recovery archive key, signed before the credentials change: once Connect takes
+  // the code, nothing that can fail stands between that and keeping the key to publish.
+  const newest = Math.max(0, ...(await deps.api.archiveRecovery(opened.token)).map(k => recoveryVersion(k.statement)));
+  const key = await signedRecoveryKey(account, bytes, newest + 1, Date.now());
   try {
     await deps.api.changeRecovery(opened.token, { recovery_auth: auth, recovery_blob: blob,
       ...await credentialAuthorization(deps.api, opened.token, account, "recovery", null, auth, blob) });
@@ -362,8 +391,6 @@ export async function changeRecoveryCode(record: ConnectRecord, password: string
     if (!took) throw error;
   }
   // The new code works: its recovery archive key, kept until published (the key archive retries).
-  const newest = Math.max(0, ...(await deps.api.archiveRecovery(opened.token)).map(k => recoveryVersion(k.statement)));
-  const key = await signedRecoveryKey(account, bytes, newest + 1, Date.now());
   const pending = await saveUnlocked(record, { ...opened, archiveRecovery: key }, deps);
   try {
     await deps.api.putArchiveRecovery(opened.token, key);

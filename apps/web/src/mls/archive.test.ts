@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import init from "../../../../crates/gwar-mls-wasm/pkg/gwar_mls_wasm.js";
-import { changeRecoveryCode, createAccount, newRecoveryCode, recover, signIn } from "../connect/account";
+import { changeRecoveryCode, createAccount, newRecoveryCode, recover, renewCertificate, signIn } from "../connect/account";
 import { setup, type FakeService } from "../connect/testing";
 import { decodeBase64Url, encodeBase64Url } from "../net/base64url";
 import { identityFromConnect, identitySeed, uidForPublicKey, type ConnectRecord } from "../net/identity";
@@ -171,5 +171,24 @@ describe("key archive", () => {
     expect(transferGeneration(netstring("gwar archive manifest v1\nacc\n7"))).toBeNull();
     expect(transferGeneration(enc.encode("99:short"))).toBeNull();
     expect(transferGeneration(enc.encode("garbage"))).toBeNull();
+  });
+
+  it("keeps a newer pending key whose version an older one took, and signs it again with the password", async () => {
+    const { service, deps, store } = setup();
+    const created = await createAccount({ handle: "erin", password: "correct horse battery" }, deps());
+    await store.save(created.record);
+    const pending = created.record.archiveRecovery!;
+    const [, account, , x25519, at] = pending.statement.split("\n");
+    // Another device published an older code's key at version 1 first.
+    service.archive.set("erin", { devices: new Map(), recovery: [{ statement: `gwar archive recovery v1\n${account}\n1\n${"A".repeat(43)}\n${Number(at) - 1000}`, signature: "older" }], manifests: new Map(), records: [], transfers: [] });
+    const laptop = await device(service, deps, created.record);
+    // (The fake's older key is unsigned, so the sync after publishing refuses it.)
+    await laptop.archive.pass().catch(() => {});
+    expect(laptop.record.archiveRecovery).toEqual(pending);
+    // The next flow with the password signs it at version 2.
+    const renewed = await renewCertificate(created.record, "correct horse battery", deps());
+    expect(renewed.archiveRecovery).toBeUndefined();
+    const keys = service.archive.get("erin")!.recovery;
+    expect(keys.map(k => k.statement.split("\n").slice(2, 4))).toEqual([["1", "A".repeat(43)], ["2", x25519]]);
   });
 });

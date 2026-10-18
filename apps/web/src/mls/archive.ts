@@ -133,8 +133,13 @@ export class KeyArchive {
     try { await this.o.api.putArchiveRecovery(token, key); }
     catch (error) {
       if (!conflict(error)) throw error;
-      const newest = Math.max(0, ...(await this.o.api.archiveRecovery(token)).map(k => recoveryVersion(k.statement)));
-      if (newest < recoveryVersion(key.statement)) throw error;
+      const newest = (await this.o.api.archiveRecovery(token)).at(-1);
+      if (!newest || recoveryVersion(newest.statement) < recoveryVersion(key.statement)) throw error;
+      // Another key took this version. If it is older than this one (another device's earlier
+      // code), this key stays pending: the next flow with the password signs it at the next
+      // version. A newer key replaced it.
+      const created = (statement: string) => Number(statement.split("\n")[4]);
+      if (created(key.statement) > created(newest.statement)) return;
     }
     await this.o.used({ recovery: key });
   }
