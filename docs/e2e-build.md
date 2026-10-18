@@ -2762,7 +2762,9 @@ account signatures, sorted by device key) and the **sealed keys** (a
 netstring list, one per recipient in statement order and then the recovery
 key, each `enc ‖ ciphertext` of the generation key, HPKE with
 `info = "gwar archive generation v1\n" + account_key + "\n" + generation`
-and `aad = statement`).
+and `aad` = the **sealing header**: the statement without its `body_hash`
+line). The creator seals first, then hashes the body into `body_hash` and
+signs the statement.
 
 Readers accept a manifest only if:
 
@@ -2835,7 +2837,9 @@ A **key transfer** gives one generation key to one recipient later: a new
 device, or a new recovery key. Four netstrings: the statement, the sender's
 device signature, the sender's device certificate current at `created_at`,
 and `enc ‖ ciphertext` (HPKE, `info = "gwar archive transfer v1\n" +
-account_key + "\n" + generation`, `aad = statement`).
+account_key + "\n" + generation`, `aad` = the statement without its
+`sealed_hash` line). The sender seals first, then puts the hash of the
+sealed bytes into `sealed_hash` and signs.
 
 ```text
 gwar archive transfer v1
@@ -2873,17 +2877,22 @@ staged, resumable rotation on that device:
    from the new code, signs the next version's statement, and stores the
    signed statement and the public key (never the code) as a **pending
    rotation** in its MLS store.
-2. It updates the recovery credentials (`PUT /v1/account/recovery`). If that
-   fails, the pending rotation is discarded.
+2. It updates the recovery credentials (`PUT /v1/account/recovery`). A
+   definite refusal discards the pending rotation; an ambiguous failure (no
+   reply, a network error) keeps it until the credential version tells
+   (below).
 3. It publishes the statement (`PUT /v1/archive/recovery`), sends transfers
    of every generation it can open to the new version, and creates a new
    generation sealed to it; then the rotation is complete.
 
-After a crash, a pending rotation whose credential update succeeded (the
-pending rotation records the credential version it expects after the update;
-the device compares it with the version `POST /v1/challenges` reports)
-resumes at step 3
-without the password; one whose update did not happen is discarded. The
+After a crash or an ambiguous failure, a pending rotation whose credential
+update succeeded (the pending rotation records the credential version it
+expects after the update; the device compares it with the version `POST
+/v1/challenges` reports) resumes at step 3. Publishing is idempotent:
+Connect answers `{}` to the identical statement for the version it already
+holds, and a device that finds its pending statement as the newest version
+in `GET /v1/archive/recovery` continues with the transfers, all without
+the password; one whose update did not happen is discarded. The
 interface reports the change only when step 3 is done, and generations the
 device could not open: "History before {date} can't be restored with the
 new recovery code." Restoring with
@@ -2899,7 +2908,7 @@ Device sessions only (except where public), all JSON, binary as base64url:
 | --- | --- |
 | `PUT /v1/archive/device` | `{statement, signature}` → `{}`; the session's own device; once per device key |
 | `GET /v1/archive/devices` | → `{devices: [{statement, signature, certificate}]}` for the account (with each device's current certificate) |
-| `PUT /v1/archive/recovery` | `{statement, signature}` → `{}`; account-signed, version `n + 1` only |
+| `PUT /v1/archive/recovery` | `{statement, signature}` → `{}`; account-signed, version `n + 1` only (the identical statement for version `n` is accepted again) |
 | `GET /v1/archive/recovery` | → `{keys: [{statement, signature}]}` ascending |
 | `POST /v1/archive/manifests` | `{manifest}` → `{}`; `409 conflict` if the generation exists |
 | `GET /v1/archive/manifests?after=<generation>` | → `{manifests: [...], next}` (at most 100) |
