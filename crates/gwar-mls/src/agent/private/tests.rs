@@ -395,3 +395,83 @@ fn a_manager_outside_the_group_offers_lists_a_member_commits() {
     let stale = manager.offer_access(&server(), &p.info, Some(&tree), None, p.t, &()).unwrap();
     assert_eq!(copy.adopt_offer(&server(), &p.id, &stale, p.t, &()).map(|_| ()), Err(AgentError::Waiting));
 }
+
+/// The successor of `previous` (incarnation `incarnation`), created by `creator`.
+fn successor_of(creator: &Agent, previous: &[u8; 32], incarnation: u64, t: i64) -> SignedDescriptor {
+    let mut d = descriptor(creator, t).descriptor;
+    d.incarnation = incarnation;
+    d.previous_group_id = Some(b64(previous));
+    d.creation_nonce = b64(&[incarnation as u8 + 10; 16]);
+    SignedDescriptor::sign(d, creator.credential.clone(), &creator.signer.0)
+}
+fn incarnations(ds: &[&SignedDescriptor]) -> Vec<([u8; 32], Vec<u8>)> {
+    ds.iter().map(|d| (d.group_id(), d.encode())).collect()
+}
+
+#[test]
+fn a_private_restart_is_adopted_only_once_its_tip_gives_current_authority() {
+    let mut p = private();
+    let first = SignedDescriptor::parse(&p.owner.group(&server(), &p.id).unwrap().descriptor).unwrap();
+    // The owner accepts a newer pair and restarts the channel under it.
+    let newer = pair(&p.chain, &p.owner, 2, &[], p.t);
+    accept_pair(&mut p.owner, &newer, p.t);
+    let next = successor_of(&p.owner, &p.id, 1, p.t);
+    let info = p.owner.create_private(next.clone(), &[uid(2)], p.t, &()).unwrap();
+    p.owner.take_changes();
+    assert!(p.owner.settle(&server(), &next.group_id(), Some(&next.group_id())).unwrap());
+    p.owner.take_changes();
+    let tree = Observer::create_with(&info, &server(), Some(p.chain.clone())).unwrap().tree().unwrap().1;
+    let chain = incarnations(&[&first, &next]);
+    // A plain restart chain is refused for a private conversation.
+    let mut copy = Agent::load([21; 32], p.member.credential.clone(), p.member.durable.clone()).unwrap();
+    assert!(copy.accept_chain(&server(), "channel:7", &chain).is_err());
+    // The member has not accepted the newer pair: nothing changes but the pending tip.
+    let pending = p.member.accept_private_chain(&server(), "channel:7", &chain, &info, Some(&tree), p.t, &()).unwrap();
+    p.member.take_changes();
+    assert!(!pending.adopted);
+    assert_eq!(p.member.group(&server(), &p.id).unwrap().status, Status::Active);
+    assert!(p.member.group(&server(), &next.group_id()).is_none());
+    assert!(p.member.group(&server(), &p.id).unwrap().pending_tip.is_some());
+    // Once it accepts the pair, the chain is adopted: the successor is live, the first superseded.
+    accept_pair(&mut p.member, &newer, p.t);
+    let adopted = p.member.accept_private_chain(&server(), "channel:7", &chain, &info, Some(&tree), p.t, &()).unwrap();
+    p.member.take_changes();
+    assert_eq!((adopted.adopted, adopted.group), (true, next.group_id()));
+    assert_eq!(p.member.group(&server(), &p.id).unwrap().status, Status::Superseded);
+    assert_eq!(p.member.group(&server(), &next.group_id()).unwrap().access.as_ref().map(|c| c.seq), Some(1));
+}
+
+#[test]
+fn an_authority_restarts_from_a_pending_tip() {
+    let mut p = private();
+    let first = SignedDescriptor::parse(&p.owner.group(&server(), &p.id).unwrap().descriptor).unwrap();
+    // A second device of the owner joined under the first pair only.
+    let mut second = device(1, 12, p.t, &p.chain);
+    accept_pair(&mut second, &pair(&p.chain, &p.owner, 1, &[], p.t), p.t);
+    let newer = pair(&p.chain, &p.owner, 2, &[], p.t);
+    accept_pair(&mut p.owner, &newer, p.t);
+    let next = successor_of(&p.owner, &p.id, 1, p.t);
+    let info = p.owner.create_private(next.clone(), &[uid(2)], p.t, &()).unwrap();
+    p.owner.take_changes();
+    let tree = Observer::create_with(&info, &server(), Some(p.chain.clone())).unwrap().tree().unwrap().1;
+    // The second device pins the first incarnation, then sees the restart pending.
+    let base = incarnations(&[&first]);
+    let tree0 = p.observer.tree().unwrap().1;
+    assert!(
+        second.accept_private_chain(&server(), "channel:7", &base, &p.info, Some(&tree0), p.t, &()).unwrap().adopted
+    );
+    second.take_changes();
+    let chain = incarnations(&[&first, &next]);
+    assert!(
+        !second.accept_private_chain(&server(), "channel:7", &chain, &info, Some(&tree), p.t, &()).unwrap().adopted
+    );
+    second.take_changes();
+    // It creates a successor of the pending tip, which is live once it wins.
+    let after = successor_of(&second, &next.group_id(), 2, p.t);
+    second.create_private(after.clone(), &[uid(2)], p.t, &()).unwrap();
+    second.take_changes();
+    assert!(second.settle(&server(), &after.group_id(), Some(&after.group_id())).unwrap());
+    second.take_changes();
+    assert_eq!(second.group(&server(), &p.id).unwrap().status, Status::Superseded);
+    assert_eq!(second.group(&server(), &after.group_id()).unwrap().status, Status::Active);
+}

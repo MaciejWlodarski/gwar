@@ -2044,8 +2044,9 @@ Status: **6a and 6b built, 6c in progress**. Hidden plaintext private channels
 extension, the rules, the observer and the server (6c-1) and the device
 agent's core (6c-2a: creation, the tree rule under the pinned owner chain,
 member-list checkpoints and tombstones, current authority, access edits and
-repairs) and 6c-2b (voice under a private parent, offers, the runtime's
-repairs) are built; restarts, member-list renewal and the interface are next. A private
+repairs), 6c-2b (voice under a private parent, offers, the runtime's
+repairs) and 6c-2c (restarts with staged adoption and pending tips, member-list
+renewal) are built; the interface (6c-3) is next. A private
 channel is hidden from everyone it does not admit. It can be plaintext or encrypted, chosen at creation as
 today:
 

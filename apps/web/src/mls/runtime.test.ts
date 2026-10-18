@@ -97,11 +97,14 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
         case "open_message": if (world.openError) throw world.openError; return world.openResult;
         case "epoch": return null;
         case "behind": if ((d!.group as ArrayLike<number> | undefined)?.length !== 32) throw new Error("behind names its group"); return world.behind;
+        case "accept_private_chain":
         case "accept_chain": {
+          if (op === "accept_private_chain" && !world.adopt) return { group: (d!.chain as { group: number[] }[]).at(-1)!.group, adopted: false };
+          if (op === "accept_chain" && world.privateChain) throw new Error("a private conversation's restart needs its final GroupInfo");
           const chain = d!.chain as { group: number[] }[];
           this.state.groups = [...this.state.groups.map(x => ({ ...x, live: false, members: [], record: { ...x.record, status: "superseded" as const } })),
             { ...summary("rejoin"), group: chain.at(-1)!.group, incarnation: String(chain.length - 1), record: { ...summary("rejoin").record, checkpoint: null } }];
-          return chain.at(-1)!.group;
+          return op === "accept_chain" ? chain.at(-1)!.group : { group: chain.at(-1)!.group, adopted: true };
         }
         default: throw new Error(`unexpected fake agent op ${op}`);
       }
@@ -116,6 +119,8 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
   const world = {
     groups: initial.groups.length && hasRemoteGroup ? [{ conversation, group, incarnation: 0, epoch: 0, pending: false }] : [],
     head: 0, oldest: 0, revocations: [] as Revocation[], behind: false, joinError: false,
+    /** A private conversation's restart (6c): the plain chain is refused; `adopt` passes its tip. */
+    privateChain: false, adopt: true,
     /** A private group's authority as the gate reports it (6c). */
     access: undefined as undefined | { kind: "current" } | { kind: "carry" } | { kind: "remove"; leaves: number[] } | { kind: "wait" },
     chain: [] as { group: string; descriptor: string }[],
@@ -596,6 +601,16 @@ describe("Restarts", () => {
     expect(stored).toEqual([[2, "0", false, "superseded"], [12, "1", true, "active"]]);
     expect(f.runtime.status(conversation)).toBe("ready");
     expect(f.runtime.roster(conversation)).toMatchObject({ group: restartedGroup, restarted: true });
+  });
+  it("adopts a private conversation's restart only through its final GroupInfo", async () => {
+    const f = await fixture({ ...clean(), groups: [summary()] });
+    f.world.groups = [{ conversation, group: restartedGroup, incarnation: 1, epoch: 0, pending: false }];
+    f.world.chain = [{ group, descriptor: "AQ" }, { group: restartedGroup, descriptor: "Ag" }];
+    f.world.privateChain = true; f.world.adopt = false;
+    await f.runtime.sync();
+    // Pending: nothing changes, the device waits for a channel manager.
+    expect(f.operations.find(o => o.op === "accept_private_chain")).toMatchObject({ conversation, group_info: expect.any(Array) });
+    expect((await f.durable()).groups.map(g => g.record.status)).toEqual(["active"]);
   });
   it("names the restarted group while it cannot be joined yet", async () => {
     const f = await fixture({ ...clean(), groups: [summary()] });

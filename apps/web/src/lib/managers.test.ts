@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { OwnerView } from "../mls/types";
-import { managerUpkeep, type UpkeepInput } from "./managers";
+import { managerUpkeep, memberListRenewalDue, type UpkeepInput } from "./managers";
 
 const DAY = 86_400_000, NOW = 1_800_000_000_000;
 const view = (over: Partial<OwnerView> = {}): OwnerView => ({
@@ -60,5 +60,19 @@ describe("manager list upkeep (6b)", () => {
   });
   it("waits for the first anchor before maintaining a list", () => {
     expect(managerUpkeep(input({ server: { anchor: null, list: null, pending: ["p"], stale: [] } }))).toEqual({ kind: "none" });
+  });
+});
+
+describe("member list renewal (6c)", () => {
+  const list = { seq: 3, members: ["a"], signer_uid: "s", signer_device: "d", signer_account: "acc", signer_expires_at: NOW + 30 * DAY, signed_at: NOW - DAY };
+  it("is due when old, expiring or revoked", () => {
+    expect(memberListRenewalDue(list, NOW, Infinity, [])).toBe(false);
+    expect(memberListRenewalDue({ ...list, signed_at: NOW - 61 * DAY }, NOW, Infinity, [])).toBe(true);
+    expect(memberListRenewalDue({ ...list, signer_expires_at: NOW + 3 * DAY }, NOW, Infinity, [])).toBe(true);
+    expect(memberListRenewalDue(list, NOW, Infinity, [{ account_key: "acc", device_key: "d", revoked_at: NOW - 1 }])).toBe(true);
+    expect(memberListRenewalDue(list, NOW, Infinity, [{ account_key: "other", device_key: "d", revoked_at: NOW - 1 }])).toBe(false);
+  });
+  it("is not due for expiry with a device that expires as soon", () => {
+    expect(memberListRenewalDue({ ...list, signer_expires_at: NOW + 3 * DAY }, NOW, NOW + 2 * DAY, [])).toBe(false);
   });
 });

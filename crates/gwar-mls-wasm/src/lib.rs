@@ -219,6 +219,19 @@ enum Request {
         conversation: String,
         chain: Vec<Incarnation>,
     },
+    AcceptPrivateChain {
+        server: String,
+        conversation: String,
+        chain: Vec<Incarnation>,
+        group_info: Vec<u8>,
+        tree: Option<Vec<u8>>,
+        now: i64,
+        revocations: View,
+    },
+    AccessView {
+        server: String,
+        group: [u8; 32],
+    },
     Behind {
         server: String,
         group: [u8; 32],
@@ -503,6 +516,22 @@ impl Agent {
                 let chain: Vec<_> = chain.into_iter().map(|i| (i.group, i.descriptor)).collect();
                 output(a.accept_chain(&server, &conversation, &chain).map_err(error)?)
             }
+            Request::AcceptPrivateChain { server, conversation, chain, group_info, tree, now, revocations } => {
+                let chain: Vec<_> = chain.into_iter().map(|i| (i.group, i.descriptor)).collect();
+                output(
+                    a.accept_private_chain(
+                        &server,
+                        &conversation,
+                        &chain,
+                        &group_info,
+                        tree.as_deref(),
+                        now,
+                        &revocations,
+                    )
+                    .map_err(error)?,
+                )
+            }
+            Request::AccessView { server, group } => output(a.access_view(&server, &group).map_err(error)?),
             Request::Behind { server, group, bytes, tree } => {
                 output(a.behind(&server, &group, &bytes, tree.as_deref()).map_err(error)?)
             }
