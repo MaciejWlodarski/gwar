@@ -21,7 +21,9 @@ export async function connect(account: number, device: number, ws: string, { tak
   const runtime = held = await MlsRuntime.connect({ identity, seed, link, revocations: () => [], onError: error => errors.push(String(error)), onTakeover });
   const uid = await uidForPublicKey(accountKey);
   return {
-    runtime, link, uid, publicKey, errors, takenOver: () => tookOver,
+    runtime, link, uid, publicKey, errors, takenOver: () => tookOver, accountKey,
+    /** The account key's signature of a statement (the owner signs anchors and links, 6b). */
+    signAccount: (statement: string) => b64(ed25519.sign(enc.encode(statement), accountSeed)),
     async seal(conversation: string) {
       let signature!: MessageSignature;
       const sealed = await runtime.sealMessage(conversation, async context => {
