@@ -19,6 +19,7 @@ import type { VoiceState } from "../proto/VoiceState";
 import type { Managers } from "../proto/Managers";
 import type { OwnerInfo } from "../proto/OwnerInfo";
 import type { AgentFactory, Change, OwnerCheck, OwnerGeneration, OwnerView, CommitOutbox, ConversationStatus, Gate, GroupSummary, HistoryJob, OpenResult, PackageJob, Plaintext, RequestJob, Resolution, Revocation, Roster, SealedFields } from "./types";
+import { usable } from "./types";
 const bytes = (value: string): number[] => [...decodeBase64Url(value)];
 const encoded = (value: number[]): string => encodeBase64Url(new Uint8Array(value));
 /** The DS protocol currently uses safe JSON integers; core epochs remain u64 strings. */
@@ -443,7 +444,7 @@ export class MlsRuntime {
     }
     for (const [conversation, g] of shown) {
       const gate = this.gate(encoded(g.group));
-      const ready = gate.status === "active" && !gate.rejoin && !gate.server_pending && !gate.blocked.length && !gate.pending_commit && !this.held.has(conversation);
+      const ready = usable(gate) && !this.held.has(conversation);
       this.statuses.set(conversation, gate.status === "creating" ? "creating" : ready && !securing ? "ready" : "securing");
       const first = g.record.evidence?.[this.uid]?.[0]?.first;
       // A live pin still to be joined (a restart just accepted) already names the conversation's group.
@@ -646,7 +647,8 @@ export class MlsRuntime {
     if (!channels) return;
     for (const g of this.inventory()) {
       const id = channelOf(g.conversation);
-      if (id === undefined || channels.has(id)) continue;
+      // Tombstones stay: they are all that is left of a forgotten group.
+      if (id === undefined || channels.has(id) || g.record.status === "forgotten") continue;
       const group = encoded(g.group);
       // The group's runtime jobs go with it, in the same write.
       const jobs = [...this.engine.jobs.values()].filter(job => job.kind !== "packages" && job.server === this.server && job.group === group);
@@ -796,7 +798,8 @@ export class MlsRuntime {
       if (++pages > 128) throw new Error("MLS catch-up continues on the next pass");
       const version = this.groupVersions.get(group) ?? 0;
       let local = this.summary(group);
-      if (!local || local.record.status === "removed" || local.record.status === "rejoin") {
+      // A tombstone (the channel was hidden and is shown again) is joined like a removal.
+      if (!local || local.record.status === "removed" || local.record.status === "rejoin" || local.record.status === "forgotten") {
         if (beforeWelcome) return false;
         await this.join(group); local = this.summary(group)!;
       }
@@ -941,8 +944,7 @@ export class MlsRuntime {
     const conversation = this.summary(group)?.conversation;
     if (!this.enabled(conversation)) return false;
     const gate = this.gate(group);
-    return gate.status === "active" && !gate.rejoin && !gate.server_pending && !gate.blocked.length && !gate.pending_commit
-      && conversation !== undefined && !this.held.has(conversation);
+    return usable(gate) && conversation !== undefined && !this.held.has(conversation);
   }
   private async sendHistory(): Promise<void> {
     jobs: for (const value of [...this.engine.jobs.values()]) {
@@ -1140,13 +1142,13 @@ export class MlsRuntime {
         const gate = this.gate(group);
         // An event announced a parent change this device has not processed yet.
         const unseen = this.syncedVersions.get(group) !== (this.groupVersions.get(group) ?? 0);
-        return !unseen && gate.status === "active" && !gate.rejoin && !gate.server_pending && !gate.blocked.length && !gate.pending_commit && !this.outbox(group);
+        return !unseen && usable(gate) && !this.outbox(group);
       },
       syncParent: group => this.engine.run(async () => {
         this.activeGeneration = this.generation; this.assertCurrent(this.activeGeneration);
         await this.syncGroup(group);
         const gate = this.gate(group);
-        return gate.status === "active" && !gate.rejoin && !gate.server_pending && !gate.blocked.length && !gate.pending_commit && !this.outbox(group);
+        return usable(gate) && !this.outbox(group);
       }),
       factory,
       onError: error => this.options.onError?.(error),

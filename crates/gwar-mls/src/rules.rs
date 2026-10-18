@@ -93,6 +93,23 @@ pub(crate) fn tree_with<'a>(
     if is_private(descriptor) && private.is_none() {
         return Err(Invalid("private channel without its owner record"));
     }
+    tree_checked(descriptor, leaves, private)
+}
+
+/// The tree rule without a private channel's admission: for state this device validated when it
+/// wrote it, which a later owner chain (a new generation) need not admit any more.
+pub(crate) fn tree_structure<'a>(
+    descriptor: &SignedDescriptor,
+    leaves: impl Iterator<Item = &'a LeafNode>,
+) -> Result<(), DsError> {
+    tree_checked(descriptor, leaves, None)
+}
+
+fn tree_checked<'a>(
+    descriptor: &SignedDescriptor,
+    leaves: impl Iterator<Item = &'a LeafNode>,
+    private: Option<Private<'_>>,
+) -> Result<(), DsError> {
     let mut devices = BTreeSet::new();
     let participants = dm_participants(&descriptor.descriptor.conversation);
     for leaf in leaves {
@@ -149,16 +166,6 @@ pub(crate) struct Transition {
     pub welcome_for: BTreeSet<Vec<u8>>,
     pub added_devices: Vec<Credential>,
     pub external: Option<Credential>,
-}
-
-pub(crate) fn staged(
-    group: &PublicGroup,
-    staged: &StagedCommit,
-    sender: &CommitSender,
-    committed_at: i64,
-    crypto: &impl OpenMlsCrypto,
-) -> Result<Transition, DsError> {
-    staged_with(group, staged, sender, committed_at, crypto, None)
 }
 
 /// A commit's structure. In a private channel's group a member may replace `0xff01` alone with a

@@ -85,6 +85,25 @@ enum Request {
     Create {
         descriptor: Vec<u8>,
     },
+    CreatePrivate {
+        descriptor: Vec<u8>,
+        members: Vec<String>,
+        now: i64,
+        revocations: View,
+    },
+    ObserveAccess {
+        server: String,
+        group: [u8; 32],
+        now: i64,
+        revocations: View,
+    },
+    CommitAccess {
+        server: String,
+        group: [u8; 32],
+        members: Option<Vec<String>>,
+        now: i64,
+        revocations: View,
+    },
     Settle {
         server: String,
         group: [u8; 32],
@@ -403,6 +422,21 @@ impl Agent {
                 a.create(SignedDescriptor::parse(&descriptor).ok_or_else(|| error("invalid descriptor"))?)
                     .map_err(error)?,
             ),
+            Request::CreatePrivate { descriptor, members, now, revocations } => output(
+                a.create_private(
+                    SignedDescriptor::parse(&descriptor).ok_or_else(|| error("invalid descriptor"))?,
+                    &members,
+                    now,
+                    &revocations,
+                )
+                .map_err(error)?,
+            ),
+            Request::ObserveAccess { server, group, now, revocations } => {
+                output(a.observe_access(&server, &group, now, &revocations).map_err(error)?)
+            }
+            Request::CommitAccess { server, group, members, now, revocations } => {
+                output(a.commit_access(&server, &group, members.as_deref(), now, &revocations).map_err(error)?)
+            }
             Request::Settle { server, group, winner } => {
                 output(a.settle(&server, &group, winner.as_ref()).map_err(error)?)
             }

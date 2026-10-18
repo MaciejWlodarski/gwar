@@ -1626,7 +1626,7 @@ fn welcome_readmission_clears_own_commit_time() {
     assert_eq!(own(&b, &f.id), None);
 }
 #[test]
-fn forgetting_a_group_leaves_nothing_of_it() {
+fn forgetting_a_group_leaves_only_its_tombstone() {
     let mut f = joined();
     let target = f.a.durable.openmls.clone();
     // Another group of the same device and its key packages must survive.
@@ -1665,17 +1665,14 @@ fn forgetting_a_group_leaves_nothing_of_it() {
     f.a.take_changes().apply(&mut stores);
     assert_eq!(stores, f.a.durable);
     let a = Agent::load([11; 32], f.a.credential.clone(), stores.clone()).unwrap();
-    assert!(a.group(&server(), &f.id).is_none() && a.outbox(&server(), &f.id).is_none());
+    // A tombstone keeps the pin and checkpoint only: no MLS state, keys, evidence or outbox.
+    let tombstone = a.group(&server(), &f.id).unwrap();
+    assert_eq!(tombstone.status, Status::Forgotten);
+    assert!(tombstone.checkpoint.is_some() && tombstone.evidence.is_empty() && tombstone.welcome_ids.is_empty());
+    assert!(a.outbox(&server(), &f.id).is_none());
     assert_eq!(stores.openmls, unrelated, "only the other group's and the device's OpenMLS records");
     let target_key = group_key(&server(), &f.id);
-    assert!(
-        !stores
-            .groups
-            .keys()
-            .chain(stores.epochs.keys())
-            .chain(stores.outbox.keys())
-            .any(|k| k.starts_with(target_key.as_bytes()))
-    );
+    assert!(!stores.epochs.keys().chain(stores.outbox.keys()).any(|k| k.starts_with(target_key.as_bytes())));
     assert_eq!(kept(&stores), other_records);
     assert!(a.sending_key(&server(), &other, f.t, &()).is_ok());
     // Forgetting is idempotent and the device can join again later.
