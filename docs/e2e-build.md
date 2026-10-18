@@ -2948,7 +2948,7 @@ Device sessions only (except where public), all JSON, binary as base64url:
 | `PUT /v1/archive/device` | `{statement, signature}` → `{}`; the session's own device; once per device key |
 | `GET /v1/archive/devices` | → `{devices: [{statement, signature, certificate}]}` for the account (with each device's current certificate) |
 | `PUT /v1/archive/recovery` | `{statement, signature}` → `{}`; account-signed, version `n + 1` only (the identical statement for version `n` is accepted again) |
-| `GET /v1/archive/recovery` | → `{keys: [{statement, signature}]}` ascending |
+| `GET /v1/archive/recovery` | → `{keys: [{statement, signature}]}`: the newest version only (at most 100 versions per account) |
 | `POST /v1/archive/manifests` | `{manifest}` → `{}`; `409 conflict` if the generation exists |
 | `GET /v1/archive/manifests?after=<generation>` | → `{manifests: [...], next}` (at most 100) |
 | `POST /v1/archive/records` | `{records: [{generation, record_id, data}]}` (at most 100) → `{}`; idempotent per record id |
@@ -2957,11 +2957,18 @@ Device sessions only (except where public), all JSON, binary as base64url:
 | `GET /v1/archive/transfers?after=<cursor>` | → `{transfers: [...], next}` for this account |
 
 Connect checks shapes and sizes, the signatures it can check (device
-statements, manifests, transfers against the account's devices; recovery
-statements against the account key), the first manifest per generation, and
-quotas: 200,000 records and 64 MiB per account, 1,000 manifests, 10,000
-transfers; uploads are rate-limited. A revoked device's session ends as
-today; its statements stay, so readers can judge older manifests. Connect
+statements against the session's device; manifests and transfers fully, as a
+reader does without its own knowledge: statement, signature, embedded
+certificate, body or sealed-key hash, so a malformed manifest cannot take a
+generation; recovery statements against the account key), the first manifest
+per generation (an existing generation is `409`, also at the quota), and
+quotas: 200,000 records and 64 MiB per account (only records it does not
+hold count, so a retried batch is accepted), 1,000 manifests, 10,000
+transfers, 100 recovery versions; archive writes are limited to 600 per 10
+minutes per account. Every write checks the session again under the lock
+that covers it, so a device revoked meanwhile writes nothing. A revoked
+device's session ends as today; its statements stay, so readers can judge
+older manifests. Connect
 never sees generation keys, record contents or which server, group or epoch
 a record belongs to.
 

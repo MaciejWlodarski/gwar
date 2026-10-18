@@ -192,6 +192,8 @@ const MIGRATIONS: &[&str] = &[
         account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
         transfer TEXT NOT NULL
     );
+    CREATE INDEX archive_records_account ON archive_records(account_id, seq);
+    CREATE INDEX archive_transfers_account ON archive_transfers(account_id, seq);
     "#,
 ];
 
@@ -620,6 +622,18 @@ impl Store {
         Ok(())
     }
 
+    /// The newest recovery archive key (statement, signature), if any.
+    pub fn archive_recovery_newest_signed(&self, account: i64) -> Result<Option<(String, String)>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT statement,signature FROM archive_recovery WHERE account_id=?1 ORDER BY version DESC LIMIT 1",
+                params![account],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
     pub fn archive_recovery(&self, account: i64) -> Result<Vec<(String, String)>> {
         let mut stmt =
             self.db.prepare("SELECT statement,signature FROM archive_recovery WHERE account_id=?1 ORDER BY version")?;
@@ -655,8 +669,15 @@ impl Store {
         )?)
     }
 
-    /// Appends records in one transaction; a record id the account already has is skipped.
-    pub fn put_archive_records(&self, account: i64, records: &[(i64, String, String)]) -> Result<()> {
+    /// Appends records in one transaction; a record id the account already has is skipped. False
+    /// (and nothing stored) if the new ones would exceed `max_count` records or `max_bytes` of data.
+    pub fn put_archive_records(
+        &self,
+        account: i64,
+        records: &[(i64, String, String)],
+        max_count: i64,
+        max_bytes: i64,
+    ) -> Result<bool> {
         let tx = self.db.unchecked_transaction()?;
         for (generation, record_id, data) in records {
             tx.execute(
@@ -664,8 +685,16 @@ impl Store {
                 params![account, generation, record_id, data],
             )?;
         }
+        let (count, bytes): (i64, i64) = tx.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(data)),0) FROM archive_records WHERE account_id=?1",
+            params![account],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if count > max_count || bytes > max_bytes {
+            return Ok(false); // Dropping the transaction rolls back.
+        }
         tx.commit()?;
-        Ok(())
+        Ok(true)
     }
 
     pub fn archive_records(&self, account: i64, after: i64, limit: i64) -> Result<Vec<(i64, i64, String, String)>> {
@@ -711,5 +740,22 @@ mod tests {
         assert_eq!(store.vault(1).unwrap().version, 0);
         let version: usize = store.db.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(version, MIGRATIONS.len());
+    }
+
+    #[test]
+    fn archive_record_quotas_count_only_new_records() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(SCHEMA).unwrap();
+        db.execute_batch("INSERT INTO accounts VALUES(1,'a','k','{}','h','b','r','rb',0);").unwrap();
+        let store = Store::init(db).unwrap();
+        let row = |id: &str| (1, id.to_owned(), "data".to_owned());
+        assert!(store.put_archive_records(1, &[row("a"), row("b")], 2, 100).unwrap());
+        // The same batch again (a lost reply) is accepted at the quota; a new record is not.
+        assert!(store.put_archive_records(1, &[row("a"), row("b")], 2, 100).unwrap());
+        assert!(!store.put_archive_records(1, &[row("a"), row("c")], 2, 100).unwrap());
+        assert_eq!(store.archive_counts(1).unwrap().0, 2);
+        // Duplicates within a batch count once.
+        assert!(store.put_archive_records(1, &[row("d"), row("d")], 3, 100).unwrap());
+        assert!(!store.put_archive_records(1, &[row("e")], 3, 100).unwrap());
     }
 }
