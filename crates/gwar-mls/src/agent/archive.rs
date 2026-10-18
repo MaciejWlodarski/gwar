@@ -254,6 +254,23 @@ impl ArchiveRecord {
 }
 
 impl Agent {
+    /// The stored archive with `revocations` (Connect's feed now) learned, for an operation that
+    /// does not wait for the next sync to judge eligibility; the next sync stores them.
+    fn archive_now(&self, revocations: &[ArchiveRevocation]) -> Result<ArchiveRecord> {
+        let mut record = self.archive.clone().ok_or(Invalid("archive not synced"))?;
+        for r in revocations {
+            let r = Revocation {
+                device_key: r.device_key.clone(),
+                revoked_at: r.revoked_at,
+                signature: r.signature.clone(),
+            };
+            if r.verify(&record.account_key) {
+                record.learn(&r);
+            }
+        }
+        Ok(record)
+    }
+
     fn account_certificate(&self) -> Result<&DeviceCertificate> {
         match &self.credential {
             crate::Credential::Account(c) => Ok(c),
@@ -440,11 +457,12 @@ impl Agent {
         })
     }
 
-    /// The next generation's manifest, sealed to every device of the account current at `now`
+    /// The next generation's manifest (judged with `revocations`, Connect's feed now, learned),
+    /// sealed to every device of the account current at `now`
     /// with an archive key and to the current recovery key, carrying every revocation this
     /// device knows. Posted to Connect, then taken in by the next [`Agent::archive_sync`].
-    pub fn archive_create_manifest(&self, now: i64) -> Result<Vec<u8>> {
-        let record = self.archive.as_ref().ok_or(Invalid("archive not synced"))?;
+    pub fn archive_create_manifest(&self, now: i64, revocations: &[ArchiveRevocation]) -> Result<Vec<u8>> {
+        let record = &self.archive_now(revocations)?;
         let certificate = self.account_certificate()?;
         let current = record.current(now);
         if !current.contains_key(self.credential.device_key()) {
@@ -476,9 +494,15 @@ impl Agent {
 
     /// Up to `limit` epoch keys not yet in the archive (derived ones and those imported from
     /// history bundles; never `Conflicted` ones or those from the archive), sealed under the
-    /// newest generation safe at `now`; `None` without one (create one first).
-    pub fn archive_seal(&self, limit: usize, now: i64) -> Result<Option<ArchiveUpload>> {
-        let record = self.archive.as_ref().ok_or(Invalid("archive not synced"))?;
+    /// newest generation safe at `now` with `revocations` (Connect's feed now) learned; `None`
+    /// without one (create one first).
+    pub fn archive_seal(
+        &self,
+        limit: usize,
+        now: i64,
+        revocations: &[ArchiveRevocation],
+    ) -> Result<Option<ArchiveUpload>> {
+        let record = &self.archive_now(revocations)?;
         let Some(generation) = record.safe(self.credential.device_key(), now)? else { return Ok(None) };
         let key = record.keys.get(&generation).ok_or(Invalid("generation key"))?;
         let mut upload = ArchiveUpload { generation, records: Vec::new(), epochs: Vec::new() };
@@ -590,10 +614,16 @@ impl Agent {
 
     /// Transfers of the generation keys this device holds that `recipient` (a device of the
     /// account current at `now`, or `recovery:{version}` for the current recovery key) lacks and
-    /// was not sent yet, by generation. This device must be current itself. Posted to Connect;
+    /// was not sent yet, by generation, judged with `revocations` (Connect's feed now) learned.
+    /// This device must be current itself. Posted to Connect;
     /// then [`Agent::archive_transfers_sent`].
-    pub fn archive_transfers_for(&self, recipient: &str, now: i64) -> Result<Vec<(String, Vec<u8>)>> {
-        let record = self.archive.as_ref().ok_or(Invalid("archive not synced"))?;
+    pub fn archive_transfers_for(
+        &self,
+        recipient: &str,
+        now: i64,
+        revocations: &[ArchiveRevocation],
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let record = &self.archive_now(revocations)?;
         let certificate = self.account_certificate()?;
         let current = record.current(now);
         if !current.contains_key(self.credential.device_key()) {

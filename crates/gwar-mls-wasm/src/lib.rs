@@ -238,10 +238,12 @@ enum Request {
     },
     ArchiveCreateManifest {
         now: i64,
+        revocations: Vec<gwar_mls::agent::ArchiveRevocation>,
     },
     ArchiveSeal {
         limit: usize,
         now: i64,
+        revocations: Vec<gwar_mls::agent::ArchiveRevocation>,
     },
     ArchiveUploaded {
         epochs: Vec<String>,
@@ -252,6 +254,7 @@ enum Request {
     ArchiveTransfersFor {
         recipient: String,
         now: i64,
+        revocations: Vec<gwar_mls::agent::ArchiveRevocation>,
     },
     ArchiveTransfersSent {
         tags: Vec<String>,
@@ -566,12 +569,16 @@ impl Agent {
                         .map_err(error)?,
                 )
             }
-            Request::ArchiveCreateManifest { now } => output(a.archive_create_manifest(now).map_err(error)?),
-            Request::ArchiveSeal { limit, now } => output(a.archive_seal(limit, now).map_err(error)?),
+            Request::ArchiveCreateManifest { now, revocations } => {
+                output(a.archive_create_manifest(now, &revocations).map_err(error)?)
+            }
+            Request::ArchiveSeal { limit, now, revocations } => {
+                output(a.archive_seal(limit, now, &revocations).map_err(error)?)
+            }
             Request::ArchiveUploaded { epochs } => output(a.archive_uploaded(&epochs).map_err(error)?),
             Request::ArchiveImport { records } => output(a.archive_import(&records).map_err(error)?),
-            Request::ArchiveTransfersFor { recipient, now } => {
-                output(a.archive_transfers_for(&recipient, now).map_err(error)?)
+            Request::ArchiveTransfersFor { recipient, now, revocations } => {
+                output(a.archive_transfers_for(&recipient, now, &revocations).map_err(error)?)
             }
             Request::ArchiveTransfersSent { tags } => output(a.archive_transfers_sent(&tags).map_err(error)?),
             Request::AcceptPrivateChain { server, conversation, chain, group_info, tree, now, revocations } => {

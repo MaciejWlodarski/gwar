@@ -1,11 +1,11 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import init from "../../../../crates/gwar-mls-wasm/pkg/gwar_mls_wasm.js";
-import { changeRecoveryCode, createAccount, recover, signIn } from "../connect/account";
+import { changeRecoveryCode, createAccount, newRecoveryCode, recover, signIn } from "../connect/account";
 import { setup, type FakeService } from "../connect/testing";
 import { decodeBase64Url, encodeBase64Url } from "../net/base64url";
 import { identityFromConnect, identitySeed, uidForPublicKey, type ConnectRecord } from "../net/identity";
-import { KeyArchive } from "./archive";
+import { KeyArchive, transferGeneration } from "./archive";
 import { credential, descriptor } from "./descriptor";
 import { Engine } from "./engine";
 import type { Persistence } from "./storage";
@@ -118,31 +118,58 @@ describe("key archive", () => {
     const created = await createAccount({ handle: "bob", password: "correct horse battery" }, deps());
     const laptop = await device(service, deps, created.record);
     await laptop.archive.pass();
-    const changed = await changeRecoveryCode(created.record, "correct horse battery", deps());
-    expect(changed.record.archiveRecovery).toBeUndefined();
+    const code = newRecoveryCode();
+    const changed = await changeRecoveryCode(created.record, "correct horse battery", code, deps());
+    expect(changed.archiveRecovery).toBeUndefined();
     expect(stored()?.archiveRecovery).toBeUndefined();
     const archive = service.archive.get("bob")!;
     expect(archive.recovery.map(k => k.statement.split("\n")[2])).toEqual(["1", "2"]);
-    laptop.record = { ...laptop.record, token: changed.record.token };
+    laptop.record = { ...laptop.record, token: changed.token };
     await laptop.archive.pass();
     // Generation 1 went to version 2 by a transfer; generation 2 is sealed to it.
     expect([...archive.manifests.keys()]).toEqual([1, 2]);
     expect(archive.transfers).toHaveLength(1);
-    const fresh = await device(service, deps, await recover({ handle: "bob", code: changed.recoveryCode, newPassword: "another horse battery" }, deps("New")));
+    const fresh = await device(service, deps, await recover({ handle: "bob", code, newPassword: "another horse battery" }, deps("New")));
     await fresh.archive.pass();
     // It opens both (and then makes generation 3, which names it).
     expect(Object.keys(fresh.state()!.keys)).toEqual(["1", "2", "3"]);
   });
 
-  it("drops a pending recovery key whose code change never happened", async () => {
+  it("drops a pending recovery key a newer version replaced", async () => {
     const { service, deps } = setup();
     const created = await createAccount({ handle: "carol", password: "correct horse battery" }, deps());
-    const laptop = await device(service, deps, created.record);
-    await laptop.archive.pass();
-    const statement = { ...created.record.archiveRecovery!, statement: created.record.archiveRecovery!.statement.replace("\n1\n", "\n2\n"), base: 0 };
-    laptop.record = { ...laptop.record, archiveRecovery: statement };
+    const stale = created.record.archiveRecovery!;
+    // The code changed before the sign-up key was ever published: version 1 is the new code's.
+    const changed = await changeRecoveryCode(created.record, "correct horse battery", newRecoveryCode(), deps());
+    const laptop = await device(service, deps, { ...changed, archiveRecovery: stale });
     await laptop.archive.pass();
     expect(laptop.record.archiveRecovery).toBeUndefined();
-    expect(service.archive.get("carol")!.recovery).toHaveLength(1);
+    const keys = service.archive.get("carol")!.recovery;
+    expect(keys).toHaveLength(1);
+    expect(keys[0]!.statement).not.toBe(stale.statement);
+  });
+
+  it("refuses an archive page whose cursor does not advance", async () => {
+    const { service, deps } = setup();
+    const created = await createAccount({ handle: "dave", password: "correct horse battery" }, deps());
+    const laptop = await device(service, deps, created.record);
+    await laptop.archive.pass();
+    const api = deps().api;
+    api.archiveTransfers = async () => ({ transfers: [], next: 0 });
+    const stuck = new KeyArchive(laptop.engine, {
+      api, deviceKey: laptop.identity.publicKey, now: Date.now,
+      session: async () => ({ token: laptop.record.token, accountKey: laptop.record.accountKey }),
+      used: async () => {}, uploads: () => true, revocations: () => [],
+    });
+    await expect(stuck.pass()).rejects.toThrow(/cursor did not advance/);
+  });
+
+  it("reads the generation a transfer names", () => {
+    const enc = new TextEncoder();
+    const netstring = (text: string) => enc.encode(`${enc.encode(text).length}:${text},`);
+    expect(transferGeneration(netstring("gwar archive transfer v1\nacc\n7\nrest"))).toBe(7);
+    expect(transferGeneration(netstring("gwar archive manifest v1\nacc\n7"))).toBeNull();
+    expect(transferGeneration(enc.encode("99:short"))).toBeNull();
+    expect(transferGeneration(enc.encode("garbage"))).toBeNull();
   });
 });

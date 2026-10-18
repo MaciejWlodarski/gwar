@@ -2876,34 +2876,30 @@ gwar archive transfer v1
 
 ### Recovery code changes
 
-Changing the recovery code (password and a signed-in device, as today) is a
-staged, resumable rotation on that device:
+Changing the recovery code (password and a signed-in device, as today):
 
-1. With the account key decrypted, it derives the new recovery archive key
-   from the new code, signs the next version's statement, and stores the
-   signed statement (never the code) as a **pending rotation** in its
-   Connect record, with the credential version the change is made on.
-2. It updates the recovery credentials (`PUT /v1/account/recovery`). A
-   definite refusal discards the pending rotation; an ambiguous failure (no
-   reply, a network error) keeps it until the credential version tells
-   (below).
-3. It publishes the statement (`PUT /v1/archive/recovery`) and drops the
-   pending rotation. The key archive then sees a new recovery version: every
+1. The device makes the new code and shows it; nothing changes until the
+   person confirms they kept it.
+2. With the account key decrypted, it updates the recovery credentials
+   (`PUT /v1/account/recovery`). A definite refusal ends the change. After an
+   ambiguous failure (no reply, a network error) it asks Connect whether the
+   new code works, by a recovery sign-in with it (`POST /v1/recover`): only
+   then does it go on; otherwise the change failed and may be tried again
+   with the same code. (The credential version cannot tell: a password change
+   moves it too.)
+3. It signs the next version's recovery archive key statement, stores it in
+   its Connect record and publishes it (`PUT /v1/archive/recovery`; the key
+   archive retries a failed publish, and drops it once a newer version
+   holds). The key archive then sees a new recovery version: every
    generation it opened that is not sealed to it is owed a transfer, and no
    generation is safe until it makes the next one, sealed to the new version.
 
-A pending rotation left by a crash or an ambiguous failure is resumed by the
-key archive: when the credential version `POST /v1/challenges` reports moved
-past the one the change was made on, it publishes the statement (Connect
-answers `{}` to the identical statement for the version it already holds, so
-publishing is idempotent); when it did not, the change never happened and
-the pending rotation is dropped. Sign-up signs version 1 the same way (no
-credential check) and the key archive publishes it. Restoring with the
-recovery code (`POST /v1/recover`) derives the recovery archive key, which
-the new device keeps until its first archive sync: it opens every generation
-sealed or transferred to the newest recovery version and imports their
-records. Accounts made before the key archive get their first recovery key
-when the code is next changed.
+Sign-up signs version 1 the same way and the key archive publishes it.
+Restoring with the recovery code (`POST /v1/recover`) derives the recovery
+archive key, which the new device keeps until its first archive sync: it
+opens every generation sealed or transferred to the newest recovery version
+and imports their records. Accounts made before the key archive get their
+first recovery key when the code is next changed.
 
 ### Connect API
 
