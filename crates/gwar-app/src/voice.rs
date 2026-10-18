@@ -11,6 +11,9 @@ use vc_client::voice::{InputMode, LinkState, VoiceHandle, io::AudioIo};
 
 /// The microphone opens above this level in voice activity mode (dBFS), as on the desktop.
 pub const VOICE_ACTIVITY_DB: f32 = -50.0;
+/// The range offered for that threshold.
+pub const VOICE_ACTIVITY_MIN_DB: f32 = -80.0;
+pub const VOICE_ACTIVITY_MAX_DB: f32 = -10.0;
 
 /// The link of the running voice session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -35,13 +38,21 @@ pub struct VoiceStatus {
 }
 
 /// What the user set, applied to every engine the session starts.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct Controls {
     pub muted: bool,
     pub deafened: bool,
     pub push_to_talk: bool,
     /// The push-to-talk button is held.
     pub talk_held: bool,
+    /// Voice activity opens the microphone above this level (dBFS).
+    pub threshold_db: f32,
+}
+
+impl Default for Controls {
+    fn default() -> Self {
+        Self { muted: false, deafened: false, push_to_talk: false, talk_held: false, threshold_db: VOICE_ACTIVITY_DB }
+    }
 }
 
 /// A running engine.
@@ -64,7 +75,7 @@ impl Voice {
         self.handle.set_input_mode(if controls.push_to_talk {
             InputMode::PushToTalk
         } else {
-            InputMode::VoiceActivity { threshold_db: VOICE_ACTIVITY_DB }
+            InputMode::VoiceActivity { threshold_db: controls.threshold_db }
         });
         self.handle.set_ptt(controls.talk_held);
     }

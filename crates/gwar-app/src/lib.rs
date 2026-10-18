@@ -605,6 +605,15 @@ impl Session {
         });
     }
 
+    /// How loud the microphone must be to open in voice activity mode, in dBFS
+    /// (clamped to -80..-10; -50 by default, as on the desktop).
+    pub fn set_voice_activity_threshold(&self, threshold_db: f32) {
+        let threshold_db = if threshold_db.is_finite() { threshold_db } else { voice::VOICE_ACTIVITY_DB };
+        self.update_controls(|c| {
+            c.threshold_db = threshold_db.clamp(voice::VOICE_ACTIVITY_MIN_DB, voice::VOICE_ACTIVITY_MAX_DB);
+        });
+    }
+
     /// The push-to-talk button is pressed or released.
     pub fn set_talk_held(&self, held: bool) {
         self.update_controls(|c| c.talk_held = held);

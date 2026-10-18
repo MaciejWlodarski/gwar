@@ -96,4 +96,9 @@
     <string name="locked_reset_body">Serwery zobaczą Cię jako nową osobę: starej tożsamości nie da się odzyskać na tym telefonie. Zapisane serwery zostaną zachowane.</string>
     <string name="locked_reset_confirm">Utwórz nową tożsamość</string>
     <string name="error_identity_locked">Nie można odblokować tożsamości: %1$s</string>
+    <string name="done">Gotowe</string>
+    <string name="voice_sensitivity">Czułość mikrofonu</string>
+    <string name="voice_sensitivity_hint">Mów normalnie: pasek robi się zielony, gdy mikrofon jest wysyłany. Przesuń suwak w prawo, jeśli otwiera go hałas z tła, w lewo, jeśli cicha mowa go nie otwiera.</string>
+    <string name="voice_sensitivity_value">Otwiera się powyżej %1$d dB</string>
+    <string name="voice_sensitivity_default">Domyślna</string>
 </resources>

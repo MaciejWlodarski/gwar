@@ -96,6 +96,8 @@ fun GwarRoot(client: GwarClient) {
             pushToTalk = state.pushToTalk,
             talkHeld = state.talkHeld,
             onSetPushToTalk = client::setPushToTalk,
+            thresholdDb = state.thresholdDb,
+            onSetThreshold = client::setThreshold,
             onHoldToTalk = client::holdToTalk,
             onChooseOutput = client::chooseOutput,
             onAllowBluetooth = if (bluetoothMissing) {

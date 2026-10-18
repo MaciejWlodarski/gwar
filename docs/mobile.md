@@ -85,7 +85,8 @@ the native desktop app will use `gwar-app` instead.
   Mute and deafen are shown to everyone; a lost link or audio device restarts
   voice by itself. Push-to-talk (in the voice options, remembered) shows a
   large button that opens the microphone while held; otherwise the
-  microphone opens on voice activity, as on the desktop. Tapping the voice
+  microphone opens on voice activity, as on the desktop, with a sensitivity
+  slider over a live microphone meter (also remembered). Tapping the voice
   status shows the engine's counters.
 - Reconnecting by itself when the link drops: a ping timeout, a server
   restart or a change of network (Wi-Fi to mobile data and back is noticed
@@ -106,8 +107,7 @@ Roughly in this order:
 
 1. **Voice on real phones**: latency and loss measurements like the desktop's
    ([latency.md](latency.md)), output switching with real earpieces and
-   Bluetooth headsets (the emulator has only a loudspeaker), a voice activity
-   sensitivity setting.
+   Bluetooth headsets (the emulator has only a loudspeaker).
 2. **Encrypted chat, encrypted voice and direct messages.** These need the MLS client logic
    that today lives in `apps/web` (TypeScript over `gwar-mls-wasm`), moved
    into the Rust core so every native app shares it. This waits until the

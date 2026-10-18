@@ -86,6 +86,8 @@ data class UiState(
     /** The microphone opens only while the talk button is held (a saved preference). */
     val pushToTalk: Boolean = false,
     val talkHeld: Boolean = false,
+    /** Voice activity opens the microphone above this level, in dBFS (a saved preference). */
+    val thresholdDb: Float = DEFAULT_THRESHOLD_DB,
     /** Where call audio can go while voice runs, and where it goes. */
     val outputs: List<AudioOutput> = emptyList(),
     val output: AudioOutput? = null,
@@ -96,6 +98,10 @@ private const val HISTORY_PAGE = 50
 private const val STATUS_INTERVAL_MS = 250L
 private const val VOICE_RETRY_MS = 1_500L
 private const val PUSH_TO_TALK = "push_to_talk"
+private const val THRESHOLD_DB = "threshold_db"
+
+/** As on the desktop; the core clamps to -80..-10. */
+const val DEFAULT_THRESHOLD_DB = -50f
 
 /**
  * The app's one connection, owned by the process rather than a screen, so a
@@ -121,6 +127,7 @@ class GwarClient(private val app: Application) {
             uid = core.uid(),
             form = core.lastServer()?.let { ConnectForm(it.address, it.nickname, it.insecureLan) } ?: ConnectForm(),
             pushToTalk = settings.getBoolean(PUSH_TO_TALK, false),
+            thresholdDb = settings.getFloat(THRESHOLD_DB, DEFAULT_THRESHOLD_DB),
         ),
     )
     val state: StateFlow<UiState> = _state.asStateFlow()
@@ -240,6 +247,12 @@ class GwarClient(private val app: Application) {
         session?.setPushToTalk(enabled)
     }
 
+    fun setThreshold(db: Float) {
+        settings.edit().putFloat(THRESHOLD_DB, db).apply()
+        _state.update { it.copy(thresholdDb = db) }
+        session?.setVoiceActivityThreshold(db)
+    }
+
     /** The talk button is pressed or released. */
     fun holdToTalk(held: Boolean) {
         _state.update { it.copy(talkHeld = held) }
@@ -278,6 +291,7 @@ class GwarClient(private val app: Application) {
     private fun attach(s: Session) {
         session = s
         s.setPushToTalk(_state.value.pushToTalk)
+        s.setVoiceActivityThreshold(_state.value.thresholdDb)
         network.start()
         _state.update { it.copy(connecting = false, reconnecting = false, view = s.view()) }
     }

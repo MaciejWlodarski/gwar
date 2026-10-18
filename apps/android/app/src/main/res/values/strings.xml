@@ -97,4 +97,9 @@
     <string name="locked_reset_body">Servers will see you as a new person: your old identity cannot be recovered on this phone. Server bookmarks are kept.</string>
     <string name="locked_reset_confirm">Create a new identity</string>
     <string name="error_identity_locked">The identity cannot be unlocked: %1$s</string>
+    <string name="done">Done</string>
+    <string name="voice_sensitivity">Microphone sensitivity</string>
+    <string name="voice_sensitivity_hint">Speak normally: the bar turns green while your microphone is sent. Move the slider right if background noise opens it, left if quiet speech does not.</string>
+    <string name="voice_sensitivity_value">Opens above %1$d dB</string>
+    <string name="voice_sensitivity_default">Default</string>
 </resources>

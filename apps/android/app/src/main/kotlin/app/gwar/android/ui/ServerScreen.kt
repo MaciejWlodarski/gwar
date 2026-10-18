@@ -2,9 +2,11 @@ package app.gwar.android.ui
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.height
 import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.Slider
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalHapticFeedback
@@ -82,6 +84,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import app.gwar.android.R
 import app.gwar.android.AudioOutput
+import app.gwar.android.DEFAULT_THRESHOLD_DB
 import app.gwar.android.Notice
 import app.gwar.android.OutputKind
 import app.gwar.android.VoiceState
@@ -105,6 +108,8 @@ fun ServerScreen(
     pushToTalk: Boolean,
     talkHeld: Boolean,
     onSetPushToTalk: (Boolean) -> Unit,
+    thresholdDb: Float,
+    onSetThreshold: (Float) -> Unit,
     onHoldToTalk: (Boolean) -> Unit,
     onChooseOutput: (OutputKind) -> Unit,
     /** Set when Bluetooth headsets need a permission first. */
@@ -161,6 +166,8 @@ fun ServerScreen(
                         onAllowBluetooth = onAllowBluetooth,
                         pushToTalk = pushToTalk,
                         onSetPushToTalk = onSetPushToTalk,
+                        thresholdDb = thresholdDb,
+                        onSetThreshold = onSetThreshold,
                         onToggleMute = onToggleMute,
                         onToggleDeafen = onToggleDeafen,
                         onLeave = onLeave,
@@ -399,6 +406,8 @@ private fun VoiceBar(
     onAllowBluetooth: (() -> Unit)?,
     pushToTalk: Boolean,
     onSetPushToTalk: (Boolean) -> Unit,
+    thresholdDb: Float,
+    onSetThreshold: (Float) -> Unit,
     onToggleMute: () -> Unit,
     onToggleDeafen: () -> Unit,
     onLeave: () -> Unit,
@@ -448,7 +457,7 @@ private fun VoiceBar(
                     )
                 }
             }
-            if (voice != null) VoiceOptions(pushToTalk, onSetPushToTalk)
+            if (voice != null) VoiceOptions(pushToTalk, onSetPushToTalk, thresholdDb, onSetThreshold, voice)
             if (voice != null && output != null) {
                 OutputMenu(output, outputs, onChooseOutput, onAllowBluetooth)
             }
@@ -543,8 +552,15 @@ private fun AudioOutput.label(): String = when (kind) {
 }
 
 @Composable
-private fun VoiceOptions(pushToTalk: Boolean, onSetPushToTalk: (Boolean) -> Unit) {
+private fun VoiceOptions(
+    pushToTalk: Boolean,
+    onSetPushToTalk: (Boolean) -> Unit,
+    thresholdDb: Float,
+    onSetThreshold: (Float) -> Unit,
+    voice: VoiceState,
+) {
     var open by remember { mutableStateOf(false) }
+    var sensitivity by remember { mutableStateOf(false) }
     Box {
         IconButton(onClick = { open = true }) {
             Icon(Icons.Outlined.MoreVert, stringResource(R.string.voice_more))
@@ -558,8 +574,68 @@ private fun VoiceOptions(pushToTalk: Boolean, onSetPushToTalk: (Boolean) -> Unit
                     onSetPushToTalk(!pushToTalk)
                 },
             )
+            if (!pushToTalk) {
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.voice_sensitivity)) },
+                    onClick = {
+                        open = false
+                        sensitivity = true
+                    },
+                )
+            }
         }
     }
+    if (sensitivity) SensitivityDialog(thresholdDb, onSetThreshold, voice) { sensitivity = false }
+}
+
+private const val METER_MIN_DB = -80f
+private const val METER_MAX_DB = -10f
+
+/** The voice activity threshold, over a live meter of the microphone level. */
+@Composable
+private fun SensitivityDialog(thresholdDb: Float, onSet: (Float) -> Unit, voice: VoiceState, onDismiss: () -> Unit) {
+    val level = voice.status?.inputLevelDb ?: METER_MIN_DB
+    val open = voice.status?.transmitting == true
+    fun fraction(db: Float) = ((db - METER_MIN_DB) / (METER_MAX_DB - METER_MIN_DB)).coerceIn(0f, 1f)
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.voice_sensitivity)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(stringResource(R.string.voice_sensitivity_hint), style = MaterialTheme.typography.bodyMedium)
+                Box(
+                    Modifier
+                        .fillMaxWidth()
+                        .height(10.dp)
+                        .background(MaterialTheme.colorScheme.surfaceContainerHighest, RoundedCornerShape(5.dp)),
+                ) {
+                    Box(
+                        Modifier
+                            .fillMaxWidth(fraction(level))
+                            .height(10.dp)
+                            .background(
+                                if (open) GwarColors.talking else MaterialTheme.colorScheme.onSurfaceVariant,
+                                RoundedCornerShape(5.dp),
+                            ),
+                    )
+                }
+                Slider(
+                    value = thresholdDb,
+                    onValueChange = onSet,
+                    valueRange = METER_MIN_DB..METER_MAX_DB,
+                )
+                Text(
+                    stringResource(R.string.voice_sensitivity_value, thresholdDb.toInt()),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text(stringResource(R.string.done)) } },
+        dismissButton = {
+            TextButton(onClick = { onSet(DEFAULT_THRESHOLD_DB) }) { Text(stringResource(R.string.voice_sensitivity_default)) }
+        },
+    )
 }
 
 /** Held to open the microphone in push-to-talk mode. */
