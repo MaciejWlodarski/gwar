@@ -426,10 +426,18 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             let _lock = vc_server::members::lock_data_dir(&cli.data_dir)?;
-            let backup = cli.data_dir.join(format!("vc.sqlite3.before-import-{}", vc_server::core::now_ms()));
-            ts_import::copy_database(&database, &backup)?;
+            // A server that never ran has no database yet: nothing to keep.
+            let backup = database
+                .exists()
+                .then(|| cli.data_dir.join(format!("vc.sqlite3.before-import-{}", vc_server::core::now_ms())));
+            if let Some(backup) = &backup {
+                ts_import::copy_database(&database, backup)?;
+            }
             let applied = ts_import::import(&database, &plan, &source_id, apply_options, true)?;
-            println!("\nImported: {}\nThe database before the import: {}", summary(&applied), backup.display());
+            println!("\nImported: {}", summary(&applied));
+            if let Some(backup) = backup {
+                println!("The database before the import: {}", backup.display());
+            }
             return Ok(());
         }
         None => {}

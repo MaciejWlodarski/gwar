@@ -1412,6 +1412,11 @@ impl Store {
         tx.execute("UPDATE invites SET creator_uid=?2 WHERE creator_uid=?1", params![from, into])?;
         // Overrides follow too, where the target has none of its own in that channel.
         tx.execute("UPDATE OR IGNORE channel_overrides SET user=?2 WHERE user=?1", params![from, into])?;
+        // What a TeamSpeak import last wrote follows too, so a re-run does not take the merge for an edit.
+        tx.execute(
+            "UPDATE ts_imports SET written=replace(written,'\"user\":\"'||?1||'\"','\"user\":\"'||?2||'\"') WHERE kind='channel'",
+            params![from, into],
+        )?;
         tx.execute("DELETE FROM channel_overrides WHERE user=?1", [from])?;
         tx.execute("UPDATE tokens SET creator_uid=?2 WHERE creator_uid=?1", params![from, into])?;
         // bans.by and invites.created_by are display-name snapshots, not identity references.

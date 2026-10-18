@@ -85,6 +85,17 @@ fn channel_print(row: &ChannelRow) -> String {
     .to_string()
 }
 
+/// A channel's print as compared: overrides Gwar itself dropped since (a deleted role, a removed
+/// member) are no change by the operator. `None` for a print that does not parse.
+fn comparable(print: &str, keep: &impl Fn(&ChannelOverride) -> bool) -> Option<serde_json::Value> {
+    let mut value: serde_json::Value = serde_json::from_str(print).ok()?;
+    let overrides: Vec<ChannelOverride> = serde_json::from_value(value.get_mut("overrides")?.take()).ok()?;
+    let mut kept: Vec<_> = overrides.into_iter().filter(|o| keep(o)).collect();
+    kept.sort_by(|a, b| (a.role, &a.user).cmp(&(b.role, &b.user)));
+    value["overrides"] = json!(kept);
+    Some(value)
+}
+
 fn role_print(group: &Group) -> String {
     let mut permissions = group.permissions.clone();
     permissions.sort_unstable();
@@ -260,6 +271,16 @@ pub fn apply(store: &Store, plan: &Plan, source: &str, options: ApplyOptions) ->
         .unwrap_or(0);
     // TeamSpeak channels left out: deleted in Gwar, or under one that was.
     let mut skipped: BTreeSet<u64> = BTreeSet::new();
+    // The default channel follows TeamSpeak's unless chosen in Gwar since the last import.
+    let default_record = store.ts_import_record(source, "default", 0)?;
+    let default_untouched = untouched(&default_record, &store.meta("default_channel")?.unwrap_or_default());
+    if !default_untouched {
+        applied.notes.push("The default channel was chosen in Gwar since the last import: kept.".into());
+    }
+    let exists = |o: &ChannelOverride| {
+        o.role.is_none_or(|r| live.contains(&r))
+            && o.user.as_ref().is_none_or(|u| store.user_by_uid(u).ok().flatten().is_some())
+    };
     for c in &plan.channels {
         if c.parent.is_some_and(|p| skipped.contains(&p)) {
             skipped.insert(c.ts_id);
@@ -279,11 +300,11 @@ pub fn apply(store: &Store, plan: &Plan, source: &str, options: ApplyOptions) ->
             skipped.insert(c.ts_id);
             continue;
         }
-        if let Some(cur) = &current
-            && !untouched(&record, &channel_print(cur))
+        if let (Some(cur), Some((_, written))) = (&current, &record)
+            && written.as_deref().and_then(|w| comparable(w, &exists)) != comparable(&channel_print(cur), &|_| true)
         {
             applied.notes.push(format!("Channel \"{}\" changed in Gwar since the last import: kept.", cur.name));
-            if c.default {
+            if c.default && default_untouched {
                 store.set_meta("default_channel", &cur.id.to_string())?;
             }
             continue;
@@ -347,14 +368,14 @@ pub fn apply(store: &Store, plan: &Plan, source: &str, options: ApplyOptions) ->
         existing = store.channels()?;
         let written = existing.iter().find(|r| r.id == id).map(channel_print);
         store.set_ts_import_record(source, "channel", c.ts_id, i64::from(id), written.as_deref())?;
-        // A new password for the bridge to set on TeamSpeak (the same one twice is not sent again).
+        // For the bridge to set on TeamSpeak; it confirms each, so sending one again does no harm
+        // (and covers a first run without --for-bridge).
         if let Password::Kept(p) = &c.password
             && options.for_bridge
-            && hash != current_hash
         {
             store.queue_bridge_password(id, p)?;
         }
-        if c.default {
+        if c.default && default_untouched {
             store.set_meta("default_channel", &id.to_string())?;
         }
     }
@@ -365,6 +386,8 @@ pub fn apply(store: &Store, plan: &Plan, source: &str, options: ApplyOptions) ->
     {
         store.set_meta("default_channel", &first.id.to_string())?;
     }
+    let default_now = store.meta("default_channel")?.unwrap_or_default();
+    store.set_ts_import_record(source, "default", 0, 0, Some(&default_now))?;
 
     // --------------------------------------------------------------- members
     for m in &plan.members {

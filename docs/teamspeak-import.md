@@ -124,7 +124,7 @@ So the importer asks:
   alike.
 - The bridge sets a TeamSpeak channel's password only from the plain text (the
   reason above). With `--for-bridge` (the server runs with `--teamspeak`) the
-  importer leaves each new typed password in `ts_import_passwords`; the bridge
+  importer leaves each typed password in `ts_import_passwords`, on every run; the bridge
   sends it on attach and the row goes once TeamSpeak has taken it, or when the
   channel's password changes in Gwar. Without `--for-bridge` none is written,
   and a server started without TeamSpeak support clears the table. The
@@ -157,7 +157,9 @@ VC_TS_QUERY_PASSWORD=… vc-server import-teamspeak --from 127.0.0.1:10011 [--us
   went in. `--dry-run` does the same and throws the copy away, so it shows
   exactly what would change (also while the server runs).
 - Otherwise the Gwar server must be stopped (`data/vc.lock`). The database as
-  it was stays next to it (`vc.sqlite3.before-import-<time>`).
+  it was stays next to it (`vc.sqlite3.before-import-<time>`); the new one
+  keeps its owner and mode. A server that never ran gets a new database, with
+  the imported channels instead of the seeded ones.
 - `--passwords` takes one `name = password` per line (`#` comments, quotes
   optional): a channel's path (`"Clan/Room"`; a `/` or `\` in a name is
   written `\/`, `\\`), a name no other imported channel has, or `@server`
@@ -167,10 +169,13 @@ VC_TS_QUERY_PASSWORD=… vc-server import-teamspeak --from 127.0.0.1:10011 [--us
 - Running it again later updates what it imported before instead of adding
   copies (`ts_imports`, by the source server's unique id), but only what nobody
   changed in Gwar since: each record keeps what the import last wrote. A
-  channel, role, Member's permissions, the role order or the server's settings
-  edited in Gwar stay as they are; anything deleted in Gwar is not made again;
+  channel, role, Member's permissions, the role order, the default channel or
+  the server's settings edited in Gwar stay as they are (what Gwar changes by
+  itself, such as overrides that go with a deleted role or follow a merged
+  member, is no edit); anything deleted in Gwar is not made again;
   a role taken from a member in Gwar is not given back, and a ban lifted in
-  Gwar stays lifted. The report lists each. A member's roles follow TeamSpeak
+  Gwar stays lifted. The report lists each. A member merged into a Gwar
+  identity counts as removed: their roles from then on are managed in Gwar. A member's roles follow TeamSpeak
   otherwise: one added there is given, one removed there goes. New TeamSpeak
   items are added. So a community can import, try Gwar, and import again just
   before switching.

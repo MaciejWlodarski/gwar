@@ -45,9 +45,10 @@ fn remove_database(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Applies `plan` to a copy of `database`, all or nothing. With `commit` the copy then takes the
-/// database's place (the server must be stopped and its data directory locked); without, it is
-/// thrown away: a dry run that shows exactly what an import would do.
+/// Applies `plan` to a copy of `database` (a new one if the server never ran), all or nothing.
+/// With `commit` the copy then takes the database's place, with its owner and mode (the server
+/// must be stopped and its data directory locked); without, it is thrown away: a dry run that
+/// shows exactly what an import would do.
 pub fn import(
     database: &Path,
     plan: &plan::Plan,
@@ -55,9 +56,17 @@ pub fn import(
     options: apply::ApplyOptions,
     commit: bool,
 ) -> Result<apply::Applied> {
-    let staging = with_suffix(database, ".importing");
+    // A dry run takes no lock: its copy has a name of its own.
+    let staging = if commit {
+        with_suffix(database, ".importing")
+    } else {
+        with_suffix(database, &format!(".dry-run-{}", std::process::id()))
+    };
+    let existed = database.exists();
     remove_database(&staging)?;
-    copy_database(database, &staging)?;
+    if existed {
+        copy_database(database, &staging)?;
+    }
     let result = (|| {
         let store = Store::open(&staging)?;
         let applied = apply::apply(&store, plan, source, options)?;
@@ -71,17 +80,28 @@ pub fn import(
             return other;
         }
     };
-    // Nothing of the old database may stay in a write-ahead log the new file would inherit.
-    {
-        let db = Connection::open(database)?;
-        db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
-    }
-    if std::fs::metadata(with_suffix(database, "-wal")).is_ok_and(|m| m.len() > 0) {
-        remove_database(&staging)?;
-        bail!("{} is still in use: stop the server first", database.display());
-    }
-    for suffix in ["-wal", "-shm"] {
-        let _ = std::fs::remove_file(with_suffix(database, suffix));
+    if existed {
+        // Nothing of the old database may stay in a write-ahead log the new file would inherit.
+        {
+            let db = Connection::open(database)?;
+            db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        }
+        if std::fs::metadata(with_suffix(database, "-wal")).is_ok_and(|m| m.len() > 0) {
+            remove_database(&staging)?;
+            bail!("{} is still in use: stop the server first", database.display());
+        }
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(with_suffix(database, suffix));
+        }
+        // The server may run as another user than the import.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let original = std::fs::metadata(database)?;
+            std::os::unix::fs::chown(&staging, Some(original.uid()), Some(original.gid()))
+                .with_context(|| format!("give {} its owner", staging.display()))?;
+            std::fs::set_permissions(&staging, original.permissions())?;
+        }
     }
     std::fs::rename(&staging, database).with_context(|| format!("replace {}", database.display()))?;
     for suffix in ["-wal", "-shm"] {

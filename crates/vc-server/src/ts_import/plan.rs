@@ -425,7 +425,9 @@ pub fn plan(source: &Source, options: &Options) -> Result<Plan> {
                     } else if options.passwords.contains_key(&path) {
                         Some(path.as_str())
                     } else {
-                        Some(name.as_str()).filter(|n| name_count[*n] == 1 && options.passwords.contains_key(*n))
+                        Some(name.as_str()).filter(|n| {
+                            *n != SERVER_PASSWORD && name_count[*n] == 1 && options.passwords.contains_key(*n)
+                        })
                     };
                     match key.and_then(|k| options.passwords.get_key_value(k)) {
                         Some((key, p)) => {

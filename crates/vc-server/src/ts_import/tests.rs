@@ -254,8 +254,8 @@ fn applying_twice_updates_instead_of_adding_copies() {
     assert!(second.notes.is_empty(), "{:?}", second.notes);
     let dump = |rows: Vec<crate::store::ChannelRow>| format!("{rows:?}");
     assert_eq!(dump(store.channels().unwrap()), dump(channels), "an unchanged source changes nothing");
-    // The same password is not queued again.
-    assert!(store.bridge_passwords().unwrap().is_empty());
+    // Sent again: the bridge confirms each (so a first run without --for-bridge is made up for).
+    assert_eq!(store.bridge_passwords().unwrap().len(), 1);
 }
 
 #[test]
@@ -462,4 +462,46 @@ fn an_import_is_all_or_nothing_and_a_dry_run_changes_nothing() {
     assert_eq!(count(), before + 5);
     let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
     assert!(left.iter().all(|f| !f.to_string_lossy().contains("importing")), "{left:?}");
+}
+
+#[test]
+fn what_gwar_itself_drops_or_merges_is_no_edit_and_a_default_chosen_in_gwar_stays() {
+    let store = Store::in_memory().unwrap();
+    apply(&store, &plan(&source(), &Options::default()), "src", BRIDGE).unwrap();
+    // A role deleted (its overrides go with it) and the channel admin merged into a Gwar identity.
+    let moderator = store.groups().unwrap().into_iter().find(|g| g.name == "Moderator").unwrap().id;
+    store.delete_group(moderator).unwrap();
+    store.touch_user("native", "key", "Leader", 1).unwrap();
+    store.merge_members("ts:ClanAdminUid=", "native", false).unwrap();
+    let general = store.channels().unwrap().into_iter().find(|c| c.name == "General").unwrap().id;
+    store.set_meta("default_channel", &general.to_string()).unwrap();
+    let second = apply(&store, &plan(&source(), &Options::default()), "src", BRIDGE).unwrap();
+    assert!(second.notes.iter().all(|n| !n.contains("Channel")), "{:?}", second.notes);
+    assert_eq!(store.meta("default_channel").unwrap(), Some(general.to_string()));
+    assert!(second.notes.iter().any(|n| n.contains("default channel")));
+}
+
+#[test]
+fn a_subchannel_called_like_the_servers_key_does_not_take_its_password() {
+    let mut s = source();
+    s.channels[2].insert("channel_name".into(), "@server".into());
+    s.channels[2].insert("channel_flag_password".into(), "1".into());
+    s.server.insert("virtualserver_flag_password".into(), "1".into());
+    let options = Options { passwords: [("@server".into(), "top".into())].into(), ..Default::default() };
+    let planned = plan(&s, &options);
+    assert_eq!(planned.channels.iter().find(|c| c.name == "@server").unwrap().password, Password::Locked);
+}
+
+#[test]
+fn a_server_that_never_ran_is_imported_into_a_new_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let database = dir.path().join("vc.sqlite3");
+    let planned = plan(&source(), &Options::default());
+    super::import(&database, &planned, "src", ApplyOptions::default(), false).unwrap();
+    assert!(!database.exists(), "a dry run leaves nothing");
+    let applied = super::import(&database, &planned, "src", ApplyOptions::default(), true).unwrap();
+    assert_eq!(applied.channels_created, 5);
+    let store = Store::open(&database).unwrap();
+    let default: u32 = store.meta("default_channel").unwrap().unwrap().parse().unwrap();
+    assert_eq!(store.channels().unwrap().iter().find(|c| c.id == default).unwrap().name, "Lobby");
 }
