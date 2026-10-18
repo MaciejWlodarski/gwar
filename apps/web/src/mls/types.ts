@@ -58,6 +58,8 @@ export interface GroupSummary {
   history: boolean;
   /** A private channel's group (6c): its access checkpoint follows every transition. */
   private: boolean;
+  /** A private channel's owner at its first creation (restarts carry it on). */
+  founding_owner?: string;
   /** A voice group's parent channel group, from its validated descriptor. */
   channel_group?: string;
   record: {
@@ -118,7 +120,8 @@ export interface SealedFields {
   message_id: string; revision: number; ciphertext: string;
 }
 export type OpenResult = { ok: Plaintext } | { reason: "no_key" | "cannot_open" };
-export type ConversationStatus = "ready" | "securing" | "creating";
+/** `waiting`: a private channel whose lists give this device no current authority yet (6c). */
+export type ConversationStatus = "ready" | "securing" | "creating" | "waiting";
 export interface Roster {
   /** The live group; rows of earlier incarnations belong to other groups. */
   group: string;

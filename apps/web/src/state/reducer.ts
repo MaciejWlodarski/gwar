@@ -40,7 +40,7 @@ export const initialState: SessionState = {
 
 export type Action =
   | { type: "sealedUnread"; thread: SealedThreadKey; count: number; through: number }
-  | { type: "sealedStatus"; thread: SealedThreadKey; securing: boolean }
+  | { type: "sealedStatus"; thread: SealedThreadKey; securing: boolean; waiting?: boolean }
   | { type: "sealed"; thread: SealedThreadKey; item: Extract<ChatItem, { kind: "msg" }>; live: boolean }
   | { type: "sealedHistory"; thread: SealedThreadKey; hasMore: boolean }
   /** Unread messages of a public encrypted conversation mentioning me, counted after opening them. */
@@ -498,8 +498,8 @@ export function reduce(state: SessionState, action: Action): SessionState {
         + t.items.filter(i => i.kind === "msg" && i.msg.id > Math.max(t.lastRead, action.through)).length) }));
     case "sealedStatus":
       if (unavailableSealed(state, action.thread)) return state;
-      if (state.threads[action.thread]?.securing === action.securing) return state;
-      return withThread(state, action.thread, t => ({ ...t, securing: action.securing }));
+      if (state.threads[action.thread]?.securing === action.securing && !!state.threads[action.thread]?.waiting === !!action.waiting) return state;
+      return withThread(state, action.thread, t => ({ ...t, securing: action.securing, waiting: !!action.waiting }));
     case "sealedHistory":
       if (unavailableSealed(state, action.thread)) return state;
       return withThread(state, action.thread, t => ({ ...t, loaded: true, hasMore: action.hasMore }));

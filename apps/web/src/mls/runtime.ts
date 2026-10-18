@@ -107,6 +107,12 @@ export class MlsRuntime {
   private readonly lastRequest = new Map<string, number>();
   /** Encrypted channels by id with their `history`, from the latest Welcome and channel events. */
   private channels: Map<number, boolean> | undefined;
+  /** Encrypted private channels (6c): their groups carry signed member lists. */
+  private privateChannels = new Set<number>();
+  /** Members chosen in the interface for a private channel's first group, by conversation. */
+  private readonly pendingMembers = new Map<string, string[]>();
+  /** Conversations whose lists give this device no current authority yet (6c, "Newcomers"). */
+  private readonly waiting = new Set<string>();
   private serverChat = false;
   /** The owner and managers this device verified, and the server's latest managers' view. */
   private owner: OwnerView | null = null;
@@ -218,16 +224,24 @@ export class MlsRuntime {
         runtime!.serverChat = welcome.server.server_chat.encrypted;
         if (!runtime!.serverChat) { runtime!.statuses.delete("server"); runtime!.rosters.delete("server"); }
         runtime!.channels = new Map(welcome.channels.filter(c => c.encrypted).map(c => [c.id, c.history]));
+        runtime!.privateChannels = new Set(welcome.channels.filter(c => c.encrypted && c.private).map(c => c.id));
         runtime!.managers = welcome.managers ?? null;
         runtime!.checkOwner(welcome.owner ?? null);
         runtime!.schedule();
       }));
       runtime.unsubscribers.push(options.link.onEvent(event => {
         for (const call of runtime!.calls) call.event(event);
-        if (event.ev === "channel.created" && event.d.encrypted) { runtime!.channels?.set(event.d.id, event.d.history); runtime!.schedule(); }
+        if (event.ev === "channel.created" && event.d.encrypted) {
+          runtime!.channels?.set(event.d.id, event.d.history);
+          if (event.d.private) runtime!.privateChannels.add(event.d.id);
+          runtime!.schedule();
+        }
         // A hidden channel's group is forgotten like a deleted one's; its tombstone keeps the
         // checkpoints for when it is shown again (6c).
-        if ((event.ev === "channel.deleted" || event.ev === "channel.hidden") && runtime!.channels?.delete(event.d.channel)) runtime!.schedule();
+        if ((event.ev === "channel.deleted" || event.ev === "channel.hidden") && runtime!.channels?.delete(event.d.channel)) {
+          runtime!.privateChannels.delete(event.d.channel);
+          runtime!.schedule();
+        }
         if (event.ev === "owner.updated") runtime!.checkOwner(event.d);
         if (event.ev === "managers.updated") { runtime!.managers = event.d; runtime!.checkOwner(undefined); }
         // A member commits offered lists (it validates them first); a waiting newcomer retries.
@@ -258,7 +272,10 @@ export class MlsRuntime {
       throw error;
     }
   }
-  status(conversation: string): ConversationStatus { return this.statuses.get(conversation) ?? "securing"; }
+  status(conversation: string): ConversationStatus {
+    const status = this.statuses.get(conversation) ?? "securing";
+    return status !== "ready" && this.waiting.has(conversation) ? "waiting" : status;
+  }
   /** The server's owner and the managers of private channels as this device verified them. */
   ownerView(): OwnerView | null { return this.owner; }
   /** False when the server shows a manager pair that is no longer current (an expired, revoked or
@@ -782,7 +799,11 @@ export class MlsRuntime {
           if (this.inventory().some(g => g.conversation === conversation && g.record.status === "creating")) continue;
           // Every member's device may find the group missing: one random wait
           // lets the first creation reach the others before they try.
-          if (!this.groupDue.has(conversation)) { this.groupDue.set(conversation, { at: this.now() + Math.random() * 5_000, delay: 5_000 }); this.due(conversation); continue; }
+          // A private channel's group is made by its creator with the members it chose; others
+          // (an authority) only after a minute without one, admitting authorities alone.
+          const wait = this.isPrivate(conversation) ? 60_000 : 5_000;
+          if (!this.groupDue.has(conversation)) { this.groupDue.set(conversation, { at: this.now() + Math.random() * wait, delay: wait }); this.due(conversation); continue; }
+          if (this.isPrivate(conversation) && !this.pendingMembers.has(conversation) && !this.isAuthority()) continue;
           await this.createGroup(conversation, history);
         } else if (member) {
           if (!this.current(remote)) await this.syncGroup(remote.group, remote.pending);
@@ -798,10 +819,12 @@ export class MlsRuntime {
           await this.syncGroup(remote.group, remote.pending);
         }
         this.groupDue.delete(conversation);
+        this.waiting.delete(conversation);
         if (remote) await this.requestHistory(remote.group);
       } catch (error) {
         this.assertCurrent(this.activeGeneration);
         if (error instanceof Restarted) continue;
+        if (String(error).includes(WAITING)) this.waiting.add(conversation);
         // Durable state is authoritative: drop whatever the failure left in memory.
         await this.engine.reload();
         this.failed(conversation, error);
@@ -834,8 +857,43 @@ export class MlsRuntime {
     await this.engine.saveJobs([jobChange(job, true)]);
   }
   /** Lets this client create its own new channel's group right away. */
-  channelCreated(id: number): void {
+  channelCreated(id: number, members?: string[]): void {
+    if (members) { this.privateChannels.add(id); this.pendingMembers.set(`channel:${id}`, members); }
     this.groupDue.set(`channel:${id}`, { at: 0, delay: 5_000 }); this.schedule();
+  }
+  /** A private channel's first members: those chosen in the interface, the predecessor's on a
+   * restart, or none (authorities are always admitted). */
+  private initialMembers(conversation: string, successor?: Successor): string[] {
+    const chosen = this.pendingMembers.get(conversation);
+    if (chosen) return chosen;
+    if (!successor || this.summary(successor.previous)?.record.status !== "active") return [];
+    return this.engine.query<AccessView | null>({ access_view: this.args(successor.previous) })?.members ?? [];
+  }
+  private isPrivate(conversation: string): boolean {
+    const id = channelOf(conversation);
+    return id !== undefined && this.privateChannels.has(id);
+  }
+  private isAuthority(): boolean {
+    const me = this.uid, view = this.owner;
+    return !!view && (view.owner === me || view.confirmers.includes(me) || view.managers.includes(me));
+  }
+  /** An encrypted private channel's member list as this device holds it (6c). */
+  privateMembers(channel: number): AccessView | null {
+    const pin = this.livePin(`channel:${channel}`);
+    return pin?.private && pin.record.status === "active" ? this.engine.query<AccessView | null>({ access_view: this.args(encoded(pin.group)) }) : null;
+  }
+  /** Signs a new member list for an encrypted private channel and commits it with the removals it
+   * requires (6c, "Who commits"). This device's user must be the owner, a confirmer or a manager. */
+  async setPrivateMembers(channel: number, members: string[]): Promise<void> {
+    return this.engine.run(async () => {
+      const generation = this.generation; this.activeGeneration = generation; this.assertCurrent(generation);
+      const pin = this.livePin(`channel:${channel}`);
+      if (!pin?.private) throw new Error("not an encrypted private channel");
+      const group = encoded(pin.group);
+      await this.syncGroup(group);
+      await this.engine.op({ commit_access: { ...this.args(group), members, now: this.now(), revocations: this.options.revocations() } });
+      await this.syncGroup(group);
+    });
   }
   /** The ratchet tree of a public group's current epoch, which its GroupInfos
    * leave out (docs/e2e-build.md "Large groups"). */
@@ -1184,8 +1242,16 @@ export class MlsRuntime {
   /** Creates the conversation's group, or a restart's next incarnation, and
    * settles with the group the server holds. */
   private async createGroup(conversation: string, history: boolean, successor?: Successor): Promise<void> {
-    const d = await descriptor(this.options.identity, this.uid, this.server, conversation, this.now(), history, successor);
-    const info = await this.engine.op<number[]>({ create: { descriptor: d.bytes } });
+    // A private channel's group carries its lists (6c): the founding owner (the same along the
+    // chain), and the chosen members, the predecessor's on a restart, or none (authorities only).
+    const isPrivate = this.isPrivate(conversation);
+    const founding = isPrivate ? this.livePin(conversation)?.founding_owner ?? this.owner?.owner : undefined;
+    if (isPrivate && !founding) throw new Error(WAITING);
+    const d = await descriptor(this.options.identity, this.uid, this.server, conversation, this.now(), history, successor, founding);
+    const info = isPrivate
+      ? await this.engine.op<number[]>({ create_private: { descriptor: d.bytes, members: this.initialMembers(conversation, successor), now: this.now(), revocations: this.options.revocations() } })
+      : await this.engine.op<number[]>({ create: { descriptor: d.bytes } });
+    this.pendingMembers.delete(conversation);
     let winner: string;
     try { winner = (await this.request("mls.group.create", { conversation, group_info: encoded(info) })).group; }
     catch (error) {

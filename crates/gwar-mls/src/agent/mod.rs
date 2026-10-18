@@ -363,6 +363,9 @@ pub struct GroupSummary {
     pub history: bool,
     /// A private channel's group (6c): its access checkpoint must follow every transition.
     pub private: bool,
+    /// A private channel's owner at its first creation (restarts carry it on).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub founding_owner: Option<String>,
     /// A voice group's parent channel group, from its validated descriptor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel_group: Option<String>,
@@ -704,6 +707,7 @@ impl Agent {
                 };
                 Ok(GroupSummary {
                     private: rules::is_private(&d),
+                    founding_owner: d.descriptor.founding_owner.clone(),
                     group: d.group_id(),
                     live: record.status != Status::Creating
                         && live.get(&d.descriptor.conversation) == Some(&d.descriptor.incarnation),
