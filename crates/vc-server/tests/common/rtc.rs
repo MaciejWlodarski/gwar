@@ -49,12 +49,21 @@ impl Peer {
             .enable_opus(true, false)
             .build(Instant::now());
         rtc.add_local_candidate(Candidate::host(local, "udp").unwrap());
-        let mut api = rtc.sdp_api();
-        let mic = api.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
-        for _ in 0..vc_proto::AUDIO_SLOTS {
-            api.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None);
-        }
-        let (offer, pending) = api.apply().unwrap();
+        // str0m's random mids can collide within one offer (as in vc-client's voice start): redraw.
+        let (mic, offer, pending) = loop {
+            let mut api = rtc.sdp_api();
+            let mic = api.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
+            let mut mids: Vec<_> = (0..vc_proto::AUDIO_SLOTS)
+                .map(|_| api.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None))
+                .chain([mic])
+                .collect();
+            mids.sort();
+            mids.dedup();
+            if mids.len() == vc_proto::AUDIO_SLOTS + 1 {
+                let (offer, pending) = api.apply().unwrap();
+                break (mic, offer, pending);
+            }
+        };
         let sdp = offer.to_sdp_string();
         let ssrc: u32 =
             sdp.lines().find_map(|line| line.strip_prefix("a=ssrc:")?.split_whitespace().next()?.parse().ok()).unwrap();

@@ -61,11 +61,18 @@ where
         .enable_opus(true, false)
         .build(Instant::now());
     rtc.add_local_candidate(Candidate::host(local, "udp")?);
-    let mut api = rtc.sdp_api();
-    let mic = api.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
-    let slots: Vec<Mid> =
-        (0..AUDIO_SLOTS).map(|_| api.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None)).collect();
-    let (offer, pending) = api.apply().context("create offer")?;
+    let (mic, slots, offer, pending) = loop {
+        let mut api = rtc.sdp_api();
+        let mic = api.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
+        let slots: Vec<Mid> =
+            (0..AUDIO_SLOTS).map(|_| api.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None)).collect();
+        // str0m draws each mid at random, unique only among media already applied: media of one
+        // offer can collide (about 1 in 6000 offers here), so draw them again.
+        if distinct(mic, &slots) {
+            let (offer, pending) = api.apply().context("create offer")?;
+            break (mic, slots, offer, pending);
+        }
+    };
     let answer = signal(offer.to_sdp_string()).await?;
     rtc.sdp_api().accept_answer(pending, SdpAnswer::from_sdp_string(&answer)?)?;
     for mid in &slots {
@@ -256,6 +263,13 @@ fn send_ticks(capture_position: u64, last: Option<u64>) -> Option<u64> {
 
 // str0m discards extmap directions. Read the answerer's (server's) direction
 // in the matching m-section; no qualifier inherits the media direction.
+fn distinct(mic: Mid, slots: &[Mid]) -> bool {
+    let mut mids: Vec<Mid> = slots.iter().copied().chain([mic]).collect();
+    mids.sort();
+    mids.dedup();
+    mids.len() == slots.len() + 1
+}
+
 fn answer_sends_generation(answer: &str, mid: Mid, id: u8) -> bool {
     let Some(media) = answer
         .split("\nm=")
@@ -280,6 +294,14 @@ fn answer_sends_generation(answer: &str, mid: Mid, id: u8) -> bool {
 mod tests {
     use super::*;
     use str0m::change::SdpOffer;
+
+    #[test]
+    fn media_of_one_offer_have_distinct_mids() {
+        let mid = |s: &str| Mid::from(s);
+        assert!(distinct(mid("a"), &[mid("b"), mid("c")]));
+        assert!(!distinct(mid("a"), &[mid("b"), mid("a")]));
+        assert!(!distinct(mid("a"), &[mid("b"), mid("b")]));
+    }
 
     #[tokio::test]
     async fn a_retired_run_sends_no_datagram() {

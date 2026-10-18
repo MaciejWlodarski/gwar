@@ -188,11 +188,20 @@ async fn rtc_client_after(ws: &mut Ws, wait: Option<tokio::sync::oneshot::Receiv
         .enable_opus(true, false)
         .build(Instant::now());
     rtc.add_local_candidate(Candidate::host(local, "udp").unwrap());
-    let mut api = rtc.sdp_api();
-    let mic = api.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
-    let slots: Vec<Mid> =
-        (0..AUDIO_SLOTS).map(|_| api.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None)).collect();
-    let (offer, pending) = api.apply().unwrap();
+    // str0m's random mids can collide within one offer (as in vc-client's voice start): redraw.
+    let (mic, slots, offer, pending) = loop {
+        let mut api = rtc.sdp_api();
+        let mic = api.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
+        let slots: Vec<Mid> =
+            (0..AUDIO_SLOTS).map(|_| api.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None)).collect();
+        let mut mids: Vec<Mid> = slots.iter().copied().chain([mic]).collect();
+        mids.sort();
+        mids.dedup();
+        if mids.len() == AUDIO_SLOTS + 1 {
+            let (offer, pending) = api.apply().unwrap();
+            break (mic, slots, offer, pending);
+        }
+    };
     let answer = ws.offer(offer.to_sdp_string()).await;
     let answer = SdpAnswer::from_sdp_string(answer["sdp"].as_str().unwrap()).unwrap();
     rtc.sdp_api().accept_answer(pending, answer).unwrap();
