@@ -69,7 +69,8 @@ post-quantum suites (MLS can add them later); push notifications.
   release. Its size budget, first set at 400 KB gzip, is raised to 480 KB to
   make room for message encryption, to 500 KB for large groups
   (joining with a separately fetched ratchet tree), and to 560 KB for the
-  owner chain, the managers and private channel access (step 6). The module is loaded on first use and
+  owner chain, the managers and private channel access (step 6), and to 620 KB
+  for the key archive (step 7). The module is loaded on first use and
   cached.
 - **Ciphersuite** `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (0x0001):
   Ed25519 matches every Gwar key.

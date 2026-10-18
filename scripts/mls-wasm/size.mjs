@@ -14,6 +14,6 @@ for (const file of files) {
   total += gzip;
 }
 // docs/e2e.md, "The MLS library": the budget and why it was raised.
-const budget = 560_000;
+const budget = 620_000;
 console.log(`Total gzip: ${total} / ${budget} bytes`);
 if (total > budget) process.exitCode = 1;

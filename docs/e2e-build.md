@@ -361,7 +361,7 @@ credential, the OpenMLS provider and Gwar's own per-group records.
 ### Web app storage and concurrency
 
 - MLS runs in the page's main thread, in the wasm module loaded on first use
-  (gzip budget 560 KB, checked in CI; raised from 500 KB for step 6).
+  (gzip budget 620 KB, checked in CI; raised from 500 KB for steps 6 and 7).
 - Only one tab per device runs MLS: the Web Locks API lock
   `gwar-mls:{device_key}` is taken before connecting. Before releasing it
   (connection replaced or closed) the tab finishes the operation in progress,
