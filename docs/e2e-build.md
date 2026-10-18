@@ -2880,7 +2880,9 @@ staged, resumable rotation on that device:
    generation sealed to it; then the rotation is complete.
 
 After a crash, a pending rotation whose credential update succeeded (the
-device checks `GET /v1/account` credential version) resumes at step 3
+pending rotation records the credential version it expects after the update;
+the device compares it with the version `POST /v1/challenges` reports)
+resumes at step 3
 without the password; one whose update did not happen is discarded. The
 interface reports the change only when step 3 is done, and generations the
 device could not open: "History before {date} can't be restored with the
