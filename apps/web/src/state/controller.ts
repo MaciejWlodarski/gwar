@@ -1,3 +1,4 @@
+import { permissionsOf } from "../lib/permissions";
 import { attachment as attachmentSchema } from "../net/schema";
 import { SealedConversations, type SealedKey } from "./sealed";
 import type { MlsRuntime } from "../mls/runtime";
@@ -894,7 +895,7 @@ class Controller {
   private async rejoinVoice(channel: number): Promise<void> {
     const s = useSession.getState();
     const info = s.channels[channel];
-    if (!info || (info.has_password && !s.permissions.includes("channel_join_locked"))) return;
+    if (!info || (info.has_password && !s.permissions.includes("bypass_password"))) return;
     await this.attempt(this.joinChannel(channel));
   }
 
@@ -1079,7 +1080,7 @@ class Controller {
   private isLockedForMe(channel: number): boolean {
     const s = useSession.getState();
     const info = s.channels[channel];
-    return !!info?.has_password && !s.permissions.includes("channel_join_locked") && myChannelId(s) !== channel && !this.entered.has(channel);
+    return !!info?.has_password && !s.permissions.includes("bypass_password") && myChannelId(s) !== channel && !this.entered.has(channel);
   }
 
   /**
@@ -1327,10 +1328,15 @@ class Controller {
     return this.connection.request("group.delete", { group });
   }
 
+  /** The new order of every role but Member, from the top. */
+  reorderGroups(groups: number[]) {
+    return this.connection.request("group.reorder", { groups });
+  }
+
   async setMemberGroups(uid: string, groups: number[]) {
     const conn = this.conn, before = this.editsChannels(uid);
     const result = await this.connection.request("member.groups", { uid, groups });
-    // Whoever this very edit gave `channel_edit` becomes a manager without asking me again (6b);
+    // Whoever this very edit gave `manage_channels` becomes a manager without asking me again (6b);
     // taking it away ends an earlier approval.
     const after = this.editsChannels(uid, groups);
     if (this.conn === conn && !before && after) this.grantedByMe.add(uid);
@@ -1338,10 +1344,10 @@ class Controller {
     return result;
   }
 
-  /** Whether `uid`'s roles (or `groups`) carry `channel_edit`, Admin included. */
+  /** Whether `uid`'s roles (or `groups`) carry `manage_channels`, `administrator` included. */
   private editsChannels(uid: string, groups?: readonly number[]): boolean {
     const state = useSession.getState();
-    return (groups ?? state.members[uid]?.groups ?? []).some((g) => g === 1 || state.groups[g]?.permissions.includes("channel_edit"));
+    return permissionsOf(groups ?? state.members[uid]?.groups ?? [], state.groups).includes("manage_channels");
   }
 
   removeMember(uid: string, deleteMessages: boolean) {
@@ -1595,7 +1601,7 @@ class Controller {
   /** Whether this session can attach files (a vc server with uploads on, and the permission). */
   get canUpload(): boolean {
     const s = useSession.getState();
-    return s.kind === "vc" && (s.server?.upload_limit ?? 0) > 0 && s.permissions.includes("file_upload");
+    return s.kind === "vc" && (s.server?.upload_limit ?? 0) > 0 && s.permissions.includes("attach_files");
   }
 
   /**

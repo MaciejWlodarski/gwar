@@ -155,7 +155,7 @@ impl Core {
             return Err(err(ErrorCode::BadRequest, "direct messages are removed by their authors"));
         }
         self.sealed_access(session, conversation, false)?;
-        self.require(session, Permission::MessageManage)?;
+        self.require(session, Permission::ManageMessages)?;
         if !self.store.sealed_remove(conversation, id).map_err(storage_error)? {
             return Err(err(ErrorCode::NotFound, "no such sealed message"));
         }

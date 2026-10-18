@@ -2,14 +2,14 @@
 
 /**
  * The newest confirmer anchor and manager list (base64url of their envelopes), and the
- * holders of `channel_edit` the list does not yet mirror.
+ * holders of `manage_channels` the list does not yet mirror.
  */
 export type Managers = { anchor: string | null, list: string | null, 
 /**
- * Hold `channel_edit`, are neither owner nor confirmer, and are not on the list.
+ * Hold `manage_channels`, are neither owner nor confirmer, and are not on the list.
  */
 pending: Array<string>, 
 /**
- * On the list or the anchor without `channel_edit` any more.
+ * On the list or the anchor without `manage_channels` any more.
  */
 stale: Array<string>, };

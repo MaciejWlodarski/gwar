@@ -1,4 +1,4 @@
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { tsBridge, type TsListInfo } from "../connect/teamspeak";
 import { useAccount } from "../state/account";
 import type { Permission } from "../proto/Permission";
@@ -7,7 +7,7 @@ import { hasGlobalShortcut, isGlobalShortcutEvent } from "../platform/desktop";
 import { useSettings } from "../state/settings";
 import { useSession, useVoice } from "../state/stores";
 import { memberName } from "../lib/member-name";
-import { nameColor } from "../lib/permissions";
+import { nameColor, type Who } from "../lib/permissions";
 import { sealedThread } from "../lib/chat";
 import type { Roster } from "../mls/types";
 import type { SealedKey } from "../state/sealed";
@@ -45,6 +45,19 @@ const NO_GROUPS: readonly number[] = [];
 /** The roles of my own session. */
 export function useMyGroups(): readonly number[] {
   return useSession((s) => (s.me ? s.clients[s.me.session]?.groups : undefined) ?? NO_GROUPS);
+}
+
+/** Me as the rank rules see me: my roles, and whether I am the server's owner. */
+export function useMyWho(): Who {
+  const groups = useMyGroups();
+  const owner = useSession((s) => !!s.owner && !!s.me && s.owner.uid === s.me.uid);
+  return useMemo(() => ({ groups, owner }), [groups, owner]);
+}
+
+/** Someone else as the rank rules see them. */
+export function useWhoOf(uid: string, groups: readonly number[]): Who {
+  const owner = useSession((s) => !!s.owner && s.owner.uid === uid);
+  return useMemo(() => ({ groups, owner }), [groups, owner]);
 }
 
 /** Name colour from the highest role with a colour (undefined: default text). */

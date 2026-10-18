@@ -98,8 +98,8 @@ async fn gone_from_disk(path: &Path) {
 }
 
 /// The Admin group as the welcome lists it (a client that redeemed its token afterwards has the same).
-fn admin_group_holds_member_remove(client: &Client) -> bool {
-    client.welcome.groups.iter().any(|g| g.id == 1 && g.permissions.contains(&Permission::MemberRemove))
+fn admin_group_is_administrator(client: &Client) -> bool {
+    client.welcome.groups.iter().any(|g| g.id == 1 && g.permissions == [Permission::Administrator])
 }
 
 // ---------------------------------------------------------- member.remove
@@ -110,8 +110,8 @@ async fn only_admins_and_holders_of_the_permission_may_remove_members() {
     let mut root = admin(&server, "root").await;
     let mut alice = Client::connect(&server, "alice").await;
     let bob = Client::connect(&server, "bob").await;
-    assert!(admin_group_holds_member_remove(&root), "Admin holds every permission");
-    assert!(!alice.welcome.permissions.contains(&Permission::MemberRemove), "members do not get it by default");
+    assert!(admin_group_is_administrator(&root), "Admin holds every permission");
+    assert!(!alice.welcome.permissions.contains(&Permission::ManageMembers), "members do not get it by default");
 
     let target = json!({"uid": bob.welcome.uid, "delete_messages": false});
     assert_eq!(alice.fails("member.remove", target.clone()).await, "forbidden");
@@ -122,18 +122,25 @@ async fn only_admins_and_holders_of_the_permission_may_remove_members() {
 }
 
 #[tokio::test]
-async fn admin_gets_the_permission_on_an_existing_database() {
+async fn roles_from_before_version_2_are_upgraded() {
     let seeded = Seeded::new();
-    // As an older server left it: Admin without the newest permission.
-    let old =
-        serde_json::to_string(&Permission::ALL.iter().filter(|p| **p != Permission::MemberRemove).collect::<Vec<_>>());
-    rusqlite::Connection::open(seeded.database())
-        .unwrap()
-        .execute("UPDATE groups SET permissions=?1 WHERE id=1", [old.unwrap()])
-        .unwrap();
+    // As an older server left them: Admin with the old full list, a role with old names.
+    let db = rusqlite::Connection::open(seeded.database()).unwrap();
+    db.execute("UPDATE groups SET permissions='[\"server_manage\",\"client_kick\"]' WHERE id=1", []).unwrap();
+    db.execute(
+        "INSERT INTO groups(id,name,permissions,position) VALUES(7,'Mods','[\"client_kick\",\"member_remove\",\"member_nickname\",\"gone\"]',7)",
+        [],
+    )
+    .unwrap();
+    drop(db);
     let server = seeded.start().await;
     let root = admin(&server, "root").await;
-    assert!(admin_group_holds_member_remove(&root));
+    assert!(admin_group_is_administrator(&root));
+    let mods = root.welcome.groups.iter().find(|g| g.id == 7).unwrap();
+    assert_eq!(mods.permissions, [Permission::ManageMembers, Permission::KickMembers]);
+    let mut order: Vec<_> = root.welcome.groups.iter().map(|g| (g.id, g.position)).collect();
+    order.sort_by_key(|(_, position)| *position);
+    assert_eq!(order, [(1, 0), (7, 1), (2, 2)], "Admin first, Member last");
 }
 
 #[tokio::test]
@@ -144,14 +151,15 @@ async fn nobody_removes_themselves_or_anyone_above_them() {
     let mut bob = Client::connect(&server, "bob").await;
     let mut carol = Client::connect(&server, "carol").await;
     let janitors =
-        root.ok("group.create", json!({"name": "Janitors", "permissions": ["member_remove"]})).await["group"]["id"]
+        root.ok("group.create", json!({"name": "Janitors", "permissions": ["manage_members"]})).await["group"]["id"]
             .clone();
     let mods =
-        root.ok("group.create", json!({"name": "Mods", "permissions": ["client_kick"]})).await["group"]["id"].clone();
+        root.ok("group.create", json!({"name": "Mods", "permissions": ["kick_members"]})).await["group"]["id"].clone();
     root.ok("member.groups", json!({"uid": alice.welcome.uid, "groups": [2, janitors]})).await;
     root.ok("member.groups", json!({"uid": bob.welcome.uid, "groups": [2, mods]})).await;
+    root.ok("group.reorder", json!({"groups": [1, mods, janitors]})).await;
 
-    // Not oneself; not an admin; not a moderator whose rights she lacks.
+    // Not oneself; not an admin; not a moderator ranked above her.
     assert_eq!(alice.fails("member.remove", json!({"uid": alice.welcome.uid})).await, "bad_request");
     assert_eq!(root.fails("member.remove", json!({"uid": root.welcome.uid})).await, "bad_request");
     assert_eq!(alice.fails("member.remove", json!({"uid": root.welcome.uid})).await, "forbidden");
@@ -172,7 +180,7 @@ async fn removing_an_online_member_disconnects_them_and_they_return_as_a_newcome
     let mut carol = Client::connect_as(&server, key.clone(), "carol", Some("secret")).await.unwrap();
     let mut bob = Client::connect_as(&server, new_key(), "bob", Some("secret")).await.unwrap();
     let mods =
-        root.ok("group.create", json!({"name": "Mods", "permissions": ["client_kick"]})).await["group"]["id"].clone();
+        root.ok("group.create", json!({"name": "Mods", "permissions": ["kick_members"]})).await["group"]["id"].clone();
     root.ok("member.groups", json!({"uid": carol.welcome.uid, "groups": [2, mods]})).await;
     // Bans are a separate matter: this one is not touched by the removal.
     root.ok("ban.create", json!({"uid": bob.welcome.uid})).await;
@@ -247,7 +255,7 @@ async fn removal_can_delete_messages_and_files_or_leave_them() {
 #[tokio::test]
 async fn prune_spares_the_recent_the_online_the_caller_and_roles() {
     let seeded = Seeded::new();
-    let mods = seeded.store.insert_group("Mods", &[Permission::ClientKick], None).unwrap();
+    let mods = seeded.store.insert_group("Mods", &[Permission::KickMembers], None, false, false).unwrap();
     seeded.member("stale", 100, &[2]);
     seeded.member("stale-mod", 100, &[2, mods]);
     seeded.member("recent", 5, &[2]);
@@ -299,7 +307,7 @@ async fn prune_spares_the_recent_the_online_the_caller_and_roles() {
 #[tokio::test]
 async fn prune_only_touches_members_the_caller_covers() {
     let seeded = Seeded::new();
-    let mods = seeded.store.insert_group("Mods", &[Permission::ClientKick], None).unwrap();
+    let mods = seeded.store.insert_group("Mods", &[Permission::KickMembers], None, false, false).unwrap();
     seeded.member("stale", 100, &[2]);
     seeded.member("stale-mod", 100, &[2, mods]);
     seeded.member("stale-admin", 100, &[1]);
@@ -307,7 +315,7 @@ async fn prune_only_touches_members_the_caller_covers() {
     let mut root = admin(&server, "root").await;
     let mut jan = Client::connect(&server, "jan").await;
     let janitors =
-        root.ok("group.create", json!({"name": "Janitors", "permissions": ["member_remove"]})).await["group"]["id"]
+        root.ok("group.create", json!({"name": "Janitors", "permissions": ["manage_members"]})).await["group"]["id"]
             .clone();
     root.ok("member.groups", json!({"uid": jan.welcome.uid, "groups": [2, janitors]})).await;
 
@@ -354,7 +362,7 @@ fn stdout(out: &Output) -> String {
 #[test]
 fn the_command_line_lists_and_prunes_members() {
     let seeded = Seeded::new();
-    let mods = seeded.store.insert_group("Mods", &[Permission::ClientKick], None).unwrap();
+    let mods = seeded.store.insert_group("Mods", &[Permission::KickMembers], None, false, false).unwrap();
     seeded.member("stale", 100, &[2]);
     seeded.member("stale-mod", 100, &[2, mods]);
     seeded.member("recent", 3, &[2]);
@@ -414,7 +422,7 @@ fn the_command_line_lists_and_prunes_members() {
 fn merging_members_moves_all_identity_references_transactionally() {
     let seeded = Seeded::new();
     let store = &seeded.store;
-    let role = store.insert_group("Mods", &[Permission::ClientKick], None).unwrap();
+    let role = store.insert_group("Mods", &[Permission::KickMembers], None, false, false).unwrap();
     let from = seeded.member("-legacy", 5, &[2, role]);
     let into = seeded.member("account", 10, &[1, 2]);
     store.set_nickname(into, "Target name").unwrap();

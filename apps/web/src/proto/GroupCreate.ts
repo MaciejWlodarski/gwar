@@ -5,4 +5,4 @@ export type GroupCreate = { name: string, permissions: Array<Permission>,
 /**
  * `#rrggbb`
  */
-color?: string | null, };
+color?: string | null, hoist: boolean, mentionable: boolean, };

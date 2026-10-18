@@ -4,7 +4,7 @@ import type { Client } from "../proto/Client";
 import type { Group } from "../proto/Group";
 import type { Member } from "../proto/Member";
 import type { Platform } from "../proto/Platform";
-import { nameColor } from "../lib/permissions";
+import { hoistedRole, nameColor, permissionsOf, rankOf } from "../lib/permissions";
 import { useSettings } from "../state/settings";
 import { useUi } from "../state/stores";
 
@@ -44,19 +44,30 @@ export interface MemberEntry {
   session: number | null;
   /** Colour of the highest role that has one. */
   color: string | undefined;
+  /** Position of their best role (lower is higher), for ordering. */
+  rank: number;
 }
 
-const isAdmin = (groups: number[], defs: Record<number, Group>) => groups.some((g) => g === 1 || defs[g]?.permissions.includes("server_manage"));
-const byAdminThenName = (a: MemberEntry, b: MemberEntry) =>
-  Number(b.admin) - Number(a.admin) || a.nickname.localeCompare(b.nickname, undefined, { sensitivity: "base" }) || a.uid.localeCompare(b.uid);
+const isAdmin = (groups: number[], defs: Record<number, Group>) => permissionsOf(groups, defs).includes("administrator");
+const byRankThenName = (a: MemberEntry, b: MemberEntry) =>
+  a.rank - b.rank || a.nickname.localeCompare(b.nickname, undefined, { sensitivity: "base" }) || a.uid.localeCompare(b.uid);
 
-/** Splits everyone the server knows into people in voice, online and offline; administrators first. */
+/** Online people under a role shown separately (`hoist`), highest role first. */
+export interface HoistedSection {
+  role: Group;
+  entries: MemberEntry[];
+}
+
+/**
+ * Splits everyone the server knows into people in voice, online (under their highest role shown
+ * separately, if any) and offline; within each, higher ranks first.
+ */
 export function groupMembers(
   clients: Client[],
   members: Member[],
   groups: Record<number, Group>,
   channelName: (id: number) => string | null,
-): { voice: MemberEntry[]; online: MemberEntry[]; offline: MemberEntry[] } {
+): { voice: MemberEntry[]; hoisted: HoistedSection[]; online: MemberEntry[]; offline: MemberEntry[] } {
   // One entry per person: the session in voice wins over a second device that is not.
   const sessions = new Map<string, Client>();
   for (const c of clients) {
@@ -80,9 +91,24 @@ export function groupMembers(
       groups: c.groups,
       session: c.id,
       color: nameColor(c.groups, groups),
+      rank: rankOf({ groups: c.groups }, groups),
     };
     (c.channel === null ? online : voice).push(entry);
   }
+  const sections = new Map<number, HoistedSection>();
+  const rest: MemberEntry[] = [];
+  for (const entry of online) {
+    const role = hoistedRole(entry.groups, groups);
+    if (!role) {
+      rest.push(entry);
+      continue;
+    }
+    const section = sections.get(role.id) ?? { role, entries: [] };
+    section.entries.push(entry);
+    sections.set(role.id, section);
+  }
+  const hoisted = [...sections.values()].sort((a, b) => a.role.position - b.role.position);
+  for (const section of hoisted) section.entries.sort(byRankThenName);
   const offline: MemberEntry[] = members
     .filter((m) => !sessions.has(m.uid))
     .map((m) => ({
@@ -98,6 +124,7 @@ export function groupMembers(
       groups: m.groups,
       session: null,
       color: nameColor(m.groups, groups),
+      rank: rankOf({ groups: m.groups }, groups),
     }));
-  return { voice: voice.sort(byAdminThenName), online: online.sort(byAdminThenName), offline: offline.sort(byAdminThenName) };
+  return { voice: voice.sort(byRankThenName), hoisted, online: rest.sort(byRankThenName), offline: offline.sort(byRankThenName) };
 }

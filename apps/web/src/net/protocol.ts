@@ -82,6 +82,7 @@ export interface ResponseMap {
   "group.create": { group: Group };
   "group.update": { group: Group };
   "group.delete": Empty;
+  "group.reorder": Empty;
   "member.nickname": Empty;
   "member.groups": { groups: number[] };
   "member.remove": Empty;

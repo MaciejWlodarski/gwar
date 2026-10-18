@@ -13,7 +13,7 @@ import type { Member } from "../proto/Member";
 import type { Permission } from "../proto/Permission";
 import type { Welcome } from "../proto/Welcome";
 import { AUDIO_SLOTS } from "../net/protocol";
-import { permissionsOf } from "../lib/permissions";
+import { MEMBER_GROUP, permissionsOf } from "../lib/permissions";
 import type { ChatItem, Phase, SessionState, SysText, Thread, ThreadKey, StoredThreadKey } from "./types";
 
 export const MAX_ITEMS = 1000;
@@ -97,13 +97,23 @@ export function myChannelId(state: SessionState): number | null {
   return myClient(state)?.channel ?? null;
 }
 
-export function computePermissions(state: Pick<SessionState, "groups" | "clients" | "me">, fallback: Permission[] = []): Permission[] {
+export function computePermissions(state: Pick<SessionState, "groups" | "clients" | "me" | "owner">, fallback: Permission[] = []): Permission[] {
   const me = state.me ? state.clients[state.me.session] : undefined;
   if (!me) return fallback;
-  return permissionsOf(me.groups, state.groups);
+  return permissionsOf(me.groups, state.groups, !!state.owner && state.owner.uid === me.uid);
 }
 
 /** Recomputes what I may do after groups or memberships changed. */
+/** Positions follow the order of every role but Member; Member is last. */
+function reordered(groups: SessionState["groups"], order: number[]): SessionState["groups"] {
+  const next = { ...groups };
+  order.forEach((id, index) => {
+    if (next[id]) next[id] = { ...next[id], position: index };
+  });
+  if (next[MEMBER_GROUP]) next[MEMBER_GROUP] = { ...next[MEMBER_GROUP], position: order.length };
+  return next;
+}
+
 function refreshPermissions(state: SessionState): SessionState {
   const permissions = computePermissions(state, state.permissions);
   const same = permissions.length === state.permissions.length && permissions.every((p, i) => p === state.permissions[i]);
@@ -387,6 +397,8 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
       return refreshPermissions({ ...state, groups: { ...state.groups, [event.d.id]: event.d } });
     case "group.deleted":
       return onGroupDeleted(state, event.d.group);
+    case "group.reordered":
+      return refreshPermissions({ ...state, groups: reordered(state.groups, event.d.groups) });
     case "member.updated":
       return onMemberUpdated(state, event.d);
     case "member.removed": {

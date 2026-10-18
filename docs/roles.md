@@ -1,7 +1,6 @@
 # Roles and permissions, version 2
 
-Status: design, for review. Replaces the flat role model described in
-[architecture.md, "Identity and permissions"](architecture.md#identity-and-permissions).
+Status: step 1 (ranks) built; steps 2–4 designed. Replaces the flat role model.
 
 ## Why
 
@@ -70,6 +69,11 @@ channels; roles carry them as defaults, and channels override them.
 | `move_members` | channel | move people into and out of it | `client_move` |
 | `mute_members` | channel | mute or deafen someone for everyone in it | — (new) |
 | `manage_channels` | channel | create subchannels, edit, move and delete it, edit its overrides | `channel_create`, `channel_edit`, `channel_delete` |
+
+Step 1 has the twelve that replace today's permissions; `view_channel`,
+`connect`, `speak`, `send_messages` (step 2) and `mute_members` (step 3) come
+with overrides and voice moderation. Until then a role's channel permissions
+apply in every channel.
 
 `manage_channels` at the server's top level (on the Member role or a role,
 without an override) is what today's `channel_create` means for top-level
@@ -176,16 +180,14 @@ needs: join and talk power, channel admins and the group order map onto
 
 ## Moving existing servers
 
-One migration, on first start:
-
-- Groups become roles: Admin first (with `administrator`), then the others in
-  their current order of creation, Member last. Permissions map by the table
-  above; `channel_create`, `channel_edit` and `channel_delete` all become
-  `manage_channels`.
-- Plaintext private channels become `view_channel` overrides.
-- Encrypted private channels, the owner chain and the manager list stay as
-  they are; managers are now drawn from `manage_channels` holders.
-- Existing invites and tokens keep working under the new invite rule.
+Gwar is pre-release, so there is no full migration, only what keeps an existing
+data directory starting: roles get positions in their order of creation (Admin
+first, Member last), stored permission names are rewritten by the table above
+(`channel_create`, `channel_edit` and `channel_delete` become
+`manage_channels`; `token_create` and `invite_create` become `create_invites`;
+`member_remove` and `member_nickname` become `manage_members`), and Admin holds
+`administrator`. Step 2 turns plaintext private channels into overrides the same
+way.
 
 ## Protocol
 
@@ -213,10 +215,8 @@ One migration, on first start:
 Each step changes authorization, so each goes to an independent review before
 it is merged.
 
-## Open question
+## Decided
 
-Should a role's channel access really be trusted down the order (above), or
-keep today's stricter rule (only holders give a role) for roles that open a
-hidden channel? The stricter rule needs no trust in the order, but it would
-have to apply to every role (so a refusal never reveals a hidden channel),
-which makes delegating roles to moderators awkward.
+- A role's channel access is trusted down the order (2026-10-18): anyone with
+  `manage_roles` gives roles below their rank, including the hidden channels
+  they open. The stricter "only holders give a role" rule is gone.

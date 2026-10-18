@@ -153,7 +153,7 @@ Being connected is not being in voice. After connecting, `Client.channel` is
 `null`: you see everyone and read and write channel chats, but you don't
 transmit. `channel.join` enters a channel's voice, `channel.leave` leaves it
 (the session stays). A password channel's chat opens once you have entered it
-during the session (or with the `channel_join_locked` permission).
+during the session (or with the `bypass_password` permission).
 
 Read marks are stored per user in SQLite (`read_marks`), so unread counts
 (`Welcome.unread`, `chat.read`) agree on every device; `Welcome.members` lists
@@ -163,7 +163,7 @@ A nickname belongs to a member on this server. `hello.nickname` initializes it
 only on the first join; every later session uses the stored name. `client.update`
 changes mute, deafen and away state. `member.nickname {uid, nickname}` changes the
 trimmed 1–32 character name (no control characters): one's own freely, another's
-with `member_nickname`. Duplicates are allowed. The empty-ok reply follows
+with `manage_members`. Duplicates are allowed. The empty-ok reply follows
 `member.updated` and `client.updated` for every online session. Errors are
 `bad_request` for invalid names, `forbidden` for missing permission, `not_found`
 for an unknown member, and `internal` for storage failures.
@@ -390,10 +390,13 @@ snapshot after removal.
 ## Identity and permissions
 
 A user is their Ed25519 key (like a TeamSpeak identity): no central accounts,
-and it works on any self-hosted server. Groups (Admin, Member) carry permission
-lists; one-time tokens grant groups. Nobody can make a token or invite for a
-group with permissions they lack, and one only works while its maker still
-could make it: demoting or removing them voids what they handed out. Tokens the
+and it works on any self-hosted server. Roles are ordered and carry permission
+lists ([roles.md](roles.md)); one-time tokens and invites grant roles. A member's
+rank is their best role's (the owner is above every role): one acts only on
+members ranked below oneself, manages and gives only roles below one's rank, and
+never grants a permission one lacks. A token or invite only works while its
+maker could still give its role: demoting or removing them voids what they
+handed out. Tokens the
 server issues itself (the first admin token, `vc-server admin-token`) have no maker;
 invites and tokens from before makers were recorded admit nobody. Channel and server
 passwords are stored as Argon2 of TeamSpeak's wire form `base64(sha1(password))`.
@@ -401,7 +404,7 @@ passwords are stored as Argon2 of TeamSpeak's wire form `base64(sha1(password))`
 Members are the users' rows in SQLite (`users`, with groups and read marks).
 `member.remove` deletes one (and with `delete_messages` their stored messages
 and files, announcing `chat.deleted` for each); it follows the same rule as bans
-and group changes: nobody acts on a member holding permissions they lack.
+and role changes: only members ranked below the caller.
 `member.prune` does it for everyone unseen for N days (`users.last_seen`, set on
 connect and disconnect and refreshed for connected users every ten minutes and at
 shutdown). The core is a single actor, so one call removes at most 50 members
@@ -519,7 +522,7 @@ native protected storage.
 ## Files
 
 Who may download `GET /files/{random-id}/{name}` is a server setting
-(`ServerInfo.file_access`, changed with `server.update` by `server_manage`):
+(`ServerInfo.file_access`, changed with `server.update` by `manage_server`):
 
 - `link` (the default): the URL is a bearer capability. Anyone who knows it
   can fetch the file without a session, including TeamSpeak users, to whom the

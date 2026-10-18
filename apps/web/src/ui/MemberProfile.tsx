@@ -69,7 +69,7 @@ export function MemberProfileDialog({ uid, fallback }: { uid: string; fallback: 
   const nickname = useMemberName(uid, fallback);
   const own = useSession((s) => s.me?.uid === uid);
   const vc = useSession((s) => s.kind === "vc");
-  const mayRename = usePermission("member_nickname");
+  const mayRename = usePermission("manage_members");
   const connect = useConnectHandle(member);
   const copy = async () => {
     try {

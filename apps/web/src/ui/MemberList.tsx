@@ -116,7 +116,7 @@ export function MemberList({ className }: { className?: string }) {
     const id = setInterval(() => setNow(Date.now()), 60_000);
     return () => clearInterval(id);
   }, []);
-  const { voice, online, offline } = useMemo(
+  const { voice, hoisted, online, offline } = useMemo(
     () => groupMembers(Object.values(clients), Object.values(members), groups, (id) => channels[id]?.name ?? null),
     [clients, members, groups, channels],
   );
@@ -126,6 +126,9 @@ export function MemberList({ className }: { className?: string }) {
       <h2 className="flex h-12 shrink-0 items-center border-b border-line px-4 text-[15px] font-semibold">{t("members.title")}</h2>
       <div className="min-h-0 flex-1 overflow-y-auto pb-3">
         <Section title={t("members.voice")} entries={voice} mineUid={mineUid} now={now} />
+        {hoisted.map((h) => (
+          <Section key={h.role.id} title={h.role.name} entries={h.entries} mineUid={mineUid} now={now} />
+        ))}
         <Section title={t("members.online")} entries={online} mineUid={mineUid} now={now} />
         <Section title={t("members.offline")} entries={offline} mineUid={mineUid} now={now} />
       </div>

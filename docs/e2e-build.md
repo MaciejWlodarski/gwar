@@ -452,7 +452,7 @@ for every pre-v3 signature (missing `group_id` or `epoch`). Text, mentions,
 attachments and timestamps remain intact and clients display this history as
 unsigned Gwar messages. There is no v2 verification path. Author edits still
 require a signed predecessor and return `bad_request` for unsigned history;
-moderators with `message_manage` can remove it normally.
+moderators with `manage_messages` can remove it normally.
 
 ### Commit time
 
@@ -927,7 +927,7 @@ The sealed message requests of section 3 apply to `channel:{id}` and to
   encrypted). Plaintext `chat.send`, `chat.edit` and `chat.history` refuse an
   encrypted channel (`bad_request`), and the sealed requests refuse a
   plaintext one.
-- `chat.sealed.remove {conversation, id}` (moderators with `message_manage`)
+- `chat.sealed.remove {conversation, id}` (moderators with `manage_messages`)
   removes a sealed message of a channel or of server chat (not of a direct
   message) without a
   signature, as `chat.delete` does for plaintext ones, and announces
@@ -1278,7 +1278,7 @@ implementation spec"; that list remains in the design.
   join permission, and that exact `(uid, device_key)` in the channel group's
   current observer tree; TeamSpeak sessions cannot enter. Channel capacity
   still applies. The encrypted-call limit is 1000 sessions and 1000 occupied
-  leaves, including pending admissions; `client_move` does not bypass it.
+  leaves, including pending admissions; `move_members` does not bypass it.
   Plaintext retains its existing channel and server capacity rules.
   A listener without a microphone is a participant and has a leaf too.
 - **Creation and join.** Get `voice.state`, create the epoch-zero singleton
@@ -2118,7 +2118,7 @@ Three pull requests, in this order:
   `access: {roles: [group id], users: [uid]}`, at most 64 roles and 1000
   users, sorted and unique.
   - `channel.create` takes it, defaulting to the creator.
-  - `channel.update` replaces it, which needs `channel_edit` and admission.
+  - `channel.update` replaces it, which needs `manage_channels` and admission.
   - Only admitted sessions receive it.
   - Listing a role admits the members who hold it at that moment.
   - Deleting a role removes it from every access set.
@@ -2218,7 +2218,7 @@ Three pull requests, in this order:
   - Create dialog: "Private" (Gwar servers only), with "Who can see this
     channel": roles and members, defaulting to the creator. Encryption is
     hidden while "Private" is on until 6c.
-  - Channel settings: the same access picker for `channel_edit` holders.
+  - Channel settings: the same access picker for `manage_channels` holders.
   - Private channels show a small closed-eye icon.
 
 ### Owner chain (6b)
@@ -2387,12 +2387,12 @@ gwar managers v1
     hash;
   - the agent's server record `{server}/@server` keeps them with the owner
     pin, written atomically.
-- **Mirroring `channel_edit`.** The server reports the following in
+- **Mirroring `manage_channels`.** The server reports the following in
   `Welcome.managers = {anchor, list, pending, stale}` and in
   `managers.updated`:
-  - `pending`: holders of `channel_edit` other than the owner and the
+  - `pending`: holders of `manage_channels` other than the owner and the
     confirmers who are not on the list;
-  - `stale`: plain managers who lost `channel_edit`, and confirmers who lost
+  - `stale`: plain managers who lost `manage_channels`, and confirmers who lost
     it.
 - **Who signs:**
   - **The clients of the owner and of current confirmers:**

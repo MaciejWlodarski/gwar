@@ -121,7 +121,7 @@ wire! {
             mentions: Vec<Uid>,
             signature: MessageSignature,
         },
-        /// Deletes a channel message: your own, or anyone's with `message_manage`.
+        /// Deletes a channel message: your own, or anyone's with `manage_messages`.
         #[serde(rename = "chat.delete")]
         ChatDelete { message: MessageId },
         /// Marks a channel or conversation read up to `message` on every device.
@@ -151,8 +151,12 @@ wire! {
         GroupUpdate(GroupUpdate),
         #[serde(rename = "group.delete")]
         GroupDelete { group: GroupId },
+        /// The new order of every role but Member, from the top. Roles at or above the
+        /// caller's rank must keep their places.
+        #[serde(rename = "group.reorder")]
+        GroupReorder { groups: Vec<GroupId> },
         /// Sets a member's nickname on this server (online or not): your own, or
-        /// anyone's with `member_nickname`. Every session of that member follows.
+        /// anyone's with `manage_members`. Every session of that member follows.
         #[serde(rename = "member.nickname")]
         MemberNickname { uid: Uid, nickname: String },
         /// Sets a member's groups (online or not).
@@ -329,7 +333,7 @@ wire! {
         /// Sort key among siblings; lower comes first.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub position: Option<i32>,
-        /// Replaces a private channel's access (needs `channel_edit`).
+        /// Replaces a private channel's access (needs `manage_channels`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub access: Option<ChannelAccess>,
     }
@@ -359,6 +363,10 @@ wire! {
         /// `#rrggbb`
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub color: Option<String>,
+        #[serde(default)]
+        pub hoist: bool,
+        #[serde(default)]
+        pub mentionable: bool,
     }
 
     /// Absent fields stay unchanged; `color: ""` removes the color.
@@ -371,6 +379,10 @@ wire! {
         pub permissions: Option<Vec<Permission>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub color: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub hoist: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub mentionable: Option<bool>,
     }
 
     /// Bans an online client (by session) or a known member (by uid).
@@ -553,6 +565,9 @@ wire! {
         GroupUpdated(Group),
         #[serde(rename = "group.deleted")]
         GroupDeleted { group: GroupId },
+        /// Every role but Member, from the top: positions follow this order.
+        #[serde(rename = "group.reordered")]
+        GroupsReordered { groups: Vec<GroupId> },
         /// A member's groups, nickname, tag or Connect handle changed (online or not).
         #[serde(rename = "member.updated")]
         MemberUpdated(Member),
@@ -640,13 +655,13 @@ wire! {
     }
 
     /// The newest confirmer anchor and manager list (base64url of their envelopes), and the
-    /// holders of `channel_edit` the list does not yet mirror.
+    /// holders of `manage_channels` the list does not yet mirror.
     pub struct Managers {
         pub anchor: Option<String>,
         pub list: Option<String>,
-        /// Hold `channel_edit`, are neither owner nor confirmer, and are not on the list.
+        /// Hold `manage_channels`, are neither owner nor confirmer, and are not on the list.
         pub pending: Vec<Uid>,
-        /// On the list or the anchor without `channel_edit` any more.
+        /// On the list or the anchor without `manage_channels` any more.
         pub stale: Vec<Uid>,
     }
 
@@ -773,6 +788,14 @@ wire! {
         /// `#rrggbb`, shown on members' names.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub color: Option<String>,
+        /// Order from the top (0); Member is always last. A member's rank is their best role's.
+        pub position: u32,
+        /// Online holders are listed under this role in the member list.
+        #[serde(default)]
+        pub hoist: bool,
+        /// `@role` mentions notify its holders.
+        #[serde(default)]
+        pub mentionable: bool,
     }
 
     pub struct Ban {
@@ -843,21 +866,25 @@ wire! {
     #[derive(Copy, Eq, Hash, PartialOrd, Ord)]
     #[serde(rename_all = "snake_case")]
     pub enum Permission {
-        ServerManage,
-        ChannelCreate,
-        ChannelEdit,
-        ChannelDelete,
-        ChannelJoinLocked,
-        ClientMove,
-        ClientKick,
-        TokenCreate,
-        ClientBan,
-        GroupManage,
-        MessageManage,
-        InviteCreate,
-        FileUpload,
-        MemberRemove,
-        MemberNickname,
+        /// Everything, whatever else applies; rank still applies (docs/roles.md).
+        Administrator,
+        ManageServer,
+        /// Create, edit, reorder, delete and give roles below one's rank.
+        ManageRoles,
+        /// Change nicknames, remove members and prune.
+        ManageMembers,
+        KickMembers,
+        BanMembers,
+        /// Invites and tokens, for roles below one's rank.
+        CreateInvites,
+        /// Join a channel without its password.
+        BypassPassword,
+        AttachFiles,
+        /// Delete others' messages.
+        ManageMessages,
+        MoveMembers,
+        /// Create, edit, move and delete channels.
+        ManageChannels,
     }
 
     #[derive(Default)]
@@ -931,26 +958,41 @@ wire! {
 }
 
 impl Permission {
-    pub const ALL: [Permission; 15] = [
-        Permission::ServerManage,
-        Permission::ChannelCreate,
-        Permission::ChannelEdit,
-        Permission::ChannelDelete,
-        Permission::ChannelJoinLocked,
-        Permission::ClientMove,
-        Permission::ClientKick,
-        Permission::TokenCreate,
-        Permission::ClientBan,
-        Permission::GroupManage,
-        Permission::MessageManage,
-        Permission::InviteCreate,
-        Permission::FileUpload,
-        Permission::MemberRemove,
-        Permission::MemberNickname,
+    pub const ALL: [Permission; 12] = [
+        Permission::Administrator,
+        Permission::ManageServer,
+        Permission::ManageRoles,
+        Permission::ManageMembers,
+        Permission::KickMembers,
+        Permission::BanMembers,
+        Permission::CreateInvites,
+        Permission::BypassPassword,
+        Permission::AttachFiles,
+        Permission::ManageMessages,
+        Permission::MoveMembers,
+        Permission::ManageChannels,
     ];
 
     /// What every new member may do.
-    pub const MEMBER_DEFAULT: [Permission; 2] = [Permission::InviteCreate, Permission::FileUpload];
+    pub const MEMBER_DEFAULT: [Permission; 2] = [Permission::CreateInvites, Permission::AttachFiles];
+
+    /// The permission a name from before roles version 2 became (docs/roles.md), for stored roles.
+    pub fn from_v1(name: &str) -> Option<Permission> {
+        Some(match name {
+            "server_manage" => Permission::ManageServer,
+            "channel_create" | "channel_edit" | "channel_delete" => Permission::ManageChannels,
+            "channel_join_locked" => Permission::BypassPassword,
+            "client_move" => Permission::MoveMembers,
+            "client_kick" => Permission::KickMembers,
+            "token_create" | "invite_create" => Permission::CreateInvites,
+            "client_ban" => Permission::BanMembers,
+            "group_manage" => Permission::ManageRoles,
+            "message_manage" => Permission::ManageMessages,
+            "file_upload" => Permission::AttachFiles,
+            "member_remove" | "member_nickname" => Permission::ManageMembers,
+            _ => return None,
+        })
+    }
 }
 
 impl ErrorBody {
@@ -1794,11 +1836,21 @@ mod tests {
     }
 
     #[test]
-    fn removing_members_is_not_a_default_permission() {
-        assert!(Permission::ALL.contains(&Permission::MemberRemove));
-        assert!(!Permission::MEMBER_DEFAULT.contains(&Permission::MemberRemove));
-        assert!(Permission::ALL.contains(&Permission::MemberNickname));
-        assert!(!Permission::MEMBER_DEFAULT.contains(&Permission::MemberNickname));
+    fn managing_members_is_not_a_default_permission() {
+        assert!(Permission::ALL.contains(&Permission::ManageMembers));
+        assert!(!Permission::MEMBER_DEFAULT.contains(&Permission::ManageMembers));
+        assert!(!Permission::MEMBER_DEFAULT.contains(&Permission::Administrator));
+    }
+
+    #[test]
+    fn permission_names_from_version_1_map_onto_version_2() {
+        assert_eq!(Permission::from_v1("channel_edit"), Some(Permission::ManageChannels));
+        assert_eq!(Permission::from_v1("token_create"), Some(Permission::CreateInvites));
+        assert_eq!(Permission::from_v1("member_nickname"), Some(Permission::ManageMembers));
+        assert_eq!(Permission::from_v1("nonsense"), None);
+        let names: Vec<String> =
+            Permission::ALL.iter().map(|p| serde_json::to_value(p).unwrap().as_str().unwrap().into()).collect();
+        assert!(names.iter().all(|n| Permission::from_v1(n).is_none()), "new names never mean an old one");
     }
 
     #[test]

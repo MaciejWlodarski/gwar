@@ -5,7 +5,7 @@ import { cn } from "../lib/cn";
 import { canActOn, canGiveGroup, ADMIN_GROUP, MEMBER_GROUP, orderedGroups, toggleGroup } from "../lib/permissions";
 import { controller } from "../state/controller";
 import { useSession, useUi, type PersonRef } from "../state/stores";
-import { useMyGroups, usePermission } from "./hooks";
+import { useMyWho, usePermission, useWhoOf } from "./hooks";
 import { menuContent, menuItem, menuItemDanger, menuSeparator } from "./kit";
 
 /**
@@ -17,17 +17,18 @@ export function ModerationItems({ person, groups }: { person: PersonRef; groups:
   const t = useT();
   const isMe = useSession((s) => s.me?.uid === person.uid);
   const kind = useSession((s) => s.kind);
-  const permissions = useSession((s) => s.permissions);
   const defs = useSession((s) => s.groups);
-  const myGroups = useMyGroups();
-  const canKick = usePermission("client_kick");
-  const canBan = usePermission("client_ban");
-  const canGroups = usePermission("group_manage");
-  const canRemove = usePermission("member_remove");
-  const canRename = usePermission("member_nickname");
+  const me = useMyWho();
+  const target = useWhoOf(person.uid, groups);
+  const canKick = usePermission("kick_members");
+  const canBan = usePermission("ban_members");
+  const canGroups = usePermission("manage_roles");
+  const canRemove = usePermission("manage_members");
+  const canRename = usePermission("manage_members");
   // TeamSpeak servers keep their own bans and roles: only kicking is offered there, as before.
   const vc = kind === "vc";
-  const stronger = vc && !canActOn(permissions, groups, defs);
+  // Only someone ranked below me (docs/roles.md).
+  const stronger = vc && !canActOn(me, target, defs);
   const showRename = vc && (isMe || canRename);
   const showKick = !isMe && canKick && person.session !== undefined;
   const showBan = !isMe && vc && canBan;
@@ -58,8 +59,8 @@ export function ModerationItems({ person, groups }: { person: PersonRef; groups:
               {roles.length === 0 && <div className="px-2 py-1.5 text-xs text-subtle">{t("mod.noRoles")}</div>}
               {roles.map((g) => {
                 const on = groups.includes(g.id);
-                // I may only hand out roles I hold myself, and not act on someone stronger than me.
-                const blocked = stronger || !canGiveGroup(permissions, myGroups, g);
+                // Only roles below my rank, and not for someone ranked at or above me.
+                const blocked = stronger || !canGiveGroup(me, g, defs);
                 return (
                   <ContextMenu.CheckboxItem
                     key={g.id}

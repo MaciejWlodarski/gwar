@@ -4,4 +4,4 @@ import type { Permission } from "./Permission";
 /**
  * Absent fields stay unchanged; `color: ""` removes the color.
  */
-export type GroupUpdate = { group: number, name?: string | null, permissions?: Array<Permission> | null, color?: string | null, };
+export type GroupUpdate = { group: number, name?: string | null, permissions?: Array<Permission> | null, color?: string | null, hoist?: boolean | null, mentionable?: boolean | null, };

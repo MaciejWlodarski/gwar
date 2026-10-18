@@ -5,73 +5,87 @@ export const ADMIN_GROUP = 1;
 export const MEMBER_GROUP = 2;
 
 export const ALL_PERMISSIONS: Permission[] = [
-  "server_manage",
-  "channel_create",
-  "channel_edit",
-  "channel_delete",
-  "channel_join_locked",
-  "client_move",
-  "client_kick",
-  "client_ban",
-  "group_manage",
-  "token_create",
-  "invite_create",
-  "message_manage",
-  "file_upload",
-  "member_remove",
-  "member_nickname",
+  "administrator",
+  "manage_server",
+  "manage_roles",
+  "manage_members",
+  "kick_members",
+  "ban_members",
+  "create_invites",
+  "bypass_password",
+  "attach_files",
+  "manage_messages",
+  "move_members",
+  "manage_channels",
 ];
 
 /** Permissions as the role editor presents them: thematic sections, each with plain-word labels (see i18n `perm.*`). */
 export const PERMISSION_SECTIONS: Array<{ id: "server" | "channels" | "people" | "chat"; permissions: Permission[] }> = [
-  { id: "server", permissions: ["server_manage", "group_manage"] },
-  { id: "channels", permissions: ["channel_create", "channel_edit", "channel_delete", "channel_join_locked"] },
-  { id: "people", permissions: ["client_move", "client_kick", "client_ban", "member_remove", "member_nickname", "invite_create", "token_create"] },
-  { id: "chat", permissions: ["message_manage", "file_upload"] },
+  { id: "server", permissions: ["administrator", "manage_server", "manage_roles"] },
+  { id: "channels", permissions: ["manage_channels", "bypass_password"] },
+  { id: "people", permissions: ["move_members", "kick_members", "ban_members", "manage_members", "create_invites"] },
+  { id: "chat", permissions: ["manage_messages", "attach_files"] },
 ];
 
-/** What a set of groups allows. Administrators can always do everything, whatever their group lists. */
-export function permissionsOf(groupIds: readonly number[], groups: Record<number, Group>): Permission[] {
-  if (groupIds.includes(ADMIN_GROUP)) return [...ALL_PERMISSIONS];
+/** Someone as the rank rules see them: their roles, and whether they are the server's owner. */
+export interface Who {
+  groups: readonly number[];
+  owner?: boolean;
+}
+
+/** What a set of groups allows. `administrator` (and being the owner) is every permission. */
+export function permissionsOf(groupIds: readonly number[], groups: Record<number, Group>, owner = false): Permission[] {
   const set = new Set<Permission>();
   for (const g of groupIds) for (const p of groups[g]?.permissions ?? []) set.add(p);
+  if (owner || set.has("administrator")) return [...ALL_PERMISSIONS];
   return ALL_PERMISSIONS.filter((p) => set.has(p));
 }
 
-/** Whether `mine` covers everything in `theirs` (so I may act on someone who has `theirs`). */
-export function covers(mine: readonly Permission[], theirs: readonly Permission[]): boolean {
-  return theirs.every((p) => mine.includes(p));
+/** A role's place from the top (0); unknown roles rank below every role. */
+function position(id: number, groups: Record<number, Group>): number {
+  return groups[id]?.position ?? Number.MAX_SAFE_INTEGER;
 }
 
-/** Built-in groups can't be deleted; Administrator's permissions can't change. */
+/** Someone's rank: their best role's position; the owner is above every role (-1). Lower is higher. */
+export function rankOf(who: Who, groups: Record<number, Group>): number {
+  if (who.owner) return -1;
+  const ranks = who.groups.map((g) => position(g, groups));
+  return ranks.length ? Math.min(...ranks) : position(MEMBER_GROUP, groups);
+}
+
+/** Whether `me` may act on (kick, ban, move, rename, re-role) `target`: only someone ranked below. */
+export function canActOn(me: Who, target: Who, groups: Record<number, Group>): boolean {
+  return rankOf(me, groups) < rankOf(target, groups);
+}
+
+/** Whether `me` may edit, delete, give or take away `group`: only roles below one's rank. */
+export function canGiveGroup(me: Who, group: Group, groups: Record<number, Group>): boolean {
+  return rankOf(me, groups) < group.position;
+}
+
+/** Built-in groups can't be deleted; Admin's permissions can't change. */
 export function isBuiltinGroup(id: number): boolean {
   return id === ADMIN_GROUP || id === MEMBER_GROUP;
 }
 
-/** Display order: Administrator, custom roles (oldest first), Member. */
+/** Every role, from the top (Member last). */
 export function orderedGroups(groups: Record<number, Group>): Group[] {
-  const all = Object.values(groups);
-  const rank = (g: Group) => (g.id === ADMIN_GROUP ? 0 : g.id === MEMBER_GROUP ? 2 : 1);
-  return all.sort((a, b) => rank(a) - rank(b) || a.id - b.id);
-}
-
-/** Roles I may hand out or take away: only those whose permissions I hold myself. */
-export function canAssignGroup(mine: readonly Permission[], group: Group): boolean {
-  if (group.id === ADMIN_GROUP) return mine.length === ALL_PERMISSIONS.length;
-  return covers(mine, group.permissions);
+  return Object.values(groups).sort((a, b) => a.position - b.position || a.id - b.id);
 }
 
 /**
- * Roles I may hand out or take away: those I hold myself (or any, as Admin), within my own
- * permissions. The server applies the same rule to every role (docs/e2e-build.md, section 6).
+ * The order to send after moving `group` to `to` (an index among the roles but Member), or `null`
+ * when nothing changes or it cannot go there: roles at or above one's rank keep their places.
  */
-export function canGiveGroup(mine: readonly Permission[], myGroups: readonly number[], group: Group): boolean {
-  return canAssignGroup(mine, group) && (myGroups.includes(ADMIN_GROUP) || myGroups.includes(group.id));
-}
-
-/** Whether I may moderate (kick, ban, change roles of) someone with these groups. */
-export function canActOn(mine: readonly Permission[], targetGroups: readonly number[], groups: Record<number, Group>): boolean {
-  return covers(mine, permissionsOf(targetGroups, groups));
+export function reorderedTo(groups: Record<number, Group>, group: number, to: number, myRank: number): number[] | null {
+  const order = orderedGroups(groups).filter((g) => g.id !== MEMBER_GROUP).map((g) => g.id);
+  const from = order.indexOf(group);
+  const fixed = order.filter((id) => (groups[id]?.position ?? 0) <= myRank).length;
+  if (from < fixed || to < fixed || to >= order.length || to === from) return null;
+  const next = [...order];
+  next.splice(from, 1);
+  next.splice(to, 0, group);
+  return next;
 }
 
 const HEX_COLOR = /^#[0-9a-fA-F]{6}$/;
@@ -80,18 +94,22 @@ export function isHexColor(value: string | null | undefined): value is string {
   return !!value && HEX_COLOR.test(value);
 }
 
-/**
- * The colour of someone's name: the colour of their highest role that has one
- * (Administrator first, then custom roles, Member last).
- */
+/** The colour of someone's name: the colour of their highest role that has one. */
 export function nameColor(groupIds: readonly number[], groups: Record<number, Group>): string | undefined {
-  const rank = (id: number) => (id === ADMIN_GROUP ? 0 : id === MEMBER_GROUP ? Infinity : id);
-  const sorted = [...groupIds].sort((a, b) => rank(a) - rank(b));
+  const sorted = [...groupIds].sort((a, b) => position(a, groups) - position(b, groups));
   for (const id of sorted) {
     const color = groups[id]?.color;
     if (isHexColor(color)) return color;
   }
   return undefined;
+}
+
+/** The highest role of these that is shown separately in the member list, if any. */
+export function hoistedRole(groupIds: readonly number[], groups: Record<number, Group>): Group | undefined {
+  return groupIds
+    .map((id) => groups[id])
+    .filter((g): g is Group => !!g && g.hoist && g.id !== MEMBER_GROUP)
+    .sort((a, b) => a.position - b.position)[0];
 }
 
 /** Group list of a person after toggling one role, keeping everything else (and always something). */

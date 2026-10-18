@@ -17,6 +17,75 @@ async fn with_groups(admin: &mut Client, member: &Client, groups: Value) {
 // ---------------------------------------------------------------- roles
 
 #[tokio::test]
+async fn roles_are_ordered_and_only_those_below_ones_rank_move() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let mut watcher = Client::connect(&server, "watcher").await;
+    // New roles go last above Member, with their display flags.
+    let mods = group_id(
+        &root.ok("group.create", json!({"name": "Mods", "permissions": ["manage_roles"], "hoist": true})).await,
+    );
+    let created = watcher.next_event("group.created").await;
+    assert_eq!((created["position"].clone(), created["hoist"].clone()), (json!(1), json!(true)));
+    let vets = group_id(&root.ok("group.create", json!({"name": "Vets", "permissions": []})).await);
+    let crew = group_id(&root.ok("group.create", json!({"name": "Crew", "permissions": []})).await);
+    with_groups(&mut root, &alice, json!([2, mods])).await;
+
+    // Every role but Member, exactly once.
+    for bad in [json!([1, mods, vets]), json!([1, mods, vets, crew, 2]), json!([1, mods, vets, vets])] {
+        assert_eq!(alice.fails("group.reorder", json!({"groups": bad})).await, "bad_request", "{bad}");
+    }
+    // Roles at or above her rank keep their places; those below are hers to order.
+    assert_eq!(alice.fails("group.reorder", json!({"groups": [mods, 1, vets, crew]})).await, "forbidden");
+    assert_eq!(alice.fails("group.reorder", json!({"groups": [1, vets, mods, crew]})).await, "forbidden");
+    alice.ok("group.reorder", json!({"groups": [1, mods, crew, vets]})).await;
+    let order = json!([1, mods, crew, vets]);
+    watcher.next_event_where("group.reordered", |d| d["groups"] == order).await;
+    // Only roles below her rank may be edited, and only with permissions she holds.
+    assert_eq!(alice.fails("group.update", json!({"group": mods, "name": "Gods"})).await, "forbidden");
+    assert_eq!(alice.fails("group.update", json!({"group": 1, "name": "Mine"})).await, "forbidden");
+    alice.ok("group.update", json!({"group": crew, "name": "Clan", "mentionable": true})).await;
+    assert_eq!(alice.fails("group.update", json!({"group": crew, "permissions": ["kick_members"]})).await, "forbidden");
+    alice.ok("group.update", json!({"group": crew, "permissions": ["manage_roles"]})).await;
+    // Nor take away one she lacks.
+    root.ok("group.update", json!({"group": vets, "permissions": ["ban_members"]})).await;
+    assert_eq!(alice.fails("group.update", json!({"group": vets, "permissions": []})).await, "forbidden");
+}
+
+#[tokio::test]
+async fn equal_ranks_cannot_act_on_each_other() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let mut bob = Client::connect(&server, "bob").await;
+    let mods = group_id(
+        &root
+            .ok(
+                "group.create",
+                json!({"name": "Mods", "permissions": ["kick_members", "ban_members", "manage_members", "manage_roles"]}),
+            )
+            .await,
+    );
+    let crew = group_id(&root.ok("group.create", json!({"name": "Crew", "permissions": []})).await);
+    with_groups(&mut root, &alice, json!([2, mods])).await;
+    with_groups(&mut root, &bob, json!([2, mods, crew])).await;
+    let bob_uid = bob.welcome.uid.clone();
+    assert_eq!(alice.fails("client.kick", json!({"client": bob.id()})).await, "forbidden");
+    assert_eq!(alice.fails("ban.create", json!({"uid": bob_uid})).await, "forbidden");
+    assert_eq!(alice.fails("member.nickname", json!({"uid": bob_uid, "nickname": "x"})).await, "forbidden");
+    assert_eq!(alice.fails("member.groups", json!({"uid": bob_uid, "groups": [2, mods]})).await, "forbidden");
+    // An administrator below another administrator's rank cannot act on them either.
+    let admins2 =
+        group_id(&root.ok("group.create", json!({"name": "Admins 2", "permissions": ["administrator"]})).await);
+    with_groups(&mut root, &bob, json!([2, admins2])).await;
+    root.ok("group.reorder", json!({"groups": [1, mods, crew, admins2]})).await;
+    assert_eq!(bob.fails("client.kick", json!({"client": alice.id()})).await, "forbidden");
+    alice.ok("client.kick", json!({"client": bob.id()})).await;
+    bob.expect_disconnect().await;
+}
+
+#[tokio::test]
 async fn custom_roles_grant_only_what_their_manager_holds() {
     let server = TestServer::start().await;
     let mut root = admin(&server, "root").await;
@@ -27,7 +96,7 @@ async fn custom_roles_grant_only_what_their_manager_holds() {
         &root
             .ok(
                 "group.create",
-                json!({"name": "Mods", "permissions": ["client_kick", "group_manage"], "color": "#ff8800"}),
+                json!({"name": "Mods", "permissions": ["kick_members", "manage_roles"], "color": "#ff8800"}),
             )
             .await,
     );
@@ -40,7 +109,7 @@ async fn custom_roles_grant_only_what_their_manager_holds() {
 
     // Alice can kick now, but can't hand out what she doesn't have.
     assert_eq!(
-        alice.fails("group.create", json!({"name": "Bosses", "permissions": ["server_manage"]})).await,
+        alice.fails("group.create", json!({"name": "Bosses", "permissions": ["manage_server"]})).await,
         "forbidden"
     );
     assert_eq!(alice.fails("member.groups", json!({"uid": bob.welcome.uid, "groups": [1]})).await, "forbidden");
@@ -65,7 +134,7 @@ async fn moderators_cannot_kick_or_move_someone_stronger() {
     let mut bob = Client::connect(&server, "bob").await;
     let lobby = seed_channel(&root, "Lobby");
     let mods = group_id(
-        &root.ok("group.create", json!({"name": "Mods", "permissions": ["client_kick", "client_move"]})).await,
+        &root.ok("group.create", json!({"name": "Mods", "permissions": ["kick_members", "move_members"]})).await,
     );
     with_groups(&mut root, &alice, json!([2, mods])).await;
 
@@ -133,7 +202,7 @@ async fn invites_admit_without_password_grant_groups_and_run_out() {
     let server = TestServer::start_with(|c| c.server_password = Some("secret".into())).await;
     let mut root = Client::connect_as(&server, new_key(), "root", Some("secret")).await.unwrap();
     root.redeem(&server.admin_token).await;
-    let mods = group_id(&root.ok("group.create", json!({"name": "Mods", "permissions": ["client_kick"]})).await);
+    let mods = group_id(&root.ok("group.create", json!({"name": "Mods", "permissions": ["kick_members"]})).await);
     let invite = root.ok("invite.create", json!({"max_uses": 1, "expires_in": 3600, "group": mods})).await;
     let code = invite["invite"]["code"].as_str().unwrap().to_owned();
 
@@ -195,7 +264,7 @@ async fn members_create_invites_but_not_for_groups_above_them() {
 async fn invites_belong_to_their_creator_not_to_a_nickname() {
     let server = TestServer::start().await;
     let mut root = admin(&server, "root").await;
-    let mods = group_id(&root.ok("group.create", json!({"name": "Mods", "permissions": ["client_kick"]})).await);
+    let mods = group_id(&root.ok("group.create", json!({"name": "Mods", "permissions": ["kick_members"]})).await);
     let invite = root.ok("invite.create", json!({"group": mods})).await;
     let code = invite["invite"]["code"].clone();
 
@@ -221,27 +290,24 @@ async fn invites_and_tokens_lapse_with_their_makers_rights() {
     let mut root = Client::connect_as(&server, new_key(), "root", Some("secret")).await.unwrap();
     root.redeem(&server.admin_token).await;
     let mods = group_id(
-        &root
-            .ok(
-                "group.create",
-                json!({"name": "Mods", "permissions": ["client_kick", "invite_create", "token_create"]}),
-            )
-            .await,
+        &root.ok("group.create", json!({"name": "Mods", "permissions": ["kick_members", "create_invites"]})).await,
     );
+    // A role below Mods: the ones Alice may invite into.
+    let crew = group_id(&root.ok("group.create", json!({"name": "Crew", "permissions": []})).await);
     let mut alice = Client::connect_as(&server, new_key(), "alice", Some("secret")).await.unwrap();
     with_groups(&mut root, &alice, json!([2, mods])).await;
+    // Her own role is not below her rank.
+    assert_eq!(alice.fails("invite.create", json!({"group": mods})).await, "forbidden");
+    assert_eq!(alice.fails("token.create", json!({"group": mods})).await, "forbidden");
     let mut codes = Vec::new();
-    for group in [json!(mods), json!(mods), Value::Null] {
+    for group in [json!(crew), json!(crew), Value::Null] {
         codes.push(
             alice.ok("invite.create", json!({"group": group})).await["invite"]["code"].as_str().unwrap().to_owned(),
         );
     }
-    let plain = group_id(&root.ok("group.create", json!({"name": "Plain", "permissions": []})).await);
-    // Roles are given out only by those who hold them.
-    with_groups(&mut root, &alice, json!([2, mods, plain])).await;
     let mut token =
         async |group| alice.ok("token.create", json!({"group": group})).await["token"].as_str().unwrap().to_owned();
-    let (first_token, second_token, plain_token) = (token(mods).await, token(mods).await, token(plain).await);
+    let (first_token, second_token) = (token(crew).await, token(crew).await);
     let with_invite = |code: String| {
         move |raw: &RawConn, key: &_| {
             let mut hello = raw.hello(key, "guest", None);
@@ -249,12 +315,12 @@ async fn invites_and_tokens_lapse_with_their_makers_rights() {
             hello
         }
     };
-    let in_mods =
-        |c: &Client| c.welcome.clients.iter().find(|x| x.id == c.id()).unwrap().groups.contains(&(mods as u32));
+    let in_crew =
+        |c: &Client| c.welcome.clients.iter().find(|x| x.id == c.id()).unwrap().groups.contains(&(crew as u32));
 
     // While Alice holds the rights, what she made works.
     let guest = Client::connect_with(&server, new_key(), with_invite(codes[0].clone())).await.expect("invite admits");
-    assert!(in_mods(&guest));
+    assert!(in_crew(&guest));
     let mut bob = Client::connect_as(&server, new_key(), "bob", Some("secret")).await.unwrap();
     bob.redeem(&first_token).await;
 
@@ -262,11 +328,9 @@ async fn invites_and_tokens_lapse_with_their_makers_rights() {
     with_groups(&mut root, &alice, json!([2])).await;
     let refused = Client::connect_with(&server, new_key(), with_invite(codes[1].clone())).await.err().expect("lapsed");
     assert_eq!(refused.code, vc_proto::ErrorCode::WrongPassword);
-    assert!(!in_mods(&Client::connect_with(&server, new_key(), with_invite(codes[2].clone())).await.expect("admits")));
+    assert!(!in_crew(&Client::connect_with(&server, new_key(), with_invite(codes[2].clone())).await.expect("admits")));
     let mut carol = Client::connect_as(&server, new_key(), "carol", Some("secret")).await.unwrap();
     assert_eq!(carol.fails("token.redeem", json!({"token": second_token})).await, "forbidden");
-    // Even for a group with nothing in it: she can no longer make tokens at all.
-    assert_eq!(carol.fails("token.redeem", json!({"token": plain_token})).await, "forbidden");
 }
 
 // ------------------------------------------------------------- settings

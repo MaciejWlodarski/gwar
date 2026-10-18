@@ -42,7 +42,7 @@ post-quantum suites (MLS can add them later); push notifications.
   is no per-member consent to sharing history: admission is the control.
 - Your own history reaches your other devices through Gwar Connect (an option,
   on by default).
-- **Private channels** work like Discord's: holders of `channel_edit` manage
+- **Private channels** work like Discord's: holders of `manage_channels` manage
   the member list, under the server owner. Passwords remain only for
   plaintext (TeamSpeak) channels.
 - The voice key is only for current voice participants.
@@ -289,8 +289,8 @@ statements below are summaries:
   with its anchor, so a newcomer needs no history. Only the current owner
   signs a new anchor; an ownership move hands the anchor in force over by
   naming its hash, so a former owner cannot appoint confirmers afterwards. Managers mirror
-  `channel_edit`: when the owner or a confirmer gives a role with
-  `channel_edit`, their client signs a new list. When another admin does it,
+  `manage_channels`: when the owner or a confirmer gives a role with
+  `manage_channels`, their client signs a new list. When another admin does it,
   the server reports a pending manager, and the list waits until the owner or
   a confirmer confirms it ("Allow @name to manage private channels?").
 - Each private channel's GroupContext holds the **access list**: the

@@ -197,10 +197,11 @@ async fn welcome_describes_server_and_own_client() {
     // Members may only invite and upload; both seeded groups are listed.
     let mut permissions = w.permissions.clone();
     permissions.sort();
-    assert_eq!(permissions, [Permission::InviteCreate, Permission::FileUpload]);
+    assert_eq!(permissions, [Permission::CreateInvites, Permission::AttachFiles]);
     let groups: Vec<_> = w.groups.iter().map(|g| (g.id, g.name.as_str())).collect();
     assert_eq!(groups, [(1, "Admin"), (2, "Member")]);
-    assert_eq!(w.groups[0].permissions.len(), vc_proto::Permission::ALL.len());
+    assert_eq!(w.groups[0].permissions, [Permission::Administrator]);
+    assert_eq!((w.groups[0].position, w.groups[1].position), (0, 1), "Admin first, Member last");
     assert_eq!(w.groups[1].permissions, vc_proto::Permission::MEMBER_DEFAULT);
 }
 
@@ -235,7 +236,7 @@ async fn group_membership_persists_per_identity() {
     first.close().await;
     let again = Client::connect_as(&server, key, "alice2", None).await.unwrap();
     assert!(again.welcome.clients.iter().any(|c| c.groups.contains(&(ADMIN as u32))));
-    assert!(again.welcome.permissions.contains(&vc_proto::Permission::ChannelCreate));
+    assert!(again.welcome.permissions.contains(&vc_proto::Permission::ManageChannels));
 }
 
 // -------------------------------------------------------- channel.join
@@ -426,9 +427,9 @@ async fn token_create_cannot_grant_more_than_you_have() {
     moderator.redeem(&mod_token).await;
     assert!(moderator.fails("channel.create", json!({"name": "X"})).await == "forbidden");
 
-    // Moderator can hand out its own group and the empty Member group, but not Admin.
+    // Moderator can hand out roles below its rank (here the empty Member group), not its own or Admin.
     assert_eq!(moderator.fails("token.create", json!({"group": ADMIN})).await, "forbidden");
-    moderator.ok("token.create", json!({"group": 3})).await;
+    assert_eq!(moderator.fails("token.create", json!({"group": 3})).await, "forbidden");
     moderator.ok("token.create", json!({"group": MEMBER})).await;
 
     // And it can kick, since it holds client_kick.

@@ -56,8 +56,8 @@ function online(): SessionState {
       uid: "u1",
       permissions: [],
       groups: [
-        { id: 1, name: "Admin", permissions: ["channel_create", "client_kick"] },
-        { id: 2, name: "Member", permissions: [] },
+        { id: 1, name: "Admin", permissions: ["administrator"], position: 0, hoist: false, mentionable: false },
+        { id: 2, name: "Member", permissions: [], position: 1, hoist: false, mentionable: false },
       ],
       channels: [ch(1), ch(2, 1)],
       clients: [cl(1), cl(2)],
@@ -205,9 +205,9 @@ describe("permissions", () => {
     let s = online();
     expect(s.permissions).toEqual([]);
     s = ev(s, { ev: "client.updated", d: cl(1, 1, { groups: [1, 2] }) });
-    // The Admin group (1) always means everything, whatever its list says.
+    // Admin holds administrator, which is every permission.
     expect(s.permissions).toHaveLength(ALL_PERMISSIONS.length);
-    expect(computePermissions(s)).toEqual(expect.arrayContaining(["client_kick"]));
+    expect(computePermissions(s)).toEqual(expect.arrayContaining(["kick_members"]));
   });
 });
 
@@ -550,11 +550,11 @@ describe("mentions", () => {
 describe("roles", () => {
   it("recomputes my permissions when a group I am in changes", () => {
     let s = online();
-    s = ev(s, { ev: "group.created", d: { id: 5, name: "Mods", permissions: ["client_kick"], color: "#ff0000" } });
+    s = ev(s, { ev: "group.created", d: { id: 5, name: "Mods", permissions: ["kick_members"], color: "#ff0000", position: 1, hoist: false, mentionable: false } });
     s = ev(s, { ev: "client.updated", d: cl(1, 1, { groups: [2, 5] }) });
-    expect(s.permissions).toEqual(["client_kick"]);
-    s = ev(s, { ev: "group.updated", d: { id: 5, name: "Mods", permissions: ["client_kick", "client_ban"], color: null } });
-    expect(s.permissions).toEqual(["client_kick", "client_ban"]);
+    expect(s.permissions).toEqual(["kick_members"]);
+    s = ev(s, { ev: "group.updated", d: { id: 5, name: "Mods", permissions: ["kick_members", "ban_members"], color: null, position: 1, hoist: false, mentionable: false } });
+    expect(s.permissions).toEqual(["kick_members", "ban_members"]);
     expect(s.groups[5]?.color).toBeNull();
     s = ev(s, { ev: "group.deleted", d: { group: 5 } });
     expect(s.permissions).toEqual([]);
@@ -569,12 +569,20 @@ describe("roles", () => {
     expect(s.clients[2]?.groups).toEqual([2, 7]);
   });
 
+  it("group.reordered sets the positions, with Member last", () => {
+    let s = online();
+    s = ev(s, { ev: "group.created", d: { id: 5, name: "Mods", permissions: [], position: 1, hoist: false, mentionable: false } });
+    s = ev(s, { ev: "group.created", d: { id: 6, name: "Crew", permissions: [], position: 2, hoist: false, mentionable: false } });
+    s = ev(s, { ev: "group.reordered", d: { groups: [1, 6, 5] } });
+    expect([1, 6, 5, 2].map((id) => s.groups[id]?.position)).toEqual([0, 1, 2, 3]);
+  });
+
   it("member.updated on me recomputes what I may do", () => {
     let s = online();
-    s = ev(s, { ev: "group.created", d: { id: 6, name: "Inviters", permissions: ["invite_create"] } });
+    s = ev(s, { ev: "group.created", d: { id: 6, name: "Inviters", permissions: ["create_invites"], position: 1, hoist: false, mentionable: false } });
     expect(s.permissions).toEqual([]);
     s = ev(s, { ev: "member.updated", d: { uid: "u1", nickname: "n1", tag: "abcdefghij", groups: [2, 6], last_seen: 3 } });
-    expect(s.permissions).toEqual(["invite_create"]);
+    expect(s.permissions).toEqual(["create_invites"]);
   });
 });
 

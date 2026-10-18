@@ -208,7 +208,7 @@ impl Core {
         if !self.admitted(Some(s), channel) {
             return Err(err(ErrorCode::NotFound, "no such message"));
         }
-        if !self.can_read(s, channel) || !self.has(session, Permission::MessageManage) {
+        if !self.can_read(s, channel) || !self.has(session, Permission::ManageMessages) {
             return Err(err(
                 ErrorCode::Forbidden,
                 "server removal requires message_manage; authors use a signed deletion revision",

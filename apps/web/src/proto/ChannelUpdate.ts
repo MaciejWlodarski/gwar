@@ -12,6 +12,6 @@ export type ChannelUpdate = { channel: number, name?: string | null, topic?: str
  */
 position?: number | null, 
 /**
- * Replaces a private channel's access (needs `channel_edit`).
+ * Replaces a private channel's access (needs `manage_channels`).
  */
 access?: ChannelAccess | null, };

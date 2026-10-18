@@ -1,71 +1,83 @@
 import { describe, expect, it } from "vitest";
 import type { Group } from "../proto/Group";
-import { ALL_PERMISSIONS, canActOn, canAssignGroup, canGiveGroup, nameColor, orderedGroups, permissionsOf, toggleGroup } from "./permissions";
+import { ALL_PERMISSIONS, canActOn, canGiveGroup, hoistedRole, nameColor, orderedGroups, permissionsOf, rankOf, reorderedTo, toggleGroup } from "./permissions";
 
-const g = (id: number, permissions: Group["permissions"], color?: string): Group => ({ id, name: `g${id}`, permissions, color });
+const g = (id: number, position: number, permissions: Group["permissions"], color?: string, hoist = false): Group => ({
+  id, name: `g${id}`, permissions, color, position, hoist, mentionable: false,
+});
+// Admin, Mods (3), Vets (4), Crew (5), then Member.
 const groups = Object.fromEntries(
-  [g(1, [], "#ff0000"), g(2, ["invite_create", "file_upload"]), g(3, ["client_kick"], "#00ff00"), g(4, ["client_kick", "client_ban"], "#0000ff"), g(5, ["server_manage"])].map((x) => [x.id, x]),
+  [g(1, 0, ["administrator"], "#ff0000"), g(3, 1, ["kick_members"], "#00ff00", true), g(4, 2, ["kick_members", "ban_members"], "#0000ff", true), g(5, 3, ["manage_server"]), g(2, 4, ["create_invites", "attach_files"])].map((x) => [x.id, x]),
 );
 
 describe("permissionsOf", () => {
   it("unions the permissions of the groups", () => {
-    expect(permissionsOf([2, 3], groups)).toEqual(["client_kick", "invite_create", "file_upload"]);
+    expect(permissionsOf([2, 3], groups)).toEqual(["kick_members", "create_invites", "attach_files"]);
   });
-  it("gives Admin everything, whatever the group lists", () => {
+  it("gives administrator, and the owner, everything", () => {
     expect(permissionsOf([1], groups)).toEqual(ALL_PERMISSIONS);
+    expect(permissionsOf([2], groups, true)).toEqual(ALL_PERMISSIONS);
   });
   it("ignores unknown groups", () => {
     expect(permissionsOf([99], groups)).toEqual([]);
   });
 });
 
-describe("member removal", () => {
-  it("is part of the full set, so Admin has it, and is not given to plain members", () => {
-    expect(ALL_PERMISSIONS).toContain("member_remove");
-    expect(permissionsOf([1], groups)).toContain("member_remove");
-    expect(permissionsOf([2], groups)).not.toContain("member_remove");
+describe("rank", () => {
+  it("is the best role's position; the owner is above every role", () => {
+    expect(rankOf({ groups: [2, 4, 3] }, groups)).toBe(1);
+    expect(rankOf({ groups: [2] }, groups)).toBe(4);
+    expect(rankOf({ groups: [] }, groups)).toBe(4);
+    expect(rankOf({ groups: [2], owner: true }, groups)).toBe(-1);
+  });
+  it("lets me act only on someone ranked below me", () => {
+    const mod = { groups: [2, 3] };
+    expect(canActOn(mod, { groups: [2, 4] }, groups)).toBe(true);
+    expect(canActOn(mod, { groups: [2, 3] }, groups)).toBe(false);
+    expect(canActOn(mod, { groups: [1] }, groups)).toBe(false);
+    expect(canActOn({ groups: [1] }, { groups: [1], owner: true }, groups)).toBe(false);
+    expect(canActOn({ groups: [2], owner: true }, { groups: [1] }, groups)).toBe(true);
+  });
+  it("lets me give out, edit and delete only roles below my rank", () => {
+    const mod = { groups: [2, 3] };
+    expect(canGiveGroup(mod, groups[4]!, groups)).toBe(true);
+    expect(canGiveGroup(mod, groups[3]!, groups)).toBe(false);
+    expect(canGiveGroup(mod, groups[1]!, groups)).toBe(false);
   });
 });
 
-describe("moderation rules", () => {
-  const mod = permissionsOf([2, 3], groups);
-  it("lets me hand out only roles within my own permissions", () => {
-    expect(canAssignGroup(mod, groups[3]!)).toBe(true);
-    expect(canAssignGroup(mod, groups[4]!)).toBe(false);
-    expect(canAssignGroup(mod, groups[1]!)).toBe(false);
-    expect(canAssignGroup(permissionsOf([1], groups), groups[1]!)).toBe(true);
-  });
-  it("lets me give out or take away only roles I hold, unless I am Admin", () => {
-    expect(canGiveGroup(mod, [2, 3], groups[3]!)).toBe(true);
-    expect(canGiveGroup(mod, [2], groups[3]!)).toBe(false);
-    // Every permission through other roles is not Admin.
-    expect(canGiveGroup([...ALL_PERMISSIONS], [2, 3, 4], groups[1]!)).toBe(false);
-    expect(canGiveGroup(permissionsOf([1], groups), [1], groups[4]!)).toBe(true);
-  });
-  it("lets me act on equals and weaker, not stronger", () => {
-    expect(canActOn(mod, [2], groups)).toBe(true);
-    expect(canActOn(mod, [3], groups)).toBe(true);
-    expect(canActOn(mod, [4], groups)).toBe(false);
-    expect(canActOn(mod, [1], groups)).toBe(false);
-    expect(canActOn(permissionsOf([1], groups), [1, 4], groups)).toBe(true);
+describe("reorderedTo", () => {
+  it("moves a role among the roles below my rank, never past them or Member", () => {
+    // Mods (rank 1) may reorder Vets and Crew only.
+    expect(reorderedTo(groups, 5, 2, 1)).toEqual([1, 3, 5, 4]);
+    expect(reorderedTo(groups, 5, 1, 1)).toBeNull();
+    expect(reorderedTo(groups, 3, 2, 1)).toBeNull();
+    expect(reorderedTo(groups, 4, 4, 1)).toBeNull();
+    expect(reorderedTo(groups, 4, 2, 1)).toBeNull();
+    // The owner may move anything.
+    expect(reorderedTo(groups, 1, 3, -1)).toEqual([3, 4, 5, 1]);
   });
 });
 
 describe("nameColor", () => {
-  it("is the colour of the highest role that has one: Admin, then custom roles, Member last", () => {
+  it("is the colour of the highest role that has one", () => {
     expect(nameColor([2, 3, 4], groups)).toBe("#00ff00");
     expect(nameColor([4, 3], groups)).toBe("#00ff00");
     expect(nameColor([2, 1, 3], groups)).toBe("#ff0000");
   });
   it("skips roles without a colour and rejects anything but #rrggbb", () => {
     expect(nameColor([2, 5], groups)).toBeUndefined();
-    expect(nameColor([7], { 7: g(7, [], "red; background:url(x)") })).toBeUndefined();
+    expect(nameColor([7], { 7: g(7, 0, [], "red; background:url(x)") })).toBeUndefined();
   });
 });
 
-describe("orderedGroups / toggleGroup", () => {
-  it("lists Admin, custom roles, then Member", () => {
+describe("orderedGroups / hoistedRole / toggleGroup", () => {
+  it("lists roles from the top, Member last", () => {
     expect(orderedGroups(groups).map((x) => x.id)).toEqual([1, 3, 4, 5, 2]);
+  });
+  it("finds the highest role shown separately", () => {
+    expect(hoistedRole([2, 4, 3], groups)?.id).toBe(3);
+    expect(hoistedRole([2, 5], groups)).toBeUndefined();
   });
   it("adds and removes a role", () => {
     expect(toggleGroup([2], 3, true)).toEqual([2, 3]);

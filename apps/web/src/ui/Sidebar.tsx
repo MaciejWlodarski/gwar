@@ -19,16 +19,16 @@ function ServerHeader() {
   const kind = useSession((s) => s.kind);
   const openDialog = useUi((s) => s.openDialog);
   const toast = useUi((s) => s.toast);
-  const manageServer = usePermission("server_manage");
-  const manageGroups = usePermission("group_manage");
-  const banClients = usePermission("client_ban");
-  const editChannels = usePermission("channel_edit");
+  const manageServer = usePermission("manage_server");
+  const manageGroups = usePermission("manage_roles");
+  const banClients = usePermission("ban_members");
+  const editChannels = usePermission("manage_channels");
   const owned = useSession((s) => !!s.owner);
   // The Ownership tab is for anyone with channel_edit on a server with an owner (confirmers too).
   const canManage = manageServer || (kind === "vc" && (manageGroups || banClients || (owned && editChannels)));
-  const canInvite = usePermission("invite_create") && kind === "vc";
-  const canCreate = usePermission("channel_create");
-  const canToken = usePermission("token_create") && kind === "vc"; // TeamSpeak has no vc tokens
+  const canInvite = usePermission("create_invites") && kind === "vc";
+  const canCreate = usePermission("manage_channels");
+  const canToken = usePermission("create_invites") && kind === "vc"; // TeamSpeak has no vc tokens
   const serverKey = useSession((s) => s.serverKey);
 
   const copyAddress = async () => {

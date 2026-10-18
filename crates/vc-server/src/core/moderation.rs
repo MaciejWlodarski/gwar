@@ -1,8 +1,9 @@
 //! Groups and roles, bans, invites and server settings.
 //!
-//! One rule throughout: nobody can hand out, or act against someone holding,
-//! a permission they don't have themselves. That keeps moderators from
-//! promoting themselves or demoting admins.
+//! Rank decides who acts on whom (docs/roles.md): roles are ordered, a member's
+//! rank is their best role's, and the owner is above every role. One acts only
+//! on members ranked below oneself, manages and gives only roles below one's
+//! rank, and never hands out a permission one does not hold.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -63,7 +64,7 @@ impl Core {
         self.permissions(&self.sessions[&session])
     }
 
-    fn group_permissions(&self, groups: &[GroupId]) -> BTreeSet<Permission> {
+    pub(super) fn group_permissions(&self, groups: &[GroupId]) -> BTreeSet<Permission> {
         groups.iter().filter_map(|g| self.groups.get(g)).flat_map(|g| g.permissions.iter().copied()).collect()
     }
 
@@ -71,10 +72,9 @@ impl Core {
     /// (`kind`) for `group`. Grants made earlier lapse with their maker's rights.
     pub(super) fn could_grant(&self, uid: &str, kind: Permission, group: Option<GroupId>) -> anyhow::Result<bool> {
         let Some(groups) = self.store.groups_of(uid)? else { return Ok(false) };
-        let theirs = self.group_permissions(&groups);
-        let granted = group.map(|g| self.group_permissions(&[g])).unwrap_or_default();
-        let delegates = group.is_none_or(|g| Self::may_delegate(&groups, &[g]));
-        Ok(theirs.contains(&kind) && granted.is_subset(&theirs) && delegates)
+        let theirs = self.expand(self.group_permissions(&groups), uid);
+        let rank = self.rank_of(uid, &groups);
+        Ok(theirs.contains(&kind) && group.is_none_or(|g| rank < self.position(g)))
     }
 
     /// Whether everything `permissions` allows is also allowed to `session`.
@@ -82,10 +82,83 @@ impl Core {
         permissions.is_subset(&self.my_permissions(session))
     }
 
+    // ------------------------------------------------------------------ rank
+
+    /// A role's place from the top (0); an unknown role ranks below every role.
+    pub(super) fn position(&self, group: GroupId) -> i64 {
+        self.groups.get(&group).map_or(i64::MAX, |g| i64::from(g.position))
+    }
+
+    /// The rank of a member holding `groups`: their best role's position; the owner's is above all (-1).
+    pub(super) fn rank_of(&self, uid: &str, groups: &[GroupId]) -> i64 {
+        if self.owner.as_ref().is_some_and(|o| o.chain.owner() == uid) {
+            return -1;
+        }
+        groups.iter().map(|g| self.position(*g)).min().unwrap_or_else(|| self.position(MEMBER_GROUP))
+    }
+
+    pub(super) fn session_rank(&self, session: SessionId) -> i64 {
+        let s = &self.sessions[&session];
+        self.rank_of(&s.uid, &s.groups)
+    }
+
+    /// Whether `session` ranks above a member with these roles.
+    pub(super) fn outranks(&self, session: SessionId, uid: &str, groups: &[GroupId]) -> bool {
+        self.session_rank(session) < self.rank_of(uid, groups)
+    }
+
+    /// Whether `group` is below `session`'s rank, so they may manage and give it.
+    pub(super) fn below(&self, session: SessionId, group: GroupId) -> bool {
+        self.session_rank(session) < self.position(group)
+    }
+
+    pub(super) fn group_reorder(&mut self, session: SessionId, order: Vec<GroupId>) -> Reply {
+        self.require(session, Permission::ManageRoles)?;
+        let mut current: Vec<&Group> = self.groups.values().filter(|g| g.id != MEMBER_GROUP).collect();
+        current.sort_by_key(|g| g.position);
+        let current: Vec<GroupId> = current.into_iter().map(|g| g.id).collect();
+        let mut wanted = order.clone();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let mut known = current.clone();
+        known.sort_unstable();
+        if wanted != known || order.len() != current.len() {
+            return Err(err(ErrorCode::BadRequest, "list every role but Member exactly once"));
+        }
+        // Roles at or above one's rank keep their places.
+        let rank = self.session_rank(session);
+        let fixed = current.iter().take_while(|g| self.position(**g) <= rank).count();
+        if order[..fixed] != current[..fixed] {
+            return Err(err(ErrorCode::Forbidden, "roles at or above your rank keep their places"));
+        }
+        if order == current {
+            return Ok(Response::Empty {});
+        }
+        self.store.reorder_groups(&order).map_err(storage_error)?;
+        for (index, id) in order.iter().enumerate() {
+            if let Some(group) = self.groups.get_mut(id) {
+                group.position = index as u32;
+            }
+        }
+        if let Some(member) = self.groups.get_mut(&MEMBER_GROUP) {
+            member.position = order.len() as u32;
+        }
+        self.broadcast_order();
+        Ok(Response::Empty {})
+    }
+
+    /// Tells everyone the roles' order (positions follow it; Member is last).
+    pub(super) fn broadcast_order(&mut self) {
+        let mut order: Vec<&Group> = self.groups.values().filter(|g| g.id != MEMBER_GROUP).collect();
+        order.sort_by_key(|g| g.position);
+        let groups = order.into_iter().map(|g| g.id).collect();
+        self.broadcast(Event::GroupsReordered { groups }, |_| true);
+    }
+
     // ---------------------------------------------------------------- groups
 
     pub(super) fn group_create(&mut self, session: SessionId, c: GroupCreate) -> Reply {
-        self.require(session, Permission::GroupManage)?;
+        self.require(session, Permission::ManageRoles)?;
         let name = clean(&c.name, MAX_GROUP_NAME, "group name")?;
         let permissions: BTreeSet<_> = c.permissions.into_iter().collect();
         if !self.covers(session, &permissions) {
@@ -96,20 +169,29 @@ impl Core {
             return Err(err(ErrorCode::BadRequest, "color must look like #a1b2c3"));
         }
         let permissions: Vec<_> = permissions.into_iter().collect();
-        let id = self.store.insert_group(&name, &permissions, color.as_deref()).map_err(storage_error)?;
-        let group = Group { id, name, permissions, color };
+        let id = self
+            .store
+            .insert_group(&name, &permissions, color.as_deref(), c.hoist, c.mentionable)
+            .map_err(storage_error)?;
+        // A new role goes last above Member.
+        let position = self.groups.values().filter(|g| g.id != MEMBER_GROUP).count() as u32;
+        let group = Group { id, name, permissions, color, position, hoist: c.hoist, mentionable: c.mentionable };
         self.groups.insert(id, group.clone());
+        if let Some(member) = self.groups.get_mut(&MEMBER_GROUP) {
+            member.position = position + 1;
+        }
         self.broadcast(Event::GroupCreated(group.clone()), |_| true);
+        self.broadcast_order();
         Ok(Response::Group { group })
     }
 
     pub(super) fn group_update(&mut self, session: SessionId, u: GroupUpdate) -> Reply {
-        self.require(session, Permission::GroupManage)?;
+        self.require(session, Permission::ManageRoles)?;
         let Some(mut group) = self.groups.get(&u.group).cloned() else {
             return Err(err(ErrorCode::NotFound, "no such group"));
         };
-        if !self.covers(session, &group.permissions.iter().copied().collect()) {
-            return Err(err(ErrorCode::Forbidden, "this group has permissions you do not have"));
+        if !self.below(session, group.id) {
+            return Err(err(ErrorCode::Forbidden, "this role is not below your rank"));
         }
         if let Some(name) = &u.name {
             group.name = clean(name, MAX_GROUP_NAME, "group name")?;
@@ -119,8 +201,10 @@ impl Core {
                 return Err(err(ErrorCode::BadRequest, "the Admin group always has every permission"));
             }
             let permissions: BTreeSet<_> = permissions.into_iter().collect();
-            if !self.covers(session, &permissions) {
-                return Err(err(ErrorCode::Forbidden, "cannot grant permissions you do not have"));
+            let before: BTreeSet<_> = group.permissions.iter().copied().collect();
+            // Adding or taking away a permission needs it.
+            if !self.covers(session, &permissions.symmetric_difference(&before).copied().collect()) {
+                return Err(err(ErrorCode::Forbidden, "cannot change permissions you do not have"));
             }
             group.permissions = permissions.into_iter().collect();
         }
@@ -130,6 +214,12 @@ impl Core {
             Some(c) => group.color = Some(c.to_owned()),
             None => {}
         }
+        if let Some(hoist) = u.hoist {
+            group.hoist = hoist;
+        }
+        if let Some(mentionable) = u.mentionable {
+            group.mentionable = mentionable;
+        }
         self.store.update_group(&group).map_err(storage_error)?;
         self.groups.insert(group.id, group.clone());
         self.broadcast(Event::GroupUpdated(group.clone()), |_| true);
@@ -137,22 +227,21 @@ impl Core {
     }
 
     pub(super) fn group_delete(&mut self, session: SessionId, id: GroupId) -> Reply {
-        self.require(session, Permission::GroupManage)?;
+        self.require(session, Permission::ManageRoles)?;
         let Some(group) = self.groups.get(&id) else {
             return Err(err(ErrorCode::NotFound, "no such group"));
         };
         if id == ADMIN_GROUP || id == MEMBER_GROUP {
             return Err(err(ErrorCode::BadRequest, "the built-in groups cannot be deleted"));
         }
-        if !self.covers(session, &group.permissions.iter().copied().collect()) {
-            return Err(err(ErrorCode::Forbidden, "this group has permissions you do not have"));
-        }
-        // Deleting a role takes it away from everyone, so it follows the rule for taking it away.
-        if !Self::may_delegate(&self.sessions[&session].groups, &[id]) {
-            return Err(err(ErrorCode::Forbidden, "you can only give out or take away roles you hold"));
+        let _ = group;
+        if !self.below(session, id) {
+            return Err(err(ErrorCode::Forbidden, "this role is not below your rank"));
         }
         self.store.delete_group(id).map_err(storage_error)?;
         self.groups.remove(&id);
+        self.renumber_groups();
+        self.broadcast_order();
         let before = self.admissions();
         let affected: Vec<_> = self.sessions.values().filter(|s| s.groups.contains(&id)).map(|s| s.id).collect();
         for s in affected {
@@ -184,7 +273,7 @@ impl Core {
     }
 
     pub(super) fn member_groups(&mut self, session: SessionId, uid: Uid, groups: Vec<GroupId>) -> Reply {
-        self.require(session, Permission::GroupManage)?;
+        self.require(session, Permission::ManageRoles)?;
         let Some((user_id, mut member)) = self.store.user_by_uid(&uid).map_err(storage_error)? else {
             return Err(err(ErrorCode::NotFound, "no such member"));
         };
@@ -196,24 +285,23 @@ impl Core {
             wanted.push(MEMBER_GROUP);
         }
         let me = &self.sessions[&session];
-        if me.uid != uid && !self.covers(session, &self.group_permissions(&member.groups)) {
-            return Err(err(ErrorCode::Forbidden, "this member has permissions you do not have"));
+        if me.uid != uid && !self.outranks(session, &uid, &member.groups) {
+            return Err(err(ErrorCode::Forbidden, "this member is not below your rank"));
         }
-        // Every group added or removed must be within your own permissions.
+        // Every role added or taken away must be below one's rank (Member is everyone's).
         let changed: Vec<GroupId> = wanted
             .iter()
             .filter(|g| !member.groups.contains(g))
             .chain(member.groups.iter().filter(|g| !wanted.contains(g)))
             .copied()
+            .filter(|g| *g != MEMBER_GROUP)
             .collect();
-        if !self.covers(session, &self.group_permissions(&changed)) {
-            return Err(err(ErrorCode::Forbidden, "cannot grant or remove permissions you do not have"));
-        }
-        if !Self::may_delegate(&me.groups, &changed) {
-            return Err(err(ErrorCode::Forbidden, "you can only give out or take away roles you hold"));
-        }
         if me.uid == uid && member.groups.contains(&ADMIN_GROUP) && !wanted.contains(&ADMIN_GROUP) {
             return Err(err(ErrorCode::BadRequest, "you cannot remove your own Admin group"));
+        }
+        if let Some(role) = changed.iter().find(|g| !self.below(session, **g)) {
+            let name = self.groups.get(role).map_or("this role", |g| g.name.as_str());
+            return Err(err(ErrorCode::Forbidden, &format!("{name} is not below your rank")));
         }
         self.store.set_user_groups(user_id, &wanted).map_err(storage_error)?;
         member.groups = wanted.clone();
@@ -233,15 +321,15 @@ impl Core {
     // --------------------------------------------------------------- removal
 
     pub(super) fn member_remove(&mut self, session: SessionId, uid: Uid, delete_messages: bool) -> Reply {
-        self.require(session, Permission::MemberRemove)?;
+        self.require(session, Permission::ManageMembers)?;
         if self.sessions[&session].uid == uid {
             return Err(err(ErrorCode::BadRequest, "you cannot remove yourself"));
         }
         let Some((user_id, member)) = self.store.user_by_uid(&uid).map_err(storage_error)? else {
             return Err(err(ErrorCode::NotFound, "no such member"));
         };
-        if !self.covers(session, &self.group_permissions(&member.groups)) {
-            return Err(err(ErrorCode::Forbidden, "this member has permissions you do not have"));
+        if !self.outranks(session, &uid, &member.groups) {
+            return Err(err(ErrorCode::Forbidden, "this member is not below your rank"));
         }
         let by = self.sessions[&session].nickname.clone();
         self.erase_member(&by, user_id, &member, delete_messages)?;
@@ -250,10 +338,10 @@ impl Core {
 
     /// Removes members not seen for `inactive_days`, a batch per call. Online members, the
     /// caller and, with `without_groups_only`, anyone holding a role are always spared, as is
-    /// anyone holding permissions the caller lacks. Core work is bounded by [`PRUNE_BATCH`]:
+    /// anyone not ranked below the caller. Core work is bounded by [`PRUNE_BATCH`]:
     /// the caller repeats the request while `count` exceeds the uids returned.
     pub(super) fn member_prune(&mut self, session: SessionId, p: MemberPrune) -> Reply {
-        self.require(session, Permission::MemberRemove)?;
+        self.require(session, Permission::ManageMembers)?;
         if p.inactive_days == 0 || p.inactive_days > MAX_INACTIVE_DAYS {
             return Err(err(ErrorCode::BadRequest, "inactive days must be 1–3650"));
         }
@@ -268,7 +356,7 @@ impl Core {
             .into_iter()
             .filter(|m| m.member.uid != my_uid && !online.contains(m.member.uid.as_str()))
             .filter(|m| !(p.without_groups_only && m.has_roles()))
-            .filter(|m| self.covers(session, &self.group_permissions(&m.member.groups)))
+            .filter(|m| self.outranks(session, &m.member.uid, &m.member.groups))
             .collect();
         let count = doomed.len() as u32;
         if p.dry_run {
@@ -330,7 +418,7 @@ impl Core {
         let Some((group, creator)) = self.store.peek_invite(code, now)? else { return Ok(None) };
         // An invite from before ownership was recorded has nobody to vouch for it.
         let vouched = match &creator {
-            Some(creator) => self.could_grant(creator, Permission::InviteCreate, group)?,
+            Some(creator) => self.could_grant(creator, Permission::CreateInvites, group)?,
             None => false,
         };
         if !vouched {
@@ -354,7 +442,7 @@ impl Core {
     }
 
     pub(super) fn ban_create(&mut self, session: SessionId, b: BanCreate) -> Reply {
-        self.require(session, Permission::ClientBan)?;
+        self.require(session, Permission::BanMembers)?;
         let reason = b.reason.map(|r| r.trim().chars().take(MAX_REASON).collect::<String>()).filter(|r| !r.is_empty());
         if b.duration.is_some_and(|d| d == 0 || d > MAX_DURATION_SECS) {
             return Err(err(ErrorCode::BadRequest, "duration must be 1 second to 10 years"));
@@ -379,8 +467,8 @@ impl Core {
         if me.uid == uid {
             return Err(err(ErrorCode::BadRequest, "you cannot ban yourself"));
         }
-        if !self.covers(session, &self.group_permissions(&groups)) {
-            return Err(err(ErrorCode::Forbidden, "this member has permissions you do not have"));
+        if !self.outranks(session, &uid, &groups) {
+            return Err(err(ErrorCode::Forbidden, "this member is not below your rank"));
         }
         let now = now_ms();
         let mut ban = Ban {
@@ -411,12 +499,12 @@ impl Core {
     }
 
     pub(super) fn ban_list(&mut self, session: SessionId) -> Reply {
-        self.require(session, Permission::ClientBan)?;
+        self.require(session, Permission::BanMembers)?;
         Ok(Response::Bans { bans: self.store.bans(now_ms()).map_err(storage_error)? })
     }
 
     pub(super) fn ban_delete(&mut self, session: SessionId, id: BanId) -> Reply {
-        self.require(session, Permission::ClientBan)?;
+        self.require(session, Permission::BanMembers)?;
         let Some(ban) = self.store.delete_ban(id, now_ms()).map_err(storage_error)? else {
             return Err(err(ErrorCode::NotFound, "no such ban"));
         };
@@ -430,7 +518,7 @@ impl Core {
     // --------------------------------------------------------------- invites
 
     pub(super) fn invite_create(&mut self, session: SessionId, i: InviteCreate) -> Reply {
-        self.require(session, Permission::InviteCreate)?;
+        self.require(session, Permission::CreateInvites)?;
         if i.max_uses.is_some_and(|n| n == 0 || n > MAX_INVITE_USES) {
             return Err(err(ErrorCode::BadRequest, "max uses must be 1–10000"));
         }
@@ -441,11 +529,9 @@ impl Core {
             let Some(g) = self.groups.get(&group) else {
                 return Err(err(ErrorCode::NotFound, "no such group"));
             };
-            if !self.covers(session, &g.permissions.iter().copied().collect()) {
-                return Err(err(ErrorCode::Forbidden, "cannot grant permissions you do not have"));
-            }
-            if !Self::may_delegate(&self.sessions[&session].groups, &[group]) {
-                return Err(err(ErrorCode::Forbidden, "you can only give out roles you hold"));
+            let _ = g;
+            if !self.below(session, group) {
+                return Err(err(ErrorCode::Forbidden, "this role is not below your rank"));
             }
         }
         let now = now_ms();
@@ -465,16 +551,16 @@ impl Core {
     /// Everyone with `invite_create` sees the invites they made; managers see all.
     /// Ownership is the creator's identity, never their (changeable) nickname.
     pub(super) fn invite_list(&mut self, session: SessionId) -> Reply {
-        self.require(session, Permission::InviteCreate)?;
+        self.require(session, Permission::CreateInvites)?;
         let uid = self.sessions[&session].uid.clone();
-        let creator = (!self.has(session, Permission::ServerManage)).then_some(uid.as_str());
+        let creator = (!self.has(session, Permission::ManageServer)).then_some(uid.as_str());
         Ok(Response::Invites { invites: self.store.invites(creator).map_err(storage_error)? })
     }
 
     pub(super) fn invite_delete(&mut self, session: SessionId, code: &str) -> Reply {
-        self.require(session, Permission::InviteCreate)?;
+        self.require(session, Permission::CreateInvites)?;
         let uid = self.sessions[&session].uid.clone();
-        let creator = (!self.has(session, Permission::ServerManage)).then_some(uid.as_str());
+        let creator = (!self.has(session, Permission::ManageServer)).then_some(uid.as_str());
         if self.store.delete_invite(code, creator).map_err(storage_error)? {
             return Ok(Response::Empty {});
         }
@@ -488,7 +574,7 @@ impl Core {
 
     pub(super) fn server_update(&mut self, session: SessionId, id: u32, u: ServerUpdate) -> Option<Reply> {
         let checked = (|| {
-            self.require(session, Permission::ServerManage)?;
+            self.require(session, Permission::ManageServer)?;
             let name = u.name.as_deref().map(|n| clean(n, 64, "server name")).transpose()?;
             if u.welcome.as_ref().is_some_and(|w| w.chars().count() > 1000) {
                 return Err(err(ErrorCode::BadRequest, "welcome message too long"));

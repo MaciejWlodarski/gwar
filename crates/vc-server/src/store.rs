@@ -30,6 +30,8 @@ fn read_attestation(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<
 
 pub const ADMIN_GROUP: GroupId = 1;
 pub const MEMBER_GROUP: GroupId = 2;
+/// Member's stored position: after every other role.
+const MEMBER_POSITION: i64 = i64::MAX;
 
 #[derive(Debug, Clone)]
 pub struct ChannelRow {
@@ -374,6 +376,13 @@ const MIGRATIONS: &[&str] = &[
         hash TEXT NOT NULL
     );
     "#,
+    // Ordered roles (docs/roles.md): the order from the top, Member always last.
+    r#"
+    ALTER TABLE groups ADD COLUMN position INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE groups ADD COLUMN hoist INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE groups ADD COLUMN mentionable INTEGER NOT NULL DEFAULT 0;
+    UPDATE groups SET position = id;
+    "#,
 ];
 
 /// The stored genesis of the current owner generation.
@@ -445,16 +454,21 @@ impl Store {
     fn seed(&self) -> Result<()> {
         let has_groups: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM groups)", [], |r| r.get(0))?;
         if !has_groups {
-            let all = serde_json::to_string(&Permission::ALL)?;
-            self.db
-                .execute("INSERT INTO groups(id,name,permissions) VALUES(?1,'Admin',?2)", params![ADMIN_GROUP, all])?;
-            self.db
-                .execute("INSERT INTO groups(id,name,permissions) VALUES(?1,'Member','[]')", params![MEMBER_GROUP])?;
+            let all = serde_json::to_string(&[Permission::Administrator])?;
+            self.db.execute(
+                "INSERT INTO groups(id,name,permissions,position) VALUES(?1,'Admin',?2,0)",
+                params![ADMIN_GROUP, all],
+            )?;
+            self.db.execute(
+                "INSERT INTO groups(id,name,permissions,position) VALUES(?1,'Member','[]',?2)",
+                params![MEMBER_GROUP, MEMBER_POSITION],
+            )?;
         }
-        // Admin always holds every permission, including ones added in later versions.
+        self.upgrade_permission_names()?;
+        // Admin holds `administrator`, which is every permission, including ones added in later versions.
         self.db.execute(
             "UPDATE groups SET permissions=?2 WHERE id=?1",
-            params![ADMIN_GROUP, serde_json::to_string(&Permission::ALL)?],
+            params![ADMIN_GROUP, serde_json::to_string(&[Permission::Administrator])?],
         )?;
         if self.meta("member_defaults")?.is_none() {
             // Members may invite and upload unless an admin takes it away.
@@ -472,6 +486,32 @@ impl Store {
             }
             self.set_meta("member_defaults", "1")?;
         }
+        Ok(())
+    }
+
+    /// Rewrites permission names from before roles version 2 (docs/roles.md) in place; unknown ones go.
+    fn upgrade_permission_names(&self) -> Result<()> {
+        let rows: Vec<(GroupId, String)> = {
+            let mut stmt = self.db.prepare("SELECT id,permissions FROM groups")?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+        };
+        for (id, stored) in rows {
+            let names: Vec<String> = serde_json::from_str(&stored).unwrap_or_default();
+            let mut permissions: Vec<Permission> = names
+                .iter()
+                .filter_map(|n| {
+                    serde_json::from_value(serde_json::Value::String(n.clone())).ok().or_else(|| Permission::from_v1(n))
+                })
+                .collect();
+            permissions.sort_unstable();
+            permissions.dedup();
+            let upgraded = serde_json::to_string(&permissions)?;
+            if upgraded != stored {
+                self.db.execute("UPDATE groups SET permissions=?2 WHERE id=?1", params![id, upgraded])?;
+            }
+        }
+        // Member stays last whatever the stored positions say.
+        self.db.execute("UPDATE groups SET position=?2 WHERE id=?1", params![MEMBER_GROUP, MEMBER_POSITION])?;
         Ok(())
     }
 
@@ -648,31 +688,76 @@ impl Store {
         Ok(())
     }
 
+    /// Every role, from the top: Admin's position first, Member last; `position` is the index.
     pub fn groups(&self) -> Result<Vec<Group>> {
-        let mut stmt = self.db.prepare("SELECT id,name,permissions,color FROM groups ORDER BY id")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, GroupId>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get(3)?))
+        let mut stmt = self
+            .db
+            .prepare("SELECT id,name,permissions,color,hoist,mentionable FROM groups ORDER BY id=?1, position, id")?;
+        let rows = stmt.query_map([MEMBER_GROUP], |r| {
+            Ok((
+                r.get::<_, GroupId>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get(3)?,
+                r.get::<_, bool>(4)?,
+                r.get::<_, bool>(5)?,
+            ))
         })?;
-        rows.map(|row| {
-            let (id, name, permissions, color) = row?;
-            Ok(Group { id, name, permissions: serde_json::from_str(&permissions).unwrap_or_default(), color })
-        })
-        .collect()
+        rows.enumerate()
+            .map(|(index, row)| {
+                let (id, name, permissions, color, hoist, mentionable) = row?;
+                Ok(Group {
+                    id,
+                    name,
+                    permissions: serde_json::from_str(&permissions).unwrap_or_default(),
+                    color,
+                    position: index as u32,
+                    hoist,
+                    mentionable,
+                })
+            })
+            .collect()
     }
 
-    pub fn insert_group(&self, name: &str, permissions: &[Permission], color: Option<&str>) -> Result<GroupId> {
+    /// A new role goes last above Member.
+    pub fn insert_group(
+        &self,
+        name: &str,
+        permissions: &[Permission],
+        color: Option<&str>,
+        hoist: bool,
+        mentionable: bool,
+    ) -> Result<GroupId> {
         self.db.execute(
-            "INSERT INTO groups(name,permissions,color) VALUES(?1,?2,?3)",
-            params![name, serde_json::to_string(permissions)?, color],
+            "INSERT INTO groups(name,permissions,color,hoist,mentionable,position)
+             VALUES(?1,?2,?3,?4,?5,(SELECT COALESCE(MAX(position),0)+1 FROM groups WHERE id<>?6))",
+            params![name, serde_json::to_string(permissions)?, color, hoist, mentionable, MEMBER_GROUP],
         )?;
         Ok(self.db.last_insert_rowid() as GroupId)
     }
 
     pub fn update_group(&self, group: &Group) -> Result<()> {
         self.db.execute(
-            "UPDATE groups SET name=?2,permissions=?3,color=?4 WHERE id=?1",
-            params![group.id, group.name, serde_json::to_string(&group.permissions)?, group.color],
+            "UPDATE groups SET name=?2,permissions=?3,color=?4,hoist=?5,mentionable=?6 WHERE id=?1",
+            params![
+                group.id,
+                group.name,
+                serde_json::to_string(&group.permissions)?,
+                group.color,
+                group.hoist,
+                group.mentionable
+            ],
         )?;
+        Ok(())
+    }
+
+    /// Stores the order of every role but Member, from the top.
+    pub fn reorder_groups(&self, order: &[GroupId]) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        for (index, id) in order.iter().enumerate() {
+            tx.execute("UPDATE groups SET position=?2 WHERE id=?1", params![id, index as i64])?;
+        }
+        tx.commit()?;
         Ok(())
     }
 

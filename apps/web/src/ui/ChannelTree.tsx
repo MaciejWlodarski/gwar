@@ -95,10 +95,10 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
   const unread = useSession((s) => channelUnread(s, channel.id));
   const mentions = useSession((s) => channelMentions(s, channel.id));
   const isDefault = useSession((s) => s.server?.default_channel === channel.id);
-  const canMove = usePermission("client_move");
-  const canCreate = usePermission("channel_create");
-  const canEdit = usePermission("channel_edit");
-  const canDelete = usePermission("channel_delete");
+  const canMove = usePermission("move_members");
+  const canCreate = usePermission("manage_channels");
+  const canEdit = usePermission("manage_channels");
+  const canDelete = usePermission("manage_channels");
   const joining = useUi((s) => s.joining === channel.id);
   const toggleCollapsed = useUi((s) => s.toggleCollapsed);
   const openDialog = useUi((s) => s.openDialog);
@@ -261,7 +261,7 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
   const client = { ...sessionClient, nickname: member?.nickname ?? sessionClient.nickname };
   const isMe = useSession((s) => s.me?.uid === client.uid);
   const myChannel = useSession(myChannelId);
-  const canMove = usePermission("client_move");
+  const canMove = usePermission("move_members");
   const color = useGroupsColor(client.groups);
   const openDm = () => {
     if (isMe) return;

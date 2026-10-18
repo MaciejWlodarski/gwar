@@ -98,12 +98,12 @@ describe("creating a channel", () => {
     expect(members).toEqual(["me-uid"]);
     mock.ownerView = null;
   });
-  it("offers only roles I hold and no TeamSpeak users in the access picker", async () => {
-    const role = (id: number, name: string) => ({ id, name, permissions: [], color: null });
+  it("offers only roles I hold or rank above, and no TeamSpeak users, in the access picker", async () => {
+    const role = (id: number, name: string, position: number) => ({ id, name, permissions: [], color: null, position, hoist: false, mentionable: false });
     useSession.setState({
       me: { session: 1, uid: "me-uid" } as never,
       clients: { 1: { id: 1, uid: "me-uid", groups: [2, 5] } as never },
-      groups: { 1: role(1, "Admin"), 2: role(2, "Member"), 5: role(5, "Crew"), 6: role(6, "Elsewhere") },
+      groups: { 1: role(1, "Admin", 0), 2: role(2, "Member", 3), 5: role(5, "Crew", 2), 6: role(6, "Elsewhere", 1) },
       members: { "ts:abc": { uid: "ts:abc", nickname: "Bridged", groups: [] } as never, alice: { uid: "alice", nickname: "Alice", groups: [] } as never },
     });
     await open();
