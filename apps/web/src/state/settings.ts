@@ -1,4 +1,5 @@
 import { validNickname } from "../net/nickname";
+import { serverKey } from "../lib/server-key";
 import { useMemo } from "react";
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
@@ -80,6 +81,41 @@ function removal(removed: Bookmark | undefined, account: string | null): Bookmar
   const at = nextChange(removed?.updatedAt);
   const owner = removed?.account ?? account ?? undefined;
   return owner === undefined ? { at } : { at, account: owner };
+}
+
+/** Whether two bookmarks can both be shown at once: the same account's, or one of them saved without an account. */
+function shownTogether(a: Bookmark, b: Bookmark): boolean {
+  return a.account === undefined || b.account === undefined || a.account === b.account;
+}
+
+/**
+ * One bookmark per server: of bookmarks for the same server that are shown together, one stays (the
+ * `preferred` one, else the first) and takes a password or identity only another one has; the others are
+ * removed like a removal by hand, so syncing removes them on the account's other devices too.
+ */
+export function dedupeBookmarks(
+  bookmarks: Bookmark[],
+  removed: Record<string, BookmarkRemoval>,
+  account: string | null,
+  preferred?: string,
+): { bookmarks: Bookmark[]; removed: Record<string, BookmarkRemoval>; changed: boolean } {
+  const order = [...bookmarks.filter((b) => b.id === preferred), ...bookmarks.filter((b) => b.id !== preferred)];
+  const kept: Array<{ bookmark: Bookmark; key: string }> = [];
+  const dropped: Record<string, BookmarkRemoval> = {};
+  for (const b of order) {
+    const key = serverKey(b);
+    const first = kept.find((k) => k.key === key && shownTogether(k.bookmark, b));
+    if (!first) {
+      kept.push({ bookmark: b, key });
+      continue;
+    }
+    if (!first.bookmark.password && b.password) first.bookmark = { ...first.bookmark, password: b.password };
+    if (!first.bookmark.identity && b.identity) first.bookmark = { ...first.bookmark, identity: b.identity };
+    dropped[b.id] = removal(b, account);
+  }
+  if (Object.keys(dropped).length === 0) return { bookmarks, removed, changed: false };
+  const stays = new Map(kept.map((k) => [k.bookmark.id, k.bookmark]));
+  return { bookmarks: bookmarks.flatMap((b) => stays.get(b.id) ?? []), removed: { ...removed, ...dropped }, changed: true };
 }
 
 function pruneRemoved(removed: Record<string, BookmarkRemoval>, now: number): Record<string, BookmarkRemoval> {
@@ -224,8 +260,12 @@ export const useSettings = create<SettingsState>()(
           else userVolumes[uid] = volume;
           return { userVolumes };
         }),
-      saveBookmark: (bookmark) =>
+      saveBookmark: (input) =>
         set((s) => {
+          // Saving a server that is already saved updates that bookmark, in its place.
+          const key = serverKey(input);
+          const twin = s.bookmarks.find((b) => b.id !== input.id && inAccount(b, s.bookmarkAccount) && serverKey(b) === key);
+          const bookmark = twin && !s.bookmarks.some((b) => b.id === input.id) ? { ...input, id: twin.id } : input;
           const existing = s.bookmarks.find((b) => b.id === bookmark.id);
           const changed = !existing || syncedChange(existing, bookmark);
           const account = existing?.account ?? s.bookmarkAccount ?? undefined;
@@ -233,10 +273,17 @@ export const useSettings = create<SettingsState>()(
           if (saved.updatedAt === undefined) delete saved.updatedAt;
           if (saved.account === undefined) delete saved.account;
           const { [bookmark.id]: _revived, ...removedBookmarks } = s.removedBookmarks;
-          return {
-            bookmarks: existing ? s.bookmarks.map((b) => (b.id === bookmark.id ? saved : b)) : [...s.bookmarks, saved],
+          // An edit that now names another saved server replaces that one.
+          const deduped = dedupeBookmarks(
+            existing ? s.bookmarks.map((b) => (b.id === bookmark.id ? saved : b)) : [...s.bookmarks, saved],
             removedBookmarks,
-            bookmarkEdits: s.bookmarkEdits + (changed ? 1 : 0),
+            s.bookmarkAccount,
+            bookmark.id,
+          );
+          return {
+            bookmarks: deduped.bookmarks,
+            removedBookmarks: deduped.removed,
+            bookmarkEdits: s.bookmarkEdits + (changed || deduped.changed ? 1 : 0),
           };
         }),
       removeBookmark: (id) =>
@@ -248,7 +295,12 @@ export const useSettings = create<SettingsState>()(
             bookmarkEdits: s.bookmarkEdits + 1,
           };
         }),
-      replaceBookmarks: (bookmarks) => set((s) => ({ bookmarks, removedBookmarks: pruneRemoved(s.removedBookmarks, Date.now()) })),
+      replaceBookmarks: (list) =>
+        set((s) => {
+          // Two devices may have saved the same server under different ids: the vault then has both.
+          const deduped = dedupeBookmarks(list, pruneRemoved(s.removedBookmarks, Date.now()), s.bookmarkAccount);
+          return { bookmarks: deduped.bookmarks, removedBookmarks: deduped.removed, bookmarkEdits: s.bookmarkEdits + (deduped.changed ? 1 : 0) };
+        }),
       setBookmarkAccount: (bookmarkAccount) => set({ bookmarkAccount }),
       dropAccountBookmarks: (account) =>
         set((s) => ({
@@ -271,8 +323,11 @@ export const useSettings = create<SettingsState>()(
         const p = (persisted ?? {}) as Partial<SettingsState>;
         const legacy = p.bookmarks as Array<Bookmark & { nickname?: string }> | undefined;
         const lastNickname = validNickname(p.lastNickname) ?? legacy?.map((b) => validNickname(b.nickname)).find(Boolean) ?? "";
-        const bookmarks = legacy?.map(({ nickname: _nickname, ...bookmark }) => bookmark) ?? current.bookmarks;
-        return { ...current, ...p, lastNickname, bookmarks, audio: { ...current.audio, ...(p.audio ?? {}) }, desktop: { ...current.desktop, ...(p.desktop ?? {}) },
+        const loaded = legacy?.map(({ nickname: _nickname, ...bookmark }) => bookmark) ?? current.bookmarks;
+        // Lists saved before servers were matched by address can hold one server twice.
+        const deduped = dedupeBookmarks(loaded, p.removedBookmarks ?? current.removedBookmarks, p.bookmarkAccount ?? current.bookmarkAccount);
+        return { ...current, ...p, lastNickname, bookmarks: deduped.bookmarks, removedBookmarks: deduped.removed,
+          bookmarkEdits: (p.bookmarkEdits ?? current.bookmarkEdits) + (deduped.changed ? 1 : 0), audio: { ...current.audio, ...(p.audio ?? {}) }, desktop: { ...current.desktop, ...(p.desktop ?? {}) },
           notifications: { ...current.notifications, ...(p.notifications ?? {}) },
           channelEncryption: typeof p.channelEncryption === "object" && p.channelEncryption !== null ? p.channelEncryption : {},
           archiveUploads: typeof p.archiveUploads === "boolean" ? p.archiveUploads : current.archiveUploads,

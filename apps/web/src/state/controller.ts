@@ -58,6 +58,7 @@ import { microphoneSsrc } from "../voice/sdp";
 import { VoiceError, type VoiceEngine } from "../voice/engine";
 import { channelThreadKey, latestMessageId, myChannelId, storedKey } from "./reducer";
 import { inAccount, newId, useSettings, type ServerKind } from "./settings";
+import { sameServer } from "../lib/server-key";
 import { useConnectUi, useOutbox, useSession, useUi, useVoice, type FailedSend } from "./stores";
 import type { ThreadKey } from "./types";
 
@@ -497,9 +498,7 @@ class Controller {
     const name = useSession.getState().server?.name || params.address;
     const existing = settings.bookmarks.find(
       (b) =>
-        inAccount(b, settings.bookmarkAccount) &&
-        b.address.trim().toLowerCase() === params.address.trim().toLowerCase() &&
-        (b.kind ?? "vc") === kind,
+        inAccount(b, settings.bookmarkAccount) && sameServer(b, { kind, address: params.address, insecureLan: params.insecureLan }),
     );
     // A TeamSpeak server remembers which identity was used to get in.
     const identity = kind === "teamspeak" && params.identity ? { identity: params.identity } : {};
