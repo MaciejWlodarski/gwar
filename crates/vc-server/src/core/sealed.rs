@@ -46,6 +46,28 @@ impl Core {
         Ok(())
     }
 
+    /// Writing a new message in a channel or server chat (direct messages are always open).
+    fn may_write(&self, session: SessionId, conversation: &str, files: bool) -> Result<(), ErrorBody> {
+        if dm_participants(conversation).is_some() {
+            return Ok(());
+        }
+        match super::mls::channel_id(conversation) {
+            Some(channel) => {
+                self.require_in(session, channel, Permission::SendMessages)?;
+                if files {
+                    self.require_in(session, channel, Permission::AttachFiles)?;
+                }
+            }
+            None => {
+                self.require(session, Permission::SendMessages)?;
+                if files {
+                    self.require(session, Permission::AttachFiles)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn sealed_request(&mut self, session: SessionId, request: SealedRequest) -> Reply {
         let (conversation, group, epoch, message_id, ciphertext, change, files) = match request {
             SealedRequest::History { conversation, before, limit } => {
@@ -68,6 +90,10 @@ impl Core {
             }
         };
         self.sealed_access(session, &conversation, true)?;
+        // New messages need the right to write there (edits and own deletions do not).
+        if change.is_none() {
+            self.may_write(session, &conversation, !files.is_empty())?;
+        }
         let live = self.store.mls_live_group(&conversation).map_err(storage_error)?;
         if !live.as_ref().is_some_and(|live| live.group == group && live.epoch == epoch) {
             return Err(err(ErrorCode::Stale, "catch up with the conversation's live MLS group and epoch"));
@@ -155,7 +181,10 @@ impl Core {
             return Err(err(ErrorCode::BadRequest, "direct messages are removed by their authors"));
         }
         self.sealed_access(session, conversation, false)?;
-        self.require(session, Permission::ManageMessages)?;
+        match super::mls::channel_id(conversation) {
+            Some(channel) => self.require_in(session, channel, Permission::ManageMessages)?,
+            None => self.require(session, Permission::ManageMessages)?,
+        }
         if !self.store.sealed_remove(conversation, id).map_err(storage_error)? {
             return Err(err(ErrorCode::NotFound, "no such sealed message"));
         }

@@ -17,14 +17,18 @@ export const ALL_PERMISSIONS: Permission[] = [
   "manage_messages",
   "move_members",
   "manage_channels",
+  "connect",
+  "speak",
+  "send_messages",
 ];
 
 /** Permissions as the role editor presents them: thematic sections, each with plain-word labels (see i18n `perm.*`). */
-export const PERMISSION_SECTIONS: Array<{ id: "server" | "channels" | "people" | "chat"; permissions: Permission[] }> = [
+export const PERMISSION_SECTIONS: Array<{ id: "server" | "channels" | "voice" | "people" | "chat"; permissions: Permission[] }> = [
   { id: "server", permissions: ["administrator", "manage_server", "manage_roles"] },
   { id: "channels", permissions: ["manage_channels", "bypass_password"] },
+  { id: "voice", permissions: ["connect", "speak"] },
   { id: "people", permissions: ["move_members", "kick_members", "ban_members", "manage_members", "create_invites"] },
-  { id: "chat", permissions: ["manage_messages", "attach_files"] },
+  { id: "chat", permissions: ["send_messages", "attach_files", "manage_messages"] },
 ];
 
 /** Someone as the rank rules see them: their roles, and whether they are the server's owner. */

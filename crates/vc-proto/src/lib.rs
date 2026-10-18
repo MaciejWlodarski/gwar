@@ -98,6 +98,9 @@ wire! {
         ChannelCreate(ChannelCreate),
         #[serde(rename = "channel.update")]
         ChannelUpdate(ChannelUpdate),
+        /// Sets one role's or member's override in a channel; empty `allow` and `deny` remove it.
+        #[serde(rename = "channel.override")]
+        ChannelOverrideSet { channel: ChannelId, #[serde(rename = "override")] entry: ChannelOverride },
         #[serde(rename = "channel.delete")]
         ChannelDelete { channel: ChannelId },
         #[serde(rename = "chat.send")]
@@ -303,6 +306,9 @@ wire! {
         /// Who a private channel admits; defaults to the creator.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub access: Option<ChannelAccess>,
+        /// Use the parent's overrides; defaults to true for a subchannel.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub synced: Option<bool>,
     }
 
     /// Who a private channel admits besides admins: members of these roles and these users.
@@ -310,6 +316,20 @@ wire! {
     pub struct ChannelAccess {
         pub roles: Vec<GroupId>,
         pub users: Vec<Uid>,
+    }
+
+    /// A channel's override for one role or one member (docs/roles.md, "Overrides"): permissions
+    /// it allows and denies there; everything else is inherited.
+    #[derive(Default, Eq)]
+    pub struct ChannelOverride {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub role: Option<GroupId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub user: Option<Uid>,
+        #[serde(default)]
+        pub allow: Vec<Permission>,
+        #[serde(default)]
+        pub deny: Vec<Permission>,
     }
 
     /// Absent fields stay unchanged. `password: ""` removes the password,
@@ -336,6 +356,9 @@ wire! {
         /// Replaces a private channel's access (needs `manage_channels`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub access: Option<ChannelAccess>,
+        /// Use the parent's overrides (true) or the channel's own (false).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub synced: Option<bool>,
     }
 
     /// Absent fields stay unchanged; `password: ""` removes the server password.
@@ -761,6 +784,12 @@ wire! {
         /// A private channel's access, sent only to sessions it admits.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub access: Option<ChannelAccess>,
+        /// This channel's own overrides (used when not `synced`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub overrides: Vec<ChannelOverride>,
+        /// A subchannel that uses its parent's overrides.
+        #[serde(default)]
+        pub synced: bool,
     }
 
     pub struct Client {
@@ -885,6 +914,12 @@ wire! {
         MoveMembers,
         /// Create, edit, move and delete channels.
         ManageChannels,
+        /// Join a channel's voice.
+        Connect,
+        /// Be heard in a channel's voice.
+        Speak,
+        /// Write in a channel's chat.
+        SendMessages,
     }
 
     #[derive(Default)]
@@ -958,7 +993,7 @@ wire! {
 }
 
 impl Permission {
-    pub const ALL: [Permission; 12] = [
+    pub const ALL: [Permission; 15] = [
         Permission::Administrator,
         Permission::ManageServer,
         Permission::ManageRoles,
@@ -971,10 +1006,35 @@ impl Permission {
         Permission::ManageMessages,
         Permission::MoveMembers,
         Permission::ManageChannels,
+        Permission::Connect,
+        Permission::Speak,
+        Permission::SendMessages,
     ];
 
     /// What every new member may do.
-    pub const MEMBER_DEFAULT: [Permission; 2] = [Permission::CreateInvites, Permission::AttachFiles];
+    pub const MEMBER_DEFAULT: [Permission; 5] = [
+        Permission::CreateInvites,
+        Permission::AttachFiles,
+        Permission::Connect,
+        Permission::Speak,
+        Permission::SendMessages,
+    ];
+
+    /// The permissions a channel can override (docs/roles.md, "Overrides").
+    pub const CHANNEL: [Permission; 8] = [
+        Permission::Connect,
+        Permission::Speak,
+        Permission::SendMessages,
+        Permission::AttachFiles,
+        Permission::ManageMessages,
+        Permission::MoveMembers,
+        Permission::BypassPassword,
+        Permission::ManageChannels,
+    ];
+
+    pub fn is_channel(self) -> bool {
+        Self::CHANNEL.contains(&self)
+    }
 
     /// The permission a name from before roles version 2 became (docs/roles.md), for stored roles.
     pub fn from_v1(name: &str) -> Option<Permission> {

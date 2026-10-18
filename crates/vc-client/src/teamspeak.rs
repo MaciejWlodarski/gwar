@@ -312,6 +312,8 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>, previous: &View)
                     history: false,
                     private: false,
                     access: None,
+                    overrides: Vec::new(),
+                    synced: false,
                 },
             );
             previous = c.id.0;
@@ -580,6 +582,7 @@ fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Option<Out
         | Request::GroupUpdate(_)
         | Request::GroupDelete { .. }
         | Request::GroupReorder { .. }
+        | Request::ChannelOverrideSet { .. }
         | Request::MemberNickname { .. }
         | Request::MemberGroups { .. }
         | Request::MemberRemove { .. }

@@ -64,8 +64,15 @@ impl Core {
         self.permissions(&self.sessions[&session])
     }
 
+    /// What these roles allow, Member's included: Member is everyone's role, even someone's
+    /// without a member record yet (a TeamSpeak user seen for the first time).
     pub(super) fn group_permissions(&self, groups: &[GroupId]) -> BTreeSet<Permission> {
-        groups.iter().filter_map(|g| self.groups.get(g)).flat_map(|g| g.permissions.iter().copied()).collect()
+        groups
+            .iter()
+            .chain(std::iter::once(&MEMBER_GROUP))
+            .filter_map(|g| self.groups.get(g))
+            .flat_map(|g| g.permissions.iter().copied())
+            .collect()
     }
 
     /// Whether the member `uid`, online or not, could now make an invite or token
@@ -230,6 +237,7 @@ impl Core {
         self.groups.insert(group.id, group.clone());
         self.broadcast(Event::GroupUpdated(group.clone()), |_| true);
         self.reconcile_admissions(before);
+        self.enforce_connect_everywhere();
         Ok(Response::Group { group })
     }
 
@@ -248,6 +256,7 @@ impl Core {
         let before = self.admissions();
         self.store.delete_group(id).map_err(storage_error)?;
         self.groups.remove(&id);
+        self.forget_role_overrides(id);
         self.renumber_groups();
         self.broadcast_order();
         let affected: Vec<_> = self.sessions.values().filter(|s| s.groups.contains(&id)).map(|s| s.id).collect();
@@ -276,6 +285,7 @@ impl Core {
         }
         self.broadcast(Event::GroupDeleted { group: id }, |_| true);
         self.reconcile_admissions(before);
+        self.enforce_connect_everywhere();
         Ok(Response::Empty {})
     }
 
@@ -322,6 +332,7 @@ impl Core {
         }
         self.broadcast(Event::MemberUpdated(member), |_| true);
         self.reconcile_admissions(before);
+        self.enforce_connect_everywhere();
         Ok(Response::Groups { groups: wanted })
     }
 
