@@ -49,6 +49,10 @@ impl Core {
     /// Writing a new message in a channel or server chat (direct messages are always open).
     fn may_write(&self, session: SessionId, conversation: &str, files: bool) -> Result<(), ErrorBody> {
         if dm_participants(conversation).is_some() {
+            // Direct messages are always open; files there follow the role's permission.
+            if files {
+                self.require(session, Permission::AttachFiles)?;
+            }
             return Ok(());
         }
         match super::mls::channel_id(conversation) {

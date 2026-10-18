@@ -120,46 +120,31 @@ impl Core {
         if entry.allow.iter().any(|p| entry.deny.contains(p)) {
             return Err(err(ErrorCode::BadRequest, "a permission is either allowed or denied"));
         }
-        match (&entry.role, &entry.user) {
-            (Some(role), None) => {
-                if !self.groups.contains_key(role) {
-                    return Err(err(ErrorCode::NotFound, "no such role"));
-                }
-                if !self.below(session, *role) {
-                    return Err(err(ErrorCode::Forbidden, "this role is not below your rank"));
-                }
-            }
-            (None, Some(uid)) => {
-                let Some((_, member)) = self.store.user_by_uid(uid).map_err(storage_error)? else {
-                    return Err(err(ErrorCode::NotFound, "no such member"));
-                };
-                if !self.outranks(session, uid, &member.groups) {
-                    return Err(err(ErrorCode::Forbidden, "this member is not below your rank"));
-                }
-            }
-            _ => return Err(err(ErrorCode::BadRequest, "name a role or a member")),
+        if entry.role.is_some() == entry.user.is_some() {
+            return Err(err(ErrorCode::BadRequest, "name a role or a member"));
         }
-        let mut row = self.channels[&channel].clone();
+        if entry.role.is_some_and(|r| !self.groups.contains_key(&r)) {
+            return Err(err(ErrorCode::NotFound, "no such role"));
+        }
+        // A new or changed override names a member; lifting one may name someone who left.
+        let lifting = entry.allow.is_empty() && entry.deny.is_empty();
+        if let Some(uid) = entry.user.as_deref().filter(|_| !lifting)
+            && self.store.user_by_uid(uid).map_err(storage_error)?.is_none()
+        {
+            return Err(err(ErrorCode::NotFound, "no such member"));
+        }
+        let Some(mut row) = self.channels.get(&channel).cloned() else {
+            return Err(err(ErrorCode::NotFound, "no such channel"));
+        };
         // Editing a synced channel starts it off with its parent's overrides.
         if row.synced {
             row.overrides = self.effective_overrides(channel).to_vec();
             row.synced = false;
         }
         let same = |o: &ChannelOverride| o.role == entry.role && o.user == entry.user;
-        let before = row.overrides.iter().find(|o| same(o)).cloned().unwrap_or_default();
-        // Allowing or denying a permission, or lifting either, needs it here.
-        let mine = {
-            let s = &self.sessions[&session];
-            self.channel_permissions(&s.uid, &s.groups, channel)
-        };
-        let changed = |a: &[Permission], b: &[Permission]| {
-            a.iter().filter(|p| !b.contains(p)).chain(b.iter().filter(|p| !a.contains(p))).copied().collect::<Vec<_>>()
-        };
-        let touched: Vec<_> =
-            changed(&entry.allow, &before.allow).into_iter().chain(changed(&entry.deny, &before.deny)).collect();
-        if touched.iter().any(|p| !mine.contains(p)) {
-            return Err(err(ErrorCode::Forbidden, "you cannot change a permission you do not have here"));
-        }
+        let before = row.overrides.iter().find(|o| same(o)).cloned();
+        let mine = self.mine_in(session, channel);
+        self.may_change_entry(session, &mine, before.as_ref(), Some(&entry))?;
         row.overrides.retain(|o| !same(o));
         if !entry.allow.is_empty() || !entry.deny.is_empty() {
             if row.overrides.len() >= MAX_OVERRIDES {
@@ -173,6 +158,68 @@ impl Core {
         self.broadcast_channel(Event::ChannelUpdated(view.clone()));
         self.enforce_connect(channel);
         Ok(Response::Channel(view))
+    }
+
+    /// What `session` may do in `channel` now.
+    fn mine_in(&self, session: SessionId, channel: ChannelId) -> BTreeSet<Permission> {
+        let s = &self.sessions[&session];
+        self.channel_permissions(&s.uid, &s.groups, channel)
+    }
+
+    /// Whether `session` may turn one target's override from `before` into `after` (either may be
+    /// absent): the target must be a role below their rank or a member ranked below them, and
+    /// every permission allowed, denied or lifted must be one they hold there (`mine`).
+    fn may_change_entry(
+        &self,
+        session: SessionId,
+        mine: &BTreeSet<Permission>,
+        before: Option<&ChannelOverride>,
+        after: Option<&ChannelOverride>,
+    ) -> Result<(), ErrorBody> {
+        let Some(target) = after.or(before) else { return Ok(()) };
+        let empty = ChannelOverride::default();
+        let (b, a) = (before.unwrap_or(&empty), after.unwrap_or(&empty));
+        if b.allow == a.allow && b.deny == a.deny {
+            return Ok(());
+        }
+        if let Some(role) = target.role {
+            if !self.below(session, role) {
+                return Err(err(ErrorCode::Forbidden, "this role is not below your rank"));
+            }
+        } else if let Some(uid) = &target.user {
+            // Someone no longer a member ranks as Member: their override can still be lifted.
+            let groups = self.store.user_by_uid(uid).map_err(storage_error)?.map(|(_, m)| m.groups).unwrap_or_default();
+            if !self.outranks(session, uid, &groups) {
+                return Err(err(ErrorCode::Forbidden, "this member is not below your rank"));
+            }
+        }
+        let changed = |x: &[Permission], y: &[Permission]| {
+            x.iter().filter(|p| !y.contains(p)).chain(y.iter().filter(|p| !x.contains(p))).copied().collect::<Vec<_>>()
+        };
+        let touched = changed(&a.allow, &b.allow).into_iter().chain(changed(&a.deny, &b.deny));
+        if touched.into_iter().any(|p| !mine.contains(&p)) {
+            return Err(err(ErrorCode::Forbidden, "you cannot change a permission you do not have here"));
+        }
+        Ok(())
+    }
+
+    /// Whether `session` may replace `channel`'s effective overrides `old` with `new` (syncing it,
+    /// or moving a synced channel): every entry that changes follows the rules of `channel.override`.
+    pub(super) fn may_replace_overrides(
+        &self,
+        session: SessionId,
+        channel: ChannelId,
+        old: &[ChannelOverride],
+        new: &[ChannelOverride],
+    ) -> Result<(), ErrorBody> {
+        let mine = self.mine_in(session, channel);
+        let same = |x: &ChannelOverride, y: &ChannelOverride| x.role == y.role && x.user == y.user;
+        for o in old.iter().chain(new) {
+            let before = old.iter().find(|x| same(x, o));
+            let after = new.iter().find(|x| same(x, o));
+            self.may_change_entry(session, &mine, before, after)?;
+        }
+        Ok(())
     }
 
     /// Takes out of voice, in `channel` and every channel under it, whoever may no longer join

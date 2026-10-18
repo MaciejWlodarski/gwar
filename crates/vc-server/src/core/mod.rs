@@ -1086,6 +1086,7 @@ impl Core {
                 self.client_updated(other);
             }
             self.reconcile_admissions(before);
+            self.enforce_connect_everywhere();
         }
         self.sessions.insert(id, session);
         let welcome = Welcome {
@@ -1588,6 +1589,19 @@ impl Core {
         if !self.admitted(Some(target), channel) {
             return Err(err(ErrorCode::BadRequest, "this client cannot see that channel"));
         }
+        if client == session {
+            // Moving oneself is joining: the channel's password and joining rule apply.
+            let locked = self.channels[&channel].password_hash.is_some()
+                && !self.sessions[&session].unlocked.contains(&channel)
+                && !self.can_in(session, channel, Permission::BypassPassword);
+            if locked {
+                return Err(err(ErrorCode::WrongPassword, "this channel has a password"));
+            }
+            return self.enter_channel(session, channel);
+        }
+        if !self.channel_permissions(&target.uid, &target.groups, channel).contains(&Permission::Connect) {
+            return Err(err(ErrorCode::BadRequest, "this member may not join that channel"));
+        }
         self.move_client(client, Some(channel))?;
         Ok(Response::Empty {})
     }
@@ -1885,7 +1899,11 @@ impl Core {
             history: encrypted && c.history.unwrap_or(true),
             private: c.private,
             access,
-            overrides: Vec::new(),
+            // An unsynced subchannel starts with a copy of what applies in its parent.
+            overrides: match c.parent {
+                Some(parent) if c.synced == Some(false) => self.effective_overrides(parent).to_vec(),
+                _ => Vec::new(),
+            },
             synced: c.synced.unwrap_or(c.parent.is_some()) && c.parent.is_some(),
         };
         Ok((row, password))
@@ -2008,20 +2026,36 @@ impl Core {
         if row.parent.is_none() && current.parent.is_some() {
             self.require(session, Permission::ManageChannels)?;
         }
+        let before = self.effective_overrides(row.id).to_vec();
         match u.synced {
             Some(true) if row.parent.is_none() => {
                 return Err(err(ErrorCode::BadRequest, "only a subchannel follows its parent"));
             }
-            Some(true) => row.synced = true,
+            // Following the parent drops the channel's own overrides.
+            Some(true) => {
+                row.synced = true;
+                row.overrides.clear();
+            }
             // Breaking the sync keeps the parent's overrides as the channel's own.
             Some(false) if row.synced => {
-                row.overrides = self.effective_overrides(row.id).to_vec();
+                row.overrides = before.clone();
                 row.synced = false;
             }
             _ => {}
         }
-        if row.parent.is_none() {
+        if row.parent.is_none() && row.synced {
+            // At the top it can follow nothing: what applied stays, as its own.
+            row.overrides = before.clone();
             row.synced = false;
+        }
+        // Syncing, or moving a synced channel under another parent, changes what applies there:
+        // every entry that changes needs what `channel.override` needs.
+        let after = match row.parent.filter(|_| row.synced) {
+            Some(parent) => self.effective_overrides(parent).to_vec(),
+            None => row.overrides.clone(),
+        };
+        if after != before {
+            self.may_replace_overrides(session, row.id, &before, &after)?;
         }
         if let Some(access) = &u.access {
             if !row.private {
@@ -2108,6 +2142,10 @@ impl Core {
             return Err(err(ErrorCode::BadRequest, "the default channel cannot be deleted"));
         }
         let mut doomed: Vec<_> = self.channels.keys().copied().filter(|&c| self.is_descendant(c, channel)).collect();
+        // Every channel that goes with it must be one this session may delete.
+        if doomed.iter().any(|&c| !self.can_in(session, c, Permission::ManageChannels)) {
+            return Err(err(ErrorCode::Forbidden, "it holds channels you may not delete"));
+        }
         // Deepest first, so clients never see an orphaned child.
         doomed.sort_by_key(|&c| std::cmp::Reverse(self.depth(c)));
         self.store.delete_channel(channel).map_err(storage_error)?;
@@ -2324,6 +2362,7 @@ impl Core {
             self.client_updated(id);
         }
         self.reconcile_admissions(before);
+        self.enforce_connect_everywhere();
         Ok(Response::Groups { groups })
     }
 }
@@ -2396,7 +2435,8 @@ fn named_channels(request: &Request) -> Vec<ChannelId> {
         | Request::ChannelDelete { channel }
         | Request::ChatHistory { channel, .. }
         | Request::ChatRead { target: vc_proto::ChatReadTarget::Channel { channel }, .. }
-        | Request::ChatSend { target: ChatTarget::Channel(channel), .. } => vec![*channel],
+        | Request::ChatSend { target: ChatTarget::Channel(channel), .. }
+        | Request::ChannelOverrideSet { channel, .. } => vec![*channel],
         Request::ChannelCreate(c) => c.parent.into_iter().collect(),
         Request::ChannelUpdate(u) => [Some(u.channel), u.parent].into_iter().flatten().collect(),
         Request::ServerUpdate(u) => u.default_channel.into_iter().collect(),

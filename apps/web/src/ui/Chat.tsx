@@ -770,7 +770,8 @@ function Composer({ threadKey, attachRef, editLastRef }: { threadKey: ThreadKey;
   const uploadsOn = useSession((s) => s.kind === "vc" && (s.server?.upload_limit ?? 0) > 0);
   const inChannel = useSession((s) => (threadKey === "channel" ? s.viewChannel : null));
   const isDm = threadKey.startsWith("dm:");
-  const mayUpload = useChannelPermission(inChannel, "attach_files") || isDm;
+  // Direct messages follow the role's permission (inChannel is null there).
+  const mayUpload = useChannelPermission(inChannel, "attach_files");
   // Direct messages are always open; a channel follows its rule, server chat the role's.
   const mayWrite = useChannelPermission(inChannel, "send_messages") || isDm;
   // Files travel with channel messages and encrypted conversations, where they are encrypted too.

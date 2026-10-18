@@ -166,3 +166,57 @@ async fn who_may_set_an_override() {
     carol.ok("channel.update", json!({"channel": other, "topic": "ours"})).await;
     assert_eq!(carol.fails("channel.update", json!({"channel": room, "topic": "no"})).await, "forbidden");
 }
+
+#[tokio::test]
+async fn syncing_moving_creating_and_deleting_follow_the_same_rules() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let seniors = role(&mut root, "Seniors", json!([])).await;
+    let mods = role(&mut root, "Mods", json!(["manage_channels", "move_members"])).await;
+    give(&mut root, &alice, json!([2, mods])).await;
+    let clan = channel_id(&root.create_channel(json!({"name": "Clan"})).await);
+    let room = channel_id(&root.create_channel(json!({"name": "Room", "parent": clan, "synced": false})).await);
+
+    // No crash and no oracle for a channel that does not exist.
+    assert_eq!(alice.fails("channel.override", for_role(999_999, 2, json!([]), json!(["connect"]))).await, "not_found");
+
+    // An unsynced subchannel starts with a copy of its parent's rules.
+    root.ok("channel.override", for_role(clan, 2, json!([]), json!(["send_messages"]))).await;
+    let sub = root.ok("channel.create", json!({"name": "Sub", "parent": clan, "synced": false})).await;
+    assert_eq!(sub["overrides"][0]["deny"], json!(["send_messages"]));
+
+    // Syncing would drop a rule on a role above her: refused; for the admin it is fine.
+    root.ok("channel.override", for_role(room, seniors, json!(["connect"]), json!([]))).await;
+    assert_eq!(alice.fails("channel.update", json!({"channel": room, "synced": true})).await, "forbidden");
+    let synced = root.ok("channel.update", json!({"channel": room, "synced": true})).await;
+    assert!(synced.get("overrides").is_none(), "a synced channel keeps no rules of its own");
+    // At the top it keeps what applied, as its own.
+    let top = root.ok("channel.update", json!({"channel": room, "move_to_root": true})).await;
+    assert_eq!((top["synced"].clone(), top["overrides"][0]["deny"].clone()), (json!(false), json!(["send_messages"])));
+
+    // Moving oneself is joining: the joining rule applies.
+    root.ok("channel.override", for_role(clan, mods, json!([]), json!(["connect"]))).await;
+    assert_eq!(alice.fails("client.move", json!({"client": alice.id(), "channel": clan})).await, "forbidden");
+
+    // Deleting a channel needs the right in every channel that goes with it.
+    let inner = channel_id(&root.create_channel(json!({"name": "Inner", "parent": room})).await);
+    root.ok("channel.override", for_role(inner, mods, json!([]), json!(["manage_channels"]))).await;
+    assert_eq!(alice.fails("channel.delete", json!({"channel": room})).await, "forbidden");
+}
+
+#[tokio::test]
+async fn a_removed_members_overrides_go_with_them() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let bob = Client::connect(&server, "bob").await;
+    let room = channel_id(&root.create_channel(json!({"name": "Room"})).await);
+    let bob_uid = bob.welcome.uid.clone();
+    root.ok("channel.override", json!({"channel": room, "override": {"user": bob_uid, "allow": ["manage_messages"]}}))
+        .await;
+    root.ok("member.remove", json!({"uid": bob_uid})).await;
+    let view = root.next_event_where("channel.updated", |c| c["id"] == room && c.get("overrides").is_none()).await;
+    assert_eq!(view["id"], room);
+    // Lifting one for someone who left is allowed (nothing to lift now, so it is a no-op).
+    root.ok("channel.override", json!({"channel": room, "override": {"user": bob_uid}})).await;
+}

@@ -403,6 +403,21 @@ const MIGRATIONS: &[&str] = &[
     "#,
 ];
 
+fn write_overrides(
+    tx: &rusqlite::Transaction,
+    channel: ChannelId,
+    overrides: &[vc_proto::ChannelOverride],
+) -> Result<()> {
+    tx.execute("DELETE FROM channel_overrides WHERE channel=?1", [channel])?;
+    for o in overrides {
+        tx.execute(
+            "INSERT INTO channel_overrides(channel,role,user,allow,deny) VALUES(?1,?2,?3,?4,?5)",
+            params![channel, o.role, o.user, serde_json::to_string(&o.allow)?, serde_json::to_string(&o.deny)?],
+        )?;
+    }
+    Ok(())
+}
+
 /// The stored genesis of the current owner generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnerGenesis {
@@ -674,15 +689,16 @@ impl Store {
     /// Replaces a channel's overrides.
     pub fn set_channel_overrides(&self, channel: ChannelId, overrides: &[vc_proto::ChannelOverride]) -> Result<()> {
         let tx = self.db.unchecked_transaction()?;
-        tx.execute("DELETE FROM channel_overrides WHERE channel=?1", [channel])?;
-        for o in overrides {
-            tx.execute(
-                "INSERT INTO channel_overrides(channel,role,user,allow,deny) VALUES(?1,?2,?3,?4,?5)",
-                params![channel, o.role, o.user, serde_json::to_string(&o.allow)?, serde_json::to_string(&o.deny)?],
-            )?;
-        }
+        write_overrides(&tx, channel, overrides)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Removes a member's overrides everywhere; returns the channels that had one.
+    pub fn delete_user_overrides(&self, uid: &str) -> Result<Vec<ChannelId>> {
+        let mut stmt = self.db.prepare("DELETE FROM channel_overrides WHERE user=?1 RETURNING channel")?;
+        let channels = stmt.query_map([uid], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(channels)
     }
 
     /// The next id from a counter that never goes back and never wraps: once `u32` ids run out, inserts fail.
@@ -738,12 +754,15 @@ impl Store {
         Ok(id)
     }
 
+    /// The row and its overrides in one transaction.
     pub fn update_channel(&self, row: &ChannelRow) -> Result<()> {
-        self.db.execute(
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
             "UPDATE channels SET parent=?2,name=?3,topic=?4,position=?5,password_hash=?6,max_clients=?7,access=?8,synced=?9 WHERE id=?1",
             params![row.id, row.parent, row.name, row.topic, row.position, row.password_hash, row.max_clients, access_json(row)?, row.synced],
         )?;
-        self.set_channel_overrides(row.id, &row.overrides)?;
+        write_overrides(&tx, row.id, &row.overrides)?;
+        tx.commit()?;
         Ok(())
     }
 
