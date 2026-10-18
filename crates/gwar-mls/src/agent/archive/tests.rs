@@ -413,3 +413,62 @@ fn uploads_transfers_and_new_generations_judge_the_feed_now() {
     assert!(g2.recipients.iter().all(|r| r.device_key != tablet_key));
     assert!(g2.revocations.iter().any(|r| r.device_key == tablet_key));
 }
+
+#[test]
+fn a_forgotten_group_keeps_no_archive_keys() {
+    let t = now();
+    let server = public(&key(200));
+    let mut laptop = device(11, t);
+    let devices = vec![entry(&laptop, t)];
+    sync(&mut laptop, &devices, &[], &[], &[], &[], None, t);
+    let g1 = laptop.archive_create_manifest(t, &[]).unwrap();
+    sync(&mut laptop, &devices, &[], &[], std::slice::from_ref(&g1), &[], None, t);
+    let descriptor = crate::SignedDescriptor::sign(
+        crate::Descriptor {
+            server_key: server.clone(),
+            conversation: "channel:2".into(),
+            kind: crate::Kind::Channel,
+            incarnation: 0,
+            previous_group_id: None,
+            private: false,
+            history: true,
+            founding_owner: None,
+            channel_group_id: None,
+            creator_uid: laptop.credential.uid(),
+            created_at: t,
+            creation_nonce: b64(&[2; 16]),
+        },
+        laptop.credential.clone(),
+        &laptop.signer.0,
+    );
+    let group = descriptor.group_id();
+    let generation_key = laptop.archive.as_ref().unwrap().keys[&1];
+    let account = public(&key(1));
+    let record = |epoch: u64| {
+        let entry = RecordKey { server: server.clone(), group, epoch, key: [epoch as u8; 32] };
+        let (id, data) = archive::seal_record(&generation_key, &account, 1, &entry).unwrap();
+        (1, b64(&id), b64(&data))
+    };
+    // Held while the creation is unsettled, then forgotten with it.
+    laptop.create(descriptor.clone()).unwrap();
+    laptop.take_changes();
+    laptop.archive_import(&[record(5)]).unwrap();
+    laptop.take_changes();
+    assert_eq!(laptop.archive.as_ref().unwrap().held.len(), 1);
+    laptop.forget(&server, &group).unwrap();
+    laptop.take_changes();
+    assert!(laptop.archive.as_ref().unwrap().held.is_empty());
+    // A settled group forgotten (a tombstone) takes no keys later.
+    laptop.create(descriptor).unwrap();
+    laptop.take_changes();
+    assert!(laptop.settle(&server, &group, Some(&group)).unwrap());
+    laptop.take_changes();
+    laptop.forget(&server, &group).unwrap();
+    laptop.take_changes();
+    assert!(laptop.epochs.is_empty());
+    // A later import keeps nothing for the tombstone.
+    laptop.archive_import(&[record(6)]).unwrap();
+    laptop.take_changes();
+    assert!(laptop.archive.as_ref().unwrap().held.is_empty());
+    assert!(laptop.epochs.is_empty());
+}

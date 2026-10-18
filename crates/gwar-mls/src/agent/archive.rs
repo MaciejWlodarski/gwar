@@ -551,6 +551,7 @@ impl Agent {
     /// different keys for the epoch). Returns how many records it opened.
     pub fn archive_import(&mut self, records: &[(u64, String, String)]) -> Result<usize> {
         self.operation(|a| {
+            let groups = &a.groups;
             let record = a.archive.as_mut().ok_or(Invalid("archive not synced"))?;
             let mut imported = 0;
             for (generation, id, data) in records {
@@ -562,7 +563,12 @@ impl Agent {
                 let Ok(entry) = archive::open_record(key, &record.account_key, *generation, &id, &data) else {
                     continue;
                 };
-                let k = epoch_key(&group_key(&entry.server, &entry.group), entry.epoch);
+                let group = group_key(&entry.server, &entry.group);
+                // A forgotten group keeps no keys (docs/security.md, "Device storage").
+                if groups.get(&group).is_some_and(|r| r.status == Status::Forgotten) {
+                    continue;
+                }
+                let k = epoch_key(&group, entry.epoch);
                 match record.held.get(&k) {
                     None => {
                         record.held.insert(k, Held::Key(entry.key));
@@ -581,6 +587,13 @@ impl Agent {
     /// Moves held archive keys into the epochs of groups this device now holds (settled: active,
     /// removed, waiting to rejoin or superseded); run at the end of every operation, so a group it
     /// adopts (a join, a rejoin, a restart chain) gets them in the same change.
+    /// Drops held archive keys of a group being forgotten.
+    pub(super) fn forget_held(&mut self, group: &str) {
+        if let Some(record) = self.archive.as_mut() {
+            record.held.retain(|k, _| k.rsplit_once('/').is_none_or(|(g, _)| g != group));
+        }
+    }
+
     pub(super) fn settle_held(&mut self) {
         let Some(record) = self.archive.as_mut() else { return };
         let uid = self.credential.uid();

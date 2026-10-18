@@ -346,9 +346,13 @@ Every guarantee assumes your client runs genuine code.
   not encrypted beyond what the operating system provides. Anyone who can read
   that profile can read the history those keys open and act as the device
   until it is revoked: protect it with the operating system's login and disk
-  encryption, and revoke a lost device. Deleted keys (a forgotten group, a
-  removed epoch) are deleted from the database; the underlying files may keep
-  old pages until they are compacted.
+  encryption, and revoke a lost device. Deleted keys (a forgotten group with
+  its epoch keys and any archive keys held for it, a removed epoch) are
+  deleted from the database; the underlying files may keep old pages until
+  they are compacted. One exception lasts longer: a last-resort key package
+  that a group was joined with keeps its private keys (enough to open that
+  join's Welcome) until a week after the package expires, at most about 13
+  weeks after it was made.
 - **Web apps hosted by other servers** are other origins: they don't have your
   keys, but they can phish your Connect password.
 - **Uploaded files** are served with `nosniff`, a sandboxing CSP and

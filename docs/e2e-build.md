@@ -2066,7 +2066,10 @@ Read against RFC 9605 and this section; an independent review verifies it.
   X25519 only, HPKE base mode only; cross-checked against `openmls_rust_crypto`.
 - **Storage** (`mls_storage.rs`, `agent/storage.rs`, `mls/storage.ts`):
   labels and keys cannot collide; a group's epoch key pairs are purged with
-  it; no past-epoch message secrets are kept (plaintext wire format, default
+  it, and now also the archive keys held for it (an import for a forgotten
+  group keeps nothing); key packages, including used last-resort ones that
+  OpenMLS keeps, are now deleted a week after they expire; no past-epoch
+  message secrets are kept (plaintext wire format, default
   `max_past_epochs`); every operation is one IndexedDB transaction, and a
   rejected operation is reloaded. The store is not encrypted at rest:
   **documented** in docs/security.md ("Device storage").
