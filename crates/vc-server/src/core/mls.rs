@@ -136,6 +136,19 @@ fn page<T: Serialize>(items: Vec<(String, T)>, paging: MlsPage) -> Result<(Vec<T
 }
 
 /// The channel of a canonical `channel:{id}` conversation.
+/// A conversation's group a session may not read. A channel's answers as if it did not exist, so
+/// hidden and deleted channels look alike (6a, 6c).
+fn no_access(conversation: &str) -> ErrorBody {
+    if channel_id(conversation).is_some() {
+        err(ErrorCode::NotFound, "no such MLS group")
+    } else {
+        err(ErrorCode::Forbidden, "no access to this conversation")
+    }
+}
+
+/// A SQL page bound for queries whose rows are filtered while read: the page ends them.
+const UNBOUNDED: usize = i64::MAX as usize;
+
 pub(super) fn channel_id(conversation: &str) -> Option<ChannelId> {
     let id: ChannelId = conversation.strip_prefix("channel:")?.parse().ok()?;
     (format!("channel:{id}") == conversation).then_some(id)
@@ -156,16 +169,23 @@ impl Core {
             && !self.store.bans(now_ms()).map_err(storage_error)?.iter().any(|b| b.uid.as_deref() == Some(uid)))
     }
 
-    /// Direct messages: their two participants. Encrypted channels and server chat: every member.
+    /// Direct messages: their two participants. Encrypted channels and server chat: every member;
+    /// an encrypted private channel: whom its lists admit.
     pub(super) fn mls_can_read(&self, uid: &str, conversation: &str) -> Result<bool, ErrorBody> {
-        let allowed = match dm_participants(conversation) {
+        Ok(self.mls_conversation_admits(uid, conversation) && self.mls_member(uid)?)
+    }
+
+    /// [`Self::mls_can_read`] without the membership lookup, for a uid known to be a member.
+    pub(super) fn mls_conversation_admits(&self, uid: &str, conversation: &str) -> bool {
+        match dm_participants(conversation) {
             Some(participants) => participants.contains(&uid),
             None => {
                 (conversation == "server" && self.info.server_chat.encrypted)
-                    || channel_id(conversation).is_some_and(|c| self.is_encrypted(c))
+                    || channel_id(conversation).is_some_and(|c| {
+                        self.is_encrypted(c) && (!self.is_encrypted_private(c) || self.private_admits(c, uid))
+                    })
             }
-        };
-        Ok(allowed && self.mls_member(uid)?)
+        }
     }
 
     pub(super) fn mls_readers(&self, conversation: &str) -> BTreeSet<SessionId> {
@@ -197,7 +217,7 @@ impl Core {
         if *count > TREE_REQUESTS_PER_MINUTE {
             return Err(TreeRefusal::TooManyRequests);
         }
-        if let Some(channel) = self.voice_group_channel(group) {
+        if let Some(channel) = self.voice_group_visible(session, group) {
             self.voice_info(session, channel).map_err(|_| TreeRefusal::NotFound)?;
             if let Some((epoch, tree)) = self.mls_trees.get(group) {
                 return Ok((*epoch, tree.clone()));
@@ -225,7 +245,7 @@ impl Core {
     }
 
     fn mls_group_for(&self, session: SessionId, group: &str) -> Result<GroupRow, ErrorBody> {
-        if self.voice_group_channel(group).is_some() {
+        if self.voice_group_visible(session, group).is_some() {
             return Err(bad("voice has no chat or history"));
         }
         if vc_proto::decode_fixed::<32>(group).is_none() {
@@ -237,13 +257,15 @@ impl Core {
             .map_err(storage_error)?
             .ok_or_else(|| err(ErrorCode::NotFound, "no such MLS group"))?;
         if !self.mls_can_read(&self.sessions[&session].uid, &row.conversation)? {
-            return Err(err(ErrorCode::Forbidden, "no access to this conversation"));
+            return Err(no_access(&row.conversation));
         }
         Ok(row)
     }
 
     fn mls_observer(&self, row: &GroupRow) -> Result<Observer, ErrorBody> {
-        Observer::load(&row.observer, &self.server_key).map_err(|e| storage_error(e.into()))
+        Ok(Observer::load(&row.observer, &self.server_key)
+            .map_err(|e| storage_error(e.into()))?
+            .with_owner(self.current_chain()))
     }
 
     fn mls_missing_proposals(
@@ -253,11 +275,14 @@ impl Core {
     ) -> anyhow::Result<Vec<ProposalRow>> {
         let conversation = observer.descriptor().descriptor.conversation.clone();
         let participants = dm_participants(&conversation);
+        let private = self.private_channel_of(&conversation);
         let mut proposals = Vec::new();
         for leaf in observer.leaves() {
-            // Any member's well-formed device may be in a channel group.
+            // Any member's well-formed device may be in a channel group; a private channel's only
+            // when its lists (or the server's newest managers) admit it now.
             let allowed = self.mls_member(&leaf.uid).map_err(|e| anyhow::anyhow!(e.message))?
                 && participants.is_none_or(|p| p.contains(&leaf.uid.as_str()))
+                && private.is_none_or(|c| self.private_admits(c, &leaf.uid))
                 && !self.store.mls_revoked(&leaf.device_key, &leaf.uid)?;
             if !allowed && !existing.iter().any(|p| p.leaf == leaf.index) {
                 proposals.push(ProposalRow {
@@ -284,13 +309,13 @@ impl Core {
     }
 
     pub(super) fn mls_reconcile_group(&mut self, mut row: GroupRow) -> anyhow::Result<()> {
-        let mut observer = Observer::load(&row.observer, &self.server_key)?;
+        let mut observer = Observer::load(&row.observer, &self.server_key)?.with_owner(self.current_chain());
         let mut existing = self.store.mls_proposals(&row.group)?;
         let added = self.mls_missing_proposals(&mut observer, &existing)?;
         if !added.is_empty() {
             row.observer = observer.save();
             existing.extend(added.iter().map(|p| ProposalRow { leaf: p.leaf, proposal: p.proposal.clone() }));
-            self.store.mls_write_group(&row, &observer.leaves(), &existing, None, None, &[])?;
+            self.store.mls_write_group(&row, &observer.leaves(), &existing, None, None, &[], None)?;
             self.voice_dirty |= channel_id(&row.conversation).is_some_and(|c| self.calls.contains_key(&c));
             self.mls_announce_proposals(&row, &added);
         }
@@ -421,17 +446,22 @@ impl Core {
                 self.mls_create(session, &conversation, &group_info)
             }
             MlsRequest::GroupInfo { group } => {
-                if let Some(channel) = self.voice_group_channel(&group) {
+                if let Some(channel) = self.voice_group_visible(session, &group) {
                     return self.voice_info(session, channel);
                 }
                 let row = self.mls_group_for(session, &group)?;
                 reply(MlsResponse::GroupInfo { group_info: B64.encode(row.group_info), epoch: row.epoch })
             }
             MlsRequest::Commit { group, epoch, commit, group_info, welcome, voice } => {
-                if voice.is_some() && self.store.mls_group(&group).map_err(storage_error)?.is_some() {
+                // Only a reader learns that the id is a chat group; to anyone else it is like a
+                // missing group (validated as voice below).
+                if voice.is_some()
+                    && let Some(row) = self.store.mls_group(&group).map_err(storage_error)?
+                    && self.mls_can_read(&uid, &row.conversation)?
+                {
                     return Err(bad("voice binding on chat group"));
                 }
-                if self.voice_group_channel(&group).is_some() || voice.is_some() {
+                if self.voice_group_visible(session, &group).is_some() || voice.is_some() {
                     if welcome.is_some() {
                         return Err(bad("voice takes no Welcome"));
                     }
@@ -447,7 +477,7 @@ impl Core {
                 self.mls_commit(session, &group, epoch, &commit, &group_info, welcome.as_deref())
             }
             MlsRequest::Log { group, since, limit: requested } => {
-                if let Some(channel) = self.voice_group_channel(&group) {
+                if let Some(channel) = self.voice_group_visible(session, &group) {
                     return self.voice_log(session, channel, since, requested);
                 }
                 let row = self.mls_group_for(session, &group)?;
@@ -491,8 +521,14 @@ impl Core {
                 let after = cursor(&paging)?;
                 let count = limit(paging.limit)?;
                 let mut page = ListPage::new(count, LIST_BYTES);
+                // Hidden private channels are skipped without using up the page (6c).
                 self.store
-                    .mls_groups(&uid, &after, count + 1, |g| page.push(g.conversation.clone(), g))
+                    .mls_groups(&uid, &after, UNBOUNDED, |g| {
+                        if !self.mls_conversation_admits(&uid, &g.conversation) {
+                            return Ok(true);
+                        }
+                        page.push(g.conversation.clone(), g)
+                    })
                     .map_err(storage_error)?;
                 reply(MlsResponse::Groups { groups: page.items, next: page.next })
             }
@@ -514,8 +550,12 @@ impl Core {
                 let answers = assignment.filter(|a| routed && self.history.is_active(a, &group, &recipient, &device));
                 let observer = self.mls_observer(&row)?;
                 let leaves = observer.leaves();
+                // The recipient's user must still be admitted: a former member of a private channel
+                // keeps leaves in its earlier incarnations (6c).
                 if !leaves.iter().any(|l| l.device_key == device && l.uid == uid)
-                    || !leaves.iter().any(|l| l.device_key == recipient)
+                    || !leaves
+                        .iter()
+                        .any(|l| l.device_key == recipient && self.mls_conversation_admits(&l.uid, &row.conversation))
                 {
                     return Err(err(ErrorCode::Forbidden, "history devices must be group members"));
                 }
@@ -565,8 +605,12 @@ impl Core {
                 let after = cursor(&paging)?;
                 let count = limit(paging.limit)?;
                 let mut page = ListPage::new(count, LIST_BYTES);
+                // Chunks still queued for a device whose user lost a private channel stay unread.
                 self.store
-                    .mls_history(&device, &uid, group.as_deref(), now_ms(), (&after, count + 1), |c| {
+                    .mls_history(&device, &uid, group.as_deref(), now_ms(), (&after, UNBOUNDED), |conversation, c| {
+                        if !self.mls_conversation_admits(&uid, conversation) {
+                            return Ok(true);
+                        }
                         page.push(c.id.clone(), c)
                     })
                     .map_err(storage_error)?;
@@ -580,13 +624,14 @@ impl Core {
                     Some(assignment) => format!("{}:{}:{assignment}", w.group, w.device),
                     None => format!("{}:{}", w.group, w.device),
                 };
-                let mut wanted: Vec<_> = self
-                    .history
-                    .wanted(&device)
-                    .into_iter()
-                    .map(|w| (key(&w), w))
-                    .filter(|(k, _)| *k > after)
-                    .collect();
+                let mut wanted = Vec::new();
+                for w in self.history.wanted(&device) {
+                    // Not for a channel this user is no longer admitted to.
+                    let row = self.store.mls_group(&w.group).map_err(storage_error)?;
+                    if key(&w) > after && row.is_some_and(|r| self.mls_conversation_admits(&uid, &r.conversation)) {
+                        wanted.push((key(&w), w));
+                    }
+                }
                 self.store
                     .mls_wanted(&uid, &device, now_ms(), &after, count + 1, |w| {
                         wanted.push((key(&w), w));
@@ -612,7 +657,7 @@ impl Core {
                     return Err(bad("voice has no incarnation history"));
                 }
                 if !self.mls_can_read(&uid, &conversation)? {
-                    return Err(err(ErrorCode::Forbidden, "no access to this conversation"));
+                    return Err(no_access(&conversation));
                 }
                 let after = paging
                     .after
@@ -659,7 +704,7 @@ impl Core {
 
     fn mls_create(&mut self, session: SessionId, conversation: &str, info: &str) -> Reply {
         let info = blob(info, BLOB_BYTES)?;
-        let mut observer = Observer::create(&info, &self.server_key).map_err(ds_error)?;
+        let mut observer = Observer::create_with(&info, &self.server_key, self.current_chain()).map_err(ds_error)?;
         let signed = observer.descriptor();
         let d = &signed.descriptor;
         let s = &self.sessions[&session];
@@ -674,11 +719,16 @@ impl Core {
                 Kind::Dm
             }
             (None, Some(channel)) => {
-                let Some(row) = self.channels.get(&channel).filter(|c| c.encrypted) else {
+                // A channel hidden from this session answers like a missing one (6a, 6c).
+                let Some(row) = self.channels.get(&channel).filter(|c| c.encrypted && self.admitted(Some(s), channel))
+                else {
                     return Err(err(ErrorCode::NotFound, "no such encrypted channel"));
                 };
-                if d.private || d.history != row.history {
+                if d.private != row.private || d.history != row.history {
                     return Err(bad("the descriptor must match the channel"));
+                }
+                if d.private {
+                    self.check_private_create(&s.uid, &observer)?;
                 }
                 Kind::Channel
             }
@@ -723,7 +773,24 @@ impl Core {
         };
         let proposals = self.mls_missing_proposals(&mut observer, &[]).map_err(storage_error)?;
         row.observer = observer.save();
-        self.store.mls_write_group(&row, &observer.leaves(), &proposals, None, None, &[]).map_err(storage_error)?;
+        let private = self.private_channel_of(conversation);
+        let admissions = self.admissions();
+        let checkpoint = private.and(observer.access()).map(|a| (a.members().members().seq, a.members().hash()));
+        self.store
+            .mls_write_group(
+                &row,
+                &observer.leaves(),
+                &proposals,
+                None,
+                None,
+                &[],
+                checkpoint.as_ref().map(|(seq, hash)| (*seq, hash.as_str())),
+            )
+            .map_err(storage_error)?;
+        if let (Some(channel), Some(_)) = (private, checkpoint) {
+            self.refresh_private(channel);
+            self.reconcile_admissions(admissions);
+        }
         self.voice_dirty |= channel_id(&row.conversation).is_some_and(|c| self.calls.contains_key(&c));
         self.mls_announce_proposals(&row, &proposals);
         reply(MlsResponse::Created { group: row.group })
@@ -756,8 +823,13 @@ impl Core {
         // Read referenced proposals only after the time and full commit validation,
         // so even a now-invalid Add receives the terminal expired reply.
         let original = observer.save();
+        let access_before = observer.access();
         let (mut observer, accepted) =
             observer.commit(&commit, &info, welcome.as_deref(), clock, row.committed_at).map_err(ds_error)?;
+        // A private channel's new lists must be current under this server's managers and newer (6c).
+        let private = self.private_channel_of(&row.conversation);
+        let checkpoint =
+            if private.is_some() { self.check_private_commit(group, access_before.as_ref(), &observer)? } else { None };
         let s = &self.sessions[&session];
         let sender_matches = match accepted.sender {
             CommitSender::Member(index) => {
@@ -799,8 +871,14 @@ impl Core {
                 Some(&entry),
                 welcome.as_deref().map(|w| (w, accepted.welcome_recipients.as_slice())),
                 &removed,
+                checkpoint.as_ref().map(|(seq, hash)| (*seq, hash.as_str())),
             )
             .map_err(storage_error)?;
+        if let (Some(channel), Some(_)) = (private, &checkpoint) {
+            let admissions = self.admissions();
+            self.refresh_private(channel);
+            self.reconcile_admissions(admissions);
+        }
         self.voice_dirty |= channel_id(&row.conversation).is_some_and(|c| self.calls.contains_key(&c));
         let readers = self.mls_readers(&row.conversation);
         self.broadcast(

@@ -2,6 +2,7 @@
 //! conversation descriptor and what the server and clients check
 //! (docs/e2e.md, docs/e2e-build.md).
 
+pub mod access;
 pub mod chat;
 pub mod credential;
 pub mod descriptor;

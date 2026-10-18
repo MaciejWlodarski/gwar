@@ -43,6 +43,7 @@ impl Fixture {
                 None,
                 None,
                 &[],
+                None,
             )
             .unwrap();
     }

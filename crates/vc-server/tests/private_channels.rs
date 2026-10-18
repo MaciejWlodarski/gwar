@@ -116,7 +116,6 @@ async fn private_channel_rules() {
     let public = channel_id(&root.create_channel(json!({"name": "open"})).await);
     for d in [
         json!({"name": "pw", "private": true, "password": "secret12"}),
-        json!({"name": "enc", "private": true, "encrypted": true}),
         json!({"name": "kid", "parent": private}),
         json!({"name": "acc", "access": {"roles": [], "users": []}}),
         json!({"name": "role", "private": true, "access": {"roles": [999], "users": []}}),
@@ -130,6 +129,11 @@ async fn private_channel_rules() {
         "bad_request"
     );
     assert_eq!(root.fails("server.update", json!({"default_channel": private})).await, "bad_request");
+    // An encrypted private channel (6c) is created only by someone who may sign its member list.
+    assert_eq!(
+        bob.fails("channel.create", json!({"name": "enc", "private": true, "encrypted": true})).await,
+        "forbidden"
+    );
     // The creator is admitted by default; others cannot be moved in.
     let created = root.ok("channel.update", json!({"channel": private, "name": "p2"})).await;
     assert_eq!(created["access"]["users"], json!([root.welcome.uid]));

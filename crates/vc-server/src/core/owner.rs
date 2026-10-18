@@ -17,7 +17,7 @@ pub(super) struct OwnerState {
 }
 
 /// Devices revoked on Gwar Connect, as the server has learned them.
-struct StoredRevocations<'a>(&'a Store);
+pub(super) struct StoredRevocations<'a>(pub(super) &'a Store);
 
 impl Revocations for StoredRevocations<'_> {
     fn revoked_at(&self, account_key: &str, device_key: &str) -> Option<i64> {
@@ -138,6 +138,8 @@ impl Core {
             .append_owner_link(chain.generation(), chain.seq(), statement, signature, &new_owner)
             .map_err(storage_error)?;
         self.owner.as_mut().expect("checked above").chain = chain;
+        // Private channels admit the current owner (6c).
+        self.refresh_all_private();
         // The new owner holds the Admin group (the old owner keeps their roles).
         let online: Vec<_> = self.sessions.values().filter(|s| s.user_id == user_id).map(|s| s.id).collect();
         for s in online {
@@ -182,9 +184,12 @@ impl Core {
             }
         }
         let before = self.managers_view();
+        let admissions = self.admissions();
         let generation = owner.chain.generation();
         self.store.set_manager_pair(generation, &anchor.encode(), &list.encode()).map_err(storage_error)?;
         self.owner.as_mut().expect("checked above").pair = Some((anchor, list));
+        // Confirmers and managers are admitted to every encrypted private channel (6c).
+        self.reconcile_admissions(admissions);
         self.reconcile_managers(before);
         Ok(Response::Empty {})
     }
