@@ -205,3 +205,96 @@ fn a_transfer_gives_one_generation_key_to_one_recipient() {
     .unwrap();
     assert_eq!(Transfer::parse(&t, &account_key()).unwrap().open(&secret).unwrap(), generation_key);
 }
+
+// Golden vectors (docs/e2e-build.md, section 7, "Tests and acceptance"): statements and
+// signatures are deterministic; the manifest, record and transfer were made once (their HPKE and
+// nonces are random) and must keep parsing and opening the same.
+const DEVICE_STATEMENT: &str = "gwar archive device v1\niojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w\nZr5-Myx6RTMyvZ0Kf32wVfXF7xoGraZtmLOftoEMRzo\nc7LYt2qptTZgAyvI9di-46OuTjs6f9Sa3oH3NHo0qmg\n1800000000000";
+const DEVICE_SIGNATURE: &str = "IZ9Xue9TRNjoJ67VfGwlHOT_xqxBYyz9pvoN56Ha437NL4c1s5VeKMJCyxiCFzk5WvQP6io6nUpOCrvBhRQnAA";
+const RECOVERY_SECRET: &str = "wsE9Zu0C9ZRa32xyamWkiuQn3t4P6Kp31hBB6J6aOsA";
+const RECOVERY_STATEMENT: &str = "gwar archive recovery v1\niojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1w\n1\nAdYez8CTRak_2wmVbKJzGXGL61WgXF0wZg7rPPOCjWc\n1800000000000";
+const RECOVERY_SIGNATURE: &str =
+    "_J0wCKw7P2hrrn3GC_GS9zHyXHCWydG8vYLNmAAerNp1TqZP6Z7CbpaIKeTvLK78SNRelyfSaLPiN-Weo_cgAA";
+const REVOCATION_SIGNATURE: &str =
+    "YJXz-eci-w_FlUIlkmv1eP__uNAZNSSV9sI2XKd05yBg214bpg_GnVxy-TnAxtOWKATs-fDw1yeStjxuyj3rAw";
+const MANIFEST: &str = concat!(
+    "Mzk2Omd3YXIgYXJjaGl2ZSBtYW5pZmVzdCB2MQppb2pqM1hRSjhaWDlVdHN0UExwZGNzcG5DYjhkbEJJYjgzU0lBYlFQYjF3",
+    "CjEKLQpacjUtTXl4NlJUTXl2WjBLZjMyd1ZmWEY3eG9HcmFadG1MT2Z0b0VNUnpvCkMxRTYyYlNTUUJYS0NRTHRCNUJFMDZ4",
+    "ZHZzSXdid2FVakJEYWpyYmpueTA6bDhPeEMwMXNFenA0NmwzTUhQWkNIVC1CcmpleDlpak9GTXB2em5jdzh6TSxacjUtTXl4",
+    "NlJUTXl2WjBLZjMyd1ZmWEY3eG9HcmFadG1MT2Z0b0VNUnpvOmM3TFl0MnFwdFRaZ0F5dkk5ZGktNDZPdVRqczZmOVNhM29I",
+    "M05IbzBxbWcKMQpLN1p0bHgxcVhyUjVORUxPaVVQZ01oZUtWY1loWkw3U3k1azR0dGxwbXRzClBNWmNwTlIzUWlrT043elR0",
+    "aHNTSURFRFVWLV9GVHFfN2pZWnJwX3lUZ1EKMTgwMDAwMDAwMDAwMCw4NjpDQ0VHT0s4NFZ1R3JOYUdlcE5GY19vSXZTekk3",
+    "eVFid1lFd09ralM5dUhQX2FfUkhfN3FvZmJWd1FxLWlvRlFDUXJKNW5vY09MbWMtUnd2azhGX3REZywyMjU6MTMwOmd3YXIg",
+    "ZGV2aWNlIHYxCmlvamozWFFKOFpYOVV0c3RQTHBkY3NwbkNiOGRsQkliODNTSUFiUVBiMXcKWnI1LU15eDZSVE15dlowS2Yz",
+    "MndWZlhGN3hvR3JhWnRtTE9mdG9FTVJ6bwoxNzk5OTk5OTk5OTk5CjE4MDI1OTE5OTk5OTksODY6S2dUQ0hubjFlMjNoY2ZP",
+    "REZhS1NiVjB6bXFQazlhZmxNbGZYbEZtVXQ0a2hnUlRLMnFXT1JROVBsR2JnMTd2U0tHMkNzNFRkRWVZb05PZGhTdHV5Qmcs",
+    "LDQ3ODoyMTY6MjExOjExNjpnd2FyIHJldm9rZSB2MQppb2pqM1hRSjhaWDlVdHN0UExwZGNzcG5DYjhkbEJJYjgzU0lBYlFQ",
+    "YjF3CmthS0tDM1E0RlpPazJVYVZlU0NKSnFfSXJZTElnNXQyUkRXYm5ycWFTem8KMTc5OTk5OTk5OTk5MCw4NjpZSlh6LWVj",
+    "aS13X0ZsVUlsa212MWVQX191TkFaTlNTVjlzSTJYS2QwNXlCZzIxNGJwZ19HblZ4eS1UbkF4dE9XS0FUcy1mRHcxeWVTdGp4",
+    "dXlqM3JBdywsLDI1Mjo4MDrOxO9-q2pp_-VoE3_ngi4iUSs71s1FBOuY415P3XDWY7dRFqG4vj8suxqTF8g8dn7H5u0xJPac",
+    "4y7iI-onslI19-AsLLLfr7XvL7m-CvJALCw4MDpCvSvKPTfgM-kxrlB_wNq0DQGlfQOAlR26PNKrSTVXeAHsIXeozoS1eFpx",
+    "k2sB_qluQZv0tCKaJOyXkKS9jkueZNUJbarRJL8rm03ZEs2_aiw4MDrMtOP354wX6X9wp6a6Xexfzq3Qzn85yUWAY7TWNVXx",
+    "ShoKrMeFu_3sDYDoIfkhWbMB1zAtzWL3-0atdLOyitcNrxmaYw2h1nzPTO3VbH7zIywsLA"
+);
+const MANIFEST_HASH: &str = "88R13kz5H1VZiD-c_biQoUHqmK80sisMZ0QG2oz2YBo";
+const GENERATION_KEY: &str = "TzUPvCHn-y7RUzptyTGZjfkGB1QQWCpIM6GD-xREfy0";
+const RECORD_ID: &str = "iylmaVjXGRZjJxBLe_4jAQ";
+const RECORD_DATA: &str = concat!(
+    "YHytEk8vPDSD9-dXsDo3wM0UbESX_oGfKBuinYEEREoooB2cc4QcwPnfFDLHjFfMk7WqNOyr5sq5ODFNRmaF8eZ9FonU7eDD",
+    "2oA7tcuA9lDPI-lHnuVrsDLF7K3GMlNz-YX1USycMc0e94MN2Ok0cnLvSPHr0X-A1Z7sXQLfgbQhCG5dzyfjWsiognpBNFTF",
+    "IaJqLGbA7DpNy86s2hhVO_w4S7vm82uK-07zw1u4syujlYwJTzI2YvIKbS3y3IyDlo5c6knGQ4YYuqY"
+);
+const TRANSFER: &str = concat!(
+    "MjcxOmd3YXIgYXJjaGl2ZSB0cmFuc2ZlciB2MQppb2pqM1hRSjhaWDlVdHN0UExwZGNzcG5DYjhkbEJJYjgzU0lBYlFQYjF3",
+    "CjEKODhSMTNrejVIMVZaaUQtY19iaVFvVUhxbUs4MHNpc01aMFFHMm96MllCbwpacjUtTXl4NlJUTXl2WjBLZjMyd1ZmWEY3",
+    "eG9HcmFadG1MT2Z0b0VNUnpvCnJlY292ZXJ5OjEKSzdadGx4MXFYclI1TkVMT2lVUGdNaGVLVmNZaFpMN1N5NWs0dHRscG10",
+    "cwo0QkltaUR6Q0gxZk5ROW0zdXpMRFM3R2E0WTNHcmp6ZHZCWldGakNLU1ZrCjE4MDAwMDAwMDAwMDAsODY6Y2EwY3ViOEk0",
+    "S3p3ejJvMkVXRUFrTm1idHRUXzduZkVkREkxTFFUWnplRjNJWndOS2dCVEdBTjlvT2dNaUJrTy1ZMTVHLU92djJ2QzJ0R0ZY",
+    "bWt2Q1EsMjI1OjEzMDpnd2FyIGRldmljZSB2MQppb2pqM1hRSjhaWDlVdHN0UExwZGNzcG5DYjhkbEJJYjgzU0lBYlFQYjF3",
+    "ClpyNS1NeXg2UlRNeXZaMEtmMzJ3VmZYRjd4b0dyYVp0bUxPZnRvRU1Sem8KMTc5OTk5OTk5OTk5OQoxODAyNTkxOTk5OTk5",
+    "LDg2OktnVENIbm4xZTIzaGNmT0RGYUtTYlYwem1xUGs5YWZsTWxmWGxGbVV0NGtoZ1JUSzJxV09SUTlQbEdiZzE3dlNLRzJD",
+    "czRUZEVlWW9OT2RoU3R1eUJnLCw4MDrW6tkXLY_HuQtWjJdBHQ4CdGYapAz0r-qFIklG-tRLdkcjWPEoEfxsaULJgG7oElJV",
+    "DEXNX9LtFi2e_d252Wn1LXHFax1c8oBt2HHZBjth1yw"
+);
+
+#[test]
+fn golden_vectors() {
+    let (a, b, c) = (device(11), device(12), device(13));
+    let k = DeviceArchiveKey::sign(&account_key(), &a.signing, a.public, NOW);
+    assert_eq!((k.statement().as_str(), k.signature.as_str()), (DEVICE_STATEMENT, DEVICE_SIGNATURE));
+    let (secret, public_key) = recovery_key_pair(&[7; 20], &account().verifying_key().to_bytes());
+    assert_eq!(b64(&secret), RECOVERY_SECRET);
+    let r = RecoveryArchiveKey::sign(&account(), 1, public_key, NOW);
+    assert_eq!((r.statement().as_str(), r.signature.as_str()), (RECOVERY_STATEMENT, RECOVERY_SIGNATURE));
+    assert_eq!(revocation(&c.signing, NOW - 10).signature, REVOCATION_SIGNATURE);
+
+    let manifest = fixed_bytes(MANIFEST);
+    let m = Manifest::parse(&manifest, &account_key()).unwrap();
+    assert_eq!(m.hash(), MANIFEST_HASH);
+    assert_eq!((m.generation, m.recovery_version, m.created_at), (1, Some(1), NOW));
+    assert_eq!(m.recipients, {
+        let mut r = vec![recipient(&a), recipient(&b)];
+        r.sort();
+        r
+    });
+    assert_eq!(m.revocations, vec![revocation(&c.signing, NOW - 10)]);
+    let generation_key = fixed::<32>(GENERATION_KEY).unwrap();
+    assert_eq!(m.open(Seat::Device(&public(&a.signing)), &a.secret).unwrap(), generation_key);
+    assert_eq!(m.open(Seat::Device(&public(&b.signing)), &b.secret).unwrap(), generation_key);
+    assert_eq!(m.open(Seat::Recovery, &secret).unwrap(), generation_key);
+
+    let record =
+        open_record(&generation_key, &account_key(), 1, &fixed::<16>(RECORD_ID).unwrap(), &fixed_bytes(RECORD_DATA));
+    assert_eq!(record.unwrap(), RecordKey { server: public(&key_of(200)), group: [3; 32], epoch: 42, key: [9; 32] });
+
+    let t = Transfer::parse(&fixed_bytes(TRANSFER), &account_key()).unwrap();
+    assert_eq!(
+        (t.generation, t.manifest_hash.as_str(), &t.recipient),
+        (1, MANIFEST_HASH, &TransferRecipient::Recovery { version: 1 })
+    );
+    assert_eq!(t.open(&secret).unwrap(), generation_key);
+}
+fn fixed_bytes(text: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(text).unwrap()
+}
