@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use vc_proto::DeviceCertificate;
 
-use super::{Agent, AgentError, EpochRecord, Invalid, Result, epoch_key, group_key};
+use super::{Agent, AgentError, EpochRecord, Invalid, Result, Status, epoch_key, group_key};
 use crate::archive::{
     self, DeviceArchiveKey, Knowledge, Manifest, Recipient, RecordKey, RecoveryArchiveKey, Revocation, Seat, Transfer,
     TransferRecipient,
@@ -112,9 +112,13 @@ fn certificate_current(account_key: &str, device_key: &str, c: &ArchiveCertifica
         expires_at: c.expires_at,
         signature: c.signature.clone(),
     };
-    c.issued_at <= now
+    // Unsigned until the signature is checked: bounded before any arithmetic.
+    let valid = 1..=vc_proto::MAX_SAFE_INTEGER;
+    valid.contains(&c.issued_at)
+        && valid.contains(&c.expires_at)
+        && c.issued_at <= now
         && now < c.expires_at
-        && c.expires_at - c.issued_at <= 90 * 86_400_000
+        && c.expires_at.checked_sub(c.issued_at).is_some_and(|d| d <= 90 * 86_400_000)
         && vc_proto::signed_by(account_key, &vc_proto::device_statement(&certificate), &c.signature)
 }
 
@@ -553,16 +557,21 @@ impl Agent {
         })
     }
 
-    /// Moves held archive keys into the epochs of groups this device now holds; run at the end
-    /// of every operation, so a group it adopts (a join, a rejoin, a restart chain) gets them in
-    /// the same change.
+    /// Moves held archive keys into the epochs of groups this device now holds (settled: active,
+    /// removed, waiting to rejoin or superseded); run at the end of every operation, so a group it
+    /// adopts (a join, a rejoin, a restart chain) gets them in the same change.
     pub(super) fn settle_held(&mut self) {
         let Some(record) = self.archive.as_mut() else { return };
         let uid = self.credential.uid();
         let ready: Vec<String> = record
             .held
             .keys()
-            .filter(|k| k.rsplit_once('/').is_some_and(|(group, _)| self.groups.contains_key(group)))
+            .filter(|k| {
+                // Groups holding epoch keys: not an unsettled creation, a join in flight or a tombstone.
+                k.rsplit_once('/').and_then(|(group, _)| self.groups.get(group)).is_some_and(|r| {
+                    matches!(r.status, Status::Active | Status::Removed | Status::Rejoin | Status::Superseded)
+                })
+            })
             .cloned()
             .collect();
         for k in ready {

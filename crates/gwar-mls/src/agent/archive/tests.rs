@@ -307,8 +307,12 @@ fn held_keys_keep_conflicts_and_settle_when_the_group_appears() {
     assert_eq!(held.len(), 2);
     assert!(held.values().any(|h| *h == Held::Conflicted));
     assert!(laptop.epochs.is_empty());
-    // The group appears: its held keys move into its epochs in the same change.
+    // An unsettled creation holds no keys; once it settles, its held keys move into its epochs
+    // in the same change.
     laptop.create(descriptor).unwrap();
+    laptop.take_changes();
+    assert!(laptop.epochs.is_empty());
+    assert!(laptop.settle(&server, &group, Some(&group)).unwrap());
     let group_text = group_key(&server, &group);
     assert!(matches!(
         laptop.epochs.get(&epoch_key(&group_text, 5)),
@@ -316,8 +320,6 @@ fn held_keys_keep_conflicts_and_settle_when_the_group_appears() {
     ));
     assert_eq!(laptop.epochs.get(&epoch_key(&group_text, 6)), Some(&EpochRecord::Conflicted));
     assert!(laptop.archive.as_ref().unwrap().held.is_empty());
-    laptop.take_changes();
-    assert!(laptop.settle(&server, &group, Some(&group)).unwrap());
     laptop.take_changes();
     let reloaded = Agent::load([11; 32], laptop.credential.clone(), laptop.durable.clone()).unwrap();
     assert_eq!(reloaded.epochs.get(&epoch_key(&group_text, 6)), Some(&EpochRecord::Conflicted));
@@ -355,4 +357,22 @@ fn a_stored_archive_record_is_checked_on_load() {
     assert_eq!(load(&|v| v["keys"]["3"] = v["keys"]["1"].clone()), invalid);
     assert_eq!(load(&|v| v["sent"] = serde_json::json!(["9/x"])), invalid);
     assert_eq!(load(&|v| v["account_key"] = public(&key(2)).into()), invalid);
+}
+
+#[test]
+fn unsigned_certificate_times_are_bounded_before_any_arithmetic() {
+    let t = now();
+    let laptop = device(11, t);
+    let mut forged = entry(&laptop, t);
+    forged.certificate = Some(ArchiveCertificate { issued_at: i64::MIN, expires_at: t + 1, signature: "x".into() });
+    let crate::Credential::Account(c) = &laptop.credential else { unreachable!() };
+    assert!(!certificate_current(
+        &c.account_key,
+        laptop.credential.device_key(),
+        forged.certificate.as_ref().unwrap(),
+        t
+    ));
+    let mut reader = device(12, t);
+    sync(&mut reader, &[forged], &[], &[], &[], &[], None, t);
+    assert!(reader.archive.as_ref().unwrap().current(t).is_empty());
 }
