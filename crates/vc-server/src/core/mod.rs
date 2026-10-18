@@ -1966,6 +1966,9 @@ impl Core {
             if !row.private {
                 return Err(err(ErrorCode::BadRequest, "only a private channel has access"));
             }
+            if row.encrypted {
+                return Err(err(ErrorCode::BadRequest, "an encrypted private channel's members are its signed list"));
+            }
             let before = row.access.as_ref().map(|a| a.roles.clone()).unwrap_or_default();
             self.may_list_roles(session, &access.roles, &before)?;
             row.access = Some(self.checked_access(access.clone())?);

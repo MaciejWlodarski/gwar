@@ -214,6 +214,11 @@ async fn an_encrypted_private_channel_admits_only_its_signed_members_and_never_g
         "forbidden"
     );
     let channel = channel_id(&owner.create_channel(json!({"name": "p", "private": true, "encrypted": true})).await);
+    assert_eq!(
+        owner.fails("channel.update", json!({"channel": channel, "access": {"roles": [], "users": [uid(2)]}})).await,
+        "bad_request",
+        "its members are the signed list"
+    );
     assert!(bob.drain_events("channel.created").await.iter().all(|e| e["id"] != channel));
 
     // The owner's device creates the group admitting Bob.
