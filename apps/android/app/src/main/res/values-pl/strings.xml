@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="cancel">Anuluj</string>
+    <string name="back">Wstecz</string>
+
+    <string name="connect_subtitle">Połącz się z serwerem</string>
+    <string name="connect_address">Adres serwera</string>
+    <string name="connect_nickname">Nick</string>
+    <string name="connect_server_password">Hasło serwera (opcjonalne)</string>
+    <string name="connect_insecure_lan">Zezwól na nieszyfrowane połączenie w sieci lokalnej</string>
+    <string name="connect_insecure_lan_hint">Tylko dla serwera we własnej sieci. Każdy w tej sieci może czytać i zmieniać ruch.</string>
+    <string name="connect_more">Więcej opcji</string>
+    <string name="connect_button">Połącz</string>
+    <string name="connect_your_id">Twój identyfikator: %1$s…</string>
+
+    <string name="identity_changed_title">Tożsamość serwera się zmieniła</string>
+    <string name="identity_changed_body">Serwer pod adresem %1$s przedstawia inny klucz niż przy pierwszym połączeniu. Tak robi przeinstalowany serwer, ale tak samo ktoś, kto się pod niego podszywa. Zaufaj nowemu kluczowi tylko, jeśli wiesz, dlaczego się zmienił.</string>
+    <string name="identity_changed_trust">Zaufaj nowemu kluczowi</string>
+
+    <string name="server_disconnect">Rozłącz z serwerem</string>
+    <string name="server_join">Dołącz do %1$s</string>
+    <string name="server_leave">Wyjdź</string>
+    <string name="server_lobby">Na serwerze (%1$d)</string>
+    <string name="server_you">%1$s (ty)</string>
+    <string name="server_away">nieobecny</string>
+    <string name="server_muted">Wyciszony mikrofon</string>
+    <string name="server_deafened">Wyciszony dźwięk</string>
+    <string name="server_password_title">Dołącz do %1$s</string>
+    <string name="server_password_label">Hasło kanału</string>
+    <string name="server_password_join">Dołącz</string>
+
+    <string name="chat_placeholder">Wiadomość na #%1$s</string>
+    <string name="chat_send">Wyślij</string>
+    <string name="chat_empty">Brak wiadomości</string>
+    <string name="chat_edited">(edytowano)</string>
+    <string name="chat_encrypted_unsupported">Ten kanał jest szyfrowany end-to-end. Szyfrowany czat nie jest jeszcze dostępny w aplikacji na Androida; użyj aplikacji desktopowej lub webowej.</string>
+
+    <string name="error_address_empty">Wpisz adres serwera.</string>
+    <string name="error_address_invalid">Ten adres wygląda niepoprawnie.</string>
+    <string name="error_address_scheme">Wpisz adres w rodzaju voice.example.com.</string>
+    <string name="error_address_insecure">Ten adres nie jest szyfrowany. Jeśli serwer jest w Twojej sieci, włącz „Zezwól na nieszyfrowane połączenie w sieci lokalnej”.</string>
+    <string name="error_wrong_password">Złe hasło.</string>
+    <string name="error_banned">Masz bana na tym serwerze.</string>
+    <string name="error_channel_full">Kanał jest pełny.</string>
+    <string name="error_forbidden">Nie masz do tego uprawnień.</string>
+    <string name="error_rate_limited">Za dużo prób. Odczekaj chwilę i spróbuj ponownie.</string>
+    <string name="error_refused">Serwer odmówił: %1$s</string>
+    <string name="error_timeout">Serwer nie odpowiedział na czas.</string>
+    <string name="error_not_connected">Brak połączenia.</string>
+    <string name="error_network">Nie udało się połączyć z serwerem: %1$s</string>
+    <string name="error_protocol">Serwer odpowiedział w nieoczekiwany sposób: %1$s</string>
+    <string name="error_storage">Nie udało się odczytać lub zapisać danych aplikacji: %1$s</string>
+
+    <string name="closed_connection_lost">Połączenie zostało przerwane.</string>
+    <string name="closed_timeout">Serwer przestał otrzymywać sygnał z tego urządzenia.</string>
+    <string name="closed_kicked">%1$s wyrzucił(a) Cię z serwera.</string>
+    <string name="closed_kicked_reason">%1$s wyrzucił(a) Cię z serwera: %2$s</string>
+    <string name="closed_banned">%1$s zbanował(a) Cię na serwerze.</string>
+    <string name="closed_banned_reason">%1$s zbanował(a) Cię na serwerze: %2$s</string>
+    <string name="closed_removed">%1$s usunął(ęła) Cię z serwera.</string>
+    <string name="closed_shutdown">Serwer został wyłączony.</string>
+    <string name="closed_replaced">Połączono z tym serwerem z innego miejsca.</string>
+
+    <string name="voice_off">Na kanale, bez głosu</string>
+    <string name="voice_connecting">Łączenie głosu…</string>
+    <string name="voice_connected">Głos połączony</string>
+    <string name="voice_reconnecting">Utracono głos, łączenie ponownie…</string>
+    <string name="voice_mute">Wycisz mikrofon</string>
+    <string name="voice_unmute">Włącz mikrofon</string>
+    <string name="voice_deafen">Wycisz dźwięk</string>
+    <string name="voice_undeafen">Włącz dźwięk</string>
+    <string name="voice_notification_channel">Rozmowy głosowe</string>
+    <string name="voice_notification_title">Na kanale %1$s</string>
+    <string name="voice_notification_text">Głos w Gwarze jest włączony. Dotknij, aby otworzyć.</string>
+    <string name="notice_microphone_needed">Dołączono bez głosu: Gwar potrzebuje uprawnienia do mikrofonu.</string>
+    <string name="error_not_in_channel">Najpierw dołącz do kanału.</string>
+    <string name="error_encrypted_voice">Głos na tym kanale jest szyfrowany end-to-end, czego aplikacja na Androida jeszcze nie obsługuje. Jesteś na kanale bez głosu.</string>
+    <string name="error_microphone_denied">Gwar nie ma dostępu do mikrofonu. Zezwól na niego w ustawieniach systemu.</string>
+    <string name="error_voice">Nie udało się uruchomić głosu: %1$s</string>
+    <string name="voice_details">wysłane %1$d · odebrane %2$d · luki %3$d · mikrofon %4$d dB</string>
+    <string name="server_reconnecting">Utracono połączenie, łączenie ponownie…</string>
+    <string name="voice_output">Wyjście dźwięku: %1$s</string>
+    <string name="voice_output_speaker">Głośnik</string>
+    <string name="voice_output_earpiece">Słuchawka telefonu</string>
+    <string name="voice_output_wired">Słuchawki przewodowe</string>
+    <string name="voice_output_bluetooth">Słuchawki Bluetooth</string>
+    <string name="voice_output_usb">Słuchawki USB</string>
+    <string name="voice_output_allow_bluetooth">Zezwól na słuchawki Bluetooth</string>
+    <string name="voice_more">Opcje głosu</string>
+    <string name="voice_push_to_talk">Naciśnij, aby mówić</string>
+    <string name="voice_hold_to_talk">Przytrzymaj, aby mówić</string>
+    <string name="voice_talking">Mówisz…</string>
+    <string name="locked_title">Nie można odblokować Twojej tożsamości</string>
+    <string name="locked_body">Gwar przechowuje Twoją tożsamość zabezpieczoną kluczem w bezpiecznym magazynie tego telefonu, a ten klucz już jej nie otwiera. Dzieje się tak po zresetowaniu zabezpieczeń lub kluczy telefonu.</string>
+    <string name="locked_reset">Zacznij od nowa z nową tożsamością</string>
+    <string name="locked_reset_body">Serwery zobaczą Cię jako nową osobę: starej tożsamości nie da się odzyskać na tym telefonie. Zapisane serwery zostaną zachowane.</string>
+    <string name="locked_reset_confirm">Utwórz nową tożsamość</string>
+    <string name="error_identity_locked">Nie można odblokować tożsamości: %1$s</string>
+    <string name="done">Gotowe</string>
+    <string name="voice_sensitivity">Czułość mikrofonu</string>
+    <string name="voice_sensitivity_hint">Mów normalnie: pasek robi się zielony, gdy mikrofon jest wysyłany. Przesuń suwak w prawo, jeśli otwiera go hałas z tła, w lewo, jeśli cicha mowa go nie otwiera.</string>
+    <string name="voice_sensitivity_value">Otwiera się powyżej %1$d dB</string>
+    <string name="voice_sensitivity_default">Domyślna</string>
+</resources>
