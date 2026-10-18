@@ -224,6 +224,38 @@ enum Request {
         conversation: String,
         chain: Vec<Incarnation>,
     },
+    ArchiveDeviceKey {
+        now: i64,
+    },
+    ArchiveSync {
+        devices: Vec<gwar_mls::agent::ArchiveDevice>,
+        recovery: Vec<(String, String)>,
+        revocations: Vec<gwar_mls::agent::ArchiveRevocation>,
+        manifests: Vec<Vec<u8>>,
+        transfers: Vec<Vec<u8>>,
+        recovery_code: Option<Vec<u8>>,
+        now: i64,
+    },
+    ArchiveCreateManifest {
+        now: i64,
+    },
+    ArchiveSeal {
+        limit: usize,
+        now: i64,
+    },
+    ArchiveUploaded {
+        epochs: Vec<String>,
+    },
+    ArchiveImport {
+        records: Vec<(u64, String, String)>,
+    },
+    ArchiveTransfersFor {
+        recipient: String,
+        now: i64,
+    },
+    ArchiveTransfersSent {
+        tags: Vec<String>,
+    },
     AcceptPrivateChain {
         server: String,
         conversation: String,
@@ -527,6 +559,29 @@ impl Agent {
                 let chain: Vec<_> = chain.into_iter().map(|i| (i.group, i.descriptor)).collect();
                 output(a.accept_chain(&server, &conversation, &chain).map_err(error)?)
             }
+            Request::ArchiveDeviceKey { now } => output(a.archive_device_key(now).map_err(error)?),
+            Request::ArchiveSync { devices, recovery, revocations, manifests, transfers, recovery_code, now } => {
+                output(
+                    a.archive_sync(
+                        &devices,
+                        &recovery,
+                        &revocations,
+                        &manifests,
+                        &transfers,
+                        recovery_code.as_deref(),
+                        now,
+                    )
+                    .map_err(error)?,
+                )
+            }
+            Request::ArchiveCreateManifest { now } => output(a.archive_create_manifest(now).map_err(error)?),
+            Request::ArchiveSeal { limit, now } => output(a.archive_seal(limit, now).map_err(error)?),
+            Request::ArchiveUploaded { epochs } => output(a.archive_uploaded(&epochs).map_err(error)?),
+            Request::ArchiveImport { records } => output(a.archive_import(&records).map_err(error)?),
+            Request::ArchiveTransfersFor { recipient, now } => {
+                output(a.archive_transfers_for(&recipient, now).map_err(error)?)
+            }
+            Request::ArchiveTransfersSent { tags } => output(a.archive_transfers_sent(&tags).map_err(error)?),
             Request::AcceptPrivateChain { server, conversation, chain, group_info, tree, now, revocations } => {
                 let chain: Vec<_> = chain.into_iter().map(|i| (i.group, i.descriptor)).collect();
                 output(

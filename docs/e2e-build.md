@@ -361,7 +361,7 @@ credential, the OpenMLS provider and Gwar's own per-group records.
 ### Web app storage and concurrency
 
 - MLS runs in the page's main thread, in the wasm module loaded on first use
-  (gzip budget 560 KB, checked in CI; raised from 500 KB for step 6).
+  (gzip budget 620 KB, checked in CI; raised from 500 KB for steps 6 and 7).
 - Only one tab per device runs MLS: the Web Locks API lock
   `gwar-mls:{device_key}` is taken before connecting. Before releasing it
   (connection replaced or closed) the tab finishes the operation in progress,
@@ -2694,9 +2694,11 @@ imports, the setting, recovery.
 
 ### Keys
 
-- **Device archive key:** each Connect device generates an X25519 key pair
-  for the archive (random, kept with the device's MLS store, never exported)
-  and publishes its public half in a statement signed by its **device key**:
+- **Device archive key:** each Connect device's X25519 history key (the key
+  it already publishes for history bundles, random, kept with its MLS store,
+  never exported) also serves the archive; HPKE `info` strings keep the two
+  uses apart. The device publishes its public half to Connect in a statement
+  signed by its **device key**:
 
   ```text
   gwar archive device v1
@@ -2827,8 +2829,9 @@ the encryption.
   imported key (a different key for the same epoch makes it `Conflicted`, as
   today). It never creates a group record, pin, checkpoint or membership: a
   key for a group the device has no record of is kept in an **archive key
-  store** (by server, group, epoch) and moved into the group's epoch keys
-  when the device later holds the group (a rejoin, a restart chain).
+  store** (by server, group, epoch; different keys for one epoch are kept
+  as a conflict) and moved into the group's epoch keys in the same change
+  that makes the device hold the group (a join, a rejoin, a restart chain).
 - An older or partial archive can only hide keys; it cannot reveal or forge
   anything (message signatures are inside the ciphertext).
 
@@ -2858,10 +2861,12 @@ gwar archive transfer v1
   generation; before sending it learns the manifest's revocations, and it
   never sends to a device revoked by them or by its own feed, or to a
   device without a current certificate.
-- An existing device sends transfers of every generation it can open when it
-  sees a new current device that published an archive key and holds none of
-  them, and to a new recovery version (below). Until one is online, a new
-  device reads nothing from the archive.
+- An existing device sends transfers of every generation it can open to
+  each current device that published an archive key and that the
+  generation does not name, and to a current recovery version the
+  generation is not sealed to (below), once per generation and recipient; a
+  transfer it sees on Connect from another device counts as sent. Until one
+  is online, a new device reads nothing from the archive.
 - A recipient accepts a transfer only for a manifest it accepted (its
   checkpoint), whose sealed key hashes to `sealed_hash`, from a sender whose
   embedded certificate covers `created_at` and who was not revoked before it.
@@ -2939,8 +2944,12 @@ a record belongs to.
 - Uploads run in the background in batches of 100, after each derived
   epoch, and are retried; a device that cannot reach Connect keeps its queue
   (in its MLS store) and never blocks messaging on it.
-- A device that sees a new current device of the account with an archive
-  key sends it transfers (once per generation and recipient).
+- A device that sees a current device of the account with an archive key
+  that some generation it opened does not name sends it transfers (once per
+  generation and recipient). Device eligibility (certificates, revocations)
+  is checked again at each upload, generation and transfer, not only at
+  sync; a recovery code given after a sync opens generations accepted
+  before.
 - Recovery (`POST /v1/recover`): after the account key is decrypted and a
   new device is certified, the recovery archive key opens the generations
   sealed to the newest recovery version; the device imports their records.

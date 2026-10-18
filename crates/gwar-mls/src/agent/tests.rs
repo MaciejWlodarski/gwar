@@ -445,7 +445,11 @@ fn history_off_shares_only_derived_epochs_with_recipient_evidence() {
     let k = group_key(&server(), &id);
     a.epochs.insert(
         epoch_key(&k, 2),
-        EpochRecord::Imported { key: [2; 32], sender_uids: [b.credential.uid()].into_iter().collect() },
+        EpochRecord::Imported {
+            key: [2; 32],
+            sender_uids: [b.credential.uid()].into_iter().collect(),
+            archived: false,
+        },
     );
     let chunks = a.share_history(&server(), &id, &b.device_hpke_key(), t, &()).unwrap();
     a.take_changes();
@@ -462,7 +466,7 @@ fn history_chunks_cover_at_most_a_thousand_epochs_and_skip_conflicts() {
     let mut f = joined();
     let k = group_key(&server(), &f.id);
     for e in 2..2200 {
-        f.a.epochs.insert(epoch_key(&k, e), EpochRecord::Derived { key: [7; 32] });
+        f.a.epochs.insert(epoch_key(&k, e), EpochRecord::Derived { key: [7; 32], archived: false });
     }
     f.a.epochs.insert(epoch_key(&k, 2001), EpochRecord::Conflicted);
     let chunks = f.a.share_history(&server(), &f.id, &f.b.device_hpke_key(), f.t, &()).unwrap();
