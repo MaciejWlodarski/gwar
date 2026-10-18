@@ -72,7 +72,8 @@ describe("member list renewal (6c)", () => {
     expect(memberListRenewalDue(list, NOW, Infinity, [{ account_key: "acc", device_key: "d", revoked_at: NOW - 1 }])).toBe(true);
     expect(memberListRenewalDue(list, NOW, Infinity, [{ account_key: "other", device_key: "d", revoked_at: NOW - 1 }])).toBe(false);
   });
-  it("is not due for expiry with a device that expires as soon", () => {
+  it("is due for expiry only with a device that outlasts the signer", () => {
     expect(memberListRenewalDue({ ...list, signer_expires_at: NOW + 3 * DAY }, NOW, NOW + 2 * DAY, [])).toBe(false);
+    expect(memberListRenewalDue({ ...list, signer_expires_at: NOW + DAY }, NOW, NOW + 6 * DAY, [])).toBe(true);
   });
 });

@@ -525,16 +525,21 @@ export class MlsRuntime {
    * was revoked (6c, "Newcomers"); at most every ten minutes per group, and not for expiry by a
    * device whose own certificate expires as soon. */
   private async renewMembers(group: string, gate: Gate): Promise<boolean> {
-    const me = this.uid, view = this.owner;
-    if (gate.access?.kind !== "current" || !view || !(view.owner === me || view.confirmers.includes(me) || view.managers.includes(me))) return false;
-    if (this.now() - (this.renewedAt.get(group) ?? -Infinity) < 10 * 60_000) return false;
-    const list = this.engine.query<AccessView | null>({ access_view: this.args(group) });
+    const list = this.renewalDue(group, gate);
     if (!list) return false;
     const now = this.now();
-    if (!memberListRenewalDue(list, now, this.options.identity.device?.expires_at ?? Infinity, this.options.revocations())) return false;
     this.renewedAt.set(group, now);
     await this.engine.op({ commit_access: { ...this.args(group), members: list.members, now, revocations: this.options.revocations() } });
     return true;
+  }
+  /** The member list to re-sign now, if this device's user is an authority and it is due. */
+  private renewalDue(group: string, gate: Gate): AccessView | null {
+    const me = this.uid, view = this.owner;
+    if (gate.access?.kind !== "current" || !view || !(view.owner === me || view.confirmers.includes(me) || view.managers.includes(me))) return null;
+    if (this.now() - (this.renewedAt.get(group) ?? -Infinity) < 10 * 60_000) return null;
+    const list = this.engine.query<AccessView | null>({ access_view: this.args(group) });
+    if (!list || !memberListRenewalDue(list, this.now(), this.options.identity.device?.expires_at ?? Infinity, this.options.revocations())) return null;
+    return list;
   }
   /** Offers fresh lists for a private group this device could not join, when its user is the
    * owner, a confirmer or a manager. */
@@ -805,7 +810,7 @@ export class MlsRuntime {
     const local = this.summary(remote.group), gate = this.gate(remote.group);
     return !remote.pending && local?.record.checkpoint?.epoch === String(remote.epoch) && gate.status === "active"
       && !gate.rejoin && !gate.server_pending && !gate.blocked.length && !gate.pending_commit && !repairable(gate)
-      && !this.offers.has(remote.group)
+      && !this.offers.has(remote.group) && !this.renewalDue(remote.group, gate)
       && this.syncedVersions.has(remote.group) && this.syncedVersions.get(remote.group) === (this.groupVersions.get(remote.group) ?? 0);
   }
   /** After joining, ask the server to route history to this device; senders
