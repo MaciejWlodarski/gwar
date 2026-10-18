@@ -327,8 +327,18 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
             </span>
           )}
           <span className="ml-auto flex shrink-0 items-center gap-1.5">
-            {client.muted && !client.deafened && <MicOff aria-label={t("tree.muted")} className="size-3.5 text-danger" />}
-            {client.deafened && <HeadphoneOff aria-label={t("tree.deafened")} className="size-3.5 text-danger" />}
+            {client.server_muted && !client.server_deafened && (
+              <MicOff aria-label={t("tree.serverMuted")} className="size-3.5 text-warn">
+                <title>{t("tree.serverMuted")}</title>
+              </MicOff>
+            )}
+            {client.server_deafened && (
+              <HeadphoneOff aria-label={t("tree.serverDeafened")} className="size-3.5 text-warn">
+                <title>{t("tree.serverDeafened")}</title>
+              </HeadphoneOff>
+            )}
+            {!client.server_muted && !client.server_deafened && client.muted && !client.deafened && <MicOff aria-label={t("tree.muted")} className="size-3.5 text-danger" />}
+            {!client.server_deafened && client.deafened && <HeadphoneOff aria-label={t("tree.deafened")} className="size-3.5 text-danger" />}
             {!compact && client.platform !== "web" && (
               <span className="rounded bg-hover px-1 text-[10px] font-medium leading-4 text-subtle">{PLATFORM_LABEL[client.platform]}</span>
             )}

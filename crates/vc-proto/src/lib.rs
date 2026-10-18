@@ -86,6 +86,15 @@ wire! {
         ClientUpdate(ClientUpdate),
         #[serde(rename = "client.move")]
         ClientMove { client: SessionId, channel: ChannelId },
+        /// Mutes or deafens someone for everyone (`mute_members` in their channel); absent fields stay.
+        #[serde(rename = "client.voice")]
+        ClientVoice {
+            client: SessionId,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            muted: Option<bool>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            deafened: Option<bool>,
+        },
         #[serde(rename = "client.kick")]
         ClientKick { client: SessionId, #[serde(default)] reason: Option<String> },
         /// Joins the channel's voice room (leaving any other).
@@ -808,6 +817,12 @@ wire! {
         pub voice: bool,
         #[serde(deserialize_with = "voice::required_option")]
         pub voice_binding: Option<VoiceBinding>,
+        /// Muted for everyone by a moderator (`client.voice`).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub server_muted: bool,
+        /// Deafened for everyone by a moderator: hears nothing.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub server_deafened: bool,
     }
 
     pub struct Group {
@@ -920,6 +935,8 @@ wire! {
         Speak,
         /// Write in a channel's chat.
         SendMessages,
+        /// Mute or deafen someone for everyone in a channel.
+        MuteMembers,
     }
 
     #[derive(Default)]
@@ -993,7 +1010,7 @@ wire! {
 }
 
 impl Permission {
-    pub const ALL: [Permission; 15] = [
+    pub const ALL: [Permission; 16] = [
         Permission::Administrator,
         Permission::ManageServer,
         Permission::ManageRoles,
@@ -1009,6 +1026,7 @@ impl Permission {
         Permission::Connect,
         Permission::Speak,
         Permission::SendMessages,
+        Permission::MuteMembers,
     ];
 
     /// What every new member may do.
@@ -1021,7 +1039,7 @@ impl Permission {
     ];
 
     /// The permissions a channel can override (docs/roles.md, "Overrides").
-    pub const CHANNEL: [Permission; 8] = [
+    pub const CHANNEL: [Permission; 9] = [
         Permission::Connect,
         Permission::Speak,
         Permission::SendMessages,
@@ -1030,6 +1048,7 @@ impl Permission {
         Permission::MoveMembers,
         Permission::BypassPassword,
         Permission::ManageChannels,
+        Permission::MuteMembers,
     ];
 
     pub fn is_channel(self) -> bool {

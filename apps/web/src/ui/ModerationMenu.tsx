@@ -1,11 +1,12 @@
 import * as ContextMenu from "@radix-ui/react-context-menu";
-import { Ban, Pencil, ChevronRight, ShieldCheck, UserMinus, UserX } from "lucide-react";
+import { Ban, Pencil, ChevronRight, HeadphoneOff, MicOff, ShieldCheck, UserMinus, UserX } from "lucide-react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
+import { isTeamSpeak } from "../lib/platform";
 import { canActOn, canGiveGroup, ADMIN_GROUP, MEMBER_GROUP, orderedGroups, toggleGroup } from "../lib/permissions";
 import { controller } from "../state/controller";
 import { useSession, useUi, type PersonRef } from "../state/stores";
-import { useMyWho, usePermission, useWhoOf } from "./hooks";
+import { useChannelPermission, useMyWho, usePermission, useWhoOf } from "./hooks";
 import { menuContent, menuItem, menuItemDanger, menuSeparator } from "./kit";
 
 /**
@@ -19,22 +20,26 @@ export function ModerationItems({ person, groups }: { person: PersonRef; groups:
   const kind = useSession((s) => s.kind);
   const defs = useSession((s) => s.groups);
   const me = useMyWho();
-  const target = useWhoOf(person.uid, groups);
+  const rank = useWhoOf(person.uid, groups);
   const canKick = usePermission("kick_members");
   const canBan = usePermission("ban_members");
   const canGroups = usePermission("manage_roles");
   const canRemove = usePermission("manage_members");
   const canRename = usePermission("manage_members");
+  // Muting for everyone: in the channel the person is in.
+  const target = useSession((s) => (person.session !== undefined ? s.clients[person.session] : undefined));
+  const canMuteHere = useChannelPermission(target?.channel ?? null, "mute_members");
   // TeamSpeak servers keep their own bans and roles: only kicking is offered there, as before.
   const vc = kind === "vc";
   // Only someone ranked below me (docs/roles.md).
-  const stronger = vc && !canActOn(me, target, defs);
+  const stronger = vc && !canActOn(me, rank, defs);
   const showRename = vc && (isMe || (canRename && !stronger));
   const showKick = !isMe && canKick && person.session !== undefined;
   const showBan = !isMe && vc && canBan;
   const showRoles = !isMe && vc && canGroups;
   const showRemove = !isMe && vc && canRemove;
-  if (!showRename && !showKick && !showBan && !showRoles && !showRemove) return null;
+  const showVoice = !isMe && vc && !!target && target.channel !== null && canMuteHere;
+  if (!showRename && !showKick && !showBan && !showRoles && !showRemove && !showVoice) return null;
 
   const roles = orderedGroups(defs).filter((g) => g.id !== MEMBER_GROUP);
 
@@ -84,6 +89,27 @@ export function ModerationItems({ person, groups }: { person: PersonRef; groups:
             </ContextMenu.SubContent>
           </ContextMenu.Portal>
         </ContextMenu.Sub>
+      )}
+      {showVoice && (
+        <>
+          <ContextMenu.Item
+            className={menuItem}
+            disabled={stronger}
+            onSelect={() => void controller.attempt(controller.setVoiceFor(person.session!, { muted: !target!.server_muted }))}
+          >
+            <MicOff className="size-4" /> {t(target!.server_muted ? "mod.unmuteAll" : "mod.muteAll")}
+          </ContextMenu.Item>
+          {/* A TeamSpeak user hears through the puppets, which a deafen does not reach (docs/roles.md). */}
+          {!isTeamSpeak(target!.platform) && (
+            <ContextMenu.Item
+              className={menuItem}
+              disabled={stronger}
+              onSelect={() => void controller.attempt(controller.setVoiceFor(person.session!, { deafened: !target!.server_deafened }))}
+            >
+              <HeadphoneOff className="size-4" /> {t(target!.server_deafened ? "mod.undeafenAll" : "mod.deafenAll")}
+            </ContextMenu.Item>
+          )}
+        </>
       )}
       {showKick && (
         <ContextMenu.Item

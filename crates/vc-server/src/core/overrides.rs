@@ -223,7 +223,8 @@ impl Core {
     }
 
     /// Takes out of voice, in `channel` and every channel under it, whoever may no longer join
-    /// there. TeamSpeak users follow their own server.
+    /// there. TeamSpeak users, always in some channel, go to the default one (and the bridge
+    /// moves them there on TeamSpeak).
     pub(super) fn enforce_connect(&mut self, channel: ChannelId) {
         self.enforce_connect_where(|core, c| core.is_descendant(c, channel));
     }
@@ -234,20 +235,75 @@ impl Core {
     }
 
     fn enforce_connect_where(&mut self, within: impl Fn(&Self, ChannelId) -> bool) {
-        let affected: Vec<SessionId> = self
+        let fallback = self.info.default_channel;
+        let affected: Vec<(SessionId, bool)> = self
             .sessions
             .values()
-            .filter(|s| s.out.is_some())
-            .filter(|s| s.channel.is_some_and(|c| within(self, c)))
+            .filter(|s| s.channel.is_some_and(|c| within(self, c) && (s.out.is_some() || c != fallback)))
             .filter(|s| {
                 let c = s.channel.expect("in a channel");
                 !self.channel_permissions(&s.uid, &s.groups, c).contains(&Permission::Connect)
             })
-            .map(|s| s.id)
+            .map(|s| (s.id, s.out.is_none()))
             .collect();
-        for session in affected {
-            let _ = self.channel_leave(session);
+        for (session, remote) in affected {
+            if remote {
+                // A move the bridge did not ask for reaches it as usual; during a bridge message
+                // it is told afterwards.
+                let _ = self.move_client(session, Some(fallback));
+                if self.applying_remote {
+                    self.bridge_corrections.push(session);
+                }
+            } else {
+                let _ = self.channel_leave(session);
+            }
         }
+        // Who may speak can have changed as well: the SFU follows.
+        self.publish_routing();
+    }
+
+    /// Mutes or deafens someone for everyone (docs/roles.md, `mute_members`): needs the permission in
+    /// their channel and a rank above theirs. Lasts for their connection.
+    pub(super) fn client_voice(
+        &mut self,
+        session: SessionId,
+        client: SessionId,
+        muted: Option<bool>,
+        deafened: Option<bool>,
+    ) -> Reply {
+        let Some(target) = self.sessions.get(&client) else {
+            return Err(err(ErrorCode::NotFound, "no such client"));
+        };
+        let Some(channel) = target.channel else {
+            return Err(err(ErrorCode::BadRequest, "this person is not in voice"));
+        };
+        if client == session {
+            return Err(err(ErrorCode::BadRequest, "mute or deafen yourself instead"));
+        }
+        // A TeamSpeak user hears through the bridge's puppets, which a deafen does not reach.
+        if deafened.is_some() && target.out.is_none() {
+            return Err(err(ErrorCode::BadRequest, "TeamSpeak users cannot be deafened from here"));
+        }
+        self.require_in(session, channel, Permission::MuteMembers)?;
+        if !self.outranks(session, &target.uid, &target.groups) {
+            return Err(err(ErrorCode::Forbidden, "this member is not below your rank"));
+        }
+        let s = self.sessions.get_mut(&client).expect("checked above");
+        if let Some(muted) = muted {
+            s.server_muted = muted;
+        }
+        if let Some(deafened) = deafened {
+            s.server_deafened = deafened;
+        }
+        self.client_updated(client);
+        self.publish_routing();
+        Ok(Response::Empty {})
+    }
+
+    /// Whether a remote (TeamSpeak) session may be in `channel`'s voice; if not, the bridge
+    /// is told to put it back (see `bridge_corrections`).
+    pub(super) fn remote_may_join(&self, uid: &str, groups: &[GroupId], channel: ChannelId) -> bool {
+        self.channel_permissions(uid, groups, channel).contains(&Permission::Connect)
     }
 
     /// Drops a deleted role's overrides (the database already did) and tells those who see them.

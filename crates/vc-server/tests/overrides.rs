@@ -222,6 +222,36 @@ async fn a_removed_members_overrides_go_with_them() {
 }
 
 #[tokio::test]
+async fn moderators_mute_and_deafen_for_everyone_those_ranked_below() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let mut bob = Client::connect(&server, "bob").await;
+    let mods = role(&mut root, "Mods", json!(["mute_members"])).await;
+    give(&mut root, &alice, json!([2, mods])).await;
+    let room = channel_id(&root.create_channel(json!({"name": "Room"})).await);
+    let bob_id = bob.id();
+    // Not someone outside voice, not oneself, not someone above.
+    assert_eq!(alice.fails("client.voice", json!({"client": bob_id, "muted": true})).await, "bad_request");
+    bob.ok("channel.join", json!({"channel": room})).await;
+    root.ok("channel.join", json!({"channel": room})).await;
+    assert_eq!(alice.fails("client.voice", json!({"client": alice.id(), "muted": true})).await, "bad_request");
+    assert_eq!(alice.fails("client.voice", json!({"client": root.id(), "muted": true})).await, "forbidden");
+    alice.ok("client.voice", json!({"client": bob_id, "muted": true, "deafened": true})).await;
+    let seen = bob.next_event_where("client.updated", |c| c["id"] == bob_id && c["server_muted"] == true).await;
+    assert_eq!(seen["server_deafened"], true);
+    alice.ok("client.voice", json!({"client": bob_id, "muted": false})).await;
+    // Deafened stays until lifted.
+    bob.next_event_where("client.updated", |c| {
+        c["id"] == bob_id && c.get("server_muted").is_none() && c["server_deafened"] == true
+    })
+    .await;
+    // Without mute_members in that channel, nothing.
+    root.ok("channel.override", for_role(room, mods, json!([]), json!(["mute_members"]))).await;
+    assert_eq!(alice.fails("client.voice", json!({"client": bob_id, "deafened": false})).await, "forbidden");
+}
+
+#[tokio::test]
 async fn deleting_a_channel_keeps_private_ones_hidden_from_the_deleter_and_says_nothing_of_them() {
     let server = TestServer::start().await;
     let mut root = admin(&server, "root").await;

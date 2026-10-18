@@ -342,6 +342,8 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>, previous: &View)
                     away: c.away_message.clone(),
                     talking: talking.contains_key(&c.id.0),
                     voice: true,
+                    server_muted: false,
+                    server_deafened: false,
                     voice_binding: Some(
                         previous
                             .clients
@@ -583,6 +585,7 @@ fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Option<Out
         | Request::GroupDelete { .. }
         | Request::GroupReorder { .. }
         | Request::ChannelOverrideSet { .. }
+        | Request::ClientVoice { .. }
         | Request::MemberNickname { .. }
         | Request::MemberGroups { .. }
         | Request::MemberRemove { .. }
