@@ -385,6 +385,8 @@ export class SframeState {
     if (frame.length < MIN_FRAME || frame.length > MAX_FRAME) { this.counters.oversize_dropped++; return null; }
     const header = decodeHeader(frame);
     if (!header) { this.counters.auth_failed++; return null; }
+    // Retention is exact: an epoch past its window opens nothing, whatever the sweep timer.
+    this.sweep();
     const low = header.kid >> 32n, leaf = Number(header.kid & 0xffffffffn);
     const newest = [...this.epochs.values()].filter(k => (k.epoch & 0xffffffffn) === low).sort((a, b) => (a.epoch > b.epoch ? -1 : 1));
     if (newest.some(k => k.ownLeaf === leaf)) { this.counters.own_kid_dropped++; return null; }

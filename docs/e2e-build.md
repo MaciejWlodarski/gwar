@@ -33,7 +33,8 @@ and the web client working after every merge.
 8. **Pre-release reviews**: the WebCrypto SFrame worker; `openmls_rust_crypto`
    and our storage.
 
-Parts 1–7 are specified below. Voice comes before private channels and the
+Parts 1–7 are specified below and built. Step 8 began with an internal
+audit (below, "Step 8: internal audit"); an independent review verifies it. Voice comes before private channels and the
 archive because it is the product's core and needs only public channel
 groups.
 
@@ -2035,6 +2036,39 @@ Check the native wrapper/IPC binding and cross-implementation vectors as
 part of that review. Native SFrame already uses the fixed crates.io release
 (sframe 2.1.0); a green interop test does not substitute for the worker
 review.
+
+### Step 8: internal audit (2026-10-18)
+
+Read against RFC 9605 and this section; an independent review verifies it.
+
+- **WebCrypto SFrame worker** (`apps/web/src/voice/sframe`): header encoding
+  (minimal, BigInt, non-minimal and truncated forms refused; RFC C.1 vectors),
+  key and salt derivation (HKDF-SHA256 with empty salt, labels with the u64
+  KID and suite; RFC C.3 vector including the header ‖ metadata AAD order),
+  nonce (salt XOR the counter), one-directional non-extractable keys, counter
+  reserved before each attempt and capped at 2^32 (then securing until an own
+  update), monotonic activation, no reinstall of a processed epoch in a new
+  run (`resumeAfter`; voice groups are volatile), replay window (fresh check,
+  authentication, atomic admit; concurrent decryptions admit once), own-KID
+  drop, removal fences across asynchronous imports, ordered controls with a
+  bounded queue, and a worker that starts closed and stops on any failure
+  (no plaintext passthrough). Native interop vectors match. **Changed:**
+  retention was enforced by a one-second sweep, so an epoch could open
+  frames up to a second past its window; both engines now sweep before
+  choosing a key.
+- **Native wrapper and IPC** (`vc-client` `sframe.rs`, `keys.rs`; desktop
+  `voice_set_keys`): the same contract on the fixed `sframe` 2.1.0 release;
+  the IPC command is main-window only, bound to the run, size-checked before
+  parsing, and wipes the exporter keys on every exit.
+- **OpenMLS provider** (`crypto.rs`, `hpke.rs`): one suite (X25519,
+  AES-128-GCM, SHA-256, Ed25519), strict Ed25519 verification, contributory
+  X25519 only, HPKE base mode only; cross-checked against `openmls_rust_crypto`.
+- **Storage** (`mls_storage.rs`, `agent/storage.rs`, `mls/storage.ts`):
+  labels and keys cannot collide; a group's epoch key pairs are purged with
+  it; no past-epoch message secrets are kept (plaintext wire format, default
+  `max_past_epochs`); every operation is one IndexedDB transaction, and a
+  rejected operation is reloaded. The store is not encrypted at rest:
+  **documented** in docs/security.md ("Device storage").
 
 ## 6. Private channels
 

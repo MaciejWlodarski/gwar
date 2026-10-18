@@ -467,18 +467,20 @@ Connect, next to the vault (which is capped at 64 KiB and stays as it is):
   a **key transfer**, signed by a current device of the account: account
   key, manifest hash and generation, the recipient (device key and X25519
   key, or recovery key version), and the HPKE encapsulation and ciphertext.
-  The sender first learns the manifest's revocations and never transfers to
-  a device revoked by them or by its own feed. Manifests never change. An
-  existing device sends transfers for every generation it can open when it
-  sees a new device's certificate; until one is online, the new device reads
-  nothing from the archive.
+  The sender judges eligibility with the revocations it knows at that moment
+  (its feed and every manifest's) and never transfers to a revoked device or
+  one without a current certificate. Manifests never change. Each device
+  sends transfers of every generation it can open to every current device a
+  generation does not name, and to a recovery key version a generation is not
+  sealed to, once per generation and recipient (a transfer already on Connect
+  counts); until one is online, a new device reads nothing from the archive.
 - **Changing the recovery code** (which needs the password and a signed-in
-  device) publishes a new recovery key version; that device then sends
-  transfers of every generation it can open to the new recovery key and
-  creates a new generation sealed to it. If it cannot open some generation,
-  it says so: "History before … can't be restored with the new recovery
-  code." With that caveat, the recovery code opens the whole archive, so
-  history survives losing all devices.
+  device) shows the new code first and changes nothing until you confirm you
+  kept it; once Connect took it, the device publishes a new recovery key
+  version. Every device then transfers the generations it can open to it,
+  and the next upload creates a new generation sealed to it. The recovery
+  code thus opens the whole archive any current device can open, so history
+  survives losing all devices.
 - Older generations stay usable for **reading**; only uploads follow the
   rules above.
 - Each record holds its context (server key, group id, epoch) and key inside

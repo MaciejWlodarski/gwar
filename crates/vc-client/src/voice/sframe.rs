@@ -804,6 +804,8 @@ impl SframeState {
             self.counters.auth_failed += 1;
             return None;
         };
+        // Retention is exact: an epoch past its window opens nothing, whatever the sweep timer.
+        self.sweep(now);
         let (low, leaf) = (kid >> 32, kid as u32);
         let newest: Vec<u64> = self.epochs.keys().rev().copied().filter(|e| e & 0xffff_ffff == low).collect();
         if newest.iter().any(|e| self.epochs[e].own_leaf == leaf) {

@@ -180,6 +180,19 @@ describe("SframeState", () => {
     expect(await b.state.decrypt((await late.state.encrypt(OPUS.slice()))!)).toBeNull();
   });
 
+  it("checks retention before choosing a key, not only on the sweep timer", async () => {
+    const clock = new Clock(); clock.t = 0;
+    const a = engine(), b = engine(clock);
+    await a.enter(1n, 0, members(1n, [[0, 0], [1, 1]]));
+    await b.enter(1n, 1, members(1n, [[0, 0], [1, 1]]));
+    const frame = (await a.state.encrypt(OPUS.slice()))!;
+    await b.ok({ action: "supersede", epoch: "2" });
+    await b.ok({ action: "install", epoch: "2", own_leaf: 1, members: members(2n, [[0, 0], [1, 1]]), removed: [] });
+    clock.t = 10_000;
+    expect(await b.state.decrypt(frame)).toBeNull();
+    expect(b.state.retained).toEqual([2n]);
+  });
+
   it("starts retention at the barrier, not the import (delayed barrier and delayed import)", async () => {
     // Barrier for epoch 2 applied at engine time 1 s, prompt install: epoch 1 kept until 11 s.
     const clock = new Clock(); clock.t = 0;

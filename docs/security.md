@@ -339,6 +339,16 @@ Every guarantee assumes your client runs genuine code.
   of a closed connection never reaches the next one, even on the same server.
   A compromised interface could still name any server, as it can connect to
   one.
+- **Device storage.** A device keeps its MLS state (signature and HPKE
+  private keys, group secrets of the current epoch), the epoch keys of every
+  conversation it reads, its key archive state and its Connect record (device
+  key, session) in the browser profile or the desktop app's data (IndexedDB),
+  not encrypted beyond what the operating system provides. Anyone who can read
+  that profile can read the history those keys open and act as the device
+  until it is revoked: protect it with the operating system's login and disk
+  encryption, and revoke a lost device. Deleted keys (a forgotten group, a
+  removed epoch) are deleted from the database; the underlying files may keep
+  old pages until they are compacted.
 - **Web apps hosted by other servers** are other origins: they don't have your
   keys, but they can phish your Connect password.
 - **Uploaded files** are served with `nosniff`, a sandboxing CSP and
