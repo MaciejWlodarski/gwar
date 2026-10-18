@@ -2055,7 +2055,8 @@ Read against RFC 9605 and this section; an independent review verifies it.
   (no plaintext passthrough). Native interop vectors match. **Changed:**
   retention was enforced by a one-second sweep, so an epoch could open
   frames up to a second past its window; both engines now sweep before
-  choosing a key.
+  choosing a key, and the web worker again after its asynchronous
+  decryption (a frame whose decryption crossed the window is dropped).
 - **Native wrapper and IPC** (`vc-client` `sframe.rs`, `keys.rs`; desktop
   `voice_set_keys`): the same contract on the fixed `sframe` 2.1.0 release;
   the IPC command is main-window only, bound to the run, size-checked before

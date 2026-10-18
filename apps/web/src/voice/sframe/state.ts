@@ -399,7 +399,9 @@ export class SframeState {
       const fence = this.removals.get(receiver.device) ?? 0;
       const plaintext = await open(receiver.key, aad, header.ctr, new Uint8Array(), body, this.options.subtle);
       if (!plaintext) continue;
-      // Recheck after the await: the run, the retained key and its device's membership.
+      // Recheck after the await: retention (the window may have closed meanwhile), the run, the
+      // retained key and its device's membership.
+      this.sweep();
       if (this.ended || this.epochs.get(keys.epoch) !== keys || keys.receivers.get(leaf) !== receiver || (this.removals.get(receiver.device) ?? 0) !== fence) {
         this.counters.no_key++; return null;
       }

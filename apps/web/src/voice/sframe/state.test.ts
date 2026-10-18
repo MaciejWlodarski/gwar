@@ -24,9 +24,9 @@ const members = (epoch: bigint, leaves: [number, number][], salt = 0): Member[] 
 
 class Clock { t = 1_000; wall = 1_800_000_000_000; now = () => this.t; wallNow = () => this.wall; }
 
-function engine(clock = new Clock(), resumeAfter: bigint | null = null) {
+function engine(clock = new Clock(), resumeAfter: bigint | null = null, subtle?: SubtleCrypto) {
   const statuses: CryptoStatus[] = [];
-  const state = new SframeState({ binding, resumeAfter, now: clock.now, wallNow: clock.wallNow, onStatus: s => statuses.push(s) });
+  const state = new SframeState({ binding, resumeAfter, now: clock.now, wallNow: clock.wallNow, onStatus: s => statuses.push(s), subtle });
   let serial = 0;
   const send = (c: Record<string, unknown>) => state.control({ binding, serial: String(++serial), ...c });
   const ok = async (c: Record<string, unknown>) => {
@@ -190,6 +190,29 @@ describe("SframeState", () => {
     await b.ok({ action: "install", epoch: "2", own_leaf: 1, members: members(2n, [[0, 0], [1, 1]]), removed: [] });
     clock.t = 10_000;
     expect(await b.state.decrypt(frame)).toBeNull();
+    expect(b.state.retained).toEqual([2n]);
+  });
+
+  it("rechecks retention after a decryption that crossed the window", async () => {
+    const real = crypto.subtle;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const slow = {
+      importKey: real.importKey.bind(real), deriveBits: real.deriveBits.bind(real), encrypt: real.encrypt.bind(real),
+      decrypt: async (...args: Parameters<SubtleCrypto["decrypt"]>) => { await gate; return real.decrypt(...args); },
+    } as unknown as SubtleCrypto;
+    const clock = new Clock(); clock.t = 0;
+    const a = engine(), b = engine(clock, null, slow);
+    await a.enter(1n, 0, members(1n, [[0, 0], [1, 1]]));
+    await b.enter(1n, 1, members(1n, [[0, 0], [1, 1]]));
+    const frame = (await a.state.encrypt(OPUS.slice()))!;
+    await b.ok({ action: "supersede", epoch: "2" });
+    await b.ok({ action: "install", epoch: "2", own_leaf: 1, members: members(2n, [[0, 0], [1, 1]]), removed: [] });
+    clock.t = 9_999;
+    const pending = b.state.decrypt(frame);
+    clock.t = 10_001;
+    release();
+    expect(await pending).toBeNull();
     expect(b.state.retained).toEqual([2n]);
   });
 
