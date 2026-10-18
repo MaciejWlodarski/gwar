@@ -2686,8 +2686,9 @@ after losing every device, reads the account's history. The archive holds
 keys, never MLS state, membership or messages. Local identities have no
 archive.
 
-Parts: **7a** the archive crypto in `crates/gwar-archive` (statements,
-sealing, safety rules, test vectors); **7b** Connect's archive API and
+Parts: **7a** the archive crypto in `crates/gwar-mls` (module `archive`,
+with the HPKE and AEAD of history bundles and chat; statements, sealing,
+safety rules, test vectors); **7b** Connect's archive API and
 storage; **7c** the client: device and recovery keys, uploads, transfers,
 imports, the setting, recovery.
 
