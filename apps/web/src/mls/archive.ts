@@ -210,18 +210,15 @@ export class KeyArchive {
 
   private async transfers(token: string, session: ArchiveSession, state: ArchiveState): Promise<void> {
     for (const recipient of state.waiting) {
-      const sent: string[] = [];
-      try {
-        // One at a time, each judged with the feed as it is then.
-        for (;;) {
-          const [next] = await this.engine.run(async () => this.engine.query<[string, number[]][]>({ archive_transfers_for: { recipient, now: this.o.now(), revocations: this.revocations(session) } }))
-            .then(all => all.filter(([tag]) => !sent.includes(tag)), () => []);
-          if (!next) break;
-          await this.o.api.postArchiveTransfer(token, encodeBase64Url(new Uint8Array(next[1])));
-          sent.push(next[0]);
-        }
-      } finally {
-        if (sent.length) await this.engine.run(() => this.engine.op({ archive_transfers_sent: { tags: sent } }));
+      // One at a time, each judged with the feed as it is then and marked sent once Connect has it.
+      for (let sent = 0; sent < MAX_TRANSFER_PAGES * 100; sent++) {
+        // A recipient no longer current (revoked or expired since the sync) gets nothing.
+        const [next] = await this.engine.run(async () => this.engine.query<[string, number[]][]>({
+          archive_transfers_for: { recipient, now: this.o.now(), revocations: this.revocations(session), limit: 1 },
+        })).catch(() => []);
+        if (!next) break;
+        await this.o.api.postArchiveTransfer(token, encodeBase64Url(new Uint8Array(next[1])));
+        await this.engine.run(() => this.engine.op({ archive_transfers_sent: { tags: [next[0]] } }));
       }
     }
   }

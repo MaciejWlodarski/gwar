@@ -614,7 +614,8 @@ impl Agent {
 
     /// Transfers of the generation keys this device holds that `recipient` (a device of the
     /// account current at `now`, or `recovery:{version}` for the current recovery key) lacks and
-    /// was not sent yet, by generation, judged with `revocations` (Connect's feed now) learned.
+    /// was not sent yet, by generation (at most `limit`), judged with `revocations` (Connect's
+    /// feed now) learned.
     /// This device must be current itself. Posted to Connect;
     /// then [`Agent::archive_transfers_sent`].
     pub fn archive_transfers_for(
@@ -622,6 +623,7 @@ impl Agent {
         recipient: &str,
         now: i64,
         revocations: &[ArchiveRevocation],
+        limit: usize,
     ) -> Result<Vec<(String, Vec<u8>)>> {
         let record = &self.archive_now(revocations)?;
         let certificate = self.account_certificate()?;
@@ -641,7 +643,7 @@ impl Agent {
         };
         let owed = record.owed(self.credential.device_key(), now)?;
         let mut out = Vec::new();
-        for generation in owed.get(recipient).into_iter().flatten() {
+        for generation in owed.get(recipient).into_iter().flatten().take(limit) {
             let m = record.manifest(*generation)?;
             let key = record.keys.get(generation).ok_or(Invalid("generation key"))?;
             let t = Transfer::create(&m, key, &self.signer.0, certificate, to.clone(), &x25519, now)

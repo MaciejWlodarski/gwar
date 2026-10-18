@@ -255,6 +255,7 @@ enum Request {
         recipient: String,
         now: i64,
         revocations: Vec<gwar_mls::agent::ArchiveRevocation>,
+        limit: usize,
     },
     ArchiveTransfersSent {
         tags: Vec<String>,
@@ -577,8 +578,8 @@ impl Agent {
             }
             Request::ArchiveUploaded { epochs } => output(a.archive_uploaded(&epochs).map_err(error)?),
             Request::ArchiveImport { records } => output(a.archive_import(&records).map_err(error)?),
-            Request::ArchiveTransfersFor { recipient, now, revocations } => {
-                output(a.archive_transfers_for(&recipient, now, &revocations).map_err(error)?)
+            Request::ArchiveTransfersFor { recipient, now, revocations, limit } => {
+                output(a.archive_transfers_for(&recipient, now, &revocations, limit).map_err(error)?)
             }
             Request::ArchiveTransfersSent { tags } => output(a.archive_transfers_sent(&tags).map_err(error)?),
             Request::AcceptPrivateChain { server, conversation, chain, group_info, tree, now, revocations } => {
