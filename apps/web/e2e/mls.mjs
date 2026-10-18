@@ -67,8 +67,15 @@ try {
     if (pages.length === 2) {
       const uids = await Promise.all(pages.map(p => p.evaluate(() => window.mls.uid)));
       const conversation = `dm:${uids.sort().join(":")}`;
-      await pages[0].evaluate(c => window.mls.runtime.openConversation(c), conversation);
-      await pages[1].evaluate(() => window.mls.runtime.sync());
+      // The other device may join the new group at the same moment, making the first add commit
+      // stale; the runtime settles that on its next pass, as the app does, so open until it holds.
+      await until("the conversation is created", async () => {
+        try { await pages[0].evaluate(c => window.mls.runtime.openConversation(c), conversation); return true; }
+        catch (error) { console.error("opening again after:", String(error).split("\n")[0]); return false; }
+      });
+      await until("the second device is in the group", async () => {
+        try { await pages[1].evaluate(() => window.mls.runtime.sync()); return true; } catch { return false; }
+      });
       const message = await pages[0].evaluate(c => window.mls.seal(c), conversation);
       const opened = await pages[1].evaluate(m => window.mls.runtime.openMessage(m), message);
       assert.equal(opened.ok?.text, "encrypted hello");
