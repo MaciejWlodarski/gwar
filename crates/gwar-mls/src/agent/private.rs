@@ -343,6 +343,7 @@ impl Agent {
             let (anchor, list) = record.pair()?.ok_or(AgentError::Waiting)?;
             let current = rules::access(group.public_group().group_context()).ok_or(Invalid("access lists"))?;
             let checkpoint = a.groups[&key].access.clone();
+            let members_none = members.is_none();
             let members = match members {
                 // The next seq after the list this device accepted: a list it never accepted (never
                 // current, or history only) sets no floor.
@@ -360,7 +361,11 @@ impl Agent {
                 None => current.members().clone(),
             };
             let access = Access::new(anchor, list, members);
-            if !access.current(&chain, id, now, revocations) {
+            // A removal-only repair keeps the lists the device holds current authority under (they
+            // need not be renewable, e.g. a list a former owner signed); anything new must be current.
+            let removal_only =
+                members_none && matches!(gate.access, Some(Authority::Remove { .. })) && access == current;
+            if !removal_only && !access.current(&chain, id, now, revocations) {
                 return Err(AgentError::Waiting);
             }
             let encoded = access.encode();

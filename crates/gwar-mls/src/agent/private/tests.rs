@@ -280,3 +280,55 @@ fn a_forgotten_group_keeps_its_access_checkpoint() {
     let info = out.group_info.clone();
     assert!(p.member.join_external(&server(), &info, Some(&tree), p.t, &()).is_ok());
 }
+
+#[test]
+fn a_former_owners_leaf_is_removed_without_renewing_the_lists() {
+    let t = now();
+    let chain = OwnerChain::new(Genesis { server_key: server(), generation: 1, owner_uid: uid(1) });
+    let mut owner = device(1, 11, t, &chain);
+    let mut manager = device(2, 21, t, &chain);
+    // Account 2 is a manager; it signs the member list after the owner creates the group.
+    let first = pair(&chain, &owner, 1, &[2], t);
+    accept_pair(&mut owner, &first, t);
+    accept_pair(&mut manager, &first, t);
+    let d = descriptor(&owner, t);
+    let id = d.group_id();
+    let info = owner.create_private(d, &[], t, &()).unwrap();
+    owner.take_changes();
+    owner.settle(&server(), &id, Some(&id)).unwrap();
+    owner.take_changes();
+    let mut observer = Observer::create_with(&info, &server(), Some(chain.clone())).unwrap();
+    let out = manager.join_external(&server(), &info, Some(&observer.tree().unwrap().1), t, &()).unwrap();
+    manager.take_changes();
+    observer = observer.commit(&out.commit, &out.group_info, None, t, t).unwrap().0;
+    ack(&mut manager, &id, &out);
+    let out = manager.commit_access(&server(), &id, Some(&[uid(3)]), t, &()).unwrap();
+    manager.take_changes();
+    observer = observer.commit(&out.commit, &out.group_info, None, t, t).unwrap().0;
+    ack(&mut manager, &id, &out);
+    assert_eq!(manager.observe_access(&server(), &id, t, &()).unwrap(), Some(Authority::Current));
+    manager.take_changes();
+    // Ownership moves to account 5 with the anchor: the former owner's leaf is no longer admitted.
+    let link = crate::owner::OwnerLink {
+        server_key: server(),
+        generation: 1,
+        seq: 1,
+        previous_link_hash: chain.head(),
+        previous_owner_account_key: public(&key(1)),
+        new_owner_uid: uid(5),
+        anchor_hash: Some(first.0.hash()),
+        signed_at: t,
+    };
+    let link = crate::owner::SignedLink::sign(link, &key(1));
+    let links = vec![(link.link().statement(), link.signature().to_owned())];
+    manager.check_owner(&server(), &chain.genesis().statement(), links, None).unwrap();
+    manager.take_changes();
+    let Some(Authority::Remove { leaves }) = authority(&manager, &id, t) else { panic!("a removal is due") };
+    assert_eq!(leaves.len(), 1);
+    // The manager list was signed by the former owner, yet the removal needs no renewal.
+    let out = manager.commit_access(&server(), &id, None, t, &()).unwrap();
+    manager.take_changes();
+    observer.commit(&out.commit, &out.group_info, None, t, t).unwrap();
+    ack(&mut manager, &id, &out);
+    assert_eq!(authority(&manager, &id, t), Some(Authority::Current));
+}
