@@ -61,7 +61,7 @@ import { inAccount, newId, useSettings, type ServerKind } from "./settings";
 import { useConnectUi, useOutbox, useSession, useUi, useVoice, type FailedSend } from "./stores";
 import type { ThreadKey } from "./types";
 
-export const CLIENT_VERSION = "0.1.0";
+export const CLIENT_VERSION = __APP_VERSION__;
 const HISTORY_PAGE = 50;
 /** How long joining an encrypted call may take before it gives up with Retry. */
 const VOICE_SECURING_TIMEOUT_MS = 30_000;
@@ -738,9 +738,7 @@ class Controller {
    * latest warnings and errors. No keys, tokens, passwords or message contents. */
   async reportDiagnostics(): Promise<Record<string, unknown> & { logs: LogEntry[] }> {
     const s = useSession.getState(), v = useVoice.getState();
-    // The web app's build names its commit; the desktop app has its version only.
-    const commit = isDesktop() ? null : await fetch("/version.json", { cache: "no-store", signal: AbortSignal.timeout(2_000) })
-      .then((r) => (r.ok ? r.json() : null)).then((j: unknown) => (j && typeof (j as { commit?: unknown }).commit === "string" ? (j as { commit: string }).commit : null)).catch(() => null);
+    const commit = __APP_COMMIT__ || null;
     return {
       app: { version: CLIENT_VERSION, commit, platform: platform(), userAgent: navigator.userAgent, language: navigator.language },
       time: new Date().toISOString(),

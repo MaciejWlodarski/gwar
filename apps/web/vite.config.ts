@@ -2,6 +2,15 @@ import { contentSecurityPolicy } from "./src/net/csp.ts";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vitest/config";
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+
+// The app's version comes from package.json (set by scripts/bump-version.sh) and the commit it is
+// built from (CI's GITHUB_SHA, else git), so reports and the server know exactly which build runs.
+const version = (JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")) as { version: string }).version;
+const commit = process.env.GITHUB_SHA ?? (() => {
+  try { return execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(); } catch { return ""; }
+})();
 
 // The dev server proxies the WebSocket so `pnpm dev` works against a local
 // `vc-server` without CORS or mixed-content issues.
@@ -22,6 +31,7 @@ export default defineConfig(({ command, mode }) => ({
     },
   },
   build: { target: "es2022", sourcemap: true },
+  define: { __APP_VERSION__: JSON.stringify(version), __APP_COMMIT__: JSON.stringify(commit) },
   // The browser e2e fixtures are imported at run time: scanning them up front
   // keeps Vite from reloading the pages when it finds their dependencies.
   optimizeDeps: { entries: ["index.html", "e2e/*.html", "e2e/*-fixture.{ts,tsx}"] },
