@@ -92,7 +92,14 @@ fn a_member_list_is_valid_only_for_its_group_and_from_an_authorized_signer() {
     // Bound to its group.
     assert!(!Access::new(anchor.clone(), list.clone(), members([3; 32], &[8], 6)).valid(&c, &GROUP, NOW));
     // Certified at the commit's time, not after.
-    assert!(!Access::new(anchor, list, members(GROUP, &[8], 6)).valid(&c, &GROUP, NOW + 31 * 86_400_000));
+    assert!(!Access::new(anchor.clone(), list.clone(), members(GROUP, &[8], 6)).valid(
+        &c,
+        &GROUP,
+        NOW + 31 * 86_400_000
+    ));
+    // Without a commit time, each signer when it signed.
+    assert!(Access::new(anchor.clone(), list.clone(), members(GROUP, &[8], 6)).valid_when_signed(&c, &GROUP));
+    assert!(!Access::new(anchor, list, members([3; 32], &[8], 6)).valid_when_signed(&c, &GROUP));
 }
 
 #[test]

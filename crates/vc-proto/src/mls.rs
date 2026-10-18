@@ -49,6 +49,9 @@ wire! {
         HistoryAck { ids: Vec<String> },
         #[serde(rename = "mls.history.request")]
         HistoryRequest { group: String },
+        /// A fresh signed `0xff01` for a private channel's group, for a member to commit (6c).
+        #[serde(rename = "mls.access.offer")]
+        AccessOffer { group: String, extension: String },
     }
 
     #[serde(untagged, deny_unknown_fields)]
@@ -89,6 +92,8 @@ wire! {
         History { group: String },
         #[serde(rename = "mls.history.wanted")]
         HistoryWanted { group: String, device: String, #[serde(default, skip_serializing_if = "Option::is_none")] assignment: Option<String> },
+        #[serde(rename = "mls.access.offered")]
+        AccessOffered { group: String, extension: String },
     }
 }
 

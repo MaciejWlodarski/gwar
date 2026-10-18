@@ -3,12 +3,13 @@
 
 use std::collections::BTreeSet;
 
-use gwar_mls::access::Access;
+use gwar_mls::access::{Access, MAX_ACCESS_BYTES};
 use gwar_mls::ds::Observer;
 use gwar_mls::owner::OwnerChain;
 use vc_proto::{ChannelId, ErrorBody, ErrorCode, Uid};
 
-use super::{Core, err, mls::channel_id, now_ms, storage_error};
+use super::{Core, Reply, err, mls::channel_id, now_ms, storage_error};
+use vc_proto::{Event, MlsEvent, Response, SessionId};
 
 impl Core {
     /// The owner chain a private channel's lists are checked against.
@@ -112,6 +113,50 @@ impl Core {
             return conflict("an older member list");
         }
         Ok(Some((seq, hash)))
+    }
+
+    /// `mls.access.offer`: a channel authority that cannot commit to a private channel's live group
+    /// offers fresh lists, which go to the group's readers for a member to commit (6c, "Offers").
+    /// The server checks them as it would a commit: its newest pair, a current member list signed
+    /// by the offering user, bound to the group and no older than the checkpoint. It grants nothing.
+    pub(super) fn mls_access_offer(&mut self, session: SessionId, group: &str, extension: &str) -> Reply {
+        let row = self.mls_group_for(session, group)?;
+        if self.private_channel_of(&row.conversation).is_none() {
+            return Err(super::mls::bad("not a private channel's group"));
+        }
+        if self
+            .store
+            .mls_live_group(&row.conversation)
+            .map_err(storage_error)?
+            .is_none_or(|live| live.group != row.group)
+        {
+            return Err(err(ErrorCode::Conflict, "not the conversation's live group"));
+        }
+        let bytes = super::mls::blob(extension, MAX_ACCESS_BYTES)?;
+        let access = Access::parse(&bytes).ok_or_else(|| super::mls::bad("invalid access lists"))?;
+        let id: [u8; 32] = vc_proto::decode_fixed::<32>(group).ok_or_else(|| super::mls::bad("invalid group id"))?;
+        let (Some(owner), Some(chain)) = (&self.owner, self.current_chain()) else {
+            return Err(err(ErrorCode::Conflict, "this server has no owner"));
+        };
+        if access.members().members().signer_uid != self.sessions[&session].uid {
+            return Err(err(ErrorCode::Forbidden, "the offering user signs the member list"));
+        }
+        if !same_pair(owner.pair.as_ref(), &access)
+            || !access.current(&chain, &id, now_ms(), &super::owner::StoredRevocations(&self.store))
+        {
+            return Err(err(ErrorCode::Conflict, "the access lists are not current under this server's managers"));
+        }
+        let (seq, hash) = (access.members().members().seq, access.members().hash());
+        if let Some((old_seq, old_hash)) = self.store.mls_access_checkpoint(group).map_err(storage_error)?
+            && (seq < old_seq || (seq == old_seq && hash != old_hash))
+        {
+            return Err(err(ErrorCode::Conflict, "an older member list"));
+        }
+        let readers = self.mls_readers(&row.conversation);
+        self.broadcast(Event::Mls(MlsEvent::AccessOffered { group: group.into(), extension: extension.into() }), |s| {
+            readers.contains(&s.id)
+        });
+        Ok(Response::Empty {})
     }
 
     /// The private channel a group belongs to, if any.

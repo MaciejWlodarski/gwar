@@ -376,6 +376,7 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
     case "mls.welcome":
     case "mls.history":
     case "mls.history.wanted":
+    case "mls.access.offered":
       return state;
     case "chat.edited":
       return onChatEdited(state, event.d, verified, authentic);

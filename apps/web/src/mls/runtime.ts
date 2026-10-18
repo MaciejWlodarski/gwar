@@ -19,8 +19,10 @@ import type { VoiceState } from "../proto/VoiceState";
 import type { Managers } from "../proto/Managers";
 import type { OwnerInfo } from "../proto/OwnerInfo";
 import type { AgentFactory, Change, OwnerCheck, OwnerGeneration, OwnerView, CommitOutbox, ConversationStatus, Gate, GroupSummary, HistoryJob, OpenResult, PackageJob, Plaintext, RequestJob, Resolution, Revocation, Roster, SealedFields } from "./types";
-import { usable } from "./types";
+import { repairable, usable } from "./types";
 const bytes = (value: string): number[] => [...decodeBase64Url(value)];
+/** The agent's error when a private group's lists give this device no current authority. */
+const WAITING = "waiting for a channel manager";
 const encoded = (value: number[]): string => encodeBase64Url(new Uint8Array(value));
 /** The DS protocol currently uses safe JSON integers; core epochs remain u64 strings. */
 function wireEpoch(value: string | number): number {
@@ -130,6 +132,11 @@ export class MlsRuntime {
   /** Pending restart triggers by conversation: the live pin and checkpoint
    * first found behind, and when (docs/e2e-build.md "Restarts"). */
   private readonly triggers = new Map<string, { key: string; at: number }>();
+  /** Private groups (6c): offered lists to commit, by group; when a due repair may be committed;
+   * offers this device sent for a GroupInfo it could not join (one each). */
+  private readonly offers = new Map<string, string>();
+  private readonly repairAt = new Map<string, number>();
+  private readonly offered = new Map<string, number>();
   private wakeAt: number | undefined;
   /** Volatile voice calls under this device lease, closed with it. */
   private readonly calls = new Set<VoiceCall>();
@@ -219,6 +226,8 @@ export class MlsRuntime {
         if ((event.ev === "channel.deleted" || event.ev === "channel.hidden") && runtime!.channels?.delete(event.d.channel)) runtime!.schedule();
         if (event.ev === "owner.updated") runtime!.checkOwner(event.d);
         if (event.ev === "managers.updated") { runtime!.managers = event.d; runtime!.checkOwner(undefined); }
+        // A member commits offered lists (it validates them first); a waiting newcomer retries.
+        if (event.ev === "mls.access.offered") { runtime!.offers.set(event.d.group, event.d.extension); runtime!.schedule(); return; }
         if (!event.ev.startsWith("mls.")) return;
         if (event.ev === "mls.commit" || event.ev === "mls.proposal") {
           const group = event.d.group;
@@ -480,6 +489,51 @@ export class MlsRuntime {
     const before = this.inventory();
     return this.engine.op<T>(request, result => { validate?.(result); return [...this.historyIntents(before), ...this.supersededJobs()]; });
   }
+  /** A private group's repair (6c): commits offered lists it validates, or, when its own
+   * authority says so, the accepted pair it carries or the removals the lists require, after a
+   * random delay of up to 10 s so that concurrent repairers settle on the first commit. Returns
+   * whether it committed something (the caller then submits it). */
+  private async repairAccess(group: string, gate: Gate): Promise<boolean> {
+    // An offer waits while a newer manager pair is still being checked: it may carry that pair.
+    // It is kept until it brings nothing more (committed, or older than what the group holds), so
+    // an expired or losing commit of it is built again.
+    const offer = this.offers.get(group);
+    if (offer !== undefined && this.managersSettled()) {
+      try {
+        await this.engine.op({ adopt_offer: { ...this.args(group), extension: bytes(offer), now: this.now(), revocations: this.options.revocations() } });
+        return true;
+      } catch (error) {
+        if (!(error instanceof AgentOperationError)) throw error;
+        await this.engine.reload(); // Nothing (more) to commit for this device: dropped.
+        if (this.offers.get(group) === offer) this.offers.delete(group);
+      }
+    }
+    if (!repairable(gate)) { this.repairAt.delete(group); return false; }
+    const at = this.repairAt.get(group);
+    if (at === undefined) { this.repairAt.set(group, this.now() + Math.random() * 10_000); }
+    if (at === undefined || at > this.now()) { this.wakeAt = Math.min(this.wakeAt ?? Infinity, this.repairAt.get(group)!); return false; }
+    this.repairAt.delete(group);
+    await this.engine.op({ commit_access: { ...this.args(group), members: null, now: this.now(), revocations: this.options.revocations() } });
+    return true;
+  }
+  /** Offers fresh lists for a private group this device could not join, when its user is the
+   * owner, a confirmer or a manager. */
+  private async offerAccess(group: string, info: number[], tree: number[] | null): Promise<void> {
+    // Once per GroupInfo and accepted pair: a newer pair needs a fresh offer.
+    const me = this.uid, view = this.owner;
+    const key = `${group}:${view?.generation}:${view?.anchor_seq}:${view?.list_seq}:${encoded(info)}`;
+    // Sent again every ten minutes while the join still waits: a member may have been offline.
+    const sent = this.offered.get(key);
+    if (!view || (sent !== undefined && this.now() - sent < 10 * 60_000) || !(view.owner === me || view.confirmers.includes(me) || view.managers.includes(me))) return;
+    try {
+      const extension = this.engine.query<number[]>({ offer_access: { server: this.server, group_info: info, tree, members: null, now: this.now(), revocations: this.options.revocations() } });
+      await this.request("mls.access.offer", { group, extension: encoded(extension) });
+      // A failed offer is retried with the join's backoff; a delivered one after ten minutes.
+      this.offered.set(key, this.now());
+    } catch (error) {
+      this.options.onError?.(error);
+    }
+  }
   /** At the start of every pass, before any replay: records access an interrupted pass, or a
    * manager pair accepted since, left unobserved. */
   private async observePrivateGroups(): Promise<void> {
@@ -718,7 +772,8 @@ export class MlsRuntime {
   private current(remote: MlsGroup): boolean {
     const local = this.summary(remote.group), gate = this.gate(remote.group);
     return !remote.pending && local?.record.checkpoint?.epoch === String(remote.epoch) && gate.status === "active"
-      && !gate.rejoin && !gate.server_pending && !gate.blocked.length && !gate.pending_commit
+      && !gate.rejoin && !gate.server_pending && !gate.blocked.length && !gate.pending_commit && !repairable(gate)
+      && !this.offers.has(remote.group)
       && this.syncedVersions.has(remote.group) && this.syncedVersions.get(remote.group) === (this.groupVersions.get(remote.group) ?? 0);
   }
   /** After joining, ask the server to route history to this device; senders
@@ -798,11 +853,22 @@ export class MlsRuntime {
       // A verified GroupInfo at or past the checkpoint: no restart is due.
       this.triggers.delete(local.conversation);
     }
-    await this.engine.op<CommitOutbox>({ join_external: { server: this.server, bytes: info, tree, now: this.now(), revocations: this.options.revocations() } }, out => {
-      if (encoded(out.group) !== group) throw new Error("GroupInfo group mismatch");
-      const conversation = this.summary(group)?.conversation ?? "";
-      return conversation === "server" || channelOf(conversation) !== undefined ? [jobChange({ kind: "request", server: this.server, group })] : [];
-    });
+    try {
+      await this.engine.op<CommitOutbox>({ join_external: { server: this.server, bytes: info, tree, now: this.now(), revocations: this.options.revocations() } }, out => {
+        if (encoded(out.group) !== group) throw new Error("GroupInfo group mismatch");
+        const conversation = this.summary(group)?.conversation ?? "";
+        return conversation === "server" || channelOf(conversation) !== undefined ? [jobChange({ kind: "request", server: this.server, group })] : [];
+      });
+    } catch (error) {
+      // A private group whose lists give no current authority: the device waits for a channel
+      // manager (retrying after managers.updated, an offer, or its backoff). An authority that
+      // cannot join offers fresh lists for a member to commit, once per GroupInfo (6c, "Offers").
+      if (error instanceof AgentOperationError && String(error.message).includes(WAITING)) {
+        await this.engine.reload();
+        await this.offerAccess(group, info, tree);
+      }
+      throw error;
+    }
     // A rejoined parent may lack devices the voice call still shares keys with.
     this.voiceGate(group);
   }
@@ -910,6 +976,7 @@ export class MlsRuntime {
         await this.engine.op({ commit: { ...this.args(group), adds: [], removes: [], now: this.now(), revocations: this.options.revocations() } });
         continue;
       }
+      if (await this.repairAccess(group, gate)) continue;
       if (local.conversation.startsWith("dm:") && await this.admitMissing(group)) continue;
       if (version !== (this.groupVersions.get(group) ?? 0)) continue;
       this.syncedVersions.set(group, version);

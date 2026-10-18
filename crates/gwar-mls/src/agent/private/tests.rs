@@ -332,3 +332,66 @@ fn a_former_owners_leaf_is_removed_without_renewing_the_lists() {
     ack(&mut manager, &id, &out);
     assert_eq!(authority(&manager, &id, t), Some(Authority::Current));
 }
+
+#[test]
+fn a_private_channels_call_exports_keys_only_with_the_parents_current_authority() {
+    let mut p = private();
+    let mut call = Agent::new_voice([11; 32], p.owner.credential.clone(), p.t).unwrap();
+    call.take_changes();
+    let d = SignedDescriptor::sign(
+        Descriptor {
+            server_key: server(),
+            conversation: "voice:7".into(),
+            kind: Kind::Voice,
+            incarnation: 0,
+            previous_group_id: None,
+            private: false,
+            history: false,
+            founding_owner: None,
+            channel_group_id: Some(b64(&p.id)),
+            creator_uid: uid(1),
+            created_at: p.t,
+            creation_nonce: b64(&[5; 16]),
+        },
+        call.credential.clone(),
+        &call.signer.0,
+    );
+    let voice = d.group_id();
+    call.create(d).unwrap();
+    call.take_changes();
+    call.settle(&server(), &voice, Some(&voice)).unwrap();
+    call.take_changes();
+    assert!(call.voice_keys(&server(), &voice, &p.owner, p.t, &()).is_ok());
+    // A newer pair the parent does not carry yet holds the call.
+    let newer = pair(&p.chain, &p.owner, 2, &[], p.t);
+    accept_pair(&mut p.owner, &newer, p.t);
+    assert_eq!(call.voice_keys(&server(), &voice, &p.owner, p.t, &()).map(|_| ()), Err(AgentError::Blocked));
+}
+
+#[test]
+fn a_manager_outside_the_group_offers_lists_a_member_commits() {
+    let mut p = private();
+    // Account 3 becomes a manager; its device is not in the group.
+    let newer = pair(&p.chain, &p.owner, 2, &[3], p.t);
+    accept_pair(&mut p.owner, &newer, p.t);
+    accept_pair(&mut p.member, &newer, p.t);
+    let mut manager = device(3, 31, p.t, &p.chain);
+    accept_pair(&mut manager, &newer, p.t);
+    let tree = p.observer.tree().unwrap().1;
+    let offer = manager
+        .offer_access(&server(), &p.info, Some(&p.observer.tree().unwrap().1), Some(&[uid(2), uid(4)]), p.t, &())
+        .unwrap();
+    // A plain member cannot offer: it holds no authority.
+    assert_eq!(p.member.offer_access(&server(), &p.info, Some(&tree), None, p.t, &()), Err(AgentError::Waiting));
+    let out = p.member.adopt_offer(&server(), &p.id, &offer, p.t, &()).unwrap();
+    p.member.take_changes();
+    p.observer = p.observer.commit(&out.commit, &out.group_info, None, p.t, p.t).unwrap().0;
+    ack(&mut p.member, &p.id, &out);
+    assert_eq!(p.member.observe_access(&server(), &p.id, p.t, &()).unwrap(), Some(Authority::Current));
+    p.member.take_changes();
+    assert_eq!(p.member.group(&server(), &p.id).unwrap().access.as_ref().map(|c| c.seq), Some(2));
+    // Another list at the same seq is refused.
+    let mut copy = Agent::load([21; 32], p.member.credential.clone(), p.member.durable.clone()).unwrap();
+    let stale = manager.offer_access(&server(), &p.info, Some(&tree), None, p.t, &()).unwrap();
+    assert_eq!(copy.adopt_offer(&server(), &p.id, &stale, p.t, &()).map(|_| ()), Err(AgentError::Waiting));
+}

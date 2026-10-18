@@ -128,6 +128,8 @@ export const events: { [K in EventName]: Rule<EventData<K>> } = {
   "mls.proposal": shape({ group: mlsGroupId, epoch: id, proposal: mlsBlob }),
   "mls.welcome": shape({ group: mlsGroupId }), "mls.history": shape({ group: mlsGroupId }),
   "mls.history.wanted": mlsWanted,
+  // A private channel's offered access lists (at most 48 KiB, base64url).
+  "mls.access.offered": shape({ group: mlsGroupId, extension: str(65536) }),
 
   "chat.sealed": sealedMessage, "chat.sealed.removed": shape({ conversation, ids: array(id, 1000) }),
   challenge, "server.updated": server, "channel.created": channel, "channel.updated": channel,
@@ -153,7 +155,7 @@ export const responses: { [K in Op]: Rule<ResponseMap[K]> } = {
   "mls.welcomes.ack": empty, "mls.history.share": empty,
   "mls.history.fetch": shape({ chunks: array(shape({ id: fixed(16), group: mlsGroupId, sender_uid: fixed(20), chunk: mlsChunk }), 100), next: cursor }),
   "mls.history.wanted": shape({ wanted: array(mlsWanted, 100), next: cursor }),
-  "mls.history.ack": empty, "mls.history.request": empty, "mls.history.decline": empty,
+  "mls.history.ack": empty, "mls.history.request": empty, "mls.history.decline": empty, "mls.access.offer": empty,
   "mls.group_history": shape({ incarnations: array(shape({ group: mlsGroupId, descriptor: str(16384) }), 100), next: cursor }),
 
   hello: serverProof, join: welcome, ping: empty, "client.update": empty, "client.move": empty, "client.kick": empty,

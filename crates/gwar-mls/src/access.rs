@@ -222,14 +222,26 @@ impl Access {
     /// list names this group and is signed by an owner of the span, a confirmer or a manager, and
     /// both device signers were certified at `at`.
     pub fn valid(&self, chain: &OwnerChain, group: &[u8; 32], at: i64) -> bool {
+        self.structure(chain, group)
+            && self.list.signer().is_current(at, &())
+            && self.members.signer().is_current(at, &())
+    }
+
+    /// Valid as history without a commit time: each signer certified when it signed (a member list
+    /// may be carried under a later manager list, signed by a device certified only since).
+    pub fn valid_when_signed(&self, chain: &OwnerChain, group: &[u8; 32]) -> bool {
+        self.structure(chain, group)
+            && self.list.signer().is_current(self.list.list().signed_at, &())
+            && self.members.signer().is_current(self.members.members().signed_at, &())
+    }
+
+    fn structure(&self, chain: &OwnerChain, group: &[u8; 32]) -> bool {
         let m = self.members.members();
         chain.list_valid(&self.anchor, &self.list)
             && m.server_key == chain.genesis().server_key
             && m.generation == chain.generation()
             && m.group_id == b64(group)
             && self.signer_authorized(chain, false)
-            && self.list.signer().is_current(at, &())
-            && self.members.signer().is_current(at, &())
     }
 
     /// Current now ((a)–(c) without the checkpoints): the pair may be accepted as current and the
