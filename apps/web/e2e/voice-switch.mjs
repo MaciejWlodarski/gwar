@@ -158,10 +158,6 @@ async function join(page, channel) {
   }, `${page.deviceName} enters the channel`, 40_000);
   return Date.now() - started;
 }
-const left = page => page.evaluate(async () => {
-  const { controller } = await window.__gwarE2eImport("/src/state/controller.ts");
-  await controller.leaveVoice();
-});
 
 async function run(engine, web, server, token) {
   const type = engine === "webkit" ? webkit : chromium;
