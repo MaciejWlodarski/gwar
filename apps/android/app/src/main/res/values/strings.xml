@@ -79,4 +79,5 @@
     <string name="error_microphone_denied">Gwar is not allowed to use the microphone. Allow it in the system settings.</string>
     <string name="error_voice">Voice could not start: %1$s</string>
     <string name="voice_details">sent %1$d · received %2$d · gaps %3$d · mic %4$d dB</string>
+    <string name="server_reconnecting">Connection lost, reconnecting…</string>
 </resources>

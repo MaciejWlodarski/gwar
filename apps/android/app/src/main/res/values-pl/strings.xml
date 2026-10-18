@@ -78,4 +78,5 @@
     <string name="error_microphone_denied">Gwar nie ma dostępu do mikrofonu. Zezwól na niego w ustawieniach systemu.</string>
     <string name="error_voice">Nie udało się uruchomić głosu: %1$s</string>
     <string name="voice_details">wysłane %1$d · odebrane %2$d · luki %3$d · mikrofon %4$d dB</string>
+    <string name="server_reconnecting">Utracono połączenie, łączenie ponownie…</string>
 </resources>

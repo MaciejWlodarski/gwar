@@ -154,6 +154,28 @@ impl From<LeaveReason> for CloseReason {
     }
 }
 
+/// Whether to connect again by itself after a session closed for `reason`:
+/// yes when the link or the server went away, not when someone removed me.
+#[uniffi::export]
+pub fn should_reconnect(reason: CloseReason) -> bool {
+    matches!(reason, CloseReason::ConnectionLost | CloseReason::Timeout | CloseReason::ServerShutdown)
+}
+
+/// Whether a failed reconnection attempt is worth repeating: network trouble
+/// is, a refusal or a changed server key is not (the user must see it).
+#[uniffi::export]
+pub fn should_retry(error: &AppError) -> bool {
+    matches!(error, AppError::Timeout | AppError::NotConnected | AppError::Network { .. } | AppError::Protocol { .. })
+}
+
+/// Milliseconds to wait before reconnection attempt `attempt` (0-based):
+/// quick at first, then every 30 s.
+#[uniffi::export]
+pub fn reconnect_delay_ms(attempt: u32) -> u64 {
+    const STEPS: [u64; 5] = [500, 1_000, 2_000, 5_000, 10_000];
+    STEPS.get(attempt as usize).copied().unwrap_or(30_000)
+}
+
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct ConnectRequest {
     pub address: String,
@@ -376,9 +398,22 @@ fn deliver(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnects_only_after_losing_the_link() {
+        assert!(should_reconnect(CloseReason::ConnectionLost));
+        assert!(should_reconnect(CloseReason::ServerShutdown));
+        assert!(!should_reconnect(CloseReason::Replaced));
+        assert!(!should_reconnect(CloseReason::Kicked { by: "a".into(), reason: None }));
+        assert!(should_retry(&AppError::Network { detail: "refused".into() }));
+        assert!(!should_retry(&AppError::ServerIdentityChanged { endpoint: "e".into() }));
+        assert!(!should_retry(&AppError::Refused { code: "banned".into(), detail: String::new() }));
+        assert_eq!((reconnect_delay_ms(0), reconnect_delay_ms(4), reconnect_delay_ms(40)), (500, 10_000, 30_000));
+    }
+
     #[test]
     fn server_host_adds_the_default_port() {
-        use super::server_host;
         assert_eq!(server_host("wss://voice.example.com/ws").unwrap(), "voice.example.com:443");
         assert_eq!(server_host("ws://10.0.2.2:8790/ws").unwrap(), "10.0.2.2:8790");
         assert_eq!(server_host("ws://[::1]:8790/ws").unwrap(), "[::1]:8790");

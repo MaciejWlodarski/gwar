@@ -1,6 +1,8 @@
 package app.gwar.android
 
+import android.Manifest
 import android.app.Application
+import android.content.pm.PackageManager
 import app.gwar.core.AppException
 import app.gwar.core.ChatLine
 import app.gwar.core.CloseReason
@@ -10,6 +12,9 @@ import app.gwar.core.Session
 import app.gwar.core.SessionListener
 import app.gwar.core.VoiceLink
 import app.gwar.core.VoiceStatus
+import app.gwar.core.reconnectDelayMs
+import app.gwar.core.shouldReconnect
+import app.gwar.core.shouldRetry
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -49,10 +54,8 @@ data class ChatState(
 
 /** Voice in the channel I am in. */
 data class VoiceState(
-    /** `null` until the engine runs. */
+    /** `null` until the engine runs, and while the session reconnects. */
     val status: VoiceStatus? = null,
-    val muted: Boolean = false,
-    val deafened: Boolean = false,
 )
 
 /** Something to tell the user once, while connected. */
@@ -68,29 +71,40 @@ data class UiState(
     val form: ConnectForm,
     val connecting: Boolean = false,
     val problem: Problem? = null,
-    /** Set while connected. */
+    /** Set while connected, and kept (as last seen) while reconnecting. */
     val view: ServerView? = null,
+    /** The link went away and the app is connecting again by itself. */
+    val reconnecting: Boolean = false,
     val openChannel: UInt? = null,
     val chats: Map<UInt, ChatState> = emptyMap(),
     /** Set while voice is wanted: starting, running or reconnecting. */
     val voice: VoiceState? = null,
+    /** Kept across channels and reconnections, as the other apps do. */
+    val muted: Boolean = false,
+    val deafened: Boolean = false,
     val notice: Notice? = null,
 )
 
 private const val HISTORY_PAGE = 50
 private const val STATUS_INTERVAL_MS = 250L
-private const val RECONNECT_DELAY_MS = 1_500L
+private const val VOICE_RETRY_MS = 1_500L
 
 /**
  * The app's one connection, owned by the process rather than a screen, so a
  * call keeps going while the screen is off or the app is in the background
  * ([VoiceService] keeps the process alive meanwhile). Runs on the main thread;
  * the core's callbacks only update [state].
+ *
+ * When the link drops (network change, ping timeout, server restart) it
+ * connects again by itself and puts back what the user had: the channel, voice,
+ * mute and deafen, the open chat. The call's service and audio mode stay up
+ * meanwhile, so the process is not stopped in the background.
  */
 class GwarClient(private val app: Application) {
     private val core = (app as GwarApplication).core
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val audio = CallAudio(app)
+    private val network = NetworkWatch(app) { onNetworkChanged() }
 
     private val _state = MutableStateFlow(
         UiState(
@@ -105,11 +119,24 @@ class GwarClient(private val app: Application) {
     @Volatile
     private var session: Session? = null
 
-    /** Bumped on every connect and disconnect, so a closed session's late updates are ignored. */
+    /** Bumped for every new session and every teardown, so an old session's late updates are ignored. */
     @Volatile
     private var generation = 0
 
+    /** How to connect again; `null` once the user disconnected. */
+    private var request: ConnectRequest? = null
+
+    /** What to put back after reconnecting. */
+    private var wantedChannel: UInt? = null
+    private var channelPassword: String? = null
+    private var wantVoice = false
+
+    /** A join or a restore is moving me; the views in between show the old channel. */
+    private var moving = 0
+
+    private var serviceRunning = false
     private var voiceJob: Job? = null
+    private var reconnectJob: Job? = null
 
     fun updateForm(form: ConnectForm) = _state.update { it.copy(form = form) }
 
@@ -119,27 +146,24 @@ class GwarClient(private val app: Application) {
 
     fun connect() {
         val current = _state.value
-        if (current.connecting || session != null) return
+        if (current.connecting || session != null || reconnectJob != null) return
         val form = current.form
+        val request = ConnectRequest(
+            address = form.address,
+            nickname = form.nickname.trim(),
+            insecureLan = form.insecureLan,
+            serverPassword = form.serverPassword.ifEmpty { null },
+        )
         _state.update { it.copy(connecting = true, problem = null) }
         val listener = Listener(++generation)
         scope.launch {
             try {
-                val request = ConnectRequest(
-                    address = form.address,
-                    nickname = form.nickname.trim(),
-                    insecureLan = form.insecureLan,
-                    serverPassword = form.serverPassword.ifEmpty { null },
-                )
                 val connected = core.connect(request, listener)
-                session = connected
-                _state.update {
-                    it.copy(connecting = false, view = connected.view(), openChannel = null, chats = emptyMap())
-                }
-            } catch (e: AppException.ServerIdentityChanged) {
-                _state.update { it.copy(connecting = false, problem = Problem.IdentityChanged(e.endpoint)) }
+                this@GwarClient.request = request
+                attach(connected)
+                _state.update { it.copy(openChannel = null, chats = emptyMap()) }
             } catch (e: AppException) {
-                _state.update { it.copy(connecting = false, problem = Problem.Failed(e)) }
+                _state.update { it.copy(connecting = false, problem = problemFor(e)) }
             }
         }
     }
@@ -155,48 +179,45 @@ class GwarClient(private val app: Application) {
         connect()
     }
 
-    fun disconnect() {
-        generation++
-        endVoice()
-        session?.disconnect()
-        session = null
-        _state.update { it.copy(view = null, openChannel = null, chats = emptyMap(), notice = null) }
-    }
+    fun disconnect() = teardown(problem = null)
 
     /** Joins a channel, with voice unless [withVoice] is false (no microphone permission). */
     fun joinChannel(channel: UInt, password: String? = null, withVoice: Boolean = true) {
-        val s = session ?: return
+        val s = session ?: return notConnected()
         scope.launch {
+            moving++
             try {
                 endVoice()
                 s.joinChannel(channel, password)
-                when {
-                    !withVoice -> _state.update { it.copy(notice = Notice.MicrophoneNeeded) }
-                    else -> startVoice(s, channel)
-                }
+                wantedChannel = channel
+                channelPassword = password
+                if (withVoice) startVoice(s, channel) else _state.update { it.copy(notice = Notice.MicrophoneNeeded) }
             } catch (e: AppException) {
                 _state.update { it.copy(notice = Notice.Failed(e)) }
+            } finally {
+                moving--
             }
         }
     }
 
     fun leaveChannel() {
+        wantedChannel = null
+        channelPassword = null
         endVoice()
         act { it.leaveChannel() }
     }
 
     fun toggleMute() {
-        val voice = _state.value.voice ?: return
+        val current = _state.value
         // Unmuting while deafened also undeafens; the core does the same.
-        val muted = if (voice.deafened) false else !voice.muted
-        _state.update { it.copy(voice = it.voice?.copy(muted = muted, deafened = if (muted) voice.deafened else false)) }
+        val muted = if (current.deafened) false else !current.muted
+        _state.update { it.copy(muted = muted, deafened = if (muted) it.deafened else false) }
         act { it.setMuted(muted) }
     }
 
     fun toggleDeafen() {
-        val voice = _state.value.voice ?: return
-        val deafened = !voice.deafened
-        _state.update { it.copy(voice = it.voice?.copy(deafened = deafened)) }
+        val deafened = !_state.value.deafened
+        _state.update { it.copy(deafened = deafened) }
         act { it.setDeafened(deafened) }
     }
 
@@ -226,10 +247,104 @@ class GwarClient(private val app: Application) {
         }
     }
 
+    private fun attach(s: Session) {
+        session = s
+        network.start()
+        _state.update { it.copy(connecting = false, reconnecting = false, view = s.view()) }
+    }
+
+    /** Ends everything: the session, voice, reconnection. Shows [problem] on the connect screen. */
+    private fun teardown(problem: Problem?) {
+        generation++
+        reconnectJob?.cancel()
+        reconnectJob = null
+        network.stop()
+        request = null
+        wantedChannel = null
+        channelPassword = null
+        endVoice()
+        session?.disconnect()
+        session = null
+        _state.update {
+            it.copy(
+                view = null, reconnecting = false, connecting = false, openChannel = null, chats = emptyMap(),
+                notice = null, problem = problem,
+            )
+        }
+    }
+
+    /** Drops the current link (if any) and connects again, from a short first delay. */
+    private fun reconnect() {
+        if (request == null) return
+        generation++
+        session?.let {
+            it.stopVoice()
+            it.disconnect()
+        }
+        session = null
+        voiceJob?.cancel()
+        voiceJob = null
+        _state.update { it.copy(reconnecting = true, voice = it.voice?.let { VoiceState() }) }
+        reconnectJob?.cancel()
+        reconnectJob = scope.launch {
+            var attempt = 0u
+            while (true) {
+                delay(reconnectDelayMs(attempt).toLong())
+                val request = request ?: return@launch
+                try {
+                    val connected = core.connect(request, Listener(++generation))
+                    reconnectJob = null
+                    attach(connected)
+                    restore(connected)
+                    return@launch
+                } catch (e: AppException) {
+                    if (!shouldRetry(e)) {
+                        reconnectJob = null
+                        teardown(problemFor(e))
+                        return@launch
+                    }
+                }
+                attempt++
+            }
+        }
+    }
+
+    /** Puts back what the user had before the link dropped. */
+    private suspend fun restore(s: Session) {
+        val channel = wantedChannel
+        val password = channelPassword
+        val voice = wantVoice
+        moving++
+        try {
+            val current = _state.value
+            if (current.muted) s.setMuted(true)
+            if (current.deafened) s.setDeafened(true)
+            if (channel != null && s.view().channels.any { it.id == channel }) {
+                s.joinChannel(channel, password)
+                if (voice && microphoneAllowed()) startVoice(s, channel) else endVoice()
+            } else {
+                wantedChannel = null
+                endVoice()
+            }
+            _state.value.openChannel?.let { open ->
+                s.setOpenChannel(open)
+                loadHistory(open, older = false)
+            }
+        } catch (e: AppException) {
+            _state.update { it.copy(notice = Notice.Failed(e)) }
+        } finally {
+            moving--
+        }
+    }
+
+    private fun onNetworkChanged() {
+        // The link was made on the network that went away; connect on the new one now.
+        if (session != null || reconnectJob != null) reconnect()
+    }
+
     /**
-     * Starts the engine and watches it: a lost link (the server moved me, the
-     * network changed, a headset was unplugged) starts it again while I am
-     * still in a channel.
+     * Starts the engine and watches it: a lost voice link (the server moved
+     * me, a headset was unplugged) starts it again while the session lives.
      */
     private suspend fun startVoice(s: Session, channelId: UInt) {
         val channel = s.view().channels.firstOrNull { it.id == channelId }
@@ -238,11 +353,13 @@ class GwarClient(private val app: Application) {
             _state.update { it.copy(notice = Notice.Failed(AppException.EncryptedVoice())) }
             return
         }
-        val muted = s.muted()
-        val deafened = s.deafened()
-        _state.update { it.copy(voice = VoiceState(muted = muted, deafened = deafened)) }
+        wantVoice = true
+        _state.update { it.copy(voice = VoiceState()) }
         audio.enter()
-        VoiceService.start(app, channel?.name.orEmpty())
+        if (!serviceRunning) {
+            VoiceService.start(app, channel?.name.orEmpty())
+            serviceRunning = true
+        }
         try {
             s.startVoice()
         } catch (e: AppException) {
@@ -250,33 +367,48 @@ class GwarClient(private val app: Application) {
             _state.update { it.copy(notice = Notice.Failed(e)) }
             return
         }
+        voiceJob?.cancel()
         voiceJob = scope.launch {
-            while (isActive) {
+            while (true) {
                 delay(STATUS_INTERVAL_MS)
+                if (session !== s) return@launch
                 val status = s.voiceStatus()
                 _state.update { it.copy(voice = it.voice?.copy(status = status)) }
-                if (status?.link == VoiceLink.LOST && _state.value.view?.myChannel != null) {
-                    delay(RECONNECT_DELAY_MS)
+                if (status?.link == VoiceLink.LOST) {
+                    delay(VOICE_RETRY_MS)
                     try {
-                        s.startVoice()
+                        if (session === s) s.startVoice()
                     } catch (e: AppException) {
-                        // Keep trying while the channel is joined; the status shows the link as lost.
+                        // Keep trying while the session lives; the status shows the link as lost.
                     }
                 }
             }
         }
     }
 
-    /** Stops the engine, call audio and the service. */
+    /** Stops the engine, call audio and the service: the user no longer wants voice. */
     private fun endVoice() {
+        wantVoice = false
         voiceJob?.cancel()
         voiceJob = null
-        if (_state.value.voice == null) return
         session?.stopVoice()
         audio.leave()
-        VoiceService.stop(app)
+        if (serviceRunning) {
+            VoiceService.stop(app)
+            serviceRunning = false
+        }
         _state.update { it.copy(voice = null) }
     }
+
+    private fun microphoneAllowed() =
+        app.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+    private fun problemFor(e: AppException): Problem = when (e) {
+        is AppException.ServerIdentityChanged -> Problem.IdentityChanged(e.endpoint)
+        else -> Problem.Failed(e)
+    }
+
+    private fun notConnected() = _state.update { it.copy(notice = Notice.Failed(AppException.NotConnected())) }
 
     private fun loadHistory(channel: UInt, older: Boolean) {
         val s = session ?: return
@@ -288,7 +420,9 @@ class GwarClient(private val app: Application) {
                 _state.update {
                     val chat = it.chats[channel] ?: ChatState()
                     val lines = (page + chat.lines).associateBy { line -> line.id }.values.sortedBy { line -> line.id }
-                    it.copy(chats = it.chats + (channel to ChatState(lines, loading = false, complete = page.size < HISTORY_PAGE)))
+                    // A reload after reconnecting keeps what older pages were loaded.
+                    val complete = if (older) page.size < HISTORY_PAGE else chat.complete || page.size < HISTORY_PAGE
+                    it.copy(chats = it.chats + (channel to ChatState(lines, loading = false, complete = complete)))
                 }
             } catch (e: AppException) {
                 _state.update {
@@ -300,7 +434,7 @@ class GwarClient(private val app: Application) {
     }
 
     private fun act(block: suspend (Session) -> Unit) {
-        val s = session ?: return
+        val s = session ?: return notConnected()
         scope.launch {
             try {
                 block(s)
@@ -316,8 +450,12 @@ class GwarClient(private val app: Application) {
         override fun onView(view: ServerView) {
             if (!current) return
             _state.update { it.copy(view = view) }
-            // Taken out of every channel (moved to none, kicked from the channel): no voice.
-            if (view.myChannel == null) scope.launch { if (current) endVoice() }
+            scope.launch {
+                // The server moved me (or out of every channel); a join in flight moves me itself.
+                if (!current || moving > 0 || view.myChannel == wantedChannel) return@launch
+                wantedChannel = view.myChannel
+                if (view.myChannel == null) endVoice()
+            }
         }
 
         override fun onChat(line: ChatLine) {
@@ -336,14 +474,7 @@ class GwarClient(private val app: Application) {
             if (!current) return
             scope.launch {
                 if (!current) return@launch
-                generation++
-                endVoice()
-                // A dead link may still hold its socket; let it go.
-                session?.disconnect()
-                session = null
-                _state.update {
-                    it.copy(view = null, openChannel = null, chats = emptyMap(), notice = null, problem = Problem.Closed(reason))
-                }
+                if (request != null && shouldReconnect(reason)) reconnect() else teardown(Problem.Closed(reason))
             }
         }
     }

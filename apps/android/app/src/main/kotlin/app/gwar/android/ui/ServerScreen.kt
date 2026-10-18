@@ -78,6 +78,9 @@ private const val INDENT = 18
 fun ServerScreen(
     view: ServerView,
     voice: VoiceState?,
+    muted: Boolean,
+    deafened: Boolean,
+    reconnecting: Boolean,
     notice: Notice?,
     onOpenChat: (UInt) -> Unit,
     onJoin: (UInt, String?) -> Unit,
@@ -99,9 +102,9 @@ fun ServerScreen(
                     Column {
                         Text(view.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold)
                         Text(
-                            view.label,
+                            if (reconnecting) stringResource(R.string.server_reconnecting) else view.label,
                             style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            color = if (reconnecting) GwarColors.warn else MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1,
                         )
                     }
@@ -115,7 +118,7 @@ fun ServerScreen(
         },
         bottomBar = {
             if (myChannel != null) {
-                VoiceBar(myChannel.name, voice, onToggleMute, onToggleDeafen, onLeave)
+                VoiceBar(myChannel.name, voice, muted, deafened, reconnecting, onToggleMute, onToggleDeafen, onLeave)
             }
         },
         snackbarHost = { SnackbarHost(snackbar) },
@@ -340,6 +343,9 @@ fun NoticeEffect(notice: Notice?, snackbar: SnackbarHostState, onShown: () -> Un
 private fun VoiceBar(
     channelName: String,
     voice: VoiceState?,
+    muted: Boolean,
+    deafened: Boolean,
+    reconnecting: Boolean,
     onToggleMute: () -> Unit,
     onToggleDeafen: () -> Unit,
     onLeave: () -> Unit,
@@ -361,6 +367,7 @@ private fun VoiceBar(
                 )
                 val link = voice?.status?.link
                 val (text, color) = when {
+                    reconnecting -> stringResource(R.string.server_reconnecting) to GwarColors.warn
                     voice == null -> stringResource(R.string.voice_off) to MaterialTheme.colorScheme.onSurfaceVariant
                     link == VoiceLink.CONNECTED -> stringResource(R.string.voice_connected) to GwarColors.talking
                     link == VoiceLink.LOST -> stringResource(R.string.voice_reconnecting) to GwarColors.warn
@@ -391,14 +398,14 @@ private fun VoiceBar(
             if (voice != null) {
                 val off = MaterialTheme.colorScheme.error
                 IconButton(onClick = onToggleMute) {
-                    if (voice.muted || voice.deafened) {
+                    if (muted || deafened) {
                         Icon(Icons.Outlined.MicOff, stringResource(R.string.voice_unmute), tint = off)
                     } else {
                         Icon(Icons.Outlined.Mic, stringResource(R.string.voice_mute))
                     }
                 }
                 IconButton(onClick = onToggleDeafen) {
-                    if (voice.deafened) {
+                    if (deafened) {
                         Icon(Icons.Outlined.HeadsetOff, stringResource(R.string.voice_undeafen), tint = off)
                     } else {
                         Icon(Icons.Outlined.Headset, stringResource(R.string.voice_deafen))

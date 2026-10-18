@@ -68,6 +68,9 @@ fun GwarRoot(client: GwarClient) {
         ServerScreen(
             view = view,
             voice = state.voice,
+            muted = state.muted,
+            deafened = state.deafened,
+            reconnecting = state.reconnecting,
             notice = state.notice,
             onOpenChat = client::openChat,
             onJoin = join,
