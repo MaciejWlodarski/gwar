@@ -80,4 +80,11 @@
     <string name="error_voice">Voice could not start: %1$s</string>
     <string name="voice_details">sent %1$d · received %2$d · gaps %3$d · mic %4$d dB</string>
     <string name="server_reconnecting">Connection lost, reconnecting…</string>
+    <string name="voice_output">Audio output: %1$s</string>
+    <string name="voice_output_speaker">Loudspeaker</string>
+    <string name="voice_output_earpiece">Phone earpiece</string>
+    <string name="voice_output_wired">Wired headphones</string>
+    <string name="voice_output_bluetooth">Bluetooth headset</string>
+    <string name="voice_output_usb">USB headset</string>
+    <string name="voice_output_allow_bluetooth">Allow Bluetooth headsets</string>
 </resources>

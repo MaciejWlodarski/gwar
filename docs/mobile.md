@@ -73,7 +73,9 @@ the native desktop app will use `gwar-app` instead.
   (`VoiceCommunication` input preset and usage), so the phone's own echo
   cancellation and noise suppression apply. While voice runs, the phone is in
   communication mode with call audio focus, sound goes to a connected headset
-  or else the loudspeaker, and a foreground service with an ongoing
+  or else the loudspeaker (the output button picks another: loudspeaker,
+  earpiece, wired, Bluetooth or USB headset; Bluetooth asks for its
+  permission first), and a foreground service with an ongoing
   notification (with a Leave action) keeps the call going with the screen off.
   Mute and deafen are shown to everyone; a lost link or audio device restarts
   voice by itself. Tapping the voice status shows the engine's counters.
@@ -95,8 +97,8 @@ the native desktop app will use `gwar-app` instead.
 Roughly in this order:
 
 1. **Voice on real phones**: latency and loss measurements like the desktop's
-   ([latency.md](latency.md)), Bluetooth headsets (needs the Bluetooth
-   permission for routing), an earpiece/loudspeaker switch, push-to-talk.
+   ([latency.md](latency.md)), output switching with real earpieces and
+   Bluetooth headsets (the emulator has only a loudspeaker), push-to-talk.
 2. **Identity storage hardening.** Wrap the identity seed with a key from the
    Android Keystore.
 3. **Encrypted chat, encrypted voice and direct messages.** These need the MLS client logic

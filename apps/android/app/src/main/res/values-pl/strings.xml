@@ -79,4 +79,11 @@
     <string name="error_voice">Nie udało się uruchomić głosu: %1$s</string>
     <string name="voice_details">wysłane %1$d · odebrane %2$d · luki %3$d · mikrofon %4$d dB</string>
     <string name="server_reconnecting">Utracono połączenie, łączenie ponownie…</string>
+    <string name="voice_output">Wyjście dźwięku: %1$s</string>
+    <string name="voice_output_speaker">Głośnik</string>
+    <string name="voice_output_earpiece">Słuchawka telefonu</string>
+    <string name="voice_output_wired">Słuchawki przewodowe</string>
+    <string name="voice_output_bluetooth">Słuchawki Bluetooth</string>
+    <string name="voice_output_usb">Słuchawki USB</string>
+    <string name="voice_output_allow_bluetooth">Zezwól na słuchawki Bluetooth</string>
 </resources>

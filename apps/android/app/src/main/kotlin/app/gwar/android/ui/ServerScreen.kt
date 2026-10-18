@@ -21,7 +21,13 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.Login
 import androidx.compose.material.icons.automirrored.outlined.Logout
 import androidx.compose.material.icons.outlined.EnhancedEncryption
+import androidx.compose.material.icons.automirrored.outlined.VolumeUp
+import androidx.compose.material.icons.outlined.Bluetooth
 import androidx.compose.material.icons.outlined.CallEnd
+import androidx.compose.material.icons.outlined.Check
+import androidx.compose.material.icons.outlined.Headphones
+import androidx.compose.material.icons.outlined.PhoneInTalk
+import androidx.compose.material.icons.outlined.Usb
 import androidx.compose.material.icons.outlined.Headset
 import androidx.compose.material.icons.outlined.HeadsetOff
 import androidx.compose.material.icons.outlined.Mic
@@ -31,6 +37,8 @@ import androidx.compose.material.icons.outlined.Tag
 import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.FilledIconButton
@@ -63,7 +71,9 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import app.gwar.android.R
+import app.gwar.android.AudioOutput
 import app.gwar.android.Notice
+import app.gwar.android.OutputKind
 import app.gwar.android.VoiceState
 import app.gwar.core.VoiceLink
 import app.gwar.core.ChannelView
@@ -80,6 +90,11 @@ fun ServerScreen(
     voice: VoiceState?,
     muted: Boolean,
     deafened: Boolean,
+    outputs: List<AudioOutput>,
+    output: AudioOutput?,
+    onChooseOutput: (OutputKind) -> Unit,
+    /** Set when Bluetooth headsets need a permission first. */
+    onAllowBluetooth: (() -> Unit)?,
     reconnecting: Boolean,
     notice: Notice?,
     onOpenChat: (UInt) -> Unit,
@@ -118,7 +133,20 @@ fun ServerScreen(
         },
         bottomBar = {
             if (myChannel != null) {
-                VoiceBar(myChannel.name, voice, muted, deafened, reconnecting, onToggleMute, onToggleDeafen, onLeave)
+                VoiceBar(
+                    channelName = myChannel.name,
+                    voice = voice,
+                    muted = muted,
+                    deafened = deafened,
+                    reconnecting = reconnecting,
+                    output = output,
+                    outputs = outputs,
+                    onChooseOutput = onChooseOutput,
+                    onAllowBluetooth = onAllowBluetooth,
+                    onToggleMute = onToggleMute,
+                    onToggleDeafen = onToggleDeafen,
+                    onLeave = onLeave,
+                )
             }
         },
         snackbarHost = { SnackbarHost(snackbar) },
@@ -346,6 +374,10 @@ private fun VoiceBar(
     muted: Boolean,
     deafened: Boolean,
     reconnecting: Boolean,
+    output: AudioOutput?,
+    outputs: List<AudioOutput>,
+    onChooseOutput: (OutputKind) -> Unit,
+    onAllowBluetooth: (() -> Unit)?,
     onToggleMute: () -> Unit,
     onToggleDeafen: () -> Unit,
     onLeave: () -> Unit,
@@ -395,6 +427,9 @@ private fun VoiceBar(
                     )
                 }
             }
+            if (voice != null && output != null) {
+                OutputMenu(output, outputs, onChooseOutput, onAllowBluetooth)
+            }
             if (voice != null) {
                 val off = MaterialTheme.colorScheme.error
                 IconButton(onClick = onToggleMute) {
@@ -422,5 +457,65 @@ private fun VoiceBar(
                 Icon(Icons.Outlined.CallEnd, stringResource(R.string.server_leave))
             }
         }
+    }
+}
+
+@Composable
+private fun OutputMenu(
+    output: AudioOutput,
+    outputs: List<AudioOutput>,
+    onChoose: (OutputKind) -> Unit,
+    onAllowBluetooth: (() -> Unit)?,
+) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        IconButton(onClick = { open = true }) {
+            Icon(output.kind.icon(), stringResource(R.string.voice_output, output.label()))
+        }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            for (choice in outputs) {
+                DropdownMenuItem(
+                    text = { Text(choice.label()) },
+                    leadingIcon = { Icon(choice.kind.icon(), null) },
+                    trailingIcon = if (choice == output) {
+                        { Icon(Icons.Outlined.Check, null) }
+                    } else {
+                        null
+                    },
+                    onClick = {
+                        open = false
+                        onChoose(choice.kind)
+                    },
+                )
+            }
+            if (onAllowBluetooth != null) {
+                DropdownMenuItem(
+                    text = { Text(stringResource(R.string.voice_output_allow_bluetooth)) },
+                    leadingIcon = { Icon(Icons.Outlined.Bluetooth, null) },
+                    onClick = {
+                        open = false
+                        onAllowBluetooth()
+                    },
+                )
+            }
+        }
+    }
+}
+
+private fun OutputKind.icon(): ImageVector = when (this) {
+    OutputKind.SPEAKER -> Icons.AutoMirrored.Outlined.VolumeUp
+    OutputKind.EARPIECE -> Icons.Outlined.PhoneInTalk
+    OutputKind.WIRED -> Icons.Outlined.Headphones
+    OutputKind.BLUETOOTH -> Icons.Outlined.Bluetooth
+    OutputKind.USB -> Icons.Outlined.Usb
+}
+
+@Composable
+private fun AudioOutput.label(): String = when (kind) {
+    OutputKind.SPEAKER -> stringResource(R.string.voice_output_speaker)
+    OutputKind.EARPIECE -> stringResource(R.string.voice_output_earpiece)
+    OutputKind.WIRED -> stringResource(R.string.voice_output_wired)
+    OutputKind.BLUETOOTH, OutputKind.USB -> name.ifBlank {
+        stringResource(if (kind == OutputKind.USB) R.string.voice_output_usb else R.string.voice_output_bluetooth)
     }
 }

@@ -82,6 +82,9 @@ data class UiState(
     /** Kept across channels and reconnections, as the other apps do. */
     val muted: Boolean = false,
     val deafened: Boolean = false,
+    /** Where call audio can go while voice runs, and where it goes. */
+    val outputs: List<AudioOutput> = emptyList(),
+    val output: AudioOutput? = null,
     val notice: Notice? = null,
 )
 
@@ -103,7 +106,7 @@ private const val VOICE_RETRY_MS = 1_500L
 class GwarClient(private val app: Application) {
     private val core = (app as GwarApplication).core
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val audio = CallAudio(app)
+    private val audio = CallAudio(app) { outputs, output -> _state.update { it.copy(outputs = outputs, output = output) } }
     private val network = NetworkWatch(app) { onNetworkChanged() }
 
     private val _state = MutableStateFlow(
@@ -220,6 +223,11 @@ class GwarClient(private val app: Application) {
         _state.update { it.copy(deafened = deafened) }
         act { it.setDeafened(deafened) }
     }
+
+    fun chooseOutput(kind: OutputKind) = audio.choose(kind)
+
+    /** A permission changed (Bluetooth): list the outputs again. */
+    fun refreshOutputs() = audio.refresh()
 
     fun openChat(channel: UInt) {
         _state.update { it.copy(openChannel = channel) }
