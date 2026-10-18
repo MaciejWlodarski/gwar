@@ -403,28 +403,6 @@ impl Agent {
         Ok((descriptor, context))
     }
 
-    /// Whether this device's own creation of a private group still holds authority (no time at
-    /// hand: the pair it carries is the newest accepted one, its anchor is current under the pinned
-    /// head and its member list is signed by an authority under the current owner). Other groups:
-    /// always.
-    pub(super) fn own_creation_authorized(&self, key: &str) -> Result<bool> {
-        let record = self.groups.get(key).ok_or(Invalid("record"))?;
-        let descriptor = SignedDescriptor::parse(&record.descriptor).ok_or(Invalid("descriptor"))?;
-        if !rules::is_private(&descriptor) {
-            return Ok(true);
-        }
-        let server = &descriptor.descriptor.server_key;
-        let Some(server_record) = self.servers.get(server) else { return Ok(false) };
-        let chain = server_record.chain(server)?;
-        let Some((anchor, list)) = server_record.pair()? else { return Ok(false) };
-        let group = self.mls(key)?;
-        let access = rules::access(group.public_group().group_context()).ok_or(Invalid("access lists"))?;
-        Ok(access.anchor().hash() == anchor.hash()
-            && access.list().hash() == list.hash()
-            && chain.anchor_current(access.anchor())
-            && access.signer_authorized(&chain, true))
-    }
-
     /// The verified pending tip of a private conversation, kept on its live pin.
     pub(super) fn pending_tip(&self, server: &str, conversation: &str) -> Result<Option<SignedDescriptor>> {
         let Some(live) = self.live(server, conversation)? else { return Ok(None) };

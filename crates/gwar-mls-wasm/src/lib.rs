@@ -123,6 +123,11 @@ enum Request {
         server: String,
         group: [u8; 32],
         winner: Option<[u8; 32]>,
+        /// A private channel's creation settles as of now (6c).
+        #[serde(default)]
+        now: Option<i64>,
+        #[serde(default)]
+        revocations: Option<View>,
     },
     Welcome {
         server: String,
@@ -472,9 +477,15 @@ impl Agent {
                 a.offer_access(&server, &group_info, tree.as_deref(), members.as_deref(), now, &revocations)
                     .map_err(error)?,
             ),
-            Request::Settle { server, group, winner } => {
-                output(a.settle(&server, &group, winner.as_ref()).map_err(error)?)
-            }
+            Request::Settle { server, group, winner, now, revocations } => output(
+                match (now, revocations) {
+                    (Some(now), Some(revocations)) => {
+                        a.settle_private(&server, &group, winner.as_ref(), now, &revocations)
+                    }
+                    _ => a.settle(&server, &group, winner.as_ref()),
+                }
+                .map_err(error)?,
+            ),
             Request::Welcome { server, id, bytes } => output(a.welcome(&server, &id, &bytes).map_err(error)?),
             Request::ReplaceStaleWelcome { server, group, id, bytes } => {
                 output(a.replace_stale_welcome(&server, &group, &id, &bytes).map_err(error)?)

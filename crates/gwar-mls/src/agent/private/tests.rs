@@ -105,7 +105,7 @@ fn private() -> Private {
     assert_eq!(owner.create(d.clone()), Err(Invalid("a private channel's group needs its members")));
     let info = owner.create_private(d, &[uid(2)], t, &()).unwrap();
     owner.take_changes();
-    assert!(owner.settle(&server(), &id, Some(&id)).unwrap());
+    assert!(owner.settle_private(&server(), &id, Some(&id), t, &()).unwrap());
     owner.take_changes();
     let mut observer = Observer::create_with(&info, &server(), Some(chain.clone())).unwrap();
     let tree = observer.tree().unwrap().1;
@@ -295,7 +295,7 @@ fn a_former_owners_leaf_is_removed_without_renewing_the_lists() {
     let id = d.group_id();
     let info = owner.create_private(d, &[], t, &()).unwrap();
     owner.take_changes();
-    owner.settle(&server(), &id, Some(&id)).unwrap();
+    owner.settle_private(&server(), &id, Some(&id), t, &()).unwrap();
     owner.take_changes();
     let mut observer = Observer::create_with(&info, &server(), Some(chain.clone())).unwrap();
     let out = manager.join_external(&server(), &info, Some(&observer.tree().unwrap().1), t, &()).unwrap();
@@ -418,7 +418,7 @@ fn a_private_restart_is_adopted_only_once_its_tip_gives_current_authority() {
     let next = successor_of(&p.owner, &p.id, 1, p.t);
     let info = p.owner.create_private(next.clone(), &[uid(2)], p.t, &()).unwrap();
     p.owner.take_changes();
-    assert!(p.owner.settle(&server(), &next.group_id(), Some(&next.group_id())).unwrap());
+    assert!(p.owner.settle_private(&server(), &next.group_id(), Some(&next.group_id()), p.t, &()).unwrap());
     p.owner.take_changes();
     let tree = Observer::create_with(&info, &server(), Some(p.chain.clone())).unwrap().tree().unwrap().1;
     let chain = incarnations(&[&first, &next]);
@@ -470,7 +470,7 @@ fn an_authority_restarts_from_a_pending_tip() {
     let after = successor_of(&second, &next.group_id(), 2, p.t);
     second.create_private(after.clone(), &[uid(2)], p.t, &()).unwrap();
     second.take_changes();
-    assert!(second.settle(&server(), &after.group_id(), Some(&after.group_id())).unwrap());
+    assert!(second.settle_private(&server(), &after.group_id(), Some(&after.group_id()), p.t, &()).unwrap());
     second.take_changes();
     assert_eq!(second.group(&server(), &p.id).unwrap().status, Status::Superseded);
     assert_eq!(second.group(&server(), &after.group_id()).unwrap().status, Status::Active);
@@ -520,7 +520,7 @@ fn a_restart_created_before_losing_authority_stays_pending_when_it_wins() {
     // A newer pair is accepted before the server's reply: the creation no longer carries it.
     let newer = pair(&p.chain, &p.owner, 2, &[], p.t);
     accept_pair(&mut p.owner, &newer, p.t);
-    assert!(!p.owner.settle(&server(), &next.group_id(), Some(&next.group_id())).unwrap());
+    assert!(!p.owner.settle_private(&server(), &next.group_id(), Some(&next.group_id()), p.t, &()).unwrap());
     p.owner.take_changes();
     let live = p.owner.group(&server(), &p.id).unwrap();
     assert_eq!((live.status, live.pending_tip.is_some()), (Status::Active, true));

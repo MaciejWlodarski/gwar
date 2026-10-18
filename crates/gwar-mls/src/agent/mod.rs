@@ -969,17 +969,54 @@ impl Agent {
     /// is deleted, with its pin, so the device can join the winner or create
     /// the conversation again.
     pub fn settle(&mut self, server: &str, id: &[u8; 32], winner: Option<&[u8; 32]>) -> Result<bool> {
+        self.operation(|a| a.settle_inner(server, id, winner, None))
+    }
+    /// [`Agent::settle`] for a private channel's creation: a won creation is adopted only if its
+    /// lists still give this device current authority now ((a)–(c), as for a newcomer); otherwise
+    /// the predecessor stays, with this creation as its pending tip (staged adoption, 6c).
+    pub fn settle_private(
+        &mut self,
+        server: &str,
+        id: &[u8; 32],
+        winner: Option<&[u8; 32]>,
+        now: i64,
+        revocations: &dyn Revocations,
+    ) -> Result<bool> {
         self.operation(|a| {
+            current_time(now)?;
+            a.settle_inner(server, id, winner, Some((now, revocations)))
+        })
+    }
+    fn settle_inner(
+        &mut self,
+        server: &str,
+        id: &[u8; 32],
+        winner: Option<&[u8; 32]>,
+        at: Option<(i64, &dyn Revocations)>,
+    ) -> Result<bool> {
+        {
+            let a = self;
             let key = group_key(server, id);
             if a.groups.get(&key).is_none_or(|r| r.status != Status::Creating) {
                 return Err(Invalid("not creating"));
             }
+            let d = SignedDescriptor::parse(&a.groups[&key].descriptor).ok_or(Invalid("descriptor"))?;
+            if rules::is_private(&d) != at.is_some() {
+                return Err(Invalid("a private creation settles with settle_private, others with settle"));
+            }
             if winner == Some(id) {
-                // A private restart this device created is adopted only while it still holds
-                // authority: otherwise the predecessor stays, with this creation as its pending tip
-                // (staged adoption, 6c).
-                if !a.own_creation_authorized(&key)? {
-                    let d = SignedDescriptor::parse(&a.groups[&key].descriptor).ok_or(Invalid("descriptor"))?;
+                let authorized = match at {
+                    Some((now, revocations)) => {
+                        let group = a.mls(&key)?;
+                        match a.newcomer(&key, &d, group.public_group().group_context(), now, revocations) {
+                            Ok(_) => true,
+                            Err(AgentError::Waiting) => false,
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    None => true,
+                };
+                if !authorized {
                     let mut group = a.mls(&key)?;
                     group.delete(a.provider.storage()).map_err(err("delete group"))?;
                     a.groups.remove(&key);
@@ -999,7 +1036,7 @@ impl Agent {
             group.delete(a.provider.storage()).map_err(err("delete group"))?;
             a.groups.remove(&key);
             Ok(false)
-        })
+        }
     }
 
     /// This device's creation is the group the server holds: it is active at

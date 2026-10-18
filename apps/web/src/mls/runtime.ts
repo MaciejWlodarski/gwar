@@ -449,6 +449,10 @@ export class MlsRuntime {
   private inventory(): GroupSummary[] { return this.engine.query({ inventory: { server: this.server } }); }
   private summary(group: string): GroupSummary | undefined { return this.inventory().find(g => encoded(g.group) === group); }
   private args(group: string) { return { server: this.server, group: [...decodeFixed(group, 32)] }; }
+  /** A private channel's creation settles as of now (staged adoption, 6c). */
+  private settleArgs(group: string) {
+    return this.summary(group)?.private ? { ...this.args(group), now: this.now(), revocations: this.options.revocations() } : this.args(group);
+  }
   private gate(group: string): Gate { return this.engine.query({ gate: { ...this.args(group), now: this.now(), revocations: this.options.revocations() } }); }
   private outbox(group: string): CommitOutbox | null { return this.engine.query({ outbox: this.args(group) }); }
   private updateStatuses(securing = false): void {
@@ -647,7 +651,7 @@ export class MlsRuntime {
     const groups = await this.groups();
     for (const g of this.inventory()) if (g.record.status === "creating" && this.enabled(g.conversation)) {
       const winner = groups.find(remote => remote.conversation === g.conversation);
-      await this.transition({ settle: { ...this.args(encoded(g.group)), winner: winner ? bytes(winner.group) : null } });
+      await this.transition({ settle: { ...this.settleArgs(encoded(g.group)), winner: winner ? bytes(winner.group) : null } });
     }
     this.held = await this.acceptRestarts(groups);
     await this.welcomes();
@@ -1168,7 +1172,7 @@ export class MlsRuntime {
       this.statuses.set(conversation, "creating"); this.notify();
       const known = (await this.groups()).find(g => g.conversation === conversation);
       for (const g of this.inventory()) if (g.conversation === conversation && g.record.status === "creating") {
-        await this.transition({ settle: { ...this.args(encoded(g.group)), winner: known ? bytes(known.group) : null } });
+        await this.transition({ settle: { ...this.settleArgs(encoded(g.group)), winner: known ? bytes(known.group) : null } });
       }
       if (known && (await this.acceptRestarts([known])).size) { this.held.add(conversation); throw new Error("MLS conversation is still securing"); }
       if (known) { this.held.delete(conversation); await this.syncGroup(known.group, known.pending); this.updateStatuses(); return; }
@@ -1192,7 +1196,7 @@ export class MlsRuntime {
       if (!found) throw error;
       winner = found.group;
     }
-    await this.transition({ settle: { ...this.args(d.group), winner: bytes(winner) } });
+    await this.transition({ settle: { ...this.settleArgs(d.group), winner: bytes(winner) } });
     // Another device's restart is joined after its chain is accepted, on the next pass.
     if (successor && winner !== d.group) { this.schedule(); return; }
     await this.syncGroup(winner);
