@@ -78,8 +78,8 @@ function RichText({ msg, meUid }: { msg: ChatMessage; meUid?: string }) {
   return <MessageText text={msg.text} mentioned={mentioned} meUid={meUid} />;
 }
 
-function formatTime(at: number, lang: string, short = false): string {
-  return new Date(at).toLocaleTimeString(lang, { hour: short ? "numeric" : "2-digit", minute: "2-digit" });
+function formatTime(at: number, lang: string): string {
+  return new Date(at).toLocaleTimeString(lang, { hour: "numeric", minute: "2-digit" });
 }
 
 function formatDay(at: number, lang: string, t: TFn): string {
@@ -181,28 +181,30 @@ export const MessageRow = memo(function MessageRow({
       data-message-verification={verification?.status ?? "pending"}
       data-mentions-me={mentionsMe || undefined}
       className={cn(
-        "group relative flex gap-3 px-4 hover:bg-hover/60",
-        row.first ? (compact ? "pt-2" : "pt-3") : "pt-px",
+        // Space between groups is margin, so the hover background sits evenly around the row.
+        "group relative flex gap-3 px-4 py-0.5 hover:bg-hover/60",
+        row.first && (compact ? "mt-2" : "mt-3"),
         mentionsMe && "bg-accent-soft/60 shadow-[inset_2px_0_0_var(--accent)] hover:bg-accent-soft",
         editing && "bg-hover/60",
       )}
     >
-      <div className="w-9 shrink-0 pt-0.5">
+      <div className="w-10 shrink-0">
         {row.first ? (
-          <Avatar name={authorName} seed={msg.author_uid} size={36} />
+          <Avatar name={authorName} seed={msg.author_uid} size={40} className="mt-0.5" />
         ) : (
+          // Always laid out (only hidden), one text line high: hovering never moves the chat.
           <time
             dateTime={new Date(at).toISOString()}
             title={full}
-            className="hidden pt-1 text-right text-[10px] leading-5 whitespace-nowrap text-subtle group-hover:block"
+            className="invisible block text-center text-[10px] leading-[21px] whitespace-nowrap text-subtle tabular-nums group-hover:visible"
           >
-            {formatTime(at, lang, true)}
+            {time}
           </time>
         )}
       </div>
-      <div className="min-w-0 flex-1 pb-px">
+      <div className="min-w-0 flex-1">
         {row.first && (
-          <div className="flex items-baseline gap-2">
+          <div className="flex min-w-0 items-center gap-2 leading-[21px]">
             <button className={cn("cursor-pointer text-sm font-semibold hover:underline", mine && !color && "text-accent")} style={color ? { color } : undefined}
               onClick={() => useUi.getState().openDialog({ kind: "memberProfile", uid: msg.author_uid, fallback: msg.author_name })}>
               {authorName}
@@ -1103,8 +1105,8 @@ function ChatHeader() {
       )}
       {isMobile && phase !== "idle" && inVoice && (
         <div className="flex items-center gap-1">
-          <MicButton size="sm" />
-          <DeafenButton size="sm" />
+          <MicButton size="md" />
+          <DeafenButton size="md" />
         </div>
       )}
       <IconButton

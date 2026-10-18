@@ -202,14 +202,6 @@
     animation: toast-in 150ms ease-out;
   }
 
-  /* Talking: a quiet green ring, no layout shift. */
-  .talking-ring {
-    box-shadow:
-      0 0 0 2px var(--side),
-      0 0 0 4px var(--ok);
-  }
-
-
   /* Radix Slider */
   .slider-root {
     position: relative;

@@ -1,16 +1,17 @@
-import { Headphones, HeadphoneOff, Mic, MicOff, PhoneOff, Settings, Wifi } from "lucide-react";
+import { Headphones, HeadphoneOff, Mic, MicOff, PhoneOff, Wifi } from "lucide-react";
+import type { ReactNode } from "react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { controller, describeVoiceError } from "../state/controller";
 import { canOpenMicrophoneSettings, openMicrophoneSettings } from "../platform";
 import { useSettings } from "../state/settings";
-import { useSession, useUi, useVoice } from "../state/stores";
+import { useSession, useVoice } from "../state/stores";
 import { useMe, keyLabel, modKey } from "./hooks";
-import { Avatar, IconButton, Button } from "./kit";
+import { Button, IconButton, TalkingAvatar } from "./kit";
 import { ConnectBadge } from "./badges";
 
 /** Mic toggle that doubles as a level meter and talking indicator. */
-export function MicButton({ size = "md" }: { size?: "sm" | "md" }) {
+export function MicButton({ size = "lg" }: { size?: "md" | "lg" | "wide" }) {
   const t = useT();
   const muted = useVoice((s) => s.muted);
   const deafened = useVoice((s) => s.deafened);
@@ -30,10 +31,10 @@ export function MicButton({ size = "md" }: { size?: "sm" | "md" }) {
       label={ptt && !off ? t("voice.pttHint", { key: pttKey ? keyLabel(pttKey) : "—" }) : label}
       shortcut={`${modKey}+⇧+M`}
       active={off}
+      size={size}
       onClick={() => (micError ? void controller.retryMic() : controller.toggleMute())}
       className={cn(
         "relative overflow-hidden",
-        size === "md" ? "size-9" : "size-8",
         off ? "bg-danger-soft text-danger hover:bg-danger hover:text-white" : "bg-hover text-fg hover:bg-active",
         talking && "ring-2 ring-ok",
         ptt && pttActive && !off && "ring-2 ring-ok",
@@ -51,7 +52,7 @@ export function MicButton({ size = "md" }: { size?: "sm" | "md" }) {
   );
 }
 
-export function DeafenButton({ size = "md" }: { size?: "sm" | "md" }) {
+export function DeafenButton({ size = "lg" }: { size?: "md" | "lg" | "wide" }) {
   const t = useT();
   const deafened = useVoice((s) => s.deafened);
   return (
@@ -59,24 +60,34 @@ export function DeafenButton({ size = "md" }: { size?: "sm" | "md" }) {
       label={deafened ? t("voice.undeafen") : t("voice.deafen")}
       shortcut={`${modKey}+⇧+D`}
       active={deafened}
+      size={size}
       onClick={() => controller.toggleDeafen()}
-      className={cn(
-        size === "md" ? "size-9" : "size-8",
-        deafened ? "bg-danger-soft text-danger hover:bg-danger hover:text-white" : "bg-hover text-fg hover:bg-active",
-      )}
+      className={deafened ? "bg-danger-soft text-danger hover:bg-danger hover:text-white" : "bg-hover text-fg hover:bg-active"}
     >
       {deafened ? <HeadphoneOff className="size-[18px]" /> : <Headphones className="size-[18px]" />}
     </IconButton>
   );
 }
 
-/** My nickname, with a client-verified Connect badge. */
-function SelfName({ nickname }: { nickname?: string }) {
+/** Who I am here: avatar (with the talking ring), nickname with the Connect badge, and one line under it. */
+function SelfRow({ sub, subTitle }: { sub: ReactNode; subTitle?: string }) {
+  const me = useMe();
   const member = useSession((s) => (s.me ? s.members[s.me.uid] : undefined));
+  if (!me) return null;
   return (
-    <div className="flex min-w-0 items-center gap-1">
-      <span className="truncate text-sm font-medium">{nickname}</span>
-      <ConnectBadge member={member} name={nickname} />
+    <div className="flex min-w-0 items-center gap-2 px-1">
+      <TalkingAvatar name={me.nickname} seed={me.uid} size={32} talking={me.talking && me.channel !== null} />
+      <div className="min-w-0 flex-1 leading-tight">
+        <div className="flex min-w-0 items-center gap-1">
+          <span className="truncate text-sm font-semibold">{me.nickname}</span>
+          <ConnectBadge member={member} name={me.nickname} />
+        </div>
+        {sub && (
+          <div className="flex min-w-0 items-center gap-1 text-xs text-subtle" title={subTitle}>
+            {sub}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -93,24 +104,19 @@ export function VoicePanel() {
   const phase = useSession((s) => s.phase);
   // TeamSpeak servers always keep you in a channel: there is nothing to leave.
   const canLeave = useSession((s) => s.kind === "vc");
-  const openDialog = useUi((s) => s.openDialog);
 
   if (me && me.channel === null) {
     return (
-      <div className="border-t border-line bg-side">
-        <div className="flex items-center gap-1 px-3 py-2.5">
-          <Avatar name={me.nickname} seed={me.uid} size={32} />
-          <div className="mr-auto ml-1.5 min-w-0 leading-tight">
-            <SelfName nickname={me.nickname} />
-            <div className="flex items-center gap-1 truncate text-xs text-subtle" title={t("voice.notInHint")}>
+      <div className="border-t border-line bg-side p-2">
+        <SelfRow
+          subTitle={t("voice.notInHint")}
+          sub={
+            <>
               <HeadphoneOff aria-hidden className="size-3 shrink-0" />
               <span className="truncate">{t("voice.notIn")}</span>
-            </div>
-          </div>
-          <IconButton label={t("settings.title")} onClick={() => openDialog({ kind: "settings", tab: "audio" })}>
-            <Settings className="size-[18px]" />
-          </IconButton>
-        </div>
+            </>
+          }
+        />
       </div>
     );
   }
@@ -130,31 +136,19 @@ export function VoicePanel() {
               ? { tone: encryption || encryptedChannel ? "muted" : "danger", text: t("voice.failed") }
               : { tone: "warn", text: t("voice.connecting") };
   const unavailable = voiceState === "failed" || encryption === "failed";
+  const tone = cn(
+    status.tone === "ok" && "text-ok",
+    status.tone === "warn" && "text-warn",
+    status.tone === "danger" && "text-danger",
+    status.tone === "muted" && "text-muted",
+  );
 
   return (
-    <div className="border-t border-line bg-side">
-      <div className="flex items-center gap-2 px-3 pt-2.5">
-        <Wifi
-          className={cn(
-            "size-4 shrink-0",
-            status.tone === "ok" && "text-ok",
-            status.tone === "warn" && "animate-pulse text-warn",
-            status.tone === "danger" && "text-danger",
-            status.tone === "muted" && "text-muted",
-          )}
-        />
+    <div className="flex flex-col gap-2 border-t border-line bg-side p-2">
+      <div className="flex items-center gap-2 rounded-lg bg-hover py-1.5 pr-1.5 pl-2.5">
+        <Wifi aria-hidden className={cn("size-4 shrink-0", tone, status.tone === "warn" && "animate-pulse")} />
         <div className="min-w-0 flex-1 leading-tight">
-          <div
-            className={cn(
-              "text-[13px] font-medium",
-              status.tone === "ok" && "text-ok",
-              status.tone === "warn" && "text-warn",
-              status.tone === "danger" && "text-danger",
-              status.tone === "muted" && "text-muted",
-            )}
-          >
-            {status.text}
-          </div>
+          <div className={cn("truncate text-[13px] font-medium", tone)}>{status.text}</div>
           {channelName && <div className="truncate text-xs text-muted">{channelName}</div>}
         </div>
         {unavailable && phase === "online" && (
@@ -162,9 +156,14 @@ export function VoicePanel() {
             {t("voice.retry")}
           </Button>
         )}
+        {canLeave && (
+          <IconButton label={t("voice.leave")} tone="danger" onClick={() => void controller.leaveVoice()}>
+            <PhoneOff className="size-4" />
+          </IconButton>
+        )}
       </div>
       {micError && (
-        <div role="alert" className="mx-3 mt-2 rounded-md bg-danger-soft px-2 py-1.5 text-xs text-danger">
+        <div role="alert" className="rounded-md bg-danger-soft px-2 py-1.5 text-xs text-danger">
           {describeVoiceError(micError)}
           {micError.kind === "mic_denied" && canOpenMicrophoneSettings() && (
             <button
@@ -179,22 +178,10 @@ export function VoicePanel() {
           </button>
         </div>
       )}
-      <div className="flex items-center gap-1 px-3 py-2.5">
-        {me && <Avatar name={me.nickname} seed={me.uid} size={32} className={cn(me.talking && "talking-ring")} />}
-        <div className="mr-auto ml-1.5 min-w-0 leading-tight">
-          <SelfName nickname={me?.nickname} />
-          <div className="truncate text-xs text-subtle">{me?.away ?? ""}</div>
-        </div>
-        <MicButton />
-        <DeafenButton />
-        <IconButton label={t("settings.title")} onClick={() => openDialog({ kind: "settings", tab: "audio" })}>
-          <Settings className="size-[18px]" />
-        </IconButton>
-        {canLeave && (
-          <IconButton label={t("voice.leave")} tone="danger" onClick={() => void controller.leaveVoice()}>
-            <PhoneOff className="size-[18px]" />
-          </IconButton>
-        )}
+      <SelfRow sub={me?.away ? <span className="truncate">{me.away}</span> : null} />
+      <div className="grid grid-cols-2 gap-1.5">
+        <MicButton size="wide" />
+        <DeafenButton size="wide" />
       </div>
     </div>
   );
