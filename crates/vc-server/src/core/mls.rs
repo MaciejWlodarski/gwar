@@ -136,6 +136,16 @@ fn page<T: Serialize>(items: Vec<(String, T)>, paging: MlsPage) -> Result<(Vec<T
 }
 
 /// The channel of a canonical `channel:{id}` conversation.
+/// A conversation's group a session may not read. A channel's answers as if it did not exist, so
+/// hidden and deleted channels look alike (6a, 6c).
+fn no_access(conversation: &str) -> ErrorBody {
+    if channel_id(conversation).is_some() {
+        err(ErrorCode::NotFound, "no such MLS group")
+    } else {
+        err(ErrorCode::Forbidden, "no access to this conversation")
+    }
+}
+
 /// A SQL page bound for queries whose rows are filtered while read: the page ends them.
 const UNBOUNDED: usize = i64::MAX as usize;
 
@@ -247,7 +257,7 @@ impl Core {
             .map_err(storage_error)?
             .ok_or_else(|| err(ErrorCode::NotFound, "no such MLS group"))?;
         if !self.mls_can_read(&self.sessions[&session].uid, &row.conversation)? {
-            return Err(err(ErrorCode::Forbidden, "no access to this conversation"));
+            return Err(no_access(&row.conversation));
         }
         Ok(row)
     }
@@ -535,8 +545,12 @@ impl Core {
                 let answers = assignment.filter(|a| routed && self.history.is_active(a, &group, &recipient, &device));
                 let observer = self.mls_observer(&row)?;
                 let leaves = observer.leaves();
+                // The recipient's user must still be admitted: a former member of a private channel
+                // keeps leaves in its earlier incarnations (6c).
                 if !leaves.iter().any(|l| l.device_key == device && l.uid == uid)
-                    || !leaves.iter().any(|l| l.device_key == recipient)
+                    || !leaves
+                        .iter()
+                        .any(|l| l.device_key == recipient && self.mls_conversation_admits(&l.uid, &row.conversation))
                 {
                     return Err(err(ErrorCode::Forbidden, "history devices must be group members"));
                 }
@@ -605,13 +619,14 @@ impl Core {
                     Some(assignment) => format!("{}:{}:{assignment}", w.group, w.device),
                     None => format!("{}:{}", w.group, w.device),
                 };
-                let mut wanted: Vec<_> = self
-                    .history
-                    .wanted(&device)
-                    .into_iter()
-                    .map(|w| (key(&w), w))
-                    .filter(|(k, _)| *k > after)
-                    .collect();
+                let mut wanted = Vec::new();
+                for w in self.history.wanted(&device) {
+                    // Not for a channel this user is no longer admitted to.
+                    let row = self.store.mls_group(&w.group).map_err(storage_error)?;
+                    if key(&w) > after && row.is_some_and(|r| self.mls_conversation_admits(&uid, &r.conversation)) {
+                        wanted.push((key(&w), w));
+                    }
+                }
                 self.store
                     .mls_wanted(&uid, &device, now_ms(), &after, count + 1, |w| {
                         wanted.push((key(&w), w));
@@ -637,7 +652,7 @@ impl Core {
                     return Err(bad("voice has no incarnation history"));
                 }
                 if !self.mls_can_read(&uid, &conversation)? {
-                    return Err(err(ErrorCode::Forbidden, "no access to this conversation"));
+                    return Err(no_access(&conversation));
                 }
                 let after = paging
                     .after

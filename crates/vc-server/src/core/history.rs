@@ -197,6 +197,39 @@ impl Core {
         }
     }
 
+    /// A session lost a private channel: its assignments in that channel's groups (any incarnation)
+    /// are used up, and every request there is routed again (one for its user ends).
+    pub(super) fn history_admission_lost(&mut self, session: SessionId, channel: vc_proto::ChannelId) {
+        let conversation = format!("channel:{channel}");
+        let groups: BTreeSet<String> = self
+            .history
+            .groups()
+            .into_iter()
+            .filter(|g| matches!(self.store.mls_group(g), Ok(Some(row)) if row.conversation == conversation))
+            .collect();
+        let ended: Vec<_> = self
+            .history
+            .assignments
+            .iter()
+            .filter(|(_, a)| a.session == session && groups.contains(&a.key.0))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ended {
+            self.history.end(&id, Ended::Used);
+        }
+        let keys: BTreeSet<Key> = self
+            .history
+            .assignments
+            .values()
+            .map(|a| a.key.clone())
+            .chain(self.history.rotations.keys().cloned())
+            .filter(|k| groups.contains(&k.0))
+            .collect();
+        for key in keys {
+            self.history_route(&key);
+        }
+    }
+
     /// Timeouts and finished backoffs.
     pub(super) fn history_wake(&mut self) {
         let now = now_ms();
@@ -256,8 +289,14 @@ impl Core {
         }
         let Some(row) = self.store.mls_group(group)? else { return Ok(()) };
         let leaves: BTreeMap<String, String> = self.store.mls_leaf_devices(group)?.into_iter().collect();
-        // Only while the recipient has a leaf.
-        if !leaves.contains_key(recipient) {
+        // Only while the recipient has a leaf and its user may read the conversation (a former
+        // member of a private channel keeps leaves in earlier incarnations).
+        let Some(recipient_uid) = leaves.get(recipient) else { return Ok(()) };
+        if !self.mls_conversation_admits(recipient_uid, &row.conversation) {
+            let ids: Vec<_> = self.history.active(key).map(|(id, _)| id.clone()).collect();
+            for id in ids {
+                self.history.end(&id, Ended::Cancelled);
+            }
             return Ok(());
         }
         let readers = self.mls_readers(&row.conversation);

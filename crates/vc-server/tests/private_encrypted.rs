@@ -270,7 +270,7 @@ async fn an_encrypted_private_channel_admits_only_its_signed_members_and_never_g
         .to_owned();
     // Bob is admitted (he sees the channel); Eve is not.
     assert_eq!(bob.next_event_where("channel.created", |e| e["id"] == channel).await["private"], true);
-    assert!(matches!(eve.fails("mls.group_info", json!({"group": group})).await.as_str(), "forbidden" | "not_found"));
+    assert_eq!(eve.fails("mls.group_info", json!({"group": group})).await, "not_found");
     assert!(eve.drain_events("channel.created").await.iter().all(|e| e["id"] != channel));
     // Nor does Eve find its group or its read marks: in `mls.groups` or a new Welcome.
     let conversation = format!("channel:{channel}");
@@ -353,6 +353,9 @@ async fn an_encrypted_private_channel_admits_only_its_signed_members_and_never_g
     owner.ok("mls.commit", commit_request(&group, 1, &commit, &info)).await;
     owner_device.group.as_mut().unwrap().merge_pending_commit(&owner_device.provider).unwrap();
     assert_eq!(bob.next_event_where("channel.hidden", |e| e["channel"] == channel).await["channel"], channel);
+    // Its group now answers Bob as if it did not exist, like a deleted channel's.
+    assert_eq!(bob.fails("mls.group_info", json!({"group": group})).await, "not_found");
+    assert_eq!(bob.fails("mls.log", json!({"group": group, "since": 0})).await, "not_found");
 
     // Going back to the first list is refused, and so is a list under another (non-current) pair.
     let (commit, info) =

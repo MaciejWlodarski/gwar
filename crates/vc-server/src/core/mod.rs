@@ -833,6 +833,7 @@ impl Core {
             if self.sessions[&session].channel == Some(channel) {
                 let _ = self.channel_leave(session);
             }
+            self.history_admission_lost(session, channel);
             let inside: Vec<_> = self
                 .sessions
                 .values()
