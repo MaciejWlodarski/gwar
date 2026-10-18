@@ -1,4 +1,4 @@
-import { boundedImageBlob, verifiedAttachmentBlob } from "../net/attachment";
+import { AttachmentIntegrityError, boundedImageBlob, verifiedAttachmentBlob } from "../net/attachment";
 import { imageBudget, imageMemory, type ImageBudget } from "../net/image-budget";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { Download, File as FileIcon, FileArchive, FileAudio, FileText, FileVideo, Loader2, X } from "lucide-react";
@@ -24,9 +24,13 @@ const KIND_ICON: Record<FileKind, ReactNode> = {
   other: <FileIcon className="size-5" />,
 };
 
-/** An encrypted file that fails to download, decrypt or check is not offered unverified: it cannot be opened. */
-function AttachmentState({ failed, onLoad, untrusted = false, sealed = false }: { failed: boolean; onLoad?: () => void; untrusted?: boolean; sealed?: boolean }) {
+/** An encrypted file that fails to download, decrypt or check is not offered unverified: it cannot be opened.
+ * A download that failed (the network, the server, the session's file token) is not a failed check:
+ * it is offered again, still checked. */
+function AttachmentState({ failed, onLoad, untrusted = false, sealed = false, onRetry }: { failed: boolean; onLoad?: () => void; untrusted?: boolean; sealed?: boolean; onRetry?: () => void }) {
   const t = useT();
+  if (onRetry) return <span className="text-xs text-subtle"><span role="alert">{t("file.loadFailed")}</span>
+    <Button size="sm" variant="ghost" className="ml-2 underline" onClick={onRetry}>{t("file.retry")}</Button></span>;
   if (sealed && failed) return <span role="alert" className="text-xs text-subtle">{t("file.cannotOpen")}</span>;
   return <span className="text-xs text-subtle"><span role={failed ? "alert" : "status"}>{untrusted ? t("file.unverified") : t(failed ? "file.notVerified" : "file.verifying")}</span>
     {onLoad && <Tooltip label={t("file.unverifiedRisk")}><Button size="sm" variant="ghost" className="ml-2 underline" onClick={onLoad}>{t("file.loadUnverified")}</Button></Tooltip>}</span>;
@@ -66,8 +70,9 @@ function useAttachmentUrl(att: Attachment, verified: boolean, { autoLoad = true,
   const session = useSession((s) => s.fileSession), access = useSession(fileAccess);
   const [explicit, setExplicit] = useState<string>();
   const [requested, setRequested] = useState<string>();
+  const [attempt, setAttempt] = useState(0);
   const key = JSON.stringify([origin, session, access, att, limit, verified]);
-  const [loaded, setLoaded] = useState<{ key: string; url: string; failed: boolean }>();
+  const [loaded, setLoaded] = useState<{ key: string; attempt: number; url: string; failed: boolean; transport?: boolean }>();
   const load = () => setExplicit(key);
   const open = () => setRequested(key);
   const allowed = verified || explicit === key;
@@ -88,15 +93,24 @@ function useAttachmentUrl(att: Attachment, verified: boolean, { autoLoad = true,
           signal.throwIfAborted();
         }));
         signal.throwIfAborted();
-        url = URL.createObjectURL(image); setLoaded({ key, url, failed: false });
+        url = URL.createObjectURL(image); setLoaded({ key, attempt, url, failed: false });
       } finally { slot?.(); }
-    })().catch(() => { release?.(); if (!signal.aborted) setLoaded({ key, url: "", failed: true }); });
+    })().catch((error: unknown) => {
+      release?.();
+      // An aborted load (scrolled away, a newer key) shows nothing; only a real mismatch is a failed check.
+      if (!signal.aborted) setLoaded({ key, attempt, url: "", failed: true, transport: !(error instanceof AttachmentIntegrityError) });
+    });
     return () => {
       abort.abort(); release?.();
       if (url) { URL.revokeObjectURL(url); const gone = url; setLoaded((l) => l?.url === gone ? undefined : l); }
     };
-  }, [key, allowed, explicit, origin, session, access, limit, att, autoLoad, requested, active, budget]);
-  return { open, requested: requested === key || explicit === key, url: loaded?.key === key ? loaded.url : "", failed: loaded?.key === key && loaded.failed, load, allowed, unverified: explicit === key };
+  }, [key, attempt, allowed, explicit, origin, session, access, limit, att, autoLoad, requested, active, budget]);
+  const current = loaded?.key === key && loaded.attempt === attempt ? loaded : undefined;
+  const retry = () => setAttempt((n) => n + 1);
+  return {
+    open, requested: requested === key || explicit === key, url: current?.url ?? "",
+    failed: !!current?.failed && !current.transport, transportFailed: !!current?.transport, retry, load, allowed, unverified: explicit === key,
+  };
 }
 function useSave(att: Attachment, verified: boolean) {
   const t = useT();
@@ -113,8 +127,12 @@ function useSave(att: Attachment, verified: boolean) {
       request.signal.throwIfAborted();
       const ok = await saveBlob(blob, att.name);
       if (ok && isDesktop() && !request.signal.aborted) useUi.getState().toast("success", t("file.saved", { name: att.name }));
-    } catch {
-      if (!request.signal.aborted) { setFailed(true); useUi.getState().toast("error", t(att.sealed ? "file.cannotOpen" : "file.notVerified")); }
+    } catch (error) {
+      if (request.signal.aborted) return;
+      // Only a real mismatch fails the check (and offers an unverified copy); a failed download
+      // stays a verified one to try again.
+      if (error instanceof AttachmentIntegrityError) { setFailed(true); useUi.getState().toast("error", t(att.sealed ? "file.cannotOpen" : "file.notVerified")); }
+      else useUi.getState().toast("error", t("file.loadFailed"));
     } finally { if (!request.signal.aborted) setBusy(false); }
   };
   return { busy, run, failed };
@@ -135,10 +153,11 @@ function ImageAttachment({ att, verified }: { att: Attachment; verified: boolean
   const t = useT();
   const [failed, setFailed] = useState(false);
   const [ref, near] = useNearView<HTMLDivElement>();
-  const { url, failed: hashFailed, load, allowed, unverified } = useAttachmentUrl(att, verified, { active: near, budget: imageBudget });
+  const { url, failed: hashFailed, transportFailed, retry, load, allowed, unverified } = useAttachmentUrl(att, verified, { active: near, budget: imageBudget });
   const box = att.width && att.height ? fitBox(att.width, att.height, MAX_W, MAX_H) : null;
   return <div ref={ref} className="max-w-full">{body()}</div>;
   function body() {
+  if (transportFailed) return <AttachmentState failed={false} onRetry={retry} />;
   if (hashFailed) return <AttachmentState failed untrusted={!allowed} onLoad={load} sealed={!!att.sealed} />;
   // Until it is loaded (or after it was released far off screen) the image keeps its box, so the chat does not shift.
   if (!url) return allowed && box ? <div style={{ width: box.width, height: box.height }} className="flex max-w-full items-center justify-center rounded-lg bg-side"><AttachmentState failed={false} /></div>
@@ -171,8 +190,9 @@ function ImageAttachment({ att, verified }: { att: Attachment; verified: boolean
 
 function VideoAttachment({ att, verified }: { att: Attachment; verified: boolean }) {
   const t = useT();
-  const { url, failed, load, allowed, unverified, open, requested } = useAttachmentUrl(att, verified, { autoLoad: false });
+  const { url, failed, transportFailed, retry, load, allowed, unverified, open, requested } = useAttachmentUrl(att, verified, { autoLoad: false });
   if (verified && !requested) return <Button size="sm" onClick={open}>{t("file.open", { name: att.name })}</Button>;
+  if (transportFailed) return <AttachmentState failed={false} onRetry={retry} />;
   if (failed || !url) return <AttachmentState failed={failed} untrusted={!allowed} onLoad={failed || !allowed ? load : undefined} sealed={!!att.sealed} />;
   const box = att.width && att.height ? fitBox(att.width, att.height, MAX_W, MAX_H) : null;
   return (
@@ -198,8 +218,9 @@ function VideoAttachment({ att, verified }: { att: Attachment; verified: boolean
 
 function AudioAttachment({ att, verified }: { att: Attachment; verified: boolean }) {
   const t = useT();
-  const { url, failed, load, allowed, unverified, open, requested } = useAttachmentUrl(att, verified, { autoLoad: false });
+  const { url, failed, transportFailed, retry, load, allowed, unverified, open, requested } = useAttachmentUrl(att, verified, { autoLoad: false });
   if (verified && !requested) return <Button size="sm" onClick={open}>{t("file.open", { name: att.name })}</Button>;
+  if (transportFailed) return <AttachmentState failed={false} onRetry={retry} />;
   if (failed || !url) return <AttachmentState failed={failed} untrusted={!allowed} onLoad={failed || !allowed ? load : undefined} sealed={!!att.sealed} />;
   return (
     <div className="flex w-full max-w-[400px] flex-col gap-1.5 rounded-lg border border-line bg-side p-2.5">
@@ -261,7 +282,7 @@ export function AttachmentList({ attachments, verified = false }: { attachments:
 }
 
 export function Lightbox({ attachment, verified }: { attachment: Attachment; verified: boolean }) {
-  const { url, load, failed, allowed, unverified } = useAttachmentUrl(attachment, verified);
+  const { url, load, failed, transportFailed, retry, allowed, unverified } = useAttachmentUrl(attachment, verified);
   const name = attachment.name;
   const t = useT();
   const close = useUi((s) => s.closeDialog);
@@ -282,7 +303,8 @@ export function Lightbox({ attachment, verified }: { attachment: Attachment; ver
           onClick={(e) => e.target === e.currentTarget && close()}
         >
           <DialogPrimitive.Title className="sr-only">{name}</DialogPrimitive.Title>
-          {!url && <AttachmentState failed={failed} untrusted={!allowed} onLoad={failed || !allowed ? load : undefined} sealed={!!attachment.sealed} />}
+          {!url && (transportFailed ? <AttachmentState failed={false} onRetry={retry} />
+            : <AttachmentState failed={failed} untrusted={!allowed} onLoad={failed || !allowed ? load : undefined} sealed={!!attachment.sealed} />)}
           {unverified && <span className="text-xs text-warn">{t("file.loadedUnverified")}</span>}
           <img src={url || undefined} alt={name} className="max-h-[calc(100dvh-8rem)] max-w-full rounded-lg object-contain shadow-pop" />
           <div className="flex items-center gap-2 rounded-lg border border-line-strong bg-raised px-3 py-1.5 text-sm">

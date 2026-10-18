@@ -475,6 +475,8 @@ export const pl: Record<Key, string> = {
   "file.aborted": "Wysyłanie anulowane.",
   "file.networkFailed": "Nie udało się wysłać pliku. Sprawdź połączenie i spróbuj ponownie.",
   "file.notVerified": "Weryfikacja załącznika nie powiodła się",
+  "file.loadFailed": "Nie udało się wczytać załącznika",
+  "file.retry": "Spróbuj ponownie",
   "file.cannotOpen": "Nie można otworzyć tego pliku",
   "file.verifying": "Weryfikowanie załącznika…",
   "file.unverified": "Niezweryfikowany załącznik",

@@ -52,6 +52,17 @@ describe("attachment trust", () => {
       expect(container.querySelector(tag)).toBeNull(); expect(URL.createObjectURL).not.toHaveBeenCalled();
       expect(container.textContent).toContain("Load unverified attachment");
     });
+    it(`offers ${mime} again, still checked, after a failed download (not a failed check)`, async () => {
+      await show(await media(mime), true);
+      vi.mocked(fetchFileBytes).mockRejectedValueOnce(new Error("HTTP 401"));
+      await act(async () => container.querySelector<HTMLButtonElement>('button')!.click());
+      await vi.waitFor(() => expect(container.textContent).toContain("Couldn't load the attachment"));
+      expect(container.textContent).not.toContain("Attachment verification failed");
+      expect(container.textContent).not.toContain("Load unverified attachment");
+      const retry = [...container.querySelectorAll("button")].find((b) => b.textContent === "Try again")!;
+      await act(async () => retry.click());
+      await vi.waitFor(() => expect(container.querySelector(tag)?.getAttribute("src")).toBe("blob:checked"));
+    });
     it(`does not fetch pending ${mime}`, async () => { await show(await media(mime), null); expect(fetchFileBytes).not.toHaveBeenCalled(); expect(container.querySelector(tag)).toBeNull(); });
   }
   it("a lightbox retry verifies again; substituted bytes are saved only through the labeled action", async () => {

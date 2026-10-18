@@ -473,6 +473,8 @@ export const en = {
   "file.aborted": "Upload cancelled.",
   "file.networkFailed": "The upload failed. Check your connection and try again.",
   "file.notVerified": "Attachment verification failed",
+  "file.loadFailed": "Couldn't load the attachment",
+  "file.retry": "Try again",
   "file.cannotOpen": "Can't open this file",
   "file.verifying": "Verifying attachment…",
   "file.unverified": "Unverified attachment",
