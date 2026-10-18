@@ -136,7 +136,7 @@ export class MlsRuntime {
    * offers this device sent for a GroupInfo it could not join (one each). */
   private readonly offers = new Map<string, string>();
   private readonly repairAt = new Map<string, number>();
-  private readonly offered = new Set<string>();
+  private readonly offered = new Map<string, number>();
   private wakeAt: number | undefined;
   /** Volatile voice calls under this device lease, closed with it. */
   private readonly calls = new Set<VoiceCall>();
@@ -495,15 +495,17 @@ export class MlsRuntime {
    * whether it committed something (the caller then submits it). */
   private async repairAccess(group: string, gate: Gate): Promise<boolean> {
     // An offer waits while a newer manager pair is still being checked: it may carry that pair.
+    // It is kept until it brings nothing more (committed, or older than what the group holds), so
+    // an expired or losing commit of it is built again.
     const offer = this.offers.get(group);
     if (offer !== undefined && this.managersSettled()) {
-      this.offers.delete(group);
       try {
         await this.engine.op({ adopt_offer: { ...this.args(group), extension: bytes(offer), now: this.now(), revocations: this.options.revocations() } });
         return true;
       } catch (error) {
         if (!(error instanceof AgentOperationError)) throw error;
-        await this.engine.reload(); // Not valid for this device (older, another pair): ignored.
+        await this.engine.reload(); // Nothing (more) to commit for this device: dropped.
+        if (this.offers.get(group) === offer) this.offers.delete(group);
       }
     }
     if (!repairable(gate)) { this.repairAt.delete(group); return false; }
@@ -520,12 +522,14 @@ export class MlsRuntime {
     // Once per GroupInfo and accepted pair: a newer pair needs a fresh offer.
     const me = this.uid, view = this.owner;
     const key = `${group}:${view?.generation}:${view?.anchor_seq}:${view?.list_seq}:${encoded(info)}`;
-    if (!view || this.offered.has(key) || !(view.owner === me || view.confirmers.includes(me) || view.managers.includes(me))) return;
+    // Sent again every ten minutes while the join still waits: a member may have been offline.
+    const sent = this.offered.get(key);
+    if (!view || (sent !== undefined && this.now() - sent < 10 * 60_000) || !(view.owner === me || view.confirmers.includes(me) || view.managers.includes(me))) return;
     try {
       const extension = this.engine.query<number[]>({ offer_access: { server: this.server, group_info: info, tree, members: null, now: this.now(), revocations: this.options.revocations() } });
       await this.request("mls.access.offer", { group, extension: encoded(extension) });
-      // Only a delivered offer is not sent again; a failed one is retried with the join's backoff.
-      this.offered.add(key);
+      // A failed offer is retried with the join's backoff; a delivered one after ten minutes.
+      this.offered.set(key, this.now());
     } catch (error) {
       this.options.onError?.(error);
     }
