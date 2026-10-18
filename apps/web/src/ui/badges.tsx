@@ -58,9 +58,9 @@ export function ConnectBadge({ member, name }: { member?: HandleMember | null; n
   if (status === "changed") {
     const label = t("badge.handleChanged", { handle });
     return (
-      <span title={label} aria-label={label} data-testid="connect-badge-changed" className="inline-flex min-w-0 shrink-[3] items-center gap-0.5 align-middle text-muted">
+      <span title={label} aria-label={label} data-testid="connect-badge-changed" className="inline-flex min-w-0 shrink-[3] items-center gap-1 align-middle text-muted">
         <BadgeInfo aria-hidden className="size-3.5 shrink-0" />
-        <span className="truncate font-mono text-xs">@{handle}</span>
+        <span className="truncate text-xs font-normal">@{handle}</span>
       </span>
     );
   }
@@ -69,9 +69,9 @@ export function ConnectBadge({ member, name }: { member?: HandleMember | null; n
   return (
     // In a tight row the handle gives way first (the nickname is the name people read); the
     // check mark always stays.
-    <span title={label} aria-label={label} data-testid="connect-badge" className="inline-flex min-w-0 shrink-[3] items-center gap-0.5 align-middle text-accent">
-      <BadgeCheck aria-hidden className="size-3.5 shrink-0" />
-      {visible && <span className="truncate font-mono text-xs">@{handle}</span>}
+    <span title={label} aria-label={label} data-testid="connect-badge" className="inline-flex min-w-0 shrink-[3] items-center gap-1 align-middle">
+      <BadgeCheck aria-hidden className="size-3.5 shrink-0 text-accent" />
+      {visible && <span className="truncate text-xs font-normal text-subtle">@{handle}</span>}
     </span>
   );
 }

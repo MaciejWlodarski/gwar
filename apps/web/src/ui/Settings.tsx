@@ -1,6 +1,5 @@
-import * as Tabs from "@radix-ui/react-tabs";
 import { Bell, Check, CloudCog, Copy, Download, Languages, Monitor, Moon, Palette, SlidersHorizontal, Sun, Upload, UserRound } from "lucide-react";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState } from "react";
 import { tNow, useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { accountKeyOf, uidForPublicKey } from "../net/identity";
@@ -18,7 +17,8 @@ import { useSettings, type Language, type Theme } from "../state/settings";
 import { useSession, useUi, useVoice, type SettingsTab } from "../state/stores";
 import { VoiceError } from "../voice/engine";
 import { keyLabel } from "./hooks";
-import { Button, Dialog, Field, Input, Segmented, Select, Slider, Switch } from "./kit";
+import { Button, Field, Input, Section, Segmented, Select, Slider, Switch } from "./kit";
+import { SettingsLayout, type SettingsPage } from "./SettingsLayout";
 
 const DEFAULT = "__default";
 
@@ -26,7 +26,7 @@ export function SettingsDialog({ tab }: { tab: SettingsTab }) {
   const t = useT();
   const close = useUi((s) => s.closeDialog);
   const [current, setCurrent] = useState<SettingsTab>(tab);
-  const tabs: Array<{ id: SettingsTab; label: string; icon: ReactNode }> = [
+  const tabs: Array<SettingsPage<SettingsTab>> = [
     { id: "audio", label: t("settings.audio"), icon: <SlidersHorizontal className="size-4" /> },
     { id: "notifications", label: t("settings.notifications"), icon: <Bell className="size-4" /> },
     { id: "appearance", label: t("settings.appearance"), icon: <Palette className="size-4" /> },
@@ -35,49 +35,15 @@ export function SettingsDialog({ tab }: { tab: SettingsTab }) {
     { id: "language", label: t("settings.language"), icon: <Languages className="size-4" /> },
   ];
   return (
-    <Dialog open onOpenChange={(o) => !o && close()} title={t("settings.title")} width="max-w-xl">
-      <Tabs.Root value={current} onValueChange={(v) => setCurrent(v as SettingsTab)}>
-        <Tabs.List className="-mx-1 mb-4 flex gap-1 overflow-x-auto border-b border-line px-1 pb-2" aria-label={t("settings.title")}>
-          {tabs.map((x) => (
-            <Tabs.Trigger
-              key={x.id}
-              value={x.id}
-              className="t flex h-8 shrink-0 cursor-pointer items-center gap-2 rounded-md px-3 text-sm text-muted hover:bg-hover hover:text-fg data-[state=active]:bg-active data-[state=active]:text-fg"
-            >
-              {x.icon}
-              {x.label}
-            </Tabs.Trigger>
-          ))}
-        </Tabs.List>
-        <Tabs.Content value="audio" className="outline-none">
-          <AudioTab />
-        </Tabs.Content>
-        <Tabs.Content value="notifications" className="outline-none">
-          <NotificationsTab />
-        </Tabs.Content>
-        <Tabs.Content value="appearance" className="outline-none">
-          <AppearanceTab />
-        </Tabs.Content>
-        <Tabs.Content value="identity" className="outline-none">
-          <IdentityTab />
-        </Tabs.Content>
-        <Tabs.Content value="account" className="outline-none">
-          <AccountTab />
-        </Tabs.Content>
-        <Tabs.Content value="language" className="outline-none">
-          <LanguageTab />
-        </Tabs.Content>
-      </Tabs.Root>
-    </Dialog>
-  );
-}
-
-function Section({ title, children }: { title: string; children: ReactNode }) {
-  return (
-    <section className="mb-6 last:mb-0">
-      <h3 className="mb-2 text-xs font-semibold tracking-wide text-subtle uppercase">{title}</h3>
-      <div className="flex flex-col gap-3">{children}</div>
-    </section>
+    <SettingsLayout title={t("settings.title")} pages={tabs} value={current} onValueChange={setCurrent} onClose={close}>
+      {(page) =>
+        page === "audio" ? <AudioTab />
+        : page === "notifications" ? <NotificationsTab />
+        : page === "appearance" ? <AppearanceTab />
+        : page === "identity" ? <IdentityTab />
+        : page === "account" ? <AccountTab />
+        : <LanguageTab />}
+    </SettingsLayout>
   );
 }
 

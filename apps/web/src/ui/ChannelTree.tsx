@@ -29,7 +29,7 @@ import { buildTree, descendantsCount, type ChannelNode } from "../state/tree";
 import { MentionBadge, UnreadBadge } from "./badges";
 import { useGroupsColor, usePermission } from "./hooks";
 import { ModerationItems } from "./ModerationMenu";
-import { Avatar, EmptyState, Slider, menuContent, menuItem, menuItemDanger, menuLabel, menuSeparator } from "./kit";
+import { EmptyState, TalkingAvatar, Slider, menuContent, menuItem, menuItemDanger, menuLabel, menuSeparator } from "./kit";
 
 const CLIENT_MIME = "application/x-vc-client";
 
@@ -268,7 +268,7 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
     useSession.getState().dispatch({ type: "openDm", uid: client.uid, name: client.nickname });
     useUi.getState().setDrawer(false);
   };
-  const avatarSize = compact ? 18 : 22;
+  const avatarSize = compact ? 18 : 22; // plus the ring: the row height
   const silenced = client.muted || client.deafened;
 
   return (
@@ -292,15 +292,13 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
               openDm();
             }
           }}
-          style={{ paddingLeft: 4 + (depth + 1) * 16 + 20 }}
+          style={{ paddingLeft: 4 + (depth + 1) * 16 + 17 }}
           className={cn(
-            "t flex items-center gap-2 rounded-md pr-2 text-sm text-fg hover:bg-hover",
+            "t flex items-center gap-1.5 rounded-md pr-2 text-sm text-fg hover:bg-hover",
             compact ? "h-6" : "h-7",
           )}
         >
-          <span className={cn("relative flex shrink-0 rounded-full", client.talking && "talking-ring")}>
-            <Avatar name={client.nickname} seed={client.uid} size={avatarSize} />
-          </span>
+          <TalkingAvatar name={client.nickname} seed={client.uid} size={avatarSize} talking={client.talking} />
           <span className={cn("min-w-0 truncate", silenced && "text-muted", isMe && "font-medium")} style={color ? { color } : undefined}>
             {client.nickname}
           </span>

@@ -502,7 +502,7 @@ async function main() {
   });
 
   await check("talking indicator shows in the tree", async () => {
-    await waitFor(async () => (await a.locator(".talking-ring").count()) > 0, "talking ring", 15000);
+    await waitFor(async () => (await a.locator("[data-talking]").count()) > 0, "talking ring", 15000);
   });
 
   await check("incoming audio reaches a WebAudio slot (receiver stats)", async () => {

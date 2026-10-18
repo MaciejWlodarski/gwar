@@ -141,7 +141,8 @@ export const IconButton = forwardRef<
     tone?: "default" | "danger" | "accent";
     active?: boolean;
     side?: "top" | "right" | "bottom" | "left";
-    size?: "sm" | "md";
+    /** sm 28 px, md 32 px, lg 36 px square; wide is 36 px high and fills its cell. */
+    size?: "sm" | "md" | "lg" | "wide";
   }
 >(function IconButton({ label, shortcut, tone = "default", active, side, size = "md", className, children, ...props }, ref) {
   return (
@@ -152,7 +153,7 @@ export const IconButton = forwardRef<
         aria-pressed={active}
         className={cn(
           "t inline-flex shrink-0 cursor-pointer items-center justify-center rounded-md disabled:cursor-not-allowed disabled:opacity-40",
-          size === "md" ? "size-8" : "size-7",
+          { sm: "size-7", md: "size-8", lg: "size-9", wide: "h-9 w-full" }[size],
           tone === "danger"
             ? "bg-danger-soft text-danger hover:bg-danger hover:text-white"
             : tone === "accent"
@@ -203,6 +204,18 @@ export function Avatar({
       style={{ width: size, height: size, fontSize: Math.max(9, Math.round(size * 0.4)), ...avatarColors(seed ?? name) }}
     >
       {initials(name)}
+    </span>
+  );
+}
+
+/** An avatar with room for the talking ring around it (size + 6 px), so the ring never covers what is next to it. */
+export function TalkingAvatar({ talking, className, ...avatar }: Parameters<typeof Avatar>[0] & { talking: boolean }) {
+  return (
+    <span
+      data-talking={talking || undefined}
+      className={cn("t inline-flex shrink-0 rounded-full p-[3px]", talking && "shadow-[inset_0_0_0_2px_var(--ok)]", className)}
+    >
+      <Avatar {...avatar} />
     </span>
   );
 }
@@ -411,6 +424,17 @@ export function Dialog({
         </DialogPrimitive.Content>
       </DialogPrimitive.Portal>
     </DialogPrimitive.Root>
+  );
+}
+
+/** A titled group of settings; groups after the first are set apart by a rule. */
+export function Section({ title, description, children }: { title: string; description?: ReactNode; children: ReactNode }) {
+  return (
+    <section className="border-line not-first:mt-6 not-first:border-t not-first:pt-6">
+      <h3 className="text-xs font-semibold tracking-wide text-subtle uppercase">{title}</h3>
+      {description && <p className="mt-1 text-sm text-muted">{description}</p>}
+      <div className="mt-3 flex flex-col gap-3">{children}</div>
+    </section>
   );
 }
 

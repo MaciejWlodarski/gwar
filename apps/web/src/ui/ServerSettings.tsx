@@ -1,5 +1,4 @@
 import * as Dropdown from "@radix-ui/react-dropdown-menu";
-import * as Tabs from "@radix-ui/react-tabs";
 import { Ban, Check, Copy, Crown, Link2, Lock, Plus, Search, ShieldCheck, Trash2, UserMinus, UserPlus, Users, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { countKey, useLanguage, useT, type Key } from "../i18n";
@@ -32,6 +31,7 @@ import { controller, describeRequestError } from "../state/controller";
 import { sortedChannels } from "../state/reducer";
 import { useSession, useUi, type ServerSettingsTab } from "../state/stores";
 import { OwnershipTab } from "./Ownership";
+import { SettingsLayout, type SettingsPage } from "./SettingsLayout";
 import { useMyGroups, usePermission } from "./hooks";
 import { Avatar, Button, Dialog, EmptyState, Field, IconButton, Input, Select, Spinner, Switch, Textarea, menuContent, menuItem } from "./kit";
 
@@ -96,14 +96,14 @@ export function ServerSettingsDialog({ tab }: { tab?: ServerSettingsTab }) {
   const canEdit = usePermission("channel_edit");
 
   const tabs = useMemo(() => {
-    const list: Array<{ id: ServerSettingsTab; label: string; icon: ReactNode }> = [];
+    const list: Array<SettingsPage<ServerSettingsTab>> = [];
     if (canServer) list.push({ id: "overview", label: t("ss.overview"), icon: <Lock className="size-4" /> });
-    if (vc && (canGroups || canServer)) list.push({ id: "roles", label: t("ss.roles"), icon: <ShieldCheck className="size-4" /> });
-    if (vc && (canGroups || canServer || canBan || canRemove)) list.push({ id: "members", label: t("ss.members"), icon: <Users className="size-4" /> });
-    if (vc && owned && (canServer || canEdit)) list.push({ id: "ownership", label: t("ss.ownership"), icon: <Crown className="size-4" /> });
-    if (vc && canRemove) list.push({ id: "cleanup", label: t("ss.cleanup"), icon: <UserMinus className="size-4" /> });
-    if (vc && canBan) list.push({ id: "bans", label: t("ss.bans"), icon: <Ban className="size-4" /> });
-    if (vc && canInvite) list.push({ id: "invites", label: t("ss.invites"), icon: <Link2 className="size-4" /> });
+    if (vc && (canGroups || canServer)) list.push({ id: "roles", wide: true, label: t("ss.roles"), icon: <ShieldCheck className="size-4" /> });
+    if (vc && (canGroups || canServer || canBan || canRemove)) list.push({ id: "members", wide: true, label: t("ss.members"), icon: <Users className="size-4" /> });
+    if (vc && owned && (canServer || canEdit)) list.push({ id: "ownership", wide: true, label: t("ss.ownership"), icon: <Crown className="size-4" /> });
+    if (vc && canRemove) list.push({ id: "cleanup", wide: true, label: t("ss.cleanup"), icon: <UserMinus className="size-4" /> });
+    if (vc && canBan) list.push({ id: "bans", wide: true, label: t("ss.bans"), icon: <Ban className="size-4" /> });
+    if (vc && canInvite) list.push({ id: "invites", wide: true, label: t("ss.invites"), icon: <Link2 className="size-4" /> });
     return list;
   }, [t, vc, canServer, canGroups, canBan, canRemove, canInvite, owned, canEdit]);
 
@@ -115,43 +115,16 @@ export function ServerSettingsDialog({ tab }: { tab?: ServerSettingsTab }) {
   }, [tabs, close]);
 
   return (
-    <Dialog open onOpenChange={(o) => !o && close()} title={t("server.settings")} width="max-w-3xl">
-      <Tabs.Root value={current} onValueChange={(v) => setCurrent(v as ServerSettingsTab)}>
-        <Tabs.List className="-mx-1 mb-4 flex gap-1 overflow-x-auto border-b border-line px-1 pb-2" aria-label={t("server.settings")}>
-          {tabs.map((x) => (
-            <Tabs.Trigger
-              key={x.id}
-              value={x.id}
-              className="t flex h-8 shrink-0 cursor-pointer items-center gap-2 rounded-md px-3 text-sm text-muted hover:bg-hover hover:text-fg data-[state=active]:bg-active data-[state=active]:text-fg"
-            >
-              {x.icon}
-              {x.label}
-            </Tabs.Trigger>
-          ))}
-        </Tabs.List>
-        <Tabs.Content value="overview" className="outline-none">
-          <OverviewTab />
-        </Tabs.Content>
-        <Tabs.Content value="roles" className="outline-none">
-          <RolesTab />
-        </Tabs.Content>
-        <Tabs.Content value="members" className="outline-none">
-          <MembersTab />
-        </Tabs.Content>
-        <Tabs.Content value="ownership" className="outline-none">
-          <OwnershipTab />
-        </Tabs.Content>
-        <Tabs.Content value="cleanup" className="outline-none">
-          <CleanupTab />
-        </Tabs.Content>
-        <Tabs.Content value="bans" className="outline-none">
-          <BansTab />
-        </Tabs.Content>
-        <Tabs.Content value="invites" className="outline-none">
-          <InvitesPanel />
-        </Tabs.Content>
-      </Tabs.Root>
-    </Dialog>
+    <SettingsLayout title={t("server.settings")} pages={tabs} value={current} onValueChange={setCurrent} onClose={close}>
+      {(page) =>
+        page === "overview" ? <OverviewTab />
+        : page === "roles" ? <RolesTab />
+        : page === "members" ? <MembersTab />
+        : page === "ownership" ? <OwnershipTab />
+        : page === "cleanup" ? <CleanupTab />
+        : page === "bans" ? <BansTab />
+        : <InvitesPanel />}
+    </SettingsLayout>
   );
 }
 

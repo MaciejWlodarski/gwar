@@ -11,7 +11,7 @@ import { loadOrCreateIdentity, uidForPublicKey } from "../net/identity";
 import { accountActions, useAccount } from "../state/account";
 import { useSettings } from "../state/settings";
 import { useUi } from "../state/stores";
-import { Button, Dialog, Field, Input, Segmented, Switch } from "./kit";
+import { Button, Dialog, Field, Input, Section, Segmented, Switch } from "./kit";
 import { TeamspeakIdentity } from "./TeamspeakIdentity";
 import { tsBridge } from "../connect/teamspeak";
 
@@ -21,15 +21,6 @@ function Banner({ children }: { children: ReactNode }) {
       <AlertTriangle className="mt-0.5 size-4 shrink-0" />
       <span>{children}</span>
     </div>
-  );
-}
-
-function Section({ title, children }: { title: string; children: ReactNode }) {
-  return (
-    <section className="mb-6 last:mb-0">
-      <h3 className="mb-2 text-xs font-semibold tracking-wide text-subtle uppercase">{title}</h3>
-      <div className="flex flex-col gap-3">{children}</div>
-    </section>
   );
 }
 
