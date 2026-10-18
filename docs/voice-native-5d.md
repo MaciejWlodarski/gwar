@@ -183,6 +183,34 @@ flips between series (A +0.69 and −0.02 ms, D +2.09 and +4.20 ms, with single
 pairs from −14.92 to +7.46 ms). The 5b callbacks question (more concealment in
 the candidate) does not reappear here.
 
+### Night re-run with ten pairs (2026-10-18)
+
+reorder and the stall condition, run again with ten pairs each against the same
+binaries, 15 s warmup, guarded ABBA. Series E 23:51–00:22 UTC and a repeat of
+reorder, series F, 01:08–01:23 UTC; raw data in
+`~/dev/projects/gwar-latency-runs/sframe-{e,f}/`. Before series E the macOS
+scheduler `dasd` spun one core at about 105% and was restarted
+(`sudo killall dasd`); an earlier start under that load
+(`sframe-e-aborted-dasd`) is not counted.
+
+| Series | Condition | Pairs | p95 plain / SFrame (ms) | Added p95; paired 95% interval | Median plain / SFrame | PLC | Underruns | Decision |
+| --- | --- | ---: | --- | --- | --- | --- | --- | --- |
+| E | reorder | 9 | 49.83 / 77.13 | +27.30; [−2.56, +29.79] | 37.4 / 37.9 | 210 / 218 | 0 / 8 | rule: FAIL (underruns) |
+| E | stall @27 s | 6 | 52.43 / 48.89 | −3.55; [−9.32, +1.67] | 39.9 / 39.8 | 66 / 63 | 0 / 0 | PASS |
+| F | reorder | 9 | 50.05 / 50.55 | +0.50; [−6.00, +6.64] | 44.7 / 45.8 | 203 / 209 | 0 / 0 | INCONCLUSIVE |
+
+- In E all eight underruns and the 78 ms p95 come from one SFrame run (run 2,
+  the second of the night); the other eight pairs differ by −13 to +11 ms
+  around equal medians. The repeat F has no underrun in either mode and an
+  added p95 of +0.5 ms. The underrun did not recur: no SFrame mechanism
+  behind it is visible.
+- **stall @27 s passes.**
+- **reorder** stays INCONCLUSIVE: its pairs move in the same 38/48/50 ms
+  steps in both modes (F: −8 to +10 ms per pair), which keeps the interval
+  wider than ±2 ms. These run-level latency steps are the open receiver
+  item ("level steps"), not an SFrame cost: the measured crypto cost is below
+  half a microsecond per packet.
+
 ## Not yet run (acceptance still pending)
 
 - **Physical devices.** The desktop app with real microphones and speakers,

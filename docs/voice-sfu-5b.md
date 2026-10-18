@@ -1074,3 +1074,34 @@ necessity):
 - Make CPU and mixed diagnostic: report the p95 comparison and underruns, and
   attribute each episode with stage timestamps. One extra candidate underrun
   or a single post-stall level step would then no longer decide the outcome.
+
+## Night re-run with ten pairs (2026-10-18)
+
+The three conditions left open above, run again with ten pairs each against the
+same binaries (`bin/latency-base` and `bin/latency-main`, 15 s warmup, guarded
+ABBA). Series `main15-g`, 00:22–01:06 UTC on 2026-10-18; raw data in
+`~/dev/projects/gwar-latency-runs/main15-g/`. Two slots were contended; only
+uncontended adjacent pairs count.
+
+| Condition | Pairs | p95 base / main (ms) | Added p95; paired 95% interval | Median base / main | PLC | Underruns | Decision |
+| --- | ---: | --- | --- | --- | --- | --- | --- |
+| mixed | 9 | 97.80 / 80.10 | −17.70; [−20.69, −0.26] | 70.5 / 67.6 | 1478 / 1491 | 0 / 0 | PASS |
+| callbacks | 9 | 79.16 / 80.89 | +1.73; [+0.45, +2.71] | 74.8 / 71.2 | 13 / 24 | 0 / 0 | INCONCLUSIVE (pairs) |
+| cpu | 10 | 50.06 / 72.23 | +22.17; [−9.00, +73.06] | 39.6 / 39.5 | 6 / 17 | 0 / 2 | diagnostic (rule: FAIL) |
+
+- **mixed** passes the gate for the first time.
+- **callbacks** stays one pair short, and its interval reaches +2.7 ms. Across
+  the five series so far its added p95 was +0.04, +0.99, +1.73, +3.52 and
+  +0.04 ms, with PASS in two of them: no stable regression, but no clean pass
+  either.
+- **cpu** (six busy-loop workers on a 10-core Mac) is diagnostic, as decided
+  above. One run (main, run 18) carries both underruns and a p95 of 122 ms;
+  the other nine pairs differ by −16 to +9 ms and the medians are equal.
+  Underruns under this load also appeared on the baseline side before
+  (`main15-b`: 4 base, 1 main), so they belong to the loaded machine.
+
+**Decision.** No change to the 5b conclusion: nothing points to a
+mechanism in 5b that adds latency. mixed is now a PASS; callbacks remains the
+one gated condition without a clean pass, at about +1–3 ms with more
+concealment in some series, and stays open for the receiver latency
+level-step work.
