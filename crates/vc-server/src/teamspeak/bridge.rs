@@ -50,6 +50,8 @@ const PUPPET_GROUP: &str = "Voice bridge";
 const PUPPET_DESCRIPTION: &str = "Gwar user (bridged)";
 /// Flood points one address may collect before TeamSpeak blocks it (default 250).
 const PUPPET_IP_BLOCK: u32 = 2500;
+/// How long a retired puppet stays down before the same user gets a new one.
+const PUPPET_COOLDOWN: Duration = Duration::from_secs(3);
 /// Connections one puppet identity may have at once (one per device of a member).
 const PUPPET_CLONES: u32 = 100;
 /// Powers of TeamSpeak's stock Server Admin group (ServerQuery has 100).
@@ -785,6 +787,9 @@ impl<'a> Bridge<'a> {
                 Presence::Absent => {
                     if local.puppet.is_some() {
                         info!(session, channel = ?local.client.channel, "puppet retires: not in a bridged channel");
+                        // Someone going in and out of an encrypted channel would otherwise connect
+                        // a new puppet each time, which TeamSpeak's flood guard punishes.
+                        local.retry_at = Some(now + PUPPET_COOLDOWN);
                     }
                     self.retire_puppet(session);
                 }
