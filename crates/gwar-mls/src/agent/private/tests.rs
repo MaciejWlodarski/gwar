@@ -377,9 +377,12 @@ fn a_manager_outside_the_group_offers_lists_a_member_commits() {
     accept_pair(&mut p.member, &newer, p.t);
     let mut manager = device(3, 31, p.t, &p.chain);
     accept_pair(&mut manager, &newer, p.t);
-    let offer = manager.offer_access(&server(), &p.info, Some(&[uid(2), uid(4)]), p.t, &()).unwrap();
+    let tree = p.observer.tree().unwrap().1;
+    let offer = manager
+        .offer_access(&server(), &p.info, Some(&p.observer.tree().unwrap().1), Some(&[uid(2), uid(4)]), p.t, &())
+        .unwrap();
     // A plain member cannot offer: it holds no authority.
-    assert_eq!(p.member.offer_access(&server(), &p.info, None, p.t, &()), Err(AgentError::Waiting));
+    assert_eq!(p.member.offer_access(&server(), &p.info, Some(&tree), None, p.t, &()), Err(AgentError::Waiting));
     let out = p.member.adopt_offer(&server(), &p.id, &offer, p.t, &()).unwrap();
     p.member.take_changes();
     p.observer = p.observer.commit(&out.commit, &out.group_info, None, p.t, p.t).unwrap().0;
@@ -389,6 +392,6 @@ fn a_manager_outside_the_group_offers_lists_a_member_commits() {
     assert_eq!(p.member.group(&server(), &p.id).unwrap().access.as_ref().map(|c| c.seq), Some(2));
     // Another list at the same seq is refused.
     let mut copy = Agent::load([21; 32], p.member.credential.clone(), p.member.durable.clone()).unwrap();
-    let stale = manager.offer_access(&server(), &p.info, None, p.t, &()).unwrap();
+    let stale = manager.offer_access(&server(), &p.info, Some(&tree), None, p.t, &()).unwrap();
     assert_eq!(copy.adopt_offer(&server(), &p.id, &stale, p.t, &()).map(|_| ()), Err(AgentError::Waiting));
 }

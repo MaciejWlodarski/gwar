@@ -114,6 +114,7 @@ enum Request {
     OfferAccess {
         server: String,
         group_info: Vec<u8>,
+        tree: Option<Vec<u8>>,
         members: Option<Vec<String>>,
         now: i64,
         revocations: View,
@@ -454,9 +455,10 @@ impl Agent {
             Request::AdoptOffer { server, group, extension, now, revocations } => {
                 output(a.adopt_offer(&server, &group, &extension, now, &revocations).map_err(error)?)
             }
-            Request::OfferAccess { server, group_info, members, now, revocations } => {
-                output(a.offer_access(&server, &group_info, members.as_deref(), now, &revocations).map_err(error)?)
-            }
+            Request::OfferAccess { server, group_info, tree, members, now, revocations } => output(
+                a.offer_access(&server, &group_info, tree.as_deref(), members.as_deref(), now, &revocations)
+                    .map_err(error)?,
+            ),
             Request::Settle { server, group, winner } => {
                 output(a.settle(&server, &group, winner.as_ref()).map_err(error)?)
             }

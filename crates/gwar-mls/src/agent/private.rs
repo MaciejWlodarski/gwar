@@ -336,12 +336,16 @@ impl Agent {
 
     /// Fresh lists for a private group this device's user has authority over but cannot commit to
     /// (not a member, or the lists are no longer current): the newest pair it accepted and a member
-    /// list it signs at the next seq after the group's (from its GroupInfo) and its own checkpoint,
-    /// with `members` or the group's members. Sent as `mls.access.offer`; a member commits it.
+    /// list it signs at the next seq after the group's and its own checkpoint, with `members` or the
+    /// group's members. The group's lists come from its GroupInfo, verified as an external joiner
+    /// would (tree, a member's signature, Gwar's rules) and valid as history (bound to the group,
+    /// signed by an authority of their own pair, certified when signed). Sent as
+    /// `mls.access.offer`; a member commits it.
     pub fn offer_access(
         &self,
         server: &str,
         group_info: &[u8],
+        tree: Option<&[u8]>,
         members: Option<&[Uid]>,
         now: i64,
         revocations: &dyn Revocations,
@@ -357,6 +361,21 @@ impl Agent {
         let chain = record.chain(server)?;
         let (anchor, list) = record.pair()?.ok_or(AgentError::Waiting)?;
         let shown = rules::access(info.group_context()).ok_or(Invalid("access lists"))?;
+        let tree_in = super::info_tree(&info, descriptor.descriptor.kind, tree)?;
+        let verified = tree_in
+            .clone()
+            .into_verified(crate::SUITE, self.provider.crypto(), info.group_id())
+            .map_err(err("ratchet tree"))?;
+        self.tree_rule(&descriptor, info.group_context(), verified.leaves())?;
+        if !shown.valid(&chain, &id, shown.members().members().signed_at) {
+            return Err(Invalid("the group's access lists"));
+        }
+        // Verification only: a throwaway provider, and nothing is committed.
+        MlsGroup::external_commit_builder()
+            .with_ratchet_tree(tree_in)
+            .skip_lifetime_validation()
+            .build_group(&crate::crypto::Provider::default(), info, self.with_key())
+            .map_err(err("group info"))?;
         let own = self.groups.get(&group_key(server, &id)).and_then(|r| r.access.as_ref()).map_or(0, |c| c.seq);
         let seq = shown.members().members().seq.max(own).checked_add(1).ok_or(Invalid("member list seq"))?;
         let members = members.map_or_else(|| shown.members().members().members.clone(), <[Uid]>::to_vec);

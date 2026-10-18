@@ -494,8 +494,9 @@ export class MlsRuntime {
    * random delay of up to 10 s so that concurrent repairers settle on the first commit. Returns
    * whether it committed something (the caller then submits it). */
   private async repairAccess(group: string, gate: Gate): Promise<boolean> {
+    // An offer waits while a newer manager pair is still being checked: it may carry that pair.
     const offer = this.offers.get(group);
-    if (offer !== undefined) {
+    if (offer !== undefined && this.managersSettled()) {
       this.offers.delete(group);
       try {
         await this.engine.op({ adopt_offer: { ...this.args(group), extension: bytes(offer), now: this.now(), revocations: this.options.revocations() } });
@@ -515,13 +516,14 @@ export class MlsRuntime {
   }
   /** Offers fresh lists for a private group this device could not join, when its user is the
    * owner, a confirmer or a manager. */
-  private async offerAccess(group: string, info: number[]): Promise<void> {
+  private async offerAccess(group: string, info: number[], tree: number[] | null): Promise<void> {
     const me = this.uid, view = this.owner, key = `${group}:${encoded(info)}`;
     if (!view || this.offered.has(key) || !(view.owner === me || view.confirmers.includes(me) || view.managers.includes(me))) return;
-    this.offered.add(key);
     try {
-      const extension = this.engine.query<number[]>({ offer_access: { server: this.server, group_info: info, members: null, now: this.now(), revocations: this.options.revocations() } });
+      const extension = this.engine.query<number[]>({ offer_access: { server: this.server, group_info: info, tree, members: null, now: this.now(), revocations: this.options.revocations() } });
       await this.request("mls.access.offer", { group, extension: encoded(extension) });
+      // Only a delivered offer is not sent again; a failed one is retried with the join's backoff.
+      this.offered.add(key);
     } catch (error) {
       this.options.onError?.(error);
     }
@@ -857,7 +859,7 @@ export class MlsRuntime {
       // cannot join offers fresh lists for a member to commit, once per GroupInfo (6c, "Offers").
       if (error instanceof AgentOperationError && String(error.message).includes(WAITING)) {
         await this.engine.reload();
-        await this.offerAccess(group, info);
+        await this.offerAccess(group, info, tree);
       }
       throw error;
     }
