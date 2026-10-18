@@ -88,14 +88,6 @@ impl Credential {
     }
 
     /// Valid at `at`: the certificate covers it and the device was not revoked by then.
-    /// Whether the account revoked this device, at any time.
-    pub fn is_revoked(&self, revocations: &dyn Revocations) -> bool {
-        match self {
-            Credential::Local { .. } => false,
-            Credential::Account(c) => revocations.revoked_at(&c.account_key, &c.device_key).is_some(),
-        }
-    }
-
     pub fn is_current(&self, at: i64, revocations: &dyn Revocations) -> bool {
         match self {
             Credential::Local { .. } => true,

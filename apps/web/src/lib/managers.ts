@@ -55,7 +55,8 @@ export function managerUpkeep(i: UpkeepInput): Upkeep {
   if (server.anchor && !i.current) return i.renewable && renewable ? { kind: "publish", managers: null, renewal: true, consumed: [] } : { kind: "none" };
   if (!isOwner && !view.confirmers.includes(i.me)) return { kind: "none" };
   const staleConfirmers = view.confirmers.filter((c) => server.stale.includes(c));
-  const marker = `@confirmers:${staleConfirmers.join(",")}`;
+  // Per anchor and stale set: the same person going stale again under a later anchor counts anew.
+  const marker = `@confirmers:${view.anchor_seq ?? 0}:${staleConfirmers.join(",")}`;
   if (isOwner && staleConfirmers.length && !i.asked.has(marker)) {
     return { kind: "staleConfirmers", keep: view.confirmers.filter((c) => !staleConfirmers.includes(c)), stale: staleConfirmers, marker };
   }

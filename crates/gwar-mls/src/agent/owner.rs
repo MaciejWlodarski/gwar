@@ -349,11 +349,11 @@ impl Agent {
             });
         let accepted = pair.as_ref().map(|(_, l)| l.list().clone());
         let floor = accepted.as_ref().map_or(0, |l| l.seq).max(verified.as_ref().map_or(0, |l| l.list().seq));
-        // Renewal never copies the membership of a list this device has not accepted whose signer
-        // device was revoked (it may have been signed by a compromised device); its seq still
-        // counts, or the renewal could not follow it.
+        // Renewal copies the membership of a list this device has not accepted only when its signer
+        // device is current now (an expired or revoked device key could sign anything); its seq
+        // still counts, or the renewal could not follow it.
         let members_from = verified.as_ref().filter(|l| {
-            pair.as_ref().is_none_or(|(_, old)| l.hash() == old.hash() || !l.signer().is_revoked(revocations))
+            pair.as_ref().is_none_or(|(_, old)| l.hash() == old.hash() || l.signer().is_current(signed_at, revocations))
         });
         let mut managers = match managers {
             Some(m) => m.to_vec(),
@@ -841,6 +841,25 @@ mod tests {
         };
         assert_eq!((renew(&()).seq, renew(&()).managers), (6, vec![uid(8)]));
         assert_eq!((renew(&revoked).seq, renew(&revoked).managers), (6, vec![]));
+        // Nor of a device whose certificate has expired.
+        let expired =
+            Agent::new([92; 32], certified(&key(2), &key(92), NOW - 31 * 86_400_000), NOW - 31 * 86_400_000).unwrap();
+        let by_expired = expired
+            .sign_manager_list(ManagerList {
+                server_key: server(),
+                generation: 1,
+                anchor_hash: x.hash(),
+                seq: 5,
+                managers: vec![uid(8)],
+                signer_uid: uid(2),
+                signed_at: NOW,
+            })
+            .unwrap();
+        let next = ManagerList::parse(
+            &new_owner.next_list(&server(), None, None, NOW, Some(&x.encode()), Some(&by_expired), &()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!((next.seq, next.managers), (6, vec![]));
     }
 
     #[test]
