@@ -223,7 +223,8 @@ impl Core {
     }
 
     /// Takes out of voice, in `channel` and every channel under it, whoever may no longer join
-    /// there. TeamSpeak users follow their own server.
+    /// there. TeamSpeak users, always in some channel, go to the default one (and the bridge
+    /// moves them there on TeamSpeak).
     pub(super) fn enforce_connect(&mut self, channel: ChannelId) {
         self.enforce_connect_where(|core, c| core.is_descendant(c, channel));
     }
@@ -234,19 +235,28 @@ impl Core {
     }
 
     fn enforce_connect_where(&mut self, within: impl Fn(&Self, ChannelId) -> bool) {
-        let affected: Vec<SessionId> = self
+        let fallback = self.info.default_channel;
+        let affected: Vec<(SessionId, bool)> = self
             .sessions
             .values()
-            .filter(|s| s.out.is_some())
-            .filter(|s| s.channel.is_some_and(|c| within(self, c)))
+            .filter(|s| s.channel.is_some_and(|c| within(self, c) && (s.out.is_some() || c != fallback)))
             .filter(|s| {
                 let c = s.channel.expect("in a channel");
                 !self.channel_permissions(&s.uid, &s.groups, c).contains(&Permission::Connect)
             })
-            .map(|s| s.id)
+            .map(|s| (s.id, s.out.is_none()))
             .collect();
-        for session in affected {
-            let _ = self.channel_leave(session);
+        for (session, remote) in affected {
+            if remote {
+                // A move the bridge did not ask for reaches it as usual; during a bridge message
+                // it is told afterwards.
+                let _ = self.move_client(session, Some(fallback));
+                if self.applying_remote {
+                    self.bridge_corrections.push(session);
+                }
+            } else {
+                let _ = self.channel_leave(session);
+            }
         }
         // Who may speak can have changed as well: the SFU follows.
         self.publish_routing();

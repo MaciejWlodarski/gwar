@@ -155,7 +155,8 @@ The core stays the authority for official TeamSpeak clients too:
 - Private channels are not mirrored (as before).
 - `connect`: a TeamSpeak user who arrives in, or moves into, a channel they
   may not join stays where they were in Gwar (the default channel on
-  arrival), and the bridge moves them back there on TeamSpeak. Should
+  arrival), and the bridge moves them back there on TeamSpeak. One who loses
+  `connect` where they are goes to the default channel, on TeamSpeak too. Should
   TeamSpeak refuse that move too, the bridge kicks them from the channel
   (to TeamSpeak's default one) rather than retry. The default channel itself
   is not checked: a server that denies Member `connect` there leaves arriving

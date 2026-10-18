@@ -3146,5 +3146,26 @@ mod voice_rights_tests {
         // A deafen would not reach a TeamSpeak user's ears (the puppets): refused, not pretended.
         let refused = on_core(&core, move |core| core.client_voice(walker, speaker, None, Some(true))).await;
         assert_eq!(refused.unwrap_err().code, ErrorCode::BadRequest);
+
+        // Losing `connect` where they are sends them to the default channel, on TeamSpeak too.
+        while bridge.try_recv().is_ok() {}
+        let channel = on_core(&core, move |core| {
+            let row = core.channels.get_mut(&stage).unwrap();
+            row.overrides[0].deny.push(Permission::Connect);
+            core.enforce_connect(stage);
+            core.sessions[&speaker].channel
+        })
+        .await;
+        assert_eq!(channel, Some(server.default_channel));
+        let mut told = false;
+        while let Ok(note) = bridge.try_recv() {
+            if let BridgeNote::Event(event) = note
+                && let Event::ClientUpdated(c) = *event
+                && c.id == speaker
+            {
+                told = c.channel == Some(server.default_channel);
+            }
+        }
+        assert!(told, "the bridge moves them on TeamSpeak");
     }
 }
