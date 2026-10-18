@@ -281,7 +281,7 @@ async fn an_encrypted_private_channel_admits_only_its_signed_members_and_never_g
         .await
         .unwrap();
     let MlsMessageBodyIn::GroupInfo(gi) =
-        MlsMessageIn::tls_deserialize_exact(&B64.decode(info["group_info"].as_str().unwrap()).unwrap())
+        MlsMessageIn::tls_deserialize_exact(B64.decode(info["group_info"].as_str().unwrap()).unwrap())
             .unwrap()
             .extract()
     else {
