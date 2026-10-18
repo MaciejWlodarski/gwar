@@ -517,7 +517,9 @@ export class MlsRuntime {
   /** Offers fresh lists for a private group this device could not join, when its user is the
    * owner, a confirmer or a manager. */
   private async offerAccess(group: string, info: number[], tree: number[] | null): Promise<void> {
-    const me = this.uid, view = this.owner, key = `${group}:${encoded(info)}`;
+    // Once per GroupInfo and accepted pair: a newer pair needs a fresh offer.
+    const me = this.uid, view = this.owner;
+    const key = `${group}:${view?.generation}:${view?.anchor_seq}:${view?.list_seq}:${encoded(info)}`;
     if (!view || this.offered.has(key) || !(view.owner === me || view.confirmers.includes(me) || view.managers.includes(me))) return;
     try {
       const extension = this.engine.query<number[]>({ offer_access: { server: this.server, group_info: info, tree, members: null, now: this.now(), revocations: this.options.revocations() } });
