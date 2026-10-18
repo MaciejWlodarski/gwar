@@ -1,5 +1,5 @@
 import * as Dropdown from "@radix-ui/react-dropdown-menu";
-import { Ban, Check, Copy, Crown, Link2, Lock, Plus, Search, ShieldCheck, Trash2, UserMinus, UserPlus, Users, X } from "lucide-react";
+import { Ban, Check, ChevronDown, ChevronUp, Copy, Crown, GripVertical, Link2, Lock, Plus, Search, ShieldCheck, Trash2, UserMinus, UserPlus, Users, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { countKey, useLanguage, useT, type Key } from "../i18n";
 import { INVITE_EXPIRY, INVITE_USES } from "../lib/ban";
@@ -7,16 +7,16 @@ import { memberName } from "../lib/member-name";
 import { cn } from "../lib/cn";
 import {
   ADMIN_GROUP,
-  ALL_PERMISSIONS,
   MEMBER_GROUP,
   PERMISSION_SECTIONS,
   canActOn,
-  canAssignGroup,
   canGiveGroup,
   isBuiltinGroup,
   isHexColor,
   nameColor,
   orderedGroups,
+  rankOf,
+  reorderedTo,
   toggleGroup,
 } from "../lib/permissions";
 import { PRUNE_DAYS_DEFAULT, PRUNE_DAYS_MAX, parsePruneDays, pruneAll, pruneKey, pruneRequest, type PruneForm, type PruneReply } from "../lib/prune";
@@ -32,7 +32,7 @@ import { sortedChannels } from "../state/reducer";
 import { useSession, useUi, type ServerSettingsTab } from "../state/stores";
 import { OwnershipTab } from "./Ownership";
 import { SettingsLayout, type SettingsPage } from "./SettingsLayout";
-import { useMyGroups, usePermission } from "./hooks";
+import { useMyWho, usePermission } from "./hooks";
 import { Avatar, Button, Dialog, EmptyState, Field, IconButton, Input, Select, Spinner, Switch, Textarea, menuContent, menuItem } from "./kit";
 
 // ------------------------------------------------------------------ helpers
@@ -85,15 +85,15 @@ export function ServerSettingsDialog({ tab }: { tab?: ServerSettingsTab }) {
   const t = useT();
   const close = useUi((s) => s.closeDialog);
   const kind = useSession((s) => s.kind);
-  const canServer = usePermission("server_manage");
-  const canGroups = usePermission("group_manage");
-  const canBan = usePermission("client_ban");
-  const canInvite = usePermission("invite_create");
-  const canRemove = usePermission("member_remove");
+  const canServer = usePermission("manage_server");
+  const canGroups = usePermission("manage_roles");
+  const canBan = usePermission("ban_members");
+  const canInvite = usePermission("create_invites");
+  const canRemove = usePermission("manage_members");
   const vc = kind === "vc";
   // The owner, confirmers and managers of private channels (6b), for those who may act on them.
   const owned = useSession((s) => !!s.owner);
-  const canEdit = usePermission("channel_edit");
+  const canEdit = usePermission("manage_channels");
 
   const tabs = useMemo(() => {
     const list: Array<SettingsPage<ServerSettingsTab>> = [];
@@ -263,36 +263,92 @@ const COLOR_PRESETS = ["#e74c3c", "#e67e22", "#f1c40f", "#2ecc71", "#1abc9c", "#
 function RolesTab() {
   const t = useT();
   const groups = useSession((s) => s.groups);
-  const canManage = usePermission("group_manage");
+  const canManage = usePermission("manage_roles");
+  const me = useMyWho();
+  const myRank = rankOf(me, groups);
   const list = useMemo(() => orderedGroups(groups), [groups]);
   const [chosen, setSelected] = useState<number | "new">(list.find((g) => g.id !== ADMIN_GROUP && g.id !== MEMBER_GROUP)?.id ?? list[0]?.id ?? "new");
   // A deleted role leaves the editor empty: fall back to the first one.
   const selected = chosen === "new" || groups[chosen] ? chosen : (list[0]?.id ?? "new");
   const current = selected === "new" ? undefined : groups[selected];
+  const [dragging, setDragging] = useState<number | null>(null);
+  const [over, setOver] = useState<number | null>(null);
+
+  const move = (id: number, to: number) => {
+    const order = reorderedTo(groups, id, to, myRank);
+    if (order) void controller.attempt(controller.reorderGroups(order));
+  };
+  // A new role goes right above Member: only someone ranked above Member creates roles.
+  const canCreate = canManage && myRank < (groups[MEMBER_GROUP]?.position ?? Infinity);
+  // Roles below my rank (and not Member) can be moved.
+  const movable = (g: Group) => canManage && g.id !== MEMBER_GROUP && g.position > myRank;
+  const indexOf = (id: number) => list.findIndex((g) => g.id === id);
 
   return (
-    <div className="grid gap-4 md:grid-cols-[13rem_1fr]">
+    <div className="grid gap-4 md:grid-cols-[15rem_1fr]">
       <div className="flex flex-col gap-1">
+        {canManage && <p className="px-1 pb-1 text-xs text-subtle">{t("ss.rolesOrderHint")}</p>}
         <ul aria-label={t("ss.roles")} className="flex flex-col gap-0.5">
-          {list.map((g) => (
-            <li key={g.id}>
-              <button
-                type="button"
-                onClick={() => setSelected(g.id)}
-                aria-current={selected === g.id}
-                className={cn(
-                  "t flex h-9 w-full cursor-pointer items-center gap-2 rounded-md px-2 text-left text-sm",
-                  selected === g.id ? "bg-active text-fg" : "text-muted hover:bg-hover hover:text-fg",
-                )}
+          {list.map((g) => {
+            const mine = g.position === myRank && me.groups.includes(g.id);
+            const canMove = movable(g);
+            return (
+              <li
+                key={g.id}
+                draggable={canMove}
+                onDragStart={(e) => {
+                  setDragging(g.id);
+                  e.dataTransfer.effectAllowed = "move";
+                }}
+                onDragOver={(e) => {
+                  if (dragging === null || !movable(g)) return;
+                  e.preventDefault();
+                  setOver(g.id);
+                }}
+                onDragLeave={() => setOver((o) => (o === g.id ? null : o))}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  if (dragging !== null) move(dragging, indexOf(g.id));
+                  setDragging(null);
+                  setOver(null);
+                }}
+                onDragEnd={() => {
+                  setDragging(null);
+                  setOver(null);
+                }}
+                className={cn("group/role relative rounded-md", over === g.id && dragging !== g.id && "shadow-[inset_0_2px_0_var(--accent)]", dragging === g.id && "opacity-50")}
               >
-                <span className="size-3 shrink-0 rounded-full border border-line-strong" style={{ background: isHexColor(g.color) ? g.color : "transparent" }} />
-                <span className="min-w-0 flex-1 truncate">{g.name}</span>
-                {isBuiltinGroup(g.id) && <Lock aria-label={t("ss.builtin")} className="size-3 shrink-0 text-subtle" />}
-              </button>
-            </li>
-          ))}
+                <button
+                  type="button"
+                  onClick={() => setSelected(g.id)}
+                  aria-current={selected === g.id}
+                  className={cn(
+                    "t flex h-9 w-full cursor-pointer items-center gap-2 rounded-md px-2 text-left text-sm",
+                    selected === g.id ? "bg-active text-fg" : "text-muted hover:bg-hover hover:text-fg",
+                    mine && "shadow-[inset_2px_0_0_var(--accent)]",
+                  )}
+                >
+                  <GripVertical aria-hidden className={cn("size-3.5 shrink-0", canMove ? "cursor-grab text-subtle" : "invisible")} />
+                  <span className="size-3 shrink-0 rounded-full border border-line-strong" style={{ background: isHexColor(g.color) ? g.color : "transparent" }} />
+                  <span className="min-w-0 flex-1 truncate">{g.name}</span>
+                  {mine && <span className="shrink-0 text-[11px] text-accent">{t("ss.yourRank")}</span>}
+                  {!mine && isBuiltinGroup(g.id) && <Lock aria-label={t("ss.builtin")} className="size-3 shrink-0 text-subtle" />}
+                </button>
+                {canMove && (
+                  <span className="absolute top-1/2 right-1 hidden -translate-y-1/2 items-center gap-0.5 group-focus-within/role:flex group-hover/role:flex">
+                    <IconButton label={t("ss.moveUp")} size="sm" disabled={!reorderedTo(groups, g.id, indexOf(g.id) - 1, myRank)} onClick={() => move(g.id, indexOf(g.id) - 1)}>
+                      <ChevronUp className="size-3.5" />
+                    </IconButton>
+                    <IconButton label={t("ss.moveDown")} size="sm" disabled={!reorderedTo(groups, g.id, indexOf(g.id) + 1, myRank)} onClick={() => move(g.id, indexOf(g.id) + 1)}>
+                      <ChevronDown className="size-3.5" />
+                    </IconButton>
+                  </span>
+                )}
+              </li>
+            );
+          })}
         </ul>
-        {canManage && (
+        {canCreate && (
           <Button size="sm" onClick={() => setSelected("new")} className={cn("mt-1 justify-start", selected === "new" && "border-accent text-accent")}>
             <Plus className="size-4" /> {t("ss.createRole")}
           </Button>
@@ -335,20 +391,25 @@ function PermissionRow({
 function RoleEditor({ group, onSaved }: { group: Group | undefined; onSaved: (id: number) => void }) {
   const t = useT();
   const mine = useSession((s) => s.permissions);
-  const canManage = usePermission("group_manage");
+  const groups = useSession((s) => s.groups);
+  const canManage = usePermission("manage_roles");
+  const me = useMyWho();
   const creating = !group;
   const isAdmin = group?.id === ADMIN_GROUP;
-  // A role with permissions I lack is out of my hands (the server enforces it too).
-  const outranked = !!group && !canAssignGroup(mine, group);
+  // Only roles below my rank are mine to edit, and new ones only from above Member (the server enforces it too).
+  const outranked = group ? !canGiveGroup(me, group, groups) : rankOf(me, groups) >= (groups[MEMBER_GROUP]?.position ?? Infinity);
   const readOnly = !canManage || outranked;
   const [name, setName] = useState(group?.name ?? "");
   const [color, setColor] = useState(group?.color ?? "");
-  const [perms, setPerms] = useState<Permission[]>(isAdmin ? ALL_PERMISSIONS : (group?.permissions ?? []));
+  const [hoist, setHoist] = useState(group?.hoist ?? false);
+  const [mentionable, setMentionable] = useState(group?.mentionable ?? false);
+  const [perms, setPerms] = useState<Permission[]>(group?.permissions ?? []);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const colorOk = color === "" || isHexColor(color);
   const permsChanged = !!group && (perms.length !== group.permissions.length || perms.some((p) => !group.permissions.includes(p)));
-  const dirty = creating || name.trim() !== group.name || color !== (group.color ?? "") || (!isAdmin && permsChanged);
+  const dirty =
+    creating || name.trim() !== group.name || color !== (group.color ?? "") || hoist !== group.hoist || mentionable !== group.mentionable || (!isAdmin && permsChanged);
 
   const save = async (e?: FormEvent) => {
     e?.preventDefault();
@@ -357,7 +418,7 @@ function RoleEditor({ group, onSaved }: { group: Group | undefined; onSaved: (id
     setError(null);
     try {
       if (creating) {
-        const r = await controller.createGroup({ name: name.trim(), permissions: perms, color: color || null });
+        const r = await controller.createGroup({ name: name.trim(), permissions: perms, color: color || null, hoist, mentionable });
         onSaved(r.group.id);
       } else {
         await controller.updateGroup({
@@ -365,6 +426,8 @@ function RoleEditor({ group, onSaved }: { group: Group | undefined; onSaved: (id
           ...(name.trim() !== group.name ? { name: name.trim() } : {}),
           ...(!isAdmin && permsChanged ? { permissions: perms } : {}),
           ...(color !== (group.color ?? "") ? { color } : {}),
+          ...(hoist !== group.hoist ? { hoist } : {}),
+          ...(mentionable !== group.mentionable ? { mentionable } : {}),
         });
         useUi.getState().toast("success", t("common.saved"));
       }
@@ -434,6 +497,11 @@ function RoleEditor({ group, onSaved }: { group: Group | undefined; onSaved: (id
           </div>
         )}
       </Field>
+      <fieldset className="flex flex-col gap-1" disabled={readOnly}>
+        <legend className="mb-1 text-xs font-medium text-muted">{t("ss.roleDisplay")}</legend>
+        <Switch checked={hoist} onCheckedChange={(v) => !readOnly && setHoist(v)} label={t("ss.roleHoist")} description={t("ss.roleHoistHint")} />
+        <Switch checked={mentionable} onCheckedChange={(v) => !readOnly && setMentionable(v)} label={t("ss.roleMentionable")} description={t("ss.roleMentionableHint")} />
+      </fieldset>
       <fieldset className="flex flex-col gap-3" disabled={readOnly}>
         <legend className="mb-1 text-xs font-medium text-muted">{t("ss.permissions")}</legend>
         {isAdmin && <p className="text-xs text-subtle">{t("ss.adminAll")}</p>}
@@ -480,11 +548,12 @@ function MembersTab() {
   const members = useSession((s) => s.members);
   const clients = useSession((s) => s.clients);
   const defs = useSession((s) => s.groups);
-  const mine = useSession((s) => s.permissions);
+  const me = useMyWho();
+  const ownerUid = useSession((s) => s.owner?.uid);
   const meUid = useSession((s) => s.me?.uid);
-  const canGroups = usePermission("group_manage");
-  const canBan = usePermission("client_ban");
-  const canRemove = usePermission("member_remove");
+  const canGroups = usePermission("manage_roles");
+  const canBan = usePermission("ban_members");
+  const canRemove = usePermission("manage_members");
   const [query, setQuery] = useState("");
   const [now] = useState(() => Date.now());
   const online = useMemo(() => new Map(Object.values(clients).map((c) => [c.uid, c.id])), [clients]);
@@ -514,7 +583,8 @@ function MembersTab() {
             const color = nameColor(m.groups, defs);
             const isMe = m.uid === meUid;
             const session = online.get(m.uid);
-            const stronger = !canActOn(mine, m.groups, defs);
+            // My own roles are mine to change within my rank; others only below me.
+            const stronger = !isMe && !canActOn(me, { groups: m.groups, owner: m.uid === ownerUid }, defs);
             const assigned = m.groups.map((g) => defs[g]).filter((g): g is Group => !!g && g.id !== MEMBER_GROUP);
             return (
               <li key={m.uid} data-member={m.nickname} className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2">
@@ -707,8 +777,8 @@ function RoleMenu({
   nickname: string;
 }) {
   const t = useT();
-  const mine = useSession((s) => s.permissions);
-  const myGroups = useMyGroups();
+  const me = useMyWho();
+  const defs = useSession((s) => s.groups);
   return (
     <Dropdown.Root>
       <Dropdown.Trigger asChild>
@@ -724,7 +794,7 @@ function RoleMenu({
         <Dropdown.Content align="end" sideOffset={4} className={cn(menuContent, "w-56")}>
           {roles.map((g) => {
             const on = groups.includes(g.id);
-            const blocked = stronger || !canGiveGroup(mine, myGroups, g) || (isMe && g.id === ADMIN_GROUP && on);
+            const blocked = stronger || !canGiveGroup(me, g, defs) || (isMe && g.id === ADMIN_GROUP && on);
             return (
               <Dropdown.CheckboxItem
                 key={g.id}
@@ -815,8 +885,6 @@ export function InvitesPanel() {
   const lang = useLanguage();
   const copy = useCopy();
   const defs = useSession((s) => s.groups);
-  const mine = useSession((s) => s.permissions);
-  const myGroups = useMyGroups();
   const address = useSession((s) => s.address);
 
   const [invites, setInvites] = useState<Invite[] | null>(null);
@@ -828,7 +896,8 @@ export function InvitesPanel() {
   const [copied, setCopied] = useState<string | null>(null);
   const [now] = useState(() => Date.now());
 
-  const assignable = useMemo(() => orderedGroups(defs).filter((g) => g.id !== MEMBER_GROUP && g.id !== ADMIN_GROUP && canGiveGroup(mine, myGroups, g)), [defs, mine, myGroups]);
+  const me = useMyWho();
+  const assignable = useMemo(() => orderedGroups(defs).filter((g) => g.id !== MEMBER_GROUP && canGiveGroup(me, g, defs)), [defs, me]);
 
   useEffect(() => {
     let alive = true;

@@ -5,4 +5,16 @@ export type Group = { id: number, name: string, permissions: Array<Permission>,
 /**
  * `#rrggbb`, shown on members' names.
  */
-color?: string | null, };
+color?: string | null, 
+/**
+ * Order from the top (0); Member is always last. A member's rank is their best role's.
+ */
+position: number, 
+/**
+ * Online holders are listed under this role in the member list.
+ */
+hoist: boolean, 
+/**
+ * `@role` mentions notify its holders.
+ */
+mentionable: boolean, };

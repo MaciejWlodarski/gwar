@@ -6,7 +6,10 @@ import { validNickname } from "../net/nickname";
 import { controller, describeRequestError } from "../state/controller";
 import { useSession, useUi } from "../state/stores";
 import { ConnectBadge, IdentityLine } from "./badges";
-import { useMemberName, usePermission } from "./hooks";
+import { useMemberName, useMyWho, usePermission, useWhoOf } from "./hooks";
+import { canActOn } from "../lib/permissions";
+
+const NO_GROUPS: readonly number[] = [];
 import { useConnectHandle } from "./useConnectHandle";
 import { Avatar, Button, Dialog, Field, Input } from "./kit";
 
@@ -69,7 +72,12 @@ export function MemberProfileDialog({ uid, fallback }: { uid: string; fallback: 
   const nickname = useMemberName(uid, fallback);
   const own = useSession((s) => s.me?.uid === uid);
   const vc = useSession((s) => s.kind === "vc");
-  const mayRename = usePermission("member_nickname");
+  const canRename = usePermission("manage_members");
+  const me = useMyWho();
+  const groupDefs = useSession((s) => s.groups);
+  const target = useWhoOf(uid, member?.groups ?? NO_GROUPS);
+  // Someone else's nickname only if they rank below me (docs/roles.md).
+  const mayRename = canRename && canActOn(me, target, groupDefs);
   const connect = useConnectHandle(member);
   const copy = async () => {
     try {

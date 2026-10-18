@@ -27,7 +27,8 @@ import { useSettings } from "../state/settings";
 import { useSession, useUi } from "../state/stores";
 import { buildTree, descendantsCount, type ChannelNode } from "../state/tree";
 import { MentionBadge, UnreadBadge } from "./badges";
-import { useGroupsColor, usePermission } from "./hooks";
+import { useGroupsColor, useMyWho, usePermission, useWhoOf } from "./hooks";
+import { canActOn } from "../lib/permissions";
 import { ModerationItems } from "./ModerationMenu";
 import { EmptyState, TalkingAvatar, Slider, menuContent, menuItem, menuItemDanger, menuLabel, menuSeparator } from "./kit";
 
@@ -95,10 +96,10 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
   const unread = useSession((s) => channelUnread(s, channel.id));
   const mentions = useSession((s) => channelMentions(s, channel.id));
   const isDefault = useSession((s) => s.server?.default_channel === channel.id);
-  const canMove = usePermission("client_move");
-  const canCreate = usePermission("channel_create");
-  const canEdit = usePermission("channel_edit");
-  const canDelete = usePermission("channel_delete");
+  const canMove = usePermission("move_members");
+  const canCreate = usePermission("manage_channels");
+  const canEdit = usePermission("manage_channels");
+  const canDelete = usePermission("manage_channels");
   const joining = useUi((s) => s.joining === channel.id);
   const toggleCollapsed = useUi((s) => s.toggleCollapsed);
   const openDialog = useUi((s) => s.openDialog);
@@ -261,7 +262,13 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
   const client = { ...sessionClient, nickname: member?.nickname ?? sessionClient.nickname };
   const isMe = useSession((s) => s.me?.uid === client.uid);
   const myChannel = useSession(myChannelId);
-  const canMove = usePermission("client_move");
+  const mayMove = usePermission("move_members");
+  const me = useMyWho();
+  const target = useWhoOf(client.uid, client.groups);
+  const groups = useSession((s) => s.groups);
+  const vc = useSession((s) => s.kind === "vc");
+  // Myself, or someone ranked below me (docs/roles.md); a TeamSpeak server decides that itself.
+  const canMove = mayMove && (isMe || !vc || canActOn(me, target, groups));
   const color = useGroupsColor(client.groups);
   const openDm = () => {
     if (isMe) return;

@@ -585,7 +585,7 @@ describe("sending, editing and deleting", () => {
 describe("moderation requests", () => {
   it("sends role, ban and invite requests as the protocol defines them", async () => {
     connectFake();
-    await controller.createGroup({ name: "Mods", permissions: ["client_kick"], color: "#ff0000" });
+    await controller.createGroup({ name: "Mods", permissions: ["kick_members"], color: "#ff0000", hoist: false, mentionable: false });
     await controller.updateGroup({ group: 3, color: "" });
     await controller.setMemberGroups("u2", [2, 3]);
     await controller.createBan({ client: 2, ip: true, duration: 3600, reason: "spam" });
@@ -731,7 +731,7 @@ describe("uploads", () => {
   it("is off when the server takes no uploads, and on TeamSpeak", async () => {
     connectFake();
     expect(controller.canUpload).toBe(false);
-    stores.useSession.setState({ server: { ...session().server!, upload_limit: 100 }, permissions: ["file_upload"] });
+    stores.useSession.setState({ server: { ...session().server!, upload_limit: 100 }, permissions: ["attach_files"] });
     expect(controller.canUpload).toBe(true);
     session().setAddress("ts", "teamspeak");
     expect(controller.canUpload).toBe(false);

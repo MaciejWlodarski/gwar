@@ -66,8 +66,15 @@ impl Core {
 
     /// Members holding `channel_edit` (Admin included), sorted.
     fn channel_editors(&self) -> anyhow::Result<Vec<Uid>> {
-        let groups: Vec<_> =
-            self.groups.values().filter(|g| g.permissions.contains(&Permission::ChannelEdit)).map(|g| g.id).collect();
+        let groups: Vec<_> = self
+            .groups
+            .values()
+            .filter(|g| {
+                g.permissions.contains(&Permission::ManageChannels)
+                    || g.permissions.contains(&Permission::Administrator)
+            })
+            .map(|g| g.id)
+            .collect();
         self.store.uids_in_groups(&groups)
     }
 

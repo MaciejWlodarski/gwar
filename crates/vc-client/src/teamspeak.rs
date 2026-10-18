@@ -579,6 +579,7 @@ fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Option<Out
         Request::GroupCreate(_)
         | Request::GroupUpdate(_)
         | Request::GroupDelete { .. }
+        | Request::GroupReorder { .. }
         | Request::MemberNickname { .. }
         | Request::MemberGroups { .. }
         | Request::MemberRemove { .. }

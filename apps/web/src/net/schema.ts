@@ -54,7 +54,7 @@ const id = int();
 const text = str(4096);
 const uid: Rule<string> = (v): v is string => str(128)(v) && v.length > 0 && v !== "prototype" && !Object.hasOwn(Object.prototype, v);
 const ids = array(id, 128);
-const permissions = literal<Permission>(["server_manage", "channel_create", "channel_edit", "channel_delete", "channel_join_locked", "client_move", "client_kick", "token_create", "client_ban", "group_manage", "message_manage", "invite_create", "file_upload", "member_remove", "member_nickname"]);
+const permissions = literal<Permission>(["administrator", "manage_server", "manage_roles", "manage_members", "kick_members", "ban_members", "create_invites", "bypass_password", "attach_files", "manage_messages", "move_members", "manage_channels"]);
 const platform = literal<Platform>(["web", "desktop", "mobile", "ts3", "ts6"]);
 const errorCode = literal<ErrorCode>(["bad_request", "not_authenticated", "not_found", "forbidden", "wrong_password", "channel_full", "rate_limited", "conflict", "unavailable", "internal", "banned", "too_large", "quota_exceeded", "certificate_expired", "stale", "pending", "expired", "early"]);
 const path = (put = false): Rule<string> => (v): v is string => {
@@ -79,7 +79,7 @@ const channelAccess = shape<ChannelAccess>({ roles: array(id, 64), users: array(
 const channel = shape<Channel>({ id, parent: nullable(id), name: str(256), topic: text, position: int(2147483647, -2147483648), has_password: bool, max_clients: nullable(int(65535)), encrypted: bool, history: bool, private: bool, access: optional(nullable(channelAccess)) });
 const client = shape<Client>({ id, uid, nickname: str(256), channel: nullable(id), groups: ids, platform, muted: bool, deafened: bool, away: nullable(text), talking: bool, voice: bool, voice_binding: nullable(voiceBinding) });
 const color: Rule<string> = (v): v is string => typeof v === "string" && /^#[0-9a-f]{6}$/i.test(v);
-const group = shape<Group>({ id, name: str(256), permissions: array(permissions, 32), color: optional(nullable(color)) });
+const group = shape<Group>({ id, name: str(256), permissions: array(permissions, 32), color: optional(nullable(color)), position: int(4294967295), hoist: bool, mentionable: bool });
 const attestation = shape<HandleAttestation>({ account_key: str(128), handle: str(64), issued_at: id, expires_at: id, signature: str(128) });
 const member = shape<Member>({ uid, nickname: str(256), tag: str(128), connect: optional(nullable(attestation)), groups: ids, last_seen: id });
 const unread = shape<Unread>({ channel: id, last_read: id, count: int(1000000), mentions: int(1000000) });
@@ -136,7 +136,7 @@ export const events: { [K in EventName]: Rule<EventData<K>> } = {
   "channel.deleted": shape({ channel: id }), "channel.hidden": shape({ channel: id }), "owner.updated": ownerInfo, "managers.updated": managers, "client.joined": client, "client.updated": client,
   "client.left": shape({ client: id, reason: leave }), "chat.message": message, "chat.edited": message,
   "chat.deleted": shape({ channel: id, message: id }), "group.created": group, "group.updated": group,
-  "group.deleted": shape({ group: id }), "member.updated": member, "member.removed": shape({ uid }),
+  "group.deleted": shape({ group: id }), "group.reordered": shape({ groups: ids }), "member.updated": member, "member.removed": shape({ uid }),
   "voice.talking": shape({ ...voiceFields, client: int(4294967295), talking: bool }), "voice.slot": shape({ ...transportFields, slot: int(7), client: nullable(int(4294967295)) }),
   "voice.state": shape({ voice: nullable(voiceState) }),
   "voice.epoch.ack": shape({call:fixed(16),group:fixed(32),epoch:id,device:fixed(32)}),
@@ -166,7 +166,7 @@ export const responses: { [K in Op]: Rule<ResponseMap[K]> } = {
   "chat.history": shape({ messages: array(message, 100) }), "server.update": empty,
   "token.create": shape({ token: str(256) }), "token.redeem": shape({ groups: ids }),
   "file.upload": shape({ file: str(64), upload_url: path(true) }),
-  "group.create": shape({ group }), "group.update": shape({ group }), "group.delete": empty,
+  "group.create": shape({ group }), "group.update": shape({ group }), "group.delete": empty, "group.reorder": empty,
   "member.nickname": empty, "member.groups": shape({ groups: ids }), "member.remove": empty,
   "member.prune": shape({ uids: array(uid, 500), count: int(4294967295), members: array(member, 500) }),
   "ban.create": shape({ ban }), "ban.list": shape({ bans: array(ban, 4096) }), "ban.delete": empty,

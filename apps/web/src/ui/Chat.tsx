@@ -454,7 +454,7 @@ export function MessageList({ threadKey, editLastRef }: { threadKey: ThreadKey; 
   const locked = isChannel && !!thread?.locked;
   const viewChannel = useSession((s) => s.viewChannel);
   const vc = useSession((s) => s.kind === "vc");
-  const canManageMessages = usePermission("message_manage");
+  const canManageMessages = usePermission("manage_messages");
   const editing = useUi((s) => s.editing);
 
   const verificationFor = useCallback((item: Extract<ChatItem, { kind: "msg" }>) => {
@@ -767,7 +767,7 @@ function Composer({ threadKey, attachRef, editLastRef }: { threadKey: ThreadKey;
   // A password channel I have not entered: the server would refuse, and I cannot read it either.
   const locked = useSession((s) => threadKey === "channel" && s.viewChannel !== null && !!s.threads[`ch:${s.viewChannel}`]?.locked);
   const uploadsOn = useSession((s) => s.kind === "vc" && (s.server?.upload_limit ?? 0) > 0);
-  const mayUpload = usePermission("file_upload");
+  const mayUpload = usePermission("attach_files");
   // Files travel with channel messages and encrypted conversations, where they are encrypted too.
   const canAttach = (threadKey === "channel" || encrypted) && uploadsOn && mayUpload;
   const disabled = !online || !peerOnline || locked || securing;

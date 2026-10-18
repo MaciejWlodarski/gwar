@@ -208,7 +208,7 @@ impl Core {
         sha256: String,
         sealed: bool,
     ) -> Reply {
-        self.require(session, Permission::FileUpload)?;
+        self.require(session, Permission::AttachFiles)?;
         if self.info.upload_limit == 0 {
             return Err(err(ErrorCode::Unavailable, "uploads are disabled on this server"));
         }

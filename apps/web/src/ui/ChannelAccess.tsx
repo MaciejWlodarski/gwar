@@ -1,9 +1,10 @@
 import { useMemo, useState } from "react";
 import { useT } from "../i18n";
-import { ADMIN_GROUP } from "../lib/permissions";
+import { cn } from "../lib/cn";
+import { ADMIN_GROUP, canGiveGroup, orderedGroups } from "../lib/permissions";
 import type { ChannelAccess } from "../proto/ChannelAccess";
 import { useSession } from "../state/stores";
-import { useMyGroups } from "./hooks";
+import { useMyWho } from "./hooks";
 import { Input } from "./kit";
 
 /** Who a private channel admits besides admins: roles and members (docs/e2e-build.md, section 6).
@@ -13,15 +14,15 @@ export function AccessPicker({ value, onChange, membersOnly = false, disabled = 
   const t = useT();
   const groups = useSession((s) => s.groups);
   const members = useSession((s) => s.members);
-  const myGroups = useMyGroups();
+  const me = useMyWho();
   const [filter, setFilter] = useState("");
-  // A role is listed only by someone holding it or Admin; one already listed can always be removed.
+  // A role is listed by someone holding it or ranked above it; one already listed can always be removed.
   const roles = useMemo(
     () =>
-      Object.values(groups)
-        .filter((g) => g.id !== ADMIN_GROUP && (myGroups.includes(ADMIN_GROUP) || myGroups.includes(g.id) || value.roles.includes(g.id)))
-        .sort((a, b) => a.name.localeCompare(b.name)),
-    [groups, myGroups, value.roles],
+      orderedGroups(groups).filter(
+        (g) => g.id !== ADMIN_GROUP && (me.groups.includes(g.id) || canGiveGroup(me, g, groups) || value.roles.includes(g.id)),
+      ),
+    [groups, me, value.roles],
   );
   const people = useMemo(() => {
     const needle = filter.trim().toLowerCase();
@@ -58,17 +59,22 @@ export function AccessPicker({ value, onChange, membersOnly = false, disabled = 
       {!membersOnly && roles.length > 0 && (
         <fieldset className="flex flex-col gap-1">
           <legend className="mb-1 text-xs font-medium text-subtle">{t("channel.accessRoles")}</legend>
-          {roles.map((role) => (
-            <label key={role.id} className="flex cursor-pointer items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={value.roles.includes(role.id)}
-                onChange={() => onChange({ ...value, roles: toggle(value.roles, role.id) })}
-                className="size-4 accent-[var(--accent)]"
-              />
-              {role.name}
-            </label>
-          ))}
+          {roles.map((role) => {
+            // Only roles I hold or rank above can be added or taken away; others stay as they are.
+            const locked = !me.groups.includes(role.id) && !canGiveGroup(me, role, groups);
+            return (
+              <label key={role.id} className={cn("flex items-center gap-2 text-sm", locked ? "cursor-not-allowed opacity-60" : "cursor-pointer")}>
+                <input
+                  type="checkbox"
+                  checked={value.roles.includes(role.id)}
+                  disabled={disabled || locked}
+                  onChange={() => onChange({ ...value, roles: toggle(value.roles, role.id) })}
+                  className="size-4 accent-[var(--accent)]"
+                />
+                {role.name}
+              </label>
+            );
+          })}
         </fieldset>
       )}
       <fieldset className="flex flex-col gap-1">

@@ -195,18 +195,22 @@ async fn private_attachments_need_an_admitted_session_even_in_link_mode() {
 }
 
 #[tokio::test]
-async fn roles_are_given_out_only_by_those_holding_them() {
+async fn roles_and_the_channels_they_open_are_given_out_by_rank() {
     let server = TestServer::start().await;
     let mut root = admin(&server, "root").await;
     let mut mallory = Client::connect(&server, "mallory").await;
     let bystander = Client::connect(&server, "bystander").await;
-    // Mallory holds every permission through a custom role, but neither Admin nor Crew.
-    let all = vc_proto::Permission::ALL.iter().map(|p| json!(p)).collect::<Vec<_>>();
-    let boss = root.ok("group.create", json!({"name": "Boss", "permissions": all})).await["group"]["id"].clone();
+    // Mallory holds every permission but administrator through Boss; Crew starts above Boss.
+    let all: Vec<_> = vc_proto::Permission::ALL
+        .iter()
+        .filter(|p| **p != vc_proto::Permission::Administrator)
+        .map(|p| json!(p))
+        .collect();
     let crew = root.ok("group.create", json!({"name": "Crew", "permissions": []})).await["group"]["id"].clone();
+    let boss = root.ok("group.create", json!({"name": "Boss", "permissions": all})).await["group"]["id"].clone();
     root.ok("member.groups", json!({"uid": mallory.welcome.uid, "groups": [2, boss]})).await;
     let (me, them) = (mallory.welcome.uid.clone(), bystander.welcome.uid.clone());
-    let refused = |role: &Value| {
+    let giving = |role: &Value| {
         [
             ("member.groups", json!({"uid": me, "groups": [2, boss, role]})),
             ("member.groups", json!({"uid": them, "groups": [2, role]})),
@@ -214,25 +218,52 @@ async fn roles_are_given_out_only_by_those_holding_them() {
             ("token.create", json!({"group": role})),
         ]
     };
-    for (op, d) in refused(&json!(1)) {
-        assert_eq!(mallory.fails(op, d.clone()).await, "forbidden", "Admin: {op} {d}");
+    // Admin, Crew and her own role are not below her rank.
+    for role in [json!(1), crew.clone(), boss.clone()] {
+        // (Asking for a role she already holds changes nothing.)
+        for (op, d) in giving(&role).into_iter().skip(usize::from(role == boss)) {
+            assert_eq!(mallory.fails(op, d.clone()).await, "forbidden", "{role}: {op} {d}");
+        }
     }
-    // The outcome is the same before and after Crew starts admitting a hidden channel.
-    for (op, d) in refused(&crew) {
-        assert_eq!(mallory.fails(op, d.clone()).await, "forbidden", "before: {op} {d}");
-    }
+    // The outcome does not depend on hidden channels: the same after Crew starts admitting one.
     let private = channel_id(
         &root.create_channel(json!({"name": "p", "private": true, "access": {"roles": [crew], "users": []}})).await,
     );
-    for (op, d) in refused(&crew) {
+    for (op, d) in giving(&crew) {
         assert_eq!(mallory.fails(op, d.clone()).await, "forbidden", "after: {op} {d}");
     }
-    // A role you hold you may give out; a token from an Admin works.
-    let invite = mallory.ok("invite.create", json!({"group": boss})).await;
-    assert!(invite.get("invite").is_some() || invite.get("code").is_some(), "{invite}");
-    let token = root.ok("token.create", json!({"group": crew})).await["token"].as_str().unwrap().to_owned();
-    mallory.ok("token.redeem", json!({"token": token})).await;
+    // Moved below Boss, Crew (and its channel) is hers to give: the order says whom the admin trusts.
+    root.ok("group.reorder", json!({"groups": [1, boss, crew]})).await;
+    mallory.ok("member.groups", json!({"uid": them, "groups": [2, crew]})).await;
+    mallory.ok("member.groups", json!({"uid": me, "groups": [2, boss, crew]})).await;
     assert_eq!(mallory.next_event("channel.created").await["id"], private);
+    let invite = mallory.ok("invite.create", json!({"group": crew})).await;
+    assert!(invite.get("invite").is_some(), "{invite}");
+}
+
+#[tokio::test]
+async fn a_private_channels_roles_change_only_below_ones_rank_or_for_ones_own() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let mut mallory = Client::connect(&server, "mallory").await;
+    let seniors = root.ok("group.create", json!({"name": "Seniors", "permissions": []})).await["group"]["id"].clone();
+    let editors =
+        root.ok("group.create", json!({"name": "Editors", "permissions": ["manage_channels"]})).await["group"]["id"]
+            .clone();
+    let crew = root.ok("group.create", json!({"name": "Crew", "permissions": []})).await["group"]["id"].clone();
+    root.ok("member.groups", json!({"uid": mallory.welcome.uid, "groups": [2, editors]})).await;
+    // She is listed by name, so she sees the channel.
+    let me = mallory.welcome.uid.clone();
+    let access = |roles: Value| json!({"roles": roles, "users": [me]});
+    let private = channel_id(
+        &root.create_channel(json!({"name": "p", "private": true, "access": access(json!([seniors]))})).await,
+    );
+    mallory.next_event("channel.created").await;
+    let update = |roles: Value| json!({"channel": private, "access": access(roles)});
+    // Not taking away a higher role, not adding one.
+    assert_eq!(mallory.fails("channel.update", update(json!([]))).await, "forbidden");
+    // Her own role and a lower one, keeping the higher one listed.
+    mallory.ok("channel.update", update(json!([seniors, editors, crew]))).await;
 }
 
 #[tokio::test]
@@ -240,7 +271,7 @@ async fn a_hidden_sibling_is_no_name_oracle() {
     let server = TestServer::start().await;
     let mut root = admin(&server, "root").await;
     let editors = root
-        .ok("group.create", json!({"name": "Editors", "permissions": ["channel_create", "channel_edit"]}))
+        .ok("group.create", json!({"name": "Editors", "permissions": ["manage_channels", "manage_channels"]}))
         .await["group"]["id"]
         .clone();
     let mut eve = Client::connect(&server, "eve").await;
@@ -266,7 +297,7 @@ async fn a_hidden_channel_answers_exactly_as_a_missing_one() {
     let server = TestServer::start().await;
     let mut root = admin(&server, "root").await;
     let managers = root
-        .ok("group.create", json!({"name": "Managers", "permissions": ["server_manage", "channel_edit"]}))
+        .ok("group.create", json!({"name": "Managers", "permissions": ["manage_server", "manage_channels"]}))
         .await["group"]["id"]
         .clone();
     let mut bob = Client::connect(&server, "bob").await;
@@ -305,16 +336,17 @@ async fn a_hidden_channel_answers_exactly_as_a_missing_one() {
 }
 
 #[tokio::test]
-async fn deleting_a_role_needs_holding_it() {
+async fn deleting_a_role_needs_a_higher_rank() {
     let server = TestServer::start().await;
     let mut root = admin(&server, "root").await;
     let mut mallory = Client::connect(&server, "mallory").await;
-    let all = vc_proto::Permission::ALL.iter().map(|p| json!(p)).collect::<Vec<_>>();
-    let boss = root.ok("group.create", json!({"name": "Boss", "permissions": all})).await["group"]["id"].clone();
     let crew = root.ok("group.create", json!({"name": "Crew", "permissions": []})).await["group"]["id"].clone();
+    let boss =
+        root.ok("group.create", json!({"name": "Boss", "permissions": ["manage_roles"]})).await["group"]["id"].clone();
     root.ok("member.groups", json!({"uid": mallory.welcome.uid, "groups": [2, boss]})).await;
     assert_eq!(mallory.fails("group.delete", json!({"group": crew})).await, "forbidden");
-    root.ok("member.groups", json!({"uid": mallory.welcome.uid, "groups": [2, boss, crew]})).await;
+    assert_eq!(mallory.fails("group.delete", json!({"group": boss})).await, "forbidden");
+    root.ok("group.reorder", json!({"groups": [1, boss, crew]})).await;
     mallory.ok("group.delete", json!({"group": crew})).await;
 }
 

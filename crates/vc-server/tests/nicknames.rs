@@ -62,23 +62,28 @@ async fn renaming_self_updates_all_sessions_and_current_chat_names() {
 }
 
 #[tokio::test]
-async fn another_members_name_requires_only_the_nickname_permission() {
+async fn another_members_name_needs_the_permission_and_a_higher_rank() {
     let server = TestServer::start().await;
     let mut root = admin(&server, "root").await;
     let mut alice = Client::connect(&server, "alice").await;
-    assert!(root.welcome.groups.iter().find(|g| g.id == 1).unwrap().permissions.contains(&Permission::MemberNickname));
-    assert!(!alice.welcome.permissions.contains(&Permission::MemberNickname));
+    assert_eq!(root.welcome.groups.iter().find(|g| g.id == 1).unwrap().permissions, [Permission::Administrator]);
+    assert!(!alice.welcome.permissions.contains(&Permission::ManageMembers));
     assert_eq!(alice.fails("member.nickname", json!({"uid": root.welcome.uid, "nickname": "no"})).await, "forbidden");
     let role =
-        root.ok("group.create", json!({"name": "Names", "permissions": ["member_nickname"]})).await["group"]["id"]
+        root.ok("group.create", json!({"name": "Names", "permissions": ["manage_members"]})).await["group"]["id"]
             .clone();
     root.ok("member.groups", json!({"uid": alice.welcome.uid, "groups": [2, role]})).await;
-    // This permission intentionally allows renaming even an admin.
-    alice.ok("member.nickname", json!({"uid": root.welcome.uid, "nickname": "alice"})).await;
-    let root_uid = root.welcome.uid.clone();
+    // Not someone ranked above her.
     assert_eq!(
-        root.next_event_where("member.updated", |m| m["uid"] == root_uid && m["nickname"] == "alice").await["nickname"],
-        "alice"
+        alice.fails("member.nickname", json!({"uid": root.welcome.uid, "nickname": "alice"})).await,
+        "forbidden"
+    );
+    let mut bob = Client::connect(&server, "bob").await;
+    alice.ok("member.nickname", json!({"uid": bob.welcome.uid, "nickname": "Robert"})).await;
+    let bob_uid = bob.welcome.uid.clone();
+    assert_eq!(
+        bob.next_event_where("member.updated", |m| m["uid"] == bob_uid && m["nickname"] == "Robert").await["nickname"],
+        "Robert"
     );
     assert_eq!(alice.fails("member.nickname", json!({"uid": "absent", "nickname": "valid"})).await, "not_found");
     for bad in ["", "   ", &"é".repeat(33), "new\nline", "a\u{7f}b"] {

@@ -139,7 +139,7 @@ async fn managers_update_accepts_only_current_newer_pairs_and_reports_pending_an
     let mut carol = Client::connect(&server, "carol").await; // a confirmer
     let dave = Client::connect(&server, "dave").await; // a manager
     let editors =
-        root.ok("group.create", json!({"name": "Editors", "permissions": ["channel_edit"]})).await["group"]["id"]
+        root.ok("group.create", json!({"name": "Editors", "permissions": ["manage_channels"]})).await["group"]["id"]
             .clone();
     for c in [&carol, &dave] {
         root.ok("member.groups", json!({"uid": c.welcome.uid, "groups": [2, editors]})).await;
@@ -224,7 +224,7 @@ async fn a_newcomer_given_channel_edit_by_default_is_reported_pending() {
     let server = TestServer::start().await;
     let mut root = admin(&server, "root").await;
     // The default Member role may edit channels.
-    root.ok("group.update", json!({"group": 2, "permissions": ["channel_edit"]})).await;
+    root.ok("group.update", json!({"group": 2, "permissions": ["manage_channels"]})).await;
     let newcomer = Client::connect(&server, "newcomer").await;
     let uid = newcomer.welcome.uid.clone();
     root.next_event_where("managers.updated", |m| m["pending"].as_array().unwrap().contains(&json!(uid))).await;
@@ -237,8 +237,9 @@ async fn the_owner_is_admitted_to_private_channels_whatever_their_roles() {
     let mut other = Client::connect(&server, "other").await;
     root.ok("member.groups", json!({"uid": other.welcome.uid, "groups": [1, 2]})).await;
     let private = channel_id(&other.create_channel(json!({"name": "p", "private": true})).await);
-    // Another Admin takes the owner's Admin role away: the owner still sees the channel.
-    other.ok("member.groups", json!({"uid": root.welcome.uid, "groups": [2]})).await;
+    // Another Admin cannot take the owner's Admin role away: the owner ranks above every role.
+    assert_eq!(other.fails("member.groups", json!({"uid": root.welcome.uid, "groups": [2]})).await, "forbidden");
+    assert_eq!(other.fails("client.kick", json!({"client": root.id()})).await, "forbidden");
     let late = Client::connect_as(&server, new_key(), "probe", None).await.unwrap();
     assert!(late.welcome.channels.iter().all(|c| c.id != private), "others do not");
     root.ok("channel.join", json!({"channel": private})).await;

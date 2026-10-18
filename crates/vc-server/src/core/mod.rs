@@ -786,20 +786,12 @@ impl Core {
         if row.encrypted {
             return self.private_admits(channel, uid);
         }
-        // The server's owner is admitted whatever their roles (6b).
-        groups.contains(&ADMIN_GROUP)
-            || self.owner.as_ref().is_some_and(|o| o.chain.owner() == uid)
+        // Administrators and the server's owner are admitted whatever their roles (6b).
+        self.expand(self.group_permissions(groups), uid).contains(&Permission::Administrator)
             || row
                 .access
                 .as_ref()
                 .is_some_and(|a| a.users.iter().any(|u| u == uid) || a.roles.iter().any(|r| groups.contains(r)))
-    }
-
-    /// Granting a role is delegation: a role, and every private channel it admits, is given out or
-    /// taken away only by someone holding it or Admin. The rule is the same for every role, so the
-    /// outcome never depends on hidden channels (docs/e2e-build.md, section 6).
-    fn may_delegate(granter: &[GroupId], roles: &[GroupId]) -> bool {
-        granter.contains(&ADMIN_GROUP) || roles.iter().all(|r| granter.contains(r))
     }
 
     /// `viewer`'s copy of a channel, or `None` when it is hidden from them.
@@ -1200,12 +1192,15 @@ impl Core {
 
     fn member_nickname(&mut self, session: SessionId, uid: Uid, nickname: String) -> Reply {
         if self.sessions[&session].uid != uid {
-            self.require(session, Permission::MemberNickname)?;
+            self.require(session, Permission::ManageMembers)?;
         }
         let nickname = clean(&nickname, NICKNAME_MAX_LEN, "nickname")?;
         let Some((user_id, mut member)) = self.store.user_by_uid(&uid).map_err(storage_error)? else {
             return Err(err(ErrorCode::NotFound, "no such member"));
         };
+        if self.sessions[&session].uid != uid && !self.outranks(session, &uid, &member.groups) {
+            return Err(err(ErrorCode::Forbidden, "this member is not below your rank"));
+        }
         self.store.set_nickname(user_id, &nickname).map_err(storage_error)?;
         member.nickname = nickname.clone();
         self.broadcast(Event::MemberUpdated(member), |_| true);
@@ -1399,7 +1394,29 @@ impl Core {
     // ----------------------------------------------------------- permissions
 
     fn permissions(&self, session: &Session) -> BTreeSet<Permission> {
-        session.groups.iter().filter_map(|g| self.groups.get(g)).flat_map(|g| g.permissions.iter().copied()).collect()
+        let held = session.groups.iter().filter_map(|g| self.groups.get(g)).flat_map(|g| g.permissions.iter().copied());
+        self.expand(held.collect(), &session.uid)
+    }
+
+    /// `administrator`, and being the owner, mean every permission.
+    fn expand(&self, held: BTreeSet<Permission>, uid: &str) -> BTreeSet<Permission> {
+        let owner = self.owner.as_ref().is_some_and(|o| o.chain.owner() == uid);
+        if owner || held.contains(&Permission::Administrator) { Permission::ALL.into_iter().collect() } else { held }
+    }
+
+    /// Positions follow the roles' order again after one was removed: Member stays last.
+    fn renumber_groups(&mut self) {
+        let mut order: Vec<(u32, GroupId)> =
+            self.groups.values().filter(|g| g.id != MEMBER_GROUP).map(|g| (g.position, g.id)).collect();
+        order.sort_unstable();
+        for (index, (_, id)) in order.iter().enumerate() {
+            if let Some(g) = self.groups.get_mut(id) {
+                g.position = index as u32;
+            }
+        }
+        if let Some(member) = self.groups.get_mut(&MEMBER_GROUP) {
+            member.position = order.len() as u32;
+        }
     }
 
     fn require(&self, session: SessionId, permission: Permission) -> Result<(), ErrorBody> {
@@ -1431,7 +1448,7 @@ impl Core {
         {
             return Some(Err(err(ErrorCode::NotFound, "no such channel")));
         }
-        // Role changes can change who holds `channel_edit`, and so the managers' view.
+        // Role changes can change who holds `manage_channels`, and so the managers' view.
         let managers_before = matches!(
             request,
             Request::MemberGroups { .. }
@@ -1477,6 +1494,7 @@ impl Core {
             Request::GroupCreate(create) => self.group_create(session, create),
             Request::GroupUpdate(update) => self.group_update(session, update),
             Request::GroupDelete { group } => self.group_delete(session, group),
+            Request::GroupReorder { groups } => self.group_reorder(session, groups),
             Request::MemberNickname { uid, nickname } => self.member_nickname(session, uid, nickname),
             Request::MemberGroups { uid, groups } => self.member_groups(session, uid, groups),
             Request::MemberRemove { uid, delete_messages } => self.member_remove(session, uid, delete_messages),
@@ -1552,15 +1570,15 @@ impl Core {
     }
 
     fn client_move(&mut self, session: SessionId, client: SessionId, channel: ChannelId) -> Reply {
-        self.require(session, Permission::ClientMove)?;
+        self.require(session, Permission::MoveMembers)?;
         if !self.channels.contains_key(&channel) {
             return Err(err(ErrorCode::NotFound, "no such channel"));
         }
         let Some(target) = self.sessions.get(&client) else {
             return Err(err(ErrorCode::NotFound, "no such client"));
         };
-        if !self.covers(session, &self.permissions(target)) {
-            return Err(err(ErrorCode::Forbidden, "this client has permissions you do not have"));
+        if client != session && !self.outranks(session, &target.uid, &target.groups) {
+            return Err(err(ErrorCode::Forbidden, "this member is not below your rank"));
         }
         if target.out.is_none() && self.is_encrypted(channel) {
             return Err(err(ErrorCode::BadRequest, "TeamSpeak users cannot join encrypted channels"));
@@ -1573,15 +1591,15 @@ impl Core {
     }
 
     fn client_kick(&mut self, session: SessionId, client: SessionId, reason: Option<String>) -> Reply {
-        self.require(session, Permission::ClientKick)?;
+        self.require(session, Permission::KickMembers)?;
         if client == session {
             return Err(err(ErrorCode::BadRequest, "cannot kick yourself"));
         }
         let Some(target) = self.sessions.get(&client) else {
             return Err(err(ErrorCode::NotFound, "no such client"));
         };
-        if !self.covers(session, &self.permissions(target)) {
-            return Err(err(ErrorCode::Forbidden, "this client has permissions you do not have"));
+        if !self.outranks(session, &target.uid, &target.groups) {
+            return Err(err(ErrorCode::Forbidden, "this member is not below your rank"));
         }
         let reason = reason.map(|r| r.chars().take(MAX_AWAY).collect());
         let by = self.sessions[&session].nickname.clone();
@@ -1601,7 +1619,7 @@ impl Core {
         }
         if let Some(max) = row.max_clients {
             let inside = self.sessions.values().filter(|s| s.channel == Some(channel)).count();
-            if inside >= max as usize && !self.has(session, Permission::ClientMove) {
+            if inside >= max as usize && !self.has(session, Permission::MoveMembers) {
                 return Err(err(ErrorCode::ChannelFull, "channel is full"));
             }
         }
@@ -1632,7 +1650,7 @@ impl Core {
         row.password_hash.is_none()
             || s.channel == Some(channel)
             || s.unlocked.contains(&channel)
-            || self.permissions(s).contains(&Permission::ChannelJoinLocked)
+            || self.permissions(s).contains(&Permission::BypassPassword)
     }
 
     /// Whether `channel` exists and has encrypted (sealed) chat.
@@ -1712,7 +1730,7 @@ impl Core {
             return Some(Ok(Response::Empty {}));
         }
         // The password is checked before occupancy so a locked channel reveals nothing.
-        let Some(hash) = row.password_hash.clone().filter(|_| !self.has(session, Permission::ChannelJoinLocked)) else {
+        let Some(hash) = row.password_hash.clone().filter(|_| !self.has(session, Permission::BypassPassword)) else {
             return Some(self.enter_channel(session, channel));
         };
         let password = password.unwrap_or_default();
@@ -1794,7 +1812,7 @@ impl Core {
         session: SessionId,
         c: &ChannelCreate,
     ) -> Result<(ChannelRow, Option<String>), ErrorBody> {
-        self.require(session, Permission::ChannelCreate)?;
+        self.require(session, Permission::ManageChannels)?;
         let name = clean(&c.name, MAX_CHANNEL_NAME, "channel name")?;
         let topic = c.topic.as_deref().map(str::trim).unwrap_or("").to_owned();
         if topic.chars().count() > MAX_TOPIC {
@@ -1938,7 +1956,7 @@ impl Core {
 
     /// The channel as `u` would leave it, if `session` may make that change now.
     fn checked_channel_update(&self, session: SessionId, u: &ChannelUpdate) -> Result<ChannelRow, ErrorBody> {
-        self.require(session, Permission::ChannelEdit)?;
+        self.require(session, Permission::ManageChannels)?;
         let viewer = Some(&self.sessions[&session]);
         let Some(current) = self.channels.get(&u.channel).filter(|_| self.admitted(viewer, u.channel)) else {
             return Err(err(ErrorCode::NotFound, "no such channel"));
@@ -2043,7 +2061,7 @@ impl Core {
     }
 
     fn channel_delete(&mut self, session: SessionId, channel: ChannelId) -> Reply {
-        self.require(session, Permission::ChannelDelete)?;
+        self.require(session, Permission::ManageChannels)?;
         if !self.channels.contains_key(&channel) {
             return Err(err(ErrorCode::NotFound, "no such channel"));
         }
@@ -2219,17 +2237,13 @@ impl Core {
     }
 
     fn token_create(&mut self, session: SessionId, group: GroupId) -> Reply {
-        self.require(session, Permission::TokenCreate)?;
+        self.require(session, Permission::CreateInvites)?;
         let Some(g) = self.groups.get(&group) else {
             return Err(err(ErrorCode::NotFound, "no such group"));
         };
-        // A token may only hand out permissions its creator already has.
-        let mine = self.permissions(&self.sessions[&session]);
-        if !g.permissions.iter().all(|p| mine.contains(p)) {
-            return Err(err(ErrorCode::Forbidden, "cannot grant permissions you do not have"));
-        }
-        if !Self::may_delegate(&self.sessions[&session].groups, &[group]) {
-            return Err(err(ErrorCode::Forbidden, "you can only give out roles you hold"));
+        let _ = g;
+        if !self.below(session, group) {
+            return Err(err(ErrorCode::Forbidden, "this role is not below your rank"));
         }
         let token = issue_token(&self.store, group, Some(&self.sessions[&session].uid)).map_err(storage_error)?;
         Ok(Response::Token { token })
@@ -2242,7 +2256,7 @@ impl Core {
             return Err(err(ErrorCode::NotFound, "invalid or used token"));
         };
         if let Some(creator) = creator
-            && !self.could_grant(&creator, Permission::TokenCreate, Some(group)).map_err(storage_error)?
+            && !self.could_grant(&creator, Permission::CreateInvites, Some(group)).map_err(storage_error)?
         {
             return Err(err(ErrorCode::Forbidden, "whoever made this token can no longer grant its group"));
         }
@@ -2281,13 +2295,16 @@ pub fn encode(frame: &ServerFrame) -> Arc<str> {
 
 /// Validates a private channel's access: known roles, well-formed uids, bounds; sorted and deduplicated.
 impl Core {
-    /// Listing a role in an access set needs that role or the Admin group.
+    /// Adding a role to an access set, or taking one away, needs that role or a rank above it.
     fn may_list_roles(&self, session: SessionId, roles: &[GroupId], already: &[GroupId]) -> Result<(), ErrorBody> {
         let me = &self.sessions[&session];
-        if me.groups.contains(&ADMIN_GROUP) || roles.iter().all(|r| already.contains(r) || me.groups.contains(r)) {
+        // Every role added or taken away: one held, or one below one's rank. Unchanged ones stay.
+        let changed =
+            roles.iter().filter(|r| !already.contains(r)).chain(already.iter().filter(|r| !roles.contains(r)));
+        if changed.into_iter().all(|r| me.groups.contains(r) || self.below(session, *r)) {
             Ok(())
         } else {
-            Err(err(ErrorCode::Forbidden, "you can only admit roles you hold"))
+            Err(err(ErrorCode::Forbidden, "you can only admit or remove roles you hold or below your rank"))
         }
     }
 
@@ -2683,7 +2700,7 @@ pub(crate) mod expiry_tests {
     #[tokio::test]
     async fn a_channel_update_finishing_after_access_is_revoked_changes_nothing() {
         let store = Store::in_memory().unwrap();
-        let editors = store.insert_group("Editors", &[Permission::ChannelEdit], None).unwrap();
+        let editors = store.insert_group("Editors", &[Permission::ManageChannels], None, false, false).unwrap();
         let uid = crate::identity::uid_for_key(&[1; 32]);
         let private = store
             .create_channel(&ChannelRow {
@@ -2746,7 +2763,7 @@ pub(crate) mod expiry_tests {
     #[tokio::test]
     async fn a_channel_create_finishing_after_losing_the_permission_creates_nothing() {
         let store = Store::in_memory().unwrap();
-        let creators = store.insert_group("Creators", &[Permission::ChannelCreate], None).unwrap();
+        let creators = store.insert_group("Creators", &[Permission::ManageChannels], None, false, false).unwrap();
         let core = test_core(store, None);
         let (out, mut frames) = mpsc::channel(OUTBOUND_QUEUE);
         let session = core
