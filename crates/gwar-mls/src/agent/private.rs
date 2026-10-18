@@ -403,6 +403,28 @@ impl Agent {
         Ok((descriptor, context))
     }
 
+    /// Whether this device's own creation of a private group still holds authority (no time at
+    /// hand: the pair it carries is the newest accepted one, its anchor is current under the pinned
+    /// head and its member list is signed by an authority under the current owner). Other groups:
+    /// always.
+    pub(super) fn own_creation_authorized(&self, key: &str) -> Result<bool> {
+        let record = self.groups.get(key).ok_or(Invalid("record"))?;
+        let descriptor = SignedDescriptor::parse(&record.descriptor).ok_or(Invalid("descriptor"))?;
+        if !rules::is_private(&descriptor) {
+            return Ok(true);
+        }
+        let server = &descriptor.descriptor.server_key;
+        let Some(server_record) = self.servers.get(server) else { return Ok(false) };
+        let chain = server_record.chain(server)?;
+        let Some((anchor, list)) = server_record.pair()? else { return Ok(false) };
+        let group = self.mls(key)?;
+        let access = rules::access(group.public_group().group_context()).ok_or(Invalid("access lists"))?;
+        Ok(access.anchor().hash() == anchor.hash()
+            && access.list().hash() == list.hash()
+            && chain.anchor_current(access.anchor())
+            && access.signer_authorized(&chain, true))
+    }
+
     /// The verified pending tip of a private conversation, kept on its live pin.
     pub(super) fn pending_tip(&self, server: &str, conversation: &str) -> Result<Option<SignedDescriptor>> {
         let Some(live) = self.live(server, conversation)? else { return Ok(None) };
@@ -442,18 +464,35 @@ impl Agent {
             if descriptor.group_id() != tip.group_id() {
                 return Err(Invalid("the final successor's GroupInfo"));
             }
+            // Its lists must be valid history (bound to it, signed by an authority of their span),
+            // even to be kept as pending: a fabricated tip must not become a restart's predecessor.
+            let pin_chain = a.owner_chain(server)?.ok_or(AgentError::Waiting)?;
+            let access = rules::access(&context).ok_or(Invalid("access lists"))?;
+            if !access.valid_when_signed(&pin_chain, &tip.group_id()) {
+                return Err(Invalid("the final successor's access lists"));
+            }
             let key = group_key(server, &tip.group_id());
             match a.newcomer(&key, &tip, &context, now, revocations) {
                 Ok(checkpoint) => {
                     let group = a.adopt_chain(server, conversation, &chain)?;
-                    let record = a.groups.get_mut(&key).ok_or(Invalid("record"))?;
-                    if record.access.is_none() {
-                        record.access = checkpoint;
+                    // The list seen current now is the newest accepted (newcomer refused older ones).
+                    if checkpoint.is_some() {
+                        a.groups.get_mut(&key).ok_or(Invalid("record"))?.access = checkpoint;
                     }
                     Ok(ChainAdoption { group, adopted: true })
                 }
                 Err(AgentError::Waiting) => {
-                    if let Some(live) = a.live(server, conversation)? {
+                    // Without any pin, the chain's verified first link is pinned (not joined) to
+                    // carry the pending tip, so an authority can still restart from it.
+                    let live = match a.live(server, conversation)? {
+                        Some(live) => live,
+                        None => {
+                            let first = chain.first().ok_or(Invalid("chain anchor"))?.clone();
+                            a.adopt_chain(server, conversation, std::slice::from_ref(&first))?;
+                            first
+                        }
+                    };
+                    if live.group_id() != tip.group_id() {
                         a.groups
                             .get_mut(&group_key(server, &live.group_id()))
                             .ok_or(Invalid("live pin"))?

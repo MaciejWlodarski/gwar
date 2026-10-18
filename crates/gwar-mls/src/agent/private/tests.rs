@@ -475,3 +475,54 @@ fn an_authority_restarts_from_a_pending_tip() {
     assert_eq!(second.group(&server(), &p.id).unwrap().status, Status::Superseded);
     assert_eq!(second.group(&server(), &after.group_id()).unwrap().status, Status::Active);
 }
+
+#[test]
+fn adopting_a_chain_records_the_newer_list_and_recovers_without_any_pin() {
+    let mut p = private();
+    let first = SignedDescriptor::parse(&p.owner.group(&server(), &p.id).unwrap().descriptor).unwrap();
+    // The owner edits access; the member has not processed it, then accepts the live pin's GroupInfo.
+    let out = p.owner.commit_access(&server(), &p.id, Some(&[uid(2), uid(3)]), p.t, &()).unwrap();
+    p.owner.take_changes();
+    p.observer = p.observer.commit(&out.commit, &out.group_info, None, p.t, p.t).unwrap().0;
+    let tree = p.observer.tree().unwrap().1;
+    let adopted = p
+        .member
+        .accept_private_chain(&server(), "channel:7", &incarnations(&[&first]), &out.group_info, Some(&tree), p.t, &())
+        .unwrap();
+    p.member.take_changes();
+    assert!(adopted.adopted);
+    assert_eq!(p.member.group(&server(), &p.id).unwrap().access.as_ref().map(|c| c.seq), Some(2));
+    // A device without any pin, whose accepted pair is older than the restart's, keeps the tip
+    // pending on the chain's first link and can restart from it.
+    let newer = pair(&p.chain, &p.owner, 2, &[], p.t);
+    let mut fresh = device(1, 13, p.t, &p.chain);
+    accept_pair(&mut fresh, &pair(&p.chain, &p.owner, 1, &[], p.t), p.t);
+    accept_pair(&mut p.owner, &newer, p.t);
+    let next = successor_of(&p.owner, &p.id, 1, p.t);
+    let info = p.owner.create_private(next.clone(), &[uid(2)], p.t, &()).unwrap();
+    p.owner.take_changes();
+    let next_tree = Observer::create_with(&info, &server(), Some(p.chain.clone())).unwrap().tree().unwrap().1;
+    let chain = incarnations(&[&first, &next]);
+    assert!(
+        !fresh.accept_private_chain(&server(), "channel:7", &chain, &info, Some(&next_tree), p.t, &()).unwrap().adopted
+    );
+    fresh.take_changes();
+    assert!(fresh.group(&server(), &p.id).unwrap().pending_tip.is_some());
+    assert!(fresh.create_private(successor_of(&fresh, &next.group_id(), 2, p.t), &[uid(2)], p.t, &()).is_ok());
+}
+
+#[test]
+fn a_restart_created_before_losing_authority_stays_pending_when_it_wins() {
+    let mut p = private();
+    let next = successor_of(&p.owner, &p.id, 1, p.t);
+    p.owner.create_private(next.clone(), &[uid(2)], p.t, &()).unwrap();
+    p.owner.take_changes();
+    // A newer pair is accepted before the server's reply: the creation no longer carries it.
+    let newer = pair(&p.chain, &p.owner, 2, &[], p.t);
+    accept_pair(&mut p.owner, &newer, p.t);
+    assert!(!p.owner.settle(&server(), &next.group_id(), Some(&next.group_id())).unwrap());
+    p.owner.take_changes();
+    let live = p.owner.group(&server(), &p.id).unwrap();
+    assert_eq!((live.status, live.pending_tip.is_some()), (Status::Active, true));
+    assert!(p.owner.group(&server(), &next.group_id()).is_none());
+}

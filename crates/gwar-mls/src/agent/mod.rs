@@ -975,6 +975,22 @@ impl Agent {
                 return Err(Invalid("not creating"));
             }
             if winner == Some(id) {
+                // A private restart this device created is adopted only while it still holds
+                // authority: otherwise the predecessor stays, with this creation as its pending tip
+                // (staged adoption, 6c).
+                if !a.own_creation_authorized(&key)? {
+                    let d = SignedDescriptor::parse(&a.groups[&key].descriptor).ok_or(Invalid("descriptor"))?;
+                    let mut group = a.mls(&key)?;
+                    group.delete(a.provider.storage()).map_err(err("delete group"))?;
+                    a.groups.remove(&key);
+                    if let Some(live) = a.live(server, &d.descriptor.conversation)? {
+                        a.groups
+                            .get_mut(&group_key(server, &live.group_id()))
+                            .ok_or(Invalid("live pin"))?
+                            .pending_tip = Some(d.encode());
+                    }
+                    return Ok(false);
+                }
                 a.won(server, &key)?;
                 return Ok(true);
             }
