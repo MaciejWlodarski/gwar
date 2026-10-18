@@ -1,6 +1,6 @@
 # Roles and permissions, version 2
 
-Status: step 1 (ranks) built; steps 2–4 designed. Replaces the flat role model.
+Status: steps 1 (ranks) and 2 (overrides) built; steps 3–4 designed. Replaces the flat role model.
 
 ## Why
 
@@ -59,7 +59,6 @@ channels; roles carry them as defaults, and channels override them.
 | `kick_members` | server | disconnect from the server | `client_kick` |
 | `ban_members` | server | ban and unban | `client_ban` |
 | `create_invites` | server | invites (for roles below one's rank) | `invite_create`, `token_create` |
-| `view_channel` | channel | see the channel, its occupants and its chat | private channels' access (plaintext) |
 | `connect` | channel | join its voice | TeamSpeak join power |
 | `speak` | channel | be heard in its voice | TeamSpeak talk power |
 | `bypass_password` | channel | join without the channel password | `channel_join_locked` |
@@ -70,10 +69,13 @@ channels; roles carry them as defaults, and channels override them.
 | `mute_members` | channel | mute or deafen someone for everyone in it | — (new) |
 | `manage_channels` | channel | create subchannels, edit, move and delete it, edit its overrides | `channel_create`, `channel_edit`, `channel_delete` |
 
-Step 1 has the twelve that replace today's permissions; `view_channel`,
-`connect`, `speak`, `send_messages` (step 2) and `mute_members` (step 3) come
-with overrides and voice moderation. Until then a role's channel permissions
-apply in every channel.
+Step 1 has the twelve that replace today's permissions; `connect`, `speak`,
+`send_messages` (step 2) and `mute_members` (step 3) come with overrides and
+voice moderation.
+
+Who **sees** a channel is not a permission: a channel is public, or private
+and admits the roles and members on its list (below, "Private and encrypted
+channels"). Seeing it is the condition for every channel permission there.
 
 `manage_channels` at the server's top level (on the Member role or a role,
 without an override) is what today's `channel_create` means for top-level
@@ -99,8 +101,9 @@ For member *m* in channel *c*:
    2. all of *m*'s other roles' overrides together: any **deny** removes, then
       any **allow** adds (an allow wins over a deny between two of *m*'s roles);
    3. *m*'s own member override.
-4. Dependencies: without `view_channel` every other channel permission is
-   off; without `connect`, `speak` is off.
+4. Dependencies: in a channel one is not admitted to (a private channel not
+   listing them) every channel permission is off; without `connect`, `speak`
+   is off.
 
 This is Discord's order, so the result is what people expect from there; the
 same function runs on the server (authoritative) and in the clients (to show
@@ -123,12 +126,14 @@ One rule replaces "nobody acts on someone holding permissions they lack":
 
 ## Private and encrypted channels
 
-- A **plaintext private channel** becomes an ordinary channel with
-  `view_channel` denied to Member and allowed to the admitted roles and
-  members. "Private" stays as a label in the UI (a lock on the channel),
-  and a hidden channel is still exactly as invisible as today: it, its
-  occupants and its chat never reach those who cannot view it, and requests
-  naming it answer "no such channel".
+- **Private channels stay the way to hide a channel** (decided while building
+  step 2, 2026-10-19). The design first turned a plaintext private channel
+  into `view_channel` overrides. Private channels already do exactly that
+  job (a list of roles and members, server-enforced, reviewed for not
+  revealing hidden channels by name, occupants, errors or children), so a
+  second way to hide would only add places for the two to disagree. Overrides
+  apply inside a channel one sees, private or not: "visible, but only Crew may
+  join" is `connect` denied to Member and allowed to Crew.
 - **Rank decides who may give access.** Today a role (and the private
   channels it opens) is given out only by someone holding it or Admin. With
   ranks, anyone with `manage_roles` gives roles below their rank, so a role's
@@ -137,8 +142,8 @@ One rule replaces "nobody acts on someone holding permissions they lack":
   admin's statement of who is trusted with what.
 - **Encrypted private channels do not change.** Their admission is the member
   list signed by the owner or a manager and enforced by the MLS group
-  (docs/e2e-build.md, step 6). Overrides cannot widen it: `view_channel` and
-  `connect` there are the signed list, whatever the roles. Overrides can still
+  (docs/e2e-build.md, step 6). Overrides cannot widen it: seeing and joining
+  there are the signed list, whatever the roles. Overrides can still
   narrow what the server controls in them anyway: `speak` (the SFU forwards
   nothing from a member who may not speak), `send_messages` (the server refuses
   to store) and `attach_files`.
@@ -148,7 +153,7 @@ One rule replaces "nobody acts on someone holding permissions they lack":
 The bridge mirrors the result for official TeamSpeak clients (the core stays
 the authority):
 
-- A channel Member cannot view is not mirrored (as private channels today).
+- Private channels are not mirrored (as today).
 - `connect` and `speak` become the TeamSpeak channel's needed join and talk
   power. Each Gwar role a TeamSpeak user (`ts:<uid>`) holds is mirrored as a
   TeamSpeak server group `Gwar: <role>` carrying the join and talk power that
@@ -172,8 +177,8 @@ needs: join and talk power, channel admins and the group order map onto
 - **Channel → Permissions.** The roles and members with overrides, plus "add
   role or member". Each permission is a three-way switch (deny / inherit /
   allow). Subchannels show "Synced with Clan" with a button to break the sync.
-- **"Who can see this channel?"** under the list: the roles that end up with
-  `view_channel`, so a rule's effect is visible before saving.
+- **Who can see it** stays the private channel's access list, shown above the
+  overrides, so the whole picture of a channel is on one page.
 - **View as role.** An admin previews the channel tree and the chat as a role
   sees it. Later; not needed for the first release.
 - Errors say why: "Moderator is above your rank", not "missing permission".
@@ -186,8 +191,8 @@ first, Member last), stored permission names are rewritten by the table above
 (`channel_create`, `channel_edit` and `channel_delete` become
 `manage_channels`; `token_create` and `invite_create` become `create_invites`;
 `member_remove` and `member_nickname` become `manage_members`), and Admin holds
-`administrator`. Step 2 turns plaintext private channels into overrides the same
-way.
+`administrator`. Step 2 adds `connect`, `speak` and `send_messages` to
+Member once, so existing members keep joining, talking and writing.
 
 ## Protocol
 
@@ -206,8 +211,10 @@ way.
 1. **Ranks**: positions, the rank rule, `administrator`, the new permission
    names, the migration, the roles page with dragging. Server, protocol,
    clients.
-2. **Overrides**: storage, resolution with shared test vectors, plaintext
-   private channels moved onto overrides, the channel permissions UI.
+2. **Overrides**: storage, resolution with shared test vectors, the channel
+   permissions UI, and `connect`, `send_messages` and per-channel
+   `attach_files`, `manage_messages`, `move_members`, `bypass_password` and
+   `manage_channels` enforced.
 3. **Voice and TeamSpeak**: `speak` and `mute_members` in the SFU, the
    bridge's mirrored groups and powers.
 4. **Then the importer**, onto this model.

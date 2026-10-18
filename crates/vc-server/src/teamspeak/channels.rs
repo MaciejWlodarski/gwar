@@ -179,6 +179,8 @@ mod tests {
             history: false,
             private: false,
             access: None,
+            overrides: Vec::new(),
+            synced: false,
         }
     }
 

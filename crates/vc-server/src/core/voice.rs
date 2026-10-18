@@ -1017,6 +1017,8 @@ mod tests {
                 history: true,
                 private: false,
                 access: None,
+                overrides: Vec::new(),
+                synced: false,
             })
             .unwrap();
         core.channels = core.store.channels().unwrap().into_iter().map(|c| (c.id, c)).collect();
@@ -1670,6 +1672,8 @@ mod tests {
                     history: false,
                     private: false,
                     access: None,
+                    overrides: Vec::new(),
+                    synced: false,
                 },
                 None,
             )

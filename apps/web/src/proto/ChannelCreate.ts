@@ -17,4 +17,8 @@ private: boolean,
 /**
  * Who a private channel admits; defaults to the creator.
  */
-access?: ChannelAccess | null, };
+access?: ChannelAccess | null, 
+/**
+ * Use the parent's overrides; defaults to true for a subchannel.
+ */
+synced?: boolean | null, };

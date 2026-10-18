@@ -188,6 +188,8 @@ fn sealed_channel_subtree_deletion_and_member_removal_are_atomic() {
                 history: true,
                 private: false,
                 access: None,
+                overrides: Vec::new(),
+                synced: false,
             })
             .unwrap();
         parent = if id == "parent" { Some(channel) } else { None };

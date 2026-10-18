@@ -110,6 +110,7 @@ export type DialogState =
   | { kind: "addServer"; editId?: string }
   | { kind: "channelEdit"; mode: "create"; parent: number | null }
   | { kind: "channelEdit"; mode: "edit"; channel: number }
+  | { kind: "channelPermissions"; channel: number }
   | { kind: "channelPassword"; channel: number }
   | { kind: "serverSettings"; tab?: ServerSettingsTab }
   | { kind: "invites" }

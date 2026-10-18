@@ -208,7 +208,10 @@ impl Core {
         sha256: String,
         sealed: bool,
     ) -> Reply {
-        self.require(session, Permission::AttachFiles)?;
+        // Where it may be attached is checked when it is (an override can allow it in one channel).
+        if !self.can_anywhere(session, Permission::AttachFiles) {
+            return Err(err(ErrorCode::Forbidden, "missing permission"));
+        }
         if self.info.upload_limit == 0 {
             return Err(err(ErrorCode::Unavailable, "uploads are disabled on this server"));
         }

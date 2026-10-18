@@ -7,6 +7,7 @@ import { RequestError } from "../net/connection";
 import type { Channel } from "../proto/Channel";
 import type { ChannelAccess } from "../proto/ChannelAccess";
 import { AccessPicker } from "./ChannelAccess";
+import { ChannelPermissionsDialog } from "./ChannelPermissions";
 import { BugReportDialog } from "./BugReport";
 import { rebaseAccess, sameAccess } from "../lib/access";
 import { controller, describeRequestError } from "../state/controller";
@@ -42,6 +43,8 @@ export function Dialogs() {
       return dialog.mode === "create" ? <ChannelDialog mode="create" parent={dialog.parent} /> : <ChannelDialog mode="edit" channel={dialog.channel} />;
     case "channelPassword":
       return <ChannelPasswordDialog channel={dialog.channel} />;
+    case "channelPermissions":
+      return <ChannelPermissionsDialog channel={dialog.channel} />;
     case "serverSettings":
       return <ServerSettingsDialog tab={dialog.tab} />;
     case "invites":

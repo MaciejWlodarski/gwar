@@ -64,8 +64,15 @@ impl Core {
         self.permissions(&self.sessions[&session])
     }
 
+    /// What these roles allow, Member's included: Member is everyone's role, even someone's
+    /// without a member record yet (a TeamSpeak user seen for the first time).
     pub(super) fn group_permissions(&self, groups: &[GroupId]) -> BTreeSet<Permission> {
-        groups.iter().filter_map(|g| self.groups.get(g)).flat_map(|g| g.permissions.iter().copied()).collect()
+        groups
+            .iter()
+            .chain(std::iter::once(&MEMBER_GROUP))
+            .filter_map(|g| self.groups.get(g))
+            .flat_map(|g| g.permissions.iter().copied())
+            .collect()
     }
 
     /// Whether the member `uid`, online or not, could now make an invite or token
@@ -230,6 +237,7 @@ impl Core {
         self.groups.insert(group.id, group.clone());
         self.broadcast(Event::GroupUpdated(group.clone()), |_| true);
         self.reconcile_admissions(before);
+        self.enforce_connect_everywhere();
         Ok(Response::Group { group })
     }
 
@@ -248,6 +256,7 @@ impl Core {
         let before = self.admissions();
         self.store.delete_group(id).map_err(storage_error)?;
         self.groups.remove(&id);
+        self.forget_role_overrides(id);
         self.renumber_groups();
         self.broadcast_order();
         let affected: Vec<_> = self.sessions.values().filter(|s| s.groups.contains(&id)).map(|s| s.id).collect();
@@ -276,6 +285,7 @@ impl Core {
         }
         self.broadcast(Event::GroupDeleted { group: id }, |_| true);
         self.reconcile_admissions(before);
+        self.enforce_connect_everywhere();
         Ok(Response::Empty {})
     }
 
@@ -322,6 +332,7 @@ impl Core {
         }
         self.broadcast(Event::MemberUpdated(member), |_| true);
         self.reconcile_admissions(before);
+        self.enforce_connect_everywhere();
         Ok(Response::Groups { groups: wanted })
     }
 
@@ -396,6 +407,14 @@ impl Core {
         let tags = self.store.member_tags().map_err(storage_error)?;
         self.connect_pending.remove(&member.uid);
         let removal = self.store.remove_member(user_id, &member.uid, delete_messages).map_err(storage_error)?;
+        // Their overrides went with them (in the same transaction): one who comes back starts afresh.
+        for &channel in &removal.overrides {
+            if let Some(row) = self.channels.get_mut(&channel) {
+                row.overrides.retain(|o| o.user.as_deref() != Some(member.uid.as_str()));
+                let view = super::channel_view(row);
+                self.broadcast_channel(Event::ChannelUpdated(view));
+            }
+        }
         for (conversation, ids) in removal.sealed {
             let readers = self.mls_readers(&conversation);
             self.broadcast(Event::ChatSealedRemoved { conversation, ids }, |s| readers.contains(&s.id));

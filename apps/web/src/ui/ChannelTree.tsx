@@ -13,6 +13,7 @@ import {
   MoveRight,
   Pencil,
   Plus,
+  ShieldCheck,
   Trash2,
   Volume2,
 } from "lucide-react";
@@ -27,7 +28,7 @@ import { useSettings } from "../state/settings";
 import { useSession, useUi } from "../state/stores";
 import { buildTree, descendantsCount, type ChannelNode } from "../state/tree";
 import { MentionBadge, UnreadBadge } from "./badges";
-import { useGroupsColor, useMyWho, usePermission, useWhoOf } from "./hooks";
+import { useChannelPermission, useGroupsColor, useMyWho, useWhoOf } from "./hooks";
 import { canActOn } from "../lib/permissions";
 import { ModerationItems } from "./ModerationMenu";
 import { EmptyState, TalkingAvatar, Slider, menuContent, menuItem, menuItemDanger, menuLabel, menuSeparator } from "./kit";
@@ -96,10 +97,14 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
   const unread = useSession((s) => channelUnread(s, channel.id));
   const mentions = useSession((s) => channelMentions(s, channel.id));
   const isDefault = useSession((s) => s.server?.default_channel === channel.id);
-  const canMove = usePermission("move_members");
-  const canCreate = usePermission("manage_channels");
-  const canEdit = usePermission("manage_channels");
-  const canDelete = usePermission("manage_channels");
+  // Per channel, overrides included (docs/roles.md).
+  const canMove = useChannelPermission(channel.id, "move_members");
+  const canManage = useChannelPermission(channel.id, "manage_channels");
+  const canCreate = canManage;
+  const canEdit = canManage;
+  const canDelete = canManage;
+  const canJoin = useChannelPermission(channel.id, "connect");
+  const vc = useSession((s) => s.kind === "vc");
   const joining = useUi((s) => s.joining === channel.id);
   const toggleCollapsed = useUi((s) => s.toggleCollapsed);
   const openDialog = useUi((s) => s.openDialog);
@@ -108,7 +113,9 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
   const total = descendantsCount(node);
   const count = node.clients.length;
 
-  const join = () => void controller.joinChannelInteractive(channel.id);
+  const join = () => {
+    if (canJoin) void controller.joinChannelInteractive(channel.id);
+  };
   const select = () => {
     controller.selectChannel(channel.id);
     useUi.getState().setDrawer(false);
@@ -194,7 +201,7 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
           {collapsed && total > 0 && <span className="shrink-0 rounded-full bg-hover px-1.5 text-xs tabular-nums text-muted">{total}</span>}
           <MentionBadge count={mentions} />
           <UnreadBadge count={unread} />
-          {!current && !joining && (
+          {!current && !joining && canJoin && (
             <button
               type="button"
               aria-label={t("tree.joinVoiceNamed", { name: channel.name })}
@@ -217,7 +224,7 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
           <ContextMenu.Item className={menuItem} onSelect={select}>
             <MessageSquare className="size-4" /> {t("tree.openChat")}
           </ContextMenu.Item>
-          <ContextMenu.Item className={menuItem} disabled={current} onSelect={join}>
+          <ContextMenu.Item className={menuItem} disabled={current || !canJoin} onSelect={join}>
             <LogIn className="size-4" /> {t("tree.joinVoice")}
           </ContextMenu.Item>
           {(canCreate || canEdit || canDelete) && <ContextMenu.Separator className={menuSeparator} />}
@@ -229,6 +236,11 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
           {canEdit && (
             <ContextMenu.Item className={menuItem} onSelect={() => openDialog({ kind: "channelEdit", mode: "edit", channel: channel.id })}>
               <Pencil className="size-4" /> {t("tree.edit")}
+            </ContextMenu.Item>
+          )}
+          {canEdit && vc && (
+            <ContextMenu.Item className={menuItem} onSelect={() => openDialog({ kind: "channelPermissions", channel: channel.id })}>
+              <ShieldCheck className="size-4" /> {t("chperm.open")}
             </ContextMenu.Item>
           )}
           {canDelete && (
@@ -262,7 +274,7 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
   const client = { ...sessionClient, nickname: member?.nickname ?? sessionClient.nickname };
   const isMe = useSession((s) => s.me?.uid === client.uid);
   const myChannel = useSession(myChannelId);
-  const mayMove = usePermission("move_members");
+  const mayMove = useChannelPermission(myChannel, "move_members");
   const me = useMyWho();
   const target = useWhoOf(client.uid, client.groups);
   const groups = useSession((s) => s.groups);

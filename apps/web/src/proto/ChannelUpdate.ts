@@ -14,4 +14,8 @@ position?: number | null,
 /**
  * Replaces a private channel's access (needs `manage_channels`).
  */
-access?: ChannelAccess | null, };
+access?: ChannelAccess | null, 
+/**
+ * Use the parent's overrides (true) or the channel's own (false).
+ */
+synced?: boolean | null, };

@@ -159,6 +159,7 @@ impl Core {
         }
         self.announce_member(&new_owner);
         self.reconcile_admissions(admissions);
+        self.enforce_connect_everywhere();
         let info = self.owner_info().expect("an owner");
         self.broadcast(Event::OwnerUpdated(info), |_| true);
         self.reconcile_managers(before);
@@ -197,6 +198,7 @@ impl Core {
         self.owner.as_mut().expect("checked above").pair = Some((anchor, list));
         // Confirmers and managers are admitted to every encrypted private channel (6c).
         self.reconcile_admissions(admissions);
+        self.enforce_connect_everywhere();
         self.reconcile_managers(before);
         Ok(Response::Empty {})
     }

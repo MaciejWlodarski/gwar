@@ -1,4 +1,5 @@
 import { permissionsOf } from "../lib/permissions";
+import type { ChannelOverride } from "../proto/ChannelOverride";
 import { attachment as attachmentSchema } from "../net/schema";
 import { SealedConversations, type SealedKey } from "./sealed";
 import type { MlsRuntime } from "../mls/runtime";
@@ -1293,6 +1294,11 @@ class Controller {
 
   updateChannel(u: Omit<ChannelUpdate, "move_to_root"> & { move_to_root?: boolean }) {
     return this.connection.request("channel.update", u);
+  }
+
+  /** Sets one role's or person's override in a channel; empty allow and deny remove it. */
+  setChannelOverride(channel: number, entry: ChannelOverride) {
+    return this.connection.request("channel.override", { channel, override: entry });
   }
 
   deleteChannel(channel: number) {

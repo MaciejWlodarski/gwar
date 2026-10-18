@@ -67,7 +67,7 @@ export function welcome(overrides: Partial<Welcome> = {}): Welcome {
     server: serverInfo,
     permissions: [],
     groups: [],
-    channels: [{ id: 1, parent: null, name: "Lobby", topic: "", position: 0, has_password: false, max_clients: null, encrypted: false, history: false, private: false }],
+    channels: [{ id: 1, parent: null, name: "Lobby", topic: "", position: 0, has_password: false, max_clients: null, encrypted: false, history: false, private: false , synced: false}],
     clients: [],
     members: [],
     unread: [],

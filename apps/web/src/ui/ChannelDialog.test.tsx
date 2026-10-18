@@ -115,7 +115,7 @@ describe("creating a channel", () => {
     expect(text).not.toContain("Bridged");
   });
   it("saving other settings never resends an access list changed meanwhile", async () => {
-    const channel = { id: 4, parent: null, name: "p", topic: "", position: 0, has_password: false, max_clients: null, encrypted: false, history: false, private: true, access: { roles: [], users: ["me-uid", "bob"] } };
+    const channel = { id: 4, parent: null, name: "p", topic: "", position: 0, has_password: false, max_clients: null, encrypted: false, history: false, private: true, synced: false, access: { roles: [], users: ["me-uid", "bob"] } };
     useSession.setState({ me: { session: 1, uid: "me-uid" } as never, clients: {}, groups: {}, members: {}, channels: { 4: channel } });
     useUi.getState().openDialog({ kind: "channelEdit", mode: "edit", channel: 4 });
     await act(async () => root.render(<TooltipProvider><Dialogs /></TooltipProvider>));

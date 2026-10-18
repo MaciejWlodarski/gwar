@@ -8,6 +8,7 @@ import { useSettings } from "../state/settings";
 import { useSession, useVoice } from "../state/stores";
 import { memberName } from "../lib/member-name";
 import { nameColor, type Who } from "../lib/permissions";
+import { channelPermissions } from "../lib/channel-permissions";
 import { sealedThread } from "../lib/chat";
 import type { Roster } from "../mls/types";
 import type { SealedKey } from "../state/sealed";
@@ -33,6 +34,18 @@ export function useMemberName(uid: string, fallback: string): string {
 
 export function usePermission(p: Permission): boolean {
   return useSession((s) => s.permissions.includes(p));
+}
+
+/** Whether I may do `p` in `channel`, overrides included (the server decides; this shows it). */
+export function useChannelPermission(channel: number | null | undefined, p: Permission): boolean {
+  return useSession((s) => {
+    // TeamSpeak servers keep their own rules; their permissions arrive as they are.
+    if (channel == null || !s.me || s.kind !== "vc") return s.permissions.includes(p);
+    const me = s.clients[s.me.session];
+    if (!me || !s.channels[channel]) return false;
+    const owner = !!s.owner && s.owner.uid === s.me.uid;
+    return channelPermissions({ uid: s.me.uid, groups: me.groups, owner }, channel, s.channels, s.groups).includes(p);
+  });
 }
 
 /** The server's owner and the managers of private channels as this device verified them (6b). */

@@ -33,7 +33,7 @@ pub const MEMBER_GROUP: GroupId = 2;
 /// Member's stored position: after every other role.
 const MEMBER_POSITION: i64 = i64::MAX;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ChannelRow {
     pub id: ChannelId,
     pub parent: Option<ChannelId>,
@@ -51,6 +51,10 @@ pub struct ChannelRow {
     pub private: bool,
     /// Who a private channel admits besides admins; `None` for public channels.
     pub access: Option<vc_proto::ChannelAccess>,
+    /// This channel's own overrides (docs/roles.md).
+    pub overrides: Vec<vc_proto::ChannelOverride>,
+    /// A subchannel that uses its parent's overrides.
+    pub synced: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +89,8 @@ pub struct Removal {
     pub sealed: BTreeMap<String, Vec<MessageId>>,
     /// Files to remove from disk (then [`Store::forget_removed`]).
     pub files: Vec<FileId>,
+    /// Channels where the member had an override (removed with them).
+    pub overrides: Vec<ChannelId>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -384,7 +390,35 @@ const MIGRATIONS: &[&str] = &[
     UPDATE groups SET position = id;
     ALTER TABLE bans ADD COLUMN by_uid TEXT;
     "#,
+    // Per-channel overrides (docs/roles.md): one row per role or member.
+    r#"
+    ALTER TABLE channels ADD COLUMN synced INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE channel_overrides (
+        channel INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        role INTEGER REFERENCES groups(id) ON DELETE CASCADE,
+        user TEXT,
+        allow TEXT NOT NULL,
+        deny TEXT NOT NULL,
+        CHECK ((role IS NULL) <> (user IS NULL))
+    );
+    CREATE UNIQUE INDEX channel_overrides_target ON channel_overrides(channel, COALESCE(role, -1), COALESCE(user, ''));
+    "#,
 ];
+
+fn write_overrides(
+    tx: &rusqlite::Transaction,
+    channel: ChannelId,
+    overrides: &[vc_proto::ChannelOverride],
+) -> Result<()> {
+    tx.execute("DELETE FROM channel_overrides WHERE channel=?1", [channel])?;
+    for o in overrides {
+        tx.execute(
+            "INSERT INTO channel_overrides(channel,role,user,allow,deny) VALUES(?1,?2,?3,?4,?5)",
+            params![channel, o.role, o.user, serde_json::to_string(&o.allow)?, serde_json::to_string(&o.deny)?],
+        )?;
+    }
+    Ok(())
+}
 
 /// The stored genesis of the current owner generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -471,6 +505,22 @@ impl Store {
             "UPDATE groups SET permissions=?2 WHERE id=?1",
             params![ADMIN_GROUP, serde_json::to_string(&[Permission::Administrator])?],
         )?;
+        if self.meta("member_channel_defaults")?.is_none() {
+            // Roles version 2, step 2: joining, talking and writing became permissions; members keep them.
+            let mut member = self.groups()?.into_iter().find(|g| g.id == MEMBER_GROUP).map(|g| g.permissions);
+            if let Some(permissions) = member.as_mut() {
+                for p in [Permission::Connect, Permission::Speak, Permission::SendMessages] {
+                    if !permissions.contains(&p) {
+                        permissions.push(p);
+                    }
+                }
+                self.db.execute(
+                    "UPDATE groups SET permissions=?2 WHERE id=?1",
+                    params![MEMBER_GROUP, serde_json::to_string(permissions)?],
+                )?;
+            }
+            self.set_meta("member_channel_defaults", "1")?;
+        }
         if self.meta("member_defaults")?.is_none() {
             // Members may invite and upload unless an admin takes it away.
             let mut member = self.groups()?.into_iter().find(|g| g.id == MEMBER_GROUP).map(|g| g.permissions);
@@ -534,6 +584,8 @@ impl Store {
                     history: false,
                     private: false,
                     access: None,
+                    overrides: Vec::new(),
+                    synced: false,
                 })
             };
             let lobby = channel("Lobby", 0)?;
@@ -588,7 +640,7 @@ impl Store {
 
     pub fn channels(&self) -> Result<Vec<ChannelRow>> {
         let mut stmt = self.db.prepare(
-            "SELECT id,parent,name,topic,position,password_hash,max_clients,encrypted,history,private,access FROM channels ORDER BY position,id",
+            "SELECT id,parent,name,topic,position,password_hash,max_clients,encrypted,history,private,access,synced FROM channels ORDER BY position,id",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(ChannelRow {
@@ -605,9 +657,43 @@ impl Store {
                 access: r.get::<_, Option<String>>(10)?.map(|json| serde_json::from_str(&json)).transpose().map_err(
                     |e| rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e)),
                 )?,
+                synced: r.get(11)?,
+                overrides: Vec::new(),
             })
         })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let mut rows: Vec<ChannelRow> = rows.collect::<rusqlite::Result<_>>()?;
+        let mut overrides = self.channel_overrides()?;
+        for row in &mut rows {
+            row.overrides = overrides.remove(&row.id).unwrap_or_default();
+        }
+        Ok(rows)
+    }
+
+    fn channel_overrides(&self) -> Result<std::collections::HashMap<ChannelId, Vec<vc_proto::ChannelOverride>>> {
+        let mut stmt =
+            self.db.prepare("SELECT channel,role,user,allow,deny FROM channel_overrides ORDER BY channel,rowid")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, ChannelId>(0)?, r.get(1)?, r.get(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?))
+        })?;
+        let mut out: std::collections::HashMap<ChannelId, Vec<vc_proto::ChannelOverride>> = Default::default();
+        for row in rows {
+            let (channel, role, user, allow, deny) = row?;
+            out.entry(channel).or_default().push(vc_proto::ChannelOverride {
+                role,
+                user,
+                allow: serde_json::from_str(&allow).unwrap_or_default(),
+                deny: serde_json::from_str(&deny).unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Replaces a channel's overrides.
+    pub fn set_channel_overrides(&self, channel: ChannelId, overrides: &[vc_proto::ChannelOverride]) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        write_overrides(&tx, channel, overrides)?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// The next id from a counter that never goes back and never wraps: once `u32` ids run out, inserts fail.
@@ -645,6 +731,8 @@ impl Store {
             history: false,
             private: false,
             access: None,
+            overrides: Vec::new(),
+            synced: false,
         })
     }
 
@@ -652,17 +740,24 @@ impl Store {
     pub fn create_channel(&self, row: &ChannelRow) -> Result<ChannelId> {
         let id = self.next_id("channel_counter")?;
         self.db.execute(
-            "INSERT INTO channels(id,parent,name,topic,position,password_hash,max_clients,encrypted,history,private,access) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-            params![id, row.parent, row.name, row.topic, row.position, row.password_hash, row.max_clients, row.encrypted, row.history && row.encrypted, row.private, access_json(row)?],
+            "INSERT INTO channels(id,parent,name,topic,position,password_hash,max_clients,encrypted,history,private,access,synced) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![id, row.parent, row.name, row.topic, row.position, row.password_hash, row.max_clients, row.encrypted, row.history && row.encrypted, row.private, access_json(row)?, row.synced],
         )?;
+        if !row.overrides.is_empty() {
+            self.set_channel_overrides(id, &row.overrides)?;
+        }
         Ok(id)
     }
 
+    /// The row and its overrides in one transaction.
     pub fn update_channel(&self, row: &ChannelRow) -> Result<()> {
-        self.db.execute(
-            "UPDATE channels SET parent=?2,name=?3,topic=?4,position=?5,password_hash=?6,max_clients=?7,access=?8 WHERE id=?1",
-            params![row.id, row.parent, row.name, row.topic, row.position, row.password_hash, row.max_clients, access_json(row)?],
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE channels SET parent=?2,name=?3,topic=?4,position=?5,password_hash=?6,max_clients=?7,access=?8,synced=?9 WHERE id=?1",
+            params![row.id, row.parent, row.name, row.topic, row.position, row.password_hash, row.max_clients, access_json(row)?, row.synced],
         )?;
+        write_overrides(&tx, row.id, &row.overrides)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1141,6 +1236,11 @@ impl Store {
         let pending = stmt.query_map([uid], |r| r.get::<_, FileId>(0))?;
         removal.files.extend(pending.collect::<rusqlite::Result<Vec<_>>>()?);
         self.db.execute("DELETE FROM message_mentions WHERE uid=?1 AND message IN (SELECT id FROM messages WHERE signature IS NULL)", [uid])?;
+        // Their overrides go with them: one who comes back starts afresh.
+        removal.overrides = {
+            let mut stmt = tx.prepare("DELETE FROM channel_overrides WHERE user=?1 RETURNING channel")?;
+            stmt.query_map([uid], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+        };
         // The foreign keys take the group memberships and read marks along.
         self.db.execute("DELETE FROM users WHERE id=?1", [id])?;
         tx.commit()?;
@@ -1190,6 +1290,9 @@ impl Store {
         // Their IP bans keep reaching only those ranked below them.
         tx.execute("UPDATE bans SET by_uid=?2 WHERE by_uid=?1", params![from, into])?;
         tx.execute("UPDATE invites SET creator_uid=?2 WHERE creator_uid=?1", params![from, into])?;
+        // Overrides follow too, where the target has none of its own in that channel.
+        tx.execute("UPDATE OR IGNORE channel_overrides SET user=?2 WHERE user=?1", params![from, into])?;
+        tx.execute("DELETE FROM channel_overrides WHERE user=?1", [from])?;
         tx.execute("UPDATE tokens SET creator_uid=?2 WHERE creator_uid=?1", params![from, into])?;
         // bans.by and invites.created_by are display-name snapshots, not identity references.
         // Revoked devices belong to cryptographic account keys and must never be reassigned.
@@ -2346,5 +2449,34 @@ mod tests {
         let id = store.insert_ban(&ban, Some("v")).unwrap();
         store.merge_members("v", "u", false).unwrap();
         assert_eq!(store.ban_issuer(id).unwrap().as_deref(), Some("u"));
+    }
+
+    #[test]
+    fn user_overrides_follow_a_merge_and_go_with_a_removal() {
+        let store = Store::in_memory().unwrap();
+        let (a, b) = (
+            store.insert_channel(None, "a", "", 0, None, None).unwrap(),
+            store.insert_channel(None, "b", "", 1, None, None).unwrap(),
+        );
+        store.touch_user("u", "ku", "u", 0).unwrap();
+        store.touch_user("v", "kv", "v", 0).unwrap();
+        let of = |uid: &str, allow: &[Permission]| vc_proto::ChannelOverride {
+            role: None,
+            user: Some(uid.into()),
+            allow: allow.to_vec(),
+            deny: vec![],
+        };
+        // u has their own override in a, so v's there gives way; v's in b moves over.
+        store.set_channel_overrides(a, &[of("u", &[Permission::Speak]), of("v", &[Permission::Connect])]).unwrap();
+        store.set_channel_overrides(b, &[of("v", &[Permission::Connect])]).unwrap();
+        store.merge_members("v", "u", false).unwrap();
+        let all = store.channel_overrides().unwrap();
+        assert_eq!(all[&a], vec![of("u", &[Permission::Speak])]);
+        assert_eq!(all[&b], vec![of("u", &[Permission::Connect])]);
+        let id = store.user_by_uid("u").unwrap().unwrap().0;
+        let mut removal = store.remove_member(id, "u", false).unwrap();
+        removal.overrides.sort_unstable();
+        assert_eq!(removal.overrides, vec![a, b]);
+        assert!(store.channel_overrides().unwrap().values().all(Vec::is_empty));
     }
 }

@@ -194,15 +194,19 @@ async fn welcome_describes_server_and_own_client() {
     assert_eq!(w.uid, uid_of(&c.key));
     assert!(!me.muted && !me.deafened && me.away.is_none() && !me.talking && !me.voice);
 
-    // Members may only invite and upload; both seeded groups are listed.
+    // Members may invite, upload, join voice, talk and write; both seeded groups are listed.
     let mut permissions = w.permissions.clone();
     permissions.sort();
-    assert_eq!(permissions, [Permission::CreateInvites, Permission::AttachFiles]);
+    let mut defaults = vc_proto::Permission::MEMBER_DEFAULT.to_vec();
+    defaults.sort();
+    assert_eq!(permissions, defaults);
     let groups: Vec<_> = w.groups.iter().map(|g| (g.id, g.name.as_str())).collect();
     assert_eq!(groups, [(1, "Admin"), (2, "Member")]);
     assert_eq!(w.groups[0].permissions, [Permission::Administrator]);
     assert_eq!((w.groups[0].position, w.groups[1].position), (0, 1), "Admin first, Member last");
-    assert_eq!(w.groups[1].permissions, vc_proto::Permission::MEMBER_DEFAULT);
+    let mut member = w.groups[1].permissions.clone();
+    member.sort();
+    assert_eq!(member, defaults);
 }
 
 #[tokio::test]

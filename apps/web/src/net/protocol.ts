@@ -64,6 +64,7 @@ export interface ResponseMap {
   "channel.leave": Empty;
   "channel.create": Channel;
   "channel.update": Channel;
+  "channel.override": Channel;
   "channel.delete": Empty;
   "chat.sealed.send": SealedMessage;
   "chat.sealed.edit": SealedMessage;

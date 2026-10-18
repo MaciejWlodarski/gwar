@@ -283,6 +283,8 @@ mod tests {
                     history: true,
                     private: false,
                     access: None,
+                    overrides: Vec::new(),
+                    synced: false,
                 })
                 .unwrap()
         };
