@@ -155,10 +155,17 @@ The core stays the authority for official TeamSpeak clients too:
 - Private channels are not mirrored (as before).
 - `connect`: a TeamSpeak user who arrives in, or moves into, a channel they
   may not join stays where they were in Gwar (the default channel on
-  arrival), and the bridge moves them back there on TeamSpeak.
+  arrival), and the bridge moves them back there on TeamSpeak. Should
+  TeamSpeak refuse that move too, the bridge kicks them from the channel
+  (to TeamSpeak's default one) rather than retry. The default channel itself
+  is not checked: a server that denies Member `connect` there leaves arriving
+  TeamSpeak users in it, unheard.
 - `speak` and moderators' mutes: Gwar users never hear a TeamSpeak user who
   may not speak there or was muted for everyone: the SFU drops their audio
-  like anyone's.
+  like anyone's, and they do not show as talking.
+- Deafening for everyone is refused for TeamSpeak users: they hear Gwar
+  through the puppets in their TeamSpeak channel, which a deafen does not
+  reach.
 - Not yet: TeamSpeak users in the same TeamSpeak channel still hear each
   other directly through the TeamSpeak server. Closing that needs the bridge
   to set the channel's needed talk power and mark who may talk

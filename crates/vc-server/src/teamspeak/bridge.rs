@@ -261,6 +261,9 @@ struct Bridge<'a> {
     query_clid: Option<u64>,
     /// Encrypted channels whose join power was set since the bridge started.
     locked: HashSet<u64>,
+    /// TeamSpeak users a refused move left in place, with that channel: a second refusal there
+    /// means our side will not take them in it either.
+    held: HashMap<u16, u64>,
 }
 
 /// Runs `channelcreate` and lets the stock Server Admin power manage the
@@ -347,6 +350,7 @@ impl<'a> Bridge<'a> {
             descriptions: HashMap::new(),
             query_clid: None,
             locked: HashSet::new(),
+            held: HashMap::new(),
         };
         let result = bridge.serve(&mut notifications, &mut puppet_rx, &mut listener_rx, ready).await;
         // Hand the TeamSpeak users back; the next attach starts from scratch.
@@ -668,6 +672,7 @@ impl<'a> Bridge<'a> {
     }
 
     async fn remove_remote(&mut self, clid: u16, reason: LeaveReason) {
+        self.held.remove(&clid);
         if let Some(remote) = self.remotes.remove(&clid) {
             self.shared.forget(clid);
             self.core.bridge(BridgeMsg::Leave(remote.session, reason)).await;
@@ -968,7 +973,8 @@ impl<'a> Bridge<'a> {
             Event::ClientUpdated(client) => {
                 // An admin of ours moved a TeamSpeak user.
                 let Some((clid, remote)) = self.remote_by_session(client.id) else { return };
-                let Some(cid) = client.channel.and_then(|c| self.map.ts(c)).filter(|cid| *cid != remote.cid) else {
+                let (session, current) = (remote.session, remote.cid);
+                let Some(cid) = client.channel.and_then(|c| self.map.ts(c)).filter(|cid| *cid != current) else {
                     return;
                 };
                 self.shared.forget(clid);
@@ -979,8 +985,27 @@ impl<'a> Bridge<'a> {
                     // reconcile core participation and mint a fresh mirror route.
                     match self.query.call(Cmd::new("clientinfo").arg("clid", clid)).await {
                         Ok(records) => {
-                            if let Some(cid) = records.first().and_then(|r| r.get("cid")).and_then(|v| v.parse().ok()) {
+                            let Some(cid) = records.first().and_then(|r| r.get("cid")).and_then(|v| v.parse().ok())
+                            else {
+                                return;
+                            };
+                            if self.held.get(&clid) == Some(&cid) {
+                                // Our side refused this channel and TeamSpeak refuses the way
+                                // back: out of the channel, unheard meanwhile (no mirror).
+                                self.held.remove(&clid);
+                                let kick = Cmd::new("clientkick").arg("clid", clid).arg("reasonid", 4);
+                                if let Err(e) = self.query.call(kick).await {
+                                    warn!(clid, "TeamSpeak channel kick: {e:#}");
+                                }
+                            } else {
+                                self.held.insert(clid, cid);
                                 self.client_moved(clid, cid).await;
+                                // Taken in there after all (an admin's move undone): nothing held.
+                                if self.core.audio_origin(session).await.map(|o| o.channel)
+                                    == Some(self.our_channel(cid))
+                                {
+                                    self.held.remove(&clid);
+                                }
                             }
                         }
                         Err(e) => warn!(clid, "TeamSpeak refused move reconciliation: {e:#}"),
@@ -1150,6 +1175,7 @@ impl<'a> Bridge<'a> {
                     ) else {
                         continue;
                     };
+                    self.held.remove(&clid);
                     self.client_moved(clid, cid).await;
                 }
             }
@@ -1429,6 +1455,11 @@ mod tests {
     /// A ServerQuery that answers `channelcreate` with cid 42 and refuses
     /// `channeladdperm` when `refuse` is set; returns the commands it got.
     async fn channel_query(refuse: bool) -> (Query, Arc<std::sync::Mutex<Vec<String>>>) {
+        channel_query_at(refuse, 10).await
+    }
+
+    /// The same, with `clientinfo` placing the client in `cid`.
+    async fn channel_query_at(refuse: bool, cid: u64) -> (Query, Arc<std::sync::Mutex<Vec<String>>>) {
         use tokio::{
             io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
             net::TcpListener,
@@ -1447,7 +1478,7 @@ mod tests {
                 seen.lock().unwrap().push(line);
                 let reply = match name.as_str() {
                     "clientmove" if refuse => "error id=2568 msg=insufficient\\sclient\\spermissions\n\r",
-                    "clientinfo" => "cid=10\n\rerror id=0 msg=ok\n\r",
+                    "clientinfo" => &format!("cid={cid}\n\rerror id=0 msg=ok\n\r"),
                     "channelcreate" => "cid=42\n\rerror id=0 msg=ok\n\r",
                     "channeladdperm" if refuse => "error id=2568 msg=insufficient\\sclient\\spermissions\n\r",
                     _ => "error id=0 msg=ok\n\r",
@@ -1507,6 +1538,7 @@ mod tests {
             descriptions: HashMap::new(),
             query_clid: None,
             locked: HashSet::new(),
+            held: HashMap::new(),
         };
         bridge.map.link(1, 10);
         bridge.map.link(2, 20);
@@ -1561,6 +1593,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_refused_way_back_ends_in_a_channel_kick_not_a_loop() {
+        use crate::{
+            core::expiry_tests::test_core_teamspeak,
+            media::{MediaPlane, Routing},
+            store::{MEMBER_GROUP, Store},
+        };
+
+        let store = Store::in_memory().unwrap();
+        store.init_server_chat(false).unwrap();
+        let deny = vc_proto::ChannelOverride {
+            role: Some(MEMBER_GROUP),
+            user: None,
+            allow: vec![],
+            deny: vec![vc_proto::Permission::Connect],
+        };
+        store.set_channel_overrides(2, &[deny]).unwrap();
+        let core = test_core_teamspeak(store).unwrap();
+        let (notes, mut receiver) = mpsc::unbounded_channel();
+        core.bridge(BridgeMsg::Attach(notes)).await;
+        let BridgeNote::Snapshot { server, .. } = receiver.recv().await.unwrap() else { panic!("snapshot") };
+        let (webrtc, _media) = mpsc::channel(8);
+        let plane = MediaPlane {
+            routing: Arc::new(arc_swap::ArcSwap::from_pointee(Routing::default())),
+            sinks: Arc::default(),
+            uplinks: Arc::default(),
+            webrtc,
+        };
+        // TeamSpeak refuses every move and keeps the user in 20 (our 2, closed to them).
+        let (query, commands) = channel_query_at(true, 20).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut identities = Identities::load(&dir.path().join("identities.json")).unwrap();
+        let (puppet_events, _puppets) = mpsc::channel(8);
+        let (listener_events, _listeners) = mpsc::channel(8);
+        let mut bridge = Bridge {
+            query,
+            core: core.clone(),
+            shared: Arc::new(Shared::new(core.clone(), plane)),
+            voice: "127.0.0.1:1".parse().unwrap(),
+            public_url: None,
+            identities: &mut identities,
+            puppet_uids: HashSet::new(),
+            map: ChannelMap::load(&dir.path().join("channels.json")).unwrap(),
+            ts: HashMap::new(),
+            channels: BTreeMap::new(),
+            server: Some(server),
+            locals: HashMap::new(),
+            remotes: HashMap::new(),
+            puppet_clids: HashMap::new(),
+            puppet_events,
+            puppet_group: None,
+            listeners: ChannelListeners::new("127.0.0.1:1".parse().unwrap(), "p".into(), listener_events),
+            descriptions: HashMap::new(),
+            query_clid: None,
+            locked: HashSet::new(),
+            held: HashMap::new(),
+        };
+        bridge.map.link(1, 10);
+        bridge.map.link(2, 20);
+        let session = core
+            .remote_join(RemoteClient {
+                uid: "ts:held".into(),
+                nickname: "remote".into(),
+                channel: 1,
+                platform: Platform::Desktop,
+                muted: false,
+                deafened: false,
+                away: None,
+            })
+            .await
+            .unwrap();
+        bridge.remotes.insert(7, remote(session, 10));
+        commands.lock().unwrap().clear();
+        // They walk into 20 on TeamSpeak: our side refuses and asks for them back, twice at most.
+        bridge.client_moved(7, 20).await;
+        let mut corrections = 0;
+        while let Ok(Some(note)) = tokio::time::timeout(Duration::from_millis(200), receiver.recv()).await {
+            if let BridgeNote::Event(event) = note
+                && matches!(*event, Event::ClientUpdated(ref c) if c.id == session)
+            {
+                corrections += 1;
+                assert!(corrections <= 2, "the correction loops");
+                bridge.on_event(*event).await;
+            }
+        }
+        assert_eq!(corrections, 2);
+        assert_eq!(core.audio_origin(session).await.unwrap().channel, 1);
+        assert!(commands.lock().unwrap().iter().any(|c| c.starts_with("clientkick clid=7 reasonid=4")));
+        // Unheard in the meantime: no route mirrors them from 20 as if they were in 1.
+        assert!(!bridge.shared.mirrors.read().unwrap().contains_key(&7));
+    }
+
+    #[tokio::test]
     async fn relay_server_chat_checks_its_permanent_mode_before_sending_to_query() {
         use crate::{
             core::expiry_tests::test_core_teamspeak,
@@ -1608,6 +1732,7 @@ mod tests {
             descriptions: HashMap::new(),
             query_clid: None,
             locked: HashSet::new(),
+            held: HashMap::new(),
         };
         let message = ChatMessage {
             id: 1,

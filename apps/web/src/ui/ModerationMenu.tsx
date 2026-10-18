@@ -2,6 +2,7 @@ import * as ContextMenu from "@radix-ui/react-context-menu";
 import { Ban, Pencil, ChevronRight, HeadphoneOff, MicOff, ShieldCheck, UserMinus, UserX } from "lucide-react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
+import { isTeamSpeak } from "../lib/platform";
 import { canActOn, canGiveGroup, ADMIN_GROUP, MEMBER_GROUP, orderedGroups, toggleGroup } from "../lib/permissions";
 import { controller } from "../state/controller";
 import { useSession, useUi, type PersonRef } from "../state/stores";
@@ -98,13 +99,16 @@ export function ModerationItems({ person, groups }: { person: PersonRef; groups:
           >
             <MicOff className="size-4" /> {t(target!.server_muted ? "mod.unmuteAll" : "mod.muteAll")}
           </ContextMenu.Item>
-          <ContextMenu.Item
-            className={menuItem}
-            disabled={stronger}
-            onSelect={() => void controller.attempt(controller.setVoiceFor(person.session!, { deafened: !target!.server_deafened }))}
-          >
-            <HeadphoneOff className="size-4" /> {t(target!.server_deafened ? "mod.undeafenAll" : "mod.deafenAll")}
-          </ContextMenu.Item>
+          {/* A TeamSpeak user hears through the puppets, which a deafen does not reach (docs/roles.md). */}
+          {!isTeamSpeak(target!.platform) && (
+            <ContextMenu.Item
+              className={menuItem}
+              disabled={stronger}
+              onSelect={() => void controller.attempt(controller.setVoiceFor(person.session!, { deafened: !target!.server_deafened }))}
+            >
+              <HeadphoneOff className="size-4" /> {t(target!.server_deafened ? "mod.undeafenAll" : "mod.deafenAll")}
+            </ContextMenu.Item>
+          )}
         </>
       )}
       {showKick && (

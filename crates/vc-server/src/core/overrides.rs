@@ -270,6 +270,10 @@ impl Core {
         if client == session {
             return Err(err(ErrorCode::BadRequest, "mute or deafen yourself instead"));
         }
+        // A TeamSpeak user hears through the bridge's puppets, which a deafen does not reach.
+        if deafened.is_some() && target.out.is_none() {
+            return Err(err(ErrorCode::BadRequest, "TeamSpeak users cannot be deafened from here"));
+        }
         self.require_in(session, channel, Permission::MuteMembers)?;
         if !self.outranks(session, &target.uid, &target.groups) {
             return Err(err(ErrorCode::Forbidden, "this member is not below your rank"));

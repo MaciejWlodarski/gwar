@@ -602,6 +602,10 @@ impl Core {
                 }) {
                     return;
                 }
+                // Someone not heard (muted, or without `speak`) shows no talking either.
+                if talking && !self.routing.load().can_speak(session) {
+                    return;
+                }
                 if let Some(s) = self.sessions.get_mut(&session).filter(|s| s.talking != talking) {
                     s.talking = talking;
                     if let Some(binding) = s.participation.as_ref().map(|p| p.binding.clone()) {
@@ -887,7 +891,7 @@ impl Core {
         }
     }
 
-    fn publish_routing(&self) {
+    fn publish_routing(&mut self) {
         self.voice_bindings.store(Arc::new(
             self.sessions
                 .values()
@@ -913,6 +917,17 @@ impl Core {
             })
             .collect();
         self.routing.store(Arc::new(Routing { members }));
+        // Those no longer heard stop showing as talking.
+        let routing = self.routing.load();
+        let silenced: Vec<_> =
+            self.sessions.values().filter(|s| s.talking && !routing.can_speak(s.id)).map(|s| s.id).collect();
+        for session in silenced {
+            let s = self.sessions.get_mut(&session).expect("listed above");
+            s.talking = false;
+            if let Some(binding) = s.participation.as_ref().map(|p| p.binding.clone()) {
+                self.broadcast(Event::VoiceTalking { binding, client: session, talking: false }, |_| true);
+            }
+        }
     }
 
     /// Runs `work` on the blocking pool, then `then` back on the actor.
@@ -3122,5 +3137,14 @@ mod voice_rights_tests {
             .await;
         let channel = on_core(&core, move |core| core.sessions[&walker].channel).await;
         assert_eq!(channel, Some(server.default_channel));
+
+        // Not heard, so not shown talking either.
+        let origin = core.audio_origin(speaker).await.unwrap();
+        core.talking_origin(&origin, true);
+        assert!(!on_core(&core, move |core| core.sessions[&speaker].talking).await);
+
+        // A deafen would not reach a TeamSpeak user's ears (the puppets): refused, not pretended.
+        let refused = on_core(&core, move |core| core.client_voice(walker, speaker, None, Some(true))).await;
+        assert_eq!(refused.unwrap_err().code, ErrorCode::BadRequest);
     }
 }
