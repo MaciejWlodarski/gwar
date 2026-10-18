@@ -23,6 +23,10 @@ pub const MAX_RECIPIENTS: usize = 64;
 pub const MAX_RECORD_PLAINTEXT: usize = 512;
 /// A manifest's size limit (64 recipients, many revocations).
 pub const MAX_MANIFEST_BYTES: usize = 256 * 1024;
+/// A transfer's size limit (a statement, a certificate and one sealed key).
+pub const MAX_TRANSFER_BYTES: usize = 4096;
+/// A record's size limit: nonce, the largest plaintext and the tag.
+pub const MAX_RECORD_BYTES: usize = 12 + MAX_RECORD_PLAINTEXT + 16;
 const MAX_CERTIFICATE_MS: i64 = 90 * 86_400_000;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -676,7 +680,7 @@ pub fn open_record(
     record_id: &[u8; 16],
     data: &[u8],
 ) -> Result<RecordKey> {
-    if data.len() < 28 {
+    if data.len() < 28 || data.len() > MAX_RECORD_BYTES {
         return Err(ArchiveError::Open);
     }
     let plaintext = RustCrypto::default()
@@ -800,6 +804,7 @@ impl Transfer {
         );
         let signature = b64(&sender.sign(statement.as_bytes()).to_bytes());
         let bytes = netstrings(&[statement.as_bytes(), signature.as_bytes(), &certificate, &sealed]);
+        // What a reader accepts (including its size), the sender produced.
         Self::parse(&bytes, account_key)?;
         Ok(bytes)
     }
@@ -808,6 +813,9 @@ impl Transfer {
     /// embedded certificate covering its time, the sealed key bound by its hash. Whether the
     /// manifest is one the reader accepted, and the sender's revocation, are the caller's.
     pub fn parse(bytes: &[u8], account_key: &str) -> Result<Self> {
+        if bytes.len() > MAX_TRANSFER_BYTES {
+            return Err(Invalid("transfer size"));
+        }
         let [statement, signature, certificate, sealed] = parse_netstrings(bytes, 4).ok_or(Invalid("transfer"))?[..]
         else {
             return Err(Invalid("transfer"));

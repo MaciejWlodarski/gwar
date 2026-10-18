@@ -154,6 +154,8 @@ fn records_are_bound_to_their_account_generation_and_id() {
     assert!(open_record(&key, &account_key(), 2, &id, &data).is_err());
     assert!(open_record(&key, &account_key(), 1, &[0; 16], &data).is_err());
     assert!(open_record(&key, &public(&key_of(2)), 1, &id, &data).is_err());
+    // Oversized data is refused before decryption.
+    assert_eq!(open_record(&key, &account_key(), 1, &id, &vec![0; MAX_RECORD_BYTES + 1]), Err(ArchiveError::Open));
 }
 fn key_of(seed: u8) -> SigningKey {
     key(seed)
@@ -185,6 +187,10 @@ fn a_transfer_gives_one_generation_key_to_one_recipient() {
     let [statement, signature, cert, _] = parse_netstrings(&t, 4).unwrap()[..] else { panic!() };
     let forged = netstrings(&[statement, signature, cert, &seal_to(&b.public, b"x", b"y", &[0; 32]).unwrap()]);
     assert_eq!(Transfer::parse(&forged, &account_key()), Err(Invalid("transfer binding")));
+    // Size before parsing, and no extra fields.
+    assert_eq!(Transfer::parse(&b"0:,".repeat(MAX_TRANSFER_BYTES), &account_key()), Err(Invalid("transfer size")));
+    let extra = [t.as_slice(), b"0:,"].concat();
+    assert_eq!(Transfer::parse(&extra, &account_key()), Err(Invalid("transfer")));
     // A recovery recipient.
     let (secret, public_key) = recovery_key_pair(&[7; 20], &account().verifying_key().to_bytes());
     let t = Transfer::create(
