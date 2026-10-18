@@ -2925,14 +2925,21 @@ Changing the recovery code (password and a signed-in device, as today):
    then does it go on; otherwise the change failed and may be tried again
    with the same code. (The credential version cannot tell: a password change
    moves it too.)
-3. It signs the next version's recovery archive key statement, stores it in
-   its Connect record and publishes it (`PUT /v1/archive/recovery`; the key
-   archive retries a failed publish, and drops it once a newer version
-   holds). The key archive then sees a new recovery version: every
+3. It signs the next version's recovery archive key statement (before step
+   2, so nothing can fail between Connect taking the code and keeping its
+   key), stores it in its Connect record with the recovery credential
+   version the change left, and publishes it (`PUT /v1/archive/recovery`).
+   A key that could not be published stays pending: the key archive
+   publishes it only while the credential version `POST /v1/challenges`
+   reports is still that one (then its code is the current one), and drops
+   it otherwise (a missing key is safe; a key for a code nobody holds is
+   not; device clocks never decide). If another key took its version, the
+   next flow with the password signs it again at the next version, under
+   the same check. The key archive then sees a new recovery version: every
    generation it opened that is not sealed to it is owed a transfer, and no
    generation is safe until it makes the next one, sealed to the new version.
 
-Sign-up signs version 1 the same way and the key archive publishes it.
+Sign-up signs version 1 the same way (credential version 0) and the key archive publishes it.
 Restoring with the recovery code (`POST /v1/recover`) derives the recovery
 archive key, which the new device keeps until its first archive sync: it
 opens every generation sealed or transferred to the newest recovery version

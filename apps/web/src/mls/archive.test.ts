@@ -173,13 +173,13 @@ describe("key archive", () => {
     expect(transferGeneration(enc.encode("garbage"))).toBeNull();
   });
 
-  it("keeps a newer pending key whose version an older one took, and signs it again with the password", async () => {
+  it("keeps a pending key for the current code whose version another took, and signs it again with the password", async () => {
     const { service, deps, store } = setup();
     const created = await createAccount({ handle: "erin", password: "correct horse battery" }, deps());
     await store.save(created.record);
     const pending = created.record.archiveRecovery!;
     const [, account, , x25519, at] = pending.statement.split("\n");
-    // Another device published an older code's key at version 1 first.
+    // Another key took version 1 while the credentials are still as this code's change left them.
     service.archive.set("erin", { devices: new Map(), recovery: [{ statement: `gwar archive recovery v1\n${account}\n1\n${"A".repeat(43)}\n${Number(at) - 1000}`, signature: "older" }], manifests: new Map(), records: [], transfers: [] });
     const laptop = await device(service, deps, created.record);
     // (The fake's older key is unsigned, so the sync after publishing refuses it.)
@@ -190,5 +190,16 @@ describe("key archive", () => {
     expect(renewed.archiveRecovery).toBeUndefined();
     const keys = service.archive.get("erin")!.recovery;
     expect(keys.map(k => k.statement.split("\n").slice(2, 4))).toEqual([["1", "A".repeat(43)], ["2", x25519]]);
+  });
+
+  it("drops a pending key once the recovery credentials changed since", async () => {
+    const { service, deps } = setup();
+    const created = await createAccount({ handle: "frank", password: "correct horse battery" }, deps());
+    // Another device changed the code meanwhile (credential version 1), without publishing yet.
+    service.accounts.get("frank")!.credential_version = 1;
+    const laptop = await device(service, deps, created.record);
+    await laptop.archive.pass();
+    expect(laptop.record.archiveRecovery).toBeUndefined();
+    expect(service.archive.get("frank")?.recovery ?? []).toEqual([]);
   });
 });

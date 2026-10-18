@@ -84,6 +84,8 @@ async function credentialAuthorization(api: ConnectApi, token: string, account: 
 }
 
 /** Renew only a key whose private half is held on this device. */
+type PendingRecovery = NonNullable<ConnectRecord["archiveRecovery"]>;
+
 async function withAccountKey(
   account: KeyPairJwk,
   token: string,
@@ -105,18 +107,23 @@ async function withAccountKey(
 
 /**
  * With the account key at hand, a recovery archive key this device could not publish (see
- * `KeyArchive.publishRecovery`): published, or signed again at the next version when another
- * device took its version for an older code. Returns what is still pending (nothing once done).
+ * `KeyArchive.publishRecovery`). Its code is the current one only while the recovery credentials
+ * are as its change left them (`credential`): then it is published, or signed again at the next
+ * version if another key took its version; otherwise it is dropped (a missing key is safe, a key
+ * for a code nobody holds is not). Returns what is still pending (nothing once settled).
  */
-async function settleRecoveryKey(api: ConnectApi, token: string, account: KeyPairJwk, pending: ArchiveStatement): Promise<ArchiveStatement | undefined> {
+async function settleRecoveryKey(api: ConnectApi, token: string, account: KeyPairJwk, pending: PendingRecovery): Promise<PendingRecovery | undefined> {
   try {
+    const { credential_version } = await api.challenge(token, "recovery");
+    if (credential_version !== pending.credential) return undefined;
     const newest = (await api.archiveRecovery(token)).at(-1);
     if (newest?.statement === pending.statement) return undefined;
-    const [, , , x25519, createdAt] = pending.statement.split("\n");
-    // A newer code's key holds that version: this one is obsolete.
-    if (newest && Number(newest.statement.split("\n")[4]) > Number(createdAt)) return undefined;
-    const statement = recoveryArchiveStatement(account.publicKey, recoveryVersion(newest?.statement ?? "") + 1, x25519!, Date.now());
-    const key = { statement, signature: await signText(account.jwk, statement) };
+    let key: ArchiveStatement = { statement: pending.statement, signature: pending.signature };
+    if (newest && recoveryVersion(newest.statement) >= recoveryVersion(pending.statement)) {
+      const x25519 = pending.statement.split("\n")[3]!;
+      const statement = recoveryArchiveStatement(account.publicKey, recoveryVersion(newest.statement) + 1, x25519, Date.now());
+      key = { statement, signature: await signText(account.jwk, statement) };
+    }
     await api.putArchiveRecovery(token, key);
     return undefined;
   } catch {
@@ -191,8 +198,9 @@ export class PreparedAccount {
       body: { handle: this.handle, ...this.body },
       record: (token) => ({
         ...recordOf(this.handle, this.body.account_key, this.device, certificateOf(this.body.account_key, this.cert), this.deviceName, token, this.vaultKey),
-        // Version 1 of the recovery archive key, published by the key archive.
-        archiveRecovery: this.archiveRecovery,
+        // Version 1 of the recovery archive key, published by the key archive (credentials as set
+        // at registration: version 0).
+        archiveRecovery: { ...this.archiveRecovery, credential: 0 },
       }),
     };
   }
@@ -381,17 +389,20 @@ export async function changeRecoveryCode(record: ConnectRecord, password: string
   // the code, nothing that can fail stands between that and keeping the key to publish.
   const newest = Math.max(0, ...(await deps.api.archiveRecovery(opened.token)).map(k => recoveryVersion(k.statement)));
   const key = await signedRecoveryKey(account, bytes, newest + 1, Date.now());
+  const authorization = await credentialAuthorization(deps.api, opened.token, account, "recovery", null, auth, blob);
+  // The credentials as this change leaves them: its key stays current only while they are.
+  let credential = authorization.credential_version + 1;
   try {
-    await deps.api.changeRecovery(opened.token, { recovery_auth: auth, recovery_blob: blob,
-      ...await credentialAuthorization(deps.api, opened.token, account, "recovery", null, auth, blob) });
+    await deps.api.changeRecovery(opened.token, { recovery_auth: auth, recovery_blob: blob, ...authorization });
   } catch (error) {
     // A definite refusal: nothing changed. Otherwise only the new code itself tells.
     if (error instanceof ConnectApiError && error.kind !== "network" && error.kind !== "server") throw error;
     const took = await deps.api.recover(record.handle, auth).then(() => true, () => false);
     if (!took) throw error;
+    credential = (await deps.api.challenge(opened.token, "recovery")).credential_version;
   }
   // The new code works: its recovery archive key, kept until published (the key archive retries).
-  const pending = await saveUnlocked(record, { ...opened, archiveRecovery: key }, deps);
+  const pending = await saveUnlocked(record, { ...opened, archiveRecovery: { ...key, credential } }, deps);
   try {
     await deps.api.putArchiveRecovery(opened.token, key);
   } catch {
