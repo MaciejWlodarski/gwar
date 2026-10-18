@@ -59,6 +59,7 @@ export interface ResponseMap {
   ping: Empty;
   "client.update": Empty;
   "client.move": Empty;
+  "client.voice": Empty;
   "client.kick": Empty;
   "channel.join": Empty;
   "channel.leave": Empty;

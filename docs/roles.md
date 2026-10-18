@@ -1,6 +1,6 @@
 # Roles and permissions, version 2
 
-Status: steps 1 (ranks) and 2 (overrides) built; steps 3–4 designed. Replaces the flat role model.
+Status: steps 1 (ranks), 2 (overrides) and 3 (voice; TeamSpeak talk power still open) built; step 4 designed. Replaces the flat role model.
 
 ## Why
 
@@ -150,18 +150,22 @@ One rule replaces "nobody acts on someone holding permissions they lack":
 
 ## TeamSpeak
 
-The bridge mirrors the result for official TeamSpeak clients (the core stays
-the authority):
+The core stays the authority for official TeamSpeak clients too:
 
-- Private channels are not mirrored (as today).
-- `connect` and `speak` become the TeamSpeak channel's needed join and talk
-  power. Each Gwar role a TeamSpeak user (`ts:<uid>`) holds is mirrored as a
-  TeamSpeak server group `Gwar: <role>` carrying the join and talk power that
-  role's allows need, and the bridge keeps their membership in sync.
-- Puppets (Gwar users on TeamSpeak) keep powers above any channel's: the core
-  already decided for them.
-- Moderation from a TeamSpeak client is not supported: TeamSpeak users with
-  Gwar roles moderate from the Gwar app.
+- Private channels are not mirrored (as before).
+- `connect`: a TeamSpeak user who arrives in, or moves into, a channel they
+  may not join stays where they were in Gwar (the default channel on
+  arrival), and the bridge moves them back there on TeamSpeak.
+- `speak` and moderators' mutes: Gwar users never hear a TeamSpeak user who
+  may not speak there or was muted for everyone: the SFU drops their audio
+  like anyone's.
+- Not yet: TeamSpeak users in the same TeamSpeak channel still hear each
+  other directly through the TeamSpeak server. Closing that needs the bridge
+  to set the channel's needed talk power and mark who may talk
+  (`client_is_talker`), tested against the official server in CI.
+- Puppets (Gwar users on TeamSpeak) follow the core; moderation from a
+  TeamSpeak client is not supported: TeamSpeak users with Gwar roles moderate
+  from the Gwar app.
 
 This is also what the TeamSpeak importer ([teamspeak-import.md](teamspeak-import.md))
 needs: join and talk power, channel admins and the group order map onto
@@ -215,8 +219,9 @@ Member once, so existing members keep joining, talking and writing.
    permissions UI, and `connect`, `send_messages` and per-channel
    `attach_files`, `manage_messages`, `move_members`, `bypass_password` and
    `manage_channels` enforced.
-3. **Voice and TeamSpeak**: `speak` and `mute_members` in the SFU, the
-   bridge's mirrored groups and powers.
+3. **Voice and TeamSpeak**: `speak` and `mute_members` (`client.voice`) in
+   the SFU, TeamSpeak users kept out of channels they may not join; the
+   bridge's talk power is the remaining part.
 4. **Then the importer**, onto this model.
 
 Each step changes authorization, so each goes to an independent review before

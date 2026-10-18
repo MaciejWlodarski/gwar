@@ -14,6 +14,7 @@ export const CHANNEL_PERMISSIONS: Permission[] = [
   "move_members",
   "bypass_password",
   "manage_channels",
+  "mute_members",
 ];
 
 /** The channel whose overrides apply in `id`: itself, or its nearest unsynced ancestor. */

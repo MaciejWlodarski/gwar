@@ -1545,6 +1545,8 @@ mod tests {
                 talking: false,
                 voice: true,
                 voice_binding: Some(moved.binding.clone()),
+                server_muted: false,
+                server_deafened: false,
             }))
             .await;
         let restored = core.audio_origin(session).await.unwrap();

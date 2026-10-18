@@ -2,12 +2,20 @@
 import type { Platform } from "./Platform";
 import type { VoiceBinding } from "./VoiceBinding";
 
-export type Client = { id: number, uid: string, nickname: string,
+export type Client = { id: number, uid: string, nickname: string, 
 /**
  * Voice channel; `None` while on the server without being in voice.
  */
-channel: number | null, groups: Array<number>, platform: Platform, muted: boolean, deafened: boolean, away: string | null, talking: boolean,
+channel: number | null, groups: Array<number>, platform: Platform, muted: boolean, deafened: boolean, away: string | null, talking: boolean, 
 /**
  * Whether the client currently has a connected audio transport.
  */
-voice: boolean, voice_binding: VoiceBinding | null, };
+voice: boolean, voice_binding: VoiceBinding | null, 
+/**
+ * Muted for everyone by a moderator (`client.voice`).
+ */
+server_muted?: boolean, 
+/**
+ * Deafened for everyone by a moderator: hears nothing.
+ */
+server_deafened?: boolean, };

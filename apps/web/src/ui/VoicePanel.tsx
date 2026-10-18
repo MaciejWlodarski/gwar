@@ -6,7 +6,7 @@ import { controller, describeVoiceError } from "../state/controller";
 import { canOpenMicrophoneSettings, openMicrophoneSettings } from "../platform";
 import { useSettings } from "../state/settings";
 import { useSession, useVoice } from "../state/stores";
-import { useMe, keyLabel, modKey } from "./hooks";
+import { useChannelPermission, useMe, keyLabel, modKey } from "./hooks";
 import { Button, IconButton, TalkingAvatar } from "./kit";
 import { ConnectBadge } from "./badges";
 
@@ -104,6 +104,7 @@ export function VoicePanel() {
   const phase = useSession((s) => s.phase);
   // TeamSpeak servers always keep you in a channel: there is nothing to leave.
   const canLeave = useSession((s) => s.kind === "vc");
+  const canSpeak = useChannelPermission(me?.channel ?? null, "speak");
 
   if (me && me.channel === null) {
     return (
@@ -136,6 +137,14 @@ export function VoicePanel() {
               ? { tone: encryption || encryptedChannel ? "muted" : "danger", text: t("voice.failed") }
               : { tone: "warn", text: t("voice.connecting") };
   const unavailable = voiceState === "failed" || encryption === "failed";
+  // Nobody hears me: a moderator muted or deafened me, or this channel does not let me speak.
+  const silencedNote = me?.server_deafened
+    ? t("voice.serverDeafened")
+    : me?.server_muted
+      ? t("voice.serverMuted")
+      : !canSpeak
+        ? t("voice.cannotSpeak")
+        : null;
   const tone = cn(
     status.tone === "ok" && "text-ok",
     status.tone === "warn" && "text-warn",
@@ -176,6 +185,12 @@ export function VoicePanel() {
           <button className="ml-1 cursor-pointer font-medium underline underline-offset-2" onClick={() => void controller.retryMic()}>
             {t("voice.retryMic")}
           </button>
+        </div>
+      )}
+      {silencedNote && (
+        <div role="status" className="flex items-center gap-1.5 rounded-md bg-warn/10 px-2 py-1.5 text-xs text-warn">
+          <MicOff aria-hidden className="size-3.5 shrink-0" />
+          <span className="min-w-0">{silencedNote}</span>
         </div>
       )}
       <SelfRow sub={me?.away ? <span className="truncate">{me.away}</span> : null} />

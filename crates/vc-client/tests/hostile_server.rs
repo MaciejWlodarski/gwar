@@ -23,6 +23,8 @@ fn server_pk() -> String {
 fn client(id: u32, uid: &str) -> Client {
     Client {
         voice_binding: None,
+        server_muted: false,
+        server_deafened: false,
         id,
         uid: uid.into(),
         nickname: format!("c{id}"),

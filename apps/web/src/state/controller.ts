@@ -1296,6 +1296,11 @@ class Controller {
     return this.connection.request("channel.update", u);
   }
 
+  /** Mutes or deafens someone for everyone (a moderator's `mute_members`); absent fields stay. */
+  setVoiceFor(client: number, change: { muted?: boolean; deafened?: boolean }) {
+    return this.connection.request("client.voice", { client, ...change });
+  }
+
   /** Sets one role's or person's override in a channel; empty allow and deny remove it. */
   setChannelOverride(channel: number, entry: ChannelOverride) {
     return this.connection.request("channel.override", { channel, override: entry });

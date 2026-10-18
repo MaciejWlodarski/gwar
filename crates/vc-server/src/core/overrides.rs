@@ -248,6 +248,48 @@ impl Core {
         for session in affected {
             let _ = self.channel_leave(session);
         }
+        // Who may speak can have changed as well: the SFU follows.
+        self.publish_routing();
+    }
+
+    /// Mutes or deafens someone for everyone (docs/roles.md, `mute_members`): needs the permission in
+    /// their channel and a rank above theirs. Lasts for their connection.
+    pub(super) fn client_voice(
+        &mut self,
+        session: SessionId,
+        client: SessionId,
+        muted: Option<bool>,
+        deafened: Option<bool>,
+    ) -> Reply {
+        let Some(target) = self.sessions.get(&client) else {
+            return Err(err(ErrorCode::NotFound, "no such client"));
+        };
+        let Some(channel) = target.channel else {
+            return Err(err(ErrorCode::BadRequest, "this person is not in voice"));
+        };
+        if client == session {
+            return Err(err(ErrorCode::BadRequest, "mute or deafen yourself instead"));
+        }
+        self.require_in(session, channel, Permission::MuteMembers)?;
+        if !self.outranks(session, &target.uid, &target.groups) {
+            return Err(err(ErrorCode::Forbidden, "this member is not below your rank"));
+        }
+        let s = self.sessions.get_mut(&client).expect("checked above");
+        if let Some(muted) = muted {
+            s.server_muted = muted;
+        }
+        if let Some(deafened) = deafened {
+            s.server_deafened = deafened;
+        }
+        self.client_updated(client);
+        self.publish_routing();
+        Ok(Response::Empty {})
+    }
+
+    /// Whether a remote (TeamSpeak) session may be in `channel`'s voice; if not, the bridge
+    /// is told to put it back (see `bridge_corrections`).
+    pub(super) fn remote_may_join(&self, uid: &str, groups: &[GroupId], channel: ChannelId) -> bool {
+        self.channel_permissions(uid, groups, channel).contains(&Permission::Connect)
     }
 
     /// Drops a deleted role's overrides (the database already did) and tells those who see them.

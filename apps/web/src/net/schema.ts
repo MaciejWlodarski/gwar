@@ -55,7 +55,7 @@ const id = int();
 const text = str(4096);
 const uid: Rule<string> = (v): v is string => str(128)(v) && v.length > 0 && v !== "prototype" && !Object.hasOwn(Object.prototype, v);
 const ids = array(id, 128);
-const permissions = literal<Permission>(["administrator", "manage_server", "manage_roles", "manage_members", "kick_members", "ban_members", "create_invites", "bypass_password", "attach_files", "manage_messages", "move_members", "manage_channels", "connect", "speak", "send_messages"]);
+const permissions = literal<Permission>(["administrator", "manage_server", "manage_roles", "manage_members", "kick_members", "ban_members", "create_invites", "bypass_password", "attach_files", "manage_messages", "move_members", "manage_channels", "connect", "speak", "send_messages", "mute_members"]);
 const platform = literal<Platform>(["web", "desktop", "mobile", "ts3", "ts6"]);
 const errorCode = literal<ErrorCode>(["bad_request", "not_authenticated", "not_found", "forbidden", "wrong_password", "channel_full", "rate_limited", "conflict", "unavailable", "internal", "banned", "too_large", "quota_exceeded", "certificate_expired", "stale", "pending", "expired", "early"]);
 const path = (put = false): Rule<string> => (v): v is string => {
@@ -79,7 +79,7 @@ const serverProof = shape<ServerProof>({ server_proof: fixed(64) });
 const channelAccess = shape<ChannelAccess>({ roles: array(id, 64), users: array(uid, 1000) });
 const channelOverride = shape<ChannelOverride>({ role: optional(nullable(id)), user: optional(nullable(uid)), allow: array(permissions, 32), deny: array(permissions, 32) });
 const channel = shape<Channel>({ id, parent: nullable(id), name: str(256), topic: text, position: int(2147483647, -2147483648), has_password: bool, max_clients: nullable(int(65535)), encrypted: bool, history: bool, private: bool, access: optional(nullable(channelAccess)), overrides: optional(array(channelOverride, 100)), synced: bool });
-const client = shape<Client>({ id, uid, nickname: str(256), channel: nullable(id), groups: ids, platform, muted: bool, deafened: bool, away: nullable(text), talking: bool, voice: bool, voice_binding: nullable(voiceBinding) });
+const client = shape<Client>({ id, uid, nickname: str(256), channel: nullable(id), groups: ids, platform, muted: bool, deafened: bool, away: nullable(text), talking: bool, voice: bool, voice_binding: nullable(voiceBinding), server_muted: optional(bool), server_deafened: optional(bool) });
 const color: Rule<string> = (v): v is string => typeof v === "string" && /^#[0-9a-f]{6}$/i.test(v);
 const group = shape<Group>({ id, name: str(256), permissions: array(permissions, 32), color: optional(nullable(color)), position: int(4294967295), hoist: bool, mentionable: bool });
 const attestation = shape<HandleAttestation>({ account_key: str(128), handle: str(64), issued_at: id, expires_at: id, signature: str(128) });
@@ -160,7 +160,7 @@ export const responses: { [K in Op]: Rule<ResponseMap[K]> } = {
   "mls.history.ack": empty, "mls.history.request": empty, "mls.history.decline": empty, "mls.access.offer": empty,
   "mls.group_history": shape({ incarnations: array(shape({ group: mlsGroupId, descriptor: str(16384) }), 100), next: cursor }),
 
-  hello: serverProof, join: welcome, ping: empty, "client.update": empty, "client.move": empty, "client.kick": empty,
+  hello: serverProof, join: welcome, ping: empty, "client.update": empty, "client.move": empty, "client.voice": empty, "client.kick": empty,
   "channel.join": empty, "channel.leave": empty, "channel.create": channel, "channel.update": channel, "channel.override": channel, "channel.delete": empty,
   "chat.sealed.send": sealedMessage, "chat.sealed.edit": sealedMessage, "chat.delete_own": sealedMessage,
   "chat.sealed.history": shape({ sealed: array(sealedMessage, 100) }), "chat.sealed.remove": empty,
