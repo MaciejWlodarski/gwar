@@ -115,15 +115,20 @@ it("keeps one bookmark per server: on load, when saving, when editing and after 
   try {
     const { useSettings } = await import("./settings");
     const s = () => useSettings.getState();
-    // A list saved before servers were matched: the first stays, with the password only the other had,
-    // and the other is removed so syncing removes it elsewhere too. Another kind is another server.
-    expect(s().bookmarks).toEqual([{ id: "a", name: "Gwar", address: "gwar.app", kind: "vc", password: "secret" }, before.state.bookmarks[2]]);
+    // A list saved before servers were matched: the first stays, with the password only the other had
+    // (timed as a change, so syncing keeps it), and the other is removed so syncing removes it elsewhere
+    // too. Another kind is another server.
+    expect(s().bookmarks).toEqual([{ id: "a", name: "Gwar", address: "gwar.app", kind: "vc", password: "secret", updatedAt: 1_000 }, before.state.bookmarks[2]]);
     expect(s().removedBookmarks).toEqual({ b: { at: 1_000 } });
     expect(s().bookmarkEdits).toBe(1);
 
-    // Saving a saved server again (another spelling) updates that bookmark in its place.
+    // Saving a saved server again (another spelling) updates that bookmark in its place, keeping what
+    // the new entry leaves unsaid: its address and its password.
     s().saveBookmark({ id: "new", name: "Renamed", address: "GWAR.app:443", kind: "vc" });
-    expect(s().bookmarks.map((b) => [b.id, b.name, b.address])).toEqual([["a", "Renamed", "GWAR.app:443"], ["ts", "TS", "gwar.app"]]);
+    expect(s().bookmarks.map((b) => [b.id, b.name, b.address, b.password])).toEqual([["a", "Renamed", "gwar.app", "secret"], ["ts", "TS", "gwar.app", undefined]]);
+    // A name that is just the address is no name.
+    s().saveBookmark({ id: "new2", name: "gwar.app", address: "gwar.app", kind: "vc" });
+    expect(s().bookmarks[0]?.name).toBe("Renamed");
 
     // Editing a bookmark into another saved server replaces that one.
     s().saveBookmark({ id: "c", name: "C", address: "c.example.com", kind: "vc" });
@@ -137,12 +142,23 @@ it("keeps one bookmark per server: on load, when saving, when editing and after 
     vi.setSystemTime(3_000);
     s().replaceBookmarks([
       { id: "x", name: "X", address: "x.example.com", account: "acct", updatedAt: 10 },
-      { id: "y", name: "X", address: "wss://x.example.com/ws", account: "acct", updatedAt: 20 },
+      { id: "y", name: "X", address: "wss://x.example.com/ws", password: "pw", account: "acct", updatedAt: 20 },
       // Another account's bookmark is not shown with these and stays for its own account.
       { id: "z", name: "X", address: "x.example.com", account: "other", updatedAt: 30 },
     ]);
     expect(s().bookmarks.map((b) => b.id)).toEqual(["x", "z"]);
     expect(s().removedBookmarks.y).toEqual({ at: 3_000, account: "acct" });
+    // The password it took is newer than the vault's copy of it, so the next sync keeps it.
+    expect(s().bookmarks[0]).toMatchObject({ password: "pw", updatedAt: 3_000 });
+
+    // Signed out, another account's hidden bookmark for the same server is left alone, password and all.
+    s().setBookmarkAccount(null);
+    s().replaceBookmarks([
+      { id: "hidden", name: "Q", address: "q.example.com", password: "theirs", account: "other", updatedAt: 5 },
+    ]);
+    s().saveBookmark({ id: "mine", name: "Q", address: "wss://q.example.com/ws", kind: "vc" });
+    expect(s().bookmarks.map((b) => [b.id, b.password])).toEqual([["hidden", "theirs"], ["mine", undefined]]);
+    expect(s().removedBookmarks.hidden).toBeUndefined();
   } finally {
     vi.useRealTimers();
   }

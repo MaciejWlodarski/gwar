@@ -4,6 +4,7 @@ import { X } from "lucide-react";
 import type { ReactNode } from "react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
+import { useIsMobile } from "../lib/media";
 import { IconButton } from "./kit";
 
 export interface SettingsPage<T extends string> {
@@ -32,6 +33,7 @@ export function SettingsLayout<T extends string>({
   children: (page: T) => ReactNode;
 }) {
   const t = useT();
+  const isMobile = useIsMobile();
   const current = pages.find((p) => p.id === value);
   return (
     <DialogPrimitive.Root open onOpenChange={(o) => !o && onClose()}>
@@ -49,7 +51,7 @@ export function SettingsLayout<T extends string>({
           <Tabs.Root
             value={value}
             onValueChange={(v) => onValueChange(v as T)}
-            orientation="vertical"
+            orientation={isMobile ? "horizontal" : "vertical"}
             className="flex min-h-0 flex-1 flex-col md:flex-row"
           >
             <div className="flex shrink-0 flex-col border-line bg-side max-md:border-b md:w-56 md:border-r">
