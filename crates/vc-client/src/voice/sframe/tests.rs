@@ -334,6 +334,19 @@ fn an_install_purges_its_removed_devices_from_older_epochs_without_a_hold() {
 }
 
 #[test]
+fn checks_retention_before_choosing_a_key_not_only_on_the_sweep_timer() {
+    let (mut a, mut b) = (Engine::new(), Engine::new());
+    let one = members(1, &[(0, 0), (1, 1)]);
+    a.enter(1, 0, &one, &[]);
+    b.enter(1, 1, &one, &[]);
+    let f = a.encrypt(&OPUS).unwrap();
+    b.enter(2, 1, &members(2, &[(0, 0), (1, 1)]), &[]);
+    b.now += RETAIN;
+    assert_eq!(b.decrypt(&f), None);
+    assert_eq!(b.state.retained(), vec![2]);
+}
+
+#[test]
 fn a_device_gone_from_the_latest_tree_no_longer_retains_its_epoch() {
     let (mut a, mut b) = (Engine::new(), Engine::new());
     let one = members(1, &[(0, 0), (1, 1)]);

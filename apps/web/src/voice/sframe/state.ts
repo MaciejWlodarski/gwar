@@ -385,6 +385,8 @@ export class SframeState {
     if (frame.length < MIN_FRAME || frame.length > MAX_FRAME) { this.counters.oversize_dropped++; return null; }
     const header = decodeHeader(frame);
     if (!header) { this.counters.auth_failed++; return null; }
+    // Retention is exact: an epoch past its window opens nothing, whatever the sweep timer.
+    this.sweep();
     const low = header.kid >> 32n, leaf = Number(header.kid & 0xffffffffn);
     const newest = [...this.epochs.values()].filter(k => (k.epoch & 0xffffffffn) === low).sort((a, b) => (a.epoch > b.epoch ? -1 : 1));
     if (newest.some(k => k.ownLeaf === leaf)) { this.counters.own_kid_dropped++; return null; }
@@ -397,7 +399,9 @@ export class SframeState {
       const fence = this.removals.get(receiver.device) ?? 0;
       const plaintext = await open(receiver.key, aad, header.ctr, new Uint8Array(), body, this.options.subtle);
       if (!plaintext) continue;
-      // Recheck after the await: the run, the retained key and its device's membership.
+      // Recheck after the await: retention (the window may have closed meanwhile), the run, the
+      // retained key and its device's membership.
+      this.sweep();
       if (this.ended || this.epochs.get(keys.epoch) !== keys || keys.receivers.get(leaf) !== receiver || (this.removals.get(receiver.device) ?? 0) !== fence) {
         this.counters.no_key++; return null;
       }

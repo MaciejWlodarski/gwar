@@ -55,6 +55,28 @@ impl Storage {
 }
 
 impl Storage {
+    /// Deletes every stored key package bundle whose lifetime ended before `cutoff` (Unix
+    /// seconds), including used last-resort ones, which OpenMLS keeps.
+    pub(crate) fn prune_key_packages(&self, cutoff: u64) -> Result<(), StorageError> {
+        let mut values = self.values.write().unwrap();
+        let mut expired = Vec::new();
+        for (key, value) in values.iter() {
+            if !key.starts_with(KEY_PACKAGE_LABEL) {
+                continue;
+            }
+            let bundle: openmls::prelude::KeyPackageBundle = codec::decode(value)?;
+            if bundle.key_package().life_time().not_after() < cutoff {
+                expired.push(key.clone());
+            }
+        }
+        for key in expired {
+            values.remove(&key);
+        }
+        Ok(())
+    }
+}
+
+impl Storage {
     #[inline(always)]
     fn write<const VERSION: u16>(
         &self,

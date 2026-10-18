@@ -365,6 +365,15 @@ fn key_package_lifetimes_and_last_resort() {
     let p = f.b.last_resort_key_package(f.t).unwrap();
     f.b.take_changes();
     assert!(ds::key_package(&p).unwrap().last_resort);
+    // Private keys of expired packages, last-resort ones too, go a week after expiry.
+    let stored =
+        |a: &Agent| a.provider.storage().values.read().unwrap().keys().filter(|k| k.starts_with(b"KeyPackage")).count();
+    assert_eq!(stored(&f.b), 3);
+    let not_after = ds::key_package(&p).unwrap().not_after as i64 * 1000;
+    f.b.prune_key_packages(not_after + 7 * 86_400_000 - 1000).unwrap();
+    assert_eq!(stored(&f.b), 3);
+    f.b.prune_key_packages(not_after + 7 * 86_400_000 + 1000).unwrap();
+    assert_eq!(stored(&f.b), 0);
 }
 
 #[test]

@@ -51,6 +51,8 @@ pub enum AgentError {
     Rule(#[from] ds::DsError),
 }
 use AgentError::Invalid;
+/// How long after its expiry a key package's private keys are kept.
+const KEY_PACKAGE_GRACE_SECS: i64 = 7 * 86_400;
 type Result<T> = std::result::Result<T, AgentError>;
 fn err<E>(reason: &'static str) -> impl FnOnce(E) -> AgentError {
     move |_| Invalid(reason)
@@ -693,6 +695,7 @@ impl Agent {
             if n > 20 {
                 return Err(Invalid("key package count"));
             }
+            a.prune_key_packages(now)?;
             (0..n).map(|_| a.package(now, false)).collect()
         })
     }
@@ -700,7 +703,20 @@ impl Agent {
         if self.voice_only {
             return Err(Invalid("voice has no key packages"));
         }
-        self.operation(|a| a.package(now, true))
+        self.operation(|a| {
+            a.prune_key_packages(now)?;
+            a.package(now, true)
+        })
+    }
+    /// Deletes key packages (and their private keys) a week after they expired: the server
+    /// no longer hands them out, and a last-resort package that was used is otherwise kept by
+    /// OpenMLS for good (docs/security.md, "Device storage").
+    fn prune_key_packages(&self, now: i64) -> Result<()> {
+        let cutoff = (now / 1000).saturating_sub(KEY_PACKAGE_GRACE_SECS);
+        self.provider
+            .storage()
+            .prune_key_packages(u64::try_from(cutoff).unwrap_or(0))
+            .map_err(err("prune key packages"))
     }
     fn package(&self, now: i64, last_resort: bool) -> Result<Vec<u8>> {
         let mut builder =
@@ -1472,6 +1488,7 @@ impl Agent {
             a.provider.storage().purge_epoch_key_pairs(&group_id).map_err(err("delete keys"))?;
             a.outbox.remove(&key);
             a.epochs.retain(|k, _| !k.starts_with(&format!("{key}/")));
+            a.forget_held(&key);
             let voice = a.voice_only;
             let record = a.groups.get_mut(&key).ok_or(Invalid("record"))?;
             if !voice && record.status != Status::Creating {
