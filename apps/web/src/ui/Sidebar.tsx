@@ -22,7 +22,10 @@ function ServerHeader() {
   const manageServer = usePermission("server_manage");
   const manageGroups = usePermission("group_manage");
   const banClients = usePermission("client_ban");
-  const canManage = manageServer || (kind === "vc" && (manageGroups || banClients));
+  const editChannels = usePermission("channel_edit");
+  const owned = useSession((s) => !!s.owner);
+  // The Ownership tab is for anyone with channel_edit on a server with an owner (confirmers too).
+  const canManage = manageServer || (kind === "vc" && (manageGroups || banClients || (owned && editChannels)));
   const canInvite = usePermission("invite_create") && kind === "vc";
   const canCreate = usePermission("channel_create");
   const canToken = usePermission("token_create") && kind === "vc"; // TeamSpeak has no vc tokens
