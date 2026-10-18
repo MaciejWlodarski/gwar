@@ -21,9 +21,12 @@ const requestValue = <T>(request: IDBRequest<T>): Promise<T> => new Promise((res
 
 export class MessageStorage {
   private db?: Promise<IDBDatabase>;
-  /** With their signatures, which the key archive passes on to the MLS agent. */
   private known: Array<Pick<Revocation, "account_key" | "device_key" | "revoked_at" | "signature">> = [];
-  currentRevocations = () => this.known;
+  /** For the MLS agent's gates (no signatures: its revocation fields are exactly these). */
+  currentRevocations = (): Array<Pick<Revocation, "account_key" | "device_key" | "revoked_at">> =>
+    this.known.map(({ account_key, device_key, revoked_at }) => ({ account_key, device_key, revoked_at }));
+  /** With their signatures, which the key archive passes on to the agent to verify. */
+  signedRevocations = () => this.known;
   async loadRevocations(): Promise<void> {
     const entries = await this.transaction(["revocations"], "readonly", tx => requestValue<Revocation[]>(tx.objectStore("revocations").getAll()));
     this.known = entries.map(({ account_key, device_key, revoked_at, signature }) => ({ account_key, device_key, revoked_at, signature }));

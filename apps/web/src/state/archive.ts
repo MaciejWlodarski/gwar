@@ -29,6 +29,6 @@ export function archiveOptions(identity: Identity): Omit<ArchiveOptions, "device
         return next;
       }),
     uploads: () => useSettings.getState().archiveUploads,
-    revocations: messageStorage.currentRevocations,
+    revocations: messageStorage.signedRevocations,
   };
 }
