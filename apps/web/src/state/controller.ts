@@ -1090,11 +1090,12 @@ class Controller {
     return this.runtime?.privateMembers(channel) ?? null;
   }
 
-  /** Signs and commits a new member list for an encrypted private channel (6c). */
-  async setPrivateMembers(channel: number, members: string[]) {
+  /** Signs and commits an encrypted private channel's member list with these changes applied to
+   * its current list (6c). */
+  async setPrivateMembers(channel: number, added: string[], removed: string[]) {
     const runtime = this.runtime;
     if (!runtime) throw new Error("encryption is not ready");
-    await runtime.setPrivateMembers(channel, members);
+    await runtime.setPrivateMembers(channel, added, removed);
   }
 
   /** Who can read an encrypted conversation, as this device's group sees it; null until it is secured. */

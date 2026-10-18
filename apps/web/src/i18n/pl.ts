@@ -246,6 +246,7 @@ export const pl: Record<Key, string> = {
   "channel.addRole": "Dodaj wszystkich z rolą {role}",
   "channel.membersSigned": "Listę członków podpisał(a) {name}, {date}",
   "channel.membersAuthority": "Szyfrowany kanał prywatny mogą tworzyć i edytować tylko właściciel serwera, potwierdzający i managerowie (Ustawienia serwera → Własność).",
+  "channel.membersLoading": "Wczytywanie podpisanej listy członków…",
   "channel.accessFilter": "Filtruj członków",
   "tree.private": "Kanał prywatny",
   "channel.encrypted": "Szyfrowanie end-to-end",

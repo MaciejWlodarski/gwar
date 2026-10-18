@@ -19,7 +19,7 @@ import type { VoiceState } from "../proto/VoiceState";
 import type { Managers } from "../proto/Managers";
 import type { OwnerInfo } from "../proto/OwnerInfo";
 import { KeyArchive, type ArchiveOptions } from "./archive";
-import type { AccessView, AgentFactory, ArchiveState, Change, OwnerCheck, OwnerGeneration, OwnerView, CommitOutbox, ConversationStatus, Gate, GroupSummary, HistoryJob, OpenResult, PackageJob, Plaintext, RequestJob, Resolution, Revocation, Roster, SealedFields } from "./types";
+import type { AccessView, AgentFactory, ArchiveState, MembersJob, Change, OwnerCheck, OwnerGeneration, OwnerView, CommitOutbox, ConversationStatus, Gate, GroupSummary, HistoryJob, OpenResult, PackageJob, Plaintext, RequestJob, Resolution, Revocation, Roster, SealedFields } from "./types";
 import { repairable, usable } from "./types";
 import { memberListRenewalDue } from "../lib/managers";
 const bytes = (value: string): number[] => [...decodeBase64Url(value)];
@@ -113,7 +113,6 @@ export class MlsRuntime {
   /** Encrypted private channels (6c): their groups carry signed member lists. */
   private privateChannels = new Set<number>();
   /** Members chosen in the interface for a private channel's first group, by conversation. */
-  private readonly pendingMembers = new Map<string, string[]>();
   /** Conversations whose lists give this device no current authority yet (6c, "Newcomers"). */
   private readonly waiting = new Set<string>();
   private serverChat = false;
@@ -147,6 +146,8 @@ export class MlsRuntime {
   /** Private groups (6c): offered lists to commit, by group; when a due repair may be committed;
    * offers this device sent for a GroupInfo it could not join (one each). */
   private readonly offers = new Map<string, string>();
+  /** Members chosen for a private channel this device is creating (also kept as a runtime job). */
+  private readonly chosen = new Map<string, string[]>();
   private readonly repairAt = new Map<string, number>();
   private readonly offered = new Map<string, number>();
   private readonly renewedAt = new Map<string, number>();
@@ -545,7 +546,7 @@ export class MlsRuntime {
   /** Runtime jobs of superseded groups go with them, in the same write. */
   private supersededJobs(): Change[] {
     const old = new Set(this.inventory().filter(g => g.record.status === "superseded").map(g => encoded(g.group)));
-    return [...this.engine.jobs.values()].filter(job => job.kind !== "packages" && job.kind !== "archive" && job.server === this.server && old.has(job.group)).map(job => jobChange(job, true));
+    return [...this.engine.jobs.values()].filter(job => job.kind !== "packages" && job.kind !== "archive" && job.kind !== "members" && job.server === this.server && old.has(job.group)).map(job => jobChange(job, true));
   }
   private async transition<T>(request: unknown, validate?: (result: T) => void): Promise<T> {
     const before = this.inventory();
@@ -740,11 +741,13 @@ export class MlsRuntime {
           if (this.due(remote.conversation)) await this.acceptChain(remote.conversation, pin);
         } catch (error) {
           this.assertCurrent(this.activeGeneration);
+          // A private successor without current authority waits for a manager (6c).
+          if (String(error).includes(WAITING)) this.waiting.add(remote.conversation);
           await this.engine.reload();
           this.failed(remote.conversation, error);
         }
         const live = this.livePin(remote.conversation);
-        if (live && encoded(live.group) === remote.group) continue;
+        if (live && encoded(live.group) === remote.group) { this.waiting.delete(remote.conversation); continue; }
       }
       held.add(remote.conversation);
     }
@@ -816,7 +819,7 @@ export class MlsRuntime {
       if (id === undefined || channels.has(id) || g.record.status === "forgotten") continue;
       const group = encoded(g.group);
       // The group's runtime jobs go with it, in the same write.
-      const jobs = [...this.engine.jobs.values()].filter(job => job.kind !== "packages" && job.kind !== "archive" && job.server === this.server && job.group === group);
+      const jobs = [...this.engine.jobs.values()].filter(job => job.kind !== "packages" && job.kind !== "archive" && job.kind !== "members" && job.server === this.server && job.group === group);
       await this.engine.op({ forget: this.args(group) }, () => jobs.map(job => jobChange(job, true)));
       for (const job of jobs) this.historyDue.delete(jobKey(job));
       this.missing.delete(group); this.statuses.delete(g.conversation);
@@ -838,9 +841,12 @@ export class MlsRuntime {
           // lets the first creation reach the others before they try.
           // A private channel's group is made by its creator with the members it chose; others
           // (an authority) only after a minute without one, admitting authorities alone.
-          const wait = this.isPrivate(conversation) ? 60_000 : 5_000;
-          if (!this.groupDue.has(conversation)) { this.groupDue.set(conversation, { at: this.now() + Math.random() * wait, delay: wait }); this.due(conversation); continue; }
-          if (this.isPrivate(conversation) && !this.pendingMembers.has(conversation) && !this.isAuthority()) continue;
+          const chosen = this.isPrivate(conversation) && this.chosenMembers(conversation) !== null;
+          const wait = this.isPrivate(conversation) && !chosen ? 60_000 : 5_000;
+          // A private channel's authority waits a full minute (plus jitter) for its creator.
+          const floor = this.isPrivate(conversation) && !chosen ? wait : 0;
+          if (!this.groupDue.has(conversation)) { this.groupDue.set(conversation, { at: this.now() + floor + Math.random() * wait, delay: wait }); this.due(conversation); continue; }
+          if (this.isPrivate(conversation) && !chosen && !this.isAuthority()) continue;
           await this.createGroup(conversation, history);
         } else if (member) {
           if (!this.current(remote)) await this.syncGroup(remote.group, remote.pending);
@@ -895,13 +901,28 @@ export class MlsRuntime {
   }
   /** Lets this client create its own new channel's group right away. */
   channelCreated(id: number, members?: string[]): void {
-    if (members) { this.privateChannels.add(id); this.pendingMembers.set(`channel:${id}`, members); }
-    this.groupDue.set(`channel:${id}`, { at: 0, delay: 5_000 }); this.schedule();
+    const conversation = `channel:${id}`;
+    if (members) {
+      this.privateChannels.add(id);
+      // At once for a pass already queued, and durably until a group with them is settled, also
+      // across a reload (6c).
+      this.chosen.set(conversation, members);
+      const job: MembersJob = { kind: "members", server: this.server, conversation, members };
+      void this.engine.run(() => this.engine.saveJobs([jobChange(job)])).catch(error => this.options.onError?.(error));
+    }
+    this.groupDue.set(conversation, { at: 0, delay: 5_000 }); this.schedule();
+  }
+  /** The members chosen when creating a private channel, until a group with them is settled. */
+  private chosenMembers(conversation: string): string[] | null {
+    const now = this.chosen.get(conversation);
+    if (now) return now;
+    const job = this.engine.jobs.get(jobKey({ kind: "members", server: this.server, conversation, members: [] })) as MembersJob | undefined;
+    return job?.members ?? null;
   }
   /** A private channel's first members: those chosen in the interface, the predecessor's on a
    * restart, or none (authorities are always admitted). */
   private initialMembers(conversation: string, successor?: Successor): string[] {
-    const chosen = this.pendingMembers.get(conversation);
+    const chosen = this.chosenMembers(conversation);
     if (chosen) return chosen;
     if (!successor || this.summary(successor.previous)?.record.status !== "active") return [];
     return this.engine.query<AccessView | null>({ access_view: this.args(successor.previous) })?.members ?? [];
@@ -919,17 +940,26 @@ export class MlsRuntime {
     const pin = this.livePin(`channel:${channel}`);
     return pin?.private && pin.record.status === "active" ? this.engine.query<AccessView | null>({ access_view: this.args(encoded(pin.group)) }) : null;
   }
-  /** Signs a new member list for an encrypted private channel and commits it with the removals it
-   * requires (6c, "Who commits"). This device's user must be the owner, a confirmer or a manager. */
-  async setPrivateMembers(channel: number, members: string[]): Promise<void> {
+  /** Signs a new member list for an encrypted private channel, with `added` and `removed` applied
+   * to its current list (changes made meanwhile by others stay), and commits it with the removals it
+   * requires (6c, "Who commits"). A commit that loses to another is made again on the newer list;
+   * it resolves only once the list holds the change. This device's user must be the owner, a
+   * confirmer or a manager. */
+  async setPrivateMembers(channel: number, added: string[], removed: string[]): Promise<void> {
     return this.engine.run(async () => {
       const generation = this.generation; this.activeGeneration = generation; this.assertCurrent(generation);
-      const pin = this.livePin(`channel:${channel}`);
-      if (!pin?.private) throw new Error("not an encrypted private channel");
-      const group = encoded(pin.group);
-      await this.syncGroup(group);
-      await this.engine.op({ commit_access: { ...this.args(group), members, now: this.now(), revocations: this.options.revocations() } });
-      await this.syncGroup(group);
+      for (let attempt = 0; attempt < 4; attempt++) {
+        const pin = this.livePin(`channel:${channel}`);
+        if (!pin?.private) throw new Error("not an encrypted private channel");
+        const group = encoded(pin.group);
+        await this.syncGroup(group);
+        const current = this.engine.query<AccessView | null>({ access_view: this.args(group) })?.members ?? [];
+        const next = [...new Set([...current.filter(u => !removed.includes(u)), ...added])];
+        if (next.length === current.length && next.every(u => current.includes(u))) return;
+        await this.engine.op({ commit_access: { ...this.args(group), members: next, now: this.now(), revocations: this.options.revocations() } });
+        await this.syncGroup(group);
+      }
+      throw new Error("the member list changed too often to save; try again");
     });
   }
   /** The ratchet tree of a public group's current epoch, which its GroupInfos
@@ -1288,7 +1318,6 @@ export class MlsRuntime {
     const info = isPrivate
       ? await this.engine.op<number[]>({ create_private: { descriptor: d.bytes, members: this.initialMembers(conversation, successor), now: this.now(), revocations: this.options.revocations() } })
       : await this.engine.op<number[]>({ create: { descriptor: d.bytes } });
-    this.pendingMembers.delete(conversation);
     let winner: string;
     try { winner = (await this.request("mls.group.create", { conversation, group_info: encoded(info) })).group; }
     catch (error) {
@@ -1303,6 +1332,21 @@ export class MlsRuntime {
     // Another device's restart is joined after its chain is accepted, on the next pass.
     if (successor && winner !== d.group) { this.schedule(); return; }
     await this.syncGroup(winner);
+    const chosen = isPrivate ? this.chosenMembers(conversation) : null;
+    if (chosen) {
+      // Another authority's group won (it admits authorities alone): the chosen members are
+      // added to it. Then they are settled.
+      if (winner !== d.group) {
+        const current = this.engine.query<AccessView | null>({ access_view: this.args(winner) })?.members ?? [];
+        const next = [...new Set([...current, ...chosen])];
+        if (next.length !== current.length) {
+          await this.engine.op({ commit_access: { ...this.args(winner), members: next, now: this.now(), revocations: this.options.revocations() } });
+          await this.syncGroup(winner);
+        }
+      }
+      await this.engine.saveJobs([jobChange({ kind: "members", server: this.server, conversation, members: chosen }, true)]);
+      this.chosen.delete(conversation);
+    }
   }
   /** Signing runs inside the queue, with the exact current group/epoch. The
    * builder may await WebCrypto; close waits for it and its write to finish. */
