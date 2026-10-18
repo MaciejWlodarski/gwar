@@ -2038,8 +2038,10 @@ review.
 
 ## 6. Private channels
 
-Status: **specified, not built**. A private channel is hidden from everyone
-it does not admit. It can be plaintext or encrypted, chosen at creation as
+Status: **6a and 6b built, 6c specified**. Hidden plaintext private channels
+(6a), the owner chain and the manager list with their device pins and signing
+(6b) are implemented; encrypted private channels (6c) are next. A private
+channel is hidden from everyone it does not admit. It can be plaintext or encrypted, chosen at creation as
 today:
 
 - In a **plaintext private channel** the server alone decides who is
