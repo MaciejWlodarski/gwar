@@ -123,7 +123,11 @@ the same list:
   saved server updates that entry. When a list holds one server twice (two
   devices saved it under different ids, or an edit made one entry name another
   server), the edited entry or else the first in the list stays and the others
-  become tombstones, so every device ends up with the same single entry.
+  become tombstones, so every device ends up with the same single entry. The
+  pinned key is this device's knowledge: a device that has connected to an IP
+  and a name of one server removes the second bookmark everywhere, even on a
+  device that never learned they are the same. Bookmarks of another account
+  kept on a device (signed out before they synced) are never merged or removed.
 - The desktop app's plaintext LAN opt-in is a choice about one device's
   network and is never synced.
 - A device remembers which account each bookmark and removal belongs to: the

@@ -497,10 +497,12 @@ class Controller {
     const kind: ServerKind = params.kind ?? "vc";
     settings.setLast(params.address, kind);
     const name = useSession.getState().server?.name || params.address;
-    const existing = settings.bookmarks.find(
-      (b) =>
-        inAccount(b, settings.bookmarkAccount) && sameServer(b, { kind, address: params.address, insecureLan: params.insecureLan }),
-    );
+    // The bookmark used to connect when there is one (the address as typed), else one for the same server.
+    const shown = settings.bookmarks.filter((b) => inAccount(b, settings.bookmarkAccount) && (b.kind ?? "vc") === kind);
+    const typed = params.address.trim().toLowerCase();
+    const existing =
+      shown.find((b) => b.address.trim().toLowerCase() === typed) ??
+      shown.find((b) => sameServer(b, { kind, address: params.address, insecureLan: params.insecureLan }));
     // A TeamSpeak server remembers which identity was used to get in.
     const identity = kind === "teamspeak" && params.identity ? { identity: params.identity } : {};
     if (existing) {

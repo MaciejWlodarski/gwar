@@ -83,15 +83,12 @@ function removal(removed: Bookmark | undefined, account: string | null): Bookmar
   return owner === undefined ? { at } : { at, account: owner };
 }
 
-/** Whether two bookmarks can both be shown at once: the same account's, or one of them saved without an account. */
-function shownTogether(a: Bookmark, b: Bookmark): boolean {
-  return a.account === undefined || b.account === undefined || a.account === b.account;
-}
-
 /**
- * One bookmark per server: of bookmarks for the same server that are shown together, one stays (the
- * `preferred` one, else the first) and takes a password or identity only another one has; the others are
- * removed like a removal by hand, so syncing removes them on the account's other devices too.
+ * One bookmark per server among those shown now (this account's and those saved without an account;
+ * another account's hidden ones are never touched): one stays (the `preferred` one, else the first)
+ * and takes a password or identity only another one has, timed as a new change so syncing keeps it;
+ * the others are removed like a removal by hand, so syncing removes them on the account's other
+ * devices too.
  */
 export function dedupeBookmarks(
   bookmarks: Bookmark[],
@@ -99,23 +96,35 @@ export function dedupeBookmarks(
   account: string | null,
   preferred?: string,
 ): { bookmarks: Bookmark[]; removed: Record<string, BookmarkRemoval>; changed: boolean } {
-  const order = [...bookmarks.filter((b) => b.id === preferred), ...bookmarks.filter((b) => b.id !== preferred)];
-  const kept: Array<{ bookmark: Bookmark; key: string }> = [];
-  const dropped: Record<string, BookmarkRemoval> = {};
+  const shown = bookmarks.filter((b) => inAccount(b, account));
+  const order = [...shown.filter((b) => b.id === preferred), ...shown.filter((b) => b.id !== preferred)];
+  const groups = new Map<string, Bookmark[]>();
   for (const b of order) {
     const key = serverKey(b);
-    const first = kept.find((k) => k.key === key && shownTogether(k.bookmark, b));
-    if (!first) {
-      kept.push({ bookmark: b, key });
-      continue;
+    groups.set(key, [...(groups.get(key) ?? []), b]);
+  }
+  const stays = new Map<string, Bookmark>();
+  const dropped: Record<string, BookmarkRemoval> = {};
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    // One time for the whole group, after every version in it: the kept bookmark and the removals
+    // carry it, so whichever device decided last wins every id and exactly one bookmark survives.
+    const at = Math.max(Date.now(), ...group.map((b) => (b.updatedAt ?? 0) + 1));
+    let kept: Bookmark = { ...group[0]!, updatedAt: at };
+    for (const b of group.slice(1)) {
+      if (!kept.password && b.password) kept = { ...kept, password: b.password };
+      if (!kept.identity && b.identity) kept = { ...kept, identity: b.identity };
+      const owner = b.account ?? account ?? undefined;
+      dropped[b.id] = owner === undefined ? { at } : { at, account: owner };
     }
-    if (!first.bookmark.password && b.password) first.bookmark = { ...first.bookmark, password: b.password };
-    if (!first.bookmark.identity && b.identity) first.bookmark = { ...first.bookmark, identity: b.identity };
-    dropped[b.id] = removal(b, account);
+    stays.set(kept.id, kept);
   }
   if (Object.keys(dropped).length === 0) return { bookmarks, removed, changed: false };
-  const stays = new Map(kept.map((k) => [k.bookmark.id, k.bookmark]));
-  return { bookmarks: bookmarks.flatMap((b) => stays.get(b.id) ?? []), removed: { ...removed, ...dropped }, changed: true };
+  return {
+    bookmarks: bookmarks.flatMap((b) => (dropped[b.id] ? [] : [stays.get(b.id) ?? b])),
+    removed: { ...removed, ...dropped },
+    changed: true,
+  };
 }
 
 function pruneRemoved(removed: Record<string, BookmarkRemoval>, now: number): Record<string, BookmarkRemoval> {
@@ -265,7 +274,20 @@ export const useSettings = create<SettingsState>()(
           // Saving a server that is already saved updates that bookmark, in its place.
           const key = serverKey(input);
           const twin = s.bookmarks.find((b) => b.id !== input.id && inAccount(b, s.bookmarkAccount) && serverKey(b) === key);
-          const bookmark = twin && !s.bookmarks.some((b) => b.id === input.id) ? { ...input, id: twin.id } : input;
+          // Adopting it keeps what the new entry leaves unsaid: its address, password, identity and LAN choice.
+          const bookmark =
+            twin && !s.bookmarks.some((b) => b.id === input.id)
+              ? {
+                  ...twin,
+                  name: input.name.trim() && input.name.trim() !== input.address.trim() ? input.name : twin.name,
+                  kind: input.kind ?? twin.kind,
+                  password: input.password || twin.password,
+                  identity: input.identity ?? twin.identity,
+                  insecureLan: input.insecureLan || twin.insecureLan,
+                }
+              : input;
+          if (bookmark.password === undefined) delete bookmark.password;
+          if (bookmark.identity === undefined) delete bookmark.identity;
           const existing = s.bookmarks.find((b) => b.id === bookmark.id);
           const changed = !existing || syncedChange(existing, bookmark);
           const account = existing?.account ?? s.bookmarkAccount ?? undefined;
