@@ -716,7 +716,7 @@ export class MlsRuntime {
       const tip = chain[chain.length - 1]!.group;
       const { info, tree } = await this.groupInfo(tip);
       const result = await this.transition<{ group: number[]; adopted: boolean }>({ accept_private_chain: { server: this.server, conversation, chain: links, group_info: info, tree, now: this.now(), revocations: this.options.revocations() } });
-      if (!result.adopted) { await this.offerAccess(tip, info, tree); throw new Error(WAITING); }
+      if (!result.adopted) { await this.offerAccess(tip, info, tree); throw new Error(WAITING, { cause: error }); }
     }
     this.triggers.delete(conversation);
   }
