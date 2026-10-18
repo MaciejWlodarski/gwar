@@ -16,6 +16,7 @@ pub use mls::TreeRefusal;
 mod moderation;
 mod owner;
 mod passwords;
+mod private;
 mod sealed;
 mod voice;
 
@@ -292,6 +293,8 @@ pub struct Core {
     store: Store,
     /// The owner chain and manager pair, once the server has an owner (6b).
     owner: Option<owner::OwnerState>,
+    /// Who each encrypted private channel's live group admits now, from its lists (6c).
+    private_access: HashMap<ChannelId, BTreeSet<vc_proto::Uid>>,
     info: ServerInfo,
     ice_servers: Vec<IceServer>,
     channels: BTreeMap<ChannelId, ChannelRow>,
@@ -514,6 +517,7 @@ impl Core {
         let mut core = Self {
             store,
             owner,
+            private_access: HashMap::new(),
             info,
             ice_servers: config.ice_servers,
             channels,
@@ -557,6 +561,7 @@ impl Core {
             voice_parent_loads: std::cell::Cell::new(0),
             voice_bindings: Arc::new(ArcSwap::from_pointee(HashMap::new())),
         };
+        core.refresh_all_private();
         core.mls_reconcile()?;
         Ok(core)
     }
@@ -777,6 +782,10 @@ impl Core {
             return true;
         }
         let Some((uid, groups)) = member else { return false };
+        // An encrypted private channel admits whom its group's signed lists admit (6c).
+        if row.encrypted {
+            return self.private_admits(channel, uid);
+        }
         // The server's owner is admitted whatever their roles (6b).
         groups.contains(&ADMIN_GROUP)
             || self.owner.as_ref().is_some_and(|o| o.chain.owner() == uid)
@@ -1805,10 +1814,16 @@ impl Core {
         if c.parent.is_some_and(|p| self.channels.get(&p).is_some_and(|p| p.private)) {
             return Err(err(ErrorCode::BadRequest, "a private channel has no child channels"));
         }
-        let access = if c.private {
-            if encrypted {
-                return Err(err(ErrorCode::BadRequest, "encrypted private channels are not available yet"));
+        let access = if c.private && encrypted {
+            // Its members are a signed list in its group (6c): only someone who may sign one creates it.
+            if password.is_some() || c.access.is_some() {
+                return Err(err(ErrorCode::BadRequest, "an encrypted private channel has no password or access set"));
             }
+            if !self.private_authorities().contains(&self.sessions[&session].uid) {
+                return Err(err(ErrorCode::Forbidden, "only the owner, a confirmer or a manager creates one"));
+            }
+            None
+        } else if c.private {
             if password.is_some() {
                 return Err(err(ErrorCode::BadRequest, "a private channel has no password"));
             }

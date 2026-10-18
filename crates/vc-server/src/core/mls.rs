@@ -162,7 +162,9 @@ impl Core {
             Some(participants) => participants.contains(&uid),
             None => {
                 (conversation == "server" && self.info.server_chat.encrypted)
-                    || channel_id(conversation).is_some_and(|c| self.is_encrypted(c))
+                    || channel_id(conversation).is_some_and(|c| {
+                        self.is_encrypted(c) && (!self.is_encrypted_private(c) || self.private_admits(c, uid))
+                    })
             }
         };
         Ok(allowed && self.mls_member(uid)?)
@@ -243,7 +245,9 @@ impl Core {
     }
 
     fn mls_observer(&self, row: &GroupRow) -> Result<Observer, ErrorBody> {
-        Observer::load(&row.observer, &self.server_key).map_err(|e| storage_error(e.into()))
+        Ok(Observer::load(&row.observer, &self.server_key)
+            .map_err(|e| storage_error(e.into()))?
+            .with_owner(self.current_chain()))
     }
 
     fn mls_missing_proposals(
@@ -253,11 +257,14 @@ impl Core {
     ) -> anyhow::Result<Vec<ProposalRow>> {
         let conversation = observer.descriptor().descriptor.conversation.clone();
         let participants = dm_participants(&conversation);
+        let private = self.private_channel_of(&conversation);
         let mut proposals = Vec::new();
         for leaf in observer.leaves() {
-            // Any member's well-formed device may be in a channel group.
+            // Any member's well-formed device may be in a channel group; a private channel's only
+            // when its lists (or the server's newest managers) admit it now.
             let allowed = self.mls_member(&leaf.uid).map_err(|e| anyhow::anyhow!(e.message))?
                 && participants.is_none_or(|p| p.contains(&leaf.uid.as_str()))
+                && private.is_none_or(|c| self.private_admits(c, &leaf.uid))
                 && !self.store.mls_revoked(&leaf.device_key, &leaf.uid)?;
             if !allowed && !existing.iter().any(|p| p.leaf == leaf.index) {
                 proposals.push(ProposalRow {
@@ -284,7 +291,7 @@ impl Core {
     }
 
     pub(super) fn mls_reconcile_group(&mut self, mut row: GroupRow) -> anyhow::Result<()> {
-        let mut observer = Observer::load(&row.observer, &self.server_key)?;
+        let mut observer = Observer::load(&row.observer, &self.server_key)?.with_owner(self.current_chain());
         let mut existing = self.store.mls_proposals(&row.group)?;
         let added = self.mls_missing_proposals(&mut observer, &existing)?;
         if !added.is_empty() {
@@ -659,7 +666,7 @@ impl Core {
 
     fn mls_create(&mut self, session: SessionId, conversation: &str, info: &str) -> Reply {
         let info = blob(info, BLOB_BYTES)?;
-        let mut observer = Observer::create(&info, &self.server_key).map_err(ds_error)?;
+        let mut observer = Observer::create_with(&info, &self.server_key, self.current_chain()).map_err(ds_error)?;
         let signed = observer.descriptor();
         let d = &signed.descriptor;
         let s = &self.sessions[&session];
@@ -677,8 +684,11 @@ impl Core {
                 let Some(row) = self.channels.get(&channel).filter(|c| c.encrypted) else {
                     return Err(err(ErrorCode::NotFound, "no such encrypted channel"));
                 };
-                if d.private || d.history != row.history {
+                if d.private != row.private || d.history != row.history {
                     return Err(bad("the descriptor must match the channel"));
+                }
+                if d.private {
+                    self.check_private_create(&s.uid, &observer)?;
                 }
                 Kind::Channel
             }
@@ -723,7 +733,15 @@ impl Core {
         };
         let proposals = self.mls_missing_proposals(&mut observer, &[]).map_err(storage_error)?;
         row.observer = observer.save();
+        let private = self.private_channel_of(conversation);
+        let admissions = self.admissions();
         self.store.mls_write_group(&row, &observer.leaves(), &proposals, None, None, &[]).map_err(storage_error)?;
+        if let (Some(channel), Some(access)) = (private, observer.access()) {
+            let m = access.members();
+            self.store.set_mls_access_checkpoint(&row.group, m.members().seq, &m.hash()).map_err(storage_error)?;
+            self.refresh_private(channel);
+            self.reconcile_admissions(admissions);
+        }
         self.voice_dirty |= channel_id(&row.conversation).is_some_and(|c| self.calls.contains_key(&c));
         self.mls_announce_proposals(&row, &proposals);
         reply(MlsResponse::Created { group: row.group })
@@ -756,8 +774,13 @@ impl Core {
         // Read referenced proposals only after the time and full commit validation,
         // so even a now-invalid Add receives the terminal expired reply.
         let original = observer.save();
+        let access_before = observer.access();
         let (mut observer, accepted) =
             observer.commit(&commit, &info, welcome.as_deref(), clock, row.committed_at).map_err(ds_error)?;
+        // A private channel's new lists must be current under this server's managers and newer (6c).
+        let private = self.private_channel_of(&row.conversation);
+        let checkpoint =
+            if private.is_some() { self.check_private_commit(group, access_before.as_ref(), &observer)? } else { None };
         let s = &self.sessions[&session];
         let sender_matches = match accepted.sender {
             CommitSender::Member(index) => {
@@ -801,6 +824,12 @@ impl Core {
                 &removed,
             )
             .map_err(storage_error)?;
+        if let (Some(channel), Some((seq, hash))) = (private, checkpoint) {
+            let admissions = self.admissions();
+            self.store.set_mls_access_checkpoint(group, seq, &hash).map_err(storage_error)?;
+            self.refresh_private(channel);
+            self.reconcile_admissions(admissions);
+        }
         self.voice_dirty |= channel_id(&row.conversation).is_some_and(|c| self.calls.contains_key(&c));
         let readers = self.mls_readers(&row.conversation);
         self.broadcast(

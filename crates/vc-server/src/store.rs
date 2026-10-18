@@ -366,6 +366,14 @@ const MIGRATIONS: &[&str] = &[
         list BLOB NOT NULL
     );
     "#,
+    // The newest member list each private channel group accepted (6c): live commits never go back.
+    r#"
+    CREATE TABLE mls_access (
+        group_id TEXT PRIMARY KEY,
+        seq INTEGER NOT NULL,
+        hash TEXT NOT NULL
+    );
+    "#,
 ];
 
 /// The stored genesis of the current owner generation.
@@ -856,6 +864,25 @@ impl Store {
             )?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// The `(seq, hash)` of the newest member list a private channel group accepted.
+    pub fn mls_access_checkpoint(&self, group: &str) -> Result<Option<(u64, String)>> {
+        Ok(self
+            .db
+            .query_row("SELECT seq,hash FROM mls_access WHERE group_id=?1", [group], |r| {
+                Ok((r.get::<_, i64>(0)? as u64, r.get(1)?))
+            })
+            .optional()?)
+    }
+
+    pub fn set_mls_access_checkpoint(&self, group: &str, seq: u64, hash: &str) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO mls_access(group_id,seq,hash) VALUES(?1,?2,?3)
+             ON CONFLICT(group_id) DO UPDATE SET seq=excluded.seq, hash=excluded.hash",
+            params![group, seq as i64, hash],
+        )?;
         Ok(())
     }
 
