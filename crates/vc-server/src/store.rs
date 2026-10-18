@@ -403,6 +403,21 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE UNIQUE INDEX channel_overrides_target ON channel_overrides(channel, COALESCE(role, -1), COALESCE(user, ''));
     "#,
+    // TeamSpeak import (docs/teamspeak-import.md): what each imported item became, so a second import
+    // updates it; and passwords typed for imported channels, until the bridge has set them.
+    r#"
+    CREATE TABLE ts_imports (
+        source TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        ts_id TEXT NOT NULL,
+        gwar_id INTEGER NOT NULL,
+        PRIMARY KEY (source, kind, ts_id)
+    );
+    CREATE TABLE ts_import_passwords (
+        channel INTEGER PRIMARY KEY REFERENCES channels(id) ON DELETE CASCADE,
+        password TEXT NOT NULL
+    );
+    "#,
 ];
 
 fn write_overrides(
@@ -694,6 +709,44 @@ impl Store {
         write_overrides(&tx, channel, overrides)?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// What an imported TeamSpeak item became (`kind`: role, channel).
+    pub fn ts_import_target(&self, source: &str, kind: &str, ts_id: u64) -> Result<Option<i64>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT gwar_id FROM ts_imports WHERE source=?1 AND kind=?2 AND ts_id=?3",
+                params![source, kind, ts_id.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn set_ts_import_target(&self, source: &str, kind: &str, ts_id: u64, gwar_id: i64) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO ts_imports(source,kind,ts_id,gwar_id) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(source,kind,ts_id) DO UPDATE SET gwar_id=excluded.gwar_id",
+            params![source, kind, ts_id.to_string(), gwar_id],
+        )?;
+        Ok(())
+    }
+
+    /// A typed password for the bridge to set on the TeamSpeak side once (it needs the plain text).
+    pub fn queue_bridge_password(&self, channel: ChannelId, password: &str) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO ts_import_passwords(channel,password) VALUES(?1,?2)
+             ON CONFLICT(channel) DO UPDATE SET password=excluded.password",
+            params![channel, password],
+        )?;
+        Ok(())
+    }
+
+    /// Takes (and deletes) the queued passwords.
+    pub fn take_bridge_passwords(&self) -> Result<Vec<(ChannelId, String)>> {
+        let mut stmt = self.db.prepare("DELETE FROM ts_import_passwords RETURNING channel,password")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     /// The next id from a counter that never goes back and never wraps: once `u32` ids run out, inserts fail.

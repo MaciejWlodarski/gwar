@@ -22,6 +22,8 @@ pub mod store;
 #[cfg(feature = "teamspeak")]
 pub mod teamspeak;
 pub mod tls;
+#[cfg(feature = "teamspeak")]
+pub mod ts_import;
 
 use std::{collections::HashSet, net::SocketAddr, path::PathBuf, sync::Arc};
 

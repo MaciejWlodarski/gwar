@@ -16,7 +16,7 @@ pub use mls::TreeRefusal;
 mod moderation;
 mod overrides;
 mod owner;
-mod passwords;
+pub(crate) mod passwords;
 mod private;
 mod sealed;
 mod voice;
@@ -492,6 +492,10 @@ impl Core {
             store.clear_connect_cache()?;
         }
         let connect = config.connect_url.map(crate::connect::Lookup::new).transpose()?;
+        // Without a bridge nothing will ever set them: plain-text passwords do not wait around.
+        if !config.teamspeak {
+            store.take_bridge_passwords()?;
+        }
         let channels = store.channels()?.into_iter().map(|c| (c.id, c)).collect::<BTreeMap<_, _>>();
         let default_channel = store
             .meta("default_channel")?
@@ -1319,6 +1323,23 @@ impl Core {
                     clients: self.sessions.values().map(|s| self.client_for(s, None)).collect(),
                 });
                 self.bridge = Some(bridge);
+                // Passwords typed at a TeamSpeak import: TeamSpeak needs the plain text once.
+                match self.store.take_bridge_passwords() {
+                    Ok(queued) => {
+                        for (channel, password) in queued {
+                            let Some(view) = self.channels.get(&channel).filter(|c| !c.private).map(channel_view)
+                            else {
+                                continue;
+                            };
+                            self.notify_bridge(|| BridgeNote::Channel {
+                                channel: view,
+                                created: false,
+                                password: Some(Some(password)),
+                            });
+                        }
+                    }
+                    Err(e) => warn!("store: {e:#}"),
+                }
             }
             BridgeMsg::Join(client, reply) => {
                 if self.ban_for(Some(&client.uid), None).is_some() {

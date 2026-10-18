@@ -1,6 +1,7 @@
 # Moving a TeamSpeak server to Gwar
 
-Status: design. Nothing here is built yet.
+Status: built (`vc-server import-teamspeak`), onto roles version 2 ([roles.md](roles.md)).
+Later: the claim flow for roles, a wizard in the desktop app, TeamSpeak 6.
 
 A community with a TeamSpeak 3 server can move to a Gwar server without
 rebuilding it by hand: `vc-server import-teamspeak` reads the TeamSpeak server
@@ -16,23 +17,23 @@ the Gwar app when they want; nobody has to install anything on moving day.
 | --- | --- | --- |
 | Channel tree: parent, order, name, topic, max clients | Channels, same tree and order | Exact |
 | Default channel | `default_channel` | Exact |
-| Channel password | The same password when the admin types it; otherwise locked (see [Passwords](#passwords)) | Needs the admin |
+| Channel password | The same password when the admin gives it; otherwise locked (see [Passwords](#passwords)) | Needs the admin |
 | Channel description | Not imported (Gwar has a topic only) | Reported |
-| Join power above the default group's | Private channel open to the roles that have the power | Changed: hidden instead of visible but locked; reported |
-| Needed talk power (moderated channels) | Not imported | Reported |
-| Temporary channels | Not imported | Skipped |
+| Needed join power above the default group's | `connect` denied to Member, allowed to the roles with enough join power | Exact for those roles |
+| Needed talk power above the default group's (moderated) | `speak` denied to Member, allowed to the roles with enough talk power | Exact for those roles |
+| Channel groups (Channel Admin, Operator, …) | That member's override in that channel, allowing the channel permissions the group maps to | Per person |
+| Temporary channels | Not imported | Reported |
 | Semi-permanent channels | Permanent channels | Exact |
 | Spacers (`[spacer]`, `[cspacer]`, …) | Not imported by default (`--spacers` keeps them as plain channels) | Reported |
-| Server name, welcome message, max clients | Server settings | Exact |
-| Server password | The same password when the admin types it | As channel passwords |
-| Regular server groups (`type=1`) | Roles, permissions mapped (see [Roles](#roles-and-permissions)) | Lossy, previewed |
-| Template and query groups | Not imported | Skipped |
+| Server name, welcome message, max clients, password | Server settings (the password as channel passwords) | Exact |
+| Regular server groups (`type=1`) | Roles in TeamSpeak's sort order, below Admin, permissions mapped (see [Roles](#roles-and-permissions)) | Lossy, reported per permission |
+| The default server group (Guest) | Member's permissions, plus `connect`, `speak`, `send_messages` | As mapped |
+| Template and query groups | Not imported | Reported |
 | Group members | Members `ts:<uid>` with their roles | Exact |
-| Channel groups (Channel Admin, Operator) | Not imported | Reported (count per channel) |
-| UID bans | Bans of `ts:<uid>` | Exact, expiry kept |
+| UID bans | Bans of `ts:<uid>` | Exact, expiry kept; expired ones skipped |
 | IP bans that are a plain address | IP bans | Exact; a pattern is reported instead |
 | Nickname and myTeamSpeak-id bans | Not imported | Reported |
-| Icons, avatars, file browser | Not imported | Reported |
+| Icons, avatars, file browser | Not imported | — |
 | Chat history | Nothing to import: TeamSpeak keeps none | — |
 | Privilege keys | Not imported: create Gwar invites | — |
 
@@ -67,43 +68,36 @@ to bring a TeamSpeak member's roles to their Gwar identity:
 
 ## Roles and permissions
 
-TeamSpeak has around 300 permissions with integer powers; Gwar has 15 yes/no
-permissions. A role gets a Gwar permission when its server group's own
-assignments grant the TeamSpeak counterpart: a `b_` permission set to 1 and not
-negated, or an `i_…_power` at least the matching `i_…_needed_…_power` of the
-server's default group, so the role can act on an ordinary member.
+TeamSpeak has around 300 permissions with integer powers; Gwar has a short list
+([roles.md](roles.md)). A role gets a Gwar permission when its server group's
+own assignments grant the TeamSpeak counterpart: a `b_` permission set to 1 and
+not negated, or an `i_…_power` above 0 and at least the matching
+`i_…_needed_…_power` of the default group, so the role can act on an ordinary
+member. The report lists, per role, each permission and the assignment behind it.
 
 | Gwar | TeamSpeak |
 | --- | --- |
-| `server_manage` | any of `b_virtualserver_modify_name`, `_welcomemessage`, `_password` |
-| `channel_create` | `b_channel_create_permanent` or `b_channel_create_semi_permanent` |
-| `channel_edit` | `b_channel_modify_name` |
-| `channel_delete` | `b_channel_delete_permanent` |
-| `channel_join_locked` | `b_channel_join_ignore_password` |
-| `client_move` | `i_client_move_power` |
-| `client_kick` | `i_client_kick_from_server_power` |
-| `client_ban` | `b_client_ban_create` and `i_client_ban_power` |
-| `group_manage` | `b_virtualserver_servergroup_create` or `i_group_member_add_power` |
-| `token_create`, `invite_create` | `b_virtualserver_token_add` |
-| `message_manage` | no counterpart (TeamSpeak keeps no chat): given with `client_ban` |
-| `file_upload` | `i_ft_file_upload_power` |
-| `member_remove` | `b_client_delete_dbproperties` |
-| `member_nickname` | `b_client_modify_dbproperties` |
+| `manage_server` | any of `b_virtualserver_modify_name`, `_welcomemessage`, `_password` |
+| `manage_roles` | `b_virtualserver_servergroup_create`, or `i_group_member_add_power` |
+| `manage_members` | `b_client_modify_dbproperties` or `b_client_delete_dbproperties` |
+| `kick_members` | `i_client_kick_from_server_power` |
+| `ban_members` | `b_client_ban_create` |
+| `manage_messages` | no counterpart (TeamSpeak keeps no chat): given with `b_client_ban_create` |
+| `create_invites` | `b_virtualserver_token_add` |
+| `bypass_password` | `b_channel_join_ignore_password` |
+| `attach_files` | `i_ft_file_upload_power` |
+| `move_members` | `i_client_move_power` |
+| `mute_members` | `i_client_kick_from_channel_power` (the closest: keeping someone quiet in a channel) |
+| `manage_channels` | `b_channel_create_permanent` or `b_channel_modify_name` |
+| `connect`, `speak` | channel overrides from join and talk power (above) |
 
-- The group named in `virtualserver_default_server_group` (Guest) becomes
-  Gwar's built-in Member role: its mapped permissions replace Member's, after
-  the dry run shows the difference.
-- A group whose mapping grants every Gwar permission is imported as a role, not
-  merged into Gwar's built-in Admin; the server's owner and Admin stay as they
-  are.
-- Group colours do not exist in TeamSpeak (it has icons); imported roles have
-  none.
-- Negated (`permnegated`) and skipped (`permskip`) assignments count as not
-  granting; client- and channel-specific permissions are not read.
-
-The mapping is a starting point: the dry run prints, per group, the Gwar
-permissions it would get and the TeamSpeak assignments behind each, and roles
-can be edited after the import as usual.
+- `administrator` is never given: a group mapping to every permission is
+  imported as such, and the admin ticks `administrator` if wanted.
+- Roles go below Admin in TeamSpeak's sort order (lowest sort id on top), so
+  rank follows TeamSpeak's display order; reorder them after if TeamSpeak's
+  powers said otherwise.
+- Negated and skipped assignments count as not granting; client permissions
+  are not read.
 
 ## Passwords
 
@@ -138,48 +132,50 @@ So the importer asks:
 ## Running it
 
 ```sh
-vc-server import-teamspeak --from ts.example.com:10011 --user serveradmin \
-  [--port 9987 | --sid 1] [--dry-run] [--all-clients] [--spacers] \
-  [--passwords passwords.toml | --drop-passwords] [--report report.json]
+VC_TS_QUERY_PASSWORD=… vc-server import-teamspeak --from ts.example.com:10011 [--user serveradmin] \
+  [--sid 1] [--dry-run] [--all-clients] [--spacers] [--replace-channels] \
+  [--passwords passwords.txt | --drop-passwords]
 ```
 
-- The ServerQuery password is read from the terminal (or `--password-stdin`),
-  used for this run only and never stored. The source server is only read.
-- The Gwar server must be stopped (`data/vc.lock`, as `members merge`), even
-  for `--dry-run`, which reads the TeamSpeak server and prints the full plan
-  without writing.
-- The import runs in one transaction: it applies fully or not at all.
+- The ServerQuery password comes from `VC_TS_QUERY_PASSWORD` or, with
+  `--password-stdin`, the first line of stdin; it is used for this run only.
+  The source server is only read (the importing host must be allowed by its
+  `query_ip_allowlist.txt`, or its flood limits apply).
+- `--dry-run` reads the TeamSpeak server and prints the full plan and report;
+  it does not touch the Gwar database.
+- Otherwise the Gwar server must be stopped (`data/vc.lock`). The import first
+  writes a copy of the database next to it (`vc.sqlite3.before-import-<time>`),
+  then applies the plan.
+- `--passwords` takes one `name = password` per line (`#` comments, quotes
+  optional): a channel's path (`"Clan/Room"`), its name, or `server`.
 - Running it again later updates what it imported before instead of adding
-  copies: `ts_imports(source, kind, ts_id, gwar_id)` remembers each imported
-  item by the source server's unique id. Items deleted on the Gwar side since
-  stay deleted; new TeamSpeak items are added. So a community can import,
-  try Gwar, and import again just before switching over.
-- Imported channels go after the existing ones; an existing empty server (the
-  default Lobby, General, AFK) can be replaced with `--replace-channels`.
-- Requests are paced to stay under ServerQuery's flood limits; the client
-  database is read in pages. The source must allow the importing host in its
-  `query_ip_whitelist.txt` or the default flood limits apply.
+  copies (`ts_imports`, by the source server's unique id). Items deleted on
+  the Gwar side since are created again; new TeamSpeak items are added. So a
+  community can import, try Gwar, and import again just before switching.
+- Imported channels go after the existing ones; a name taken among siblings
+  gets ` (2)`. `--replace-channels` removes the server's own top-level
+  channels first (the seeded Lobby, General, AFK; the default channel stays
+  unless TeamSpeak's replaces it).
+- Imported channels have their own overrides (`synced` off): TeamSpeak has no
+  inheritance to follow.
 
 ## Scope
 
-First version: the CLI above, TeamSpeak 3 servers (3.13) over the raw
-ServerQuery port, which `vc-server` already speaks for the bridge. Later:
+Built: the CLI above, TeamSpeak 3 servers (3.13) over the raw ServerQuery
+port, which `vc-server` already speaks for the bridge. Later:
 
 - the claim flow for roles (above);
 - a wizard in the desktop app's server settings (the app can open TCP; the web
   app cannot);
 - ServerQuery over SSH and TeamSpeak 6 servers (no raw ServerQuery port, and a
   different uid hash, so `ts:<uid>` would not match);
-- channel descriptions, channel groups, icons.
+- channel descriptions, icons.
 
 ## Tests
 
-- Unit: permission mapping, channel tree reconstruction (`channel_order` is the
-  id of the sibling above), ban conversion, password import, re-run updates.
-- Integration (CI, the official TeamSpeak server it already runs; its free
-  license allows one instance per host, so the steps run one after another):
-  start a plain TeamSpeak server as the source and build it up through
-  ServerQuery (tree, passwords, groups, members, bans); import into a stopped
-  Gwar server; stop the source; start Gwar with its bridge and check the result,
-  and that a TeamSpeak client joins a password channel with the original
-  password and arrives with its role.
+- Unit (`src/ts_import/tests.rs`): permission mapping, the plan (tree, order,
+  join and talk power, channel groups, passwords, members, bans, notes),
+  applying twice, `--replace-channels`, the passwords file.
+- Integration (`tests/teamspeak_import.rs`, CI with the official server): the
+  TeamSpeak server Gwar runs, given a group, powers and a password through
+  ServerQuery, is read, planned and imported into a fresh database.

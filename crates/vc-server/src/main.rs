@@ -138,6 +138,41 @@ enum Command {
         #[command(subcommand)]
         command: OwnerCommand,
     },
+    /// Import a TeamSpeak 3 server's channels, roles, members and bans over ServerQuery
+    /// (docs/teamspeak-import.md). The TeamSpeak server is only read. Without --dry-run this
+    /// changes the database, so this server must be stopped; a copy of the database is kept first.
+    /// The ServerQuery password is read from VC_TS_QUERY_PASSWORD or, with --password-stdin, stdin.
+    #[cfg(feature = "teamspeak")]
+    ImportTeamspeak {
+        /// ServerQuery address, host:port (raw query, usually 10011).
+        #[arg(long)]
+        from: String,
+        #[arg(long, default_value = "serveradmin")]
+        user: String,
+        /// Virtual server id on that instance.
+        #[arg(long, default_value_t = 1)]
+        sid: u32,
+        #[arg(long)]
+        password_stdin: bool,
+        /// Print the plan, change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also import clients without a role.
+        #[arg(long)]
+        all_clients: bool,
+        /// Keep spacer channels as plain channels.
+        #[arg(long)]
+        spacers: bool,
+        /// Channel passwords to keep: one `name = password` per line (a channel's path, its name, or `server`).
+        #[arg(long, conflicts_with = "drop_passwords")]
+        passwords: Option<PathBuf>,
+        /// Import password channels without a password.
+        #[arg(long)]
+        drop_passwords: bool,
+        /// Remove this server's own top-level channels first (the seeded Lobby, General, AFK).
+        #[arg(long)]
+        replace_channels: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -293,6 +328,70 @@ async fn main() -> Result<()> {
                     println!("{uid} is the owner of the new generation {generation}");
                 }
             }
+            return Ok(());
+        }
+        #[cfg(feature = "teamspeak")]
+        Some(Command::ImportTeamspeak {
+            from,
+            user,
+            sid,
+            password_stdin,
+            dry_run,
+            all_clients,
+            spacers,
+            passwords,
+            drop_passwords,
+            replace_channels,
+        }) => {
+            use vc_server::ts_import;
+            let query_password = if password_stdin {
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                line.trim_end_matches(['\r', '\n']).to_owned()
+            } else {
+                std::env::var("VC_TS_QUERY_PASSWORD").context("set VC_TS_QUERY_PASSWORD or use --password-stdin")?
+            };
+            let options = ts_import::plan::Options {
+                all_clients,
+                spacers,
+                drop_passwords,
+                passwords: passwords.as_deref().map(ts_import::read_passwords).transpose()?.unwrap_or_default(),
+            };
+            let addr = tokio::net::lookup_host(&from)
+                .await
+                .with_context(|| format!("resolve {from}"))?
+                .next()
+                .with_context(|| format!("no address for {from}"))?;
+            let (query, _notes) =
+                vc_server::teamspeak::query::Query::connect(addr, &user, &query_password, sid).await?;
+            let source = ts_import::source::read(&query).await?;
+            let source_id = source
+                .server
+                .get("virtualserver_unique_identifier")
+                .cloned()
+                .unwrap_or_else(|| format!("{from}/{sid}"));
+            let plan = ts_import::plan::plan(&source, &options);
+            print!("{}", ts_import::plan::report(&plan));
+            if dry_run {
+                println!("\nDry run: nothing changed.");
+                return Ok(());
+            }
+            let _lock = vc_server::members::lock_data_dir(&cli.data_dir)?;
+            let store = Store::open(&database)?;
+            let backup = cli.data_dir.join(format!("vc.sqlite3.before-import-{}", vc_server::core::now_ms()));
+            store.backup_to(&backup)?;
+            let applied = ts_import::apply::apply(&store, &plan, &source_id, replace_channels)?;
+            println!(
+                "\nImported: {} roles new, {} updated; {} channels new, {} updated; {} members new, {} updated; {} bans.\nThe database before the import: {}",
+                applied.roles_created,
+                applied.roles_updated,
+                applied.channels_created,
+                applied.channels_updated,
+                applied.members_created,
+                applied.members_updated,
+                applied.bans,
+                backup.display()
+            );
             return Ok(());
         }
         None => {}
