@@ -2509,8 +2509,11 @@ gwar managers v1
     when chosen, so the person sees every uid before signing; the edit is
     the members added and removed in the dialog, applied to the group's
     current list at signing (changes others made meanwhile stay). A
-    creation's chosen members are kept durably until its group is settled;
-    if another authority's group wins first, they are added to it.
+    creation's chosen members are kept durably until its first group holds
+    them: if another authority's group wins first, they are added to it
+    while its list is still the initial one; once the list was edited, the
+    edit decides and the choice is dropped. A restart's successor carries
+    its predecessor's current list, never a creation's choice.
   - When a newer manager pair is accepted, every member carries it into its
     private groups as above (one group at a time, random delay up to 10 s, so
     concurrent carriers settle on the first commit).

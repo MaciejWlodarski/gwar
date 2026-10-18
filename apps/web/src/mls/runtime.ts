@@ -850,6 +850,7 @@ export class MlsRuntime {
           await this.createGroup(conversation, history);
         } else if (member) {
           if (!this.current(remote)) await this.syncGroup(remote.group, remote.pending);
+          if (this.isPrivate(conversation) && this.chosenMembers(conversation)) await this.applyChosen(conversation, remote.group);
           const own = this.summary(remote.group)?.record.own_commit_at ?? 0;
           if (!leafUpdated && this.now() - own > LEAF_UPDATE_AFTER && !this.outbox(remote.group)) {
             leafUpdated = true; // One group at a time.
@@ -922,7 +923,9 @@ export class MlsRuntime {
   /** A private channel's first members: those chosen in the interface, the predecessor's on a
    * restart, or none (authorities are always admitted). */
   private initialMembers(conversation: string, successor?: Successor): string[] {
-    const chosen = this.chosenMembers(conversation);
+    // Chosen members are for the channel's first group only; a successor carries its
+    // predecessor's current list (never a stale choice).
+    const chosen = successor ? null : this.chosenMembers(conversation);
     if (chosen) return chosen;
     if (!successor || this.summary(successor.previous)?.record.status !== "active") return [];
     return this.engine.query<AccessView | null>({ access_view: this.args(successor.previous) })?.members ?? [];
@@ -958,6 +961,8 @@ export class MlsRuntime {
         if (next.length === current.length && next.every(u => current.includes(u))) return;
         await this.engine.op({ commit_access: { ...this.args(group), members: next, now: this.now(), revocations: this.options.revocations() } });
         await this.syncGroup(group);
+        const saved = this.engine.query<AccessView | null>({ access_view: this.args(group) })?.members ?? [];
+        if (added.every(u => saved.includes(u)) && removed.every(u => !saved.includes(u))) return;
       }
       throw new Error("the member list changed too often to save; try again");
     });
@@ -1332,21 +1337,26 @@ export class MlsRuntime {
     // Another device's restart is joined after its chain is accepted, on the next pass.
     if (successor && winner !== d.group) { this.schedule(); return; }
     await this.syncGroup(winner);
-    const chosen = isPrivate ? this.chosenMembers(conversation) : null;
-    if (chosen) {
-      // Another authority's group won (it admits authorities alone): the chosen members are
-      // added to it. Then they are settled.
-      if (winner !== d.group) {
-        const current = this.engine.query<AccessView | null>({ access_view: this.args(winner) })?.members ?? [];
-        const next = [...new Set([...current, ...chosen])];
-        if (next.length !== current.length) {
-          await this.engine.op({ commit_access: { ...this.args(winner), members: next, now: this.now(), revocations: this.options.revocations() } });
-          await this.syncGroup(winner);
-        }
-      }
-      await this.engine.saveJobs([jobChange({ kind: "members", server: this.server, conversation, members: chosen }, true)]);
-      this.chosen.delete(conversation);
+    if (isPrivate && !successor) await this.applyChosen(conversation, winner);
+  }
+  /** A creation's chosen members, once its group exists: added to it while its list is still the
+   * initial one (another authority's group that won admits authorities alone), and forgotten once
+   * the list holds them, or once the list was edited since (a later edit decides, 6c). */
+  private async applyChosen(conversation: string, group: string): Promise<void> {
+    const chosen = this.chosenMembers(conversation);
+    if (!chosen) return;
+    const view = this.engine.query<AccessView | null>({ access_view: this.args(group) });
+    if (!view) return;
+    const missing = chosen.filter(u => !view.members.includes(u));
+    if (missing.length && view.seq === 1) {
+      await this.engine.op({ commit_access: { ...this.args(group), members: [...view.members, ...missing], now: this.now(), revocations: this.options.revocations() } });
+      await this.syncGroup(group);
+      const after = this.engine.query<AccessView | null>({ access_view: this.args(group) });
+      // A commit that lost is tried again on a later pass while the list stays initial.
+      if (after && after.seq === 1 && chosen.some(u => !after.members.includes(u))) return;
     }
+    await this.engine.saveJobs([jobChange({ kind: "members", server: this.server, conversation, members: chosen }, true)]);
+    this.chosen.delete(conversation);
   }
   /** Signing runs inside the queue, with the exact current group/epoch. The
    * builder may await WebCrypto; close waits for it and its write to finish. */
