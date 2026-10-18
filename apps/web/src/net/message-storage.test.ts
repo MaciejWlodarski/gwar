@@ -57,11 +57,13 @@ describe("atomic bounded message storage", () => {
     const store = new MessageStorage(crypto.randomUUID()); await store.mergeFeed([e]);
     expect((await store.revocation(account.publicKey, device.publicKey)).revokedAt).toBe(2);
     expect(store.currentRevocations()).toEqual([{ account_key: account.publicKey, device_key: device.publicKey, revoked_at: 2 }]);
+    expect(store.signedRevocations()).toEqual([{ account_key: account.publicKey, device_key: device.publicKey, revoked_at: 2, signature: e.signature }]);
     expect((await store.revocation(device.publicKey, device.publicKey)).revokedAt).toBeUndefined();
     expect((await store.revocation(account.publicKey, device.publicKey)).fresh).toBe(true);
     await store.unavailable(); expect((await store.revocation(account.publicKey, device.publicKey)).fresh).toBe(false);
     expect((await store.revocation(account.publicKey, device.publicKey)).revokedAt).toBe(2);
     expect(store.currentRevocations()).toEqual([{ account_key: account.publicKey, device_key: device.publicKey, revoked_at: 2 }]);
+    expect(store.signedRevocations()).toEqual([{ account_key: account.publicKey, device_key: device.publicKey, revoked_at: 2, signature: e.signature }]);
   });
 });
 

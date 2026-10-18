@@ -32,7 +32,7 @@ fn sync(
     revocations: &[ArchiveRevocation],
     manifests: &[Vec<u8>],
     transfers: &[Vec<u8>],
-    code: Option<&[u8]>,
+    code: Option<[u8; 32]>,
     t: i64,
 ) -> ArchiveState {
     let state = a.archive_sync(devices, recovery, revocations, manifests, transfers, code, t).unwrap();
@@ -49,23 +49,23 @@ fn devices_share_the_archive_through_generations_transfers_and_the_recovery_code
     let devices = vec![entry(&laptop, t)];
     // No generation yet: the laptop creates the first one.
     assert_eq!(sync(&mut laptop, &devices, &[], &[], &[], &[], None, t).safe, None);
-    let g1 = laptop.archive_create_manifest(t).unwrap();
+    let g1 = laptop.archive_create_manifest(t, &[]).unwrap();
     assert_eq!(sync(&mut laptop, &devices, &[], &[], std::slice::from_ref(&g1), &[], None, t).safe, Some(1));
     // An epoch key goes up once.
     let epoch = format!("{}/{}/{:020}", server, b64(&[3; 32]), 7);
     laptop.epochs.insert(epoch.clone(), EpochRecord::Derived { key: [9; 32], archived: false });
-    let upload = laptop.archive_seal(100, t).unwrap().unwrap();
+    let upload = laptop.archive_seal(100, t, &[]).unwrap().unwrap();
     assert_eq!((upload.generation, upload.records.len()), (1, 1));
     laptop.archive_uploaded(&upload.epochs).unwrap();
     laptop.take_changes();
-    assert!(laptop.archive_seal(100, t).unwrap().unwrap().records.is_empty());
+    assert!(laptop.archive_seal(100, t, &[]).unwrap().unwrap().records.is_empty());
 
     // The phone joins: it cannot read generation 1 until the laptop sends a transfer.
     let devices = vec![entry(&laptop, t), entry(&phone, t)];
     let phone_key = phone.credential.device_key().to_owned();
     assert!(sync(&mut phone, &devices, &[], &[], std::slice::from_ref(&g1), &[], None, t).opened.is_empty());
     assert_eq!(sync(&mut laptop, &devices, &[], &[], &[], &[], None, t).waiting, vec![phone_key.clone()]);
-    let transfers = laptop.archive_transfers_for(&phone_key, t).unwrap();
+    let transfers = laptop.archive_transfers_for(&phone_key, t, &[], usize::MAX).unwrap();
     assert_eq!(transfers.len(), 1);
     laptop.archive_transfers_sent(&transfers.iter().map(|(tag, _)| tag.clone()).collect::<Vec<_>>()).unwrap();
     laptop.take_changes();
@@ -85,7 +85,7 @@ fn devices_share_the_archive_through_generations_transfers_and_the_recovery_code
     let recovery_key = RecoveryArchiveKey::sign(&key(1), 1, recovery_public, t);
     let recovery = vec![(recovery_key.statement(), recovery_key.signature.clone())];
     assert_eq!(sync(&mut laptop, &devices, &recovery, &[], &[], &[], None, t).safe, None);
-    let g2 = laptop.archive_create_manifest(t).unwrap();
+    let g2 = laptop.archive_create_manifest(t, &[]).unwrap();
     assert_eq!(sync(&mut laptop, &devices, &recovery, &[], std::slice::from_ref(&g2), &[], None, t).safe, Some(2));
     // A new device with only the recovery code opens generation 2.
     let mut fresh = device(13, t);
@@ -94,7 +94,20 @@ fn devices_share_the_archive_through_generations_transfers_and_the_recovery_code
     let state = sync(&mut fresh, &all, &recovery, &[], &[g1.clone(), g2.clone()], &[], None, t);
     assert!(state.opened.is_empty());
     // The code given later opens the generation it accepted before.
-    assert_eq!(sync(&mut fresh, &all, &recovery, &[], &[], &[], Some(&code), t).opened, vec![2]);
+    assert_eq!(
+        sync(
+            &mut fresh,
+            &all,
+            &recovery,
+            &[],
+            &[],
+            &[],
+            Some(archive::recovery_key_pair(&code, &key(1).verifying_key().to_bytes()).0),
+            t
+        )
+        .opened,
+        vec![2]
+    );
 
     // Revoking the phone makes generation 2 unsafe; generation 3 leaves it out.
     let revoked_at = t + 1;
@@ -109,7 +122,7 @@ fn devices_share_the_archive_through_generations_transfers_and_the_recovery_code
         sync(&mut laptop, &only_laptop, &recovery, std::slice::from_ref(&revocation), &[], &[], None, t + 2).safe,
         None
     );
-    let g3 = laptop.archive_create_manifest(t + 2).unwrap();
+    let g3 = laptop.archive_create_manifest(t + 2, &[]).unwrap();
     assert_eq!(
         sync(&mut laptop, &only_laptop, &recovery, &[], std::slice::from_ref(&g3), &[], None, t + 2).safe,
         Some(3)
@@ -119,7 +132,7 @@ fn devices_share_the_archive_through_generations_transfers_and_the_recovery_code
     assert!(m3.revocations.iter().any(|r| r.device_key == phone_key));
 
     // A different manifest for a generation it saw is refused; the state reloads.
-    let other = laptop.archive_create_manifest(t + 2).unwrap();
+    let other = laptop.archive_create_manifest(t + 2, &[]).unwrap();
     // (The test's epoch has no group record, which loading requires: leave it out.)
     let mut stores = laptop.durable.clone();
     stores.epochs.clear();
@@ -157,23 +170,23 @@ fn revocations_carried_by_manifests_and_expiring_certificates_narrow_recipients(
     let tablet_key = tablet.credential.device_key().to_owned();
     let devices = vec![entry(&laptop, t), entry(&phone, t), entry(&tablet, t)];
     sync(&mut laptop, &devices, &[], &[], &[], &[], None, t);
-    let g1 = laptop.archive_create_manifest(t).unwrap();
+    let g1 = laptop.archive_create_manifest(t, &[]).unwrap();
     assert_eq!(sync(&mut laptop, &devices, &[], &[], std::slice::from_ref(&g1), &[], None, t).safe, Some(1));
     // Rechecked when sealing: once the tablet's certificate expires, generation 1 is unsafe.
-    assert!(laptop.archive_seal(100, t).unwrap().is_some());
-    assert!(laptop.archive_seal(100, t + 20_000).unwrap().is_none());
+    assert!(laptop.archive_seal(100, t, &[]).unwrap().is_some());
+    assert!(laptop.archive_seal(100, t + 20_000, &[]).unwrap().is_none());
 
     // The phone learns of the tablet's revocation and makes generation 2 carrying it.
     let revocation = revoke(&tablet_key, t + 1);
     sync(&mut phone, &devices, &[], std::slice::from_ref(&revocation), std::slice::from_ref(&g1), &[], None, t + 2);
-    let g2 = phone.archive_create_manifest(t + 2).unwrap();
+    let g2 = phone.archive_create_manifest(t + 2, &[]).unwrap();
     // The laptop's feed lacks the revocation; the manifest's revocation still leaves the tablet
     // out of transfers and new generations.
     let state = sync(&mut laptop, &devices, &[], &[], std::slice::from_ref(&g2), &[], None, t + 2);
     assert_eq!(state.safe, Some(2));
     assert!(state.waiting.is_empty());
-    assert!(laptop.archive_transfers_for(&tablet_key, t + 2).is_err());
-    let g3 = Manifest::parse(&laptop.archive_create_manifest(t + 3).unwrap(), &public(&key(1))).unwrap();
+    assert!(laptop.archive_transfers_for(&tablet_key, t + 2, &[], usize::MAX).is_err());
+    let g3 = Manifest::parse(&laptop.archive_create_manifest(t + 3, &[]).unwrap(), &public(&key(1))).unwrap();
     assert!(g3.recipients.iter().all(|r| r.device_key != tablet_key));
 
     // A reader refuses a manifest whose creator its own carried revocations revoked.
@@ -219,7 +232,7 @@ fn a_device_keeps_the_first_archive_key_of_each_device() {
     let record = laptop.archive.as_ref().unwrap();
     assert_eq!(record.devices[&phone_key].x25519, phone.device.hpke_public);
     assert!(!record.current(t).contains_key(&phone_key));
-    let g1 = Manifest::parse(&laptop.archive_create_manifest(t).unwrap(), &public(&key(1))).unwrap();
+    let g1 = Manifest::parse(&laptop.archive_create_manifest(t, &[]).unwrap(), &public(&key(1))).unwrap();
     assert!(g1.recipients.iter().all(|r| r.device_key != phone_key));
 }
 
@@ -231,7 +244,7 @@ fn transfers_are_owed_per_generation_and_recipient() {
     let phone_key = phone.credential.device_key().to_owned();
     let alone = vec![entry(&laptop, t)];
     sync(&mut laptop, &alone, &[], &[], &[], &[], None, t);
-    let g1 = laptop.archive_create_manifest(t).unwrap();
+    let g1 = laptop.archive_create_manifest(t, &[]).unwrap();
     sync(&mut laptop, &alone, &[], &[], std::slice::from_ref(&g1), &[], None, t);
     let code = [5u8; 20];
     let (_, recovery_public) = archive::recovery_key_pair(&code, &key(1).verifying_key().to_bytes());
@@ -239,13 +252,13 @@ fn transfers_are_owed_per_generation_and_recipient() {
     let recovery = vec![(recovery_key.statement(), recovery_key.signature.clone())];
     // Generation 1 is not sealed to the new recovery key: it is owed a transfer.
     assert_eq!(sync(&mut laptop, &alone, &recovery, &[], &[], &[], None, t).waiting, vec!["recovery:1".to_owned()]);
-    let g2 = laptop.archive_create_manifest(t).unwrap();
+    let g2 = laptop.archive_create_manifest(t, &[]).unwrap();
     sync(&mut laptop, &alone, &recovery, &[], std::slice::from_ref(&g2), &[], None, t);
 
     let both = vec![entry(&laptop, t), entry(&phone, t)];
     let state = sync(&mut laptop, &both, &recovery, &[], &[], &[], None, t);
     assert_eq!(state.waiting, vec![phone_key.clone(), "recovery:1".to_owned()]);
-    let transfers = laptop.archive_transfers_for(&phone_key, t).unwrap();
+    let transfers = laptop.archive_transfers_for(&phone_key, t, &[], usize::MAX).unwrap();
     assert_eq!(
         transfers.iter().map(|(tag, _)| tag.clone()).collect::<Vec<_>>(),
         [format!("1/{phone_key}"), format!("2/{phone_key}")]
@@ -255,9 +268,9 @@ fn transfers_are_owed_per_generation_and_recipient() {
     laptop.take_changes();
     let state = sync(&mut laptop, &both, &recovery, &[], &[], &[], None, t);
     assert!(state.waiting.contains(&phone_key));
-    assert_eq!(laptop.archive_transfers_for(&phone_key, t).unwrap().len(), 1);
+    assert_eq!(laptop.archive_transfers_for(&phone_key, t, &[], usize::MAX).unwrap().len(), 1);
     // A transfer on Connect counts, whoever sent it.
-    let recovery_transfers = laptop.archive_transfers_for("recovery:1", t).unwrap();
+    let recovery_transfers = laptop.archive_transfers_for("recovery:1", t, &[], usize::MAX).unwrap();
     let bytes: Vec<Vec<u8>> = recovery_transfers.into_iter().map(|(_, b)| b).collect();
     let state = sync(&mut laptop, &both, &recovery, &[], &[], &bytes, None, t);
     assert_eq!(state.waiting, vec![phone_key]);
@@ -270,7 +283,7 @@ fn held_keys_keep_conflicts_and_settle_when_the_group_appears() {
     let mut laptop = device(11, t);
     let devices = vec![entry(&laptop, t)];
     sync(&mut laptop, &devices, &[], &[], &[], &[], None, t);
-    let g1 = laptop.archive_create_manifest(t).unwrap();
+    let g1 = laptop.archive_create_manifest(t, &[]).unwrap();
     sync(&mut laptop, &devices, &[], &[], std::slice::from_ref(&g1), &[], None, t);
     let descriptor = crate::SignedDescriptor::sign(
         crate::Descriptor {
@@ -331,9 +344,9 @@ fn a_stored_archive_record_is_checked_on_load() {
     let mut laptop = device(11, t);
     let devices = vec![entry(&laptop, t)];
     sync(&mut laptop, &devices, &[], &[], &[], &[], None, t);
-    let g1 = laptop.archive_create_manifest(t).unwrap();
+    let g1 = laptop.archive_create_manifest(t, &[]).unwrap();
     sync(&mut laptop, &devices, &[], &[], std::slice::from_ref(&g1), &[], None, t);
-    let g2 = laptop.archive_create_manifest(t).unwrap();
+    let g2 = laptop.archive_create_manifest(t, &[]).unwrap();
     sync(&mut laptop, &devices, &[], &[], std::slice::from_ref(&g2), &[], None, t);
     let stored: serde_json::Value = serde_json::from_slice(&laptop.durable.groups[KEY]).unwrap();
     let load = |edit: &dyn Fn(&mut serde_json::Value)| {
@@ -375,4 +388,28 @@ fn unsigned_certificate_times_are_bounded_before_any_arithmetic() {
     let mut reader = device(12, t);
     sync(&mut reader, &[forged], &[], &[], &[], &[], None, t);
     assert!(reader.archive.as_ref().unwrap().current(t).is_empty());
+}
+
+#[test]
+fn uploads_transfers_and_new_generations_judge_the_feed_now() {
+    let t = now();
+    let mut laptop = device(11, t);
+    let phone = device(12, t);
+    let tablet = device(14, t);
+    let tablet_key = tablet.credential.device_key().to_owned();
+    let devices = vec![entry(&laptop, t), entry(&phone, t)];
+    sync(&mut laptop, &devices, &[], &[], &[], &[], None, t);
+    let g1 = laptop.archive_create_manifest(t, &[]).unwrap();
+    sync(&mut laptop, &devices, &[], &[], std::slice::from_ref(&g1), &[], None, t);
+    let all = vec![entry(&laptop, t), entry(&phone, t), entry(&tablet, t)];
+    sync(&mut laptop, &all, &[], &[], &[], &[], None, t);
+    assert_eq!(laptop.archive_transfers_for(&tablet_key, t, &[], usize::MAX).unwrap().len(), 1);
+    // The feed revokes the tablet before the next sync: no transfer to it, generation 1 is unsafe
+    // and the next generation leaves it out.
+    let revoked = [revoke(&tablet_key, t)];
+    assert!(laptop.archive_transfers_for(&tablet_key, t, &revoked, usize::MAX).is_err());
+    assert!(laptop.archive_seal(100, t, &revoked).unwrap().is_none());
+    let g2 = Manifest::parse(&laptop.archive_create_manifest(t, &revoked).unwrap(), &public(&key(1))).unwrap();
+    assert!(g2.recipients.iter().all(|r| r.device_key != tablet_key));
+    assert!(g2.revocations.iter().any(|r| r.device_key == tablet_key));
 }

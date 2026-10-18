@@ -138,4 +138,11 @@ export interface HistoryJob { publication: HpkePublication | null; kind: "histor
 export interface PackageJob { kind: "packages"; server: string; packages: string[]; last_resort: string; expires_at: number }
 /** A channel group joined by external commit still owes `mls.history.request`. */
 export interface RequestJob { kind: "request"; server: string; group: string }
-export type Job = HistoryJob | PackageJob | RequestJob;
+/** Where the key archive left off (docs/e2e-build.md, section 7): the newest generation it
+ * accepted, the record and transfer cursors, and the generations it could open when it read
+ * records (a newly opened one reads them again from the start). */
+export interface ArchiveJob { kind: "archive"; newest: number; records: number; transfers: number; opened: number[] }
+export type Job = HistoryJob | PackageJob | RequestJob | ArchiveJob;
+/** What {@link ArchiveJob}'s agent sync reports (`ArchiveState`). */
+export interface ArchiveState { newest: number | null; safe: number | null; opened: number[]; waiting: string[]; recovery_version: number | null }
+export interface ArchiveUpload { generation: number; records: [string, string][]; epochs: string[] }

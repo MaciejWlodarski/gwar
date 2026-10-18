@@ -233,15 +233,17 @@ enum Request {
         revocations: Vec<gwar_mls::agent::ArchiveRevocation>,
         manifests: Vec<Vec<u8>>,
         transfers: Vec<Vec<u8>>,
-        recovery_code: Option<Vec<u8>>,
+        recovery_secret: Option<[u8; 32]>,
         now: i64,
     },
     ArchiveCreateManifest {
         now: i64,
+        revocations: Vec<gwar_mls::agent::ArchiveRevocation>,
     },
     ArchiveSeal {
         limit: usize,
         now: i64,
+        revocations: Vec<gwar_mls::agent::ArchiveRevocation>,
     },
     ArchiveUploaded {
         epochs: Vec<String>,
@@ -252,6 +254,8 @@ enum Request {
     ArchiveTransfersFor {
         recipient: String,
         now: i64,
+        revocations: Vec<gwar_mls::agent::ArchiveRevocation>,
+        limit: usize,
     },
     ArchiveTransfersSent {
         tags: Vec<String>,
@@ -560,26 +564,22 @@ impl Agent {
                 output(a.accept_chain(&server, &conversation, &chain).map_err(error)?)
             }
             Request::ArchiveDeviceKey { now } => output(a.archive_device_key(now).map_err(error)?),
-            Request::ArchiveSync { devices, recovery, revocations, manifests, transfers, recovery_code, now } => {
+            Request::ArchiveSync { devices, recovery, revocations, manifests, transfers, recovery_secret, now } => {
                 output(
-                    a.archive_sync(
-                        &devices,
-                        &recovery,
-                        &revocations,
-                        &manifests,
-                        &transfers,
-                        recovery_code.as_deref(),
-                        now,
-                    )
-                    .map_err(error)?,
+                    a.archive_sync(&devices, &recovery, &revocations, &manifests, &transfers, recovery_secret, now)
+                        .map_err(error)?,
                 )
             }
-            Request::ArchiveCreateManifest { now } => output(a.archive_create_manifest(now).map_err(error)?),
-            Request::ArchiveSeal { limit, now } => output(a.archive_seal(limit, now).map_err(error)?),
+            Request::ArchiveCreateManifest { now, revocations } => {
+                output(a.archive_create_manifest(now, &revocations).map_err(error)?)
+            }
+            Request::ArchiveSeal { limit, now, revocations } => {
+                output(a.archive_seal(limit, now, &revocations).map_err(error)?)
+            }
             Request::ArchiveUploaded { epochs } => output(a.archive_uploaded(&epochs).map_err(error)?),
             Request::ArchiveImport { records } => output(a.archive_import(&records).map_err(error)?),
-            Request::ArchiveTransfersFor { recipient, now } => {
-                output(a.archive_transfers_for(&recipient, now).map_err(error)?)
+            Request::ArchiveTransfersFor { recipient, now, revocations, limit } => {
+                output(a.archive_transfers_for(&recipient, now, &revocations, limit).map_err(error)?)
             }
             Request::ArchiveTransfersSent { tags } => output(a.archive_transfers_sent(&tags).map_err(error)?),
             Request::AcceptPrivateChain { server, conversation, chain, group_info, tree, now, revocations } => {

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   changePassword,
   changeRecoveryCode,
+  newRecoveryCode,
   createAccount,
   normalizeHandle,
   pickUpCertificate,
@@ -79,6 +80,30 @@ describe("account flows", () => {
     await expect(signIn({ handle: "erin", password: "old password" }, deps())).rejects.toMatchObject({ kind: "unauthorized" });
     expect((await signIn({ handle: "erin", password: "new password" }, deps())).accountKey).toBe(rec.accountKey);
   }, 60_000);
+
+it("a recovery code change whose reply was lost goes on once the new code works", async () => {
+  const { service, deps, stored } = setup();
+  const created = await createAccount({ handle: "lost", password: "right password" }, deps());
+  await deps().store.save(created.record);
+  const code = newRecoveryCode();
+  // Connect takes the change, but the reply never arrives.
+  const lossy = { ...deps(), api: new ConnectApi("https://c", (async (url: string, init?: RequestInit) => {
+    const response = await service.fetch(url, init);
+    if (String(url).endsWith("/account/recovery")) throw new TypeError("network");
+    return response;
+  }) as typeof fetch) };
+  const next = await changeRecoveryCode(created.record, "right password", code, lossy);
+  expect(next.archiveRecovery).toBeUndefined();
+  expect(service.archive.get("lost")?.recovery.map(k => k.statement.split("\n")[2])).toEqual(["1"]);
+  expect(stored()?.archiveRecovery).toBeUndefined();
+  // A change that never reached Connect fails, and leaves nothing to publish.
+  const dropped = { ...deps(), api: new ConnectApi("https://c", (async (url: string, init?: RequestInit) => {
+    if (String(url).endsWith("/account/recovery")) throw new TypeError("network");
+    return service.fetch(url, init);
+  }) as typeof fetch) };
+  await expect(changeRecoveryCode(next, "right password", newRecoveryCode(), dropped)).rejects.toMatchObject({ kind: "network" });
+  expect(stored()?.archiveRecovery).toBeUndefined();
+}, 60_000);
 
   it("recovers with the code (any spelling), sets a new password and enrols the device", async () => {
     const { deps } = setup();
@@ -381,8 +406,9 @@ describe("signed credential updates", () => {
 it("rotates recovery credentials with an account-signed update", async () => {
   const { deps } = setup();
   const created = await createAccount({ handle: "rotation", password: "right password" }, deps());
-  const rotated = await changeRecoveryCode(created.record, "right password", deps());
+  const code = newRecoveryCode();
+  await changeRecoveryCode(created.record, "right password", code, deps());
   await expect(recover({ handle: "rotation", code: created.recoveryCode, newPassword: "new password" }, deps())).rejects.toMatchObject({ kind: "unauthorized" });
-  const back = await recover({ handle: "rotation", code: rotated.recoveryCode, newPassword: "new password" }, deps());
+  const back = await recover({ handle: "rotation", code, newPassword: "new password" }, deps());
   expect(back.accountKey).toBe(created.record.accountKey);
 }, 60_000);

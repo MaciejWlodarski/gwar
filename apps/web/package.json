@@ -16,6 +16,7 @@
     "e2e:native-audio": "node e2e/native-audio.mjs",
     "e2e:native-voice": "node e2e/native-voice.mjs",
     "e2e:mls": "node e2e/mls.mjs",
+    "e2e:archive": "node e2e/archive.mjs",
     "e2e:private": "node e2e/private.mjs",
     "e2e:voice": "node e2e/voice.mjs",
     "e2e:dm": "node --test e2e/processes.test.mjs && node e2e/dm.mjs"
