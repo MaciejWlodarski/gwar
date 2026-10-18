@@ -245,6 +245,7 @@ export const en = {
   "channel.addRole": "Add everyone with {role}",
   "channel.membersSigned": "Member list signed by {name}, {date}",
   "channel.membersAuthority": "Only the server's owner, confirmers and managers can create or edit an encrypted private channel (Server settings → Ownership).",
+  "channel.membersLoading": "Loading the signed member list…",
   "tree.private": "Private channel",
   "channel.encrypted": "End-to-end encrypted",
   "channel.encryptedHint": "Only members' devices can read messages. TeamSpeak users can't join.",

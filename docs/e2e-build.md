@@ -2504,15 +2504,23 @@ gwar managers v1
 - **Who commits:**
   - The owner, confirmers and managers are always admitted. Their devices
     join every private group, which lets them change it.
-  - Editing access in the interface signs a new member list (roles are
-    expanded to their current members at signing time) and commits it with
-    the removals.
+  - Editing access in the interface signs a new member list and commits it
+    with the removals. "Add everyone with a role" adds the role's members
+    when chosen, so the person sees every uid before signing; the edit is
+    the members added and removed in the dialog, applied to the group's
+    current list at signing (changes others made meanwhile stay). A
+    creation's chosen members are kept durably until its first group holds
+    them: if another authority's group wins first, they are added to it
+    while its list is still the initial one; once the list was edited, the
+    edit decides and the choice is dropped. A restart's successor carries
+    its predecessor's current list, never a creation's choice.
   - When a newer manager pair is accepted, every member carries it into its
     private groups as above (one group at a time, random delay up to 10 s, so
     concurrent carriers settle on the first commit).
   - A stale commit is recomputed from the new epoch. A losing list edit
     needs a new signature at the next seq; the old signed list is never
-    retried.
+    retried: the interface's edit is applied again to the newer list and
+    signed anew, and saving ends only once the list holds it.
 - **Offers.** A manager who cannot commit to a group, because it is not a
   member and the group's lists are no longer current, sends
   `mls.access.offer {group, extension}` with a fresh signed extension.

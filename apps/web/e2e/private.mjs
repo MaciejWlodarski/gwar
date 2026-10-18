@@ -97,12 +97,19 @@ try {
   assert.equal((await outsider.evaluate(m => window.mls.runtime.openMessage(m), message)).ok, undefined);
   console.log("PASS an outsider holds no group and cannot read it");
 
-  // A new member list without the member removes its device in the same commit.
-  await owner.evaluate(id => window.mls.runtime.setPrivateMembers(id, []), channel);
+  // An edit is the members added and removed, applied to the list as it is when signing: one
+  // made from a dialog opened before another edit keeps that other edit.
+  const outsiderUid = await outsider.evaluate(() => window.mls.uid);
+  await owner.evaluate(({ id, uid }) => window.mls.runtime.setPrivateMembers(id, [uid], []), { id: channel, uid: outsiderUid });
+  await until("the added outsider joins", async () => (await outsider.evaluate(c => window.mls.runtime.status(c), conversation)) === "ready");
+  // (This dialog saw only the member; it removes the member.)
+  await owner.evaluate(({ id, uid }) => window.mls.runtime.setPrivateMembers(id, [], [uid]), { id: channel, uid: memberUid });
+  assert.deepEqual(await owner.evaluate(id => window.mls.runtime.privateMembers(id)?.members, channel), [outsiderUid]);
   await until("the member loses the channel", async () => (await member.evaluate(c => window.mls.runtime.status(c), conversation)) !== "ready");
   const after = await owner.evaluate(c => window.mls.seal(c), conversation);
   assert.equal((await member.evaluate(m => window.mls.runtime.openMessage(m), after)).ok, undefined);
-  console.log("PASS a new member list removes the member, who reads nothing after it");
+  assert.equal((await outsider.evaluate(m => window.mls.runtime.openMessage(m), after)).ok?.text, "encrypted hello");
+  console.log("PASS edits apply to the current list: the member is removed, the newer addition stays");
   await Promise.all(pages.map(page => page.evaluate(() => window.mls.runtime.close())));
 } catch (error) {
   for (const child of children) console.error(`--- ${child.spawnargs.join(" ")}\n${child.output}`);

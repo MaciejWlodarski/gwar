@@ -142,7 +142,9 @@ export interface RequestJob { kind: "request"; server: string; group: string }
  * accepted, the record and transfer cursors, and the generations it could open when it read
  * records (a newly opened one reads them again from the start). */
 export interface ArchiveJob { kind: "archive"; newest: number; records: number; transfers: number; opened: number[] }
-export type Job = HistoryJob | PackageJob | RequestJob | ArchiveJob;
+/** The members chosen when creating an encrypted private channel, kept until its group is settled (6c). */
+export interface MembersJob { kind: "members"; server: string; conversation: string; members: string[] }
+export type Job = HistoryJob | PackageJob | RequestJob | ArchiveJob | MembersJob;
 /** What {@link ArchiveJob}'s agent sync reports (`ArchiveState`). */
 export interface ArchiveState { newest: number | null; safe: number | null; opened: number[]; waiting: string[]; recovery_version: number | null }
 export interface ArchiveUpload { generation: number; records: [string, string][]; epochs: string[] }

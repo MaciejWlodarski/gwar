@@ -250,8 +250,20 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
   const ownerView = useOwnerView();
   const authority = !!ownerView && !!ownerView.anchor_seq && (ownerView.owner === me || ownerView.confirmers.includes(me) || ownerView.managers.includes(me));
   const encryptedPrivate = props.mode === "create" ? offerEncryption && encrypted && privateChannel : !!existing?.private && !!existing?.encrypted;
-  const [signedMembers] = useState(() => (existing && encryptedPrivate ? controller.privateMembers(existing.id) : null));
+  const [signedMembers, setSignedMembers] = useState(() => (existing && encryptedPrivate ? controller.privateMembers(existing.id) : null));
   const [members, setMembers] = useState<ChannelAccess>(() => ({ roles: [], users: signedMembers?.members ?? (me ? [me] : []) }));
+  // Opened before this device holds the list: it is shown (and can be edited) once it does.
+  const editingId = props.mode === "edit" && existing && encryptedPrivate ? existing.id : null;
+  useEffect(() => {
+    if (editingId === null || signedMembers) return;
+    const timer = setInterval(() => {
+      const view = controller.privateMembers(editingId);
+      if (!view) return;
+      setSignedMembers(view);
+      setMembers({ roles: [], users: view.members });
+    }, 1_000);
+    return () => clearInterval(timer);
+  }, [editingId, signedMembers]);
   const signerName = useMemberName(signedMembers?.signer_uid ?? "", (signedMembers?.signer_uid ?? "").slice(0, 8));
   // An encrypted channel has no password: its messages are readable only by its group anyway.
   const sealedChannel = (offerEncryption ? encrypted : !!existing?.encrypted) || isPrivate;
@@ -307,9 +319,12 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
           ...(parentChanged ? (parentId === null ? { move_to_root: true } : { parent: parentId }) : {}),
           ...(existing.private && !encryptedPrivate && !sameAccess(openedAccess, access) ? { access: rebaseAccess(openedAccess, access, existing.access) } : {}),
         });
-        const before = new Set(signedMembers?.members ?? []);
-        if (encryptedPrivate && signedMembers && (before.size !== members.users.length || members.users.some((u) => !before.has(u)))) {
-          await controller.setPrivateMembers(existing.id, members.users);
+        // Only the changes made here, applied to the list as it is when signing (others' changes stay).
+        const before = signedMembers?.members ?? [];
+        const added = members.users.filter((u) => !before.includes(u));
+        const removed = before.filter((u) => !members.users.includes(u));
+        if (encryptedPrivate && signedMembers && (added.length || removed.length)) {
+          await controller.setPrivateMembers(existing.id, added, removed);
         }
       }
       close();
@@ -372,7 +387,8 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
         {isPrivate && !encryptedPrivate && <AccessPicker value={access} onChange={setAccess} />}
         {encryptedPrivate && (
           <>
-            <AccessPicker value={members} onChange={setMembers} membersOnly disabled={!authority} />
+            <AccessPicker value={members} onChange={setMembers} membersOnly disabled={!authority || (editingId !== null && !signedMembers)} />
+            {editingId !== null && !signedMembers && <p className="text-xs text-subtle">{t("channel.membersLoading")}</p>}
             {signedMembers && (
               <p className="text-xs text-subtle">{t("channel.membersSigned", { name: signerName, date: new Date(signedMembers.signed_at).toLocaleString() })}</p>
             )}
