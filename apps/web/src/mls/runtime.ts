@@ -18,11 +18,14 @@ import { VoiceCall } from "./voice";
 import type { VoiceState } from "../proto/VoiceState";
 import type { Managers } from "../proto/Managers";
 import type { OwnerInfo } from "../proto/OwnerInfo";
-import type { AgentFactory, Change, OwnerCheck, OwnerGeneration, OwnerView, CommitOutbox, ConversationStatus, Gate, GroupSummary, HistoryJob, OpenResult, PackageJob, Plaintext, RequestJob, Resolution, Revocation, Roster, SealedFields } from "./types";
+import type { AccessView, AgentFactory, Change, OwnerCheck, OwnerGeneration, OwnerView, CommitOutbox, ConversationStatus, Gate, GroupSummary, HistoryJob, OpenResult, PackageJob, Plaintext, RequestJob, Resolution, Revocation, Roster, SealedFields } from "./types";
 import { repairable, usable } from "./types";
+import { memberListRenewalDue } from "../lib/managers";
 const bytes = (value: string): number[] => [...decodeBase64Url(value)];
 /** The agent's error when a private group's lists give this device no current authority. */
 const WAITING = "waiting for a channel manager";
+/** The agent's refusal of a plain restart chain for a private conversation. */
+const PRIVATE_CHAIN = "needs its final GroupInfo";
 const encoded = (value: number[]): string => encodeBase64Url(new Uint8Array(value));
 /** The DS protocol currently uses safe JSON integers; core epochs remain u64 strings. */
 function wireEpoch(value: string | number): number {
@@ -137,6 +140,7 @@ export class MlsRuntime {
   private readonly offers = new Map<string, string>();
   private readonly repairAt = new Map<string, number>();
   private readonly offered = new Map<string, number>();
+  private readonly renewedAt = new Map<string, number>();
   private wakeAt: number | undefined;
   /** Volatile voice calls under this device lease, closed with it. */
   private readonly calls = new Set<VoiceCall>();
@@ -445,6 +449,10 @@ export class MlsRuntime {
   private inventory(): GroupSummary[] { return this.engine.query({ inventory: { server: this.server } }); }
   private summary(group: string): GroupSummary | undefined { return this.inventory().find(g => encoded(g.group) === group); }
   private args(group: string) { return { server: this.server, group: [...decodeFixed(group, 32)] }; }
+  /** A private channel's creation settles as of now (staged adoption, 6c). */
+  private settleArgs(group: string) {
+    return this.summary(group)?.private ? { ...this.args(group), now: this.now(), revocations: this.options.revocations() } : this.args(group);
+  }
   private gate(group: string): Gate { return this.engine.query({ gate: { ...this.args(group), now: this.now(), revocations: this.options.revocations() } }); }
   private outbox(group: string): CommitOutbox | null { return this.engine.query({ outbox: this.args(group) }); }
   private updateStatuses(securing = false): void {
@@ -508,13 +516,34 @@ export class MlsRuntime {
         if (this.offers.get(group) === offer) this.offers.delete(group);
       }
     }
-    if (!repairable(gate)) { this.repairAt.delete(group); return false; }
+    if (!repairable(gate)) { this.repairAt.delete(group); return this.renewMembers(group, gate); }
     const at = this.repairAt.get(group);
     if (at === undefined) { this.repairAt.set(group, this.now() + Math.random() * 10_000); }
     if (at === undefined || at > this.now()) { this.wakeAt = Math.min(this.wakeAt ?? Infinity, this.repairAt.get(group)!); return false; }
     this.repairAt.delete(group);
     await this.engine.op({ commit_access: { ...this.args(group), members: null, now: this.now(), revocations: this.options.revocations() } });
     return true;
+  }
+  /** The owner's, confirmers' and managers' clients re-sign a member list (seq + 1, the same
+   * members) when it is older than 60 days, or its signer's certificate expires within 7 days or
+   * was revoked (6c, "Newcomers"); at most every ten minutes per group, and not for expiry by a
+   * device whose own certificate expires as soon. */
+  private async renewMembers(group: string, gate: Gate): Promise<boolean> {
+    const list = this.renewalDue(group, gate);
+    if (!list) return false;
+    const now = this.now();
+    this.renewedAt.set(group, now);
+    await this.engine.op({ commit_access: { ...this.args(group), members: list.members, now, revocations: this.options.revocations() } });
+    return true;
+  }
+  /** The member list to re-sign now, if this device's user is an authority and it is due. */
+  private renewalDue(group: string, gate: Gate): AccessView | null {
+    const me = this.uid, view = this.owner;
+    if (gate.access?.kind !== "current" || !view || !(view.owner === me || view.confirmers.includes(me) || view.managers.includes(me))) return null;
+    if (this.now() - (this.renewedAt.get(group) ?? -Infinity) < 10 * 60_000) return null;
+    const list = this.engine.query<AccessView | null>({ access_view: this.args(group) });
+    if (!list || !memberListRenewalDue(list, this.now(), this.options.identity.device?.expires_at ?? Infinity, this.options.revocations())) return null;
+    return list;
   }
   /** Offers fresh lists for a private group this device could not join, when its user is the
    * owner, a confirmer or a manager. */
@@ -622,7 +651,7 @@ export class MlsRuntime {
     const groups = await this.groups();
     for (const g of this.inventory()) if (g.record.status === "creating" && this.enabled(g.conversation)) {
       const winner = groups.find(remote => remote.conversation === g.conversation);
-      await this.transition({ settle: { ...this.args(encoded(g.group)), winner: winner ? bytes(winner.group) : null } });
+      await this.transition({ settle: { ...this.settleArgs(encoded(g.group)), winner: winner ? bytes(winner.group) : null } });
     }
     this.held = await this.acceptRestarts(groups);
     await this.welcomes();
@@ -676,7 +705,19 @@ export class MlsRuntime {
       const page: ResponseMap["mls.group_history"] = await this.request("mls.group_history", { conversation, after });
       chain.push(...page.incarnations); after = page.next;
     } while (after);
-    await this.transition({ accept_chain: { server: this.server, conversation, chain: chain.map(i => ({ group: bytes(i.group), descriptor: bytes(i.descriptor) })) } });
+    const links = chain.map(i => ({ group: bytes(i.group), descriptor: bytes(i.descriptor) }));
+    try {
+      await this.transition({ accept_chain: { server: this.server, conversation, chain: links } });
+    } catch (error) {
+      if (!(error instanceof AgentOperationError) || !String(error.message).includes(PRIVATE_CHAIN)) throw error;
+      await this.engine.reload();
+      // A private conversation: adopted only once its final successor gives current authority
+      // (staged adoption, 6c); otherwise it stays pending and the device waits for a manager.
+      const tip = chain[chain.length - 1]!.group;
+      const { info, tree } = await this.groupInfo(tip);
+      const result = await this.transition<{ group: number[]; adopted: boolean }>({ accept_private_chain: { server: this.server, conversation, chain: links, group_info: info, tree, now: this.now(), revocations: this.options.revocations() } });
+      if (!result.adopted) { await this.offerAccess(tip, info, tree); throw new Error(WAITING, { cause: error }); }
+    }
     this.triggers.delete(conversation);
   }
   /** The server showed this device's live pin behind its durable checkpoint.
@@ -773,7 +814,7 @@ export class MlsRuntime {
     const local = this.summary(remote.group), gate = this.gate(remote.group);
     return !remote.pending && local?.record.checkpoint?.epoch === String(remote.epoch) && gate.status === "active"
       && !gate.rejoin && !gate.server_pending && !gate.blocked.length && !gate.pending_commit && !repairable(gate)
-      && !this.offers.has(remote.group)
+      && !this.offers.has(remote.group) && !this.renewalDue(remote.group, gate)
       && this.syncedVersions.has(remote.group) && this.syncedVersions.get(remote.group) === (this.groupVersions.get(remote.group) ?? 0);
   }
   /** After joining, ask the server to route history to this device; senders
@@ -1131,7 +1172,7 @@ export class MlsRuntime {
       this.statuses.set(conversation, "creating"); this.notify();
       const known = (await this.groups()).find(g => g.conversation === conversation);
       for (const g of this.inventory()) if (g.conversation === conversation && g.record.status === "creating") {
-        await this.transition({ settle: { ...this.args(encoded(g.group)), winner: known ? bytes(known.group) : null } });
+        await this.transition({ settle: { ...this.settleArgs(encoded(g.group)), winner: known ? bytes(known.group) : null } });
       }
       if (known && (await this.acceptRestarts([known])).size) { this.held.add(conversation); throw new Error("MLS conversation is still securing"); }
       if (known) { this.held.delete(conversation); await this.syncGroup(known.group, known.pending); this.updateStatuses(); return; }
@@ -1155,7 +1196,7 @@ export class MlsRuntime {
       if (!found) throw error;
       winner = found.group;
     }
-    await this.transition({ settle: { ...this.args(d.group), winner: bytes(winner) } });
+    await this.transition({ settle: { ...this.settleArgs(d.group), winner: bytes(winner) } });
     // Another device's restart is joined after its chain is accepted, on the next pass.
     if (successor && winner !== d.group) { this.schedule(); return; }
     await this.syncGroup(winner);

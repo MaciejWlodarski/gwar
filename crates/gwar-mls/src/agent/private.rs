@@ -351,8 +351,7 @@ impl Agent {
         revocations: &dyn Revocations,
     ) -> Result<Vec<u8>> {
         super::current_time(now)?;
-        let info = super::info(group_info)?;
-        let descriptor = client_context(info.group_context(), server)?;
+        let (descriptor, context) = self.verified_info(server, group_info, tree)?;
         if !rules::is_private(&descriptor) {
             return Err(Invalid("not a private channel"));
         }
@@ -360,22 +359,10 @@ impl Agent {
         let record = self.servers.get(server).ok_or(AgentError::Waiting)?;
         let chain = record.chain(server)?;
         let (anchor, list) = record.pair()?.ok_or(AgentError::Waiting)?;
-        let shown = rules::access(info.group_context()).ok_or(Invalid("access lists"))?;
-        let tree_in = super::info_tree(&info, descriptor.descriptor.kind, tree)?;
-        let verified = tree_in
-            .clone()
-            .into_verified(crate::SUITE, self.provider.crypto(), info.group_id())
-            .map_err(err("ratchet tree"))?;
-        self.tree_rule(&descriptor, info.group_context(), verified.leaves())?;
+        let shown = rules::access(&context).ok_or(Invalid("access lists"))?;
         if !shown.valid_when_signed(&chain, &id) {
             return Err(Invalid("the group's access lists"));
         }
-        // Verification only: a throwaway provider, and nothing is committed.
-        MlsGroup::external_commit_builder()
-            .with_ratchet_tree(tree_in)
-            .skip_lifetime_validation()
-            .build_group(&crate::crypto::Provider::default(), info, self.with_key())
-            .map_err(err("group info"))?;
         let own = self.groups.get(&group_key(server, &id)).and_then(|r| r.access.as_ref()).map_or(0, |c| c.seq);
         let seq = shown.members().members().seq.max(own).checked_add(1).ok_or(Invalid("member list seq"))?;
         let members = members.map_or_else(|| shown.members().members().members.clone(), <[Uid]>::to_vec);
@@ -388,6 +375,137 @@ impl Agent {
             return Err(Invalid("access lists too large"));
         }
         Ok(encoded)
+    }
+
+    /// A GroupInfo verified as an external joiner would: its tree, Gwar's rules (with a private
+    /// channel's lists) and a member's signature. Returns its descriptor and GroupContext.
+    fn verified_info(
+        &self,
+        server: &str,
+        bytes: &[u8],
+        tree: Option<&[u8]>,
+    ) -> Result<(SignedDescriptor, GroupContext)> {
+        let info = super::info(bytes)?;
+        let descriptor = client_context(info.group_context(), server)?;
+        let context = info.group_context().clone();
+        let tree_in = super::info_tree(&info, descriptor.descriptor.kind, tree)?;
+        let verified = tree_in
+            .clone()
+            .into_verified(crate::SUITE, self.provider.crypto(), info.group_id())
+            .map_err(err("ratchet tree"))?;
+        self.tree_rule(&descriptor, &context, verified.leaves())?;
+        // Verification only: a throwaway provider, and nothing is committed.
+        MlsGroup::external_commit_builder()
+            .with_ratchet_tree(tree_in)
+            .skip_lifetime_validation()
+            .build_group(&crate::crypto::Provider::default(), info, self.with_key())
+            .map_err(err("group info"))?;
+        Ok((descriptor, context))
+    }
+
+    /// The verified pending tip of a private conversation, kept on its live pin.
+    pub(super) fn pending_tip(&self, server: &str, conversation: &str) -> Result<Option<SignedDescriptor>> {
+        let Some(live) = self.live(server, conversation)? else { return Ok(None) };
+        let record = self.groups.get(&group_key(server, &live.group_id())).ok_or(Invalid("live pin"))?;
+        record
+            .pending_tip
+            .as_ref()
+            .map(|bytes| SignedDescriptor::parse(bytes).ok_or(Invalid("stored pending tip")))
+            .transpose()
+    }
+
+    /// Accepts a private conversation's restarts (6c, "Restarts", staged adoption): the chain is
+    /// verified as [`Agent::accept_chain`] does, then its final successor's current GroupInfo
+    /// (`group_info`, `tree`) must give (a)–(c) as of now, as for a newcomer. Only then are the pins,
+    /// the live incarnation and the superseding written. Otherwise nothing changes but the verified
+    /// tip, kept as pending on the live pin (`adopted` false): the device waits for a channel
+    /// manager, as a newcomer does.
+    #[allow(clippy::too_many_arguments)]
+    pub fn accept_private_chain(
+        &mut self,
+        server: &str,
+        conversation: &str,
+        chain: &[([u8; 32], Vec<u8>)],
+        group_info: &[u8],
+        tree: Option<&[u8]>,
+        now: i64,
+        revocations: &dyn Revocations,
+    ) -> Result<ChainAdoption> {
+        self.operation(|a| {
+            super::current_time(now)?;
+            let chain = a.verify_chain(server, conversation, chain)?;
+            let tip = chain.last().ok_or(Invalid("chain anchor"))?.clone();
+            if !rules::is_private(&tip) {
+                return Err(Invalid("not a private conversation"));
+            }
+            let (descriptor, context) = a.verified_info(server, group_info, tree)?;
+            if descriptor.group_id() != tip.group_id() {
+                return Err(Invalid("the final successor's GroupInfo"));
+            }
+            // Its lists must be valid history (bound to it, signed by an authority of their span),
+            // even to be kept as pending: a fabricated tip must not become a restart's predecessor.
+            let pin_chain = a.owner_chain(server)?.ok_or(AgentError::Waiting)?;
+            let access = rules::access(&context).ok_or(Invalid("access lists"))?;
+            if !access.valid_when_signed(&pin_chain, &tip.group_id()) {
+                return Err(Invalid("the final successor's access lists"));
+            }
+            let key = group_key(server, &tip.group_id());
+            match a.newcomer(&key, &tip, &context, now, revocations) {
+                Ok(checkpoint) => {
+                    let group = a.adopt_chain(server, conversation, &chain)?;
+                    // The list seen current now is the newest accepted (newcomer refused older ones).
+                    if checkpoint.is_some() {
+                        a.groups.get_mut(&key).ok_or(Invalid("record"))?.access = checkpoint;
+                    }
+                    Ok(ChainAdoption { group, adopted: true })
+                }
+                Err(AgentError::Waiting) => {
+                    // Without any pin, the chain's verified first link is pinned (not joined) to
+                    // carry the pending tip, so an authority can still restart from it.
+                    let live = match a.live(server, conversation)? {
+                        Some(live) => live,
+                        None => {
+                            let first = chain.first().ok_or(Invalid("chain anchor"))?.clone();
+                            a.adopt_chain(server, conversation, std::slice::from_ref(&first))?;
+                            first
+                        }
+                    };
+                    if live.group_id() != tip.group_id() {
+                        a.groups
+                            .get_mut(&group_key(server, &live.group_id()))
+                            .ok_or(Invalid("live pin"))?
+                            .pending_tip = Some(tip.encode());
+                    }
+                    Ok(ChainAdoption { group: tip.group_id(), adopted: false })
+                }
+                Err(error) => Err(error),
+            }
+        })
+    }
+
+    /// The member list of a private group this device holds, for renewal and the interface.
+    pub fn access_view(&self, server: &str, id: &[u8; 32]) -> Result<Option<AccessView>> {
+        let key = group_key(server, id);
+        let Some(record) = self.groups.get(&key) else { return Ok(None) };
+        if record.status != Status::Active {
+            return Ok(None);
+        }
+        let group = self.mls(&key)?;
+        let Some(access) = rules::access(group.public_group().group_context()) else { return Ok(None) };
+        let m = access.members().members();
+        let (signer_device, signer_account, signer_expires_at) = match access.members().signer() {
+            crate::Credential::Account(c) => (c.device_key.clone(), Some(c.account_key.clone()), Some(c.expires_at)),
+            other => (other.device_key().to_owned(), None, None),
+        };
+        Ok(Some(AccessView {
+            seq: m.seq,
+            members: m.members.clone(),
+            signer_uid: m.signer_uid.clone(),
+            signer_device,
+            signer_account,
+            signer_expires_at,
+            signed_at: m.signed_at,
+        }))
     }
 
     fn commit_lists(
@@ -514,6 +632,27 @@ impl Agent {
             Ok(out)
         })
     }
+}
+
+/// The outcome of [`Agent::accept_private_chain`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ChainAdoption {
+    /// The final successor.
+    pub group: [u8; 32],
+    /// False: kept as pending, waiting for a channel manager.
+    pub adopted: bool,
+}
+
+/// A private group's member list as this device holds it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AccessView {
+    pub seq: u64,
+    pub members: Vec<Uid>,
+    pub signer_uid: Uid,
+    pub signer_device: String,
+    pub signer_account: Option<String>,
+    pub signer_expires_at: Option<i64>,
+    pub signed_at: i64,
 }
 
 /// Where `commit_lists` takes its member list from.

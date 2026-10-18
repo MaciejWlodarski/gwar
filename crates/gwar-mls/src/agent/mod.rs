@@ -7,7 +7,7 @@ mod private;
 mod storage;
 mod voice;
 pub use owner::{ManagersCheck, OwnerCheck, OwnerView, ServerRecord};
-pub use private::{AccessCheckpoint, Authority};
+pub use private::{AccessCheckpoint, AccessView, Authority, ChainAdoption};
 pub use storage::{Change, Changes, Store, Stores};
 pub use voice::{VoiceKey, VoiceKeys, voice_kid};
 
@@ -215,6 +215,11 @@ pub struct GroupRecord {
     /// pair this device accepted ([`Agent::observe_access`]), so it cannot rejoin under older ones.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub removal_access: Option<Vec<u8>>,
+    /// On a private conversation's live pin: the verified final successor of a restart chain that
+    /// did not pass yet ((a)–(c) of its GroupInfo), kept as pending; an authority may create a
+    /// successor of it (6c, "Restarts").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_tip: Option<Vec<u8>>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -512,6 +517,9 @@ impl Agent {
             }
             if record.removal_access.as_ref().is_some_and(|a| crate::access::Access::parse(a).is_none()) {
                 return Err(Invalid("stored removal access"));
+            }
+            if record.pending_tip.as_ref().is_some_and(|d| SignedDescriptor::parse(d).is_none()) {
+                return Err(Invalid("stored pending tip"));
             }
             if matches!(record.status, Status::Creating | Status::Active | Status::Joining) {
                 let group = agent.mls(key)?;
@@ -817,6 +825,7 @@ impl Agent {
             access: None,
             removed: false,
             removal_access: None,
+            pending_tip: None,
         });
         record.status = status;
         record.removed = false;
@@ -892,10 +901,14 @@ impl Agent {
             } else {
                 // A restart candidate continues this device's live pin, one per predecessor.
                 a.check_incarnation(&descriptor)?;
+                // A private conversation's verified pending tip may be the predecessor too, without
+                // being adopted (6c, "Recovery of a pending tip").
+                let pending = a.pending_tip(&d.server_key, &d.conversation)?;
                 if a.pins(&d.server_key, &d.conversation)?
                     .iter()
                     .any(|(_, p, _)| p.descriptor.incarnation == d.incarnation)
-                    || !a.live(&d.server_key, &d.conversation)?.is_some_and(|live| successor(&live, &descriptor))
+                    || !(a.live(&d.server_key, &d.conversation)?.is_some_and(|live| successor(&live, &descriptor))
+                        || pending.is_some_and(|tip| successor(&tip, &descriptor)))
                 {
                     return Err(Invalid("restart predecessor"));
                 }
@@ -956,12 +969,65 @@ impl Agent {
     /// is deleted, with its pin, so the device can join the winner or create
     /// the conversation again.
     pub fn settle(&mut self, server: &str, id: &[u8; 32], winner: Option<&[u8; 32]>) -> Result<bool> {
+        self.operation(|a| a.settle_inner(server, id, winner, None))
+    }
+    /// [`Agent::settle`] for a private channel's creation: a won creation is adopted only if its
+    /// lists still give this device current authority now ((a)–(c), as for a newcomer); otherwise
+    /// the predecessor stays, with this creation as its pending tip (staged adoption, 6c).
+    pub fn settle_private(
+        &mut self,
+        server: &str,
+        id: &[u8; 32],
+        winner: Option<&[u8; 32]>,
+        now: i64,
+        revocations: &dyn Revocations,
+    ) -> Result<bool> {
         self.operation(|a| {
+            current_time(now)?;
+            a.settle_inner(server, id, winner, Some((now, revocations)))
+        })
+    }
+    fn settle_inner(
+        &mut self,
+        server: &str,
+        id: &[u8; 32],
+        winner: Option<&[u8; 32]>,
+        at: Option<(i64, &dyn Revocations)>,
+    ) -> Result<bool> {
+        {
+            let a = self;
             let key = group_key(server, id);
             if a.groups.get(&key).is_none_or(|r| r.status != Status::Creating) {
                 return Err(Invalid("not creating"));
             }
+            let d = SignedDescriptor::parse(&a.groups[&key].descriptor).ok_or(Invalid("descriptor"))?;
+            if rules::is_private(&d) != at.is_some() {
+                return Err(Invalid("a private creation settles with settle_private, others with settle"));
+            }
             if winner == Some(id) {
+                let authorized = match at {
+                    Some((now, revocations)) => {
+                        let group = a.mls(&key)?;
+                        match a.newcomer(&key, &d, group.public_group().group_context(), now, revocations) {
+                            Ok(_) => true,
+                            Err(AgentError::Waiting) => false,
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    None => true,
+                };
+                if !authorized {
+                    let mut group = a.mls(&key)?;
+                    group.delete(a.provider.storage()).map_err(err("delete group"))?;
+                    a.groups.remove(&key);
+                    if let Some(live) = a.live(server, &d.descriptor.conversation)? {
+                        a.groups
+                            .get_mut(&group_key(server, &live.group_id()))
+                            .ok_or(Invalid("live pin"))?
+                            .pending_tip = Some(d.encode());
+                    }
+                    return Ok(false);
+                }
                 a.won(server, &key)?;
                 return Ok(true);
             }
@@ -970,7 +1036,7 @@ impl Agent {
             group.delete(a.provider.storage()).map_err(err("delete group"))?;
             a.groups.remove(&key);
             Ok(false)
-        })
+        }
     }
 
     /// This device's creation is the group the server holds: it is active at
@@ -1399,6 +1465,22 @@ impl Agent {
         chain: &[([u8; 32], Vec<u8>)],
     ) -> Result<[u8; 32]> {
         self.operation(|a| {
+            let chain = a.verify_chain(server, conversation, chain)?;
+            if chain.last().is_some_and(rules::is_private) {
+                return Err(Invalid("a private conversation's restart needs its final GroupInfo"));
+            }
+            a.adopt_chain(server, conversation, &chain)
+        })
+    }
+    /// The links of a restart chain, verified as [`Agent::accept_chain`] describes.
+    fn verify_chain(
+        &self,
+        server: &str,
+        conversation: &str,
+        chain: &[([u8; 32], Vec<u8>)],
+    ) -> Result<Vec<SignedDescriptor>> {
+        {
+            let a = self;
             if a.voice_only || conversation.starts_with("voice:") {
                 return Err(Invalid("voice has no incarnation chain"));
             }
@@ -1430,6 +1512,16 @@ impl Agent {
             }
             for d in &chain {
                 a.check_incarnation(d)?;
+            }
+            Ok(chain)
+        }
+    }
+    /// Pins a verified chain: new incarnations are pinned, the last becomes live, to be joined, and
+    /// the earlier ones are superseded.
+    fn adopt_chain(&mut self, server: &str, conversation: &str, chain: &[SignedDescriptor]) -> Result<[u8; 32]> {
+        {
+            let a = self;
+            for d in chain {
                 a.groups.entry(group_key(server, &d.group_id())).or_insert_with(|| GroupRecord {
                     descriptor: d.encode(),
                     status: Status::Rejoin,
@@ -1444,9 +1536,10 @@ impl Agent {
                     access: None,
                     removed: false,
                     removal_access: None,
+                    pending_tip: None,
                 });
             }
-            let live = chain.last().expect("checked above");
+            let live = chain.last().ok_or(Invalid("chain anchor"))?;
             let key = group_key(server, &live.group_id());
             if a.groups[&key].status == Status::Creating {
                 // This device's own creation, which the server holds: it won.
@@ -1456,7 +1549,7 @@ impl Agent {
             // continued past, are never live again.
             a.supersede(server, conversation, live.descriptor.incarnation)?;
             Ok(live.group_id())
-        })
+        }
     }
     /// Whether a GroupInfo of `id`, verified as an external joiner would
     /// (tree, a member's signature, Gwar's rules; leaf lifetimes are skipped,

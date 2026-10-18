@@ -89,6 +89,11 @@ export interface Gate {
   /** A private channel's group: this device's current authority in it (6c). */
   access?: Authority;
 }
+/** A private group's member list as this device holds it (6c). */
+export interface AccessView {
+  seq: number; members: string[]; signer_uid: string; signer_device: string;
+  signer_account: string | null; signer_expires_at: number | null; signed_at: number;
+}
 /** Current authority in a private group ((a)–(d)) and the repair this device can make otherwise. */
 export type Authority = { kind: "current" } | { kind: "carry" } | { kind: "remove"; leaves: number[] } | { kind: "wait" };
 /** A gate that lets this device use its group: active, nothing blocking or pending, and in a

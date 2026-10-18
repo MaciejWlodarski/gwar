@@ -1,4 +1,4 @@
-import type { OwnerView } from "../mls/types";
+import type { AccessView, OwnerView, Revocation } from "../mls/types";
 import type { Managers } from "../proto/Managers";
 
 const DAY = 86_400_000;
@@ -75,4 +75,17 @@ export function managerUpkeep(i: UpkeepInput): Upkeep {
   }
   const ask = server.pending.find((u) => !i.asked.has(u));
   return ask ? { kind: "ask", uid: ask } : { kind: "none" };
+}
+
+/**
+ * A private channel's member list is re-signed (seq + 1, the same members) when it is older than
+ * 60 days, or its signer's certificate expires within 7 days or was revoked (docs/e2e-build.md,
+ * section 6, 6c "Newcomers"). For expiry, only by a device whose own certificate outlasts the
+ * signer's: re-signing could not make the list last longer otherwise.
+ */
+export function memberListRenewalDue(list: AccessView, now: number, ownExpiry: number, revocations: Revocation[]): boolean {
+  const old = now - list.signed_at > 60 * DAY;
+  const expiring = list.signer_expires_at !== null && list.signer_expires_at - now < 7 * DAY && ownExpiry > list.signer_expires_at;
+  const revoked = revocations.some((r) => r.device_key === list.signer_device && (list.signer_account === null || r.account_key === list.signer_account));
+  return old || expiring || revoked;
 }
