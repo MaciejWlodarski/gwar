@@ -235,7 +235,8 @@ impl Agent {
     /// The next confirmer anchor's statement under the pinned head, for the owner's account key
     /// to sign. Sorted, deduplicated confirmers; the owner is never one.
     /// The seq is beyond both the accepted anchor and `server_anchor` (the server's, when it is valid
-    /// as history), so a fresh device of a new owner can replace an inherited anchor.
+    /// as history), so a fresh device of a new owner can replace an inherited anchor. With a
+    /// checkpoint only a current server anchor counts: a former owner's history cannot raise it.
     pub fn next_anchor(
         &self,
         server: &str,
@@ -245,6 +246,7 @@ impl Agent {
     ) -> Result<String> {
         let record = self.servers.get(server).ok_or(Invalid("no owner pin"))?;
         let chain = record.chain(server)?;
+        let accepted = record.pair()?.map(|(a, _)| a);
         let mut confirmers = confirmers.to_vec();
         confirmers.sort();
         confirmers.dedup();
@@ -254,8 +256,9 @@ impl Agent {
         let server_seq = server_anchor
             .and_then(SignedAnchor::parse)
             .filter(|a| chain.anchor_valid(a))
+            .filter(|a| accepted.is_none() || chain.anchor_current(a))
             .map_or(0, |a| a.anchor().anchor_seq);
-        let seq = record.pair()?.map_or(0, |(a, _)| a.anchor().anchor_seq).max(server_seq) + 1;
+        let seq = successor(accepted.as_ref().map_or(0, |a| a.anchor().anchor_seq).max(server_seq))?;
         Ok(crate::owner::Anchor {
             server_key: server.to_owned(),
             generation: chain.generation(),
@@ -297,7 +300,9 @@ impl Agent {
     /// The next manager list's statement under `anchor` (the accepted one when `None`), signed
     /// by this device ([`Agent::sign_manager_list`]), which must be the current owner's or a
     /// confirmer's. `managers` `None` renews: it keeps the server's list (`server_list`, when it
-    /// verifies as history under a trusted anchor), else the accepted one. Its seq follows both.
+    /// verifies as history under a trusted anchor and is no older than the accepted list), else the
+    /// accepted one. Its seq follows both. Trusted anchors are the signing and the accepted one; the
+    /// server's own (`server_anchor`) only on a device without a checkpoint, which inherits it.
     pub fn next_list(
         &self,
         server: &str,
@@ -314,14 +319,20 @@ impl Agent {
         }
         let record = self.servers.get(server).expect("checked by signing_anchor");
         let pair = record.pair()?;
-        // Anchors the server's list may be verified under: the signing one, the accepted one, and
-        // the server's own when it is valid history of the pinned chain.
-        let shown = server_anchor.and_then(SignedAnchor::parse).filter(|a| chain.anchor_valid(a));
+        // A superseded anchor never vouches for a list (its former confirmers could sign any seq),
+        // and a replayed older list never renews removed managers.
+        let shown = server_anchor.and_then(SignedAnchor::parse).filter(|a| pair.is_none() && chain.anchor_valid(a));
         let trusted: Vec<&SignedAnchor> =
             [Some(&anchor), pair.as_ref().map(|(a, _)| a), shown.as_ref()].into_iter().flatten().collect();
         let verified = server_list
             .and_then(SignedList::parse)
-            .filter(|l| trusted.iter().any(|a| a.hash() == l.list().anchor_hash && chain.list_valid(a, l)));
+            .filter(|l| trusted.iter().any(|a| a.hash() == l.list().anchor_hash && chain.list_valid(a, l)))
+            .filter(|l| {
+                pair.as_ref().is_none_or(|(_, old)| {
+                    let (seq, old_seq) = (l.list().seq, old.list().seq);
+                    seq > old_seq || (seq == old_seq && l.hash() == old.hash())
+                })
+            });
         let accepted = pair.as_ref().map(|(_, l)| l.list().clone());
         let floor = accepted.as_ref().map_or(0, |l| l.seq).max(verified.as_ref().map_or(0, |l| l.list().seq));
         let mut managers = match managers {
@@ -339,7 +350,7 @@ impl Agent {
             server_key: server.to_owned(),
             generation: chain.generation(),
             anchor_hash: anchor.hash(),
-            seq: floor + 1,
+            seq: successor(floor)?,
             managers,
             signer_uid: me,
             signed_at,
@@ -391,6 +402,11 @@ impl Agent {
         }
         Ok(SignedList::sign(list, self.credential.clone(), &self.signer.0).encode())
     }
+}
+
+/// The next sequence number, within the protocol's bound.
+fn successor(seq: u64) -> Result<u64> {
+    (seq < vc_proto::MAX_SAFE_INTEGER as u64).then_some(seq + 1).ok_or(Invalid("sequence exhausted"))
 }
 
 /// Splits a stored key into the server of a server record.
@@ -649,6 +665,57 @@ mod tests {
         )
         .unwrap();
         assert_eq!(next.seq, 3);
+        // With a checkpoint, a replayed older list renews nothing of its own (its seq neither), and
+        // the server's superseded anchor vouches for no list: the accepted list is kept.
+        let renew = |owner: &Agent, server_anchor: &SignedAnchor, server_list: &[u8]| {
+            ManagerList::parse(
+                &owner.next_list(&server(), None, None, NOW, Some(&server_anchor.encode()), Some(server_list)).unwrap(),
+            )
+            .unwrap()
+        };
+        let removed = owner
+            .sign_manager_list(ManagerList {
+                managers: vec![uid(8)],
+                ..ManagerList::parse(&owner.next_list(&server(), None, Some(&[]), NOW, None, None).unwrap()).unwrap()
+            })
+            .unwrap();
+        assert_eq!(
+            owner.accept_managers(&server(), &a2.encode(), &removed, NOW, &()).unwrap(),
+            ManagersCheck::Accepted
+        );
+        owner.take_changes();
+        let kept = renew(&owner, &a2, &l2);
+        assert_eq!((kept.seq, kept.managers), (4, vec![uid(8)]), "l2 (seq 2) is older than the accepted seq 3");
+        let mut c = agent(5);
+        check(&mut c, &chain, None);
+        c.accept_managers(&server(), &a1.encode(), &l1, NOW, &()).unwrap();
+        c.take_changes();
+        let high = c
+            .sign_manager_list(ManagerList {
+                seq: vc_proto::MAX_SAFE_INTEGER as u64 - 1,
+                ..ManagerList::parse(&c.next_list(&server(), None, Some(&[]), NOW, None, None).unwrap()).unwrap()
+            })
+            .unwrap();
+        assert_eq!(renew(&owner, &a1, &high).seq, 4, "a former confirmer's list under the superseded anchor");
+        assert!(
+            c.next_list(
+                &server(),
+                None,
+                Some(&[]),
+                NOW,
+                Some(&a1.encode()),
+                Some(&{
+                    c.sign_manager_list(ManagerList {
+                        seq: vc_proto::MAX_SAFE_INTEGER as u64,
+                        ..ManagerList::parse(&c.next_list(&server(), None, Some(&[]), NOW, None, None).unwrap())
+                            .unwrap()
+                    })
+                    .unwrap()
+                })
+            )
+            .is_err(),
+            "beyond the protocol's bound"
+        );
     }
 
     #[test]

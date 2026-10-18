@@ -961,8 +961,13 @@ describe("the server's owner (6b)", () => {
     f.world.managersCheck = "not_current";
     f.ownerWelcome(owner, { anchor: "AQ", list: "AQ", pending: [], stale: [] });
     await vi.waitFor(() => expect(f.runtime.serverManagersCurrent()).toBe(false));
+    // No membership change against a pair that is not current: only a renewal.
+    await expect(f.runtime.publishManagers(["x"])).rejects.toThrow("changing");
     f.world.managersCheck = "accepted";
     f.event({ ev: "managers.updated", d: { anchor: "AQ", list: "Ag", pending: [], stale: [] } });
+    // Until the newer list is checked, the view still describes the older one.
+    expect(f.runtime.managersSettled()).toBe(false);
     await vi.waitFor(() => expect(f.runtime.serverManagersCurrent()).toBe(true));
+    expect(f.runtime.managersSettled()).toBe(true);
   });
 });

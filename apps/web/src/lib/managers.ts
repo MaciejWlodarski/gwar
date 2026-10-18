@@ -22,6 +22,8 @@ export interface UpkeepInput {
   server: Managers;
   /** Whether the server's pair is current for this device. */
   current: boolean;
+  /** Whether `view` and `current` describe the server's newest pair (its check has finished). */
+  settled: boolean;
   /** People this client just gave `channel_edit` on this connection. */
   granted: ReadonlySet<string>;
   /** Pending people (and "@confirmers") already asked about on this connection. */
@@ -42,16 +44,16 @@ export interface UpkeepInput {
 export function managerUpkeep(i: UpkeepInput): Upkeep {
   const { view, server } = i;
   const isOwner = view.owner === i.me;
-  if (!isOwner && !view.confirmers.includes(i.me)) return { kind: "none" };
+  if ((!isOwner && !view.confirmers.includes(i.me)) || !i.settled) return { kind: "none" };
+  // A pair that is no longer current is renewed first, keeping the server's verified membership:
+  // this device's own checkpoint may be older (changes are made against a current list only).
+  const renewable = i.now - i.lastRenewal > 10 * 60_000;
+  if (server.anchor && !i.current) return renewable ? { kind: "publish", managers: null, renewal: true, consumed: [] } : { kind: "none" };
   const staleConfirmers = view.confirmers.filter((c) => server.stale.includes(c));
   if (isOwner && staleConfirmers.length && !i.asked.has("@confirmers")) {
     return { kind: "staleConfirmers", keep: view.confirmers.filter((c) => !staleConfirmers.includes(c)), stale: staleConfirmers };
   }
   if (!server.anchor) return { kind: "none" };
-  // A pair that is no longer current is renewed first, keeping the server's verified membership:
-  // this device's own checkpoint may be older (changes are made against a current list only).
-  const renewable = i.now - i.lastRenewal > 10 * 60_000;
-  if (!i.current) return renewable ? { kind: "publish", managers: null, renewal: true, consumed: [] } : { kind: "none" };
   const stale = view.managers.filter((m) => server.stale.includes(m));
   const mine = server.pending.filter((u) => i.granted.has(u));
   if (stale.length || mine.length) {

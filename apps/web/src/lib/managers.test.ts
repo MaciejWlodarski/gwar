@@ -8,7 +8,7 @@ const view = (over: Partial<OwnerView> = {}): OwnerView => ({
   list_signer: "owner", list_signed_at: NOW - DAY, list_signer_expires_at: null, anchor_seq: 1, list_seq: 3, ...over,
 });
 const input = (over: Partial<UpkeepInput> = {}): UpkeepInput => ({
-  me: "owner", view: view(), server: { anchor: "A", list: "L", pending: [], stale: [] }, current: true,
+  me: "owner", view: view(), server: { anchor: "A", list: "L", pending: [], stale: [] }, current: true, settled: true,
   granted: new Set(), asked: new Set(), now: NOW, ownExpiry: Infinity, lastRenewal: 0, ...over,
 });
 
@@ -40,6 +40,13 @@ describe("manager list upkeep (6b)", () => {
     expect(managerUpkeep(input({ server }))).toEqual({ kind: "staleConfirmers", keep: [], stale: ["conf"] });
     expect(managerUpkeep(input({ server, asked: new Set(["@confirmers"]) })).kind).toBe("none");
     expect(managerUpkeep(input({ me: "conf", server })).kind).toBe("none");
+    // A lapsed pair is renewed (keeping the server's membership) before any confirmer change.
+    expect(managerUpkeep(input({ server, current: false }))).toEqual({ kind: "publish", managers: null, renewal: true, consumed: [] });
+  });
+  it("does nothing until the server's newest list has been checked", () => {
+    const server = { anchor: "A", list: "L2", pending: ["p"], stale: ["m2", "conf"] };
+    expect(managerUpkeep(input({ server, settled: false, granted: new Set(["p"]) }))).toEqual({ kind: "none" });
+    expect(managerUpkeep(input({ settled: false, current: false }))).toEqual({ kind: "none" });
   });
   it("waits for the first anchor before maintaining a list", () => {
     expect(managerUpkeep(input({ server: { anchor: null, list: null, pending: ["p"], stale: [] } }))).toEqual({ kind: "none" });

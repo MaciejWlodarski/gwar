@@ -107,6 +107,8 @@ export class MlsRuntime {
   private managers: Managers | null = null;
   /** Whether the server's manager pair is current for this device (false: it needs renewing). */
   private managersCurrent = true;
+  /** The server list `managersCurrent` and `ownerView()` were last checked against. */
+  private verifiedList: string | null = null;
   private ownerChecks: Promise<void> = Promise.resolve();
   private ownerRetries = 0;
   /** This session's file access token: the bearer for the tree endpoint. */
@@ -245,6 +247,8 @@ export class MlsRuntime {
   /** False when the server shows a manager pair that is no longer current (an expired, revoked or
    * former signer): the owner or a confirmer renews it. */
   serverManagersCurrent(): boolean { return this.managersCurrent; }
+  /** True once the server's newest list has been checked: until then the view describes an older one. */
+  managersSettled(): boolean { return !this.managers?.list || this.verifiedList === this.managers.list; }
   /**
    * Checks the server's owner chain against this device's pin, then its newest managers
    * (docs/e2e-build.md, section 6, 6b). `owner` undefined re-checks only the managers.
@@ -323,6 +327,12 @@ export class MlsRuntime {
   async publishManagers(managers: string[] | null, anchor?: Uint8Array): Promise<void> {
     const server = this.server, shown = this.serverAnchor(), under = anchor ?? shown;
     if (!under) throw new Error("no confirmer anchor yet");
+    // A change is made only against the server's newest pair, checked and current: otherwise the
+    // view this change was derived from may be older than the list it would replace. A plain
+    // renewal keeps the server's verified membership and is what makes a pair current again.
+    if ((managers !== null || anchor) && this.managers?.list && !(this.managersSettled() && this.managersCurrent)) {
+      throw new Error("the manager list is changing; try again");
+    }
     const floor = this.managers?.list ? decodeBase64Url(this.managers.list) : undefined;
     const list = await this.engine.run(async () => this.engine.withAgent(a => a.sign_manager_list!(a.next_list!(server, under, managers ?? undefined, this.now(), shown, floor))));
     await this.request("managers.update", { anchor: encodeBase64Url(under), list: encodeBase64Url(list) }, undefined, this.generation);
@@ -336,6 +346,7 @@ export class MlsRuntime {
       this.managersCurrent = check?.kind !== "not_current";
     }
     this.owner = await this.engine.run(async () => this.engine.withAgent(a => a.owner_view?.(server) ?? null));
+    this.verifiedList = managers?.list ?? null;
     this.notify();
   }
   /** Who can read an active conversation (devices by uid) and whether new members get earlier messages. */

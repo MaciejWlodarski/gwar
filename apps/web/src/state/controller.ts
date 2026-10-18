@@ -1113,7 +1113,9 @@ class Controller {
     const { accountKey, signature } = await this.signAsAccount(statement, password);
     const { anchorEnvelope } = await import("../mls/wasm");
     const anchor = await anchorEnvelope(statement, accountKey, signature);
-    const keep = (managers ?? runtime.ownerView()?.managers ?? []).filter((m) => !confirmers.includes(m));
+    // Without explicit managers the list keeps the server's verified membership (the agent drops
+    // new confirmers from it); the very first list starts empty.
+    const keep = managers ? managers.filter((m) => !confirmers.includes(m)) : useSession.getState().managers?.list ? null : [];
     await runtime.publishManagers(keep, anchor);
   }
 
@@ -1166,8 +1168,14 @@ class Controller {
     const runtime = this.runtime, view = runtime?.ownerView(), state = useSession.getState(), conn = this.conn;
     const me = state.me?.uid, server = state.managers;
     if (!runtime || !view || !me || !server || this.maintaining || !(conn instanceof Connection)) return;
+    // An approval ends once the list names the person (whoever added them) or they lost the role.
+    for (const u of this.grantedByMe) {
+      if (view.managers.includes(u) || view.confirmers.includes(u) || u === view.owner || !this.editsChannels(u)) this.grantedByMe.delete(u);
+    }
+    // One prompt at a time: an unanswered one is never replaced; the next comes after it closes.
+    const idle = useUi.getState().dialog.kind === "none";
     const action = managerUpkeep({
-      me, view, server, current: runtime.serverManagersCurrent(), granted: this.grantedByMe, asked: this.askedManagers,
+      me, view, server, current: runtime.serverManagersCurrent(), settled: runtime.managersSettled(), granted: this.grantedByMe, asked: this.askedManagers,
       now: Date.now(), ownExpiry: conn.identity.device?.expires_at ?? Infinity, lastRenewal: this.lastRenewal,
     });
     const settle = (work: Promise<void>, what: string) => {
@@ -1182,8 +1190,9 @@ class Controller {
         settle(runtime.publishManagers(action.managers), "Manager list:");
         return;
       case "staleConfirmers": {
+        if (!this.ownerSigningNeedsPassword()) { this.askedManagers.add("@confirmers"); settle(this.setConfirmers(action.keep), "Confirmers:"); return; }
+        if (!idle) return;
         this.askedManagers.add("@confirmers");
-        if (!this.ownerSigningNeedsPassword()) { settle(this.setConfirmers(action.keep), "Confirmers:"); return; }
         const names = action.stale.map((u) => state.members[u]?.nickname ?? u).join(", ");
         useUi.getState().openDialog({
           kind: "confirm", title: tNow("own.staleTitle"), body: tNow("own.staleBody", { names }), confirmLabel: tNow("own.open"),
@@ -1193,6 +1202,7 @@ class Controller {
       }
       case "ask": {
         const uid = action.uid;
+        if (!idle) return;
         this.askedManagers.add(uid);
         const name = state.members[uid]?.nickname ?? uid;
         useUi.getState().openDialog({
@@ -1253,13 +1263,20 @@ class Controller {
   }
 
   async setMemberGroups(uid: string, groups: number[]) {
-    const conn = this.conn, state = useSession.getState();
-    const edits = (ids: readonly number[]) => ids.some((g) => g === 1 || state.groups[g]?.permissions.includes("channel_edit"));
-    const before = edits(state.members[uid]?.groups ?? []);
+    const conn = this.conn, before = this.editsChannels(uid);
     const result = await this.connection.request("member.groups", { uid, groups });
-    // Whoever this very edit gave `channel_edit` becomes a manager without asking me again (6b).
-    if (this.conn === conn && !before && edits(groups)) this.grantedByMe.add(uid);
+    // Whoever this very edit gave `channel_edit` becomes a manager without asking me again (6b);
+    // taking it away ends an earlier approval.
+    const after = this.editsChannels(uid, groups);
+    if (this.conn === conn && !before && after) this.grantedByMe.add(uid);
+    if (!after) this.grantedByMe.delete(uid);
     return result;
+  }
+
+  /** Whether `uid`'s roles (or `groups`) carry `channel_edit`, Admin included. */
+  private editsChannels(uid: string, groups?: readonly number[]): boolean {
+    const state = useSession.getState();
+    return (groups ?? state.members[uid]?.groups ?? []).some((g) => g === 1 || state.groups[g]?.permissions.includes("channel_edit"));
   }
 
   removeMember(uid: string, deleteMessages: boolean) {
