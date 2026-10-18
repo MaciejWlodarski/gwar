@@ -119,11 +119,13 @@ pub async fn read(query: &Query) -> Result<Source> {
     }
     source.channels.retain(|c| c.get("cid").is_none_or(|cid| !gone.contains(cid)));
     source.groups = list(query, Cmd::new("servergrouplist")).await.context("servergrouplist")?;
+    // Everyone is in the default group: TeamSpeak does not list it (2564), nor is it needed.
+    let default_group = source.server.get("virtualserver_default_server_group").and_then(|g| g.parse::<u64>().ok());
     for g in source.groups.clone() {
         let Some(sgid) = g.get("sgid").and_then(|s| s.parse::<u64>().ok()) else { continue };
         let perms = list(query, Cmd::new("servergrouppermlist").arg("sgid", sgid).flag("permsid")).await?;
         source.group_perms.insert(sgid, Perms::from_records(&perms));
-        if g.get("type").map(String::as_str) == Some("1") {
+        if g.get("type").map(String::as_str) == Some("1") && Some(sgid) != default_group {
             let members = list(query, Cmd::new("servergroupclientlist").arg("sgid", sgid)).await?;
             source.group_members.insert(sgid, members.iter().filter_map(|m| m.get("cldbid")?.parse().ok()).collect());
         }
