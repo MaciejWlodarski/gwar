@@ -278,6 +278,8 @@ function RolesTab() {
     const order = reorderedTo(groups, id, to, myRank);
     if (order) void controller.attempt(controller.reorderGroups(order));
   };
+  // A new role goes right above Member: only someone ranked above Member creates roles.
+  const canCreate = canManage && myRank < (groups[MEMBER_GROUP]?.position ?? Infinity);
   // Roles below my rank (and not Member) can be moved.
   const movable = (g: Group) => canManage && g.id !== MEMBER_GROUP && g.position > myRank;
   const indexOf = (id: number) => list.findIndex((g) => g.id === id);
@@ -346,7 +348,7 @@ function RolesTab() {
             );
           })}
         </ul>
-        {canManage && (
+        {canCreate && (
           <Button size="sm" onClick={() => setSelected("new")} className={cn("mt-1 justify-start", selected === "new" && "border-accent text-accent")}>
             <Plus className="size-4" /> {t("ss.createRole")}
           </Button>
@@ -394,8 +396,8 @@ function RoleEditor({ group, onSaved }: { group: Group | undefined; onSaved: (id
   const me = useMyWho();
   const creating = !group;
   const isAdmin = group?.id === ADMIN_GROUP;
-  // Only roles below my rank are mine to edit (the server enforces it too).
-  const outranked = !!group && !canGiveGroup(me, group, groups);
+  // Only roles below my rank are mine to edit, and new ones only from above Member (the server enforces it too).
+  const outranked = group ? !canGiveGroup(me, group, groups) : rankOf(me, groups) >= (groups[MEMBER_GROUP]?.position ?? Infinity);
   const readOnly = !canManage || outranked;
   const [name, setName] = useState(group?.name ?? "");
   const [color, setColor] = useState(group?.color ?? "");

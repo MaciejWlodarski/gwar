@@ -1187,6 +1187,8 @@ impl Store {
         )?;
         tx.execute("DELETE FROM message_mentions WHERE uid=?1 AND message IN (SELECT id FROM messages WHERE signature IS NULL)", [from])?;
         report.bans = tx.execute("UPDATE bans SET uid=?2 WHERE uid=?1", params![from, into])?;
+        // Their IP bans keep reaching only those ranked below them.
+        tx.execute("UPDATE bans SET by_uid=?2 WHERE by_uid=?1", params![from, into])?;
         tx.execute("UPDATE invites SET creator_uid=?2 WHERE creator_uid=?1", params![from, into])?;
         tx.execute("UPDATE tokens SET creator_uid=?2 WHERE creator_uid=?1", params![from, into])?;
         // bans.by and invites.created_by are display-name snapshots, not identity references.
@@ -2324,5 +2326,25 @@ mod tests {
         store.forget_removed(&["old".into(), "theirs".into()]).unwrap();
         assert_eq!(store.stored_bytes(None).unwrap(), 5);
         assert_eq!(store.removed_files().unwrap(), vec!["sent".to_owned()]);
+    }
+
+    #[test]
+    fn a_merge_carries_the_bans_one_issued() {
+        let store = Store::in_memory().unwrap();
+        store.touch_user("u", "ku", "u", 0).unwrap();
+        store.touch_user("v", "kv", "v", 0).unwrap();
+        let ban = Ban {
+            id: 0,
+            uid: Some("x".into()),
+            ip: Some("10.0.0.1".into()),
+            nickname: "x".into(),
+            reason: None,
+            by: "v".into(),
+            created_at: 0,
+            expires_at: None,
+        };
+        let id = store.insert_ban(&ban, Some("v")).unwrap();
+        store.merge_members("v", "u", false).unwrap();
+        assert_eq!(store.ban_issuer(id).unwrap().as_deref(), Some("u"));
     }
 }

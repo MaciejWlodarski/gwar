@@ -266,8 +266,9 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
   const me = useMyWho();
   const target = useWhoOf(client.uid, client.groups);
   const groups = useSession((s) => s.groups);
-  // Myself, or someone ranked below me (docs/roles.md).
-  const canMove = mayMove && (isMe || canActOn(me, target, groups));
+  const vc = useSession((s) => s.kind === "vc");
+  // Myself, or someone ranked below me (docs/roles.md); a TeamSpeak server decides that itself.
+  const canMove = mayMove && (isMe || !vc || canActOn(me, target, groups));
   const color = useGroupsColor(client.groups);
   const openDm = () => {
     if (isMe) return;

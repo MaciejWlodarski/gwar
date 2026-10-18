@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { useT } from "../i18n";
+import { cn } from "../lib/cn";
 import { ADMIN_GROUP, canGiveGroup, orderedGroups } from "../lib/permissions";
 import type { ChannelAccess } from "../proto/ChannelAccess";
 import { useSession } from "../state/stores";
@@ -58,17 +59,22 @@ export function AccessPicker({ value, onChange, membersOnly = false, disabled = 
       {!membersOnly && roles.length > 0 && (
         <fieldset className="flex flex-col gap-1">
           <legend className="mb-1 text-xs font-medium text-subtle">{t("channel.accessRoles")}</legend>
-          {roles.map((role) => (
-            <label key={role.id} className="flex cursor-pointer items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={value.roles.includes(role.id)}
-                onChange={() => onChange({ ...value, roles: toggle(value.roles, role.id) })}
-                className="size-4 accent-[var(--accent)]"
-              />
-              {role.name}
-            </label>
-          ))}
+          {roles.map((role) => {
+            // Only roles I hold or rank above can be added or taken away; others stay as they are.
+            const locked = !me.groups.includes(role.id) && !canGiveGroup(me, role, groups);
+            return (
+              <label key={role.id} className={cn("flex items-center gap-2 text-sm", locked ? "cursor-not-allowed opacity-60" : "cursor-pointer")}>
+                <input
+                  type="checkbox"
+                  checked={value.roles.includes(role.id)}
+                  disabled={disabled || locked}
+                  onChange={() => onChange({ ...value, roles: toggle(value.roles, role.id) })}
+                  className="size-4 accent-[var(--accent)]"
+                />
+                {role.name}
+              </label>
+            );
+          })}
         </fieldset>
       )}
       <fieldset className="flex flex-col gap-1">
