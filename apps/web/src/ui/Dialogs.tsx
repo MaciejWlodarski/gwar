@@ -1,4 +1,5 @@
 import { MemberProfileDialog, NicknameDialog } from "./MemberProfile";
+import { sameServer } from "../lib/server-key";
 import { Check, Copy } from "lucide-react";
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { useT } from "../i18n";
@@ -143,8 +144,10 @@ function AddServerDialog({ editId }: { editId?: string }) {
     useSettings.getState().saveBookmark(bookmark);
     close();
     if (connect) {
+      // A server saved before keeps its bookmark (and password): connect with what was stored.
+      const stored = useSettings.getState().bookmarks.find((b) => b.id === bookmark.id) ?? useSettings.getState().bookmarks.find((b) => sameServer(b, bookmark)) ?? bookmark;
       void controller.connectInteractive(
-        { kind, address: bookmark.address, password: bookmark.password, identity: bookmark.identity, insecureLan: bookmark.insecureLan },
+        { kind: stored.kind ?? kind, address: stored.address, password: stored.password, identity: stored.identity, insecureLan: stored.insecureLan },
         { remember: false },
       );
     }

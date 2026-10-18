@@ -135,7 +135,8 @@ it("keeps one bookmark per server: on load, when saving, when editing and after 
     vi.setSystemTime(2_000);
     s().saveBookmark({ ...s().bookmarks.find((b) => b.id === "c")!, address: "wss://gwar.app/ws" });
     expect(s().bookmarks.map((b) => b.id)).toEqual(["ts", "c"]);
-    expect(s().removedBookmarks.a).toEqual({ at: 2_000 });
+    // After every version in the group, the edit included.
+    expect(s().removedBookmarks.a).toEqual({ at: 2_001 });
 
     // Two devices saved one server under different ids: after syncing, the first in the vault's order stays.
     s().setBookmarkAccount("acct");
@@ -159,6 +160,27 @@ it("keeps one bookmark per server: on load, when saving, when editing and after 
     s().saveBookmark({ id: "mine", name: "Q", address: "wss://q.example.com/ws", kind: "vc" });
     expect(s().bookmarks.map((b) => [b.id, b.password])).toEqual([["hidden", "theirs"], ["mine", undefined]]);
     expect(s().removedBookmarks.hidden).toBeUndefined();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("two devices that keep different twins of one server still end with one bookmark", async () => {
+  const { mergeServers, fromBookmark } = await import("../connect/servers");
+  const { dedupeBookmarks } = await import("./settings");
+  const a = { id: "a", name: "Short", address: "gwar.app", kind: "vc" as const, account: "acct", updatedAt: 10 };
+  const b = { id: "b", name: "Long", address: "wss://gwar.app/ws", kind: "vc" as const, account: "acct", updatedAt: 20 };
+  vi.useFakeTimers({ now: 1_000 });
+  try {
+    // Each device prefers the one clicked; the second decides later.
+    const first = dedupeBookmarks([b, a], {}, "acct", "a");
+    vi.setSystemTime(2_000);
+    const second = dedupeBookmarks([a, b], {}, "acct", "b");
+    // Device one synced first, then device two merges its own decision in.
+    const vault = mergeServers([], { bookmarks: first.bookmarks, removed: first.removed }, 2_000);
+    const merged = mergeServers(vault, { bookmarks: second.bookmarks, removed: second.removed }, 2_000);
+    expect(merged.filter((e) => !e.deleted).map((e) => e.id)).toEqual(["b"]);
+    expect(fromBookmark(b).id).toBe("b");
   } finally {
     vi.useRealTimers();
   }

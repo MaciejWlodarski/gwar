@@ -98,24 +98,28 @@ export function dedupeBookmarks(
 ): { bookmarks: Bookmark[]; removed: Record<string, BookmarkRemoval>; changed: boolean } {
   const shown = bookmarks.filter((b) => inAccount(b, account));
   const order = [...shown.filter((b) => b.id === preferred), ...shown.filter((b) => b.id !== preferred)];
-  const kept: Array<{ bookmark: Bookmark; key: string }> = [];
-  const dropped: Record<string, BookmarkRemoval> = {};
+  const groups = new Map<string, Bookmark[]>();
   for (const b of order) {
     const key = serverKey(b);
-    const first = kept.find((k) => k.key === key);
-    if (!first) {
-      kept.push({ bookmark: b, key });
-      continue;
+    groups.set(key, [...(groups.get(key) ?? []), b]);
+  }
+  const stays = new Map<string, Bookmark>();
+  const dropped: Record<string, BookmarkRemoval> = {};
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    // One time for the whole group, after every version in it: the kept bookmark and the removals
+    // carry it, so whichever device decided last wins every id and exactly one bookmark survives.
+    const at = Math.max(Date.now(), ...group.map((b) => (b.updatedAt ?? 0) + 1));
+    let kept: Bookmark = { ...group[0]!, updatedAt: at };
+    for (const b of group.slice(1)) {
+      if (!kept.password && b.password) kept = { ...kept, password: b.password };
+      if (!kept.identity && b.identity) kept = { ...kept, identity: b.identity };
+      const owner = b.account ?? account ?? undefined;
+      dropped[b.id] = owner === undefined ? { at } : { at, account: owner };
     }
-    const password = !first.bookmark.password && b.password ? { password: b.password } : {};
-    const identity = !first.bookmark.identity && b.identity ? { identity: b.identity } : {};
-    if ("password" in password || "identity" in identity) {
-      first.bookmark = { ...first.bookmark, ...password, ...identity, updatedAt: nextChange(first.bookmark.updatedAt) };
-    }
-    dropped[b.id] = removal(b, account);
+    stays.set(kept.id, kept);
   }
   if (Object.keys(dropped).length === 0) return { bookmarks, removed, changed: false };
-  const stays = new Map(kept.map((k) => [k.bookmark.id, k.bookmark]));
   return {
     bookmarks: bookmarks.flatMap((b) => (dropped[b.id] ? [] : [stays.get(b.id) ?? b])),
     removed: { ...removed, ...dropped },
