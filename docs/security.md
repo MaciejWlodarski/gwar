@@ -351,8 +351,9 @@ Every guarantee assumes your client runs genuine code.
   deleted from the database; the underlying files may keep old pages until
   they are compacted. One exception lasts longer: a last-resort key package
   that a group was joined with keeps its private keys (enough to open that
-  join's Welcome) until a week after the package expires, at most about 13
-  weeks after it was made.
+  join's Welcome) until a week after the package expires (packages last at
+  most 12 weeks); the device deletes it the next time it makes key packages
+  after that.
 - **Web apps hosted by other servers** are other origins: they don't have your
   keys, but they can phish your Connect password.
 - **Uploaded files** are served with `nosniff`, a sandboxing CSP and
