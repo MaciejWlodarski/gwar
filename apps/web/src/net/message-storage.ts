@@ -92,7 +92,10 @@ export class MessageStorage {
   async revocations(pairs: Array<{ account: string; device: string }>, base = CONNECT_URL, now = Date.now()): Promise<Map<string, RevocationState>> {
     return this.transaction(["revocations", "feeds"], "readonly", async (tx) => {
       const feed: Feed | undefined = await requestValue(tx.objectStore("feeds").get(base));
-      const fresh = !!feed?.available && now - feed.checked >= 0 && now - feed.checked <= REVOCATION_FRESH_MS;
+      // A refresh that finished after `now` was taken (a verification waits for one) is fresh too;
+      // only a check from the far future (a clock set back) is not.
+      const age = now - (feed?.checked ?? 0);
+      const fresh = !!feed?.available && age >= -REVOCATION_FRESH_MS && age <= REVOCATION_FRESH_MS;
       const keys = [...new Set(pairs.map((p) => pair(p.account, p.device)))];
       const states = await Promise.all(keys.map(async (key) => {
         const entry: Revocation | undefined = await requestValue(tx.objectStore("revocations").get(key));

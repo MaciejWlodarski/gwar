@@ -141,3 +141,18 @@ describe("isPlaintextRemote", () => {
     expect(isPlaintextRemote("wss://192.168.1.20/ws")).toBe(false);
   });
 });
+
+describe("addressLabel", () => {
+  const page = { protocol: "https:", hostname: "gwar.app", port: "" };
+  it("shows a secure default URL as its host", async () => {
+    const { addressLabel } = await import("./address");
+    expect(addressLabel("wss://gwar.app/ws", page)).toBe("gwar.app");
+    expect(addressLabel("wss://voice.example.com:8443/ws", page)).toBe("voice.example.com:8443");
+    expect(addressLabel("wss://voice.example.com/other", page)).toBe("voice.example.com/other");
+  });
+  it("keeps anything that would not mean the same URL again", async () => {
+    const { addressLabel } = await import("./address");
+    expect(addressLabel("ws://192.168.1.10:8790/ws", page)).toBe("ws://192.168.1.10:8790/ws");
+    expect(addressLabel("not a url", page)).toBe("not a url");
+  });
+});

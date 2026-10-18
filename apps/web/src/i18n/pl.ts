@@ -308,6 +308,8 @@ export const pl: Record<Key, string> = {
   "voice.pttHint": "Naciśnij i mów: przytrzymaj {key}",
   "voice.encryptedUnsupported": "Zaktualizuj przeglądarkę albo użyj aplikacji na komputer, żeby dołączyć do szyfrowanej rozmowy.",
   "voice.securing": "Zabezpieczanie głosu…",
+  "voice.channelSecuring": "Ten szyfrowany kanał jest jeszcze zabezpieczany na tym urządzeniu. Spróbuj za chwilę.",
+  "voice.securingTimeout": "Nie udało się zabezpieczyć szyfrowanej rozmowy. Spróbuj ponownie.",
   "voice.closed": "Połączenie głosowe zostało zamknięte. Łączenie ponownie…",
 
   "chat.today": "Dzisiaj",
@@ -456,7 +458,7 @@ export const pl: Record<Key, string> = {
   "err.req.banned": "Masz bana na tym serwerze.",
   "err.req.too_large": "To jest za duże.",
   "err.req.quota_exceeded": "Brak miejsca na to na serwerze.",
-  "connect.invited": "Dostajesz zaproszenie na ten serwer. Wybierz pseudonim, żeby dołączyć.",
+  "connect.invited": "Dostajesz zaproszenie na ten serwer. Połącz się, żeby dołączyć.",
   "connect.inviteForget": "Zignoruj zaproszenie",
   "file.attach": "Dołącz pliki",
   "file.attachInput": "Dołącz pliki",

@@ -152,6 +152,9 @@ export const MessageRow = memo(function MessageRow({
   const authorName = member?.nickname ?? msg.author_name;
   const attachments = msg.attachments ?? [];
   const mentionsTrusted = fullyVerified(verification);
+  // Attachments are trusted on a valid signature (it covers each one's hash), also with a
+  // qualification such as a stale revocation feed or a since revoked device.
+  const attachmentsTrusted = verification === undefined ? null : verification.status === "verified";
   const mentionsMe = mentionsTrusted && !!meUid && (msg.mentions ?? []).includes(meUid);
   // A row this device cannot open can only be removed (by a moderator in a channel).
   const editable = canEdit && !row.item.cannotOpen;
@@ -237,7 +240,7 @@ export const MessageRow = memo(function MessageRow({
               </div>
             )}
             {!row.item.removed && !msg.text && warning && <div className="leading-none">{warning}</div>}
-            {!row.item.removed && attachments.length > 0 && <AttachmentList attachments={attachments} verified={verification === undefined ? null : fullyVerified(verification)} />}
+            {!row.item.removed && attachments.length > 0 && <AttachmentList attachments={attachments} verified={attachmentsTrusted} />}
           </>
         )}
       </div>
