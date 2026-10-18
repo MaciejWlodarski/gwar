@@ -109,7 +109,7 @@ private const val PUSH_TO_TALK = "push_to_talk"
  * meanwhile, so the process is not stopped in the background.
  */
 class GwarClient(private val app: Application) {
-    private val core = (app as GwarApplication).core
+    private val core = (app as GwarApplication).core()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private val audio = CallAudio(app) { outputs, output -> _state.update { it.copy(outputs = outputs, output = output) } }
     private val network = NetworkWatch(app) { onNetworkChanged() }

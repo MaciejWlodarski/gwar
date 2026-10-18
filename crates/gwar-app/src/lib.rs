@@ -10,6 +10,7 @@ mod aaudio;
 pub mod address;
 pub mod state;
 pub mod store;
+pub mod vault;
 pub mod voice;
 
 use std::{
@@ -91,6 +92,9 @@ pub enum AppError {
     Protocol { detail: String },
     #[error("{detail}")]
     Storage { detail: String },
+    /// The identity is sealed by a platform key that no longer opens it.
+    #[error("{detail}")]
+    IdentityLocked { detail: String },
 }
 
 impl From<ClientError> for AppError {
@@ -113,7 +117,10 @@ impl From<ClientError> for AppError {
 
 impl From<StoreError> for AppError {
     fn from(e: StoreError) -> Self {
-        Self::Storage { detail: e.to_string() }
+        match e {
+            StoreError::Vault(detail) => Self::IdentityLocked { detail },
+            e => Self::Storage { detail: e.to_string() },
+        }
     }
 }
 
@@ -210,10 +217,11 @@ pub struct GwarApp {
 
 #[uniffi::export]
 impl GwarApp {
-    /// Opens the app's state in `data_dir` (the app's private files directory).
+    /// Opens the app's state in `data_dir` (the app's private files directory),
+    /// with the identity sealed by `vault` when the platform has one.
     #[uniffi::constructor]
-    pub fn new(data_dir: String) -> Result<Arc<Self>, AppError> {
-        let store = Store::open(&PathBuf::from(data_dir))?;
+    pub fn new(data_dir: String, vault: Option<Arc<dyn vault::KeyVault>>) -> Result<Arc<Self>, AppError> {
+        let store = Store::open(&PathBuf::from(data_dir), vault.as_deref())?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("gwar-core")

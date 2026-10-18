@@ -13,6 +13,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 use vc_client::Identity;
 
+use crate::vault::{KeyVault, load_identity};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerPin {
     pub server_pk: String,
@@ -44,6 +46,9 @@ pub enum StoreError {
     Format(String),
     #[error("server identity changed")]
     PinMismatch,
+    /// The platform's key vault failed, e.g. its key is gone.
+    #[error("the identity cannot be unlocked: {0}")]
+    Vault(String),
 }
 
 pub struct Store {
@@ -53,10 +58,9 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn open(dir: &Path) -> Result<Self, StoreError> {
+    pub fn open(dir: &Path, vault: Option<&dyn KeyVault>) -> Result<Self, StoreError> {
         fs::create_dir_all(dir)?;
-        let identity =
-            Identity::load_or_create(&dir.join("identity")).map_err(|e| StoreError::Format(e.to_string()))?;
+        let identity = load_identity(dir, vault)?;
         let servers_path = dir.join("servers.json");
         let servers = match fs::read(&servers_path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| StoreError::Format(e.to_string()))?,
@@ -132,7 +136,7 @@ mod tests {
     #[test]
     fn identity_pins_and_form_survive_a_restart() {
         let dir = temp_dir();
-        let store = Store::open(&dir).unwrap();
+        let store = Store::open(&dir, None).unwrap();
         let uid = store.identity().uid();
         assert_eq!(store.pin("wss://a/ws"), None);
         store.commit_pin("wss://a/ws", "key-a").unwrap();
@@ -142,12 +146,12 @@ mod tests {
         store.set_last_server(form.clone()).unwrap();
         drop(store);
 
-        let store = Store::open(&dir).unwrap();
+        let store = Store::open(&dir, None).unwrap();
         assert_eq!(store.identity().uid(), uid);
         assert_eq!(store.pin("wss://a/ws").unwrap().server_pk, "key-a");
         assert_eq!(store.last_server(), Some(form));
         store.forget_pin("wss://a/ws").unwrap();
-        assert_eq!(Store::open(&dir).unwrap().pin("wss://a/ws"), None);
+        assert_eq!(Store::open(&dir, None).unwrap().pin("wss://a/ws"), None);
         fs::remove_dir_all(dir).unwrap();
     }
 }

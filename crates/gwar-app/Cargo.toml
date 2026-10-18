@@ -30,6 +30,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uniffi = "0.32"
+zeroize = "1"
 
 # AAudio input presets and usages need API level 28 (the app's minSdk).
 [target.'cfg(target_os = "android")'.dependencies]

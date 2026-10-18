@@ -2778,6 +2778,7 @@ dependencies = [
  "vc-client",
  "vc-proto",
  "vc-server",
+ "zeroize",
 ]
 
 [[package]]

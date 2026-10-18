@@ -56,8 +56,13 @@ the native desktop app will use `gwar-app` instead.
 
 ## What the Android app does today
 
-- A device identity (Ed25519) created on first start and kept in the app's
-  private storage, excluded from cloud backup and device transfer.
+- A device identity (Ed25519) created on first start, kept in the app's
+  private storage (excluded from cloud backup and device transfer) and sealed
+  there with AES-256-GCM by a key in the Android Keystore (StrongBox hardware
+  where the phone has it), so a copy of the app's files is useless elsewhere.
+  An identity kept in plain by an earlier build moves in on first start. If
+  the key is ever gone (the phone's keys were reset), the app says so and
+  offers to start over with a new identity; it never replaces one silently.
 - Server addresses with the same rules as the desktop app: TLS by default,
   plaintext only to this device or through the explicit "unencrypted LAN"
   option.
@@ -103,15 +108,13 @@ Roughly in this order:
    ([latency.md](latency.md)), output switching with real earpieces and
    Bluetooth headsets (the emulator has only a loudspeaker), a voice activity
    sensitivity setting.
-2. **Identity storage hardening.** Wrap the identity seed with a key from the
-   Android Keystore.
-3. **Encrypted chat, encrypted voice and direct messages.** These need the MLS client logic
+2. **Encrypted chat, encrypted voice and direct messages.** These need the MLS client logic
    that today lives in `apps/web` (TypeScript over `gwar-mls-wasm`), moved
    into the Rust core so every native app shares it. This waits until the
    main roadmap's encryption stages are finished.
-4. Gwar Connect accounts, invites and links, attachments, server-wide chat,
+3. Gwar Connect accounts, invites and links, attachments, server-wide chat,
    moderation, several servers, notifications.
-5. iOS.
+4. iOS.
 
 ## Build and run
 

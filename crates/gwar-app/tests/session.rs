@@ -105,8 +105,8 @@ async fn connects_joins_and_chats_like_the_app() {
     let server = server().await;
     let address = format!("ws://{}", server.http);
     let (ania_dir, bartek_dir) = (data_dir("ania"), data_dir("bartek"));
-    let ania = GwarApp::new(ania_dir.clone()).unwrap();
-    let bartek = GwarApp::new(bartek_dir.clone()).unwrap();
+    let ania = GwarApp::new(ania_dir.clone(), None).unwrap();
+    let bartek = GwarApp::new(bartek_dir.clone(), None).unwrap();
 
     let (l, ania_rx) = listener();
     let a = ania.connect(request(&address, "ania"), l).await.unwrap();
@@ -162,7 +162,7 @@ async fn connects_joins_and_chats_like_the_app() {
 
     // The form and the pin survive a restart of the app.
     drop(a);
-    let again = GwarApp::new(ania_dir.clone()).unwrap();
+    let again = GwarApp::new(ania_dir.clone(), None).unwrap();
     let last = again.last_server().unwrap();
     assert_eq!((last.address.as_str(), last.nickname.as_str()), (address.as_str(), "ania"));
     assert_eq!(again.uid(), ania.uid());
@@ -176,7 +176,7 @@ async fn a_different_server_key_at_a_pinned_address_is_refused() {
     let first = server().await;
     let address = format!("ws://{}", first.http);
     let dir = data_dir("pin");
-    let app = GwarApp::new(dir.clone()).unwrap();
+    let app = GwarApp::new(dir.clone(), None).unwrap();
     let (l, _rx) = listener();
     app.connect(request(&address, "ania"), l).await.unwrap().disconnect();
 
@@ -186,7 +186,7 @@ async fn a_different_server_key_at_a_pinned_address_is_refused() {
     let other = server().await;
     let other_endpoint = gwar_app::parse_server_address(format!("ws://{}", other.http), false).unwrap().url;
     std::fs::write(std::path::Path::new(&dir).join("servers.json"), pins.replace(&endpoint, &other_endpoint)).unwrap();
-    let app = GwarApp::new(dir.clone()).unwrap();
+    let app = GwarApp::new(dir.clone(), None).unwrap();
     let (l, _rx) = listener();
     let refused = app.connect(request(&format!("ws://{}", other.http), "ania"), l).await;
     assert!(matches!(refused, Err(AppError::ServerIdentityChanged { endpoint }) if endpoint == other_endpoint));
@@ -247,9 +247,9 @@ async fn voice_reaches_the_other_app_and_mute_stops_it() {
     let address = format!("ws://{}", server.http);
     let (a_dir, b_dir) = (data_dir("voice-a"), data_dir("voice-b"));
     let (l, _a_rx) = listener();
-    let a = GwarApp::new(a_dir.clone()).unwrap().connect(request(&address, "ania"), l).await.unwrap();
+    let a = GwarApp::new(a_dir.clone(), None).unwrap().connect(request(&address, "ania"), l).await.unwrap();
     let (l, b_rx) = listener();
-    let b = GwarApp::new(b_dir.clone()).unwrap().connect(request(&address, "bartek"), l).await.unwrap();
+    let b = GwarApp::new(b_dir.clone(), None).unwrap().connect(request(&address, "bartek"), l).await.unwrap();
 
     let silent = Arc::new(AtomicBool::new(false));
     assert!(matches!(
@@ -314,8 +314,11 @@ async fn an_idle_session_stays_connected() {
     let server = server().await;
     let dir = data_dir("idle");
     let (l, rx) = listener();
-    let session =
-        GwarApp::new(dir.clone()).unwrap().connect(request(&format!("ws://{}", server.http), "ania"), l).await.unwrap();
+    let session = GwarApp::new(dir.clone(), None)
+        .unwrap()
+        .connect(request(&format!("ws://{}", server.http), "ania"), l)
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_secs(75)).await;
     assert!(!rx.try_iter().any(|h| matches!(h, Heard::Closed(_))), "the server closed an idle session");
     session.history(session.view().channels[0].id, None).await.unwrap();

@@ -91,4 +91,10 @@
     <string name="voice_push_to_talk">Push to talk</string>
     <string name="voice_hold_to_talk">Hold to talk</string>
     <string name="voice_talking">Talking…</string>
+    <string name="locked_title">Your identity cannot be unlocked</string>
+    <string name="locked_body">Gwar keeps your identity sealed by a key in this phone’s secure storage, and that key no longer opens it. This happens when the phone’s security settings or keys were reset.</string>
+    <string name="locked_reset">Start over with a new identity</string>
+    <string name="locked_reset_body">Servers will see you as a new person: your old identity cannot be recovered on this phone. Server bookmarks are kept.</string>
+    <string name="locked_reset_confirm">Create a new identity</string>
+    <string name="error_identity_locked">The identity cannot be unlocked: %1$s</string>
 </resources>

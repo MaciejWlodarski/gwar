@@ -90,4 +90,10 @@
     <string name="voice_push_to_talk">Naciśnij, aby mówić</string>
     <string name="voice_hold_to_talk">Przytrzymaj, aby mówić</string>
     <string name="voice_talking">Mówisz…</string>
+    <string name="locked_title">Nie można odblokować Twojej tożsamości</string>
+    <string name="locked_body">Gwar przechowuje Twoją tożsamość zabezpieczoną kluczem w bezpiecznym magazynie tego telefonu, a ten klucz już jej nie otwiera. Dzieje się tak po zresetowaniu zabezpieczeń lub kluczy telefonu.</string>
+    <string name="locked_reset">Zacznij od nowa z nową tożsamością</string>
+    <string name="locked_reset_body">Serwery zobaczą Cię jako nową osobę: starej tożsamości nie da się odzyskać na tym telefonie. Zapisane serwery zostaną zachowane.</string>
+    <string name="locked_reset_confirm">Utwórz nową tożsamość</string>
+    <string name="error_identity_locked">Nie można odblokować tożsamości: %1$s</string>
 </resources>

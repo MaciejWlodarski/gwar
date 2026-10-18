@@ -34,6 +34,7 @@ fun describe(error: AppException): String = when (error) {
     is AppException.Network -> stringResource(R.string.error_network, error.detail)
     is AppException.Protocol -> stringResource(R.string.error_protocol, error.detail)
     is AppException.Storage -> stringResource(R.string.error_storage, error.detail)
+    is AppException.IdentityLocked -> stringResource(R.string.error_identity_locked, error.detail)
 }
 
 @Composable
