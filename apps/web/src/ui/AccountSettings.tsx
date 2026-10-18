@@ -11,7 +11,7 @@ import { loadOrCreateIdentity, uidForPublicKey } from "../net/identity";
 import { accountActions, useAccount } from "../state/account";
 import { useSettings } from "../state/settings";
 import { useUi } from "../state/stores";
-import { Button, Dialog, Field, Input, Segmented } from "./kit";
+import { Button, Dialog, Field, Input, Segmented, Switch } from "./kit";
 import { TeamspeakIdentity } from "./TeamspeakIdentity";
 import { tsBridge } from "../connect/teamspeak";
 
@@ -414,6 +414,8 @@ function AccountView() {
   const t = useT();
   const toast = useUi((s) => s.toast);
   const lang = useSettings((s) => s.language);
+  const archiveUploads = useSettings((s) => s.archiveUploads);
+  const setArchiveUploads = useSettings((s) => s.setArchiveUploads);
   const account = useAccount((s) => s.account)!;
   const certChecked = useAccount((s) => s.certChecked);
   const [now] = useState(() => Date.now());
@@ -530,6 +532,15 @@ function AccountView() {
             <RefreshCw className="size-4" /> {t("account.refresh")}
           </Button>
         </div>
+      </Section>
+
+      <Section title={t("account.archive")}>
+        <Switch
+          checked={archiveUploads}
+          onCheckedChange={setArchiveUploads}
+          label={t("account.archiveUploads")}
+          description={t("account.archiveUploadsHint")}
+        />
       </Section>
 
       <TeamspeakSection onUnlock={() => setUnlocking(true)} />

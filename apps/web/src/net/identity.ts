@@ -80,6 +80,15 @@ export interface ConnectRecord {
    * saved before the vault existed lack it until the next such flow.
    */
   vaultKey?: string;
+  /**
+   * A recovery archive key statement to publish (docs/e2e-build.md, section 7): signed at
+   * sign-up or by a recovery code change, published by the key archive. After a code change,
+   * `base` is the credential version the change was made on: the statement is published once
+   * Connect's version moved past it, and dropped if it did not (the change never happened).
+   */
+  archiveRecovery?: { statement: string; signature: string; base?: number };
+  /** After a recovery-code sign-in: the recovery archive key (base64url), until the archive opened what it can with it. */
+  archiveRecoverySecret?: string;
 }
 
 export interface ConnectStore {

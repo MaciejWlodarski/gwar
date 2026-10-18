@@ -18,6 +18,7 @@ import { VoiceCall } from "./voice";
 import type { VoiceState } from "../proto/VoiceState";
 import type { Managers } from "../proto/Managers";
 import type { OwnerInfo } from "../proto/OwnerInfo";
+import { KeyArchive, type ArchiveOptions } from "./archive";
 import type { AccessView, AgentFactory, Change, OwnerCheck, OwnerGeneration, OwnerView, CommitOutbox, ConversationStatus, Gate, GroupSummary, HistoryJob, OpenResult, PackageJob, Plaintext, RequestJob, Resolution, Revocation, Roster, SealedFields } from "./types";
 import { repairable, usable } from "./types";
 import { memberListRenewalDue } from "../lib/managers";
@@ -62,6 +63,8 @@ export interface RuntimeOptions {
   inviteOwner?: string;
   /** The server's owner record is no extension of this device's pin: the caller disconnects. */
   onOwnerChanged?: () => void;
+  /** The key archive of a Connect device (docs/e2e-build.md, section 7); none for a local identity. */
+  archive?: Omit<ArchiveOptions, "deviceKey" | "now">;
   /** An owner reset: a neutral notice the user may accept (docs/e2e-build.md, section 6, 6b). */
   onOwnerGeneration?: (notice: OwnerGeneration) => void;
 }
@@ -151,7 +154,17 @@ export class MlsRuntime {
   /** Volatile voice calls under this device lease, closed with it. */
   private readonly calls = new Set<VoiceCall>();
   private readonly now: () => number;
-  private constructor(private readonly options: RuntimeOptions, private readonly engine: Engine, private readonly release: () => Promise<void>) { this.now = options.now ?? Date.now; }
+  /** The key archive runs after a successful pass, at most once a minute, backing off on failures. */
+  private readonly archive: KeyArchive | undefined;
+  private archiveAt = 0;
+  private archiveDelay = 60_000;
+  private archiving = false;
+  private constructor(private readonly options: RuntimeOptions, private readonly engine: Engine, private readonly release: () => Promise<void>) {
+    this.now = options.now ?? Date.now;
+    this.archive = options.archive && options.identity.device
+      ? new KeyArchive(engine, { ...options.archive, deviceKey: options.identity.publicKey, now: this.now })
+      : undefined;
+  }
 
   static async connect(options: RuntimeOptions): Promise<MlsRuntime> {
     if (options.link.status.state !== "idle") throw new Error("MLS must acquire its lock before connecting");
@@ -458,8 +471,20 @@ export class MlsRuntime {
       // sooner for a channel group whose create or join comes due.
       const wake = this.wakeAt === undefined ? 15_000 : Math.max(200, Math.min(15_000, this.wakeAt - this.now()));
       this.schedule(!failed && this.dirty ? 200 : wake);
+      if (!failed) this.archivePass();
     });
     return this.syncing;
+  }
+  private archivePass(): void {
+    if (!this.archive || this.archiving || this.stopped || this.now() < this.archiveAt) return;
+    this.archiving = true;
+    void this.archive.pass().then(
+      () => { this.archiveDelay = 60_000; },
+      error => {
+        this.archiveDelay = Math.min(this.archiveDelay * 2, 30 * 60_000);
+        if (!this.stopped) this.options.onError?.(error);
+      },
+    ).finally(() => { this.archiving = false; this.archiveAt = this.now() + this.archiveDelay; });
   }
   /** A plaintext Welcome leaves persisted server groups and jobs dormant. */
   private enabled(conversation: string | undefined): boolean { return conversation !== "server" || this.serverChat; }
@@ -508,7 +533,7 @@ export class MlsRuntime {
   /** Runtime jobs of superseded groups go with them, in the same write. */
   private supersededJobs(): Change[] {
     const old = new Set(this.inventory().filter(g => g.record.status === "superseded").map(g => encoded(g.group)));
-    return [...this.engine.jobs.values()].filter(job => job.kind !== "packages" && job.server === this.server && old.has(job.group)).map(job => jobChange(job, true));
+    return [...this.engine.jobs.values()].filter(job => job.kind !== "packages" && job.kind !== "archive" && job.server === this.server && old.has(job.group)).map(job => jobChange(job, true));
   }
   private async transition<T>(request: unknown, validate?: (result: T) => void): Promise<T> {
     const before = this.inventory();
@@ -779,7 +804,7 @@ export class MlsRuntime {
       if (id === undefined || channels.has(id) || g.record.status === "forgotten") continue;
       const group = encoded(g.group);
       // The group's runtime jobs go with it, in the same write.
-      const jobs = [...this.engine.jobs.values()].filter(job => job.kind !== "packages" && job.server === this.server && job.group === group);
+      const jobs = [...this.engine.jobs.values()].filter(job => job.kind !== "packages" && job.kind !== "archive" && job.server === this.server && job.group === group);
       await this.engine.op({ forget: this.args(group) }, () => jobs.map(job => jobChange(job, true)));
       for (const job of jobs) this.historyDue.delete(jobKey(job));
       this.missing.delete(group); this.statuses.delete(g.conversation);

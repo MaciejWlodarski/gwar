@@ -30,6 +30,14 @@ export class FakeService {
   expiries = new Map<string, number>();
   challenges = new Map<string, { token: string; purpose: string; cert?: SignedDevice; reply: ConnectChallenge }>();
   vaults = new Map<string, { vault: string; version: number }>();
+  /** The key archive by handle; shapes only, like Connect's checks minus signatures. */
+  archive = new Map<string, {
+    devices: Map<string, { statement: string; signature: string }>;
+    recovery: { statement: string; signature: string }[];
+    manifests: Map<number, string>;
+    records: { cursor: number; generation: number; record_id: string; data: string }[];
+    transfers: { cursor: number; transfer: string }[];
+  }>();
   n = 0;
 
   fetch = async (url: string | URL | Request, init?: RequestInit): Promise<Response> => {
@@ -139,6 +147,66 @@ export class FakeService {
       if (body.version !== have) return err(409, "conflict");
       this.vaults.set(handle, { vault: body.vault, version: have + 1 });
       return ok({ version: have + 1 });
+    }
+    if (path.startsWith("/archive/")) {
+      const device = this.sessionDevices.get(auth);
+      if (!device) return err(401, "unauthorized");
+      let ar = this.archive.get(handle);
+      if (!ar) this.archive.set(handle, ar = { devices: new Map(), recovery: [], manifests: new Map(), records: [], transfers: [] });
+      const [route, query] = path.slice(9).split("?");
+      const after = Number(new URLSearchParams(query).get("after") ?? 0);
+      const method = init?.method ?? "GET";
+      if (route === "device" && method === "PUT") {
+        if (body.statement.split("\n")[2] !== device) return err(400, "bad_request");
+        if (ar.devices.has(device)) return err(409, "conflict");
+        ar.devices.set(device, { statement: body.statement, signature: body.signature });
+        return ok({});
+      }
+      if (route === "devices") {
+        return ok({ devices: [...ar.devices].map(([key, d]) => {
+          const known = this.devices.find((x) => x.device_key === key);
+          return { ...d, certificate: known?.revoked_at === null ? known.certificate : null };
+        }) });
+      }
+      if (route === "recovery" && method === "PUT") {
+        const version = Number(body.statement.split("\n")[2]);
+        const newest = ar.recovery.at(-1);
+        if (newest && version === ar.recovery.length && newest.statement === body.statement) return ok({});
+        if (version !== ar.recovery.length + 1) return err(409, "conflict");
+        ar.recovery.push({ statement: body.statement, signature: body.signature });
+        return ok({});
+      }
+      if (route === "recovery") return ok({ keys: ar.recovery });
+      if (route === "manifests" && method === "POST") {
+        const bytes = decodeBase64Url(body.manifest);
+        const generation = Number(new TextDecoder().decode(bytes).split("\n")[2]);
+        if (ar.manifests.has(generation)) return err(409, "conflict");
+        ar.manifests.set(generation, body.manifest);
+        return ok({});
+      }
+      if (route === "manifests") {
+        const list = [...ar.manifests].filter(([g]) => g > after).sort(([x], [y]) => x - y).map(([generation, manifest]) => ({ generation, manifest }));
+        return ok({ manifests: list.slice(0, 100), next: list.length > 100 ? list[99]!.generation : null });
+      }
+      if (route === "records" && method === "POST") {
+        for (const r of body.records) {
+          if (!ar.records.some((x) => x.record_id === r.record_id)) ar.records.push({ cursor: ++this.n, ...r });
+        }
+        return ok({});
+      }
+      if (route === "records") {
+        const list = ar.records.filter((r) => r.cursor > after);
+        return ok({ records: list.slice(0, 1000), next: list.length > 1000 ? list[999]!.cursor : null });
+      }
+      if (route === "transfers" && method === "POST") {
+        ar.transfers.push({ cursor: ++this.n, transfer: body.transfer });
+        return ok({});
+      }
+      if (route === "transfers") {
+        const list = ar.transfers.filter((t) => t.cursor > after);
+        return ok({ transfers: list.slice(0, 100), next: list.length > 100 ? list[99]!.cursor : null });
+      }
+      return err(404, "not_found");
     }
     if (path === "/logout") {
       this.sessions.delete(auth);

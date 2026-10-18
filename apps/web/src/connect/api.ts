@@ -103,6 +103,24 @@ export interface Revocation {
   signature: string;
 }
 
+/** A signed archive statement (docs/e2e-build.md, section 7): a device's or a recovery archive key. */
+export interface ArchiveStatement {
+  statement: string;
+  signature: string;
+}
+
+export interface ArchiveDevice extends ArchiveStatement {
+  /** The device's current certificate, if Connect has one. */
+  certificate: { issued_at: number; expires_at: number; signature: string } | null;
+}
+
+export interface ArchiveRecordEntry {
+  cursor: number;
+  generation: number;
+  record_id: string;
+  data: string;
+}
+
 export interface VaultReply {
   /** The sealed vault, or null before the first write. */
   vault: string | null;
@@ -205,6 +223,49 @@ export class ConnectApi {
 
   async revocations(since = 0): Promise<Revocation[]> {
     return (await this.call<{ revocations: Revocation[] }>("GET", `/revocations?since=${since}`)).revocations;
+  }
+
+  /** Publishes this device's archive key; "conflict" once it has one. */
+  async putArchiveDevice(token: string, key: ArchiveStatement): Promise<void> {
+    await this.call("PUT", "/archive/device", key, token);
+  }
+
+  async archiveDevices(token: string): Promise<ArchiveDevice[]> {
+    return (await this.call<{ devices: ArchiveDevice[] }>("GET", "/archive/devices", undefined, token)).devices;
+  }
+
+  /** Publishes the next recovery archive key version (the identical statement again is accepted). */
+  async putArchiveRecovery(token: string, key: ArchiveStatement): Promise<void> {
+    await this.call("PUT", "/archive/recovery", key, token);
+  }
+
+  async archiveRecovery(token: string): Promise<ArchiveStatement[]> {
+    return (await this.call<{ keys: ArchiveStatement[] }>("GET", "/archive/recovery", undefined, token)).keys;
+  }
+
+  /** Posts a generation's manifest; "conflict" if the generation exists. */
+  async postArchiveManifest(token: string, manifest: string): Promise<void> {
+    await this.call("POST", "/archive/manifests", { manifest }, token);
+  }
+
+  archiveManifests(token: string, after: number): Promise<{ manifests: { generation: number; manifest: string }[]; next: number | null }> {
+    return this.call("GET", `/archive/manifests?after=${after}`, undefined, token);
+  }
+
+  async postArchiveRecords(token: string, records: { generation: number; record_id: string; data: string }[]): Promise<void> {
+    await this.call("POST", "/archive/records", { records }, token);
+  }
+
+  archiveRecords(token: string, after: number): Promise<{ records: ArchiveRecordEntry[]; next: number | null }> {
+    return this.call("GET", `/archive/records?after=${after}`, undefined, token);
+  }
+
+  async postArchiveTransfer(token: string, transfer: string): Promise<void> {
+    await this.call("POST", "/archive/transfers", { transfer }, token);
+  }
+
+  archiveTransfers(token: string, after: number): Promise<{ transfers: { cursor: number; transfer: string }[]; next: number | null }> {
+    return this.call("GET", `/archive/transfers?after=${after}`, undefined, token);
   }
 
   /** The public account key of a handle (needed to derive recovery secrets). */

@@ -233,7 +233,7 @@ enum Request {
         revocations: Vec<gwar_mls::agent::ArchiveRevocation>,
         manifests: Vec<Vec<u8>>,
         transfers: Vec<Vec<u8>>,
-        recovery_code: Option<Vec<u8>>,
+        recovery_secret: Option<[u8; 32]>,
         now: i64,
     },
     ArchiveCreateManifest {
@@ -560,18 +560,10 @@ impl Agent {
                 output(a.accept_chain(&server, &conversation, &chain).map_err(error)?)
             }
             Request::ArchiveDeviceKey { now } => output(a.archive_device_key(now).map_err(error)?),
-            Request::ArchiveSync { devices, recovery, revocations, manifests, transfers, recovery_code, now } => {
+            Request::ArchiveSync { devices, recovery, revocations, manifests, transfers, recovery_secret, now } => {
                 output(
-                    a.archive_sync(
-                        &devices,
-                        &recovery,
-                        &revocations,
-                        &manifests,
-                        &transfers,
-                        recovery_code.as_deref(),
-                        now,
-                    )
-                    .map_err(error)?,
+                    a.archive_sync(&devices, &recovery, &revocations, &manifests, &transfers, recovery_secret, now)
+                        .map_err(error)?,
                 )
             }
             Request::ArchiveCreateManifest { now } => output(a.archive_create_manifest(now).map_err(error)?),

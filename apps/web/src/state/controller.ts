@@ -15,6 +15,7 @@ import { signMessage, sha256, MessageVerifier, fullyVerified, DELETION_TEXT, inv
 import type { Attachment } from "../proto/Attachment";
 import type { MessageSignature } from "../proto/MessageSignature";
 import { useAccountIdentity } from "./identity";
+import { archiveOptions } from "./archive";
 import type { BanNotice } from "../proto/BanNotice";
 /**
  * Glue between the network client, the voice engine and the stores. UI
@@ -409,6 +410,7 @@ class Controller {
               onError: error => console.warn("Conversation synchronization:", error),
               onTakeover: () => void this.sessionMoved(conn),
               inviteOwner: params.inviteOwner,
+              archive: archiveOptions(conn.identity),
               // docs/e2e-build.md, section 6, 6b: a changed owner record is not this server any more.
               onOwnerChanged: () => {
                 if (this.conn !== conn) return;

@@ -32,7 +32,7 @@ fn sync(
     revocations: &[ArchiveRevocation],
     manifests: &[Vec<u8>],
     transfers: &[Vec<u8>],
-    code: Option<&[u8]>,
+    code: Option<[u8; 32]>,
     t: i64,
 ) -> ArchiveState {
     let state = a.archive_sync(devices, recovery, revocations, manifests, transfers, code, t).unwrap();
@@ -94,7 +94,20 @@ fn devices_share_the_archive_through_generations_transfers_and_the_recovery_code
     let state = sync(&mut fresh, &all, &recovery, &[], &[g1.clone(), g2.clone()], &[], None, t);
     assert!(state.opened.is_empty());
     // The code given later opens the generation it accepted before.
-    assert_eq!(sync(&mut fresh, &all, &recovery, &[], &[], &[], Some(&code), t).opened, vec![2]);
+    assert_eq!(
+        sync(
+            &mut fresh,
+            &all,
+            &recovery,
+            &[],
+            &[],
+            &[],
+            Some(archive::recovery_key_pair(&code, &key(1).verifying_key().to_bytes()).0),
+            t
+        )
+        .opened,
+        vec![2]
+    );
 
     // Revoking the phone makes generation 2 unsafe; generation 3 leaves it out.
     let revoked_at = t + 1;

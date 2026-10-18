@@ -271,7 +271,8 @@ impl Agent {
     /// checked as a reader must (signature, certificate, body, chain, recipients' archive keys,
     /// the creator against the revocations it knows and those the manifest carries); a different
     /// manifest for a generation it saw is refused. It then opens every accepted generation it
-    /// can: as a recipient, by a transfer, or with `recovery_code` (account recovery) the
+    /// can: as a recipient, by a transfer, or with `recovery_secret` (the recovery archive key
+    /// derived from the recovery code, [`archive::recovery_key_pair`], for account recovery) the
     /// generations sealed or transferred to the current recovery version.
     #[allow(clippy::too_many_arguments)]
     pub fn archive_sync(
@@ -281,7 +282,7 @@ impl Agent {
         revocations: &[ArchiveRevocation],
         manifests: &[Vec<u8>],
         transfers: &[Vec<u8>],
-        recovery_code: Option<&[u8]>,
+        recovery_secret: Option<[u8; 32]>,
         now: i64,
     ) -> Result<ArchiveState> {
         self.operation(|a| {
@@ -372,10 +373,6 @@ impl Agent {
             }
             // Opening: every accepted generation it has no key for (a recovery code given later
             // opens generations accepted before).
-            let recovery_secret = recovery_code.map(|code| {
-                let account = fixed::<32>(&account_key).expect("account key");
-                archive::recovery_key_pair(code, &account).0
-            });
             let unopened: Vec<u64> =
                 record.manifests.keys().filter(|g| !record.keys.contains_key(g)).copied().collect();
             for generation in unopened {

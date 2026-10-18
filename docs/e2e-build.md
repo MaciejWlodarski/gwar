@@ -2881,30 +2881,29 @@ staged, resumable rotation on that device:
 
 1. With the account key decrypted, it derives the new recovery archive key
    from the new code, signs the next version's statement, and stores the
-   signed statement and the public key (never the code) as a **pending
-   rotation** in its MLS store.
+   signed statement (never the code) as a **pending rotation** in its
+   Connect record, with the credential version the change is made on.
 2. It updates the recovery credentials (`PUT /v1/account/recovery`). A
    definite refusal discards the pending rotation; an ambiguous failure (no
    reply, a network error) keeps it until the credential version tells
    (below).
-3. It publishes the statement (`PUT /v1/archive/recovery`), sends transfers
-   of every generation it can open to the new version, and creates a new
-   generation sealed to it; then the rotation is complete.
+3. It publishes the statement (`PUT /v1/archive/recovery`) and drops the
+   pending rotation. The key archive then sees a new recovery version: every
+   generation it opened that is not sealed to it is owed a transfer, and no
+   generation is safe until it makes the next one, sealed to the new version.
 
-After a crash or an ambiguous failure, a pending rotation whose credential
-update succeeded (the pending rotation records the credential version it
-expects after the update; the device compares it with the version `POST
-/v1/challenges` reports) resumes at step 3. Publishing is idempotent:
-Connect answers `{}` to the identical statement for the version it already
-holds, and a device that finds its pending statement as the newest version
-in `GET /v1/archive/recovery` continues with the transfers, all without
-the password; one whose update did not happen is discarded. The
-interface reports the change only when step 3 is done, and generations the
-device could not open: "History before {date} can't be restored with the
-new recovery code." Restoring with
-the recovery code (`POST /v1/recover`) derives the recovery archive key,
-fetches the manifests and transfers for the newest version it can derive
-and opens every generation sealed to it.
+A pending rotation left by a crash or an ambiguous failure is resumed by the
+key archive: when the credential version `POST /v1/challenges` reports moved
+past the one the change was made on, it publishes the statement (Connect
+answers `{}` to the identical statement for the version it already holds, so
+publishing is idempotent); when it did not, the change never happened and
+the pending rotation is dropped. Sign-up signs version 1 the same way (no
+credential check) and the key archive publishes it. Restoring with the
+recovery code (`POST /v1/recover`) derives the recovery archive key, which
+the new device keeps until its first archive sync: it opens every generation
+sealed or transferred to the newest recovery version and imports their
+records. Accounts made before the key archive get their first recovery key
+when the code is next changed.
 
 ### Connect API
 
@@ -2968,5 +2967,5 @@ a record belongs to.
   revoking a device makes the next upload create a new generation that
   excludes it; restoring with the recovery code on a new device after
   "losing" every device reads the history; changing the recovery code
-  re-seals and reports unopenable generations; the setting off stops
-  uploads; e2e in the browser with Connect.
+  re-seals (a transfer of every older generation and a new generation); the
+  setting off stops uploads; e2e in the browser with Connect.

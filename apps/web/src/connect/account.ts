@@ -9,7 +9,8 @@
  */
 import { decodeBase64Url, encodeBase64Url } from "../net/base64url";
 import type { ConnectRecord, ConnectStore } from "../net/identity";
-import { ConnectApi, ConnectApiError, type DeviceCertBody, type RegisterBody, type CredentialAuthorization } from "./api";
+import { ConnectApi, ConnectApiError, type ArchiveStatement, type DeviceCertBody, type RegisterBody, type CredentialAuthorization } from "./api";
+import { recoveryArchiveKey, recoveryVersion, signedRecoveryKey } from "./archive";
 import {
   certifyDevice,
   checkChallenge,
@@ -149,21 +150,25 @@ export class PreparedAccount {
     private readonly cert: Awaited<ReturnType<typeof certifyDevice>>,
     private readonly deviceName: string,
     private readonly vaultKey: string,
+    private readonly archiveRecovery: ArchiveStatement,
   ) {}
 
   /** The same account under another handle (the recovery code stays valid). */
   withHandle(raw: string): PreparedAccount {
     const handle = normalizeHandle(raw);
     if (!handle) throw new ConnectApiError("bad_request", "invalid handle");
-    return new PreparedAccount(handle, this.body, this.device, this.cert, this.deviceName, this.vaultKey);
+    return new PreparedAccount(handle, this.body, this.device, this.cert, this.deviceName, this.vaultKey, this.archiveRecovery);
   }
 
   /** @internal Only {@link registerPrepared} sends it. */
   request(): { body: RegisterBody; record: (token: string) => ConnectRecord } {
     return {
       body: { handle: this.handle, ...this.body },
-      record: (token) =>
-        recordOf(this.handle, this.body.account_key, this.device, certificateOf(this.body.account_key, this.cert), this.deviceName, token, this.vaultKey),
+      record: (token) => ({
+        ...recordOf(this.handle, this.body.account_key, this.device, certificateOf(this.body.account_key, this.cert), this.deviceName, token, this.vaultKey),
+        // Version 1 of the recovery archive key, published by the key archive.
+        archiveRecovery: this.archiveRecovery,
+      }),
     };
   }
 }
@@ -196,7 +201,8 @@ export async function prepareAccount(p: CreateParams, deps: FlowDeps): Promise<{
     device: certBody(cert, deps.deviceName),
   };
   // Nothing to renew here: the only device is the one certified just now.
-  const prepared = new PreparedAccount(handle, body, device, cert, deps.deviceName, await vaultKeyOf(account));
+  const archiveRecovery = await signedRecoveryKey(account, code, 1, Date.now());
+  const prepared = new PreparedAccount(handle, body, device, cert, deps.deviceName, await vaultKeyOf(account), archiveRecovery);
   return { prepared, recoveryCode: formatRecoveryCode(code) };
 }
 
@@ -262,7 +268,9 @@ export async function recover(p: { handle: string; code: string; newPassword: st
   if (account.publicKey !== reply.account_key) throw new ConnectApiError("server", "the stored key does not match the account");
   const record = await enroll(handle, reply.token, account, deps);
   await setPassword(deps.api, record.token, account, p.newPassword);
-  return record;
+  // The key archive opens what is sealed to this code with it (docs/e2e-build.md, section 7).
+  const archive = await recoveryArchiveKey(code, account.publicKey);
+  return { ...record, archiveRecoverySecret: encodeBase64Url(archive.secret) };
 }
 
 async function setPassword(api: ConnectApi, token: string, account: KeyPairJwk, password: string): Promise<void> {
@@ -274,7 +282,7 @@ async function setPassword(api: ConnectApi, token: string, account: KeyPairJwk, 
 }
 
 /** What a flow that unlocked the account key stores on this device: the new session, the vault key and any newer certificate. */
-async function saveUnlocked(record: ConnectRecord, opened: { token: string; vaultKey: string; certificate: Certificate }, deps: FlowDeps): Promise<ConnectRecord> {
+async function saveUnlocked(record: ConnectRecord, opened: { token: string; vaultKey: string; certificate: Certificate; archiveRecovery?: ConnectRecord["archiveRecovery"] }, deps: FlowDeps): Promise<ConnectRecord> {
   const next = { ...record, ...opened };
   await deps.store.save(next);
   return next;
@@ -332,9 +340,28 @@ export async function changeRecoveryCode(record: ConnectRecord, password: string
   const secrets = await recoverySecrets(code, decodeBase64Url(account.publicKey));
   const auth = encodeBase64Url(secrets.authKey);
   const blob = await sealKey(secrets.encKey, seedOfJwk(account.jwk), account.publicKey);
-  await deps.api.changeRecovery(opened.token, { recovery_auth: auth, recovery_blob: blob,
-    ...await credentialAuthorization(deps.api, opened.token, account, "recovery", null, auth, blob) });
-  return { record: await saveUnlocked(record, opened, deps), recoveryCode: formatRecoveryCode(code) };
+  const authorization = await credentialAuthorization(deps.api, opened.token, account, "recovery", null, auth, blob);
+  // The next recovery archive key, kept as a pending rotation before the credentials change
+  // (docs/e2e-build.md, section 7, "Recovery code changes"); the key archive publishes it.
+  const newest = Math.max(0, ...(await deps.api.archiveRecovery(opened.token)).map(k => recoveryVersion(k.statement)));
+  const key = await signedRecoveryKey(account, code, newest + 1, Date.now());
+  const pending = await saveUnlocked(record, { ...opened, archiveRecovery: { ...key, base: authorization.credential_version } }, deps);
+  try {
+    await deps.api.changeRecovery(opened.token, { recovery_auth: auth, recovery_blob: blob, ...authorization });
+  } catch (error) {
+    // A definite refusal: the change did not happen. Otherwise the credential version tells later.
+    if (error instanceof ConnectApiError && error.kind !== "network" && error.kind !== "server") {
+      await deps.store.save({ ...pending, archiveRecovery: undefined });
+    }
+    throw error;
+  }
+  let next = pending;
+  try {
+    await deps.api.putArchiveRecovery(opened.token, key);
+    next = { ...pending, archiveRecovery: undefined };
+    await deps.store.save(next);
+  } catch { /* The key archive publishes it later. */ }
+  return { record: next, recoveryCode: formatRecoveryCode(code) };
 }
 
 export type PickUp = "updated" | "current" | "unlisted" | "revoked" | "invalid";

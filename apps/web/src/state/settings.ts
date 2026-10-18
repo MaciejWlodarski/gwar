@@ -141,6 +141,8 @@ export interface SettingsState {
   tsDetectAsked: boolean;
   /** Per server key, whether my last new channel there was end-to-end encrypted: the next one starts the same. */
   channelEncryption: Record<string, boolean>;
+  /** "Back up message keys to Gwar Connect" (docs/e2e-build.md, section 7): off means no uploads; reading and transfers still work. */
+  archiveUploads: boolean;
 
   setTheme(theme: Theme): void;
   setLanguage(language: Language): void;
@@ -163,6 +165,7 @@ export interface SettingsState {
   setLast(address: string, kind?: ServerKind): void;
   setTsDetectAsked(asked: boolean): void;
   setChannelEncryption(serverKey: string, encrypted: boolean): void;
+  setArchiveUploads(on: boolean): void;
 }
 
 export function detectLanguage(): Language {
@@ -205,6 +208,7 @@ export const useSettings = create<SettingsState>()(
       lastKind: "vc",
       tsDetectAsked: false,
       channelEncryption: {},
+      archiveUploads: true,
 
       setTheme: (theme) => set({ theme }),
       setLanguage: (language) => set({ language }),
@@ -254,6 +258,7 @@ export const useSettings = create<SettingsState>()(
       setLast: (lastAddress, lastKind = "vc") => set({ lastAddress, lastKind }),
       setTsDetectAsked: (tsDetectAsked) => set({ tsDetectAsked }),
       setChannelEncryption: (serverKey, encrypted) => set((s) => ({ channelEncryption: { ...s.channelEncryption, [serverKey]: encrypted } })),
+      setArchiveUploads: (archiveUploads) => set({ archiveUploads }),
     }),
     {
       name: "vc.settings",
@@ -270,6 +275,7 @@ export const useSettings = create<SettingsState>()(
         return { ...current, ...p, lastNickname, bookmarks, audio: { ...current.audio, ...(p.audio ?? {}) }, desktop: { ...current.desktop, ...(p.desktop ?? {}) },
           notifications: { ...current.notifications, ...(p.notifications ?? {}) },
           channelEncryption: typeof p.channelEncryption === "object" && p.channelEncryption !== null ? p.channelEncryption : {},
+          archiveUploads: typeof p.archiveUploads === "boolean" ? p.archiveUploads : current.archiveUploads,
         };
       },
     },
