@@ -2,6 +2,7 @@ import * as ContextMenu from "@radix-ui/react-context-menu";
 import { Plus, Settings } from "lucide-react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
+import { sameServer } from "../lib/server-key";
 import { controller } from "../state/controller";
 import { useBookmarks, useSettings, type Bookmark } from "../state/settings";
 import { useSession, useUi } from "../state/stores";
@@ -18,10 +19,7 @@ export function ServerRail() {
   const openDialog = useUi((s) => s.openDialog);
   const setDrawer = useUi((s) => s.setDrawer);
 
-  const isActive = (b: Bookmark) =>
-    phase !== "idle" &&
-    (b.kind ?? "vc") === kind &&
-    b.address.trim().toLowerCase() === address.trim().toLowerCase();
+  const isActive = (b: Bookmark) => phase !== "idle" && sameServer(b, { kind, address, insecureLan: b.insecureLan });
 
   const open = (b: Bookmark) => {
     if (isActive(b) && phase === "online") {

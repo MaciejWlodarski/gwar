@@ -13,6 +13,7 @@ import { TeamSpeakBadge } from "./badges";
 import { useIsMobile } from "../lib/media";
 import { resolveIdentity } from "../connect/ts-list";
 import { useTsIdentities } from "./hooks";
+import { sameServer } from "../lib/server-key";
 import { IdentityPicker } from "./IdentityPicker";
 
 /**
@@ -47,7 +48,7 @@ export function ConnectScreen() {
   const [kind, setKind] = useState<ServerKind>(desktop && !invite?.server ? lastKind : "vc");
   const [address, setAddress] = useState(invite?.server ? addressLabel(invite.server, pageContextFromLocation()) : lastAddress);
   const [password, setPassword] = useState("");
-  const savedInsecureLan = bookmarks.find((b) => b.address === address)?.insecureLan ?? false;
+  const savedInsecureLan = bookmarks.find((b) => sameServer(b, { kind, address, insecureLan: b.insecureLan }))?.insecureLan ?? false;
   const [insecureLan, setInsecureLan] = useState(savedInsecureLan);
   // Another address (or its bookmark changing) brings back that bookmark's choice.
   const [insecureFor, setInsecureFor] = useState({ address, bookmarks });

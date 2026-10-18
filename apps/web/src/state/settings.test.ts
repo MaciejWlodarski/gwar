@@ -94,3 +94,56 @@ it("times only synced changes, remembers removals and forgets them when the serv
     vi.useRealTimers();
   }
 });
+
+it("keeps one bookmark per server: on load, when saving, when editing and after syncing", async () => {
+  const before = {
+    version: 1,
+    state: {
+      bookmarks: [
+        { id: "a", name: "Gwar", address: "gwar.app", kind: "vc" },
+        { id: "b", name: "Gwar invite", address: "wss://gwar.app/ws", kind: "vc", password: "secret" },
+        { id: "ts", name: "TS", address: "gwar.app", kind: "teamspeak" },
+      ],
+    },
+  };
+  const storage = new Map([["vc.settings", JSON.stringify(before)]]);
+  const browserStorage = { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value), removeItem: (key: string) => storage.delete(key) };
+  vi.stubGlobal("localStorage", browserStorage);
+  vi.stubGlobal("window", { localStorage: browserStorage });
+  vi.resetModules();
+  vi.useFakeTimers({ now: 1_000 });
+  try {
+    const { useSettings } = await import("./settings");
+    const s = () => useSettings.getState();
+    // A list saved before servers were matched: the first stays, with the password only the other had,
+    // and the other is removed so syncing removes it elsewhere too. Another kind is another server.
+    expect(s().bookmarks).toEqual([{ id: "a", name: "Gwar", address: "gwar.app", kind: "vc", password: "secret" }, before.state.bookmarks[2]]);
+    expect(s().removedBookmarks).toEqual({ b: { at: 1_000 } });
+    expect(s().bookmarkEdits).toBe(1);
+
+    // Saving a saved server again (another spelling) updates that bookmark in its place.
+    s().saveBookmark({ id: "new", name: "Renamed", address: "GWAR.app:443", kind: "vc" });
+    expect(s().bookmarks.map((b) => [b.id, b.name, b.address])).toEqual([["a", "Renamed", "GWAR.app:443"], ["ts", "TS", "gwar.app"]]);
+
+    // Editing a bookmark into another saved server replaces that one.
+    s().saveBookmark({ id: "c", name: "C", address: "c.example.com", kind: "vc" });
+    vi.setSystemTime(2_000);
+    s().saveBookmark({ ...s().bookmarks.find((b) => b.id === "c")!, address: "wss://gwar.app/ws" });
+    expect(s().bookmarks.map((b) => b.id)).toEqual(["ts", "c"]);
+    expect(s().removedBookmarks.a).toEqual({ at: 2_000 });
+
+    // Two devices saved one server under different ids: after syncing, the first in the vault's order stays.
+    s().setBookmarkAccount("acct");
+    vi.setSystemTime(3_000);
+    s().replaceBookmarks([
+      { id: "x", name: "X", address: "x.example.com", account: "acct", updatedAt: 10 },
+      { id: "y", name: "X", address: "wss://x.example.com/ws", account: "acct", updatedAt: 20 },
+      // Another account's bookmark is not shown with these and stays for its own account.
+      { id: "z", name: "X", address: "x.example.com", account: "other", updatedAt: 30 },
+    ]);
+    expect(s().bookmarks.map((b) => b.id)).toEqual(["x", "z"]);
+    expect(s().removedBookmarks.y).toEqual({ at: 3_000, account: "acct" });
+  } finally {
+    vi.useRealTimers();
+  }
+});

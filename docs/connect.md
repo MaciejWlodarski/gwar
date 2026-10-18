@@ -116,6 +116,14 @@ the same list:
   90 days, so a device that still has it does not bring it back. Merging keeps
   the newer `updated_at` per `id` (the vault on a tie); bookmarks saved before
   syncing count as time 0. At most 100 entries; tombstones go first.
+- One server is saved once. Clients compare servers rather than spellings: a vc
+  address by the WebSocket URL it opens (`gwar.app` is `wss://gwar.app/ws`), or,
+  once the device has connected, by the server's pinned key, so another address
+  of the same server matches too; a TeamSpeak address by `host:port`. Saving a
+  saved server updates that entry. When a list holds one server twice (two
+  devices saved it under different ids, or an edit made one entry name another
+  server), the edited entry or else the first in the list stays and the others
+  become tombstones, so every device ends up with the same single entry.
 - The desktop app's plaintext LAN opt-in is a choice about one device's
   network and is never synced.
 - A device remembers which account each bookmark and removal belongs to: the
