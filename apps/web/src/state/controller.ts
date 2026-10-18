@@ -1193,15 +1193,15 @@ class Controller {
         if (!this.ownerSigningNeedsPassword()) {
           // Done once per connection when it succeeds; a failure (e.g. the list changed meanwhile)
           // is tried again against fresh state a minute later.
-          this.askedManagers.add("@confirmers");
+          this.askedManagers.add(action.marker);
           settle(this.setConfirmers(action.keep).catch((error) => {
-            setTimeout(() => { if (this.conn === conn) { this.askedManagers.delete("@confirmers"); this.maintainManagers(); } }, 60_000);
+            setTimeout(() => { if (this.conn === conn) { this.askedManagers.delete(action.marker); this.maintainManagers(); } }, 60_000);
             throw error;
           }), "Confirmers:");
           return;
         }
         if (!idle) return;
-        this.askedManagers.add("@confirmers");
+        this.askedManagers.add(action.marker);
         const names = action.stale.map((u) => state.members[u]?.nickname ?? u).join(", ");
         useUi.getState().openDialog({
           kind: "confirm", title: tNow("own.staleTitle"), body: tNow("own.staleBody", { names }), confirmLabel: tNow("own.open"),

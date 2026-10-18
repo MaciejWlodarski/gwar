@@ -9,8 +9,9 @@ export type Upkeep =
   /** Sign and install a list with `managers` (null: renew the server's verified list);
    * `consumed` are approvals used up by it. */
   | { kind: "publish"; managers: string[] | null; renewal: boolean; consumed: string[] }
-  /** The owner removes confirmers who lost `channel_edit` with a new anchor (`keep` remain). */
-  | { kind: "staleConfirmers"; keep: string[]; stale: string[] }
+  /** The owner removes confirmers who lost `channel_edit` with a new anchor (`keep` remain);
+   * `marker` (in `asked`) records that this very set was handled. */
+  | { kind: "staleConfirmers"; keep: string[]; stale: string[]; marker: string }
   /** Ask "Allow @name to manage private channels?". */
   | { kind: "ask"; uid: string };
 
@@ -29,7 +30,7 @@ export interface UpkeepInput {
   settled: boolean;
   /** People this client just gave `channel_edit` on this connection. */
   granted: ReadonlySet<string>;
-  /** Pending people (and "@confirmers") already asked about on this connection. */
+  /** Pending people (and handled stale-confirmer sets, "@confirmers:…") on this connection. */
   asked: ReadonlySet<string>;
   now: number;
   /** When this device's own certificate expires (Infinity for a local identity). */
@@ -54,8 +55,9 @@ export function managerUpkeep(i: UpkeepInput): Upkeep {
   if (server.anchor && !i.current) return i.renewable && renewable ? { kind: "publish", managers: null, renewal: true, consumed: [] } : { kind: "none" };
   if (!isOwner && !view.confirmers.includes(i.me)) return { kind: "none" };
   const staleConfirmers = view.confirmers.filter((c) => server.stale.includes(c));
-  if (isOwner && staleConfirmers.length && !i.asked.has("@confirmers")) {
-    return { kind: "staleConfirmers", keep: view.confirmers.filter((c) => !staleConfirmers.includes(c)), stale: staleConfirmers };
+  const marker = `@confirmers:${staleConfirmers.join(",")}`;
+  if (isOwner && staleConfirmers.length && !i.asked.has(marker)) {
+    return { kind: "staleConfirmers", keep: view.confirmers.filter((c) => !staleConfirmers.includes(c)), stale: staleConfirmers, marker };
   }
   if (!server.anchor) return { kind: "none" };
   const stale = view.managers.filter((m) => server.stale.includes(m));

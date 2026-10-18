@@ -41,8 +41,11 @@ describe("manager list upkeep (6b)", () => {
   });
   it("has the owner remove confirmers who lost channel_edit, once per connection", () => {
     const server = { anchor: "A", list: "L", pending: [], stale: ["conf"] };
-    expect(managerUpkeep(input({ server }))).toEqual({ kind: "staleConfirmers", keep: [], stale: ["conf"] });
-    expect(managerUpkeep(input({ server, asked: new Set(["@confirmers"]) })).kind).toBe("none");
+    expect(managerUpkeep(input({ server }))).toEqual({ kind: "staleConfirmers", keep: [], stale: ["conf"], marker: "@confirmers:conf" });
+    expect(managerUpkeep(input({ server, asked: new Set(["@confirmers:conf"]) })).kind).toBe("none");
+    // Another confirmer going stale later is handled again.
+    const later = { anchor: "A", list: "L", pending: [], stale: ["c2"] };
+    expect(managerUpkeep(input({ view: view({ confirmers: ["c2"] }), server: later, asked: new Set(["@confirmers:conf"]) })).kind).toBe("staleConfirmers");
     expect(managerUpkeep(input({ me: "conf", server })).kind).toBe("none");
     // A lapsed pair is renewed (keeping the server's membership) before any confirmer change.
     expect(managerUpkeep(input({ server, current: false, renewable: true }))).toEqual({ kind: "publish", managers: null, renewal: true, consumed: [] });

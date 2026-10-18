@@ -341,7 +341,9 @@ impl Agent {
         signed_at: f64,
         server_anchor: Option<Vec<u8>>,
         server_list: Option<Vec<u8>>,
+        revocations: JsValue,
     ) -> Result<String, JsValue> {
+        let revocations: View = input(revocations)?;
         self.inner
             .next_list(
                 server,
@@ -350,6 +352,7 @@ impl Agent {
                 signed_at as i64,
                 server_anchor.as_deref(),
                 server_list.as_deref(),
+                &revocations,
             )
             .map_err(error)
     }

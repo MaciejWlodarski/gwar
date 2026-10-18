@@ -19,7 +19,7 @@ export interface WasmAgent {
   sign_manager_list?(statement: string): Uint8Array;
   next_anchor?(server: string, confirmers: string[], signedAt: number, serverAnchor: Uint8Array | undefined): string;
   /** `managers` undefined renews the server's (verified) or the accepted list. */
-  next_list?(server: string, anchor: Uint8Array | undefined, managers: string[] | undefined, signedAt: number, serverAnchor: Uint8Array | undefined, serverList: Uint8Array | undefined): string;
+  next_list?(server: string, anchor: Uint8Array | undefined, managers: string[] | undefined, signedAt: number, serverAnchor: Uint8Array | undefined, serverList: Uint8Array | undefined, revocations: Revocation[]): string;
   transfer_statement?(server: string, accountKey: string, newOwner: string, serverAnchor: Uint8Array | undefined, signedAt: number): string;
 }
 export type OwnerCheck =

@@ -314,6 +314,7 @@ impl Agent {
         signed_at: i64,
         server_anchor: Option<&[u8]>,
         server_list: Option<&[u8]>,
+        revocations: &dyn Revocations,
     ) -> Result<String> {
         let (chain, anchor) = self.signing_anchor(server, anchor)?;
         let me = self.credential.uid();
@@ -347,10 +348,15 @@ impl Agent {
             });
         let accepted = pair.as_ref().map(|(_, l)| l.list().clone());
         let floor = accepted.as_ref().map_or(0, |l| l.seq).max(verified.as_ref().map_or(0, |l| l.list().seq));
+        // Renewal never copies the membership of a list this device has not accepted whose signer
+        // device was revoked (it may have been signed by a compromised device); its seq still
+        // counts, or the renewal could not follow it.
+        let members_from = verified.as_ref().filter(|l| {
+            pair.as_ref().is_none_or(|(_, old)| l.hash() == old.hash() || !l.signer().is_revoked(revocations))
+        });
         let mut managers = match managers {
             Some(m) => m.to_vec(),
-            None => verified
-                .as_ref()
+            None => members_from
                 .map(|l| l.list().managers.clone())
                 .or_else(|| accepted.as_ref().map(|l| l.managers.clone()))
                 .ok_or(Invalid("no list to renew"))?,
@@ -604,7 +610,7 @@ mod tests {
         assert_eq!(anchor.anchor().confirmers, vec![uid(5)]);
         assert!(owner.next_anchor(&server(), &[uid(1)], NOW, None).is_err(), "the owner is no confirmer");
         let list_statement =
-            owner.next_list(&server(), Some(&anchor.encode()), Some(&[uid(5), uid(7)]), NOW, None, None).unwrap();
+            owner.next_list(&server(), Some(&anchor.encode()), Some(&[uid(5), uid(7)]), NOW, None, None, &()).unwrap();
         let list = owner.sign_manager_list(ManagerList::parse(&list_statement).unwrap()).unwrap();
         assert_eq!(SignedList::parse(&list).unwrap().list().managers, vec![uid(7)], "confirmers are not repeated");
         assert_eq!(
@@ -613,7 +619,8 @@ mod tests {
         );
         owner.take_changes();
         // The next list continues the sequence under the accepted anchor.
-        let next = ManagerList::parse(&owner.next_list(&server(), None, Some(&[]), NOW, None, None).unwrap()).unwrap();
+        let next =
+            ManagerList::parse(&owner.next_list(&server(), None, Some(&[]), NOW, None, None, &()).unwrap()).unwrap();
         assert_eq!((next.seq, next.anchor_hash), (2, anchor.hash()));
         // A transfer link the chain accepts, handing over the anchor.
         let link = owner.transfer_statement(&server(), &public(&key(1)), &uid(9), Some(&anchor.encode()), NOW).unwrap();
@@ -639,7 +646,7 @@ mod tests {
         let l1 = owner
             .sign_manager_list(
                 ManagerList::parse(
-                    &owner.next_list(&server(), Some(&a1.encode()), Some(&[]), NOW, None, None).unwrap(),
+                    &owner.next_list(&server(), Some(&a1.encode()), Some(&[]), NOW, None, None, &()).unwrap(),
                 )
                 .unwrap(),
             )
@@ -670,14 +677,17 @@ mod tests {
         let l2 = owner
             .sign_manager_list(
                 ManagerList::parse(
-                    &owner.next_list(&server(), Some(&a2.encode()), Some(&[]), NOW, None, None).unwrap(),
+                    &owner.next_list(&server(), Some(&a2.encode()), Some(&[]), NOW, None, None, &()).unwrap(),
                 )
                 .unwrap(),
             )
             .unwrap();
         assert_eq!(owner.accept_managers(&server(), &a2.encode(), &l2, NOW, &()).unwrap(), ManagersCheck::Accepted);
         owner.take_changes();
-        assert!(owner.next_list(&server(), Some(&a1.encode()), Some(&[]), NOW, None, None).is_err(), "an older anchor");
+        assert!(
+            owner.next_list(&server(), Some(&a1.encode()), Some(&[]), NOW, None, None, &()).is_err(),
+            "an older anchor"
+        );
         assert!(owner.transfer_statement(&server(), &public(&key(1)), &uid(9), Some(&a1.encode()), NOW).is_err());
         assert!(
             owner.transfer_statement(&server(), &public(&key(1)), &uid(9), None, NOW).is_err(),
@@ -689,13 +699,13 @@ mod tests {
         check(&mut former, &chain, None);
         former.accept_managers(&server(), &a2.encode(), &l2, NOW, &()).unwrap();
         former.take_changes();
-        assert!(former.next_list(&server(), None, Some(&[]), NOW, None, None).is_err());
+        assert!(former.next_list(&server(), None, Some(&[]), NOW, None, None, &()).is_err());
         // A fresh device of the owner renews from the server's list, beyond its seq.
         let mut fresh = Agent::new([90; 32], certified(&key(1), &key(90), NOW - 1), NOW).unwrap();
         fresh.take_changes();
         check(&mut fresh, &chain, None);
         let next = ManagerList::parse(
-            &fresh.next_list(&server(), Some(&a2.encode()), None, NOW, Some(&a2.encode()), Some(&l2)).unwrap(),
+            &fresh.next_list(&server(), Some(&a2.encode()), None, NOW, Some(&a2.encode()), Some(&l2), &()).unwrap(),
         )
         .unwrap();
         assert_eq!(next.seq, 3);
@@ -703,14 +713,17 @@ mod tests {
         // the server's superseded anchor vouches for no list: the accepted list is kept.
         let renew = |owner: &Agent, server_anchor: &SignedAnchor, server_list: &[u8]| {
             ManagerList::parse(
-                &owner.next_list(&server(), None, None, NOW, Some(&server_anchor.encode()), Some(server_list)).unwrap(),
+                &owner
+                    .next_list(&server(), None, None, NOW, Some(&server_anchor.encode()), Some(server_list), &())
+                    .unwrap(),
             )
             .unwrap()
         };
         let removed = owner
             .sign_manager_list(ManagerList {
                 managers: vec![uid(8)],
-                ..ManagerList::parse(&owner.next_list(&server(), None, Some(&[]), NOW, None, None).unwrap()).unwrap()
+                ..ManagerList::parse(&owner.next_list(&server(), None, Some(&[]), NOW, None, None, &()).unwrap())
+                    .unwrap()
             })
             .unwrap();
         assert_eq!(
@@ -727,7 +740,7 @@ mod tests {
         let high = c
             .sign_manager_list(ManagerList {
                 seq: vc_proto::MAX_SAFE_INTEGER as u64 - 1,
-                ..ManagerList::parse(&c.next_list(&server(), None, Some(&[]), NOW, None, None).unwrap()).unwrap()
+                ..ManagerList::parse(&c.next_list(&server(), None, Some(&[]), NOW, None, None, &()).unwrap()).unwrap()
             })
             .unwrap();
         assert_eq!(renew(&owner, &a1, &high).seq, 4, "a former confirmer's list under the superseded anchor");
@@ -741,11 +754,12 @@ mod tests {
                 Some(&{
                     c.sign_manager_list(ManagerList {
                         seq: vc_proto::MAX_SAFE_INTEGER as u64,
-                        ..ManagerList::parse(&c.next_list(&server(), None, Some(&[]), NOW, None, None).unwrap())
+                        ..ManagerList::parse(&c.next_list(&server(), None, Some(&[]), NOW, None, None, &()).unwrap())
                             .unwrap()
                     })
                     .unwrap()
-                })
+                }),
+                &()
             )
             .is_err(),
             "beyond the protocol's bound"
@@ -768,7 +782,7 @@ mod tests {
             .sign_manager_list(
                 ManagerList::parse(
                     &new_owner
-                        .next_list(&server(), Some(&x.encode()), None, NOW, Some(&x.encode()), Some(&l1))
+                        .next_list(&server(), Some(&x.encode()), None, NOW, Some(&x.encode()), Some(&l1), &())
                         .unwrap(),
                 )
                 .unwrap(),
@@ -792,10 +806,40 @@ mod tests {
             })
             .unwrap();
         let next = ManagerList::parse(
-            &new_owner.next_list(&server(), None, None, NOW, Some(&x.encode()), Some(&injected)).unwrap(),
+            &new_owner.next_list(&server(), None, None, NOW, Some(&x.encode()), Some(&injected), &()).unwrap(),
         )
         .unwrap();
         assert_eq!((next.seq, next.managers), (3, vec![]));
+        // A list by another device of the owner, later revoked: its seq counts, its members do not.
+        let other = Agent::new([91; 32], certified(&key(2), &key(91), NOW - 1), NOW).unwrap();
+        let by_other = other
+            .sign_manager_list(ManagerList {
+                server_key: server(),
+                generation: 1,
+                anchor_hash: x.hash(),
+                seq: 5,
+                managers: vec![uid(8)],
+                signer_uid: uid(2),
+                signed_at: NOW,
+            })
+            .unwrap();
+        struct Revoked(String);
+        impl Revocations for Revoked {
+            fn revoked_at(&self, _: &str, device: &str) -> Option<i64> {
+                (device == self.0).then_some(NOW - 1)
+            }
+        }
+        let revoked = Revoked(public(&key(91)));
+        let renew = |revocations: &dyn Revocations| {
+            ManagerList::parse(
+                &new_owner
+                    .next_list(&server(), None, None, NOW, Some(&x.encode()), Some(&by_other), revocations)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!((renew(&()).seq, renew(&()).managers), (6, vec![uid(8)]));
+        assert_eq!((renew(&revoked).seq, renew(&revoked).managers), (6, vec![]));
     }
 
     #[test]
@@ -821,8 +865,9 @@ mod tests {
             &crate::encoding::b64(&ed25519_dalek::Signer::sign(&key(5), statement.as_bytes()).to_bytes()),
         )
         .unwrap();
-        let next =
-            fresh.next_list(&server(), Some(&replacement.encode()), None, NOW, Some(&x.encode()), Some(&lx)).unwrap();
+        let next = fresh
+            .next_list(&server(), Some(&replacement.encode()), None, NOW, Some(&x.encode()), Some(&lx), &())
+            .unwrap();
         let next = ManagerList::parse(&next).unwrap();
         assert_eq!((next.seq, next.managers), (5, vec![]));
     }

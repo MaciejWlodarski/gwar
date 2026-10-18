@@ -337,7 +337,7 @@ export class MlsRuntime {
       throw new Error("the manager list is changing; try again");
     }
     const floor = this.managers?.list ? decodeBase64Url(this.managers.list) : undefined;
-    const list = await this.engine.run(async () => this.engine.withAgent(a => a.sign_manager_list!(a.next_list!(server, under, managers ?? undefined, this.now(), shown, floor))));
+    const list = await this.engine.run(async () => this.engine.withAgent(a => a.sign_manager_list!(a.next_list!(server, under, managers ?? undefined, this.now(), shown, floor, this.options.revocations()))));
     await this.request("managers.update", { anchor: encodeBase64Url(under), list: encodeBase64Url(list) }, undefined, this.generation);
   }
   private async acceptManagers(): Promise<void> {
