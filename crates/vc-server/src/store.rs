@@ -411,6 +411,8 @@ const MIGRATIONS: &[&str] = &[
         kind TEXT NOT NULL,
         ts_id TEXT NOT NULL,
         gwar_id INTEGER NOT NULL,
+        -- What the import last wrote there (JSON): a re-run updates only what nobody changed since.
+        written TEXT,
         PRIMARY KEY (source, kind, ts_id)
     );
     CREATE TABLE ts_import_passwords (
@@ -475,7 +477,10 @@ impl Store {
     }
 
     fn init(db: Connection) -> Result<Self> {
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
+        // secure_delete: what is deleted (messages, passwords queued for the bridge) is overwritten.
+        db.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;",
+        )?;
         let version: usize = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         for (index, migration) in MIGRATIONS.iter().enumerate().skip(version) {
             let tx = db.unchecked_transaction()?;
@@ -614,6 +619,18 @@ impl Store {
     /// A consistent copy of the database, safe while the server runs (for backups).
     pub fn backup_to(&self, path: &Path) -> Result<()> {
         self.db.execute("VACUUM INTO ?1", [path.to_string_lossy()])?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+
+    /// Moves everything from the write-ahead log into the database and empties the log, so
+    /// nothing deleted lingers there.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
         Ok(())
     }
 
@@ -711,25 +728,59 @@ impl Store {
         Ok(())
     }
 
-    /// What an imported TeamSpeak item became (`kind`: role, channel).
-    pub fn ts_import_target(&self, source: &str, kind: &str, ts_id: u64) -> Result<Option<i64>> {
+    /// What an imported TeamSpeak item became (`kind`: role, channel, …) and what the import last
+    /// wrote there.
+    pub fn ts_import_record(
+        &self,
+        source: &str,
+        kind: &str,
+        ts_id: impl std::fmt::Display,
+    ) -> Result<Option<(i64, Option<String>)>> {
         Ok(self
             .db
             .query_row(
-                "SELECT gwar_id FROM ts_imports WHERE source=?1 AND kind=?2 AND ts_id=?3",
+                "SELECT gwar_id,written FROM ts_imports WHERE source=?1 AND kind=?2 AND ts_id=?3",
                 params![source, kind, ts_id.to_string()],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?)
     }
 
-    pub fn set_ts_import_target(&self, source: &str, kind: &str, ts_id: u64, gwar_id: i64) -> Result<()> {
+    /// Everything of `kind` an import from `source` made.
+    pub fn ts_import_targets(&self, source: &str, kind: &str) -> Result<Vec<i64>> {
+        let mut stmt = self.db.prepare("SELECT gwar_id FROM ts_imports WHERE source=?1 AND kind=?2")?;
+        let rows = stmt.query_map([source, kind], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn ts_import_target(&self, source: &str, kind: &str, ts_id: impl std::fmt::Display) -> Result<Option<i64>> {
+        Ok(self.ts_import_record(source, kind, ts_id)?.map(|(id, _)| id))
+    }
+
+    pub fn set_ts_import_record(
+        &self,
+        source: &str,
+        kind: &str,
+        ts_id: impl std::fmt::Display,
+        gwar_id: i64,
+        written: Option<&str>,
+    ) -> Result<()> {
         self.db.execute(
-            "INSERT INTO ts_imports(source,kind,ts_id,gwar_id) VALUES(?1,?2,?3,?4)
-             ON CONFLICT(source,kind,ts_id) DO UPDATE SET gwar_id=excluded.gwar_id",
-            params![source, kind, ts_id.to_string(), gwar_id],
+            "INSERT INTO ts_imports(source,kind,ts_id,gwar_id,written) VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(source,kind,ts_id) DO UPDATE SET gwar_id=excluded.gwar_id,written=excluded.written",
+            params![source, kind, ts_id.to_string(), gwar_id, written],
         )?;
         Ok(())
+    }
+
+    /// Whether deleting a channel loses something: messages, subchannels, or an encrypted history.
+    pub fn channel_in_use(&self, channel: ChannelId) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE channel=?1) OR EXISTS(SELECT 1 FROM channels WHERE parent=?1)
+             OR EXISTS(SELECT 1 FROM channels WHERE id=?1 AND encrypted=1)",
+            [channel],
+            |r| r.get(0),
+        )?)
     }
 
     /// A typed password for the bridge to set on the TeamSpeak side once (it needs the plain text).
@@ -742,11 +793,27 @@ impl Store {
         Ok(())
     }
 
-    /// Takes (and deletes) the queued passwords.
-    pub fn take_bridge_passwords(&self) -> Result<Vec<(ChannelId, String)>> {
-        let mut stmt = self.db.prepare("DELETE FROM ts_import_passwords RETURNING channel,password")?;
+    /// The passwords waiting for the bridge.
+    pub fn bridge_passwords(&self) -> Result<Vec<(ChannelId, String)>> {
+        let mut stmt = self.db.prepare("SELECT channel,password FROM ts_import_passwords ORDER BY channel")?;
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
         Ok(rows)
+    }
+
+    /// Drops a queued password (set on TeamSpeak, or replaced in Gwar), leaving no copy behind.
+    pub fn forget_bridge_password(&self, channel: ChannelId) -> Result<()> {
+        if self.db.execute("DELETE FROM ts_import_passwords WHERE channel=?1", [channel])? > 0 {
+            self.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    /// Drops every queued password (a server without the bridge never sends them).
+    pub fn clear_bridge_passwords(&self) -> Result<()> {
+        if self.db.execute("DELETE FROM ts_import_passwords", [])? > 0 {
+            self.checkpoint()?;
+        }
+        Ok(())
     }
 
     /// The next id from a counter that never goes back and never wraps: once `u32` ids run out, inserts fail.

@@ -142,11 +142,16 @@ enum Command {
     /// (docs/teamspeak-import.md). The TeamSpeak server is only read. Without --dry-run this
     /// changes the database, so this server must be stopped; a copy of the database is kept first.
     /// The ServerQuery password is read from VC_TS_QUERY_PASSWORD or, with --password-stdin, stdin.
+    /// Raw ServerQuery is unencrypted: reach a remote TeamSpeak server through an SSH tunnel.
     #[cfg(feature = "teamspeak")]
     ImportTeamspeak {
-        /// ServerQuery address, host:port (raw query, usually 10011).
+        /// ServerQuery address, host:port (raw query, usually 10011); this machine's unless
+        /// --insecure-query.
         #[arg(long)]
         from: String,
+        /// Allow a ServerQuery address on another machine: its password crosses the network in clear.
+        #[arg(long)]
+        insecure_query: bool,
         #[arg(long, default_value = "serveradmin")]
         user: String,
         /// Virtual server id on that instance.
@@ -154,7 +159,7 @@ enum Command {
         sid: u32,
         #[arg(long)]
         password_stdin: bool,
-        /// Print the plan, change nothing.
+        /// Show what the import would do (tried on a copy of the database), change nothing.
         #[arg(long)]
         dry_run: bool,
         /// Also import clients without a role.
@@ -163,15 +168,22 @@ enum Command {
         /// Keep spacer channels as plain channels.
         #[arg(long)]
         spacers: bool,
-        /// Channel passwords to keep: one `name = password` per line (a channel's path, its name, or `server`).
+        /// Passwords to keep: one `name = password` per line (a channel's path, its name, or `@server`).
         #[arg(long, conflicts_with = "drop_passwords")]
         passwords: Option<PathBuf>,
-        /// Import password channels without a password.
+        /// Import the server and its password channels without a password.
         #[arg(long)]
         drop_passwords: bool,
         /// Remove this server's own top-level channels first (the seeded Lobby, General, AFK).
         #[arg(long)]
         replace_channels: bool,
+        /// With --replace-channels, also channels holding messages, subchannels or encrypted history.
+        #[arg(long, requires = "replace_channels")]
+        force: bool,
+        /// This server runs with --teamspeak: the bridge sets the kept passwords on TeamSpeak
+        /// (they wait in the database in plain text until it has).
+        #[arg(long)]
+        for_bridge: bool,
     },
 }
 
@@ -333,6 +345,7 @@ async fn main() -> Result<()> {
         #[cfg(feature = "teamspeak")]
         Some(Command::ImportTeamspeak {
             from,
+            insecure_query,
             user,
             sid,
             password_stdin,
@@ -342,6 +355,8 @@ async fn main() -> Result<()> {
             passwords,
             drop_passwords,
             replace_channels,
+            force,
+            for_bridge,
         }) => {
             use vc_server::ts_import;
             let query_password = if password_stdin {
@@ -362,6 +377,12 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("resolve {from}"))?
                 .next()
                 .with_context(|| format!("no address for {from}"))?;
+            if !addr.ip().is_loopback() && !insecure_query {
+                anyhow::bail!(
+                    "{from} is not this machine: raw ServerQuery sends the password unencrypted. Use an SSH tunnel \
+                     (ssh -L 10011:localhost:10011 that-host, then --from 127.0.0.1:10011) or pass --insecure-query"
+                );
+            }
             let (query, _notes) =
                 vc_server::teamspeak::query::Query::connect(addr, &user, &query_password, sid).await?;
             let source = ts_import::source::read(&query).await?;
@@ -370,28 +391,45 @@ async fn main() -> Result<()> {
                 .get("virtualserver_unique_identifier")
                 .cloned()
                 .unwrap_or_else(|| format!("{from}/{sid}"));
-            let plan = ts_import::plan::plan(&source, &options);
+            let plan = ts_import::plan::plan(&source, &options)?;
             print!("{}", ts_import::plan::report(&plan));
+            let apply_options = ts_import::apply::ApplyOptions { replace_channels, force, for_bridge };
+            let summary = |applied: &ts_import::apply::Applied| {
+                let mut out = format!(
+                    "{} roles new, {} updated; {} channels new, {} updated; {} members new, {} updated; {} bans.",
+                    applied.roles_created,
+                    applied.roles_updated,
+                    applied.channels_created,
+                    applied.channels_updated,
+                    applied.members_created,
+                    applied.members_updated,
+                    applied.bans,
+                );
+                if !applied.deleted.is_empty() {
+                    out += &format!("\nChannels removed (--replace-channels): {}.", applied.deleted.join(", "));
+                }
+                for note in &applied.notes {
+                    out += &format!("\n  - {note}");
+                }
+                out
+            };
             if dry_run {
-                println!("\nDry run: nothing changed.");
+                // Tried on a copy: works while this server runs.
+                let applied = ts_import::import(
+                    &database,
+                    &plan,
+                    &source_id,
+                    ts_import::apply::ApplyOptions { for_bridge: false, ..apply_options },
+                    false,
+                )?;
+                println!("\nDry run, on a copy of the database: {}\nNothing changed.", summary(&applied));
                 return Ok(());
             }
             let _lock = vc_server::members::lock_data_dir(&cli.data_dir)?;
-            let store = Store::open(&database)?;
             let backup = cli.data_dir.join(format!("vc.sqlite3.before-import-{}", vc_server::core::now_ms()));
-            store.backup_to(&backup)?;
-            let applied = ts_import::apply::apply(&store, &plan, &source_id, replace_channels)?;
-            println!(
-                "\nImported: {} roles new, {} updated; {} channels new, {} updated; {} members new, {} updated; {} bans.\nThe database before the import: {}",
-                applied.roles_created,
-                applied.roles_updated,
-                applied.channels_created,
-                applied.channels_updated,
-                applied.members_created,
-                applied.members_updated,
-                applied.bans,
-                backup.display()
-            );
+            ts_import::copy_database(&database, &backup)?;
+            let applied = ts_import::import(&database, &plan, &source_id, apply_options, true)?;
+            println!("\nImported: {}\nThe database before the import: {}", summary(&applied), backup.display());
             return Ok(());
         }
         None => {}

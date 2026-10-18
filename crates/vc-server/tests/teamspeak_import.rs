@@ -16,7 +16,10 @@ use vc_server::{
         install,
         query::{Cmd, Query},
     },
-    ts_import::{apply::apply, plan, source},
+    ts_import::{
+        apply::{ApplyOptions, apply},
+        plan, source,
+    },
 };
 
 fn free_port(udp: bool) -> u16 {
@@ -103,7 +106,7 @@ async fn a_real_teamspeak_server_reads_and_imports() {
     let read = source::read(&query).await.unwrap();
     let mut options = plan::Options::default();
     options.passwords.insert("Secret".into(), "hunter2".into());
-    let plan = plan::plan(&read, &options);
+    let plan = plan::plan(&read, &options).unwrap();
     eprintln!("{}", plan::report(&plan));
     let moderator = plan.roles.iter().find(|r| r.name == "Moderator").expect("the Moderator group");
     assert!(moderator.permissions.contains(&Permission::KickMembers), "{:?}", moderator.reasons);
@@ -122,7 +125,8 @@ async fn a_real_teamspeak_server_reads_and_imports() {
 
     // Into a fresh Gwar server.
     let store = Store::in_memory().unwrap();
-    let applied = apply(&store, &plan, "real", true).unwrap();
+    let replace = ApplyOptions { replace_channels: true, ..Default::default() };
+    let applied = apply(&store, &plan, "real", replace).unwrap();
     assert!(applied.channels_created >= 2 && applied.roles_created >= 1, "{applied:?}");
     let channels = store.channels().unwrap();
     let imported = channels.iter().find(|c| c.name == "Clan").unwrap();

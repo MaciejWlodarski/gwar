@@ -943,8 +943,11 @@ impl<'a> Bridge<'a> {
             BridgeNote::Snapshot { .. } => warn!("unexpected second snapshot"),
             BridgeNote::Channel { channel, password, .. } => {
                 self.channels.insert(channel.id, channel.clone());
-                if let Err(e) = self.ensure_channel(&channel, password).await {
-                    warn!(channel = channel.id, "TeamSpeak channel sync: {e:#}");
+                let typed = matches!(password, Some(Some(_)));
+                match self.ensure_channel(&channel, password).await {
+                    Ok(()) if typed => self.core.bridge(BridgeMsg::PasswordSet(channel.id)).await,
+                    Ok(()) => {}
+                    Err(e) => warn!(channel = channel.id, "TeamSpeak channel sync: {e:#}"),
                 }
                 self.reconcile(Duration::ZERO);
             }

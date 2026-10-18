@@ -494,7 +494,7 @@ impl Core {
         let connect = config.connect_url.map(crate::connect::Lookup::new).transpose()?;
         // Without a bridge nothing will ever set them: plain-text passwords do not wait around.
         if !config.teamspeak {
-            store.take_bridge_passwords()?;
+            store.clear_bridge_passwords()?;
         }
         let channels = store.channels()?.into_iter().map(|c| (c.id, c)).collect::<BTreeMap<_, _>>();
         let default_channel = store
@@ -1323,8 +1323,9 @@ impl Core {
                     clients: self.sessions.values().map(|s| self.client_for(s, None)).collect(),
                 });
                 self.bridge = Some(bridge);
-                // Passwords typed at a TeamSpeak import: TeamSpeak needs the plain text once.
-                match self.store.take_bridge_passwords() {
+                // Passwords typed at a TeamSpeak import: TeamSpeak needs the plain text once. Each
+                // is dropped when the bridge says it is set (`PasswordSet`), so a lost one is sent again.
+                match self.store.bridge_passwords() {
                     Ok(queued) => {
                         for (channel, password) in queued {
                             let Some(view) = self.channels.get(&channel).filter(|c| !c.private).map(channel_view)
@@ -1445,6 +1446,11 @@ impl Core {
                     self.publish_routing();
                 }
                 self.client_updated(session);
+            }
+            BridgeMsg::PasswordSet(channel) => {
+                if let Err(e) = self.store.forget_bridge_password(channel) {
+                    warn!("store: {e:#}");
+                }
             }
             BridgeMsg::Leave(session, reason) => {
                 if self.sessions.get(&session).is_some_and(|s| s.out.is_none()) {
@@ -2181,8 +2187,13 @@ impl Core {
             return Err(err(ErrorCode::Conflict, "channel tree changed; try again"));
         }
         let new_password = matches!(password_hash, Some(Some(_)));
+        let password_changed = password_hash.is_some();
         row.password_hash = password_hash.unwrap_or_else(|| current.password_hash.clone());
         self.store.update_channel(&row).map_err(storage_error)?;
+        // An imported password still waiting for the bridge is out of date now.
+        if password_changed && let Err(e) = self.store.forget_bridge_password(channel) {
+            warn!("store: {e:#}");
+        }
         // A new password shuts out everyone who entered with the old one and has left since.
         if new_password {
             for s in self.sessions.values_mut().filter(|s| s.channel != Some(channel)) {
@@ -3188,5 +3199,42 @@ mod voice_rights_tests {
             }
         }
         assert!(told, "the bridge moves them on TeamSpeak");
+    }
+}
+
+#[cfg(test)]
+mod import_password_tests {
+    use super::expiry_tests::{on_core, test_core, test_core_teamspeak};
+    use super::*;
+
+    #[tokio::test]
+    async fn a_queued_password_waits_until_the_bridge_has_set_it() {
+        let store = Store::in_memory().unwrap();
+        let channel = store.channels().unwrap()[0].id;
+        store.queue_bridge_password(channel, "hunter2").unwrap();
+        let core = test_core_teamspeak(store).unwrap();
+        let (notes, mut bridge) = mpsc::unbounded_channel();
+        core.bridge(BridgeMsg::Attach(notes)).await;
+        on_core(&core, |_| ()).await; // the attach is handled
+        let mut sent = false;
+        while let Ok(note) = bridge.try_recv() {
+            if let BridgeNote::Channel { channel: c, password: Some(Some(p)), .. } = note {
+                sent = c.id == channel && p == "hunter2";
+            }
+        }
+        assert!(sent, "the bridge gets the plain text");
+        // Not gone until the bridge says it is set: a lost note is sent again on the next attach.
+        assert_eq!(on_core(&core, |core| core.store.bridge_passwords().unwrap().len()).await, 1);
+        core.bridge(BridgeMsg::PasswordSet(channel)).await;
+        assert!(on_core(&core, |core| core.store.bridge_passwords().unwrap().is_empty()).await);
+    }
+
+    #[tokio::test]
+    async fn without_the_bridge_no_password_waits() {
+        let store = Store::in_memory().unwrap();
+        let channel = store.channels().unwrap()[0].id;
+        store.queue_bridge_password(channel, "hunter2").unwrap();
+        let core = test_core(store, None);
+        assert!(on_core(&core, |core| core.store.bridge_passwords().unwrap().is_empty()).await);
     }
 }

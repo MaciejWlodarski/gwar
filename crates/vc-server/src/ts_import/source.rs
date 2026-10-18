@@ -57,9 +57,22 @@ async fn list(query: &Query, cmd: Cmd) -> Result<Vec<Record>> {
     match query.call(cmd).await {
         Ok(records) => Ok(records),
         // 1281: "database empty result set".
-        Err(e) if e.downcast_ref::<QueryError>().is_some_and(|q| q.id == 1281) => Ok(vec![]),
+        Err(e) if query_error(&e) == Some(1281) => Ok(vec![]),
         Err(e) => Err(e),
     }
+}
+
+fn query_error(e: &anyhow::Error) -> Option<u32> {
+    e.downcast_ref::<QueryError>().map(|q| q.id)
+}
+
+/// 768: "invalid channel id", a channel gone while reading.
+const CHANNEL_GONE: u32 = 768;
+
+fn permanent(c: &Record) -> bool {
+    ["channel_flag_permanent", "channel_flag_semi_permanent", "channel_flag_default"]
+        .iter()
+        .any(|flag| c.get(*flag).is_some_and(|f| f == "1"))
 }
 
 /// Clients per call when paging the client database.
@@ -73,19 +86,38 @@ pub async fn read(query: &Query) -> Result<Source> {
     source.channels = list(query, Cmd::new("channellist").flag("topic").flag("flags").flag("voice").flag("limits"))
         .await
         .context("channellist")?;
+    let mut gone = Vec::new();
     for c in &mut source.channels {
         let Some(cid) = c.get("cid").cloned() else { continue };
+        // Temporary channels are not imported: no need to read more of them.
+        if !permanent(c) {
+            continue;
+        }
         // The description is only in channelinfo.
-        if let Some(info) = list(query, Cmd::new("channelinfo").arg("cid", &cid)).await?.into_iter().next() {
-            for key in ["channel_description", "channel_flag_semi_permanent", "channel_needed_talk_power"] {
+        let info = match list(query, Cmd::new("channelinfo").arg("cid", &cid)).await {
+            Err(e) if query_error(&e) == Some(CHANNEL_GONE) => {
+                gone.push(cid);
+                continue;
+            }
+            other => other?,
+        };
+        if let Some(info) = info.into_iter().next() {
+            for key in ["channel_description", "channel_needed_talk_power"] {
                 if let Some(v) = info.get(key) {
                     c.entry(key.to_owned()).or_insert_with(|| v.clone());
                 }
             }
         }
-        let perms = list(query, Cmd::new("channelpermlist").arg("cid", &cid).flag("permsid")).await?;
+        let perms = match list(query, Cmd::new("channelpermlist").arg("cid", &cid).flag("permsid")).await {
+            Err(e) if query_error(&e) == Some(CHANNEL_GONE) => {
+                gone.push(cid);
+                continue;
+            }
+            other => other?,
+        };
         source.channel_perms.insert(cid.parse()?, Perms::from_records(&perms));
     }
+    source.channels.retain(|c| c.get("cid").is_none_or(|cid| !gone.contains(cid)));
     source.groups = list(query, Cmd::new("servergrouplist")).await.context("servergrouplist")?;
     for g in source.groups.clone() {
         let Some(sgid) = g.get("sgid").and_then(|s| s.parse::<u64>().ok()) else { continue };
@@ -102,15 +134,15 @@ pub async fn read(query: &Query) -> Result<Source> {
         source.channel_group_perms.insert(cgid, Perms::from_records(&perms));
     }
     source.channel_group_members = list(query, Cmd::new("channelgroupclientlist")).await?;
+    // Until an empty page: a server may cap pages below what was asked.
     let mut start = 0;
     loop {
         let page = list(query, Cmd::new("clientdblist").arg("start", start).arg("duration", PAGE)).await?;
-        let n = page.len();
-        source.clients.extend(page);
-        if n < PAGE {
+        if page.is_empty() {
             break;
         }
-        start += n;
+        start += page.len();
+        source.clients.extend(page);
     }
     source.bans = list(query, Cmd::new("banlist")).await?;
     Ok(source)
