@@ -72,3 +72,27 @@ export async function kvEnroll(key: string, value: unknown, accountKey: string):
     db.close();
   }
 }
+
+/**
+ * Reads and changes one value in a single read-write transaction: nothing commits in between.
+ * `change` returns the new value, or undefined to leave it as it is.
+ */
+export async function kvUpdate<T>(key: string, change: (value: T | undefined) => T | undefined): Promise<void> {
+  const db = await open();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction(STORE, "readwrite", { durability: "strict" });
+      const store = tx.objectStore(STORE);
+      const read = store.get(key);
+      read.onsuccess = () => {
+        const next = change(read.result as T | undefined);
+        if (next !== undefined) store.put(next, key);
+      };
+      tx.oncomplete = () => resolve();
+      tx.onabort = () => reject(tx.error ?? new Error("indexedDB update aborted"));
+      tx.onerror = () => reject(tx.error ?? new Error("indexedDB update failed"));
+    });
+  } finally {
+    db.close();
+  }
+}

@@ -66,10 +66,11 @@ export class KeyArchive {
     return (this.engine.jobs.get(KEY) as ArchiveJob | undefined) ?? { kind: "archive", newest: 0, records: 0, transfers: 0, opened: [] };
   }
 
-  /** One pass; throws on the first failure (the caller retries later). */
-  async pass(): Promise<void> {
+  /** One pass; throws on the first failure (the caller retries later). Returns what the
+   * device knows of the archive at its end, or null without a Connect session. */
+  async pass(): Promise<ArchiveState | null> {
     const session = await this.o.session();
-    if (!session) return;
+    if (!session) return null;
     const { api } = this.o;
     const { token } = session;
     if (session.recovery) await this.publishRecovery(token, session.recovery);
@@ -93,6 +94,7 @@ export class KeyArchive {
       if (state.safe !== null) await this.upload(token);
     }
     await this.transfers(token, state);
+    return state;
   }
 
   /** Publishes a pending recovery archive key: after a code change only once Connect's

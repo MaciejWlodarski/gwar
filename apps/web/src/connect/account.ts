@@ -332,36 +332,47 @@ export async function unlockVault(record: ConnectRecord, password: string, deps:
   return saveUnlocked(record, await withAccountKey(account, token, deps, record), deps);
 }
 
-/** Replace recovery credentials with account-key authorization; show the new code once. */
-export async function changeRecoveryCode(record: ConnectRecord, password: string, deps: FlowDeps): Promise<Created> {
+/** A new recovery code to show; {@link changeRecoveryCode} sets it once the person confirmed they kept it. */
+export function newRecoveryCode(): string {
+  return formatRecoveryCode(generateRecoveryCode());
+}
+
+/**
+ * Replaces the recovery credentials with `code` (from {@link newRecoveryCode}, already kept by the
+ * person) under account-key authorization, then publishes its recovery archive key
+ * (docs/e2e-build.md, section 7, "Recovery code changes"). After an ambiguous failure it asks
+ * Connect whether the new code works (a recovery sign-in with it) before going on; trying again
+ * with the same code is safe.
+ */
+export async function changeRecoveryCode(record: ConnectRecord, password: string, code: string, deps: FlowDeps): Promise<ConnectRecord> {
+  const bytes = parseRecoveryCode(code);
+  if (!bytes) throw new ConnectApiError("bad_request", "invalid recovery code");
   const { token, account } = await unlock(deps.api, record.handle, password);
   const opened = await withAccountKey(account, token, deps, record);
-  const code = generateRecoveryCode();
-  const secrets = await recoverySecrets(code, decodeBase64Url(account.publicKey));
+  const secrets = await recoverySecrets(bytes, decodeBase64Url(account.publicKey));
   const auth = encodeBase64Url(secrets.authKey);
   const blob = await sealKey(secrets.encKey, seedOfJwk(account.jwk), account.publicKey);
-  const authorization = await credentialAuthorization(deps.api, opened.token, account, "recovery", null, auth, blob);
-  // The next recovery archive key, kept as a pending rotation before the credentials change
-  // (docs/e2e-build.md, section 7, "Recovery code changes"); the key archive publishes it.
-  const newest = Math.max(0, ...(await deps.api.archiveRecovery(opened.token)).map(k => recoveryVersion(k.statement)));
-  const key = await signedRecoveryKey(account, code, newest + 1, Date.now());
-  const pending = await saveUnlocked(record, { ...opened, archiveRecovery: { ...key, base: authorization.credential_version } }, deps);
   try {
-    await deps.api.changeRecovery(opened.token, { recovery_auth: auth, recovery_blob: blob, ...authorization });
+    await deps.api.changeRecovery(opened.token, { recovery_auth: auth, recovery_blob: blob,
+      ...await credentialAuthorization(deps.api, opened.token, account, "recovery", null, auth, blob) });
   } catch (error) {
-    // A definite refusal: the change did not happen. Otherwise the credential version tells later.
-    if (error instanceof ConnectApiError && error.kind !== "network" && error.kind !== "server") {
-      await deps.store.save({ ...pending, archiveRecovery: undefined });
-    }
-    throw error;
+    // A definite refusal: nothing changed. Otherwise only the new code itself tells.
+    if (error instanceof ConnectApiError && error.kind !== "network" && error.kind !== "server") throw error;
+    const took = await deps.api.recover(record.handle, auth).then(() => true, () => false);
+    if (!took) throw error;
   }
-  let next = pending;
+  // The new code works: its recovery archive key, kept until published (the key archive retries).
+  const newest = Math.max(0, ...(await deps.api.archiveRecovery(opened.token)).map(k => recoveryVersion(k.statement)));
+  const key = await signedRecoveryKey(account, bytes, newest + 1, Date.now());
+  const pending = await saveUnlocked(record, { ...opened, archiveRecovery: key }, deps);
   try {
     await deps.api.putArchiveRecovery(opened.token, key);
-    next = { ...pending, archiveRecovery: undefined };
-    await deps.store.save(next);
-  } catch { /* The key archive publishes it later. */ }
-  return { record: next, recoveryCode: formatRecoveryCode(code) };
+  } catch {
+    return pending;
+  }
+  const next = { ...pending, archiveRecovery: undefined };
+  await deps.store.save(next);
+  return next;
 }
 
 export type PickUp = "updated" | "current" | "unlisted" | "revoked" | "invalid";

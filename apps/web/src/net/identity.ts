@@ -14,7 +14,7 @@
  */
 import type { DeviceCertificate } from "../proto/DeviceCertificate";
 import { decodeBase64Url, encodeBase64Url } from "./base64url";
-import { kvDelete, kvEnroll, kvGet, kvSet } from "./kv";
+import { kvDelete, kvEnroll, kvGet, kvSet, kvUpdate } from "./kv";
 import { defaultNickname, legacyNickname, validNickname } from "./nickname";
 
 export interface Identity {
@@ -82,11 +82,10 @@ export interface ConnectRecord {
   vaultKey?: string;
   /**
    * A recovery archive key statement to publish (docs/e2e-build.md, section 7): signed at
-   * sign-up or by a recovery code change, published by the key archive. After a code change,
-   * `base` is the credential version the change was made on: the statement is published once
-   * Connect's version moved past it, and dropped if it did not (the change never happened).
+   * sign-up, or by a recovery code change once Connect took the new code; the key archive
+   * publishes it.
    */
-  archiveRecovery?: { statement: string; signature: string; base?: number };
+  archiveRecovery?: { statement: string; signature: string };
   /** After a recovery-code sign-in: the recovery archive key (base64url), until the archive opened what it can with it. */
   archiveRecoverySecret?: string;
 }
@@ -106,6 +105,11 @@ export const indexedDbConnectStore: ConnectStore = {
     await kvDelete(CONNECT_KEY);
   },
 };
+
+/** Changes the stored Connect record in one transaction; `change` returns undefined to leave it. */
+export function updateConnectRecord(change: (record: ConnectRecord | undefined) => ConnectRecord | undefined): Promise<void> {
+  return kvUpdate<ConnectRecord>(CONNECT_KEY, change);
+}
 
 export class IdentityUnsupportedError extends Error {
   constructor() {
