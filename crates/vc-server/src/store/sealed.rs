@@ -190,6 +190,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
             )
             .unwrap();
     }

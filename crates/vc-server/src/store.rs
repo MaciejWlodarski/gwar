@@ -877,15 +877,6 @@ impl Store {
             .optional()?)
     }
 
-    pub fn set_mls_access_checkpoint(&self, group: &str, seq: u64, hash: &str) -> Result<()> {
-        self.db.execute(
-            "INSERT INTO mls_access(group_id,seq,hash) VALUES(?1,?2,?3)
-             ON CONFLICT(group_id) DO UPDATE SET seq=excluded.seq, hash=excluded.hash",
-            params![group, seq as i64, hash],
-        )?;
-        Ok(())
-    }
-
     /// The newest anchor and list of `generation`.
     pub fn manager_pair(&self, generation: u64) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         Ok(self

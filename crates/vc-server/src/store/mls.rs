@@ -119,7 +119,9 @@ impl Store {
     }
 
     /// Writes a group's state; `ended_requests` are devices whose history requests end with it
-    /// (removed from a channel group by the commit being written).
+    /// (removed from a channel group by the commit being written); `access` is a private channel
+    /// group's new member-list checkpoint `(seq, hash)`, written in the same transaction (6c).
+    #[allow(clippy::too_many_arguments)]
     pub fn mls_write_group(
         &self,
         row: &GroupRow,
@@ -128,8 +130,16 @@ impl Store {
         log: Option<&MlsLogEntry>,
         welcome: Option<(&[u8], &[String])>,
         ended_requests: &[String],
+        access: Option<(u64, &str)>,
     ) -> Result<()> {
         let tx = self.db.unchecked_transaction()?;
+        if let Some((seq, hash)) = access {
+            tx.execute(
+                "INSERT INTO mls_access(group_id,seq,hash) VALUES(?1,?2,?3)
+                 ON CONFLICT(group_id) DO UPDATE SET seq=excluded.seq, hash=excluded.hash",
+                params![row.group, seq as i64, hash],
+            )?;
+        }
         for device in ended_requests {
             tx.execute(
                 "DELETE FROM mls_history_requests WHERE group_id=?1 AND device_key=?2",
@@ -396,10 +406,10 @@ impl Store {
         group: Option<&str>,
         now: i64,
         paging: (&str, usize),
-        mut visit: impl FnMut(MlsHistoryChunk) -> Result<bool>,
+        mut visit: impl FnMut(&str, MlsHistoryChunk) -> Result<bool>,
     ) -> Result<()> {
         let mut stmt = self.db.prepare(
-            "SELECT h.id,h.group_id,h.sender_uid,h.chunk FROM mls_history h
+            "SELECT h.id,h.group_id,h.sender_uid,h.chunk,g.conversation FROM mls_history h
             JOIN mls_groups g ON g.group_id=h.group_id
             WHERE h.recipient_device=?1 AND h.created_at>=?2 AND h.id>?3 AND (?4 IS NULL OR h.group_id=?4)
               AND (substr(g.conversation,1,31)='dm:' || ?5 || ':' OR substr(g.conversation,31)=':' || ?5
@@ -408,12 +418,16 @@ impl Store {
         )?;
         let mut rows = stmt.query(params![device, now - RETENTION_MS, paging.0, group, uid, paging.1])?;
         while let Some(r) = rows.next()? {
-            if !visit(MlsHistoryChunk {
-                id: r.get(0)?,
-                group: r.get(1)?,
-                sender_uid: r.get(2)?,
-                chunk: B64.encode(r.get::<_, Vec<u8>>(3)?),
-            })? {
+            let conversation: String = r.get(4)?;
+            if !visit(
+                &conversation,
+                MlsHistoryChunk {
+                    id: r.get(0)?,
+                    group: r.get(1)?,
+                    sender_uid: r.get(2)?,
+                    chunk: B64.encode(r.get::<_, Vec<u8>>(3)?),
+                },
+            )? {
                 break;
             }
         }
@@ -625,6 +639,7 @@ mod tests {
                 None,
                 None,
                 &[],
+                None,
             )
             .unwrap();
         store
@@ -684,10 +699,10 @@ mod tests {
         store.mls_request_history("g", "removed", 100).unwrap();
         store.mls_request_history("g", "kept", 100).unwrap();
         store.db.execute_batch("CREATE TRIGGER fail_write BEFORE UPDATE ON mls_groups BEGIN SELECT RAISE(ABORT,'injected write failure'); END;").unwrap();
-        assert!(store.mls_write_group(&row, &[], &[], None, None, &["removed".into()]).is_err());
+        assert!(store.mls_write_group(&row, &[], &[], None, None, &["removed".into()], None).is_err());
         assert!(store.mls_history_requested("g", "removed", 100).unwrap());
         store.db.execute_batch("DROP TRIGGER fail_write").unwrap();
-        store.mls_write_group(&row, &[], &[], None, None, &["removed".into()]).unwrap();
+        store.mls_write_group(&row, &[], &[], None, None, &["removed".into()], None).unwrap();
         assert!(!store.mls_history_requested("g", "removed", 100).unwrap());
         assert!(store.mls_history_requested("g", "kept", 100).unwrap());
     }
@@ -705,7 +720,7 @@ mod tests {
             observer: vec![],
             created_at: 1,
         };
-        store.mls_write_group(&row, &[], &[], None, Some((b"welcome", &["device".into()])), &[]).unwrap();
+        store.mls_write_group(&row, &[], &[], None, Some((b"welcome", &["device".into()])), &[], None).unwrap();
         store
             .db
             .execute(
@@ -732,7 +747,7 @@ mod tests {
                 .unwrap();
             let mut chunks = 0;
             store
-                .mls_history("device", "u", None, 1, ("", 10), |_| {
+                .mls_history("device", "u", None, 1, ("", 10), |_, _| {
                     chunks += 1;
                     Ok(true)
                 })
@@ -761,7 +776,7 @@ mod tests {
                 observer: vec![],
                 created_at: 1,
             };
-            store.mls_write_group(&row, &[], &[], None, None, &[]).unwrap();
+            store.mls_write_group(&row, &[], &[], None, None, &[], None).unwrap();
         }
         let page = |after, limit| -> Vec<u64> {
             store.mls_incarnations("channel:1", after, limit).unwrap().iter().map(|g| g.incarnation).collect()

@@ -272,6 +272,15 @@ async fn an_encrypted_private_channel_admits_only_its_signed_members_and_never_g
     assert_eq!(bob.next_event_where("channel.created", |e| e["id"] == channel).await["private"], true);
     assert!(matches!(eve.fails("mls.group_info", json!({"group": group})).await.as_str(), "forbidden" | "not_found"));
     assert!(eve.drain_events("channel.created").await.iter().all(|e| e["id"] != channel));
+    // Nor does Eve find its group or its read marks: in `mls.groups` or a new Welcome.
+    let conversation = format!("channel:{channel}");
+    let listed =
+        |groups: &Value| groups["groups"].as_array().unwrap().iter().any(|g| g["conversation"] == conversation);
+    assert!(listed(&owner.ok("mls.groups", json!({})).await) && !listed(&eve.ok("mls.groups", json!({})).await));
+    let eve_again = connect(&server, &Device::new(3, 34)).await;
+    assert!(eve_again.welcome.conversations.iter().all(|c| c.conversation != conversation));
+    let owner_again = connect(&server, &Device::new(1, 12)).await;
+    assert!(owner_again.welcome.conversations.iter().any(|c| c.conversation == conversation));
 
     // Bob joins by external commit.
     let info = bob.ok("mls.group_info", json!({"group": group})).await;

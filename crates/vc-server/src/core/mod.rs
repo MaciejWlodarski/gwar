@@ -1668,7 +1668,12 @@ impl Core {
     /// Unread sealed messages: direct messages, encrypted channels and server chat.
     fn conversations_for(&self, user: i64, uid: &str) -> Result<Vec<vc_proto::ConversationUnread>> {
         let mut conversations = self.store.sealed_unread(user, uid)?;
-        for c in self.channels.values().filter(|c| c.encrypted) {
+        // Hidden encrypted private channels are not listed, not even their read marks (6c).
+        for c in self
+            .channels
+            .values()
+            .filter(|c| c.encrypted && self.mls_conversation_admits(uid, &format!("channel:{}", c.id)))
+        {
             conversations.push(self.store.sealed_conversation_unread(user, &format!("channel:{}", c.id))?);
         }
         if self.info.server_chat.encrypted {

@@ -395,7 +395,8 @@ mod tests {
             created_at: 1,
         };
         let core = test_core(store, None);
-        on_core(&core, move |core| core.store.mls_write_group(&row, &leaves, &[], None, None, &[]).unwrap()).await;
+        on_core(&core, move |core| core.store.mls_write_group(&row, &leaves, &[], None, None, &[], None).unwrap())
+            .await;
         core
     }
 
@@ -628,7 +629,7 @@ mod tests {
                 .enumerate()
                 .map(|(index, (account, d))| Leaf { index: index as u32, device_key: device(*d), uid: uid(*account) })
                 .collect();
-            core.store.mls_write_group(&row, &leaves, &[], None, None, &[device(10)]).unwrap();
+            core.store.mls_write_group(&row, &leaves, &[], None, None, &[device(10)], None).unwrap();
             core.history_members_changed(GROUP, &BTreeSet::from([device(10)]));
         })
         .await;

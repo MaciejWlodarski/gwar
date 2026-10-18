@@ -136,6 +136,9 @@ fn page<T: Serialize>(items: Vec<(String, T)>, paging: MlsPage) -> Result<(Vec<T
 }
 
 /// The channel of a canonical `channel:{id}` conversation.
+/// A SQL page bound for queries whose rows are filtered while read: the page ends them.
+const UNBOUNDED: usize = i64::MAX as usize;
+
 pub(super) fn channel_id(conversation: &str) -> Option<ChannelId> {
     let id: ChannelId = conversation.strip_prefix("channel:")?.parse().ok()?;
     (format!("channel:{id}") == conversation).then_some(id)
@@ -156,9 +159,15 @@ impl Core {
             && !self.store.bans(now_ms()).map_err(storage_error)?.iter().any(|b| b.uid.as_deref() == Some(uid)))
     }
 
-    /// Direct messages: their two participants. Encrypted channels and server chat: every member.
+    /// Direct messages: their two participants. Encrypted channels and server chat: every member;
+    /// an encrypted private channel: whom its lists admit.
     pub(super) fn mls_can_read(&self, uid: &str, conversation: &str) -> Result<bool, ErrorBody> {
-        let allowed = match dm_participants(conversation) {
+        Ok(self.mls_conversation_admits(uid, conversation) && self.mls_member(uid)?)
+    }
+
+    /// [`Self::mls_can_read`] without the membership lookup, for a uid known to be a member.
+    pub(super) fn mls_conversation_admits(&self, uid: &str, conversation: &str) -> bool {
+        match dm_participants(conversation) {
             Some(participants) => participants.contains(&uid),
             None => {
                 (conversation == "server" && self.info.server_chat.encrypted)
@@ -166,8 +175,7 @@ impl Core {
                         self.is_encrypted(c) && (!self.is_encrypted_private(c) || self.private_admits(c, uid))
                     })
             }
-        };
-        Ok(allowed && self.mls_member(uid)?)
+        }
     }
 
     pub(super) fn mls_readers(&self, conversation: &str) -> BTreeSet<SessionId> {
@@ -297,7 +305,7 @@ impl Core {
         if !added.is_empty() {
             row.observer = observer.save();
             existing.extend(added.iter().map(|p| ProposalRow { leaf: p.leaf, proposal: p.proposal.clone() }));
-            self.store.mls_write_group(&row, &observer.leaves(), &existing, None, None, &[])?;
+            self.store.mls_write_group(&row, &observer.leaves(), &existing, None, None, &[], None)?;
             self.voice_dirty |= channel_id(&row.conversation).is_some_and(|c| self.calls.contains_key(&c));
             self.mls_announce_proposals(&row, &added);
         }
@@ -498,8 +506,14 @@ impl Core {
                 let after = cursor(&paging)?;
                 let count = limit(paging.limit)?;
                 let mut page = ListPage::new(count, LIST_BYTES);
+                // Hidden private channels are skipped without using up the page (6c).
                 self.store
-                    .mls_groups(&uid, &after, count + 1, |g| page.push(g.conversation.clone(), g))
+                    .mls_groups(&uid, &after, UNBOUNDED, |g| {
+                        if !self.mls_conversation_admits(&uid, &g.conversation) {
+                            return Ok(true);
+                        }
+                        page.push(g.conversation.clone(), g)
+                    })
                     .map_err(storage_error)?;
                 reply(MlsResponse::Groups { groups: page.items, next: page.next })
             }
@@ -572,8 +586,12 @@ impl Core {
                 let after = cursor(&paging)?;
                 let count = limit(paging.limit)?;
                 let mut page = ListPage::new(count, LIST_BYTES);
+                // Chunks still queued for a device whose user lost a private channel stay unread.
                 self.store
-                    .mls_history(&device, &uid, group.as_deref(), now_ms(), (&after, count + 1), |c| {
+                    .mls_history(&device, &uid, group.as_deref(), now_ms(), (&after, UNBOUNDED), |conversation, c| {
+                        if !self.mls_conversation_admits(&uid, conversation) {
+                            return Ok(true);
+                        }
                         page.push(c.id.clone(), c)
                     })
                     .map_err(storage_error)?;
@@ -735,10 +753,19 @@ impl Core {
         row.observer = observer.save();
         let private = self.private_channel_of(conversation);
         let admissions = self.admissions();
-        self.store.mls_write_group(&row, &observer.leaves(), &proposals, None, None, &[]).map_err(storage_error)?;
-        if let (Some(channel), Some(access)) = (private, observer.access()) {
-            let m = access.members();
-            self.store.set_mls_access_checkpoint(&row.group, m.members().seq, &m.hash()).map_err(storage_error)?;
+        let checkpoint = private.and(observer.access()).map(|a| (a.members().members().seq, a.members().hash()));
+        self.store
+            .mls_write_group(
+                &row,
+                &observer.leaves(),
+                &proposals,
+                None,
+                None,
+                &[],
+                checkpoint.as_ref().map(|(seq, hash)| (*seq, hash.as_str())),
+            )
+            .map_err(storage_error)?;
+        if let (Some(channel), Some(_)) = (private, checkpoint) {
             self.refresh_private(channel);
             self.reconcile_admissions(admissions);
         }
@@ -822,11 +849,11 @@ impl Core {
                 Some(&entry),
                 welcome.as_deref().map(|w| (w, accepted.welcome_recipients.as_slice())),
                 &removed,
+                checkpoint.as_ref().map(|(seq, hash)| (*seq, hash.as_str())),
             )
             .map_err(storage_error)?;
-        if let (Some(channel), Some((seq, hash))) = (private, checkpoint) {
+        if let (Some(channel), Some(_)) = (private, &checkpoint) {
             let admissions = self.admissions();
-            self.store.set_mls_access_checkpoint(group, seq, &hash).map_err(storage_error)?;
             self.refresh_private(channel);
             self.reconcile_admissions(admissions);
         }

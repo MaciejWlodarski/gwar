@@ -14,7 +14,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 use vc_proto::{Attachment, ErrorCode, FileAccess, Permission, Response, SessionId};
 
-use super::{Core, CoreHandle, CoreMsg, Reply, err, now_ms, storage_error};
+use super::{Core, CoreHandle, CoreMsg, Reply, err, mls::channel_id, now_ms, storage_error};
 
 /// How long a reserved upload waits for its bytes to start coming. Once started, it stays
 /// reserved until it finishes or is given up, however long writing it takes.
@@ -361,14 +361,18 @@ impl Core {
     /// sealed conversation the file is posted in may download it. A file in no message (not posted
     /// yet, or its message or channel deleted) is for nobody: its uploader has the bytes.
     fn may_download(&self, id: &str, access: Option<&str>) -> bool {
-        // Attachments of a private channel need an admitted session in every mode.
-        let private = match self.store.file_channel(id) {
-            Ok(channel) => channel.is_some_and(|c| self.channels.get(&c).is_some_and(|c| c.private)),
-            Err(e) => {
+        let (conversation, channel) = match (self.store.file_conversation(id), self.store.file_channel(id)) {
+            (Ok(conversation), Ok(channel)) => (conversation, channel),
+            (Err(e), _) | (_, Err(e)) => {
                 warn!("store: {e:#}");
                 return false;
             }
         };
+        // Attachments of a private channel, plaintext or encrypted, need an admitted session in
+        // every mode.
+        let private = channel
+            .or_else(|| conversation.as_deref().and_then(channel_id))
+            .is_some_and(|c| self.channels.get(&c).is_some_and(|c| c.private));
         if self.info.file_access == FileAccess::Link && !private {
             return true;
         }
@@ -378,21 +382,10 @@ impl Core {
         else {
             return false;
         };
-        match self.store.file_conversation(id) {
-            Ok(Some(conversation)) => return self.mls_can_read(&session.uid, &conversation).unwrap_or(false),
-            Ok(None) => {}
-            Err(e) => {
-                warn!("store: {e:#}");
-                return false;
-            }
-        }
-        match self.store.file_channel(id) {
-            Ok(Some(channel)) => self.can_read(session, channel),
-            Ok(None) => false,
-            Err(e) => {
-                warn!("store: {e:#}");
-                false
-            }
+        match (conversation, channel) {
+            (Some(conversation), _) => self.mls_can_read(&session.uid, &conversation).unwrap_or(false),
+            (None, Some(channel)) => self.can_read(session, channel),
+            (None, None) => false,
         }
     }
 
