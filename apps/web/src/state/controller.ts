@@ -16,6 +16,7 @@ import type { Attachment } from "../proto/Attachment";
 import type { MessageSignature } from "../proto/MessageSignature";
 import { useAccountIdentity } from "./identity";
 import { archiveOptions } from "./archive";
+import { recentLogs, type LogEntry } from "../lib/diagnostics";
 import type { BanNotice } from "../proto/BanNotice";
 /**
  * Glue between the network client, the voice engine and the stores. UI
@@ -732,6 +733,23 @@ class Controller {
 
   /** The encrypted call controller's diagnostics (no key material), or null. */
   voiceDebug(): Record<string, unknown> | null { return this.voiceCall?.call.debug() ?? null; }
+
+  /** What a bug report says about this app and its state: versions, the connection, voice and the
+   * latest warnings and errors. No keys, tokens, passwords or message contents. */
+  async reportDiagnostics(): Promise<Record<string, unknown> & { logs: LogEntry[] }> {
+    const s = useSession.getState(), v = useVoice.getState();
+    // The web app's build names its commit; the desktop app has its version only.
+    const commit = isDesktop() ? null : await fetch("/version.json", { cache: "no-store", signal: AbortSignal.timeout(2_000) })
+      .then((r) => (r.ok ? r.json() : null)).then((j: unknown) => (j && typeof (j as { commit?: unknown }).commit === "string" ? (j as { commit: string }).commit : null)).catch(() => null);
+    return {
+      app: { version: CLIENT_VERSION, commit, platform: platform(), userAgent: navigator.userAgent, language: navigator.language },
+      time: new Date().toISOString(),
+      connection: { kind: s.kind, phase: s.phase, address: s.address || null, server: s.server?.name ?? null, insecure: s.insecureConnection },
+      voice: { state: v.state, encryption: v.encryption, muted: v.muted, deafened: v.deafened, call: this.voiceDebug() },
+      encryption: this.runtime ? "running" : this.conn ? "unavailable" : "not connected",
+      logs: recentLogs(),
+    };
+  }
   /** The current encrypted run's aggregate SFrame counters, or null. */
   voiceCounters(): Promise<Record<string, number> | null> { return this.engine.cryptoCounters?.() ?? Promise.resolve(null); }
 

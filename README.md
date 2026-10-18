@@ -78,8 +78,9 @@ use.
   - The desktop app can connect to any existing TS3/TS6 server with the same
     interface.
 
-Gwar is early software: it works and is tested end to end, but expect rough
-edges and breaking changes.
+Gwar is alpha software: it works and is tested end to end, but expect rough
+edges and breaking changes. The bug button in the app sends a report (with
+screenshots and diagnostics, if you choose) privately to the Gwar team.
 
 ## Security
 

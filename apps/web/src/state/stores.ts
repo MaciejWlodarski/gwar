@@ -119,6 +119,7 @@ export type DialogState =
   | { kind: "removeMember"; person: PersonRef; back?: ServerSettingsTab }
   | { kind: "lightbox"; attachment: Attachment; verified: boolean }
   | { kind: "redeem" }
+  | { kind: "bugReport" }
   | { kind: "createToken" }
   | { kind: "serverKey" }
   | { kind: "readers"; thread: SealedThreadKey }

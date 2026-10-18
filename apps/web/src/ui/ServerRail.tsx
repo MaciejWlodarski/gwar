@@ -7,6 +7,7 @@ import { useBookmarks, useSettings, type Bookmark } from "../state/settings";
 import { useSession, useUi } from "../state/stores";
 import { TeamSpeakBadge } from "./badges";
 import { Avatar, IconButton, Tooltip, menuContent, menuItem, menuItemDanger } from "./kit";
+import { AlphaReport } from "./BugReport";
 
 export function ServerRail() {
   const t = useT();
@@ -93,6 +94,7 @@ export function ServerRail() {
           </button>
         </Tooltip>
       </div>
+      <AlphaReport />
       <IconButton label={t("settings.title")} side="right" onClick={() => openDialog({ kind: "settings", tab: "audio" })}>
         <Settings className="size-5" />
       </IconButton>

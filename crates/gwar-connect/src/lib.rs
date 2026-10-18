@@ -11,6 +11,7 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use anyhow::{Context, Result};
 use axum::{
     Router,
+    extract::DefaultBodyLimit,
     http::{HeaderName, HeaderValue, Method, header},
     routing::{get, post, put},
 };
@@ -66,6 +67,8 @@ pub fn router(state: Arc<Connect>, origins: &[String]) -> Router {
         .route("/v1/archive/records", get(api::archive::records).post(api::archive::put_records))
         .route("/v1/archive/transfers", get(api::archive::transfers).post(api::archive::put_transfer))
         .route("/v1/logout", post(api::logout))
+        // Screenshots need more than the default request size.
+        .route("/v1/reports", post(api::reports::create).layer(DefaultBodyLimit::max(api::reports::MAX_BODY_BYTES)))
         .route("/v1/revocations", get(api::revocations))
         .route("/v1/accounts/by-key/{account_key}", get(api::lookup_by_key))
         .route("/v1/accounts/{handle}", get(api::lookup))

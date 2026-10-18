@@ -878,3 +878,24 @@ async fn the_key_archive_keeps_signed_statements_first_manifests_records_and_tra
     assert_eq!(api.post("/archive/transfers", Some(&token), json!({"transfer": b64(&transfer)})).await.0, 200);
     assert_eq!(api.get("/archive/transfers?after=0", Some(&token)).await.1["transfers"].as_array().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn bug_reports_keep_text_diagnostics_and_real_screenshots() {
+    let api = Api::start().await;
+    let png = [b"\x89PNG\r\n\x1a\n".as_slice(), &[7; 100]].concat();
+    let report =
+        |images: Value| json!({"text": "Voice stuck on Securing", "diagnostics": {"app": "web"}, "images": images});
+    let (status, body) = api.post("/reports", None, report(json!([{"mime": "image/png", "data": b64(&png)}]))).await;
+    assert_eq!(status, 200, "{body}");
+    let id = body["id"].as_i64().unwrap();
+    // A screenshot whose bytes are not the type it claims, too many of them, or no text: refused.
+    let fake = json!([{"mime": "image/png", "data": b64(b"<svg onload=alert(1)>")}]);
+    assert_eq!(api.post("/reports", None, report(fake)).await.0, 400);
+    let six: Vec<Value> = (0..6).map(|_| json!({"mime": "image/png", "data": b64(&png)})).collect();
+    assert_eq!(api.post("/reports", None, report(json!(six))).await.0, 400);
+    assert_eq!(api.post("/reports", None, json!({"text": "  ", "diagnostics": {}})).await.0, 400);
+    let store = api.state.store.lock().unwrap();
+    let ((_, handle, _, text, diagnostics), images) = store.report(id).unwrap().unwrap();
+    assert_eq!((handle, text.as_str(), diagnostics.as_str()), (None, "Voice stuck on Securing", r#"{"app":"web"}"#));
+    assert_eq!(images, vec![("image/png".to_owned(), png)]);
+}
