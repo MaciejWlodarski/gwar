@@ -1,7 +1,7 @@
 import { AlertTriangle, Check, Copy, Download, KeyRound, LogOut, RefreshCw, ShieldCheck, Smartphone } from "lucide-react";
 import { useCallback, useEffect, useState, type FormEvent, type ReactNode } from "react";
 import { tNow, useT } from "../i18n";
-import { normalizeHandle } from "../connect/account";
+import { newRecoveryCode, normalizeHandle } from "../connect/account";
 import type { DeviceInfo } from "../connect/api";
 import { describeAccountError, type AccountContext } from "../connect/errors";
 import { MIN_PASSWORD_LENGTH, passwordStrength } from "../connect/crypto";
@@ -286,14 +286,11 @@ function RecoverForm({ onMode }: { onMode: (m: Mode) => void }) {
  * The account is only prepared here: the service hears about it when the person confirms. If registering
  * fails (handle taken, rate limit) the code stays and can be tried again, under another handle if needed.
  */
-function RecoveryCode({ code, handle: prepared }: { code: string; handle: string }) {
+/** A recovery code to keep: shown, copied or downloaded. */
+function CodeCard({ code }: { code: string }) {
   const t = useT();
   const toast = useUi((s) => s.toast);
-  const [saved, setSaved] = useState(false);
   const [copied, setCopied] = useState(false);
-  const [failed, setFailed] = useState(false);
-  const [handle, setHandle] = useState(prepared);
-  const { busy, error, setError, run } = useAction("register");
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(code);
@@ -312,11 +309,7 @@ function RecoveryCode({ code, handle: prepared }: { code: string; handle: string
     URL.revokeObjectURL(url);
   };
   return (
-    <div className="flex flex-col gap-3">
-      <h3 className="flex items-center gap-2 text-base font-semibold">
-        <KeyRound className="size-4" /> {t("account.recoveryTitle")}
-      </h3>
-      <p className="text-sm text-muted">{t("account.recoveryBody")}</p>
+    <>
       <div
         data-testid="recovery-code"
         className="rounded-lg border border-line-strong bg-side px-4 py-3 text-center font-mono text-sm tracking-wider select-all"
@@ -331,6 +324,24 @@ function RecoveryCode({ code, handle: prepared }: { code: string; handle: string
           <Download className="size-4" /> {t("account.recoveryDownload")}
         </Button>
       </div>
+    </>
+  );
+}
+
+function RecoveryCode({ code, handle: prepared }: { code: string; handle: string }) {
+  const t = useT();
+  const toast = useUi((s) => s.toast);
+  const [saved, setSaved] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const [handle, setHandle] = useState(prepared);
+  const { busy, error, setError, run } = useAction("register");
+  return (
+    <div className="flex flex-col gap-3">
+      <h3 className="flex items-center gap-2 text-base font-semibold">
+        <KeyRound className="size-4" /> {t("account.recoveryTitle")}
+      </h3>
+      <p className="text-sm text-muted">{t("account.recoveryBody")}</p>
+      <CodeCard code={code} />
       <label className="flex cursor-pointer items-center gap-2 text-sm">
         <input type="checkbox" checked={saved} onChange={(e) => setSaved(e.target.checked)} className="size-4 accent-[var(--color-accent)]" />
         {t("account.recoverySaved")}
@@ -547,6 +558,8 @@ function AccountView() {
 
       <ChangePassword />
 
+      <ChangeRecoveryCode />
+
       <Section title={t("account.signOut")}>
         <p className="text-sm text-muted">{t("account.signOutHint", { uid: localUid })}</p>
         <div>
@@ -599,6 +612,65 @@ function AccountView() {
         />
       )}
     </div>
+  );
+}
+
+/**
+ * A new recovery code: shown first, set only once the person says they kept it (with the password),
+ * so a code nobody saw never replaces the old one (docs/e2e-build.md, section 7).
+ */
+export function ChangeRecoveryCode() {
+  const t = useT();
+  const toast = useUi((s) => s.toast);
+  const [code, setCode] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+  const [password, setPassword] = useState("");
+  const { busy, error, run } = useAction("password");
+  const close = () => {
+    setCode(null);
+    setSaved(false);
+    setPassword("");
+  };
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!code || !saved) return;
+    if (await run(() => accountActions.changeRecoveryCode(password, code))) {
+      close();
+      toast("success", t("account.recoveryChanged"));
+    }
+  };
+  return (
+    <Section title={t("account.recoveryCode")}>
+      <p className="text-sm text-muted">{t("account.recoveryChangeHint")}</p>
+      <Button className="self-start" onClick={() => setCode(newRecoveryCode())}>
+        <KeyRound className="size-4" /> {t("account.recoveryChange")}
+      </Button>
+      {code && (
+        <Dialog open onOpenChange={(o) => !o && close()} title={t("account.recoveryChange")} description={t("account.recoveryBody")}>
+          <form onSubmit={(e) => void submit(e)} className="mt-2 flex flex-col gap-3">
+            <CodeCard code={code} />
+            <label className="flex cursor-pointer items-center gap-2 text-sm">
+              <input type="checkbox" checked={saved} onChange={(e) => setSaved(e.target.checked)} className="size-4 accent-[var(--color-accent)]" />
+              {t("account.recoverySavedNew")}
+            </label>
+            <Field label={t("account.password")}>
+              {(id) => (
+                <Input id={id} type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" required />
+              )}
+            </Field>
+            {error && <Banner>{error}</Banner>}
+            <div className="flex justify-end gap-2">
+              <Button type="button" onClick={close}>
+                {t("common.cancel")}
+              </Button>
+              <Button type="submit" variant="primary" busy={busy} disabled={!saved}>
+                {t("account.recoveryChange")}
+              </Button>
+            </div>
+          </form>
+        </Dialog>
+      )}
+    </Section>
   );
 }
 
