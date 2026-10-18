@@ -93,6 +93,10 @@ export interface Gate {
 export type Authority = { kind: "current" } | { kind: "carry" } | { kind: "remove"; leaves: number[] } | { kind: "wait" };
 /** A gate that lets this device use its group: active, nothing blocking or pending, and in a
  * private channel's group current authority. */
+/** A private group this device can repair itself (carry the accepted pair, or remove leaves). */
+export function repairable(gate: Gate): boolean {
+  return gate.access?.kind === "carry" || gate.access?.kind === "remove";
+}
 export function usable(gate: Gate): boolean {
   return gate.status === "active" && !gate.rejoin && !gate.server_pending && !gate.blocked.length && !gate.pending_commit
     && (!gate.access || gate.access.kind === "current");

@@ -44,7 +44,8 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
       switch (op) {
         case "inventory": return structuredClone(this.state.groups);
         case "device_hpke_key": return { hpke_key: b64(7), created_at: 1, signature: b64(8,64) };
-        case "gate": return { status: g?.record.status, rejoin: false, pending_commit: !!this.state.out, server_pending: g?.record.server_pending, blocked: g?.members.filter(m => world.revocations.some(r => r.device_key === m.device_key)).map((_, i) => i) ?? [] };
+        case "gate": return { status: g?.record.status, rejoin: false, pending_commit: !!this.state.out, server_pending: g?.record.server_pending, blocked: g?.members.filter(m => world.revocations.some(r => r.device_key === m.device_key)).map((_, i) => i) ?? [], ...(world.access && { access: world.access }) };
+        case "commit_access": case "adopt_offer": world.access = undefined; this.state.out = { ...pending(), epoch: g!.record.checkpoint!.epoch }; return this.state.out;
         case "outbox": return this.state.out;
         case "sending_key": return [g!.record.checkpoint!.epoch, Array(32).fill(1)];
         case "seal_message": return [9];
@@ -115,6 +116,8 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
   const world = {
     groups: initial.groups.length && hasRemoteGroup ? [{ conversation, group, incarnation: 0, epoch: 0, pending: false }] : [],
     head: 0, oldest: 0, revocations: [] as Revocation[], behind: false, joinError: false,
+    /** A private group's authority as the gate reports it (6c). */
+    access: undefined as undefined | { kind: "current" } | { kind: "carry" } | { kind: "remove"; leaves: number[] } | { kind: "wait" },
     chain: [] as { group: string; descriptor: string }[],
     openError: null as Error | null, openResult: { reason: "no_key" } as { reason: "no_key" | "cannot_open" } | { ok: number[] },
     claimed: [] as { device_key: string; package: string }[],
@@ -876,6 +879,26 @@ describe("Public groups", () => {
     await f.runtime.sync();
     expect(f.operations.filter(o => o.op === "observe_access").length).toBeGreaterThan(before);
     expect(f.operations.find(o => o.op === "observe_access")).toMatchObject({ group: Array(32).fill(2) });
+  });
+  it("repairs a private group itself after a random delay, then submits the commit", async () => {
+    asChannel();
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const f = await fixture({ ...clean(), groups: [{ ...summary(), private: true }] }, true, { channels: [channel()] });
+    f.world.access = { kind: "carry" };
+    f.event({ ev: "mls.commit", d: { group: b64(2), epoch: 0, proposals: [], commit: b64(1) } } as Event);
+    await f.runtime.sync();
+    await f.runtime.sync();
+    expect(f.operations.find(o => o.op === "commit_access")).toMatchObject({ members: null });
+    expect(f.calls.some(c => c.op === "mls.commit")).toBe(true);
+    vi.restoreAllMocks();
+  });
+  it("commits lists a channel authority offered", async () => {
+    asChannel();
+    const f = await fixture({ ...clean(), groups: [{ ...summary(), private: true }] }, true, { channels: [channel()] });
+    f.event({ ev: "mls.access.offered", d: { group: b64(2), extension: b64(9, 40) } } as Event);
+    await f.runtime.sync();
+    expect(f.operations.find(o => o.op === "adopt_offer")).toMatchObject({ extension: Array(40).fill(9) });
+    expect(f.calls.some(c => c.op === "mls.commit")).toBe(true);
   });
   it("forgets the group of a channel hidden from this session", async () => {
     asChannel();

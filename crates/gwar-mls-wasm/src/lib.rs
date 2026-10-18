@@ -104,6 +104,20 @@ enum Request {
         now: i64,
         revocations: View,
     },
+    AdoptOffer {
+        server: String,
+        group: [u8; 32],
+        extension: Vec<u8>,
+        now: i64,
+        revocations: View,
+    },
+    OfferAccess {
+        server: String,
+        group_info: Vec<u8>,
+        members: Option<Vec<String>>,
+        now: i64,
+        revocations: View,
+    },
     Settle {
         server: String,
         group: [u8; 32],
@@ -436,6 +450,12 @@ impl Agent {
             }
             Request::CommitAccess { server, group, members, now, revocations } => {
                 output(a.commit_access(&server, &group, members.as_deref(), now, &revocations).map_err(error)?)
+            }
+            Request::AdoptOffer { server, group, extension, now, revocations } => {
+                output(a.adopt_offer(&server, &group, &extension, now, &revocations).map_err(error)?)
+            }
+            Request::OfferAccess { server, group_info, members, now, revocations } => {
+                output(a.offer_access(&server, &group_info, members.as_deref(), now, &revocations).map_err(error)?)
             }
             Request::Settle { server, group, winner } => {
                 output(a.settle(&server, &group, winner.as_ref()).map_err(error)?)

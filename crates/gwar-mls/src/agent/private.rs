@@ -317,6 +317,68 @@ impl Agent {
         now: i64,
         revocations: &dyn Revocations,
     ) -> Result<Outbox> {
+        self.commit_lists(server, id, Lists::Members(members), now, revocations)
+    }
+
+    /// Commits lists a channel authority offered (`mls.access.offered`): they must carry the newest
+    /// pair this device accepted, be current now, bound to this group, and no older than its
+    /// checkpoint or the group's own list. The same commit removes the leaves they exclude.
+    pub fn adopt_offer(
+        &mut self,
+        server: &str,
+        id: &[u8; 32],
+        extension: &[u8],
+        now: i64,
+        revocations: &dyn Revocations,
+    ) -> Result<Outbox> {
+        self.commit_lists(server, id, Lists::Offer(extension), now, revocations)
+    }
+
+    /// Fresh lists for a private group this device's user has authority over but cannot commit to
+    /// (not a member, or the lists are no longer current): the newest pair it accepted and a member
+    /// list it signs at the next seq after the group's (from its GroupInfo) and its own checkpoint,
+    /// with `members` or the group's members. Sent as `mls.access.offer`; a member commits it.
+    pub fn offer_access(
+        &self,
+        server: &str,
+        group_info: &[u8],
+        members: Option<&[Uid]>,
+        now: i64,
+        revocations: &dyn Revocations,
+    ) -> Result<Vec<u8>> {
+        super::current_time(now)?;
+        let info = super::info(group_info)?;
+        let descriptor = client_context(info.group_context(), server)?;
+        if !rules::is_private(&descriptor) {
+            return Err(Invalid("not a private channel"));
+        }
+        let id = descriptor.group_id();
+        let record = self.servers.get(server).ok_or(AgentError::Waiting)?;
+        let chain = record.chain(server)?;
+        let (anchor, list) = record.pair()?.ok_or(AgentError::Waiting)?;
+        let shown = rules::access(info.group_context()).ok_or(Invalid("access lists"))?;
+        let own = self.groups.get(&group_key(server, &id)).and_then(|r| r.access.as_ref()).map_or(0, |c| c.seq);
+        let seq = shown.members().members().seq.max(own).checked_add(1).ok_or(Invalid("member list seq"))?;
+        let members = members.map_or_else(|| shown.members().members().members.clone(), <[Uid]>::to_vec);
+        let access = Access::new(anchor, list, self.sign_members(&chain, &id, seq, &members, now)?);
+        if !access.current(&chain, &id, now, revocations) {
+            return Err(AgentError::Waiting);
+        }
+        let encoded = access.encode();
+        if encoded.len() > MAX_ACCESS_BYTES {
+            return Err(Invalid("access lists too large"));
+        }
+        Ok(encoded)
+    }
+
+    fn commit_lists(
+        &mut self,
+        server: &str,
+        id: &[u8; 32],
+        lists: Lists<'_>,
+        now: i64,
+        revocations: &dyn Revocations,
+    ) -> Result<Outbox> {
         self.operation(|a| {
             let key = group_key(server, id);
             let gate = a.gate(server, id, now, revocations)?;
@@ -343,24 +405,34 @@ impl Agent {
             let (anchor, list) = record.pair()?.ok_or(AgentError::Waiting)?;
             let current = rules::access(group.public_group().group_context()).ok_or(Invalid("access lists"))?;
             let checkpoint = a.groups[&key].access.clone();
-            let members_none = members.is_none();
-            let members = match members {
+            let members_none = matches!(lists, Lists::Members(None));
+            let older = |m: &SignedMembers| checkpoint.as_ref().is_some_and(|c| !c.is(m) && !c.before(m));
+            let access = match lists {
                 // The next seq after the list this device accepted: a list it never accepted (never
                 // current, or history only) sets no floor.
-                Some(m) => {
+                Lists::Members(Some(m)) => {
                     let seq = checkpoint.as_ref().ok_or(AgentError::Waiting)?.seq;
-                    a.sign_members(&chain, id, seq.checked_add(1).ok_or(Invalid("member list seq"))?, m, now)?
+                    let members =
+                        a.sign_members(&chain, id, seq.checked_add(1).ok_or(Invalid("member list seq"))?, m, now)?;
+                    Access::new(anchor, list, members)
                 }
                 // Never carry a member list older than the one this device accepted.
-                None if checkpoint
-                    .as_ref()
-                    .is_some_and(|c| !c.is(current.members()) && !c.before(current.members())) =>
-                {
-                    return Err(AgentError::Waiting);
+                Lists::Members(None) if older(current.members()) => return Err(AgentError::Waiting),
+                Lists::Members(None) => Access::new(anchor, list, current.members().clone()),
+                Lists::Offer(bytes) => {
+                    let offered = Access::parse(bytes).ok_or(Invalid("offered access lists"))?;
+                    let (m, c) = (offered.members(), current.members());
+                    let behind = (m.members().generation, m.members().seq) < (c.members().generation, c.members().seq);
+                    if offered.anchor().hash() != anchor.hash()
+                        || offered.list().hash() != list.hash()
+                        || older(m)
+                        || behind
+                    {
+                        return Err(AgentError::Waiting);
+                    }
+                    offered
                 }
-                None => current.members().clone(),
             };
-            let access = Access::new(anchor, list, members);
             // A removal-only repair keeps the lists the device holds current authority under (they
             // need not be renewable, e.g. a list a former owner signed); anything new must be current.
             let removal_only =
@@ -423,6 +495,14 @@ impl Agent {
             Ok(out)
         })
     }
+}
+
+/// Where `commit_lists` takes its member list from.
+enum Lists<'a> {
+    /// A new list with these members, signed by this device, or (`None`) the group's own.
+    Members(Option<&'a [Uid]>),
+    /// An offered extension.
+    Offer(&'a [u8]),
 }
 
 /// Leaves whose users the lists do not admit now (the owner being only the current one).

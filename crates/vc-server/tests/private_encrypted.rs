@@ -336,6 +336,28 @@ async fn an_encrypted_private_channel_admits_only_its_signed_members_and_never_g
         g.merge_staged_commit(&owner_device.provider, *staged).unwrap();
     }
 
+    // An offer from the owner reaches the group's readers; only its signer may send it.
+    let offered = Access::new(
+        anchor.clone(),
+        list.clone(),
+        with_server(owner_device.members(&gid, 2, &[2, 4]), &owner_device, &server_key),
+    );
+    let extension = b64(&offered.encode());
+    owner.ok("mls.access.offer", json!({"group": group, "extension": extension})).await;
+    assert_eq!(bob.next_event_where("mls.access.offered", |e| e["group"] == group).await["extension"], extension);
+    assert_eq!(bob.fails("mls.access.offer", json!({"group": group, "extension": extension})).await, "forbidden");
+    assert_eq!(eve.fails("mls.access.offer", json!({"group": group, "extension": extension})).await, "not_found");
+    // Nor is another list at the group's seq.
+    let older = Access::new(
+        anchor.clone(),
+        list.clone(),
+        with_server(owner_device.members(&gid, 1, &[3]), &owner_device, &server_key),
+    );
+    assert_eq!(
+        owner.fails("mls.access.offer", json!({"group": group, "extension": b64(&older.encode())})).await,
+        "conflict"
+    );
+
     // The owner drops Bob in the same commit as his leaf: Bob loses the channel.
     let bob_leaf = owner_device
         .group

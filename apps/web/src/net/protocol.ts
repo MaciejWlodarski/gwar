@@ -51,6 +51,7 @@ export interface ResponseMap {
   "mls.history.ack": Empty;
   "mls.history.request": Empty;
   "mls.history.decline": Empty;
+  "mls.access.offer": Empty;
   "mls.group_history": { incarnations: MlsIncarnation[]; next: string | null };
 
   hello: { server_proof: string };

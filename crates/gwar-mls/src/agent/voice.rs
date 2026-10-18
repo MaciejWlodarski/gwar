@@ -80,8 +80,9 @@ impl Agent {
             return Err(AgentError::Blocked);
         }
         let p = client_context(channel.public_group().group_context(), server)?;
+        // A private channel's call binds to its parent too; its keys need the parent's current
+        // authority (`voice_keys`).
         if p.descriptor.kind != crate::Kind::Channel
-            || p.descriptor.private
             || d.descriptor.conversation.strip_prefix("voice:") != p.descriptor.conversation.strip_prefix("channel:")
             || parent.live(server, &p.descriptor.conversation)?.is_none_or(|live| live.group_id() != parent_id)
         {
@@ -134,6 +135,12 @@ impl Agent {
             return Err(AgentError::Blocked);
         }
         let (voice, channel) = self.voice_parent(server, id, parent)?;
+        // In a private channel, every export needs the parent's current authority (a)–(d): a newer
+        // pair or member list the parent does not carry yet holds the call (docs/e2e-build.md, 6c).
+        let parent_key = group_key(server, &channel.group_id().as_slice().try_into().map_err(err("parent id"))?);
+        if parent.authority(&parent_key, &channel, now, revocations)?.is_some_and(|a| a != super::Authority::Current) {
+            return Err(AgentError::Blocked);
+        }
         let members: BTreeSet<_> = channel
             .public_group()
             .treesync()

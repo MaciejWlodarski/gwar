@@ -44,7 +44,7 @@ impl CoreHandle {
 const BLOB_BYTES: usize = 128 * 1024;
 const LIST_BYTES: usize = 640 * 1024 - 4096;
 
-fn bad(message: &str) -> ErrorBody {
+pub(super) fn bad(message: &str) -> ErrorBody {
     err(ErrorCode::BadRequest, message)
 }
 pub(super) fn ds_error(error: DsError) -> ErrorBody {
@@ -244,7 +244,7 @@ impl Core {
         Ok((epoch, tree))
     }
 
-    fn mls_group_for(&self, session: SessionId, group: &str) -> Result<GroupRow, ErrorBody> {
+    pub(super) fn mls_group_for(&self, session: SessionId, group: &str) -> Result<GroupRow, ErrorBody> {
         if self.voice_group_visible(session, group).is_some() {
             return Err(bad("voice has no chat or history"));
         }
@@ -675,6 +675,7 @@ impl Core {
                 }
                 reply(MlsResponse::Incarnations { incarnations: page.items, next: page.next })
             }
+            MlsRequest::AccessOffer { group, extension } => self.mls_access_offer(session, &group, &extension),
             MlsRequest::HistoryRequest { group } => {
                 let row = self.mls_group_for(session, &group)?;
                 if !self.store.mls_request_history(&group, &device, now_ms()).map_err(storage_error)? {
