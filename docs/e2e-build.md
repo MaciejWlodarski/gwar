@@ -2694,9 +2694,11 @@ imports, the setting, recovery.
 
 ### Keys
 
-- **Device archive key:** each Connect device generates an X25519 key pair
-  for the archive (random, kept with the device's MLS store, never exported)
-  and publishes its public half in a statement signed by its **device key**:
+- **Device archive key:** each Connect device's X25519 history key (the key
+  it already publishes for history bundles, random, kept with its MLS store,
+  never exported) also serves the archive; HPKE `info` strings keep the two
+  uses apart. The device publishes its public half to Connect in a statement
+  signed by its **device key**:
 
   ```text
   gwar archive device v1

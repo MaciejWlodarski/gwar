@@ -1,11 +1,13 @@
 //! One device's MLS state. Persist `take_changes()` atomically after every
 //! operation, before sending its output. On any error, discard and reload.
 
+mod archive;
 pub mod epoch_number;
 mod owner;
 mod private;
 mod storage;
 mod voice;
+pub use archive::{ArchiveCertificate, ArchiveDevice, ArchiveRecord, ArchiveRevocation, ArchiveState, ArchiveUpload};
 pub use owner::{ManagersCheck, OwnerCheck, OwnerView, ServerRecord};
 pub use private::{AccessCheckpoint, AccessView, Authority, ChainAdoption};
 pub use storage::{Change, Changes, Store, Stores};
@@ -250,8 +252,18 @@ fn valid_evidence(evidence: &BTreeMap<String, Vec<Interval>>) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum EpochRecord {
-    Derived { key: [u8; 32] },
-    Imported { key: [u8; 32], sender_uids: BTreeSet<String> },
+    /// `archived`: the key archive holds it (uploaded, or imported from it) (section 7).
+    Derived {
+        key: [u8; 32],
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        archived: bool,
+    },
+    Imported {
+        key: [u8; 32],
+        sender_uids: BTreeSet<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        archived: bool,
+    },
     Conflicted,
 }
 impl EpochRecord {
@@ -381,6 +393,8 @@ pub struct Agent {
     groups: BTreeMap<String, GroupRecord>,
     /// Owner pins and manager checkpoints by server key, stored as `{server}/@server`.
     servers: BTreeMap<String, ServerRecord>,
+    /// The key archive of this device's Connect account, stored as `@archive` (section 7).
+    archive: Option<ArchiveRecord>,
     epochs: BTreeMap<String, EpochRecord>,
     outbox: BTreeMap<String, Outbox>,
     durable: Stores,
@@ -419,6 +433,7 @@ impl Agent {
             provider,
             groups: BTreeMap::new(),
             servers: BTreeMap::new(),
+            archive: None,
             epochs: BTreeMap::new(),
             outbox: BTreeMap::new(),
             durable: Stores::default(),
@@ -463,7 +478,12 @@ impl Agent {
         fn records<T: serde::de::DeserializeOwned>(store: &Store, skip_device: bool) -> Result<BTreeMap<String, T>> {
             store
                 .iter()
-                .filter(|(k, _)| !skip_device || (k.as_slice() != b"@device" && !k.ends_with(owner::SUFFIX.as_bytes())))
+                .filter(|(k, _)| {
+                    !skip_device
+                        || (k.as_slice() != b"@device"
+                            && k.as_slice() != archive::KEY
+                            && !k.ends_with(owner::SUFFIX.as_bytes()))
+                })
                 .map(|(k, v)| Ok((String::from_utf8(k.clone()).map_err(err("record key"))?, parse(v)?)))
                 .collect()
         }
@@ -484,6 +504,7 @@ impl Agent {
             provider,
             device,
             groups: records(&stores.groups, true)?,
+            archive: stores.groups.get(archive::KEY).map(|v| archive::parse_record(v)).transpose()?,
             servers,
             epochs: records(&stores.epochs, false)?,
             outbox: records(&stores.outbox, false)?,
@@ -577,6 +598,9 @@ impl Agent {
         }
         let mut groups = records(&self.groups);
         groups.insert(b"@device".to_vec(), json(&self.device));
+        if let Some(archive) = &self.archive {
+            groups.insert(archive::KEY.to_vec(), json(archive));
+        }
         for (server, record) in &self.servers {
             groups.insert(format!("{server}{}", owner::SUFFIX).into_bytes(), json(record));
         }
@@ -853,7 +877,7 @@ impl Agent {
         let epoch = group.epoch().as_u64();
         self.epochs.insert(
             epoch_key(key, epoch),
-            EpochRecord::Derived { key: exported.try_into().map_err(err("exporter length"))? },
+            EpochRecord::Derived { key: exported.try_into().map_err(err("exporter length"))?, archived: false },
         );
         let record = self.groups.get_mut(key).ok_or(Invalid("group record"))?;
         for (_, leaf) in group.public_group().treesync().full_leaves() {
@@ -1795,11 +1819,12 @@ impl Agent {
                 .find(|c| c.device_key() == chunk.header.sender_device_key)
                 .ok_or(Invalid("history sender is not a member"))?;
             for (epoch, value) in chunk.open(&a.device.hpke_private).map_err(err("history open"))? {
-                let record = a
-                    .epochs
-                    .entry(epoch_key(&key, epoch))
-                    .or_insert_with(|| EpochRecord::Imported { key: value, sender_uids: BTreeSet::new() });
-                if let EpochRecord::Imported { key, sender_uids } = record {
+                let record = a.epochs.entry(epoch_key(&key, epoch)).or_insert_with(|| EpochRecord::Imported {
+                    key: value,
+                    sender_uids: BTreeSet::new(),
+                    archived: false,
+                });
+                if let EpochRecord::Imported { key, sender_uids, .. } = record {
                     if *key != value {
                         *record = EpochRecord::Conflicted;
                     } else {
