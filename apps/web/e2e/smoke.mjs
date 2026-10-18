@@ -1247,7 +1247,7 @@ async function main() {
     await item.getByText("0 of 1 uses").waitFor();
     await item.getByRole("button", { name: "Copy link" }).click();
     inviteLink = await a.evaluate(() => navigator.clipboard.readText());
-    const expected = new RegExp(`^${escapeRe(new URL(WEB_URL).origin)}/\\?server=${escapeRe(encodeURIComponent(CLIENT_ADDR))}&invite=[\\w-]+&server_key=[\\w-]{43}$`);
+    const expected = new RegExp(`^${escapeRe(new URL(WEB_URL).origin)}/\\?server=${escapeRe(encodeURIComponent(CLIENT_ADDR))}&invite=[\\w-]+&server_key=[\\w-]{43}&owner=[\\w-]{27}$`);
     if (!expected.test(inviteLink)) throw new Error(`unexpected invite link ${inviteLink}`);
     // The web app (Vite) and the server are different origins here, so the link has to name the server.
     const link = new URL(inviteLink);
