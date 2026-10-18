@@ -2738,8 +2738,10 @@ newline).
 ### Manifests
 
 A generation is created by one current device of the account as a
-**manifest**: three netstrings — the statement, the creator's device
-signature over it, and the body.
+**manifest**: four netstrings — the statement, the creator's device
+signature over it, the creator's **device certificate** (its `gwar device
+v1` statement and account signature, the one current when it created the
+manifest), and the body.
 
 ```text
 gwar archive manifest v1
@@ -2749,7 +2751,8 @@ gwar archive manifest v1
 {creator_device_key}
 {recipients}             sorted, comma-separated device_key:x25519_public pairs
 {recovery_version}       the recovery key version it is sealed to, - without a code
-{revocations_hash}       b64url(SHA256(the body's revocations netstring))
+{certificate_hash}       b64url(SHA256(the certificate netstring's bytes))
+{body_hash}              b64url(SHA256(the body's bytes)): revocations and every sealed key
 {created_at}
 ```
 
@@ -2764,12 +2767,14 @@ and `aad = statement`).
 Readers accept a manifest only if:
 
 - it parses canonically, its signature verifies under `creator_device_key`,
-  and the creator held a device certificate of the account current at
-  `created_at` (the certificate is the one in the creator's device statement
-  set; see the API);
+  the embedded certificate hashes to `certificate_hash`, is signed by the
+  account key, names `creator_device_key` and covers `created_at`, and no
+  revocation the reader knows revoked the creator before `created_at`;
 - every recipient's x25519 key matches its device's archive key statement,
   the creator is a recipient, at most 64 recipients;
-- the revocations verify and hash to `revocations_hash`;
+- the body hashes to `body_hash` (so neither the revocations nor any sealed
+  key can be swapped: the signature commits to every ciphertext), and the
+  revocations verify;
 - `previous_hash` names the manifest the reader holds for `generation − 1`
   (a reader that does not hold it fetches the chain from generation 1).
 
@@ -2808,9 +2813,12 @@ generation + "\n" + record_id`. The plaintext is canonical JSON
 "<b64url 32 bytes>"}` (at most 512 bytes). Context and key are only inside
 the encryption.
 
-- A device uploads every epoch key it **derived** itself (MLS exporter), in
-  every conversation kind, once per `(server, group, epoch)`. Keys it only
-  imported (history bundles, the archive) are not uploaded again.
+- A device uploads every epoch key it holds that the archive may lack: those
+  it **derived** (MLS exporter) and those it **imported from history
+  bundles**, in every conversation kind, once per `(server, group, epoch)`.
+  It records what it uploaded (durably, with its MLS store) and never
+  uploads keys it imported from the archive itself. A `Conflicted` epoch is
+  not uploaded.
 - **Importing** a record adds an `Imported` epoch key, as a history bundle
   does, attributed to this account's uid; it never overwrites a derived or
   imported key (a different key for the same epoch makes it `Conflicted`, as
@@ -2824,9 +2832,10 @@ the encryption.
 ### Transfers
 
 A **key transfer** gives one generation key to one recipient later: a new
-device, or a new recovery key. Three netstrings: the statement, the sender's
-device signature, and `enc ‖ ciphertext` (HPKE, `info = "gwar archive
-transfer v1\n" + account_key + "\n" + generation`, `aad = statement`).
+device, or a new recovery key. Four netstrings: the statement, the sender's
+device signature, the sender's device certificate current at `created_at`,
+and `enc ‖ ciphertext` (HPKE, `info = "gwar archive transfer v1\n" +
+account_key + "\n" + generation`, `aad = statement`).
 
 ```text
 gwar archive transfer v1
@@ -2835,6 +2844,8 @@ gwar archive transfer v1
 {manifest_hash}
 {sender_device_key}
 {recipient}              device:{device_key}:{x25519_public} or recovery:{version}
+{certificate_hash}       b64url(SHA256(the certificate netstring's bytes))
+{sealed_hash}            b64url(SHA256(enc ‖ ciphertext))
 {created_at}
 ```
 
@@ -2847,15 +2858,33 @@ gwar archive transfer v1
   them, and to a new recovery version (below). Until one is online, a new
   device reads nothing from the archive.
 - A recipient accepts a transfer only for a manifest it accepted (its
-  checkpoint) and from a sender current at `created_at`.
+  checkpoint), whose sealed key hashes to `sealed_hash`, from a sender whose
+  embedded certificate covers `created_at` and who was not revoked before it.
+  The generation key it opens must match the manifest's (a recipient that
+  can also open the manifest compares; otherwise the first opened key for a
+  generation wins and a different one is reported and ignored).
 
 ### Recovery code changes
 
-Changing the recovery code (password and a signed-in device, as today)
-publishes the next recovery version. That device then sends transfers of
-every generation it can open to the new version and creates a new
-generation sealed to it. Generations it cannot open are reported: "History
-before {date} can't be restored with the new recovery code." Restoring with
+Changing the recovery code (password and a signed-in device, as today) is a
+staged, resumable rotation on that device:
+
+1. With the account key decrypted, it derives the new recovery archive key
+   from the new code, signs the next version's statement, and stores the
+   signed statement and the public key (never the code) as a **pending
+   rotation** in its MLS store.
+2. It updates the recovery credentials (`PUT /v1/account/recovery`). If that
+   fails, the pending rotation is discarded.
+3. It publishes the statement (`PUT /v1/archive/recovery`), sends transfers
+   of every generation it can open to the new version, and creates a new
+   generation sealed to it; then the rotation is complete.
+
+After a crash, a pending rotation whose credential update succeeded (the
+device checks `GET /v1/account` credential version) resumes at step 3
+without the password; one whose update did not happen is discarded. The
+interface reports the change only when step 3 is done, and generations the
+device could not open: "History before {date} can't be restored with the
+new recovery code." Restoring with
 the recovery code (`POST /v1/recover`) derives the recovery archive key,
 fetches the manifests and transfers for the newest version it can derive
 and opens every generation sealed to it.
