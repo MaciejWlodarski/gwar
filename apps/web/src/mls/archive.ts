@@ -7,7 +7,6 @@
  * operations; Connect is reached between them, so messaging never waits for it.
  */
 import { ConnectApiError, type ArchiveDevice, type ArchiveStatement } from "../connect/api";
-import { recoveryVersion } from "../connect/archive";
 import { decodeBase64Url, encodeBase64Url } from "../net/base64url";
 import { jobChange, type Engine } from "./engine";
 import type { ArchiveJob, ArchiveState, ArchiveUpload } from "./types";
@@ -24,14 +23,16 @@ export interface ArchiveConnect {
   archiveRecords(token: string, after: number): Promise<{ records: { cursor: number; generation: number; record_id: string; data: string }[]; next: number | null }>;
   postArchiveTransfer(token: string, transfer: string): Promise<void>;
   archiveTransfers(token: string, after: number): Promise<{ transfers: { cursor: number; transfer: string }[]; next: number | null }>;
+  challenge(token: string, purpose: "recovery"): Promise<{ credential_version: number }>;
 }
 
 /** This device's Connect session, as its stored record has it now. */
 export interface ArchiveSession {
   token: string;
   accountKey: string;
-  /** A recovery archive key statement to publish (`ConnectRecord.archiveRecovery`). */
-  recovery?: ArchiveStatement;
+  /** A recovery archive key statement to publish, with the recovery credential version its code
+   * holds (`ConnectRecord.archiveRecovery`). */
+  recovery?: ArchiveStatement & { credential: number };
   /** The recovery archive key after a recovery-code sign-in (`ConnectRecord.archiveRecoverySecret`). */
   recoverySecret?: string;
 }
@@ -127,14 +128,19 @@ export class KeyArchive {
   }
 
   /** Publishes a recovery archive key the account signed (at sign-up, or after Connect took a new
-   * code); a newer version on Connect replaced it. */
-  private async publishRecovery(token: string, recovery: ArchiveStatement): Promise<void> {
+   * code) while its code is the current one: the recovery credentials are still at the version that
+   * change left. Otherwise it is dropped (a missing key is safe; a key for a code nobody holds is
+   * not). If another key took its version, it stays for the next flow with the password, which
+   * signs it at the next version. */
+  private async publishRecovery(token: string, recovery: ArchiveStatement & { credential: number }): Promise<void> {
     const key = { statement: recovery.statement, signature: recovery.signature };
+    const { credential_version } = await this.o.api.challenge(token, "recovery");
+    if (credential_version !== recovery.credential) { await this.o.used({ recovery: key }); return; }
     try { await this.o.api.putArchiveRecovery(token, key); }
     catch (error) {
       if (!conflict(error)) throw error;
-      const newest = Math.max(0, ...(await this.o.api.archiveRecovery(token)).map(k => recoveryVersion(k.statement)));
-      if (newest < recoveryVersion(key.statement)) throw error;
+      const newest = (await this.o.api.archiveRecovery(token)).at(-1);
+      if (newest?.statement !== key.statement) return;
     }
     await this.o.used({ recovery: key });
   }

@@ -830,7 +830,10 @@ async fn the_key_archive_keeps_signed_statements_first_manifests_records_and_tra
     assert_eq!(api.put("/archive/recovery", Some(&token), recovery(1)).await.0, 200);
     assert_eq!(api.put("/archive/recovery", Some(&token), recovery(1)).await.0, 200, "idempotent");
     assert_eq!(api.put("/archive/recovery", Some(&token), recovery(2)).await.0, 200);
-    assert_eq!(api.get("/archive/recovery", Some(&token)).await.1["keys"].as_array().unwrap().len(), 2);
+    // Only the newest is listed (readers need the current one).
+    let keys = api.get("/archive/recovery", Some(&token)).await.1["keys"].clone();
+    assert_eq!(keys.as_array().unwrap().len(), 1);
+    assert_eq!(keys[0]["statement"], recovery(2)["statement"]);
 
     // The first manifest of a generation wins.
     let mut cert = vc_proto::DeviceCertificate {

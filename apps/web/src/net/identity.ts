@@ -83,9 +83,10 @@ export interface ConnectRecord {
   /**
    * A recovery archive key statement to publish (docs/e2e-build.md, section 7): signed at
    * sign-up, or by a recovery code change once Connect took the new code; the key archive
-   * publishes it.
+   * publishes it while the recovery credentials are still at `credential` (the version that
+   * change left), and drops it otherwise.
    */
-  archiveRecovery?: { statement: string; signature: string };
+  archiveRecovery?: { statement: string; signature: string; credential: number };
   /** After a recovery-code sign-in: the recovery archive key (base64url), until the archive opened what it can with it. */
   archiveRecoverySecret?: string;
 }
