@@ -27,7 +27,9 @@ describe("manager list upkeep (6b)", () => {
   it("renews an old, expiring or lapsed list, at most every ten minutes", () => {
     expect(managerUpkeep(input({ view: view({ list_signed_at: NOW - 61 * DAY }) })).kind).toBe("publish");
     expect(managerUpkeep(input({ view: view({ list_signer_expires_at: NOW + 3 * DAY }) })).kind).toBe("publish");
-    expect(managerUpkeep(input({ current: false }))).toEqual({ kind: "publish", managers: ["m1", "m2"], renewal: true, consumed: [] });
+    expect(managerUpkeep(input({ current: false }))).toEqual({ kind: "publish", managers: null, renewal: true, consumed: [] });
+    // Not current: no change is made against this device's possibly older checkpoint.
+    expect(managerUpkeep(input({ current: false, lastRenewal: NOW - 60_000, server: { anchor: "A", list: "L", pending: [], stale: ["m2"] } }))).toEqual({ kind: "none" });
     expect(managerUpkeep(input({ current: false, lastRenewal: NOW - 60_000 }))).toEqual({ kind: "none" });
   });
   it("does not renew for expiry with a device that expires as soon", () => {

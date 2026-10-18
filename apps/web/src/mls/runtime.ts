@@ -250,6 +250,8 @@ export class MlsRuntime {
    * (docs/e2e-build.md, section 6, 6b). `owner` undefined re-checks only the managers.
    * Checks run one after another.
    */
+  /** A managers-only check from `sync` is queued (coalesces bursts of events). */
+  private managersRecheck = false;
   private checkOwner(owner: OwnerInfo | null | undefined): void {
     const generation = this.generation;
     this.ownerChecks = this.ownerChecks
@@ -302,8 +304,8 @@ export class MlsRuntime {
   }
   /** The next confirmer anchor's statement, for the owner's account key to sign. */
   nextAnchor(confirmers: string[]): Promise<string> {
-    const server = this.server;
-    return this.engine.run(async () => this.engine.withAgent(a => a.next_anchor!(server, confirmers, this.now())));
+    const server = this.server, shown = this.serverAnchor();
+    return this.engine.run(async () => this.engine.withAgent(a => a.next_anchor!(server, confirmers, this.now(), shown)));
   }
   /** The statement moving ownership to `newOwner`, for the owner's account key to sign. */
   transferStatement(accountKey: string, newOwner: string): Promise<string> {
@@ -315,13 +317,14 @@ export class MlsRuntime {
   }
   /**
    * Signs the next manager list with this device and installs it with `anchor` (a newly signed
-   * anchor envelope) or the server's current anchor.
+   * anchor envelope) or the server's current anchor. `managers` null renews: the agent keeps the
+   * server's list when it verifies, else the accepted one, and refuses when there is neither.
    */
-  async publishManagers(managers: string[], anchor?: Uint8Array): Promise<void> {
-    const server = this.server, under = anchor ?? this.serverAnchor();
+  async publishManagers(managers: string[] | null, anchor?: Uint8Array): Promise<void> {
+    const server = this.server, shown = this.serverAnchor(), under = anchor ?? shown;
     if (!under) throw new Error("no confirmer anchor yet");
     const floor = this.managers?.list ? decodeBase64Url(this.managers.list) : undefined;
-    const list = await this.engine.run(async () => this.engine.withAgent(a => a.sign_manager_list!(a.next_list!(server, under, managers, this.now(), floor))));
+    const list = await this.engine.run(async () => this.engine.withAgent(a => a.sign_manager_list!(a.next_list!(server, under, managers ?? undefined, this.now(), shown, floor))));
     await this.request("managers.update", { anchor: encodeBase64Url(under), list: encodeBase64Url(list) }, undefined, this.generation);
   }
   private async acceptManagers(): Promise<void> {
@@ -378,6 +381,12 @@ export class MlsRuntime {
   sync(): Promise<void> {
     // Revocation refreshes and membership events reach voice gates at once.
     for (const call of this.calls) call.recheck();
+    // ... and the manager pair: a revoked or expired signer makes it no longer current (6b).
+    if (this.managers?.anchor && !this.managersRecheck) {
+      this.managersRecheck = true;
+      this.checkOwner(undefined);
+      void this.ownerChecks.then(() => { this.managersRecheck = false; });
+    }
     if (this.syncing) { this.dirty = true; return this.syncing; }
     let failed = false;
     this.syncing = this.engine.run(async () => {

@@ -322,20 +322,35 @@ impl Agent {
         output(self.inner.owner_view(server).map_err(error)?)
     }
     /// The next confirmer anchor's statement, for the owner's account key to sign.
-    pub fn next_anchor(&self, server: &str, confirmers: Vec<String>, signed_at: f64) -> Result<String, JsValue> {
-        self.inner.next_anchor(server, &confirmers, signed_at as i64).map_err(error)
+    pub fn next_anchor(
+        &self,
+        server: &str,
+        confirmers: Vec<String>,
+        signed_at: f64,
+        server_anchor: Option<Vec<u8>>,
+    ) -> Result<String, JsValue> {
+        self.inner.next_anchor(server, &confirmers, signed_at as i64, server_anchor.as_deref()).map_err(error)
     }
     /// The next manager list's statement, under `anchor` or the accepted anchor.
+    /// `managers` `None` renews the server's (verified) or the accepted list.
     pub fn next_list(
         &self,
         server: &str,
         anchor: Option<Vec<u8>>,
-        managers: Vec<String>,
+        managers: Option<Vec<String>>,
         signed_at: f64,
+        server_anchor: Option<Vec<u8>>,
         server_list: Option<Vec<u8>>,
     ) -> Result<String, JsValue> {
         self.inner
-            .next_list(server, anchor.as_deref(), &managers, signed_at as i64, server_list.as_deref())
+            .next_list(
+                server,
+                anchor.as_deref(),
+                managers.as_deref(),
+                signed_at as i64,
+                server_anchor.as_deref(),
+                server_list.as_deref(),
+            )
             .map_err(error)
     }
     /// The statement of a link moving ownership, for the owner's account key to sign.

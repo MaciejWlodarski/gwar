@@ -6,8 +6,9 @@ const DAY = 86_400_000;
 /** What the owner's or a confirmer's client should do about the manager list now. */
 export type Upkeep =
   | { kind: "none" }
-  /** Sign and install a list with `managers`; `consumed` are approvals used up by it. */
-  | { kind: "publish"; managers: string[]; renewal: boolean; consumed: string[] }
+  /** Sign and install a list with `managers` (null: renew the server's verified list);
+   * `consumed` are approvals used up by it. */
+  | { kind: "publish"; managers: string[] | null; renewal: boolean; consumed: string[] }
   /** The owner removes confirmers who lost `channel_edit` with a new anchor (`keep` remain). */
   | { kind: "staleConfirmers"; keep: string[]; stale: string[] }
   /** Ask "Allow @name to manage private channels?". */
@@ -47,6 +48,10 @@ export function managerUpkeep(i: UpkeepInput): Upkeep {
     return { kind: "staleConfirmers", keep: view.confirmers.filter((c) => !staleConfirmers.includes(c)), stale: staleConfirmers };
   }
   if (!server.anchor) return { kind: "none" };
+  // A pair that is no longer current is renewed first, keeping the server's verified membership:
+  // this device's own checkpoint may be older (changes are made against a current list only).
+  const renewable = i.now - i.lastRenewal > 10 * 60_000;
+  if (!i.current) return renewable ? { kind: "publish", managers: null, renewal: true, consumed: [] } : { kind: "none" };
   const stale = view.managers.filter((m) => server.stale.includes(m));
   const mine = server.pending.filter((u) => i.granted.has(u));
   if (stale.length || mine.length) {
@@ -56,8 +61,8 @@ export function managerUpkeep(i: UpkeepInput): Upkeep {
   // re-signing could not make the list last longer.
   const old = view.list_signed_at !== null && i.now - view.list_signed_at > 60 * DAY;
   const expiring = view.list_signer_expires_at !== null && view.list_signer_expires_at - i.now < 7 * DAY && i.ownExpiry - i.now >= 7 * DAY;
-  if ((old || expiring || !i.current) && i.now - i.lastRenewal > 10 * 60_000) {
-    return { kind: "publish", managers: view.managers, renewal: true, consumed: [] };
+  if ((old || expiring) && renewable) {
+    return { kind: "publish", managers: null, renewal: true, consumed: [] };
   }
   const ask = server.pending.find((u) => !i.asked.has(u));
   return ask ? { kind: "ask", uid: ask } : { kind: "none" };

@@ -24,10 +24,12 @@ export function OwnershipTab() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const name = (uid: string) => members[uid]?.nickname ?? `${uid.slice(0, 8)}…`;
-  const people = useMemo(
-    () => Object.values(members).filter((m) => !m.uid.startsWith("ts:") && m.uid !== view?.owner).sort((a, b) => a.nickname.localeCompare(b.nickname)),
-    [members, view?.owner],
-  );
+  // Members, and confirmers no longer listed as members (removed people), so the owner can drop them.
+  const people = useMemo(() => {
+    const listed = Object.values(members).filter((m) => !m.uid.startsWith("ts:") && m.uid !== view?.owner);
+    const gone = (view?.confirmers ?? []).filter((u) => !members[u]).map((uid) => ({ uid, nickname: `${uid.slice(0, 8)}…` }));
+    return [...listed, ...gone].sort((a, b) => a.nickname.localeCompare(b.nickname));
+  }, [members, view?.owner, view?.confirmers]);
 
   if (!claimed) return <p className="text-sm text-muted">{t("own.none")}</p>;
   if (!view) return <p className="text-sm text-muted">{t("own.verifying")}</p>;

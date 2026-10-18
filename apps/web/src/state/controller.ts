@@ -1253,12 +1253,12 @@ class Controller {
   }
 
   async setMemberGroups(uid: string, groups: number[]) {
-    const conn = this.conn;
+    const conn = this.conn, state = useSession.getState();
+    const edits = (ids: readonly number[]) => ids.some((g) => g === 1 || state.groups[g]?.permissions.includes("channel_edit"));
+    const before = edits(state.members[uid]?.groups ?? []);
     const result = await this.connection.request("member.groups", { uid, groups });
-    // Whoever I just gave `channel_edit` on this connection becomes a manager without asking me
-    // again (6b): only a successful grant that carries the permission counts.
-    const defs = useSession.getState().groups;
-    if (this.conn === conn && groups.some((g) => g === 1 || defs[g]?.permissions.includes("channel_edit"))) this.grantedByMe.add(uid);
+    // Whoever this very edit gave `channel_edit` becomes a manager without asking me again (6b).
+    if (this.conn === conn && !before && edits(groups)) this.grantedByMe.add(uid);
     return result;
   }
 
