@@ -210,6 +210,11 @@ pub struct GroupRecord {
     /// before the removal, which it must not rejoin.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub removed: bool,
+    /// The access lists of the commit that removed this device from a private channel's group,
+    /// validated as history: recorded as the checkpoint once they are current under the newest
+    /// pair this device accepted ([`Agent::observe_access`]), so it cannot rejoin under older ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removal_access: Option<Vec<u8>>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -504,6 +509,9 @@ impl Agent {
             }
             if !valid_evidence(&record.evidence) {
                 return Err(Invalid("stored evidence"));
+            }
+            if record.removal_access.as_ref().is_some_and(|a| crate::access::Access::parse(a).is_none()) {
+                return Err(Invalid("stored removal access"));
             }
             if matches!(record.status, Status::Creating | Status::Active | Status::Joining) {
                 let group = agent.mls(key)?;
@@ -808,9 +816,11 @@ impl Agent {
             own_commit_at: None,
             access: None,
             removed: false,
+            removal_access: None,
         });
         record.status = status;
         record.removed = false;
+        record.removal_access = None;
         record.server_pending = false;
         key
     }
@@ -1261,7 +1271,11 @@ impl Agent {
             // removes only the current epoch's key pairs, and an eviction merge
             // advances the public epoch without deleting the old private keys.
             group.delete(self.provider.storage()).map_err(err("delete group"))?;
-            self.groups.get_mut(key).ok_or(Invalid("record"))?.status = Status::Removed;
+            let access =
+                staged.group_context().extensions().unknown(crate::access::ACCESS_EXTENSION).map(|ext| ext.0.clone());
+            let record = self.groups.get_mut(key).ok_or(Invalid("record"))?;
+            record.status = Status::Removed;
+            record.removal_access = access;
         } else {
             self.fresh(key, staged.group_context())?;
             group.merge_staged_commit(&self.provider, *staged).map_err(err("merge commit"))?;
@@ -1429,6 +1443,7 @@ impl Agent {
                     own_commit_at: None,
                     access: None,
                     removed: false,
+                    removal_access: None,
                 });
             }
             let live = chain.last().expect("checked above");

@@ -75,6 +75,8 @@ export interface GroupSummary {
     access?: { generation: number; seq: number; hash: string };
     /** A tombstone of a group this device was removed from. */
     removed?: boolean;
+    /** The lists of the commit that removed this device, until recorded as the checkpoint. */
+    removal_access?: number[];
   };
   members: { leaf: number; device_key: string; uid: string }[];
 }

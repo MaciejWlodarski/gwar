@@ -483,7 +483,8 @@ export class MlsRuntime {
   /** At the start of every pass, before any replay: records access an interrupted pass, or a
    * manager pair accepted since, left unobserved. */
   private async observePrivateGroups(): Promise<void> {
-    for (const g of this.inventory()) if (g.private && g.record.status === "active") await this.observeAccess(encoded(g.group));
+    // Also a removal's lists, until they are recorded (they may wait for a manager pair).
+    for (const g of this.inventory()) if (g.private && (g.record.status === "active" || g.record.removal_access)) await this.observeAccess(encoded(g.group));
   }
   /** After every transition of a private channel's group, before the next one: records a member
    * list current on first sight as the newest accepted, so a later commit cannot roll it back. */

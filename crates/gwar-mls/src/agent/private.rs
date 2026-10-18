@@ -244,7 +244,15 @@ impl Agent {
         self.operation(|a| {
             super::current_time(now)?;
             let key = group_key(server, id);
-            if a.groups.get(&key).is_none_or(|r| r.status != Status::Active) {
+            let Some(record) = a.groups.get(&key) else { return Ok(None) };
+            if record.status != Status::Active {
+                // A removal's lists, once current under the accepted pair, still raise the checkpoint.
+                if let Some(bytes) = record.removal_access.clone() {
+                    let access = Access::parse(&bytes).ok_or(Invalid("removal access"))?;
+                    if a.advance_with(&key, &access, now, revocations)? {
+                        a.groups.get_mut(&key).ok_or(Invalid("record"))?.removal_access = None;
+                    }
+                }
                 return Ok(None);
             }
             let group = a.mls(&key)?;
@@ -265,22 +273,35 @@ impl Agent {
         if !rules::is_private(&descriptor) {
             return Ok(());
         }
-        let server = &descriptor.descriptor.server_key;
-        let Some(server_record) = self.servers.get(server) else { return Ok(()) };
-        let chain = server_record.chain(server)?;
-        let Some((anchor, list)) = server_record.pair()? else { return Ok(()) };
         let access = rules::access(group.public_group().group_context()).ok_or(Invalid("access lists"))?;
+        self.advance_with(key, &access, now, revocations)?;
+        Ok(())
+    }
+
+    /// Records `access`'s member list as the newest accepted when it is newer than the checkpoint,
+    /// carries exactly the newest pair this device accepted, and is current now. Returns whether
+    /// it is (now) the checkpoint or older than it: either way it has nothing more to give.
+    fn advance_with(&mut self, key: &str, access: &Access, now: i64, revocations: &dyn Revocations) -> Result<bool> {
+        let record = self.groups.get(key).ok_or(Invalid("unknown group"))?;
+        let descriptor = SignedDescriptor::parse(&record.descriptor).ok_or(Invalid("descriptor"))?;
+        let server = &descriptor.descriptor.server_key;
+        let Some(server_record) = self.servers.get(server) else { return Ok(false) };
+        let chain = server_record.chain(server)?;
+        let Some((anchor, list)) = server_record.pair()? else { return Ok(false) };
         let members = access.members();
+        if record.access.as_ref().is_some_and(|cp| !cp.before(members)) {
+            return Ok(true);
+        }
         // Only under the newest pair this device accepted: a signer that pair no longer names
         // cannot raise the checkpoint through an older pair still in the group.
-        if record.access.as_ref().is_none_or(|cp| cp.before(members))
-            && access.anchor().hash() == anchor.hash()
+        if access.anchor().hash() == anchor.hash()
             && access.list().hash() == list.hash()
             && access.current(&chain, &descriptor.group_id(), now, revocations)
         {
             self.groups.get_mut(key).ok_or(Invalid("record"))?.access = Some(AccessCheckpoint::of(members));
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Commits new access lists to a private group: with `members`, a member list signed by this

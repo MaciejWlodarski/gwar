@@ -223,6 +223,12 @@ fn a_removed_member_cannot_rejoin_the_removed_epoch_from_a_tombstone() {
     p.observer = p.observer.commit(&out.commit, &out.group_info, None, p.t, p.t).unwrap().0;
     p.member.receive(&server(), &p.id, &out.commit, &[]).unwrap();
     p.member.take_changes();
+    // The removing commit's lists still become the checkpoint: no rejoin under the older list.
+    assert!(p.member.group(&server(), &p.id).unwrap().removal_access.is_some());
+    assert_eq!(p.member.observe_access(&server(), &p.id, p.t, &()).unwrap(), None);
+    p.member.take_changes();
+    let record = p.member.group(&server(), &p.id).unwrap();
+    assert_eq!((record.access.as_ref().map(|c| c.seq), record.removal_access.is_none()), (Some(2), true));
     p.member.forget(&server(), &p.id).unwrap();
     p.member.take_changes();
     assert!(p.member.group(&server(), &p.id).unwrap().removed);
