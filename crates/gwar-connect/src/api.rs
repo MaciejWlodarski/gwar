@@ -25,6 +25,8 @@ use crate::{
     store::{Account, Certificate, Challenge, Credentials, Kdf, NewAccount, Store},
 };
 
+pub mod archive;
+
 const SESSION_MS: i64 = 90 * 24 * 3600 * 1000;
 const CHALLENGE_MS: i64 = 5 * 60 * 1000;
 const MAX_DEVICE_NAME: usize = 64;

@@ -791,3 +791,86 @@ fn client_integrity_vectors() {
         assert_eq!(b64(&account.sign(statement.as_bytes()).to_bytes()), v[format!("{purpose}_signature")]);
     }
 }
+
+/// The key archive (docs/e2e-build.md, section 7): Connect keeps what devices sign, the first
+/// manifest per generation, records under existing generations, transfers; nothing it holds
+/// opens anything.
+#[tokio::test]
+async fn the_key_archive_keeps_signed_statements_first_manifests_records_and_transfers() {
+    use gwar_mls::archive::{DeviceArchiveKey, Manifest, Recipient, RecoveryArchiveKey, Transfer, TransferRecipient};
+    let api = Api::start().await;
+    let account = SigningKey::from_bytes(&rand::random());
+    let laptop = SigningKey::from_bytes(&rand::random());
+    let token = api.register("ada", "pw", &account, &laptop, &rand::random()).await;
+    let account_key = b64(account.verifying_key().as_bytes());
+    let now = gwar_connect::api::now_ms();
+
+    // The device's archive key, once, signed by the device itself.
+    let (secret, public) = gwar_mls::archive::device_key_pair().unwrap();
+    let key = DeviceArchiveKey::sign(&account_key, &laptop, public, now);
+    let body = json!({"statement": key.statement(), "signature": key.signature});
+    assert_eq!(api.put("/archive/device", Some(&token), body.clone()).await.0, 200);
+    assert_eq!(api.put("/archive/device", Some(&token), body).await.0, 409);
+    let other = SigningKey::from_bytes(&rand::random());
+    let forged = DeviceArchiveKey::sign(&account_key, &other, public, now);
+    let (status, _) = api
+        .put("/archive/device", Some(&token), json!({"statement": forged.statement(), "signature": forged.signature}))
+        .await;
+    assert_eq!(status, 400, "another device's key");
+    let (_, devices) = api.get("/archive/devices", Some(&token)).await;
+    assert_eq!(devices["devices"].as_array().unwrap().len(), 1);
+    assert!(devices["devices"][0]["certificate"]["signature"].is_string());
+
+    // Recovery versions rise by one; the newest again is accepted.
+    let recovery = |version| {
+        let k = RecoveryArchiveKey::sign(&account, version, [version as u8; 32], now);
+        json!({"statement": k.statement(), "signature": k.signature})
+    };
+    assert_eq!(api.put("/archive/recovery", Some(&token), recovery(2)).await.0, 409);
+    assert_eq!(api.put("/archive/recovery", Some(&token), recovery(1)).await.0, 200);
+    assert_eq!(api.put("/archive/recovery", Some(&token), recovery(1)).await.0, 200, "idempotent");
+    assert_eq!(api.put("/archive/recovery", Some(&token), recovery(2)).await.0, 200);
+    assert_eq!(api.get("/archive/recovery", Some(&token)).await.1["keys"].as_array().unwrap().len(), 2);
+
+    // The first manifest of a generation wins.
+    let mut cert = vc_proto::DeviceCertificate {
+        account_key: account_key.clone(),
+        device_key: b64(laptop.verifying_key().as_bytes()),
+        issued_at: now - 1000,
+        expires_at: now + 86_400_000,
+        signature: String::new(),
+    };
+    cert.signature = b64(&account.sign(vc_proto::device_statement(&cert).as_bytes()).to_bytes());
+    let me = Recipient { device_key: cert.device_key.clone(), x25519: public };
+    let (manifest, generation_key) = Manifest::create(1, None, &laptop, &cert, &[me.clone()], None, &[], now).unwrap();
+    let encoded = b64(&manifest);
+    assert_eq!(api.post("/archive/manifests", Some(&token), json!({"manifest": encoded})).await.0, 200);
+    let (again, _) = Manifest::create(1, None, &laptop, &cert, &[me], None, &[], now).unwrap();
+    assert_eq!(api.post("/archive/manifests", Some(&token), json!({"manifest": b64(&again)})).await.0, 409);
+    let (_, list) = api.get("/archive/manifests?after=0", Some(&token)).await;
+    assert_eq!(list["manifests"][0]["manifest"], encoded);
+    let parsed = Manifest::parse(&manifest, &account_key).unwrap();
+    assert_eq!(parsed.open(gwar_mls::archive::Seat::Device(&cert.device_key), &secret).unwrap(), generation_key);
+
+    // Records under existing generations only; ids are idempotent; a cursor pages.
+    let record =
+        |generation: i64, id: u8| json!({"generation": generation, "record_id": b64(&[id; 16]), "data": b64(&[7; 60])});
+    assert_eq!(api.post("/archive/records", Some(&token), json!({"records": [record(2, 1)]})).await.0, 400);
+    assert_eq!(
+        api.post("/archive/records", Some(&token), json!({"records": [record(1, 1), record(1, 2)]})).await.0,
+        200
+    );
+    assert_eq!(api.post("/archive/records", Some(&token), json!({"records": [record(1, 2)]})).await.0, 200);
+    let (_, records) = api.get("/archive/records?after=0", Some(&token)).await;
+    assert_eq!(records["records"].as_array().unwrap().len(), 2);
+    let first = records["records"][0]["cursor"].as_i64().unwrap();
+    let (_, rest) = api.get(&format!("/archive/records?after={first}"), Some(&token)).await;
+    assert_eq!(rest["records"].as_array().unwrap().len(), 1);
+
+    // A transfer this device signed.
+    let phone = gwar_mls::archive::device_key_pair().unwrap();
+    let to = TransferRecipient::Device { device_key: b64(&[9; 32]), x25519: phone.1 };
+    let transfer = Transfer::create(&parsed, &generation_key, &laptop, &cert, to, &phone.1, now).unwrap();
+    assert_eq!(api.post("/archive/transfers", Some(&token), json!({"transfer": b64(&transfer)})).await.0, 200);
+    assert_eq!(api.get("/archive/transfers?after=0", Some(&token)).await.1["transfers"].as_array().unwrap().len(), 1);
+}
