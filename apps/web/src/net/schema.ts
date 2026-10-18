@@ -29,6 +29,8 @@ import { decodeFixed } from "./handshake";
 import type { ServerInfo } from "../proto/ServerInfo";
 import type { Unread } from "../proto/Unread";
 import type { Welcome } from "../proto/Welcome";
+import type { Managers } from "../proto/Managers";
+import type { OwnerInfo } from "../proto/OwnerInfo";
 import type { EventData, EventName, Op, ResponseMap } from "./protocol";
 import { filePath } from "./address";
 import { MAX_FILE_BYTES } from "../platform/download";
@@ -83,7 +85,11 @@ const member = shape<Member>({ uid, nickname: str(256), tag: str(128), connect: 
 const unread = shape<Unread>({ channel: id, last_read: id, count: int(1000000), mentions: int(1000000) });
 const conversationUnread = shape<ConversationUnread>({ conversation: str(128), last_read: id, count: int(100) });
 const ice = shape<IceServer>({ urls: array(str(2048), 16), username: optional(nullable(str(1024))), credential: optional(nullable(str(1024))) });
-const welcome = shape<Welcome>({ session: id, uid, server, permissions: array(permissions, 32), groups: array(group, 128), channels: array(channel, 1024), clients: array(client, 4096), members: array(member, 10000), unread: array(unread, 1024), conversations: array(conversationUnread, 10000), ice_servers: array(ice, 32), file_access: bearer });
+// The owner chain and the managers of private channels (docs/e2e-build.md, section 6, 6b).
+const ownerInfo = shape<OwnerInfo>({ uid: fixed(20), generation: int(Number.MAX_SAFE_INTEGER, 1), seq: id, head: fixed(32) });
+const envelope = str(32768);
+const managers = shape<Managers>({ anchor: nullable(envelope), list: nullable(envelope), pending: array(uid, 10000), stale: array(uid, 10000) });
+const welcome = shape<Welcome>({ session: id, uid, server, permissions: array(permissions, 32), groups: array(group, 128), channels: array(channel, 1024), clients: array(client, 4096), members: array(member, 10000), unread: array(unread, 1024), conversations: array(conversationUnread, 10000), ice_servers: array(ice, 32), file_access: bearer, owner: optional(nullable(ownerInfo)), managers: optional(nullable(managers)) });
 const target: Rule<ChatTarget> = (v): v is ChatTarget => v === "server" || shape<{ channel: number }>({ channel: id })(v) || shape<{ client: number }>({ client: id })(v);
 const certificate = shape<DeviceCertificate>({ account_key: fixed(32), device_key: fixed(32), issued_at: id, expires_at: id, signature: fixed(64) });
 const commitment: Rule<string> = (v): v is string => v === "-" || fixed(32)(v);
@@ -125,7 +131,7 @@ export const events: { [K in EventName]: Rule<EventData<K>> } = {
 
   "chat.sealed": sealedMessage, "chat.sealed.removed": shape({ conversation, ids: array(id, 1000) }),
   challenge, "server.updated": server, "channel.created": channel, "channel.updated": channel,
-  "channel.deleted": shape({ channel: id }), "channel.hidden": shape({ channel: id }), "client.joined": client, "client.updated": client,
+  "channel.deleted": shape({ channel: id }), "channel.hidden": shape({ channel: id }), "owner.updated": ownerInfo, "managers.updated": managers, "client.joined": client, "client.updated": client,
   "client.left": shape({ client: id, reason: leave }), "chat.message": message, "chat.edited": message,
   "chat.deleted": shape({ channel: id, message: id }), "group.created": group, "group.updated": group,
   "group.deleted": shape({ group: id }), "member.updated": member, "member.removed": shape({ uid }),
@@ -166,6 +172,8 @@ export const responses: { [K in Op]: Rule<ResponseMap[K]> } = {
   "voice.offer": shape({ ...transportFields, sdp: str(65536) }),
   "voice.state": shape({voice:nullable(voiceState)}),
   "voice.epoch.ack": empty, "voice.epoch.repeat": empty,
+  "owner.chain": shape({ genesis: str(1024), links: array(shape({ statement: str(2048), signature: fixed(64) }), 64), next: nullable(id) }),
+  "owner.transfer": empty, "managers.update": empty,
 };
 export const responseFor = (op: Op, value: unknown): boolean => responses[op](value);
 export const anyResponse = (value: unknown): boolean => Object.values(responses).some((rule) => rule(value));

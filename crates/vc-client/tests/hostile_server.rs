@@ -100,6 +100,8 @@ async fn start_with_reply(
             conversations: vec![],
             ice_servers: vec![],
             file_access: String::new(),
+            owner: None,
+            managers: None,
         };
         let mut welcome = serde_json::to_value(welcome).unwrap();
         welcome["clients"] = clients(&me);

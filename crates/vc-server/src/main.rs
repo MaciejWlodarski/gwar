@@ -132,6 +132,21 @@ enum Command {
         #[command(subcommand)]
         command: MembersCommand,
     },
+    /// Set the server's owner (docs/e2e-build.md, section 6). Changes the database directly,
+    /// so the server must be stopped.
+    Owner {
+        #[command(subcommand)]
+        command: OwnerCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum OwnerCommand {
+    /// Make a stored member the owner of a server that has none.
+    Set { uid: String },
+    /// Start a new owner generation for a lost owner account. Clients show a neutral notice
+    /// of a changed owner and ask before accepting it.
+    Reset { uid: String },
 }
 
 #[derive(Subcommand)]
@@ -265,6 +280,21 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         Some(Command::Members { command }) => return members(&cli.data_dir, &database, command),
+        Some(Command::Owner { command }) => {
+            let _lock = vc_server::members::lock_data_dir(&cli.data_dir)?;
+            let store = Store::open(&database)?;
+            match command {
+                OwnerCommand::Set { uid } => {
+                    store.set_owner(&uid)?;
+                    println!("{uid} is the owner (generation 1)");
+                }
+                OwnerCommand::Reset { uid } => {
+                    let generation = store.reset_owner(&uid)?;
+                    println!("{uid} is the owner of the new generation {generation}");
+                }
+            }
+            return Ok(());
+        }
         None => {}
     }
     // Held while the server runs, so `members prune` can tell.

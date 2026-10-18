@@ -594,6 +594,9 @@ fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Option<Out
         }
         Request::Sealed(_) => return Err(refused("encrypted direct messages require a Gwar server")),
         Request::Mls(_) => return Err(refused("MLS requires a Gwar server")),
+        Request::OwnerChain { .. } | Request::OwnerTransfer { .. } | Request::ManagersUpdate { .. } => {
+            return Err(refused("a TeamSpeak server has no Gwar owner"));
+        }
         Request::Hello(_) | Request::Join(_) => return Err(refused("already connected")),
     };
     Ok(Some(cmd))
@@ -670,6 +673,8 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
         conversations: Vec::new(),
         ice_servers: Vec::new(),
         file_access: String::new(),
+        owner: None,
+        managers: None,
     };
 
     let (request_tx, mut requests) = mpsc::channel(64);

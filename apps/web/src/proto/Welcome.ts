@@ -4,26 +4,36 @@ import type { Client } from "./Client";
 import type { ConversationUnread } from "./ConversationUnread";
 import type { Group } from "./Group";
 import type { IceServer } from "./IceServer";
+import type { Managers } from "./Managers";
 import type { Member } from "./Member";
+import type { OwnerInfo } from "./OwnerInfo";
 import type { Permission } from "./Permission";
 import type { ServerInfo } from "./ServerInfo";
 import type { Unread } from "./Unread";
 
-export type Welcome = { session: number, uid: string, server: ServerInfo, permissions: Array<Permission>, groups: Array<Group>, channels: Array<Channel>, clients: Array<Client>,
+export type Welcome = { session: number, uid: string, server: ServerInfo, permissions: Array<Permission>, groups: Array<Group>, channels: Array<Channel>, clients: Array<Client>, 
 /**
  * Known users of this server (online ones are also in `clients`).
  */
-members: Array<Member>,
+members: Array<Member>, 
 /**
  * Read state of every channel this user can read.
  */
-unread: Array<Unread>,
+unread: Array<Unread>, 
 /**
  * Direct messages with unread sealed messages, including offline peers, and
  * every readable encrypted channel and server chat with its read mark.
  */
-conversations: Array<ConversationUnread>, ice_servers: Array<IceServer>,
+conversations: Array<ConversationUnread>, ice_servers: Array<IceServer>, 
 /**
  * Sent as `Authorization: Bearer <token>` with file downloads; valid while this session lasts.
  */
-file_access: string, };
+file_access: string, 
+/**
+ * The server's owner, once it has one (docs/e2e-build.md, section 6, 6b).
+ */
+owner?: OwnerInfo | null, 
+/**
+ * The managers of private channels, once the server has an owner.
+ */
+managers?: Managers | null, };

@@ -306,6 +306,11 @@ total). The server options also have `VC_…` environment variables;
 On first start the server prints a one-time **admin token**; open the web app,
 connect to `voice.example.com` and redeem it from the server menu ("Use
 token"). Get another one with `vc-server --data-dir data admin-token`.
+Whoever redeems that first token becomes the server's **owner**, who decides
+who manages private channels; later admin tokens grant Admin only. With the
+server stopped, `vc-server --data-dir data owner set {uid}` names the owner of
+a server that has none, and `owner reset {uid}` replaces a lost owner account
+(clients ask before accepting the change).
 
 Connections are encrypted by default: plain `ws://` works only to loopback for
 development, or through the desktop app's explicit LAN option (see

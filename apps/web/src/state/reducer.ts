@@ -27,6 +27,8 @@ export const initialState: SessionState = {
   clients: {},
   members: {},
   permissions: [],
+  owner: null,
+  managers: null,
   iceServers: [],
   slots: Array.from({ length: AUDIO_SLOTS }, () => null),
   threads: {},
@@ -397,6 +399,10 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
     case "channel.updated":
       return { ...state, channels: { ...state.channels, [event.d.id]: event.d } };
     // Hidden (no longer admitted to a private channel) looks the same here; only the lifecycle record differs.
+    case "owner.updated":
+      return { ...state, owner: event.d };
+    case "managers.updated":
+      return { ...state, managers: event.d };
     case "channel.hidden":
     case "channel.deleted": {
       const { [event.d.channel]: _gone, ...channels } = state.channels;
@@ -545,6 +551,8 @@ export function reduce(state: SessionState, action: Action): SessionState {
         clients,
         members,
         permissions: w.permissions,
+        owner: w.owner ?? null,
+        managers: w.managers ?? null,
         iceServers: w.ice_servers,
         slots: initialState.slots,
         // Private and plaintext server history survives a resync; encrypted scrollback is reloaded.
