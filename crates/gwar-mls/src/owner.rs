@@ -300,7 +300,7 @@ impl OwnerChain {
     }
 
     /// Owners in whose time the anchor was theirs.
-    fn span_owners(&self, anchor: &SignedAnchor) -> Vec<Uid> {
+    pub(crate) fn span_owners(&self, anchor: &SignedAnchor) -> Vec<Uid> {
         self.span(anchor).map(|span| span.map(|i| self.owner_at_index(i)).collect()).unwrap_or_default()
     }
 
