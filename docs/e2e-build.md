@@ -2047,7 +2047,7 @@ member-list checkpoints and tombstones, current authority, access edits and
 repairs), 6c-2b (voice under a private parent, offers, the runtime's
 repairs), 6c-2c (restarts with staged adoption and pending tips, member-list
 renewal) and the interface (6c-3: creation with a signed member list, editing
-it, the waiting state) are built; the browser e2e of 6c is next. A private
+it, the waiting state) are built, with a browser e2e (`e2e/private.mjs`). A private
 channel is hidden from everyone it does not admit. It can be plaintext or encrypted, chosen at creation as
 today:
 
