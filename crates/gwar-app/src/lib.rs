@@ -26,7 +26,7 @@ use state::{Change, ChatLine, ServerState, ServerView};
 use store::{LastServer, Store, StoreError};
 use tokio::{runtime::Runtime, task::AbortHandle};
 use vc_client::voice::io::AudioIo;
-use voice::{Voice, VoiceStatus};
+use voice::{Controls, Voice, VoiceStatus};
 
 /// The core's own tokio runtime. Dropped without waiting, so the last
 /// reference may go from any thread, a runtime's own included.
@@ -298,8 +298,7 @@ impl GwarApp {
             endpoint,
             voice: Mutex::new(None),
             voice_run: AtomicU64::new(0),
-            muted: AtomicBool::new(false),
-            deafened: AtomicBool::new(false),
+            controls: Mutex::new(Controls::default()),
         }))
     }
 }
@@ -436,8 +435,7 @@ pub struct Session {
     voice: Mutex<Option<Voice>>,
     /// Bumped by every start and stop, so a start that finishes after a stop is dropped.
     voice_run: AtomicU64,
-    muted: AtomicBool,
-    deafened: AtomicBool,
+    controls: Mutex<Controls>,
 }
 
 impl Session {
@@ -483,29 +481,31 @@ impl Session {
                     AppError::Voice { detail: format!("{e:#}") }
                 }
             })?;
+        // Locks in the order `update_controls` takes them: controls, then voice.
+        let controls = self.controls.lock().unwrap();
         let mut voice = self.voice.lock().unwrap();
         // A stop or a newer start came first: this run is stale (dropping it stops it).
         if self.voice_run.load(Ordering::SeqCst) == run {
-            let (muted, deafened) = (self.muted.load(Ordering::SeqCst), self.deafened.load(Ordering::SeqCst));
-            *voice = Some(Voice::new(handle, audio_lost, muted, deafened));
+            *voice = Some(Voice::new(handle, audio_lost, *controls));
         }
         Ok(())
     }
 
     /// Tells the server, so others see it; the local engine already applied it.
     async fn push_mute_state(&self) -> Result<(), AppError> {
-        let update = ClientUpdate {
-            muted: Some(self.muted.load(Ordering::SeqCst)),
-            deafened: Some(self.deafened.load(Ordering::SeqCst)),
-            ..Default::default()
-        };
+        let controls = *self.controls.lock().unwrap();
+        let update =
+            ClientUpdate { muted: Some(controls.muted), deafened: Some(controls.deafened), ..Default::default() };
         self.request(Request::ClientUpdate(update)).await.map(drop)
     }
 
-    fn apply_mute_state(&self) {
+    /// Changes the controls and applies them to the running engine. Takes the
+    /// controls lock, then the voice lock (as `start_voice_with` does).
+    fn update_controls(&self, change: impl FnOnce(&mut Controls)) {
+        let mut controls = self.controls.lock().unwrap();
+        change(&mut controls);
         if let Some(voice) = self.voice.lock().unwrap().as_ref() {
-            voice.set_muted(self.muted.load(Ordering::SeqCst));
-            voice.set_deafened(self.deafened.load(Ordering::SeqCst));
+            voice.apply(*controls);
         }
     }
 
@@ -566,28 +566,40 @@ impl Session {
     }
 
     pub fn muted(&self) -> bool {
-        self.muted.load(Ordering::SeqCst)
+        self.controls.lock().unwrap().muted
     }
 
     pub fn deafened(&self) -> bool {
-        self.deafened.load(Ordering::SeqCst)
+        self.controls.lock().unwrap().deafened
     }
 
     /// Unmuting while deafened also undeafens, like the other Gwar apps.
     pub async fn set_muted(&self, muted: bool) -> Result<(), AppError> {
-        self.muted.store(muted, Ordering::SeqCst);
-        if !muted {
-            self.deafened.store(false, Ordering::SeqCst);
-        }
-        self.apply_mute_state();
+        self.update_controls(|c| {
+            c.muted = muted;
+            c.deafened &= muted;
+        });
         self.push_mute_state().await
     }
 
     /// Deafened also keeps the microphone closed.
     pub async fn set_deafened(&self, deafened: bool) -> Result<(), AppError> {
-        self.deafened.store(deafened, Ordering::SeqCst);
-        self.apply_mute_state();
+        self.update_controls(|c| c.deafened = deafened);
         self.push_mute_state().await
+    }
+
+    /// Push-to-talk: the microphone opens only while [`Session::set_talk_held`] says so.
+    /// Otherwise it opens on voice activity.
+    pub fn set_push_to_talk(&self, enabled: bool) {
+        self.update_controls(|c| {
+            c.push_to_talk = enabled;
+            c.talk_held = false;
+        });
+    }
+
+    /// The push-to-talk button is pressed or released.
+    pub fn set_talk_held(&self, held: bool) {
+        self.update_controls(|c| c.talk_held = held);
     }
 
     /// Marks which channel's chat is on screen (or none); opening one marks it read.

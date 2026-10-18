@@ -87,4 +87,8 @@
     <string name="voice_output_bluetooth">Bluetooth headset</string>
     <string name="voice_output_usb">USB headset</string>
     <string name="voice_output_allow_bluetooth">Allow Bluetooth headsets</string>
+    <string name="voice_more">Voice options</string>
+    <string name="voice_push_to_talk">Push to talk</string>
+    <string name="voice_hold_to_talk">Hold to talk</string>
+    <string name="voice_talking">Talking…</string>
 </resources>

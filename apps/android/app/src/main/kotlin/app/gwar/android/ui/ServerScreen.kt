@@ -1,6 +1,16 @@
 package app.gwar.android.ui
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.height
+import androidx.compose.material.icons.outlined.MoreVert
+import androidx.compose.material3.Checkbox
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -92,6 +102,10 @@ fun ServerScreen(
     deafened: Boolean,
     outputs: List<AudioOutput>,
     output: AudioOutput?,
+    pushToTalk: Boolean,
+    talkHeld: Boolean,
+    onSetPushToTalk: (Boolean) -> Unit,
+    onHoldToTalk: (Boolean) -> Unit,
     onChooseOutput: (OutputKind) -> Unit,
     /** Set when Bluetooth headsets need a permission first. */
     onAllowBluetooth: (() -> Unit)?,
@@ -133,20 +147,25 @@ fun ServerScreen(
         },
         bottomBar = {
             if (myChannel != null) {
-                VoiceBar(
-                    channelName = myChannel.name,
-                    voice = voice,
-                    muted = muted,
-                    deafened = deafened,
-                    reconnecting = reconnecting,
-                    output = output,
-                    outputs = outputs,
-                    onChooseOutput = onChooseOutput,
-                    onAllowBluetooth = onAllowBluetooth,
-                    onToggleMute = onToggleMute,
-                    onToggleDeafen = onToggleDeafen,
-                    onLeave = onLeave,
-                )
+                Column {
+                    if (voice != null && pushToTalk && !reconnecting) TalkButton(talkHeld, onHoldToTalk)
+                    VoiceBar(
+                        channelName = myChannel.name,
+                        voice = voice,
+                        muted = muted,
+                        deafened = deafened,
+                        reconnecting = reconnecting,
+                        output = output,
+                        outputs = outputs,
+                        onChooseOutput = onChooseOutput,
+                        onAllowBluetooth = onAllowBluetooth,
+                        pushToTalk = pushToTalk,
+                        onSetPushToTalk = onSetPushToTalk,
+                        onToggleMute = onToggleMute,
+                        onToggleDeafen = onToggleDeafen,
+                        onLeave = onLeave,
+                    )
+                }
             }
         },
         snackbarHost = { SnackbarHost(snackbar) },
@@ -378,6 +397,8 @@ private fun VoiceBar(
     outputs: List<AudioOutput>,
     onChooseOutput: (OutputKind) -> Unit,
     onAllowBluetooth: (() -> Unit)?,
+    pushToTalk: Boolean,
+    onSetPushToTalk: (Boolean) -> Unit,
     onToggleMute: () -> Unit,
     onToggleDeafen: () -> Unit,
     onLeave: () -> Unit,
@@ -427,6 +448,7 @@ private fun VoiceBar(
                     )
                 }
             }
+            if (voice != null) VoiceOptions(pushToTalk, onSetPushToTalk)
             if (voice != null && output != null) {
                 OutputMenu(output, outputs, onChooseOutput, onAllowBluetooth)
             }
@@ -517,5 +539,69 @@ private fun AudioOutput.label(): String = when (kind) {
     OutputKind.WIRED -> stringResource(R.string.voice_output_wired)
     OutputKind.BLUETOOTH, OutputKind.USB -> name.ifBlank {
         stringResource(if (kind == OutputKind.USB) R.string.voice_output_usb else R.string.voice_output_bluetooth)
+    }
+}
+
+@Composable
+private fun VoiceOptions(pushToTalk: Boolean, onSetPushToTalk: (Boolean) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        IconButton(onClick = { open = true }) {
+            Icon(Icons.Outlined.MoreVert, stringResource(R.string.voice_more))
+        }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            DropdownMenuItem(
+                text = { Text(stringResource(R.string.voice_push_to_talk)) },
+                trailingIcon = { Checkbox(checked = pushToTalk, onCheckedChange = null) },
+                onClick = {
+                    open = false
+                    onSetPushToTalk(!pushToTalk)
+                },
+            )
+        }
+    }
+}
+
+/** Held to open the microphone in push-to-talk mode. */
+@Composable
+private fun TalkButton(held: Boolean, onHold: (Boolean) -> Unit) {
+    val haptics = LocalHapticFeedback.current
+    val color = if (held) GwarColors.talking else MaterialTheme.colorScheme.primary
+    // Dark text on the light talking green, white on the accent.
+    val content = if (held) Color(0xFF0E0F12) else MaterialTheme.colorScheme.onPrimary
+    Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh) {
+        Box(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 10.dp), contentAlignment = Alignment.Center) {
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .height(64.dp)
+                    .background(color, RoundedCornerShape(32.dp))
+                    .pointerInput(Unit) {
+                        detectTapGestures(
+                            onPress = {
+                                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                                onHold(true)
+                                try {
+                                    tryAwaitRelease()
+                                } finally {
+                                    onHold(false)
+                                }
+                            },
+                        )
+                    }
+                    .semantics { role = Role.Button },
+                contentAlignment = Alignment.Center,
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Outlined.Mic, null, tint = content)
+                    Spacer(Modifier.size(8.dp))
+                    Text(
+                        stringResource(if (held) R.string.voice_talking else R.string.voice_hold_to_talk),
+                        color = content,
+                        style = MaterialTheme.typography.titleMedium,
+                    )
+                }
+            }
+        }
     }
 }

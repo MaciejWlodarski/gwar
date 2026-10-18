@@ -2,6 +2,7 @@ package app.gwar.android
 
 import android.Manifest
 import android.app.Application
+import android.content.Context
 import android.content.pm.PackageManager
 import app.gwar.core.AppException
 import app.gwar.core.ChatLine
@@ -82,6 +83,9 @@ data class UiState(
     /** Kept across channels and reconnections, as the other apps do. */
     val muted: Boolean = false,
     val deafened: Boolean = false,
+    /** The microphone opens only while the talk button is held (a saved preference). */
+    val pushToTalk: Boolean = false,
+    val talkHeld: Boolean = false,
     /** Where call audio can go while voice runs, and where it goes. */
     val outputs: List<AudioOutput> = emptyList(),
     val output: AudioOutput? = null,
@@ -91,6 +95,7 @@ data class UiState(
 private const val HISTORY_PAGE = 50
 private const val STATUS_INTERVAL_MS = 250L
 private const val VOICE_RETRY_MS = 1_500L
+private const val PUSH_TO_TALK = "push_to_talk"
 
 /**
  * The app's one connection, owned by the process rather than a screen, so a
@@ -109,10 +114,13 @@ class GwarClient(private val app: Application) {
     private val audio = CallAudio(app) { outputs, output -> _state.update { it.copy(outputs = outputs, output = output) } }
     private val network = NetworkWatch(app) { onNetworkChanged() }
 
+    private val settings = app.getSharedPreferences("settings", Context.MODE_PRIVATE)
+
     private val _state = MutableStateFlow(
         UiState(
             uid = core.uid(),
             form = core.lastServer()?.let { ConnectForm(it.address, it.nickname, it.insecureLan) } ?: ConnectForm(),
+            pushToTalk = settings.getBoolean(PUSH_TO_TALK, false),
         ),
     )
     val state: StateFlow<UiState> = _state.asStateFlow()
@@ -226,6 +234,18 @@ class GwarClient(private val app: Application) {
 
     fun chooseOutput(kind: OutputKind) = audio.choose(kind)
 
+    fun setPushToTalk(enabled: Boolean) {
+        settings.edit().putBoolean(PUSH_TO_TALK, enabled).apply()
+        _state.update { it.copy(pushToTalk = enabled, talkHeld = false) }
+        session?.setPushToTalk(enabled)
+    }
+
+    /** The talk button is pressed or released. */
+    fun holdToTalk(held: Boolean) {
+        _state.update { it.copy(talkHeld = held) }
+        session?.setTalkHeld(held)
+    }
+
     /** A permission changed (Bluetooth): list the outputs again. */
     fun refreshOutputs() = audio.refresh()
 
@@ -257,6 +277,7 @@ class GwarClient(private val app: Application) {
 
     private fun attach(s: Session) {
         session = s
+        s.setPushToTalk(_state.value.pushToTalk)
         network.start()
         _state.update { it.copy(connecting = false, reconnecting = false, view = s.view()) }
     }

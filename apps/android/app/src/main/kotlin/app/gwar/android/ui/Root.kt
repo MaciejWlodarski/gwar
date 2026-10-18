@@ -93,6 +93,10 @@ fun GwarRoot(client: GwarClient) {
             deafened = state.deafened,
             outputs = state.outputs,
             output = state.output,
+            pushToTalk = state.pushToTalk,
+            talkHeld = state.talkHeld,
+            onSetPushToTalk = client::setPushToTalk,
+            onHoldToTalk = client::holdToTalk,
             onChooseOutput = client::chooseOutput,
             onAllowBluetooth = if (bluetoothMissing) {
                 { bluetooth.launch(Manifest.permission.BLUETOOTH_CONNECT) }

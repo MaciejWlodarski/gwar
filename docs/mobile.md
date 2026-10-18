@@ -78,7 +78,10 @@ the native desktop app will use `gwar-app` instead.
   permission first), and a foreground service with an ongoing
   notification (with a Leave action) keeps the call going with the screen off.
   Mute and deafen are shown to everyone; a lost link or audio device restarts
-  voice by itself. Tapping the voice status shows the engine's counters.
+  voice by itself. Push-to-talk (in the voice options, remembered) shows a
+  large button that opens the microphone while held; otherwise the
+  microphone opens on voice activity, as on the desktop. Tapping the voice
+  status shows the engine's counters.
 - Reconnecting by itself when the link drops: a ping timeout, a server
   restart or a change of network (Wi-Fi to mobile data and back is noticed
   at once, without waiting for the ping). It puts back the channel, voice,
@@ -98,7 +101,8 @@ Roughly in this order:
 
 1. **Voice on real phones**: latency and loss measurements like the desktop's
    ([latency.md](latency.md)), output switching with real earpieces and
-   Bluetooth headsets (the emulator has only a loudspeaker), push-to-talk.
+   Bluetooth headsets (the emulator has only a loudspeaker), a voice activity
+   sensitivity setting.
 2. **Identity storage hardening.** Wrap the identity seed with a key from the
    Android Keystore.
 3. **Encrypted chat, encrypted voice and direct messages.** These need the MLS client logic

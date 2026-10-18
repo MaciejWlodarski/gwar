@@ -7,7 +7,10 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-use vc_client::voice::{LinkState, VoiceHandle, io::AudioIo};
+use vc_client::voice::{InputMode, LinkState, VoiceHandle, io::AudioIo};
+
+/// The microphone opens above this level in voice activity mode (dBFS), as on the desktop.
+pub const VOICE_ACTIVITY_DB: f32 = -50.0;
 
 /// The link of the running voice session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -31,6 +34,16 @@ pub struct VoiceStatus {
     pub underruns: u64,
 }
 
+/// What the user set, applied to every engine the session starts.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Controls {
+    pub muted: bool,
+    pub deafened: bool,
+    pub push_to_talk: bool,
+    /// The push-to-talk button is held.
+    pub talk_held: bool,
+}
+
 /// A running engine.
 pub(crate) struct Voice {
     handle: VoiceHandle,
@@ -39,18 +52,21 @@ pub(crate) struct Voice {
 }
 
 impl Voice {
-    pub fn new(handle: VoiceHandle, audio_lost: Arc<AtomicBool>, muted: bool, deafened: bool) -> Self {
-        handle.set_muted(muted);
-        handle.set_deafened(deafened);
-        Self { handle, audio_lost }
+    pub fn new(handle: VoiceHandle, audio_lost: Arc<AtomicBool>, controls: Controls) -> Self {
+        let voice = Self { handle, audio_lost };
+        voice.apply(controls);
+        voice
     }
 
-    pub fn set_muted(&self, muted: bool) {
-        self.handle.set_muted(muted);
-    }
-
-    pub fn set_deafened(&self, deafened: bool) {
-        self.handle.set_deafened(deafened);
+    pub fn apply(&self, controls: Controls) {
+        self.handle.set_muted(controls.muted);
+        self.handle.set_deafened(controls.deafened);
+        self.handle.set_input_mode(if controls.push_to_talk {
+            InputMode::PushToTalk
+        } else {
+            InputMode::VoiceActivity { threshold_db: VOICE_ACTIVITY_DB }
+        });
+        self.handle.set_ptt(controls.talk_held);
     }
 
     pub fn status(&self) -> VoiceStatus {

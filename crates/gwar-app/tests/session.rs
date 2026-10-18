@@ -283,6 +283,18 @@ async fn voice_reaches_the_other_app_and_mute_stops_it() {
     let level = rms_of_last_second(&heard);
     assert!(level < 0.01, "B still heard rms {level} after A muted");
 
+    // Push-to-talk: silent until the button is held, then the tone comes back.
+    a.set_muted(false).await.unwrap();
+    a.set_push_to_talk(true);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let level = rms_of_last_second(&heard);
+    assert!(level < 0.01, "B heard rms {level} with push-to-talk released");
+    a.set_talk_held(true);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let level = rms_of_last_second(&heard);
+    assert!(level > 0.05, "B heard rms {level} with push-to-talk held");
+    a.set_push_to_talk(false);
+
     // Unmuting while deafened also undeafens.
     a.set_deafened(true).await.unwrap();
     a.set_muted(false).await.unwrap();

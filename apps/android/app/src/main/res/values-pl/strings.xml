@@ -86,4 +86,8 @@
     <string name="voice_output_bluetooth">Słuchawki Bluetooth</string>
     <string name="voice_output_usb">Słuchawki USB</string>
     <string name="voice_output_allow_bluetooth">Zezwól na słuchawki Bluetooth</string>
+    <string name="voice_more">Opcje głosu</string>
+    <string name="voice_push_to_talk">Naciśnij, aby mówić</string>
+    <string name="voice_hold_to_talk">Przytrzymaj, aby mówić</string>
+    <string name="voice_talking">Mówisz…</string>
 </resources>
