@@ -314,6 +314,11 @@ These are limits of a voice chat relayed through a server:
 - Serve an older vault (rollback), which can bring back a removed saved server
   or an old server password. A revoked device keeps the vault key it had.
 - Deny service; learn which servers look up which accounts.
+- Read the bug reports people send from the apps: their text, the diagnostics
+  they chose to include (versions, platform, connection and voice state,
+  recent warnings and errors; never keys, passwords or messages) and their
+  screenshots, which may show conversations. Reports are sent only when someone
+  presses Send, and the dialog says so.
 - It cannot sign as you, decrypt your account key without your password, read
   the vault, or forge revocations.
 

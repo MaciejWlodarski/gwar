@@ -94,6 +94,15 @@ server {
         proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto https;
     }
+    # Bug reports carry screenshots (Connect accepts up to about 28 MiB here).
+    location = /connect/v1/reports {
+        client_max_body_size 30m;
+        proxy_pass http://127.0.0.1:8900/v1/reports;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+    }
     # The Gwar server's routes; the snippet is the proxy block of voice.gwar.app below.
     # Downloads share the web app's origin safely: only sniffed media is inline, and every
     # file is served with nosniff and `Content-Security-Policy: default-src 'none'; sandbox`.

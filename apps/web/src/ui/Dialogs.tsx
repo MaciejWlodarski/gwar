@@ -6,6 +6,7 @@ import { RequestError } from "../net/connection";
 import type { Channel } from "../proto/Channel";
 import type { ChannelAccess } from "../proto/ChannelAccess";
 import { AccessPicker } from "./ChannelAccess";
+import { BugReportDialog } from "./BugReport";
 import { rebaseAccess, sameAccess } from "../lib/access";
 import { controller, describeRequestError } from "../state/controller";
 import { sortedChannels } from "../state/reducer";
@@ -32,6 +33,8 @@ export function Dialogs() {
       return null;
     case "settings":
       return <SettingsDialog tab={dialog.tab} />;
+    case "bugReport":
+      return <BugReportDialog />;
     case "addServer":
       return <AddServerDialog editId={dialog.editId} />;
     case "channelEdit":

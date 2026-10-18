@@ -234,6 +234,13 @@ at the expiry of the certificate proven when issued, whichever comes first. Erro
 | `GET /v1/accounts/{handle}` | public → `{handle, account_key}`; `404 not_found` if unknown |
 | `GET /v1/accounts/by-key/{account_key}` | public → `{handle, account_key}`; `404 not_found` if unknown |
 | `/v1/archive/*` | the key archive: device and recovery archive keys, manifests, records, transfers (docs/e2e-build.md, section 7, "Connect API"); device sessions only |
+| `POST /v1/reports` | a bug report from the apps (alpha): `{text, diagnostics, images: [{mime, data}]}` → `{id}`; anyone may send one (a device session names its account); text up to 10,000 characters, diagnostics a JSON object up to 64 KiB, up to 5 PNG/JPEG/WebP/GIF screenshots of 4 MiB each, checked by their bytes; 10 per hour per address; 2 GiB for all reports together |
+
+Reports are read by the operator on the host, never served back:
+`gwar-connect --data-dir DIR reports list`, `reports show ID OUT_DIR` (writes
+`report.txt` with the text and diagnostics, and the screenshots) and
+`reports delete ID`. A reverse proxy must let this route through with a larger
+body than Connect's other calls (see docs/deploy.md).
 
 `POST /v1/devices/renew` is removed. Each client certifies only its own locally
 held key through `POST /v1/devices`, then proves possession for a new session.

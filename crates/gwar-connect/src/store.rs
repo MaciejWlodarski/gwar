@@ -195,6 +195,25 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX archive_records_account ON archive_records(account_id, seq);
     CREATE INDEX archive_transfers_account ON archive_transfers(account_id, seq);
     "#,
+    // 5: bug reports from the apps (alpha): text, diagnostics and screenshots, read by the operator.
+    r#"
+    CREATE TABLE reports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at INTEGER NOT NULL,
+        account_id INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+        device_key TEXT,
+        text TEXT NOT NULL,
+        diagnostics TEXT NOT NULL,
+        bytes INTEGER NOT NULL
+    );
+    CREATE TABLE report_images (
+        report_id INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+        idx INTEGER NOT NULL,
+        mime TEXT NOT NULL,
+        data BLOB NOT NULL,
+        PRIMARY KEY (report_id, idx)
+    );
+    "#,
 ];
 
 /// A device certificate as stored (docs/connect.md).
@@ -569,6 +588,76 @@ impl Store {
     }
 
     /// A consistent copy of the database (for backups).
+    /// Stores a report with its screenshots in one transaction; None (nothing stored) once all
+    /// reports together would exceed `max_bytes`.
+    pub fn put_report(
+        &self,
+        account: Option<(i64, String)>,
+        text: &str,
+        diagnostics: &str,
+        images: &[(String, Vec<u8>)],
+        max_bytes: i64,
+    ) -> Result<Option<i64>> {
+        let bytes = (text.len() + diagnostics.len() + images.iter().map(|(_, d)| d.len()).sum::<usize>()) as i64;
+        let tx = self.db.unchecked_transaction()?;
+        let used: i64 = tx.query_row("SELECT COALESCE(SUM(bytes),0) FROM reports", [], |r| r.get(0))?;
+        if used + bytes > max_bytes {
+            return Ok(None);
+        }
+        let (account_id, device) = account.unzip();
+        tx.execute(
+            "INSERT INTO reports(created_at,account_id,device_key,text,diagnostics,bytes) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![crate::api::now_ms(), account_id, device, text, diagnostics, bytes],
+        )?;
+        let id = tx.last_insert_rowid();
+        for (idx, (mime, data)) in images.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO report_images(report_id,idx,mime,data) VALUES(?1,?2,?3,?4)",
+                params![id, idx as i64, mime, data],
+            )?;
+        }
+        tx.commit()?;
+        Ok(Some(id))
+    }
+
+    /// Reports, newest first: (id, created_at, handle, text, screenshots).
+    #[allow(clippy::type_complexity)]
+    pub fn reports(&self, limit: i64) -> Result<Vec<(i64, i64, Option<String>, String, i64)>> {
+        let mut stmt = self.db.prepare(
+            "SELECT r.id, r.created_at, a.handle, r.text, (SELECT COUNT(*) FROM report_images i WHERE i.report_id=r.id)
+             FROM reports r LEFT JOIN accounts a ON a.id=r.account_id ORDER BY r.id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// One report: (created_at, handle, device key, text, diagnostics) and its screenshots.
+    #[allow(clippy::type_complexity)]
+    pub fn report(
+        &self,
+        id: i64,
+    ) -> Result<Option<((i64, Option<String>, Option<String>, String, String), Vec<(String, Vec<u8>)>)>> {
+        let Some(head) = self
+            .db
+            .query_row(
+                "SELECT r.created_at, a.handle, r.device_key, r.text, r.diagnostics FROM reports r
+                 LEFT JOIN accounts a ON a.id=r.account_id WHERE r.id=?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        let mut stmt = self.db.prepare("SELECT mime, data FROM report_images WHERE report_id=?1 ORDER BY idx")?;
+        let images = stmt.query_map(params![id], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        Ok(Some((head, images)))
+    }
+
+    pub fn delete_report(&self, id: i64) -> Result<bool> {
+        Ok(self.db.execute("DELETE FROM reports WHERE id=?1", params![id])? > 0)
+    }
+
     pub fn backup_to(&self, path: &Path) -> Result<()> {
         self.db.execute("VACUUM INTO ?1", [path.to_string_lossy()])?;
         Ok(())

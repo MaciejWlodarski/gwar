@@ -268,6 +268,11 @@ export class ConnectApi {
     return this.call("GET", `/archive/transfers?after=${after}`, undefined, token);
   }
 
+  /** Sends a bug report (alpha); a device session names its account. */
+  async report(body: { text: string; diagnostics: Record<string, unknown>; images: { mime: string; data: string }[] }, token?: string): Promise<number> {
+    return (await this.call<{ id: number }>("POST", "/reports", body, token)).id;
+  }
+
   /** The public account key of a handle (needed to derive recovery secrets). */
   async publicAccount(handle: string): Promise<{ handle: string; account_key: string }> {
     return this.call("GET", `/accounts/${encodeURIComponent(handle)}`);

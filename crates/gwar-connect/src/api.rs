@@ -26,6 +26,7 @@ use crate::{
 };
 
 pub mod archive;
+pub mod reports;
 
 const SESSION_MS: i64 = 90 * 24 * 3600 * 1000;
 const CHALLENGE_MS: i64 = 5 * 60 * 1000;
