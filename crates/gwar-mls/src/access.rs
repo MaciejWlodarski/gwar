@@ -209,7 +209,9 @@ impl Access {
         all
     }
 
-    fn signer_authorized(&self, chain: &OwnerChain, current: bool) -> bool {
+    /// The member list's signer is an owner (of the anchor's span, or only the current one), a
+    /// confirmer or a manager of these lists.
+    pub(crate) fn signer_authorized(&self, chain: &OwnerChain, current: bool) -> bool {
         let signer = &self.members.members().signer_uid;
         self.owners(chain, current).contains(signer)
             || self.anchor.anchor().confirmers.contains(signer)

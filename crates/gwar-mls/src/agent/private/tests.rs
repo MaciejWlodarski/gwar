@@ -194,7 +194,61 @@ fn a_newer_manager_pair_is_carried_into_the_group() {
     p.member.take_changes();
     assert_eq!(authority(&p.member, &p.id, p.t), Some(Authority::Wait));
     accept_pair(&mut p.member, &newer, p.t);
+    // The carried member list is the one it accepted: current at once.
     assert_eq!(authority(&p.member, &p.id, p.t), Some(Authority::Current));
+}
+
+#[test]
+fn a_new_member_list_counts_once_it_is_recorded() {
+    let mut p = private();
+    let out = p.owner.commit_access(&server(), &p.id, Some(&[uid(2), uid(3)]), p.t, &()).unwrap();
+    p.owner.take_changes();
+    p.observer = p.observer.commit(&out.commit, &out.group_info, None, p.t, p.t).unwrap().0;
+    p.member.receive(&server(), &p.id, &out.commit, &[]).unwrap();
+    p.member.take_changes();
+    // Not usable until recorded (current on first sight): a later commit cannot then roll it back.
+    assert_eq!(authority(&p.member, &p.id, p.t), Some(Authority::Wait));
+    assert!(p.member.sending_key(&server(), &p.id, p.t, &()).is_err());
+    assert_eq!(p.member.observe_access(&server(), &p.id, p.t, &()).unwrap(), Some(Authority::Current));
+    p.member.take_changes();
+    assert_eq!(p.member.group(&server(), &p.id).unwrap().access.as_ref().map(|c| c.seq), Some(2));
+}
+
+#[test]
+fn a_removed_member_cannot_rejoin_the_removed_epoch_from_a_tombstone() {
+    let mut p = private();
+    let before = p.info.clone();
+    let out = p.owner.commit_access(&server(), &p.id, Some(&[]), p.t, &()).unwrap();
+    p.owner.take_changes();
+    p.observer = p.observer.commit(&out.commit, &out.group_info, None, p.t, p.t).unwrap().0;
+    p.member.receive(&server(), &p.id, &out.commit, &[]).unwrap();
+    p.member.take_changes();
+    p.member.forget(&server(), &p.id).unwrap();
+    p.member.take_changes();
+    assert!(p.member.group(&server(), &p.id).unwrap().removed);
+    let tree = p.observer.tree().unwrap().1;
+    assert_eq!(p.member.join_external(&server(), &before, Some(&tree), p.t, &()), Err(Invalid("removed checkpoint")));
+}
+
+#[test]
+fn a_transfer_without_the_anchor_leaves_the_group_waiting() {
+    let mut p = private();
+    // Ownership moves to account 5 without handing the anchor over: it is no longer current.
+    let link = crate::owner::OwnerLink {
+        server_key: server(),
+        generation: 1,
+        seq: 1,
+        previous_link_hash: p.chain.head(),
+        previous_owner_account_key: public(&key(1)),
+        new_owner_uid: uid(5),
+        anchor_hash: None,
+        signed_at: p.t,
+    };
+    let link = crate::owner::SignedLink::sign(link, &key(1));
+    let links = vec![(link.link().statement(), link.signature().to_owned())];
+    p.member.check_owner(&server(), &p.chain.genesis().statement(), links, None).unwrap();
+    p.member.take_changes();
+    assert_eq!(authority(&p.member, &p.id, p.t), Some(Authority::Wait));
 }
 
 #[test]

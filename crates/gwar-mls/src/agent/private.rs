@@ -156,6 +156,7 @@ impl Agent {
     /// A newcomer joins a private group only with (a)–(c) as of now: the GroupInfo carries the
     /// newest manager pair this device accepted and a member list current now and not older than
     /// its checkpoint (a tombstone keeps it). Otherwise it waits for a channel manager.
+    /// Returns the member list to record as accepted (before the join is sent).
     pub(super) fn newcomer(
         &self,
         key: &str,
@@ -163,9 +164,9 @@ impl Agent {
         context: &GroupContext,
         now: i64,
         revocations: &dyn Revocations,
-    ) -> Result<()> {
+    ) -> Result<Option<AccessCheckpoint>> {
         if !rules::is_private(descriptor) {
-            return Ok(());
+            return Ok(None);
         }
         let server = &descriptor.descriptor.server_key;
         let record = self.servers.get(server).ok_or(AgentError::Waiting)?;
@@ -181,7 +182,7 @@ impl Agent {
         {
             return Err(AgentError::Waiting);
         }
-        Ok(())
+        Ok(Some(AccessCheckpoint::of(members)))
     }
 
     /// Current authority in the group at `key` (`None` outside private channels). Pure: a member
@@ -206,13 +207,13 @@ impl Agent {
         let access = rules::access(group.public_group().group_context()).ok_or(Invalid("access lists"))?;
         let id = descriptor.group_id();
         let members = access.members();
-        // (a) the newest pair this device accepted; (b), (c) the newest member list it accepted,
-        // current when first seen.
+        // (a) the newest pair this device accepted; (b), (c) the member list recorded as the newest
+        // accepted (current on first sight, see `advance_access`), still under an anchor the
+        // pinned head holds and signed by someone these lists authorize under the current owner.
         let pair_ok = access.anchor().hash() == anchor.hash() && access.list().hash() == list.hash();
-        let list_ok = match &record.access {
-            Some(cp) if cp.is(members) => true,
-            cp => cp.as_ref().is_none_or(|cp| cp.before(members)) && access.current(&chain, &id, now, revocations),
-        };
+        let list_ok = record.access.as_ref().is_some_and(|cp| cp.is(members))
+            && chain.anchor_current(access.anchor())
+            && access.signer_authorized(&chain, true);
         let not_older = record.access.as_ref().is_none_or(|cp| cp.is(members) || cp.before(members));
         if pair_ok && list_ok {
             // (d) no leaf the lists exclude (the owner being only the current one).
@@ -264,10 +265,17 @@ impl Agent {
         if !rules::is_private(&descriptor) {
             return Ok(());
         }
-        let Some(chain) = self.owner_chain(&descriptor.descriptor.server_key)? else { return Ok(()) };
+        let server = &descriptor.descriptor.server_key;
+        let Some(server_record) = self.servers.get(server) else { return Ok(()) };
+        let chain = server_record.chain(server)?;
+        let Some((anchor, list)) = server_record.pair()? else { return Ok(()) };
         let access = rules::access(group.public_group().group_context()).ok_or(Invalid("access lists"))?;
         let members = access.members();
+        // Only under the newest pair this device accepted: a signer that pair no longer names
+        // cannot raise the checkpoint through an older pair still in the group.
         if record.access.as_ref().is_none_or(|cp| cp.before(members))
+            && access.anchor().hash() == anchor.hash()
+            && access.list().hash() == list.hash()
             && access.current(&chain, &descriptor.group_id(), now, revocations)
         {
             self.groups.get_mut(key).ok_or(Invalid("record"))?.access = Some(AccessCheckpoint::of(members));
@@ -315,8 +323,10 @@ impl Agent {
             let current = rules::access(group.public_group().group_context()).ok_or(Invalid("access lists"))?;
             let checkpoint = a.groups[&key].access.clone();
             let members = match members {
+                // The next seq after the list this device accepted: a list it never accepted (never
+                // current, or history only) sets no floor.
                 Some(m) => {
-                    let seq = checkpoint.as_ref().map_or(0, |c| c.seq).max(current.members().members().seq);
+                    let seq = checkpoint.as_ref().ok_or(AgentError::Waiting)?.seq;
                     a.sign_members(&chain, id, seq.checked_add(1).ok_or(Invalid("member list seq"))?, m, now)?
                 }
                 // Never carry a member list older than the one this device accepted.

@@ -206,6 +206,10 @@ pub struct GroupRecord {
     /// A private channel's group: the newest member list this device accepted (6c).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access: Option<AccessCheckpoint>,
+    /// A tombstone of a group this device had been removed from: its checkpoint is the epoch
+    /// before the removal, which it must not rejoin.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub removed: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -803,8 +807,10 @@ impl Agent {
             evidence: BTreeMap::new(),
             own_commit_at: None,
             access: None,
+            removed: false,
         });
         record.status = status;
+        record.removed = false;
         record.server_pending = false;
         key
     }
@@ -1347,6 +1353,7 @@ impl Agent {
             let voice = a.voice_only;
             let record = a.groups.get_mut(&key).ok_or(Invalid("record"))?;
             if !voice && record.status != Status::Creating {
+                record.removed |= record.status == Status::Removed;
                 record.status = Status::Forgotten;
                 record.welcome_ids.clear();
                 record.server_pending = false;
@@ -1421,6 +1428,7 @@ impl Agent {
                     evidence: BTreeMap::new(),
                     own_commit_at: None,
                     access: None,
+                    removed: false,
                 });
             }
             let live = chain.last().expect("checked above");
@@ -1506,8 +1514,10 @@ impl Agent {
             if a.outbox.get(&key).is_some_and(|out| info.epoch().as_u64() <= out.epoch) {
                 return Err(Invalid("pending commit"));
             }
+            // Also a tombstone of a removal: forgetting does not make the removed epoch joinable.
             if a.groups.get(&key).is_some_and(|r| {
-                r.status == Status::Removed && r.checkpoint.as_ref().is_some_and(|c| info.epoch().as_u64() <= c.epoch)
+                (r.status == Status::Removed || r.removed)
+                    && r.checkpoint.as_ref().is_some_and(|c| info.epoch().as_u64() <= c.epoch)
             }) {
                 return Err(Invalid("removed checkpoint"));
             }
@@ -1519,7 +1529,7 @@ impl Agent {
                 .map_err(err("ratchet tree"))?;
             a.tree_rule(&descriptor, info.group_context(), old_tree.leaves())?;
             rules::voice_initial_tree(&descriptor, info.epoch().as_u64(), old_tree.leaves())?;
-            a.newcomer(&key, &descriptor, info.group_context(), now, revocations)?;
+            let accepted_access = a.newcomer(&key, &descriptor, info.group_context(), now, revocations)?;
             if old_tree
                 .leaves()
                 .filter_map(leaf_credential)
@@ -1559,6 +1569,9 @@ impl Agent {
             a.record(&descriptor, Status::Joining);
             let record = a.groups.get_mut(&key).ok_or(Invalid("record"))?;
             record.checkpoint = Some(old_checkpoint.clone());
+            if accepted_access.is_some() {
+                record.access = accepted_access;
+            }
             if a.voice_only {
                 // A snapshot cannot distinguish missed removal/rejoin from a
                 // self-update. Start a fresh membership trust interval, but do

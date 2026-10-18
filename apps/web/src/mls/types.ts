@@ -73,6 +73,8 @@ export interface GroupSummary {
     evidence?: Record<string, { first: string; last: string }[]>;
     /** A private channel's group: the newest member list this device accepted (6c). */
     access?: { generation: number; seq: number; hash: string };
+    /** A tombstone of a group this device was removed from. */
+    removed?: boolean;
   };
   members: { leaf: number; device_key: string; uid: string }[];
 }
