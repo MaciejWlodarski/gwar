@@ -219,7 +219,9 @@ async fn a_removed_members_overrides_go_with_them() {
     assert_eq!(view["id"], room);
     // Lifting one for someone who left is allowed (nothing to lift now, so it is a no-op).
     root.ok("channel.override", json!({"channel": room, "override": {"user": bob_uid}})).await;
+}
 
+#[tokio::test]
 async fn moderators_mute_and_deafen_for_everyone_those_ranked_below() {
     let server = TestServer::start().await;
     let mut root = admin(&server, "root").await;
