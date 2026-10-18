@@ -50,6 +50,8 @@ const PUPPET_GROUP: &str = "Voice bridge";
 const PUPPET_DESCRIPTION: &str = "Gwar user (bridged)";
 /// Flood points one address may collect before TeamSpeak blocks it (default 250).
 const PUPPET_IP_BLOCK: u32 = 2500;
+/// How long a retired puppet stays down before the same user gets a new one.
+const PUPPET_COOLDOWN: Duration = Duration::from_secs(3);
 /// Connections one puppet identity may have at once (one per device of a member).
 const PUPPET_CLONES: u32 = 100;
 /// Powers of TeamSpeak's stock Server Admin group (ServerQuery has 100).
@@ -769,6 +771,7 @@ impl<'a> Bridge<'a> {
                 Presence::Puppet => {
                     local.idle_since = None;
                     if local.puppet.is_none() && local.retry_at.is_none_or(|at| at <= now) {
+                        info!(session, channel = ?local.client.channel, "puppet starts");
                         self.spawn_puppet(session, stagger * started);
                         started += 1;
                     }
@@ -776,11 +779,20 @@ impl<'a> Bridge<'a> {
                 Presence::Listed if local.puppet.is_some() => {
                     let idle = *local.idle_since.get_or_insert(now);
                     if now.duration_since(idle) >= LINGER {
+                        info!(session, channel = ?local.client.channel, "puppet retires: no TeamSpeak user shares its channel");
                         self.retire_puppet(session);
                     }
                 }
                 Presence::Listed => local.idle_since = None,
-                Presence::Absent => self.retire_puppet(session),
+                Presence::Absent => {
+                    if local.puppet.is_some() {
+                        info!(session, channel = ?local.client.channel, "puppet retires: not in a bridged channel");
+                        // Someone going in and out of an encrypted channel would otherwise connect
+                        // a new puppet each time, which TeamSpeak's flood guard punishes.
+                        local.retry_at = Some(now + PUPPET_COOLDOWN);
+                    }
+                    self.retire_puppet(session);
+                }
             }
         }
     }
@@ -1181,11 +1193,13 @@ impl<'a> Bridge<'a> {
                 local.clid = Some(clid);
                 self.puppet_clids.insert(clid, session);
                 let ts_uid = local.ts_uid.clone();
-                // The channel may have changed while connecting.
-                self.move_puppet(session);
+                // The bridge group first: it exempts the puppet from TeamSpeak's flood guard, which
+                // otherwise refuses a new client's first commands (the move, the nickname).
                 if let Err(e) = self.join_puppet_group(&ts_uid).await {
                     debug!(session, "puppet group: {e:#}");
                 }
+                // The channel may have changed while connecting.
+                self.move_puppet(session);
                 // Say what this client is, so nobody mistakes it for a TeamSpeak app.
                 let describe = Cmd::new("clientedit").arg("clid", clid).arg("client_description", PUPPET_DESCRIPTION);
                 if let Err(e) = self.query.call(describe).await {

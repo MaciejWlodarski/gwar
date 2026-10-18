@@ -306,6 +306,8 @@ export const en = {
   "voice.pttHint": "Push to talk: hold {key}",
   "voice.encryptedUnsupported": "Update your browser or use the desktop app to join encrypted voice.",
   "voice.securing": "Securing voice…",
+  "voice.channelSecuring": "This encrypted channel is still being secured on this device. Try again in a moment.",
+  "voice.securingTimeout": "Encrypted voice could not be secured. Try again.",
   "voice.closed": "The voice connection was closed. Reconnecting…",
 
   "chat.today": "Today",
@@ -454,7 +456,7 @@ export const en = {
   "err.req.banned": "You are banned from this server.",
   "err.req.too_large": "That is too large.",
   "err.req.quota_exceeded": "There is no storage space left for that.",
-  "connect.invited": "You were invited to this server. Pick a nickname to join.",
+  "connect.invited": "You were invited to this server. Connect to join.",
   "connect.inviteForget": "Ignore invite",
   "file.attach": "Attach files",
   "file.attachInput": "Attach files",

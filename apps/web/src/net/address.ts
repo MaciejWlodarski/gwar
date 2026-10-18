@@ -113,6 +113,15 @@ export function parseServerAddress(input: string, page: PageContext, insecureLan
   return { ok: true, value: { url: url.toString(), label, secure } };
 }
 
+/** How to show a server's WebSocket URL in the address field: `host[:port][/path]` when that
+ * means the same secure URL again (`wss://gwar.app/ws` is `gwar.app`), otherwise the URL itself. */
+export function addressLabel(url: string, page: PageContext): string {
+  const parsed = parseServerAddress(url, page);
+  if (!parsed.ok || !parsed.value.secure) return url;
+  const again = parseServerAddress(parsed.value.label, page);
+  return again.ok && again.value.url === parsed.value.url ? parsed.value.label : url;
+}
+
 // ---------------------------------------------------------------- TeamSpeak
 
 export const TS_DEFAULT_PORT = 9987;

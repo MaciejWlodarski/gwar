@@ -1,7 +1,7 @@
 import { AlertTriangle, CloudCog, Menu, Mic, ShieldAlert, Ticket } from "lucide-react";
 import { useEffect, useState, type FormEvent } from "react";
 import { useT } from "../i18n";
-import { pageContextFromLocation, sameOriginUrl } from "../net/address";
+import { addressLabel, pageContextFromLocation, sameOriginUrl } from "../net/address";
 import { parseInviteLink } from "../net/invite";
 import { controller, describeBan } from "../state/controller";
 import { isDesktop } from "../platform";
@@ -45,7 +45,7 @@ export function ConnectScreen() {
   const openDialog = useUi((s) => s.openDialog);
   const account = useAccount((s) => s.account);
   const [kind, setKind] = useState<ServerKind>(desktop && !invite?.server ? lastKind : "vc");
-  const [address, setAddress] = useState(invite?.server ?? lastAddress);
+  const [address, setAddress] = useState(invite?.server ? addressLabel(invite.server, pageContextFromLocation()) : lastAddress);
   const [password, setPassword] = useState("");
   const savedInsecureLan = bookmarks.find((b) => b.address === address)?.insecureLan ?? false;
   const [insecureLan, setInsecureLan] = useState(savedInsecureLan);
@@ -80,7 +80,7 @@ export function ConnectScreen() {
     setSeenInvite(invite);
     if (invite?.server) {
       setKind("vc");
-      setAddress(invite.server);
+      setAddress(addressLabel(invite.server, pageContextFromLocation()));
     }
   }
 
@@ -89,7 +89,7 @@ export function ConnectScreen() {
     const pasted = kind === "vc" ? parseInviteLink(value) : null;
     if (pasted) {
       useConnectUi.getState().set({ invite: pasted });
-      setAddress(pasted.server ?? "");
+      setAddress(pasted.server ? addressLabel(pasted.server, pageContextFromLocation()) : "");
       return;
     }
     setAddress(value);

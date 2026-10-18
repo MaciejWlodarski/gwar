@@ -298,7 +298,7 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
             compact ? "h-6" : "h-7",
           )}
         >
-          <span className={cn("relative rounded-full", client.talking && "talking-ring")}>
+          <span className={cn("relative flex shrink-0 rounded-full", client.talking && "talking-ring")}>
             <Avatar name={client.nickname} seed={client.uid} size={avatarSize} />
           </span>
           <span className={cn("min-w-0 truncate", silenced && "text-muted", isMe && "font-medium")} style={color ? { color } : undefined}>

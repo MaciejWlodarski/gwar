@@ -938,6 +938,23 @@ export class MlsRuntime {
     const me = this.uid, view = this.owner;
     return !!view && (view.owner === me || view.confirmers.includes(me) || view.managers.includes(me));
   }
+  /** Joins an encrypted channel's group now instead of after the background pass's jitter, so
+   * entering its voice (which the server allows only to devices in that group) need not wait.
+   * True once this device holds the group, false if it does not within `timeoutMs`. */
+  async prepareChannel(channel: number, timeoutMs = 15_000): Promise<boolean> {
+    const conversation = `channel:${channel}`;
+    const deadline = this.now() + timeoutMs;
+    this.nextJoin = 0;
+    this.groupDue.delete(conversation);
+    while (this.status(conversation) !== "ready") {
+      if (this.stopped || this.now() >= deadline) return false;
+      await this.sync().catch(() => {});
+      if (this.status(conversation) === "ready") break;
+      await new Promise(resolve => setTimeout(resolve, 250));
+      this.nextJoin = 0;
+    }
+    return true;
+  }
   /** An encrypted private channel's member list as this device holds it (6c). */
   privateMembers(channel: number): AccessView | null {
     const pin = this.livePin(`channel:${channel}`);

@@ -62,6 +62,8 @@ import type { ThreadKey } from "./types";
 
 export const CLIENT_VERSION = "0.1.0";
 const HISTORY_PAGE = 50;
+/** How long joining an encrypted call may take before it gives up with Retry. */
+const VOICE_SECURING_TIMEOUT_MS = 30_000;
 /** Finished uploads not yet sent in a message. */
 const MAX_PENDING_UPLOADS = 64;
 /** Reading is reported to the server at most this often. */
@@ -802,7 +804,17 @@ class Controller {
       }
       try {
         keys = await this.encryptedCall(conn, channel, participation!, own.id, current);
-        group = await keys.joined;
+        const call = keys;
+        // A call that cannot secure its keys in time ends here with "Voice unavailable" and Retry,
+        // never an endless "Securing voice"; its state goes to the console for a report.
+        const late = new Error(tNow("voice.securingTimeout"));
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(late), VOICE_SECURING_TIMEOUT_MS); });
+        try { group = await Promise.race([call.joined, timeout]); }
+        catch (e) {
+          if (e === late && current()) { console.warn("Encrypted voice did not secure in time:", JSON.stringify(call.debug())); this.endVoiceCall(); }
+          throw e;
+        } finally { clearTimeout(timer); }
       } catch (e) {
         if (!current()) return;
         useVoice.getState().set({ state: "failed" });
@@ -1027,6 +1039,16 @@ class Controller {
       // A newer join, move or connection makes this one obsolete.
       if (this.conn !== conn || attempt !== this.joinAttempt) return;
       if (refusal) { useUi.getState().toast("info", refusal); return; }
+      // The server admits only devices already in the channel's group: join it first (a new
+      // channel's group is otherwise joined in the background, after a random wait).
+      const runtime = this.runtime;
+      if (runtime && runtime.status(`channel:${channel}`) !== "ready") {
+        useUi.getState().setJoining(channel);
+        const ready = await runtime.prepareChannel(channel);
+        if (useUi.getState().joining === channel) useUi.getState().setJoining(null);
+        if (this.conn !== conn || attempt !== this.joinAttempt) return;
+        if (!ready) { useUi.getState().toast("info", tNow("voice.channelSecuring")); return; }
+      }
     } else this.joinAttempt++;
     const ui = useUi.getState();
     ui.setJoining(channel);

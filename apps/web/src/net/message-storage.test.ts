@@ -51,6 +51,15 @@ describe("atomic bounded message storage", () => {
     await expect(store.mergeFeed([e])).rejects.toThrow(); expect(await store.cursor()).toBe(0);
     expect((await store.revocation(account.publicKey, device.publicKey)).fresh).toBe(false);
   });
+  it("counts a feed checked just after a verification began as fresh", async () => {
+    const store = new MessageStorage(crypto.randomUUID());
+    const account = await keyFromSeed(new Uint8Array(32).fill(1)), device = await keyFromSeed(new Uint8Array(32).fill(2));
+    const started = Date.now();
+    // The verification took `now` before awaiting the refresh, which then wrote a later `checked`.
+    await store.mergeFeed([], undefined, started + 300);
+    expect((await store.revocation(account.publicKey, device.publicKey, undefined, started)).fresh).toBe(true);
+    expect((await store.revocation(account.publicKey, device.publicKey, undefined, started + 6 * 60_000)).fresh).toBe(false);
+  });
   it("uses account/device pairing and persists failure of a previously fresh feed", async () => {
     const account = await keyFromSeed(new Uint8Array(32).fill(1)), device = await keyFromSeed(new Uint8Array(32).fill(2));
     const e = { seq: 1, account_key: account.publicKey, device_key: device.publicKey, revoked_at: 2, signature: await signText(account.jwk, revokeStatement(account.publicKey, device.publicKey, 2)) };
