@@ -220,3 +220,27 @@ async fn a_removed_members_overrides_go_with_them() {
     // Lifting one for someone who left is allowed (nothing to lift now, so it is a no-op).
     root.ok("channel.override", json!({"channel": room, "override": {"user": bob_uid}})).await;
 }
+
+#[tokio::test]
+async fn deleting_a_channel_keeps_private_ones_hidden_from_the_deleter_and_says_nothing_of_them() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let mut officer = Client::connect(&server, "officer").await;
+    let mods = role(&mut root, "Mods", json!(["manage_channels"])).await;
+    let officers = role(&mut root, "Officers", json!([])).await;
+    give(&mut root, &alice, json!([2, mods])).await;
+    give(&mut root, &officer, json!([2, officers])).await;
+    let clan = channel_id(&root.create_channel(json!({"name": "Clan"})).await);
+    let hidden = channel_id(
+        &root
+            .create_channel(json!({"name": "Officers", "parent": clan, "private": true, "access": {"roles": [officers], "users": []}}))
+            .await,
+    );
+    // Alice manages Clan and sees nothing under it: deleting it works.
+    alice.ok("channel.delete", json!({"channel": clan})).await;
+    // The hidden channel survives at the top, and only those who see it hear of the move.
+    let moved = officer.next_event_where("channel.updated", |c| c["id"] == hidden).await;
+    assert!(moved["parent"].is_null());
+    assert!(alice.drain_events("channel.updated").await.iter().all(|c| c["id"] != hidden));
+}

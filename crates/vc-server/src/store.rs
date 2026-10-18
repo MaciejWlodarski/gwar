@@ -89,6 +89,8 @@ pub struct Removal {
     pub sealed: BTreeMap<String, Vec<MessageId>>,
     /// Files to remove from disk (then [`Store::forget_removed`]).
     pub files: Vec<FileId>,
+    /// Channels where the member had an override (removed with them).
+    pub overrides: Vec<ChannelId>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -694,13 +696,6 @@ impl Store {
         Ok(())
     }
 
-    /// Removes a member's overrides everywhere; returns the channels that had one.
-    pub fn delete_user_overrides(&self, uid: &str) -> Result<Vec<ChannelId>> {
-        let mut stmt = self.db.prepare("DELETE FROM channel_overrides WHERE user=?1 RETURNING channel")?;
-        let channels = stmt.query_map([uid], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
-        Ok(channels)
-    }
-
     /// The next id from a counter that never goes back and never wraps: once `u32` ids run out, inserts fail.
     fn next_id(&self, counter: &'static str) -> Result<u32> {
         let id: Option<i64> = self
@@ -1241,6 +1236,11 @@ impl Store {
         let pending = stmt.query_map([uid], |r| r.get::<_, FileId>(0))?;
         removal.files.extend(pending.collect::<rusqlite::Result<Vec<_>>>()?);
         self.db.execute("DELETE FROM message_mentions WHERE uid=?1 AND message IN (SELECT id FROM messages WHERE signature IS NULL)", [uid])?;
+        // Their overrides go with them: one who comes back starts afresh.
+        removal.overrides = {
+            let mut stmt = tx.prepare("DELETE FROM channel_overrides WHERE user=?1 RETURNING channel")?;
+            stmt.query_map([uid], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+        };
         // The foreign keys take the group memberships and read marks along.
         self.db.execute("DELETE FROM users WHERE id=?1", [id])?;
         tx.commit()?;
@@ -1290,6 +1290,9 @@ impl Store {
         // Their IP bans keep reaching only those ranked below them.
         tx.execute("UPDATE bans SET by_uid=?2 WHERE by_uid=?1", params![from, into])?;
         tx.execute("UPDATE invites SET creator_uid=?2 WHERE creator_uid=?1", params![from, into])?;
+        // Overrides follow too, where the target has none of its own in that channel.
+        tx.execute("UPDATE OR IGNORE channel_overrides SET user=?2 WHERE user=?1", params![from, into])?;
+        tx.execute("DELETE FROM channel_overrides WHERE user=?1", [from])?;
         tx.execute("UPDATE tokens SET creator_uid=?2 WHERE creator_uid=?1", params![from, into])?;
         // bans.by and invites.created_by are display-name snapshots, not identity references.
         // Revoked devices belong to cryptographic account keys and must never be reassigned.
@@ -2446,5 +2449,34 @@ mod tests {
         let id = store.insert_ban(&ban, Some("v")).unwrap();
         store.merge_members("v", "u", false).unwrap();
         assert_eq!(store.ban_issuer(id).unwrap().as_deref(), Some("u"));
+    }
+
+    #[test]
+    fn user_overrides_follow_a_merge_and_go_with_a_removal() {
+        let store = Store::in_memory().unwrap();
+        let (a, b) = (
+            store.insert_channel(None, "a", "", 0, None, None).unwrap(),
+            store.insert_channel(None, "b", "", 1, None, None).unwrap(),
+        );
+        store.touch_user("u", "ku", "u", 0).unwrap();
+        store.touch_user("v", "kv", "v", 0).unwrap();
+        let of = |uid: &str, allow: &[Permission]| vc_proto::ChannelOverride {
+            role: None,
+            user: Some(uid.into()),
+            allow: allow.to_vec(),
+            deny: vec![],
+        };
+        // u has their own override in a, so v's there gives way; v's in b moves over.
+        store.set_channel_overrides(a, &[of("u", &[Permission::Speak]), of("v", &[Permission::Connect])]).unwrap();
+        store.set_channel_overrides(b, &[of("v", &[Permission::Connect])]).unwrap();
+        store.merge_members("v", "u", false).unwrap();
+        let all = store.channel_overrides().unwrap();
+        assert_eq!(all[&a], vec![of("u", &[Permission::Speak])]);
+        assert_eq!(all[&b], vec![of("u", &[Permission::Connect])]);
+        let id = store.user_by_uid("u").unwrap().unwrap().0;
+        let mut removal = store.remove_member(id, "u", false).unwrap();
+        removal.overrides.sort_unstable();
+        assert_eq!(removal.overrides, vec![a, b]);
+        assert!(store.channel_overrides().unwrap().values().all(Vec::is_empty));
     }
 }

@@ -407,9 +407,8 @@ impl Core {
         let tags = self.store.member_tags().map_err(storage_error)?;
         self.connect_pending.remove(&member.uid);
         let removal = self.store.remove_member(user_id, &member.uid, delete_messages).map_err(storage_error)?;
-        // Their overrides go with them: one who comes back starts afresh.
-        let touched = self.store.delete_user_overrides(&member.uid).map_err(storage_error)?;
-        for channel in touched {
+        // Their overrides went with them (in the same transaction): one who comes back starts afresh.
+        for &channel in &removal.overrides {
             if let Some(row) = self.channels.get_mut(&channel) {
                 row.overrides.retain(|o| o.user.as_deref() != Some(member.uid.as_str()));
                 let view = super::channel_view(row);

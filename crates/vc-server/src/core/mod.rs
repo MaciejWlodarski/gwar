@@ -2141,10 +2141,28 @@ impl Core {
         if self.is_descendant(self.info.default_channel, channel) {
             return Err(err(ErrorCode::BadRequest, "the default channel cannot be deleted"));
         }
-        let mut doomed: Vec<_> = self.channels.keys().copied().filter(|&c| self.is_descendant(c, channel)).collect();
+        let subtree: Vec<_> = self.channels.keys().copied().filter(|&c| self.is_descendant(c, channel)).collect();
+        // Private channels hidden from this session neither stop the deletion nor go with it (a
+        // refusal would reveal them): they move up to where the deleted channel was. They are
+        // always leaves (a private channel has no children).
+        let viewer = Some(&self.sessions[&session]);
+        let (mut doomed, hidden): (Vec<_>, Vec<_>) = subtree.into_iter().partition(|&c| self.admitted(viewer, c));
         // Every channel that goes with it must be one this session may delete.
         if doomed.iter().any(|&c| !self.can_in(session, c, Permission::ManageChannels)) {
             return Err(err(ErrorCode::Forbidden, "it holds channels you may not delete"));
+        }
+        let new_parent = self.channels[&channel].parent;
+        for c in hidden {
+            let mut row = self.channels[&c].clone();
+            if row.synced {
+                row.overrides = self.effective_overrides(c).to_vec();
+                row.synced = false;
+            }
+            row.parent = new_parent;
+            self.store.update_channel(&row).map_err(storage_error)?;
+            let view = channel_view(&row);
+            self.channels.insert(c, row);
+            self.broadcast_channel(Event::ChannelUpdated(view));
         }
         // Deepest first, so clients never see an orphaned child.
         doomed.sort_by_key(|&c| std::cmp::Reverse(self.depth(c)));
