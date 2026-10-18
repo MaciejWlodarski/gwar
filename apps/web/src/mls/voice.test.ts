@@ -55,7 +55,7 @@ class FakeVoiceAgent implements WasmAgent {
   constructor(world: { agent?: FakeVoiceAgent }) { world.agent = this; }
   private summary(): GroupSummary[] {
     if (!this.status) return [];
-    return [{ group: this.group, conversation: "voice:7", incarnation: "0", live: this.status !== "creating", history: false, channel_group: this.parent, record: { status: this.status, checkpoint: this.status === "creating" ? null : { epoch: String(this.epoch), hash: [] }, server_pending: this.serverPending, voice_removed: this.removed }, members: structuredClone(this.members) }];
+    return [{ group: this.group, conversation: "voice:7", incarnation: "0", live: this.status !== "creating", private: false, history: false, channel_group: this.parent, record: { status: this.status, checkpoint: this.status === "creating" ? null : { epoch: String(this.epoch), hash: [] }, server_pending: this.serverPending, voice_removed: this.removed }, members: structuredClone(this.members) }];
   }
   /** Rust poisons an agent after a failed operation until it is reloaded. */
   poisoned = false;

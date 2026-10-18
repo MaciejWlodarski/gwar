@@ -81,11 +81,11 @@ fn chain_of(server: &str, genesis: &str, links: &[(String, String)]) -> Option<O
 }
 
 impl ServerRecord {
-    fn chain(&self, server: &str) -> Result<OwnerChain> {
+    pub(super) fn chain(&self, server: &str) -> Result<OwnerChain> {
         chain_of(server, &self.genesis, &self.links).ok_or(Invalid("stored owner chain"))
     }
 
-    fn pair(&self) -> Result<Option<(SignedAnchor, SignedList)>> {
+    pub(super) fn pair(&self) -> Result<Option<(SignedAnchor, SignedList)>> {
         match (&self.anchor, &self.list) {
             (Some(a), Some(l)) => Ok(Some((
                 SignedAnchor::parse(a).ok_or(Invalid("stored anchor"))?,

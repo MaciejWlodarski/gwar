@@ -361,7 +361,7 @@ credential, the OpenMLS provider and Gwar's own per-group records.
 ### Web app storage and concurrency
 
 - MLS runs in the page's main thread, in the wasm module loaded on first use
-  (gzip budget 530 KB, checked in CI; raised from 500 KB for step 6).
+  (gzip budget 560 KB, checked in CI; raised from 500 KB for step 6).
 - Only one tab per device runs MLS: the Web Locks API lock
   `gwar-mls:{device_key}` is taken before connecting. Before releasing it
   (connection replaced or closed) the tab finishes the operation in progress,
@@ -2038,9 +2038,13 @@ review.
 
 ## 6. Private channels
 
-Status: **6a and 6b built, 6c specified**. Hidden plaintext private channels
+Status: **6a and 6b built, 6c in progress**. Hidden plaintext private channels
 (6a), the owner chain and the manager list with their device pins and signing
-(6b) are implemented; encrypted private channels (6c) are next. A private
+(6b) are implemented. For encrypted private channels (6c), the access
+extension, the rules, the observer and the server (6c-1) and the device
+agent's core (6c-2a: creation, the tree rule under the pinned owner chain,
+member-list checkpoints and tombstones, current authority, access edits and
+repairs) are built; offers, restarts, voice and the interface are next. A private
 channel is hidden from everyone it does not admit. It can be plaintext or encrypted, chosen at creation as
 today:
 

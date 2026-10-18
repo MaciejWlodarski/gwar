@@ -19,6 +19,7 @@ import type { VoiceState } from "../proto/VoiceState";
 import type { Managers } from "../proto/Managers";
 import type { OwnerInfo } from "../proto/OwnerInfo";
 import type { AgentFactory, Change, OwnerCheck, OwnerGeneration, OwnerView, CommitOutbox, ConversationStatus, Gate, GroupSummary, HistoryJob, OpenResult, PackageJob, Plaintext, RequestJob, Resolution, Revocation, Roster, SealedFields } from "./types";
+import { usable } from "./types";
 const bytes = (value: string): number[] => [...decodeBase64Url(value)];
 const encoded = (value: number[]): string => encodeBase64Url(new Uint8Array(value));
 /** The DS protocol currently uses safe JSON integers; core epochs remain u64 strings. */
@@ -213,7 +214,9 @@ export class MlsRuntime {
       runtime.unsubscribers.push(options.link.onEvent(event => {
         for (const call of runtime!.calls) call.event(event);
         if (event.ev === "channel.created" && event.d.encrypted) { runtime!.channels?.set(event.d.id, event.d.history); runtime!.schedule(); }
-        if (event.ev === "channel.deleted" && runtime!.channels?.delete(event.d.channel)) runtime!.schedule();
+        // A hidden channel's group is forgotten like a deleted one's; its tombstone keeps the
+        // checkpoints for when it is shown again (6c).
+        if ((event.ev === "channel.deleted" || event.ev === "channel.hidden") && runtime!.channels?.delete(event.d.channel)) runtime!.schedule();
         if (event.ev === "owner.updated") runtime!.checkOwner(event.d);
         if (event.ev === "managers.updated") { runtime!.managers = event.d; runtime!.checkOwner(undefined); }
         if (!event.ev.startsWith("mls.")) return;
@@ -348,6 +351,8 @@ export class MlsRuntime {
       const check = await this.engine.run(() => this.engine.call(a => a.accept_managers?.(server, anchor, list, this.now(), this.options.revocations())));
       this.managersCurrent = check?.kind !== "not_current" && check?.kind !== "renewable";
       this.managersRenewable = check?.kind === "renewable";
+      // A newly accepted pair may make private groups' lists recordable: a pass observes them.
+      if (check?.kind === "accepted") this.schedule();
     }
     this.owner = await this.engine.run(async () => this.engine.withAgent(a => a.owner_view?.(server) ?? null));
     this.verifiedList = managers?.list ?? null;
@@ -409,7 +414,7 @@ export class MlsRuntime {
       this.dirty = false; this.wakeAt = undefined;
       this.activeGeneration = this.generation;
       this.assertCurrent(this.generation);
-      try { await this.synchronize(); }
+      try { await this.observePrivateGroups(); await this.synchronize(); }
       catch (error) {
         // Rosters follow the durable state the failed pass left (a restart
         // accepted before a join failed), before any later operation runs.
@@ -443,7 +448,7 @@ export class MlsRuntime {
     }
     for (const [conversation, g] of shown) {
       const gate = this.gate(encoded(g.group));
-      const ready = gate.status === "active" && !gate.rejoin && !gate.server_pending && !gate.blocked.length && !gate.pending_commit && !this.held.has(conversation);
+      const ready = usable(gate) && !this.held.has(conversation);
       this.statuses.set(conversation, gate.status === "creating" ? "creating" : ready && !securing ? "ready" : "securing");
       const first = g.record.evidence?.[this.uid]?.[0]?.first;
       // A live pin still to be joined (a restart just accepted) already names the conversation's group.
@@ -474,6 +479,18 @@ export class MlsRuntime {
   private async transition<T>(request: unknown, validate?: (result: T) => void): Promise<T> {
     const before = this.inventory();
     return this.engine.op<T>(request, result => { validate?.(result); return [...this.historyIntents(before), ...this.supersededJobs()]; });
+  }
+  /** At the start of every pass, before any replay: records access an interrupted pass, or a
+   * manager pair accepted since, left unobserved. */
+  private async observePrivateGroups(): Promise<void> {
+    // Also a removal's lists, until they are recorded (they may wait for a manager pair).
+    for (const g of this.inventory()) if (g.private && (g.record.status === "active" || g.record.removal_access)) await this.observeAccess(encoded(g.group));
+  }
+  /** After every transition of a private channel's group, before the next one: records a member
+   * list current on first sight as the newest accepted, so a later commit cannot roll it back. */
+  private async observeAccess(group: string): Promise<void> {
+    if (!this.summary(group)?.private) return;
+    await this.engine.op({ observe_access: { ...this.args(group), now: this.now(), revocations: this.options.revocations() } });
   }
   private async groups(): Promise<MlsGroup[]> {
     const all: MlsGroup[] = []; let after: string | null = null;
@@ -646,7 +663,8 @@ export class MlsRuntime {
     if (!channels) return;
     for (const g of this.inventory()) {
       const id = channelOf(g.conversation);
-      if (id === undefined || channels.has(id)) continue;
+      // Tombstones stay: they are all that is left of a forgotten group.
+      if (id === undefined || channels.has(id) || g.record.status === "forgotten") continue;
       const group = encoded(g.group);
       // The group's runtime jobs go with it, in the same write.
       const jobs = [...this.engine.jobs.values()].filter(job => job.kind !== "packages" && job.server === this.server && job.group === group);
@@ -789,6 +807,9 @@ export class MlsRuntime {
     this.voiceGate(group);
   }
   private async syncGroup(group: string, pending = false, beforeWelcome = false): Promise<boolean | "pruned"> {
+    // Every path that replays a private group first records the access it holds (an interrupted
+    // observation included); a failure to persist it aborts the replay.
+    await this.observeAccess(group);
     // Concurrent joins can lose. Bounded retries yield to backoff instead of
     // holding the device's queue forever on an adversarial/busy server.
     let pages = 0;
@@ -796,7 +817,8 @@ export class MlsRuntime {
       if (++pages > 128) throw new Error("MLS catch-up continues on the next pass");
       const version = this.groupVersions.get(group) ?? 0;
       let local = this.summary(group);
-      if (!local || local.record.status === "removed" || local.record.status === "rejoin") {
+      // A tombstone (the channel was hidden and is shown again) is joined like a removal.
+      if (!local || local.record.status === "removed" || local.record.status === "rejoin" || local.record.status === "forgotten") {
         if (beforeWelcome) return false;
         await this.join(group); local = this.summary(group)!;
       }
@@ -811,7 +833,7 @@ export class MlsRuntime {
       }
       if (log.oldest > since) {
         if (beforeWelcome) return "pruned";
-        if (out) { await this.transition({ reconcile: { ...this.args(group), result: { case: "pruned", oldest: String(log.oldest) } } }); this.voiceGate(group); }
+        if (out) { await this.transition({ reconcile: { ...this.args(group), result: { case: "pruned", oldest: String(log.oldest) } } }); await this.observeAccess(group); this.voiceGate(group); }
         else await this.join(group); // Validated newer GroupInfo replaces pruned membership.
         continue;
       }
@@ -820,6 +842,7 @@ export class MlsRuntime {
         if (entry) {
           try {
             const resolution = await this.transition<Resolution>({ reconcile: { ...this.args(group), result: { case: "entry", epoch: String(entry.epoch), commit: bytes(entry.commit), proposals: entry.proposals.map(bytes) } } });
+            await this.observeAccess(group);
             this.voiceGate(group);
             // A validated entry continuing from the checkpoint: no restart is
             // due. A pending join that lost is dropped without validating it.
@@ -854,6 +877,7 @@ export class MlsRuntime {
         if (entry.epoch !== expected) throw new Error("noncontiguous MLS log");
         try {
           await this.transition({ receive: { ...this.args(group), commit: bytes(entry.commit), proposals: entry.proposals.map(bytes) } });
+          await this.observeAccess(group);
           this.voiceGate(group);
         } catch (error) {
           if (!(error instanceof AgentOperationError)) throw error;
@@ -941,8 +965,7 @@ export class MlsRuntime {
     const conversation = this.summary(group)?.conversation;
     if (!this.enabled(conversation)) return false;
     const gate = this.gate(group);
-    return gate.status === "active" && !gate.rejoin && !gate.server_pending && !gate.blocked.length && !gate.pending_commit
-      && conversation !== undefined && !this.held.has(conversation);
+    return usable(gate) && conversation !== undefined && !this.held.has(conversation);
   }
   private async sendHistory(): Promise<void> {
     jobs: for (const value of [...this.engine.jobs.values()]) {
@@ -1140,13 +1163,13 @@ export class MlsRuntime {
         const gate = this.gate(group);
         // An event announced a parent change this device has not processed yet.
         const unseen = this.syncedVersions.get(group) !== (this.groupVersions.get(group) ?? 0);
-        return !unseen && gate.status === "active" && !gate.rejoin && !gate.server_pending && !gate.blocked.length && !gate.pending_commit && !this.outbox(group);
+        return !unseen && usable(gate) && !this.outbox(group);
       },
       syncParent: group => this.engine.run(async () => {
         this.activeGeneration = this.generation; this.assertCurrent(this.activeGeneration);
         await this.syncGroup(group);
         const gate = this.gate(group);
-        return gate.status === "active" && !gate.rejoin && !gate.server_pending && !gate.blocked.length && !gate.pending_commit && !this.outbox(group);
+        return usable(gate) && !this.outbox(group);
       }),
       factory,
       onError: error => this.options.onError?.(error),

@@ -56,10 +56,13 @@ export interface GroupSummary {
   /** The conversation's live pin: its highest accepted incarnation. */
   live: boolean;
   history: boolean;
+  /** A private channel's group (6c): its access checkpoint follows every transition. */
+  private: boolean;
   /** A voice group's parent channel group, from its validated descriptor. */
   channel_group?: string;
   record: {
-    status: "creating" | "active" | "joining" | "removed" | "rejoin" | "superseded";
+    /** `forgotten`: a tombstone of a deleted or hidden channel's group (pin and checkpoints only). */
+    status: "creating" | "active" | "joining" | "removed" | "rejoin" | "superseded" | "forgotten";
     checkpoint: { epoch: string; hash: number[] } | null;
     server_pending: boolean;
     welcome_ids?: string[];
@@ -68,6 +71,12 @@ export interface GroupSummary {
     voice_removed?: string[];
     /** Per uid, the epoch ranges in which it had a leaf, as this device saw them. */
     evidence?: Record<string, { first: string; last: string }[]>;
+    /** A private channel's group: the newest member list this device accepted (6c). */
+    access?: { generation: number; seq: number; hash: string };
+    /** A tombstone of a group this device was removed from. */
+    removed?: boolean;
+    /** The lists of the commit that removed this device, until recorded as the checkpoint. */
+    removal_access?: number[];
   };
   members: { leaf: number; device_key: string; uid: string }[];
 }
@@ -77,6 +86,16 @@ export interface Gate {
   server_pending: boolean;
   rejoin: boolean;
   pending_commit: boolean;
+  /** A private channel's group: this device's current authority in it (6c). */
+  access?: Authority;
+}
+/** Current authority in a private group ((a)–(d)) and the repair this device can make otherwise. */
+export type Authority = { kind: "current" } | { kind: "carry" } | { kind: "remove"; leaves: number[] } | { kind: "wait" };
+/** A gate that lets this device use its group: active, nothing blocking or pending, and in a
+ * private channel's group current authority. */
+export function usable(gate: Gate): boolean {
+  return gate.status === "active" && !gate.rejoin && !gate.server_pending && !gate.blocked.length && !gate.pending_commit
+    && (!gate.access || gate.access.kind === "current");
 }
 export interface CommitOutbox {
   group: number[]; epoch: string; hash: number[]; commit: number[];

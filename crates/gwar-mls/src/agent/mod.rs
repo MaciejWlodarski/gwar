@@ -3,9 +3,11 @@
 
 pub mod epoch_number;
 mod owner;
+mod private;
 mod storage;
 mod voice;
 pub use owner::{ManagersCheck, OwnerCheck, OwnerView, ServerRecord};
+pub use private::{AccessCheckpoint, Authority};
 pub use storage::{Change, Changes, Store, Stores};
 pub use voice::{VoiceKey, VoiceKeys, voice_kid};
 
@@ -40,6 +42,9 @@ pub enum AgentError {
     Blocked,
     #[error("device must rejoin")]
     Rejoin,
+    /// A private channel's lists do not give this device current authority (6c).
+    #[error("waiting for a channel manager")]
+    Waiting,
     #[error(transparent)]
     Rule(#[from] ds::DsError),
 }
@@ -103,7 +108,12 @@ fn capabilities() -> Capabilities {
     Capabilities::new(
         None,
         Some(&[SUITE]),
-        Some(&[ExtensionType::Unknown(DESCRIPTOR_EXTENSION), ExtensionType::LastResort]),
+        // Every leaf can join a private channel's group, which requires its access lists (6c).
+        Some(&[
+            ExtensionType::Unknown(DESCRIPTOR_EXTENSION),
+            ExtensionType::Unknown(crate::access::ACCESS_EXTENSION),
+            ExtensionType::LastResort,
+        ]),
         None,
         Some(&[CredentialType::Basic]),
     )
@@ -165,6 +175,9 @@ pub enum Status {
     /// An earlier incarnation of a conversation that was restarted: no MLS
     /// state, never live again; its epoch keys stay for reading.
     Superseded,
+    /// A tombstone of a group whose channel was deleted or hidden: no MLS state
+    /// and no keys, only its pin and checkpoints, so it can never roll back.
+    Forgotten,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -190,6 +203,18 @@ pub struct GroupRecord {
     /// When this device's own last commit in the group was accepted; `None`
     /// after a Welcome, whose leaf came from a key package.
     pub own_commit_at: Option<i64>,
+    /// A private channel's group: the newest member list this device accepted (6c).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<AccessCheckpoint>,
+    /// A tombstone of a group this device had been removed from: its checkpoint is the epoch
+    /// before the removal, which it must not rejoin.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub removed: bool,
+    /// The access lists of the commit that removed this device from a private channel's group,
+    /// validated as history: recorded as the checkpoint once they are current under the newest
+    /// pair this device accepted ([`Agent::observe_access`]), so it cannot rejoin under older ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removal_access: Option<Vec<u8>>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -252,10 +277,17 @@ pub struct Gate {
     pub server_pending: bool,
     pub rejoin: bool,
     pub status: Status,
+    /// A private channel's group: this device's current authority in it (6c).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<Authority>,
 }
 impl Gate {
     pub fn can_send(&self) -> bool {
-        self.status == Status::Active && self.blocked.is_empty() && !self.server_pending && !self.rejoin
+        self.status == Status::Active
+            && self.blocked.is_empty()
+            && !self.server_pending
+            && !self.rejoin
+            && self.access.as_ref().is_none_or(|a| *a == Authority::Current)
     }
 }
 
@@ -324,6 +356,8 @@ pub struct GroupSummary {
     /// The conversation's live pin: its highest accepted incarnation.
     pub live: bool,
     pub history: bool,
+    /// A private channel's group (6c): its access checkpoint must follow every transition.
+    pub private: bool,
     /// A voice group's parent channel group, from its validated descriptor.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel_group: Option<String>,
@@ -476,10 +510,14 @@ impl Agent {
             if !valid_evidence(&record.evidence) {
                 return Err(Invalid("stored evidence"));
             }
+            if record.removal_access.as_ref().is_some_and(|a| crate::access::Access::parse(a).is_none()) {
+                return Err(Invalid("stored removal access"));
+            }
             if matches!(record.status, Status::Creating | Status::Active | Status::Joining) {
                 let group = agent.mls(key)?;
                 client_context(group.public_group().group_context(), &descriptor.descriptor.server_key)?;
-                rules::tree(&descriptor, group.public_group().treesync().full_leaves().map(|(_, l)| l))?;
+                // Admission was checked when the state was written; a later owner chain need not hold it.
+                rules::tree_structure(&descriptor, group.public_group().treesync().full_leaves().map(|(_, l)| l))?;
                 if record.status == Status::Creating
                     && (group.epoch().as_u64() != 0
                         || record.checkpoint.is_some()
@@ -657,6 +695,7 @@ impl Agent {
                     Vec::new()
                 };
                 Ok(GroupSummary {
+                    private: rules::is_private(&d),
                     group: d.group_id(),
                     live: record.status != Status::Creating
                         && live.get(&d.descriptor.conversation) == Some(&d.descriptor.incarnation),
@@ -775,8 +814,13 @@ impl Agent {
             voice_removed: Vec::new(),
             evidence: BTreeMap::new(),
             own_commit_at: None,
+            access: None,
+            removed: false,
+            removal_access: None,
         });
         record.status = status;
+        record.removed = false;
+        record.removal_access = None;
         record.server_pending = false;
         key
     }
@@ -808,7 +852,33 @@ impl Agent {
         Ok(())
     }
     pub fn create(&mut self, descriptor: SignedDescriptor) -> Result<Vec<u8>> {
+        if rules::is_private(&descriptor) {
+            return Err(Invalid("a private channel's group needs its members"));
+        }
+        self.operation(|a| a.create_inner(descriptor, None))
+    }
+    /// Creates a private channel's group with its initial lists: the newest manager pair this
+    /// device accepted and `members`, signed by this device, which must be the owner, a confirmer
+    /// or a manager under that pair now (docs/e2e-build.md, section 6, 6c).
+    pub fn create_private(
+        &mut self,
+        descriptor: SignedDescriptor,
+        members: &[String],
+        now: i64,
+        revocations: &dyn Revocations,
+    ) -> Result<Vec<u8>> {
+        if !rules::is_private(&descriptor) {
+            return Err(Invalid("not a private channel"));
+        }
         self.operation(|a| {
+            current_time(now)?;
+            let access = a.initial_access(&descriptor, members, now, revocations)?;
+            a.create_inner(descriptor, Some(access))
+        })
+    }
+    fn create_inner(&mut self, descriptor: SignedDescriptor, access: Option<crate::access::Access>) -> Result<Vec<u8>> {
+        {
+            let a = self;
             let descriptor = SignedDescriptor::parse(&descriptor.encode()).ok_or(Invalid("descriptor"))?;
             if descriptor.creator != a.credential || !a.credential.is_current(descriptor.descriptor.created_at, &()) {
                 return Err(Invalid("creator"));
@@ -834,9 +904,9 @@ impl Agent {
             if a.groups.contains_key(&key) {
                 return Err(Invalid("group already known"));
             }
-            let extensions = Extensions::from_vec(vec![
+            let mut extensions = vec![
                 Extension::RequiredCapabilities(RequiredCapabilitiesExtension::new(
-                    &[ExtensionType::Unknown(DESCRIPTOR_EXTENSION)],
+                    &private::required_extensions(access.is_some()),
                     &[],
                     &[CredentialType::Basic],
                 )),
@@ -845,8 +915,11 @@ impl Agent {
                     fixed::<32>(&descriptor.descriptor.server_key).ok_or(Invalid("server key"))?.to_vec().into(),
                     BasicCredential::new(server_credential(&descriptor.descriptor.server_key)).into(),
                 )]),
-            ])
-            .map_err(err("extensions"))?;
+            ];
+            if let Some(access) = &access {
+                extensions.push(Extension::Unknown(crate::access::ACCESS_EXTENSION, UnknownExtension(access.encode())));
+            }
+            let extensions = Extensions::from_vec(extensions).map_err(err("extensions"))?;
             let config = MlsGroupCreateConfig::builder()
                 .ciphersuite(SUITE)
                 .capabilities(capabilities())
@@ -864,10 +937,16 @@ impl Agent {
             )
             .map_err(err("create group"))?;
             client_context(group.public_group().group_context(), &descriptor.descriptor.server_key)?;
-            rules::tree(&descriptor, group.public_group().treesync().full_leaves().map(|(_, l)| l))?;
-            a.record(&descriptor, Status::Creating);
+            a.tree_rule(
+                &descriptor,
+                group.public_group().group_context(),
+                group.public_group().treesync().full_leaves().map(|(_, l)| l),
+            )?;
+            let key = a.record(&descriptor, Status::Creating);
+            a.groups.get_mut(&key).ok_or(Invalid("record"))?.access =
+                access.as_ref().map(|access| AccessCheckpoint::of(access.members()));
             wire(group.export_group_info(a.provider.crypto(), &a.signer, true).map_err(err("group info"))?)
-        })
+        }
     }
 
     /// Settles a creation with the group the server holds for the
@@ -919,6 +998,7 @@ impl Agent {
             pending_commit: self.outbox.contains_key(&key),
             rejoin: false,
             status: record.status,
+            access: None,
         };
         if record.status != Status::Active {
             gate.rejoin = matches!(record.status, Status::Removed | Status::Rejoin);
@@ -937,6 +1017,7 @@ impl Agent {
             }
         }
         gate.rejoin |= gate.blocked.contains(&group.own_leaf_index().u32());
+        gate.access = self.authority(&key, &group, now, revocations)?;
         Ok(gate)
     }
     pub fn sending_key(
@@ -1015,7 +1096,15 @@ impl Agent {
         }
     }
     fn check_staged(&self, group: &MlsGroup, staged: &StagedCommit, sender: &CommitSender, time: i64) -> Result<()> {
-        rules::staged(group.public_group(), staged, sender, time, self.provider.crypto())?;
+        let current = group
+            .public_group()
+            .group_context()
+            .extensions()
+            .unknown(DESCRIPTOR_EXTENSION)
+            .and_then(|ext| SignedDescriptor::parse(&ext.0))
+            .ok_or(Invalid("descriptor"))?;
+        let chain = self.owner_chain(&current.descriptor.server_key)?;
+        rules::staged_with(group.public_group(), staged, sender, time, self.provider.crypto(), chain.as_ref())?;
         for p in staged.queued_proposals() {
             if p.proposal_or_ref_type() == ProposalOrRefType::Reference
                 && !matches!(p.sender(),Sender::External(i) if *i==SenderExtensionIndex::new(0))
@@ -1051,7 +1140,8 @@ impl Agent {
             .collect();
         leaves.extend(staged.add_proposals().map(|p| p.add_proposal().key_package().leaf_node().clone()));
         leaves.extend(staged.update_path_leaf_node().cloned());
-        rules::tree(&descriptor, leaves.iter())?;
+        // A private channel's tree is checked against the lists this commit installs.
+        self.tree_rule(&descriptor, staged.group_context(), leaves.iter())?;
         Ok(())
     }
 
@@ -1181,7 +1271,11 @@ impl Agent {
             // removes only the current epoch's key pairs, and an eviction merge
             // advances the public epoch without deleting the old private keys.
             group.delete(self.provider.storage()).map_err(err("delete group"))?;
-            self.groups.get_mut(key).ok_or(Invalid("record"))?.status = Status::Removed;
+            let access =
+                staged.group_context().extensions().unknown(crate::access::ACCESS_EXTENSION).map(|ext| ext.0.clone());
+            let record = self.groups.get_mut(key).ok_or(Invalid("record"))?;
+            record.status = Status::Removed;
+            record.removal_access = access;
         } else {
             self.fresh(key, staged.group_context())?;
             group.merge_staged_commit(&self.provider, *staged).map_err(err("merge commit"))?;
@@ -1253,9 +1347,10 @@ impl Agent {
             }
         })
     }
-    /// Deletes everything this device holds for a group whose conversation
-    /// no longer exists (a deleted channel): its MLS state with every epoch's
-    /// keys, its outbox, epoch keys, evidence and pin.
+    /// Deletes what this device holds for a group whose conversation it can no
+    /// longer see (a deleted or hidden channel): its MLS state with every
+    /// epoch's keys, its outbox, epoch keys and evidence. A tombstone keeps the
+    /// pin and checkpoints, so the group can never roll back if it returns.
     pub fn forget(&mut self, server: &str, id: &[u8; 32]) -> Result<()> {
         self.operation(|a| {
             let key = group_key(server, id);
@@ -1269,7 +1364,23 @@ impl Agent {
             a.provider.storage().purge_epoch_key_pairs(&group_id).map_err(err("delete keys"))?;
             a.outbox.remove(&key);
             a.epochs.retain(|k, _| !k.starts_with(&format!("{key}/")));
-            a.groups.remove(&key);
+            let voice = a.voice_only;
+            let record = a.groups.get_mut(&key).ok_or(Invalid("record"))?;
+            if !voice && record.status != Status::Creating {
+                record.removed |= record.status == Status::Removed;
+                record.status = Status::Forgotten;
+                record.welcome_ids.clear();
+                record.server_pending = false;
+                record.voice_removals.clear();
+                record.voice_needs_sync = false;
+                record.voice_removed.clear();
+                record.evidence.clear();
+                record.own_commit_at = None;
+            } else {
+                // An unsettled creation was never accepted, and a call's volatile store keeps no
+                // pins: nothing to keep.
+                a.groups.remove(&key);
+            }
             Ok(())
         })
     }
@@ -1330,6 +1441,9 @@ impl Agent {
                     voice_removed: Vec::new(),
                     evidence: BTreeMap::new(),
                     own_commit_at: None,
+                    access: None,
+                    removed: false,
+                    removal_access: None,
                 });
             }
             let live = chain.last().expect("checked above");
@@ -1361,7 +1475,7 @@ impl Agent {
             .clone()
             .into_verified(SUITE, self.provider.crypto(), info.group_id())
             .map_err(err("ratchet tree"))?;
-        rules::tree(&descriptor, tree.leaves())?;
+        self.tree_rule(&descriptor, info.group_context(), tree.leaves())?;
         rules::voice_initial_tree(&descriptor, info.epoch().as_u64(), tree.leaves())?;
         let next = checkpoint(info.group_context())?;
         // Verification only: a throwaway provider, and nothing is committed.
@@ -1415,8 +1529,10 @@ impl Agent {
             if a.outbox.get(&key).is_some_and(|out| info.epoch().as_u64() <= out.epoch) {
                 return Err(Invalid("pending commit"));
             }
+            // Also a tombstone of a removal: forgetting does not make the removed epoch joinable.
             if a.groups.get(&key).is_some_and(|r| {
-                r.status == Status::Removed && r.checkpoint.as_ref().is_some_and(|c| info.epoch().as_u64() <= c.epoch)
+                (r.status == Status::Removed || r.removed)
+                    && r.checkpoint.as_ref().is_some_and(|c| info.epoch().as_u64() <= c.epoch)
             }) {
                 return Err(Invalid("removed checkpoint"));
             }
@@ -1426,8 +1542,9 @@ impl Agent {
                 .clone()
                 .into_verified(SUITE, a.provider.crypto(), info.group_id())
                 .map_err(err("ratchet tree"))?;
-            rules::tree(&descriptor, old_tree.leaves())?;
+            a.tree_rule(&descriptor, info.group_context(), old_tree.leaves())?;
             rules::voice_initial_tree(&descriptor, info.epoch().as_u64(), old_tree.leaves())?;
+            let accepted_access = a.newcomer(&key, &descriptor, info.group_context(), now, revocations)?;
             if old_tree
                 .leaves()
                 .filter_map(leaf_credential)
@@ -1456,13 +1573,20 @@ impl Agent {
                 .finalize(&a.provider)
                 .map_err(err("external finalize"))?;
             client_context(group.public_group().group_context(), server)?;
-            rules::tree(&descriptor, group.public_group().treesync().full_leaves().map(|(_, l)| l))?;
+            a.tree_rule(
+                &descriptor,
+                group.public_group().group_context(),
+                group.public_group().treesync().full_leaves().map(|(_, l)| l),
+            )?;
             group
                 .set_configuration(a.provider.storage(), &join_config(descriptor.descriptor.kind))
                 .map_err(err("group config"))?;
             a.record(&descriptor, Status::Joining);
             let record = a.groups.get_mut(&key).ok_or(Invalid("record"))?;
             record.checkpoint = Some(old_checkpoint.clone());
+            if accepted_access.is_some() {
+                record.access = accepted_access;
+            }
             if a.voice_only {
                 // A snapshot cannot distinguish missed removal/rejoin from a
                 // self-update. Start a fresh membership trust interval, but do
@@ -1700,7 +1824,11 @@ impl Agent {
                 a.drop_mls(&key)?;
             }
             let group = staged.into_group(&a.provider).map_err(err("welcome group"))?;
-            rules::tree(&descriptor, group.public_group().treesync().full_leaves().map(|(_, l)| l))?;
+            a.tree_rule(
+                &descriptor,
+                group.public_group().group_context(),
+                group.public_group().treesync().full_leaves().map(|(_, l)| l),
+            )?;
             a.record(&descriptor, Status::Active);
             a.derived(&key, &group)?;
             let record = a.groups.get_mut(&key).ok_or(Invalid("record"))?;
