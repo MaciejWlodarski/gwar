@@ -339,7 +339,7 @@ impl Agent {
     /// list it signs at the next seq after the group's and its own checkpoint, with `members` or the
     /// group's members. The group's lists come from its GroupInfo, verified as an external joiner
     /// would (tree, a member's signature, Gwar's rules) and valid as history (bound to the group,
-    /// signed by an authority of their own pair, certified when signed). Sent as
+    /// signed by an authority of their own pair, each signer certified when it signed). Sent as
     /// `mls.access.offer`; a member commits it.
     pub fn offer_access(
         &self,
@@ -367,7 +367,7 @@ impl Agent {
             .into_verified(crate::SUITE, self.provider.crypto(), info.group_id())
             .map_err(err("ratchet tree"))?;
         self.tree_rule(&descriptor, info.group_context(), verified.leaves())?;
-        if !shown.valid(&chain, &id, shown.members().members().signed_at) {
+        if !shown.valid_when_signed(&chain, &id) {
             return Err(Invalid("the group's access lists"));
         }
         // Verification only: a throwaway provider, and nothing is committed.
