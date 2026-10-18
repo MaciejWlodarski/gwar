@@ -842,7 +842,8 @@ async fn the_key_archive_keeps_signed_statements_first_manifests_records_and_tra
     };
     cert.signature = b64(&account.sign(vc_proto::device_statement(&cert).as_bytes()).to_bytes());
     let me = Recipient { device_key: cert.device_key.clone(), x25519: public };
-    let (manifest, generation_key) = Manifest::create(1, None, &laptop, &cert, &[me.clone()], None, &[], now).unwrap();
+    let (manifest, generation_key) =
+        Manifest::create(1, None, &laptop, &cert, std::slice::from_ref(&me), None, &[], now).unwrap();
     let encoded = b64(&manifest);
     assert_eq!(api.post("/archive/manifests", Some(&token), json!({"manifest": encoded})).await.0, 200);
     let (again, _) = Manifest::create(1, None, &laptop, &cert, &[me], None, &[], now).unwrap();
