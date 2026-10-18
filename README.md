@@ -3,8 +3,9 @@
 **Gwar** is an open-source, self-hosted voice chat. Run your own server,
 talk from the browser or the desktop app, and keep your friends who still use
 TeamSpeak in the same conversation. It is built to stay trustworthy even when
-the server you join is not: your identity is a key only you hold, and Gwar
-clients sign what you write (see [Security](#security)).
+the server you join is not: your identity is a key only you hold, Gwar clients
+sign what you write, and encrypted conversations, voice included, are
+end-to-end encrypted with MLS (see [Security](#security)).
 
 **Use it:** the official web app at <https://gwar.app> and the desktop app
 connect to any Gwar server. The project also runs a public server that anyone
@@ -44,17 +45,28 @@ use.
   you are. Your saved servers follow you to every device. Servers verify
   devices themselves and keep working if Connect is down. See
   [docs/connect.md](docs/connect.md).
-- **Encrypted direct messages and channels.** Gwar members exchange end-to-end
-  encrypted messages, edits, deletions and files, in direct messages and in
-  channels created encrypted (channels are unencrypted by default). Other
-  devices receive history keys when a member is online. DMs with TeamSpeak users remain plaintext and live-only.
+- **End-to-end encryption.** Direct messages between Gwar members, channels
+  created encrypted (their chat, files and voice) and, if chosen when a server
+  is set up, server-wide chat are end-to-end encrypted with MLS. Voice in an
+  encrypted channel is encrypted on your device (SFrame); the server forwards
+  frames it cannot read. Channels are unencrypted by default, so TeamSpeak users
+  can join them; DMs with TeamSpeak users remain plaintext and live-only.
+- **Your history on every device.** A new device of yours receives history
+  from your other devices, and with the key archive on Gwar Connect (on by
+  default, encrypted so Connect cannot read it) it survives losing every
+  device: your recovery code opens it.
+- **Private channels.** Hidden from everyone they do not admit, for chosen
+  roles and members. An encrypted private channel's member list is signed by
+  the server's owner or a manager and enforced by the encryption itself, so
+  the server cannot add a reader.
 - **Signed chat.** Gwar clients sign every message, edit, deletion and
   attachment and verify everyone else's, so a server cannot put words in a
   Gwar user's mouth without a warning. See [Security](#security).
 - **Moderation.** Roles with any permissions and colors, bans (timed or
   permanent, by identity or IP), invite links that can grant a role, server
   settings, removing members and cleaning up the inactive ones. Nobody can hand
-  out more than they hold.
+  out more than they hold. Every server has an owner, who decides who manages
+  private channels; ownership moves only by a statement the owner signs.
 - **One web app, plus a desktop app, with one UI.** The project hosts the web
   app; it connects to any server. The Tauri 2 desktop app has a native audio
   engine (Opus with FEC, jitter buffer with loss concealment), global
@@ -74,10 +86,11 @@ edges and breaking changes.
 Gwar starts from the assumption that everything is public: the code, the
 protocol, and possibly a modified server you join by mistake. Nothing depends
 on hidden behavior; security comes only from keys that never leave their owner.
-A server is trusted to route voice and deliver messages, and today it can read
-them, but it is never trusted with who you are: even a hostile server cannot
-log in as you elsewhere, forge your messages or show a fake verified name
-without a visible warning.
+A server is trusted to route voice and deliver messages. It can read what is
+said in plaintext channels, but not in encrypted conversations, where it only
+stores and forwards ciphertext; and it is never trusted with who you are: even a
+hostile server cannot log in as you elsewhere, forge your messages or show a
+fake verified name without a visible warning.
 The limits are listed plainly [at the end](#what-gwar-does-not-protect-yet).
 
 ### Your identity is a key
@@ -134,6 +147,32 @@ The limits are listed plainly [at the end](#what-gwar-does-not-protect-yet).
   messages cannot be signed: they still notify, labeled as TeamSpeak, and
   removals by moderators are labeled as the server's.
 
+### End-to-end encryption
+
+- Encrypted conversations use **MLS** (RFC 9420, through OpenMLS) with one
+  cipher suite: X25519, AES-128-GCM, SHA-256 and Ed25519. Each device is its
+  own MLS member, certified by your identity; the server only orders and
+  delivers the group's messages. Every device checks who may join: a direct
+  message admits only its two people, a private channel only its signed list;
+  in a public encrypted channel the server says who is a member, and channel
+  info lists every device that can read.
+- Messages, edits, deletions and files are sealed with keys exported from the
+  group, inside the signed message. A device can open what was sent while it
+  was a member, and what your other devices or the archive gave it.
+- **Voice** in an encrypted channel is encrypted on the sending device with
+  **SFrame** (RFC 9605) under keys from a separate MLS group for each call; the
+  server forwards frames it cannot read, and nothing of an encrypted channel
+  crosses to TeamSpeak.
+- **Private channels**: the server's owner chain, the managers it signs and
+  each channel's member list are signed statements that every device checks,
+  so a server cannot invent a manager or a member.
+- **Key archive**: your devices back up conversation keys to Gwar Connect,
+  encrypted under keys only your current devices and your recovery code can
+  open; Connect sees how much you store, not what or for which conversation.
+- The server still sees who talks to whom and when, sizes, membership changes
+  and who is speaking; the full list is in
+  [docs/e2e.md](docs/e2e.md#what-the-server-still-sees).
+
 ### Gwar Connect: an account that never sees your secrets
 
 - **Your password never leaves your device.** It is stretched there with
@@ -174,14 +213,21 @@ The limits are listed plainly [at the end](#what-gwar-does-not-protect-yet).
 
 Being honest about the limits is part of the design:
 
-- **Gwar-to-Gwar direct messages and encrypted channels are end-to-end
-  encrypted, with their files.** The server stores ciphertext and sees
-  participants, timing, sizes and read marks. Unencrypted channels (the
-  default), server-wide chat, their files, voice, and DMs with TeamSpeak users
-  remain readable by the server. The remaining encryption work is tracked in
-  [docs/e2e-build.md](docs/e2e-build.md).
-- Voice is not signed, and presence, nicknames, channel names and roles are the
-  server's word. A server can also hide, delay or reorder messages.
+- **Only encrypted conversations are end-to-end encrypted.** Unencrypted
+  channels (the default) with their files and voice, plaintext server-wide
+  chat (the default) and DMs with TeamSpeak users remain readable by the
+  server. In encrypted ones it still sees participants, timing, sizes and read
+  marks.
+- In an encrypted call every participant can derive every sender's voice key,
+  so a participant (not the server) could forge another's audio. Presence,
+  nicknames, channel names and roles are the server's word. A server can also
+  hide, delay or reorder messages.
+- **Your devices hold the keys unencrypted.** Conversation keys and the MLS
+  state live in the browser profile or the app's data; anyone who can read
+  them reads the history they open until you revoke the device. Use your
+  operating system's login and disk encryption
+  ([details](docs/security.md#clients-and-the-code-supply-chain)).
+- The encryption has had internal reviews, not yet an independent audit.
 - **File links are like keys** by default: anyone holding a file's link can
   download it without logging in, also after leaving the server, until the
   message is deleted. TeamSpeak users need that to open files posted on Gwar.
@@ -216,8 +262,8 @@ self-hosted Gwar server, so server operators do not need to host a web client.
 
 - The web app runs the code gwar.app serves on every load. Whoever controlled
   its hosting or deployment could serve modified code that reaches your keys,
-  your password and your messages; signatures (and, later, end-to-end
-  encryption) assume your client is genuine.
+  your password and your messages; signatures and end-to-end encryption
+  assume your client is genuine.
 - gwar.app loads no third-party scripts, runs under a strict
   Content-Security-Policy, and publishes the commit it was built from at
   <https://gwar.app/version.json>.
@@ -480,7 +526,9 @@ feature (`teamspeak`, on by default); build without it with
 | Path | What it is |
 | --- | --- |
 | `crates/vc-server` | Server: core (state, permissions, SQLite), WebSocket gateway, WebRTC SFU, TeamSpeak bridge |
-| `crates/vc-proto` | The `vc/3` protocol (Rust types, generated TypeScript types) |
+| `crates/vc-proto` | The `vc/4` protocol (Rust types, generated TypeScript types) |
+| `crates/gwar-mls` | End-to-end encryption: Gwar's rules on top of OpenMLS, the device agent, the key archive |
+| `crates/gwar-mls-wasm` | `gwar-mls` for the web app (WebAssembly) |
 | `crates/vc-client` | Native client: protocol, voice engine, TeamSpeak mode |
 | `crates/gwar-connect` | Gwar Connect, the optional account service |
 | `apps/web` | The shared UI (React): the hosted web app and the desktop app's UI |
@@ -489,8 +537,9 @@ feature (`teamspeak`, on by default); build without it with
 
 More in [docs/architecture.md](docs/architecture.md), [docs/connect.md](docs/connect.md),
 [docs/security.md](docs/security.md), [docs/deploy.md](docs/deploy.md),
-[docs/releasing.md](docs/releasing.md), [docs/latency.md](docs/latency.md) and, for what comes next,
-[docs/e2e.md](docs/e2e.md).
+[docs/releasing.md](docs/releasing.md), [docs/latency.md](docs/latency.md), and for the
+end-to-end encryption [docs/e2e.md](docs/e2e.md) (design) and
+[docs/e2e-build.md](docs/e2e-build.md) (specification).
 
 ## Tests
 
@@ -498,6 +547,8 @@ More in [docs/architecture.md](docs/architecture.md), [docs/connect.md](docs/con
 cargo test --workspace          # includes end-to-end WebRTC voice tests
 pnpm --filter web test          # UI unit tests
 pnpm --filter web e2e           # Playwright: two users against a local server and Connect
+pnpm --filter web e2e:mls       # encrypted groups in the browser (also e2e:dm, e2e:private, e2e:archive);
+                                # needs the wasm build and `cargo build -p vc-server -p gwar-connect`
 VC_TS3_DIR=/tmp/ts3 cargo test -p vc-client --test teamspeak_mode --test teamspeak_interop -- --test-threads=1
                                 # against the real TeamSpeak server (downloaded into VC_TS3_DIR)
 ```
@@ -518,13 +569,10 @@ VC_TS3_DIR=/tmp/ts3 cargo test -p vc-client --test teamspeak_mode --test teamspe
   the desktop RNNoise by default, which adds almost no latency, with
   DeepFilterNet as a higher-quality option for loud surroundings; the web
   app starts with the browser's own suppression.
-- **More end-to-end encryption**: server-wide chat with MLS, voice with
-  SFrame. Gwar direct messages and encrypted channels, with their files,
-  already use encrypted storage and offline delivery. Encryption is chosen when a channel is created, with or without
-  history for new members, and your history follows you to your devices
-  through Gwar Connect. Channels shared with TeamSpeak users stay unencrypted
-  and are labeled as such. Design: [docs/e2e.md](docs/e2e.md); prototypes
-  and the remaining build steps are in progress.
+- **An independent review of the end-to-end encryption** before it is called
+  stable. It is built (direct messages, channels, server-wide chat, voice,
+  private channels, the key archive) and reviewed internally; the record is in
+  [docs/e2e-build.md](docs/e2e-build.md).
 - **Mobile app** (iOS and Android).
 - **Streaming**: screen sharing and video, peer to peer and through the server.
 - **Fully native clients** later, keeping the same protocol.
