@@ -6,8 +6,10 @@ import { useSession } from "../state/stores";
 import { useMyGroups } from "./hooks";
 import { Input } from "./kit";
 
-/** Who a private channel admits besides admins: roles and members (docs/e2e-build.md, section 6). */
-export function AccessPicker({ value, onChange }: { value: ChannelAccess; onChange: (access: ChannelAccess) => void }) {
+/** Who a private channel admits besides admins: roles and members (docs/e2e-build.md, section 6).
+ * `membersOnly`: an encrypted private channel's signed member list (6c): roles are not stored but
+ * expanded to their current members ("Add everyone with role…"). */
+export function AccessPicker({ value, onChange, membersOnly = false, disabled = false }: { value: ChannelAccess; onChange: (access: ChannelAccess) => void; membersOnly?: boolean; disabled?: boolean }) {
   const t = useT();
   const groups = useSession((s) => s.groups);
   const members = useSession((s) => s.members);
@@ -34,8 +36,26 @@ export function AccessPicker({ value, onChange }: { value: ChannelAccess; onChan
   return (
     <div className="flex flex-col gap-2 rounded-md border border-line p-3">
       <p className="text-sm font-medium">{t("channel.access")}</p>
-      <p className="text-xs text-subtle">{t("channel.accessHint")}</p>
-      {roles.length > 0 && (
+      <p className="text-xs text-subtle">{t(membersOnly ? "channel.membersHint" : "channel.accessHint")}</p>
+      {membersOnly && roles.length > 0 && (
+        <div className="flex flex-wrap gap-1">
+          {roles.map((role) => (
+            <button
+              key={role.id}
+              type="button"
+              disabled={disabled}
+              className="rounded border border-line px-2 py-0.5 text-xs hover:bg-hover disabled:opacity-50"
+              onClick={() => {
+                const add = Object.values(members).filter((m) => !m.uid.startsWith("ts:") && m.groups.includes(role.id)).map((m) => m.uid);
+                onChange({ ...value, users: [...new Set([...value.users, ...add])] });
+              }}
+            >
+              {t("channel.addRole", { role: role.name })}
+            </button>
+          ))}
+        </div>
+      )}
+      {!membersOnly && roles.length > 0 && (
         <fieldset className="flex flex-col gap-1">
           <legend className="mb-1 text-xs font-medium text-subtle">{t("channel.accessRoles")}</legend>
           {roles.map((role) => (
@@ -60,6 +80,7 @@ export function AccessPicker({ value, onChange }: { value: ChannelAccess; onChan
               <input
                 type="checkbox"
                 checked={value.users.includes(m.uid)}
+                disabled={disabled}
                 onChange={() => onChange({ ...value, users: toggle(value.users, m.uid) })}
                 className="size-4 accent-[var(--accent)]"
               />

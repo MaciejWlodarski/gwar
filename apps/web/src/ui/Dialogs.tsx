@@ -21,7 +21,7 @@ import { Lightbox } from "./Attachments";
 import { InvitesDialog, ServerSettingsDialog } from "./ServerSettings";
 import { FirstRunDialog } from "./TeamspeakFound";
 import { IdentityPicker } from "./IdentityPicker";
-import { useMemberName, useMyGroups, useTsIdentities } from "./hooks";
+import { useMemberName, useMyGroups, useOwnerView, useTsIdentities } from "./hooks";
 import { canGiveGroup } from "../lib/permissions";
 import { resolveIdentity } from "../connect/ts-list";
 
@@ -245,8 +245,16 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
   const [access, setAccess] = useState<ChannelAccess>(() => existing?.access ?? { roles: [], users: me ? [me] : [] });
   // What the dialog opened with: saving sends only the changes made here, on top of the current access.
   const [openedAccess] = useState(access);
+  // An encrypted private channel (6c): its members are a list signed by the owner, a confirmer or a
+  // manager, which only they can create or edit.
+  const ownerView = useOwnerView();
+  const authority = !!ownerView && !!ownerView.anchor_seq && (ownerView.owner === me || ownerView.confirmers.includes(me) || ownerView.managers.includes(me));
+  const encryptedPrivate = props.mode === "create" ? offerEncryption && encrypted && privateChannel : !!existing?.private && !!existing?.encrypted;
+  const [signedMembers] = useState(() => (existing && encryptedPrivate ? controller.privateMembers(existing.id) : null));
+  const [members, setMembers] = useState<ChannelAccess>(() => ({ roles: [], users: signedMembers?.members ?? (me ? [me] : []) }));
+  const signerName = useMemberName(signedMembers?.signer_uid ?? "", (signedMembers?.signer_uid ?? "").slice(0, 8));
   // An encrypted channel has no password: its messages are readable only by its group anyway.
-  const sealedChannel = (offerEncryption ? encrypted && !privateChannel : !!existing?.encrypted) || isPrivate;
+  const sealedChannel = (offerEncryption ? encrypted : !!existing?.encrypted) || isPrivate;
 
   useEffect(() => {
     if (props.mode === "edit" && !existing) close();
@@ -275,15 +283,16 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
     const parentId = parent === NONE ? null : Number(parent);
     try {
       if (props.mode === "create") {
-        await controller.createChannel({
+        const payload = {
           name: name.trim(),
           parent: parentId,
           topic: topic.trim() || null,
           password: sealedChannel ? null : password || null,
           max_clients: max,
-          ...(offerEncryption && encrypted && !privateChannel ? { encrypted: true, history } : {}),
-          ...(privateChannel ? { private: true, access } : {}),
-        });
+          ...(offerEncryption && encrypted ? { encrypted: true, history } : {}),
+          ...(privateChannel ? { private: true, ...(encryptedPrivate ? {} : { access }) } : {}),
+        };
+        await (encryptedPrivate ? controller.createChannel(payload, members.users) : controller.createChannel(payload));
         if (offerEncryption) useSettings.getState().setChannelEncryption(serverKey, encrypted);
       } else if (existing) {
         const parentChanged = parentId !== existing.parent;
@@ -296,8 +305,12 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
           // 0 removes the limit (protocol rule for channel.update).
           ...(max !== (existing.max_clients ?? null) ? { max_clients: max ?? 0 } : {}),
           ...(parentChanged ? (parentId === null ? { move_to_root: true } : { parent: parentId }) : {}),
-          ...(existing.private && !sameAccess(openedAccess, access) ? { access: rebaseAccess(openedAccess, access, existing.access) } : {}),
+          ...(existing.private && !encryptedPrivate && !sameAccess(openedAccess, access) ? { access: rebaseAccess(openedAccess, access, existing.access) } : {}),
         });
+        const before = new Set(signedMembers?.members ?? []);
+        if (encryptedPrivate && signedMembers && (before.size !== members.users.length || members.users.some((u) => !before.has(u)))) {
+          await controller.setPrivateMembers(existing.id, members.users);
+        }
       }
       close();
     } catch (err) {
@@ -314,7 +327,7 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
       footer={
         <>
           <Button onClick={close}>{t("common.cancel")}</Button>
-          <Button variant="primary" busy={busy} disabled={!name.trim()} onClick={() => void submit()}>
+          <Button variant="primary" busy={busy} disabled={!name.trim() || (props.mode === "create" && encryptedPrivate && !authority)} onClick={() => void submit()}>
             {props.mode === "create" ? t("common.create") : t("common.save")}
           </Button>
         </>
@@ -356,8 +369,17 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
         {offerEncryption && (
           <Switch checked={privateChannel} onCheckedChange={setPrivateChannel} label={t("channel.private")} description={t("channel.privateHint")} />
         )}
-        {isPrivate && <AccessPicker value={access} onChange={setAccess} />}
-        {offerEncryption && !privateChannel && (
+        {isPrivate && !encryptedPrivate && <AccessPicker value={access} onChange={setAccess} />}
+        {encryptedPrivate && (
+          <>
+            <AccessPicker value={members} onChange={setMembers} membersOnly disabled={!authority} />
+            {signedMembers && (
+              <p className="text-xs text-subtle">{t("channel.membersSigned", { name: signerName, date: new Date(signedMembers.signed_at).toLocaleString() })}</p>
+            )}
+            {!authority && <p className="text-xs text-subtle">{t("channel.membersAuthority")}</p>}
+          </>
+        )}
+        {offerEncryption && (
           <div className="flex flex-col gap-1">
             <Switch checked={encrypted} onCheckedChange={setEncrypted} label={t("channel.encrypted")} description={t("channel.encryptedHint")} />
             {encrypted && <Switch checked={history} onCheckedChange={setHistory} label={t("channel.history")} description={t("channel.historyHint")} />}

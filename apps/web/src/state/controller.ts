@@ -1071,12 +1071,28 @@ class Controller {
     await this.attempt(this.joinChannel(channel));
   }
 
-  async createChannel(c: ChannelCreate | (Partial<ChannelCreate> & { name: string })) {
+  /** `members`: an encrypted private channel's first member list, signed by this device (6c). */
+  async createChannel(c: ChannelCreate | (Partial<ChannelCreate> & { name: string }), members?: string[]) {
     const runtime = this.runtime;
     const channel = await this.connection.request("channel.create", c);
     // The creator makes the group right away instead of after a random wait.
-    if (channel.encrypted && runtime === this.runtime) runtime?.channelCreated(channel.id);
+    if (channel.encrypted && runtime === this.runtime) {
+      if (channel.private) runtime?.channelCreated(channel.id, members ?? []);
+      else runtime?.channelCreated(channel.id);
+    }
     return channel;
+  }
+
+  /** An encrypted private channel's member list as this device holds it (6c). */
+  privateMembers(channel: number) {
+    return this.runtime?.privateMembers(channel) ?? null;
+  }
+
+  /** Signs and commits a new member list for an encrypted private channel (6c). */
+  async setPrivateMembers(channel: number, members: string[]) {
+    const runtime = this.runtime;
+    if (!runtime) throw new Error("encryption is not ready");
+    await runtime.setPrivateMembers(channel, members);
   }
 
   /** Who can read an encrypted conversation, as this device's group sees it; null until it is secured. */

@@ -92,7 +92,8 @@ export class SealedConversations {
     const state = useSession.getState();
     for (const key of Object.keys(state.threads)) {
       if (!sealedThread(key, state.kind, state.channels, state.server?.server_chat)) continue;
-      state.dispatch({ type: "sealedStatus", thread: key as SealedKey, securing: this.runtime.status(this.conversation(key as SealedKey)) !== "ready" });
+      const status = this.runtime.status(this.conversation(key as SealedKey));
+      state.dispatch({ type: "sealedStatus", thread: key as SealedKey, securing: status !== "ready", waiting: status === "waiting" });
     }
     void this.retryMissing();
   }

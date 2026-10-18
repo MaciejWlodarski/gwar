@@ -44,6 +44,8 @@ export interface Thread {
   /** Private conversations: who it is with. */
   peer?: { uid: string; name: string };
   securing?: boolean;
+  /** An encrypted private channel waiting for a channel manager to confirm this device's access (6c). */
+  waiting?: boolean;
 }
 
 export type Phase = "idle" | "connecting" | "online" | "reconnecting" | "closed";

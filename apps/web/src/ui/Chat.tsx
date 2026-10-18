@@ -758,6 +758,7 @@ function Composer({ threadKey, attachRef, editLastRef }: { threadKey: ThreadKey;
   const online = useSession((s) => s.phase === "online");
   const encrypted = useSession(s => sealedThread(storedKey(s, threadKey), s.kind, s.channels, s.server?.server_chat));
   const securing = useSession(s => encrypted && s.threads[storedKey(s, threadKey) ?? ""]?.securing !== false);
+  const waiting = useSession(s => encrypted && !!s.threads[storedKey(s, threadKey) ?? ""]?.waiting);
   const peerOnline = useSession((s) => (threadKey.startsWith("dm:") && !encrypted ? Object.values(s.clients).some((c) => c.uid === threadKey.slice(3)) : true));
   const peerName = useSession((s) => (threadKey.startsWith("dm:") ? s.threads[threadKey]?.peer?.name : undefined));
   const channelName = useSession((s) => (s.viewChannel === null ? "" : (s.channels[s.viewChannel]?.name ?? "")));
@@ -882,7 +883,7 @@ function Composer({ threadKey, attachRef, editLastRef }: { threadKey: ThreadKey;
     addFiles(files);
   };
 
-  const placeholder = securing ? t("chat.securing") : locked
+  const placeholder = waiting ? t("chat.waitingManager") : securing ? t("chat.securing") : locked
     ? t("chat.placeholderLocked")
     : !peerOnline
     ? t("chat.peerOfflineNamed", { name: peerName ?? "" })

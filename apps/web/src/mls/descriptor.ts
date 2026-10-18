@@ -20,14 +20,17 @@ export function channelOf(conversation: string): number | undefined {
 }
 /** A restart's place in its conversation's chain: the next incarnation and the group it replaces. */
 export interface Successor { incarnation: number; previous: string }
-export async function descriptor(identity: Identity, uid: string, server: string, conversation: string, now: number, history = true, successor?: Successor): Promise<{ bytes: number[]; group: string }> {
+/** `foundingOwner`: an encrypted private channel's group, with the owner at its first creation (6c). */
+export async function descriptor(identity: Identity, uid: string, server: string, conversation: string, now: number, history = true, successor?: Successor, foundingOwner?: string): Promise<{ bytes: number[]; group: string }> {
   const kind = conversation === "server" ? "server" : conversation.startsWith("dm:") ? "dm" : channelOf(conversation) !== undefined ? "channel" : undefined;
   if (kind === "dm" && (!participants(conversation).includes(uid) || !history)) throw new Error("not a participant");
   if (kind === "server" && !history) throw new Error("server chat requires history");
   if (!kind) throw new Error("unsupported conversation");
+  if (foundingOwner !== undefined && kind !== "channel") throw new Error("only channels are private");
+  if (foundingOwner !== undefined) decodeFixed(foundingOwner, 20);
   decodeFixed(server, 32);
   if (successor) decodeFixed(successor.previous, 32);
-  const statement = enc.encode(["gwar conversation v1", server, conversation, kind, String(successor?.incarnation ?? 0), successor?.previous ?? "-", "0", history ? "1" : "0", "-", "-", uid, now, encodeBase64Url(crypto.getRandomValues(new Uint8Array(16)))].join("\n"));
+  const statement = enc.encode(["gwar conversation v1", server, conversation, kind, String(successor?.incarnation ?? 0), successor?.previous ?? "-", foundingOwner ? "1" : "0", history ? "1" : "0", foundingOwner ?? "-", "-", uid, now, encodeBase64Url(crypto.getRandomValues(new Uint8Array(16)))].join("\n"));
   const fields = [statement, credential(identity), decodeFixed(await identity.sign(statement), 64)];
   // The descriptor signature is base64url text, unlike history's raw signature.
   fields[2] = enc.encode(encodeBase64Url(fields[2]!));

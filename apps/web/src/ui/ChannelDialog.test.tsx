@@ -7,8 +7,8 @@ import { useSession, useUi } from "../state/stores";
 import { Dialogs } from "./Dialogs";
 import { TooltipProvider } from "./kit";
 
-const mock = vi.hoisted(() => ({ create: vi.fn(async (_: object) => ({ id: 9 })), update: vi.fn(async (_: object) => ({})) }));
-vi.mock("../state/controller", () => ({ controller: { messageServerKey: "server-a", createChannel: mock.create, updateChannel: mock.update }, describeRequestError: String, UploadError: class extends Error {} }));
+const mock = vi.hoisted(() => ({ create: vi.fn(async (_: object, _members?: string[]) => ({ id: 9 })), update: vi.fn(async (_: object) => ({})), ownerView: null as unknown }));
+vi.mock("../state/controller", () => ({ controller: { messageServerKey: "server-a", createChannel: mock.create, updateChannel: mock.update, onRoster: () => () => {}, ownerView: () => mock.ownerView, privateMembers: () => null }, describeRequestError: String, UploadError: class extends Error {} }));
 
 describe("creating a channel", () => {
   let container: HTMLDivElement, root: Root;
@@ -71,11 +71,32 @@ describe("creating a channel", () => {
     await open();
     await act(async () => switchFor("Private")!.click());
     expect(password()).toBeNull();
-    expect(switchFor("End-to-end encrypted")).toBeUndefined();
+    expect(switchFor("End-to-end encrypted")?.getAttribute("aria-checked")).toBe("false");
     expect(document.body.textContent).toContain("Who can see this channel");
     await create("hidden");
     expect(mock.create).toHaveBeenCalledWith(expect.objectContaining({ name: "hidden", password: null, private: true, access: { roles: [], users: ["me-uid"] } }));
     expect(mock.create.mock.calls[0]![0]).not.toHaveProperty("encrypted");
+  });
+  it("creates an encrypted private channel with a signed member list, for an authority only", async () => {
+    useSession.setState({ me: { session: 1, uid: "me-uid" } as never, groups: {}, members: {} });
+    mock.ownerView = null;
+    await open();
+    await act(async () => switchFor("Private")!.click());
+    await act(async () => switchFor("End-to-end encrypted")!.click());
+    expect(document.body.textContent).toContain("Only the server's owner, confirmers and managers");
+    const button = () => [...document.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')].find(b => b.textContent === "Create")!;
+    expect(button().disabled).toBe(true);
+    await act(async () => useUi.getState().closeDialog());
+    mock.ownerView = { owner: "me-uid", confirmers: [], managers: [], anchor_seq: 1 };
+    await open();
+    await act(async () => switchFor("Private")!.click());
+    await act(async () => switchFor("End-to-end encrypted")!.click());
+    await create("sealed");
+    const [payload, members] = mock.create.mock.calls[0]!;
+    expect(payload).toMatchObject({ name: "sealed", private: true, encrypted: true });
+    expect(payload).not.toHaveProperty("access");
+    expect(members).toEqual(["me-uid"]);
+    mock.ownerView = null;
   });
   it("offers only roles I hold and no TeamSpeak users in the access picker", async () => {
     const role = (id: number, name: string) => ({ id, name, permissions: [], color: null });
