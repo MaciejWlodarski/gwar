@@ -60,6 +60,15 @@ export class Engine {
     if (!this.agent) throw new Error("MLS agent not loaded");
     return this.agent.execute(request) as T;
   }
+  /** A direct agent method that may change state; its changes are persisted like an operation's.
+   * Call it inside `run`. */
+  async call<T>(method: (agent: WasmAgent) => T): Promise<T> {
+    if (!this.agent) throw new Error("MLS agent not loaded");
+    let result: T;
+    try { result = method(this.agent); } catch (error) { throw new AgentOperationError(error); }
+    await this.persist(this.agent.take_changes());
+    return result;
+  }
   async op<T>(request: unknown, extra?: (result: T) => Change[]): Promise<T> {
     let result: T;
     try { result = this.query<T>(request); } catch (error) { throw new AgentOperationError(error); }

@@ -7,4 +7,6 @@ declare module "*gwar_mls_wasm.js" {
     take_changes(): import("./types").Changes;
     free(): void;
   }
+  /** The envelope of a confirmer anchor signed by the owner's account key, verified. */
+  export function anchor_envelope(statement: string, account_key: string, signature: string): Uint8Array;
 }

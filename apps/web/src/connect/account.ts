@@ -300,6 +300,15 @@ export async function revokeDevice(record: ConnectRecord, deviceKey: string, pas
   return saveUnlocked(record, opened, deps);
 }
 
+/**
+ * Signs a Gwar statement with the account key (an owner link or a confirmer anchor,
+ * docs/e2e-build.md section 6); needs the password, like revoking a device.
+ */
+export async function signStatement(record: ConnectRecord, statement: string, password: string, deps: FlowDeps): Promise<{ accountKey: string; signature: string }> {
+  const { account } = await unlock(deps.api, record.handle, password);
+  return { accountKey: account.publicKey, signature: await signText(account.jwk, statement) };
+}
+
 /** Renews only this device's certificate. */
 export async function renewCertificate(record: ConnectRecord, password: string, deps: FlowDeps): Promise<ConnectRecord> {
   const { token, account } = await unlock(deps.api, record.handle, password);

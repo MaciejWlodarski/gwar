@@ -2,7 +2,8 @@ import { attachment as attachmentSchema } from "../net/schema";
 import { SealedConversations, type SealedKey } from "./sealed";
 import type { MlsRuntime } from "../mls/runtime";
 import type { VoiceCall } from "../mls/voice";
-import type { Roster } from "../mls/types";
+import type { OwnerView, Roster } from "../mls/types";
+import { managerUpkeep } from "../lib/managers";
 import { messageStorage, refreshRevocations } from "../net/message-storage";
 import { conversationThread, sealedThread, threadConversation } from "../lib/chat";
 import { messageTarget } from "../lib/chat";
@@ -87,6 +88,8 @@ export interface ConnectParams {
   /** Invite code from a link: admits without the server password. */
   invite?: string;
   inviteServerKey?: string;
+  /** The owner an invite link named: checked on first contact with its server. */
+  inviteOwner?: string;
   insecureLan?: boolean;
   /** TeamSpeak only: the uid of the identity to connect with (default: the default one). */
   identity?: string;
@@ -405,6 +408,22 @@ class Controller {
               revocations: messageStorage.currentRevocations, signal: abort.signal,
               onError: error => console.warn("Conversation synchronization:", error),
               onTakeover: () => void this.sessionMoved(conn),
+              inviteOwner: params.inviteOwner,
+              // docs/e2e-build.md, section 6, 6b: a changed owner record is not this server any more.
+              onOwnerChanged: () => {
+                if (this.conn !== conn) return;
+                useUi.getState().toast("error", tNow("owner.changed"));
+                void this.disconnect();
+              },
+              onOwnerGeneration: (notice) => {
+                if (this.conn !== conn) return;
+                const name = useSession.getState().members[notice.owner]?.nickname ?? notice.owner;
+                useUi.getState().openDialog({
+                  kind: "confirm", title: tNow("owner.newTitle"), body: tNow("owner.newBody", { name }),
+                  confirmLabel: tNow("owner.accept"),
+                  onConfirm: () => { void notice.accept().catch((error) => console.warn("Owner change:", error)); },
+                });
+              },
             }).catch((error: unknown) => { throw error instanceof DeviceTakenOver ? new SessionMoved() : error; });
           } catch (error) {
             // Voice and channels do not depend on MLS: if it cannot start before
@@ -660,6 +679,8 @@ class Controller {
   }
 
   private async teardown(): Promise<void> {
+    // Approvals and prompts of the manager list belong to one connection to one server.
+    this.grantedByMe.clear(); this.askedManagers.clear(); this.lastRenewal = 0;
     // A newer connect may finish its own teardown and start while this one
     // waits; it then owns the state below, so this one stops.
     const generation = this.connections;
@@ -1063,9 +1084,147 @@ class Controller {
     const uid = useSession.getState().me?.uid;
     return uid && this.runtime ? this.runtime.roster(threadConversation(thread, uid)) : null;
   }
+  /** The server's owner and the managers of private channels as this device verified them (6b). */
+  ownerView(): OwnerView | null { return this.runtime?.ownerView() ?? null; }
+
+  /** True when this identity signs owner statements with a Gwar Connect account (needs the password). */
+  ownerSigningNeedsPassword(): boolean { return !!(this.conn instanceof Connection && this.conn.identity.device); }
+
+  /** Signs a statement with the account key: the local identity's own key, or the Connect account's. */
+  private async signAsAccount(statement: string, password?: string): Promise<{ accountKey: string; signature: string }> {
+    const conn = this.conn;
+    if (!(conn instanceof Connection)) throw new Error("not connected to a Gwar server");
+    if (conn.identity.device) {
+      if (!password) throw new Error("the password is needed");
+      const { accountActions } = await import("./account");
+      return accountActions.signStatement(statement, password);
+    }
+    return { accountKey: accountKeyOf(conn.identity), signature: await conn.identity.sign(new TextEncoder().encode(statement)) };
+  }
+
+  /**
+   * The owner names the confirmers (who may maintain the manager list): signs a new anchor with the
+   * account key and a list under it with the managers that remain (docs/e2e-build.md, section 6).
+   */
+  async setConfirmers(confirmers: string[], password?: string, managers?: string[]): Promise<void> {
+    const runtime = this.runtime;
+    if (!runtime) throw new Error("encryption is not ready");
+    const statement = await runtime.nextAnchor(confirmers);
+    const { accountKey, signature } = await this.signAsAccount(statement, password);
+    const { anchorEnvelope } = await import("../mls/wasm");
+    const anchor = await anchorEnvelope(statement, accountKey, signature);
+    // Without explicit managers the list keeps the server's verified membership (the agent drops
+    // new confirmers from it); the very first list starts empty.
+    const keep = managers ? managers.filter((m) => !confirmers.includes(m)) : useSession.getState().managers?.list ? null : [];
+    await runtime.publishManagers(keep, anchor);
+  }
+
+  /** The owner or a confirmer sets the plain managers. The first list needs the owner's anchor. */
+  async setManagers(managers: string[], password?: string): Promise<void> {
+    const runtime = this.runtime;
+    if (!runtime) throw new Error("encryption is not ready");
+    if (useSession.getState().managers?.anchor) await runtime.publishManagers(managers);
+    else await this.setConfirmers([], password, managers);
+  }
+
+  /** Moves ownership to another member, signed with the owner's account key. */
+  async transferOwnership(newOwner: string, password?: string): Promise<void> {
+    const runtime = this.runtime, conn = this.conn;
+    if (!runtime || !(conn instanceof Connection)) throw new Error("encryption is not ready");
+    let accountKey = accountKeyOf(conn.identity);
+    if (conn.identity.device) {
+      const { useAccount } = await import("./account");
+      accountKey = useAccount.getState().account?.accountKey ?? accountKey;
+    }
+    const statement = await runtime.transferStatement(accountKey, newOwner);
+    const { signature } = await this.signAsAccount(statement, password);
+    await runtime.transferOwnership(statement, signature);
+  }
+
   /** Calls back when a conversation's readers may have changed. */
   onRoster(listener: () => void): () => void { this.rosterListeners.add(listener); return () => this.rosterListeners.delete(listener); }
-  private rosterChanged = (): void => { for (const listener of this.rosterListeners) listener(); };
+  private rosterChanged = (): void => {
+    for (const listener of this.rosterListeners) listener();
+    this.maintainManagers();
+  };
+
+  /** Uids this session gave roles to: added as managers without a prompt when they become pending. */
+  private grantedByMe = new Set<string>();
+  /** Pending managers already asked about in this session. */
+  private askedManagers = new Set<string>();
+  private maintaining: Promise<void> | null = null;
+
+  /** When this client last re-signed a list only to renew it (not for a change). */
+  private lastRenewal = 0;
+
+  /**
+   * The owner's and confirmers' clients keep the manager list mirroring `channel_edit`
+   * (docs/e2e-build.md, section 6, "Who signs" and "Renewal"): stale managers go, people I just
+   * gave the role join, others after "Allow @name to manage private channels?", and the list is
+   * re-signed when it is old, its signer's certificate is about to expire, or it is no longer
+   * current (its signer was revoked or lost authority). The owner removes stale confirmers.
+   */
+  private maintainManagers(): void {
+    const runtime = this.runtime, view = runtime?.ownerView(), state = useSession.getState(), conn = this.conn;
+    const me = state.me?.uid, server = state.managers;
+    if (!runtime || !view || !me || !server || this.maintaining || !(conn instanceof Connection)) return;
+    // An approval ends once the list names the person (whoever added them) or they lost the role.
+    for (const u of this.grantedByMe) {
+      if (view.managers.includes(u) || view.confirmers.includes(u) || u === view.owner || !this.editsChannels(u)) this.grantedByMe.delete(u);
+    }
+    // One prompt at a time: an unanswered one is never replaced; the next comes after it closes.
+    const idle = useUi.getState().dialog.kind === "none";
+    const action = managerUpkeep({
+      me, view, server, current: runtime.serverManagersCurrent(), renewable: runtime.serverManagersRenewable(), settled: runtime.managersSettled(), granted: this.grantedByMe, asked: this.askedManagers,
+      now: Date.now(), ownExpiry: conn.identity.device?.expires_at ?? Infinity, lastRenewal: this.lastRenewal,
+    });
+    const settle = (work: Promise<void>, what: string) => {
+      this.maintaining = work.catch((error) => console.warn(what, error)).finally(() => { this.maintaining = null; });
+    };
+    switch (action.kind) {
+      case "none":
+        return;
+      case "publish":
+        if (action.renewal) this.lastRenewal = Date.now();
+        for (const u of action.consumed) this.grantedByMe.delete(u);
+        settle(runtime.publishManagers(action.managers), "Manager list:");
+        return;
+      case "staleConfirmers": {
+        if (!this.ownerSigningNeedsPassword()) {
+          // Done once per connection when it succeeds; a failure (e.g. the list changed meanwhile)
+          // is tried again against fresh state a minute later.
+          this.askedManagers.add(action.marker);
+          settle(this.setConfirmers(action.keep).catch((error) => {
+            setTimeout(() => { if (this.conn === conn) { this.askedManagers.delete(action.marker); this.maintainManagers(); } }, 60_000);
+            throw error;
+          }), "Confirmers:");
+          return;
+        }
+        if (!idle) return;
+        this.askedManagers.add(action.marker);
+        const names = action.stale.map((u) => state.members[u]?.nickname ?? u).join(", ");
+        useUi.getState().openDialog({
+          kind: "confirm", title: tNow("own.staleTitle"), body: tNow("own.staleBody", { names }), confirmLabel: tNow("own.open"),
+          onConfirm: () => useUi.getState().openDialog({ kind: "serverSettings", tab: "ownership" }),
+        });
+        return;
+      }
+      case "ask": {
+        const uid = action.uid;
+        if (!idle) return;
+        this.askedManagers.add(uid);
+        const name = state.members[uid]?.nickname ?? uid;
+        useUi.getState().openDialog({
+          kind: "confirm", title: tNow("own.allowTitle"), body: tNow("own.allowBody", { name }), confirmLabel: tNow("own.allow"),
+          onConfirm: () => {
+            const current = this.runtime?.ownerView()?.managers ?? [];
+            void this.runtime?.publishManagers([...current, uid]).catch((error) => useUi.getState().toast("error", String(error)));
+          },
+        });
+        return;
+      }
+    }
+  }
 
   /** Encrypted threads on screen: the open chat and the channel I am looking at. */
   private sealedOnScreen(s: SessionSnapshot): SealedKey[] {
@@ -1112,8 +1271,21 @@ class Controller {
     return this.connection.request("group.delete", { group });
   }
 
-  setMemberGroups(uid: string, groups: number[]) {
-    return this.connection.request("member.groups", { uid, groups });
+  async setMemberGroups(uid: string, groups: number[]) {
+    const conn = this.conn, before = this.editsChannels(uid);
+    const result = await this.connection.request("member.groups", { uid, groups });
+    // Whoever this very edit gave `channel_edit` becomes a manager without asking me again (6b);
+    // taking it away ends an earlier approval.
+    const after = this.editsChannels(uid, groups);
+    if (this.conn === conn && !before && after) this.grantedByMe.add(uid);
+    if (!after) this.grantedByMe.delete(uid);
+    return result;
+  }
+
+  /** Whether `uid`'s roles (or `groups`) carry `channel_edit`, Admin included. */
+  private editsChannels(uid: string, groups?: readonly number[]): boolean {
+    const state = useSession.getState();
+    return (groups ?? state.members[uid]?.groups ?? []).some((g) => g === 1 || state.groups[g]?.permissions.includes("channel_edit"));
   }
 
   removeMember(uid: string, deleteMessages: boolean) {

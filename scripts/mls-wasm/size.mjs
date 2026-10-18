@@ -13,5 +13,7 @@ for (const file of files) {
   console.log(`${file}: ${bytes.length} bytes, ${gzip} bytes gzip`);
   total += gzip;
 }
-console.log(`Total gzip: ${total} / 500000 bytes`);
-if (total > 500_000) process.exitCode = 1;
+// docs/e2e.md, "The MLS library": the budget and why it was raised.
+const budget = 530_000;
+console.log(`Total gzip: ${total} / ${budget} bytes`);
+if (total > budget) process.exitCode = 1;

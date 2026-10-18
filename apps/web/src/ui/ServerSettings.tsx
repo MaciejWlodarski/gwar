@@ -1,6 +1,6 @@
 import * as Dropdown from "@radix-ui/react-dropdown-menu";
 import * as Tabs from "@radix-ui/react-tabs";
-import { Ban, Check, Copy, Link2, Lock, Plus, Search, ShieldCheck, Trash2, UserMinus, UserPlus, Users, X } from "lucide-react";
+import { Ban, Check, Copy, Crown, Link2, Lock, Plus, Search, ShieldCheck, Trash2, UserMinus, UserPlus, Users, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { countKey, useLanguage, useT, type Key } from "../i18n";
 import { INVITE_EXPIRY, INVITE_USES } from "../lib/ban";
@@ -31,6 +31,7 @@ import type { Permission } from "../proto/Permission";
 import { controller, describeRequestError } from "../state/controller";
 import { sortedChannels } from "../state/reducer";
 import { useSession, useUi, type ServerSettingsTab } from "../state/stores";
+import { OwnershipTab } from "./Ownership";
 import { useMyGroups, usePermission } from "./hooks";
 import { Avatar, Button, Dialog, EmptyState, Field, IconButton, Input, Select, Spinner, Switch, Textarea, menuContent, menuItem } from "./kit";
 
@@ -90,17 +91,21 @@ export function ServerSettingsDialog({ tab }: { tab?: ServerSettingsTab }) {
   const canInvite = usePermission("invite_create");
   const canRemove = usePermission("member_remove");
   const vc = kind === "vc";
+  // The owner, confirmers and managers of private channels (6b), for those who may act on them.
+  const owned = useSession((s) => !!s.owner);
+  const canEdit = usePermission("channel_edit");
 
   const tabs = useMemo(() => {
     const list: Array<{ id: ServerSettingsTab; label: string; icon: ReactNode }> = [];
     if (canServer) list.push({ id: "overview", label: t("ss.overview"), icon: <Lock className="size-4" /> });
     if (vc && (canGroups || canServer)) list.push({ id: "roles", label: t("ss.roles"), icon: <ShieldCheck className="size-4" /> });
     if (vc && (canGroups || canServer || canBan || canRemove)) list.push({ id: "members", label: t("ss.members"), icon: <Users className="size-4" /> });
+    if (vc && owned && (canServer || canEdit)) list.push({ id: "ownership", label: t("ss.ownership"), icon: <Crown className="size-4" /> });
     if (vc && canRemove) list.push({ id: "cleanup", label: t("ss.cleanup"), icon: <UserMinus className="size-4" /> });
     if (vc && canBan) list.push({ id: "bans", label: t("ss.bans"), icon: <Ban className="size-4" /> });
     if (vc && canInvite) list.push({ id: "invites", label: t("ss.invites"), icon: <Link2 className="size-4" /> });
     return list;
-  }, [t, vc, canServer, canGroups, canBan, canRemove, canInvite]);
+  }, [t, vc, canServer, canGroups, canBan, canRemove, canInvite, owned, canEdit]);
 
   const [chosen, setCurrent] = useState<ServerSettingsTab>(tab ?? "overview");
   // Permissions can change under us (a role edit): fall back from tabs that are no longer allowed.
@@ -132,6 +137,9 @@ export function ServerSettingsDialog({ tab }: { tab?: ServerSettingsTab }) {
         </Tabs.Content>
         <Tabs.Content value="members" className="outline-none">
           <MembersTab />
+        </Tabs.Content>
+        <Tabs.Content value="ownership" className="outline-none">
+          <OwnershipTab />
         </Tabs.Content>
         <Tabs.Content value="cleanup" className="outline-none">
           <CleanupTab />
@@ -861,7 +869,7 @@ export function InvitesPanel() {
   }, []);
 
   const link = (code: string) =>
-    buildInviteLink({ webOrigin: webOrigin(), serverEndpoint: useSession.getState().endpoint!, serverKey: useSession.getState().serverKey!, code });
+    buildInviteLink({ webOrigin: webOrigin(), serverEndpoint: useSession.getState().endpoint!, serverKey: useSession.getState().serverKey!, code, owner: controller.ownerView()?.owner });
 
   const create = async (e?: FormEvent) => {
     e?.preventDefault();

@@ -11,7 +11,39 @@ export interface WasmAgent {
   execute_with_parent?(request: unknown, parent: WasmAgent): unknown;
   take_changes(): Changes;
   free(): void;
+  /** The device's owner pin and manager checkpoints (docs/e2e-build.md, section 6, 6b). */
+  check_owner?(server: string, genesis: string, statements: string[], signatures: string[], inviteOwner?: string): OwnerCheck;
+  accept_generation?(server: string, genesis: string, statements: string[], signatures: string[]): void;
+  accept_managers?(server: string, anchor: Uint8Array, list: Uint8Array, now: number, revocations: Revocation[]): ManagersCheck;
+  owner_view?(server: string): OwnerView | null;
+  sign_manager_list?(statement: string): Uint8Array;
+  next_anchor?(server: string, confirmers: string[], signedAt: number, serverAnchor: Uint8Array | undefined): string;
+  /** `managers` undefined renews the server's (verified) or the accepted list. */
+  next_list?(server: string, anchor: Uint8Array | undefined, managers: string[] | undefined, signedAt: number, serverAnchor: Uint8Array | undefined, serverList: Uint8Array | undefined, revocations: Revocation[]): string;
+  transfer_statement?(server: string, accountKey: string, newOwner: string, serverAnchor: Uint8Array | undefined, signedAt: number): string;
 }
+export type OwnerCheck =
+  | { kind: "pinned" } | { kind: "unchanged" } | { kind: "extended" } | { kind: "changed" }
+  | { kind: "new_generation"; generation: number; owner: string };
+/** `renewable`: not current, but this device may renew it (its anchor is current and names it). */
+export type ManagersCheck = { kind: "accepted" | "unchanged" | "not_current" | "renewable" | "rollback" };
+/** The pinned owner and the managers this device accepted. */
+export interface OwnerView {
+  generation: number;
+  seq: number;
+  head: string;
+  owner: string;
+  confirmers: string[];
+  managers: string[];
+  list_signer: string | null;
+  list_signed_at: number | null;
+  /** When the list signer's device certificate expires (null: a local identity, or no list). */
+  list_signer_expires_at: number | null;
+  anchor_seq: number | null;
+  list_seq: number | null;
+}
+/** An owner reset, shown as a neutral notice: the device follows it only after `accept`. */
+export interface OwnerGeneration { generation: number; owner: string; accept: () => Promise<void> }
 export interface AgentFactory {
   create(): WasmAgent;
   load(records: Changes): WasmAgent;

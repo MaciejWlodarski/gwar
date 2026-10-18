@@ -283,6 +283,98 @@ impl Agent {
             }
         }
     }
+    /// The server's owner chain against this device's pin (docs/e2e-build.md, section 6, 6b).
+    /// Plain parameters, not a `Request` variant: each serde variant costs bundle size.
+    pub fn check_owner(
+        &mut self,
+        server: &str,
+        genesis: &str,
+        statements: Vec<String>,
+        signatures: Vec<String>,
+        invite_owner: Option<String>,
+    ) -> Result<JsValue, JsValue> {
+        let links = statements.into_iter().zip(signatures).collect();
+        output(self.inner.check_owner(server, genesis, links, invite_owner.as_deref()).map_err(error)?)
+    }
+    /// Accepts an owner reset the user confirmed; clears the old generation's checkpoints.
+    pub fn accept_generation(
+        &mut self,
+        server: &str,
+        genesis: &str,
+        statements: Vec<String>,
+        signatures: Vec<String>,
+    ) -> Result<(), JsValue> {
+        let links = statements.into_iter().zip(signatures).collect();
+        self.inner.accept_generation(server, genesis, links).map_err(error)
+    }
+    pub fn accept_managers(
+        &mut self,
+        server: &str,
+        anchor: &[u8],
+        list: &[u8],
+        now: f64,
+        revocations: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        let revocations: View = input(revocations)?;
+        output(self.inner.accept_managers(server, anchor, list, now as i64, &revocations).map_err(error)?)
+    }
+    pub fn owner_view(&self, server: &str) -> Result<JsValue, JsValue> {
+        output(self.inner.owner_view(server).map_err(error)?)
+    }
+    /// The next confirmer anchor's statement, for the owner's account key to sign.
+    pub fn next_anchor(
+        &self,
+        server: &str,
+        confirmers: Vec<String>,
+        signed_at: f64,
+        server_anchor: Option<Vec<u8>>,
+    ) -> Result<String, JsValue> {
+        self.inner.next_anchor(server, &confirmers, signed_at as i64, server_anchor.as_deref()).map_err(error)
+    }
+    /// The next manager list's statement, under `anchor` or the accepted anchor.
+    /// `managers` `None` renews the server's (verified) or the accepted list.
+    #[allow(clippy::too_many_arguments)]
+    pub fn next_list(
+        &self,
+        server: &str,
+        anchor: Option<Vec<u8>>,
+        managers: Option<Vec<String>>,
+        signed_at: f64,
+        server_anchor: Option<Vec<u8>>,
+        server_list: Option<Vec<u8>>,
+        revocations: JsValue,
+    ) -> Result<String, JsValue> {
+        let revocations: View = input(revocations)?;
+        self.inner
+            .next_list(
+                server,
+                anchor.as_deref(),
+                managers.as_deref(),
+                signed_at as i64,
+                server_anchor.as_deref(),
+                server_list.as_deref(),
+                &revocations,
+            )
+            .map_err(error)
+    }
+    /// The statement of a link moving ownership, for the owner's account key to sign.
+    pub fn transfer_statement(
+        &self,
+        server: &str,
+        account_key: &str,
+        new_owner: &str,
+        server_anchor: Option<Vec<u8>>,
+        signed_at: f64,
+    ) -> Result<String, JsValue> {
+        self.inner
+            .transfer_statement(server, account_key, new_owner, server_anchor.as_deref(), signed_at as i64)
+            .map_err(error)
+    }
+    /// Signs a `gwar managers v1` statement with this device.
+    pub fn sign_manager_list(&self, statement: &str) -> Result<Vec<u8>, JsValue> {
+        let list = gwar_mls::owner::ManagerList::parse(statement).ok_or_else(|| error("invalid manager list"))?;
+        self.inner.sign_manager_list(list).map_err(error)
+    }
     pub fn take_changes(&mut self) -> Result<JsValue, JsValue> {
         output(self.inner.take_changes())
     }
@@ -393,4 +485,12 @@ mod tests {
             }
         }
     }
+}
+
+/// The envelope of a confirmer anchor signed by the owner's account key, verified.
+#[wasm_bindgen]
+pub fn anchor_envelope(statement: &str, account_key: &str, signature: &str) -> Result<Vec<u8>, JsValue> {
+    gwar_mls::owner::SignedAnchor::from_parts(statement, account_key, signature)
+        .map(|a| a.encode())
+        .ok_or_else(|| error("invalid confirmer anchor"))
 }

@@ -425,6 +425,12 @@ impl SignedAnchor {
         netstrings(&[self.anchor.statement().as_bytes(), self.account_key.as_bytes(), self.signature.as_bytes()])
     }
 
+    /// The envelope of a statement signed elsewhere (the owner's account key in the browser),
+    /// verified as [`SignedAnchor::parse`] does.
+    pub fn from_parts(statement: &str, account_key: &str, signature: &str) -> Option<Self> {
+        Self::parse(&netstrings(&[statement.as_bytes(), account_key.as_bytes(), signature.as_bytes()]))
+    }
+
     /// Parses three netstrings and checks the signature by the key they carry. Whose key it is,
     /// is the chain's question ([`OwnerChain::anchor_valid`]).
     pub fn parse(bytes: &[u8]) -> Option<Self> {

@@ -2,8 +2,10 @@
 //! operation, before sending its output. On any error, discard and reload.
 
 pub mod epoch_number;
+mod owner;
 mod storage;
 mod voice;
+pub use owner::{ManagersCheck, OwnerCheck, OwnerView, ServerRecord};
 pub use storage::{Change, Changes, Store, Stores};
 pub use voice::{VoiceKey, VoiceKeys, voice_kid};
 
@@ -335,6 +337,8 @@ pub struct Agent {
     provider: Provider,
     device: DeviceRecord,
     groups: BTreeMap<String, GroupRecord>,
+    /// Owner pins and manager checkpoints by server key, stored as `{server}/@server`.
+    servers: BTreeMap<String, ServerRecord>,
     epochs: BTreeMap<String, EpochRecord>,
     outbox: BTreeMap<String, Outbox>,
     durable: Stores,
@@ -372,6 +376,7 @@ impl Agent {
             credential,
             provider,
             groups: BTreeMap::new(),
+            servers: BTreeMap::new(),
             epochs: BTreeMap::new(),
             outbox: BTreeMap::new(),
             durable: Stores::default(),
@@ -416,9 +421,20 @@ impl Agent {
         fn records<T: serde::de::DeserializeOwned>(store: &Store, skip_device: bool) -> Result<BTreeMap<String, T>> {
             store
                 .iter()
-                .filter(|(k, _)| !skip_device || k.as_slice() != b"@device")
+                .filter(|(k, _)| !skip_device || (k.as_slice() != b"@device" && !k.ends_with(owner::SUFFIX.as_bytes())))
                 .map(|(k, v)| Ok((String::from_utf8(k.clone()).map_err(err("record key"))?, parse(v)?)))
                 .collect()
+        }
+        let servers = stores
+            .groups
+            .iter()
+            .filter_map(|(k, v)| {
+                let key = std::str::from_utf8(k).ok()?;
+                owner::record_server(key).map(|server| Ok((server.to_owned(), parse::<ServerRecord>(v)?)))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        for (server, record) in &servers {
+            record.validate(server)?;
         }
         let agent = Self {
             signer,
@@ -426,6 +442,7 @@ impl Agent {
             provider,
             device,
             groups: records(&stores.groups, true)?,
+            servers,
             epochs: records(&stores.epochs, false)?,
             outbox: records(&stores.outbox, false)?,
             durable: stores,
@@ -511,6 +528,9 @@ impl Agent {
         }
         let mut groups = records(&self.groups);
         groups.insert(b"@device".to_vec(), json(&self.device));
+        for (server, record) in &self.servers {
+            groups.insert(format!("{server}{}", owner::SUFFIX).into_bytes(), json(record));
+        }
         Stores {
             openmls: self.provider.storage().values.read().expect("not poisoned").clone().into_iter().collect(),
             groups,

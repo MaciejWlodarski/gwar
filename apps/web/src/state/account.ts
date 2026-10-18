@@ -308,6 +308,11 @@ export const accountActions = {
     await refresh(await flows.changePassword(await current(), p, deps()));
   },
 
+  /** Signs a statement with the account key (owner links, confirmer anchors). */
+  async signStatement(statement: string, password: string): Promise<{ accountKey: string; signature: string }> {
+    return flows.signStatement(await current(), statement, password, deps());
+  },
+
   async revoke(deviceKey: string, password: string): Promise<void> {
     await refresh(await flows.revokeDevice(await current(), deviceKey, password, deps()));
   },

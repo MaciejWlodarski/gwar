@@ -7,7 +7,7 @@ import type { Event } from "../proto/Event";
 import { uidForPublicKey } from "../net/identity";
 import type { Identity } from "../net/identity";
 import { openStorage } from "./storage";
-import { emptyChanges, type AgentFactory, type CommitOutbox, type GroupSummary, type WasmAgent, type Plaintext, type Revocation } from "./types";
+import { emptyChanges, type AgentFactory, type CommitOutbox, type GroupSummary, type WasmAgent, type OwnerCheck, type OwnerGeneration, type Plaintext, type Revocation } from "./types";
 vi.mock("./wasm", () => ({ loadAgent: vi.fn() }));
 const enc = new TextEncoder(), dec = new TextDecoder();
 const b64 = (n: number, length = 32) => encodeBase64Url(new Uint8Array(length).fill(n));
@@ -20,7 +20,7 @@ const pending = (): CommitOutbox => ({ group: Array(32).fill(2), epoch: "0", has
 const clean = (): State => ({ groups: [], out: null, welcomes: [], imports: 0, shares: 0 });
 const runtimes: MlsRuntime[] = [];
 afterEach(async () => { conversation = dm; await Promise.all(runtimes.splice(0).map(r => r.close())); });
-interface Options { serverChat?: boolean; channels?: { id: number; encrypted: boolean; history: boolean }[]; now?: () => number }
+interface Options { serverChat?: boolean; channels?: { id: number; encrypted: boolean; history: boolean }[]; now?: () => number; inviteOwner?: string }
 async function fixture(initial = clean(), hasRemoteGroup = true, options: Options = {}) {
   const errors: unknown[] = [];
   const operations: Record<string, unknown>[] = [], calls: { op: string; data: Record<string, unknown> }[] = [];
@@ -30,6 +30,10 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
       // eslint-disable-next-line @typescript-eslint/no-this-alias -- inspect the live fake after reload
       current = this;
     }
+    check_owner(): OwnerCheck { operations.push({ op: "check_owner" }); return world.ownerCheck; }
+    accept_generation(): void { operations.push({ op: "accept_generation" }); }
+    accept_managers() { operations.push({ op: "accept_managers" }); return { kind: world.managersCheck }; }
+    owner_view() { return null; }
     execute(request: unknown): unknown {
       const r = request as Record<string, Record<string, unknown>>;
       const [op, d] = Object.entries(r)[0]!;
@@ -125,6 +129,9 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
     /** Replaces the tree endpoint's answer. */
     treeResponse: null as null | ((signal: AbortSignal) => Promise<Response>),
     packages: 5, devices: [] as { uid: string; device_key: string; hpke_key: string; created_at: number; signature: string }[],
+    /** What the agent makes of the owner chain, and what the runtime reported (6b). */
+    ownerCheck: { kind: "pinned" } as OwnerCheck, ownerChanged: 0, generations: [] as OwnerGeneration[],
+    managersCheck: "accepted" as "accepted" | "unchanged" | "not_current" | "rollback",
   };
   let welcomeHandler = (_welcome: { channels: unknown[] }) => {};
   let eventHandler = (_event: Event) => {};
@@ -158,6 +165,7 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
         case "mls.group.create": world.groups = [{ conversation, group, incarnation: 0, epoch: 0, pending: false }]; return { group };
         case "mls.history.decline": return {};
         case "mls.group_history": return { incarnations: world.chain, next: null };
+        case "owner.chain": return { genesis: "genesis", links: [], next: null };
         case "mls.history.share": expect((await storage.load()).outbox.length).toBeGreaterThan(0); if (world.shareError) throw new Error("lost share response"); return {};
         default: throw new Error(`unexpected request ${op}`);
       }
@@ -170,7 +178,8 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
     if (world.treeResponse) return world.treeResponse(init!.signal!);
     return new Response(new Uint8Array([3, 3]), { headers: { "x-gwar-epoch": String(world.treeEpochs.shift() ?? world.head) } });
   };
-  const connectOptions = { identity, seed: new Uint8Array(32), link: link as unknown as Link, revocations: () => world.revocations, locks, storage: async () => storage, factory, now: options.now, onError: (error: unknown) => errors.push(error), fetch: fetchTree as typeof fetch };
+  const connectOptions = { identity, seed: new Uint8Array(32), link: link as unknown as Link, revocations: () => world.revocations, locks, storage: async () => storage, factory, now: options.now, onError: (error: unknown) => errors.push(error), fetch: fetchTree as typeof fetch,
+    inviteOwner: options.inviteOwner, onOwnerChanged: () => { world.ownerChanged++; }, onOwnerGeneration: (notice: OwnerGeneration) => { world.generations.push(notice); } };
   const runtime = await MlsRuntime.connect(connectOptions);
   runtimes.push(runtime);
   // Initialization has completed, so changes below model subsequent reconnects/events.
@@ -187,6 +196,7 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
       runtimes.push(next);
       return next;
     },
+    ownerWelcome: (owner: unknown, managers: unknown) => welcomeHandler({ channels: [], server: { server_chat: { encrypted: false, history: false } }, file_access: "access", owner, managers } as never),
     welcome: (serverChat: boolean) => welcomeHandler({ channels: options.channels ?? [], server: { server_chat: { encrypted: serverChat, history: serverChat } }, file_access: "access" } as never),
     reconnect: () => {
       link.isOnline = false; statusHandler({ state: "reconnecting", attempt: 1, retryAt: Date.now() });
@@ -920,5 +930,44 @@ describe("Public groups", () => {
     f.world.groups = [{ conversation, group, incarnation: 0, epoch: 1, pending: false }];
     await f.runtime.sync();
     expect(logs()).toBe(before + 2);
+  });
+});
+
+describe("the server's owner (6b)", () => {
+  it("follows the chain, checks the managers and reports a changed record or a new generation", async () => {
+    const f = await fixture();
+    const owner = { uid: b64(4, 20), generation: 1, seq: 0, head: b64(6) };
+    f.ownerWelcome(owner, { anchor: "AQ", list: "AQ", pending: [], stale: [] });
+    await vi.waitFor(() => expect(f.operations.some(o => o.op === "accept_managers")).toBe(true));
+    expect(f.calls.filter(c => c.op === "owner.chain")[0]?.data).toEqual({ generation: 1, after: 0 });
+    f.world.ownerCheck = { kind: "changed" };
+    f.event({ ev: "owner.updated", d: owner });
+    await vi.waitFor(() => expect(f.world.ownerChanged).toBe(1));
+    f.world.ownerCheck = { kind: "new_generation", generation: 2, owner: b64(5, 20) };
+    f.event({ ev: "owner.updated", d: { ...owner, generation: 2 } });
+    await vi.waitFor(() => expect(f.world.generations).toHaveLength(1));
+    expect(f.operations.some(o => o.op === "accept_generation")).toBe(false);
+    await f.world.generations[0]!.accept();
+    expect(f.operations.some(o => o.op === "accept_generation")).toBe(true);
+  });
+  it("refuses a server without an owner when the invite named one", async () => {
+    const f = await fixture(clean(), true, { inviteOwner: b64(4, 20) });
+    f.ownerWelcome(null, null);
+    await vi.waitFor(() => expect(f.world.ownerChanged).toBe(1));
+  });
+  it("tells when the server's manager pair is no longer current", async () => {
+    const f = await fixture();
+    const owner = { uid: b64(4, 20), generation: 1, seq: 0, head: b64(6) };
+    f.world.managersCheck = "not_current";
+    f.ownerWelcome(owner, { anchor: "AQ", list: "AQ", pending: [], stale: [] });
+    await vi.waitFor(() => expect(f.runtime.serverManagersCurrent()).toBe(false));
+    // No membership change against a pair that is not current: only a renewal.
+    await expect(f.runtime.publishManagers(["x"])).rejects.toThrow("changing");
+    f.world.managersCheck = "accepted";
+    f.event({ ev: "managers.updated", d: { anchor: "AQ", list: "Ag", pending: [], stale: [] } });
+    // Until the newer list is checked, the view still describes the older one.
+    expect(f.runtime.managersSettled()).toBe(false);
+    await vi.waitFor(() => expect(f.runtime.serverManagersCurrent()).toBe(true));
+    expect(f.runtime.managersSettled()).toBe(true);
   });
 });

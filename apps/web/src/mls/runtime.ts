@@ -16,7 +16,9 @@ import { openStorage, type Persistence } from "./storage";
 import { loadAgent, loadVoiceAgent } from "./wasm";
 import { VoiceCall } from "./voice";
 import type { VoiceState } from "../proto/VoiceState";
-import type { AgentFactory, Change, CommitOutbox, ConversationStatus, Gate, GroupSummary, HistoryJob, OpenResult, PackageJob, Plaintext, RequestJob, Resolution, Revocation, Roster, SealedFields } from "./types";
+import type { Managers } from "../proto/Managers";
+import type { OwnerInfo } from "../proto/OwnerInfo";
+import type { AgentFactory, Change, OwnerCheck, OwnerGeneration, OwnerView, CommitOutbox, ConversationStatus, Gate, GroupSummary, HistoryJob, OpenResult, PackageJob, Plaintext, RequestJob, Resolution, Revocation, Roster, SealedFields } from "./types";
 const bytes = (value: string): number[] => [...decodeBase64Url(value)];
 const encoded = (value: number[]): string => encodeBase64Url(new Uint8Array(value));
 /** The DS protocol currently uses safe JSON integers; core epochs remain u64 strings. */
@@ -50,6 +52,12 @@ export interface RuntimeOptions {
   onTakeover?: () => void;
   /** Fetches public groups' ratchet trees over HTTP; the global fetch by default. */
   fetch?: typeof fetch;
+  /** The owner an invite link named (`owner={uid}`), checked on first contact. */
+  inviteOwner?: string;
+  /** The server's owner record is no extension of this device's pin: the caller disconnects. */
+  onOwnerChanged?: () => void;
+  /** An owner reset: a neutral notice the user may accept (docs/e2e-build.md, section 6, 6b). */
+  onOwnerGeneration?: (notice: OwnerGeneration) => void;
 }
 /** A ratchet tree larger than this is refused (about 15 000 devices). */
 const MAX_TREE_BYTES = 8 * 1024 * 1024;
@@ -94,6 +102,16 @@ export class MlsRuntime {
   /** Encrypted channels by id with their `history`, from the latest Welcome and channel events. */
   private channels: Map<number, boolean> | undefined;
   private serverChat = false;
+  /** The owner and managers this device verified, and the server's latest managers' view. */
+  private owner: OwnerView | null = null;
+  private managers: Managers | null = null;
+  /** Whether the server's manager pair is current for this device (false: it needs renewing). */
+  private managersCurrent = true;
+  private managersRenewable = false;
+  /** The server list `managersCurrent` and `ownerView()` were last checked against. */
+  private verifiedList: string | null = null;
+  private ownerChecks: Promise<void> = Promise.resolve();
+  private ownerRetries = 0;
   /** This session's file access token: the bearer for the tree endpoint. */
   private fileAccess: string | null = null;
   /** The conversation of every group the server listed, for groups not joined yet. */
@@ -188,12 +206,16 @@ export class MlsRuntime {
         runtime!.serverChat = welcome.server.server_chat.encrypted;
         if (!runtime!.serverChat) { runtime!.statuses.delete("server"); runtime!.rosters.delete("server"); }
         runtime!.channels = new Map(welcome.channels.filter(c => c.encrypted).map(c => [c.id, c.history]));
+        runtime!.managers = welcome.managers ?? null;
+        runtime!.checkOwner(welcome.owner ?? null);
         runtime!.schedule();
       }));
       runtime.unsubscribers.push(options.link.onEvent(event => {
         for (const call of runtime!.calls) call.event(event);
         if (event.ev === "channel.created" && event.d.encrypted) { runtime!.channels?.set(event.d.id, event.d.history); runtime!.schedule(); }
         if (event.ev === "channel.deleted" && runtime!.channels?.delete(event.d.channel)) runtime!.schedule();
+        if (event.ev === "owner.updated") runtime!.checkOwner(event.d);
+        if (event.ev === "managers.updated") { runtime!.managers = event.d; runtime!.checkOwner(undefined); }
         if (!event.ev.startsWith("mls.")) return;
         if (event.ev === "mls.commit" || event.ev === "mls.proposal") {
           const group = event.d.group;
@@ -221,6 +243,116 @@ export class MlsRuntime {
     }
   }
   status(conversation: string): ConversationStatus { return this.statuses.get(conversation) ?? "securing"; }
+  /** The server's owner and the managers of private channels as this device verified them. */
+  ownerView(): OwnerView | null { return this.owner; }
+  /** False when the server shows a manager pair that is no longer current (an expired, revoked or
+   * former signer): the owner or a confirmer renews it. */
+  serverManagersCurrent(): boolean { return this.managersCurrent; }
+  /** The server's pair is not current and this device may renew it (checked by the agent). */
+  serverManagersRenewable(): boolean { return this.managersRenewable; }
+  /** True once the server's newest list has been checked: until then the view describes an older one. */
+  managersSettled(): boolean { return !this.managers?.list || this.verifiedList === this.managers.list; }
+  /**
+   * Checks the server's owner chain against this device's pin, then its newest managers
+   * (docs/e2e-build.md, section 6, 6b). `owner` undefined re-checks only the managers.
+   * Checks run one after another.
+   */
+  /** A managers-only check from `sync` is queued (coalesces bursts of events). */
+  private managersRecheck = false;
+  private checkOwner(owner: OwnerInfo | null | undefined): void {
+    const generation = this.generation;
+    this.ownerChecks = this.ownerChecks
+      .then(() => owner === undefined ? this.acceptManagers() : this.followOwner(owner, generation))
+      .catch(error => { if (!this.stopped) this.options.onError?.(error); });
+  }
+  private async followOwner(owner: OwnerInfo | null, generation: number): Promise<void> {
+    const server = this.server;
+    if (!owner) {
+      // A server that dropped the owner this device pinned, or that an invite said has one, is
+      // not the server the device knows.
+      const pinned = await this.engine.run(async () => this.engine.withAgent(a => a.owner_view?.(server) ?? null));
+      if (pinned || this.options.inviteOwner) this.options.onOwnerChanged?.();
+      return;
+    }
+    let after = 0, genesis = "";
+    const statements: string[] = [], signatures: string[] = [];
+    try {
+      for (;;) {
+        const page = await this.request("owner.chain", { generation: owner.generation, after }, undefined, generation);
+        genesis = page.genesis;
+        for (const link of page.links) { statements.push(link.statement); signatures.push(link.signature); }
+        if (page.next === null || page.links.length === 0) break;
+        after = page.next;
+      }
+    } catch (error) {
+      // A transient failure (not a verdict on the chain): check again a few times, then report.
+      if (this.ownerRetries++ < 5 && !this.stopped) setTimeout(() => { if (this.generation === generation) this.checkOwner(owner); }, 2000 * this.ownerRetries);
+      throw error;
+    }
+    this.ownerRetries = 0;
+    this.assertCurrent(generation);
+    const check = await this.engine.run(() => this.engine.call(a => a.check_owner!(server, genesis, statements, signatures, this.options.inviteOwner))) as OwnerCheck;
+    if (check.kind === "changed") { this.options.onOwnerChanged?.(); return; }
+    if (check.kind === "new_generation") {
+      this.options.onOwnerGeneration?.({
+        generation: check.generation, owner: check.owner,
+        accept: async () => {
+          await this.engine.run(() => this.engine.call(a => a.accept_generation!(server, genesis, statements, signatures)));
+          this.checkOwner(undefined);
+        },
+      });
+      return;
+    }
+    await this.acceptManagers();
+  }
+  /** The server's current anchor envelope, if it has one. */
+  private serverAnchor(): Uint8Array | undefined {
+    return this.managers?.anchor ? decodeBase64Url(this.managers.anchor) : undefined;
+  }
+  /** The next confirmer anchor's statement, for the owner's account key to sign. */
+  nextAnchor(confirmers: string[]): Promise<string> {
+    const server = this.server, shown = this.serverAnchor();
+    return this.engine.run(async () => this.engine.withAgent(a => a.next_anchor!(server, confirmers, this.now(), shown)));
+  }
+  /** The statement moving ownership to `newOwner`, for the owner's account key to sign. */
+  transferStatement(accountKey: string, newOwner: string): Promise<string> {
+    const server = this.server, anchor = this.serverAnchor();
+    return this.engine.run(async () => this.engine.withAgent(a => a.transfer_statement!(server, accountKey, newOwner, anchor, this.now())));
+  }
+  async transferOwnership(statement: string, signature: string): Promise<void> {
+    await this.request("owner.transfer", { statement, signature }, undefined, this.generation);
+  }
+  /**
+   * Signs the next manager list with this device and installs it with `anchor` (a newly signed
+   * anchor envelope) or the server's current anchor. `managers` null renews: the agent keeps the
+   * server's list when it verifies, else the accepted one, and refuses when there is neither.
+   */
+  async publishManagers(managers: string[] | null, anchor?: Uint8Array): Promise<void> {
+    const server = this.server, shown = this.serverAnchor(), under = anchor ?? shown;
+    if (!under) throw new Error("no confirmer anchor yet");
+    // A change is made only against the server's newest pair, checked and current: otherwise the
+    // view this change was derived from may be older than the list it would replace. A plain
+    // renewal keeps the server's verified membership and is what makes a pair current again.
+    if ((managers !== null || anchor) && this.managers?.list && !(this.managersSettled() && this.managersCurrent)) {
+      throw new Error("the manager list is changing; try again");
+    }
+    const floor = this.managers?.list ? decodeBase64Url(this.managers.list) : undefined;
+    const list = await this.engine.run(async () => this.engine.withAgent(a => a.sign_manager_list!(a.next_list!(server, under, managers ?? undefined, this.now(), shown, floor, this.options.revocations()))));
+    await this.request("managers.update", { anchor: encodeBase64Url(under), list: encodeBase64Url(list) }, undefined, this.generation);
+  }
+  private async acceptManagers(): Promise<void> {
+    const server = this.server, managers = this.managers;
+    if (!server) return;
+    if (managers?.anchor && managers.list) {
+      const anchor = decodeBase64Url(managers.anchor), list = decodeBase64Url(managers.list);
+      const check = await this.engine.run(() => this.engine.call(a => a.accept_managers?.(server, anchor, list, this.now(), this.options.revocations())));
+      this.managersCurrent = check?.kind !== "not_current" && check?.kind !== "renewable";
+      this.managersRenewable = check?.kind === "renewable";
+    }
+    this.owner = await this.engine.run(async () => this.engine.withAgent(a => a.owner_view?.(server) ?? null));
+    this.verifiedList = managers?.list ?? null;
+    this.notify();
+  }
   /** Who can read an active conversation (devices by uid) and whether new members get earlier messages. */
   roster(conversation: string): Roster | null { return this.rosters.get(conversation) ?? null; }
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
@@ -264,6 +396,12 @@ export class MlsRuntime {
   sync(): Promise<void> {
     // Revocation refreshes and membership events reach voice gates at once.
     for (const call of this.calls) call.recheck();
+    // ... and the manager pair: a revoked or expired signer makes it no longer current (6b).
+    if (this.managers?.anchor && !this.managersRecheck) {
+      this.managersRecheck = true;
+      this.checkOwner(undefined);
+      void this.ownerChecks.then(() => { this.managersRecheck = false; });
+    }
     if (this.syncing) { this.dirty = true; return this.syncing; }
     let failed = false;
     this.syncing = this.engine.run(async () => {
