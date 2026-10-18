@@ -42,6 +42,10 @@ pub(crate) fn parse_netstrings(mut input: &[u8], count: usize) -> Option<Vec<&[u
         if rest.len() <= len || rest[len] != b',' {
             return None;
         }
+        // More fields than expected: refused at once, without collecting them.
+        if fields.len() == count {
+            return None;
+        }
         fields.push(&rest[..len]);
         input = &rest[len + 1..];
     }

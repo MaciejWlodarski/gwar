@@ -3,6 +3,7 @@
 //! (docs/e2e.md, docs/e2e-build.md).
 
 pub mod access;
+pub mod archive;
 pub mod chat;
 pub mod credential;
 pub mod descriptor;
