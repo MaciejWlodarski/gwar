@@ -77,7 +77,63 @@ async fn join(ts: &mut tsclientlib::Connection, cid: &str, cpw: &str) -> Result<
 
 #[tokio::test]
 #[ignore]
-async fn spike_channel_password_hash() {
+async fn spike_a_channel_password_hash() {
+    run("first").await;
+}
+
+#[tokio::test]
+#[ignore]
+async fn spike_b_fresh_instance() {
+    run("second").await;
+}
+
+fn find_db(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if entry.file_type().ok()?.is_symlink() {
+            continue;
+        }
+        if path.is_dir() {
+            if let Some(found) = find_db(&path) {
+                return Some(found);
+            }
+        } else if path.file_name().is_some_and(|n| n == "ts3server.sqlitedb") {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn dump_db(dir: &std::path::Path, label: &str) {
+    let Some(db) = find_db(dir) else {
+        eprintln!("SPIKE [{label}] no ts3server.sqlitedb under {}", dir.display());
+        return;
+    };
+    let conn = rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let mut tables = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").unwrap();
+    let names: Vec<String> = tables.query_map([], |r| r.get(0)).unwrap().flatten().collect();
+    eprintln!("SPIKE [{label}] tables: {names:?}");
+    for table in ["channel_properties", "server_properties", "instance_properties"] {
+        let Ok(mut q) = conn.prepare(&format!("SELECT * FROM {table}")) else { continue };
+        let cols: Vec<String> = q.column_names().iter().map(|c| c.to_string()).collect();
+        let n = cols.len();
+        let rows = q
+            .query_map([], |r| {
+                Ok((0..n)
+                    .map(|i| r.get::<_, rusqlite::types::Value>(i).map(|v| format!("{v:?}")).unwrap_or_default())
+                    .collect::<Vec<_>>())
+            })
+            .unwrap();
+        for row in rows.flatten() {
+            let line = row.join(" | ");
+            if table != "channel_properties" || line.to_lowercase().contains("password") {
+                eprintln!("SPIKE [{label}] {table} {cols:?}: {line}");
+            }
+        }
+    }
+}
+
+async fn run(label: &str) {
     let root = PathBuf::from(std::env::var_os("VC_TS3_DIR").expect("VC_TS3_DIR"));
     let installed = install::ensure_installed(&root).await.unwrap();
     let dir = std::env::temp_dir().join(format!("vc-ts-pw-spike-{}", free_port(false)));
@@ -108,7 +164,8 @@ async fn spike_channel_password_hash() {
     let h = wire("sekret");
     let a = stored(&query, &cid).await;
     eprintln!("SPIKE wire(sekret) = {h}");
-    eprintln!("SPIKE A channelinfo after plaintext set = {a:?} (equals wire: {})", a == h);
+    eprintln!("SPIKE [{label}] A channelinfo after plaintext set = {a:?} (equals wire: {})", a == h);
+    dump_db(&dir, label);
 
     let mut ts = tsclientlib::Connection::build(voice.to_string()).name("ts-guest".to_string()).connect().unwrap();
     within("TeamSpeak client", async {
@@ -163,5 +220,7 @@ async fn spike_channel_password_hash() {
         info.first().and_then(|r| r.get("virtualserver_password"))
     );
     let _ = query.call(Cmd::new("serveredit").arg("virtualserver_password", "")).await;
+    drop(server);
+    tokio::time::sleep(Duration::from_secs(3)).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
