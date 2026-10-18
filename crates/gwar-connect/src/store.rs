@@ -157,6 +157,42 @@ const MIGRATIONS: &[&str] = &[
         expires_at INTEGER NOT NULL
     );
     "#,
+    // 4: the key archive (docs/e2e-build.md, section 7): device and recovery archive keys,
+    // manifests (the first per generation), records and transfers. Connect stores ciphertext.
+    r#"
+    CREATE TABLE archive_devices (
+        device_key TEXT PRIMARY KEY,
+        account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        statement TEXT NOT NULL,
+        signature TEXT NOT NULL
+    );
+    CREATE TABLE archive_recovery (
+        account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        version INTEGER NOT NULL,
+        statement TEXT NOT NULL,
+        signature TEXT NOT NULL,
+        PRIMARY KEY (account_id, version)
+    );
+    CREATE TABLE archive_manifests (
+        account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        generation INTEGER NOT NULL,
+        manifest TEXT NOT NULL,
+        PRIMARY KEY (account_id, generation)
+    );
+    CREATE TABLE archive_records (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        generation INTEGER NOT NULL,
+        record_id TEXT NOT NULL,
+        data TEXT NOT NULL,
+        UNIQUE (account_id, record_id)
+    );
+    CREATE TABLE archive_transfers (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        transfer TEXT NOT NULL
+    );
+    "#,
 ];
 
 /// A device certificate as stored (docs/connect.md).
@@ -534,6 +570,126 @@ impl Store {
     pub fn backup_to(&self, path: &Path) -> Result<()> {
         self.db.execute("VACUUM INTO ?1", [path.to_string_lossy()])?;
         Ok(())
+    }
+
+    // The key archive (docs/e2e-build.md, section 7).
+
+    /// Stores a device's archive key once; false if the device already has one.
+    pub fn put_archive_device(&self, account: i64, device_key: &str, statement: &str, signature: &str) -> Result<bool> {
+        Ok(self.db.execute(
+            "INSERT OR IGNORE INTO archive_devices(device_key,account_id,statement,signature) VALUES(?1,?2,?3,?4)",
+            params![device_key, account, statement, signature],
+        )? == 1)
+    }
+
+    /// The account's devices' archive keys, with each device's current certificate.
+    pub fn archive_devices(&self, account: i64) -> Result<Vec<(String, String, Option<Certificate>)>> {
+        let mut stmt = self.db.prepare(
+            "SELECT a.statement,a.signature,d.issued_at,d.expires_at,d.signature FROM archive_devices a
+             JOIN devices d ON d.device_key=a.device_key WHERE a.account_id=?1 ORDER BY a.device_key",
+        )?;
+        let rows = stmt.query_map([account], |r| {
+            let certificate = match (r.get(2)?, r.get(3)?, r.get(4)?) {
+                (Some(issued_at), Some(expires_at), Some(signature)) => {
+                    Some(Certificate { issued_at, expires_at, signature })
+                }
+                _ => None,
+            };
+            Ok((r.get(0)?, r.get(1)?, certificate))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The newest recovery archive key version and its statement, if any.
+    pub fn archive_recovery_newest(&self, account: i64) -> Result<Option<(i64, String)>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT version,statement FROM archive_recovery WHERE account_id=?1 ORDER BY version DESC LIMIT 1",
+                [account],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn put_archive_recovery(&self, account: i64, version: i64, statement: &str, signature: &str) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO archive_recovery(account_id,version,statement,signature) VALUES(?1,?2,?3,?4)",
+            params![account, version, statement, signature],
+        )?;
+        Ok(())
+    }
+
+    pub fn archive_recovery(&self, account: i64) -> Result<Vec<(String, String)>> {
+        let mut stmt =
+            self.db.prepare("SELECT statement,signature FROM archive_recovery WHERE account_id=?1 ORDER BY version")?;
+        let rows = stmt.query_map([account], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Stores the first manifest of a generation; false if the generation exists.
+    pub fn put_archive_manifest(&self, account: i64, generation: i64, manifest: &str) -> Result<bool> {
+        Ok(self.db.execute(
+            "INSERT OR IGNORE INTO archive_manifests(account_id,generation,manifest) VALUES(?1,?2,?3)",
+            params![account, generation, manifest],
+        )? == 1)
+    }
+
+    pub fn archive_manifests(&self, account: i64, after: i64, limit: i64) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.db.prepare(
+            "SELECT generation,manifest FROM archive_manifests WHERE account_id=?1 AND generation>?2
+             ORDER BY generation LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![account, after, limit], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn archive_counts(&self, account: i64) -> Result<(i64, i64, i64, i64)> {
+        Ok(self.db.query_row(
+            "SELECT (SELECT COUNT(*) FROM archive_records WHERE account_id=?1),
+                    (SELECT COALESCE(SUM(LENGTH(data)),0) FROM archive_records WHERE account_id=?1),
+                    (SELECT COUNT(*) FROM archive_manifests WHERE account_id=?1),
+                    (SELECT COUNT(*) FROM archive_transfers WHERE account_id=?1)",
+            [account],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?)
+    }
+
+    /// Appends records in one transaction; a record id the account already has is skipped.
+    pub fn put_archive_records(&self, account: i64, records: &[(i64, String, String)]) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        for (generation, record_id, data) in records {
+            tx.execute(
+                "INSERT OR IGNORE INTO archive_records(account_id,generation,record_id,data) VALUES(?1,?2,?3,?4)",
+                params![account, generation, record_id, data],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn archive_records(&self, account: i64, after: i64, limit: i64) -> Result<Vec<(i64, i64, String, String)>> {
+        let mut stmt = self.db.prepare(
+            "SELECT seq,generation,record_id,data FROM archive_records WHERE account_id=?1 AND seq>?2
+             ORDER BY seq LIMIT ?3",
+        )?;
+        let rows =
+            stmt.query_map(params![account, after, limit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn put_archive_transfer(&self, account: i64, transfer: &str) -> Result<()> {
+        self.db
+            .execute("INSERT INTO archive_transfers(account_id,transfer) VALUES(?1,?2)", params![account, transfer])?;
+        Ok(())
+    }
+
+    pub fn archive_transfers(&self, account: i64, after: i64, limit: i64) -> Result<Vec<(i64, String)>> {
+        let mut stmt = self.db.prepare(
+            "SELECT seq,transfer FROM archive_transfers WHERE account_id=?1 AND seq>?2 ORDER BY seq LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![account, after, limit], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 }
 

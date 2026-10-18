@@ -2675,6 +2675,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "ed25519-dalek",
+ "gwar-mls",
  "hkdf 0.12.4",
  "hmac 0.12.1",
  "rand 0.9.5",

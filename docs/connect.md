@@ -233,6 +233,7 @@ at the expiry of the certificate proven when issued, whichever comes first. Erro
 | `GET /v1/revocations?since=<seq>` | public → `{revocations: [{seq, account_key, device_key, revoked_at, signature}]}` (at most 1000, ascending) |
 | `GET /v1/accounts/{handle}` | public → `{handle, account_key}`; `404 not_found` if unknown |
 | `GET /v1/accounts/by-key/{account_key}` | public → `{handle, account_key}`; `404 not_found` if unknown |
+| `/v1/archive/*` | the key archive: device and recovery archive keys, manifests, records, transfers (docs/e2e-build.md, section 7, "Connect API"); device sessions only |
 
 `POST /v1/devices/renew` is removed. Each client certifies only its own locally
 held key through `POST /v1/devices`, then proves possession for a new session.
