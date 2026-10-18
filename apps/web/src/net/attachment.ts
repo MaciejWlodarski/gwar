@@ -5,20 +5,26 @@ import { sha256 } from "./message-signature";
 import { openFile } from "./sealed-file";
 import { isInlineImage } from "../lib/files";
 
+/** The bytes are not the file the sender signed (hash, size, decryption or dimensions): unlike a
+ * failed download, trying again cannot help. */
+export class AttachmentIntegrityError extends Error {
+  constructor(message: string) { super(message); this.name = "AttachmentIntegrityError"; }
+}
+
 /** Nothing is displayed or saved from a signed attachment until its complete bytes hash correctly. An
  * encrypted one is checked as downloaded, decrypted, and checked again as the file its sender signed. */
 export async function verifiedAttachmentBlob(att: Attachment, path: string, fetchBytes = fetchFileBytes, opts: FileOptions = { origin: null, size: att.size, uploadLimit: 30 * 1024 * 1024 }): Promise<Blob> {
   let bytes: Uint8Array<ArrayBuffer>;
   if (att.sealed) {
     const ciphertext = await fetchBytes(path, { ...opts, size: att.sealed.size });
-    if (ciphertext.byteLength !== att.sealed.size || await sha256(ciphertext as BufferSource) !== att.sealed.sha256) throw new Error("Attachment hash mismatch");
-    bytes = await openFile(ciphertext, att.sealed.key);
+    if (ciphertext.byteLength !== att.sealed.size || await sha256(ciphertext as BufferSource) !== att.sealed.sha256) throw new AttachmentIntegrityError("Attachment hash mismatch");
+    bytes = await openFile(ciphertext, att.sealed.key).catch(() => { throw new AttachmentIntegrityError("Attachment does not decrypt"); });
   } else bytes = await fetchBytes(path, opts);
-  if (bytes.byteLength !== att.size || await sha256(bytes as BufferSource) !== att.sha256) throw new Error("Attachment hash mismatch");
+  if (bytes.byteLength !== att.size || await sha256(bytes as BufferSource) !== att.sha256) throw new AttachmentIntegrityError("Attachment hash mismatch");
   // The sender's size hints must describe the image it encrypted.
   if (att.sealed && (att.width || att.height)) {
     const [width, height] = imageDimensions(bytes);
-    if (width !== att.width || height !== att.height) throw new Error("Attachment dimensions mismatch");
+    if (width !== att.width || height !== att.height) throw new AttachmentIntegrityError("Attachment dimensions mismatch");
   }
   return new Blob([bytes as BlobPart], { type: att.mime });
 }
