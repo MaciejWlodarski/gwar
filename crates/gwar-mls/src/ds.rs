@@ -131,13 +131,24 @@ pub struct Observer {
     group: PublicGroup,
     descriptor: SignedDescriptor,
     server_key: String,
+    /// The server's owner chain: a private channel's lists are checked against it (6c).
+    owner: Option<crate::owner::OwnerChain>,
 }
 
 impl Observer {
     /// Starts following a new group from its first GroupInfo.
     pub fn create(group_info: &[u8], server_key: &str) -> Result<Self, DsError> {
+        Self::create_with(group_info, server_key, None)
+    }
+
+    /// Like [`Observer::create`], with the owner chain a private channel's lists are checked against.
+    pub fn create_with(
+        group_info: &[u8],
+        server_key: &str,
+        owner: Option<crate::owner::OwnerChain>,
+    ) -> Result<Self, DsError> {
         let (storage, group) = verified_group_info(group_info)?;
-        let observer = Self::from_parts(storage, group, server_key)?;
+        let observer = Self::from_parts(storage, group, server_key)?.with_owner(owner);
         observer.check_tree()?;
         if observer.descriptor.descriptor.kind == crate::Kind::Voice && observer.epoch() != 0 {
             return Err(Invalid("voice creator"));
@@ -152,7 +163,18 @@ impl Observer {
 
     fn from_parts(storage: MemoryStorage, group: PublicGroup, server_key: &str) -> Result<Self, DsError> {
         let descriptor = crate::rules::context(group.group_context(), server_key)?;
-        Ok(Self { storage, group, descriptor, server_key: server_key.to_owned() })
+        Ok(Self { storage, group, descriptor, server_key: server_key.to_owned(), owner: None })
+    }
+
+    /// Checks a private channel's commits and tree against this owner chain.
+    pub fn with_owner(mut self, owner: Option<crate::owner::OwnerChain>) -> Self {
+        self.owner = owner;
+        self
+    }
+
+    /// A private channel's access lists in the current epoch.
+    pub fn access(&self) -> Option<crate::access::Access> {
+        crate::rules::access(self.group.group_context())
     }
 
     /// Restores an observer saved with [`Observer::save`].
@@ -222,7 +244,10 @@ impl Observer {
     /// Gwar's rules on the whole tree: well-formed credentials, one leaf per
     /// device key, and the membership rule of the conversation's kind.
     fn check_tree(&self) -> Result<(), DsError> {
-        crate::rules::tree(&self.descriptor, self.group.treesync().full_leaves().map(|(_, leaf)| leaf))
+        let access = self.access();
+        let private =
+            access.as_ref().zip(self.owner.as_ref()).map(|(access, chain)| crate::rules::Private { access, chain });
+        crate::rules::tree_with(&self.descriptor, self.group.treesync().full_leaves().map(|(_, leaf)| leaf), private)
     }
 
     /// Server removal proposals this commit references, in commit order.
@@ -304,7 +329,7 @@ impl Observer {
             return Err(Invalid("not a commit"));
         };
         let crate::rules::Transition { removed, welcome_for, added_devices, external } =
-            crate::rules::staged(&self.group, &staged, &sender, committed_at, &crypto)?;
+            crate::rules::staged_with(&self.group, &staged, &sender, committed_at, &crypto, self.owner.as_ref())?;
         self.group.merge_commit(&self.storage, *staged).map_err(invalid("merge"))?;
         self.check_tree()?;
 
