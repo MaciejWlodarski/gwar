@@ -33,7 +33,7 @@ and the web client working after every merge.
 8. **Pre-release reviews**: the WebCrypto SFrame worker; `openmls_rust_crypto`
    and our storage.
 
-Parts 1–6 are specified below. Voice comes before private channels and the
+Parts 1–7 are specified below. Voice comes before private channels and the
 archive because it is the product's core and needs only public channel
 groups.
 
@@ -2676,3 +2676,247 @@ gwar managers v1
   - web e2e: the owner and a manager create a private encrypted channel, add
     a member by role expansion, remove them (removed from the group and the
     view), and the member list survives a restart.
+
+## 7. Key archive
+
+Status: **specified**. The design is [e2e.md](e2e.md), "Your own devices".
+A Connect account's devices keep a copy of every epoch key in an encrypted
+archive on Gwar Connect, so a new device of the account, or the recovery code
+after losing every device, reads the account's history. The archive holds
+keys, never MLS state, membership or messages. Local identities have no
+archive.
+
+Parts: **7a** the archive crypto in `crates/gwar-archive` (statements,
+sealing, safety rules, test vectors); **7b** Connect's archive API and
+storage; **7c** the client: device and recovery keys, uploads, transfers,
+imports, the setting, recovery.
+
+### Keys
+
+- **Device archive key:** each Connect device generates an X25519 key pair
+  for the archive (random, kept with the device's MLS store, never exported)
+  and publishes its public half in a statement signed by its **device key**:
+
+  ```text
+  gwar archive device v1
+  {account_key}
+  {device_key}
+  {x25519_public}
+  {created_at}
+  ```
+
+  A device key is usable as a recipient only while the account certifies it
+  (a certificate current now, not revoked in any revocation the reader
+  knows). One archive key per device key: a second statement for the same
+  device key is ignored.
+- **Recovery archive key:** an X25519 key derived from the recovery code,
+  `HKDF-SHA256(ikm = code bytes, salt = account public key, info = "gwar
+  archive recovery v1", 32 bytes)` as the private scalar (clamped by X25519).
+  Its public half is published by whoever sets the recovery code (sign-up,
+  changing the code), in a statement signed by the **account key**:
+
+  ```text
+  gwar archive recovery v1
+  {account_key}
+  {version}
+  {x25519_public}
+  {created_at}
+  ```
+
+  `version` starts at 1 and rises by one with each new code; the newest
+  version is current. Connect accepts version `n + 1` only. A reader rejects a
+  statement with a version it already saw with another key.
+- **Generation key:** 32 random bytes per archive generation, created by a
+  device (below). Records are encrypted with it.
+
+HPKE everywhere is RFC 9180 base mode, DHKEM(X25519, HKDF-SHA256),
+HKDF-SHA256, AES-128-GCM (the suite of history bundles), with `info` and
+`aad` as given per use. Statements follow Connect's encoding rules
+(canonical base64url, decimal Unix milliseconds, no CR/LF, no trailing
+newline).
+
+### Manifests
+
+A generation is created by one current device of the account as a
+**manifest**: three netstrings — the statement, the creator's device
+signature over it, and the body.
+
+```text
+gwar archive manifest v1
+{account_key}
+{generation}             decimal, 1 first
+{previous_hash}          b64url(SHA256(previous manifest bytes)), - for generation 1
+{creator_device_key}
+{recipients}             sorted, comma-separated device_key:x25519_public pairs
+{recovery_version}       the recovery key version it is sealed to, - without a code
+{revocations_hash}       b64url(SHA256(the body's revocations netstring))
+{created_at}
+```
+
+The **body** is two netstrings: the **revocations** the creator knows for
+this account (a netstring list of `gwar revoke v1` statements with their
+account signatures, sorted by device key) and the **sealed keys** (a
+netstring list, one per recipient in statement order and then the recovery
+key, each `enc ‖ ciphertext` of the generation key, HPKE with
+`info = "gwar archive generation v1\n" + account_key + "\n" + generation`
+and `aad = statement`).
+
+Readers accept a manifest only if:
+
+- it parses canonically, its signature verifies under `creator_device_key`,
+  and the creator held a device certificate of the account current at
+  `created_at` (the certificate is the one in the creator's device statement
+  set; see the API);
+- every recipient's x25519 key matches its device's archive key statement,
+  the creator is a recipient, at most 64 recipients;
+- the revocations verify and hash to `revocations_hash`;
+- `previous_hash` names the manifest the reader holds for `generation − 1`
+  (a reader that does not hold it fetches the chain from generation 1).
+
+**Checkpoints.** Each device keeps `(generation, manifest hash)` for every
+generation it saw, and rejects a different manifest for a number it saw.
+It learns every revocation in every manifest it accepts (adding them to
+the revocations it knows from Connect's feed).
+
+**Safe generation** (for uploads only), by what this device knows now:
+
+- it carries every revocation of the account the device knows;
+- its creator and every recipient are current, unrevoked devices of the
+  account;
+- it is sealed to the current recovery version, or to none when the account
+  has no recovery key;
+- this device is a recipient and can open it.
+
+**Uploading** uses the newest safe generation. Without one, the device queues
+its uploads and creates the next generation itself: a fresh key, every
+current device of the account that published an archive key as recipients,
+the current recovery key, the revocations it knows. If Connect already holds
+a manifest for that number, the device fetches it: when it is safe, it uses
+it; otherwise it takes the next free number. A device never uploads under an
+older or unsafe generation: a withheld manifest can stall uploads, never
+weaken them. Once a device learns a revocation, every generation made
+before it is unsafe (a transfer the device never saw may have brought it to
+the revoked device), so a new one is made before its next upload.
+
+### Records
+
+One record per epoch key: a random 16-byte `record_id` and
+`nonce ‖ AES-256-GCM(generation key, nonce, plaintext, aad)` with a random
+12-byte nonce, `aad = "gwar archive record v1\n" + account_key + "\n" +
+generation + "\n" + record_id`. The plaintext is canonical JSON
+`{"server": server_key, "group": group_id, "epoch": "<decimal>", "key":
+"<b64url 32 bytes>"}` (at most 512 bytes). Context and key are only inside
+the encryption.
+
+- A device uploads every epoch key it **derived** itself (MLS exporter), in
+  every conversation kind, once per `(server, group, epoch)`. Keys it only
+  imported (history bundles, the archive) are not uploaded again.
+- **Importing** a record adds an `Imported` epoch key, as a history bundle
+  does, attributed to this account's uid; it never overwrites a derived or
+  imported key (a different key for the same epoch makes it `Conflicted`, as
+  today). It never creates a group record, pin, checkpoint or membership: a
+  key for a group the device has no record of is kept in an **archive key
+  store** (by server, group, epoch) and moved into the group's epoch keys
+  when the device later holds the group (a rejoin, a restart chain).
+- An older or partial archive can only hide keys; it cannot reveal or forge
+  anything (message signatures are inside the ciphertext).
+
+### Transfers
+
+A **key transfer** gives one generation key to one recipient later: a new
+device, or a new recovery key. Three netstrings: the statement, the sender's
+device signature, and `enc ‖ ciphertext` (HPKE, `info = "gwar archive
+transfer v1\n" + account_key + "\n" + generation`, `aad = statement`).
+
+```text
+gwar archive transfer v1
+{account_key}
+{generation}
+{manifest_hash}
+{sender_device_key}
+{recipient}              device:{device_key}:{x25519_public} or recovery:{version}
+{created_at}
+```
+
+- The sender must be a current device of the account that can open the
+  generation; before sending it learns the manifest's revocations, and it
+  never sends to a device revoked by them or by its own feed, or to a
+  device without a current certificate.
+- An existing device sends transfers of every generation it can open when it
+  sees a new current device that published an archive key and holds none of
+  them, and to a new recovery version (below). Until one is online, a new
+  device reads nothing from the archive.
+- A recipient accepts a transfer only for a manifest it accepted (its
+  checkpoint) and from a sender current at `created_at`.
+
+### Recovery code changes
+
+Changing the recovery code (password and a signed-in device, as today)
+publishes the next recovery version. That device then sends transfers of
+every generation it can open to the new version and creates a new
+generation sealed to it. Generations it cannot open are reported: "History
+before {date} can't be restored with the new recovery code." Restoring with
+the recovery code (`POST /v1/recover`) derives the recovery archive key,
+fetches the manifests and transfers for the newest version it can derive
+and opens every generation sealed to it.
+
+### Connect API
+
+Device sessions only (except where public), all JSON, binary as base64url:
+
+| Call | Body → reply |
+| --- | --- |
+| `PUT /v1/archive/device` | `{statement, signature}` → `{}`; the session's own device; once per device key |
+| `GET /v1/archive/devices` | → `{devices: [{statement, signature, certificate}]}` for the account (with each device's current certificate) |
+| `PUT /v1/archive/recovery` | `{statement, signature}` → `{}`; account-signed, version `n + 1` only |
+| `GET /v1/archive/recovery` | → `{keys: [{statement, signature}]}` ascending |
+| `POST /v1/archive/manifests` | `{manifest}` → `{}`; `409 conflict` if the generation exists |
+| `GET /v1/archive/manifests?after=<generation>` | → `{manifests: [...], next}` (at most 100) |
+| `POST /v1/archive/records` | `{records: [{generation, record_id, data}]}` (at most 100) → `{}`; idempotent per record id |
+| `GET /v1/archive/records?after=<cursor>` | → `{records: [{cursor, generation, record_id, data}], next}` (at most 1000) |
+| `POST /v1/archive/transfers` | `{transfer}` → `{}` |
+| `GET /v1/archive/transfers?after=<cursor>` | → `{transfers: [...], next}` for this account |
+
+Connect checks shapes and sizes, the signatures it can check (device
+statements, manifests, transfers against the account's devices; recovery
+statements against the account key), the first manifest per generation, and
+quotas: 200,000 records and 64 MiB per account, 1,000 manifests, 10,000
+transfers; uploads are rate-limited. A revoked device's session ends as
+today; its statements stay, so readers can judge older manifests. Connect
+never sees generation keys, record contents or which server, group or epoch
+a record belongs to.
+
+### Client
+
+- **Setting:** "Back up message keys to Gwar Connect" (Settings → Account),
+  on by default for Connect accounts. Off: no uploads; reading and transfers
+  still work.
+- After signing in (and at startup), a device publishes its archive key,
+  syncs manifests (checkpoints, revocations), transfers and records, and
+  imports what it can open; then uploads queued keys under the newest safe
+  generation, creating one when needed.
+- Uploads run in the background in batches of 100, after each derived
+  epoch, and are retried; a device that cannot reach Connect keeps its queue
+  (in its MLS store) and never blocks messaging on it.
+- A device that sees a new current device of the account with an archive
+  key sends it transfers (once per generation and recipient).
+- Recovery (`POST /v1/recover`): after the account key is decrypted and a
+  new device is certified, the recovery archive key opens the generations
+  sealed to the newest recovery version; the device imports their records.
+
+### Tests and acceptance
+
+- 7a: golden vectors for every statement, manifest, record and transfer;
+  rejection of every malformed or wrongly signed form; the safe-generation
+  rules (missing revocation, revoked or expired creator or recipient, old
+  recovery version, a different manifest for a seen number); records bound
+  to their generation and id (moving one fails).
+- 7b: the first manifest per generation wins; quotas and sizes; a revoked
+  device's session cannot upload; recovery versions only rise by one.
+- 7c: a second device of the account reads the first device's history in a
+  DM and in a channel without history for new members, after a transfer;
+  revoking a device makes the next upload create a new generation that
+  excludes it; restoring with the recovery code on a new device after
+  "losing" every device reads the history; changing the recovery code
+  re-seals and reports unopenable generations; the setting off stops
+  uploads; e2e in the browser with Connect.
