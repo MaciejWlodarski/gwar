@@ -322,6 +322,13 @@ These are limits of a voice chat relayed through a server:
 - It cannot sign as you, decrypt your account key without your password, read
   the vault, or forge revocations.
 
+## The server's machine
+
+Whoever runs as the server's system user owns the server: its database, keys
+and data directory. The local control socket (`data/admin.sock`, mode 0600)
+adds nothing beyond that: it accepts maintenance work (a TeamSpeak import)
+from that user only, and nothing reaches it over the network.
+
 ## Clients and the code supply chain
 
 Every guarantee assumes your client runs genuine code.

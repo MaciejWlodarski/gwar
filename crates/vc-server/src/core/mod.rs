@@ -10,6 +10,7 @@
 pub mod bridge;
 pub mod files;
 mod history;
+mod import;
 mod links;
 mod messages;
 mod mls;
@@ -131,6 +132,13 @@ pub enum CoreMsg {
         failed: bool,
     },
     Info(oneshot::Sender<ServerInfo>),
+    /// A TeamSpeak import for the running server (`vc-server import-teamspeak` over the control socket).
+    Import {
+        plan: Box<crate::ts_import::plan::Plan>,
+        source: String,
+        options: crate::ts_import::apply::ApplyOptions,
+        reply: oneshot::Sender<Result<crate::ts_import::apply::Applied, String>>,
+    },
     DeviceAuthorized(String, String, oneshot::Sender<bool>),
     Bridge(BridgeMsg),
     Files(files::FileMsg),
@@ -663,6 +671,9 @@ impl Core {
             }
             CoreMsg::DeviceAuthorized(account_key, device_key, reply) => {
                 let _ = reply.send(self.store.device_revoked(&account_key, &device_key).is_ok_and(|revoked| !revoked));
+            }
+            CoreMsg::Import { plan, source, options, reply } => {
+                let _ = reply.send(self.import_live(&plan, &source, options));
             }
             CoreMsg::Info(reply) => {
                 let _ = reply.send(self.info.clone());

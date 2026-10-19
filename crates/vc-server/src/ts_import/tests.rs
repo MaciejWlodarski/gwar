@@ -524,3 +524,114 @@ fn an_identity_linked_to_a_gwar_member_is_not_imported_as_a_member_of_its_own() 
     assert!(store.user_by_uid("ts:ClanAdminUid=").unwrap().is_none());
     assert_eq!(store.user_by_uid("native").unwrap().unwrap().1.teamspeak.len(), 2);
 }
+
+#[tokio::test]
+async fn an_import_into_the_running_server_reaches_everyone_connected() {
+    use crate::core::{
+        ConnectRequest, OUTBOUND_QUEUE, Outbound,
+        bridge::{BridgeMsg, RemoteClient},
+        expiry_tests::test_core_teamspeak,
+    };
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use tokio::sync::{mpsc, oneshot};
+
+    let core = test_core_teamspeak(Store::in_memory().unwrap()).unwrap();
+    let (notes, mut bridge) = mpsc::unbounded_channel();
+    core.bridge(BridgeMsg::Attach(notes)).await;
+    let (out, mut frames) = mpsc::channel(OUTBOUND_QUEUE);
+    core.connect(ConnectRequest {
+        request_id: 1,
+        hello_key: String::new(),
+        certificate: None,
+        uid: crate::identity::uid_for_key(&[1; 32]),
+        public_key: URL_SAFE_NO_PAD.encode([1; 32]),
+        nickname: "alice".into(),
+        platform: vc_proto::Platform::Web,
+        out,
+        ip: None,
+        device: None,
+        device_expires_at: None,
+        invite: None,
+        password_ok: true,
+    })
+    .await
+    .unwrap();
+    let lobby = core.info().await.unwrap().default_channel;
+    // On TeamSpeak right now: one the import makes a moderator, one it bans.
+    let join = |uid: &str| {
+        let (tx, rx) = oneshot::channel();
+        let client = RemoteClient {
+            uid: uid.into(),
+            nickname: uid.into(),
+            channel: lobby,
+            platform: vc_proto::Platform::Ts3,
+            muted: false,
+            deafened: false,
+            away: None,
+        };
+        let core = core.clone();
+        async move {
+            core.bridge(BridgeMsg::Join(client, tx)).await;
+            rx.await.unwrap().unwrap()
+        }
+    };
+    let moderator = join("ts:ModUid=").await;
+    let troll = join("ts:BadUid=").await;
+
+    let replace = ApplyOptions { replace_channels: true, ..BRIDGE };
+    let refused = core.import_live(plan(&source(), &Options::default()), "src".into(), replace).await;
+    assert!(refused.unwrap_err().contains("stopped"));
+    let applied = core.import_live(plan(&source(), &Options::default()), "src".into(), BRIDGE).await.unwrap();
+    assert_eq!((applied.roles_created, applied.channels_created, applied.members_created, applied.bans), (2, 5, 3, 2));
+
+    let mut events = Vec::new();
+    while let Ok(Outbound::Frame(text)) = frames.try_recv() {
+        let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+        if let Some(ev) = frame["ev"].as_str() {
+            events.push((ev.to_owned(), frame["d"].clone()));
+        }
+    }
+    let count = |name: &str| events.iter().filter(|(ev, _)| ev == name).count();
+    assert_eq!((count("channel.created"), count("group.created")), (5, 2));
+    assert_eq!(count("server.updated"), 1);
+    assert!(events.iter().any(|(ev, d)| ev == "member.updated" && d["uid"] == "ts:ModUid="));
+    // The moderator already on TeamSpeak has the role now; the banned one is gone.
+    let moderators = events
+        .iter()
+        .filter(|(ev, d)| ev == "group.created" && d["name"] == "Moderator")
+        .map(|(_, d)| d["id"].clone())
+        .next()
+        .unwrap();
+    assert!(events.iter().any(|(ev, d)| ev == "client.updated"
+        && d["id"] == moderator
+        && d["groups"].as_array().unwrap().contains(&moderators)));
+    assert!(events.iter().any(|(ev, d)| ev == "client.left" && d["client"] == troll));
+    // The bridge is let go, so TeamSpeak's supervisor attaches a new one that syncs from scratch.
+    while bridge.try_recv().is_ok() {}
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(2), bridge.recv()).await;
+    assert!(matches!(closed, Ok(None)), "the bridge was not let go");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_import_command_hands_its_plan_to_the_running_server_over_its_socket() {
+    use std::os::unix::fs::PermissionsExt;
+    let core = crate::core::expiry_tests::test_core(Store::in_memory().unwrap(), None);
+    let dir = std::env::temp_dir().join(format!("gwar-ctl-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // A stale socket from an earlier run is replaced.
+    std::fs::write(dir.join(crate::control::SOCKET), b"").unwrap();
+    let served = crate::control::serve(&dir, core.clone()).await.unwrap();
+    assert!(crate::control::available(&dir));
+    let mode = std::fs::metadata(dir.join(crate::control::SOCKET)).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+    let applied =
+        crate::control::import(&dir, plan(&source(), &Options::default()), "src".into(), BRIDGE).await.unwrap();
+    assert_eq!((applied.roles_created, applied.channels_created), (2, 5));
+    // The server's refusal comes back as an error.
+    let replace = ApplyOptions { replace_channels: true, ..BRIDGE };
+    let refused = crate::control::import(&dir, plan(&source(), &Options::default()), "src".into(), replace).await;
+    assert!(refused.unwrap_err().to_string().contains("needs the server stopped"));
+    served.abort();
+    std::fs::remove_dir_all(&dir).unwrap();
+}

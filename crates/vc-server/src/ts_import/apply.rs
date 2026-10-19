@@ -15,7 +15,7 @@ use crate::{
     store::{ADMIN_GROUP, ChannelRow, MEMBER_GROUP, Store},
 };
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct ApplyOptions {
     /// Remove this server's own top-level channels (not imported from this source) first.
     pub replace_channels: bool,
@@ -26,7 +26,7 @@ pub struct ApplyOptions {
     pub for_bridge: bool,
 }
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Applied {
     pub roles_created: usize,
     pub roles_updated: usize,

@@ -456,7 +456,28 @@ async fn main() -> Result<()> {
                 println!("\nDry run, on a copy of the database: {}\nNothing changed.", summary(&applied));
                 return Ok(());
             }
-            let _lock = vc_server::members::lock_data_dir(&cli.data_dir)?;
+            let _lock = match vc_server::members::lock_data_dir(&cli.data_dir) {
+                Ok(lock) => lock,
+                // The server is running: try the plan on a copy, then hand it to the server.
+                Err(_) if vc_server::control::available(&cli.data_dir) => {
+                    let tried = ts_import::import(
+                        &database,
+                        &plan,
+                        &source_id,
+                        ts_import::apply::ApplyOptions { for_bridge: false, ..apply_options },
+                        false,
+                    )?;
+                    println!("\nTried on a copy of the database first: {}", summary(&tried));
+                    // Applied in steps, so the database as it was is kept first.
+                    let backup = cli.data_dir.join(format!("vc.sqlite3.before-import-{}", vc_server::core::now_ms()));
+                    ts_import::copy_database(&database, &backup)?;
+                    let applied = vc_server::control::import(&cli.data_dir, plan, source_id, apply_options).await?;
+                    println!("\nApplied to the running server: {}", summary(&applied));
+                    println!("The database as it was: {}", backup.display());
+                    return Ok(());
+                }
+                Err(e) => return Err(e),
+            };
             // A server that never ran has no database yet: nothing to keep.
             let backup = database
                 .exists()

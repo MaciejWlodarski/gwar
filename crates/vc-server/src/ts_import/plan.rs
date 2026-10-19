@@ -40,7 +40,7 @@ fn fit(text: &str, max: usize, lines: bool) -> String {
     kept.trim().chars().take(max).collect::<String>().trim_end().to_owned()
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PlannedRole {
     pub ts_id: u64,
     pub name: String,
@@ -50,21 +50,21 @@ pub struct PlannedRole {
 }
 
 /// One override in a planned channel: for an imported role (by TeamSpeak id), Member, or a member.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Target {
     Member,
     Role(u64),
     User(String),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PlannedOverride {
     pub target: Target,
     pub allow: Vec<Permission>,
     pub deny: Vec<Permission>,
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub enum Password {
     #[default]
     None,
@@ -76,7 +76,7 @@ pub enum Password {
     Dropped,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PlannedChannel {
     pub ts_id: u64,
     pub parent: Option<u64>,
@@ -90,14 +90,14 @@ pub struct PlannedChannel {
     pub overrides: Vec<PlannedOverride>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PlannedBan {
     /// TeamSpeak's ban id: each is imported once, so one lifted in Gwar stays lifted.
     pub ts_id: u64,
     pub ban: Ban,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PlannedMember {
     /// `ts:<unique id>`.
     pub uid: String,
@@ -107,7 +107,7 @@ pub struct PlannedMember {
     pub roles: Vec<u64>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Plan {
     pub server_name: Option<String>,
     pub welcome: Option<String>,

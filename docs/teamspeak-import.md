@@ -230,10 +230,23 @@ VC_TS_QUERY_PASSWORD=… vc-server import-teamspeak --from 127.0.0.1:10011 [--us
   (`vc.sqlite3.importing`), which replaces the database only once everything
   went in. `--dry-run` does the same and throws the copy away, so it shows
   exactly what would change (also while the server runs).
-- Otherwise the Gwar server must be stopped (`data/vc.lock`). The database as
-  it was stays next to it (`vc.sqlite3.before-import-<time>`); the new one
-  keeps its owner and mode. A server that never ran gets a new database, with
-  the imported channels instead of the seeded ones.
+- With the server stopped, the database as it was stays next to it
+  (`vc.sqlite3.before-import-<time>`); the new one keeps its owner and mode. A
+  server that never ran gets a new database, with the imported channels
+  instead of the seeded ones.
+- **While the server runs** (it holds `data/vc.lock`), the import goes through
+  the server instead: the command first makes the same dry run (on a copy, so
+  nothing is applied if that fails), then hands the plan to the running server
+  over its local control socket (`data/admin.sock`, a Unix socket only the
+  server's own system user can open). The server applies it to its database
+  and brings everyone up to date at once: new and changed channels, roles,
+  their order, the server's name and welcome, members' roles (also of people
+  connected right now, TeamSpeak users included) and new bans, which
+  disconnect whom they cover. The TeamSpeak bridge then reconnects (a few
+  seconds; TeamSpeak users stay on their server) to take the new channels and
+  passwords. Back up first (`vc-server backup`): a live import is applied in
+  steps, not all or nothing, but a failed one can simply be run again (re-runs
+  only finish what is missing). `--replace-channels` needs the server stopped.
 - `--passwords` takes one `name = password` per line (`#` comments, quotes
   optional): a channel's path (`"Clan/Room"`; a `/` or `\` in a name is
   written `\/`, `\\`), a name no other imported channel has, or `@server`
