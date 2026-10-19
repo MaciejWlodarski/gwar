@@ -84,7 +84,8 @@ mentions stay those of a TeamSpeak user, but acts as M: M's roles, M's
 per-channel overrides and M's rank apply (in every channel move on TeamSpeak
 too), and a ban of M or of `ts:<uid>` refuses them. Role changes, kicks and
 bans of M reach that session too; lifting M's ban lifts the TeamSpeak bans the
-bridge set for M's linked identities. Their TeamSpeak visits keep M from
+bridge set for M's linked identities when it came (`ban_teamspeak`), also for
+identities unlinked since. Their TeamSpeak visits keep M from
 looking inactive (`last_seen`), and a later import gives a linked identity's
 channel overrides to M.
 

@@ -543,6 +543,12 @@ impl Core {
             .collect();
         let reason = LeaveReason::Banned { by: ban.by.clone(), reason: ban.reason.clone(), until: ban.expires_at };
         for s in banned {
+            // The bridge bans a TeamSpeak session it removes; a linked identity's ban there is lifted with this one.
+            if let Some(teamspeak) =
+                self.sessions.get(&s).filter(|s| s.out.is_none() && s.uid != uid).map(|s| s.uid.clone())
+            {
+                self.store.add_ban_teamspeak(ban.id, &teamspeak).map_err(storage_error)?;
+            }
             self.remove(s, reason.clone());
         }
         self.mls_reconcile().map_err(storage_error)?;
@@ -560,17 +566,12 @@ impl Core {
             return Err(err(ErrorCode::NotFound, "no such ban"));
         };
         // A TeamSpeak user's ban also lives on the TeamSpeak server.
-        match ban.uid {
-            Some(uid) if uid.starts_with("ts:") => self.notify_bridge(|| BridgeNote::Unban { uid }),
-            // Banning a member banned the TeamSpeak sessions of their linked identities there too.
-            Some(uid) => {
-                if let Some((user_id, _)) = self.store.user_by_uid(&uid).map_err(storage_error)? {
-                    for teamspeak in self.store.teamspeak_links_of(user_id).map_err(storage_error)? {
-                        self.notify_bridge(|| BridgeNote::Unban { uid: teamspeak });
-                    }
-                }
-            }
-            None => {}
+        if let Some(uid) = ban.uid.filter(|uid| uid.starts_with("ts:")) {
+            self.notify_bridge(|| BridgeNote::Unban { uid });
+        }
+        // Banning a member banned the TeamSpeak sessions of their linked identities there too.
+        for teamspeak in self.store.take_ban_teamspeak(id).map_err(storage_error)? {
+            self.notify_bridge(|| BridgeNote::Unban { uid: teamspeak });
         }
         Ok(Response::Empty {})
     }
