@@ -143,9 +143,13 @@ depend on the person's identities.
 The web app signs in the page (`apps/web/src/connect/ts-key.ts`, the same
 statement check and signature as the desktop's): it decodes the identity from
 the account's vault, where the desktop keeps it in the TeamSpeak client's
-export form, signs, and wipes the key. It has no native layer, so its own
-question (or the person's click on "Claim roles from TeamSpeak") is the consent;
-the vault, and so the key, is the page's anyway once it is unlocked there.
+export form, and signs only for the account signed in, the one whose vault
+holds the key (a claim for another account, such as one a different tab signed
+in as meanwhile, is refused). It clears its own buffer of the private scalar
+afterwards, which is no promise that no copy stays in the page's memory: the
+vault, and so the key, is the page's anyway once it is unlocked there. It has
+no native layer, so its own question (or the person's click on "Claim roles
+from TeamSpeak") is the consent.
 
 ## Roles and permissions
 

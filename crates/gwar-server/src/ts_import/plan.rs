@@ -48,16 +48,22 @@ fn description_line(description: &str) -> String {
         let end = text.to_ascii_lowercase()[start..].find("[/img]").map_or(text.len(), |e| start + e + "[/img]".len());
         text.replace_range(start..end, "");
     }
+    // A tag is `[…]` within one line; a `[` without its `]` is text.
     let mut plain = String::new();
-    let mut tag = false;
-    for c in text.chars() {
-        match c {
-            '[' if !tag => tag = true,
-            ']' if tag => tag = false,
-            _ if !tag => plain.push(c),
-            _ => {}
+    let mut rest = text.as_str();
+    while let Some(open) = rest.find('[') {
+        plain.push_str(&rest[..open]);
+        let after = &rest[open..];
+        let line_end = after.find('\n').unwrap_or(after.len());
+        match after[..line_end].find(']') {
+            Some(close) => rest = &after[close + 1..],
+            None => {
+                plain.push('[');
+                rest = &after[1..];
+            }
         }
     }
+    plain.push_str(rest);
     plain
         .lines()
         .map(str::trim)

@@ -739,6 +739,10 @@ fn a_channel_without_a_topic_takes_its_descriptions_first_line() {
     assert_eq!(topic("Lobby"), "Welcome");
     assert!(planned.notes.iter().any(|n| n.contains("\"Clan\"") && n.contains("first line became the topic")));
     assert!(planned.notes.iter().any(|n| n.contains("\"Lobby\"") && n.contains("description not imported")));
+    // A `[` that closes nowhere is text, and the rest of the line stays.
+    s.channels[1].insert("channel_description".into(), "[unfinished\nWelcome everyone".into());
+    let planned = plan(&s, &Options::default());
+    assert_eq!(planned.channels.iter().find(|c| c.name == "Clan").unwrap().topic, "[unfinished");
     // Only tags (an image, say): nothing to take.
     s.channels[1].insert("channel_description".into(), "[img]https://x/banner.png[/img]".into());
     let planned = plan(&s, &Options::default());

@@ -11,7 +11,7 @@
  * - Every change (add, import, rename, delete, default) is made to the account's
  *   list when signed in, otherwise to this device's own.
  */
-import { loadConnectRecord, type ConnectRecord } from "../net/identity";
+import { loadConnectRecord, uidForPublicKey, type ConnectRecord } from "../net/identity";
 import { isDesktop, tauri } from "../platform";
 import { ConnectApi, connectApi } from "./api";
 import { addEntry, DEFAULT_NAME, emptyList, normalizeList, sameList, type TsEntry, type TsList } from "./ts-list";
@@ -97,16 +97,22 @@ const desktopSigner: ClaimSigner = {
 };
 
 /** The account's identities, with their keys; none unless signed in with the vault key. */
-async function vaultIdentities(): Promise<TsEntry[]> {
-  const record = await loadConnectRecord();
+async function vaultIdentities(record: ConnectRecord | undefined): Promise<TsEntry[]> {
   if (!record?.vaultKey) return [];
   return vaultList((await loadVault(connectApi, record)).contents).identities;
 }
 
 const browserSigner: ClaimSigner = {
-  identities: async () => (await vaultIdentities()).map(({ uid, name }) => ({ uid, name })),
+  identities: async () => (await vaultIdentities(await loadConnectRecord())).map(({ uid, name }) => ({ uid, name })),
   claimSign: async (uid, statement) => {
-    const entry = (await vaultIdentities()).find((i) => i.uid === uid);
+    // One account for the whole signature: the one whose vault holds the key must be the one the
+    // statement claims for (another tab may have signed in as someone else meanwhile).
+    const record = await loadConnectRecord();
+    const claimant = statement.split("\n")[2];
+    if (!record?.vaultKey || claimant !== (await uidForPublicKey(record.accountKey))) {
+      throw new Error("this claim is for another account than the one signed in");
+    }
+    const entry = (await vaultIdentities(record)).find((i) => i.uid === uid);
     if (!entry) throw new Error("this TeamSpeak identity is not in your account");
     const { signClaim, teamspeakUid } = await import("./ts-key");
     const signed = signClaim(entry.identity, statement);

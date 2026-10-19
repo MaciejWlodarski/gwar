@@ -139,6 +139,8 @@ const CLAIM = new RegExp(`^gwar teamspeak claim v1\\n${FIELD}\\n${FIELD}\\n${FIE
 /**
  * Signs a claim statement with `identity` (ECDSA P-256, SHA-256, DER), and nothing else: the key
  * signs no other text. Returns the public key in TeamSpeak's form and the signature, both base64.
+ * Clears its own buffer of the scalar after; other copies (the identity text, the library's) are
+ * not wiped.
  */
 export function signClaim(identity: string, statement: string): { key: string; signature: string } {
   if (!CLAIM.test(statement)) throw new Error("not a TeamSpeak claim statement");
