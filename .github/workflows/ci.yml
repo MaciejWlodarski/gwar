@@ -37,6 +37,9 @@ jobs:
       - name: Tests
         run: cargo test --workspace --exclude vc-desktop
 
+  # The jobs below select the whole workspace (with vc-server's test hooks) so that dependency
+  # features unify as in the rust job and its cached dependencies are reused; `-p` would rebuild them.
+
   # Real-time voice tests that need a runner of their own.
   rust-voice:
     runs-on: ubuntu-24.04
@@ -54,12 +57,14 @@ jobs:
       - name: System libraries (Opus, ALSA)
         run: sudo apt-get update && sudo apt-get install -y libopus-dev libasound2-dev pkg-config
       - name: Queued encrypted voice
-        run: cargo test -p vc-server --features test-hooks --test mls voice_opaque_srtp
+        run: cargo test --workspace --exclude vc-desktop --features vc-server/test-hooks --test mls voice_opaque_srtp
       - name: Eight native SFrame senders, alone (nine real-time engines)
         # Nine devices join one MLS group in a debug build: single frames can take longer than 3 s here.
         env:
           VC_TEST_FRAME_TIMEOUT_SECS: "30"
-        run: cargo test -p vc-server --test mls native_sframe_receiver_decodes_eight_senders_on_all_slots -- --ignored
+        run: cargo test --workspace --exclude vc-desktop --features vc-server/test-hooks --test mls native_sframe_receiver_decodes_eight_senders_on_all_slots -- --ignored
+      - name: Server without TeamSpeak support
+        run: cargo build -p vc-server --no-default-features
 
   # Runs the official TeamSpeak server (downloaded and checksum-verified),
   # one at a time: its free license allows a single instance per host.
@@ -79,15 +84,15 @@ jobs:
       - name: System libraries (Opus, ALSA)
         run: sudo apt-get update && sudo apt-get install -y libopus-dev libasound2-dev pkg-config
       - name: Deterministic TeamSpeak hook regressions
-        run: cargo test -p vc-server --features test-hooks --lib teamspeak
+        run: cargo test --workspace --exclude vc-desktop --features vc-server/test-hooks --lib teamspeak
       - name: TeamSpeak bridge end-to-end
         env:
           VC_TS3_DIR: ${{ runner.temp }}/ts3
-        run: cargo test -p vc-client --test teamspeak_mode --test teamspeak_interop -- --test-threads=1
+        run: cargo test --workspace --exclude vc-desktop --features vc-server/test-hooks --test teamspeak_mode --test teamspeak_interop -- --test-threads=1
       - name: TeamSpeak channel permissions
         env:
           VC_TS3_DIR: ${{ runner.temp }}/ts3
-        run: cargo test -p vc-server --features test-hooks --test teamspeak_channels --test teamspeak_import -- --ignored --test-threads=1
+        run: cargo test --workspace --exclude vc-desktop --features vc-server/test-hooks --test teamspeak_channels --test teamspeak_import -- --ignored --test-threads=1
 
   # Known vulnerabilities in dependencies fail the build (advisories only, not
   # "unmaintained" notices). Separate, so the other jobs still report.
@@ -170,6 +175,7 @@ jobs:
         run: cargo build -p vc-desktop --config 'profile.dev.package."*".opt-level=0'
 
   # Builds the MLS wasm once; the jobs that need it start as soon as it is uploaded.
+  # The browser jobs build every workspace binary and example (see above for why).
   mls-wasm:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -236,8 +242,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Browser MLS runtime with the local delivery service
         run: |
-          cargo build -p vc-server --no-default-features
-          cargo build -p gwar-connect
+          cargo build --workspace --exclude vc-desktop --bins --examples
           pnpm --filter web exec playwright install --with-deps chromium
           pnpm --filter web e2e:mls
 
@@ -270,8 +275,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Private channels, direct messages and the key archive in the browser
         run: |
-          cargo build -p vc-server --no-default-features
-          cargo build -p gwar-connect
+          cargo build --workspace --exclude vc-desktop --bins --examples
           pnpm --filter web exec playwright install --with-deps chromium
           pnpm --filter web e2e:private
           pnpm --filter web e2e:dm
@@ -283,5 +287,4 @@ jobs:
           pulseaudio --start --exit-idle-time=-1
           pactl load-module module-null-sink sink_name=e2e
           pactl set-default-sink e2e
-          cargo build -p vc-client --example native_bridge
           pnpm --filter web e2e:native-voice
