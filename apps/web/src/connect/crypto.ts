@@ -257,14 +257,18 @@ export async function hashBytes(bytes: Uint8Array): Promise<string> {
 
 export const hashText = (text: string): Promise<string> => hashBytes(enc.encode(text));
 
-export function checkChallenge(c: ConnectChallenge, serviceKey: string): void {
+/** How long a Connect challenge lives, and how far apart the service's clock and this device's may be (docs/connect.md). */
+export const CHALLENGE_MS = 300_000;
+export const CLOCK_SKEW_MS = 300_000;
+
+export function checkChallenge(c: ConnectChallenge, serviceKey: string, now: number = Date.now()): void {
   const canonical = (text: string, length: number) => {
     if (typeof text !== "string" || text.length !== Math.ceil(length * 4 / 3) || !/^[A-Za-z0-9_-]+$/.test(text)) return false;
     const bytes = decodeBase64Url(text);
     return bytes.length === length && encodeBase64Url(bytes) === text;
   };
   if (!c || !canonical(serviceKey, 32) || c.service_key !== serviceKey || !canonical(c.challenge, 32)
-      || !Number.isSafeInteger(c.expires_at) || c.expires_at <= Date.now() || c.expires_at > Date.now() + 300_000
+      || !Number.isSafeInteger(c.expires_at) || c.expires_at <= now - CLOCK_SKEW_MS || c.expires_at > now + CHALLENGE_MS + CLOCK_SKEW_MS
       || !Number.isSafeInteger(c.credential_version) || c.credential_version < 0) {
     throw new Error("Invalid Connect challenge");
   }

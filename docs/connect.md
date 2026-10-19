@@ -169,7 +169,10 @@ A challenge is 32 fresh random bytes, expires after five minutes, and is bound
 in SQLite to the account, token, purpose and expected credential version.
 Only one challenge per token and purpose stays outstanding. Each successful
 operation consumes it once, atomically with the session or credential update.
-Clients reject malformed, expired or more-than-five-minute challenges.
+Clients reject malformed, expired or more-than-five-minute challenges. Like
+the service, they allow five minutes of clock skew: a device whose clock is
+behind the service's would otherwise see every fresh challenge as longer
+than five minutes.
 
 **Session proof**, by the locally held device key:
 
