@@ -74,6 +74,35 @@ pub enum Link {
 /// At most this many TeamSpeak identities link to one member (clients accept a member with as many).
 pub const MAX_TEAMSPEAK_LINKS: i64 = 64;
 
+/// In what imports last wrote for channels, `from`'s member overrides become `into`'s, except where
+/// `into` has one already (that one stays): exactly what the overrides themselves went through.
+fn move_import_overrides(tx: &rusqlite::Transaction<'_>, from: &str, into: &str) -> Result<()> {
+    let pattern = format!("%{}%", serde_json::to_string(from)?.trim_matches('"'));
+    let mut stmt =
+        tx.prepare("SELECT source,ts_id,written FROM ts_imports WHERE kind='channel' AND written LIKE ?1")?;
+    // `ts_id` is whatever the import stored (a TeamSpeak channel id): carried back as is.
+    let rows: Vec<(String, rusqlite::types::Value, String)> =
+        stmt.query_map([pattern], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+    for (source, ts_id, written) in rows {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&written) else { continue };
+        let Some(overrides) = value.get_mut("overrides").and_then(|o| o.as_array_mut()) else { continue };
+        let user = |o: &serde_json::Value, uid: &str| o.get("user").and_then(|u| u.as_str()) == Some(uid);
+        if overrides.iter().any(|o| user(o, into)) {
+            overrides.retain(|o| !user(o, from));
+        } else {
+            for o in overrides.iter_mut().filter(|o| user(o, from)) {
+                o["user"] = serde_json::Value::String(into.to_owned());
+            }
+        }
+        tx.execute(
+            "UPDATE ts_imports SET written=?3 WHERE source=?1 AND kind='channel' AND ts_id=?2",
+            params![source, ts_id, value.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
 /// A TeamSpeak identity's uid as a member uid: `ts:<uid>`.
 pub fn is_teamspeak(uid: &str) -> bool {
     uid.len() > 3 && uid.starts_with("ts:")
@@ -450,6 +479,13 @@ const MIGRATIONS: &[&str] = &[
         linked_at INTEGER NOT NULL
     );
     CREATE INDEX teamspeak_links_user ON teamspeak_links(user_id);
+    -- TeamSpeak identities a ban of their member banned on TeamSpeak too (the bridge's banclient),
+    -- so lifting the ban lifts theirs even if they were unlinked meanwhile.
+    CREATE TABLE ban_teamspeak (
+        ban INTEGER NOT NULL,
+        teamspeak TEXT NOT NULL,
+        PRIMARY KEY (ban, teamspeak)
+    );
     "#,
 ];
 
@@ -1477,10 +1513,7 @@ impl Store {
         // Overrides follow too, where the target has none of its own in that channel.
         tx.execute("UPDATE OR IGNORE channel_overrides SET user=?2 WHERE user=?1", params![from, into])?;
         // What a TeamSpeak import last wrote follows too, so a re-run does not take the merge for an edit.
-        tx.execute(
-            "UPDATE ts_imports SET written=replace(written,'\"user\":\"'||?1||'\"','\"user\":\"'||?2||'\"') WHERE kind='channel'",
-            params![from, into],
-        )?;
+        move_import_overrides(&tx, from, into)?;
         tx.execute("DELETE FROM channel_overrides WHERE user=?1", [from])?;
         tx.execute("UPDATE tokens SET creator_uid=?2 WHERE creator_uid=?1", params![from, into])?;
         // bans.by and invites.created_by are display-name snapshots, not identity references.
@@ -1567,10 +1600,7 @@ impl Store {
             overrides.sort_unstable();
             overrides.dedup();
             // What a TeamSpeak import last wrote follows too, so a re-run does not take the link for an edit.
-            tx.execute(
-                "UPDATE ts_imports SET written=replace(written,'\"user\":\"'||?1||'\"','\"user\":\"'||?2||'\"') WHERE kind='channel'",
-                params![teamspeak, into],
-            )?;
+            move_import_overrides(&tx, teamspeak, into)?;
             tx.execute(
                 "UPDATE users SET last_seen=MAX(last_seen,(SELECT last_seen FROM users WHERE id=?1)) WHERE id=?2",
                 params![from_id, into_id],
@@ -1955,6 +1985,25 @@ impl Store {
         let ban = self.bans(now)?.into_iter().find(|b| b.id == id);
         self.db.execute("DELETE FROM bans WHERE id=?1", [id])?;
         Ok(ban)
+    }
+
+    /// Records that ban `ban` banned the TeamSpeak identity `teamspeak` on TeamSpeak too.
+    pub fn add_ban_teamspeak(&self, ban: BanId, teamspeak: &str) -> Result<()> {
+        self.db
+            .execute("INSERT OR IGNORE INTO ban_teamspeak(ban,teamspeak) VALUES (?1,?2)", params![ban, teamspeak])?;
+        Ok(())
+    }
+
+    /// The TeamSpeak identities ban `ban` banned on TeamSpeak too, forgetting them (and any of bans gone).
+    pub fn take_ban_teamspeak(&self, ban: BanId) -> Result<Vec<Uid>> {
+        let tx = self.db.unchecked_transaction()?;
+        let mut stmt = tx.prepare("DELETE FROM ban_teamspeak WHERE ban=?1 RETURNING teamspeak")?;
+        let mut taken: Vec<Uid> = stmt.query_map([ban], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        tx.execute("DELETE FROM ban_teamspeak WHERE ban NOT IN (SELECT id FROM bans)", [])?;
+        tx.commit()?;
+        taken.sort_unstable();
+        Ok(taken)
     }
 
     // -------------------------------------------------- Gwar Connect devices
@@ -2886,6 +2935,28 @@ mod teamspeak_link_tests {
         assert!(store.user_by_uid("ts:z=").unwrap().is_some());
         store.merge_members("old", "new", false).unwrap();
         assert_eq!(store.teamspeak_member("ts:q=").unwrap().as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn two_identities_linked_to_one_member_leave_the_imports_record_like_the_channel() {
+        let store = Store::in_memory().unwrap();
+        user(&store, "m", &[MEMBER_GROUP]);
+        user(&store, "ts:a=", &[MEMBER_GROUP]);
+        user(&store, "ts:b=", &[MEMBER_GROUP]);
+        let overrides =
+            vec![user_override("ts:a=", Permission::MoveMembers), user_override("ts:b=", Permission::Speak)];
+        let channel = store
+            .create_channel(&ChannelRow { name: "Room".into(), overrides: overrides.clone(), ..Default::default() })
+            .unwrap();
+        let written = serde_json::json!({ "name": "Room", "overrides": overrides }).to_string();
+        store.set_ts_import_record("src", "channel", 7, i64::from(channel), Some(&written)).unwrap();
+        store.link_teamspeak("ts:a=", "m", 1).unwrap();
+        store.link_teamspeak("ts:b=", "m", 1).unwrap();
+        let actual = store.channels().unwrap().into_iter().find(|r| r.id == channel).unwrap().overrides;
+        assert_eq!(actual, vec![user_override("m", Permission::MoveMembers)]);
+        let (_, written) = store.ts_import_record("src", "channel", 7).unwrap().unwrap();
+        let recorded: serde_json::Value = serde_json::from_str(&written.unwrap()).unwrap();
+        assert_eq!(recorded["overrides"], serde_json::json!(actual));
     }
 
     #[test]

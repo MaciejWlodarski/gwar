@@ -496,27 +496,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lifting_a_members_ban_lifts_it_for_their_linked_identities_on_teamspeak() {
+    async fn lifting_a_members_ban_lifts_the_teamspeak_bans_it_caused_even_after_an_unlink() {
         let store = Store::in_memory().unwrap();
         let core = test_core_teamspeak(store).unwrap();
         let (notes, mut bridge) = mpsc::unbounded_channel();
         core.bridge(BridgeMsg::Attach(notes)).await;
         let admin = gwar_session(&core, 1, "admin").await;
         let alice = gwar_session(&core, 2, "alice").await;
-        let identity = EccKeyPrivP256::create();
-        let teamspeak = format!("ts:{}", identity.to_pub().get_uid());
-        assert!(claim(&core, alice, &identity).await.is_ok());
+        let channel = core.info().await.unwrap().default_channel;
+        // One identity online on TeamSpeak when the ban comes (the bridge bans it there), one not.
+        let (online, offline) = (EccKeyPrivP256::create(), EccKeyPrivP256::create());
+        let uid_of = |k: &EccKeyPrivP256| format!("ts:{}", k.to_pub().get_uid());
+        assert!(claim(&core, alice, &online).await.is_ok());
+        assert!(claim(&core, alice, &offline).await.is_ok());
+        remote(&core, &uid_of(&online), channel).await.unwrap();
         let alice_uid = on_core(&core, move |core| {
             core.sessions.get_mut(&admin).unwrap().groups = vec![crate::store::ADMIN_GROUP];
             core.sessions[&alice].uid.clone()
         })
         .await;
-        let ban = on_core(&core, move |core| {
-            let request = vc_proto::BanCreate { uid: Some(alice_uid), ..Default::default() };
-            core.ban_create(admin, request)
+        let ban = on_core(&core, {
+            let alice_uid = alice_uid.clone();
+            move |core| core.ban_create(admin, vc_proto::BanCreate { uid: Some(alice_uid), ..Default::default() })
         })
         .await;
         let Ok(Response::Ban { ban }) = ban else { panic!("{ban:?}") };
+        // Unlinked meanwhile: its TeamSpeak ban still goes with this one.
+        let online_uid = uid_of(&online);
+        on_core(&core, move |core| core.unlink_teamspeak(&online_uid).unwrap()).await;
         while bridge.try_recv().is_ok() {}
         let deleted = on_core(&core, move |core| core.ban_delete(admin, ban.id)).await;
         assert!(deleted.is_ok());
@@ -526,6 +533,6 @@ mod tests {
                 unbanned.push(uid);
             }
         }
-        assert_eq!(unbanned, vec![teamspeak]);
+        assert_eq!(unbanned, vec![uid_of(&online)]);
     }
 }
