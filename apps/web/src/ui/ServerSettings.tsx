@@ -1,5 +1,5 @@
 import * as Dropdown from "@radix-ui/react-dropdown-menu";
-import { Ban, Check, ChevronDown, ChevronUp, Copy, Crown, GripVertical, Link2, Lock, Plus, Search, ShieldCheck, Trash2, UserMinus, UserPlus, Users, X } from "lucide-react";
+import { Ban, Check, ChevronDown, ChevronUp, Copy, Crown, Eye, GripVertical, Link2, Lock, Plus, Search, ShieldCheck, Trash2, UserMinus, UserPlus, Users, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 import { countKey, useLanguage, useT, type Key } from "../i18n";
 import { INVITE_EXPIRY, INVITE_USES } from "../lib/ban";
@@ -353,6 +353,14 @@ function RolesTab() {
             <Plus className="size-4" /> {t("ss.createRole")}
           </Button>
         )}
+        <Button
+          size="sm"
+          variant="ghost"
+          className="justify-start"
+          onClick={() => useUi.getState().openDialog({ kind: "viewAs", role: current?.id ?? MEMBER_GROUP, back: "roles" })}
+        >
+          <Eye className="size-4" /> {t("viewAs.open")}
+        </Button>
       </div>
       <RoleEditor key={selected} group={current} onSaved={(id) => setSelected(id)} />
     </div>

@@ -1,4 +1,4 @@
-import { Copy, Pencil } from "lucide-react";
+import { Copy, Eye, Pencil } from "lucide-react";
 import { useState, type FormEvent } from "react";
 import { useT } from "../i18n";
 import { acceptHandle } from "../net/handle-pins";
@@ -75,6 +75,7 @@ export function MemberProfileDialog({ uid, fallback }: { uid: string; fallback: 
   const own = useSession((s) => s.me?.uid === uid);
   const vc = useSession((s) => s.kind === "vc");
   const canRename = usePermission("manage_members");
+  const canViewAs = usePermission("manage_roles");
   const me = useMyWho();
   const groupDefs = useSession((s) => s.groups);
   const target = useWhoOf(uid, member?.groups ?? NO_GROUPS);
@@ -126,6 +127,11 @@ export function MemberProfileDialog({ uid, fallback }: { uid: string; fallback: 
         {vc && (own || mayRename) && (
           <Button onClick={() => useUi.getState().openDialog({ kind: "nickname", uid })}>
             <Pencil className="size-4" /> {t("nickname.change")}
+          </Button>
+        )}
+        {vc && canViewAs && (
+          <Button onClick={() => useUi.getState().openDialog({ kind: "viewAs", uid })}>
+            <Eye className="size-4" /> {t("viewAs.openMember")}
           </Button>
         )}
         {vc && <TeamspeakLinks uid={uid} linked={member?.teamspeak ?? NO_LINKS} own={own} mayUnlink={own || mayRename} />}

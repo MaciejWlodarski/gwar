@@ -117,6 +117,7 @@ export type DialogState =
   | { kind: "nickname"; uid: string }
   | { kind: "memberProfile"; uid: string; fallback: string }
   | { kind: "ban"; person: PersonRef; back?: ServerSettingsTab }
+  | { kind: "viewAs"; role?: number; uid?: string; back?: ServerSettingsTab }
   | { kind: "removeMember"; person: PersonRef; back?: ServerSettingsTab }
   | { kind: "lightbox"; attachment: Attachment; verified: boolean }
   | { kind: "redeem" }

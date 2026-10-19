@@ -209,8 +209,13 @@ needs: join and talk power, channel admins and the group order map onto
   allow). Subchannels show "Synced with Clan" with a button to break the sync.
 - **Who can see it** stays the private channel's access list, shown above the
   overrides, so the whole picture of a channel is on one page.
-- **View as role.** An admin previews the channel tree and the chat as a role
-  sees it. Later; not needed for the first release.
+- **View as.** Server settings → Roles → "View as this role" (any role, picked
+  there), or a member's profile → "View the server as this member" (with
+  `manage_roles`): the channel tree as they see it, with whether they may join,
+  speak, write, send files and manage each channel, and their server-wide
+  permissions. Computed in the client like the server does; private channels
+  the viewer cannot see are not shown, and an encrypted private channel counts
+  only its signed member list.
 - Errors say why: "Moderator is above your rank", not "missing permission".
 
 ## Moving existing servers
