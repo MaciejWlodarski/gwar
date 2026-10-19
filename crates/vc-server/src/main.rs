@@ -302,6 +302,9 @@ fn members(data_dir: &std::path::Path, database: &std::path::Path, command: Memb
                 ),
                 vc_server::store::Link::Linked { member: false, .. } => println!("linked {teamspeak} to {member_uid}"),
                 vc_server::store::Link::Already => println!("{teamspeak} was already linked to {member_uid}"),
+                vc_server::store::Link::TooMany => {
+                    anyhow::bail!("{member_uid} has as many TeamSpeak identities linked as allowed")
+                }
                 vc_server::store::Link::Elsewhere => {
                     anyhow::bail!("{teamspeak} is linked to another member: unlink it first")
                 }

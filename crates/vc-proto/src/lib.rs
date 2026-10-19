@@ -1936,6 +1936,17 @@ mod tests {
         };
         let text = serde_json::to_string(&reply).unwrap();
         assert_eq!(serde_json::from_str::<ServerFrame>(&text).unwrap(), reply);
+        // The TeamSpeak claim's answers come back as themselves, not as another shape.
+        for ok in [
+            Response::TeamspeakNonce { nonce: "n".into() },
+            Response::TeamspeakClaimed { teamspeak: "ts:x=".into() },
+            Response::TeamspeakClaimable { claimable: vec!["ts:x=".into()] },
+            Response::TeamspeakClaimable { claimable: vec![] },
+        ] {
+            let reply = ServerFrame::Ok { re: 3, ok };
+            let text = serde_json::to_string(&reply).unwrap();
+            assert_eq!(serde_json::from_str::<ServerFrame>(&text).unwrap(), reply, "{text}");
+        }
         let reason = serde_json::to_value(LeaveReason::Removed { by: "root".into() }).unwrap();
         assert_eq!(reason, json!({"kind": "removed", "by": "root"}));
     }

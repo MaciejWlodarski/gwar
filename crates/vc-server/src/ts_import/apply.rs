@@ -317,8 +317,12 @@ pub fn apply(store: &Store, plan: &Plan, source: &str, options: ApplyOptions) ->
                     Some(id) => (Some(id), None),
                     None => continue,
                 },
-                Target::User(uid) => (None, Some(uid.clone())),
+                // A linked identity's override is its member's; two identities of one member keep the first.
+                Target::User(uid) => (None, Some(store.teamspeak_member(uid)?.unwrap_or_else(|| uid.clone()))),
             };
+            if user.is_some() && overrides.iter().any(|o: &ChannelOverride| o.user == user) {
+                continue;
+            }
             overrides.push(ChannelOverride { role, user, allow: o.allow.clone(), deny: o.deny.clone() });
         }
         let current_hash = current.as_ref().and_then(|r| r.password_hash.clone());

@@ -153,6 +153,9 @@ impl Core {
         }
         match self.link_teamspeak(&teamspeak, &uid)? {
             Link::Elsewhere => Err(err(ErrorCode::Conflict, "this TeamSpeak identity is linked to another member")),
+            Link::TooMany => {
+                Err(err(ErrorCode::QuotaExceeded, "you have as many TeamSpeak identities linked as allowed"))
+            }
             Link::Linked { .. } | Link::Already => {
                 info!(session, %uid, %teamspeak, "TeamSpeak identity claimed");
                 Ok(Response::TeamspeakClaimed { teamspeak })
@@ -433,5 +436,96 @@ mod tests {
         })
         .await;
         assert_eq!(remote(&core, &teamspeak, channel).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_linked_user_moving_on_teamspeak_is_held_to_the_members_own_denies() {
+        let store = Store::in_memory().unwrap();
+        let alice_uid = crate::identity::uid_for_key(&[1; 32]);
+        let overrides = vec![vc_proto::ChannelOverride {
+            user: Some(alice_uid),
+            deny: vec![Permission::Connect],
+            ..Default::default()
+        }];
+        let closed =
+            store.create_channel(&ChannelRow { name: "Closed".into(), overrides, ..Default::default() }).unwrap();
+        let core = test_core_teamspeak(store).unwrap();
+        let alice = gwar_session(&core, 1, "alice").await;
+        let channel = core.info().await.unwrap().default_channel;
+        let identity = EccKeyPrivP256::create();
+        assert!(claim(&core, alice, &identity).await.is_ok());
+        let ts = remote(&core, &format!("ts:{}", identity.to_pub().get_uid()), channel).await.unwrap();
+        core.bridge(BridgeMsg::Update(
+            ts,
+            super::super::bridge::RemoteUpdate { channel: Some(closed), ..Default::default() },
+        ))
+        .await;
+        let now = on_core(&core, move |core| core.sessions[&ts].channel).await;
+        assert_eq!(now, Some(channel));
+    }
+
+    #[tokio::test]
+    async fn a_claim_past_the_limit_is_refused_and_teamspeak_use_counts_as_seen() {
+        let store = Store::in_memory().unwrap();
+        let alice_uid = crate::identity::uid_for_key(&[1; 32]);
+        let core = test_core_teamspeak(store).unwrap();
+        let alice = gwar_session(&core, 1, "alice").await;
+        let channel = core.info().await.unwrap().default_channel;
+        let identity = EccKeyPrivP256::create();
+        assert!(claim(&core, alice, &identity).await.is_ok());
+        // Seen long ago; using the linked identity on TeamSpeak counts as being here.
+        let user_id = on_core(&core, move |core| core.sessions[&alice].user_id).await;
+        on_core(&core, move |core| core.store.set_last_seen(user_id, 1).unwrap()).await;
+        let ts = remote(&core, &format!("ts:{}", identity.to_pub().get_uid()), channel).await.unwrap();
+        async fn seen(core: &CoreHandle, uid: String) -> i64 {
+            on_core(core, move |core| core.store.user_by_uid(&uid).unwrap().unwrap().1.last_seen).await
+        }
+        assert!(seen(&core, alice_uid.clone()).await > 1);
+        on_core(&core, move |core| core.store.set_last_seen(user_id, 1).unwrap()).await;
+        core.bridge(BridgeMsg::Leave(ts, LeaveReason::Quit)).await;
+        assert!(seen(&core, alice_uid.clone()).await > 1);
+        // Fill the member up to the limit; one more claim is refused.
+        on_core(&core, move |core| {
+            for i in 1..crate::store::MAX_TEAMSPEAK_LINKS {
+                core.store.link_teamspeak(&format!("ts:filler{i}="), &core.sessions[&alice].uid.clone(), 1).unwrap();
+            }
+        })
+        .await;
+        let refused = claim(&core, alice, &EccKeyPrivP256::create()).await;
+        assert_eq!(refused.unwrap_err().code, ErrorCode::QuotaExceeded);
+    }
+
+    #[tokio::test]
+    async fn lifting_a_members_ban_lifts_it_for_their_linked_identities_on_teamspeak() {
+        let store = Store::in_memory().unwrap();
+        let core = test_core_teamspeak(store).unwrap();
+        let (notes, mut bridge) = mpsc::unbounded_channel();
+        core.bridge(BridgeMsg::Attach(notes)).await;
+        let admin = gwar_session(&core, 1, "admin").await;
+        let alice = gwar_session(&core, 2, "alice").await;
+        let identity = EccKeyPrivP256::create();
+        let teamspeak = format!("ts:{}", identity.to_pub().get_uid());
+        assert!(claim(&core, alice, &identity).await.is_ok());
+        let alice_uid = on_core(&core, move |core| {
+            core.sessions.get_mut(&admin).unwrap().groups = vec![crate::store::ADMIN_GROUP];
+            core.sessions[&alice].uid.clone()
+        })
+        .await;
+        let ban = on_core(&core, move |core| {
+            let request = vc_proto::BanCreate { uid: Some(alice_uid), ..Default::default() };
+            core.ban_create(admin, request)
+        })
+        .await;
+        let Ok(Response::Ban { ban }) = ban else { panic!("{ban:?}") };
+        while bridge.try_recv().is_ok() {}
+        let deleted = on_core(&core, move |core| core.ban_delete(admin, ban.id)).await;
+        assert!(deleted.is_ok());
+        let mut unbanned = Vec::new();
+        while let Ok(note) = bridge.try_recv() {
+            if let BridgeNote::Unban { uid } = note {
+                unbanned.push(uid);
+            }
+        }
+        assert_eq!(unbanned, vec![teamspeak]);
     }
 }
