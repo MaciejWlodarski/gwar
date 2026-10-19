@@ -47,7 +47,7 @@ jobs:
       - name: TeamSpeak channel permissions
         env:
           VC_TS3_DIR: ${{ runner.temp }}/ts3
-        run: cargo test -p vc-server --features test-hooks --test teamspeak_channels -- --ignored --test-threads=1
+        run: cargo test -p vc-server --features test-hooks --test teamspeak_channels --test teamspeak_import -- --ignored --test-threads=1
 
   # Known vulnerabilities in dependencies fail the build (advisories only, not
   # "unmaintained" notices). Separate, so the other jobs still report.

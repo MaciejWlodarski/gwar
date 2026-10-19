@@ -1,6 +1,6 @@
 # Roles and permissions, version 2
 
-Status: steps 1 (ranks), 2 (overrides) and 3 (voice; TeamSpeak talk power still open) built; step 4 designed. Replaces the flat role model.
+Status: steps 1 (ranks), 2 (overrides), 3 (voice; TeamSpeak talk power still open) and 4 (the TeamSpeak importer) built. Replaces the flat role model.
 
 ## Why
 
