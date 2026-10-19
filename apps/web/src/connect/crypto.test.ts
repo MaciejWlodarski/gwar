@@ -240,6 +240,10 @@ describe("challenge check", () => {
     for (const serviceNow of [now, now + 1, now + 30_000, now + CLOCK_SKEW_MS - 1, now - 30_000, now - CLOCK_SKEW_MS + 1]) {
       expect(() => checkChallenge(challenge(serviceNow + CHALLENGE_MS), service, now)).not.toThrow();
     }
+    // The extremes: just short of expired, and the latest expiry allowed.
+    for (const expires of [now - CLOCK_SKEW_MS + 1, now + CHALLENGE_MS + CLOCK_SKEW_MS]) {
+      expect(() => checkChallenge(challenge(expires), service, now)).not.toThrow();
+    }
   });
 
   it("rejects challenges that are expired or live too long even allowing for skew", () => {
