@@ -18,7 +18,7 @@ the Gwar app when they want; nobody has to install anything on moving day.
 | Channel tree: parent, order, name, topic, max clients | Channels, same tree and order | Exact |
 | Default channel | `default_channel` | Exact |
 | Channel password | The same password when the admin gives it; otherwise locked (see [Passwords](#passwords)) | Needs the admin |
-| Channel description | Not imported (Gwar has a topic only) | Reported |
+| Channel description | Its first line with text (BBCode and images taken out) as the topic, when the channel has none; otherwise not imported (Gwar has a topic only) | Reported |
 | Needed join power above the default group's | `connect` denied to Member, allowed to the roles with enough join power | Exact for those roles |
 | Needed talk power above the default group's (moderated) | `speak` denied to Member, allowed to the roles with enough talk power | Exact for those roles |
 | Channel groups (Channel Admin, Operator, …) | That member's override in that channel, allowing the channel permissions the group maps to, and `connect` or `speak` where the group's own join or talk power is enough | Per person |
@@ -121,10 +121,11 @@ The person proves they hold the identity, with no admin work:
 When the app offers it: `teamspeak.claimable {}` answers `{claimable}`, every
 `ts:<uid>` member holding a role other than Member (at most 5000). These uids
 are no secret: TeamSpeak shows them to everyone on its server, and Gwar's
-member list shows those members. The desktop app asks for the list only when it
-holds TeamSpeak identities and the person has not decided for this server yet.
-It compares the list with its identities on the device and offers a claim only
-for the ones in it. Nothing tells the server which identities the person holds
+member list shows those members. The app asks for the list only when it
+holds TeamSpeak identities and the person has not decided for this server yet:
+the desktop the identities it uses, the web app the account's (Gwar Connect's
+vault, signed in with the vault key). It compares the list with them on the
+device and offers a claim only for the ones in it. Nothing tells the server which identities the person holds
 unless they accept, and declining is remembered for that server. A member's
 profile lists their linked identities (unlink there); one's own profile can
 also claim again later. The desktop's private keys never reach the web view:
@@ -137,8 +138,18 @@ destination of its choice: a web view that is compromised controls the
 person's Gwar session anyway, so the codes are the line of defence until the
 desktop keeps the Gwar identity natively too. The list is asked for on
 every visit, whatever matched or was answered before, so not even the requests
-depend on the person's identities. The web app follows
-later: it does not read TeamSpeak keys yet.
+depend on the person's identities.
+
+The web app signs in the page (`apps/web/src/connect/ts-key.ts`, the same
+statement check and signature as the desktop's): it decodes the identity from
+the account's vault, where the desktop keeps it in the TeamSpeak client's
+export form, and signs only for the account signed in, the one whose vault
+holds the key (a claim for another account, such as one a different tab signed
+in as meanwhile, is refused). It clears its own buffer of the private scalar
+afterwards, which is no promise that no copy stays in the page's memory: the
+vault, and so the key, is the page's anyway once it is unlocked there. It has
+no native layer, so its own question (or the person's click on "Claim roles
+from TeamSpeak") is the consent.
 
 ## Roles and permissions
 

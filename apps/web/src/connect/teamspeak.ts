@@ -11,9 +11,9 @@
  * - Every change (add, import, rename, delete, default) is made to the account's
  *   list when signed in, otherwise to this device's own.
  */
-import type { ConnectRecord } from "../net/identity";
+import { loadConnectRecord, uidForPublicKey, type ConnectRecord } from "../net/identity";
 import { isDesktop, tauri } from "../platform";
-import { ConnectApi } from "./api";
+import { ConnectApi, connectApi } from "./api";
 import { addEntry, DEFAULT_NAME, emptyList, normalizeList, sameList, type TsEntry, type TsList } from "./ts-list";
 import { loadVault, updateVault, vaultList, withTeamspeakList, type VaultContents } from "./vault";
 
@@ -79,6 +79,50 @@ export const desktopTsBridge: TsBridge = {
 
 /** The desktop's bridge, or null in the browser. */
 export const tsBridge = (): TsBridge | null => (isDesktop() ? desktopTsBridge : null);
+
+/**
+ * Signs TeamSpeak claims (docs/teamspeak-import.md, "Claim"): the desktop natively, after its own
+ * question; the browser in the page, with the account's identities from the vault (signed in to
+ * Gwar Connect, vault unlocked). Asking the person is the caller's part there.
+ */
+export interface ClaimSigner {
+  /** The identities that can claim here: the list in use on the desktop, the vault's in the browser. */
+  identities(): Promise<TsEntryInfo[]>;
+  claimSign(uid: string, statement: string): Promise<{ key: string; signature: string }>;
+}
+
+const desktopSigner: ClaimSigner = {
+  identities: async () => (await desktopTsBridge.list("active")).identities,
+  claimSign: (uid, statement) => desktopTsBridge.claimSign(uid, statement),
+};
+
+/** The account's identities, with their keys; none unless signed in with the vault key. */
+async function vaultIdentities(record: ConnectRecord | undefined): Promise<TsEntry[]> {
+  if (!record?.vaultKey) return [];
+  return vaultList((await loadVault(connectApi, record)).contents).identities;
+}
+
+const browserSigner: ClaimSigner = {
+  identities: async () => (await vaultIdentities(await loadConnectRecord())).map(({ uid, name }) => ({ uid, name })),
+  claimSign: async (uid, statement) => {
+    // One account for the whole signature: the one whose vault holds the key must be the one the
+    // statement claims for (another tab may have signed in as someone else meanwhile).
+    const record = await loadConnectRecord();
+    const claimant = statement.split("\n")[2];
+    if (!record?.vaultKey || claimant !== (await uidForPublicKey(record.accountKey))) {
+      throw new Error("this claim is for another account than the one signed in");
+    }
+    const entry = (await vaultIdentities(record)).find((i) => i.uid === uid);
+    if (!entry) throw new Error("this TeamSpeak identity is not in your account");
+    const { signClaim, teamspeakUid } = await import("./ts-key");
+    const signed = signClaim(entry.identity, statement);
+    // A damaged entry whose key is another identity's never claims in this one's name.
+    if (teamspeakUid(signed.key) !== uid) throw new Error("this TeamSpeak identity's key does not match it");
+    return signed;
+  },
+};
+
+export const claimSigner = (): ClaimSigner => (isDesktop() ? desktopSigner : browserSigner);
 
 /** Native key references for public metadata edits, never exported private text. */
 export const plainList = (info: TsListInfo): TsList => ({

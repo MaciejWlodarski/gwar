@@ -11,7 +11,8 @@ import { canActOn } from "../lib/permissions";
 
 const NO_GROUPS: readonly number[] = [];
 import { useConnectHandle } from "./useConnectHandle";
-import { tsBridge } from "../connect/teamspeak";
+import { isDesktop } from "../platform";
+import { useAccount } from "../state/account";
 import { shortUid } from "../connect/ts-list";
 import { Avatar, Button, Dialog, Field, Input } from "./kit";
 
@@ -142,13 +143,15 @@ export function MemberProfileDialog({ uid, fallback }: { uid: string; fallback: 
 
 const NO_LINKS: string[] = [];
 
-/** The member's linked TeamSpeak identities (docs/teamspeak-import.md); one's own can also be claimed here, on the desktop. */
+/** The member's linked TeamSpeak identities (docs/teamspeak-import.md); one's own can also be claimed here (the desktop's, or the account's in the browser). */
 function TeamspeakLinks({ uid, linked, own, mayUnlink }: { uid: string; linked: string[]; own: boolean; mayUnlink: boolean }) {
   const t = useT();
   const toast = useUi((s) => s.toast);
   const [confirming, setConfirming] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const canClaim = own && !!tsBridge();
+  // In the browser the identities are the account's, so it needs the vault key.
+  const hasVault = useAccount((s) => !!s.account?.hasVaultKey);
+  const canClaim = own && (isDesktop() || hasVault);
   if (linked.length === 0 && !canClaim) return null;
   const unlink = async (teamspeak: string) => {
     setBusy(true);

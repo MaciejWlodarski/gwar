@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useT } from "../i18n";
 import type { TsEntryInfo } from "../connect/teamspeak";
 import { shortUid } from "../connect/ts-list";
+import { isDesktop } from "../platform";
 import { useSession, useUi } from "../state/stores";
 import { Button, Dialog } from "./kit";
 
@@ -42,7 +43,8 @@ export function ClaimDialog({ identities, resolve }: { identities: TsEntryInfo[]
           </li>
         ))}
       </ul>
-      <p className="text-xs text-muted">{t("tsClaim.codes", { account, server })}</p>
+      {/* The desktop asks again natively, showing these codes; the browser has only this question. */}
+      {isDesktop() && <p className="text-xs text-muted">{t("tsClaim.codes", { account, server })}</p>}
     </Dialog>
   );
 }

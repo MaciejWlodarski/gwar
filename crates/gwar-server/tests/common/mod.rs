@@ -496,6 +496,12 @@ impl Client {
         self.ws.send(Message::text(text)).await.expect("send");
     }
 
+    /// Sends a frame the server is expected to refuse: it may close the connection before the
+    /// frame is all out, so a failed send is that answer too.
+    pub async fn send_refused(&mut self, text: &str) {
+        let _ = self.ws.send(Message::text(text)).await;
+    }
+
     pub async fn reply(&mut self, id: u32) -> Result<Value, ErrorBody> {
         within(&format!("reply to request {id}"), async {
             loop {

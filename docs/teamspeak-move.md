@@ -190,8 +190,9 @@ changed.
 
 - **Roles stay with people.** TeamSpeak users keep their roles on Gwar's
   TeamSpeak server: Gwar knows them by their TeamSpeak identity. In the Gwar
-  desktop app, someone holding that identity is offered to **claim** it when
-  they join, and then has the same roles in the app.
+  app, someone holding that identity (in the desktop app, or in their Gwar
+  Connect account in the browser) is offered to **claim** it when they join,
+  and then has the same roles in the app.
 - **Locked channels:** the report lists the channels that came over with a
   random password; set new ones in Gwar (channel settings).
 - **Backups:** `gwar-server --data-dir data backup copy.sqlite3` while it runs,

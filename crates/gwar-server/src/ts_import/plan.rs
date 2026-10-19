@@ -40,6 +40,37 @@ fn fit(text: &str, max: usize, lines: bool) -> String {
     kept.trim().chars().take(max).collect::<String>().trim_end().to_owned()
 }
 
+/// The first line with text of a TeamSpeak channel description, without its BBCode tags
+/// (`[b]`, `[url=…]`, `[/color]`…) and images (`[img]…[/img]`, an address), as a topic.
+fn description_line(description: &str) -> String {
+    let mut text = description.to_owned();
+    while let Some(start) = text.to_ascii_lowercase().find("[img]") {
+        let end = text.to_ascii_lowercase()[start..].find("[/img]").map_or(text.len(), |e| start + e + "[/img]".len());
+        text.replace_range(start..end, "");
+    }
+    // A tag is `[…]` within one line; a `[` without its `]` is text.
+    let mut plain = String::new();
+    let mut rest = text.as_str();
+    while let Some(open) = rest.find('[') {
+        plain.push_str(&rest[..open]);
+        let after = &rest[open..];
+        let line_end = after.find('\n').unwrap_or(after.len());
+        match after[..line_end].find(']') {
+            Some(close) => rest = &after[close + 1..],
+            None => {
+                plain.push('[');
+                rest = &after[1..];
+            }
+        }
+    }
+    plain.push_str(rest);
+    plain
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map_or_else(String::new, |line| fit(line, MAX_TOPIC, false))
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PlannedRole {
     pub ts_id: u64,
@@ -462,14 +493,25 @@ pub fn plan(source: &Source, options: &Options) -> Result<Plan> {
             } else {
                 Password::None
             };
-            if c.get("channel_description").is_some_and(|d| !d.is_empty()) {
-                plan.notes.push(format!("\"{path}\": description not imported (Gwar has a topic only)."));
+            // Gwar has a topic only: a channel without one takes its description's first line.
+            let mut topic = fit(c.get("channel_topic").map_or("", String::as_str), MAX_TOPIC, false);
+            let description = c.get("channel_description").map_or("", String::as_str);
+            if !description.trim().is_empty() {
+                let first = description_line(description);
+                if topic.is_empty() && !first.is_empty() {
+                    plan.notes.push(format!(
+                        "\"{path}\": the description's first line became the topic (Gwar has a topic only)."
+                    ));
+                    topic = first;
+                } else {
+                    plan.notes.push(format!("\"{path}\": description not imported (Gwar has a topic only)."));
+                }
             }
             plan.channels.push(PlannedChannel {
                 ts_id: cid,
                 parent,
                 name,
-                topic: fit(c.get("channel_topic").map_or("", String::as_str), MAX_TOPIC, false),
+                topic,
                 position: position as i32,
                 max_clients: c
                     .get("channel_maxclients")

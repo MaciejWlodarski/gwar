@@ -289,6 +289,21 @@ mod tests {
         assert!(sign_claim(&identity, &format!("gwar teamspeak claim v1\n{}\nb\nc", "a".repeat(129))).is_err());
     }
 
+    /// The web app signs claims itself (`apps/web/src/connect/ts-key.ts`); its signature for this
+    /// identity and statement (deterministic, RFC 6979) passes the server's check.
+    #[test]
+    fn a_claim_signed_in_the_browser_verifies() {
+        let identity = parse("10VdE9XURaL9YZFTbfGpp0+S8X4YKpvVlVXUXItaTpbYwdTTX1/QGRtKFdwB1VnJ1NDFGZaQ3tQWywufgAie3paYglfeVdTK0hTElddERQPJFIGVFJlN2RyIX0+DVN5MkFIE3FGZlJDTWNBaUJTMEI2M0diYzgxWkh5SnltNmpzRXBOcEUvdVN3K1JQdkJCTFVXZ04wbU9BPT0=").unwrap();
+        let statement = "gwar teamspeak claim v1\nU2VydmVyS2V5\nAbCd-_09\nbm9uY2U";
+        let key =
+            "MEwDAgcAAgEgAiEAiNaZZ0dghFLXYjV26zIHsVZJ4Ba0RCfrwSkqKbhJKK4CIBjP9nIggNqcs3luunE77dePSQACJZ8dHQrxvApURCMc";
+        let signature =
+            "MEQCIGHD38YdCiiiE7yaXNPC0N9J7DXGjaWW3W6nVcJhatzAAiBlHxiRTattwKQHVAxa19/2bL64Y6W2/GXpaF1am//rUg==";
+        let public = tsproto_types::crypto::EccKeyPubP256::from_ts(key).unwrap();
+        assert_eq!(public.get_uid(), uid(&identity));
+        public.verify(statement.as_bytes(), &BASE64.decode(signature).unwrap()).unwrap();
+    }
+
     fn fresh() -> Identity {
         generate()
     }
