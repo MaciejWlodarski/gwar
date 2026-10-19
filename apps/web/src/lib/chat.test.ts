@@ -65,9 +65,9 @@ describe("sealed server routing", () => {
     expect(conversationThread("server", undefined)).toBe("server");
   });
   it("seals server chat only for encrypted Gwar sessions", () => {
-    expect(sealedThread("server", "vc", {}, { encrypted: true })).toBe(true);
-    expect(sealedThread("server", "vc", {}, { encrypted: false })).toBe(false);
-    expect(sealedThread("server", "vc", {})).toBe(false);
+    expect(sealedThread("server", "gwar", {}, { encrypted: true })).toBe(true);
+    expect(sealedThread("server", "gwar", {}, { encrypted: false })).toBe(false);
+    expect(sealedThread("server", "gwar", {})).toBe(false);
     expect(sealedThread("server", "teamspeak", {}, { encrypted: true })).toBe(false);
   });
 });

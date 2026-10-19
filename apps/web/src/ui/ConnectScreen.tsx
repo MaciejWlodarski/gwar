@@ -45,7 +45,7 @@ export function ConnectScreen() {
   const setDrawer = useUi((s) => s.setDrawer);
   const openDialog = useUi((s) => s.openDialog);
   const account = useAccount((s) => s.account);
-  const [kind, setKind] = useState<ServerKind>(desktop && !invite?.server ? lastKind : "vc");
+  const [kind, setKind] = useState<ServerKind>(desktop && !invite?.server ? lastKind : "gwar");
   const [address, setAddress] = useState(invite?.server ? addressLabel(invite.server, pageContextFromLocation()) : lastAddress);
   const [password, setPassword] = useState("");
   const savedInsecureLan = bookmarks.find((b) => sameServer(b, { kind, address, insecureLan: b.insecureLan }))?.insecureLan ?? false;
@@ -65,7 +65,7 @@ export function ConnectScreen() {
   // An invite link without a server means "the server on this page's own origin".
   const inviteWithoutServer = !!invite && !invite.server;
   useEffect(() => {
-    if (kind !== "vc" || (lastAddress && !inviteWithoutServer)) return;
+    if (kind !== "gwar" || (lastAddress && !inviteWithoutServer)) return;
     let alive = true;
     void probeSameOriginServer().then((found) => {
       if (alive && found) setAddress((current) => (inviteWithoutServer ? found : current || found));
@@ -80,14 +80,14 @@ export function ConnectScreen() {
   if (invite !== seenInvite) {
     setSeenInvite(invite);
     if (invite?.server) {
-      setKind("vc");
+      setKind("gwar");
       setAddress(addressLabel(invite.server, pageContextFromLocation()));
     }
   }
 
   // A pasted invite link becomes the server address plus the invite.
   const onAddressChange = (value: string) => {
-    const pasted = kind === "vc" ? parseInviteLink(value) : null;
+    const pasted = kind === "gwar" ? parseInviteLink(value) : null;
     if (pasted) {
       useConnectUi.getState().set({ invite: pasted });
       setAddress(pasted.server ? addressLabel(pasted.server, pageContextFromLocation()) : "");
@@ -104,10 +104,10 @@ export function ConnectScreen() {
         kind,
         address,
         password,
-        invite: kind === "vc" ? invite?.code : undefined,
-        inviteServerKey: kind === "vc" ? invite?.serverKey : undefined,
-        inviteOwner: kind === "vc" ? invite?.owner : undefined,
-        insecureLan: desktop && kind === "vc" && insecureLan,
+        invite: kind === "gwar" ? invite?.code : undefined,
+        inviteServerKey: kind === "gwar" ? invite?.serverKey : undefined,
+        inviteOwner: kind === "gwar" ? invite?.owner : undefined,
+        insecureLan: desktop && kind === "gwar" && insecureLan,
         identity: pickIdentity ? (resolveIdentity(tsList, identity) ?? undefined) : undefined,
       },
       { remember },
@@ -138,7 +138,7 @@ export function ConnectScreen() {
             <p className="text-sm text-muted">{t("connect.subtitle")}</p>
           </div>
 
-          {invite && kind === "vc" && (
+          {invite && kind === "gwar" && (
             <div className="flex items-start gap-2 rounded-lg bg-accent-soft px-3 py-2 text-sm text-fg">
               <Ticket className="mt-0.5 size-4 shrink-0 text-accent" />
               <span className="min-w-0 flex-1">
@@ -167,7 +167,7 @@ export function ConnectScreen() {
               value={kind}
               onChange={setKind}
               options={[
-                { value: "vc", label: t("connect.kindVc") },
+                { value: "gwar", label: t("connect.kindVc") },
                 { value: "teamspeak", label: t("connect.kindTs"), disabled: !desktop, title: desktop ? undefined : t("connect.tsWebOnly") },
               ]}
             />
@@ -211,7 +211,7 @@ export function ConnectScreen() {
 
           {pickIdentity && <IdentityPicker list={tsList} value={identity} onChange={setIdentity} />}
 
-          {desktop && kind === "vc" && <div className="flex flex-col gap-2">
+          {desktop && kind === "gwar" && <div className="flex flex-col gap-2">
             <Switch checked={insecureLan} onCheckedChange={setInsecureLan} label={t("security.insecureLan")} />
             {insecureLan && <p role="alert" className="text-sm text-danger">{t("security.insecureWarning")}</p>}
           </div>}

@@ -1,6 +1,6 @@
 //! The MLS `BasicCredential` identity of a Gwar device (docs/e2e-build.md, "Credentials").
 
-use vc_proto::{DeviceCertificate, Uid};
+use gwar_proto::{DeviceCertificate, Uid};
 
 use crate::encoding::{decimal, fixed};
 
@@ -39,7 +39,7 @@ impl Credential {
             Credential::Local { device_key } => device_key,
             Credential::Account(c) => &c.account_key,
         };
-        vc_proto::uid_for_key(&fixed::<32>(key).expect("parsed credentials hold valid keys"))
+        gwar_proto::uid_for_key(&fixed::<32>(key).expect("parsed credentials hold valid keys"))
     }
 
     pub fn encode(&self) -> String {
@@ -78,8 +78,8 @@ impl Credential {
                 signature: signature.into(),
             };
             // Checks keys, signature encoding, timestamps and the 90-day limit.
-            vc_proto::certificate_hash(Some(&c))?;
-            if !vc_proto::signed_by(&c.account_key, &vc_proto::device_statement(&c), &c.signature) {
+            gwar_proto::certificate_hash(Some(&c))?;
+            if !gwar_proto::signed_by(&c.account_key, &gwar_proto::device_statement(&c), &c.signature) {
                 return None;
             }
             Credential::Account(c)
@@ -123,7 +123,7 @@ pub(crate) mod tests {
             expires_at: issued_at + 30 * 86_400_000,
             signature: String::new(),
         };
-        c.signature = b64(&account.sign(vc_proto::device_statement(&c).as_bytes()).to_bytes());
+        c.signature = b64(&account.sign(gwar_proto::device_statement(&c).as_bytes()).to_bytes());
         Credential::Account(c)
     }
 
@@ -139,11 +139,11 @@ pub(crate) mod tests {
         let (account, device) = (key(1), key(2));
         let local = Credential::Local { device_key: public(&device) };
         assert_eq!(Credential::parse(local.encode().as_bytes()), Some(local.clone()));
-        assert_eq!(local.uid(), vc_proto::uid_for_key(device.verifying_key().as_bytes()));
+        assert_eq!(local.uid(), gwar_proto::uid_for_key(device.verifying_key().as_bytes()));
 
         let account_credential = certified(&account, &device, 1_000);
         assert_eq!(Credential::parse(account_credential.encode().as_bytes()), Some(account_credential.clone()));
-        assert_eq!(account_credential.uid(), vc_proto::uid_for_key(account.verifying_key().as_bytes()));
+        assert_eq!(account_credential.uid(), gwar_proto::uid_for_key(account.verifying_key().as_bytes()));
         assert_eq!(account_credential.device_key(), public(&device));
     }
 
@@ -169,7 +169,7 @@ pub(crate) mod tests {
         let mut long = certified(&account, &device, 1_000);
         if let Credential::Account(c) = &mut long {
             c.expires_at = c.issued_at + 91 * 86_400_000;
-            c.signature = b64(&account.sign(vc_proto::device_statement(c).as_bytes()).to_bytes());
+            c.signature = b64(&account.sign(gwar_proto::device_statement(c).as_bytes()).to_bytes());
         }
         assert_eq!(Credential::parse(long.encode().as_bytes()), None);
     }

@@ -36,7 +36,7 @@ async function ready(url, child) {
 try {
   const webPort = await port(), serverPort = await port();
   const web = `http://127.0.0.1:${webPort}`, ws = `ws://127.0.0.1:${serverPort}/ws`;
-  const binary = process.env.VC_SERVER_BIN ?? path.join(root, "target/debug/vc-server");
+  const binary = process.env.GWAR_SERVER_BIN ?? path.join(root, "target/debug/gwar-server");
   const service = start(binary, ["--data-dir", directory, "--http", `127.0.0.1:${serverPort}`, "--media", `127.0.0.1:${serverPort}`, "--public-ip", "127.0.0.1", "--public-endpoint", ws, "--web-origin", web, "--no-connect"], root);
   const vite = start("pnpm", ["--filter", "web", "exec", "vite", "--host", "127.0.0.1", "--port", String(webPort), "--strictPort"], root);
   await Promise.all([ready(`${web}/`, vite), ready(`http://127.0.0.1:${serverPort}/health`, service)]);

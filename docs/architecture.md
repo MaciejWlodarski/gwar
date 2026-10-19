@@ -2,12 +2,12 @@
 
 ```mermaid
 flowchart LR
-  Web[Browser<br/>apps/web] -- WSS vc/4 --> GW
-  Desk[Desktop app, Tauri<br/>apps/web + vc-client] -- WSS vc/4 --> GW
+  Web[Browser<br/>apps/web] -- WSS gwar/4 --> GW
+  Desk[Desktop app, Tauri<br/>apps/web + gwar-client] -- WSS gwar/4 --> GW
   TS3[Official TS3/TS6 clients] -- UDP 9987 --> TSS
   Web -- WebRTC Opus --> SFU
   Desk -- WebRTC Opus --> SFU
-  subgraph vc-server [vc-server]
+  subgraph gwar-server [gwar-server]
     GW[WebSocket gateway] --> CORE[core actor]
     SFU[WebRTC SFU, str0m]
     CORE -- routing snapshot --> SFU
@@ -37,7 +37,7 @@ is the development exception.
 - **One owner of state.** `core` is an actor (a single tokio task): every
   change to channels, users and permissions goes through it in order, so every
   client sees the same sequence of events, without locks. Transports
-  (WebSocket, TeamSpeak) are thin: they translate to `vc/4` and back.
+  (WebSocket, TeamSpeak) are thin: they translate to `gwar/4` and back.
 - **Audio is never decoded on the server.** Opus frames are forwarded as they
   are (SFU). The server only decides *who hears whom*, from a routing snapshot
   the core publishes (`ArcSwap`, lock-free reads). Clients decode and mix
@@ -47,11 +47,11 @@ is the development exception.
   the server drops silence, drives the "talking" indicator and ends talk spurts
   for TeamSpeak clients.
 
-## The `vc/4` protocol
+## The `gwar/4` protocol
 
 JSON over a WebSocket (`/ws`). The full, commented definition is
-[`crates/vc-proto/src/lib.rs`](../crates/vc-proto/src/lib.rs); the TypeScript
-types are generated with `cargo test -p vc-proto --features ts`.
+[`crates/gwar-proto/src/lib.rs`](../crates/gwar-proto/src/lib.rs); the TypeScript
+types are generated with `cargo test -p gwar-proto --features ts`.
 
 1. Server: `challenge {protocol: 4, server_pk, server_nonce, server,
    password_required}`. The metadata helps the connect UI; only the key and
@@ -80,7 +80,7 @@ The endpoint is the client's locally constructed canonical external WebSocket
 URL: WS(S) scheme, lowercase host without a trailing dot, bracketed IPv6,
 effective port omitted at the scheme default, and exact path. No credentials,
 query or fragment. Rust and TypeScript share normalization and transcript
-vectors in `crates/vc-proto/tests/endpoint-normalization.json` and
+vectors in `crates/gwar-proto/tests/endpoint-normalization.json` and
 `handshake-v4.json`. The path and scheme are part of the binding, so a signature
 cannot be relayed to another accepted alias endpoint.
 
@@ -88,7 +88,7 @@ Only configuration supplies accepted endpoints: every `--domain` gives
 `wss://<domain>/ws`; `--public-url` maps its scheme to WS(S), retains host/port
 and uses `/ws`; repeatable `--public-endpoint` supplies full endpoint URLs.
 An explicitly configured global unicast `--public-ip` adds
-`wss://<ip>[:port]/ws` only when vc-server terminates TLS itself, using the
+`wss://<ip>[:port]/ws` only when gwar-server terminates TLS itself, using the
 actual listener port (omitted only for 443). Behind a reverse proxy, configure
 `--public-url` or `--public-endpoint`; the external scheme and port are unknown.
 Private, loopback and link-local addresses never auto-authorize login. Request
@@ -98,10 +98,10 @@ this check and logs a loud warning.
 
 The server's Ed25519 seed is generated once, persisted atomically as
 `server-key.ed25519` in its data directory (0600 on Unix), and never logged.
-`vc-server --data-dir <dir> server-key` prints the public key. Back up the seed
+`gwar-server --data-dir <dir> server-key` prints the public key. Back up the seed
 with the database; losing it changes the authenticated server epoch.
 The web/desktop client keeps `{server_pk, first_seen}` in localStorage under
-`vc.server-pin:<canonical endpoint>`. TOFU without a pin or trusted invite
+`gwar.server-pin:<canonical endpoint>`. TOFU without a pin or trusted invite
 identifies a first-contact candidate; proof verification precedes pinning.
 Invite links include `server_key=<full public key>`, which must match the
 challenge. A pin mismatch is a blocking English/Polish dialog with both keys
@@ -208,7 +208,7 @@ plaintext TeamSpeak bridge.
 
 ## MLS delivery service
 
-The vc/4 delivery service follows direct message groups as public OpenMLS
+The gwar/4 delivery service follows direct message groups as public OpenMLS
 observers, without epoch secrets. It publishes signed device HPKE keys and key
 packages, orders commits, and keeps the handshake log, Welcomes and history
 chunks for 90 days. Outstanding history requests expire after 30 days.
@@ -264,7 +264,7 @@ Server-wide chat, attachments and voice remain later steps.
 
 ## Signed messages (v3)
 
-Every Gwar send/edit uses the vc/4 hello key and exact certificate. Honest
+Every Gwar send/edit uses the gwar/4 hello key and exact certificate. Honest
 servers enforce their persistent server key, locally routed conversation and
 account-derived author, current certificate/revocation authorization, and
 `signed_at` within five minutes of now. Edits preserve identity/context/creation
@@ -296,7 +296,7 @@ gwar message v3
 {body_hash}
 ```
 
-`server_key` is the vc/4-verified server identity, independent of endpoint aliases.
+`server_key` is the gwar/4-verified server identity, independent of endpoint aliases.
 `conversation` is `server`, `channel:{channel_id}` (never reused by an honest
 server: channel and message ids come from counters that survive deletion), or
 `dm:{lower_uid}:{higher_uid}` (ASCII-byte sorted). Both DM participants come
@@ -305,14 +305,14 @@ They are compared as complete identifiers, including a TeamSpeak peer's `ts:`
 id. Gwar-to-TeamSpeak messages verify; TeamSpeak replies remain unsigned.
 `author_uid` derives from the certificate account key, or the signing key for
 local identities. Wire `MessageSignature.key` is `client_signing_pk`; the
-certificate commitment is vc/4's `certificate_hash` (`-` for local identities).
+certificate commitment is gwar/4's `certificate_hash` (`-` for local identities).
 IDs are 16 random client bytes in canonical unpadded base64url. Revision 0 uses
 predecessor `-` and equal creation/signing times. Each edit is revision +1, with
 `previous_revision_hash = b64url(SHA256(previous_statement + "\n" + previous_signature))`.
 Times are unsigned decimal Unix ms, in the JavaScript safe-integer range.
 Binary fields have exact lengths and canonical encodings; CR/LF in statement
 fields and weak/non-strict Ed25519 signatures fail. Rust and TypeScript consume
-`crates/vc-proto/tests/message-signing.json`.
+`crates/gwar-proto/tests/message-signing.json`.
 
 `body_hash` is base64url SHA-256 of UTF-8 netstrings (`{byte_len}:{bytes},`):
 text, decimal count of sorted unique mention UIDs, each UID, decimal attachment
@@ -402,7 +402,7 @@ members ranked below oneself, manages and gives only roles below one's rank, and
 never grants a permission one lacks. A token or invite only works while its
 maker could still give its role: demoting or removing them voids what they
 handed out. Tokens the
-server issues itself (the first admin token, `vc-server admin-token`) have no maker;
+server issues itself (the first admin token, `gwar-server admin-token`) have no maker;
 invites and tokens from before makers were recorded admit nobody. Channel and server
 passwords are stored as Argon2 of TeamSpeak's wire form `base64(sha1(password))`.
 
@@ -414,11 +414,11 @@ and role changes: only members ranked below the caller.
 connect and disconnect and refreshed for connected users every ten minutes and at
 shutdown). The core is a single actor, so one call removes at most 50 members
 and the client repeats it. Private and server-wide messages are never stored,
-so there is nothing of them to delete. `vc-server members` does the same on the
-database directly and needs the server stopped (`data/vc.lock`). On Unix the
+so there is nothing of them to delete. `gwar-server members` does the same on the
+database directly and needs the server stopped (`data/gwar.lock`). On Unix the
 running server also listens on a local control socket, `data/admin.sock`
 (mode 0600, so only its own system user), one JSON request per connection;
-`vc-server import-teamspeak` uses it to import into the running server
+`gwar-server import-teamspeak` uses it to import into the running server
 ([teamspeak-import.md](teamspeak-import.md#running-it)). `members merge
 <from-uid> <into-uid> [--dry-run]` requires two existing members and the exclusive
 lock, even in dry-run mode. It reassigns messages, uploads, mentions, UID bans,
@@ -468,8 +468,8 @@ therefore have different TS suffixes while retaining the same Gwar nickname.
     Our own puppets and query clients are excluded from remote sessions to
     prevent echoes. Server chat uses the main query's `textserver` subscription;
     Gwar channel chat uses a puppet or the separate, movable posting query.
-- **Our client on TeamSpeak servers.** `vc-client::teamspeak` (tsclientlib)
-  presents a TeamSpeak server as `vc/4` (Welcome + events), so the UI has no
+- **Our client on TeamSpeak servers.** `gwar-client::teamspeak` (tsclientlib)
+  presents a TeamSpeak server as `gwar/4` (Welcome + events), so the UI has no
   TeamSpeak-specific code; voice goes straight to the native engine.
 
 ## Clients
@@ -477,7 +477,7 @@ therefore have different TS suffixes while retaining the same Gwar nickname.
 - `apps/web`: React. The connection (`net/connection.ts`) and the voice engine
   (`voice/engine.ts`) sit behind interfaces.
 - `apps/desktop`: Tauri 2 with the same UI; voice through the native
-  `vc-client` (cpal, Opus with FEC, jitter buffer with PLC), global
+  `gwar-client` (cpal, Opus with FEC, jitter buffer with PLC), global
   push-to-talk, tray.
 
 ### Native command surface
@@ -594,7 +594,7 @@ Clients validate every incoming event and per-operation response against small
 handwritten schemas checked by TypeScript against generated protocol types.
 Frames are capped at 2 MiB before parsing; schemas reject unknown/pollution keys,
 unsafe integers and unbounded strings/arrays. Updating generated types requires
-updating these validators. The vc/4 challenge validates canonical 32-byte keys
+updating these validators. The gwar/4 challenge validates canonical 32-byte keys
 and nonces; hello replies accept exactly `{server_proof}` with a canonical 64-byte signature, and join
 replies validate Welcome. Unknown fields are deliberately rejected.
 Declared image dimensions are clamped to 1–16384 pixels before layout, then to

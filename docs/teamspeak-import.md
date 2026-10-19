@@ -1,10 +1,10 @@
 # Moving a TeamSpeak server to Gwar
 
-Status: built (`vc-server import-teamspeak`), onto roles version 2 ([roles.md](roles.md)).
+Status: built (`gwar-server import-teamspeak`), onto roles version 2 ([roles.md](roles.md)).
 Later: a wizard in the desktop app, TeamSpeak 6.
 
 A community with a TeamSpeak 3 server can move to a Gwar server without
-rebuilding it by hand: `vc-server import-teamspeak` reads the TeamSpeak server
+rebuilding it by hand: `gwar-server import-teamspeak` reads the TeamSpeak server
 over ServerQuery and recreates its channels, roles, members, bans and settings.
 Gwar runs the official TeamSpeak server next to it (see
 [architecture.md, "TeamSpeak"](architecture.md#teamspeak)), so after the move
@@ -62,7 +62,7 @@ set of roles whichever app they use.
 A member can have up to 64 TeamSpeak identities linked (`teamspeak_links`: the
 TeamSpeak uid, the member, when); an identity is linked to at most one member.
 The person links their own by a claim (below); the admin can link any with
-`vc-server members link ts:<uid> <member-uid>` on a stopped server.
+`gwar-server members link ts:<uid> <member-uid>` on a stopped server.
 
 Linking `ts:<uid>` to member M is one transaction:
 
@@ -90,7 +90,7 @@ looking inactive (`last_seen`), and a later import gives a linked identity's
 channel overrides to M.
 
 **Unlinking** (`member.teamspeak.unlink`, by M or by someone with
-`manage_members` ranked above M; or `vc-server members unlink ts:<uid>`) leaves
+`manage_members` ranked above M; or `gwar-server members unlink ts:<uid>`) leaves
 the roles with M. A connected session of that identity goes on as an unknown
 TeamSpeak user, with Member's permissions. Removing M removes its links.
 `members merge` moves the source's links to the target (refused past 64) and
@@ -215,29 +215,29 @@ So the importer asks:
 
 ```sh
 ssh -L 10011:localhost:10011 ts.example.com   # raw ServerQuery is unencrypted
-VC_TS_QUERY_PASSWORD=… vc-server import-teamspeak --from 127.0.0.1:10011 [--user serveradmin] \
+GWAR_TS_QUERY_PASSWORD=… gwar-server import-teamspeak --from 127.0.0.1:10011 [--user serveradmin] \
   [--sid 1] [--dry-run] [--all-clients] [--spacers] [--replace-channels [--force]] \
   [--passwords passwords.txt | --drop-passwords] [--for-bridge]
 ```
 
-- The ServerQuery password comes from `VC_TS_QUERY_PASSWORD` or, with
+- The ServerQuery password comes from `GWAR_TS_QUERY_PASSWORD` or, with
   `--password-stdin`, the first line of stdin; it is used for this run only.
   Raw ServerQuery sends it unencrypted, so `--from` must be this machine (an
   SSH tunnel, as above) unless `--insecure-query`. The source server is only
   read (the importing host must be allowed by its `query_ip_allowlist.txt`, or
   its flood limits apply).
 - The import is all or nothing: it runs on a copy of the database
-  (`vc.sqlite3.importing`), which replaces the database only once everything
+  (`gwar.sqlite3.importing`), which replaces the database only once everything
   went in. `--dry-run` does the same and throws the copy away, so it shows
   exactly what would change (also while the server runs).
 - With the server stopped, the database as it was stays next to it
-  (`vc.sqlite3.before-import-<time>`); the new one keeps its owner and mode. A
+  (`gwar.sqlite3.before-import-<time>`); the new one keeps its owner and mode. A
   server that never ran gets a new database, with the imported channels
   instead of the seeded ones.
-- **While the server runs** (it holds `data/vc.lock`), the import goes through
+- **While the server runs** (it holds `data/gwar.lock`), the import goes through
   the server instead: the command first makes the same dry run (on a copy, so
   nothing is applied if that fails), keeps the database as it was
-  (`vc.sqlite3.before-import-<time>`), then hands the plan to the running
+  (`gwar.sqlite3.before-import-<time>`), then hands the plan to the running
   server over its local control socket (`data/admin.sock`, a Unix socket only
   the server's own system user can use). The server applies it in one
   transaction (all or nothing, like the stopped import), reloads its channels,
@@ -279,7 +279,7 @@ VC_TS_QUERY_PASSWORD=… vc-server import-teamspeak --from 127.0.0.1:10011 [--us
 ## Scope
 
 Built: the CLI above, TeamSpeak 3 servers (3.13) over the raw ServerQuery
-port, which `vc-server` already speaks for the bridge. Later:
+port, which `gwar-server` already speaks for the bridge. Later:
 
 - a wizard in the desktop app's server settings (the app can open TCP; the web
   app cannot);

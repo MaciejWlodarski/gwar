@@ -7,7 +7,7 @@ import type { MlsHistoryChunk } from "../proto/MlsHistoryChunk";
 import type { MlsHistoryWanted } from "../proto/MlsHistoryWanted";
 import type { MlsIncarnation } from "../proto/MlsIncarnation";
 /**
- * Typed view over the generated `vc/4` types: which response each request
+ * Typed view over the generated `gwar/4` types: which response each request
  * produces and the payload type of each event. The generated unions describe
  * the wire; this file describes the conversation.
  */

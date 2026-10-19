@@ -25,10 +25,10 @@ function ServerHeader() {
   const editChannels = usePermission("manage_channels");
   const owned = useSession((s) => !!s.owner);
   // The Ownership tab is for anyone with channel_edit on a server with an owner (confirmers too).
-  const canManage = manageServer || (kind === "vc" && (manageGroups || banClients || (owned && editChannels)));
-  const canInvite = usePermission("create_invites") && kind === "vc";
+  const canManage = manageServer || (kind === "gwar" && (manageGroups || banClients || (owned && editChannels)));
+  const canInvite = usePermission("create_invites") && kind === "gwar";
   const canCreate = usePermission("manage_channels");
-  const canToken = usePermission("create_invites") && kind === "vc"; // TeamSpeak has no vc tokens
+  const canToken = usePermission("create_invites") && kind === "gwar"; // TeamSpeak has no Gwar tokens
   const serverKey = useSession((s) => s.serverKey);
 
   const copyAddress = async () => {
@@ -63,7 +63,7 @@ function ServerHeader() {
       </Dropdown.Trigger>
       <Dropdown.Portal>
         <Dropdown.Content align="start" sideOffset={4} className={cn(menuContent, "w-64")}>
-          {kind === "vc" && uid && (
+          {kind === "gwar" && uid && (
             <Dropdown.Item className={menuItem} onSelect={() => openDialog({ kind: "nickname", uid })}>
               <Pencil className="size-4" /> {t("nickname.change")}
             </Dropdown.Item>

@@ -311,7 +311,7 @@ node scripts/mls-wasm/smoke.mjs
 pnpm --filter web lint
 pnpm --filter web test
 pnpm --filter web build
-cargo build -p vc-server --no-default-features
+cargo build -p gwar-server --no-default-features
 pnpm --filter web e2e:mls
 ```
 

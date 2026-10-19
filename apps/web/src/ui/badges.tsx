@@ -34,7 +34,7 @@ export function MentionBadge({ count, className }: { count: number; className?: 
   );
 }
 
-/** Marks a server as a TeamSpeak server (as opposed to a native vc/1 one). */
+/** Marks a server as a TeamSpeak server (as opposed to a native gwar/1 one). */
 export function TeamSpeakBadge({ className, short }: { className?: string; short?: boolean }) {
   const t = useT();
   return (

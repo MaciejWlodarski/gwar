@@ -1,16 +1,16 @@
 //! A scriptable second participant for verifying the desktop app against a
 //! local server, without a microphone or speakers.
 //!
-//!   cargo run -p vc-desktop --example peer -- ws://127.0.0.1:8790/ws [nick] [tone|silent] [seconds]
+//!   cargo run -p gwar-desktop --example peer -- ws://127.0.0.1:8790/ws [nick] [tone|silent] [seconds]
 //!
 //! `tone` transmits a 440 Hz tone; the peer always reports what its fake
 //! speaker received from other participants.
 
 use std::{sync::Arc, time::Duration};
 
-use vc_client::{ConnectOptions, Identity, connect, voice};
-use vc_desktop_lib::fake_audio::{FakeIo, Heard};
-use vc_proto::{ClientSoftware, Platform};
+use gwar_client::{ConnectOptions, Identity, connect, voice};
+use gwar_desktop_lib::fake_audio::{FakeIo, Heard};
+use gwar_proto::{ClientSoftware, Platform};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -42,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
             let connection = connected.connection.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(4)).await;
-                match connection.chat(vc_proto::ChatTarget::Channel(channel), text).await {
+                match connection.chat(gwar_proto::ChatTarget::Channel(channel), text).await {
                     Ok(m) => println!("peer: said {:?}", m.text),
                     Err(e) => println!("peer: chat failed: {e}"),
                 }

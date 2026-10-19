@@ -128,7 +128,7 @@ function AddServerDialog({ editId }: { editId?: string }) {
   const close = useClose();
   const existing = useSettings((s) => s.bookmarks.find((b) => b.id === editId));
   const desktop = isDesktop();
-  const [kind, setKind] = useState<ServerKind>(existing?.kind ?? "vc");
+  const [kind, setKind] = useState<ServerKind>(existing?.kind ?? "gwar");
   const [name, setName] = useState(existing?.name ?? "");
   const [address, setAddress] = useState(existing?.address ?? "");
   const [password, setPassword] = useState(existing?.password ?? "");
@@ -144,7 +144,7 @@ function AddServerDialog({ editId }: { editId?: string }) {
       id: existing?.id ?? newId(),
       name: name.trim() || address.trim(),
       kind,
-      insecureLan: desktop && kind === "vc" && insecureLan,
+      insecureLan: desktop && kind === "gwar" && insecureLan,
       address: address.trim(),
       password: password || undefined,
       // Without a choice to make, a remembered identity stays as it was.
@@ -189,7 +189,7 @@ function AddServerDialog({ editId }: { editId?: string }) {
           value={kind}
           onChange={setKind}
           options={[
-            { value: "vc", label: t("connect.kindVc") },
+            { value: "gwar", label: t("connect.kindVc") },
             { value: "teamspeak", label: t("connect.kindTs"), disabled: !desktop && kind !== "teamspeak", title: desktop ? undefined : t("connect.tsWebOnly") },
           ]}
         />
@@ -203,7 +203,7 @@ function AddServerDialog({ editId }: { editId?: string }) {
         <Field label={t("addServer.password")} hint={kind === "teamspeak" ? t("addServer.tsPasswordHint") : t("addServer.passwordHint")}>
           {(id) => <Input id={id} type="password" value={password} onChange={(e) => setPassword(e.target.value)} maxLength={128} autoComplete="off" />}
         </Field>
-        {desktop && kind === "vc" && <div className="flex flex-col gap-2">
+        {desktop && kind === "gwar" && <div className="flex flex-col gap-2">
           <Switch checked={insecureLan} onCheckedChange={setInsecureLan} label={t("security.insecureLan")} />
           {insecureLan && <p className="text-sm text-danger">{t("security.insecureWarning")}</p>}
         </div>}
@@ -250,7 +250,7 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
   const [error, setError] = useState<string | null>(null);
   // Encryption is chosen once, when the channel is created; on Gwar servers only.
   const serverKey = controller.messageServerKey;
-  const offerEncryption = useSession((s) => s.kind === "vc") && props.mode === "create";
+  const offerEncryption = useSession((s) => s.kind === "gwar") && props.mode === "create";
   const [encrypted, setEncrypted] = useState(() => useSettings.getState().channelEncryption[serverKey] ?? false);
   const [history, setHistory] = useState(true);
   // A private channel is hidden from everyone its access does not admit (fixed at creation).

@@ -3,7 +3,7 @@
 //! list and the channel's signed member list, bound to the group.
 
 use ed25519_dalek::{Signer, SigningKey};
-use vc_proto::Uid;
+use gwar_proto::Uid;
 
 use crate::credential::{Credential, Revocations};
 use crate::encoding::{b64, decimal, fixed, netstrings, parse_netstrings};
@@ -121,7 +121,7 @@ impl SignedMembers {
         let members = ChannelMembers::parse(statement)?;
         let signer = Credential::parse(fields[1])?;
         let signature = std::str::from_utf8(fields[2]).ok()?.to_owned();
-        (signer.uid() == members.signer_uid && vc_proto::signed_by(signer.device_key(), statement, &signature))
+        (signer.uid() == members.signer_uid && gwar_proto::signed_by(signer.device_key(), statement, &signature))
             .then_some(Self { members, signer, signature })
     }
 

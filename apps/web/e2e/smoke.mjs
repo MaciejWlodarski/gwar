@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * End-to-end smoke test against a real vc-server, driven by Chromium with a
+ * End-to-end smoke test against a real gwar-server, driven by Chromium with a
  * fake microphone. Also writes screenshots to e2e/screenshots/.
  *
  *   pnpm --filter web e2e
@@ -18,8 +18,8 @@
  *   E2E_REUSE=1  use the server already running at SERVER_HTTP instead of a
  *                fresh throwaway one (state from earlier runs may break the test)
  *   ADMIN_TOKEN  admin token of that already running server
- *   VC_SERVER_BIN  path to the vc-server binary (default ../../target/debug/vc-server,
- *                  falling back to `cargo run -p vc-server`)
+ *   GWAR_SERVER_BIN  path to the gwar-server binary (default ../../target/debug/gwar-server,
+ *                  falling back to `cargo run -p gwar-server`)
  *   E2E_LATENCY_MS  simulate this round-trip time (ms) on the WebSocket via a local
  *                   delaying TCP proxy (default 0). The suite must pass at any value.
  *   GWAR_CONNECT_BIN  path to the gwar-connect binary (default ../../target/debug/gwar-connect,
@@ -85,21 +85,21 @@ async function ensureServer(connectUrl) {
   if (process.env.E2E_REUSE && (await reachable(`http://${SERVER}/health`))) {
     console.log(`using running server at ${SERVER}`);
     if (process.env.ADMIN_TOKEN) return process.env.ADMIN_TOKEN;
-    const bin = process.env.VC_SERVER_BIN ?? path.join(repoRoot, "target/debug/vc-server");
-    const dir = process.env.VC_DATA_DIR ?? "/tmp/vc-dev";
+    const bin = process.env.GWAR_SERVER_BIN ?? path.join(repoRoot, "target/debug/gwar-server");
+    const dir = process.env.GWAR_DATA_DIR ?? "/tmp/gwar-dev";
     const r = existsSync(bin)
       ? spawnSync(bin, ["--data-dir", dir, "admin-token"], { encoding: "utf8" })
-      : spawnSync("cargo", ["run", "-q", "-p", "vc-server", "--", "--data-dir", dir, "admin-token"], { cwd: repoRoot, encoding: "utf8" });
+      : spawnSync("cargo", ["run", "-q", "-p", "gwar-server", "--", "--data-dir", dir, "admin-token"], { cwd: repoRoot, encoding: "utf8" });
     const token = r.stdout.trim().split("\n").pop();
     if (!token) throw new Error("could not obtain an admin token; set ADMIN_TOKEN");
     return token;
   }
-  const dataDir = mkdtempSync(path.join(tmpdir(), "vc-e2e-"));
-  const bin = process.env.VC_SERVER_BIN ?? path.join(repoRoot, "target/debug/vc-server");
+  const dataDir = mkdtempSync(path.join(tmpdir(), "gwar-e2e-"));
+  const bin = process.env.GWAR_SERVER_BIN ?? path.join(repoRoot, "target/debug/gwar-server");
   const args = ["--data-dir", dataDir, "--http", SERVER, "--media", SERVER, "--public-ip", SERVER.split(":")[0], "--public-endpoint", CLIENT_ADDR, "--public-endpoint", CLIENT_ALIAS, "--web-origin", new URL(WEB_URL).origin, "--connect-url", connectUrl];
   const child = existsSync(bin)
     ? spawn(bin, args, { cwd: repoRoot })
-    : spawn("cargo", ["run", "-q", "-p", "vc-server", "--", ...args], { cwd: repoRoot });
+    : spawn("cargo", ["run", "-q", "-p", "gwar-server", "--", ...args], { cwd: repoRoot });
   child.on("exit", (code) => code && console.error(`server exited with code ${code}`));
   children.push(child);
   let log = "";
@@ -226,7 +226,7 @@ async function check(name, fn) {
   }
 }
 
-/** Collects vc/1 frames received over any websocket of a page. */
+/** Collects gwar/1 frames received over any websocket of a page. */
 function recordFrames(page) {
   const frames = [];
   page.on("websocket", (ws) => {
@@ -404,7 +404,7 @@ async function main() {
   });
   await check("verified server fingerprint is visible and pinned after first connection", async () => {
     const fingerprint = await serverFingerprint(a);
-    const stored = await a.evaluate((endpoint) => localStorage.getItem(`vc.server-pin:${endpoint}`), CLIENT_ADDR);
+    const stored = await a.evaluate((endpoint) => localStorage.getItem(`gwar.server-pin:${endpoint}`), CLIENT_ADDR);
     if (!stored || JSON.parse(stored).server_pk !== fingerprint || !/^[A-Za-z0-9_-]{43}$/.test(fingerprint)) throw new Error("missing verified fingerprint or pin");
   });
   await check("plaintext to loopback shows no impersonation warning", async () => {
@@ -436,7 +436,7 @@ async function main() {
       page.on("websocket", (ws) => ws.on("framesent", ({ payload }) => sent.push(String(payload))));
       await page.goto(WEB_URL);
       const oldPin = JSON.stringify({ server_pk: "A".repeat(43), first_seen: 1 });
-      await page.evaluate(({ endpoint, pin }) => localStorage.setItem(`vc.server-pin:${endpoint}`, pin), { endpoint: CLIENT_ADDR, pin: oldPin });
+      await page.evaluate(({ endpoint, pin }) => localStorage.setItem(`gwar.server-pin:${endpoint}`, pin), { endpoint: CLIENT_ADDR, pin: oldPin });
       await page.getByLabel(pl ? "Adres serwera" : "Server address").fill(CLIENT_ADDR);
       await setGlobalNickname(page, pl ? "PinPL" : "PinEN", { pl });
       await page.getByRole("button", { name: pl ? "Połącz" : "Connect", exact: true }).click();
@@ -448,14 +448,14 @@ async function main() {
       const active = await page.evaluate(() => document.activeElement?.textContent);
       if (active !== (pl ? "Anuluj" : "Cancel")) throw new Error("dangerous trust is the default focus");
       if (sent.length !== 0) throw new Error("client sent data after a pin mismatch");
-      const unchanged = await page.evaluate((endpoint) => localStorage.getItem(`vc.server-pin:${endpoint}`), CLIENT_ADDR);
+      const unchanged = await page.evaluate((endpoint) => localStorage.getItem(`gwar.server-pin:${endpoint}`), CLIENT_ADDR);
       if (unchanged !== oldPin) throw new Error("pin changed without explicit trust");
       await shot(page, pl ? "03-pin-changed-pl" : "03-pin-changed-en");
       await dialog.getByRole("button", { name: pl ? "Niebezpieczne: zapomnij stary klucz i zaufaj nowemu" : "Dangerous: forget old pin and trust new key", exact: true }).click();
       if (pl) await page.setViewportSize({ width: 1280, height: 800 });
       await page.getByRole("button", { name: /^(Server menu|Menu serwera)$/ }).waitFor({ timeout: 15000 });
       const fingerprint = await serverFingerprint(page);
-      const replacement = JSON.parse(await page.evaluate((endpoint) => localStorage.getItem(`vc.server-pin:${endpoint}`), CLIENT_ADDR));
+      const replacement = JSON.parse(await page.evaluate((endpoint) => localStorage.getItem(`gwar.server-pin:${endpoint}`), CLIENT_ADDR));
       if (replacement.server_pk !== fingerprint || replacement.first_seen <= 1) throw new Error("explicit trust did not persist the verified replacement");
       await ctx.close();
     });
@@ -771,13 +771,13 @@ async function main() {
     await b.keyboard.press("ArrowRight");
     await b.keyboard.press("ArrowRight");
     await b.keyboard.press("Escape");
-    const stored = await b.evaluate(() => JSON.parse(localStorage.getItem("vc.settings")).state.userVolumes);
+    const stored = await b.evaluate(() => JSON.parse(localStorage.getItem("gwar.settings")).state.userVolumes);
     if (!Object.values(stored).some((v) => Math.abs(v - 1.1) < 0.01)) throw new Error(JSON.stringify(stored));
   });
 
   console.log("reconnect");
   await check("client reconnects after the socket drops and resyncs", async () => {
-    const pinBefore = await b.evaluate((endpoint) => localStorage.getItem(`vc.server-pin:${endpoint}`), CLIENT_ALIAS);
+    const pinBefore = await b.evaluate((endpoint) => localStorage.getItem(`gwar.server-pin:${endpoint}`), CLIENT_ALIAS);
     if (!pinBefore) throw new Error("first connection did not persist a server pin");
     const before = fa.events("client.joined").length;
     await b.evaluate(() => window.__sockets.filter((s) => s.url.endsWith("/ws")).forEach((s) => s.close()));
@@ -789,7 +789,7 @@ async function main() {
     await treeItem(b, /Alice/).waitFor();
     await b.getByRole("tab", { name: "Server" }).click();
     await b.getByText("Reconnected to the server").waitFor();
-    const pinAfter = await b.evaluate((endpoint) => localStorage.getItem(`vc.server-pin:${endpoint}`), CLIENT_ALIAS);
+    const pinAfter = await b.evaluate((endpoint) => localStorage.getItem(`gwar.server-pin:${endpoint}`), CLIENT_ALIAS);
     if (pinBefore !== pinAfter) throw new Error("second connection replaced the first-contact pin");
     const fingerprint = await serverFingerprint(b);
     if (fingerprint !== JSON.parse(pinAfter).server_pk) throw new Error("verified fingerprint is not visible");
@@ -1390,18 +1390,18 @@ async function main() {
   });
 
   const dist = path.join(webRoot, "dist");
-  if (existsSync(path.join(dist, "index.html")) && !process.env.VC_SERVER_BIN?.includes("cargo")) {
-    await check("built app served by vc-server defaults to its own address", async () => {
-      const bin = process.env.VC_SERVER_BIN ?? path.join(repoRoot, "target/debug/vc-server");
+  if (existsSync(path.join(dist, "index.html")) && !process.env.GWAR_SERVER_BIN?.includes("cargo")) {
+    await check("built app served by gwar-server defaults to its own address", async () => {
+      const bin = process.env.GWAR_SERVER_BIN ?? path.join(repoRoot, "target/debug/gwar-server");
       if (!existsSync(bin)) return;
       const port = await new Promise((resolve) => {
         const probe = net.createServer().listen(0, "127.0.0.1", () => { const { port } = probe.address(); probe.close(() => resolve(port)); });
       });
-      const dir = mkdtempSync(path.join(tmpdir(), "vc-e2e-web-"));
+      const dir = mkdtempSync(path.join(tmpdir(), "gwar-e2e-web-"));
       const child = spawn(
         bin,
         ["--data-dir", dir, "--http", `127.0.0.1:${port}`, "--media", `127.0.0.1:${port}`, "--public-ip", "127.0.0.1", "--public-endpoint", `ws://127.0.0.1:${port}/ws`, "--web-root", dist],
-        { env: { ...process.env, VC_NO_TEAMSPEAK: "true" } },
+        { env: { ...process.env, GWAR_NO_TEAMSPEAK: "true" } },
       );
       children.push(child);
       try {

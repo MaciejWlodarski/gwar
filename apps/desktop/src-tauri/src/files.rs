@@ -343,7 +343,7 @@ pub async fn save_blob_as(
 }
 
 #[tauri::command]
-pub async fn upload_put(files: State<'_, Files>, request: Request<'_>) -> Result<vc_proto::Attachment, String> {
+pub async fn upload_put(files: State<'_, Files>, request: Request<'_>) -> Result<gwar_proto::Attachment, String> {
     let _permit = files.slots.try_acquire().map_err(|_| "too many file requests")?;
     let header = |name: &str| request.headers().get(name).and_then(|v| v.to_str().ok());
     // Only the connection the upload was reserved on; checked before the destination is chosen.

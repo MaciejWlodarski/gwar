@@ -53,7 +53,7 @@ export function forAccount(local: LocalServers, account: string): LocalServers {
 
 const text = (v: unknown, max: number): string | undefined => (typeof v === "string" && v.length <= max ? v : undefined);
 
-const tombstone = (id: string, at: number): VaultServer => ({ id, name: "", address: "", kind: "vc", updated_at: at, deleted: true });
+const tombstone = (id: string, at: number): VaultServer => ({ id, name: "", address: "", kind: "gwar", updated_at: at, deleted: true });
 
 /** The usable entries of the vault, in order; malformed and repeated ids are skipped. */
 export function vaultServers(contents: VaultContents): VaultServer[] {
@@ -74,7 +74,7 @@ export function vaultServers(contents: VaultContents): VaultServer[] {
     const address = text(e.address, LIMITS.address)?.trim();
     if (!address) continue;
     seen.add(id);
-    const kind: ServerKind = e.kind === "teamspeak" ? "teamspeak" : "vc";
+    const kind: ServerKind = e.kind === "teamspeak" ? "teamspeak" : "gwar";
     const { password: _p, identity: _i, deleted: _d, ...unknown } = e;
     const entry: VaultServer = { ...unknown, id, name: text(e.name, LIMITS.name)?.trim() || address, address, kind, updated_at: at };
     const password = text(e.password, LIMITS.password);
@@ -93,7 +93,7 @@ function stored(e: VaultServer): Record<string, unknown> {
 
 /** The synced part of a bookmark, as a vault entry. Bookmarks saved before syncing existed count as time 0. */
 export function fromBookmark(b: Bookmark): VaultServer {
-  const kind = b.kind ?? "vc";
+  const kind = b.kind ?? "gwar";
   const address = b.address.trim();
   const entry: VaultServer = { id: b.id, name: b.name.trim().slice(0, LIMITS.name) || address, address, kind, updated_at: b.updatedAt ?? 0 };
   if (b.password) entry.password = b.password;
@@ -159,7 +159,7 @@ export function toBookmarks(entries: VaultServer[], previous: Bookmark[], accoun
       const b: Bookmark = { id: e.id, name: e.name, address: e.address, kind: e.kind, updatedAt: e.updated_at, account };
       if (e.password) b.password = e.password;
       if (e.identity) b.identity = e.identity;
-      if (old?.insecureLan && e.kind === "vc" && old.address.trim() === e.address) b.insecureLan = true;
+      if (old?.insecureLan && e.kind === "gwar" && old.address.trim() === e.address) b.insecureLan = true;
       return b;
     });
   return [...synced, ...localOnly.values(), ...previous.filter((b) => !inAccount(b, account))];

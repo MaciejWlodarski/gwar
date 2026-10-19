@@ -7,12 +7,12 @@ use gwar_mls::{
     ds::{self, CommitSender, DsError, Observer, commit_aad},
     signer::{Ed25519Signer, server_credential},
 };
+use gwar_proto::DeviceCertificate;
 use openmls::prelude::{
     tls_codec::{Deserialize as _, Serialize as _},
     *,
 };
 use openmls_rust_crypto::OpenMlsRustCrypto;
-use vc_proto::DeviceCertificate;
 
 /// The test's clock (Unix ms) for commit times.
 const NOW: i64 = 1_800_000_000_000;
@@ -26,7 +26,7 @@ fn key(seed: u8) -> SigningKey {
 }
 
 fn uid(account: u8) -> String {
-    vc_proto::uid_for_key(key(account).verifying_key().as_bytes())
+    gwar_proto::uid_for_key(key(account).verifying_key().as_bytes())
 }
 
 fn server() -> Ed25519Signer {
@@ -51,7 +51,7 @@ fn certified_until(account: u8, device: u8, expires_at: i64) -> Credential {
         expires_at,
         signature: String::new(),
     };
-    c.signature = b64(&key(account).sign(vc_proto::device_statement(&c).as_bytes()).to_bytes());
+    c.signature = b64(&key(account).sign(gwar_proto::device_statement(&c).as_bytes()).to_bytes());
     Credential::Account(c)
 }
 

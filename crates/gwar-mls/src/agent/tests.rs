@@ -1226,17 +1226,17 @@ fn load_validates_hpke_key_pair_and_positive_safe_statement_time() {
             1 => record.hpke_private[1] ^= 1,
             2 => record.created_at = 0,
             3 => record.created_at = -1,
-            4 => record.created_at = vc_proto::MAX_SAFE_INTEGER + 1,
+            4 => record.created_at = gwar_proto::MAX_SAFE_INTEGER + 1,
             _ => record.created_at = i64::MAX,
         }
         stores.groups.insert(b"@device".to_vec(), json(&record));
         assert!(matches!(Agent::load([11; 32], a.credential.clone(), stores), Err(Invalid("device record"))));
     }
     let credential = Credential::Local { device_key: public(&key(11)) };
-    for t in [0, -1, vc_proto::MAX_SAFE_INTEGER + 1] {
+    for t in [0, -1, gwar_proto::MAX_SAFE_INTEGER + 1] {
         assert!(matches!(Agent::new([11; 32], credential.clone(), t), Err(Invalid("time"))));
     }
-    for t in [1, vc_proto::MAX_SAFE_INTEGER] {
+    for t in [1, gwar_proto::MAX_SAFE_INTEGER] {
         let mut a = Agent::new([11; 32], credential.clone(), t).unwrap();
         a.take_changes();
         let loaded = Agent::load([11; 32], credential.clone(), a.durable.clone()).unwrap();

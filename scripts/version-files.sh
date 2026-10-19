@@ -7,10 +7,10 @@
 
 # Cargo manifests: the `version` under [package].
 CARGO_MANIFESTS=(
-  crates/vc-server/Cargo.toml
+  crates/gwar-server/Cargo.toml
   crates/gwar-connect/Cargo.toml
-  crates/vc-client/Cargo.toml
-  crates/vc-proto/Cargo.toml
+  crates/gwar-client/Cargo.toml
+  crates/gwar-proto/Cargo.toml
   apps/desktop/src-tauri/Cargo.toml
 )
 

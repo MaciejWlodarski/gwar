@@ -28,7 +28,7 @@ beforeEach(() => {
   }));
   useSettings.setState({ language: "en" });
   useUi.setState({ editing: null, dialog: { kind: "none" } });
-  useSession.setState({ ...initialState, kind: "vc", phase: "online", activeThread: "server", me: { uid: "me", session: 1 },
+  useSession.setState({ ...initialState, kind: "gwar", phase: "online", activeThread: "server", me: { uid: "me", session: 1 },
     server: { ...welcome().server, upload_limit: 1000, server_chat: { encrypted: true, history: true } }, permissions: ["attach_files", "manage_messages", "send_messages"],
     threads: { server: { items: [], unread: 0, mentions: 0, hasMore: true, loaded: true, lastRead: 0, locked: false, securing: false } } });
   internals.conn = { request, serverKey: "", isOnline: true };
@@ -46,7 +46,7 @@ const button = (label: string) => container.querySelector<HTMLButtonElement>(`bu
 
 it.each(["encrypted", "plaintext", "teamspeak"] as const)("uses the %s server sending and attachment path", async mode => {
   const encrypted = mode === "encrypted";
-  useSession.setState({ kind: mode === "teamspeak" ? "teamspeak" : "vc", server: { ...welcome().server, upload_limit: 1000, server_chat: { encrypted, history: encrypted } } });
+  useSession.setState({ kind: mode === "teamspeak" ? "teamspeak" : "gwar", server: { ...welcome().server, upload_limit: 1000, server_chat: { encrypted, history: encrypted } } });
   await show();
   expect(!!button("Who can read")).toBe(encrypted);
   expect(container.textContent).toContain(encrypted ? "Messages here go to everyone on the server and are saved." : "Messages here go to everyone on the server and are not saved.");

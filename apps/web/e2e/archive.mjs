@@ -35,7 +35,7 @@ try {
   const webPort = await port(), serverPort = await port(), connectPort = await port();
   const web = `http://127.0.0.1:${webPort}`, ws = `ws://127.0.0.1:${serverPort}/ws`, connect = `http://127.0.0.1:${connectPort}`;
   const target = path.join(root, "target/debug");
-  const service = start(process.env.VC_SERVER_BIN ?? path.join(target, "vc-server"), ["--data-dir", path.join(directory, "server"), "--http", `127.0.0.1:${serverPort}`, "--media", `127.0.0.1:${serverPort}`, "--public-ip", "127.0.0.1", "--public-endpoint", ws, "--web-origin", web, "--no-connect"], root);
+  const service = start(process.env.GWAR_SERVER_BIN ?? path.join(target, "gwar-server"), ["--data-dir", path.join(directory, "server"), "--http", `127.0.0.1:${serverPort}`, "--media", `127.0.0.1:${serverPort}`, "--public-ip", "127.0.0.1", "--public-endpoint", ws, "--web-origin", web, "--no-connect"], root);
   const connectService = start(process.env.GWAR_CONNECT_BIN ?? path.join(target, "gwar-connect"), ["--data-dir", path.join(directory, "connect"), "--http", `127.0.0.1:${connectPort}`, "--origin", web], root);
   const vite = start("pnpm", ["--filter", "web", "exec", "vite", "--host", "127.0.0.1", "--port", String(webPort), "--strictPort"], root);
   await Promise.all([ready(`${web}/`, vite), ready(`http://127.0.0.1:${serverPort}/health`, service), ready(`${connect}/v1/service-key`, connectService)]);

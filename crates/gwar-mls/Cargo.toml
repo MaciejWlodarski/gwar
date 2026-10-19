@@ -7,7 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-vc-proto = { path = "../vc-proto" }
+gwar-proto = { path = "../gwar-proto" }
 openmls = "=0.9.1"
 openmls_rust_crypto = "=0.6.0"
 openmls_traits = "=0.6.0"

@@ -4,41 +4,41 @@
 #   HTTP/WS   : 127.0.0.1:8800 on the VM, published by nginx (or: ssh -L 8800:127.0.0.1:8800 oracle)
 #   voice     : UDP 9988 (WebRTC) on the VM's private address; the cloud NAT
 #               maps the public IP to it, so browsers get PUBLIC_IP:9988
-#   TeamSpeak : UDP 9987, the bridged official TeamSpeak server (VC_TEAMSPEAK=0 disables it;
+#   TeamSpeak : UDP 9987, the bridged official TeamSpeak server (GWAR_TEAMSPEAK=0 disables it;
 #               enabling it accepts the TeamSpeak server license), and its file
 #               transfer on TCP 30033 (all addresses, so clients use the public IP)
-#   Connect   : 127.0.0.1:8900, Gwar Connect (VC_CONNECT=0 skips it); nginx publishes it
+#   Connect   : 127.0.0.1:8900, Gwar Connect (GWAR_CONNECT=0 skips it); nginx publishes it
 #               under /connect/ (see docs/deploy.md)
 #   Backups   : daily copies of both databases in ~/gwar-backups, kept 14 days
-#   Web app   : with --web, dist is also published to VC_WEB_DIR (a static nginx root)
+#   Web app   : with --web, dist is also published to GWAR_WEB_DIR (a static nginx root)
 #
 # Usage: scripts/deploy-vm.sh [--web]   (--web also builds apps/web locally and uploads dist)
 set -euo pipefail
 cd "$(dirname "$0")/.."
-# Host-specific settings (VC_DEPLOY_HOST, VC_PUBLIC_IP, VC_PRIVATE_IP, ...) live
+# Host-specific settings (GWAR_DEPLOY_HOST, GWAR_PUBLIC_IP, GWAR_PRIVATE_IP, ...) live
 # in scripts/deploy.env, which is not committed.
 if [[ -f scripts/deploy.env ]]; then
   # shellcheck source=/dev/null
   source scripts/deploy.env
 fi
-HOST=${VC_DEPLOY_HOST:?set VC_DEPLOY_HOST (ssh host) in scripts/deploy.env}
-PRIVATE_IP=${VC_PRIVATE_IP:-0.0.0.0}
+HOST=${GWAR_DEPLOY_HOST:?set GWAR_DEPLOY_HOST (ssh host) in scripts/deploy.env}
+PRIVATE_IP=${GWAR_PRIVATE_IP:-0.0.0.0}
 # Fail fast instead of hanging when the connection drops mid-build.
 SSH_OPTS="-o ConnectTimeout=20 -o ServerAliveInterval=15 -o ServerAliveCountMax=8"
-TEAMSPEAK=${VC_TEAMSPEAK:-1}
+TEAMSPEAK=${GWAR_TEAMSPEAK:-1}
 if [[ "$TEAMSPEAK" == 1 ]]; then
-  MEDIA_BIND=${VC_MEDIA_BIND:-$PRIVATE_IP:9988}
-  TS_ARGS="--teamspeak --accept-teamspeak-license --teamspeak-voice ${VC_TEAMSPEAK_VOICE:-$PRIVATE_IP:9987}"
+  MEDIA_BIND=${GWAR_MEDIA_BIND:-$PRIVATE_IP:9988}
+  TS_ARGS="--teamspeak --accept-teamspeak-license --teamspeak-voice ${GWAR_TEAMSPEAK_VOICE:-$PRIVATE_IP:9987}"
 else
-  MEDIA_BIND=${VC_MEDIA_BIND:-$PRIVATE_IP:9987}
+  MEDIA_BIND=${GWAR_MEDIA_BIND:-$PRIVATE_IP:9987}
   TS_ARGS=""
 fi
-PUBLIC_IP=${VC_PUBLIC_IP:?set VC_PUBLIC_IP (address clients reach) in scripts/deploy.env}
-# Extra vc-server flags
-EXTRA_ARGS="$TS_ARGS ${VC_EXTRA_ARGS:-}"
-CONNECT=${VC_CONNECT:-1}
-CONNECT_ARGS=${VC_CONNECT_ARGS:-}
-WEB_DIR=${VC_WEB_DIR:-}
+PUBLIC_IP=${GWAR_PUBLIC_IP:?set GWAR_PUBLIC_IP (address clients reach) in scripts/deploy.env}
+# Extra gwar-server flags
+EXTRA_ARGS="$TS_ARGS ${GWAR_EXTRA_ARGS:-}"
+CONNECT=${GWAR_CONNECT:-1}
+CONNECT_ARGS=${GWAR_CONNECT_ARGS:-}
+WEB_DIR=${GWAR_WEB_DIR:-}
 PUBLISH_WEB=0
 
 # The published app names the commit it was built from (README, "The official web app"), so it must be
@@ -71,7 +71,7 @@ if [[ "${1:-}" == "--web" ]]; then
 fi
 
 rsync -az -e "ssh $SSH_OPTS" --delete --exclude target --exclude node_modules --exclude .git --exclude .claude \
-  --exclude 'apps/web/e2e/screenshots' ./ "$HOST:vc/src/"
+  --exclude 'apps/web/e2e/screenshots' ./ "$HOST:gwar/src/"
 
 # The remote shell re-parses the command line, so quote the values for it.
 ssh $SSH_OPTS -T "$HOST" MEDIA_BIND="$MEDIA_BIND" PUBLIC_IP="$PUBLIC_IP" EXTRA_ARGS="$(printf %q "$EXTRA_ARGS")" \
@@ -79,19 +79,19 @@ ssh $SSH_OPTS -T "$HOST" MEDIA_BIND="$MEDIA_BIND" PUBLIC_IP="$PUBLIC_IP" EXTRA_A
   timeout 1500 bash -s <<'REMOTE'
 set -euo pipefail
 export PATH=$HOME/.cargo/bin:$PATH
-cd ~/vc/src
-PACKAGES="-p vc-server"
+cd ~/gwar/src
+PACKAGES="-p gwar-server"
 [[ "$CONNECT" == 1 ]] && PACKAGES="$PACKAGES -p gwar-connect"
-CARGO_TARGET_DIR=$HOME/vc/target nice cargo build --release $PACKAGES
-install -m 755 ~/vc/target/release/vc-server ~/vc/vc-server
-mkdir -p ~/.config/systemd/user ~/vc/data ~/gwar-backups
-cat > ~/.config/systemd/user/vc-server.service <<UNIT
+CARGO_TARGET_DIR=$HOME/gwar/target nice cargo build --release $PACKAGES
+install -m 755 ~/gwar/target/release/gwar-server ~/gwar/gwar-server
+mkdir -p ~/.config/systemd/user ~/gwar/data ~/gwar-backups
+cat > ~/.config/systemd/user/gwar-server.service <<UNIT
 [Unit]
 Description=Voice communicator server (development)
 
 [Service]
-WorkingDirectory=%h/vc
-ExecStart=%h/vc/vc-server --data-dir %h/vc/data --http 127.0.0.1:8800 --client-ip-header x-real-ip --media ${MEDIA_BIND} --public-ip ${PUBLIC_IP} --web-root %h/vc/src/apps/web/dist ${EXTRA_ARGS}
+WorkingDirectory=%h/gwar
+ExecStart=%h/gwar/gwar-server --data-dir %h/gwar/data --http 127.0.0.1:8800 --client-ip-header x-real-ip --media ${MEDIA_BIND} --public-ip ${PUBLIC_IP} --web-root %h/gwar/src/apps/web/dist ${EXTRA_ARGS}
 Restart=on-failure
 UMask=0077
 
@@ -101,7 +101,7 @@ UNIT
 
 if [[ "$CONNECT" == 1 ]]; then
   mkdir -p ~/gwar-connect/data
-  install -m 755 ~/vc/target/release/gwar-connect ~/gwar-connect/gwar-connect
+  install -m 755 ~/gwar/target/release/gwar-connect ~/gwar-connect/gwar-connect
   cat > ~/.config/systemd/user/gwar-connect.service <<UNIT
 [Unit]
 Description=Gwar Connect (accounts)
@@ -123,10 +123,10 @@ cat > ~/gwar-backups/backup.sh <<'SCRIPT'
 set -euo pipefail
 day=$(date +%F)
 cd ~/gwar-backups
-~/vc/vc-server --data-dir ~/vc/data backup "server-$day.sqlite3.tmp" >/dev/null
+~/gwar/gwar-server --data-dir ~/gwar/data backup "server-$day.sqlite3.tmp" >/dev/null
 mv -f "server-$day.sqlite3.tmp" "server-$day.sqlite3"
-if [[ -f ~/vc/data/server-key.ed25519 ]]; then
-  install -m 600 ~/vc/data/server-key.ed25519 server-key.ed25519
+if [[ -f ~/gwar/data/server-key.ed25519 ]]; then
+  install -m 600 ~/gwar/data/server-key.ed25519 server-key.ed25519
 fi
 if [[ -x ~/gwar-connect/gwar-connect ]]; then
   ~/gwar-connect/gwar-connect --data-dir ~/gwar-connect/data backup "connect-$day.sqlite3.tmp" >/dev/null
@@ -167,14 +167,14 @@ if [[ "$PUBLISH_WEB" == 1 && -n "$WEB_DIR" ]]; then
 fi
 systemctl --user daemon-reload
 systemctl --user enable --now gwar-backup.timer
-systemctl --user enable --now vc-server.service
-systemctl --user restart vc-server.service
+systemctl --user enable --now gwar-server.service
+systemctl --user restart gwar-server.service
 if [[ "$CONNECT" == 1 ]]; then
   systemctl --user enable --now gwar-connect.service
   systemctl --user restart gwar-connect.service
 fi
 sleep 1
-systemctl --user is-active vc-server.service
+systemctl --user is-active gwar-server.service
 curl -fsS -m 5 http://127.0.0.1:8800/health && echo
 if [[ "$CONNECT" == 1 ]]; then
   systemctl --user is-active gwar-connect.service

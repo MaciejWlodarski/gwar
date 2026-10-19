@@ -34,7 +34,7 @@ async function ready(url, child) {
 try {
   const webPort = await port(), serverPort = await port();
   const web = `http://127.0.0.1:${webPort}`, ws = `ws://127.0.0.1:${serverPort}/ws`;
-  const service = start(process.env.VC_SERVER_BIN ?? path.join(root, "target/debug/vc-server"), ["--data-dir", directory, "--http", `127.0.0.1:${serverPort}`, "--media", `127.0.0.1:${serverPort}`, "--public-ip", "127.0.0.1", "--public-endpoint", ws, "--web-origin", web, "--no-connect"], root);
+  const service = start(process.env.GWAR_SERVER_BIN ?? path.join(root, "target/debug/gwar-server"), ["--data-dir", directory, "--http", `127.0.0.1:${serverPort}`, "--media", `127.0.0.1:${serverPort}`, "--public-ip", "127.0.0.1", "--public-endpoint", ws, "--web-origin", web, "--no-connect"], root);
   const vite = start("pnpm", ["--filter", "web", "exec", "vite", "--host", "127.0.0.1", "--port", String(webPort), "--strictPort"], root);
   await Promise.all([ready(`${web}/`, vite), ready(`http://127.0.0.1:${serverPort}/health`, service)]);
   browser = await chromium.launch({ headless: true });
@@ -256,7 +256,7 @@ try {
   console.log("PASS the server connection works when MLS cannot start");
   // A separate new database opts into encrypted server chat; all devices join on connect.
   const encryptedPort = await port(), encryptedWs = `ws://127.0.0.1:${encryptedPort}/ws`;
-  const encryptedService = start(process.env.VC_SERVER_BIN ?? path.join(root, "target/debug/vc-server"), ["--data-dir", path.join(directory, "encrypted"), "--http", `127.0.0.1:${encryptedPort}`, "--media", `127.0.0.1:${encryptedPort}`, "--public-ip", "127.0.0.1", "--public-endpoint", encryptedWs, "--web-origin", web, "--no-connect", "--encrypted-server-chat"], root);
+  const encryptedService = start(process.env.GWAR_SERVER_BIN ?? path.join(root, "target/debug/gwar-server"), ["--data-dir", path.join(directory, "encrypted"), "--http", `127.0.0.1:${encryptedPort}`, "--media", `127.0.0.1:${encryptedPort}`, "--public-ip", "127.0.0.1", "--public-endpoint", encryptedWs, "--web-origin", web, "--no-connect", "--encrypted-server-chat"], root);
   await ready(`http://127.0.0.1:${encryptedPort}/health`, encryptedService);
   const d = await device(61, 10, encryptedWs), e = await device(71, 11, encryptedWs);
   // Neither device has opened server chat yet.

@@ -23,7 +23,7 @@ vi.mock("../state/controller", () => ({ controller: { messageServerKey: "S", mes
 
 it("drops verification results of rows the thread evicted, including late completions", async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
-  useSession.setState({ ...initialState, kind: "vc", me: { uid: "me", session: 1 }, viewChannel: 1 });
+  useSession.setState({ ...initialState, kind: "gwar", me: { uid: "me", session: 1 }, viewChannel: 1 });
   const div = document.createElement("div"); document.body.appendChild(div);
   const root = createRoot(div);
   const item = (id: number) => ({ id, target: { channel: 1 }, author: 2, author_uid: "u", author_name: "attacker", text: `unique-${id}`, sent_at: 1700000000000 });

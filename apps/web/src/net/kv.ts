@@ -1,14 +1,22 @@
 /** Minimal promise wrapper over one IndexedDB object store (no dependency). */
-const DB_NAME = "vc";
+import { moveLegacyDatabase } from "../rename-migration";
+const DB_NAME = "gwar";
 const STORE = "kv";
 
-function open(): Promise<IDBDatabase> {
+function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, 1);
     req.onupgradeneeded = () => req.result.createObjectStore(STORE);
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error ?? new Error("indexedDB open failed"));
   });
+}
+
+/** The database under the old name moves first (rename-migration.ts; remove with it). */
+let moved: Promise<void> | undefined;
+async function open(): Promise<IDBDatabase> {
+  await (moved ??= moveLegacyDatabase(openDb).catch((e: unknown) => console.warn("moving the old local database", e)));
+  return openDb();
 }
 
 export async function kvGet<T>(key: string): Promise<T | undefined> {

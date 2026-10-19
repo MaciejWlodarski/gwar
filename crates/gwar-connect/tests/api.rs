@@ -512,12 +512,12 @@ async fn public_accounts_can_be_looked_up_by_handle_or_key() {
         assert_eq!(status, 200);
         assert_eq!(reply["handle"], "lookup");
         assert_eq!(reply["account_key"], key);
-        let a: vc_proto::HandleAttestation = serde_json::from_value(reply["attestation"].clone()).unwrap();
+        let a: gwar_proto::HandleAttestation = serde_json::from_value(reply["attestation"].clone()).unwrap();
         assert_eq!(a.account_key, key);
         assert_eq!(a.handle, "lookup");
         assert!((before..=gwar_connect::api::now_ms()).contains(&a.issued_at));
         assert_eq!(a.expires_at - a.issued_at, 7 * 24 * 3600 * 1000);
-        assert!(crypto::verify(service, &vc_proto::handle_statement(&a), &a.signature));
+        assert!(crypto::verify(service, &gwar_proto::handle_statement(&a), &a.signature));
     }
     let unknown = b64(SigningKey::from_bytes(&rand::random()).verifying_key().as_bytes());
     for path in [format!("/accounts/by-key/{unknown}"), "/accounts/by-key/malformed".into(), "/accounts/by-key".into()]
@@ -836,14 +836,14 @@ async fn the_key_archive_keeps_signed_statements_first_manifests_records_and_tra
     assert_eq!(keys[0]["statement"], recovery(2)["statement"]);
 
     // The first manifest of a generation wins.
-    let mut cert = vc_proto::DeviceCertificate {
+    let mut cert = gwar_proto::DeviceCertificate {
         account_key: account_key.clone(),
         device_key: b64(laptop.verifying_key().as_bytes()),
         issued_at: now - 1000,
         expires_at: now + 86_400_000,
         signature: String::new(),
     };
-    cert.signature = b64(&account.sign(vc_proto::device_statement(&cert).as_bytes()).to_bytes());
+    cert.signature = b64(&account.sign(gwar_proto::device_statement(&cert).as_bytes()).to_bytes());
     let me = Recipient { device_key: cert.device_key.clone(), x25519: public };
     let (manifest, generation_key) =
         Manifest::create(1, None, &laptop, &cert, std::slice::from_ref(&me), None, &[], now).unwrap();

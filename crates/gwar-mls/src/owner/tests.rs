@@ -4,7 +4,7 @@ use crate::credential::tests::{certified, key, public};
 const NOW: i64 = 10_000;
 
 fn uid(seed: u8) -> Uid {
-    vc_proto::uid_for_key(key(seed).verifying_key().as_bytes())
+    gwar_proto::uid_for_key(key(seed).verifying_key().as_bytes())
 }
 
 fn server() -> String {

@@ -1,4 +1,4 @@
-/** Base64url without padding, as used by the vc/1 wire format. */
+/** Base64url without padding, as used by the gwar/1 wire format. */
 export function encodeBase64Url(bytes: Uint8Array): string {
   let binary = "";
   for (const b of bytes) binary += String.fromCharCode(b);

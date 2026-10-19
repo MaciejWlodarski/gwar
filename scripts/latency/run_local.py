@@ -67,7 +67,7 @@ def install_signals():
 
 
 def environment(args):
-    env = {key: value for key, value in os.environ.items() if not key.startswith(("VC_", "LATENCY_"))}
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("GWAR_", "LATENCY_"))}
     env.update(LATENCY_MIN_MS=str(args.minimum_latency_ms), LATENCY_EXTRA_DELAY_MS=str(args.extra_delay_ms))
     return env
 

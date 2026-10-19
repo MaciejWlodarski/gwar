@@ -48,7 +48,7 @@ describe("durable root migration", () => {
   it("keeps an unrelated local identity", async () => {
     const record = await enrollment();
     const other = await generateKeyPair();
-    await indexedDbIdentityStore.save({ format: "vc-identity", version: 1, jwk: other.jwk });
+    await indexedDbIdentityStore.save({ format: "gwar-identity", version: 1, jwk: other.jwk });
     await indexedDbConnectStore.save(record);
     expect((await indexedDbIdentityStore.load())?.jwk.x).toBe(other.publicKey);
   });

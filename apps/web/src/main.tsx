@@ -1,3 +1,5 @@
+// First: what was kept under the project's old name moves before any store reads it.
+import "./rename-migration";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";

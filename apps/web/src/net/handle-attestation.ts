@@ -7,7 +7,7 @@ export type HandleMember = Pick<Member, "uid" | "connect">;
 const SKEW_MS = 5 * 60 * 1000;
 const verified = new WeakMap<HandleAttestation, { fingerprint: string; identity: Promise<string | null> }>();
 
-/** Mirrors vc_proto::handle_statement exactly, with no trailing newline. */
+/** Mirrors gwar_proto::handle_statement exactly, with no trailing newline. */
 export function handleStatement(a: HandleAttestation): Uint8Array {
   return new TextEncoder().encode(`gwar handle v1\n${a.account_key}\n${a.handle}\n${a.issued_at}\n${a.expires_at}`);
 }

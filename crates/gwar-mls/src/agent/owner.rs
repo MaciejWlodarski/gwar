@@ -2,8 +2,8 @@
 //! the record `{server}/@server` holds the verified owner chain and the newest current
 //! anchor and list this device accepted, which are its checkpoints.
 
+use gwar_proto::Uid;
 use serde::{Deserialize, Serialize};
-use vc_proto::Uid;
 
 use super::{Agent, Invalid, Result};
 use crate::Revocations;
@@ -440,7 +440,7 @@ fn lapsed(agent: &Agent, chain: &OwnerChain, anchor: &SignedAnchor) -> ManagersC
 
 /// The next sequence number, within the protocol's bound.
 fn successor(seq: u64) -> Result<u64> {
-    (seq < vc_proto::MAX_SAFE_INTEGER as u64).then_some(seq + 1).ok_or(Invalid("sequence exhausted"))
+    (seq < gwar_proto::MAX_SAFE_INTEGER as u64).then_some(seq + 1).ok_or(Invalid("sequence exhausted"))
 }
 
 /// Splits a stored key into the server of a server record.
@@ -459,7 +459,7 @@ mod tests {
     const NOW: i64 = 1_800_000_000_000;
 
     fn uid(seed: u8) -> Uid {
-        vc_proto::uid_for_key(key(seed).verifying_key().as_bytes())
+        gwar_proto::uid_for_key(key(seed).verifying_key().as_bytes())
     }
     fn server() -> String {
         public(&key(200))
@@ -740,7 +740,7 @@ mod tests {
         c.take_changes();
         let high = c
             .sign_manager_list(ManagerList {
-                seq: vc_proto::MAX_SAFE_INTEGER as u64 - 1,
+                seq: gwar_proto::MAX_SAFE_INTEGER as u64 - 1,
                 ..ManagerList::parse(&c.next_list(&server(), None, Some(&[]), NOW, None, None, &()).unwrap()).unwrap()
             })
             .unwrap();
@@ -754,7 +754,7 @@ mod tests {
                 Some(&a1.encode()),
                 Some(&{
                     c.sign_manager_list(ManagerList {
-                        seq: vc_proto::MAX_SAFE_INTEGER as u64,
+                        seq: gwar_proto::MAX_SAFE_INTEGER as u64,
                         ..ManagerList::parse(&c.next_list(&server(), None, Some(&[]), NOW, None, None, &()).unwrap())
                             .unwrap()
                     })

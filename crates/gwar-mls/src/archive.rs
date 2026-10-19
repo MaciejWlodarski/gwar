@@ -3,6 +3,7 @@
 //! the reader's checks; what a device keeps (checkpoints, revocations, queues) is the caller's.
 
 use ed25519_dalek::{Signer as _, SigningKey};
+use gwar_proto::DeviceCertificate;
 use openmls_rust_crypto::RustCrypto;
 use openmls_traits::{
     crypto::OpenMlsCrypto,
@@ -11,7 +12,6 @@ use openmls_traits::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use vc_proto::DeviceCertificate;
 
 use crate::crypto::Crypto;
 use crate::encoding::{b64, decimal, fixed, netstrings, parse_netstrings};
@@ -92,7 +92,7 @@ pub fn recovery_key_pair(code: &[u8], account_key: &[u8; 32]) -> ([u8; 32], [u8;
 
 /// A device certificate's wire form: its statement and the account signature.
 pub fn certificate_bytes(c: &DeviceCertificate) -> Vec<u8> {
-    netstrings(&[vc_proto::device_statement(c).as_bytes(), c.signature.as_bytes()])
+    netstrings(&[gwar_proto::device_statement(c).as_bytes(), c.signature.as_bytes()])
 }
 fn parse_certificate(bytes: &[u8]) -> Result<DeviceCertificate> {
     let [statement, signature] = parse_netstrings(bytes, 2).ok_or(Invalid("certificate"))?[..] else {
@@ -109,7 +109,7 @@ fn parse_certificate(bytes: &[u8]) -> Result<DeviceCertificate> {
         expires_at: decimal(expires_at).ok_or(Invalid("certificate"))? as i64,
         signature: signature_text(signature)?,
     };
-    if header != "gwar device v1" || vc_proto::device_statement(&c) != text(statement)? {
+    if header != "gwar device v1" || gwar_proto::device_statement(&c) != text(statement)? {
         return Err(Invalid("certificate"));
     }
     Ok(c)
@@ -121,7 +121,7 @@ fn certificate_covers(c: &DeviceCertificate, account_key: &str, device_key: &str
         && c.issued_at <= at
         && at < c.expires_at
         && c.expires_at - c.issued_at <= MAX_CERTIFICATE_MS
-        && vc_proto::signed_by(account_key, &vc_proto::device_statement(c), &c.signature)
+        && gwar_proto::signed_by(account_key, &gwar_proto::device_statement(c), &c.signature)
 }
 
 /// A signed device revocation of this account (`gwar revoke v1`).
@@ -138,7 +138,7 @@ impl Revocation {
     pub fn verify(&self, account_key: &str) -> bool {
         fixed::<32>(&self.device_key).is_some()
             && self.revoked_at >= 0
-            && vc_proto::signed_by(account_key, &self.statement(account_key), &self.signature)
+            && gwar_proto::signed_by(account_key, &self.statement(account_key), &self.signature)
     }
     fn encode(&self, account_key: &str) -> Vec<u8> {
         netstrings(&[self.statement(account_key).as_bytes(), self.signature.as_bytes()])
@@ -207,7 +207,7 @@ impl DeviceArchiveKey {
         (header == "gwar archive device v1"
             && fixed::<32>(&k.account_key).is_some()
             && k.statement() == statement
-            && vc_proto::signed_by(&k.device_key, statement, signature))
+            && gwar_proto::signed_by(&k.device_key, statement, signature))
         .then_some(k)
     }
 }
@@ -251,7 +251,7 @@ impl RecoveryArchiveKey {
         (header == "gwar archive recovery v1"
             && k.version >= 1
             && k.statement() == statement
-            && vc_proto::signed_by(&k.account_key, statement, signature))
+            && gwar_proto::signed_by(&k.account_key, statement, signature))
         .then_some(k)
     }
 }
@@ -482,7 +482,7 @@ impl Manifest {
         {
             return Err(Invalid("manifest"));
         }
-        if !vc_proto::signed_by(creator, statement_text, &signature_text(signature)?) {
+        if !gwar_proto::signed_by(creator, statement_text, &signature_text(signature)?) {
             return Err(Invalid("manifest signature"));
         }
         if hash(certificate) != certificate_hash {
@@ -846,7 +846,7 @@ impl Transfer {
         {
             return Err(Invalid("transfer"));
         }
-        if !vc_proto::signed_by(sender, statement_text, &signature_text(signature)?) {
+        if !gwar_proto::signed_by(sender, statement_text, &signature_text(signature)?) {
             return Err(Invalid("transfer signature"));
         }
         if hash(certificate) != certificate_hash || hash(sealed) != sealed_hash {

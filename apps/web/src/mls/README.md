@@ -167,14 +167,14 @@ rejects values it cannot represent exactly.
 
 Tests use fake-indexeddb, an injectable agent/connection and real IndexedDB
 transaction aborts. `pnpm --filter web e2e:mls` additionally starts its own
-loopback-only `vc-server --no-connect` with disposable data and Vite, then
+loopback-only `gwar-server --no-connect` with disposable data and Vite, then
 uses Chromium with the real wasm. It checks two users, four devices, equal
 epoch keys, authenticated message opening, history import, restart and device-lock
 handoff. Unit regressions also cover offline readmission and failed Welcome
 writes, locally revoked admission and a feed advancing during claims, HPKE
 rotation with failed atomic replacement, identical history retries, read-only
 opening and operational failure propagation, and full v3 plaintext validation.
-Build `cargo build -p vc-server --no-default-features` and the wasm first;
+Build `cargo build -p gwar-server --no-default-features` and the wasm first;
 install Chromium using `pnpm --filter web exec playwright install chromium`.
 The `mls-wasm` CI job runs this test. `e2e:dm` additionally exercises the real
 controller and React chat UI with four devices. No production or TeamSpeak service is used.

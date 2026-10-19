@@ -115,10 +115,10 @@ Against the merged implementation, all requested commands passed:
 | `cargo fmt --all --check` | Pass |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Pass |
 | `cargo test --workspace` | 659 passed, 0 failed, 6 ignored |
-| `cargo test -p vc-server --features test-hooks --test mls voice_opaque_srtp` | 1 passed |
-| `cargo test -p vc-server --features test-hooks --test teamspeak_channels --no-run` | Compiles |
-| `cargo test -p vc-server --features test-hooks --lib teamspeak` | 54 passed |
-| `cargo clippy -p vc-server --features test-hooks --all-targets -- -D warnings` | Pass |
+| `cargo test -p gwar-server --features test-hooks --test mls voice_opaque_srtp` | 1 passed |
+| `cargo test -p gwar-server --features test-hooks --test teamspeak_channels --no-run` | Compiles |
+| `cargo test -p gwar-server --features test-hooks --lib teamspeak` | 54 passed |
+| `cargo clippy -p gwar-server --features test-hooks --all-targets -- -D warnings` | Pass |
 
 The official suite now requires both `teamspeak` and `test-hooks`; default
 workspace tests exclude that suite rather than counting it as an ignored test.
@@ -197,7 +197,7 @@ the original implementation and latency measurements remain historical evidence.
   forwarding. The MLS integration moves out and back, establishes a fresh
   run, releases the old packet into the production forwarding queue, rejects
   it and delivers the fresh run's ciphertext.
-- B1: both native sender and plaintext SFU use `vc_proto::opus::packet_samples`.
+- B1: both native sender and plaintext SFU use `gwar_proto::opus::packet_samples`.
   It validates [RFC 6716 §3.2](https://www.rfc-editor.org/rfc/rfc6716.html#section-3.2)
   codes 0–3, frame length bytes, CBR divisibility, VBR frame
   boundaries, padding, the 1275-byte frame limit and 120 ms duration before
@@ -255,16 +255,16 @@ with no compile failure. Every mutation was restored before final checks:
 
 | Finding | Reverted behavior | Exact failing command |
 | --- | --- | --- |
-| A1 | Subtract active run from reserved SSRC count | `cargo test -p vc-server --lib active_replacements_reserve` |
-| A2 | Disable early datagram size rejection | `cargo test -p vc-server --lib early_payload_cap` |
-| A3 | Relabel held packet with the current origin at queued forwarding | `cargo test -p vc-server --features test-hooks --test mls voice_opaque_srtp` |
-| B1 | Restore duration-only parsing | `cargo test -p vc-proto opus::tests::malformed` |
-| B1 | Same parser mutation at plaintext admission | `cargo test -p vc-server --lib malformed_opus_framing` |
-| B1 | Same parser mutation at native sender | `cargo test -p vc-client --lib encoded_sender_bounds` |
-| C1 | Restore tsproto queued audio send | `cargo test -p vc-server --lib pending_transport_audio` |
-| C2 | Remove refused remote-move reconciliation | `cargo test -p vc-server --lib refused_remote_move` |
-| C4 | Suppress cumulative receive-byte accounting | `cargo test -p vc-server --test teamspeak_probe_helpers forbidden_counts` |
-| C5 | Stop sending after 20 packets | `cargo test -p vc-server --test teamspeak_probe_helpers plaintext_control` |
+| A1 | Subtract active run from reserved SSRC count | `cargo test -p gwar-server --lib active_replacements_reserve` |
+| A2 | Disable early datagram size rejection | `cargo test -p gwar-server --lib early_payload_cap` |
+| A3 | Relabel held packet with the current origin at queued forwarding | `cargo test -p gwar-server --features test-hooks --test mls voice_opaque_srtp` |
+| B1 | Restore duration-only parsing | `cargo test -p gwar-proto opus::tests::malformed` |
+| B1 | Same parser mutation at plaintext admission | `cargo test -p gwar-server --lib malformed_opus_framing` |
+| B1 | Same parser mutation at native sender | `cargo test -p gwar-client --lib encoded_sender_bounds` |
+| C1 | Restore tsproto queued audio send | `cargo test -p gwar-server --lib pending_transport_audio` |
+| C2 | Remove refused remote-move reconciliation | `cargo test -p gwar-server --lib refused_remote_move` |
+| C4 | Suppress cumulative receive-byte accounting | `cargo test -p gwar-server --test teamspeak_probe_helpers forbidden_counts` |
+| C5 | Stop sending after 20 packets | `cargo test -p gwar-server --test teamspeak_probe_helpers plaintext_control` |
 
 C4/C5 mutations exercise the shared probe helpers without an official server.
 C3's official ingress, grace, tail/end and reconnect probes are compiled here;
@@ -297,18 +297,18 @@ commands passed again afterward.
 | `cargo fmt --all --check` | Pass |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Pass, no warnings |
 | `cargo test --workspace` | 655 passed, 0 failed, 7 ignored |
-| `cargo test -p vc-server --test teamspeak_channels --no-run` | Pass; compile only |
-| `cargo test -p vc-server --features test-hooks --test teamspeak_channels --no-run` | Pass; compile only |
-| `cargo test -p vc-server --features test-hooks --test mls voice_opaque_srtp` | 1 passed, 0 failed |
-| `cargo test -p vc-server --test media official_probe_fixture` | 1 passed, 0 failed |
-| `cargo test -p vc-server --test teamspeak_probe_helpers` | 2 passed, 0 failed |
-| `cargo test -p vc-server --lib --no-fail-fast` | 165 passed, 0 failed |
-| `cargo test -p vc-client --lib` | 88 passed, 0 failed, 1 ignored |
-| `cargo test -p vc-proto opus -- --nocapture` | 2 passed, 0 failed |
+| `cargo test -p gwar-server --test teamspeak_channels --no-run` | Pass; compile only |
+| `cargo test -p gwar-server --features test-hooks --test teamspeak_channels --no-run` | Pass; compile only |
+| `cargo test -p gwar-server --features test-hooks --test mls voice_opaque_srtp` | 1 passed, 0 failed |
+| `cargo test -p gwar-server --test media official_probe_fixture` | 1 passed, 0 failed |
+| `cargo test -p gwar-server --test teamspeak_probe_helpers` | 2 passed, 0 failed |
+| `cargo test -p gwar-server --lib --no-fail-fast` | 165 passed, 0 failed |
+| `cargo test -p gwar-client --lib` | 88 passed, 0 failed, 1 ignored |
+| `cargo test -p gwar-proto opus -- --nocapture` | 2 passed, 0 failed |
 | `pnpm --filter web typecheck` | Pass |
 | `pnpm --filter web test` | 73 files, 890 passed, 0 failed |
-| `cargo build -p vc-server --no-default-features` | Pass |
-| `cargo build -p gwar-connect -p vc-client --example web_audio` | Pass; browser fixture prerequisites |
+| `cargo build -p gwar-server --no-default-features` | Pass |
+| `cargo build -p gwar-connect -p gwar-client --example web_audio` | Pass; browser fixture prerequisites |
 | `PATH=/private/tmp/node-v22.23.3-darwin-arm64/bin:$PATH pnpm e2e` (in `apps/web`) | 65/65 passed |
 | `PATH=/private/tmp/node-v22.23.3-darwin-arm64/bin:$PATH pnpm e2e:native-audio` (in `apps/web`) | Pass; 2 tone/slot-reuse phases |
 
@@ -326,19 +326,19 @@ The original latency acceptance limitation below is unchanged by these fixes.
 
 | Files | Behavior |
 | --- | --- |
-| `crates/vc-server/src/media/admission.rs` | One negotiated microphone SSRC; clear-header rejection before str0m, authenticated post-str0m check, opaque/Opus size bounds, extended-sequence ordering, per-source clock generation and encrypted span estimate. |
-| `crates/vc-server/src/media/mod.rs` | Opaque `AudioPacket`, explicit audio/end control, immutable `AudioOrigin`, revocable/confirmed `AudioRoute`, source/recipient binding checks and fences at fan-out, external sinks and puppet uplinks. |
-| `crates/vc-server/src/media/webrtc.rs` | Validate offered SSRC against negotiated microphone media; retain original extended sequence/raw timestamp; immediate forwarding with u64 slot time, 480-tick ceiling and previous-span floor. Recheck source and recipient authority at queued forwarding. Bounded in-process diagnostic inspection supports the real-SRTP churn test. |
-| `crates/vc-server/src/core/{mod,voice}.rs` | Publish mode and exact call/participation/run authority, provide an actor barrier for bridge origin capture, and enforce 32 retired SSRCs even after failed offers or a move with no active run. |
-| `crates/vc-server/src/teamspeak/{bridge,puppet}.rs` | Capture source origin at the receive callback; source and receiving-puppet routes survive every queue. Retire routes before enqueueing moves, on refusal and on replacement. Recheck current bindings, mode and confirmed TS channel at the socket; discard old packetizer tails. Incoming text also carries captured source and receiver routes. |
-| `crates/vc-server/src/teamspeak/listeners.rs` | Distinguish every ServerQuery listener connection generation, including reconnects of the same logical listener; reject old queued text. |
-| `crates/vc-client/src/voice/{mod,rtc}.rs` | Native sender checks complete encoded framing, duration and the 1000-byte cap, exposes separate counters, uses capture positions plus a fixed run offset and drops non-increasing positions. Native Gwar remains 480 samples; direct TS remains 960. |
+| `crates/gwar-server/src/media/admission.rs` | One negotiated microphone SSRC; clear-header rejection before str0m, authenticated post-str0m check, opaque/Opus size bounds, extended-sequence ordering, per-source clock generation and encrypted span estimate. |
+| `crates/gwar-server/src/media/mod.rs` | Opaque `AudioPacket`, explicit audio/end control, immutable `AudioOrigin`, revocable/confirmed `AudioRoute`, source/recipient binding checks and fences at fan-out, external sinks and puppet uplinks. |
+| `crates/gwar-server/src/media/webrtc.rs` | Validate offered SSRC against negotiated microphone media; retain original extended sequence/raw timestamp; immediate forwarding with u64 slot time, 480-tick ceiling and previous-span floor. Recheck source and recipient authority at queued forwarding. Bounded in-process diagnostic inspection supports the real-SRTP churn test. |
+| `crates/gwar-server/src/core/{mod,voice}.rs` | Publish mode and exact call/participation/run authority, provide an actor barrier for bridge origin capture, and enforce 32 retired SSRCs even after failed offers or a move with no active run. |
+| `crates/gwar-server/src/teamspeak/{bridge,puppet}.rs` | Capture source origin at the receive callback; source and receiving-puppet routes survive every queue. Retire routes before enqueueing moves, on refusal and on replacement. Recheck current bindings, mode and confirmed TS channel at the socket; discard old packetizer tails. Incoming text also carries captured source and receiver routes. |
+| `crates/gwar-server/src/teamspeak/listeners.rs` | Distinguish every ServerQuery listener connection generation, including reconnects of the same logical listener; reject old queued text. |
+| `crates/gwar-client/src/voice/{mod,rtc}.rs` | Native sender checks complete encoded framing, duration and the 1000-byte cap, exposes separate counters, uses capture positions plus a fixed run offset and drops non-increasing positions. Native Gwar remains 480 samples; direct TS remains 960. |
 | `apps/desktop/src-tauri/src/voice.rs` | Expose sender duration, malformed/oversize and capture-position counters in existing diagnostics. |
-| `crates/vc-server/tests/common/rtc.rs`, `tests/mls.rs` | Real str0m/SRTP fixture and MLS-authorized opaque stream integration, unknown-SSRC churn and live RTCP control. |
-| `crates/vc-server/tests/teamspeak_channels.rs` | Extend the existing ignored official-server permissions test with S6 transport, audio and text probes. No second TS process is started. |
+| `crates/gwar-server/tests/common/rtc.rs`, `tests/mls.rs` | Real str0m/SRTP fixture and MLS-authorized opaque stream integration, unknown-SSRC churn and live RTCP control. |
+| `crates/gwar-server/tests/teamspeak_channels.rs` | Extend the existing ignored official-server permissions test with S6 transport, audio and text probes. No second TS process is started. |
 | `docs/{e2e-build,latency,opus-10ms,voice-sfu-5b}.md` | Status, implementation record and corrected clock/route-tail descriptions. |
 
-No wire type changed, so no `vc-proto` or generated TypeScript binding changes
+No wire type changed, so no `gwar-proto` or generated TypeScript binding changes
 were needed. Existing web transport reconstruction supplies a fresh SSRC on
 run/move; native reconstruction uses str0m's fresh nonzero microphone SSRC.
 The browser's SDP is passed unchanged. No web source change was needed.
@@ -398,7 +398,7 @@ puppets carry no audio origin; their text lifetime cannot authorize audio.
 | Official S6 routes | Extended ignored `teamspeak_server_admins_manage_permissions_of_mirrored_channels`: existing permission assertions retained; plaintext controls for channel voice in both directions, incoming TS whisper, puppet/query/listener/private text, listener/puppet reconnect, re-entry, real refused TS move, queued-before-move cutoff, retained private puppet and replacement. Compiled locally; execution and mutation acceptance pending CI. |
 
 The official fixture uses the same checksum-verified server selected by
-`VC_TS3_DIR` in the existing CI job. Its controlled second Gwar core uses
+`GWAR_TS3_DIR` in the existing CI job. Its controlled second Gwar core uses
 that same official TS process. Fixed-origin injection and opaque marker bytes
 exercise S6 boundaries before client SFrame exists; they are not real SFrame
 endpoints. Assertions require zero forbidden payload bytes at egress and no
@@ -463,22 +463,22 @@ from this worktree, except the four `pnpm e2e*` commands, which ran from
 | `cargo test --workspace` | 645 passed, 0 failed, 7 ignored |
 | `pnpm --filter web typecheck` | Pass |
 | `pnpm --filter web test` | 73 files, 890 passed, 0 failed |
-| `cargo build -p vc-server --no-default-features` | Pass |
-| `cargo test -p vc-server --test teamspeak_channels --no-run` | Pass; compile only |
-| `cargo build -p gwar-connect -p vc-client --example web_audio` | Pass; local fixture prerequisites |
+| `cargo build -p gwar-server --no-default-features` | Pass |
+| `cargo test -p gwar-server --test teamspeak_channels --no-run` | Pass; compile only |
+| `cargo build -p gwar-connect -p gwar-client --example web_audio` | Pass; local fixture prerequisites |
 | `pnpm e2e` | 65/65 checks passed |
 | `pnpm e2e:mls` | First attempt failed with `stale epoch or incarnation` at `e2e/mls.mjs:70` while sealing the initial DM; isolated rerun passed all 9 checkpoints without code changes |
 | `pnpm e2e:dm` | 1 process-cleanup test and 23 browser checkpoints passed |
 | `pnpm e2e:native-audio` | Pass, two decoded audio phases including slot reuse |
-| `cargo build --release -p vc-client --example latency` | Pass; candidate binary |
-| `cargo build --manifest-path /private/tmp/gwar-5b-baseline/Cargo.toml --target-dir /private/tmp/gwar-5b-baseline/target --release -p vc-client --example latency` | Pass; pinned baseline binary |
+| `cargo build --release -p gwar-client --example latency` | Pass; candidate binary |
+| `cargo build --manifest-path /private/tmp/gwar-5b-baseline/Cargo.toml --target-dir /private/tmp/gwar-5b-baseline/target --release -p gwar-client --example latency` | Pass; pinned baseline binary |
 
 The seven ignored workspace tests are the MLS 350-device stress test,
 privileged macOS scheduling test and five official TeamSpeak tests. The official
 command remains **not run locally, pending CI**:
 
 ```sh
-cargo test -p vc-server --test teamspeak_channels -- --ignored --test-threads=1
+cargo test -p gwar-server --test teamspeak_channels -- --ignored --test-threads=1
 ```
 
 The first MLS browser failure was in existing chat setup before any voice
@@ -528,9 +528,9 @@ Both locked release builds finished before measurement:
 git -C /Users/zireael/dev/projects/gwar worktree add --detach /tmp/gwar-5b-gate-baseline b0c6e6b
 git -C /tmp/gwar-5b-gate-baseline cherry-pick dadda0f
 # In the baseline worktree:
-cargo build --locked --release -p vc-client --example latency --target-dir /tmp/gwar-5b-gate-target-baseline
+cargo build --locked --release -p gwar-client --example latency --target-dir /tmp/gwar-5b-gate-target-baseline
 # In the candidate worktree:
-cargo build --locked --release -p vc-client --example latency --target-dir /tmp/gwar-5b-gate-target-candidate
+cargo build --locked --release -p gwar-client --example latency --target-dir /tmp/gwar-5b-gate-target-candidate
 ```
 
 Hardware: Apple M5 / Mac17,3, 10 physical/logical CPUs, 16 GiB RAM;
@@ -544,7 +544,7 @@ server was used.
 Both variants use native 480-sample / 10 ms Opus, 48 kHz mono, 48 kbps,
 identical detector, two-second warmup and playout tuning. All wrappers set
 `LATENCY_WAIT_CONNECTED=1` **after** the runner clears inherited `LATENCY_*`
-and `VC_*`: carrier/impairments start normally, but markers wait for both
+and `GWAR_*`: carrier/impairments start normally, but markers wait for both
 transports to connect plus warmup. Harness source differs only in two event
 patterns adding `..` for candidate protocol fields; timing and detector logic
 are identical. Capture callbacks are 480 samples. Receiver callbacks are 480
@@ -752,8 +752,8 @@ partner was contended. Together with the 60-run gate table, it accounts for
   and final packet queues are 20–30 versus 10–20 ms. These prevent treating
   its favorable p95 point estimate as proof of no added tail/queue cost.
 
-Inspection of `git diff b0c6e6b..2c03f3f -- crates/vc-client
-crates/vc-server/src/media` shows native Opus validation/counters,
+Inspection of `git diff b0c6e6b..2c03f3f -- crates/gwar-client
+crates/gwar-server/src/media` shows native Opus validation/counters,
 strictly increasing capture positions and a random RTP clock offset, plus
 SFU admission, source-generation/previous-span handling and synchronous
 binding/route checks. The native jitter buffer, decoded playout policy,

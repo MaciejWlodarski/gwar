@@ -79,7 +79,7 @@ describe("verifiedHandle", () => {
 });
 
 describe("uidForPublicKey Rust vectors", () => {
-  // Printed and asserted by vc_server::identity::tests::uid_vectors_match_web.
+  // Printed and asserted by gwar_server::identity::tests::uid_vectors_match_web.
   it.each([
     [new Uint8Array(32), "Zmh6rfhivXdsj8GLjp-OIAiXFIU"],
     [new Uint8Array(32).fill(1), "cs1uhCLEB_ttCYaQ8RMLfe1-wvc"],

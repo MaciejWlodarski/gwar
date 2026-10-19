@@ -18,7 +18,7 @@ export class ServerIdentityChanged extends Error {
   }
 }
 
-const PREFIX = "vc.server-pin:";
+const PREFIX = "gwar.server-pin:";
 export const serverPins: PinStore = {
   load(endpoint) {
     const value = localStorage.getItem(PREFIX + normalizeEndpoint(endpoint));

@@ -106,8 +106,8 @@ function quietDeletion(v: MessageVerification): boolean {
   return v.status === "verified" && v.authorization.length === 0 && v.continuity !== "rollback" && v.continuity !== "fork";
 }
 
-function editableMessage(item: Extract<ChatItem, { kind: "msg" }>, vc: boolean, uid: string | undefined, verification?: MessageVerification): boolean {
-  const stored = vc && (!!item.sealed || (typeof item.msg.target === "object" && "channel" in item.msg.target));
+function editableMessage(item: Extract<ChatItem, { kind: "msg" }>, onGwar: boolean, uid: string | undefined, verification?: MessageVerification): boolean {
+  const stored = onGwar && (!!item.sealed || (typeof item.msg.target === "object" && "channel" in item.msg.target));
   return stored && item.msg.author_uid === uid && verification?.status === "verified" && !verification.authorization.includes("device-revoked")
     && !item.cannotOpen && !item.removed && item.msg.text !== DELETION_TEXT;
 }
@@ -453,7 +453,7 @@ export function MessageList({ threadKey, editLastRef }: { threadKey: ThreadKey; 
   const isChannel = threadKey === "channel" || encrypted;
   const locked = isChannel && !!thread?.locked;
   const viewChannel = useSession((s) => s.viewChannel);
-  const vc = useSession((s) => s.kind === "vc");
+  const onGwar = useSession((s) => s.kind === "gwar");
   // Others' messages in a channel: that channel's rule (overrides included); elsewhere the role's.
   const canManageMessages = useChannelPermission(threadKey === "channel" ? viewChannel : null, "manage_messages");
   const editing = useUi((s) => s.editing);
@@ -468,7 +468,7 @@ export function MessageList({ threadKey, editLastRef }: { threadKey: ThreadKey; 
     editLastRef.current = () => {
       const s = useSession.getState();
       if (!key || storedKey(s, s.activeThread) !== key || s.threads[key]?.items !== thread?.items) return false;
-      const item = thread?.items.findLast(i => i.kind === "msg" && editableMessage(i, s.kind === "vc", s.me?.uid, verificationFor(i)));
+      const item = thread?.items.findLast(i => i.kind === "msg" && editableMessage(i, s.kind === "gwar", s.me?.uid, verificationFor(i)));
       if (item?.kind !== "msg") return false;
       useUi.getState().setEditing(item.msg.id);
       return true;
@@ -584,11 +584,11 @@ export function MessageList({ threadKey, editLastRef }: { threadKey: ThreadKey; 
           if (row.type === "sys") return <SysRow key={row.key} row={row} t={t} />;
           const m = row.item.msg;
           // Stored messages can be edited or deleted.
-          const stored = vc && (!!row.item.sealed || (typeof m.target === "object" && "channel" in m.target));
+          const stored = onGwar && (!!row.item.sealed || (typeof m.target === "object" && "channel" in m.target));
           const own = m.author_uid === mineUid;
           const verification = verificationFor(row.item);
           // My signature may only extend a message this client verified (the controller checks again).
-          const signable = !vc || (verification?.status === "verified" && !verification.authorization.includes("device-revoked"));
+          const signable = !onGwar || (verification?.status === "verified" && !verification.authorization.includes("device-revoked"));
           return (
             <MessageRow
               key={row.key}
@@ -598,7 +598,7 @@ export function MessageList({ threadKey, editLastRef }: { threadKey: ThreadKey; 
               meUid={mineUid}
               lang={lang}
               compact={compact}
-              canEdit={editableMessage(row.item, vc, mineUid, verification)}
+              canEdit={editableMessage(row.item, onGwar, mineUid, verification)}
               canDelete={stored && ((own && signable) || (canManageMessages && (!row.item.sealed || !row.item.sealed.conversation.startsWith("dm:"))))}
               editing={editing === m.id}
             />
@@ -767,7 +767,7 @@ function Composer({ threadKey, attachRef, editLastRef }: { threadKey: ThreadKey;
   const channelName = useSession((s) => (s.viewChannel === null ? "" : (s.channels[s.viewChannel]?.name ?? "")));
   // A password channel I have not entered: the server would refuse, and I cannot read it either.
   const locked = useSession((s) => threadKey === "channel" && s.viewChannel !== null && !!s.threads[`ch:${s.viewChannel}`]?.locked);
-  const uploadsOn = useSession((s) => s.kind === "vc" && (s.server?.upload_limit ?? 0) > 0);
+  const uploadsOn = useSession((s) => s.kind === "gwar" && (s.server?.upload_limit ?? 0) > 0);
   const inChannel = useSession((s) => (threadKey === "channel" ? s.viewChannel : null));
   const isDm = threadKey.startsWith("dm:");
   // Direct messages follow the role's permission (inChannel is null there).
@@ -879,7 +879,7 @@ function Composer({ threadKey, attachRef, editLastRef }: { threadKey: ThreadKey;
     if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault();
       void send();
-    } else if (e.key === "ArrowUp" && !text && pending.length === 0 && useSession.getState().kind === "vc" && (threadKey === "channel" || encrypted)) {
+    } else if (e.key === "ArrowUp" && !text && pending.length === 0 && useSession.getState().kind === "gwar" && (threadKey === "channel" || encrypted)) {
       if (editLastRef.current?.()) e.preventDefault();
     }
   };
@@ -1054,7 +1054,7 @@ function ChatHeader() {
   const members = useMembersPanel();
   const sealed = useSession(s => { const key = storedKey(s, active); return sealedThread(key, s.kind, s.channels, s.server?.server_chat) ? key as StoredThreadKey : null; });
   const encrypted = !!sealed;
-  const vc = useSession(s => s.kind === "vc");
+  const onGwar = useSession(s => s.kind === "gwar");
   const dmName = useSession((s) => (active.startsWith("dm:") ? memberName(s.members, active.slice(3), s.threads[active]?.peer?.name ?? "") : undefined));
 
   let title: string;
@@ -1089,7 +1089,7 @@ function ChatHeader() {
           {sub}
         </p>
       </div>
-      {active === "channel" && vc && !encrypted && (
+      {active === "channel" && onGwar && !encrypted && (
         <span className="hidden shrink-0 text-xs text-subtle md:inline">{t("chat.notEncrypted")}</span>
       )}
       {sealed && (
@@ -1100,7 +1100,7 @@ function ChatHeader() {
           </button>
         </Tooltip>
       )}
-      {active === "channel" && vc && channel?.encrypted && viewChannel !== null && (
+      {active === "channel" && onGwar && channel?.encrypted && viewChannel !== null && (
         <button type="button" aria-label={t("channel.hearers")} onClick={() => useUi.getState().openDialog({ kind: "hearers", channel: viewChannel })}
           className="t flex shrink-0 cursor-pointer items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted hover:bg-hover hover:text-fg">
           <Headphones className="size-3.5" /> <span className="hidden sm:inline">{t("channel.hearers")}</span>

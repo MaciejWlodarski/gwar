@@ -17,7 +17,7 @@ describe("creating a channel", () => {
     mock.create.mockClear();
     mock.update.mockClear();
     useSettings.setState({ language: "en", channelEncryption: {} });
-    useSession.setState({ kind: "vc", channels: {} });
+    useSession.setState({ kind: "gwar", channels: {} });
     container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
   });
   afterEach(async () => {

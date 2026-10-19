@@ -63,7 +63,7 @@ the server, presence, voice authenticity.
   (or `404` where absence is the answer), read at most 1 MiB and 1,000
   revocations per page, and give each request, body included, 20 seconds.
 
-## Logging in to a server (vc/4, implemented)
+## Logging in to a server (gwar/4, implemented)
 
 Threats: a malicious server A relays your login to an honest server B and logs
 in to B as you (relay); or A pretends to be B.
@@ -92,7 +92,7 @@ directory; back it up, losing it means a new server identity). Login:
    certificate, or is `-` for a local identity.
 4. The server accepts only its own configured endpoints (`--public-endpoint`,
    `--domain`, `--public-url`, and a global unicast `--public-ip` only when
-   vc-server terminates TLS itself, with its listening port), never request headers. It checks that `expected_server_key` is its
+   gwar-server terminates TLS itself, with its listening port), never request headers. It checks that `expected_server_key` is its
    own, the nonce is this connection's, the signature, and that the certificate
    is current and not revoked. Then it signs
    `gwar server proof v3\n{hello_hash}\n{client_signature}`.
@@ -266,7 +266,7 @@ gwar message v3
 
 - The web app (also the desktop app's interface) validates every server message
   at runtime, with bounds, before use. The native protocol client in
-  `vc-client`, used by tests and tools but not by the apps, bounds what a
+  `gwar-client`, used by tests and tools but not by the apps, bounds what a
   server can make it hold (frame size, requests awaiting a reply, announced
   clients). Its event stream passes on chat messages and edits only when their
   signature verifies for this server and conversation, or when they come

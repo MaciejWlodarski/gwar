@@ -1,6 +1,6 @@
 # Native mouth-to-ear latency
 
-`vc-client`'s `latency` example feeds synthetic audio into one native client's
+`gwar-client`'s `latency` example feeds synthetic audio into one native client's
 microphone ring and timestamps decoded marker onsets at another's speaker ring.
 It includes capture batching, Opus, WebRTC, the Gwar SFU, jitter buffering,
 decoding and virtual speaker playout. Both clients run on the measuring host and
@@ -39,11 +39,11 @@ Use the native Rust prerequisites in the README and Python 3.9+ (stdlib only).
 From the checkout root:
 
 ```sh
-cargo build --release -p vc-client --example latency
-cargo build --release -p vc-server
+cargo build --release -p gwar-client --example latency
+cargo build --release -p gwar-server
 mkdir -p target/latency
-cargo run --release -p vc-client --example latency -- target/latency/local-1.csv 100
-cargo run --release -p vc-client --example latency -- target/latency/local-2.csv 100
+cargo run --release -p gwar-client --example latency -- target/latency/local-1.csv 100
+cargo run --release -p gwar-client --example latency -- target/latency/local-2.csv 100
 python3 scripts/latency/run_local.py \
   --variant current=target/release/examples/latency \
   --markers 100 --runs 4 --out target/latency/current
@@ -54,7 +54,7 @@ positive. Create the output parent first. Each local run uses a fresh server,
 random loopback HTTP/UDP ports and a temporary data directory beside the CSV,
 removed on completion, errors or Ctrl-C. Allow roughly `5 + 0.25 * count` seconds
 plus setup. Unset `LATENCY_URL` and `LATENCY_SERVER` for local mode; the local
-runner clears inherited `LATENCY_*` and `VC_*` settings itself. Both runners
+runner clears inherited `LATENCY_*` and `GWAR_*` settings itself. Both runners
 accept `--minimum-latency-ms` (default 5) and `--extra-delay-ms` (default 0),
 passing these settings explicitly to the client.
 
@@ -246,9 +246,9 @@ checkout paths:
 
 ```sh
 cargo build --manifest-path /path/to/baseline/Cargo.toml \
-  --target-dir /path/to/baseline/target/latency-build --release -p vc-client --example latency
+  --target-dir /path/to/baseline/target/latency-build --release -p gwar-client --example latency
 cargo build --manifest-path /path/to/candidate/Cargo.toml \
-  --target-dir /path/to/candidate/target/latency-build --release -p vc-client --example latency
+  --target-dir /path/to/candidate/target/latency-build --release -p gwar-client --example latency
 python3 scripts/latency/run_local.py \
   --variant baseline=/path/to/baseline/target/latency-build/release/examples/latency \
   --variant candidate=/path/to/candidate/target/latency-build/release/examples/latency \
@@ -263,7 +263,7 @@ measurements, and keep host/network conditions comparable.
 
 ## Remote server
 
-Prepare an SSH-accessible checkout with a built `vc-server` and open the chosen
+Prepare an SSH-accessible checkout with a built `gwar-server` and open the chosen
 UDP port. The runner builds and installs nothing remotely. Choose unused ports
 and supply all addresses and paths explicitly:
 
@@ -273,7 +273,7 @@ python3 scripts/latency/run_remote.py \
   --public-ip YOUR_PUBLIC_IP --media-bind YOUR_REMOTE_INTERFACE_IP \
   --media-port 9990 --http-port 8791 --tunnel-port 18791 \
   --remote-checkout /absolute/remote/checkout \
-  --server-binary target/release/vc-server \
+  --server-binary target/release/gwar-server \
   --variant current=target/release/examples/latency \
   --markers 100 --runs 4 --out target/latency/remote
 ```
@@ -281,8 +281,8 @@ python3 scripts/latency/run_remote.py \
 IPv4/IPv6 are accepted; the media bind IP may differ from the advertised public
 IP behind NAT. Remote binary paths can be absolute or checkout-relative. To
 interleave complete client/server builds, replace `--server-binary` with repeated
-`--server-variant baseline=target/baseline/release/vc-server` and
-`--server-variant candidate=target/candidate/release/vc-server`, supplying matching
+`--server-variant baseline=target/baseline/release/gwar-server` and
+`--server-variant candidate=target/candidate/release/gwar-server`, supplying matching
 client `--variant` names. Use separate target directories for server builds too.
 Floor and artificial audio-delay flags are shared with the local runner; validation uses the
 client's recorded identity window instead of assuming latency below 250 ms.
@@ -544,7 +544,7 @@ GWAR_CHECKOUT=/absolute/path/to/gwar
 pnpm --dir "$GWAR_CHECKOUT" install --frozen-lockfile
 pnpm --dir "$GWAR_CHECKOUT" --filter web exec playwright install chromium
 cargo build --manifest-path "$GWAR_CHECKOUT/Cargo.toml" \
-  --target-dir "$GWAR_CHECKOUT/target" -p vc-client --example web_audio
+  --target-dir "$GWAR_CHECKOUT/target" -p gwar-client --example web_audio
 pnpm --dir "$GWAR_CHECKOUT" --filter web e2e:native-audio
 # Optional diagnostic run through an additional loopback UDP hop:
 E2E_RTP_TRACE=1 pnpm --dir "$GWAR_CHECKOUT" --filter web e2e:native-audio

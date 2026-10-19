@@ -34,7 +34,7 @@ async function ready(url, child) {
 try {
   const webPort = await port(), serverPort = await port();
   const web = `http://127.0.0.1:${webPort}`, ws = `ws://127.0.0.1:${serverPort}/ws`;
-  const binary = process.env.VC_SERVER_BIN ?? path.join(root, "target/debug/vc-server");
+  const binary = process.env.GWAR_SERVER_BIN ?? path.join(root, "target/debug/gwar-server");
   const startServer = () => start(binary, ["--data-dir", directory, "--http", `127.0.0.1:${serverPort}`, "--media", `127.0.0.1:${serverPort}`, "--public-ip", "127.0.0.1", "--public-endpoint", ws, "--web-origin", web, "--no-connect"], root);
   let service = startServer();
   const vite = start("pnpm", ["--filter", "web", "exec", "vite", "--host", "127.0.0.1", "--port", String(webPort), "--strictPort"], root);
@@ -111,8 +111,8 @@ try {
   const restore = async backup => {
     await Promise.all(pages.map(page => page.evaluate(() => window.mls.runtime.close())));
     await stopProcesses([service]);
-    await copyFile(backup, path.join(directory, "vc.sqlite3"));
-    for (const suffix of ["-wal", "-shm"]) await rm(path.join(directory, `vc.sqlite3${suffix}`), { force: true });
+    await copyFile(backup, path.join(directory, "gwar.sqlite3"));
+    for (const suffix of ["-wal", "-shm"]) await rm(path.join(directory, `gwar.sqlite3${suffix}`), { force: true });
     service = startServer();
     await ready(`http://127.0.0.1:${serverPort}/health`, service);
     for (const i of pages.keys()) await reconnect(i);

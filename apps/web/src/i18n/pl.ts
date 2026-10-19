@@ -164,7 +164,7 @@ export const pl: Record<Key, string> = {
   "security.fingerprint": "Odcisk klucza serwera",
   "security.fingerprintHelp": "Porównaj go z właścicielem serwera, aby upewnić się, że łączysz się z właściwym serwerem.",
   "ss.ownership": "Właściciel",
-  "own.none": "Ten serwer nie ma jeszcze właściciela. Operator wskazuje go poleceniem `vc-server owner set` albo zostaje nim osoba, która użyje pierwszego tokenu admina.",
+  "own.none": "Ten serwer nie ma jeszcze właściciela. Operator wskazuje go poleceniem `gwar-server owner set` albo zostaje nim osoba, która użyje pierwszego tokenu admina.",
   "own.verifying": "Sprawdzanie zapisu właściciela…",
   "own.owner": "Właściciel",
   "own.verified": "Sprawdzone przez to urządzenie z zapisem właściciela, który przechowuje dla tego serwera.",

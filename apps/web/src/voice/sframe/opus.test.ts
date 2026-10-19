@@ -3,7 +3,7 @@ import { packetSamples } from "./opus";
 
 const packet = (bytes: number[], pad = 0) => new Uint8Array([...bytes, ...new Array<number>(pad).fill(0)]);
 
-describe("packetSamples (the vc-proto RFC 6716 cases)", () => {
+describe("packetSamples (the gwar-proto RFC 6716 cases)", () => {
   it("accepts every code and length boundary", () => {
     for (const [bytes, samples] of [
       [[0xf0], 480], [[0xf0, 1], 480], [[0xf1, 1, 2], 960], [[0xf1], 960], [[0xf2, 1, 1, 2, 3], 960], [[0xf2, 0], 960],

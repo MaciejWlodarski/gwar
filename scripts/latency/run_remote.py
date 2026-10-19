@@ -59,12 +59,12 @@ def start_server(args, directory, server_binary):
         "--http", f"127.0.0.1:{args.http_port}", "--media", address(args.media_bind, args.media_port),
         "--public-ip", str(args.public_ip), "--max-clients", "8", "--no-connect", "--insecure-any-host",
     ])
-    # VC_* can enable unrelated services. Extract variable names only, then unset them.
+    # GWAR_* can enable unrelated services. Extract variable names only, then unset them.
     # ';' keeps `cd` out of the background job. All three streams must be detached,
     # including stdin: without '< /dev/null' a remote start has hung in practice.
     script = (
         f"cd {checkout} || exit 1; "
-        r"""for variable in $(env | sed -n 's/^\(VC_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$variable"; done; """
+        r"""for variable in $(env | sed -n 's/^\(GWAR_[A-Za-z0-9_]*\)=.*/\1/p'); do unset "$variable"; done; """
         f"{command} > {shlex.quote(directory + '/server.log')} 2>&1 < /dev/null & "
         f"pid=$!; printf '%s\\n' \"$pid\" > {shlex.quote(directory + '/pid')}; printf '%s\\n' \"$pid\""
     )

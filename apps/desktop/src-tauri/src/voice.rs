@@ -1,4 +1,4 @@
-//! Native voice: Tauri commands around `vc_client::voice`.
+//! Native voice: Tauri commands around `gwar_client::voice`.
 //!
 //! The web UI owns the WebSocket and signalling. For the SDP exchange this
 //! module emits `voice://offer {owner, run, sdp}`; the UI sends it as `voice.offer`
@@ -33,10 +33,7 @@ use std::{
     time::Duration,
 };
 
-use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
-use tokio::sync::{oneshot, watch};
-use vc_client::voice::{
+use gwar_client::voice::{
     InputMode, LinkState, VoiceHandle,
     io::{AudioIo, AudioPorts, DeviceIo, DeviceIssue, IssueSink},
     keys::EncryptedStart,
@@ -44,7 +41,10 @@ use vc_client::voice::{
     sframe::{Binding, ControlReply, Counters, CryptoStatus},
     start_encrypted, start_teamspeak, start_with,
 };
-use vc_proto::AUDIO_SLOTS;
+use gwar_proto::AUDIO_SLOTS;
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
+use tokio::sync::{oneshot, watch};
 
 use crate::{
     fake_audio::{self, FakeIo, Heard, NullIo},
@@ -96,7 +96,7 @@ pub struct Voice {
     inner: Mutex<Inner>,
     /// Id of the active `voice_start`; zero after retirement.
     run: AtomicU64,
-    /// What the fake speaker heard (only with `VC_FAKE_AUDIO`).
+    /// What the fake speaker heard (only with `GWAR_FAKE_AUDIO`).
     pub heard: Arc<Heard>,
 }
 
@@ -319,7 +319,7 @@ struct FallbackIo {
 }
 
 impl AudioIo for FallbackIo {
-    fn open(self: Box<Self>) -> anyhow::Result<vc_client::voice::io::AudioPorts> {
+    fn open(self: Box<Self>) -> anyhow::Result<gwar_client::voice::io::AudioPorts> {
         let FallbackIo { primary, sink } = *self;
         match primary.open() {
             Ok(ports) => Ok(ports),
@@ -338,11 +338,11 @@ impl AudioIo for FallbackIo {
 }
 
 fn make_io(voice: &Voice, input: Option<String>, output: Option<String>, sink: IssueSink) -> Box<dyn AudioIo> {
-    if cfg!(debug_assertions) && std::env::var("VC_FAKE_AUDIO").is_ok_and(|v| v == "fail") {
+    if cfg!(debug_assertions) && std::env::var("GWAR_FAKE_AUDIO").is_ok_and(|v| v == "fail") {
         // Exercises the "no devices at all" path: report problems, keep listening/chatting.
         struct Failing;
         impl AudioIo for Failing {
-            fn open(self: Box<Self>) -> anyhow::Result<vc_client::voice::io::AudioPorts> {
+            fn open(self: Box<Self>) -> anyhow::Result<gwar_client::voice::io::AudioPorts> {
                 anyhow::bail!("simulated: no audio hardware")
             }
         }
@@ -470,9 +470,9 @@ impl StartBinding {
             && if direct {
                 self.server_key.is_none() && self.call.is_none() && self.participation.is_none()
             } else {
-                self.server_key.as_deref().and_then(vc_proto::decode_fixed::<32>).is_some()
-                    && self.call.as_deref().and_then(vc_proto::decode_fixed::<16>).is_some()
-                    && self.participation.as_deref().and_then(vc_proto::decode_fixed::<16>).is_some()
+                self.server_key.as_deref().and_then(gwar_proto::decode_fixed::<32>).is_some()
+                    && self.call.as_deref().and_then(gwar_proto::decode_fixed::<16>).is_some()
+                    && self.participation.as_deref().and_then(gwar_proto::decode_fixed::<16>).is_some()
             }
     }
 
@@ -514,7 +514,7 @@ pub async fn voice_start(
 ) -> Result<(), String> {
     check_main_window(window.label())?;
     let app = window.app_handle().clone();
-    if run == 0 || run > vc_proto::MAX_SAFE_INTEGER as u64 {
+    if run == 0 || run > gwar_proto::MAX_SAFE_INTEGER as u64 {
         return Err("invalid voice binding".into());
     }
     let direct = app.state::<Ts>().has_voice_connection();
@@ -570,7 +570,7 @@ pub async fn voice_start(
     Ok(())
 }
 
-/// Negotiates WebRTC with a vc server through the UI's WebSocket.
+/// Negotiates WebRTC with a Gwar server through the UI's WebSocket.
 async fn start_vc(
     app: &AppHandle,
     io: Box<dyn AudioIo>,
@@ -618,7 +618,7 @@ async fn forward_crypto(
     mut events: tokio::sync::mpsc::UnboundedReceiver<CryptoStatus>,
 ) {
     while let Some(status) = events.recv().await {
-        let failed = status.state == vc_client::voice::sframe::CryptoState::Failed;
+        let failed = status.state == gwar_client::voice::sframe::CryptoState::Failed;
         let _ = app.emit("voice://crypto", CryptoPayload { owner, run, status });
         if failed {
             // A failed run is retired at once: transport, pipeline and devices close.
@@ -629,7 +629,7 @@ async fn forward_crypto(
 }
 
 /// The current encrypted run's key channel, without holding the lock across awaits.
-fn run_keys(voice: &Voice, owner: u64, run: u64) -> Result<Option<vc_client::voice::keys::KeyChannel>, String> {
+fn run_keys(voice: &Voice, owner: u64, run: u64) -> Result<Option<gwar_client::voice::keys::KeyChannel>, String> {
     let inner = voice.lock();
     check_owner(&inner, owner)?;
     if voice.run.load(Ordering::SeqCst) != run {
@@ -650,7 +650,7 @@ pub async fn voice_set_keys(
     body: serde_json::Value,
 ) -> Result<ControlReply, String> {
     // Wipe the body's exporter keys on every exit, including refusals.
-    let mut body = vc_client::voice::sframe::ScrubOnDrop(body);
+    let mut body = gwar_client::voice::sframe::ScrubOnDrop(body);
     check_main_window(window.label())?;
     match run_keys(&voice, owner, run)? {
         Some(keys) => Ok(keys.control(std::mem::take(&mut body.0)).await),
@@ -711,7 +711,7 @@ async fn monitor(app: AppHandle, owner: u64, run: u64) {
     let mut tick = tokio::time::interval(Duration::from_millis(50));
     let mut last_link = None;
     let mut ticks = 0u32;
-    let log_stats = std::env::var("VC_VOICE_STATS").is_ok();
+    let log_stats = std::env::var("GWAR_VOICE_STATS").is_ok();
     loop {
         tick.tick().await;
         ticks += 1;
@@ -907,7 +907,7 @@ pub async fn audio_devices(window: WebviewWindow) -> Result<Devices, String> {
     check_main_window(window.label())?;
     // Enumeration talks to the OS audio stack and can block for a moment.
     let (inputs, outputs) =
-        tokio::task::spawn_blocking(vc_client::voice::io::devices).await.map_err(|e| e.to_string())?;
+        tokio::task::spawn_blocking(gwar_client::voice::io::devices).await.map_err(|e| e.to_string())?;
     Ok(Devices { inputs: dedupe(inputs), outputs: dedupe(outputs) })
 }
 
@@ -950,7 +950,7 @@ pub async fn mic_test_start(
         })
         .await?;
     thread::Builder::new()
-        .name("vc-mic-test".into())
+        .name("gwar-mic-test".into())
         .spawn(move || {
             let AudioPorts { mut mic, speaker: _speaker, _guard, .. } = ports;
             let mut acc = (0f32, 0usize);

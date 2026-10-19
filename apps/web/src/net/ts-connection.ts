@@ -1,9 +1,9 @@
 import { error as validError, responseFor } from "./schema";
 /**
  * A session on a TeamSpeak 3/6 server (desktop app only). The native client
- * presents the TS server through `vc/1` shapes (see `vc_client::teamspeak`), so
+ * presents the TS server through `gwar/1` shapes (see `gwar_client::teamspeak`), so
  * this class is the Tauri-bridge twin of `Connection`: same `Link` surface,
- * same Welcome / events / requests, no WebSocket and no vc handshake.
+ * same Welcome / events / requests, no WebSocket and no Gwar handshake.
  */
 import type { Event } from "../proto/Event";
 import type { ErrorCode } from "../proto/ErrorCode";

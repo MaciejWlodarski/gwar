@@ -1,14 +1,14 @@
 #!/usr/bin/env node
 /**
  * Encrypted voice with the native engine (docs/e2e-build.md "Tests and
- * acceptance", 5d): a real local vc-server, the built app and its real MLS
+ * acceptance", 5d): a real local gwar-server, the built app and its real MLS
  * controller, and desktop devices whose `NativeVoiceEngine` drives the Rust
  * engine in `native_bridge` (the desktop shell's command contract, virtual
  * 10 ms devices) instead of Tauri. One browser device uses WebRTC + SFrame
  * workers. Tones are checked at the browser's WebAudio output and at each
  * native speaker.
  *
- * Build once: cargo build -p vc-server && cargo build -p vc-client --example native_bridge
+ * Build once: cargo build -p gwar-server && cargo build -p gwar-client --example native_bridge
  *   E2E_BROWSERS=chromium,webkit   engine of every page (default: chromium)
  */
 import { stopProcesses } from "./processes.mjs";
@@ -306,7 +306,7 @@ try {
   const viteCli = path.join(path.dirname(fileURLToPath(import.meta.resolve("vite/package.json"))), "bin/vite.js");
   start(process.execPath, [viteCli, "preview", "--outDir", path.join(dataDir, "dist"), "--host", "127.0.0.1", "--port", String(webPort), "--strictPort"], { cwd: webRoot });
   await waitFor(async () => { try { return (await fetch(web)).ok; } catch { return false; } }, "web preview", 30_000);
-  const binary = process.env.VC_SERVER_BIN ?? path.join(repoRoot, "target/debug/vc-server");
+  const binary = process.env.GWAR_SERVER_BIN ?? path.join(repoRoot, "target/debug/gwar-server");
   for (const engine of engines) {
     const serverPort = await port();
     const ws = `ws://127.0.0.1:${serverPort}/ws`;

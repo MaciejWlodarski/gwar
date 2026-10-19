@@ -18,7 +18,7 @@ unchanged.
     empty);
   - the 128-counter replay window;
   - a port of the RFC 6716 framing validator.
-- **Shared vectors.** `crates/vc-client/tests/sframe-vectors.json` holds the
+- **Shared vectors.** `crates/gwar-client/tests/sframe-vectors.json` holds the
   RFC's 289 header vectors and the suite 0x0004 vector with non-empty
   metadata, for the browser now and the Rust implementation in 5d.
 - **Engine key state.** `apps/web/src/voice/sframe/state.ts` implements the

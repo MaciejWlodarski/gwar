@@ -24,26 +24,26 @@ Plaintext voice retains the existing Opus format and packetization.
   Voice has no chat exporter, epoch archive, history import/share, key
   packages, Welcome, or incarnation-chain acceptance. Key IDs keep full
   epochs internally and use the low 32 epoch bits only for the SFrame ID.
-- `crates/vc-server/src/core/voice.rs`: volatile per-channel calls, independent
+- `crates/gwar-server/src/core/voice.rs`: volatile per-channel calls, independent
   random 16-byte call/participation tokens, exact parent admission, first-wins
   group creation, authenticated leaf mappings, copy/validate/swap commits,
   removals and proposal reissue, log/tree access, epoch acknowledgements,
   bound negotiation, limits and expiry deadlines.
-- `crates/vc-server/src/core/mod.rs`: every entry, including bridge Join/Update
+- `crates/gwar-server/src/core/mod.rs`: every entry, including bridge Join/Update
   and forced moves, uses the same allocation path. Same-channel entries are
   idempotent; the last exit destroys the call. Authenticated same-device
   takeover removes the predecessor with `Replaced` only after admission;
   capacity counts it once. Common exits invalidate participation, routing,
   talking and acknowledgements. Parent restart, deletion, revocation and
   certificate expiry reconcile call state. Process restart restores no calls.
-- `crates/vc-server/src/core/mls.rs`: dispatches bound voice MLS operations to
+- `crates/gwar-server/src/core/mls.rs`: dispatches bound voice MLS operations to
   volatile state, excludes voice from durable group discovery/history/chat,
   and applies participant authorization to the existing tree endpoint/cache.
-- `crates/vc-server/src/media/webrtc.rs`: bound offers, answers, slots and
+- `crates/gwar-server/src/media/webrtc.rs`: bound offers, answers, slots and
   callbacks; retired peers cannot route after a move/run replacement.
   Encrypted ingress is rejected before Opus inspection. No opaque-packet or
   timestamp-forwarding implementation from 5b is included.
-- `crates/vc-proto/src/{lib,mls,voice}.rs`, generated `apps/web/src/proto/*`,
+- `crates/gwar-proto/src/{lib,mls,voice}.rs`, generated `apps/web/src/proto/*`,
   `apps/web/src/net/{protocol,schema}.ts`: `voice.state`, voice MLS bindings,
   bound offers/answers, ack/repeat/request, closed reasons, roster bindings,
   source-bound talking and recipient-bound slots. Epoch/run parsing rejects
@@ -52,7 +52,7 @@ Plaintext voice retains the existing Opus format and packetization.
 - `apps/web/src/{state,voice}` and i18n: explicit plaintext starts, run and
   participation fencing, stale event rejection, restart after a confirmed
   move, and refusal of an unconfirmed call/participation replacement.
-- `crates/vc-client` and `apps/desktop/src-tauri`: bound plaintext negotiation,
+- `crates/gwar-client` and `apps/desktop/src-tauri`: bound plaintext negotiation,
   direct-TeamSpeak adapter events, checked native starts and serialized
   run claim/retirement. Old stop/answer commands cannot stop the current run.
 - `vendor/openmls`, `Cargo.toml`, `Cargo.lock`: pinned 0.9.1 with one source
@@ -159,12 +159,12 @@ source contents before the implementation commit. Dependency fix commit:
 | `cargo fmt --all --check` | Pass |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Pass |
 | `cargo test --workspace` | Pass: 611 tests, 7 ignored, 0 failures |
-| `cargo test -p vc-proto --features ts` | Pass: 90 tests; generated types refreshed |
+| `cargo test -p gwar-proto --features ts` | Pass: 90 tests; generated types refreshed |
 | `pnpm --filter web test` | Pass: 70 files, 864 tests |
 | `pnpm --filter web typecheck` | Pass |
-| `cargo build -p vc-server --no-default-features` | Pass |
+| `cargo build -p gwar-server --no-default-features` | Pass |
 | `cargo build -p gwar-connect` | Pass; local smoke fixture |
-| `cargo build -p vc-client --example web_audio` | Pass |
+| `cargo build -p gwar-client --example web_audio` | Pass |
 | `bash scripts/mls-wasm/build.sh` (environment below) | Pass: 480081 / 500000 aggregate gzip bytes |
 | `PATH=/private/tmp/node-v22.23.3-darwin-arm64/bin:$PATH pnpm --filter web e2e` | Pass: 65/65 Chromium smoke checks |
 | `PATH=/private/tmp/node-v22.23.3-darwin-arm64/bin:$PATH pnpm --filter web e2e:mls` | Pass: all 9 printed MLS/channel/restart/lease checkpoints |
@@ -200,8 +200,8 @@ corresponding wire fields.
 The seven ignored workspace tests are the existing 350-device MLS stress
 test, the privileged macOS real-time scheduling test, and five official
 TeamSpeak tests. The official-server command
-`cargo test -p vc-server --test teamspeak_channels -- --ignored --test-threads=1`
-was deliberately not run: it needs `VC_TS3_DIR` and belongs to CI. No real
+`cargo test -p gwar-server --test teamspeak_channels -- --ignored --test-threads=1`
+was deliberately not run: it needs `GWAR_TS3_DIR` and belongs to CI. No real
 TeamSpeak server, production endpoint, Oracle VM, push or PR was used.
 The smoke suite now blocks non-loopback browser requests; the MLS and audio
 suites already did so. Generated smoke screenshots were restored after the

@@ -35,7 +35,7 @@ async function row(text = "hello", original?: Plaintext, attachments: Attachment
 beforeEach(() => {
   active = true; opened = undefined; drafts = []; status = "ready"; epoch = 0;
   request.mockReset(); notify.mockReset();
-  useSession.setState({ ...initialState, me: { uid: a, session: 1 }, focused: false, kind: "vc" });
+  useSession.setState({ ...initialState, me: { uid: a, session: 1 }, focused: false, kind: "gwar" });
   runtime = { status: () => status, subscribe: () => () => {}, openConversation: vi.fn(async () => {}), sync: vi.fn(async () => { epoch++; }),
     sealMessage: vi.fn(async (_conversation, build) => {
       const plain = await build({ server_key: server, conversation, group_id: group, epoch: String(epoch) });
@@ -140,7 +140,7 @@ describe("encrypted attachments", () => {
     // (An id alone is not signed: the files must differ in what is.)
     const original = await sent(++id), swapped = await row("swapped", original, [{ ...file("f2"), sha256: b64(32, 5) }]), plain = opened;
     await dm.receive({ ...swapped, id }, true);
-    useSession.setState({ ...initialState, me: { uid: a, session: 1 }, focused: false, kind: "vc" });
+    useSession.setState({ ...initialState, me: { uid: a, session: 1 }, focused: false, kind: "gwar" });
     dm = new SealedConversations(runtime, { serverKey: server, request } as unknown as Link, alice, a, () => active, notify, () => {});
     opened = plain;
     await dm.receive({ ...swapped, id: 99 }, true);

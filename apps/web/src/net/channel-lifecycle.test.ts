@@ -55,12 +55,12 @@ describe("channel lifecycle", () => {
       `{"known":[1],"deleted":[],"incomplete":false,"extra":1}`,
       JSON.stringify({ known: Array.from({ length: MAX_IDS + 1 }, (_, i) => i), deleted: [], incomplete: false })];
     for (const raw of malformed) {
-      store.m.set("vc.channels:A", raw);
+      store.m.set("gwar.channels:A", raw);
       expect([raw.slice(0, 60), channelLifecycle(store).check("A", 1)]).toEqual([raw.slice(0, 60), "unknown"]);
     }
-    store.m.set("vc.channels:A", `{"known":[1],"deleted":[2],"incomplete":false}`);
+    store.m.set("gwar.channels:A", `{"known":[1],"deleted":[2],"incomplete":false}`);
     expect([1, 2].map((id) => channelLifecycle(store).check("A", id))).toEqual(["ok", "reused"]);
-    store.m.delete("vc.channels:A");
+    store.m.delete("gwar.channels:A");
     expect(channelLifecycle(store).check("A", 1)).toBe("ok");
   });
   it("never drops an unsaved record from memory, however many servers pass through (Astra r4 probe, inverted)", () => {
