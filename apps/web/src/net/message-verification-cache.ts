@@ -1,5 +1,5 @@
 import type { ChatMessage } from "../proto/ChatMessage";
-import { messageStorage, refreshRevocations, MAX_CHECKPOINTS, type MessageStorage, type RevocationState } from "./message-storage";
+import { confirmedBefore, messageStorage, refreshRevocations, MAX_CHECKPOINTS, type MessageStorage, type RevocationState } from "./message-storage";
 import { messageFingerprint, MessageVerifier, invalidVerification, type MessageContext, type MessageVerification } from "./message-signature";
 
 /** View-local cache: immutable message/context fingerprints also share in-flight verification. */
@@ -34,7 +34,7 @@ export class MessageVerificationCache {
         if (signature.signed_at >= revocation.revokedAt) { entry.state = Promise.resolve(invalidVerification()); return; }
         state.authorization.push("device-revoked");
       }
-      if (!revocation?.fresh) state.authorization.push("revocations-stale");
+      if (!revocation?.fresh && !confirmedBefore(old.order, revocation)) state.authorization.push("revocations-stale");
       if (certificate.expires_at <= now) state.authorization.push("certificate-expired");
       entry.state = Promise.resolve(state);
     });

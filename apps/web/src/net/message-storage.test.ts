@@ -77,6 +77,37 @@ describe("atomic bounded message storage", () => {
 });
 
 describe("per-record storage work", () => {
+  it("reports a blocked upgrade as unavailable storage and opens once the older tab lets go", async () => {
+    const name = crypto.randomUUID();
+    const old = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open(name, 2);
+      request.onupgradeneeded = () => {
+        request.result.createObjectStore("checkpoints").createIndex("at", "at");
+        request.result.createObjectStore("revocations");
+        request.result.createObjectStore("feeds");
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    // An older tab that ignores the version change keeps its connection open.
+    const store = new MessageStorage(name);
+    await expect(store.cursor()).rejects.toThrow("being upgraded in another tab");
+    old.close();
+    expect(await store.cursor()).toBe(0);
+  });
+  it("closes its connection so a newer version of the app can upgrade the database", async () => {
+    const name = crypto.randomUUID(), store = new MessageStorage(name);
+    await store.mergeFeed([], "https://connect.example", 1);
+    const newer = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open(name, 4);
+      request.onblocked = () => reject(new Error("blocked"));
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    newer.close();
+    // This (older) code then reports its storage unavailable instead of using a database it cannot read.
+    await expect(store.cursor("https://connect.example")).rejects.toThrow();
+  });
   it("writes only the affected checkpoint, with no write on an exact duplicate", async () => {
     const store = new MessageStorage(crypto.randomUUID());
     await store.cursor(); // Open the database before counting application transactions.
@@ -88,7 +119,7 @@ describe("per-record storage work", () => {
       expect(puts).toHaveBeenCalledOnce();
       expect(puts.mock.calls[0]?.[1]).toBe("server:author:message");
       expect(transactions).toHaveBeenCalledTimes(2);
-      expect(transactions.mock.calls.every(([stores, mode]) => JSON.stringify(stores) === '["checkpoints"]' && mode === "readwrite")).toBe(true);
+      expect(transactions.mock.calls.every(([stores, mode]) => JSON.stringify(stores) === '["checkpoints","order"]' && mode === "readwrite")).toBe(true);
     } finally { puts.mockRestore(); transactions.mockRestore(); }
   });
   it("reads thread authorization in one transaction and aborts an extra feed at the eight-service bound", async () => {

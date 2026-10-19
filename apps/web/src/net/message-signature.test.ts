@@ -20,9 +20,9 @@ const verificationLabel = (v: Parameters<typeof verificationExplanation>[0]) => 
 vi.mock("./message-storage", async (original) => ({ ...await original<object>(), refreshRevocations: vi.fn().mockResolvedValue(undefined) }));
 const now = 1_700_000_000_000;
 const storage = () => new MessageStorage(`test-${crypto.randomUUID()}`);
-async function fixture(device = false) {
+async function fixture(device = false, lifetime = 1000) {
   const account = await keyFromSeed(new Uint8Array(32).fill(1)), pair = await keyFromSeed(new Uint8Array(32).fill(device ? 2 : 3));
-  const cert = device ? { ...await certifyDevice(account, pair.publicKey, now - 1000, now + 1000), account_key: account.publicKey } : undefined;
+  const cert = device ? { ...await certifyDevice(account, pair.publicKey, now - 1000, now + lifetime), account_key: account.publicKey } : undefined;
   const identity = { ...pair, nickname: "Alice", exportBackup: () => ({ format: "vc-identity", version: 1, jwk: pair.jwk }), ...(cert ? { device: cert } : {}), sign: (bytes: Uint8Array) => signText(pair.jwk, new TextDecoder().decode(bytes)) } as Identity;
   const uid = await uidForPublicKey(device ? account.publicKey : pair.publicKey);
   const ctx = { serverKey: vectors[0]!.signature.server_key, target: "channel:7" };
@@ -239,6 +239,81 @@ describe("message view verification cache", () => {
     expect((await cache.verify(f.msg, f.ctx)).status).toBe("invalid");
     expect(checkpoint).toHaveBeenCalledTimes(1);
     expect(reads).toHaveBeenCalledTimes(3);
+  });
+  it("keeps a stored message confirmed by the complete feed read after it while the feed is stale; what arrived since stays unconfirmed", async () => {
+    const f = await fixture(true, 3_600_000), edited = await editMessage(f, "after the read"), store = storage(), clock = vi.spyOn(Date, "now");
+    const stale = now + REVOCATION_FRESH_MS + 1;
+    clock.mockReturnValue(now);
+    expect((await new MessageVerificationCache(store).verify(f.msg, f.ctx)).authorization).toEqual(["revocations-stale"]);
+    await store.mergeFeed([], CONNECT_URL, now);
+    clock.mockReturnValue(stale);
+    // Reopened later (a new view or a reload), the message keeps the read that followed it...
+    const cache = new MessageVerificationCache(store);
+    expect(fullyVerified(await cache.verify(f.msg, f.ctx))).toBe(true);
+    await cache.refresh(stale);
+    expect(fullyVerified(await cache.verify(f.msg, f.ctx))).toBe(true);
+    // ...while its edit, first stored after that read, is unconfirmed, also after a refresh.
+    expect((await cache.verify(edited, f.ctx)).authorization).toEqual(["revocations-stale"]);
+    await cache.refresh(stale);
+    expect((await cache.verify(edited, f.ctx)).authorization).toEqual(["revocations-stale"]);
+    clock.mockRestore();
+  });
+  it("orders by storage, not by the clock: a revision stored after the read under a clock set back stays unconfirmed", async () => {
+    const f = await fixture(true, 3_600_000), store = storage(), clock = vi.spyOn(Date, "now");
+    clock.mockReturnValue(now);
+    await store.mergeFeed([], CONNECT_URL, now);
+    clock.mockReturnValue(now - 3_600_000);
+    await new MessageVerificationCache(store).verify(f.msg, f.ctx);
+    // The clock is right again and the feed has gone stale.
+    clock.mockReturnValue(now + REVOCATION_FRESH_MS + 1);
+    const cache = new MessageVerificationCache(store);
+    expect((await cache.verify(f.msg, f.ctx)).authorization).toEqual(["revocations-stale"]);
+    await cache.refresh(now + REVOCATION_FRESH_MS + 1);
+    expect((await cache.verify(f.msg, f.ctx)).authorization).toEqual(["revocations-stale"]);
+    clock.mockRestore();
+  });
+  it("lets a later revocation still mark a confirmed message", async () => {
+    const f = await fixture(true, 3_600_000), store = storage(), clock = vi.spyOn(Date, "now");
+    clock.mockReturnValue(now);
+    const cache = new MessageVerificationCache(store);
+    await cache.verify(f.msg, f.ctx);
+    await store.mergeFeed([], CONNECT_URL, now);
+    const c = f.msg.signature!.certificate!, at = now + 2000;
+    // An unfinished read brings a revocation of the device (signed after the message).
+    await store.mergeFeed([{ seq: 1, account_key: c.account_key, device_key: c.device_key, revoked_at: at,
+      signature: await signText(f.account.jwk, revokeStatement(c.account_key, c.device_key, at)) }], CONNECT_URL, now + 3000, false);
+    await cache.refresh(now + 3000);
+    const result = await cache.verify(f.msg, f.ctx);
+    expect(result.authorization).toContain("device-revoked");
+    expect(fullyVerified(result)).toBe(false);
+    clock.mockRestore();
+  });
+  it("counts revisions stored before the order existed (database version 2) as stored before every ordered read", async () => {
+    const f = await fixture(true, 3_600_000), name = `test-${crypto.randomUUID()}`, s = f.msg.signature!;
+    const old = { revision: 0, hash: await revisionHash(s), created: s.created_at, conversation: s.conversation, at: now, proven: true, files: await messageBodyHash("", [], []) };
+    await new Promise<void>((resolve, reject) => {
+      const request = indexedDB.open(name, 2);
+      request.onupgradeneeded = () => {
+        request.result.createObjectStore("checkpoints").createIndex("at", "at");
+        request.result.createObjectStore("revocations");
+        request.result.createObjectStore("feeds");
+      };
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        const db = request.result, tx = db.transaction(["checkpoints"], "readwrite");
+        tx.objectStore("checkpoints").put(old, `${f.ctx.serverKey}:${s.author_uid}:${s.message_id}`);
+        tx.oncomplete = () => { db.close(); resolve(); };
+        tx.onerror = () => reject(tx.error);
+      };
+    });
+    const store = new MessageStorage(name), clock = vi.spyOn(Date, "now");
+    clock.mockReturnValue(now);
+    await store.mergeFeed([], CONNECT_URL, now);
+    clock.mockReturnValue(now + REVOCATION_FRESH_MS + 1);
+    const v = await new MessageVerificationCache(store).verify(f.msg, f.ctx);
+    expect(v.duplicate).toBe(true);
+    expect(fullyVerified(v)).toBe(true);
+    clock.mockRestore();
   });
   it("qualifies cached messages if authorization storage becomes unavailable", async () => {
     const f = await fixture(true), store = storage(), cache = new MessageVerificationCache(store);

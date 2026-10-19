@@ -359,7 +359,8 @@ HTTPS/no-redirect transport and persist signed account/device pairs permanently,
 with their cursor. Feed omission cannot undo a revocation already seen. Capacity
 limits fail closed. A revoked or expired device can fabricate an earlier signing
 time: historical signatures explicitly show that uncertainty. Stale/unavailable
-revocation data is also shown. Handles, signatures, historical authorization and
+revocation data is also shown, for what the device first stored after its last
+complete read of the feed (see [architecture.md](architecture.md)). Handles, signatures, historical authorization and
 connection security remain separate; signed chat does not authenticate voice.
 
 Unverified or unsigned attachments load only through an explicit user action.

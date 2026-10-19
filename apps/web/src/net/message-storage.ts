@@ -10,9 +10,22 @@ export const MAX_REVOCATIONS = 20_000;
 export const REVOCATION_FRESH_MS = 5 * 60_000;
 export interface Revocation { seq: number; account_key: string; device_key: string; revoked_at: number; signature: string }
 /** `files` fingerprints the signed attachments the message was first seen with; only its deletion may list others. */
-interface Checkpoint { revision: number; hash: string; created: number; conversation: string; at: number; proven?: boolean; deleted?: boolean; files?: string }
-interface Feed { cursor: number; checked: number; available?: boolean }
-export interface RevocationState { revokedAt?: number; fresh: boolean }
+/** `order` (see `confirmedBefore`) is missing on revisions stored before it existed: those came before every ordered read. */
+interface Checkpoint { revision: number; hash: string; created: number; conversation: string; at: number; proven?: boolean; deleted?: boolean; files?: string; order?: number }
+/** `read`: the order of the last read to the feed's end. */
+interface Feed { cursor: number; checked: number; available?: boolean; read?: number }
+export interface RevocationState { revokedAt?: number; fresh: boolean; read?: number }
+/**
+ * Whether this device stored a message revision (`order`) before its last complete read of the
+ * revocation feed, which then found the signing device not revoked: content confirmed then keeps
+ * that confirmation while the feed is stale, and only what arrived since is unconfirmed. A later
+ * revocation still marks it. Stored revisions and complete reads share one persistent counter, so
+ * no clock decides what came first.
+ */
+export function confirmedBefore(order: number | undefined, r: RevocationState | undefined): boolean {
+  return order !== undefined && r?.read !== undefined && r.revokedAt === undefined && order < r.read;
+}
+const ORDER = "order";
 const pair = (account: string, device: string) => `${account}:${device}`;
 const requestValue = <T>(request: IDBRequest<T>): Promise<T> => new Promise((resolve, reject) => {
   request.onsuccess = () => resolve(request.result);
@@ -33,16 +46,38 @@ export class MessageStorage {
   }
   constructor(private name = "gwar-message-auth-v3") {}
   private open(): Promise<IDBDatabase> {
-    return this.db ??= new Promise((resolve, reject) => {
-      const request = indexedDB.open(this.name, 2);
+    if (this.db) return this.db;
+    const opening: Promise<IDBDatabase> = new Promise((resolve, reject) => {
+      let abandoned = false;
+      const request = indexedDB.open(this.name, 3);
+      // A tab still holding an older version blocks the upgrade: storage is unavailable until it
+      // closes (the next operation tries again), instead of waiting forever.
+      request.onblocked = () => {
+        abandoned = true;
+        reject(new Error("Message storage is being upgraded in another tab"));
+      };
       request.onupgradeneeded = () => {
-        request.result.createObjectStore("checkpoints").createIndex("at", "at");
-        request.result.createObjectStore("revocations");
-        request.result.createObjectStore("feeds");
+        const db = request.result, missing = (name: string) => !db.objectStoreNames.contains(name);
+        if (missing("checkpoints")) db.createObjectStore("checkpoints").createIndex("at", "at");
+        if (missing("revocations")) db.createObjectStore("revocations");
+        if (missing("feeds")) db.createObjectStore("feeds");
+        // One counter ordering stored revisions and complete feed reads (version 3).
+        if (missing(ORDER)) db.createObjectStore(ORDER);
       };
       request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve(request.result);
+      request.onsuccess = () => {
+        const db = request.result;
+        if (abandoned) return db.close();
+        // Let a newer version of the app upgrade the database; the next operation reopens it.
+        db.onversionchange = () => {
+          db.close();
+          if (this.db === opening) this.db = undefined;
+        };
+        resolve(db);
+      };
     });
+    opening.catch(() => { if (this.db === opening) this.db = undefined; });
+    return this.db = opening;
   }
   private async transaction<T>(stores: string[], mode: IDBTransactionMode, change: (tx: IDBTransaction) => Promise<T>): Promise<T> {
     const db = await this.open();
@@ -57,8 +92,9 @@ export class MessageStorage {
       });
     });
   }
-  async checkpoint(key: string, next: Checkpoint, predecessor: string): Promise<{ continuity: "proven" | "unproven" | "rollback" | "fork"; duplicate: boolean }> {
-    return this.transaction(["checkpoints"], "readwrite", async (tx) => {
+  /** `order`: when, among complete feed reads, this device stored the revision it returns as proven or unproven. */
+  async checkpoint(key: string, next: Omit<Checkpoint, "order">, predecessor: string): Promise<{ continuity: "proven" | "unproven" | "rollback" | "fork"; duplicate: boolean; order?: number }> {
+    return this.transaction(["checkpoints", ORDER], "readwrite", async (tx) => {
       const store = tx.objectStore("checkpoints");
       const old: Checkpoint | undefined = await requestValue(store.get(key));
       if (old) {
@@ -66,11 +102,14 @@ export class MessageStorage {
         if (next.revision < old.revision) return { continuity: "rollback", duplicate: false };
         if (next.created !== old.created || next.conversation !== old.conversation) return { continuity: "fork", duplicate: false };
         if (!next.deleted && old.files !== undefined && next.files !== old.files) return { continuity: "fork", duplicate: false };
-        if (next.revision === old.revision) return { continuity: next.hash === old.hash ? (old.proven ? "proven" : "unproven") : "fork", duplicate: next.hash === old.hash };
+        if (next.revision === old.revision) {
+          return next.hash === old.hash ? { continuity: old.proven ? "proven" : "unproven", duplicate: true, order: old.order ?? 0 } : { continuity: "fork", duplicate: false };
+        }
         if (next.revision === old.revision + 1 && predecessor !== old.hash) return { continuity: "fork", duplicate: false };
       }
       const proven = next.revision === 0 || (!!old && !!old.proven && next.revision === old.revision + 1 && predecessor === old.hash);
-      store.put({ ...next, proven }, key);
+      const order = await requestValue<number | undefined>(tx.objectStore(ORDER).get(ORDER)) ?? 0;
+      store.put({ ...next, proven, order }, key);
       if (!old) {
         const count = await requestValue(store.count());
         if (count > MAX_CHECKPOINTS) {
@@ -85,7 +124,7 @@ export class MessageStorage {
           });
         }
       }
-      return { continuity: proven ? "proven" : "unproven", duplicate: false };
+      return { continuity: proven ? "proven" : "unproven", duplicate: false, order };
     });
   }
   /** One read transaction for all authorization notes in a visible thread. */
@@ -99,7 +138,7 @@ export class MessageStorage {
       const keys = [...new Set(pairs.map((p) => pair(p.account, p.device)))];
       const states = await Promise.all(keys.map(async (key) => {
         const entry: Revocation | undefined = await requestValue(tx.objectStore("revocations").get(key));
-        return [key, { revokedAt: entry?.revoked_at, fresh }] as const;
+        return [key, { revokedAt: entry?.revoked_at, fresh, read: feed?.read }] as const;
       }));
       return new Map(states);
     });
@@ -124,7 +163,7 @@ export class MessageStorage {
           || !strictVerify(e.account_key, revokeStatement(e.account_key, e.device_key, e.revoked_at), e.signature)) throw new Error("Invalid revocation feed");
       previous = e.seq;
     }
-    await this.transaction(["revocations", "feeds"], "readwrite", async (tx) => {
+    await this.transaction(["revocations", "feeds", ORDER], "readwrite", async (tx) => {
       const feeds = tx.objectStore("feeds"), revocations = tx.objectStore("revocations");
       const oldFeed: Feed | undefined = await requestValue(feeds.get(base));
       if (!oldFeed && await requestValue(feeds.count()) >= 8) throw new Error("Revocation service storage full");
@@ -138,7 +177,13 @@ export class MessageStorage {
       }
       if (await requestValue(revocations.count()) > MAX_REVOCATIONS) throw new Error("Revocation storage full");
       feed.available = complete;
-      if (complete) feed.checked = now;
+      if (complete) {
+        feed.checked = now;
+        // Revisions stored from now on come after this read.
+        const order = (await requestValue<number | undefined>(tx.objectStore(ORDER).get(ORDER)) ?? 0) + 1;
+        tx.objectStore(ORDER).put(order, ORDER);
+        feed.read = order;
+      }
       feeds.put(feed, base);
     });
     await this.loadRevocations();

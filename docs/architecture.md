@@ -381,7 +381,12 @@ mark it unavailable. Feed sequence numbers cannot prove completeness.
 `signed_at >= revoked_at` fails. Earlier signatures show **signing device
 revoked; signing time unproven**. A certificate valid at signing time but expired
 now shows **certificate expired; signing time unproven**. Stale/unavailable
-feeds and unavailable checkpoint storage are explicit states.
+feeds and unavailable checkpoint storage are explicit states. A stale feed
+qualifies only what this device first stored after its last complete feed
+read: a revision stored before that read was confirmed by it (its device was
+not revoked then) and keeps that confirmation, also across reloads, until a
+later revocation marks it. Stored revisions and complete reads share one
+persistent counter, so no clock decides which came first.
 
 Stored chat author names remain send-time snapshots. History and message reads
 use the member's current name while their record exists, then fall back to the
