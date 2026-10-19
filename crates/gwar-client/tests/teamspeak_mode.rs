@@ -24,7 +24,9 @@ use tokio::time::timeout;
 
 async fn until(events: &mut tokio::sync::mpsc::Receiver<Event>, pred: impl Fn(&Event) -> bool) -> Event {
     let mut seen = Vec::new();
-    let found = timeout(Duration::from_secs(15), async {
+    // A puppet whose first connection meets the TeamSpeak server just started by the bridge tries
+    // again after 10 s (bridge.rs, `retry_at`), so 15 s was too tight for its arrival.
+    let found = timeout(Duration::from_secs(30), async {
         loop {
             let event = events.recv().await.expect("events ended");
             if pred(&event) {

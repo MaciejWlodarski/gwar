@@ -212,6 +212,19 @@ function makePng(width, height, [r, g, b]) {
 const ROLE = `Mods-${rid}`;
 const ROLE_RGB = "rgb(231, 76, 60)"; // #e74c3c, the first colour preset
 
+/**
+ * Presses Escape until no dialog or menu is open on `page`: one Escape may only close something inside a
+ * dialog (a menu, a field's own popup), and a dialog left open covers what the next step clicks.
+ */
+async function closeOverlays(page) {
+  const open = page.locator('[role="dialog"], [role="menu"], [role="alertdialog"]');
+  for (let i = 0; i < 6 && (await open.count()) > 0; i++) {
+    await page.keyboard.press("Escape");
+    await sleep(150);
+  }
+  await open.first().waitFor({ state: "detached", timeout: 5000 });
+}
+
 async function check(name, fn) {
   try {
     await fn();
@@ -222,6 +235,8 @@ async function check(name, fn) {
     console.log(`  FAIL ${name}\n${e.stack ?? e}`);
     for (const [i, p] of debugPages.entries()) {
       await p.screenshot({ path: path.join(shots, `fail-${results.length}-${i}.png`) }).catch(() => {});
+      // What failed may have left a dialog open; the next check starts without it.
+      await closeOverlays(p).catch(() => {});
     }
   }
 }
@@ -992,7 +1007,7 @@ async function main() {
     await a.getByLabel("Role name").fill(CREW);
     await a.getByRole("button", { name: "Create", exact: true }).click();
     await a.getByRole("button", { name: CREW }).waitFor();
-    await a.keyboard.press("Escape");
+    await closeOverlays(a);
     await a.getByRole("button", { name: "Server menu" }).click();
     await a.getByRole("menuitem", { name: "Create channel" }).click();
     await a.getByLabel("Name").fill(PRIVATE);
@@ -1008,8 +1023,7 @@ async function main() {
       await a.getByRole("button", { name: "Change roles of Bob" }).click();
       await a.getByRole("menuitemcheckbox", { name: CREW }).click();
       await a.getByRole("menuitemcheckbox", { name: CREW, checked: on }).waitFor();
-      await a.keyboard.press("Escape");
-      await a.keyboard.press("Escape");
+      await closeOverlays(a);
     };
     await setCrew(true);
     await treeItem(b, PRIVATE).waitFor();
