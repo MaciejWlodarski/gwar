@@ -26,6 +26,11 @@ lto = "thin"
 [profile.dev.package.audiopus_sys]
 opt-level = 3
 
+# Dependencies (crypto, MLS, codecs) optimized in debug builds and tests; our own crates stay
+# unoptimized for debugging. Debug assertions and overflow checks stay on everywhere.
+[profile.dev.package."*"]
+opt-level = 2
+
 [profile.wasm-release]
 inherits = "release"
 opt-level = "z"
