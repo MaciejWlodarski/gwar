@@ -818,3 +818,177 @@ async fn queued_listener_reconnect(query: &Query, port: u16, password: &str, cid
     assert!(listeners.accepts(&fresh));
     assert_eq!(fresh.text, "queued listener fresh");
 }
+
+/// A TeamSpeak client of the bridged server, ready once it has the server's state.
+async fn teamspeak_user(voice: std::net::SocketAddr, name: &str) -> (tsclientlib::Connection, u16, u64) {
+    let mut con = tsclientlib::Connection::build(voice.to_string()).name(name.to_string()).connect().unwrap();
+    // Until the server's state includes this client itself.
+    within("TeamSpeak client", async {
+        loop {
+            con.events().next().await.expect("TeamSpeak events").unwrap();
+            if let Ok(state) = con.get_state()
+                && state.clients.contains_key(&state.own_client)
+            {
+                break;
+            }
+        }
+    })
+    .await;
+    let state = con.get_state().unwrap();
+    let clid = state.own_client.0;
+    let cid = state.clients[&state.own_client].channel.0;
+    (con, clid, cid)
+}
+
+/// Waits until ServerQuery reports `clid` as a talker or not.
+async fn wait_for_talker(query: &Query, clid: u16, talker: bool) {
+    let want = if talker { "1" } else { "0" };
+    within("talker flag", async {
+        loop {
+            let info = query.call(Cmd::new("clientinfo").arg("clid", clid)).await.unwrap();
+            if info.first().and_then(|r| r.get("client_is_talker")).map(String::as_str) == Some(want) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+}
+
+/// `from` talks with `marker` until `to` hears it.
+async fn heard(from: &Probe, to: &Probe, marker: u8) {
+    let mut sequence = 0;
+    probe_support::control(
+        |seq| {
+            let tx = from.tx.clone();
+            async move { tx.send(ProbeCmd::Voice(vec![0xf8, marker, seq as u8])).await.unwrap() }
+        },
+        || to.audio_counts.bytes(marker) > 0,
+        &mut sequence,
+    )
+    .await;
+}
+
+/// `from` whispers `to` (its clid) with `marker` until `to` hears it.
+async fn whispered(from: &Probe, to: &Probe, to_clid: u16, marker: u8) {
+    let mut sequence = 0;
+    probe_support::control(
+        |seq| {
+            let tx = from.tx.clone();
+            async move { tx.send(ProbeCmd::Whisper(to_clid, vec![0xf8, marker, seq as u8])).await.unwrap() }
+        },
+        || to.audio_counts.bytes(marker) > 0,
+        &mut sequence,
+    )
+    .await;
+}
+
+/// `from` whispers `to` for a while; `to` must hear none of it.
+async fn unwhispered(from: &Probe, to: &mut Probe, to_clid: u16, marker: u8) {
+    for seq in 0..50u8 {
+        from.tx.send(ProbeCmd::Whisper(to_clid, vec![0xf8, marker, seq])).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    from.barrier().await;
+    assert_eq!(to.forbidden_bytes(marker).await, 0, "a TeamSpeak user who may not speak was heard whispering");
+}
+
+/// `from` talks with `marker` for a while; `to` must hear none of it.
+async fn unheard(from: &Probe, to: &mut Probe, marker: u8) {
+    for seq in 0..50u8 {
+        from.tx.send(ProbeCmd::Voice(vec![0xf8, marker, seq])).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    from.barrier().await;
+    assert_eq!(to.forbidden_bytes(marker).await, 0, "a TeamSpeak user who may not speak was heard");
+}
+
+#[tokio::test]
+#[ignore]
+async fn on_teamspeak_only_those_who_may_speak_talk() {
+    let root = PathBuf::from(std::env::var_os("VC_TS3_DIR").expect("VC_TS3_DIR"));
+    let installed = install::ensure_installed(&root).await.unwrap();
+    let dir = TempDir(std::env::temp_dir().join(format!("vc-ts-talk-{}", free_port(false))));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    std::os::unix::fs::symlink(&installed.dir, dir.0.join(installed.dir.file_name().unwrap())).unwrap();
+    let voice = format!("127.0.0.1:{}", free_port(true)).parse().unwrap();
+    let query_port = free_port(false);
+    let server = TestServer::start_with(|c| {
+        c.teamspeak = Some(TeamSpeakConfig {
+            dir: dir.0.clone(),
+            voice,
+            query_port,
+            filetransfer: format!("127.0.0.1:{}", free_port(false)).parse().unwrap(),
+            public_url: None,
+        })
+    })
+    .await;
+    let mut ready = server.running.teamspeak_ready.clone().unwrap();
+    tokio::time::timeout(Duration::from_secs(120), ready.wait_for(|ready| *ready)).await.unwrap().unwrap();
+    let password = std::fs::read_to_string(dir.0.join("query-password")).unwrap();
+    let (query, _notes) =
+        Query::connect(format!("127.0.0.1:{query_port}").parse().unwrap(), "serveradmin", password.trim(), 1)
+            .await
+            .unwrap();
+    let mut admin = admin(&server, "root").await;
+
+    let (a, a_clid, lobby) = teamspeak_user(voice, "ts-speaker").await;
+    let (b, b_clid, _) = teamspeak_user(voice, "ts-listener").await;
+    let (a, mut b) = (Probe::new(a), Probe::new(b));
+    // Mirrored channels need talk power nobody has; the bridge makes those who may speak talkers.
+    let info = query.call(Cmd::new("channelinfo").arg("cid", lobby)).await.unwrap();
+    assert_eq!(info[0].get("channel_needed_talk_power").map(String::as_str), Some("1000000"), "{info:?}");
+    wait_for_talker(&query, a_clid, true).await;
+    heard(&a, &b, 60).await;
+
+    // Muted for everyone by a Gwar moderator: nobody on TeamSpeak hears them either, nor a whisper.
+    let speaker = admin.next_event_where("client.joined", |c| c["nickname"] == "ts-speaker").await["id"].clone();
+    admin.ok("client.voice", json!({"client": speaker, "muted": true})).await;
+    wait_for_talker(&query, a_clid, false).await;
+    unheard(&a, &mut b, 61).await;
+    unwhispered(&a, &mut b, b_clid, 64).await;
+    admin.ok("client.voice", json!({"client": speaker, "muted": false})).await;
+    wait_for_talker(&query, a_clid, true).await;
+    heard(&a, &b, 62).await;
+    whispered(&a, &b, b_clid, 65).await;
+
+    let channel_id =
+        |created: serde_json::Value| created["channel"]["id"].as_u64().or_else(|| created["id"].as_u64()).unwrap();
+    admin.create_channel(json!({"name": "Open"})).await;
+    let stage = channel_id(admin.create_channel(json!({"name": "Stage"})).await);
+    let closed = channel_id(admin.create_channel(json!({"name": "Closed"})).await);
+    for (channel, deny) in [(stage, "speak"), (closed, "connect")] {
+        let entry = json!({"channel": channel, "override": {"role": 2, "allow": [], "deny": [deny]}});
+        admin.ok("channel.override", entry).await;
+    }
+    let (open_cid, stage_cid, closed_cid) =
+        (find_channel(&query, "Open").await, find_channel(&query, "Stage").await, find_channel(&query, "Closed").await);
+    let move_to = |clid: u16, cid: String| {
+        let query = &query;
+        async move { query.call(Cmd::new("clientmove").arg("clid", clid).arg("cid", cid)).await.unwrap() }
+    };
+    // Moved where they may speak: a talker again there.
+    move_to(a_clid, open_cid.clone()).await;
+    move_to(b_clid, open_cid.clone()).await;
+    wait_for_talker(&query, a_clid, true).await;
+    heard(&a, &b, 66).await;
+    // Into a channel they may not join: back in Open, and heard there again.
+    move_to(a_clid, closed_cid).await;
+    within("moved back from Closed", async {
+        loop {
+            let info = query.call(Cmd::new("clientinfo").arg("clid", a_clid)).await.unwrap();
+            if info[0].get("cid") == Some(&open_cid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    wait_for_talker(&query, a_clid, true).await;
+    heard(&a, &b, 67).await;
+    // A channel where Member may not speak: silent there.
+    move_to(a_clid, stage_cid.clone()).await;
+    move_to(b_clid, stage_cid).await;
+    wait_for_talker(&query, a_clid, false).await;
+    unheard(&a, &mut b, 63).await;
+}

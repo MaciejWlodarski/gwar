@@ -1,6 +1,6 @@
 # Roles and permissions, version 2
 
-Status: steps 1 (ranks), 2 (overrides), 3 (voice; TeamSpeak talk power still open) and 4 (the TeamSpeak importer) built. Replaces the flat role model.
+Status: steps 1 (ranks), 2 (overrides), 3 (voice, with TeamSpeak talk power) and 4 (the TeamSpeak importer) built. Replaces the flat role model.
 
 ## Why
 
@@ -167,10 +167,25 @@ The core stays the authority for official TeamSpeak clients too:
 - Deafening for everyone is refused for TeamSpeak users: they hear Gwar
   through the puppets in their TeamSpeak channel, which a deafen does not
   reach.
-- Not yet: TeamSpeak users in the same TeamSpeak channel still hear each
-  other directly through the TeamSpeak server. Closing that needs the bridge
-  to set the channel's needed talk power and mark who may talk
-  (`client_is_talker`), tested against the official server in CI.
+- TeamSpeak users hear each other on the TeamSpeak server, so the same rule
+  holds there: every mirrored channel needs a talk power no TeamSpeak group
+  has (1 000 000, set on its own so no other failed edit leaves it out), and
+  the bridge marks as talkers (`client_is_talker`) those TeamSpeak users who
+  may speak in their channel and are not muted for everyone. The core decides
+  for the channel they are in (`BridgeNote::Talker`), again after every move;
+  until a decision for their current channel arrives, the bridge keeps them
+  silent, and it retries a flag that did not take. Whispering another
+  TeamSpeak user takes the same right: their needed whisper power is the
+  bridge's, which a TeamSpeak identity gets while all its connections are
+  talkers (TeamSpeak keeps it per identity), and loses when they leave. Puppets have both powers in their group, and anyone may whisper a
+  puppet: whether a Gwar user is heard, or hears a whisper, is decided by the
+  core. A TeamSpeak user is silent for the moment between joining or moving
+  and being marked. A TeamSpeak server admin (a group only ServerQuery gives)
+  could change a channel's talk power or a channel they create themselves
+  until the bridge restarts. A moderator's mute lasts for the bridge's
+  connection: a bridge restart lifts it. Talker flags and whisper rights
+  set before a restart are corrected for everyone connected (and anyone
+  returning) within a second of it.
 - Puppets (Gwar users on TeamSpeak) follow the core; moderation from a
   TeamSpeak client is not supported: TeamSpeak users with Gwar roles moderate
   from the Gwar app.
@@ -213,8 +228,8 @@ Member once, so existing members keep joining, talking and writing.
   before release).
 - `Channel` gains `overrides` (`{ role | user, allow: [...], deny: [...] }`)
   and `synced`, sent to everyone who can view the channel.
-- New requests: `group.reorder`, `channel.overrides` (set one role's or
-  member's override), `member.voice` (mute or deafen someone for everyone).
+- New requests: `group.reorder`, `channel.override` (set one role's or
+  member's override), `client.voice` (mute or deafen someone for everyone).
 - The welcome no longer has a private channel's `access`; `overrides` say the
   same.
 
@@ -228,8 +243,8 @@ Member once, so existing members keep joining, talking and writing.
    `attach_files`, `manage_messages`, `move_members`, `bypass_password` and
    `manage_channels` enforced.
 3. **Voice and TeamSpeak**: `speak` and `mute_members` (`client.voice`) in
-   the SFU, TeamSpeak users kept out of channels they may not join; the
-   bridge's talk power is the remaining part.
+   the SFU, TeamSpeak users kept out of channels they may not join, and the
+   bridge's talk power so they are not heard on TeamSpeak either.
 4. **Then the importer**, onto this model.
 
 Each step changes authorization, so each goes to an independent review before
