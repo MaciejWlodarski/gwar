@@ -1,6 +1,6 @@
 [package]
 name = "vc-client"
-version = "0.1.0"
+version = "0.1.1"
 description = "Native client for the vc/3 protocol (used by the desktop app)"
 edition.workspace = true
 license.workspace = true

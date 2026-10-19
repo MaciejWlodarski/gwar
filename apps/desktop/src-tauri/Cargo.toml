@@ -1,6 +1,6 @@
 [package]
 name = "vc-desktop"
-version = "0.1.0"
+version = "0.1.1"
 description = "Voice desktop app (Tauri 2) with a native audio engine"
 edition.workspace = true
 license.workspace = true
