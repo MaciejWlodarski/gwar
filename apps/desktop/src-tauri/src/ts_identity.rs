@@ -21,6 +21,8 @@
 //!   native dialog: they exist nowhere else. The account's are in the Connect vault.
 //! - `ts_identity_detect` -> `[{source, name, uid, level, identity, selected}]` from the official
 //!   TeamSpeak client on this computer. Reads files only when called, which the UI does on request.
+//! - `ts_identity_claim {uid, statement}` -> `{key, signature}`: the active list's identity `uid`
+//!   signs a Gwar server's claim statement (docs/teamspeak-import.md, "Claim"), nothing else.
 //!
 //! A TeamSpeak connection that is already open keeps the identity it started with.
 
@@ -561,4 +563,26 @@ mod tests {
         assert!(files.set_list("device", None, &BTreeSet::new()).is_err());
         assert!(files.set_list("elsewhere", None, &BTreeSet::new()).is_err());
     }
+}
+
+#[derive(Serialize)]
+pub struct ClaimSignature {
+    key: String,
+    signature: String,
+}
+
+/// Signs a claim with an identity of the active list; the private key stays here.
+#[tauri::command]
+pub async fn ts_identity_claim(app: AppHandle, uid: String, statement: String) -> Result<ClaimSignature, String> {
+    tokio::task::spawn_blocking(move || {
+        let files = files(&app)?;
+        let _files = lock();
+        let (_, list) = files.active().map_err(err)?;
+        let entry = list.identities.iter().find(|e| e.uid == uid).ok_or("identity not found")?;
+        let identity = ts_identity::parse(&entry.identity).map_err(err)?;
+        let (key, signature) = ts_identity::sign_claim(&identity, &statement).map_err(err)?;
+        Ok(ClaimSignature { key, signature })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }

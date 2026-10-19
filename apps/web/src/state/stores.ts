@@ -1,7 +1,7 @@
 import type { Attachment } from "../proto/Attachment";
 import { create } from "zustand";
 import type { Key } from "../i18n";
-import type { TsFound } from "../connect/teamspeak";
+import type { TsEntryInfo, TsFound } from "../connect/teamspeak";
 import type { ChatTarget } from "../proto/ChatTarget";
 import type { CloseReason } from "../net/connection";
 import type { InviteTarget } from "../net/invite";
@@ -127,7 +127,8 @@ export type DialogState =
   | { kind: "hearers"; channel: number }
   | { kind: "confirm"; title: string; memberTitle?: { uid: string; fallback: string; key: Key }; body: string; confirmLabel: string; danger?: boolean; serverIdentity?: boolean; onConfirm: () => void }
   /** First TeamSpeak connection on a device: offers the official client's identities. Resolves with the chosen ones, or null. */
-  | { kind: "tsFirstRun"; found: TsFound[]; resolve: (chosen: TsFound[] | null) => void };
+  | { kind: "tsFirstRun"; found: TsFound[]; resolve: (chosen: TsFound[] | null) => void }
+  | { kind: "tsClaim"; identities: TsEntryInfo[]; resolve: (accepted: boolean) => void };
 
 interface UiStore {
   toasts: Toast[];

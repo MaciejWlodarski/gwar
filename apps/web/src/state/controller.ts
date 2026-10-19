@@ -1,3 +1,4 @@
+import { claimAll, claimableIdentities, offerClaims } from "./ts-claim";
 import { permissionsOf } from "../lib/permissions";
 import type { ChannelOverride } from "../proto/ChannelOverride";
 import { attachment as attachmentSchema } from "../net/schema";
@@ -543,6 +544,8 @@ class Controller {
       this.sealed?.reset();
       session.dispatch({ type: "welcome", welcome, resync, now: Date.now() });
       if (this.sealed) { this.sealed.refresh(); void this.sealed.scanUnread(); }
+      // A server moved from TeamSpeak may hold roles for this person's TeamSpeak identities.
+      if (!resync && useSession.getState().kind === "vc" && conn.serverKey) void offerClaims(conn, conn.serverKey, welcome.uid);
       const myCh = myChannelId(useSession.getState());
       const v = useVoice.getState();
       if (v.muted || v.deafened) void this.pushMuteState();
@@ -1365,6 +1368,20 @@ class Controller {
 
   removeMember(uid: string, deleteMessages: boolean) {
     return this.connection.request("member.remove", { uid, delete_messages: deleteMessages });
+  }
+
+  /** Unlinks a TeamSpeak identity (`ts:<uid>`) from a member; the roles stay. */
+  unlinkTeamspeak(uid: string, teamspeak: string) {
+    return this.connection.request("member.teamspeak.unlink", { uid, teamspeak });
+  }
+
+  /** Claims every TeamSpeak identity of this device that has roles here: `null` when there is none. */
+  async claimTeamspeak(): Promise<{ linked: number; of: number } | null> {
+    const conn = this.connection, serverKey = conn.serverKey, me = useSession.getState().me?.uid;
+    if (!serverKey || !me) return null;
+    const identities = await claimableIdentities(conn);
+    if (identities.length === 0) return null;
+    return { linked: await claimAll(conn, serverKey, me, identities), of: identities.length };
   }
 
   /** One batch of `member.prune`; `pruneAll` repeats it. */

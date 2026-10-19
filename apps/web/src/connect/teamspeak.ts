@@ -58,6 +58,8 @@ export interface TsBridge {
   setList(which: "account" | "device", list: TsList | null): Promise<void>;
   /** Looks in the official TeamSpeak client's settings. Call only when the user asked for it. */
   detect(): Promise<TsFound[]>;
+  /** The active list's identity `uid` signs a Gwar server's claim statement (docs/teamspeak-import.md, "Claim"). */
+  claimSign(uid: string, statement: string): Promise<{ key: string; signature: string }>;
 }
 
 export const desktopTsBridge: TsBridge = {
@@ -71,6 +73,8 @@ export const desktopTsBridge: TsBridge = {
       list: list && { default: list.default, identities: list.identities.map(({ uid, name, identity }) => ({ uid, name, identity })) },
     }),
   detect: async () => (await tauri()).invoke<TsFound[]>("ts_identity_detect"),
+  claimSign: async (uid, statement) =>
+    (await tauri()).invoke<{ key: string; signature: string }>("ts_identity_claim", { uid, statement }),
 };
 
 /** The desktop's bridge, or null in the browser. */

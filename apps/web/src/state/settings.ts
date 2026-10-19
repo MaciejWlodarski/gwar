@@ -184,6 +184,8 @@ export interface SettingsState {
   lastKind: ServerKind;
   /** This device was already offered the identities of the official TeamSpeak client (asked only once). */
   tsDetectAsked: boolean;
+  /** Per server key: the TeamSpeak claim was offered there (docs/teamspeak-import.md, "Claim"), asked only once. */
+  tsClaimAsked: Record<string, true>;
   /** Per server key, whether my last new channel there was end-to-end encrypted: the next one starts the same. */
   channelEncryption: Record<string, boolean>;
   /** "Back up message keys to Gwar Connect" (docs/e2e-build.md, section 7): off means no uploads; reading and transfers still work. */
@@ -209,6 +211,7 @@ export interface SettingsState {
   dropAccountBookmarks(account: string): void;
   setLast(address: string, kind?: ServerKind): void;
   setTsDetectAsked(asked: boolean): void;
+  setTsClaimAsked(serverKey: string): void;
   setChannelEncryption(serverKey: string, encrypted: boolean): void;
   setArchiveUploads(on: boolean): void;
 }
@@ -252,6 +255,7 @@ export const useSettings = create<SettingsState>()(
       lastAddress: "",
       lastKind: "vc",
       tsDetectAsked: false,
+      tsClaimAsked: {},
       channelEncryption: {},
       archiveUploads: true,
 
@@ -331,6 +335,7 @@ export const useSettings = create<SettingsState>()(
         })),
       setLast: (lastAddress, lastKind = "vc") => set({ lastAddress, lastKind }),
       setTsDetectAsked: (tsDetectAsked) => set({ tsDetectAsked }),
+      setTsClaimAsked: (serverKey) => set((s) => ({ tsClaimAsked: { ...s.tsClaimAsked, [serverKey]: true } })),
       setChannelEncryption: (serverKey, encrypted) => set((s) => ({ channelEncryption: { ...s.channelEncryption, [serverKey]: encrypted } })),
       setArchiveUploads: (archiveUploads) => set({ archiveUploads }),
     }),

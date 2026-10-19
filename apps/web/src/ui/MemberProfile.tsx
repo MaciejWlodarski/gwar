@@ -11,6 +11,8 @@ import { canActOn } from "../lib/permissions";
 
 const NO_GROUPS: readonly number[] = [];
 import { useConnectHandle } from "./useConnectHandle";
+import { tsBridge } from "../connect/teamspeak";
+import { shortUid } from "../connect/ts-list";
 import { Avatar, Button, Dialog, Field, Input } from "./kit";
 
 export function NicknameDialog({ uid }: { uid: string }) {
@@ -126,7 +128,76 @@ export function MemberProfileDialog({ uid, fallback }: { uid: string; fallback: 
             <Pencil className="size-4" /> {t("nickname.change")}
           </Button>
         )}
+        {vc && <TeamspeakLinks uid={uid} linked={member?.teamspeak ?? NO_LINKS} own={own} mayUnlink={own || mayRename} />}
       </div>
     </Dialog>
+  );
+}
+
+const NO_LINKS: string[] = [];
+
+/** The member's linked TeamSpeak identities (docs/teamspeak-import.md); one's own can also be claimed here, on the desktop. */
+function TeamspeakLinks({ uid, linked, own, mayUnlink }: { uid: string; linked: string[]; own: boolean; mayUnlink: boolean }) {
+  const t = useT();
+  const toast = useUi((s) => s.toast);
+  const [confirming, setConfirming] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const canClaim = own && !!tsBridge();
+  if (linked.length === 0 && !canClaim) return null;
+  const unlink = async (teamspeak: string) => {
+    setBusy(true);
+    try {
+      await controller.unlinkTeamspeak(uid, teamspeak);
+      toast("success", t("tsClaim.unlinked"));
+    } catch (e) {
+      toast("error", describeRequestError(e));
+    } finally {
+      setBusy(false);
+      setConfirming(null);
+    }
+  };
+  const claim = async () => {
+    setBusy(true);
+    try {
+      const result = await controller.claimTeamspeak();
+      if (!result) toast("success", t("tsClaim.none"));
+      else toast(result.linked === result.of ? "success" : "error", t(result.linked === result.of ? "tsClaim.done" : "tsClaim.failed"));
+    } catch (e) {
+      toast("error", describeRequestError(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <section aria-label={t("tsClaim.linked")} className="flex flex-col gap-2">
+      {linked.length > 0 && (
+        <>
+          <h3 className="text-xs font-semibold uppercase text-muted">{t("tsClaim.linked")}</h3>
+          <ul className="flex flex-col gap-1">
+            {linked.map((teamspeak) => (
+              <li key={teamspeak} className="flex items-center gap-2 rounded-md bg-raised px-3 py-2">
+                <span className="min-w-0 flex-1 truncate font-mono text-xs">{shortUid(teamspeak.slice(3))}</span>
+                {mayUnlink && confirming !== teamspeak && (
+                  <Button size="sm" variant="ghost" disabled={busy} onClick={() => setConfirming(teamspeak)}>
+                    {t("tsClaim.unlink")}
+                  </Button>
+                )}
+                {mayUnlink && confirming === teamspeak && (
+                  <Button size="sm" variant="danger" busy={busy} onClick={() => void unlink(teamspeak)}>
+                    {t("tsClaim.unlink")}?
+                  </Button>
+                )}
+              </li>
+            ))}
+          </ul>
+          {confirming && <p className="text-xs text-muted">{t("tsClaim.unlinkConfirm")}</p>}
+        </>
+      )}
+      {canClaim && (
+        <Button busy={busy} onClick={() => void claim()}>
+          {t("tsClaim.check")}
+        </Button>
+      )}
+    </section>
   );
 }

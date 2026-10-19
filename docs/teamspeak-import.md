@@ -118,9 +118,11 @@ member list shows those members. The desktop app asks for the list only when it
 holds TeamSpeak identities and the person has not decided for this server yet.
 It compares the list with its identities on the device and offers a claim only
 for the ones in it. Nothing tells the server which identities the person holds
-unless they accept, and declining is remembered for that server. The server's
-settings list linked identities (to unlink) and claimable ones. The web app
-follows later: it does not read TeamSpeak keys yet.
+unless they accept, and declining is remembered for that server. A member's
+profile lists their linked identities (unlink there); one's own profile can
+also claim again later. The desktop's private keys never reach the web view:
+the app signs only a statement of exactly this form. The web app follows
+later: it does not read TeamSpeak keys yet.
 
 ## Roles and permissions
 

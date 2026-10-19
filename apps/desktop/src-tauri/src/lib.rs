@@ -110,6 +110,7 @@ pub fn run() {
             ts_identity::ts_identity_generate,
             ts_identity::ts_identity_set_list,
             ts_identity::ts_identity_detect,
+            ts_identity::ts_identity_claim,
             ts_identity::ts_identity_export,
             tray::tray_set_state,
             tray::set_close_to_tray,
