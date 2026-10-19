@@ -173,12 +173,14 @@ export const useUi = create<UiStore>()((set) => ({
   openDialog: (dialog) =>
     set((s) => {
       if (s.dialog.kind === "tsFirstRun") s.dialog.resolve(null);
+      if (s.dialog.kind === "tsClaim") s.dialog.resolve(false);
       return { dialog };
     }),
   closeDialog: () =>
     set((s) => {
       // Whoever waits for the first-run answer must not wait forever: leaving it unanswered means "no".
       if (s.dialog.kind === "tsFirstRun") s.dialog.resolve(null);
+      if (s.dialog.kind === "tsClaim") s.dialog.resolve(false);
       return { dialog: { kind: "none" } };
     }),
   setDrawer: (drawerOpen) => set({ drawerOpen }),

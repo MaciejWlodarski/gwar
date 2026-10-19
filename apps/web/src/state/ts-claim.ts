@@ -3,7 +3,9 @@
  * moved from TeamSpeak has members `ts:<uid>`; the desktop app holds the person's TeamSpeak
  * identities. `teamspeak.claimable` lists the TeamSpeak members with roles, and the app compares it
  * with its identities here, so the server learns which identities are the person's only if they
- * accept. Asked once per server, whatever the answer; the member profile can claim again later.
+ * accept: the list is asked for on every visit whatever matches or was answered before, so not even
+ * the requests depend on the identities. Asked once per server, whatever the answer; the member
+ * profile can claim again later. The desktop asks natively before each signature.
  */
 import { tsBridge, type TsBridge, type TsEntryInfo } from "../connect/teamspeak";
 import type { Op, RequestInput, ResponseMap } from "../net/protocol";
@@ -55,10 +57,10 @@ export async function claimAll(link: ClaimLink, serverKey: string, myUid: string
 
 /** After joining a server: offers the claim once, when there is something to claim. Failures are logged. */
 export async function offerClaims(link: ClaimLink, serverKey: string, myUid: string, ts: TsBridge | null = tsBridge()): Promise<void> {
-  if (!ts || useSettings.getState().tsClaimAsked[serverKey]) return;
+  if (!ts) return;
   try {
     const identities = await claimableIdentities(link, ts);
-    if (identities.length === 0) return;
+    if (identities.length === 0 || useSettings.getState().tsClaimAsked[serverKey]) return;
     useSettings.getState().setTsClaimAsked(serverKey);
     if (!(await ask(identities))) return;
     const linked = await claimAll(link, serverKey, myUid, identities, ts);

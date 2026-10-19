@@ -75,9 +75,24 @@ describe("offering the TeamSpeak claim", () => {
     await offered;
     expect(signed).toEqual([]);
     expect(calls.map((c) => c.op)).toEqual(["teamspeak.claimable"]);
+    // Asked again later: the same request (so it tells the server nothing), but no question.
     await offerClaims(link, SERVER, ME, ts);
-    expect(calls.map((c) => c.op)).toEqual(["teamspeak.claimable"]);
+    expect(calls.map((c) => c.op)).toEqual(["teamspeak.claimable", "teamspeak.claimable"]);
     expect(useUi.getState().dialog.kind).toBe("none");
+  });
+
+  it("takes a dialog closed by something else for no", async () => {
+    for (const close of [() => useUi.getState().closeDialog(), () => useUi.getState().openDialog({ kind: "bugReport" })]) {
+      useSettings.setState({ tsClaimAsked: {} });
+      const { ts, signed } = bridge(["A="]);
+      const { link } = server(["ts:A="]);
+      const offered = offerClaims(link, SERVER, ME, ts);
+      await vi.waitFor(() => expect(useUi.getState().dialog.kind).toBe("tsClaim"));
+      close();
+      await offered;
+      expect(signed).toEqual([]);
+      useUi.getState().closeDialog();
+    }
   });
 
   it("stays quiet without a desktop, without identities or without a match, and asks again later then", async () => {

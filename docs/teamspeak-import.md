@@ -127,7 +127,11 @@ for the ones in it. Nothing tells the server which identities the person holds
 unless they accept, and declining is remembered for that server. A member's
 profile lists their linked identities (unlink there); one's own profile can
 also claim again later. The desktop's private keys never reach the web view:
-the app signs only a statement of exactly this form. The web app follows
+the app signs only a statement of exactly this form, and only after the
+person agrees in a native dialog naming the identity, so a compromised web
+view cannot give an identity's roles away on its own. The list is asked for on
+every visit, whatever matched or was answered before, so not even the requests
+depend on the person's identities. The web app follows
 later: it does not read TeamSpeak keys yet.
 
 ## Roles and permissions
