@@ -622,8 +622,8 @@ fn pipeline<const CAPTURE: usize>(
             let Some(capture_position) = capture.push_at(sample, Instant::now(), &counters) else { continue };
             // The meter and the gate measure the microphone as it is, so its sensitivity setting
             // means what it did (a strong suppressor also takes very quiet speech down). The
-            // encoder gets the cleaned audio. Suppression runs on every frame, sent or not, so its
-            // state follows the audio.
+            // encoder, and the RTP level the server's speech gate reads, get the cleaned audio.
+            // Suppression runs on every frame, sent or not, so its state follows the audio.
             let db = level_db(&capture.samples);
             let mode = NoiseSuppression::from_u8(controls.noise_suppression.load(Ordering::Relaxed));
             denoiser.process(&mut capture.samples, mode, next_position == Some(capture_position));
@@ -646,7 +646,9 @@ fn pipeline<const CAPTURE: usize>(
                 if !validate_encoded(&packet[..n], CAPTURE as u32, &counters) {
                     continue;
                 }
-                let level = (-db.clamp(-127.0, 0.0)).round() as i8;
+                // RFC 6464: the level of the audio actually sent. Suppressed noise reads as
+                // silence, so it cannot hold a receive slot at the server.
+                let level = (-level_db(frame).clamp(-127.0, 0.0)).round() as i8;
                 // Tell the server's speech gate the truth about voice activity.
                 if out
                     .try_send(Outgoing {
