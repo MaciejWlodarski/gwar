@@ -352,7 +352,8 @@ impl<'a> Bridge<'a> {
         ready: &watch::Sender<bool>,
     ) -> Result<()> {
         let (query, mut notifications) =
-            Query::connect(link.query, "serveradmin", &link.password, 1).await.context("connect ServerQuery")?;
+            // The virtual server waits, stopped, for its password (`set_server_password`).
+            Query::connect_stopped(link.query, "serveradmin", &link.password, 1).await.context("connect ServerQuery")?;
         let (puppet_events, mut puppet_rx) = mpsc::channel(256);
         let (listener_events, mut listener_rx) = mpsc::channel(256);
         let mut bridge = Bridge {
@@ -403,9 +404,9 @@ impl<'a> Bridge<'a> {
         let Some(BridgeNote::Snapshot { server, channels, clients, password }) = notes.recv().await else {
             bail!("core did not send a snapshot");
         };
+        // Before anyone connects: TeamSpeak starts only with it, and our puppets need it.
+        self.set_server_password(password, true).await?;
         self.configure_server(&server).await?;
-        // Before any puppet connects: they need it.
-        self.set_server_password(password).await?;
         self.sync_channels(channels).await?;
         for event in ["server", "textserver"] {
             self.query.call(Cmd::new("servernotifyregister").arg("event", event)).await?;
@@ -424,6 +425,11 @@ impl<'a> Bridge<'a> {
         loop {
             tokio::select! {
                 note = notes.recv() => match note {
+                    Some(BridgeNote::ServerPassword(password)) => {
+                        // Not set, TeamSpeak may be open (or keep an old one): the next bridge tries
+                        // again, with the queued plain text.
+                        self.set_server_password(password, false).await.context("set the TeamSpeak server password")?;
+                    }
                     Some(note) => self.on_note(note).await,
                     None => bail!("core stopped"),
                 },
@@ -564,36 +570,62 @@ impl<'a> Bridge<'a> {
     /// Gives TeamSpeak the server password ours has. Without the plain text, the one set before
     /// stays if it is still ours; otherwise TeamSpeak gets a random one: closed until the password
     /// is set again on our side, never open where ours is not.
-    async fn set_server_password(&mut self, ours: ServerPassword) -> Result<()> {
-        let Some(hash) = ours.hash else {
-            self.query.call(Cmd::new("serveredit").arg("virtualserver_password", "")).await?;
-            self.server_password = None;
-            return match std::fs::remove_file(&self.password_file) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-                _ => Ok(()),
-            };
-        };
-        let saved = std::fs::read(&self.password_file)
-            .ok()
-            .and_then(|data| serde_json::from_slice::<SavedPassword>(&data).ok())
-            .filter(|saved| saved.hash == hash)
-            .map(|saved| saved.password);
-        let typed = ours.plaintext.is_some();
-        let password = match ours.plaintext.or(saved) {
-            Some(password) => password,
-            None => {
-                warn!(
-                    "the server has a password TeamSpeak does not know: TeamSpeak users are kept out until \
-                     it is set again in the server settings"
-                );
-                random_password()
+    ///
+    /// At `startup` the bridge also starts the virtual server, which never starts by itself (no
+    /// autostart): it takes clients only once its password is ours. One that started by itself
+    /// anyway (its first run, or from before) stops first, so nobody it let in stays.
+    async fn set_server_password(&mut self, ours: ServerPassword, startup: bool) -> Result<()> {
+        let (password, typed) = match ours.hash.clone() {
+            None => (None, false),
+            Some(hash) => {
+                let saved = std::fs::read(&self.password_file)
+                    .ok()
+                    .and_then(|data| serde_json::from_slice::<SavedPassword>(&data).ok())
+                    .filter(|saved| saved.hash == hash)
+                    .map(|saved| saved.password);
+                let typed = ours.plaintext.is_some();
+                let password = ours.plaintext.clone().or(saved).unwrap_or_else(|| {
+                    warn!(
+                        "the server has a password TeamSpeak does not know: TeamSpeak users are kept out \
+                         until it is set again in the server settings"
+                    );
+                    random_password()
+                });
+                (Some(password), typed)
             }
         };
-        self.query.call(Cmd::new("serveredit").arg("virtualserver_password", &password)).await?;
-        write_private(&self.password_file, &serde_json::to_vec(&SavedPassword { hash, password: password.clone() })?)?;
-        self.server_password = Some(password.clone());
-        if typed {
-            self.core.bridge(BridgeMsg::ServerPasswordSet(password)).await;
+        let mut running = false;
+        if startup {
+            let info = self.query.call(Cmd::new("serverinfo")).await?;
+            let field = |name: &str| info.first().and_then(|r| r.get(name)).cloned().unwrap_or_default();
+            running = field("virtualserver_status") == "online";
+            if running && field("virtualserver_autostart") != "0" && password.is_some() {
+                self.query.call(Cmd::new("serverstop").arg("sid", 1)).await?;
+                self.query.call(Cmd::new("use").arg("sid", 1).flag("-virtual")).await?;
+                running = false;
+            }
+        }
+        let edit = Cmd::new("serveredit")
+            .arg("virtualserver_password", password.as_deref().unwrap_or(""))
+            .arg("virtualserver_autostart", 0);
+        self.query.call(edit).await?;
+        self.server_password = password.clone();
+        match (&ours.hash, &password) {
+            (Some(hash), Some(password)) => write_private(
+                &self.password_file,
+                &serde_json::to_vec(&SavedPassword { hash: hash.clone(), password: password.clone() })?,
+            )?,
+            _ => match std::fs::remove_file(&self.password_file) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            },
+        }
+        if startup && !running {
+            self.query.call(Cmd::new("serverstart").arg("sid", 1)).await.context("start the TeamSpeak server")?;
+            self.query.call(Cmd::new("use").arg("sid", 1)).await?;
+        }
+        if let (true, Some(hash), Some(password)) = (typed, ours.hash, password) {
+            self.core.bridge(BridgeMsg::ServerPasswordSet { hash, password }).await;
         }
         Ok(())
     }
@@ -1133,11 +1165,8 @@ impl<'a> Bridge<'a> {
     async fn on_note(&mut self, note: BridgeNote) {
         match note {
             BridgeNote::Snapshot { .. } => warn!("unexpected second snapshot"),
-            BridgeNote::ServerPassword(password) => {
-                if let Err(e) = self.set_server_password(password).await {
-                    warn!("TeamSpeak server password: {e:#}");
-                }
-            }
+            // Handled in `serve`: a failure there restarts the bridge, to set it again.
+            BridgeNote::ServerPassword(_) => {}
             BridgeNote::Channel { channel, password, .. } => {
                 self.channels.insert(channel.id, channel.clone());
                 // Which typed password was set: a queued one goes only once this very one is.

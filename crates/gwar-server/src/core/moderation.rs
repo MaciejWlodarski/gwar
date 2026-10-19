@@ -714,7 +714,7 @@ impl Core {
                             // TeamSpeak takes the same password: it waits for the bridge (which may be
                             // restarting) like one typed at an import, and replaces any such.
                             let queued = match (&hash, core.info.teamspeak) {
-                                (Some(_), true) => core.store.queue_bridge_server_password(&typed),
+                                (Some(hash), true) => core.store.queue_bridge_server_password(hash, &typed),
                                 _ => core.store.forget_bridge_server_password(None),
                             };
                             if let Err(e) = queued {

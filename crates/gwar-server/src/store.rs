@@ -738,7 +738,12 @@ impl Store {
 
     /// Moves everything from the write-ahead log into the database and empties the log, so
     /// nothing deleted lingers there.
+    /// Empties the write-ahead log into the database. Inside a transaction it waits: the caller
+    /// checkpoints once that has committed.
     pub fn checkpoint(&self) -> Result<()> {
+        if !self.db.is_autocommit() {
+            return Ok(());
+        }
         self.db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
         Ok(())
     }
@@ -939,21 +944,24 @@ impl Store {
         Ok(())
     }
 
-    /// The server's password typed at an import, for the bridge to set on TeamSpeak once.
-    pub fn queue_bridge_server_password(&self, password: &str) -> Result<()> {
-        self.set_meta(BRIDGE_SERVER_PASSWORD, password)
+    /// The server's password in plain text, for the bridge to set on TeamSpeak once, with the hash
+    /// it is the password of: good only while that is still the server's.
+    pub fn queue_bridge_server_password(&self, hash: &str, password: &str) -> Result<()> {
+        self.set_meta(BRIDGE_SERVER_PASSWORD, &serde_json::to_string(&(hash, password))?)
     }
 
-    pub fn bridge_server_password(&self) -> Result<Option<String>> {
-        self.meta(BRIDGE_SERVER_PASSWORD)
+    /// The queued `(hash, password)`, if any.
+    pub fn bridge_server_password(&self) -> Result<Option<(String, String)>> {
+        Ok(self.meta(BRIDGE_SERVER_PASSWORD)?.and_then(|v| serde_json::from_str(&v).ok()))
     }
 
-    /// Forgets the queued server password once TeamSpeak has it (`Some`), or whatever is queued
-    /// (`None`: the password changed in Gwar).
-    pub fn forget_bridge_server_password(&self, password: Option<&str>) -> Result<()> {
-        let gone = match password {
-            Some(p) => {
-                self.db.execute("DELETE FROM meta WHERE key=?1 AND value=?2", params![BRIDGE_SERVER_PASSWORD, p])?
+    /// Forgets the queued server password once TeamSpeak has that one (`Some`), or whatever is
+    /// queued (`None`: the password changed).
+    pub fn forget_bridge_server_password(&self, set: Option<(&str, &str)>) -> Result<()> {
+        let gone = match set {
+            Some((hash, password)) => {
+                let value = serde_json::to_string(&(hash, password))?;
+                self.db.execute("DELETE FROM meta WHERE key=?1 AND value=?2", params![BRIDGE_SERVER_PASSWORD, value])?
             }
             None => self.db.execute("DELETE FROM meta WHERE key=?1", [BRIDGE_SERVER_PASSWORD])?,
         };

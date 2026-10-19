@@ -40,6 +40,10 @@ impl Core {
             .atomically(|store| Ok((apply::apply(store, plan, source, options)?, Reloaded::read(store)?)))
             .map_err(|e| format!("nothing was changed: {e:#}"))?;
         self.install(reloaded);
+        // What the import deleted (a queued password, say) leaves no copy in the write-ahead log.
+        if let Err(e) = self.store.checkpoint() {
+            tracing::warn!("store: {e:#}");
+        }
         // The bridge goes first, so nothing that follows reaches it (it would kick TeamSpeak users, who
         // stay on their server and come back through the new bridge the supervisor attaches).
         if self.bridge.take().is_some() {
@@ -266,5 +270,13 @@ mod tests {
         let core = test_core_teamspeak(Store::in_memory().unwrap()).unwrap();
         core.import_live(with_server_password().0, "src".into(), BRIDGE).await.unwrap();
         assert_eq!(on_core(&core, |core| core.store.bridge_passwords().unwrap().len()).await, 1);
+        let queued = on_core(&core, |core| core.store.bridge_server_password().unwrap()).await;
+        assert_eq!(queued.map(|(_, p)| p).as_deref(), Some("top"));
+        // Imported again with the server's password locked: the queued one goes, inside the
+        // import's transaction (which a checkpoint there would break).
+        let mut s = source();
+        s.server.insert("virtualserver_flag_password".into(), "1".into());
+        core.import_live(plan(&s, &Options::default()), "src".into(), BRIDGE).await.unwrap();
+        assert_eq!(on_core(&core, |core| core.store.bridge_server_password().unwrap()).await, None);
     }
 }

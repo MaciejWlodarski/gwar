@@ -421,7 +421,13 @@ until TeamSpeak has taken it, as the channel passwords of an import do
 restarting gets it too. `--server-password` is held in memory only. When the
 hash no longer matches and no plain text is known, TeamSpeak gets a random
 password: closed to TeamSpeak clients until the password is set again, never
-open where Gwar is not.
+open where Gwar is not. TeamSpeak's virtual server does not start by itself
+(no autostart): the bridge starts it once the password is set, so a restart
+never lets anyone in with an old one or none; one that started by itself (its
+first run) is stopped first, which sends away anyone it let in. A queued plain
+text counts only with the hash it was typed for, so a password replaced since
+never comes back. Clients already connected stay when the password changes,
+on TeamSpeak as in Gwar.
 
 ## Later
 

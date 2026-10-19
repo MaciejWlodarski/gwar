@@ -915,8 +915,12 @@ impl Core {
                 None
             }
         };
+        // Only a plain text of this very hash: a password replaced since never comes back.
         let plaintext = hash.as_ref().and_then(|hash| {
-            queued.or_else(|| self.password_plaintext.as_ref().filter(|(h, _)| h == hash).map(|(_, p)| p.clone()))
+            queued
+                .filter(|(h, _)| h == hash)
+                .map(|(_, p)| p)
+                .or_else(|| self.password_plaintext.as_ref().filter(|(h, _)| h == hash).map(|(_, p)| p.clone()))
         });
         bridge::ServerPassword { hash, plaintext }
     }
@@ -1551,8 +1555,8 @@ impl Core {
                     warn!("store: {e:#}");
                 }
             }
-            BridgeMsg::ServerPasswordSet(password) => {
-                if let Err(e) = self.store.forget_bridge_server_password(Some(&password)) {
+            BridgeMsg::ServerPasswordSet { hash, password } => {
+                if let Err(e) = self.store.forget_bridge_server_password(Some((&hash, &password))) {
                     warn!("store: {e:#}");
                 }
             }
@@ -3463,7 +3467,7 @@ mod import_password_tests {
         let store = Store::in_memory().unwrap();
         let channel = store.channels().unwrap()[0].id;
         store.queue_bridge_password(channel, "hunter2").unwrap();
-        store.queue_bridge_server_password("hunter2").unwrap();
+        store.queue_bridge_server_password("HASH", "hunter2").unwrap();
         let core = test_core(store, None);
         assert!(on_core(&core, |core| core.store.bridge_passwords().unwrap().is_empty()).await);
         assert_eq!(on_core(&core, |core| core.store.bridge_server_password().unwrap()).await, None);
@@ -3482,7 +3486,7 @@ mod import_password_tests {
     #[tokio::test]
     async fn the_server_password_reaches_the_bridge_with_its_plain_text_while_that_is_known() {
         let store = Store::in_memory().unwrap();
-        store.queue_bridge_server_password("hunter2").unwrap();
+        store.queue_bridge_server_password("HASH", "hunter2").unwrap();
         let core = test_core_teamspeak(store).unwrap();
         // No password: nothing to set, whatever is queued.
         assert_eq!(attached_password(&core).await, bridge::ServerPassword::default());
@@ -3490,12 +3494,16 @@ mod import_password_tests {
         let sent = attached_password(&core).await;
         assert_eq!((sent.hash.as_deref(), sent.plaintext.as_deref()), (Some("HASH"), Some("hunter2")));
         // Kept until the bridge has set that very one.
-        core.bridge(BridgeMsg::ServerPasswordSet("older".into())).await;
+        core.bridge(BridgeMsg::ServerPasswordSet { hash: "OLDER".into(), password: "hunter2".into() }).await;
         assert!(on_core(&core, |core| core.store.bridge_server_password().unwrap()).await.is_some());
-        core.bridge(BridgeMsg::ServerPasswordSet("hunter2".into())).await;
+        core.bridge(BridgeMsg::ServerPasswordSet { hash: "HASH".into(), password: "hunter2".into() }).await;
         assert_eq!(on_core(&core, |core| core.store.bridge_server_password().unwrap()).await, None);
         // Then: the bridge keeps what it set; only the hash comes.
         assert_eq!(attached_password(&core).await.plaintext, None);
+        // A plain text queued for another hash (a password replaced since) is never sent.
+        on_core(&core, |core| core.store.queue_bridge_server_password("REPLACED", "old").unwrap()).await;
+        assert_eq!(attached_password(&core).await.plaintext, None);
+        on_core(&core, |core| core.store.forget_bridge_server_password(None).unwrap()).await;
         // --server-password counts only while it is still the password.
         on_core(&core, |core| core.password_plaintext = Some(("OLD".into(), "cli".into()))).await;
         assert_eq!(attached_password(&core).await.plaintext, None);

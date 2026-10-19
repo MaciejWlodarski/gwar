@@ -1123,6 +1123,7 @@ async fn the_servers_password_holds_on_teamspeak_too() {
     let voice = format!("127.0.0.1:{}", free_port(true)).parse().unwrap();
     let query_port = free_port(false);
     let server = TestServer::start_with(|c| {
+        c.server_password = Some("from-cli".into());
         c.teamspeak = Some(TeamSpeakConfig {
             dir: dir.0.clone(),
             voice,
@@ -1139,22 +1140,30 @@ async fn the_servers_password_holds_on_teamspeak_too() {
         Query::connect(format!("127.0.0.1:{query_port}").parse().unwrap(), "serveradmin", password.trim(), 1)
             .await
             .unwrap();
-    let flag = || async {
-        let info = query.call(Cmd::new("serverinfo")).await.unwrap();
-        info[0].get("virtualserver_flag_password").cloned().unwrap_or_default()
+    let field = |name: &'static str| {
+        let query = &query;
+        async move {
+            let info = query.call(Cmd::new("serverinfo")).await.unwrap();
+            info[0].get(name).cloned().unwrap_or_default()
+        }
     };
-    assert_eq!(flag().await, "0");
-    let mut admin = admin(&server, "root").await;
+    // Up, it already has the password given on the command line, and starts only by the bridge.
+    assert_eq!(field("virtualserver_flag_password").await, "1");
+    assert_eq!(field("virtualserver_autostart").await, "0");
+    assert!(!teamspeak_admits(voice, "no-password", None).await);
+    assert!(teamspeak_admits(voice, "cli-password", Some("from-cli")).await);
+    let mut admin = Client::connect_as(&server, new_key(), "root", Some("from-cli")).await.unwrap();
+    admin.redeem(&server.admin_token).await;
 
     // Set in Gwar: TeamSpeak takes the same password.
     admin.ok("server.update", json!({"password": "hunter2"})).await;
-    tokio::time::timeout(Duration::from_secs(20), async {
-        while flag().await != "1" {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !teamspeak_admits(voice, "probe", Some("hunter2")).await {
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     })
     .await
-    .expect("TeamSpeak gets a server password");
+    .expect("TeamSpeak gets the new server password");
     assert!(!teamspeak_admits(voice, "no-password", None).await);
     assert!(!teamspeak_admits(voice, "wrong-password", Some("hunter3")).await);
     assert!(teamspeak_admits(voice, "right-password", Some("hunter2")).await);
@@ -1182,7 +1191,7 @@ async fn the_servers_password_holds_on_teamspeak_too() {
     // Removed in Gwar: open on TeamSpeak again.
     admin.ok("server.update", json!({"password": ""})).await;
     tokio::time::timeout(Duration::from_secs(20), async {
-        while flag().await != "0" {
+        while field("virtualserver_flag_password").await != "0" {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     })

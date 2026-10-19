@@ -54,8 +54,12 @@ pub enum BridgeMsg {
     Chat(SessionId, ChatTarget, String),
     /// A channel's password is set on TeamSpeak (one queued by an import may go).
     PasswordSet(ChannelId, String),
-    /// The server's password is set on TeamSpeak (a queued one may go).
-    ServerPasswordSet(String),
+    /// The server's password (with the hash it is the password of) is set on TeamSpeak: a queued
+    /// one may go.
+    ServerPasswordSet {
+        hash: String,
+        password: String,
+    },
 }
 
 #[derive(Debug, Clone)]

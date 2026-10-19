@@ -150,8 +150,8 @@ pub fn apply(store: &Store, plan: &Plan, source: &str, options: ApplyOptions) ->
             store.set_meta("password_hash", hash.as_deref().unwrap_or(""))?;
             // The bridge sets it on TeamSpeak too, as with channels; any other outcome replaces one
             // queued before.
-            match &plan.server_password {
-                Password::Kept(p) if options.for_bridge => store.queue_bridge_server_password(p)?,
+            match (&plan.server_password, &hash) {
+                (Password::Kept(p), Some(hash)) if options.for_bridge => store.queue_bridge_server_password(hash, p)?,
                 _ => store.forget_bridge_server_password(None)?,
             }
         }
