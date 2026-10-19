@@ -208,7 +208,9 @@ const CLAIM_PREFIX: &str = "gwar teamspeak claim v1\n";
 pub fn sign_claim(identity: &Identity, statement: &str) -> Result<(String, String)> {
     let fields = statement.strip_prefix(CLAIM_PREFIX).context("not a claim statement")?;
     let fields: Vec<&str> = fields.split('\n').collect();
-    let plain = |f: &&str| !f.is_empty() && f.len() <= 128 && f.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    let plain = |f: &&str| {
+        !f.is_empty() && f.len() <= 128 && f.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
     if fields.len() != 3 || !fields.iter().all(plain) {
         bail!("not a claim statement");
     }
