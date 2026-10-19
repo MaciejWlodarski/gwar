@@ -45,6 +45,12 @@ pub fn lock_data_dir(data_dir: &Path) -> Result<File> {
     }
 }
 
+/// Whether a server (or a maintenance command) holds `data_dir` now. Changes nothing: no lock file
+/// is made, and one that cannot be read counts as free.
+pub fn data_dir_in_use(data_dir: &Path) -> bool {
+    File::open(data_dir.join("gwar.lock")).is_ok_and(|file| matches!(file.try_lock(), Err(TryLockError::WouldBlock)))
+}
+
 pub struct PruneOptions {
     pub inactive_days: u32,
     /// Also remove members who hold a role besides the default one.

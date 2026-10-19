@@ -14,10 +14,14 @@ pub fn query_hint(error: &anyhow::Error, from: &str, sid: u32) -> Option<String>
                     first start (on the console and in its first log under logs/). Lost it: stop TeamSpeak \
                     and start it once with serveradmin_password=<new> on its command line."
                 .into(),
-            3329 | 3331 => "TeamSpeak has banned this address for too many queries (flood protection, \
-                            10 minutes by default). Add the address the import connects from to \
-                            query_ip_allowlist.txt next to ts3server (127.0.0.1 is there by default, \
-                            so an SSH tunnel avoids this), restart TeamSpeak, and run the import again."
+            3331 => "TeamSpeak has banned this address for too many queries (flood protection, 10 minutes \
+                     by default). Add the address the import connects from to query_ip_allowlist.txt \
+                     next to ts3server (127.0.0.1 is there by default, so an SSH tunnel avoids this), \
+                     restart TeamSpeak, and run the import again."
+                .into(),
+            3329 => "TeamSpeak refuses this address: it is banned there (by a ban, or for flooding). Lift \
+                     the ban on TeamSpeak, or connect from an address in its query_ip_allowlist.txt \
+                     (127.0.0.1, through an SSH tunnel)."
                 .into(),
             1024 => format!(
                 "TeamSpeak has no virtual server {sid}. Most have only server 1; `serverlist` in a \
@@ -37,7 +41,8 @@ pub fn query_hint(error: &anyhow::Error, from: &str, sid: u32) -> Option<String>
         return Some(format!(
             "Nothing answers on {from}. Is TeamSpeak running, and is its ServerQuery on that port (10011 \
              unless query_port says otherwise)? For a TeamSpeak server on another machine, open a tunnel \
-             first: ssh -N -L 10011:127.0.0.1:10011 user@that-host, then --from 127.0.0.1:10011."
+             first: ssh -N -L 20011:127.0.0.1:10011 user@that-host, then --from 127.0.0.1:20011 (not 10011 \
+             locally: a Gwar server with --teamspeak uses it for its own TeamSpeak)."
         ));
     }
     let text = format!("{error:#}");
@@ -50,7 +55,7 @@ pub fn query_hint(error: &anyhow::Error, from: &str, sid: u32) -> Option<String>
     if text.contains("timed out") {
         return Some(format!(
             "{from} did not answer in time: a firewall may drop the connection. Reach TeamSpeak through an \
-             SSH tunnel (ssh -N -L 10011:127.0.0.1:10011 user@that-host) and use --from 127.0.0.1:10011."
+             SSH tunnel (ssh -N -L 20011:127.0.0.1:10011 user@that-host) and use --from 127.0.0.1:20011."
         ));
     }
     None
@@ -63,6 +68,7 @@ pub struct DryRun<'a> {
     pub passwords_given: bool,
     pub drop_passwords: bool,
     pub for_bridge: bool,
+    pub replace_channels: bool,
     /// The Gwar server holds its data directory (runs): the import would go through it.
     pub server_running: bool,
 }
@@ -106,7 +112,13 @@ pub fn after_dry_run(d: &DryRun) -> String {
              same passwords as before.",
         );
     }
-    if d.server_running {
+    if d.server_running && d.replace_channels {
+        next(
+            &mut out,
+            "Stop this server, then run the same command without --dry-run: --replace-channels needs it \
+             stopped. (Later imports can run while it runs, without --replace-channels.)",
+        );
+    } else if d.server_running {
         next(
             &mut out,
             "Run the same command without --dry-run. This server is running: the import goes through it, and \

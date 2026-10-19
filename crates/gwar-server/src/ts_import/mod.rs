@@ -141,16 +141,15 @@ pub fn parse_passwords(text: &str) -> Result<BTreeMap<String, String>> {
     Ok(out)
 }
 
-/// Where a quoted name ends: the first `"` not written `\"`.
+/// Where a quoted name ends: the first `"` after an even number of backslashes (a path writes
+/// a backslash `\\`, the quoting a quote `\"`).
 fn closing_quote(rest: &str) -> Option<usize> {
-    let bytes = rest.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' if bytes.get(i + 1) == Some(&b'"') => i += 2,
-            b'"' => return Some(i),
-            _ => i += 1,
+    let mut backslashes = 0;
+    for (i, b) in rest.bytes().enumerate() {
+        if b == b'"' && backslashes % 2 == 0 {
+            return Some(i);
         }
+        backslashes = if b == b'\\' { backslashes + 1 } else { 0 };
     }
     None
 }

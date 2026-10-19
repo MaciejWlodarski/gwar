@@ -574,7 +574,16 @@ impl Store {
     /// Opens (and migrates) a database. A new one gets its channels only when
     /// the server first starts ([`Store::seed_channels`]), not from administrative commands.
     pub fn open(path: &Path) -> Result<Self> {
+        let new = !path.exists();
         let db = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+        // A new database is its owner's only before anything goes in (password hashes, messages,
+        // passwords queued for the bridge); SQLite gives its -wal and -shm the same mode.
+        #[cfg(unix)]
+        if new {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("restrict {}", path.display()))?;
+        }
         Self::init(db)
     }
 

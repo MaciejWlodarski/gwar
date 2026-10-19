@@ -70,28 +70,30 @@ now the owner. Stop the server again (Ctrl-C) for the first import.
 ServerQuery sends its password in clear, so go through SSH. On the new host:
 
 ```sh
-ssh -N -L 10011:127.0.0.1:10011 you@old-teamspeak-host &
+ssh -N -L 20011:127.0.0.1:10011 you@old-teamspeak-host &
 ```
 
-Leave it running. The import then connects to `127.0.0.1:10011`, which
-TeamSpeak's `query_ip_allowlist.txt` already trusts, so its flood protection
-does not get in the way.
+Leave it running. The import then connects to `127.0.0.1:20011` (not 10011:
+that port is Gwar's own TeamSpeak's). On the old host the connection comes from
+127.0.0.1, which TeamSpeak's `query_ip_allowlist.txt` already trusts, so its
+flood protection does not get in the way.
 
 ### A3. Dry run and passwords (5 to 15 minutes)
 
 ```sh
 read -rs GWAR_TS_QUERY_PASSWORD && export GWAR_TS_QUERY_PASSWORD   # not in shell history
-gwar-server --data-dir data import-teamspeak --from 127.0.0.1:10011 --dry-run
+gwar-server --data-dir data import-teamspeak --from 127.0.0.1:20011 --dry-run
 ```
 
 It lists the roles with the permissions they get and why, the channels, the
 members and bans, and everything that does not move. Nothing changes. Read it,
 then follow the **Next steps** it prints.
 
-If the TeamSpeak server has passwords:
+Then write the passwords file (also when TeamSpeak has no passwords: the file
+is just empty then, and the commands below stay the same):
 
 ```sh
-gwar-server --data-dir data import-teamspeak --from 127.0.0.1:10011 --passwords-template passwords.txt
+gwar-server --data-dir data import-teamspeak --from 127.0.0.1:20011 --passwords-template passwords.txt
 ```
 
 `passwords.txt` (readable only by you) lists the server's password as
@@ -101,12 +103,14 @@ line empty to have that channel locked, and keep the file private.
 ### A4. Import (2 minutes)
 
 ```sh
-gwar-server --data-dir data import-teamspeak --from 127.0.0.1:10011 \
+gwar-server --data-dir data import-teamspeak --from 127.0.0.1:20011 \
   --passwords passwords.txt --for-bridge --replace-channels
 ```
 
 - `--for-bridge`: TeamSpeak clients on Gwar's TeamSpeak server use the same
-  passwords as before.
+  passwords as before, the server's and the channels'. Gwar keeps them in plain
+  text only until its TeamSpeak has taken them (the database is readable by its
+  owner only).
 - `--replace-channels`: drops Gwar's own starting channels (Lobby, General,
   AFK). It needs the server stopped, so it belongs to the first import only.
 
@@ -125,7 +129,7 @@ what you changed in Gwar.
 1. A day before, lower the TTL of your TeamSpeak address's DNS record (for
    example to 300 seconds), so the switch takes minutes, not hours.
 2. Import once more, with the server running, to bring the latest changes:
-   `gwar-server --data-dir data import-teamspeak --from 127.0.0.1:10011 --passwords passwords.txt --for-bridge`.
+   `gwar-server --data-dir data import-teamspeak --from 127.0.0.1:20011 --passwords passwords.txt --for-bridge`.
 3. Point the address at the new host: the A record of `ts.example.com`, or the
    `_ts3._udp` SRV record if your people type a name without a port. Add the
    name to Gwar too (another `--domain ts.example.com`) and restart it, so the
@@ -160,7 +164,8 @@ gwar-server --data-dir data import-teamspeak --from 127.0.0.1:10011 \
 ```
 
 A server that never ran gets the imported channels instead of its starting
-ones.
+ones. It had no database to keep a copy of: to start over, delete
+`data/gwar.sqlite3` (and `-wal`, `-shm`) and import again.
 
 ### B3. Switch over (2 minutes)
 
@@ -210,6 +215,8 @@ The importer explains the common failures itself. In short:
 | "the passwords file names …" | A name several channels share, or one that is not a password channel: write the channel's path, `Parent/Child` |
 | "needs the server stopped" | `--replace-channels` only with the Gwar server stopped |
 
-Every import keeps the database as it was (`data/gwar.sqlite3.before-import-<time>`);
-it prints the name. To undo an import, stop the server, put that file back as
-`data/gwar.sqlite3` and delete `gwar.sqlite3-wal` and `-shm`.
+Every import into an existing database keeps it as it was
+(`data/gwar.sqlite3.before-import-<time>`) and prints the name. To undo such an
+import, stop the server, put that file back as `data/gwar.sqlite3` and delete
+`gwar.sqlite3-wal` and `-shm`. The first import into a server that never ran
+(path B) has nothing to keep: delete `data/gwar.sqlite3*` to start over.

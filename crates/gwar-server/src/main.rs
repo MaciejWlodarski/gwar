@@ -429,7 +429,7 @@ async fn main() -> Result<()> {
             if !addr.ip().is_loopback() && !insecure_query {
                 anyhow::bail!(
                     "{from} is not this machine: raw ServerQuery sends the password unencrypted. Use an SSH tunnel \
-                     (ssh -L 10011:localhost:10011 that-host, then --from 127.0.0.1:10011) or pass --insecure-query"
+                     (ssh -N -L 20011:127.0.0.1:10011 that-host, then --from 127.0.0.1:20011) or pass --insecure-query"
                 );
             }
             let source = async {
@@ -447,16 +447,9 @@ async fn main() -> Result<()> {
                 .get("virtualserver_unique_identifier")
                 .cloned()
                 .unwrap_or_else(|| format!("{from}/{sid}"));
+            let plan = ts_import::plan::plan(&source, &options)?;
             if let Some(path) = passwords_template {
-                // Planned without --passwords' check that each name matches: the file is to be filled in.
-                let plan = ts_import::plan::plan(
-                    &source,
-                    &ts_import::plan::Options { passwords: Default::default(), ..options },
-                )?;
-                ts_import::write_passwords_template(
-                    &path,
-                    &ts_import::plan::passwords_template(&plan, &options.passwords),
-                )?;
+                ts_import::write_passwords_template(&path, &ts_import::plan::passwords_template(&plan))?;
                 println!(
                     "Wrote {} ({} passwords). Type each after its \"=\", then run the import with --passwords {}.",
                     path.display(),
@@ -465,7 +458,6 @@ async fn main() -> Result<()> {
                 );
                 return Ok(());
             }
-            let plan = ts_import::plan::plan(&source, &options)?;
             print!("{}", ts_import::plan::report(&plan));
             let apply_options = ts_import::apply::ApplyOptions { replace_channels, force, for_bridge };
             let summary = |applied: &ts_import::apply::Applied| {
@@ -497,7 +489,7 @@ async fn main() -> Result<()> {
                     false,
                 )?;
                 println!("\nDry run, on a copy of the database: {}\nNothing changed.", summary(&applied));
-                let server_running = gwar_server::members::lock_data_dir(&cli.data_dir).is_err();
+                let server_running = gwar_server::members::data_dir_in_use(&cli.data_dir);
                 print!(
                     "{}",
                     ts_import::guide::after_dry_run(&ts_import::guide::DryRun {
@@ -505,6 +497,7 @@ async fn main() -> Result<()> {
                         passwords_given,
                         drop_passwords,
                         for_bridge,
+                        replace_channels,
                         server_running,
                     })
                 );

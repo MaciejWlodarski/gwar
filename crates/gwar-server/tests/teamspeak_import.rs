@@ -32,7 +32,8 @@ fn free_port(udp: bool) -> u16 {
 }
 
 async fn cid(query: &Query, name: &str) -> String {
-    within("mirrored channel", async {
+    // Long enough for a bridge that reattaches after a live import (it waits a few seconds first).
+    let wait = tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let channels = query.call(Cmd::new("channellist")).await.unwrap();
             if let Some(cid) =
@@ -42,8 +43,14 @@ async fn cid(query: &Query, name: &str) -> String {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-    })
-    .await
+    });
+    wait.await.unwrap_or_else(|_| panic!("timed out waiting for the mirrored channel {name}"))
+}
+
+/// TeamSpeak's form of a channel's password: a hash keyed per server, the same for the same password.
+async fn password_hash(query: &Query, cid: &str) -> String {
+    let info = query.call(Cmd::new("channelinfo").arg("cid", cid)).await.unwrap();
+    info.first().and_then(|c| c.get("channel_password")).cloned().unwrap_or_default()
 }
 
 #[tokio::test]
@@ -79,7 +86,7 @@ async fn a_real_teamspeak_server_reads_and_imports() {
     admin.create_channel(json!({"name": "Clan"})).await;
     admin.create_channel(json!({"name": "Secret", "password": "hunter2"})).await;
     let clan = cid(&query, "Clan").await;
-    cid(&query, "Secret").await;
+    let original_secret = cid(&query, "Secret").await;
     // A moderator group with powers, and a members-only Clan, set as a TeamSpeak admin would.
     let created = query.call(Cmd::new("servergroupadd").arg("name", "Moderator")).await.unwrap();
     let sgid = created[0]["sgid"].clone();
@@ -150,16 +157,17 @@ async fn a_real_teamspeak_server_reads_and_imports() {
     let after = Client::connect(&server, "after").await;
     let names: Vec<_> = after.welcome.channels.iter().map(|c| c.name.as_str()).collect();
     assert!(names.contains(&"Clan (2)") && names.contains(&"Secret (2)"), "{names:?}");
+    // The bridge first locks the new channel with a random password, then sets the kept one:
+    // the same password as the channel created in Gwar with "hunter2", so the same hash.
     let secret = cid(&query, "Secret (2)").await;
-    within("the bridge sets the kept password on TeamSpeak", async {
-        loop {
-            let info = query.call(Cmd::new("channelinfo").arg("cid", &secret)).await.unwrap();
-            if info.first().and_then(|c| c.get("channel_flag_password")).is_some_and(|f| f == "1") {
-                break;
-            }
+    let hunter2 = password_hash(&query, &original_secret).await;
+    assert!(!hunter2.is_empty());
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while password_hash(&query, &secret).await != hunter2 {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
     })
-    .await;
+    .await
+    .expect("the bridge sets the kept password on TeamSpeak");
     let _ = std::fs::remove_dir_all(&dir);
 }

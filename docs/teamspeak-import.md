@@ -215,8 +215,8 @@ So the importer asks:
 ## Running it
 
 ```sh
-ssh -L 10011:localhost:10011 ts.example.com   # raw ServerQuery is unencrypted
-GWAR_TS_QUERY_PASSWORD=… gwar-server import-teamspeak --from 127.0.0.1:10011 [--user serveradmin] \
+ssh -N -L 20011:127.0.0.1:10011 ts.example.com   # raw ServerQuery is unencrypted
+GWAR_TS_QUERY_PASSWORD=… gwar-server import-teamspeak --from 127.0.0.1:20011 [--user serveradmin] \
   [--sid 1] [--dry-run] [--all-clients] [--spacers] [--replace-channels [--force]] \
   [--passwords passwords.txt | --drop-passwords] [--passwords-template new.txt] [--for-bridge]
 ```

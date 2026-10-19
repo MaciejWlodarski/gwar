@@ -127,6 +127,10 @@ pub struct Plan {
     /// such channel's path (see [`passwords_template`]).
     #[serde(default)]
     pub password_keys: Vec<String>,
+    /// The passwords given for them, by those keys: what `--passwords` resolved to, whichever way
+    /// it named them. Not sent to a running server (the plan carries them in place).
+    #[serde(skip)]
+    pub known_passwords: BTreeMap<String, String>,
 }
 
 /// Group types: 1 is a regular group (0 template, 2 query).
@@ -224,6 +228,7 @@ pub fn plan(source: &Source, options: &Options) -> Result<Plan> {
             match options.passwords.get_key_value(SERVER_PASSWORD) {
                 Some((key, p)) => {
                     used_passwords.insert(key);
+                    plan.known_passwords.insert(SERVER_PASSWORD.into(), p.clone());
                     Password::Kept(p.clone())
                 }
                 None => {
@@ -421,7 +426,10 @@ pub fn plan(source: &Source, options: &Options) -> Result<Plan> {
             }
             let overrides = merge_overrides(overrides);
             let password = if c.get("channel_flag_password").is_some_and(|f| f == "1") {
-                plan.password_keys.push(path.clone());
+                // A top-level channel called like the server's key cannot be named in the file.
+                if path != SERVER_PASSWORD {
+                    plan.password_keys.push(path.clone());
+                }
                 if options.drop_passwords {
                     plan.notes.push(format!("\"{path}\": password dropped (--drop-passwords)."));
                     Password::Dropped
@@ -438,6 +446,7 @@ pub fn plan(source: &Source, options: &Options) -> Result<Plan> {
                     match key.and_then(|k| options.passwords.get_key_value(k)) {
                         Some((key, p)) => {
                             used_passwords.insert(key);
+                            plan.known_passwords.insert(path.clone(), p.clone());
                             Password::Kept(p.clone())
                         }
                         None => {
@@ -657,7 +666,7 @@ fn parents_first(channels: Vec<PlannedChannel>) -> Vec<PlannedChannel> {
 
 /// A passwords file to fill in (`--passwords-template`): every password the TeamSpeak server has,
 /// one per line, with what is already known filled in. A line left empty keeps nothing.
-pub fn passwords_template(plan: &Plan, known: &BTreeMap<String, String>) -> String {
+pub fn passwords_template(plan: &Plan) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     for line in [
@@ -672,7 +681,10 @@ pub fn passwords_template(plan: &Plan, known: &BTreeMap<String, String>) -> Stri
     for key in &plan.password_keys {
         let name =
             if key.contains(['=', '#', '"']) { format!("\"{}\"", key.replace('"', "\\\"")) } else { key.clone() };
-        let _ = writeln!(out, "{name} = {}", known.get(key).map_or("", String::as_str));
+        // Quoted, so spaces at either end and quotes inside come back as they are.
+        let password =
+            plan.known_passwords.get(key).map(|p| format!("\"{}\"", p.replace('"', "\\\""))).unwrap_or_default();
+        let _ = writeln!(out, "{name} = {password}");
     }
     out
 }
