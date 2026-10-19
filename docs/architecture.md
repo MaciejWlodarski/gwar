@@ -415,7 +415,11 @@ connect and disconnect and refreshed for connected users every ten minutes and a
 shutdown). The core is a single actor, so one call removes at most 50 members
 and the client repeats it. Private and server-wide messages are never stored,
 so there is nothing of them to delete. `vc-server members` does the same on the
-database directly and needs the server stopped (`data/vc.lock`). `members merge
+database directly and needs the server stopped (`data/vc.lock`). On Unix the
+running server also listens on a local control socket, `data/admin.sock`
+(mode 0600, so only its own system user), one JSON request per connection;
+`vc-server import-teamspeak` uses it to import into the running server
+([teamspeak-import.md](teamspeak-import.md#running-it)). `members merge
 <from-uid> <into-uid> [--dry-run]` requires two existing members and the exclusive
 lock, even in dry-run mode. It reassigns messages, uploads, mentions, UID bans,
 invite ownership and linked TeamSpeak identities, unions roles, keeps the highest

@@ -10,6 +10,8 @@
 pub mod bridge;
 pub mod files;
 mod history;
+#[cfg(feature = "teamspeak")]
+mod import;
 mod links;
 mod messages;
 mod mls;
@@ -131,6 +133,14 @@ pub enum CoreMsg {
         failed: bool,
     },
     Info(oneshot::Sender<ServerInfo>),
+    /// A TeamSpeak import for the running server (`vc-server import-teamspeak` over the control socket).
+    #[cfg(feature = "teamspeak")]
+    Import {
+        plan: Box<crate::ts_import::plan::Plan>,
+        source: String,
+        options: crate::ts_import::apply::ApplyOptions,
+        reply: oneshot::Sender<Result<crate::ts_import::apply::Applied, String>>,
+    },
     DeviceAuthorized(String, String, oneshot::Sender<bool>),
     Bridge(BridgeMsg),
     Files(files::FileMsg),
@@ -663,6 +673,10 @@ impl Core {
             }
             CoreMsg::DeviceAuthorized(account_key, device_key, reply) => {
                 let _ = reply.send(self.store.device_revoked(&account_key, &device_key).is_ok_and(|revoked| !revoked));
+            }
+            #[cfg(feature = "teamspeak")]
+            CoreMsg::Import { plan, source, options, reply } => {
+                let _ = reply.send(self.import_live(&plan, &source, options));
             }
             CoreMsg::Info(reply) => {
                 let _ = reply.send(self.info.clone());
@@ -1508,8 +1522,8 @@ impl Core {
                 }
                 self.client_updated(session);
             }
-            BridgeMsg::PasswordSet(channel) => {
-                if let Err(e) = self.store.forget_bridge_password(channel) {
+            BridgeMsg::PasswordSet(channel, password) => {
+                if let Err(e) = self.store.forget_bridge_password(channel, &password) {
                     warn!("store: {e:#}");
                 }
             }
@@ -2257,7 +2271,7 @@ impl Core {
         row.password_hash = password_hash.unwrap_or_else(|| current.password_hash.clone());
         self.store.update_channel(&row).map_err(storage_error)?;
         // An imported password still waiting for the bridge is out of date now.
-        if password_changed && let Err(e) = self.store.forget_bridge_password(channel) {
+        if password_changed && let Err(e) = self.store.drop_bridge_password(channel) {
             warn!("store: {e:#}");
         }
         // A new password shuts out everyone who entered with the old one and has left since.
@@ -3406,7 +3420,10 @@ mod import_password_tests {
         assert!(sent, "the bridge gets the plain text");
         // Not gone until the bridge says it is set: a lost note is sent again on the next attach.
         assert_eq!(on_core(&core, |core| core.store.bridge_passwords().unwrap().len()).await, 1);
-        core.bridge(BridgeMsg::PasswordSet(channel)).await;
+        // An earlier bridge confirming an earlier password does not take a newer one away.
+        core.bridge(BridgeMsg::PasswordSet(channel, "older".into())).await;
+        assert_eq!(on_core(&core, |core| core.store.bridge_passwords().unwrap().len()).await, 1);
+        core.bridge(BridgeMsg::PasswordSet(channel, "hunter2".into())).await;
         assert!(on_core(&core, |core| core.store.bridge_passwords().unwrap().is_empty()).await);
     }
 

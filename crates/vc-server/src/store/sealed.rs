@@ -34,7 +34,7 @@ impl Store {
     /// Reserves the identity, ties finished uploads and prunes old bodies in the same transaction.
     /// Identities survive pruning and member removal, so neither permits replay.
     pub fn sealed_insert(&self, m: &SealedMessage, ciphertext: &[u8], files: &[FileId]) -> Result<Option<MessageId>> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.begin()?;
         if files.len() > 10 || files.iter().collect::<BTreeSet<_>>().len() != files.len() {
             return Err(InvalidFiles.into());
         }
@@ -141,7 +141,7 @@ impl Store {
     /// are unread: clients prune mention counts at the mark. A member's missing mark is
     /// set to the newest message the first time, so newcomers don't inherit the whole history.
     pub fn sealed_conversation_unread(&self, user: i64, conversation: &str) -> Result<ConversationUnread> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.begin()?;
         tx.execute(
             "INSERT OR IGNORE INTO conversation_reads(user_id,conversation,message)
              SELECT ?1,?2,COALESCE(MAX(id),0) FROM sealed_messages WHERE conversation=?2",

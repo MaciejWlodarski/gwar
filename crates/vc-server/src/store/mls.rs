@@ -132,7 +132,7 @@ impl Store {
         ended_requests: &[String],
         access: Option<(u64, &str)>,
     ) -> Result<()> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.begin()?;
         if let Some((seq, hash)) = access {
             tx.execute(
                 "INSERT INTO mls_access(group_id,seq,hash) VALUES(?1,?2,?3)
@@ -280,7 +280,7 @@ impl Store {
     }
 
     pub fn mls_publish_packages(&self, packages: &[(KeyPackageInfo, Vec<u8>)], device: &str, now: i64) -> Result<u32> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.begin()?;
         tx.execute("DELETE FROM mls_key_packages WHERE not_after<=?1", [now / 1000])?;
         for (info, bytes) in packages {
             if info.last_resort {
@@ -355,7 +355,7 @@ impl Store {
     }
 
     pub fn mls_consume_packages(&self, references: &[String]) -> Result<()> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.begin()?;
         for reference in references {
             tx.execute("DELETE FROM mls_key_packages WHERE ref=?1 AND last_resort=0", [reference])?;
         }
@@ -440,7 +440,7 @@ impl Store {
         } else {
             "DELETE FROM mls_welcomes WHERE device_key=?1 AND id=?2"
         };
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.begin()?;
         for id in ids {
             tx.execute(sql, params![device, id])?;
         }
@@ -450,7 +450,7 @@ impl Store {
 
     pub fn mls_request_history(&self, group: &str, device: &str, now: i64) -> Result<bool> {
         let key = format!("mls_history_request:{group}:{device}");
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.begin()?;
         let previous: Option<String> =
             tx.query_row("SELECT value FROM meta WHERE key=?1", [&key], |r| r.get(0)).optional()?;
         if previous.map(|s| s.parse::<i64>()).transpose()?.is_some_and(|t| now.saturating_sub(t) < 60_000) {
@@ -601,7 +601,7 @@ impl Store {
     }
 
     pub fn mls_prune(&self, now: i64) -> Result<()> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.begin()?;
         tx.execute("DELETE FROM mls_key_packages WHERE not_after<=?1", [now / 1000])?;
         tx.execute("DELETE FROM mls_log WHERE committed_at<?1", [now - RETENTION_MS])?;
         tx.execute("DELETE FROM mls_welcomes WHERE created_at<?1", [now - RETENTION_MS])?;

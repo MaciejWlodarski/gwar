@@ -17,11 +17,11 @@ fn r(pairs: &[(&str, &str)]) -> Record {
     pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
 }
 
-fn plan(source: &Source, options: &Options) -> Plan {
+pub(crate) fn plan(source: &Source, options: &Options) -> Plan {
     super::plan::plan(source, options).unwrap()
 }
 
-const BRIDGE: ApplyOptions = ApplyOptions { replace_channels: false, force: false, for_bridge: true };
+pub(crate) const BRIDGE: ApplyOptions = ApplyOptions { replace_channels: false, force: false, for_bridge: true };
 
 fn perms(pairs: &[(&str, i64)]) -> Perms {
     Perms(pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v, false))).collect())
@@ -30,7 +30,7 @@ fn perms(pairs: &[(&str, i64)]) -> Perms {
 /// A small TeamSpeak server: Guest (8, default), Server Admin (6), Moderator (9), a template group;
 /// Lobby (default), Clan with a members-only Room under it, a moderated Stage, a spacer, a temporary
 /// channel, and a password channel.
-fn source() -> Source {
+pub(crate) fn source() -> Source {
     let mut s = Source {
         server: r(&[
             ("virtualserver_name", "Old TS"),
@@ -244,7 +244,7 @@ fn applying_twice_updates_instead_of_adding_copies() {
     let secret = channels.iter().find(|c| c.name == "Secret").unwrap();
     assert!(crate::core::passwords::verify_secret("hunter2", secret.password_hash.as_deref().unwrap(), false));
     assert_eq!(store.bridge_passwords().unwrap(), vec![(secret.id, "hunter2".to_owned())]);
-    store.forget_bridge_password(secret.id).unwrap();
+    store.forget_bridge_password(secret.id, "hunter2").unwrap();
     let (_, boss) = store.user_by_uid("ts:AdminUid=").unwrap().unwrap();
     assert!(boss.groups.contains(&groups[1].id) && boss.groups.contains(&MEMBER_GROUP));
 
@@ -523,4 +523,28 @@ fn an_identity_linked_to_a_gwar_member_is_not_imported_as_a_member_of_its_own() 
     apply(&store, &plan(&source(), &Options::default()), "src", BRIDGE).unwrap();
     assert!(store.user_by_uid("ts:ClanAdminUid=").unwrap().is_none());
     assert_eq!(store.user_by_uid("native").unwrap().unwrap().1.teamspeak.len(), 2);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_import_command_hands_its_plan_to_the_running_server_over_its_socket() {
+    use std::os::unix::fs::PermissionsExt;
+    let core = crate::core::expiry_tests::test_core(Store::in_memory().unwrap(), None);
+    let dir = std::env::temp_dir().join(format!("gwar-ctl-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    // A stale socket from an earlier run is replaced.
+    std::fs::write(dir.join(crate::control::SOCKET), b"").unwrap();
+    let served = crate::control::serve(&dir, core.clone()).await.unwrap();
+    assert!(crate::control::available(&dir));
+    let mode = std::fs::metadata(dir.join(crate::control::SOCKET)).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+    let applied =
+        crate::control::import(&dir, plan(&source(), &Options::default()), "src".into(), BRIDGE).await.unwrap();
+    assert_eq!((applied.roles_created, applied.channels_created), (2, 5));
+    // The server's refusal comes back as an error.
+    let replace = ApplyOptions { replace_channels: true, ..BRIDGE };
+    let refused = crate::control::import(&dir, plan(&source(), &Options::default()), "src".into(), replace).await;
+    assert!(refused.unwrap_err().to_string().contains("needs the server stopped"));
+    served.abort();
+    std::fs::remove_dir_all(&dir).unwrap();
 }

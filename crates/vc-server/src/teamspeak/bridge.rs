@@ -1078,10 +1078,14 @@ impl<'a> Bridge<'a> {
             BridgeNote::Snapshot { .. } => warn!("unexpected second snapshot"),
             BridgeNote::Channel { channel, password, .. } => {
                 self.channels.insert(channel.id, channel.clone());
-                let typed = matches!(password, Some(Some(_)));
+                // Which typed password was set: a queued one goes only once this very one is.
+                let typed = password.clone().flatten();
                 match self.ensure_channel(&channel, password).await {
-                    Ok(()) if typed => self.core.bridge(BridgeMsg::PasswordSet(channel.id)).await,
-                    Ok(()) => {}
+                    Ok(()) => {
+                        if let Some(typed) = typed {
+                            self.core.bridge(BridgeMsg::PasswordSet(channel.id, typed)).await;
+                        }
+                    }
                     Err(e) => warn!(channel = channel.id, "TeamSpeak channel sync: {e:#}"),
                 }
                 self.reconcile(Duration::ZERO);
