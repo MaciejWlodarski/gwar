@@ -164,8 +164,9 @@ reloads (accepting then says it was not saved).
 - Revocations are keyed by (account key, device key) and served from a
   monotonic cursor. Servers disconnect a session, including its voice, when its
   certificate expires or is revoked.
-- Migrating an old browser's plaintext account root is crash-safe: the device
-  record is saved before the root is removed.
+- Signing in with the browser's own identity as the account key is crash-safe:
+  the device record is saved and the plaintext account root removed in one
+  transaction.
 
 ## Messages (implemented)
 

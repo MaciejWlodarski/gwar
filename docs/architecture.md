@@ -350,7 +350,7 @@ attachments, including hash failures, load only after
 a labeled user action. Image headers and decoded first frames are limited to
 4096 pixels per side and 16 million pixels; previews become static PNGs.
 
-The web/desktop client uses IndexedDB `gwar-message-auth-v3` (version 2) with
+The web/desktop client uses IndexedDB `gwar-message-auth-v3` (version 3) with
 separate `checkpoints`, `revocations` and `feeds` stores keyed per record. Each
 checkpoint update and feed merge uses one atomic transaction. Checkpoints key
 `(server_key, author_uid, message_id)` to the highest revision, statement/signature
@@ -402,8 +402,8 @@ members ranked below oneself, manages and gives only roles below one's rank, and
 never grants a permission one lacks. A token or invite only works while its
 maker could still give its role: demoting or removing them voids what they
 handed out. Tokens the
-server issues itself (the first admin token, `gwar-server admin-token`) have no maker;
-invites and tokens from before makers were recorded admit nobody. Channel and server
+server issues itself (the first admin token, `gwar-server admin-token`) have no maker.
+Channel and server
 passwords are stored as Argon2 of TeamSpeak's wire form `base64(sha1(password))`.
 
 Members are the users' rows in SQLite (`users`, with groups and read marks).

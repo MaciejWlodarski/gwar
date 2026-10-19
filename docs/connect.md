@@ -69,13 +69,9 @@ profile and TeamSpeak identities:
   `updated_at` is when the entry was added or last changed.
 - There is one entry per `uid`, and `default` is the `uid` used when nothing
   else is chosen. A reader repairs what it finds: it skips entries without a
-  `uid` or `identity` and repeated `uid`s (the first stays), and a `default`
-  that is not in the list means the first entry.
-- **Older form.** Earlier clients wrote one identity,
-  `{"teamspeak": {"identity": "…", "uid": "…", "updated_at": …}}`. Readers
-  accept it as a list of one entry named "TeamSpeak" (also the name for an
-  entry that has none), but only when `identities` is missing or has no usable
-  entry. Writers write only the list form and drop the three older fields.
+  `uid` or `identity` and repeated `uid`s (the first stays), an entry without
+  a name is "Default", and a `default` that is not in the list means the first
+  entry.
 - **Encrypted with the vault key:** `b64url(nonce ‖ AES-256-GCM(vault_key, nonce, UTF-8 JSON, aad))`,
   random 12-byte nonce, `aad = "gwar vault v1\n" + account public key (b64url)`.
   The key comes from the account key, so changing the password or recovering
@@ -114,8 +110,8 @@ the same list:
   bookmark beyond them stays on its device.
 - A removed server becomes a tombstone (`deleted`, `id`, `updated_at`) kept for
   90 days, so a device that still has it does not bring it back. Merging keeps
-  the newer `updated_at` per `id` (the vault on a tie); bookmarks saved before
-  syncing count as time 0. At most 100 entries; tombstones go first.
+  the newer `updated_at` per `id` (the vault on a tie). At most 100 entries;
+  tombstones go first.
 - One server is saved once. Clients compare servers rather than spellings: a Gwar
   address by the WebSocket URL it opens (`gwar.app` is `wss://gwar.app/ws`), or,
   once the device has connected, by the server's pinned key, so another address
@@ -395,8 +391,7 @@ HTTP. Servers cache the entire attestation and omit it once expired.
   account key (keeps roles) or a new one; make a device key and certificate;
   show the recovery code once. On activation, durably store the device record
   and remove a matching plaintext local root in one IndexedDB transaction.
-  Older signed-in records are repaired on load and sign-out. An unrelated
-  local identity stays; otherwise sign-out creates a fresh local identity.
+  An unrelated local identity stays; otherwise sign-out creates a fresh local identity.
   A previously exported identity backup remains a full account credential,
   even after revoking the device that exported it.
 - **Log in on a device:** prelogin → derive secrets → login → decrypt the
@@ -425,10 +420,7 @@ HTTP. Servers cache the entire attestation and omit it once expired.
   default. The browser shows the list read-only.
   The desktop keeps the lists as `teamspeak-identities.json` (device) and
   `teamspeak-identities.account.json` (account, removed on sign-out), each
-  `{"default": "<uid>", "identities": [{"uid", "name", "identity"}]}`. A single
-  identity file of older versions (`teamspeak-identity.json`, and
-  `teamspeak-identity.account.json`) becomes a list of one named "Default" the
-  first time it is read; the old file is left in place.
+  `{"default": "<uid>", "identities": [{"uid", "name", "identity"}]}`.
 - **Finding identities from the official TeamSpeak client (desktop):** only when
   the user asks (a button, or accepting the prompt before the first TeamSpeak
   connection on a device, asked once), the desktop reads the client's
@@ -456,9 +448,7 @@ and signed revocations are persisted together. Nothing deletes revocations.
 
 Client activation saves the device and deletes a matching plaintext root in
 one strict-durability IndexedDB transaction. Failure leaves both records as
-before. Legacy signed-in records are repaired on load or sign-out. A legacy
-browser already signed out has no account record identifying its root; sign
-in again to migrate it. Exported root backups cannot be removed by migration.
+before. Exported root backups stay full account credentials.
 
 Vault encryption authenticates contents, not freshness: a malicious service
 can replay an old vault and version. Revocation prevents future honest-service

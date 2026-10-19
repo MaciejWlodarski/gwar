@@ -218,17 +218,6 @@ needs: join and talk power, channel admins and the group order map onto
   only its signed member list.
 - Errors say why: "Moderator is above your rank", not "missing permission".
 
-## Moving existing servers
-
-Gwar is pre-release, so there is no full migration, only what keeps an existing
-data directory starting: roles get positions in their order of creation (Admin
-first, Member last), stored permission names are rewritten by the table above
-(`channel_create`, `channel_edit` and `channel_delete` become
-`manage_channels`; `token_create` and `invite_create` become `create_invites`;
-`member_remove` and `member_nickname` become `manage_members`), and Admin holds
-`administrator`. Step 2 adds `connect`, `speak` and `send_messages` to
-Member once, so existing members keep joining, talking and writing.
-
 ## Protocol
 
 - `Group` gains `position`, `hoist`, `mentionable`; `Permission` gets the new
