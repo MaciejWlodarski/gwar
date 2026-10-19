@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import integrityVectors from "../../../../crates/gwar-connect/tests/integrity-vectors.json";
 import { decodeBase64Url, encodeBase64Url } from "../net/base64url";
 import {
+  CHALLENGE_MS,
+  CLOCK_SKEW_MS,
+  checkChallenge,
   certifyDevice,
   certificateHash,
   credentialsStatement,
@@ -224,6 +227,29 @@ describe("shared Connect integrity vectors", () => {
       expect(statement).toBe(v[`${purpose}_statement`]);
       expect(await hashText(statement)).toBe(v[`${purpose}_hash`]);
       expect(await signText(account.jwk, statement)).toBe(v[`${purpose}_signature`]);
+    }
+  });
+});
+
+describe("challenge check", () => {
+  const service = encodeBase64Url(new Uint8Array(32).fill(1));
+  const challenge = (expires_at: number) => ({ challenge: encodeBase64Url(new Uint8Array(32).fill(2)), expires_at, credential_version: 0, service_key: service });
+
+  it("accepts a fresh challenge from a service whose clock is ahead of or behind this device's", () => {
+    const now = 1_800_000_000_000;
+    for (const serviceNow of [now, now + 1, now + 30_000, now + CLOCK_SKEW_MS - 1, now - 30_000, now - CLOCK_SKEW_MS + 1]) {
+      expect(() => checkChallenge(challenge(serviceNow + CHALLENGE_MS), service, now)).not.toThrow();
+    }
+    // The extremes: just short of expired, and the latest expiry allowed.
+    for (const expires of [now - CLOCK_SKEW_MS + 1, now + CHALLENGE_MS + CLOCK_SKEW_MS]) {
+      expect(() => checkChallenge(challenge(expires), service, now)).not.toThrow();
+    }
+  });
+
+  it("rejects challenges that are expired or live too long even allowing for skew", () => {
+    const now = 1_800_000_000_000;
+    for (const expires of [now - CLOCK_SKEW_MS, now - CLOCK_SKEW_MS - 1, now + CHALLENGE_MS + CLOCK_SKEW_MS + 1, Number.MAX_SAFE_INTEGER]) {
+      expect(() => checkChallenge(challenge(expires), service, now)).toThrow("Invalid Connect challenge");
     }
   });
 });
