@@ -723,3 +723,24 @@ fn a_unique_name_may_be_written_as_a_path_would_write_it() {
     let room = planned.channels.iter().find(|c| c.name == "Room=\\").unwrap();
     assert_eq!(room.password, Password::Kept("pw".into()));
 }
+
+#[test]
+fn a_channel_without_a_topic_takes_its_descriptions_first_line() {
+    let mut s = source();
+    // Clan has no topic; Lobby has one, and a description that stays out.
+    s.channels[1].insert(
+        "channel_description".into(),
+        "\n  [b][color=red]Our clan[/color][/b] since 2009\nRules: [url=https://x]here[/url]".into(),
+    );
+    s.channels[0].insert("channel_description".into(), "Say hello".into());
+    let planned = plan(&s, &Options::default());
+    let topic = |name: &str| planned.channels.iter().find(|c| c.name == name).unwrap().topic.clone();
+    assert_eq!(topic("Clan"), "Our clan since 2009");
+    assert_eq!(topic("Lobby"), "Welcome");
+    assert!(planned.notes.iter().any(|n| n.contains("\"Clan\"") && n.contains("first line became the topic")));
+    assert!(planned.notes.iter().any(|n| n.contains("\"Lobby\"") && n.contains("description not imported")));
+    // Only tags (an image, say): nothing to take.
+    s.channels[1].insert("channel_description".into(), "[img]https://x/banner.png[/img]".into());
+    let planned = plan(&s, &Options::default());
+    assert_eq!(planned.channels.iter().find(|c| c.name == "Clan").unwrap().topic, "");
+}

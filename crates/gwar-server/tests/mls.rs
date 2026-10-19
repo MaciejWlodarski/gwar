@@ -715,7 +715,7 @@ async fn decoded_blob_and_authenticated_frame_limits_are_enforced() {
         "bad_request"
     );
     let text = "x".repeat(640 * 1024 + 1);
-    a.send_raw(&text).await;
+    a.send_refused(&text).await;
     a.expect_disconnect().await;
     let mut raw = open(&server).await;
     raw.send(json!({"id":1,"op":"hello","d":{"junk":"x".repeat(97*1024)}})).await;

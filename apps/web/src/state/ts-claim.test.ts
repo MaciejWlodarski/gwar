@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { TsBridge } from "../connect/teamspeak";
+import type { ClaimSigner } from "../connect/teamspeak";
 import { claimAll, offerClaims, type ClaimLink } from "./ts-claim";
 import { useSettings } from "./settings";
 import { useUi } from "./stores";
@@ -9,15 +9,15 @@ const ME = "my-uid";
 
 function bridge(uids: string[], fail: string[] = []) {
   const signed: Array<{ uid: string; statement: string }> = [];
-  const ts: Partial<TsBridge> = {
-    list: async () => ({ source: "device", default: uids[0] ?? null, identities: uids.map((uid) => ({ uid, name: `name-${uid}` })) }),
+  const ts: ClaimSigner = {
+    identities: async () => uids.map((uid) => ({ uid, name: `name-${uid}` })),
     claimSign: async (uid, statement) => {
       signed.push({ uid, statement });
       if (fail.includes(uid)) throw new Error("no such identity");
       return { key: `key-${uid}`, signature: `sig-${uid}` };
     },
   };
-  return { ts: ts as TsBridge, signed };
+  return { ts, signed };
 }
 
 function server(claimable: string[]) {
@@ -95,9 +95,8 @@ describe("offering the TeamSpeak claim", () => {
     }
   });
 
-  it("stays quiet without a desktop, without identities or without a match, and asks again later then", async () => {
+  it("stays quiet without identities (a browser not signed in) or without a match, and asks again later then", async () => {
     const { link, calls } = server(["ts:Z="]);
-    await offerClaims(link, SERVER, ME, null);
     await offerClaims(link, SERVER, ME, bridge([]).ts);
     expect(calls).toEqual([]);
     await offerClaims(link, SERVER, ME, bridge(["A="]).ts);

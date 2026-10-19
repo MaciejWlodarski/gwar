@@ -407,6 +407,8 @@ A TeamSpeak identity linked to a member (a claim proves the identity's key,
 act as the member on the bridged TeamSpeak server: roles, overrides, rank and
 bans of either. Claims are bound to the server, the claimant and a one-time
 nonce; see "Clients" for what the desktop app's signing can and cannot check.
+In the browser the page signs claims itself with the identities from the
+account's vault: no stronger than the page that holds the unlocked vault.
 
 The server password protects the bridged TeamSpeak server too: the bridge sets
 the same password there, so TeamSpeak clients need it as Gwar apps do. Gwar
