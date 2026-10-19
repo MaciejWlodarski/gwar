@@ -859,6 +859,7 @@ export const pl: Record<Key, string> = {
   "tsClaim.unlinkConfirm": "Odłączyć tę tożsamość TeamSpeak? Role zostają; wejście z nią na TeamSpeaku nie będzie już liczone jako ten członek.",
   "tsClaim.unlinked": "Tożsamość TeamSpeak odłączona.",
   "tsClaim.check": "Przejmij role z TeamSpeaka",
+  "tsClaim.codes": "Twoje konto tutaj: {account}… · ten serwer: {server}…. Pytanie Gwara o każdą tożsamość pokazuje te same kody.",
   "tsClaim.none": "Żadna z twoich tożsamości TeamSpeak nie ma tu ról.",
 
   "close.removed": "{by} usunął(a) Cię z serwera. Możesz dołączyć ponownie jako nowy członek.",

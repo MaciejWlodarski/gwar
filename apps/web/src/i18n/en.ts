@@ -857,6 +857,7 @@ export const en = {
   "tsClaim.unlinkConfirm": "Unlink this TeamSpeak identity? The roles stay; joining with it on TeamSpeak no longer counts as this member.",
   "tsClaim.unlinked": "TeamSpeak identity unlinked.",
   "tsClaim.check": "Claim roles from TeamSpeak",
+  "tsClaim.codes": "Your account here: {account}… · this server: {server}…. Gwar's own question for each identity shows the same codes.",
   "tsClaim.none": "None of your TeamSpeak identities has roles here.",
 
   "close.removed": "You were removed from the server by {by}. You can join again as a new member.",

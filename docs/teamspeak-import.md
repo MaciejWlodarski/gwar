@@ -129,8 +129,13 @@ unless they accept, and declining is remembered for that server. A member's
 profile lists their linked identities (unlink there); one's own profile can
 also claim again later. The desktop's private keys never reach the web view:
 the app signs only a statement of exactly this form, and only after the
-person agrees in a native dialog naming the identity, so a compromised web
-view cannot give an identity's roles away on its own. The list is asked for on
+person agrees in a native dialog naming the identity and showing the first
+characters of the account and the server the statement binds (the app's own
+dialog shows the same codes), so a compromised web view cannot give an
+identity's roles away on its own or unnoticed. It could still ask about a
+destination of its choice: a web view that is compromised controls the
+person's Gwar session anyway, so the codes are the line of defence until the
+desktop keeps the Gwar identity natively too. The list is asked for on
 every visit, whatever matched or was answered before, so not even the requests
 depend on the person's identities. The web app follows
 later: it does not read TeamSpeak keys yet.

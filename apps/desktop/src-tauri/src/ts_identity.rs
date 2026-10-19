@@ -594,10 +594,16 @@ pub async fn ts_identity_claim(app: AppHandle, uid: String, statement: String) -
     })
     .await
     .map_err(|e| e.to_string())??;
+    // What the statement binds, as the app shows it too, so a substituted destination can be noticed.
+    let mut fields = statement.lines().skip(1);
+    let (server, account) = (fields.next().unwrap_or_default(), fields.next().unwrap_or_default());
+    let short = |s: &str| s.chars().take(8).collect::<String>();
     ask(
         &app,
         format!(
-            "Prove to this Gwar server that the TeamSpeak identity \"{name}\" is yours? The roles it has there move to your account on that server."
+            "Prove that the TeamSpeak identity \"{name}\" is yours, so its roles move to the Gwar account {}… on the server {}…? The app shows the same two codes.",
+            short(account),
+            short(server)
         ),
     )
     .await?;

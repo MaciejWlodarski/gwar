@@ -2,12 +2,15 @@ import { useState } from "react";
 import { useT } from "../i18n";
 import type { TsEntryInfo } from "../connect/teamspeak";
 import { shortUid } from "../connect/ts-list";
-import { useUi } from "../state/stores";
+import { useSession, useUi } from "../state/stores";
 import { Button, Dialog } from "./kit";
 
 /** Offers to bring the roles of these TeamSpeak identities here (docs/teamspeak-import.md, "Claim"). */
 export function ClaimDialog({ identities, resolve }: { identities: TsEntryInfo[]; resolve: (accepted: boolean) => void }) {
   const t = useT();
+  // The same codes the desktop's own question shows, to check that it asks about this account and server.
+  const account = useSession((s) => s.me?.uid ?? "").slice(0, 8);
+  const server = useSession((s) => s.serverKey ?? "").slice(0, 8);
   const closeDialog = useUi((s) => s.closeDialog);
   const [answered, setAnswered] = useState(false);
   const answer = (accepted: boolean) => {
@@ -39,6 +42,7 @@ export function ClaimDialog({ identities, resolve }: { identities: TsEntryInfo[]
           </li>
         ))}
       </ul>
+      <p className="text-xs text-muted">{t("tsClaim.codes", { account, server })}</p>
     </Dialog>
   );
 }
