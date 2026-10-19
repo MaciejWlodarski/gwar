@@ -198,10 +198,11 @@ So the importer asks:
   alike.
 - The bridge sets a TeamSpeak channel's password only from the plain text (the
   reason above). With `--for-bridge` (the server runs with `--teamspeak`) the
-  importer leaves each typed password in `ts_import_passwords`, on every run; the bridge
+  importer leaves each typed password in `ts_import_passwords` (the server's
+  in `meta`, `bridge_server_password`), on every run; the bridge
   sends it on attach and the row goes once TeamSpeak has taken it, or when the
-  channel's password changes in Gwar. Without `--for-bridge` none is written,
-  and a server started without TeamSpeak support clears the table. The
+  channel's (or the server's) password changes in Gwar. Without `--for-bridge`
+  none is written, and a server started without TeamSpeak support clears them. The
   database overwrites what it deletes (`secure_delete`) and empties its
   write-ahead log after, so no copy stays on disk; backups made while a
   password waits contain it, and are readable by their owner only.

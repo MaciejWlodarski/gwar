@@ -548,3 +548,21 @@ async fn the_import_command_hands_its_plan_to_the_running_server_over_its_socket
     served.abort();
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn the_servers_password_waits_for_the_bridge_like_a_channels() {
+    let mut s = source();
+    s.server.insert("virtualserver_flag_password".into(), "1".into());
+    let given = Options { passwords: [("@server".into(), "letmein".into())].into(), ..Default::default() };
+    let store = Store::in_memory().unwrap();
+    apply(&store, &plan(&s, &given), "src", ApplyOptions::default()).unwrap();
+    assert_eq!(store.bridge_server_password().unwrap(), None);
+    apply(&store, &plan(&s, &given), "src", BRIDGE).unwrap();
+    let (hash, queued) = store.bridge_server_password().unwrap().unwrap();
+    assert_eq!(queued, "letmein");
+    // Bound to the hash the import stored: the plain text of exactly that password.
+    assert_eq!(store.meta("password_hash").unwrap(), Some(hash));
+    // Imported again without it (locked with a random one): the queued one is no longer the password.
+    apply(&store, &plan(&s, &Options::default()), "src", BRIDGE).unwrap();
+    assert_eq!(store.bridge_server_password().unwrap(), None);
+}

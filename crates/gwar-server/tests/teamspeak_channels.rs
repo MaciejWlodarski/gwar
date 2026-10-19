@@ -544,6 +544,7 @@ async fn s6_controlled_routes(
         muted: false,
         deafened: false,
         away: None,
+        server_password: None,
         delay: Duration::ZERO,
     };
     let handle = puppet::spawn(voice, spec(1, route.clone()), shared.clone(), events.clone());
@@ -1081,4 +1082,120 @@ async fn a_claimed_teamspeak_identity_acts_as_its_member_on_teamspeak() {
     // On the Stage, the linked identity speaks with Alice's role; an unlinked one does not.
     wait_for_talker(&query, linked_clid, true).await;
     wait_for_talker(&query, other_clid, false).await;
+}
+
+/// Connects a TeamSpeak client with `password`: whether TeamSpeak lets it in.
+async fn teamspeak_admits(voice: std::net::SocketAddr, name: &str, password: Option<&str>) -> bool {
+    let mut builder = tsclientlib::Connection::build(voice.to_string()).name(name.to_string());
+    if let Some(password) = password {
+        builder = builder.password(password.to_string());
+    }
+    let mut con = builder.connect().unwrap();
+    let admitted = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let failed = !matches!(con.events().next().await, Some(Ok(_)));
+            if failed {
+                return false;
+            }
+            if let Ok(state) = con.get_state()
+                && state.clients.contains_key(&state.own_client)
+            {
+                return true;
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    if admitted {
+        let _ = con.disconnect(tsclientlib::DisconnectOptions::new());
+    }
+    admitted
+}
+
+#[tokio::test]
+#[ignore]
+async fn the_servers_password_holds_on_teamspeak_too() {
+    let root = PathBuf::from(std::env::var_os("GWAR_TS3_DIR").expect("GWAR_TS3_DIR"));
+    let installed = install::ensure_installed(&root).await.unwrap();
+    let dir = TempDir(std::env::temp_dir().join(format!("gwar-ts-password-{}", free_port(false))));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    std::os::unix::fs::symlink(&installed.dir, dir.0.join(installed.dir.file_name().unwrap())).unwrap();
+    let voice = format!("127.0.0.1:{}", free_port(true)).parse().unwrap();
+    let query_port = free_port(false);
+    let server = TestServer::start_with(|c| {
+        c.server_password = Some("from-cli".into());
+        c.teamspeak = Some(TeamSpeakConfig {
+            dir: dir.0.clone(),
+            voice,
+            query_port,
+            filetransfer: format!("127.0.0.1:{}", free_port(false)).parse().unwrap(),
+            public_url: None,
+        })
+    })
+    .await;
+    let mut ready = server.running.teamspeak_ready.clone().unwrap();
+    tokio::time::timeout(Duration::from_secs(120), ready.wait_for(|ready| *ready)).await.unwrap().unwrap();
+    let password = std::fs::read_to_string(dir.0.join("query-password")).unwrap();
+    let (query, _notes) =
+        Query::connect(format!("127.0.0.1:{query_port}").parse().unwrap(), "serveradmin", password.trim(), 1)
+            .await
+            .unwrap();
+    let field = |name: &'static str| {
+        let query = &query;
+        async move {
+            let info = query.call(Cmd::new("serverinfo")).await.unwrap();
+            info[0].get(name).cloned().unwrap_or_default()
+        }
+    };
+    // Up, it already has the password given on the command line, and starts only by the bridge.
+    assert_eq!(field("virtualserver_flag_password").await, "1");
+    assert_eq!(field("virtualserver_autostart").await, "0");
+    assert!(!teamspeak_admits(voice, "no-password", None).await);
+    assert!(teamspeak_admits(voice, "cli-password", Some("from-cli")).await);
+    let mut admin = Client::connect_as(&server, new_key(), "root", Some("from-cli")).await.unwrap();
+    admin.redeem(&server.admin_token).await;
+
+    // Set in Gwar: TeamSpeak takes the same password.
+    admin.ok("server.update", json!({"password": "hunter2"})).await;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !teamspeak_admits(voice, "probe", Some("hunter2")).await {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("TeamSpeak gets the new server password");
+    assert!(!teamspeak_admits(voice, "no-password", None).await);
+    assert!(!teamspeak_admits(voice, "wrong-password", Some("hunter3")).await);
+    assert!(teamspeak_admits(voice, "right-password", Some("hunter2")).await);
+
+    // Our puppets still get in: a Gwar user sharing a channel with a TeamSpeak user has one.
+    let mut ts = tsclientlib::Connection::build(voice.to_string())
+        .name("ts-user".to_string())
+        .password("hunter2".to_string())
+        .connect()
+        .unwrap();
+    within("TeamSpeak client", async {
+        loop {
+            ts.events().next().await.expect("TeamSpeak events").unwrap();
+            if let Ok(state) = ts.get_state()
+                && state.clients.contains_key(&state.own_client)
+            {
+                break;
+            }
+        }
+    })
+    .await;
+    admin.ok("channel.join", json!({"channel": 1})).await;
+    puppet_id(&query, "root").await;
+
+    // Removed in Gwar: open on TeamSpeak again.
+    admin.ok("server.update", json!({"password": ""})).await;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while field("virtualserver_flag_password").await != "0" {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("TeamSpeak's server password removed");
+    assert!(teamspeak_admits(voice, "open-again", None).await);
 }

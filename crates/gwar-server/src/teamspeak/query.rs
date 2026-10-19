@@ -237,6 +237,27 @@ impl Query {
         password: &str,
         server_id: u32,
     ) -> Result<(Query, mpsc::Receiver<Notification>)> {
+        Self::open(addr, login, password, server_id, false).await
+    }
+
+    /// [`Query::connect`], also to a virtual server that is not running (`use -virtual`), to set
+    /// it up before it starts.
+    pub async fn connect_stopped(
+        addr: SocketAddr,
+        login: &str,
+        password: &str,
+        server_id: u32,
+    ) -> Result<(Query, mpsc::Receiver<Notification>)> {
+        Self::open(addr, login, password, server_id, true).await
+    }
+
+    async fn open(
+        addr: SocketAddr,
+        login: &str,
+        password: &str,
+        server_id: u32,
+        stopped: bool,
+    ) -> Result<(Query, mpsc::Receiver<Notification>)> {
         let stream = timeout(Duration::from_secs(10), TcpStream::connect(addr))
             .await
             .context("connect timed out")?
@@ -264,7 +285,11 @@ impl Query {
             .call(Cmd::new("login").arg("client_login_name", login).arg("client_login_password", password))
             .await
             .context("query login")?;
-        query.call(Cmd::new("use").arg("sid", server_id)).await.context("select virtual server")?;
+        let mut select = Cmd::new("use").arg("sid", server_id);
+        if stopped {
+            select = select.flag("-virtual");
+        }
+        query.call(select).await.context("select virtual server")?;
         Ok((query, notify_rx))
     }
 

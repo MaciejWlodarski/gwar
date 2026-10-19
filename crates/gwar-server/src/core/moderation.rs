@@ -701,16 +701,33 @@ impl Core {
         match u.password {
             None => Some(apply(self, None)),
             // Hashing is slow: do it off the actor, then apply everything together.
-            Some(password) => self.defer(
-                move || (!password.is_empty()).then(|| passwords::hash_secret(&password, false)),
-                move |core, hash| {
-                    if !core.sessions.contains_key(&session) {
-                        return;
-                    }
-                    let result = apply(core, Some(hash));
-                    core.reply(session, id, result);
-                },
-            ),
+            Some(password) => {
+                let typed = password.clone();
+                self.defer(
+                    move || (!password.is_empty()).then(|| passwords::hash_secret(&password, false)),
+                    move |core, hash| {
+                        if !core.sessions.contains_key(&session) {
+                            return;
+                        }
+                        let result = apply(core, Some(hash.clone()));
+                        if result.is_ok() {
+                            // TeamSpeak takes the same password: it waits for the bridge (which may be
+                            // restarting) like one typed at an import, and replaces any such.
+                            let queued = match (&hash, core.info.teamspeak) {
+                                (Some(hash), true) => core.store.queue_bridge_server_password(hash, &typed),
+                                _ => core.store.forget_bridge_server_password(None),
+                            };
+                            if let Err(e) = queued {
+                                tracing::warn!("store: {e:#}");
+                            }
+                            let note =
+                                super::bridge::ServerPassword { plaintext: hash.is_some().then_some(typed), hash };
+                            core.notify_bridge(|| BridgeNote::ServerPassword(note));
+                        }
+                        core.reply(session, id, result);
+                    },
+                )
+            }
         }
     }
 

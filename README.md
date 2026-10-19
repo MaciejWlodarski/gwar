@@ -499,7 +499,8 @@ server from TeamSpeak (checksum-verified), runs it as a hidden child process
 and bridges it:
 
 - channels, the server name and the welcome message are managed by Gwar and
-  mirrored to TeamSpeak;
+  mirrored to TeamSpeak, and so is the server password: TeamSpeak users need
+  the same one as Gwar users;
 - TeamSpeak users appear in Gwar like everyone else, with a TS3/TS6 badge;
 - a Gwar user who shares a channel with TeamSpeak users (or chats with one
   privately) gets a stand-in client on TeamSpeak, so TeamSpeak users see, hear

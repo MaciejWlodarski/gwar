@@ -222,10 +222,17 @@ pub async fn start(config: Config) -> Result<Running> {
     let admin_token = core::ensure_first_admin_token(&store)?;
     let connect_seq: i64 = store.meta("connect_seq")?.and_then(|s| s.parse().ok()).unwrap_or(0);
     // A password set in the server settings (even "none") wins over the command line.
+    // The command line's is also kept in plain text, in memory, for the TeamSpeak bridge.
+    let mut password_plaintext = None;
     let hash = match store.meta("password_hash")? {
         Some(stored) => Some(stored).filter(|h| !h.is_empty()),
         None => match config.server_password.clone().filter(|p| !p.is_empty()) {
-            Some(p) => Some(tokio::task::spawn_blocking(move || core::hash_secret(&p, false)).await?),
+            Some(p) => {
+                let typed = p.clone();
+                let hash = tokio::task::spawn_blocking(move || core::hash_secret(&p, false)).await?;
+                password_plaintext = Some((hash.clone(), typed));
+                Some(hash)
+            }
             None => None,
         },
     };
@@ -243,6 +250,7 @@ pub async fn start(config: Config) -> Result<Running> {
             ice_servers: config.ice_servers,
             version: env!("CARGO_PKG_VERSION").into(),
             password: password.clone(),
+            password_plaintext,
             upload_limit: config.upload_limit,
             upload_quota: config.upload_quota,
             storage_limit: config.storage_limit,
