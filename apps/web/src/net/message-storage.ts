@@ -10,20 +10,22 @@ export const MAX_REVOCATIONS = 20_000;
 export const REVOCATION_FRESH_MS = 5 * 60_000;
 export interface Revocation { seq: number; account_key: string; device_key: string; revoked_at: number; signature: string }
 /** `files` fingerprints the signed attachments the message was first seen with; only its deletion may list others. */
-interface Checkpoint { revision: number; hash: string; created: number; conversation: string; at: number; proven?: boolean; deleted?: boolean; files?: string }
-interface Feed { cursor: number; checked: number; available?: boolean }
-/** `checked` is when the feed was last read to its end (this device's clock). */
-export interface RevocationState { revokedAt?: number; fresh: boolean; checked?: number }
+/** `order` (see `confirmedBefore`) is missing on revisions stored before it existed: those came before every ordered read. */
+interface Checkpoint { revision: number; hash: string; created: number; conversation: string; at: number; proven?: boolean; deleted?: boolean; files?: string; order?: number }
+/** `read`: the order of the last read to the feed's end. */
+interface Feed { cursor: number; checked: number; available?: boolean; read?: number }
+export interface RevocationState { revokedAt?: number; fresh: boolean; read?: number }
 /**
- * Whether this device stored a message revision (at `seenAt`) before its last complete revocation
- * check, which then found the signing device not revoked: content confirmed then keeps that
- * confirmation while the feed is stale, and only what arrived since is unconfirmed. A later
- * revocation still marks it. Both times are this device's clock; a check from the far future (a
- * clock set back) confirms nothing.
+ * Whether this device stored a message revision (`order`) before its last complete read of the
+ * revocation feed, which then found the signing device not revoked: content confirmed then keeps
+ * that confirmation while the feed is stale, and only what arrived since is unconfirmed. A later
+ * revocation still marks it. Stored revisions and complete reads share one persistent counter, so
+ * no clock decides what came first.
  */
-export function confirmedBefore(seenAt: number | undefined, r: RevocationState | undefined, now = Date.now()): boolean {
-  return seenAt !== undefined && r?.checked !== undefined && r.revokedAt === undefined && seenAt <= r.checked && r.checked - now <= REVOCATION_FRESH_MS;
+export function confirmedBefore(order: number | undefined, r: RevocationState | undefined): boolean {
+  return order !== undefined && r?.read !== undefined && r.revokedAt === undefined && order < r.read;
 }
+const ORDER = "order";
 const pair = (account: string, device: string) => `${account}:${device}`;
 const requestValue = <T>(request: IDBRequest<T>): Promise<T> => new Promise((resolve, reject) => {
   request.onsuccess = () => resolve(request.result);
@@ -45,11 +47,14 @@ export class MessageStorage {
   constructor(private name = "gwar-message-auth-v3") {}
   private open(): Promise<IDBDatabase> {
     return this.db ??= new Promise((resolve, reject) => {
-      const request = indexedDB.open(this.name, 2);
+      const request = indexedDB.open(this.name, 3);
       request.onupgradeneeded = () => {
-        request.result.createObjectStore("checkpoints").createIndex("at", "at");
-        request.result.createObjectStore("revocations");
-        request.result.createObjectStore("feeds");
+        const db = request.result, missing = (name: string) => !db.objectStoreNames.contains(name);
+        if (missing("checkpoints")) db.createObjectStore("checkpoints").createIndex("at", "at");
+        if (missing("revocations")) db.createObjectStore("revocations");
+        if (missing("feeds")) db.createObjectStore("feeds");
+        // One counter ordering stored revisions and complete feed reads (version 3).
+        if (missing(ORDER)) db.createObjectStore(ORDER);
       };
       request.onerror = () => reject(request.error);
       request.onsuccess = () => resolve(request.result);
@@ -68,9 +73,9 @@ export class MessageStorage {
       });
     });
   }
-  /** `seenAt`: when this device first stored the revision it returns as proven or unproven. */
-  async checkpoint(key: string, next: Checkpoint, predecessor: string): Promise<{ continuity: "proven" | "unproven" | "rollback" | "fork"; duplicate: boolean; seenAt?: number }> {
-    return this.transaction(["checkpoints"], "readwrite", async (tx) => {
+  /** `order`: when, among complete feed reads, this device stored the revision it returns as proven or unproven. */
+  async checkpoint(key: string, next: Omit<Checkpoint, "order">, predecessor: string): Promise<{ continuity: "proven" | "unproven" | "rollback" | "fork"; duplicate: boolean; order?: number }> {
+    return this.transaction(["checkpoints", ORDER], "readwrite", async (tx) => {
       const store = tx.objectStore("checkpoints");
       const old: Checkpoint | undefined = await requestValue(store.get(key));
       if (old) {
@@ -79,12 +84,13 @@ export class MessageStorage {
         if (next.created !== old.created || next.conversation !== old.conversation) return { continuity: "fork", duplicate: false };
         if (!next.deleted && old.files !== undefined && next.files !== old.files) return { continuity: "fork", duplicate: false };
         if (next.revision === old.revision) {
-          return next.hash === old.hash ? { continuity: old.proven ? "proven" : "unproven", duplicate: true, seenAt: old.at } : { continuity: "fork", duplicate: false };
+          return next.hash === old.hash ? { continuity: old.proven ? "proven" : "unproven", duplicate: true, order: old.order ?? 0 } : { continuity: "fork", duplicate: false };
         }
         if (next.revision === old.revision + 1 && predecessor !== old.hash) return { continuity: "fork", duplicate: false };
       }
       const proven = next.revision === 0 || (!!old && !!old.proven && next.revision === old.revision + 1 && predecessor === old.hash);
-      store.put({ ...next, proven }, key);
+      const order = await requestValue<number | undefined>(tx.objectStore(ORDER).get(ORDER)) ?? 0;
+      store.put({ ...next, proven, order }, key);
       if (!old) {
         const count = await requestValue(store.count());
         if (count > MAX_CHECKPOINTS) {
@@ -99,7 +105,7 @@ export class MessageStorage {
           });
         }
       }
-      return { continuity: proven ? "proven" : "unproven", duplicate: false, seenAt: next.at };
+      return { continuity: proven ? "proven" : "unproven", duplicate: false, order };
     });
   }
   /** One read transaction for all authorization notes in a visible thread. */
@@ -113,7 +119,7 @@ export class MessageStorage {
       const keys = [...new Set(pairs.map((p) => pair(p.account, p.device)))];
       const states = await Promise.all(keys.map(async (key) => {
         const entry: Revocation | undefined = await requestValue(tx.objectStore("revocations").get(key));
-        return [key, { revokedAt: entry?.revoked_at, fresh, checked: feed?.checked || undefined }] as const;
+        return [key, { revokedAt: entry?.revoked_at, fresh, read: feed?.read }] as const;
       }));
       return new Map(states);
     });
@@ -138,7 +144,7 @@ export class MessageStorage {
           || !strictVerify(e.account_key, revokeStatement(e.account_key, e.device_key, e.revoked_at), e.signature)) throw new Error("Invalid revocation feed");
       previous = e.seq;
     }
-    await this.transaction(["revocations", "feeds"], "readwrite", async (tx) => {
+    await this.transaction(["revocations", "feeds", ORDER], "readwrite", async (tx) => {
       const feeds = tx.objectStore("feeds"), revocations = tx.objectStore("revocations");
       const oldFeed: Feed | undefined = await requestValue(feeds.get(base));
       if (!oldFeed && await requestValue(feeds.count()) >= 8) throw new Error("Revocation service storage full");
@@ -152,7 +158,13 @@ export class MessageStorage {
       }
       if (await requestValue(revocations.count()) > MAX_REVOCATIONS) throw new Error("Revocation storage full");
       feed.available = complete;
-      if (complete) feed.checked = now;
+      if (complete) {
+        feed.checked = now;
+        // Revisions stored from now on come after this read.
+        const order = (await requestValue<number | undefined>(tx.objectStore(ORDER).get(ORDER)) ?? 0) + 1;
+        tx.objectStore(ORDER).put(order, ORDER);
+        feed.read = order;
+      }
       feeds.put(feed, base);
     });
     await this.loadRevocations();

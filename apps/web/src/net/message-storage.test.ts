@@ -88,7 +88,7 @@ describe("per-record storage work", () => {
       expect(puts).toHaveBeenCalledOnce();
       expect(puts.mock.calls[0]?.[1]).toBe("server:author:message");
       expect(transactions).toHaveBeenCalledTimes(2);
-      expect(transactions.mock.calls.every(([stores, mode]) => JSON.stringify(stores) === '["checkpoints"]' && mode === "readwrite")).toBe(true);
+      expect(transactions.mock.calls.every(([stores, mode]) => JSON.stringify(stores) === '["checkpoints","order"]' && mode === "readwrite")).toBe(true);
     } finally { puts.mockRestore(); transactions.mockRestore(); }
   });
   it("reads thread authorization in one transaction and aborts an extra feed at the eight-service bound", async () => {
