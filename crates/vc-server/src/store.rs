@@ -76,7 +76,7 @@ pub const MAX_TEAMSPEAK_LINKS: i64 = 64;
 
 /// In what imports last wrote for channels, `from`'s member overrides become `into`'s, except where
 /// `into` has one already (that one stays): exactly what the overrides themselves went through.
-fn move_import_overrides(tx: &rusqlite::Transaction<'_>, from: &str, into: &str) -> Result<()> {
+fn move_import_overrides(tx: &Connection, from: &str, into: &str) -> Result<()> {
     let pattern = format!("%{}%", serde_json::to_string(from)?.trim_matches('"'));
     let mut stmt =
         tx.prepare("SELECT source,ts_id,written FROM ts_imports WHERE kind='channel' AND written LIKE ?1")?;
@@ -101,6 +101,46 @@ fn move_import_overrides(tx: &rusqlite::Transaction<'_>, from: &str, into: &str)
         )?;
     }
     Ok(())
+}
+
+/// A store transaction. Inside another one (`Store::atomically`) it is a savepoint of that one
+/// instead, so the outer transaction decides whether anything is kept. Dropped without `commit`, it
+/// rolls back.
+pub struct Tx<'a> {
+    db: &'a Connection,
+    nested: bool,
+    done: bool,
+}
+
+impl std::ops::Deref for Tx<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.db
+    }
+}
+
+impl Tx<'_> {
+    pub fn commit(mut self) -> rusqlite::Result<()> {
+        self.done = true;
+        self.db.execute_batch(if self.nested { "RELEASE gwar_nested" } else { "COMMIT" })
+    }
+
+    pub fn rollback(mut self) -> rusqlite::Result<()> {
+        self.done = true;
+        self.undo()
+    }
+
+    fn undo(&self) -> rusqlite::Result<()> {
+        self.db.execute_batch(if self.nested { "ROLLBACK TO gwar_nested; RELEASE gwar_nested" } else { "ROLLBACK" })
+    }
+}
+
+impl Drop for Tx<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = self.undo();
+        }
+    }
 }
 
 /// A TeamSpeak identity's uid as a member uid: `ts:<uid>`.
@@ -489,11 +529,7 @@ const MIGRATIONS: &[&str] = &[
     "#,
 ];
 
-fn write_overrides(
-    tx: &rusqlite::Transaction,
-    channel: ChannelId,
-    overrides: &[vc_proto::ChannelOverride],
-) -> Result<()> {
+fn write_overrides(tx: &Connection, channel: ChannelId, overrides: &[vc_proto::ChannelOverride]) -> Result<()> {
     tx.execute("DELETE FROM channel_overrides WHERE channel=?1", [channel])?;
     for o in overrides {
         tx.execute(
@@ -789,7 +825,7 @@ impl Store {
 
     /// Replaces a channel's overrides.
     pub fn set_channel_overrides(&self, channel: ChannelId, overrides: &[vc_proto::ChannelOverride]) -> Result<()> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.begin()?;
         write_overrides(&tx, channel, overrides)?;
         tx.commit()?;
         Ok(())
@@ -868,8 +904,20 @@ impl Store {
     }
 
     /// Drops a queued password (set on TeamSpeak, or replaced in Gwar), leaving no copy behind.
-    pub fn forget_bridge_password(&self, channel: ChannelId) -> Result<()> {
+    /// Forgets whatever password `channel` has queued (its password changed in Gwar).
+    pub fn drop_bridge_password(&self, channel: ChannelId) -> Result<()> {
         if self.db.execute("DELETE FROM ts_import_passwords WHERE channel=?1", [channel])? > 0 {
+            self.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    /// Forgets `channel`'s queued password once TeamSpeak has that one (a later queued one stays).
+    pub fn forget_bridge_password(&self, channel: ChannelId, password: &str) -> Result<()> {
+        let gone = self
+            .db
+            .execute("DELETE FROM ts_import_passwords WHERE channel=?1 AND password=?2", params![channel, password])?;
+        if gone > 0 {
             self.checkpoint()?;
         }
         Ok(())
@@ -938,7 +986,7 @@ impl Store {
 
     /// The row and its overrides in one transaction.
     pub fn update_channel(&self, row: &ChannelRow) -> Result<()> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.begin()?;
         tx.execute(
             "UPDATE channels SET parent=?2,name=?3,topic=?4,position=?5,password_hash=?6,max_clients=?7,access=?8,synced=?9 WHERE id=?1",
             params![row.id, row.parent, row.name, row.topic, row.position, row.password_hash, row.max_clients, access_json(row)?, row.synced],
@@ -952,7 +1000,7 @@ impl Store {
     /// with the encrypted conversations of every deleted channel in the same transaction:
     /// their MLS groups (with log, Welcomes, requests and history chunks), sealed messages and read marks.
     pub fn delete_channel(&self, id: ChannelId) -> Result<()> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.begin()?;
         let conversations: Vec<String> = tx
             .prepare(
                 "WITH RECURSIVE doomed(id) AS (SELECT ?1 UNION SELECT c.id FROM channels c JOIN doomed d ON c.parent=d.id)
@@ -1036,7 +1084,7 @@ impl Store {
 
     /// Stores the order of every role but Member, from the top.
     pub fn reorder_groups(&self, order: &[GroupId]) -> Result<()> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.begin()?;
         for (index, id) in order.iter().enumerate() {
             tx.execute("UPDATE groups SET position=?2 WHERE id=?1", params![id, index as i64])?;
         }
@@ -1077,7 +1125,7 @@ impl Store {
     }
 
     pub fn set_user_groups(&self, user_id: i64, groups: &[GroupId]) -> Result<()> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.begin()?;
         tx.execute("DELETE FROM user_groups WHERE user_id=?1", [user_id])?;
         for group in groups {
             tx.execute("INSERT INTO user_groups(user_id,group_id) VALUES(?1,?2)", params![user_id, group])?;
@@ -1154,7 +1202,7 @@ impl Store {
     /// Grants `group` and, for the first admin token while there is no owner, makes the user the
     /// owner (generation 1) in the same transaction. Returns whether they became the owner.
     pub fn grant_token_group(&self, user_id: i64, uid: &str, group: GroupId, first: bool) -> Result<bool> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.begin()?;
         tx.execute("INSERT OR IGNORE INTO user_groups(user_id,group_id) VALUES(?1,?2)", params![user_id, group])?;
         let owned = tx.query_row("SELECT 1 FROM meta WHERE key='owner_generation'", [], |_| Ok(())).optional()?;
         let becomes = first && group == ADMIN_GROUP && owned.is_none();
@@ -1169,7 +1217,7 @@ impl Store {
     /// `vc-server owner set`: the genesis of generation 1, only while there is no owner, for a
     /// stored member.
     pub fn set_owner(&self, uid: &str) -> Result<()> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.begin()?;
         if tx.query_row("SELECT 1 FROM meta WHERE key='owner_generation'", [], |_| Ok(())).optional()?.is_some() {
             anyhow::bail!("this server already has an owner; use `owner reset` for a lost owner account");
         }
@@ -1187,7 +1235,7 @@ impl Store {
     /// `vc-server owner reset`: a new generation with `uid` as its genesis owner; drops the old
     /// generation's chain, anchor and list. Returns the new generation.
     pub fn reset_owner(&self, uid: &str) -> Result<u64> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.begin()?;
         let user: i64 = tx
             .query_row("SELECT id FROM users WHERE uid=?1", [uid], |r| r.get(0))
             .optional()?
@@ -1222,7 +1270,7 @@ impl Store {
         signature: &str,
         new_owner: &str,
     ) -> Result<()> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.begin()?;
         tx.execute(
             "INSERT INTO owner_links(generation,seq,statement,signature) VALUES(?1,?2,?3,?4)",
             params![generation as i64, seq as i64, statement, signature],
@@ -1414,7 +1462,7 @@ impl Store {
     /// With `delete_messages` also everything they wrote, with its files.
     /// All or nothing; the caller announces the deleted messages and removes the files.
     pub fn remove_member(&self, id: i64, uid: &str, delete_messages: bool) -> Result<Removal> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.begin()?;
         let mut removal = Removal::default();
         if delete_messages {
             let mut stmt = tx.prepare(
@@ -1459,7 +1507,7 @@ impl Store {
         if from == into {
             bail!("cannot merge a member into itself");
         }
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.begin()?;
         let id = |uid: &str| -> Result<i64> {
             tx.query_row("SELECT id FROM users WHERE uid=?1", [uid], |r| r.get(0))
                 .optional()?
@@ -1562,7 +1610,7 @@ impl Store {
         if is_teamspeak(into) {
             bail!("{into} is a TeamSpeak identity; link to a Gwar member");
         }
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.begin()?;
         let into_id: i64 = tx
             .query_row("SELECT id FROM users WHERE uid=?1", [into], |r| r.get(0))
             .optional()?
@@ -1631,6 +1679,21 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![MEMBER_GROUP, limit], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// A transaction (a savepoint inside an outer one); see [`Tx`].
+    pub fn begin(&self) -> rusqlite::Result<Tx<'_>> {
+        let nested = !self.db.is_autocommit();
+        self.db.execute_batch(if nested { "SAVEPOINT gwar_nested" } else { "BEGIN" })?;
+        Ok(Tx { db: &self.db, nested, done: false })
+    }
+
+    /// Runs `work` in one transaction: everything it does is kept, or nothing (a live import).
+    pub fn atomically<T>(&self, work: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+        let tx = self.begin()?;
+        let value = work(self)?;
+        tx.commit()?;
+        Ok(value)
     }
 
     pub fn latest_message(&self, channel: ChannelId) -> Result<MessageId> {
@@ -1863,7 +1926,7 @@ impl Store {
 
     /// Stops charging removed files whose bytes are gone.
     pub fn forget_removed(&self, ids: &[FileId]) -> Result<()> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.begin()?;
         for id in ids {
             tx.execute("DELETE FROM removed_files WHERE id=?1", [id])?;
         }
@@ -1996,7 +2059,7 @@ impl Store {
 
     /// The TeamSpeak identities ban `ban` banned on TeamSpeak too, forgetting them (and any of bans gone).
     pub fn take_ban_teamspeak(&self, ban: BanId) -> Result<Vec<Uid>> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.begin()?;
         let mut stmt = tx.prepare("DELETE FROM ban_teamspeak WHERE ban=?1 RETURNING teamspeak")?;
         let mut taken: Vec<Uid> = stmt.query_map([ban], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
         drop(stmt);
@@ -2010,7 +2073,7 @@ impl Store {
 
     /// Permanently retain signed revocations and advance the cursor together.
     pub fn apply_revocations(&self, devices: &[crate::core::RevokedDevice], seq: i64) -> Result<bool> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.begin()?;
         let current = self.meta("connect_seq")?.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
         if seq <= current {
             return Ok(false);

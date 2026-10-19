@@ -1,6 +1,8 @@
 //! The running server's local control socket, `data/admin.sock` (Unix only): maintenance commands
 //! that would otherwise need the server stopped hand their work to it here. Only the server's own
-//! system user can open it (mode 0600), and it takes one request per connection:
+//! system user may use it: the socket is mode 0600, and a connection from any other user (one that
+//! got in before the mode was set, say) is refused by its peer credentials. It takes one request
+//! per connection, two connections at a time, each within a minute:
 //! `{"import": {plan, source, options}}` answers `{"ok": applied}` or `{"error": message}`.
 
 use std::path::Path;
@@ -17,6 +19,10 @@ use crate::ts_import::{
 pub const SOCKET: &str = "admin.sock";
 /// The largest request accepted: a plan with every client of a big TeamSpeak server.
 const MAX_REQUEST: u64 = 64 << 20;
+/// How long a connection may take to send its request.
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Connections handled at once; more are refused.
+const CONCURRENT: usize = 2;
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,7 +40,7 @@ enum ControlReply {
 /// Listens on `data_dir/admin.sock` for as long as the server runs.
 #[cfg(unix)]
 pub async fn serve(data_dir: &Path, core: crate::core::CoreHandle) -> Result<tokio::task::JoinHandle<()>> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let path = data_dir.join(SOCKET);
@@ -46,15 +52,33 @@ pub async fn serve(data_dir: &Path, core: crate::core::CoreHandle) -> Result<tok
     }
     let listener = tokio::net::UnixListener::bind(&path).with_context(|| format!("bind {}", path.display()))?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    // The socket file is ours: only connections from its owner are served.
+    let owner = std::fs::metadata(&path)?.uid();
+    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(CONCURRENT));
     Ok(tokio::spawn(async move {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else { continue };
+            if stream.peer_cred().map(|c| c.uid()).ok() != Some(owner) {
+                tracing::warn!("control socket: refused a connection from another system user");
+                continue;
+            }
+            let Ok(slot) = slots.clone().try_acquire_owned() else {
+                let _ = stream
+                    .write_all(&serde_json::to_vec(&ControlReply::Error("busy".into())).unwrap_or_default())
+                    .await;
+                continue;
+            };
             let core = core.clone();
             tokio::spawn(async move {
+                let _slot = slot;
                 let mut text = Vec::new();
-                let reply = match (&mut stream).take(MAX_REQUEST + 1).read_to_end(&mut text).await {
-                    Ok(_) if text.len() as u64 > MAX_REQUEST => ControlReply::Error("request too large".into()),
-                    Ok(_) => match serde_json::from_slice::<ControlRequest>(&text) {
+                let mut limited = (&mut stream).take(MAX_REQUEST + 1);
+                let read = tokio::time::timeout(READ_TIMEOUT, limited.read_to_end(&mut text)).await;
+                drop(limited);
+                let reply = match read {
+                    Err(_) => ControlReply::Error("no request within a minute".into()),
+                    Ok(Ok(_)) if text.len() as u64 > MAX_REQUEST => ControlReply::Error("request too large".into()),
+                    Ok(Ok(_)) => match serde_json::from_slice::<ControlRequest>(&text) {
                         Ok(ControlRequest::Import { plan, source, options }) => {
                             match core.import_live(plan, source, options).await {
                                 Ok(applied) => ControlReply::Ok(applied),
@@ -63,7 +87,7 @@ pub async fn serve(data_dir: &Path, core: crate::core::CoreHandle) -> Result<tok
                         }
                         Err(e) => ControlReply::Error(format!("bad request: {e}")),
                     },
-                    Err(e) => ControlReply::Error(format!("read: {e}")),
+                    Ok(Err(e)) => ControlReply::Error(format!("read: {e}")),
                 };
                 if let Ok(bytes) = serde_json::to_vec(&reply) {
                     let _ = stream.write_all(&bytes).await;

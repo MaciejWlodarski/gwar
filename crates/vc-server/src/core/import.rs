@@ -1,6 +1,7 @@
 //! A TeamSpeak import into the running server (docs/teamspeak-import.md, "Running it"): the plan is
-//! applied to the live database, then everything the core keeps in memory follows and everyone is
-//! told, as if each change had been made by hand.
+//! applied to the live database in one transaction, the core reloads what it keeps in memory, and
+//! everyone connects again, as after a restart that is not one: Gwar clients reconnect by themselves
+//! and get a fresh welcome, and the TeamSpeak bridge reattaches and syncs from scratch.
 
 use super::*;
 use crate::ts_import::{
@@ -19,154 +20,222 @@ impl CoreHandle {
 }
 
 impl Core {
-    /// Applies `plan` to the live database (in steps: a failure leaves what was done, and a re-run
-    /// finishes it), then reloads channels, roles and the server's settings, refreshes everyone
-    /// connected and has the TeamSpeak bridge reconnect to take the new channels and passwords.
-    pub(super) fn import_live(&mut self, plan: &Plan, source: &str, options: ApplyOptions) -> Result<Applied, String> {
+    /// Applies `plan` atomically, reloads roles, channels, the server's settings and password, then
+    /// has everyone connect again. The actor is busy meanwhile (hashing protected channels' passwords
+    /// takes most of it): requests wait, as they would during a restart.
+    pub(super) fn import_live(
+        &mut self,
+        plan: &Plan,
+        source: &str,
+        mut options: ApplyOptions,
+    ) -> Result<Applied, String> {
         if options.replace_channels {
             return Err("--replace-channels needs the server stopped".into());
         }
-        let before = self.admissions();
-        let applied = apply::apply(&self.store, plan, source, options).map_err(|e| format!("{e:#}"));
+        // Without a bridge nothing would ever take a typed password from the queue: none is kept.
+        options.for_bridge &= self.info.teamspeak;
+        let applied = self
+            .store
+            .atomically(|store| apply::apply(store, plan, source, options))
+            .map_err(|e| format!("nothing was changed: {e:#}"))?;
         if let Err(e) = self.reload_after_import() {
-            warn!("reloading after an import: {e:#}");
+            tracing::error!("the import is in the database, but reloading it failed: {e:#}");
+            return Err(format!(
+                "the import is in the database, but the server could not reload it ({e:#}): restart it"
+            ));
         }
-        self.announce_imported_members(plan);
-        if let Err(e) = self.refresh_sessions_after_import() {
-            warn!("refreshing sessions after an import: {e:#}");
+        // Everyone connects again and sees the server as it is now; nobody keeps an earlier unlock.
+        let ids: Vec<SessionId> = self.sessions.keys().copied().collect();
+        for id in ids {
+            self.remove(id, LeaveReason::ServerShutdown);
         }
-        self.reconcile_admissions(before);
-        self.enforce_connect_everywhere();
-        self.publish_routing();
-        // The bridge reconnects (the TeamSpeak supervisor attaches a new one) and syncs from scratch.
+        // The TeamSpeak supervisor attaches a new bridge, which syncs channels and queued passwords
+        // from scratch; TeamSpeak users stay on their server and come back through it.
         if self.bridge.take().is_some() {
             info!("TeamSpeak bridge restarts to take the import");
         }
-        if let Ok(applied) = &applied {
-            info!(
-                roles = applied.roles_created + applied.roles_updated,
-                channels = applied.channels_created + applied.channels_updated,
-                members = applied.members_created + applied.members_updated,
-                bans = applied.bans,
-                "TeamSpeak import applied to the running server"
-            );
-        }
-        applied
+        info!(
+            roles = applied.roles_created + applied.roles_updated,
+            channels = applied.channels_created + applied.channels_updated,
+            members = applied.members_created + applied.members_updated,
+            bans = applied.bans,
+            "TeamSpeak import applied to the running server"
+        );
+        Ok(applied)
     }
 
-    /// Makes the core's copies of channels, roles and the server's settings match the database again,
-    /// telling everyone what changed, and gives connected people their current roles.
+    /// Makes the core's copies of roles, channels, the server's settings and password match the
+    /// database again (nobody is connected to be told: everyone reconnects).
     fn reload_after_import(&mut self) -> anyhow::Result<()> {
-        // Roles: new, changed, gone, and their order.
-        let stored: BTreeMap<GroupId, Group> = self.store.groups()?.into_iter().map(|g| (g.id, g)).collect();
-        let order = |groups: &BTreeMap<GroupId, Group>| {
-            let mut ids: Vec<_> =
-                groups.values().filter(|g| g.id != MEMBER_GROUP).map(|g| (g.position, g.id)).collect();
-            ids.sort_unstable();
-            ids.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
-        };
-        let reordered = order(&stored) != order(&self.groups);
-        let gone: Vec<GroupId> = self.groups.keys().filter(|id| !stored.contains_key(id)).copied().collect();
-        let old = std::mem::replace(&mut self.groups, stored);
-        for id in gone {
-            self.broadcast(Event::GroupDeleted { group: id }, |_| true);
-        }
-        let groups: Vec<Group> = self.groups.values().cloned().collect();
-        for group in groups {
-            match old.get(&group.id) {
-                None => self.broadcast(Event::GroupCreated(group), |_| true),
-                Some(before) if *before != group => self.broadcast(Event::GroupUpdated(group), |_| true),
-                Some(_) => {}
-            }
-        }
-        if reordered {
-            let groups = order(&self.groups);
-            self.broadcast(Event::GroupsReordered { groups }, |_| true);
-        }
-
-        // Channels: an import only adds and changes them (it removes none while the server runs).
-        let stored: BTreeMap<ChannelId, ChannelRow> = self.store.channels()?.into_iter().map(|c| (c.id, c)).collect();
-        for (id, row) in stored {
-            let view = channel_view(&row);
-            let changed = match self.channels.get(&id) {
-                None => Some(true),
-                Some(before) if channel_view(before) != view || before.password_hash != row.password_hash => {
-                    Some(false)
-                }
-                Some(_) => None,
-            };
-            self.channels.insert(id, row);
-            match changed {
-                Some(true) => self.broadcast_channel(Event::ChannelCreated(view)),
-                Some(false) => self.broadcast_channel(Event::ChannelUpdated(view)),
-                None => {}
-            }
-        }
-
-        // The server's name, welcome, size and default channel.
-        let mut info = self.info.clone();
-        info.name = self.store.meta("name")?.unwrap_or(info.name);
-        info.welcome = self.store.meta("welcome")?.unwrap_or(info.welcome);
-        info.max_clients = self.store.meta("max_clients")?.and_then(|v| v.parse().ok()).unwrap_or(info.max_clients);
-        info.default_channel = self
+        self.groups = self.store.groups()?.into_iter().map(|g| (g.id, g)).collect();
+        self.channels = self.store.channels()?.into_iter().map(|c| (c.id, c)).collect();
+        let name = self.store.meta("name")?;
+        let welcome = self.store.meta("welcome")?;
+        let max_clients = self.store.meta("max_clients")?.and_then(|v| v.parse().ok());
+        let default_channel = self
             .store
             .meta("default_channel")?
-            .and_then(|v| v.parse().ok())
-            .filter(|id| self.channels.get(id).is_some_and(|c| !c.encrypted && !c.private))
-            .unwrap_or(info.default_channel);
-        if info != self.info {
-            self.info = info;
-            self.broadcast(Event::ServerUpdated(self.info.clone()), |_| true);
-        }
-
-        Ok(())
-    }
-
-    /// Tells everyone about the members an import made or changed (as many as a welcome lists).
-    fn announce_imported_members(&mut self, plan: &Plan) {
-        for m in plan.members.iter().take(MAX_MEMBERS as usize) {
-            match self.store.user_by_uid(&m.uid) {
-                Ok(Some((_, member))) => self.broadcast(Event::MemberUpdated(member), |_| true),
-                Ok(None) => {}
-                Err(e) => warn!("store: {e:#}"),
-            }
-        }
-    }
-
-    /// Gives everyone connected their roles now (a TeamSpeak user may have become a member) and
-    /// applies new bans.
-    fn refresh_sessions_after_import(&mut self) -> anyhow::Result<()> {
-        let ids: Vec<SessionId> = self.sessions.keys().copied().collect();
-        for id in ids {
-            let s = &self.sessions[&id];
-            let banned = self
-                .ban_for(Some(&s.uid), s.ip)
-                .or_else(|| (s.member != s.uid).then(|| self.ban_for(Some(&s.member), None)).flatten());
-            if let Some(ban) = banned {
-                self.remove(id, LeaveReason::Banned { by: ban.by, reason: ban.reason, until: ban.expires_at });
-                continue;
-            }
-            let (uid, member, user_id) = (s.uid.clone(), s.member.clone(), s.user_id);
-            let known = if user_id != 0 {
-                self.store.user_by_uid(&member)?
-            } else {
-                // An unknown TeamSpeak user the import made a member of.
-                let linked = self.store.teamspeak_member(&uid)?.unwrap_or_else(|| uid.clone());
-                self.store.user_by_uid(&linked)?
-            };
-            let Some((user_id, known)) = known else { continue };
-            let s = self.sessions.get_mut(&id).expect("listed above");
-            if s.user_id == user_id && s.groups == known.groups {
-                continue;
-            }
-            if s.user_id == 0 {
-                s.nickname = known.nickname.clone();
-            }
-            s.user_id = user_id;
-            s.member = known.uid.clone();
-            s.groups = known.groups.clone();
-            self.client_updated(id);
+            .and_then(|v| v.parse::<ChannelId>().ok())
+            .filter(|id| self.channels.get(id).is_some_and(|c| !c.encrypted && !c.private));
+        let info = &mut self.info;
+        info.name = name.unwrap_or_else(|| info.name.clone());
+        info.welcome = welcome.unwrap_or_else(|| info.welcome.clone());
+        info.max_clients = max_clients.unwrap_or(info.max_clients);
+        info.default_channel = default_channel.unwrap_or(info.default_channel);
+        // A password the import set (or cleared) is the server's now; one never stored stays as started.
+        if let Some(stored) = self.store.meta("password_hash")? {
+            self.password.store(Arc::new(Some(stored).filter(|h| !h.is_empty()).map(Into::into)));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::bridge::{BridgeMsg, RemoteClient};
+    use super::super::expiry_tests::{on_core, test_core, test_core_teamspeak};
+    use super::*;
+    use crate::ts_import::{
+        plan::Options,
+        tests::{BRIDGE, plan, source},
+    };
+
+    async fn gwar_session(core: &CoreHandle) -> mpsc::Receiver<Outbound> {
+        let (out, frames) = mpsc::channel(OUTBOUND_QUEUE);
+        core.connect(ConnectRequest {
+            request_id: 1,
+            hello_key: String::new(),
+            certificate: None,
+            uid: crate::identity::uid_for_key(&[1; 32]),
+            public_key: URL_SAFE_NO_PAD.encode([1; 32]),
+            nickname: "alice".into(),
+            platform: Platform::Web,
+            out,
+            ip: None,
+            device: None,
+            device_expires_at: None,
+            invite: None,
+            password_ok: true,
+        })
+        .await
+        .unwrap();
+        frames
+    }
+
+    async fn remote(core: &CoreHandle, uid: &str, channel: ChannelId) {
+        let (tx, rx) = oneshot::channel();
+        let client = RemoteClient {
+            uid: uid.into(),
+            nickname: uid.into(),
+            channel,
+            platform: Platform::Ts3,
+            muted: false,
+            deafened: false,
+            away: None,
+        };
+        core.bridge(BridgeMsg::Join(client, tx)).await;
+        rx.await.unwrap().unwrap();
+    }
+
+    /// The fixture with a server password, and that password typed for the import.
+    fn with_server_password() -> (crate::ts_import::plan::Plan, &'static str) {
+        let mut s = source();
+        s.server.insert("virtualserver_flag_password".into(), "1".into());
+        let passwords = [("@server", "top"), ("Secret", "hunter2")];
+        let options = Options {
+            passwords: passwords.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
+            ..Default::default()
+        };
+        (plan(&s, &options), "top")
+    }
+
+    #[tokio::test]
+    async fn a_live_import_is_applied_whole_and_everyone_reconnects_to_it() {
+        let core = test_core_teamspeak(Store::in_memory().unwrap()).unwrap();
+        let (notes, mut bridge) = mpsc::unbounded_channel();
+        core.bridge(BridgeMsg::Attach(notes)).await;
+        let mut frames = gwar_session(&core).await;
+        let lobby = core.info().await.unwrap().default_channel;
+        remote(&core, "ts:ModUid=", lobby).await;
+
+        let (planned, password) = with_server_password();
+        let applied = core.import_live(planned, "src".into(), BRIDGE).await.unwrap();
+        assert_eq!((applied.roles_created, applied.channels_created, applied.members_created), (2, 5, 3));
+        // Everyone was let go to come back; the Gwar client is told it is a restart (it reconnects).
+        let mut closed = None;
+        while let Ok(frame) = frames.try_recv() {
+            if let Outbound::Close(reason) = frame {
+                closed = Some(reason);
+            }
+        }
+        assert_eq!(closed, Some(LeaveReason::ServerShutdown));
+        let closed =
+            tokio::time::timeout(std::time::Duration::from_secs(2), async { while bridge.recv().await.is_some() {} })
+                .await;
+        assert!(closed.is_ok(), "the bridge was not let go");
+        // What the core keeps is what the database has now, the server password included.
+        let (sessions, roles, channels, hash) = on_core(&core, |core| {
+            (
+                core.sessions.len(),
+                core.groups.values().map(|g| g.name.clone()).collect::<Vec<_>>(),
+                core.channels.values().map(|c| c.name.clone()).collect::<Vec<_>>(),
+                core.password.load_full().as_ref().as_ref().map(|h| h.to_string()),
+            )
+        })
+        .await;
+        assert_eq!(sessions, 0);
+        assert!(roles.contains(&"Moderator".to_string()), "{roles:?}");
+        assert!(channels.contains(&"Secret".to_string()), "{channels:?}");
+        assert!(passwords::verify_secret(password, &hash.expect("a server password"), false));
+    }
+
+    #[tokio::test]
+    async fn a_failed_live_import_changes_nothing_and_lets_nobody_go() {
+        let store = Store::in_memory().unwrap();
+        // The bans come last: failing there tests that the roles and channels before go back too.
+        store
+            .raw()
+            .execute_batch("CREATE TRIGGER no_bans BEFORE INSERT ON bans BEGIN SELECT RAISE(ABORT, 'test'); END;")
+            .unwrap();
+        let core = test_core_teamspeak(store).unwrap();
+        let (notes, mut bridge) = mpsc::unbounded_channel();
+        core.bridge(BridgeMsg::Attach(notes)).await;
+        let mut frames = gwar_session(&core).await;
+        let before = on_core(&core, |core| (core.groups.len(), core.channels.len())).await;
+        let refused = core.import_live(with_server_password().0, "src".into(), BRIDGE).await;
+        assert!(refused.unwrap_err().starts_with("nothing was changed"));
+        let after = on_core(&core, |core| {
+            let stored = (core.store.groups().unwrap().len(), core.store.channels().unwrap().len());
+            (
+                (core.groups.len(), core.channels.len()),
+                stored,
+                core.sessions.len(),
+                core.store.meta("password_hash").unwrap(),
+            )
+        })
+        .await;
+        assert_eq!(after, (before, before, 1, None));
+        assert!(!std::iter::from_fn(|| frames.try_recv().ok()).any(|f| matches!(f, Outbound::Close(_))));
+        while bridge.try_recv().is_ok() {}
+        assert!(matches!(bridge.try_recv(), Err(mpsc::error::TryRecvError::Empty)), "the bridge stays");
+        // --replace-channels needs the server stopped.
+        let replace = ApplyOptions { replace_channels: true, ..BRIDGE };
+        assert!(
+            core.import_live(plan(&source(), &Options::default()), "src".into(), replace)
+                .await
+                .unwrap_err()
+                .contains("stopped")
+        );
+    }
+
+    #[tokio::test]
+    async fn without_teamspeak_a_live_import_keeps_no_typed_password() {
+        let core = test_core(Store::in_memory().unwrap(), None);
+        core.import_live(with_server_password().0, "src".into(), BRIDGE).await.unwrap();
+        assert!(on_core(&core, |core| core.store.bridge_passwords().unwrap().is_empty()).await);
+        // With TeamSpeak it waits for the bridge.
+        let core = test_core_teamspeak(Store::in_memory().unwrap()).unwrap();
+        core.import_live(with_server_password().0, "src".into(), BRIDGE).await.unwrap();
+        assert_eq!(on_core(&core, |core| core.store.bridge_passwords().unwrap().len()).await, 1);
     }
 }

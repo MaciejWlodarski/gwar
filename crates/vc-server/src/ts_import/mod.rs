@@ -139,4 +139,4 @@ pub fn read_passwords(path: &Path) -> Result<BTreeMap<String, String>> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

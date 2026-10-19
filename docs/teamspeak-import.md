@@ -236,17 +236,19 @@ VC_TS_QUERY_PASSWORD=… vc-server import-teamspeak --from 127.0.0.1:10011 [--us
   instead of the seeded ones.
 - **While the server runs** (it holds `data/vc.lock`), the import goes through
   the server instead: the command first makes the same dry run (on a copy, so
-  nothing is applied if that fails), then hands the plan to the running server
-  over its local control socket (`data/admin.sock`, a Unix socket only the
-  server's own system user can open). The server applies it to its database
-  and brings everyone up to date at once: new and changed channels, roles,
-  their order, the server's name and welcome, members' roles (also of people
-  connected right now, TeamSpeak users included) and new bans, which
-  disconnect whom they cover. The TeamSpeak bridge then reconnects (a few
-  seconds; TeamSpeak users stay on their server) to take the new channels and
-  passwords. Back up first (`vc-server backup`): a live import is applied in
-  steps, not all or nothing, but a failed one can simply be run again (re-runs
-  only finish what is missing). `--replace-channels` needs the server stopped.
+  nothing is applied if that fails), keeps the database as it was
+  (`vc.sqlite3.before-import-<time>`), then hands the plan to the running
+  server over its local control socket (`data/admin.sock`, a Unix socket only
+  the server's own system user can use). The server applies it in one
+  transaction (all or nothing, like the stopped import), reloads its channels,
+  roles, settings and password, and then everyone connects again, as after a
+  restart that is not one: Gwar apps reconnect by themselves within seconds
+  and see the server as it is now, and the TeamSpeak bridge reconnects to
+  take the new channels and passwords (TeamSpeak users stay on their server).
+  Requests wait while the server applies the import; hashing the passwords of
+  protected channels takes most of that. `--replace-channels` needs the server
+  stopped, and typed passwords wait for the bridge only on a server running
+  with TeamSpeak.
 - `--passwords` takes one `name = password` per line (`#` comments, quotes
   optional): a channel's path (`"Clan/Room"`; a `/` or `\` in a name is
   written `\/`, `\\`), a name no other imported channel has, or `@server`

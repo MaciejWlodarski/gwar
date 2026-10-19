@@ -40,7 +40,7 @@ pub enum BridgeMsg {
     Leave(SessionId, LeaveReason),
     Chat(SessionId, ChatTarget, String),
     /// A channel's password is set on TeamSpeak (one queued by an import may go).
-    PasswordSet(ChannelId),
+    PasswordSet(ChannelId, String),
 }
 
 #[derive(Debug, Clone)]
