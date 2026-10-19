@@ -343,6 +343,28 @@ async fn lock_encrypted(query: &Query, cid: u64) -> Result<()> {
     Ok(())
 }
 
+/// One of the virtual server's properties (`serverinfo`).
+async fn server_field(query: &Query, name: &str) -> Result<String> {
+    let info = query.call(Cmd::new("serverinfo")).await?;
+    Ok(info.first().and_then(|r| r.get(name)).cloned().unwrap_or_default())
+}
+
+/// Makes sure the virtual server takes clients only once the bridge has set its password: it
+/// never starts by itself, and one that did (its first run, or set up before this) stops now,
+/// sending away whoever it let in. Until the bridge starts it, TeamSpeak is closed, also when
+/// setting the bridge up fails.
+async fn seal(query: &Query) -> Result<()> {
+    if server_field(query, "virtualserver_autostart").await? == "0" {
+        return Ok(());
+    }
+    if server_field(query, "virtualserver_status").await? == "online" {
+        query.call(Cmd::new("serverstop").arg("sid", 1)).await?;
+        query.call(Cmd::new("use").arg("sid", 1).flag("-virtual")).await?;
+    }
+    query.call(Cmd::new("serveredit").arg("virtualserver_autostart", 0)).await?;
+    Ok(())
+}
+
 impl<'a> Bridge<'a> {
     async fn run(
         link: &Link,
@@ -354,6 +376,8 @@ impl<'a> Bridge<'a> {
         let (query, mut notifications) =
             // The virtual server waits, stopped, for its password (`set_server_password`).
             Query::connect_stopped(link.query, "serveradmin", &link.password, 1).await.context("connect ServerQuery")?;
+        // First of all, before anything here can fail: a server that started by itself stops.
+        seal(&query).await.context("stop the TeamSpeak server until its password is set")?;
         let (puppet_events, mut puppet_rx) = mpsc::channel(256);
         let (listener_events, mut listener_rx) = mpsc::channel(256);
         let mut bridge = Bridge {
@@ -572,8 +596,7 @@ impl<'a> Bridge<'a> {
     /// is set again on our side, never open where ours is not.
     ///
     /// At `startup` the bridge also starts the virtual server, which never starts by itself (no
-    /// autostart): it takes clients only once its password is ours. One that started by itself
-    /// anyway (its first run, or from before) stops first, so nobody it let in stays.
+    /// autostart, see [`seal`]): it takes clients only once its password is ours.
     async fn set_server_password(&mut self, ours: ServerPassword, startup: bool) -> Result<()> {
         let (password, typed) = match ours.hash.clone() {
             None => (None, false),
@@ -594,17 +617,8 @@ impl<'a> Bridge<'a> {
                 (Some(password), typed)
             }
         };
-        let mut running = false;
-        if startup {
-            let info = self.query.call(Cmd::new("serverinfo")).await?;
-            let field = |name: &str| info.first().and_then(|r| r.get(name)).cloned().unwrap_or_default();
-            running = field("virtualserver_status") == "online";
-            if running && field("virtualserver_autostart") != "0" && password.is_some() {
-                self.query.call(Cmd::new("serverstop").arg("sid", 1)).await?;
-                self.query.call(Cmd::new("use").arg("sid", 1).flag("-virtual")).await?;
-                running = false;
-            }
-        }
+        // Stopped unless the bridge started it before (see `seal`).
+        let running = startup && server_field(&self.query, "virtualserver_status").await? == "online";
         let edit = Cmd::new("serveredit")
             .arg("virtualserver_password", password.as_deref().unwrap_or(""))
             .arg("virtualserver_autostart", 0);
