@@ -270,6 +270,8 @@ struct Bridge<'a> {
     /// Who of the TeamSpeak users may talk, and in which of our channels, as our side last said
     /// ([`BridgeNote::Talker`]).
     talkers: HashMap<SessionId, (ChannelId, bool)>,
+    /// The whisper right as last set per TeamSpeak identity (see `sync_whisper`).
+    whispers: HashMap<u64, bool>,
     /// TeamSpeak users a refused move left in place, with that channel: a second refusal there
     /// means our side will not take them in it either.
     held: HashMap<u16, u64>,
@@ -361,6 +363,7 @@ impl<'a> Bridge<'a> {
             locked: HashSet::new(),
             held: HashMap::new(),
             talkers: HashMap::new(),
+            whispers: HashMap::new(),
         };
         let result = bridge.serve(&mut notifications, &mut puppet_rx, &mut listener_rx, ready).await;
         // Hand the TeamSpeak users back; the next attach starts from scratch.
@@ -718,7 +721,9 @@ impl<'a> Bridge<'a> {
         self.held.remove(&clid);
         if let Some(remote) = self.remotes.remove(&clid) {
             self.talkers.remove(&remote.session);
-            self.revoke_whisper(&remote).await;
+            if let Some(cldbid) = remote.cldbid {
+                self.sync_whisper(cldbid).await;
+            }
             self.shared.forget(clid);
             self.core.bridge(BridgeMsg::Leave(remote.session, reason)).await;
             self.reconcile(Duration::ZERO);
@@ -727,54 +732,58 @@ impl<'a> Bridge<'a> {
 
     /// Marks a TeamSpeak user a talker or not, as our side last said ([`BridgeNote::Talker`]) for
     /// the channel they are in. Without such a decision (a move not answered yet, a channel our
-    /// side does not have them in) they are silent. A talker may also whisper other TeamSpeak
-    /// users, whose needed whisper power is ours. A failure is retried by [`Self::poll`].
+    /// side does not have them in) they are silent. A failure is retried by [`Self::poll`].
     async fn apply_talker(&mut self, clid: u16) {
         let Some(remote) = self.remotes.get(&clid) else { return };
         let here = self.our_channel(remote.cid);
         let want = matches!(self.talkers.get(&remote.session), Some(&(channel, true)) if channel == here);
-        if remote.talker == Some(want) {
-            return;
-        }
         let cldbid = remote.cldbid;
-        let talker =
-            self.query.call(Cmd::new("clientedit").arg("clid", clid).arg("client_is_talker", u8::from(want))).await;
-        let whisper = match cldbid {
-            Some(cldbid) if want => self
-                .query
-                .call(
-                    Cmd::new("clientaddperm")
-                        .arg("cldbid", cldbid)
-                        .arg("permsid", "i_client_whisper_power")
-                        .arg("permvalue", BRIDGE_TALK_POWER)
-                        .arg("permskip", 0),
-                )
-                .await
-                .map(drop),
-            Some(cldbid) => ignore_missing(
-                self.query
-                    .call(Cmd::new("clientdelperm").arg("cldbid", cldbid).arg("permsid", "i_client_whisper_power"))
-                    .await,
-            ),
-            None => Ok(()),
-        };
-        let done = talker.map(drop).and(whisper);
-        if let Err(e) = &done {
-            warn!(clid, "TeamSpeak talker: {e:#}");
+        if remote.talker != Some(want) {
+            let cmd = Cmd::new("clientedit").arg("clid", clid).arg("client_is_talker", u8::from(want));
+            let done = self.query.call(cmd).await;
+            if let Err(e) = &done {
+                warn!(clid, "TeamSpeak talker: {e:#}");
+            }
+            if let Some(remote) = self.remotes.get_mut(&clid) {
+                remote.talker = done.is_ok().then_some(want);
+            }
         }
-        if let Some(remote) = self.remotes.get_mut(&clid) {
-            remote.talker = done.is_ok().then_some(want);
+        if let Some(cldbid) = cldbid {
+            self.sync_whisper(cldbid).await;
         }
     }
 
-    /// A TeamSpeak user who left keeps no whisper right (it is stored with their identity).
-    async fn revoke_whisper(&self, remote: &Remote) {
-        if let Some(cldbid) = remote.cldbid
-            && remote.talker != Some(false)
-        {
+    /// Whispering other TeamSpeak users takes the bridge's whisper power (their needed one),
+    /// which TeamSpeak keeps per identity: given only while every connection of that identity is
+    /// a talker, so one that may not speak never whispers through another. A failure is
+    /// retried by [`Self::poll`].
+    async fn sync_whisper(&mut self, cldbid: u64) {
+        let want = {
+            let mut connections = self.remotes.values().filter(|r| r.cldbid == Some(cldbid)).peekable();
+            connections.peek().is_some() && connections.all(|r| r.talker == Some(true))
+        };
+        if self.whispers.get(&cldbid) == Some(&want) {
+            return;
+        }
+        let done = if want {
+            let cmd = Cmd::new("clientaddperm")
+                .arg("cldbid", cldbid)
+                .arg("permsid", "i_client_whisper_power")
+                .arg("permvalue", BRIDGE_TALK_POWER)
+                .arg("permskip", 0);
+            self.query.call(cmd).await.map(drop)
+        } else {
             let cmd = Cmd::new("clientdelperm").arg("cldbid", cldbid).arg("permsid", "i_client_whisper_power");
-            if let Err(e) = ignore_missing(self.query.call(cmd).await) {
-                debug!(cldbid, "TeamSpeak whisper right: {e:#}");
+            ignore_missing(self.query.call(cmd).await)
+        };
+        match done {
+            Ok(()) => {
+                self.whispers.insert(cldbid, want);
+            }
+            Err(e) => {
+                warn!(cldbid, "TeamSpeak whisper right: {e:#}");
+                // Possibly still the other way: the next sync tries again.
+                self.whispers.insert(cldbid, !want);
             }
         }
     }
@@ -825,10 +834,15 @@ impl<'a> Bridge<'a> {
                 self.core.bridge(BridgeMsg::Update(session, update)).await;
             }
         }
-        // Talker flags that did not take, and puppets not yet in their group.
+        // Talker flags and whisper rights that did not take (also of those who left), and
+        // puppets not yet in their group.
         let clids: Vec<u16> = self.remotes.keys().copied().collect();
         for clid in clids {
             self.apply_talker(clid).await;
+        }
+        let identities: Vec<u64> = self.whispers.keys().copied().collect();
+        for cldbid in identities {
+            self.sync_whisper(cldbid).await;
         }
         let ungrouped: Vec<(SessionId, String)> = self
             .locals
@@ -1147,8 +1161,11 @@ impl<'a> Bridge<'a> {
                     self.remove_local(client);
                 } else if let Some((clid, _)) = self.remote_by_session(client) {
                     // Our side already removed the session; make TeamSpeak follow.
-                    self.remotes.remove(&clid);
+                    let cldbid = self.remotes.remove(&clid).and_then(|r| r.cldbid);
                     self.talkers.remove(&client);
+                    if let Some(cldbid) = cldbid {
+                        self.sync_whisper(cldbid).await;
+                    }
                     self.shared.forget(clid);
                     self.reconcile(Duration::ZERO);
                     let cmd = match &reason {
@@ -1693,6 +1710,7 @@ mod tests {
             locked: HashSet::new(),
             held: HashMap::new(),
             talkers: HashMap::new(),
+            whispers: HashMap::new(),
         };
         bridge.map.link(1, 10);
         bridge.map.link(2, 20);
@@ -1803,6 +1821,7 @@ mod tests {
             locked: HashSet::new(),
             held: HashMap::new(),
             talkers: HashMap::new(),
+            whispers: HashMap::new(),
         };
         bridge.map.link(1, 10);
         bridge.map.link(2, 20);
@@ -1888,6 +1907,7 @@ mod tests {
             locked: HashSet::new(),
             held: HashMap::new(),
             talkers: HashMap::new(),
+            whispers: HashMap::new(),
         };
         bridge.map.link(1, 10);
         bridge.map.link(2, 20);
@@ -1911,9 +1931,17 @@ mod tests {
         bridge.client_moved(7, 20).await;
         let got = sent(&commands);
         assert!(got.iter().any(|c| c == "clientedit clid=7 client_is_talker=0"), "{got:?}");
+        assert!(got.iter().any(|c| c.starts_with("clientdelperm cldbid=5")), "{got:?}");
         assert!(!bridge.talkers.contains_key(&3));
-        // Leaving takes the whisper right away.
-        bridge.remotes.get_mut(&7).unwrap().talker = Some(true);
+        bridge.on_note(BridgeNote::Talker { session: 3, channel: 2, talks: true }).await;
+        assert!(sent(&commands).iter().any(|c| c.starts_with("clientaddperm cldbid=5")));
+        // A second connection of the same identity that may not talk: nobody of it whispers.
+        bridge.remotes.insert(8, Remote { cldbid: Some(5), ..remote(4, 10) });
+        bridge.on_note(BridgeNote::Talker { session: 4, channel: 1, talks: false }).await;
+        assert!(sent(&commands).iter().any(|c| c.starts_with("clientdelperm cldbid=5")));
+        // When it leaves, the talker left whispers again; when that one leaves too, nobody does.
+        bridge.remove_remote(8, LeaveReason::Quit).await;
+        assert!(sent(&commands).iter().any(|c| c.starts_with("clientaddperm cldbid=5")));
         bridge.remove_remote(7, LeaveReason::Quit).await;
         assert!(sent(&commands).iter().any(|c| c.starts_with("clientdelperm cldbid=5")));
     }
@@ -1968,6 +1996,7 @@ mod tests {
             locked: HashSet::new(),
             held: HashMap::new(),
             talkers: HashMap::new(),
+            whispers: HashMap::new(),
         };
         let message = ChatMessage {
             id: 1,

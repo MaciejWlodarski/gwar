@@ -176,14 +176,16 @@ The core stays the authority for official TeamSpeak clients too:
   until a decision for their current channel arrives, the bridge keeps them
   silent, and it retries a flag that did not take. Whispering another
   TeamSpeak user takes the same right: their needed whisper power is the
-  bridge's, which only talkers get (on their identity, removed when they
-  leave). Puppets have both powers in their group, and anyone may whisper a
+  bridge's, which a TeamSpeak identity gets while all its connections are
+  talkers (TeamSpeak keeps it per identity), and loses when they leave. Puppets have both powers in their group, and anyone may whisper a
   puppet: whether a Gwar user is heard, or hears a whisper, is decided by the
   core. A TeamSpeak user is silent for the moment between joining or moving
   and being marked. A TeamSpeak server admin (a group only ServerQuery gives)
   could change a channel's talk power or a channel they create themselves
   until the bridge restarts. A moderator's mute lasts for the bridge's
-  connection: a bridge restart lifts it.
+  connection: a bridge restart lifts it. Talker flags and whisper rights
+  set before a restart are corrected for everyone connected (and anyone
+  returning) within a second of it.
 - Puppets (Gwar users on TeamSpeak) follow the core; moderation from a
   TeamSpeak client is not supported: TeamSpeak users with Gwar roles moderate
   from the Gwar app.
