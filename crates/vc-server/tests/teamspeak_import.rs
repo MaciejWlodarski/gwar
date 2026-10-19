@@ -111,7 +111,10 @@ async fn a_real_teamspeak_server_reads_and_imports() {
     let moderator = plan.roles.iter().find(|r| r.name == "Moderator").expect("the Moderator group");
     assert!(moderator.permissions.contains(&Permission::KickMembers), "{:?}", moderator.reasons);
     let planned = plan.channels.iter().find(|c| c.name == "Clan").unwrap();
-    assert!(planned.overrides.iter().any(|o| o.target == plan::Target::Member && o.deny == [Permission::Connect]));
+    // The bridge's channels also need its talk power, so Member may not speak there either.
+    assert!(
+        planned.overrides.iter().any(|o| o.target == plan::Target::Member && o.deny.contains(&Permission::Connect))
+    );
     assert!(
         planned
             .overrides
@@ -130,6 +133,6 @@ async fn a_real_teamspeak_server_reads_and_imports() {
     assert!(applied.channels_created >= 2 && applied.roles_created >= 1, "{applied:?}");
     let channels = store.channels().unwrap();
     let imported = channels.iter().find(|c| c.name == "Clan").unwrap();
-    assert!(imported.overrides.iter().any(|o| o.role == Some(MEMBER_GROUP) && o.deny == [Permission::Connect]));
+    assert!(imported.overrides.iter().any(|o| o.role == Some(MEMBER_GROUP) && o.deny.contains(&Permission::Connect)));
     let _ = std::fs::remove_dir_all(&dir);
 }
