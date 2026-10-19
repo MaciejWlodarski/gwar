@@ -686,12 +686,12 @@ fn a_template_keeps_the_passwords_given_whichever_way_and_exactly() {
 fn checking_whether_a_server_runs_changes_nothing() {
     let dir = std::env::temp_dir().join(format!("gwar-in-use-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    assert!(!crate::members::data_dir_in_use(&dir));
+    assert_eq!(crate::members::data_dir_in_use(&dir), Some(false));
     assert!(!dir.join("gwar.lock").exists());
     let held = crate::members::lock_data_dir(&dir).unwrap();
-    assert!(crate::members::data_dir_in_use(&dir));
+    assert_eq!(crate::members::data_dir_in_use(&dir), Some(true));
     drop(held);
-    assert!(!crate::members::data_dir_in_use(&dir));
+    assert_eq!(crate::members::data_dir_in_use(&dir), Some(false));
     // A new database is its owner's only.
     #[cfg(unix)]
     {
@@ -699,6 +699,24 @@ fn checking_whether_a_server_runs_changes_nothing() {
         let path = dir.join("new.sqlite3");
         Store::open(&path).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        // One that exists keeps its mode.
+        let shared = dir.join("shared.sqlite3");
+        drop(Store::open(&shared).unwrap());
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o640)).unwrap();
+        Store::open(&shared).unwrap();
+        assert_eq!(std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777, 0o640);
     }
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_unique_name_may_be_written_as_a_path_would_write_it() {
+    let mut s = source();
+    s.channels[2].insert("channel_name".into(), "Room=\\".into());
+    s.channels[2].insert("channel_flag_password".into(), "1".into());
+    // `Room=\` as a passwords file writes it, quoted for the `=`: the name with its backslash.
+    let passwords = super::parse_passwords("\"Room=\\\\\" = pw\n").unwrap();
+    let planned = plan(&s, &Options { passwords, ..Default::default() });
+    let room = planned.channels.iter().find(|c| c.name == "Room=\\").unwrap();
+    assert_eq!(room.password, Password::Kept("pw".into()));
 }

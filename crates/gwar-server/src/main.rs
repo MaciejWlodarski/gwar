@@ -489,7 +489,9 @@ async fn main() -> Result<()> {
                     false,
                 )?;
                 println!("\nDry run, on a copy of the database: {}\nNothing changed.", summary(&applied));
-                let server_running = gwar_server::members::data_dir_in_use(&cli.data_dir);
+                // Unknown: whether its control socket is there.
+                let server_running = gwar_server::members::data_dir_in_use(&cli.data_dir)
+                    .unwrap_or_else(|| gwar_server::control::available(&cli.data_dir));
                 print!(
                     "{}",
                     ts_import::guide::after_dry_run(&ts_import::guide::DryRun {

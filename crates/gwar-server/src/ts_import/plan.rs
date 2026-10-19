@@ -434,14 +434,18 @@ pub fn plan(source: &Source, options: &Options) -> Result<Plan> {
                     plan.notes.push(format!("\"{path}\": password dropped (--drop-passwords)."));
                     Password::Dropped
                 } else {
+                    let escaped_name = name.replace('\\', "\\\\").replace('/', "\\/");
                     let key = if path == SERVER_PASSWORD {
                         None
                     } else if options.passwords.contains_key(&path) {
                         Some(path.as_str())
+                    } else if name_count[name.as_str()] == 1 {
+                        // The name as typed, or written as a path is (`\\` for a backslash).
+                        [name.as_str(), escaped_name.as_str()]
+                            .into_iter()
+                            .find(|n| *n != SERVER_PASSWORD && options.passwords.contains_key(*n))
                     } else {
-                        Some(name.as_str()).filter(|n| {
-                            *n != SERVER_PASSWORD && name_count[*n] == 1 && options.passwords.contains_key(*n)
-                        })
+                        None
                     };
                     match key.and_then(|k| options.passwords.get_key_value(k)) {
                         Some((key, p)) => {
