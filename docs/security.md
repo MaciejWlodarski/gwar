@@ -343,7 +343,13 @@ Every guarantee assumes your client runs genuine code.
   refuses any other before choosing a destination or sending a byte, so work
   of a closed connection never reaches the next one, even on the same server.
   A compromised interface could still name any server, as it can connect to
-  one.
+  one. TeamSpeak identities' private keys stay in native code too: it signs
+  only a TeamSpeak claim statement, after a native dialog showing the first
+  characters of the account and server the statement binds. It cannot check
+  that account itself, because the Gwar identity lives in the interface: a
+  compromised interface could have a claim made for an account of its choice,
+  which the person sees only by comparing those codes (accepted 2026-10-19:
+  such an interface already controls the Gwar session). See "Later".
 - **Device storage.** A device keeps its MLS state (signature and HPKE
   private keys, group secrets of the current epoch), the epoch keys of every
   conversation it reads, its key archive state and its Connect record (device
@@ -389,10 +395,20 @@ Every guarantee assumes your client runs genuine code.
 TeamSpeak users have no Gwar keys; their messages are marked as TeamSpeak and
 never verified. TeamSpeak identities in the vault are shared by all of an
 account's devices; revoking a device does not invalidate a copy it already has.
+A TeamSpeak identity linked to a member (a claim proves the identity's key,
+[teamspeak-import.md](teamspeak-import.md#claim)) makes whoever holds that key
+act as the member on the bridged TeamSpeak server: roles, overrides, rank and
+bans of either. Claims are bound to the server, the claimant and a one-time
+nonce; see "Clients" for what the desktop app's signing can and cannot check.
 
 ## Later
 
 Noise for LAN connections, stronger evidence of signing time, vault
 checkpoints against rollback, non-exportable signing keys, signed server key
-rotation. End-to-end encrypted Gwar direct messages are implemented. Encryption
+rotation. **Desktop: keep the Gwar identity (and the Connect device key) in
+native code.** When the desktop moves more of its work out of the interface,
+native code must know the person's own uid on each server, and then sign a
+TeamSpeak claim only for that uid and the server it is connected to, instead
+of relying on the person comparing codes (the residual risk under "Clients").
+The same move would make every key non-exportable from the interface. End-to-end encrypted Gwar direct messages are implemented. Encryption
 of channels, server-wide chat and voice is designed in [e2e.md](e2e.md).
