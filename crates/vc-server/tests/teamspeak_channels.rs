@@ -866,6 +866,30 @@ async fn heard(from: &Probe, to: &Probe, marker: u8) {
     .await;
 }
 
+/// `from` whispers `to` (its clid) with `marker` until `to` hears it.
+async fn whispered(from: &Probe, to: &Probe, to_clid: u16, marker: u8) {
+    let mut sequence = 0;
+    probe_support::control(
+        |seq| {
+            let tx = from.tx.clone();
+            async move { tx.send(ProbeCmd::Whisper(to_clid, vec![0xf8, marker, seq as u8])).await.unwrap() }
+        },
+        || to.audio_counts.bytes(marker) > 0,
+        &mut sequence,
+    )
+    .await;
+}
+
+/// `from` whispers `to` for a while; `to` must hear none of it.
+async fn unwhispered(from: &Probe, to: &mut Probe, to_clid: u16, marker: u8) {
+    for seq in 0..50u8 {
+        from.tx.send(ProbeCmd::Whisper(to_clid, vec![0xf8, marker, seq])).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    from.barrier().await;
+    assert_eq!(to.forbidden_bytes(marker).await, 0, "a TeamSpeak user who may not speak was heard whispering");
+}
+
 /// `from` talks with `marker` for a while; `to` must hear none of it.
 async fn unheard(from: &Probe, to: &mut Probe, marker: u8) {
     for seq in 0..50u8 {
@@ -914,24 +938,54 @@ async fn on_teamspeak_only_those_who_may_speak_talk() {
     wait_for_talker(&query, a_clid, true).await;
     heard(&a, &b, 60).await;
 
-    // Muted for everyone by a Gwar moderator: nobody on TeamSpeak hears them either.
+    // Muted for everyone by a Gwar moderator: nobody on TeamSpeak hears them either, nor a whisper.
     let speaker = admin.next_event_where("client.joined", |c| c["nickname"] == "ts-speaker").await["id"].clone();
     admin.ok("client.voice", json!({"client": speaker, "muted": true})).await;
     wait_for_talker(&query, a_clid, false).await;
     unheard(&a, &mut b, 61).await;
+    unwhispered(&a, &mut b, b_clid, 64).await;
     admin.ok("client.voice", json!({"client": speaker, "muted": false})).await;
     wait_for_talker(&query, a_clid, true).await;
     heard(&a, &b, 62).await;
+    whispered(&a, &b, b_clid, 65).await;
 
-    // A channel where Member may not speak, and a move into it: still silent there.
-    let stage = admin.create_channel(json!({"name": "Stage"})).await;
-    let stage_id = stage["channel"]["id"].as_u64().or_else(|| stage["id"].as_u64()).unwrap();
-    let deny = json!({"channel": stage_id, "override": {"role": 2, "allow": [], "deny": ["speak"]}});
-    admin.ok("channel.override", deny).await;
-    let stage_cid = find_channel(&query, "Stage").await;
-    for clid in [a_clid, b_clid] {
-        query.call(Cmd::new("clientmove").arg("clid", clid).arg("cid", &stage_cid)).await.unwrap();
+    let channel_id =
+        |created: serde_json::Value| created["channel"]["id"].as_u64().or_else(|| created["id"].as_u64()).unwrap();
+    admin.create_channel(json!({"name": "Open"})).await;
+    let stage = channel_id(admin.create_channel(json!({"name": "Stage"})).await);
+    let closed = channel_id(admin.create_channel(json!({"name": "Closed"})).await);
+    for (channel, deny) in [(stage, "speak"), (closed, "connect")] {
+        let entry = json!({"channel": channel, "override": {"role": 2, "allow": [], "deny": [deny]}});
+        admin.ok("channel.override", entry).await;
     }
+    let (open_cid, stage_cid, closed_cid) =
+        (find_channel(&query, "Open").await, find_channel(&query, "Stage").await, find_channel(&query, "Closed").await);
+    let move_to = |clid: u16, cid: String| {
+        let query = &query;
+        async move { query.call(Cmd::new("clientmove").arg("clid", clid).arg("cid", cid)).await.unwrap() }
+    };
+    // Moved where they may speak: a talker again there.
+    move_to(a_clid, open_cid.clone()).await;
+    move_to(b_clid, open_cid.clone()).await;
+    wait_for_talker(&query, a_clid, true).await;
+    heard(&a, &b, 66).await;
+    // Into a channel they may not join: back in Open, and heard there again.
+    move_to(a_clid, closed_cid).await;
+    within("moved back from Closed", async {
+        loop {
+            let info = query.call(Cmd::new("clientinfo").arg("clid", a_clid)).await.unwrap();
+            if info[0].get("cid") == Some(&open_cid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    wait_for_talker(&query, a_clid, true).await;
+    heard(&a, &b, 67).await;
+    // A channel where Member may not speak: silent there.
+    move_to(a_clid, stage_cid.clone()).await;
+    move_to(b_clid, stage_cid).await;
     wait_for_talker(&query, a_clid, false).await;
     unheard(&a, &mut b, 63).await;
 }

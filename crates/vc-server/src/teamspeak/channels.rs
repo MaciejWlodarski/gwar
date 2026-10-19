@@ -68,7 +68,7 @@ pub fn desired(channel: &Channel, parent: u64, order: u64) -> TsChannel {
 }
 
 /// `channeledit` properties turning `current` into `want` (without parent,
-/// order and password, which have their own commands/handling).
+/// order, password and talk power, which have their own commands/handling).
 pub fn edits(current: &TsChannel, want: &TsChannel) -> Vec<(&'static str, String)> {
     let mut args = Vec::new();
     // TeamSpeak rejects setting a channel's name to its current value.
@@ -80,9 +80,6 @@ pub fn edits(current: &TsChannel, want: &TsChannel) -> Vec<(&'static str, String
     }
     if current.max_clients != want.max_clients {
         args.extend(max_clients_args(want.max_clients));
-    }
-    if current.talk_power != want.talk_power {
-        args.push(("channel_needed_talk_power", want.talk_power.to_string()));
     }
     args
 }
@@ -214,9 +211,9 @@ mod tests {
         let current = TsChannel { name: want.name.clone(), talk_power: BRIDGE_TALK_POWER, ..Default::default() };
         let args = edits(&current, &want);
         assert_eq!(args, vec![("channel_maxclients", "5".into()), ("channel_flag_maxclients_unlimited", "0".into())]);
-        // A channel from before (or one a TeamSpeak admin opened up) needs the bridge's talk power again.
+        // The talk power has its own edit (see the bridge's ensure_channel).
         let open = TsChannel { talk_power: 0, ..want.clone() };
-        assert_eq!(edits(&open, &want), vec![("channel_needed_talk_power", BRIDGE_TALK_POWER.to_string())]);
+        assert!(edits(&open, &want).is_empty());
     }
 
     #[test]

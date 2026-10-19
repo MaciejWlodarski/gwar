@@ -169,17 +169,21 @@ The core stays the authority for official TeamSpeak clients too:
   reach.
 - TeamSpeak users hear each other on the TeamSpeak server, so the same rule
   holds there: every mirrored channel needs a talk power no TeamSpeak group
-  has (1 000 000), and the bridge marks as talkers (`client_is_talker`) those
-  TeamSpeak users who may speak in their channel and are not muted for
-  everyone. The core tells it whenever that or their channel changes
-  (`BridgeNote::Talker`, applied only while they are in that channel), and
-  the bridge sets it again after every move, since TeamSpeak drops the flag.
-  Puppets have the talk power in their group: whether a Gwar user is heard
-  is decided before their audio reaches the puppet. A TeamSpeak user is
-  silent for the moment between joining or moving and being marked. Whispers
-  follow TeamSpeak's own whisper powers, and a TeamSpeak server admin (a
-  group only ServerQuery gives) could lower a channel's talk power until the
-  bridge next syncs that channel.
+  has (1 000 000, set on its own so no other failed edit leaves it out), and
+  the bridge marks as talkers (`client_is_talker`) those TeamSpeak users who
+  may speak in their channel and are not muted for everyone. The core decides
+  for the channel they are in (`BridgeNote::Talker`), again after every move;
+  until a decision for their current channel arrives, the bridge keeps them
+  silent, and it retries a flag that did not take. Whispering another
+  TeamSpeak user takes the same right: their needed whisper power is the
+  bridge's, which only talkers get (on their identity, removed when they
+  leave). Puppets have both powers in their group, and anyone may whisper a
+  puppet: whether a Gwar user is heard, or hears a whisper, is decided by the
+  core. A TeamSpeak user is silent for the moment between joining or moving
+  and being marked. A TeamSpeak server admin (a group only ServerQuery gives)
+  could change a channel's talk power or a channel they create themselves
+  until the bridge restarts. A moderator's mute lasts for the bridge's
+  connection: a bridge restart lifts it.
 - Puppets (Gwar users on TeamSpeak) follow the core; moderation from a
   TeamSpeak client is not supported: TeamSpeak users with Gwar roles moderate
   from the Gwar app.

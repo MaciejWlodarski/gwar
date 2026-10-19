@@ -905,6 +905,15 @@ impl Core {
                 .filter_map(|s| s.participation.as_ref().map(|p| (s.id, p.binding.clone())))
                 .collect(),
         ));
+        // Who may speak where they are (`speak`).
+        let speaks: HashMap<SessionId, bool> = self
+            .sessions
+            .values()
+            .filter_map(|s| {
+                let channel = s.channel?;
+                Some((s.id, self.channel_permissions(&s.uid, &s.groups, channel).contains(&Permission::Speak)))
+            })
+            .collect();
         let members = self
             .sessions
             .values()
@@ -917,8 +926,7 @@ impl Core {
                 // TeamSpeak never hears an encrypted or a private channel.
                 let bridged = origin.bridgeable();
                 // Not heard: muted by oneself or a moderator, or without `speak` in this channel.
-                let speaks = self.channel_permissions(&s.uid, &s.groups, channel).contains(&Permission::Speak);
-                let muted = s.muted || s.server_muted || !speaks;
+                let muted = s.muted || s.server_muted || !speaks[&s.id];
                 let deafened = s.deafened || s.server_deafened;
                 Some((s.id, Member { channel, muted, deafened, bridged, origin }))
             })
@@ -929,11 +937,7 @@ impl Core {
             .sessions
             .values()
             .filter(|s| s.out.is_none())
-            .filter_map(|s| {
-                let channel = s.channel?;
-                let speaks = self.channel_permissions(&s.uid, &s.groups, channel).contains(&Permission::Speak);
-                Some((s.id, (channel, speaks && !s.server_muted)))
-            })
+            .filter_map(|s| Some((s.id, (s.channel?, speaks[&s.id] && !s.server_muted))))
             .collect();
         let changed: Vec<(SessionId, (ChannelId, bool))> = talkers
             .iter()
@@ -1442,6 +1446,12 @@ impl Core {
                 let routing_changed = u.muted.is_some_and(|m| m != s.muted)
                     || u.deafened.is_some_and(|d| d != s.deafened)
                     || u.channel.is_some_and(|c| Some(c) != s.channel);
+                // Each move on TeamSpeak gets a fresh talker decision, even an unchanged one: the
+                // bridge silences them until it comes.
+                let moved = u.channel.is_some();
+                if moved {
+                    self.remote_talkers.remove(&session);
+                }
                 if let Some(nickname) = u.nickname {
                     if s.user_id == 0 {
                         s.nickname = nickname;
@@ -1467,7 +1477,7 @@ impl Core {
                         self.bridge_corrections.push(session);
                     }
                 }
-                if routing_changed {
+                if routing_changed || moved {
                     self.publish_routing();
                 }
                 self.client_updated(session);
@@ -3209,6 +3219,32 @@ mod voice_rights_tests {
         core.bridge(BridgeMsg::Update(talker, bridge::RemoteUpdate { channel: Some(stage), ..Default::default() }))
             .await;
         on_core(&core, |_| ()).await;
+        assert_eq!(talker_notes(&mut bridge, talker), [false]);
+        // Each move gets its decision, even an unchanged one (the bridge silences them meanwhile).
+        core.bridge(BridgeMsg::Update(talker, bridge::RemoteUpdate { channel: Some(stage), ..Default::default() }))
+            .await;
+        on_core(&core, |_| ()).await;
+        assert_eq!(talker_notes(&mut bridge, talker), [false]);
+
+        // Speak denied where they already are, by an override: silenced there.
+        core.bridge(BridgeMsg::Update(
+            talker,
+            bridge::RemoteUpdate { channel: Some(server.default_channel), ..Default::default() },
+        ))
+        .await;
+        on_core(&core, |_| ()).await;
+        assert_eq!(talker_notes(&mut bridge, talker), [true]);
+        let lobby = server.default_channel;
+        on_core(&core, move |core| {
+            let row = core.channels.get_mut(&lobby).unwrap();
+            row.overrides.push(vc_proto::ChannelOverride {
+                role: Some(MEMBER_GROUP),
+                deny: vec![Permission::Speak],
+                ..Default::default()
+            });
+            core.enforce_connect(lobby);
+        })
+        .await;
         assert_eq!(talker_notes(&mut bridge, talker), [false]);
     }
 
