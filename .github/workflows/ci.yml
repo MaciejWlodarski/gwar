@@ -164,8 +164,10 @@ jobs:
           path: crates/gwar-mls-wasm/pkg/
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter web build
+      # Only built here, never run: unoptimized dependencies build faster.
       - name: Build desktop
-        run: cargo build -p vc-desktop
+        shell: bash
+        run: cargo build -p vc-desktop --config 'profile.dev.package."*".opt-level=0'
 
   # Builds the MLS wasm once; the jobs that need it start as soon as it is uploaded.
   mls-wasm:
