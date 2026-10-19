@@ -343,16 +343,6 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     std::fs::create_dir_all(&cli.data_dir).with_context(|| format!("create {}", cli.data_dir.display()))?;
     let database = cli.data_dir.join("gwar.sqlite3");
-    // Before the rename the database was vc.sqlite3. Starting with an empty one beside it would lose
-    // every account, channel and role without a word, so stop and say how to move it.
-    let legacy = cli.data_dir.join("vc.sqlite3");
-    if legacy.exists() && !database.exists() {
-        anyhow::bail!(
-            "{} is from before the rename to Gwar: stop the server, rename it (and any vc.sqlite3-wal and \
-             vc.sqlite3-shm beside it) to gwar.sqlite3, delete vc.lock, then start again",
-            legacy.display()
-        );
-    }
 
     match cli.command {
         Some(Command::ServerKey) => {

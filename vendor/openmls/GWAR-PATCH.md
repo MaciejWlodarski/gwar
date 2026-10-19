@@ -17,6 +17,6 @@ that duplicate device. This patch preserves that rejection and makes the
 valid replacement produce the expected tree for both member and observer.
 
 Regression: `voice_four_devices_creation_join_takeover_removal_and_new_call`
-in `crates/vc-server/tests/mls.rs`; shared agent/observer voice transition
+in `crates/gwar-server/tests/mls.rs`; shared agent/observer voice transition
 coverage is in `crates/gwar-mls/src/agent/tests.rs`. Remove the patch only after
 a pinned upstream release passes these tests. No protocol or crypto change.
