@@ -23,7 +23,7 @@ const storage = () => new MessageStorage(`test-${crypto.randomUUID()}`);
 async function fixture(device = false, lifetime = 1000) {
   const account = await keyFromSeed(new Uint8Array(32).fill(1)), pair = await keyFromSeed(new Uint8Array(32).fill(device ? 2 : 3));
   const cert = device ? { ...await certifyDevice(account, pair.publicKey, now - 1000, now + lifetime), account_key: account.publicKey } : undefined;
-  const identity = { ...pair, nickname: "Alice", exportBackup: () => ({ format: "gwar-identity", version: 1, jwk: pair.jwk }), ...(cert ? { device: cert } : {}), sign: (bytes: Uint8Array) => signText(pair.jwk, new TextDecoder().decode(bytes)) } as Identity;
+  const identity = { ...pair, nickname: "Alice", exportBackup: () => ({ format: "gwar-identity", version: 1, jwk: pair.jwk, nickname: "Alice" }), ...(cert ? { device: cert } : {}), sign: (bytes: Uint8Array) => signText(pair.jwk, new TextDecoder().decode(bytes)) } as Identity;
   const uid = await uidForPublicKey(device ? account.publicKey : pair.publicKey);
   const ctx = { serverKey: vectors[0]!.signature.server_key, target: "channel:7" };
   const msg: ChatMessage = { id: 1, target: { channel: 7 }, author: 3, author_uid: uid, author_name: "Alice", text: "hello", sent_at: now, mentions: [], attachments: [] };
@@ -286,33 +286,6 @@ describe("message view verification cache", () => {
     const result = await cache.verify(f.msg, f.ctx);
     expect(result.authorization).toContain("device-revoked");
     expect(fullyVerified(result)).toBe(false);
-    clock.mockRestore();
-  });
-  it("counts revisions stored before the order existed (database version 2) as stored before every ordered read", async () => {
-    const f = await fixture(true, 3_600_000), name = `test-${crypto.randomUUID()}`, s = f.msg.signature!;
-    const old = { revision: 0, hash: await revisionHash(s), created: s.created_at, conversation: s.conversation, at: now, proven: true, files: await messageBodyHash("", [], []) };
-    await new Promise<void>((resolve, reject) => {
-      const request = indexedDB.open(name, 2);
-      request.onupgradeneeded = () => {
-        request.result.createObjectStore("checkpoints").createIndex("at", "at");
-        request.result.createObjectStore("revocations");
-        request.result.createObjectStore("feeds");
-      };
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => {
-        const db = request.result, tx = db.transaction(["checkpoints"], "readwrite");
-        tx.objectStore("checkpoints").put(old, `${f.ctx.serverKey}:${s.author_uid}:${s.message_id}`);
-        tx.oncomplete = () => { db.close(); resolve(); };
-        tx.onerror = () => reject(tx.error);
-      };
-    });
-    const store = new MessageStorage(name), clock = vi.spyOn(Date, "now");
-    clock.mockReturnValue(now);
-    await store.mergeFeed([], CONNECT_URL, now);
-    clock.mockReturnValue(now + REVOCATION_FRESH_MS + 1);
-    const v = await new MessageVerificationCache(store).verify(f.msg, f.ctx);
-    expect(v.duplicate).toBe(true);
-    expect(fullyVerified(v)).toBe(true);
     clock.mockRestore();
   });
   it("qualifies cached messages if authorization storage becomes unavailable", async () => {

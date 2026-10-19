@@ -138,11 +138,9 @@ describe("handshake", () => {
   });
 
   it.each([
-    ["a certificate that ran out", 2, "invalid identity", "certificate_expired"],
-    ["the server saying so", Date.now() + 1e10, "the device certificate has expired; sign in again", "certificate_expired"],
     ["another problem with a valid certificate", Date.now() + 1e10, "the device certificate is not signed by the account", "rejected"],
     ["a revoked device", Date.now() + 1e10, "this device was signed out of its Gwar account", "rejected"],
-  ])("tells an expired device certificate apart from other not_authenticated replies: %s", async (_name, expiresAt, message, kind) => {
+  ])("a not_authenticated reply is a rejection (the server says certificate_expired itself): %s", async (_name, expiresAt, message, kind) => {
     const device = { account_key: testServerIdentity.publicKey, device_key: fakeIdentity.publicKey, issued_at: 1, expires_at: expiresAt, signature: "A".repeat(86) };
     const conn = make({ identity: { ...fakeIdentity, device } });
     const p = conn.connect();

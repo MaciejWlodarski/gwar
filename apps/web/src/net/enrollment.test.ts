@@ -1,7 +1,6 @@
 import { IDBFactory, IDBObjectStore } from "fake-indexeddb";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { certifyDevice, generateKeyPair } from "../connect/crypto";
-import { kvSet } from "./kv";
 import { indexedDbConnectStore, indexedDbIdentityStore, loadActiveIdentity, type ConnectRecord } from "./identity";
 
 beforeEach(() => vi.stubGlobal("indexedDB", new IDBFactory()));
@@ -16,7 +15,7 @@ async function enrollment(): Promise<ConnectRecord> {
   const device = await generateKeyPair();
   const certificate = await certifyDevice({ jwk: backup.jwk, publicKey: root.publicKey }, device.publicKey);
   return { version: 1, handle: "alice", accountKey: root.publicKey, deviceName: "browser", deviceJwk: device.jwk,
-    certificate: { account_key: root.publicKey, ...certificate }, token: "device-session" };
+    certificate: { account_key: root.publicKey, ...certificate }, token: "device-session", vaultKey: "vault-key" };
 }
 
 describe("durable root migration", () => {
@@ -48,26 +47,8 @@ describe("durable root migration", () => {
   it("keeps an unrelated local identity", async () => {
     const record = await enrollment();
     const other = await generateKeyPair();
-    await indexedDbIdentityStore.save({ format: "gwar-identity", version: 1, jwk: other.jwk });
+    await indexedDbIdentityStore.save({ format: "gwar-identity", version: 1, jwk: other.jwk, nickname: "Other" });
     await indexedDbConnectStore.save(record);
     expect((await indexedDbIdentityStore.load())?.jwk.x).toBe(other.publicKey);
   });
-  it("repairs a legacy signed-in root before returning the active identity, preserving its nickname", async () => {
-    const record = await enrollment();
-    const local = await indexedDbIdentityStore.load();
-    await kvSet("connect", record);
-    const active = await loadActiveIdentity();
-    expect(active.nickname).toBe(local?.nickname);
-    expect(await indexedDbIdentityStore.load()).toBeUndefined();
-    expect((await indexedDbConnectStore.load())?.nickname).toBe(local?.nickname);
-  });
-
-  it("sign-out repairs legacy root storage even when the identity was not loaded", async () => {
-    const record = await enrollment();
-    await kvSet("connect", record);
-    await indexedDbConnectStore.clear();
-    expect(await indexedDbIdentityStore.load()).toBeUndefined();
-    expect((await loadActiveIdentity()).publicKey).not.toBe(record.accountKey);
-  });
-
 });

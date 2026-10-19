@@ -3,12 +3,9 @@
 //!
 //! Two lists in the app data directory (`gwar_client::ts_identities` has the format):
 //!
-//! - `teamspeak-identities.json`: this device's own identities. A device that has only the
-//!   single identity of older versions (`teamspeak-identity.json`) gets a list of one named "Default".
-//! - `teamspeak-identities.account.json`: the account's identities from the vault (likewise migrated
-//!   from `teamspeak-identity.account.json`). While it exists TeamSpeak connections use it; removing
-//!   it (signing out) returns to the device's own. The old files are left in place, except that
-//!   removing the account list removes the old account file too, or it would come back.
+//! - `teamspeak-identities.json`: this device's own identities.
+//! - `teamspeak-identities.account.json`: the account's identities from the vault. While it exists
+//!   TeamSpeak connections use it; removing it (signing out) returns to the device's own.
 //!
 //! Commands (the UI does the vault sync and every list edit, see `apps/web/src/connect/teamspeak.ts`):
 //!
@@ -46,9 +43,7 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 /// The identity files in one directory.
 struct Files {
     device: PathBuf,
-    device_legacy: PathBuf,
     account: PathBuf,
-    account_legacy: PathBuf,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -76,12 +71,7 @@ fn err(e: anyhow::Error) -> String {
 
 impl Files {
     fn in_dir(dir: &Path) -> Self {
-        Self {
-            device: dir.join("teamspeak-identities.json"),
-            device_legacy: dir.join("teamspeak-identity.json"),
-            account: dir.join("teamspeak-identities.account.json"),
-            account_legacy: dir.join("teamspeak-identity.account.json"),
-        }
+        Self { device: dir.join("teamspeak-identities.json"), account: dir.join("teamspeak-identities.account.json") }
     }
 
     fn path(&self, source: Source) -> &Path {
@@ -93,16 +83,12 @@ impl Files {
 
     /// The list of one source; empty if there is none yet.
     fn list(&self, source: Source) -> anyhow::Result<List> {
-        let legacy = match source {
-            Source::Account => &self.account_legacy,
-            Source::Device => &self.device_legacy,
-        };
-        Ok(ts_identities::load(self.path(source), legacy)?.unwrap_or_default())
+        Ok(ts_identities::load(self.path(source))?.unwrap_or_default())
     }
 
     /// The list TeamSpeak connections use: the account's if there is one, else the device's.
     fn active(&self) -> anyhow::Result<(Source, List)> {
-        match ts_identities::load(&self.account, &self.account_legacy)? {
+        match ts_identities::load(&self.account)? {
             Some(list) => Ok((Source::Account, list)),
             None => Ok((Source::Device, self.list(Source::Device)?)),
         }
@@ -159,23 +145,18 @@ impl Files {
                 let next = list.resolve(self.list(Source::Account).map_err(err)?);
                 ts_identities::save(&self.account, &next).map_err(err)
             }
-            ("account", None) => {
-                for path in [&self.account, &self.account_legacy] {
-                    match std::fs::remove_file(path) {
-                        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.to_string()),
-                        _ => {}
-                    }
-                }
-                Ok(())
-            }
+            ("account", None) => match std::fs::remove_file(&self.account) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+                _ => Ok(()),
+            },
             ("device", None) => Err("the device's identities cannot be removed".into()),
             (other, _) => Err(format!("unknown list {other:?}")),
         }
     }
 }
 
-/// Held across every read-modify-write of the lists (connecting may add a default identity and
-/// reading may migrate an older file), so none of them overwrites another's change.
+/// Held across every read-modify-write of the lists (connecting may add a default identity), so
+/// none of them overwrites another's change.
 fn lock() -> MutexGuard<'static, ()> {
     static FILES: Mutex<()> = Mutex::new(());
     FILES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -426,33 +407,6 @@ mod tests {
         assert_eq!(list.identities[0].name, "Default");
         assert_eq!(list.identities[0].uid, uid(&made));
         assert_eq!(uid(&files.for_connect(None).unwrap()), uid(&made), "the same one next time");
-    }
-
-    #[test]
-    fn the_older_single_identity_files_become_lists_and_stay() {
-        let dir = Dir::new();
-        let files = Files::in_dir(&dir.0);
-        let (device, account) = (ts_identity::generate(), ts_identity::generate());
-        ts_identity::write(&files.device_legacy, &device).unwrap();
-        // Nothing about the account yet: the device's identity is the one in use.
-        assert_eq!(uid(&files.for_connect(None).unwrap()), uid(&device));
-        let (source, list) = files.active().unwrap();
-        assert_eq!((source, list.identities[0].name.as_str()), (Source::Device, "Default"));
-
-        ts_identity::write(&files.account_legacy, &account).unwrap();
-        let (source, list) = files.active().unwrap();
-        assert_eq!(source, Source::Account);
-        assert_eq!(list.identities.len(), 1);
-        assert_eq!(list.identities[0].uid, uid(&account));
-        assert!(files.device_legacy.exists() && files.account_legacy.exists());
-        assert!(files.account.exists() && files.device.exists());
-
-        // Signing out removes the account's list, and the old file with it, or it would come back.
-        files.set_list("account", None, &BTreeSet::new()).unwrap();
-        assert!(!files.account.exists() && !files.account_legacy.exists());
-        assert_eq!(files.active().unwrap().0, Source::Device);
-        assert!(files.device_legacy.exists(), "the device's old file is left alone");
-        files.set_list("account", None, &BTreeSet::new()).unwrap();
     }
 
     #[test]

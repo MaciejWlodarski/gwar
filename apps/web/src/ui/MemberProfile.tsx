@@ -149,9 +149,9 @@ function TeamspeakLinks({ uid, linked, own, mayUnlink }: { uid: string; linked: 
   const toast = useUi((s) => s.toast);
   const [confirming, setConfirming] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  // In the browser the identities are the account's, so it needs the vault key.
-  const hasVault = useAccount((s) => !!s.account?.hasVaultKey);
-  const canClaim = own && (isDesktop() || hasVault);
+  // In the browser the identities are the account's: signed in to Gwar Connect.
+  const signedIn = useAccount((s) => !!s.account);
+  const canClaim = own && (isDesktop() || signedIn);
   if (linked.length === 0 && !canClaim) return null;
   const unlink = async (teamspeak: string) => {
     setBusy(true);

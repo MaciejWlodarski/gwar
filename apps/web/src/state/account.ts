@@ -12,7 +12,7 @@ import { deviceName } from "../connect/device-name";
 import { certificateWarning } from "../connect/expiry";
 import { changeIdentities, refreshFromVault, syncAfterUnlock, tsBridge } from "../connect/teamspeak";
 import { addEntry, cleanName, DEFAULT_NAME, type TsEntry, type TsList } from "../connect/ts-list";
-import { loadVault, VaultLockedError, vaultList } from "../connect/vault";
+import { loadVault, vaultList } from "../connect/vault";
 import { syncServers, toBookmarks } from "../connect/servers";
 import { syncQueue } from "./sync-queue";
 import {
@@ -36,8 +36,6 @@ export interface AccountSummary {
   deviceName: string;
   /** Certificate expiry, Unix ms. */
   expiresAt: number;
-  /** False for sign-ins saved before vaults existed: a flow with the password adds the key. */
-  hasVaultKey: boolean;
 }
 
 interface AccountStore {
@@ -63,7 +61,6 @@ const summarize = (r: ConnectRecord): AccountSummary => ({
   deviceKey: r.certificate.device_key,
   deviceName: r.deviceName,
   expiresAt: r.certificate.expires_at,
-  hasVaultKey: !!r.vaultKey,
 });
 
 const deps = () => ({
@@ -87,7 +84,7 @@ const bumpTs = () => useAccount.setState((s) => ({ tsRevision: s.tsRevision + 1 
  */
 function syncTeamspeak(record: ConnectRecord): void {
   const ts = tsBridge();
-  if (!ts || !record.vaultKey) return;
+  if (!ts) return;
   syncAfterUnlock(connectApi, record, ts)
     .then((outcome) => console.info(`TeamSpeak identity: ${outcome}`))
     .catch((e: unknown) => console.warn("TeamSpeak identity sync failed", e))
@@ -104,7 +101,7 @@ let serverSynced: { edits: number; account: string } | null = null;
  */
 const bookmarkSync = syncQueue(async () => {
   const record = await loadConnectRecord();
-  if (!record?.vaultKey) return;
+  if (!record) return;
   const before = useSettings.getState();
   const merged = await syncServers(connectApi, record, { bookmarks: before.bookmarks, removed: before.removedBookmarks });
   serverSyncedAt = Date.now();
@@ -132,7 +129,7 @@ useSettings.subscribe((s, prev) => {
 });
 if (typeof window !== "undefined") {
   window.addEventListener("focus", () => {
-    if (Date.now() - serverSyncedAt > 60_000 && useAccount.getState().account?.hasVaultKey) syncBookmarks();
+    if (Date.now() - serverSyncedAt > 60_000 && useAccount.getState().account) syncBookmarks();
   });
 }
 
@@ -243,7 +240,7 @@ export const accountActions = {
     const record = await loadConnectRecord();
     useAccount.setState({ account: record ? summarize(record) : null, loaded: true, certChecked: !record?.token });
     useSettings.getState().setBookmarkAccount(record?.accountKey ?? null);
-    if (record?.vaultKey) {
+    if (record) {
       refreshProfile(connectApi, record)
         .then(async (nickname) => {
           if (!nickname) return;
@@ -256,12 +253,12 @@ export const accountActions = {
         })
         .catch((e: unknown) => console.warn("account profile refresh skipped", e));
     }
-    if (record?.vaultKey) syncBookmarks();
+    if (record) syncBookmarks();
     if (record?.token) checkCertificate(record);
     else warnAboutExpiry();
     // Pick up an identity another desktop put in the vault. Never waited for: starting must not depend on the network.
     const ts = tsBridge();
-    if (record?.vaultKey && ts) {
+    if (record && ts) {
       refreshFromVault(connectApi, record, ts)
         .then((outcome) => outcome === "applied" && bumpTs())
         .catch((e: unknown) => console.warn("TeamSpeak identity refresh skipped", e));
@@ -327,19 +324,9 @@ export const accountActions = {
     await refresh(await flows.renewCertificate(await current(), password, deps()));
   },
 
-  /** For a sign-in without a vault key: the password derives it (see `unlockVault`). */
-  async unlockVault(password: string): Promise<void> {
-    await refresh(await flows.unlockVault(await current(), password, deps()));
-  },
-
-  /** What the vault says about TeamSpeak: `locked` until this device has the vault key. */
-  async teamspeakInVault(): Promise<{ locked: true } | { locked: false; list: TsList }> {
-    try {
-      return { locked: false, list: vaultList((await loadVault(connectApi, await current())).contents) };
-    } catch (e) {
-      if (e instanceof VaultLockedError) return { locked: true };
-      throw e;
-    }
+  /** The account's TeamSpeak identities, from the vault. */
+  async teamspeakInVault(): Promise<TsList> {
+    return vaultList((await loadVault(connectApi, await current())).contents);
   },
 
   /**
@@ -385,7 +372,7 @@ export const accountActions = {
   /** Back to an unrelated local identity, or a fresh one after root migration. */
   async signOut(): Promise<void> {
     const record = await loadConnectRecord();
-    const synced = !!record?.vaultKey && (await flushBookmarks(record.accountKey));
+    const synced = !!record && (await flushBookmarks(record.accountKey));
     const flushed = useSettings.getState().bookmarkEdits;
     if (record) await flows.signOut(record, deps());
     const settings = useSettings.getState();

@@ -52,7 +52,7 @@ pub struct Device {
     pub created_at: i64,
     pub last_seen: i64,
     pub revoked_at: Option<i64>,
-    /// The newest certificate Connect has for it (none for devices registered before renewal existed).
+    /// The newest certificate Connect has for it (none in the moment between storing a new device and its first one).
     pub certificate: Option<Certificate>,
 }
 

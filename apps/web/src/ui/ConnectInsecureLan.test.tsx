@@ -25,7 +25,7 @@ const show = async () => act(async () => { root.render(<TooltipProvider><Connect
 const choice = () => mock.connect.mock.calls.at(-1)![0];
 beforeEach(() => {
   vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true); mock.connect.mockReset(); mock.inputs.clear();
-  useSettings.setState({ language: 'en', lastAddress: 'a.lan', lastKind: 'gwar', bookmarks: [{ id: 'a', name: 'A', address: 'a.lan', insecureLan: true }] });
+  useSettings.setState({ language: 'en', lastAddress: 'a.lan', lastKind: 'gwar', bookmarks: [{ id: 'a', name: 'A', address: 'a.lan', kind: 'gwar', updatedAt: 1, insecureLan: true }] });
   useConnectUi.setState({ busy: false, error: null, needPassword: false, invite: null });
   div = document.createElement('div'); document.body.appendChild(div); root = createRoot(div);
 });
@@ -43,8 +43,8 @@ it('bookmark removal withdraws plaintext for the current address', async () => {
   await submit(); expect(choice()).toMatchObject({ address: 'a.lan', insecureLan: false });
 });
 it('uses only the new address own saved plaintext setting', async () => {
-  await show(); await act(async () => useSettings.getState().saveBookmark({ id: 'b', name: 'B', address: 'b.lan', insecureLan: true }));
+  await show(); await act(async () => useSettings.getState().saveBookmark({ id: 'b', name: 'B', address: 'b.lan', kind: 'gwar', insecureLan: true }));
   await change('a.lan', 'b.lan'); await submit(); expect(choice()).toMatchObject({ address: 'b.lan', insecureLan: true });
-  await act(async () => useSettings.getState().saveBookmark({ id: 'b', name: 'B', address: 'b.lan', insecureLan: false }));
+  await act(async () => useSettings.getState().saveBookmark({ id: 'b', name: 'B', address: 'b.lan', kind: 'gwar', insecureLan: false }));
   await submit(); expect(choice()).toMatchObject({ address: 'b.lan', insecureLan: false });
 });

@@ -91,7 +91,7 @@ export interface DeviceInfo {
   created_at: number;
   last_seen: number;
   revoked_at: number | null;
-  /** The newest certificate Connect has for this device; null for a device that never had one. */
+  /** The newest certificate Connect has for this device (null only while a new one is being stored). */
   certificate: { issued_at: number; expires_at: number; signature: string } | null;
 }
 

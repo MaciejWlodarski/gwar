@@ -122,14 +122,6 @@ describe("syncAfterUnlock", () => {
     expect((await serverVault(service, record))?.version).toBe(1);
   }, 30_000);
 
-  it("adopts the older single-identity vault form as one entry named TeamSpeak", async () => {
-    const { api, record, service, ts } = await signedIn("ts.legacy");
-    await writeServerVault(service, record, { teamspeak: { identity: "22Vaccount", uid: "account-uid", updated_at: 5 } });
-    expect(await syncAfterUnlock(api, record, ts)).toBe("adopted");
-    expect(ts.account).toEqual({ default: "account-uid", identities: [{ uid: "account-uid", name: "TeamSpeak", identity: "22Vaccount" }] });
-    expect((await serverVault(service, record))?.version).toBe(1);
-  }, 30_000);
-
   it("if another desktop seeds first, its list wins", async () => {
     const { api, record, service, ts } = await signedIn("ts.race");
     const theirs = list(["theirs"]);
@@ -139,12 +131,6 @@ describe("syncAfterUnlock", () => {
     expect((await serverVault(service, record))?.contents).toEqual({ teamspeak: stored(theirs, 5) });
   }, 30_000);
 
-  it("does nothing on a record without a vault key", async () => {
-    const { api, record, service, ts } = await signedIn("ts.locked");
-    expect(await syncAfterUnlock(api, { ...record, vaultKey: undefined }, ts)).toBe("locked");
-    expect(ts.calls).toEqual([]);
-    expect(await serverVault(service, record)).toBeNull();
-  }, 30_000);
 });
 
 describe("refreshFromVault", () => {
@@ -179,7 +165,6 @@ describe("refreshFromVault", () => {
     service.sessions.clear();
     await expect(refreshFromVault(api, record, ts)).rejects.toMatchObject({ kind: "unauthorized" });
     expect(ts.calls).toEqual([]);
-    expect(await refreshFromVault(api, { ...record, vaultKey: undefined }, ts)).toBe("locked");
   }, 30_000);
 });
 
@@ -206,25 +191,13 @@ describe("changeIdentities", () => {
     expect(ts.device).toEqual(list(["own1", "own2"]));
   }, 30_000);
 
-  it("signed in: rename, delete of the default and the older vault form", async () => {
+  it("signed in: rename and delete of the default", async () => {
     const { api, record, service, ts } = await signedIn("ts.rules");
     await writeServerVault(service, record, { teamspeak: stored(list(["a", "b", "c"], "a"), 5) });
     await changeIdentities(api, record, ts, (l) => renameEntry(l, "b", "Work"), 10);
     await changeIdentities(api, record, ts, (l) => deleteEntry(l, "a"), 11);
     expect(ts.account).toEqual({ default: "b", identities: [entry("b", "Work"), entry("c")] });
     expect(vaultList((await serverVault(service, record))!.contents as never)).toEqual(ts.account);
-
-    await writeServerVault(service, record, { teamspeak: { identity: "22Vold", uid: "old-uid", updated_at: 1 } });
-    await changeIdentities(api, record, ts, add(entry("new")), 12);
-    expect((await serverVault(service, record))?.contents).toEqual({
-      teamspeak: {
-        identities: [
-          { uid: "old-uid", name: "TeamSpeak", identity: "22Vold", updated_at: 12 },
-          { ...entry("new"), updated_at: 12 },
-        ],
-        default: "old-uid",
-      },
-    });
   }, 30_000);
 
   it("signed in: after the vault lost its TeamSpeak section, a change starts from the identities in use", async () => {
@@ -268,12 +241,6 @@ describe("changeIdentities", () => {
     const { api, record, service, ts } = await signedIn("ts.fail");
     service.sessions.clear();
     await expect(changeIdentities(api, record, ts, add(entry("c")), 1)).rejects.toMatchObject({ kind: "unauthorized" });
-    expect(ts.calls).toEqual([]);
-  }, 30_000);
-
-  it("signed in: no vault key is refused without touching anything", async () => {
-    const { api, record, ts } = await signedIn("ts.nokey");
-    await expect(changeIdentities(api, { ...record, vaultKey: undefined }, ts, add(entry("c")))).rejects.toThrow(/vault key/);
     expect(ts.calls).toEqual([]);
   }, 30_000);
 

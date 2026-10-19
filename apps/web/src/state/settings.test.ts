@@ -2,35 +2,6 @@ import { afterEach, expect, it, vi } from "vitest";
 
 afterEach(() => vi.unstubAllGlobals());
 
-it("drops bookmark nicknames without losing bookmarks, credentials, identity choices or the legacy nickname", async () => {
-  const before = {
-    version: 1,
-    state: {
-      lastAddress: "voice.example.com",
-      lastKind: "gwar",
-      bookmarks: [
-        { id: "gwar", name: "Gwar", address: "voice.example.com", kind: "gwar", nickname: "  Łucja  ", password: "secret" },
-        { id: "ts", name: "TS", address: "ts.example.com", kind: "teamspeak", nickname: "Other", identity: "ts-uid" },
-      ],
-    },
-  };
-  const storage = new Map([["gwar.settings", JSON.stringify(before)]]);
-  const browserStorage = { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value), removeItem: (key: string) => storage.delete(key) };
-  vi.stubGlobal("localStorage", browserStorage);
-  vi.stubGlobal("window", { localStorage: browserStorage });
-  vi.resetModules();
-  const { useSettings } = await import("./settings");
-  expect(useSettings.getState().lastNickname).toBe("Łucja");
-  expect(useSettings.getState().bookmarks).toEqual(before.state.bookmarks.map(({ nickname: _nickname, ...bookmark }) => bookmark));
-  const saved = JSON.parse(storage.get("gwar.settings")!);
-  expect(saved.state.bookmarks).toEqual(useSettings.getState().bookmarks);
-  expect(saved.state.lastNickname).toBe("Łucja");
-  const { legacyNickname } = await import("../net/nickname");
-  expect(legacyNickname()).toBe("Łucja");
-  useSettings.getState().setLast("new.example.com", "gwar");
-  expect(useSettings.getState().lastNickname).toBe("Łucja");
-});
-
 it("times only synced changes, remembers removals and forgets them when the server is saved again", async () => {
   const storage = new Map<string, string>();
   const browserStorage = { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value), removeItem: (key: string) => storage.delete(key) };
@@ -74,13 +45,13 @@ it("times only synced changes, remembers removals and forgets them when the serv
 
     // Signed in: new bookmarks and removals belong to the account at once, before any sync.
     s().setBookmarkAccount("acct");
-    s().saveBookmark({ id: "n", name: "N", address: "n.example.com" });
+    s().saveBookmark({ id: "n", name: "N", address: "n.example.com", kind: "gwar" });
     expect(s().bookmarks.at(-1)?.account).toBe("acct");
     s().replaceBookmarks([
-      { id: "d", name: "D", address: "d.example.com", account: "acct" },
-      { id: "big", name: "Big", address: "big.example.com", password: "p".repeat(200), account: "acct" },
-      { id: "e", name: "E", address: "e.example.com", account: "other" },
-      { id: "f", name: "F", address: "f.example.com" },
+      { id: "d", name: "D", address: "d.example.com", kind: "gwar", account: "acct", updatedAt: 1 },
+      { id: "big", name: "Big", address: "big.example.com", kind: "gwar", password: "p".repeat(200), account: "acct", updatedAt: 1 },
+      { id: "e", name: "E", address: "e.example.com", kind: "gwar", account: "other", updatedAt: 1 },
+      { id: "f", name: "F", address: "f.example.com", kind: "gwar", updatedAt: 1 },
     ]);
     s().removeBookmark("f");
     expect(s().removedBookmarks.f).toMatchObject({ account: "acct" });
@@ -95,18 +66,8 @@ it("times only synced changes, remembers removals and forgets them when the serv
   }
 });
 
-it("keeps one bookmark per server: on load, when saving, when editing and after syncing", async () => {
-  const before = {
-    version: 1,
-    state: {
-      bookmarks: [
-        { id: "a", name: "Gwar", address: "gwar.app", kind: "gwar" },
-        { id: "b", name: "Gwar invite", address: "wss://gwar.app/ws", kind: "gwar", password: "secret" },
-        { id: "ts", name: "TS", address: "gwar.app", kind: "teamspeak" },
-      ],
-    },
-  };
-  const storage = new Map([["gwar.settings", JSON.stringify(before)]]);
+it("keeps one bookmark per server: when saving, when editing and after syncing", async () => {
+  const storage = new Map<string, string>();
   const browserStorage = { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value), removeItem: (key: string) => storage.delete(key) };
   vi.stubGlobal("localStorage", browserStorage);
   vi.stubGlobal("window", { localStorage: browserStorage });
@@ -115,12 +76,10 @@ it("keeps one bookmark per server: on load, when saving, when editing and after 
   try {
     const { useSettings } = await import("./settings");
     const s = () => useSettings.getState();
-    // A list saved before servers were matched: the first stays, with the password only the other had
-    // (timed as a change, so syncing keeps it), and the other is removed so syncing removes it elsewhere
-    // too. Another kind is another server.
-    expect(s().bookmarks).toEqual([{ id: "a", name: "Gwar", address: "gwar.app", kind: "gwar", password: "secret", updatedAt: 1_000 }, before.state.bookmarks[2]]);
-    expect(s().removedBookmarks).toEqual({ b: { at: 1_000 } });
-    expect(s().bookmarkEdits).toBe(1);
+    s().saveBookmark({ id: "a", name: "Gwar", address: "gwar.app", kind: "gwar", password: "secret" });
+    // Another kind is another server.
+    s().saveBookmark({ id: "ts", name: "TS", address: "gwar.app", kind: "teamspeak" });
+    expect(s().bookmarks.map((b) => b.id)).toEqual(["a", "ts"]);
 
     // Saving a saved server again (another spelling) updates that bookmark in its place, keeping what
     // the new entry leaves unsaid: its address and its password.
@@ -142,10 +101,10 @@ it("keeps one bookmark per server: on load, when saving, when editing and after 
     s().setBookmarkAccount("acct");
     vi.setSystemTime(3_000);
     s().replaceBookmarks([
-      { id: "x", name: "X", address: "x.example.com", account: "acct", updatedAt: 10 },
-      { id: "y", name: "X", address: "wss://x.example.com/ws", password: "pw", account: "acct", updatedAt: 20 },
+      { id: "x", name: "X", address: "x.example.com", kind: "gwar", account: "acct", updatedAt: 10 },
+      { id: "y", name: "X", address: "wss://x.example.com/ws", kind: "gwar", password: "pw", account: "acct", updatedAt: 20 },
       // Another account's bookmark is not shown with these and stays for its own account.
-      { id: "z", name: "X", address: "x.example.com", account: "other", updatedAt: 30 },
+      { id: "z", name: "X", address: "x.example.com", kind: "gwar", account: "other", updatedAt: 30 },
     ]);
     expect(s().bookmarks.map((b) => b.id)).toEqual(["x", "z"]);
     expect(s().removedBookmarks.y).toEqual({ at: 3_000, account: "acct" });
@@ -155,7 +114,7 @@ it("keeps one bookmark per server: on load, when saving, when editing and after 
     // Signed out, another account's hidden bookmark for the same server is left alone, password and all.
     s().setBookmarkAccount(null);
     s().replaceBookmarks([
-      { id: "hidden", name: "Q", address: "q.example.com", password: "theirs", account: "other", updatedAt: 5 },
+      { id: "hidden", name: "Q", address: "q.example.com", kind: "gwar", password: "theirs", account: "other", updatedAt: 5 },
     ]);
     s().saveBookmark({ id: "mine", name: "Q", address: "wss://q.example.com/ws", kind: "gwar" });
     expect(s().bookmarks.map((b) => [b.id, b.password])).toEqual([["hidden", "theirs"], ["mine", undefined]]);

@@ -118,11 +118,11 @@ export function AccountTab() {
 }
 
 /** The desktop app's TeamSpeak identity; in the browser only for a signed-in account. */
-function TeamspeakSection({ onUnlock }: { onUnlock?: () => void }) {
+function TeamspeakSection() {
   const t = useT();
   return (
     <Section title={t("ts.title")}>
-      <TeamspeakIdentity onUnlock={onUnlock} />
+      <TeamspeakIdentity />
     </Section>
   );
 }
@@ -427,7 +427,6 @@ function AccountView() {
   const [devicesError, setDevicesError] = useState<string | null>(null);
   const [revoking, setRevoking] = useState<DeviceInfo | null>(null);
   const [renewing, setRenewing] = useState(false);
-  const [unlocking, setUnlocking] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -545,7 +544,7 @@ function AccountView() {
         />
       </Section>
 
-      <TeamspeakSection onUnlock={() => setUnlocking(true)} />
+      <TeamspeakSection />
 
       <ChangePassword />
 
@@ -574,18 +573,6 @@ function AccountView() {
             await accountActions.revoke(revoking.device_key, password);
             toast("success", t("account.deviceRevoked"));
             load();
-          }}
-        />
-      )}
-      {unlocking && (
-        <PasswordDialog
-          title={t("ts.unlockTitle")}
-          body={t("ts.unlockBody")}
-          confirmLabel={t("ts.unlock")}
-          onClose={() => setUnlocking(false)}
-          onSubmit={async (password) => {
-            await accountActions.unlockVault(password);
-            toast("success", t("ts.unlocked"));
           }}
         />
       )}

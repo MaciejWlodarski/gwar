@@ -96,9 +96,9 @@ const desktopSigner: ClaimSigner = {
   claimSign: (uid, statement) => desktopTsBridge.claimSign(uid, statement),
 };
 
-/** The account's identities, with their keys; none unless signed in with the vault key. */
+/** The account's identities, with their keys; none unless signed in. */
 async function vaultIdentities(record: ConnectRecord | undefined): Promise<TsEntry[]> {
-  if (!record?.vaultKey) return [];
+  if (!record) return [];
   return vaultList((await loadVault(connectApi, record)).contents).identities;
 }
 
@@ -109,7 +109,7 @@ const browserSigner: ClaimSigner = {
     // statement claims for (another tab may have signed in as someone else meanwhile).
     const record = await loadConnectRecord();
     const claimant = statement.split("\n")[2];
-    if (!record?.vaultKey || claimant !== (await uidForPublicKey(record.accountKey))) {
+    if (!record || claimant !== (await uidForPublicKey(record.accountKey))) {
       throw new Error("this claim is for another account than the one signed in");
     }
     const entry = (await vaultIdentities(record)).find((i) => i.uid === uid);
@@ -137,9 +137,7 @@ export type SyncOutcome =
   /** The vault had identities; the desktop uses them now. */
   | "adopted"
   /** The vault had none; it now holds this desktop's own. */
-  | "seeded"
-  /** No vault key on this device yet: nothing to do until a flow that has the password. */
-  | "locked";
+  | "seeded";
 
 /** The device's own list; if it has none, a new identity named "Default" is made and stored first. */
 async function deviceListOrNew(ts: TsBridge): Promise<TsList> {
@@ -186,7 +184,6 @@ async function updateWithLists(
 
 /** Run after any flow that stored a (new) vault key. Throws on network or TeamSpeak errors; callers log them. */
 export async function syncAfterUnlock(api: ConnectApi, record: ConnectRecord, ts: TsBridge, now: number = Date.now()): Promise<SyncOutcome> {
-  if (!record.vaultKey) return "locked";
   let { contents } = await loadVault(api, record);
   let outcome: SyncOutcome = "adopted";
   if (vaultList(contents).identities.length === 0) {
@@ -208,11 +205,10 @@ export async function syncAfterUnlock(api: ConnectApi, record: ConnectRecord, ts
   return outcome;
 }
 
-export type RefreshOutcome = "applied" | "unchanged" | "empty" | "locked";
+export type RefreshOutcome = "applied" | "unchanged" | "empty";
 
 /** At start: applies the vault's identities if this desktop is not using them yet. Never seeds. */
 export async function refreshFromVault(api: ConnectApi, record: ConnectRecord, ts: TsBridge): Promise<RefreshOutcome> {
-  if (!record.vaultKey) return "locked";
   const found = vaultList((await loadVault(api, record)).contents);
   if (found.identities.length === 0) return "empty";
   const info = await ts.list("active");

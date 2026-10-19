@@ -16,14 +16,11 @@ use tsproto_types::crypto::EccKeyPrivP256;
 /// Most servers require a security level of at least 8 to connect.
 pub const MIN_LEVEL: u8 = 8;
 
-/// A new identity at level [`MIN_LEVEL`]. tsproto cannot read back a key whose private scalar starts with
-/// a zero byte (one in 256: its DER form is a byte short). The text form is read by [`parse_any`] anyway,
-/// but the JSON files of older versions go through tsproto, so this makes another key instead.
+/// A new identity at level [`MIN_LEVEL`], one whose text form reads back.
 pub fn generate() -> Identity {
     loop {
         let identity = Identity::create();
-        let stored = serde_json::to_vec(&identity).ok().and_then(|json| serde_json::from_slice::<Identity>(&json).ok());
-        if stored.is_some() && parse_any(&export(&identity)).is_ok() {
+        if parse_any(&export(&identity)).is_ok() {
             return identity;
         }
     }
@@ -159,20 +156,6 @@ pub fn parse(text: &str) -> Result<Identity> {
         );
     }
     Ok(identity)
-}
-
-/// The identity stored at `path`, if there is a file.
-pub fn read(path: &Path) -> Result<Option<Identity>> {
-    match std::fs::read(path) {
-        Ok(data) => Ok(Some(serde_json::from_slice(&data).context("invalid TeamSpeak identity file")?)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Writes `identity` to `path` (private to the user), replacing what is there.
-pub fn write(path: &Path, identity: &Identity) -> Result<()> {
-    write_private(path, &serde_json::to_vec(identity)?)
 }
 
 /// Writes `data` to `path` readable by the user only, replacing what is there.
@@ -378,23 +361,5 @@ mod tests {
         let identity = low_level();
         let message = parse(&export(&identity)).unwrap_err().to_string();
         assert!(message.contains("security level"), "{message}");
-    }
-
-    #[test]
-    fn files_round_trip_and_are_private() {
-        let dir = std::env::temp_dir().join(format!("gwar-ts-identity-{}", std::process::id()));
-        let path = dir.join("identity.json");
-        assert!(read(&path).unwrap().is_none());
-        let first = fresh();
-        write(&path, &first).unwrap();
-        let second = fresh();
-        write(&path, &second).unwrap();
-        assert_eq!(uid(&read(&path).unwrap().unwrap()), uid(&second));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
-        }
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -46,12 +46,4 @@ describe("vault profile sync", () => {
     expect(puts).toBe(2);
     expect((await serverVault(service, record))?.contents).toEqual({ profile: { nickname: "Changed", updated_at: 10, avatar: "kept" }, teamspeak: { default: "ts" } });
   }, 30_000);
-  it("keeps the local nickname while locked and rejects edits without writing", async () => {
-    const { api, record, service } = await account();
-    const locked = { ...record, vaultKey: undefined };
-    expect(await syncProfileAfterUnlock(api, locked, "Local")).toBe("Local");
-    expect(await refreshProfile(api, locked)).toBeUndefined();
-    await expect(changeProfileNickname(api, locked, "New")).rejects.toThrow(/vault key/);
-    expect(await serverVault(service, record)).toBeNull();
-  }, 30_000);
 });

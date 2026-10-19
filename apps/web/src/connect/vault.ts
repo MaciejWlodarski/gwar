@@ -12,7 +12,7 @@ import { decodeBase64Url } from "../net/base64url";
 import type { ConnectRecord } from "../net/identity";
 import { ConnectApi, ConnectApiError } from "./api";
 import { openVault, sealVault } from "./crypto";
-import { cleanName, emptyList, LEGACY_NAME, normalizeList, type TsEntry, type TsList } from "./ts-list";
+import { cleanName, DEFAULT_NAME, emptyList, normalizeList, type TsEntry, type TsList } from "./ts-list";
 
 /** One TeamSpeak identity as stored: the TeamSpeak client's export string, its uid, a name and when it was set (Unix ms). */
 export interface VaultIdentity {
@@ -23,16 +23,10 @@ export interface VaultIdentity {
   [unknown: string]: unknown;
 }
 
-/**
- * The TeamSpeak part of the vault. Writers produce `identities` and `default`; readers also take the
- * older single-identity form (`identity`, `uid`, `updated_at` next to each other), which they never write.
- */
+/** The TeamSpeak part of the vault: the identities and the default one's uid. */
 export interface TeamspeakVault {
   identities?: VaultIdentity[];
   default?: string;
-  identity?: string;
-  uid?: string;
-  updated_at?: number;
   [unknown: string]: unknown;
 }
 
@@ -54,18 +48,9 @@ export interface VaultState {
   version: number;
 }
 
-/** This device has no vault key yet (it signed in before vaults existed); a flow that has the password adds it. */
-export class VaultLockedError extends Error {
-  constructor() {
-    super("the vault key is not on this device");
-    this.name = "VaultLockedError";
-  }
-}
-
 const MAX_TRIES = 4;
 
 function keyOf(record: ConnectRecord): Uint8Array {
-  if (!record.vaultKey) throw new VaultLockedError();
   return decodeBase64Url(record.vaultKey);
 }
 
@@ -110,31 +95,23 @@ export async function updateVault(
   }
 }
 
-/** The TeamSpeak identities in the vault: the list form if it has entries, else the older single identity (named "TeamSpeak"). */
+/** The TeamSpeak identities in the vault. */
 export function vaultList(contents: VaultContents): TsList {
   const ts = contents.teamspeak;
-  if (!ts || typeof ts !== "object") return emptyList();
-  if (Array.isArray(ts.identities)) {
-    const identities = ts.identities
-      .filter((e): e is VaultIdentity => !!e && typeof e.uid === "string" && typeof e.identity === "string")
-      .map((e): TsEntry => ({ uid: e.uid, name: cleanName(typeof e.name === "string" ? e.name : "", LEGACY_NAME), identity: e.identity }));
-    const list = normalizeList({ default: typeof ts.default === "string" ? ts.default : null, identities });
-    if (list.identities.length > 0) return list;
-  }
-  if (typeof ts.identity === "string" && ts.identity !== "" && typeof ts.uid === "string" && ts.uid !== "") {
-    return normalizeList({ default: ts.uid, identities: [{ uid: ts.uid, name: LEGACY_NAME, identity: ts.identity }] });
-  }
-  return emptyList();
+  if (!ts || typeof ts !== "object" || !Array.isArray(ts.identities)) return emptyList();
+  const identities = ts.identities
+    .filter((e): e is VaultIdentity => !!e && typeof e.uid === "string" && typeof e.identity === "string")
+    .map((e): TsEntry => ({ uid: e.uid, name: cleanName(typeof e.name === "string" ? e.name : "", DEFAULT_NAME), identity: e.identity }));
+  return normalizeList({ default: typeof ts.default === "string" ? ts.default : null, identities });
 }
 
 /**
  * Contents with the TeamSpeak identities replaced by `list`; whatever else the vault holds stays, and so do
- * unknown fields of the TeamSpeak part and of entries that are still there. The older single-identity fields
- * are dropped. An entry keeps its `updated_at` unless its name or key changed.
+ * unknown fields of the TeamSpeak part and of entries that are still there. An entry keeps its `updated_at`
+ * unless its name or key changed.
  */
 export function withTeamspeakList(contents: VaultContents, list: TsList, now: number = Date.now()): VaultContents {
   const ts: TeamspeakVault = { ...contents.teamspeak };
-  for (const legacy of ["identity", "uid", "updated_at"]) delete ts[legacy];
   const before = new Map((Array.isArray(ts.identities) ? ts.identities : []).map((e) => [e?.uid, e] as const));
   ts.identities = list.identities.map((e) => {
     const old = before.get(e.uid);

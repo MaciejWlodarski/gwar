@@ -356,15 +356,6 @@ export async function renewCertificate(record: ConnectRecord, password: string, 
   return saveUnlocked(record, await withAccountKey(account, token, deps, record), deps);
 }
 
-/**
- * Records saved before the vault existed have no vault key. The password
- * derives it (and refreshes the session token, and renews this certificate).
- */
-export async function unlockVault(record: ConnectRecord, password: string, deps: FlowDeps): Promise<ConnectRecord> {
-  const { token, account } = await unlock(deps.api, record.handle, password);
-  return saveUnlocked(record, await withAccountKey(account, token, deps, record), deps);
-}
-
 /** A new recovery code to show; {@link changeRecoveryCode} sets it once the person confirmed they kept it. */
 export function newRecoveryCode(): string {
   return formatRecoveryCode(generateRecoveryCode());

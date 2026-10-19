@@ -635,79 +635,19 @@ impl Store {
                 "INSERT INTO groups(id,name,permissions,position) VALUES(?1,'Admin',?2,0)",
                 params![ADMIN_GROUP, all],
             )?;
+            // Members join, talk and write, and may invite and upload, unless an admin takes it away.
+            let mut member = vec![Permission::Connect, Permission::Speak, Permission::SendMessages];
+            member.extend(Permission::MEMBER_DEFAULT);
+            member.sort_unstable();
+            member.dedup();
             self.db.execute(
-                "INSERT INTO groups(id,name,permissions,position) VALUES(?1,'Member','[]',?2)",
-                params![MEMBER_GROUP, MEMBER_POSITION],
+                "INSERT INTO groups(id,name,permissions,position) VALUES(?1,'Member',?2,?3)",
+                params![MEMBER_GROUP, serde_json::to_string(&member)?, MEMBER_POSITION],
             )?;
         }
-        self.upgrade_permission_names()?;
-        // Admin holds `administrator`, which is every permission, including ones added in later versions.
-        self.db.execute(
-            "UPDATE groups SET permissions=?2 WHERE id=?1",
-            params![ADMIN_GROUP, serde_json::to_string(&[Permission::Administrator])?],
-        )?;
-        if self.meta("member_channel_defaults")?.is_none() {
-            // Roles version 2, step 2: joining, talking and writing became permissions; members keep them.
-            let mut member = self.groups()?.into_iter().find(|g| g.id == MEMBER_GROUP).map(|g| g.permissions);
-            if let Some(permissions) = member.as_mut() {
-                for p in [Permission::Connect, Permission::Speak, Permission::SendMessages] {
-                    if !permissions.contains(&p) {
-                        permissions.push(p);
-                    }
-                }
-                self.db.execute(
-                    "UPDATE groups SET permissions=?2 WHERE id=?1",
-                    params![MEMBER_GROUP, serde_json::to_string(permissions)?],
-                )?;
-            }
-            self.set_meta("member_channel_defaults", "1")?;
-        }
-        if self.meta("member_defaults")?.is_none() {
-            // Members may invite and upload unless an admin takes it away.
-            let mut member = self.groups()?.into_iter().find(|g| g.id == MEMBER_GROUP).map(|g| g.permissions);
-            if let Some(permissions) = member.as_mut() {
-                for p in Permission::MEMBER_DEFAULT {
-                    if !permissions.contains(&p) {
-                        permissions.push(p);
-                    }
-                }
-                self.db.execute(
-                    "UPDATE groups SET permissions=?2 WHERE id=?1",
-                    params![MEMBER_GROUP, serde_json::to_string(permissions)?],
-                )?;
-            }
-            self.set_meta("member_defaults", "1")?;
-        }
         Ok(())
     }
 
-    /// Rewrites permission names from before roles version 2 (docs/roles.md) in place; unknown ones go.
-    fn upgrade_permission_names(&self) -> Result<()> {
-        let rows: Vec<(GroupId, String)> = {
-            let mut stmt = self.db.prepare("SELECT id,permissions FROM groups")?;
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
-        };
-        for (id, stored) in rows {
-            let names: Vec<String> = serde_json::from_str(&stored).unwrap_or_default();
-            let mut permissions: Vec<Permission> = names
-                .iter()
-                .filter_map(|n| {
-                    serde_json::from_value(serde_json::Value::String(n.clone())).ok().or_else(|| Permission::from_v1(n))
-                })
-                .collect();
-            permissions.sort_unstable();
-            permissions.dedup();
-            let upgraded = serde_json::to_string(&permissions)?;
-            if upgraded != stored {
-                self.db.execute("UPDATE groups SET permissions=?2 WHERE id=?1", params![id, upgraded])?;
-            }
-        }
-        // Member stays last whatever the stored positions say.
-        self.db.execute("UPDATE groups SET position=?2 WHERE id=?1", params![MEMBER_GROUP, MEMBER_POSITION])?;
-        Ok(())
-    }
-
-    /// A new database's channels, at the server's first start.
     /// A new database's channels, plaintext like every channel created without choosing encryption.
     pub fn seed_channels(&self) -> Result<()> {
         let has_channels: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM channels)", [], |r| r.get(0))?;
@@ -1421,14 +1361,11 @@ impl Store {
         Ok(())
     }
 
-    /// Includes expired attestations (and handles confirmed before attestations existed)
-    /// so a returning account still triggers refresh.
+    /// Includes expired attestations so a returning account still triggers refresh.
     pub fn has_connect_attestation(&self, user_id: i64) -> Result<bool> {
-        Ok(self.db.query_row(
-            "SELECT connect_attestation IS NOT NULL OR connect_handle IS NOT NULL FROM users WHERE id=?1",
-            [user_id],
-            |r| r.get(0),
-        )?)
+        Ok(self
+            .db
+            .query_row("SELECT connect_attestation IS NOT NULL FROM users WHERE id=?1", [user_id], |r| r.get(0))?)
     }
 
     /// Disabling Connect forgets cached handles, so enabling it starts with fresh checks.
@@ -2215,7 +2152,7 @@ impl Store {
 
     /// Whether an invite is valid now, without using it; returns the group it grants.
     /// A valid invite's group and creator, without using it.
-    pub fn peek_invite(&self, code: &str, now: i64) -> Result<Option<(Option<GroupId>, Option<String>)>> {
+    pub fn peek_invite(&self, code: &str, now: i64) -> Result<Option<(Option<GroupId>, String)>> {
         Ok(self
             .db
             .query_row(
@@ -2726,8 +2663,8 @@ mod tests {
         assert_eq!(member.nickname, "Kept");
         assert!(member.connect.is_none());
         assert_eq!(store.connect_next_check(id).unwrap(), None);
-        // The unsigned handle is not shown, but still marks the key as a Connect account.
-        assert!(store.has_connect_attestation(id).unwrap());
+        // The unsigned handle is not shown, nor taken for a Connect account's.
+        assert!(!store.has_connect_attestation(id).unwrap());
         let (id, member) = store.user_by_uid("unknown").unwrap().unwrap();
         assert!(member.connect.is_none());
         assert_eq!(store.connect_next_check(id).unwrap(), None);
@@ -2735,29 +2672,6 @@ mod tests {
         assert!(store.db.prepare("SELECT connect_checked_at FROM users").is_err());
         let version: usize = store.db.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(version, MIGRATIONS.len());
-    }
-
-    #[test]
-    fn invites_from_before_ownership_belong_to_nobody() {
-        let db = Connection::open_in_memory().unwrap();
-        let before = migration_adding("invites ADD COLUMN creator_uid");
-        for migration in &MIGRATIONS[..before] {
-            db.execute_batch(migration).unwrap();
-        }
-        db.pragma_update(None, "user_version", before).unwrap();
-        db.execute("INSERT INTO invites(code,uses,created_by,created_at) VALUES('old',0,'root',1)", []).unwrap();
-        let store = Store::init(db).unwrap();
-        // Whoever is called "root" now does not own it; only an unrestricted (manager) view sees it.
-        assert!(store.invites(Some("root")).unwrap().is_empty());
-        assert!(!store.delete_invite("old", Some("root")).unwrap());
-        assert_eq!(store.invites(None).unwrap()[0].code, "old");
-        let invite =
-            Invite { code: "new".into(), created_by: "Name".into(), ..store.invites(None).unwrap()[0].clone() };
-        store.insert_invite(&invite, "uid").unwrap();
-        assert_eq!(store.invites(Some("uid")).unwrap()[0].code, "new");
-        assert!(!store.delete_invite("new", Some("other")).unwrap());
-        assert!(store.delete_invite("new", Some("uid")).unwrap());
-        assert!(store.delete_invite("old", None).unwrap());
     }
 
     #[test]

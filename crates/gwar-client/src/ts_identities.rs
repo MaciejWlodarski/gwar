@@ -1,10 +1,6 @@
 //! The list of TeamSpeak identities the desktop app keeps (docs/connect.md): each
 //! has a name, its unique id and the text form of `ts_identity`, and one is the
 //! default. The list is a private JSON file, `{default, identities: [{uid, name, identity}]}`.
-//!
-//! Older versions kept a single identity in a file of its own; [`load`] turns
-//! that into a list with one entry named "Default" the first time it is read and
-//! leaves the old file where it is.
 
 use std::path::Path;
 
@@ -13,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ts_identity::{self, Identity};
 
-/// The name of the identity a device starts with, and of one carried over from an older single-identity file.
+/// The name of the identity a device starts with.
 pub const DEFAULT_NAME: &str = "Default";
 
 /// Longer names are cut.
@@ -114,23 +110,14 @@ impl List {
     }
 }
 
-/// The list stored at `path`. With no file there, a single identity from the older `legacy` file becomes
-/// the list (and is stored at `path`); `None` if there is neither.
-pub fn load(path: &Path, legacy: &Path) -> Result<Option<List>> {
+/// The list stored at `path`; `None` if there is none.
+pub fn load(path: &Path) -> Result<Option<List>> {
     match std::fs::read(path) {
         Ok(data) => {
             let list: List = serde_json::from_slice(&data).context("invalid TeamSpeak identities file")?;
             Ok(Some(list.normalized()))
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let Some(identity) = ts_identity::read(legacy)? else { return Ok(None) };
-            let mut list = List::default();
-            list.push(DEFAULT_NAME, &identity);
-            if let Err(e) = save(path, &list) {
-                tracing::warn!("cannot store the migrated TeamSpeak identities: {e:#}");
-            }
-            Ok(Some(list))
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
 }
@@ -200,44 +187,24 @@ mod tests {
     #[test]
     fn a_missing_everything_is_none_and_a_damaged_file_is_an_error() {
         let dir = TempDir::new("ts-list");
-        let (path, legacy) = (dir.join("list.json"), dir.join("old.json"));
-        assert!(load(&path, &legacy).unwrap().is_none());
+        let path = dir.join("list.json");
+        assert!(load(&path).unwrap().is_none());
         assert!(!path.exists(), "nothing is created for an empty device");
         std::fs::write(&path, "{not json").unwrap();
-        assert!(load(&path, &legacy).is_err());
-    }
-
-    #[test]
-    fn an_older_single_identity_file_becomes_a_list_named_default_and_stays_in_place() {
-        let dir = TempDir::new("ts-list");
-        let (path, legacy) = (dir.join("list.json"), dir.join("old.json"));
-        let old = generate();
-        ts_identity::write(&legacy, &old).unwrap();
-
-        let list = load(&path, &legacy).unwrap().unwrap();
-        assert_eq!(list.identities.len(), 1);
-        assert_eq!(list.identities[0].name, DEFAULT_NAME);
-        assert_eq!(list.identities[0].uid, uid(&old));
-        assert_eq!(list.default.as_deref(), Some(uid(&old).as_str()));
-        assert!(legacy.exists(), "the old file is left alone");
-        assert!(path.exists(), "the migration is stored");
-
-        // From now on the list file rules; the old file is not read again.
-        ts_identity::write(&legacy, &generate()).unwrap();
-        assert_eq!(load(&path, &legacy).unwrap().unwrap(), list);
+        assert!(load(&path).is_err());
     }
 
     #[test]
     fn a_list_file_round_trips_privately_and_is_repaired_on_read() {
         let dir = TempDir::new("ts-list");
-        let (path, legacy) = (dir.join("sub/list.json"), dir.join("old.json"));
+        let path = dir.join("sub/list.json");
         let (a, b) = (generate(), low_level());
         let mut list = List::default();
         list.push("a", &a);
         list.push("low", &b);
         save(&path, &list).unwrap();
         save(&path, &list).unwrap();
-        assert_eq!(load(&path, &legacy).unwrap().unwrap(), list, "a low level identity stays in the list");
+        assert_eq!(load(&path).unwrap().unwrap(), list, "a low level identity stays in the list");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -254,7 +221,7 @@ mod tests {
             ],
         });
         std::fs::write(&path, edited.to_string()).unwrap();
-        let repaired = load(&path, &legacy).unwrap().unwrap();
+        let repaired = load(&path).unwrap().unwrap();
         assert_eq!(repaired.identities.len(), 1);
         assert_eq!(repaired.identities[0].uid, uid(&a));
         assert_eq!(repaired.default.as_deref(), Some(uid(&a).as_str()));

@@ -135,22 +135,10 @@ export function shouldReconnectAfter(reason: LeaveReason): boolean {
   return reason.kind !== "kicked" && reason.kind !== "banned" && reason.kind !== "removed" && reason.kind !== "replaced";
 }
 
-/**
- * Servers answer an unusable device certificate with the generic `not_authenticated` (the same code
- * as a bad signature or a revoked device), so the cause is told apart here: our own clock against the
- * certificate we sent, or the server's wording ("the device certificate has expired").
- */
-export function isExpiredCertificate(device: Identity["device"], message: string, now: number = Date.now()): boolean {
-  return !!device && (device.expires_at <= now || /certificate has expired/i.test(message));
-}
-
-function mapHelloError(code: ErrorCode, message: string, serverName?: string, ban?: BanNotice, device?: Identity["device"]): ConnectError {
+function mapHelloError(code: ErrorCode, message: string, serverName?: string, ban?: BanNotice): ConnectError {
   switch (code) {
     case "certificate_expired":
       return new ConnectError("certificate_expired", message, serverName);
-    case "not_authenticated":
-      // Servers before the certificate_expired code only said so in the message.
-      return new ConnectError(isExpiredCertificate(device, message) ? "certificate_expired" : "rejected", message, serverName);
     case "wrong_password":
       return new ConnectError("wrong_password", message, serverName);
     case "unavailable":
@@ -462,7 +450,7 @@ export class Connection implements Link {
             .catch((e: unknown) => {
               if (e instanceof ServerIdentityChanged) fail(new ConnectError("server_identity", e.message, serverName, undefined, e));
               else if (e instanceof ConnectError) fail(e);
-              else if (e instanceof RequestError) fail(mapHelloError(e.code, e.message, serverName, e.ban, identity.device));
+              else if (e instanceof RequestError) fail(mapHelloError(e.code, e.message, serverName, e.ban));
               else if (e instanceof RequestTimeoutError) fail(new ConnectError(e.op === "hello" ? "protocol" : "timeout", e.op === "hello" ? "missing server proof" : e.message, serverName));
               else fail(new ConnectError("protocol", e instanceof Error ? e.message : String(e), serverName));
             });

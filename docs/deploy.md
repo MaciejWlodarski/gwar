@@ -75,7 +75,7 @@ comes from `CF-Connecting-IP`, trusted only from Cloudflare's ranges
 `real_ip_header CF-Connecting-IP;`). Connect's rate limits depend on it.
 
 ```nginx
-map $http_upgrade $vc_connection_upgrade {
+map $http_upgrade $gwar_connection_upgrade {
     default upgrade;
     ""      close;
 }
@@ -142,7 +142,7 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $vc_connection_upgrade;
+        proxy_set_header Connection $gwar_connection_upgrade;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
     }

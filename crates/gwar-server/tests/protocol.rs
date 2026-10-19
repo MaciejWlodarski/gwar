@@ -403,7 +403,7 @@ impl ModeratorDb {
         drop(gwar_server::store::Store::open(&path).unwrap());
         let db = rusqlite::Connection::open(&path).unwrap();
         db.execute(
-            "INSERT INTO groups(id,name,permissions) VALUES(3,'Moderator','[\"token_create\",\"client_kick\"]')",
+            "INSERT INTO groups(id,name,permissions) VALUES(3,'Moderator','[\"create_invites\",\"kick_members\"]')",
             [],
         )
         .unwrap();

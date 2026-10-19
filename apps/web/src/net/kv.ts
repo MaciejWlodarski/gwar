@@ -1,30 +1,14 @@
 /** Minimal promise wrapper over one IndexedDB object store (no dependency). */
-import { moveLegacyDatabase } from "../rename-migration";
 const DB_NAME = "gwar";
 const STORE = "kv";
 
-function openDb(): Promise<IDBDatabase> {
+function open(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, 1);
     req.onupgradeneeded = () => req.result.createObjectStore(STORE);
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error ?? new Error("indexedDB open failed"));
   });
-}
-
-/**
- * The database under the old name moves first (rename-migration.ts; remove with it). Until it has,
- * nothing here works: an empty new database must never look like "no identity yet". A failed move
- * is tried again on the next use.
- */
-let moved: Promise<void> | undefined;
-async function open(): Promise<IDBDatabase> {
-  moved ??= moveLegacyDatabase(openDb).catch((e: unknown) => {
-    moved = undefined;
-    throw e;
-  });
-  await moved;
-  return openDb();
 }
 
 export async function kvGet<T>(key: string): Promise<T | undefined> {

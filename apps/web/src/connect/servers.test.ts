@@ -9,7 +9,7 @@ const ACCT = "account-key";
 /** Small times are offsets from a recent moment, so tombstones are fresh. */
 const T = (n: number) => NOW - 1_000_000 + n;
 const entry = (id: string, at: number, extra: Partial<VaultServer> = {}): VaultServer => ({ id, name: id, address: `${id}.example.com`, kind: "gwar", updated_at: T(at), ...extra });
-const bookmark = (id: string, at: number | undefined, extra: Partial<Bookmark> = {}): Bookmark => ({ id, name: id, address: `${id}.example.com`, kind: "gwar", updatedAt: at === undefined ? undefined : T(at), ...extra });
+const bookmark = (id: string, at: number, extra: Partial<Bookmark> = {}): Bookmark => ({ id, name: id, address: `${id}.example.com`, kind: "gwar", updatedAt: T(at), ...extra });
 
 describe("vaultServers", () => {
   it("keeps valid entries in order and skips malformed or repeated ones", () => {
@@ -54,16 +54,16 @@ describe("mergeServers", () => {
     expect(merged[1]?.extra).toBe(1);
   });
 
-  it("removals win only when newer, and bookmarks from before syncing lose to the vault", () => {
+  it("removals win only when newer, and an older bookmark loses to the vault", () => {
     const merged = mergeServers(
-      [entry("old", 5), entry("fresh", 20), entry("legacy", 1, { name: "vault legacy" }), { ...entry("deleted", 30), deleted: true }],
-      { bookmarks: [bookmark("legacy", undefined, { name: "local legacy" }), bookmark("deleted", 10)], removed: { old: { at: T(10) }, fresh: { at: T(10) } } },
+      [entry("old", 5), entry("fresh", 20), entry("older", 2, { name: "vault older" }), { ...entry("deleted", 30), deleted: true }],
+      { bookmarks: [bookmark("older", 1, { name: "local older" }), bookmark("deleted", 10)], removed: { old: { at: T(10) }, fresh: { at: T(10) } } },
       NOW,
     );
     expect(merged.map((e) => [e.id, !!e.deleted, e.name])).toEqual([
       ["old", true, ""],
       ["fresh", false, "fresh"],
-      ["legacy", false, "vault legacy"],
+      ["older", false, "vault older"],
       ["deleted", true, "deleted"],
     ]);
   });
