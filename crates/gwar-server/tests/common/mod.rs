@@ -547,6 +547,11 @@ impl Client {
         .await
     }
 
+    /// Reads (keeping events) until the server closes the connection.
+    pub async fn closed(&mut self) {
+        while self.pump().await.is_some() {}
+    }
+
     /// Round-trips a ping. Every event queued for this client before the ping
     /// was processed has arrived afterwards, so absence checks are deterministic.
     pub async fn sync(&mut self) {

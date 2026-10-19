@@ -565,4 +565,82 @@ fn the_servers_password_waits_for_the_bridge_like_a_channels() {
     // Imported again without it (locked with a random one): the queued one is no longer the password.
     apply(&store, &plan(&s, &Options::default()), "src", BRIDGE).unwrap();
     assert_eq!(store.bridge_server_password().unwrap(), None);
+fn a_filled_in_passwords_template_gives_back_exactly_those_passwords() {
+    let mut s = source();
+    s.server.insert("virtualserver_flag_password".into(), "1".into());
+    // A tricky name too: quotes, an equals sign and a slash.
+    s.channels[6].insert("channel_name".into(), "Odd \"=/".into());
+    s.channels[6].insert("channel_flag_password".into(), "1".into());
+    let blank = plan(&s, &Options::default());
+    assert_eq!(blank.password_keys.first().map(String::as_str), Some(super::plan::SERVER_PASSWORD));
+    let template = super::plan::passwords_template(&blank, &BTreeMap::new());
+    // Left as written, it gives no password at all.
+    assert!(super::parse_passwords(&template).unwrap().is_empty(), "{template}");
+    // Every line filled in: each password lands where it belongs.
+    let filled: String = template
+        .lines()
+        .map(|line| if line.starts_with('#') { line.to_owned() } else { format!("{line}pw-{}", line.len()) })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let passwords = super::parse_passwords(&filled).unwrap();
+    assert_eq!(passwords.len(), blank.password_keys.len());
+    let options = Options { passwords, ..Default::default() };
+    let kept = plan(&s, &options);
+    assert!(matches!(kept.server_password, Password::Kept(_)));
+    assert!(kept.channels.iter().all(|c| !matches!(c.password, Password::Locked)), "{:?}", kept.notes);
+}
+
+#[test]
+fn a_failed_query_connection_says_what_to_do() {
+    use super::guide::query_hint;
+    use crate::teamspeak::query::QueryError;
+    let query = |id| anyhow::Error::new(QueryError { id, msg: "x".into() }).context("query login");
+    assert!(query_hint(&query(520), "127.0.0.1:10011", 1).unwrap().contains("serveradmin_password="));
+    assert!(query_hint(&query(3331), "127.0.0.1:10011", 1).unwrap().contains("query_ip_allowlist.txt"));
+    assert!(query_hint(&query(1024), "127.0.0.1:10011", 7).unwrap().contains("virtual server 7"));
+    assert!(query_hint(&query(1), "127.0.0.1:10011", 1).is_none());
+    let refused = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)).context("connect");
+    assert!(query_hint(&refused, "127.0.0.1:10011", 1).unwrap().contains("ssh -N -L"));
+    let voice_port = anyhow::anyhow!("not a TeamSpeak query interface (banner \"x\")");
+    assert!(query_hint(&voice_port, "127.0.0.1:9987", 1).unwrap().contains("query port"));
+}
+
+#[test]
+fn the_next_steps_follow_what_the_dry_run_found() {
+    use super::guide::{DryRun, after_dry_run, after_import};
+    let locked = plan(&source(), &Options::default());
+    let dry = |plan, passwords_given, server_running| {
+        after_dry_run(&DryRun { plan, passwords_given, drop_passwords: false, for_bridge: false, server_running })
+    };
+    let first = dry(&locked, false, false);
+    assert!(first.contains("--passwords-template passwords.txt"), "{first}");
+    assert!(first.contains("imports directly"), "{first}");
+    assert!(dry(&locked, false, true).contains("goes through it"));
+    let open = plan(&source(), &Options { drop_passwords: true, ..Default::default() });
+    let no_passwords = dry(&open, false, false);
+    assert!(!no_passwords.contains("--passwords-template") && !no_passwords.contains("--for-bridge"), "{no_passwords}");
+    let kept = plan(&source(), &Options { passwords: [("Secret".into(), "pw".into())].into(), ..Default::default() });
+    assert!(dry(&kept, true, false).contains("--for-bridge"));
+
+    let done = after_import(&locked, true, Some("/data/gwar.sqlite3.before-import-1"));
+    assert!(done.contains("locked with a random password"), "{done}");
+    assert!(done.contains("stop this server, then put /data/gwar.sqlite3.before-import-1 back"), "{done}");
+    assert!(!after_import(&kept, false, None).contains("To undo"));
+}
+
+#[test]
+fn a_passwords_template_is_a_new_file_its_owner_alone_reads() {
+    let dir = std::env::temp_dir().join(format!("gwar-template-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("passwords.txt");
+    super::write_passwords_template(&path, "@server = \n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    // One already filled in is never overwritten.
+    assert!(super::write_passwords_template(&path, "other").is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "@server = \n");
+    std::fs::remove_dir_all(&dir).unwrap();
 }

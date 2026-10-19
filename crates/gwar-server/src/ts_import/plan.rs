@@ -123,6 +123,10 @@ pub struct Plan {
     pub bans: Vec<PlannedBan>,
     /// What did not move, or moved differently, by name: the report.
     pub notes: Vec<String>,
+    /// What has a password on TeamSpeak, as a passwords file names it: `@server` first, then each
+    /// such channel's path (see [`passwords_template`]).
+    #[serde(default)]
+    pub password_keys: Vec<String>,
 }
 
 /// Group types: 1 is a regular group (0 template, 2 query).
@@ -212,6 +216,7 @@ pub fn plan(source: &Source, options: &Options) -> Result<Plan> {
     plan.max_clients = server.get("virtualserver_maxclients").and_then(|m| m.parse().ok());
     let mut used_passwords: BTreeSet<&str> = BTreeSet::new();
     if server.get("virtualserver_flag_password").is_some_and(|f| f == "1") {
+        plan.password_keys.push(SERVER_PASSWORD.into());
         plan.server_password = if options.drop_passwords {
             plan.notes.push("The server: password dropped (--drop-passwords).".into());
             Password::Dropped
@@ -416,6 +421,7 @@ pub fn plan(source: &Source, options: &Options) -> Result<Plan> {
             }
             let overrides = merge_overrides(overrides);
             let password = if c.get("channel_flag_password").is_some_and(|f| f == "1") {
+                plan.password_keys.push(path.clone());
                 if options.drop_passwords {
                     plan.notes.push(format!("\"{path}\": password dropped (--drop-passwords)."));
                     Password::Dropped
@@ -645,6 +651,28 @@ fn parents_first(channels: Vec<PlannedChannel>) -> Vec<PlannedChannel> {
             out.extend(left.into_iter().map(|c| PlannedChannel { parent: None, ..c }));
             break;
         }
+    }
+    out
+}
+
+/// A passwords file to fill in (`--passwords-template`): every password the TeamSpeak server has,
+/// one per line, with what is already known filled in. A line left empty keeps nothing.
+pub fn passwords_template(plan: &Plan, known: &BTreeMap<String, String>) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    for line in [
+        "# The passwords to keep, for `gwar-server import-teamspeak --passwords <this file>`.",
+        "# Write each one after its \"=\". A line left empty imports that channel locked with a random",
+        "# password (set a new one in Gwar later); --drop-passwords imports them all without one.",
+        "# \"@server\" is the server's own password. Channels are named by their path, \"Parent/Child\";",
+        "# a \"/\" in a name is written \"\\/\" and a backslash \"\\\\\". Quote a name with \"=\" or \"#\" in it.",
+    ] {
+        let _ = writeln!(out, "{line}");
+    }
+    for key in &plan.password_keys {
+        let name =
+            if key.contains(['=', '#', '"']) { format!("\"{}\"", key.replace('"', "\\\"")) } else { key.clone() };
+        let _ = writeln!(out, "{name} = {}", known.get(key).map_or("", String::as_str));
     }
     out
 }

@@ -2,6 +2,7 @@
 //! work out the plan, and write it into a stopped Gwar server's database.
 
 pub mod apply;
+pub mod guide;
 pub mod plan;
 pub mod source;
 
@@ -125,13 +126,46 @@ pub fn parse_passwords(text: &str) -> Result<BTreeMap<String, String>> {
         }
         // The name may itself contain '=' only when quoted.
         let split = match line.strip_prefix('"') {
-            Some(rest) => rest.find('"').map(|end| end + 2).and_then(|end| line[end..].find('=').map(|eq| end + eq)),
+            Some(rest) => {
+                closing_quote(rest).map(|end| end + 2).and_then(|end| line[end..].find('=').map(|eq| end + eq))
+            }
             None => line.find('='),
         };
         let Some(eq) = split else { bail!("line {}: expected name = password", n + 1) };
-        out.insert(unquote(&line[..eq]), unquote(&line[eq + 1..]));
+        // A line left empty (as `--passwords-template` writes them) gives no password.
+        let password = unquote(&line[eq + 1..]);
+        if !password.is_empty() {
+            out.insert(unquote(&line[..eq]), password);
+        }
     }
     Ok(out)
+}
+
+/// Where a quoted name ends: the first `"` not written `\"`.
+fn closing_quote(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if bytes.get(i + 1) == Some(&b'"') => i += 2,
+            b'"' => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Writes a passwords template (it may hold passwords already): a new file, its owner's only.
+pub fn write_passwords_template(path: &Path, text: &str) -> Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path).with_context(|| format!("create {} (it must not exist yet)", path.display()))?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
 }
 
 pub fn read_passwords(path: &Path) -> Result<BTreeMap<String, String>> {
