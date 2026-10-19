@@ -46,8 +46,16 @@ export class MessageStorage {
   }
   constructor(private name = "gwar-message-auth-v3") {}
   private open(): Promise<IDBDatabase> {
-    return this.db ??= new Promise((resolve, reject) => {
+    if (this.db) return this.db;
+    const opening: Promise<IDBDatabase> = new Promise((resolve, reject) => {
+      let abandoned = false;
       const request = indexedDB.open(this.name, 3);
+      // A tab still holding an older version blocks the upgrade: storage is unavailable until it
+      // closes (the next operation tries again), instead of waiting forever.
+      request.onblocked = () => {
+        abandoned = true;
+        reject(new Error("Message storage is being upgraded in another tab"));
+      };
       request.onupgradeneeded = () => {
         const db = request.result, missing = (name: string) => !db.objectStoreNames.contains(name);
         if (missing("checkpoints")) db.createObjectStore("checkpoints").createIndex("at", "at");
@@ -57,8 +65,19 @@ export class MessageStorage {
         if (missing(ORDER)) db.createObjectStore(ORDER);
       };
       request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve(request.result);
+      request.onsuccess = () => {
+        const db = request.result;
+        if (abandoned) return db.close();
+        // Let a newer version of the app upgrade the database; the next operation reopens it.
+        db.onversionchange = () => {
+          db.close();
+          if (this.db === opening) this.db = undefined;
+        };
+        resolve(db);
+      };
     });
+    opening.catch(() => { if (this.db === opening) this.db = undefined; });
+    return this.db = opening;
   }
   private async transaction<T>(stores: string[], mode: IDBTransactionMode, change: (tx: IDBTransaction) => Promise<T>): Promise<T> {
     const db = await this.open();
