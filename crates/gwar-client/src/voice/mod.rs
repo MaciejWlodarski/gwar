@@ -620,13 +620,15 @@ fn pipeline<const CAPTURE: usize>(
         for _ in 0..mic.slots() {
             let Ok(sample) = mic.pop() else { break };
             let Some(capture_position) = capture.push_at(sample, Instant::now(), &counters) else { continue };
-            // Before the meter and the gate, which then react to the voice, not to the noise; on
-            // every frame, sent or not, so its state follows the audio.
+            // The meter and the gate measure the microphone as it is, so its sensitivity setting
+            // means what it did (a strong suppressor also takes very quiet speech down). The
+            // encoder gets the cleaned audio. Suppression runs on every frame, sent or not, so its
+            // state follows the audio.
+            let db = level_db(&capture.samples);
             let mode = NoiseSuppression::from_u8(controls.noise_suppression.load(Ordering::Relaxed));
             denoiser.process(&mut capture.samples, mode, next_position == Some(capture_position));
             next_position = Some(capture_position + CAPTURE as u64);
             let frame = &capture.samples;
-            let db = level_db(frame);
             set_f(&controls.input_level, db);
             let blocked = controls.muted.load(Ordering::Relaxed) || controls.deafened.load(Ordering::Relaxed);
             let wants = if controls.push_to_talk.load(Ordering::Relaxed) {

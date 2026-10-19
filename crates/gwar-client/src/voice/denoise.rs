@@ -1,6 +1,6 @@
-//! Background-noise suppression on the capture path (docs/latency.md, "Clean audio"): every
-//! 10 ms frame goes through it before the level meter, the voice-activity gate and the encoder,
-//! so the gate also stops opening on noise alone. It runs on the device, before encryption.
+//! Background-noise suppression on the capture path (docs/latency.md, "Noise suppression"): every
+//! 10 ms frame goes through it before the encoder; the level meter and the voice-activity gate
+//! still measure the microphone as captured. It runs on the device, before encryption.
 //!
 //! Both modes work on 48 kHz frames of exactly our 480 samples and add one frame (10 ms) of
 //! delay, their overlap-add; neither looks ahead. Measured on speech with noise at 5 dB SNR
@@ -54,7 +54,7 @@ mod deep {
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
-            mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel},
+            mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel},
         },
         time::Duration,
     };
@@ -66,10 +66,10 @@ mod deep {
     /// Longer than any frame takes (a few ms at worst): past it the worker counts as gone.
     const PATIENCE: Duration = Duration::from_millis(40);
 
-    enum Job {
-        Frame(Box<[f32; FRAME]>),
-        /// Start over from the untouched model (a gap in the capture).
-        Reset,
+    struct Job {
+        frame: Box<[f32; FRAME]>,
+        /// Start over from the untouched model first (a gap in the capture).
+        reset: bool,
     }
 
     pub(super) struct Worker {
@@ -78,6 +78,8 @@ mod deep {
         ready: Arc<AtomicBool>,
         /// A frame buffer that travels to the worker and back, so nothing is allocated per frame.
         spare: Option<Box<[f32; FRAME]>>,
+        /// The next frame starts from the untouched model.
+        reset: bool,
         broken: bool,
     }
 
@@ -106,25 +108,48 @@ mod deep {
                     let mut noisy = ndarray::Array2::<f32>::zeros((1, FRAME));
                     let mut clean = ndarray::Array2::<f32>::zeros((1, FRAME));
                     ready_flag.store(true, Ordering::Release);
-                    while let Ok(job) = job_rx.recv() {
-                        match job {
-                            Job::Reset => live = base.clone(),
-                            Job::Frame(mut frame) => {
-                                noisy.row_mut(0).iter_mut().zip(frame.iter()).for_each(|(n, s)| *n = *s);
-                                if let Err(e) = live.process(noisy.view(), clean.view_mut()) {
-                                    tracing::warn!("DeepFilterNet failed, using RNNoise: {e:#}");
-                                    return;
-                                }
-                                frame.iter_mut().zip(clean.row(0).iter()).for_each(|(s, c)| *s = c.clamp(-1.0, 1.0));
-                                if done_tx.send(frame).is_err() {
-                                    return;
-                                }
-                            }
+                    while let Ok(Job { mut frame, reset }) = job_rx.recv() {
+                        if reset {
+                            live = base.clone();
+                        }
+                        noisy.row_mut(0).iter_mut().zip(frame.iter()).for_each(|(n, s)| *n = *s);
+                        if let Err(e) = live.process(noisy.view(), clean.view_mut()) {
+                            tracing::warn!("DeepFilterNet failed, using RNNoise: {e:#}");
+                            return;
+                        }
+                        frame.iter_mut().zip(clean.row(0).iter()).for_each(|(s, c)| *s = c.clamp(-1.0, 1.0));
+                        if done_tx.send(frame).is_err() {
+                            return;
                         }
                     }
                 })
                 .ok()?;
-            Some(Self { jobs, done, ready, spare: Some(Box::new([0.0; FRAME])), broken: false })
+            Some(Self { jobs, done, ready, spare: Some(Box::new([0.0; FRAME])), reset: false, broken: false })
+        }
+
+        /// A stand-in worker: hands the first `answers` frames back unchanged, then takes frames
+        /// and never answers (stuck).
+        #[cfg(test)]
+        pub(super) fn fake(answers: usize) -> Self {
+            let (jobs, job_rx) = sync_channel::<Job>(1);
+            let (done_tx, done) = sync_channel(1);
+            std::thread::spawn(move || {
+                let mut n = 0;
+                while let Ok(Job { frame, .. }) = job_rx.recv() {
+                    n += 1;
+                    if n <= answers && done_tx.send(frame).is_err() {
+                        return;
+                    }
+                }
+            });
+            Self {
+                jobs,
+                done,
+                ready: Arc::new(AtomicBool::new(true)),
+                spare: Some(Box::new([0.0; FRAME])),
+                reset: false,
+                broken: false,
+            }
         }
 
         pub(super) fn ready(&self) -> bool {
@@ -132,21 +157,24 @@ mod deep {
         }
 
         pub(super) fn reset(&mut self) {
-            if self.jobs.send(Job::Reset).is_err() {
-                self.broken = true;
-            }
+            self.reset = true;
         }
 
-        /// Cleans `chunk` in place; false (and `chunk` untouched) once the worker is gone.
+        /// Cleans `chunk` in place; false (and `chunk` untouched) once the worker is gone. Waits
+        /// [`PATIENCE`] at most: the hand-over never blocks (the worker has taken every earlier
+        /// frame before answering it, so its queue is empty unless it is gone or stuck).
         pub(super) fn process(&mut self, chunk: &mut [f32; FRAME]) -> bool {
             let Some(mut frame) = self.spare.take() else {
                 self.broken = true;
                 return false;
             };
             frame.copy_from_slice(chunk);
-            if self.jobs.send(Job::Frame(frame)).is_err() {
-                self.broken = true;
-                return false;
+            match self.jobs.try_send(Job { frame, reset: std::mem::take(&mut self.reset) }) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                    self.broken = true;
+                    return false;
+                }
             }
             match self.done.recv_timeout(PATIENCE) {
                 Ok(frame) => {
@@ -249,12 +277,14 @@ impl Denoiser {
             NoiseSuppression::Strong => {
                 #[cfg(feature = "deep-filter")]
                 if let Some(d) = self.deep.as_mut() {
-                    for chunk in frame.as_chunks_mut::<FRAME>().0 {
-                        if !d.process(chunk) {
-                            // Not again for this pipeline: RNNoise from here on, from a fresh state.
+                    let chunks = frame.as_chunks_mut::<FRAME>().0;
+                    for i in 0..chunks.len() {
+                        if !d.process(&mut chunks[i]) {
+                            // Not again for this pipeline: RNNoise from here on, from a fresh state,
+                            // for this chunk (left as captured) and the rest; earlier ones are done.
                             self.deep = None;
                             self.running = NoiseSuppression::Off;
-                            return self.process(frame, NoiseSuppression::Light, false);
+                            return self.process(chunks[i..].as_flattened_mut(), NoiseSuppression::Light, false);
                         }
                     }
                 }
@@ -373,6 +403,32 @@ mod tests {
         let window = start + 20 * FRAME..out.len() - 4 * FRAME;
         let score = |lag: usize| -> f32 { window.clone().map(|i| out[i] * input[i - lag]).sum() };
         (0..4 * FRAME).max_by(|a, b| score(*a).total_cmp(&score(*b))).unwrap() as i64
+    }
+
+    #[cfg(feature = "deep-filter")]
+    #[test]
+    fn a_stuck_worker_costs_one_wait_and_then_rnnoise_takes_over() {
+        let mut d = Denoiser::new();
+        d.deep_started = true;
+        d.deep = Some(deep::Worker::fake(1));
+        let mut seed = 3;
+        let original: Vec<f32> = (0..2 * FRAME).map(|_| noise(&mut seed)).collect();
+        // A TeamSpeak-sized frame: the worker answers its first half, then stops answering.
+        let mut frame = original.clone();
+        let started = std::time::Instant::now();
+        d.process(&mut frame, NoiseSuppression::Strong, true);
+        assert!(started.elapsed() < std::time::Duration::from_millis(200), "waited {:?}", started.elapsed());
+        assert_eq!(frame[..FRAME], original[..FRAME], "the answered half is what the worker gave");
+        // The other half went through a fresh RNNoise, from the audio as captured.
+        let mut fresh = Denoiser::new();
+        let mut expected = original[FRAME..].to_vec();
+        fresh.process(&mut expected, NoiseSuppression::Light, true);
+        assert_eq!(frame[FRAME..], expected[..]);
+        assert!(d.deep.is_none());
+        // From then on, no more waiting.
+        let started = std::time::Instant::now();
+        d.process(&mut [0.0; FRAME], NoiseSuppression::Strong, true);
+        assert!(started.elapsed() < std::time::Duration::from_millis(20));
     }
 
     #[test]

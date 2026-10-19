@@ -524,8 +524,11 @@ pooled p95. The runners impose no fixed performance pass threshold.
 
 ## Noise suppression
 
-The desktop app cleans the microphone before the level meter, the voice gate and
-the encoder (`crates/gwar-client/src/voice/denoise.rs`), on every 10 ms frame:
+The desktop app cleans the microphone before the encoder
+(`crates/gwar-client/src/voice/denoise.rs`), on every 10 ms frame. The level meter
+and the voice gate still measure the microphone as captured: a strong suppressor
+also takes very quiet speech down (speech peaking near -48 dBFS lost most of its
+gated frames to it), and the sensitivity setting should keep meaning what it did.
 
 | Setting | Engine | Added delay | CPU per 10 ms frame |
 | --- | --- | --- | --- |
@@ -540,7 +543,9 @@ steady white noise down by more than 20 dB, at least 10 dB more than light.
 DeepFilterNet's model loads in ~0.3 s on a thread of its own when strong is
 first asked for; RNNoise stands in until then, so joining a channel never waits.
 tract's models cannot leave the thread that built them, so that thread also runs
-every frame for the pipeline, which waits for it (40 ms at most, then RNNoise).
+every frame for the pipeline, which hands it over without blocking and waits for
+it 40 ms at most; past that, RNNoise from a fresh state for the rest of the call
+(the unit tests cover a worker that stops answering mid-frame).
 
 Measured on Apple Silicon (2026-10-20) with a bench outside the repository:
 speech from macOS `say` at 48 kHz mixed with noise at 5 dB SNR, SI-SDR against the
@@ -552,7 +557,7 @@ clean speech after aligning the delay:
 | pink, fan-like | 5.0 dB | 11.1 (+6.1) | 15.7 (+10.7) | 15.3 (+10.3) |
 | keyboard clicks | 5.0 dB | 10.2 (+5.2) | 7.5 (+2.5) | 16.9 (+11.9) |
 
-Clean speech passes all three unchanged in level. The latency harness above
+Clean speech at a normal level passes all three unchanged in level. The latency harness above
 keeps suppression off (the library's default): its markers are steady tones,
 which a suppressor rightly takes for noise.
 
