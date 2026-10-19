@@ -566,3 +566,160 @@ fn the_servers_password_waits_for_the_bridge_like_a_channels() {
     apply(&store, &plan(&s, &Options::default()), "src", BRIDGE).unwrap();
     assert_eq!(store.bridge_server_password().unwrap(), None);
 }
+
+#[test]
+fn a_filled_in_passwords_template_gives_back_exactly_those_passwords() {
+    let mut s = source();
+    s.server.insert("virtualserver_flag_password".into(), "1".into());
+    // A tricky name too: quotes, an equals sign and a slash.
+    s.channels[6].insert("channel_name".into(), "Odd \"=/".into());
+    s.channels[6].insert("channel_flag_password".into(), "1".into());
+    let blank = plan(&s, &Options::default());
+    assert_eq!(blank.password_keys.first().map(String::as_str), Some(super::plan::SERVER_PASSWORD));
+    let template = super::plan::passwords_template(&blank);
+    // Left as written, it gives no password at all.
+    assert!(super::parse_passwords(&template).unwrap().is_empty(), "{template}");
+    // Every line filled in: each password lands where it belongs.
+    let filled: String = template
+        .lines()
+        .map(|line| if line.starts_with('#') { line.to_owned() } else { format!("{line}pw-{}", line.len()) })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let passwords = super::parse_passwords(&filled).unwrap();
+    assert_eq!(passwords.len(), blank.password_keys.len());
+    let options = Options { passwords, ..Default::default() };
+    let kept = plan(&s, &options);
+    assert!(matches!(kept.server_password, Password::Kept(_)));
+    assert!(kept.channels.iter().all(|c| !matches!(c.password, Password::Locked)), "{:?}", kept.notes);
+}
+
+#[test]
+fn a_failed_query_connection_says_what_to_do() {
+    use super::guide::query_hint;
+    use crate::teamspeak::query::QueryError;
+    let query = |id| anyhow::Error::new(QueryError { id, msg: "x".into() }).context("query login");
+    assert!(query_hint(&query(520), "127.0.0.1:10011", 1).unwrap().contains("serveradmin_password="));
+    assert!(query_hint(&query(3331), "127.0.0.1:10011", 1).unwrap().contains("query_ip_allowlist.txt"));
+    assert!(query_hint(&query(3329), "127.0.0.1:10011", 1).unwrap().contains("Lift"));
+    assert!(query_hint(&query(1024), "127.0.0.1:10011", 7).unwrap().contains("virtual server 7"));
+    assert!(query_hint(&query(1), "127.0.0.1:10011", 1).is_none());
+    let refused = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)).context("connect");
+    assert!(query_hint(&refused, "127.0.0.1:10011", 1).unwrap().contains("ssh -N -L"));
+    let voice_port = anyhow::anyhow!("not a TeamSpeak query interface (banner \"x\")");
+    assert!(query_hint(&voice_port, "127.0.0.1:9987", 1).unwrap().contains("query port"));
+}
+
+#[test]
+fn the_next_steps_follow_what_the_dry_run_found() {
+    use super::guide::{DryRun, after_dry_run, after_import};
+    let locked = plan(&source(), &Options::default());
+    let dry = |plan, passwords_given, server_running| {
+        let replace_channels = false;
+        after_dry_run(&DryRun {
+            plan,
+            passwords_given,
+            drop_passwords: false,
+            for_bridge: false,
+            replace_channels,
+            server_running,
+        })
+    };
+    let replacing = after_dry_run(&DryRun {
+        plan: &plan(&source(), &Options::default()),
+        passwords_given: false,
+        drop_passwords: false,
+        for_bridge: false,
+        replace_channels: true,
+        server_running: true,
+    });
+    assert!(replacing.contains("Stop this server"), "{replacing}");
+    let first = dry(&locked, false, false);
+    assert!(first.contains("--passwords-template passwords.txt"), "{first}");
+    assert!(first.contains("imports directly"), "{first}");
+    assert!(dry(&locked, false, true).contains("goes through it"));
+    let open = plan(&source(), &Options { drop_passwords: true, ..Default::default() });
+    let no_passwords = dry(&open, false, false);
+    assert!(!no_passwords.contains("--passwords-template") && !no_passwords.contains("--for-bridge"), "{no_passwords}");
+    let kept = plan(&source(), &Options { passwords: [("Secret".into(), "pw".into())].into(), ..Default::default() });
+    assert!(dry(&kept, true, false).contains("--for-bridge"));
+
+    let done = after_import(&locked, true, Some("/data/gwar.sqlite3.before-import-1"));
+    assert!(done.contains("locked with a random password"), "{done}");
+    assert!(done.contains("stop this server, then put /data/gwar.sqlite3.before-import-1 back"), "{done}");
+    assert!(!after_import(&kept, false, None).contains("To undo"));
+}
+
+#[test]
+fn a_passwords_template_is_a_new_file_its_owner_alone_reads() {
+    let dir = std::env::temp_dir().join(format!("gwar-template-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("passwords.txt");
+    super::write_passwords_template(&path, "@server = \n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+    // One already filled in is never overwritten.
+    assert!(super::write_passwords_template(&path, "other").is_err());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "@server = \n");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_template_keeps_the_passwords_given_whichever_way_and_exactly() {
+    let mut s = source();
+    // Odd names: one ending in a backslash after an equals sign.
+    s.channels[2].insert("channel_name".into(), "Room=\\".into());
+    s.channels[2].insert("channel_flag_password".into(), "1".into());
+    let given: BTreeMap<String, String> =
+        [("Secret".to_owned(), " spaced \"quoted\" ".to_owned()), ("Clan/Room=\\\\".to_owned(), "x\\".to_owned())]
+            .into();
+    let first = plan(&s, &Options { passwords: given.clone(), ..Default::default() });
+    let template = super::plan::passwords_template(&first);
+    let back = super::parse_passwords(&template).unwrap();
+    // Given by name ("Secret"), written by path; the passwords come back byte for byte.
+    let again = plan(&s, &Options { passwords: back, ..Default::default() });
+    let kept = |p: &Plan, name: &str| p.channels.iter().find(|c| c.name == name).unwrap().password.clone();
+    assert_eq!(kept(&again, "Secret"), Password::Kept(" spaced \"quoted\" ".into()), "{template}");
+    assert_eq!(kept(&again, "Room=\\"), Password::Kept("x\\".into()), "{template}");
+}
+
+#[test]
+fn checking_whether_a_server_runs_changes_nothing() {
+    let dir = std::env::temp_dir().join(format!("gwar-in-use-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    assert_eq!(crate::members::data_dir_in_use(&dir), Some(false));
+    assert!(!dir.join("gwar.lock").exists());
+    let held = crate::members::lock_data_dir(&dir).unwrap();
+    assert_eq!(crate::members::data_dir_in_use(&dir), Some(true));
+    drop(held);
+    assert_eq!(crate::members::data_dir_in_use(&dir), Some(false));
+    // A new database is its owner's only.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("new.sqlite3");
+        Store::open(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        // One that exists keeps its mode.
+        let shared = dir.join("shared.sqlite3");
+        drop(Store::open(&shared).unwrap());
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o640)).unwrap();
+        Store::open(&shared).unwrap();
+        assert_eq!(std::fs::metadata(&shared).unwrap().permissions().mode() & 0o777, 0o640);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_unique_name_may_be_written_as_a_path_would_write_it() {
+    let mut s = source();
+    s.channels[2].insert("channel_name".into(), "Room=\\".into());
+    s.channels[2].insert("channel_flag_password".into(), "1".into());
+    // `Room=\` as a passwords file writes it, quoted for the `=`: the name with its backslash.
+    let passwords = super::parse_passwords("\"Room=\\\\\" = pw\n").unwrap();
+    let planned = plan(&s, &Options { passwords, ..Default::default() });
+    let room = planned.channels.iter().find(|c| c.name == "Room=\\").unwrap();
+    assert_eq!(room.password, Password::Kept("pw".into()));
+}

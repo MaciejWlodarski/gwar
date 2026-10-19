@@ -523,6 +523,11 @@ slots. Gwar is not affiliated with TeamSpeak. TeamSpeak support is a cargo
 feature (`teamspeak`, on by default); build without it with
 `--no-default-features`.
 
+**Moving from TeamSpeak.** `gwar-server import-teamspeak` brings an existing
+TeamSpeak 3 server over: channels, roles, members, bans, passwords and
+settings, and people keep their roles. Step by step, in 15 to 60 minutes:
+[docs/teamspeak-move.md](docs/teamspeak-move.md).
+
 ## Project layout
 
 | Path | What it is |

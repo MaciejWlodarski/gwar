@@ -174,6 +174,10 @@ enum Command {
         /// Import the server and its password channels without a password.
         #[arg(long)]
         drop_passwords: bool,
+        /// Write every password TeamSpeak has into this new file, to fill in for --passwords (with
+        /// what --passwords already gives), then stop: nothing is imported.
+        #[arg(long, conflicts_with = "drop_passwords")]
+        passwords_template: Option<PathBuf>,
         /// Remove this server's own top-level channels first (the seeded Lobby, General, AFK).
         #[arg(long)]
         replace_channels: bool,
@@ -397,6 +401,7 @@ async fn main() -> Result<()> {
             spacers,
             passwords,
             drop_passwords,
+            passwords_template,
             replace_channels,
             force,
             for_bridge,
@@ -415,6 +420,7 @@ async fn main() -> Result<()> {
                 drop_passwords,
                 passwords: passwords.as_deref().map(ts_import::read_passwords).transpose()?.unwrap_or_default(),
             };
+            let passwords_given = passwords.is_some();
             let addr = tokio::net::lookup_host(&from)
                 .await
                 .with_context(|| format!("resolve {from}"))?
@@ -423,18 +429,35 @@ async fn main() -> Result<()> {
             if !addr.ip().is_loopback() && !insecure_query {
                 anyhow::bail!(
                     "{from} is not this machine: raw ServerQuery sends the password unencrypted. Use an SSH tunnel \
-                     (ssh -L 10011:localhost:10011 that-host, then --from 127.0.0.1:10011) or pass --insecure-query"
+                     (ssh -N -L 20011:127.0.0.1:10011 that-host, then --from 127.0.0.1:20011) or pass --insecure-query"
                 );
             }
-            let (query, _notes) =
-                gwar_server::teamspeak::query::Query::connect(addr, &user, &query_password, sid).await?;
-            let source = ts_import::source::read(&query).await?;
+            let source = async {
+                let (query, _notes) =
+                    gwar_server::teamspeak::query::Query::connect(addr, &user, &query_password, sid).await?;
+                ts_import::source::read(&query).await
+            }
+            .await
+            .map_err(|e| match ts_import::guide::query_hint(&e, &from, sid) {
+                Some(hint) => e.context(hint),
+                None => e,
+            })?;
             let source_id = source
                 .server
                 .get("virtualserver_unique_identifier")
                 .cloned()
                 .unwrap_or_else(|| format!("{from}/{sid}"));
             let plan = ts_import::plan::plan(&source, &options)?;
+            if let Some(path) = passwords_template {
+                ts_import::write_passwords_template(&path, &ts_import::plan::passwords_template(&plan))?;
+                println!(
+                    "Wrote {} ({} passwords). Type each after its \"=\", then run the import with --passwords {}.",
+                    path.display(),
+                    plan.password_keys.len(),
+                    path.display()
+                );
+                return Ok(());
+            }
             print!("{}", ts_import::plan::report(&plan));
             let apply_options = ts_import::apply::ApplyOptions { replace_channels, force, for_bridge };
             let summary = |applied: &ts_import::apply::Applied| {
@@ -466,6 +489,20 @@ async fn main() -> Result<()> {
                     false,
                 )?;
                 println!("\nDry run, on a copy of the database: {}\nNothing changed.", summary(&applied));
+                // Unknown: whether its control socket is there.
+                let server_running = gwar_server::members::data_dir_in_use(&cli.data_dir)
+                    .unwrap_or_else(|| gwar_server::control::available(&cli.data_dir));
+                print!(
+                    "{}",
+                    ts_import::guide::after_dry_run(&ts_import::guide::DryRun {
+                        plan: &plan,
+                        passwords_given,
+                        drop_passwords,
+                        for_bridge,
+                        replace_channels,
+                        server_running,
+                    })
+                );
                 return Ok(());
             }
             let _lock = match gwar_server::members::lock_data_dir(&cli.data_dir) {
@@ -484,9 +521,11 @@ async fn main() -> Result<()> {
                     let backup =
                         cli.data_dir.join(format!("gwar.sqlite3.before-import-{}", gwar_server::core::now_ms()));
                     ts_import::copy_database(&database, &backup)?;
+                    let advice = ts_import::guide::after_import(&plan, true, Some(&backup.display().to_string()));
                     let applied = gwar_server::control::import(&cli.data_dir, plan, source_id, apply_options).await?;
                     println!("\nApplied to the running server: {}", summary(&applied));
                     println!("The database as it was: {}", backup.display());
+                    print!("{advice}");
                     return Ok(());
                 }
                 Err(e) => return Err(e),
@@ -500,9 +539,11 @@ async fn main() -> Result<()> {
             }
             let applied = ts_import::import(&database, &plan, &source_id, apply_options, true)?;
             println!("\nImported: {}", summary(&applied));
-            if let Some(backup) = backup {
+            if let Some(backup) = &backup {
                 println!("The database before the import: {}", backup.display());
             }
+            let backup = backup.map(|b| b.display().to_string());
+            print!("{}", ts_import::guide::after_import(&plan, false, backup.as_deref()));
             return Ok(());
         }
         None => {}

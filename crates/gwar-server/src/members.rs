@@ -45,6 +45,22 @@ pub fn lock_data_dir(data_dir: &Path) -> Result<File> {
     }
 }
 
+/// Whether a server (or a maintenance command) holds `data_dir` now. Changes nothing: no lock file
+/// is made, and a shared lock (which a read-only file takes everywhere) only tests the exclusive
+/// one. `None` when it cannot tell.
+pub fn data_dir_in_use(data_dir: &Path) -> Option<bool> {
+    let file = match File::open(data_dir.join("gwar.lock")) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(false),
+        Err(_) => return None,
+    };
+    match file.try_lock_shared() {
+        Ok(()) => Some(false),
+        Err(TryLockError::WouldBlock) => Some(true),
+        Err(TryLockError::Error(_)) => None,
+    }
+}
+
 pub struct PruneOptions {
     pub inactive_days: u32,
     /// Also remove members who hold a role besides the default one.

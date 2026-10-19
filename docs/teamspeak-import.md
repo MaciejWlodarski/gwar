@@ -1,7 +1,7 @@
 # Moving a TeamSpeak server to Gwar
 
 Status: built (`gwar-server import-teamspeak`), onto roles version 2 ([roles.md](roles.md)).
-Later: a wizard in the desktop app, TeamSpeak 6.
+Later: TeamSpeak 6. The step-by-step move: [teamspeak-move.md](teamspeak-move.md).
 
 A community with a TeamSpeak 3 server can move to a Gwar server without
 rebuilding it by hand: `gwar-server import-teamspeak` reads the TeamSpeak server
@@ -215,10 +215,10 @@ So the importer asks:
 ## Running it
 
 ```sh
-ssh -L 10011:localhost:10011 ts.example.com   # raw ServerQuery is unencrypted
-GWAR_TS_QUERY_PASSWORD=… gwar-server import-teamspeak --from 127.0.0.1:10011 [--user serveradmin] \
+ssh -N -L 20011:127.0.0.1:10011 ts.example.com   # raw ServerQuery is unencrypted
+GWAR_TS_QUERY_PASSWORD=… gwar-server import-teamspeak --from 127.0.0.1:20011 [--user serveradmin] \
   [--sid 1] [--dry-run] [--all-clients] [--spacers] [--replace-channels [--force]] \
-  [--passwords passwords.txt | --drop-passwords] [--for-bridge]
+  [--passwords passwords.txt | --drop-passwords] [--passwords-template new.txt] [--for-bridge]
 ```
 
 - The ServerQuery password comes from `GWAR_TS_QUERY_PASSWORD` or, with
@@ -255,7 +255,14 @@ GWAR_TS_QUERY_PASSWORD=… gwar-server import-teamspeak --from 127.0.0.1:10011 [
   written `\/`, `\\`), a name no other imported channel has, or `@server`
   for the server's. A name several channels share, or one that matches no
   password channel, stops the import: a password never lands where it was not
-  meant.
+  meant. `--passwords-template new.txt` writes every password the TeamSpeak
+  server has into a new file (mode 0600), as path lines to fill in, with what
+  `--passwords` already gives, and imports nothing.
+- Besides the report, the command prints **Next steps** after a dry run and
+  after an import (passwords still to give, `--for-bridge`, how the import
+  will run, how to undo it), and a hint for the common ServerQuery failures
+  (wrong login, flood ban, wrong `--sid`, nothing listening, not the query
+  port).
 - Running it again later updates what it imported before instead of adding
   copies (`ts_imports`, by the source server's unique id), but only what nobody
   changed in Gwar since: each record keeps what the import last wrote. A
@@ -280,10 +287,10 @@ GWAR_TS_QUERY_PASSWORD=… gwar-server import-teamspeak --from 127.0.0.1:10011 [
 ## Scope
 
 Built: the CLI above, TeamSpeak 3 servers (3.13) over the raw ServerQuery
-port, which `gwar-server` already speaks for the bridge. Later:
+port, which `gwar-server` already speaks for the bridge. Moving a server is a
+job for its admin on the command line, once ([teamspeak-move.md](teamspeak-move.md));
+the apps have no import. Later:
 
-- a wizard in the desktop app's server settings (the app can open TCP; the web
-  app cannot);
 - ServerQuery over SSH and TeamSpeak 6 servers (no raw ServerQuery port, and a
   different uid hash, so `ts:<uid>` would not match);
 - channel descriptions, icons.
@@ -295,9 +302,14 @@ port, which `gwar-server` already speaks for the bridge. Later:
   they are matched, members, bans, notes), applying twice without change, a
   second import after edits in Gwar, roles following TeamSpeak,
   `--replace-channels` and `--force`, the password queue, the all-or-nothing
-  copy and the dry run.
+  copy and the dry run, the import through a running server's control socket,
+  the passwords template (filled in, it gives back exactly those passwords; a
+  new file only, owner-only), and the hints and next steps.
 - Core (`core::import_password_tests`): a queued password is sent on attach and
   kept until the bridge confirms it; without TeamSpeak none is kept.
 - Integration (`tests/teamspeak_import.rs`, CI with the official server): the
   TeamSpeak server Gwar runs, given a group, powers and a password through
-  ServerQuery, is read, planned and imported into a fresh database.
+  ServerQuery, is read, planned and imported into a fresh database; then the
+  same plan goes live into that running server through `admin.sock`: it
+  closes every connection, a new one sees the imported channels, and the
+  bridge sets the kept password on the new TeamSpeak channel.
