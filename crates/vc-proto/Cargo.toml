@@ -1,6 +1,6 @@
 [package]
 name = "vc-proto"
-version = "0.1.0"
+version = "0.1.1"
 description = "Wire protocol (vc/4) shared by the server and all clients"
 edition.workspace = true
 license.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "vc-server"
-version = "0.1.0"
+version = "0.1.1"
 description = "Self-hosted voice server core: WebSocket gateway, WebRTC SFU and TeamSpeak compatibility"
 edition.workspace = true
 license.workspace = true

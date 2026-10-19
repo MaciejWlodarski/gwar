@@ -1,6 +1,6 @@
 [package]
 name = "gwar-connect"
-version = "0.1.0"
+version = "0.1.1"
 description = "Gwar Connect: optional accounts that keep one identity across devices (see docs/connect.md)"
 edition.workspace = true
 license.workspace = true
