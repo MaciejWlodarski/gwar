@@ -565,6 +565,9 @@ fn the_servers_password_waits_for_the_bridge_like_a_channels() {
     // Imported again without it (locked with a random one): the queued one is no longer the password.
     apply(&store, &plan(&s, &Options::default()), "src", BRIDGE).unwrap();
     assert_eq!(store.bridge_server_password().unwrap(), None);
+}
+
+#[test]
 fn a_filled_in_passwords_template_gives_back_exactly_those_passwords() {
     let mut s = source();
     s.server.insert("virtualserver_flag_password".into(), "1".into());
