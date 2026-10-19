@@ -120,14 +120,17 @@ impl std::ops::Deref for Tx<'_> {
 }
 
 impl Tx<'_> {
+    /// Keeps the work; if that fails, dropping the guard still rolls it back.
     pub fn commit(mut self) -> rusqlite::Result<()> {
+        self.db.execute_batch(if self.nested { "RELEASE gwar_nested" } else { "COMMIT" })?;
         self.done = true;
-        self.db.execute_batch(if self.nested { "RELEASE gwar_nested" } else { "COMMIT" })
+        Ok(())
     }
 
     pub fn rollback(mut self) -> rusqlite::Result<()> {
+        self.undo()?;
         self.done = true;
-        self.undo()
+        Ok(())
     }
 
     fn undo(&self) -> rusqlite::Result<()> {

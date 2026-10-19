@@ -34,25 +34,27 @@ impl Core {
         }
         // Without a bridge nothing would ever take a typed password from the queue: none is kept.
         options.for_bridge &= self.info.teamspeak;
-        let applied = self
+        // What the core keeps is read inside the same transaction: a failure there undoes the import too.
+        let (applied, reloaded) = self
             .store
-            .atomically(|store| apply::apply(store, plan, source, options))
+            .atomically(|store| Ok((apply::apply(store, plan, source, options)?, Reloaded::read(store)?)))
             .map_err(|e| format!("nothing was changed: {e:#}"))?;
-        if let Err(e) = self.reload_after_import() {
-            tracing::error!("the import is in the database, but reloading it failed: {e:#}");
-            return Err(format!(
-                "the import is in the database, but the server could not reload it ({e:#}): restart it"
-            ));
+        self.install(reloaded);
+        // The bridge goes first, so nothing that follows reaches it (it would kick TeamSpeak users, who
+        // stay on their server and come back through the new bridge the supervisor attaches).
+        if self.bridge.take().is_some() {
+            info!("TeamSpeak bridge restarts to take the import");
         }
-        // Everyone connects again and sees the server as it is now; nobody keeps an earlier unlock.
+        // Each Gwar app is told before anything else is queued for it, and then nothing more is sent to
+        // anyone while everyone leaves: they reconnect and see the server as it is now.
+        for s in self.sessions.values_mut() {
+            if let Some(out) = s.out.take() {
+                let _ = out.try_send(Outbound::Close(LeaveReason::ServerShutdown));
+            }
+        }
         let ids: Vec<SessionId> = self.sessions.keys().copied().collect();
         for id in ids {
             self.remove(id, LeaveReason::ServerShutdown);
-        }
-        // The TeamSpeak supervisor attaches a new bridge, which syncs channels and queued passwords
-        // from scratch; TeamSpeak users stay on their server and come back through it.
-        if self.bridge.take().is_some() {
-            info!("TeamSpeak bridge restarts to take the import");
         }
         info!(
             roles = applied.roles_created + applied.roles_updated,
@@ -64,29 +66,47 @@ impl Core {
         Ok(applied)
     }
 
-    /// Makes the core's copies of roles, channels, the server's settings and password match the
-    /// database again (nobody is connected to be told: everyone reconnects).
-    fn reload_after_import(&mut self) -> anyhow::Result<()> {
-        self.groups = self.store.groups()?.into_iter().map(|g| (g.id, g)).collect();
-        self.channels = self.store.channels()?.into_iter().map(|c| (c.id, c)).collect();
-        let name = self.store.meta("name")?;
-        let welcome = self.store.meta("welcome")?;
-        let max_clients = self.store.meta("max_clients")?.and_then(|v| v.parse().ok());
-        let default_channel = self
-            .store
-            .meta("default_channel")?
-            .and_then(|v| v.parse::<ChannelId>().ok())
-            .filter(|id| self.channels.get(id).is_some_and(|c| !c.encrypted && !c.private));
+    /// Takes over what the database has now (nobody is connected to be told: everyone reconnects).
+    fn install(&mut self, r: Reloaded) {
+        self.groups = r.groups;
+        self.channels = r.channels;
         let info = &mut self.info;
-        info.name = name.unwrap_or_else(|| info.name.clone());
-        info.welcome = welcome.unwrap_or_else(|| info.welcome.clone());
-        info.max_clients = max_clients.unwrap_or(info.max_clients);
-        info.default_channel = default_channel.unwrap_or(info.default_channel);
+        info.name = r.name.unwrap_or_else(|| info.name.clone());
+        info.welcome = r.welcome.unwrap_or_else(|| info.welcome.clone());
+        info.max_clients = r.max_clients.unwrap_or(info.max_clients);
+        info.default_channel = r
+            .default_channel
+            .filter(|id| self.channels.get(id).is_some_and(|c| !c.encrypted && !c.private))
+            .unwrap_or(info.default_channel);
         // A password the import set (or cleared) is the server's now; one never stored stays as started.
-        if let Some(stored) = self.store.meta("password_hash")? {
+        if let Some(stored) = r.password_hash {
             self.password.store(Arc::new(Some(stored).filter(|h| !h.is_empty()).map(Into::into)));
         }
-        Ok(())
+    }
+}
+
+/// What the core keeps of the database, read after an import.
+struct Reloaded {
+    groups: BTreeMap<GroupId, Group>,
+    channels: BTreeMap<ChannelId, ChannelRow>,
+    name: Option<String>,
+    welcome: Option<String>,
+    max_clients: Option<u32>,
+    default_channel: Option<ChannelId>,
+    password_hash: Option<String>,
+}
+
+impl Reloaded {
+    fn read(store: &Store) -> anyhow::Result<Self> {
+        Ok(Self {
+            groups: store.groups()?.into_iter().map(|g| (g.id, g)).collect(),
+            channels: store.channels()?.into_iter().map(|c| (c.id, c)).collect(),
+            name: store.meta("name")?,
+            welcome: store.meta("welcome")?,
+            max_clients: store.meta("max_clients")?.and_then(|v| v.parse().ok()),
+            default_channel: store.meta("default_channel")?.and_then(|v| v.parse().ok()),
+            password_hash: store.meta("password_hash")?,
+        })
     }
 }
 
@@ -158,6 +178,7 @@ mod tests {
         let lobby = core.info().await.unwrap().default_channel;
         remote(&core, "ts:ModUid=", lobby).await;
 
+        while bridge.try_recv().is_ok() {}
         let (planned, password) = with_server_password();
         let applied = core.import_live(planned, "src".into(), BRIDGE).await.unwrap();
         assert_eq!((applied.roles_created, applied.channels_created, applied.members_created), (2, 5, 3));
@@ -169,10 +190,18 @@ mod tests {
             }
         }
         assert_eq!(closed, Some(LeaveReason::ServerShutdown));
-        let closed =
-            tokio::time::timeout(std::time::Duration::from_secs(2), async { while bridge.recv().await.is_some() {} })
-                .await;
-        assert!(closed.is_ok(), "the bridge was not let go");
+        // The bridge is let go before anyone leaves: it hears no departure (it would kick them on
+        // TeamSpeak), and its TeamSpeak users come back through the next one.
+        let notes = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut notes = Vec::new();
+            while let Some(note) = bridge.recv().await {
+                notes.push(note);
+            }
+            notes
+        })
+        .await
+        .expect("the bridge was not let go");
+        assert!(!notes.iter().any(|n| matches!(n, BridgeNote::Event(e) if matches!(**e, Event::ClientLeft { .. }))));
         // What the core keeps is what the database has now, the server password included.
         let (sessions, roles, channels, hash) = on_core(&core, |core| {
             (
