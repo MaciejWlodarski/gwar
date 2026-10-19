@@ -822,10 +822,13 @@ async fn queued_listener_reconnect(query: &Query, port: u16, password: &str, cid
 /// A TeamSpeak client of the bridged server, ready once it has the server's state.
 async fn teamspeak_user(voice: std::net::SocketAddr, name: &str) -> (tsclientlib::Connection, u16, u64) {
     let mut con = tsclientlib::Connection::build(voice.to_string()).name(name.to_string()).connect().unwrap();
+    // Until the server's state includes this client itself.
     within("TeamSpeak client", async {
-        let mut stream = con.events();
-        while let Some(item) = stream.next().await {
-            if matches!(item.unwrap(), StreamItem::BookEvents(_)) {
+        loop {
+            con.events().next().await.expect("TeamSpeak events").unwrap();
+            if let Ok(state) = con.get_state()
+                && state.clients.contains_key(&state.own_client)
+            {
                 break;
             }
         }
