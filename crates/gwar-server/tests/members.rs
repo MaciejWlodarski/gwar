@@ -122,28 +122,6 @@ async fn only_admins_and_holders_of_the_permission_may_remove_members() {
 }
 
 #[tokio::test]
-async fn roles_from_before_version_2_are_upgraded() {
-    let seeded = Seeded::new();
-    // As an older server left them: Admin with the old full list, a role with old names.
-    let db = rusqlite::Connection::open(seeded.database()).unwrap();
-    db.execute("UPDATE groups SET permissions='[\"server_manage\",\"client_kick\"]' WHERE id=1", []).unwrap();
-    db.execute(
-        "INSERT INTO groups(id,name,permissions,position) VALUES(7,'Mods','[\"client_kick\",\"member_remove\",\"member_nickname\",\"gone\"]',7)",
-        [],
-    )
-    .unwrap();
-    drop(db);
-    let server = seeded.start().await;
-    let root = admin(&server, "root").await;
-    assert!(admin_group_is_administrator(&root));
-    let mods = root.welcome.groups.iter().find(|g| g.id == 7).unwrap();
-    assert_eq!(mods.permissions, [Permission::ManageMembers, Permission::KickMembers]);
-    let mut order: Vec<_> = root.welcome.groups.iter().map(|g| (g.id, g.position)).collect();
-    order.sort_by_key(|(_, position)| *position);
-    assert_eq!(order, [(1, 0), (7, 1), (2, 2)], "Admin first, Member last");
-}
-
-#[tokio::test]
 async fn nobody_removes_themselves_or_anyone_above_them() {
     let server = TestServer::start().await;
     let mut root = admin(&server, "root").await;

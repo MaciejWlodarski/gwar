@@ -34,7 +34,7 @@ async fn fake_server(mode: &str) -> (String, String, tokio::task::JoinHandle<Vec
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
             json!({"ev":"challenge","d":{
                 "protocol":4,"server_pk":server_pk,"server_nonce":B64.encode([4;32]),"password_required":true,
-                "server":{"name":"test","welcome":"","version":"0","default_channel":1,"max_clients":8,"upload_limit":0,"server_chat":{"encrypted":false,"history":false}}
+                "server":{"name":"test","welcome":"","version":"0","default_channel":1,"max_clients":8,"upload_limit":0,"file_access":"link","teamspeak":false,"server_chat":{"encrypted":false,"history":false}}
             }})
             .to_string()
             .into(),

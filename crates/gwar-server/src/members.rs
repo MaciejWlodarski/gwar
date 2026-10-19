@@ -26,8 +26,7 @@ const DAY_MS: i64 = 24 * 3600 * 1000;
 ///
 /// The server and the destructive maintenance commands both need it, so they
 /// can never run at the same time. Dropping the returned file releases it, and
-/// so does the process ending. Servers started before this existed do not hold
-/// it: stop those by hand before pruning.
+/// so does the process ending.
 pub fn lock_data_dir(data_dir: &Path) -> Result<File> {
     let path = data_dir.join("gwar.lock");
     let file = OpenOptions::new()

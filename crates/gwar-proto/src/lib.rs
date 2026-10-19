@@ -668,17 +668,14 @@ wire! {
         pub channels: Vec<Channel>,
         pub clients: Vec<Client>,
         /// Known users of this server (online ones are also in `clients`).
-        #[serde(default)]
         pub members: Vec<Member>,
         /// Read state of every channel this user can read.
-        #[serde(default)]
         pub unread: Vec<Unread>,
         /// Direct messages with unread sealed messages, including offline peers, and
         /// every readable encrypted channel and server chat with its read mark.
         pub conversations: Vec<ConversationUnread>,
         pub ice_servers: Vec<IceServer>,
         /// Sent as `Authorization: Bearer <token>` with file downloads; valid while this session lasts.
-        #[serde(default)]
         pub file_access: String,
         /// The server's owner, once it has one (docs/e2e-build.md, section 6, 6b).
         #[serde(default)]
@@ -757,7 +754,6 @@ wire! {
         /// Messages after `last_read`, capped at [`UNREAD_CAP`].
         pub count: u32,
         /// Of those, messages mentioning this user.
-        #[serde(default)]
         pub mentions: u32,
     }
 
@@ -768,13 +764,10 @@ wire! {
         pub default_channel: ChannelId,
         pub max_clients: u32,
         /// Largest accepted upload in bytes (0: uploads disabled).
-        #[serde(default)]
         #[cfg_attr(feature = "ts", ts(type = "number"))]
         pub upload_limit: u64,
-        #[serde(default)]
         pub file_access: FileAccess,
         /// TeamSpeak compatibility is on (new channels default to plaintext).
-        #[serde(default)]
         pub teamspeak: bool,
         pub server_chat: ServerChat,
     }
@@ -807,13 +800,10 @@ wire! {
         pub has_password: bool,
         pub max_clients: Option<u32>,
         /// End-to-end encrypted, fixed at creation (docs/e2e-build.md, section 4).
-        #[serde(default)]
         pub encrypted: bool,
         /// New members see earlier messages; for display only, clients trust the group's descriptor.
-        #[serde(default)]
         pub history: bool,
         /// Hidden from everyone it does not admit; fixed at creation.
-        #[serde(default)]
         pub private: bool,
         /// A private channel's access, sent only to sessions it admits.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -822,7 +812,6 @@ wire! {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub overrides: Vec<ChannelOverride>,
         /// A subchannel that uses its parent's overrides.
-        #[serde(default)]
         pub synced: bool,
     }
 
@@ -1078,24 +1067,6 @@ impl Permission {
 
     pub fn is_channel(self) -> bool {
         Self::CHANNEL.contains(&self)
-    }
-
-    /// The permission a name from before roles version 2 became (docs/roles.md), for stored roles.
-    pub fn from_v1(name: &str) -> Option<Permission> {
-        Some(match name {
-            "server_manage" => Permission::ManageServer,
-            "channel_create" | "channel_edit" | "channel_delete" => Permission::ManageChannels,
-            "channel_join_locked" => Permission::BypassPassword,
-            "client_move" => Permission::MoveMembers,
-            "client_kick" => Permission::KickMembers,
-            "token_create" | "invite_create" => Permission::CreateInvites,
-            "client_ban" => Permission::BanMembers,
-            "group_manage" => Permission::ManageRoles,
-            "message_manage" => Permission::ManageMessages,
-            "file_upload" => Permission::AttachFiles,
-            "member_remove" | "member_nickname" => Permission::ManageMembers,
-            _ => return None,
-        })
     }
 }
 
@@ -1956,17 +1927,6 @@ mod tests {
         assert!(Permission::ALL.contains(&Permission::ManageMembers));
         assert!(!Permission::MEMBER_DEFAULT.contains(&Permission::ManageMembers));
         assert!(!Permission::MEMBER_DEFAULT.contains(&Permission::Administrator));
-    }
-
-    #[test]
-    fn permission_names_from_version_1_map_onto_version_2() {
-        assert_eq!(Permission::from_v1("channel_edit"), Some(Permission::ManageChannels));
-        assert_eq!(Permission::from_v1("token_create"), Some(Permission::CreateInvites));
-        assert_eq!(Permission::from_v1("member_nickname"), Some(Permission::ManageMembers));
-        assert_eq!(Permission::from_v1("nonsense"), None);
-        let names: Vec<String> =
-            Permission::ALL.iter().map(|p| serde_json::to_value(p).unwrap().as_str().unwrap().into()).collect();
-        assert!(names.iter().all(|n| Permission::from_v1(n).is_none()), "new names never mean an old one");
     }
 
     #[test]

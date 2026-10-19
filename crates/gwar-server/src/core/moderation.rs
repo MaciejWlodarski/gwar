@@ -443,12 +443,7 @@ impl Core {
     ) -> anyhow::Result<Option<Option<GroupId>>> {
         let now = now_ms();
         let Some((group, creator)) = self.store.peek_invite(code, now)? else { return Ok(None) };
-        // An invite from before ownership was recorded has nobody to vouch for it.
-        let vouched = match &creator {
-            Some(creator) => self.could_grant(creator, Permission::CreateInvites, group)?,
-            None => false,
-        };
-        if !vouched {
+        if !self.could_grant(&creator, Permission::CreateInvites, group)? {
             return Ok(None);
         }
         let useful = match known {
