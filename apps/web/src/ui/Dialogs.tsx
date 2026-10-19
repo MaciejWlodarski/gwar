@@ -156,7 +156,7 @@ function AddServerDialog({ editId }: { editId?: string }) {
       // A server saved before keeps its bookmark (and password): connect with what was stored.
       const stored = useSettings.getState().bookmarks.find((b) => b.id === bookmark.id) ?? useSettings.getState().bookmarks.find((b) => sameServer(b, bookmark)) ?? bookmark;
       void controller.connectInteractive(
-        { kind: stored.kind ?? kind, address: stored.address, password: stored.password, identity: stored.identity, insecureLan: stored.insecureLan },
+        { kind: stored.kind, address: stored.address, password: stored.password, identity: stored.identity, insecureLan: stored.insecureLan },
         { remember: false },
       );
     }

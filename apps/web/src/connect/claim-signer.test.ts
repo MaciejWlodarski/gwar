@@ -39,8 +39,8 @@ describe("claiming in the browser", () => {
     expect(p256.verify(der, new TextEncoder().encode(STATEMENT), point, { format: "der" })).toBe(true);
   });
 
-  it("has none without the vault key, and never signs for an identity whose key is another's", async () => {
-    state.record = {};
+  it("has none signed out, and never signs for an identity whose key is another's", async () => {
+    state.record = undefined;
     expect(await claimSigner().identities()).toEqual([]);
     state.record = { vaultKey: "key", accountKey: ACCOUNT_KEY };
     state.identities = [{ uid: "someone-else=", name: "Wrong", identity: IDENTITY }];

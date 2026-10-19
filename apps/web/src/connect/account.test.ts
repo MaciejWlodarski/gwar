@@ -13,7 +13,6 @@ import {
   revokeDevice,
   signIn,
   signOut,
-  unlockVault,
 } from "./account";
 import { ConnectApi, ConnectApiError } from "./api";
 import { certifyDevice, generateKeyPair, keyFromSeed } from "./crypto";
@@ -150,22 +149,11 @@ describe("vault key", () => {
     expect((await signIn({ handle: "ivan", password: "other password" }, deps("C"))).vaultKey).toBe(key);
   }, 90_000);
 
-  it("is recomputed by recovery and added to a record from before vaults", async () => {
-    const { deps, stored } = setup();
+  it("is recomputed by recovery", async () => {
+    const { deps } = setup();
     const created = await createAccount({ handle: "judy", password: "right password" }, deps());
     const recovered = await recover({ handle: "judy", code: created.recoveryCode, newPassword: "fresh password" }, deps("Phone"));
     expect(recovered.vaultKey).toBe(created.record.vaultKey);
-
-    const old = { ...created.record, vaultKey: undefined };
-    await deps().store.save(old);
-    await expect(unlockVault(old, "wrong", deps())).rejects.toMatchObject({ kind: "unauthorized" });
-    expect(stored()?.vaultKey).toBeUndefined();
-    const unlocked = await unlockVault(old, "fresh password", deps());
-    expect(unlocked.vaultKey).toBe(created.record.vaultKey);
-    // The password also renewed the certificates; the device key is the same.
-    expect(unlocked.certificate.device_key).toBe(old.certificate.device_key);
-    expect(unlocked.certificate.expires_at).toBeGreaterThan(old.certificate.expires_at);
-    expect(stored()?.vaultKey).toBe(created.record.vaultKey);
   }, 90_000);
 });
 
@@ -178,8 +166,7 @@ describe("renewing only the local device", () => {
     const attacker = await generateKeyPair();
     service.devices.push({ handle: "kate", device_key: attacker.publicKey, name: "attacker", revoked_at: null, certificate: null });
     const other = await signIn({ handle: "kate", password: "right password" }, deps("B"));
-    let own = await unlockVault(created.record, "right password", deps("A"));
-    own = await renewCertificate(own, "right password", deps("A"));
+    let own = await renewCertificate(created.record, "right password", deps("A"));
     own = await revokeDevice(own, other.certificate.device_key, "right password", deps("A"));
     await changePassword(own, { password: "right password", newPassword: "other password" }, deps("A"));
     await recover({ handle: "kate", code: created.recoveryCode, newPassword: "fresh password" }, deps("C"));
@@ -350,12 +337,12 @@ describe("device names", () => {
 });
 
 describe("device-bound session paths", () => {
-  it("password change, revocation and vault unlock keep tokens bound to this device and revocation ends them", async () => {
+  it("password change, revocation and renewal keep tokens bound to this device and revocation ends them", async () => {
     const { service, deps } = setup();
     const created = await createAccount({ handle: "bound", password: "first password" }, deps("A"));
     const a = created.record;
     const other = await signIn({ handle: "bound", password: "first password" }, deps("B"));
-    const unlocked = await unlockVault(a, "first password", deps("A"));
+    const unlocked = await renewCertificate(a, "first password", deps("A"));
     const revoked = await revokeDevice(unlocked, other.certificate.device_key, "first password", deps("A"));
     const changed = await changePassword(revoked, { password: "first password", newPassword: "second password" }, deps("A"));
     for (const record of [a, unlocked, revoked, changed]) {

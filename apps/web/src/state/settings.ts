@@ -1,4 +1,3 @@
-import { validNickname } from "../net/nickname";
 import { serverKey } from "../lib/server-key";
 import { useMemo } from "react";
 import { create } from "zustand";
@@ -17,19 +16,21 @@ export interface Bookmark {
   name: string;
   /** What the user typed; parsed with `parseServerAddress` at connect time. */
   address: string;
-  /** Missing in bookmarks saved before TeamSpeak support: those are `gwar`. */
-  kind?: ServerKind;
+  kind: ServerKind;
   /** Explicit per-server desktop LAN plaintext opt-in. */
   insecureLan?: boolean;
   /** Stored in plain text in localStorage (needed to reconnect). */
   password?: string;
   /** TeamSpeak only: the uid of the identity to connect with. Missing, or no longer in the list: the default one. */
   identity?: string;
-  /** Unix ms of the last change to what Gwar Connect syncs (all but `insecureLan`); missing before syncing existed. */
-  updatedAt?: number;
+  /** Unix ms of the last change to what Gwar Connect syncs (all but `insecureLan`). */
+  updatedAt: number;
   /** The Gwar Connect account (its account key) whose vault this bookmark syncs with. Missing: saved without an account, and the next account to sync takes it. */
   account?: string;
 }
+
+/** A bookmark to save: its change time comes from saving. */
+export type BookmarkInput = Omit<Bookmark, "updatedAt"> & { updatedAt?: number };
 
 /** How long a removed bookmark is remembered, so syncing does not bring it back from another device. */
 export const BOOKMARK_TOMBSTONE_MS = 90 * 86_400_000;
@@ -68,8 +69,8 @@ export function useBookmarks(): Bookmark[] {
 }
 
 /** Whether two bookmarks differ in what Gwar Connect syncs. */
-function syncedChange(a: Bookmark, b: Bookmark): boolean {
-  return a.name !== b.name || a.address !== b.address || (a.kind ?? "gwar") !== (b.kind ?? "gwar") || (a.password ?? "") !== (b.password ?? "") || (a.identity ?? "") !== (b.identity ?? "");
+function syncedChange(a: BookmarkInput, b: BookmarkInput): boolean {
+  return a.name !== b.name || a.address !== b.address || a.kind !== b.kind || (a.password ?? "") !== (b.password ?? "") || (a.identity ?? "") !== (b.identity ?? "");
 }
 
 /** A change's time: now, but always after the last one, so a device whose clock is behind still wins with a newer edit. */
@@ -109,7 +110,7 @@ export function dedupeBookmarks(
     if (group.length < 2) continue;
     // One time for the whole group, after every version in it: the kept bookmark and the removals
     // carry it, so whichever device decided last wins every id and exactly one bookmark survives.
-    const at = Math.max(Date.now(), ...group.map((b) => (b.updatedAt ?? 0) + 1));
+    const at = Math.max(Date.now(), ...group.map((b) => b.updatedAt + 1));
     let kept: Bookmark = { ...group[0]!, updatedAt: at };
     for (const b of group.slice(1)) {
       if (!kept.password && b.password) kept = { ...kept, password: b.password };
@@ -178,8 +179,6 @@ export interface SettingsState {
   bookmarkAccount: string | null;
   /** Counts changes made on this device (not those that came from syncing), so a sync can follow them. */
   bookmarkEdits: number;
-  /** Migration source for identities saved before nicknames belonged to them. */
-  lastNickname: string;
   lastAddress: string;
   lastKind: ServerKind;
   /** This device was already offered the identities of the official TeamSpeak client (asked only once). */
@@ -199,7 +198,7 @@ export interface SettingsState {
   setDesktop(patch: Partial<DesktopSettings>): void;
   setNotifications(patch: Partial<NotificationSettings>): void;
   setUserVolume(uid: string, volume: number): void;
-  saveBookmark(bookmark: Bookmark): void;
+  saveBookmark(bookmark: BookmarkInput): void;
   removeBookmark(id: string): void;
   /** The list after a sync with Gwar Connect; not counted as an edit. */
   replaceBookmarks(bookmarks: Bookmark[]): void;
@@ -251,7 +250,6 @@ export const useSettings = create<SettingsState>()(
       removedBookmarks: {},
       bookmarkAccount: null,
       bookmarkEdits: 0,
-      lastNickname: "",
       lastAddress: "",
       lastKind: "gwar",
       tsDetectAsked: false,
@@ -284,7 +282,7 @@ export const useSettings = create<SettingsState>()(
               ? {
                   ...twin,
                   name: input.name.trim() && input.name.trim() !== input.address.trim() ? input.name : twin.name,
-                  kind: input.kind ?? twin.kind,
+                  kind: input.kind,
                   password: input.password || twin.password,
                   identity: input.identity ?? twin.identity,
                   insecureLan: input.insecureLan || twin.insecureLan,
@@ -296,7 +294,6 @@ export const useSettings = create<SettingsState>()(
           const changed = !existing || syncedChange(existing, bookmark);
           const account = existing?.account ?? s.bookmarkAccount ?? undefined;
           const saved: Bookmark = { ...bookmark, updatedAt: changed ? nextChange(existing?.updatedAt) : existing.updatedAt, account };
-          if (saved.updatedAt === undefined) delete saved.updatedAt;
           if (saved.account === undefined) delete saved.account;
           const { [bookmark.id]: _revived, ...removedBookmarks } = s.removedBookmarks;
           // An edit that now names another saved server replaces that one.
@@ -342,19 +339,9 @@ export const useSettings = create<SettingsState>()(
     {
       name: "gwar.settings",
       version: 1,
-      // Persist the cleaned bookmark shape while retaining the legacy migration source.
-      onRehydrateStorage: () => (state) => {
-        if (state) queueMicrotask(() => state.setLast(state.lastAddress, state.lastKind));
-      },
       merge: (persisted, current) => {
         const p = (persisted ?? {}) as Partial<SettingsState>;
-        const legacy = p.bookmarks as Array<Bookmark & { nickname?: string }> | undefined;
-        const lastNickname = validNickname(p.lastNickname) ?? legacy?.map((b) => validNickname(b.nickname)).find(Boolean) ?? "";
-        const loaded = legacy?.map(({ nickname: _nickname, ...bookmark }) => bookmark) ?? current.bookmarks;
-        // Lists saved before servers were matched by address can hold one server twice.
-        const deduped = dedupeBookmarks(loaded, p.removedBookmarks ?? current.removedBookmarks, p.bookmarkAccount ?? current.bookmarkAccount);
-        return { ...current, ...p, lastNickname, bookmarks: deduped.bookmarks, removedBookmarks: deduped.removed,
-          bookmarkEdits: (p.bookmarkEdits ?? current.bookmarkEdits) + (deduped.changed ? 1 : 0), audio: { ...current.audio, ...(p.audio ?? {}) }, desktop: { ...current.desktop, ...(p.desktop ?? {}) },
+        return { ...current, ...p, audio: { ...current.audio, ...(p.audio ?? {}) }, desktop: { ...current.desktop, ...(p.desktop ?? {}) },
           notifications: { ...current.notifications, ...(p.notifications ?? {}) },
           channelEncryption: typeof p.channelEncryption === "object" && p.channelEncryption !== null ? p.channelEncryption : {},
           archiveUploads: typeof p.archiveUploads === "boolean" ? p.archiveUploads : current.archiveUploads,

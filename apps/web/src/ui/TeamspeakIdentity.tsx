@@ -17,7 +17,6 @@ function errorText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-type VaultView = { locked: true } | { locked: false; list: TsList };
 
 const Alert = ({ children }: { children: string }) => (
   <p role="alert" className="text-sm text-danger">
@@ -91,17 +90,16 @@ function Row({ entry, level, isDefault, actions }: { entry: PublicEntry; level?:
  * servers can see you as and lets the person add, rename, export and delete them and choose the
  * default; in the browser (signed in) it only shows the list the desktop app uses.
  */
-export function TeamspeakIdentity({ onUnlock }: { onUnlock?: () => void }) {
+export function TeamspeakIdentity() {
   const t = useT();
   const bridge = tsBridge();
   const account = useAccount((s) => s.account);
   const revision = useAccount((s) => s.tsRevision);
   const [info, setInfo] = useState<TsListInfo | null>(null);
-  const [vault, setVault] = useState<VaultView | null>(null);
+  const [vault, setVault] = useState<TsList | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [open, setOpen] = useState<Open | null>(null);
   const signedIn = !!account;
-  const locked = signedIn && vault?.locked === true;
 
   useEffect(() => {
     let alive = true;
@@ -114,22 +112,11 @@ export function TeamspeakIdentity({ onUnlock }: { onUnlock?: () => void }) {
     return () => {
       alive = false;
     };
-  }, [bridge, signedIn, account?.hasVaultKey, revision]);
-
-  const lockedNote = locked && (
-    <div className="flex flex-wrap items-center gap-2 text-sm text-muted">
-      <span>{t("ts.locked")}</span>
-      {onUnlock && (
-        <Button size="sm" onClick={onUnlock}>
-          {t("ts.unlock")}
-        </Button>
-      )}
-    </div>
-  );
+  }, [bridge, signedIn, revision]);
 
   // The browser cannot use TeamSpeak; it shows what the desktop app will use.
   if (!bridge) {
-    const list = vault && !vault.locked ? vault.list : null;
+    const list = vault;
     return (
       <>
         {list && list.identities.length > 0 && (
@@ -143,7 +130,6 @@ export function TeamspeakIdentity({ onUnlock }: { onUnlock?: () => void }) {
           </>
         )}
         {list && list.identities.length === 0 && <p className="text-sm text-muted">{t("ts.webNone")}</p>}
-        {lockedNote}
         {error && <Alert>{error}</Alert>}
       </>
     );
@@ -176,13 +162,13 @@ export function TeamspeakIdentity({ onUnlock }: { onUnlock?: () => void }) {
                 isDefault={isDefault}
                 actions={
                   <div className="flex shrink-0 items-center">
-                    <IconButton label={t("ts.rename")} size="sm" disabled={locked} onClick={() => setOpen({ kind: "rename", entry: e })}>
+                    <IconButton label={t("ts.rename")} size="sm" onClick={() => setOpen({ kind: "rename", entry: e })}>
                       <Pencil className="size-4" />
                     </IconButton>
                     <IconButton
                       label={t("ts.setDefault")}
                       size="sm"
-                      disabled={locked || isDefault}
+                      disabled={isDefault}
                       onClick={() => void act(() => change((l) => setDefault(l, e.uid)))}
                     >
                       <Star className="size-4" />
@@ -194,7 +180,7 @@ export function TeamspeakIdentity({ onUnlock }: { onUnlock?: () => void }) {
                     })}>
                       <Download className="size-4" />
                     </IconButton>
-                    <IconButton label={t("ts.delete")} size="sm" tone="danger" disabled={locked} onClick={() => setOpen({ kind: "delete", entry: e })}>
+                    <IconButton label={t("ts.delete")} size="sm" tone="danger" onClick={() => setOpen({ kind: "delete", entry: e })}>
                       <Trash2 className="size-4" />
                     </IconButton>
                   </div>
@@ -204,19 +190,18 @@ export function TeamspeakIdentity({ onUnlock }: { onUnlock?: () => void }) {
           })}
         </ul>
       )}
-      {lockedNote}
       {error && <Alert>{error}</Alert>}
       <div className="flex flex-wrap items-center gap-2" role="group" aria-label={t("ts.add")}>
         <span className="flex items-center gap-1 text-sm text-muted">
           <Plus className="size-4" /> {t("ts.add")}
         </span>
-        <Button size="sm" disabled={!info || locked} onClick={() => setOpen({ kind: "import" })}>
+        <Button size="sm" disabled={!info} onClick={() => setOpen({ kind: "import" })}>
           <Upload className="size-4" /> {t("ts.import")}
         </Button>
-        <Button size="sm" disabled={!info || locked} onClick={() => setOpen({ kind: "generate" })}>
+        <Button size="sm" disabled={!info} onClick={() => setOpen({ kind: "generate" })}>
           {t("ts.generate")}
         </Button>
-        <Button size="sm" disabled={!info || locked} onClick={() => setOpen({ kind: "find" })}>
+        <Button size="sm" disabled={!info} onClick={() => setOpen({ kind: "find" })}>
           <Search className="size-4" /> {t("ts.find")}
         </Button>
       </div>

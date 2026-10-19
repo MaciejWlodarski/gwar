@@ -21,8 +21,6 @@ export const emptyList = (): TsList => ({ default: null, identities: [] });
 
 /** The name of the identity a device starts with. */
 export const DEFAULT_NAME = "Default";
-/** The name given to the single identity of the older vault format. */
-export const LEGACY_NAME = "TeamSpeak";
 export const MAX_NAME_LENGTH = 48;
 
 /** Names are trimmed and cut; an empty one becomes `fallback`. */

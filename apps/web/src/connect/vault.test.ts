@@ -3,7 +3,7 @@ import { createAccount } from "./account";
 import { ConnectApi } from "./api";
 import { setup, serverVault, writeServerVault, type FakeService } from "./testing";
 import type { TsList } from "./ts-list";
-import { loadVault, updateVault, vaultList, VaultLockedError, withTeamspeakList, type VaultContents } from "./vault";
+import { loadVault, updateVault, vaultList, withTeamspeakList, type VaultContents } from "./vault";
 
 async function account(handle: string) {
   const s = setup();
@@ -94,11 +94,9 @@ describe("vault", () => {
     expect(calls).toBe(4);
   }, 30_000);
 
-  it("needs the vault key, and refuses a wrong one without writing", async () => {
+  it("refuses a wrong vault key without writing", async () => {
     const { api, record, service } = await account("vault.keys");
     await writeServerVault(service, record, { a: 1 });
-    await expect(loadVault(api, { ...record, vaultKey: undefined })).rejects.toBeInstanceOf(VaultLockedError);
-    await expect(updateVault(api, { ...record, vaultKey: undefined }, (c) => c)).rejects.toBeInstanceOf(VaultLockedError);
     const wrong = { ...record, vaultKey: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" };
     await expect(updateVault(api, wrong, (c) => ({ ...c, b: 1 }))).rejects.toThrow(/decrypt/);
     expect((await serverVault(service, record))?.version).toBe(1);
@@ -114,15 +112,6 @@ describe("TeamSpeak identities in the vault", () => {
     ],
   };
 
-  it("reads the older single identity as one entry named TeamSpeak", () => {
-    const legacy = { teamspeak: { identity: "1V", uid: "u", updated_at: 1 } };
-    expect(vaultList(legacy)).toEqual({ default: "u", identities: [{ uid: "u", name: "TeamSpeak", identity: "1V" }] });
-    expect(vaultList({})).toEqual({ default: null, identities: [] });
-    expect(vaultList({ teamspeak: { identity: "", uid: "u", updated_at: 1 } }).identities).toEqual([]);
-    expect(vaultList({ teamspeak: { identity: "1V", uid: "", updated_at: 1 } }).identities).toEqual([]);
-    expect(vaultList({ teamspeak: { identity: 5 as unknown as string, uid: "u", updated_at: 1 } }).identities).toEqual([]);
-  });
-
   it("reads the list form, skipping broken and repeated entries and repairing the default", () => {
     const stored = {
       teamspeak: {
@@ -137,25 +126,19 @@ describe("TeamSpeak identities in the vault", () => {
         default: "gone",
       },
     };
+    expect(vaultList({}).identities).toEqual([]);
     expect(vaultList(stored as VaultContents)).toEqual({
       default: "a",
       identities: [
         { uid: "a", name: "Main", identity: "1Va" },
-        { uid: "c", name: "TeamSpeak", identity: "3Vc" },
+        { uid: "c", name: "Default", identity: "3Vc" },
       ],
     });
   });
 
-  it("the list form wins when both are present, and the older form is used when the list is empty", () => {
-    const both = { teamspeak: { identities: [{ uid: "a", name: "Main", identity: "1Va", updated_at: 1 }], default: "a", identity: "9Vold", uid: "old", updated_at: 1 } };
-    expect(vaultList(both).identities.map((e) => e.uid)).toEqual(["a"]);
-    const emptyList = { teamspeak: { identities: [], identity: "9Vold", uid: "old", updated_at: 1 } };
-    expect(vaultList(emptyList).identities.map((e) => e.uid)).toEqual(["old"]);
-  });
-
-  it("writes only the list form, dropping the older fields but keeping everything else", () => {
-    const legacy = { other: { deep: [1] }, teamspeak: { identity: "1Va", uid: "a", updated_at: 1, unknown: "kept" } };
-    const written = withTeamspeakList(legacy, list, 50);
+  it("writes the list, keeping everything else", () => {
+    const before = { other: { deep: [1] }, teamspeak: { unknown: "kept" } };
+    const written = withTeamspeakList(before, list, 50);
     expect(written).toEqual({
       other: { deep: [1] },
       teamspeak: {

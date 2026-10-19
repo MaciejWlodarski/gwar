@@ -6,10 +6,10 @@ import { CONNECT_URL } from "../lib/official";
 
 async function seed(name: string, state: { checkpoints: Record<string, unknown>; revocations: Record<string, unknown>; feeds: Record<string, unknown> }) {
   const db = await new Promise<IDBDatabase>((resolve) => {
-    const r = indexedDB.open(name, 2);
+    const r = indexedDB.open(name, 3);
     r.onupgradeneeded = () => {
       r.result.createObjectStore("checkpoints").createIndex("at", "at");
-      r.result.createObjectStore("revocations"); r.result.createObjectStore("feeds");
+      r.result.createObjectStore("revocations"); r.result.createObjectStore("feeds"); r.result.createObjectStore("order");
     };
     r.onsuccess = () => resolve(r.result);
   });
@@ -80,12 +80,8 @@ describe("per-record storage work", () => {
   it("reports a blocked upgrade as unavailable storage and opens once the older tab lets go", async () => {
     const name = crypto.randomUUID();
     const old = await new Promise<IDBDatabase>((resolve, reject) => {
-      const request = indexedDB.open(name, 2);
-      request.onupgradeneeded = () => {
-        request.result.createObjectStore("checkpoints").createIndex("at", "at");
-        request.result.createObjectStore("revocations");
-        request.result.createObjectStore("feeds");
-      };
+      // Any lower version: a tab of an older app, before this one's stores.
+      const request = indexedDB.open(name, 1);
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
     });

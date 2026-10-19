@@ -15,7 +15,7 @@
 import type { DeviceCertificate } from "../proto/DeviceCertificate";
 import { decodeBase64Url, encodeBase64Url } from "./base64url";
 import { kvDelete, kvEnroll, kvGet, kvSet, kvUpdate } from "./kv";
-import { defaultNickname, legacyNickname, validNickname } from "./nickname";
+import { defaultNickname, validNickname } from "./nickname";
 
 export interface Identity {
   readonly nickname: string;
@@ -39,8 +39,7 @@ export interface IdentityBackup {
   format: "gwar-identity";
   version: 1;
   jwk: JsonWebKey;
-  /** Missing only in backups saved before identity nicknames. */
-  nickname?: string;
+  nickname: string;
 }
 
 export interface IdentityStore {
@@ -76,10 +75,9 @@ export interface ConnectRecord {
   token: string;
   /**
    * Opens the account's vault (base64url, docs/connect.md): derived from the
-   * account key, so it can only be set by a flow that decrypts that key. Records
-   * saved before the vault existed lack it until the next such flow.
+   * account key, so it can only be set by a flow that decrypts that key.
    */
-  vaultKey?: string;
+  vaultKey: string;
   /**
    * A recovery archive key statement to publish (docs/e2e-build.md, section 7): signed at
    * sign-up, or by a recovery code change once Connect took the new code; the key archive
@@ -100,11 +98,7 @@ export interface ConnectStore {
 export const indexedDbConnectStore: ConnectStore = {
   load: () => kvGet<ConnectRecord>(CONNECT_KEY),
   save: (record) => kvEnroll(CONNECT_KEY, record, record.accountKey),
-  clear: async () => {
-    const record = await kvGet<ConnectRecord>(CONNECT_KEY);
-    if (record) await kvEnroll(CONNECT_KEY, record, record.accountKey);
-    await kvDelete(CONNECT_KEY);
-  },
+  clear: () => kvDelete(CONNECT_KEY),
 };
 
 /** Changes the stored Connect record in one transaction; `change` returns undefined to leave it. */
@@ -146,6 +140,7 @@ function isValidConnectRecord(value: unknown): value is ConnectRecord {
     typeof v.handle === "string" &&
     typeof v.accountKey === "string" &&
     typeof v.token === "string" &&
+    typeof v.vaultKey === "string" &&
     !!jwk &&
     jwk.kty === "OKP" &&
     jwk.crv === "Ed25519" &&
@@ -196,7 +191,7 @@ async function fromBackup(backup: IdentityBackup, device?: DeviceCertificate): P
 /** The identity of a device signed in to Gwar Connect. */
 export function identityFromConnect(record: ConnectRecord): Promise<Identity> {
   const { kty, crv, x, d } = record.deviceJwk;
-  return fromBackup({ format: "gwar-identity", version: 1, jwk: { kty, crv, x, d }, nickname: record.nickname }, record.certificate);
+  return fromBackup({ format: "gwar-identity", version: 1, jwk: { kty, crv, x, d }, nickname: record.nickname ?? defaultNickname() }, record.certificate);
 }
 
 /** The key the uid comes from: the account key when signed in to Connect, otherwise the identity key itself. */
@@ -220,7 +215,7 @@ export async function generateIdentity(): Promise<Identity> {
 export async function loadOrCreateIdentity(store: IdentityStore = indexedDbIdentityStore): Promise<Identity> {
   const existing = await store.load();
   if (existing && isValidBackup(existing)) {
-    const nickname = validNickname(existing.nickname) ?? legacyNickname() ?? defaultNickname();
+    const nickname = validNickname(existing.nickname) ?? defaultNickname();
     const backup = { ...existing, nickname };
     if (existing.nickname !== nickname) await store.save(backup);
     return fromBackup(backup);
@@ -245,9 +240,8 @@ export async function loadActiveIdentity(
   if (record) {
     if (!validNickname(record.nickname)) {
       record.nickname = validNickname((await store.load())?.nickname) ?? defaultNickname();
+      await connect.save(record);
     }
-    // Also removes plaintext roots left by older clients, after saving the device.
-    await connect.save(record);
     return identityFromConnect(record);
   }
   return loadOrCreateIdentity(store);
@@ -270,7 +264,7 @@ export async function importIdentity(text: string, store: IdentityStore = indexe
   if (!isValidBackup(parsed)) throw new Error("invalid identity file");
   // Normalise to exactly the fields we need; drop key_ops etc.
   const { kty, crv, x, d } = parsed.jwk;
-  const backup: IdentityBackup = { format: "gwar-identity", version: 1, jwk: { kty, crv, x, d }, nickname: validNickname(parsed.nickname) ?? legacyNickname() ?? defaultNickname() };
+  const backup: IdentityBackup = { format: "gwar-identity", version: 1, jwk: { kty, crv, x, d }, nickname: validNickname(parsed.nickname) ?? defaultNickname() };
   const identity = await fromBackup(backup);
   // Make sure the public half really belongs to the private half.
   const probe = new TextEncoder().encode("probe");

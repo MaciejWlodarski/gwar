@@ -4,7 +4,6 @@ import { tNow, useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { accountKeyOf, uidForPublicKey } from "../net/identity";
 import { describeAccountError } from "../connect/errors";
-import { VaultLockedError } from "../connect/vault";
 import { validNickname } from "../net/nickname";
 import { useAccountIdentity } from "../state/identity";
 import { accountActions, useAccount } from "../state/account";
@@ -479,7 +478,7 @@ function IdentityTab() {
       await accountActions.changeNickname(nickname);
       toast("success", t("common.saved"));
     } catch (e) {
-      setNicknameError(e instanceof VaultLockedError ? t("nickname.vaultLocked") : describeAccountError(e, "session"));
+      setNicknameError(describeAccountError(e, "session"));
     } finally {
       setBusy(false);
     }

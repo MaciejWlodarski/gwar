@@ -39,6 +39,7 @@ async function record(): Promise<ConnectRecord> {
     deviceJwk: { kty: "OKP", crv: "Ed25519", x: device.jwk.x, d: device.jwk.d },
     certificate: { account_key: account.publicKey, ...cert },
     token: "tok",
+    vaultKey: "vault-key",
   };
 }
 

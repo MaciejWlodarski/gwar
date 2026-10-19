@@ -91,13 +91,12 @@ function stored(e: VaultServer): Record<string, unknown> {
   return e.deleted ? { id: e.id, updated_at: e.updated_at, deleted: true } : e;
 }
 
-/** The synced part of a bookmark, as a vault entry. Bookmarks saved before syncing existed count as time 0. */
+/** The synced part of a bookmark, as a vault entry. */
 export function fromBookmark(b: Bookmark): VaultServer {
-  const kind = b.kind ?? "gwar";
   const address = b.address.trim();
-  const entry: VaultServer = { id: b.id, name: b.name.trim().slice(0, LIMITS.name) || address, address, kind, updated_at: b.updatedAt ?? 0 };
+  const entry: VaultServer = { id: b.id, name: b.name.trim().slice(0, LIMITS.name) || address, address, kind: b.kind, updated_at: b.updatedAt };
   if (b.password) entry.password = b.password;
-  if (kind === "teamspeak" && b.identity) entry.identity = b.identity;
+  if (b.kind === "teamspeak" && b.identity) entry.identity = b.identity;
   return entry;
 }
 

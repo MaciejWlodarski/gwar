@@ -19,19 +19,3 @@ export function defaultNickname(): string {
   }
   return `gwar-${digits}`;
 }
-
-/** A one-time migration source; identity records become authoritative afterwards. */
-export function legacyNickname(): string | undefined {
-  try {
-    const state = JSON.parse(localStorage.getItem("gwar.settings") ?? "{}").state;
-    const remembered = validNickname(state?.lastNickname);
-    if (remembered) return remembered;
-    for (const bookmark of state?.bookmarks ?? []) {
-      const nickname = validNickname(bookmark?.nickname);
-      if (nickname) return nickname;
-    }
-  } catch {
-    // Storage may be unavailable, or the old settings may be malformed.
-  }
-  return undefined;
-}

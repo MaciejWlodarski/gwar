@@ -5,8 +5,6 @@ export interface Persistence {
   close(): void;
 }
 export async function openStorage(device: string, factory: IDBFactory = indexedDB): Promise<Persistence> {
-  // Version 1 stored epoch evidence per epoch; this device rejoins instead.
-  factory.deleteDatabase(`gwar-mls-v1-${device}`);
   const db = await new Promise<IDBDatabase>((resolve, reject) => {
     const request = factory.open(`gwar-mls-v2-${device}`, 1);
     request.onupgradeneeded = () => { for (const name of stores) request.result.createObjectStore(name); };

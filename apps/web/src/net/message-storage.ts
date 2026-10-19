@@ -10,8 +10,8 @@ export const MAX_REVOCATIONS = 20_000;
 export const REVOCATION_FRESH_MS = 5 * 60_000;
 export interface Revocation { seq: number; account_key: string; device_key: string; revoked_at: number; signature: string }
 /** `files` fingerprints the signed attachments the message was first seen with; only its deletion may list others. */
-/** `order` (see `confirmedBefore`) is missing on revisions stored before it existed: those came before every ordered read. */
-interface Checkpoint { revision: number; hash: string; created: number; conversation: string; at: number; proven?: boolean; deleted?: boolean; files?: string; order?: number }
+/** `order`: see `confirmedBefore`. */
+interface Checkpoint { revision: number; hash: string; created: number; conversation: string; at: number; proven?: boolean; deleted?: boolean; files?: string; order: number }
 /** `read`: the order of the last read to the feed's end. */
 interface Feed { cursor: number; checked: number; available?: boolean; read?: number }
 export interface RevocationState { revokedAt?: number; fresh: boolean; read?: number }
@@ -57,12 +57,12 @@ export class MessageStorage {
         reject(new Error("Message storage is being upgraded in another tab"));
       };
       request.onupgradeneeded = () => {
-        const db = request.result, missing = (name: string) => !db.objectStoreNames.contains(name);
-        if (missing("checkpoints")) db.createObjectStore("checkpoints").createIndex("at", "at");
-        if (missing("revocations")) db.createObjectStore("revocations");
-        if (missing("feeds")) db.createObjectStore("feeds");
-        // One counter ordering stored revisions and complete feed reads (version 3).
-        if (missing(ORDER)) db.createObjectStore(ORDER);
+        const db = request.result;
+        db.createObjectStore("checkpoints").createIndex("at", "at");
+        db.createObjectStore("revocations");
+        db.createObjectStore("feeds");
+        // One counter ordering stored revisions and complete feed reads.
+        db.createObjectStore(ORDER);
       };
       request.onerror = () => reject(request.error);
       request.onsuccess = () => {
@@ -103,7 +103,7 @@ export class MessageStorage {
         if (next.created !== old.created || next.conversation !== old.conversation) return { continuity: "fork", duplicate: false };
         if (!next.deleted && old.files !== undefined && next.files !== old.files) return { continuity: "fork", duplicate: false };
         if (next.revision === old.revision) {
-          return next.hash === old.hash ? { continuity: old.proven ? "proven" : "unproven", duplicate: true, order: old.order ?? 0 } : { continuity: "fork", duplicate: false };
+          return next.hash === old.hash ? { continuity: old.proven ? "proven" : "unproven", duplicate: true, order: old.order } : { continuity: "fork", duplicate: false };
         }
         if (next.revision === old.revision + 1 && predecessor !== old.hash) return { continuity: "fork", duplicate: false };
       }

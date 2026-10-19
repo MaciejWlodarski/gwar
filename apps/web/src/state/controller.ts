@@ -52,7 +52,6 @@ import {
   type ConnectionStatus,
 } from "../net/connection";
 import { TsConnection } from "../net/ts-connection";
-import { parseBanMessage } from "../lib/ban";
 import type { pruneRequest } from "../lib/prune";
 import { identitySeed, uidForPublicKey, accountKeyOf, importIdentity, loadActiveIdentity, IdentityUnsupportedError, type Identity } from "../net/identity";
 import { isDesktop } from "../platform";
@@ -138,10 +137,7 @@ export function describeConnectFailure(f: ConnectFailure): string {
   if (f.kind === "address") return f.message;
   if (f.kind === "server_identity") return tNow("security.changedTitle");
   if (f.kind === "insecure_transport") return tNow("err.addr.insecure");
-  if (f.kind === "banned") {
-    // Older servers only describe the ban in the message.
-    return f.ban ? describeBan({ until: f.ban.until ?? null, reason: f.ban.reason ?? null }, f.ban.by) : describeBan(parseBanMessage(f.message));
-  }
+  if (f.kind === "banned") return describeBan({ until: f.ban?.until ?? null, reason: f.ban?.reason ?? null }, f.ban?.by);
   // From an https page only wss:// servers are reachable; a bare address that fails is most often one without HTTPS.
   if (f.kind === "unreachable" && !isDesktop() && window.location.protocol === "https:") return tNow("err.connect.unreachableHttps");
   return tNow(`err.connect.${f.kind}` as Key, { server: f.serverName ?? "" });
@@ -500,7 +496,7 @@ class Controller {
     settings.setLast(params.address, kind);
     const name = useSession.getState().server?.name || params.address;
     // The bookmark used to connect when there is one (the address as typed), else one for the same server.
-    const shown = settings.bookmarks.filter((b) => inAccount(b, settings.bookmarkAccount) && (b.kind ?? "gwar") === kind);
+    const shown = settings.bookmarks.filter((b) => inAccount(b, settings.bookmarkAccount) && b.kind === kind);
     const typed = params.address.trim().toLowerCase();
     const existing =
       shown.find((b) => b.address.trim().toLowerCase() === typed) ??
