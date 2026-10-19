@@ -137,12 +137,12 @@ let link: FakeLink;
 
 const session = () => stores.useSession.getState();
 
-/** Connects a fake link; vc servers start users outside voice. */
-function connectFake(opts: { channel?: number | null; kind?: "vc" | "teamspeak"; resync?: boolean; encrypted?: number[]; serverChat?: boolean } = {}) {
+/** Connects a fake link; Gwar servers start users outside voice. */
+function connectFake(opts: { channel?: number | null; kind?: "gwar" | "teamspeak"; resync?: boolean; encrypted?: number[]; serverChat?: boolean } = {}) {
   const c = controller as unknown as { conn: Link | null; wire(l: Link): void };
   c.conn = link;
   c.wire(link);
-  session().setAddress("test", opts.kind ?? "vc");
+  session().setAddress("test", opts.kind ?? "gwar");
   link.welcomeNow(
     welcome({
       session: 1,
@@ -822,7 +822,7 @@ describe("edits stay on their connection; history ownership follows each verifie
     const switchTo = () => {
       g.c.conn = b;
       session().dispatch({ type: "reset" });
-      stores.useSession.setState({ me: { session: 1, uid: g.uid }, kind: "vc" });
+      stores.useSession.setState({ me: { session: 1, uid: g.uid }, kind: "gwar" });
     };
     return { a, b, connection, switchTo };
   }
@@ -1021,7 +1021,7 @@ describe("native file sessions", () => {
   const welcomeAgain = (resync: boolean) => link.welcomeNow(welcome({ session: 1, uid: "u1", channels: [chan(1)], clients: [client(1, null)] }), resync);
   it("every welcome names a new connection for native file commands; TeamSpeak and leaving have none", async () => {
     connectFake();
-    session().setAddress("test", "vc", "https://a.example");
+    session().setAddress("test", "gwar", "https://a.example");
     welcomeAgain(false);
     const first = session().fileSession;
     expect(first).toMatch(/^[0-9a-f-]{36}$/);
@@ -1031,7 +1031,7 @@ describe("native file sessions", () => {
     session().setAddress("ts", "teamspeak", null);
     welcomeAgain(false);
     expect(session().fileSession).toBeNull();
-    session().setAddress("test", "vc", "https://a.example");
+    session().setAddress("test", "gwar", "https://a.example");
     welcomeAgain(false);
     await controller.disconnect(true);
     expect(session().fileSession).toBeNull();
@@ -1213,7 +1213,7 @@ describe.each(["channel", "server"] as const)("encrypted %s chat", kind => {
 });
 
 
-it.each(["vc", "teamspeak"] as const)("keeps default server chat plaintext in %s sessions", async kind => {
+it.each(["gwar", "teamspeak"] as const)("keeps default server chat plaintext in %s sessions", async kind => {
   connectFake({ kind });
   expect(await controller.sendChat("server", "plain server hello")).toBe(true);
   expect(link.sent("chat.send").at(-1)?.d).toMatchObject({ target: "server", text: "plain server hello", signature: expect.any(Object) });

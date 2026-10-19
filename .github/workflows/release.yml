@@ -195,16 +195,16 @@ jobs:
       - name: Build tools
         run: sudo apt-get update && sudo apt-get install -y cmake pkg-config
       - name: Build
-        run: cargo build --release --locked -p vc-server -p gwar-connect
+        run: cargo build --release --locked -p gwar-server -p gwar-connect
       - name: Check the binaries
         run: |
-          file target/release/vc-server target/release/gwar-connect
-          ldd target/release/vc-server
-          if ldd target/release/vc-server | grep -q libopus; then
-            echo "::error::vc-server links libopus dynamically"; exit 1
+          file target/release/gwar-server target/release/gwar-connect
+          ldd target/release/gwar-server
+          if ldd target/release/gwar-server | grep -q libopus; then
+            echo "::error::gwar-server links libopus dynamically"; exit 1
           fi
           # Native runners, so the binaries can run here.
-          target/release/vc-server --version
+          target/release/gwar-server --version
           target/release/gwar-connect --version
       - name: Package
         env:
@@ -213,8 +213,8 @@ jobs:
         run: |
           name="gwar-server-v${VERSION}-${TARGET}"
           mkdir -p "dist/$name"
-          cp target/release/vc-server target/release/gwar-connect LICENSE THIRD_PARTY_NOTICES.md "dist/$name/"
-          strip "dist/$name/vc-server" "dist/$name/gwar-connect"
+          cp target/release/gwar-server target/release/gwar-connect LICENSE THIRD_PARTY_NOTICES.md "dist/$name/"
+          strip "dist/$name/gwar-server" "dist/$name/gwar-connect"
           tar -czf "dist/$name.tar.gz" -C dist "$name"
           tar -tzf "dist/$name.tar.gz"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

@@ -36,7 +36,7 @@ export interface Identity {
 }
 
 export interface IdentityBackup {
-  format: "vc-identity";
+  format: "gwar-identity";
   version: 1;
   jwk: JsonWebKey;
   /** Missing only in backups saved before identity nicknames. */
@@ -126,7 +126,7 @@ function isValidBackup(value: unknown): value is IdentityBackup {
   const v = value as Partial<IdentityBackup>;
   const jwk = v.jwk;
   return (
-    v.format === "vc-identity" &&
+    v.format === "gwar-identity" &&
     v.version === 1 &&
     !!jwk &&
     jwk.kty === "OKP" &&
@@ -196,7 +196,7 @@ async function fromBackup(backup: IdentityBackup, device?: DeviceCertificate): P
 /** The identity of a device signed in to Gwar Connect. */
 export function identityFromConnect(record: ConnectRecord): Promise<Identity> {
   const { kty, crv, x, d } = record.deviceJwk;
-  return fromBackup({ format: "vc-identity", version: 1, jwk: { kty, crv, x, d }, nickname: record.nickname }, record.certificate);
+  return fromBackup({ format: "gwar-identity", version: 1, jwk: { kty, crv, x, d }, nickname: record.nickname }, record.certificate);
 }
 
 /** The key the uid comes from: the account key when signed in to Connect, otherwise the identity key itself. */
@@ -214,7 +214,7 @@ export async function generateIdentity(): Promise<Identity> {
     throw new IdentityUnsupportedError();
   }
   const jwk = await subtle.exportKey("jwk", pair.privateKey);
-  return fromBackup({ format: "vc-identity", version: 1, jwk, nickname: defaultNickname() });
+  return fromBackup({ format: "gwar-identity", version: 1, jwk, nickname: defaultNickname() });
 }
 
 export async function loadOrCreateIdentity(store: IdentityStore = indexedDbIdentityStore): Promise<Identity> {
@@ -238,7 +238,10 @@ export async function loadActiveIdentity(
   store: IdentityStore = indexedDbIdentityStore,
   connect: ConnectStore = indexedDbConnectStore,
 ): Promise<Identity> {
-  const record = await loadConnectRecord(connect);
+  // Not loadConnectRecord: a storage error must fail the load (and be retried whole), not read as
+  // "signed out" and go on to create a local identity.
+  const stored = await connect.load();
+  const record = stored && isValidConnectRecord(stored) ? stored : undefined;
   if (record) {
     if (!validNickname(record.nickname)) {
       record.nickname = validNickname((await store.load())?.nickname) ?? defaultNickname();
@@ -267,7 +270,7 @@ export async function importIdentity(text: string, store: IdentityStore = indexe
   if (!isValidBackup(parsed)) throw new Error("invalid identity file");
   // Normalise to exactly the fields we need; drop key_ops etc.
   const { kty, crv, x, d } = parsed.jwk;
-  const backup: IdentityBackup = { format: "vc-identity", version: 1, jwk: { kty, crv, x, d }, nickname: validNickname(parsed.nickname) ?? legacyNickname() ?? defaultNickname() };
+  const backup: IdentityBackup = { format: "gwar-identity", version: 1, jwk: { kty, crv, x, d }, nickname: validNickname(parsed.nickname) ?? legacyNickname() ?? defaultNickname() };
   const identity = await fromBackup(backup);
   // Make sure the public half really belongs to the private half.
   const probe = new TextEncoder().encode("probe");

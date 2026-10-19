@@ -1,6 +1,6 @@
 //! TeamSpeak 3/6 servers ("our client on their server"), bridged to the UI.
 //!
-//! `vc_client::teamspeak` presents a TS server as `vc/1`: a `Welcome`, a stream
+//! `gwar_client::teamspeak` presents a TS server as `gwar/1`: a `Welcome`, a stream
 //! of events and request handling. This module forwards them to the web UI:
 //!
 //! - `ts_connect {session, address, nickname, password?, identity?}` -> `Welcome` JSON; `identity`
@@ -8,34 +8,34 @@
 //! - `ts_request {session, op, d}` -> reply value, or rejects with an `ErrorBody`
 //! - `ts_disconnect {session}`
 //! - event `ts://event {session, frame}` where `frame` is the JSON text of a
-//!   `vc/1` event (`{"ev":..,"d":..}`, identical to the server's frames)
+//!   `gwar/1` event (`{"ev":..,"d":..}`, identical to the server's frames)
 //! - event `ts://closed {session}` when the connection ended
 //!
 //! The UI picks its own `session` number (and listens before connecting), so
 //! nothing is lost between connecting and the first event. Voice uses the same
-//! `voice_start` command as vc servers; see [`Ts::voice_link`].
+//! `voice_start` command as Gwar servers; see [`Ts::voice_link`].
 
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
 
+use gwar_client::{
+    ClientError,
+    teamspeak::{self, TsAudio, TsHandle, TsOptions},
+};
+use gwar_proto::{ErrorBody, ErrorCode, Request};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::mpsc;
-use vc_client::{
-    ClientError,
-    teamspeak::{self, TsAudio, TsHandle, TsOptions},
-};
-use vc_proto::{ErrorBody, ErrorCode, Request};
 
 use crate::ts_identity;
 
 /// What voice needs from the active TS connection.
 pub struct VoiceLink {
     pub audio_in: mpsc::Receiver<TsAudio>,
-    pub audio_out: mpsc::Sender<vc_client::teamspeak::TsMicrophone>,
+    pub audio_out: mpsc::Sender<gwar_client::teamspeak::TsMicrophone>,
 }
 
 #[derive(Default)]
@@ -47,7 +47,7 @@ impl VoiceSink {
     pub(crate) fn link(
         self: &Arc<Self>,
         run: u64,
-        audio_out: mpsc::Sender<vc_client::teamspeak::TsMicrophone>,
+        audio_out: mpsc::Sender<gwar_client::teamspeak::TsMicrophone>,
     ) -> (VoiceLink, VoiceSinkLease) {
         let (tx, rx) = mpsc::channel(256);
         *self.target.lock().unwrap_or_else(|e| e.into_inner()) = Some((run, tx));

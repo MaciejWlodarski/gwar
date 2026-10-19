@@ -17,7 +17,7 @@ fn certificate(device: &SigningKey, issued_at: i64) -> DeviceCertificate {
         expires_at: issued_at + 30 * 86_400_000,
         signature: String::new(),
     };
-    c.signature = b64(&account().sign(vc_proto::device_statement(&c).as_bytes()).to_bytes());
+    c.signature = b64(&account().sign(gwar_proto::device_statement(&c).as_bytes()).to_bytes());
     c
 }
 struct Device {

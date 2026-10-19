@@ -8,8 +8,8 @@ const NOW = 1_800_000_000_000;
 const ACCT = "account-key";
 /** Small times are offsets from a recent moment, so tombstones are fresh. */
 const T = (n: number) => NOW - 1_000_000 + n;
-const entry = (id: string, at: number, extra: Partial<VaultServer> = {}): VaultServer => ({ id, name: id, address: `${id}.example.com`, kind: "vc", updated_at: T(at), ...extra });
-const bookmark = (id: string, at: number | undefined, extra: Partial<Bookmark> = {}): Bookmark => ({ id, name: id, address: `${id}.example.com`, kind: "vc", updatedAt: at === undefined ? undefined : T(at), ...extra });
+const entry = (id: string, at: number, extra: Partial<VaultServer> = {}): VaultServer => ({ id, name: id, address: `${id}.example.com`, kind: "gwar", updated_at: T(at), ...extra });
+const bookmark = (id: string, at: number | undefined, extra: Partial<Bookmark> = {}): Bookmark => ({ id, name: id, address: `${id}.example.com`, kind: "gwar", updatedAt: at === undefined ? undefined : T(at), ...extra });
 
 describe("vaultServers", () => {
   it("keeps valid entries in order and skips malformed or repeated ones", () => {
@@ -32,8 +32,8 @@ describe("vaultServers", () => {
     expect(entries).toEqual([
       entry("a", 1, { future: true }),
       { id: "ts", name: "ts.example.com", address: "ts.example.com", kind: "teamspeak", identity: "uid", password: "p", updated_at: 3 },
-      { id: "vcid", name: "v.example.com", address: "v.example.com", kind: "vc", updated_at: 3 },
-      { id: "gone", name: "", address: "", kind: "vc", updated_at: 4, deleted: true },
+      { id: "vcid", name: "v.example.com", address: "v.example.com", kind: "gwar", updated_at: 3 },
+      { id: "gone", name: "", address: "", kind: "gwar", updated_at: 4, deleted: true },
     ]);
   });
 
@@ -95,8 +95,8 @@ describe("toBookmarks", () => {
     ];
     const result = toBookmarks([entry("lan", 2, { address: "192.168.1.10:8790" }), entry("moved", 2, { address: "10.0.0.3:8790" }), { ...entry("x", 3), deleted: true }], previous, ACCT);
     expect(result).toEqual([
-      { id: "lan", name: "lan", address: "192.168.1.10:8790", kind: "vc", updatedAt: T(2), account: ACCT, insecureLan: true },
-      { id: "moved", name: "moved", address: "10.0.0.3:8790", kind: "vc", updatedAt: T(2), account: ACCT },
+      { id: "lan", name: "lan", address: "192.168.1.10:8790", kind: "gwar", updatedAt: T(2), account: ACCT, insecureLan: true },
+      { id: "moved", name: "moved", address: "10.0.0.3:8790", kind: "gwar", updatedAt: T(2), account: ACCT },
       previous[2],
     ]);
   });
@@ -105,7 +105,7 @@ describe("toBookmarks", () => {
     const edited = bookmark("a", 5, { password: "p".repeat(129), account: ACCT });
     expect(toBookmarks([entry("a", 1, { password: "short" }), entry("b", 1)], [edited, bookmark("b", 1, { account: ACCT })], ACCT)).toEqual([
       edited,
-      { id: "b", name: "b", address: "b.example.com", kind: "vc", updatedAt: T(1), account: ACCT },
+      { id: "b", name: "b", address: "b.example.com", kind: "gwar", updatedAt: T(1), account: ACCT },
     ]);
   });
 
@@ -133,7 +133,7 @@ describe("syncServers", () => {
     const phone = await signIn({ handle: "servers.sync", password: "right password" }, s.deps("Firefox on Linux"));
     const onPhone = await syncServers(api, phone, { bookmarks: [bookmark("ts", 20, { kind: "teamspeak", address: "ts.example.com", identity: "uid1" })], removed: {} }, NOW);
     expect(toBookmarks(onPhone, [], phone.accountKey)).toEqual([
-      { id: "gwar", name: "Gwar", address: "gwar.app", kind: "vc", updatedAt: T(10), account: phone.accountKey, password: "secret" },
+      { id: "gwar", name: "Gwar", address: "gwar.app", kind: "gwar", updatedAt: T(10), account: phone.accountKey, password: "secret" },
       { id: "ts", name: "ts", address: "ts.example.com", kind: "teamspeak", updatedAt: T(20), account: phone.accountKey, identity: "uid1" },
     ]);
 
@@ -145,7 +145,7 @@ describe("syncServers", () => {
     const stored = await serverVault(s.service, laptop);
     expect(stored?.contents).toEqual({
       profile: { nickname: "Dominika", updated_at: 1 },
-      servers: { entries: [{ id: "gwar", name: "Gwar", address: "gwar.app", kind: "vc", password: "secret", updated_at: T(10) }, { id: "ts", updated_at: T(30), deleted: true }] },
+      servers: { entries: [{ id: "gwar", name: "Gwar", address: "gwar.app", kind: "gwar", password: "secret", updated_at: T(10) }, { id: "ts", updated_at: T(30), deleted: true }] },
     });
 
     // Nothing changed: nothing is written.

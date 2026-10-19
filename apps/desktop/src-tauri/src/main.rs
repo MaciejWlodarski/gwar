@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    vc_desktop_lib::run();
+    gwar_desktop_lib::run();
 }

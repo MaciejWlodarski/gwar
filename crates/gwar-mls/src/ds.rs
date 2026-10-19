@@ -8,12 +8,12 @@
 
 use std::collections::BTreeSet;
 
+use gwar_proto::Uid;
 use openmls::prelude::{
     tls_codec::{Deserialize as _, Serialize as _},
     *,
 };
 use openmls_rust_crypto::{MemoryStorage, RustCrypto};
-use vc_proto::Uid;
 
 use crate::{
     DESCRIPTOR_EXTENSION, SUITE,

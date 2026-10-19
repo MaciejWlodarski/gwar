@@ -22,7 +22,7 @@ describe("view as", () => {
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
     useSettings.setState({ language: "en" });
     useSession.setState({
-      kind: "vc",
+      kind: "gwar",
       groups: { 1: group(1, "Admin", 0, ["administrator"]), 5: group(5, "Speakers", 1, []), 2: group(2, "Member", 2, ["connect", "send_messages"]) },
       channels: {
         1: channel(1, "Lobby"),

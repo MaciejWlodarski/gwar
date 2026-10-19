@@ -2,7 +2,7 @@
 /**
  * Moving between plaintext and encrypted voice with one click (live-test regression), then:
  * encrypted voice in real browsers (docs/e2e-build.md "Tests and acceptance",
- * 5c): a real local vc-server, the built app, SFrame workers and synthetic
+ * 5c): a real local gwar-server, the built app, SFrame workers and synthetic
  * microphone tones observed at each receiver's WebAudio output.
  *
  *   E2E_BROWSERS=chromium,webkit   engines to run (default: both)
@@ -213,12 +213,12 @@ try {
   const viteCli = path.join(path.dirname(fileURLToPath(import.meta.resolve("vite/package.json"))), "bin/vite.js");
   start("vite", process.execPath, [viteCli, "preview", "--outDir", path.join(dataDir, "dist"), "--host", "127.0.0.1", "--port", String(webPort), "--strictPort"], { cwd: webRoot });
   await waitFor(async () => { try { return (await fetch(web)).ok; } catch { return false; } }, "web preview", 30_000);
-  const binary = process.env.VC_SERVER_BIN ?? path.join(repoRoot, "target/debug/vc-server");
+  const binary = process.env.GWAR_SERVER_BIN ?? path.join(repoRoot, "target/debug/gwar-server");
   for (const engine of engines) {
     // A fresh server per engine: its own admin token, calls and groups.
     const serverPort = await port();
     const ws = `ws://127.0.0.1:${serverPort}/ws`;
-    const server = start("vc-server", binary, ["--data-dir", path.join(dataDir, `server-${engine}`), "--http", `127.0.0.1:${serverPort}`, "--media", `127.0.0.1:${serverPort}`, "--public-ip", "127.0.0.1", "--public-endpoint", ws, "--web-origin", web, "--no-connect"]);
+    const server = start("gwar-server", binary, ["--data-dir", path.join(dataDir, `server-${engine}`), "--http", `127.0.0.1:${serverPort}`, "--media", `127.0.0.1:${serverPort}`, "--public-ip", "127.0.0.1", "--public-endpoint", ws, "--web-origin", web, "--no-connect"]);
     await waitFor(() => /redeem this one-time admin token in your client: (\S+)/.test(server.output), "server admin token", 60_000);
     const token = /redeem this one-time admin token in your client: (\S+)/.exec(server.output)[1];
     try { await run(engine, web, ws, token); }

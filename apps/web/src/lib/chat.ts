@@ -7,10 +7,10 @@ export function dmPeer(conversation: string, me: string | undefined): string | n
   if (!parts || parts[1]! >= parts[2]!) return null;
   return parts[1] === me ? parts[2]! : parts[2] === me ? parts[1]! : null;
 }
-export function encryptedDm(key: string, kind: string): boolean { return kind === "vc" && key.startsWith("dm:") && !key.slice(3).startsWith("ts:"); }
+export function encryptedDm(key: string, kind: string): boolean { return kind === "gwar" && key.startsWith("dm:") && !key.slice(3).startsWith("ts:"); }
 /** A stored thread whose messages are sealed: a Gwar direct message, encrypted channel or server chat. */
 export function sealedThread(key: string | null | undefined, kind: string, channels: Record<number, { encrypted: boolean }>, serverChat?: { encrypted: boolean }): boolean {
-  if (!key || kind !== "vc") return false;
+  if (!key || kind !== "gwar") return false;
   if (key === "server") return !!serverChat?.encrypted;
   if (key.startsWith("ch:")) return !!channels[Number(key.slice(3))]?.encrypted;
   return encryptedDm(key, kind);

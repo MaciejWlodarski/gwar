@@ -10,12 +10,12 @@ use gwar_mls::{
     owner::{Anchor, Genesis, ManagerList, OwnerChain, SignedAnchor, SignedList},
     signer::{Ed25519Signer, server_credential},
 };
+use gwar_proto::DeviceCertificate;
 use openmls::prelude::{
     tls_codec::{Deserialize as _, Serialize as _},
     *,
 };
 use openmls_rust_crypto::OpenMlsRustCrypto;
-use vc_proto::DeviceCertificate;
 
 const NOW: i64 = 1_800_000_000_000;
 const DAY: i64 = 86_400_000;
@@ -27,7 +27,7 @@ fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
 }
 fn uid(account: u8) -> String {
-    vc_proto::uid_for_key(key(account).verifying_key().as_bytes())
+    gwar_proto::uid_for_key(key(account).verifying_key().as_bytes())
 }
 fn server_key() -> String {
     b64(key(200).verifying_key().as_bytes())
@@ -40,7 +40,7 @@ fn certified(account: u8, device: u8) -> Credential {
         expires_at: NOW + 29 * DAY,
         signature: String::new(),
     };
-    c.signature = b64(&key(account).sign(vc_proto::device_statement(&c).as_bytes()).to_bytes());
+    c.signature = b64(&key(account).sign(gwar_proto::device_statement(&c).as_bytes()).to_bytes());
     Credential::Account(c)
 }
 fn capabilities() -> Capabilities {

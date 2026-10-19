@@ -4,8 +4,8 @@
 //! current.
 
 use ed25519_dalek::{Signer, SigningKey};
+use gwar_proto::Uid;
 use sha2::{Digest, Sha256};
-use vc_proto::Uid;
 
 use crate::credential::{Credential, Revocations};
 use crate::encoding::{b64, decimal, fixed, netstrings, parse_netstrings};
@@ -42,7 +42,7 @@ fn parse_uids(value: &str) -> Option<Vec<Uid>> {
 }
 
 fn key_uid(key: &str) -> Option<Uid> {
-    Some(vc_proto::uid_for_key(&fixed::<32>(key)?))
+    Some(gwar_proto::uid_for_key(&fixed::<32>(key)?))
 }
 
 // ------------------------------------------------------------------ genesis
@@ -174,7 +174,7 @@ impl SignedLink {
     /// Parses a statement and its signature; the signature is checked against the key it names.
     pub fn parse(statement: &str, signature: &str) -> Option<Self> {
         let link = OwnerLink::parse(statement)?;
-        vc_proto::signed_by(&link.previous_owner_account_key, statement, signature)
+        gwar_proto::signed_by(&link.previous_owner_account_key, statement, signature)
             .then(|| Self { link, signature: signature.to_owned() })
     }
 }
@@ -213,7 +213,7 @@ impl OwnerChain {
             && link.seq == self.seq() + 1
             && link.previous_link_hash == self.head()
             && link.previous_owner() == self.owner()
-            && vc_proto::signed_by(&link.previous_owner_account_key, &link.statement(), &signed.signature);
+            && gwar_proto::signed_by(&link.previous_owner_account_key, &link.statement(), &signed.signature);
         if !extends {
             return None;
         }
@@ -439,7 +439,7 @@ impl SignedAnchor {
         let anchor = Anchor::parse(statement)?;
         let account_key = std::str::from_utf8(fields[1]).ok()?.to_owned();
         let signature = std::str::from_utf8(fields[2]).ok()?.to_owned();
-        (fixed::<32>(&account_key).is_some() && vc_proto::signed_by(&account_key, statement, &signature))
+        (fixed::<32>(&account_key).is_some() && gwar_proto::signed_by(&account_key, statement, &signature))
             .then_some(Self { anchor, account_key, signature })
     }
 
@@ -540,7 +540,7 @@ impl SignedList {
         let list = ManagerList::parse(statement)?;
         let signer = Credential::parse(fields[1])?;
         let signature = std::str::from_utf8(fields[2]).ok()?.to_owned();
-        (signer.uid() == list.signer_uid && vc_proto::signed_by(signer.device_key(), statement, &signature))
+        (signer.uid() == list.signer_uid && gwar_proto::signed_by(signer.device_key(), statement, &signature))
             .then_some(Self { list, signer, signature })
     }
 

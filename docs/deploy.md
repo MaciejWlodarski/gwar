@@ -1,7 +1,7 @@
 # Deploying the official services
 
 How the official services run. A self-hosted server needs none of this:
-`vc-server --domain …` is enough (see the README).
+`gwar-server --domain …` is enough (see the README).
 
 | Address | What | DNS |
 | --- | --- | --- |
@@ -14,17 +14,17 @@ Keep `gwar.app` DNS only: a Cloudflare proxy would terminate TLS for the
 server's WebSocket and see every chat message and upload in the clear.
 
 `scripts/deploy-vm.sh [--web]` copies the source to the host, builds
-`vc-server` and `gwar-connect` there and installs them as systemd user units:
+`gwar-server` and `gwar-connect` there and installs them as systemd user units:
 
 | Unit | Listens on | Data |
 | --- | --- | --- |
-| `vc-server.service` | HTTP `127.0.0.1:8800`, WebRTC UDP 9988, TeamSpeak UDP 9987 and TCP 30033 | `~/vc/data` |
+| `gwar-server.service` | HTTP `127.0.0.1:8800`, WebRTC UDP 9988, TeamSpeak UDP 9987 and TCP 30033 | `~/gwar/data` |
 | `gwar-connect.service` | HTTP `127.0.0.1:8900` | `~/gwar-connect/data` |
 | `gwar-backup.timer` | daily at 04:20 | copies in `~/gwar-backups`, kept 14 days |
 
-Host settings live in `scripts/deploy.env` (not committed): `VC_DEPLOY_HOST`,
-`VC_PUBLIC_IP`, `VC_PRIVATE_IP`, `VC_EXTRA_ARGS`, `VC_CONNECT` (0 skips
-Connect), `VC_CONNECT_ARGS`, `VC_WEB_DIR` (where `--web` publishes the web
+Host settings live in `scripts/deploy.env` (not committed): `GWAR_DEPLOY_HOST`,
+`GWAR_PUBLIC_IP`, `GWAR_PRIVATE_IP`, `GWAR_EXTRA_ARGS`, `GWAR_CONNECT` (0 skips
+Connect), `GWAR_CONNECT_ARGS`, `GWAR_WEB_DIR` (where `--web` publishes the web
 app, `/var/www/gwar`, owned by the deploy user).
 
 For user units to keep running without a login session, enable lingering once:
@@ -176,12 +176,12 @@ rm -f ~/gwar-connect/data/connect.sqlite3-wal ~/gwar-connect/data/connect.sqlite
 systemctl --user start gwar-connect
 ```
 
-The same works for `vc-server` with `~/vc/data/vc.sqlite3`.
+The same works for `gwar-server` with `~/gwar/data/gwar.sqlite3`.
 
-Back up `~/vc/data/server-key.ed25519` together with the server database and
+Back up `~/gwar/data/server-key.ed25519` together with the server database and
 restore both. This private 32-byte seed identifies the server; keep its Unix
 permissions at 0600. Losing it changes the identity and blocks pinned clients.
-`vc-server --data-dir ~/vc/data server-key` prints the public fingerprint for
+`gwar-server --data-dir ~/gwar/data server-key` prints the public fingerprint for
 users to check. Clients pin each endpoint only after verifying the proof; invite
 links carry `server_key`. A changed pin requires checking with the owner before
 explicitly trusting the replacement. The deployment backup timer copies the

@@ -3,7 +3,7 @@
  * any self-hosted Gwar server from there. Invite links point at it (the desktop
  * app has no web address of its own, `location.origin` is `tauri://...` there).
  *
- * Change it here only (and `OFFICIAL_WEB_ORIGIN` in vc-server).
+ * Change it here only (and `OFFICIAL_WEB_ORIGIN` in gwar-server).
  */
 export const OFFICIAL_WEB_ORIGIN = "https://gwar.app";
 

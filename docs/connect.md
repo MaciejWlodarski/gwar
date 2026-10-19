@@ -105,10 +105,10 @@ The `servers` section holds the saved servers, so every signed-in device shows
 the same list:
 
 ```json
-{"servers": {"entries": [{"id": "<random>", "name": "Gwar", "address": "gwar.app", "kind": "vc", "password": "<server password, if any>", "updated_at": 1760000000000}, {"id": "<random>", "updated_at": 1760000000000, "deleted": true}]}}
+{"servers": {"entries": [{"id": "<random>", "name": "Gwar", "address": "gwar.app", "kind": "gwar", "password": "<server password, if any>", "updated_at": 1760000000000}, {"id": "<random>", "updated_at": 1760000000000, "deleted": true}]}}
 ```
 
-- `kind` is `vc` or `teamspeak`; a TeamSpeak entry may name the TeamSpeak
+- `kind` is `gwar` or `teamspeak`; a TeamSpeak entry may name the TeamSpeak
   identity to use (`identity`, a `uid` from the `teamspeak` section).
   Limits: `id` 64, `name` 64, `address` 255, `password` 128 characters; a
   bookmark beyond them stays on its device.
@@ -116,7 +116,7 @@ the same list:
   90 days, so a device that still has it does not bring it back. Merging keeps
   the newer `updated_at` per `id` (the vault on a tie); bookmarks saved before
   syncing count as time 0. At most 100 entries; tombstones go first.
-- One server is saved once. Clients compare servers rather than spellings: a vc
+- One server is saved once. Clients compare servers rather than spellings: a Gwar
   address by the WebSocket URL it opens (`gwar.app` is `wss://gwar.app/ws`), or,
   once the device has connected, by the server's pinned key, so another address
   of the same server matches too; a TeamSpeak address by `host:port`. Saving a
@@ -270,7 +270,7 @@ login and recovery are rate-limited per address and per handle.
 
 ## On Gwar servers
 
-The vc/4 `hello` has an optional `certificate` field:
+The gwar/4 `hello` has an optional `certificate` field:
 `{account_key, device_key, issued_at, expires_at, signature}`. With it,
 `client_signing_pk` must equal `device_key`; the uid comes from `account_key`.
 The server checks the certificate's signature, current validity and revocation
@@ -321,7 +321,7 @@ cursor are ignored, and a missing entry never clears a stored revocation.
 Connect can withhold the feed; its sequence numbers do not prove completeness.
 The core disconnects an ongoing session at certificate expiry with an explicit
 renewal reason, removes its subscriptions and voice routing, and closes its
-SFU transport. Issuance, vc/4 and message verifiers all enforce a 90-day maximum.
+SFU transport. Issuance, gwar/4 and message verifiers all enforce a 90-day maximum.
 
 A certificate proves key possession, not registration with Connect. After a
 device-authenticated hello, servers asynchronously look up the account key via
@@ -348,7 +348,7 @@ verified behind each handle and marks the handle as changed, not verified, when
 it shows up on a different account, until you accept that account in the
 member's profile ([security.md](security.md#handles-implemented)).
 Chat messages, edits and author deletions use the hello key and exact certificate,
-the vc/4-verified server key (independent of endpoint aliases), locally rebuilt
+the gwar/4-verified server key (independent of endpoint aliases), locally rebuilt
 conversation and account-derived UID. The v3 revision chain and netstring body
 are specified in [architecture.md](architecture.md#signed-messages-v3).
 Certificate validity is checked at each operation's signed time, including edits.

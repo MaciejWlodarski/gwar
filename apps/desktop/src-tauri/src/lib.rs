@@ -1,6 +1,6 @@
 //! Voice desktop shell: hosts the shared web UI in a Tauri window and
 //! provides the native pieces the browser cannot: the audio engine
-//! (`vc-client`), global shortcuts and the system tray.
+//! (`gwar-client`), global shortcuts and the system tray.
 
 pub mod fake_audio;
 mod files;
@@ -18,10 +18,10 @@ use tauri::{Manager, WindowEvent};
 /// release builds (the commands exist but answer with nothing).
 mod debug {
 
-    /// `VC_AUTOCONNECT="address|kind"` makes the UI connect on startup.
+    /// `GWAR_AUTOCONNECT="address|kind"` makes the UI connect on startup.
     #[tauri::command]
     pub fn debug_autoconnect() -> Option<String> {
-        if cfg!(debug_assertions) { std::env::var("VC_AUTOCONNECT").ok() } else { None }
+        if cfg!(debug_assertions) { std::env::var("GWAR_AUTOCONNECT").ok() } else { None }
     }
 
     #[tauri::command]
@@ -42,7 +42,7 @@ fn loggable_target(target: &str) -> bool {
 pub fn run() {
     use tracing_subscriber::{EnvFilter, filter::filter_fn, prelude::*};
     let env = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("warn,vc_desktop_lib=info,vc_client=info,ui=info"));
+        .unwrap_or_else(|_| EnvFilter::new("warn,gwar_desktop_lib=info,gwar_client=info,ui=info"));
     let _ = tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
@@ -137,7 +137,7 @@ mod log_tests {
         for target in ["sframe", "sframe::frame::encrypted_frame", "sframe::header"] {
             assert!(!super::loggable_target(target), "{target}");
         }
-        for target in ["vc_client::voice::sframe", "vc_desktop_lib", "sframes", "ui"] {
+        for target in ["gwar_client::voice::sframe", "gwar_desktop_lib", "sframes", "ui"] {
             assert!(super::loggable_target(target), "{target}");
         }
     }

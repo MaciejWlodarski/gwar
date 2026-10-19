@@ -73,7 +73,7 @@ fn hash(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 fn current_time(now: i64) -> Result<()> {
-    if !(0..=vc_proto::MAX_SAFE_INTEGER).contains(&now) {
+    if !(0..=gwar_proto::MAX_SAFE_INTEGER).contains(&now) {
         return Err(Invalid("time"));
     }
     Ok(())
@@ -416,7 +416,7 @@ impl Agent {
 
     pub fn new(seed: [u8; 32], credential: Credential, now: i64) -> Result<Self> {
         let signer = Self::signer(seed, &credential)?;
-        if !(1..=vc_proto::MAX_SAFE_INTEGER).contains(&now) {
+        if !(1..=gwar_proto::MAX_SAFE_INTEGER).contains(&now) {
             return Err(Invalid("time"));
         }
         let provider = Provider::default();
@@ -469,7 +469,7 @@ impl Agent {
             parse(stores.groups.get(b"@device".as_slice()).ok_or(Invalid("missing device record"))?)?;
         if device.version != 1
             || device.device_key != credential.device_key()
-            || !(1..=vc_proto::MAX_SAFE_INTEGER).contains(&device.created_at)
+            || !(1..=gwar_proto::MAX_SAFE_INTEGER).contains(&device.created_at)
             || device.hpke_public
                 != x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(device.hpke_private)).to_bytes()
         {
@@ -674,7 +674,7 @@ impl Agent {
         }
     }
     fn lifetime(&self, now: i64) -> Result<Lifetime> {
-        if !(0..=vc_proto::MAX_SAFE_INTEGER).contains(&now) || !self.credential.is_current(now, &()) {
+        if !(0..=gwar_proto::MAX_SAFE_INTEGER).contains(&now) || !self.credential.is_current(now, &()) {
             return Err(Invalid("certificate now"));
         }
         let start = now as u64 / 1000;

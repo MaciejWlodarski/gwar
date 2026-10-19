@@ -23,7 +23,7 @@ export function defaultNickname(): string {
 /** A one-time migration source; identity records become authoritative afterwards. */
 export function legacyNickname(): string | undefined {
   try {
-    const state = JSON.parse(localStorage.getItem("vc.settings") ?? "{}").state;
+    const state = JSON.parse(localStorage.getItem("gwar.settings") ?? "{}").state;
     const remembered = validNickname(state?.lastNickname);
     if (remembered) return remembered;
     for (const bookmark of state?.bookmarks ?? []) {

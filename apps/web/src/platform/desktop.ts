@@ -108,14 +108,14 @@ export function initDesktop(): (() => void) | undefined {
 }
 
 /**
- * Debug builds only: `VC_AUTOCONNECT="address|kind"` connects on startup
+ * Debug builds only: `GWAR_AUTOCONNECT="address|kind"` connects on startup
  * and reports progress to the Rust log, for automated verification.
  */
 async function debugAutoconnect(api: TauriBridge): Promise<void> {
   const spec = await api.invoke<string | null>("debug_autoconnect").catch(() => null);
   if (!spec) return;
-  const [address = "", kindName = "vc"] = spec.split("|");
-  const kind = kindName === "teamspeak" ? "teamspeak" : "vc";
+  const [address = "", kindName = "gwar"] = spec.split("|");
+  const kind = kindName === "teamspeak" ? "teamspeak" : "gwar";
   const log = (message: string) => void api.invoke("debug_log", { message }).catch(() => {});
 
   Object.assign(window, { __vc: { controller, useSettings, useSession, useVoice, useUi, api, log } });

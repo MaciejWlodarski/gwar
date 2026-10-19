@@ -12,11 +12,11 @@ const pins = (byEndpoint: Record<string, string>): PinStore => ({
 });
 
 describe("serverKey", () => {
-  it("treats every spelling of one vc address as one server", () => {
+  it("treats every spelling of one Gwar address as one server", () => {
     const same = ["gwar.app", " GWAR.app ", "gwar.app/", "wss://gwar.app/ws", "https://gwar.app", "gwar.app:443"];
     for (const page of [web, app]) {
       const keys = new Set(same.map((address) => serverKey({ address }, page, null)));
-      expect(keys).toEqual(new Set(["vc|wss://gwar.app/ws"]));
+      expect(keys).toEqual(new Set(["gwar|wss://gwar.app/ws"]));
     }
     expect(serverKey({ address: "voice.gwar.app" }, web, null)).not.toBe(serverKey({ address: "gwar.app" }, web, null));
     expect(serverKey({ address: "gwar.app/other" }, web, null)).not.toBe(serverKey({ address: "gwar.app" }, web, null));
@@ -32,16 +32,16 @@ describe("serverKey", () => {
   it("names a LAN server the same with or without the scheme typed", () => {
     expect(serverKey({ address: "192.168.1.10", insecureLan: true }, app, null)).toBe(serverKey({ address: "ws://192.168.1.10:8790/ws" }, app, null));
     // Even where it cannot be opened (a web page), the explicit address still names one server.
-    expect(serverKey({ address: "ws://192.168.1.10:8790/ws" }, web, null)).toBe("vc|ws://192.168.1.10:8790/ws");
-    expect(serverKey({ address: "not a server" }, web, null)).toBe("vc|not a server");
+    expect(serverKey({ address: "ws://192.168.1.10:8790/ws" }, web, null)).toBe("gwar|ws://192.168.1.10:8790/ws");
+    expect(serverKey({ address: "not a server" }, web, null)).toBe("gwar|not a server");
   });
 
   it("knows a server it has connected to by its pinned key under any address", () => {
     const store = pins({ "wss://gwar.app/ws": key, "wss://203.0.113.7/ws": key });
-    expect(serverKey({ address: "gwar.app" }, web, store)).toBe(`vc-key|${key}`);
-    expect(serverKey({ address: "203.0.113.7" }, web, store)).toBe(`vc-key|${key}`);
-    expect(serverKey({ address: "other.example" }, web, store)).toBe("vc|wss://other.example/ws");
+    expect(serverKey({ address: "gwar.app" }, web, store)).toBe(`gwar-key|${key}`);
+    expect(serverKey({ address: "203.0.113.7" }, web, store)).toBe(`gwar-key|${key}`);
+    expect(serverKey({ address: "other.example" }, web, store)).toBe("gwar|wss://other.example/ws");
     const broken: PinStore = { ...store, load: () => { throw new Error("invalid server pin"); } };
-    expect(serverKey({ address: "gwar.app" }, web, broken)).toBe("vc|wss://gwar.app/ws");
+    expect(serverKey({ address: "gwar.app" }, web, broken)).toBe("gwar|wss://gwar.app/ws");
   });
 });

@@ -13,7 +13,7 @@ and the web client working after every merge.
 
 1. **MLS core** (`crates/gwar-mls`): Gwar's rules on top of OpenMLS, for the
    web app (WebAssembly), the server and tests. No user-visible change.
-2. **Protocol `vc/4` and the delivery service**: key packages, group infos,
+2. **Protocol `gwar/4` and the delivery service**: key packages, group infos,
    ordered commits, the handshake log, server removal proposals; message
    statement and body v3 everywhere.
 3. **Encrypted direct messages**: stored, delivered to offline members,
@@ -130,7 +130,7 @@ All keys and signatures are canonical unpadded base64url. The uid is
 `uid_for_key(account_key)`, or `uid_for_key(device_key)` without an account.
 A credential is **well-formed** when it parses canonically (re-encoding gives
 the same bytes), the leaf's signature key equals `device_key`, and for an
-account: the certificate verifies as `gwar device v1` (vc-proto's
+account: the certificate verifies as `gwar device v1` (gwar-proto's
 `device_statement`), both times are safe integers and
 `0 < expires_at - issued_at <= 90 days`.
 
@@ -417,10 +417,10 @@ credential, the OpenMLS provider and Gwar's own per-group records.
   another commit wins, or the server answers `expired`, it is deleted and the
   join is built again from the newest GroupInfo.
 
-## 2. Protocol `vc/4` and the delivery service
+## 2. Protocol `gwar/4` and the delivery service
 
 `PROTOCOL_VERSION = 4`; the hello statement becomes `gwar client hello v4`.
-No compatibility with `vc/3`.
+No compatibility with `gwar/3`.
 
 ### Message statement and body v3
 
@@ -648,7 +648,7 @@ Encrypted attachments, channels and voice remain subsequent steps.
   (messages from TeamSpeak arrive through the bridge), and clients drop a
   plaintext direct message unless one of its two participants is a
   TeamSpeak user. Such a conversation is `dm_conversation(uid, ts_uid)`
-  with the TeamSpeak participant's `ts:…` id. The verifiers (`vc-proto`
+  with the TeamSpeak participant's `ts:…` id. The verifiers (`gwar-proto`
   `verify_message`, web `verifyMessage`) stop splitting a direct message's
   conversation on `:` and instead compare it with `dm_conversation` of its
   two known participants, the author being one of them and every Gwar
@@ -1122,10 +1122,10 @@ channels and server chat:
 - The server's mode (`plaintext`, or `encrypted` with history) is stored in
   `meta` and never changes once set. An existing database is set to
   `plaintext` by the migration. A new database gets it at the first start of
-  the server itself (`vc-server` serving, not administrative commands such as
+  the server itself (`gwar-server` serving, not administrative commands such as
   `admin-token`, which leave it unset): `plaintext`, with or without
   TeamSpeak compatibility, unless that start passes
-  `--encrypted-server-chat` (`VC_ENCRYPTED_SERVER_CHAT`), which makes it
+  `--encrypted-server-chat` (`GWAR_ENCRYPTED_SERVER_CHAT`), which makes it
   `encrypted`. The option is read only while the mode is unset; given
   later on a server whose stored mode is `plaintext`, it logs a warning and
   the mode stays (without the option, an encrypted server stays encrypted). From then on the stored mode decides:
@@ -1351,7 +1351,7 @@ implementation spec"; that list remains in the design.
 
 ### Wire and delivery (5a)
 
-All new operations use the existing authenticated `vc/4` request/reply/event
+All new operations use the existing authenticated `gwar/4` request/reply/event
 envelopes and generated Rust/TypeScript types. Binary fields are canonical
 unpadded base64url: `call` and `participation` 16 bytes; `group`,
 `channel_group` and `device` 32 bytes. `channel`, `leaf` and `ssrc` are u32
@@ -1838,7 +1838,7 @@ cannot relax key provenance, removal cutoff or the no-plaintext rule.
   takeover closes voice before releasing the old tab's lease. Post key
   material only on installation, never per frame or in React state/logs.
 - `apps/web/src/voice/native-engine.ts` relays the same contract to
-  `apps/desktop/src-tauri/src/voice.rs`; Rust `vc-client::voice` is the actual
+  `apps/desktop/src-tauri/src/voice.rs`; Rust `gwar-client::voice` is the actual
   encryptor/decryptor. Bind `voice_start`, `voice_answer`, `voice_stop`, key
   commands and asynchronous events to the current run; stale stop/answer
   cannot cancel a new run. Validate in both Tauri and the engine; return
@@ -1933,8 +1933,8 @@ physical audio or official-server acceptance.
   Require monotonic output and no extra buffer in plaintext/encrypted modes,
   plus TeamSpeak's independent packet-id/spurt clock and unchanged pairing.
 - **5b, official TeamSpeak in CI:** extend the existing
-  `cargo test -p vc-server --test teamspeak_channels -- --ignored --test-threads=1`
-  job using its checksum-verified official server and `VC_TS3_DIR`. The
+  `cargo test -p gwar-server --test teamspeak_channels -- --ignored --test-threads=1`
+  job using its checksum-verified official server and `GWAR_TS3_DIR`. The
   current permissions/locked-channel check is retained; add S6 audio/text
   probes with a working plaintext control for **each** route: moves during
   speech, delayed packets from before classification, grace-period and
@@ -2058,7 +2058,7 @@ Read against RFC 9605 and this section, then verified by an independent review
   frames up to a second past its window; both engines now sweep before
   choosing a key, and the web worker again after its asynchronous
   decryption (a frame whose decryption crossed the window is dropped).
-- **Native wrapper and IPC** (`vc-client` `sframe.rs`, `keys.rs`; desktop
+- **Native wrapper and IPC** (`gwar-client` `sframe.rs`, `keys.rs`; desktop
   `voice_set_keys`): the same contract on the fixed `sframe` 2.1.0 release;
   the IPC command is main-window only, bound to the run, size-checked before
   parsing, and wipes the exporter keys on every exit.
@@ -2239,10 +2239,10 @@ Three pull requests, in this order:
     genesis or a generation.
   - Other admin tokens never make an owner.
 - **Operator commands** run locally on the database, like the other
-  `vc-server` admin commands, with the server stopped:
-  - `vc-server owner set {uid}` sets the genesis only while there is no
+  `gwar-server` admin commands, with the server stopped:
+  - `gwar-server owner set {uid}` sets the genesis only while there is no
     owner, for a uid that is a stored member;
-  - `vc-server owner reset {uid}` (lost owner account) starts a new
+  - `gwar-server owner reset {uid}` (lost owner account) starts a new
     **generation**: it writes a new genesis with the generation incremented,
     and drops the chain, the confirmer anchor and the manager list of the old
     generation.

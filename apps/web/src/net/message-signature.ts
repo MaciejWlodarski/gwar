@@ -36,7 +36,7 @@ export function strictVerify(key: string, text: string, signature: string): bool
   } catch { return false; }
 }
 
-/** Mirrors vc_proto::canonical_message_body: byte lengths, never JS string lengths. */
+/** Mirrors gwar_proto::canonical_message_body: byte lengths, never JS string lengths. */
 export function canonicalMessageBody(text: string, mentions: string[], attachments: Attachment[]): Uint8Array {
   const uids = [...new Set(mentions)].sort((a, b) => {
     const x = enc.encode(a), y = enc.encode(b);
@@ -60,7 +60,7 @@ export function messageBodyHash(text: string, mentions: string[], attachments: A
   return sha256(canonicalMessageBody(text, mentions, attachments) as BufferSource);
 }
 
-/** Mirrors vc_proto::message_statement: exact UTF-8 fields and no trailing newline. */
+/** Mirrors gwar_proto::message_statement: exact UTF-8 fields and no trailing newline. */
 export function messageStatement(serverKey: string, target: string, authorUid: string, s: MessageSignature, hash: string): string {
   return `gwar message v3\n${serverKey}\n${target}\n${s.group_id}\n${s.epoch}\n${authorUid}\n${s.key}\n${s.certificate_hash}\n${s.message_id}\n${s.revision}\n${s.previous_revision_hash}\n${s.created_at}\n${s.signed_at}\n${hash}`;
 }

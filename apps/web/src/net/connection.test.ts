@@ -23,7 +23,7 @@ function make(overrides: Partial<ConnectionOptions> = {}) {
     pinStore: memoryPins(),
     identity: fakeIdentity,
     nickname: "Ann",
-    client: { name: "vc-web", version: "0.1.0", platform: "web" },
+    client: { name: "gwar-web", version: "0.1.0", platform: "web" },
     createSocket: (u) => new FakeSocket(u),
     random: () => 0.5,
     ...overrides,

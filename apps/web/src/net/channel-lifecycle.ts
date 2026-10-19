@@ -22,7 +22,7 @@ export interface ChannelLifecycle {
 export const MAX_IDS = 10_000;
 /** Servers whose records stay in memory. */
 const MAX_SERVERS = 64;
-const PREFIX = "vc.channels:";
+const PREFIX = "gwar.channels:";
 /** `unsaved`: storage does not hold what memory knows, so this record must never be dropped from memory. */
 type Record = { known: Set<number>; deleted: Set<number>; incomplete: boolean; unsaved: boolean };
 type Store = Pick<Storage, "getItem" | "setItem">;

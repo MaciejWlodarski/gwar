@@ -38,13 +38,13 @@ export function dbToLevel(db: number): number {
 type StartParams = Parameters<VoiceEngine["start"]>[0];
 
 /**
- * Desktop voice engine. Audio, Opus and WebRTC live in Rust (`vc-client`);
+ * Desktop voice engine. Audio, Opus and WebRTC live in Rust (`gwar-client`);
  * this class is a thin remote control for it. The SDP exchange still goes over
  * the UI's own WebSocket: Rust emits `voice://offer`, we send `voice.offer`
  * and return the answer with `voice_answer`.
  */
 export class NativeVoiceEngine implements VoiceEngine {
-  // SFrame runs in Rust (`vc_client::voice::sframe`); keys arrive through `voice_set_keys`.
+  // SFrame runs in Rust (`gwar_client::voice::sframe`); keys arrive through `voice_set_keys`.
   readonly capabilities: VoiceEngine["capabilities"] = { outputDeviceSelection: true, captureProcessing: false, encryptedVoice: async () => true };
 
   private handlers = new Map<string, Set<Handler>>();

@@ -1,5 +1,5 @@
 [package]
-name = "vc-desktop"
+name = "gwar-desktop"
 version = "0.1.1"
 description = "Voice desktop app (Tauri 2) with a native audio engine"
 edition.workspace = true
@@ -7,7 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [lib]
-name = "vc_desktop_lib"
+name = "gwar_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
@@ -19,8 +19,8 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 percent-encoding = "2"
-vc-client = { path = "../../../crates/vc-client" }
-vc-proto = { path = "../../../crates/vc-proto" }
+gwar-client = { path = "../../../crates/gwar-client" }
+gwar-proto = { path = "../../../crates/gwar-proto" }
 anyhow.workspace = true
 rtrb = "0.4"
 serde.workspace = true

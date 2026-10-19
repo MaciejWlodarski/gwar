@@ -140,7 +140,7 @@ fn open_bytes(c: &Context, key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vc_proto::{Attachment, MessageSignature};
+    use gwar_proto::{Attachment, MessageSignature};
     #[derive(Clone, Serialize)]
     struct Plaintext {
         text: String,

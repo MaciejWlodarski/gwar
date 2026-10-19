@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 # Archive manifests and transfers are checked as readers check them (docs/e2e-build.md, section 7).
 gwar-mls = { path = "../gwar-mls" }
-vc-proto = { path = "../vc-proto" }
+gwar-proto = { path = "../gwar-proto" }
 anyhow.workspace = true
 argon2 = "0.5"
 axum = "0.8"
@@ -33,7 +33,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-vc-proto = { path = "../vc-proto" }
+gwar-proto = { path = "../gwar-proto" }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
 aes-gcm = "0.10"

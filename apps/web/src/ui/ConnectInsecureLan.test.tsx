@@ -25,7 +25,7 @@ const show = async () => act(async () => { root.render(<TooltipProvider><Connect
 const choice = () => mock.connect.mock.calls.at(-1)![0];
 beforeEach(() => {
   vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true); mock.connect.mockReset(); mock.inputs.clear();
-  useSettings.setState({ language: 'en', lastAddress: 'a.lan', lastKind: 'vc', bookmarks: [{ id: 'a', name: 'A', address: 'a.lan', insecureLan: true }] });
+  useSettings.setState({ language: 'en', lastAddress: 'a.lan', lastKind: 'gwar', bookmarks: [{ id: 'a', name: 'A', address: 'a.lan', insecureLan: true }] });
   useConnectUi.setState({ busy: false, error: null, needPassword: false, invite: null });
   div = document.createElement('div'); document.body.appendChild(div); root = createRoot(div);
 });

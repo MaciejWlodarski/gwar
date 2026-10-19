@@ -19,7 +19,7 @@ interface SessionStore extends SessionState {
   address: string;
   /** What kind of server we are on (TeamSpeak servers lack history, tokens ...). */
   kind: ServerKind;
-  /** HTTP origin of the vc server (uploads, attachments); null on TeamSpeak. */
+  /** HTTP origin of the Gwar server (uploads, attachments); null on TeamSpeak. */
   httpOrigin: string | null;
   /** Names this connection to the desktop's native file commands; a command carrying an older one is refused. */
   fileSession: string | null;
@@ -39,7 +39,7 @@ export const useSession = create<SessionStore>()((set) => ({
   ...initialState,
   closeReason: null,
   address: "",
-  kind: "vc",
+  kind: "gwar",
   httpOrigin: null,
   fileSession: null,
   fileAccess: null,
@@ -50,7 +50,7 @@ export const useSession = create<SessionStore>()((set) => ({
   setFileSession: (fileSession, fileAccess = null) => set({ fileSession, fileAccess }),
   dispatch: (action) => set((s) => reduce(s, action)),
   setClose: (closeReason) => set({ closeReason }),
-  setAddress: (address, kind = "vc", httpOrigin = null) => set({ address, kind, httpOrigin }),
+  setAddress: (address, kind = "gwar", httpOrigin = null) => set({ address, kind, httpOrigin }),
 }));
 
 // -------------------------------------------------------------------- voice

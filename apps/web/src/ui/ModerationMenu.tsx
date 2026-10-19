@@ -30,15 +30,15 @@ export function ModerationItems({ person, groups }: { person: PersonRef; groups:
   const target = useSession((s) => (person.session !== undefined ? s.clients[person.session] : undefined));
   const canMuteHere = useChannelPermission(target?.channel ?? null, "mute_members");
   // TeamSpeak servers keep their own bans and roles: only kicking is offered there, as before.
-  const vc = kind === "vc";
+  const onGwar = kind === "gwar";
   // Only someone ranked below me (docs/roles.md).
-  const stronger = vc && !canActOn(me, rank, defs);
-  const showRename = vc && (isMe || (canRename && !stronger));
+  const stronger = onGwar && !canActOn(me, rank, defs);
+  const showRename = onGwar && (isMe || (canRename && !stronger));
   const showKick = !isMe && canKick && person.session !== undefined;
-  const showBan = !isMe && vc && canBan;
-  const showRoles = !isMe && vc && canGroups;
-  const showRemove = !isMe && vc && canRemove;
-  const showVoice = !isMe && vc && !!target && target.channel !== null && canMuteHere;
+  const showBan = !isMe && onGwar && canBan;
+  const showRoles = !isMe && onGwar && canGroups;
+  const showRemove = !isMe && onGwar && canRemove;
+  const showVoice = !isMe && onGwar && !!target && target.channel !== null && canMuteHere;
   if (!showRename && !showKick && !showBan && !showRoles && !showRemove && !showVoice) return null;
 
   const roles = orderedGroups(defs).filter((g) => g.id !== MEMBER_GROUP);

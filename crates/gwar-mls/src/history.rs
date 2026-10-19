@@ -69,8 +69,8 @@ impl DeviceHpkeKey {
     pub fn verify(&self) -> bool {
         fixed::<32>(&self.device_key).is_some()
             && fixed::<32>(&self.hpke_key).is_some()
-            && (0..=vc_proto::MAX_SAFE_INTEGER).contains(&self.created_at)
-            && vc_proto::signed_by(
+            && (0..=gwar_proto::MAX_SAFE_INTEGER).contains(&self.created_at)
+            && gwar_proto::signed_by(
                 &self.device_key,
                 &Self::statement(&self.device_key, &self.hpke_key, self.created_at),
                 &self.signature,
@@ -212,7 +212,7 @@ impl Chunk {
 
     /// Signed by the header's sender device key.
     pub fn verify(&self) -> bool {
-        vc_proto::signed_by(
+        gwar_proto::signed_by(
             &self.header.sender_device_key,
             &self.header.signed(&self.enc, &self.ciphertext),
             &b64(&self.signature),

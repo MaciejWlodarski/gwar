@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import vectors from "../../../../../crates/vc-client/tests/sframe-vectors.json";
-import interop from "../../../../../crates/vc-client/tests/sframe-interop.json";
+import vectors from "../../../../../crates/gwar-client/tests/sframe-vectors.json";
+import interop from "../../../../../crates/gwar-client/tests/sframe-interop.json";
 import { decodeHeader, encodeHeader } from "./header";
 import { Replay } from "./replay";
 import { voiceKid } from "./state";
@@ -69,7 +69,7 @@ describe("AES_128_GCM_SHA256_128 (RFC 9605 C.3, non-empty metadata)", () => {
   });
 });
 
-describe("Native interop (crates/vc-client/tests/sframe-interop.json)", () => {
+describe("Native interop (crates/gwar-client/tests/sframe-interop.json)", () => {
   it("seals the same bytes as the Rust engine and opens its frames", async () => {
     expect(interop.frames.length).toBe(4);
     for (const f of interop.frames) {

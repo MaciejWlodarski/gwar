@@ -73,7 +73,7 @@ export function MemberProfileDialog({ uid, fallback }: { uid: string; fallback: 
   const member = useSession((s) => s.members[uid]);
   const nickname = useMemberName(uid, fallback);
   const own = useSession((s) => s.me?.uid === uid);
-  const vc = useSession((s) => s.kind === "vc");
+  const onGwar = useSession((s) => s.kind === "gwar");
   const canRename = usePermission("manage_members");
   const canViewAs = usePermission("manage_roles");
   const me = useMyWho();
@@ -124,17 +124,17 @@ export function MemberProfileDialog({ uid, fallback }: { uid: string; fallback: 
             </div>
           )}
         </Field>
-        {vc && (own || mayRename) && (
+        {onGwar && (own || mayRename) && (
           <Button onClick={() => useUi.getState().openDialog({ kind: "nickname", uid })}>
             <Pencil className="size-4" /> {t("nickname.change")}
           </Button>
         )}
-        {vc && canViewAs && (
+        {onGwar && canViewAs && (
           <Button onClick={() => useUi.getState().openDialog({ kind: "viewAs", uid })}>
             <Eye className="size-4" /> {t("viewAs.openMember")}
           </Button>
         )}
-        {vc && <TeamspeakLinks uid={uid} linked={member?.teamspeak ?? NO_LINKS} own={own} mayUnlink={own || mayRename} />}
+        {onGwar && <TeamspeakLinks uid={uid} linked={member?.teamspeak ?? NO_LINKS} own={own} mayUnlink={own || mayRename} />}
       </div>
     </Dialog>
   );

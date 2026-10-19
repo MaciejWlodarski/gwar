@@ -20,7 +20,7 @@ beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   useSettings.setState({ language: "en" });
   const lobby = welcome().channels[0]!;
-  useSession.setState({ kind: "vc", viewChannel: 7, channels: { 7: { ...lobby, id: 7, encrypted: true, history: true } }, members: {} });
+  useSession.setState({ kind: "gwar", viewChannel: 7, channels: { 7: { ...lobby, id: 7, encrypted: true, history: true } }, members: {} });
   container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
 });
 afterEach(async () => { await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals(); });

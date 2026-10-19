@@ -3,7 +3,7 @@
  * Real native 10 ms Opus -> Chromium playback, browser -> native playback,
  * and speaker reassignment on the same receive slot. Loopback services only.
  *
- * Build once: cargo build -p vc-client --example web_audio
+ * Build once: cargo build -p gwar-client --example web_audio
  * Run: pnpm --filter web e2e:native-audio
  * JSON snapshots, SDP, process logs and generated fake-mic WAV are retained in
  * target/web-audio/<run>. The default takes about 30 s, excluding builds.
@@ -253,7 +253,7 @@ async function main() {
   const nativeBin = path.resolve(repoRoot, process.env.E2E_AUDIO_FIXTURE ?? "target/debug/examples/web_audio");
   assert(nativeBin.startsWith(path.join(repoRoot, "target") + path.sep), "fixture must be built in this checkout's target directory");
   report.fixture = path.relative(repoRoot, nativeBin);
-  assert(existsSync(nativeBin), "build the fixture first: cargo build -p vc-client --example web_audio");
+  assert(existsSync(nativeBin), "build the fixture first: cargo build -p gwar-client --example web_audio");
   report.fixtureSha256 = createHash("sha256").update(readFileSync(nativeBin)).digest("hex");
   report.harnessSha256 = createHash("sha256").update(readFileSync(fileURLToPath(import.meta.url))).digest("hex");
   const webUrl = `http://127.0.0.1:${await port()}`;

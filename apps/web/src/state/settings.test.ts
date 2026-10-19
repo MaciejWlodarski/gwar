@@ -7,14 +7,14 @@ it("drops bookmark nicknames without losing bookmarks, credentials, identity cho
     version: 1,
     state: {
       lastAddress: "voice.example.com",
-      lastKind: "vc",
+      lastKind: "gwar",
       bookmarks: [
-        { id: "gwar", name: "Gwar", address: "voice.example.com", kind: "vc", nickname: "  Łucja  ", password: "secret" },
+        { id: "gwar", name: "Gwar", address: "voice.example.com", kind: "gwar", nickname: "  Łucja  ", password: "secret" },
         { id: "ts", name: "TS", address: "ts.example.com", kind: "teamspeak", nickname: "Other", identity: "ts-uid" },
       ],
     },
   };
-  const storage = new Map([["vc.settings", JSON.stringify(before)]]);
+  const storage = new Map([["gwar.settings", JSON.stringify(before)]]);
   const browserStorage = { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value), removeItem: (key: string) => storage.delete(key) };
   vi.stubGlobal("localStorage", browserStorage);
   vi.stubGlobal("window", { localStorage: browserStorage });
@@ -22,12 +22,12 @@ it("drops bookmark nicknames without losing bookmarks, credentials, identity cho
   const { useSettings } = await import("./settings");
   expect(useSettings.getState().lastNickname).toBe("Łucja");
   expect(useSettings.getState().bookmarks).toEqual(before.state.bookmarks.map(({ nickname: _nickname, ...bookmark }) => bookmark));
-  const saved = JSON.parse(storage.get("vc.settings")!);
+  const saved = JSON.parse(storage.get("gwar.settings")!);
   expect(saved.state.bookmarks).toEqual(useSettings.getState().bookmarks);
   expect(saved.state.lastNickname).toBe("Łucja");
   const { legacyNickname } = await import("../net/nickname");
   expect(legacyNickname()).toBe("Łucja");
-  useSettings.getState().setLast("new.example.com", "vc");
+  useSettings.getState().setLast("new.example.com", "gwar");
   expect(useSettings.getState().lastNickname).toBe("Łucja");
 });
 
@@ -41,7 +41,7 @@ it("times only synced changes, remembers removals and forgets them when the serv
   try {
     const { useSettings } = await import("./settings");
     const s = () => useSettings.getState();
-    s().saveBookmark({ id: "a", name: "A", address: "a.example.com", kind: "vc" });
+    s().saveBookmark({ id: "a", name: "A", address: "a.example.com", kind: "gwar" });
     expect(s().bookmarks[0]?.updatedAt).toBe(1_000);
     expect(s().bookmarkEdits).toBe(1);
 
@@ -59,15 +59,15 @@ it("times only synced changes, remembers removals and forgets them when the serv
     expect(s().bookmarks).toEqual([]);
     expect(s().removedBookmarks).toEqual({ a: { at: 3_000 } });
 
-    s().replaceBookmarks([{ id: "b", name: "B", address: "b.example.com", kind: "vc", updatedAt: 5 }]);
+    s().replaceBookmarks([{ id: "b", name: "B", address: "b.example.com", kind: "gwar", updatedAt: 5 }]);
     expect(s().bookmarkEdits).toBe(3);
-    s().saveBookmark({ id: "a", name: "A", address: "a.example.com", kind: "vc" });
+    s().saveBookmark({ id: "a", name: "A", address: "a.example.com", kind: "gwar" });
     expect(s().removedBookmarks).toEqual({});
     expect(s().bookmarks.map((b) => b.id)).toEqual(["b", "a"]);
 
     // A synced bookmark from a device whose clock is ahead: edits and removals here still come after it.
-    s().replaceBookmarks([{ id: "c", name: "C", address: "c.example.com", kind: "vc", updatedAt: 9_000, account: "acct" }]);
-    s().saveBookmark({ id: "c", name: "C2", address: "c.example.com", kind: "vc" });
+    s().replaceBookmarks([{ id: "c", name: "C", address: "c.example.com", kind: "gwar", updatedAt: 9_000, account: "acct" }]);
+    s().saveBookmark({ id: "c", name: "C2", address: "c.example.com", kind: "gwar" });
     expect(s().bookmarks[0]).toMatchObject({ name: "C2", updatedAt: 9_001, account: "acct" });
     s().removeBookmark("c");
     expect(s().removedBookmarks).toEqual({ c: { at: 9_002, account: "acct" } });
@@ -100,13 +100,13 @@ it("keeps one bookmark per server: on load, when saving, when editing and after 
     version: 1,
     state: {
       bookmarks: [
-        { id: "a", name: "Gwar", address: "gwar.app", kind: "vc" },
-        { id: "b", name: "Gwar invite", address: "wss://gwar.app/ws", kind: "vc", password: "secret" },
+        { id: "a", name: "Gwar", address: "gwar.app", kind: "gwar" },
+        { id: "b", name: "Gwar invite", address: "wss://gwar.app/ws", kind: "gwar", password: "secret" },
         { id: "ts", name: "TS", address: "gwar.app", kind: "teamspeak" },
       ],
     },
   };
-  const storage = new Map([["vc.settings", JSON.stringify(before)]]);
+  const storage = new Map([["gwar.settings", JSON.stringify(before)]]);
   const browserStorage = { getItem: (key: string) => storage.get(key) ?? null, setItem: (key: string, value: string) => storage.set(key, value), removeItem: (key: string) => storage.delete(key) };
   vi.stubGlobal("localStorage", browserStorage);
   vi.stubGlobal("window", { localStorage: browserStorage });
@@ -118,20 +118,20 @@ it("keeps one bookmark per server: on load, when saving, when editing and after 
     // A list saved before servers were matched: the first stays, with the password only the other had
     // (timed as a change, so syncing keeps it), and the other is removed so syncing removes it elsewhere
     // too. Another kind is another server.
-    expect(s().bookmarks).toEqual([{ id: "a", name: "Gwar", address: "gwar.app", kind: "vc", password: "secret", updatedAt: 1_000 }, before.state.bookmarks[2]]);
+    expect(s().bookmarks).toEqual([{ id: "a", name: "Gwar", address: "gwar.app", kind: "gwar", password: "secret", updatedAt: 1_000 }, before.state.bookmarks[2]]);
     expect(s().removedBookmarks).toEqual({ b: { at: 1_000 } });
     expect(s().bookmarkEdits).toBe(1);
 
     // Saving a saved server again (another spelling) updates that bookmark in its place, keeping what
     // the new entry leaves unsaid: its address and its password.
-    s().saveBookmark({ id: "new", name: "Renamed", address: "GWAR.app:443", kind: "vc" });
+    s().saveBookmark({ id: "new", name: "Renamed", address: "GWAR.app:443", kind: "gwar" });
     expect(s().bookmarks.map((b) => [b.id, b.name, b.address, b.password])).toEqual([["a", "Renamed", "gwar.app", "secret"], ["ts", "TS", "gwar.app", undefined]]);
     // A name that is just the address is no name.
-    s().saveBookmark({ id: "new2", name: "gwar.app", address: "gwar.app", kind: "vc" });
+    s().saveBookmark({ id: "new2", name: "gwar.app", address: "gwar.app", kind: "gwar" });
     expect(s().bookmarks[0]?.name).toBe("Renamed");
 
     // Editing a bookmark into another saved server replaces that one.
-    s().saveBookmark({ id: "c", name: "C", address: "c.example.com", kind: "vc" });
+    s().saveBookmark({ id: "c", name: "C", address: "c.example.com", kind: "gwar" });
     vi.setSystemTime(2_000);
     s().saveBookmark({ ...s().bookmarks.find((b) => b.id === "c")!, address: "wss://gwar.app/ws" });
     expect(s().bookmarks.map((b) => b.id)).toEqual(["ts", "c"]);
@@ -157,7 +157,7 @@ it("keeps one bookmark per server: on load, when saving, when editing and after 
     s().replaceBookmarks([
       { id: "hidden", name: "Q", address: "q.example.com", password: "theirs", account: "other", updatedAt: 5 },
     ]);
-    s().saveBookmark({ id: "mine", name: "Q", address: "wss://q.example.com/ws", kind: "vc" });
+    s().saveBookmark({ id: "mine", name: "Q", address: "wss://q.example.com/ws", kind: "gwar" });
     expect(s().bookmarks.map((b) => [b.id, b.password])).toEqual([["hidden", "theirs"], ["mine", undefined]]);
     expect(s().removedBookmarks.hidden).toBeUndefined();
   } finally {
@@ -168,8 +168,8 @@ it("keeps one bookmark per server: on load, when saving, when editing and after 
 it("two devices that keep different twins of one server still end with one bookmark", async () => {
   const { mergeServers, fromBookmark } = await import("../connect/servers");
   const { dedupeBookmarks } = await import("./settings");
-  const a = { id: "a", name: "Short", address: "gwar.app", kind: "vc" as const, account: "acct", updatedAt: 10 };
-  const b = { id: "b", name: "Long", address: "wss://gwar.app/ws", kind: "vc" as const, account: "acct", updatedAt: 20 };
+  const a = { id: "a", name: "Short", address: "gwar.app", kind: "gwar" as const, account: "acct", updatedAt: 10 };
+  const b = { id: "b", name: "Long", address: "wss://gwar.app/ws", kind: "gwar" as const, account: "acct", updatedAt: 20 };
   vi.useFakeTimers({ now: 1_000 });
   try {
     // Each device prefers the one clicked; the second decides later.

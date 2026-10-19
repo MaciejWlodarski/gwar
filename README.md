@@ -311,10 +311,10 @@ Prebuilt apps are on the [GitHub Releases page](https://github.com/MaciejWlodars
   Linux (`.AppImage` or `.deb`). Builds may be unsigned: macOS and Windows then
   warn at the first start, and [docs/releasing.md](docs/releasing.md) shows how
   to open them anyway.
-- **Server:** `vc-server` and `gwar-connect` for Linux x86-64 and ARM64
+- **Server:** `gwar-server` and `gwar-connect` for Linux x86-64 and ARM64
   (`gwar-server-*.tar.gz`), so you do not need Rust to run your own. Unpack and
-  continue with "Run a server" below, using `./vc-server` instead of
-  `./target/release/vc-server`.
+  continue with "Run a server" below, using `./gwar-server` instead of
+  `./target/release/gwar-server`.
 
 `SHA256SUMS` on each release lists the checksum of every built file, and
 `SHA256SUMS.minisig` signs it with the release key in
@@ -331,8 +331,8 @@ desktop app. The web app is served over HTTPS, so browsers can only reach
 servers that have HTTPS too, which the server can do on its own:
 
 ```bash
-cargo build --release -p vc-server
-./target/release/vc-server --data-dir data --domain voice.example.com --acme-email you@example.com
+cargo build --release -p gwar-server
+./target/release/gwar-server --data-dir data --domain voice.example.com --acme-email you@example.com
 ```
 
 With `--domain` the server gets a certificate from Let's Encrypt and renews it
@@ -347,15 +347,15 @@ Other useful options: `--max-clients` (128 by default), `--server-password`,
 `--ice-servers` (a JSON file of TURN servers for clients behind strict
 firewalls), and upload limits `--upload-limit-mb` (25 MiB per file),
 `--upload-quota-mb` (1 GiB per member) and `--storage-limit-mb` (10 GiB in
-total). The server options also have `VC_…` environment variables;
-`vc-server --help` lists them all.
+total). The server options also have `GWAR_…` environment variables;
+`gwar-server --help` lists them all.
 
 On first start the server prints a one-time **admin token**; open the web app,
 connect to `voice.example.com` and redeem it from the server menu ("Use
-token"). Get another one with `vc-server --data-dir data admin-token`.
+token"). Get another one with `gwar-server --data-dir data admin-token`.
 Whoever redeems that first token becomes the server's **owner**, who decides
 who manages private channels; later admin tokens grant Admin only. With the
-server stopped, `vc-server --data-dir data owner set {uid}` names the owner of
+server stopped, `gwar-server --data-dir data owner set {uid}` names the owner of
 a server that has none, and `owner reset {uid}` replaces a lost owner account
 (clients ask before accepting the change).
 
@@ -371,7 +371,7 @@ port and path), so the server accepts only the addresses you configure:
 - `--domain`: `wss://<domain>/ws` for each domain;
 - `--public-url`: the same host and port as `ws(s)://…/ws`;
 - `--public-endpoint`: any full address, repeatable, including alias paths
-  (or comma-separated `VC_PUBLIC_ENDPOINTS`);
+  (or comma-separated `GWAR_PUBLIC_ENDPOINTS`);
 - `--public-ip`: a global unicast IP adds `wss://<ip>[:port]/ws` with the
   actual listening port (omitted for 443), but only when the server terminates
   TLS itself (behind a proxy use `--public-url` or `--public-endpoint`).
@@ -384,10 +384,10 @@ link-local IPs are never added automatically. For local development, list
 loopback explicitly:
 
 ```bash
-vc-server --public-endpoint ws://127.0.0.1:8790/ws
+gwar-server --public-endpoint ws://127.0.0.1:8790/ws
 ```
 
-`--insecure-any-host` (`VC_INSECURE_ANY_HOST`) accepts any address with a loud
+`--insecure-any-host` (`GWAR_INSECURE_ANY_HOST`) accepts any address with a loud
 warning. It gives up the protection against relayed logins, even for pinned
 servers, so use it only for isolated development and tests.
 
@@ -396,7 +396,7 @@ servers, so use it only for isolated development and tests.
 Set the public URL and the header your proxy puts the client's address in:
 
 ```bash
-vc-server --http 127.0.0.1:8800 --public-url https://voice.example.com --client-ip-header x-real-ip
+gwar-server --http 127.0.0.1:8800 --public-url https://voice.example.com --client-ip-header x-real-ip
 ```
 
 With nginx that is `proxy_set_header X-Real-IP $remote_addr;`. The header is
@@ -407,17 +407,17 @@ believed only from loopback, so name one the proxy always overwrites.
 On first start the server creates `server-key.ed25519` in its data directory
 (an Ed25519 seed, mode 0600 on Unix). It is the server's identity: clients pin
 it, and invite links and the server menu's **Server key** show its
-fingerprint, the full public key (`vc-server --data-dir data server-key`
+fingerprint, the full public key (`gwar-server --data-dir data server-key`
 prints it). **Back it up with the database and never share it**; with a new
 key clients see a new server and have to confirm the change with you.
 
 Back up the database while the server runs with
-`vc-server --data-dir data backup copy.sqlite3`.
+`gwar-server --data-dir data backup copy.sqlite3`.
 
 ### Server-wide chat
 
 Server-wide chat is plaintext and live-only by default. On the first serving
-start of a new server, `--encrypted-server-chat` (`VC_ENCRYPTED_SERVER_CHAT`)
+start of a new server, `--encrypted-server-chat` (`GWAR_ENCRYPTED_SERVER_CHAT`)
 chooses encrypted server chat with history permanently. Administrative commands
 such as `admin-token` do not choose its mode. Existing servers stay plaintext;
 a conflicting flag warns and keeps the stored mode. Encrypted server chat stays
@@ -440,17 +440,17 @@ settings. Removing is not a ban: the member's record, roles and read marks go
 member. The same works from the command line, straight on the database:
 
 ```bash
-vc-server --data-dir data members list [--inactive-days 90]
-vc-server --data-dir data members prune --inactive-days 90 --dry-run
-vc-server --data-dir data members prune --inactive-days 90 [--include-grouped] [--delete-messages]
-vc-server --data-dir data members remove [--delete-messages] [--dry-run] -- <uid>...
-vc-server --data-dir data members merge [--dry-run] -- <from-uid> <into-uid>
+gwar-server --data-dir data members list [--inactive-days 90]
+gwar-server --data-dir data members prune --inactive-days 90 --dry-run
+gwar-server --data-dir data members prune --inactive-days 90 [--include-grouped] [--delete-messages]
+gwar-server --data-dir data members remove [--delete-messages] [--dry-run] -- <uid>...
+gwar-server --data-dir data members merge [--dry-run] -- <from-uid> <into-uid>
 ```
 
 - `list` (with each member's tag and confirmed handle) and the `--dry-run` of
   `prune` and `remove` are safe while the server runs. A real `prune` or
   `remove`, and `merge` even with `--dry-run`, need the server stopped: it
-  holds `data/vc.lock`, and the commands refuse to run while it does.
+  holds `data/gwar.lock`, and the commands refuse to run while it does.
 - `prune` keeps members with a role besides Member unless `--include-grouped`
   is given.
 - `merge` moves one identity's unsigned messages (and the mentions in them),
@@ -473,7 +473,7 @@ rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.129 --locked
 npm install --prefix .build-tools --no-audit --no-fund binaryen@123.0.0
 WASM_OPT=.build-tools/node_modules/.bin/wasm-opt scripts/mls-wasm/build.sh
-cargo run -p vc-server -- --data-dir data --public-endpoint ws://localhost:8790/ws --public-endpoint ws://127.0.0.1:8790/ws --public-endpoint ws://localhost:5173/ws --public-endpoint ws://127.0.0.1:5173/ws
+cargo run -p gwar-server -- --data-dir data --public-endpoint ws://localhost:8790/ws --public-endpoint ws://127.0.0.1:8790/ws --public-endpoint ws://localhost:5173/ws --public-endpoint ws://127.0.0.1:5173/ws
 pnpm --filter web dev                            # web app on http://localhost:5173
 pnpm --filter desktop dev                        # desktop app
 ```
@@ -526,11 +526,11 @@ feature (`teamspeak`, on by default); build without it with
 
 | Path | What it is |
 | --- | --- |
-| `crates/vc-server` | Server: core (state, permissions, SQLite), WebSocket gateway, WebRTC SFU, TeamSpeak bridge |
-| `crates/vc-proto` | The `vc/4` protocol (Rust types, generated TypeScript types) |
+| `crates/gwar-server` | Server: core (state, permissions, SQLite), WebSocket gateway, WebRTC SFU, TeamSpeak bridge |
+| `crates/gwar-proto` | The `gwar/4` protocol (Rust types, generated TypeScript types) |
 | `crates/gwar-mls` | End-to-end encryption: Gwar's rules on top of OpenMLS, the device agent, the key archive |
 | `crates/gwar-mls-wasm` | `gwar-mls` for the web app (WebAssembly) |
-| `crates/vc-client` | Native client: protocol, voice engine, TeamSpeak mode |
+| `crates/gwar-client` | Native client: protocol, voice engine, TeamSpeak mode |
 | `crates/gwar-connect` | Gwar Connect, the optional account service |
 | `apps/web` | The shared UI (React): the hosted web app and the desktop app's UI |
 | `apps/desktop` | Tauri 2 desktop app: native voice, global push-to-talk, tray |
@@ -549,9 +549,9 @@ cargo test --workspace          # includes end-to-end WebRTC voice tests
 pnpm --filter web test          # UI unit tests
 pnpm --filter web e2e           # Playwright: two users against a local server and Connect
 pnpm --filter web e2e:mls       # encrypted groups in the browser (also e2e:dm, e2e:private, e2e:archive);
-                                # needs the wasm build and `cargo build -p vc-server -p gwar-connect`
-VC_TS3_DIR=/tmp/ts3 cargo test -p vc-client --test teamspeak_mode --test teamspeak_interop -- --test-threads=1
-                                # against the real TeamSpeak server (downloaded into VC_TS3_DIR)
+                                # needs the wasm build and `cargo build -p gwar-server -p gwar-connect`
+GWAR_TS3_DIR=/tmp/ts3 cargo test -p gwar-client --test teamspeak_mode --test teamspeak_interop -- --test-threads=1
+                                # against the real TeamSpeak server (downloaded into GWAR_TS3_DIR)
 ```
 
 ## Roadmap

@@ -74,7 +74,7 @@ export function dmKey(uid: string): StoredThreadKey {
 
 /** Late sealed results must not bring back an unavailable conversation. */
 function unavailableSealed(state: SessionState, thread: string): boolean {
-  return thread === "server" ? !sealedThread(thread, "vc", state.channels, state.server?.server_chat)
+  return thread === "server" ? !sealedThread(thread, "gwar", state.channels, state.server?.server_chat)
     : thread.startsWith("ch:") && !state.channels[Number(thread.slice(3))];
 }
 
@@ -583,11 +583,11 @@ export function reduce(state: SessionState, action: Action): SessionState {
         next = withThread(next, channelThreadKey(u.channel), (t) => ({ ...t, unread: u.count, mentions: 0, lastRead: u.last_read }));
       }
       for (const [key, thread] of Object.entries(next.threads)) {
-        if (sealedThread(key, "vc", channels, w.server.server_chat)) next.threads[key] = { ...thread, loaded: false, unread: 0, mentions: 0, securing: true };
+        if (sealedThread(key, "gwar", channels, w.server.server_chat)) next.threads[key] = { ...thread, loaded: false, unread: 0, mentions: 0, securing: true };
       }
       for (const u of w.conversations ?? []) {
         const key = conversationThread(u.conversation, w.uid);
-        if (!key || !sealedThread(key, "vc", channels, w.server.server_chat)) continue;
+        if (!key || !sealedThread(key, "gwar", channels, w.server.server_chat)) continue;
         const peer = key.startsWith("dm:") ? key.slice(3) : null;
         next = withThread(next, key, t => ({ ...t, unread: u.count, lastRead: u.last_read, securing: true,
           ...(peer ? { peer: { uid: peer, name: members[peer]?.nickname ?? t.peer?.name ?? peer } } : {}) }));

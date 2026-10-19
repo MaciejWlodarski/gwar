@@ -1,0 +1,3057 @@
+//! SQLite persistence. Owned by the core actor; every call is a short local
+//! transaction, so it runs inline rather than on a blocking pool.
+
+pub mod mls;
+mod sealed;
+
+use std::{collections::BTreeMap, path::Path};
+
+use anyhow::{Context, Result, bail};
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
+use gwar_proto::{
+    Attachment, Ban, BanId, ChannelId, ChatMessage, ChatTarget, FileId, Group, GroupId, HandleAttestation, Invite,
+    Member, MessageId, Permission, TAG_MIN_LEN, UNREAD_CAP, Uid,
+};
+use rusqlite::{Connection, OptionalExtension, params};
+use sha2::{Digest, Sha256};
+
+/// Expired attestations never reach a wire member, including offline/history lookups.
+fn read_attestation(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<Option<HandleAttestation>> {
+    let json: Option<String> = row.get(column)?;
+    let a = json
+        .map(|s| serde_json::from_str::<HandleAttestation>(&s))
+        .transpose()
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, Box::new(e)))?;
+    Ok(a.filter(|a| a.expires_at > crate::core::now_ms()))
+}
+
+pub const ADMIN_GROUP: GroupId = 1;
+pub const MEMBER_GROUP: GroupId = 2;
+/// Member's stored position: after every other role.
+const MEMBER_POSITION: i64 = i64::MAX;
+
+#[derive(Debug, Clone, Default)]
+pub struct ChannelRow {
+    pub id: ChannelId,
+    pub parent: Option<ChannelId>,
+    pub name: String,
+    pub topic: String,
+    pub position: i32,
+    /// Argon2 hash of the password's TeamSpeak wire form (see `core::passwords`).
+    pub password_hash: Option<String>,
+    pub max_clients: Option<u32>,
+    /// End-to-end encrypted chat (sealed messages), fixed at creation.
+    pub encrypted: bool,
+    /// New members see earlier messages; always false for plaintext channels.
+    pub history: bool,
+    /// Hidden from everyone it does not admit (docs/e2e-build.md, section 6).
+    pub private: bool,
+    /// Who a private channel admits besides admins; `None` for public channels.
+    pub access: Option<gwar_proto::ChannelAccess>,
+    /// This channel's own overrides (docs/roles.md).
+    pub overrides: Vec<gwar_proto::ChannelOverride>,
+    /// A subchannel that uses its parent's overrides.
+    pub synced: bool,
+}
+
+/// What linking a TeamSpeak identity did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Link {
+    /// Linked now. `member`: a member `ts:<uid>` gave `groups` roles and the overrides in
+    /// these channels to the target and was removed.
+    Linked { member: bool, groups: usize, overrides: Vec<ChannelId> },
+    /// Already linked to this member.
+    Already,
+    /// The member has [`MAX_TEAMSPEAK_LINKS`] identities linked: nothing changed.
+    TooMany,
+    /// Linked to another member: nothing changed.
+    Elsewhere,
+}
+
+/// At most this many TeamSpeak identities link to one member (clients accept a member with as many).
+pub const MAX_TEAMSPEAK_LINKS: i64 = 64;
+
+/// In what imports last wrote for channels, `from`'s member overrides become `into`'s, except where
+/// `into` has one already (that one stays): exactly what the overrides themselves went through.
+fn move_import_overrides(tx: &Connection, from: &str, into: &str) -> Result<()> {
+    let pattern = format!("%{}%", serde_json::to_string(from)?.trim_matches('"'));
+    let mut stmt =
+        tx.prepare("SELECT source,ts_id,written FROM ts_imports WHERE kind='channel' AND written LIKE ?1")?;
+    // `ts_id` is whatever the import stored (a TeamSpeak channel id): carried back as is.
+    let rows: Vec<(String, rusqlite::types::Value, String)> =
+        stmt.query_map([pattern], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+    for (source, ts_id, written) in rows {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&written) else { continue };
+        let Some(overrides) = value.get_mut("overrides").and_then(|o| o.as_array_mut()) else { continue };
+        let user = |o: &serde_json::Value, uid: &str| o.get("user").and_then(|u| u.as_str()) == Some(uid);
+        if overrides.iter().any(|o| user(o, into)) {
+            overrides.retain(|o| !user(o, from));
+        } else {
+            for o in overrides.iter_mut().filter(|o| user(o, from)) {
+                o["user"] = serde_json::Value::String(into.to_owned());
+            }
+        }
+        tx.execute(
+            "UPDATE ts_imports SET written=?3 WHERE source=?1 AND kind='channel' AND ts_id=?2",
+            params![source, ts_id, value.to_string()],
+        )?;
+    }
+    Ok(())
+}
+
+/// A store transaction. Inside another one (`Store::atomically`) it is a savepoint of that one
+/// instead, so the outer transaction decides whether anything is kept. Dropped without `commit`, it
+/// rolls back.
+pub struct Tx<'a> {
+    db: &'a Connection,
+    nested: bool,
+    done: bool,
+}
+
+impl std::ops::Deref for Tx<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.db
+    }
+}
+
+impl Tx<'_> {
+    /// Keeps the work; if that fails, dropping the guard still rolls it back.
+    pub fn commit(mut self) -> rusqlite::Result<()> {
+        self.db.execute_batch(if self.nested { "RELEASE gwar_nested" } else { "COMMIT" })?;
+        self.done = true;
+        Ok(())
+    }
+
+    pub fn rollback(mut self) -> rusqlite::Result<()> {
+        self.undo()?;
+        self.done = true;
+        Ok(())
+    }
+
+    fn undo(&self) -> rusqlite::Result<()> {
+        self.db.execute_batch(if self.nested { "ROLLBACK TO gwar_nested; RELEASE gwar_nested" } else { "ROLLBACK" })
+    }
+}
+
+impl Drop for Tx<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = self.undo();
+        }
+    }
+}
+
+/// A TeamSpeak identity's uid as a member uid: `ts:<uid>`.
+pub fn is_teamspeak(uid: &str) -> bool {
+    uid.len() > 3 && uid.starts_with("ts:")
+}
+
+#[derive(Debug, Clone)]
+pub struct UserRow {
+    pub id: i64,
+    pub groups: Vec<GroupId>,
+    pub nickname: String,
+}
+
+/// A stored member with what the maintenance tools need to judge them.
+#[derive(Debug, Clone)]
+pub struct MemberRow {
+    pub id: i64,
+    pub member: Member,
+    /// Stored channel and sealed messages written by this member.
+    pub messages: u32,
+}
+
+impl MemberRow {
+    /// Whether the member holds a role besides the default one.
+    pub fn has_roles(&self) -> bool {
+        self.member.groups.iter().any(|g| *g != MEMBER_GROUP)
+    }
+}
+
+/// What deleting a member took with it, for the caller to announce and clean up.
+#[derive(Debug, Default)]
+pub struct Removal {
+    /// Deleted messages and the channels they were in.
+    pub messages: Vec<(MessageId, ChannelId)>,
+    /// Deleted sealed messages, grouped by conversation for participant-only announcements.
+    pub sealed: BTreeMap<String, Vec<MessageId>>,
+    /// Files to remove from disk (then [`Store::forget_removed`]).
+    pub files: Vec<FileId>,
+    /// Channels where the member had an override (removed with them).
+    pub overrides: Vec<ChannelId>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("files must be distinct, finished, unattached sealed uploads of this author (at most 10)")]
+pub struct InvalidFiles;
+
+pub struct Store {
+    db: Connection,
+}
+
+const MIGRATIONS: &[&str] = &[
+    r#"
+    CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE channels (
+        id INTEGER PRIMARY KEY,
+        parent INTEGER REFERENCES channels(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        topic TEXT NOT NULL DEFAULT '',
+        position INTEGER NOT NULL DEFAULT 0,
+        password_hash TEXT,
+        max_clients INTEGER
+    );
+    CREATE TABLE groups (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        permissions TEXT NOT NULL
+    );
+    CREATE TABLE users (
+        id INTEGER PRIMARY KEY,
+        uid TEXT NOT NULL UNIQUE,
+        public_key TEXT NOT NULL,
+        nickname TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_seen INTEGER NOT NULL
+    );
+    CREATE TABLE user_groups (
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+        PRIMARY KEY (user_id, group_id)
+    );
+    CREATE TABLE tokens (
+        token_hash TEXT PRIMARY KEY,
+        group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+        created_at INTEGER NOT NULL
+    );
+    CREATE TABLE messages (
+        id INTEGER PRIMARY KEY,
+        channel INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        author_uid TEXT NOT NULL,
+        author_name TEXT NOT NULL,
+        text TEXT NOT NULL,
+        sent_at INTEGER NOT NULL
+    );
+    CREATE INDEX messages_by_channel ON messages(channel, id);
+"#,
+    r#"
+    CREATE TABLE read_marks (
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        channel INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        message INTEGER NOT NULL,
+        PRIMARY KEY (user_id, channel)
+    );
+"#,
+    r#"
+    ALTER TABLE groups ADD COLUMN color TEXT;
+    ALTER TABLE messages ADD COLUMN edited_at INTEGER;
+    CREATE TABLE message_mentions (
+        message INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+        uid TEXT NOT NULL,
+        PRIMARY KEY (message, uid)
+    );
+    CREATE INDEX mentions_by_uid ON message_mentions(uid, message);
+    CREATE TABLE files (
+        id TEXT PRIMARY KEY,
+        uploader TEXT NOT NULL,
+        name TEXT NOT NULL,
+        mime TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        width INTEGER,
+        height INTEGER,
+        created_at INTEGER NOT NULL,
+        message INTEGER REFERENCES messages(id) ON DELETE SET NULL
+    );
+    CREATE INDEX files_by_message ON files(message);
+    CREATE TABLE bans (
+        id INTEGER PRIMARY KEY,
+        uid TEXT,
+        ip TEXT,
+        nickname TEXT NOT NULL,
+        reason TEXT,
+        by TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER
+    );
+    CREATE TABLE invites (
+        code TEXT PRIMARY KEY,
+        group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL,
+        max_uses INTEGER,
+        uses INTEGER NOT NULL DEFAULT 0,
+        expires_at INTEGER,
+        created_by TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+"#,
+    r#"
+    CREATE TABLE revoked_devices (
+        device_key TEXT PRIMARY KEY,
+        account_key TEXT NOT NULL,
+        revoked_at INTEGER NOT NULL
+    );
+"#,
+    // Member removal and pruning look people up by uid and by last visit.
+    // `users.last_seen` has been set on every connect and disconnect since the
+    // first version, so there is nothing to add; the backfill only repairs rows
+    // a crash or restart left behind: a member who wrote a message after their
+    // recorded last visit was evidently here then, so `last_seen` rises to
+    // their newest message. It never goes down.
+    r#"
+    CREATE INDEX messages_by_author ON messages(author_uid, id);
+    CREATE INDEX files_by_uploader ON files(uploader);
+    CREATE INDEX users_by_last_seen ON users(last_seen);
+    UPDATE users SET last_seen = MAX(last_seen, COALESCE((SELECT MAX(sent_at) FROM messages WHERE author_uid = users.uid), 0));
+"#,
+    r#"
+    ALTER TABLE users ADD COLUMN connect_handle TEXT;
+    ALTER TABLE users ADD COLUMN connect_checked_at INTEGER;
+"#,
+    r#"
+    ALTER TABLE users RENAME COLUMN connect_checked_at TO connect_next_check;
+    UPDATE users SET connect_next_check=NULL;
+"#,
+    r#"
+    ALTER TABLE users ADD COLUMN connect_attestation TEXT;
+    UPDATE users SET connect_next_check=NULL;
+"#,
+    // Revocations authorize an account/device pair, never a device key alone.
+    r#"
+    ALTER TABLE revoked_devices RENAME TO revoked_devices_old;
+    CREATE TABLE revoked_devices (
+        device_key TEXT NOT NULL,
+        account_key TEXT NOT NULL,
+        revoked_at INTEGER NOT NULL,
+        signature TEXT,
+        PRIMARY KEY(account_key,device_key)
+    );
+    INSERT INTO revoked_devices(device_key,account_key,revoked_at)
+        SELECT device_key,account_key,revoked_at FROM revoked_devices_old;
+    DROP TABLE revoked_devices_old;
+    "#,
+    r#"
+    ALTER TABLE messages ADD COLUMN signature TEXT;
+    ALTER TABLE files ADD COLUMN sha256 TEXT NOT NULL DEFAULT '';
+    ALTER TABLE files ADD COLUMN position INTEGER NOT NULL DEFAULT 0;
+"#,
+    r#"
+    CREATE TABLE message_identities (
+        server_key TEXT NOT NULL, author_uid TEXT NOT NULL, message_id TEXT NOT NULL,
+        PRIMARY KEY(server_key, author_uid, message_id)
+    );
+    "#,
+    // Message ids never repeat, even after the newest message is deleted:
+    // clients keep removed messages and refuse a different message under the same id.
+    r#"
+    CREATE TABLE message_counter (id INTEGER PRIMARY KEY CHECK (id = 0), last INTEGER NOT NULL);
+    INSERT INTO message_counter VALUES (0, COALESCE((SELECT MAX(id) FROM messages), 0));
+    "#,
+    // Channel ids never repeat either: signed messages name `channel:{id}`, so a recreated
+    // channel must not inherit the context of a deleted one.
+    r#"
+    CREATE TABLE channel_counter (id INTEGER PRIMARY KEY CHECK (id = 0), last INTEGER NOT NULL);
+    INSERT INTO channel_counter VALUES (0, COALESCE((SELECT MAX(id) FROM channels), 0));
+    "#,
+    // Invites belong to the identity that made them; `created_by` is only the name shown.
+    // Older invites have no owner and are left to server managers.
+    r#"
+    ALTER TABLE invites ADD COLUMN creator_uid TEXT;
+    "#,
+    // Who made a token, so it grants only while they still could; NULL: the server itself
+    // (the first admin token, `gwar-server admin-token`). Older tokens have no known maker and
+    // would pass as the server's, so they lapse; `admin-token` issues a new one.
+    r#"
+    ALTER TABLE tokens ADD COLUMN creator_uid TEXT;
+    DELETE FROM tokens;
+    "#,
+    // A file whose row is deleted stays charged to its uploader until its bytes are gone from
+    // disk, so space that could not be freed is never handed out again.
+    r#"
+    CREATE TABLE removed_files (id TEXT PRIMARY KEY, uploader TEXT NOT NULL, size INTEGER NOT NULL);
+    CREATE TRIGGER files_removed AFTER DELETE ON files BEGIN
+        INSERT OR REPLACE INTO removed_files(id,uploader,size) VALUES(old.id, old.uploader, old.size);
+    END;
+    "#,
+    r#"
+    CREATE TABLE mls_devices (device_key TEXT PRIMARY KEY, uid TEXT NOT NULL, hpke_key TEXT NOT NULL, created_at INTEGER NOT NULL, signature TEXT NOT NULL);
+    CREATE INDEX mls_devices_by_uid ON mls_devices(uid, device_key);
+    CREATE TABLE mls_key_packages (ref TEXT PRIMARY KEY, device_key TEXT NOT NULL, uid TEXT NOT NULL, package BLOB NOT NULL, last_resort INTEGER NOT NULL, not_after INTEGER NOT NULL);
+    CREATE INDEX mls_packages_by_device ON mls_key_packages(uid, device_key, last_resort, not_after, ref);
+    CREATE UNIQUE INDEX mls_last_resort ON mls_key_packages(device_key) WHERE last_resort=1;
+    CREATE TABLE mls_groups (group_id TEXT PRIMARY KEY, conversation TEXT NOT NULL, incarnation INTEGER NOT NULL, epoch INTEGER NOT NULL, committed_at INTEGER NOT NULL, group_info BLOB NOT NULL, observer BLOB NOT NULL, created_at INTEGER NOT NULL, UNIQUE(conversation, incarnation));
+    CREATE TABLE mls_log (group_id TEXT NOT NULL REFERENCES mls_groups(group_id) ON DELETE CASCADE, epoch INTEGER NOT NULL, proposals TEXT NOT NULL, "commit" BLOB NOT NULL, committed_at INTEGER NOT NULL, PRIMARY KEY(group_id, epoch));
+    CREATE TABLE mls_leaves (group_id TEXT NOT NULL REFERENCES mls_groups(group_id) ON DELETE CASCADE, leaf INTEGER NOT NULL, device_key TEXT NOT NULL, uid TEXT NOT NULL, PRIMARY KEY(group_id, leaf), UNIQUE(group_id, device_key));
+    CREATE TABLE mls_welcomes (id TEXT PRIMARY KEY, device_key TEXT NOT NULL, group_id TEXT NOT NULL REFERENCES mls_groups(group_id) ON DELETE CASCADE, welcome BLOB NOT NULL, created_at INTEGER NOT NULL);
+    CREATE INDEX mls_welcomes_by_device ON mls_welcomes(device_key, id);
+    CREATE TABLE mls_proposals (group_id TEXT NOT NULL REFERENCES mls_groups(group_id) ON DELETE CASCADE, epoch INTEGER NOT NULL, leaf INTEGER NOT NULL, proposal BLOB NOT NULL, PRIMARY KEY(group_id, epoch, leaf));
+    CREATE TABLE mls_history_requests (group_id TEXT NOT NULL REFERENCES mls_groups(group_id) ON DELETE CASCADE, device_key TEXT NOT NULL, requested_at INTEGER NOT NULL, PRIMARY KEY(group_id, device_key));
+    CREATE TABLE mls_history (id TEXT PRIMARY KEY, group_id TEXT NOT NULL REFERENCES mls_groups(group_id) ON DELETE CASCADE, recipient_device TEXT NOT NULL, sender_uid TEXT NOT NULL, first_epoch INTEGER NOT NULL, last_epoch INTEGER NOT NULL, chunk BLOB NOT NULL, created_at INTEGER NOT NULL);
+    CREATE INDEX mls_history_by_recipient ON mls_history(recipient_device, id);
+    "#,
+    // v2 statements cannot be verified as v3. Preserve their bodies as unsigned history.
+    r#"
+    UPDATE messages SET signature=NULL WHERE signature IS NOT NULL AND
+        (json_type(signature, '$.group_id') IS NULL OR json_type(signature, '$.epoch') IS NULL);
+    "#,
+    r#"
+    ALTER TABLE mls_history ADD COLUMN chunk_hash BLOB;
+    CREATE INDEX mls_history_chunks ON mls_history(group_id, recipient_device, sender_uid);
+    CREATE INDEX mls_history_hashes ON mls_history(group_id, recipient_device, chunk_hash);
+    CREATE INDEX mls_history_group_inbox ON mls_history(recipient_device, group_id, id);
+    "#,
+    r#"
+    CREATE TABLE sealed_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation TEXT NOT NULL, group_id TEXT NOT NULL REFERENCES mls_groups(group_id),
+        author_uid TEXT NOT NULL, author_name TEXT NOT NULL, message_id TEXT NOT NULL,
+        revision INTEGER NOT NULL, epoch INTEGER NOT NULL, ciphertext BLOB NOT NULL,
+        sent_at INTEGER NOT NULL, edited_at INTEGER, deleted INTEGER NOT NULL,
+        UNIQUE(conversation,message_id)
+    );
+    CREATE INDEX sealed_by_conversation ON sealed_messages(conversation,id);
+    CREATE INDEX sealed_by_author ON sealed_messages(author_uid,id);
+    CREATE TABLE sealed_message_identities (conversation TEXT NOT NULL,message_id TEXT NOT NULL,PRIMARY KEY(conversation,message_id));
+    CREATE TABLE conversation_reads (
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        conversation TEXT NOT NULL, message INTEGER NOT NULL,PRIMARY KEY(user_id,conversation)
+    );
+    "#,
+    r#"
+    ALTER TABLE channels ADD COLUMN encrypted INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE channels ADD COLUMN history INTEGER NOT NULL DEFAULT 0;
+    "#,
+    // Both hard deletion and author tombstones remove files inside the message's transaction,
+    // including pruning and CLI maintenance. The existing files_removed trigger holds their charge.
+    r#"
+    ALTER TABLE files ADD COLUMN sealed INTEGER NOT NULL DEFAULT 0
+        CHECK(sealed IN (0,1) AND (sealed=0 OR message IS NULL));
+    ALTER TABLE files ADD COLUMN sealed_message INTEGER REFERENCES sealed_messages(id)
+        CHECK(sealed_message IS NULL OR (message IS NULL AND sealed=1));
+    CREATE INDEX files_by_sealed_message ON files(sealed_message);
+    CREATE TRIGGER sealed_files_removed BEFORE DELETE ON sealed_messages BEGIN
+        DELETE FROM files WHERE sealed_message=OLD.id;
+    END;
+    CREATE TRIGGER sealed_files_deleted AFTER UPDATE OF deleted ON sealed_messages WHEN NEW.deleted=1 BEGIN
+        DELETE FROM files WHERE sealed_message=NEW.id;
+    END;
+    "#,
+    // Channels are seeded by serving and users join by connecting; groups and
+    // meta rows are also written by administrative commands, before any serving.
+    r#"
+    INSERT INTO meta(key,value) SELECT 'server_chat','plaintext'
+    WHERE EXISTS(SELECT 1 FROM channels) OR EXISTS(SELECT 1 FROM users);
+    "#,
+    // Private channels: hidden from everyone their access (JSON roles and users) does not admit.
+    r#"
+    ALTER TABLE channels ADD COLUMN private INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE channels ADD COLUMN access TEXT;
+    "#,
+    // The owner chain and the managers (docs/e2e-build.md, section 6, 6b). The genesis is
+    // meta `owner_generation` and `owner_uid`; the first admin token is marked `first`.
+    r#"
+    ALTER TABLE tokens ADD COLUMN first INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE owner_links (
+        generation INTEGER NOT NULL,
+        seq INTEGER NOT NULL,
+        statement TEXT NOT NULL,
+        signature TEXT NOT NULL,
+        PRIMARY KEY (generation, seq)
+    );
+    CREATE TABLE manager_pair (
+        generation INTEGER PRIMARY KEY,
+        anchor BLOB NOT NULL,
+        list BLOB NOT NULL
+    );
+    "#,
+    // The newest member list each private channel group accepted (6c): live commits never go back.
+    r#"
+    CREATE TABLE mls_access (
+        group_id TEXT PRIMARY KEY,
+        seq INTEGER NOT NULL,
+        hash TEXT NOT NULL
+    );
+    "#,
+    // Ordered roles (docs/roles.md): the order from the top, Member always last.
+    r#"
+    ALTER TABLE groups ADD COLUMN position INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE groups ADD COLUMN hoist INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE groups ADD COLUMN mentionable INTEGER NOT NULL DEFAULT 0;
+    UPDATE groups SET position = id;
+    ALTER TABLE bans ADD COLUMN by_uid TEXT;
+    "#,
+    // Per-channel overrides (docs/roles.md): one row per role or member.
+    r#"
+    ALTER TABLE channels ADD COLUMN synced INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE channel_overrides (
+        channel INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+        role INTEGER REFERENCES groups(id) ON DELETE CASCADE,
+        user TEXT,
+        allow TEXT NOT NULL,
+        deny TEXT NOT NULL,
+        CHECK ((role IS NULL) <> (user IS NULL))
+    );
+    CREATE UNIQUE INDEX channel_overrides_target ON channel_overrides(channel, COALESCE(role, -1), COALESCE(user, ''));
+    "#,
+    // TeamSpeak import (docs/teamspeak-import.md): what each imported item became, so a second import
+    // updates it; and passwords typed for imported channels, until the bridge has set them.
+    r#"
+    CREATE TABLE ts_imports (
+        source TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        ts_id TEXT NOT NULL,
+        gwar_id INTEGER NOT NULL,
+        -- What the import last wrote there (JSON): a re-run updates only what nobody changed since.
+        written TEXT,
+        PRIMARY KEY (source, kind, ts_id)
+    );
+    CREATE TABLE ts_import_passwords (
+        channel INTEGER PRIMARY KEY REFERENCES channels(id) ON DELETE CASCADE,
+        password TEXT NOT NULL
+    );
+    "#,
+    // TeamSpeak identities linked to members (docs/teamspeak-import.md, "Linked TeamSpeak identities").
+    r#"
+    CREATE TABLE teamspeak_links (
+        teamspeak TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        linked_at INTEGER NOT NULL
+    );
+    CREATE INDEX teamspeak_links_user ON teamspeak_links(user_id);
+    -- TeamSpeak identities a ban of their member banned on TeamSpeak too (the bridge's banclient),
+    -- so lifting the ban lifts theirs even if they were unlinked meanwhile.
+    CREATE TABLE ban_teamspeak (
+        ban INTEGER NOT NULL,
+        teamspeak TEXT NOT NULL,
+        PRIMARY KEY (ban, teamspeak)
+    );
+    "#,
+];
+
+fn write_overrides(tx: &Connection, channel: ChannelId, overrides: &[gwar_proto::ChannelOverride]) -> Result<()> {
+    tx.execute("DELETE FROM channel_overrides WHERE channel=?1", [channel])?;
+    for o in overrides {
+        tx.execute(
+            "INSERT INTO channel_overrides(channel,role,user,allow,deny) VALUES(?1,?2,?3,?4,?5)",
+            params![channel, o.role, o.user, serde_json::to_string(&o.allow)?, serde_json::to_string(&o.deny)?],
+        )?;
+    }
+    Ok(())
+}
+
+/// The stored genesis of the current owner generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerGenesis {
+    pub generation: u64,
+    pub owner_uid: Uid,
+}
+
+fn access_json(row: &ChannelRow) -> Result<Option<String>> {
+    Ok(row.access.as_ref().map(serde_json::to_string).transpose()?)
+}
+
+/// References reassigned by a member merge (including ones already held by the target).
+#[derive(Debug, Default)]
+pub struct MergeReport {
+    pub messages: usize,
+    pub files: usize,
+    pub read_marks: usize,
+    pub groups: usize,
+    pub mentions: usize,
+    pub bans: usize,
+}
+
+const HISTORY_KEEP: i64 = 1000;
+
+impl Store {
+    /// Opens (and migrates) a database. A new one gets its channels only when
+    /// the server first starts ([`Store::seed_channels`]), not from administrative commands.
+    pub fn open(path: &Path) -> Result<Self> {
+        let db = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+        Self::init(db)
+    }
+
+    /// A database for tests and memory-only servers, with plaintext channels.
+    pub fn in_memory() -> Result<Self> {
+        let store = Self::init(Connection::open_in_memory()?)?;
+        store.seed_channels()?;
+        Ok(store)
+    }
+
+    fn init(db: Connection) -> Result<Self> {
+        // secure_delete: what is deleted (messages, passwords queued for the bridge) is overwritten.
+        db.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;",
+        )?;
+        let version: usize = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        for (index, migration) in MIGRATIONS.iter().enumerate().skip(version) {
+            let tx = db.unchecked_transaction()?;
+            tx.execute_batch(migration)?;
+            if migration.contains("ADD COLUMN chunk_hash") {
+                let mut stmt = tx.prepare("SELECT id,chunk FROM mls_history")?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let id: String = row.get(0)?;
+                    let chunk: Vec<u8> = row.get(1)?;
+                    tx.execute(
+                        "UPDATE mls_history SET chunk_hash=?2 WHERE id=?1",
+                        params![id, Sha256::digest(chunk).as_slice()],
+                    )?;
+                }
+                tx.execute("DELETE FROM mls_history WHERE rowid NOT IN (SELECT MIN(rowid) FROM mls_history GROUP BY group_id,recipient_device,chunk_hash)", [])?;
+            }
+            tx.pragma_update(None, "user_version", index + 1)?;
+            tx.commit()?;
+        }
+        let store = Self { db };
+        store.seed()?;
+        Ok(store)
+    }
+
+    fn seed(&self) -> Result<()> {
+        let has_groups: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM groups)", [], |r| r.get(0))?;
+        if !has_groups {
+            let all = serde_json::to_string(&[Permission::Administrator])?;
+            self.db.execute(
+                "INSERT INTO groups(id,name,permissions,position) VALUES(?1,'Admin',?2,0)",
+                params![ADMIN_GROUP, all],
+            )?;
+            self.db.execute(
+                "INSERT INTO groups(id,name,permissions,position) VALUES(?1,'Member','[]',?2)",
+                params![MEMBER_GROUP, MEMBER_POSITION],
+            )?;
+        }
+        self.upgrade_permission_names()?;
+        // Admin holds `administrator`, which is every permission, including ones added in later versions.
+        self.db.execute(
+            "UPDATE groups SET permissions=?2 WHERE id=?1",
+            params![ADMIN_GROUP, serde_json::to_string(&[Permission::Administrator])?],
+        )?;
+        if self.meta("member_channel_defaults")?.is_none() {
+            // Roles version 2, step 2: joining, talking and writing became permissions; members keep them.
+            let mut member = self.groups()?.into_iter().find(|g| g.id == MEMBER_GROUP).map(|g| g.permissions);
+            if let Some(permissions) = member.as_mut() {
+                for p in [Permission::Connect, Permission::Speak, Permission::SendMessages] {
+                    if !permissions.contains(&p) {
+                        permissions.push(p);
+                    }
+                }
+                self.db.execute(
+                    "UPDATE groups SET permissions=?2 WHERE id=?1",
+                    params![MEMBER_GROUP, serde_json::to_string(permissions)?],
+                )?;
+            }
+            self.set_meta("member_channel_defaults", "1")?;
+        }
+        if self.meta("member_defaults")?.is_none() {
+            // Members may invite and upload unless an admin takes it away.
+            let mut member = self.groups()?.into_iter().find(|g| g.id == MEMBER_GROUP).map(|g| g.permissions);
+            if let Some(permissions) = member.as_mut() {
+                for p in Permission::MEMBER_DEFAULT {
+                    if !permissions.contains(&p) {
+                        permissions.push(p);
+                    }
+                }
+                self.db.execute(
+                    "UPDATE groups SET permissions=?2 WHERE id=?1",
+                    params![MEMBER_GROUP, serde_json::to_string(permissions)?],
+                )?;
+            }
+            self.set_meta("member_defaults", "1")?;
+        }
+        Ok(())
+    }
+
+    /// Rewrites permission names from before roles version 2 (docs/roles.md) in place; unknown ones go.
+    fn upgrade_permission_names(&self) -> Result<()> {
+        let rows: Vec<(GroupId, String)> = {
+            let mut stmt = self.db.prepare("SELECT id,permissions FROM groups")?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+        };
+        for (id, stored) in rows {
+            let names: Vec<String> = serde_json::from_str(&stored).unwrap_or_default();
+            let mut permissions: Vec<Permission> = names
+                .iter()
+                .filter_map(|n| {
+                    serde_json::from_value(serde_json::Value::String(n.clone())).ok().or_else(|| Permission::from_v1(n))
+                })
+                .collect();
+            permissions.sort_unstable();
+            permissions.dedup();
+            let upgraded = serde_json::to_string(&permissions)?;
+            if upgraded != stored {
+                self.db.execute("UPDATE groups SET permissions=?2 WHERE id=?1", params![id, upgraded])?;
+            }
+        }
+        // Member stays last whatever the stored positions say.
+        self.db.execute("UPDATE groups SET position=?2 WHERE id=?1", params![MEMBER_GROUP, MEMBER_POSITION])?;
+        Ok(())
+    }
+
+    /// A new database's channels, at the server's first start.
+    /// A new database's channels, plaintext like every channel created without choosing encryption.
+    pub fn seed_channels(&self) -> Result<()> {
+        let has_channels: bool = self.db.query_row("SELECT EXISTS(SELECT 1 FROM channels)", [], |r| r.get(0))?;
+        if !has_channels {
+            let channel = |name: &str, position| {
+                self.create_channel(&ChannelRow {
+                    id: 0,
+                    parent: None,
+                    name: name.into(),
+                    topic: String::new(),
+                    position,
+                    password_hash: None,
+                    max_clients: None,
+                    encrypted: false,
+                    history: false,
+                    private: false,
+                    access: None,
+                    overrides: Vec::new(),
+                    synced: false,
+                })
+            };
+            let lobby = channel("Lobby", 0)?;
+            channel("General", 1)?;
+            channel("AFK", 2)?;
+            self.set_meta("default_channel", &lobby.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// A consistent copy of the database, safe while the server runs (for backups).
+    pub fn backup_to(&self, path: &Path) -> Result<()> {
+        self.db.execute("VACUUM INTO ?1", [path.to_string_lossy()])?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+
+    /// Moves everything from the write-ahead log into the database and empties the log, so
+    /// nothing deleted lingers there.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+        Ok(())
+    }
+
+    pub fn meta(&self, key: &str) -> Result<Option<String>> {
+        Ok(self.db.query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0)).optional()?)
+    }
+
+    /// Serving startup alone fixes the permanent mode; opening the store does not.
+    pub fn init_server_chat(&self, encrypted: bool) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO meta(key,value) VALUES('server_chat',?1) ON CONFLICT(key) DO NOTHING",
+            [if encrypted { "encrypted" } else { "plaintext" }],
+        )?;
+        let stored = self.server_chat()?;
+        if encrypted && !stored.encrypted {
+            tracing::warn!(
+                "--encrypted-server-chat only applies to a new server; keeping stored plaintext server chat"
+            );
+        }
+        Ok(())
+    }
+
+    pub fn server_chat(&self) -> Result<gwar_proto::ServerChat> {
+        let encrypted = match self.meta("server_chat")?.as_deref() {
+            None | Some("plaintext") => false,
+            Some("encrypted") => true,
+            Some(mode) => anyhow::bail!("invalid server chat mode: {mode}"),
+        };
+        Ok(gwar_proto::ServerChat { encrypted, history: encrypted })
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn channels(&self) -> Result<Vec<ChannelRow>> {
+        let mut stmt = self.db.prepare(
+            "SELECT id,parent,name,topic,position,password_hash,max_clients,encrypted,history,private,access,synced FROM channels ORDER BY position,id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ChannelRow {
+                id: r.get(0)?,
+                parent: r.get(1)?,
+                name: r.get(2)?,
+                topic: r.get(3)?,
+                position: r.get(4)?,
+                password_hash: r.get(5)?,
+                max_clients: r.get(6)?,
+                encrypted: r.get(7)?,
+                history: r.get(8)?,
+                private: r.get(9)?,
+                access: r.get::<_, Option<String>>(10)?.map(|json| serde_json::from_str(&json)).transpose().map_err(
+                    |e| rusqlite::Error::FromSqlConversionFailure(10, rusqlite::types::Type::Text, Box::new(e)),
+                )?,
+                synced: r.get(11)?,
+                overrides: Vec::new(),
+            })
+        })?;
+        let mut rows: Vec<ChannelRow> = rows.collect::<rusqlite::Result<_>>()?;
+        let mut overrides = self.channel_overrides()?;
+        for row in &mut rows {
+            row.overrides = overrides.remove(&row.id).unwrap_or_default();
+        }
+        Ok(rows)
+    }
+
+    fn channel_overrides(&self) -> Result<std::collections::HashMap<ChannelId, Vec<gwar_proto::ChannelOverride>>> {
+        let mut stmt =
+            self.db.prepare("SELECT channel,role,user,allow,deny FROM channel_overrides ORDER BY channel,rowid")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, ChannelId>(0)?, r.get(1)?, r.get(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?))
+        })?;
+        let mut out: std::collections::HashMap<ChannelId, Vec<gwar_proto::ChannelOverride>> = Default::default();
+        for row in rows {
+            let (channel, role, user, allow, deny) = row?;
+            out.entry(channel).or_default().push(gwar_proto::ChannelOverride {
+                role,
+                user,
+                allow: serde_json::from_str(&allow).unwrap_or_default(),
+                deny: serde_json::from_str(&deny).unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Replaces a channel's overrides.
+    pub fn set_channel_overrides(&self, channel: ChannelId, overrides: &[gwar_proto::ChannelOverride]) -> Result<()> {
+        let tx = self.begin()?;
+        write_overrides(&tx, channel, overrides)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// What an imported TeamSpeak item became (`kind`: role, channel, …) and what the import last
+    /// wrote there.
+    pub fn ts_import_record(
+        &self,
+        source: &str,
+        kind: &str,
+        ts_id: impl std::fmt::Display,
+    ) -> Result<Option<(i64, Option<String>)>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT gwar_id,written FROM ts_imports WHERE source=?1 AND kind=?2 AND ts_id=?3",
+                params![source, kind, ts_id.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Everything of `kind` an import from `source` made.
+    pub fn ts_import_targets(&self, source: &str, kind: &str) -> Result<Vec<i64>> {
+        let mut stmt = self.db.prepare("SELECT gwar_id FROM ts_imports WHERE source=?1 AND kind=?2")?;
+        let rows = stmt.query_map([source, kind], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn ts_import_target(&self, source: &str, kind: &str, ts_id: impl std::fmt::Display) -> Result<Option<i64>> {
+        Ok(self.ts_import_record(source, kind, ts_id)?.map(|(id, _)| id))
+    }
+
+    pub fn set_ts_import_record(
+        &self,
+        source: &str,
+        kind: &str,
+        ts_id: impl std::fmt::Display,
+        gwar_id: i64,
+        written: Option<&str>,
+    ) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO ts_imports(source,kind,ts_id,gwar_id,written) VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(source,kind,ts_id) DO UPDATE SET gwar_id=excluded.gwar_id,written=excluded.written",
+            params![source, kind, ts_id.to_string(), gwar_id, written],
+        )?;
+        Ok(())
+    }
+
+    /// Whether deleting a channel loses something: messages, subchannels, or an encrypted history.
+    pub fn channel_in_use(&self, channel: ChannelId) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE channel=?1) OR EXISTS(SELECT 1 FROM channels WHERE parent=?1)
+             OR EXISTS(SELECT 1 FROM channels WHERE id=?1 AND encrypted=1)",
+            [channel],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// A typed password for the bridge to set on the TeamSpeak side once (it needs the plain text).
+    pub fn queue_bridge_password(&self, channel: ChannelId, password: &str) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO ts_import_passwords(channel,password) VALUES(?1,?2)
+             ON CONFLICT(channel) DO UPDATE SET password=excluded.password",
+            params![channel, password],
+        )?;
+        Ok(())
+    }
+
+    /// The passwords waiting for the bridge.
+    pub fn bridge_passwords(&self) -> Result<Vec<(ChannelId, String)>> {
+        let mut stmt = self.db.prepare("SELECT channel,password FROM ts_import_passwords ORDER BY channel")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    /// Drops a queued password (set on TeamSpeak, or replaced in Gwar), leaving no copy behind.
+    /// Forgets whatever password `channel` has queued (its password changed in Gwar).
+    pub fn drop_bridge_password(&self, channel: ChannelId) -> Result<()> {
+        if self.db.execute("DELETE FROM ts_import_passwords WHERE channel=?1", [channel])? > 0 {
+            self.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    /// Forgets `channel`'s queued password once TeamSpeak has that one (a later queued one stays).
+    pub fn forget_bridge_password(&self, channel: ChannelId, password: &str) -> Result<()> {
+        let gone = self
+            .db
+            .execute("DELETE FROM ts_import_passwords WHERE channel=?1 AND password=?2", params![channel, password])?;
+        if gone > 0 {
+            self.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    /// Drops every queued password (a server without the bridge never sends them).
+    pub fn clear_bridge_passwords(&self) -> Result<()> {
+        if self.db.execute("DELETE FROM ts_import_passwords", [])? > 0 {
+            self.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    /// The next id from a counter that never goes back and never wraps: once `u32` ids run out, inserts fail.
+    fn next_id(&self, counter: &'static str) -> Result<u32> {
+        let id: Option<i64> = self
+            .db
+            .query_row(
+                &format!("UPDATE {counter} SET last = last + 1 WHERE id = 0 AND last < {} RETURNING last", u32::MAX),
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let id = id.ok_or_else(|| anyhow::anyhow!("{counter}: ids exhausted"))?;
+        Ok(u32::try_from(id)?)
+    }
+
+    pub fn insert_channel(
+        &self,
+        parent: Option<ChannelId>,
+        name: &str,
+        topic: &str,
+        position: i32,
+        password_hash: Option<&str>,
+        max_clients: Option<u32>,
+    ) -> Result<ChannelId> {
+        self.create_channel(&ChannelRow {
+            id: 0,
+            parent,
+            name: name.into(),
+            topic: topic.into(),
+            position,
+            password_hash: password_hash.map(Into::into),
+            max_clients,
+            encrypted: false,
+            history: false,
+            private: false,
+            access: None,
+            overrides: Vec::new(),
+            synced: false,
+        })
+    }
+
+    /// Inserts `row` under a new id (its own `id` is ignored).
+    pub fn create_channel(&self, row: &ChannelRow) -> Result<ChannelId> {
+        let id = self.next_id("channel_counter")?;
+        self.db.execute(
+            "INSERT INTO channels(id,parent,name,topic,position,password_hash,max_clients,encrypted,history,private,access,synced) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![id, row.parent, row.name, row.topic, row.position, row.password_hash, row.max_clients, row.encrypted, row.history && row.encrypted, row.private, access_json(row)?, row.synced],
+        )?;
+        if !row.overrides.is_empty() {
+            self.set_channel_overrides(id, &row.overrides)?;
+        }
+        Ok(id)
+    }
+
+    /// The row and its overrides in one transaction.
+    pub fn update_channel(&self, row: &ChannelRow) -> Result<()> {
+        let tx = self.begin()?;
+        tx.execute(
+            "UPDATE channels SET parent=?2,name=?3,topic=?4,position=?5,password_hash=?6,max_clients=?7,access=?8,synced=?9 WHERE id=?1",
+            params![row.id, row.parent, row.name, row.topic, row.position, row.password_hash, row.max_clients, access_json(row)?, row.synced],
+        )?;
+        write_overrides(&tx, row.id, &row.overrides)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Deletes the channel and, through the foreign key cascade, its subtree and history,
+    /// with the encrypted conversations of every deleted channel in the same transaction:
+    /// their MLS groups (with log, Welcomes, requests and history chunks), sealed messages and read marks.
+    pub fn delete_channel(&self, id: ChannelId) -> Result<()> {
+        let tx = self.begin()?;
+        let conversations: Vec<String> = tx
+            .prepare(
+                "WITH RECURSIVE doomed(id) AS (SELECT ?1 UNION SELECT c.id FROM channels c JOIN doomed d ON c.parent=d.id)
+                 SELECT 'channel:' || id FROM doomed",
+            )?
+            .query_map([id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for conversation in &conversations {
+            tx.execute("DELETE FROM sealed_messages WHERE conversation=?1", [conversation])?;
+            tx.execute("DELETE FROM sealed_message_identities WHERE conversation=?1", [conversation])?;
+            tx.execute("DELETE FROM conversation_reads WHERE conversation=?1", [conversation])?;
+            tx.execute("DELETE FROM mls_groups WHERE conversation=?1", [conversation])?;
+        }
+        tx.execute("DELETE FROM channels WHERE id=?1", [id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every role, from the top: Admin's position first, Member last; `position` is the index.
+    pub fn groups(&self) -> Result<Vec<Group>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT id,name,permissions,color,hoist,mentionable FROM groups ORDER BY id=?1, position, id")?;
+        let rows = stmt.query_map([MEMBER_GROUP], |r| {
+            Ok((
+                r.get::<_, GroupId>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get(3)?,
+                r.get::<_, bool>(4)?,
+                r.get::<_, bool>(5)?,
+            ))
+        })?;
+        rows.enumerate()
+            .map(|(index, row)| {
+                let (id, name, permissions, color, hoist, mentionable) = row?;
+                Ok(Group {
+                    id,
+                    name,
+                    permissions: serde_json::from_str(&permissions).unwrap_or_default(),
+                    color,
+                    position: index as u32,
+                    hoist,
+                    mentionable,
+                })
+            })
+            .collect()
+    }
+
+    /// A new role goes last above Member.
+    pub fn insert_group(
+        &self,
+        name: &str,
+        permissions: &[Permission],
+        color: Option<&str>,
+        hoist: bool,
+        mentionable: bool,
+    ) -> Result<GroupId> {
+        self.db.execute(
+            "INSERT INTO groups(name,permissions,color,hoist,mentionable,position)
+             VALUES(?1,?2,?3,?4,?5,(SELECT COALESCE(MAX(position),0)+1 FROM groups WHERE id<>?6))",
+            params![name, serde_json::to_string(permissions)?, color, hoist, mentionable, MEMBER_GROUP],
+        )?;
+        Ok(self.db.last_insert_rowid() as GroupId)
+    }
+
+    pub fn update_group(&self, group: &Group) -> Result<()> {
+        self.db.execute(
+            "UPDATE groups SET name=?2,permissions=?3,color=?4,hoist=?5,mentionable=?6 WHERE id=?1",
+            params![
+                group.id,
+                group.name,
+                serde_json::to_string(&group.permissions)?,
+                group.color,
+                group.hoist,
+                group.mentionable
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Stores the order of every role but Member, from the top.
+    pub fn reorder_groups(&self, order: &[GroupId]) -> Result<()> {
+        let tx = self.begin()?;
+        for (index, id) in order.iter().enumerate() {
+            tx.execute("UPDATE groups SET position=?2 WHERE id=?1", params![id, index as i64])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_group(&self, id: GroupId) -> Result<()> {
+        self.db.execute("DELETE FROM groups WHERE id=?1", [id])?;
+        Ok(())
+    }
+
+    pub fn user_by_uid(&self, uid: &str) -> Result<Option<(i64, Member)>> {
+        let row = self
+            .db
+            .query_row("SELECT id,nickname,last_seen,connect_attestation FROM users WHERE uid=?1", [uid], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, read_attestation(r, 3)?))
+            })
+            .optional()?;
+        let Some((id, nickname, last_seen, connect)) = row else { return Ok(None) };
+        let tag = self.member_tags()?.remove(uid).unwrap_or_default();
+        let teamspeak = self.teamspeak_links_of(id)?;
+        Ok(Some((
+            id,
+            Member { uid: uid.to_owned(), nickname, tag, connect, groups: self.user_groups(id)?, last_seen, teamspeak },
+        )))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn raw(&self) -> &Connection {
+        &self.db
+    }
+
+    /// The groups of the member `uid`, `None` if there is no such member.
+    pub fn groups_of(&self, uid: &str) -> Result<Option<Vec<GroupId>>> {
+        let id = self.db.query_row("SELECT id FROM users WHERE uid=?1", [uid], |r| r.get::<_, i64>(0)).optional()?;
+        id.map(|id| self.user_groups(id)).transpose()
+    }
+
+    pub fn set_user_groups(&self, user_id: i64, groups: &[GroupId]) -> Result<()> {
+        let tx = self.begin()?;
+        tx.execute("DELETE FROM user_groups WHERE user_id=?1", [user_id])?;
+        for group in groups {
+            tx.execute("INSERT INTO user_groups(user_id,group_id) VALUES(?1,?2)", params![user_id, group])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Records a connecting identity, keeping its existing nickname.
+    pub fn touch_user(&self, uid: &str, public_key: &str, nickname: &str, now: i64) -> Result<UserRow> {
+        self.db.execute(
+            "INSERT INTO users(uid,public_key,nickname,created_at,last_seen) VALUES(?1,?2,?3,?4,?4)
+             ON CONFLICT(uid) DO UPDATE SET last_seen=excluded.last_seen",
+            params![uid, public_key, nickname, now],
+        )?;
+        let (id, nickname) = self.db.query_row("SELECT id,nickname FROM users WHERE uid=?1", [uid], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        Ok(UserRow { id, groups: self.user_groups(id)?, nickname })
+    }
+
+    pub fn user_groups(&self, user_id: i64) -> Result<Vec<GroupId>> {
+        let mut stmt = self.db.prepare("SELECT group_id FROM user_groups WHERE user_id=?1 ORDER BY group_id")?;
+        let rows = stmt.query_map([user_id], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn add_user_group(&self, user_id: i64, group: GroupId) -> Result<()> {
+        self.db
+            .execute("INSERT OR IGNORE INTO user_groups(user_id,group_id) VALUES(?1,?2)", params![user_id, group])?;
+        Ok(())
+    }
+
+    pub fn insert_token(&self, token_hash: &str, group: GroupId, creator: Option<&str>, now: i64) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO tokens(token_hash,group_id,created_at,creator_uid) VALUES(?1,?2,?3,?4)",
+            params![token_hash, group, now, creator],
+        )?;
+        Ok(())
+    }
+
+    /// Consumes a single-use token, returning the group it grants and who made it.
+    pub fn redeem_token(&self, token_hash: &str) -> Result<Option<(GroupId, Option<String>)>> {
+        Ok(self.redeem_token_marked(token_hash)?.map(|(group, creator, _)| (group, creator)))
+    }
+
+    /// Like [`Store::redeem_token`], also telling whether it was the first admin token.
+    pub fn redeem_token_marked(&self, token_hash: &str) -> Result<Option<(GroupId, Option<String>, bool)>> {
+        Ok(self
+            .db
+            .query_row(
+                "DELETE FROM tokens WHERE token_hash=?1 RETURNING group_id,creator_uid,first",
+                [token_hash],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    /// Marks the first admin token: its redeemer becomes the owner while there is none.
+    pub fn mark_first_token(&self, token_hash: &str) -> Result<()> {
+        self.db.execute("UPDATE tokens SET first=1 WHERE token_hash=?1", [token_hash])?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------ owner
+
+    pub fn owner_genesis(&self) -> Result<Option<OwnerGenesis>> {
+        let (Some(generation), Some(owner_uid)) = (self.meta("owner_generation")?, self.meta("owner_uid")?) else {
+            return Ok(None);
+        };
+        Ok(Some(OwnerGenesis { generation: generation.parse()?, owner_uid }))
+    }
+
+    /// Grants `group` and, for the first admin token while there is no owner, makes the user the
+    /// owner (generation 1) in the same transaction. Returns whether they became the owner.
+    pub fn grant_token_group(&self, user_id: i64, uid: &str, group: GroupId, first: bool) -> Result<bool> {
+        let tx = self.begin()?;
+        tx.execute("INSERT OR IGNORE INTO user_groups(user_id,group_id) VALUES(?1,?2)", params![user_id, group])?;
+        let owned = tx.query_row("SELECT 1 FROM meta WHERE key='owner_generation'", [], |_| Ok(())).optional()?;
+        let becomes = first && group == ADMIN_GROUP && owned.is_none();
+        if becomes {
+            tx.execute("INSERT INTO meta(key,value) VALUES('owner_generation','1')", [])?;
+            tx.execute("INSERT INTO meta(key,value) VALUES('owner_uid',?1)", [uid])?;
+        }
+        tx.commit()?;
+        Ok(becomes)
+    }
+
+    /// `gwar-server owner set`: the genesis of generation 1, only while there is no owner, for a
+    /// stored member.
+    pub fn set_owner(&self, uid: &str) -> Result<()> {
+        let tx = self.begin()?;
+        if tx.query_row("SELECT 1 FROM meta WHERE key='owner_generation'", [], |_| Ok(())).optional()?.is_some() {
+            anyhow::bail!("this server already has an owner; use `owner reset` for a lost owner account");
+        }
+        let user: i64 = tx
+            .query_row("SELECT id FROM users WHERE uid=?1", [uid], |r| r.get(0))
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("no member with uid {uid}"))?;
+        tx.execute("INSERT INTO meta(key,value) VALUES('owner_generation','1')", [])?;
+        tx.execute("INSERT INTO meta(key,value) VALUES('owner_uid',?1)", [uid])?;
+        tx.execute("INSERT OR IGNORE INTO user_groups(user_id,group_id) VALUES(?1,?2)", params![user, ADMIN_GROUP])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// `gwar-server owner reset`: a new generation with `uid` as its genesis owner; drops the old
+    /// generation's chain, anchor and list. Returns the new generation.
+    pub fn reset_owner(&self, uid: &str) -> Result<u64> {
+        let tx = self.begin()?;
+        let user: i64 = tx
+            .query_row("SELECT id FROM users WHERE uid=?1", [uid], |r| r.get(0))
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("no member with uid {uid}"))?;
+        let current: Option<String> =
+            tx.query_row("SELECT value FROM meta WHERE key='owner_generation'", [], |r| r.get(0)).optional()?;
+        let generation = current.map(|g| g.parse::<u64>()).transpose()?.unwrap_or(0) + 1;
+        let set = "INSERT INTO meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value";
+        tx.execute(set, params!["owner_generation", generation.to_string()])?;
+        tx.execute(set, params!["owner_uid", uid])?;
+        tx.execute("DELETE FROM owner_links WHERE generation<?1", [generation as i64])?;
+        tx.execute("DELETE FROM manager_pair WHERE generation<?1", [generation as i64])?;
+        tx.execute("INSERT OR IGNORE INTO user_groups(user_id,group_id) VALUES(?1,?2)", params![user, ADMIN_GROUP])?;
+        tx.commit()?;
+        Ok(generation)
+    }
+
+    /// The links of `generation`, by seq: `(statement, signature)`.
+    pub fn owner_links(&self, generation: u64) -> Result<Vec<(String, String)>> {
+        let mut stmt =
+            self.db.prepare("SELECT statement,signature FROM owner_links WHERE generation=?1 ORDER BY seq")?;
+        let rows = stmt.query_map([generation as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Appends a link and gives the new owner the Admin group, in one transaction.
+    pub fn append_owner_link(
+        &self,
+        generation: u64,
+        seq: u64,
+        statement: &str,
+        signature: &str,
+        new_owner: &str,
+    ) -> Result<()> {
+        let tx = self.begin()?;
+        tx.execute(
+            "INSERT INTO owner_links(generation,seq,statement,signature) VALUES(?1,?2,?3,?4)",
+            params![generation as i64, seq as i64, statement, signature],
+        )?;
+        if let Some(user) =
+            tx.query_row("SELECT id FROM users WHERE uid=?1", [new_owner], |r| r.get::<_, i64>(0)).optional()?
+        {
+            tx.execute(
+                "INSERT OR IGNORE INTO user_groups(user_id,group_id) VALUES(?1,?2)",
+                params![user, ADMIN_GROUP],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The `(seq, hash)` of the newest member list a private channel group accepted.
+    pub fn mls_access_checkpoint(&self, group: &str) -> Result<Option<(u64, String)>> {
+        Ok(self
+            .db
+            .query_row("SELECT seq,hash FROM mls_access WHERE group_id=?1", [group], |r| {
+                Ok((r.get::<_, i64>(0)? as u64, r.get(1)?))
+            })
+            .optional()?)
+    }
+
+    /// The newest anchor and list of `generation`.
+    pub fn manager_pair(&self, generation: u64) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        Ok(self
+            .db
+            .query_row("SELECT anchor,list FROM manager_pair WHERE generation=?1", [generation as i64], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?)
+    }
+
+    pub fn set_manager_pair(&self, generation: u64, anchor: &[u8], list: &[u8]) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO manager_pair(generation,anchor,list) VALUES(?1,?2,?3)
+             ON CONFLICT(generation) DO UPDATE SET anchor=excluded.anchor, list=excluded.list",
+            params![generation as i64, anchor, list],
+        )?;
+        Ok(())
+    }
+
+    pub fn add_message(
+        &self,
+        channel: ChannelId,
+        author_uid: &str,
+        author_name: &str,
+        text: &str,
+        sent_at: i64,
+    ) -> Result<MessageId> {
+        let id = self.next_id("message_counter")?;
+        self.db.execute(
+            "INSERT INTO messages(id,channel,author_uid,author_name,text,sent_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![id, channel, author_uid, author_name, text, sent_at],
+        )?;
+        self.db.execute(
+            "DELETE FROM messages WHERE channel=?1 AND id <= ?2 - ?3 AND id NOT IN
+             (SELECT id FROM messages WHERE channel=?1 ORDER BY id DESC LIMIT ?3)",
+            params![channel, id, HISTORY_KEEP],
+        )?;
+        Ok(id as MessageId)
+    }
+
+    /// Shortest distinguishing tags over the entire member table, including old members.
+    pub fn member_tags(&self) -> Result<BTreeMap<Uid, String>> {
+        let mut stmt = self.db.prepare("SELECT uid FROM users")?;
+        let uids = stmt.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(member_tags(uids))
+    }
+
+    pub fn set_nickname(&self, user_id: i64, nickname: &str) -> Result<()> {
+        self.db.execute("UPDATE users SET nickname=?2 WHERE id=?1", params![user_id, nickname])?;
+        Ok(())
+    }
+
+    pub fn connect_next_check(&self, user_id: i64) -> Result<Option<i64>> {
+        Ok(self.db.query_row("SELECT connect_next_check FROM users WHERE id=?1", [user_id], |r| r.get(0))?)
+    }
+
+    /// Persists the next eligible lookup time, including the guard before starting HTTP.
+    pub fn schedule_connect(&self, user_id: i64, at: i64) -> Result<()> {
+        self.db.execute("UPDATE users SET connect_next_check=?2 WHERE id=?1", params![user_id, at])?;
+        Ok(())
+    }
+
+    pub fn set_connect_attestation(&self, user_id: i64, a: Option<&HandleAttestation>) -> Result<()> {
+        let json = a.map(serde_json::to_string).transpose()?;
+        let handle = a.map(|a| a.handle.as_str());
+        self.db.execute(
+            "UPDATE users SET connect_attestation=?2,connect_handle=?3 WHERE id=?1",
+            params![user_id, json, handle],
+        )?;
+        Ok(())
+    }
+
+    /// Includes expired attestations (and handles confirmed before attestations existed)
+    /// so a returning account still triggers refresh.
+    pub fn has_connect_attestation(&self, user_id: i64) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT connect_attestation IS NOT NULL OR connect_handle IS NOT NULL FROM users WHERE id=?1",
+            [user_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Disabling Connect forgets cached handles, so enabling it starts with fresh checks.
+    pub fn clear_connect_cache(&self) -> Result<()> {
+        self.db.execute("UPDATE users SET connect_handle=NULL,connect_attestation=NULL,connect_next_check=NULL", [])?;
+        Ok(())
+    }
+
+    /// Users seen since `since` (ms), most recent first.
+    pub fn members(&self, since: i64, limit: u32) -> Result<Vec<Member>> {
+        let tags = self.member_tags()?;
+        let mut stmt = self.db.prepare(
+            "SELECT id,uid,nickname,last_seen,connect_attestation FROM users WHERE last_seen >= ?1 ORDER BY last_seen DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![since, limit], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+                read_attestation(r, 4)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, uid, nickname, last_seen, connect) = row?;
+            let tag = tags.get(&uid).cloned().unwrap_or_default();
+            Ok(Member {
+                uid,
+                nickname,
+                tag,
+                connect,
+                groups: self.user_groups(id)?,
+                last_seen,
+                teamspeak: self.teamspeak_links_of(id)?,
+            })
+        })
+        .collect()
+    }
+
+    pub fn set_last_seen(&self, user_id: i64, now: i64) -> Result<()> {
+        self.db.execute("UPDATE users SET last_seen=?2 WHERE id=?1", params![user_id, now])?;
+        Ok(())
+    }
+
+    /// Every member (those last seen before `seen_before`, if given), longest away first.
+    pub fn member_rows(&self, seen_before: Option<i64>) -> Result<Vec<MemberRow>> {
+        let tags = self.member_tags()?;
+        let mut stmt = self.db.prepare(
+            "SELECT id,uid,nickname,last_seen,(SELECT COUNT(*) FROM messages WHERE author_uid = users.uid)+(SELECT COUNT(*) FROM sealed_messages WHERE author_uid = users.uid),connect_attestation
+             FROM users WHERE ?1 IS NULL OR last_seen < ?1 ORDER BY last_seen, id",
+        )?;
+        let rows = stmt.query_map([seen_before], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                read_attestation(r, 5)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, uid, nickname, last_seen, messages, connect) = row?;
+            let tag = tags.get(&uid).cloned().unwrap_or_default();
+            Ok(MemberRow {
+                id,
+                member: Member {
+                    uid,
+                    nickname,
+                    tag,
+                    connect,
+                    groups: self.user_groups(id)?,
+                    last_seen,
+                    teamspeak: self.teamspeak_links_of(id)?,
+                },
+                messages,
+            })
+        })
+        .collect()
+    }
+
+    /// Deletes a member: groups, read marks, mentions of them and unattached uploads.
+    /// With `delete_messages` also everything they wrote, with its files.
+    /// All or nothing; the caller announces the deleted messages and removes the files.
+    pub fn remove_member(&self, id: i64, uid: &str, delete_messages: bool) -> Result<Removal> {
+        let tx = self.begin()?;
+        let mut removal = Removal::default();
+        if delete_messages {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM files WHERE sealed_message IN (SELECT id FROM sealed_messages WHERE author_uid=?1)",
+            )?;
+            removal.files = stmt.query_map([uid], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            let mut stmt = tx.prepare("DELETE FROM sealed_messages WHERE author_uid=?1 RETURNING conversation,id")?;
+            let rows = stmt.query_map([uid], |r| Ok((r.get::<_, String>(0)?, r.get::<_, MessageId>(1)?)))?;
+            for row in rows {
+                let (conversation, id) = row?;
+                removal.sealed.entry(conversation).or_default().push(id);
+            }
+            for ids in removal.sealed.values_mut() {
+                ids.sort_unstable();
+            }
+            let mut stmt = self.db.prepare("SELECT id,channel FROM messages WHERE author_uid=?1 ORDER BY id")?;
+            let rows = stmt.query_map([uid], |r| Ok((r.get::<_, MessageId>(0)?, r.get::<_, ChannelId>(1)?)))?;
+            removal.messages = rows.collect::<rusqlite::Result<_>>()?;
+            for (message, _) in &removal.messages {
+                removal.files.extend(self.delete_message(*message)?);
+            }
+        }
+        let mut stmt = self.db.prepare(
+            "DELETE FROM files WHERE uploader=?1 AND message IS NULL AND sealed_message IS NULL RETURNING id",
+        )?;
+        let pending = stmt.query_map([uid], |r| r.get::<_, FileId>(0))?;
+        removal.files.extend(pending.collect::<rusqlite::Result<Vec<_>>>()?);
+        self.db.execute("DELETE FROM message_mentions WHERE uid=?1 AND message IN (SELECT id FROM messages WHERE signature IS NULL)", [uid])?;
+        // Their overrides go with them: one who comes back starts afresh.
+        removal.overrides = {
+            let mut stmt = tx.prepare("DELETE FROM channel_overrides WHERE user=?1 RETURNING channel")?;
+            stmt.query_map([uid], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?
+        };
+        // The foreign keys take the group memberships and read marks along.
+        self.db.execute("DELETE FROM users WHERE id=?1", [id])?;
+        tx.commit()?;
+        Ok(removal)
+    }
+
+    /// Reassigns every identity reference atomically; a dry run rolls the transaction back.
+    pub fn merge_members(&self, from: &str, into: &str, dry_run: bool) -> Result<MergeReport> {
+        if from == into {
+            bail!("cannot merge a member into itself");
+        }
+        let tx = self.begin()?;
+        let id = |uid: &str| -> Result<i64> {
+            tx.query_row("SELECT id FROM users WHERE uid=?1", [uid], |r| r.get(0))
+                .optional()?
+                .with_context(|| format!("no member with uid {uid}"))
+        };
+        if is_teamspeak(from) {
+            bail!(
+                "{from} is a TeamSpeak identity: link it to a member instead (gwar-server members link {from} <member>)"
+            );
+        }
+        let (from_id, into_id) = (id(from)?, id(into)?);
+        tx.execute("UPDATE teamspeak_links SET user_id=?2 WHERE user_id=?1", params![from_id, into_id])?;
+        let links: i64 =
+            tx.query_row("SELECT COUNT(*) FROM teamspeak_links WHERE user_id=?1", [into_id], |r| r.get(0))?;
+        if links > MAX_TEAMSPEAK_LINKS {
+            bail!(
+                "together they have {links} linked TeamSpeak identities, more than {MAX_TEAMSPEAK_LINKS}: unlink some first"
+            );
+        }
+        let mut report = MergeReport {
+            messages: tx.execute(
+                "UPDATE messages SET author_uid=?2 WHERE author_uid=?1 AND signature IS NULL",
+                params![from, into],
+            )?,
+            files: tx.execute("UPDATE files SET uploader=?2 WHERE uploader=?1", params![from, into])?,
+            ..Default::default()
+        };
+        tx.execute("UPDATE removed_files SET uploader=?2 WHERE uploader=?1", params![from, into])?;
+        report.read_marks =
+            tx.query_row("SELECT COUNT(*) FROM read_marks WHERE user_id=?1", [from_id], |r| r.get(0))?;
+        tx.execute(
+            "INSERT INTO read_marks(user_id,channel,message) SELECT ?2,channel,message FROM read_marks WHERE user_id=?1
+             ON CONFLICT(user_id,channel) DO UPDATE SET message=MAX(read_marks.message,excluded.message)",
+            params![from_id, into_id],
+        )?;
+        report.groups = tx.query_row("SELECT COUNT(*) FROM user_groups WHERE user_id=?1", [from_id], |r| r.get(0))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO user_groups SELECT ?2,group_id FROM user_groups WHERE user_id=?1",
+            params![from_id, into_id],
+        )?;
+        report.mentions = tx.query_row("SELECT COUNT(*) FROM message_mentions WHERE uid=?1 AND message IN (SELECT id FROM messages WHERE signature IS NULL)", [from], |r| r.get(0))?;
+        tx.execute(
+            "INSERT OR IGNORE INTO message_mentions SELECT message,?2 FROM message_mentions WHERE uid=?1 AND message IN (SELECT id FROM messages WHERE signature IS NULL)",
+            params![from, into],
+        )?;
+        tx.execute("DELETE FROM message_mentions WHERE uid=?1 AND message IN (SELECT id FROM messages WHERE signature IS NULL)", [from])?;
+        report.bans = tx.execute("UPDATE bans SET uid=?2 WHERE uid=?1", params![from, into])?;
+        // Their IP bans keep reaching only those ranked below them.
+        tx.execute("UPDATE bans SET by_uid=?2 WHERE by_uid=?1", params![from, into])?;
+        tx.execute("UPDATE invites SET creator_uid=?2 WHERE creator_uid=?1", params![from, into])?;
+        // Overrides follow too, where the target has none of its own in that channel.
+        tx.execute("UPDATE OR IGNORE channel_overrides SET user=?2 WHERE user=?1", params![from, into])?;
+        // What a TeamSpeak import last wrote follows too, so a re-run does not take the merge for an edit.
+        move_import_overrides(&tx, from, into)?;
+        tx.execute("DELETE FROM channel_overrides WHERE user=?1", [from])?;
+        tx.execute("UPDATE tokens SET creator_uid=?2 WHERE creator_uid=?1", params![from, into])?;
+        // bans.by and invites.created_by are display-name snapshots, not identity references.
+        // Revoked devices belong to cryptographic account keys and must never be reassigned.
+        tx.execute(
+            "UPDATE users SET created_at=MIN(created_at,(SELECT created_at FROM users WHERE id=?1)),
+             last_seen=MAX(last_seen,(SELECT last_seen FROM users WHERE id=?1)) WHERE id=?2",
+            params![from_id, into_id],
+        )?;
+        tx.execute("DELETE FROM users WHERE id=?1", [from_id])?;
+        if dry_run {
+            tx.rollback()?;
+        } else {
+            tx.commit()?;
+        }
+        Ok(report)
+    }
+
+    /// The TeamSpeak identities linked to member `user_id`.
+    pub fn teamspeak_links_of(&self, user_id: i64) -> Result<Vec<Uid>> {
+        let mut stmt =
+            self.db.prepare_cached("SELECT teamspeak FROM teamspeak_links WHERE user_id=?1 ORDER BY teamspeak")?;
+        let rows = stmt.query_map([user_id], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The member a TeamSpeak identity (`ts:<uid>`) is linked to.
+    pub fn teamspeak_member(&self, teamspeak: &str) -> Result<Option<Uid>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT users.uid FROM teamspeak_links JOIN users ON users.id=teamspeak_links.user_id WHERE teamspeak=?1",
+                [teamspeak],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Links a TeamSpeak identity to member `into` (docs/teamspeak-import.md, "Linked TeamSpeak
+    /// identities"): a member `teamspeak` gives its roles and its per-channel overrides (where
+    /// `into` has none there) to `into` and is removed; its messages, files and bans stay its own.
+    pub fn link_teamspeak(&self, teamspeak: &str, into: &str, now: i64) -> Result<Link> {
+        if !is_teamspeak(teamspeak) {
+            bail!("{teamspeak} is not a TeamSpeak identity (ts:<uid>)");
+        }
+        if is_teamspeak(into) {
+            bail!("{into} is a TeamSpeak identity; link to a Gwar member");
+        }
+        let tx = self.begin()?;
+        let into_id: i64 = tx
+            .query_row("SELECT id FROM users WHERE uid=?1", [into], |r| r.get(0))
+            .optional()?
+            .with_context(|| format!("no member with uid {into}"))?;
+        let linked: Option<i64> = tx
+            .query_row("SELECT user_id FROM teamspeak_links WHERE teamspeak=?1", [teamspeak], |r| r.get(0))
+            .optional()?;
+        match linked {
+            Some(user) if user == into_id => return Ok(Link::Already),
+            Some(_) => return Ok(Link::Elsewhere),
+            None => {}
+        }
+        let links: i64 =
+            tx.query_row("SELECT COUNT(*) FROM teamspeak_links WHERE user_id=?1", [into_id], |r| r.get(0))?;
+        if links >= MAX_TEAMSPEAK_LINKS {
+            return Ok(Link::TooMany);
+        }
+        let from_id: Option<i64> =
+            tx.query_row("SELECT id FROM users WHERE uid=?1", [teamspeak], |r| r.get(0)).optional()?;
+        let mut link = Link::Linked { member: from_id.is_some(), groups: 0, overrides: Vec::new() };
+        if let (Some(from_id), Link::Linked { groups, overrides, .. }) = (from_id, &mut link) {
+            *groups = tx.execute(
+                "INSERT OR IGNORE INTO user_groups SELECT ?2,group_id FROM user_groups WHERE user_id=?1",
+                params![from_id, into_id],
+            )?;
+            let mut stmt =
+                tx.prepare("UPDATE OR IGNORE channel_overrides SET user=?2 WHERE user=?1 RETURNING channel")?;
+            *overrides = stmt.query_map(params![teamspeak, into], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            drop(stmt);
+            let mut stmt = tx.prepare("DELETE FROM channel_overrides WHERE user=?1 RETURNING channel")?;
+            overrides.extend(
+                stmt.query_map([teamspeak], |r| r.get::<_, ChannelId>(0))?.collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+            drop(stmt);
+            overrides.sort_unstable();
+            overrides.dedup();
+            // What a TeamSpeak import last wrote follows too, so a re-run does not take the link for an edit.
+            move_import_overrides(&tx, teamspeak, into)?;
+            tx.execute(
+                "UPDATE users SET last_seen=MAX(last_seen,(SELECT last_seen FROM users WHERE id=?1)) WHERE id=?2",
+                params![from_id, into_id],
+            )?;
+            // The foreign keys take its group memberships along; messages, files and bans keep `ts:<uid>`.
+            tx.execute("DELETE FROM users WHERE id=?1", [from_id])?;
+        }
+        tx.execute(
+            "INSERT INTO teamspeak_links(teamspeak,user_id,linked_at) VALUES (?1,?2,?3)",
+            params![teamspeak, into_id, now],
+        )?;
+        tx.commit()?;
+        Ok(link)
+    }
+
+    /// Unlinks a TeamSpeak identity; returns the member it was linked to.
+    pub fn unlink_teamspeak(&self, teamspeak: &str) -> Result<Option<Uid>> {
+        let member = self.teamspeak_member(teamspeak)?;
+        self.db.execute("DELETE FROM teamspeak_links WHERE teamspeak=?1", [teamspeak])?;
+        Ok(member)
+    }
+
+    /// TeamSpeak members (`ts:<uid>`) holding a role other than Member: what a claim could bring.
+    pub fn teamspeak_claimable(&self, limit: u32) -> Result<Vec<Uid>> {
+        let mut stmt = self.db.prepare(
+            "SELECT uid FROM users WHERE uid LIKE 'ts:%'
+             AND EXISTS (SELECT 1 FROM user_groups WHERE user_id=users.id AND group_id!=?1) ORDER BY uid LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![MEMBER_GROUP, limit], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// A transaction (a savepoint inside an outer one); see [`Tx`].
+    pub fn begin(&self) -> rusqlite::Result<Tx<'_>> {
+        let nested = !self.db.is_autocommit();
+        self.db.execute_batch(if nested { "SAVEPOINT gwar_nested" } else { "BEGIN" })?;
+        Ok(Tx { db: &self.db, nested, done: false })
+    }
+
+    /// Runs `work` in one transaction: everything it does is kept, or nothing (a live import).
+    pub fn atomically<T>(&self, work: impl FnOnce(&Store) -> Result<T>) -> Result<T> {
+        let tx = self.begin()?;
+        let value = work(self)?;
+        tx.commit()?;
+        Ok(value)
+    }
+
+    pub fn latest_message(&self, channel: ChannelId) -> Result<MessageId> {
+        Ok(self.db.query_row("SELECT COALESCE(MAX(id),0) FROM messages WHERE channel=?1", [channel], |r| r.get(0))?)
+    }
+
+    /// Where `user_id` stopped reading `channel`. A channel they never opened
+    /// counts as read up to now, so newcomers don't inherit the whole history.
+    pub fn read_mark(&self, user_id: i64, channel: ChannelId) -> Result<MessageId> {
+        let mark = self
+            .db
+            .query_row(
+                "SELECT message FROM read_marks WHERE user_id=?1 AND channel=?2",
+                params![user_id, channel],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match mark {
+            Some(mark) => Ok(mark),
+            None => {
+                let latest = self.latest_message(channel)?;
+                self.mark_read(user_id, channel, latest)?;
+                Ok(latest)
+            }
+        }
+    }
+
+    /// Moves the read mark forward (never back); returns the stored mark.
+    pub fn mark_read(&self, user_id: i64, channel: ChannelId, message: MessageId) -> Result<MessageId> {
+        Ok(self.db.query_row(
+            "INSERT INTO read_marks(user_id,channel,message) VALUES(?1,?2,?3)
+             ON CONFLICT(user_id,channel) DO UPDATE SET message=MAX(message, excluded.message)
+             RETURNING message",
+            params![user_id, channel, message],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Messages after `after`, up to [`UNREAD_CAP`].
+    pub fn unread_count(&self, channel: ChannelId, after: MessageId) -> Result<u32> {
+        Ok(self.db.query_row(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM messages WHERE channel=?1 AND id>?2 LIMIT ?3)",
+            params![channel, after, UNREAD_CAP],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Newest `limit` channel messages older than `before`, returned oldest first.
+    pub fn history(&self, channel: ChannelId, before: Option<MessageId>, limit: u32) -> Result<Vec<ChatMessage>> {
+        let mut stmt = self.db.prepare(
+            "SELECT m.id,m.author_uid,COALESCE(u.nickname,m.author_name),m.text,m.sent_at,m.edited_at,m.signature FROM messages m
+             LEFT JOIN users u ON u.uid=m.author_uid WHERE m.channel=?1 AND m.id < ?2 ORDER BY m.id DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![channel, before.unwrap_or(MessageId::MAX), limit], |r| {
+            Ok(ChatMessage {
+                id: r.get(0)?,
+                target: ChatTarget::Channel(channel),
+                author: 0,
+                author_uid: r.get(1)?,
+                author_name: r.get(2)?,
+                text: r.get(3)?,
+                sent_at: r.get(4)?,
+                mentions: Vec::new(),
+                attachments: Vec::new(),
+                edited_at: r.get(5)?,
+                signature: decode_signature(r, 6)?,
+            })
+        })?;
+        let mut messages: Vec<_> = rows.collect::<rusqlite::Result<_>>()?;
+        messages.reverse();
+        for m in &mut messages {
+            m.mentions = self.mentions(m.id)?;
+            m.attachments = self.attachments(m.id)?;
+        }
+        Ok(messages)
+    }
+
+    /// One stored channel message with its mentions and attachments.
+    pub fn message(&self, id: MessageId) -> Result<Option<ChatMessage>> {
+        let row = self
+            .db
+            .query_row(
+                "SELECT m.channel,m.author_uid,COALESCE(u.nickname,m.author_name),m.text,m.sent_at,m.edited_at,m.signature FROM messages m LEFT JOIN users u ON u.uid=m.author_uid WHERE m.id=?1",
+                [id],
+                |r| {
+                    Ok(ChatMessage {
+                        id,
+                        target: ChatTarget::Channel(r.get(0)?),
+                        author: 0,
+                        author_uid: r.get(1)?,
+                        author_name: r.get(2)?,
+                        text: r.get(3)?,
+                        sent_at: r.get(4)?,
+                        mentions: Vec::new(),
+                        attachments: Vec::new(),
+                        edited_at: r.get(5)?,
+                        signature: decode_signature(r, 6)?,
+                    })
+                },
+            )
+            .optional()?;
+        let Some(mut message) = row else { return Ok(None) };
+        message.mentions = self.mentions(id)?;
+        message.attachments = self.attachments(id)?;
+        Ok(Some(message))
+    }
+
+    pub fn reserve_message_identity(&self, server_key: &str, author_uid: &str, message_id: &str) -> Result<()> {
+        self.db
+            .execute("INSERT INTO message_identities VALUES(?1,?2,?3)", params![server_key, author_uid, message_id])?;
+        Ok(())
+    }
+
+    /// The body, signature and attachment order change together.
+    pub fn save_message_body(&mut self, msg: &ChatMessage) -> Result<()> {
+        let tx = self.db.transaction()?;
+        let signature = msg.signature.as_ref().map(serde_json::to_string).transpose()?;
+        tx.execute(
+            "UPDATE messages SET text=?2,sent_at=?3,edited_at=?4,signature=?5 WHERE id=?1",
+            params![msg.id, msg.text, msg.sent_at, msg.edited_at, signature],
+        )?;
+        tx.execute("DELETE FROM message_mentions WHERE message=?1", [msg.id])?;
+        for uid in &msg.mentions {
+            tx.execute("INSERT INTO message_mentions(message,uid) VALUES(?1,?2)", params![msg.id, uid])?;
+        }
+        if msg.text == gwar_proto::DELETION_TEXT {
+            tx.execute("DELETE FROM files WHERE message=?1", [msg.id])?;
+        }
+        for (position, file) in msg.attachments.iter().enumerate() {
+            tx.execute(
+                "UPDATE files SET message=?2,position=?3 WHERE id=?1",
+                params![file.id, msg.id, position as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn set_mentions(&self, message: MessageId, uids: &[Uid]) -> Result<()> {
+        self.db.execute("DELETE FROM message_mentions WHERE message=?1", [message])?;
+        for uid in uids {
+            self.db
+                .execute("INSERT OR IGNORE INTO message_mentions(message,uid) VALUES(?1,?2)", params![message, uid])?;
+        }
+        Ok(())
+    }
+
+    fn mentions(&self, message: MessageId) -> Result<Vec<Uid>> {
+        let mut stmt = self.db.prepare("SELECT uid FROM message_mentions WHERE message=?1 ORDER BY uid")?;
+        let rows = stmt.query_map([message], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn edit_message(&self, message: MessageId, text: &str, edited_at: i64) -> Result<()> {
+        self.db.execute("UPDATE messages SET text=?2, edited_at=?3 WHERE id=?1", params![message, text, edited_at])?;
+        Ok(())
+    }
+
+    /// Deletes a message; returns the ids of its attached files (to remove from disk).
+    pub fn delete_message(&self, message: MessageId) -> Result<Vec<FileId>> {
+        let files = self.attachments(message)?.into_iter().map(|a| a.id).collect::<Vec<_>>();
+        for id in &files {
+            self.db.execute("DELETE FROM files WHERE id=?1", [id])?;
+        }
+        self.db.execute("DELETE FROM messages WHERE id=?1", [message])?;
+        Ok(files)
+    }
+
+    /// Messages in `channel` after `after` that mention `uid`, up to [`UNREAD_CAP`].
+    pub fn unread_mentions(&self, channel: ChannelId, after: MessageId, uid: &str) -> Result<u32> {
+        Ok(self.db.query_row(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM message_mentions mm JOIN messages m ON m.id = mm.message
+             WHERE mm.uid=?3 AND m.channel=?1 AND m.id>?2 LIMIT ?4)",
+            params![channel, after, uid, UNREAD_CAP],
+            |r| r.get(0),
+        )?)
+    }
+
+    // ---------------------------------------------------------------- files
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_file(
+        &self,
+        id: &str,
+        uploader: &str,
+        name: &str,
+        mime: &str,
+        size: u64,
+        sha256: &str,
+        dimensions: Option<(u32, u32)>,
+        now: i64,
+        sealed: bool,
+    ) -> Result<()> {
+        let (name, mime, dimensions) =
+            if sealed { ("file", "application/octet-stream", None) } else { (name, mime, dimensions) };
+        self.db.execute(
+            "INSERT INTO files(id,uploader,name,mime,size,width,height,created_at,sha256,sealed) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![id, uploader, name, mime, size as i64, dimensions.map(|d| d.0), dimensions.map(|d| d.1), now, sha256, sealed],
+        )?;
+        Ok(())
+    }
+
+    /// Bytes of stored uploads, all or `uploader`'s, including removed ones whose bytes may
+    /// still be on disk.
+    pub fn stored_bytes(&self, uploader: Option<&str>) -> Result<u64> {
+        let bytes: i64 = self.db.query_row(
+            "SELECT COALESCE((SELECT SUM(size) FROM files WHERE ?1 IS NULL OR uploader=?1),0)
+                  + COALESCE((SELECT SUM(size) FROM removed_files WHERE ?1 IS NULL OR uploader=?1),0)",
+            [uploader],
+            |r| r.get(0),
+        )?;
+        Ok(bytes.max(0) as u64)
+    }
+
+    /// Files whose rows are deleted but whose bytes were not yet seen gone.
+    pub fn removed_files(&self) -> Result<Vec<FileId>> {
+        let mut stmt = self.db.prepare("SELECT id FROM removed_files")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Whether `id` is a stored file or a removed one still charged.
+    pub fn file_known(&self, id: &str) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM files WHERE id=?1) OR EXISTS(SELECT 1 FROM removed_files WHERE id=?1)",
+            [id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Stops charging removed files whose bytes are gone.
+    pub fn forget_removed(&self, ids: &[FileId]) -> Result<()> {
+        let tx = self.begin()?;
+        for id in ids {
+            tx.execute("DELETE FROM removed_files WHERE id=?1", [id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// A plaintext upload not yet attached to either kind of message, if `uploader` owns it.
+    pub fn pending_file(&self, id: &str, uploader: &str) -> Result<Option<Attachment>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT id,name,mime,size,width,height,sha256 FROM files WHERE id=?1 AND uploader=?2 AND message IS NULL AND sealed_message IS NULL AND sealed=0",
+                params![id, uploader],
+                attachment_row,
+            )
+            .optional()?)
+    }
+
+    pub fn attach_file(&self, id: &str, message: MessageId) -> Result<()> {
+        self.db.execute("UPDATE files SET message=?2 WHERE id=?1", params![id, message])?;
+        Ok(())
+    }
+
+    pub fn file(&self, id: &str) -> Result<Option<Attachment>> {
+        Ok(self
+            .db
+            .query_row("SELECT id,name,mime,size,width,height,sha256 FROM files WHERE id=?1", [id], attachment_row)
+            .optional()?)
+    }
+
+    /// The channel of the message a file is attached to; `None` for a missing file or one in no message.
+    pub fn file_channel(&self, id: &str) -> Result<Option<ChannelId>> {
+        Ok(self
+            .db
+            .query_row("SELECT m.channel FROM files f JOIN messages m ON m.id = f.message WHERE f.id=?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?)
+    }
+
+    /// The sealed conversation, resolved only through the sealed association.
+    pub fn file_conversation(&self, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT m.conversation FROM files f JOIN sealed_messages m ON m.id=f.sealed_message WHERE f.id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    fn attachments(&self, message: MessageId) -> Result<Vec<Attachment>> {
+        let mut stmt = self
+            .db
+            .prepare("SELECT id,name,mime,size,width,height,sha256 FROM files WHERE message=?1 ORDER BY position")?;
+        let rows = stmt.query_map([message], attachment_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Uploads never attached to a message within `before` (ms); returns their ids.
+    pub fn expire_unattached(&self, before: i64) -> Result<Vec<FileId>> {
+        let mut stmt = self.db.prepare(
+            "DELETE FROM files WHERE message IS NULL AND sealed_message IS NULL AND created_at < ?1 RETURNING id",
+        )?;
+        let rows = stmt.query_map([before], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Files whose message is gone (history trimming); returns their ids.
+    pub fn expire_orphans(&self) -> Result<Vec<FileId>> {
+        let mut stmt = self.db.prepare(
+            "DELETE FROM files WHERE (message IS NOT NULL AND message NOT IN (SELECT id FROM messages)) OR (sealed_message IS NOT NULL AND sealed_message NOT IN (SELECT id FROM sealed_messages)) RETURNING id",
+        )?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    // ----------------------------------------------------------------- bans
+
+    /// `by_uid`: who issued it, so an IP ban reaches only those ranked below them.
+    pub fn insert_ban(&self, ban: &Ban, by_uid: Option<&str>) -> Result<BanId> {
+        self.db.execute(
+            "INSERT INTO bans(uid,ip,nickname,reason,by,created_at,expires_at,by_uid) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![ban.uid, ban.ip, ban.nickname, ban.reason, ban.by, ban.created_at, ban.expires_at, by_uid],
+        )?;
+        Ok(self.db.last_insert_rowid() as BanId)
+    }
+
+    /// Who issued a ban, when it was recorded.
+    pub fn ban_issuer(&self, id: BanId) -> Result<Option<String>> {
+        Ok(self.db.query_row("SELECT by_uid FROM bans WHERE id=?1", [id], |r| r.get(0)).optional()?.flatten())
+    }
+
+    /// Bans in force at `now`.
+    pub fn bans(&self, now: i64) -> Result<Vec<Ban>> {
+        let mut stmt = self.db.prepare(
+            "SELECT id,uid,ip,nickname,reason,by,created_at,expires_at FROM bans
+             WHERE expires_at IS NULL OR expires_at > ?1 ORDER BY id DESC",
+        )?;
+        let rows = stmt.query_map([now], |r| {
+            Ok(Ban {
+                id: r.get(0)?,
+                uid: r.get(1)?,
+                ip: r.get(2)?,
+                nickname: r.get(3)?,
+                reason: r.get(4)?,
+                by: r.get(5)?,
+                created_at: r.get(6)?,
+                expires_at: r.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Removes a ban; returns it if it existed.
+    pub fn delete_ban(&self, id: BanId, now: i64) -> Result<Option<Ban>> {
+        let ban = self.bans(now)?.into_iter().find(|b| b.id == id);
+        self.db.execute("DELETE FROM bans WHERE id=?1", [id])?;
+        Ok(ban)
+    }
+
+    /// Records that ban `ban` banned the TeamSpeak identity `teamspeak` on TeamSpeak too.
+    pub fn add_ban_teamspeak(&self, ban: BanId, teamspeak: &str) -> Result<()> {
+        self.db
+            .execute("INSERT OR IGNORE INTO ban_teamspeak(ban,teamspeak) VALUES (?1,?2)", params![ban, teamspeak])?;
+        Ok(())
+    }
+
+    /// The TeamSpeak identities ban `ban` banned on TeamSpeak too, forgetting them (and any of bans gone).
+    pub fn take_ban_teamspeak(&self, ban: BanId) -> Result<Vec<Uid>> {
+        let tx = self.begin()?;
+        let mut stmt = tx.prepare("DELETE FROM ban_teamspeak WHERE ban=?1 RETURNING teamspeak")?;
+        let mut taken: Vec<Uid> = stmt.query_map([ban], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        drop(stmt);
+        tx.execute("DELETE FROM ban_teamspeak WHERE ban NOT IN (SELECT id FROM bans)", [])?;
+        tx.commit()?;
+        taken.sort_unstable();
+        Ok(taken)
+    }
+
+    // -------------------------------------------------- Gwar Connect devices
+
+    /// Permanently retain signed revocations and advance the cursor together.
+    pub fn apply_revocations(&self, devices: &[crate::core::RevokedDevice], seq: i64) -> Result<bool> {
+        let tx = self.begin()?;
+        let current = self.meta("connect_seq")?.and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+        if seq <= current {
+            return Ok(false);
+        }
+        for d in devices.iter().filter(|d| d.seq > current && d.seq <= seq) {
+            tx.execute(
+                "INSERT OR IGNORE INTO revoked_devices(device_key,account_key,revoked_at,signature) VALUES(?1,?2,?3,?4)",
+                params![d.device_key, d.account_key, d.revoked_at, d.signature],
+            )?;
+        }
+        self.set_meta("connect_seq", &seq.to_string())?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// When the account revoked this device, if the server learned that it did.
+    pub fn device_revoked_at(&self, account_key: &str, device_key: &str) -> Result<Option<i64>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT revoked_at FROM revoked_devices WHERE account_key=?1 AND device_key=?2",
+                [account_key, device_key],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The uids of members holding any of `groups`, sorted.
+    pub fn uids_in_groups(&self, groups: &[GroupId]) -> Result<Vec<Uid>> {
+        if groups.is_empty() {
+            return Ok(Vec::new());
+        }
+        let list = groups.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(",");
+        let mut stmt = self.db.prepare(&format!(
+            "SELECT DISTINCT u.uid FROM users u JOIN user_groups g ON g.user_id=u.id WHERE g.group_id IN ({list}) ORDER BY u.uid"
+        ))?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn device_revoked(&self, account_key: &str, device_key: &str) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM revoked_devices WHERE account_key=?1 AND device_key=?2)",
+            [account_key, device_key],
+            |r| r.get(0),
+        )?)
+    }
+
+    // -------------------------------------------------------------- invites
+
+    pub fn insert_invite(&self, invite: &Invite, creator_uid: &str) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO invites(code,group_id,max_uses,uses,expires_at,created_by,created_at,creator_uid)
+             VALUES(?1,?2,?3,0,?4,?5,?6,?7)",
+            params![
+                invite.code,
+                invite.group,
+                invite.max_uses,
+                invite.expires_at,
+                invite.created_by,
+                invite.created_at,
+                creator_uid
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every invite, or with `creator` only the ones that identity made.
+    pub fn invites(&self, creator: Option<&str>) -> Result<Vec<Invite>> {
+        let mut stmt = self.db.prepare(
+            "SELECT code,uses,max_uses,expires_at,group_id,created_by,created_at FROM invites
+             WHERE ?1 IS NULL OR creator_uid=?1 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([creator], |r| {
+            Ok(Invite {
+                code: r.get(0)?,
+                uses: r.get(1)?,
+                max_uses: r.get(2)?,
+                expires_at: r.get(3)?,
+                group: r.get(4)?,
+                created_by: r.get(5)?,
+                created_at: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Whether an invite is valid now, without using it; returns the group it grants.
+    /// A valid invite's group and creator, without using it.
+    pub fn peek_invite(&self, code: &str, now: i64) -> Result<Option<(Option<GroupId>, Option<String>)>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT group_id,creator_uid FROM invites
+                 WHERE code=?1 AND (expires_at IS NULL OR expires_at > ?2) AND (max_uses IS NULL OR uses < max_uses)",
+                params![code, now],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Uses an invite if it is still valid; returns the group it grants (`Some(None)` for none).
+    pub fn use_invite(&self, code: &str, now: i64) -> Result<Option<Option<GroupId>>> {
+        Ok(self
+            .db
+            .query_row(
+                "UPDATE invites SET uses = uses + 1
+                 WHERE code=?1 AND (expires_at IS NULL OR expires_at > ?2) AND (max_uses IS NULL OR uses < max_uses)
+                 RETURNING group_id",
+                params![code, now],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Deletes an invite; with `creator` only one that identity made.
+    pub fn delete_invite(&self, code: &str, creator: Option<&str>) -> Result<bool> {
+        Ok(self
+            .db
+            .execute("DELETE FROM invites WHERE code=?1 AND (?2 IS NULL OR creator_uid=?2)", params![code, creator])?
+            > 0)
+    }
+}
+
+fn member_tags(uids: Vec<Uid>) -> BTreeMap<Uid, String> {
+    let mut full: Vec<_> = uids
+        .into_iter()
+        .map(|uid| {
+            let decoded = match uid.strip_prefix("ts:") {
+                Some(ts) => STANDARD.decode(ts),
+                None => URL_SAFE_NO_PAD.decode(&uid),
+            };
+            let bytes =
+                decoded.ok().filter(|b| b.len() == 20).unwrap_or_else(|| Sha256::digest(uid.as_bytes())[..20].to_vec());
+            let alphabet = b"abcdefghijklmnopqrstuvwxyz234567";
+            let mut encoded = String::with_capacity(32);
+            let (mut bits, mut count) = (0u32, 0);
+            for byte in bytes {
+                bits = (bits << 8) | u32::from(byte);
+                count += 8;
+                while count >= 5 {
+                    count -= 5;
+                    encoded.push(alphabet[((bits >> count) & 31) as usize] as char);
+                }
+            }
+            (encoded, uid)
+        })
+        .collect();
+    full.sort_unstable();
+    let common = |a: &str, b: &str| a.bytes().zip(b.bytes()).take_while(|(a, b)| a == b).count();
+    full.iter()
+        .enumerate()
+        .map(|(i, (tag, uid))| {
+            let left = i.checked_sub(1).map_or(0, |j| common(tag, &full[j].0));
+            let right = full.get(i + 1).map_or(0, |(next, _)| common(tag, next));
+            let len = TAG_MIN_LEN.max(left.max(right) + 1).min(tag.len());
+            (uid.clone(), tag[..len].to_owned())
+        })
+        .collect()
+}
+
+fn decode_signature(
+    r: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<Box<gwar_proto::MessageSignature>>> {
+    r.get::<_, Option<String>>(index)?
+        .map(|s| {
+            serde_json::from_str(&s)
+                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(e)))
+        })
+        .transpose()
+}
+
+fn attachment_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attachment> {
+    let id: String = r.get(0)?;
+    let name: String = r.get(1)?;
+    Ok(Attachment {
+        url: format!("/files/{id}/{}", urlencode(&name)),
+        id,
+        name,
+        mime: r.get(2)?,
+        size: r.get::<_, i64>(3)? as u64,
+        width: r.get(4)?,
+        height: r.get(5)?,
+        sha256: r.get(6)?,
+        sealed: None,
+    })
+}
+
+/// Percent-encodes a file name for a URL path segment.
+fn urlencode(name: &str) -> String {
+    name.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owner_commands_and_the_first_token() {
+        let store = Store::in_memory().unwrap();
+        let a = store.touch_user("a", "ka", "A", 1).unwrap().id;
+        let b = store.touch_user("b", "kb", "B", 1).unwrap().id;
+        store.insert_token("first", ADMIN_GROUP, None, 0).unwrap();
+        store.mark_first_token("first").unwrap();
+        assert!(store.set_owner("missing").is_err(), "only a stored member");
+        store.set_owner("a").unwrap();
+        assert!(store.user_groups(a).unwrap().contains(&ADMIN_GROUP));
+        assert!(store.set_owner("b").is_err(), "only while there is no owner");
+        // An unused first token now grants Admin only.
+        let (group, _, first) = store.redeem_token_marked("first").unwrap().unwrap();
+        assert!(first);
+        assert!(!store.grant_token_group(b, "b", group, first).unwrap());
+        assert!(store.user_groups(b).unwrap().contains(&ADMIN_GROUP));
+        assert_eq!(store.owner_genesis().unwrap(), Some(OwnerGenesis { generation: 1, owner_uid: "a".into() }));
+        // A reset starts a new generation and drops the old one's chain and pair.
+        store.append_owner_link(1, 1, "statement", "signature", "b").unwrap();
+        store.set_manager_pair(1, b"anchor", b"list").unwrap();
+        assert_eq!(store.reset_owner("b").unwrap(), 2);
+        assert_eq!(store.owner_genesis().unwrap(), Some(OwnerGenesis { generation: 2, owner_uid: "b".into() }));
+        assert!(store.owner_links(1).unwrap().is_empty() && store.manager_pair(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn the_first_token_makes_an_owner_only_once() {
+        let store = Store::in_memory().unwrap();
+        let a = store.touch_user("a", "ka", "A", 1).unwrap().id;
+        assert!(store.grant_token_group(a, "a", ADMIN_GROUP, true).unwrap());
+        assert!(!store.grant_token_group(a, "a", ADMIN_GROUP, true).unwrap(), "never a second genesis");
+        assert!(!store.grant_token_group(a, "a", MEMBER_GROUP, false).unwrap());
+    }
+
+    #[test]
+    fn server_chat_migration_distinguishes_existing_data_from_a_new_database() {
+        for (data, existing) in [
+            ("", false),
+            // What administrative commands of earlier versions left behind.
+            (
+                "INSERT INTO groups(id,name,permissions) VALUES(1,'Admin','[]'); INSERT INTO meta VALUES('member_defaults','[]');",
+                false,
+            ),
+            ("INSERT INTO channels(id,name) VALUES(1,'Lobby');", true),
+            ("INSERT INTO users(uid,public_key,nickname,created_at,last_seen) VALUES('u','k','U',0,0);", true),
+        ] {
+            let db = Connection::open_in_memory().unwrap();
+            let before = migration_adding("SELECT 'server_chat','plaintext'");
+            for migration in &MIGRATIONS[..before] {
+                db.execute_batch(migration).unwrap();
+            }
+            db.pragma_update(None, "user_version", before).unwrap();
+            db.execute_batch(data).unwrap();
+            let store = Store::init(db).unwrap();
+            assert_eq!(store.meta("server_chat").unwrap().as_deref(), existing.then_some("plaintext"), "{data}");
+        }
+    }
+
+    #[test]
+    fn serving_fixes_server_chat_once_and_rejects_unknown_modes() {
+        for encrypted in [false, true] {
+            let store = Store::in_memory().unwrap();
+            assert_eq!(store.meta("server_chat").unwrap(), None);
+            store.init_server_chat(encrypted).unwrap();
+            store.init_server_chat(!encrypted).unwrap();
+            let mode = store.server_chat().unwrap();
+            assert_eq!((mode.encrypted, mode.history), (encrypted, encrypted));
+            assert_eq!(
+                store.meta("server_chat").unwrap().as_deref(),
+                Some(if encrypted { "encrypted" } else { "plaintext" })
+            );
+        }
+        let store = Store::in_memory().unwrap();
+        store.set_meta("server_chat", "invalid").unwrap();
+        assert!(store.init_server_chat(false).is_err());
+    }
+
+    #[test]
+    fn encrypted_attachment_migration_keeps_existing_plaintext_files() {
+        let db = Connection::open_in_memory().unwrap();
+        let before = migration_adding("ALTER TABLE files ADD COLUMN sealed INTEGER");
+        for migration in &MIGRATIONS[..before] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.pragma_update(None, "user_version", before).unwrap();
+        db.execute_batch(
+            "INSERT INTO channels(id,name) VALUES(1,'legacy');
+            INSERT INTO messages(id,channel,author_uid,author_name,text,sent_at) VALUES(1,1,'a','A','body',1);
+            INSERT INTO files(id,uploader,name,mime,size,width,height,created_at,message,sha256)
+            VALUES('file','a','photo.png','image/png',3,10,20,1,1,'hash');",
+        )
+        .unwrap();
+        let store = Store::init(db).unwrap();
+        let file = store.file("file").unwrap().unwrap();
+        assert_eq!(
+            (file.name.as_str(), file.mime.as_str(), file.width, file.height),
+            ("photo.png", "image/png", Some(10), Some(20))
+        );
+        assert_eq!(store.file_channel("file").unwrap(), Some(1));
+        assert_eq!(store.file_conversation("file").unwrap(), None);
+        assert!(!store.db.query_row("SELECT sealed FROM files WHERE id='file'", [], |r| r.get::<_, bool>(0)).unwrap());
+    }
+
+    #[test]
+    fn upgrading_v2_history_preserves_bodies_and_makes_them_unsigned() {
+        let db = Connection::open_in_memory().unwrap();
+        let before = migration_adding("CREATE TABLE mls_devices");
+        for migration in &MIGRATIONS[..before] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.pragma_update(None, "user_version", before).unwrap();
+        db.execute_batch(
+            "INSERT INTO channels(id,name) VALUES(1,'legacy');
+            INSERT INTO messages(id,channel,author_uid,author_name,text,sent_at,signature) VALUES
+            (1,1,'gwar-user','author','old text',1,'{\"key\":\"old device\",\"signature\":\"v2\"}'),
+            (2,1,'gwar-user','author','delete me',2,'{\"key\":\"old device\",\"signature\":\"v2\"}'),
+            (3,1,'ts:peer','peer','unsigned',3,NULL);",
+        )
+        .unwrap();
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../../gwar-proto/tests/message-signing.json")).unwrap();
+        let v3 = vectors[0]["signature"].clone();
+        let mut v2 = v3.clone();
+        v2.as_object_mut().unwrap().remove("group_id");
+        v2.as_object_mut().unwrap().remove("epoch");
+        db.execute("UPDATE messages SET signature=?1 WHERE id IN (1,2)", [v2.to_string()]).unwrap();
+        db.execute("INSERT INTO messages(id,channel,author_uid,author_name,text,sent_at,signature) VALUES(4,1,'gwar-user','author','v3',4,?1)", [v3.to_string()]).unwrap();
+        let store = Store::init(db).unwrap();
+        let history = store.history(1, None, 100).unwrap();
+        assert_eq!(history.len(), 4);
+        assert!(history[..3].iter().all(|m| m.signature.is_none()));
+        assert!(history[3].signature.is_some());
+        assert_eq!(history[0].text, "old text");
+        assert_eq!(store.message(1).unwrap().unwrap().text, "old text");
+        store.edit_message(1, "edited", 4).unwrap();
+        let edited = store.message(1).unwrap().unwrap();
+        assert_eq!(edited.text, "edited");
+        assert_eq!(edited.edited_at, Some(4));
+        assert!(edited.signature.is_none());
+        store.delete_message(2).unwrap();
+        assert!(store.message(2).unwrap().is_none());
+        assert_eq!(store.history(1, None, 100).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn history_hash_migration_backfills_and_deduplicates_existing_chunks() {
+        let db = Connection::open_in_memory().unwrap();
+        let before = migration_adding("ADD COLUMN chunk_hash");
+        for migration in &MIGRATIONS[..before] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.pragma_update(None, "user_version", before).unwrap();
+        db.execute_batch(
+            "INSERT INTO mls_groups VALUES('g','dm:a:b',0,0,1,X'00',X'00',1);
+            INSERT INTO mls_history VALUES('one','g','recipient','sender',0,0,X'01',1);
+            INSERT INTO mls_history VALUES('two','g','recipient','sender',0,0,X'01',2);
+            INSERT INTO mls_history VALUES('other','g','other-device','sender',0,0,X'01',2);",
+        )
+        .unwrap();
+        let store = Store::init(db).unwrap();
+        assert_eq!(store.db.query_row::<u32, _, _>("SELECT COUNT(*) FROM mls_history", [], |r| r.get(0)).unwrap(), 2);
+        let hash: Vec<u8> =
+            store.db.query_row("SELECT chunk_hash FROM mls_history WHERE id='one'", [], |r| r.get(0)).unwrap();
+        assert_eq!(hash, Sha256::digest([1]).as_slice());
+        assert_eq!(
+            store.mls_share_history("g", "recipient", ("sender", "device"), &[1], (0, 0), 2, true).unwrap(),
+            mls::ShareHistory::Duplicate
+        );
+    }
+
+    #[test]
+    fn sqlite_connections_use_full_durability() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("durable.sqlite");
+        for store in [Store::in_memory().unwrap(), Store::open(&path).unwrap(), Store::open(&path).unwrap()] {
+            let synchronous: u32 = store.db.query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap();
+            assert_eq!(synchronous, 2);
+            store.set_meta("mls_commit_clock", "123").unwrap();
+        }
+        assert_eq!(Store::open(&path).unwrap().meta("mls_commit_clock").unwrap().as_deref(), Some("123"));
+    }
+
+    #[test]
+    fn seeds_and_persists() {
+        let store = Store::in_memory().unwrap();
+        let channels = store.channels().unwrap();
+        assert_eq!(channels.len(), 3);
+        let default: ChannelId = store.meta("default_channel").unwrap().unwrap().parse().unwrap();
+        assert_eq!(channels[0].id, default);
+        assert_eq!(store.groups().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn delete_cascades_to_subtree_and_history() {
+        let store = Store::in_memory().unwrap();
+        let parent = store.insert_channel(None, "a", "", 5, None, None).unwrap();
+        let child = store.insert_channel(Some(parent), "b", "", 0, None, None).unwrap();
+        store.add_message(child, "u", "n", "hi", 1).unwrap();
+        store.delete_channel(parent).unwrap();
+        assert!(store.channels().unwrap().iter().all(|c| c.id != child));
+        assert!(store.history(child, None, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn tokens_are_single_use() {
+        let store = Store::in_memory().unwrap();
+        store.insert_token("h", ADMIN_GROUP, None, 0).unwrap();
+        assert_eq!(store.redeem_token("h").unwrap(), Some((ADMIN_GROUP, None)));
+        assert_eq!(store.redeem_token("h").unwrap(), None);
+    }
+
+    #[test]
+    fn read_marks_only_move_forward_and_count_unread() {
+        let store = Store::in_memory().unwrap();
+        let channel = store.channels().unwrap()[0].id;
+        let user = store.touch_user("u", "k", "n", 0).unwrap().id;
+        let first = store.add_message(channel, "u", "n", "old", 1).unwrap();
+        // Never opened: read up to now.
+        assert_eq!(store.read_mark(user, channel).unwrap(), first);
+        let ids: Vec<_> = (0..3).map(|i| store.add_message(channel, "u", "n", "new", i).unwrap()).collect();
+        assert_eq!(store.unread_count(channel, first).unwrap(), 3);
+        assert_eq!(store.mark_read(user, channel, ids[1]).unwrap(), ids[1]);
+        assert_eq!(store.mark_read(user, channel, first).unwrap(), ids[1], "marks never move back");
+        assert_eq!(store.unread_count(channel, ids[1]).unwrap(), 1);
+        assert_eq!(store.members(0, 10).unwrap()[0].uid, "u");
+    }
+
+    #[test]
+    fn history_pages_backwards() {
+        let store = Store::in_memory().unwrap();
+        let channel = store.channels().unwrap()[0].id;
+        let ids: Vec<_> = (0..5).map(|i| store.add_message(channel, "u", "n", &i.to_string(), i).unwrap()).collect();
+        let page = store.history(channel, Some(ids[4]), 2).unwrap();
+        assert_eq!(page.iter().map(|m| m.id).collect::<Vec<_>>(), vec![ids[2], ids[3]]);
+    }
+
+    #[test]
+    fn message_ids_never_repeat_after_deleting_the_newest() {
+        let store = Store::in_memory().unwrap();
+        let channel = store.channels().unwrap()[0].id;
+        let first = store.add_message(channel, "u", "n", "a", 1).unwrap();
+        let newest = store.add_message(channel, "u", "n", "b", 2).unwrap();
+        store.delete_message(newest).unwrap();
+        assert!(store.add_message(channel, "u", "n", "c", 3).unwrap() > newest);
+        assert!(newest > first);
+    }
+
+    /// Index of the migration containing `sql`: a database before it is "the previous release".
+    fn migration_adding(sql: &str) -> usize {
+        MIGRATIONS.iter().position(|m| m.contains(sql)).expect("migration exists")
+    }
+
+    #[test]
+    fn channel_ids_never_repeat_after_deleting_the_newest() {
+        let store = Store::in_memory().unwrap();
+        let first = store.insert_channel(None, "a", "", 0, None, None).unwrap();
+        store.delete_channel(first).unwrap();
+        let second = store.insert_channel(None, "b", "", 0, None, None).unwrap();
+        assert!(second > first);
+        let reopened = Store::init({
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+            let before = migration_adding("CREATE TABLE channel_counter");
+            for migration in &MIGRATIONS[..before] {
+                db.execute_batch(migration).unwrap();
+            }
+            db.pragma_update(None, "user_version", before).unwrap();
+            db.execute_batch("INSERT INTO channels(id,name) VALUES(41,'old');").unwrap();
+            db
+        })
+        .unwrap();
+        assert_eq!(reopened.insert_channel(None, "new", "", 0, None, None).unwrap(), 42);
+    }
+
+    #[test]
+    fn counters_survive_reopening_and_never_wrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gwar.sqlite3");
+        let first = {
+            let store = Store::open(&path).unwrap();
+            let id = store.insert_channel(None, "a", "", 0, None, None).unwrap();
+            store.delete_channel(id).unwrap();
+            id
+        };
+        let store = Store::open(&path).unwrap();
+        assert!(store.insert_channel(None, "b", "", 0, None, None).unwrap() > first);
+        store.db.execute_batch(&format!("UPDATE channel_counter SET last = {}", u32::MAX)).unwrap();
+        let before = store.channels().unwrap().len();
+        assert!(store.insert_channel(None, "c", "", 0, None, None).is_err());
+        assert_eq!(store.channels().unwrap().len(), before);
+    }
+
+    #[test]
+    fn message_counter_migration_starts_after_existing_messages() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        let before = migration_adding("CREATE TABLE message_counter");
+        for migration in &MIGRATIONS[..before] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.pragma_update(None, "user_version", before).unwrap();
+        db.execute_batch(
+            "INSERT INTO channels(id,name) VALUES(1,'c');
+             INSERT INTO messages(id,channel,author_uid,author_name,text,sent_at) VALUES (41,1,'u','n','x',1);",
+        )
+        .unwrap();
+        let store = Store::init(db).unwrap();
+        assert_eq!(store.add_message(1, "u", "n", "y", 2).unwrap(), 42);
+    }
+
+    #[test]
+    fn migration_backfills_last_seen_from_messages_and_never_lowers_it() {
+        // A database as the previous release left it (four migrations applied).
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        for migration in &MIGRATIONS[..4] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.pragma_update(None, "user_version", 4).unwrap();
+        db.execute_batch(
+            "INSERT INTO channels(id,name) VALUES(1,'c');
+             INSERT INTO users(id,uid,public_key,nickname,created_at,last_seen) VALUES
+               (1,'wrote-later','k','a',10,100), (2,'wrote-earlier','k','b',10,9000), (3,'silent','k','c',10,50);
+             INSERT INTO messages(channel,author_uid,author_name,text,sent_at) VALUES
+               (1,'wrote-later','a','x',5000), (1,'wrote-later','a','y',4000), (1,'wrote-earlier','b','z',200);",
+        )
+        .unwrap();
+
+        let store = Store::init(db).unwrap();
+        let seen = |uid: &str| store.user_by_uid(uid).unwrap().unwrap().1.last_seen;
+        assert_eq!(seen("wrote-later"), 5000, "raised to the newest message");
+        assert_eq!(seen("wrote-earlier"), 9000, "never lowered");
+        assert_eq!(seen("silent"), 50, "no messages, no change");
+        let version: usize = store.db.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, MIGRATIONS.len());
+        let indexes: Vec<String> = store
+            .db
+            .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name IN ('messages_by_author','files_by_uploader','users_by_last_seen')")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(indexes.len(), 3);
+        // Opening again changes nothing.
+        let again = Store::init(store.db).unwrap();
+        assert_eq!(again.user_by_uid("wrote-later").unwrap().unwrap().1.last_seen, 5000);
+    }
+
+    #[test]
+    fn migration_adds_the_connect_cache_and_preserves_member_names() {
+        let db = Connection::open_in_memory().unwrap();
+        for migration in &MIGRATIONS[..5] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.pragma_update(None, "user_version", 5).unwrap();
+        db.execute(
+            "INSERT INTO users(uid,public_key,nickname,created_at,last_seen) VALUES('old','k','Kept',10,20)",
+            [],
+        )
+        .unwrap();
+        let store = Store::init(db).unwrap();
+        let (id, member) = store.user_by_uid("old").unwrap().unwrap();
+        assert_eq!(member.nickname, "Kept");
+        assert!(member.connect.is_none());
+        assert_eq!(store.connect_next_check(id).unwrap(), None);
+        store.schedule_connect(id, 30).unwrap();
+        let a = HandleAttestation {
+            account_key: "key".into(),
+            handle: "account".into(),
+            issued_at: 1,
+            expires_at: i64::MAX,
+            signature: "signature".into(),
+        };
+        store.set_connect_attestation(id, Some(&a)).unwrap();
+        let reopened = Store::init(store.db).unwrap();
+        assert_eq!(reopened.connect_next_check(id).unwrap(), Some(30));
+        assert_eq!(reopened.user_by_uid("old").unwrap().unwrap().1.connect, Some(a));
+    }
+
+    #[test]
+    fn migration_resets_connect_check_times_and_discards_unsigned_handles() {
+        let db = Connection::open_in_memory().unwrap();
+        for migration in &MIGRATIONS[..6] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.pragma_update(None, "user_version", 6).unwrap();
+        db.execute_batch(
+            "INSERT INTO users(uid,public_key,nickname,created_at,last_seen,connect_handle,connect_checked_at) VALUES
+               ('known','k','Kept',10,20,'account',30), ('unknown','k','Local',10,20,NULL,40);",
+        )
+        .unwrap();
+        let store = Store::init(db).unwrap();
+        let (id, member) = store.user_by_uid("known").unwrap().unwrap();
+        assert_eq!(member.nickname, "Kept");
+        assert!(member.connect.is_none());
+        assert_eq!(store.connect_next_check(id).unwrap(), None);
+        // The unsigned handle is not shown, but still marks the key as a Connect account.
+        assert!(store.has_connect_attestation(id).unwrap());
+        let (id, member) = store.user_by_uid("unknown").unwrap().unwrap();
+        assert!(member.connect.is_none());
+        assert_eq!(store.connect_next_check(id).unwrap(), None);
+        assert!(!store.has_connect_attestation(id).unwrap());
+        assert!(store.db.prepare("SELECT connect_checked_at FROM users").is_err());
+        let version: usize = store.db.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, MIGRATIONS.len());
+    }
+
+    #[test]
+    fn invites_from_before_ownership_belong_to_nobody() {
+        let db = Connection::open_in_memory().unwrap();
+        let before = migration_adding("invites ADD COLUMN creator_uid");
+        for migration in &MIGRATIONS[..before] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.pragma_update(None, "user_version", before).unwrap();
+        db.execute("INSERT INTO invites(code,uses,created_by,created_at) VALUES('old',0,'root',1)", []).unwrap();
+        let store = Store::init(db).unwrap();
+        // Whoever is called "root" now does not own it; only an unrestricted (manager) view sees it.
+        assert!(store.invites(Some("root")).unwrap().is_empty());
+        assert!(!store.delete_invite("old", Some("root")).unwrap());
+        assert_eq!(store.invites(None).unwrap()[0].code, "old");
+        let invite =
+            Invite { code: "new".into(), created_by: "Name".into(), ..store.invites(None).unwrap()[0].clone() };
+        store.insert_invite(&invite, "uid").unwrap();
+        assert_eq!(store.invites(Some("uid")).unwrap()[0].code, "new");
+        assert!(!store.delete_invite("new", Some("other")).unwrap());
+        assert!(store.delete_invite("new", Some("uid")).unwrap());
+        assert!(store.delete_invite("old", None).unwrap());
+    }
+
+    #[test]
+    fn tokens_from_before_makers_lapse() {
+        let db = Connection::open_in_memory().unwrap();
+        let before = migration_adding("tokens ADD COLUMN creator_uid");
+        for migration in &MIGRATIONS[..before] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.pragma_update(None, "user_version", before).unwrap();
+        db.execute_batch(
+            "INSERT INTO groups(id,name,permissions) VALUES(1,'Admin','[]');
+             INSERT INTO tokens(token_hash,group_id,created_at) VALUES('old',1,1);",
+        )
+        .unwrap();
+        let store = Store::init(db).unwrap();
+        assert_eq!(store.redeem_token("old").unwrap(), None);
+        store.insert_token("new", 1, None, 2).unwrap();
+        assert_eq!(store.redeem_token("new").unwrap(), Some((1, None)));
+    }
+
+    #[test]
+    fn tags_use_the_shortest_unique_base32_prefix_over_all_members() {
+        let store = Store::in_memory().unwrap();
+        let a = URL_SAFE_NO_PAD.encode([0u8; 20]);
+        let mut bytes = [0u8; 20];
+        bytes[7] = 128;
+        let b = URL_SAFE_NO_PAD.encode(bytes);
+        store.touch_user(&a, "k", "same", 1).unwrap();
+        assert_eq!(store.member_tags().unwrap()[&a], "a".repeat(10));
+        let b_id = store.touch_user(&b, "k", "same", 2).unwrap().id;
+        let tags = store.member_tags().unwrap();
+        assert_eq!(tags[&a], "a".repeat(12));
+        assert_eq!(tags[&b], format!("{}i", "a".repeat(11)));
+        // Even a snapshot excluding the old member must account for its tag collision.
+        assert_eq!(store.members(2, 1).unwrap()[0].tag, tags[&b]);
+        let single = member_tags(vec![format!("ts:{}", STANDARD.encode([255u8; 20]))]);
+        assert_eq!(single.values().next().unwrap(), &"7".repeat(10));
+        store.remove_member(b_id, &b, false).unwrap();
+        assert_eq!(store.user_by_uid(&a).unwrap().unwrap().1.tag, "a".repeat(10));
+        let fallback = member_tags(vec!["not a uid".into()]);
+        assert_eq!(fallback["not a uid"].len(), TAG_MIN_LEN);
+        assert!(fallback["not a uid"].bytes().all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)));
+    }
+
+    #[test]
+    fn tags_can_expand_to_the_whole_uid() {
+        let a = URL_SAFE_NO_PAD.encode([0u8; 20]);
+        let mut bytes = [0u8; 20];
+        bytes[19] = 1;
+        let b = URL_SAFE_NO_PAD.encode(bytes);
+        let tags = member_tags(vec![a.clone(), b.clone()]);
+        assert_eq!(tags[&a], "a".repeat(32));
+        assert_eq!(tags[&b], format!("{}b", "a".repeat(31)));
+    }
+
+    #[test]
+    fn message_snapshots_survive_renames_and_member_removal() {
+        let store = Store::in_memory().unwrap();
+        let user = store.touch_user("u", "k", "Before", 1).unwrap();
+        let channel = store.channels().unwrap()[0].id;
+        let message = store.add_message(channel, "u", "Before", "hi", 2).unwrap();
+        store.touch_user("u", "k", "Ignored", 3).unwrap();
+        assert_eq!(store.user_by_uid("u").unwrap().unwrap().1.nickname, "Before");
+        store.set_nickname(user.id, "After").unwrap();
+        assert_eq!(store.history(channel, None, 10).unwrap()[0].author_name, "After");
+        assert_eq!(store.message(message).unwrap().unwrap().author_name, "After");
+        store.remove_member(user.id, "u", false).unwrap();
+        assert_eq!(store.message(message).unwrap().unwrap().author_name, "Before");
+    }
+
+    #[test]
+    fn removing_a_member_takes_everything_tied_to_them() {
+        let store = Store::in_memory().unwrap();
+        let channel = store.channels().unwrap()[0].id;
+        let gone = store.touch_user("gone", "k", "gone", 1).unwrap().id;
+        let other = store.touch_user("other", "k", "other", 1).unwrap().id;
+        store.add_user_group(gone, MEMBER_GROUP).unwrap();
+        store.read_mark(gone, channel).unwrap();
+        store.read_mark(other, channel).unwrap();
+        let theirs = store.add_message(channel, "gone", "gone", "bye", 2).unwrap();
+        let mine = store.add_message(channel, "other", "other", "hi @gone", 3).unwrap();
+        store.set_mentions(mine, &["gone".to_owned()]).unwrap();
+        store.insert_file("attached", "gone", "a", "x", 1, "hash", None, 2, false).unwrap();
+        store.attach_file("attached", theirs).unwrap();
+        store.insert_file("pending", "gone", "p", "x", 1, "hash", None, 2, false).unwrap();
+        store.insert_file("other-file", "other", "o", "x", 1, "hash", None, 2, false).unwrap();
+
+        // Without deleting messages: the record, its pending upload and mentions go.
+        let kept = store.remove_member(gone, "gone", false).unwrap();
+        assert!(kept.messages.is_empty());
+        assert_eq!(kept.files, vec!["pending".to_owned()]);
+        assert!(store.user_by_uid("gone").unwrap().is_none());
+        assert!(store.message(mine).unwrap().unwrap().mentions.is_empty());
+        assert!(store.message(theirs).unwrap().is_some());
+        assert!(store.file("attached").unwrap().is_some());
+        let marks: i64 = store.db.query_row("SELECT COUNT(*) FROM read_marks", [], |r| r.get(0)).unwrap();
+        let groups: i64 =
+            store.db.query_row("SELECT COUNT(*) FROM user_groups WHERE user_id=?1", [gone], |r| r.get(0)).unwrap();
+        assert_eq!((marks, groups), (1, 0));
+
+        // With: their messages and files too, and nobody else's.
+        let removal = store.remove_member(store.touch_user("gone", "k", "gone", 4).unwrap().id, "gone", true).unwrap();
+        assert_eq!(removal.messages, vec![(theirs, channel)]);
+        assert_eq!(removal.files, vec!["attached".to_owned()]);
+        assert!(store.message(theirs).unwrap().is_none() && store.message(mine).unwrap().is_some());
+        assert!(store.file("other-file").unwrap().is_some());
+    }
+
+    #[test]
+    fn removed_files_stay_charged_until_forgotten() {
+        let store = Store::in_memory().unwrap();
+        let channel = store.insert_channel(None, "a", "", 0, None, None).unwrap();
+        let message = store.add_message(channel, "u", "n", "m", 1).unwrap();
+        for (id, uploader, size, created_at) in
+            [("kept", "u", 1, 100), ("old", "u", 2, 0), ("sent", "u", 4, 0), ("theirs", "v", 8, 0)]
+        {
+            store.insert_file(id, uploader, "f", "x", size, "h", None, created_at, false).unwrap();
+        }
+        store.attach_file("sent", message).unwrap();
+        assert_eq!(store.expire_unattached(50).unwrap().len(), 2);
+        assert_eq!(store.delete_message(message).unwrap(), vec!["sent".to_owned()]);
+        assert_eq!((store.stored_bytes(Some("u")).unwrap(), store.stored_bytes(None).unwrap()), (7, 15));
+        // A merge takes the charge along.
+        store.touch_user("u", "ku", "u", 0).unwrap();
+        store.touch_user("v", "kv", "v", 0).unwrap();
+        store.merge_members("v", "u", false).unwrap();
+        assert_eq!((store.stored_bytes(Some("u")).unwrap(), store.stored_bytes(Some("v")).unwrap()), (15, 0));
+        store.forget_removed(&["old".into(), "theirs".into()]).unwrap();
+        assert_eq!(store.stored_bytes(None).unwrap(), 5);
+        assert_eq!(store.removed_files().unwrap(), vec!["sent".to_owned()]);
+    }
+
+    #[test]
+    fn a_merge_carries_the_bans_one_issued() {
+        let store = Store::in_memory().unwrap();
+        store.touch_user("u", "ku", "u", 0).unwrap();
+        store.touch_user("v", "kv", "v", 0).unwrap();
+        let ban = Ban {
+            id: 0,
+            uid: Some("x".into()),
+            ip: Some("10.0.0.1".into()),
+            nickname: "x".into(),
+            reason: None,
+            by: "v".into(),
+            created_at: 0,
+            expires_at: None,
+        };
+        let id = store.insert_ban(&ban, Some("v")).unwrap();
+        store.merge_members("v", "u", false).unwrap();
+        assert_eq!(store.ban_issuer(id).unwrap().as_deref(), Some("u"));
+    }
+
+    #[test]
+    fn user_overrides_follow_a_merge_and_go_with_a_removal() {
+        let store = Store::in_memory().unwrap();
+        let (a, b) = (
+            store.insert_channel(None, "a", "", 0, None, None).unwrap(),
+            store.insert_channel(None, "b", "", 1, None, None).unwrap(),
+        );
+        store.touch_user("u", "ku", "u", 0).unwrap();
+        store.touch_user("v", "kv", "v", 0).unwrap();
+        let of = |uid: &str, allow: &[Permission]| gwar_proto::ChannelOverride {
+            role: None,
+            user: Some(uid.into()),
+            allow: allow.to_vec(),
+            deny: vec![],
+        };
+        // u has their own override in a, so v's there gives way; v's in b moves over.
+        store.set_channel_overrides(a, &[of("u", &[Permission::Speak]), of("v", &[Permission::Connect])]).unwrap();
+        store.set_channel_overrides(b, &[of("v", &[Permission::Connect])]).unwrap();
+        store.merge_members("v", "u", false).unwrap();
+        let all = store.channel_overrides().unwrap();
+        assert_eq!(all[&a], vec![of("u", &[Permission::Speak])]);
+        assert_eq!(all[&b], vec![of("u", &[Permission::Connect])]);
+        let id = store.user_by_uid("u").unwrap().unwrap().0;
+        let mut removal = store.remove_member(id, "u", false).unwrap();
+        removal.overrides.sort_unstable();
+        assert_eq!(removal.overrides, vec![a, b]);
+        assert!(store.channel_overrides().unwrap().values().all(Vec::is_empty));
+    }
+}
+
+#[cfg(test)]
+mod teamspeak_link_tests {
+    use super::*;
+    use gwar_proto::ChannelOverride;
+
+    fn user(store: &Store, uid: &str, groups: &[GroupId]) -> i64 {
+        let row = store.touch_user(uid, uid, uid, 1).unwrap();
+        store.set_user_groups(row.id, groups).unwrap();
+        row.id
+    }
+
+    fn user_override(user: &str, allow: Permission) -> ChannelOverride {
+        ChannelOverride { user: Some(user.into()), allow: vec![allow], ..Default::default() }
+    }
+
+    #[test]
+    fn linking_gives_the_teamspeak_members_roles_and_overrides_and_keeps_what_it_did() {
+        let store = Store::in_memory().unwrap();
+        let mods = store.insert_group("Moderators", &[Permission::KickMembers], None, false, false).unwrap();
+        let djs = store.insert_group("DJs", &[Permission::Speak], None, false, false).unwrap();
+        user(&store, "ts:abc=", &[MEMBER_GROUP, mods]);
+        user(&store, "gwar", &[MEMBER_GROUP, djs]);
+        // One channel where only the TeamSpeak member has an override, one where both do.
+        let only = store.create_channel(&ChannelRow { name: "Only".into(), ..Default::default() }).unwrap();
+        let both = store.create_channel(&ChannelRow { name: "Both".into(), ..Default::default() }).unwrap();
+        store.set_channel_overrides(only, &[user_override("ts:abc=", Permission::MoveMembers)]).unwrap();
+        store
+            .set_channel_overrides(
+                both,
+                &[user_override("ts:abc=", Permission::MoveMembers), user_override("gwar", Permission::Speak)],
+            )
+            .unwrap();
+        store
+            .raw()
+            .execute(
+                "INSERT INTO messages(channel,author_uid,author_name,text,sent_at) VALUES (?1,'ts:abc=','T','hi',1)",
+                [only],
+            )
+            .unwrap();
+        let ban = Ban {
+            id: 0,
+            uid: Some("ts:abc=".into()),
+            ip: None,
+            nickname: "T".into(),
+            reason: None,
+            by: "x".into(),
+            created_at: 1,
+            expires_at: None,
+        };
+        store.insert_ban(&ban, None).unwrap();
+
+        let link = store.link_teamspeak("ts:abc=", "gwar", 5).unwrap();
+        assert_eq!(link, Link::Linked { member: true, groups: 1, overrides: vec![only, both] });
+        // The roles are united, the member is gone, and the link points at the Gwar member.
+        let (_, member) = store.user_by_uid("gwar").unwrap().unwrap();
+        let mut expected = vec![MEMBER_GROUP, mods, djs];
+        expected.sort_unstable();
+        assert_eq!(member.groups, expected);
+        assert_eq!(member.teamspeak, vec!["ts:abc=".to_string()]);
+        assert!(store.user_by_uid("ts:abc=").unwrap().is_none());
+        assert_eq!(store.teamspeak_member("ts:abc=").unwrap().as_deref(), Some("gwar"));
+        // Overrides move where the target had none; the target's own stays where it had one.
+        let overrides = |c| store.channels().unwrap().into_iter().find(|r| r.id == c).unwrap().overrides;
+        assert_eq!(overrides(only), vec![user_override("gwar", Permission::MoveMembers)]);
+        assert_eq!(overrides(both), vec![user_override("gwar", Permission::Speak)]);
+        // What the identity did stays its own: its message and its ban.
+        let author: String = store.raw().query_row("SELECT author_uid FROM messages", [], |r| r.get(0)).unwrap();
+        assert_eq!(author, "ts:abc=");
+        assert!(store.bans(2).unwrap().iter().any(|b| b.uid.as_deref() == Some("ts:abc=")));
+
+        // Again: nothing to do; to someone else: refused.
+        user(&store, "other", &[MEMBER_GROUP]);
+        assert_eq!(store.link_teamspeak("ts:abc=", "gwar", 6).unwrap(), Link::Already);
+        assert_eq!(store.link_teamspeak("ts:abc=", "other", 6).unwrap(), Link::Elsewhere);
+        assert_eq!(store.teamspeak_member("ts:abc=").unwrap().as_deref(), Some("gwar"));
+    }
+
+    #[test]
+    fn links_need_a_teamspeak_identity_and_a_gwar_member_and_go_with_the_member() {
+        let store = Store::in_memory().unwrap();
+        user(&store, "gwar", &[MEMBER_GROUP]);
+        user(&store, "ts:x=", &[MEMBER_GROUP]);
+        assert!(store.link_teamspeak("gwar", "gwar", 1).is_err());
+        assert!(store.link_teamspeak("ts:y=", "ts:x=", 1).is_err());
+        assert!(store.link_teamspeak("ts:y=", "nobody", 1).is_err());
+        // An identity with no member links too.
+        assert_eq!(
+            store.link_teamspeak("ts:y=", "gwar", 1).unwrap(),
+            Link::Linked { member: false, groups: 0, overrides: vec![] }
+        );
+        assert_eq!(store.unlink_teamspeak("ts:y=").unwrap().as_deref(), Some("gwar"));
+        assert_eq!(store.unlink_teamspeak("ts:y=").unwrap(), None);
+        store.link_teamspeak("ts:y=", "gwar", 1).unwrap();
+        let (id, member) = store.user_by_uid("gwar").unwrap().unwrap();
+        store.remove_member(id, &member.uid, false).unwrap();
+        assert_eq!(store.teamspeak_member("ts:y=").unwrap(), None);
+    }
+
+    #[test]
+    fn merging_moves_links_and_refuses_a_teamspeak_source() {
+        let store = Store::in_memory().unwrap();
+        user(&store, "old", &[MEMBER_GROUP]);
+        user(&store, "new", &[MEMBER_GROUP]);
+        user(&store, "ts:z=", &[MEMBER_GROUP]);
+        store.link_teamspeak("ts:q=", "old", 1).unwrap();
+        let refused = store.merge_members("ts:z=", "new", false).unwrap_err().to_string();
+        assert!(refused.contains("link it to a member instead"), "{refused}");
+        user(&store, "ts:w=", &[MEMBER_GROUP]);
+        assert!(store.merge_members("ts:z=", "ts:w=", false).is_err());
+        assert!(store.user_by_uid("ts:z=").unwrap().is_some());
+        store.merge_members("old", "new", false).unwrap();
+        assert_eq!(store.teamspeak_member("ts:q=").unwrap().as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn two_identities_linked_to_one_member_leave_the_imports_record_like_the_channel() {
+        let store = Store::in_memory().unwrap();
+        user(&store, "m", &[MEMBER_GROUP]);
+        user(&store, "ts:a=", &[MEMBER_GROUP]);
+        user(&store, "ts:b=", &[MEMBER_GROUP]);
+        let overrides =
+            vec![user_override("ts:a=", Permission::MoveMembers), user_override("ts:b=", Permission::Speak)];
+        let channel = store
+            .create_channel(&ChannelRow { name: "Room".into(), overrides: overrides.clone(), ..Default::default() })
+            .unwrap();
+        let written = serde_json::json!({ "name": "Room", "overrides": overrides }).to_string();
+        store.set_ts_import_record("src", "channel", 7, i64::from(channel), Some(&written)).unwrap();
+        store.link_teamspeak("ts:a=", "m", 1).unwrap();
+        store.link_teamspeak("ts:b=", "m", 1).unwrap();
+        let actual = store.channels().unwrap().into_iter().find(|r| r.id == channel).unwrap().overrides;
+        assert_eq!(actual, vec![user_override("m", Permission::MoveMembers)]);
+        let (_, written) = store.ts_import_record("src", "channel", 7).unwrap().unwrap();
+        let recorded: serde_json::Value = serde_json::from_str(&written.unwrap()).unwrap();
+        assert_eq!(recorded["overrides"], serde_json::json!(actual));
+    }
+
+    #[test]
+    fn a_member_has_at_most_so_many_linked_identities_also_after_a_merge() {
+        let store = Store::in_memory().unwrap();
+        user(&store, "full", &[MEMBER_GROUP]);
+        user(&store, "other", &[MEMBER_GROUP]);
+        for i in 0..MAX_TEAMSPEAK_LINKS {
+            assert!(matches!(store.link_teamspeak(&format!("ts:{i}="), "full", 1).unwrap(), Link::Linked { .. }));
+        }
+        assert_eq!(store.link_teamspeak("ts:one-more=", "full", 1).unwrap(), Link::TooMany);
+        assert_eq!(store.teamspeak_member("ts:one-more=").unwrap(), None);
+        store.link_teamspeak("ts:theirs=", "other", 1).unwrap();
+        assert!(store.merge_members("other", "full", false).is_err());
+        assert_eq!(store.teamspeak_member("ts:theirs=").unwrap().as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn claimable_identities_are_teamspeak_members_with_a_role() {
+        let store = Store::in_memory().unwrap();
+        let mods = store.insert_group("Moderators", &[], None, false, false).unwrap();
+        user(&store, "ts:b=", &[MEMBER_GROUP, mods]);
+        user(&store, "ts:a=", &[MEMBER_GROUP]);
+        user(&store, "gwar", &[MEMBER_GROUP, mods]);
+        user(&store, "ts:c=", &[mods]);
+        assert_eq!(store.teamspeak_claimable(10).unwrap(), vec!["ts:b=".to_string(), "ts:c=".to_string()]);
+        assert_eq!(store.teamspeak_claimable(1).unwrap(), vec!["ts:b=".to_string()]);
+    }
+}

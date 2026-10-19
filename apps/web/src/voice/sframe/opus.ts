@@ -1,6 +1,6 @@
 /**
  * Complete Opus packet framing validation without decoding (RFC 6716 §3.2),
- * the same rules as `vc-proto::opus::packet_samples`.
+ * the same rules as `gwar-proto::opus::packet_samples`.
  */
 
 /** Samples per channel at 48 kHz, only after validating every frame boundary.

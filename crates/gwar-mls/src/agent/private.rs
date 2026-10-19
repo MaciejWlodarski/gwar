@@ -3,10 +3,10 @@
 //! a per-group checkpoint of the newest member list it accepted guards against rollback, and
 //! current authority (a)–(d) gates sending.
 
+use gwar_proto::Uid;
 use openmls::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use vc_proto::Uid;
 
 use super::{Agent, AgentError, Invalid, Outbox, Result, Status, client_context, ds, err, group_key, join_config};
 use crate::access::{ACCESS_EXTENSION, Access, ChannelMembers, MAX_ACCESS_BYTES, MAX_MEMBERS, SignedMembers};
@@ -112,7 +112,7 @@ impl Agent {
         if members.len() > MAX_MEMBERS || members.iter().any(|m| fixed::<20>(m).is_none()) {
             return Err(Invalid("members"));
         }
-        if seq == 0 || seq > vc_proto::MAX_SAFE_INTEGER as u64 {
+        if seq == 0 || seq > gwar_proto::MAX_SAFE_INTEGER as u64 {
             return Err(Invalid("member list seq"));
         }
         let statement = ChannelMembers {

@@ -16,7 +16,7 @@ Opus), plaintext voice and direct TeamSpeak are unchanged.
   `SingleUseCounter` and decrypts with one key at a time, so counter and replay
   state stay ours. Headers must also be minimal, as in the browser; the library
   alone would accept non-minimal encodings.
-- **Key state.** `crates/vc-client/src/voice/sframe.rs` ports
+- **Key state.** `crates/gwar-client/src/voice/sframe.rs` ports
   `apps/web/src/voice/sframe/state.ts`:
   - controls: `hold`, `supersede`, `install`, `activate`, with serial ordering,
     duplicate and conflict rules, `bad_keys` without mutation and
@@ -36,7 +36,7 @@ Opus), plaintext voice and direct TeamSpeak are unchanged.
     the decoded key bytes, so no key-bearing text is allocated. Keys decode
     into zeroizing storage, body keys are wiped after parsing, and derived keys
     zeroize on drop.
-- **Engine.** `crates/vc-client/src/voice/{keys,rtc,mod}.rs`:
+- **Engine.** `crates/gwar-client/src/voice/{keys,rtc,mod}.rs`:
   - `voice::start_encrypted` binds the run before negotiation; the engine
     starts closed.
   - The RTC task encrypts each microphone packet right before its RTP write.
@@ -99,7 +99,7 @@ Tests added by 5d:
   - expiry while the monotonic clock is stopped;
   - scrubbing.
   Ten mutations of the state rules all fail a test.
-- **Interop.** `crates/vc-client/tests/sframe-interop.json` holds frames
+- **Interop.** `crates/gwar-client/tests/sframe-interop.json` holds frames
   sealed by Rust at the shortest and widest KID/CTR encodings and a 1000-byte
   packet. WebCrypto seals the same bytes and opens them (`primitives.test.ts`),
   and a Rust receiver opens them.
@@ -108,7 +108,7 @@ Tests added by 5d:
   admitted; a retained channel cannot apply after retirement; dropping the
   handle closes the gate before returning (mutation-checked); a retired run
   sends no datagram.
-- **Through the real SFU** (`crates/vc-server/tests/mls.rs`):
+- **Through the real SFU** (`crates/gwar-server/tests/mls.rs`):
   - Two native engines use exporter keys of a real voice MLS group. Nothing
     crosses the SFU before keys: B's decryptor counted nothing and its speaker
     stayed silent. Then the tone plays, and sending plaintext instead fails

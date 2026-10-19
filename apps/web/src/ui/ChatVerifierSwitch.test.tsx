@@ -35,7 +35,7 @@ const state = () => div.querySelector('[data-message]')?.getAttribute('data-mess
 beforeEach(() => {
   vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true); vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
   held.jobs = []; held.map = new Map(); held.controller.messageServerKey = 'A';
-  useSession.setState({ ...initialState, kind: 'vc', me: { uid: 'me', session: 1 }, viewChannel: 1, threads: { 'ch:1': thread(), 'ch:2': thread() } });
+  useSession.setState({ ...initialState, kind: 'gwar', me: { uid: 'me', session: 1 }, viewChannel: 1, threads: { 'ch:1': thread(), 'ch:2': thread() } });
   div = document.createElement('div'); document.body.appendChild(div); root = createRoot(div);
 });
 afterEach(async () => { await act(async () => root.unmount()); div.remove(); vi.useRealTimers(); vi.unstubAllGlobals(); });

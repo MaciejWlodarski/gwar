@@ -1,4 +1,4 @@
-//! Synthetic audio device for automated verification (`VC_FAKE_AUDIO=1`,
+//! Synthetic audio device for automated verification (`GWAR_FAKE_AUDIO=1`,
 //! debug builds only; see [`enabled`]). The "microphone" is silence or a
 //! 440 Hz tone and the "speaker" records how much sound it was given.
 
@@ -11,17 +11,17 @@ use std::{
     time::Duration,
 };
 
+use gwar_client::voice::io::{AudioIo, AudioPorts, CaptureSample, OutputTiming};
 use rtrb::RingBuffer;
-use vc_client::voice::io::{AudioIo, AudioPorts, CaptureSample, OutputTiming};
 
 /// Fake audio is only honoured in debug builds.
 pub fn enabled() -> bool {
-    cfg!(debug_assertions) && std::env::var("VC_FAKE_AUDIO").is_ok_and(|v| v != "0" && v != "fail" && !v.is_empty())
+    cfg!(debug_assertions) && std::env::var("GWAR_FAKE_AUDIO").is_ok_and(|v| v != "0" && v != "fail" && !v.is_empty())
 }
 
-/// `VC_FAKE_TONE=1` makes the fake microphone emit a tone instead of silence.
+/// `GWAR_FAKE_TONE=1` makes the fake microphone emit a tone instead of silence.
 pub fn tone() -> bool {
-    std::env::var("VC_FAKE_TONE").is_ok_and(|v| v != "0" && !v.is_empty())
+    std::env::var("GWAR_FAKE_TONE").is_ok_and(|v| v != "0" && !v.is_empty())
 }
 
 /// What the fake speaker heard.
@@ -69,7 +69,7 @@ impl AudioIo for FakeIo {
         // Real-time pacing: 10 ms of samples in, 10 ms out, like a device.
         let output = Arc::new(OutputTiming::default());
         let timing = output.clone();
-        thread::Builder::new().name("vc-fake-audio".into()).spawn(move || {
+        thread::Builder::new().name("gwar-fake-audio".into()).spawn(move || {
             let mut t = 0u64;
             let (mut sum, mut n) = (0f32, 0usize);
             while !stopped.load(Ordering::Relaxed) {

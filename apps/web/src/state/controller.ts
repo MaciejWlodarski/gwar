@@ -89,7 +89,7 @@ export class ConnectFailure extends Error {
 }
 
 export interface ConnectParams {
-  /** `vc` (default) or `teamspeak` (desktop only). */
+  /** `gwar` (default) or `teamspeak` (desktop only). */
   kind?: ServerKind;
   address: string;
   password?: string;
@@ -349,7 +349,7 @@ class Controller {
   async connect(params: ConnectParams): Promise<void> {
     this.init();
     await this.disconnect(true);
-    const kind: ServerKind = params.kind ?? "vc";
+    const kind: ServerKind = params.kind ?? "gwar";
     const session = useSession.getState();
     let conn: Link;
     if (kind === "teamspeak") {
@@ -395,7 +395,7 @@ class Controller {
         invite: params.invite || undefined,
         inviteServerKey: params.inviteServerKey,
         insecureLan: params.insecureLan,
-        client: { name: "vc-web", version: CLIENT_VERSION, platform: platform() },
+        client: { name: "gwar-web", version: CLIENT_VERSION, platform: platform() },
       });
     }
     this.conn = conn;
@@ -496,11 +496,11 @@ class Controller {
     }
     ui.set({ busy: false, error: null, needPassword: false, serverName: null, invite: null });
     const settings = useSettings.getState();
-    const kind: ServerKind = params.kind ?? "vc";
+    const kind: ServerKind = params.kind ?? "gwar";
     settings.setLast(params.address, kind);
     const name = useSession.getState().server?.name || params.address;
     // The bookmark used to connect when there is one (the address as typed), else one for the same server.
-    const shown = settings.bookmarks.filter((b) => inAccount(b, settings.bookmarkAccount) && (b.kind ?? "vc") === kind);
+    const shown = settings.bookmarks.filter((b) => inAccount(b, settings.bookmarkAccount) && (b.kind ?? "gwar") === kind);
     const typed = params.address.trim().toLowerCase();
     const existing =
       shown.find((b) => b.address.trim().toLowerCase() === typed) ??
@@ -536,7 +536,7 @@ class Controller {
       this.entered.clear();
       this.historyRequested.clear();
       this.sentRead.clear();
-      this.nativeFiles(useSession.getState().kind === "vc" ? useSession.getState().httpOrigin : null, welcome.server.upload_limit, welcome.file_access);
+      this.nativeFiles(useSession.getState().kind === "gwar" ? useSession.getState().httpOrigin : null, welcome.server.upload_limit, welcome.file_access);
       session.setSecurity(conn.serverKey ?? null, conn.endpoint ?? null, !!conn.endpoint && isPlaintextRemote(conn.endpoint));
       if (conn.serverKey) channelLifecycle.observe(conn.serverKey, welcome.channels.map((c) => c.id));
       // A resync rebuilds channel threads: count the encrypted ones' mentions again,
@@ -545,12 +545,12 @@ class Controller {
       session.dispatch({ type: "welcome", welcome, resync, now: Date.now() });
       if (this.sealed) { this.sealed.refresh(); void this.sealed.scanUnread(); }
       // A server moved from TeamSpeak may hold roles for this person's TeamSpeak identities.
-      if (!resync && useSession.getState().kind === "vc" && conn.serverKey) void offerClaims(conn, conn.serverKey, welcome.uid);
+      if (!resync && useSession.getState().kind === "gwar" && conn.serverKey) void offerClaims(conn, conn.serverKey, welcome.uid);
       const myCh = myChannelId(useSession.getState());
       const v = useVoice.getState();
       if (v.muted || v.deafened) void this.pushMuteState();
       if (myCh !== null) {
-        // TeamSpeak servers always have me in a channel; vc servers start me outside voice.
+        // TeamSpeak servers always have me in a channel; Gwar servers start me outside voice.
         this.entered.add(myCh);
         void this.startVoice();
       } else if (resync && this.rejoin !== null) {
@@ -578,7 +578,7 @@ class Controller {
       if ((event.ev === "chat.message" || event.ev === "chat.edited") && typeof event.d.target === "object" && "client" in event.d.target) {
         const s = useSession.getState(), msg = event.d;
         const recipient = s.clients[(msg.target as { client: number }).client]?.uid;
-        if (s.kind === "vc" && (!recipient || ![msg.author_uid, recipient].some(uid => uid.startsWith("ts:")))) return;
+        if (s.kind === "gwar" && (!recipient || ![msg.author_uid, recipient].some(uid => uid.startsWith("ts:")))) return;
       }
       // Recorded before anything else, so messages that follow are checked against it.
       if (conn.serverKey && event.ev === "channel.created") channelLifecycle.created(conn.serverKey, event.d.id);
@@ -650,7 +650,7 @@ class Controller {
         case "reconnecting":
           this.nativeFiles(null);
           // A new session starts outside voice: remember where to go back to.
-          this.rejoin ??= useSession.getState().kind === "vc" ? myChannelId(useSession.getState()) : null;
+          this.rejoin ??= useSession.getState().kind === "gwar" ? myChannelId(useSession.getState()) : null;
           session.dispatch({ type: "phase", phase: "reconnecting" });
           void this.stopVoice();
           break;
@@ -804,18 +804,18 @@ class Controller {
     const encrypted = !!state.channels[channel]?.encrypted;
     const { iceServers } = state;
     const own = state.me === null ? null : state.clients[state.me.session];
-    if (!own || (state.kind === "vc" && !own.voice_binding)) return;
+    if (!own || (state.kind === "gwar" && !own.voice_binding)) return;
     const run = ++this.voiceRun;
     const participation = own.voice_binding;
     const current = () => {
       const s = useSession.getState(); const b = s.me === null ? null : s.clients[s.me.session]?.voice_binding;
-      return this.voiceRun === run && this.conn === conn && s.phase === "online" && myChannelId(s) === channel && (state.kind !== "vc" || (b?.call === participation?.call && b?.participation === participation?.participation));
+      return this.voiceRun === run && this.conn === conn && s.phase === "online" && myChannelId(s) === channel && (state.kind !== "gwar" || (b?.call === participation?.call && b?.participation === participation?.participation));
     };
     let keys: VoiceCall | undefined;
     let group: string | null = null;
     if (encrypted) {
       // There is never a plaintext fallback in an encrypted channel.
-      const refusal = state.kind === "vc" && participation ? await this.encryptedVoiceRefusal() : tNow("voice.encryptedUnsupported");
+      const refusal = state.kind === "gwar" && participation ? await this.encryptedVoiceRefusal() : tNow("voice.encryptedUnsupported");
       if (!current()) return;
       if (refusal) {
         this.endVoiceCall(); await this.engine.stop();
@@ -845,7 +845,7 @@ class Controller {
       }
       if (!current()) return;
     } else this.endVoiceCall();
-    const binding = { server_key: conn.serverKey ?? null, session: own.id, channel, call: state.kind === "vc" ? participation!.call : null, participation: state.kind === "vc" ? participation!.participation : null, group };
+    const binding = { server_key: conn.serverKey ?? null, session: own.id, channel, call: state.kind === "gwar" ? participation!.call : null, participation: state.kind === "gwar" ? participation!.participation : null, group };
     this.engine.setMuted(useVoice.getState().muted);
     this.engine.setDeafened(useVoice.getState().deafened);
     try {
@@ -886,7 +886,7 @@ class Controller {
 
   /** Whether I can leave voice without leaving the server (not on TeamSpeak). */
   get canLeaveVoice(): boolean {
-    return useSession.getState().kind === "vc";
+    return useSession.getState().kind === "gwar";
   }
 
   /** Leaves voice but stays on the server (and keeps reading chat). */
@@ -1567,7 +1567,7 @@ class Controller {
   /** Changes the text of one of my channel messages; shows a toast and returns false on failure. */
   async editMessage(message: number, text: string, mentions: string[]): Promise<boolean> {
     return this.changeMessage(message, async (original, bound) => {
-      if (useSession.getState().kind === "vc" && !(await this.editableOriginal(original, bound.conn))) throw new Error(tNow("chat.editUnverified"));
+      if (useSession.getState().kind === "gwar" && !(await this.editableOriginal(original, bound.conn))) throw new Error(tNow("chat.editUnverified"));
       return this.sendEdit(original, text, mentions, bound);
     });
   }
@@ -1575,7 +1575,7 @@ class Controller {
   async deleteMessage(message: number): Promise<boolean> {
     return this.changeMessage(message, async (original, bound, sealed) => {
       // My verified message: a signed deletion. Otherwise a moderator's server removal.
-      if (useSession.getState().kind === "vc" && (await this.editableOriginal(original, bound.conn))) return this.sendEdit(original, DELETION_TEXT, [], bound);
+      if (useSession.getState().kind === "gwar" && (await this.editableOriginal(original, bound.conn))) return this.sendEdit(original, DELETION_TEXT, [], bound);
       bound.check();
       // The route comes from the snapshot: the view may have moved to another thread meanwhile.
       if (sealed) await bound.conn.request("chat.sealed.remove", { conversation: sealed, id: message });
@@ -1628,10 +1628,10 @@ class Controller {
 
   // ----------------------------------------------------------- attachments
 
-  /** Whether this session can attach files (a vc server with uploads on, and the permission). */
+  /** Whether this session can attach files (a Gwar server with uploads on, and the permission). */
   get canUpload(): boolean {
     const s = useSession.getState();
-    return s.kind === "vc" && (s.server?.upload_limit ?? 0) > 0 && s.permissions.includes("attach_files");
+    return s.kind === "gwar" && (s.server?.upload_limit ?? 0) > 0 && s.permissions.includes("attach_files");
   }
 
   /**
@@ -1642,7 +1642,7 @@ class Controller {
    */
   async uploadFile(file: File, opts: { onProgress?: (fraction: number) => void; signal?: AbortSignal; sealed?: boolean } = {}): Promise<string> {
     const s = useSession.getState();
-    if (s.kind !== "vc") throw new UploadError("unsupported");
+    if (s.kind !== "gwar") throw new UploadError("unsupported");
     const check = checkUpload(file.size, s.server?.upload_limit ?? 0, opts.sealed ? SEALED_FILE_OVERHEAD : 0);
     if (!check.ok) throw new UploadError(check.reason);
     // The file goes only to the server it was chosen on.
@@ -1830,7 +1830,7 @@ class Controller {
   /** The newest message of the open channel chat that the server does not know I have read, if any. */
   private unreadReport(s: SessionSnapshot): { channel: number; message: number } | { conversation: string; message: number } | null {
     // TeamSpeak keeps no read state: unread counts there are purely local.
-    if (s.phase !== "online" || s.kind !== "vc" || !s.focused) return null;
+    if (s.phase !== "online" || s.kind !== "gwar" || !s.focused) return null;
     const active = storedKey(s, s.activeThread);
     if (sealedThread(active, s.kind, s.channels, s.server?.server_chat)) {
       const thread = s.threads[active!], latest = latestMessageId(thread);

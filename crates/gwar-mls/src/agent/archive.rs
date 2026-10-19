@@ -2,9 +2,9 @@
 //! the account's manifests, the revocations, devices and recovery key it knows, the generation
 //! keys it opened, records to upload and import, and transfers. Connect is reached by the caller.
 
+use gwar_proto::DeviceCertificate;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use vc_proto::DeviceCertificate;
 
 use super::{Agent, AgentError, EpochRecord, Invalid, Result, Status, epoch_key, group_key};
 use crate::archive::{
@@ -113,13 +113,13 @@ fn certificate_current(account_key: &str, device_key: &str, c: &ArchiveCertifica
         signature: c.signature.clone(),
     };
     // Unsigned until the signature is checked: bounded before any arithmetic.
-    let valid = 1..=vc_proto::MAX_SAFE_INTEGER;
+    let valid = 1..=gwar_proto::MAX_SAFE_INTEGER;
     valid.contains(&c.issued_at)
         && valid.contains(&c.expires_at)
         && c.issued_at <= now
         && now < c.expires_at
         && c.expires_at.checked_sub(c.issued_at).is_some_and(|d| d <= 90 * 86_400_000)
-        && vc_proto::signed_by(account_key, &vc_proto::device_statement(&certificate), &c.signature)
+        && gwar_proto::signed_by(account_key, &gwar_proto::device_statement(&certificate), &c.signature)
 }
 
 impl ArchiveRecord {

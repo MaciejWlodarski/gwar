@@ -1,6 +1,6 @@
 import { normalizeEndpoint } from "./handshake";
 import { describe, expect, it } from "vitest";
-import endpointVectors from "../../../../crates/vc-proto/tests/endpoint-normalization.json";
+import endpointVectors from "../../../../crates/gwar-proto/tests/endpoint-normalization.json";
 import { generateKeyPair, certifyDevice } from "../connect/crypto";
 import { decodeBase64Url } from "./base64url";
 import {

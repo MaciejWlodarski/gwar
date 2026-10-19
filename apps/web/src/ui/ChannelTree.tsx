@@ -33,7 +33,7 @@ import { canActOn } from "../lib/permissions";
 import { ModerationItems } from "./ModerationMenu";
 import { EmptyState, TalkingAvatar, Slider, menuContent, menuItem, menuItemDanger, menuLabel, menuSeparator } from "./kit";
 
-const CLIENT_MIME = "application/x-vc-client";
+const CLIENT_MIME = "application/x-gwar-client";
 
 export function ChannelTree() {
   const t = useT();
@@ -104,7 +104,7 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
   const canEdit = canManage;
   const canDelete = canManage;
   const canJoin = useChannelPermission(channel.id, "connect");
-  const vc = useSession((s) => s.kind === "vc");
+  const onGwar = useSession((s) => s.kind === "gwar");
   const joining = useUi((s) => s.joining === channel.id);
   const toggleCollapsed = useUi((s) => s.toggleCollapsed);
   const openDialog = useUi((s) => s.openDialog);
@@ -238,7 +238,7 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
               <Pencil className="size-4" /> {t("tree.edit")}
             </ContextMenu.Item>
           )}
-          {canEdit && vc && (
+          {canEdit && onGwar && (
             <ContextMenu.Item className={menuItem} onSelect={() => openDialog({ kind: "channelPermissions", channel: channel.id })}>
               <ShieldCheck className="size-4" /> {t("chperm.open")}
             </ContextMenu.Item>
@@ -278,9 +278,9 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
   const me = useMyWho();
   const target = useWhoOf(client.uid, client.groups);
   const groups = useSession((s) => s.groups);
-  const vc = useSession((s) => s.kind === "vc");
+  const onGwar = useSession((s) => s.kind === "gwar");
   // Myself, or someone ranked below me (docs/roles.md); a TeamSpeak server decides that itself.
-  const canMove = mayMove && (isMe || !vc || canActOn(me, target, groups));
+  const canMove = mayMove && (isMe || !onGwar || canActOn(me, target, groups));
   const color = useGroupsColor(client.groups);
   const openDm = () => {
     if (isMe) return;

@@ -3,7 +3,7 @@ import type { DeviceCertificate } from "../proto/DeviceCertificate";
 import type { Hello } from "../proto/Hello";
 import { decodeBase64Url, encodeBase64Url } from "./base64url";
 
-/** Mirrors vc_proto::normalize_endpoint. The path is part of the binding. */
+/** Mirrors gwar_proto::normalize_endpoint. The path is part of the binding. */
 export function normalizeEndpoint(address: string): string {
   if (!address || /[\s\\?#]/u.test(address) || !/^[a-z]+:\/\//i.test(address)) throw new Error("invalid endpoint");
   const url = new URL(address);

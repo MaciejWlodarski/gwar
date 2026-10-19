@@ -1,10 +1,10 @@
 //! Connects to a TeamSpeak server in TeamSpeak mode and sends a chat message,
 //! printing how long the reply takes.
-//!   cargo run -p vc-desktop --example ts_probe -- 127.0.0.1:9987 nick "text"
+//!   cargo run -p gwar-desktop --example ts_probe -- 127.0.0.1:9987 nick "text"
 use std::time::Instant;
 
-use vc_client::teamspeak::{self, TsOptions};
-use vc_proto::{ChatTarget, Request};
+use gwar_client::teamspeak::{self, TsOptions};
+use gwar_proto::{ChatTarget, Request};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -16,7 +16,7 @@ async fn main() -> anyhow::Result<()> {
         address,
         nickname,
         server_password: None,
-        identity: teamspeak::load_identity(&std::env::temp_dir().join("vc-ts-probe-identity.json"))?,
+        identity: teamspeak::load_identity(&std::env::temp_dir().join("gwar-ts-probe-identity.json"))?,
     })
     .await?;
     let me = ts.welcome.session;
@@ -27,7 +27,7 @@ async fn main() -> anyhow::Result<()> {
     let r = ts
         .handle
         .request(Request::ChatSend {
-            signature: vc_proto::MessageSignature::default(),
+            signature: gwar_proto::MessageSignature::default(),
             target: ChatTarget::Channel(channel),
             text,
             mentions: Vec::new(),

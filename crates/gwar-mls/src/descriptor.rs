@@ -2,8 +2,8 @@
 //! (docs/e2e.md "The descriptor", docs/e2e-build.md "Descriptor").
 
 use ed25519_dalek::{Signer, SigningKey};
+use gwar_proto::Uid;
 use sha2::{Digest, Sha256};
-use vc_proto::Uid;
 
 use crate::credential::Credential;
 use crate::encoding::{b64, decimal, fixed, netstrings, parse_netstrings};
@@ -208,7 +208,7 @@ impl SignedDescriptor {
         let descriptor = Descriptor::parse(statement)?;
         let creator = Credential::parse(fields[1])?;
         let signature = std::str::from_utf8(fields[2]).ok()?.to_owned();
-        (creator.uid() == descriptor.creator_uid && vc_proto::signed_by(creator.device_key(), statement, &signature))
+        (creator.uid() == descriptor.creator_uid && gwar_proto::signed_by(creator.device_key(), statement, &signature))
             .then_some(Self { descriptor, creator, signature })
     }
 
@@ -223,7 +223,7 @@ mod tests {
     use crate::credential::tests::{certified, key, public};
 
     fn uid(seed: u8) -> Uid {
-        vc_proto::uid_for_key(key(seed).verifying_key().as_bytes())
+        gwar_proto::uid_for_key(key(seed).verifying_key().as_bytes())
     }
 
     fn dm() -> (Descriptor, Credential) {

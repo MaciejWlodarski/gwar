@@ -1,7 +1,7 @@
 //! The TeamSpeak identities of this device, and the ones that follow the Gwar Connect
 //! account (docs/connect.md, "TeamSpeak identities").
 //!
-//! Two lists in the app data directory (`vc_client::ts_identities` has the format):
+//! Two lists in the app data directory (`gwar_client::ts_identities` has the format):
 //!
 //! - `teamspeak-identities.json`: this device's own identities. A device that has only the
 //!   single identity of older versions (`teamspeak-identity.json`) gets a list of one named "Default".
@@ -34,14 +34,14 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
-use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
-use vc_client::{
+use gwar_client::{
     ts_identities::{self, DEFAULT_NAME, List},
     ts_identity::{self, Identity as TsIdentity},
     ts_import,
 };
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Manager};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
 /// The identity files in one directory.
 struct Files {
@@ -352,7 +352,7 @@ pub async fn ts_identity_detect(app: AppHandle) -> Result<Vec<ts_import::Found>,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vc_client::ts_identity::{export, uid};
+    use gwar_client::ts_identity::{export, uid};
 
     struct Dir(PathBuf);
 

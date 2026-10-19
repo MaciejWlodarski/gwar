@@ -1,7 +1,7 @@
 import "fake-indexeddb/auto";
 import { describe, expect, it, vi } from "vitest";
-import vectors from "../../../../crates/vc-proto/tests/message-signing.json";
-import attachmentVectors from "../../../../crates/vc-proto/tests/attachment-body.json";
+import vectors from "../../../../crates/gwar-proto/tests/message-signing.json";
+import attachmentVectors from "../../../../crates/gwar-proto/tests/attachment-body.json";
 import { CONNECT_URL } from "../lib/official";
 import { messageTarget } from "../lib/chat";
 import { certifyDevice, keyFromSeed, signText, revokeStatement } from "../connect/crypto";
@@ -23,7 +23,7 @@ const storage = () => new MessageStorage(`test-${crypto.randomUUID()}`);
 async function fixture(device = false, lifetime = 1000) {
   const account = await keyFromSeed(new Uint8Array(32).fill(1)), pair = await keyFromSeed(new Uint8Array(32).fill(device ? 2 : 3));
   const cert = device ? { ...await certifyDevice(account, pair.publicKey, now - 1000, now + lifetime), account_key: account.publicKey } : undefined;
-  const identity = { ...pair, nickname: "Alice", exportBackup: () => ({ format: "vc-identity", version: 1, jwk: pair.jwk }), ...(cert ? { device: cert } : {}), sign: (bytes: Uint8Array) => signText(pair.jwk, new TextDecoder().decode(bytes)) } as Identity;
+  const identity = { ...pair, nickname: "Alice", exportBackup: () => ({ format: "gwar-identity", version: 1, jwk: pair.jwk }), ...(cert ? { device: cert } : {}), sign: (bytes: Uint8Array) => signText(pair.jwk, new TextDecoder().decode(bytes)) } as Identity;
   const uid = await uidForPublicKey(device ? account.publicKey : pair.publicKey);
   const ctx = { serverKey: vectors[0]!.signature.server_key, target: "channel:7" };
   const msg: ChatMessage = { id: 1, target: { channel: 7 }, author: 3, author_uid: uid, author_name: "Alice", text: "hello", sent_at: now, mentions: [], attachments: [] };

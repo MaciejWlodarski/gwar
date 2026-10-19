@@ -162,7 +162,7 @@ export const en = {
   "security.fingerprint": "Server key fingerprint",
   "security.fingerprintHelp": "Compare it with the server owner to make sure you are connected to the right server.",
   "ss.ownership": "Ownership",
-  "own.none": "This server has no owner yet. Its operator names one with `vc-server owner set`, or whoever redeems the first admin token becomes it.",
+  "own.none": "This server has no owner yet. Its operator names one with `gwar-server owner set`, or whoever redeems the first admin token becomes it.",
   "own.verifying": "Checking the owner record…",
   "own.owner": "Owner",
   "own.verified": "Checked by this device against the owner record it keeps for this server.",

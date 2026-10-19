@@ -64,13 +64,13 @@ job only verifies that all versions agree with each other.
 | `Gwar_X.Y.Z_x64_en-US.msi` | Windows installer (MSI) |
 | `Gwar_X.Y.Z_amd64.AppImage` | Linux desktop app, runs anywhere with a recent glibc |
 | `Gwar_X.Y.Z_amd64.deb` | Linux desktop app for Debian and Ubuntu |
-| `gwar-server-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` | `vc-server` and `gwar-connect`, Linux x86-64 |
+| `gwar-server-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` | `gwar-server` and `gwar-connect`, Linux x86-64 |
 | `gwar-server-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz` | the same for Linux ARM64 (Oracle Ampere, Raspberry Pi 4/5 with a 64-bit OS) |
 | `SHA256SUMS` | SHA-256 of every file above |
 | `SHA256SUMS.minisig` | minisign signature of `SHA256SUMS` with the release key |
 
 The desktop file names come from Tauri, so they can differ slightly from this
-table. The server archives hold a folder with `vc-server`, `gwar-connect`,
+table. The server archives hold a folder with `gwar-server`, `gwar-connect`,
 `LICENSE` and `THIRD_PARTY_NOTICES.md`. They include TeamSpeak support (the
 default `teamspeak` feature), link Opus statically, and are built on Ubuntu
 22.04, so they need glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+).

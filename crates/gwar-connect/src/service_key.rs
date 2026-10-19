@@ -4,7 +4,7 @@ use std::{fs, io::Write, path::Path};
 
 use anyhow::{Context, Result};
 use ed25519_dalek::{Signer, SigningKey};
-use vc_proto::{HandleAttestation, handle_statement};
+use gwar_proto::{HandleAttestation, handle_statement};
 
 use crate::crypto::b64;
 

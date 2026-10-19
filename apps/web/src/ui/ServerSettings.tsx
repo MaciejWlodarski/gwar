@@ -90,7 +90,7 @@ export function ServerSettingsDialog({ tab }: { tab?: ServerSettingsTab }) {
   const canBan = usePermission("ban_members");
   const canInvite = usePermission("create_invites");
   const canRemove = usePermission("manage_members");
-  const vc = kind === "vc";
+  const onGwar = kind === "gwar";
   // The owner, confirmers and managers of private channels (6b), for those who may act on them.
   const owned = useSession((s) => !!s.owner);
   const canEdit = usePermission("manage_channels");
@@ -98,14 +98,14 @@ export function ServerSettingsDialog({ tab }: { tab?: ServerSettingsTab }) {
   const tabs = useMemo(() => {
     const list: Array<SettingsPage<ServerSettingsTab>> = [];
     if (canServer) list.push({ id: "overview", label: t("ss.overview"), icon: <Lock className="size-4" /> });
-    if (vc && (canGroups || canServer)) list.push({ id: "roles", wide: true, label: t("ss.roles"), icon: <ShieldCheck className="size-4" /> });
-    if (vc && (canGroups || canServer || canBan || canRemove)) list.push({ id: "members", wide: true, label: t("ss.members"), icon: <Users className="size-4" /> });
-    if (vc && owned && (canServer || canEdit)) list.push({ id: "ownership", wide: true, label: t("ss.ownership"), icon: <Crown className="size-4" /> });
-    if (vc && canRemove) list.push({ id: "cleanup", wide: true, label: t("ss.cleanup"), icon: <UserMinus className="size-4" /> });
-    if (vc && canBan) list.push({ id: "bans", wide: true, label: t("ss.bans"), icon: <Ban className="size-4" /> });
-    if (vc && canInvite) list.push({ id: "invites", wide: true, label: t("ss.invites"), icon: <Link2 className="size-4" /> });
+    if (onGwar && (canGroups || canServer)) list.push({ id: "roles", wide: true, label: t("ss.roles"), icon: <ShieldCheck className="size-4" /> });
+    if (onGwar && (canGroups || canServer || canBan || canRemove)) list.push({ id: "members", wide: true, label: t("ss.members"), icon: <Users className="size-4" /> });
+    if (onGwar && owned && (canServer || canEdit)) list.push({ id: "ownership", wide: true, label: t("ss.ownership"), icon: <Crown className="size-4" /> });
+    if (onGwar && canRemove) list.push({ id: "cleanup", wide: true, label: t("ss.cleanup"), icon: <UserMinus className="size-4" /> });
+    if (onGwar && canBan) list.push({ id: "bans", wide: true, label: t("ss.bans"), icon: <Ban className="size-4" /> });
+    if (onGwar && canInvite) list.push({ id: "invites", wide: true, label: t("ss.invites"), icon: <Link2 className="size-4" /> });
     return list;
-  }, [t, vc, canServer, canGroups, canBan, canRemove, canInvite, owned, canEdit]);
+  }, [t, onGwar, canServer, canGroups, canBan, canRemove, canInvite, owned, canEdit]);
 
   const [chosen, setCurrent] = useState<ServerSettingsTab>(tab ?? "overview");
   // Permissions can change under us (a role edit): fall back from tabs that are no longer allowed.
@@ -149,7 +149,7 @@ function OverviewTab() {
   const server = useSession((s) => s.server);
   const kind = useSession((s) => s.kind);
   const channels = useSession((s) => s.channels);
-  const vc = kind === "vc";
+  const onGwar = kind === "gwar";
   const [name, setName] = useState(server?.name ?? "");
   const [welcome, setWelcome] = useState(server?.welcome ?? "");
   const [defaultChannel, setDefaultChannel] = useState(String(server?.default_channel ?? NO_CHANNEL));
@@ -167,7 +167,7 @@ function OverviewTab() {
     const update: Parameters<typeof controller.updateServer>[0] = {};
     if (name.trim() !== server?.name) update.name = name.trim();
     if (welcome !== server?.welcome) update.welcome = welcome;
-    if (vc) {
+    if (onGwar) {
       if (defaultChannel !== NO_CHANNEL && Number(defaultChannel) !== server?.default_channel) update.default_channel = Number(defaultChannel);
       const max = Number(maxClients);
       if (!Number.isInteger(max) || max < 1 || max > 100_000) {
@@ -202,7 +202,7 @@ function OverviewTab() {
       <Field label={t("serverSettings.welcome")} hint={t("serverSettings.welcomeHint")}>
         {(id) => <Textarea id={id} rows={4} value={welcome} onChange={(e) => setWelcome(e.target.value)} maxLength={1000} />}
       </Field>
-      {vc && (
+      {onGwar && (
         <>
           <div className="grid gap-3 sm:grid-cols-2">
             <Field label={t("ss.defaultChannel")} hint={t("ss.defaultChannelHint")}>

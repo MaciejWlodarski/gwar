@@ -33,11 +33,11 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --workspace --exclude vc-desktop --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude gwar-desktop --all-targets -- -D warnings
       - name: Tests
-        run: cargo test --workspace --exclude vc-desktop
+        run: cargo test --workspace --exclude gwar-desktop
 
-  # The jobs below select the whole workspace (with vc-server's test hooks) so that dependency
+  # The jobs below select the whole workspace (with gwar-server's test hooks) so that dependency
   # features unify as in the rust job and its cached dependencies are reused; `-p` would rebuild them.
 
   # Real-time voice tests that need a runner of their own.
@@ -57,14 +57,14 @@ jobs:
       - name: System libraries (Opus, ALSA)
         run: sudo apt-get update && sudo apt-get install -y libopus-dev libasound2-dev pkg-config
       - name: Queued encrypted voice
-        run: cargo test --workspace --exclude vc-desktop --features vc-server/test-hooks --test mls voice_opaque_srtp
+        run: cargo test --workspace --exclude gwar-desktop --features gwar-server/test-hooks --test mls voice_opaque_srtp
       - name: Eight native SFrame senders, alone (nine real-time engines)
         # Nine devices join one MLS group in a debug build: single frames can take longer than 3 s here.
         env:
-          VC_TEST_FRAME_TIMEOUT_SECS: "30"
-        run: cargo test --workspace --exclude vc-desktop --features vc-server/test-hooks --test mls native_sframe_receiver_decodes_eight_senders_on_all_slots -- --ignored
+          GWAR_TEST_FRAME_TIMEOUT_SECS: "30"
+        run: cargo test --workspace --exclude gwar-desktop --features gwar-server/test-hooks --test mls native_sframe_receiver_decodes_eight_senders_on_all_slots -- --ignored
       - name: Server without TeamSpeak support
-        run: cargo build -p vc-server --no-default-features
+        run: cargo build -p gwar-server --no-default-features
 
   # Runs the official TeamSpeak server (downloaded and checksum-verified),
   # one at a time: its free license allows a single instance per host.
@@ -84,15 +84,15 @@ jobs:
       - name: System libraries (Opus, ALSA)
         run: sudo apt-get update && sudo apt-get install -y libopus-dev libasound2-dev pkg-config
       - name: Deterministic TeamSpeak hook regressions
-        run: cargo test --workspace --exclude vc-desktop --features vc-server/test-hooks --lib teamspeak
+        run: cargo test --workspace --exclude gwar-desktop --features gwar-server/test-hooks --lib teamspeak
       - name: TeamSpeak bridge end-to-end
         env:
-          VC_TS3_DIR: ${{ runner.temp }}/ts3
-        run: cargo test --workspace --exclude vc-desktop --features vc-server/test-hooks --test teamspeak_mode --test teamspeak_interop -- --test-threads=1
+          GWAR_TS3_DIR: ${{ runner.temp }}/ts3
+        run: cargo test --workspace --exclude gwar-desktop --features gwar-server/test-hooks --test teamspeak_mode --test teamspeak_interop -- --test-threads=1
       - name: TeamSpeak channel permissions
         env:
-          VC_TS3_DIR: ${{ runner.temp }}/ts3
-        run: cargo test --workspace --exclude vc-desktop --features vc-server/test-hooks --test teamspeak_channels --test teamspeak_import -- --ignored --test-threads=1
+          GWAR_TS3_DIR: ${{ runner.temp }}/ts3
+        run: cargo test --workspace --exclude gwar-desktop --features gwar-server/test-hooks --test teamspeak_channels --test teamspeak_import -- --ignored --test-threads=1
 
   # Known vulnerabilities in dependencies fail the build (advisories only, not
   # "unmaintained" notices). Separate, so the other jobs still report.
@@ -172,10 +172,10 @@ jobs:
       # Only built here, never run: unoptimized dependencies build faster.
       - name: Build desktop
         shell: bash
-        run: cargo build -p vc-desktop --config 'profile.dev.package."*".opt-level=0'
+        run: cargo build -p gwar-desktop --config 'profile.dev.package."*".opt-level=0'
 
   # Builds the MLS wasm once; the jobs that need it start as soon as it is uploaded.
-  # The browser jobs get vc-server, gwar-connect and the native_bridge example from the same
+  # The browser jobs get gwar-server, gwar-connect and the native_bridge example from the same
   # build as the rust job's tests (`cargo test --no-run` builds binaries and examples too).
   mls-wasm:
     runs-on: ubuntu-24.04
@@ -243,7 +243,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Browser MLS runtime with the local delivery service
         run: |
-          cargo test --workspace --exclude vc-desktop --no-run
+          cargo test --workspace --exclude gwar-desktop --no-run
           pnpm --filter web exec playwright install --with-deps chromium
           pnpm --filter web e2e:mls
 
@@ -277,7 +277,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Smoke test in the browser
         run: |
-          cargo test --workspace --exclude vc-desktop --no-run
+          cargo test --workspace --exclude gwar-desktop --no-run
           pnpm --filter web exec playwright install --with-deps chromium
           pnpm --filter web e2e
 
@@ -311,7 +311,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Encrypted voice in Chromium and WebKit
         run: |
-          cargo test --workspace --exclude vc-desktop --no-run
+          cargo test --workspace --exclude gwar-desktop --no-run
           pnpm --filter web exec playwright install --with-deps chromium webkit
           sudo apt-get install -y pulseaudio
           # Headless browsers need an audio output for the WebAudio taps.
@@ -349,7 +349,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Private channels, direct messages and the key archive in the browser
         run: |
-          cargo test --workspace --exclude vc-desktop --no-run
+          cargo test --workspace --exclude gwar-desktop --no-run
           pnpm --filter web exec playwright install --with-deps chromium
           pnpm --filter web e2e:private
           pnpm --filter web e2e:dm

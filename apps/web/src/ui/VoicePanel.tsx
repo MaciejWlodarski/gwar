@@ -103,7 +103,7 @@ export function VoicePanel() {
   const channelName = useSession((s) => (me?.channel != null ? s.channels[me.channel]?.name : undefined));
   const phase = useSession((s) => s.phase);
   // TeamSpeak servers always keep you in a channel: there is nothing to leave.
-  const canLeave = useSession((s) => s.kind === "vc");
+  const canLeave = useSession((s) => s.kind === "gwar");
   const canSpeak = useChannelPermission(me?.channel ?? null, "speak");
 
   if (me && me.channel === null) {

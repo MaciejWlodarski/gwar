@@ -51,7 +51,7 @@ post-quantum suites (MLS can add them later); push notifications.
 - Encrypted direct messages and server-wide chat are **stored** (as
   ciphertext), so they reach members who are offline and survive a reload.
   Direct messages are implemented; server-wide chat remains live-only until step 4.
-- Pre-release: no compatibility with today's protocol (`vc/3` becomes `vc/4`).
+- Pre-release: no compatibility with today's protocol (`gwar/3` becomes `gwar/4`).
 
 ## Building blocks
 
@@ -97,7 +97,7 @@ nonces and 128-bit tags.
 ## Identities in MLS
 
 Each **device** is one MLS member (a leaf), identified by its
-`client_signing_pk`, the key it already uses for vc/3 and message
+`client_signing_pk`, the key it already uses for gwar/3 and message
 signatures. A person with three devices has three leaves; the interface
 groups leaves by uid.
 
@@ -584,7 +584,7 @@ Local identities have one device and no archive.
   all eight receiver transforms are attached when the transceivers are
   created, before any frame flows. Keys are posted to the worker only when
   they change.
-- **Desktop**: the native engine (`vc-client`) encrypts and decrypts with the
+- **Desktop**: the native engine (`gwar-client`) encrypts and decrypts with the
   `sframe` crate, decrypting before it inspects Opus or fills the jitter
   buffer. The web layer, which runs MLS, passes keys through a new
   `voice_set_keys` command (High risk class): bound to the engine run,
@@ -731,7 +731,7 @@ and epoch a key belongs to, are encrypted.
 
 ## Protocol changes (sketch)
 
-`vc/4`, with no compatibility with `vc/3`:
+`gwar/4`, with no compatibility with `gwar/3`:
 
 - `mls.key_packages.publish`, `mls.key_packages.claim {uid}`;
 - `mls.group_info {group}`, `mls.commit {group, epoch, commit, welcome?,
@@ -759,7 +759,7 @@ p95/p99.
 | --- | --- | --- |
 | S1 MLS in the web app | Does OpenMLS 0.9 work in WebAssembly for create, external commit, add/remove, external-sender removals, exporter, GroupContext extensions, in Chrome, Firefox and Safari? Can it sign with the existing device key? Can a client catch up through epochs holding expired leaves and then remove them? Bundle size, speed, persistence in IndexedDB? | All operations work in the three browsers; gzip size under 400 KB; a commit in a 100-device group under 100 ms (p95) on a laptop; state survives reloads and a crash mid-commit. Otherwise mls-rs or ts-mls is evaluated the same way. |
 | S2 SFrame in browsers | Does `RTCRtpScriptTransform` encrypt to our SFU and decrypt across slot changes in Chrome, Firefox and Safari, failing closed? | Clean audio with eight senders; speakers moving between slots keep decrypting; added latency p99 under 2 ms including worker queueing, also with the tab in the background; no plaintext frame ever sent or played. |
-| S3 SFrame native | Does `sframe` 2.0 in `vc-client` interoperate with S2? | Shared test vectors pass both ways; frames at the 1000-byte cap with the widest key id and counter, and the negotiated RTP extensions, cross the real SFU intact in both directions; larger frames are dropped. |
+| S3 SFrame native | Does `sframe` 2.0 in `gwar-client` interoperate with S2? | Shared test vectors pass both ways; frames at the 1000-byte cap with the widest key id and counter, and the negotiated RTP extensions, cross the real SFU intact in both directions; larger frames are dropped. |
 | S4 SFU and latency | Timestamp-based forwarding, speech gate, end-to-end cost. | Talking indicators and slots unchanged; mouth-to-ear p95 within 2 ms of plaintext on the VM; correct timing with packet loss, reordering, duplicates, timestamp wrap and resets, silence, mute, burst delivery and resumed speech. |
 | S5 Churn | Joins, removals, restarts, overlapping transitions, lost, fabricated or duplicate acknowledgements, withheld commits, repeated key installation, leaf reuse, epoch wrap, silent senders across epochs, more than eight epochs in a row, a call ending and a new one starting with returning devices, stale `voice_set_keys` calls. | Zero nonce reuse; a removed participant decrypts nothing after the removal commit is processed; no plaintext fallback; audio resumes after every transition (time to usable audio measured). |
 | S6 TeamSpeak isolation | With the official TS3 server: moves, whispers, puppets in their grace period, query listeners, restarts. | Zero bytes of an encrypted channel's audio or text reach TeamSpeak, and no TeamSpeak audio, whisper or text enters an encrypted conversation; plaintext channels keep working both ways. |

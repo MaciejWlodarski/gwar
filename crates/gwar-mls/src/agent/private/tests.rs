@@ -12,7 +12,7 @@ fn server() -> String {
     public(&key(200))
 }
 fn uid(account: u8) -> Uid {
-    vc_proto::uid_for_key(key(account).verifying_key().as_bytes())
+    gwar_proto::uid_for_key(key(account).verifying_key().as_bytes())
 }
 /// Device `seed` of account `account`, with the owner chain of account 1 pinned.
 fn device(account: u8, seed: u8, t: i64, chain: &OwnerChain) -> Agent {

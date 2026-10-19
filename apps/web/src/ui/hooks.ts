@@ -40,7 +40,7 @@ export function usePermission(p: Permission): boolean {
 export function useChannelPermission(channel: number | null | undefined, p: Permission): boolean {
   return useSession((s) => {
     // TeamSpeak servers keep their own rules; their permissions arrive as they are.
-    if (channel == null || !s.me || s.kind !== "vc") return s.permissions.includes(p);
+    if (channel == null || !s.me || s.kind !== "gwar") return s.permissions.includes(p);
     const me = s.clients[s.me.session];
     if (!me || !s.channels[channel]) return false;
     const owner = !!s.owner && s.owner.uid === s.me.uid;

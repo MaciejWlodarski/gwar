@@ -13,7 +13,7 @@ const commit = process.env.GITHUB_SHA ?? (() => {
 })();
 
 // The dev server proxies the WebSocket so `pnpm dev` works against a local
-// `vc-server` without CORS or mixed-content issues.
+// `gwar-server` without CORS or mixed-content issues.
 export default defineConfig(({ command, mode }) => ({
   plugins: [react(), tailwindcss(), {
     name: "production-csp",

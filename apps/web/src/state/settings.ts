@@ -8,8 +8,8 @@ import type { InputMode } from "../voice/engine";
 export type Theme = "system" | "dark" | "light";
 export type Language = "pl" | "en";
 
-/** `vc`: a vc/1 server (WebSocket + WebRTC). `teamspeak`: a TeamSpeak 3/6 server (desktop app only). */
-export type ServerKind = "vc" | "teamspeak";
+/** `gwar`: a gwar/1 server (WebSocket + WebRTC). `teamspeak`: a TeamSpeak 3/6 server (desktop app only). */
+export type ServerKind = "gwar" | "teamspeak";
 
 export interface Bookmark {
   id: string;
@@ -17,7 +17,7 @@ export interface Bookmark {
   name: string;
   /** What the user typed; parsed with `parseServerAddress` at connect time. */
   address: string;
-  /** Missing in bookmarks saved before TeamSpeak support: those are `vc`. */
+  /** Missing in bookmarks saved before TeamSpeak support: those are `gwar`. */
   kind?: ServerKind;
   /** Explicit per-server desktop LAN plaintext opt-in. */
   insecureLan?: boolean;
@@ -69,7 +69,7 @@ export function useBookmarks(): Bookmark[] {
 
 /** Whether two bookmarks differ in what Gwar Connect syncs. */
 function syncedChange(a: Bookmark, b: Bookmark): boolean {
-  return a.name !== b.name || a.address !== b.address || (a.kind ?? "vc") !== (b.kind ?? "vc") || (a.password ?? "") !== (b.password ?? "") || (a.identity ?? "") !== (b.identity ?? "");
+  return a.name !== b.name || a.address !== b.address || (a.kind ?? "gwar") !== (b.kind ?? "gwar") || (a.password ?? "") !== (b.password ?? "") || (a.identity ?? "") !== (b.identity ?? "");
 }
 
 /** A change's time: now, but always after the last one, so a device whose clock is behind still wins with a newer edit. */
@@ -253,7 +253,7 @@ export const useSettings = create<SettingsState>()(
       bookmarkEdits: 0,
       lastNickname: "",
       lastAddress: "",
-      lastKind: "vc",
+      lastKind: "gwar",
       tsDetectAsked: false,
       tsClaimAsked: {},
       channelEncryption: {},
@@ -333,14 +333,14 @@ export const useSettings = create<SettingsState>()(
           bookmarks: s.bookmarks.filter((b) => b.account !== account || !syncable(b)),
           removedBookmarks: Object.fromEntries(Object.entries(s.removedBookmarks).filter(([, r]) => !inAccount(r, account))),
         })),
-      setLast: (lastAddress, lastKind = "vc") => set({ lastAddress, lastKind }),
+      setLast: (lastAddress, lastKind = "gwar") => set({ lastAddress, lastKind }),
       setTsDetectAsked: (tsDetectAsked) => set({ tsDetectAsked }),
       setTsClaimAsked: (serverKey) => set((s) => ({ tsClaimAsked: { ...s.tsClaimAsked, [serverKey]: true } })),
       setChannelEncryption: (serverKey, encrypted) => set((s) => ({ channelEncryption: { ...s.channelEncryption, [serverKey]: encrypted } })),
       setArchiveUploads: (archiveUploads) => set({ archiveUploads }),
     }),
     {
-      name: "vc.settings",
+      name: "gwar.settings",
       version: 1,
       // Persist the cleaned bookmark shape while retaining the legacy migration source.
       onRehydrateStorage: () => (state) => {
