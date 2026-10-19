@@ -25,6 +25,10 @@ pub enum BridgeNote {
     Event(Box<Event>),
     /// A ban on a remote user was lifted on our side.
     Unban { uid: Uid },
+    /// Whether a remote user may be heard in `channel`, where they are (`speak`, no moderator's
+    /// mute): the bridge marks them a talker on TeamSpeak, where nobody else talks. Sent when it
+    /// or their channel changes; the bridge applies it only while they are in that channel.
+    Talker { session: SessionId, channel: ChannelId, talks: bool },
 }
 
 /// Bridge → core.

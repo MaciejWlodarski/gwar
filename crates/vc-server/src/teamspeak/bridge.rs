@@ -27,7 +27,7 @@ use vc_proto::{
 };
 
 use super::{
-    channels::{self, ChannelMap, TsChannel},
+    channels::{self, BRIDGE_TALK_POWER, ChannelMap, TsChannel},
     install,
     listeners::{self, ChannelListeners},
     process::{ProcessConfig, TsProcess},
@@ -235,6 +235,8 @@ struct Remote {
     muted: bool,
     deafened: bool,
     away: Option<String>,
+    /// Whether TeamSpeak has them as a talker, as far as we set it (`None`: unknown, after a move).
+    talker: Option<bool>,
 }
 
 struct Bridge<'a> {
@@ -261,6 +263,9 @@ struct Bridge<'a> {
     query_clid: Option<u64>,
     /// Encrypted channels whose join power was set since the bridge started.
     locked: HashSet<u64>,
+    /// Who of the TeamSpeak users may talk, and in which of our channels, as our side last said
+    /// ([`BridgeNote::Talker`]).
+    talkers: HashMap<SessionId, (ChannelId, bool)>,
     /// TeamSpeak users a refused move left in place, with that channel: a second refusal there
     /// means our side will not take them in it either.
     held: HashMap<u16, u64>,
@@ -351,6 +356,7 @@ impl<'a> Bridge<'a> {
             query_clid: None,
             locked: HashSet::new(),
             held: HashMap::new(),
+            talkers: HashMap::new(),
         };
         let result = bridge.serve(&mut notifications, &mut puppet_rx, &mut listener_rx, ready).await;
         // Hand the TeamSpeak users back; the next attach starts from scratch.
@@ -492,6 +498,9 @@ impl<'a> Bridge<'a> {
             ("b_channel_join_ignore_maxclients", 1),
             // Our users may write to everyone.
             ("b_client_server_textmessage_send", 1),
+            // Mirrored channels need more talk power than anyone else has; our core
+            // already decided who of our users is heard.
+            ("i_client_talk_power", BRIDGE_TALK_POWER),
             // Every device of a member has a puppet with the member's identity,
             // and a guest identity may be connected only once.
             ("i_client_max_clones_uid", PUPPET_CLONES),
@@ -513,7 +522,10 @@ impl<'a> Bridge<'a> {
 
     async fn sync_channels(&mut self, channels: Vec<Channel>) -> Result<()> {
         self.channels = channels.into_iter().map(|c| (c.id, c)).collect();
-        let list = self.query.call(Cmd::new("channellist").flag("-topic").flag("-flags").flag("-limits")).await?;
+        let list = self
+            .query
+            .call(Cmd::new("channellist").flag("-topic").flag("-flags").flag("-limits").flag("-voice"))
+            .await?;
         self.ts = list.iter().filter_map(TsChannel::from_record).map(|c| (c.cid, c)).collect();
         let (channels, ts) = (&self.channels, &self.ts);
         self.map.retain(|ours, cid| channels.contains_key(&ours) && ts.contains_key(&cid));
@@ -563,7 +575,8 @@ impl<'a> Bridge<'a> {
                 .arg("cpid", parent)
                 .arg("channel_order", order)
                 .arg("channel_codec", 4)
-                .arg("channel_codec_quality", 10);
+                .arg("channel_codec_quality", 10)
+                .arg("channel_needed_talk_power", want.talk_power);
             for (key, value) in channels::max_clients_args(want.max_clients) {
                 cmd = cmd.arg(key, value);
             }
@@ -644,6 +657,7 @@ impl<'a> Bridge<'a> {
             muted: flag(r, "client_input_muted"),
             deafened: flag(r, "client_output_muted"),
             away: away_of(r),
+            talker: None,
         };
         let client = RemoteClient {
             uid: format!("ts:{uid}"),
@@ -674,9 +688,29 @@ impl<'a> Bridge<'a> {
     async fn remove_remote(&mut self, clid: u16, reason: LeaveReason) {
         self.held.remove(&clid);
         if let Some(remote) = self.remotes.remove(&clid) {
+            self.talkers.remove(&remote.session);
             self.shared.forget(clid);
             self.core.bridge(BridgeMsg::Leave(remote.session, reason)).await;
             self.reconcile(Duration::ZERO);
+        }
+    }
+
+    /// Marks a TeamSpeak user a talker or not, as our side last said ([`BridgeNote::Talker`]) for
+    /// the channel they are in (a decision for another one waits for the next note).
+    async fn apply_talker(&mut self, clid: u16) {
+        let Some(remote) = self.remotes.get(&clid) else { return };
+        let Some(&(channel, want)) = self.talkers.get(&remote.session) else { return };
+        if channel != self.our_channel(remote.cid) || remote.talker == Some(want) {
+            return;
+        }
+        let cmd = Cmd::new("clientedit").arg("clid", clid).arg("client_is_talker", u8::from(want));
+        match self.query.call(cmd).await {
+            Ok(_) => {
+                if let Some(remote) = self.remotes.get_mut(&clid) {
+                    remote.talker = Some(want);
+                }
+            }
+            Err(e) => warn!(clid, "TeamSpeak talker: {e:#}"),
         }
     }
 
@@ -953,6 +987,12 @@ impl<'a> Bridge<'a> {
             }
             BridgeNote::Event(event) => self.on_event(*event).await,
             BridgeNote::Unban { uid } => self.unban(&uid).await,
+            BridgeNote::Talker { session, channel, talks } => {
+                self.talkers.insert(session, (channel, talks));
+                if let Some((clid, _)) = self.remote_by_session(session) {
+                    self.apply_talker(clid).await;
+                }
+            }
         }
     }
 
@@ -1021,6 +1061,7 @@ impl<'a> Bridge<'a> {
                 } else if let Some((clid, _)) = self.remote_by_session(client) {
                     // Our side already removed the session; make TeamSpeak follow.
                     self.remotes.remove(&clid);
+                    self.talkers.remove(&client);
                     self.shared.forget(clid);
                     self.reconcile(Duration::ZERO);
                     let cmd = match &reason {
@@ -1207,6 +1248,12 @@ impl<'a> Bridge<'a> {
             if let Some(origin) = self.core.audio_origin(session).await {
                 self.shared.mirror(clid, cid, origin);
             }
+            // TeamSpeak takes a talker's flag away on a move: set it again where they may talk
+            // (in a channel our side has decided on; otherwise its note follows).
+            if let Some(remote) = self.remotes.get_mut(&clid) {
+                remote.talker = None;
+            }
+            self.apply_talker(clid).await;
             self.reconcile(Duration::ZERO);
         } else if let Some(&session) = self.puppet_clids.get(&clid) {
             // Someone moved a puppet on TeamSpeak; our user decides where they are.
@@ -1452,7 +1499,15 @@ mod tests {
     use super::*;
 
     fn remote(session: SessionId, cid: u64) -> Remote {
-        Remote { session, nickname: "TeamSpeak user".into(), cid, muted: false, deafened: false, away: None }
+        Remote {
+            session,
+            nickname: "TeamSpeak user".into(),
+            cid,
+            muted: false,
+            deafened: false,
+            away: None,
+            talker: None,
+        }
     }
 
     /// A ServerQuery that answers `channelcreate` with cid 42 and refuses
@@ -1542,6 +1597,7 @@ mod tests {
             query_clid: None,
             locked: HashSet::new(),
             held: HashMap::new(),
+            talkers: HashMap::new(),
         };
         bridge.map.link(1, 10);
         bridge.map.link(2, 20);
@@ -1651,6 +1707,7 @@ mod tests {
             query_clid: None,
             locked: HashSet::new(),
             held: HashMap::new(),
+            talkers: HashMap::new(),
         };
         bridge.map.link(1, 10);
         bridge.map.link(2, 20);
@@ -1736,6 +1793,7 @@ mod tests {
             query_clid: None,
             locked: HashSet::new(),
             held: HashMap::new(),
+            talkers: HashMap::new(),
         };
         let message = ChatMessage {
             id: 1,

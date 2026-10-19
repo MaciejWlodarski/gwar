@@ -16,6 +16,10 @@ use super::query::Record;
 /// TeamSpeak limits channel names to 40 characters.
 pub const TS_NAME_MAX: usize = 40;
 
+/// The talk power every mirrored channel needs: more than any TeamSpeak group has, so only
+/// those the bridge marks as talkers speak there (docs/roles.md, "TeamSpeak"), and our puppets.
+pub const BRIDGE_TALK_POWER: u32 = 1_000_000;
+
 /// The parts of a TeamSpeak channel we keep in sync.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TsChannel {
@@ -27,6 +31,7 @@ pub struct TsChannel {
     pub max_clients: Option<u32>,
     pub password: bool,
     pub default: bool,
+    pub talk_power: u32,
 }
 
 impl TsChannel {
@@ -42,6 +47,7 @@ impl TsChannel {
             max_clients: (max >= 0).then_some(max as u32),
             password: num("channel_flag_password") == Some(1),
             default: num("channel_flag_default") == Some(1),
+            talk_power: num("channel_needed_talk_power").and_then(|p| u32::try_from(p).ok()).unwrap_or(0),
         })
     }
 }
@@ -57,6 +63,7 @@ pub fn desired(channel: &Channel, parent: u64, order: u64) -> TsChannel {
         max_clients: channel.max_clients,
         password: channel.has_password,
         default: false,
+        talk_power: BRIDGE_TALK_POWER,
     }
 }
 
@@ -73,6 +80,9 @@ pub fn edits(current: &TsChannel, want: &TsChannel) -> Vec<(&'static str, String
     }
     if current.max_clients != want.max_clients {
         args.extend(max_clients_args(want.max_clients));
+    }
+    if current.talk_power != want.talk_power {
+        args.push(("channel_needed_talk_power", want.talk_power.to_string()));
     }
     args
 }
@@ -201,9 +211,12 @@ mod tests {
         c.max_clients = Some(5);
         let want = desired(&c, 0, 0);
         assert_eq!(want.name.chars().count(), TS_NAME_MAX);
-        let current = TsChannel { name: want.name.clone(), ..Default::default() };
+        let current = TsChannel { name: want.name.clone(), talk_power: BRIDGE_TALK_POWER, ..Default::default() };
         let args = edits(&current, &want);
         assert_eq!(args, vec![("channel_maxclients", "5".into()), ("channel_flag_maxclients_unlimited", "0".into())]);
+        // A channel from before (or one a TeamSpeak admin opened up) needs the bridge's talk power again.
+        let open = TsChannel { talk_power: 0, ..want.clone() };
+        assert_eq!(edits(&open, &want), vec![("channel_needed_talk_power", BRIDGE_TALK_POWER.to_string())]);
     }
 
     #[test]
