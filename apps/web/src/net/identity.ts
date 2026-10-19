@@ -126,7 +126,8 @@ function isValidBackup(value: unknown): value is IdentityBackup {
     jwk.kty === "OKP" &&
     jwk.crv === "Ed25519" &&
     typeof jwk.x === "string" &&
-    typeof jwk.d === "string"
+    typeof jwk.d === "string" &&
+    validNickname(v.nickname) !== undefined
   );
 }
 
@@ -214,12 +215,7 @@ export async function generateIdentity(): Promise<Identity> {
 
 export async function loadOrCreateIdentity(store: IdentityStore = indexedDbIdentityStore): Promise<Identity> {
   const existing = await store.load();
-  if (existing && isValidBackup(existing)) {
-    const nickname = validNickname(existing.nickname) ?? defaultNickname();
-    const backup = { ...existing, nickname };
-    if (existing.nickname !== nickname) await store.save(backup);
-    return fromBackup(backup);
-  }
+  if (existing && isValidBackup(existing)) return fromBackup(existing);
   const identity = await generateIdentity();
   await store.save(identity.exportBackup());
   return identity;
@@ -264,7 +260,7 @@ export async function importIdentity(text: string, store: IdentityStore = indexe
   if (!isValidBackup(parsed)) throw new Error("invalid identity file");
   // Normalise to exactly the fields we need; drop key_ops etc.
   const { kty, crv, x, d } = parsed.jwk;
-  const backup: IdentityBackup = { format: "gwar-identity", version: 1, jwk: { kty, crv, x, d }, nickname: validNickname(parsed.nickname) ?? defaultNickname() };
+  const backup: IdentityBackup = { format: "gwar-identity", version: 1, jwk: { kty, crv, x, d }, nickname: validNickname(parsed.nickname)! };
   const identity = await fromBackup(backup);
   // Make sure the public half really belongs to the private half.
   const probe = new TextEncoder().encode("probe");

@@ -26,6 +26,11 @@ describe("identity nicknames", () => {
     expect(restored.nickname).toBe("Previous");
     expect((await importIdentity(JSON.stringify(backup), store)).nickname).toBe("Previous");
   });
+  it("refuses a backup without a nickname", async () => {
+    const { nickname: _nickname, ...bare } = (await generateIdentity()).exportBackup();
+    const store: IdentityStore = { load: async () => undefined, save: async () => {} };
+    await expect(importIdentity(JSON.stringify(bare), store)).rejects.toThrow("invalid identity file");
+  });
   it("new identities get a persisted random default", async () => {
     let saved: IdentityBackup | undefined;
     const store: IdentityStore = { load: async () => saved, save: async (b) => { saved = b; } };
