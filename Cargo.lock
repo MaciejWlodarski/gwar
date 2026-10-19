@@ -2666,7 +2666,7 @@ dependencies = [
 
 [[package]]
 name = "gwar-client"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "audiopus",
@@ -2710,7 +2710,7 @@ dependencies = [
 
 [[package]]
 name = "gwar-connect"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2739,7 +2739,7 @@ dependencies = [
 
 [[package]]
 name = "gwar-desktop"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2802,7 +2802,7 @@ dependencies = [
 
 [[package]]
 name = "gwar-proto"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "curve25519-dalek 4.1.3",
@@ -2817,7 +2817,7 @@ dependencies = [
 
 [[package]]
 name = "gwar-server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "arc-swap",

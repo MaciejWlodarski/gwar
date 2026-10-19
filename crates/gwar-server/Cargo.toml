@@ -1,6 +1,6 @@
 [package]
 name = "gwar-server"
-version = "0.1.1"
+version = "0.1.2"
 description = "Self-hosted voice server core: WebSocket gateway, WebRTC SFU and TeamSpeak compatibility"
 edition.workspace = true
 license.workspace = true

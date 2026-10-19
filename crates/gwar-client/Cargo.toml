@@ -1,6 +1,6 @@
 [package]
 name = "gwar-client"
-version = "0.1.1"
+version = "0.1.2"
 description = "Native client for the gwar/3 protocol (used by the desktop app)"
 edition.workspace = true
 license.workspace = true
