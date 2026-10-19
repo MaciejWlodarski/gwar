@@ -71,10 +71,7 @@ fn err(e: anyhow::Error) -> String {
 
 impl Files {
     fn in_dir(dir: &Path) -> Self {
-        Self {
-            device: dir.join("teamspeak-identities.json"),
-            account: dir.join("teamspeak-identities.account.json"),
-        }
+        Self { device: dir.join("teamspeak-identities.json"), account: dir.join("teamspeak-identities.account.json") }
     }
 
     fn path(&self, source: Source) -> &Path {

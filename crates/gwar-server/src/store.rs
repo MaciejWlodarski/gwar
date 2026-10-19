@@ -1363,11 +1363,9 @@ impl Store {
 
     /// Includes expired attestations so a returning account still triggers refresh.
     pub fn has_connect_attestation(&self, user_id: i64) -> Result<bool> {
-        Ok(self.db.query_row(
-            "SELECT connect_attestation IS NOT NULL FROM users WHERE id=?1",
-            [user_id],
-            |r| r.get(0),
-        )?)
+        Ok(self
+            .db
+            .query_row("SELECT connect_attestation IS NOT NULL FROM users WHERE id=?1", [user_id], |r| r.get(0))?)
     }
 
     /// Disabling Connect forgets cached handles, so enabling it starts with fresh checks.
