@@ -89,6 +89,10 @@ export interface ResponseMap {
   "member.groups": { groups: number[] };
   "member.remove": Empty;
   "member.prune": { uids: string[]; count: number; members: Member[] };
+  "member.teamspeak.unlink": Empty;
+  "teamspeak.challenge": { nonce: string };
+  "teamspeak.claim": { teamspeak: string };
+  "teamspeak.claimable": { claimable: string[] };
   "ban.create": { ban: Ban };
   "ban.list": { bans: Ban[] };
   "ban.delete": Empty;

@@ -590,6 +590,10 @@ fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Option<Out
         | Request::MemberGroups { .. }
         | Request::MemberRemove { .. }
         | Request::MemberPrune(_)
+        | Request::MemberTeamspeakUnlink { .. }
+        | Request::TeamspeakChallenge {}
+        | Request::TeamspeakClaim { .. }
+        | Request::TeamspeakClaimable {}
         | Request::BanCreate(_)
         | Request::BanList {}
         | Request::BanDelete { .. }

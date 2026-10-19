@@ -54,6 +54,8 @@ sha1 = "0.10"
 tsclientlib = { git = "https://github.com/ReSpeak/tsclientlib", rev = "ee3bc6f45a7137db7793ba5593a321df400d53e5", default-features = false, features = ["audio", "unstable"], optional = true }
 tsproto = { git = "https://github.com/ReSpeak/tsclientlib", rev = "ee3bc6f45a7137db7793ba5593a321df400d53e5", optional = true }
 tsproto-packets = { git = "https://github.com/ReSpeak/tsclientlib", rev = "ee3bc6f45a7137db7793ba5593a321df400d53e5", optional = true }
+# TeamSpeak public keys and their uids, for claims (docs/teamspeak-import.md); no network code.
+tsproto-types = { git = "https://github.com/ReSpeak/tsclientlib", rev = "ee3bc6f45a7137db7793ba5593a321df400d53e5" }
 tar = { version = "0.4", default-features = false, optional = true }
 zip = { version = "9", default-features = false, features = ["deflate"], optional = true }
 

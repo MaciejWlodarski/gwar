@@ -80,7 +80,7 @@ impl Core {
     /// Whether `session` sees `channel` and may do `permission` there.
     pub(super) fn can_in(&self, session: SessionId, channel: ChannelId, permission: Permission) -> bool {
         let s = &self.sessions[&session];
-        self.admitted(Some(s), channel) && self.channel_permissions(&s.uid, &s.groups, channel).contains(&permission)
+        self.admitted(Some(s), channel) && self.channel_permissions(&s.member, &s.groups, channel).contains(&permission)
     }
 
     pub(super) fn require_in(
@@ -163,7 +163,7 @@ impl Core {
     /// What `session` may do in `channel` now.
     fn mine_in(&self, session: SessionId, channel: ChannelId) -> BTreeSet<Permission> {
         let s = &self.sessions[&session];
-        self.channel_permissions(&s.uid, &s.groups, channel)
+        self.channel_permissions(&s.member, &s.groups, channel)
     }
 
     /// Whether `session` may turn one target's override from `before` into `after` (either may be
@@ -242,7 +242,7 @@ impl Core {
             .filter(|s| s.channel.is_some_and(|c| within(self, c) && (s.out.is_some() || c != fallback)))
             .filter(|s| {
                 let c = s.channel.expect("in a channel");
-                !self.channel_permissions(&s.uid, &s.groups, c).contains(&Permission::Connect)
+                !self.channel_permissions(&s.member, &s.groups, c).contains(&Permission::Connect)
             })
             .map(|s| (s.id, s.out.is_none()))
             .collect();
@@ -285,7 +285,7 @@ impl Core {
             return Err(err(ErrorCode::BadRequest, "TeamSpeak users cannot be deafened from here"));
         }
         self.require_in(session, channel, Permission::MuteMembers)?;
-        if !self.outranks(session, &target.uid, &target.groups) {
+        if !self.outranks(session, &target.member, &target.groups) {
             return Err(err(ErrorCode::Forbidden, "this member is not below your rank"));
         }
         let s = self.sessions.get_mut(&client).expect("checked above");

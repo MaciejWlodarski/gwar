@@ -10,6 +10,7 @@
 pub mod bridge;
 pub mod files;
 mod history;
+mod links;
 mod messages;
 mod mls;
 pub use mls::TreeRefusal;
@@ -264,6 +265,11 @@ struct Session {
     id: SessionId,
     user_id: i64,
     uid: Uid,
+    /// The member whose roles, overrides, rank and bans apply: `uid`, except for a TeamSpeak
+    /// identity linked to a member (docs/teamspeak-import.md, "Linked TeamSpeak identities").
+    member: Uid,
+    /// The nonce `teamspeak.challenge` gave and when it expires (ms); a claim uses it up.
+    claim_nonce: Option<(String, i64)>,
     nickname: String,
     /// Voice channel; `None` while on the server without being in voice.
     channel: Option<ChannelId>,
@@ -692,7 +698,8 @@ impl Core {
     /// or restart without looking like an absence.
     fn touch_online(&self) {
         let now = now_ms();
-        let users: BTreeSet<_> = self.sessions.values().filter(|s| s.out.is_some()).map(|s| s.user_id).collect();
+        // TeamSpeak users who are members (imported, or linked to one) count too.
+        let users: BTreeSet<_> = self.sessions.values().filter(|s| s.user_id != 0).map(|s| s.user_id).collect();
         for user in users {
             if let Err(e) = self.store.set_last_seen(user, now) {
                 warn!("store: {e:#}");
@@ -741,7 +748,7 @@ impl Core {
             // The bridge is never admitted to a private channel.
             match self.event_view(&event, None) {
                 EventView::Same => self.notify_bridge(|| BridgeNote::Event(Box::new(event.clone()))),
-                EventView::Masked(masked) => self.notify_bridge(|| BridgeNote::Event(Box::new(masked))),
+                EventView::Masked(masked) => self.notify_bridge(|| BridgeNote::Event(masked)),
                 EventView::Hidden => {}
             }
         }
@@ -752,7 +759,7 @@ impl Core {
             match self.event_view(&event, Some(&self.sessions[&id])) {
                 EventView::Same => self.push(id, frame.clone()),
                 EventView::Masked(masked) => {
-                    let masked = masked_frame.get_or_insert_with(|| encode(&ServerFrame::Event(masked))).clone();
+                    let masked = masked_frame.get_or_insert_with(|| encode(&ServerFrame::Event(*masked))).clone();
                     self.push(id, masked);
                 }
                 EventView::Hidden => {}
@@ -782,11 +789,11 @@ impl Core {
             }
             Event::ClientJoined(c) | Event::ClientUpdated(c) if c.channel.is_some_and(hidden) => {
                 let masked = masked_client(c.clone());
-                EventView::Masked(if matches!(event, Event::ClientJoined(_)) {
+                EventView::Masked(Box::new(if matches!(event, Event::ClientJoined(_)) {
                     Event::ClientJoined(masked)
                 } else {
                     Event::ClientUpdated(masked)
-                })
+                }))
             }
             _ => EventView::Same,
         }
@@ -911,7 +918,7 @@ impl Core {
             .values()
             .filter_map(|s| {
                 let channel = s.channel?;
-                Some((s.id, self.channel_permissions(&s.uid, &s.groups, channel).contains(&Permission::Speak)))
+                Some((s.id, self.channel_permissions(&s.member, &s.groups, channel).contains(&Permission::Speak)))
             })
             .collect();
         let members = self
@@ -1107,6 +1114,8 @@ impl Core {
             certificate: r.certificate,
             id,
             user_id: user.id,
+            member: r.uid.clone(),
+            claim_nonce: None,
             uid: r.uid,
             nickname: user.nickname,
             channel: None,
@@ -1271,7 +1280,7 @@ impl Core {
         self.store.set_nickname(user_id, &nickname).map_err(storage_error)?;
         member.nickname = nickname.clone();
         self.broadcast(Event::MemberUpdated(member), |_| true);
-        let online: Vec<_> = self.sessions.values().filter(|s| s.uid == uid).map(|s| s.id).collect();
+        let online: Vec<_> = self.sessions.values().filter(|s| s.member == uid).map(|s| s.id).collect();
         for id in online {
             self.sessions.get_mut(&id).expect("online session").nickname = nickname.clone();
             self.client_updated(id);
@@ -1318,9 +1327,11 @@ impl Core {
         info!(session, uid = %s.uid, ?reason, "client left");
         if let Some(out) = &s.out {
             let _ = out.try_send(Outbound::Close(reason.clone()));
-            if let Err(e) = self.store.set_last_seen(s.user_id, now_ms()) {
-                warn!("store: {e:#}");
-            }
+        }
+        if s.user_id != 0
+            && let Err(e) = self.store.set_last_seen(s.user_id, now_ms())
+        {
+            warn!("store: {e:#}");
         }
         if let Err(tokio::sync::mpsc::error::TrySendError::Full(command)) =
             self.media.try_send(MediaCmd::Remove { session })
@@ -1372,11 +1383,12 @@ impl Core {
                 }
             }
             BridgeMsg::Join(client, reply) => {
-                if self.ban_for(Some(&client.uid), None).is_some() {
-                    let _ = reply.send(None);
-                    return;
-                }
-                let known = match self.store.user_by_uid(&client.uid) {
+                // A TeamSpeak identity linked to a member acts as that member.
+                let known = self.store.teamspeak_member(&client.uid).and_then(|linked| {
+                    let member = linked.unwrap_or_else(|| client.uid.clone());
+                    Ok(self.store.user_by_uid(&member)?.map(|known| (member, known)))
+                });
+                let known = match known {
                     Ok(known) => known,
                     Err(e) => {
                         warn!("store: {e:#}");
@@ -1384,17 +1396,29 @@ impl Core {
                         return;
                     }
                 };
+                let member = known.as_ref().map_or_else(|| client.uid.clone(), |(member, _)| member.clone());
+                if self.ban_for(Some(&client.uid), None).is_some()
+                    || (member != client.uid && self.ban_for(Some(&member), None).is_some())
+                {
+                    let _ = reply.send(None);
+                    return;
+                }
                 let (user_id, nickname, groups) = match known {
-                    Some((id, member)) => (id, member.nickname, member.groups),
+                    Some((_, (id, member))) => (id, member.nickname, member.groups),
                     None => (0, client.nickname, Vec::new()),
                 };
+                if user_id != 0
+                    && let Err(e) = self.store.set_last_seen(user_id, now_ms())
+                {
+                    warn!("store: {e:#}");
+                }
                 let id = self.allocate_session();
                 // TeamSpeak users are always in some channel.
                 let wanted = Some(client.channel)
                     .filter(|c| self.channels.contains_key(c) && !self.is_encrypted(*c))
                     .or(Some(self.info.default_channel));
                 // Arriving in a channel they may not join (`connect`): the default channel instead.
-                let refused = wanted.is_some_and(|c| !self.remote_may_join(&client.uid, &groups, c));
+                let refused = wanted.is_some_and(|c| !self.remote_may_join(&member, &groups, c));
                 let channel = if refused { Some(self.info.default_channel) } else { wanted };
                 if refused {
                     self.bridge_corrections.push(id);
@@ -1405,6 +1429,8 @@ impl Core {
                     id,
                     user_id,
                     uid: client.uid,
+                    member,
+                    claim_nonce: None,
                     nickname,
                     channel: None,
                     unlocked: BTreeSet::new(),
@@ -1471,7 +1497,7 @@ impl Core {
                 if let Some(channel) = u.channel.filter(|c| self.channels.contains_key(c) && !self.is_encrypted(*c)) {
                     let s = &self.sessions[&session];
                     // A channel they may not join (`connect`): they stay where they were, and go back there.
-                    if self.remote_may_join(&s.uid, &s.groups, channel) {
+                    if self.remote_may_join(&s.member, &s.groups, channel) {
                         let _ = self.move_client(session, Some(channel));
                     } else {
                         self.bridge_corrections.push(session);
@@ -1506,7 +1532,7 @@ impl Core {
     // ----------------------------------------------------------- permissions
 
     fn permissions(&self, session: &Session) -> BTreeSet<Permission> {
-        self.expand(self.group_permissions(&session.groups), &session.uid)
+        self.expand(self.group_permissions(&session.groups), &session.member)
     }
 
     /// `administrator`, and being the owner, mean every permission.
@@ -1568,6 +1594,7 @@ impl Core {
                 | Request::MemberRemove { .. }
                 | Request::MemberPrune(_)
                 | Request::TokenRedeem { .. }
+                | Request::TeamspeakClaim { .. }
         )
         .then(|| self.managers_view());
         let result = match request {
@@ -1611,6 +1638,10 @@ impl Core {
             Request::MemberNickname { uid, nickname } => self.member_nickname(session, uid, nickname),
             Request::MemberGroups { uid, groups } => self.member_groups(session, uid, groups),
             Request::MemberRemove { uid, delete_messages } => self.member_remove(session, uid, delete_messages),
+            Request::MemberTeamspeakUnlink { uid, teamspeak } => self.member_teamspeak_unlink(session, uid, teamspeak),
+            Request::TeamspeakChallenge {} => self.teamspeak_challenge(session),
+            Request::TeamspeakClaim { key, signature } => self.teamspeak_claim(session, &key, &signature),
+            Request::TeamspeakClaimable {} => self.teamspeak_claimable(session),
             Request::MemberPrune(prune) => self.member_prune(session, prune),
             Request::BanCreate(ban) => self.ban_create(session, ban),
             Request::BanList {} => self.ban_list(session),
@@ -1691,7 +1722,7 @@ impl Core {
         let Some(target) = self.sessions.get(&client) else {
             return Err(err(ErrorCode::NotFound, "no such client"));
         };
-        if client != session && !self.outranks(session, &target.uid, &target.groups) {
+        if client != session && !self.outranks(session, &target.member, &target.groups) {
             return Err(err(ErrorCode::Forbidden, "this member is not below your rank"));
         }
         if target.out.is_none() && self.is_encrypted(channel) {
@@ -1710,7 +1741,7 @@ impl Core {
             }
             return self.enter_channel(session, channel);
         }
-        if !self.channel_permissions(&target.uid, &target.groups, channel).contains(&Permission::Connect) {
+        if !self.channel_permissions(&target.member, &target.groups, channel).contains(&Permission::Connect) {
             return Err(err(ErrorCode::BadRequest, "this member may not join that channel"));
         }
         self.move_client(client, Some(channel))?;
@@ -1725,7 +1756,7 @@ impl Core {
         let Some(target) = self.sessions.get(&client) else {
             return Err(err(ErrorCode::NotFound, "no such client"));
         };
-        if !self.outranks(session, &target.uid, &target.groups) {
+        if !self.outranks(session, &target.member, &target.groups) {
             return Err(err(ErrorCode::Forbidden, "this member is not below your rank"));
         }
         let reason = reason.map(|r| r.chars().take(MAX_AWAY).collect());
@@ -1780,7 +1811,7 @@ impl Core {
         row.password_hash.is_none()
             || s.channel == Some(channel)
             || s.unlocked.contains(&channel)
-            || self.channel_permissions(&s.uid, &s.groups, channel).contains(&Permission::BypassPassword)
+            || self.channel_permissions(&s.member, &s.groups, channel).contains(&Permission::BypassPassword)
     }
 
     /// Whether `channel` exists and has encrypted (sealed) chat.
@@ -2548,7 +2579,7 @@ const MAX_ACCESS_USERS: usize = 1000;
 
 enum EventView {
     Same,
-    Masked(Event),
+    Masked(Box<Event>),
     Hidden,
 }
 

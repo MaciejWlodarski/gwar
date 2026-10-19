@@ -8046,6 +8046,7 @@ dependencies = [
  "tsclientlib",
  "tsproto",
  "tsproto-packets",
+ "tsproto-types",
  "vc-client",
  "vc-proto",
  "zip",

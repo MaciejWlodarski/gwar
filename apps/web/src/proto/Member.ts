@@ -19,4 +19,9 @@ connect?: HandleAttestation | null, groups: Array<number>,
 /**
  * Unix time in milliseconds.
  */
-last_seen: number, };
+last_seen: number, 
+/**
+ * TeamSpeak identities linked to this member (`ts:<uid>`): someone joining with one
+ * acts as this member (docs/teamspeak-import.md, "Linked TeamSpeak identities").
+ */
+teamspeak?: Array<string>, };
