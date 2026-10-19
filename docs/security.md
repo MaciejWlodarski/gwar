@@ -408,6 +408,21 @@ act as the member on the bridged TeamSpeak server: roles, overrides, rank and
 bans of either. Claims are bound to the server, the claimant and a one-time
 nonce; see "Clients" for what the desktop app's signing can and cannot check.
 
+The server password protects the bridged TeamSpeak server too: the bridge sets
+the same password there, so TeamSpeak clients need it as Gwar apps do. Gwar
+itself keeps only a hash, and TeamSpeak only a hash of its own, but the bridge's
+stand-in clients must log in with the password, so the bridge keeps the plain
+text it set, with the hash of ours it stands for, in
+`data/teamspeak/server-password.json` (mode 0600, next to the ServerQuery
+password). It learns the plain text when the password is set in the server
+settings or typed at an import (`--for-bridge`); both wait in the database
+until TeamSpeak has taken it, as the channel passwords of an import do
+([teamspeak-import.md](teamspeak-import.md#passwords)), so a bridge that is
+restarting gets it too. `--server-password` is held in memory only. When the
+hash no longer matches and no plain text is known, TeamSpeak gets a random
+password: closed to TeamSpeak clients until the password is set again, never
+open where Gwar is not.
+
 ## Later
 
 Noise for LAN connections, stronger evidence of signing time, vault

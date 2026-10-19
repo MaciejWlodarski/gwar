@@ -191,6 +191,9 @@ pub struct Removal {
 #[error("files must be distinct, finished, unattached sealed uploads of this author (at most 10)")]
 pub struct InvalidFiles;
 
+/// The meta key of the server password queued for the bridge (see `queue_bridge_server_password`).
+const BRIDGE_SERVER_PASSWORD: &str = "bridge_server_password";
+
 pub struct Store {
     db: Connection,
 }
@@ -928,7 +931,33 @@ impl Store {
 
     /// Drops every queued password (a server without the bridge never sends them).
     pub fn clear_bridge_passwords(&self) -> Result<()> {
-        if self.db.execute("DELETE FROM ts_import_passwords", [])? > 0 {
+        let channels = self.db.execute("DELETE FROM ts_import_passwords", [])?;
+        let server = self.db.execute("DELETE FROM meta WHERE key=?1", [BRIDGE_SERVER_PASSWORD])?;
+        if channels + server > 0 {
+            self.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    /// The server's password typed at an import, for the bridge to set on TeamSpeak once.
+    pub fn queue_bridge_server_password(&self, password: &str) -> Result<()> {
+        self.set_meta(BRIDGE_SERVER_PASSWORD, password)
+    }
+
+    pub fn bridge_server_password(&self) -> Result<Option<String>> {
+        self.meta(BRIDGE_SERVER_PASSWORD)
+    }
+
+    /// Forgets the queued server password once TeamSpeak has it (`Some`), or whatever is queued
+    /// (`None`: the password changed in Gwar).
+    pub fn forget_bridge_server_password(&self, password: Option<&str>) -> Result<()> {
+        let gone = match password {
+            Some(p) => {
+                self.db.execute("DELETE FROM meta WHERE key=?1 AND value=?2", params![BRIDGE_SERVER_PASSWORD, p])?
+            }
+            None => self.db.execute("DELETE FROM meta WHERE key=?1", [BRIDGE_SERVER_PASSWORD])?,
+        };
+        if gone > 0 {
             self.checkpoint()?;
         }
         Ok(())

@@ -442,6 +442,8 @@ pub struct PuppetSpec {
     pub muted: bool,
     pub deafened: bool,
     pub away: Option<String>,
+    /// TeamSpeak's server password, when it has one.
+    pub server_password: Option<String>,
     /// Waited before connecting, to spread out reconnect storms.
     pub delay: Duration,
 }
@@ -586,6 +588,9 @@ async fn connect(server: SocketAddr, spec: &PuppetSpec, nickname: String) -> Res
         .log_commands(false);
     if let Some(away) = &spec.away {
         builder = builder.away(away.clone());
+    }
+    if let Some(password) = &spec.server_password {
+        builder = builder.password(password.clone());
     }
     let mut con = builder.connect()?;
     tokio::time::timeout(CONNECT_TIMEOUT, async {

@@ -15,7 +15,9 @@ use tokio::sync::{mpsc, oneshot};
 pub enum BridgeNote {
     /// First note after attaching: everything the other side must mirror.
     /// `clients` holds our own (non-remote) sessions only.
-    Snapshot { server: ServerInfo, channels: Vec<Channel>, clients: Vec<Client> },
+    Snapshot { server: ServerInfo, channels: Vec<Channel>, clients: Vec<Client>, password: ServerPassword },
+    /// The server's password changed on our side.
+    ServerPassword(ServerPassword),
     /// A channel was created (`created`) or changed. `password` carries the
     /// plaintext when it was set (`Some(Some)`) or removed (`Some(None)`) in
     /// this change, since the core itself only keeps a hash.
@@ -31,6 +33,17 @@ pub enum BridgeNote {
     Talker { session: SessionId, channel: ChannelId, talks: bool },
 }
 
+/// The server's password as TeamSpeak must have it: Gwar's protects only Gwar logins, so the
+/// bridge sets the same one on TeamSpeak. The core keeps a hash only; the plain text comes
+/// when it is known (set in Gwar, typed at an import, or `--server-password`).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ServerPassword {
+    /// The current hash, `None` for no password. Tells the bridge whether a plain text it set
+    /// before is still this password.
+    pub hash: Option<String>,
+    pub plaintext: Option<String>,
+}
+
 /// Bridge → core.
 pub enum BridgeMsg {
     /// Replaces any previous bridge; remote sessions of the old one are removed.
@@ -41,6 +54,8 @@ pub enum BridgeMsg {
     Chat(SessionId, ChatTarget, String),
     /// A channel's password is set on TeamSpeak (one queued by an import may go).
     PasswordSet(ChannelId, String),
+    /// The server's password is set on TeamSpeak (a queued one may go).
+    ServerPasswordSet(String),
 }
 
 #[derive(Debug, Clone)]

@@ -956,6 +956,7 @@ mod tests {
                 ice_servers: vec![],
                 version: "test".into(),
                 password: Arc::new(ArcSwap::from_pointee(None)),
+                password_plaintext: None,
                 upload_limit: 0,
                 upload_quota: 0,
                 storage_limit: 0,

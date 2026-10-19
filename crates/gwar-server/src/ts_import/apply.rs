@@ -148,6 +148,12 @@ pub fn apply(store: &Store, plan: &Plan, source: &str, options: ApplyOptions) ->
         if plan.server_password != Password::None {
             let hash = password_hash(&plan.server_password, current.as_deref());
             store.set_meta("password_hash", hash.as_deref().unwrap_or(""))?;
+            // The bridge sets it on TeamSpeak too, as with channels; any other outcome replaces one
+            // queued before.
+            match &plan.server_password {
+                Password::Kept(p) if options.for_bridge => store.queue_bridge_server_password(p)?,
+                _ => store.forget_bridge_server_password(None)?,
+            }
         }
         store.set_ts_import_record(source, "server", 0, 0, Some(&server_print(store)?))?;
     } else {

@@ -256,6 +256,9 @@ pub struct CoreConfig {
     pub ice_servers: Vec<IceServer>,
     pub version: String,
     pub password: ServerPassword,
+    /// `--server-password` with the hash made from it, when that is the server's password: the
+    /// bridge sets it on TeamSpeak.
+    pub password_plaintext: Option<(String, String)>,
     /// Largest upload in bytes; 0 disables uploads.
     pub upload_limit: u64,
     /// Stored bytes per member and in total; 0 means no limit.
@@ -336,6 +339,8 @@ pub struct Core {
     /// What the bridge was last told of each remote session's talking (`BridgeNote::Talker`).
     remote_talkers: HashMap<SessionId, (ChannelId, bool)>,
     password: ServerPassword,
+    /// See [`CoreConfig::password_plaintext`]; good only while the hash is still the current one.
+    password_plaintext: Option<(String, String)>,
     files_dir: PathBuf,
     uploads: HashMap<String, files::PendingUpload>,
     /// Removed files whose bytes are being deleted right now.
@@ -563,6 +568,7 @@ impl Core {
             bridge_corrections: Vec::new(),
             remote_talkers: HashMap::new(),
             password: config.password,
+            password_plaintext: config.password_plaintext,
             files_dir: config.files_dir,
             uploads: HashMap::new(),
             removing: HashSet::new(),
@@ -896,6 +902,23 @@ impl Core {
 
     fn send_event(&mut self, session: SessionId, event: Event) {
         self.push(session, encode(&ServerFrame::Event(event)));
+    }
+
+    /// The server's password for the bridge: the current hash, with the plain text when known (one
+    /// typed at an import and still queued, else `--server-password` if it is still the password).
+    fn bridge_server_password(&self) -> bridge::ServerPassword {
+        let hash = self.password.load().as_deref().map(str::to_owned);
+        let queued = match self.store.bridge_server_password() {
+            Ok(queued) => queued,
+            Err(e) => {
+                warn!("store: {e:#}");
+                None
+            }
+        };
+        let plaintext = hash.as_ref().and_then(|hash| {
+            queued.or_else(|| self.password_plaintext.as_ref().filter(|(h, _)| h == hash).map(|(_, p)| p.clone()))
+        });
+        bridge::ServerPassword { hash, plaintext }
     }
 
     fn notify_bridge(&mut self, note: impl FnOnce() -> BridgeNote) {
@@ -1373,6 +1396,7 @@ impl Core {
                     server: self.info.clone(),
                     channels: self.channels.values().filter_map(|c| self.channel_for(c, None)).collect(),
                     clients: self.sessions.values().map(|s| self.client_for(s, None)).collect(),
+                    password: self.bridge_server_password(),
                 });
                 self.bridge = Some(bridge);
                 // The new bridge knows nobody's talking yet; its users join anew.
@@ -1524,6 +1548,11 @@ impl Core {
             }
             BridgeMsg::PasswordSet(channel, password) => {
                 if let Err(e) = self.store.forget_bridge_password(channel, &password) {
+                    warn!("store: {e:#}");
+                }
+            }
+            BridgeMsg::ServerPasswordSet(password) => {
+                if let Err(e) = self.store.forget_bridge_server_password(Some(&password)) {
                     warn!("store: {e:#}");
                 }
             }
@@ -2710,6 +2739,7 @@ pub(crate) mod expiry_tests {
                 ice_servers: Vec::new(),
                 version: "test".into(),
                 password: Arc::new(ArcSwap::from_pointee(password.map(Arc::from))),
+                password_plaintext: None,
                 upload_limit,
                 upload_quota: 0,
                 storage_limit: 0,
@@ -3168,6 +3198,7 @@ pub(crate) mod expiry_tests {
                 ice_servers: Vec::new(),
                 version: "test".into(),
                 password: Arc::new(ArcSwap::from_pointee(None)),
+                password_plaintext: None,
                 upload_limit: 0,
                 upload_quota: 0,
                 storage_limit: 0,
@@ -3432,7 +3463,43 @@ mod import_password_tests {
         let store = Store::in_memory().unwrap();
         let channel = store.channels().unwrap()[0].id;
         store.queue_bridge_password(channel, "hunter2").unwrap();
+        store.queue_bridge_server_password("hunter2").unwrap();
         let core = test_core(store, None);
         assert!(on_core(&core, |core| core.store.bridge_passwords().unwrap().is_empty()).await);
+        assert_eq!(on_core(&core, |core| core.store.bridge_server_password().unwrap()).await, None);
+    }
+
+    async fn attached_password(core: &CoreHandle) -> bridge::ServerPassword {
+        let (notes, mut bridge) = mpsc::unbounded_channel();
+        core.bridge(BridgeMsg::Attach(notes)).await;
+        on_core(core, |_| ()).await;
+        match bridge.try_recv() {
+            Ok(BridgeNote::Snapshot { password, .. }) => password,
+            _ => panic!("snapshot"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_server_password_reaches_the_bridge_with_its_plain_text_while_that_is_known() {
+        let store = Store::in_memory().unwrap();
+        store.queue_bridge_server_password("hunter2").unwrap();
+        let core = test_core_teamspeak(store).unwrap();
+        // No password: nothing to set, whatever is queued.
+        assert_eq!(attached_password(&core).await, bridge::ServerPassword::default());
+        on_core(&core, |core| core.password.store(Arc::new(Some("HASH".into())))).await;
+        let sent = attached_password(&core).await;
+        assert_eq!((sent.hash.as_deref(), sent.plaintext.as_deref()), (Some("HASH"), Some("hunter2")));
+        // Kept until the bridge has set that very one.
+        core.bridge(BridgeMsg::ServerPasswordSet("older".into())).await;
+        assert!(on_core(&core, |core| core.store.bridge_server_password().unwrap()).await.is_some());
+        core.bridge(BridgeMsg::ServerPasswordSet("hunter2".into())).await;
+        assert_eq!(on_core(&core, |core| core.store.bridge_server_password().unwrap()).await, None);
+        // Then: the bridge keeps what it set; only the hash comes.
+        assert_eq!(attached_password(&core).await.plaintext, None);
+        // --server-password counts only while it is still the password.
+        on_core(&core, |core| core.password_plaintext = Some(("OLD".into(), "cli".into()))).await;
+        assert_eq!(attached_password(&core).await.plaintext, None);
+        on_core(&core, |core| core.password_plaintext = Some(("HASH".into(), "cli".into()))).await;
+        assert_eq!(attached_password(&core).await.plaintext.as_deref(), Some("cli"));
     }
 }

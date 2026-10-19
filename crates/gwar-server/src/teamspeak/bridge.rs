@@ -38,7 +38,7 @@ use crate::{
     TeamSpeakConfig,
     core::{
         CoreHandle,
-        bridge::{BridgeMsg, BridgeNote, RemoteClient, RemoteUpdate},
+        bridge::{BridgeMsg, BridgeNote, RemoteClient, RemoteUpdate, ServerPassword},
         now_ms,
     },
     media::{AudioRoute, MediaPlane},
@@ -105,6 +105,7 @@ async fn supervise(
         password,
         voice: SocketAddr::new(voice_ip, config.voice.port()),
         map: config.dir.join("channels.json"),
+        server_password: config.dir.join("server-password.json"),
         public_url: config.public_url.clone(),
     };
     loop {
@@ -128,6 +129,17 @@ struct Link {
     password: String,
     voice: SocketAddr,
     map: PathBuf,
+    /// The server password set on TeamSpeak ([`SavedPassword`]).
+    server_password: PathBuf,
+}
+
+/// The plain text of the server password the bridge set on TeamSpeak, and the hash of ours it
+/// stands for: our puppets need it to connect, also after a restart, and TeamSpeak keeps only its
+/// own hash. Readable only by us, like the ServerQuery password next to it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedPassword {
+    hash: String,
+    password: String,
 }
 
 /// Reads or creates a random secret file readable only by us.
@@ -267,6 +279,9 @@ struct Bridge<'a> {
     query_clid: Option<u64>,
     /// Encrypted channels whose join power was set since the bridge started.
     locked: HashSet<u64>,
+    /// The server password set on TeamSpeak, for our puppets to connect with.
+    server_password: Option<String>,
+    password_file: PathBuf,
     /// Who of the TeamSpeak users may talk, and in which of our channels, as our side last said
     /// ([`BridgeNote::Talker`]).
     talkers: HashMap<SessionId, (ChannelId, bool)>,
@@ -361,6 +376,8 @@ impl<'a> Bridge<'a> {
             descriptions: HashMap::new(),
             query_clid: None,
             locked: HashSet::new(),
+            server_password: None,
+            password_file: link.server_password.clone(),
             held: HashMap::new(),
             talkers: HashMap::new(),
             whispers: HashMap::new(),
@@ -383,10 +400,12 @@ impl<'a> Bridge<'a> {
     ) -> Result<()> {
         let (tx, mut notes) = mpsc::unbounded_channel();
         self.core.bridge(BridgeMsg::Attach(tx)).await;
-        let Some(BridgeNote::Snapshot { server, channels, clients }) = notes.recv().await else {
+        let Some(BridgeNote::Snapshot { server, channels, clients, password }) = notes.recv().await else {
             bail!("core did not send a snapshot");
         };
         self.configure_server(&server).await?;
+        // Before any puppet connects: they need it.
+        self.set_server_password(password).await?;
         self.sync_channels(channels).await?;
         for event in ["server", "textserver"] {
             self.query.call(Cmd::new("servernotifyregister").arg("event", event)).await?;
@@ -539,6 +558,43 @@ impl<'a> Bridge<'a> {
                 .await?;
         }
         self.puppet_group = Some(sgid);
+        Ok(())
+    }
+
+    /// Gives TeamSpeak the server password ours has. Without the plain text, the one set before
+    /// stays if it is still ours; otherwise TeamSpeak gets a random one: closed until the password
+    /// is set again on our side, never open where ours is not.
+    async fn set_server_password(&mut self, ours: ServerPassword) -> Result<()> {
+        let Some(hash) = ours.hash else {
+            self.query.call(Cmd::new("serveredit").arg("virtualserver_password", "")).await?;
+            self.server_password = None;
+            return match std::fs::remove_file(&self.password_file) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+                _ => Ok(()),
+            };
+        };
+        let saved = std::fs::read(&self.password_file)
+            .ok()
+            .and_then(|data| serde_json::from_slice::<SavedPassword>(&data).ok())
+            .filter(|saved| saved.hash == hash)
+            .map(|saved| saved.password);
+        let typed = ours.plaintext.is_some();
+        let password = match ours.plaintext.or(saved) {
+            Some(password) => password,
+            None => {
+                warn!(
+                    "the server has a password TeamSpeak does not know: TeamSpeak users are kept out until \
+                     it is set again in the server settings"
+                );
+                random_password()
+            }
+        };
+        self.query.call(Cmd::new("serveredit").arg("virtualserver_password", &password)).await?;
+        write_private(&self.password_file, &serde_json::to_vec(&SavedPassword { hash, password: password.clone() })?)?;
+        self.server_password = Some(password.clone());
+        if typed {
+            self.core.bridge(BridgeMsg::ServerPasswordSet(password)).await;
+        }
         Ok(())
     }
 
@@ -997,6 +1053,7 @@ impl<'a> Bridge<'a> {
             muted: c.muted,
             deafened: c.deafened,
             away: c.away.clone(),
+            server_password: self.server_password.clone(),
             delay,
         };
         local.puppet = Some(puppet::spawn(self.voice, spec, self.shared.clone(), self.puppet_events.clone()));
@@ -1076,6 +1133,11 @@ impl<'a> Bridge<'a> {
     async fn on_note(&mut self, note: BridgeNote) {
         match note {
             BridgeNote::Snapshot { .. } => warn!("unexpected second snapshot"),
+            BridgeNote::ServerPassword(password) => {
+                if let Err(e) = self.set_server_password(password).await {
+                    warn!("TeamSpeak server password: {e:#}");
+                }
+            }
             BridgeNote::Channel { channel, password, .. } => {
                 self.channels.insert(channel.id, channel.clone());
                 // Which typed password was set: a queued one goes only once this very one is.
@@ -1712,6 +1774,8 @@ mod tests {
             descriptions: HashMap::new(),
             query_clid: None,
             locked: HashSet::new(),
+            server_password: None,
+            password_file: dir.path().join("server-password.json"),
             held: HashMap::new(),
             talkers: HashMap::new(),
             whispers: HashMap::new(),
@@ -1823,6 +1887,8 @@ mod tests {
             descriptions: HashMap::new(),
             query_clid: None,
             locked: HashSet::new(),
+            server_password: None,
+            password_file: dir.path().join("server-password.json"),
             held: HashMap::new(),
             talkers: HashMap::new(),
             whispers: HashMap::new(),
@@ -1909,6 +1975,8 @@ mod tests {
             descriptions: HashMap::new(),
             query_clid: None,
             locked: HashSet::new(),
+            server_password: None,
+            password_file: dir.path().join("server-password.json"),
             held: HashMap::new(),
             talkers: HashMap::new(),
             whispers: HashMap::new(),
@@ -1998,6 +2066,8 @@ mod tests {
             descriptions: HashMap::new(),
             query_clid: None,
             locked: HashSet::new(),
+            server_password: None,
+            password_file: dir.path().join("server-password.json"),
             held: HashMap::new(),
             talkers: HashMap::new(),
             whispers: HashMap::new(),
