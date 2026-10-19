@@ -615,6 +615,15 @@ impl<'a> Bridge<'a> {
             lock_encrypted(&self.query, cid).await?;
             self.locked.insert(cid);
         }
+        // On its own: a rejected rename or limit must not leave the channel open to every talker.
+        if current.talk_power != want.talk_power {
+            let cmd = Cmd::new("channeledit").arg("cid", cid).arg("channel_needed_talk_power", want.talk_power);
+            if let Err(e) = self.query.call(cmd).await {
+                warn!(cid, "TeamSpeak channel talk power: {e:#}");
+                // Tried again on the next change or sync.
+                want.talk_power = current.talk_power;
+            }
+        }
         let mut args = channels::edits(&current, &want);
         if let Some(p) = &password {
             args.push(("channel_password", p.clone().unwrap_or_default()));
