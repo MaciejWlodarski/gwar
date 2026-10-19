@@ -198,6 +198,27 @@ pub(crate) fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// What a claim signs (docs/teamspeak-import.md, "Claim"); [`sign_claim`] signs nothing else.
+const CLAIM_PREFIX: &str = "gwar teamspeak claim v1\n";
+
+/// Signs a Gwar server's claim statement with the identity's key, the way a TeamSpeak client signs:
+/// returns the public key in TeamSpeak's form (base64 libtomcrypt DER) and the signature (base64
+/// DER ECDSA). Only `gwar teamspeak claim v1\n{server_key}\n{uid}\n{nonce}` with plain base64url
+/// fields is signed, so the key cannot be made to sign anything else.
+pub fn sign_claim(identity: &Identity, statement: &str) -> Result<(String, String)> {
+    let fields = statement.strip_prefix(CLAIM_PREFIX).context("not a claim statement")?;
+    let fields: Vec<&str> = fields.split('\n').collect();
+    let plain = |f: &&str| {
+        !f.is_empty() && f.len() <= 128 && f.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
+    if fields.len() != 3 || !fields.iter().all(plain) {
+        bail!("not a claim statement");
+    }
+    let key = identity.key().to_pub().to_ts();
+    let signature = identity.key().clone().sign(statement.as_bytes());
+    Ok((key, BASE64.encode(signature)))
+}
+
 /// A fresh key with a counter that gives it a level below [`MIN_LEVEL`] (a key reaches 8 at counter 0 once in 256).
 #[cfg(test)]
 pub(crate) fn low_level() -> Identity {
@@ -245,6 +266,28 @@ impl Drop for TempDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_claim_is_signed_verifiably_and_nothing_else_is() {
+        let identity = generate();
+        let statement = "gwar teamspeak claim v1\nU2VydmVyS2V5\nAbCd-_09\nbm9uY2U";
+        let (key, signature) = sign_claim(&identity, statement).unwrap();
+        let public = tsproto_types::crypto::EccKeyPubP256::from_ts(&key).unwrap();
+        assert_eq!(public.get_uid(), uid(&identity));
+        public.verify(statement.as_bytes(), &BASE64.decode(signature).unwrap()).unwrap();
+        for other in [
+            "gwar teamspeak claim v2\na\nb\nc",
+            "gwar teamspeak claim v1\na\nb",
+            "gwar teamspeak claim v1\na\nb\nc\nd",
+            "gwar teamspeak claim v1\na\nb\n",
+            "gwar teamspeak claim v1\na b\nb\nc",
+            "gwar teamspeak claim v1\na=\nb\nc",
+            "clientinitiv alpha=x",
+        ] {
+            assert!(sign_claim(&identity, other).is_err(), "{other:?}");
+        }
+        assert!(sign_claim(&identity, &format!("gwar teamspeak claim v1\n{}\nb\nc", "a".repeat(129))).is_err());
+    }
 
     fn fresh() -> Identity {
         generate()

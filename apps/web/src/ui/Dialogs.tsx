@@ -23,6 +23,7 @@ import { RemoveMemberDialog } from "./RemoveMemberDialog";
 import { Lightbox } from "./Attachments";
 import { InvitesDialog, ServerSettingsDialog } from "./ServerSettings";
 import { FirstRunDialog } from "./TeamspeakFound";
+import { ClaimDialog } from "./TeamspeakClaim";
 import { IdentityPicker } from "./IdentityPicker";
 import { useMemberName, useMyWho, useOwnerView, useTsIdentities } from "./hooks";
 import { canGiveGroup, orderedGroups } from "../lib/permissions";
@@ -73,6 +74,8 @@ export function Dialogs() {
       return <ConfirmDialog {...dialog} />;
     case "tsFirstRun":
       return <FirstRunDialog found={dialog.found} resolve={dialog.resolve} />;
+    case "tsClaim":
+      return <ClaimDialog identities={dialog.identities} resolve={dialog.resolve} />;
   }
 }
 

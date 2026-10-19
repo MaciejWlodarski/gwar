@@ -21,6 +21,10 @@
 //!   native dialog: they exist nowhere else. The account's are in the Connect vault.
 //! - `ts_identity_detect` -> `[{source, name, uid, level, identity, selected}]` from the official
 //!   TeamSpeak client on this computer. Reads files only when called, which the UI does on request.
+//! - `ts_identity_claim {uid, statement}` -> `{key, signature}`: the active list's identity `uid`
+//!   signs a Gwar server's claim statement (docs/teamspeak-import.md, "Claim"), nothing else, after
+//!   the person agrees in a native dialog naming the identity: a web view must not be able to give
+//!   an identity's roles away on its own.
 //!
 //! A TeamSpeak connection that is already open keeps the identity it started with.
 
@@ -298,6 +302,10 @@ pub async fn ts_identity_set_list(app: AppHandle, which: String, list: Option<Li
 }
 
 async fn confirm(app: &AppHandle, message: &'static str) -> Result<(), String> {
+    ask(app, message.to_owned()).await
+}
+
+async fn ask(app: &AppHandle, message: String) -> Result<(), String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog().message(message).title("TeamSpeak private identities").buttons(MessageDialogButtons::OkCancel).show(
         move |yes| {
@@ -561,4 +569,44 @@ mod tests {
         assert!(files.set_list("device", None, &BTreeSet::new()).is_err());
         assert!(files.set_list("elsewhere", None, &BTreeSet::new()).is_err());
     }
+}
+
+#[derive(Serialize)]
+pub struct ClaimSignature {
+    key: String,
+    signature: String,
+}
+
+/// Signs a claim with an identity of the active list, once the person agrees; the private key stays here.
+#[tauri::command]
+pub async fn ts_identity_claim(app: AppHandle, uid: String, statement: String) -> Result<ClaimSignature, String> {
+    let (lookup, checked) = (app.clone(), statement.clone());
+    let (name, identity) = tokio::task::spawn_blocking(move || {
+        let files = files(&lookup)?;
+        let _files = lock();
+        let (_, list) = files.active().map_err(err)?;
+        let entry = list.identities.iter().find(|e| e.uid == uid).ok_or("identity not found")?;
+        // Any security level: a claim needs no TeamSpeak proof of work.
+        let identity = ts_identity::parse_any(&entry.identity).map_err(err)?;
+        // Refuse anything but a claim before asking.
+        ts_identity::sign_claim(&identity, &checked).map_err(err)?;
+        Ok::<_, String>((entry.name.clone(), identity))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    // What the statement binds, as the app shows it too, so a substituted destination can be noticed.
+    let mut fields = statement.lines().skip(1);
+    let (server, account) = (fields.next().unwrap_or_default(), fields.next().unwrap_or_default());
+    let short = |s: &str| s.chars().take(8).collect::<String>();
+    ask(
+        &app,
+        format!(
+            "Prove that the TeamSpeak identity \"{name}\" is yours, so its roles move to the Gwar account {}… on the server {}…? The app shows the same two codes.",
+            short(account),
+            short(server)
+        ),
+    )
+    .await?;
+    let (key, signature) = ts_identity::sign_claim(&identity, &statement).map_err(err)?;
+    Ok(ClaimSignature { key, signature })
 }

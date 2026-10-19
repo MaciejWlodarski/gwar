@@ -47,6 +47,9 @@ class FakeDesktop implements TsBridge {
   async detect() {
     return [];
   }
+  async claimSign(): Promise<{ key: string; signature: string }> {
+    throw new Error("not used here");
+  }
 }
 
 async function signedIn(handle: string) {
