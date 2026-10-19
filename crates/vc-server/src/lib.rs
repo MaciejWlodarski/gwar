@@ -8,6 +8,7 @@
 //! ```
 
 pub mod connect;
+#[cfg(feature = "teamspeak")]
 pub mod control;
 pub mod core;
 pub mod files;
@@ -334,7 +335,7 @@ pub async fn start(config: Config) -> Result<Running> {
         tasks.push(tokio::spawn(connect::follow(url, core.clone(), connect_seq)));
     }
     // Maintenance commands reach the running server here (a TeamSpeak import, for one).
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "teamspeak"))]
     if let Some(dir) = config.data_dir.as_deref() {
         // Without it the server still runs; such maintenance then needs it stopped.
         match control::serve(dir, core.clone()).await {

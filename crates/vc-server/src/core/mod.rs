@@ -10,6 +10,7 @@
 pub mod bridge;
 pub mod files;
 mod history;
+#[cfg(feature = "teamspeak")]
 mod import;
 mod links;
 mod messages;
@@ -133,6 +134,7 @@ pub enum CoreMsg {
     },
     Info(oneshot::Sender<ServerInfo>),
     /// A TeamSpeak import for the running server (`vc-server import-teamspeak` over the control socket).
+    #[cfg(feature = "teamspeak")]
     Import {
         plan: Box<crate::ts_import::plan::Plan>,
         source: String,
@@ -672,6 +674,7 @@ impl Core {
             CoreMsg::DeviceAuthorized(account_key, device_key, reply) => {
                 let _ = reply.send(self.store.device_revoked(&account_key, &device_key).is_ok_and(|revoked| !revoked));
             }
+            #[cfg(feature = "teamspeak")]
             CoreMsg::Import { plan, source, options, reply } => {
                 let _ = reply.send(self.import_live(&plan, &source, options));
             }
