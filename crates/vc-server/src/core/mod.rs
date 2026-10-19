@@ -2689,6 +2689,41 @@ pub(crate) mod expiry_tests {
         rx.await.unwrap()
     }
 
+    #[tokio::test]
+    async fn slow_work_runs_at_most_four_at_once_and_refuses_the_rest() {
+        let core = test_core(Store::in_memory().unwrap(), None);
+        // Each piece of work blocks until the test releases it.
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = Arc::new(std::sync::Mutex::new(gate));
+        let (finished, mut done) = mpsc::unbounded_channel();
+        let start = move |core: &mut Core, n: usize| -> Vec<Option<ErrorCode>> {
+            (0..n)
+                .map(|_| {
+                    let (gate, finished) = (gate.clone(), finished.clone());
+                    let work = move || gate.lock().unwrap().recv().unwrap();
+                    core.defer(work, move |_, ()| finished.send(()).unwrap()).map(|reply| reply.unwrap_err().code)
+                })
+                .collect()
+        };
+        let first = on_core(&core, {
+            let start = start.clone();
+            move |core| start(core, 12)
+        })
+        .await;
+        assert!(first[..SLOW_WORK].iter().all(Option::is_none), "{first:?}");
+        assert!(first[SLOW_WORK..].iter().all(|c| *c == Some(ErrorCode::RateLimited)), "{first:?}");
+
+        // A finished piece frees its turn for the next request.
+        release.send(()).unwrap();
+        done.recv().await.unwrap();
+        let next = on_core(&core, move |core| start(core, 2)).await;
+        assert_eq!(next, [None, Some(ErrorCode::RateLimited)]);
+        for _ in 0..SLOW_WORK {
+            release.send(()).unwrap();
+            done.recv().await.unwrap();
+        }
+    }
+
     fn encrypted_channel(store: &Store, name: &str) -> ChannelId {
         store
             .create_channel(&ChannelRow {

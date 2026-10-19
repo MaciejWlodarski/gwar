@@ -23,11 +23,11 @@ jobs:
         with:
           toolchain: stable
           components: clippy, rustfmt
-      # One dependency cache for every Linux test job; only the main test job saves it.
+      # One dependency cache for every Linux test job, saved by the main test job only
+      # (pull requests too: a dependency change would otherwise rebuild everything on each push).
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: linux-tests
-          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: System libraries (Opus, ALSA)
         run: sudo apt-get update && sudo apt-get install -y libopus-dev libasound2-dev pkg-config
       - name: Format
@@ -46,7 +46,7 @@ jobs:
         with:
           toolchain: stable
           components: clippy, rustfmt
-      # One dependency cache for every Linux test job; only the main test job saves it.
+      # One dependency cache for every Linux test job, saved by the main test job only.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: linux-tests
@@ -71,7 +71,7 @@ jobs:
         with:
           toolchain: stable
           components: clippy, rustfmt
-      # One dependency cache for every Linux test job; only the main test job saves it.
+      # One dependency cache for every Linux test job, saved by the main test job only.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: linux-tests
@@ -215,7 +215,7 @@ jobs:
         with:
           toolchain: stable
           components: clippy, rustfmt
-      # One dependency cache for every Linux test job; only the main test job saves it.
+      # One dependency cache for every Linux test job, saved by the main test job only.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: linux-tests
@@ -249,7 +249,7 @@ jobs:
         with:
           toolchain: stable
           components: clippy, rustfmt
-      # One dependency cache for every Linux test job; only the main test job saves it.
+      # One dependency cache for every Linux test job, saved by the main test job only.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: linux-tests
