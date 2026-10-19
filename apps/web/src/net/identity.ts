@@ -238,7 +238,10 @@ export async function loadActiveIdentity(
   store: IdentityStore = indexedDbIdentityStore,
   connect: ConnectStore = indexedDbConnectStore,
 ): Promise<Identity> {
-  const record = await loadConnectRecord(connect);
+  // Not loadConnectRecord: a storage error must fail the load (and be retried whole), not read as
+  // "signed out" and go on to create a local identity.
+  const stored = await connect.load();
+  const record = stored && isValidConnectRecord(stored) ? stored : undefined;
   if (record) {
     if (!validNickname(record.nickname)) {
       record.nickname = validNickname((await store.load())?.nickname) ?? defaultNickname();

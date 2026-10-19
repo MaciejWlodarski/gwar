@@ -1,5 +1,6 @@
 import "fake-indexeddb/auto";
 import { describe, expect, it } from "vitest";
+import { loadActiveIdentity } from "./net/identity";
 import { moveLegacyDatabase, moveLegacyStorage } from "./rename-migration";
 
 class MemoryStorage implements Storage {
@@ -56,7 +57,7 @@ describe("moving off the old name", () => {
     expect(storage.getItem("other")).toBe("kept");
   });
 
-  it("moves the identity database, renaming the identity's format, and deletes the old one", async () => {
+  it("moves the identity database, renaming the identity's format, once", async () => {
     await put("vc", { identity: { format: "vc-identity", version: 1, jwk: { x: "k" } }, connect: { handle: "me" } });
     await put("gwar", { connect: { handle: "already here" } });
     await moveLegacyDatabase(() => openKv("gwar"));
@@ -80,5 +81,29 @@ describe("a failed move", () => {
     await put("vc", { identity: { format: "vc-identity", version: 1, jwk: { x: "k2" } } });
     const failing = () => Promise.reject(new Error("disk full"));
     await expect(moveLegacyDatabase(failing)).rejects.toThrow("disk full");
+  });
+});
+
+describe("two tabs moving at once", () => {
+  it("copies nothing when the other tab moved (and signed out) in between", async () => {
+    await new Promise((resolve) => { indexedDB.deleteDatabase("gwar").onsuccess = resolve; });
+    await put("vc", { identity: { format: "vc-identity", version: 1, jwk: { x: "k3" } } });
+    let opens = 0;
+    await moveLegacyDatabase(async () => {
+      // The second open is the copy: the other tab has finished its move by then.
+      if (++opens === 2) await put("gwar", { "moved-from-vc": 1 });
+      return openKv("gwar");
+    });
+    expect(await get("gwar", "identity")).toBeUndefined();
+  });
+});
+
+describe("loading the identity while storage fails", () => {
+  it("fails instead of creating a new identity", async () => {
+    const created: unknown[] = [];
+    const store = { load: () => Promise.resolve(undefined), save: (b: unknown) => { created.push(b); return Promise.resolve(); } };
+    const connect = { load: () => Promise.reject(new Error("move failed")), save: () => Promise.resolve(), clear: () => Promise.resolve() };
+    await expect(loadActiveIdentity(store as never, connect)).rejects.toThrow("move failed");
+    expect(created).toEqual([]);
   });
 });

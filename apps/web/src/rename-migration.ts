@@ -110,13 +110,18 @@ export async function moveLegacyDatabase(newDb: () => Promise<IDBDatabase>, fact
       await new Promise<void>((resolve, reject) => {
         const tx = db.transaction(STORE, "readwrite", { durability: "strict" });
         const store = tx.objectStore(STORE);
-        for (const [key, value] of entries) {
-          const present = store.getKey(key);
-          present.onsuccess = () => {
-            if (present.result === undefined) store.put(renamedValue(value), key);
-          };
-        }
-        store.put(Date.now(), MOVED_MARKER);
+        // Checked again here: another tab may have moved (and since signed out) after the check above.
+        const marker = store.getKey(MOVED_MARKER);
+        marker.onsuccess = () => {
+          if (marker.result !== undefined) return;
+          for (const [key, value] of entries) {
+            const present = store.getKey(key);
+            present.onsuccess = () => {
+              if (present.result === undefined) store.put(renamedValue(value), key);
+            };
+          }
+          store.put(Date.now(), MOVED_MARKER);
+        };
         tx.oncomplete = () => resolve();
         tx.onabort = tx.onerror = () => reject(tx.error ?? new Error("indexedDB move failed"));
       });

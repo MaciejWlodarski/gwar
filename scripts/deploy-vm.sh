@@ -71,7 +71,14 @@ if [[ "${1:-}" == "--web" ]]; then
 fi
 
 # Before the rename to Gwar everything lived in ~/vc. Deploying beside it would start an empty server.
-if ssh $SSH_OPTS -T "$HOST" 'test -d ~/vc && ! test -d ~/gwar'; then
+# Exit 3 means the old layout; anything else but 0 (ssh failing) stops too.
+layout=0
+ssh $SSH_OPTS -T "$HOST" 'if test -d ~/vc && ! test -d ~/gwar; then exit 3; fi' || layout=$?
+if [[ "$layout" != 0 && "$layout" != 3 ]]; then
+  echo "refusing to deploy: could not check $HOST (ssh exit $layout)" >&2
+  exit 1
+fi
+if [[ "$layout" == 3 ]]; then
   echo "refusing to deploy: $HOST still has ~/vc from before the rename. On the VM: stop and disable" >&2
   echo "vc-server.service, remove its unit, mv ~/vc ~/gwar, rename data/vc.sqlite3 (and -wal, -shm) to" >&2
   echo "gwar.sqlite3, delete data/vc.lock, then deploy again." >&2
