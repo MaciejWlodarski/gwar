@@ -10,6 +10,8 @@ export type InputMode = "vad" | "ptt";
 
 export interface CaptureOptions {
   noiseSuppression: boolean;
+  /** Only the desktop engine has a choice; the browser's suppression is its own. */
+  noiseStrength: "light" | "strong";
   echoCancellation: boolean;
   autoGainControl: boolean;
 }
@@ -76,7 +78,8 @@ export interface VoiceEngine {
     /** Output device can be chosen (not just the system default). */
     outputDeviceSelection: boolean;
     /** Noise suppression / echo cancellation / AGC are available (default true). */
-    captureProcessing?: boolean;
+    /** `false`: none; `"noise"`: noise suppression only (the desktop app, no echo cancellation yet). */
+    captureProcessing?: boolean | "noise";
     /** Whether this engine can join encrypted voice; checked before the microphone and `channel.join`. */
     encryptedVoice(): Promise<boolean>;
   };

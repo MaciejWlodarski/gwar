@@ -12,7 +12,7 @@ import { isDesktop } from "../platform";
 import { notificationsPermission, requestNotifications, type NotificationsPermission } from "../platform/notify";
 import { acceleratorFromEvent, acceleratorParts } from "../platform/desktop";
 import { controller, describeVoiceError } from "../state/controller";
-import { useSettings, type Language, type Theme } from "../state/settings";
+import { useSettings, type Language, type NoiseStrength, type Theme } from "../state/settings";
 import { useSession, useUi, useVoice, type SettingsTab } from "../state/stores";
 import { VoiceError } from "../voice/engine";
 import { keyLabel } from "./hooks";
@@ -263,8 +263,25 @@ function AudioTab() {
         )}
       </Section>
 
-      {engine.capabilities.captureProcessing === false ? (
+      {engine.capabilities.captureProcessing === false ? null : engine.capabilities.captureProcessing === "noise" ? (
         <Section title={t("audio.processing")}>
+          <Switch
+            checked={audio.noiseSuppression}
+            onCheckedChange={(v) => setAudio({ noiseSuppression: v })}
+            label={t("audio.noiseSuppression")}
+            description={t("audio.noiseSuppressionHint")}
+          />
+          {audio.noiseSuppression && (
+            <Segmented<NoiseStrength>
+              label={t("audio.noiseStrength")}
+              value={audio.noiseStrength}
+              onChange={(noiseStrength) => setAudio({ noiseStrength })}
+              options={[
+                { value: "strong", label: t("audio.noiseStrong"), title: t("audio.noiseStrongHint") },
+                { value: "light", label: t("audio.noiseLight"), title: t("audio.noiseLightHint") },
+              ]}
+            />
+          )}
           <p className="text-xs text-subtle">{t("audio.processingDesktop")}</p>
         </Section>
       ) : (

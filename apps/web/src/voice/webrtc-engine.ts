@@ -70,7 +70,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   private masterVolume = 1;
   private inputDeviceId: string | null = null;
   private outputDeviceId: string | null = null;
-  private capture: CaptureOptions = { noiseSuppression: true, echoCancellation: true, autoGainControl: true };
+  private capture: CaptureOptions = { noiseSuppression: true, noiseStrength: "strong", echoCancellation: true, autoGainControl: true };
   private state: VoiceState = "idle";
   private runId = 0;
   private micGeneration = 0;
