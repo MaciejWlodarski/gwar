@@ -65,9 +65,14 @@ pub enum Link {
     Linked { member: bool, groups: usize, overrides: Vec<ChannelId> },
     /// Already linked to this member.
     Already,
+    /// The member has [`MAX_TEAMSPEAK_LINKS`] identities linked: nothing changed.
+    TooMany,
     /// Linked to another member: nothing changed.
     Elsewhere,
 }
+
+/// At most this many TeamSpeak identities link to one member (clients accept a member with as many).
+pub const MAX_TEAMSPEAK_LINKS: i64 = 64;
 
 /// A TeamSpeak identity's uid as a member uid: `ts:<uid>`.
 pub fn is_teamspeak(uid: &str) -> bool {
@@ -1424,11 +1429,20 @@ impl Store {
                 .optional()?
                 .with_context(|| format!("no member with uid {uid}"))
         };
-        if is_teamspeak(from) && !is_teamspeak(into) {
-            bail!("{from} is a TeamSpeak identity: link it instead (vc-server members link {from} {into})");
+        if is_teamspeak(from) {
+            bail!(
+                "{from} is a TeamSpeak identity: link it to a member instead (vc-server members link {from} <member>)"
+            );
         }
         let (from_id, into_id) = (id(from)?, id(into)?);
         tx.execute("UPDATE teamspeak_links SET user_id=?2 WHERE user_id=?1", params![from_id, into_id])?;
+        let links: i64 =
+            tx.query_row("SELECT COUNT(*) FROM teamspeak_links WHERE user_id=?1", [into_id], |r| r.get(0))?;
+        if links > MAX_TEAMSPEAK_LINKS {
+            bail!(
+                "together they have {links} linked TeamSpeak identities, more than {MAX_TEAMSPEAK_LINKS}: unlink some first"
+            );
+        }
         let mut report = MergeReport {
             messages: tx.execute(
                 "UPDATE messages SET author_uid=?2 WHERE author_uid=?1 AND signature IS NULL",
@@ -1527,6 +1541,11 @@ impl Store {
             Some(user) if user == into_id => return Ok(Link::Already),
             Some(_) => return Ok(Link::Elsewhere),
             None => {}
+        }
+        let links: i64 =
+            tx.query_row("SELECT COUNT(*) FROM teamspeak_links WHERE user_id=?1", [into_id], |r| r.get(0))?;
+        if links >= MAX_TEAMSPEAK_LINKS {
+            return Ok(Link::TooMany);
         }
         let from_id: Option<i64> =
             tx.query_row("SELECT id FROM users WHERE uid=?1", [teamspeak], |r| r.get(0)).optional()?;
@@ -2861,9 +2880,27 @@ mod teamspeak_link_tests {
         user(&store, "ts:z=", &[MEMBER_GROUP]);
         store.link_teamspeak("ts:q=", "old", 1).unwrap();
         let refused = store.merge_members("ts:z=", "new", false).unwrap_err().to_string();
-        assert!(refused.contains("link it instead"), "{refused}");
+        assert!(refused.contains("link it to a member instead"), "{refused}");
+        user(&store, "ts:w=", &[MEMBER_GROUP]);
+        assert!(store.merge_members("ts:z=", "ts:w=", false).is_err());
+        assert!(store.user_by_uid("ts:z=").unwrap().is_some());
         store.merge_members("old", "new", false).unwrap();
         assert_eq!(store.teamspeak_member("ts:q=").unwrap().as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn a_member_has_at_most_so_many_linked_identities_also_after_a_merge() {
+        let store = Store::in_memory().unwrap();
+        user(&store, "full", &[MEMBER_GROUP]);
+        user(&store, "other", &[MEMBER_GROUP]);
+        for i in 0..MAX_TEAMSPEAK_LINKS {
+            assert!(matches!(store.link_teamspeak(&format!("ts:{i}="), "full", 1).unwrap(), Link::Linked { .. }));
+        }
+        assert_eq!(store.link_teamspeak("ts:one-more=", "full", 1).unwrap(), Link::TooMany);
+        assert_eq!(store.teamspeak_member("ts:one-more=").unwrap(), None);
+        store.link_teamspeak("ts:theirs=", "other", 1).unwrap();
+        assert!(store.merge_members("other", "full", false).is_err());
+        assert_eq!(store.teamspeak_member("ts:theirs=").unwrap().as_deref(), Some("other"));
     }
 
     #[test]

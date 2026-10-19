@@ -560,8 +560,17 @@ impl Core {
             return Err(err(ErrorCode::NotFound, "no such ban"));
         };
         // A TeamSpeak user's ban also lives on the TeamSpeak server.
-        if let Some(uid) = ban.uid.filter(|uid| uid.starts_with("ts:")) {
-            self.notify_bridge(|| BridgeNote::Unban { uid });
+        match ban.uid {
+            Some(uid) if uid.starts_with("ts:") => self.notify_bridge(|| BridgeNote::Unban { uid }),
+            // Banning a member banned the TeamSpeak sessions of their linked identities there too.
+            Some(uid) => {
+                if let Some((user_id, _)) = self.store.user_by_uid(&uid).map_err(storage_error)? {
+                    for teamspeak in self.store.teamspeak_links_of(user_id).map_err(storage_error)? {
+                        self.notify_bridge(|| BridgeNote::Unban { uid: teamspeak });
+                    }
+                }
+            }
+            None => {}
         }
         Ok(Response::Empty {})
     }

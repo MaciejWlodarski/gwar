@@ -477,6 +477,10 @@ fn what_gwar_itself_drops_or_merges_is_no_edit_and_a_default_chosen_in_gwar_stay
     store.set_meta("default_channel", &general.to_string()).unwrap();
     let second = apply(&store, &plan(&source(), &Options::default()), "src", BRIDGE).unwrap();
     assert!(second.notes.iter().all(|n| !n.contains("Channel")), "{:?}", second.notes);
+    // The linked channel admin's override is imported for the member it is linked to.
+    let users: Vec<_> =
+        store.channels().unwrap().into_iter().flat_map(|c| c.overrides).filter_map(|o| o.user).collect();
+    assert!(users.contains(&"native".to_string()) && !users.iter().any(|u| u == "ts:ClanAdminUid="), "{users:?}");
     assert_eq!(store.meta("default_channel").unwrap(), Some(general.to_string()));
     assert!(second.notes.iter().any(|n| n.contains("default channel")));
 }

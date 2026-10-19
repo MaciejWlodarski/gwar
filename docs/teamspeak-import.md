@@ -59,7 +59,7 @@ set of roles whichever app they use.
 
 ### Linked TeamSpeak identities
 
-A member can have several TeamSpeak identities linked (`teamspeak_links`: the
+A member can have up to 64 TeamSpeak identities linked (`teamspeak_links`: the
 TeamSpeak uid, the member, when); an identity is linked to at most one member.
 The person links their own by a claim (below); the admin can link any with
 `vc-server members link ts:<uid> <member-uid>` on a stopped server.
@@ -81,15 +81,20 @@ Linking `ts:<uid>` to member M is one transaction:
 A **linked TeamSpeak user** (someone joining Gwar's TeamSpeak server with that
 identity) keeps the identity `ts:<uid>`, so their chat, direct messages and
 mentions stay those of a TeamSpeak user, but acts as M: M's roles, M's
-per-channel overrides and M's rank apply, and a ban of M or of `ts:<uid>`
-refuses them. Role changes, kicks and bans of M reach that session too.
+per-channel overrides and M's rank apply (in every channel move on TeamSpeak
+too), and a ban of M or of `ts:<uid>` refuses them. Role changes, kicks and
+bans of M reach that session too; lifting M's ban lifts the TeamSpeak bans the
+bridge set for M's linked identities. Their TeamSpeak visits keep M from
+looking inactive (`last_seen`), and a later import gives a linked identity's
+channel overrides to M.
 
 **Unlinking** (`member.teamspeak.unlink`, by M or by someone with
 `manage_members` ranked above M; or `vc-server members unlink ts:<uid>`) leaves
 the roles with M. A connected session of that identity goes on as an unknown
 TeamSpeak user, with Member's permissions. Removing M removes its links.
-`members merge` moves the source's links to the target and refuses a `ts:`
-source: linking is the way to bring a TeamSpeak member to a Gwar one.
+`members merge` moves the source's links to the target (refused past 64) and
+refuses any `ts:` source: linking is the way to bring a TeamSpeak member to a
+Gwar one.
 
 ### Claim
 
@@ -108,8 +113,9 @@ The person proves they hold the identity, with no admin work:
    signature and links the identity to the claimant. It answers
    `{teamspeak: "ts:<uid>"}`; `bad_request` for a malformed key or signature,
    `forbidden` for a wrong signature or no valid nonce, `conflict` when the
-   identity is linked to another member, `banned` when it is banned. Only Gwar
-   sessions claim, not TeamSpeak ones.
+   identity is linked to another member, `banned` when it is banned,
+   `quota_exceeded` past 64 linked identities. Only Gwar sessions claim, not
+   TeamSpeak ones.
 
 When the app offers it: `teamspeak.claimable {}` answers `{claimable}`, every
 `ts:<uid>` member holding a role other than Member (at most 5000). These uids

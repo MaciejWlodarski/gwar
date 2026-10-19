@@ -698,7 +698,8 @@ impl Core {
     /// or restart without looking like an absence.
     fn touch_online(&self) {
         let now = now_ms();
-        let users: BTreeSet<_> = self.sessions.values().filter(|s| s.out.is_some()).map(|s| s.user_id).collect();
+        // TeamSpeak users who are members (imported, or linked to one) count too.
+        let users: BTreeSet<_> = self.sessions.values().filter(|s| s.user_id != 0).map(|s| s.user_id).collect();
         for user in users {
             if let Err(e) = self.store.set_last_seen(user, now) {
                 warn!("store: {e:#}");
@@ -1326,9 +1327,11 @@ impl Core {
         info!(session, uid = %s.uid, ?reason, "client left");
         if let Some(out) = &s.out {
             let _ = out.try_send(Outbound::Close(reason.clone()));
-            if let Err(e) = self.store.set_last_seen(s.user_id, now_ms()) {
-                warn!("store: {e:#}");
-            }
+        }
+        if s.user_id != 0
+            && let Err(e) = self.store.set_last_seen(s.user_id, now_ms())
+        {
+            warn!("store: {e:#}");
         }
         if let Err(tokio::sync::mpsc::error::TrySendError::Full(command)) =
             self.media.try_send(MediaCmd::Remove { session })
@@ -1404,6 +1407,11 @@ impl Core {
                     Some((_, (id, member))) => (id, member.nickname, member.groups),
                     None => (0, client.nickname, Vec::new()),
                 };
+                if user_id != 0
+                    && let Err(e) = self.store.set_last_seen(user_id, now_ms())
+                {
+                    warn!("store: {e:#}");
+                }
                 let id = self.allocate_session();
                 // TeamSpeak users are always in some channel.
                 let wanted = Some(client.channel)
@@ -1489,7 +1497,7 @@ impl Core {
                 if let Some(channel) = u.channel.filter(|c| self.channels.contains_key(c) && !self.is_encrypted(*c)) {
                     let s = &self.sessions[&session];
                     // A channel they may not join (`connect`): they stay where they were, and go back there.
-                    if self.remote_may_join(&s.uid, &s.groups, channel) {
+                    if self.remote_may_join(&s.member, &s.groups, channel) {
                         let _ = self.move_client(session, Some(channel));
                     } else {
                         self.bridge_corrections.push(session);
