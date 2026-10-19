@@ -6,7 +6,7 @@ import { deviceStatement } from "../connect/crypto";
 import { certificateHash, decodeFixed, serverPublicKey } from "./handshake";
 import { encodeBase64Url } from "./base64url";
 import { uidForPublicKey, type Identity } from "./identity";
-import { messageStorage, refreshRevocations, type MessageStorage } from "./message-storage";
+import { confirmedBefore, messageStorage, refreshRevocations, type MessageStorage } from "./message-storage";
 
 const enc = new TextEncoder();
 export const DELETION_TEXT = "\0gwar deleted v1";
@@ -17,6 +17,8 @@ export type MessageVerification = {
   /** Qualifications of a valid signature: the signing device, revocation freshness, or (added by the view's
    *  context) a channel id the server reused after deleting it. */
   authorization: Array<"device-revoked" | "certificate-expired" | "revocations-stale" | "channel-reused" | "channel-history-incomplete">;
+  /** When this device first stored the revision (see `confirmedBefore`). */
+  seenAt?: number;
 };
 export interface MessageContext { serverKey: string; target: string; participants?: readonly [string, string]; sealed?: { group: string; epoch: number } }
 export const invalidVerification = (): MessageVerification => ({ status: "invalid", continuity: "unproven", authorization: [] });
@@ -153,6 +155,11 @@ export class MessageVerifier {
       }, s.previous_revision_hash);
       result.continuity = checkpoint.continuity;
       result.duplicate = checkpoint.duplicate;
+      result.seenAt = checkpoint.seenAt;
+      if (s.certificate && result.authorization.includes("revocations-stale")) {
+        const revocation = await this.storage.revocation(s.certificate.account_key, s.certificate.device_key).catch(() => undefined);
+        if (confirmedBefore(checkpoint.seenAt, revocation)) result.authorization = result.authorization.filter((a) => a !== "revocations-stale");
+      }
       if (result.continuity === "rollback" || result.continuity === "fork") result.status = "invalid";
     } catch { result.continuity = "storage-unavailable"; }
     return result;

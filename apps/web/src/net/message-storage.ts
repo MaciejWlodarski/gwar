@@ -12,7 +12,18 @@ export interface Revocation { seq: number; account_key: string; device_key: stri
 /** `files` fingerprints the signed attachments the message was first seen with; only its deletion may list others. */
 interface Checkpoint { revision: number; hash: string; created: number; conversation: string; at: number; proven?: boolean; deleted?: boolean; files?: string }
 interface Feed { cursor: number; checked: number; available?: boolean }
-export interface RevocationState { revokedAt?: number; fresh: boolean }
+/** `checked` is when the feed was last read to its end (this device's clock). */
+export interface RevocationState { revokedAt?: number; fresh: boolean; checked?: number }
+/**
+ * Whether this device stored a message revision (at `seenAt`) before its last complete revocation
+ * check, which then found the signing device not revoked: content confirmed then keeps that
+ * confirmation while the feed is stale, and only what arrived since is unconfirmed. A later
+ * revocation still marks it. Both times are this device's clock; a check from the far future (a
+ * clock set back) confirms nothing.
+ */
+export function confirmedBefore(seenAt: number | undefined, r: RevocationState | undefined, now = Date.now()): boolean {
+  return seenAt !== undefined && r?.checked !== undefined && r.revokedAt === undefined && seenAt <= r.checked && r.checked - now <= REVOCATION_FRESH_MS;
+}
 const pair = (account: string, device: string) => `${account}:${device}`;
 const requestValue = <T>(request: IDBRequest<T>): Promise<T> => new Promise((resolve, reject) => {
   request.onsuccess = () => resolve(request.result);
@@ -57,7 +68,8 @@ export class MessageStorage {
       });
     });
   }
-  async checkpoint(key: string, next: Checkpoint, predecessor: string): Promise<{ continuity: "proven" | "unproven" | "rollback" | "fork"; duplicate: boolean }> {
+  /** `seenAt`: when this device first stored the revision it returns as proven or unproven. */
+  async checkpoint(key: string, next: Checkpoint, predecessor: string): Promise<{ continuity: "proven" | "unproven" | "rollback" | "fork"; duplicate: boolean; seenAt?: number }> {
     return this.transaction(["checkpoints"], "readwrite", async (tx) => {
       const store = tx.objectStore("checkpoints");
       const old: Checkpoint | undefined = await requestValue(store.get(key));
@@ -66,7 +78,9 @@ export class MessageStorage {
         if (next.revision < old.revision) return { continuity: "rollback", duplicate: false };
         if (next.created !== old.created || next.conversation !== old.conversation) return { continuity: "fork", duplicate: false };
         if (!next.deleted && old.files !== undefined && next.files !== old.files) return { continuity: "fork", duplicate: false };
-        if (next.revision === old.revision) return { continuity: next.hash === old.hash ? (old.proven ? "proven" : "unproven") : "fork", duplicate: next.hash === old.hash };
+        if (next.revision === old.revision) {
+          return next.hash === old.hash ? { continuity: old.proven ? "proven" : "unproven", duplicate: true, seenAt: old.at } : { continuity: "fork", duplicate: false };
+        }
         if (next.revision === old.revision + 1 && predecessor !== old.hash) return { continuity: "fork", duplicate: false };
       }
       const proven = next.revision === 0 || (!!old && !!old.proven && next.revision === old.revision + 1 && predecessor === old.hash);
@@ -85,7 +99,7 @@ export class MessageStorage {
           });
         }
       }
-      return { continuity: proven ? "proven" : "unproven", duplicate: false };
+      return { continuity: proven ? "proven" : "unproven", duplicate: false, seenAt: next.at };
     });
   }
   /** One read transaction for all authorization notes in a visible thread. */
@@ -99,7 +113,7 @@ export class MessageStorage {
       const keys = [...new Set(pairs.map((p) => pair(p.account, p.device)))];
       const states = await Promise.all(keys.map(async (key) => {
         const entry: Revocation | undefined = await requestValue(tx.objectStore("revocations").get(key));
-        return [key, { revokedAt: entry?.revoked_at, fresh }] as const;
+        return [key, { revokedAt: entry?.revoked_at, fresh, checked: feed?.checked || undefined }] as const;
       }));
       return new Map(states);
     });

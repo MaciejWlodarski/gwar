@@ -1,6 +1,6 @@
 # End-to-end encryption: build plan and implementation spec
 
-Status: **building** (phase 4). [e2e.md](e2e.md) is the design and stays the
+Status: **built** (phase 4, steps 1–8; first alpha v0.1.0). [e2e.md](e2e.md) is the design and stays the
 reference for *what* and *why*. This document pins down *how*: the order of
 work, crate and module layout, exact encodings, wire messages and storage. A
 part is specified here before it is built; later parts are only outlined
@@ -33,8 +33,8 @@ and the web client working after every merge.
 8. **Pre-release reviews**: the WebCrypto SFrame worker; `openmls_rust_crypto`
    and our storage.
 
-Parts 1–7 are specified below and built. Step 8 began with an internal
-audit (below, "Step 8: internal audit"); an independent review verifies it. Voice comes before private channels and the
+Parts 1–7 are specified below and built. Step 8 was an internal audit
+(below, "Step 8: internal audit"), verified by an independent review. Voice comes before private channels and the
 archive because it is the product's core and needs only public channel
 groups.
 
@@ -2039,7 +2039,8 @@ review.
 
 ### Step 8: internal audit (2026-10-18)
 
-Read against RFC 9605 and this section; an independent review verifies it.
+Read against RFC 9605 and this section, then verified by an independent review
+(its findings are fixed in the same pull request, #86).
 
 - **WebCrypto SFrame worker** (`apps/web/src/voice/sframe`): header encoding
   (minimal, BigInt, non-minimal and truncated forms refused; RFC C.1 vectors),
@@ -2076,7 +2077,7 @@ Read against RFC 9605 and this section; an independent review verifies it.
 
 ## 6. Private channels
 
-Status: **6a and 6b built, 6c in progress**. Hidden plaintext private channels
+Status: **built** (6a, 6b and 6c). Hidden plaintext private channels
 (6a), the owner chain and the manager list with their device pins and signing
 (6b) are implemented. For encrypted private channels (6c), the access
 extension, the rules, the observer and the server (6c-1) and the device
@@ -2725,7 +2726,7 @@ gwar managers v1
 
 ## 7. Key archive
 
-Status: **specified**. The design is [e2e.md](e2e.md), "Your own devices".
+Status: **built** (7a, 7b and 7c). The design is [e2e.md](e2e.md), "Your own devices".
 A Connect account's devices keep a copy of every epoch key in an encrypted
 archive on Gwar Connect, so a new device of the account, or the recovery code
 after losing every device, reads the account's history. The archive holds
