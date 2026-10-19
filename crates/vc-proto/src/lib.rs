@@ -181,6 +181,21 @@ wire! {
         /// Removes members not seen for a while (or previews that with `dry_run`).
         #[serde(rename = "member.prune")]
         MemberPrune(MemberPrune),
+        /// Unlinks a TeamSpeak identity (`ts:<uid>`) from a member: your own, or with
+        /// `manage_members` a member ranked below you. The roles stay with the member.
+        #[serde(rename = "member.teamspeak.unlink")]
+        MemberTeamspeakUnlink { uid: Uid, teamspeak: Uid },
+        /// A one-time nonce for `teamspeak.claim`, valid five minutes (docs/teamspeak-import.md, "Claim").
+        #[serde(rename = "teamspeak.challenge")]
+        TeamspeakChallenge {},
+        /// Links the TeamSpeak identity whose public `key` (base64 libtomcrypt DER, as TeamSpeak
+        /// sends it) made `signature` (base64 DER ECDSA P-256 with SHA-256) over
+        /// `gwar teamspeak claim v1\n{server_key}\n{uid}\n{nonce}` to the caller.
+        #[serde(rename = "teamspeak.claim")]
+        TeamspeakClaim { key: String, signature: String },
+        /// The TeamSpeak members (`ts:<uid>`) holding a role other than Member.
+        #[serde(rename = "teamspeak.claimable")]
+        TeamspeakClaimable {},
         #[serde(rename = "ban.create")]
         BanCreate(BanCreate),
         #[serde(rename = "ban.list")]
@@ -509,6 +524,12 @@ wire! {
             #[cfg_attr(feature = "ts", ts(type = "number | null"))]
             next: Option<u64>,
         },
+        /// `teamspeak.challenge`.
+        TeamspeakNonce { nonce: String },
+        /// `teamspeak.claim`: the identity now linked to the caller.
+        TeamspeakClaimed { teamspeak: Uid },
+        /// `teamspeak.claimable`.
+        TeamspeakClaimable { claimable: Vec<Uid> },
         Mls(MlsResponse),
         Empty {},
     }
@@ -723,6 +744,10 @@ wire! {
         /// Unix time in milliseconds.
         #[cfg_attr(feature = "ts", ts(type = "number"))]
         pub last_seen: i64,
+        /// TeamSpeak identities linked to this member (`ts:<uid>`): someone joining with one
+        /// acts as this member (docs/teamspeak-import.md, "Linked TeamSpeak identities").
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub teamspeak: Vec<Uid>,
     }
 
     pub struct Unread {
@@ -1905,6 +1930,7 @@ mod tests {
                     connect: None,
                     groups: vec![2],
                     last_seen: 7,
+                    teamspeak: vec!["ts:abc=".into()],
                 }],
             },
         };

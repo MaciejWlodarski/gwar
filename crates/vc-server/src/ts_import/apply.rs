@@ -396,6 +396,14 @@ pub fn apply(store: &Store, plan: &Plan, source: &str, options: ApplyOptions) ->
         // The roles the last import gave: one taken away in Gwar since is not given again.
         let before: BTreeSet<GroupId> =
             record.as_ref().and_then(|(_, written)| serde_json::from_str(written.as_deref()?).ok()).unwrap_or_default();
+        // A TeamSpeak identity linked to a member is that member, whose roles are managed in Gwar.
+        if let Some(linked) = store.teamspeak_member(&m.uid)? {
+            applied.notes.push(format!(
+                "Member \"{}\" is linked to the Gwar member {linked}: roles left as they are.",
+                m.nickname
+            ));
+            continue;
+        }
         let id = match store.user_by_uid(&m.uid)? {
             Some((id, member)) => {
                 let mut groups: BTreeSet<GroupId> = member.groups.iter().copied().collect();

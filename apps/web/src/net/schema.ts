@@ -83,7 +83,7 @@ const client = shape<Client>({ id, uid, nickname: str(256), channel: nullable(id
 const color: Rule<string> = (v): v is string => typeof v === "string" && /^#[0-9a-f]{6}$/i.test(v);
 const group = shape<Group>({ id, name: str(256), permissions: array(permissions, 32), color: optional(nullable(color)), position: int(4294967295), hoist: bool, mentionable: bool });
 const attestation = shape<HandleAttestation>({ account_key: str(128), handle: str(64), issued_at: id, expires_at: id, signature: str(128) });
-const member = shape<Member>({ uid, nickname: str(256), tag: str(128), connect: optional(nullable(attestation)), groups: ids, last_seen: id });
+const member = shape<Member>({ uid, nickname: str(256), tag: str(128), connect: optional(nullable(attestation)), groups: ids, last_seen: id, teamspeak: optional(array(uid, 64)) });
 const unread = shape<Unread>({ channel: id, last_read: id, count: int(1000000), mentions: int(1000000) });
 const conversationUnread = shape<ConversationUnread>({ conversation: str(128), last_read: id, count: int(100) });
 const ice = shape<IceServer>({ urls: array(str(2048), 16), username: optional(nullable(str(1024))), credential: optional(nullable(str(1024))) });
@@ -169,7 +169,9 @@ export const responses: { [K in Op]: Rule<ResponseMap[K]> } = {
   "token.create": shape({ token: str(256) }), "token.redeem": shape({ groups: ids }),
   "file.upload": shape({ file: str(64), upload_url: path(true) }),
   "group.create": shape({ group }), "group.update": shape({ group }), "group.delete": empty, "group.reorder": empty,
-  "member.nickname": empty, "member.groups": shape({ groups: ids }), "member.remove": empty,
+  "member.nickname": empty, "member.groups": shape({ groups: ids }), "member.remove": empty, "member.teamspeak.unlink": empty,
+  "teamspeak.challenge": shape({ nonce: fixed(32) }), "teamspeak.claim": shape({ teamspeak: uid }),
+  "teamspeak.claimable": shape({ claimable: array(uid, 5000) }),
   "member.prune": shape({ uids: array(uid, 500), count: int(4294967295), members: array(member, 500) }),
   "ban.create": shape({ ban }), "ban.list": shape({ bans: array(ban, 4096) }), "ban.delete": empty,
   "invite.create": shape({ invite }), "invite.list": shape({ invites: array(invite, 4096) }), "invite.delete": empty,

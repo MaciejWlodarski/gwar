@@ -55,7 +55,7 @@ channels; roles carry them as defaults, and channels override them.
 | `administrator` | server | everything; overrides do not apply (rank still does) | the Admin group |
 | `manage_server` | server | name, welcome message, password, uploads, server chat | `server_manage` |
 | `manage_roles` | server | create, edit, reorder, delete and give roles below one's rank | `group_manage` |
-| `manage_members` | server | change nicknames, remove members and prune | `member_nickname`, `member_remove` |
+| `manage_members` | server | change nicknames, remove members, prune, unlink their TeamSpeak identities | `member_nickname`, `member_remove` |
 | `kick_members` | server | disconnect from the server | `client_kick` |
 | `ban_members` | server | ban and unban | `client_ban` |
 | `create_invites` | server | invites (for roles below one's rank) | `invite_create`, `token_create` |
@@ -152,6 +152,9 @@ One rule replaces "nobody acts on someone holding permissions they lack":
 
 The core stays the authority for official TeamSpeak clients too:
 
+- A TeamSpeak user is the member `ts:<uid>`, or, when that identity is linked
+  to a Gwar member, acts as that member: their roles, overrides, rank and bans
+  apply ([teamspeak-import.md](teamspeak-import.md#linked-teamspeak-identities)).
 - Private channels are not mirrored (as before).
 - `connect`: a TeamSpeak user who arrives in, or moves into, a channel they
   may not join stays where they were in Gwar (the default channel on

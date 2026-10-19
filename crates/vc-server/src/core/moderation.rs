@@ -106,7 +106,7 @@ impl Core {
 
     pub(super) fn session_rank(&self, session: SessionId) -> i64 {
         let s = &self.sessions[&session];
-        self.rank_of(&s.uid, &s.groups)
+        self.rank_of(&s.member, &s.groups)
     }
 
     /// Whether `session` ranks above a member with these roles.
@@ -366,7 +366,7 @@ impl Core {
         let cutoff = now_ms() - i64::from(p.inactive_days) * DAY_MS;
         let me = &self.sessions[&session];
         let (my_uid, by) = (me.uid.clone(), me.nickname.clone());
-        let online: BTreeSet<&str> = self.sessions.values().map(|s| s.uid.as_str()).collect();
+        let online: BTreeSet<&str> = self.sessions.values().map(|s| s.member.as_str()).collect();
         let mut doomed: Vec<_> = self
             .store
             .member_rows(Some(cutoff))
@@ -400,7 +400,8 @@ impl Core {
         member: &Member,
         delete_messages: bool,
     ) -> Result<(), ErrorBody> {
-        let online: Vec<_> = self.sessions.values().filter(|s| s.uid == member.uid).map(|s| s.id).collect();
+        // Linked TeamSpeak identities act as this member, so they leave too (their links go with the record).
+        let online: Vec<_> = self.sessions.values().filter(|s| s.member == member.uid).map(|s| s.id).collect();
         for s in online {
             self.remove(s, LeaveReason::Removed { by: by.to_owned() });
         }
@@ -497,7 +498,8 @@ impl Core {
                 let Some(s) = self.sessions.get(&client) else {
                     return Err(err(ErrorCode::NotFound, "no such client"));
                 };
-                (s.uid.clone(), s.nickname.clone(), s.ip.filter(|_| b.ip), s.groups.clone())
+                // A linked TeamSpeak user is the member they act as.
+                (s.member.clone(), s.nickname.clone(), s.ip.filter(|_| b.ip), s.groups.clone())
             }
             (None, Some(uid)) => {
                 let Some((_, member)) = self.store.user_by_uid(&uid).map_err(storage_error)? else {
@@ -532,8 +534,10 @@ impl Core {
             .sessions
             .values()
             .filter(|s| {
-                s.uid == uid
-                    || (range.is_some() && s.ip.map(subscriber) == range && self.outranks(session, &s.uid, &s.groups))
+                s.member == uid
+                    || (range.is_some()
+                        && s.ip.map(subscriber) == range
+                        && self.outranks(session, &s.member, &s.groups))
             })
             .map(|s| s.id)
             .collect();

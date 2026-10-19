@@ -1,7 +1,7 @@
 # Moving a TeamSpeak server to Gwar
 
 Status: built (`vc-server import-teamspeak`), onto roles version 2 ([roles.md](roles.md)).
-Later: the claim flow for roles, a wizard in the desktop app, TeamSpeak 6.
+Later: a wizard in the desktop app, TeamSpeak 6.
 
 A community with a TeamSpeak 3 server can move to a Gwar server without
 rebuilding it by hand: `vc-server import-teamspeak` reads the TeamSpeak server
@@ -53,18 +53,74 @@ When such a person joins Gwar's TeamSpeak server with their TeamSpeak client,
 the bridge already looks the member up by `ts:<uid>` (`BridgeMsg::Join`), so
 they arrive with their roles.
 
-The Gwar app identifies people by an Ed25519 key, a different identity. Two ways
-to bring a TeamSpeak member's roles to their Gwar identity:
+The Gwar app identifies people by an Ed25519 key, a different identity. A
+TeamSpeak identity can be **linked** to a Gwar member, so the person keeps one
+set of roles whichever app they use.
 
-1. **Claim (planned, second step).** The desktop app holds the person's
-   TeamSpeak identities (docs/connect.md, "TeamSpeak identities"). It proves
-   ownership by signing a server challenge with the identity's P-256 key and
-   sending the public key; the server checks that the SHA-1 of the key is the
-   member's uid and the signature, then merges `ts:<uid>` into the person's
-   member (`members merge` semantics: roles united, nothing else lost). No
-   admin work and nothing to trust but the key.
-2. **By hand, today:** `vc-server members merge ts:<uid> <uid>` on a stopped
-   server, or the same from the members tab later.
+### Linked TeamSpeak identities
+
+A member can have several TeamSpeak identities linked (`teamspeak_links`: the
+TeamSpeak uid, the member, when); an identity is linked to at most one member.
+The person links their own by a claim (below); the admin can link any with
+`vc-server members link ts:<uid> <member-uid>` on a stopped server.
+
+Linking `ts:<uid>` to member M is one transaction:
+
+- If a member `ts:<uid>` exists (imported, or given roles in Gwar), its roles
+  join M's (united, as in a merge), its per-channel member overrides move to M
+  where M has none in that channel, and what the import last wrote for it
+  follows M. The `ts:<uid>` member is then removed: its roles are M's from now
+  on, and a later import counts it as removed in Gwar, so it does not come back.
+- Messages, files, mentions and bans stay with `ts:<uid>`: they are what that
+  TeamSpeak identity did, and its chat stays TeamSpeak chat (never an unsigned
+  message of M). A banned identity cannot be claimed (`banned`); the admin can
+  still link it, and the ban keeps refusing it.
+- The link is public on this server: M's member entry lists its TeamSpeak
+  uids, and a linked TeamSpeak user is shown with M's nickname.
+
+A **linked TeamSpeak user** (someone joining Gwar's TeamSpeak server with that
+identity) keeps the identity `ts:<uid>`, so their chat, direct messages and
+mentions stay those of a TeamSpeak user, but acts as M: M's roles, M's
+per-channel overrides and M's rank apply, and a ban of M or of `ts:<uid>`
+refuses them. Role changes, kicks and bans of M reach that session too.
+
+**Unlinking** (`member.teamspeak.unlink`, by M or by someone with
+`manage_members` ranked above M; or `vc-server members unlink ts:<uid>`) leaves
+the roles with M. A connected session of that identity goes on as an unknown
+TeamSpeak user, with Member's permissions. Removing M removes its links.
+`members merge` moves the source's links to the target and refuses a `ts:`
+source: linking is the way to bring a TeamSpeak member to a Gwar one.
+
+### Claim
+
+The person proves they hold the identity, with no admin work:
+
+1. `teamspeak.challenge {}` answers `{nonce}`: 32 random bytes (base64url), one
+   per session, valid for five minutes and usable once.
+2. The app signs, with the identity's P-256 key (ECDSA with SHA-256, DER, the
+   way a TeamSpeak client signs), the UTF-8 statement
+   `gwar teamspeak claim v1\n{server_key}\n{uid}\n{nonce}`, where `server_key`
+   is the server's key from the handshake and `uid` the claimant's.
+3. `teamspeak.claim {key, signature}` sends the public key in TeamSpeak's own
+   form (base64 of the libtomcrypt DER encoding, as `clientinitiv` carries it)
+   and the signature (base64). The server derives the uid exactly as TeamSpeak
+   does (base64 of the SHA-1 of the key re-encoded in that form), checks the
+   signature and links the identity to the claimant. It answers
+   `{teamspeak: "ts:<uid>"}`; `bad_request` for a malformed key or signature,
+   `forbidden` for a wrong signature or no valid nonce, `conflict` when the
+   identity is linked to another member, `banned` when it is banned. Only Gwar
+   sessions claim, not TeamSpeak ones.
+
+When the app offers it: `teamspeak.claimable {}` answers `{claimable}`, every
+`ts:<uid>` member holding a role other than Member (at most 5000). These uids
+are no secret: TeamSpeak shows them to everyone on its server, and Gwar's
+member list shows those members. The desktop app asks for the list only when it
+holds TeamSpeak identities and the person has not decided for this server yet.
+It compares the list with its identities on the device and offers a claim only
+for the ones in it. Nothing tells the server which identities the person holds
+unless they accept, and declining is remembered for that server. The server's
+settings list linked identities (to unlink) and claimable ones. The web app
+follows later: it does not read TeamSpeak keys yet.
 
 ## Roles and permissions
 
@@ -172,10 +228,10 @@ VC_TS_QUERY_PASSWORD=… vc-server import-teamspeak --from 127.0.0.1:10011 [--us
   channel, role, Member's permissions, the role order, the default channel or
   the server's settings edited in Gwar stay as they are (what Gwar changes by
   itself, such as overrides that go with a deleted role or follow a merged
-  member, is no edit); anything deleted in Gwar is not made again;
+  or linked member, is no edit); anything deleted in Gwar is not made again;
   a role taken from a member in Gwar is not given back, and a ban lifted in
-  Gwar stays lifted. The report lists each. A member merged into a Gwar
-  identity counts as removed: their roles from then on are managed in Gwar. A member's roles follow TeamSpeak
+  Gwar stays lifted. The report lists each. A TeamSpeak member linked to a
+  Gwar member counts as removed: their roles from then on are managed in Gwar. A member's roles follow TeamSpeak
   otherwise: one added there is given, one removed there goes. New TeamSpeak
   items are added. So a community can import, try Gwar, and import again just
   before switching.
@@ -192,7 +248,6 @@ VC_TS_QUERY_PASSWORD=… vc-server import-teamspeak --from 127.0.0.1:10011 [--us
 Built: the CLI above, TeamSpeak 3 servers (3.13) over the raw ServerQuery
 port, which `vc-server` already speaks for the bridge. Later:
 
-- the claim flow for roles (above);
 - a wizard in the desktop app's server settings (the app can open TCP; the web
   app cannot);
 - ServerQuery over SSH and TeamSpeak 6 servers (no raw ServerQuery port, and a

@@ -57,6 +57,23 @@ pub struct ChannelRow {
     pub synced: bool,
 }
 
+/// What linking a TeamSpeak identity did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Link {
+    /// Linked now. `member`: a member `ts:<uid>` gave `groups` roles and the overrides in
+    /// these channels to the target and was removed.
+    Linked { member: bool, groups: usize, overrides: Vec<ChannelId> },
+    /// Already linked to this member.
+    Already,
+    /// Linked to another member: nothing changed.
+    Elsewhere,
+}
+
+/// A TeamSpeak identity's uid as a member uid: `ts:<uid>`.
+pub fn is_teamspeak(uid: &str) -> bool {
+    uid.len() > 3 && uid.starts_with("ts:")
+}
+
 #[derive(Debug, Clone)]
 pub struct UserRow {
     pub id: i64,
@@ -419,6 +436,15 @@ const MIGRATIONS: &[&str] = &[
         channel INTEGER PRIMARY KEY REFERENCES channels(id) ON DELETE CASCADE,
         password TEXT NOT NULL
     );
+    "#,
+    // TeamSpeak identities linked to members (docs/teamspeak-import.md, "Linked TeamSpeak identities").
+    r#"
+    CREATE TABLE teamspeak_links (
+        teamspeak TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        linked_at INTEGER NOT NULL
+    );
+    CREATE INDEX teamspeak_links_user ON teamspeak_links(user_id);
     "#,
 ];
 
@@ -991,7 +1017,11 @@ impl Store {
             .optional()?;
         let Some((id, nickname, last_seen, connect)) = row else { return Ok(None) };
         let tag = self.member_tags()?.remove(uid).unwrap_or_default();
-        Ok(Some((id, Member { uid: uid.to_owned(), nickname, tag, connect, groups: self.user_groups(id)?, last_seen })))
+        let teamspeak = self.teamspeak_links_of(id)?;
+        Ok(Some((
+            id,
+            Member { uid: uid.to_owned(), nickname, tag, connect, groups: self.user_groups(id)?, last_seen, teamspeak },
+        )))
     }
 
     #[cfg(test)]
@@ -1284,7 +1314,15 @@ impl Store {
         rows.map(|row| {
             let (id, uid, nickname, last_seen, connect) = row?;
             let tag = tags.get(&uid).cloned().unwrap_or_default();
-            Ok(Member { uid, nickname, tag, connect, groups: self.user_groups(id)?, last_seen })
+            Ok(Member {
+                uid,
+                nickname,
+                tag,
+                connect,
+                groups: self.user_groups(id)?,
+                last_seen,
+                teamspeak: self.teamspeak_links_of(id)?,
+            })
         })
         .collect()
     }
@@ -1316,7 +1354,15 @@ impl Store {
             let tag = tags.get(&uid).cloned().unwrap_or_default();
             Ok(MemberRow {
                 id,
-                member: Member { uid, nickname, tag, connect, groups: self.user_groups(id)?, last_seen },
+                member: Member {
+                    uid,
+                    nickname,
+                    tag,
+                    connect,
+                    groups: self.user_groups(id)?,
+                    last_seen,
+                    teamspeak: self.teamspeak_links_of(id)?,
+                },
                 messages,
             })
         })
@@ -1378,7 +1424,11 @@ impl Store {
                 .optional()?
                 .with_context(|| format!("no member with uid {uid}"))
         };
+        if is_teamspeak(from) && !is_teamspeak(into) {
+            bail!("{from} is a TeamSpeak identity: link it instead (vc-server members link {from} {into})");
+        }
         let (from_id, into_id) = (id(from)?, id(into)?);
+        tx.execute("UPDATE teamspeak_links SET user_id=?2 WHERE user_id=?1", params![from_id, into_id])?;
         let mut report = MergeReport {
             messages: tx.execute(
                 "UPDATE messages SET author_uid=?2 WHERE author_uid=?1 AND signature IS NULL",
@@ -1433,6 +1483,105 @@ impl Store {
             tx.commit()?;
         }
         Ok(report)
+    }
+
+    /// The TeamSpeak identities linked to member `user_id`.
+    pub fn teamspeak_links_of(&self, user_id: i64) -> Result<Vec<Uid>> {
+        let mut stmt =
+            self.db.prepare_cached("SELECT teamspeak FROM teamspeak_links WHERE user_id=?1 ORDER BY teamspeak")?;
+        let rows = stmt.query_map([user_id], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The member a TeamSpeak identity (`ts:<uid>`) is linked to.
+    pub fn teamspeak_member(&self, teamspeak: &str) -> Result<Option<Uid>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT users.uid FROM teamspeak_links JOIN users ON users.id=teamspeak_links.user_id WHERE teamspeak=?1",
+                [teamspeak],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Links a TeamSpeak identity to member `into` (docs/teamspeak-import.md, "Linked TeamSpeak
+    /// identities"): a member `teamspeak` gives its roles and its per-channel overrides (where
+    /// `into` has none there) to `into` and is removed; its messages, files and bans stay its own.
+    pub fn link_teamspeak(&self, teamspeak: &str, into: &str, now: i64) -> Result<Link> {
+        if !is_teamspeak(teamspeak) {
+            bail!("{teamspeak} is not a TeamSpeak identity (ts:<uid>)");
+        }
+        if is_teamspeak(into) {
+            bail!("{into} is a TeamSpeak identity; link to a Gwar member");
+        }
+        let tx = self.db.unchecked_transaction()?;
+        let into_id: i64 = tx
+            .query_row("SELECT id FROM users WHERE uid=?1", [into], |r| r.get(0))
+            .optional()?
+            .with_context(|| format!("no member with uid {into}"))?;
+        let linked: Option<i64> = tx
+            .query_row("SELECT user_id FROM teamspeak_links WHERE teamspeak=?1", [teamspeak], |r| r.get(0))
+            .optional()?;
+        match linked {
+            Some(user) if user == into_id => return Ok(Link::Already),
+            Some(_) => return Ok(Link::Elsewhere),
+            None => {}
+        }
+        let from_id: Option<i64> =
+            tx.query_row("SELECT id FROM users WHERE uid=?1", [teamspeak], |r| r.get(0)).optional()?;
+        let mut link = Link::Linked { member: from_id.is_some(), groups: 0, overrides: Vec::new() };
+        if let (Some(from_id), Link::Linked { groups, overrides, .. }) = (from_id, &mut link) {
+            *groups = tx.execute(
+                "INSERT OR IGNORE INTO user_groups SELECT ?2,group_id FROM user_groups WHERE user_id=?1",
+                params![from_id, into_id],
+            )?;
+            let mut stmt =
+                tx.prepare("UPDATE OR IGNORE channel_overrides SET user=?2 WHERE user=?1 RETURNING channel")?;
+            *overrides = stmt.query_map(params![teamspeak, into], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+            drop(stmt);
+            let mut stmt = tx.prepare("DELETE FROM channel_overrides WHERE user=?1 RETURNING channel")?;
+            overrides.extend(
+                stmt.query_map([teamspeak], |r| r.get::<_, ChannelId>(0))?.collect::<rusqlite::Result<Vec<_>>>()?,
+            );
+            drop(stmt);
+            overrides.sort_unstable();
+            overrides.dedup();
+            // What a TeamSpeak import last wrote follows too, so a re-run does not take the link for an edit.
+            tx.execute(
+                "UPDATE ts_imports SET written=replace(written,'\"user\":\"'||?1||'\"','\"user\":\"'||?2||'\"') WHERE kind='channel'",
+                params![teamspeak, into],
+            )?;
+            tx.execute(
+                "UPDATE users SET last_seen=MAX(last_seen,(SELECT last_seen FROM users WHERE id=?1)) WHERE id=?2",
+                params![from_id, into_id],
+            )?;
+            // The foreign keys take its group memberships along; messages, files and bans keep `ts:<uid>`.
+            tx.execute("DELETE FROM users WHERE id=?1", [from_id])?;
+        }
+        tx.execute(
+            "INSERT INTO teamspeak_links(teamspeak,user_id,linked_at) VALUES (?1,?2,?3)",
+            params![teamspeak, into_id, now],
+        )?;
+        tx.commit()?;
+        Ok(link)
+    }
+
+    /// Unlinks a TeamSpeak identity; returns the member it was linked to.
+    pub fn unlink_teamspeak(&self, teamspeak: &str) -> Result<Option<Uid>> {
+        let member = self.teamspeak_member(teamspeak)?;
+        self.db.execute("DELETE FROM teamspeak_links WHERE teamspeak=?1", [teamspeak])?;
+        Ok(member)
+    }
+
+    /// TeamSpeak members (`ts:<uid>`) holding a role other than Member: what a claim could bring.
+    pub fn teamspeak_claimable(&self, limit: u32) -> Result<Vec<Uid>> {
+        let mut stmt = self.db.prepare(
+            "SELECT uid FROM users WHERE uid LIKE 'ts:%'
+             AND EXISTS (SELECT 1 FROM user_groups WHERE user_id=users.id AND group_id!=?1) ORDER BY uid LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![MEMBER_GROUP, limit], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn latest_message(&self, channel: ChannelId) -> Result<MessageId> {
@@ -2603,5 +2752,129 @@ mod tests {
         removal.overrides.sort_unstable();
         assert_eq!(removal.overrides, vec![a, b]);
         assert!(store.channel_overrides().unwrap().values().all(Vec::is_empty));
+    }
+}
+
+#[cfg(test)]
+mod teamspeak_link_tests {
+    use super::*;
+    use vc_proto::ChannelOverride;
+
+    fn user(store: &Store, uid: &str, groups: &[GroupId]) -> i64 {
+        let row = store.touch_user(uid, uid, uid, 1).unwrap();
+        store.set_user_groups(row.id, groups).unwrap();
+        row.id
+    }
+
+    fn user_override(user: &str, allow: Permission) -> ChannelOverride {
+        ChannelOverride { user: Some(user.into()), allow: vec![allow], ..Default::default() }
+    }
+
+    #[test]
+    fn linking_gives_the_teamspeak_members_roles_and_overrides_and_keeps_what_it_did() {
+        let store = Store::in_memory().unwrap();
+        let mods = store.insert_group("Moderators", &[Permission::KickMembers], None, false, false).unwrap();
+        let djs = store.insert_group("DJs", &[Permission::Speak], None, false, false).unwrap();
+        user(&store, "ts:abc=", &[MEMBER_GROUP, mods]);
+        user(&store, "gwar", &[MEMBER_GROUP, djs]);
+        // One channel where only the TeamSpeak member has an override, one where both do.
+        let only = store.create_channel(&ChannelRow { name: "Only".into(), ..Default::default() }).unwrap();
+        let both = store.create_channel(&ChannelRow { name: "Both".into(), ..Default::default() }).unwrap();
+        store.set_channel_overrides(only, &[user_override("ts:abc=", Permission::MoveMembers)]).unwrap();
+        store
+            .set_channel_overrides(
+                both,
+                &[user_override("ts:abc=", Permission::MoveMembers), user_override("gwar", Permission::Speak)],
+            )
+            .unwrap();
+        store
+            .raw()
+            .execute(
+                "INSERT INTO messages(channel,author_uid,author_name,text,sent_at) VALUES (?1,'ts:abc=','T','hi',1)",
+                [only],
+            )
+            .unwrap();
+        let ban = Ban {
+            id: 0,
+            uid: Some("ts:abc=".into()),
+            ip: None,
+            nickname: "T".into(),
+            reason: None,
+            by: "x".into(),
+            created_at: 1,
+            expires_at: None,
+        };
+        store.insert_ban(&ban, None).unwrap();
+
+        let link = store.link_teamspeak("ts:abc=", "gwar", 5).unwrap();
+        assert_eq!(link, Link::Linked { member: true, groups: 1, overrides: vec![only, both] });
+        // The roles are united, the member is gone, and the link points at the Gwar member.
+        let (_, member) = store.user_by_uid("gwar").unwrap().unwrap();
+        let mut expected = vec![MEMBER_GROUP, mods, djs];
+        expected.sort_unstable();
+        assert_eq!(member.groups, expected);
+        assert_eq!(member.teamspeak, vec!["ts:abc=".to_string()]);
+        assert!(store.user_by_uid("ts:abc=").unwrap().is_none());
+        assert_eq!(store.teamspeak_member("ts:abc=").unwrap().as_deref(), Some("gwar"));
+        // Overrides move where the target had none; the target's own stays where it had one.
+        let overrides = |c| store.channels().unwrap().into_iter().find(|r| r.id == c).unwrap().overrides;
+        assert_eq!(overrides(only), vec![user_override("gwar", Permission::MoveMembers)]);
+        assert_eq!(overrides(both), vec![user_override("gwar", Permission::Speak)]);
+        // What the identity did stays its own: its message and its ban.
+        let author: String = store.raw().query_row("SELECT author_uid FROM messages", [], |r| r.get(0)).unwrap();
+        assert_eq!(author, "ts:abc=");
+        assert!(store.bans(2).unwrap().iter().any(|b| b.uid.as_deref() == Some("ts:abc=")));
+
+        // Again: nothing to do; to someone else: refused.
+        user(&store, "other", &[MEMBER_GROUP]);
+        assert_eq!(store.link_teamspeak("ts:abc=", "gwar", 6).unwrap(), Link::Already);
+        assert_eq!(store.link_teamspeak("ts:abc=", "other", 6).unwrap(), Link::Elsewhere);
+        assert_eq!(store.teamspeak_member("ts:abc=").unwrap().as_deref(), Some("gwar"));
+    }
+
+    #[test]
+    fn links_need_a_teamspeak_identity_and_a_gwar_member_and_go_with_the_member() {
+        let store = Store::in_memory().unwrap();
+        user(&store, "gwar", &[MEMBER_GROUP]);
+        user(&store, "ts:x=", &[MEMBER_GROUP]);
+        assert!(store.link_teamspeak("gwar", "gwar", 1).is_err());
+        assert!(store.link_teamspeak("ts:y=", "ts:x=", 1).is_err());
+        assert!(store.link_teamspeak("ts:y=", "nobody", 1).is_err());
+        // An identity with no member links too.
+        assert_eq!(
+            store.link_teamspeak("ts:y=", "gwar", 1).unwrap(),
+            Link::Linked { member: false, groups: 0, overrides: vec![] }
+        );
+        assert_eq!(store.unlink_teamspeak("ts:y=").unwrap().as_deref(), Some("gwar"));
+        assert_eq!(store.unlink_teamspeak("ts:y=").unwrap(), None);
+        store.link_teamspeak("ts:y=", "gwar", 1).unwrap();
+        let (id, member) = store.user_by_uid("gwar").unwrap().unwrap();
+        store.remove_member(id, &member.uid, false).unwrap();
+        assert_eq!(store.teamspeak_member("ts:y=").unwrap(), None);
+    }
+
+    #[test]
+    fn merging_moves_links_and_refuses_a_teamspeak_source() {
+        let store = Store::in_memory().unwrap();
+        user(&store, "old", &[MEMBER_GROUP]);
+        user(&store, "new", &[MEMBER_GROUP]);
+        user(&store, "ts:z=", &[MEMBER_GROUP]);
+        store.link_teamspeak("ts:q=", "old", 1).unwrap();
+        let refused = store.merge_members("ts:z=", "new", false).unwrap_err().to_string();
+        assert!(refused.contains("link it instead"), "{refused}");
+        store.merge_members("old", "new", false).unwrap();
+        assert_eq!(store.teamspeak_member("ts:q=").unwrap().as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn claimable_identities_are_teamspeak_members_with_a_role() {
+        let store = Store::in_memory().unwrap();
+        let mods = store.insert_group("Moderators", &[], None, false, false).unwrap();
+        user(&store, "ts:b=", &[MEMBER_GROUP, mods]);
+        user(&store, "ts:a=", &[MEMBER_GROUP]);
+        user(&store, "gwar", &[MEMBER_GROUP, mods]);
+        user(&store, "ts:c=", &[mods]);
+        assert_eq!(store.teamspeak_claimable(10).unwrap(), vec!["ts:b=".to_string(), "ts:c=".to_string()]);
+        assert_eq!(store.teamspeak_claimable(1).unwrap(), vec!["ts:b=".to_string()]);
     }
 }

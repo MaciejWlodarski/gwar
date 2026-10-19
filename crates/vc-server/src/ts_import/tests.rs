@@ -468,11 +468,11 @@ fn an_import_is_all_or_nothing_and_a_dry_run_changes_nothing() {
 fn what_gwar_itself_drops_or_merges_is_no_edit_and_a_default_chosen_in_gwar_stays() {
     let store = Store::in_memory().unwrap();
     apply(&store, &plan(&source(), &Options::default()), "src", BRIDGE).unwrap();
-    // A role deleted (its overrides go with it) and the channel admin merged into a Gwar identity.
+    // A role deleted (its overrides go with it) and the channel admin linked to a Gwar identity.
     let moderator = store.groups().unwrap().into_iter().find(|g| g.name == "Moderator").unwrap().id;
     store.delete_group(moderator).unwrap();
     store.touch_user("native", "key", "Leader", 1).unwrap();
-    store.merge_members("ts:ClanAdminUid=", "native", false).unwrap();
+    store.link_teamspeak("ts:ClanAdminUid=", "native", 1).unwrap();
     let general = store.channels().unwrap().into_iter().find(|c| c.name == "General").unwrap().id;
     store.set_meta("default_channel", &general.to_string()).unwrap();
     let second = apply(&store, &plan(&source(), &Options::default()), "src", BRIDGE).unwrap();
@@ -504,4 +504,19 @@ fn a_server_that_never_ran_is_imported_into_a_new_database() {
     let store = Store::open(&database).unwrap();
     let default: u32 = store.meta("default_channel").unwrap().unwrap().parse().unwrap();
     assert_eq!(store.channels().unwrap().iter().find(|c| c.id == default).unwrap().name, "Lobby");
+}
+
+#[test]
+fn an_identity_linked_to_a_gwar_member_is_not_imported_as_a_member_of_its_own() {
+    let store = Store::in_memory().unwrap();
+    // Claimed before the first import, and linked after it: neither comes back as `ts:<uid>`.
+    store.touch_user("native", "key", "Leader", 1).unwrap();
+    store.link_teamspeak("ts:ModUid=", "native", 1).unwrap();
+    let first = apply(&store, &plan(&source(), &Options::default()), "src", BRIDGE).unwrap();
+    assert!(store.user_by_uid("ts:ModUid=").unwrap().is_none());
+    assert!(first.notes.iter().any(|n| n.contains("linked to the Gwar member native")), "{:?}", first.notes);
+    store.link_teamspeak("ts:ClanAdminUid=", "native", 1).unwrap();
+    apply(&store, &plan(&source(), &Options::default()), "src", BRIDGE).unwrap();
+    assert!(store.user_by_uid("ts:ClanAdminUid=").unwrap().is_none());
+    assert_eq!(store.user_by_uid("native").unwrap().unwrap().1.teamspeak.len(), 2);
 }

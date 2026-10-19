@@ -248,6 +248,11 @@ enum MembersCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Link a TeamSpeak identity (`ts:<uid>`) to a member: joining with it acts as the member, and a
+    /// member `ts:<uid>` gives them its roles (docs/teamspeak-import.md). The server must be stopped.
+    Link { teamspeak: String, member_uid: String },
+    /// Unlink a TeamSpeak identity; the member keeps the roles. The server must be stopped.
+    Unlink { teamspeak: String },
 }
 
 fn members(data_dir: &std::path::Path, database: &std::path::Path, command: MembersCommand) -> Result<()> {
@@ -286,6 +291,29 @@ fn members(data_dir: &std::path::Path, database: &std::path::Path, command: Memb
                 "{verb} {from_uid} into {into_uid}: {} unsigned messages, {} files, {} read marks, {} group memberships, {} unsigned mentions, {} bans; signed messages keep their original author uid and mentions",
                 report.messages, report.files, report.read_marks, report.groups, report.mentions, report.bans
             );
+        }
+        MembersCommand::Link { teamspeak, member_uid } => {
+            let _lock = members::lock_data_dir(data_dir)?;
+            let store = Store::open(database)?;
+            match store.link_teamspeak(&teamspeak, &member_uid, vc_server::core::now_ms())? {
+                vc_server::store::Link::Linked { member: true, groups, overrides } => println!(
+                    "linked {teamspeak} to {member_uid}: {groups} roles and the overrides in {} channels moved over, the member {teamspeak} removed",
+                    overrides.len()
+                ),
+                vc_server::store::Link::Linked { member: false, .. } => println!("linked {teamspeak} to {member_uid}"),
+                vc_server::store::Link::Already => println!("{teamspeak} was already linked to {member_uid}"),
+                vc_server::store::Link::Elsewhere => {
+                    anyhow::bail!("{teamspeak} is linked to another member: unlink it first")
+                }
+            }
+        }
+        MembersCommand::Unlink { teamspeak } => {
+            let _lock = members::lock_data_dir(data_dir)?;
+            let store = Store::open(database)?;
+            match store.unlink_teamspeak(&teamspeak)? {
+                Some(member) => println!("unlinked {teamspeak} from {member}; the roles stay with {member}"),
+                None => anyhow::bail!("{teamspeak} is not linked to anyone"),
+            }
         }
     }
     Ok(())

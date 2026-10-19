@@ -992,3 +992,93 @@ async fn on_teamspeak_only_those_who_may_speak_talk() {
     wait_for_talker(&query, a_clid, false).await;
     unheard(&a, &mut b, 63).await;
 }
+
+/// A TeamSpeak client with this identity, connected and in the server's state.
+async fn teamspeak_user_with(
+    voice: std::net::SocketAddr,
+    name: &str,
+    identity: tsclientlib::Identity,
+) -> (tsclientlib::Connection, u16) {
+    let mut con =
+        tsclientlib::Connection::build(voice.to_string()).name(name.to_string()).identity(identity).connect().unwrap();
+    within("TeamSpeak client", async {
+        loop {
+            con.events().next().await.expect("TeamSpeak events").unwrap();
+            if let Ok(state) = con.get_state()
+                && state.clients.contains_key(&state.own_client)
+            {
+                break;
+            }
+        }
+    })
+    .await;
+    let clid = con.get_state().unwrap().own_client.0;
+    (con, clid)
+}
+
+#[tokio::test]
+#[ignore]
+async fn a_claimed_teamspeak_identity_acts_as_its_member_on_teamspeak() {
+    let root = PathBuf::from(std::env::var_os("VC_TS3_DIR").expect("VC_TS3_DIR"));
+    let installed = install::ensure_installed(&root).await.unwrap();
+    let dir = TempDir(std::env::temp_dir().join(format!("vc-ts-claim-{}", free_port(false))));
+    std::fs::create_dir_all(&dir.0).unwrap();
+    std::os::unix::fs::symlink(&installed.dir, dir.0.join(installed.dir.file_name().unwrap())).unwrap();
+    let voice = format!("127.0.0.1:{}", free_port(true)).parse().unwrap();
+    let query_port = free_port(false);
+    let server = TestServer::start_with(|c| {
+        c.teamspeak = Some(TeamSpeakConfig {
+            dir: dir.0.clone(),
+            voice,
+            query_port,
+            filetransfer: format!("127.0.0.1:{}", free_port(false)).parse().unwrap(),
+            public_url: None,
+        })
+    })
+    .await;
+    let mut ready = server.running.teamspeak_ready.clone().unwrap();
+    tokio::time::timeout(Duration::from_secs(120), ready.wait_for(|ready| *ready)).await.unwrap().unwrap();
+    let password = std::fs::read_to_string(dir.0.join("query-password")).unwrap();
+    let (query, _notes) =
+        Query::connect(format!("127.0.0.1:{query_port}").parse().unwrap(), "serveradmin", password.trim(), 1)
+            .await
+            .unwrap();
+    let mut admin = admin(&server, "root").await;
+
+    // Only Speakers may speak on the Stage; Alice is one.
+    let created = admin.ok("group.create", json!({"name": "Speakers", "permissions": []})).await;
+    let speakers = created["group"]["id"].as_u64().unwrap();
+    let stage = channel_id(&admin.create_channel(json!({"name": "Stage"})).await);
+    for (role, allow, deny) in [(2, json!([]), json!(["speak"])), (speakers, json!(["speak"]), json!([]))] {
+        let entry = json!({"channel": stage, "override": {"role": role, "allow": allow, "deny": deny}});
+        admin.ok("channel.override", entry).await;
+    }
+    let mut alice = Client::connect(&server, "alice").await;
+    let alice_uid = alice.welcome.uid.clone();
+    admin.ok("member.groups", json!({"uid": alice_uid, "groups": [2, speakers]})).await;
+
+    // Alice proves she holds the TeamSpeak identity.
+    let identity = tsclientlib::Identity::create();
+    let key = identity.key().to_pub();
+    let nonce = alice.ok("teamspeak.challenge", json!({})).await["nonce"].as_str().unwrap().to_owned();
+    let statement = format!("gwar teamspeak claim v1\n{}\n{}\n{}", alice.server_key, alice_uid, nonce);
+    let signature = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        identity.key().clone().sign(statement.as_bytes()),
+    );
+    let claimed = alice.ok("teamspeak.claim", json!({"key": key.to_ts(), "signature": signature})).await;
+    // The uid the server derived is the one TeamSpeak shows for that client.
+    assert_eq!(claimed["teamspeak"], format!("ts:{}", key.get_uid()));
+
+    let stage_cid = find_channel(&query, "Stage").await;
+    let (_linked, linked_clid) = teamspeak_user_with(voice, "ts-alice", identity).await;
+    let info = query.call(Cmd::new("clientinfo").arg("clid", linked_clid)).await.unwrap();
+    assert_eq!(info[0].get("client_unique_identifier").map(String::as_str), Some(key.get_uid().as_str()));
+    let (_other, other_clid, _) = teamspeak_user(voice, "ts-other").await;
+    for clid in [linked_clid, other_clid] {
+        query.call(Cmd::new("clientmove").arg("clid", clid).arg("cid", stage_cid.clone())).await.unwrap();
+    }
+    // On the Stage, the linked identity speaks with Alice's role; an unlinked one does not.
+    wait_for_talker(&query, linked_clid, true).await;
+    wait_for_talker(&query, other_clid, false).await;
+}

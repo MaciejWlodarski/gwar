@@ -417,9 +417,13 @@ and the client repeats it. Private and server-wide messages are never stored,
 so there is nothing of them to delete. `vc-server members` does the same on the
 database directly and needs the server stopped (`data/vc.lock`). `members merge
 <from-uid> <into-uid> [--dry-run]` requires two existing members and the exclusive
-lock, even in dry-run mode. It reassigns messages, uploads, mentions, UID bans and
-invite ownership, unions roles, keeps the highest read mark per channel, and deletes
-the source in one transaction. The target keeps its name, key and Connect cache.
+lock, even in dry-run mode. It reassigns messages, uploads, mentions, UID bans,
+invite ownership and linked TeamSpeak identities, unions roles, keeps the highest
+read mark per channel, and deletes the source in one transaction. The target keeps
+its name, key and Connect cache. A TeamSpeak member (`ts:<uid>`) is not merged but
+linked (`members link`, or the person's own claim): its chat stays TeamSpeak chat,
+and someone joining with that identity acts as the member
+([teamspeak-import.md](teamspeak-import.md#linked-teamspeak-identities)).
 Ban/invite creator names are snapshots for display; invites are owned by the
 creator's uid, never matched by nickname (members may rename themselves). Device
 revocations remain bound to account keys.
