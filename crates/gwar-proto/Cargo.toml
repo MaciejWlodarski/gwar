@@ -1,6 +1,6 @@
 [package]
 name = "gwar-proto"
-version = "0.1.1"
+version = "0.1.2"
 description = "Wire protocol (gwar/4) shared by the server and all clients"
 edition.workspace = true
 license.workspace = true
