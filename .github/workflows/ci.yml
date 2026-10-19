@@ -175,7 +175,8 @@ jobs:
         run: cargo build -p vc-desktop --config 'profile.dev.package."*".opt-level=0'
 
   # Builds the MLS wasm once; the jobs that need it start as soon as it is uploaded.
-  # The browser jobs build every workspace binary and example (see above for why).
+  # The browser jobs get vc-server, gwar-connect and the native_bridge example from the same
+  # build as the rust job's tests (`cargo test --no-run` builds binaries and examples too).
   mls-wasm:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -242,7 +243,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Browser MLS runtime with the local delivery service
         run: |
-          cargo build --workspace --exclude vc-desktop --bins --examples
+          cargo test --workspace --exclude vc-desktop --no-run
           pnpm --filter web exec playwright install --with-deps chromium
           pnpm --filter web e2e:mls
 
@@ -275,7 +276,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - name: Private channels, direct messages and the key archive in the browser
         run: |
-          cargo build --workspace --exclude vc-desktop --bins --examples
+          cargo test --workspace --exclude vc-desktop --no-run
           pnpm --filter web exec playwright install --with-deps chromium
           pnpm --filter web e2e:private
           pnpm --filter web e2e:dm
