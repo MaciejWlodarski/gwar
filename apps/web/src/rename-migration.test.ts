@@ -62,10 +62,23 @@ describe("moving off the old name", () => {
     await moveLegacyDatabase(() => openKv("gwar"));
     expect(await get("gwar", "identity")).toEqual({ format: "gwar-identity", version: 1, jwk: { x: "k" } });
     expect(await get("gwar", "connect")).toEqual({ handle: "already here" });
-    const names = (await indexedDB.databases()).map((d) => d.name);
-    expect(names).not.toContain("vc");
-    // Again: nothing to move.
+    // Once only: an identity removed later (signing out) is not brought back from the old copy.
+    const db = await openKv("gwar");
+    await new Promise<void>((resolve) => {
+      const tx = db.transaction("kv", "readwrite");
+      tx.objectStore("kv").delete("identity");
+      tx.oncomplete = () => resolve();
+    });
+    db.close();
     await moveLegacyDatabase(() => openKv("gwar"));
-    expect(await get("gwar", "identity")).toEqual({ format: "gwar-identity", version: 1, jwk: { x: "k" } });
+    expect(await get("gwar", "identity")).toBeUndefined();
+  });
+});
+
+describe("a failed move", () => {
+  it("is reported, so nothing reads an empty new database as no identity", async () => {
+    await put("vc", { identity: { format: "vc-identity", version: 1, jwk: { x: "k2" } } });
+    const failing = () => Promise.reject(new Error("disk full"));
+    await expect(moveLegacyDatabase(failing)).rejects.toThrow("disk full");
   });
 });

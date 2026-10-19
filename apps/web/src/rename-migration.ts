@@ -5,9 +5,11 @@
  *
  * - localStorage `vc.*` keys become `gwar.*` (settings: a server's kind "vc" becomes "gwar"). This
  *   part runs on import, before any store reads its saved state.
- * - The IndexedDB database "vc" (the identity and the Gwar Connect record) becomes "gwar"
- *   ([`moveLegacyDatabase`], which `net/kv.ts` awaits before its first use). The old database is
- *   deleted only once everything is safely in the new one.
+ * - The IndexedDB database "vc" (the identity and the Gwar Connect record) is copied into "gwar"
+ *   ([`moveLegacyDatabase`], which `net/kv.ts` awaits before every use until it has succeeded). The
+ *   old database is left in place: a tab still running the old version may be writing to it, and
+ *   deleting it could lose that. Delete it (`indexedDB.deleteDatabase("vc")`) in the release that
+ *   removes this file.
  */
 
 const OLD_PREFIX = "vc.";
@@ -31,6 +33,7 @@ function renamedSettings(text: string): string {
   }
 }
 
+/** Moves what can be moved; a key that cannot be copied (storage full) stays under its old name. */
 export function moveLegacyStorage(storage: Storage = localStorage): void {
   const keys: string[] = [];
   for (let i = 0; i < storage.length; i++) {
@@ -40,15 +43,21 @@ export function moveLegacyStorage(storage: Storage = localStorage): void {
   for (const key of keys) {
     const value = storage.getItem(key);
     const next = NEW_PREFIX + key.slice(OLD_PREFIX.length);
-    if (value !== null && storage.getItem(next) === null) {
-      storage.setItem(next, key === "vc.settings" ? renamedSettings(value) : value);
+    try {
+      if (value !== null && storage.getItem(next) === null) {
+        storage.setItem(next, key === "vc.settings" ? renamedSettings(value) : value);
+      }
+      storage.removeItem(key);
+    } catch (e) {
+      console.warn("moving a saved setting to its new name", key, e);
     }
-    storage.removeItem(key);
   }
 }
 
 const OLD_DB = "vc";
 const STORE = "kv";
+/** Written into the new database with the copy, so it happens once (a later sign-out stays one). */
+export const MOVED_MARKER = "moved-from-vc";
 
 const request = <T>(r: IDBRequest<T>) =>
   new Promise<T>((resolve, reject) => {
@@ -66,11 +75,20 @@ function renamedValue(value: unknown): unknown {
 
 /**
  * Copies every entry of the old database into `newDb` (an entry the new one already has stays as it
- * is), then deletes the old database. Without an old database, nothing happens.
+ * is). Without an old database, nothing happens. Throws if the copy did not commit.
  */
 export async function moveLegacyDatabase(newDb: () => Promise<IDBDatabase>, factory: IDBFactory = indexedDB): Promise<void> {
   const names = await factory.databases?.().catch(() => undefined);
   if (names && !names.some((d) => d.name === OLD_DB)) return;
+  {
+    const db = await newDb();
+    try {
+      const done = await request(db.transaction(STORE, "readonly").objectStore(STORE).getKey(MOVED_MARKER));
+      if (done !== undefined) return;
+    } finally {
+      db.close();
+    }
+  }
   const old = await new Promise<IDBDatabase>((resolve, reject) => {
     const r = factory.open(OLD_DB);
     r.onsuccess = () => resolve(r.result);
@@ -86,7 +104,7 @@ export async function moveLegacyDatabase(newDb: () => Promise<IDBDatabase>, fact
   } finally {
     old.close();
   }
-  if (entries.length) {
+  {
     const db = await newDb();
     try {
       await new Promise<void>((resolve, reject) => {
@@ -98,6 +116,7 @@ export async function moveLegacyDatabase(newDb: () => Promise<IDBDatabase>, fact
             if (present.result === undefined) store.put(renamedValue(value), key);
           };
         }
+        store.put(Date.now(), MOVED_MARKER);
         tx.oncomplete = () => resolve();
         tx.onabort = tx.onerror = () => reject(tx.error ?? new Error("indexedDB move failed"));
       });
@@ -105,10 +124,6 @@ export async function moveLegacyDatabase(newDb: () => Promise<IDBDatabase>, fact
       db.close();
     }
   }
-  await new Promise<void>((resolve) => {
-    const r = factory.deleteDatabase(OLD_DB);
-    r.onsuccess = r.onerror = r.onblocked = () => resolve();
-  });
 }
 
 if (typeof localStorage !== "undefined") moveLegacyStorage();

@@ -70,6 +70,14 @@ if [[ "${1:-}" == "--web" ]]; then
   PUBLISH_WEB=1
 fi
 
+# Before the rename to Gwar everything lived in ~/vc. Deploying beside it would start an empty server.
+if ssh $SSH_OPTS -T "$HOST" 'test -d ~/vc && ! test -d ~/gwar'; then
+  echo "refusing to deploy: $HOST still has ~/vc from before the rename. On the VM: stop and disable" >&2
+  echo "vc-server.service, remove its unit, mv ~/vc ~/gwar, rename data/vc.sqlite3 (and -wal, -shm) to" >&2
+  echo "gwar.sqlite3, delete data/vc.lock, then deploy again." >&2
+  exit 1
+fi
+
 rsync -az -e "ssh $SSH_OPTS" --delete --exclude target --exclude node_modules --exclude .git --exclude .claude \
   --exclude 'apps/web/e2e/screenshots' ./ "$HOST:gwar/src/"
 

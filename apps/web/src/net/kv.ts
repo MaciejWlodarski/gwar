@@ -12,10 +12,18 @@ function openDb(): Promise<IDBDatabase> {
   });
 }
 
-/** The database under the old name moves first (rename-migration.ts; remove with it). */
+/**
+ * The database under the old name moves first (rename-migration.ts; remove with it). Until it has,
+ * nothing here works: an empty new database must never look like "no identity yet". A failed move
+ * is tried again on the next use.
+ */
 let moved: Promise<void> | undefined;
 async function open(): Promise<IDBDatabase> {
-  await (moved ??= moveLegacyDatabase(openDb).catch((e: unknown) => console.warn("moving the old local database", e)));
+  moved ??= moveLegacyDatabase(openDb).catch((e: unknown) => {
+    moved = undefined;
+    throw e;
+  });
+  await moved;
   return openDb();
 }
 
