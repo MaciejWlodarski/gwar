@@ -120,6 +120,24 @@ function AudioTab() {
   const [testError, setTestError] = useState<string | null>(null);
   const [capturing, setCapturing] = useState(false);
   const engine = controller.voice;
+  // Gwar's own suppression has a strength: native on the desktop, an AudioWorklet in the browser.
+  const noiseStrength = audio.noiseSuppression && (
+    <Field label={t("audio.noiseStrength")} hint={t("audio.noiseStrengthHint")}>
+      {() => (
+        <div className="flex items-center gap-3">
+          <Slider
+            value={audio.noiseStrength}
+            min={10}
+            max={100}
+            step={5}
+            onChange={(noiseStrength) => setAudio({ noiseStrength })}
+            label={t("audio.noiseStrength")}
+          />
+          <span className="w-12 shrink-0 text-right text-sm tabular-nums text-muted">{audio.noiseStrength}%</span>
+        </div>
+      )}
+    </Field>
+  );
 
   useEffect(() => {
     void engine.listDevices().then((d) => useVoice.getState().set({ devices: d }));
@@ -271,23 +289,7 @@ function AudioTab() {
             label={t("audio.noiseSuppression")}
             description={t("audio.noiseSuppressionHint")}
           />
-          {audio.noiseSuppression && (
-            <Field label={t("audio.noiseStrength")} hint={t("audio.noiseStrengthHint")}>
-              {() => (
-                <div className="flex items-center gap-3">
-                  <Slider
-                    value={audio.noiseStrength}
-                    min={10}
-                    max={100}
-                    step={5}
-                    onChange={(noiseStrength) => setAudio({ noiseStrength })}
-                    label={t("audio.noiseStrength")}
-                  />
-                  <span className="w-12 shrink-0 text-right text-sm tabular-nums text-muted">{audio.noiseStrength}%</span>
-                </div>
-              )}
-            </Field>
-          )}
+          {noiseStrength}
           <p className="text-xs text-subtle">{t("audio.processingDesktop")}</p>
         </Section>
       ) : (
@@ -298,6 +300,7 @@ function AudioTab() {
             label={t("audio.noiseSuppression")}
             description={t("audio.noiseSuppressionHint")}
           />
+          {noiseStrength}
           <Switch
             checked={audio.echoCancellation}
             onCheckedChange={(v) => setAudio({ echoCancellation: v })}

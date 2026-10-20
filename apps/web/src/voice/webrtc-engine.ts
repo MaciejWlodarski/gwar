@@ -1,3 +1,4 @@
+import { startDenoise, type DenoisePipeline } from "./denoise";
 import { nextMediaRun } from "./engine";
 import { encryptedVoiceSupported, SframeWorker } from "./sframe/client";
 import { AUDIO_SLOTS } from "../net/protocol";
@@ -71,6 +72,13 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   private inputDeviceId: string | null = null;
   private outputDeviceId: string | null = null;
   private capture: CaptureOptions = { noiseSuppression: true, noiseStrength: 100, echoCancellation: true, autoGainControl: true };
+  /**
+   * Gwar's own noise suppression (./denoise) once it is loaded; the browser's until then, and for
+   * the rest of the page if it cannot run here.
+   */
+  private denoise: DenoisePipeline | null = null;
+  private denoiseLoading = false;
+  private denoiseUnavailable = false;
   private state: VoiceState = "idle";
   private runId = 0;
   private micGeneration = 0;
@@ -131,6 +139,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
 
     if (!this.stream) await this.openMic();
     if (run !== this.runId) return;
+    this.loadDenoise();
 
     try {
       const pc = new RTCPeerConnection({
@@ -149,7 +158,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
         if (status.state === "failed") { this.teardownPeer(); this.setState("failed"); }
       }) : null;
       this.sframe = sframe;
-      const track = this.stream?.getAudioTracks()[0] ?? null;
+      const track = this.sentTrack();
       // Transceiver 0 = microphone, created without a track so its transform is
       // attached before any audio; the track follows with replaceTrack.
       const mic = pc.addTransceiver("audio", { direction: "sendonly" });
@@ -208,6 +217,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     this.runId++;
     this.teardownPeer();
     this.closeMic();
+    this.closeDenoise();
     this.setState("idle");
   }
 
@@ -231,7 +241,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   private audioConstraints(exact: boolean): MediaTrackConstraints {
     return {
       ...(this.inputDeviceId ? { deviceId: exact ? { exact: this.inputDeviceId } : this.inputDeviceId } : {}),
-      noiseSuppression: this.capture.noiseSuppression,
+      noiseSuppression: this.capture.noiseSuppression && !this.denoise,
       echoCancellation: this.capture.echoCancellation,
       autoGainControl: this.capture.autoGainControl,
       channelCount: 1,
@@ -265,6 +275,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
         return null;
       }
       this.stream = stream;
+      this.denoise?.setSource(stream);
       this.startMeter(stream);
       this.emit("micError", null);
       this.applyTrackEnabled();
@@ -295,7 +306,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     const stream = await this.openMic();
     if (!stream || this.stream !== stream) return;
     const track = stream.getAudioTracks()[0] ?? null;
-    if (track && this.micSender) await this.micSender.replaceTrack(track);
+    if (track && this.micSender) await this.micSender.replaceTrack(this.sentTrack());
     this.applyTrackEnabled();
   }
 
@@ -307,7 +318,75 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   private applyTrackEnabled(): void {
     const track = this.stream?.getAudioTracks()[0];
     if (!track) return;
-    track.enabled = !this.muted && !this.deafened && (this.mode === "vad" || this.ptt);
+    const enabled = !this.muted && !this.deafened && (this.mode === "vad" || this.ptt);
+    track.enabled = enabled;
+    if (this.denoise) {
+      this.denoise.track.enabled = enabled;
+      this.denoise.setActive(enabled);
+    }
+  }
+
+  // ----------------------------------------------------- noise suppression
+
+  /** The microphone as sent: through the model while it runs, else as captured. */
+  private sentTrack(): MediaStreamTrack | null {
+    const captured = this.stream?.getAudioTracks()[0] ?? null;
+    return captured && this.denoise?.running ? this.denoise.track : captured;
+  }
+
+  private async updateSentTrack(): Promise<void> {
+    const track = this.sentTrack();
+    if (track && this.micSender && this.micSender.track !== track) await this.micSender.replaceTrack(track).catch(() => {});
+  }
+
+  private inCall(): boolean {
+    return this.state === "starting" || this.state === "connected";
+  }
+
+  /** Loads the model in the background, once per page; the browser's suppression works meanwhile. */
+  private loadDenoise(): void {
+    if (this.denoise || this.denoiseLoading || this.denoiseUnavailable || !this.capture.noiseSuppression) return;
+    this.denoiseLoading = true;
+    let pipeline: DenoisePipeline | null = null;
+    startDenoise({
+      trouble: reason => {
+        if (pipeline && this.denoise === pipeline) this.denoiseTrouble(reason);
+      },
+      changed: () => {
+        if (pipeline && this.denoise === pipeline) void this.updateSentTrack();
+      },
+    }).then(
+      async loaded => {
+        pipeline = loaded;
+        this.denoiseLoading = false;
+        if (!this.inCall() || !this.capture.noiseSuppression) {
+          loaded.close();
+          return;
+        }
+        this.denoise = loaded;
+        loaded.setStrength(this.capture.noiseStrength);
+        // Captured again, without the browser's suppression, and sent through the model.
+        await this.reopenMic();
+      },
+      (error: unknown) => {
+        this.denoiseLoading = false;
+        this.denoiseTrouble(error instanceof Error ? error.message : String(error));
+      },
+    );
+  }
+
+  /** The model cannot run here: the browser's suppression for the rest of the page. */
+  private denoiseTrouble(reason: string): void {
+    console.warn("Noise suppression falls back to the browser's:", reason);
+    this.denoiseUnavailable = true;
+    if (!this.denoise) return;
+    this.closeDenoise();
+    void this.reopenMic();
+  }
+
+  private closeDenoise(): void {
+    this.denoise?.close();
+    this.denoise = null;
   }
 
   // ------------------------------------------------------------------ meter
@@ -493,7 +572,10 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       options.echoCancellation !== this.capture.echoCancellation ||
       options.autoGainControl !== this.capture.autoGainControl;
     this.capture = options;
+    this.denoise?.setStrength(options.noiseStrength);
+    if (!options.noiseSuppression) this.closeDenoise();
     if (changed) await this.reopenMic();
+    if (this.inCall()) this.loadDenoise();
   }
 
   async setOutputDevice(deviceId: string | null): Promise<void> {

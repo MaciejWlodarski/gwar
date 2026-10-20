@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { DenoiseEvents, DenoisePipeline } from "./denoise";
 import type { VoiceEngine } from "./engine";
 import { WebRtcVoiceEngine } from "./webrtc-engine";
+
+const startDenoise = vi.hoisted(() => vi.fn<(events: DenoiseEvents) => Promise<DenoisePipeline>>());
+vi.mock("./denoise", () => ({ startDenoise }));
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -55,7 +59,9 @@ beforeEach(() => {
   Peer.all = [];
   resume.mockReset().mockResolvedValue(undefined);
   mediaSource.mockClear();
-  getUserMedia.mockReset().mockResolvedValue(microphone().stream);
+  getUserMedia.mockReset().mockImplementation(async () => microphone().stream);
+  startDenoise.mockReset().mockRejectedValue(new Error("no AudioWorklet"));
+  vi.spyOn(console, "warn").mockImplementation(() => {});
   vi.stubGlobal("AudioContext", Context);
   vi.stubGlobal("RTCPeerConnection", Peer);
   vi.stubGlobal("window", { isSecureContext: true, addEventListener: vi.fn() });
@@ -67,6 +73,7 @@ afterEach(async () => {
   await engine.stop();
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe("browser voice run ownership", () => {
@@ -185,5 +192,110 @@ describe("browser microphone acquisition ownership", () => {
     await retry;
     expect(mic.track.stop).toHaveBeenCalledOnce();
     expect(mediaSource).not.toHaveBeenCalled();
+  });
+});
+
+describe("browser noise suppression", () => {
+  function pipeline(running = true) {
+    const fake = {
+      track: { enabled: true, id: "cleaned" } as unknown as MediaStreamTrack,
+      running,
+      setSource: vi.fn(),
+      setActive: vi.fn(),
+      setStrength: vi.fn(),
+      close: vi.fn(),
+    };
+    return fake;
+  }
+  const constraints = (call: number) => (getUserMedia.mock.calls[call] as unknown as [MediaStreamConstraints])[0].audio as MediaTrackConstraints;
+  const captured = (call: number) => (getUserMedia.mock.results[call]!.value as Promise<MediaStream>);
+  const sender = () => (Peer.all[0]!.addTransceiver.mock.results[0]!.value as { sender: { replaceTrack: ReturnType<typeof vi.fn> } }).sender;
+  async function loaded(model = pipeline()) {
+    let events!: DenoiseEvents;
+    startDenoise.mockImplementationOnce(async e => { events = e; return model as DenoisePipeline; });
+    await engine.start(params());
+    await flush();
+    return { model, events: () => events };
+  }
+
+  it("uses the browser's until the model has loaded, then sends the microphone through it", async () => {
+    const load = deferred<DenoisePipeline>();
+    startDenoise.mockReturnValueOnce(load.promise);
+    await engine.start(params());
+    expect(constraints(0).noiseSuppression).toBe(true);
+    const first = (await captured(0)).getAudioTracks()[0];
+    expect(sender().replaceTrack).toHaveBeenLastCalledWith(first);
+    const model = pipeline();
+    load.resolve(model as DenoisePipeline);
+    await flush();
+    expect(constraints(1).noiseSuppression).toBe(false);
+    expect(model.setSource).toHaveBeenCalledExactlyOnceWith(await captured(1));
+    expect(model.setStrength).toHaveBeenCalledWith(100);
+    expect(sender().replaceTrack).toHaveBeenLastCalledWith(model.track);
+  });
+
+  it("sends the microphone as captured until the capture context runs", async () => {
+    const { model, events } = await loaded(pipeline(false));
+    expect(sender().replaceTrack).toHaveBeenLastCalledWith((await captured(1)).getAudioTracks()[0]);
+    model.running = true;
+    events().changed();
+    await flush();
+    expect(sender().replaceTrack).toHaveBeenLastCalledWith(model.track);
+  });
+
+  it("idles the model while the microphone is not sent", async () => {
+    const { model } = await loaded();
+    engine.setMuted(true);
+    expect(model.setActive).toHaveBeenLastCalledWith(false);
+    expect(model.track.enabled).toBe(false);
+    engine.setMuted(false);
+    expect(model.setActive).toHaveBeenLastCalledWith(true);
+    expect(model.track.enabled).toBe(true);
+  });
+
+  it("falls back to the browser's for the rest of the page when the model has trouble", async () => {
+    const { model, events } = await loaded();
+    events().trouble("too slow: 4.0 ms a frame");
+    await flush();
+    expect(model.close).toHaveBeenCalledOnce();
+    expect(constraints(2).noiseSuppression).toBe(true);
+    expect(sender().replaceTrack).toHaveBeenLastCalledWith((await captured(2)).getAudioTracks()[0]);
+    await engine.stop();
+    await engine.start(params());
+    await flush();
+    expect(startDenoise).toHaveBeenCalledOnce();
+    expect(constraints(3).noiseSuppression).toBe(true);
+  });
+
+  it("keeps the browser's when the model cannot load", async () => {
+    await engine.start(params());
+    await flush();
+    expect(startDenoise).toHaveBeenCalledOnce();
+    expect(getUserMedia).toHaveBeenCalledOnce();
+    expect(constraints(0).noiseSuppression).toBe(true);
+  });
+
+  it("closes the model when suppression is turned off, and passes on strength changes", async () => {
+    const { model } = await loaded();
+    const options = { noiseSuppression: true, noiseStrength: 60, echoCancellation: true, autoGainControl: true };
+    await engine.setCaptureOptions(options);
+    expect(model.setStrength).toHaveBeenLastCalledWith(60);
+    expect(model.close).not.toHaveBeenCalled();
+    await engine.setCaptureOptions({ ...options, noiseSuppression: false });
+    expect(model.close).toHaveBeenCalledOnce();
+    expect(constraints(2).noiseSuppression).toBe(false);
+    expect(sender().replaceTrack).toHaveBeenLastCalledWith((await captured(2)).getAudioTracks()[0]);
+  });
+
+  it("closes a model that loads after the call ended", async () => {
+    const load = deferred<DenoisePipeline>();
+    startDenoise.mockReturnValueOnce(load.promise);
+    await engine.start(params());
+    await engine.stop();
+    const model = pipeline();
+    load.resolve(model as DenoisePipeline);
+    await flush();
+    expect(model.close).toHaveBeenCalledOnce();
+    expect(getUserMedia).toHaveBeenCalledOnce();
   });
 });

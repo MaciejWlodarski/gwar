@@ -29,6 +29,7 @@ server-key.ed25519
 apps/web/e2e/screenshots/fail-*.png
 .DS_Store
 
-# Generated MLS bindings and isolated local build tooling
+# Generated wasm packages and isolated local build tooling
 crates/gwar-mls-wasm/pkg/
+crates/gwar-denoise-wasm/pkg/
 .build-tools/

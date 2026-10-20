@@ -20,6 +20,7 @@
     "e2e:private": "node e2e/private.mjs",
     "e2e:voice": "node e2e/voice.mjs",
     "e2e:voice-switch": "node e2e/voice-switch.mjs",
+    "e2e:denoise": "node e2e/denoise.mjs",
     "e2e:dm": "node --test e2e/processes.test.mjs && node e2e/dm.mjs"
   },
   "dependencies": {

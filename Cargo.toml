@@ -39,6 +39,14 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
+# The noise suppression's wasm runs on the browser's audio thread every 10 ms: built for speed.
+[profile.wasm-fast]
+inherits = "release"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
 # 0.9.1 can resurrect a removed tail leaf when an external rejoin shrinks
 # and regrows the tree in one commit. See vendor/openmls/GWAR-PATCH.md.
 [patch.crates-io]

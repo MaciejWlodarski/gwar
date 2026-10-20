@@ -60,6 +60,11 @@ if [[ "${1:-}" == "--web" ]]; then
     echo "refusing to publish the web app: the MLS wasm did not build (see scripts/mls-wasm/build.sh)" >&2
     exit 1
   fi
+  # And the noise suppression's module and model (scripts/denoise-wasm/build.sh, same tools).
+  if ! scripts/denoise-wasm/build.sh; then
+    echo "refusing to publish the web app: the noise suppression wasm did not build (see scripts/denoise-wasm/build.sh)" >&2
+    exit 1
+  fi
   # shellcheck disable=SC2046
   env $(env | grep -o '^VITE_[A-Za-z0-9_]*' | sed 's/^/-u /') pnpm --filter web build
   if [[ "$(git rev-parse HEAD)" != "$commit" ]] || ! web_tree_clean; then

@@ -12,12 +12,16 @@ Cargo manifests and lockfiles.
 
 ## Noise suppression model
 
-The desktop app's noise suppression embeds **DeepFilterNet3** (low-latency
-model `DeepFilterNet3_ll_onnx.tar.gz`) and its runtime `libDF` from
+The noise suppression uses **DeepFilterNet3** (low-latency model
+`DeepFilterNet3_ll_onnx.tar.gz`) and its runtime `libDF` from
 [Rikorose/DeepFilterNet](https://github.com/Rikorose/DeepFilterNet) (MIT OR
-Apache-2.0, code and published models), pinned to commit
-`d375b2d8309e0935d165700c91da9de862a99c31`, run with
-[sonos/tract](https://github.com/sonos/tract) (MIT OR Apache-2.0).
+Apache-2.0, code and published models), through our fork
+[MaciejWlodarski/DeepFilterNet](https://github.com/MaciejWlodarski/DeepFilterNet)
+(branch `gwar/tract-0.23`: libDF ported to tract 0.23), pinned to commit
+`24d1b6df281f0e8208aa2eeb5d2bb942fb0737d0` (upstream `d375b2d8309e0935d165700c91da9de862a99c31`
+plus the port), run with [sonos/tract](https://github.com/sonos/tract) (MIT OR
+Apache-2.0). The desktop app embeds the model; the web app serves it, with the
+runtime built as WebAssembly, and downloads it when suppression is first on.
 
 ## TeamSpeak server
 
