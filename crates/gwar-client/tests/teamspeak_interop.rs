@@ -34,7 +34,8 @@ fn tone(t: u64) -> f32 {
 }
 
 /// What the native client's microphone hears: another tone, or its echo canceller would take it
-/// out as the speaker's.
+/// out as the speaker's for good. It takes this one down for the first ~2 s too, until it finds
+/// there is no echo.
 fn mic_tone(t: u64) -> f32 {
     tone_at(660.0, t)
 }

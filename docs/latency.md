@@ -590,13 +590,24 @@ allocates as it works (~50 times a frame with both stages on); with six other
 threads hammering the allocator, a frame still took 0.15 ms at the 99.9th
 percentile and 0.9 ms at worst, of the 10 ms it has.
 
-An echo of a voice-like signal, 60 to 250 ms late, went down by 31–34 dB once the
-canceller had converged; the near voice, talking over it, lost ~2.5 dB, and with
-nothing played it is left as it is. Gain control brought a -40 dBFS voice to about
--20. Tests (`apm.rs`): an echo 60 ms late and 10 dB down goes down by more than
-25 dB; a voice with nothing played changes by less than 1 dB; a -40 dBFS voice comes
-out above -30 dBFS; an 18 kHz tone passes the canceller as it is; with both off the
-microphone passes untouched.
+An echo of a voice-like signal, 60 to 250 ms late and 10 dB down, went down by
+34–70 dB once the canceller had converged (within ~1.5 s of the other side talking,
+also after a switch from headphones to speakers mid-call); the near voice, talking
+over it, lost 1–4 dB, and with nothing played it is left as it is. Until then the
+canceller cannot know there is no echo: talking over the other side in the first
+~0.5–1.5 s they talk takes the voice down by ~45 dB (a browser's canceller starts the
+same way). With headphones it then lets the voice through as it is, after about 2 s
+of the other side talking: the canceller's model-based detector of "no echo" is used
+(`TransparentModeType::Hmm`). The default, counter-based one cancels exactly as well
+with an echo, but kept taking a voice over a played tone down by 3–7 dB, and a tone
+over a tone (a steady voice, to it) by ~40 dB for good. Gain control brought a
+-40 dBFS voice to about -20.
+
+Tests (`apm.rs`): an echo 60 ms late and 10 dB down goes down by more than 25 dB; a
+voice with nothing played changes by less than 1 dB, and with a tone played and no
+echo, by less than 1.5 dB after 3 s; a -40 dBFS voice comes out above -30 dBFS; an
+18 kHz tone passes the canceller as it is; with both off the microphone passes
+untouched.
 
 ## Noise suppression
 

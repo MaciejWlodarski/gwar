@@ -9,7 +9,7 @@
 
 use sonora::{
     AudioProcessing, Config, StreamConfig,
-    config::{AdaptiveDigital, EchoCanceller, GainController2, MaxProcessingRate, Pipeline},
+    config::{AdaptiveDigital, EchoCanceller, GainController2, MaxProcessingRate, Pipeline, TransparentModeType},
 };
 
 use super::FRAME;
@@ -64,10 +64,13 @@ impl Processing {
     }
 
     /// Turns the stages on or off, as the settings choose them. The canceller enforces its
-    /// high-pass filter, as in browsers; gain control is digital only (the device's own input
+    /// high-pass filter, as in browsers, and finds out when there is no echo to cancel
+    /// (headphones) with its model-based detector: the default one never lets go of a steady
+    /// voice the speaker's sound overlaps. Gain control is digital only (the device's own input
     /// volume is the user's).
     pub(crate) fn configure(&mut self, echo: bool, gain: bool) {
-        if self.echo.set(echo, || Config { echo_canceller: Some(EchoCanceller::default()), ..base() }) {
+        let canceller = EchoCanceller { transparent_mode: TransparentModeType::Hmm, ..Default::default() };
+        if self.echo.set(echo, || Config { echo_canceller: Some(canceller), ..base() }) {
             self.rendered = 0;
         }
         self.gain.set(gain, || Config {
@@ -185,6 +188,21 @@ mod tests {
         let out = run(&mut processing, &vec![0.0; len], &near);
         let change = db(&out[RATE..]) - db(&near[RATE..]);
         assert!(change.abs() < 1.0, "voice changed by {change:.1} dB");
+    }
+
+    #[test]
+    fn lets_a_voice_through_once_there_is_no_echo() {
+        // Headphones: the speaker's sound never reaches the microphone. A tone is the hardest to
+        // tell from an echo; the canceller takes the voice down hard while it starts.
+        let len = 6 * RATE;
+        let far: Vec<f32> =
+            (0..len).map(|i| 0.3 * (std::f32::consts::TAU * 440.0 * i as f32 / RATE as f32).sin()).collect();
+        let near = voice(len, 200.0, -14.0);
+        let mut processing = Processing::new();
+        processing.configure(true, false);
+        let out = run(&mut processing, &far, &near);
+        let change = db(&out[3 * RATE..]) - db(&near[3 * RATE..]);
+        assert!(change.abs() < 1.5, "the voice changed by {change:.1} dB");
     }
 
     #[test]
