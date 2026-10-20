@@ -662,8 +662,9 @@ That is immediate and needs no str0m change:
 
 - A dropped repair is like a lost one. The viewer NACKs again, or the slot
   recovers through a keyframe.
-- A probe cut short measures low, so the estimate grows more slowly. That
-  errs on the safe side.
+- A probe cut short can fail to give a valid result, or give one from the
+  packets that arrived, so the estimate can grow more slowly. That errs on the
+  safe side.
 - str0m already gave dropped packets TWCC numbers, so the viewer reports them
   lost. str0m's loss controller then lowers the estimate of an overloaded
   viewer, which is the right direction.
