@@ -83,7 +83,16 @@ ssh $SSH_OPTS -T "$HOST" MEDIA_BIND="$MEDIA_BIND" PUBLIC_IP="$PUBLIC_IP" EXTRA_A
   CONNECT="$CONNECT" CONNECT_ARGS="$(printf %q "$CONNECT_ARGS")" WEB_DIR="$WEB_DIR" PUBLISH_WEB="$PUBLISH_WEB" \
   timeout 1500 bash -s <<'REMOTE'
 set -euo pipefail
-export PATH=$HOME/.cargo/bin:$PATH
+# Gwar builds with a toolchain of its own: other CI runners on the host share ~/.cargo
+# and ~/.rustup and have replaced rustup mid-job. One-time setup on the host:
+#   curl -sSf https://sh.rustup.rs | CARGO_HOME=~/gwar/cargo RUSTUP_HOME=~/gwar/rustup \
+#     sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable
+export CARGO_HOME=$HOME/gwar/cargo RUSTUP_HOME=$HOME/gwar/rustup
+if [[ ! -x $CARGO_HOME/bin/cargo ]]; then
+  echo "no Rust toolchain in ~/gwar/cargo (see the setup in scripts/deploy-vm.sh)" >&2
+  exit 1
+fi
+export PATH=$CARGO_HOME/bin:$PATH
 cd ~/gwar/src
 PACKAGES="-p gwar-server"
 [[ "$CONNECT" == 1 ]] && PACKAGES="$PACKAGES -p gwar-connect"
