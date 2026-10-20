@@ -584,7 +584,8 @@ GWAR_TS3_DIR=/tmp/ts3 cargo test -p gwar-client --test teamspeak_mode --test tea
   private channels, the key archive) and reviewed internally; the record is in
   [docs/e2e-build.md](docs/e2e-build.md).
 - **Mobile app** (iOS and Android).
-- **Streaming**: screen sharing and video, peer to peer and through the server.
+- **Streaming**: screen sharing and video, through the server first, then peer
+  to peer (design: [docs/screen-share.md](docs/screen-share.md)).
 - **Fully native clients** later, keeping the same protocol.
 - **More TeamSpeak options**: bring your own TeamSpeak license for more slots,
   and a mixed stand-in so Gwar users can still talk when the free slots run out.
