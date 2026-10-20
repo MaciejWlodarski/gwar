@@ -46,6 +46,20 @@ describe("noise suppression pace", () => {
     expect(run(pace, clocks, 2.1, 0.9)).toEqual([]);
   });
 
+  it("reports frames so slow that each looks like a pause", () => {
+    const pace = new Pace(), clocks = { now: 1_000, time: 0 };
+    expect(run(pace, clocks, 2.1, 1)).toEqual([]);
+    const reports = [];
+    for (let q = 0; q < 100; q++) {
+      const frameMs = q % 4 === 0 ? 250 : null;
+      clocks.now += 128 / 48 + (frameMs ?? 0);
+      clocks.time += 128 / 48_000;
+      const report = pace.check(clocks.now, clocks.time, frameMs);
+      if (report) reports.push(report);
+    }
+    expect(reports[0]).toMatchObject({ type: "slow" });
+  });
+
   it("reports frames over budget even while the audio clock keeps up", () => {
     expect(run(new Pace(), { now: 1_000, time: 0 }, 20, 1, 3)).toEqual([]);
     const [report] = run(new Pace(), { now: 1_000, time: 0 }, 4.2, 1, 6);

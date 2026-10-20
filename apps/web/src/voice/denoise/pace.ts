@@ -50,8 +50,9 @@ export class Pace {
    * quantum (null if none); a report once it is too slow.
    */
   check(now: number, time: number, frameMs: number | null): Slow | null {
-    // A new window at the start, and after a pause (suspended, or the model idle).
-    if (!this.wall || now - this.last > 200) {
+    // A new window at the start, and after a pause (suspended, or the model idle): a gap between
+    // quanta that the model's own time does not explain.
+    if (!this.wall || now - (frameMs ?? 0) - this.last > 200) {
       this.wall = this.last = now;
       this.audio = time;
       this.spent = this.frames = 0;
