@@ -1,9 +1,10 @@
 # Screen sharing (design)
 
-Status: **design for review**. Nothing here is built yet. Phase 1 goes through
-the server's SFU. Peer-to-peer sharing comes later and is only sketched at the
-end. The spike code was thrown away; only its results are kept here
-([Spikes](#spikes)).
+Status: **design, with the owner's decisions of 2026-10-21 folded in**
+([Owner decisions](#owner-decisions)). Nothing here is built yet. Phase 1
+goes through the server's SFU. Peer-to-peer sharing comes later and is only
+sketched at the end. The spike code was thrown away; only its results are
+kept here ([Spikes](#spikes)).
 
 ## Summary
 
@@ -18,8 +19,8 @@ end. The spike code was thrown away; only its results are kept here
   that the system WKWebView at `tauri://localhost` has `getDisplayMedia`,
   `RTCPeerConnection`, `RTCRtpScriptTransform` and the VP8, VP9, H.264 and AV1
   encoders. WebView2 is Chromium. Linux desktop is the exception: distro
-  WebKitGTK ships without WebRTC, so Linux users share from a browser until a
-  native path exists (phase 3).
+  WebKitGTK ships without WebRTC, so the Linux app has no screen sharing for
+  now (owner decision): Linux users share and watch from a browser.
 - **The SFU forwards video like it forwards voice.** It uses str0m 0.24 in RTP
   mode and does not decode. Spikes (Chromium/WebKit → str0m RTP-mode SFU →
   Chromium/WebKit) showed:
@@ -53,10 +54,18 @@ end. The spike code was thrown away; only its results are kept here
   `MLS-Exporter("gwar screen v1", u32be(leaf), 32)`. The call controller gains
   a second endpoint kind (screen beside audio), with explicit rules for
   barriers, activation, restarts and nonce safety. Keyframe recovery covers
-  viewers that switch keys late. Only call participants can watch.
-- **Plaintext channels ship first.** The first release (PRs 1–5) shares in
+  viewers that switch keys late. In encrypted channels only call participants
+  can watch.
+- **Plaintext channels ship first.** The first release (PRs 1–6) shares in
   plaintext channels only. Encrypted channels refuse sharing until encrypted
-  shares land (PR 6) and never fall back to sending a share in the clear.
+  shares land (PR 7) and never fall back to sending a share in the clear.
+- **Who can watch.** In plaintext channels, anyone who can see the channel,
+  whether in its voice or not. In encrypted channels, only the call's
+  participants, because the keys come from the voice MLS group.
+- **Shares have no sound in the first release.** Sound is designed and
+  comes in phase 2: it is more than a week of work, and its echo-safe default
+  (tab audio) exists only in Chrome and Edge
+  ([Shared audio](#shared-audio-phase-2)).
 - **Phase 1 is single-layer.** The sharer adapts only to its own uplink.
   - Each viewer's estimate is split across its watched shares in priority
     order (the stage first).
@@ -66,19 +75,24 @@ end. The spike code was thrown away; only its results are kept here
 
   Temporal layers, then simulcast, come in phase 2.
 - **Permission:** a new channel permission `share_screen`, which needs
-  `connect`. Moderators with `mute_members` can stop someone's share. Limits
-  are per channel, per share and per server.
-- **TeamSpeak users** cannot see shares. TS3 has no video. In bridged
-  plaintext channels they see a "sharing screen" marker in the channel
-  description (phase 2).
+  `connect`. Every member has it by default; admins can remove it.
+  Moderators with `mute_members` can stop someone's share. Limits are per
+  channel, per share and per server.
+- **TeamSpeak users watch through a link.** TeamSpeak has no video. In a
+  bridged plaintext channel, the bridge posts a watch link into the TeamSpeak
+  channel chat, like attachment links. The link opens a watch-only web page
+  with no account, through a capability token scoped to that one share
+  ([TeamSpeak watch links](#teamspeak-watch-links-guests-pr-6)).
 
 ## Goals and non-goals
 
 Goals:
 
 - Share a screen, a window or (in Chromium) a tab into one's voice channel.
-- Everyone in that channel's voice can open the share. A share costs bandwidth
-  only for people who open it.
+- Everyone who can see the channel can open the share (in encrypted channels,
+  everyone in its call). TeamSpeak users in a bridged plaintext channel can
+  open it through a watch link. A share costs bandwidth only for people who
+  open it.
 - Low latency, for games and live coding. Target: p50 glass-to-glass at most
   150 ms over the internet at 1080p30, and at most 100 ms within a region.
 - End-to-end encrypted in encrypted channels, with the same guarantees and
@@ -90,7 +104,7 @@ Not in phase 1:
 - peer-to-peer;
 - camera video (the same transport would carry it later);
 - recording;
-- the shared screen's audio (phase 2);
+- shared audio (phase 2; [Shared audio](#shared-audio-phase-2));
 - remote control;
 - shares outside voice (for example "go live" to a text channel).
 
@@ -123,7 +137,8 @@ Chromium constraints Gwar passes:
 - `selfBrowserSurface: "exclude"`;
 - `surfaceSwitching: "include"`, so the user can switch what they share
   without stopping;
-- `systemAudio: "exclude"` while shared audio is not supported;
+- `audio: false` and `systemAudio: "exclude"` until shared audio lands
+  (phase 2);
 - a `CaptureController` with `setFocusBehavior("no-focus-change")`, so sharing
   a window does not pull it in front of Gwar.
 
@@ -136,7 +151,7 @@ everywhere.
 | --- | --- | --- | --- |
 | macOS 14+ | `getDisplayMedia` exposed at `tauri://localhost` (secure context, spike S2) | `RTCPeerConnection` and `RTCRtpScriptTransform` present; encoders VP8, VP9, H.264, H.265, AV1 (S2) | **Webview path** |
 | Windows 10/11 | WebView2 = Chromium: `getDisplayMedia` with Chromium's picker; host can veto via `ScreenCaptureStarting` | yes | **Webview path** |
-| Linux | portal/PipeWire capture works with wry's `DisplayCapture` permission kind | **no**: `enable-webrtc` defaults off; in 2.52/2.54 the GStreamer backend is incomplete and libwebrtc is not in release tarballs (WPE FAQ; WebKit bug 274711 closed 2026-07) | **Not in phase 1**; browser instead; native path in phase 3 |
+| Linux | portal/PipeWire capture works with wry's `DisplayCapture` permission kind | **no**: `enable-webrtc` defaults off; in 2.52/2.54 the GStreamer backend is incomplete and libwebrtc is not in release tarballs (WPE FAQ; WebKit bug 274711 closed 2026-07) | **Deferred** (owner decision); Linux users share and watch from a browser |
 
 macOS details:
 
@@ -200,12 +215,15 @@ Tradeoffs we accept with the webview path:
   PR 1 check: frame rate with Gwar hidden for five minutes. If it fails, the
   desktop sets `NSProcessInfo.beginActivity(.userInitiated)` while sharing.
 - **No hardware H.264 under E2E** in phase 1; see the codec section.
-- **No system audio on macOS from the webview** (phase 2 uses native capture
-  for that on desktop).
+- **No shared audio from the desktop app**, even in phase 2's browser audio.
+  WKWebView cannot capture audio, and on Windows the system mix would contain
+  Gwar's native voice playback ([Shared audio](#shared-audio-phase-2)). Native
+  capture that leaves out Gwar's own process comes later (PR 10).
 
-Phase 3 brings native capture: Linux first (no alternative there), then macOS
-and Windows for games if measurements show the webview's encoder or throttling
-falls short.
+Phase 3 may bring native capture: macOS and Windows for games if measurements
+show the webview's encoder or throttling falls short. A native Linux path
+(portal and PipeWire capture, libvpx, str0m frame mode) is the one way to give
+the Linux app sharing; the owner deferred it.
 
 ## 2. Codecs and encoding
 
@@ -340,11 +358,16 @@ Each session has at most two screen transports besides its voice transport
 (a session shares at most one thing at a time):
 
 - **Watch transport.** One `Rtc` per session that watches anything, negotiated
-  by `screen.watch.offer` on the first watch and kept while the session is in
-  the call. Its offer is fixed: `SCREEN_SLOTS = 4` `recvonly` video m-lines,
-  nothing to send. This mirrors the eight audio slots: no renegotiation when
-  shares start, stop or change hands. A `run` number restarts it, like voice's
-  run.
+  by `screen.watch.offer` on the first watch and kept while the session is
+  connected. It belongs to the session, not to a call, because plaintext
+  shares can be watched from outside their voice. Its offer is fixed:
+  `SCREEN_SLOTS = 4` `recvonly` video m-lines, nothing to send. Phase 2
+  widens each slot with an audio m-line
+  ([Shared audio](#shared-audio-phase-2)). This mirrors the eight voice
+  slots: no renegotiation when shares start, stop or change hands. A `run`
+  number restarts it, like voice's run.
+- **Guest watch transport.** The same, with one slot, for a TeamSpeak guest
+  ([TeamSpeak watch links](#teamspeak-watch-links-guests-pr-6)).
 - **Publish transport.** One `Rtc` **per share**, negotiated by
   `screen.publish.offer` and closed when the share ends: one `sendonly` video
   m-line with RTX.
@@ -450,16 +473,35 @@ Limits are enforced continuously, not only when a share or watch is admitted:
 - **Per viewer slot.** A reservation equal to the share's **cap**, not its
   current rate. Static content cannot be admitted cheaply and then grow. Every
   reservation is charged 1.3 × its cap to cover RTX, TWCC padding probes and
-  headers. That charge is an admission estimate; the per-viewer egress cap in
-  "Queues and repairs" enforces the bytes actually sent.
+  headers. That charge is an admission estimate; the per-viewer egress cap
+  in "Queues and repairs" enforces the bytes actually sent. Guests reserve
+  the same way as members.
 - **Server-wide budget** (default 300 Mbps). The sum of all slot reservations
   plus all publish caps, because ingress costs CPU too. A watch or start that
   would exceed it gets `busy`.
+  - **Members come before guests at admission.** When a member's watch or
+    start would not fit, the server first reclaims guest reservations,
+    newest guest first, across all shares, until it fits. Those guests are
+    paused (`screen.paused {reason: "budget"}`) and their reservations are
+    released at once, so the member is admitted in the same request. Only
+    when no guest reservation is left does the member get `busy`.
+  - **A paused guest resumes only by passing admission again.** Every 5 s
+    the server re-admits paused guests, oldest pause first, while their
+    reservation fits beside every member's. A member is never paused to
+    make room for a guest.
+  - Without this, four 8 Mbps publishers and 25 guests spread over them
+    reserve 32 + 25 × 10.4 = 292 Mbps and lock members out, while real guest
+    egress (around 200 Mbps) never trips the measured overrun below.
   - The screen task also measures real egress every second, including
     retransmissions and padding, from str0m's `Event::PeerStats`, enabled with `set_stats_interval(1 s)`.
-  - When it stays over budget for 5 s, the newest watches are paused first.
+  - When it stays over budget for 5 s, guest watches are paused first, then
+    the newest member watches.
 - **Negotiation.**
   - At most 4 `screen.*.offer` per session per minute.
+  - A guest connection gets exactly one accepted `guest.offer`. A second one
+    closes the connection, so renegotiating means reconnecting through the
+    gateway's pre-authentication limits
+    ([TeamSpeak watch links](#teamspeak-watch-links-guests-pr-6)).
   - At most `shares_per_server` publish transports (default 32) and one watch
     transport per session.
 - **Dropping leads to a keyframe.** Every drop, whether from an ingress limit,
@@ -530,6 +572,9 @@ Each viewer slot keeps a **segment**: `(base_src, base_out)` and a
 - Timestamps pass through with a per-segment offset, so a slot reused for
   another share starts a fresh timeline. The marker bit is copied, the payload
   type is mapped to the viewer's, and packets are written `nackable(true)`.
+- `write_rtp`'s `wallclock` is the packet's arrival time at the SFU, never its
+  release time from the Gwar queue, so str0m's sender reports describe the
+  sharer's timeline. Phase 2's shared audio relies on this for lip sync.
 
 Viewer NACKs are answered hop by hop from str0m's send buffer. A gap the SFU
 itself has not received yet stays open until the SFU's own NACK to the
@@ -764,7 +809,8 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
 **sending is peak-capable**:
 
 - **Release rate.** The viewer's leaky bucket releases at
-  `B = 0.8 × estimate`. Slots are served in strict priority order:
+  `B = 0.8 × estimate`. Slots are served in strict priority order (phase 2
+  puts share audio first, as a class of its own):
   1. the share on the viewer's stage (`screen.focus {share}`);
   2. the other watched shares in watch order.
 
@@ -847,6 +893,32 @@ Egress per viewer equals the share's rate (the SFU never transcodes):
 - **Oracle's 10 TB/month of free outbound transfer** is about 5,500
   viewer-hours at 4 Mbps. For example, two shares a day, three hours each, five
   viewers each: 2 × 3 × 5 × 1.8 GB × 30 days ≈ 1.6 TB/month.
+  - At the limits, one full share (25 viewers × 8 Mbps = 200 Mbps, 90 GB an
+    hour) uses the 10 TB in **about 110 hours a month**. The whole 300 Mbps
+    budget uses it in about 74 hours.
+  - Voice, the web app, file downloads and TeamSpeak count toward the same
+    allowance.
+- **Monthly egress counter (PR 3), from the network interface.** Counting
+  only Gwar's own sockets would miss the web app, file downloads, TeamSpeak
+  and everything else, so the counter reads the host's total instead:
+  - Once a minute the server reads the transmitted-bytes counter of the
+    default-route interface from `/proc/net/dev` (Linux). It adds the delta
+    since the last read to a per-calendar-month total persisted in the store.
+    A counter lower than the last read (a reboot or a wrap) counts from zero.
+  - The total therefore **includes every service on the host and every
+    outbound byte of that interface**: TeamSpeak, a reverse proxy, SSH,
+    package updates and backups. Traffic Oracle does not bill (for example to
+    its own services in the region) is counted too, so the figure errs high.
+  - It covers this VM only. Oracle's 10 TB is per tenancy, so other VMs in it
+    are not included.
+  - In a container, `/proc/net/dev` shows the container's own interface, and
+    the settings page labels the figure "this container only". Off Linux the
+    counter is unavailable and the page says so.
+  - Server settings show the month's total, with the screen task's own
+    bytes (members, guests) beside it as a breakdown.
+  - Admins get a warning at 80 % and 100 % of `monthly_egress_tb` (default
+    10). There is no automatic cut-off by default. An optional
+    `monthly_egress_stop` refuses new watches above 100 %.
 - **Network:** A1 shapes get 1 Gbps per OCPU, so bandwidth binds after CPU.
 - **CPU, measured in S3** on an Apple M5, with str0m RTP mode doing SRTP for
   every packet:
@@ -858,24 +930,30 @@ Egress per viewer equals the share's rate (the SFU never transcodes):
   - **100 Mbps of egress (25 viewers at 4 Mbps) ≈ 0.4 of one A1 core**, on a
     task separate from voice.
   - PR 3 re-measures this on the VM.
-- **Compute allowance.** Oracle's Always Free page now gives every tenancy
-  1,500 A1 OCPU-hours and 9,000 GB-hours a month, which is 2 OCPUs and 12 GB
-  running continuously. It changed around June 2026 (InfoQ, 2026-07).
-  - The VM was created as 4 OCPU / 24 GB. On a free-only tenancy the
-    excess must be resized away; on a paid tenancy it is billed.
-  - Which applies to this VM is **not verified** (open question 5).
-  - 2 OCPU is enough for the phase 1 numbers above; the defaults below assume
-    it.
+- **Compute allowance.** The account is Always Free (confirmed by the owner,
+  2026-10-21). Oracle's Always Free page gives 1,500 A1 OCPU-hours and
+  9,000 GB-hours a month, which is 2 OCPUs and 12 GB running continuously.
+  2 OCPU is enough for the phase 1 numbers above, and the defaults below
+  assume it.
 
 ### Limits (server settings, with defaults)
 
 - Concurrent shares per channel: **4**, which equals `SCREEN_SLOTS`, so anyone
   can watch every share at once.
 - Shares per server: **32**.
-- Viewers per share: **25**.
+- Viewers per share: **25**, guests included.
+- Guests per share: **10** (`guests_per_share`).
 - Server-wide screen budget, reservations as above: **300 Mbps**.
 - Bitrate cap per share: **8 Mbps**.
-- `screen.watch` from someone not in the share's voice call: `forbidden`.
+- TeamSpeak watch links: **on** (`screen_guest_links`).
+- Monthly egress warning: **10 TB** (`monthly_egress_tb`); no cut-off unless
+  `monthly_egress_stop` is set.
+- `screen.watch` for a channel the session cannot see: `not_found`, so
+  hidden channels are not revealed. For an encrypted share, from someone not
+  in its call: `forbidden`.
+
+The owner confirmed these defaults (4 shares per channel, 25 viewers, 8 Mbps,
+300 Mbps) on 2026-10-21.
 
 ## 4. Encryption
 
@@ -1015,7 +1093,7 @@ used a scrambling transform with a checksum, not AES-GCM. They show:
   through the SFU;
 - that corruption would be detected.
 
-They do not measure real AEAD cost in the worker. PR 6 measures that: worker
+They do not measure real AEAD cost in the worker. PR 7 measures that: worker
 time per frame at 1080p60 keyframe sizes, in Chromium, WebKit and Firefox.
 
 Capability check: no `RTCRtpScriptTransform` means "Update your browser or use
@@ -1042,13 +1120,15 @@ None of the pixels. This list goes into e2e.md's "What the server still sees".
 
 - **Plaintext channels:** same transport and codecs, no transform. The server
   could read the video by depacketizing it.
-- **TeamSpeak** has no video, so TS users never receive a share.
-  - In a bridged plaintext channel, the bridge's presence line in the channel
-    description gets " · sharing screen" after the sharer's name. The
-    description already lists Gwar users (`Presence` in
-    `teamspeak/bridge.rs`).
-  - Encrypted channels are unreachable from TS anyway, and their description
-    stays the fixed notice.
+- **TeamSpeak** has no video, so TS clients never receive a share in
+  TeamSpeak itself.
+  - In a bridged plaintext channel, TS users get a watch link in the channel
+    chat ([TeamSpeak watch links](#teamspeak-watch-links-guests-pr-6)).
+  - The bridge's presence line in the channel description gets
+    " · sharing screen" after the sharer's name. The description already
+    lists Gwar users (`Presence` in `teamspeak/bridge.rs`).
+  - Encrypted channels are unreachable from TS anyway, never get a link, and
+    their description stays the fixed notice.
   - The puppet's nickname does not change: renames cost TS slots and spam
     the channel.
 - **The desktop's TeamSpeak mode** (Gwar client on a TS server) offers no
@@ -1064,39 +1144,89 @@ New channel permission **`share_screen`** ("Share screen").
   `Permission::CHANNEL`.
 - Dependency: without `connect` it is off (the resolution rule in roles.md
   step 4).
-- Default: in `MEMBER_DEFAULT` (open question 3).
-- Watching needs no permission beyond being in the channel's voice. Anyone who
-  can hear the channel can see its shares.
+- Default: in `MEMBER_DEFAULT` (owner decision): every member may share, and
+  admins can remove it per role, member or channel.
+- **Watching needs no permission of its own:**
+  - **plaintext channel:** the session can see the channel (private channels
+    by their member list, as everywhere else). Being in the channel's voice
+    is not required. In a password-protected channel the session must also be
+    in the channel or hold `bypass_password`, so the password keeps its
+    meaning;
+  - **encrypted channel:** the session is in the share's call, because the
+    keys come from the voice MLS group;
+  - **TeamSpeak guests:** the share's watch-link token.
 
 ### Requests (`gwar/4`)
 
-All are bound to the voice participation, `{call, participation}`. A request
-after leaving the call answers `stale`.
+Sharing requests are bound to the voice participation,
+`{call, participation}`: a share always comes from one's voice channel, and a
+sharing request after leaving the call answers `stale`. Watching requests are
+bound to the session, and checked against the watching rules in
+[Permission](#permission) on every `screen.watch`.
+
+**Watch access is revalidated whenever it can change,** for every watcher,
+wherever the watcher is, not only for the channel's occupants:
+
+- **Effective permissions.** Today `enforce_connect` and
+  `enforce_connect_everywhere` (`core/overrides.rs`) run after every change
+  that can alter effective permissions: role edits and role permission
+  changes, channel overrides, member role grants and removals, owner
+  transfer and links. They only look at sessions *in* the affected channels.
+  PR 2 adds `enforce_watch` beside them, called from the same places with the
+  same scope. It re-checks every watch slot whose *share* is in scope:
+  visibility, `bypass_password` for password-protected channels, and call
+  membership for encrypted ones.
+- **Channel state.** Making a channel private or editing its member list,
+  setting or changing its password, and switching it to encrypted run the
+  same check for that channel.
+- **The viewer's own channel.** Every departure or move of the session runs
+  `enforce_watch` on all of its slots: joining another channel, leaving
+  voice, a moderator or bridge move (`move_admitted`, `move_client`), and
+  `channel_leave`. These paths do not call `enforce_connect`, so they get
+  their own hook. A viewer watching a password-protected channel's share
+  from inside it, without `bypass_password`, loses the slot on leaving. An
+  encrypted share's watch ends when its viewer leaves the call.
+- **Session state.** Kicks, bans and disconnects end all of a session's
+  watches.
+
+When access ends, the slot is released exactly like `screen.unwatch`, in the
+screen task's next loop iteration. Its Gwar queue is cleared, its RTX cache
+is wiped with `set_rtx_cache`, and its reservation is freed. The viewer gets
+`screen.slot {share: null}` and `screen.stopped {reason: "access"}`. Nothing
+of the share is sent to that viewer after that iteration; repairs and probes
+included ([Queues and repairs](#queues-and-repairs)).
 
 | Op | Body | Reply / effect |
 | --- | --- | --- |
-| `screen.start` | `{call, participation, preset, surface}` (`surface`: `screen`/`window`/`tab`/`unknown`, display only) | `{share}`, a 16-byte random id; checks `share_screen`, limits and budget. Not announced until its publish transport connects |
+| `screen.start` | `{call, participation, preset, surface, guest_link}` (`surface`: `screen`/`window`/`tab`/`unknown`, display only; `guest_link`: post a TeamSpeak watch link where one is possible) | `{share}`, a 16-byte random id; checks `share_screen`, limits and budget; refused in encrypted channels until PR 7. Not announced until its publish transport connects |
 | `screen.publish.offer` | `{share, ssrc, rtx_ssrc, sdp}` | `{sdp}`; the share's own publish transport. Its first connection announces `screen.started` to the channel. One per share, never renegotiated |
 | `screen.stop` | `{share}` | ok; event `screen.stopped {share, reason: "stopped"}` |
-| `screen.watch.offer` | `{call, participation, run, sdp}` | `{sdp}`; the session's watch transport (4 `recvonly` slots). `run` restarts it like voice's run |
+| `screen.watch.offer` | `{run, sdp}` | `{sdp}`; the session's watch transport (4 `recvonly` slots). `run` restarts it like voice's run |
 | `screen.watch` | `{share}` | `{slot}`; needs a connected watch transport; the server assigns a slot, opens a segment at the next keyframe (throttled request), event `screen.slot` |
 | `screen.focus` | `{share}` | ok; the share on the viewer's stage gets first claim on its bandwidth |
 | `screen.unwatch` | `{share}` | ok; the slot is freed |
 | `screen.keyframe` | `{share}` | ok; throttled PLI. Lets a viewer whose decryptor lost sync, for example after a key change, recover without re-watching |
 | `screen.stop_other` | `{share}` | needs `mute_members` in the channel and rank above the sharer; event `screen.stopped {reason: "moderator", by}` |
+| `screen.link.revoke` | `{share}` | the sharer, or `mute_members` with rank above the sharer; the share's watch link stops working and its guests are disconnected; final for that share |
 
 Events:
 
 - `screen.started {share, client, channel, preset, surface}`;
-- `screen.stopped {share, reason: stopped|moderator|left|limit|transport|budget}`;
+- `screen.viewers {share, members, guests}`, to the sharer only, and
+  `screen.link {share, active}` to the sharer and the channel's moderators;
+- `screen.stopped {share, reason: stopped|moderator|left|limit|transport|budget|access}`;
 - `screen.slot {binding, slot, share | null}`, like `voice.slot`;
 - `screen.paused {share, reason: bandwidth}` and `screen.resumed {share}`.
 
-`Welcome` and `VoiceState` carry `shares: [{share, client, preset, surface}]`
-for the channel one is in. Shares in other channels are not listed: phase 1
-shows them only to the channel's voice. The channel tree shows a "LIVE" badge
-next to sharers to everyone who can see the channel. That uses one more client
-field, `Client.sharing: bool`.
+`Welcome` carries `shares: [{share, client, channel, preset, surface}]` for
+every channel the session can see, and `screen.started` /
+`screen.stopped` go to everyone who can see the channel. In encrypted
+channels this is only what the LIVE badge needs anyway: watching still needs
+the call. The channel tree shows a "LIVE" badge next to sharers. That uses
+one more client field, `Client.sharing: bool`.
+
+Guests speak a separate, smaller protocol on `/ws/watch`
+([TeamSpeak watch links](#teamspeak-watch-links-guests-pr-6)).
 
 Lifecycle rules:
 
@@ -1108,29 +1238,324 @@ Lifecycle rules:
   frame from an old share can enter a new one.
 - Start, stop and start again while watching other shares touches only publish
   transports; the watch transport and its slots are unaffected.
+- Watching a plaintext share survives moving between channels and leaving
+  voice while the watching rules still hold. It ends when the session can no
+  longer see the channel, or when it leaves a password-protected channel
+  without `bypass_password`. Watching an encrypted share ends when the
+  session leaves that call.
 
 TypeScript types are generated as today (`cargo test -p gwar-proto --features
 ts`). The handwritten client validators gain the new schemas (architecture.md,
 "Input bounds").
 
-### Shared audio
+### TeamSpeak watch links (guests, PR 6)
 
-Not in phase 1. In phase 2:
+TeamSpeak has no video, so its users cannot watch inside TeamSpeak. When a
+share starts in a **bridged plaintext channel**, the bridge posts a link in
+that TeamSpeak channel's chat. The link opens a watch-only page in any
+browser, without a Gwar account.
 
-- one `sendonly` Opus stereo m-line beside the video, plus one `recvonly` audio
-  m-line per screen slot;
-- not speech-gated: no RFC 6464 gate, music must pass;
-- SFrame under `"gwar screen audio v1"`.
+**When a link exists.** All of these must hold:
 
-Sources:
+- **The channel is bridged and plaintext.** Encrypted channels are never
+  bridged, and the server refuses to create a link for an encrypted channel
+  anyway: a second check, so a bug elsewhere cannot leak an encrypted share.
+- **The server's `file_access` is `link`.** This is the same decision as for
+  attachment links: `teamspeak/bridge.rs` gives TeamSpeak users only file
+  names on a members-only server. One setting covers both.
+- **The server has a public URL.**
+- **The server setting `screen_guest_links` allows it.** It is on by default.
+- **The sharer, or a moderator, has not turned the link off.**
 
-- Chromium tab audio, and system audio on Windows;
-- desktop system audio through native capture: ScreenCaptureKit audio with
-  `excludesCurrentProcessAudio`, WASAPI process loopback excluding Gwar,
-  PipeWire. Gwar's own voice playback must never be shared back; Chromium's
-  `suppressLocalAudioPlayback` / `restrictOwnAudio` covers the browser.
+**Posting.** The bridge reuses the path of a relayed chat message with an
+attachment (`ts_text`, `plain`, `split_for_teamspeak`):
 
-Firefox and Safari cannot share audio at all.
+- The sharer's puppet writes into its TeamSpeak channel. Without a puppet,
+  ServerQuery posts it, signed `[name]`, and only if TeamSpeak users are in
+  that channel.
+- The text is `🖥 {name} is sharing their screen. Watch: {url}`, with the
+  name passed through `plain`.
+- A TeamSpeak user who enters the channel while the share runs gets the link
+  once, as a private message from ServerQuery, so late joiners are not left
+  out. The bridge sends it from its in-memory copy of the link (below).
+- Nothing is posted when the share ends. The link simply stops working.
+- The channel description's presence line gets " · sharing screen" after the
+  sharer's name. The link is not put there: descriptions are visible to
+  everyone on the TeamSpeak server, while channel chat reaches only that
+  channel.
+
+**The link and its token.**
+
+- The token is 32 random bytes from the OS generator, in base64url.
+- The URL is `{public_url}/watch#{token}` when the server serves the web app
+  itself (`--web-root`). Otherwise it is
+  `https://gwar.app/watch?server={endpoint}#{token}`, the same `server=` form
+  that invite links use.
+- The token is in the URL fragment. Browsers never send the fragment to the
+  web host or in a Referer header. Only the watch page reads it, and sends it
+  over the WebSocket to the Gwar server.
+- **Where it is kept:**
+  - The guest gateway checks tokens against SHA-256(token) → share, in
+    memory.
+  - The bridge also keeps the raw link, in memory, for one purpose: sending
+    it to TeamSpeak users who enter the channel later. It is a map from share
+    to link inside the bridge task.
+  - Nothing is written to disk or to logs. The raw link exists only in that
+    bridge map and in the messages sent to TeamSpeak.
+- **When it dies.** The token and the bridge's copy are both removed when
+  the share ends (stop, leave, moderator stop, transport failure), when the
+  link is turned off, and when the bridge detaches. A server restart ends
+  every share, and so every link.
+- One share has one token. A new share gets a new token and a new post.
+- The token grants exactly one thing: watching that share. Guests see no
+  other name than the sharer's display name, and no channel, chat or other
+  shares.
+
+**Guest sessions.**
+
+- **A separate WebSocket endpoint,** `GET /ws/watch`, so the member handshake
+  is unchanged. It reuses the gateway's pre-authentication bounds as they are
+  (`gateway.rs`, `preauth.rs`):
+  - the client address comes from `client_ip`, honouring
+    `--client-ip-header`;
+  - `PreAuth::connection` runs before the upgrade. It caps connections
+    server-wide and per subscriber, bounds the address table, and applies the
+    per-subscriber attempt bucket. Guests and members share these limits;
+  - `subscriber` groups IPv6 addresses by /64, as for bans and member limits;
+  - `PreAuth::hello` rate-limits the first frame, `guest.watch`, in the same
+    bucket as member hellos;
+  - `HELLO_TIMEOUT` closes a connection that sends no `guest.watch` in time.
+    The same deadline applies again between the reply and `guest.offer`;
+  - pre-authentication frame size (`MAX_FRAME`), the per-connection frame
+    rate limit, `PING_INTERVAL` and `IDLE_TIMEOUT` apply unchanged.
+  - **Heartbeat.** `IDLE_TIMEOUT` (60 s) waits for a text frame, and
+    WebSocket Ping/Pong frames do not reset it (`next_text`). So guests use
+    the member client's application `ping {}` request: the watch page sends
+    it every 20 s, as `net/connection.ts` does, and the server answers it.
+    A guest that stops pinging is closed after 60 s.
+  - The first frame is `guest.watch {token}`. The reply is
+    `{share, sharer, preset, ice_servers}`, or one generic `not_found`
+    for unknown, ended and revoked tokens alike.
+  - After that, only `guest.offer {sdp}` is accepted, **once per
+    connection**, plus `screen.keyframe` and `ping {}`. The offer is a
+    watch transport with **one** slot. A second offer closes the
+    connection.
+  - Server events are `screen.paused`, `screen.resumed` and `screen.stopped`.
+    Then the server closes the socket.
+  - There is no identity and no MLS, and nothing is stored on the guest's
+    device.
+- **The server password does not apply.** The token is the capability, as an
+  attachment link is on a password-protected server.
+- **Limits:**
+  - guests count toward the 25 viewers per share and the server budget, with
+    the same cap-based reservation as members;
+  - at most 10 guests per share (`guests_per_share`), so a leaked link cannot
+    crowd out members;
+  - per subscriber (an IPv4 address or an IPv6 /64): at most 3 concurrent
+    guest sessions, counted inside `PreAuth`'s per-subscriber connection
+    limit;
+  - guests never keep a member out of the budget: a member's admission
+    reclaims guest reservations, and a paused guest must pass admission again
+    ([Admission and resource limits](#admission-and-resource-limits)).
+- **Revocation** closes every guest session of the share within one loop
+  iteration.
+
+**The page.** A second Vite entry, `apps/web/watch.html`:
+
+- one video element, with fullscreen and picture-in-picture (phase 2 adds
+  volume and mute with sound);
+- status lines: "Connecting…", "Your connection is too slow for this share",
+  "The share has ended", "This link was turned off";
+- no MLS, no app stores, no local storage or cookies, and
+  `Referrer-Policy: no-referrer`;
+- Polish or English from `navigator.language`;
+- a small bundle (target under 100 KB gzipped);
+- it watches in every browser that can watch: Chrome, Firefox and Safari.
+
+**What the sharer sees.**
+
+- Before starting, in a bridged channel, the preset menu says: "TeamSpeak
+  users in this channel can watch through a link. Anyone with the link can
+  watch." The checkbox "Post a watch link to TeamSpeak" is on by default.
+- While sharing, the sharing bar shows "TeamSpeak link on · 2 guests" with
+  "Turn off". Turning it off is final for that share.
+- Moderators with `mute_members` can turn it off too, with
+  `screen.link.revoke {share}`.
+- **Ordering, an acceptance check.** The notice and the checkbox appear
+  before anything is published. The client sends `screen.start
+  {guest_link}` only after the sharer confirms the preset menu. The server
+  creates the token only from that request, and the bridge posts only after
+  the share is announced. With the checkbox off, no token exists and nothing
+  is posted. PR 6's tests check both orders.
+
+**What each side learns.**
+
+- **The TeamSpeak server and its admins:** the link, so they can watch, the
+  sharer's name and the start time. TeamSpeak chat logs keep the link, but it
+  is dead once the share ends.
+- **The Gwar server:** guests' IP addresses, the user agent at the WebSocket
+  upgrade and watch times, plus the same media metadata as for any viewer. It
+  learns no identity, and nothing new is logged.
+- **Gwar members:** the guest count, which the sharer sees.
+- **The web host (gwar.app):** that someone opened `/watch`, and the
+  `server=` parameter. Never the token.
+- **Guests:** the sharer's display name and the video. Nothing about
+  the channel or its other members.
+
+**Abuse.** A leaked token is equivalent to a leaked attachment link: anyone
+holding it can watch until the share ends or the link is turned off. That is
+bounded by:
+
+- the share's lifetime, and revocation;
+- 10 guests per share, and the server budget;
+- the per-IP limits.
+
+256 random bits make guessing pointless; the attempt limit protects the
+server, not the token. The sharer is told, before starting, that anyone with
+the link can watch.
+
+**Estimate:**
+
+- server: tokens, `/ws/watch`, the guest transport, limits, revocation and
+  `screen.viewers`, 3–4 days;
+- bridge: the post, the late-joiner message, the presence marker and tests in
+  the existing bridge test harness, 1–2 days;
+- the watch page, 2 days;
+- the sharer UI and a Playwright guest e2e, 1–2 days.
+
+In total **7–10 working days, about 2 weeks.**
+
+### Shared audio (phase 2)
+
+The owner made sound optional for the first release: in it only if it is
+clearly simple and safe, otherwise phase 2. **It goes to phase 2 (PR 9):**
+
+- **It is more than a week.** Even the echo-safe minimum, tab audio in
+  Chromium, touches every layer:
+  - Opus m-lines on both transports;
+  - SFU forwarding with its own bucket and pacer priority;
+  - lip sync;
+  - per-share volume and mute;
+  - tests with real tab audio.
+
+  That is 4–6 working days. With computer sound on Windows it is 6–8.
+- **The safe default covers few users.** Tab audio exists only in Chrome and
+  Edge. Firefox, Safari and both desktop apps would share without sound
+  anyway, and the desktop needs native capture to leave out Gwar's own voice.
+- **Computer sound is not simple.** On Windows it depends on
+  `restrictOwnAudio`, which MDN still marks experimental, to keep Gwar's
+  voice out of the share.
+
+**What phase 1 keeps ready, so sound is added without rework:**
+
+- A share's publish transport is new for every share, so a share with sound
+  simply offers one more m-line. Nothing existing is renegotiated.
+- The watch transport has a fixed layout restarted by `run`. Phase 2 widens
+  each slot to a video and audio pair; clients and server update together.
+- The per-viewer pacer already serves classes in priority order, and audio
+  becomes the first class.
+- Video already uses each packet's arrival time at the SFU as `write_rtp`'s
+  `wallclock`, which is what lip sync needs.
+
+The design below is what PR 9 builds.
+
+**What can be captured, and what is offered.** Gwar's own voice playback must
+never be captured into a share. Everyone in the call would hear themselves
+again, delayed.
+
+| Where | What can be captured | Is Gwar's voice playback excluded? | Offered |
+| --- | --- | --- | --- |
+| Chrome/Edge, tab, any OS | the tab's audio | yes: Gwar's own tab cannot be picked (`selfBrowserSurface: "exclude"`) | **yes, by default**: the picker's "Also share tab audio" box |
+| Chrome/Edge on Windows, screen or window | the whole system mix (`systemAudio`, `windowAudio: "system"`) | only through `restrictOwnAudio` (Chrome 141+), which removes the capturing tab's own audio; Gwar web plays voice in that tab | **only after the user turns on "Share computer sound"**, with a warning, and only where `getSupportedConstraints().restrictOwnAudio` is true |
+| Chrome/Edge on macOS and Linux | tab audio only (MDN: "On Linux and macOS, only the audio of a tab can be captured") | as for tabs | as for tabs |
+| Firefox, Safari | nothing: no `getDisplayMedia` audio (MDN `audio_capture_support`) | n/a | no; the share has no sound |
+| Desktop on macOS (WKWebView) | nothing, as Safari | n/a | no; macOS desktop shares without sound |
+| Desktop on Windows (WebView2) | at most the system mix; WebView2's audio support is unverified (PR 1 checks it) | **no**: voice plays natively in the Gwar process, outside the webview, and `restrictOwnAudio` covers only the capturing document | **no**; native capture that leaves out Gwar comes in PR 10 |
+
+Constraints Gwar passes:
+
+- by default: `audio: true` (so the picker can offer tab audio),
+  `systemAudio: "exclude"` and `windowAudio: "exclude"`;
+- with "Share computer sound" on: `systemAudio: "include"`,
+  `windowAudio: "system"` and `restrictOwnAudio: true`;
+- after capture, a system-audio track is kept only if
+  `track.getSettings().restrictOwnAudio` is true. Otherwise it is stopped,
+  and the sharer sees "Computer sound could not leave out Gwar's voice, so it
+  is not shared".
+
+The opt-in warning says: "Everyone watching will hear everything your
+computer plays, from every app. Gwar's own voice is left out." The setting is
+remembered per device and is off by default.
+
+**The sharer's own speakers.** `suppressLocalAudioPlayback` (Chrome 109+,
+tab capture) stops the captured tab from playing locally.
+
+- Gwar offers it as "Mute the shared tab for me", **off** by default, so the
+  sharer hears what they share.
+- The risk: on speakers, the sharer's microphone also picks up the tab, and
+  viewers hear it twice (through the share and through voice), unless the
+  voice echo canceller removes it.
+- PR 9 measures whether Chrome's echo canceller removes another tab's audio.
+  If it does not, the default turns on for sharers without headphones (when
+  the output device's label says so; otherwise the user is asked once).
+
+**Transport.**
+
+- **Publish:** a second m-line, `sendonly` Opus, when the share has an audio
+  track (`screen.start {audio: true}`): stereo, 48 kHz,
+  `maxaveragebitrate=128000`, `useinbandfec=1`, no DTX. There is no RFC 6464
+  level gate: music must pass.
+- **Watch:** each of the 4 slots is a video and audio pair: 4 `recvonly`
+  video and 4 `recvonly` audio m-lines, fixed, as before. In the SFU's
+  answer, slot k's audio and video share one `msid` stream, so the viewer's
+  browser synchronizes them.
+- **SFU:**
+  - The audio SSRC is bound in the share's `ScreenOrigin`, with its own
+    ingress bucket: 192 kbps, burst 16 KB.
+  - Packets are forwarded with the same source-sequence mapping. A segment
+    opens at slot assignment, on any packet, because Opus has no keyframes.
+  - In the viewer's pacer, share audio is served before every video slot, so
+    a keyframe never delays it. The same 400 ms deadline applies.
+  - Audio is not NACKed (Opus in-band FEC instead), so it has no RTX m-line.
+  - Reservation: 0.2 Mbps more per slot with audio.
+- **Lip sync:**
+  - `write_rtp`'s `wallclock` is each packet's arrival time at the SFU, for
+    audio and video alike; str0m documents this as the simple SFU choice. It
+    is never the release time from the Gwar queue.
+  - str0m's sender reports then put both on one clock, and the viewer
+    aligns them.
+  - What remains is the difference in uplink delay between the sharer's audio
+    and video, normally tens of milliseconds. PR 9 measures it with a stamped
+    flash and click.
+- **Pausing a slot stops its video only.** The sound continues, and the card
+  says "Your connection is too slow for video". Audio stops only if even
+  audio does not fit (an estimate under 0.3 Mbps).
+
+**Viewer controls.**
+
+- A volume slider (0–100 %) and a mute button per share, on its card and on
+  the stage. They set the media element's volume directly, with no Web Audio
+  graph.
+- The volume is remembered per sharer in local settings.
+- Deafen mutes share audio too.
+- Share audio plays on the voice output device (`setSinkId` where supported).
+
+**Encrypted channels.** PR 9 adds SFrame for share audio, with its own label
+`"gwar screen audio v1"`, so it has its own key and counter. The voice rules
+apply.
+
+**Tests in PR 9:**
+
+- Playwright: a Chromium sharer shares a tab playing a tone (spike S4 showed
+  headless tab capture returns a tab-audio track). Viewers in Chromium and
+  WebKit detect the tone with an analyser, check mute and volume, and confirm
+  the sharer's voice is not in the share.
+- System audio on Windows, `restrictOwnAudio` and lip sync are checked by
+  hand.
+
+**Estimate:** 2–3 days for the SFU, 3–4 days for the web client, and 1 day
+for SFrame and tests: **6–8 working days, about 1.5 weeks.** Desktop sound
+from native capture is PR 10.
 
 ## 6. Interface
 
@@ -1140,21 +1565,27 @@ Firefox and Safari cannot share audio at all.
     unsupported (Linux desktop, macOS < 14, mobile Chrome/Firefox) or in an
     encrypted channel without transforms.
   - Click → the browser/OS picker → a small preset menu: Auto, Text, Smooth,
-    Game, Saver.
+    Game, Saver. In a bridged channel it has the TeamSpeak link notice and
+    checkbox.
   - The preset can change while sharing, with no renegotiation, through
     `setParameters` and `applyConstraints`.
 - **While sharing.**
   - A red "You are sharing" bar with Stop (and Chromium's "Switch source"), at
     the top of the window, in the tray menu, and as a red dot on the tray icon
     on desktop.
+  - The bar shows who watches ("5 watching") and, when a watch link is
+    active, "TeamSpeak link on · 2 guests" with "Turn off".
   - The sharer's own preview is a small thumbnail, off by default, because a
     mirrored screen is confusing.
   - Browsers add their own indicators (Chrome's "Stop sharing" bar, macOS's
     menu-bar indicator).
 - **Discovering.**
-  - A "LIVE" badge next to the sharer in the channel tree and the voice panel.
+  - A "LIVE" badge next to the sharer in the channel tree and the voice panel,
+    in every channel one can see.
   - Clicking it, or "Watch" on the share card, opens the share. Nothing
-    streams before that.
+    streams before that. In plaintext channels this works without joining
+    the channel's voice. In encrypted channels the button says "Join the
+    call to watch".
 - **Watching (the stage).**
   - The main content area switches from chat to a stage: the active share
     large, other shares in this channel as cards (click to swap), and chat
@@ -1165,7 +1596,8 @@ Firefox and Safari cannot share audio at all.
     `getStats`), and "Stop watching".
   - The sharer's speaking ring shows on their card, from the existing
     `voice.talking` event.
-  - Video volume does not apply in phase 1 (no audio).
+  - No sound in the first release; phase 2 adds a volume slider and mute per
+    share ([Shared audio](#shared-audio-phase-2)).
 - **Encrypted.** The same lock as voice ("End-to-end encrypted") on the stage,
   and "Securing screen share…" until keys are active. Channel info's "who can
   hear" also covers watchers: the same set as the call.
@@ -1178,7 +1610,8 @@ Firefox and Safari cannot share audio at all.
   - Browsers get pop-out through Document Picture-in-Picture (Chromium 116+)
     in phase 2. Elsewhere, plain PiP.
 - **TeamSpeak mode and Linux desktop:** no button, and a one-line explanation
-  in the voice panel's menu.
+  in the voice panel's menu. On Linux desktop the LIVE badge shows, and its
+  tooltip says that watching needs the browser for now.
 
 Polish and English strings are added together, as for every UI change.
 
@@ -1204,22 +1637,35 @@ person.
      frame rate.
    - Manual acceptance: macOS 14, 15, 26, 27 (picker appears; capture works;
      no TCC prompt or the expected one; frame rate with the window hidden for
-     five minutes) and Windows 10/11 (picker; frame rate).
+     five minutes) and Windows 10/11 (picker; frame rate; whether WebView2
+     offers any audio with `audio: true`, recorded for later).
    - Results are recorded in this document.
    - This settles the only unverified premise of the webview path before
      anything depends on it.
-2. **Protocol, permission and share state (M, 3–4 days).**
-   - `share_screen`;
-   - the requests and events above, except the `*.offer` and slot ones;
+2. **Protocol, permission and share state (M, 4–5 days).**
+   - `share_screen`, in `MEMBER_DEFAULT`;
+   - the requests and events above, except the `*.offer` and slot ones,
+     including `guest_link`, `screen.viewers` and `screen.link`;
+   - the watching rules: session-bound watching, channel visibility, the
+     password rule and call membership for encrypted channels;
+   - `enforce_watch` at every `enforce_connect` call site, on every departure
+     or move of the viewer (`move_admitted`, `move_client`, `channel_leave`),
+     and on the channel and session changes listed under "Requests". Tests:
+     - revoking `bypass_password` by role edit, override and role removal
+       from a viewer outside the channel;
+     - a viewer without it leaving, switching channel, and being moved out
+       by a moderator, each ending the watch of a password-protected
+       channel's share;
+   - shares listed for every visible channel, without revealing hidden ones;
    - limits, lifecycle and the moderator stop;
-   - `screen.start` refused in encrypted channels until PR 6;
+   - `screen.start` refused in encrypted channels until PR 7;
    - `Client.sharing`;
    - shared role-resolution vectors;
    - server tests in `tests/protocol.rs`, `tests/overrides.rs` and
      `tests/moderation.rs`;
    - the client validators;
    - no media yet.
-3. **SFU video forwarding (L, 8–11 days).**
+3. **SFU video forwarding (L, 8–12 days).**
    - The address-map dispatch and bounded hand-off from the voice task, and
      the screen task.
    - `screen.publish.offer` and `screen.watch.offer`, and their `Rtc`s
@@ -1235,6 +1681,7 @@ person.
    - Per-viewer aggregate allocation with pause/resume.
    - Cap-based reservations, continuous egress measurement and negotiation
      limits.
+   - The monthly egress counter and admin warnings.
    - Counters in `MediaCmd::Inspect`.
    - Tests: Rust end-to-end in `tests/media.rs` style, using str0m frame-mode
      clients as sharer and viewers:
@@ -1243,6 +1690,16 @@ person.
        correctly (frames compared byte for byte);
      - viewer-side loss is repaired without reaching the sharer;
      - two shares on one constrained viewer pause the lower priority one;
+     - a viewer outside the share's voice watches a plaintext share, and
+       loses it when the channel becomes hidden to it;
+     - a viewer outside a password-protected channel, watching through
+       `bypass_password`, loses the slot when a role edit, an override or a
+       role removal takes that permission away. Nothing of the share reaches
+       it afterwards, NACK answers and probes included;
+     - a viewer without `bypass_password` watching from inside a
+       password-protected channel loses the slot when it leaves voice, joins
+       another channel, or is moved out by a moderator or the bridge, with
+       the same cleanup;
      - stale packets after a drop never cross a segment;
      - unknown and stale-share SSRCs drop;
      - a stopped share frees slots;
@@ -1263,11 +1720,13 @@ person.
      and acceptance", including the `LATENCY_NET` `rate=` option and the
      screen load generator.
    - CPU per Mbps measured on the VM, recorded here.
-4. **Web sharing and watching, plaintext (L, 6–8 days).**
+4. **Web sharing and watching, plaintext (L, 7–9 days).**
    - `voice/screen.ts`: publish and watch transports, the capture with presets
      and constraints, codec preference, sender parameters with uplink
      headroom, and receiver `jitterBufferTarget`;
-   - the stage UI, LIVE badges, sharing bar, fullscreen and PiP.
+   - the stage UI, LIVE badges in every visible channel, watching without
+     joining voice, the sharing bar with the viewer count, fullscreen and
+     PiP.
    - Unit tests for the state machine.
    - Playwright `e2e/screen.mjs` against a real local server:
      - Chromium sharer with **real tab capture** (`channel: "chromium"`,
@@ -1277,29 +1736,56 @@ person.
      - viewers in both engines check decoded frames and a stamped barcode
        (the S3 technique);
      - late join, start → stop → start while watching two other shares,
-       moderator stop and the slot limit.
+       moderator stop and the slot limit;
+     - a viewer in another channel watches without joining voice.
 5. **Desktop enablement, plaintext (M, 3–4 days).**
    - The desktop UI runs the web screen transports and the screen worker
      beside the native voice engine. The native engine and `voice_set_keys`
      are unaffected.
-   - The button is hidden on Linux, and gated to macOS 14+.
+   - The button is hidden on Linux (owner decision: deferred), and gated to
+     macOS 14+ (owner decision).
    - CSP review: no change expected, since WebRTC is not governed by
      `connect-src`.
    - The native-voice Playwright run (`e2e:native-voice`) extended with a
      plaintext share watched by a browser, with native voice in the same call.
    - The manual checklist from PR 1 repeated on release builds.
+6. **TeamSpeak watch links (L, 7–10 days).** Everything in
+   [TeamSpeak watch links](#teamspeak-watch-links-guests-pr-6): the token,
+   `/ws/watch` and the guest transport, guest limits and revocation, the
+   bridge's post, late-joiner message and presence marker, the watch page,
+   the sharer's indicator, and tests:
+   - bridge unit tests with the existing harness: the post goes through the
+     puppet or signed ServerQuery like an attachment link, never in
+     encrypted channels or with `file_access: members`;
+   - server tests: an unknown, ended or revoked token answers the same
+     `not_found`; the guest limit, the viewer limit and the per-IP limits
+     hold; revocation disconnects guests; a guest cannot send anything but
+     the watch ops;
+   - Playwright: a guest page in Chromium and WebKit watches a share, then
+     sees "The share has ended";
+   - acceptance: the TeamSpeak notice and checkbox are shown before any
+     token exists or any post is made. Nothing is posted before the sharer
+     confirms, and nothing at all with the checkbox off;
+   - a member's watch reclaims guest reservations when the budget is full;
+     the paused guests resume only after passing admission again;
+   - `/ws/watch` is held to the same `PreAuth` limits as `/ws`, IPv6 /64
+     grouping included; a second `guest.offer` closes the connection;
+   - the heartbeat: a guest page keeps watching for 150 s, more than two
+     idle intervals, without being disconnected, and a guest that stops
+     sending `ping` is closed after `IDLE_TIMEOUT`;
+   - the bridge's link copy is gone after stop, revocation and detach.
 
-**First release after PR 5: plaintext channels only.** The owner chose to
-ship sharing in plaintext channels first and add encryption afterwards, so
-PRs 1–5 are released before PR 6:
+**First release after PR 6: plaintext channels only, without sound.** The
+owner chose to ship sharing in plaintext channels first and add encryption
+afterwards, so PRs 1–6 are released before PR 7:
 
 - In encrypted channels the server refuses `screen.start` (PR 2), and the
   button shows a disabled "coming soon" state. A share is never sent in the
   clear in an encrypted channel: no silent downgrade.
-- PR 6 then enables encrypted channels. Until it lands, the controller work in
+- PR 7 then enables encrypted channels. Until it lands, the controller work in
   "Two engines under one call controller" does not touch voice at all.
 
-6. **Encrypted shares (L, 8–10 days).**
+7. **Encrypted shares (L, 8–10 days).**
    - Screen key derivation in `gwar-mls` (agent and wasm), with the
      `"gwar screen v1"` label and vectors.
    - The call controller's per-kind endpoints: attach and restart per kind,
@@ -1333,41 +1819,57 @@ PRs 1–5 are released before PR 6:
 
 - sharers and viewers on Chrome, Firefox and Safari, and the desktop on
   macOS and Windows, in plaintext channels for the first release and again
-  in encrypted channels after PR 6;
+  in encrypted channels after PR 7;
+- a TeamSpeak watch link opened from TS3 and TS6 clients, in Chrome,
+  Firefox and Safari;
 - Firefox both shares and watches. Playwright's Firefox did not start in the
   spike environment, so this interop is checked by hand, or in CI if it runs
   there.
 
-The first release (PRs 1–5) is about **6–8 weeks**; phase 1 with encryption
-(PR 6) is about **8–11 weeks** in total. The earlier 5–7-week figure assumed the
-simpler forwarding and key model the review rejected. The estimate stays
-uncertain until three things are known:
+The first release (PRs 1–6) is about **9–12 weeks**. Phase 1 with encryption
+(PR 7) is about **11–15 weeks** in total. Against the merged design's 6–8
+weeks, the owner's decisions add:
+
+- TeamSpeak watch links (PR 6): 7–10 working days, about 2 weeks;
+- watching from outside voice (PRs 2–4): 2–3 days;
+- the monthly egress counter (PR 3): half a day.
+
+Shared audio (6–8 working days) is not in these figures: it moved to phase 2
+(PR 9).
+
+Calendar weeks include review rounds, at the same ratio as before (about 1.4
+times the working days). The estimate stays uncertain until three things are
+known:
 
 - PR 1 shows whether the WKWebView picker works without changes;
 - PR 3's voice gate passes or forces more isolation (its own thread or port);
-- PR 6's controller change lands without reworking the voice activation
+- PR 7's controller change lands without reworking the voice activation
   tests.
 
 ### Phase 2: quality and reach
 
-7. **Slow viewers without pausing (M, 4–5 days):** VP9 `L1T3` from Chromium
+8. **Slow viewers without pausing (M, 4–5 days):** VP9 `L1T3` from Chromium
    sharers, and per-viewer temporal-layer dropping driven by the egress
    estimate. Pause stays as the last resort.
-8. **Shared audio (M, 4–6 days):** Chromium tab/system audio first, then
-   desktop native system audio (macOS ScreenCaptureKit, Windows WASAPI
-   loopback). Own playback is excluded.
-9. **H.264 with hardware encoding (M, 4–5 days):** NAL-aware SFrame with
-   start-code escaping, and the "Game" preset prefers H.264 where the sharer
-   has a hardware encoder (`powerEfficientEncoder` in stats).
-10. **Pop-out (M, 3–4 days):** a desktop second window, and Document PiP in
+9. **Shared audio (M, 6–8 days):** everything in
+   [Shared audio](#shared-audio-phase-2): browser tab audio by default,
+   computer sound on Windows Chrome/Edge on request, and SFrame for it in
+   encrypted channels.
+10. **Desktop shared audio (M, 5–7 days):** native system-audio capture that
+    leaves out Gwar's own process (macOS ScreenCaptureKit with
+    `excludesCurrentProcessAudio`, Windows WASAPI process loopback excluding
+    Gwar), fed into the webview's share as a track.
+11. **H.264 with hardware encoding (M, 4–5 days):** NAL-aware SFrame with
+    start-code escaping, and the "Game" preset prefers H.264 where the sharer
+    has a hardware encoder (`powerEfficientEncoder` in stats).
+12. **Pop-out (M, 3–4 days):** a desktop second window, and Document PiP in
     Chromium.
-11. **TeamSpeak presence marker (S, 1 day).**
-12. **Simulcast (L, 1–2 weeks)**, if temporal layers prove insufficient.
+13. **Simulcast (L, 1–2 weeks)**, if temporal layers prove insufficient.
 
 ### Phase 3: native and peer-to-peer
 
-- **Native capture and encode in `gwar-client`:** Linux (portal + PipeWire +
-  VA-API/software) first, then macOS and Windows for games. str0m frame mode
+- **Native capture and encode in `gwar-client`:** macOS and Windows for games
+  if needed; Linux only if the owner revisits the deferral. str0m frame mode
   with its packetizers; Rust SFrame (5d's library) with the same layouts.
 - **Peer-to-peer.** For a share with one viewer, both peers could negotiate a
   direct connection through the server's signalling. ICE, STUN and TURN are
@@ -1393,12 +1895,25 @@ uncertain until three things are known:
   paired gate decides whether the shared-runtime task is enough, or whether
   the screen task needs its own thread or port.
 - **Controller complexity.** Two endpoint kinds under one MLS call controller
-  is the riskiest change to already-reviewed encrypted-voice code (PR 6). It
+  is the riskiest change to already-reviewed encrypted-voice code (PR 7). It
   needs its own review round, as voice 5c/5d had.
 - **WebView2 picker bugs** (#5173 size, #5763 deadlock).
 - **Firefox:** no `contentHint`, no `scalabilityMode`, no audio. It works, but
   it is the lowest-quality sharer.
-- **Oracle compute allowance** (open question 5).
+- **Voice echo through shared sound (phase 2).** Computer sound on Windows
+  relies on `restrictOwnAudio` (Chrome 141+, still marked experimental on
+  MDN). Gwar keeps a system-audio track only when the setting reads back
+  true, and PR 9's acceptance checks it with a live call. The desktop app
+  shares no sound until native capture can leave out Gwar's own process.
+- **Lip sync (phase 2)** rests on arrival wallclocks at the SFU. If PR 9
+  measures more than about 80 ms of skew, the SFU derives wallclocks from the
+  sharer's sender reports instead.
+- **Watch links leak like attachment links.** Anyone holding one watches until
+  the share ends or the link is turned off. This is bounded and documented,
+  not prevented.
+- **Wider audience, more egress.** Watching without joining voice, and
+  guests, raise the number of viewers per share. The 25-viewer limit, the
+  budget and the monthly counter bound it.
 - **Spike limitations.**
   - One machine, loopback, synthetic content, software encoders and heavy
     background load.
@@ -1527,26 +2042,50 @@ covers them.
   pending packet. Polling after every input fixed it. The rule is in "The
   SFU" above.
 
-## Open questions for the owner
+## Owner decisions
 
-1. **Linux desktop.** Is it acceptable that the Linux desktop app cannot share
-   or watch in phase 1 (Linux users use the browser), with native Linux
-   sharing in phase 3? Watching could also be native earlier, since decoding
-   is simpler than capturing, but it is still a native video pipeline.
-2. **Who can watch.** Only people in the channel's voice (as proposed, like
-   Discord), or anyone who can see the channel?
-3. **Default permission.** Should members be allowed to share by default
-   (`share_screen` in the Member role), or only roles the admin picks?
-4. **Default limits.** Are 4 shares per channel, 25 viewers per share, an
-   8 Mbps cap and a 300 Mbps server budget right for the public server?
-5. **Oracle VM billing.** Oracle's Always Free page now gives every tenancy
-   2 cores / 12 GB of A1 for free (1,500 OCPU-hours and 9,000 GB-hours a
-   month). The VM was made with 4 / 24.
-   - Is the tenancy free-only (the excess must be resized away) or paid (the
-     excess is billed)?
-   - Phase 1 fits in 2 cores either way. Should the VM be resized to stay
-     free?
-6. **Shared audio.** Is sharing without sound acceptable for the first
-   release, with sound (tab and system audio) following in phase 2?
-7. **macOS 13 and older.** Is it acceptable that screen sharing needs
-   macOS 14+ in the desktop app, while the app itself still runs on 11+?
+Recorded on 2026-10-21. They replace the open questions of the first
+version of this design.
+
+1. **Linux desktop: deferred.** The Linux app has no screen sharing for now;
+   Linux users share and watch from the browser. A native Linux path (portal
+   and PipeWire capture, libvpx, str0m frame mode) remains possible later.
+2. **Who can watch.**
+   - In plaintext channels, anyone who can see the channel; being in its
+     voice is not required.
+   - In encrypted channels, only the call's participants (the keys come from
+     the voice MLS group).
+   - New: TeamSpeak users watch through a link posted in the bridged
+     TeamSpeak channel, never for encrypted channels
+     ([TeamSpeak watch links](#teamspeak-watch-links-guests-pr-6), PR 6, in
+     the first release).
+3. **Default permission:** every member may share (`share_screen` in the
+   Member role); admins can remove it.
+4. **Limits:** 4 shares per channel, 25 viewers per share (guests included),
+   8 Mbps per share and a 300 Mbps server budget. A monthly egress counter
+   warns admins against Oracle's 10 TB/month outbound allowance (one full
+   share uses it in about 110 hours).
+5. **Oracle: the account is Always Free** (owner, 2026-10-21). The free
+   compute allowance is 2 OCPU / 12 GB of A1, as Oracle's documentation
+   states (1,500 OCPU-hours and 9,000 GB-hours a month). No design change:
+   phase 1 fits in 2 OCPU.
+6. **Audio: optional for the first release, and moved to phase 2** (PR 9,
+   [Shared audio](#shared-audio-phase-2)). The owner allowed it in the first
+   release only if clearly simple and safe. It is not: even tab audio alone
+   is 4–6 working days across both transports, the SFU, lip sync and the UI;
+   the echo-safe default reaches only Chrome and Edge; and computer sound
+   depends on an experimental Chrome constraint. Phase 1 keeps the
+   transports, pacer and wallclock rule ready, so sound is added without
+   rework.
+7. **macOS 14+** for desktop sharing: accepted.
+
+Smaller defaults chosen in this design, which the owner may change:
+
+- watching a plaintext share in a password-protected channel needs being in
+  that channel or `bypass_password`;
+- at most 10 guests per share; the watch link is on by default and the
+  sharer can turn it off before or during the share;
+- the monthly egress counter only warns; it never stops watches unless
+  `monthly_egress_stop` is set;
+- in phase 2, "Mute the shared tab for me" starts off, until PR 9 measures
+  echo.
