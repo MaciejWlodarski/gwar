@@ -133,6 +133,12 @@ export function describeRequestError(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+/** Why a channel refused me, in the words of joining. */
+export function describeJoinError(e: unknown): string {
+  if (e instanceof RequestError && e.code === "forbidden") return tNow("err.join.forbidden");
+  return describeRequestError(e);
+}
+
 export function describeConnectFailure(f: ConnectFailure): string {
   if (f.kind === "address") return f.message;
   if (f.kind === "server_identity") return tNow("security.changedTitle");
@@ -191,6 +197,8 @@ class Controller {
   private loadingOlder = false;
   /** Password channels I have entered during this session: their chat is readable. */
   private entered = new Set<number>();
+  /** Channel passwords typed this session, sent again on the next join (as TeamSpeak's own client does). */
+  private channelPasswords = new Map<number, string>();
   /** Channels whose history was requested: `epoch:channel:inVoice`. */
   private historyRequested = new Set<string>();
   /** Newest message per channel I already told the server about. */
@@ -533,6 +541,7 @@ class Controller {
     conn.onWelcome((welcome, resync) => {
       if (this.conn !== conn) return;
       this.entered.clear();
+      if (!resync) this.channelPasswords.clear();
       this.historyRequested.clear();
       this.sentRead.clear();
       this.nativeFiles(useSession.getState().kind === "gwar" ? useSession.getState().httpOrigin : null, welcome.server.upload_limit, welcome.file_access);
@@ -541,7 +550,7 @@ class Controller {
       // A resync rebuilds channel threads: count the encrypted ones' mentions again,
       // with nothing left from before (the Welcome's view change already recounts).
       this.sealed?.reset();
-      session.dispatch({ type: "welcome", welcome, resync, now: Date.now() });
+      session.dispatch({ type: "welcome", welcome, resync, now: Date.now(), teamspeak: useSession.getState().kind === "teamspeak" });
       if (this.sealed) { this.sealed.refresh(); void this.sealed.scanUnread(); }
       // A server moved from TeamSpeak may hold roles for this person's TeamSpeak identities.
       if (!resync && useSession.getState().kind === "gwar" && conn.serverKey) void offerClaims(conn, conn.serverKey, welcome.uid);
@@ -552,6 +561,8 @@ class Controller {
         // TeamSpeak servers always have me in a channel; Gwar servers start me outside voice.
         this.entered.add(myCh);
         void this.startVoice();
+        // A returning TeamSpeak client lands in the default channel: go back, like TeamSpeak's own client.
+        if (resync && this.rejoin !== null && this.rejoin !== myCh) void this.rejoinVoice(this.rejoin);
       } else if (resync && this.rejoin !== null) {
         const channel = this.rejoin;
         this.rejoin = null;
@@ -649,7 +660,7 @@ class Controller {
         case "reconnecting":
           this.nativeFiles(null);
           // A new session starts outside voice: remember where to go back to.
-          this.rejoin ??= useSession.getState().kind === "gwar" ? myChannelId(useSession.getState()) : null;
+          this.rejoin ??= myChannelId(useSession.getState());
           session.dispatch({ type: "phase", phase: "reconnecting" });
           void this.stopVoice();
           break;
@@ -715,6 +726,7 @@ class Controller {
     this.readTimer = null;
     this.rejoin = null;
     this.entered.clear();
+    this.channelPasswords.clear();
     this.historyRequested.clear();
     this.sentRead.clear();
     this.voiceRun++;
@@ -899,9 +911,9 @@ class Controller {
 
   private async rejoinVoice(channel: number): Promise<void> {
     const s = useSession.getState();
-    const info = s.channels[channel];
-    if (!info || (info.has_password && !s.permissions.includes("bypass_password"))) return;
-    await this.attempt(this.joinChannel(channel));
+    const info = s.channels[channel], password = this.channelPasswords.get(channel);
+    if (!info || (info.has_password && !password && !s.permissions.includes("bypass_password"))) return;
+    await this.attempt(this.joinChannel(channel, password));
   }
 
   /** Hostname (no brackets) of the server we are connected to; the native engine sends media there. */
@@ -1076,6 +1088,7 @@ class Controller {
     try {
       await this.connection.request("channel.join", { channel, password: password ?? null });
       this.entered.add(channel);
+      if (password) this.channelPasswords.set(channel, password);
     } finally {
       if (useUi.getState().joining === channel) useUi.getState().setJoining(null);
     }
@@ -1113,7 +1126,16 @@ class Controller {
       this.joinAttempt++; // staying where I am supersedes a pending encrypted join
       return;
     }
-    await this.attempt(this.joinChannel(channel));
+    // Without a typed password first: only the server knows whether I may skip it (a TeamSpeak
+    // admin with b_channel_join_ignore_password may), and it asks for one by refusing.
+    try {
+      await this.joinChannel(channel, this.channelPasswords.get(channel));
+    } catch (e) {
+      if (e instanceof RequestError && e.code === "wrong_password" && useSession.getState().channels[channel]) {
+        this.channelPasswords.delete(channel);
+        useUi.getState().openDialog({ kind: "channelPassword", channel });
+      } else useUi.getState().toast("error", describeJoinError(e));
+    }
   }
 
   /** `members`: an encrypted private channel's first member list, signed by this device (6c). */

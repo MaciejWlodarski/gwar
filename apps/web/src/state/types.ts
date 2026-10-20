@@ -60,6 +60,8 @@ export interface SessionState {
   /** Known users (online and offline) by uid, kept current from client events. */
   members: Record<string, Member>;
   permissions: Permission[];
+  /** `permissions` stay as the server sent them: a TeamSpeak server has no Gwar roles to work them out from. */
+  fixedPermissions: boolean;
   /** The server's owner and the managers of private channels (docs/e2e-build.md, section 6, 6b). */
   owner: OwnerInfo | null;
   managers: Managers | null;

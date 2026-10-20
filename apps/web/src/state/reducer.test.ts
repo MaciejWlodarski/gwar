@@ -210,6 +210,17 @@ describe("permissions", () => {
     expect(s.permissions).toHaveLength(ALL_PERMISSIONS.length);
     expect(computePermissions(s)).toEqual(expect.arrayContaining(["kick_members"]));
   });
+
+  it("keeps what a TeamSpeak server offers: it has no Gwar roles to derive them from", () => {
+    // TeamSpeak server groups arrive as plain ids; no Gwar role has them.
+    const w = welcome({ session: 1, uid: "u1", permissions: ["connect", "send_messages", "bypass_password"], groups: [], clients: [cl(1, 1, { groups: [6, 8] })] });
+    let s = reduce(initialState, { type: "welcome", welcome: w, resync: false, now: 0, teamspeak: true });
+    expect(s.permissions).toEqual(["connect", "send_messages", "bypass_password"]);
+    s = ev(s, { ev: "client.updated", d: cl(1, 2, { groups: [6] }) });
+    expect(s.permissions).toEqual(["connect", "send_messages", "bypass_password"]);
+    // A Gwar server's offer is worked out from roles.
+    expect(reduce(initialState, { type: "welcome", welcome: w, resync: false, now: 0 }).permissions).toEqual([]);
+  });
 });
 
 describe("chat", () => {

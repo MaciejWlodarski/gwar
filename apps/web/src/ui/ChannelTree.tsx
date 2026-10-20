@@ -1,10 +1,12 @@
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import {
+  Ban,
   ChevronRight,
   EyeOff,
   Hash,
   HeadphoneOff,
   Headphones,
+  House,
   Loader2,
   Lock,
   LogIn,
@@ -26,7 +28,8 @@ import { controller } from "../state/controller";
 import { channelMentions, channelUnread, myChannelId } from "../state/reducer";
 import { useSettings } from "../state/settings";
 import { useSession, useUi } from "../state/stores";
-import { buildTree, descendantsCount, type ChannelNode } from "../state/tree";
+import { buildTree, descendantsCount, isFull, type ChannelNode } from "../state/tree";
+import { fillText, parseSpacer } from "../lib/spacer";
 import { MentionBadge, UnreadBadge } from "./badges";
 import { useChannelPermission, useGroupsColor, useMyWho, useWhoOf } from "./hooks";
 import { canActOn } from "../lib/permissions";
@@ -112,6 +115,8 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
   const expandable = node.children.length > 0 || node.clients.length > 0;
   const total = descendantsCount(node);
   const count = node.clients.length;
+  const full = isFull(node);
+  const spacer = onGwar ? null : parseSpacer(channel.name, node.depth === 0);
 
   const join = () => {
     if (canJoin) void controller.joinChannelInteractive(channel.id);
@@ -182,20 +187,42 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
           >
             <ChevronRight className={cn("size-3.5 transition-transform duration-150", !collapsed && "rotate-90")} />
           </span>
+          {/* Like TeamSpeak's channel bubbles: whether and how I can get in. */}
           {joining ? (
             <Loader2 aria-label={t("chat.joiningShort")} className="size-4 shrink-0 animate-spin text-accent" />
           ) : current ? (
             <Volume2 aria-hidden className="size-4 shrink-0 text-accent" />
+          ) : spacer ? null : full ? (
+            <Ban aria-label={t("tree.full")} className="size-4 shrink-0 text-danger" />
+          ) : channel.has_password ? (
+            <Lock aria-label={t("tree.locked")} className="size-4 shrink-0 text-warn" />
           ) : (
             <Hash className={cn("size-4 shrink-0", selected ? "text-accent" : "text-subtle")} />
           )}
-          <span className="min-w-0 flex-1 truncate">{channel.name}</span>
+          {spacer ? (
+            <span
+              aria-hidden={spacer.align === "fill" || undefined}
+              className={cn(
+                "min-w-0 flex-1 overflow-hidden whitespace-pre text-subtle",
+                spacer.align === "center" && "text-center",
+                spacer.align === "right" && "text-right",
+              )}
+            >
+              {spacer.align === "fill" ? fillText(spacer.text) : spacer.text}
+            </span>
+          ) : (
+            <span className="min-w-0 flex-1 truncate" title={channel.topic || undefined}>{channel.name}</span>
+          )}
           {current && <span className="sr-only">({t("tree.inVoice")})</span>}
-          {channel.has_password && <Lock aria-label={t("tree.locked")} className="size-3.5 shrink-0 text-subtle" />}
+          {current && channel.has_password && <Lock aria-label={t("tree.locked")} className="size-3.5 shrink-0 text-warn" />}
+          {isDefault && !spacer && <House aria-label={t("tree.default")} className="size-3.5 shrink-0 text-subtle" />}
           {channel.private && <EyeOff aria-label={t("tree.private")} className="size-3.5 shrink-0 text-subtle" />}
-          {(count > 0 || channel.max_clients) && !collapsed && (
-            <span className="shrink-0 text-xs tabular-nums text-subtle">
-              {channel.max_clients ? `${count}/${channel.max_clients}` : count}
+          {(count > 0 || (channel.max_clients !== null && !spacer)) && !collapsed && (
+            <span
+              className={cn("shrink-0 text-xs tabular-nums", full ? "font-medium text-danger" : "text-subtle")}
+              title={channel.max_clients !== null ? t(full ? "tree.full" : "tree.limit", { max: channel.max_clients }) : undefined}
+            >
+              {channel.max_clients !== null ? `${count}/${channel.max_clients}` : count}
             </span>
           )}
           {collapsed && total > 0 && <span className="shrink-0 rounded-full bg-hover px-1.5 text-xs tabular-nums text-muted">{total}</span>}

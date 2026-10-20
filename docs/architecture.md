@@ -469,8 +469,23 @@ therefore have different TS suffixes while retaining the same Gwar nickname.
     prevent echoes. Server chat uses the main query's `textserver` subscription;
     Gwar channel chat uses a puppet or the separate, movable posting query.
 - **Our client on TeamSpeak servers.** `gwar-client::teamspeak` (tsclientlib)
-  presents a TeamSpeak server as `gwar/4` (Welcome + events), so the UI has no
-  TeamSpeak-specific code; voice goes straight to the native engine.
+  presents a TeamSpeak server as `gwar/4` (Welcome + events), so the UI needs
+  little TeamSpeak-specific code; voice goes straight to the native engine.
+  - Replies have the shapes the UI checks a Gwar server's against: `chat.send`
+    answers with the message (also the one copy of our own message: TeamSpeak's
+    echo is dropped), `channel.create`/`channel.update` with the channel once
+    the book shows it, `token.redeem` with our server groups.
+  - Refusals keep their meaning: a wrong or missing channel password is
+    `wrong_password`, a full channel `channel_full`, missing permissions
+    (needed join power, channel kind) `forbidden`.
+  - The Welcome offers every permission and the UI keeps that list (there are
+    no Gwar roles to derive it from); the server decides. Joins go out without
+    a password first, so admins with `b_channel_join_ignore_password` are never
+    asked; on `wrong_password` the UI asks, and remembers typed passwords for
+    the session, rejoins after a reconnect included.
+  - TeamSpeak gives a channel's chat only to the people in it, so the UI writes
+    only in the user's own channel. Top-level `[spacer]` channels are drawn as
+    spacers.
 
 ## Clients
 

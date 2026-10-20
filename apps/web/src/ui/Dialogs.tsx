@@ -10,7 +10,7 @@ import { AccessPicker } from "./ChannelAccess";
 import { ChannelPermissionsDialog } from "./ChannelPermissions";
 import { BugReportDialog } from "./BugReport";
 import { rebaseAccess, sameAccess } from "../lib/access";
-import { controller, describeRequestError } from "../state/controller";
+import { controller, describeJoinError, describeRequestError } from "../state/controller";
 import { sortedChannels } from "../state/reducer";
 import { isDesktop } from "../platform";
 import { newId, useSettings, type ServerKind } from "../state/settings";
@@ -460,7 +460,7 @@ function ChannelPasswordDialog({ channel }: { channel: number }) {
       close();
       useUi.getState().setDrawer(false);
     } catch (err) {
-      setError(err instanceof RequestError && err.code === "wrong_password" ? t("channelPassword.wrong") : describeRequestError(err));
+      setError(err instanceof RequestError && err.code === "wrong_password" ? t("channelPassword.wrong") : describeJoinError(err));
       setBusy(false);
     }
   };
