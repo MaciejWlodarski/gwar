@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "tauri dev",
     "build": "tauri build",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "bundle-licenses": "node ../../scripts/licenses/build.mjs"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.12.1"

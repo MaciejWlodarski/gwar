@@ -30,7 +30,8 @@ export default defineConfig(({ command, mode }) => ({
       "/ws": { target: "ws://127.0.0.1:8790", ws: true },
     },
   },
-  build: { target: "es2022", sourcemap: true },
+  // licenses.md: the bundled packages' licenses, served with the app and shipped in the desktop bundle.
+  build: { target: "es2022", sourcemap: true, license: { fileName: "licenses.md" } },
   define: { __APP_VERSION__: JSON.stringify(version), __APP_COMMIT__: JSON.stringify(commit) },
   // The browser e2e fixtures are imported at run time: scanning them up front
   // keeps Vite from reloading the pages when it finds their dependencies.

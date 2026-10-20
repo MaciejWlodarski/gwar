@@ -3,7 +3,11 @@
 This project's own code is licensed under MIT. Third-party components retain
 their respective licenses and attribution.
 
-The desktop app carries this file and the project's `LICENSE` in its bundle.
+The desktop app carries this file, the project's `LICENSE` and
+`THIRD_PARTY_LICENSES.md` in its bundle: the licenses of every Rust crate and
+JavaScript package it ships, written at build time by
+`scripts/licenses/build.mjs` (cargo-about, and Vite's list of the bundled
+packages). The web app serves its packages' licenses at `/licenses.md`.
 
 ## ReSpeak / tsclientlib
 

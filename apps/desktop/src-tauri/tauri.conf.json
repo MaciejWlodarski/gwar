@@ -7,7 +7,7 @@
     "devUrl": "http://localhost:5173",
     "frontendDist": "../../web/dist",
     "beforeDevCommand": "pnpm --filter web dev",
-    "beforeBuildCommand": "pnpm --filter web build:desktop"
+    "beforeBuildCommand": "pnpm --filter web build:desktop && pnpm --filter desktop bundle-licenses"
   },
   "app": {
     "withGlobalTauri": false,
@@ -35,7 +35,11 @@
     "category": "SocialNetworking",
     "shortDescription": "Self-hosted voice communicator",
     "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
-    "resources": { "../../../LICENSE": "LICENSE", "../../../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md" },
+    "resources": {
+      "../../../LICENSE": "LICENSE",
+      "../../../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
+      "gen/licenses/THIRD_PARTY_LICENSES.md": "THIRD_PARTY_LICENSES.md"
+    },
     "macOS": {
       "minimumSystemVersion": "11.0",
       "entitlements": "Entitlements.plist",
