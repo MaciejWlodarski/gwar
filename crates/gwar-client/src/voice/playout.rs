@@ -707,6 +707,62 @@ mod tests {
     }
 
     #[test]
+    fn a_small_residual_drains_through_frequent_loss_of_voice() {
+        use super::super::jitter::Clock;
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            for excess in [480u64, 960] {
+                let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
+                let mut slot = Slot::new().unwrap();
+                let now = Instant::now();
+                let mut packet = 0u64;
+                let mut losses = 0;
+                for tick in (0..20 * 48_000u64).step_by(480) {
+                    let at = now + Duration::from_secs_f64(tick as f64 / 48_000.0);
+                    loop {
+                        let scheduled = (packet * 480).saturating_sub(excess);
+                        if scheduled > tick {
+                            break;
+                        }
+                        // Two losses a second, one of them a burst of two.
+                        let phase = scheduled % 48_000;
+                        let lost = scheduled > 0 && (phase == 0 || phase == 480 || phase == 24_000);
+                        losses += u64::from(lost);
+                        if !lost {
+                            // Phase-continuous voice: the decoder only cuts a correlated period.
+                            let pcm = harmonic(
+                                150.0,
+                                0.0,
+                                (packet * 480) as f32 * std::f32::consts::TAU * 150.0 / 48_000.0,
+                                480,
+                            );
+                            let mut data = vec![0; 1275];
+                            let n = encoder.encode_float(&pcm, &mut data).unwrap();
+                            data.truncate(n);
+                            slot.buffer.push_at(
+                                packet * if clock == Clock::Sequence { 960 } else { 480 },
+                                480,
+                                data,
+                                now + Duration::from_secs_f64(scheduled as f64 / 48_000.0),
+                                clock,
+                            );
+                        }
+                        packet += 1;
+                    }
+                    slot.mix_refill(&mut [0.0; 480], 1.0, at, 480).unwrap();
+                }
+                let tail = slot.buffer.depth().1 + slot.staged_samples() as u64;
+                let label = format!("{clock:?}, excess={excess}");
+                assert!(
+                    tail <= slot.buffer.target_samples() + 240,
+                    "{label}: tail={tail}, shrunk {}",
+                    slot.buffer.shrink_samples
+                );
+                assert_eq!(slot.buffer.concealments, losses, "{label}: draining must not starve");
+            }
+        }
+    }
+
+    #[test]
     fn fractional_staged_surplus_converges_with_bounded_periodic_corrections() {
         use super::super::jitter::Clock;
         for clock in [Clock::Rtp, Clock::Sequence] {

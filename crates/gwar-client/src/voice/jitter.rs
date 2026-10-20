@@ -41,6 +41,44 @@ struct Recovery {
     before: u64,
 }
 
+/// One refill-time depth observation, judged in hindsight. Audio is buffered from `head` (the
+/// effective playout position) to `end`; at first `end` is where the queue ended. The next
+/// arrival at or beyond `end` moves it there: the packets in between were lost and are
+/// concealed, never late, so they must not hold back a drain. A packet arriving into the
+/// span (reordered, or simply late after a hole) pulls `end` back to itself: it was not there.
+struct Mark {
+    at: Instant,
+    /// Staged audio minus demand and reserve; may be negative. Debited by every cut.
+    base: i64,
+    span: Option<Span>,
+}
+
+struct Span {
+    head: u64,
+    end: u64,
+    /// Samples per key stride under the sequence clock.
+    samples: u64,
+    resolved: bool,
+}
+
+impl Mark {
+    fn margin(&self, clock: Clock) -> u64 {
+        let buffered = self.span.as_ref().map_or(0, |span| {
+            let keys = span.end.saturating_sub(span.head);
+            match clock {
+                Clock::Rtp => keys,
+                Clock::Sequence => keys / FRAME * span.samples,
+            }
+        });
+        (buffered as i64 + self.base).max(0) as u64
+    }
+
+    /// A known lower bound: no later arrival can raise it.
+    fn settled(&self) -> bool {
+        self.span.as_ref().is_none_or(|span| span.resolved)
+    }
+}
+
 pub struct JitterBuffer {
     packets: BTreeMap<u64, Packet>,
     next: Option<u64>,
@@ -54,7 +92,7 @@ pub struct JitterBuffer {
     jitter: f64,
     above_since: Option<Instant>,
     surplus: u64,
-    low_water: VecDeque<(Instant, u64)>,
+    low_water: VecDeque<Mark>,
     observing_since: Option<Instant>,
     last_observation: Option<Instant>,
     last_shrink: Option<Instant>,
@@ -169,6 +207,7 @@ impl JitterBuffer {
         if self.packets.contains_key(&ts) {
             return;
         }
+        self.revise_marks(now, ts);
         if let Some((last_ts, last_at, last_samples)) = self.arrival {
             if ts > last_ts {
                 let elapsed = now.saturating_duration_since(last_at).as_secs_f64();
@@ -240,8 +279,8 @@ impl JitterBuffer {
             // Debit every historical margin: the same audio cannot authorize
             // another cut. New low-water samples can still veto immediately;
             // supported surplus need not wait another full window after each cut.
-            for (_, margin) in &mut self.low_water {
-                *margin = margin.saturating_sub(samples as u64);
+            for mark in &mut self.low_water {
+                mark.base -= samples as i64;
             }
             self.surplus = self.surplus.saturating_sub(samples as u64);
         }
@@ -254,35 +293,73 @@ impl JitterBuffer {
         self.surplus = 0;
     }
 
-    /// Sample queue + decoded tail immediately before each refill. The packet
-    /// target includes one packet of batching; at the low-water point only the
+    /// Buffered audio (holes included) + decoded tail immediately before each refill. The
+    /// packet target includes one packet of batching; at the low-water point only the
     /// pending refill, additional jitter reserve and safety margin are required.
     /// Arrival phase is never audio credit. A full five seconds of observations must
     /// support a surplus, and any lower sample vetoes a correction immediately.
+    ///
+    /// Each observation is revised in hindsight by the arrivals after it (`Mark`). Counting
+    /// only the packets present made every loss look like a dip, and with a loss every
+    /// couple of seconds the five-second low-water rule kept a 10-20 ms residual for good
+    /// (the receiver's "level steps", docs/latency.md).
     pub(crate) fn observe_depth(&mut self, now: Instant, staged: usize, demand: usize) {
         if self.last_observation.is_some_and(|at| now.saturating_duration_since(at) >= STALL) {
             self.clear_depth();
             self.above_since = None;
         }
         self.last_observation = Some(now);
-        let since = *self.observing_since.get_or_insert(now);
+        self.observing_since.get_or_insert(now);
         let packet_samples = self.packets.first_key_value().map_or(self.last_samples, |(_, p)| p.samples);
         let reserve = self.target_samples().saturating_sub(packet_samples) + SAFETY;
-        let margin = (self.depth().1 + staged as u64).saturating_sub(demand as u64 + reserve);
-        // Monotone queue: the front is the minimum of the trailing window.
-        while self.low_water.front().is_some_and(|&(at, _)| now.saturating_duration_since(at) > DEPTH_WINDOW) {
+        let span = self.next.or_else(|| self.packets.first_key_value().map(|(&ts, _)| ts)).map(|next| {
+            // Head-hold PLC has already played part of the hole at `next`.
+            let mut head = next + self.held;
+            let mut end = head;
+            if let Some((&first, _)) = self.packets.first_key_value() {
+                head = head.min(first);
+                let (&last, packet) = self.packets.last_key_value().unwrap();
+                end = last + packet.step;
+            }
+            Span { head, end, samples: packet_samples, resolved: false }
+        });
+        // The whole trailing window is kept (a few hundred marks), not a monotone queue:
+        // hindsight can raise a recent mark above older ones.
+        while self.low_water.front().is_some_and(|mark| now.saturating_duration_since(mark.at) > DEPTH_WINDOW) {
             self.low_water.pop_front();
         }
-        while self.low_water.back().is_some_and(|&(_, value)| value >= margin) {
-            self.low_water.pop_back();
+        self.low_water.push_back(Mark { at: now, base: staged as i64 - demand as i64 - reserve as i64, span });
+        self.refresh_surplus(now);
+    }
+
+    /// Revise the marks with an arrival at `ts` (neither late nor a duplicate).
+    fn revise_marks(&mut self, now: Instant, ts: u64) {
+        for span in self.low_water.iter_mut().filter_map(|mark| mark.span.as_mut()) {
+            if ts < span.end {
+                span.end = ts.max(span.head);
+                span.resolved = true;
+            } else if !span.resolved {
+                span.end = ts;
+                span.resolved = true;
+            }
         }
-        self.low_water.push_back((now, margin));
-        let minimum = self.low_water.front().unwrap().1;
+        self.refresh_surplus(now);
+    }
+
+    /// Every mark bounds the cut, so a hole whose fate is not known yet vetoes it. The
+    /// shrink hold restarts only on a settled low mark: a dip that a later arrival proves
+    /// was a loss does not cost the one-to-two-second wait again.
+    fn refresh_surplus(&mut self, now: Instant) {
+        let Some(since) = self.observing_since else { return };
+        let minimum = self.low_water.iter().map(|mark| mark.margin(self.clock)).min().unwrap_or(0);
         self.surplus = if now.saturating_duration_since(since) >= DEPTH_WINDOW { minimum } else { 0 };
-        if minimum >= SAFETY {
-            self.above_since.get_or_insert(now);
-        } else {
-            self.above_since = None;
+        let settled = self.low_water.iter().filter(|mark| mark.settled()).map(|mark| mark.margin(self.clock)).min();
+        match settled {
+            Some(low) if low < SAFETY => self.above_since = None,
+            _ if minimum >= SAFETY => {
+                self.above_since.get_or_insert(now);
+            }
+            _ => {}
         }
     }
 
@@ -389,9 +466,10 @@ impl JitterBuffer {
             self.concealments_after_trim += 1;
         }
         // A missing packet is not an empty queue. Sample only real queued audio
-        // (never PLC) with the remaining refill demand. An empty/low queue vetoes
-        // shrinking for the full window; isolated loss with surplus preserves it.
-        self.observe_depth(now, 0, demand);
+        // (never PLC) with the refill demand this PLC left; charging the whole demand
+        // again turned every loss into a dip of one refill. An empty queue still
+        // vetoes shrinking for the full window unless a later arrival proves a loss.
+        self.observe_depth(now, 0, demand.saturating_sub(samples as usize));
         Playout::Conceal(samples as usize)
     }
 }
@@ -501,6 +579,48 @@ mod tests {
         jb.push(FRAME, FRAME, vec![2]);
         assert_eq!(jb.pop(), packet(2));
         assert_eq!(jb.late_drops, 0);
+    }
+
+    /// Ten seconds of 20 ms packets queued 40 ms ahead, every 100th one disturbed; the
+    /// surplus a cut could take at the end.
+    fn surplus_with(in_order: bool, disturb: impl Fn(f64) -> Option<f64>) -> u64 {
+        let mut jb = JitterBuffer::new();
+        let now = Instant::now();
+        let mut arrivals: Vec<(f64, u64)> = (0..510u64)
+            .filter_map(|i| {
+                let nominal = i as f64 * 20.0 - 40.0;
+                if i % 100 == 50 { disturb(nominal).map(|at| (at, i)) } else { Some((nominal, i)) }
+            })
+            .collect();
+        if in_order {
+            for i in 1..arrivals.len() {
+                arrivals[i].0 = arrivals[i].0.max(arrivals[i - 1].0);
+            }
+        }
+        arrivals.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut arrivals = arrivals.into_iter().peekable();
+        for ms in (0..10_000).step_by(20) {
+            while let Some((at, i)) = arrivals.next_if(|&(at, _)| at <= ms as f64) {
+                jb.push_at(i * FRAME, FRAME, vec![1], now + Duration::from_secs_f64(at.max(0.0) / 1000.0), Clock::Rtp);
+            }
+            jb.pop_at(now + Duration::from_millis(ms));
+        }
+        jb.surplus
+    }
+
+    #[test]
+    fn a_loss_is_no_evidence_against_draining_but_lateness_and_reordering_are() {
+        let steady = surplus_with(true, Some);
+        let lost = surplus_with(true, |_| None);
+        let stalled = surplus_with(true, |at| Some(at + 30.0));
+        let reordered = surplus_with(false, |at| Some(at + 35.0));
+        assert!(steady >= FRAME, "steady={steady}");
+        // Lost: while it was due the queue looked a packet short, but nothing came late.
+        assert_eq!(lost, steady);
+        // The same packet 30 ms late, and everything behind it held up (in-order delivery).
+        assert!(stalled + 1200 <= steady, "stalled={stalled}, steady={steady}");
+        // Overtaken by the next packet, 35 ms late: the hole it left was no loss.
+        assert!(reordered < steady, "reordered={reordered}, steady={steady}");
     }
 
     #[test]

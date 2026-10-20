@@ -334,10 +334,19 @@ evidence such as a 5 ms packet delay every three seconds. The margin excludes
 the pending refill, adaptive jitter reserve beyond packet batching, and 120 samples (2.5 ms)
 of safety. Arrival phase contributes no credit. Each correction proposes at most
 720 samples (15 ms). Each committed cut is subtracted from every historical
-margin, so later corrections cannot spend the same surplus twice. Concealment
-samples actual queued depth with the pending refill demand; an empty queue
-vetoes shrinking for the full window, while isolated packet loss need not erase
-still-supported surplus. Corrections are at least 500 ms apart (at most 10 ms/s
+margin, so later corrections cannot spend the same surplus twice. Depth is
+buffered time from the playout position to the end of the queue, holes
+included, and every observation is revised in hindsight by the arrivals after
+it: the first packet at or beyond the queue's end extends it over the missing
+packets (they were lost and are concealed, never late), while a packet arriving
+inside the span pulls it back to itself (it was not there). Only the present
+packets used to count, so every loss looked like a one-packet dip at the tail;
+with a loss every couple of seconds the window never cleared and a 10--20 ms
+residual stayed for good (the receiver's "level steps"). Concealment samples
+the queue with the refill demand the PLC left, not the whole demand again. An
+empty queue still vetoes shrinking for the full window unless a later arrival
+proves a loss; a dip whose fate is still unknown vetoes a cut, but only a
+settled low mark restarts the shrink hold. Corrections are at least 500 ms apart (at most 10 ms/s
 for quiet audio or 30 ms/s for a correlated 15 ms period). Surplus below 120
 samples is not corrected. Startup, observation gaps and stall recovery still
 require a fresh window. The post-trim concealment counter retains its one-second

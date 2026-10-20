@@ -633,12 +633,38 @@ async fn run(
     } else {
         None
     };
-    tokio::time::sleep(Duration::from_secs_f64(
+    // The receiver's playout state every 100 ms, to see where a latency step sits.
+    let run_for = Duration::from_secs_f64(
         1.0 + settings.warmup_samples as f64 / RATE as f64
             + count as f64 * PERIOD as f64 / RATE as f64
             + MATCH_WINDOW_MS / 1000.0,
-    ))
-    .await;
+    );
+    let mut timeline = String::from(
+        "t_s,queued_samples,staged_samples,target_samples,shrink_samples,concealments,late_drops,trim_events,speaker_samples,callback_samples,headroom_samples,underruns\n",
+    );
+    let deadline = tokio::time::Instant::now() + run_for;
+    while tokio::time::Instant::now() < deadline {
+        let s = vb.stats();
+        if let Some(slot) = s.slots.iter().find(|slot| slot.generation > 0) {
+            timeline.push_str(&format!(
+                "{:.3},{},{},{},{},{},{},{},{},{},{},{}\n",
+                epoch.elapsed().as_secs_f64(),
+                slot.queued_samples,
+                slot.staged_samples,
+                slot.target_samples,
+                slot.shrink_samples,
+                slot.concealments,
+                slot.late_drops,
+                slot.trim_events,
+                s.speaker_samples,
+                s.callback_samples,
+                s.headroom_samples,
+                s.underruns,
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    std::fs::write(format!("{output}.timeline.csv"), timeline)?;
     let receiver_stats = vb.stats();
     let crypto = vb.keys().map(|keys| keys.counters());
     println!("sender={:?} receiver={receiver_stats:?}", va.stats());
