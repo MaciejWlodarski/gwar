@@ -5,6 +5,7 @@
 //! "pipeline" thread does all audio DSP and coding; device callbacks only
 //! move samples through lock-free rings (see [`io`]).
 
+mod apm;
 mod denoise;
 pub mod io;
 pub mod jitter;
@@ -32,6 +33,7 @@ use tokio::sync::mpsc;
 
 pub use self::denoise::NoiseSuppression;
 use self::{
+    apm::Processing,
     denoise::Denoiser,
     io::{AudioIo, AudioPorts, CaptureSample, OutputTiming},
     jitter::Clock,
@@ -60,6 +62,8 @@ pub struct Controls {
     push_to_talk: AtomicBool,
     /// [`NoiseSuppression`], in percent.
     noise_suppression: AtomicU8,
+    echo_cancellation: AtomicBool,
+    auto_gain: AtomicBool,
     master: AtomicU32,
     slot_gain: [AtomicU32; AUDIO_SLOTS],
     /// Latest input level in dBFS (for the meter).
@@ -85,6 +89,8 @@ impl Default for Controls {
             vad_threshold: AtomicU32::new((-50.0f32).to_bits()),
             push_to_talk: AtomicBool::new(false),
             noise_suppression: AtomicU8::new(NoiseSuppression::default().as_percent()),
+            echo_cancellation: AtomicBool::new(true),
+            auto_gain: AtomicBool::new(true),
             master: AtomicU32::new(1.0f32.to_bits()),
             slot_gain: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             input_level: AtomicU32::new((-100.0f32).to_bits()),
@@ -244,6 +250,11 @@ impl VoiceHandle {
     /// Background-noise suppression of the microphone (see [`NoiseSuppression`]).
     pub fn set_noise_suppression(&self, mode: NoiseSuppression) {
         self.controls.noise_suppression.store(mode.as_percent(), Ordering::Relaxed);
+    }
+    /// Echo cancellation and automatic gain control of the microphone (see `apm`).
+    pub fn set_capture_processing(&self, echo_cancellation: bool, auto_gain: bool) {
+        self.controls.echo_cancellation.store(echo_cancellation, Ordering::Relaxed);
+        self.controls.auto_gain.store(auto_gain, Ordering::Relaxed);
     }
     pub fn set_master_gain(&self, gain: f32) {
         set_f(&self.controls.master, gain.clamp(0.0, 2.0));
@@ -606,6 +617,7 @@ fn pipeline<const CAPTURE: usize>(
     output.attach();
     let mut slots = (0..AUDIO_SLOTS).map(|_| Slot::new()).collect::<Result<Vec<_>>>()?;
     let mut capture = CaptureFrame::new(CAPTURE);
+    let mut processing = Processing::new();
     let mut denoiser = Denoiser::new();
     let mut next_position = None;
     let mut mix = vec![0f32; FRAME];
@@ -620,11 +632,21 @@ fn pipeline<const CAPTURE: usize>(
         for _ in 0..mic.slots() {
             let Ok(sample) = mic.pop() else { break };
             let Some(capture_position) = capture.push_at(sample, Instant::now(), &counters) else { continue };
-            // The meter and the gate measure the microphone as it is, so its sensitivity setting
-            // means what it did (a strong suppressor also takes very quiet speech down). The
-            // encoder, and the RTP level the server's speech gate reads, get the cleaned audio.
-            // Suppression runs on every frame, sent or not, so its state follows the audio.
+            // Echo cancellation, then gain control and noise suppression, in a browser's order. The
+            // meter and the gate measure the microphone between the canceller and the rest: the
+            // speaker cannot open the gate, and the sensitivity setting means what it does with
+            // both off (gain control lifts a quiet room's noise to about -50 dBFS, and a strong
+            // suppressor also takes very quiet speech down). The encoder, and the RTP level the
+            // server's speech gate reads, get the processed audio. Every stage runs on every
+            // frame, sent or not, so its state follows the audio.
+            processing.configure(
+                controls.echo_cancellation.load(Ordering::Relaxed),
+                controls.auto_gain.load(Ordering::Relaxed),
+            );
+            let queued = speaker.buffer().capacity() - speaker.slots();
+            processing.cancel_echo(&mut capture.samples, (queued * 1000 / io::RATE as usize) as u32);
             let db = level_db(&capture.samples);
+            processing.control_gain(&mut capture.samples);
             let mode = NoiseSuppression::percent(controls.noise_suppression.load(Ordering::Relaxed));
             denoiser.process(&mut capture.samples, mode, next_position == Some(capture_position));
             next_position = Some(capture_position + CAPTURE as u64);
@@ -696,8 +718,12 @@ fn pipeline<const CAPTURE: usize>(
             }
             let master = if deafened { 0.0 } else { f(&controls.master) };
             output.playing.store(slots.iter().any(Slot::playing), Ordering::Relaxed);
-            for s in &mix[..take] {
-                let _ = speaker.push((s * master).clamp(-1.0, 1.0));
+            for s in &mut mix[..take] {
+                *s = (*s * master).clamp(-1.0, 1.0);
+            }
+            processing.render(&mix[..take]);
+            for &s in &mix[..take] {
+                let _ = speaker.push(s);
             }
             needed -= take;
         }
@@ -869,6 +895,8 @@ mod codec_tests {
             let controls = Arc::new(Controls::default());
             controls.muted.store(gate == 0, Ordering::Relaxed);
             controls.push_to_talk.store(gate == 1, Ordering::Relaxed);
+            // The samples are constant: the canceller's high-pass filter would take them to nothing.
+            controls.echo_cancellation.store(false, Ordering::Relaxed);
             let (mut tx, mic) = rtrb::RingBuffer::new(FRAME * 16);
             let (speaker, _rx) = rtrb::RingBuffer::new(FRAME * 4);
             let timing = Arc::new(OutputTiming::default());

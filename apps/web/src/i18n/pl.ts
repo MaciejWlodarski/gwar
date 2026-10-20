@@ -120,7 +120,6 @@ export const pl: Record<Key, string> = {
   "audio.shortcutNone": "Nie ustawiono",
   "audio.shortcutSet": "Ustaw skrót",
   "audio.shortcutFailed": "Nie udało się zarejestrować {key} jako skrótu globalnego. Może używa go inna aplikacja.",
-  "audio.processingDesktop": "Usuwanie echa nie jest jeszcze dostępne w aplikacji desktopowej. Używaj słuchawek, aby uniknąć echa.",
   "desktop.window": "Okno",
   "desktop.closeToTray": "Działaj w zasobniku po zamknięciu okna",
   "desktop.closeToTrayHint": "Zamknięcie okna chowa Gwar do zasobnika systemowego. Zakończ aplikację z menu zasobnika.",
@@ -134,7 +133,7 @@ export const pl: Record<Key, string> = {
   "audio.noiseStrength": "Siła redukcji szumów",
   "audio.noiseStrengthHint": "Przy 100% usuwa cały szum, jaki rozpozna, także stukanie klawiatury. Mniej zostawia trochę tła.",
   "audio.echoCancellation": "Usuwanie echa",
-  "audio.echoCancellationHint": "Zapobiega wychwytywaniu dźwięku z głośników przez mikrofon.",
+  "audio.echoCancellationHint": "Zapobiega wychwytywaniu dźwięku z głośników przez mikrofon. Ze słuchawkami wyłącz, by zmniejszyć opóźnienie.",
   "audio.autoGain": "Automatyczna regulacja wzmocnienia",
   "audio.autoGainHint": "Utrzymuje stałą głośność. Wyłącz dla mikrofonów studyjnych.",
 

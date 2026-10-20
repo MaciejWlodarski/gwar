@@ -29,6 +29,8 @@ cpal = { version = "0.18", features = ["realtime"] }
 audiopus = "=0.3.0-rc.0"
 rtrb = "0.4"
 gwar-denoise = { path = "../gwar-denoise" }
+# Echo cancellation and gain control: WebRTC's audio processing, ported to Rust.
+sonora = "0.2.0"
 str0m = { version = "0.24", default-features = false, features = ["aws-lc-rs"] }
 
 sha1 = "0.10"

@@ -23,6 +23,16 @@ plus the port), run with [sonos/tract](https://github.com/sonos/tract) (MIT OR
 Apache-2.0). The desktop app embeds the model; the web app serves it, with the
 runtime built as WebAssembly, and downloads it when suppression is first on.
 
+## Echo cancellation and gain control
+
+The desktop app's echo cancellation and automatic gain control are WebRTC's audio
+processing (AEC3, AGC2), through
+[dignifiedquire/sonora](https://github.com/dignifiedquire/sonora) 0.2.0, its port
+to Rust (BSD-3-Clause: Copyright (c) 2011, The WebRTC Project Authors; Copyright
+(c) 2016, Arun Raghavan and contributors; Copyright (c) 2026, dignifiedquire. All
+rights reserved). The license's conditions and disclaimer are in the crate's
+`LICENSE`. Browsers run their own copy of the same processing for the web app.
+
 ## TeamSpeak server
 
 With `--teamspeak`, the server downloads the official TeamSpeak 3 server from

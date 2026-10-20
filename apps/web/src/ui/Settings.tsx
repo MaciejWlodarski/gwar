@@ -281,40 +281,27 @@ function AudioTab() {
         )}
       </Section>
 
-      {engine.capabilities.captureProcessing === false ? null : engine.capabilities.captureProcessing === "noise" ? (
-        <Section title={t("audio.processing")}>
-          <Switch
-            checked={audio.noiseSuppression}
-            onCheckedChange={(v) => setAudio({ noiseSuppression: v })}
-            label={t("audio.noiseSuppression")}
-            description={t("audio.noiseSuppressionHint")}
-          />
-          {noiseStrength}
-          <p className="text-xs text-subtle">{t("audio.processingDesktop")}</p>
-        </Section>
-      ) : (
-        <Section title={t("audio.processing")}>
-          <Switch
-            checked={audio.noiseSuppression}
-            onCheckedChange={(v) => setAudio({ noiseSuppression: v })}
-            label={t("audio.noiseSuppression")}
-            description={t("audio.noiseSuppressionHint")}
-          />
-          {noiseStrength}
-          <Switch
-            checked={audio.echoCancellation}
-            onCheckedChange={(v) => setAudio({ echoCancellation: v })}
-            label={t("audio.echoCancellation")}
-            description={t("audio.echoCancellationHint")}
-          />
-          <Switch
-            checked={audio.autoGainControl}
-            onCheckedChange={(v) => setAudio({ autoGainControl: v })}
-            label={t("audio.autoGain")}
-            description={t("audio.autoGainHint")}
-          />
-        </Section>
-      )}
+      <Section title={t("audio.processing")}>
+        <Switch
+          checked={audio.noiseSuppression}
+          onCheckedChange={(v) => setAudio({ noiseSuppression: v })}
+          label={t("audio.noiseSuppression")}
+          description={t("audio.noiseSuppressionHint")}
+        />
+        {noiseStrength}
+        <Switch
+          checked={audio.echoCancellation}
+          onCheckedChange={(v) => setAudio({ echoCancellation: v })}
+          label={t("audio.echoCancellation")}
+          description={t("audio.echoCancellationHint")}
+        />
+        <Switch
+          checked={audio.autoGainControl}
+          onCheckedChange={(v) => setAudio({ autoGainControl: v })}
+          label={t("audio.autoGain")}
+          description={t("audio.autoGainHint")}
+        />
+      </Section>
     </div>
   );
 }

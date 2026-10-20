@@ -562,15 +562,47 @@ Compare loss and underflows alongside latency. Frame counters cover warmup too.
 Inspect individual call levels: startup buffering or network drift can dominate
 pooled p95. The runners impose no fixed performance pass threshold.
 
+## Echo cancellation and gain control
+
+Both apps run WebRTC's audio processing on the microphone, with the same settings
+(both on by default): the web app the browser's own (`getUserMedia`'s
+`echoCancellation` and `autoGainControl`), the desktop app the same processing
+natively (AEC3 and AGC2 through `sonora`, a port to Rust;
+`crates/gwar-client/src/voice/apm.rs`), on every 10 ms frame, on the pipeline thread
+that also mixes what the speaker plays. The order is a browser's: echo
+cancellation, gain control, then noise suppression (below). The canceller is given
+the speaker's audio as the pipeline queues it, with the queue's length as the delay
+hint, and finds the rest of the echo's delay (device buffers, the room) itself. On
+the desktop, the level meter and the voice gate measure between the canceller and
+the rest: the speaker cannot open the gate, and the sensitivity setting means what
+it does with the processing off (gain control lifts a quiet room's noise: -60 dBFS
+of it comes out at about -48, above the default threshold of -50).
+
+Echo cancellation adds ~9 ms (about 430 samples: AEC3 splits 48 kHz into three
+bands, works in 4 ms blocks and overlaps them); gain control adds nothing. With
+headphones there is no echo to cancel, and turning it off saves those ~9 ms. A
+browser's canceller is the same code in C++, built the same way, so it likely costs
+as much; that is read from the code, not measured (a browser reports when audio
+reaches the page, not what its processing holds). A frame takes ~0.05 ms of CPU on
+Apple Silicon.
+
+An echo of a voice-like signal, 60 to 250 ms late, went down by 31–34 dB once the
+canceller had converged; the near voice, talking over it, lost ~2.5 dB, and with
+nothing played it is left as it is. Gain control brought a -40 dBFS voice to about
+-20. Tests (`apm.rs`): an echo 60 ms late and 10 dB down goes down by more than
+25 dB; a voice with nothing played changes by less than 1 dB; a -40 dBFS voice comes
+out above -30 dBFS; with both off the microphone passes untouched.
+
 ## Noise suppression
 
 Both apps clean the microphone on the device, before encoding (and so before
 encryption), with the same model and settings (`crates/gwar-denoise`): the desktop
 app natively, before the encoder (`crates/gwar-client/src/voice/denoise.rs`), on
 every 10 ms frame; the web app in the browser (below). On the desktop, the level meter
-and the voice gate still measure the microphone as captured: a strong suppressor
+and the voice gate measure the microphone before it (and before gain control, see
+above): a strong suppressor
 also takes very quiet speech down (speech peaking near -48 dBFS lost most of its
-gated frames to it), and the sensitivity setting should keep meaning what it did.
+gated frames to it), and the sensitivity setting should keep meaning what it does.
 The RTP audio level (RFC 6464) is the cleaned audio's, so suppressed noise cannot
 hold a receive slot at the server.
 
