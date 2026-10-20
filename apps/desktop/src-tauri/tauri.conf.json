@@ -7,7 +7,8 @@
     "devUrl": "http://localhost:5173",
     "frontendDist": "../../web/dist",
     "beforeDevCommand": "pnpm --filter web dev",
-    "beforeBuildCommand": "pnpm --filter web build:desktop && pnpm --filter desktop bundle-licenses"
+    "beforeBuildCommand": "pnpm --filter web build:desktop && pnpm --filter desktop bundle-licenses",
+    "beforeBundleCommand": "pnpm --filter desktop check-licenses"
   },
   "app": {
     "withGlobalTauri": false,

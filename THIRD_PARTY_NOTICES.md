@@ -4,10 +4,13 @@ This project's own code is licensed under MIT. Third-party components retain
 their respective licenses and attribution.
 
 The desktop app carries this file, the project's `LICENSE` and
-`THIRD_PARTY_LICENSES.md` in its bundle: the licenses of every Rust crate and
-JavaScript package it ships, written at build time by
-`scripts/licenses/build.mjs` (cargo-about, and Vite's list of the bundled
-packages). The web app serves its packages' licenses at `/licenses.md`.
+`THIRD_PARTY_LICENSES.md` in its bundle: the licenses of every Rust crate it
+ships (native, and in its MLS WebAssembly module), of the Opus library built
+into it, and of the JavaScript packages and the font of its interface, written
+at build time by `scripts/licenses/build.mjs` (cargo-about, and Vite's list of
+the bundled packages). The web app serves its JavaScript packages' and font's
+licenses at `/licenses.md`. The components under the Mozilla Public License 2.0
+are used unmodified; their source code is at the repositories listed with them.
 
 ## ReSpeak / tsclientlib
 
