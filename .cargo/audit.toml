@@ -3,11 +3,4 @@
 # 0.7 (its `libcrux` feature, which openmls_rust_crypto 0.6 does not enable),
 # so it is never built; CI checks that it stays out of the build. Drop this
 # when openmls_rust_crypto moves to hpke-rs 0.8.
-#
-# tract-nnef 0.21.4 (RUSTSEC-2026-0217: its NNEF tensor parser can read out of
-# bounds on a crafted model) comes with DeepFilterNet's libDF, which builds only
-# against tract 0.21.4 (later 0.21.x moved to ndarray 0.16). The desktop loads one
-# model, DeepFilterNet3's ONNX archive embedded in its binary at build time, through
-# tract-onnx: no NNEF model, and no model from anyone else, is ever parsed. Drop
-# this when libDF builds against tract >= 0.21.16.
-ignore = ["RUSTSEC-2026-0330", "RUSTSEC-2026-0331", "RUSTSEC-2026-0217"]
+ignore = ["RUSTSEC-2026-0330", "RUSTSEC-2026-0331"]

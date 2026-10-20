@@ -1,0 +1,20 @@
+[package]
+name = "gwar-denoise"
+version = "0.1.0"
+description = "Noise suppression shared by the desktop and the web app (DeepFilterNet3 low-latency)"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# The model runtime; without it, only the strength setting.
+model = ["dep:deep_filter", "dep:ndarray"]
+# The model's archive in the binary (the desktop app); the web app downloads it instead.
+embedded-model = ["model", "deep_filter/default-model-ll"]
+
+[dependencies]
+anyhow = { workspace = true }
+# DeepFilterNet's libDF, ported to tract 0.23 (WebAssembly SIMD kernels, RUSTSEC-2026-0217 fixed) in
+# our fork; upstream is unmaintained. Its low-latency model (no lookahead) comes with it.
+deep_filter = { git = "https://github.com/MaciejWlodarski/DeepFilterNet", rev = "24d1b6df281f0e8208aa2eeb5d2bb942fb0737d0", default-features = false, features = ["tract"], optional = true }
+ndarray = { version = "0.17", optional = true }

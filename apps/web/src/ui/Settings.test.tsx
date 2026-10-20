@@ -116,3 +116,21 @@ describe("desktop noise suppression", () => {
     }
   });
 });
+
+describe("browser noise suppression", () => {
+  it("offers its strength beside echo cancellation", async () => {
+    voice.capabilities.captureProcessing = true;
+    try {
+      await act(async () => root.render(<TooltipProvider><SettingsDialog tab="audio" /></TooltipProvider>));
+      const strength = document.querySelector<HTMLElement>('[role="slider"][aria-label="Noise suppression strength"]')!;
+      expect(strength.getAttribute("aria-valuenow")).toBe("100");
+      expect([...document.querySelectorAll("*")].some((e) => e.children.length === 0 && e.textContent === "Echo cancellation")).toBe(true);
+      await act(async () => strength.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true })));
+      expect(useSettings.getState().audio.noiseStrength).toBe(95);
+      await act(async () => useSettings.getState().setAudio({ noiseSuppression: false }));
+      expect(document.querySelector('[aria-label="Noise suppression strength"]')).toBeNull();
+    } finally {
+      voice.capabilities.captureProcessing = false;
+    }
+  });
+});

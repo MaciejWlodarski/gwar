@@ -564,8 +564,10 @@ pooled p95. The runners impose no fixed performance pass threshold.
 
 ## Noise suppression
 
-The desktop app cleans the microphone before the encoder
-(`crates/gwar-client/src/voice/denoise.rs`), on every 10 ms frame. The level meter
+Both apps clean the microphone on the device, before encoding (and so before
+encryption), with the same model and settings (`crates/gwar-denoise`): the desktop
+app natively, before the encoder (`crates/gwar-client/src/voice/denoise.rs`), on
+every 10 ms frame; the web app in the browser (below). On the desktop, the level meter
 and the voice gate still measure the microphone as captured: a strong suppressor
 also takes very quiet speech down (speech peaking near -48 dBFS lost most of its
 gated frames to it), and the sensitivity setting should keep meaning what it did.
@@ -575,7 +577,11 @@ hold a receive slot at the server.
 One model for every kind of noise: DeepFilterNet3's low-latency model (no
 lookahead), run with tract. It adds 10 ms, one frame of overlap-add (the standard
 DeepFilterNet3 model looks two frames ahead: 30 ms here, so it is not used), and
-takes about 1.3 ms of CPU per frame on Apple Silicon. The setting is one switch and
+takes about 0.75–0.9 ms of CPU per 10 ms frame on Apple Silicon, natively and as
+WebAssembly alike. DeepFilterNet's runtime, libDF, is unmaintained upstream and pinned
+tract 0.21, which has no WebAssembly SIMD kernels and a parser advisory (RUSTSEC-2026-0217, the NNEF loader); it comes from our fork
+(github.com/MaciejWlodarski/DeepFilterNet, branch `gwar/tract-0.23`), ported to
+tract 0.23, whose output matches the original's to 1.5e-6. The setting is one switch and
 a strength from 10 to 100 %: below 100 the cleaned audio is mixed with what was
 captured so that no sound goes down by more than half a dB per percent (50 % caps
 the cut at 25 dB; DeepFilterNet's attenuation limit). The unit tests check the
@@ -621,6 +627,81 @@ model.
 
 The latency harness above keeps suppression off (the library's default): its markers
 are steady tones, which a suppressor rightly takes for noise.
+
+### In the web app
+
+The web app runs the model on the browser's audio thread, in an AudioWorklet on a
+48 kHz capture context of its own (`apps/web/src/voice/denoise`), and sends that
+context's output in place of the microphone. The module
+(`crates/gwar-denoise-wasm`, built by `scripts/denoise-wasm/build.sh`: SIMD, speed
+over size, ~15 MB, 4 MB gzipped) exports a plain C ABI and imports nothing: the
+audio thread has no `TextDecoder` for wasm-bindgen's glue, and Chromium hands
+compiled modules only to cross-origin isolated worklets, so the worklet compiles
+the code itself. Running the model there, rather than in a worker the audio thread
+waits on, saves a hop between threads and a render callback's worth of delay.
+
+It adds ~19 ms: the model's 10 ms, and 448 samples (9.3 ms) to fit its 480-sample
+frames to the audio thread's 128-sample quanta (the most a quantum can be past the
+last whole frame; the output starts that far behind, so every quantum has samples
+the moment its frame is cleaned). The desktop app's capture already comes in 10 ms
+frames, so it adds the 10 ms alone.
+
+The module and the model's archive (36 MB) are downloaded the first time
+suppression is on in a call and kept in the Cache API; the archive must match its
+SHA-256 pin (`crates/gwar-denoise-wasm/model.json`), which the build checks too. The
+browser's own suppression works until the model has loaded (~1.2 s once cached),
+then the microphone is opened again without it and sent through the model. A load
+belongs to its call: ending the call, or turning suppression off, cancels it and
+releases what it holds. The model runs only while the microphone is sent: muted,
+deafened or push-to-talk released, it idles, and starts over when sending resumes.
+The capture context resumes on the next user gesture whenever it is not running
+(not yet allowed to start, or interrupted by Safari); until then the microphone is
+sent as captured.
+
+The worklet compiles the module asynchronously; building the model (~0.3 s) is the
+one step that holds the audio thread, which Firefox shares with the page's other
+48 kHz contexts, so playback there can pause once while the model loads. 200 frames
+of quiet noise then run through the model, one every other render quantum, so the
+browser compiles it fully before it counts; if the second half of them averages
+more than 5 ms a frame, the model is too slow here.
+
+While it runs, three checks, over 2 s windows; any of them two windows in a row and
+the machine is too slow for the model beside everything else on the audio thread:
+
+- The model's time on a frame, against 5 ms on average. The render quantum a frame
+  lands in comes that much later, and the audio after it with it, so half a frame's
+  time bounds what this adds to the microphone's delay. On Apple Silicon a frame
+  takes ~1.2 ms on the audio thread when it runs every quantum, but ~3.6 ms at one
+  frame per 10 ms, as the system clocks the thread down.
+- The audio clock against the wall clock, behind by more than 3%: render callbacks
+  missed for good, audio the microphone lost.
+- In Chromium, which counts them (`playbackStats`), more than 20 ms of the capture
+  context's underruns.
+
+With a deliberate burden (a busy wait after each frame), 4 ms a frame passed in
+Chromium and WebKit; 6 ms was reported by the frame's time, 12 ms by the clocks
+(17% behind) and, in Chromium, by the underruns.
+
+The page then falls back to the browser's suppression, as it does if the model
+fails (an error in the worklet included), cannot load, or the browser cannot take
+the microphone into a 48 kHz context (Firefox, for a microphone at another rate).
+The desktop build of the web app leaves all of this out.
+
+Tests: the framing's 448-sample delay and order, and the checks above (unit tests);
+the engine's switch between the browser's suppression and the model, idling,
+fallback, loads that end with their call or are cancelled, and a model that loads
+while the call attaches its first track (unit tests with a stand-in); `scripts/denoise-wasm/build.sh` checks the pin, that
+the module imports nothing, and that it takes white noise down by more than 20 dB
+in real time; and `apps/web/e2e/denoise.mjs` loads the built app's model in
+Chromium, WebKit and Firefox and checks that noise through the worklet goes down by
+more than 20 dB with no trouble past two windows of checks, that a voice at -20 dBFS
+over it comes through (a vowel's harmonics, pitch and loudness moving like
+speech), and that it passes as captured while the microphone is not sent
+(Chromium and WebKit locally: noise from -30 dBFS to about -80, the voice out at
+about -18, loaded in ~1.2 s; all three in the Playwright Linux image as well, loaded
+in 1.6–2.6 s). Firefox's audio contexts start only with an audio device; CI gives it
+a PulseAudio null sink. Without one the capture context never runs, and the browser's
+suppression stays on.
 
 ## Native 10 ms frames
 

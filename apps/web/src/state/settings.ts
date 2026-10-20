@@ -139,7 +139,7 @@ export interface AudioSettings {
   /** KeyboardEvent.code of the push-to-talk key. */
   pttKey: string | null;
   noiseSuppression: boolean;
-  /** Desktop app: how hard noise suppression works, 10..100 (percent; below 100 it caps the cut at half a dB per percent). */
+  /** How hard noise suppression works, 10..100 (percent; below 100 it caps the cut at half a dB per percent). */
   noiseStrength: number;
   echoCancellation: boolean;
   autoGainControl: boolean;

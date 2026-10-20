@@ -9,7 +9,7 @@ publish.workspace = true
 [features]
 default = ["deep-filter"]
 # Noise suppression (DeepFilterNet3, its model embedded); without it, the microphone passes as captured.
-deep-filter = ["dep:deep_filter", "dep:ndarray", "dep:tract-core", "dep:tract-data", "dep:tract-hir", "dep:tract-linalg", "dep:tract-nnef", "dep:tract-onnx", "dep:tract-onnx-opl", "dep:tract-pulse", "dep:tract-pulse-opl"]
+deep-filter = ["gwar-denoise/embedded-model"]
 
 [dependencies]
 url = "2"
@@ -28,19 +28,7 @@ tracing.workspace = true
 cpal = { version = "0.18", features = ["realtime"] }
 audiopus = "=0.3.0-rc.0"
 rtrb = "0.4"
-# DeepFilterNet3, low-latency model (no lookahead), run with tract; only on git (crates.io has 0.2.5 from 2022).
-deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", rev = "d375b2d8309e0935d165700c91da9de862a99c31", default-features = false, features = ["tract", "default-model-ll"], optional = true }
-ndarray = { version = "0.15", optional = true }
-# libDF builds against tract 0.21.4 (ndarray 0.15); later 0.21.x moved to ndarray 0.16 and break it.
-tract-core = { version = "=0.21.4", optional = true }
-tract-data = { version = "=0.21.4", optional = true }
-tract-hir = { version = "=0.21.4", optional = true }
-tract-linalg = { version = "=0.21.4", optional = true }
-tract-nnef = { version = "=0.21.4", optional = true }
-tract-onnx = { version = "=0.21.4", optional = true }
-tract-onnx-opl = { version = "=0.21.4", optional = true }
-tract-pulse = { version = "=0.21.4", optional = true }
-tract-pulse-opl = { version = "=0.21.4", optional = true }
+gwar-denoise = { path = "../gwar-denoise" }
 str0m = { version = "0.24", default-features = false, features = ["aws-lc-rs"] }
 
 sha1 = "0.10"

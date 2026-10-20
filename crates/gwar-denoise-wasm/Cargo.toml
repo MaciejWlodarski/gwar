@@ -1,0 +1,17 @@
+[package]
+name = "gwar-denoise-wasm"
+version = "0.1.0"
+description = "WebAssembly build of the Gwar noise suppression"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = { workspace = true }
+gwar-denoise = { path = "../gwar-denoise", features = ["model"] }
+# Pulled in by tract (through rand) and never asked for randomness here. The wasm build supplies
+# a backend that refuses (scripts/denoise-wasm/build.sh), so the module needs no imports.
+getrandom = "0.4"

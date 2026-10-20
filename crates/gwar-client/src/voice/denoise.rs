@@ -2,45 +2,16 @@
 //! 10 ms frame goes through it before the encoder; the level meter and the voice-activity gate
 //! still measure the microphone as captured. It runs on the device, before encryption.
 //!
-//! One model for every kind of noise: DeepFilterNet3's low-latency model (no lookahead), run with
-//! tract on 48 kHz frames of exactly our 480 samples. It adds one frame (10 ms) of delay, its
-//! overlap-add, and takes ~1.3 ms of CPU per frame. How hard it works is one setting, a strength:
-//! the cleaned audio is mixed with what was captured so that no sound goes down by more than a set
-//! number of dB (DeepFilterNet's attenuation limit).
+//! The model and its settings are `gwar-denoise`'s, shared with the web app: DeepFilterNet3's
+//! low-latency model on 48 kHz frames of exactly our 480 samples. It adds one frame (10 ms) of
+//! delay and takes ~0.8 ms of CPU per frame on Apple Silicon.
+
+pub use gwar_denoise::NoiseSuppression;
 
 #[cfg(any(feature = "deep-filter", test))]
 use super::FRAME;
 
-/// How much background noise to take out, in percent: 0 is off, 100 all the model can. In
-/// between, no sound is taken down by more than half a dB per percent (50 % caps it at 25 dB). Off
-/// unless the app chooses (the desktop app's default is [`NoiseSuppression::FULL`]): tests and
-/// tools that send tones through the pipeline get them through untouched.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct NoiseSuppression(u8);
-
-impl NoiseSuppression {
-    pub const OFF: Self = Self(0);
-    pub const FULL: Self = Self(100);
-
-    /// Above 100 counts as 100.
-    pub const fn percent(percent: u8) -> Self {
-        Self(if percent > 100 { 100 } else { percent })
-    }
-
-    pub const fn as_percent(self) -> u8 {
-        self.0
-    }
-
-    fn is_off(self) -> bool {
-        self.0 == 0
-    }
-
-    /// DeepFilterNet's attenuation limit; 100 dB or more is none.
-    #[cfg_attr(not(feature = "deep-filter"), allow(dead_code))]
-    fn limit_db(self) -> f32 {
-        if self.0 >= 100 { 100.0 } else { f32::from(self.0) * 0.5 }
-    }
-}
+const _: () = assert!(gwar_denoise::FRAME == super::FRAME);
 
 /// DeepFilterNet3's low-latency model on a worker thread of the pipeline's own: tract's model is
 /// tied to the thread that built it, and building it takes ~0.3 s, which the pipeline must not
@@ -56,21 +27,9 @@ mod deep {
         time::{Duration, Instant},
     };
 
-    use df::tract::{DfParams, DfTract, RuntimeParams};
+    use gwar_denoise::{Model, NoiseSuppression};
 
     use super::FRAME;
-
-    /// libDF's thresholds on its estimate of the local SNR (dB), as its own `deep-filter` command
-    /// sets them: below `MIN_DB` a frame is taken for noise alone and silenced, above `MAX_DB` for
-    /// clean speech and left alone. The library's defaults (-10, and 30 and 20 for its two stages)
-    /// leave more frames alone: with a quiet background, half the gain (docs/latency.md).
-    const MIN_DB: f32 = -15.0;
-    const MAX_DB: f32 = 35.0;
-    /// DeepFilterNet's post-filter (the command's `--pf`) at its default strength: takes noise
-    /// between words further down.
-    const POST_FILTER_BETA: f32 = 0.02;
-    /// libDF: an attenuation limit of 100 dB or more is none.
-    const NO_LIMIT: f32 = 100.0;
 
     /// A frame that takes longer than this holds up the pipeline: it is passed on as captured.
     const PATIENCE: Duration = Duration::from_millis(20);
@@ -89,7 +48,7 @@ mod deep {
         frame: Box<[f32; FRAME]>,
         /// Start over from the untouched model first (a gap in the capture).
         reset: bool,
-        limit_db: f32,
+        strength: NoiseSuppression,
     }
 
     struct Done {
@@ -154,18 +113,8 @@ mod deep {
             std::thread::Builder::new()
                 .name("gwar-denoise".into())
                 .spawn(move || {
-                    let params = RuntimeParams::default_with_ch(1)
-                        .with_thresholds(MIN_DB, MAX_DB, MAX_DB)
-                        .with_post_filter(POST_FILTER_BETA);
-                    let base = match DfTract::new(DfParams::default(), &params) {
-                        Ok(model) if model.hop_size == FRAME => model,
-                        Ok(model) => {
-                            flag.store(FAILED, Ordering::Release);
-                            return tracing::warn!(
-                                hop = model.hop_size,
-                                "DeepFilterNet hop is not 10 ms; no noise suppression"
-                            );
-                        }
+                    let mut model = match Model::embedded() {
+                        Ok(model) => model,
                         Err(e) => {
                             flag.store(FAILED, Ordering::Release);
                             return tracing::warn!("DeepFilterNet unavailable, no noise suppression: {e:#}");
@@ -173,26 +122,15 @@ mod deep {
                     };
                     // Frames it holds hold up the pipeline too.
                     let _priority = super::super::priority::Priority::promote();
-                    let mut live = base.clone();
-                    let mut limit = NO_LIMIT;
-                    let mut noisy = ndarray::Array2::<f32>::zeros((1, FRAME));
-                    let mut clean = ndarray::Array2::<f32>::zeros((1, FRAME));
                     flag.store(READY, Ordering::Release);
-                    while let Ok(Job { seq, mut frame, reset, limit_db }) = job_rx.recv() {
+                    while let Ok(Job { seq, mut frame, reset, strength }) = job_rx.recv() {
                         if reset {
-                            live = base.clone();
-                            limit = NO_LIMIT;
+                            model.reset();
                         }
-                        if limit_db != limit {
-                            live.set_atten_lim(limit_db);
-                            limit = limit_db;
-                        }
-                        noisy.row_mut(0).iter_mut().zip(frame.iter()).for_each(|(n, s)| *n = *s);
-                        if let Err(e) = live.process(noisy.view(), clean.view_mut()) {
+                        if let Err(e) = model.process(&mut frame, strength) {
                             flag.store(FAILED, Ordering::Release);
                             return tracing::warn!("DeepFilterNet failed: {e:#}");
                         }
-                        frame.iter_mut().zip(clean.row(0).iter()).for_each(|(s, c)| *s = c.clamp(-1.0, 1.0));
                         if done_tx.send(Done { seq, frame }).is_err() {
                             return;
                         }
@@ -271,13 +209,13 @@ mod deep {
 
         /// Cleans `chunk` in place, waiting [`PATIENCE`] at most; past that it is left as captured.
         /// The hand-over never blocks: the worker has taken every earlier frame unless one is late.
-        pub(super) fn process(&mut self, chunk: &mut [f32; FRAME], limit_db: f32) -> Outcome {
+        pub(super) fn process(&mut self, chunk: &mut [f32; FRAME], strength: NoiseSuppression) -> Outcome {
             let started = Instant::now();
             // Only after a late frame is the buffer still away.
             let mut frame = self.spare.take().unwrap_or_else(|| Box::new([0.0; FRAME]));
             frame.copy_from_slice(chunk);
             self.seq += 1;
-            let job = Job { seq: self.seq, frame, reset: std::mem::take(&mut self.reset), limit_db };
+            let job = Job { seq: self.seq, frame, reset: std::mem::take(&mut self.reset), strength };
             let cleaned = match self.jobs.try_send(job) {
                 Ok(()) => self.answer(chunk, started + self.patience),
                 // Still on the frame before the last: this one never reaches the model, whose
@@ -422,8 +360,7 @@ impl Denoiser {
         if fresh {
             worker.reset();
         }
-        let limit = mode.limit_db();
-        let end = frame.as_chunks_mut::<FRAME>().0.iter_mut().find_map(|chunk| match worker.process(chunk, limit) {
+        let end = frame.as_chunks_mut::<FRAME>().0.iter_mut().find_map(|chunk| match worker.process(chunk, mode) {
             deep::Outcome::Cleaned | deep::Outcome::Skipped => None,
             end => Some(end),
         });
@@ -466,13 +403,6 @@ mod tests {
         let original = frame;
         d.process(&mut frame, NoiseSuppression::OFF, true);
         assert_eq!(frame, original);
-    }
-
-    #[test]
-    fn strength_is_a_percentage() {
-        assert_eq!(NoiseSuppression::percent(250), NoiseSuppression::FULL);
-        assert_eq!(NoiseSuppression::percent(50).limit_db(), 25.0);
-        assert_eq!(NoiseSuppression::FULL.limit_db(), 100.0);
     }
 
     #[cfg(feature = "deep-filter")]

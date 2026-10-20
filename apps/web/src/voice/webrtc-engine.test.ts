@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { DenoiseEvents, DenoisePipeline } from "./denoise";
 import type { VoiceEngine } from "./engine";
 import { WebRtcVoiceEngine } from "./webrtc-engine";
+
+const startDenoise = vi.hoisted(() => vi.fn<(events: DenoiseEvents, signal: AbortSignal) => Promise<DenoisePipeline>>());
+vi.mock("./denoise", () => ({ startDenoise }));
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -55,7 +59,9 @@ beforeEach(() => {
   Peer.all = [];
   resume.mockReset().mockResolvedValue(undefined);
   mediaSource.mockClear();
-  getUserMedia.mockReset().mockResolvedValue(microphone().stream);
+  getUserMedia.mockReset().mockImplementation(async () => microphone().stream);
+  startDenoise.mockReset().mockRejectedValue(new Error("no AudioWorklet"));
+  vi.spyOn(console, "warn").mockImplementation(() => {});
   vi.stubGlobal("AudioContext", Context);
   vi.stubGlobal("RTCPeerConnection", Peer);
   vi.stubGlobal("window", { isSecureContext: true, addEventListener: vi.fn() });
@@ -67,6 +73,7 @@ afterEach(async () => {
   await engine.stop();
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe("browser voice run ownership", () => {
@@ -185,5 +192,230 @@ describe("browser microphone acquisition ownership", () => {
     await retry;
     expect(mic.track.stop).toHaveBeenCalledOnce();
     expect(mediaSource).not.toHaveBeenCalled();
+  });
+});
+
+describe("browser noise suppression", () => {
+  function pipeline(running = true) {
+    const fake = {
+      track: { enabled: true, id: "cleaned" } as unknown as MediaStreamTrack,
+      running,
+      setSource: vi.fn(),
+      setActive: vi.fn(),
+      setStrength: vi.fn(),
+      close: vi.fn(),
+    };
+    return fake;
+  }
+  const constraints = (call: number) => (getUserMedia.mock.calls[call] as unknown as [MediaStreamConstraints])[0].audio as MediaTrackConstraints;
+  const captured = (call: number) => (getUserMedia.mock.results[call]!.value as Promise<MediaStream>);
+  const sender = () => (Peer.all[0]!.addTransceiver.mock.results[0]!.value as { sender: { replaceTrack: ReturnType<typeof vi.fn> } }).sender;
+  async function loaded(model = pipeline()) {
+    let events!: DenoiseEvents;
+    startDenoise.mockImplementationOnce(async e => { events = e; return model as DenoisePipeline; });
+    await engine.start(params());
+    await flush();
+    return { model, events: () => events };
+  }
+
+  it("uses the browser's until the model has loaded, then sends the microphone through it", async () => {
+    const load = deferred<DenoisePipeline>();
+    startDenoise.mockReturnValueOnce(load.promise);
+    await engine.start(params());
+    expect(constraints(0).noiseSuppression).toBe(true);
+    const first = (await captured(0)).getAudioTracks()[0];
+    expect(sender().replaceTrack).toHaveBeenLastCalledWith(first);
+    const model = pipeline();
+    load.resolve(model as DenoisePipeline);
+    await flush();
+    expect(constraints(1).noiseSuppression).toBe(false);
+    expect(model.setSource).toHaveBeenCalledExactlyOnceWith(await captured(1));
+    expect(model.setStrength).toHaveBeenCalledWith(100);
+    expect(sender().replaceTrack).toHaveBeenLastCalledWith(model.track);
+  });
+
+  it("sends the microphone as captured until the capture context runs", async () => {
+    const { model, events } = await loaded(pipeline(false));
+    expect(sender().replaceTrack).toHaveBeenLastCalledWith((await captured(1)).getAudioTracks()[0]);
+    model.running = true;
+    events().changed();
+    await flush();
+    expect(sender().replaceTrack).toHaveBeenLastCalledWith(model.track);
+  });
+
+  it("idles the model while the microphone is not sent", async () => {
+    const { model } = await loaded();
+    engine.setMuted(true);
+    expect(model.setActive).toHaveBeenLastCalledWith(false);
+    expect(model.track.enabled).toBe(false);
+    engine.setMuted(false);
+    expect(model.setActive).toHaveBeenLastCalledWith(true);
+    expect(model.track.enabled).toBe(true);
+  });
+
+  it("falls back to the browser's for the rest of the page when the model has trouble", async () => {
+    const { model, events } = await loaded();
+    events().trouble("too slow: 4.0 ms a frame");
+    await flush();
+    expect(model.close).toHaveBeenCalledOnce();
+    expect(constraints(2).noiseSuppression).toBe(true);
+    expect(sender().replaceTrack).toHaveBeenLastCalledWith((await captured(2)).getAudioTracks()[0]);
+    await engine.stop();
+    await engine.start(params());
+    await flush();
+    expect(startDenoise).toHaveBeenCalledOnce();
+    expect(constraints(3).noiseSuppression).toBe(true);
+  });
+
+  it("keeps the browser's when the model cannot load", async () => {
+    await engine.start(params());
+    await flush();
+    expect(startDenoise).toHaveBeenCalledOnce();
+    expect(getUserMedia).toHaveBeenCalledOnce();
+    expect(constraints(0).noiseSuppression).toBe(true);
+  });
+
+  it("closes the model when suppression is turned off, and passes on strength changes", async () => {
+    const { model } = await loaded();
+    const options = { noiseSuppression: true, noiseStrength: 60, echoCancellation: true, autoGainControl: true };
+    await engine.setCaptureOptions(options);
+    expect(model.setStrength).toHaveBeenLastCalledWith(60);
+    expect(model.close).not.toHaveBeenCalled();
+    await engine.setCaptureOptions({ ...options, noiseSuppression: false });
+    expect(model.close).toHaveBeenCalledOnce();
+    expect(constraints(2).noiseSuppression).toBe(false);
+    expect(sender().replaceTrack).toHaveBeenLastCalledWith((await captured(2)).getAudioTracks()[0]);
+  });
+
+  it("cancels a load when its call ends, and the next call loads and uses its own", async () => {
+    const first = deferred<DenoisePipeline>(), second = deferred<DenoisePipeline>();
+    startDenoise.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+    await engine.start(params());
+    const cancelled = startDenoise.mock.calls[0]![1];
+    await engine.stop();
+    expect(cancelled.aborted).toBe(true);
+    await engine.start(params());
+    expect(startDenoise).toHaveBeenCalledTimes(2);
+    const stale = pipeline(), current = pipeline();
+    first.resolve(stale as DenoisePipeline);
+    await flush();
+    expect(stale.close).toHaveBeenCalledOnce();
+    expect(stale.setSource).not.toHaveBeenCalled();
+    second.resolve(current as DenoisePipeline);
+    await flush();
+    expect(current.close).not.toHaveBeenCalled();
+    expect(current.setSource).toHaveBeenCalledOnce();
+    expect(constraints(2).noiseSuppression).toBe(false);
+  });
+
+  it("cancels a load in progress when suppression is turned off", async () => {
+    startDenoise.mockReturnValueOnce(new Promise(() => {}));
+    await engine.start(params());
+    await engine.setCaptureOptions({ noiseSuppression: false, noiseStrength: 100, echoCancellation: true, autoGainControl: true });
+    expect(startDenoise.mock.calls[0]![1].aborted).toBe(true);
+  });
+
+  it("cancels the run before's load as soon as a new run starts", async () => {
+    const first = deferred<DenoisePipeline>();
+    startDenoise.mockReturnValueOnce(first.promise);
+    await engine.start(params());
+    const resumed = deferred<void>();
+    resume.mockReturnValueOnce(resumed.promise);
+    const replacing = engine.start(params());
+    expect(startDenoise.mock.calls[0]![1].aborted).toBe(true);
+    const stale = pipeline();
+    first.resolve(stale as DenoisePipeline);
+    await flush();
+    expect(stale.close).toHaveBeenCalledOnce();
+    expect(getUserMedia).toHaveBeenCalledOnce();
+    resumed.resolve();
+    await replacing;
+    expect(startDenoise).toHaveBeenCalledTimes(2);
+  });
+
+  it("sends the model's track when it loads while the call's first track is being attached", async () => {
+    const attached = deferred<void>();
+    vi.stubGlobal("RTCPeerConnection", class extends Peer {
+      override addTransceiver = vi.fn(() => ({ sender: { replaceTrack: vi.fn(async () => {}) } }));
+      constructor() {
+        super();
+        this.addTransceiver.mockImplementationOnce(() => ({ sender: { replaceTrack: vi.fn().mockReturnValueOnce(attached.promise).mockResolvedValue(undefined) } }));
+      }
+    });
+    const load = deferred<DenoisePipeline>();
+    startDenoise.mockReturnValueOnce(load.promise);
+    const starting = engine.start(params());
+    await flush();
+    const first = (await captured(0)).getAudioTracks()[0]!;
+    expect(sender().replaceTrack).toHaveBeenLastCalledWith(first);
+    const model = pipeline();
+    load.resolve(model as DenoisePipeline);
+    await flush();
+    expect(first.stop).toHaveBeenCalled();
+    attached.resolve();
+    await starting;
+    expect(sender().replaceTrack).toHaveBeenLastCalledWith(model.track);
+  });
+
+  it("sends what fits the capture context's state once replacements in progress are done", async () => {
+    const replaced = deferred<void>();
+    let hold = false;
+    const peerSender = { track: null as MediaStreamTrack | null, replaceTrack: vi.fn(async (track: MediaStreamTrack) => {
+      if (hold) { hold = false; await replaced.promise; }
+      peerSender.track = track;
+    }) };
+    vi.stubGlobal("RTCPeerConnection", class extends Peer {
+      override addTransceiver = vi.fn(() => ({ sender: { replaceTrack: vi.fn(async () => {}) } }));
+      constructor() {
+        super();
+        this.addTransceiver.mockImplementationOnce(() => ({ sender: peerSender as never }));
+      }
+    });
+    const { model, events } = await loaded(pipeline(false));
+    const raw = (await captured(1)).getAudioTracks()[0]!;
+    expect(peerSender.track).toBe(raw);
+    // Running: the model's track is on its way when Safari interrupts the context again.
+    hold = true;
+    model.running = true;
+    events().changed();
+    await flush();
+    model.running = false;
+    events().changed();
+    await flush();
+    replaced.resolve();
+    await flush();
+    expect(peerSender.track).toBe(raw);
+  });
+
+  it("does not hold the next call behind a replacement its closed peer left unsettled", async () => {
+    vi.stubGlobal("RTCPeerConnection", class extends Peer {
+      constructor() {
+        super();
+        if (Peer.all.length > 1) return;
+        // The first call's sender settles its first replacement, never the next.
+        const replaceTrack = vi.fn().mockResolvedValueOnce(undefined).mockReturnValue(new Promise(() => {}));
+        this.addTransceiver.mockImplementationOnce(() => ({ sender: { replaceTrack } }));
+      }
+    });
+    const { model, events } = await loaded(pipeline(false));
+    model.running = true;
+    events().changed();
+    await flush();
+    await engine.stop();
+    await engine.start(params());
+    expect(Peer.all[1]!.createOffer).toHaveBeenCalledOnce();
+    expect(Peer.all[1]!.setRemoteDescription).toHaveBeenCalledOnce();
+  });
+
+  it("closes a model that loads after the call ended", async () => {
+    const load = deferred<DenoisePipeline>();
+    startDenoise.mockReturnValueOnce(load.promise);
+    await engine.start(params());
+    await engine.stop();
+    const model = pipeline();
+    load.resolve(model as DenoisePipeline);
+    await flush();
+    expect(model.close).toHaveBeenCalledOnce();
+    expect(getUserMedia).toHaveBeenCalledOnce();
   });
 });

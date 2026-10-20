@@ -10,7 +10,7 @@ export type InputMode = "vad" | "ptt";
 
 export interface CaptureOptions {
   noiseSuppression: boolean;
-  /** Percent, 10..100. Only the desktop engine has a choice; the browser's suppression is its own. */
+  /** Percent, 10..100: how hard Gwar's own suppression works (the browser's, a fallback, has no setting). */
   noiseStrength: number;
   echoCancellation: boolean;
   autoGainControl: boolean;
