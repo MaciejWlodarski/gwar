@@ -280,7 +280,7 @@ The largest keyframe was 204 KB at 1080p60, about 175 packets in a burst.
 | Encode | 2–15 ms (spike: VP9 3.6–5 ms, H.264 SW 5–15 ms, AV1 2.3 ms at 720p) |
 | Pacing (keyframe bursts) | 0–20 ms |
 | Network, sharer → SFU → viewer | RTT-dependent, 10–60 ms in region |
-| SFU | < 1 ms: no reordering buffer; the pacer queue is normally empty and is capped at 150 ms ([Queues](#queues)) |
+| SFU | < 1 ms when the viewer's allocation exceeds the share's rate; a keyframe is spread over size ÷ (1.25 × allocation), e.g. 30 ms for 200 KB at 40 Mbps or 160 ms at 8 Mbps; hard limit 300 ms, then the frame is evicted ([Queues](#queues)) |
 | Jitter buffer | 5–50 ms (spike: 5–53 ms on loopback) |
 | Decode + render | 2–20 ms (one display refresh) |
 
@@ -436,7 +436,8 @@ is captured at negotiation and re-checked on every forward, like
 
 Limits are enforced continuously, not only when a share or watch is admitted:
 
-- **Per share, ingress.** Two token buckets, checked before forwarding:
+- **Per share, ingress.** Two token buckets plus a frame bound, all enforced
+  **per packet, on arrival** ("Ingress enforcement" below):
   - bytes: rate 1.25 × the share's cap, burst 512 KB (two 1080p keyframes);
   - packets: rate 2,000 per second, burst 600.
 
@@ -457,11 +458,44 @@ Limits are enforced continuously, not only when a share or watch is admitted:
   - At most 4 `screen.*.offer` per session per minute.
   - At most `shares_per_server` publish transports (default 32) and one watch
     transport per session.
-- **Dropping is frame-granular.** When a bucket or the budget forces a drop,
-  the SFU drops from the next frame start (a new RTP timestamp with the
-  descriptor's start bit) onward. It marks the slot **waiting for keyframe**
-  and forwards nothing to it until a keyframe arrives, which the throttled PLI
-  rule below requests. No partial frame is ever forwarded.
+- **Dropping leads to a keyframe.** Every drop, whether from an ingress limit,
+  the budget, a queue deadline or a pause, marks the affected share or slot
+  **waiting for keyframe**. Nothing more is forwarded to it until a keyframe's
+  first packet, which the throttled keyframe rule below requests.
+  - A frame whose first packets were already forwarded may end incomplete. That
+    is allowed: a viewer's jitter buffer never decodes an incomplete frame, and
+    the next segment starts at a keyframe.
+  - No buffering of whole frames is needed for this.
+
+### Ingress enforcement
+
+Limits apply to each packet as it arrives (option (a) of the review). The SFU
+does not assemble frames before forwarding.
+
+- A packet that does not fit the share's byte or packet bucket is dropped at
+  once, and so is every later packet of the share, until the next keyframe
+  starts.
+  - The SFU recognizes a frame by its RTP timestamp. It recognizes a keyframe
+    start by the clear payload descriptor: VP9's start-of-frame bit with P = 0,
+    or VP8's S bit with partition 0 and the key bit of the clear payload
+    header byte.
+  - The share's earlier packets of that frame stay forwarded, so the frame is
+    incomplete.
+  - The share goes to *waiting for keyframe* for **all** its slots, and one
+    throttled PLI goes to the publisher.
+- **The server bounds frames.** One RTP timestamp may carry at most 512 KB
+  (the byte burst), at most 600 packets (the packet burst), and must end, by a
+  marker bit or a new timestamp, within 500 ms of its first packet.
+  - A packet that breaks any of these is treated exactly like a bucket overrun.
+  - So a publisher that sends continuations without ever starting a new frame
+    is cut off after 500 ms at most. It cannot postpone the drop.
+- **Repeated overruns end the share.** Three overruns of one share within 10 s
+  stop it with `screen.stopped {reason: "limit"}`. An honest sharer's frames
+  fit far inside these bounds: the largest frame measured was 204 KB, a
+  1080p60 keyframe (S3). Without this rule, a keyframe that can never fit
+  would loop through drops and requests.
+- **Packet-level overshoot is zero.** A packet is either within the buckets
+  when it arrives or it is dropped. Nothing waits for a frame boundary.
 
 ### Forwarding: stable sequence mapping
 
@@ -483,7 +517,7 @@ Each viewer slot keeps a **segment**: `(base_src, base_out)` and a
     first-time packet;
   - retransmissions map consistently.
 - A new segment starts at slot assignment, and when resuming after a pause or
-  a frame-granular drop. It always starts at a keyframe's first packet:
+  a drop. It always starts at a keyframe's first packet:
   `base_src` is that packet's `src`, and `base_out` is the slot's highest
   `out` + 1 + 64. The jump makes the viewer treat the hole as an old loss, and
   the keyframe makes it irrelevant.
@@ -505,21 +539,71 @@ end-to-end layer.
 
 ### Queues
 
-Writes do queue: `write_rtp` puts packets into str0m's send queue. With BWE
-enabled, a leaky-bucket pacer drains it. The pacer's 2 s queue limit makes it
-*send faster*, not drop (`pacer/leaky.rs`). The queue cannot be cleared from
-outside str0m. So the SFU controls what goes in:
+str0m's own pacer cannot give a bound:
 
-- before writing a frame's first packet to a slot, it reads the stream's
-  `queue_info()`;
-- when the oldest unsent packet is more than 150 ms old, or more than 256 KB
-  are queued, it drops that frame for that slot and the slot waits for a
-  keyframe, as above;
-- packets already queued drain at pacing rate, which is the bounded leftover
-  of at most 150 ms or 256 KB.
+- with BWE enabled, `write_rtp` queues video into str0m's leaky-bucket pacer;
+- when the queue grows, the pacer **raises its rate** to drain within 2 s,
+  rather than expiring packets (`pacer/leaky.rs`, the `queue_limit` logic);
+- the queue cannot be cleared through the public API;
+- `queue_info()` is a cached sample.
 
-On pause, the slot stops receiving writes immediately, and the residue drains
-within that bound. Unpaced streams (`set_unpaced`) are not used for video.
+So the SFU does not let str0m queue video. It owns the queue instead:
+
+- **Video streams are unpaced.** Every forwarded video `StreamTx` gets
+  `set_unpaced(true)`. The pacer then sends unpaced packets on the next
+  `poll_output`, without holding them (`pacer/leaky.rs`: "Unpaced packets …
+  are sent immediately"; str0m uses this for audio by default). str0m's BWE
+  still runs from TWCC feedback, and its padding probes still go through the
+  pacer.
+- **A Gwar-owned queue per viewer slot.** Packets wait in the screen task, in
+  a per-viewer queue.
+  - A per-viewer leaky bucket releases them at 1.25 × the slot's
+    allocation from "Bandwidth allocation per viewer", so a keyframe is spread
+    out rather than sent as one burst.
+  - Released packets go to `write_rtp` and leave on the same iteration's poll.
+  - Nothing else holds video between the SFU and the socket.
+- **Hard deadline.** Each packet gets `deadline = arrival + 300 ms`. A packet
+  still queued at its deadline is evicted with every later packet of its frame,
+  and the slot waits for a keyframe.
+  - No video packet leaves the SFU more than 300 ms after it arrived, whatever
+    the bandwidth does.
+  - If a keyframe cannot fit within the deadline at the slot's allocation
+    (more than 300 ms × release rate, for example 204 KB at a release rate under
+    5.4 Mbps, that is, an allocation under 4.4 Mbps), the SFU
+    pauses that share for that viewer instead of retrying. "Bandwidth
+    allocation per viewer" covers this pause.
+- **Bounded admission.** A packet enters the queue only if the queued bytes
+  stay at or under `max(64 KB, 300 ms × release rate)`. Otherwise it is
+  dropped like an eviction. Overshoot is therefore zero: the bound is checked
+  per packet, not per frame.
+- **Pause and drop clear the queue.** The SFU owns it, so pausing or
+  unwatching a slot discards its queue at once.
+  - Only packets released to str0m in the current loop iteration can still
+    go out.
+  - A paused viewer receives no media older than that iteration.
+- **Repairs are bounded too.** Each video `StreamTx` gets
+  `set_rtx_cache(1024 packets, 300 ms, Some(0.15))`. str0m does not answer a
+  NACK for a packet older than 300 ms, and it clears queued resends when they
+  exceed 15 % of the traffic. Retransmissions are not in the Gwar queue: they
+  go out unpaced and are bounded by these numbers.
+- **Measured, not sampled.** The Gwar queue's bytes and oldest age come from
+  its own bookkeeping; `queue_info()` is not used for decisions.
+- **Fallback if this proves wrong.** If PR 3's tests show unpaced writes or
+  probing misbehave, the bound is enforced by rebuilding the viewer's watch
+  transport: a new `run` and a new `Rtc`, which discards every str0m queue.
+  It is heavier (one DTLS handshake, all four slots restart from keyframes),
+  but it is a hard bound with the public API.
+
+Tests in PR 3, with str0m viewers behind the relay's `rate=` bottleneck:
+
+- **A 300 KB keyframe at 2 Mbps.** It is evicted at the deadline, and the
+  share is paused for that viewer. No packet arrives more than 300 ms after
+  the SFU received it.
+- **A bandwidth collapse from 10 to 1 Mbps mid-share.** The queue never holds
+  packets past their deadline, the viewer is paused within the allocation
+  rule's 5 s, and no stale video arrives after the pause.
+- **Pause and unwatch.** No media packet for the slot is sent after the
+  iteration that paused it. Repairs stop within the 300 ms repair age.
 
 ### Keyframes
 
@@ -727,12 +811,14 @@ So:
   times. After that the card shows "Reconnecting to the share…" and the viewer
   re-watches. All of this goes through the server's per-share throttle and the
   per-viewer budget, so it cannot amplify.
-- **Sender side:** right after a sharer activates a new epoch, it asks its own
-  encoder for a keyframe, through `generateKeyFrame()` on the worker's
-  `RTCRtpScriptTransformer` (WebRTC Encoded Transform spec). Where an engine
-  lacks it (PR 5 checks all three), the viewers' requests cover it. That
-  keyframe is the first frame under the new key, so viewers that already have
-  the key never see a gap.
+- **Sender side, best effort only.** Right after a sharer activates a new
+  epoch, it calls `generateKeyFrame()` on the worker's
+  `RTCRtpScriptTransformer` where that exists.
+  - MDN's browser-compat-data lists it as unavailable in Chromium.
+  - The spec's request is asynchronous, so the first frames under the new key
+    may still be delta frames.
+  - It only shortens recovery. **The viewer-side requests above carry the
+    guarantee.**
 
 ### Frame layout
 
@@ -963,7 +1049,9 @@ person.
    - Share admission: the `ScreenOrigin` binding and byte/packet buckets.
    - Slot assignment, `screen.watch`/`unwatch`/`focus` and `screen.slot`.
    - Stable sequence mapping with segments, and timestamp offsets.
-   - Frame-granular drops with wait-for-keyframe, queue-age control, the one
+   - Per-packet ingress enforcement with frame bounds; the Gwar-owned
+     per-viewer queue with unpaced streams, 300 ms deadlines, bounded
+     admission and RTX cache limits; wait-for-keyframe; the one
      keyframe throttle, and NACK/RTX.
    - Per-viewer aggregate allocation with pause/resume.
    - Cap-based reservations, continuous egress measurement and negotiation
@@ -979,7 +1067,15 @@ person.
      - stale packets after a drop never cross a segment;
      - unknown and stale-share SSRCs drop;
      - a stopped share frees slots;
-     - the keyframe throttle holds under a request flood.
+     - the keyframe throttle holds under a request flood;
+     - **a bucket emptying mid-frame**: the forwarded prefix stays, the rest
+       of the frame and later deltas drop, the next keyframe starts a new
+       segment, and the publisher receives one PLI;
+     - **missing frame boundaries**: a publisher sending one timestamp past
+       512 KB, 600 packets or 500 ms is cut at the bound, and three such
+       overruns in 10 s stop the share;
+     - the queue tests in "Queues": a large keyframe, a bandwidth collapse,
+       and pause/unwatch.
    - **Voice acceptance:** the paired measurements and gate in "Voice headroom
      and acceptance", including the `LATENCY_NET` `rate=` option and the
      screen load generator.
