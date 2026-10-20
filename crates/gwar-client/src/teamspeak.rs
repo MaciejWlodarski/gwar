@@ -20,8 +20,8 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use futures::StreamExt;
 use gwar_proto::{
-    Channel, ChatMessage, ChatTarget, Client, ClientUpdate, ErrorBody, ErrorCode, Event, LeaveReason, Permission,
-    Platform, Request, ServerInfo, SessionId, Welcome,
+    Channel, ChannelId, ChatMessage, ChatTarget, Client, ClientUpdate, ErrorBody, ErrorCode, Event, LeaveReason,
+    MessageId, Permission, Platform, Request, ServerInfo, SessionId, Welcome,
 };
 use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
@@ -450,6 +450,103 @@ fn refused(message: impl Into<String>) -> ErrorBody {
     ErrorBody::new(ErrorCode::BadRequest, message)
 }
 
+/// What a successful TeamSpeak command answers, in the `gwar/1` response shape
+/// the UI checks every reply against (`apps/web/src/net/schema.ts`).
+#[derive(Debug, Clone, PartialEq)]
+enum Reply {
+    Empty,
+    /// Moving into the channel we are already in counts as done.
+    Join,
+    /// `chat.send`: our own message. TeamSpeak's echo of it is dropped, so this is its one copy.
+    Message(ChatTarget, String),
+    /// `channel.create`: the new channel, once the book shows it.
+    Created {
+        parent: Option<ChannelId>,
+        name: String,
+    },
+    /// `channel.update`: the channel as it is now.
+    Channel(ChannelId),
+    /// `token.redeem`: our server groups now.
+    Groups,
+}
+
+fn reply_for(request: &Request) -> Reply {
+    match request {
+        Request::ChannelJoin { .. } => Reply::Join,
+        Request::ChatSend { target, text, .. } => Reply::Message(target.clone(), text.clone()),
+        Request::ChannelCreate(c) => Reply::Created { parent: c.parent, name: c.name.clone() },
+        Request::ChannelUpdate(u) => Reply::Channel(u.channel),
+        Request::TokenRedeem { .. } => Reply::Groups,
+        _ => Reply::Empty,
+    }
+}
+
+/// Our own message as everyone in its target sees it.
+fn own_message(view: &View, own: u16, id: MessageId, target: ChatTarget, text: String) -> ChatMessage {
+    let me = view.clients.get(&u32::from(own));
+    ChatMessage {
+        signature: None,
+        id,
+        target,
+        author: u32::from(own),
+        author_uid: me.map(|c| c.uid.clone()).filter(|uid| !uid.is_empty()).unwrap_or_else(|| "ts:unknown".into()),
+        author_name: me.map(|c| c.nickname.clone()).unwrap_or_default(),
+        text,
+        sent_at: now_ms(),
+        mentions: Vec::new(),
+        attachments: Vec::new(),
+        edited_at: None,
+    }
+}
+
+/// The answer to a successful command; `None` while the book does not show its result yet.
+fn answer(reply: &Reply, view: &View, own: u16) -> Option<Result<Value, ErrorBody>> {
+    let value = |c: &Channel| serde_json::to_value(c).map_err(|e| ErrorBody::new(ErrorCode::Internal, e.to_string()));
+    match reply {
+        Reply::Empty | Reply::Join | Reply::Message(..) => Some(Ok(json!({}))),
+        Reply::Created { parent, name } => {
+            view.channels.values().find(|c| c.parent == *parent && c.name == *name).map(value)
+        }
+        Reply::Channel(id) => match view.channels.get(id) {
+            Some(channel) => Some(value(channel)),
+            None => Some(Err(ErrorBody::new(ErrorCode::NotFound, "that channel no longer exists"))),
+        },
+        Reply::Groups => Some(Ok(
+            json!({ "groups": view.clients.get(&u32::from(own)).map(|c| c.groups.clone()).unwrap_or_default() }),
+        )),
+    }
+}
+
+/// A refused TeamSpeak command as a `gwar/1` error the UI explains.
+fn command_error(error: &tsclientlib::CommandError) -> ErrorBody {
+    use tsclientlib::TsError;
+    let code = match error.error {
+        TsError::ChannelInvalidPassword => ErrorCode::WrongPassword,
+        TsError::ChannelMaxclientsReached | TsError::ChannelMaxfamilyReached => ErrorCode::ChannelFull,
+        TsError::PermissionsClientInsufficient
+        | TsError::PermissionsInsufficientGroupPower
+        | TsError::PermissionsInsufficientPermissionPower
+        | TsError::Permissions => ErrorCode::Forbidden,
+        TsError::ChannelInvalidId | TsError::ClientInvalidId => ErrorCode::NotFound,
+        TsError::ChannelNameInuse => ErrorCode::Conflict,
+        TsError::ClientIsFlooding => ErrorCode::RateLimited,
+        _ => ErrorCode::BadRequest,
+    };
+    ErrorBody::new(code, format!("TeamSpeak: {}", readable(&error.error)))
+}
+
+/// `ChannelMaxclientsReached` -> `channel maxclients reached`.
+fn readable(error: &tsclientlib::TsError) -> String {
+    let mut out = String::new();
+    for c in format!("{error:?}").chars() {
+        if c.is_uppercase() && !out.is_empty() {
+            out.push(' ');
+        }
+        out.extend(c.to_lowercase());
+    }
+    out
+}
+
 /// Translates a `gwar/1` request into a TS command; `Ok(None)` = answered locally.
 fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Option<OutCommand>, ErrorBody> {
     let cmd = match request {
@@ -616,6 +713,9 @@ fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Option<Out
 /// Speakers count as talking this long after their last frame.
 const TALKING: Duration = Duration::from_millis(300);
 
+/// How long a done command waits for the book to show its result.
+const RESULT_WAIT: Duration = Duration::from_secs(5);
+
 async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
     let mut builder = TsConnection::build(options.address)
         .name(options.nickname)
@@ -704,7 +804,10 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
         return;
     }
 
-    let mut pending: HashMap<MessageHandle, oneshot::Sender<Result<Value, ErrorBody>>> = HashMap::new();
+    type ReplyTx = oneshot::Sender<Result<Value, ErrorBody>>;
+    let mut pending: HashMap<MessageHandle, (Reply, ReplyTx)> = HashMap::new();
+    // Done on the server, answered once the book shows the result (or given up on).
+    let mut done: Vec<(Reply, ReplyTx, Instant)> = Vec::new();
     let mut slots = SlotMap::new();
     let mut mic_packet: u16 = 0;
     let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -735,6 +838,10 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                     book_changed = true;
                     for event in events {
                         if let BookEvent::Message { target, invoker, message } = event {
+                            // Our own messages come from the `chat.send` reply, whether or not TeamSpeak echoes them.
+                            if invoker.id.0 == own {
+                                continue;
+                            }
                             let target = match target {
                                 MessageTarget::Channel => ChatTarget::Channel(
                                     view.clients.get(&u32::from(own)).and_then(|c| c.channel).unwrap_or(0),
@@ -795,11 +902,20 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                     }
                 }
                 StreamItem::MessageResult(handle, result) => {
-                    if let Some(reply) = pending.remove(&handle) {
-                        let _ = reply.send(match result {
-                            Ok(()) => Ok(json!({})),
-                            Err(e) => Err(ErrorBody::new(ErrorCode::Forbidden, e.to_string())),
-                        });
+                    if let Some((expected, reply)) = pending.remove(&handle) {
+                        match result {
+                            Ok(()) => {
+                                // Answered from a fresh view below.
+                                book_changed = true;
+                                done.push((expected, reply, Instant::now()));
+                            }
+                            Err(e) if expected == Reply::Join && e.error == tsclientlib::TsError::ChannelAlreadyIn => {
+                                let _ = reply.send(Ok(json!({})));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(command_error(&e)));
+                            }
+                        }
                     }
                 }
                 StreamItem::DisconnectedTemporarily(_) => {}
@@ -814,7 +930,7 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                     }
                     Ok(Some(cmd)) => match cmd.send_with_result(&mut con) {
                         Ok(handle) => {
-                            pending.insert(handle, reply);
+                            pending.insert(handle, (reply_for(&request), reply));
                         }
                         Err(e) => {
                             let _ = reply.send(Err(ErrorBody::new(ErrorCode::Unavailable, e.to_string())));
@@ -866,6 +982,28 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                         client: None,
                     });
                 }
+            }
+        }
+        // Answers wait for the view that shows their result; one TeamSpeak never shows gives up.
+        for (expected, reply, at) in std::mem::take(&mut done) {
+            if let Reply::Message(target, text) = expected {
+                next_message = next_message.wrapping_add(1).max(1 << 31);
+                let message = own_message(&view, own, next_message, target, text);
+                let _ = reply.send(
+                    serde_json::to_value(&message).map_err(|e| ErrorBody::new(ErrorCode::Internal, e.to_string())),
+                );
+                out.push(Event::ChatMessage(message));
+                continue;
+            }
+            match answer(&expected, &view, own) {
+                Some(result) => {
+                    let _ = reply.send(result);
+                }
+                None if at.elapsed() > RESULT_WAIT => {
+                    let _ =
+                        reply.send(Err(ErrorBody::new(ErrorCode::Unavailable, "TeamSpeak did not show the result")));
+                }
+                None => done.push((expected, reply, at)),
             }
         }
         for event in out {
@@ -948,6 +1086,98 @@ mod tests {
         };
         assert!(matches!(translate(&request, 1, 4), Err(e) if e.code == ErrorCode::Forbidden));
         assert!(matches!(translate(&Request::Ping {}, 1, 4), Ok(None)));
+    }
+
+    fn view() -> View {
+        let mut view = View::default();
+        view.channels.insert(
+            7,
+            Channel {
+                id: 7,
+                parent: Some(1),
+                name: "Seven".into(),
+                topic: String::new(),
+                position: 0,
+                has_password: true,
+                max_clients: Some(2),
+                encrypted: false,
+                history: false,
+                private: false,
+                access: None,
+                overrides: Vec::new(),
+                synced: false,
+            },
+        );
+        view.clients.insert(
+            3,
+            Client {
+                id: 3,
+                uid: "ts:me".into(),
+                nickname: "me".into(),
+                channel: Some(7),
+                groups: vec![6, 8],
+                platform: Platform::Ts3,
+                muted: false,
+                deafened: false,
+                away: None,
+                talking: false,
+                voice: true,
+                voice_binding: None,
+                server_muted: false,
+                server_deafened: false,
+            },
+        );
+        view
+    }
+
+    #[test]
+    fn done_commands_answer_in_gwar_response_shapes() {
+        let view = view();
+        let send = Request::ChatSend {
+            signature: gwar_proto::MessageSignature::default(),
+            target: ChatTarget::Channel(7),
+            text: "hi".into(),
+            mentions: Vec::new(),
+            attachments: Vec::new(),
+        };
+        let Reply::Message(target, text) = reply_for(&send) else { panic!("chat.send answers with the message") };
+        let message = own_message(&view, 3, 1 << 31, target, text);
+        let message: ChatMessage = serde_json::from_value(serde_json::to_value(&message).unwrap()).unwrap();
+        assert_eq!((message.author, message.author_uid.as_str(), message.author_name.as_str()), (3, "ts:me", "me"));
+        assert_eq!((message.target, message.text.as_str()), (ChatTarget::Channel(7), "hi"));
+
+        // A new channel is answered once the book shows it.
+        let create = Reply::Created { parent: Some(1), name: "Seven".into() };
+        assert_eq!(answer(&create, &View::default(), 3), None);
+        let created: Channel = serde_json::from_value(answer(&create, &view, 3).unwrap().unwrap()).unwrap();
+        assert_eq!(created.id, 7);
+        let updated = answer(
+            &reply_for(&Request::ChannelUpdate(gwar_proto::ChannelUpdate { channel: 7, ..Default::default() })),
+            &view,
+            3,
+        );
+        assert_eq!(serde_json::from_value::<Channel>(updated.unwrap().unwrap()).unwrap().id, 7);
+        assert!(matches!(answer(&Reply::Channel(9), &view, 3), Some(Err(e)) if e.code == ErrorCode::NotFound));
+        let redeem = reply_for(&Request::TokenRedeem { token: "t".into() });
+        assert_eq!(answer(&redeem, &view, 3), Some(Ok(json!({ "groups": [6, 8] }))));
+        assert_eq!(
+            answer(&reply_for(&Request::ChannelJoin { channel: 7, password: None }), &view, 3),
+            Some(Ok(json!({})))
+        );
+    }
+
+    #[test]
+    fn teamspeak_refusals_keep_their_meaning() {
+        use tsclientlib::TsError;
+        let refused = |error| command_error(&tsclientlib::CommandError { error, missing_permission: None });
+        assert_eq!(refused(TsError::ChannelInvalidPassword).code, ErrorCode::WrongPassword);
+        assert_eq!(refused(TsError::ChannelMaxclientsReached).code, ErrorCode::ChannelFull);
+        assert_eq!(refused(TsError::ChannelMaxfamilyReached).code, ErrorCode::ChannelFull);
+        // A needed join power above ours, or no b_channel_join_* for this kind of channel.
+        assert_eq!(refused(TsError::PermissionsClientInsufficient).code, ErrorCode::Forbidden);
+        assert_eq!(refused(TsError::ClientIsFlooding).code, ErrorCode::RateLimited);
+        let other = refused(TsError::ChannelNotEmpty);
+        assert_eq!((other.code, other.message.as_str()), (ErrorCode::BadRequest, "TeamSpeak: channel not empty"));
     }
 }
 

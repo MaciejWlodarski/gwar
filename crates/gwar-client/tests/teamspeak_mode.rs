@@ -16,10 +16,11 @@ use gwar_client::voice::{
 use rtrb::RingBuffer;
 
 use gwar_client::{
-    ConnectOptions, Identity, connect,
+    ClientError, ConnectOptions, Identity, connect,
     teamspeak::{self},
 };
-use gwar_proto::{Channel, ChannelId, ChatTarget, ClientSoftware, Event, Platform, Request};
+use gwar_proto::{Channel, ChannelId, ChatTarget, ClientSoftware, ErrorCode, Event, Platform, Request};
+use gwar_server::teamspeak::query::{Cmd, Query};
 use tokio::time::timeout;
 
 async fn until(events: &mut tokio::sync::mpsc::Receiver<Event>, pred: impl Fn(&Event) -> bool) -> Event {
@@ -247,6 +248,98 @@ async fn teamspeak_users_get_attachment_links_and_can_be_banned() {
     })
     .await;
     assert!(again.is_err(), "banned TeamSpeak users can't come back");
+}
+
+/// Password channels behave as on TeamSpeak: the password is asked for only when the server
+/// refuses, Server Admins enter without one, and chat is answered like on a Gwar server.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn teamspeak_mode_password_channels_admins_and_chat_replies() {
+    let Some(bridged) = support::start().await else { return };
+    let token = bridged.server.admin_token.clone().expect("fresh server");
+    let alice = connect(ConnectOptions {
+        url: format!("ws://{}/ws", bridged.server.http),
+        nickname: "alice".into(),
+        invite: None,
+        certificate: None,
+        expected_server_key: None,
+        trust_on_first_use: true,
+        insecure_lan: false,
+        server_password: None,
+        identity: Identity::generate(),
+        software: ClientSoftware { name: "t".into(), version: "0".into(), platform: Platform::Web },
+    })
+    .await
+    .unwrap();
+    alice.connection.request(Request::TokenRedeem { token }).await.unwrap();
+    // The bridge gives the TeamSpeak channel the same password.
+    alice
+        .connection
+        .request(Request::ChannelCreate(gwar_proto::ChannelCreate {
+            name: "Secret".into(),
+            password: Some("hunter2".into()),
+            ..Default::default()
+        }))
+        .await
+        .unwrap();
+
+    let mut ts = support::ts_client(bridged.ts_voice, "bob").await;
+    let secret = match ts.welcome.channels.iter().find(|c| c.name == "Secret") {
+        Some(channel) => channel.clone(),
+        None => match until(&mut ts.events, |e| matches!(e, Event::ChannelCreated(c) if c.name == "Secret")).await {
+            Event::ChannelCreated(channel) => channel,
+            _ => unreachable!(),
+        },
+    };
+    assert!(secret.has_password, "{secret:?}");
+    let join = |password: Option<&str>| Request::ChannelJoin { channel: secret.id, password: password.map(Into::into) };
+    for password in [None, Some("wrong")] {
+        let refused = ts.handle.request(join(password)).await.unwrap_err();
+        assert!(matches!(&refused, ClientError::Server(e) if e.code == ErrorCode::WrongPassword), "{refused:?}");
+    }
+    ts.handle.request(join(Some("hunter2"))).await.unwrap();
+    // Joining the channel I am already in is no error.
+    ts.handle.request(join(None)).await.unwrap();
+
+    // `chat.send` answers with the message, which arrives exactly once.
+    let send = |text: &str| Request::ChatSend {
+        signature: gwar_proto::MessageSignature::default(),
+        target: ChatTarget::Channel(secret.id),
+        text: text.into(),
+        mentions: Vec::new(),
+        attachments: Vec::new(),
+    };
+    let sent: gwar_proto::ChatMessage =
+        serde_json::from_value(ts.handle.request(send("only once")).await.unwrap()).unwrap();
+    assert_eq!((sent.author, sent.text.as_str()), (ts.welcome.session, "only once"));
+    ts.handle.request(send("marker")).await.unwrap();
+    let mut copies = Vec::new();
+    timeout(Duration::from_secs(15), async {
+        loop {
+            match ts.events.recv().await.expect("events ended") {
+                Event::ChatMessage(m) if m.text == "marker" => break,
+                Event::ChatMessage(m) if m.text == "only once" => copies.push(m),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("my own messages arrive");
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    assert_eq!((copies[0].id, &copies[0].author_uid), (sent.id, &sent.author_uid));
+
+    // A Server Admin (b_channel_join_ignore_password) needs no password.
+    let carol = support::ts_client(bridged.ts_voice, "carol").await;
+    let (query, _notifications) =
+        Query::connect(bridged.query, "serveradmin", &bridged.query_password(), 1).await.unwrap();
+    let clients = query.call(Cmd::new("clientlist")).await.unwrap();
+    let cldbid = clients
+        .iter()
+        .find(|c| c.get("client_nickname").is_some_and(|n| n == "carol"))
+        .and_then(|c| c.get("client_database_id"))
+        .expect("carol on TeamSpeak")
+        .to_owned();
+    query.call(Cmd::new("servergroupaddclient").arg("sgid", 6).arg("cldbid", &cldbid)).await.unwrap();
+    carol.handle.request(join(None)).await.unwrap();
 }
 
 struct FakeIo {
