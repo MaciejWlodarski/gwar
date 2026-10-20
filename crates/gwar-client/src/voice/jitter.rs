@@ -56,18 +56,26 @@ struct Mark {
 struct Span {
     head: u64,
     end: u64,
-    /// Samples per key stride under the sequence clock.
-    samples: u64,
+    /// Sequence clock only: the packets queued at the time, as (key, samples). Its keys step
+    /// one stride per packet whatever the duration, so only these say how much audio a
+    /// stretch of keys held.
+    queued: Vec<(u64, u64)>,
+    /// Sequence clock only: the duration assumed for a stride with no packet, the shortest
+    /// one seen then (conservative for mixed 10/20 ms streams).
+    hole: u64,
     resolved: bool,
 }
 
 impl Mark {
     fn margin(&self, clock: Clock) -> u64 {
-        let buffered = self.span.as_ref().map_or(0, |span| {
-            let keys = span.end.saturating_sub(span.head);
-            match clock {
-                Clock::Rtp => keys,
-                Clock::Sequence => keys / FRAME * span.samples,
+        let buffered = self.span.as_ref().map_or(0, |span| match clock {
+            // RTP keys are sample positions: holes included, the span is the audio.
+            Clock::Rtp => span.end.saturating_sub(span.head),
+            Clock::Sequence => {
+                let inside = span.queued.iter().filter(|(key, _)| (span.head..span.end).contains(key));
+                let (present, packets) = inside.fold((0, 0), |(sum, n), (_, samples)| (sum + samples, n + 1));
+                let strides = span.end.saturating_sub(span.head).div_ceil(FRAME);
+                present + strides.saturating_sub(packets) * span.hole
             }
         });
         (buffered as i64 + self.base).max(0) as u64
@@ -311,6 +319,7 @@ impl JitterBuffer {
         self.last_observation = Some(now);
         self.observing_since.get_or_insert(now);
         let packet_samples = self.packets.first_key_value().map_or(self.last_samples, |(_, p)| p.samples);
+        let sequence = self.clock == Clock::Sequence;
         let reserve = self.target_samples().saturating_sub(packet_samples) + SAFETY;
         let span = self.next.or_else(|| self.packets.first_key_value().map(|(&ts, _)| ts)).map(|next| {
             // Head-hold PLC has already played part of the hole at `next`.
@@ -321,7 +330,10 @@ impl JitterBuffer {
                 let (&last, packet) = self.packets.last_key_value().unwrap();
                 end = last + packet.step;
             }
-            Span { head, end, samples: packet_samples, resolved: false }
+            let queued =
+                if sequence { self.packets.iter().map(|(&ts, p)| (ts, p.samples)).collect() } else { Vec::new() };
+            let hole = self.packets.values().map(|p| p.samples).fold(self.last_samples, u64::min);
+            Span { head, end, queued, hole, resolved: false }
         });
         // The whole trailing window is kept (a few hundred marks), not a monotone queue:
         // hindsight can raise a recent mark above older ones.

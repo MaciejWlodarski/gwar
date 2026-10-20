@@ -763,6 +763,51 @@ mod tests {
     }
 
     #[test]
+    fn mixed_packet_durations_drain_alike_on_both_clocks() {
+        // TS packet counters step one stride per packet whatever its duration, so depth must
+        // come from the packets' own durations: a sequence stream may not drain more or less
+        // than the same stream with RTP timestamps.
+        use super::super::jitter::Clock;
+        for (pattern, delay) in [(&[1920u64, 120, 480, 240, 1920][..], 960u64), (&[960, 480][..], 0)] {
+            let mut results = Vec::new();
+            for clock in [Clock::Sequence, Clock::Rtp] {
+                let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
+                let mut slot = Slot::new().unwrap();
+                let start = Instant::now();
+                let (mut arrivals, mut media, mut last) = (Vec::new(), 0u64, 0u64);
+                for i in 0.. {
+                    let n = pattern[i % pattern.len()];
+                    // Every three seconds one refill's worth of packets comes late, in order.
+                    let late = media > 0 && media % (3 * 48_000) < 960;
+                    let time = (media + if late { delay } else { 0 }).max(last);
+                    last = time;
+                    let key = if clock == Clock::Sequence { i as u64 * 960 } else { media };
+                    arrivals.push((time, key, n, encode_n(&encoder, false, n as usize)));
+                    media += n;
+                    if media > 30 * 48_000 {
+                        break;
+                    }
+                }
+                slot.end = 1440;
+                let mut arrivals = arrivals.into_iter().peekable();
+                for tick in (0..30 * 48_000u64).step_by(960) {
+                    let now = start + Duration::from_secs_f64(tick as f64 / 48_000.0);
+                    while let Some((time, key, n, data)) = arrivals.next_if(|a| a.0 <= tick) {
+                        let at = start + Duration::from_secs_f64(time as f64 / 48_000.0);
+                        slot.buffer.push_at(key, n, data, at, clock);
+                    }
+                    for (offset, take) in [(0, 480), (480, 480)] {
+                        slot.mix_refill(&mut [0.0; 480][..take], 1.0, now, 960 - offset).unwrap();
+                    }
+                }
+                let tail = slot.buffer.depth().1 + slot.staged_samples() as u64;
+                results.push((slot.buffer.concealments, tail));
+            }
+            assert_eq!(results[0], results[1], "pattern {pattern:?}: (concealments, tail) sequence vs rtp");
+        }
+    }
+
+    #[test]
     fn fractional_staged_surplus_converges_with_bounded_periodic_corrections() {
         use super::super::jitter::Clock;
         for clock in [Clock::Rtp, Clock::Sequence] {

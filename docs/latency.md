@@ -339,7 +339,9 @@ buffered time from the playout position to the end of the queue, holes
 included, and every observation is revised in hindsight by the arrivals after
 it: the first packet at or beyond the queue's end extends it over the missing
 packets (they were lost and are concealed, never late), while a packet arriving
-inside the span pulls it back to itself (it was not there). Only the present
+inside the span pulls it back to itself (it was not there). Under the TS sequence
+clock a key stride says nothing about duration, so an observation keeps the
+durations of the packets queued then and counts a hole as the shortest of them. Only the present
 packets used to count, so every loss looked like a one-packet dip at the tail;
 with a loss every couple of seconds the window never cleared and a 10--20 ms
 residual stayed for good (the receiver's "level steps"). Concealment samples
