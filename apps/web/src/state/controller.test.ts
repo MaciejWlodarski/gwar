@@ -3,6 +3,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import type { Client } from "../proto/Client";
 import type { ChatMessage } from "../proto/ChatMessage";
 import type { Event } from "../proto/Event";
+import type { Permission } from "../proto/Permission";
 import type { Welcome } from "../proto/Welcome";
 import type { ConnectionStatus, Link } from "../net/connection";
 import type { EventName, Op } from "../net/protocol";
@@ -138,7 +139,7 @@ let link: FakeLink;
 const session = () => stores.useSession.getState();
 
 /** Connects a fake link; Gwar servers start users outside voice. */
-function connectFake(opts: { channel?: number | null; kind?: "gwar" | "teamspeak"; resync?: boolean; encrypted?: number[]; serverChat?: boolean } = {}) {
+function connectFake(opts: { channel?: number | null; kind?: "gwar" | "teamspeak"; resync?: boolean; encrypted?: number[]; serverChat?: boolean; permissions?: Permission[] } = {}) {
   const c = controller as unknown as { conn: Link | null; wire(l: Link): void };
   c.conn = link;
   c.wire(link);
@@ -148,6 +149,7 @@ function connectFake(opts: { channel?: number | null; kind?: "gwar" | "teamspeak
       session: 1,
       uid: "u1",
       server: { ...welcome().server, server_chat: { encrypted: opts.serverChat ?? false, history: opts.serverChat ?? false } },
+      permissions: opts.permissions ?? [],
       channels: [chan(1), chan(2), chan(3, { has_password: true })].map(c => opts.encrypted?.includes(c.id) ? { ...c, encrypted: true } : c),
       clients: [client(1, opts.channel ?? null), client(2, 2)],
     }),
@@ -502,6 +504,151 @@ describe("telling the server what I have read", () => {
     await vi.advanceTimersByTimeAsync(5000);
     expect(link.sent("chat.read")).toHaveLength(0);
     expect(session().threads["ch:2"]?.unread).toBe(1);
+  });
+});
+
+describe("request errors", () => {
+  it("say which part of a half-done change went through", async () => {
+    const { RequestError } = await import("../net/connection");
+    const { describeRequestError } = await import("./controller");
+    const text = describeRequestError(new RequestError("partial", "channel edited, but not moved (TeamSpeak: refused)"));
+    expect(text).toBe("Only part of that went through (channel edited, but not moved (TeamSpeak: refused))");
+  });
+});
+
+describe("joining password channels", () => {
+  /** Like a TeamSpeak session: every action offered, the server decides. */
+  const teamspeak = (channel = 1) => connectFake({ channel, kind: "teamspeak", permissions: ["bypass_password", "connect"] });
+  /** Answers the next `channel.join` with an error, recording it like any request. */
+  const refuseJoin = async (code: "wrong_password" | "forbidden" | "channel_full") => {
+    const { RequestError } = await import("../net/connection");
+    const request = link.request.bind(link);
+    vi.spyOn(link, "request").mockImplementationOnce(async (op, d) => {
+      await request(op, d);
+      throw new RequestError(code, "TeamSpeak: refused");
+    });
+  };
+
+  it("joins without asking when the server lets me in (a TeamSpeak admin)", async () => {
+    teamspeak();
+    await controller.joinChannelInteractive(3);
+    expect(link.sent("channel.join").at(-1)?.d).toEqual({ channel: 3, password: null });
+    expect(stores.useUi.getState().dialog.kind).toBe("none");
+  });
+
+  it("asks for the password only when refused, then remembers it for the session", async () => {
+    teamspeak();
+    await refuseJoin("wrong_password");
+    await controller.joinChannelInteractive(3);
+    expect(link.sent("channel.join").at(-1)?.d).toEqual({ channel: 3, password: null });
+    expect(stores.useUi.getState().dialog).toEqual({ kind: "channelPassword", channel: 3 });
+    expect(stores.useUi.getState().toasts).toEqual([]);
+    // What the dialog does.
+    await controller.joinChannel(3, "pw");
+    link.emit({ ev: "client.updated", d: client(1, 3) });
+    link.emit({ ev: "client.updated", d: client(1, 2) });
+    stores.useUi.setState({ dialog: { kind: "none" } });
+    await controller.joinChannelInteractive(3);
+    expect(link.sent("channel.join").at(-1)?.d).toEqual({ channel: 3, password: "pw" });
+    expect(stores.useUi.getState().dialog.kind).toBe("none");
+  });
+
+  it("forgets a password that stopped working and asks again", async () => {
+    teamspeak();
+    await controller.joinChannel(3, "old");
+    link.emit({ ev: "client.updated", d: client(1, 2) });
+    await refuseJoin("wrong_password");
+    await controller.joinChannelInteractive(3);
+    expect(link.sent("channel.join").at(-1)?.d).toEqual({ channel: 3, password: "old" });
+    expect(stores.useUi.getState().dialog).toEqual({ kind: "channelPassword", channel: 3 });
+    stores.useUi.setState({ dialog: { kind: "none" } });
+    await refuseJoin("wrong_password");
+    await controller.joinChannelInteractive(3);
+    expect(link.sent("channel.join").at(-1)?.d).toEqual({ channel: 3, password: null });
+  });
+
+  it.each([
+    ["forbidden", "You aren't allowed to join this channel."],
+    ["channel_full", "That channel is full."],
+  ] as const)("says why a %s channel stays closed", async (code, text) => {
+    teamspeak();
+    await refuseJoin(code);
+    await controller.joinChannelInteractive(2);
+    expect(stores.useUi.getState().toasts.at(-1)?.text).toBe(text);
+    expect(stores.useUi.getState().dialog.kind).toBe("none");
+  });
+
+  it("goes back to my TeamSpeak channel, password included, after a reconnect", async () => {
+    teamspeak();
+    await controller.joinChannel(3, "pw");
+    link.emit({ ev: "client.updated", d: client(1, 3) });
+    link.status_({ state: "reconnecting", attempt: 1, retryAt: 0 });
+    // TeamSpeak puts a returning client in the default channel.
+    link.welcomeNow(welcome({ session: 9, uid: "u1", permissions: ["bypass_password", "connect"], channels: [chan(1), chan(3, { has_password: true })], clients: [client(9, 1, { uid: "u1" })] }), true);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(link.sent("channel.join").at(-1)?.d).toEqual({ channel: 3, password: "pw" });
+  });
+
+  it("forgets typed passwords on another server", async () => {
+    teamspeak();
+    await controller.joinChannel(3, "pw");
+    link.emit({ ev: "client.updated", d: client(1, 2) });
+    link = new FakeLink();
+    teamspeak(2);
+    await controller.joinChannelInteractive(3);
+    expect(link.sent("channel.join").at(-1)?.d).toEqual({ channel: 3, password: null });
+  });
+
+  /** Holds the next `channel.join` on the current link until the test answers it. */
+  const holdJoin = () => {
+    let answer!: (error?: Error) => void;
+    vi.spyOn(link, "request").mockImplementationOnce((op, d) => {
+      link.requests.push({ op, d });
+      return new Promise<never>((resolve, reject) => { answer = (error) => (error ? reject(error) : resolve({} as never)); });
+    });
+    return (error?: Error) => answer(error);
+  };
+
+  it("keeps a late answer from an ended session to that session", async () => {
+    teamspeak();
+    const answer = holdJoin();
+    const joined = controller.joinChannel(3, "pw-of-a");
+    // Another server, whose channel 3 is something else.
+    link = new FakeLink();
+    teamspeak(2);
+    stores.useUi.getState().setJoining(1);
+    answer();
+    expect(await joined).toBe(false);
+    expect(stores.useUi.getState().joining).toBe(1);
+    await controller.joinChannelInteractive(3);
+    expect(link.sent("channel.join").at(-1)?.d).toEqual({ channel: 3, password: null });
+  });
+
+  it("asks for no password over another server when the refusal comes late", async () => {
+    teamspeak();
+    const answer = holdJoin();
+    const joining = controller.joinChannelInteractive(3);
+    link = new FakeLink();
+    teamspeak(2);
+    const { RequestError } = await import("../net/connection");
+    answer(new RequestError("wrong_password", "TeamSpeak: channel invalid password"));
+    await joining;
+    expect(stores.useUi.getState().dialog.kind).toBe("none");
+    expect(stores.useUi.getState().toasts).toEqual([]);
+  });
+
+  it("drops the spinner of a join a resync ended", async () => {
+    teamspeak();
+    const answer = holdJoin();
+    const joined = controller.joinChannel(3);
+    expect(stores.useUi.getState().joining).toBe(3);
+    link.status_({ state: "reconnecting", attempt: 1, retryAt: 0 });
+    // The resync keeps me in channel 1, where I was.
+    link.welcomeNow(welcome({ session: 9, uid: "u1", permissions: ["bypass_password", "connect"], channels: [chan(1), chan(3)], clients: [client(9, 1, { uid: "u1" })] }), true);
+    expect(stores.useUi.getState().joining).toBeNull();
+    answer();
+    expect(await joined).toBe(false);
+    expect(stores.useUi.getState().joining).toBeNull();
   });
 });
 

@@ -84,7 +84,9 @@ use.
     below). They see the same channels and people, and talk and chat with
     everyone else.
   - The desktop app can connect to any existing TS3/TS6 server with the same
-    interface.
+    interface: channel, server and private chat, password and full channels,
+    spacers. A channel password is asked for only when the server wants one
+    (admins get in without) and is remembered while connected.
 
 Gwar is alpha software: it works and is tested end to end, but expect rough
 edges and breaking changes. The bug button in the app sends a report (with

@@ -364,6 +364,11 @@ function SysRow({ row, t }: { row: Extract<Row, { type: "sys" }>; t: TFn }) {
   );
 }
 
+/** TeamSpeak gives a channel's chat only to the people in it: one I view without being in is closed to me. */
+function useClosedTsChannel(threadKey: ThreadKey): boolean {
+  return useSession((s) => s.kind === "teamspeak" && threadKey === "channel" && s.viewChannel !== null && s.viewChannel !== myChannelId(s));
+}
+
 export function MessageList({ threadKey, editLastRef }: { threadKey: ThreadKey; editLastRef?: EditLastRef }) {
   const t = useT();
   const lang = useLanguage();
@@ -372,6 +377,7 @@ export function MessageList({ threadKey, editLastRef }: { threadKey: ThreadKey; 
   const key = useSession((s) => storedKey(s, threadKey));
   const thread = useSession((s) => (key ? s.threads[key] : undefined));
   const hasHistory = useSession((s) => s.kind !== "teamspeak");
+  const elsewhere = useClosedTsChannel(threadKey);
   const roster = useRoster(key);
   // Without shared history, rows from before my account joined stay unreadable: one muted line stands for them.
   const unshared = useCallback((i: ChatItem) => i.kind === "msg" && i.cannotOpen === "no_key" && !!i.sealed
@@ -569,7 +575,7 @@ export function MessageList({ threadKey, editLastRef }: { threadKey: ThreadKey; 
                 : threadKey === "channel"
                   ? hasHistory
                     ? "chat.emptyChannel"
-                    : "chat.emptyChannelNoHistory"
+                    : elsewhere ? "chat.emptyChannelElsewhere" : "chat.emptyChannelNoHistory"
                   : "chat.emptyDm",
             )}
           </EmptyState>
@@ -781,7 +787,8 @@ function Composer({ threadKey, attachRef, editLastRef }: { threadKey: ThreadKey;
   const mayWrite = useChannelPermission(inChannel, "send_messages") || isDm;
   // Files travel with channel messages and encrypted conversations, where they are encrypted too.
   const canAttach = (threadKey === "channel" || encrypted) && uploadsOn && mayUpload;
-  const disabled = !online || !peerOnline || locked || securing || !mayWrite;
+  const elsewhere = useClosedTsChannel(threadKey);
+  const disabled = !online || !peerOnline || locked || securing || !mayWrite || elsewhere;
   const over = text.length > MAX_MESSAGE_LENGTH;
   const uploading = pending.some((f) => f.status === "uploading");
   const ready = pending.filter((f) => f.status === "done");
@@ -896,7 +903,7 @@ function Composer({ threadKey, attachRef, editLastRef }: { threadKey: ThreadKey;
     addFiles(files);
   };
 
-  const placeholder = !mayWrite ? t("chat.placeholderNoWrite") : waiting ? t("chat.waitingManager") : securing ? t("chat.securing") : locked
+  const placeholder = !mayWrite ? t("chat.placeholderNoWrite") : elsewhere ? t("chat.placeholderJoinToWrite") : waiting ? t("chat.waitingManager") : securing ? t("chat.securing") : locked
     ? t("chat.placeholderLocked")
     : !peerOnline
     ? t("chat.peerOfflineNamed", { name: peerName ?? "" })

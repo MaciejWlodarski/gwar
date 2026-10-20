@@ -27,6 +27,7 @@ export const initialState: SessionState = {
   clients: {},
   members: {},
   permissions: [],
+  fixedPermissions: false,
   owner: null,
   managers: null,
   iceServers: [],
@@ -46,7 +47,7 @@ export type Action =
   /** Unread messages of a public encrypted conversation mentioning me, counted after opening them. */
   | { type: "sealedMentions"; thread: "server" | `ch:${number}`; count: number }
   | { type: "phase"; phase: Phase }
-  | { type: "welcome"; welcome: Welcome; resync: boolean; now: number }
+  | { type: "welcome"; welcome: Welcome; resync: boolean; now: number; teamspeak?: boolean }
   | { type: "event"; event: Event; now: number; verified?: boolean; authentic?: boolean }
   | { type: "history"; channel: number; messages: ChatMessage[]; before: number | null; limit: number; authentic?: boolean[] }
   | { type: "historyForbidden"; channel: number }
@@ -97,9 +98,9 @@ export function myChannelId(state: SessionState): number | null {
   return myClient(state)?.channel ?? null;
 }
 
-export function computePermissions(state: Pick<SessionState, "groups" | "clients" | "me" | "owner">, fallback: Permission[] = []): Permission[] {
+export function computePermissions(state: Pick<SessionState, "groups" | "clients" | "me" | "owner"> & Partial<Pick<SessionState, "fixedPermissions">>, fallback: Permission[] = []): Permission[] {
   const me = state.me ? state.clients[state.me.session] : undefined;
-  if (!me) return fallback;
+  if (!me || state.fixedPermissions) return fallback;
   return permissionsOf(me.groups, state.groups, !!state.owner && state.owner.uid === me.uid);
 }
 
@@ -564,6 +565,7 @@ export function reduce(state: SessionState, action: Action): SessionState {
         clients,
         members,
         permissions: w.permissions,
+        fixedPermissions: !!action.teamspeak,
         owner: w.owner ?? null,
         managers: w.managers ?? null,
         iceServers: w.ice_servers,

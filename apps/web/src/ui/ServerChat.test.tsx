@@ -83,6 +83,22 @@ it("loads older sealed server rows and offers moderator removal", async () => {
 });
 
 
+it("writes only in my own channel on TeamSpeak, which gives a channel's chat only to the people in it", async () => {
+  const channel = (id: number) => ({ id, parent: null, name: `c${id}`, topic: "", position: id, has_password: false, max_clients: null, encrypted: false, history: false, private: false, synced: false });
+  const me = { id: 1, uid: "me", nickname: "me", channel: 1, groups: [], platform: "ts3" as const, muted: false, deafened: false, away: null, talking: false, voice: true, voice_binding: null };
+  const thread = { items: [], unread: 0, mentions: 0, hasMore: false, loaded: true, lastRead: 0, locked: false };
+  useSession.setState({ kind: "teamspeak", activeThread: "channel", viewChannel: 2, channels: { 1: channel(1), 2: channel(2) }, clients: { 1: me },
+    permissions: ["send_messages"], server: { ...welcome().server, teamspeak: true }, threads: { "ch:1": thread, "ch:2": thread } });
+  await show();
+  const input = () => container.querySelector("textarea")!;
+  expect(input().disabled).toBe(true);
+  expect(input().placeholder).toBe("Join this channel to write here");
+  expect(container.textContent).toContain("Join this channel to read and write here.");
+  await act(async () => useSession.setState({ viewChannel: 1 }));
+  expect(input().disabled).toBe(false);
+  expect(input().placeholder).toBe("Message #c1");
+});
+
 it("keeps the server composer disabled until the group is ready", async () => {
   useSession.setState(s => ({ threads: { server: { ...s.threads.server!, securing: true } } }));
   await show();

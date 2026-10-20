@@ -57,7 +57,7 @@ const uid: Rule<string> = (v): v is string => str(128)(v) && v.length > 0 && v !
 const ids = array(id, 128);
 const permissions = literal<Permission>(["administrator", "manage_server", "manage_roles", "manage_members", "kick_members", "ban_members", "create_invites", "bypass_password", "attach_files", "manage_messages", "move_members", "manage_channels", "connect", "speak", "send_messages", "mute_members"]);
 const platform = literal<Platform>(["web", "desktop", "mobile", "ts3", "ts6"]);
-const errorCode = literal<ErrorCode>(["bad_request", "not_authenticated", "not_found", "forbidden", "wrong_password", "channel_full", "rate_limited", "conflict", "unavailable", "internal", "banned", "too_large", "quota_exceeded", "certificate_expired", "stale", "pending", "expired", "early"]);
+const errorCode = literal<ErrorCode>(["bad_request", "not_authenticated", "not_found", "forbidden", "wrong_password", "channel_full", "rate_limited", "conflict", "unavailable", "internal", "banned", "too_large", "quota_exceeded", "certificate_expired", "stale", "pending", "expired", "early", "partial"]);
 const path = (put = false): Rule<string> => (v): v is string => {
   if (!str(2048)(v)) return false;
   try { filePath(v, put ? "PUT" : "GET"); return true; } catch { return false; }

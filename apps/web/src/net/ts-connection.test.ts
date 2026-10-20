@@ -35,7 +35,7 @@ describe("classifyTsError", () => {
   });
 });
 
-function fakeBridge() {
+function fakeBridge(reply?: (op: string) => unknown) {
   const listeners = new Map<string, (p: never) => void>();
   const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
   const bridge: TauriBridge = {
@@ -46,7 +46,10 @@ function fakeBridge() {
         listeners.get("ts://event")?.({ session: args?.session, frame: JSON.stringify({ ev: "voice.talking", d: { call: "AAAAAAAAAAAAAAAAAAAAAA", participation: "AQEBAQEBAQEBAQEBAQEBAQ", run: 1, client: 1, talking: true } }) } as never);
         return { session: 1, uid: "uid", server: { name: "TS", welcome: "", version: "1", default_channel: 1, max_clients: 64, upload_limit: 0, file_access: "link", teamspeak: true, server_chat: { encrypted: false, history: false } }, permissions: [], groups: [], channels: [], clients: [], members: [], unread: [], conversations: [], ice_servers: [], file_access: "" };
       }
-      if (command === "ts_request") throw { code: "forbidden", message: "no" };
+      if (command === "ts_request") {
+        if (reply) return reply(String(args?.op));
+        throw { code: "forbidden", message: "no" };
+      }
       return undefined;
     }) as TauriBridge["invoke"],
     listen: async (name, handler) => {
@@ -71,5 +74,33 @@ describe("TsConnection", () => {
     expect(calls.find((c) => c.command === "ts_connect")?.args).toMatchObject({ address: "h:9987", nickname: "n", password: null, identity: "uid-1" });
     conn.close();
     expect(calls.at(-1)?.command).toBe("ts_disconnect");
+  });
+});
+
+describe("TsConnection replies", () => {
+  // What `gwar_client::teamspeak` answers for done commands.
+  const replies: Record<string, unknown> = {
+    "chat.send": { id: 2147483649, target: { channel: 4 }, author: 3, author_uid: "ts:AAAAAAAAAAAAAAAAAAAAAAAAAAA=", author_name: "me", text: "hi", sent_at: 1 },
+    "channel.create": { id: 9, parent: 4, name: "New", topic: "", position: 0, has_password: false, max_clients: 5, encrypted: false, history: false, private: false, synced: false },
+    "token.redeem": { groups: [6] },
+    "channel.join": {},
+  };
+
+  it("accepts the native client's answers in Gwar shapes", async () => {
+    const { bridge } = fakeBridge((op) => replies[op]);
+    const conn = new TsConnection({ address: "h:9987", nickname: "n", bridge: async () => bridge });
+    await conn.connect();
+    await expect(conn.request("chat.send", { target: { channel: 4 }, text: "hi" } as never)).resolves.toMatchObject({ text: "hi" });
+    await expect(conn.request("channel.create", { name: "New", parent: 4 } as never)).resolves.toMatchObject({ id: 9 });
+    await expect(conn.request("token.redeem", { token: "t" })).resolves.toEqual({ groups: [6] });
+    await expect(conn.request("channel.join", { channel: 4, password: null })).resolves.toEqual({});
+  });
+
+  it("refuses an empty answer where a message is due", async () => {
+    // An empty `chat.send` answer once failed every TeamSpeak message after it had gone out.
+    const { bridge } = fakeBridge(() => ({}));
+    const conn = new TsConnection({ address: "h:9987", nickname: "n", bridge: async () => bridge });
+    await conn.connect();
+    await expect(conn.request("chat.send", { target: { channel: 4 }, text: "hi" } as never)).rejects.toBeInstanceOf(RequestError);
   });
 });

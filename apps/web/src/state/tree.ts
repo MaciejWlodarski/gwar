@@ -49,3 +49,8 @@ export function buildTree(channels: Channel[], clients: Client[]): ChannelNode[]
 export function descendantsCount(node: ChannelNode): number {
   return node.clients.length + node.children.reduce((n, c) => n + descendantsCount(c), 0);
 }
+
+/** No room left: as many users as the channel's limit (a TeamSpeak limit may also be 0). */
+export function isFull(node: ChannelNode): boolean {
+  return node.channel.max_clients !== null && node.clients.length >= node.channel.max_clients;
+}

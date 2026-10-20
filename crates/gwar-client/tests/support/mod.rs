@@ -24,7 +24,18 @@ pub struct Bridged {
     pub server: Running,
     pub ts_voice: SocketAddr,
     pub media: SocketAddr,
-    _dir: TempDir,
+    /// The TeamSpeak server's ServerQuery port; see [`Bridged::query_password`].
+    #[allow(dead_code)]
+    pub query: SocketAddr,
+    dir: TempDir,
+}
+
+impl Bridged {
+    /// The `serveradmin` password of the TeamSpeak server's ServerQuery.
+    #[allow(dead_code)]
+    pub fn query_password(&self) -> String {
+        std::fs::read_to_string(self.dir.0.join("query-password")).unwrap().trim().to_owned()
+    }
 }
 
 struct TempDir(PathBuf);
@@ -56,6 +67,7 @@ pub async fn start() -> Option<Bridged> {
     let media: SocketAddr = format!("127.0.0.1:{}", free_port(true)).parse().unwrap();
     let ts_voice: SocketAddr = format!("127.0.0.1:{}", free_port(true)).parse().unwrap();
     let http: SocketAddr = format!("127.0.0.1:{}", free_port(false)).parse().unwrap();
+    let query: SocketAddr = format!("127.0.0.1:{}", free_port(false)).parse().unwrap();
     let server = gwar_server::start(gwar_server::Config {
         database: None,
         http_bind: http,
@@ -69,7 +81,7 @@ pub async fn start() -> Option<Bridged> {
         teamspeak: Some(TeamSpeakConfig {
             dir: dir.clone(),
             voice: ts_voice,
-            query_port: free_port(false),
+            query_port: query.port(),
             filetransfer: format!("127.0.0.1:{}", free_port(false)).parse().unwrap(),
             public_url: Some(PUBLIC_URL.into()),
         }),
@@ -95,7 +107,7 @@ pub async fn start() -> Option<Bridged> {
         .await
         .expect("TeamSpeak bridge did not get ready")
         .unwrap();
-    Some(Bridged { server, ts_voice, media, _dir: TempDir(dir) })
+    Some(Bridged { server, ts_voice, media, query, dir: TempDir(dir) })
 }
 
 /// Connects a TeamSpeak client once the TeamSpeak server is up (it starts in the background).

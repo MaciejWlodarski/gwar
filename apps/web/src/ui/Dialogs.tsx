@@ -10,7 +10,7 @@ import { AccessPicker } from "./ChannelAccess";
 import { ChannelPermissionsDialog } from "./ChannelPermissions";
 import { BugReportDialog } from "./BugReport";
 import { rebaseAccess, sameAccess } from "../lib/access";
-import { controller, describeRequestError } from "../state/controller";
+import { controller, describeJoinError, describeRequestError } from "../state/controller";
 import { sortedChannels } from "../state/reducer";
 import { isDesktop } from "../platform";
 import { newId, useSettings, type ServerKind } from "../state/settings";
@@ -456,11 +456,16 @@ function ChannelPasswordDialog({ channel }: { channel: number }) {
     setBusy(true);
     setError(null);
     try {
-      await controller.joinChannel(channel, password);
+      // An answer for an ended session must not close what is open now. After a resync this dialog
+      // is still open: let the password be sent again.
+      if (!(await controller.joinChannel(channel, password))) {
+        setBusy(false);
+        return;
+      }
       close();
       useUi.getState().setDrawer(false);
     } catch (err) {
-      setError(err instanceof RequestError && err.code === "wrong_password" ? t("channelPassword.wrong") : describeRequestError(err));
+      setError(err instanceof RequestError && err.code === "wrong_password" ? t("channelPassword.wrong") : describeJoinError(err));
       setBusy(false);
     }
   };
