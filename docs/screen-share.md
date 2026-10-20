@@ -3,8 +3,8 @@
 Status: **design, with the owner's decisions of 2026-10-21 folded in**
 ([Owner decisions](#owner-decisions)). Nothing here is built yet. Phase 1
 goes through the server's SFU. Peer-to-peer sharing comes later and is only
-sketched at the end. The spike code was thrown away; only its results are kept here
-([Spikes](#spikes)).
+sketched at the end. The spike code was thrown away; only its results are
+kept here ([Spikes](#spikes)).
 
 ## Summary
 
@@ -364,7 +364,8 @@ Each session has at most two screen transports besides its voice transport
   `SCREEN_SLOTS = 4` `recvonly` video m-lines, nothing to send. Phase 2
   widens each slot with an audio m-line
   ([Shared audio](#shared-audio-phase-2)). This mirrors the eight voice
-  slots: no renegotiation when shares start, stop or change hands. A `run` number restarts it, like voice's run.
+  slots: no renegotiation when shares start, stop or change hands. A `run`
+  number restarts it, like voice's run.
 - **Guest watch transport.** The same, with one slot, for a TeamSpeak guest
   ([TeamSpeak watch links](#teamspeak-watch-links-guests-pr-6)).
 - **Publish transport.** One `Rtc` **per share**, negotiated by
@@ -1178,8 +1179,15 @@ wherever the watcher is, not only for the channel's occupants:
 - **Channel state.** Making a channel private or editing its member list,
   setting or changing its password, and switching it to encrypted run the
   same check for that channel.
-- **Session state.** Leaving a call ends that session's encrypted watches;
-  kicks, bans and disconnects end all of them.
+- **The viewer's own channel.** Every departure or move of the session runs
+  `enforce_watch` on all of its slots: joining another channel, leaving
+  voice, a moderator or bridge move (`move_admitted`, `move_client`), and
+  `channel_leave`. These paths do not call `enforce_connect`, so they get
+  their own hook. A viewer watching a password-protected channel's share
+  from inside it, without `bypass_password`, loses the slot on leaving. An
+  encrypted share's watch ends when its viewer leaves the call.
+- **Session state.** Kicks, bans and disconnects end all of a session's
+  watches.
 
 When access ends, the slot is released exactly like `screen.unwatch`, in the
 screen task's next loop iteration. Its Gwar queue is cleared, its RTX cache
@@ -1231,8 +1239,10 @@ Lifecycle rules:
 - Start, stop and start again while watching other shares touches only publish
   transports; the watch transport and its slots are unaffected.
 - Watching a plaintext share survives moving between channels and leaving
-  voice. It ends when the session can no longer see the channel. Watching an
-  encrypted share ends when the session leaves that call.
+  voice while the watching rules still hold. It ends when the session can no
+  longer see the channel, or when it leaves a password-protected channel
+  without `bypass_password`. Watching an encrypted share ends when the
+  session leaves that call.
 
 TypeScript types are generated as today (`cargo test -p gwar-proto --features
 ts`). The handwritten client validators gain the new schemas (architecture.md,
@@ -1318,12 +1328,18 @@ attachment (`ts_text`, `plain`, `split_for_teamspeak`):
     The same deadline applies again between the reply and `guest.offer`;
   - pre-authentication frame size (`MAX_FRAME`), the per-connection frame
     rate limit, `PING_INTERVAL` and `IDLE_TIMEOUT` apply unchanged.
+  - **Heartbeat.** `IDLE_TIMEOUT` (60 s) waits for a text frame, and
+    WebSocket Ping/Pong frames do not reset it (`next_text`). So guests use
+    the member client's application `ping {}` request: the watch page sends
+    it every 20 s, as `net/connection.ts` does, and the server answers it.
+    A guest that stops pinging is closed after 60 s.
   - The first frame is `guest.watch {token}`. The reply is
     `{share, sharer, preset, ice_servers}`, or one generic `not_found`
     for unknown, ended and revoked tokens alike.
   - After that, only `guest.offer {sdp}` is accepted, **once per
-    connection**, plus `screen.keyframe`. The offer is a watch transport with
-    **one** slot. A second offer closes the connection.
+    connection**, plus `screen.keyframe` and `ping {}`. The offer is a
+    watch transport with **one** slot. A second offer closes the
+    connection.
   - Server events are `screen.paused`, `screen.resumed` and `screen.stopped`.
     Then the server closes the socket.
   - There is no identity and no MLS, and nothing is stored on the guest's
@@ -1632,10 +1648,14 @@ person.
      including `guest_link`, `screen.viewers` and `screen.link`;
    - the watching rules: session-bound watching, channel visibility, the
      password rule and call membership for encrypted channels;
-   - `enforce_watch` at every `enforce_connect` call site and on the channel
-     and session changes listed under "Requests", with tests that revoke
-     `bypass_password` by role edit, override and role removal from a viewer
-     outside the channel;
+   - `enforce_watch` at every `enforce_connect` call site, on every departure
+     or move of the viewer (`move_admitted`, `move_client`, `channel_leave`),
+     and on the channel and session changes listed under "Requests". Tests:
+     - revoking `bypass_password` by role edit, override and role removal
+       from a viewer outside the channel;
+     - a viewer without it leaving, switching channel, and being moved out
+       by a moderator, each ending the watch of a password-protected
+       channel's share;
    - shares listed for every visible channel, without revealing hidden ones;
    - limits, lifecycle and the moderator stop;
    - `screen.start` refused in encrypted channels until PR 7;
@@ -1676,6 +1696,10 @@ person.
        `bypass_password`, loses the slot when a role edit, an override or a
        role removal takes that permission away. Nothing of the share reaches
        it afterwards, NACK answers and probes included;
+     - a viewer without `bypass_password` watching from inside a
+       password-protected channel loses the slot when it leaves voice, joins
+       another channel, or is moved out by a moderator or the bridge, with
+       the same cleanup;
      - stale packets after a drop never cross a segment;
      - unknown and stale-share SSRCs drop;
      - a stopped share frees slots;
@@ -1746,6 +1770,9 @@ person.
      the paused guests resume only after passing admission again;
    - `/ws/watch` is held to the same `PreAuth` limits as `/ws`, IPv6 /64
      grouping included; a second `guest.offer` closes the connection;
+   - the heartbeat: a guest page keeps watching for 150 s, more than two
+     idle intervals, without being disconnected, and a guest that stops
+     sending `ping` is closed after `IDLE_TIMEOUT`;
    - the bridge's link copy is gone after stop, revocation and detach.
 
 **First release after PR 6: plaintext channels only, without sound.** The
