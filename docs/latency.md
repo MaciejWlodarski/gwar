@@ -583,15 +583,20 @@ bands, works in 4 ms blocks and overlaps them); gain control adds nothing. With
 headphones there is no echo to cancel, and turning it off saves those ~9 ms. A
 browser's canceller is the same code in C++, built the same way, so it likely costs
 as much; that is read from the code, not measured (a browser reports when audio
-reaches the page, not what its processing holds). A frame takes ~0.05 ms of CPU on
-Apple Silicon.
+reaches the page, not what its processing holds). It runs at 48 kHz, as set
+explicitly (`sonora` defaults to 32 kHz, which would take everything above 16 kHz out
+of the microphone). A frame takes ~0.05 ms of CPU on Apple Silicon. The processing
+allocates as it works (~50 times a frame with both stages on); with six other
+threads hammering the allocator, a frame still took 0.15 ms at the 99.9th
+percentile and 0.9 ms at worst, of the 10 ms it has.
 
 An echo of a voice-like signal, 60 to 250 ms late, went down by 31–34 dB once the
 canceller had converged; the near voice, talking over it, lost ~2.5 dB, and with
 nothing played it is left as it is. Gain control brought a -40 dBFS voice to about
 -20. Tests (`apm.rs`): an echo 60 ms late and 10 dB down goes down by more than
 25 dB; a voice with nothing played changes by less than 1 dB; a -40 dBFS voice comes
-out above -30 dBFS; with both off the microphone passes untouched.
+out above -30 dBFS; an 18 kHz tone passes the canceller as it is; with both off the
+microphone passes untouched.
 
 ## Noise suppression
 

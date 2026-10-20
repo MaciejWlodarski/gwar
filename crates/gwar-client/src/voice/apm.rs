@@ -9,10 +9,19 @@
 
 use sonora::{
     AudioProcessing, Config, StreamConfig,
-    config::{AdaptiveDigital, EchoCanceller, GainController2},
+    config::{AdaptiveDigital, EchoCanceller, GainController2, MaxProcessingRate, Pipeline},
 };
 
 use super::FRAME;
+
+/// Nothing on, at the full 48 kHz: by default the processing runs at 32 kHz, which would take
+/// everything above 16 kHz out of the microphone.
+fn base() -> Config {
+    Config {
+        pipeline: Pipeline { maximum_internal_processing_rate: MaxProcessingRate::Rate48kHz, ..Default::default() },
+        ..Default::default()
+    }
+}
 
 /// One of WebRTC's processors, set up for a single stage (or none, while it is off).
 struct Stage {
@@ -23,7 +32,10 @@ struct Stage {
 impl Stage {
     fn new() -> Self {
         let stream = StreamConfig::new(super::io::RATE, 1);
-        Self { apm: AudioProcessing::builder().capture_config(stream).render_config(stream).build(), on: false }
+        Self {
+            apm: AudioProcessing::builder().config(base()).capture_config(stream).render_config(stream).build(),
+            on: false,
+        }
     }
 
     /// Whether `on` changed; one turned on starts from scratch.
@@ -32,7 +44,7 @@ impl Stage {
             return false;
         }
         self.on = on;
-        self.apm.apply_config(if on { config() } else { Config::default() });
+        self.apm.apply_config(if on { config() } else { base() });
         true
     }
 }
@@ -55,7 +67,7 @@ impl Processing {
     /// high-pass filter, as in browsers; gain control is digital only (the device's own input
     /// volume is the user's).
     pub(crate) fn configure(&mut self, echo: bool, gain: bool) {
-        if self.echo.set(echo, || Config { echo_canceller: Some(EchoCanceller::default()), ..Default::default() }) {
+        if self.echo.set(echo, || Config { echo_canceller: Some(EchoCanceller::default()), ..base() }) {
             self.rendered = 0;
         }
         self.gain.set(gain, || Config {
@@ -64,7 +76,7 @@ impl Processing {
                 adaptive_digital: Some(AdaptiveDigital::default()),
                 ..Default::default()
             }),
-            ..Default::default()
+            ..base()
         });
     }
 
@@ -173,6 +185,18 @@ mod tests {
         let out = run(&mut processing, &vec![0.0; len], &near);
         let change = db(&out[RATE..]) - db(&near[RATE..]);
         assert!(change.abs() < 1.0, "voice changed by {change:.1} dB");
+    }
+
+    #[test]
+    fn keeps_the_whole_band() {
+        // 18 kHz: gone if the processing ran at 32 kHz.
+        let tone: Vec<f32> =
+            (0..2 * RATE).map(|i| 0.1 * (std::f32::consts::TAU * 18_000.0 * i as f32 / RATE as f32).sin()).collect();
+        let mut processing = Processing::new();
+        processing.configure(true, false);
+        let out = run(&mut processing, &vec![0.0; tone.len()], &tone);
+        let change = db(&out[RATE..]) - db(&tone[RATE..]);
+        assert!(change.abs() < 1.0, "an 18 kHz tone changed by {change:.1} dB");
     }
 
     #[test]
