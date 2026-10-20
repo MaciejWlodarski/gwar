@@ -16,5 +16,5 @@ export type Request =
 export type Report =
   | { type: "ready" }
   | { type: "failed"; reason: string }
-  /** Average ms a frame took over a second: too slow for this machine. */
-  | { type: "slow"; ms: number };
+  /** Too slow for this machine. */
+  | { type: "slow"; reason: string };

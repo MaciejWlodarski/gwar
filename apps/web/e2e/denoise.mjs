@@ -34,7 +34,7 @@ async function measure() {
   const { startDenoise } = await window.__gwarE2eImport("/src/voice/denoise/index.ts");
   const troubles = [];
   const started = performance.now();
-  const model = await startDenoise({ trouble: reason => troubles.push(reason), changed: () => {} });
+  const model = await startDenoise({ trouble: reason => troubles.push(reason), changed: () => {} }, new AbortController().signal);
   const loadMs = performance.now() - started;
   const context = new AudioContext({ sampleRate: 48_000 });
   await context.resume();
@@ -66,7 +66,8 @@ async function measure() {
   await sleep(500);
   const passed = await level();
   model.setActive(true);
-  await sleep(1500);
+  // Past two of the worklet's pace checks (2 s each): a machine that keeps up raises no trouble.
+  await sleep(4500);
   const cleaned = await level();
   model.close();
   await context.close();

@@ -77,7 +77,8 @@ export class WebRtcVoiceEngine implements VoiceEngine {
    * the rest of the page if it cannot run here.
    */
   private denoise: DenoisePipeline | null = null;
-  private denoiseLoading = false;
+  /** The model loading for a run (`runId`), cancelled when that run ends or suppression goes off. */
+  private denoiseLoad: { run: number; abort: AbortController } | null = null;
   private denoiseUnavailable = false;
   private state: VoiceState = "idle";
   private runId = 0;
@@ -343,36 +344,48 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     return this.state === "starting" || this.state === "connected";
   }
 
-  /** Loads the model in the background, once per page; the browser's suppression works meanwhile. */
+  /** Loads the model in the background for this run; the browser's suppression works meanwhile. */
   private loadDenoise(): void {
-    if (this.denoise || this.denoiseLoading || this.denoiseUnavailable || !this.capture.noiseSuppression) return;
-    this.denoiseLoading = true;
+    if (this.denoise || this.denoiseUnavailable || !this.capture.noiseSuppression || this.denoiseLoad?.run === this.runId) return;
+    this.cancelDenoiseLoad();
+    const load = { run: this.runId, abort: new AbortController() };
+    this.denoiseLoad = load;
     let pipeline: DenoisePipeline | null = null;
-    startDenoise({
-      trouble: reason => {
-        if (pipeline && this.denoise === pipeline) this.denoiseTrouble(reason);
+    startDenoise(
+      {
+        trouble: reason => {
+          if (pipeline && this.denoise === pipeline) this.denoiseTrouble(reason);
+        },
+        changed: () => {
+          if (pipeline && this.denoise === pipeline) void this.updateSentTrack();
+        },
       },
-      changed: () => {
-        if (pipeline && this.denoise === pipeline) void this.updateSentTrack();
-      },
-    }).then(
+      load.abort.signal,
+    ).then(
       async loaded => {
-        pipeline = loaded;
-        this.denoiseLoading = false;
-        if (!this.inCall() || !this.capture.noiseSuppression) {
+        // A load another run started, or one cancelled: its pipeline is not this run's.
+        if (this.denoiseLoad !== load || !this.inCall()) {
           loaded.close();
           return;
         }
+        this.denoiseLoad = null;
+        pipeline = loaded;
         this.denoise = loaded;
         loaded.setStrength(this.capture.noiseStrength);
         // Captured again, without the browser's suppression, and sent through the model.
         await this.reopenMic();
       },
       (error: unknown) => {
-        this.denoiseLoading = false;
+        if (this.denoiseLoad !== load) return;
+        this.denoiseLoad = null;
         this.denoiseTrouble(error instanceof Error ? error.message : String(error));
       },
     );
+  }
+
+  private cancelDenoiseLoad(): void {
+    this.denoiseLoad?.abort.abort();
+    this.denoiseLoad = null;
   }
 
   /** The model cannot run here: the browser's suppression for the rest of the page. */
@@ -385,6 +398,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   }
 
   private closeDenoise(): void {
+    this.cancelDenoiseLoad();
     this.denoise?.close();
     this.denoise = null;
   }

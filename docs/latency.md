@@ -649,26 +649,44 @@ frames, so it adds the 10 ms alone.
 The module and the model's archive (36 MB) are downloaded the first time
 suppression is on in a call and kept in the Cache API; the archive must match its
 SHA-256 pin (`crates/gwar-denoise-wasm/model.json`), which the build checks too. The
-browser's own suppression works until the model has loaded (~0.8 s once cached),
-then the microphone is opened again without it and sent through the model. The
-model runs only while the microphone is sent: muted, deafened or push-to-talk
-released, it idles, and starts over when sending resumes. On loading, 200 frames of
-quiet noise run through it, so the browser compiles it fully before it counts; if
-the last 100 of them, or any later second of frames, average more than 3 ms a
-frame, the machine is too slow for it beside everything else on the audio thread,
-and the page falls back to the browser's suppression, as it does if the model
-fails, cannot load, or the browser cannot take the microphone into a 48 kHz context
-(Firefox, for a microphone at another rate). The desktop build of the web app leaves
-all of this out.
+browser's own suppression works until the model has loaded (~1.2 s once cached),
+then the microphone is opened again without it and sent through the model. A load
+belongs to its call: ending the call, or turning suppression off, cancels it and
+releases what it holds. The model runs only while the microphone is sent: muted,
+deafened or push-to-talk released, it idles, and starts over when sending resumes.
+The capture context resumes on the next user gesture whenever it is not running
+(not yet allowed to start, or interrupted by Safari); until then the microphone is
+sent as captured.
 
-Tests: the framing's 448-sample delay and order (unit tests); the engine's switch
-between the browser's suppression and the model, idling, fallback and late loads
-(unit tests with a stand-in); `scripts/denoise-wasm/build.sh` checks the pin, that
+The worklet compiles the module asynchronously; building the model (~0.3 s) is the
+one step that holds the audio thread, which Firefox shares with the page's other
+48 kHz contexts, so playback there can pause once while the model loads. 200 frames
+of quiet noise then run through the model, one every other render quantum, so the
+browser compiles it fully before it counts; if the second half of them averages
+more than 8 ms a frame, the model could not keep up even running flat out.
+
+After that, a frame's time is no measure of trouble. On Apple Silicon a frame takes
+~1.2 ms on the audio thread when it runs every quantum, but ~3.6 ms at one frame per
+10 ms, as the system clocks the thread down; and a render callback that runs late
+(WebKit's last 2.67 ms) costs nothing while the device's buffer covers it. What
+harms is a callback the device skips: the audio clock then falls behind the wall
+clock, and the microphone loses that audio. So every 2 s the worklet compares the
+two clocks; behind by more than 3% twice in a row, the machine is too slow for the
+model beside everything else on the audio thread, and the page falls back to the
+browser's suppression, as it does if the model fails, cannot load, or the browser
+cannot take the microphone into a 48 kHz context (Firefox, for a microphone at
+another rate). The desktop build of the web app leaves all of this out.
+
+Tests: the framing's 448-sample delay and order, and the pace check (unit tests);
+the engine's switch between the browser's suppression and the model, idling,
+fallback, and loads that end with their call or are cancelled (unit tests with a
+stand-in); `scripts/denoise-wasm/build.sh` checks the pin, that
 the module imports nothing, and that it takes white noise down by more than 20 dB
 in real time; and `apps/web/e2e/denoise.mjs` loads the built app's model in
 Chromium, WebKit and Firefox and checks that noise through the worklet goes down by
-more than 20 dB, and passes as captured while the microphone is not sent (Chromium
-and WebKit locally: from -30 dBFS to -89 and -95, loaded in ~0.8 s).
+more than 20 dB with no trouble past two pace checks, and passes as captured while
+the microphone is not sent (Chromium and WebKit locally: from -30 dBFS to about -80,
+loaded in ~1.2 s; the audio clocks kept within 0.5% of the wall clock).
 
 ## Native 10 ms frames
 

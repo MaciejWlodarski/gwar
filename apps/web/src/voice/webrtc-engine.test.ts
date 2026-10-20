@@ -3,7 +3,7 @@ import type { DenoiseEvents, DenoisePipeline } from "./denoise";
 import type { VoiceEngine } from "./engine";
 import { WebRtcVoiceEngine } from "./webrtc-engine";
 
-const startDenoise = vi.hoisted(() => vi.fn<(events: DenoiseEvents) => Promise<DenoisePipeline>>());
+const startDenoise = vi.hoisted(() => vi.fn<(events: DenoiseEvents, signal: AbortSignal) => Promise<DenoisePipeline>>());
 vi.mock("./denoise", () => ({ startDenoise }));
 
 function deferred<T>() {
@@ -285,6 +285,34 @@ describe("browser noise suppression", () => {
     expect(model.close).toHaveBeenCalledOnce();
     expect(constraints(2).noiseSuppression).toBe(false);
     expect(sender().replaceTrack).toHaveBeenLastCalledWith((await captured(2)).getAudioTracks()[0]);
+  });
+
+  it("cancels a load when its call ends, and the next call loads and uses its own", async () => {
+    const first = deferred<DenoisePipeline>(), second = deferred<DenoisePipeline>();
+    startDenoise.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+    await engine.start(params());
+    const cancelled = startDenoise.mock.calls[0]![1];
+    await engine.stop();
+    expect(cancelled.aborted).toBe(true);
+    await engine.start(params());
+    expect(startDenoise).toHaveBeenCalledTimes(2);
+    const stale = pipeline(), current = pipeline();
+    first.resolve(stale as DenoisePipeline);
+    await flush();
+    expect(stale.close).toHaveBeenCalledOnce();
+    expect(stale.setSource).not.toHaveBeenCalled();
+    second.resolve(current as DenoisePipeline);
+    await flush();
+    expect(current.close).not.toHaveBeenCalled();
+    expect(current.setSource).toHaveBeenCalledOnce();
+    expect(constraints(2).noiseSuppression).toBe(false);
+  });
+
+  it("cancels a load in progress when suppression is turned off", async () => {
+    startDenoise.mockReturnValueOnce(new Promise(() => {}));
+    await engine.start(params());
+    await engine.setCaptureOptions({ noiseSuppression: false, noiseStrength: 100, echoCancellation: true, autoGainControl: true });
+    expect(startDenoise.mock.calls[0]![1].aborted).toBe(true);
   });
 
   it("closes a model that loads after the call ended", async () => {
