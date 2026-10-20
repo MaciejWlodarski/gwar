@@ -334,10 +334,21 @@ evidence such as a 5 ms packet delay every three seconds. The margin excludes
 the pending refill, adaptive jitter reserve beyond packet batching, and 120 samples (2.5 ms)
 of safety. Arrival phase contributes no credit. Each correction proposes at most
 720 samples (15 ms). Each committed cut is subtracted from every historical
-margin, so later corrections cannot spend the same surplus twice. Concealment
-samples actual queued depth with the pending refill demand; an empty queue
-vetoes shrinking for the full window, while isolated packet loss need not erase
-still-supported surplus. Corrections are at least 500 ms apart (at most 10 ms/s
+margin, so later corrections cannot spend the same surplus twice. Depth is
+buffered time from the playout position to the end of the queue, holes
+included, and every observation is revised in hindsight by the arrivals after
+it: the first packet at or beyond the queue's end extends it over the missing
+packets (they were lost and are concealed, never late), while a packet arriving
+inside the span pulls it back to itself (it was not there). Under the TS sequence
+clock a key stride says nothing about duration, so an observation keeps the
+durations of the packets queued then and counts a hole as the shortest of them. Only the present
+packets used to count, so every loss looked like a one-packet dip at the tail;
+with a loss every couple of seconds the window never cleared and a 10--20 ms
+residual stayed for good (the receiver's "level steps"). Concealment samples
+the queue with the refill demand the PLC left, not the whole demand again. An
+empty queue still vetoes shrinking for the full window unless a later arrival
+proves a loss; a dip whose fate is still unknown vetoes a cut, but only a
+settled low mark restarts the shrink hold. Corrections are at least 500 ms apart (at most 10 ms/s
 for quiet audio or 30 ms/s for a correlated 15 ms period). Surplus below 120
 samples is not corrected. Startup, observation gaps and stall recovery still
 require a fresh window. The post-trim concealment counter retains its one-second
@@ -384,6 +395,35 @@ comparison demonstrates no latency improvement attributable to TSM. These are
 single pairs on a shared Mac, not controlled idle-host measurements. Synthetic
 splice tests did show 39.5--99.98% less normalized magnitude-spectrum error than
 the equal-count skip/fade baseline across all 36 tone/vibrato/phase cases.
+
+Level steps (2026-10-20). Under the mixed profile (`up:delay=20ms,jitter=5ms,
+keep_order,stall=270ms@12s,every=10s;down:loss=1%,burst=3@0.5%,reorder=0.5%`)
+marker latency moved between 67, 77 and 95 ms from one stall to the next. The
+harness now writes `{output}.timeline.csv` (playout state every 100 ms); it shows
+the queue holding one extra 10 ms packet (mean 25 instead of 16 ms) in the 77 ms
+windows. Two causes: stall recovery kept the packet straddling its deadline (the
+stall rarely ends on a packet boundary; the sequence clock also rounded the
+deadline down), and the fractional drain needs a fresh five-second window after
+each stall, so one packet of excess usually survives until the next. Recovery now
+discards every packet that starts before the deadline, still keeping the target
+and the pending refill. Separately, loss no longer counts as a low-water dip (see
+above); that matters for steady streams with frequent loss and is neutral here.
+
+Local runs, 2026-10-20, 200 markers, median per 10 s window between stalls
+(windows over 72 ms count as a step). Single runs on a shared Mac; harness exit
+status 1 because the mixed profile loses more than 5% of markers by design.
+
+| Build | Seeds | Stepped windows | Mean of window medians | Concealments / run | Late drops / run |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `cb004d8` | 3, 5, 7 | 4 / 15 | 71.1 ms | 216 | 21.7 |
+| hindsight marks only | 3, 5, 7, 11, 13, 17 | 11 / 30 | 72.7 ms | 222 | 18.2 |
+| + recovery rounding | 3, 5, 7, 11, 13, 17 | 5 / 30 | 69.5 ms | 226 | 21.5 |
+
+The remaining steps follow longer loss bursts or stalls while the jitter
+estimate is high. The drain still subtracts the jitter reserve from a low-water
+minimum that already contains the jitter dips, and restarts its window after
+every stall; relaxing either would drain faster at some risk of late packets and
+is left as a separate decision.
 
 Receiver recovery follow-up (2026-10-16; measurement pending). Low-water
 observations now survive isolated PLC and are debited after each cut, retaining
