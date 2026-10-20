@@ -542,6 +542,9 @@ class Controller {
     conn.onWelcome((welcome, resync) => {
       if (this.conn !== conn) return;
       this.entered.clear();
+      // Joins asked before this Welcome can no longer settle (their session ended): drop their spinner
+      // before any rejoin below shows its own.
+      useUi.getState().setJoining(null);
       if (!resync) this.channelPasswords.clear();
       this.historyRequested.clear();
       this.sentRead.clear();

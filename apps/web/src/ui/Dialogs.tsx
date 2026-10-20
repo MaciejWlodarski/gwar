@@ -456,8 +456,12 @@ function ChannelPasswordDialog({ channel }: { channel: number }) {
     setBusy(true);
     setError(null);
     try {
-      // An answer for an ended session: this dialog closed with it, and must not close what is open now.
-      if (!(await controller.joinChannel(channel, password))) return;
+      // An answer for an ended session must not close what is open now. After a resync this dialog
+      // is still open: let the password be sent again.
+      if (!(await controller.joinChannel(channel, password))) {
+        setBusy(false);
+        return;
+      }
       close();
       useUi.getState().setDrawer(false);
     } catch (err) {

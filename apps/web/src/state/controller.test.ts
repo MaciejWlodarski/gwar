@@ -636,6 +636,20 @@ describe("joining password channels", () => {
     expect(stores.useUi.getState().dialog.kind).toBe("none");
     expect(stores.useUi.getState().toasts).toEqual([]);
   });
+
+  it("drops the spinner of a join a resync ended", async () => {
+    teamspeak();
+    const answer = holdJoin();
+    const joined = controller.joinChannel(3);
+    expect(stores.useUi.getState().joining).toBe(3);
+    link.status_({ state: "reconnecting", attempt: 1, retryAt: 0 });
+    // The resync keeps me in channel 1, where I was.
+    link.welcomeNow(welcome({ session: 9, uid: "u1", permissions: ["bypass_password", "connect"], channels: [chan(1), chan(3)], clients: [client(9, 1, { uid: "u1" })] }), true);
+    expect(stores.useUi.getState().joining).toBeNull();
+    answer();
+    expect(await joined).toBe(false);
+    expect(stores.useUi.getState().joining).toBeNull();
+  });
 });
 
 describe("sending, editing and deleting", () => {
