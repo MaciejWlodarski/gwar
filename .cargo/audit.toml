@@ -3,4 +3,8 @@
 # 0.7 (its `libcrux` feature, which openmls_rust_crypto 0.6 does not enable),
 # so it is never built; CI checks that it stays out of the build. Drop this
 # when openmls_rust_crypto moves to hpke-rs 0.8.
-ignore = ["RUSTSEC-2026-0330", "RUSTSEC-2026-0331"]
+# webpki-roots 0.26.11 is a semver shim that re-exports TLS_SERVER_ROOTS from
+# webpki-roots 1.x, which is locked at a patched version (>= 1.0.10), so the
+# emSign roots RUSTSEC-2026-0381 flags are not in the build. Drop this when
+# rustls-acme (async-web-client) and tokio-tungstenite move to webpki-roots 1.
+ignore = ["RUSTSEC-2026-0330", "RUSTSEC-2026-0331", "RUSTSEC-2026-0381"]
