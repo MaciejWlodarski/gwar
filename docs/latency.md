@@ -394,6 +394,35 @@ single pairs on a shared Mac, not controlled idle-host measurements. Synthetic
 splice tests did show 39.5--99.98% less normalized magnitude-spectrum error than
 the equal-count skip/fade baseline across all 36 tone/vibrato/phase cases.
 
+Level steps (2026-10-20). Under the mixed profile (`up:delay=20ms,jitter=5ms,
+keep_order,stall=270ms@12s,every=10s;down:loss=1%,burst=3@0.5%,reorder=0.5%`)
+marker latency moved between 67, 77 and 95 ms from one stall to the next. The
+harness now writes `{output}.timeline.csv` (playout state every 100 ms); it shows
+the queue holding one extra 10 ms packet (mean 25 instead of 16 ms) in the 77 ms
+windows. Two causes: stall recovery kept the packet straddling its deadline (the
+stall rarely ends on a packet boundary; the sequence clock also rounded the
+deadline down), and the fractional drain needs a fresh five-second window after
+each stall, so one packet of excess usually survives until the next. Recovery now
+discards every packet that starts before the deadline, still keeping the target
+and the pending refill. Separately, loss no longer counts as a low-water dip (see
+above); that matters for steady streams with frequent loss and is neutral here.
+
+Local runs, 2026-10-20, 200 markers, median per 10 s window between stalls
+(windows over 72 ms count as a step). Single runs on a shared Mac; harness exit
+status 1 because the mixed profile loses more than 5% of markers by design.
+
+| Build | Seeds | Stepped windows | Mean of window medians | Concealments / run | Late drops / run |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `cb004d8` | 3, 5, 7 | 4 / 15 | 71.1 ms | 216 | 21.7 |
+| hindsight marks only | 3, 5, 7, 11, 13, 17 | 11 / 30 | 72.7 ms | 222 | 18.2 |
+| + recovery rounding | 3, 5, 7, 11, 13, 17 | 5 / 30 | 69.5 ms | 226 | 21.5 |
+
+The remaining steps follow longer loss bursts or stalls while the jitter
+estimate is high. The drain still subtracts the jitter reserve from a low-water
+minimum that already contains the jitter dips, and restarts its window after
+every stall; relaxing either would drain faster at some risk of late packets and
+is left as a separate decision.
+
 Receiver recovery follow-up (2026-10-16; measurement pending). Low-water
 observations now survive isolated PLC and are debited after each cut, retaining
 the five-second jitter protection without repeatedly restarting it. Deterministic

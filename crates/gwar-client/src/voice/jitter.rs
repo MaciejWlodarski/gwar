@@ -193,7 +193,7 @@ impl JitterBuffer {
                 let behind = elapsed_samples.saturating_sub(self.target_samples().saturating_sub(last_samples));
                 let advance = match clock {
                     Clock::Rtp => behind,
-                    Clock::Sequence => behind / last_samples * FRAME,
+                    Clock::Sequence => behind.div_ceil(last_samples) * FRAME,
                 };
                 self.recovering =
                     Some(Recovery { until: now + Duration::from_millis(200), before: last_ts.saturating_add(advance) });
@@ -378,14 +378,14 @@ impl JitterBuffer {
         }
         let mut fade = false;
         if let Some(recovery) = &self.recovering {
-            // Only discard media behind the stalled timeline's deadline, and
-            // retain enough audio for this refill as well as the pre-stall target.
+            // Only discard media that starts behind the stalled timeline's deadline, and
+            // retain enough audio for this refill as well as the pre-stall target. A packet
+            // straddling the deadline goes too: kept, it stayed as up to one packet of excess
+            // delay that the fractional drain rarely removes before the next stall.
             let mut depth = self.depth().1;
             while self.packets.len() > 1 {
                 let (&ts, packet) = self.packets.first_key_value().unwrap();
-                if ts.saturating_add(packet.step) > recovery.before
-                    || depth - packet.samples < self.target_samples().max(demand as u64)
-                {
+                if ts >= recovery.before || depth - packet.samples < self.target_samples().max(demand as u64) {
                     break;
                 }
                 let (_, packet) = self.packets.pop_first().unwrap();
@@ -737,6 +737,32 @@ mod tests {
                 }
                 assert_eq!(jb.concealments, MAX_CONCEAL / FRAME);
             }
+        }
+    }
+
+    #[test]
+    fn recovery_does_not_keep_the_packet_straddling_its_deadline() {
+        // A stall that ends mid-packet (277 ms of 10 ms packets, 10 ms of jitter): keeping the
+        // packet across the deadline left 10 ms over the target until the next stall (the
+        // harness "level steps").
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            let stride = if clock == Clock::Sequence { FRAME } else { 480 };
+            let mut jb = JitterBuffer::new();
+            let start = Instant::now();
+            jb.push_at(0, 480, vec![0], start, clock);
+            assert_eq!(jb.pop_for(start, 480), packet(0));
+            for i in 1..27 {
+                jb.pop_for(start + Duration::from_millis(i * 10), 480);
+            }
+            jb.jitter = 480.0;
+            let burst = start + Duration::from_millis(277);
+            for i in 1..=29 {
+                jb.push_at(i * stride, 480, vec![i as u8], burst, clock);
+            }
+            assert!(matches!(jb.pop_for(burst, 480), Playout::Packet { fade: true, .. }));
+            let target = jb.target_samples();
+            assert!(jb.depth().1 <= target, "{clock:?}: depth {} over target {target}", jb.depth().1);
+            assert!(jb.depth().1 + 480 >= target, "{clock:?}: depth {} under target {target}", jb.depth().1);
         }
     }
 
