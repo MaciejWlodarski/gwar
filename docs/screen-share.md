@@ -280,7 +280,7 @@ The largest keyframe was 204 KB at 1080p60, about 175 packets in a burst.
 | Encode | 2–15 ms (spike: VP9 3.6–5 ms, H.264 SW 5–15 ms, AV1 2.3 ms at 720p) |
 | Pacing (keyframe bursts) | 0–20 ms |
 | Network, sharer → SFU → viewer | RTT-dependent, 10–60 ms in region |
-| SFU | < 1 ms for delta frames when the viewer has room; a keyframe leaves over size ÷ (0.8 × the viewer's estimate), e.g. 100 ms for 200 KB at 20 Mbps; queued packets are evicted at 400 ms, and no payload, repairs included, leaves later than 700 ms after arrival ([Queues and repairs](#queues-and-repairs)) |
+| SFU | < 1 ms for delta frames when the viewer has room; a keyframe leaves over size ÷ (0.8 × the viewer's estimate), e.g. 100 ms for 200 KB at 20 Mbps; no original packet leaves later than 400 ms after arrival; repairs are best effort, bounded in volume, not age ([Queues and repairs](#queues-and-repairs)) |
 | Jitter buffer | 5–50 ms (spike: 5–53 ms on loopback) |
 | Decode + render | 2–20 ms (one display refresh) |
 
@@ -539,14 +539,18 @@ end-to-end layer.
 
 ### Queues and repairs
 
-**The promise, measured at the SFU's own transmission:** no video payload
-leaves the SFU more than **700 ms** after the SFU received it from the
-publisher. That covers original packets, RTX repairs and padding probes that
-reuse cached media. Nothing is promised about downstream network queues; the
-SFU cannot see them.
+**What is bounded, measured at the SFU's own transmission:**
 
-Three parts make up the 700 ms: the Gwar queue (400 ms), str0m's repair cache
-(200 ms) and the cache wipe interval (100 ms).
+- **Original packets** leave the SFU at most **400 ms** after the SFU received
+  them from the publisher. Later ones are evicted.
+- **Pause, unwatch and slot reassignment** stop everything for that slot:
+  originals, repairs and padding that reuses its media. Nothing from before
+  the stop is sent afterwards.
+- **Repairs** (RTX answers to NACKs, and padding probes that reuse cached
+  media) have **no hard age bound**. Their age is normally under 400 + 200 ms,
+  but str0m cannot enforce that (below). Their volume is bounded instead.
+
+Nothing is promised about downstream network queues; the SFU cannot see them.
 
 **Why str0m's pacer cannot be the queue:**
 
@@ -576,71 +580,94 @@ Three parts make up the 700 ms: the Gwar queue (400 ms), str0m's repair cache
   queued bytes stay at or under `max(64 KB, 400 ms × release rate)`.
   Otherwise it is dropped like an eviction. The bound is checked per packet,
   so it never overshoots.
+- Both kinds of drop are recorded per frame. A keyframe that loses any packet
+  either way is a **failed keyframe**, which the pause rule counts.
 - **Pause, unwatch and drops clear the queue at once.** Only packets released
   to str0m in the current loop iteration can still leave.
 - **Measured, not sampled.** The queue's bytes and oldest age come from Gwar's
   own bookkeeping; `queue_info()` is not used for decisions.
 
-**Repairs: str0m's RTX cache, bounded by Gwar.**
+**Repairs: str0m's RTX cache.**
 
-str0m's cache cannot enforce an age by itself:
+Every video `StreamTx` gets `set_rtx_cache(1024, 200 ms, Some(0.15))`. Its age
+limit is a target, not a bound:
 
-- it evicts by age only when another packet is cached
+- eviction runs only when a packet is cached
   (`streams/rtx_cache.rs`, `cache_sent_packet` → `maybe_evict`);
+- it scans in sequence order and stops at the first fresh entry
+  (`streams/rtx_cache_buf.rs`, `evict`). A delayed publisher repair with a
+  lower sequence number, cached later, therefore shields older entries behind
+  it while traffic continues;
 - lookup checks no age;
 - padding probes reuse cached packets without the NACK limiter
   (`streams/send.rs`, `poll_packet_padding`);
 - `rtx_ratio_cap` is a periodically sampled ratio, not a hard cap.
 
-Gwar still has one public lever that is enforceable:
+**Why no age bound is needed:**
+
+- **Freshness belongs to originals,** and the Gwar queue enforces it.
+- **A stale repair costs bandwidth, not correctness.** It is the same
+  ciphertext with the same mapped sequence number. A viewer only NACKs packets
+  it is still waiting for. Its jitter buffer discards a packet for a frame it
+  already played or skipped, and a duplicate is dropped.
+- **Stale padding is still only padding.** Probes are sent only while the
+  desired bitrate exceeds the estimate, at the rate BWE asks for, whatever
+  bytes fill them.
+- **Volume is bounded.** The cache holds at most 1024 packets, about 1.2 MB,
+  per slot. All repair and padding bytes count in the continuous egress
+  measurement and against the 1.3 × reservation in "Admission and resource
+  limits".
+
+**The one hard lever, used where a hard stop matters:**
 `StreamTx::set_rtx_cache` **replaces the cache with an empty one**
-(`streams/send.rs`: "Dump old cache"). So:
+(`streams/send.rs`: "Dump old cache"). Pause, unwatch and slot reassignment
+call it on the slot's stream. After that, neither a late NACK nor a probe can
+send anything of the old media on that stream.
 
-- Every video `StreamTx` gets `set_rtx_cache(1024, 200 ms, Some(0.15))`. The
-  ratio cap stays as a soft limiter, not as a bound.
-- **Pause, unwatch and slot reassignment wipe the slot's cache** by calling
-  `set_rtx_cache` again. After that, neither a late NACK nor a probe can send
-  anything of the old media on that stream.
-- **Idle wipe.** A 25 ms timer wipes the cache of any slot that has cached no
-  new packet for 75 ms. While a slot is active, every new packet evicts entries
-  older than 200 ms. While it is idle, the wipe does. A cached packet therefore
-  never outlives its transmission by more than 200 + 100 ms.
-- Its transmission was at most 400 ms after arrival (the queue deadline), so
-  every repair or probe that reuses it leaves within 400 + 200 + 100 = 700 ms
-  of arrival.
-- **Repair volume.** Repairs and padding are not in the Gwar queue. Their
-  volume is bounded by the 1.3 × reservation charge and the continuous egress
-  measurement in "Admission and resource limits", not by the ratio cap.
-
-**Options considered:**
+**Options considered and rejected:**
 
 - **Gwar answers NACKs itself** (str0m's RTX cache off). This would need two
   things str0m 0.24.1 does not offer in RTP mode: incoming NACKs reach the
   application only as debug `RawPacket` events, and `write_rtp` writes the
   main SSRC, with no public way to emit RTX-format packets on the RTX SSRC.
   That means a str0m fork or upstream change, so it is not phase 1.
-- **Rebuilding the watch transport** on every pause or unwatch would also
-  bound everything, but it interrupts all four slots with a DTLS handshake.
-  The wipe above achieves the bound with the public API at no cost.
-- Rebuilding stays the **mandatory fallback**. It is used if a str0m upgrade
-  changes `set_rtx_cache`'s replace-on-set behavior, which PR 3 pins with a
-  test, or if PR 3's tests find a path that resends media the wipe misses.
+- **A periodic wipe**, every 100 ms for example, would bound repair age to
+  the period plus the 400 ms queue deadline. But every wipe also drops fresh
+  entries. Any loss whose NACK arrives after the wipe can no longer be
+  repaired, so the viewer must wait for a keyframe: a visible freeze, to save
+  bandwidth that stale repairs rarely use.
+- **A wipe at each keyframe** costs nothing visible, since the viewer skips to
+  the keyframe anyway. But screen shares send keyframes only on request, so it
+  bounds nothing.
+- **Rebuilding the watch transport** on every pause or unwatch also stops
+  everything, but it restarts all four slots with a DTLS handshake. The wipe
+  does the same with the public API. Rebuilding stays the **mandatory
+  fallback** if a str0m upgrade changes `set_rtx_cache`'s replace-on-set
+  behavior, which PR 3 pins with a test.
+- **Upstream fix.** If str0m gains an age check on lookup or time-ordered
+  eviction, repairs get a hard bound at no cost. That is worth proposing
+  upstream, but phase 1 does not depend on it.
 
 **Tests in PR 3**, with str0m viewers behind the relay's `rate=` bottleneck.
 Every check timestamps packets **at the SFU's socket send**, against their
 arrival from the publisher:
 
-- **A bandwidth collapse** from 10 to 1 Mbps mid-share: no payload is sent
-  past 700 ms, queued packets are evicted at 400 ms, and the viewer is paused
-  by the allocation rule.
-- **Pause and unwatch:** no original media for the slot after the pausing
-  iteration.
-- **A late NACK:** the viewer NACKs a packet 250 ms after its transmission
-  (beyond the 200 ms cache age) and gets nothing. A NACK after pause, or
-  after an idle period over 75 ms, gets nothing either.
-- **A probe after pause:** forced BWE probing (a raised desired bitrate) on a
-  watch transport with a paused slot sends only blank padding or other active
-  slots' fresh media, never the paused slot's.
+- **A bandwidth collapse** from 10 to 1 Mbps mid-share: no original is sent
+  past 400 ms, and the viewer is paused by the allocation rule.
+- **Pause and unwatch:** after the pausing iteration, nothing of the slot's
+  old media is sent. That covers originals, a NACK for a packet sent just
+  before the pause, and a forced BWE probe on the same watch transport, which
+  sends only blank padding or other active slots' media.
+- **A reordered publisher repair:**
+  - 102 arrives at 0 ms and is sent at 390 ms;
+  - a delayed 101 is sent at 580 ms;
+  - traffic continues every 25 ms;
+  - the viewer NACKs 102 at 715 ms.
+
+  The test records whether str0m still serves it, so a str0m change is
+  noticed. It asserts the viewer's playout is unaffected (no extra freeze,
+  frames byte-identical), the slot's repair and padding bytes stay within its
+  reservation, and a pause still wipes the shielded entry.
 - **A test pins str0m behavior:** `set_rtx_cache` empties the cache.
 
 ### Keyframes
@@ -683,8 +710,12 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   "bandwidth"}`), lowest priority first, when either of these holds:
   - the sum of its 2 s average and the higher-priority slots' averages exceeds
     `B`, for 5 s;
-  - its packets were evicted at the deadline in two keyframes within 10 s.
-    That means the keyframes, not the average, do not fit.
+  - two of its keyframes failed within 10 s, that is, lost packets either
+    to the deadline or to admission ("Queues and repairs"). That means the
+    keyframes, not the average, do not fit. Counting admission matters: at a
+    3 Mbps estimate, `B` is 2.4 Mbps and the admission bound 120 KB, so a
+    204 KB keyframe is rejected at admission before any packet reaches its
+    deadline.
 - **Resume** only when, for 10 s:
   `B − Σ other slots' averages ≥ max(1.2 × its average, K_last / 400 ms)`.
   `K_last` is the share's last keyframe size. Resuming accounts for the
@@ -701,11 +732,20 @@ example, a viewer with about 4 Mbps of estimate cannot watch a 1080p share
 whose keyframes are 200 KB. That is the honest limit of a single-layer share;
 phase 2's lower-resolution layer is the remedy.
 
-Test in PR 3: a Text-preset share averaging 0.3–0.5 Mbps, forced to emit
-204 KB keyframes every 2 s, watched by an unconstrained viewer and a 20 Mbps
-viewer. Neither is paused, no packet is evicted, and each keyframe leaves the
-SFU within `K ÷ B` plus 10 ms. A 3 Mbps viewer of the same share is paused by
-the keyframe rule and not resumed while its estimate stays at 3 Mbps.
+Tests in PR 3, with a Text-preset share averaging 0.3–0.5 Mbps, forced to
+emit 204 KB keyframes every 2 s:
+
+- **Room for keyframes.** An unconstrained viewer and a 20 Mbps viewer: neither
+  is paused, no packet is dropped, and each keyframe leaves the SFU within
+  `K ÷ B` plus 10 ms.
+- **Admission overflow.** A 3 Mbps viewer: the keyframes fail at admission,
+  the viewer is paused within two keyframes, and it is not resumed while its
+  estimate stays at 3 Mbps.
+- **Deadline expiry.** A 6 Mbps viewer whose stage share takes 3 Mbps: the
+  204 KB keyframe fits the 240 KB admission bound but gets only about
+  1.8 Mbps, so it expires at the deadline. The average trigger stays below
+  `B`, and the keyframe trigger pauses the low-priority slot within two
+  keyframes. The stage share is unaffected.
 
 The sharer is never slowed by viewers. The SFU never relays viewers' estimates
 or REMB to the publisher. The sharer adapts only to its own uplink (TWCC on
@@ -1116,7 +1156,7 @@ person.
    - Stable sequence mapping with segments, and timestamp offsets.
    - Per-packet ingress enforcement with frame bounds; the Gwar-owned
      per-viewer priority queue with unpaced streams, 400 ms deadlines and
-     bounded admission; RTX cache age, wipe on pause/unwatch/idle;
+     bounded admission; RTX cache wiped on pause/unwatch/reassignment;
      wait-for-keyframe; the one
      keyframe throttle, and NACK/RTX.
    - Per-viewer aggregate allocation with pause/resume.
@@ -1141,10 +1181,10 @@ person.
        512 KB, 600 packets or 500 ms is cut at the bound, and three such
        overruns in 10 s stop the share;
      - the tests in "Queues and repairs": a bandwidth collapse,
-       pause/unwatch, a late NACK, a probe after pause, and the
-       `set_rtx_cache` pin;
-     - the allocation test: a low-average share with large keyframes and an
-       unconstrained viewer.
+       pause/unwatch (NACK and probe included), a reordered publisher
+       repair, and the `set_rtx_cache` pin;
+     - the allocation tests: a low-average share with large keyframes on an
+       unconstrained viewer, admission overflow, and deadline expiry.
    - **Voice acceptance:** the paired measurements and gate in "Voice headroom
      and acceptance", including the `LATENCY_NET` `rate=` option and the
      screen load generator.
