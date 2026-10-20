@@ -595,12 +595,13 @@ An echo of a voice-like signal, 60 to 250 ms late and 10 dB down, went down by
 also after a switch from headphones to speakers mid-call); the near voice, talking
 over it, lost 1–4 dB, and with nothing played it is left as it is. Until then the
 canceller cannot know there is no echo: talking over the other side in the first
-~0.5–1.5 s they talk takes the voice down by ~45 dB (a browser's canceller starts the
-same way). With headphones it then lets the voice through as it is, after about 2 s
+~0.5–1.5 s they talk takes the voice down by ~45 dB (measured here; a browser's
+canceller is the same code, so it likely starts the same way). With headphones it then lets the voice through as it is, after about 2 s
 of the other side talking: the canceller's model-based detector of "no echo" is used
 (`TransparentModeType::Hmm`). The default, counter-based one cancels exactly as well
 with an echo, but kept taking a voice over a played tone down by 3–7 dB, and a tone
-over a tone (a steady voice, to it) by ~40 dB for good. Gain control brought a
+over a tone (a steady voice, to it) by ~40 dB, for about 6 s in both cases. Upstream
+WebRTC picks the model-based detector only through a field trial. Gain control brought a
 -40 dBFS voice to about -20.
 
 Tests (`apm.rs`): an echo 60 ms late and 10 dB down goes down by more than 25 dB; a
