@@ -750,6 +750,8 @@ class Controller {
       connection: { kind: s.kind, phase: s.phase, address: s.address || null, server: s.server?.name ?? null, insecure: s.insecureConnection },
       voice: { state: v.state, encryption: v.encryption, muted: v.muted, deafened: v.deafened, call: this.voiceDebug() },
       encryption: this.runtime ? "running" : this.conn ? "unavailable" : "not connected",
+      // Why messages may show checkpoints or revocation information unavailable.
+      messageChecks: { storage: messageStorage.error ?? "ok", revocations: messageStorage.feedError ?? "ok" },
       logs: recentLogs(),
     };
   }

@@ -4,21 +4,27 @@ import { messageFingerprint, MessageVerifier, invalidVerification, type MessageC
 
 /** View-local cache: immutable message/context fingerprints also share in-flight verification. */
 export class MessageVerificationCache {
-  private entries = new Map<number, { fingerprint: string; msg: ChatMessage; state: Promise<MessageVerification> }>();
+  private entries = new Map<number, { fingerprint: string; msg: ChatMessage; ctx: MessageContext; state: Promise<MessageVerification> }>();
   private verifier: MessageVerifier;
   constructor(private storage: MessageStorage = messageStorage) { this.verifier = new MessageVerifier(storage); }
   verify(msg: ChatMessage, ctx: MessageContext): Promise<MessageVerification> {
     const fingerprint = messageFingerprint(msg, ctx), old = this.entries.get(msg.id);
     if (old?.fingerprint === fingerprint) return old.state;
-    const snapshot = structuredClone(msg), state = this.verifier.verify(snapshot, ctx);
-    this.entries.set(msg.id, { fingerprint, msg: snapshot, state });
+    const snapshot = structuredClone(msg), context = structuredClone(ctx), state = this.verifier.verify(snapshot, context);
+    this.entries.set(msg.id, { fingerprint, msg: snapshot, ctx: context, state });
     if (this.entries.size > MAX_CHECKPOINTS) this.entries.delete(this.entries.keys().next().value!);
     return state;
   }
-  /** Refresh time/feed qualifications without hashing bodies, signatures or updating checkpoints. */
+  /** Refresh time/feed qualifications without hashing bodies or checking signatures again; only the
+   *  checkpoints storage could not take before are taken now. */
   async refresh(now = Date.now()): Promise<void> {
     const entries = [...this.entries.values()];
     const results = await Promise.all(entries.map((e) => e.state));
+    await Promise.all(entries.map(async (entry, i) => {
+      if (results[i]!.status !== "verified" || results[i]!.continuity !== "storage-unavailable") return;
+      entry.state = this.verifier.checkpoint(entry.msg, entry.ctx, results[i]!);
+      results[i] = await entry.state;
+    }));
     const certified = entries.filter((e, i) => results[i]!.status === "verified" && e.msg.signature?.certificate);
     if (!certified.length) return;
     await refreshRevocations();

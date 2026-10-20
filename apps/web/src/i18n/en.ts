@@ -452,7 +452,7 @@ export const en = {
   "chat.channelHistoryIncomplete": "this client could not keep a complete record of this server's deleted channels, so it cannot rule out a reused channel id",
   "chat.revocationsStale": "revocation information stale or unavailable",
   "chat.continuityUnproven": "continuity unproven; this device has no record of earlier versions, so it cannot detect a rollback. Older evicted history also has no rollback protection",
-  "chat.checkpointsUnavailable": "checkpoints unavailable; rollback protection unavailable",
+  "chat.checkpointsUnavailable": "this device cannot use its local storage for message checks right now, so it cannot detect a rollback. The check runs again once storage works; if this persists, the browser may be blocking site data (for example in a private window)",
   "chat.teamSpeakNotification": "TeamSpeak / unsigned",
   "chat.teamSpeakUnsigned": "TeamSpeak messages are unsigned: this server may have forged or altered this message",
   "chat.serverRemoved": "Message removed by the server",

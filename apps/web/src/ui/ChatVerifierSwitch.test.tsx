@@ -7,9 +7,10 @@ import { beforeEach, afterEach, it, expect, vi } from 'vitest';
 import { useSession } from '../state/stores';
 import { initialState } from '../state/reducer';
 import type { MessageVerification } from '../net/message-signature';
+import { messageStorage } from '../net/message-storage';
 import { MessageList } from './Chat';
 import { TooltipProvider } from './kit';
-const held = vi.hoisted(() => ({ jobs: [] as { serverKey: string; id: number; resolve: (s: MessageVerification) => void }[], map: new Map<number, { fingerprint: string }>(), controller: { messageServerKey: 'A', messageUid: Promise.resolve('me'), onRoster: () => () => {}, roster: () => null } }));
+const held = vi.hoisted(() => ({ refreshes: 0, jobs: [] as { serverKey: string; id: number; resolve: (s: MessageVerification) => void }[], map: new Map<number, { fingerprint: string }>(), controller: { messageServerKey: 'A', messageUid: Promise.resolve('me'), onRoster: () => () => {}, roster: () => null } }));
 vi.mock('react', async (get) => {
   const original = await get<typeof import('react')>();
   return { ...original, useState: (...args: unknown[]) => {
@@ -22,7 +23,7 @@ vi.mock('./useVerifiedHandle', () => ({ useVerifiedHandle: () => null }));
 vi.mock('../state/controller', () => ({ controller: held.controller, UploadError: class extends Error {} }));
 vi.mock('../net/message-verification-cache', () => ({ MessageVerificationCache: class {
   verify(msg: { id: number }, ctx: { serverKey: string }) { return new Promise<MessageVerification>((resolve) => held.jobs.push({ id: msg.id, serverKey: ctx.serverKey, resolve })); }
-  refresh() { return Promise.resolve(); }
+  refresh() { held.refreshes++; return Promise.resolve(); }
 } }));
 vi.mock('../net/channel-lifecycle', () => ({ withChannelLifecycle: (v: MessageVerification) => v }));
 const valid: MessageVerification = { status: 'verified', continuity: 'proven', authorization: [] };
@@ -34,7 +35,7 @@ const flush = () => act(async () => { await vi.advanceTimersByTimeAsync(16); });
 const state = () => div.querySelector('[data-message]')?.getAttribute('data-message-verification');
 beforeEach(() => {
   vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true); vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
-  held.jobs = []; held.map = new Map(); held.controller.messageServerKey = 'A';
+  held.jobs = []; held.map = new Map(); held.refreshes = 0; held.controller.messageServerKey = 'A';
   useSession.setState({ ...initialState, kind: 'gwar', me: { uid: 'me', session: 1 }, viewChannel: 1, threads: { 'ch:1': thread(), 'ch:2': thread() } });
   div = document.createElement('div'); document.body.appendChild(div); root = createRoot(div);
 });
@@ -55,6 +56,16 @@ it('cancels the old pending batch flush when changing thread', async () => {
   await act(async () => useSession.setState({ viewChannel: 2 }));
   await flush(); expect(state()).toBe('pending'); expect(held.map.size).toBe(0);
   await act(async () => held.jobs.at(-1)!.resolve(valid)); await flush(); expect(state()).toBe('verified');
+});
+it('refreshes results at once when message storage or the revocation feed works again', async () => {
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  await show(); await act(async () => held.jobs[0]!.resolve(valid)); await flush();
+  expect(held.refreshes).toBe(0);
+  await act(async () => { messageStorage.feedRead(new Error('down')); messageStorage.feedRead(); });
+  expect(held.refreshes).toBe(1);
+  await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+  expect(held.refreshes).toBe(2);
+  warn.mockRestore();
 });
 it('prunes an evicted row and refuses its late result', async () => {
   await show(); const old = held.jobs[0]!;

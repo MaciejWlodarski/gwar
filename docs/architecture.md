@@ -365,7 +365,14 @@ rollback/clearing is outside
 this protection; missing predecessors remain **continuity unproven**. Visible
 message/context fingerprints share cached and in-flight verification. Thread
 updates check only new fingerprints; the minute timer refreshes time-dependent
-authorization notes with one bulk read and no checkpoint writes. Fully verified
+authorization notes with one bulk read and no checkpoint writes. A database of an
+older version is rebuilt, not migrated (a fresh device's view). A failed storage
+transaction is tried once more on a new connection; a tab blocking an upgrade makes
+storage unavailable at once rather than pending. A message checked while storage was
+unavailable shows **checkpoints unavailable** until storage works again: then (at
+once, or by the minute timer) only its checkpoint is taken, which may still find a
+rollback or fork; its signature is not checked again. The last storage and feed
+failures are in bug report diagnostics. Fully verified
 messages have no extra signature marker; historical qualifications use a subtle
 icon and localized tooltip, unsigned Gwar messages a warning icon, and invalid
 messages a red icon with visible text.
@@ -376,8 +383,9 @@ and permanent `(account_key, device_key)` records commit together. Feed omission
 never erase a record; the earliest signed revocation wins. Storage caps at
 20,000 revocations and eight service cursors; capacity failure aborts the update
 and marks authorization unavailable, without eviction. Refresh attempts are at
-most once per minute; freshness lasts five minutes and failures immediately
-mark it unavailable. Feed sequence numbers cannot prove completeness.
+most once per minute (ten seconds after a failed one), one at a time; freshness
+lasts five minutes and failures immediately mark it unavailable. The open view
+refreshes its notes as soon as a read succeeds after a failure. Feed sequence numbers cannot prove completeness.
 `signed_at >= revoked_at` fails. Earlier signatures show **signing device
 revoked; signing time unproven**. A certificate valid at signing time but expired
 now shows **certificate expired; signing time unproven**. Stale/unavailable

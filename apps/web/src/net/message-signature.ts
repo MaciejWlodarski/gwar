@@ -145,13 +145,17 @@ export class MessageVerifier {
   constructor(private storage: MessageStorage = messageStorage) {}
   async verify(msg: ChatMessage, ctx: MessageContext): Promise<MessageVerification> {
     const snapshot = structuredClone(msg), result = await verifyMessage(snapshot, ctx, this.storage);
-    if (result.status !== "verified" || !snapshot.signature) return result;
-    const s = snapshot.signature;
+    return result.status === "verified" && snapshot.signature ? this.checkpoint(snapshot, ctx, result) : result;
+  }
+  /** Revision continuity of `msg`, whose signature in `ctx` gave `verified` (returned updated, as a
+   *  copy). Run again for a result checked while storage was unavailable, once it works. */
+  async checkpoint(msg: ChatMessage, ctx: MessageContext, verified: MessageVerification): Promise<MessageVerification> {
+    const s = msg.signature!, result: MessageVerification = { ...verified, authorization: [...verified.authorization] };
     try {
       const checkpoint = await this.storage.checkpoint(`${ctx.serverKey}:${s.author_uid}:${s.message_id}`, {
-        revision: s.revision, hash: await revisionHash(s), created: s.created_at, conversation: s.conversation, at: Date.now(), deleted: snapshot.text === DELETION_TEXT,
+        revision: s.revision, hash: await revisionHash(s), created: s.created_at, conversation: s.conversation, at: Date.now(), deleted: msg.text === DELETION_TEXT,
         // Edits keep a message's files: a revision signing other ones is a fork.
-        files: snapshot.text === DELETION_TEXT ? undefined : await messageBodyHash("", [], snapshot.attachments ?? []),
+        files: msg.text === DELETION_TEXT ? undefined : await messageBodyHash("", [], msg.attachments ?? []),
       }, s.previous_revision_hash);
       result.continuity = checkpoint.continuity;
       result.duplicate = checkpoint.duplicate;

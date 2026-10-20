@@ -295,6 +295,41 @@ describe("message view verification cache", () => {
     await cache.refresh(now);
     expect((await cache.verify(f.msg, f.ctx)).authorization).toContain("revocations-stale");
   });
+  it("takes a checkpoint storage could not take once it works, and only then clears the warnings", async () => {
+    const f = await fixture(true), store = storage(), cache = new MessageVerificationCache(store);
+    await store.mergeFeed([], CONNECT_URL, now);
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const failing = () => Promise.reject(new DOMException("lost", "UnknownError"));
+    const checkpoint = vi.spyOn(store, "checkpoint").mockImplementation(failing), revocation = vi.spyOn(store, "revocation").mockImplementation(failing);
+    const first = await cache.verify(f.msg, f.ctx);
+    expect(verificationLabel(first)).toMatch(/^Signature valid; revocation information stale or unavailable; this device cannot use its local storage/);
+    // Still failing: the signature stands, the warnings stay.
+    vi.spyOn(store, "revocations").mockImplementationOnce(failing);
+    await cache.refresh(now);
+    expect(await cache.verify(f.msg, f.ctx)).toMatchObject({ status: "verified", continuity: "storage-unavailable", authorization: ["revocations-stale"] });
+    checkpoint.mockRestore(); revocation.mockRestore();
+    const taken = vi.spyOn(store, "checkpoint");
+    await cache.refresh(now);
+    expect(fullyVerified(await cache.verify(f.msg, f.ctx))).toBe(true);
+    // Taken once, and not again by the next refresh.
+    expect(taken).toHaveBeenCalledOnce();
+    await cache.refresh(now);
+    expect(taken).toHaveBeenCalledOnce();
+    vi.restoreAllMocks();
+  });
+  it("reports a rollback replayed while storage failed once storage works", async () => {
+    const f = await fixture(true), store = storage();
+    await store.mergeFeed([], CONNECT_URL, now);
+    await new MessageVerificationCache(store).verify(await editMessage(f, "edited"), f.ctx);
+    const checkpoint = vi.spyOn(store, "checkpoint").mockRejectedValue(new DOMException("lost", "UnknownError"));
+    const cache = new MessageVerificationCache(store);
+    // The replayed original is never shown fully verified meanwhile...
+    expect(fullyVerified(await cache.verify(f.msg, f.ctx))).toBe(false);
+    checkpoint.mockRestore();
+    await cache.refresh(now);
+    // ...and is the rollback it is once storage can tell.
+    expect(await cache.verify(f.msg, f.ctx)).toMatchObject({ status: "invalid", continuity: "rollback" });
+  });
 });
 
 
