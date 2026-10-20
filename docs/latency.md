@@ -542,11 +542,11 @@ the cut at 25 dB; DeepFilterNet's attenuation limit). The unit tests check the
 480-sample delay, that full strength takes steady white noise down by more than
 40 dB, and that 50 % takes it down by 25.
 
-The runtime settings are those of DeepFilterNet's own `deep-filter` command, not
-its library defaults: frames whose local SNR estimate is below -15 dB are taken for
-noise alone and silenced, above 35 dB for clean speech and left alone (the defaults
-leave frames alone from 20 or 30 dB on), and the post-filter (beta 0.02) takes noise
-between words further down. Measured on Apple Silicon (2026-10-20) with a bench
+The runtime settings are those of DeepFilterNet's own `deep-filter` command with
+its post-filter on (`--pf`), not its library defaults: frames whose local SNR
+estimate is below -15 dB are taken for noise alone and silenced, above 35 dB for
+clean speech and left alone (the defaults leave frames alone from 20 or 30 dB on),
+and the post-filter (beta 0.02) takes noise between words further down. Measured on Apple Silicon (2026-10-20) with a bench
 outside the repository: speech from macOS `say` (one English and one Polish voice)
 at 48 kHz mixed with synthetic noise, SI-SDR gain against the clean speech after
 aligning the delay, averaged over both voices:
@@ -569,11 +569,15 @@ The model loads in ~0.3 s on a thread of its own when suppression is first on; t
 microphone passes as captured until then, so joining a channel never waits. tract's
 models cannot leave the thread that built them, so that thread also runs every
 frame for the pipeline, which hands it over without blocking and waits 20 ms at
-most. A frame the model is late with passes as captured and the model goes on; if
-the pipeline waits more than 5 ms a frame on average (the machine is too slow), or
-100 ms of frames in a row pass uncleaned (the model is stuck), suppression pauses
-and starts over with a fresh model 10 s later, then 20, 40, up to 5 minutes. The
-unit tests cover a late frame, a stuck model and one too slow for the machine.
+most. A frame the model is late with passes as captured and the model goes on; one
+that cannot even be handed over (the model is still on an earlier one) never
+reaches it, so the model starts over after it. If the pipeline waits more than 5 ms
+a frame on average (the machine is too slow), or 100 ms of frames in a row pass
+uncleaned (the model is stuck), suppression pauses and starts over with a fresh
+model 10 s later, then 20, 40, up to 5 minutes; never while the old one's thread is
+still stuck, so stuck models cannot pile up. A model that fails on a frame is not
+started again for the call. The unit tests cover each of these with a stand-in
+model.
 
 The latency harness above keeps suppression off (the library's default): its markers
 are steady tones, which a suppressor rightly takes for noise.

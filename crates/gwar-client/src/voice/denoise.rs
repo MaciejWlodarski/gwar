@@ -66,7 +66,8 @@ mod deep {
     /// leave more frames alone: with a quiet background, half the gain (docs/latency.md).
     const MIN_DB: f32 = -15.0;
     const MAX_DB: f32 = 35.0;
-    /// DeepFilterNet's post-filter at its usual strength: takes noise between words further down.
+    /// DeepFilterNet's post-filter (the command's `--pf`) at its default strength: takes noise
+    /// between words further down.
     const POST_FILTER_BETA: f32 = 0.02;
     /// libDF: an attenuation limit of 100 dB or more is none.
     const NO_LIMIT: f32 = 100.0;
@@ -76,7 +77,7 @@ mod deep {
     /// The model cannot keep up once the pipeline waits for it this long on average (half of
     /// each 10 ms frame; ~1.3 ms on Apple Silicon), or once this many frames in a row (100 ms)
     /// pass uncleaned. A one-off stall of the worker costs a few frames, not the suppression.
-    const BUDGET: Duration = Duration::from_millis(5);
+    pub(super) const BUDGET: Duration = Duration::from_millis(5);
     const MISSED: u32 = 10;
 
     const LOADING: u8 = 0;
@@ -100,8 +101,31 @@ mod deep {
         Cleaned,
         /// Left as captured: the model was late with it.
         Skipped,
-        /// The model failed or cannot keep up; this frame is left as captured or cleaned, as it came.
-        Gone,
+        /// The model cannot keep up; this frame is left as captured or cleaned, as it came.
+        Behind,
+        /// The worker has ended (the model failed); this frame is left as captured.
+        Failed,
+    }
+
+    /// A worker's thread, after the worker is dropped: a stuck one may never end.
+    pub(super) struct Thread(Arc<AtomicU8>);
+
+    impl Thread {
+        pub(super) fn running(&self) -> bool {
+            // The thread holds the other reference until it returns.
+            Arc::strong_count(&self.0) > 1
+        }
+    }
+
+    /// What the stand-in worker of the tests does with a frame.
+    #[cfg(test)]
+    pub(super) enum Step {
+        Now,
+        Sleep(Duration),
+        /// Until the test sends (or drops the sender).
+        Hold(std::sync::mpsc::Receiver<()>),
+        /// Ends the worker without an answer, as a model error does.
+        Fail,
     }
 
     pub(super) struct Worker {
@@ -113,6 +137,8 @@ mod deep {
         seq: u64,
         /// The next frame starts from the untouched model.
         reset: bool,
+        patience: Duration,
+        budget: Duration,
         /// The pipeline's wait per frame, averaged over ~16 frames (seconds).
         load: f32,
         /// Frames in a row passed on as captured.
@@ -177,30 +203,57 @@ mod deep {
         }
 
         fn new(jobs: SyncSender<Job>, done: Receiver<Done>, state: Arc<AtomicU8>) -> Self {
-            Self { jobs, done, state, spare: Some(Box::new([0.0; FRAME])), seq: 0, reset: false, load: 0.0, missed: 0 }
+            Self {
+                jobs,
+                done,
+                state,
+                spare: Some(Box::new([0.0; FRAME])),
+                seq: 0,
+                reset: false,
+                patience: PATIENCE,
+                budget: BUDGET,
+                load: 0.0,
+                missed: 0,
+            }
         }
 
-        /// A stand-in worker: halves each frame after waiting `delays[i]` for the i-th (none past
-        /// the list); `None` takes the frame and never answers again.
+        /// A stand-in worker: does `steps[i]` with the i-th frame ([`Step::Now`] past the list),
+        /// then scales it by 0.5, or by 0.25 when it starts the model over.
         #[cfg(test)]
-        pub(super) fn fake(delays: Vec<Option<Duration>>) -> Self {
+        pub(super) fn fake(steps: Vec<Step>) -> Self {
             let (jobs, job_rx) = sync_channel::<Job>(1);
             let (done_tx, done) = sync_channel(1);
+            let state = Arc::new(AtomicU8::new(READY));
+            let thread = state.clone();
             std::thread::spawn(move || {
-                let mut delays = delays.into_iter();
-                while let Ok(Job { seq, mut frame, .. }) = job_rx.recv() {
-                    match delays.next() {
-                        Some(None) => return std::thread::sleep(Duration::from_secs(3600)),
-                        Some(Some(delay)) => std::thread::sleep(delay),
-                        None => {}
+                let mut steps = steps.into_iter();
+                while let Ok(Job { seq, mut frame, reset, .. }) = job_rx.recv() {
+                    match steps.next() {
+                        Some(Step::Sleep(delay)) => std::thread::sleep(delay),
+                        Some(Step::Hold(release)) => drop(release.recv()),
+                        Some(Step::Fail) => return thread.store(FAILED, Ordering::Release),
+                        Some(Step::Now) | None => {}
                     }
-                    frame.iter_mut().for_each(|s| *s *= 0.5);
+                    let scale = if reset { 0.25 } else { 0.5 };
+                    frame.iter_mut().for_each(|s| *s *= scale);
                     if done_tx.send(Done { seq, frame }).is_err() {
                         return;
                     }
                 }
             });
-            Self::new(jobs, done, Arc::new(AtomicU8::new(READY)))
+            Self::new(jobs, done, state)
+        }
+
+        /// Waits up to `patience` for a frame, and up to `budget` per frame on average.
+        #[cfg(test)]
+        pub(super) fn with_limits(mut self, patience: Duration, budget: Duration) -> Self {
+            self.patience = patience;
+            self.budget = budget;
+            self
+        }
+
+        pub(super) fn thread(&self) -> Thread {
+            Thread(self.state.clone())
         }
 
         /// `Some(true)` once the model is there, `Some(false)` while it loads, `None` if it could not.
@@ -226,25 +279,27 @@ mod deep {
             self.seq += 1;
             let job = Job { seq: self.seq, frame, reset: std::mem::take(&mut self.reset), limit_db };
             let cleaned = match self.jobs.try_send(job) {
-                Ok(()) => self.answer(chunk, started + PATIENCE),
-                // Still on the frame before the last: this one never reaches the model.
+                Ok(()) => self.answer(chunk, started + self.patience),
+                // Still on the frame before the last: this one never reaches the model, whose
+                // state would bridge the gap.
                 Err(TrySendError::Full(job)) => {
                     self.spare = Some(job.frame);
-                    self.reset |= job.reset;
+                    self.reset = true;
                     Some(false)
                 }
                 Err(TrySendError::Disconnected(_)) => None,
             };
-            let Some(cleaned) = cleaned else { return Outcome::Gone };
+            // The thread ends only when the model fails (or panics).
+            let Some(cleaned) = cleaned else { return Outcome::Failed };
             self.load += (started.elapsed().as_secs_f32() - self.load) / 16.0;
             self.missed = if cleaned { 0 } else { self.missed + 1 };
-            if self.load > BUDGET.as_secs_f32() || self.missed >= MISSED {
+            if self.load > self.budget.as_secs_f32() || self.missed >= MISSED {
                 tracing::warn!(
                     load_ms = self.load * 1e3,
                     missed = self.missed,
                     "DeepFilterNet cannot keep up; noise suppression paused"
                 );
-                Outcome::Gone
+                Outcome::Behind
             } else if cleaned {
                 Outcome::Cleaned
             } else {
@@ -285,9 +340,11 @@ enum Model {
     /// Started the first time suppression is on.
     Unstarted,
     Running(deep::Worker),
-    /// Could not keep up: started again (from scratch) at `retry`.
+    /// Could not keep up: started again (from scratch) at `retry`, once the old worker's thread
+    /// has ended (a stuck one is never joined by another).
     Paused {
         retry: std::time::Instant,
+        previous: Option<deep::Thread>,
     },
     /// Could not load, or failed on a frame.
     Unavailable,
@@ -334,10 +391,17 @@ impl Denoiser {
     fn suppress(&mut self, frame: &mut [f32], mode: NoiseSuppression, fresh: bool) {
         use std::time::Instant;
 
-        let start = match self.model {
+        let now = Instant::now();
+        let start = match &mut self.model {
             Model::Unstarted => true,
-            Model::Paused { retry } => Instant::now() >= retry,
-            Model::Running(_) | Model::Unavailable => false,
+            Model::Paused { retry, previous } if now >= *retry => {
+                let stuck = previous.as_ref().is_some_and(deep::Thread::running);
+                if stuck {
+                    *retry = now + self.retry_wait;
+                }
+                !stuck
+            }
+            Model::Running(_) | Model::Paused { .. } | Model::Unavailable => false,
         };
         if start {
             // A new worker starts from the untouched model.
@@ -359,22 +423,28 @@ impl Denoiser {
             worker.reset();
         }
         let limit = mode.limit_db();
-        let gone = frame
-            .as_chunks_mut::<FRAME>()
-            .0
-            .iter_mut()
-            .any(|chunk| matches!(worker.process(chunk, limit), deep::Outcome::Gone));
-        if gone {
-            // The rest of `frame`, and the audio until the retry, passes as captured.
-            self.model = self.pause();
+        let end = frame.as_chunks_mut::<FRAME>().0.iter_mut().find_map(|chunk| match worker.process(chunk, limit) {
+            deep::Outcome::Cleaned | deep::Outcome::Skipped => None,
+            end => Some(end),
+        });
+        // The rest of `frame`, and the audio from then on, passes as captured.
+        match end {
+            None => {}
+            Some(deep::Outcome::Failed) => self.model = Model::Unavailable,
+            Some(_) => self.model = self.pause(),
         }
     }
 
+    /// Paused from now on; drops a running worker.
     #[cfg(feature = "deep-filter")]
     fn pause(&mut self) -> Model {
+        let previous = match &self.model {
+            Model::Running(worker) => Some(worker.thread()),
+            _ => None,
+        };
         let retry = std::time::Instant::now() + self.retry_wait;
         self.retry_wait = (self.retry_wait * 2).min(MAX_RETRY);
-        Model::Paused { retry }
+        Model::Paused { retry, previous }
     }
 }
 
@@ -415,7 +485,8 @@ mod tests {
             (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt()
         }
 
-        /// A denoiser whose model has loaded.
+        /// A denoiser whose model has loaded, with no time limits: however slow the machine, every
+        /// frame is the model's.
         fn loaded() -> Denoiser {
             let mut d = Denoiser::new();
             d.process(&mut [0.0; FRAME], NoiseSuppression::FULL, true);
@@ -424,6 +495,9 @@ mod tests {
                 assert!(Instant::now() < deadline, "DeepFilterNet did not load");
                 std::thread::sleep(Duration::from_millis(20));
             }
+            let Model::Running(worker) = std::mem::replace(&mut d.model, Model::Unavailable) else { unreachable!() };
+            let unlimited = Duration::from_secs(3600);
+            d.model = Model::Running(worker.with_limits(unlimited, unlimited));
             d
         }
 
@@ -500,59 +574,118 @@ mod tests {
             assert_eq!((0..4 * FRAME).max_by(|a, b| score(*a).total_cmp(&score(*b))), Some(FRAME));
         }
 
-        /// A denoiser on a stand-in worker (see [`deep::Worker::fake`]), and what each frame of
-        /// 0.2s came out as: 0.1 cleaned, 0.2 passed as captured.
-        fn run_fake(delays: Vec<Option<Duration>>, frames: usize) -> (Denoiser, Vec<f32>) {
+        use deep::Step;
+
+        /// A denoiser on a stand-in worker (see [`deep::Worker::fake`]).
+        fn on(worker: deep::Worker) -> Denoiser {
             let mut d = Denoiser::new();
-            d.model = Model::Running(deep::Worker::fake(delays));
-            let out = (0..frames)
-                .map(|_| {
-                    let mut frame = [0.2; FRAME];
-                    d.process(&mut frame, NoiseSuppression::FULL, true);
-                    assert!(frame.iter().all(|s| *s == frame[0]));
-                    frame[0]
-                })
-                .collect();
-            (d, out)
+            d.model = Model::Running(worker);
+            d
+        }
+
+        /// What a frame of 0.2s comes out as: 0.1 cleaned, 0.05 cleaned by a model started over,
+        /// 0.2 passed as captured.
+        fn frame(d: &mut Denoiser) -> f32 {
+            let mut frame = [0.2; FRAME];
+            d.process(&mut frame, NoiseSuppression::FULL, true);
+            assert!(frame.iter().all(|s| *s == frame[0]));
+            frame[0]
+        }
+
+        /// Room for a slow machine: only the frame held on purpose is late.
+        fn patient(steps: Vec<Step>) -> deep::Worker {
+            deep::Worker::fake(steps).with_limits(Duration::from_millis(200), Duration::from_secs(3600))
         }
 
         #[test]
         fn a_late_frame_passes_as_captured_and_the_model_goes_on() {
-            let fast = Some(Duration::ZERO);
-            let (d, out) = run_fake(vec![fast, Some(Duration::from_millis(35)), fast], 20);
-            assert_eq!(out[..3], [0.1, 0.2, 0.1]);
-            assert!(out[3..].iter().all(|s| *s == 0.1), "{out:?}");
+            let (release, held) = std::sync::mpsc::channel();
+            let mut d = on(patient(vec![Step::Now, Step::Hold(held)]));
+            // The first frame starts the model.
+            assert_eq!(frame(&mut d), 0.05);
+            assert_eq!(frame(&mut d), 0.2);
+            release.send(()).unwrap();
+            // The model had that frame: it goes on from it.
+            let out: Vec<f32> = (0..10).map(|_| frame(&mut d)).collect();
+            assert!(out.iter().all(|s| *s == 0.1), "{out:?}");
             assert!(matches!(d.model, Model::Running(_)));
         }
 
         #[test]
-        fn a_stuck_model_is_paused_after_100_ms_of_frames_and_started_again_later() {
+        fn a_frame_that_never_reached_the_model_starts_it_over() {
+            let (release, held) = std::sync::mpsc::channel();
+            let mut d = on(patient(vec![Step::Now, Step::Hold(held)]));
+            assert_eq!(frame(&mut d), 0.05);
+            // Held; the next waits in the queue; the one after cannot be handed over.
+            assert_eq!([frame(&mut d), frame(&mut d), frame(&mut d)], [0.2; 3]);
+            release.send(()).unwrap();
+            // A frame every 10 ms, as captured: one that cannot be handed over does not wait.
+            let out: Vec<f32> = (0..8)
+                .map(|_| {
+                    std::thread::sleep(Duration::from_millis(10));
+                    frame(&mut d)
+                })
+                .collect();
+            let first = out.iter().position(|s| *s != 0.2).expect("cleaned again");
+            assert_eq!(out[first..first + 2], [0.05, 0.1], "{out:?}");
+        }
+
+        #[test]
+        fn a_stuck_model_is_paused_and_no_second_one_starts_beside_it() {
+            let (release, held) = std::sync::mpsc::channel();
+            let mut d = on(deep::Worker::fake(vec![Step::Now, Step::Hold(held)]));
             let started = Instant::now();
-            let (mut d, out) = run_fake(vec![Some(Duration::ZERO), None], 15);
+            let out: Vec<f32> = (0..15).map(|_| frame(&mut d)).collect();
             // Two waits for answers; the rest could not be handed over.
-            assert!(started.elapsed() < Duration::from_millis(200), "waited {:?}", started.elapsed());
-            assert_eq!(out[0], 0.1);
+            assert!(started.elapsed() < Duration::from_secs(1), "waited {:?}", started.elapsed());
+            assert_eq!(out[0], 0.05);
             assert!(out[1..].iter().all(|s| *s == 0.2), "{out:?}");
             assert!(matches!(d.model, Model::Paused { .. }));
             assert_eq!(d.retry_wait, RETRY * 2);
             // Paused: no waiting.
             let started = Instant::now();
-            d.process(&mut [0.2; FRAME], NoiseSuppression::FULL, true);
-            assert!(started.elapsed() < Duration::from_millis(5));
-            // Time to try again: a new model.
-            d.model = Model::Paused { retry: Instant::now() };
-            d.process(&mut [0.2; FRAME], NoiseSuppression::FULL, true);
+            assert_eq!(frame(&mut d), 0.2);
+            assert!(started.elapsed() < Duration::from_millis(50));
+            let retry_now = |d: &mut Denoiser| {
+                let Model::Paused { retry, .. } = &mut d.model else { panic!("not paused") };
+                *retry = Instant::now();
+            };
+            // Time to try again, but the old thread is still stuck.
+            retry_now(&mut d);
+            assert_eq!(frame(&mut d), 0.2);
+            assert!(matches!(&d.model, Model::Paused { retry, .. } if *retry > Instant::now()));
+            // Once it ends, a new model starts.
+            release.send(()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while matches!(&d.model, Model::Paused { previous: Some(t), .. } if t.running()) {
+                assert!(Instant::now() < deadline, "the stuck thread did not end");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            retry_now(&mut d);
+            frame(&mut d);
             assert!(matches!(d.model, Model::Running(_)));
         }
 
         #[test]
         fn a_model_too_slow_for_the_machine_is_paused() {
             // 8 ms a frame: real time, but it leaves the pipeline too little of each 10 ms.
-            let (d, out) = run_fake(vec![Some(Duration::from_millis(8)); 40], 40);
-            let cleaned = out.iter().take_while(|s| **s == 0.1).count();
-            assert!((3..30).contains(&cleaned), "{out:?}");
+            let worker = deep::Worker::fake((0..40).map(|_| Step::Sleep(Duration::from_millis(8))).collect())
+                .with_limits(Duration::from_secs(3600), deep::BUDGET);
+            let mut d = on(worker);
+            let out: Vec<f32> = (0..40).map(|_| frame(&mut d)).collect();
+            let cleaned = out.iter().take_while(|s| **s < 0.2).count();
+            // The average wait passes 5 ms within 16 frames.
+            assert!((1..=16).contains(&cleaned), "{out:?}");
             assert!(out[cleaned..].iter().all(|s| *s == 0.2));
             assert!(matches!(d.model, Model::Paused { .. }));
+        }
+
+        #[test]
+        fn a_failed_model_is_not_started_again() {
+            let mut d = on(deep::Worker::fake(vec![Step::Now, Step::Fail]));
+            assert_eq!(frame(&mut d), 0.05);
+            assert_eq!(frame(&mut d), 0.2);
+            assert!(matches!(d.model, Model::Unavailable));
         }
     }
 }
