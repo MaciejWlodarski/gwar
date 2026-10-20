@@ -54,6 +54,9 @@ end. The spike code was thrown away; only its results are kept here
   a second endpoint kind (screen beside audio), with explicit rules for
   barriers, activation, restarts and nonce safety. Keyframe recovery covers
   viewers that switch keys late. Only call participants can watch.
+- **Plaintext channels ship first.** The first release (PRs 1–5) shares in
+  plaintext channels only. Encrypted channels refuse sharing until encrypted
+  shares land (PR 6) and never fall back to sending a share in the clear.
 - **Phase 1 is single-layer.** The sharer adapts only to its own uplink.
   - Each viewer's estimate is split across its watched shares in priority
     order (the stage first).
