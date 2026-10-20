@@ -295,6 +295,24 @@ describe("message view verification cache", () => {
     await cache.refresh(now);
     expect((await cache.verify(f.msg, f.ctx)).authorization).toContain("revocations-stale");
   });
+  it("keeps a known revocation when authorization storage becomes unreadable", async () => {
+    const f = await fixture(true, 3_600_000), store = storage(), cache = new MessageVerificationCache(store);
+    await store.mergeFeed([], CONNECT_URL, now);
+    await cache.verify(f.msg, f.ctx);
+    const c = f.msg.signature!.certificate!, at = now + 2000;
+    await store.mergeFeed([{ seq: 1, account_key: c.account_key, device_key: c.device_key, revoked_at: at,
+      signature: await signText(f.account.jwk, revokeStatement(c.account_key, c.device_key, at)) }], CONNECT_URL, now);
+    await cache.refresh(now);
+    expect((await cache.verify(f.msg, f.ctx)).authorization).toEqual(["device-revoked"]);
+    const reads = vi.spyOn(store, "revocations").mockRejectedValue(new DOMException("lost", "UnknownError"));
+    await cache.refresh(now);
+    await cache.refresh(now);
+    expect((await cache.verify(f.msg, f.ctx)).authorization).toEqual(["device-revoked", "revocations-stale"]);
+    // Read again, the stored revocation says the same.
+    reads.mockRestore();
+    await cache.refresh(now);
+    expect((await cache.verify(f.msg, f.ctx)).authorization).toEqual(["device-revoked"]);
+  });
   it("takes a checkpoint storage could not take once it works, and only then clears the warnings", async () => {
     const f = await fixture(true), store = storage(), cache = new MessageVerificationCache(store);
     await store.mergeFeed([], CONNECT_URL, now);

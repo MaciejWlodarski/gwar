@@ -148,6 +148,29 @@ describe("per-record storage work", () => {
       expect(recovered).toHaveBeenCalledOnce();
     } finally { transaction.mockRestore(); warn.mockRestore(); }
   });
+  it("recovers writes only by a write: reads succeeding beside a full disk signal nothing", async () => {
+    const store = new MessageStorage(crypto.randomUUID()), recovered = vi.fn(), warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    store.subscribe(recovered);
+    await store.cursor();
+    const original = IDBDatabase.prototype.transaction;
+    const transaction = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (this: IDBDatabase, ...args: Parameters<IDBDatabase["transaction"]>) {
+      if (args[1] === "readwrite") throw new DOMException("disk full", "QuotaExceededError");
+      return original.apply(this, args);
+    });
+    try {
+      for (let i = 0; i < 3; i++) {
+        await expect(store.checkpoint("a", checkpoint(), "-")).rejects.toThrow("disk full");
+        expect((await store.revocation("x", "y")).revokedAt).toBeUndefined();
+        expect(await store.cursor()).toBe(0);
+      }
+      expect(recovered).not.toHaveBeenCalled();
+      expect(store.error).toBe("QuotaExceededError: disk full");
+      transaction.mockRestore();
+      expect((await store.checkpoint("a", checkpoint(), "-")).continuity).toBe("proven");
+      expect(recovered).toHaveBeenCalledOnce();
+      expect(store.error).toBeUndefined();
+    } finally { transaction.mockRestore(); warn.mockRestore(); }
+  });
   it("neither tries again nor counts as a storage failure what a change refuses", async () => {
     const store = new MessageStorage(crypto.randomUUID());
     for (let i = 0; i < 8; i++) await store.mergeFeed([], `https://connect-${i}.example`, 1);

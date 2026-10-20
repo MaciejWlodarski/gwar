@@ -371,7 +371,10 @@ transaction is tried once more on a new connection; a tab blocking an upgrade ma
 storage unavailable at once rather than pending. A message checked while storage was
 unavailable shows **checkpoints unavailable** until storage works again: then (at
 once, or by the minute timer) only its checkpoint is taken, which may still find a
-rollback or fork; its signature is not checked again. The last storage and feed
+rollback or fork; its signature is not checked again. Storage counts as working
+again only when what failed (opening, reading or writing) works: reads succeeding
+beside a full disk signal nothing. An unreadable revocation store never drops a
+known revocation note. The last storage and feed
 failures are in bug report diagnostics. Fully verified
 messages have no extra signature marker; historical qualifications use a subtle
 icon and localized tooltip, unsigned Gwar messages a warning icon, and invalid
@@ -383,7 +386,8 @@ and permanent `(account_key, device_key)` records commit together. Feed omission
 never erase a record; the earliest signed revocation wins. Storage caps at
 20,000 revocations and eight service cursors; capacity failure aborts the update
 and marks authorization unavailable, without eviction. Refresh attempts are at
-most once per minute (ten seconds after a failed one), one at a time; freshness
+most once per minute, one at a time; a failed read is tried again by itself 10, 20
+and 40 seconds later, then by the callers' minute; freshness
 lasts five minutes and failures immediately mark it unavailable. The open view
 refreshes its notes as soon as a read succeeds after a failure. Feed sequence numbers cannot prove completeness.
 `signed_at >= revoked_at` fails. Earlier signatures show **signing device

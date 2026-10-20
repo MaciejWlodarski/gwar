@@ -27,6 +27,9 @@ export function confirmedBefore(order: number | undefined, r: RevocationState | 
 }
 const ORDER = "order";
 const VERSION = 3;
+/** Each works only if those before it do. */
+const CAPABILITIES = ["open", "readonly", "readwrite"] as const;
+type Capability = typeof CAPABILITIES[number];
 const describe = (error: unknown) => error instanceof Error ? `${error.name}: ${error.message}` : String(error);
 const pair = (account: string, device: string) => `${account}:${device}`;
 const requestValue = <T>(request: IDBRequest<T>): Promise<T> => new Promise((resolve, reject) => {
@@ -47,8 +50,11 @@ export class MessageStorage {
     this.known = entries.map(({ account_key, device_key, revoked_at, signature }) => ({ account_key, device_key, revoked_at, signature }));
   }
   constructor(private name = "gwar-message-auth-v3") {}
-  /** The last storage failure, until an operation succeeds again; for bug reports. */
-  error?: string;
+  /** Failures by what failed: opening, reading or writing. Each holds until that, or more, works
+   *  again: a read succeeding while writes fail (a full disk) recovers nothing that needs a write. */
+  private failures = new Map<Capability, string>();
+  /** The last storage failure, until storage works again; for bug reports. */
+  get error(): string | undefined { return this.failures.get("readwrite") ?? this.failures.get("readonly") ?? this.failures.get("open"); }
   /** The last failure to read the revocation feed to its end, until a read succeeds again. */
   feedError?: string;
   private listeners = new Set<() => void>();
@@ -56,10 +62,14 @@ export class MessageStorage {
    *  checked meanwhile can be checked again. */
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; }
   private recovered(): void { for (const listener of [...this.listeners]) listener(); }
-  private working(): void { if (this.error !== undefined) { this.error = undefined; this.recovered(); } }
-  private failed(error: unknown): void {
+  private working(capability: Capability): void {
+    let cleared = false;
+    for (const c of CAPABILITIES.slice(0, CAPABILITIES.indexOf(capability) + 1)) cleared = this.failures.delete(c) || cleared;
+    if (cleared) this.recovered();
+  }
+  private failed(capability: Capability, error: unknown): void {
     if (this.error === undefined) console.warn("Message storage unavailable:", error);
-    this.error = describe(error);
+    this.failures.set(capability, describe(error));
   }
   feedRead(error?: unknown): void {
     const was = this.feedError;
@@ -104,7 +114,7 @@ export class MessageStorage {
         this.connection = db;
         this.db = Promise.resolve(db);
         resolve(db);
-        if (blocked) this.working();
+        if (blocked) this.working("open");
       };
     });
     // A blocked open stays pending (see above); any other failure lets the next operation try again.
@@ -119,7 +129,7 @@ export class MessageStorage {
   }
   /** A storage failure, unlike the change refusing, is tried once more on a new connection and then
    *  remembered. A failed transaction committed nothing, so trying it again is safe. */
-  private async transaction<T>(stores: string[], mode: IDBTransactionMode, change: (tx: IDBTransaction) => Promise<T>): Promise<T> {
+  private async transaction<T>(stores: string[], mode: "readonly" | "readwrite", change: (tx: IDBTransaction) => Promise<T>): Promise<T> {
     for (let attempt = 0; ; attempt++) {
       let refused = false, db: IDBDatabase | undefined;
       try {
@@ -136,12 +146,13 @@ export class MessageStorage {
             try { tx.abort(); } catch { /* already finished */ }
           });
         });
-        this.working();
+        this.working(mode);
         return value;
       } catch (error) {
-        if (refused) { this.working(); throw error; }
+        // Refusing, the change read what it needed but wrote nothing.
+        if (refused) { this.working("readonly"); throw error; }
         if (db) this.forget(db);
-        if (attempt > 0) { this.failed(error); throw error; }
+        if (attempt > 0) { this.failed(db ? mode : "open", error); throw error; }
         await new Promise((resolve) => setTimeout(resolve, 100));
       }
     }
@@ -247,11 +258,15 @@ export const messageStorage = new MessageStorage();
 let refresh: Promise<void> | undefined;
 let refreshing = false;
 let lastAttempt = 0;
+let failedInRow = 0;
+let retry: ReturnType<typeof setTimeout> | undefined;
+/** After a failed read, the next ones start by themselves 10, 20 and 40 s later; then the callers' minute. */
+export const FEED_RETRIES = [10_000, 20_000, 40_000];
 export function refreshRevocations(base = CONNECT_URL, storage = messageStorage, force = false): Promise<void> {
   // One read at a time; after a failed one, the next may start sooner.
-  const interval = storage.feedError === undefined ? 60_000 : 10_000;
+  const interval = storage.feedError === undefined ? 60_000 : FEED_RETRIES[0]!;
   if (storage === messageStorage && (refreshing || (!force && Date.now() - lastAttempt < interval))) return refresh ?? Promise.resolve();
-  if (storage === messageStorage) { lastAttempt = Date.now(); refreshing = true; }
+  if (storage === messageStorage) { lastAttempt = Date.now(); refreshing = true; clearTimeout(retry); retry = undefined; }
   const run = async () => {
     // A feed is paginated at 1000. Only reaching its end marks authorization current.
     for (let page = 0; page < 20; page++) {
@@ -264,9 +279,15 @@ export function refreshRevocations(base = CONNECT_URL, storage = messageStorage,
     }
     throw new Error("Revocation feed exceeds storage bound");
   };
-  const promise = run().then(() => storage.feedRead(), async (error: unknown) => {
+  const promise = run().then(() => {
+    if (storage === messageStorage) failedInRow = 0;
+    storage.feedRead();
+  }, async (error: unknown) => {
     storage.feedRead(error);
     await storage.unavailable(base).catch(() => {});
+    if (storage !== messageStorage) return;
+    const delay = FEED_RETRIES[failedInRow++];
+    if (delay !== undefined) retry = setTimeout(() => void refreshRevocations(base, storage, true), delay);
   }).finally(() => { if (storage === messageStorage && refresh === promise) refreshing = false; });
   if (storage === messageStorage) refresh = promise;
   return promise;

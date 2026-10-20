@@ -1,5 +1,5 @@
 import type { ChatMessage } from "../proto/ChatMessage";
-import { confirmedBefore, messageStorage, refreshRevocations, MAX_CHECKPOINTS, type MessageStorage, type RevocationState } from "./message-storage";
+import { confirmedBefore, messageStorage, refreshRevocations, MAX_CHECKPOINTS, type MessageStorage } from "./message-storage";
 import { messageFingerprint, MessageVerifier, invalidVerification, type MessageContext, type MessageVerification } from "./message-signature";
 
 /** View-local cache: immutable message/context fingerprints also share in-flight verification. */
@@ -30,16 +30,23 @@ export class MessageVerificationCache {
     await refreshRevocations();
     const revocations = await this.storage.revocations(certified.map((e) => ({
       account: e.msg.signature!.certificate!.account_key, device: e.msg.signature!.certificate!.device_key,
-    })), undefined, now).catch(() => new Map<string, RevocationState>());
+    })), undefined, now).catch(() => undefined);
     entries.forEach((entry, i) => {
       const old = results[i]!, signature = entry.msg.signature, certificate = signature?.certificate;
       if (old.status !== "verified" || !certificate) return;
+      if (!revocations) {
+        // Unreadable now: what was known stays (a revocation above all), qualified as stale.
+        const notes = new Set([...old.authorization, "revocations-stale" as const]);
+        if (certificate.expires_at <= now) notes.add("certificate-expired");
+        entry.state = Promise.resolve({ ...old, authorization: [...notes] });
+        return;
+      }
       const state: MessageVerification = { ...old, authorization: [] };
       const revocation = revocations.get(`${certificate.account_key}:${certificate.device_key}`);
       if (revocation?.revokedAt !== undefined) {
         if (signature.signed_at >= revocation.revokedAt) { entry.state = Promise.resolve(invalidVerification()); return; }
         state.authorization.push("device-revoked");
-      }
+      } else if (old.authorization.includes("device-revoked")) state.authorization.push("device-revoked"); // Stored revocations are never dropped; neither is a known one.
       if (!revocation?.fresh && !confirmedBefore(old.order, revocation)) state.authorization.push("revocations-stale");
       if (certificate.expires_at <= now) state.authorization.push("certificate-expired");
       entry.state = Promise.resolve(state);

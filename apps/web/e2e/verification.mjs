@@ -108,8 +108,10 @@ const scenarios = {
       const c = await context(browser), p = await page(c);
       assert.deepEqual(await verify(p), { [STALE]: N });
       assert.match((await failures(p)).feed, /Revocation feed unavailable/);
-      feed = "ok";
-      assert.deepEqual(await refresh(p, true), VERIFIED, "checked again once the feed is back");
+      // Back: read again by itself (10 s after the failure), nothing forced and no new messages.
+      const recovered = p.evaluate(() => window.fixture.recovered());
+      feed = "ok"; await recovered;
+      assert.deepEqual(await refresh(p), VERIFIED, "checked again once the feed is back");
       assert.deepEqual(await failures(p), { storage: null, feed: null });
       await c.close();
     } finally { feed = "ok"; }
