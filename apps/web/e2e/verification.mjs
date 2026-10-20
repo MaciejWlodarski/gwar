@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * Message verification storage in real engines: a whole history verified at once, on fresh and older
- * databases, beside an older tab, across two tabs and a reload, with the revocation feed down and with
- * site storage refused. A result checked while storage or the feed failed is checked again once it
+ * Message verification storage in real engines: a whole history verified at once, beside a tab
+ * blocking the upgrade, across two tabs and a reload, with the revocation feed down and with site
+ * storage refused. A result checked while storage or the feed failed is checked again once it
  * works, without a reload; refused storage stays visible.
  *
  *   E2E_BROWSERS=chromium,webkit,firefox   engines to run (default: chromium,webkit)
@@ -53,10 +53,9 @@ const verify = (p, fresh = true) => p.evaluate((fresh) => Promise.race([window.f
   new Promise((resolve) => setTimeout(() => resolve("still verifying after 20 s"), 20_000))]), fresh);
 const refresh = (p, feed = false) => p.evaluate((feed) => window.fixture.refresh(feed), feed);
 const failures = (p) => p.evaluate(() => window.fixture.failures());
-/** A tab of the app from before the current schema: version 2, never closing for an upgrade. */
+/** A tab holding the database at a lower version (empty), never closing for an upgrade. */
 const OLDER = () => new Promise((resolve, reject) => {
-  const r = indexedDB.open("gwar-message-auth-v3", 2);
-  r.onupgradeneeded = () => { r.result.createObjectStore("checkpoints").createIndex("at", "at"); r.result.createObjectStore("revocations"); r.result.createObjectStore("feeds"); };
+  const r = indexedDB.open("gwar-message-auth-v3", 1);
   r.onsuccess = () => { window.older = r.result; resolve(); }; r.onerror = () => reject(r.error);
 });
 
@@ -65,13 +64,6 @@ const scenarios = {
     const c = await context(browser), p = await page(c);
     assert.deepEqual(await verify(p), VERIFIED);
     assert.deepEqual(await verify(p), VERIFIED, "seen again");
-    await c.close();
-  },
-  async olderDatabase(browser) {
-    const c = await context(browser), p = await page(c);
-    await p.evaluate(OLDER); await p.evaluate(() => window.older.close());
-    assert.deepEqual(await verify(p), VERIFIED);
-    assert.deepEqual(await failures(p), { storage: null, feed: null });
     await c.close();
   },
   async olderTab(browser) {

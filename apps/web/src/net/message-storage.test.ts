@@ -22,14 +22,15 @@ async function seed(name: string, state: { checkpoints: Record<string, unknown>;
   }); db.close();
 }
 const checkpoint = (revision = 0, hash = "hash", at = 1) => ({ revision, hash, conversation: "channel:7", created: 1, at });
-/** The database as an app from before the current schema left it (version 2, no order store), held open. */
-function older(name: string, checkpoints: Record<string, unknown> = {}) {
+/** A database of a lower version, held open: empty at version 1, or as the app before the current
+ *  schema left it at version 2 (no order store). */
+function older(name: string, version: 1 | 2) {
   return new Promise<IDBDatabase>((resolve, reject) => {
-    const r = indexedDB.open(name, 2);
+    const r = indexedDB.open(name, version);
     r.onupgradeneeded = () => {
-      const store = r.result.createObjectStore("checkpoints"); store.createIndex("at", "at");
+      if (version === 1) return;
+      r.result.createObjectStore("checkpoints").createIndex("at", "at");
       r.result.createObjectStore("revocations"); r.result.createObjectStore("feeds");
-      for (const [key, value] of Object.entries(checkpoints)) store.put(value, key);
     };
     r.onsuccess = () => resolve(r.result);
     r.onerror = () => reject(r.error);
@@ -91,7 +92,7 @@ describe("atomic bounded message storage", () => {
 
 describe("per-record storage work", () => {
   it("reports a blocked upgrade as unavailable storage at once, and storage working when the older tab lets go", async () => {
-    const name = crypto.randomUUID(), old = await older(name);
+    const name = crypto.randomUUID(), old = await older(name, 1);
     // An older tab that ignores the version change keeps its connection open.
     const store = new MessageStorage(name), recovered = vi.fn(), open = vi.spyOn(IDBFactory.prototype, "open");
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -108,12 +109,16 @@ describe("per-record storage work", () => {
       expect(await store.cursor()).toBe(0);
     } finally { open.mockRestore(); warn.mockRestore(); }
   });
-  it("rebuilds a database of an older version instead of failing to open it", async () => {
-    const name = crypto.randomUUID();
-    (await older(name, { key: { ...checkpoint(1, "seen"), proven: true } })).close();
+  it("reports why a database of an older schema does not open", async () => {
+    const name = crypto.randomUUID(), warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    (await older(name, 2)).close();
     const store = new MessageStorage(name);
-    expect((await store.checkpoint("key", checkpoint(0, "hash"), "-")).continuity).toBe("proven");
-    expect(store.error).toBeUndefined();
+    try {
+      await expect(store.checkpoint("key", checkpoint(), "-")).rejects.toThrow();
+      await expect(store.cursor()).rejects.toThrow();
+      expect(store.error).toMatch(/^ConstraintError: /);
+      expect(warn).toHaveBeenCalledOnce();
+    } finally { warn.mockRestore(); }
   });
   it("opens again after the browser closes the connection", async () => {
     const store = new MessageStorage(crypto.randomUUID()), connection = () => (store as unknown as { connection: IDBDatabase }).connection;

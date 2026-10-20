@@ -89,20 +89,25 @@ export class MessageStorage {
         blocked = true;
         reject(new Error("Message storage is being upgraded in another tab"));
       };
+      // Pre-release: no upgrades. A database of an older schema fails to open (storage unavailable);
+      // the reason, not the abort it causes, is what diagnostics report.
+      let upgrade: unknown;
       request.onupgradeneeded = () => {
-        // Pre-release: an older database is rebuilt, never migrated. Like a new device, this one then
-        // holds checkpoints of what it sees from now on, and reads the revocation feed from its start.
         const db = request.result;
-        for (const name of Array.from(db.objectStoreNames)) db.deleteObjectStore(name);
-        db.createObjectStore("checkpoints").createIndex("at", "at");
-        db.createObjectStore("revocations");
-        db.createObjectStore("feeds");
-        // One counter ordering stored revisions and complete feed reads.
-        db.createObjectStore(ORDER);
+        try {
+          db.createObjectStore("checkpoints").createIndex("at", "at");
+          db.createObjectStore("revocations");
+          db.createObjectStore("feeds");
+          // One counter ordering stored revisions and complete feed reads.
+          db.createObjectStore(ORDER);
+        } catch (error) {
+          upgrade = error;
+          request.transaction!.abort();
+        }
       };
       request.onerror = () => {
         if (this.db === opening) this.db = undefined;
-        reject(request.error);
+        reject(upgrade ?? request.error);
       };
       request.onsuccess = () => {
         const db = request.result;

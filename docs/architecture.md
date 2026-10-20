@@ -365,8 +365,9 @@ rollback/clearing is outside
 this protection; missing predecessors remain **continuity unproven**. Visible
 message/context fingerprints share cached and in-flight verification. Thread
 updates check only new fingerprints; the minute timer refreshes time-dependent
-authorization notes with one bulk read and no checkpoint writes. A database of an
-older version is rebuilt, not migrated (a fresh device's view). A failed storage
+authorization notes with one bulk read and no checkpoint writes. Before the
+release there are no upgrades: a database of an older schema does not open, and
+storage counts as unavailable (with the reason in diagnostics). A failed storage
 transaction is tried once more on a new connection; a tab blocking an upgrade makes
 storage unavailable at once rather than pending. A message checked while storage was
 unavailable shows **checkpoints unavailable** until storage works again: then (at
