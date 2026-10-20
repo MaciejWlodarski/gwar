@@ -478,12 +478,29 @@ Limits are enforced continuously, not only when a share or watch is admitted:
 - **Server-wide budget** (default 300 Mbps). The sum of all slot reservations
   plus all publish caps, because ingress costs CPU too. A watch or start that
   would exceed it gets `busy`.
+  - **Members come before guests at admission.** When a member's watch or
+    start would not fit, the server first reclaims guest reservations,
+    newest guest first, across all shares, until it fits. Those guests are
+    paused (`screen.paused {reason: "budget"}`) and their reservations are
+    released at once, so the member is admitted in the same request. Only
+    when no guest reservation is left does the member get `busy`.
+  - **A paused guest resumes only by passing admission again.** Every 5 s
+    the server re-admits paused guests, oldest pause first, while their
+    reservation fits beside every member's. A member is never paused to
+    make room for a guest.
+  - Without this, four 8 Mbps publishers and 25 guests spread over them
+    reserve 32 + 25 × 10.4 = 292 Mbps and lock members out, while real guest
+    egress (around 200 Mbps) never trips the measured overrun below.
   - The screen task also measures real egress every second, including
     retransmissions and padding, from str0m's `Event::PeerStats`, enabled with `set_stats_interval(1 s)`.
   - When it stays over budget for 5 s, guest watches are paused first, then
     the newest member watches.
 - **Negotiation.**
   - At most 4 `screen.*.offer` per session per minute.
+  - A guest connection gets exactly one accepted `guest.offer`. A second one
+    closes the connection, so renegotiating means reconnecting through the
+    gateway's pre-authentication limits
+    ([TeamSpeak watch links](#teamspeak-watch-links-guests-pr-6)).
   - At most `shares_per_server` publish transports (default 32) and one watch
     transport per session.
 - **Dropping leads to a keyframe.** Every drop, whether from an ingress limit,
@@ -880,14 +897,26 @@ Egress per viewer equals the share's rate (the SFU never transcodes):
     budget uses it in about 74 hours.
   - Voice, the web app, file downloads and TeamSpeak count toward the same
     allowance.
-- **Monthly egress counter (PR 3).** It is cheap: the screen task already
-  counts every byte it sends for the per-viewer egress cap, and the voice
-  task can count its own.
-  - Both add to a per-calendar-month total, persisted in the store once a
-    minute, and shown to admins in server settings (screen, voice, guests).
+- **Monthly egress counter (PR 3), from the network interface.** Counting
+  only Gwar's own sockets would miss the web app, file downloads, TeamSpeak
+  and everything else, so the counter reads the host's total instead:
+  - Once a minute the server reads the transmitted-bytes counter of the
+    default-route interface from `/proc/net/dev` (Linux). It adds the delta
+    since the last read to a per-calendar-month total persisted in the store.
+    A counter lower than the last read (a reboot or a wrap) counts from zero.
+  - The total therefore **includes every service on the host and every
+    outbound byte of that interface**: TeamSpeak, a reverse proxy, SSH,
+    package updates and backups. Traffic Oracle does not bill (for example to
+    its own services in the region) is counted too, so the figure errs high.
+  - It covers this VM only. Oracle's 10 TB is per tenancy, so other VMs in it
+    are not included.
+  - In a container, `/proc/net/dev` shows the container's own interface, and
+    the settings page labels the figure "this container only". Off Linux the
+    counter is unavailable and the page says so.
+  - Server settings show the month's total, with the screen task's own
+    bytes (members, guests) beside it as a breakdown.
   - Admins get a warning at 80 % and 100 % of `monthly_egress_tb` (default
-    10).
-  - There is no automatic cut-off by default. An optional
+    10). There is no automatic cut-off by default. An optional
     `monthly_egress_stop` refuses new watches above 100 %.
 - **Network:** A1 shapes get 1 Gbps per OCPU, so bandwidth binds after CPU.
 - **CPU, measured in S3** on an Apple M5, with str0m RTP mode doing SRTP for
@@ -900,16 +929,11 @@ Egress per viewer equals the share's rate (the SFU never transcodes):
   - **100 Mbps of egress (25 viewers at 4 Mbps) ≈ 0.4 of one A1 core**, on a
     task separate from voice.
   - PR 3 re-measures this on the VM.
-- **Compute allowance (flagged for the owner).** Oracle's Always Free page
-  now gives every tenancy 1,500 A1 OCPU-hours and 9,000 GB-hours a month,
-  which is 2 OCPUs and 12 GB running continuously. It changed around June
-  2026 (InfoQ, 2026-07).
-  - The owner believes the account is pay-as-you-go and that 4 OCPU / 24 GB is
-    free there. The current documentation says otherwise for every tenancy.
-  - The VM runs 4 OCPU / 24 GB. **To verify in the billing console:** if the
-    excess is billed, resize to 2 / 12.
-  - No design change either way: 2 OCPU is enough for the phase 1 numbers
-    above, and the defaults below assume it.
+- **Compute allowance.** The account is Always Free (confirmed by the owner,
+  2026-10-21). Oracle's Always Free page gives 1,500 A1 OCPU-hours and
+  9,000 GB-hours a month, which is 2 OCPUs and 12 GB running continuously.
+  2 OCPU is enough for the phase 1 numbers above, and the defaults below
+  assume it.
 
 ### Limits (server settings, with defaults)
 
@@ -1137,8 +1161,32 @@ Sharing requests are bound to the voice participation,
 `{call, participation}`: a share always comes from one's voice channel, and a
 sharing request after leaving the call answers `stale`. Watching requests are
 bound to the session, and checked against the watching rules in
-[Permission](#permission) on every `screen.watch` and again whenever
-visibility, the channel password state or call membership changes.
+[Permission](#permission) on every `screen.watch`.
+
+**Watch access is revalidated whenever it can change,** for every watcher,
+wherever the watcher is, not only for the channel's occupants:
+
+- **Effective permissions.** Today `enforce_connect` and
+  `enforce_connect_everywhere` (`core/overrides.rs`) run after every change
+  that can alter effective permissions: role edits and role permission
+  changes, channel overrides, member role grants and removals, owner
+  transfer and links. They only look at sessions *in* the affected channels.
+  PR 2 adds `enforce_watch` beside them, called from the same places with the
+  same scope. It re-checks every watch slot whose *share* is in scope:
+  visibility, `bypass_password` for password-protected channels, and call
+  membership for encrypted ones.
+- **Channel state.** Making a channel private or editing its member list,
+  setting or changing its password, and switching it to encrypted run the
+  same check for that channel.
+- **Session state.** Leaving a call ends that session's encrypted watches;
+  kicks, bans and disconnects end all of them.
+
+When access ends, the slot is released exactly like `screen.unwatch`, in the
+screen task's next loop iteration. Its Gwar queue is cleared, its RTX cache
+is wiped with `set_rtx_cache`, and its reservation is freed. The viewer gets
+`screen.slot {share: null}` and `screen.stopped {reason: "access"}`. Nothing
+of the share is sent to that viewer after that iteration; repairs and probes
+included ([Queues and repairs](#queues-and-repairs)).
 
 | Op | Body | Reply / effect |
 | --- | --- | --- |
@@ -1158,7 +1206,7 @@ Events:
 - `screen.started {share, client, channel, preset, surface}`;
 - `screen.viewers {share, members, guests}`, to the sharer only, and
   `screen.link {share, active}` to the sharer and the channel's moderators;
-- `screen.stopped {share, reason: stopped|moderator|left|limit|transport|budget}`;
+- `screen.stopped {share, reason: stopped|moderator|left|limit|transport|budget|access}`;
 - `screen.slot {binding, slot, share | null}`, like `voice.slot`;
 - `screen.paused {share, reason: bandwidth}` and `screen.resumed {share}`.
 
@@ -1219,7 +1267,7 @@ attachment (`ts_text`, `plain`, `split_for_teamspeak`):
   name passed through `plain`.
 - A TeamSpeak user who enters the channel while the share runs gets the link
   once, as a private message from ServerQuery, so late joiners are not left
-  out.
+  out. The bridge sends it from its in-memory copy of the link (below).
 - Nothing is posted when the share ends. The link simply stops working.
 - The channel description's presence line gets " · sharing screen" after the
   sharer's name. The link is not put there: descriptions are visible to
@@ -1236,10 +1284,19 @@ attachment (`ts_text`, `plain`, `split_for_teamspeak`):
 - The token is in the URL fragment. Browsers never send the fragment to the
   web host or in a Referer header. Only the watch page reads it, and sends it
   over the WebSocket to the Gwar server.
-- The server keeps only SHA-256(token) → share, in memory. The token dies
-  with the share: stop, leave, moderator stop, transport failure or server
-  restart. It also dies when the sharer or a moderator turns the link off.
-  One share has one token. A new share gets a new token and a new post.
+- **Where it is kept:**
+  - The guest gateway checks tokens against SHA-256(token) → share, in
+    memory.
+  - The bridge also keeps the raw link, in memory, for one purpose: sending
+    it to TeamSpeak users who enter the channel later. It is a map from share
+    to link inside the bridge task.
+  - Nothing is written to disk or to logs. The raw link exists only in that
+    bridge map and in the messages sent to TeamSpeak.
+- **When it dies.** The token and the bridge's copy are both removed when
+  the share ends (stop, leave, moderator stop, transport failure), when the
+  link is turned off, and when the bridge detaches. A server restart ends
+  every share, and so every link.
+- One share has one token. A new share gets a new token and a new post.
 - The token grants exactly one thing: watching that share. Guests see no
   other name than the sharer's display name, and no channel, chat or other
   shares.
@@ -1247,12 +1304,26 @@ attachment (`ts_text`, `plain`, `split_for_teamspeak`):
 **Guest sessions.**
 
 - **A separate WebSocket endpoint,** `GET /ws/watch`, so the member handshake
-  is unchanged.
+  is unchanged. It reuses the gateway's pre-authentication bounds as they are
+  (`gateway.rs`, `preauth.rs`):
+  - the client address comes from `client_ip`, honouring
+    `--client-ip-header`;
+  - `PreAuth::connection` runs before the upgrade. It caps connections
+    server-wide and per subscriber, bounds the address table, and applies the
+    per-subscriber attempt bucket. Guests and members share these limits;
+  - `subscriber` groups IPv6 addresses by /64, as for bans and member limits;
+  - `PreAuth::hello` rate-limits the first frame, `guest.watch`, in the same
+    bucket as member hellos;
+  - `HELLO_TIMEOUT` closes a connection that sends no `guest.watch` in time.
+    The same deadline applies again between the reply and `guest.offer`;
+  - pre-authentication frame size (`MAX_FRAME`), the per-connection frame
+    rate limit, `PING_INTERVAL` and `IDLE_TIMEOUT` apply unchanged.
   - The first frame is `guest.watch {token}`. The reply is
     `{share, sharer, preset, ice_servers}`, or one generic `not_found`
     for unknown, ended and revoked tokens alike.
-  - After that, only `guest.offer {sdp}` is accepted, plus
-    `screen.keyframe`. The offer is a watch transport with **one** slot.
+  - After that, only `guest.offer {sdp}` is accepted, **once per
+    connection**, plus `screen.keyframe`. The offer is a watch transport with
+    **one** slot. A second offer closes the connection.
   - Server events are `screen.paused`, `screen.resumed` and `screen.stopped`.
     Then the server closes the socket.
   - There is no identity and no MLS, and nothing is stored on the guest's
@@ -1264,10 +1335,12 @@ attachment (`ts_text`, `plain`, `split_for_teamspeak`):
     the same cap-based reservation as members;
   - at most 10 guests per share (`guests_per_share`), so a leaked link cannot
     crowd out members;
-  - per client IP (the gateway's existing `--client-ip-header` logic): at
-    most 3 concurrent guest sessions and 10 `guest.watch` attempts per
-    minute;
-  - under server-budget pressure, guests are paused before any member.
+  - per subscriber (an IPv4 address or an IPv6 /64): at most 3 concurrent
+    guest sessions, counted inside `PreAuth`'s per-subscriber connection
+    limit;
+  - guests never keep a member out of the budget: a member's admission
+    reclaims guest reservations, and a paused guest must pass admission again
+    ([Admission and resource limits](#admission-and-resource-limits)).
 - **Revocation** closes every guest session of the share within one loop
   iteration.
 
@@ -1292,6 +1365,12 @@ attachment (`ts_text`, `plain`, `split_for_teamspeak`):
   "Turn off". Turning it off is final for that share.
 - Moderators with `mute_members` can turn it off too, with
   `screen.link.revoke {share}`.
+- **Ordering, an acceptance check.** The notice and the checkbox appear
+  before anything is published. The client sends `screen.start
+  {guest_link}` only after the sharer confirms the preset menu. The server
+  creates the token only from that request, and the bridge posts only after
+  the share is announced. With the checkbox off, no token exists and nothing
+  is posted. PR 6's tests check both orders.
 
 **What each side learns.**
 
@@ -1552,8 +1631,11 @@ person.
    - the requests and events above, except the `*.offer` and slot ones,
      including `guest_link`, `screen.viewers` and `screen.link`;
    - the watching rules: session-bound watching, channel visibility, the
-     password rule, call membership for encrypted channels, and re-checks
-     when any of them changes;
+     password rule and call membership for encrypted channels;
+   - `enforce_watch` at every `enforce_connect` call site and on the channel
+     and session changes listed under "Requests", with tests that revoke
+     `bypass_password` by role edit, override and role removal from a viewer
+     outside the channel;
    - shares listed for every visible channel, without revealing hidden ones;
    - limits, lifecycle and the moderator stop;
    - `screen.start` refused in encrypted channels until PR 7;
@@ -1590,6 +1672,10 @@ person.
      - two shares on one constrained viewer pause the lower priority one;
      - a viewer outside the share's voice watches a plaintext share, and
        loses it when the channel becomes hidden to it;
+     - a viewer outside a password-protected channel, watching through
+       `bypass_password`, loses the slot when a role edit, an override or a
+       role removal takes that permission away. Nothing of the share reaches
+       it afterwards, NACK answers and probes included;
      - stale packets after a drop never cross a segment;
      - unknown and stale-share SSRCs drop;
      - a stopped share frees slots;
@@ -1652,7 +1738,15 @@ person.
      hold; revocation disconnects guests; a guest cannot send anything but
      the watch ops;
    - Playwright: a guest page in Chromium and WebKit watches a share, then
-     sees "The share has ended".
+     sees "The share has ended";
+   - acceptance: the TeamSpeak notice and checkbox are shown before any
+     token exists or any post is made. Nothing is posted before the sharer
+     confirms, and nothing at all with the checkbox off;
+   - a member's watch reclaims guest reservations when the budget is full;
+     the paused guests resume only after passing admission again;
+   - `/ws/watch` is held to the same `PreAuth` limits as `/ws`, IPv6 /64
+     grouping included; a second `guest.offer` closes the connection;
+   - the bridge's link copy is gone after stop, revocation and detach.
 
 **First release after PR 6: plaintext channels only, without sound.** The
 owner chose to ship sharing in plaintext channels first and add encryption
@@ -1793,8 +1887,6 @@ known:
 - **Wider audience, more egress.** Watching without joining voice, and
   guests, raise the number of viewers per share. The 25-viewer limit, the
   budget and the monthly counter bound it.
-- **Oracle compute allowance:** flagged for the owner to verify in the
-  billing console (see Cost).
 - **Spike limitations.**
   - One machine, loopback, synthetic content, software encoders and heavy
     background load.
@@ -1946,11 +2038,10 @@ version of this design.
    8 Mbps per share and a 300 Mbps server budget. A monthly egress counter
    warns admins against Oracle's 10 TB/month outbound allowance (one full
    share uses it in about 110 hours).
-5. **Oracle: flagged for the owner to verify.** The owner believes the
-   account is pay-as-you-go and that 4 OCPU / 24 GB is free there. Oracle's
-   current documentation gives every tenancy 1,500 OCPU-hours and 9,000
-   GB-hours a month (2 OCPU / 12 GB). To check in the billing console. No
-   design change: phase 1 fits in 2 OCPU.
+5. **Oracle: the account is Always Free** (owner, 2026-10-21). The free
+   compute allowance is 2 OCPU / 12 GB of A1, as Oracle's documentation
+   states (1,500 OCPU-hours and 9,000 GB-hours a month). No design change:
+   phase 1 fits in 2 OCPU.
 6. **Audio: optional for the first release, and moved to phase 2** (PR 9,
    [Shared audio](#shared-audio-phase-2)). The owner allowed it in the first
    release only if clearly simple and safe. It is not: even tab audio alone
