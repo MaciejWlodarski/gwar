@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
  * The web app's noise suppression in real browsers: the built app downloads the model, the
- * AudioWorklet loads it, and white noise sent through comes out far down; while the microphone
- * is not sent, it passes as captured. Needs crates/gwar-denoise-wasm/pkg (scripts/denoise-wasm/build.sh).
+ * AudioWorklet loads it, and white noise sent through comes out far down while a voice over it
+ * comes through; while the microphone is not sent, it passes as captured. Needs crates/gwar-denoise-wasm/pkg (scripts/denoise-wasm/build.sh).
  *
  *   E2E_BROWSERS=chromium,webkit,firefox   engines to run (default: chromium,webkit)
  */
@@ -29,7 +29,10 @@ async function port() {
   return port;
 }
 
-/** In the page: noise at -30 dBFS through the model; the level that comes out, active and not. */
+/**
+ * In the page: noise at -30 dBFS through the model, then a voice at -20 dBFS over it (a vowel's
+ * harmonics, its pitch and loudness moving like speech); the levels that come out.
+ */
 async function measure() {
   const { startDenoise } = await window.__gwarE2eImport("/src/voice/denoise/index.ts");
   const troubles = [];
@@ -66,12 +69,34 @@ async function measure() {
   await sleep(500);
   const passed = await level();
   model.setActive(true);
-  // Past two of the worklet's pace checks (2 s each): a machine that keeps up raises no trouble.
+  // Past two of the pace checks (2 s each): a machine that keeps up raises no trouble.
   await sleep(4500);
   const cleaned = await level();
+  const speech = context.createBuffer(1, 48_000 * 2, 48_000);
+  const voice = speech.getChannelData(0);
+  let phase = 0, power = 0;
+  for (let i = 0; i < voice.length; i++) {
+    const t = i / 48_000;
+    const pitch = 130 + 20 * Math.sin(2 * Math.PI * 3 * t);
+    phase += (2 * Math.PI * pitch) / 48_000;
+    let sample = 0;
+    for (let h = 1; h * pitch < 5_000; h++) sample += Math.sin(h * phase) / h;
+    // Four syllables a second.
+    voice[i] = sample * Math.sin(Math.PI * ((4 * t) % 1)) ** 2;
+    power += voice[i] ** 2;
+  }
+  const gain = 10 ** (-20 / 20) / Math.sqrt(power / voice.length);
+  for (let i = 0; i < voice.length; i++) voice[i] *= gain;
+  const speaker = context.createBufferSource();
+  speaker.buffer = speech;
+  speaker.loop = true;
+  speaker.connect(microphone);
+  speaker.start();
+  await sleep(500);
+  const spoken = await level();
   model.close();
   await context.close();
-  return { loadMs, passed, cleaned, troubles };
+  return { loadMs, passed, cleaned, spoken, troubles };
 }
 
 async function run(engine, web) {
@@ -93,6 +118,7 @@ async function run(engine, web) {
     assert.deepEqual(result.troubles, [], "the model reported trouble");
     assert.ok(result.passed > -35, `inactive: passes as captured (${result.passed.toFixed(1)} dBFS)`);
     assert.ok(result.cleaned < result.passed - 20, `active: noise down by more than 20 dB (${result.passed.toFixed(1)} → ${result.cleaned.toFixed(1)} dBFS)`);
+    assert.ok(result.spoken > -26, `active: a voice at -20 dBFS over the noise comes through (${result.spoken.toFixed(1)} dBFS)`);
     results.push({ engine, status: "pass", ...result, errors });
   } finally { await browser.close(); }
 }

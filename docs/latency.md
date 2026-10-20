@@ -663,30 +663,42 @@ one step that holds the audio thread, which Firefox shares with the page's other
 48 kHz contexts, so playback there can pause once while the model loads. 200 frames
 of quiet noise then run through the model, one every other render quantum, so the
 browser compiles it fully before it counts; if the second half of them averages
-more than 8 ms a frame, the model could not keep up even running flat out.
+more than 5 ms a frame, the model is too slow here.
 
-After that, a frame's time is no measure of trouble. On Apple Silicon a frame takes
-~1.2 ms on the audio thread when it runs every quantum, but ~3.6 ms at one frame per
-10 ms, as the system clocks the thread down; and a render callback that runs late
-(WebKit's last 2.67 ms) costs nothing while the device's buffer covers it. What
-harms is a callback the device skips: the audio clock then falls behind the wall
-clock, and the microphone loses that audio. So every 2 s the worklet compares the
-two clocks; behind by more than 3% twice in a row, the machine is too slow for the
-model beside everything else on the audio thread, and the page falls back to the
-browser's suppression, as it does if the model fails, cannot load, or the browser
-cannot take the microphone into a 48 kHz context (Firefox, for a microphone at
-another rate). The desktop build of the web app leaves all of this out.
+While it runs, three checks, over 2 s windows; any of them two windows in a row and
+the machine is too slow for the model beside everything else on the audio thread:
 
-Tests: the framing's 448-sample delay and order, and the pace check (unit tests);
+- The model's time on a frame, against 5 ms on average. The render quantum a frame
+  lands in comes that much later, and the audio after it with it, so half a frame's
+  time bounds what this adds to the microphone's delay. On Apple Silicon a frame
+  takes ~1.2 ms on the audio thread when it runs every quantum, but ~3.6 ms at one
+  frame per 10 ms, as the system clocks the thread down.
+- The audio clock against the wall clock, behind by more than 3%: render callbacks
+  missed for good, audio the microphone lost.
+- In Chromium, which counts them (`playbackStats`), more than 20 ms of the capture
+  context's underruns.
+
+With a deliberate burden (a busy wait after each frame), 4 ms a frame passed in
+Chromium and WebKit; 6 ms was reported by the frame's time, 12 ms by the clocks
+(17% behind) and, in Chromium, by the underruns.
+
+The page then falls back to the browser's suppression, as it does if the model
+fails (an error in the worklet included), cannot load, or the browser cannot take
+the microphone into a 48 kHz context (Firefox, for a microphone at another rate).
+The desktop build of the web app leaves all of this out.
+
+Tests: the framing's 448-sample delay and order, and the checks above (unit tests);
 the engine's switch between the browser's suppression and the model, idling,
-fallback, and loads that end with their call or are cancelled (unit tests with a
-stand-in); `scripts/denoise-wasm/build.sh` checks the pin, that
+fallback, loads that end with their call or are cancelled, and a model that loads
+while the call attaches its first track (unit tests with a stand-in); `scripts/denoise-wasm/build.sh` checks the pin, that
 the module imports nothing, and that it takes white noise down by more than 20 dB
 in real time; and `apps/web/e2e/denoise.mjs` loads the built app's model in
 Chromium, WebKit and Firefox and checks that noise through the worklet goes down by
-more than 20 dB with no trouble past two pace checks, and passes as captured while
-the microphone is not sent (Chromium and WebKit locally: from -30 dBFS to about -80,
-loaded in ~1.2 s; the audio clocks kept within 0.5% of the wall clock).
+more than 20 dB with no trouble past two windows of checks, that a voice at -20 dBFS
+over it comes through (a vowel's harmonics, pitch and loudness moving like
+speech), and that it passes as captured while the microphone is not sent
+(Chromium and WebKit locally: noise from -30 dBFS to about -80, the voice out at
+about -18, loaded in ~1.2 s).
 
 ## Native 10 ms frames
 

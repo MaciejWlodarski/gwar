@@ -3,7 +3,7 @@
  * capture context's audio thread, frame by frame, with no hop to another thread and back.
  */
 import { FRAME, Framing } from "./framing";
-import { Pace } from "./pace";
+import { BUDGET_MS, Pace } from "./pace";
 import type { Report, Request } from "./protocol";
 
 // AudioWorkletGlobalScope, which TypeScript's DOM library leaves out.
@@ -26,8 +26,6 @@ interface Exports {
 
 /** Frames run through the model after loading, one every other render quantum, before it counts. */
 const WARM_UP = 200;
-/** Average ms a warm-up frame may take; past it, the model could not keep up even running flat out. */
-const WARM_UP_LIMIT_MS = 8;
 class DenoiseProcessor extends AudioWorkletProcessor {
   private exports: Exports | null = null;
   private denoiser = 0;
@@ -42,6 +40,8 @@ class DenoiseProcessor extends AudioWorkletProcessor {
   /** The model starts over before the next frame: a gap in what it was given. */
   private fresh = true;
   private failed = false;
+  /** The ms the model took on a frame in this render quantum, if it ran. */
+  private frameMs: number | null = null;
   private framing = new Framing(frame => this.clean(frame));
 
   constructor() {
@@ -95,13 +95,19 @@ class DenoiseProcessor extends AudioWorkletProcessor {
     return String.fromCharCode(...bytes);
   }
 
-  /** Cleans `frame` in place with the model; false if it failed. */
+  /** Cleans `frame` in place with the model; false if it failed, the frame left as it was. */
   private run(frame: Float32Array, reset: boolean): boolean {
     const exports = this.exports!;
-    if (reset) exports.gwar_denoise_reset(this.denoiser);
-    new Float32Array(exports.memory.buffer, exports.gwar_denoise_frame(this.denoiser), FRAME).set(frame);
-    if (!exports.gwar_denoise_process(this.denoiser, this.strength)) {
-      this.report({ type: "failed", reason: this.error(exports) });
+    try {
+      if (reset) exports.gwar_denoise_reset(this.denoiser);
+      new Float32Array(exports.memory.buffer, exports.gwar_denoise_frame(this.denoiser), FRAME).set(frame);
+      if (!exports.gwar_denoise_process(this.denoiser, this.strength)) {
+        this.report({ type: "failed", reason: this.error(exports) });
+        return false;
+      }
+    } catch (error) {
+      // A trap (a panic aborts): the module is unusable from here on.
+      this.fail(error);
       return false;
     }
     frame.set(new Float32Array(exports.memory.buffer, exports.gwar_denoise_frame(this.denoiser), FRAME));
@@ -121,7 +127,7 @@ class DenoiseProcessor extends AudioWorkletProcessor {
     if (this.warming <= WARM_UP / 2) this.warmUpMs += Date.now() - started;
     if (--this.warming > 0) return;
     const mean = this.warmUpMs / (WARM_UP / 2);
-    if (mean > WARM_UP_LIMIT_MS) return this.report({ type: "slow", reason: `${mean.toFixed(1)} ms a frame` });
+    if (mean > BUDGET_MS) return this.report({ type: "slow", reason: `${mean.toFixed(1)} ms a frame` });
     this.fresh = true;
     this.report({ type: "ready" });
   }
@@ -131,19 +137,21 @@ class DenoiseProcessor extends AudioWorkletProcessor {
     if (!this.exports || this.warming > 0 || !this.active || this.failed) return;
     const reset = this.fresh;
     this.fresh = false;
-    this.run(frame, reset);
+    const started = Date.now();
+    if (this.run(frame, reset)) this.frameMs = Date.now() - started;
   }
 
   process(inputs: Float32Array[][], outputs: Float32Array[][]): boolean {
     // Every other quantum, so as not to take the thread over (Firefox shares it with the page's
     // other 48 kHz contexts).
     if (this.exports && this.warming > 0 && !this.failed && this.quanta++ % 2 === 0) this.warmUp();
-    if (this.exports && this.warming === 0 && this.active && !this.failed) {
-      const slow = this.pace.check(Date.now(), currentTime);
-      if (slow) this.report(slow);
-    }
+    this.frameMs = null;
     const output = outputs[0]?.[0];
     if (output) this.framing.push(inputs[0]?.[0] ?? null, output);
+    if (this.exports && this.warming === 0 && this.active && !this.failed) {
+      const slow = this.pace.check(Date.now(), currentTime, this.frameMs);
+      if (slow) this.report(slow);
+    }
     return true;
   }
 }

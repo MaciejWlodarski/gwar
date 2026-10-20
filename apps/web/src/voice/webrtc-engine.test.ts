@@ -315,6 +315,48 @@ describe("browser noise suppression", () => {
     expect(startDenoise.mock.calls[0]![1].aborted).toBe(true);
   });
 
+  it("cancels the run before's load as soon as a new run starts", async () => {
+    const first = deferred<DenoisePipeline>();
+    startDenoise.mockReturnValueOnce(first.promise);
+    await engine.start(params());
+    const resumed = deferred<void>();
+    resume.mockReturnValueOnce(resumed.promise);
+    const replacing = engine.start(params());
+    expect(startDenoise.mock.calls[0]![1].aborted).toBe(true);
+    const stale = pipeline();
+    first.resolve(stale as DenoisePipeline);
+    await flush();
+    expect(stale.close).toHaveBeenCalledOnce();
+    expect(getUserMedia).toHaveBeenCalledOnce();
+    resumed.resolve();
+    await replacing;
+    expect(startDenoise).toHaveBeenCalledTimes(2);
+  });
+
+  it("sends the model's track when it loads while the call's first track is being attached", async () => {
+    const attached = deferred<void>();
+    vi.stubGlobal("RTCPeerConnection", class extends Peer {
+      override addTransceiver = vi.fn(() => ({ sender: { replaceTrack: vi.fn(async () => {}) } }));
+      constructor() {
+        super();
+        this.addTransceiver.mockImplementationOnce(() => ({ sender: { replaceTrack: vi.fn().mockReturnValueOnce(attached.promise).mockResolvedValue(undefined) } }));
+      }
+    });
+    const load = deferred<DenoisePipeline>();
+    startDenoise.mockReturnValueOnce(load.promise);
+    const starting = engine.start(params());
+    await flush();
+    const first = (await captured(0)).getAudioTracks()[0]!;
+    expect(sender().replaceTrack).toHaveBeenLastCalledWith(first);
+    const model = pipeline();
+    load.resolve(model as DenoisePipeline);
+    await flush();
+    expect(first.stop).toHaveBeenCalled();
+    attached.resolve();
+    await starting;
+    expect(sender().replaceTrack).toHaveBeenLastCalledWith(model.track);
+  });
+
   it("closes a model that loads after the call ended", async () => {
     const load = deferred<DenoisePipeline>();
     startDenoise.mockReturnValueOnce(load.promise);

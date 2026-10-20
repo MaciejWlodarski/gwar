@@ -6,6 +6,7 @@
  * its 10 ms frames to the audio thread's quanta.
  */
 import pin from "../../../../../crates/gwar-denoise-wasm/model.json";
+import { PACE_WINDOW_S, Underruns } from "./pace";
 import type { Report, Request } from "./protocol";
 
 export interface DenoisePipeline {
@@ -122,8 +123,7 @@ export async function startDenoise(events: DenoiseEvents, signal: AbortSignal): 
       };
       context.addEventListener("statechange", started);
     });
-    node.port.onmessage = (event: MessageEvent<Report>) => {
-      const report = event.data;
+    const receive = (report: Report) => {
       if (settle) {
         settle(report);
         settle = null;
@@ -131,6 +131,9 @@ export async function startDenoise(events: DenoiseEvents, signal: AbortSignal): 
         events.trouble(describe(report));
       }
     };
+    node.port.onmessage = (event: MessageEvent<Report>) => receive(event.data);
+    // An exception the worklet left uncaught: its output is silence from then on.
+    node.onprocessorerror = () => receive({ type: "failed", reason: "the worklet failed" });
     resume();
     post({ type: "load", code, archive }, [code, archive]);
     const report = await ready;
@@ -139,7 +142,17 @@ export async function startDenoise(events: DenoiseEvents, signal: AbortSignal): 
     signal.removeEventListener("abort", abort);
 
     let source: MediaStreamAudioSourceNode | null = null;
+    let active = false;
     context.onstatechange = () => events.changed();
+    // Chromium counts the context's underruns: render callbacks the model made miss their time.
+    const underruns = new Underruns();
+    const playback = () => (context as AudioContext & { playbackStats?: { underrunDuration: number } }).playbackStats;
+    const watch = playback()
+      ? setInterval(() => {
+          const slow = underruns.check(active && context.state === "running" ? playback()!.underrunDuration : null);
+          if (slow && !closed) events.trouble(describe(slow));
+        }, PACE_WINDOW_S * 1000)
+      : undefined;
     const track = destination.stream.getAudioTracks()[0]!;
     return {
       track,
@@ -162,14 +175,16 @@ export async function startDenoise(events: DenoiseEvents, signal: AbortSignal): 
         source.connect(node);
         post({ type: "reset" });
       },
-      setActive(active) {
-        post({ type: "active", active });
+      setActive(sent) {
+        active = sent;
+        post({ type: "active", active: sent });
       },
       setStrength(strength) {
         post({ type: "strength", strength });
       },
       close() {
         closed = true;
+        clearInterval(watch);
         context.onstatechange = null;
         source?.disconnect();
         track.stop();

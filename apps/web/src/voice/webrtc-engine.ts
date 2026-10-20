@@ -126,6 +126,8 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     if (encrypted && (!keys || !server_key || !call || !participation || !group)) throw new VoiceError("unsupported", "encrypted voice needs its call binding and keys");
     const mediaRun = nextMediaRun();
     const run = ++this.runId;
+    // A model still loading is the run before's.
+    this.cancelDenoiseLoad();
     // Closes the old gate and drops its queued audio before the new run starts.
     this.teardownPeer();
     if (encrypted && !(await encryptedVoiceSupported())) {
@@ -167,6 +169,9 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       if (track) await mic.sender.replaceTrack(track);
       if (run !== this.runId) return;
       this.micSender = mic.sender;
+      // The model may have loaded meanwhile, and the microphone been captured again.
+      await this.updateSentTrack();
+      if (run !== this.runId) return;
       const slotTransceivers: RTCRtpTransceiver[] = [];
       for (let i = 0; i < AUDIO_SLOTS; i++) {
         const slot = pc.addTransceiver("audio", { direction: "recvonly" });
@@ -364,7 +369,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     ).then(
       async loaded => {
         // A load another run started, or one cancelled: its pipeline is not this run's.
-        if (this.denoiseLoad !== load || !this.inCall()) {
+        if (this.denoiseLoad !== load || load.run !== this.runId || !this.inCall()) {
           loaded.close();
           return;
         }
@@ -376,7 +381,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
         await this.reopenMic();
       },
       (error: unknown) => {
-        if (this.denoiseLoad !== load) return;
+        if (this.denoiseLoad !== load || load.run !== this.runId) return;
         this.denoiseLoad = null;
         this.denoiseTrouble(error instanceof Error ? error.message : String(error));
       },
