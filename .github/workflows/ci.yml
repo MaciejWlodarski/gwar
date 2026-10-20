@@ -142,13 +142,13 @@ jobs:
       - run: pnpm --filter web build
       - run: pnpm --filter web exec playwright install --with-deps chromium webkit firefox
       - run: pnpm --filter web e2e:images
-      # The runner has no audio device: Firefox's audio contexts never start without one.
+      # Headless browsers need an audio output: Firefox's audio contexts never start without one.
       - name: Sound server with a null sink
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends pulseaudio
-          pulseaudio -D --exit-idle-time=-1
-          pactl load-module module-null-sink sink_name=null
+          sudo apt-get install -y pulseaudio
+          pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=e2e
+          pactl set-default-sink e2e
       - name: Noise suppression in Chromium, WebKit and Firefox
         run: pnpm --filter web e2e:denoise
         env:

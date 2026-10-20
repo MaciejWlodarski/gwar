@@ -357,6 +357,36 @@ describe("browser noise suppression", () => {
     expect(sender().replaceTrack).toHaveBeenLastCalledWith(model.track);
   });
 
+  it("sends what fits the capture context's state once replacements in progress are done", async () => {
+    const replaced = deferred<void>();
+    let hold = false;
+    const peerSender = { track: null as MediaStreamTrack | null, replaceTrack: vi.fn(async (track: MediaStreamTrack) => {
+      if (hold) { hold = false; await replaced.promise; }
+      peerSender.track = track;
+    }) };
+    vi.stubGlobal("RTCPeerConnection", class extends Peer {
+      override addTransceiver = vi.fn(() => ({ sender: { replaceTrack: vi.fn(async () => {}) } }));
+      constructor() {
+        super();
+        this.addTransceiver.mockImplementationOnce(() => ({ sender: peerSender as never }));
+      }
+    });
+    const { model, events } = await loaded(pipeline(false));
+    const raw = (await captured(1)).getAudioTracks()[0]!;
+    expect(peerSender.track).toBe(raw);
+    // Running: the model's track is on its way when Safari interrupts the context again.
+    hold = true;
+    model.running = true;
+    events().changed();
+    await flush();
+    model.running = false;
+    events().changed();
+    await flush();
+    replaced.resolve();
+    await flush();
+    expect(peerSender.track).toBe(raw);
+  });
+
   it("closes a model that loads after the call ended", async () => {
     const load = deferred<DenoisePipeline>();
     startDenoise.mockReturnValueOnce(load.promise);

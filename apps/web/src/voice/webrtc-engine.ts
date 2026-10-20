@@ -80,6 +80,8 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   /** The model loading for a run (`runId`), cancelled when that run ends or suppression goes off. */
   private denoiseLoad: { run: number; abort: AbortController } | null = null;
   private denoiseUnavailable = false;
+  /** Replacements of the sent track, one at a time: `sender.track` changes only once one completes. */
+  private sentTrackUpdates: Promise<void> = Promise.resolve();
   private state: VoiceState = "idle";
   private runId = 0;
   private micGeneration = 0;
@@ -312,7 +314,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     const stream = await this.openMic();
     if (!stream || this.stream !== stream) return;
     const track = stream.getAudioTracks()[0] ?? null;
-    if (track && this.micSender) await this.micSender.replaceTrack(this.sentTrack());
+    if (track) await this.updateSentTrack();
     this.applyTrackEnabled();
   }
 
@@ -340,9 +342,14 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     return captured && this.denoise?.running ? this.denoise.track : captured;
   }
 
-  private async updateSentTrack(): Promise<void> {
-    const track = this.sentTrack();
-    if (track && this.micSender && this.micSender.track !== track) await this.micSender.replaceTrack(track).catch(() => {});
+  /** Sends `sentTrack()`, after any replacement still in progress, as it is when that is done. */
+  private updateSentTrack(): Promise<void> {
+    const update = this.sentTrackUpdates.then(async () => {
+      const sender = this.micSender, track = this.sentTrack();
+      if (track && sender && sender.track !== track) await sender.replaceTrack(track).catch(() => {});
+    });
+    this.sentTrackUpdates = update;
+    return update;
   }
 
   private inCall(): boolean {
