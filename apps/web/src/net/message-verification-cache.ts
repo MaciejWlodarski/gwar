@@ -15,22 +15,39 @@ export class MessageVerificationCache {
     if (this.entries.size > MAX_CHECKPOINTS) this.entries.delete(this.entries.keys().next().value!);
     return state;
   }
+  private running?: Promise<void>;
+  private queued?: { now: number; done: Promise<void> };
   /** Refresh time/feed qualifications without hashing bodies or checking signatures again; only the
-   *  checkpoints storage could not take before are taken now. */
-  async refresh(now = Date.now()): Promise<void> {
+   *  checkpoints storage could not take before are taken now. One refresh at a time, at most one more
+   *  waiting (at the latest time asked for), so none acts on results another changed meanwhile. */
+  refresh(now = Date.now()): Promise<void> {
+    if (this.queued) { this.queued.now = now; return this.queued.done; }
+    if (!this.running) return this.start(now);
+    const queued: { now: number; done?: Promise<void> } = { now };
+    queued.done = this.running.then(() => { this.queued = undefined; return this.start(queued.now); });
+    this.queued = queued as { now: number; done: Promise<void> };
+    return queued.done;
+  }
+  private start(now: number): Promise<void> {
+    const run: Promise<void> = this.run(now).catch(() => {}).finally(() => { if (this.running === run) this.running = undefined; });
+    return this.running = run;
+  }
+  private async run(now: number): Promise<void> {
     const entries = [...this.entries.values()];
-    const results = await Promise.all(entries.map((e) => e.state));
-    await Promise.all(entries.map(async (entry, i) => {
-      if (results[i]!.status !== "verified" || results[i]!.continuity !== "storage-unavailable") return;
-      entry.state = this.verifier.checkpoint(entry.msg, entry.ctx, results[i]!);
-      results[i] = await entry.state;
+    await Promise.all(entries.map(async (entry) => {
+      const current = await entry.state;
+      if (current.status !== "verified" || current.continuity !== "storage-unavailable") return;
+      await (entry.state = this.verifier.checkpoint(entry.msg, entry.ctx, current));
     }));
-    const certified = entries.filter((e, i) => results[i]!.status === "verified" && e.msg.signature?.certificate);
+    const certified: typeof entries = [];
+    for (const e of entries) if ((await e.state).status === "verified" && e.msg.signature?.certificate) certified.push(e);
     if (!certified.length) return;
     await refreshRevocations();
     const revocations = await this.storage.revocations(certified.map((e) => ({
       account: e.msg.signature!.certificate!.account_key, device: e.msg.signature!.certificate!.device_key,
     })), undefined, now).catch(() => undefined);
+    // From each result as it is now, never as it was before the awaits above.
+    const results = await Promise.all(entries.map((e) => e.state));
     entries.forEach((entry, i) => {
       const old = results[i]!, signature = entry.msg.signature, certificate = signature?.certificate;
       if (old.status !== "verified" || !certificate) return;
