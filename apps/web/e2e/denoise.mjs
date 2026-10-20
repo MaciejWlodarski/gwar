@@ -5,6 +5,9 @@
  * comes through; while the microphone is not sent, it passes as captured. Needs crates/gwar-denoise-wasm/pkg (scripts/denoise-wasm/build.sh).
  *
  *   E2E_BROWSERS=chromium,webkit,firefox   engines to run (default: chromium,webkit)
+ *
+ * Firefox's audio contexts start only with an audio device (on Linux, a sound server: CI runs
+ * PulseAudio with a null sink).
  */
 import { stopProcesses } from "./processes.mjs";
 import assert from "node:assert/strict";
@@ -114,7 +117,12 @@ async function run(engine, web) {
     await page.waitForFunction(() => typeof window.__gwarE2eImport === "function");
     // A gesture, for browsers that start audio only after one.
     await page.mouse.click(1, 1);
-    const result = await page.evaluate(measure);
+    // A context that never starts (no audio device) leaves the load waiting.
+    let timer;
+    const result = await Promise.race([
+      page.evaluate(measure),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("timed out: no audio device?")), 120_000); }),
+    ]).finally(() => clearTimeout(timer));
     assert.deepEqual(result.troubles, [], "the model reported trouble");
     assert.ok(result.passed > -35, `inactive: passes as captured (${result.passed.toFixed(1)} dBFS)`);
     assert.ok(result.cleaned < result.passed - 20, `active: noise down by more than 20 dB (${result.passed.toFixed(1)} → ${result.cleaned.toFixed(1)} dBFS)`);

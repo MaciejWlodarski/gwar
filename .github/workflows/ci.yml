@@ -120,6 +120,7 @@ jobs:
   web:
     needs: [mls-wasm, denoise-wasm]
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
@@ -141,6 +142,13 @@ jobs:
       - run: pnpm --filter web build
       - run: pnpm --filter web exec playwright install --with-deps chromium webkit firefox
       - run: pnpm --filter web e2e:images
+      # The runner has no audio device: Firefox's audio contexts never start without one.
+      - name: Sound server with a null sink
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends pulseaudio
+          pulseaudio -D --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=null
       - name: Noise suppression in Chromium, WebKit and Firefox
         run: pnpm --filter web e2e:denoise
         env:
