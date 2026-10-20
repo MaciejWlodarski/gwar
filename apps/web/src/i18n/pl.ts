@@ -481,6 +481,7 @@ export const pl: Record<Key, string> = {
   "err.req.too_large": "To jest za duże.",
   "err.join.forbidden": "Nie masz uprawnień, aby dołączyć do tego kanału.",
   "err.req.quota_exceeded": "Brak miejsca na to na serwerze.",
+  "err.req.partial": "Udało się tylko częściowo",
   "connect.invited": "Dostajesz zaproszenie na ten serwer. Połącz się, żeby dołączyć.",
   "connect.inviteForget": "Zignoruj zaproszenie",
   "file.attach": "Dołącz pliki",

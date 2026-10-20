@@ -478,6 +478,11 @@ therefore have different TS suffixes while retaining the same Gwar nickname.
   - Refusals keep their meaning: a wrong or missing channel password is
     `wrong_password`, a full channel `channel_full`, missing permissions
     (needed join power, channel kind) `forbidden`.
+  - TeamSpeak edits and moves a channel with separate commands, so
+    `channel.update` runs the edit, then the move; a move refused after the
+    edit went through is `partial`, and its message says which part was done.
+  - Ids for TeamSpeak messages come from one counter per process, so rows kept
+    across a reconnect never share an id with new ones.
   - The Welcome offers every permission and the UI keeps that list (there are
     no Gwar roles to derive it from); the server decides. Joins go out without
     a password first, so admins with `b_channel_join_ignore_password` are never

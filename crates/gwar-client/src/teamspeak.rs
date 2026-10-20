@@ -10,7 +10,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -481,6 +481,17 @@ fn reply_for(request: &Request) -> Reply {
     }
 }
 
+/// An id for a message TeamSpeak sent without one. Unique for the life of the process, not
+/// of a connection: rows the UI keeps across a reconnect (server chat, private messages)
+/// would otherwise share ids with new ones, and the UI drops a repeated id.
+fn message_id() -> MessageId {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    FIRST_MESSAGE_ID | (NEXT.fetch_add(1, Ordering::Relaxed) & !FIRST_MESSAGE_ID)
+}
+
+/// The upper half of the id space, apart from the ids a Gwar server hands out.
+const FIRST_MESSAGE_ID: MessageId = 1 << 31;
+
 /// Our own message as everyone in its target sees it.
 fn own_message(view: &View, own: u16, id: MessageId, target: ChatTarget, text: String) -> ChatMessage {
     let me = view.clients.get(&u32::from(own));
@@ -547,10 +558,79 @@ fn readable(error: &tsclientlib::TsError) -> String {
     out
 }
 
-/// Translates a `gwar/1` request into a TS command; `Ok(None)` = answered locally.
-fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Option<OutCommand>, ErrorBody> {
+/// One TeamSpeak command of a request. `channel.update` may take two: TeamSpeak edits a
+/// channel and moves it with separate commands.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Part {
+    Whole,
+    Edit,
+    Move,
+}
+
+impl Part {
+    fn done(self) -> &'static str {
+        match self {
+            Part::Whole => "done",
+            Part::Edit => "edited",
+            Part::Move => "moved",
+        }
+    }
+}
+
+/// The refusal of `failed` after `done` went through. Parts already done stay done, so the
+/// error says so rather than reading as if nothing changed.
+fn refusal_after(done: &[Part], failed: Part, error: ErrorBody) -> ErrorBody {
+    if done.is_empty() {
+        return error;
+    }
+    let done: Vec<&str> = done.iter().map(|p| p.done()).collect();
+    ErrorBody::new(
+        ErrorCode::Partial,
+        format!("channel {}, but not {} ({})", done.join(" and "), failed.done(), error.message),
+    )
+}
+
+/// `channel.update` as TeamSpeak commands: the edit first, then the move, which only runs
+/// once the edit went through.
+fn channel_update(u: &gwar_proto::ChannelUpdate) -> Vec<(Part, OutCommand)> {
+    let mut args = vec![("cid", u.channel.to_string())];
+    if let Some(name) = &u.name {
+        args.push(("channel_name", name.clone()));
+    }
+    if let Some(topic) = &u.topic {
+        args.push(("channel_topic", topic.clone()));
+    }
+    if let Some(password) = &u.password {
+        args.push(("channel_password", if password.is_empty() { String::new() } else { ts_password(password) }));
+    }
+    match u.max_clients {
+        Some(0) => args.push(("channel_flag_maxclients_unlimited", "1".into())),
+        Some(max) => {
+            args.push(("channel_maxclients", max.to_string()));
+            args.push(("channel_flag_maxclients_unlimited", "0".into()));
+        }
+        None => {}
+    }
+    // Reordering within a parent is not mapped yet; moves keep TS's default order.
+    let parent = if u.move_to_root { Some(0) } else { u.parent.map(u64::from) };
+    let mut commands = Vec::new();
+    if args.len() > 1 || parent.is_none() {
+        commands.push((Part::Edit, command("channeledit", &args)));
+    }
+    if let Some(parent) = parent {
+        commands.push((
+            Part::Move,
+            command("channelmove", &[("cid", u.channel.to_string()), ("cpid", parent.to_string())]),
+        ));
+    }
+    commands
+}
+
+/// Translates a `gwar/1` request into the TS commands that carry it out, in order; none
+/// = answered locally.
+fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Vec<(Part, OutCommand)>, ErrorBody> {
     let cmd = match request {
-        Request::Ping {} => return Ok(None),
+        Request::Ping {} => return Ok(Vec::new()),
         Request::ChannelJoin { channel, password } => {
             let mut args = vec![("clid", own.to_string()), ("cid", channel.to_string())];
             if let Some(password) = password.as_deref().filter(|p| !p.is_empty()) {
@@ -603,7 +683,7 @@ fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Option<Out
                 None => {}
             }
             if args.is_empty() {
-                return Ok(None);
+                return Ok(Vec::new());
             }
             command("clientupdate", &args)
         }
@@ -624,36 +704,7 @@ fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Option<Out
             }
             command("channelcreate", &args)
         }
-        Request::ChannelUpdate(u) => {
-            if u.parent.is_some() || u.move_to_root || u.position.is_some() {
-                let parent = if u.move_to_root { 0 } else { u.parent.map(u64::from).unwrap_or(0) };
-                // Reordering within a parent is not mapped yet; moves keep TS's default order.
-                command("channelmove", &[("cid", u.channel.to_string()), ("cpid", parent.to_string())])
-            } else {
-                let mut args = vec![("cid", u.channel.to_string())];
-                if let Some(name) = &u.name {
-                    args.push(("channel_name", name.clone()));
-                }
-                if let Some(topic) = &u.topic {
-                    args.push(("channel_topic", topic.clone()));
-                }
-                if let Some(password) = &u.password {
-                    args.push((
-                        "channel_password",
-                        if password.is_empty() { String::new() } else { ts_password(password) },
-                    ));
-                }
-                match u.max_clients {
-                    Some(0) => args.push(("channel_flag_maxclients_unlimited", "1".into())),
-                    Some(max) => {
-                        args.push(("channel_maxclients", max.to_string()));
-                        args.push(("channel_flag_maxclients_unlimited", "0".into()));
-                    }
-                    None => {}
-                }
-                command("channeledit", &args)
-            }
-        }
+        Request::ChannelUpdate(u) => return Ok(channel_update(u)),
         Request::ChannelDelete { channel } => {
             command("channeldelete", &[("cid", channel.to_string()), ("force", "1".into())])
         }
@@ -671,7 +722,7 @@ fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Option<Out
         Request::ChatHistory { .. } => return Err(refused("TeamSpeak servers keep no chat history")),
         Request::ChannelLeave {} => return Err(refused("on TeamSpeak servers you are always in a channel")),
         // Read state lives in this client only.
-        Request::ChatRead { .. } => return Ok(None),
+        Request::ChatRead { .. } => return Ok(Vec::new()),
         Request::TokenCreate { .. } => return Err(refused("create privilege keys in the TeamSpeak client")),
         Request::ChatEdit { .. } | Request::ChatDelete { .. } => {
             return Err(refused("TeamSpeak messages can't be edited or deleted"));
@@ -707,7 +758,7 @@ fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Option<Out
         }
         Request::Hello(_) | Request::Join(_) => return Err(refused("already connected")),
     };
-    Ok(Some(cmd))
+    Ok(vec![(Part::Whole, cmd)])
 }
 
 /// Speakers count as talking this long after their last frame.
@@ -805,13 +856,39 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
     }
 
     type ReplyTx = oneshot::Sender<Result<Value, ErrorBody>>;
-    let mut pending: HashMap<MessageHandle, (Reply, ReplyTx)> = HashMap::new();
+    /// A request waiting for TeamSpeak to answer `part`; `rest` runs only if it went through.
+    struct InFlight {
+        expected: Reply,
+        reply: ReplyTx,
+        done: Vec<Part>,
+        part: Part,
+        rest: std::vec::IntoIter<(Part, OutCommand)>,
+    }
+    /// Sends the next command of `flight`, or hands it back once none is left.
+    fn send_next(
+        con: &mut TsConnection,
+        pending: &mut HashMap<MessageHandle, InFlight>,
+        mut flight: InFlight,
+    ) -> Option<InFlight> {
+        let Some((part, cmd)) = flight.rest.next() else { return Some(flight) };
+        flight.part = part;
+        match cmd.send_with_result(con) {
+            Ok(handle) => {
+                pending.insert(handle, flight);
+            }
+            Err(e) => {
+                let error = ErrorBody::new(ErrorCode::Unavailable, e.to_string());
+                let _ = flight.reply.send(Err(refusal_after(&flight.done, part, error)));
+            }
+        }
+        None
+    }
+    let mut pending: HashMap<MessageHandle, InFlight> = HashMap::new();
     // Done on the server, answered once the book shows the result (or given up on).
     let mut done: Vec<(Reply, ReplyTx, Instant)> = Vec::new();
     let mut slots = SlotMap::new();
     let mut mic_packet: u16 = 0;
     let mut tick = tokio::time::interval(Duration::from_millis(100));
-    let mut next_message: u32 = 1 << 31;
     type PendingRequest = (Box<Request>, oneshot::Sender<Result<Value, ErrorBody>>);
     enum Step {
         Item(Option<Result<StreamItem, tsclientlib::Error>>),
@@ -850,10 +927,9 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                                 MessageTarget::Client(id) => ChatTarget::Client(u32::from(id.0)),
                                 MessageTarget::Poke(id) => ChatTarget::Client(u32::from(id.0)),
                             };
-                            next_message = next_message.wrapping_add(1).max(1 << 31);
                             out.push(Event::ChatMessage(ChatMessage {
                                 signature: None,
-                                id: next_message,
+                                id: message_id(),
                                 target,
                                 author: u32::from(invoker.id.0),
                                 author_uid: invoker
@@ -902,18 +978,25 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                     }
                 }
                 StreamItem::MessageResult(handle, result) => {
-                    if let Some((expected, reply)) = pending.remove(&handle) {
+                    if let Some(mut flight) = pending.remove(&handle) {
                         match result {
                             Ok(()) => {
-                                // Answered from a fresh view below.
-                                book_changed = true;
-                                done.push((expected, reply, Instant::now()));
+                                flight.done.push(flight.part);
+                                if let Some(flight) = send_next(&mut con, &mut pending, flight) {
+                                    // Answered from a fresh view below.
+                                    book_changed = true;
+                                    done.push((flight.expected, flight.reply, Instant::now()));
+                                }
                             }
-                            Err(e) if expected == Reply::Join && e.error == tsclientlib::TsError::ChannelAlreadyIn => {
-                                let _ = reply.send(Ok(json!({})));
+                            Err(e)
+                                if flight.expected == Reply::Join
+                                    && e.error == tsclientlib::TsError::ChannelAlreadyIn =>
+                            {
+                                let _ = flight.reply.send(Ok(json!({})));
                             }
                             Err(e) => {
-                                let _ = reply.send(Err(command_error(&e)));
+                                let error = refusal_after(&flight.done, flight.part, command_error(&e));
+                                let _ = flight.reply.send(Err(error));
                             }
                         }
                     }
@@ -925,17 +1008,20 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
             Step::Request(Some((request, reply))) => {
                 let own_channel = view.clients.get(&u32::from(own)).and_then(|c| c.channel).map(u64::from).unwrap_or(0);
                 match translate(&request, own, own_channel) {
-                    Ok(None) => {
+                    Ok(commands) if commands.is_empty() => {
                         let _ = reply.send(Ok(json!({})));
                     }
-                    Ok(Some(cmd)) => match cmd.send_with_result(&mut con) {
-                        Ok(handle) => {
-                            pending.insert(handle, (reply_for(&request), reply));
-                        }
-                        Err(e) => {
-                            let _ = reply.send(Err(ErrorBody::new(ErrorCode::Unavailable, e.to_string())));
-                        }
-                    },
+                    Ok(commands) => {
+                        let flight = InFlight {
+                            expected: reply_for(&request),
+                            reply,
+                            done: Vec::new(),
+                            part: Part::Whole,
+                            rest: commands.into_iter(),
+                        };
+                        // A list with commands always leaves one to send.
+                        let _ = send_next(&mut con, &mut pending, flight);
+                    }
                     Err(e) => {
                         let _ = reply.send(Err(e));
                     }
@@ -987,8 +1073,7 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
         // Answers wait for the view that shows their result; one TeamSpeak never shows gives up.
         for (expected, reply, at) in std::mem::take(&mut done) {
             if let Reply::Message(target, text) = expected {
-                next_message = next_message.wrapping_add(1).max(1 << 31);
-                let message = own_message(&view, own, next_message, target, text);
+                let message = own_message(&view, own, message_id(), target, text);
                 let _ = reply.send(
                     serde_json::to_value(&message).map_err(|e| ErrorBody::new(ErrorCode::Internal, e.to_string())),
                 );
@@ -1085,7 +1170,7 @@ mod tests {
             attachments: Vec::new(),
         };
         assert!(matches!(translate(&request, 1, 4), Err(e) if e.code == ErrorCode::Forbidden));
-        assert!(matches!(translate(&Request::Ping {}, 1, 4), Ok(None)));
+        assert!(matches!(translate(&Request::Ping {}, 1, 4), Ok(c) if c.is_empty()));
     }
 
     fn view() -> View {
@@ -1178,6 +1263,51 @@ mod tests {
         assert_eq!(refused(TsError::ClientIsFlooding).code, ErrorCode::RateLimited);
         let other = refused(TsError::ChannelNotEmpty);
         assert_eq!((other.code, other.message.as_str()), (ErrorCode::BadRequest, "TeamSpeak: channel not empty"));
+    }
+
+    #[test]
+    fn message_ids_outlive_a_connection() {
+        // The counter is the process's, so a reconnect cannot hand out ids the UI already holds.
+        let first = message_id();
+        let second = message_id();
+        assert!(first >= FIRST_MESSAGE_ID && second > first);
+    }
+
+    fn sent(commands: &[(Part, OutCommand)]) -> Vec<(Part, String)> {
+        commands.iter().map(|(part, cmd)| (*part, String::from_utf8_lossy(cmd.0.content()).into_owned())).collect()
+    }
+
+    #[test]
+    fn channel_update_edits_and_moves() {
+        let update = |u: gwar_proto::ChannelUpdate| sent(&translate(&Request::ChannelUpdate(u), 1, 4).unwrap());
+        let both = update(gwar_proto::ChannelUpdate {
+            channel: 7,
+            name: Some("New".into()),
+            max_clients: Some(5),
+            parent: Some(2),
+            ..Default::default()
+        });
+        assert_eq!(both.len(), 2);
+        assert_eq!(both[0].0, Part::Edit);
+        assert!(both[0].1.starts_with("channeledit cid=7 channel_name=New channel_maxclients=5"));
+        assert_eq!(both[1], (Part::Move, "channelmove cid=7 cpid=2".into()));
+
+        let root = update(gwar_proto::ChannelUpdate { channel: 7, move_to_root: true, ..Default::default() });
+        assert_eq!(root, vec![(Part::Move, "channelmove cid=7 cpid=0".into())]);
+        let edit = update(gwar_proto::ChannelUpdate { channel: 7, topic: Some("t".into()), ..Default::default() });
+        assert_eq!(edit, vec![(Part::Edit, "channeledit cid=7 channel_topic=t".into())]);
+        // A position alone is not a move to the root.
+        let reorder = update(gwar_proto::ChannelUpdate { channel: 7, position: Some(3), ..Default::default() });
+        assert_eq!(reorder.iter().map(|(p, _)| *p).collect::<Vec<_>>(), vec![Part::Edit]);
+    }
+
+    #[test]
+    fn a_refusal_after_a_done_part_says_what_went_through() {
+        let refused = || ErrorBody::new(ErrorCode::Forbidden, "TeamSpeak: permissions client insufficient");
+        assert_eq!(refusal_after(&[], Part::Edit, refused()).code, ErrorCode::Forbidden);
+        let partial = refusal_after(&[Part::Edit], Part::Move, refused());
+        assert_eq!(partial.code, ErrorCode::Partial);
+        assert_eq!(partial.message, "channel edited, but not moved (TeamSpeak: permissions client insufficient)");
     }
 }
 

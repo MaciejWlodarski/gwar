@@ -479,6 +479,7 @@ export const en = {
   "err.req.too_large": "That is too large.",
   "err.join.forbidden": "You aren't allowed to join this channel.",
   "err.req.quota_exceeded": "There is no storage space left for that.",
+  "err.req.partial": "Only part of that went through",
   "connect.invited": "You were invited to this server. Connect to join.",
   "connect.inviteForget": "Ignore invite",
   "file.attach": "Attach files",

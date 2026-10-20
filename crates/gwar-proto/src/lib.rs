@@ -575,6 +575,8 @@ wire! {
         Pending,
         Expired,
         Early,
+        /// Part of the request went through and the rest was refused; the message says which.
+        Partial,
     }
 
     #[serde(tag = "ev", content = "d")]

@@ -340,6 +340,25 @@ async fn teamspeak_mode_password_channels_admins_and_chat_replies() {
         .to_owned();
     query.call(Cmd::new("servergroupaddclient").arg("sgid", 6).arg("cldbid", &cldbid)).await.unwrap();
     carol.handle.request(join(None)).await.unwrap();
+
+    // One `channel.update` that renames and moves does both (TeamSpeak takes two commands).
+    let create =
+        |name: &str| Request::ChannelCreate(gwar_proto::ChannelCreate { name: name.into(), ..Default::default() });
+    let parent: Channel = serde_json::from_value(carol.handle.request(create("Parent")).await.unwrap()).unwrap();
+    let child: Channel = serde_json::from_value(carol.handle.request(create("Child")).await.unwrap()).unwrap();
+    let update = Request::ChannelUpdate(gwar_proto::ChannelUpdate {
+        channel: child.id,
+        name: Some("Moved child".into()),
+        topic: Some("kept".into()),
+        parent: Some(parent.id),
+        ..Default::default()
+    });
+    let updated: Channel = serde_json::from_value(carol.handle.request(update).await.unwrap()).unwrap();
+    assert_eq!(
+        (updated.name.as_str(), updated.topic.as_str(), updated.parent),
+        ("Moved child", "kept", Some(parent.id)),
+        "{updated:?}"
+    );
 }
 
 struct FakeIo {

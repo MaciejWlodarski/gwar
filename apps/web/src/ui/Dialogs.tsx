@@ -456,7 +456,8 @@ function ChannelPasswordDialog({ channel }: { channel: number }) {
     setBusy(true);
     setError(null);
     try {
-      await controller.joinChannel(channel, password);
+      // An answer for an ended session: this dialog closed with it, and must not close what is open now.
+      if (!(await controller.joinChannel(channel, password))) return;
       close();
       useUi.getState().setDrawer(false);
     } catch (err) {

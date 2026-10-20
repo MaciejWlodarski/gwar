@@ -126,7 +126,8 @@ export function describeRequestError(e: unknown): string {
   if (e instanceof RequestError) {
     const key = `err.req.${e.code}` as Key;
     const base = tNow(key);
-    return e.code === "bad_request" || e.code === "conflict" ? `${base} (${e.message})` : base;
+    // These say more than the code: what was malformed, what clashed, which part went through.
+    return e.code === "bad_request" || e.code === "conflict" || e.code === "partial" ? `${base} (${e.message})` : base;
   }
   if (e instanceof RequestTimeoutError) return tNow("err.req.timeout");
   if (e instanceof ConnectionLostError) return tNow("err.req.lost");
@@ -1063,35 +1064,44 @@ class Controller {
   /**
    * Asks the server to move me. `ui.joining` stays set until the server has
    * answered, so the composer does not send into a channel we are not in yet.
+   * Resolves to false when the answer came for a session that has ended (another
+   * server, a reconnect): it then changes nothing, a refusal included.
    */
-  async joinChannel(channel: number, password?: string): Promise<void> {
+  async joinChannel(channel: number, password?: string): Promise<boolean> {
+    // Joining state, entered channels and typed passwords belong to the session that asked.
+    const bound = this.bind();
+    const settle = () => { if (bound.current() && useUi.getState().joining === channel) useUi.getState().setJoining(null); };
     // Checked before the microphone prompt and before entering the channel.
     if (useSession.getState().channels[channel]?.encrypted) {
-      const conn = this.conn, attempt = ++this.joinAttempt;
+      const attempt = ++this.joinAttempt;
       const refusal = await this.encryptedVoiceRefusal();
       // A newer join, move or connection makes this one obsolete.
-      if (this.conn !== conn || attempt !== this.joinAttempt) return;
-      if (refusal) { useUi.getState().toast("info", refusal); return; }
+      if (!bound.current() || attempt !== this.joinAttempt) return bound.current();
+      if (refusal) { useUi.getState().toast("info", refusal); return true; }
       // The server admits only devices already in the channel's group: join it first (a new
       // channel's group is otherwise joined in the background, after a random wait).
       const runtime = this.runtime;
       if (runtime && runtime.status(`channel:${channel}`) !== "ready") {
         useUi.getState().setJoining(channel);
         const ready = await runtime.prepareChannel(channel);
-        if (useUi.getState().joining === channel) useUi.getState().setJoining(null);
-        if (this.conn !== conn || attempt !== this.joinAttempt) return;
-        if (!ready) { useUi.getState().toast("info", tNow("voice.channelSecuring")); return; }
+        settle();
+        if (!bound.current() || attempt !== this.joinAttempt) return bound.current();
+        if (!ready) { useUi.getState().toast("info", tNow("voice.channelSecuring")); return true; }
       }
     } else this.joinAttempt++;
-    const ui = useUi.getState();
-    ui.setJoining(channel);
+    useUi.getState().setJoining(channel);
     try {
-      await this.connection.request("channel.join", { channel, password: password ?? null });
-      this.entered.add(channel);
-      if (password) this.channelPasswords.set(channel, password);
+      await bound.conn.request("channel.join", { channel, password: password ?? null });
+    } catch (e) {
+      if (!bound.current()) return false;
+      throw e;
     } finally {
-      if (useUi.getState().joining === channel) useUi.getState().setJoining(null);
+      settle();
     }
+    if (!bound.current()) return false;
+    this.entered.add(channel);
+    if (password) this.channelPasswords.set(channel, password);
+    return true;
   }
 
   /** Whether the chat of a channel is closed to me until I enter it with its password. */
@@ -1128,9 +1138,12 @@ class Controller {
     }
     // Without a typed password first: only the server knows whether I may skip it (a TeamSpeak
     // admin with b_channel_join_ignore_password may), and it asks for one by refusing.
+    const bound = this.bind();
     try {
       await this.joinChannel(channel, this.channelPasswords.get(channel));
     } catch (e) {
+      // A refusal only ever concerns the session that asked.
+      if (!bound.current()) return;
       if (e instanceof RequestError && e.code === "wrong_password" && useSession.getState().channels[channel]) {
         this.channelPasswords.delete(channel);
         useUi.getState().openDialog({ kind: "channelPassword", channel });
