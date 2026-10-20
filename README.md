@@ -27,6 +27,14 @@ use.
 
 - **Voice with very low latency.** Opus is forwarded by a WebRTC SFU without
   being decoded or re-encoded; the server only decides who hears whom.
+- **Clean audio, the same in every app.** Echo cancellation, automatic gain
+  control and noise suppression (DeepFilterNet3's low-latency model, with a
+  strength setting) run on your device before encoding, so they also work with
+  end-to-end encryption. Noise suppression adds 10 ms on the desktop and ~19 ms
+  in the web app, which downloads it the first time and falls back to the
+  browser's own suppression where it cannot run it; echo cancellation ~9 ms,
+  which headphones let you turn off
+  ([docs/latency.md](docs/latency.md#echo-cancellation-and-gain-control)).
 - **Always on, like Discord.** You stay connected to a server without being in
   voice: read and write any channel's chat, see who is in which voice channel,
   join voice when you want to talk. Unread counts follow you across devices.
@@ -571,13 +579,6 @@ GWAR_TS3_DIR=/tmp/ts3 cargo test -p gwar-client --test teamspeak_mode --test tea
   measured for latency and for audio lost on lossy links, so lower latency
   never costs choppy voice. An extreme mode for very good connections may
   follow as an option.
-- **Clean audio**: echo cancellation on the desktop next. Noise suppression
-  is there: on your device before encoding (so it also works with end-to-end
-  encryption), one model for every kind of noise, DeepFilterNet3's
-  low-latency one, with a strength setting. It adds 10 ms on the desktop and
-  ~19 ms in the web app, which downloads it the first time and falls back to
-  the browser's own suppression where it cannot run it
-  ([docs/latency.md](docs/latency.md#noise-suppression)).
 - **An independent review of the end-to-end encryption** before it is called
   stable. It is built (direct messages, channels, server-wide chat, voice,
   private channels, the key archive) and reviewed internally; the record is in

@@ -2588,7 +2588,11 @@ async fn native_encrypted(
         answer.send(reply["sdp"].as_str().unwrap().to_owned()).unwrap();
     };
     let (handle, ()) = tokio::join!(start, exchange);
-    (handle.expect("native encrypted start"), json)
+    let handle = handle.expect("native encrypted start");
+    // Every sender's tone is the same: to an echo canceller, each hears its own microphone played
+    // back. These devices have no acoustic path, so there is no echo to cancel.
+    handle.set_capture_processing(false, true);
+    (handle, json)
 }
 
 /// The exporter values of every voice leaf, as each member computes them.

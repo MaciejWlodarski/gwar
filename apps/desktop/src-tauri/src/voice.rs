@@ -64,6 +64,8 @@ struct Prefs {
     muted: bool,
     deafened: bool,
     ptt: bool,
+    echo: bool,
+    gain: bool,
     noise: NoiseSuppression,
     master: f32,
     slot_gain: [f32; AUDIO_SLOTS],
@@ -75,6 +77,7 @@ impl Prefs {
         handle.set_muted(self.muted);
         handle.set_deafened(self.deafened);
         handle.set_ptt(self.ptt);
+        handle.set_capture_processing(self.echo, self.gain);
         handle.set_noise_suppression(self.noise);
         handle.set_master_gain(self.master);
         for (slot, gain) in self.slot_gain.iter().enumerate() {
@@ -116,7 +119,9 @@ impl Default for Voice {
                     muted: false,
                     deafened: false,
                     ptt: false,
-                    // Until the settings say otherwise (they default to full strength too).
+                    // Until the settings say otherwise (they default to all on, at full strength).
+                    echo: true,
+                    gain: true,
                     noise: NoiseSuppression::FULL,
                     master: 1.0,
                     slot_gain: [1.0; AUDIO_SLOTS],
@@ -837,21 +842,26 @@ pub fn voice_set_input_mode(
     Ok(())
 }
 
-/// The microphone's processing, as the settings choose it. Only noise suppression exists natively;
-/// `strength` is in percent (see [`NoiseSuppression`]).
+/// The microphone's processing, as the settings choose it; `strength` is noise suppression's, in
+/// percent (see [`NoiseSuppression`]).
 #[tauri::command]
 pub fn voice_set_capture_options(
     window: WebviewWindow,
     voice: State<'_, Voice>,
     owner: u64,
+    echo_cancellation: bool,
+    auto_gain_control: bool,
     noise_suppression: bool,
     strength: u8,
 ) -> Result<(), String> {
     check_main_window(window.label())?;
     let mut inner = voice.lock();
     check_owner(&inner, owner)?;
+    inner.prefs.echo = echo_cancellation;
+    inner.prefs.gain = auto_gain_control;
     inner.prefs.noise = if noise_suppression { NoiseSuppression::percent(strength) } else { NoiseSuppression::OFF };
     if let Some(h) = &inner.handle {
+        h.set_capture_processing(inner.prefs.echo, inner.prefs.gain);
         h.set_noise_suppression(inner.prefs.noise);
     }
     Ok(())

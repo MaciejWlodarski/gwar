@@ -28,8 +28,20 @@ use tokio::time::{Instant, timeout};
 use tsclientlib::{Connection, Identity as TsIdentity, StreamItem};
 use tsproto_packets::packets::{AudioData, CodecType, OutAudio};
 
+/// What TeamSpeak clients speak.
 fn tone(t: u64) -> f32 {
-    (t as f32 * 440.0 * std::f32::consts::TAU / 48_000.0).sin() * 0.3
+    tone_at(440.0, t)
+}
+
+/// What the native client's microphone hears: another tone, or its echo canceller would take it
+/// out as the speaker's for good. It takes this one down for the first ~2 s too, until it finds
+/// there is no echo.
+fn mic_tone(t: u64) -> f32 {
+    tone_at(660.0, t)
+}
+
+fn tone_at(hz: f32, t: u64) -> f32 {
+    (t as f32 * hz * std::f32::consts::TAU / 48_000.0).sin() * 0.3
 }
 
 /// Synthetic devices: optional tone into the mic, speaker output recorded.
@@ -49,7 +61,7 @@ impl AudioIo for FakeIo {
             let mut t = 0u64;
             loop {
                 for _ in 0..480 {
-                    let s = if with_tone { tone(t) } else { 0.0 };
+                    let s = if with_tone { mic_tone(t) } else { 0.0 };
                     t += 1;
                     if mic_tx
                         .push(CaptureSample { captured_at: std::time::Instant::now(), position: t - 1, value: s })

@@ -118,7 +118,6 @@ export const en = {
   "audio.shortcutNone": "Not set",
   "audio.shortcutSet": "Set shortcut",
   "audio.shortcutFailed": "Couldn't register {key} as a global shortcut. Another app may be using it.",
-  "audio.processingDesktop": "Echo cancellation isn't available in the desktop app yet. Use headphones to avoid echo.",
   "desktop.window": "Window",
   "desktop.closeToTray": "Keep running in the tray when closed",
   "desktop.closeToTrayHint": "Closing the window hides Gwar to the system tray. Use the tray menu to quit.",
@@ -132,7 +131,7 @@ export const en = {
   "audio.noiseStrength": "Noise suppression strength",
   "audio.noiseStrengthHint": "At 100% it takes out all the noise it can, typing too. Lower leaves some of the background in.",
   "audio.echoCancellation": "Echo cancellation",
-  "audio.echoCancellationHint": "Prevents your speakers from being picked up by the microphone.",
+  "audio.echoCancellationHint": "Prevents your speakers from being picked up by the microphone. With headphones, turn it off for lower latency.",
   "audio.autoGain": "Automatic gain control",
   "audio.autoGainHint": "Keeps your volume steady. Turn off for studio microphones.",
 

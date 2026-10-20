@@ -315,7 +315,7 @@ async fn teamspeak_mode_voice_reaches_webrtc_clients_and_back() {
     .unwrap();
     web.connection.join(web.welcome.server.default_channel, None).await.unwrap();
     let web_heard = Arc::new(Mutex::new(Vec::new()));
-    let _web_voice =
+    let web_voice =
         voice::start(&web.connection, Box::new(FakeIo { heard: web_heard.clone(), tone: true }), bridged.media)
             .await
             .unwrap();
@@ -323,13 +323,18 @@ async fn teamspeak_mode_voice_reaches_webrtc_clients_and_back() {
     // TS-mode participant speaking a tone.
     let ts = support::ts_client(bridged.ts_voice, "tsuser").await;
     let ts_heard = Arc::new(Mutex::new(Vec::new()));
-    let _ts_voice = voice::start_teamspeak(
+    let ts_voice = voice::start_teamspeak(
         Box::new(FakeIo { heard: ts_heard.clone(), tone: true }),
         ts.audio_in,
         ts.handle.audio_out.clone(),
     )
     .await
     .unwrap();
+    // Both speak the same tone: to an echo canceller, each hears its own microphone played back.
+    // These devices have no acoustic path, so there is no echo to cancel.
+    for handle in [&web_voice, &ts_voice] {
+        handle.set_capture_processing(false, true);
+    }
 
     // The web user's puppet joins once the bridge is up.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);

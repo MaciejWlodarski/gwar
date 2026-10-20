@@ -9,7 +9,7 @@ import { SettingsDialog } from "./Settings";
 import { TooltipProvider } from "./kit";
 
 const voice = vi.hoisted(() => ({
-  capabilities: { outputDeviceSelection: true, captureProcessing: false as boolean | "noise" },
+  capabilities: { outputDeviceSelection: true },
   listDevices: vi.fn(async () => ({ inputs: [{ id: "replacement", label: "Replacement microphone" }], outputs: [] })),
   startMicTest: vi.fn<(onLevel: (level: number) => void) => Promise<() => void>>(),
 }));
@@ -98,39 +98,15 @@ describe("microphone test replacement", () => {
   });
 });
 
-describe("desktop noise suppression", () => {
-  it("offers noise suppression and its strength, and no echo cancellation", async () => {
-    voice.capabilities.captureProcessing = "noise";
-    try {
-      await act(async () => root.render(<TooltipProvider><SettingsDialog tab="audio" /></TooltipProvider>));
-      const strength = document.querySelector<HTMLElement>('[role="slider"][aria-label="Noise suppression strength"]')!;
-      expect(strength.getAttribute("aria-valuenow")).toBe("100");
-      expect([...document.querySelectorAll("*")].some((e) => e.children.length === 0 && e.textContent === "Echo cancellation")).toBe(false);
-      await act(async () => strength.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true })));
-      expect(useSettings.getState().audio.noiseStrength).toBe(95);
-      // Off: no strength to choose.
-      await act(async () => useSettings.getState().setAudio({ noiseSuppression: false }));
-      expect(document.querySelector('[aria-label="Noise suppression strength"]')).toBeNull();
-    } finally {
-      voice.capabilities.captureProcessing = false;
-    }
-  });
-});
-
-describe("browser noise suppression", () => {
-  it("offers its strength beside echo cancellation", async () => {
-    voice.capabilities.captureProcessing = true;
-    try {
-      await act(async () => root.render(<TooltipProvider><SettingsDialog tab="audio" /></TooltipProvider>));
-      const strength = document.querySelector<HTMLElement>('[role="slider"][aria-label="Noise suppression strength"]')!;
-      expect(strength.getAttribute("aria-valuenow")).toBe("100");
-      expect([...document.querySelectorAll("*")].some((e) => e.children.length === 0 && e.textContent === "Echo cancellation")).toBe(true);
-      await act(async () => strength.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true })));
-      expect(useSettings.getState().audio.noiseStrength).toBe(95);
-      await act(async () => useSettings.getState().setAudio({ noiseSuppression: false }));
-      expect(document.querySelector('[aria-label="Noise suppression strength"]')).toBeNull();
-    } finally {
-      voice.capabilities.captureProcessing = false;
-    }
+describe("capture processing", () => {
+  it("offers noise suppression's strength beside echo cancellation", async () => {
+    await act(async () => root.render(<TooltipProvider><SettingsDialog tab="audio" /></TooltipProvider>));
+    const strength = document.querySelector<HTMLElement>('[role="slider"][aria-label="Noise suppression strength"]')!;
+    expect(strength.getAttribute("aria-valuenow")).toBe("100");
+    expect([...document.querySelectorAll("*")].some((e) => e.children.length === 0 && e.textContent === "Echo cancellation")).toBe(true);
+    await act(async () => strength.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true })));
+    expect(useSettings.getState().audio.noiseStrength).toBe(95);
+    await act(async () => useSettings.getState().setAudio({ noiseSuppression: false }));
+    expect(document.querySelector('[aria-label="Noise suppression strength"]')).toBeNull();
   });
 });

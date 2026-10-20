@@ -45,7 +45,7 @@ type StartParams = Parameters<VoiceEngine["start"]>[0];
  */
 export class NativeVoiceEngine implements VoiceEngine {
   // SFrame runs in Rust (`gwar_client::voice::sframe`); keys arrive through `voice_set_keys`.
-  readonly capabilities: VoiceEngine["capabilities"] = { outputDeviceSelection: true, captureProcessing: "noise", encryptedVoice: async () => true };
+  readonly capabilities: VoiceEngine["capabilities"] = { outputDeviceSelection: true, encryptedVoice: async () => true };
 
   private handlers = new Map<string, Set<Handler>>();
   // Bootstrap once per engine: a fresh view retires native audio left by the
@@ -294,9 +294,13 @@ export class NativeVoiceEngine implements VoiceEngine {
     this.scheduleRestart();
   }
 
-  /** Noise suppression runs natively; echo cancellation and AGC are not implemented natively yet. */
   async setCaptureOptions(options: CaptureOptions): Promise<void> {
-    await this.send("voice_set_capture_options", { noiseSuppression: options.noiseSuppression, strength: Math.round(Math.min(100, Math.max(10, options.noiseStrength))) });
+    await this.send("voice_set_capture_options", {
+      echoCancellation: options.echoCancellation,
+      autoGainControl: options.autoGainControl,
+      noiseSuppression: options.noiseSuppression,
+      strength: Math.round(Math.min(100, Math.max(10, options.noiseStrength))),
+    });
   }
 
   setMasterVolume(volume: number): void {
