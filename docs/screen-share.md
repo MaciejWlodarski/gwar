@@ -1012,7 +1012,7 @@ used a scrambling transform with a checksum, not AES-GCM. They show:
   through the SFU;
 - that corruption would be detected.
 
-They do not measure real AEAD cost in the worker. PR 5 measures that: worker
+They do not measure real AEAD cost in the worker. PR 6 measures that: worker
 time per frame at 1080p60 keyframe sizes, in Chromium, WebKit and Firefox.
 
 Capability check: no `RTCRtpScriptTransform` means "Update your browser or use
@@ -1209,6 +1209,7 @@ person.
    - `share_screen`;
    - the requests and events above, except the `*.offer` and slot ones;
    - limits, lifecycle and the moderator stop;
+   - `screen.start` refused in encrypted channels until PR 6;
    - `Client.sharing`;
    - shared role-resolution vectors;
    - server tests in `tests/protocol.rs`, `tests/overrides.rs` and
@@ -1274,7 +1275,28 @@ person.
        (the S3 technique);
      - late join, start → stop → start while watching two other shares,
        moderator stop and the slot limit.
-5. **Encrypted shares (L, 8–10 days).**
+5. **Desktop enablement, plaintext (M, 3–4 days).**
+   - The desktop UI runs the web screen transports and the screen worker
+     beside the native voice engine. The native engine and `voice_set_keys`
+     are unaffected.
+   - The button is hidden on Linux, and gated to macOS 14+.
+   - CSP review: no change expected, since WebRTC is not governed by
+     `connect-src`.
+   - The native-voice Playwright run (`e2e:native-voice`) extended with a
+     plaintext share watched by a browser, with native voice in the same call.
+   - The manual checklist from PR 1 repeated on release builds.
+
+**First release after PR 5: plaintext channels only.** The owner chose to
+ship sharing in plaintext channels first and add encryption afterwards, so
+PRs 1–5 are released before PR 6:
+
+- In encrypted channels the server refuses `screen.start` (PR 2), and the
+  button shows a disabled "coming soon" state. A share is never sent in the
+  clear in an encrypted channel: no silent downgrade.
+- PR 6 then enables encrypted channels. Until it lands, the controller work in
+  "Two engines under one call controller" does not touch voice at all.
+
+6. **Encrypted shares (L, 8–10 days).**
    - Screen key derivation in `gwar-mls` (agent and wasm), with the
      `"gwar screen v1"` label and vectors.
    - The call controller's per-kind endpoints: attach and restart per kind,
@@ -1286,6 +1308,8 @@ person.
    - Keyframe recovery: the receiver gap tracking, `screen.keyframe` retries
      and the sender `generateKeyFrame()` after activation.
    - Fail closed and "Securing screen share…".
+   - The server stops refusing `screen.start` in encrypted channels, and the
+     button's "coming soon" state is removed.
    - e2e.md "What the server still sees".
    - AEAD worker cost measured at 1080p60 in all three engines.
    - Tests:
@@ -1297,33 +1321,28 @@ person.
      - Playwright `e2e:screen-mls`: an encrypted share across Chromium and
        WebKit; a member removed mid-share stops decrypting; a joiner watches
        after activation; a viewer installing an epoch late recovers through a
-       keyframe.
-6. **Desktop enablement (M, 3–4 days).**
-   - The desktop UI runs the web screen transports and the screen worker
-     beside the native voice engine. The native engine and `voice_set_keys`
-     are unaffected.
-   - The button is hidden on Linux, and gated to macOS 14+.
-   - CSP review: no change expected, since WebRTC is not governed by
-     `connect-src`.
-   - The native-voice Playwright run (`e2e:native-voice`) extended with an
-     encrypted share watched by a browser, with native voice in the same call.
-   - The manual checklist from PR 1 repeated on release builds.
+       keyframe;
+     - the native-voice Playwright run (`e2e:native-voice`) extended with an
+       encrypted share watched by a browser, with native voice in the same
+       call.
 
 **Release acceptance (before the feature is announced)** is a manual matrix:
 
 - sharers and viewers on Chrome, Firefox and Safari, and the desktop on
-  macOS and Windows, plaintext and encrypted;
+  macOS and Windows, in plaintext channels for the first release and again
+  in encrypted channels after PR 6;
 - Firefox both shares and watches. Playwright's Firefox did not start in the
   spike environment, so this interop is checked by hand, or in CI if it runs
   there.
 
-Phase 1 total: about **8–11 weeks**. The earlier 5–7-week figure assumed the
+The first release (PRs 1–5) is about **6–8 weeks**; phase 1 with encryption
+(PR 6) is about **8–11 weeks** in total. The earlier 5–7-week figure assumed the
 simpler forwarding and key model the review rejected. The estimate stays
 uncertain until three things are known:
 
 - PR 1 shows whether the WKWebView picker works without changes;
 - PR 3's voice gate passes or forces more isolation (its own thread or port);
-- PR 5's controller change lands without reworking the voice activation
+- PR 6's controller change lands without reworking the voice activation
   tests.
 
 ### Phase 2: quality and reach
@@ -1371,7 +1390,7 @@ uncertain until three things are known:
   paired gate decides whether the shared-runtime task is enough, or whether
   the screen task needs its own thread or port.
 - **Controller complexity.** Two endpoint kinds under one MLS call controller
-  is the riskiest change to already-reviewed encrypted-voice code (PR 5). It
+  is the riskiest change to already-reviewed encrypted-voice code (PR 6). It
   needs its own review round, as voice 5c/5d had.
 - **WebView2 picker bugs** (#5173 size, #5763 deadlock).
 - **Firefox:** no `contentHint`, no `scalabilityMode`, no audio. It works, but
