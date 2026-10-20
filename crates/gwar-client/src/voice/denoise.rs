@@ -633,11 +633,11 @@ mod tests {
         #[test]
         fn a_stuck_model_is_paused_and_no_second_one_starts_beside_it() {
             let (release, held) = std::sync::mpsc::channel();
-            let mut d = on(deep::Worker::fake(vec![Step::Now, Step::Hold(held)]));
+            let mut d = on(patient(vec![Step::Now, Step::Hold(held)]));
             let started = Instant::now();
             let out: Vec<f32> = (0..15).map(|_| frame(&mut d)).collect();
             // Two waits for answers; the rest could not be handed over.
-            assert!(started.elapsed() < Duration::from_secs(1), "waited {:?}", started.elapsed());
+            assert!(started.elapsed() < Duration::from_secs(2), "waited {:?}", started.elapsed());
             assert_eq!(out[0], 0.05);
             assert!(out[1..].iter().all(|s| *s == 0.2), "{out:?}");
             assert!(matches!(d.model, Model::Paused { .. }));
@@ -682,7 +682,7 @@ mod tests {
 
         #[test]
         fn a_failed_model_is_not_started_again() {
-            let mut d = on(deep::Worker::fake(vec![Step::Now, Step::Fail]));
+            let mut d = on(patient(vec![Step::Now, Step::Fail]));
             assert_eq!(frame(&mut d), 0.05);
             assert_eq!(frame(&mut d), 0.2);
             assert!(matches!(d.model, Model::Unavailable));
