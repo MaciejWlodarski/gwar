@@ -387,6 +387,26 @@ describe("browser noise suppression", () => {
     expect(peerSender.track).toBe(raw);
   });
 
+  it("does not hold the next call behind a replacement its closed peer left unsettled", async () => {
+    vi.stubGlobal("RTCPeerConnection", class extends Peer {
+      constructor() {
+        super();
+        if (Peer.all.length > 1) return;
+        // The first call's sender settles its first replacement, never the next.
+        const replaceTrack = vi.fn().mockResolvedValueOnce(undefined).mockReturnValue(new Promise(() => {}));
+        this.addTransceiver.mockImplementationOnce(() => ({ sender: { replaceTrack } }));
+      }
+    });
+    const { model, events } = await loaded(pipeline(false));
+    model.running = true;
+    events().changed();
+    await flush();
+    await engine.stop();
+    await engine.start(params());
+    expect(Peer.all[1]!.createOffer).toHaveBeenCalledOnce();
+    expect(Peer.all[1]!.setRemoteDescription).toHaveBeenCalledOnce();
+  });
+
   it("closes a model that loads after the call ended", async () => {
     const load = deferred<DenoisePipeline>();
     startDenoise.mockReturnValueOnce(load.promise);

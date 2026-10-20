@@ -80,7 +80,10 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   /** The model loading for a run (`runId`), cancelled when that run ends or suppression goes off. */
   private denoiseLoad: { run: number; abort: AbortController } | null = null;
   private denoiseUnavailable = false;
-  /** Replacements of the sent track, one at a time: `sender.track` changes only once one completes. */
+  /**
+   * The peer's replacements of the sent track, one at a time: `sender.track` changes only once
+   * one completes. One a closed peer leaves unsettled is not waited for.
+   */
   private sentTrackUpdates: Promise<void> = Promise.resolve();
   private state: VoiceState = "idle";
   private runId = 0;
@@ -236,6 +239,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     const pc = this.pc;
     this.pc = null;
     this.micSender = null;
+    this.sentTrackUpdates = Promise.resolve();
     if (pc) {
       pc.ontrack = null;
       pc.onconnectionstatechange = null;
@@ -344,9 +348,11 @@ export class WebRtcVoiceEngine implements VoiceEngine {
 
   /** Sends `sentTrack()`, after any replacement still in progress, as it is when that is done. */
   private updateSentTrack(): Promise<void> {
+    const sender = this.micSender;
+    if (!sender) return Promise.resolve();
     const update = this.sentTrackUpdates.then(async () => {
-      const sender = this.micSender, track = this.sentTrack();
-      if (track && sender && sender.track !== track) await sender.replaceTrack(track).catch(() => {});
+      const track = this.sentTrack();
+      if (this.micSender === sender && track && sender.track !== track) await sender.replaceTrack(track).catch(() => {});
     });
     this.sentTrackUpdates = update;
     return update;
