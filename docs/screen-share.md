@@ -447,7 +447,8 @@ Limits are enforced continuously, not only when a share or watch is admitted:
 - **Per viewer slot.** A reservation equal to the share's **cap**, not its
   current rate. Static content cannot be admitted cheaply and then grow. Every
   reservation is charged 1.3 × its cap to cover RTX, TWCC padding probes and
-  headers.
+  headers. That charge is an admission estimate; the per-viewer egress cap in
+  "Queues and repairs" enforces the bytes actually sent.
 - **Server-wide budget** (default 300 Mbps). The sum of all slot reservations
   plus all publish caps, because ingress costs CPU too. A watch or start that
   would exceed it gets `busy`.
@@ -548,7 +549,10 @@ end-to-end layer.
   the stop is sent afterwards.
 - **Repairs** (RTX answers to NACKs, and padding probes that reuse cached
   media) have **no hard age bound**. Their age is normally under 400 + 200 ms,
-  but str0m cannot enforce that (below). Their volume is bounded instead.
+  but str0m cannot enforce that (below).
+- **Volume:** each viewer's originals, repairs and probes together stay
+  within a per-viewer egress cap, enforced at the socket send ("Per-viewer
+  egress cap" below).
 
 Nothing is promised about downstream network queues; the SFU cannot see them.
 
@@ -610,13 +614,68 @@ limit is a target, not a bound:
   ciphertext with the same mapped sequence number. A viewer only NACKs packets
   it is still waiting for. Its jitter buffer discards a packet for a frame it
   already played or skipped, and a duplicate is dropped.
-- **Stale padding is still only padding.** Probes are sent only while the
-  desired bitrate exceeds the estimate, at the rate BWE asks for, whatever
-  bytes fill them.
-- **Volume is bounded.** The cache holds at most 1024 packets, about 1.2 MB,
-  per slot. All repair and padding bytes count in the continuous egress
-  measurement and against the 1.3 × reservation in "Admission and resource
-  limits".
+- **Probes carry no fresh information, only bytes.** str0m probes in short
+  clusters (about 15 ms each, `bwe/probe/cluster.rs`):
+  - when the desired bitrate rises above the estimate, at 1× and 2× desired,
+    capped at 2× the estimate;
+  - periodically while application-limited, at least 5 s apart, at 2× desired
+    even when the estimate already exceeds it (`bwe/probe/control.rs`,
+    `maybe_periodic_alr`);
+  - when the estimate has stagnated for 15 s with unmet demand.
+
+  str0m 0.24.1 offers no public setting to cap or disable them; only the
+  desired bitrate steers them. Their volume is capped by the egress cap below.
+
+**Per-viewer egress cap: originals, repairs and probes together.**
+
+Nothing inside str0m bounds repair or probe volume for a viewer:
+
+- unpaced streams also send queued resends at once (`streams/send.rs`,
+  `queue_state`);
+- the RTX ratio is recalculated every 50 ms, so repeated NACKs can burst
+  first;
+- padding bypasses it.
+
+So Gwar enforces the bound where it owns the path: **at the socket send.**
+Every `Output::Transmit` of a watch transport goes through the screen task's
+send function. SRTP leaves the RTP header in the clear, so each datagram is
+classified by its header, with no decryption:
+
+- **Originals:** RTP on a slot's main SSRC. They are already paced by the Gwar
+  queue at `B = 0.8 × estimate` and are only counted here.
+- **Extras:** RTP on any other SSRC, that is, the RTX SSRCs (repairs and
+  padding) and str0m's probe SSRC. They pass through **one token bucket per
+  viewer**:
+  - rate `0.1 × estimate`;
+  - burst `max(64 KB, 30 ms × 2 × estimate)`, enough for a str0m probe
+    cluster at up to twice the estimate. This is the reserved probe capacity.
+- **Control:** RTCP (payload types 192–223), STUN and DTLS are small and
+  always sent.
+
+A viewer's sustained egress is therefore at most `0.9 × estimate` plus control
+traffic, with bursts bounded by the extras burst. RFC 4588 §7 asks for exactly
+this: originals and retransmissions counted together. Voice runs on a
+separate transport and keeps the remaining 10 %.
+
+**When the extras bucket is empty,** the datagram is **dropped at the socket**.
+That is immediate and needs no str0m change:
+
+- A dropped repair is like a lost one. The viewer NACKs again, or the slot
+  recovers through a keyframe.
+- A probe cut short measures low, so the estimate grows more slowly. That
+  errs on the safe side.
+- str0m already gave dropped packets TWCC numbers, so the viewer reports them
+  lost. str0m's loss controller then lowers the estimate of an overloaded
+  viewer, which is the right direction.
+
+**Escalation.** If the extras bucket drops packets in more than 2 s of any 5 s
+window, the viewer's lowest-priority slot is paused with reason `bandwidth`.
+The pause wipes that slot's cache, as above. Resuming follows the usual
+resume rule.
+
+The 1.3 × charge in "Admission and resource limits" stays an admission
+estimate. This cap is what enforces it at egress, per viewer. The server-wide
+egress check remains a backstop.
 
 **The one hard lever, used where a hard stop matters:**
 `StreamTx::set_rtx_cache` **replaces the cache with an empty one**
@@ -666,8 +725,16 @@ arrival from the publisher:
 
   The test records whether str0m still serves it, so a str0m change is
   noticed. It asserts the viewer's playout is unaffected (no extra freeze,
-  frames byte-identical), the slot's repair and padding bytes stay within its
-  reservation, and a pause still wipes the shielded entry.
+  frames byte-identical) and a pause still wipes the shielded entry.
+- **A NACK storm:** a viewer NACKs the whole cache repeatedly, 50 times a
+  second. Its bytes at the socket stay within
+  `(0.8 + 0.1) × estimate × t + burst` plus control traffic. Its
+  lowest-priority slot is paused by the escalation rule. Other viewers and the
+  voice gate in "Voice headroom and acceptance" are unaffected.
+- **Probes fit the reserve:** after the bandwidth collapse ends, allocation
+  and periodic ALR probes go out whole within the extras burst, and the
+  estimate recovers to the link rate as it does with the cap disabled
+  (paired runs).
 - **A test pins str0m behavior:** `set_rtx_cache` empties the cache.
 
 ### Keyframes
@@ -704,8 +771,9 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   `bwe().set_desired_bitrate(Σ caps × 1.1 + K_max / 400 ms)`, where `K_max` is
   the largest keyframe seen on the watched shares in the last 30 s, and at
   least 200 KB. The estimate can then grow enough for keyframes to meet the
-  queue deadline, even for low-average shares. The cost is padding probes up
-  to that rate while the estimate is lower.
+  queue deadline, even for low-average shares. The cost is str0m's probes,
+  short clusters at up to 2× desired, which stay inside the viewer's extras
+  bucket ("Per-viewer egress cap").
 - **Pause** a slot for that viewer (`screen.paused {share, reason:
   "bandwidth"}`), lowest priority first, when either of these holds:
   - the sum of its 2 s average and the higher-priority slots' averages exceeds
@@ -1156,8 +1224,8 @@ person.
    - Stable sequence mapping with segments, and timestamp offsets.
    - Per-packet ingress enforcement with frame bounds; the Gwar-owned
      per-viewer priority queue with unpaced streams, 400 ms deadlines and
-     bounded admission; RTX cache wiped on pause/unwatch/reassignment;
-     wait-for-keyframe; the one
+     bounded admission; RTX cache wiped on pause/unwatch/reassignment; the
+     per-viewer egress cap at socket send; wait-for-keyframe; the one
      keyframe throttle, and NACK/RTX.
    - Per-viewer aggregate allocation with pause/resume.
    - Cap-based reservations, continuous egress measurement and negotiation
@@ -1182,7 +1250,8 @@ person.
        overruns in 10 s stop the share;
      - the tests in "Queues and repairs": a bandwidth collapse,
        pause/unwatch (NACK and probe included), a reordered publisher
-       repair, and the `set_rtx_cache` pin;
+       repair, a NACK storm against the per-viewer egress cap, probes within
+       the reserve, and the `set_rtx_cache` pin;
      - the allocation tests: a low-average share with large keyframes on an
        unconstrained viewer, admission overflow, and deadline expiry.
    - **Voice acceptance:** the paired measurements and gate in "Voice headroom
