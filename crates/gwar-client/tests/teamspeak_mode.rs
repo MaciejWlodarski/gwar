@@ -297,8 +297,8 @@ async fn teamspeak_mode_password_channels_admins_and_chat_replies() {
         assert!(matches!(&refused, ClientError::Server(e) if e.code == ErrorCode::WrongPassword), "{refused:?}");
     }
     ts.handle.request(join(Some("hunter2"))).await.unwrap();
-    // Joining the channel I am already in is no error.
-    ts.handle.request(join(None)).await.unwrap();
+    // Joining the channel I am already in is no error (TeamSpeak checks the password first).
+    ts.handle.request(join(Some("hunter2"))).await.unwrap();
 
     // `chat.send` answers with the message, which arrives exactly once.
     let send = |text: &str| Request::ChatSend {
