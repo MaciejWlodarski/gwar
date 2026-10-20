@@ -39,11 +39,12 @@ try {
   await Promise.all([ready(`${web}/`, vite), ready(`http://127.0.0.1:${serverPort}/health`, service)]);
   browser = await chromium.launch({ headless: true });
   const contexts = [], pages = [];
-  async function device(account, device, address = ws) {
+  /** `feed`: a local, empty revocation feed. Without one, a failed read soon (and again) marks revocation information stale. */
+  async function device(account, device, address = ws, feed = address !== ws) {
     const context = await browser.newContext(); contexts.push(context);
     await context.route("**/*", route => {
       const url = new URL(route.request().url());
-      if (address !== ws && url.pathname.endsWith("/v1/revocations")) {
+      if (feed && url.pathname.endsWith("/v1/revocations")) {
         return route.fulfill({ json: { revocations: [] }, headers: { "access-control-allow-origin": "*" } });
       }
       return ["127.0.0.1", "localhost"].includes(url.hostname) ? route.continue() : route.abort();
@@ -146,7 +147,8 @@ try {
   await a2.getByText("history for a second device", { exact: true }).waitFor({ timeout: 45000 });
   console.log("PASS second sender device receives history");
   await Promise.all([a, b, a2].map(p => p.evaluate(() => window.dm.close())));
-  const b2 = await device(21, 4); await open(b2, auid);
+  // Its mention in an encrypted channel below counts only when fully verified, revocations included.
+  const b2 = await device(21, 4, ws, true); await open(b2, auid);
   await b2.getByText("Can't open this message on this device", { exact: true }).first().waitFor({ timeout: 45000 });
   await b2.getByText("Earlier messages will appear when another member is online.", { exact: true }).waitFor();
   await b2.getByText("Deleted", { exact: true }).first().waitFor();

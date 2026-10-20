@@ -454,7 +454,7 @@ export const pl: Record<Key, string> = {
   "chat.channelHistoryIncomplete": "ten klient nie mógł zachować pełnego zapisu usuniętych kanałów tego serwera, więc nie może wykluczyć ponownie użytego identyfikatora kanału",
   "chat.revocationsStale": "informacje o unieważnieniach są nieaktualne lub niedostępne",
   "chat.continuityUnproven": "ciągłość niepotwierdzona; to urządzenie nie ma zapisu wcześniejszych wersji, więc nie może wykryć cofnięcia zmian. Starsza historia usunięta z pamięci również nie ma tej ochrony",
-  "chat.checkpointsUnavailable": "punkty kontrolne niedostępne; ochrona przed cofnięciem zmian niedostępna",
+  "chat.checkpointsUnavailable": "to urządzenie nie może teraz korzystać z pamięci lokalnej do sprawdzania wiadomości, więc nie wykryje cofnięcia zmian. Sprawdzenie zostanie powtórzone, gdy pamięć zacznie działać; jeśli problem się utrzymuje, przeglądarka może blokować dane witryn (na przykład w oknie prywatnym)",
   "chat.teamSpeakNotification": "TeamSpeak / bez podpisu",
   "chat.teamSpeakUnsigned": "Wiadomości TeamSpeak nie mają podpisu: ten serwer mógł podrobić lub zmienić tę wiadomość",
   "chat.serverRemoved": "Wiadomość usunięta przez serwer",

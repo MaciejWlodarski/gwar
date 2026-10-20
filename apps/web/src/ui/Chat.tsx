@@ -1,4 +1,5 @@
 import { MessageVerificationCache } from "../net/message-verification-cache";
+import { messageStorage } from "../net/message-storage";
 import { withChannelLifecycle } from "../net/channel-lifecycle";
 import { MessageVerificationIndicator, MessageVerificationPending } from "./MessageVerification";
 import { messageFingerprint, fullyVerified, DELETION_TEXT, type MessageVerification } from "../net/message-signature";
@@ -381,7 +382,11 @@ export function MessageList({ threadKey, editLastRef }: { threadKey: ThreadKey; 
   const failed = useMemo(() => allFailed.filter((f) => f.thread === key), [allFailed, key]);
   const serverKey = controller.messageServerKey;
   const [authTick, setAuthTick] = useState(0);
-  useEffect(() => { const timer = setInterval(() => setAuthTick((n) => n + 1), 60_000); return () => clearInterval(timer); }, []);
+  useEffect(() => {
+    // Every minute, and at once when storage or the revocation feed works again after failing.
+    const timer = setInterval(() => setAuthTick((n) => n + 1), 60_000), unsubscribe = messageStorage.subscribe(() => setAuthTick((n) => n + 1));
+    return () => { clearInterval(timer); unsubscribe(); };
+  }, []);
   const [verified, setVerified] = useState<Map<number, { fingerprint: string; state: MessageVerification }>>(new Map());
   const [signingUid, setSigningUid] = useState<string | undefined>();
   const verifier = useMemo(() => new MessageVerificationCache(), [serverKey, key]);

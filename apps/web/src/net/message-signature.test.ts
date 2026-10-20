@@ -295,6 +295,88 @@ describe("message view verification cache", () => {
     await cache.refresh(now);
     expect((await cache.verify(f.msg, f.ctx)).authorization).toContain("revocations-stale");
   });
+  it("never lets an overlapping refresh whose read failed undo another's revocation", async () => {
+    const f = await fixture(true, 3_600_000), store = storage(), cache = new MessageVerificationCache(store);
+    await store.mergeFeed([], CONNECT_URL, now);
+    expect((await cache.verify(f.msg, f.ctx)).status).toBe("verified");
+    // Revoked before the message was signed: invalid once read.
+    const c = f.msg.signature!.certificate!, at = f.msg.signature!.signed_at - 500;
+    await store.mergeFeed([{ seq: 1, account_key: c.account_key, device_key: c.device_key, revoked_at: at,
+      signature: await signText(f.account.jwk, revokeStatement(c.account_key, c.device_key, at)) }], CONNECT_URL, now);
+    // Real storage: the first read of refresh A fails, the next read succeeds, the one after fails again.
+    const original = IDBDatabase.prototype.transaction, warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let read = 0;
+    const transaction = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (this: IDBDatabase, ...args: Parameters<IDBDatabase["transaction"]>) {
+      if (JSON.stringify(args[0]) === '["revocations","feeds"]' && ++read % 2 === 1) throw new DOMException("lost", "UnknownError");
+      return original.apply(this, args);
+    });
+    const reads = vi.spyOn(store, "revocations");
+    try {
+      // A, then B while A waits to try its read again, then C while both run.
+      const a = cache.refresh(now);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const b = cache.refresh(now), c2 = cache.refresh(now);
+      await Promise.all([a, b, c2]);
+      expect(await cache.verify(f.msg, f.ctx)).toMatchObject({ status: "invalid" });
+      // One after the other: B and C share one run, after A, with nothing verified left to read for.
+      expect(reads).toHaveBeenCalledOnce();
+      await cache.refresh(now);
+      expect(await cache.verify(f.msg, f.ctx)).toMatchObject({ status: "invalid" });
+    } finally { transaction.mockRestore(); warn.mockRestore(); reads.mockRestore(); }
+  });
+  it("keeps a known revocation when authorization storage becomes unreadable", async () => {
+    const f = await fixture(true, 3_600_000), store = storage(), cache = new MessageVerificationCache(store);
+    await store.mergeFeed([], CONNECT_URL, now);
+    await cache.verify(f.msg, f.ctx);
+    const c = f.msg.signature!.certificate!, at = now + 2000;
+    await store.mergeFeed([{ seq: 1, account_key: c.account_key, device_key: c.device_key, revoked_at: at,
+      signature: await signText(f.account.jwk, revokeStatement(c.account_key, c.device_key, at)) }], CONNECT_URL, now);
+    await cache.refresh(now);
+    expect((await cache.verify(f.msg, f.ctx)).authorization).toEqual(["device-revoked"]);
+    const reads = vi.spyOn(store, "revocations").mockRejectedValue(new DOMException("lost", "UnknownError"));
+    await cache.refresh(now);
+    await cache.refresh(now);
+    expect((await cache.verify(f.msg, f.ctx)).authorization).toEqual(["device-revoked", "revocations-stale"]);
+    // Read again, the stored revocation says the same.
+    reads.mockRestore();
+    await cache.refresh(now);
+    expect((await cache.verify(f.msg, f.ctx)).authorization).toEqual(["device-revoked"]);
+  });
+  it("takes a checkpoint storage could not take once it works, and only then clears the warnings", async () => {
+    const f = await fixture(true), store = storage(), cache = new MessageVerificationCache(store);
+    await store.mergeFeed([], CONNECT_URL, now);
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const failing = () => Promise.reject(new DOMException("lost", "UnknownError"));
+    const checkpoint = vi.spyOn(store, "checkpoint").mockImplementation(failing), revocation = vi.spyOn(store, "revocation").mockImplementation(failing);
+    const first = await cache.verify(f.msg, f.ctx);
+    expect(verificationLabel(first)).toMatch(/^Signature valid; revocation information stale or unavailable; this device cannot use its local storage/);
+    // Still failing: the signature stands, the warnings stay.
+    vi.spyOn(store, "revocations").mockImplementationOnce(failing);
+    await cache.refresh(now);
+    expect(await cache.verify(f.msg, f.ctx)).toMatchObject({ status: "verified", continuity: "storage-unavailable", authorization: ["revocations-stale"] });
+    checkpoint.mockRestore(); revocation.mockRestore();
+    const taken = vi.spyOn(store, "checkpoint");
+    await cache.refresh(now);
+    expect(fullyVerified(await cache.verify(f.msg, f.ctx))).toBe(true);
+    // Taken once, and not again by the next refresh.
+    expect(taken).toHaveBeenCalledOnce();
+    await cache.refresh(now);
+    expect(taken).toHaveBeenCalledOnce();
+    vi.restoreAllMocks();
+  });
+  it("reports a rollback replayed while storage failed once storage works", async () => {
+    const f = await fixture(true), store = storage();
+    await store.mergeFeed([], CONNECT_URL, now);
+    await new MessageVerificationCache(store).verify(await editMessage(f, "edited"), f.ctx);
+    const checkpoint = vi.spyOn(store, "checkpoint").mockRejectedValue(new DOMException("lost", "UnknownError"));
+    const cache = new MessageVerificationCache(store);
+    // The replayed original is never shown fully verified meanwhile...
+    expect(fullyVerified(await cache.verify(f.msg, f.ctx))).toBe(false);
+    checkpoint.mockRestore();
+    await cache.refresh(now);
+    // ...and is the rollback it is once storage can tell.
+    expect(await cache.verify(f.msg, f.ctx)).toMatchObject({ status: "invalid", continuity: "rollback" });
+  });
 });
 
 

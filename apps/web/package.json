@@ -13,6 +13,7 @@
     "test": "vitest run",
     "e2e": "node e2e/smoke.mjs",
     "e2e:images": "node e2e/images.mjs",
+    "e2e:verification": "node e2e/verification.mjs",
     "e2e:native-audio": "node e2e/native-audio.mjs",
     "e2e:native-voice": "node e2e/native-voice.mjs",
     "e2e:mls": "node e2e/mls.mjs",

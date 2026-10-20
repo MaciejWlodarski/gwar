@@ -147,6 +147,10 @@ jobs:
       - run: pnpm --filter web build
       - run: pnpm --filter web exec playwright install --with-deps chromium webkit firefox
       - run: pnpm --filter web e2e:images
+      - name: Message verification storage in Chromium, WebKit and Firefox
+        run: pnpm --filter web e2e:verification
+        env:
+          E2E_BROWSERS: chromium,webkit,firefox
       # Headless browsers need an audio output: Firefox's audio contexts never start without one.
       - name: Sound server with a null sink
         run: |

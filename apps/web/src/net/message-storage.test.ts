@@ -1,6 +1,6 @@
 import "fake-indexeddb/auto";
 import { describe, expect, it, vi } from "vitest";
-import { MessageStorage, MAX_CHECKPOINTS, MAX_REVOCATIONS } from "./message-storage";
+import { MessageStorage, MAX_CHECKPOINTS, MAX_REVOCATIONS, refreshRevocations } from "./message-storage";
 import { keyFromSeed, signText, revokeStatement } from "../connect/crypto";
 import { CONNECT_URL } from "../lib/official";
 
@@ -22,6 +22,20 @@ async function seed(name: string, state: { checkpoints: Record<string, unknown>;
   }); db.close();
 }
 const checkpoint = (revision = 0, hash = "hash", at = 1) => ({ revision, hash, conversation: "channel:7", created: 1, at });
+/** A database of a lower version, held open: empty at version 1, or as the app before the current
+ *  schema left it at version 2 (no order store). */
+function older(name: string, version: 1 | 2) {
+  return new Promise<IDBDatabase>((resolve, reject) => {
+    const r = indexedDB.open(name, version);
+    r.onupgradeneeded = () => {
+      if (version === 1) return;
+      r.result.createObjectStore("checkpoints").createIndex("at", "at");
+      r.result.createObjectStore("revocations"); r.result.createObjectStore("feeds");
+    };
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+}
 
 describe("atomic bounded message storage", () => {
   it("serializes conflicting revisions across independent clients of the same database", async () => {
@@ -77,19 +91,121 @@ describe("atomic bounded message storage", () => {
 });
 
 describe("per-record storage work", () => {
-  it("reports a blocked upgrade as unavailable storage and opens once the older tab lets go", async () => {
-    const name = crypto.randomUUID();
-    const old = await new Promise<IDBDatabase>((resolve, reject) => {
-      // Any lower version: a tab of an older app, before this one's stores.
-      const request = indexedDB.open(name, 1);
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
+  it("reports a blocked upgrade as unavailable storage at once, and storage working when the older tab lets go", async () => {
+    const name = crypto.randomUUID(), old = await older(name, 1);
     // An older tab that ignores the version change keeps its connection open.
+    const store = new MessageStorage(name), recovered = vi.fn(), open = vi.spyOn(IDBFactory.prototype, "open");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    store.subscribe(recovered);
+    try {
+      await expect(store.cursor()).rejects.toThrow("being upgraded in another tab");
+      // Meanwhile nothing waits, and no other open queues behind the blocked one.
+      await expect(store.checkpoint("key", checkpoint(), "-")).rejects.toThrow("being upgraded in another tab");
+      expect(open).toHaveBeenCalledOnce();
+      expect(store.error).toMatch(/being upgraded in another tab/);
+      old.close();
+      await vi.waitFor(() => expect(recovered).toHaveBeenCalledOnce());
+      expect(store.error).toBeUndefined();
+      expect(await store.cursor()).toBe(0);
+    } finally { open.mockRestore(); warn.mockRestore(); }
+  });
+  it("reports why a database of an older schema does not open", async () => {
+    const name = crypto.randomUUID(), warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    (await older(name, 2)).close();
     const store = new MessageStorage(name);
-    await expect(store.cursor()).rejects.toThrow("being upgraded in another tab");
-    old.close();
+    try {
+      await expect(store.checkpoint("key", checkpoint(), "-")).rejects.toThrow();
+      await expect(store.cursor()).rejects.toThrow();
+      expect(store.error).toMatch(/^ConstraintError: /);
+      expect(warn).toHaveBeenCalledOnce();
+    } finally { warn.mockRestore(); }
+  });
+  it("opens again after the browser closes the connection", async () => {
+    const store = new MessageStorage(crypto.randomUUID()), connection = () => (store as unknown as { connection: IDBDatabase }).connection;
+    await store.cursor();
+    const db = connection();
+    db.close(); db.onclose?.(new Event("close"));
     expect(await store.cursor()).toBe(0);
+    expect(connection()).not.toBe(db);
+    // Closed without the event, the failed transaction is tried once more on a new connection.
+    connection().close();
+    expect(await store.cursor()).toBe(0);
+    expect(store.error).toBeUndefined();
+  });
+  it("tries a failed transaction once more, then remembers the failure until storage works again", async () => {
+    const store = new MessageStorage(crypto.randomUUID()), recovered = vi.fn(), warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    store.subscribe(recovered);
+    await store.cursor();
+    const transaction = vi.spyOn(IDBDatabase.prototype, "transaction");
+    try {
+      transaction.mockImplementationOnce(() => { throw new DOMException("hiccup", "UnknownError"); });
+      expect((await store.checkpoint("a", checkpoint(), "-")).continuity).toBe("proven");
+      expect(store.error).toBeUndefined();
+      transaction.mockImplementation(() => { throw new DOMException("lost", "UnknownError"); });
+      await expect(store.checkpoint("b", checkpoint(), "-")).rejects.toThrow("lost");
+      await expect(store.revocation("x", "y")).rejects.toThrow("lost");
+      expect(store.error).toBe("UnknownError: lost");
+      expect(warn).toHaveBeenCalledOnce();
+      expect(recovered).not.toHaveBeenCalled();
+      transaction.mockRestore();
+      expect((await store.checkpoint("b", checkpoint(), "-")).continuity).toBe("proven");
+      expect(store.error).toBeUndefined();
+      expect(recovered).toHaveBeenCalledOnce();
+    } finally { transaction.mockRestore(); warn.mockRestore(); }
+  });
+  it("recovers writes only by a write: reads succeeding beside a full disk signal nothing", async () => {
+    const store = new MessageStorage(crypto.randomUUID()), recovered = vi.fn(), warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    store.subscribe(recovered);
+    await store.cursor();
+    const original = IDBDatabase.prototype.transaction;
+    const transaction = vi.spyOn(IDBDatabase.prototype, "transaction").mockImplementation(function (this: IDBDatabase, ...args: Parameters<IDBDatabase["transaction"]>) {
+      if (args[1] === "readwrite") throw new DOMException("disk full", "QuotaExceededError");
+      return original.apply(this, args);
+    });
+    try {
+      for (let i = 0; i < 3; i++) {
+        await expect(store.checkpoint("a", checkpoint(), "-")).rejects.toThrow("disk full");
+        expect((await store.revocation("x", "y")).revokedAt).toBeUndefined();
+        expect(await store.cursor()).toBe(0);
+      }
+      expect(recovered).not.toHaveBeenCalled();
+      expect(store.error).toBe("QuotaExceededError: disk full");
+      transaction.mockRestore();
+      expect((await store.checkpoint("a", checkpoint(), "-")).continuity).toBe("proven");
+      expect(recovered).toHaveBeenCalledOnce();
+      expect(store.error).toBeUndefined();
+    } finally { transaction.mockRestore(); warn.mockRestore(); }
+  });
+  it("neither tries again nor counts as a storage failure what a change refuses", async () => {
+    const store = new MessageStorage(crypto.randomUUID());
+    for (let i = 0; i < 8; i++) await store.mergeFeed([], `https://connect-${i}.example`, 1);
+    const transactions = vi.spyOn(IDBDatabase.prototype, "transaction");
+    try {
+      await expect(store.mergeFeed([], "https://extra.example", 2)).rejects.toThrow("Revocation service storage full");
+      expect(transactions).toHaveBeenCalledOnce();
+      expect(store.error).toBeUndefined();
+    } finally { transactions.mockRestore(); }
+  });
+  it("reports refused site storage, and a failed feed read until one succeeds", async () => {
+    const store = new MessageStorage(crypto.randomUUID()), warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const open = vi.spyOn(IDBFactory.prototype, "open").mockImplementation(() => { throw new DOMException("The operation is insecure.", "SecurityError"); });
+    try {
+      await expect(store.cursor()).rejects.toThrow("insecure");
+      expect(store.error).toBe("SecurityError: The operation is insecure.");
+    } finally { open.mockRestore(); }
+    const recovered = vi.fn(), base = "https://connect.example";
+    store.subscribe(recovered);
+    const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("down", { status: 503 }));
+    try {
+      await refreshRevocations(base, store);
+      expect(store.feedError).toBe("Error: Revocation feed unavailable");
+      fetch.mockResolvedValue(Response.json({ revocations: [] }));
+      await refreshRevocations(base, store);
+      expect(store.feedError).toBeUndefined();
+      expect((await store.revocation("a", "b", base)).fresh).toBe(true);
+      // Storage worked again (the first transaction after the refused open), then the feed did.
+      expect(recovered).toHaveBeenCalledTimes(2);
+    } finally { fetch.mockRestore(); warn.mockRestore(); }
   });
   it("closes its connection so a newer version of the app can upgrade the database", async () => {
     const name = crypto.randomUUID(), store = new MessageStorage(name);
