@@ -9,28 +9,40 @@ end. The spike code was thrown away; only its results are kept here
 
 - **One media path for every client that has a usable webview.** Browsers, and
   the desktop app on macOS and Windows, capture with `getDisplayMedia` and send
-  through a *second* `RTCPeerConnection` in the web layer, the **screen
-  transport**. The desktop's voice stays native and does not change. The spike
-  confirmed that the system WKWebView at `tauri://localhost` has
-  `getDisplayMedia`, `RTCPeerConnection`, `RTCRtpScriptTransform` and the VP8,
-  VP9, H.264 and AV1 encoders. WebView2 is Chromium. Linux desktop is the
-  exception: distro WebKitGTK ships without WebRTC, so Linux users share from a
-  browser until a native path exists (phase 3).
+  through extra `RTCPeerConnection`s in the web layer, the **screen
+  transports**:
+  - one *publish* transport per share;
+  - one *watch* transport per viewer, with 4 fixed receive slots.
+
+  The desktop's voice stays native and does not change. The spike confirmed
+  that the system WKWebView at `tauri://localhost` has `getDisplayMedia`,
+  `RTCPeerConnection`, `RTCRtpScriptTransform` and the VP8, VP9, H.264 and AV1
+  encoders. WebView2 is Chromium. Linux desktop is the exception: distro
+  WebKitGTK ships without WebRTC, so Linux users share from a browser until a
+  native path exists (phase 3).
 - **The SFU forwards video like it forwards voice.** It uses str0m 0.24 in RTP
-  mode, does not decode, and keeps fixed receive slots. A spike
-  (Chromium/WebKit → str0m RTP-mode SFU → Chromium/WebKit) showed:
-  - str0m answers viewers' NACKs from its own send buffer, so 5 % loss cost one
-    freeze of about 200 ms or none;
+  mode and does not decode. Spikes (Chromium/WebKit → str0m RTP-mode SFU →
+  Chromium/WebKit) showed:
+  - viewer NACKs are answered hop by hop from str0m's send buffer;
+  - publisher losses are repaired by the SFU's own NACKs;
   - PLI relay brings late joiners in;
   - TWCC feedback and the send-side bandwidth estimate work;
   - 1080p60 forwards cleanly.
-- **Video runs in a separate media task, not in the voice loop.** It shares the
-  existing UDP port: the voice task hands datagrams it does not own to the
-  screen task, and all video egress happens in the screen task. Voice latency
-  is untouched.
+
+  Forwarding needs a **stable source-sequence mapping**, not arrival-order
+  renumbering: renumbering corrupted about a quarter of the frames under
+  publisher loss and reordering (S5).
+- **Video does not run in the voice loop.**
+  - The voice task stays the only reader of the existing UDP port. It hands
+    known screen addresses to a separate screen task through an O(1) lookup
+    and a bounded, non-blocking channel.
+  - All video egress, retransmission and pacing happens in the screen task.
+  - Paired voice latency measurements under video load and on constrained
+    links gate the server PR. A separate task alone does not prove zero voice
+    impact.
 - **Codec: VP9 first, VP8 as the fallback, in every channel.** Encrypted
-  channels use SFrame on whole frames. The spike settled which codecs survive
-  an encrypted frame through the browsers' packetizers:
+  channels use SFrame. The spikes settled which byte layouts survive the
+  browsers' packetizers:
   - VP9 survives whole-frame SFrame.
   - VP8 needs its first 10 bytes (keyframe) or 3 bytes (delta) clear; they go
     into the AAD.
@@ -38,11 +50,18 @@ end. The spike code was thrown away; only its results are kept here
 
   H.264 with hardware encoding (games) comes later, with NAL-aware SFrame.
 - **Keys** come from the existing voice call group:
-  `MLS-Exporter("gwar screen v1", u32be(leaf), 32)`. Epochs, activation and
-  removal follow voice exactly. Only call participants can watch.
-- **Phase 1 is single-layer.** The sharer adapts to its own uplink. A viewer
-  whose downlink cannot keep up is told so and paused, and never slows the
-  sharer down. Temporal layers, then simulcast, come in phase 2.
+  `MLS-Exporter("gwar screen v1", u32be(leaf), 32)`. The call controller gains
+  a second endpoint kind (screen beside audio), with explicit rules for
+  barriers, activation, restarts and nonce safety. Keyframe recovery covers
+  viewers that switch keys late. Only call participants can watch.
+- **Phase 1 is single-layer.** The sharer adapts only to its own uplink.
+  - Each viewer's estimate is split across its watched shares in priority
+    order (the stage first).
+  - Shares that do not fit are paused for that viewer and never slow the
+    sharer down.
+  - Server resources are reserved by bitrate *cap* and enforced continuously.
+
+  Temporal layers, then simulcast, come in phase 2.
 - **Permission:** a new channel permission `share_screen`, which needs
   `connect`. Moderators with `mute_members` can stop someone's share. Limits
   are per channel, per share and per server.
@@ -261,7 +280,7 @@ The largest keyframe was 204 KB at 1080p60, about 175 packets in a burst.
 | Encode | 2–15 ms (spike: VP9 3.6–5 ms, H.264 SW 5–15 ms, AV1 2.3 ms at 720p) |
 | Pacing (keyframe bursts) | 0–20 ms |
 | Network, sharer → SFU → viewer | RTT-dependent, 10–60 ms in region |
-| SFU | < 1 ms (no buffering) |
+| SFU | < 1 ms: no reordering buffer; the pacer queue is normally empty and is capped at 150 ms ([Queues](#queues)) |
 | Jitter buffer | 5–50 ms (spike: 5–53 ms on loopback) |
 | Decode + render | 2–20 ms (one display refresh) |
 
@@ -305,80 +324,254 @@ S3:
 - **Simulcast:** RID streams. `RtpWrite::vp8_patch` rewrites VP8 picture ids for
   layer switching (phase 2).
 
-### Shape
+One str0m constraint shapes the loop. In RTP mode, `Rtc` keeps **one pending
+packet** between `handle_input` and `poll_output` (`session.rs`,
+`pending_packet`). A second input before polling overwrites the first. The
+spike hit this (S5): repaired packets vanished until the loop polled after
+every input. `gwar-server`'s voice loop already handles one datagram and then
+drives the peer. The screen task must do the same.
 
-- **Screen transport.** One extra `Rtc` per session that shares or watches,
-  negotiated by `screen.offer` when first needed and closed when the session
-  leaves voice. Its offer is fixed:
-  - one `sendonly` video m-line (the own share; a transceiver without a track
-    until sharing starts);
-  - `SCREEN_SLOTS = 4` `recvonly` video m-lines.
+### Transports
 
-  This mirrors the eight audio slots: no renegotiation when shares start,
-  stop or change hands.
+Each session has at most two screen transports besides its voice transport
+(a session shares at most one thing at a time):
+
+- **Watch transport.** One `Rtc` per session that watches anything, negotiated
+  by `screen.watch.offer` on the first watch and kept while the session is in
+  the call. Its offer is fixed: `SCREEN_SLOTS = 4` `recvonly` video m-lines,
+  nothing to send. This mirrors the eight audio slots: no renegotiation when
+  shares start, stop or change hands. A `run` number restarts it, like voice's
+  run.
+- **Publish transport.** One `Rtc` **per share**, negotiated by
+  `screen.publish.offer` and closed when the share ends: one `sendonly` video
+  m-line with RTX.
+  - A new share is a new `RTCPeerConnection`. It gets a fresh DTLS session and
+    fresh SSRCs from the browser by construction. `replaceTrack` on a kept
+    transceiver would keep the old SSRC.
+  - A delayed packet of a previous share belongs to a closed `Rtc`, and the
+    dispatcher drops it before any parsing.
+  - Starting costs one ICE-lite check plus a DTLS handshake (2–3 RTTs, about
+    100–200 ms in region) before the first frame. That is acceptable for
+    starting a share.
+  - Watching other shares is unaffected, because it runs on the separate
+    watch transport. PR 4's e2e covers start, stop and start while watching
+    two other shares.
 - **Codecs:** `clear_codecs().enable_vp9(true).enable_vp8(true)`, with RTX.
   Extensions are the defaults (transport-cc, abs-send-time, mid, rid) and a
-  slot-generation extension like voice's (`gwar_proto::rtp`).
-- **Same UDP port, separate task.**
-  - The voice task keeps reading the socket.
-  - A datagram no voice peer `accepts` goes over a bounded channel to the
-    screen task, which owns the screen `Rtc`s and sends through the shared
-    socket. Only sharers' ingress (one stream per share, about 500 packets/s
-    at 6 Mbps) and viewers' RTCP cross this hop.
-  - All heavy egress (fan-out, retransmissions, padding probes) runs in the
-    screen task. A voice packet never waits behind a 175-packet keyframe
-    fan-out.
-  - No new firewall port.
-- **Admission.** Each share binds its negotiated SSRC (plus RTX SSRC) to
-  `(session, share id, channel, encrypted)`, captured at admission and
-  re-checked on forward, like `AudioOrigin`. Packets of unknown or retired
-  SSRCs drop. Video needs its own size bounds:
-  - full 1200-byte MTU payloads, instead of the voice admission's 1033-byte
-    cap;
-  - a per-share packet rate limit of 3 × the bitrate cap, in packets;
-  - no Opus parsing.
-- **Forwarding.**
-  - For each admitted packet, for each viewer slot assigned to the share:
-    rewrite the sequence number, keeping contiguity per slot and skipping
-    nothing in phase 1.
-  - Pass the timestamp through. It is re-based per slot assignment so a slot
-    reused for another share starts a new timeline.
-  - Copy the marker bit, map the payload type to the viewer's negotiated one,
-    and write `nackable(true)`.
-  - No buffering, no reordering: packets go out in arrival order. The viewer's
-    jitter buffer handles order, and retransmissions come from str0m.
-- **Keyframes.**
-  - When a viewer is assigned to a slot, the SFU sends a PLI to the publisher.
-  - A viewer's PLI/FIR is relayed with a throttle: at most one per share per
-    500 ms, and repeat requests within that window coalesce.
-  - A viewer whose PLIs exceed 10 per minute gets them dropped, so one broken
-    viewer cannot make the sharer emit keyframes forever. This is what S3's
-    whole-frame VP8 case looked like: 94 viewer requests in 10 s.
-- **Bandwidth, phase 1:**
-  - The sharer adapts only to its own uplink (TWCC through the SFU). The SFU
-    never relays viewers' estimates to the sharer, so a slow viewer cannot
-    drag the share down.
-  - Per viewer, the SFU runs str0m's egress BWE with the desired rate set to
-    the share's measured rate.
-  - When the estimate stays below 80 % of the share's rate for 5 s, the SFU
-    stops forwarding to that viewer's slot and sends `screen.paused {share,
-    reason: "bandwidth"}`. The viewer sees "Your connection is too slow for
-    this share" and a Retry button. Retrying re-subscribes and requests a
-    keyframe.
-  - The SFU drops packets beyond the server's per-share bitrate cap (averaged
-    over 2 s) and counts them. Honest clients never hit it, because they set
-    `maxBitrate`.
-- **Phase 2:**
-  - **Temporal layers.** VP9 `L1T3` in Chromium; its descriptor TID is clear
-    even under SFrame. A slow viewer gets 15 or 7.5 fps instead of a pause,
-    with no keyframe needed. Firefox does not support `scalabilityMode`, and
-    the Playwright WebKit build ignored it (S1), so these senders stay
-    single-layer.
-  - **Simulcast** with two layers (full and half resolution), switched on
-    keyframes. VP9 descriptor keyframe bits are clear; VP8 has its 10 clear
-    bytes. Browser support is uneven: Firefox has VP8/H.264/AV1 simulcast but
-    no VP9; Safari has VP8/H.264. This needs codec-specific rules, so it comes
-    after temporal layers.
+  slot-generation extension on the watch transport like voice's
+  (`gwar_proto::rtp`).
+
+### Socket ownership and dispatch
+
+The voice task stays the only reader of the media UDP socket. Screen
+datagrams reach the screen task without slowing voice down.
+
+- **Dispatch is O(1) and happens first.** The voice task keeps a
+  `HashMap<SocketAddr, Owner>`, where the owner is a voice peer or a screen
+  `Rtc` id. It is filled when an `Rtc` first accepts an address, and cleared
+  when that `Rtc` closes.
+  - A datagram from a known screen address goes over a bounded channel
+    (`try_send`, capacity 2048 datagrams) to the screen task. Nothing else
+    happens to it in the voice task: no peer scan, no `handle_input`, no
+    drive.
+  - Unknown addresses (new ICE checks) fall back to asking voice peers'
+    `accepts`, then the screen task's.
+  - `accepts` classifies by remote address and STUN credentials (ICE
+    ufrag/pwd). This is **routing, not authentication**: SRTP authentication
+    in the owning `Rtc` is what rejects forged media, as for voice today.
+- **The hand-off never blocks.** A full channel drops the datagram and counts
+  `screen_dispatch_dropped`. Video recovers through NACK/PLI; voice never
+  waits.
+- **Egress belongs to the screen task.** It sends through a clone of the
+  socket handle (`Arc<UdpSocket>`, `try_send_to`, dropping under socket
+  pressure like voice). Fan-out, retransmissions and padding probes run there,
+  on its own Tokio task. Phase 1 uses the same runtime. If PR 3's measurement
+  shows voice jitter, PR 3 moves it to its own thread.
+- **What this does not isolate:**
+  - the kernel's socket buffers and the NIC queue, which are shared;
+  - the clients' uplinks and downlinks, where audio and video congestion
+    controllers compete (next section).
+
+  A separate UDP port would isolate the socket buffer but not the rest. It
+  stays an option (`--screen-media`) if the measurements below demand it.
+
+### Voice headroom and acceptance
+
+- **On the sharer's uplink,** audio and video are separate peer connections
+  with separate congestion controllers. Browser GCC is delay-based and backs
+  off when the queue grows, which also protects audio. On top of that:
+  - the video `maxBitrate` is the preset cap, never more;
+  - the sharer lowers it to `0.7 × availableOutgoingBitrate` of the publish
+    transport (from `getStats` `candidate-pair`) when that is lower, leaving
+    30 % for voice and retransmissions;
+  - video encodings get `priority: "low"` and `networkPriority: "low"`, and
+    voice keeps the default. This is a DSCP hint that most paths ignore.
+- **On a viewer's downlink** the SFU's per-viewer allocation (below) never
+  plans more than 80 % of the viewer's estimate. Voice is about 32–40 kbps per
+  speaker and fits in the remainder.
+- **PR 3 acceptance compares voice with and without video,** paired runs, using
+  the `latency` example and `LATENCY_NET` relay from docs/latency.md:
+  - The relay gets a `rate=` bottleneck option with a bounded queue. The
+    example gets a screen load generator: a str0m frame-mode client publishing
+    synthetic VP9-sized frames at a preset's rate, through the same relay, and
+    a viewer receiving it.
+  - Scenarios: unconstrained loopback with a 1080p60 share at 8 Mbps and five
+    viewers; a 10 Mbps sharer uplink with an 8 Mbps share; a 5 Mbps viewer
+    downlink watching two 4 Mbps shares; each also with 1 % loss.
+  - Report voice p50/p95/p99 mouth-to-ear, lost and late frames, playout
+    underruns and concealment, as the latency docs do. Ten pairs, alternating
+    order.
+  - Gate: unconstrained, voice p95 and p99 within 2 ms of the paired baseline
+    and no extra underruns. Constrained, voice p99 within 20 ms of baseline and
+    underruns within baseline + 0.5 %. Missing the gate blocks PR 3 until the
+    isolation is changed (own thread, separate port or a lower video
+    allocation).
+
+### Admission and resource limits
+
+Each share's publish `Rtc` binds its negotiated SSRC and RTX SSRC to an
+immutable `ScreenOrigin {session, share, channel, encrypted, private}`. This
+is captured at negotiation and re-checked on every forward, like
+`AudioOrigin`. Packets of other SSRCs drop.
+
+Limits are enforced continuously, not only when a share or watch is admitted:
+
+- **Per share, ingress.** Two token buckets, checked before forwarding:
+  - bytes: rate 1.25 × the share's cap, burst 512 KB (two 1080p keyframes);
+  - packets: rate 2,000 per second, burst 600.
+
+  Payloads up to the negotiated MTU (1200 bytes) are allowed, instead of
+  voice's 1033-byte cap. There is no codec parsing beyond the payload
+  descriptor's start-of-frame and keyframe bits.
+- **Per viewer slot.** A reservation equal to the share's **cap**, not its
+  current rate. Static content cannot be admitted cheaply and then grow. Every
+  reservation is charged 1.3 × its cap to cover RTX, TWCC padding probes and
+  headers.
+- **Server-wide budget** (default 300 Mbps). The sum of all slot reservations
+  plus all publish caps, because ingress costs CPU too. A watch or start that
+  would exceed it gets `busy`.
+  - The screen task also measures real egress every second, including
+    retransmissions and padding, from str0m's `Event::PeerStats`, enabled with `set_stats_interval(1 s)`.
+  - When it stays over budget for 5 s, the newest watches are paused first.
+- **Negotiation.**
+  - At most 4 `screen.*.offer` per session per minute.
+  - At most `shares_per_server` publish transports (default 32) and one watch
+    transport per session.
+- **Dropping is frame-granular.** When a bucket or the budget forces a drop,
+  the SFU drops from the next frame start (a new RTP timestamp with the
+  descriptor's start bit) onward. It marks the slot **waiting for keyframe**
+  and forwards nothing to it until a keyframe arrives, which the throttled PLI
+  rule below requests. No partial frame is ever forwarded.
+
+### Forwarding: stable sequence mapping
+
+Arrival-order renumbering is wrong. A publisher packet repaired by RTX, or
+reordered on the way, arrives after its successors. Renumbering it in arrival
+order makes viewers reassemble frames in the wrong order. S5 measured it:
+95–98 corrupted frames and 2–7 decoded out of about 420, under 3 % publisher
+loss and 2 % reordering, against 0 corrupted and all decoded with the mapping
+below.
+
+Each viewer slot keeps a **segment**: `(base_src, base_out)` and a
+`resume_src`.
+
+- str0m gives the publisher packet's **extended** source sequence number
+  `src`. RTX repairs are unwrapped to it, `un_rtx`.
+- Within a segment, `out = base_out + (src - base_src)`:
+  - gaps are preserved, so the viewer NACKs them;
+  - a late or repaired packet lands exactly on its original `out`, as a
+    first-time packet;
+  - retransmissions map consistently.
+- A new segment starts at slot assignment, and when resuming after a pause or
+  a frame-granular drop. It always starts at a keyframe's first packet:
+  `base_src` is that packet's `src`, and `base_out` is the slot's highest
+  `out` + 1 + 64. The jump makes the viewer treat the hole as an old loss, and
+  the keyframe makes it irrelevant.
+- Packets with `src < resume_src` are stale and dropped, so a repair from
+  before a drop never reaches the new segment.
+- Timestamps pass through with a per-segment offset, so a slot reused for
+  another share starts a fresh timeline. The marker bit is copied, the payload
+  type is mapped to the viewer's, and packets are written `nackable(true)`.
+
+Viewer NACKs are answered hop by hop from str0m's send buffer. A gap the SFU
+itself has not received yet stays open until the SFU's own NACK to the
+publisher is repaired (S5: 72–96 publisher NACKs answered). The repair then
+fills it at its mapped `out`. S5 decoded 412–423 of about 420 frames with no
+freeze.
+
+Retransmissions resend the same SFrame ciphertext under each viewer's own SRTP
+keys. The SFU needs no screen keys for this, and nothing about it weakens the
+end-to-end layer.
+
+### Queues
+
+Writes do queue: `write_rtp` puts packets into str0m's send queue. With BWE
+enabled, a leaky-bucket pacer drains it. The pacer's 2 s queue limit makes it
+*send faster*, not drop (`pacer/leaky.rs`). The queue cannot be cleared from
+outside str0m. So the SFU controls what goes in:
+
+- before writing a frame's first packet to a slot, it reads the stream's
+  `queue_info()`;
+- when the oldest unsent packet is more than 150 ms old, or more than 256 KB
+  are queued, it drops that frame for that slot and the slot waits for a
+  keyframe, as above;
+- packets already queued drain at pacing rate, which is the bounded leftover
+  of at most 150 ms or 256 KB.
+
+On pause, the slot stops receiving writes immediately, and the residue drains
+within that bound. Unpaced streams (`set_unpaced`) are not used for video.
+
+### Keyframes
+
+All keyframe requests to a publisher go through one throttle per share: at most
+one PLI per 500 ms, with later requests in the window coalesced. Inputs are:
+
+- a slot assignment (watch, retry, resume after pause);
+- a viewer's PLI/FIR;
+- `screen.keyframe` from a viewer's decryptor;
+- a slot waiting for a keyframe after a drop.
+
+Each viewer may contribute at most 10 per minute, whatever the source.
+Watch, retry and `screen.keyframe` cannot bypass the throttle; past the
+budget, the viewer stays paused until the next keyframe the share produces
+anyway. This is what S3's whole-frame VP8 case looked like: 94 viewer
+requests in 10 s.
+
+### Bandwidth allocation per viewer
+
+The watch transport carries up to 4 slots over one TWCC estimate, so decisions
+are made for the **sum**:
+
+- the SFU sets `bwe().set_desired_bitrate(Σ caps of watched shares × 1.1)`,
+  which is what str0m's BWE API asks for when several streams share a
+  transport (`bwe/api.rs`);
+- it allocates `0.8 × estimate` to the watched shares in **priority order**:
+  1. the share on the viewer's stage (the client says which, with
+     `screen.focus {share}`);
+  2. then the other watched shares in watch order.
+
+  Each gets its current measured rate (2 s average) while the remainder allows.
+- a share that does not fit for 5 s is paused for that viewer (`screen.paused
+  {share, reason: "bandwidth"}`), lowest priority first. A paused share resumes
+  when the estimate allows it for 10 s: a new segment from a keyframe, with
+  `screen.resumed`.
+- the viewer sees "Your connection is too slow for this share" on a paused
+  card, with a Retry button (throttled as above).
+
+The sharer is never slowed by viewers. The SFU never relays viewers' estimates
+or REMB to the publisher. The sharer adapts only to its own uplink (TWCC on
+the publish transport).
+
+Phase 2:
+
+- **Temporal layers.** VP9 `L1T3` in Chromium; its descriptor TID is clear even
+  under SFrame. A slow viewer gets 15 or 7.5 fps instead of a pause, with no
+  keyframe needed. Firefox does not support `scalabilityMode`, and the
+  Playwright WebKit build ignored it (S1), so these senders stay single-layer.
+- **Simulcast** with two layers (full and half resolution), switched on
+  keyframes. Browser support is uneven: Firefox has VP8/H.264/AV1 simulcast but
+  no VP9; Safari has VP8/H.264. This needs codec-specific rules, so it comes
+  after temporal layers.
 
 ### Cost on the deployment VM
 
@@ -390,9 +583,9 @@ Egress per viewer equals the share's rate (the SFU never transcodes):
 | Smooth 1080p30 | 2–5 Mbps | 0.9–2.2 GB |
 | Game 1080p60 | 5–8 Mbps | 2.2–3.6 GB |
 
-- **Oracle's 10 TB/month free egress** is about 5,500 viewer-hours at 4 Mbps.
-  For example, two shares a day, three hours each, five viewers each:
-  2 × 3 × 5 × 1.8 GB × 30 days ≈ 1.6 TB/month.
+- **Oracle's 10 TB/month of free outbound transfer** is about 5,500
+  viewer-hours at 4 Mbps. For example, two shares a day, three hours each, five
+  viewers each: 2 × 3 × 5 × 1.8 GB × 30 days ≈ 1.6 TB/month.
 - **Network:** A1 shapes get 1 Gbps per OCPU, so bandwidth binds after CPU.
 - **CPU, measured in S3** on an Apple M5, with str0m RTP mode doing SRTP for
   every packet:
@@ -404,23 +597,22 @@ Egress per viewer equals the share's rate (the SFU never transcodes):
   - **100 Mbps of egress (25 viewers at 4 Mbps) ≈ 0.4 of one A1 core**, on a
     task separate from voice.
   - PR 3 re-measures this on the VM.
-- **Plan check (open question 5):**
-  - The VM was created as 4 OCPU / 24 GB.
-  - Oracle cut Always Free to the equivalent of 2 OCPU / 12 GB around
-    2026-06-15 for free-only tenancies (Oracle Always Free docs; InfoQ
-    2026-07). Instances above that on free-only accounts are stopped until
-    resized.
-  - Pay-as-you-go tenancies reportedly keep 4/24.
-  - If the VM is on a free-only tenancy, 2 OCPU still covers the numbers
-    above.
+- **Compute allowance.** Oracle's Always Free page now gives every tenancy
+  1,500 A1 OCPU-hours and 9,000 GB-hours a month, which is 2 OCPUs and 12 GB
+  running continuously. It changed around June 2026 (InfoQ, 2026-07).
+  - The VM was created as 4 OCPU / 24 GB. On a free-only tenancy the
+    excess must be resized away; on a paid tenancy it is billed.
+  - Which applies to this VM is **not verified** (open question 5).
+  - 2 OCPU is enough for the phase 1 numbers above; the defaults below assume
+    it.
 
 ### Limits (server settings, with defaults)
 
 - Concurrent shares per channel: **4**, which equals `SCREEN_SLOTS`, so anyone
   can watch every share at once.
+- Shares per server: **32**.
 - Viewers per share: **25**.
-- Server-wide screen egress budget: **300 Mbps**. A new watch over the budget
-  gets `busy`.
+- Server-wide screen budget, reservations as above: **300 Mbps**.
 - Bitrate cap per share: **8 Mbps**.
 - `screen.watch` from someone not in the share's voice call: `forbidden`.
 
@@ -439,13 +631,10 @@ kid(E, L)      = ((E & 0xffffffff) << 32) | L        (same layout as voice)
 The label differs from voice's `"gwar voice v1"`, so a video frame can never
 authenticate as audio or the reverse, and the two never share a nonce counter.
 
-Everything else is the voice rule set in e2e-build.md §5, applied per media
-kind:
+Rules shared with voice (e2e-build.md §5), applied per media kind:
 
 - the suite (`AES_128_GCM_SHA256_128`), RFC 9605 header and derivation;
 - one encryptor per `(call, group, full epoch, own leaf, media kind)`;
-- activation: senders switch video exactly when they switch voice, one rule
-  and one state;
 - the eight-epoch receiver table and retention, and removal purges;
 - the 2^32 sender limit;
 - fail closed: nothing is sent or shown without keys, and the stage shows
@@ -454,32 +643,121 @@ kind:
 Replay windows are per `(group, epoch, leaf, media)`. Video frames arrive in
 order through the jitter buffer, so the 128-frame window is ample.
 
+### Two engines under one call controller
+
+Today `VoiceCall.attach(media)` (`apps/web/src/mls/voice.ts`) holds exactly one
+`VoiceMedia` endpoint. That endpoint is either the browser's SFrame worker or
+the desktop's native engine through `voice_set_keys`. The controller binds to
+it:
+
+- serials, `barrier`, `installed`, `activated` and `floor`;
+- acknowledgements carry its `run`;
+- `restartMedia()` replaces it.
+
+On the desktop, audio stays native while video is a web worker, so one
+endpoint cannot serve both. The controller therefore gets **endpoints by kind**:
+
+- `attach(kind: "audio" | "screen", media)`. Each kind has its own run, serial,
+  barrier, installed, activated and floor.
+- **Attaching or restarting `screen` never touches the `audio` endpoint**, and
+  the reverse. `restartMedia(kind)` replaces only that kind. A failing screen
+  endpoint (control error, worker crash, install timeout) closes the screen
+  transports and shows "Screen share stopped"; voice continues.
+- **Acknowledgements stay audio-driven:** `voice.epoch.ack` is sent when the
+  *audio* endpoint installed the epoch, exactly as today. Voice activation
+  timing does not change when someone shares.
+  - A viewer whose screen endpoint installs later than its audio endpoint can
+    miss video frames briefly.
+  - Recovery covers it (next section).
+  - The cost of the alternative, making acks wait for video, would be voice
+    activation delays caused by video.
+- **Barriers and holds go to every attached endpoint.**
+  - `supersede` is sent to each endpoint, and the controller's `barrier`
+    advances per endpoint.
+  - A `hold` (removal, revocation, gate closed) is applied to both. "At once"
+    for a removal means each endpoint stops sending under the old key when it
+    processes the hold.
+  - An endpoint that does not confirm a hold within 1 s is closed: screen
+    transports torn down, or the voice run restarted as today.
+- **Installation and activation run per endpoint, with one decision.** The
+  controller decides once per epoch whether it may activate, using the same
+  rule as today: removal at once, otherwise all acks or two seconds. It then
+  sends `install` and `activate` to each endpoint independently.
+  - An endpoint that has not finished `install` simply activates later. Its
+    sender stays silent until then.
+  - No endpoint ever activates an epoch the decision has not reached.
+- **Restart and nonce safety.** The screen encryptor's counter must never
+  repeat under a base key. A new SSRC or a new transport does not protect the
+  nonce: SFrame's nonce is derived from the key and the counter only.
+  - **The worker outlives transports.** The screen worker belongs to the
+    call participation, not to a publish or watch transport. Each new
+    transport attaches new `RTCRtpScriptTransform`s to the *same* worker, so
+    the encryptor keeps its counter across shares and transport restarts.
+  - **A lost worker counts as a restart.** If the worker itself is lost
+    (crash, `onerror`), the screen endpoint is a restarted engine under the
+    voice rule. It gets a new floor and needs this device's own leaf update.
+    It may send video only in the epoch of that exact update, or a later one,
+    and never under a key from before it. The update is an ordinary
+    non-removal commit: the audio endpoint installs it like any epoch, and
+    voice keeps sending under its current key until normal activation.
+  - The same holds for the desktop: the screen worker lives in the webview's
+    MLS runtime; the native audio engine is a separate endpoint.
+- **The desktop needs no new native command.** Video keys never cross into
+  Rust. The webview's MLS runtime exports them straight to the screen worker.
+
+The control contract (`hold`, `supersede`, `install`, `activate`) and the key
+state module (`apps/web/src/voice/sframe/state.ts`) are reused unchanged, with
+the media kind added to the key binding.
+
+### Keyframe recovery around key changes
+
+A viewer can receive the requested keyframe under epoch E. If the sharer then
+activates E+1 before the viewer's screen endpoint has installed it, the viewer
+drops the frames it cannot open. When it catches up, the following delta frames
+authenticate but cannot be decoded: their references are gone (RFC 9605 §6.2).
+So:
+
+- The receiver worker tracks, per slot, whether any frame was dropped since
+  the last keyframe it delivered. Reasons: `no_key`, `auth_failed`, replay,
+  oversize.
+- When a slot has such a gap, the first frame that opens again triggers
+  `screen.keyframe {share}`. The same happens after a decoder reset (a `freeze`
+  or `framesDropped` jump in `getStats`) and after a slot is reassigned.
+- Retries happen at most once per second, while the gap persists, up to five
+  times. After that the card shows "Reconnecting to the share…" and the viewer
+  re-watches. All of this goes through the server's per-share throttle and the
+  per-viewer budget, so it cannot amplify.
+- **Sender side:** right after a sharer activates a new epoch, it asks its own
+  encoder for a keyframe, through `generateKeyFrame()` on the worker's
+  `RTCRtpScriptTransformer` (WebRTC Encoded Transform spec). Where an engine
+  lacks it (PR 5 checks all three), the viewers' requests cover it. That
+  keyframe is the first frame under the new key, so viewers that already have
+  the key never see a gap.
+
 ### Frame layout
 
-- **VP9:** `SFrameHeader || AEAD(frame)`, as voice does it. This works in
-  Chromium and WebKit (S3: 0 authentication failures in 2,700 frames, including
-  through 5 % loss and a late join).
+- **VP9:** `SFrameHeader || AEAD(frame)`, as voice does it.
 - **VP8:** `clear || SFrameHeader || AEAD(rest)`, where `clear` is the first
   10 bytes of a keyframe or 3 of a delta frame (Jitsi and LiveKit use the
   same split). `clear` is the RFC 9605 *metadata*, so it is authenticated:
   AAD = `header || clear`. The web `seal`/`open` already take `metadata` for
-  this (`apps/web/src/voice/sframe/suite.ts`). S3 ran this layout (Chromium
-  and WebKit, 0 failures).
+  this (`apps/web/src/voice/sframe/suite.ts`).
 - **Bounds.** Encrypted frames over 2 MiB are dropped before encryption. A
   1080p keyframe is about 200 KB.
 
-Browsers run the transform in a dedicated worker per screen transport, using
-the same key-control contract as the voice worker (`hold`, `supersede`,
-`install`, `activate`), fed by the same MLS controller. The voice worker code
-is factored so both workers share the key-state module
-(`apps/web/src/voice/sframe/state.ts`), with a media kind added to the key
-binding. The desktop's webview path runs the same worker. It needs the screen
-keys from its own MLS runtime, which already runs in the webview; native
-`voice_set_keys` is not involved.
+The spike evidence for these layouts is **layout feasibility only**. S3 and S5
+used a scrambling transform with a checksum, not AES-GCM. They show:
+
+- which byte layouts the browsers' packetizers and depacketizers carry
+  through the SFU;
+- that corruption would be detected.
+
+They do not measure real AEAD cost in the worker. PR 5 measures that: worker
+time per frame at 1080p60 keyframe sizes, in Chromium, WebKit and Firefox.
 
 Capability check: no `RTCRtpScriptTransform` means "Update your browser or use
-the desktop app to watch or share in encrypted channels". That is the same
-wording style as voice.
+the desktop app to watch or share in encrypted channels", the same wording
+style as voice.
 
 ### What the server still sees
 
@@ -534,10 +812,12 @@ after leaving the call answers `stale`.
 
 | Op | Body | Reply / effect |
 | --- | --- | --- |
-| `screen.offer` | `{call, participation, run, ssrc, rtx_ssrc, sdp}` | `{sdp}` answer; the screen transport. `run` restarts it like voice's run; `ssrc` is the send m-line's |
-| `screen.start` | `{call, participation, preset, surface}` (`surface`: `screen`/`window`/`tab`/`unknown`, display only) | `{share}`, a 16-byte random id; checks `share_screen`, limits, transport bound. Event `screen.started` to the channel |
+| `screen.start` | `{call, participation, preset, surface}` (`surface`: `screen`/`window`/`tab`/`unknown`, display only) | `{share}`, a 16-byte random id; checks `share_screen`, limits and budget. Not announced until its publish transport connects |
+| `screen.publish.offer` | `{share, ssrc, rtx_ssrc, sdp}` | `{sdp}`; the share's own publish transport. Its first connection announces `screen.started` to the channel. One per share, never renegotiated |
 | `screen.stop` | `{share}` | ok; event `screen.stopped {share, reason: "stopped"}` |
-| `screen.watch` | `{share}` | `{slot}`; the server assigns a slot, requests a keyframe, event `screen.slot` |
+| `screen.watch.offer` | `{call, participation, run, sdp}` | `{sdp}`; the session's watch transport (4 `recvonly` slots). `run` restarts it like voice's run |
+| `screen.watch` | `{share}` | `{slot}`; needs a connected watch transport; the server assigns a slot, opens a segment at the next keyframe (throttled request), event `screen.slot` |
+| `screen.focus` | `{share}` | ok; the share on the viewer's stage gets first claim on its bandwidth |
 | `screen.unwatch` | `{share}` | ok; the slot is freed |
 | `screen.keyframe` | `{share}` | ok; throttled PLI. Lets a viewer whose decryptor lost sync, for example after a key change, recover without re-watching |
 | `screen.stop_other` | `{share}` | needs `mute_members` in the channel and rank above the sharer; event `screen.stopped {reason: "moderator", by}` |
@@ -545,7 +825,7 @@ after leaving the call answers `stale`.
 Events:
 
 - `screen.started {share, client, channel, preset, surface}`;
-- `screen.stopped {share, reason: stopped|moderator|left|limit|transport}`;
+- `screen.stopped {share, reason: stopped|moderator|left|limit|transport|budget}`;
 - `screen.slot {binding, slot, share | null}`, like `voice.slot`;
 - `screen.paused {share, reason: bandwidth}` and `screen.resumed {share}`.
 
@@ -560,9 +840,11 @@ Lifecycle rules:
 - A share ends when the sharer stops, leaves or moves channel, disconnects,
   loses `share_screen` (overrides re-evaluate, like `speak`), the screen
   transport fails, or a moderator stops it.
-- A share's SSRC is retired like a voice SSRC.
-- A new share always gets a new share id and a fresh SSRC run, so no frame from
-  an old share appears in a new one.
+- A share's publish transport closes with it; its SSRCs die with that `Rtc`.
+- A new share always gets a new share id and a new publish transport, so no
+  frame from an old share can enter a new one.
+- Start, stop and start again while watching other shares touches only publish
+  transports; the watch transport and its slots are unaffected.
 
 TypeScript types are generated as today (`cargo test -p gwar-proto --features
 ts`). The handwritten client validators gain the new schemas (architecture.md,
@@ -665,7 +947,7 @@ person.
      anything depends on it.
 2. **Protocol, permission and share state (M, 3–4 days).**
    - `share_screen`;
-   - the requests and events above, except `screen.offer` and the slot ones;
+   - the requests and events above, except the `*.offer` and slot ones;
    - limits, lifecycle and the moderator stop;
    - `Client.sharing`;
    - shared role-resolution vectors;
@@ -673,25 +955,39 @@ person.
      `tests/moderation.rs`;
    - the client validators;
    - no media yet.
-3. **SFU video forwarding (L, 6–8 days).**
-   - The screen task and the datagram hand-off from the voice task;
-   - `screen.offer` and the screen `Rtc` (VP9/VP8 + RTX);
-   - share admission (SSRC binding, sizes, rate);
-   - slot assignment, `screen.watch`/`unwatch` and `screen.slot`;
-   - sequence and timestamp rewriting, PLI relay with throttle, NACK/RTX;
-   - the per-viewer egress BWE pause/resume;
-   - the per-share bitrate ceiling and the server budget;
-   - counters in `MediaCmd::Inspect`.
-   - Tests: Rust end-to-end in `tests/media.rs` style, using str0m clients
-     in frame mode as sharer and viewers. Cases: late join gets a keyframe;
-     injected loss is repaired by RTX without reaching the sharer; an unknown
-     SSRC is dropped; a stopped share frees slots; voice latency counters
-     unchanged under a 1080p60 share.
-   - A load measurement on the VM (CPU per Mbps), recorded here.
+3. **SFU video forwarding (L, 8–11 days).**
+   - The address-map dispatch and bounded hand-off from the voice task, and
+     the screen task.
+   - `screen.publish.offer` and `screen.watch.offer`, and their `Rtc`s
+     (VP9/VP8 + RTX), polling after every input.
+   - Share admission: the `ScreenOrigin` binding and byte/packet buckets.
+   - Slot assignment, `screen.watch`/`unwatch`/`focus` and `screen.slot`.
+   - Stable sequence mapping with segments, and timestamp offsets.
+   - Frame-granular drops with wait-for-keyframe, queue-age control, the one
+     keyframe throttle, and NACK/RTX.
+   - Per-viewer aggregate allocation with pause/resume.
+   - Cap-based reservations, continuous egress measurement and negotiation
+     limits.
+   - Counters in `MediaCmd::Inspect`.
+   - Tests: Rust end-to-end in `tests/media.rs` style, using str0m frame-mode
+     clients as sharer and viewers:
+     - late join decodes from a keyframe;
+     - **publisher-side** loss, reordering and RTX repair reach viewers
+       correctly (frames compared byte for byte);
+     - viewer-side loss is repaired without reaching the sharer;
+     - two shares on one constrained viewer pause the lower priority one;
+     - stale packets after a drop never cross a segment;
+     - unknown and stale-share SSRCs drop;
+     - a stopped share frees slots;
+     - the keyframe throttle holds under a request flood.
+   - **Voice acceptance:** the paired measurements and gate in "Voice headroom
+     and acceptance", including the `LATENCY_NET` `rate=` option and the
+     screen load generator.
+   - CPU per Mbps measured on the VM, recorded here.
 4. **Web sharing and watching, plaintext (L, 6–8 days).**
-   - `voice/screen.ts`: the screen transport (second `RTCPeerConnection`), the
-     capture with presets and constraints, codec preference, sender
-     parameters, receiver `jitterBufferTarget`;
+   - `voice/screen.ts`: publish and watch transports, the capture with presets
+     and constraints, codec preference, sender parameters with uplink
+     headroom, and receiver `jitterBufferTarget`;
    - the stage UI, LIVE badges, sharing bar, fullscreen and PiP.
    - Unit tests for the state machine.
    - Playwright `e2e/screen.mjs` against a real local server:
@@ -700,29 +996,60 @@ person.
        works headless);
      - WebKit sharer with a canvas track injected through the test hook;
      - viewers in both engines check decoded frames and a stamped barcode
-       (the S3 technique), late join, stop, moderator stop and the slot limit.
-5. **Encrypted shares (M–L, 5–7 days).**
+       (the S3 technique);
+     - late join, start → stop → start while watching two other shares,
+       moderator stop and the slot limit.
+5. **Encrypted shares (L, 8–10 days).**
    - Screen key derivation in `gwar-mls` (agent and wasm), with the
-     `"gwar screen v1"` label and vectors;
-   - the key-state module shared by the voice and screen workers;
-   - the VP9 and VP8 frame layouts, with RFC 9605 test vectors including
-     metadata;
-   - fail closed and "Securing screen share…";
+     `"gwar screen v1"` label and vectors.
+   - The call controller's per-kind endpoints: attach and restart per kind,
+     audio-driven acks, barriers and holds to every endpoint, the single
+     activation decision, the screen floor and own-update rule, and the
+     worker that outlives transports.
+   - The VP9 and VP8 frame layouts, with RFC 9605 test vectors including
+     metadata.
+   - Keyframe recovery: the receiver gap tracking, `screen.keyframe` retries
+     and the sender `generateKeyFrame()` after activation.
+   - Fail closed and "Securing screen share…".
    - e2e.md "What the server still sees".
-   - Playwright `e2e:screen-mls`: encrypted share across Chromium and WebKit;
-     a member removed mid-share stops decrypting; a new joiner watches after
-     activation.
-6. **Desktop enablement (M, 2–4 days).**
-   - The desktop UI uses the web screen transport beside the native voice
-     engine. The desktop's native engine is unaffected.
+   - AEAD worker cost measured at 1080p60 in all three engines.
+   - Tests:
+     - controller unit tests: a slow screen install never delays audio acks
+       or replaces the audio endpoint;
+     - a screen-worker crash commits an own update and never reuses a
+       counter;
+     - a removal holds both endpoints;
+     - Playwright `e2e:screen-mls`: an encrypted share across Chromium and
+       WebKit; a member removed mid-share stops decrypting; a joiner watches
+       after activation; a viewer installing an epoch late recovers through a
+       keyframe.
+6. **Desktop enablement (M, 3–4 days).**
+   - The desktop UI runs the web screen transports and the screen worker
+     beside the native voice engine. The native engine and `voice_set_keys`
+     are unaffected.
    - The button is hidden on Linux, and gated to macOS 14+.
    - CSP review: no change expected, since WebRTC is not governed by
      `connect-src`.
-   - The native-voice Playwright run (`e2e:native-voice`) extended with a
-     share watched by a browser.
+   - The native-voice Playwright run (`e2e:native-voice`) extended with an
+     encrypted share watched by a browser, with native voice in the same call.
    - The manual checklist from PR 1 repeated on release builds.
 
-Phase 1 total: about **5–7 weeks**.
+**Release acceptance (before the feature is announced)** is a manual matrix:
+
+- sharers and viewers on Chrome, Firefox and Safari, and the desktop on
+  macOS and Windows, plaintext and encrypted;
+- Firefox both shares and watches. Playwright's Firefox did not start in the
+  spike environment, so this interop is checked by hand, or in CI if it runs
+  there.
+
+Phase 1 total: about **8–11 weeks**. The earlier 5–7-week figure assumed the
+simpler forwarding and key model the review rejected. The estimate stays
+uncertain until three things are known:
+
+- PR 1 shows whether the WKWebView picker works without changes;
+- PR 3's voice gate passes or forces more isolation (its own thread or port);
+- PR 5's controller change lands without reworking the voice activation
+  tests.
 
 ### Phase 2: quality and reach
 
@@ -765,14 +1092,24 @@ Phase 1 total: about **5–7 weeks**.
   drops to 720p60 when `qualityLimitationReason` is `cpu`; H.264 hardware in
   phase 2.
 - **SFU CPU on the VM.** Extrapolated from an M5 (PR 3 measures).
+- **Voice under video load.** Isolation is designed, not yet measured. PR 3's
+  paired gate decides whether the shared-runtime task is enough, or whether
+  the screen task needs its own thread or port.
+- **Controller complexity.** Two endpoint kinds under one MLS call controller
+  is the riskiest change to already-reviewed encrypted-voice code (PR 5). It
+  needs its own review round, as voice 5c/5d had.
 - **WebView2 picker bugs** (#5173 size, #5763 deadlock).
 - **Firefox:** no `contentHint`, no `scalabilityMode`, no audio. It works, but
   it is the lowest-quality sharer.
-- **Oracle tenancy limits** (open question 5).
-- **Spike limitations.** One machine, loopback, synthetic content, software
-  encoders, heavy background load. No real network, no real display, no
-  Firefox: the Playwright Firefox build did not start in this environment, so
-  Firefox rows come from MDN, not from a run.
+- **Oracle compute allowance** (open question 5).
+- **Spike limitations.**
+  - One machine, loopback, synthetic content, software encoders and heavy
+    background load.
+  - No real network and no real display.
+  - The SFrame stand-in was a checksum, not AEAD.
+  - No Firefox: the Playwright Firefox build did not start in this
+    environment, so Firefox rows come from MDN, not from a run. Release
+    acceptance covers Firefox interop.
 
 ## Spikes
 
@@ -821,12 +1158,16 @@ WebKit 26.6; Firefox did not launch here.
   drop RTP toward subscribers.
 - The page drew screen-like content with a 20-bit timestamp barcode into a
   canvas track (`contentHint` detail unless noted), at a 4 Mbps cap.
-- An encoded transform emulated SFrame:
+- An encoded transform emulated SFrame's **byte layout**, without real
+  cryptography (layout feasibility only):
   - **whole** = 2-byte header + scrambled frame + 16-byte tag;
   - **clear** = codec prefix clear + scrambled rest + tag.
 
   Receivers verified a checksum, so "fails" means corrupted frames. 10 s per
   run.
+- The S3 SFU renumbered packets in arrival order. That was harmless here only
+  because its loss was injected *after* the SFU, toward viewers; S5 shows the
+  failure with publisher-side loss.
 
 | Engine, codec, layout | Frames decoded (per viewer) | Notes |
 | --- | --- | --- |
@@ -862,6 +1203,33 @@ covers them.
   stuck.
 - So the e2e suite can exercise real capture with no OS permission.
 
+**S5: publisher-side loss and reordering (added after review).**
+
+- The same kind of SFU, with impairments on the *publisher's ingress*: 3 %
+  RTP loss and 2 % of packets held behind the next one. str0m's NACKs made the
+  publisher retransmit over RTX.
+- Two forwarding rules were compared:
+  - **arrival**: renumber in arrival order;
+  - **source**: `out = base + (src - base_src)` on str0m's extended source
+    sequence number.
+- Chromium 153, 720p30, one viewer, 15 s per run, about 420 frames encoded.
+
+| Codec, layout | Mapping | Frames decoded | Corrupted frames (checksum) | Viewer NACKs | Publisher NACKs / RTX |
+| --- | --- | --- | --- | --- | --- |
+| VP9 whole | arrival | 2 | 98 of 390 | 0 | 92 / 105 |
+| VP9 whole | source | **423** | **0** of 423 | 131 | 72 / 83 |
+| VP8 clear | arrival | 7 | 95 of 386 | 0 | 77 / 87 |
+| VP8 clear | source | **412** | **0** of 412 | 153 | 84 / 98 |
+| VP8 plaintext | source | **413** | n/a | 160 | 96 / 121 |
+
+- With source mapping: no freezes, no PLIs and 0 packets lost at the viewer.
+  The viewers' NACKs for gaps the SFU had not yet repaired went unanswered,
+  and the SFU's later repair filled them.
+- The first version of the spike lost repaired packets. It called
+  `handle_input` twice before `poll_output`, and RTP mode keeps a single
+  pending packet. Polling after every input fixed it. The rule is in "The
+  SFU" above.
+
 ## Open questions for the owner
 
 1. **Linux desktop.** Is it acceptable that the Linux desktop app cannot share
@@ -874,9 +1242,13 @@ covers them.
    (`share_screen` in the Member role), or only roles the admin picks?
 4. **Default limits.** Are 4 shares per channel, 25 viewers per share, an
    8 Mbps cap and a 300 Mbps server budget right for the public server?
-5. **Oracle VM tenancy.** Is the VM's tenancy pay-as-you-go (keeps 4 cores /
-   24 GB free) or free-only (Oracle cut it to 2 cores / 12 GB in June)? Either
-   is enough for phase 1, but the limits above should match.
+5. **Oracle VM billing.** Oracle's Always Free page now gives every tenancy
+   2 cores / 12 GB of A1 for free (1,500 OCPU-hours and 9,000 GB-hours a
+   month). The VM was made with 4 / 24.
+   - Is the tenancy free-only (the excess must be resized away) or paid (the
+     excess is billed)?
+   - Phase 1 fits in 2 cores either way. Should the VM be resized to stay
+     free?
 6. **Shared audio.** Is sharing without sound acceptable for the first
    release, with sound (tab and system audio) following in phase 2?
 7. **macOS 13 and older.** Is it acceptable that screen sharing needs
