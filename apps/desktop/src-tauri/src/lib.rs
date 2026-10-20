@@ -12,7 +12,10 @@ mod voice;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use tauri::{Manager, WindowEvent};
+use tauri::{
+    Manager, WindowEvent,
+    webview::{PermissionKind, PermissionResponse},
+};
 
 /// Debug-only hooks used by automated verification. They are compiled out of
 /// release builds (the commands exist but answer with nothing).
@@ -22,6 +25,13 @@ mod debug {
     #[tauri::command]
     pub fn debug_autoconnect() -> Option<String> {
         if cfg!(debug_assertions) { std::env::var("GWAR_AUTOCONNECT").ok() } else { None }
+    }
+
+    /// `GWAR_CAPTURE_CHECK=1` shows the screen-capture check page instead of
+    /// the app (docs/screen-share.md, PR 1).
+    #[tauri::command]
+    pub fn debug_capture_check() -> bool {
+        cfg!(debug_assertions) && std::env::var_os("GWAR_CAPTURE_CHECK").is_some()
     }
 
     #[tauri::command]
@@ -36,6 +46,20 @@ mod debug {
 /// nonce counters are never logged (docs/e2e-build.md), whatever RUST_LOG says.
 fn loggable_target(target: &str) -> bool {
     target != "sframe" && !target.starts_with("sframe::")
+}
+
+/// Media permissions of the webview. Only the main window may capture the
+/// display (screen sharing). The microphone and camera are always denied:
+/// voice is captured natively, so the renderer never needs them. Without a
+/// handler, wry grants every microphone and camera request on macOS.
+fn webview_permission(window: &str, kind: PermissionKind) -> PermissionResponse {
+    match kind {
+        PermissionKind::DisplayCapture if window == "main" => PermissionResponse::Allow,
+        PermissionKind::DisplayCapture | PermissionKind::Microphone | PermissionKind::Camera => {
+            PermissionResponse::Deny
+        }
+        _ => PermissionResponse::Default,
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -64,6 +88,7 @@ pub fn run() {
         .manage(ts::Ts::default())
         .manage(files::Files::default())
         .manage(tray::CloseToTray(AtomicBool::new(true)))
+        .on_permission_request(|webview, kind| webview_permission(webview.label(), kind))
         .setup(|app| {
             tray::install(app.handle())?;
             Ok(())
@@ -116,6 +141,7 @@ pub fn run() {
             tray::tray_set_state,
             tray::set_close_to_tray,
             debug::debug_autoconnect,
+            debug::debug_capture_check,
             debug::debug_log,
         ]);
 
@@ -129,6 +155,28 @@ pub fn run() {
             app.state::<ts::Ts>().shutdown();
         }
     });
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::webview_permission;
+    use tauri::webview::{PermissionKind, PermissionResponse};
+
+    #[test]
+    fn only_the_main_window_captures_the_display() {
+        assert_eq!(webview_permission("main", PermissionKind::DisplayCapture), PermissionResponse::Allow);
+        assert_eq!(webview_permission("popout", PermissionKind::DisplayCapture), PermissionResponse::Deny);
+    }
+
+    #[test]
+    fn microphone_and_camera_are_always_denied() {
+        for window in ["main", "popout"] {
+            for kind in [PermissionKind::Microphone, PermissionKind::Camera] {
+                assert_eq!(webview_permission(window, kind), PermissionResponse::Deny, "{window} {kind}");
+            }
+        }
+        assert_eq!(webview_permission("main", PermissionKind::Notifications), PermissionResponse::Default);
+    }
 }
 
 #[cfg(test)]

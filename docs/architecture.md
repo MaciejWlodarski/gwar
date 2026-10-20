@@ -522,6 +522,12 @@ permissions are absent. Custom commands below are app-owned IPC and need their
 own validation. A compromised renderer still has audio, TeamSpeak networking
 and identity-write access; CSP and frame validation reduce that exposure.
 
+Webview media permissions are app-owned too: only `main` may capture the
+display (screen sharing, docs/screen-share.md), and the webview microphone and
+camera are always denied, because voice is captured natively. Without this
+handler wry grants every microphone and camera request on macOS. WebKit on
+macOS and WebView2 route display capture through their own system pickers.
+
 | Command | Risk and boundary |
 | --- | --- |
 | `voice_start` | High: native UDP/WebRTC and microphone; selected server host, one run. |
@@ -558,6 +564,7 @@ and identity-write access; CSP and frame validation reduce that exposure.
 | `set_close_to_tray` | Low: changes close behavior. |
 | `debug_autoconnect` | Low: reads one dedicated environment setting in debug builds; returns nothing in release. |
 | `debug_log` | Low: debug log text; no effect in release. |
+| `debug_capture_check` | Low: reads one dedicated environment setting in debug builds; returns false in release. |
 
 Unused `debug_snapshot` IPC and file-driven webview evaluation were removed.
 Confirmed export/vault sync still passes private TeamSpeak text to JS for vault
