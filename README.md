@@ -498,6 +498,10 @@ System Settings entry) to the terminal you started it from; test the real flow
 with `pnpm --filter desktop build`. To reset a decision while testing:
 `tccutil reset Microphone app.gwar.desktop`.
 
+Building the desktop bundle (`pnpm --filter desktop build`) also writes the
+licenses of everything it ships into it, which needs cargo-about:
+`cargo install cargo-about --version 0.9.2 --locked --features cli`.
+
 ## TeamSpeak compatibility
 
 Official TeamSpeak clients only accept servers that hold a license issued by

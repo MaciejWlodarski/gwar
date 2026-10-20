@@ -103,7 +103,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: stable
-      # Keeps the installed cargo-audit between runs.
+      # Keeps the installed cargo-audit and cargo-about between runs.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -116,6 +116,11 @@ jobs:
       - name: libcrux-kem stays out of the build (see .cargo/audit.toml)
         run: test -z "$(cargo tree -i libcrux-kem --target all 2>/dev/null)"
       - run: pnpm audit --prod
+      - run: cargo install cargo-about --version 0.9.2 --locked --features cli
+      - name: Every crate the desktop app ships has an accepted license (scripts/licenses)
+        run: |
+          cargo about generate --fail --locked --format json -c scripts/licenses/about.toml -m apps/desktop/src-tauri/Cargo.toml > /dev/null
+          cargo about generate --fail --locked --format json -c scripts/licenses/about.toml -m crates/gwar-mls-wasm/Cargo.toml --target wasm32-unknown-unknown > /dev/null
 
   web:
     needs: [mls-wasm, denoise-wasm]

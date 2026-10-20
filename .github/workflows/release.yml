@@ -112,6 +112,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: desktop-${{ matrix.name }}
+      # The bundle's third-party licenses (scripts/licenses/build.mjs, run by the Tauri build).
+      - run: cargo install cargo-about --version 0.9.2 --locked --features cli
       - name: Linux libraries
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libasound2-dev patchelf xdg-utils cmake
