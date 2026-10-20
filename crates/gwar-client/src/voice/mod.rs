@@ -58,7 +58,7 @@ pub struct Controls {
     ptt: AtomicBool,
     vad_threshold: AtomicU32,
     push_to_talk: AtomicBool,
-    /// [`NoiseSuppression`], as `to_u8`.
+    /// [`NoiseSuppression`], in percent.
     noise_suppression: AtomicU8,
     master: AtomicU32,
     slot_gain: [AtomicU32; AUDIO_SLOTS],
@@ -84,7 +84,7 @@ impl Default for Controls {
             ptt: AtomicBool::new(false),
             vad_threshold: AtomicU32::new((-50.0f32).to_bits()),
             push_to_talk: AtomicBool::new(false),
-            noise_suppression: AtomicU8::new(NoiseSuppression::default().to_u8()),
+            noise_suppression: AtomicU8::new(NoiseSuppression::default().as_percent()),
             master: AtomicU32::new(1.0f32.to_bits()),
             slot_gain: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             input_level: AtomicU32::new((-100.0f32).to_bits()),
@@ -243,7 +243,7 @@ impl VoiceHandle {
     }
     /// Background-noise suppression of the microphone (see [`NoiseSuppression`]).
     pub fn set_noise_suppression(&self, mode: NoiseSuppression) {
-        self.controls.noise_suppression.store(mode.to_u8(), Ordering::Relaxed);
+        self.controls.noise_suppression.store(mode.as_percent(), Ordering::Relaxed);
     }
     pub fn set_master_gain(&self, gain: f32) {
         set_f(&self.controls.master, gain.clamp(0.0, 2.0));
@@ -625,7 +625,7 @@ fn pipeline<const CAPTURE: usize>(
             // encoder, and the RTP level the server's speech gate reads, get the cleaned audio.
             // Suppression runs on every frame, sent or not, so its state follows the audio.
             let db = level_db(&capture.samples);
-            let mode = NoiseSuppression::from_u8(controls.noise_suppression.load(Ordering::Relaxed));
+            let mode = NoiseSuppression::percent(controls.noise_suppression.load(Ordering::Relaxed));
             denoiser.process(&mut capture.samples, mode, next_position == Some(capture_position));
             next_position = Some(capture_position + CAPTURE as u64);
             let frame = &capture.samples;

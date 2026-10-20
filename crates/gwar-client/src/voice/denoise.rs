@@ -2,294 +2,379 @@
 //! 10 ms frame goes through it before the encoder; the level meter and the voice-activity gate
 //! still measure the microphone as captured. It runs on the device, before encryption.
 //!
-//! Both modes work on 48 kHz frames of exactly our 480 samples and add one frame (10 ms) of
-//! delay, their overlap-add; neither looks ahead. Measured on speech with noise at 5 dB SNR
-//! (docs/latency.md, "Noise suppression"):
-//!
-//! - `Strong`: DeepFilterNet3's low-latency model (no lookahead), run with tract. Much cleaner:
-//!   +13 dB SI-SDR in white noise, +10 dB for a fan, +12 dB for typing; ~0.5 ms of CPU per frame.
-//!   Its model takes ~0.3 s to load, on a thread of its own; until then `Strong` runs as `Light`.
-//! - `Light`: RNNoise (`nnnoiseless`, pure Rust): +9, +6 and +5 dB; 0.04 ms per frame.
+//! One model for every kind of noise: DeepFilterNet3's low-latency model (no lookahead), run with
+//! tract on 48 kHz frames of exactly our 480 samples. It adds one frame (10 ms) of delay, its
+//! overlap-add, and takes ~1.3 ms of CPU per frame. How hard it works is one setting, a strength:
+//! the cleaned audio is mixed with what was captured so that no sound goes down by more than a set
+//! number of dB (DeepFilterNet's attenuation limit).
 
-use nnnoiseless::DenoiseState;
-
+#[cfg(any(feature = "deep-filter", test))]
 use super::FRAME;
 
-/// How much background noise to take out. Off unless the app chooses (the desktop app's default
-/// is `Strong`): tests and tools that send tones through the pipeline get them through untouched.
+/// How much background noise to take out, in percent: 0 is off, 100 all the model can. In
+/// between, no sound is taken down by more than half a dB per percent (50 % caps it at 25 dB). Off
+/// unless the app chooses (the desktop app's default is [`NoiseSuppression::FULL`]): tests and
+/// tools that send tones through the pipeline get them through untouched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum NoiseSuppression {
-    #[default]
-    Off,
-    /// RNNoise.
-    Light,
-    /// DeepFilterNet3 (low latency); RNNoise where it is not built in or not loaded yet.
-    Strong,
-}
+pub struct NoiseSuppression(u8);
 
 impl NoiseSuppression {
-    pub(crate) fn to_u8(self) -> u8 {
-        match self {
-            Self::Off => 0,
-            Self::Light => 1,
-            Self::Strong => 2,
-        }
+    pub const OFF: Self = Self(0);
+    pub const FULL: Self = Self(100);
+
+    /// Above 100 counts as 100.
+    pub const fn percent(percent: u8) -> Self {
+        Self(if percent > 100 { 100 } else { percent })
     }
 
-    pub(crate) fn from_u8(v: u8) -> Self {
-        match v {
-            1 => Self::Light,
-            2 => Self::Strong,
-            _ => Self::Off,
-        }
+    pub const fn as_percent(self) -> u8 {
+        self.0
+    }
+
+    fn is_off(self) -> bool {
+        self.0 == 0
+    }
+
+    /// DeepFilterNet's attenuation limit; 100 dB or more is none.
+    #[cfg_attr(not(feature = "deep-filter"), allow(dead_code))]
+    fn limit_db(self) -> f32 {
+        if self.0 >= 100 { 100.0 } else { f32::from(self.0) * 0.5 }
     }
 }
 
 /// DeepFilterNet3's low-latency model on a worker thread of the pipeline's own: tract's model is
 /// tied to the thread that built it, and building it takes ~0.3 s, which the pipeline must not
-/// wait for. The pipeline hands it one frame at a time and waits for that frame (~0.5 ms).
+/// wait for. The pipeline hands it one frame at a time and waits for that frame.
 #[cfg(feature = "deep-filter")]
 mod deep {
     use std::{
         sync::{
             Arc,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicU8, Ordering},
             mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel},
         },
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use df::tract::{DfParams, DfTract, RuntimeParams};
 
     use super::FRAME;
 
-    /// Longer than any frame takes (a few ms at worst): past it the worker counts as gone.
-    const PATIENCE: Duration = Duration::from_millis(40);
+    /// libDF's thresholds on its estimate of the local SNR (dB), as its own `deep-filter` command
+    /// sets them: below `MIN_DB` a frame is taken for noise alone and silenced, above `MAX_DB` for
+    /// clean speech and left alone. The library's defaults (-10, and 30 and 20 for its two stages)
+    /// leave more frames alone: with a quiet background, half the gain (docs/latency.md).
+    const MIN_DB: f32 = -15.0;
+    const MAX_DB: f32 = 35.0;
+    /// DeepFilterNet's post-filter at its usual strength: takes noise between words further down.
+    const POST_FILTER_BETA: f32 = 0.02;
+    /// libDF: an attenuation limit of 100 dB or more is none.
+    const NO_LIMIT: f32 = 100.0;
+
+    /// A frame that takes longer than this holds up the pipeline: it is passed on as captured.
+    const PATIENCE: Duration = Duration::from_millis(20);
+    /// The model cannot keep up once the pipeline waits for it this long on average (half of
+    /// each 10 ms frame; ~1.3 ms on Apple Silicon), or once this many frames in a row (100 ms)
+    /// pass uncleaned. A one-off stall of the worker costs a few frames, not the suppression.
+    const BUDGET: Duration = Duration::from_millis(5);
+    const MISSED: u32 = 10;
+
+    const LOADING: u8 = 0;
+    const READY: u8 = 1;
+    const FAILED: u8 = 2;
 
     struct Job {
+        seq: u64,
         frame: Box<[f32; FRAME]>,
         /// Start over from the untouched model first (a gap in the capture).
         reset: bool,
+        limit_db: f32,
+    }
+
+    struct Done {
+        seq: u64,
+        frame: Box<[f32; FRAME]>,
+    }
+
+    pub(super) enum Outcome {
+        Cleaned,
+        /// Left as captured: the model was late with it.
+        Skipped,
+        /// The model failed or cannot keep up; this frame is left as captured or cleaned, as it came.
+        Gone,
     }
 
     pub(super) struct Worker {
         jobs: SyncSender<Job>,
-        done: Receiver<Box<[f32; FRAME]>>,
-        ready: Arc<AtomicBool>,
+        done: Receiver<Done>,
+        state: Arc<AtomicU8>,
         /// A frame buffer that travels to the worker and back, so nothing is allocated per frame.
         spare: Option<Box<[f32; FRAME]>>,
+        seq: u64,
         /// The next frame starts from the untouched model.
         reset: bool,
-        broken: bool,
+        /// The pipeline's wait per frame, averaged over ~16 frames (seconds).
+        load: f32,
+        /// Frames in a row passed on as captured.
+        missed: u32,
     }
 
     impl Worker {
         pub(super) fn start() -> Option<Self> {
             let (jobs, job_rx) = sync_channel::<Job>(1);
             let (done_tx, done) = sync_channel(1);
-            let ready = Arc::new(AtomicBool::new(false));
-            let ready_flag = ready.clone();
+            let state = Arc::new(AtomicU8::new(LOADING));
+            let flag = state.clone();
             std::thread::Builder::new()
                 .name("gwar-denoise".into())
                 .spawn(move || {
-                    let base = match DfTract::new(DfParams::default(), &RuntimeParams::default_with_ch(1)) {
+                    let params = RuntimeParams::default_with_ch(1)
+                        .with_thresholds(MIN_DB, MAX_DB, MAX_DB)
+                        .with_post_filter(POST_FILTER_BETA);
+                    let base = match DfTract::new(DfParams::default(), &params) {
                         Ok(model) if model.hop_size == FRAME => model,
                         Ok(model) => {
+                            flag.store(FAILED, Ordering::Release);
                             return tracing::warn!(
                                 hop = model.hop_size,
-                                "DeepFilterNet hop is not 10 ms; using RNNoise"
+                                "DeepFilterNet hop is not 10 ms; no noise suppression"
                             );
                         }
-                        Err(e) => return tracing::warn!("DeepFilterNet unavailable, using RNNoise: {e:#}"),
+                        Err(e) => {
+                            flag.store(FAILED, Ordering::Release);
+                            return tracing::warn!("DeepFilterNet unavailable, no noise suppression: {e:#}");
+                        }
                     };
                     // Frames it holds hold up the pipeline too.
                     let _priority = super::super::priority::Priority::promote();
                     let mut live = base.clone();
+                    let mut limit = NO_LIMIT;
                     let mut noisy = ndarray::Array2::<f32>::zeros((1, FRAME));
                     let mut clean = ndarray::Array2::<f32>::zeros((1, FRAME));
-                    ready_flag.store(true, Ordering::Release);
-                    while let Ok(Job { mut frame, reset }) = job_rx.recv() {
+                    flag.store(READY, Ordering::Release);
+                    while let Ok(Job { seq, mut frame, reset, limit_db }) = job_rx.recv() {
                         if reset {
                             live = base.clone();
+                            limit = NO_LIMIT;
+                        }
+                        if limit_db != limit {
+                            live.set_atten_lim(limit_db);
+                            limit = limit_db;
                         }
                         noisy.row_mut(0).iter_mut().zip(frame.iter()).for_each(|(n, s)| *n = *s);
                         if let Err(e) = live.process(noisy.view(), clean.view_mut()) {
-                            tracing::warn!("DeepFilterNet failed, using RNNoise: {e:#}");
-                            return;
+                            flag.store(FAILED, Ordering::Release);
+                            return tracing::warn!("DeepFilterNet failed: {e:#}");
                         }
                         frame.iter_mut().zip(clean.row(0).iter()).for_each(|(s, c)| *s = c.clamp(-1.0, 1.0));
-                        if done_tx.send(frame).is_err() {
+                        if done_tx.send(Done { seq, frame }).is_err() {
                             return;
                         }
                     }
                 })
                 .ok()?;
-            Some(Self { jobs, done, ready, spare: Some(Box::new([0.0; FRAME])), reset: false, broken: false })
+            Some(Self::new(jobs, done, state))
         }
 
-        /// A stand-in worker: hands the first `answers` frames back unchanged, then takes frames
-        /// and never answers (stuck).
+        fn new(jobs: SyncSender<Job>, done: Receiver<Done>, state: Arc<AtomicU8>) -> Self {
+            Self { jobs, done, state, spare: Some(Box::new([0.0; FRAME])), seq: 0, reset: false, load: 0.0, missed: 0 }
+        }
+
+        /// A stand-in worker: halves each frame after waiting `delays[i]` for the i-th (none past
+        /// the list); `None` takes the frame and never answers again.
         #[cfg(test)]
-        pub(super) fn fake(answers: usize) -> Self {
+        pub(super) fn fake(delays: Vec<Option<Duration>>) -> Self {
             let (jobs, job_rx) = sync_channel::<Job>(1);
             let (done_tx, done) = sync_channel(1);
             std::thread::spawn(move || {
-                let mut n = 0;
-                while let Ok(Job { frame, .. }) = job_rx.recv() {
-                    n += 1;
-                    if n <= answers && done_tx.send(frame).is_err() {
+                let mut delays = delays.into_iter();
+                while let Ok(Job { seq, mut frame, .. }) = job_rx.recv() {
+                    match delays.next() {
+                        Some(None) => return std::thread::sleep(Duration::from_secs(3600)),
+                        Some(Some(delay)) => std::thread::sleep(delay),
+                        None => {}
+                    }
+                    frame.iter_mut().for_each(|s| *s *= 0.5);
+                    if done_tx.send(Done { seq, frame }).is_err() {
                         return;
                     }
                 }
             });
-            Self {
-                jobs,
-                done,
-                ready: Arc::new(AtomicBool::new(true)),
-                spare: Some(Box::new([0.0; FRAME])),
-                reset: false,
-                broken: false,
-            }
+            Self::new(jobs, done, Arc::new(AtomicU8::new(READY)))
         }
 
-        pub(super) fn ready(&self) -> bool {
-            !self.broken && self.ready.load(Ordering::Acquire)
+        /// `Some(true)` once the model is there, `Some(false)` while it loads, `None` if it could not.
+        pub(super) fn ready(&self) -> Option<bool> {
+            match self.state.load(Ordering::Acquire) {
+                LOADING => Some(false),
+                READY => Some(true),
+                _ => None,
+            }
         }
 
         pub(super) fn reset(&mut self) {
             self.reset = true;
         }
 
-        /// Cleans `chunk` in place; false (and `chunk` untouched) once the worker is gone. Waits
-        /// [`PATIENCE`] at most: the hand-over never blocks (the worker has taken every earlier
-        /// frame before answering it, so its queue is empty unless it is gone or stuck).
-        pub(super) fn process(&mut self, chunk: &mut [f32; FRAME]) -> bool {
-            let Some(mut frame) = self.spare.take() else {
-                self.broken = true;
-                return false;
-            };
+        /// Cleans `chunk` in place, waiting [`PATIENCE`] at most; past that it is left as captured.
+        /// The hand-over never blocks: the worker has taken every earlier frame unless one is late.
+        pub(super) fn process(&mut self, chunk: &mut [f32; FRAME], limit_db: f32) -> Outcome {
+            let started = Instant::now();
+            // Only after a late frame is the buffer still away.
+            let mut frame = self.spare.take().unwrap_or_else(|| Box::new([0.0; FRAME]));
             frame.copy_from_slice(chunk);
-            match self.jobs.try_send(Job { frame, reset: std::mem::take(&mut self.reset) }) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
-                    self.broken = true;
-                    return false;
+            self.seq += 1;
+            let job = Job { seq: self.seq, frame, reset: std::mem::take(&mut self.reset), limit_db };
+            let cleaned = match self.jobs.try_send(job) {
+                Ok(()) => self.answer(chunk, started + PATIENCE),
+                // Still on the frame before the last: this one never reaches the model.
+                Err(TrySendError::Full(job)) => {
+                    self.spare = Some(job.frame);
+                    self.reset |= job.reset;
+                    Some(false)
                 }
+                Err(TrySendError::Disconnected(_)) => None,
+            };
+            let Some(cleaned) = cleaned else { return Outcome::Gone };
+            self.load += (started.elapsed().as_secs_f32() - self.load) / 16.0;
+            self.missed = if cleaned { 0 } else { self.missed + 1 };
+            if self.load > BUDGET.as_secs_f32() || self.missed >= MISSED {
+                tracing::warn!(
+                    load_ms = self.load * 1e3,
+                    missed = self.missed,
+                    "DeepFilterNet cannot keep up; noise suppression paused"
+                );
+                Outcome::Gone
+            } else if cleaned {
+                Outcome::Cleaned
+            } else {
+                Outcome::Skipped
             }
-            match self.done.recv_timeout(PATIENCE) {
-                Ok(frame) => {
-                    chunk.copy_from_slice(&frame[..]);
-                    self.spare = Some(frame);
-                    true
-                }
-                Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {
-                    // A late answer would belong to this frame and arrive for the next: never trust it.
-                    tracing::warn!("DeepFilterNet did not answer in time; using RNNoise");
-                    self.broken = true;
-                    false
+        }
+
+        /// Waits for the answer to the frame just handed over: `Some(true)` with `chunk` cleaned,
+        /// `Some(false)` past `deadline`, `None` if the worker is gone.
+        fn answer(&mut self, chunk: &mut [f32; FRAME], deadline: Instant) -> Option<bool> {
+            loop {
+                match self.done.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(Done { seq, frame }) if seq == self.seq => {
+                        chunk.copy_from_slice(&frame[..]);
+                        self.spare = Some(frame);
+                        return Some(true);
+                    }
+                    // A late answer, for a frame already passed on as captured.
+                    Ok(Done { frame, .. }) => {
+                        self.spare.get_or_insert(frame);
+                    }
+                    Err(RecvTimeoutError::Timeout) => return Some(false),
+                    Err(RecvTimeoutError::Disconnected) => return None,
                 }
             }
         }
     }
 }
 
-/// RNNoise takes 16-bit sample values as floats.
-const PCM16: f32 = 32768.0;
+/// After the model stops keeping up, the wait before it is started again; doubles each time.
+#[cfg(feature = "deep-filter")]
+const RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+#[cfg(feature = "deep-filter")]
+const MAX_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
+
+#[cfg(feature = "deep-filter")]
+enum Model {
+    /// Started the first time suppression is on.
+    Unstarted,
+    Running(deep::Worker),
+    /// Could not keep up: started again (from scratch) at `retry`.
+    Paused {
+        retry: std::time::Instant,
+    },
+    /// Could not load, or failed on a frame.
+    Unavailable,
+}
 
 /// The suppressor of one capture pipeline: its state follows the audio, so it starts over after a
-/// gap in the capture and when the mode changes (the old state would smear one into the other).
+/// gap in the capture and when it is turned on (the old state would smear one into the other).
+/// Audio passes as captured while the model loads (~0.3 s, so joining a channel never waits) and
+/// while it is paused.
 pub(crate) struct Denoiser {
-    /// The engine the state below belongs to.
-    running: NoiseSuppression,
-    rnnoise: Box<DenoiseState<'static>>,
-    input: [f32; FRAME],
-    output: [f32; FRAME],
-    /// Started the first time `Strong` is asked for; `None` after that if it could not start or failed.
+    on: bool,
     #[cfg(feature = "deep-filter")]
-    deep: Option<deep::Worker>,
+    model: Model,
     #[cfg(feature = "deep-filter")]
-    deep_started: bool,
+    retry_wait: std::time::Duration,
 }
 
 impl Denoiser {
     pub(crate) fn new() -> Self {
-        // Allocated here, on the pipeline's start; `process` allocates only when starting over.
         Self {
-            running: NoiseSuppression::Off,
-            rnnoise: DenoiseState::new(),
-            input: [0.0; FRAME],
-            output: [0.0; FRAME],
+            on: false,
             #[cfg(feature = "deep-filter")]
-            deep: None,
+            model: Model::Unstarted,
             #[cfg(feature = "deep-filter")]
-            deep_started: false,
+            retry_wait: RETRY,
         }
-    }
-
-    /// The engine `mode` runs on now: `Strong` is `Light` until DeepFilterNet is there.
-    fn engine(&mut self, mode: NoiseSuppression) -> NoiseSuppression {
-        #[cfg(feature = "deep-filter")]
-        if mode == NoiseSuppression::Strong {
-            if !self.deep_started {
-                // Loads in the background; RNNoise stands in for the ~0.3 s it takes.
-                self.deep_started = true;
-                self.deep = deep::Worker::start();
-            }
-            if self.deep.as_ref().is_some_and(deep::Worker::ready) {
-                return NoiseSuppression::Strong;
-            }
-        }
-        if mode == NoiseSuppression::Off { NoiseSuppression::Off } else { NoiseSuppression::Light }
     }
 
     /// Cleans `frame` (any whole number of 10 ms frames) in place. `continues` is false when the
     /// capture skipped samples since the previous call.
     pub(crate) fn process(&mut self, frame: &mut [f32], mode: NoiseSuppression, continues: bool) {
-        let engine = self.engine(mode);
-        if engine != self.running || !continues {
-            // A fresh state: the old one would smear the earlier audio into this.
-            match engine {
-                NoiseSuppression::Off => {}
-                NoiseSuppression::Light => self.rnnoise = DenoiseState::new(),
-                NoiseSuppression::Strong =>
-                {
-                    #[cfg(feature = "deep-filter")]
-                    if let Some(d) = self.deep.as_mut() {
-                        d.reset();
-                    }
-                }
-            }
-            self.running = engine;
+        let fresh = !self.on || !continues;
+        self.on = !mode.is_off();
+        if !self.on {
+            return;
         }
-        match engine {
-            NoiseSuppression::Off => {}
-            NoiseSuppression::Light => {
-                for chunk in frame.as_chunks_mut::<FRAME>().0 {
-                    for (i, s) in chunk.iter().enumerate() {
-                        self.input[i] = s * PCM16;
-                    }
-                    self.rnnoise.process_frame(&mut self.output, &self.input);
-                    for (s, o) in chunk.iter_mut().zip(self.output.iter()) {
-                        *s = (o / PCM16).clamp(-1.0, 1.0);
-                    }
-                }
-            }
-            NoiseSuppression::Strong => {
-                #[cfg(feature = "deep-filter")]
-                if let Some(d) = self.deep.as_mut() {
-                    let chunks = frame.as_chunks_mut::<FRAME>().0;
-                    for i in 0..chunks.len() {
-                        if !d.process(&mut chunks[i]) {
-                            // Not again for this pipeline: RNNoise from here on, from a fresh state,
-                            // for this chunk (left as captured) and the rest; earlier ones are done.
-                            self.deep = None;
-                            self.running = NoiseSuppression::Off;
-                            return self.process(chunks[i..].as_flattened_mut(), NoiseSuppression::Light, false);
-                        }
-                    }
-                }
+        #[cfg(feature = "deep-filter")]
+        self.suppress(frame, mode, fresh);
+        #[cfg(not(feature = "deep-filter"))]
+        let _ = (frame, fresh);
+    }
+
+    #[cfg(feature = "deep-filter")]
+    fn suppress(&mut self, frame: &mut [f32], mode: NoiseSuppression, fresh: bool) {
+        use std::time::Instant;
+
+        let start = match self.model {
+            Model::Unstarted => true,
+            Model::Paused { retry } => Instant::now() >= retry,
+            Model::Running(_) | Model::Unavailable => false,
+        };
+        if start {
+            // A new worker starts from the untouched model.
+            self.model = match deep::Worker::start() {
+                Some(worker) => Model::Running(worker),
+                None => self.pause(),
+            };
+        }
+        let Model::Running(worker) = &mut self.model else { return };
+        match worker.ready() {
+            Some(true) => {}
+            Some(false) => return,
+            None => {
+                self.model = Model::Unavailable;
+                return;
             }
         }
+        if fresh {
+            worker.reset();
+        }
+        let limit = mode.limit_db();
+        let gone = frame
+            .as_chunks_mut::<FRAME>()
+            .0
+            .iter_mut()
+            .any(|chunk| matches!(worker.process(chunk, limit), deep::Outcome::Gone));
+        if gone {
+            // The rest of `frame`, and the audio until the retry, passes as captured.
+            self.model = self.pause();
+        }
+    }
+
+    #[cfg(feature = "deep-filter")]
+    fn pause(&mut self) -> Model {
+        let retry = std::time::Instant::now() + self.retry_wait;
+        self.retry_wait = (self.retry_wait * 2).min(MAX_RETRY);
+        Model::Paused { retry }
     }
 }
 
@@ -303,139 +388,171 @@ mod tests {
         ((*seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.1
     }
 
-    fn rms(x: &[f32]) -> f32 {
-        (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt()
-    }
-
-    /// A denoiser whose `Strong` engine is DeepFilterNet (when built in), not the RNNoise stand-in.
-    fn loaded() -> Denoiser {
-        #[allow(unused_mut)]
-        let mut d = Denoiser::new();
-        #[cfg(feature = "deep-filter")]
-        {
-            d.process(&mut [0.0; FRAME], NoiseSuppression::Strong, true);
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-            while !d.deep.as_ref().is_some_and(deep::Worker::ready) {
-                assert!(std::time::Instant::now() < deadline, "DeepFilterNet did not load");
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-        }
-        d
-    }
-
-    /// The level steady white noise comes out at, relative to what went in (dB).
-    fn noise_left(mode: NoiseSuppression) -> f32 {
-        let mut seed = 7;
-        let mut d = loaded();
-        let mut last = [0f32; FRAME];
-        for _ in 0..200 {
-            last = std::array::from_fn(|_| noise(&mut seed));
-            d.process(&mut last, mode, true);
-        }
-        let before = rms(&std::array::from_fn::<f32, FRAME, _>(|_| noise(&mut seed)));
-        20.0 * (rms(&last).max(1e-9) / before).log10()
-    }
-
     #[test]
-    fn steady_noise_is_taken_down_and_off_leaves_the_audio_alone() {
-        // RNNoise (2017 weights) takes steady white noise down by about 10 dB.
-        assert!(noise_left(NoiseSuppression::Light) < -6.0);
+    fn off_leaves_the_audio_alone() {
         let mut seed = 7;
         let mut d = Denoiser::new();
         let mut frame: [f32; FRAME] = std::array::from_fn(|_| noise(&mut seed));
         let original = frame;
-        d.process(&mut frame, NoiseSuppression::Off, true);
+        d.process(&mut frame, NoiseSuppression::OFF, true);
         assert_eq!(frame, original);
     }
 
-    #[cfg(feature = "deep-filter")]
     #[test]
-    fn strong_takes_out_far_more_than_light() {
-        let (light, strong) = (noise_left(NoiseSuppression::Light), noise_left(NoiseSuppression::Strong));
-        assert!(strong < -20.0 && strong < light - 10.0, "strong {strong} dB, light {light} dB");
+    fn strength_is_a_percentage() {
+        assert_eq!(NoiseSuppression::percent(250), NoiseSuppression::FULL);
+        assert_eq!(NoiseSuppression::percent(50).limit_db(), 25.0);
+        assert_eq!(NoiseSuppression::FULL.limit_db(), 100.0);
     }
 
-    /// A vowel-like sound from `start` on: a glottal pulse train with vibrato through two formant
-    /// resonators, in syllables (a steady tone is what a neural suppressor rightly takes for noise).
-    fn vowels(len: usize, start: usize) -> Vec<f32> {
-        use std::f32::consts::PI;
-        let (mut phase, mut out) = (0f32, vec![0f32; len]);
-        let mut formants = [(700.0f32, [0f32; 2]), (1_200.0, [0f32; 2])];
-        for (n, o) in out.iter_mut().enumerate().skip(start) {
-            let t = (n - start) as f32 / 48_000.0;
-            let f0 = 120.0 + 8.0 * (2.0 * PI * 5.0 * t).sin();
-            phase += f0 / 48_000.0;
-            let pulse = if phase >= 1.0 {
-                phase -= 1.0;
-                1.0
-            } else {
-                0.0
-            };
-            let mut y = 0.0;
-            for (f, state) in &mut formants {
-                // Two-pole resonator, ~80 Hz bandwidth.
-                let r = (-PI * 80.0 / 48_000.0).exp();
-                let v = pulse + 2.0 * r * (2.0 * PI * *f / 48_000.0).cos() * state[0] - r * r * state[1];
-                state[1] = state[0];
-                state[0] = v;
-                y += v;
+    #[cfg(feature = "deep-filter")]
+    mod model {
+        use std::time::{Duration, Instant};
+
+        use super::*;
+
+        fn rms(x: &[f32]) -> f32 {
+            (x.iter().map(|s| s * s).sum::<f32>() / x.len() as f32).sqrt()
+        }
+
+        /// A denoiser whose model has loaded.
+        fn loaded() -> Denoiser {
+            let mut d = Denoiser::new();
+            d.process(&mut [0.0; FRAME], NoiseSuppression::FULL, true);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !matches!(&d.model, Model::Running(w) if w.ready() == Some(true)) {
+                assert!(Instant::now() < deadline, "DeepFilterNet did not load");
+                std::thread::sleep(Duration::from_millis(20));
             }
-            let syllables = 0.5 - 0.5 * (2.0 * PI * 4.0 * t).cos();
-            *o = y * syllables * 0.02;
+            d
         }
-        out
-    }
 
-    /// Silence, then vowels: how late they come out.
-    fn onset_delay(mode: NoiseSuppression) -> i64 {
-        let start = 100 * FRAME + 123;
-        let input = vowels(200 * FRAME, start);
-        let mut d = loaded();
-        let mut out = Vec::new();
-        for f in 0..200 {
-            let mut frame: [f32; FRAME] = std::array::from_fn(|i| input[f * FRAME + i]);
-            d.process(&mut frame, mode, true);
-            out.extend_from_slice(&frame);
+        /// The level steady white noise comes out at, relative to what went in (dB).
+        fn noise_left(mode: NoiseSuppression) -> f32 {
+            let mut seed = 7;
+            let mut d = loaded();
+            let mut last = [0f32; FRAME];
+            for _ in 0..200 {
+                last = std::array::from_fn(|_| noise(&mut seed));
+                d.process(&mut last, mode, true);
+            }
+            let before = rms(&std::array::from_fn::<f32, FRAME, _>(|_| noise(&mut seed)));
+            20.0 * (rms(&last).max(1e-9) / before).log10()
         }
-        let kept = rms(&out[start..]) / rms(&input[start..]);
-        assert!(kept > 0.5, "{mode:?} took the vowels down to {kept}");
-        // The lag at which the output best matches the input.
-        let window = start + 20 * FRAME..out.len() - 4 * FRAME;
-        let score = |lag: usize| -> f32 { window.clone().map(|i| out[i] * input[i - lag]).sum() };
-        (0..4 * FRAME).max_by(|a, b| score(*a).total_cmp(&score(*b))).unwrap() as i64
-    }
 
-    #[cfg(feature = "deep-filter")]
-    #[test]
-    fn a_stuck_worker_costs_one_wait_and_then_rnnoise_takes_over() {
-        let mut d = Denoiser::new();
-        d.deep_started = true;
-        d.deep = Some(deep::Worker::fake(1));
-        let mut seed = 3;
-        let original: Vec<f32> = (0..2 * FRAME).map(|_| noise(&mut seed)).collect();
-        // A TeamSpeak-sized frame: the worker answers its first half, then stops answering.
-        let mut frame = original.clone();
-        let started = std::time::Instant::now();
-        d.process(&mut frame, NoiseSuppression::Strong, true);
-        assert!(started.elapsed() < std::time::Duration::from_millis(200), "waited {:?}", started.elapsed());
-        assert_eq!(frame[..FRAME], original[..FRAME], "the answered half is what the worker gave");
-        // The other half went through a fresh RNNoise, from the audio as captured.
-        let mut fresh = Denoiser::new();
-        let mut expected = original[FRAME..].to_vec();
-        fresh.process(&mut expected, NoiseSuppression::Light, true);
-        assert_eq!(frame[FRAME..], expected[..]);
-        assert!(d.deep.is_none());
-        // From then on, no more waiting.
-        let started = std::time::Instant::now();
-        d.process(&mut [0.0; FRAME], NoiseSuppression::Strong, true);
-        assert!(started.elapsed() < std::time::Duration::from_millis(20));
-    }
+        #[test]
+        fn full_strength_takes_steady_noise_far_down_and_less_caps_the_cut() {
+            let full = noise_left(NoiseSuppression::FULL);
+            assert!(full < -40.0, "full: {full} dB");
+            let half = noise_left(NoiseSuppression::percent(50));
+            assert!((-26.0..-24.0).contains(&half), "half: {half} dB");
+        }
 
-    #[test]
-    fn sound_comes_through_one_frame_late() {
-        // One frame of overlap-add; nothing looks ahead.
-        for mode in [NoiseSuppression::Light, NoiseSuppression::Strong] {
-            assert_eq!(onset_delay(mode), FRAME as i64, "{mode:?}");
+        /// A vowel-like sound from `start` on: a glottal pulse train with vibrato through two
+        /// formant resonators, in syllables (a steady tone is what a neural suppressor rightly
+        /// takes for noise).
+        fn vowels(len: usize, start: usize) -> Vec<f32> {
+            use std::f32::consts::PI;
+            let (mut phase, mut out) = (0f32, vec![0f32; len]);
+            let mut formants = [(700.0f32, [0f32; 2]), (1_200.0, [0f32; 2])];
+            for (n, o) in out.iter_mut().enumerate().skip(start) {
+                let t = (n - start) as f32 / 48_000.0;
+                let f0 = 120.0 + 8.0 * (2.0 * PI * 5.0 * t).sin();
+                phase += f0 / 48_000.0;
+                let pulse = if phase >= 1.0 {
+                    phase -= 1.0;
+                    1.0
+                } else {
+                    0.0
+                };
+                let mut y = 0.0;
+                for (f, state) in &mut formants {
+                    // Two-pole resonator, ~80 Hz bandwidth.
+                    let r = (-PI * 80.0 / 48_000.0).exp();
+                    let v = pulse + 2.0 * r * (2.0 * PI * *f / 48_000.0).cos() * state[0] - r * r * state[1];
+                    state[1] = state[0];
+                    state[0] = v;
+                    y += v;
+                }
+                let syllables = 0.5 - 0.5 * (2.0 * PI * 4.0 * t).cos();
+                *o = y * syllables * 0.02;
+            }
+            out
+        }
+
+        #[test]
+        fn sound_comes_through_one_frame_late() {
+            // One frame of overlap-add; nothing looks ahead.
+            let start = 100 * FRAME + 123;
+            let input = vowels(200 * FRAME, start);
+            let mut d = loaded();
+            let mut out = Vec::new();
+            for f in 0..200 {
+                let mut frame: [f32; FRAME] = std::array::from_fn(|i| input[f * FRAME + i]);
+                d.process(&mut frame, NoiseSuppression::FULL, true);
+                out.extend_from_slice(&frame);
+            }
+            let kept = rms(&out[start..]) / rms(&input[start..]);
+            assert!(kept > 0.5, "the vowels went down to {kept}");
+            // The lag at which the output best matches the input.
+            let window = start + 20 * FRAME..out.len() - 4 * FRAME;
+            let score = |lag: usize| -> f32 { window.clone().map(|i| out[i] * input[i - lag]).sum() };
+            assert_eq!((0..4 * FRAME).max_by(|a, b| score(*a).total_cmp(&score(*b))), Some(FRAME));
+        }
+
+        /// A denoiser on a stand-in worker (see [`deep::Worker::fake`]), and what each frame of
+        /// 0.2s came out as: 0.1 cleaned, 0.2 passed as captured.
+        fn run_fake(delays: Vec<Option<Duration>>, frames: usize) -> (Denoiser, Vec<f32>) {
+            let mut d = Denoiser::new();
+            d.model = Model::Running(deep::Worker::fake(delays));
+            let out = (0..frames)
+                .map(|_| {
+                    let mut frame = [0.2; FRAME];
+                    d.process(&mut frame, NoiseSuppression::FULL, true);
+                    assert!(frame.iter().all(|s| *s == frame[0]));
+                    frame[0]
+                })
+                .collect();
+            (d, out)
+        }
+
+        #[test]
+        fn a_late_frame_passes_as_captured_and_the_model_goes_on() {
+            let fast = Some(Duration::ZERO);
+            let (d, out) = run_fake(vec![fast, Some(Duration::from_millis(35)), fast], 20);
+            assert_eq!(out[..3], [0.1, 0.2, 0.1]);
+            assert!(out[3..].iter().all(|s| *s == 0.1), "{out:?}");
+            assert!(matches!(d.model, Model::Running(_)));
+        }
+
+        #[test]
+        fn a_stuck_model_is_paused_after_100_ms_of_frames_and_started_again_later() {
+            let started = Instant::now();
+            let (mut d, out) = run_fake(vec![Some(Duration::ZERO), None], 15);
+            // Two waits for answers; the rest could not be handed over.
+            assert!(started.elapsed() < Duration::from_millis(200), "waited {:?}", started.elapsed());
+            assert_eq!(out[0], 0.1);
+            assert!(out[1..].iter().all(|s| *s == 0.2), "{out:?}");
+            assert!(matches!(d.model, Model::Paused { .. }));
+            assert_eq!(d.retry_wait, RETRY * 2);
+            // Paused: no waiting.
+            let started = Instant::now();
+            d.process(&mut [0.2; FRAME], NoiseSuppression::FULL, true);
+            assert!(started.elapsed() < Duration::from_millis(5));
+            // Time to try again: a new model.
+            d.model = Model::Paused { retry: Instant::now() };
+            d.process(&mut [0.2; FRAME], NoiseSuppression::FULL, true);
+            assert!(matches!(d.model, Model::Running(_)));
+        }
+
+        #[test]
+        fn a_model_too_slow_for_the_machine_is_paused() {
+            // 8 ms a frame: real time, but it leaves the pipeline too little of each 10 ms.
+            let (d, out) = run_fake(vec![Some(Duration::from_millis(8)); 40], 40);
+            let cleaned = out.iter().take_while(|s| **s == 0.1).count();
+            assert!((3..30).contains(&cleaned), "{out:?}");
+            assert!(out[cleaned..].iter().all(|s| *s == 0.2));
+            assert!(matches!(d.model, Model::Paused { .. }));
         }
     }
 }

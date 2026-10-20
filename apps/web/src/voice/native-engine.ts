@@ -296,7 +296,7 @@ export class NativeVoiceEngine implements VoiceEngine {
 
   /** Noise suppression runs natively; echo cancellation and AGC are not implemented natively yet. */
   async setCaptureOptions(options: CaptureOptions): Promise<void> {
-    await this.send("voice_set_capture_options", { noiseSuppression: options.noiseSuppression, strength: options.noiseStrength });
+    await this.send("voice_set_capture_options", { noiseSuppression: options.noiseSuppression, strength: Math.round(Math.min(100, Math.max(10, options.noiseStrength))) });
   }
 
   setMasterVolume(volume: number): void {

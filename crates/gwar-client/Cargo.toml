@@ -8,7 +8,7 @@ publish.workspace = true
 
 [features]
 default = ["deep-filter"]
-# The "strong" noise suppression (DeepFilterNet3); without it, "strong" falls back to RNNoise.
+# Noise suppression (DeepFilterNet3, its model embedded); without it, the microphone passes as captured.
 deep-filter = ["dep:deep_filter", "dep:ndarray", "dep:tract-core", "dep:tract-data", "dep:tract-hir", "dep:tract-linalg", "dep:tract-nnef", "dep:tract-onnx", "dep:tract-onnx-opl", "dep:tract-pulse", "dep:tract-pulse-opl"]
 
 [dependencies]
@@ -28,7 +28,6 @@ tracing.workspace = true
 cpal = { version = "0.18", features = ["realtime"] }
 audiopus = "=0.3.0-rc.0"
 rtrb = "0.4"
-nnnoiseless = { version = "0.5.2", default-features = false }
 # DeepFilterNet3, low-latency model (no lookahead), run with tract; only on git (crates.io has 0.2.5 from 2022).
 deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", rev = "d375b2d8309e0935d165700c91da9de862a99c31", default-features = false, features = ["tract", "default-model-ll"], optional = true }
 ndarray = { version = "0.15", optional = true }

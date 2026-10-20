@@ -12,7 +12,7 @@ import { isDesktop } from "../platform";
 import { notificationsPermission, requestNotifications, type NotificationsPermission } from "../platform/notify";
 import { acceleratorFromEvent, acceleratorParts } from "../platform/desktop";
 import { controller, describeVoiceError } from "../state/controller";
-import { useSettings, type Language, type NoiseStrength, type Theme } from "../state/settings";
+import { useSettings, type Language, type Theme } from "../state/settings";
 import { useSession, useUi, useVoice, type SettingsTab } from "../state/stores";
 import { VoiceError } from "../voice/engine";
 import { keyLabel } from "./hooks";
@@ -272,15 +272,21 @@ function AudioTab() {
             description={t("audio.noiseSuppressionHint")}
           />
           {audio.noiseSuppression && (
-            <Segmented<NoiseStrength>
-              label={t("audio.noiseStrength")}
-              value={audio.noiseStrength}
-              onChange={(noiseStrength) => setAudio({ noiseStrength })}
-              options={[
-                { value: "strong", label: t("audio.noiseStrong"), title: t("audio.noiseStrongHint") },
-                { value: "light", label: t("audio.noiseLight"), title: t("audio.noiseLightHint") },
-              ]}
-            />
+            <Field label={t("audio.noiseStrength")} hint={t("audio.noiseStrengthHint")}>
+              {() => (
+                <div className="flex items-center gap-3">
+                  <Slider
+                    value={audio.noiseStrength}
+                    min={10}
+                    max={100}
+                    step={5}
+                    onChange={(noiseStrength) => setAudio({ noiseStrength })}
+                    label={t("audio.noiseStrength")}
+                  />
+                  <span className="w-12 shrink-0 text-right text-sm tabular-nums text-muted">{audio.noiseStrength}%</span>
+                </div>
+              )}
+            </Field>
           )}
           <p className="text-xs text-subtle">{t("audio.processingDesktop")}</p>
         </Section>

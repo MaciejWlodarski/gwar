@@ -132,8 +132,6 @@ function pruneRemoved(removed: Record<string, BookmarkRemoval>, now: number): Re
   return Object.fromEntries(Object.entries(removed).filter(([, r]) => now - r.at < BOOKMARK_TOMBSTONE_MS));
 }
 
-export type NoiseStrength = "light" | "strong";
-
 export interface AudioSettings {
   inputDeviceId: string | null;
   outputDeviceId: string | null;
@@ -141,8 +139,8 @@ export interface AudioSettings {
   /** KeyboardEvent.code of the push-to-talk key. */
   pttKey: string | null;
   noiseSuppression: boolean;
-  /** Desktop app: how hard noise suppression works (`strong` is DeepFilterNet, `light` RNNoise; both add 10 ms). */
-  noiseStrength: NoiseStrength;
+  /** Desktop app: how hard noise suppression works, 10..100 (percent; below 100 it caps the cut at half a dB per percent). */
+  noiseStrength: number;
   echoCancellation: boolean;
   autoGainControl: boolean;
   /** 0..1.5 */
@@ -230,7 +228,7 @@ export const defaultAudio: AudioSettings = {
   inputMode: "vad",
   pttKey: null,
   noiseSuppression: true,
-  noiseStrength: "strong",
+  noiseStrength: 100,
   echoCancellation: true,
   autoGainControl: true,
   masterVolume: 1,

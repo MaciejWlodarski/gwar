@@ -116,8 +116,8 @@ impl Default for Voice {
                     muted: false,
                     deafened: false,
                     ptt: false,
-                    // Until the settings say otherwise (they default to strong too).
-                    noise: NoiseSuppression::Strong,
+                    // Until the settings say otherwise (they default to full strength too).
+                    noise: NoiseSuppression::FULL,
                     master: 1.0,
                     slot_gain: [1.0; AUDIO_SLOTS],
                 },
@@ -837,30 +837,20 @@ pub fn voice_set_input_mode(
     Ok(())
 }
 
-#[derive(Deserialize, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-pub enum NoiseStrength {
-    Light,
-    Strong,
-}
-
-/// The microphone's processing, as the settings choose it. Only noise suppression exists natively.
+/// The microphone's processing, as the settings choose it. Only noise suppression exists natively;
+/// `strength` is in percent (see [`NoiseSuppression`]).
 #[tauri::command]
 pub fn voice_set_capture_options(
     window: WebviewWindow,
     voice: State<'_, Voice>,
     owner: u64,
     noise_suppression: bool,
-    strength: NoiseStrength,
+    strength: u8,
 ) -> Result<(), String> {
     check_main_window(window.label())?;
     let mut inner = voice.lock();
     check_owner(&inner, owner)?;
-    inner.prefs.noise = match (noise_suppression, strength) {
-        (false, _) => NoiseSuppression::Off,
-        (true, NoiseStrength::Light) => NoiseSuppression::Light,
-        (true, NoiseStrength::Strong) => NoiseSuppression::Strong,
-    };
+    inner.prefs.noise = if noise_suppression { NoiseSuppression::percent(strength) } else { NoiseSuppression::OFF };
     if let Some(h) = &inner.handle {
         h.set_noise_suppression(inner.prefs.noise);
     }

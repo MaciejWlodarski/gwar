@@ -103,11 +103,11 @@ describe("desktop noise suppression", () => {
     voice.capabilities.captureProcessing = "noise";
     try {
       await act(async () => root.render(<TooltipProvider><SettingsDialog tab="audio" /></TooltipProvider>));
-      const strength = document.querySelector('[role="radiogroup"][aria-label="Noise suppression strength"]')!;
-      expect(strength.querySelector('[aria-checked="true"]')?.textContent).toBe("Strong");
+      const strength = document.querySelector<HTMLElement>('[role="slider"][aria-label="Noise suppression strength"]')!;
+      expect(strength.getAttribute("aria-valuenow")).toBe("100");
       expect([...document.querySelectorAll("*")].some((e) => e.children.length === 0 && e.textContent === "Echo cancellation")).toBe(false);
-      await act(async () => [...strength.querySelectorAll<HTMLButtonElement>("button")].find((b) => b.textContent === "Light")!.click());
-      expect(useSettings.getState().audio.noiseStrength).toBe("light");
+      await act(async () => strength.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true })));
+      expect(useSettings.getState().audio.noiseStrength).toBe(95);
       // Off: no strength to choose.
       await act(async () => useSettings.getState().setAudio({ noiseSuppression: false }));
       expect(document.querySelector('[aria-label="Noise suppression strength"]')).toBeNull();
