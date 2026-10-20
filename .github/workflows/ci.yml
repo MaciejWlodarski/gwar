@@ -176,7 +176,8 @@ jobs:
           name: mls-wasm
           path: crates/gwar-mls-wasm/pkg/
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter web build
+      # The bundle the app embeds (tauri.conf.json's beforeBuildCommand).
+      - run: pnpm --filter web build:desktop
       # Only built here, never run: unoptimized dependencies build faster.
       - name: Build desktop
         shell: bash
