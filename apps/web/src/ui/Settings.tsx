@@ -263,8 +263,31 @@ function AudioTab() {
         )}
       </Section>
 
-      {engine.capabilities.captureProcessing === false ? (
+      {engine.capabilities.captureProcessing === false ? null : engine.capabilities.captureProcessing === "noise" ? (
         <Section title={t("audio.processing")}>
+          <Switch
+            checked={audio.noiseSuppression}
+            onCheckedChange={(v) => setAudio({ noiseSuppression: v })}
+            label={t("audio.noiseSuppression")}
+            description={t("audio.noiseSuppressionHint")}
+          />
+          {audio.noiseSuppression && (
+            <Field label={t("audio.noiseStrength")} hint={t("audio.noiseStrengthHint")}>
+              {() => (
+                <div className="flex items-center gap-3">
+                  <Slider
+                    value={audio.noiseStrength}
+                    min={10}
+                    max={100}
+                    step={5}
+                    onChange={(noiseStrength) => setAudio({ noiseStrength })}
+                    label={t("audio.noiseStrength")}
+                  />
+                  <span className="w-12 shrink-0 text-right text-sm tabular-nums text-muted">{audio.noiseStrength}%</span>
+                </div>
+              )}
+            </Field>
+          )}
           <p className="text-xs text-subtle">{t("audio.processingDesktop")}</p>
         </Section>
       ) : (

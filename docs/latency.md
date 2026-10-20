@@ -562,6 +562,66 @@ Compare loss and underflows alongside latency. Frame counters cover warmup too.
 Inspect individual call levels: startup buffering or network drift can dominate
 pooled p95. The runners impose no fixed performance pass threshold.
 
+## Noise suppression
+
+The desktop app cleans the microphone before the encoder
+(`crates/gwar-client/src/voice/denoise.rs`), on every 10 ms frame. The level meter
+and the voice gate still measure the microphone as captured: a strong suppressor
+also takes very quiet speech down (speech peaking near -48 dBFS lost most of its
+gated frames to it), and the sensitivity setting should keep meaning what it did.
+The RTP audio level (RFC 6464) is the cleaned audio's, so suppressed noise cannot
+hold a receive slot at the server.
+
+One model for every kind of noise: DeepFilterNet3's low-latency model (no
+lookahead), run with tract. It adds 10 ms, one frame of overlap-add (the standard
+DeepFilterNet3 model looks two frames ahead: 30 ms here, so it is not used), and
+takes about 1.3 ms of CPU per frame on Apple Silicon. The setting is one switch and
+a strength from 10 to 100 %: below 100 the cleaned audio is mixed with what was
+captured so that no sound goes down by more than half a dB per percent (50 % caps
+the cut at 25 dB; DeepFilterNet's attenuation limit). The unit tests check the
+480-sample delay, that full strength takes steady white noise down by more than
+40 dB, and that 50 % takes it down by 25.
+
+The runtime settings are those of DeepFilterNet's own `deep-filter` command with
+its post-filter on (`--pf`), not its library defaults: frames whose local SNR
+estimate is below -15 dB are taken for noise alone and silenced, above 35 dB for
+clean speech and left alone (the defaults leave frames alone from 20 or 30 dB on),
+and the post-filter (beta 0.02) takes noise between words further down. Measured on Apple Silicon (2026-10-20) with a bench
+outside the repository: speech from macOS `say` (one English and one Polish voice)
+at 48 kHz mixed with synthetic noise, SI-SDR gain against the clean speech after
+aligning the delay, averaged over both voices:
+
+| Noise | SNR | Library defaults | Chosen |
+| --- | --- | --- | --- |
+| white | 0 / 5 / 15 dB | +15.7 / +13.6 / +5.9 | +15.8 / +13.6 / +9.7 |
+| pink, fan-like | 0 / 5 / 15 dB | +11.6 / +9.9 / +2.3 | +11.7 / +9.9 / +5.5 |
+| keyboard clicks | 0 / 5 / 15 dB | +13.8 / +11.7 / +6.0 | +19.8 / +16.9 / +10.8 |
+| mains hum | 0 / 5 / 15 dB | +13.9 / +12.6 / +2.6 | +14.3 / +12.4 / +8.0 |
+| clatter (bursts) | 0 / 5 / 15 dB | +14.7 / +12.4 / +7.8 | +18.6 / +16.4 / +11.7 |
+
+With the library defaults a quiet background (15 dB) also took speech down by
+1.2–1.5 dB; with the chosen settings speech keeps its level within 0.2 dB at 5 and
+15 dB, and clean speech passes at 33 dB SI-SDR. Between words, the noise goes down
+by 34–50 dB (18–25 for pink noise). For comparison, RNNoise gained +5 to +9 dB at
+5 dB SNR on the same kind of bench.
+
+The model loads in ~0.3 s on a thread of its own when suppression is first on; the
+microphone passes as captured until then, so joining a channel never waits. tract's
+models cannot leave the thread that built them, so that thread also runs every
+frame for the pipeline, which hands it over without blocking and waits 20 ms at
+most. A frame the model is late with passes as captured and the model goes on; one
+that cannot even be handed over (the model is still on an earlier one) never
+reaches it, so the model starts over after it. If the pipeline waits more than 5 ms
+a frame on average (the machine is too slow), or 100 ms of frames in a row pass
+uncleaned (the model is stuck), suppression pauses and starts over with a fresh
+model 10 s later, then 20, 40, up to 5 minutes; never while the old one's thread is
+still stuck, so stuck models cannot pile up. A model that fails on a frame is not
+started again for the call. The unit tests cover each of these with a stand-in
+model.
+
+The latency harness above keeps suppression off (the library's default): its markers
+are steady tones, which a suppressor rightly takes for noise.
+
 ## Native 10 ms frames
 
 See [the 10 ms implementation report](opus-10ms.md) for transport compatibility,

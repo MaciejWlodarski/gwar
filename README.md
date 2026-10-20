@@ -571,11 +571,12 @@ GWAR_TS3_DIR=/tmp/ts3 cargo test -p gwar-client --test teamspeak_mode --test tea
   measured for latency and for audio lost on lossy links, so lower latency
   never costs choppy voice. An extreme mode for very good connections may
   follow as an option.
-- **Clean audio**: noise suppression and echo cancellation, applied on your
-  device before encoding (so they also work with end-to-end encryption). On
-  the desktop RNNoise by default, which adds almost no latency, with
-  DeepFilterNet as a higher-quality option for loud surroundings; the web
-  app starts with the browser's own suppression.
+- **Clean audio**: echo cancellation on the desktop next. Noise suppression
+  is there: on your device before encoding (so it also works with end-to-end
+  encryption), on the desktop one model for every kind of noise,
+  DeepFilterNet3's low-latency one, with a strength setting; it adds 10 ms
+  ([docs/latency.md](docs/latency.md#noise-suppression)). The web app uses the
+  browser's own.
 - **An independent review of the end-to-end encryption** before it is called
   stable. It is built (direct messages, channels, server-wide chat, voice,
   private channels, the key archive) and reviewed internally; the record is in

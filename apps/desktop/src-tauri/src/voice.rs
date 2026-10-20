@@ -34,7 +34,7 @@ use std::{
 };
 
 use gwar_client::voice::{
-    InputMode, LinkState, VoiceHandle,
+    InputMode, LinkState, NoiseSuppression, VoiceHandle,
     io::{AudioIo, AudioPorts, DeviceIo, DeviceIssue, IssueSink},
     keys::EncryptedStart,
     permission,
@@ -64,6 +64,7 @@ struct Prefs {
     muted: bool,
     deafened: bool,
     ptt: bool,
+    noise: NoiseSuppression,
     master: f32,
     slot_gain: [f32; AUDIO_SLOTS],
 }
@@ -74,6 +75,7 @@ impl Prefs {
         handle.set_muted(self.muted);
         handle.set_deafened(self.deafened);
         handle.set_ptt(self.ptt);
+        handle.set_noise_suppression(self.noise);
         handle.set_master_gain(self.master);
         for (slot, gain) in self.slot_gain.iter().enumerate() {
             handle.set_slot_gain(slot, *gain);
@@ -114,6 +116,8 @@ impl Default for Voice {
                     muted: false,
                     deafened: false,
                     ptt: false,
+                    // Until the settings say otherwise (they default to full strength too).
+                    noise: NoiseSuppression::FULL,
                     master: 1.0,
                     slot_gain: [1.0; AUDIO_SLOTS],
                 },
@@ -829,6 +833,26 @@ pub fn voice_set_input_mode(
     };
     if let Some(h) = &inner.handle {
         h.set_input_mode(inner.prefs.mode);
+    }
+    Ok(())
+}
+
+/// The microphone's processing, as the settings choose it. Only noise suppression exists natively;
+/// `strength` is in percent (see [`NoiseSuppression`]).
+#[tauri::command]
+pub fn voice_set_capture_options(
+    window: WebviewWindow,
+    voice: State<'_, Voice>,
+    owner: u64,
+    noise_suppression: bool,
+    strength: u8,
+) -> Result<(), String> {
+    check_main_window(window.label())?;
+    let mut inner = voice.lock();
+    check_owner(&inner, owner)?;
+    inner.prefs.noise = if noise_suppression { NoiseSuppression::percent(strength) } else { NoiseSuppression::OFF };
+    if let Some(h) = &inner.handle {
+        h.set_noise_suppression(inner.prefs.noise);
     }
     Ok(())
 }

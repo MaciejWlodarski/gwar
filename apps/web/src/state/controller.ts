@@ -243,6 +243,7 @@ class Controller {
     void e.setInputDevice(first.inputDeviceId);
     void e.setCaptureOptions({
       noiseSuppression: first.noiseSuppression,
+      noiseStrength: first.noiseStrength,
       echoCancellation: first.echoCancellation,
       autoGainControl: first.autoGainControl,
     });
@@ -256,11 +257,13 @@ class Controller {
       if (a.inputDeviceId !== p.inputDeviceId) void e.setInputDevice(a.inputDeviceId);
       if (
         a.noiseSuppression !== p.noiseSuppression ||
+        a.noiseStrength !== p.noiseStrength ||
         a.echoCancellation !== p.echoCancellation ||
         a.autoGainControl !== p.autoGainControl
       ) {
         void e.setCaptureOptions({
           noiseSuppression: a.noiseSuppression,
+          noiseStrength: a.noiseStrength,
           echoCancellation: a.echoCancellation,
           autoGainControl: a.autoGainControl,
         });

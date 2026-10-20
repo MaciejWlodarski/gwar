@@ -5,6 +5,7 @@
 //! "pipeline" thread does all audio DSP and coding; device callbacks only
 //! move samples through lock-free rings (see [`io`]).
 
+mod denoise;
 pub mod io;
 pub mod jitter;
 pub mod keys;
@@ -29,7 +30,9 @@ use audiopus::{Application, Bitrate, Channels, SampleRate, coder::Encoder};
 use gwar_proto::AUDIO_SLOTS;
 use tokio::sync::mpsc;
 
+pub use self::denoise::NoiseSuppression;
 use self::{
+    denoise::Denoiser,
     io::{AudioIo, AudioPorts, CaptureSample, OutputTiming},
     jitter::Clock,
     playout::{Slot, SpeakerBuffer},
@@ -55,6 +58,8 @@ pub struct Controls {
     ptt: AtomicBool,
     vad_threshold: AtomicU32,
     push_to_talk: AtomicBool,
+    /// [`NoiseSuppression`], in percent.
+    noise_suppression: AtomicU8,
     master: AtomicU32,
     slot_gain: [AtomicU32; AUDIO_SLOTS],
     /// Latest input level in dBFS (for the meter).
@@ -79,6 +84,7 @@ impl Default for Controls {
             ptt: AtomicBool::new(false),
             vad_threshold: AtomicU32::new((-50.0f32).to_bits()),
             push_to_talk: AtomicBool::new(false),
+            noise_suppression: AtomicU8::new(NoiseSuppression::default().as_percent()),
             master: AtomicU32::new(1.0f32.to_bits()),
             slot_gain: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
             input_level: AtomicU32::new((-100.0f32).to_bits()),
@@ -234,6 +240,10 @@ impl VoiceHandle {
         if let Some(g) = self.controls.slot_gain.get(slot) {
             set_f(g, gain.clamp(0.0, 2.0));
         }
+    }
+    /// Background-noise suppression of the microphone (see [`NoiseSuppression`]).
+    pub fn set_noise_suppression(&self, mode: NoiseSuppression) {
+        self.controls.noise_suppression.store(mode.as_percent(), Ordering::Relaxed);
     }
     pub fn set_master_gain(&self, gain: f32) {
         set_f(&self.controls.master, gain.clamp(0.0, 2.0));
@@ -596,6 +606,8 @@ fn pipeline<const CAPTURE: usize>(
     output.attach();
     let mut slots = (0..AUDIO_SLOTS).map(|_| Slot::new()).collect::<Result<Vec<_>>>()?;
     let mut capture = CaptureFrame::new(CAPTURE);
+    let mut denoiser = Denoiser::new();
+    let mut next_position = None;
     let mut mix = vec![0f32; FRAME];
     let mut packet = vec![0u8; 1275];
     let mut last_voice = Instant::now() - HANGOVER;
@@ -608,8 +620,15 @@ fn pipeline<const CAPTURE: usize>(
         for _ in 0..mic.slots() {
             let Ok(sample) = mic.pop() else { break };
             let Some(capture_position) = capture.push_at(sample, Instant::now(), &counters) else { continue };
+            // The meter and the gate measure the microphone as it is, so its sensitivity setting
+            // means what it did (a strong suppressor also takes very quiet speech down). The
+            // encoder, and the RTP level the server's speech gate reads, get the cleaned audio.
+            // Suppression runs on every frame, sent or not, so its state follows the audio.
+            let db = level_db(&capture.samples);
+            let mode = NoiseSuppression::percent(controls.noise_suppression.load(Ordering::Relaxed));
+            denoiser.process(&mut capture.samples, mode, next_position == Some(capture_position));
+            next_position = Some(capture_position + CAPTURE as u64);
             let frame = &capture.samples;
-            let db = level_db(frame);
             set_f(&controls.input_level, db);
             let blocked = controls.muted.load(Ordering::Relaxed) || controls.deafened.load(Ordering::Relaxed);
             let wants = if controls.push_to_talk.load(Ordering::Relaxed) {
@@ -627,7 +646,9 @@ fn pipeline<const CAPTURE: usize>(
                 if !validate_encoded(&packet[..n], CAPTURE as u32, &counters) {
                     continue;
                 }
-                let level = (-db.clamp(-127.0, 0.0)).round() as i8;
+                // RFC 6464: the level of the audio actually sent. Suppressed noise reads as
+                // silence, so it cannot hold a receive slot at the server.
+                let level = (-level_db(frame).clamp(-127.0, 0.0)).round() as i8;
                 // Tell the server's speech gate the truth about voice activity.
                 if out
                     .try_send(Outgoing {

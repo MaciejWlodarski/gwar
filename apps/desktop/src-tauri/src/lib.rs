@@ -89,6 +89,7 @@ pub fn run() {
             voice::voice_set_ptt,
             voice::voice_set_input_mode,
             voice::voice_set_master_gain,
+            voice::voice_set_capture_options,
             voice::voice_set_slot_gain,
             voice::voice_set_devices,
             voice::audio_devices,
