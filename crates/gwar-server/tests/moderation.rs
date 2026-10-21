@@ -699,7 +699,8 @@ async fn the_sharer_or_a_moderator_turns_the_watch_link_off_for_good() {
     let voice = alice.ok("voice.state", json!({})).await["voice"].clone();
     let start = json!({"call": voice["call"], "participation": voice["participation"], "preset": "smooth",
         "surface": "tab", "guest_link": true});
-    let share = alice.ok("screen.start", start).await["share"].clone();
+    let share = alice.ok("screen.start", start).await["share"].as_str().unwrap().to_owned();
+    alice.publish(&share).await;
 
     assert_eq!(bob.fails("screen.link.revoke", json!({"share": share})).await, "forbidden");
     root.ok("screen.link.revoke", json!({"share": share})).await;
@@ -709,6 +710,16 @@ async fn the_sharer_or_a_moderator_turns_the_watch_link_off_for_good() {
     alice.ok("screen.link.revoke", json!({"share": share})).await;
     assert!(alice.drain_events("screen.link").await.is_empty(), "already off");
     assert!(bob.drain_events("screen.link").await.is_empty());
+
+    // Before a share is announced, turning its link off tells its sharer alone.
+    alice.ok("screen.stop", json!({"share": share})).await;
+    let voice = alice.ok("voice.state", json!({})).await["voice"].clone();
+    let start = json!({"call": voice["call"], "participation": voice["participation"], "preset": "smooth",
+        "surface": "tab", "guest_link": true});
+    let pending = alice.ok("screen.start", start).await["share"].as_str().unwrap().to_owned();
+    alice.ok("screen.link.revoke", json!({"share": pending})).await;
+    assert_eq!(alice.next_event("screen.link").await, json!({"share": pending, "active": false}));
+    assert!(root.drain_events("screen.link").await.is_empty(), "nothing of an unannounced share");
 }
 
 #[tokio::test]
@@ -721,13 +732,13 @@ async fn a_password_channels_watch_ends_when_its_viewer_leaves_switches_or_is_mo
     let vault = channel_id(&root.create_channel(json!({"name": "Vault", "password": "s3cret"})).await);
     let enter = json!({"channel": vault, "password": "s3cret"});
     alice.ok("channel.join", enter.clone()).await;
-    let share = alice.screen_start().await.unwrap()["share"].clone();
+    let share = alice.share_here().await;
     let ended = json!({"share": share, "reason": "access"});
     let viewers = |n: u32| json!({"share": share, "members": n, "guests": 0});
 
     for exit in ["leave", "switch", "moved"] {
         bob.ok("channel.join", enter.clone()).await;
-        bob.ok("screen.watch", json!({"share": share})).await;
+        bob.watch(&share).await;
         assert_eq!(alice.next_event("screen.viewers").await, viewers(1));
         match exit {
             "leave" => drop(bob.ok("channel.leave", json!({})).await),
@@ -746,7 +757,7 @@ async fn a_kicked_viewer_stops_watching() {
     let mut alice = Client::connect(&server, "alice").await;
     let mut bob = Client::connect(&server, "bob").await;
     let share = alice.share_in(seed_channel(&root, "General")).await;
-    bob.ok("screen.watch", json!({"share": share})).await;
+    bob.watch(&share).await;
     assert_eq!(alice.next_event("screen.viewers").await["members"], 1);
     root.ok("client.kick", json!({"client": bob.id()})).await;
     assert_eq!(alice.next_event("screen.viewers").await["members"], 0);

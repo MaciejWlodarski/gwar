@@ -243,6 +243,7 @@ pub async fn start(config: Config) -> Result<Running> {
     std::fs::create_dir_all(&files_dir).with_context(|| format!("create {}", files_dir.display()))?;
     let routing = Arc::new(ArcSwap::from_pointee(media::Routing::default()));
     let (media_tx, media_rx) = mpsc::channel(256);
+    let (screen_tx, screen_rx) = mpsc::channel(256);
     let core = core::spawn(
         store,
         CoreConfig {
@@ -262,6 +263,7 @@ pub async fn start(config: Config) -> Result<Running> {
         },
         routing.clone(),
         media_tx.clone(),
+        screen_tx,
     )?;
 
     let udp = Arc::new(UdpSocket::bind(config.media_bind).await.context("bind media UDP socket")?);
@@ -278,14 +280,23 @@ pub async fn start(config: Config) -> Result<Running> {
         uplinks: uplinks.clone(),
         webrtc: media_tx,
     };
-    let mut tasks = vec![tokio::spawn(webrtc::run(
-        WebRtcConfig { socket: udp, advertise },
-        routing.clone(),
-        sinks,
-        uplinks,
-        core.clone(),
-        media_rx,
-    ))];
+    let (dispatch, dispatch_rx) = media::screen::dispatch();
+    let mut tasks = vec![
+        tokio::spawn(media::screen::run(
+            media::screen::ScreenConfig { socket: udp.clone(), advertise },
+            core.clone(),
+            dispatch_rx,
+            screen_rx,
+        )),
+        tokio::spawn(webrtc::run(
+            WebRtcConfig { socket: udp, advertise, screen: dispatch },
+            routing.clone(),
+            sinks,
+            uplinks,
+            core.clone(),
+            media_rx,
+        )),
+    ];
 
     // Installing and starting TeamSpeak can take a while; serve our clients meanwhile.
     let (teamspeak, teamspeak_ready) = match config.teamspeak {

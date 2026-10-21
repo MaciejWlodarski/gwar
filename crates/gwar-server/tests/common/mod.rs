@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 pub mod rtc;
+pub mod screen;
 
 use std::{collections::HashMap, collections::VecDeque, future::Future, time::Duration};
 
@@ -254,6 +255,10 @@ pub struct Client {
     next_id: u32,
     replies: HashMap<u32, Result<Value, ErrorBody>>,
     events: VecDeque<Value>,
+    /// Publish transports of this client's shares, kept alive with it.
+    pub publishers: Vec<screen::Publisher>,
+    /// The watch transport, made by the first `watch`.
+    pub viewer: Option<screen::Viewer>,
 }
 
 impl Client {
@@ -325,6 +330,8 @@ impl Client {
             next_id: 2,
             replies: HashMap::new(),
             events: VecDeque::new(),
+            publishers: Vec::new(),
+            viewer: None,
         })
     }
 
@@ -604,11 +611,42 @@ impl Client {
         self.request("screen.start", start).await
     }
 
-    /// Joins `channel`'s voice and shares there; returns the share's id.
+    /// Joins `channel`'s voice and shares there; returns the share's id once it is live.
     pub async fn share_in(&mut self, channel: u32) -> String {
         self.ok("channel.join", json!({"channel": channel})).await;
+        self.share_here().await
+    }
+
+    /// Shares into the current voice channel and connects the publish transport; returns the
+    /// share's id once it is live (its own `screen.started` is consumed).
+    pub async fn share_here(&mut self) -> String {
         let share = self.screen_start().await.expect("screen.start");
-        share["share"].as_str().expect("share id").to_owned()
+        let share = share["share"].as_str().expect("share id").to_owned();
+        self.publish(&share).await;
+        share
+    }
+
+    /// Connects `share`'s publish transport and waits for the share to go live.
+    pub async fn publish(&mut self, share: &str) {
+        let publisher = screen::Publisher::start(self, share).await;
+        self.publishers.push(publisher);
+        let me = self.id();
+        self.next_event_where("client.updated", |c| c["id"] == me && c["sharing"] == true).await;
+        self.drain_events("screen.started").await;
+    }
+
+    /// The publisher of one of this client's shares.
+    pub fn publisher(&self, share: &str) -> &screen::Publisher {
+        self.publishers.iter().find(|p| p.share == share).expect("a publisher for the share")
+    }
+
+    /// Watches `share`, connecting a watch transport first if there is none; returns the slot.
+    pub async fn watch(&mut self, share: &str) -> u64 {
+        if self.viewer.is_none() {
+            let run = 1;
+            self.viewer = Some(screen::Viewer::start(self, run).await);
+        }
+        self.ok("screen.watch", json!({"share": share})).await["slot"].as_u64().expect("slot")
     }
 }
 

@@ -151,6 +151,7 @@ export const events: { [K in EventName]: Rule<EventData<K>> } = {
   "screen.started": screenShare,
   "screen.stopped": shape({ share: shareId, reason: literal<ScreenStopReason>(["stopped", "moderator", "left", "limit", "transport", "budget", "access"]), by: optional(str(256)) }),
   "screen.viewers": shape({ share: shareId, members: int(4294967295), guests: int(4294967295) }), "screen.link": shape({ share: shareId, active: bool }),
+  "screen.slot": shape({ run: int(Number.MAX_SAFE_INTEGER, 1), slot: int(3), share: nullable(shareId) }),
   "voice.epoch.ack": shape({call:fixed(16),group:fixed(32),epoch:id,device:fixed(32)}),
   "voice.epoch.request": shape({call:fixed(16),group:fixed(32),epoch:id}),
   "voice.closed": shape({ ...voiceFields, reason: literal(["transport_failed", "channel_restarted", "channel_deleted", "epoch_exhausted", "stream_limit", "state_limit"]) }), "chat.read": (v): v is EventData<"chat.read"> => shape({ channel: id, message: id })(v) || shape({ conversation, message: id })(v), "disconnected": shape({ reason: leave }),
@@ -189,7 +190,8 @@ export const responses: { [K in Op]: Rule<ResponseMap[K]> } = {
   "voice.offer": shape({ ...transportFields, sdp: str(65536) }),
   "voice.state": shape({voice:nullable(voiceState)}),
   "voice.epoch.ack": empty, "voice.epoch.repeat": empty,
-  "screen.start": shape({ share: shareId }), "screen.stop": empty, "screen.watch": empty, "screen.unwatch": empty, "screen.stop_other": empty, "screen.link.revoke": empty,
+  "screen.start": shape({ share: shareId }), "screen.stop": empty, "screen.watch": shape({ slot: int(3) }), "screen.unwatch": empty, "screen.stop_other": empty, "screen.link.revoke": empty,
+  "screen.publish.offer": shape({ sdp: str(65536) }), "screen.watch.offer": shape({ sdp: str(65536) }), "screen.focus": empty, "screen.keyframe": empty,
   "owner.chain": shape({ genesis: str(1024), links: array(shape({ statement: str(2048), signature: fixed(64) }), 64), next: nullable(id) }),
   "owner.transfer": empty, "managers.update": empty,
 };

@@ -55,7 +55,11 @@ use tracing::{debug, info, warn};
 
 use self::bridge::{BridgeMsg, BridgeNote, RemoteClient};
 use crate::{
-    media::{AudioOrigin, Member, Routing, SharedRouting, webrtc::MediaCmd},
+    media::{
+        AudioOrigin, Member, Routing, SharedRouting,
+        screen::{ScreenCmd, ScreenSignal},
+        webrtc::MediaCmd,
+    },
     store::{ADMIN_GROUP, ChannelRow, MEMBER_GROUP, Store},
 };
 
@@ -133,6 +137,8 @@ pub enum CoreMsg {
         binding: gwar_proto::VoiceTransportBinding,
         failed: bool,
     },
+    /// The screen SFU on a transport, in the order it saw them.
+    Screen(ScreenSignal),
     Info(oneshot::Sender<ServerInfo>),
     /// A TeamSpeak import for the running server (`gwar-server import-teamspeak` over the control socket).
     #[cfg(feature = "teamspeak")]
@@ -155,6 +161,15 @@ pub enum CoreMsg {
     /// Periodic housekeeping (expired uploads).
     Tick,
     Resume(Resume),
+}
+
+/// A reserved place in the core's queue (`CoreHandle::screen_slot`).
+pub struct ScreenSlot(mpsc::OwnedPermit<CoreMsg>);
+
+impl ScreenSlot {
+    pub fn send(self, signal: ScreenSignal) {
+        self.0.send(CoreMsg::Screen(signal));
+    }
 }
 
 #[derive(Clone)]
@@ -240,6 +255,22 @@ impl CoreHandle {
         let _ = self.tx.try_send(CoreMsg::Voice { session, connected, binding: binding.clone(), failed });
     }
 
+    /// Hands a screen SFU signal over without waiting; `Err` gives it back when the queue is
+    /// full, for the SFU to queue in order. A closed core takes it silently.
+    pub fn try_screen(&self, signal: ScreenSignal) -> Result<(), ScreenSignal> {
+        match self.tx.try_send(CoreMsg::Screen(signal)) {
+            Err(mpsc::error::TrySendError::Full(CoreMsg::Screen(signal))) => Err(signal),
+            _ => Ok(()),
+        }
+    }
+
+    /// A place in the core's queue for one screen SFU signal, taken in turn with every waiting
+    /// sender; `None` once the core is gone.
+    pub fn screen_slot(&self) -> impl Future<Output = Option<ScreenSlot>> + Send + 'static {
+        let tx = self.tx.clone();
+        async move { tx.reserve_owned().await.ok().map(ScreenSlot) }
+    }
+
     pub async fn bridge(&self, msg: BridgeMsg) {
         let _ = self.tx.send(CoreMsg::Bridge(msg)).await;
     }
@@ -305,8 +336,14 @@ struct Session {
     voice: bool,
     participation: Option<voice::Participation>,
     used_ssrcs: BTreeSet<u32>,
-    /// The share this session runs (`Client.sharing`); it ends when the session leaves voice.
+    /// The share this session runs; it ends when the session leaves voice.
     sharing: Option<String>,
+    /// That share is live (`Client.sharing`): its publish transport connected.
+    shared: bool,
+    /// The session's screen watch transport.
+    watch: Option<screen::Watch>,
+    /// The highest watch-transport run offered; runs at or below it never come back.
+    watch_run: u64,
     /// `None` for remote sessions, which live on a bridged server.
     out: Option<OutboundTx>,
     /// Bearer token for file downloads (see [`gwar_proto::FileAccess`]); empty for remote sessions.
@@ -382,6 +419,9 @@ pub struct Core {
     shares: BTreeMap<String, screen::Share>,
     /// `screen.start` rate per session.
     screen_starts: HashMap<SessionId, voice::Bucket>,
+    /// `screen.*.offer` rate per session.
+    screen_offers: HashMap<SessionId, voice::Bucket>,
+    screen: mpsc::Sender<ScreenCmd>,
 }
 
 /// Messages with ids at or above this value are delivered live and not stored.
@@ -462,9 +502,10 @@ pub fn spawn(
     config: CoreConfig,
     routing: SharedRouting,
     media: mpsc::Sender<MediaCmd>,
+    screen: mpsc::Sender<ScreenCmd>,
 ) -> Result<CoreHandle> {
     let (tx, mut rx) = mpsc::channel(4096);
-    let mut core = Core::new(store, config, routing, media, tx.downgrade())?;
+    let mut core = Core::new(store, config, routing, media, screen, tx.downgrade())?;
     let voice_bindings = core.voice_bindings.clone();
     let ticker = tx.downgrade();
     tokio::spawn(async move {
@@ -516,6 +557,7 @@ impl Core {
         config: CoreConfig,
         routing: SharedRouting,
         media: mpsc::Sender<MediaCmd>,
+        screen: mpsc::Sender<ScreenCmd>,
         me: mpsc::WeakSender<CoreMsg>,
     ) -> Result<Self> {
         if config.connect_url.is_none() {
@@ -607,6 +649,8 @@ impl Core {
             voice_bindings: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             shares: BTreeMap::new(),
             screen_starts: HashMap::new(),
+            screen_offers: HashMap::new(),
+            screen,
         };
         core.refresh_all_private();
         core.mls_reconcile()?;
@@ -651,6 +695,10 @@ impl Core {
                         self.broadcast(Event::VoiceTalking { binding, client: session, talking }, |_| true);
                     }
                 }
+            }
+            CoreMsg::Screen(ScreenSignal::Publish { share, signal }) => self.screen_published(&share, signal),
+            CoreMsg::Screen(ScreenSignal::Watch { session, run, connected }) => {
+                self.screen_watching(session, run, connected)
             }
             CoreMsg::Voice { session, connected, binding, failed } => {
                 if self
@@ -778,6 +826,7 @@ impl Core {
                     | Event::ScreenStopped { .. }
                     | Event::ScreenViewers { .. }
                     | Event::ScreenLink { .. }
+                    | Event::ScreenSlot { .. }
             )
         {
             // The bridge is never admitted to a private channel.
@@ -1199,6 +1248,9 @@ impl Core {
             participation: None,
             used_ssrcs: BTreeSet::new(),
             sharing: None,
+            shared: false,
+            watch: None,
+            watch_run: 0,
             out: Some(r.out),
             file_access: files::random_id(32),
             since: self.next_connection(),
@@ -1517,6 +1569,9 @@ impl Core {
                     participation: None,
                     used_ssrcs: BTreeSet::new(),
                     sharing: None,
+                    shared: false,
+                    watch: None,
+                    watch_run: 0,
                     out: None,
                     file_access: String::new(),
                     since: self.next_connection(),
@@ -1739,6 +1794,10 @@ impl Core {
             Request::VoiceEpochAck(r) => self.voice_epoch(session, r, false),
             Request::VoiceEpochRepeat(r) => self.voice_epoch(session, r, true),
             Request::ScreenStart(start) => self.screen_start(session, start),
+            Request::ScreenPublishOffer(offer) => return self.screen_publish_offer(session, id, offer),
+            Request::ScreenWatchOffer(offer) => return self.screen_watch_offer(session, id, offer),
+            Request::ScreenFocus { share } => self.screen_focus(session, &share),
+            Request::ScreenKeyframe { share } => self.screen_keyframe(session, &share),
             Request::ScreenStop { share } => self.screen_stop(session, &share),
             Request::ScreenWatch { share } => self.screen_watch(session, &share),
             Request::ScreenUnwatch { share } => self.screen_unwatch(session, &share),
@@ -2753,7 +2812,7 @@ fn client_view(s: &Session) -> Client {
         voice_binding: s.participation.as_ref().map(|p| p.binding.clone()),
         server_muted: s.server_muted,
         server_deafened: s.server_deafened,
-        sharing: s.sharing.is_some(),
+        sharing: s.shared,
         channel_group: None,
     }
 }
@@ -2808,6 +2867,7 @@ pub(crate) mod expiry_tests {
             },
             Arc::new(ArcSwap::from_pointee(Routing::default())),
             media,
+            mpsc::channel(8).0,
         )
     }
 
@@ -3267,6 +3327,7 @@ pub(crate) mod expiry_tests {
             },
             routing.clone(),
             media,
+            mpsc::channel(8).0,
         )
         .unwrap();
         let (out, mut frames) = mpsc::channel(OUTBOUND_QUEUE);

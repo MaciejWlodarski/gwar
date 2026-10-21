@@ -501,7 +501,7 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
     }
     case "voice.state": case "voice.epoch.ack": case "voice.epoch.request": return state;
     // Shares reach the interface with the screen-sharing UI (docs/screen-share.md, PR 4).
-    case "screen.started": case "screen.stopped": case "screen.viewers": case "screen.link": return state;
+    case "screen.started": case "screen.stopped": case "screen.viewers": case "screen.link": case "screen.slot": return state;
     case "challenge":
     case "disconnected":
       return state;

@@ -382,7 +382,13 @@ Each session has at most two screen transports besides its voice transport
   by `screen.watch.offer` on the first watch and kept while the session is
   connected. It belongs to the session, not to a call, because plaintext
   shares can be watched from outside their voice. Its offer is fixed:
-  `SCREEN_SLOTS = 4` `recvonly` video m-lines, nothing to send. Phase 2
+  `SCREEN_SLOTS = 4` `recvonly` video m-lines, nothing to send. Any other offer
+  (another count, a slot that may send, audio, a data channel) is refused
+  before negotiation, and one that would leave a stream to receive on is
+  refused after it (the SSRCs a viewer lists are its RTCP senders). Later, the
+  screen task drops any RTP a viewer sends before str0m sees it (str0m would
+  set up a stream for it by MID and RID); STUN, DTLS and RTCP pass. Media into
+  a watch transport would bypass the publisher's admission and meter. Phase 2
   widens each slot with an audio m-line
   ([Shared audio](#shared-audio-phase-2)). This mirrors the eight voice
   slots: no renegotiation when shares start, stop or change hands. A `run`
@@ -421,19 +427,31 @@ datagrams reach the screen task without slowing voice down.
     (`try_send`, capacity 2048 datagrams) to the screen task. Nothing else
     happens to it in the voice task: no peer scan, no `handle_input`, no
     drive.
-  - Unknown addresses (new ICE checks) fall back to asking voice peers'
-    `accepts`, then the screen task's.
-  - `accepts` classifies by remote address and STUN credentials (ICE
-    ufrag/pwd). This is **routing, not authentication**: SRTP authentication
-    in the owning `Rtc` is what rejects forged media, as for voice today.
+  - **STUN always goes by credentials, voice first** (RFC 7983: first byte
+    0–3), even from a screen address: by the local ICE ufrag its `USERNAME`
+    names, then `accepts` (whose integrity check covers any address but the
+    transport's nominated one). Never by address alone: str0m's `accepts`
+    takes anything from a transport's nominated address before it looks at
+    credentials, so a stale address would keep another transport's checks.
+    A voice peer that takes a check takes the address back from the screen
+    set (`disown`), so a NAT that reuses an old screen address for a voice
+    client cannot divert that client's voice for longer than one consent
+    check. In the screen task, a check claims its address for the transport
+    it names.
+  - Other datagrams from addresses no STUN claimed go to voice peers'
+    `accepts`; the screen task drops them. This is **routing, not
+    authentication**: SRTP authentication in the owning `Rtc` is what rejects
+    forged media, as for voice today.
+  - A screen transport holds at most 4 addresses; a fifth replaces the one
+    whose checks stopped longest ago.
 - **The hand-off never blocks.** A full channel drops the datagram and counts
   `screen_dispatch_dropped`. Video recovers through NACK/PLI; voice never
   waits.
 - **Egress belongs to the screen task.** It sends through a clone of the
   socket handle (`Arc<UdpSocket>`, `try_send_to`, dropping under socket
   pressure like voice). Fan-out, retransmissions and padding probes run there,
-  on its own Tokio task. Phase 1 uses the same runtime. If PR 3's measurement
-  shows voice jitter, PR 3 moves it to its own thread.
+  on its own Tokio task. Phase 1 uses the same runtime. If PR 3b's measurement
+  shows voice jitter, PR 3b moves it to its own thread.
 - **What this does not isolate:**
   - the kernel's socket buffers and the NIC queue, which are shared;
   - the clients' uplinks and downlinks, where audio and video congestion
@@ -456,7 +474,7 @@ datagrams reach the screen task without slowing voice down.
 - **On a viewer's downlink** the SFU's per-viewer allocation (below) never
   plans more than 80 % of the viewer's estimate. Voice is about 32–40 kbps per
   speaker and fits in the remainder.
-- **PR 3 acceptance compares voice with and without video,** paired runs, using
+- **PR 3b acceptance compares voice with and without video,** paired runs, using
   the `latency` example and `LATENCY_NET` relay from docs/latency.md:
   - The relay gets a `rate=` bottleneck option with a bounded queue. The
     example gets a screen load generator: a str0m frame-mode client publishing
@@ -470,7 +488,7 @@ datagrams reach the screen task without slowing voice down.
     order.
   - Gate: unconstrained, voice p95 and p99 within 2 ms of the paired baseline
     and no extra underruns. Constrained, voice p99 within 20 ms of baseline and
-    underruns within baseline + 0.5 %. Missing the gate blocks PR 3 until the
+    underruns within baseline + 0.5 %. Missing the gate blocks PR 3b until the
     isolation is changed (own thread, separate port or a lower video
     allocation).
 
@@ -563,6 +581,16 @@ does not assemble frames before forwarding.
   would loop through drops and requests.
 - **Packet-level overshoot is zero.** A packet is either within the buckets
   when it arrives or it is dropped. Nothing waits for a frame boundary.
+- **Frame bounds count every packet of the current frame**, in whatever order
+  its packets arrive; a late repair of an older frame counts against the
+  buckets only. The VP9 descriptor is parsed to its end (RFC 9628 §4.2), and a
+  truncated one is not forwarded.
+- **The transport is metered too.** Every datagram of a publish transport,
+  before str0m sees it (RTX, padding, duplicates, RTCP, STUN included), passes
+  a meter of 2,500 packets/s and 1.5× the share's cap in bytes. Over it,
+  datagrams drop before str0m, and the first drop of a run counts as an
+  overrun, so a publisher cannot exceed its budget through repairs or padding
+  that the media buckets never see.
 
 ### Forwarding: stable sequence mapping
 
@@ -772,12 +800,12 @@ send anything of the old media on that stream.
   everything, but it restarts all four slots with a DTLS handshake. The wipe
   does the same with the public API. Rebuilding stays the **mandatory
   fallback** if a str0m upgrade changes `set_rtx_cache`'s replace-on-set
-  behavior, which PR 3 pins with a test.
+  behavior, which PR 3b pins with a test.
 - **Upstream fix.** If str0m gains an age check on lookup or time-ordered
   eviction, repairs get a hard bound at no cost. That is worth proposing
   upstream, but phase 1 does not depend on it.
 
-**Tests in PR 3**, with str0m viewers behind the relay's `rate=` bottleneck.
+**Tests in PR 3b**, with str0m viewers behind the relay's `rate=` bottleneck.
 Every check timestamps packets **at the SFU's socket send**, against their
 arrival from the publisher:
 
@@ -871,7 +899,7 @@ example, a viewer with about 4 Mbps of estimate cannot watch a 1080p share
 whose keyframes are 200 KB. That is the honest limit of a single-layer share;
 phase 2's lower-resolution layer is the remedy.
 
-Tests in PR 3, with a Text-preset share averaging 0.3–0.5 Mbps, forced to
+Tests in PR 3b, with a Text-preset share averaging 0.3–0.5 Mbps, forced to
 emit 204 KB keyframes every 2 s:
 
 - **Room for keyframes.** An unconstrained viewer and a 20 Mbps viewer: neither
@@ -919,7 +947,7 @@ Egress per viewer equals the share's rate (the SFU never transcodes):
     budget uses it in about 74 hours.
   - Voice, the web app, file downloads and TeamSpeak count toward the same
     allowance.
-- **Monthly egress counter (PR 3), from the network interface.** Counting
+- **Monthly egress counter (PR 3b), from the network interface.** Counting
   only Gwar's own sockets would miss the web app, file downloads, TeamSpeak
   and everything else, so the counter reads the host's total instead:
   - Once a minute the server reads the transmitted-bytes counter of the
@@ -950,7 +978,7 @@ Egress per viewer equals the share's rate (the SFU never transcodes):
     0.4 % of an A1 core per Mbps**;
   - **100 Mbps of egress (25 viewers at 4 Mbps) ≈ 0.4 of one A1 core**, on a
     task separate from voice.
-  - PR 3 re-measures this on the VM.
+  - PR 3b re-measures this on the VM.
 - **Compute allowance.** The account is Always Free (confirmed by the owner,
   2026-10-21). Oracle's Always Free page gives 1,500 A1 OCPU-hours and
   9,000 GB-hours a month, which is 2 OCPUs and 12 GB running continuously.
@@ -1211,19 +1239,33 @@ wherever the watcher is, not only for the channel's occupants:
   watches.
 
 When access ends, the slot is released exactly like `screen.unwatch`, in the
-screen task's next loop iteration. Its Gwar queue is cleared, its RTX cache
-is wiped with `set_rtx_cache`, and its reservation is freed. The viewer gets
+screen task's next loop iteration. The core ends the slot's grant first (a
+grant also ends with its share), and the screen task checks grants before it
+feeds or polls a watch transport, so a NACK arriving before the `Release`
+finds an empty RTX cache. Commands that end things are also fenced: a
+transport whose share or lease (a watch transport's, ended when the core drops
+it) has ended closes within 100 ms even if its command was lost to a full
+queue, and an assignment is recorded only once the queue has room for it. The
+screen task's own signals to the core (connected, ended) arrive in order: what
+the core's full queue does not take waits behind one reservation in that
+queue, in line with every other sender, so a busy core cannot keep passing
+over them. Waiting signals a later one makes moot leave (a viewer's earlier
+runs; a share's `Connected` once it ended), which keeps at most two per share
+and per viewer. Its Gwar queue is cleared, and str0m drops everything its stream
+holds: packets written but not sent yet, the RTX cache and queued repairs (a
+local switch of the m-line's direction to `inactive` and back, never
+negotiated). Its reservation is freed. The viewer gets
 `screen.slot {share: null}` and `screen.stopped {reason: "access"}`. Nothing
 of the share is sent to that viewer after that iteration; repairs and probes
 included ([Queues and repairs](#queues-and-repairs)).
 
 | Op | Body | Reply / effect |
 | --- | --- | --- |
-| `screen.start` | `{call, participation, preset, surface, guest_link}` (`surface`: `screen`/`window`/`tab`/`unknown`, display only; `guest_link`: post a TeamSpeak watch link where one is possible) | `{share}`, a 16-byte random id; checks `share_screen`, limits and budget; refused in encrypted channels until PR 7. Not announced until its publish transport connects |
+| `screen.start` | `{call, participation, preset, surface, guest_link}` (`surface`: `screen`/`window`/`tab`/`unknown`, display only; `guest_link`: post a TeamSpeak watch link where one is possible) | `{share}`, a 16-byte random id; checks `share_screen`, limits and budget; refused in encrypted channels until PR 7. Not announced until its publish transport connects; one not answered 35 s after its start, or not connected 35 s after its answer, ends with `transport`, told to the sharer only |
 | `screen.publish.offer` | `{share, ssrc, rtx_ssrc, sdp}` | `{sdp}`; the share's own publish transport. Its first connection announces `screen.started` to the channel. One per share, never renegotiated |
 | `screen.stop` | `{share}` | ok; event `screen.stopped {share, reason: "stopped"}` |
-| `screen.watch.offer` | `{run, sdp}` | `{sdp}`; the session's watch transport (4 `recvonly` slots). `run` restarts it like voice's run |
-| `screen.watch` | `{share}` | `{slot}`; needs a connected watch transport; the server assigns a slot, opens a segment at the next keyframe (throttled request), event `screen.slot` |
+| `screen.watch.offer` | `{run, sdp}` | `{sdp}`; the session's watch transport (4 `recvonly` slots). `run` restarts it like voice's run; a run is retired for good once offered, so a failed or closed run and every lower one answer `stale` |
+| `screen.watch` | `{share}` | `{slot}`; needs a connected watch transport (`unavailable` otherwise); the server assigns a slot, opens a segment at the next keyframe (throttled request), event `screen.slot` |
 | `screen.focus` | `{share}` | ok; the share on the viewer's stage gets first claim on its bandwidth |
 | `screen.unwatch` | `{share}` | ok; the slot is freed |
 | `screen.keyframe` | `{share}` | ok; throttled PLI. Lets a viewer whose decryptor lost sync, for example after a key change, recover without re-watching |
@@ -1234,9 +1276,10 @@ Events:
 
 - `screen.started {share, client, channel, preset, surface}`;
 - `screen.viewers {share, members, guests}`, to the sharer only, and
-  `screen.link {share, active}` to the sharer and the channel's moderators;
+  `screen.link {share, active}` to the sharer and, once the share is announced, the channel's moderators;
 - `screen.stopped {share, reason: stopped|moderator|left|limit|transport|budget|access}`;
-- `screen.slot {binding, slot, share | null}`, like `voice.slot`;
+- `screen.slot {run, slot, share | null}`, like `voice.slot`, tagged with the
+  watch transport's `run`;
 - `screen.paused {share, reason: bandwidth}` and `screen.resumed {share}`.
 
 `Welcome` carries `shares: [{share, client, channel, preset, surface}]` for
@@ -1686,30 +1729,50 @@ person.
      `tests/moderation.rs`;
    - the client validators;
    - no media yet.
-3. **SFU video forwarding (L, 8–12 days).**
+3. **SFU video forwarding (L, 8–12 days), in two PRs.** Forwarding and
+   allocation are each large enough to review on their own, so PR 3 is split.
+   PR 3a carries media end to end; PR 3b makes it fair under constrained
+   links and measures it. Nothing ships to users before PR 4, so 3a's gaps
+   are never live.
+
+   **PR 3a: transports and forwarding.**
    - The address-map dispatch and bounded hand-off from the voice task, and
      the screen task.
    - `screen.publish.offer` and `screen.watch.offer`, and their `Rtc`s
-     (VP9/VP8 + RTX), polling after every input.
+     (VP9/VP8 + RTX), polling after every input. A share is announced when
+     its publish transport connects, and ends with `transport` if it has not
+     35 s after the answer.
    - Share admission: the `ScreenOrigin` binding and byte/packet buckets.
-   - Slot assignment, `screen.watch`/`unwatch`/`focus` and `screen.slot`.
+   - Slot assignment, `screen.watch`/`unwatch`/`focus`/`keyframe` and
+     `screen.slot`. `screen.focus` is recorded; it takes effect with 3b's
+     allocation.
    - Stable sequence mapping with segments, and timestamp offsets.
-   - Per-packet ingress enforcement with frame bounds; the Gwar-owned
-     per-viewer priority queue with unpaced streams, 400 ms deadlines and
-     bounded admission; RTX cache wiped on pause/unwatch/reassignment; the
-     per-viewer egress cap at socket send; wait-for-keyframe; the one
-     keyframe throttle, and NACK/RTX.
-   - Per-viewer aggregate allocation with pause/resume.
+   - Per-packet ingress enforcement with frame bounds; wait-for-keyframe;
+     the one keyframe throttle, and NACK/RTX with the RTX cache wiped on
+     unwatch and reassignment. Forwarding writes straight to str0m's unpaced
+     streams.
+   - Counters in `ScreenCmd::Inspect`.
+   - Tests (`tests/screen.rs`, with str0m clients as sharer and viewers):
+     - a late viewer starts at a keyframe and receives every byte in order;
+     - publisher-side loss is repaired into place; viewer-side loss is
+       repaired without reaching the sharer;
+     - unwatching, stopping and losing access end the media at once;
+     - a bucket emptying mid-frame cuts until the next keyframe, and three
+       overruns end the share with `limit`;
+     - the keyframe throttle holds under a request flood;
+     - transports are negotiated strictly (one video m-line with its RTX
+       group, idempotent offers, `stale`/`conflict` runs).
+
+   **PR 3b: allocation, egress and measurement.**
+   - The Gwar-owned per-viewer priority queue with 400 ms deadlines and
+     bounded admission; the RTX cache also wiped on pause; the per-viewer
+     egress cap at socket send.
+   - Per-viewer aggregate allocation with pause/resume, honouring
+     `screen.focus`.
    - Cap-based reservations, continuous egress measurement and negotiation
      limits.
    - The monthly egress counter and admin warnings.
-   - Counters in `MediaCmd::Inspect`.
-   - Tests: Rust end-to-end in `tests/media.rs` style, using str0m frame-mode
-     clients as sharer and viewers:
-     - late join decodes from a keyframe;
-     - **publisher-side** loss, reordering and RTX repair reach viewers
-       correctly (frames compared byte for byte);
-     - viewer-side loss is repaired without reaching the sharer;
+   - The remaining tests:
      - two shares on one constrained viewer pause the lower priority one;
      - a viewer outside the share's voice watches a plaintext share, and
        loses it when the channel becomes hidden to it;
@@ -1721,16 +1784,6 @@ person.
        password-protected channel loses the slot when it leaves voice, joins
        another channel, or is moved out by a moderator or the bridge, with
        the same cleanup;
-     - stale packets after a drop never cross a segment;
-     - unknown and stale-share SSRCs drop;
-     - a stopped share frees slots;
-     - the keyframe throttle holds under a request flood;
-     - **a bucket emptying mid-frame**: the forwarded prefix stays, the rest
-       of the frame and later deltas drop, the next keyframe starts a new
-       segment, and the publisher receives one PLI;
-     - **missing frame boundaries**: a publisher sending one timestamp past
-       512 KB, 600 packets or 500 ms is cut at the bound, and three such
-       overruns in 10 s stop the share;
      - the tests in "Queues and repairs": a bandwidth collapse,
        pause/unwatch (NACK and probe included), a reordered publisher
        repair, a NACK storm against the per-viewer egress cap, probes within
@@ -1853,7 +1906,7 @@ weeks, the owner's decisions add:
 
 - TeamSpeak watch links (PR 6): 7–10 working days, about 2 weeks;
 - watching from outside voice (PRs 2–4): 2–3 days;
-- the monthly egress counter (PR 3): half a day.
+- the monthly egress counter (PR 3b): half a day.
 
 Shared audio (6–8 working days) is not in these figures: it moved to phase 2
 (PR 9).
@@ -1863,7 +1916,7 @@ times the working days). The estimate stays uncertain until three things are
 known:
 
 - PR 1 shows whether the WKWebView picker works without changes;
-- PR 3's voice gate passes or forces more isolation (its own thread or port);
+- PR 3b's voice gate passes or forces more isolation (its own thread or port);
 - PR 7's controller change lands without reworking the voice activation
   tests.
 
@@ -1911,8 +1964,8 @@ known:
   laptops. The spike's M5 is not representative. Mitigation: the Game preset
   drops to 720p60 when `qualityLimitationReason` is `cpu`; H.264 hardware in
   phase 2.
-- **SFU CPU on the VM.** Extrapolated from an M5 (PR 3 measures).
-- **Voice under video load.** Isolation is designed, not yet measured. PR 3's
+- **SFU CPU on the VM.** Extrapolated from an M5 (PR 3b measures).
+- **Voice under video load.** Isolation is designed, not yet measured. PR 3b's
   paired gate decides whether the shared-runtime task is enough, or whether
   the screen task needs its own thread or port.
 - **Controller complexity.** Two endpoint kinds under one MLS call controller

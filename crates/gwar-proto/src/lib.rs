@@ -25,6 +25,9 @@ pub const PROTOCOL_VERSION: u32 = 4;
 /// Number of server→client audio slots a WebRTC client must offer as `recvonly`.
 pub const AUDIO_SLOTS: usize = 8;
 
+/// Number of `recvonly` video slots a screen watch transport offers: one per share watched.
+pub const SCREEN_SLOTS: usize = 4;
+
 /// Unread counts stop at this value ("99+").
 pub const UNREAD_CAP: u32 = 100;
 
@@ -283,6 +286,18 @@ wire! {
         /// its channel with a rank above the sharer.
         #[serde(rename = "screen.link.revoke")]
         ScreenLinkRevoke { share: String },
+        /// Negotiates a share's own publish transport, once per share.
+        #[serde(rename = "screen.publish.offer")]
+        ScreenPublishOffer(ScreenPublishOffer),
+        /// Negotiates the session's watch transport ([`SCREEN_SLOTS`] `recvonly` video slots).
+        #[serde(rename = "screen.watch.offer")]
+        ScreenWatchOffer(ScreenWatchOffer),
+        /// The share on the viewer's stage: it gets first claim on the viewer's bandwidth.
+        #[serde(rename = "screen.focus")]
+        ScreenFocus { share: String },
+        /// Asks for a keyframe of a watched share (throttled).
+        #[serde(rename = "screen.keyframe")]
+        ScreenKeyframe { share: String },
         #[serde(untagged)]
         Mls(MlsRequest),
         #[serde(untagged)]
@@ -581,6 +596,10 @@ wire! {
         TeamspeakClaimable { claimable: Vec<Uid> },
         /// `screen.start`: the new share's id.
         ScreenShare { share: String },
+        /// `screen.publish.offer`, `screen.watch.offer`: the SDP answer.
+        ScreenAnswer { sdp: String },
+        /// `screen.watch`: the watch transport's slot the share arrives in.
+        ScreenSlot { slot: u32 },
         Mls(MlsResponse),
         Empty {},
     }
@@ -716,6 +735,16 @@ wire! {
         /// To the sharer and the channel's moderators: whether the share's TeamSpeak watch link works.
         #[serde(rename = "screen.link")]
         ScreenLink { share: String, active: bool },
+        /// To a viewer: which share a slot of its watch transport `run` carries now, if any.
+        #[serde(rename = "screen.slot")]
+        ScreenSlot {
+            #[serde(deserialize_with = "voice::run")]
+            #[cfg_attr(feature = "ts", ts(type = "number"))]
+            run: u64,
+            slot: u32,
+            #[serde(deserialize_with = "voice::required_option")]
+            share: Option<String>,
+        },
         /// This user read a channel or conversation up to `message` on another device.
         #[serde(rename = "chat.read")]
         ChatRead { #[serde(flatten)] target: ChatReadTarget, message: MessageId },

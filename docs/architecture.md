@@ -43,6 +43,11 @@ is the development exception.
   the core publishes (`ArcSwap`, lock-free reads). Clients decode and mix
   themselves (TS3 does it natively; browsers and the desktop app have 8 fixed
   receive "slots" assigned to active speakers).
+- **Screen video goes through the same port, on its own task.** The voice task
+  reads the socket and hands datagrams from screen transports to the screen
+  task over a bounded channel that never blocks voice. That task forwards
+  VP9/VP8 packets to up to 4 watch slots per session, starting each at a
+  keyframe ([screen-share.md](screen-share.md) §3).
 - **Speech gate on the server.** Browsers send their audio level (RFC 6464);
   the server drops silence, drives the "talking" indicator and ends talk spurts
   for TeamSpeak clients.
