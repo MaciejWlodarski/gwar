@@ -785,7 +785,7 @@ impl<'a> Bridge<'a> {
         let cid = r.get("cid").or_else(|| r.get("ctid")).and_then(|v| v.parse().ok()).unwrap_or(0);
         let remote = Remote {
             session: 0,
-            nickname: r.get("client_nickname").cloned().unwrap_or_default(),
+            nickname: r.get("client_nickname").map(|n| shown(n)).unwrap_or_default(),
             cid,
             muted: flag(r, "client_input_muted"),
             deafened: flag(r, "client_output_muted"),
@@ -912,9 +912,9 @@ impl<'a> Bridge<'a> {
             let Some(clid) = r.get("clid").and_then(|v| v.parse::<u16>().ok()) else { continue };
             let Some(remote) = self.remotes.get_mut(&clid) else { continue };
             let mut update = RemoteUpdate::default();
-            if let Some(nickname) = r.get("client_nickname").filter(|n| **n != remote.nickname) {
+            if let Some(nickname) = r.get("client_nickname").map(|n| shown(n)).filter(|n| *n != remote.nickname) {
                 remote.nickname = nickname.clone();
-                update.nickname = Some(nickname.clone());
+                update.nickname = Some(nickname);
             }
             let (muted, deafened, away) =
                 (flag(&r, "client_input_muted"), flag(&r, "client_output_muted"), away_of(&r));
@@ -1414,8 +1414,8 @@ impl<'a> Bridge<'a> {
                     let Some(clid) = r.get("clid").and_then(|v| v.parse::<u16>().ok()) else { continue };
                     let reason = match r.get("reasonid").map(String::as_str) {
                         Some("5") | Some("6") => LeaveReason::Kicked {
-                            by: r.get("invokername").cloned().unwrap_or_default(),
-                            reason: r.get("reasonmsg").filter(|m| !m.is_empty()).cloned(),
+                            by: r.get("invokername").map(|n| shown(n)).unwrap_or_default(),
+                            reason: r.get("reasonmsg").filter(|m| !m.is_empty()).map(|m| shown(m)),
                         },
                         Some("3") => LeaveReason::Timeout,
                         Some("11") => LeaveReason::ServerShutdown,
@@ -1665,7 +1665,16 @@ fn flag(r: &Record, key: &str) -> bool {
 }
 
 fn away_of(r: &Record) -> Option<String> {
-    flag(r, "client_away").then(|| r.get("client_away_message").cloned().unwrap_or_default())
+    flag(r, "client_away").then(|| r.get("client_away_message").map(|a| shown(a)).unwrap_or_default())
+}
+
+/// A TeamSpeak user's nickname or away message as Gwar shows it: bidi formatting goes (it
+/// reorders the text around it) and control characters become spaces. TeamSpeak mode cleans
+/// the same way (`display_text` in gwar-client, `displayText` in apps/web/src/lib/text.ts).
+fn shown(text: &str) -> String {
+    let bidi =
+        |c: char| matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    text.chars().filter(|&c| !bidi(c)).map(|c| if c.is_control() { ' ' } else { c }).collect()
 }
 
 /// TeamSpeak 5/6 clients report their major version first; TS3 reports 3.x.
@@ -1716,6 +1725,13 @@ fn ignore_duplicate<T>(result: Result<T>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn teamspeak_names_lose_bidi_and_control_characters() {
+        assert_eq!(super::shown("Gar\u{202e}den\u{2066}"), "Garden");
+        assert_eq!(super::shown("a\tb\nc\u{7}"), "a b c ");
+        assert_eq!(super::shown("  spaced  "), "  spaced  ");
+    }
+
     use super::*;
 
     fn remote(session: SessionId, cid: u64) -> Remote {
