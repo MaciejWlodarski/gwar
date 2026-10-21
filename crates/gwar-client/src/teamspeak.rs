@@ -20,8 +20,8 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use futures::StreamExt;
 use gwar_proto::{
-    Ban, Channel, ChannelId, ChatMessage, ChatTarget, Client, ClientUpdate, ErrorBody, ErrorCode, Event, LeaveReason,
-    MessageId, Permission, Platform, Request, ServerInfo, SessionId, Welcome,
+    Badge, BadgeKind, Ban, Channel, ChannelId, ChatMessage, ChatTarget, Client, ClientUpdate, ErrorBody, ErrorCode,
+    Event, LeaveReason, MessageId, Permission, Platform, Request, ServerInfo, SessionId, Welcome,
 };
 use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
@@ -364,6 +364,7 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>, previous: &View)
                     server_muted: false,
                     server_deafened: false,
                     sharing: false,
+                    channel_group: Some(c.channel_group.0 as u32),
                     voice_binding: Some(
                         previous
                             .clients
@@ -408,8 +409,31 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>, previous: &View)
         file_access: Default::default(),
         teamspeak: true,
         server_chat: Default::default(),
+        badges: badges(state),
     };
     Some(View { server: Some(server), channels, clients, descriptions, names })
+}
+
+/// The groups worth a badge: regular ones, but not the defaults everyone has.
+fn badges(state: &tsclientlib::data::Connection) -> Vec<Badge> {
+    let regular = |t: &tsclientlib::GroupType| matches!(t, tsclientlib::GroupType::Regular);
+    let server = state
+        .server_groups
+        .values()
+        .filter(|g| regular(&g.group_type) && g.id != state.server.default_server_group)
+        .map(|g| (BadgeKind::Server, g.id.0, &g.name, g.sort_id));
+    let channel = state
+        .channel_groups
+        .values()
+        .filter(|g| regular(&g.group_type) && g.id != state.server.default_channel_group)
+        .map(|g| (BadgeKind::Channel, g.id.0, &g.name, g.sort_id));
+    let mut badges: Vec<_> = server
+        .chain(channel)
+        .map(|(kind, id, name, sort)| Badge { kind, id: id as u32, name: name.clone(), sort })
+        .collect();
+    // Hash map order would change the server info on every look.
+    badges.sort_by_key(|b| (b.kind == BadgeKind::Channel, b.sort, b.id));
+    badges
 }
 
 /// Events turning `old` into `new`.
@@ -1387,6 +1411,7 @@ mod tests {
             server_muted: false,
             server_deafened: false,
             sharing: false,
+            channel_group: None,
         }
     }
 

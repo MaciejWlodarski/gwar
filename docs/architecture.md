@@ -535,6 +535,12 @@ therefore have different TS suffixes while retaining the same Gwar nickname.
     path) and its password (tsclientlib's `channel` and `channel_password`).
   - TeamSpeak 3.13 sends no channel permission hints, so the UI cannot tell
     ahead of time which channels refuse a join; the refusal explains it.
+  - TeamSpeak's server and channel groups arrive as `ServerInfo.badges`
+    (regular groups only, without the server's default server and channel
+    group, which everyone has); `Client.groups` holds the server groups and
+    `Client.channel_group` the channel group. The UI shows them by name next
+    to members. They are display only and never Gwar roles: permissions stay
+    with the TeamSpeak server.
 
 ## Clients
 

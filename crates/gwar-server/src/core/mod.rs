@@ -551,6 +551,7 @@ impl Core {
             },
             teamspeak: config.teamspeak,
             server_chat: store.server_chat()?,
+            badges: Vec::new(),
         };
         let groups = store.groups()?.into_iter().map(|g| (g.id, g)).collect();
         let mls_commit_clock = store.meta("mls_commit_clock")?.map(|s| s.parse()).transpose()?.unwrap_or(0);
@@ -2753,6 +2754,7 @@ fn client_view(s: &Session) -> Client {
         server_muted: s.server_muted,
         server_deafened: s.server_deafened,
         sharing: s.sharing.is_some(),
+        channel_group: None,
     }
 }
 

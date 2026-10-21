@@ -113,6 +113,15 @@ describe("gwar/4 runtime schemas", () => {
     expect(responseFor("screen.watch", {})).toBe(true);
     expect(parseFrame('{"re":1,"err":{"code":"busy","message":"full"}}')?.kind).toBe("err");
   });
+  it("accepts TeamSpeak group badges in the server info and a client's channel group", () => {
+    const w = welcome();
+    const badge = { kind: "server", id: 6, name: "Server Admin", sort: 0 };
+    const client = { id: 2, uid: "ts:QQ==", nickname: "bob", channel: 1, groups: [6], platform: "ts3", muted: false, deafened: false, away: null, talking: false, voice: true, voice_binding: null, channel_group: 5 };
+    expect(responseFor("join", { ...w, server: { ...w.server, badges: [badge] }, clients: [client] })).toBe(true);
+    expect(responseFor("join", { ...w, server: { ...w.server, badges: [{ ...badge, kind: "role" }] } })).toBe(false);
+    expect(responseFor("join", { ...w, server: { ...w.server, badges: [{ ...badge, name: "x".repeat(300) }] } })).toBe(false);
+    expect(parseFrame(JSON.stringify({ ev: "server.updated", d: { ...w.server, badges: [badge] } }))?.kind).toBe("event");
+  });
   it("validates challenge keys and nonces with exact fields and canonical encodings", () => {
     const valid = challenge();
     expect(parseFrame(JSON.stringify(valid))?.kind).toBe("event");
