@@ -37,6 +37,25 @@ wire! {
         pub surface: ScreenSurface,
     }
 
+    /// A share's publish transport: one `sendonly` video m-line whose main and RTX SSRCs are
+    /// named here and must be the only ones in the SDP.
+    #[serde(deny_unknown_fields)]
+    pub struct ScreenPublishOffer {
+        pub share: String,
+        pub ssrc: u32,
+        pub rtx_ssrc: u32,
+        pub sdp: String,
+    }
+
+    /// The session's watch transport. A greater `run` replaces it, like voice's run.
+    #[serde(deny_unknown_fields)]
+    pub struct ScreenWatchOffer {
+        #[serde(deserialize_with = "voice::run")]
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        pub run: u64,
+        pub sdp: String,
+    }
+
     /// Why a share ended. `access`: its sharer lost `share_screen`, or, told to one viewer, that
     /// viewer may no longer watch it.
     #[derive(Copy, Eq)]
@@ -83,6 +102,8 @@ mod tests {
             Event::ScreenStopped { share: "s".into(), reason: ScreenStopReason::Moderator, by: Some("mod".into()) },
             Event::ScreenViewers { share: "s".into(), members: 2, guests: 0 },
             Event::ScreenLink { share: "s".into(), active: false },
+            Event::ScreenSlot { run: 1, slot: 3, share: Some("s".into()) },
+            Event::ScreenSlot { run: 2, slot: 0, share: None },
         ] {
             let frame = ServerFrame::Event(event);
             let text = serde_json::to_string(&frame).unwrap();
@@ -93,6 +114,29 @@ mod tests {
             serde_json::to_value(ServerFrame::Event(stopped)).unwrap(),
             json!({"ev": "screen.stopped", "d": {"share": "s", "reason": "access"}})
         );
+    }
+
+    #[test]
+    fn transport_frames_are_strict() {
+        let offer = json!({"share": "s", "ssrc": 1, "rtx_ssrc": 2, "sdp": "v=0"});
+        let frame: ClientFrame =
+            serde_json::from_value(json!({"id": 1, "op": "screen.publish.offer", "d": offer})).unwrap();
+        assert!(matches!(frame.request, Request::ScreenPublishOffer(ScreenPublishOffer { ssrc: 1, rtx_ssrc: 2, .. })));
+        let watch = |run: serde_json::Value| json!({"id": 1, "op": "screen.watch.offer", "d": {"run": run, "sdp": ""}});
+        assert!(serde_json::from_value::<ClientFrame>(watch(json!(1))).is_ok());
+        for run in [json!(0), json!(9007199254740992u64), json!(-1)] {
+            assert!(serde_json::from_value::<ClientFrame>(watch(run.clone())).is_err(), "run {run}");
+        }
+        for (ok, text) in [
+            (Response::ScreenAnswer { sdp: "a".into() }, r#"{"sdp":"a"}"#),
+            (Response::ScreenSlot { slot: 2 }, r#"{"slot":2}"#),
+        ] {
+            let reply = ServerFrame::Ok { re: 1, ok };
+            assert_eq!(serde_json::to_string(&reply).unwrap(), format!(r#"{{"re":1,"ok":{text}}}"#));
+            assert_eq!(serde_json::from_str::<ServerFrame>(&serde_json::to_string(&reply).unwrap()).unwrap(), reply);
+        }
+        let slot = json!({"ev": "screen.slot", "d": {"run": 1, "slot": 0}});
+        assert!(serde_json::from_value::<ServerFrame>(slot).is_err(), "share must be present, even as null");
     }
 
     #[test]

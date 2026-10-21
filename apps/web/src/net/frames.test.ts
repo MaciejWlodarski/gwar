@@ -110,7 +110,16 @@ describe("gwar/4 runtime schemas", () => {
     expect(event("screen.link", { share: share.share, active: false })).toBe("event");
     expect(responseFor("screen.start", { share: share.share })).toBe(true);
     expect(responseFor("screen.start", {})).toBe(false);
-    expect(responseFor("screen.watch", {})).toBe(true);
+    expect(responseFor("screen.watch", { slot: 3 })).toBe(true);
+    expect(responseFor("screen.watch", { slot: 4 })).toBe(false);
+    expect(responseFor("screen.watch", {})).toBe(false);
+    expect(responseFor("screen.publish.offer", { sdp: "v=0" })).toBe(true);
+    expect(responseFor("screen.watch.offer", { sdp: "x".repeat(65537) })).toBe(false);
+    expect(event("screen.slot", { run: 1, slot: 0, share: share.share })).toBe("event");
+    expect(event("screen.slot", { run: 2, slot: 3, share: null })).toBe("event");
+    expect(event("screen.slot", { run: 0, slot: 0, share: null })).toBeUndefined();
+    expect(event("screen.slot", { run: 1, slot: 4, share: null })).toBeUndefined();
+    expect(event("screen.slot", { run: 1, slot: 0 })).toBeUndefined();
     expect(parseFrame('{"re":1,"err":{"code":"busy","message":"full"}}')?.kind).toBe("err");
   });
   it("validates challenge keys and nonces with exact fields and canonical encodings", () => {

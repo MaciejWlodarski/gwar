@@ -20,7 +20,7 @@ pub(crate) fn optional_safe_u64<'de, D: serde::Deserializer<'de>>(d: D) -> Resul
     }
     Ok(value)
 }
-fn run<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+pub(crate) fn run<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
     let value = safe_u64(d)?;
     if value == 0 {
         return Err(serde::de::Error::custom("run must be positive"));

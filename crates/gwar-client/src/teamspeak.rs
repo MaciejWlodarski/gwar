@@ -757,7 +757,11 @@ fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Vec<(Part,
         | Request::ScreenWatch { .. }
         | Request::ScreenUnwatch { .. }
         | Request::ScreenStopOther { .. }
-        | Request::ScreenLinkRevoke { .. } => return Err(refused("screen sharing requires a Gwar server")),
+        | Request::ScreenLinkRevoke { .. }
+        | Request::ScreenPublishOffer(_)
+        | Request::ScreenWatchOffer(_)
+        | Request::ScreenFocus { .. }
+        | Request::ScreenKeyframe { .. } => return Err(refused("screen sharing requires a Gwar server")),
         Request::Sealed(_) => return Err(refused("encrypted direct messages require a Gwar server")),
         Request::Mls(_) => return Err(refused("MLS requires a Gwar server")),
         Request::OwnerChain { .. } | Request::OwnerTransfer { .. } | Request::ManagersUpdate { .. } => {

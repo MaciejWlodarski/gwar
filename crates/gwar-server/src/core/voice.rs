@@ -105,10 +105,10 @@ fn token() -> String {
     rand::rng().fill_bytes(&mut b);
     URL_SAFE_NO_PAD.encode(b)
 }
-fn bad(message: &str) -> ErrorBody {
+pub(super) fn bad(message: &str) -> ErrorBody {
     err(ErrorCode::BadRequest, message)
 }
-fn stale() -> ErrorBody {
+pub(super) fn stale() -> ErrorBody {
     err(ErrorCode::Stale, "stale voice binding")
 }
 fn state_limits(
@@ -968,6 +968,7 @@ mod tests {
             },
             Arc::new(ArcSwap::from_pointee(Routing::default())),
             media,
+            mpsc::channel(8).0,
             _tx.downgrade(),
         )
         .unwrap();

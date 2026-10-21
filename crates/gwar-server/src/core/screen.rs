@@ -1,20 +1,33 @@
 //! Screen shares (docs/screen-share.md, "Protocol and permissions"): who shares what where, and
 //! who watches it. A share belongs to its sharer's voice participation and ends with it; a watch
-//! belongs to the viewer's session and is checked again whenever its access can change. No media
-//! yet: the SFU's publish and watch transports (PR 3) hang off the seams marked below.
-use super::*;
-use gwar_proto::{ScreenPreset, ScreenShare, ScreenStart, ScreenStopReason, ScreenSurface, VoiceParticipation};
+//! belongs to the viewer's session and is checked again whenever its access can change.
+//!
+//! Media runs in the screen SFU task (`media::screen`). A share is announced once its publish
+//! transport connects. Each watch holds a slot of the viewer's watch transport through a
+//! [`WatchGrant`], ended here the moment access ends, before the SFU hears of it.
+use super::{
+    voice::{bad, stale},
+    *,
+};
+use crate::media::screen::{PUBLISH_CONNECT, PublishSignal, ScreenCmd, ScreenOrigin, WatchGrant, publish_ssrcs};
+use gwar_proto::{
+    SCREEN_SLOTS, ScreenPreset, ScreenPublishOffer, ScreenShare, ScreenStart, ScreenStopReason, ScreenSurface,
+    ScreenWatchOffer, VoiceParticipation,
+};
 
 /// Sharing limits (docs/screen-share.md, "Limits"). Server settings once the SFU enforces the
-/// bitrate and budget that go with them.
+/// budget that goes with them.
 const SHARES_PER_CHANNEL: usize = 4;
 const SHARES_PER_SERVER: usize = 32;
 const VIEWERS_PER_SHARE: usize = 25;
-/// Shares one session watches at once: the watch transport's slots (`SCREEN_SLOTS`).
-const WATCHES_PER_SESSION: usize = 4;
 /// `screen.start` per session: a burst of 4, then 4 a minute.
 const STARTS_BURST: f64 = 4.0;
 const STARTS_PER_SECOND: f64 = 4.0 / 60.0;
+/// `screen.*.offer` per session: 4 a minute.
+const OFFERS_BURST: f64 = 4.0;
+const OFFERS_PER_SECOND: f64 = 4.0 / 60.0;
+/// Largest SDP offer or answer.
+const SDP_LIMIT: usize = 64 * 1024;
 
 pub(super) struct Share {
     sharer: SessionId,
@@ -28,6 +41,25 @@ pub(super) struct Share {
     /// The watch link was turned off, for good.
     link_revoked: bool,
     viewers: BTreeSet<SessionId>,
+    origin: Arc<ScreenOrigin>,
+    /// The publish transport connected and the share was announced.
+    live: bool,
+    publish: Option<Publish>,
+}
+
+/// A share's publish transport, negotiated once.
+struct Publish {
+    offer: ScreenPublishOffer,
+    answer: Option<String>,
+}
+
+/// A session's watch transport and what its slots carry.
+pub(super) struct Watch {
+    run: u64,
+    sdp: String,
+    answer: Option<String>,
+    connected: bool,
+    slots: [Option<(String, Arc<WatchGrant>)>; SCREEN_SLOTS],
 }
 
 fn not_found() -> ErrorBody {
@@ -45,16 +77,21 @@ impl Core {
         let viewer = Some(&self.sessions[&session]);
         self.shares
             .iter()
-            .filter(|(_, s)| self.admitted(viewer, s.channel))
+            .filter(|(_, s)| s.live && self.admitted(viewer, s.channel))
             .map(|(id, _)| self.share_view(id))
             .collect()
     }
 
-    /// The share `session` names, if it can see its channel: hidden, unknown and malformed ids
-    /// answer the same.
+    /// The share `session` names, if it can see its channel and the share is live, or it is
+    /// the session's own: hidden, unknown, not yet announced and malformed ids answer the same.
     fn visible_share(&self, session: SessionId, id: &str) -> Result<&Share, ErrorBody> {
         let share = self.shares.get(id).ok_or_else(not_found)?;
-        if self.admitted(Some(&self.sessions[&session]), share.channel) { Ok(share) } else { Err(not_found()) }
+        let own = share.sharer == session;
+        if own || (share.live && self.admitted(Some(&self.sessions[&session]), share.channel)) {
+            Ok(share)
+        } else {
+            Err(not_found())
+        }
     }
 
     /// Our sessions that can see `channel`: the audience of its shares' announcements.
@@ -85,6 +122,14 @@ impl Core {
         Ok(())
     }
 
+    fn take_offer(&mut self, session: SessionId) -> Result<(), ErrorBody> {
+        self.screen_offers
+            .entry(session)
+            .or_insert_with(|| voice::Bucket::new(OFFERS_PER_SECOND, OFFERS_BURST))
+            .take()
+            .map_err(|_| err(ErrorCode::RateLimited, "screen transports are negotiated too often"))
+    }
+
     pub(super) fn screen_start(&mut self, session: SessionId, start: ScreenStart) -> Reply {
         self.screen_starts
             .entry(session)
@@ -97,6 +142,9 @@ impl Core {
             return Err(err(ErrorCode::Unavailable, "screen sharing in encrypted channels is not available yet"));
         }
         self.require_in(session, channel, Permission::ShareScreen)?;
+        if self.sessions[&session].out.is_none() {
+            return Err(bad("remote session has no WebRTC transport"));
+        }
         if self.sessions[&session].sharing.is_some() {
             return Err(err(ErrorCode::Conflict, "you are already sharing"));
         }
@@ -107,6 +155,7 @@ impl Core {
             return Err(err(ErrorCode::Busy, "the server has as many shares as allowed"));
         }
         let id = files::random_id(16);
+        let private = self.channels.get(&channel).is_some_and(|c| c.private);
         let share = Share {
             sharer: session,
             channel,
@@ -116,14 +165,213 @@ impl Core {
             guest_link: start.guest_link,
             link_revoked: false,
             viewers: BTreeSet::new(),
+            origin: ScreenOrigin::new(session, id.clone(), channel, false, private),
+            live: false,
+            publish: None,
         };
         self.shares.insert(id.clone(), share);
         self.sessions.get_mut(&session).expect("checked by caller").sharing = Some(id.clone());
-        // PR 3 moves this announcement to the first connection of the share's publish transport.
-        let audience = self.share_audience(channel);
-        self.broadcast(Event::ScreenStarted(self.share_view(&id)), |s| audience.contains(&s.id));
-        self.client_updated(session);
+        // Announced when the publish transport connects; one that never does ends the share.
+        if let Some(tx) = self.me.upgrade() {
+            let share = id.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(PUBLISH_CONNECT + Duration::from_secs(5)).await;
+                let check = move |core: &mut Core| {
+                    if core.shares.get(&share).is_some_and(|s| !s.live) {
+                        core.end_share(&share, ScreenStopReason::Transport, None);
+                    }
+                };
+                let _ = tx.send(CoreMsg::Resume(Box::new(check))).await;
+            });
+        }
         Ok(Response::ScreenShare { share: id })
+    }
+
+    /// Negotiates the share's publish transport, once.
+    pub(super) fn screen_publish_offer(
+        &mut self,
+        session: SessionId,
+        id: u32,
+        offer: ScreenPublishOffer,
+    ) -> Option<Reply> {
+        let checked = (|| {
+            let share = self.visible_share(session, &offer.share)?;
+            if share.sharer != session {
+                return Err(err(ErrorCode::Forbidden, "this is not your share"));
+            }
+            if let Some(publish) = &share.publish {
+                if publish.offer != offer {
+                    return Err(err(ErrorCode::Conflict, "the share's transport is already negotiated"));
+                }
+                return publish
+                    .answer
+                    .clone()
+                    .map(|sdp| Some(Response::ScreenAnswer { sdp }))
+                    .ok_or_else(|| err(ErrorCode::Unavailable, "negotiation pending"));
+            }
+            if offer.sdp.len() > SDP_LIMIT {
+                return Err(err(ErrorCode::TooLarge, "SDP too large"));
+            }
+            if publish_ssrcs(&offer.sdp) != Some((offer.ssrc, offer.rtx_ssrc)) {
+                return Err(bad("offer must carry exactly one video stream with its RTX, as named"));
+            }
+            Ok(None)
+        })();
+        match checked {
+            Err(e) => return Some(Err(e)),
+            Ok(Some(answer)) => return Some(Ok(answer)),
+            Ok(None) => {}
+        }
+        if let Err(e) = self.take_offer(session) {
+            return Some(Err(e));
+        }
+        let Ok(permit) = self.screen.clone().try_reserve_owned() else {
+            return Some(Err(err(ErrorCode::Unavailable, "screen engine busy")));
+        };
+        let share = self.shares.get_mut(&offer.share).expect("checked above");
+        share.publish = Some(Publish { offer: offer.clone(), answer: None });
+        let (reply, rx) = oneshot::channel();
+        permit.send(ScreenCmd::Publish { origin: share.origin.clone(), ssrc: offer.ssrc, sdp: offer.sdp, reply });
+        let tx = self.me.upgrade()?;
+        let name = offer.share;
+        tokio::spawn(async move {
+            let answer = negotiated(rx).await;
+            let resume = move |core: &mut Core| {
+                let Some(share) = core.shares.get_mut(&name) else { return };
+                let result = match answer {
+                    Ok(sdp) => {
+                        if let Some(publish) = &mut share.publish {
+                            publish.answer = Some(sdp.clone());
+                        }
+                        Ok(Response::ScreenAnswer { sdp })
+                    }
+                    Err(message) => {
+                        core.end_share(&name, ScreenStopReason::Transport, None);
+                        core.client_updated(session);
+                        Err(bad(message))
+                    }
+                };
+                core.reply(session, id, result);
+            };
+            let _ = tx.send(CoreMsg::Resume(Box::new(resume))).await;
+        });
+        None
+    }
+
+    /// Negotiates the session's watch transport. A greater run replaces it and ends its watches.
+    pub(super) fn screen_watch_offer(&mut self, session: SessionId, id: u32, offer: ScreenWatchOffer) -> Option<Reply> {
+        if self.sessions[&session].out.is_none() {
+            return Some(Err(bad("remote session has no WebRTC transport")));
+        }
+        if let Some(watch) = &self.sessions[&session].watch {
+            if offer.run < watch.run {
+                return Some(Err(stale()));
+            }
+            if offer.run == watch.run {
+                if watch.sdp != offer.sdp {
+                    return Some(Err(err(ErrorCode::Conflict, "run reused with a different offer")));
+                }
+                return Some(
+                    watch
+                        .answer
+                        .clone()
+                        .map(|sdp| Response::ScreenAnswer { sdp })
+                        .ok_or_else(|| err(ErrorCode::Unavailable, "negotiation pending")),
+                );
+            }
+        }
+        if offer.sdp.len() > SDP_LIMIT {
+            return Some(Err(err(ErrorCode::TooLarge, "SDP too large")));
+        }
+        if let Err(e) = self.take_offer(session) {
+            return Some(Err(e));
+        }
+        let Ok(permit) = self.screen.clone().try_reserve_owned() else {
+            return Some(Err(err(ErrorCode::Unavailable, "screen engine busy")));
+        };
+        self.drop_watches(session, false);
+        self.sessions.get_mut(&session).expect("checked above").watch = Some(Watch {
+            run: offer.run,
+            sdp: offer.sdp.clone(),
+            answer: None,
+            connected: false,
+            slots: Default::default(),
+        });
+        let (reply, rx) = oneshot::channel();
+        permit.send(ScreenCmd::Watch { session, run: offer.run, sdp: offer.sdp, reply });
+        let tx = self.me.upgrade()?;
+        let run = offer.run;
+        tokio::spawn(async move {
+            let answer = negotiated(rx).await;
+            let resume = move |core: &mut Core| {
+                let Some(watch) = core.sessions.get_mut(&session).and_then(|s| s.watch.as_mut()) else { return };
+                if watch.run != run {
+                    return;
+                }
+                let result = match answer {
+                    Ok(sdp) => {
+                        watch.answer = Some(sdp.clone());
+                        Ok(Response::ScreenAnswer { sdp })
+                    }
+                    Err(message) => {
+                        core.sessions.get_mut(&session).expect("found above").watch = None;
+                        Err(bad(message))
+                    }
+                };
+                core.reply(session, id, result);
+            };
+            let _ = tx.send(CoreMsg::Resume(Box::new(resume))).await;
+        });
+        None
+    }
+
+    /// The screen SFU reports on a publish transport.
+    pub(super) fn screen_published(&mut self, id: &str, signal: PublishSignal) {
+        let Some(share) = self.shares.get_mut(id) else { return };
+        match signal {
+            PublishSignal::Connected => {
+                if std::mem::replace(&mut share.live, true) {
+                    return;
+                }
+                let (sharer, channel) = (share.sharer, share.channel);
+                if let Some(s) = self.sessions.get_mut(&sharer) {
+                    s.shared = true;
+                }
+                let audience = self.share_audience(channel);
+                self.broadcast(Event::ScreenStarted(self.share_view(id)), |s| audience.contains(&s.id));
+                self.client_updated(sharer);
+            }
+            PublishSignal::Ended(reason) => {
+                let sharer = share.sharer;
+                self.end_share(id, reason, None);
+                self.client_updated(sharer);
+            }
+        }
+    }
+
+    /// The screen SFU reports on a watch transport: once it is gone its watches end.
+    pub(super) fn screen_watching(&mut self, session: SessionId, run: u64, connected: bool) {
+        let Some(watch) = self.sessions.get_mut(&session).and_then(|s| s.watch.as_mut()) else { return };
+        if watch.run != run {
+            return;
+        }
+        watch.connected = connected;
+        if !connected {
+            self.drop_watches(session, true);
+            self.sessions.get_mut(&session).expect("found above").watch = None;
+        }
+    }
+
+    /// Ends every watch of `session` (its transport is replaced or gone), telling it per slot
+    /// when `tell`.
+    fn drop_watches(&mut self, session: SessionId, tell: bool) {
+        let watched: Vec<String> =
+            self.shares.iter().filter(|(_, s)| s.viewers.contains(&session)).map(|(id, _)| id.clone()).collect();
+        for id in watched {
+            self.free_slot(session, &id, tell);
+            self.shares.get_mut(&id).expect("listed above").viewers.remove(&session);
+            self.send_viewers(&id);
+        }
     }
 
     pub(super) fn screen_stop(&mut self, session: SessionId, id: &str) -> Reply {
@@ -187,28 +435,73 @@ impl Core {
             return Err(err(ErrorCode::BadRequest, "you cannot watch your own share"));
         }
         self.may_watch(session, share)?;
-        if share.viewers.contains(&session) {
-            return Ok(Response::Empty {});
+        let watching = share.viewers.contains(&session);
+        let full = share.viewers.len() >= VIEWERS_PER_SHARE;
+        let Some(watch) = self.sessions[&session].watch.as_ref().filter(|w| w.connected) else {
+            return Err(err(ErrorCode::Unavailable, "connect a watch transport first"));
+        };
+        if watching {
+            let slot = watch.slots.iter().position(|s| s.as_ref().is_some_and(|(share, _)| share == id));
+            return Ok(Response::ScreenSlot { slot: slot.expect("a watch holds a slot") as u32 });
         }
-        if share.viewers.len() >= VIEWERS_PER_SHARE {
+        if full {
             return Err(err(ErrorCode::Busy, "this share has as many viewers as allowed"));
         }
-        if self.shares.values().filter(|s| s.viewers.contains(&session)).count() >= WATCHES_PER_SESSION {
+        let Some(slot) = watch.slots.iter().position(Option::is_none) else {
             return Err(err(ErrorCode::Busy, "you are watching as many shares as allowed"));
-        }
-        // PR 3 assigns the watch transport's slot here and answers with it.
+        };
+        let run = watch.run;
+        let grant = WatchGrant::new(id.to_owned());
+        let watch = self.sessions.get_mut(&session).and_then(|s| s.watch.as_mut()).expect("checked above");
+        watch.slots[slot] = Some((id.to_owned(), grant.clone()));
         self.shares.get_mut(id).expect("checked above").viewers.insert(session);
+        let _ = self.screen.try_send(ScreenCmd::Assign { session, run, slot: slot as u32, grant });
+        self.send_event(session, Event::ScreenSlot { run, slot: slot as u32, share: Some(id.to_owned()) });
         self.send_viewers(id);
-        Ok(Response::Empty {})
+        Ok(Response::ScreenSlot { slot: slot as u32 })
     }
 
     pub(super) fn screen_unwatch(&mut self, session: SessionId, id: &str) -> Reply {
         self.visible_share(session, id)?;
         if self.shares.get_mut(id).expect("checked above").viewers.remove(&session) {
-            // PR 3 frees the slot here.
+            self.free_slot(session, id, true);
             self.send_viewers(id);
         }
         Ok(Response::Empty {})
+    }
+
+    /// The share on the viewer's stage.
+    pub(super) fn screen_focus(&mut self, session: SessionId, id: &str) -> Reply {
+        if !self.visible_share(session, id)?.viewers.contains(&session) {
+            return Err(err(ErrorCode::NotFound, "you are not watching this share"));
+        }
+        let _ = self.screen.try_send(ScreenCmd::Focus { session, share: id.to_owned() });
+        Ok(Response::Empty {})
+    }
+
+    /// A viewer's decryptor lost sync: a keyframe, within the viewer's budget.
+    pub(super) fn screen_keyframe(&mut self, session: SessionId, id: &str) -> Reply {
+        if !self.visible_share(session, id)?.viewers.contains(&session) {
+            return Err(err(ErrorCode::NotFound, "you are not watching this share"));
+        }
+        let _ = self.screen.try_send(ScreenCmd::Keyframe { session, share: id.to_owned() });
+        Ok(Response::Empty {})
+    }
+
+    /// Releases the slot that carries `id` for `session`: its grant ends now, the SFU wipes it
+    /// next, and the viewer hears of it when `tell`.
+    fn free_slot(&mut self, session: SessionId, id: &str, tell: bool) {
+        let Some(watch) = self.sessions.get_mut(&session).and_then(|s| s.watch.as_mut()) else { return };
+        let Some(slot) = watch.slots.iter().position(|s| s.as_ref().is_some_and(|(share, _)| share == id)) else {
+            return;
+        };
+        let (_, grant) = watch.slots[slot].take().expect("found above");
+        grant.end();
+        let run = watch.run;
+        let _ = self.screen.try_send(ScreenCmd::Release { session, run, slot: slot as u32 });
+        if tell {
+            self.send_event(session, Event::ScreenSlot { run, slot: slot as u32, share: None });
+        }
     }
 
     /// Tells the sharer how many watch their share.
@@ -218,16 +511,28 @@ impl Core {
         self.send_event(sharer, Event::ScreenViewers { share: id.to_owned(), members, guests: 0 });
     }
 
-    /// Ends a share for everyone who can see its channel. The caller updates the sharer's
-    /// `Client.sharing` (a move already does).
+    /// Ends a share: for everyone who can see its channel once it was announced, else for its
+    /// sharer alone. The caller updates the sharer's `Client.sharing` (a move already does).
     fn end_share(&mut self, id: &str, reason: ScreenStopReason, by: Option<String>) {
-        let Some(share) = self.shares.remove(id) else { return };
-        // PR 3 closes the share's publish transport and frees its viewers' slots here.
+        let Some(share) = self.shares.get(id) else { return };
+        share.origin.end();
+        let viewers: Vec<_> = share.viewers.iter().copied().collect();
+        for viewer in viewers {
+            self.free_slot(viewer, id, true);
+        }
+        let share = self.shares.remove(id).expect("found above");
+        let _ = self.screen.try_send(ScreenCmd::EndPublish { share: id.to_owned() });
         if let Some(s) = self.sessions.get_mut(&share.sharer) {
             s.sharing = None;
+            s.shared = false;
         }
-        let audience = self.share_audience(share.channel);
-        self.broadcast(Event::ScreenStopped { share: id.to_owned(), reason, by }, |s| audience.contains(&s.id));
+        let event = Event::ScreenStopped { share: id.to_owned(), reason, by };
+        if share.live {
+            let audience = self.share_audience(share.channel);
+            self.broadcast(event, |s| audience.contains(&s.id));
+        } else {
+            self.send_event(share.sharer, event);
+        }
     }
 
     /// Ends one viewer's watch whose access is gone, exactly like `screen.unwatch`, and says so.
@@ -236,7 +541,7 @@ impl Core {
         if !share.viewers.remove(&session) {
             return;
         }
-        // PR 3 frees the slot, clears its queue and wipes its RTX cache here.
+        self.free_slot(session, id, true);
         self.send_event(
             session,
             Event::ScreenStopped { share: id.to_owned(), reason: ScreenStopReason::Access, by: None },
@@ -287,12 +592,10 @@ impl Core {
     /// A session that is going away stops watching; its own share ended when it left voice.
     pub(super) fn screen_session_gone(&mut self, session: SessionId) {
         self.screen_starts.remove(&session);
-        let watched: Vec<String> =
-            self.shares.iter().filter(|(_, s)| s.viewers.contains(&session)).map(|(id, _)| id.clone()).collect();
-        for id in watched {
-            self.shares.get_mut(&id).expect("listed above").viewers.remove(&session);
-            // PR 3 frees the slot here.
-            self.send_viewers(&id);
+        self.screen_offers.remove(&session);
+        self.drop_watches(session, false);
+        if self.sessions.get_mut(&session).and_then(|s| s.watch.take()).is_some() {
+            let _ = self.screen.try_send(ScreenCmd::EndWatch { session });
         }
     }
 
@@ -303,20 +606,41 @@ impl Core {
         let ids: Vec<String> =
             self.shares.iter().filter(|(_, s)| s.channel == channel).map(|(id, _)| id.clone()).collect();
         for id in ids {
-            if self.shares.get_mut(&id).expect("listed above").viewers.remove(&session) {
-                // PR 3 frees the slot here.
+            let share = self.shares.get_mut(&id).expect("listed above");
+            let live = share.live;
+            if share.viewers.remove(&session) {
+                self.free_slot(session, &id, true);
                 self.send_viewers(&id);
             }
-            self.send_event(session, Event::ScreenStopped { share: id, reason: ScreenStopReason::Access, by: None });
+            if live {
+                self.send_event(
+                    session,
+                    Event::ScreenStopped { share: id, reason: ScreenStopReason::Access, by: None },
+                );
+            }
         }
     }
 
     /// `session` can see `channel` now: it learns of the shares running there.
     pub(super) fn screen_shown(&mut self, session: SessionId, channel: ChannelId) {
-        let shares: Vec<_> =
-            self.shares.iter().filter(|(_, s)| s.channel == channel).map(|(id, _)| self.share_view(id)).collect();
+        let shares: Vec<_> = self
+            .shares
+            .iter()
+            .filter(|(_, s)| s.live && s.channel == channel)
+            .map(|(id, _)| self.share_view(id))
+            .collect();
         for share in shares {
             self.send_event(session, Event::ScreenStarted(share));
         }
     }
+}
+
+/// Waits for the SFU's answer to an offer.
+async fn negotiated(rx: oneshot::Receiver<Result<String, &'static str>>) -> Result<String, &'static str> {
+    tokio::time::timeout(Duration::from_secs(30), rx)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(Err("media negotiation stopped"))
+        .and_then(|sdp| if sdp.len() <= SDP_LIMIT { Ok(sdp) } else { Err("answer too large") })
 }

@@ -6,6 +6,7 @@
 mod admission;
 pub mod opus;
 pub use admission::RtpCounters;
+pub mod screen;
 pub mod webrtc;
 
 use std::{

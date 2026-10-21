@@ -105,10 +105,14 @@ export interface ResponseMap {
   "voice.epoch.repeat": Empty;
   "screen.start": { share: string };
   "screen.stop": Empty;
-  "screen.watch": Empty;
+  "screen.watch": { slot: number };
   "screen.unwatch": Empty;
   "screen.stop_other": Empty;
   "screen.link.revoke": Empty;
+  "screen.publish.offer": { sdp: string };
+  "screen.watch.offer": { sdp: string };
+  "screen.focus": Empty;
+  "screen.keyframe": Empty;
   "owner.chain": { genesis: string; links: import("../proto/OwnerLinkStatement").OwnerLinkStatement[]; next: number | null };
   "owner.transfer": Empty;
   "managers.update": Empty;

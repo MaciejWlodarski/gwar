@@ -241,6 +241,9 @@ pub struct WebRtcConfig {
     pub socket: Arc<UdpSocket>,
     /// Address browsers should send to (public IP and UDP port).
     pub advertise: SocketAddr,
+    /// Hands datagrams of screen transports to the screen SFU (docs/screen-share.md, "Socket
+    /// ownership and dispatch").
+    pub screen: super::screen::Dispatch,
 }
 
 pub async fn run(
@@ -251,7 +254,7 @@ pub async fn run(
     core: CoreHandle,
     mut commands: mpsc::Receiver<MediaCmd>,
 ) {
-    let WebRtcConfig { socket, advertise } = config;
+    let WebRtcConfig { socket, advertise, screen } = config;
     info!(%advertise, "WebRTC media listening");
     let mut peers: HashMap<SessionId, Peer> = HashMap::new();
     let mut buf = vec![0u8; 2048];
@@ -335,14 +338,25 @@ pub async fn run(
             },
             received = socket.recv_from(&mut buf) => match received {
                 Ok((n, source)) => {
+                    // A screen transport's address goes straight to the screen task, before any
+                    // voice work.
+                    if screen.owns(&source) {
+                        screen.send(source, &buf[..n]);
+                        continue;
+                    }
                     let Ok(contents) = buf[..n].try_into() else { continue };
                     let input = Input::Receive(Instant::now(), Receive { proto: Protocol::Udp, source, destination: advertise, contents });
-                    if let Some(peer) = peers.values_mut().find(|p| p.rtc.accepts(&input))
-                        && peer.admission.admits_datagram(&buf[..n], peer.origin.encrypted)
-                        && let Err(e) = peer.rtc.handle_input(input) {
-                            debug!(session = peer.session, "rtc input: {e}");
-                            peer.rtc.disconnect();
+                    match peers.values_mut().find(|p| p.rtc.accepts(&input)) {
+                        Some(peer) => {
+                            if peer.admission.admits_datagram(&buf[..n], peer.origin.encrypted)
+                                && let Err(e) = peer.rtc.handle_input(input) {
+                                    debug!(session = peer.session, "rtc input: {e}");
+                                    peer.rtc.disconnect();
+                                }
                         }
+                        // Unknown to voice: perhaps a new screen transport's first check.
+                        None => screen.send(source, &buf[..n]),
+                    }
                 }
                 Err(e) => warn!("udp receive: {e}"),
             },

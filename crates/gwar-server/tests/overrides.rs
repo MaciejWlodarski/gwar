@@ -285,23 +285,23 @@ async fn losing_bypass_password_ends_watches_from_outside_the_channel() {
     give(&mut root, &bob, json!([2, keys])).await;
     let vault = channel_id(&root.create_channel(json!({"name": "Vault", "password": "s3cret"})).await);
     alice.ok("channel.join", json!({"channel": vault, "password": "s3cret"})).await;
-    let share = alice.screen_start().await.unwrap()["share"].clone();
+    let share = alice.share_here().await;
     let ended = json!({"share": share, "reason": "access"});
     let watch = json!({"share": share});
 
     // Bob is not in the vault, nor in voice at all.
-    bob.ok("screen.watch", watch.clone()).await;
+    bob.watch(&share).await;
     root.ok("group.update", json!({"group": keys, "permissions": []})).await;
     assert_eq!(bob.next_event("screen.stopped").await, ended, "role edit");
     assert_eq!(bob.fails("screen.watch", watch.clone()).await, "forbidden");
 
     root.ok("group.update", json!({"group": keys, "permissions": ["bypass_password"]})).await;
-    bob.ok("screen.watch", watch.clone()).await;
+    bob.watch(&share).await;
     root.ok("channel.override", for_role(vault, keys, json!([]), json!(["bypass_password"]))).await;
     assert_eq!(bob.next_event("screen.stopped").await, ended, "override");
 
     root.ok("channel.override", for_role(vault, keys, json!([]), json!([]))).await;
-    bob.ok("screen.watch", watch.clone()).await;
+    bob.watch(&share).await;
     give(&mut root, &bob, json!([2])).await;
     assert_eq!(bob.next_event("screen.stopped").await, ended, "role removal");
     assert_eq!(alice.next_event_where("screen.viewers", |v| v["members"] == 0).await["share"], share);

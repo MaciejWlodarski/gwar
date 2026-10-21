@@ -1152,15 +1152,15 @@ async fn shares_and_watches_have_limits() {
 
     let mut viewer = Client::connect(&server, "viewer").await;
     for share in &shares[..4] {
-        viewer.ok("screen.watch", json!({"share": share})).await;
+        viewer.watch(share).await;
     }
     // Watching again is a no-op; a fifth share does not fit the watch transport's slots.
-    viewer.ok("screen.watch", json!({"share": shares[0]})).await;
+    viewer.watch(&shares[0]).await;
     assert_eq!(viewer.fails("screen.watch", json!({"share": shares[4]})).await, "busy");
     assert_eq!(sharers[0].next_event("screen.viewers").await, json!({"share": shares[0], "members": 1, "guests": 0}));
     viewer.ok("screen.unwatch", json!({"share": shares[0]})).await;
     assert_eq!(sharers[0].next_event("screen.viewers").await, json!({"share": shares[0], "members": 0, "guests": 0}));
-    viewer.ok("screen.watch", json!({"share": shares[4]})).await;
+    viewer.watch(&shares[4]).await;
 
     assert_eq!(sharers[0].fails("screen.watch", json!({"share": shares[0]})).await, "bad_request");
     for unknown in ["AAAAAAAAAAAAAAAAAAAAAA", "not a share"] {
@@ -1205,7 +1205,7 @@ async fn being_admitted_or_shut_out_of_a_private_channel_shows_or_ends_its_share
     let both = json!({"roles": [], "users": [alice.welcome.uid, bob.welcome.uid]});
     root.ok("channel.update", json!({"channel": secret, "access": both})).await;
     assert_eq!(bob.next_event("screen.started").await["share"], share);
-    bob.ok("screen.watch", json!({"share": share})).await;
+    bob.watch(&share).await;
 
     root.ok("channel.update", json!({"channel": secret, "access": only_alice})).await;
     assert_eq!(bob.next_event("screen.stopped").await, json!({"share": share, "reason": "access"}));
@@ -1225,8 +1225,8 @@ async fn sharers_shut_out_together_each_hear_of_every_share_once() {
     let secret = channel_id(&root.create_channel(json!({"name": "secret", "private": true, "access": both})).await);
     let a = alice.share_in(secret).await;
     let b = bob.share_in(secret).await;
-    alice.ok("screen.watch", json!({"share": b})).await;
-    bob.ok("screen.watch", json!({"share": a})).await;
+    alice.watch(&b).await;
+    bob.watch(&a).await;
 
     // One update shuts both out: each leaves, which ends its share for those who still see it.
     let neither = json!({"roles": [], "users": [carol.welcome.uid]});
@@ -1254,18 +1254,18 @@ async fn a_password_channels_share_is_watched_from_inside_or_with_bypass_passwor
     let general = seed_channel(&root, "General");
     let vault = channel_id(&root.create_channel(json!({"name": "Vault", "password": "s3cret"})).await);
     alice.ok("channel.join", json!({"channel": vault, "password": "s3cret"})).await;
-    let share = alice.screen_start().await.unwrap()["share"].as_str().unwrap().to_owned();
+    let share = alice.share_here().await;
 
     assert_eq!(bob.fails("screen.watch", json!({"share": share})).await, "forbidden");
     bob.ok("channel.join", json!({"channel": vault, "password": "s3cret"})).await;
-    bob.ok("screen.watch", json!({"share": share})).await;
+    bob.watch(&share).await;
     // Admins hold bypass_password: they watch from anywhere.
-    root.ok("screen.watch", json!({"share": share})).await;
+    root.watch(&share).await;
 
     // A plaintext share is watched without being in voice at all.
     let mut carol = Client::connect(&server, "carol").await;
     let open = carol.share_in(general).await;
-    alice.ok("screen.watch", json!({"share": open})).await;
+    alice.watch(&open).await;
     alice.ok("channel.leave", json!({})).await;
     alice.sync().await;
     assert!(alice.drain_events("screen.stopped").await.iter().all(|e| e["share"] != open), "still watching");
