@@ -343,8 +343,9 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
         const parentChanged = parentId !== existing.parent;
         await controller.updateChannel({
           channel: existing.id,
-          name: name.trim(),
-          topic: topic.trim(),
+          // Only text edited here: the shown name and topic may be cleaned copies of the server's.
+          ...(name !== (existing.name ?? "") ? { name: name.trim() } : {}),
+          ...(topic !== (existing.topic ?? "") ? { topic: topic.trim() } : {}),
           // "" removes the password; absent keeps it.
           ...(sealedChannel ? {} : removePassword ? { password: "" } : password ? { password } : {}),
           // 0 removes the limit (protocol rule for channel.update).

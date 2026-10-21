@@ -126,4 +126,27 @@ describe("creating a channel", () => {
     expect(mock.update).toHaveBeenCalledTimes(1);
     expect(mock.update.mock.calls[0]![0]).not.toHaveProperty("access");
   });
+  it("sends the name and topic only when edited here", async () => {
+    const channel = { id: 4, parent: null, name: "Garden", topic: "Lawn", position: 0, has_password: false, max_clients: null, encrypted: false, history: false, private: false, synced: false };
+    useSession.setState({ kind: "teamspeak", channels: { 4: channel } });
+    useUi.getState().openDialog({ kind: "channelEdit", mode: "edit", channel: 4 });
+    await act(async () => root.render(<TooltipProvider><Dialogs /></TooltipProvider>));
+    const input = password() as HTMLInputElement;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "hunter2");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    const save = () => [...document.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')].find(b => b.textContent === "Save")!;
+    await act(async () => save().click());
+    expect(mock.update).toHaveBeenCalledWith({ channel: 4, password: "hunter2" });
+    useUi.getState().openDialog({ kind: "channelEdit", mode: "edit", channel: 4 });
+    await act(async () => root.render(<TooltipProvider><Dialogs /></TooltipProvider>));
+    const name = document.querySelector<HTMLInputElement>('[role="dialog"] input:not([type="password"])')!;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(name, " Yard ");
+      name.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => save().click());
+    expect(mock.update).toHaveBeenLastCalledWith({ channel: 4, name: "Yard" });
+  });
 });

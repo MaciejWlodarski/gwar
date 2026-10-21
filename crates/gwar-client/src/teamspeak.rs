@@ -277,6 +277,9 @@ struct View {
     clients: BTreeMap<u32, Client>,
     /// Channel descriptions TeamSpeak sent (on `channelgetdescription`), as it sent them.
     descriptions: BTreeMap<u32, String>,
+    /// Channel names as TeamSpeak sent them; `channels` holds the cleaned ones the UI shows, which
+    /// two channels can share.
+    names: BTreeMap<u32, String>,
 }
 
 // Direct TS has local adapter tokens only; it has no Gwar call or MLS group.
@@ -293,6 +296,7 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>, previous: &View)
         .values()
         .filter_map(|c| Some((c.id.0 as u32, c.optional_data.as_ref()?.description.clone())))
         .collect();
+    let names = state.channels.values().map(|c| (c.id.0 as u32, c.name.clone())).collect();
     // TS orders siblings by "previous sibling id"; walk the chains for positions.
     let mut by_parent: HashMap<u64, Vec<&tsclientlib::data::Channel>> = HashMap::new();
     for channel in state.channels.values() {
@@ -405,7 +409,7 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>, previous: &View)
         teamspeak: true,
         server_chat: Default::default(),
     };
-    Some(View { server: Some(server), channels, clients, descriptions })
+    Some(View { server: Some(server), channels, clients, descriptions, names })
 }
 
 /// Events turning `old` into `new`.
@@ -475,7 +479,8 @@ enum Reply {
     Join,
     /// `chat.send`: our own message. TeamSpeak's echo of it is dropped, so this is its one copy.
     Message(ChatTarget, String),
-    /// `channel.create`: the new channel, once the book shows it.
+    /// `channel.create`: the new channel, once the book shows it. Found by the name as asked for:
+    /// a cleaned name may match an older channel's.
     Created {
         parent: Option<ChannelId>,
         name: String,
@@ -494,7 +499,7 @@ fn reply_for(request: &Request, view: &View, own: u16) -> Reply {
     match request {
         Request::ChannelJoin { .. } => Reply::Join,
         Request::ChatSend { target, text, .. } => Reply::Message(target.clone(), text.clone()),
-        Request::ChannelCreate(c) => Reply::Created { parent: c.parent, name: display_text(&c.name, false) },
+        Request::ChannelCreate(c) => Reply::Created { parent: c.parent, name: c.name.clone() },
         Request::ChannelUpdate(u) => Reply::Channel(u.channel),
         Request::TokenRedeem { .. } => Reply::Groups,
         Request::ChannelDescription { channel } => Reply::Description(*channel),
@@ -594,7 +599,7 @@ fn answer(reply: &Reply, view: &View, own: u16) -> Option<Result<Value, ErrorBod
     match reply {
         Reply::Empty | Reply::Join | Reply::Message(..) => Some(Ok(json!({}))),
         Reply::Created { parent, name } => {
-            view.channels.values().find(|c| c.parent == *parent && c.name == *name).map(value)
+            view.channels.values().find(|c| c.parent == *parent && view.names.get(&c.id) == Some(name)).map(value)
         }
         Reply::Channel(id) => match view.channels.get(id) {
             Some(channel) => Some(value(channel)),
@@ -1394,6 +1399,7 @@ mod tests {
         view.channels.insert(9, channel(9, Some(1), "Nine", 2));
         view.clients.insert(3, client(3, "ts:me", "me", 7));
         view.clients.insert(4, client(4, "ts:Ym9i", "bob", 8));
+        view.names = view.channels.values().map(|c| (c.id, c.name.clone())).collect();
         view
     }
 
@@ -1420,6 +1426,24 @@ mod tests {
         assert_eq!(answer(&create, &View::default(), 3), None);
         let created: Channel = serde_json::from_value(answer(&create, &view, 3).unwrap().unwrap()).unwrap();
         assert_eq!(created.id, 7);
+        // An older channel shown under the same cleaned name is not the new one.
+        let mut clash = view.clone();
+        clash.channels.insert(10, channel(10, Some(1), "Garden", 3));
+        clash.names.insert(10, "Gar\u{202e}den".into());
+        let create = reply_for(
+            &Request::ChannelCreate(gwar_proto::ChannelCreate {
+                name: "Garden".into(),
+                parent: Some(1),
+                ..Default::default()
+            }),
+            &clash,
+            3,
+        );
+        assert_eq!(answer(&create, &clash, 3), None);
+        clash.channels.insert(11, channel(11, Some(1), "Garden", 4));
+        clash.names.insert(11, "Garden".into());
+        let created: Channel = serde_json::from_value(answer(&create, &clash, 3).unwrap().unwrap()).unwrap();
+        assert_eq!(created.id, 11);
         let updated = answer(
             &reply_for(
                 &Request::ChannelUpdate(gwar_proto::ChannelUpdate { channel: 7, ..Default::default() }),
