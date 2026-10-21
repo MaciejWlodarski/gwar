@@ -9,10 +9,11 @@ import { TooltipProvider } from "./kit";
 
 const mock = vi.hoisted(() => ({
   description: vi.fn(async (_channel: number) => ""),
-  poke: vi.fn(async (_client: number, _message: string) => ({})),
+  poke: vi.fn(async (_client: number, _uid: string, _message: string) => ({})),
+  ban: vi.fn(async (_ban: object) => ({})),
 }));
 vi.mock("../state/controller", () => ({
-  controller: { channelDescription: mock.description, pokeClient: mock.poke, onRoster: () => () => {} },
+  controller: { channelDescription: mock.description, pokeClient: mock.poke, createBan: mock.ban, onRoster: () => () => {} },
   describeJoinError: String,
   describeRequestError: String,
   UploadError: class extends Error {},
@@ -26,6 +27,7 @@ describe("TeamSpeak dialogs", () => {
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
     mock.description.mockReset();
     mock.poke.mockClear();
+    mock.ban.mockClear();
     useSettings.setState({ language: "en" });
     useSession.setState({ kind: "teamspeak", channels: { 5: channel }, members: {} });
     container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
@@ -58,7 +60,22 @@ describe("TeamSpeak dialogs", () => {
     });
     const button = [...document.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')].find((b) => b.textContent === "Poke")!;
     await act(async () => button.click());
-    expect(mock.poke).toHaveBeenCalledWith(7, "look up");
+    expect(mock.poke).toHaveBeenCalledWith(7, "ts:b", "look up");
     expect(useUi.getState().dialog.kind).toBe("none");
+  });
+
+  it("shows a description without formatting that would reorder it, keeping its lines", async () => {
+    mock.description.mockResolvedValueOnce("Rules\u202e1\n\tbe nice\u0000");
+    useUi.getState().openDialog({ kind: "channelInfo", channel: 5 });
+    await open();
+    expect(document.querySelector('[data-testid="channel-description"]')!.textContent).toBe("Rules1\n\tbe nice");
+  });
+
+  it("bans the person the dialog was opened for, by session and identity", async () => {
+    useUi.getState().openDialog({ kind: "ban", person: { uid: "ts:alice", nickname: "alice", session: 7 } });
+    await open();
+    const button = [...document.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')].find((b) => b.textContent === "Ban…")!;
+    await act(async () => button.click());
+    expect(mock.ban).toHaveBeenCalledWith(expect.objectContaining({ client: 7, uid: "ts:alice" }));
   });
 });

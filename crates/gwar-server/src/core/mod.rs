@@ -1681,7 +1681,9 @@ impl Core {
             Request::ClientKick { from_channel: true, .. } => {
                 Err(err(ErrorCode::BadRequest, "Gwar servers kick from the server only"))
             }
-            Request::ClientKick { client, reason, from_channel: false } => self.client_kick(session, client, reason),
+            Request::ClientKick { client, uid, reason, from_channel: false } => {
+                self.client_kick(session, client, uid, reason)
+            }
             Request::ClientPoke { .. } | Request::ChannelDescription { .. } => {
                 Err(err(ErrorCode::BadRequest, "only TeamSpeak servers have that"))
             }
@@ -1833,12 +1835,19 @@ impl Core {
         Ok(Response::Empty {})
     }
 
-    fn client_kick(&mut self, session: SessionId, client: SessionId, reason: Option<String>) -> Reply {
+    fn client_kick(
+        &mut self,
+        session: SessionId,
+        client: SessionId,
+        uid: Option<Uid>,
+        reason: Option<String>,
+    ) -> Reply {
         self.require(session, Permission::KickMembers)?;
         if client == session {
             return Err(err(ErrorCode::BadRequest, "cannot kick yourself"));
         }
-        let Some(target) = self.sessions.get(&client) else {
+        // A reused session id is someone else.
+        let Some(target) = self.sessions.get(&client).filter(|s| uid.as_ref().is_none_or(|u| *u == s.uid)) else {
             return Err(err(ErrorCode::NotFound, "no such client"));
         };
         if !self.outranks(session, &target.member, &target.groups) {

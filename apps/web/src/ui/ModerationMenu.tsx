@@ -122,7 +122,7 @@ export function ModerationItems({ person, groups }: { person: PersonRef; groups:
         </ContextMenu.Item>
       )}
       {showKickChannel && (
-        <ContextMenu.Item className={cn(menuItem, menuItemDanger)} onSelect={() => void controller.kickFromChannel(person.session!)}>
+        <ContextMenu.Item className={cn(menuItem, menuItemDanger)} onSelect={() => void controller.kickFromChannel(person.session!, person.uid)}>
           <DoorOpen className="size-4" /> {t("tree.kickChannel")}
         </ContextMenu.Item>
       )}
@@ -138,7 +138,7 @@ export function ModerationItems({ person, groups }: { person: PersonRef; groups:
               body: t("tree.kickBody"),
               confirmLabel: t("tree.kick"),
               danger: true,
-              onConfirm: () => void controller.kickClient(person.session!),
+              onConfirm: () => void controller.kickClient(person.session!, person.uid),
             })
           }
         >

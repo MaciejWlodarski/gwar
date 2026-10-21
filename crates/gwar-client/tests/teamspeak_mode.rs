@@ -416,9 +416,13 @@ async fn teamspeak_mode_pokes_kicks_bans_and_channel_details() {
     let described = request(&admin, Request::ChannelDescription { channel: alpha.id }).await;
     assert_eq!(described, serde_json::json!({ "description": "Welcome to Alpha" }));
 
-    // A poke reaches bob as a poke, not as a message.
+    // A poke reaches bob as a poke, not as a message, without the formatting that would
+    // reorder or break its text. It names bob as the admin's client sees him.
     let mut bob = support::ts_client(bridged.ts_voice, "bob").await;
-    let poke = Request::ClientPoke { client: bob.welcome.session, message: "over here".into() };
+    let (bob_id, bob_uid) = (bob.welcome.session, bob.welcome.uid.clone());
+    until(&mut admin.events, |e| matches!(e, Event::ClientJoined(c) if c.id == bob_id)).await;
+    let poke =
+        Request::ClientPoke { client: bob_id, uid: Some(bob_uid.clone()), message: "over\u{202e} here\u{7}".into() };
     request(&admin, poke).await;
     until(
         &mut bob.events,
@@ -428,7 +432,8 @@ async fn teamspeak_mode_pokes_kicks_bans_and_channel_details() {
 
     // Kicked from Beta, bob is back in the default channel, still on the server.
     request(&bob, Request::ChannelJoin { channel: beta.id, password: None }).await;
-    let kick = Request::ClientKick { client: bob.welcome.session, reason: Some("out".into()), from_channel: true };
+    let kick =
+        Request::ClientKick { client: bob_id, uid: Some(bob_uid), reason: Some("out".into()), from_channel: true };
     request(&admin, kick).await;
     let (me, lobby) = (bob.welcome.session, bob.welcome.server.default_channel);
     until(&mut bob.events, |e| matches!(e, Event::ClientUpdated(c) if c.id == me && c.channel == Some(lobby))).await;

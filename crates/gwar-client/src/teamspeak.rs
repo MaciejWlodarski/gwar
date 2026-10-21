@@ -499,7 +499,7 @@ fn reply_for(request: &Request, view: &View, own: u16) -> Reply {
         Request::TokenRedeem { .. } => Reply::Groups,
         Request::ChannelDescription { channel } => Reply::Description(*channel),
         Request::BanCreate(b) => {
-            let who = b.client.and_then(|c| view.clients.get(&c));
+            let who = b.client.and_then(|c| still(view, c, b.uid.as_deref()).ok());
             let now = now_ms();
             Reply::Banned(Box::new(Ban {
                 id: 0,
@@ -514,6 +514,22 @@ fn reply_for(request: &Request, view: &View, own: u16) -> Reply {
         }
         _ => Reply::Empty,
     }
+}
+
+/// Text from the TeamSpeak server (pokes, descriptions, group names) as the UI may show it: bidi
+/// formatting goes (it reorders the text around it), and control characters become spaces.
+/// `lines` text keeps its newlines and tabs; anything else is one line with its spaces collapsed.
+/// Same as `displayText` in apps/web/src/lib/text.ts.
+fn display_text(text: &str, lines: bool) -> String {
+    let bidi =
+        |c: char| matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    let text = if lines { text.replace("\r\n", "\n").replace('\r', "\n") } else { text.to_owned() };
+    let spaced: String = text
+        .chars()
+        .filter(|&c| !bidi(c))
+        .map(|c| if c.is_control() && !(lines && matches!(c, '\n' | '\t')) { ' ' } else { c })
+        .collect();
+    if lines { spaced } else { spaced.split_whitespace().collect::<Vec<_>>().join(" ") }
 }
 
 /// TeamSpeak descriptions are BBCode; the UI shows plain text. Tags go, their text stays
@@ -591,9 +607,9 @@ fn answer(reply: &Reply, view: &View, own: u16) -> Option<Result<Value, ErrorBod
         )),
         // TeamSpeak sends the description before it confirms the command: none by then is none at all.
         Reply::Description(id) => match view.channels.contains_key(id) {
-            true => {
-                Some(Ok(json!({ "description": plain_text(view.descriptions.get(id).map_or("", String::as_str)) })))
-            }
+            true => Some(Ok(
+                json!({ "description": display_text(&plain_text(view.descriptions.get(id).map_or("", String::as_str)), true) }),
+            )),
             false => Some(Err(ErrorBody::new(ErrorCode::NotFound, "that channel no longer exists"))),
         },
         Reply::Banned(ban) => Some(Ok(json!({ "ban": ban }))),
@@ -715,6 +731,15 @@ fn channel_update(u: &gwar_proto::ChannelUpdate, view: &View) -> Vec<(Part, OutC
     commands
 }
 
+/// The client `client`, if it is still `uid`'s (when given): TeamSpeak hands a leaving client's id
+/// to the next one, so a dialog opened for one person may by now name another.
+fn still<'a>(view: &'a View, client: SessionId, uid: Option<&str>) -> Result<&'a Client, ErrorBody> {
+    view.clients
+        .get(&client)
+        .filter(|c| uid.is_none_or(|uid| c.uid == uid))
+        .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "that person is no longer here"))
+}
+
 /// `ban.create`: TeamSpeak's `banclient` bans the address and the identity; a ban by identity
 /// alone is a `banadd`. Either way the TeamSpeak server drops whoever the ban matches.
 fn ban(b: &gwar_proto::BanCreate, view: &View) -> Result<Vec<(Part, OutCommand)>, ErrorBody> {
@@ -726,16 +751,15 @@ fn ban(b: &gwar_proto::BanCreate, view: &View) -> Result<Vec<(Part, OutCommand)>
         args.push(("banreason", reason.clone()));
     }
     if let (Some(client), true) = (b.client, b.ip) {
+        still(view, client, b.uid.as_deref())?;
         args.insert(0, ("clid", client.to_string()));
         return Ok(vec![(Part::Whole, command("banclient", &args))]);
     }
-    let uid = match b.client {
-        Some(client) => view
-            .clients
-            .get(&client)
-            .map(|c| c.uid.clone())
-            .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "that person is no longer here"))?,
-        None => b.uid.clone().ok_or_else(|| refused("say who to ban"))?,
+    // The uid chosen, even if its session has since gone to someone else.
+    let uid = match (b.client, &b.uid) {
+        (_, Some(uid)) => uid.clone(),
+        (Some(client), None) => still(view, client, None)?.uid.clone(),
+        (None, None) => return Err(refused("say who to ban")),
     };
     let identity = uid.strip_prefix("ts:").filter(|u| !u.is_empty() && *u != "unknown");
     let identity = identity.ok_or_else(|| refused("TeamSpeak servers ban TeamSpeak identities only"))?;
@@ -760,15 +784,19 @@ fn translate(request: &Request, own: u16, view: &View) -> Result<Vec<(Part, OutC
             command("clientmove", &[("clid", client.to_string()), ("cid", channel.to_string())])
         }
         // TeamSpeak's reasons: 4 kicks from the channel (to the default one), 5 from the server.
-        Request::ClientKick { client, reason, from_channel } => command(
-            "clientkick",
-            &[
-                ("clid", client.to_string()),
-                ("reasonid", if *from_channel { "4" } else { "5" }.into()),
-                ("reasonmsg", reason.clone().unwrap_or_default()),
-            ],
-        ),
-        Request::ClientPoke { client, message } => {
+        Request::ClientKick { client, uid, reason, from_channel } => {
+            still(view, *client, uid.as_deref())?;
+            command(
+                "clientkick",
+                &[
+                    ("clid", client.to_string()),
+                    ("reasonid", if *from_channel { "4" } else { "5" }.into()),
+                    ("reasonmsg", reason.clone().unwrap_or_default()),
+                ],
+            )
+        }
+        Request::ClientPoke { client, uid, message } => {
+            still(view, *client, uid.as_deref())?;
             command("clientpoke", &[("clid", client.to_string()), ("msg", message.clone())])
         }
         Request::ChannelDescription { channel } => command("channelgetdescription", &[("cid", channel.to_string())]),
@@ -1060,8 +1088,8 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                             if let MessageTarget::Poke(_) = target {
                                 out.push(Event::ClientPoked {
                                     client: u32::from(invoker.id.0),
-                                    nickname: invoker.name.clone(),
-                                    message,
+                                    nickname: display_text(&invoker.name, false),
+                                    message: display_text(&message, false),
                                 });
                                 continue;
                             }
@@ -1446,14 +1474,29 @@ mod tests {
     }
 
     #[test]
+    fn shown_text_loses_bidi_formatting_and_control_characters() {
+        assert_eq!(display_text("evil\u{202e}gnp.exe\u{2066}x\u{2069}", false), "evilgnp.exex");
+        assert_eq!(display_text("a\0b\nc\td  e ", false), "a b c d e");
+        assert_eq!(display_text("Zażółć 🎧 مرحبا", false), "Zażółć 🎧 مرحبا");
+        assert_eq!(display_text("one\r\ntwo\rthree\n\tfour\u{7}\u{202e}", true), "one\ntwo\nthree\n\tfour ");
+    }
+
+    #[test]
     fn kicks_pokes_and_bans_use_teamspeak_commands() {
         let view = view();
         let run = |request: Request| sent(&translate(&request, 3, &view).unwrap());
-        let kick = |from_channel| Request::ClientKick { client: 4, reason: Some("bye".into()), from_channel };
+        let kick =
+            |from_channel| Request::ClientKick { client: 4, uid: None, reason: Some("bye".into()), from_channel };
         assert_eq!(run(kick(false)), vec![(Part::Whole, "clientkick clid=4 reasonid=5 reasonmsg=bye".into())]);
         assert_eq!(run(kick(true)), vec![(Part::Whole, "clientkick clid=4 reasonid=4 reasonmsg=bye".into())]);
-        let poke = Request::ClientPoke { client: 4, message: "look here".into() };
-        assert_eq!(run(poke), vec![(Part::Whole, "clientpoke clid=4 msg=look\\shere".into())]);
+        let poke = |uid: &str| Request::ClientPoke { client: 4, uid: Some(uid.into()), message: "look here".into() };
+        assert_eq!(run(poke("ts:Ym9i")), vec![(Part::Whole, "clientpoke clid=4 msg=look\\shere".into())]);
+        // Session 4 is no longer the person chosen: nothing goes out.
+        let someone_else = |request: Request| translate(&request, 3, &view).map(|c| sent(&c));
+        assert!(matches!(someone_else(poke("ts:YWxpY2U=")), Err(e) if e.code == ErrorCode::NotFound));
+        let kick_alice =
+            Request::ClientKick { client: 4, uid: Some("ts:YWxpY2U=".into()), reason: None, from_channel: false };
+        assert!(matches!(someone_else(kick_alice), Err(e) if e.code == ErrorCode::NotFound));
         let describe = Request::ChannelDescription { channel: 8 };
         assert_eq!(run(describe), vec![(Part::Whole, "channelgetdescription cid=8".into())]);
 
@@ -1472,6 +1515,14 @@ mod tests {
         assert!(matches!(gwar_uid, Err(e) if e.code == ErrorCode::BadRequest));
         let left = ban(gwar_proto::BanCreate { client: Some(40), ..Default::default() });
         assert!(matches!(left, Err(e) if e.code == ErrorCode::NotFound));
+        // Alice chosen, her session now bob's: her identity is banned, never bob's, and her
+        // address ban (which needs her session) is refused.
+        let alice = || gwar_proto::BanCreate { client: Some(4), uid: Some("ts:YWxpY2U=".into()), ..Default::default() };
+        assert_eq!(ban(alice()).unwrap(), vec![(Part::Whole, "banadd uid=YWxpY2U=".into())]);
+        let by_address = ban(gwar_proto::BanCreate { ip: true, ..alice() });
+        assert!(matches!(by_address, Err(e) if e.code == ErrorCode::NotFound));
+        let Reply::Banned(banned) = reply_for(&Request::BanCreate(alice()), &view, 3) else { panic!("a ban") };
+        assert_eq!((banned.uid.as_deref(), banned.nickname.as_str()), (Some("ts:YWxpY2U="), ""));
         let list = translate(&Request::BanList {}, 3, &view);
         assert!(matches!(list, Err(e) if e.code == ErrorCode::BadRequest));
     }

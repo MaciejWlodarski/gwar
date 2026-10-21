@@ -510,7 +510,16 @@ therefore have different TS suffixes while retaining the same Gwar nickname.
     `client.poked` and show as a toast, not as messages), `client.kick` with
     `from_channel` (back to the default channel), and `channel.description`
     (`channelgetdescription`; BBCode tags are dropped and the UI shows the rest
-    as text, never as markup). Gwar servers refuse them.
+    as text, never as markup). Gwar servers refuse them, and the Gwar
+    connection drops `client.poked`: nothing would verify who a poke is from.
+  - Text from the TeamSpeak server that the UI shows (poke text and nicknames,
+    descriptions) loses bidi formatting and control characters, in the adapter
+    and again in the UI (`display_text`, `displayText`); descriptions keep
+    their newlines and tabs.
+  - TeamSpeak hands a leaving client's id to the next one, so `client.kick`,
+    `client.poke` and `ban.create` carry the uid the UI meant along with the
+    session; a session that is now someone else's is `not_found`, and a ban by
+    identity bans the uid meant (Gwar servers check the same).
   - `channel.update`'s `position` is the place among the other siblings;
     TeamSpeak's `channel_order` names the sibling before it, so the adapter
     translates one into the other. The UI moves TeamSpeak channels up or down.

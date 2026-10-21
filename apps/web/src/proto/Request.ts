@@ -19,7 +19,15 @@ import type { ServerUpdate } from "./ServerUpdate";
 import type { VoiceEpoch } from "./VoiceEpoch";
 import type { VoiceOffer } from "./VoiceOffer";
 
-export type Request = { "op": "hello", "d": Hello } | { "op": "join", "d": Join } | { "op": "ping", "d": Record<symbol, never> } | { "op": "client.update", "d": ClientUpdate } | { "op": "client.move", "d": { client: number, channel: number, } } | { "op": "client.voice", "d": { client: number, muted?: boolean | null, deafened?: boolean | null, } } | { "op": "client.kick", "d": { client: number, reason: string | null, from_channel?: boolean, } } | { "op": "client.poke", "d": { client: number, message: string, } } | { "op": "channel.description", "d": { channel: number, } } | { "op": "channel.join", "d": { channel: number, password: string | null, } } | { "op": "channel.leave", "d": Record<symbol, never> } | { "op": "channel.create", "d": ChannelCreate } | { "op": "channel.update", "d": ChannelUpdate } | { "op": "channel.override", "d": { channel: number, override: ChannelOverride, } } | { "op": "channel.delete", "d": { channel: number, } } | { "op": "chat.send", "d": { target: ChatTarget, text: string, 
+export type Request = { "op": "hello", "d": Hello } | { "op": "join", "d": Join } | { "op": "ping", "d": Record<symbol, never> } | { "op": "client.update", "d": ClientUpdate } | { "op": "client.move", "d": { client: number, channel: number, } } | { "op": "client.voice", "d": { client: number, muted?: boolean | null, deafened?: boolean | null, } } | { "op": "client.kick", "d": { client: number, 
+/**
+ * Who `client` was when the kick was chosen: refused if the session is now someone else's.
+ */
+uid?: string | null, reason: string | null, from_channel?: boolean, } } | { "op": "client.poke", "d": { client: number, 
+/**
+ * Who `client` was when the poke was written: refused if the session is now someone else's.
+ */
+uid?: string | null, message: string, } } | { "op": "channel.description", "d": { channel: number, } } | { "op": "channel.join", "d": { channel: number, password: string | null, } } | { "op": "channel.leave", "d": Record<symbol, never> } | { "op": "channel.create", "d": ChannelCreate } | { "op": "channel.update", "d": ChannelUpdate } | { "op": "channel.override", "d": { channel: number, override: ChannelOverride, } } | { "op": "channel.delete", "d": { channel: number, } } | { "op": "chat.send", "d": { target: ChatTarget, text: string, 
 /**
  * Users mentioned as `@nickname` in `text` (the text stays readable as is).
  */

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { tokenizeText } from "./text";
+import { displayText, tokenizeText } from "./text";
 
 describe("tokenizeText", () => {
   it("returns plain text untouched, including markup", () => {
@@ -23,5 +23,16 @@ describe("tokenizeText", () => {
 
   it("never links javascript: urls", () => {
     expect(tokenizeText("javascript:alert(1) data:text/html,x")).toEqual([{ kind: "text", value: "javascript:alert(1) data:text/html,x" }]);
+  });
+});
+
+describe("displayText", () => {
+  it("drops bidi formatting and turns control characters into spaces on one line", () => {
+    expect(displayText("evil\u202egnp.exe\u2066x\u2069")).toBe("evilgnp.exex");
+    expect(displayText("a\u0000b\nc\td  e ")).toBe("a b c d e");
+    expect(displayText("Zażółć 🎧 مرحبا")).toBe("Zażółć 🎧 مرحبا");
+  });
+  it("keeps newlines and tabs in text with lines", () => {
+    expect(displayText("one\r\ntwo\rthree\n\tfour\u0007\u202e", true)).toBe("one\ntwo\nthree\n\tfour ");
   });
 });

@@ -40,3 +40,18 @@ export function isSafeHref(href: string): boolean {
     return false;
   }
 }
+
+/** Bidi formatting: marks, embeddings, overrides and isolates, which reorder the text around them. */
+const BIDI = /[؜‎‏‪-‮⁦-⁩]/g;
+
+/**
+ * Text from a TeamSpeak server (pokes, channel descriptions, group names) as it may be shown:
+ * bidi formatting goes, and control characters become spaces. `lines` text keeps its newlines and
+ * tabs; anything else is one line with its spaces collapsed. Same as `display_text` in
+ * crates/gwar-client/src/teamspeak.rs.
+ */
+export function displayText(text: string, lines = false): string {
+  const kept = (lines ? text.replace(/\r\n?/g, "\n") : text).replace(BIDI, "");
+  const spaced = kept.replace(/\p{Cc}/gu, (c) => (lines && (c === "\n" || c === "\t") ? c : " "));
+  return lines ? spaced : spaced.split(/\s+/u).filter(Boolean).join(" ");
+}

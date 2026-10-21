@@ -110,6 +110,9 @@ the same list:
   `channel_password`).
   Limits: `id` 64, `name` 64, `address` 255, `password` 128, `channel` 255,
   `channel_password` 128 characters; a bookmark beyond them stays on its device.
+- On the device, bookmark passwords (the server's and the channel's) are stored
+  unencrypted with the app's settings, like the official TeamSpeak client's
+  bookmarks; only the copy in the Connect vault is encrypted.
 - A removed server becomes a tombstone (`deleted`, `id`, `updated_at`) kept for
   90 days, so a device that still has it does not bring it back. Merging keeps
   the newer `updated_at` per `id` (the vault on a tie). At most 100 entries;

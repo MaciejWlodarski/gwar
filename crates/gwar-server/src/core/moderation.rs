@@ -489,8 +489,9 @@ impl Core {
         }
         // Who: an online client, or a known member by uid.
         let (uid, nickname, ip, groups) = match (b.client, b.uid) {
-            (Some(client), _) => {
-                let Some(s) = self.sessions.get(&client) else {
+            (Some(client), uid) => {
+                // A reused session id is someone else.
+                let Some(s) = self.sessions.get(&client).filter(|s| uid.as_ref().is_none_or(|u| *u == s.uid)) else {
                     return Err(err(ErrorCode::NotFound, "no such client"));
                 };
                 // A linked TeamSpeak user is the member they act as.

@@ -101,6 +101,9 @@ wire! {
         #[serde(rename = "client.kick")]
         ClientKick {
             client: SessionId,
+            /// Who `client` was when the kick was chosen: refused if the session is now someone else's.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            uid: Option<Uid>,
             #[serde(default)]
             reason: Option<String>,
             #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -108,7 +111,13 @@ wire! {
         },
         /// Gets someone's attention with a short message (TeamSpeak servers only).
         #[serde(rename = "client.poke")]
-        ClientPoke { client: SessionId, message: String },
+        ClientPoke {
+            client: SessionId,
+            /// Who `client` was when the poke was written: refused if the session is now someone else's.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            uid: Option<Uid>,
+            message: String,
+        },
         /// A channel's long description, as plain text (TeamSpeak servers only); answers `{description}`.
         #[serde(rename = "channel.description")]
         ChannelDescription { channel: ChannelId },
@@ -465,7 +474,8 @@ wire! {
         pub mentionable: Option<bool>,
     }
 
-    /// Bans an online client (by session) or a known member (by uid).
+    /// Bans an online client (by session) or a known member (by uid). With both, the session must
+    /// still be that uid's: session ids are reused.
     #[derive(Default)]
     pub struct BanCreate {
         #[serde(default, skip_serializing_if = "Option::is_none")]

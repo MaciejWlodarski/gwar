@@ -518,12 +518,24 @@ describe("TeamSpeak actions", () => {
     expect(session().threads).toEqual(before.threads);
   });
 
+  it("shows a poke without formatting that would reorder or break its text", async () => {
+    teamspeak();
+    link.emit({ ev: "client.poked", d: { client: 99, nickname: "b\u202eob", message: "line\none\u2066 two" } });
+    expect(stores.useUi.getState().toasts.map((t) => t.text)).toEqual(["bob pokes you: line one two"]);
+  });
+
+  it("ignores pokes anywhere but on TeamSpeak, where nothing verifies who they are from", async () => {
+    connectFake({ channel: 1 });
+    link.emit({ ev: "client.poked", d: { client: 99, nickname: "bob", message: "look" } });
+    expect(stores.useUi.getState().toasts).toEqual([]);
+  });
+
   it("pokes, kicks from the channel, reads descriptions and moves channels among their siblings", async () => {
     teamspeak();
-    await controller.pokeClient(2, "hi");
-    expect(link.sent("client.poke").at(-1)?.d).toEqual({ client: 2, message: "hi" });
-    await controller.kickFromChannel(2);
-    expect(link.sent("client.kick").at(-1)?.d).toEqual({ client: 2, reason: null, from_channel: true });
+    await controller.pokeClient(2, "u2", "hi");
+    expect(link.sent("client.poke").at(-1)?.d).toEqual({ client: 2, uid: "u2", message: "hi" });
+    await controller.kickFromChannel(2, "u2");
+    expect(link.sent("client.kick").at(-1)?.d).toEqual({ client: 2, uid: "u2", reason: null, from_channel: true });
     for (const c of [{ id: 1, position: 0 }, { id: 2, position: 1 }, { id: 3, position: 2 }]) {
       link.emit({ ev: "channel.updated", d: { ...session().channels[c.id] ?? chan(c.id), position: c.position, parent: null } });
     }

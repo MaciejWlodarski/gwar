@@ -3,6 +3,7 @@ import { useT } from "../i18n";
 import { controller, describeRequestError } from "../state/controller";
 import { useSession, useUi, type PersonRef } from "../state/stores";
 import { Button, Dialog, Field, Input } from "./kit";
+import { displayText } from "../lib/text";
 import { useMemberName } from "./hooks";
 
 /** TeamSpeak caps a poke's message at 100 characters. */
@@ -23,7 +24,7 @@ export function PokeDialog({ person }: { person: PersonRef }) {
     setBusy(true);
     setError(null);
     try {
-      await controller.pokeClient(person.session, message.trim());
+      await controller.pokeClient(person.session, person.uid, message.trim());
       useUi.getState().toast("success", t("poke.sent", { name }));
       close();
     } catch (err) {
@@ -107,7 +108,7 @@ export function ChannelInfoDialog({ channel: id }: { channel: number }) {
             <p className="text-sm text-muted">{t("chinfo.loading")}</p>
           ) : (
             <p data-testid="channel-description" className="max-h-72 overflow-y-auto whitespace-pre-wrap wrap-anywhere text-sm">
-              {description.trim() || t("chinfo.noDescription")}
+              {displayText(description, true).trim() || t("chinfo.noDescription")}
             </p>
           )}
         </section>

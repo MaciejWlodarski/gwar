@@ -32,6 +32,7 @@ import type { ChatTarget } from "../proto/ChatTarget";
 import { tNow, type Key } from "../i18n";
 import { absoluteUrl, httpOriginFromWsUrl, isPlaintextRemote, parseServerAddress, parseTeamSpeakAddress, pageContextFromLocation } from "../net/address";
 import { memberName } from "../lib/member-name";
+import { displayText } from "../lib/text";
 import { checkUpload } from "../lib/files";
 import { notificationBody, notifyReason } from "../lib/notify-rules";
 import { setConnectedServer, FILE_TIMEOUT_MS, uploadFromApp } from "../platform/download";
@@ -609,7 +610,8 @@ class Controller {
         return;
       }
       if (event.ev === "client.poked") {
-        this.poked(event.d);
+        // Only TeamSpeak pokes: nothing verifies who a poke from anywhere else is from.
+        if (useSession.getState().kind === "teamspeak") this.poked(event.d);
         return;
       }
       if ((event.ev === "chat.message" || event.ev === "chat.edited") && typeof event.d.target === "object" && "client" in event.d.target) {
@@ -1388,18 +1390,19 @@ class Controller {
     return this.attempt(this.connection.request("client.move", { client, channel }));
   }
 
-  kickClient(client: number, reason?: string) {
-    return this.attempt(this.connection.request("client.kick", { client, reason: reason ?? null }));
+  /** `uid`: who the session was when the kick was chosen; the server refuses it for someone else. */
+  kickClient(client: number, uid: string, reason?: string) {
+    return this.attempt(this.connection.request("client.kick", { client, uid, reason: reason ?? null }));
   }
 
   /** TeamSpeak only: back to the server's default channel, still on the server. */
-  kickFromChannel(client: number) {
-    return this.attempt(this.connection.request("client.kick", { client, reason: null, from_channel: true }));
+  kickFromChannel(client: number, uid: string) {
+    return this.attempt(this.connection.request("client.kick", { client, uid, reason: null, from_channel: true }));
   }
 
   /** TeamSpeak only. */
-  pokeClient(client: number, message: string) {
-    return this.connection.request("client.poke", { client, message });
+  pokeClient(client: number, uid: string, message: string) {
+    return this.connection.request("client.poke", { client, uid, message });
   }
 
   /** TeamSpeak only: a channel's description, as plain text. */
@@ -1892,10 +1895,11 @@ class Controller {
   /** Someone pokes me (TeamSpeak): a toast, and a system notification while the app is in the background. */
   private poked(poke: EventData<"client.poked">): void {
     const s = useSession.getState();
-    const name = memberName(s.members, s.clients[poke.client]?.uid ?? "", poke.nickname);
-    useUi.getState().toast("info", poke.message ? tNow("poke.received", { name, message: poke.message }) : tNow("poke.receivedEmpty", { name }));
+    const name = displayText(memberName(s.members, s.clients[poke.client]?.uid ?? "", poke.nickname));
+    const message = displayText(poke.message);
+    useUi.getState().toast("info", message ? tNow("poke.received", { name, message }) : tNow("poke.receivedEmpty", { name }));
     if (!s.focused && useSettings.getState().notifications.privateMessages) {
-      notify({ title: tNow("poke.title", { name }), body: poke.message, tag: `poke-${poke.client}-${Date.now()}` });
+      notify({ title: tNow("poke.title", { name }), body: message, tag: `poke-${poke.client}-${Date.now()}` });
     }
   }
 
