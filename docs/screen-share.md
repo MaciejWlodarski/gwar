@@ -180,6 +180,26 @@ Windows details:
 - wry maps no screen-capture permission on WebView2. The default, which is
   Chromium's picker, is what we want.
 
+#### Capture check (PR 1)
+
+A debug desktop app whose web bundle was built with `GWAR_CAPTURE_CHECK=1`
+(for example `GWAR_CAPTURE_CHECK=1 pnpm --filter desktop tauri dev`), and that
+is started with it, shows a check page instead of the app. It probes the webview microphone and camera (both must be
+denied), calls `getDisplayMedia` on a click, loops the track through a local
+`RTCPeerConnection` pair and logs the capture and encoder frame rate, split by
+window visibility, every 30 seconds. "Copy report" copies the samples as JSON.
+Release builds never show it, and bundles built without the variable do not
+contain it (the build fails if they do).
+
+| Platform | Picker | Capture | TCC prompt | fps, window hidden 5 min | Audio offered |
+| --- | --- | --- | --- | --- | --- |
+| macOS 27.0 (26A428) | not run | not run | not run | not run | n/a |
+
+On macOS 27.0 (26A428), without a human at the screen: `getDisplayMedia`,
+`RTCPeerConnection` and `RTCRtpScriptTransform` are present in a debug build;
+`CaptureController` is not, so WebKit cannot keep focus on the app when a
+share starts. The rest of the table is filled in by hand.
+
 ### Why not native capture now
 
 Native capture means:

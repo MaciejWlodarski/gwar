@@ -14,6 +14,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # Serve the bundled frontend instead of devUrl; enabled by `tauri build`.
 custom-protocol = ["tauri/custom-protocol"]
 
+[target.'cfg(windows)'.dependencies]
+# The WebView2 profile's saved media grants (src/webview.rs); the versions wry uses.
+webview2-com = "0.39"
+windows = "0.62"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

@@ -522,6 +522,27 @@ permissions are absent. Custom commands below are app-owned IPC and need their
 own validation. A compromised renderer still has audio, TeamSpeak networking
 and identity-write access; CSP and frame validation reduce that exposure.
 
+Only the app's own document runs in the webview (`src/webview.rs`):
+
+- `main` navigates only within the app's origin: `tauri://localhost` on
+  macOS and Linux, `http://tauri.localhost` on Windows (each is ordinary
+  networking on the other), or the dev server under `tauri dev`;
+- it opens no windows: a web page it would navigate to or open in a new
+  window, such as a chat link, goes to the system browser instead (http and
+  https only, at most one a second);
+- the CSP allows no frames (`frame-src 'none'`).
+
+That is what limits screen capture (docs/screen-share.md) to the app.
+Neither WebKit nor WebView2 asks the permission handler about display
+capture: each has its own picker path, and wry forwards only microphone and
+camera requests. Intercepting WebKit's display-capture decision would need
+its private delegate SPI added to wry's delegate class, so it is not done.
+
+The webview microphone and camera are always denied, because voice is
+captured natively; without a handler wry grants them on macOS. On Windows a
+grant saved in the WebView2 profile skips the handler, so before the app
+loads, the main window sets both to deny for the app's origin.
+
 | Command | Risk and boundary |
 | --- | --- |
 | `voice_start` | High: native UDP/WebRTC and microphone; selected server host, one run. |
@@ -558,6 +579,7 @@ and identity-write access; CSP and frame validation reduce that exposure.
 | `set_close_to_tray` | Low: changes close behavior. |
 | `debug_autoconnect` | Low: reads one dedicated environment setting in debug builds; returns nothing in release. |
 | `debug_log` | Low: debug log text; no effect in release. |
+| `debug_capture_check` | Low: reads one dedicated environment setting in debug builds; returns false in release. |
 
 Unused `debug_snapshot` IPC and file-driven webview evaluation were removed.
 Confirmed export/vault sync still passes private TeamSpeak text to JS for vault

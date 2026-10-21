@@ -15,6 +15,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "Gwar",
         "width": 1180,
         "height": 760,
@@ -26,7 +27,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: https:; media-src 'self' blob: https:; font-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'; connect-src 'self' ipc: http://ipc.localhost ws: wss: http: https:",
+      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: https:; media-src 'self' blob: https:; font-src 'self' data:; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'; connect-src 'self' ipc: http://ipc.localhost ws: wss: http: https:",
       "devCsp": null
     }
   },

@@ -9,6 +9,7 @@ mod tray;
 mod ts;
 mod ts_identity;
 mod voice;
+mod webview;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -22,6 +23,14 @@ mod debug {
     #[tauri::command]
     pub fn debug_autoconnect() -> Option<String> {
         if cfg!(debug_assertions) { std::env::var("GWAR_AUTOCONNECT").ok() } else { None }
+    }
+
+    /// `GWAR_CAPTURE_CHECK=1` shows the screen-capture check page instead of
+    /// the app in the main window (docs/screen-share.md, PR 1); the web bundle
+    /// must be built with it too.
+    #[tauri::command]
+    pub fn debug_capture_check(window: tauri::WebviewWindow) -> bool {
+        cfg!(debug_assertions) && window.label() == "main" && std::env::var_os("GWAR_CAPTURE_CHECK").is_some()
     }
 
     #[tauri::command]
@@ -64,7 +73,9 @@ pub fn run() {
         .manage(ts::Ts::default())
         .manage(files::Files::default())
         .manage(tray::CloseToTray(AtomicBool::new(true)))
+        .on_permission_request(|_, kind| webview::media_permission(kind))
         .setup(|app| {
+            webview::create_main(app)?;
             tray::install(app.handle())?;
             Ok(())
         })
@@ -116,6 +127,7 @@ pub fn run() {
             tray::tray_set_state,
             tray::set_close_to_tray,
             debug::debug_autoconnect,
+            debug::debug_capture_check,
             debug::debug_log,
         ]);
 
