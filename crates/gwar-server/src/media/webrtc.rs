@@ -338,9 +338,12 @@ pub async fn run(
             },
             received = socket.recv_from(&mut buf) => match received {
                 Ok((n, source)) => {
-                    // A screen transport's address goes straight to the screen task, before any
-                    // voice work.
-                    if screen.owns(&source) {
+                    // Media from a screen transport's address goes straight to the screen task,
+                    // before any voice work. STUN (RFC 7983: first byte 0–3) is matched by ICE
+                    // credentials instead, voice first, so a voice peer can always take back an
+                    // address a screen transport once used.
+                    let stun = matches!(buf[..n].first(), Some(0..=3));
+                    if !stun && screen.owns(&source) {
                         screen.send(source, &buf[..n]);
                         continue;
                     }
@@ -348,6 +351,9 @@ pub async fn run(
                     let input = Input::Receive(Instant::now(), Receive { proto: Protocol::Udp, source, destination: advertise, contents });
                     match peers.values_mut().find(|p| p.rtc.accepts(&input)) {
                         Some(peer) => {
+                            if stun {
+                                screen.disown(&source);
+                            }
                             if peer.admission.admits_datagram(&buf[..n], peer.origin.encrypted)
                                 && let Err(e) = peer.rtc.handle_input(input) {
                                     debug!(session = peer.session, "rtc input: {e}");

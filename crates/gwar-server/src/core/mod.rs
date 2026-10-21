@@ -57,7 +57,7 @@ use self::bridge::{BridgeMsg, BridgeNote, RemoteClient};
 use crate::{
     media::{
         AudioOrigin, Member, Routing, SharedRouting,
-        screen::{PublishSignal, ScreenCmd},
+        screen::{ScreenCmd, ScreenSignal},
         webrtc::MediaCmd,
     },
     store::{ADMIN_GROUP, ChannelRow, MEMBER_GROUP, Store},
@@ -137,17 +137,8 @@ pub enum CoreMsg {
         binding: gwar_proto::VoiceTransportBinding,
         failed: bool,
     },
-    /// The screen SFU on a share's publish transport.
-    ScreenPublish {
-        share: String,
-        signal: PublishSignal,
-    },
-    /// The screen SFU on a session's watch transport `run`.
-    ScreenWatch {
-        session: SessionId,
-        run: u64,
-        connected: bool,
-    },
+    /// The screen SFU on a transport, in the order it saw them.
+    Screen(ScreenSignal),
     Info(oneshot::Sender<ServerInfo>),
     /// A TeamSpeak import for the running server (`gwar-server import-teamspeak` over the control socket).
     #[cfg(feature = "teamspeak")]
@@ -255,19 +246,12 @@ impl CoreHandle {
         let _ = self.tx.try_send(CoreMsg::Voice { session, connected, binding: binding.clone(), failed });
     }
 
-    pub fn screen_publish(&self, share: String, signal: PublishSignal) {
-        self.deliver(CoreMsg::ScreenPublish { share, signal });
-    }
-    pub fn screen_watch(&self, session: SessionId, run: u64, connected: bool) {
-        self.deliver(CoreMsg::ScreenWatch { session, run, connected });
-    }
-    /// Sends without waiting; a full queue hands it to a task rather than losing it.
-    fn deliver(&self, msg: CoreMsg) {
-        if let Err(mpsc::error::TrySendError::Full(msg)) = self.tx.try_send(msg) {
-            let tx = self.tx.clone();
-            tokio::spawn(async move {
-                let _ = tx.send(msg).await;
-            });
+    /// Hands a screen SFU signal over without waiting; `Err` gives it back when the queue is
+    /// full, for the SFU to retry in order. A closed core takes it silently.
+    pub fn try_screen(&self, signal: ScreenSignal) -> Result<(), ScreenSignal> {
+        match self.tx.try_send(CoreMsg::Screen(signal)) {
+            Err(mpsc::error::TrySendError::Full(CoreMsg::Screen(signal))) => Err(signal),
+            _ => Ok(()),
         }
     }
 
@@ -342,6 +326,8 @@ struct Session {
     shared: bool,
     /// The session's screen watch transport.
     watch: Option<screen::Watch>,
+    /// The highest watch-transport run offered; runs at or below it never come back.
+    watch_run: u64,
     /// `None` for remote sessions, which live on a bridged server.
     out: Option<OutboundTx>,
     /// Bearer token for file downloads (see [`gwar_proto::FileAccess`]); empty for remote sessions.
@@ -693,8 +679,10 @@ impl Core {
                     }
                 }
             }
-            CoreMsg::ScreenPublish { share, signal } => self.screen_published(&share, signal),
-            CoreMsg::ScreenWatch { session, run, connected } => self.screen_watching(session, run, connected),
+            CoreMsg::Screen(ScreenSignal::Publish { share, signal }) => self.screen_published(&share, signal),
+            CoreMsg::Screen(ScreenSignal::Watch { session, run, connected }) => {
+                self.screen_watching(session, run, connected)
+            }
             CoreMsg::Voice { session, connected, binding, failed } => {
                 if self
                     .sessions
@@ -1245,6 +1233,7 @@ impl Core {
             sharing: None,
             shared: false,
             watch: None,
+            watch_run: 0,
             out: Some(r.out),
             file_access: files::random_id(32),
             since: self.next_connection(),
@@ -1565,6 +1554,7 @@ impl Core {
                     sharing: None,
                     shared: false,
                     watch: None,
+                    watch_run: 0,
                     out: None,
                     file_access: String::new(),
                     since: self.next_connection(),

@@ -15,7 +15,7 @@ mod ingress;
 mod segment;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
     sync::{
         Arc,
@@ -62,6 +62,13 @@ pub const PUBLISH_CONNECT: Duration = Duration::from_secs(30);
 const RTX_PACKETS: usize = 1024;
 const RTX_AGE: Duration = Duration::from_millis(200);
 const RTX_RATIO: f32 = 0.15;
+/// Every datagram of a publish transport is metered before str0m sees it, repairs, padding,
+/// duplicates and RTCP included, with headroom over the media ingress limits.
+const TRANSPORT_PACKET_RATE: f64 = 2_500.0;
+const TRANSPORT_PACKET_BURST: f64 = 750.0;
+const TRANSPORT_BYTE_HEADROOM: f64 = 1.5;
+/// Addresses one transport may hold; a further one replaces its oldest.
+const ADDRESSES_PER_TRANSPORT: usize = 4;
 
 /// A share's immutable source authority, captured when the share is admitted and re-checked
 /// on every forwarded packet, like [`super::AudioOrigin`].
@@ -101,19 +108,21 @@ impl ScreenOrigin {
 /// Bitrate cap per share (docs/screen-share.md, "Limits").
 pub const SHARE_CAP_BPS: u64 = 8_000_000;
 
-/// One viewer's right to one share in one slot. The core ends it the moment access ends.
+/// One viewer's right to one share in one slot. The core ends it the moment access ends; it
+/// also ends with its share.
 #[derive(Debug)]
 pub struct WatchGrant {
     pub share: String,
+    origin: Arc<ScreenOrigin>,
     alive: AtomicBool,
 }
 
 impl WatchGrant {
-    pub fn new(share: String) -> Arc<Self> {
-        Arc::new(Self { share, alive: AtomicBool::new(true) })
+    pub fn new(origin: Arc<ScreenOrigin>) -> Arc<Self> {
+        Arc::new(Self { share: origin.share.clone(), origin, alive: AtomicBool::new(true) })
     }
     pub fn alive(&self) -> bool {
-        self.alive.load(Ordering::Acquire)
+        self.alive.load(Ordering::Acquire) && self.origin.alive()
     }
     pub fn end(&self) {
         self.alive.store(false, Ordering::Release);
@@ -139,6 +148,17 @@ impl Dispatch {
     /// Whether a screen transport already accepted datagrams from `source`.
     pub fn owns(&self, source: &SocketAddr) -> bool {
         self.addrs.load().contains(source)
+    }
+
+    /// A voice peer's STUN came from `source`: its datagrams are voice's from now on.
+    pub fn disown(&self, source: &SocketAddr) {
+        if self.owns(source) {
+            self.addrs.rcu(|addrs| {
+                let mut addrs = HashSet::clone(addrs);
+                addrs.remove(source);
+                addrs
+            });
+        }
     }
 
     /// Hands a datagram over without ever waiting; a full channel drops it.
@@ -171,6 +191,30 @@ pub enum PublishSignal {
     Ended(ScreenStopReason),
 }
 
+/// What the screen task tells the core, delivered in the order it happened.
+#[derive(Debug)]
+pub enum ScreenSignal {
+    Publish { share: String, signal: PublishSignal },
+    Watch { session: SessionId, run: u64, connected: bool },
+}
+
+/// A watch transport's lease: the core ends it when it drops the transport, so the screen task
+/// closes it even if the `EndWatch` that follows is lost to a full queue.
+#[derive(Debug)]
+pub struct Lease(AtomicBool);
+
+impl Lease {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self(AtomicBool::new(true)))
+    }
+    pub fn alive(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+    pub fn end(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 pub enum ScreenCmd {
     /// A share's publish transport, answered with the SDP answer.
     Publish {
@@ -187,6 +231,7 @@ pub enum ScreenCmd {
     Watch {
         session: SessionId,
         run: u64,
+        lease: Arc<Lease>,
         sdp: String,
         reply: oneshot::Sender<Result<String, &'static str>>,
     },
@@ -257,13 +302,38 @@ impl Throttle {
     }
 }
 
+/// The transport meter of a publisher: over budget, datagrams drop before str0m, and the first
+/// of a run of drops counts as an ingress overrun.
+struct Meter {
+    packets: Bucket,
+    bytes: Bucket,
+    over: bool,
+}
+
+impl Meter {
+    fn new(cap_bps: u64, now: Instant) -> Self {
+        Self {
+            packets: Bucket::new(TRANSPORT_PACKET_RATE, TRANSPORT_PACKET_BURST, now),
+            bytes: Bucket::new(
+                TRANSPORT_BYTE_HEADROOM * cap_bps as f64 / 8.0,
+                TRANSPORT_BYTE_HEADROOM * ingress::FRAME_BYTES as f64,
+                now,
+            ),
+            over: false,
+        }
+    }
+}
+
 struct Publisher {
     id: u64,
     origin: Arc<ScreenOrigin>,
     rtc: Rtc,
     ssrc: Ssrc,
     codecs: HashMap<Pt, VideoCodec>,
+    meter: Meter,
     ingress: Ingress,
+    /// Why it is ending, once it is.
+    ended: Option<ScreenStopReason>,
     connected: bool,
     created: Instant,
     keyframes: Throttle,
@@ -286,12 +356,12 @@ struct Watcher {
     id: u64,
     session: SessionId,
     run: u64,
+    lease: Arc<Lease>,
     rtc: Rtc,
     slots: Vec<Slot>,
     /// Assignments that arrived before the slot's m-line was seen.
     pending: Vec<(u32, Arc<WatchGrant>)>,
     connected: bool,
-    keyframes: Bucket,
     focus: Option<String>,
     deadline: Instant,
 }
@@ -316,9 +386,13 @@ struct Sfu {
     socket: Arc<UdpSocket>,
     advertise: SocketAddr,
     core: CoreHandle,
-    addrs: Arc<ArcSwap<HashSet<SocketAddr>>>,
     dropped: Arc<AtomicU64>,
-    owners: HashMap<SocketAddr, Owner>,
+    owners: Owners,
+    /// Signals the core's full queue did not take yet, oldest first.
+    outbox: VecDeque<ScreenSignal>,
+    /// Each viewer's keyframe budget. It belongs to the session, not to a watch transport, so a
+    /// new run does not refill it; one that refilled completely is dropped.
+    budgets: HashMap<SessionId, Bucket>,
     publishers: HashMap<String, Publisher>,
     watchers: HashMap<SessionId, Watcher>,
     next_id: u64,
@@ -336,9 +410,10 @@ pub async fn run(
         socket: config.socket,
         advertise: config.advertise,
         core,
-        addrs,
         dropped,
-        owners: HashMap::new(),
+        owners: Owners { held: HashMap::new(), addrs },
+        outbox: VecDeque::new(),
+        budgets: HashMap::new(),
         publishers: HashMap::new(),
         watchers: HashMap::new(),
         next_id: 1,
@@ -362,7 +437,8 @@ pub async fn run(
 
 impl Sfu {
     fn deadline(&self) -> Instant {
-        let mut at = Instant::now() + Duration::from_millis(100);
+        let wait = if self.outbox.is_empty() { Duration::from_millis(100) } else { Duration::from_millis(10) };
+        let mut at = Instant::now() + wait;
         for p in self.publishers.values() {
             at = at.min(p.deadline);
             if let Some(next) = p.keyframes.next() {
@@ -400,8 +476,8 @@ impl Sfu {
                 }
             }
             ScreenCmd::EndPublish { share } => self.end_publish(&share),
-            ScreenCmd::Watch { session, run, sdp, reply } => {
-                if reply.is_closed() {
+            ScreenCmd::Watch { session, run, lease, sdp, reply } => {
+                if reply.is_closed() || !lease.alive() {
                     return;
                 }
                 if self.watchers.get(&session).is_some_and(|w| w.run >= run) {
@@ -410,9 +486,11 @@ impl Sfu {
                 }
                 self.end_watch(session);
                 let id = self.id();
-                match watcher(id, session, run, &sdp, self.advertise, now) {
+                match watcher(id, session, run, lease, &sdp, self.advertise, now) {
                     Ok((mut watcher, answer)) => {
-                        self.drive_watcher(&mut watcher, &mut Vec::new());
+                        if self.drive_watcher(&mut watcher, &mut Vec::new()) {
+                            self.signal(ScreenSignal::Watch { session, run, connected: true });
+                        }
                         self.watchers.insert(session, watcher);
                         let _ = reply.send(Ok(answer));
                     }
@@ -464,7 +542,7 @@ impl Sfu {
         ScreenSnapshot {
             publishers: self.publishers.len(),
             watchers: self.watchers.len(),
-            addresses: self.owners.len(),
+            addresses: self.owners.held.len(),
             dispatch_dropped: self.dropped.load(Ordering::Relaxed),
             shares: self
                 .publishers
@@ -490,7 +568,11 @@ impl Sfu {
         let Some(s) = w.slots.get_mut(slot) else { return };
         let Some(grant) = s.grant.as_ref().filter(|g| g.alive()) else { return };
         s.asked = Some(now);
-        if !w.keyframes.take(1.0, now) {
+        let budget = self
+            .budgets
+            .entry(session)
+            .or_insert_with(|| Bucket::new(VIEWER_KEYFRAMES_PER_SECOND, VIEWER_KEYFRAMES_BURST, now));
+        if !budget.take(1.0, now) {
             return;
         }
         if let Some(p) = self.publishers.get_mut(&grant.share) {
@@ -505,20 +587,15 @@ impl Sfu {
             Receive { proto: Protocol::Udp, source: datagram.source, destination: self.advertise, contents },
         );
         let owner =
-            match self.owners.get(&datagram.source) {
-                Some(owner) => *owner,
+            match self.owners.held.get(&datagram.source) {
+                Some((owner, _)) => *owner,
                 None => {
                     let owner =
                         self.publishers.values().find(|p| p.rtc.accepts(&input)).map(|p| Owner::Publish(p.id)).or_else(
                             || self.watchers.values().find(|w| w.rtc.accepts(&input)).map(|w| Owner::Watch(w.id)),
                         );
                     let Some(owner) = owner else { return };
-                    self.owners.insert(datagram.source, owner);
-                    self.addrs.rcu(|addrs| {
-                        let mut addrs = HashSet::clone(addrs);
-                        addrs.insert(datagram.source);
-                        addrs
-                    });
+                    self.owners.own(datagram.source, owner, datagram.at);
                     owner
                 }
             };
@@ -527,14 +604,26 @@ impl Sfu {
                 let Some(share) = self.publishers.values().find(|p| p.id == id).map(|p| p.origin.share.clone()) else {
                     return;
                 };
-                let p = self.publishers.get_mut(&share).expect("found above");
-                if !p.rtc.accepts(&input) {
-                    return;
+                let mut p = self.publishers.remove(&share).expect("found above");
+                if p.rtc.accepts(&input) {
+                    let size = datagram.contents.len() as f64;
+                    let fits = p.meter.packets.take(1.0, datagram.at) && p.meter.bytes.take(size, datagram.at);
+                    let started = !fits && !p.meter.over;
+                    p.meter.over = !fits;
+                    if fits {
+                        if let Err(e) = p.rtc.handle_input(input) {
+                            debug!(share, "screen publish input: {e}");
+                            p.rtc.disconnect();
+                        }
+                    } else {
+                        p.ingress.counters.transport_dropped += 1;
+                        if started {
+                            let verdict = p.ingress.overrun(datagram.at);
+                            self.overrun(&mut p, verdict);
+                        }
+                    }
                 }
-                if let Err(e) = p.rtc.handle_input(input) {
-                    debug!(share, "screen publish input: {e}");
-                    p.rtc.disconnect();
-                }
+                self.publishers.insert(share.clone(), p);
                 self.flush_publisher(&share);
             }
             Owner::Watch(id) => {
@@ -543,6 +632,8 @@ impl Sfu {
                 if !w.rtc.accepts(&input) {
                     return;
                 }
+                // Revoked slots are wiped before a NACK can reach their RTX caches.
+                sweep(w);
                 if let Err(e) = w.rtc.handle_input(input) {
                     debug!(session, "screen watch input: {e}");
                     w.rtc.disconnect();
@@ -552,7 +643,38 @@ impl Sfu {
         }
     }
 
+    /// Queues a signal for the core behind any it has not taken yet.
+    fn signal(&mut self, signal: ScreenSignal) {
+        self.outbox.push_back(signal);
+        self.deliver();
+    }
+
+    /// Hands queued signals to the core in order, as far as its queue takes them; the rest wait
+    /// for the next loop iteration.
+    fn deliver(&mut self) {
+        while let Some(signal) = self.outbox.pop_front() {
+            if let Err(signal) = self.core.try_screen(signal) {
+                self.outbox.push_front(signal);
+                return;
+            }
+        }
+    }
+
     fn timeouts(&mut self, now: Instant) {
+        self.deliver();
+        // Transports whose share or lease the core ended close even if their command was lost.
+        let ended: Vec<String> =
+            self.publishers.iter().filter(|(_, p)| !p.origin.alive()).map(|(share, _)| share.clone()).collect();
+        for share in ended {
+            self.end_publish(&share);
+        }
+        let ended: Vec<SessionId> =
+            self.watchers.iter().filter(|(_, w)| !w.lease.alive()).map(|(session, _)| *session).collect();
+        for session in ended {
+            self.end_watch(session);
+        }
+        let watchers = &self.watchers;
+        self.budgets.retain(|session, budget| watchers.contains_key(session) || !budget.full(now));
         let shares: Vec<String> = self.publishers.keys().cloned().collect();
         for share in shares {
             let Some(p) = self.publishers.get_mut(&share) else { continue };
@@ -567,6 +689,7 @@ impl Sfu {
         let sessions: Vec<SessionId> = self.watchers.keys().copied().collect();
         for session in sessions {
             let Some(w) = self.watchers.get_mut(&session) else { continue };
+            sweep(w);
             if w.deadline <= now && w.rtc.is_alive() && w.rtc.handle_input(Input::Timeout(now)).is_err() {
                 w.rtc.disconnect();
             }
@@ -589,7 +712,6 @@ impl Sfu {
             p.keyframes.sent += 1;
         }
         let mut forwards = Vec::new();
-        let mut ended = None;
         loop {
             if !p.rtc.is_alive() {
                 break;
@@ -613,7 +735,10 @@ impl Sfu {
                 Output::Event(event) => match event {
                     RtcEvent::Connected => {
                         p.connected = true;
-                        self.core.screen_publish(p.origin.share.clone(), PublishSignal::Connected);
+                        self.signal(ScreenSignal::Publish {
+                            share: p.origin.share.clone(),
+                            signal: PublishSignal::Connected,
+                        });
                     }
                     RtcEvent::IceConnectionStateChange(IceConnectionState::Disconnected) => p.rtc.disconnect(),
                     RtcEvent::RtpPacket(packet) => {
@@ -638,21 +763,7 @@ impl Sfu {
                                     p.keyframes.pending = true;
                                 }
                             }
-                            Verdict::Overrun => {
-                                p.keyframes.pending = true;
-                                for slot in self.slots_of(share) {
-                                    let (session, index) = slot;
-                                    if let Some(s) =
-                                        self.watchers.get_mut(&session).and_then(|w| w.slots.get_mut(index))
-                                    {
-                                        s.segment.wait();
-                                    }
-                                }
-                            }
-                            Verdict::Stop => {
-                                ended = Some(ScreenStopReason::Limit);
-                                p.rtc.disconnect();
-                            }
+                            verdict @ (Verdict::Overrun | Verdict::Stop) => self.overrun(&mut p, verdict),
                         }
                     }
                     _ => {}
@@ -660,12 +771,10 @@ impl Sfu {
             }
         }
         if !p.rtc.is_alive() {
-            self.forget(Owner::Publish(p.id));
+            self.owners.forget(Owner::Publish(p.id));
             if p.origin.alive() {
-                self.core.screen_publish(
-                    p.origin.share.clone(),
-                    PublishSignal::Ended(ended.unwrap_or(ScreenStopReason::Transport)),
-                );
+                let signal = PublishSignal::Ended(p.ended.unwrap_or(ScreenStopReason::Transport));
+                self.signal(ScreenSignal::Publish { share: p.origin.share.clone(), signal });
             }
             return;
         }
@@ -697,6 +806,26 @@ impl Sfu {
         }
     }
 
+    /// Applies an ingress overrun: every slot of the share waits for its next keyframe and the
+    /// publisher is asked for one. The third within the window ends the share with `limit`.
+    fn overrun(&mut self, p: &mut Publisher, verdict: Verdict) {
+        match verdict {
+            Verdict::Overrun => {
+                p.keyframes.pending = true;
+                for (session, index) in self.slots_of(&p.origin.share) {
+                    if let Some(s) = self.watchers.get_mut(&session).and_then(|w| w.slots.get_mut(index)) {
+                        s.segment.wait();
+                    }
+                }
+            }
+            Verdict::Stop => {
+                p.ended = Some(ScreenStopReason::Limit);
+                p.rtc.disconnect();
+            }
+            Verdict::Forward { .. } | Verdict::Drop => {}
+        }
+    }
+
     /// The (viewer, slot) pairs that carry `share`.
     fn slots_of(&self, share: &str) -> Vec<(SessionId, usize)> {
         self.watchers
@@ -714,10 +843,12 @@ impl Sfu {
     fn flush_watcher(&mut self, session: SessionId) {
         let Some(mut w) = self.watchers.remove(&session) else { return };
         let mut requests = Vec::new();
-        self.drive_watcher(&mut w, &mut requests);
+        if self.drive_watcher(&mut w, &mut requests) {
+            self.signal(ScreenSignal::Watch { session: w.session, run: w.run, connected: true });
+        }
         if !w.rtc.is_alive() {
-            self.forget(Owner::Watch(w.id));
-            self.core.screen_watch(w.session, w.run, false);
+            self.owners.forget(Owner::Watch(w.id));
+            self.signal(ScreenSignal::Watch { session: w.session, run: w.run, connected: false });
             return;
         }
         self.watchers.insert(session, w);
@@ -728,24 +859,26 @@ impl Sfu {
     }
 
     /// Polls a watch transport until it sleeps; keyframe requests from the viewer are
-    /// collected by slot.
-    fn drive_watcher(&self, w: &mut Watcher, requests: &mut Vec<usize>) {
+    /// collected by slot. True if it connected just now.
+    fn drive_watcher(&self, w: &mut Watcher, requests: &mut Vec<usize>) -> bool {
+        sweep(w);
+        let mut connected = false;
         loop {
             if !w.rtc.is_alive() {
-                return;
+                return connected;
             }
             let output = match w.rtc.poll_output() {
                 Ok(output) => output,
                 Err(e) => {
                     debug!(session = w.session, "screen watch poll: {e}");
                     w.rtc.disconnect();
-                    return;
+                    return connected;
                 }
             };
             match output {
                 Output::Timeout(at) => {
                     w.deadline = at;
-                    return;
+                    return connected;
                 }
                 Output::Transmit(t) => {
                     let _ = self.socket.try_send_to(&t.contents, t.destination);
@@ -753,7 +886,7 @@ impl Sfu {
                 Output::Event(event) => match event {
                     RtcEvent::Connected => {
                         w.connected = true;
-                        self.core.screen_watch(w.session, w.run, true);
+                        connected = true;
                     }
                     RtcEvent::IceConnectionStateChange(IceConnectionState::Disconnected) => w.rtc.disconnect(),
                     RtcEvent::MediaAdded(added) if added.kind == MediaKind::Video => {
@@ -791,25 +924,57 @@ impl Sfu {
     fn end_publish(&mut self, share: &str) {
         if let Some(mut p) = self.publishers.remove(share) {
             p.rtc.disconnect();
-            self.forget(Owner::Publish(p.id));
+            self.owners.forget(Owner::Publish(p.id));
         }
     }
 
     fn end_watch(&mut self, session: SessionId) {
         if let Some(mut w) = self.watchers.remove(&session) {
             w.rtc.disconnect();
-            self.forget(Owner::Watch(w.id));
+            self.owners.forget(Owner::Watch(w.id));
         }
+    }
+}
+
+/// Which screen transport each address belongs to, mirrored into the set the voice task routes
+/// by.
+struct Owners {
+    /// Addresses each transport accepted datagrams from, and when it first did.
+    held: HashMap<SocketAddr, (Owner, Instant)>,
+    addrs: Arc<ArcSwap<HashSet<SocketAddr>>>,
+}
+
+impl Owners {
+    /// Routes `source` to `owner`. A transport holds at most `ADDRESSES_PER_TRANSPORT`; a further
+    /// one replaces its oldest, so a transport that keeps moving cannot pile addresses up.
+    fn own(&mut self, source: SocketAddr, owner: Owner, now: Instant) {
+        let held: Vec<(SocketAddr, Instant)> =
+            self.held.iter().filter(|(_, (o, _))| *o == owner).map(|(a, (_, at))| (*a, *at)).collect();
+        let oldest = (held.len() >= ADDRESSES_PER_TRANSPORT)
+            .then(|| held.iter().min_by_key(|(_, at)| *at).map(|(a, _)| *a))
+            .flatten();
+        if let Some(oldest) = oldest {
+            self.held.remove(&oldest);
+        }
+        self.held.insert(source, (owner, now));
+        self.addrs.rcu(|addrs| {
+            let mut addrs = HashSet::clone(addrs);
+            if let Some(oldest) = oldest {
+                addrs.remove(&oldest);
+            }
+            addrs.insert(source);
+            addrs
+        });
     }
 
     /// Stops routing a closed transport's addresses here.
     fn forget(&mut self, owner: Owner) {
-        let gone: Vec<SocketAddr> = self.owners.iter().filter(|(_, o)| **o == owner).map(|(a, _)| *a).collect();
+        let gone: Vec<SocketAddr> = self.held.iter().filter(|(_, (o, _))| *o == owner).map(|(a, _)| *a).collect();
         if gone.is_empty() {
             return;
         }
         for addr in &gone {
-            self.owners.remove(addr);
+            self.held.remove(addr);
         }
         self.addrs.rcu(|addrs| {
             let mut addrs = HashSet::clone(addrs);
@@ -856,6 +1021,16 @@ fn release(rtc: &mut Rtc, slot: &mut Slot) {
         stream.set_rtx_cache(RTX_PACKETS, RTX_AGE, Some(RTX_RATIO));
         stream.set_unpaced(true);
         slot.configured = true;
+    }
+}
+
+/// Releases every slot whose grant ended, ahead of the core's `Release`: once access ends,
+/// nothing of the share leaves this transport, cached repairs included.
+fn sweep(w: &mut Watcher) {
+    for slot in &mut w.slots {
+        if slot.grant.as_ref().is_some_and(|g| !g.alive()) {
+            release(&mut w.rtc, slot);
+        }
     }
 }
 
@@ -940,7 +1115,9 @@ fn publisher(
         rtc,
         ssrc,
         codecs,
+        meter: Meter::new(cap, now),
         ingress: Ingress::new(cap, now),
+        ended: None,
         connected: false,
         created: now,
         keyframes: Throttle::default(),
@@ -953,6 +1130,7 @@ fn watcher(
     id: u64,
     session: SessionId,
     run: u64,
+    lease: Arc<Lease>,
     sdp: &str,
     advertise: SocketAddr,
     now: Instant,
@@ -964,11 +1142,11 @@ fn watcher(
         id,
         session,
         run,
+        lease,
         rtc,
         slots: Vec::with_capacity(SCREEN_SLOTS),
         pending: Vec::new(),
         connected: false,
-        keyframes: Bucket::new(VIEWER_KEYFRAMES_PER_SECOND, VIEWER_KEYFRAMES_BURST, now),
         focus: None,
         deadline: now,
     };
@@ -1012,7 +1190,191 @@ pub fn publish_ssrcs(sdp: &str) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    use str0m::{change::SdpAnswer, media::Direction};
+
     use super::*;
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    fn is_rtp(datagram: &[u8]) -> bool {
+        datagram.len() >= 12 && datagram[0] >> 6 == 2 && !(192..=223).contains(&(datagram[1] & 0x7f))
+    }
+
+    /// A watch transport built as the screen task builds one, connected in memory to a viewer's
+    /// str0m with one receiving slot. Time is simulated.
+    struct Pair {
+        w: Watcher,
+        client: Rtc,
+        now: Instant,
+        /// Holds the viewer's datagrams back instead of delivering them.
+        hold: bool,
+        held: Vec<Vec<u8>>,
+    }
+
+    impl Pair {
+        fn new() -> Self {
+            let now = Instant::now();
+            let mut client = Rtc::builder().set_rtp_mode(true).clear_codecs().enable_vp8(true).build(now);
+            client.add_local_candidate(Candidate::host(addr(5000), "udp").unwrap());
+            let mut api = client.sdp_api();
+            api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+            let (offer, pending) = api.apply().unwrap();
+            let (w, answer) = watcher(1, 7, 1, Lease::new(), &offer.to_sdp_string(), addr(6000), now).unwrap();
+            client.sdp_api().accept_answer(pending, SdpAnswer::from_sdp_string(&answer).unwrap()).unwrap();
+            let mut pair = Self { w, client, now, hold: false, held: Vec::new() };
+            for _ in 0..200 {
+                if pair.w.connected && !pair.w.slots.is_empty() {
+                    break;
+                }
+                pair.step(&mut |_| false);
+            }
+            assert!(pair.w.connected && pair.w.slots.len() == 1, "the pair connects");
+            pair
+        }
+
+        fn send_to_sfu(&mut self, datagram: &[u8]) {
+            let receive = Receive {
+                proto: Protocol::Udp,
+                source: addr(5000),
+                destination: addr(6000),
+                contents: datagram.try_into().unwrap(),
+            };
+            self.w.rtc.handle_input(Input::Receive(self.now, receive)).unwrap();
+        }
+
+        /// 5 ms of both sides. RTP from the SFU that `lose` picks (by sequence number) is lost;
+        /// returns how many RTP datagrams the SFU sent.
+        fn step(&mut self, lose: &mut dyn FnMut(u16) -> bool) -> usize {
+            let mut sent = 0;
+            loop {
+                match self.w.rtc.poll_output().unwrap() {
+                    Output::Timeout(_) => break,
+                    Output::Transmit(t) => {
+                        if is_rtp(&t.contents) {
+                            sent += 1;
+                            if lose(u16::from_be_bytes([t.contents[2], t.contents[3]])) {
+                                continue;
+                            }
+                        }
+                        let receive = Receive {
+                            proto: Protocol::Udp,
+                            source: addr(6000),
+                            destination: addr(5000),
+                            contents: (&*t.contents).try_into().unwrap(),
+                        };
+                        self.client.handle_input(Input::Receive(self.now, receive)).unwrap();
+                    }
+                    Output::Event(RtcEvent::Connected) => self.w.connected = true,
+                    Output::Event(RtcEvent::MediaAdded(added)) if added.direction.is_sending() => {
+                        let pts = video_pts(&self.w.rtc, added.mid);
+                        self.w.slots.push(Slot {
+                            mid: added.mid,
+                            grant: None,
+                            segment: Segment::new(),
+                            generation: 0,
+                            pts,
+                            configured: false,
+                            asked: None,
+                            written: 0,
+                        });
+                    }
+                    Output::Event(_) => {}
+                }
+            }
+            loop {
+                match self.client.poll_output().unwrap() {
+                    Output::Timeout(_) => break,
+                    Output::Transmit(t) if self.hold => self.held.push(t.contents.to_vec()),
+                    Output::Transmit(t) => self.send_to_sfu(&t.contents),
+                    Output::Event(_) => {}
+                }
+            }
+            self.now += Duration::from_millis(5);
+            self.w.rtc.handle_input(Input::Timeout(self.now)).unwrap();
+            self.client.handle_input(Input::Timeout(self.now)).unwrap();
+            sent
+        }
+    }
+
+    /// Ends `slot`'s grant while the viewer's NACK for a lost packet is in flight, then lets the
+    /// NACK arrive (after a sweep, as the screen task does, when `swept`). Returns how many RTP
+    /// datagrams the SFU sent after the grant ended.
+    fn after_revocation(swept: bool) -> usize {
+        let mut pair = Pair::new();
+        let origin = ScreenOrigin::new(1, "share".into(), 1, false, false);
+        let grant = WatchGrant::new(origin.clone());
+        assign(&mut pair.w, 0, grant.clone());
+        let now = pair.now;
+        for n in 0..10u64 {
+            let forward = Forward {
+                source: 100 + n,
+                timestamp: 9000,
+                marker: n == 9,
+                keyframe: n == 0,
+                codec: VideoCodec::Vp8,
+                arrival: now,
+                payload: Arc::from([if n == 0 { 0x10 } else { 0x00 }, 0x00, n as u8, 0xaa].as_slice()),
+            };
+            assert!(write(&mut pair.w, 0, &origin, &forward, now));
+        }
+        // The viewer loses the third packet; its NACK is held back.
+        pair.hold = true;
+        let mut seen = 0;
+        let mut lose = |_| {
+            seen += 1;
+            seen == 3
+        };
+        let sent: usize = (0..10).map(|_| pair.step(&mut lose)).sum();
+        assert_eq!(sent, 10);
+        assert!(!pair.held.is_empty(), "the viewer reports its loss");
+        grant.end();
+        if swept {
+            sweep(&mut pair.w);
+        }
+        pair.hold = false;
+        for datagram in std::mem::take(&mut pair.held) {
+            pair.send_to_sfu(&datagram);
+        }
+        (0..20).map(|_| pair.step(&mut |_| false)).sum()
+    }
+
+    #[test]
+    fn a_revoked_slot_answers_no_nack() {
+        assert!(after_revocation(false) > 0, "the cache would answer it");
+        assert_eq!(after_revocation(true), 0, "nothing after the grant ended");
+    }
+
+    #[test]
+    fn a_grant_ends_with_its_share() {
+        let origin = ScreenOrigin::new(1, "share".into(), 1, false, false);
+        let grant = WatchGrant::new(origin.clone());
+        assert!(grant.alive());
+        origin.end();
+        assert!(!grant.alive());
+    }
+
+    #[test]
+    fn transports_hold_few_addresses_and_voice_takes_them_back() {
+        let (dispatch, rx) = dispatch();
+        let mut owners = Owners { held: HashMap::new(), addrs: rx.addrs.clone() };
+        let now = Instant::now();
+        for port in 0..ADDRESSES_PER_TRANSPORT as u16 + 2 {
+            owners.own(addr(7000 + port), Owner::Watch(1), now + Duration::from_millis(port.into()));
+        }
+        owners.own(addr(8000), Owner::Publish(2), now);
+        // The two oldest went; the newest stay, in the voice task's set too.
+        assert_eq!(owners.held.len(), ADDRESSES_PER_TRANSPORT + 1);
+        assert!(!dispatch.owns(&addr(7000)) && !dispatch.owns(&addr(7001)));
+        assert!((2..ADDRESSES_PER_TRANSPORT as u16 + 2).all(|port| dispatch.owns(&addr(7000 + port))));
+        // A voice peer's STUN from a screen address takes it back.
+        dispatch.disown(&addr(8000));
+        assert!(!dispatch.owns(&addr(8000)));
+        owners.forget(Owner::Watch(1));
+        assert_eq!(owners.held.len(), 1);
+        assert!(!dispatch.owns(&addr(7005)));
+    }
 
     #[test]
     fn publish_offers_name_exactly_one_video_stream_and_its_rtx() {

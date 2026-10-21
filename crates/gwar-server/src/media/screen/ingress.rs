@@ -37,12 +37,13 @@ pub struct Descriptor {
 }
 
 /// Reads the start-of-frame and keyframe bits, and nothing else of the codec. `None` for a
-/// payload too short to carry its descriptor.
+/// payload whose descriptor is truncated or leaves no payload.
 pub fn describe(codec: VideoCodec, payload: &[u8]) -> Option<Descriptor> {
     let first = *payload.first()?;
     match codec {
         // RFC 9628: |I|P|L|F|B|E|V|Z|. B starts a frame; P = 0 is not inter-predicted.
         VideoCodec::Vp9 => {
+            vp9_descriptor_len(payload).filter(|&len| len < payload.len())?;
             let frame_start = first & 0x08 != 0;
             Some(Descriptor { frame_start, keyframe: frame_start && first & 0x40 == 0 })
         }
@@ -70,6 +71,49 @@ pub fn describe(codec: VideoCodec, payload: &[u8]) -> Option<Descriptor> {
     }
 }
 
+/// The length of a VP9 payload descriptor (RFC 9628 §4.2), with its optional fields.
+fn vp9_descriptor_len(payload: &[u8]) -> Option<usize> {
+    let first = *payload.first()?;
+    let (picture_id, inter, layers, flexible, scalability) =
+        (first & 0x80 != 0, first & 0x40 != 0, first & 0x20 != 0, first & 0x10 != 0, first & 0x02 != 0);
+    let mut at = 1;
+    if picture_id {
+        at += if *payload.get(at)? & 0x80 != 0 { 2 } else { 1 };
+    }
+    if layers {
+        // Layer indices, and TL0PICIDX in non-flexible mode.
+        at += if flexible { 1 } else { 2 };
+    }
+    if flexible && inter {
+        // Up to three reference indices, each with a "next" bit.
+        for _ in 0..3 {
+            let reference = *payload.get(at)?;
+            at += 1;
+            if reference & 0x01 == 0 {
+                break;
+            }
+        }
+    }
+    if scalability {
+        let structure = *payload.get(at)?;
+        at += 1;
+        let spatial = usize::from(structure >> 5) + 1;
+        if structure & 0x10 != 0 {
+            at += 4 * spatial;
+        }
+        if structure & 0x08 != 0 {
+            let groups = *payload.get(at)?;
+            at += 1;
+            for _ in 0..groups {
+                let group = *payload.get(at)?;
+                at += 1 + usize::from((group >> 2) & 0x03);
+            }
+        }
+    }
+    payload.get(at.checked_sub(1)?)?;
+    Some(at)
+}
+
 /// A token bucket refilled continuously.
 #[derive(Debug, Clone)]
 pub struct Bucket {
@@ -88,6 +132,12 @@ impl Bucket {
         let elapsed = now.saturating_duration_since(self.at).as_secs_f64();
         self.tokens = (self.tokens + elapsed * self.rate).min(self.burst);
         self.at = now;
+    }
+
+    /// Whether it has refilled completely, so that dropping it loses nothing.
+    pub fn full(&mut self, now: Instant) -> bool {
+        self.refill(now);
+        self.tokens >= self.burst
     }
 
     /// Takes `amount` if it is all there; otherwise takes nothing.
@@ -126,6 +176,8 @@ pub struct IngressCounters {
     pub forwarded: u64,
     pub dropped: u64,
     pub overruns: u64,
+    /// Datagrams the publish transport's meter dropped before str0m.
+    pub transport_dropped: u64,
 }
 
 pub struct Ingress {
@@ -172,9 +224,10 @@ impl Ingress {
             self.blocked = false;
         }
         let mut within = self.packets.take(1.0, now) && self.bytes.take(size as f64, now);
-        // Frame bounds follow the newest frame; a late repair belongs to an older one and only
-        // counts against the buckets.
-        if newest {
+        // Frame bounds follow the newest frame, counting each of its packets in whatever order
+        // they arrive; a late repair of an older frame only counts against the buckets.
+        let current = self.frame.as_ref().is_some_and(|frame| frame.timestamp == timestamp);
+        if newest || current {
             let frame = match &mut self.frame {
                 Some(frame) if frame.timestamp == timestamp => frame,
                 frame => frame.insert(Frame { timestamp, first: now, bytes: 0, packets: 0 }),
@@ -190,6 +243,12 @@ impl Ingress {
             return Verdict::Forward { keyframe: newest && describe.keyframe };
         }
         self.counters.dropped += 1;
+        self.overrun(now)
+    }
+
+    /// Records an overrun: the share drops until its next keyframe, or stops on the third
+    /// within `OVERRUN_WINDOW`.
+    pub fn overrun(&mut self, now: Instant) -> Verdict {
         self.counters.overruns += 1;
         self.blocked = true;
         self.frame = None;
@@ -212,10 +271,21 @@ mod tests {
     #[test]
     fn descriptors_find_frame_and_keyframe_starts() {
         // VP9: B set, P clear → keyframe start; P set → delta; B clear → continuation.
-        assert_eq!(describe(VideoCodec::Vp9, &[0x88]), Some(KEY));
-        assert_eq!(describe(VideoCodec::Vp9, &[0xc8]), Some(START));
-        assert_eq!(describe(VideoCodec::Vp9, &[0x80]), Some(MORE));
+        assert_eq!(describe(VideoCodec::Vp9, &[0x08, 0x00]), Some(KEY));
+        assert_eq!(describe(VideoCodec::Vp9, &[0x48, 0x00]), Some(START));
+        assert_eq!(describe(VideoCodec::Vp9, &[0x00, 0x00]), Some(MORE));
         assert_eq!(describe(VideoCodec::Vp9, &[]), None);
+        // A descriptor with no payload after it.
+        assert_eq!(describe(VideoCodec::Vp9, &[0x08]), None);
+        // I (15-bit picture id) and L in non-flexible mode: four descriptor bytes.
+        assert_eq!(describe(VideoCodec::Vp9, &[0xa8, 0x81, 0x02, 0x00, 0x07, 0x00]), Some(KEY));
+        assert_eq!(describe(VideoCodec::Vp9, &[0xa8, 0x81, 0x02, 0x00, 0x07]), None);
+        // Flexible, inter-predicted, with two reference indices.
+        assert_eq!(describe(VideoCodec::Vp9, &[0x58, 0x03, 0x04, 0x00]), Some(START));
+        assert_eq!(describe(VideoCodec::Vp9, &[0x58, 0x03, 0x04]), None);
+        // A scalability structure with one spatial layer's size and one group of one reference.
+        assert_eq!(describe(VideoCodec::Vp9, &[0x0a, 0x18, 0, 1, 0, 1, 0x01, 0x04, 0x02, 0x00]), Some(KEY));
+        assert_eq!(describe(VideoCodec::Vp9, &[0x0a, 0x18, 0, 1, 0, 1, 0x01, 0x04, 0x02]), None);
         // VP8 without extensions: S, PID 0, payload header bit 0 clear → keyframe.
         assert_eq!(describe(VideoCodec::Vp8, &[0x10, 0x00]), Some(KEY));
         assert_eq!(describe(VideoCodec::Vp8, &[0x10, 0x01]), Some(START));
@@ -278,18 +348,26 @@ mod tests {
     #[test]
     fn frame_bounds_cut_frames_without_a_boundary() {
         let now = Instant::now();
-        for (case, size, packets, step) in [
-            ("bytes", 1200, FRAME_BYTES / 1200 + 1, Duration::ZERO),
-            ("packets", 10, FRAME_PACKETS + 1, Duration::ZERO),
-            ("span", 10, 12, Duration::from_millis(50)),
+        // Spaced so the buckets keep refilling: only the frame bound can cut. `reversed` sends
+        // each pair of packets in reverse sequence order.
+        for (case, size, packets, step, reversed) in [
+            ("bytes", 1200, FRAME_BYTES / 1200 + 1, Duration::from_micros(100), false),
+            ("packets", 10, FRAME_PACKETS + 1, Duration::from_micros(500), false),
+            ("reordered packets", 10, FRAME_PACKETS + 1, Duration::from_micros(500), true),
+            ("span", 10, 12, Duration::from_millis(50), false),
         ] {
-            // Fresh buckets for each frame: a generous cap and a refill between frames.
             let mut ingress = Ingress::new(1_000_000_000, now);
             let mut at = now;
             let mut verdicts = Vec::new();
             for n in 0..packets {
+                let sequence = match n {
+                    0 => 0,
+                    n if reversed && n % 2 == 1 => n + 1,
+                    n if reversed => n - 1,
+                    n => n,
+                } as u64;
                 let describe = if n == 0 { KEY } else { MORE };
-                verdicts.push(ingress.admit(n as u64, 7, size, describe, at));
+                verdicts.push(ingress.admit(sequence, 7, size, describe, at));
                 at += step;
             }
             let last = *verdicts.last().unwrap();

@@ -426,6 +426,13 @@ datagrams reach the screen task without slowing voice down.
   - `accepts` classifies by remote address and STUN credentials (ICE
     ufrag/pwd). This is **routing, not authentication**: SRTP authentication
     in the owning `Rtc` is what rejects forged media, as for voice today.
+  - **STUN always goes by credentials, voice first** (RFC 7983: first byte
+    0–3), even from a screen address. A voice peer that accepts it takes the
+    address back from the screen set (`disown`), so a NAT that reuses an old
+    screen address for a voice client cannot divert that client's voice for
+    longer than one consent check.
+  - A screen transport holds at most 4 addresses; a fifth replaces its
+    oldest.
 - **The hand-off never blocks.** A full channel drops the datagram and counts
   `screen_dispatch_dropped`. Video recovers through NACK/PLI; voice never
   waits.
@@ -563,6 +570,16 @@ does not assemble frames before forwarding.
   would loop through drops and requests.
 - **Packet-level overshoot is zero.** A packet is either within the buckets
   when it arrives or it is dropped. Nothing waits for a frame boundary.
+- **Frame bounds count every packet of the current frame**, in whatever order
+  its packets arrive; a late repair of an older frame counts against the
+  buckets only. The VP9 descriptor is parsed to its end (RFC 9628 §4.2), and a
+  truncated one is not forwarded.
+- **The transport is metered too.** Every datagram of a publish transport,
+  before str0m sees it (RTX, padding, duplicates, RTCP, STUN included), passes
+  a meter of 2,500 packets/s and 1.5× the share's cap in bytes. Over it,
+  datagrams drop before str0m, and the first drop of a run counts as an
+  overrun, so a publisher cannot exceed its budget through repairs or padding
+  that the media buckets never see.
 
 ### Forwarding: stable sequence mapping
 
@@ -1211,7 +1228,14 @@ wherever the watcher is, not only for the channel's occupants:
   watches.
 
 When access ends, the slot is released exactly like `screen.unwatch`, in the
-screen task's next loop iteration. Its Gwar queue is cleared, its RTX cache
+screen task's next loop iteration. The core ends the slot's grant first (a
+grant also ends with its share), and the screen task checks grants before it
+feeds or polls a watch transport, so a NACK arriving before the `Release`
+finds an empty RTX cache. Commands that end things are also fenced: a
+transport whose share or lease (a watch transport's, ended when the core drops
+it) has ended closes within 100 ms even if its command was lost to a full
+queue, and an assignment is recorded only once the queue has room for it. The
+screen task's own signals to the core (connected, ended) arrive in order. Its Gwar queue is cleared, its RTX cache
 is wiped with `set_rtx_cache`, and its reservation is freed. The viewer gets
 `screen.slot {share: null}` and `screen.stopped {reason: "access"}`. Nothing
 of the share is sent to that viewer after that iteration; repairs and probes
@@ -1219,10 +1243,10 @@ included ([Queues and repairs](#queues-and-repairs)).
 
 | Op | Body | Reply / effect |
 | --- | --- | --- |
-| `screen.start` | `{call, participation, preset, surface, guest_link}` (`surface`: `screen`/`window`/`tab`/`unknown`, display only; `guest_link`: post a TeamSpeak watch link where one is possible) | `{share}`, a 16-byte random id; checks `share_screen`, limits and budget; refused in encrypted channels until PR 7. Not announced until its publish transport connects; one that has not connected 35 s after its answer ends with `transport`, told to the sharer only |
+| `screen.start` | `{call, participation, preset, surface, guest_link}` (`surface`: `screen`/`window`/`tab`/`unknown`, display only; `guest_link`: post a TeamSpeak watch link where one is possible) | `{share}`, a 16-byte random id; checks `share_screen`, limits and budget; refused in encrypted channels until PR 7. Not announced until its publish transport connects; one not answered 35 s after its start, or not connected 35 s after its answer, ends with `transport`, told to the sharer only |
 | `screen.publish.offer` | `{share, ssrc, rtx_ssrc, sdp}` | `{sdp}`; the share's own publish transport. Its first connection announces `screen.started` to the channel. One per share, never renegotiated |
 | `screen.stop` | `{share}` | ok; event `screen.stopped {share, reason: "stopped"}` |
-| `screen.watch.offer` | `{run, sdp}` | `{sdp}`; the session's watch transport (4 `recvonly` slots). `run` restarts it like voice's run |
+| `screen.watch.offer` | `{run, sdp}` | `{sdp}`; the session's watch transport (4 `recvonly` slots). `run` restarts it like voice's run; a run is retired for good once offered, so a failed or closed run and every lower one answer `stale` |
 | `screen.watch` | `{share}` | `{slot}`; needs a connected watch transport (`unavailable` otherwise); the server assigns a slot, opens a segment at the next keyframe (throttled request), event `screen.slot` |
 | `screen.focus` | `{share}` | ok; the share on the viewer's stage gets first claim on its bandwidth |
 | `screen.unwatch` | `{share}` | ok; the slot is freed |
@@ -1234,7 +1258,7 @@ Events:
 
 - `screen.started {share, client, channel, preset, surface}`;
 - `screen.viewers {share, members, guests}`, to the sharer only, and
-  `screen.link {share, active}` to the sharer and the channel's moderators;
+  `screen.link {share, active}` to the sharer and, once the share is announced, the channel's moderators;
 - `screen.stopped {share, reason: stopped|moderator|left|limit|transport|budget|access}`;
 - `screen.slot {run, slot, share | null}`, like `voice.slot`, tagged with the
   watch transport's `run`;

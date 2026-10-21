@@ -166,6 +166,10 @@ async fn an_overrun_cuts_the_rest_until_a_keyframe_and_three_end_the_share() {
     let publisher = alice.publisher(&share);
     let (mut sequence, mut timestamp) = stream(publisher, 0, 0, 1, 1, 3, true).await;
     let before = publisher.keyframe_requests();
+    let viewer = bob.viewer.as_mut().unwrap();
+    for i in 0..3 {
+        assert_eq!(viewer.next().await, (slot, frame(0, 0, true, 3, 1)[i].clone()));
+    }
 
     // A frame that never ends: its continuation 600 ms later breaks the 500 ms bound.
     let overrun = |sequence: &mut u64, timestamp: &mut u32| {
@@ -180,14 +184,16 @@ async fn an_overrun_cuts_the_rest_until_a_keyframe_and_three_end_the_share() {
         *timestamp += 2700;
         (start, late)
     };
+    // The frame's span starts once the server has its first packets: the viewer has them too.
     let (start, late) = overrun(&mut sequence, &mut timestamp);
     publisher.send(start).await;
+    assert_eq!(tags(&[viewer.next().await, viewer.next().await], slot), [(40, 0), (40, 1)], "the prefix stays");
     tokio::time::sleep(Duration::from_millis(600)).await;
     publisher.send([late]).await;
     // Deltas after the cut drop too, until the next keyframe.
     let (next_sequence, next_timestamp) = stream(publisher, sequence, timestamp, 50, 2, 2, false).await;
     let received = bob.viewer.as_mut().unwrap().collect(Duration::from_millis(300)).await;
-    assert_eq!(tags(&received, slot), [(1, 0), (1, 1), (1, 2), (40, 0), (40, 1)], "the prefix stays");
+    assert!(received.is_empty(), "cut: {received:?}");
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(publisher.keyframe_requests() > before, "the sharer is asked for a keyframe");
     let (sequence, timestamp) = stream(publisher, next_sequence, next_timestamp, 60, 1, 2, true).await;
@@ -202,6 +208,9 @@ async fn an_overrun_cuts_the_rest_until_a_keyframe_and_three_end_the_share() {
         timestamp += 2700;
         let (start, late) = overrun(&mut sequence, &mut timestamp);
         publisher.send(start).await;
+        let viewer = bob.viewer.as_mut().unwrap();
+        let got = [viewer.next().await, viewer.next().await, viewer.next().await];
+        assert_eq!(tags(&got, slot), [(70, 0), (40, 0), (40, 1)]);
         tokio::time::sleep(Duration::from_millis(600)).await;
         publisher.send([late]).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -234,6 +243,17 @@ async fn keyframe_requests_are_throttled_per_share_and_per_viewer() {
         tokio::time::sleep(Duration::from_millis(600)).await;
     }
     assert!(alice.publisher(&share).keyframe_requests() - spent <= 2);
+    // A new watch transport does not bring a new budget: watching again and asking again
+    // reach the sharer at most once (what refilled meanwhile).
+    let spent = alice.publisher(&share).keyframe_requests();
+    bob.viewer = Some(screen::Viewer::start(&mut bob, 2).await);
+    bob.ok("screen.watch", json!({"share": share})).await;
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        bob.ok("screen.keyframe", json!({"share": share})).await;
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(alice.publisher(&share).keyframe_requests() - spent <= 1, "the budget carried over");
     assert_eq!(bob.fails("screen.keyframe", json!({"share": "AAAAAAAAAAAAAAAAAAAAAA"})).await, "not_found");
 }
 
@@ -271,4 +291,9 @@ async fn transports_are_negotiated_strictly() {
     assert_eq!(alice.next_event_where("screen.viewers", |v| v["members"] == 0).await["share"], share);
     assert_eq!(bob.fails("screen.watch.offer", json!({"run": 1, "sdp": "v=0"})).await, "stale");
     assert_eq!(bob.ok("screen.watch", json!({"share": share})).await["slot"], 0);
+    // A run that failed is retired with everything below it, even with no transport left.
+    assert_eq!(bob.fails("screen.watch.offer", json!({"run": 9, "sdp": "v=0"})).await, "bad_request");
+    assert_eq!(bob.fails("screen.watch.offer", json!({"run": 9, "sdp": "v=0"})).await, "stale");
+    assert_eq!(bob.fails("screen.watch.offer", json!({"run": 3, "sdp": "v=0"})).await, "stale");
+    bob.viewer = Some(screen::Viewer::start(&mut bob, 10).await);
 }

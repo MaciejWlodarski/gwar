@@ -691,6 +691,16 @@ async fn the_sharer_or_a_moderator_turns_the_watch_link_off_for_good() {
     alice.ok("screen.link.revoke", json!({"share": share})).await;
     assert!(alice.drain_events("screen.link").await.is_empty(), "already off");
     assert!(bob.drain_events("screen.link").await.is_empty());
+
+    // Before a share is announced, turning its link off tells its sharer alone.
+    alice.ok("screen.stop", json!({"share": share})).await;
+    let voice = alice.ok("voice.state", json!({})).await["voice"].clone();
+    let start = json!({"call": voice["call"], "participation": voice["participation"], "preset": "smooth",
+        "surface": "tab", "guest_link": true});
+    let pending = alice.ok("screen.start", start).await["share"].as_str().unwrap().to_owned();
+    alice.ok("screen.link.revoke", json!({"share": pending})).await;
+    assert_eq!(alice.next_event("screen.link").await, json!({"share": pending, "active": false}));
+    assert!(root.drain_events("screen.link").await.is_empty(), "nothing of an unannounced share");
 }
 
 #[tokio::test]

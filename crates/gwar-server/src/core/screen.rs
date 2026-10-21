@@ -9,7 +9,7 @@ use super::{
     voice::{bad, stale},
     *,
 };
-use crate::media::screen::{PUBLISH_CONNECT, PublishSignal, ScreenCmd, ScreenOrigin, WatchGrant, publish_ssrcs};
+use crate::media::screen::{Lease, PUBLISH_CONNECT, PublishSignal, ScreenCmd, ScreenOrigin, WatchGrant, publish_ssrcs};
 use gwar_proto::{
     SCREEN_SLOTS, ScreenPreset, ScreenPublishOffer, ScreenShare, ScreenStart, ScreenStopReason, ScreenSurface,
     ScreenWatchOffer, VoiceParticipation,
@@ -60,7 +60,19 @@ pub(super) struct Watch {
     answer: Option<String>,
     connected: bool,
     slots: [Option<(String, Arc<WatchGrant>)>; SCREEN_SLOTS],
+    /// Ends with this value: the screen task closes the transport even without `EndWatch`.
+    lease: Arc<Lease>,
 }
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        self.lease.end();
+    }
+}
+
+/// How long a share may take to connect: from its start to its answer, and again from the
+/// answer to the connection (the SFU's own `PUBLISH_CONNECT`, with slack).
+const CONNECT_DEADLINE: Duration = Duration::from_secs(PUBLISH_CONNECT.as_secs() + 5);
 
 fn not_found() -> ErrorBody {
     err(ErrorCode::NotFound, "no such share")
@@ -171,20 +183,30 @@ impl Core {
         };
         self.shares.insert(id.clone(), share);
         self.sessions.get_mut(&session).expect("checked by caller").sharing = Some(id.clone());
-        // Announced when the publish transport connects; one that never does ends the share.
-        if let Some(tx) = self.me.upgrade() {
-            let share = id.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(PUBLISH_CONNECT + Duration::from_secs(5)).await;
-                let check = move |core: &mut Core| {
-                    if core.shares.get(&share).is_some_and(|s| !s.live) {
-                        core.end_share(&share, ScreenStopReason::Transport, None);
-                    }
-                };
-                let _ = tx.send(CoreMsg::Resume(Box::new(check))).await;
-            });
-        }
+        // Announced when the publish transport connects. One never negotiated ends here; one
+        // negotiated gets its own deadline from its answer.
+        self.connect_deadline(&id, false);
         Ok(Response::ScreenShare { share: id })
+    }
+
+    /// Ends share `id` with `transport` unless, `CONNECT_DEADLINE` from now, it is live, or
+    /// (for the deadline set at its start, `answered` false) its transport was answered.
+    fn connect_deadline(&self, id: &str, answered: bool) {
+        let Some(tx) = self.me.upgrade() else { return };
+        let share = id.to_owned();
+        tokio::spawn(async move {
+            tokio::time::sleep(CONNECT_DEADLINE).await;
+            let check = move |core: &mut Core| {
+                let Some(s) = core.shares.get(&share) else { return };
+                let negotiated = s.publish.as_ref().is_some_and(|p| p.answer.is_some());
+                if !s.live && (answered || !negotiated) {
+                    let sharer = s.sharer;
+                    core.end_share(&share, ScreenStopReason::Transport, None);
+                    core.client_updated(sharer);
+                }
+            };
+            let _ = tx.send(CoreMsg::Resume(Box::new(check))).await;
+        });
     }
 
     /// Negotiates the share's publish transport, once.
@@ -243,6 +265,7 @@ impl Core {
                         if let Some(publish) = &mut share.publish {
                             publish.answer = Some(sdp.clone());
                         }
+                        core.connect_deadline(&name, true);
                         Ok(Response::ScreenAnswer { sdp })
                     }
                     Err(message) => {
@@ -263,22 +286,23 @@ impl Core {
         if self.sessions[&session].out.is_none() {
             return Some(Err(bad("remote session has no WebRTC transport")));
         }
-        if let Some(watch) = &self.sessions[&session].watch {
-            if offer.run < watch.run {
-                return Some(Err(stale()));
+        let s = &self.sessions[&session];
+        if offer.run < s.watch_run {
+            return Some(Err(stale()));
+        }
+        if offer.run == s.watch_run {
+            // The run's transport failed or closed: retired for good.
+            let Some(watch) = &s.watch else { return Some(Err(stale())) };
+            if watch.sdp != offer.sdp {
+                return Some(Err(err(ErrorCode::Conflict, "run reused with a different offer")));
             }
-            if offer.run == watch.run {
-                if watch.sdp != offer.sdp {
-                    return Some(Err(err(ErrorCode::Conflict, "run reused with a different offer")));
-                }
-                return Some(
-                    watch
-                        .answer
-                        .clone()
-                        .map(|sdp| Response::ScreenAnswer { sdp })
-                        .ok_or_else(|| err(ErrorCode::Unavailable, "negotiation pending")),
-                );
-            }
+            return Some(
+                watch
+                    .answer
+                    .clone()
+                    .map(|sdp| Response::ScreenAnswer { sdp })
+                    .ok_or_else(|| err(ErrorCode::Unavailable, "negotiation pending")),
+            );
         }
         if offer.sdp.len() > SDP_LIMIT {
             return Some(Err(err(ErrorCode::TooLarge, "SDP too large")));
@@ -290,15 +314,19 @@ impl Core {
             return Some(Err(err(ErrorCode::Unavailable, "screen engine busy")));
         };
         self.drop_watches(session, false);
-        self.sessions.get_mut(&session).expect("checked above").watch = Some(Watch {
+        let lease = Lease::new();
+        let s = self.sessions.get_mut(&session).expect("checked above");
+        s.watch_run = offer.run;
+        s.watch = Some(Watch {
             run: offer.run,
             sdp: offer.sdp.clone(),
             answer: None,
             connected: false,
             slots: Default::default(),
+            lease: lease.clone(),
         });
         let (reply, rx) = oneshot::channel();
-        permit.send(ScreenCmd::Watch { session, run: offer.run, sdp: offer.sdp, reply });
+        permit.send(ScreenCmd::Watch { session, run: offer.run, lease, sdp: offer.sdp, reply });
         let tx = self.me.upgrade()?;
         let run = offer.run;
         tokio::spawn(async move {
@@ -418,11 +446,12 @@ impl Core {
             return Ok(Response::Empty {});
         }
         // PR 6: the link's token stops working here and its guests are disconnected.
-        let (sharer, channel) = (share.sharer, share.channel);
+        let (sharer, channel, live) = (share.sharer, share.channel, share.live);
+        // Before the share is announced, only its sharer knows of it.
         let moderators: Vec<_> = self
             .share_audience(channel)
             .into_iter()
-            .filter(|&s| s == sharer || self.can_in(s, channel, Permission::MuteMembers))
+            .filter(|&s| s == sharer || (live && self.can_in(s, channel, Permission::MuteMembers)))
             .collect();
         let event = Event::ScreenLink { share: id.to_owned(), active: false };
         self.broadcast(event, |s| moderators.contains(&s.id));
@@ -451,11 +480,15 @@ impl Core {
             return Err(err(ErrorCode::Busy, "you are watching as many shares as allowed"));
         };
         let run = watch.run;
-        let grant = WatchGrant::new(id.to_owned());
+        let grant = WatchGrant::new(share.origin.clone());
+        // Room for the assignment first: nothing is recorded that the SFU never hears of.
+        let Ok(permit) = self.screen.clone().try_reserve_owned() else {
+            return Err(err(ErrorCode::Unavailable, "screen engine busy"));
+        };
         let watch = self.sessions.get_mut(&session).and_then(|s| s.watch.as_mut()).expect("checked above");
         watch.slots[slot] = Some((id.to_owned(), grant.clone()));
         self.shares.get_mut(id).expect("checked above").viewers.insert(session);
-        let _ = self.screen.try_send(ScreenCmd::Assign { session, run, slot: slot as u32, grant });
+        permit.send(ScreenCmd::Assign { session, run, slot: slot as u32, grant });
         self.send_event(session, Event::ScreenSlot { run, slot: slot as u32, share: Some(id.to_owned()) });
         self.send_viewers(id);
         Ok(Response::ScreenSlot { slot: slot as u32 })
