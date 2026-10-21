@@ -418,16 +418,63 @@ Spike S3 showed browsers' H.264 packetizers send nothing when the whole frame
 is encrypted ([screen-share.md, Spikes](screen-share.md#spikes)). The layout,
 already chosen in [screen-share.md §2](screen-share.md#support), is:
 
-- everything up to and including the first slice NAL's header stays clear
-  (start codes, SPS, PPS, SEI and the slice NAL header byte); it is
-  RFC 9605 *metadata*, so it is authenticated (AAD = `header || clear`);
-- the rest, `SFrameHeader || AEAD(slice data and later NALs)`, is
-  **start-code escaped**: any `00 00 0x` with `x ≤ 3` gets an emulation
-  prevention byte, as in H.264 itself, and a final `00` byte is followed by
-  `03`, so no packetizer splits or trims the ciphertext. The receiver
-  unescapes before opening.
+- everything up to and including the start of the first slice's header
+  stays clear: start codes, SPS, PPS, SEI, the slice NAL header byte, and
+  the **slice header bytes up to and including the byte that holds the last
+  bit of `pic_parameter_set_id`** (the third `ue(v)` field, after
+  `first_mb_in_slice` and `slice_type`). It is RFC 9605 *metadata*, so it is
+  authenticated (AAD = `header || clear`);
+- the rest, `SFrameHeader || AEAD(remaining slice data and later NALs)`, is
+  **start-code escaped** and then ends with a **trailer** (below), so no
+  packetizer splits or trims the ciphertext. The receiver checks and removes
+  the trailer and unescapes before opening.
 - Without escaping, about one frame in 2^24 ciphertext bytes contains a
   start code and is lost. Spike S3's unescaped variant worked only by luck.
+
+**Why the slice header prefix stays clear.** WebRTC receivers (Chromium, and
+WebKit, which uses the same libwebrtc) parse the first slice of each packet
+*before* the receive transform runs. `ParseSliceHeader`
+([`pps_parser.cc`](https://github.com/webrtc-mirror/webrtc/blob/main/common_video/h264/pps_parser.cc))
+reads `first_mb_in_slice`, `slice_type` and `pic_parameter_set_id`; the
+depacketizer
+([`video_rtp_depacketizer_h264.cc`](https://github.com/webrtc-mirror/webrtc/blob/main/modules/rtp_rtcp/source/video_rtp_depacketizer_h264.cc))
+uses `first_mb_in_slice == 0` to mark the first packet of a frame and drops
+a single-NAL or STAP-A slice whose header does not parse. The SPS/PPS
+tracker
+([`h264_sps_pps_tracker.cc`](https://github.com/webrtc-mirror/webrtc/blob/main/modules/video_coding/h264_sps_pps_tracker.cc))
+then looks up that PPS id for the first packet of an IDR and answers
+`kRequestKeyframe` if it has not seen that PPS, and the receiver drops the
+packet
+([`rtp_video_stream_receiver2.cc`](https://github.com/webrtc-mirror/webrtc/blob/main/video/rtp_video_stream_receiver2.cc));
+the frame transformer only sees assembled frames. If the SFrame header
+followed the NAL header byte, those fields would be read from it: a 6-byte
+header `c0 01 00 00 00 00` (KID 1 << 32, counter 0) reads as
+`first_mb_in_slice = 0`, `slice_type = 0` and PPS id 8191. The packet would
+be dropped before the opener runs, and no canonicalization after
+depacketization could recover it. Keeping those bits in the clear (at most
+about 8 bytes at 2160p, plus emulation prevention bytes) and authenticating
+them avoids this. The bits after `pic_parameter_set_id` in the last clear
+byte stay clear too.
+
+**Escaping and trailer, unambiguous.**
+
+- Escaping runs over the bytes after the clear part, continuing the zero
+  count from the clear part's last bytes: wherever two zero bytes are
+  followed by a byte `00`, `01`, `02` or `03`, an emulation prevention byte
+  `03` is inserted before it, as in H.264.
+- The escaped bytes are always followed by one **trailer byte `80`**, which
+  is also H.264's `rbsp_trailing_bits`. Because `80` is above `03`, the
+  escaper never has to look past the payload's end, and the NAL never ends
+  in `00`.
+- The receiver requires the last byte to be `80` and removes it, then
+  removes each `03` that follows two zero bytes. It **rejects** any input
+  the escaper cannot produce: a missing trailer, `00 00` followed by `00`,
+  `01` or `02`, or `00 00 03` followed by anything but `00`–`03` (the
+  trailer included). Escaping is then a bijection between ciphertexts and
+  valid escaped payloads.
+- Ciphertext ending `aa 00` is sent as `aa 00 80`; ciphertext ending
+  `aa 00 03` as `aa 00 03 80`; ending `00 00` as `00 00 80`; ending
+  `00 00 03` as `00 00 03 03 80`. These four are explicit vectors in B2.
 
 **The clear part is authenticated in canonical form.** The packetizer and
 depacketizer rewrite the clear bytes. str0m 0.24.1
@@ -462,14 +509,18 @@ cannot authenticate unchanged. The rule:
   IDR that lacks them) is **(to verify; E2)**; the publisher
   contract above means they never need to.
 
-The exact byte rules (the canonical form, which NALs are clear when several
-slices exist, the escaping, the bounds) are written once, with test vectors
+The exact byte rules (the canonical form, the slice header prefix counted
+over the NAL's bytes with its emulation prevention bytes, which NALs are
+clear when several slices exist, the escaping and trailer, the bounds) are
+written once, with test vectors
 shared by Rust and TypeScript, in work item [B2](#track-b-shared-rust-media-core)/[E2](#track-e-web-side-changes).
 The same vectors gate both implementations, like
 `crates/gwar-client/tests/sframe-interop.json` does for voice. Vectors alone
 do not prove the round trip through real packetizers, so B2 and E2 also
 require **seal → packetize → SFU → depacketize → open** tests, with input
-that has AUDs and with input that has three-byte start codes. SPS and PPS
+that has AUDs and with input that has three-byte start codes, and with real
+RFC 9605 headers at every KID and CTR width, through str0m and through
+Chromium's and WebKit's receive paths. SPS and PPS
 stay clear, so the server sees resolution and profile; it already sees
 resolution for VP9 ([What the server still sees](screen-share.md#what-the-server-still-sees)).
 
@@ -507,13 +558,34 @@ control (`kVTVideoEncoderSpecification_EnableLowLatencyRateControl`, macOS
 automatically"
 ([Apple](https://developer.apple.com/documentation/videotoolbox/kvtvideoencoderspecification_enablelowlatencyratecontrol)).
 It cannot produce the Constrained Baseline default, so the Apple adapter has
-two configurations, and each advertises only what it produces:
+two configurations. **Neither lets Gwar set the level.** VideoToolbox's
+only Constrained Baseline key is `kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel`,
+and FFmpeg's VideoToolbox encoder warns that with it "Level is
+auto-selected ... The output may be encoded with a different level"
+([`videotoolboxenc.c`](https://github.com/FFmpeg/FFmpeg/blob/master/libavcodec/videotoolboxenc.c)).
+So both configurations advertise what they actually produce:
 
 | Configuration | Settings | Advertised in the layer declaration |
 | --- | --- | --- |
-| `compat` (default) | Constrained Baseline through `kVTCompressionPropertyKey_ProfileLevel`; `RealTime`; no frame reordering; standard rate control (average bitrate plus data rate limits); level chosen to fit the share's viewers | `42e0xx` at the level the encoder was configured for |
-| `low-latency` | `EnableLowLatencyRateControl`; High profile; level chosen by the encoder | the profile and level read from the first SPS the session produces, not the requested ones |
+| `compat` (default) | `kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel`; `RealTime`; no frame reordering; standard rate control (average bitrate plus data rate limits); size and frame rate chosen to fit the share's viewers, which is the only influence on the level | profile and level read from the first SPS the session produces |
+| `low-latency` | `EnableLowLatencyRateControl`; High profile; level chosen by the encoder | profile and level read from the first SPS the session produces |
 
+- **The declaration follows the SPS.** The adapter holds the session's
+  first keyframe until it has read the SPS, sends the layer declaration
+  (A3) with that profile and level, then sends the keyframe. A new session
+  (reconfiguration, size change) repeats this before its first keyframe. The
+  declaration therefore always matches the SPS, and A3's check never
+  rejects a correct encoder's keyframes.
+- **If the produced level does not fit a viewer**, nothing is forced on the
+  wire: that viewer is handled by rule 4 of
+  [Codec negotiation](#codec-negotiation-across-mixed-viewers) (another
+  layer, a codec switch, a lower output, or a refusal). For a lower output
+  the adapter opens a session at a smaller size or frame rate and again
+  declares what its SPS shows.
+- Whether a fixed-level plain Baseline key (`kVTProfileLevel_H264_Baseline_3_1`
+  and similar) produces an SPS with `constraint_set1_flag`, which would make
+  it Constrained Baseline at a chosen level, is **(to verify; C1)**. If it
+  does, `compat` may use it; the declaration still comes from the SPS.
 - `compat` is used whenever any viewer of the layer accepts only
   Constrained Baseline, and until the first SPS of a `low-latency` session
   shows a profile and level every viewer of the layer accepts.
@@ -1277,7 +1349,9 @@ round of their own, as voice 5c/5d had.
   per-viewer decodable sets with H.264 profiles, levels and limits from
   watch offers; the sharer's encodable list from the publish offer; the
   **layer declaration** (codec, profile and level, resolution, frame rate per
-  layer) and its check against each keyframe's SPS bytes; compatibility by
+  layer), sent or updated by the sharer before the first keyframe it
+  describes and taken from that keyframe's SPS, never from encoder
+  settings, and its check against each keyframe's SPS bytes; compatibility by
   codec, profile, level and limits; `screen.codec {share, codec, limits}` to
   the sharer; slots that start only at a keyframe of a compatible layer; the
   30 s hold before switching back; and `screen.stopped {reason: "codec"}`.
@@ -1306,6 +1380,11 @@ round of their own, as voice 5c/5d had.
     lowered output, or `screen.stopped {reason: "codec"}`, in the order of
     the rule;
   - a keyframe whose SPS contradicts the layer declaration opens no segment;
+  - **an encoder that picks its own level:** a test publisher configured
+    for level 3.1 whose encoder emits level 4.0 (as VideoToolbox's
+    auto-level Constrained Baseline may) declares 4.0 from its SPS; its
+    keyframes are accepted, viewers that allow 4.0 join, and a level-3.1
+    viewer is handled by rule 4, not starved by failed keyframes;
   - both switch paths, with the other viewers' slots kept: a native (str0m)
     publisher switching in place, and a publisher using
     `screen.publish.replace`; after a replace the share id, viewer list and
@@ -1374,17 +1453,29 @@ are.
 - Acceptance:
   - vectors at the shortest and widest KID/CTR encodings, including
     non-canonical inputs and their canonical form;
-  - an H.264 frame whose ciphertext contains every start-code pattern, or
-    ends in a zero byte, round-trips;
+  - slice header prefix vectors: `first_mb_in_slice`, `slice_type` and
+    `pic_parameter_set_id` at small and large values (a PPS id above 0, a
+    2160p `first_mb_in_slice`), with an emulation prevention byte inside
+    the prefix; the clear part ends at the byte holding the PPS id's last
+    bit;
+  - an H.264 frame whose ciphertext contains every start-code pattern
+    round-trips, and the four endings of
+    [§3](#encryption-nal-aware-sframe) (`aa 00`, `aa 00 03`, `00 00`,
+    `00 00 03`) are explicit vectors with distinct escaped forms;
   - escaping is reversible and canonicalization idempotent for random inputs
-    (property tests);
+    (property tests); the unescaper rejects a missing or wrong trailer and
+    every byte pattern the escaper cannot produce;
   - **seal → str0m packetize → in-process `gwar-server` SFU → str0m
     depacketize → open**, for access units with an AUD, with three-byte
     start codes, with trailing zero bytes, with PPS before SPS, and with
     SEI: each opens, and the decoder input equals the sealer's canonical
     bytes. The same inputs sealed without canonicalization fail to open,
     which shows the test exercises the rewrite;
-  - mutation of any canonical clear byte fails authentication.
+  - the same path with real RFC 9605 headers at every KID and CTR width
+    (1 to 8 bytes each, including the `c0 01 00 00 00 00` case of
+    [§3](#encryption-nal-aware-sframe)), on keyframes and delta frames;
+  - mutation of any canonical clear byte, slice header prefix included,
+    fails authentication.
 - Now: yes for VP9/VP8; H.264 with E2.
 
 **B3. Software codecs** (M)
@@ -1617,6 +1708,10 @@ Acceptance for every capture item:
   MediaCodec and MFTs) through the adapter's conversion code; on hardware it
   runs live as part of F5. A viewer offering only Constrained Baseline gets
   a Baseline stream (for Apple, the `compat` configuration).
+- **Declared level equals produced level:** the layer declaration matches
+  the SPS of every keyframe, including a session whose encoder chose a
+  level other than the target (for Apple, a recorded `compat` session where
+  the auto-selected level differs from the one the viewers asked for).
 - **Audio:** with Gwar playing a known voice signal and another app playing a
   different tone, the share contains the tone and **not** the voice signal,
   as measured by F6's harness against its initial threshold (F8 confirms or
@@ -1667,8 +1762,12 @@ before a native Linux UI exists.
 - Acceptance: the shared vectors pass in WebCrypto; an encrypted native H.264
   share plays in Chromium and WebKit; **seal → packetize → SFU → depacketize
   → open** with a native (str0m) sealer and Chromium and WebKit openers, for
-  access units with an AUD and with three-byte start codes, opens every
-  frame; any other rewrite a browser receiver makes to the clear bytes is
+  access units with an AUD and with three-byte start codes, and with real
+  RFC 9605 headers at every KID and CTR width (1 to 8 bytes each), opens
+  every frame, with no keyframe request or dropped packet from the
+  browser's depacketizer or SPS/PPS tracker (checked in `getStats`:
+  `pliCount` and `framesDropped` stay at the unencrypted baseline); any
+  other rewrite a browser receiver makes to the clear bytes is
   recorded here and added to the canonical form or the publisher contract;
   worker cost per 2160p keyframe measured.
 - Now: with B2.
@@ -1999,7 +2098,7 @@ The details are in the linked sections.
 | 1 | macOS: no Screen Recording prompt with `SCContentSharingPicker` in a signed build; re-confirmation cadence without the picker | [macOS](#macos) | C1, F5 |
 | 2 | macOS: can a picker-chosen filter also exclude Gwar's windows? | [macOS](#macos) | C1 |
 | 3 | macOS: does `excludesCurrentProcessAudio` cover WKWebView's helper processes? | [macOS](#macos) | C2 |
-| 4 | Apple: does low-latency rate control emit Constrained High or plain High? | [Hardware encoders](#hardware-encoders-per-platform) | C1 |
+| 4 | Apple: does low-latency rate control emit Constrained High or plain High? Does a fixed-level Baseline key give Constrained Baseline? Which level does auto-level pick per size and frame rate? | [Hardware encoders](#hardware-encoders-per-platform) | C1 |
 | 5 | Apple decoders: VP9 hardware decode per OS version | [Decoding](#decoding) | D1 |
 | 6 | Windows: `graphicsCaptureWithoutBorder` in an unpackaged app; exclusive-fullscreen games | [Windows](#windows) | C3, F5 |
 | 7 | Windows: process loopback before build 20348; WebView2 inside the excluded tree | [Windows](#windows) | C4 |
