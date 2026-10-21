@@ -669,7 +669,9 @@ impl Sfu {
             Owner::Watch(id) => {
                 let Some(session) = self.watchers.values().find(|w| w.id == id).map(|w| w.session) else { return };
                 let w = self.watchers.get_mut(&session).expect("found above");
-                if !w.rtc.accepts(&input) {
+                // A watch transport only sends media. str0m would set up a stream for RTP the
+                // viewer sends anyway (by MID and RID), so none gets in: STUN, DTLS and RTCP do.
+                if is_rtp(&datagram.contents) || !w.rtc.accepts(&input) {
                     return;
                 }
                 // Revoked slots are wiped before a NACK can reach their RTX caches.
@@ -1236,6 +1238,12 @@ fn watcher(
     Ok((watcher, answer.to_sdp_string()))
 }
 
+/// RTP rather than RTCP, STUN or DTLS (RFC 7983, RFC 5761: an RTCP packet type, 192–223,
+/// fills the byte after the version).
+fn is_rtp(datagram: &[u8]) -> bool {
+    datagram.len() >= 12 && datagram[0] >> 6 == 2 && !(192..=223).contains(&datagram[1])
+}
+
 /// The local ICE username fragment a STUN binding request is for (its `USERNAME` is
 /// `ours:theirs`). STUN is routed by this, never by address: str0m's `Rtc::accepts` takes
 /// anything from a transport's nominated address before it looks at credentials, so an
@@ -1309,10 +1317,6 @@ mod tests {
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
-    }
-
-    fn is_rtp(datagram: &[u8]) -> bool {
-        datagram.len() >= 12 && datagram[0] >> 6 == 2 && !(192..=223).contains(&(datagram[1] & 0x7f))
     }
 
     /// A watch transport built as the screen task builds one, connected in memory to a viewer's
@@ -1504,6 +1508,19 @@ mod tests {
     fn a_revoked_slot_answers_no_nack() {
         assert!(after_revocation(false) > 0, "the cache would answer it");
         assert_eq!(after_revocation(true), 0, "nothing after the grant ended");
+    }
+
+    #[test]
+    fn watch_transports_take_no_rtp() {
+        let packet = |first: u8, second: u8| [&[first, second][..], &[0; 14]].concat();
+        assert!(is_rtp(&packet(0x80, 96)), "RTP");
+        assert!(is_rtp(&packet(0x90, 0x80 | 100)), "RTP with an extension and the marker");
+        for rtcp in [200, 201, 205, 206] {
+            assert!(!is_rtp(&packet(0x81, rtcp)), "RTCP {rtcp}");
+        }
+        assert!(!is_rtp(&packet(0x00, 0x01)), "STUN");
+        assert!(!is_rtp(&packet(22, 0xfe)), "DTLS");
+        assert!(!is_rtp(&[0x80, 96, 0, 1]), "too short");
     }
 
     #[test]

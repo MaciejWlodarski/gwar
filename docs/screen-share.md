@@ -385,7 +385,9 @@ Each session has at most two screen transports besides its voice transport
   `SCREEN_SLOTS = 4` `recvonly` video m-lines, nothing to send. Any other offer
   (another count, a slot that may send, audio, a data channel) is refused
   before negotiation, and one that would leave a stream to receive on is
-  refused after it (the SSRCs a viewer lists are its RTCP senders): media into
+  refused after it (the SSRCs a viewer lists are its RTCP senders). Later, the
+  screen task drops any RTP a viewer sends before str0m sees it (str0m would
+  set up a stream for it by MID and RID); STUN, DTLS and RTCP pass. Media into
   a watch transport would bypass the publisher's admission and meter. Phase 2
   widens each slot with an audio m-line
   ([Shared audio](#shared-audio-phase-2)). This mirrors the eight voice
