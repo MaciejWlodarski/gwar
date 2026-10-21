@@ -494,8 +494,8 @@ therefore have different TS suffixes while retaining the same Gwar nickname.
   - TeamSpeak edits and moves a channel with separate commands, so
     `channel.update` runs the edit, then the move; a move refused after the
     edit went through is `partial`, and its message says which part was done.
-    A ban by identity alone is TeamSpeak's `banadd`, followed by a kick for
-    someone online; with the address it is `banclient`, which does both.
+    A ban by identity alone is TeamSpeak's `banadd`; with the address it is
+    `banclient`. Either way TeamSpeak drops whoever the ban matches.
   - Ids for TeamSpeak messages come from one counter per process, so rows kept
     across a reconnect never share an id with new ones.
   - The Welcome offers every permission and the UI keeps that list (there are

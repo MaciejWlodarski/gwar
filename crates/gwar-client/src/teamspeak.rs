@@ -637,8 +637,6 @@ enum Part {
     Whole,
     Edit,
     Move,
-    Ban,
-    Kick,
 }
 
 impl Part {
@@ -647,8 +645,6 @@ impl Part {
             Part::Whole => "the request",
             Part::Edit => "the edit",
             Part::Move => "the move",
-            Part::Ban => "the ban",
-            Part::Kick => "the kick",
         }
     }
 }
@@ -719,8 +715,8 @@ fn channel_update(u: &gwar_proto::ChannelUpdate, view: &View) -> Vec<(Part, OutC
     commands
 }
 
-/// `ban.create`: TeamSpeak's `banclient` bans the address and the identity and kicks; a ban by
-/// identity alone is a `banadd`, followed by a kick for someone online.
+/// `ban.create`: TeamSpeak's `banclient` bans the address and the identity; a ban by identity
+/// alone is a `banadd`. Either way the TeamSpeak server drops whoever the ban matches.
 fn ban(b: &gwar_proto::BanCreate, view: &View) -> Result<Vec<(Part, OutCommand)>, ErrorBody> {
     let mut args = Vec::new();
     if let Some(duration) = b.duration {
@@ -731,7 +727,7 @@ fn ban(b: &gwar_proto::BanCreate, view: &View) -> Result<Vec<(Part, OutCommand)>
     }
     if let (Some(client), true) = (b.client, b.ip) {
         args.insert(0, ("clid", client.to_string()));
-        return Ok(vec![(Part::Ban, command("banclient", &args))]);
+        return Ok(vec![(Part::Whole, command("banclient", &args))]);
     }
     let uid = match b.client {
         Some(client) => view
@@ -744,16 +740,7 @@ fn ban(b: &gwar_proto::BanCreate, view: &View) -> Result<Vec<(Part, OutCommand)>
     let identity = uid.strip_prefix("ts:").filter(|u| !u.is_empty() && *u != "unknown");
     let identity = identity.ok_or_else(|| refused("TeamSpeak servers ban TeamSpeak identities only"))?;
     args.insert(0, ("uid", identity.to_owned()));
-    let mut commands = vec![(Part::Ban, command("banadd", &args))];
-    if let Some(client) = b.client {
-        let kick = [
-            ("clid", client.to_string()),
-            ("reasonid", "5".into()),
-            ("reasonmsg", b.reason.clone().unwrap_or_default()),
-        ];
-        commands.push((Part::Kick, command("clientkick", &kick)));
-    }
-    Ok(commands)
+    Ok(vec![(Part::Whole, command("banadd", &args))])
 }
 
 /// Translates a `gwar/1` request into the TS commands that carry it out, in order; none
@@ -1474,19 +1461,13 @@ mod tests {
         // With the address: TeamSpeak's own ban, which also kicks.
         let with_ip =
             ban(gwar_proto::BanCreate { client: Some(4), ip: true, duration: Some(60), ..Default::default() });
-        assert_eq!(with_ip.unwrap(), vec![(Part::Ban, "banclient clid=4 time=60".into())]);
-        // By identity only: a ban, then a kick for someone online.
+        assert_eq!(with_ip.unwrap(), vec![(Part::Whole, "banclient clid=4 time=60".into())]);
+        // By identity only, online or not: TeamSpeak drops someone online itself.
         let online =
             ban(gwar_proto::BanCreate { client: Some(4), reason: Some("spam".into()), ..Default::default() }).unwrap();
-        assert_eq!(
-            online,
-            vec![
-                (Part::Ban, "banadd uid=Ym9i banreason=spam".into()),
-                (Part::Kick, "clientkick clid=4 reasonid=5 reasonmsg=spam".into()),
-            ]
-        );
+        assert_eq!(online, vec![(Part::Whole, "banadd uid=Ym9i banreason=spam".into())]);
         let offline = ban(gwar_proto::BanCreate { uid: Some("ts:Ym9i".into()), ..Default::default() }).unwrap();
-        assert_eq!(offline, vec![(Part::Ban, "banadd uid=Ym9i".into())]);
+        assert_eq!(offline, vec![(Part::Whole, "banadd uid=Ym9i".into())]);
         let gwar_uid = ban(gwar_proto::BanCreate { uid: Some("AAAA".into()), ..Default::default() });
         assert!(matches!(gwar_uid, Err(e) if e.code == ErrorCode::BadRequest));
         let left = ban(gwar_proto::BanCreate { client: Some(40), ..Default::default() });
