@@ -504,7 +504,8 @@ Stepped runs fell from 16 to 3 of 48. Concealments rose by 2 with
 fell elsewhere, and late drops and underruns did not rise; with six pairs per
 profile on a shared host, differences of a few concealments are within run-to-run
 noise, so these runs neither show nor rule out a small concealment cost. This
-series measured the first version, without the reserve on every stream. `reorder` and `mixed` do not change: their steps are
+series measured the first version, without the reserve on any stream.
+`reorder` and `mixed` do not change: their steps are
 the late-packet stretches above, and `mixed` already runs at its window minimum.
 The stall pair that stepped in both builds had a 30–40 ms host episode in the
 baseline run before the stall. These are single-host, shared-machine runs, six
@@ -513,6 +514,29 @@ been re-run. The runs invoked the example directly from a local ABBA loop (not
 committed) with each profile's `LATENCY_NET` and the settings above;
 `run_local.py` with per-variant `LATENCY_*` wrappers (see "Compare builds")
 reproduces them.
+
+A three-way series on 2026-10-21 (06:35–07:30 CET; same settings, six rounds per
+profile, order alternating forward and reversed) compared `main` (reserve always),
+the regular-refill rule (new) and the first version (reserve never). The host was
+heavily loaded by other builds (1-minute load 4–62 at run starts, 27–52 during
+`loss`), so absolute levels sit about 10 ms above the earlier series and single
+runs are noisy. Values are main / new / first version:
+
+| Profile | Median ms | p95 ms | Stepped runs | PLC | Late drops | Underruns |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Idle | 48.41 / 48.35 / 48.54 | 51.36 / 50.33 / 51.65 | 0 / 0 / 0 | 3 / 0 / 1 | 0 / 0 / 0 | 0 / 0 / 0 |
+| `down:jitter=10ms` | 65.42 / 57.36 / 58.11 | 75.28 / 69.48 / 68.95 | 4 / 2 / 2 | 15 / 14 / 19 | 1 / 1 / 8 | 1 / 0 / 2 |
+| `down:loss=2%` | 64.58 / 60.59 / 59.30 | 77.68 / 84.75 / 69.85 | 5 / 2 / 3 | 544 / 545 / 545 | 0 / 0 / 0 | 0 / 1 / 0 |
+| `down:burst=3@0.5%` | 56.41 / 54.38 / 51.30 | 68.56 / 71.42 / 62.50 | 6 / 5 / 4 | 415 / 410 / 405 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+Stepped runs: 15 / 9 / 9 of 24. The harness's native stream (10 ms packets, fixed
+10 ms callbacks) keeps regular refills most of the time, so the new rule keeps about
+as much of the step fix as the first version here. With `loss` it concealed once more
+than `main`, had one underrun and a higher pooled p95, under the heaviest load of the
+series; these runs cannot separate that from load. The callback-jitter profile varies
+its callbacks and so keeps the reserve, as `main` does. `stall27`, `callbacks`,
+`reorder` and `mixed` were not re-run, and a series on a quiet host is still
+pending, for example the gate's ten guarded pairs per profile.
 
 Receiver recovery follow-up (2026-10-16; measurement pending). Low-water
 observations now survive isolated PLC and are debited after each cut, retaining
