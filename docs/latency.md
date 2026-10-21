@@ -895,9 +895,12 @@ its sinks (a `MediaStreamTrackProcessor`), before the app's WebAudio graph. Chro
 stamps each delivered `AudioData` with its delivery time, in microseconds since the
 page's time origin; the page reads it later on its main thread. Frames are timed from
 their stamps placed directly on the measurement clock (`performance.timeOrigin` +
-stamp), once each run checks the mapping: no frame read before its stamp, median read
-lag under 20 ms; otherwise the run falls back to read times and says so (`timing`).
-The run keeps the absolute read lags and the read-timed result beside it.
+stamp), when each run passes a plausibility check (no frame read before its stamp,
+median read lag under 20 ms); otherwise it falls back to read times and says so
+(`timing`). The check cannot tell a stamp epoch offset from read delay, so the segment
+is reported `calibrated: false` either way: the epoch is Chromium's documented
+behaviour, not independently verified. The run keeps the absolute read lags and the
+read-timed result beside it.
 `mic=track` (Chromium) replaces the worklet microphone with a
 `MediaStreamTrackGenerator` fed 10 ms `AudioData` from the page, each frame timed
 from its write: no WebAudio on the sending side.
@@ -962,11 +965,12 @@ The harness gained its segment taps during the session (`sentSegment` from set E
 `decodedSegment` in set I); clocks, detection and matching were the same in every
 set. A later single native→browser check (20 markers, 3 s warmup) measured 35.8 ms
 with NetEq buffering 13.5 ms: NetEq's buffering, not a fixed cost, separates such
-runs. Set I's segment was timed from frame reads, before the stamps were used. Two
-later runs with the stamps mapped directly (load 10) passed the check: absolute read
-lag minimum 0 ms, median 0.0 ms, p95 0.1 ms, single frames up to 21 ms, and stamp- and
-read-timed medians within 0.001 ms. Main-thread delay therefore does not bias set I's
-read-timed hop; four runs at load 12–24, timed both ways, put the hop at 13.4–14.5 ms.
+runs. Set I's segment was timed from frame reads, before the stamps were used, so its
+main-thread delay is unknown: its hop is an estimate that can only be too small. Two
+later runs with the stamps mapped directly (load 10) passed the check, with absolute read
+lag minimum 0 ms, median 0.0 ms, p95 0.1 ms and single frames up to 21 ms; that bounds
+those two runs only, and only if the stamp epoch is right. Four runs at load 12–24, timed
+both ways, put the hop at 13.4–14.5 ms.
 Set F/G ran `target/release/examples/latency` directly with
 `LATENCY_WAIT_CONNECTED=1` and `LATENCY_WARMUP_MS` 5000/15000, after the browser
 sets. No run had an output underrun (Chromium `playbackStats`) or a native
@@ -995,7 +999,7 @@ one (F against G).
 | Opus packetization | ~10–14 | estimate: 20 ms frames (50 packets/s); `ptime=10` gives 10 ms frames and lowers the non-NetEq part 40.4 → 26.8 ms (set H) |
 | Network, SFU, decoding | a few | loopback; the remainder |
 | NetEq | 20–44 | stats: actual mean buffering per run (its target 20–40 ms, often lower than the actual); 44 under 10 ms jitter |
-| Decoded track → app output (WebAudio) | ~12 | measured: `decodedSegment` (set I) 45.1–63.5 ms, 11.5–13.2 ms before the output in each of 12 runs (13.4–14.5 ms in four later, busier runs) |
+| Decoded track → app output (WebAudio) | ~12 | estimate, uncalibrated: `decodedSegment` (set I, read-timed) 45.1–63.5 ms, 11.5–13.2 ms before the output in each of 12 runs; read times include main-thread delay of unknown size, which would make the true hop larger (13.4–14.5 ms in four later, busier runs) |
 | Output device buffer | 24 (Chromium), 12.8 (WebKit) | stats only: `outputLatency`; Chromium `playbackStats.averageLatency` 24.4 ms; `baseLatency` 5.3 / 2.7 ms |
 
 "Non-NetEq part" is a run's median minus its NetEq actual mean buffering; it removes
@@ -1017,8 +1021,8 @@ Against native: native→native measured 46.9 ms here with the gate's 15 s warmu
 (41.8 ms in the quieter paired gate above), browser→browser in Chromium 61–76 ms
 (pooled medians of sets A–C, E, H, I) and in WebKit ~104 ms. Mixed paths fall between, at 65–67 ms. The browser pays for
 20 ms packets (the native sender uses 10 ms), NetEq's 20–40 ms (the native
-receiver's target starts at one 10 ms packet), and the ~12 ms WebAudio receive
-hop; it also has an output device buffer the native virtual device does not (a
+receiver's target starts at one 10 ms packet), and the WebAudio receive
+hop (estimated at ~12 ms or more); it also has an output device buffer the native virtual device does not (a
 physical device adds its own natively). Downlink jitter of 10 ms cost the browser
 +18 ms median and a 104 ms p95 (NetEq 44 ms) in set B; in set F the native client's
 median did not rise (p95 77 ms).

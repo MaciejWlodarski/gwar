@@ -516,8 +516,10 @@ function segment(captures, samples, rate, timeOf) {
  * delivery time, in microseconds since the page's time origin; the page reads it later, on its
  * main thread. Frames are timed from their stamps placed directly on the measurement clock
  * (`performance.timeOrigin` + stamp), so main-thread delay does not enter. The mapping is only
- * used once it checks out: no frame may be read before its stamp, and the median read lag must
- * stay under `STAMP_LAG_MS`. Otherwise frames are timed from their reads and `timing` says so.
+ * used once it passes a plausibility check: no frame may be read before its stamp, and the
+ * median read lag must stay under `STAMP_LAG_MS`. Otherwise frames are timed from their reads and
+ * `timing` says so. The check cannot separate an epoch offset from read delay, so the segment is
+ * always `calibrated: false`.
  * Absolute read lags and the read-timed result are kept for comparison. Samples follow their
  * frame's time, like a capture callback's.
  */
@@ -545,7 +547,8 @@ function decodedSegment(captures, decoded) {
   const steps = new Map();
   chunks.slice(1).forEach(([, , ts], i) => { const step = Math.round((ts - chunks[i][2]) / 1000); steps.set(step, (steps.get(step) ?? 0) + 1); });
   return {
-    ...result, timing: stamped ? "timestamp" : "read", frameSamples: chunks[0][1],
+    // The stamp epoch is assumed, not measured: a constant offset would pass the check.
+    ...result, timing: stamped ? "timestamp" : "read", calibrated: false, frameSamples: chunks[0][1],
     readTimedMedianMs: read.median_ms,
     // Read time minus stamp time, per frame, on the measurement clock.
     readLagMs: lag,
