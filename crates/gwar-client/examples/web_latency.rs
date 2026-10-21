@@ -260,8 +260,10 @@ async fn main() -> anyhow::Result<()> {
         "loopback origin required"
     );
     let net = std::env::var("LATENCY_NET").ok().map(|source| netem::Spec::parse(&source)).transpose()?;
-    let data = DataDir(out.join("server-data"));
-    std::fs::create_dir(&data.0).context("create the server data directory")?;
+    // The guard removes only a directory this run created.
+    let data_path = out.join("server-data");
+    std::fs::create_dir(&data_path).context("create the server data directory")?;
+    let data = DataDir(data_path);
     let mut relay = if net.is_some() { Some(netem::Relay::bind_for_browsers().await?) } else { None };
     let any = "127.0.0.1:0".parse()?;
     let advertise = relay.as_ref().map(|relay| relay.address()).transpose()?.unwrap_or(any);

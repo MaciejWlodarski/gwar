@@ -891,7 +891,11 @@ mutes it); browsers report it, as stats, below.
 Two further points are timed in Chromium on the same captures, as segments, not
 gates: `sentSegment`, what the sending app's noise suppression sends (a tap on its
 worklet), and `decodedSegment`, decoded audio as the remote track delivers it to
-its sinks (a `MediaStreamTrackProcessor`), before the app's WebAudio graph.
+its sinks (a `MediaStreamTrackProcessor`), before the app's WebAudio graph. Chromium
+stamps each delivered `AudioData` with its delivery time; the page reads it later on
+its main thread, so frames are timed from their stamps, placed on the measurement
+clock by the frame read soonest after its stamp. The run keeps the read lags and the
+read-timed result beside it.
 `mic=track` (Chromium) replaces the worklet microphone with a
 `MediaStreamTrackGenerator` fed 10 ms `AudioData` from the page, each frame timed
 from its write: no WebAudio on the sending side.
@@ -902,8 +906,10 @@ into the same frame before synthesis, so the delay is the same at every strength
 the model runs in full either way.
 
 `getStats()` and the audio contexts are recorded as stats, never as latency: NetEq's
-`jitterBufferDelay / jitterBufferEmittedCount` (its mean buffering over the marker
-window) and target, concealment, packets lost and the sender's packet rate;
+`jitterBufferDelay / jitterBufferEmittedCount` (its actual mean buffering over the
+marker window) and `jitterBufferTargetDelay` (its target, which the actual delay
+can exceed: NetEq accelerates only beyond 20 ms plus arrival variation above it, see
+"Native 10 ms packets in Chromium"), concealment, packets lost and the sender's packet rate;
 `baseLatency`, `outputLatency` and, in Chromium, `playbackStats` (output
 underruns). `LATENCY_NET` uses latency.rs's relay with `Relay::bind_for_browsers`:
 every local ICE candidate is a flow (up to 32), a host-interface candidate reaches
@@ -917,7 +923,7 @@ Apple M5, macOS 27.0, Playwright's Chromium 153.0.8010.12 and WebKit 26.6,
 release fixture at `e0d535d` plus this harness. The host was shared with other
 agents' builds; the 1-minute load during runs is given. 60 markers per run, 5 s
 warmup unless noted; quantiles pool all matched markers of a variant; the NetEq
-column is the median of runs' mean buffering (stats). Every row is one interleaved
+column is the median of runs' actual mean buffering (stats, not the target). Every row is one interleaved
 set; rows of one set compare directly.
 
 | Set | Path, engine | Condition | Runs passed | Matched | Median ms | p95 ms | p99 ms | NetEq ms | Load |
@@ -953,7 +959,10 @@ set; rows of one set compare directly.
 The harness gained its segment taps during the session (`sentSegment` from set E,
 `decodedSegment` in set I); clocks, detection and matching were the same in every
 set. A later single native→browser check (20 markers, 3 s warmup) measured 35.8 ms
-with NetEq at 13.5 ms: NetEq's target, not a fixed cost, separates such runs.
+with NetEq buffering 13.5 ms: NetEq's buffering, not a fixed cost, separates such
+runs. Set I's segment was timed from frame reads, before the stamps were used; four
+later runs (load 12–24) timed both ways differed by at most 0.11 ms (read lag median
+0.1 ms, p95 0.2 ms, single frames up to 37 ms), the hop then measuring 13.4–14.5 ms.
 Set F/G ran `target/release/examples/latency` directly with
 `LATENCY_WAIT_CONNECTED=1` and `LATENCY_WARMUP_MS` 5000/15000, after the browser
 sets. No run had an output underrun (Chromium `playbackStats`) or a native
@@ -962,26 +971,32 @@ concealed 1.7% of samples and lost 1–4 markers a run (93 packets lost over six
 runs; one run failed the gate with 56/60): a lost 20 ms packet carries a whole
 marker, while the native sender's 10 ms packets lose none of F's 240.
 
-Within a run latency is nearly constant (p95 often within 1 ms of the median):
-the 250 ms marker period is a whole number of 20 ms frames, so every marker meets
-the encoder at the same phase. Runs differ by up to a frame for that reason, and
-by NetEq's target, which settles at 20, 30 or 40 ms per run on this host. A
-longer warmup does not lower it (set E); the native receiver's startup trimming
-does need one (F against G).
+Within a run latency is nearly constant (p95 often within 1 ms of the median).
+The 250 ms marker period is 12.5 browser frames, so markers alternate between two
+encoder phases 10 ms apart, yet the mean latencies of even and odd markers differ by
+−0.15 to +0.05 ms (median per set) and at most 1.1 ms in any run of sets A, C, H
+and I: once playout runs continuously,
+every sample of the stream waits the same total time, whatever its place in a
+packet. Runs differ instead by the delay at which each settles, chiefly NetEq's
+buffering: its actual mean landed near 20, 30 or 40 ms per run, at or above its
+target (often 30 ms actual against a 20 ms target, as in set I's run 6). A longer
+warmup does not lower it (set E); the native receiver's startup trimming does need
+one (F against G).
 
 ### Where the time goes (Chromium, browser→browser, idle)
 
 | Segment | ms | How it is known |
 | --- | ---: | --- |
-| Synthetic microphone → its track | ~9–12 | measured: `mic=track` lowers the non-NetEq part 40.4 → 28.4 ms (set H) and 41.8 → 33.2 ms (set I); a real microphone has its own capture buffering instead, not measured |
-| Opus packetization | ~10–14 | measured: 20 ms frames (50 packets/s); `ptime=10` gives 10 ms frames and lowers the non-NetEq part 40.4 → 26.8 ms (set H) |
+| Synthetic microphone → its track | ~9–12 | estimate: `mic=track` lowers the non-NetEq part 40.4 → 28.4 ms (set H) and 41.8 → 33.2 ms (set I); a real microphone has its own capture buffering instead, not measured |
+| Opus packetization | ~10–14 | estimate: 20 ms frames (50 packets/s); `ptime=10` gives 10 ms frames and lowers the non-NetEq part 40.4 → 26.8 ms (set H) |
 | Network, SFU, decoding | a few | loopback; the remainder |
-| NetEq | 20–44 | stats: mean buffering per run, equal to its target; 44 under 10 ms jitter |
-| Decoded track → app output (WebAudio) | ~12 | measured: `decodedSegment` (set I) 45.1–63.5 ms, 11.5–13.2 ms before the output in each of 12 runs |
+| NetEq | 20–44 | stats: actual mean buffering per run (its target 20–40 ms, often lower than the actual); 44 under 10 ms jitter |
+| Decoded track → app output (WebAudio) | ~12 | measured: `decodedSegment` (set I) 45.1–63.5 ms, 11.5–13.2 ms before the output in each of 12 runs (13.4–14.5 ms in four later, busier runs) |
 | Output device buffer | 24 (Chromium), 12.8 (WebKit) | stats only: `outputLatency`; Chromium `playbackStats.averageLatency` 24.4 ms; `baseLatency` 5.3 / 2.7 ms |
 
-"Non-NetEq part" is a run's median minus its NetEq mean, which removes the target's
-run-to-run steps. A MediaStream hop between WebAudio contexts (a MediaStream
+"Non-NetEq part" is a run's median minus its NetEq actual mean buffering; it removes
+most of the run-to-run steps, but NetEq's mean is a stat over all samples and not a
+measured segment of the markers' path, so the rows built on it are estimates. A MediaStream hop between WebAudio contexts (a MediaStream
 destination feeding a `MediaStreamAudioSourceNode`, markers timed by the same
 render clocks, 40 markers, local check) took 21.2 ms in Chromium and 48–51 ms in
 WebKit, in one context or two. That hop is what makes the web app's noise
@@ -1011,8 +1026,8 @@ median did not rise (p95 77 ms).
   non-NetEq 43.5 against 40.4 ms: no gain. `playoutDelayHint`, Chromium's older
   form, was not measured separately.
 - 10 ms browser packets (`a=ptime:10` in the server's answer) cut ~13 ms of
-  packetization in set H, but the pooled median moved only −3.8 ms
-  because NetEq's target varied, and it costs ~29 kbps a stream
+  packetization in set H (an estimate from non-NetEq parts), but the pooled median
+  moved only −3.8 ms because NetEq's buffering varied, and it costs ~29 kbps a stream
   ([opus-10ms.md](opus-10ms.md)) and puts browser 10 ms packets through the
   TeamSpeak bridge, which no test covers yet. It is left for a decision.
 - Noise suppression without the two MediaStream hops (the model in a worker on

@@ -165,7 +165,7 @@ function pagePatch({ role, ptime, mic, scheme }) {
         const samples = new Float32Array(frame.numberOfFrames);
         frame.copyTo(samples, { planeIndex: 0, format: "f32-planar" });
         slot.audible ||= samples.some(x => Math.abs(x) > 1e-3);
-        if (slot.audible) slot.chunks.push({ ms, rate: frame.sampleRate, samples });
+        if (slot.audible) slot.chunks.push({ ms, timestamp: frame.timestamp, rate: frame.sampleRate, samples });
       }
       frame.close();
     }
@@ -379,7 +379,15 @@ async function collectTap(page, name) {
 }
 const collectGenerator = page => page.evaluate(() => window.__latency.generator.collect());
 
-async function measure({ config, web, binary, dir, markers, warmupMs, record }) {
+/**
+ * One run. `owned` lets the caller's timeout close the browser and cut the run's waits short,
+ * so a timed-out run cannot overlap the next.
+ */
+async function measure({ config, web, binary, dir, markers, warmupMs, record, owned }) {
+  const pause = ms => new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    owned.abort.signal.addEventListener("abort", () => { clearTimeout(timer); reject(new Error("run cancelled")); }, { once: true });
+  });
   const fixture = await fixtureProcess(binary, web, dir, config.netSpec);
   const ready = await fixture.response("ready");
   record.fixture = { url: ready.url, media: ready.media, mediaBind: ready.mediaBind };
@@ -389,8 +397,10 @@ async function measure({ config, web, binary, dir, markers, warmupMs, record }) 
     args: config.engine === "chromium" ? ["--autoplay-policy=no-user-gesture-required"] : [],
     firefoxUserPrefs: { "media.autoplay.default": 0, "media.autoplay.blocking_policy": 0 },
   });
+  owned.browser = browser;
   record.browserVersion = browser.version();
   try {
+    owned.abort.signal.throwIfAborted();
     const sender = config.path === "native-browser" ? null : await device(browser, web, ready.url, "sender", config);
     const receiver = config.path === "browser-native" ? null : await device(browser, web, ready.url, "receiver", config);
     const pages = [sender, receiver].filter(Boolean);
@@ -450,9 +460,9 @@ async function measure({ config, web, binary, dir, markers, warmupMs, record }) 
     if (sender) await sender.evaluate(arm => window.__latency.generator.arm(arm), { warmup: warmupFrames, count: markers });
     if (config.path !== "browser") record.armMs = (await fixture.command(`arm ${warmupMs} ${markers}`)).atMs;
     record.load.armed = load();
-    await sleep(warmupMs);
+    await pause(warmupMs);
     const before = Object.fromEntries(await Promise.all(pages.map(async page => [page.role, await page.evaluate(pageStats)])));
-    await sleep(markers * PERIOD * 1000 / RATE + MATCH_WINDOW_MS + 500);
+    await pause(markers * PERIOD * 1000 / RATE + MATCH_WINDOW_MS + 500);
     const after = Object.fromEntries(await Promise.all(pages.map(async page => [page.role, await page.evaluate(pageStats)])));
     record.stats = { before, after };
     record.load.end = load();
@@ -469,7 +479,7 @@ async function measure({ config, web, binary, dir, markers, warmupMs, record }) 
       const bytes = new Uint8Array(all.buffer);
       let binary = "";
       for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-      return { rate: slot.chunks[0]?.rate, chunks: slot.chunks.map(c => [c.ms, c.samples.length]), pcm: btoa(binary) };
+      return { rate: slot.chunks[0]?.rate, chunks: slot.chunks.map(c => [c.ms, c.samples.length, c.timestamp]), pcm: btoa(binary) };
     }) : null;
     const finish = await fixture.command("finish", "finish", 60_000);
     record.native = finish.native && { ...finish.native, blocks: undefined };
@@ -503,6 +513,44 @@ function segment(captures, samples, rate, timeOf) {
   return { n: l.length, median_ms: quantile(l, 0.5), p95_ms: quantile(l, 0.95) };
 }
 
+/**
+ * Decoded audio as the remote track delivers it. Chromium stamps each `AudioData` with its
+ * delivery time (microseconds on its monotonic clock); the page reads it later, on its main
+ * thread. Frames are timed from their stamps, placed on the measurement clock by the frame read
+ * soonest after its stamp (the smallest read-minus-stamp), so main-thread delay does not enter.
+ * Read lags and the read-timed result are kept for comparison. Without increasing stamps, frames
+ * are timed from their reads and `timing` says so. Samples follow their frame's time, like a
+ * capture callback's.
+ */
+function decodedSegment(captures, decoded) {
+  const bytes = Buffer.from(decoded.pcm, "base64");
+  const all = new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length));
+  const { chunks, rate } = decoded;
+  const stamped = chunks.every(([, , ts], i) => Number.isFinite(ts) && (i === 0 || ts > chunks[i - 1][2]));
+  const lags = chunks.map(([ms, , ts]) => ms - ts / 1000);
+  const offset = Math.min(...lags);
+  const starts = [];
+  let length = 0;
+  for (const [, n] of chunks) { starts.push(length); length += n; }
+  const timed = times => i => {
+    let low = 0, high = starts.length - 1;
+    while (low < high) { const mid = (low + high + 1) >> 1; if (starts[mid] <= i) low = mid; else high = mid - 1; }
+    return times[low] + (i - starts[low]) * 1000 / rate;
+  };
+  const read = segment(captures, all, rate, timed(chunks.map(([ms]) => ms)));
+  const result = stamped ? segment(captures, all, rate, timed(chunks.map(([, , ts]) => ts / 1000 + offset))) : read;
+  const readLags = lags.map(lag => lag - offset).sort((a, b) => a - b);
+  const steps = new Map();
+  chunks.slice(1).forEach(([, , ts], i) => { const step = Math.round((ts - chunks[i][2]) / 1000); steps.set(step, (steps.get(step) ?? 0) + 1); });
+  return {
+    ...result, timing: stamped ? "timestamp" : "read", frameSamples: chunks[0][1],
+    readTimedMedianMs: read.median_ms,
+    // How much later than the soonest read each frame was read.
+    readLagMs: { median: quantile(readLags, 0.5), p95: quantile(readLags, 0.95), max: readLags.at(-1) },
+    timestampStepsMs: Object.fromEntries([...steps].sort((a, b) => b[1] - a[1]).slice(0, 8)),
+  };
+}
+
 function analyze({ record, generator, tap, sent, decoded, native, dir, markers }) {
   // Captures: the browser generator's frames on its render clock, or the native callback times.
   let captures;
@@ -518,20 +566,7 @@ function analyze({ record, generator, tap, sent, decoded, native, dir, markers }
     const t = tapped(sent);
     record.sentSegment = { ...segment(captures, t.samples, t.rate, t.timeOf), callbacks: t.callbacks };
   }
-  if (decoded?.chunks.length) {
-    // Each frame's samples are timed from its delivery, like a capture callback's.
-    const bytes = Buffer.from(decoded.pcm, "base64");
-    const all = new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length));
-    const starts = [];
-    let length = 0;
-    for (const [, n] of decoded.chunks) { starts.push(length); length += n; }
-    const timeOf = i => {
-      let low = 0, high = starts.length - 1;
-      while (low < high) { const mid = (low + high + 1) >> 1; if (starts[mid] <= i) low = mid; else high = mid - 1; }
-      return decoded.chunks[low][0] + (i - starts[low]) * 1000 / decoded.rate;
-    };
-    record.decodedSegment = { ...segment(captures, all, decoded.rate, timeOf), frameSamples: decoded.chunks[0][1] };
-  }
+  if (decoded?.chunks.length) record.decodedSegment = decodedSegment(captures, decoded);
   if (tap) {
     let callbacks;
     ({ samples, rate, timeOf, callbacks } = tapped(tap));
@@ -658,6 +693,8 @@ async function main() {
   start(process.execPath, [viteCli, "preview", "--outDir", dist, "--host", "127.0.0.1", "--port", new URL(web).port, "--strictPort"], { cwd: webRoot });
   await waitFor(async () => { try { return (await fetch(web)).ok; } catch { return false; } }, "web preview", 30_000);
 
+  // Setup, warmup, markers, drain and collection; setup allows for 60 s waits on the model.
+  const budget = 180_000 + options.warmupMs + options.markers * PERIOD * 1000 / RATE + MATCH_WINDOW_MS;
   const runs = [];
   for (let cycle = 0; cycle < options.runs; cycle++) {
     const order = cycle % 2 === 0 ? options.variants : options.variants.toReversed();
@@ -668,16 +705,22 @@ async function main() {
       const record = { variant: variant.name, cycle, config: variant.config, started: new Date().toISOString(), load: { start: load() } };
       manifest.order.push(path.basename(dir));
       const childCount = children.length;
+      const owned = { browser: null, abort: new AbortController() };
+      const work = measure({ config: variant.config, web, binary, dir, markers: options.markers, warmupMs: options.warmupMs, record, owned });
       try {
-        const data = await deadline(measure({ config: variant.config, web, binary, dir, markers: options.markers, warmupMs: options.warmupMs, record }), 180_000, "run");
-        analyze({ ...data, record, dir, markers: options.markers });
+        analyze({ ...(await deadline(work, budget, "run")), record, dir, markers: options.markers });
         record.passed = true;
       } catch (error) {
         record.passed = false;
         record.error = String(error.stack ?? error);
       }
+      // After a timeout the run is still going: cancel its waits, close its browser and
+      // processes, and let it end before the next run starts.
+      owned.abort.abort();
+      await owned.browser?.close().catch(() => {});
       const runChildren = children.splice(childCount);
       await stopProcesses(runChildren).catch(error => { record.cleanupError = String(error); });
+      await work.catch(() => {});
       writeFileSync(path.join(dir, "fixture.log"), runChildren.map(child => child.log).join("\n"));
       rmSync(path.join(dir, "native-playout.f32"), { force: true });
       writeFileSync(path.join(dir, "run.json"), JSON.stringify(record, null, 1));
