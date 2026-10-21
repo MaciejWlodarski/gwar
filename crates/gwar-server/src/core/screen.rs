@@ -297,7 +297,8 @@ impl Core {
     }
 
     /// `session` can no longer see `channel`: its shares are gone for it, watched or not. Runs
-    /// before the session is taken out of the channel, so it hears of each share once.
+    /// for every session that lost it before any of them is taken out of it, so each hears of
+    /// each share once.
     pub(super) fn screen_hidden(&mut self, session: SessionId, channel: ChannelId) {
         let ids: Vec<String> =
             self.shares.iter().filter(|(_, s)| s.channel == channel).map(|(id, _)| id.clone()).collect();

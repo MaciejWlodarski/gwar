@@ -1215,6 +1215,37 @@ async fn being_admitted_or_shut_out_of_a_private_channel_shows_or_ends_its_share
 }
 
 #[tokio::test]
+async fn sharers_shut_out_together_each_hear_of_every_share_once() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let mut bob = Client::connect(&server, "bob").await;
+    let carol = Client::connect(&server, "carol").await;
+    let both = json!({"roles": [], "users": [alice.welcome.uid, bob.welcome.uid]});
+    let secret = channel_id(&root.create_channel(json!({"name": "secret", "private": true, "access": both})).await);
+    let a = alice.share_in(secret).await;
+    let b = bob.share_in(secret).await;
+    alice.ok("screen.watch", json!({"share": b})).await;
+    bob.ok("screen.watch", json!({"share": a})).await;
+
+    // One update shuts both out: each leaves, which ends its share for those who still see it.
+    let neither = json!({"roles": [], "users": [carol.welcome.uid]});
+    root.ok("channel.update", json!({"channel": secret, "access": neither})).await;
+    for client in [&mut alice, &mut bob] {
+        let mut stopped = client.drain_events("screen.stopped").await;
+        stopped.sort_by_key(|e| e["share"].as_str().unwrap().to_owned());
+        let mut expected = [a.clone(), b.clone()];
+        expected.sort();
+        let expected: Vec<_> = expected.iter().map(|s| json!({"share": s, "reason": "access"})).collect();
+        assert_eq!(stopped, expected);
+    }
+    // Those who still see the channel hear the shares end as usual.
+    let ended = root.drain_events("screen.stopped").await;
+    assert_eq!(ended.len(), 2);
+    assert!(ended.iter().all(|e| e["reason"] == "left"));
+}
+
+#[tokio::test]
 async fn a_password_channels_share_is_watched_from_inside_or_with_bypass_password() {
     let server = TestServer::start().await;
     let mut root = admin(&server, "root").await;

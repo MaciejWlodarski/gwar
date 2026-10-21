@@ -888,8 +888,12 @@ impl Core {
         let after = self.admissions();
         let lost: Vec<_> = before.difference(&after).copied().filter(|(s, _)| self.sessions.contains_key(s)).collect();
         let gained: Vec<_> = after.difference(&before).copied().collect();
-        for (session, channel) in lost {
+        // Every session that lost a channel hears of its shares before anyone leaves it: a leave
+        // ends the leaver's share, and the others no longer see that end announced.
+        for &(session, channel) in &lost {
             self.screen_hidden(session, channel);
+        }
+        for (session, channel) in lost {
             if self.sessions[&session].channel == Some(channel) {
                 let _ = self.channel_leave(session);
             }
