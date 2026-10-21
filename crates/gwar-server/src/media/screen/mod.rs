@@ -17,6 +17,7 @@ mod segment;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::SocketAddr,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -33,7 +34,7 @@ use str0m::{
     Candidate, Event as RtcEvent, IceConnectionState, Input, Output, Rtc,
     change::SdpOffer,
     format::Codec,
-    media::{KeyframeRequestKind, MediaKind, Mid, Pt},
+    media::{Direction, KeyframeRequestKind, MediaKind, Mid, Pt},
     net::{Protocol, Receive},
     rtp::{ExtensionValues, RtpWrite, Ssrc},
 };
@@ -44,7 +45,7 @@ use ingress::{Bucket, Ingress, Verdict};
 pub use ingress::{IngressCounters, VideoCodec, describe};
 use segment::Segment;
 
-use crate::core::CoreHandle;
+use crate::core::{CoreHandle, ScreenSlot};
 
 /// Datagrams waiting for the screen task; more are dropped (`dispatch_dropped`).
 pub const DISPATCH_CAPACITY: usize = 2048;
@@ -328,6 +329,8 @@ struct Publisher {
     id: u64,
     origin: Arc<ScreenOrigin>,
     rtc: Rtc,
+    /// Local ICE username fragment, which routes its STUN.
+    ufrag: String,
     ssrc: Ssrc,
     codecs: HashMap<Pt, VideoCodec>,
     meter: Meter,
@@ -358,6 +361,8 @@ struct Watcher {
     run: u64,
     lease: Arc<Lease>,
     rtc: Rtc,
+    /// Local ICE username fragment, which routes its STUN.
+    ufrag: String,
     slots: Vec<Slot>,
     /// Assignments that arrived before the slot's m-line was seen.
     pending: Vec<(u32, Arc<WatchGrant>)>,
@@ -388,7 +393,8 @@ struct Sfu {
     core: CoreHandle,
     dropped: Arc<AtomicU64>,
     owners: Owners,
-    /// Signals the core's full queue did not take yet, oldest first.
+    /// Signals the core's full queue did not take yet, oldest first. A signal a later one
+    /// makes moot leaves (`Sfu::signal`), so it holds at most two per share and per viewer.
     outbox: VecDeque<ScreenSignal>,
     /// Each viewer's keyframe budget. It belongs to the session, not to a watch transport, so a
     /// new run does not refill it; one that refilled completely is dropped.
@@ -418,8 +424,18 @@ pub async fn run(
         watchers: HashMap::new(),
         next_id: 1,
     };
+    // While signals wait, one reservation stands in the core's queue, in line with every other
+    // sender: a busy core cannot keep passing over them.
+    let mut slot: Option<Pin<Box<dyn Future<Output = Option<ScreenSlot>> + Send>>> = None;
     loop {
         let deadline = sfu.deadline();
+        let waiting = !sfu.outbox.is_empty();
+        if !waiting {
+            // Nothing to send: a place held in the core's queue would only keep it from others.
+            slot = None;
+        } else if slot.is_none() {
+            slot = Some(Box::pin(sfu.core.screen_slot()));
+        }
         tokio::select! {
             command = commands.recv() => match command {
                 Some(command) => sfu.command(command),
@@ -429,16 +445,29 @@ pub async fn run(
                 Some(datagram) => sfu.datagram(datagram),
                 None => break,
             },
+            reserved = reserved(&mut slot), if waiting => {
+                slot = None;
+                match reserved {
+                    Some(reserved) => sfu.deliver_into(reserved),
+                    None => sfu.outbox.clear(),
+                }
+            }
             _ = sleep_until(deadline.into()) => {}
         }
         sfu.timeouts(Instant::now());
     }
 }
 
+async fn reserved(slot: &mut Option<Pin<Box<dyn Future<Output = Option<ScreenSlot>> + Send>>>) -> Option<ScreenSlot> {
+    match slot {
+        Some(slot) => slot.as_mut().await,
+        None => std::future::pending().await,
+    }
+}
+
 impl Sfu {
     fn deadline(&self) -> Instant {
-        let wait = if self.outbox.is_empty() { Duration::from_millis(100) } else { Duration::from_millis(10) };
-        let mut at = Instant::now() + wait;
+        let mut at = Instant::now() + Duration::from_millis(100);
         for p in self.publishers.values() {
             at = at.min(p.deadline);
             if let Some(next) = p.keyframes.next() {
@@ -586,19 +615,30 @@ impl Sfu {
             datagram.at,
             Receive { proto: Protocol::Udp, source: datagram.source, destination: self.advertise, contents },
         );
-        let owner =
+        // STUN (RFC 7983: first byte 0–3) goes by ICE credentials and claims its address for
+        // the transport it names; anything else goes by address, which only STUN claims.
+        let owner = if matches!(datagram.contents.first(), Some(0..=3)) {
+            let Some(ufrag) = stun_ufrag(&datagram.contents) else { return };
+            let owner = self
+                .publishers
+                .values()
+                .find(|p| p.ufrag == ufrag && p.rtc.accepts(&input))
+                .map(|p| Owner::Publish(p.id))
+                .or_else(|| {
+                    self.watchers
+                        .values()
+                        .find(|w| w.ufrag == ufrag && w.rtc.accepts(&input))
+                        .map(|w| Owner::Watch(w.id))
+                });
+            let Some(owner) = owner else { return };
+            self.owners.own(datagram.source, owner, datagram.at);
+            owner
+        } else {
             match self.owners.held.get(&datagram.source) {
                 Some((owner, _)) => *owner,
-                None => {
-                    let owner =
-                        self.publishers.values().find(|p| p.rtc.accepts(&input)).map(|p| Owner::Publish(p.id)).or_else(
-                            || self.watchers.values().find(|w| w.rtc.accepts(&input)).map(|w| Owner::Watch(w.id)),
-                        );
-                    let Some(owner) = owner else { return };
-                    self.owners.own(datagram.source, owner, datagram.at);
-                    owner
-                }
-            };
+                None => return,
+            }
+        };
         match owner {
             Owner::Publish(id) => {
                 let Some(share) = self.publishers.values().find(|p| p.id == id).map(|p| p.origin.share.clone()) else {
@@ -643,14 +683,25 @@ impl Sfu {
         }
     }
 
-    /// Queues a signal for the core behind any it has not taken yet.
+    /// Queues a signal for the core behind any it has not taken yet. Queued signals it makes
+    /// moot go: those of a viewer's earlier runs (the core ignores any run but its latest) and,
+    /// once a share ended, its `Connected` (the core ends a share whether it went live or not).
     fn signal(&mut self, signal: ScreenSignal) {
+        match &signal {
+            ScreenSignal::Watch { session, run, .. } => self.outbox.retain(
+                |queued| !matches!(queued, ScreenSignal::Watch { session: s, run: r, .. } if s == session && r < run),
+            ),
+            ScreenSignal::Publish { share, signal: PublishSignal::Ended(_) } => self.outbox.retain(|queued| {
+                !matches!(queued, ScreenSignal::Publish { share: s, signal: PublishSignal::Connected } if s == share)
+            }),
+            ScreenSignal::Publish { .. } => {}
+        }
         self.outbox.push_back(signal);
         self.deliver();
     }
 
     /// Hands queued signals to the core in order, as far as its queue takes them; the rest wait
-    /// for the next loop iteration.
+    /// for the reservation the run loop keeps in line.
     fn deliver(&mut self) {
         while let Some(signal) = self.outbox.pop_front() {
             if let Err(signal) = self.core.try_screen(signal) {
@@ -660,8 +711,15 @@ impl Sfu {
         }
     }
 
-    fn timeouts(&mut self, now: Instant) {
+    /// The run loop's reservation came through: the oldest signal takes it.
+    fn deliver_into(&mut self, slot: ScreenSlot) {
+        if let Some(signal) = self.outbox.pop_front() {
+            slot.send(signal);
+        }
         self.deliver();
+    }
+
+    fn timeouts(&mut self, now: Instant) {
         // Transports whose share or lease the core ended close even if their command was lost.
         let ended: Vec<String> =
             self.publishers.iter().filter(|(_, p)| !p.origin.alive()).map(|(share, _)| share.clone()).collect();
@@ -939,17 +997,25 @@ impl Sfu {
 /// Which screen transport each address belongs to, mirrored into the set the voice task routes
 /// by.
 struct Owners {
-    /// Addresses each transport accepted datagrams from, and when it first did.
+    /// Addresses each transport's STUN came from, and when it last did.
     held: HashMap<SocketAddr, (Owner, Instant)>,
     addrs: Arc<ArcSwap<HashSet<SocketAddr>>>,
 }
 
 impl Owners {
     /// Routes `source` to `owner`. A transport holds at most `ADDRESSES_PER_TRANSPORT`; a further
-    /// one replaces its oldest, so a transport that keeps moving cannot pile addresses up.
+    /// one replaces the one silent longest, so a transport that keeps moving cannot pile
+    /// addresses up.
     fn own(&mut self, source: SocketAddr, owner: Owner, now: Instant) {
+        if let Some((o, at)) = self.held.get_mut(&source)
+            && *o == owner
+            && self.addrs.load().contains(&source)
+        {
+            *at = now;
+            return;
+        }
         let held: Vec<(SocketAddr, Instant)> =
-            self.held.iter().filter(|(_, (o, _))| *o == owner).map(|(a, (_, at))| (*a, *at)).collect();
+            self.held.iter().filter(|(a, (o, _))| *o == owner && **a != source).map(|(a, (_, at))| (*a, *at)).collect();
         let oldest = (held.len() >= ADDRESSES_PER_TRANSPORT)
             .then(|| held.iter().min_by_key(|(_, at)| *at).map(|(a, _)| *a))
             .flatten();
@@ -1017,10 +1083,12 @@ fn release(rtc: &mut Rtc, slot: &mut Slot) {
     slot.grant = None;
     slot.segment.wait();
     slot.asked = None;
-    if let Some(stream) = rtc.direct_api().stream_tx_by_mid(slot.mid, None) {
-        stream.set_rtx_cache(RTX_PACKETS, RTX_AGE, Some(RTX_RATIO));
-        stream.set_unpaced(true);
-        slot.configured = true;
+    // Leaving a sending direction drops all the slot's stream holds: packets written but not
+    // sent yet, the RTX cache and queued repairs. The change is local and never negotiated.
+    if let Some(direction) = rtc.media(slot.mid).map(|m| m.direction()).filter(|d| d.is_sending()) {
+        let mut sdp = rtc.sdp_api();
+        sdp.set_direction(slot.mid, Direction::Inactive);
+        sdp.set_direction(slot.mid, direction);
     }
 }
 
@@ -1109,10 +1177,12 @@ fn publisher(
         return Err("no VP9 or VP8 in the offer");
     }
     let cap = origin.cap_bps;
+    let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
     let publisher = Publisher {
         id,
         origin,
         rtc,
+        ufrag,
         ssrc,
         codecs,
         meter: Meter::new(cap, now),
@@ -1135,15 +1205,28 @@ fn watcher(
     advertise: SocketAddr,
     now: Instant,
 ) -> Result<(Watcher, String), &'static str> {
+    if !watch_offer(sdp) {
+        return Err("a watch offer has exactly 4 receive-only video m-lines");
+    }
     let offer = SdpOffer::from_sdp_string(sdp).map_err(|_| "invalid SDP offer")?;
     let mut rtc = rtc(advertise, now)?;
     let answer = rtc.sdp_api().accept_offer(offer).map_err(|_| "offer not acceptable")?;
+    let ssrcs = sections(sdp)
+        .into_iter()
+        .flatten()
+        .filter_map(|l| l.strip_prefix("a=ssrc:")?.split_whitespace().next()?.parse::<u32>().ok())
+        .collect::<HashSet<_>>();
+    if ssrcs.iter().any(|&ssrc| rtc.direct_api().stream_rx(&ssrc.into()).is_some()) {
+        return Err("a watch offer has exactly 4 receive-only video m-lines");
+    }
+    let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
     let watcher = Watcher {
         id,
         session,
         run,
         lease,
         rtc,
+        ufrag,
         slots: Vec::with_capacity(SCREEN_SLOTS),
         pending: Vec::new(),
         connected: false,
@@ -1153,9 +1236,17 @@ fn watcher(
     Ok((watcher, answer.to_sdp_string()))
 }
 
-/// The SSRCs on the offer's single video m-line, which must be exactly the share's main and
-/// RTX SSRCs, paired by an `ssrc-group:FID`. `None` when the offer has anything else.
-pub fn publish_ssrcs(sdp: &str) -> Option<(u32, u32)> {
+/// The local ICE username fragment a STUN binding request is for (its `USERNAME` is
+/// `ours:theirs`). STUN is routed by this, never by address: str0m's `Rtc::accepts` takes
+/// anything from a transport's nominated address before it looks at credentials, so an
+/// address a transport once used would keep another's checks.
+pub fn stun_ufrag(datagram: &[u8]) -> Option<String> {
+    let message = str0m::ice::StunMessage::parse(datagram).ok()?;
+    message.split_username().map(|(local, _)| local.to_owned())
+}
+
+/// The offer's m-sections, each its `m=` line and the lines under it.
+fn sections(sdp: &str) -> Vec<Vec<&str>> {
     let mut sections = Vec::new();
     for line in sdp.lines() {
         if line.starts_with("m=") {
@@ -1164,6 +1255,28 @@ pub fn publish_ssrcs(sdp: &str) -> Option<(u32, u32)> {
             section.push(line);
         }
     }
+    sections
+}
+
+/// A watch offer is the 4 slots and nothing else: `SCREEN_SLOTS` video m-lines that only
+/// receive, and no data channel. Anything that could send media to the SFU would bypass the
+/// publisher's admission and meter. (Its SSRCs are the viewer's RTCP senders; `watcher`
+/// checks no stream was set up to receive from them.)
+fn watch_offer(sdp: &str) -> bool {
+    let sections = sections(sdp);
+    sections.len() == SCREEN_SLOTS
+        && sections.iter().all(|lines| {
+            lines[0].starts_with("m=video ")
+                && lines.iter().filter(|l| DIRECTIONS.contains(&l.trim_end())).eq(["a=recvonly"].iter())
+        })
+}
+
+const DIRECTIONS: [&str; 4] = ["a=sendrecv", "a=sendonly", "a=recvonly", "a=inactive"];
+
+/// The SSRCs on the offer's single video m-line, which must be exactly the share's main and
+/// RTX SSRCs, paired by an `ssrc-group:FID`. `None` when the offer has anything else.
+pub fn publish_ssrcs(sdp: &str) -> Option<(u32, u32)> {
+    let sections = sections(sdp);
     let media: Vec<_> = sections.iter().filter(|s| !s[0].starts_with("m=application")).collect();
     if media.len() != 1 || !media[0][0].starts_with("m=video ") {
         return None;
@@ -1211,6 +1324,8 @@ mod tests {
         /// Holds the viewer's datagrams back instead of delivering them.
         hold: bool,
         held: Vec<Vec<u8>>,
+        /// The viewer's STUN checks, as sent.
+        checks: Vec<Vec<u8>>,
     }
 
     impl Pair {
@@ -1218,19 +1333,26 @@ mod tests {
             let now = Instant::now();
             let mut client = Rtc::builder().set_rtp_mode(true).clear_codecs().enable_vp8(true).build(now);
             client.add_local_candidate(Candidate::host(addr(5000), "udp").unwrap());
-            let mut api = client.sdp_api();
-            api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
-            let (offer, pending) = api.apply().unwrap();
+            // str0m's random mids can collide within one offer: redraw.
+            let (offer, pending) = loop {
+                let mut api = client.sdp_api();
+                let mids: HashSet<Mid> = (0..SCREEN_SLOTS)
+                    .map(|_| api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None))
+                    .collect();
+                if mids.len() == SCREEN_SLOTS {
+                    break api.apply().unwrap();
+                }
+            };
             let (w, answer) = watcher(1, 7, 1, Lease::new(), &offer.to_sdp_string(), addr(6000), now).unwrap();
             client.sdp_api().accept_answer(pending, SdpAnswer::from_sdp_string(&answer).unwrap()).unwrap();
-            let mut pair = Self { w, client, now, hold: false, held: Vec::new() };
+            let mut pair = Self { w, client, now, hold: false, held: Vec::new(), checks: Vec::new() };
             for _ in 0..200 {
-                if pair.w.connected && !pair.w.slots.is_empty() {
+                if pair.w.connected && pair.w.slots.len() == SCREEN_SLOTS {
                     break;
                 }
                 pair.step(&mut |_| false);
             }
-            assert!(pair.w.connected && pair.w.slots.len() == 1, "the pair connects");
+            assert!(pair.w.connected && pair.w.slots.len() == SCREEN_SLOTS, "the pair connects");
             pair
         }
 
@@ -1287,7 +1409,12 @@ mod tests {
                 match self.client.poll_output().unwrap() {
                     Output::Timeout(_) => break,
                     Output::Transmit(t) if self.hold => self.held.push(t.contents.to_vec()),
-                    Output::Transmit(t) => self.send_to_sfu(&t.contents),
+                    Output::Transmit(t) => {
+                        if matches!(t.contents.first(), Some(0..=3)) {
+                            self.checks.push(t.contents.to_vec());
+                        }
+                        self.send_to_sfu(&t.contents);
+                    }
                     Output::Event(_) => {}
                 }
             }
@@ -1340,10 +1467,55 @@ mod tests {
         (0..20).map(|_| pair.step(&mut |_| false)).sum()
     }
 
+    /// Writes ten packets into a slot and ends its grant before the transport sends them.
+    /// Returns how many RTP datagrams still left (after a sweep when `swept`).
+    fn queued_at_revocation(swept: bool) -> usize {
+        let mut pair = Pair::new();
+        let origin = ScreenOrigin::new(1, "share".into(), 1, false, false);
+        let grant = WatchGrant::new(origin.clone());
+        assign(&mut pair.w, 0, grant.clone());
+        let now = pair.now;
+        for n in 0..10u64 {
+            let forward = Forward {
+                source: 100 + n,
+                timestamp: 9000,
+                marker: n == 9,
+                keyframe: n == 0,
+                codec: VideoCodec::Vp8,
+                arrival: now,
+                payload: Arc::from([if n == 0 { 0x10 } else { 0x00 }, 0x00, n as u8, 0xaa].as_slice()),
+            };
+            assert!(write(&mut pair.w, 0, &origin, &forward, now));
+        }
+        grant.end();
+        if swept {
+            sweep(&mut pair.w);
+        }
+        (0..20).map(|_| pair.step(&mut |_| false)).sum()
+    }
+
+    #[test]
+    fn a_revoked_slot_sends_nothing_it_queued() {
+        assert_eq!(queued_at_revocation(false), 10, "the queue would send them");
+        assert_eq!(queued_at_revocation(true), 0, "nothing after the grant ended");
+    }
+
     #[test]
     fn a_revoked_slot_answers_no_nack() {
         assert!(after_revocation(false) > 0, "the cache would answer it");
         assert_eq!(after_revocation(true), 0, "nothing after the grant ended");
+    }
+
+    #[test]
+    fn stun_names_the_transport_it_is_for() {
+        let pair = Pair::new();
+        let other = Pair::new();
+        assert_ne!(pair.w.ufrag, other.w.ufrag);
+        assert!(!pair.checks.is_empty());
+        for check in &pair.checks {
+            assert_eq!(stun_ufrag(check).as_deref(), Some(pair.w.ufrag.as_str()));
+        }
+        assert_eq!(stun_ufrag(&[0x80, 0x60, 0, 0]), None, "RTP");
     }
 
     #[test]
@@ -1374,6 +1546,25 @@ mod tests {
         owners.forget(Owner::Watch(1));
         assert_eq!(owners.held.len(), 1);
         assert!(!dispatch.owns(&addr(7005)));
+    }
+
+    #[test]
+    fn watch_offers_only_receive_video_in_four_slots() {
+        let slot = |direction: &str| format!("m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:x\r\n{direction}");
+        let offer = |slots: &[String]| format!("v=0\r\n{}", slots.concat());
+        let four = vec![slot("a=recvonly\r\n"); SCREEN_SLOTS];
+        assert!(watch_offer(&offer(&four)));
+        assert!(!watch_offer(&offer(&four[..3])), "three slots");
+        for other in ["a=sendonly\r\n", "a=sendrecv\r\n", "", "a=recvonly\r\na=sendonly\r\n"] {
+            let mut slots = four.clone();
+            slots[2] = slot(other);
+            assert!(!watch_offer(&offer(&slots)), "{other:?}");
+        }
+        let mut slots = four.clone();
+        slots[3] = "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=recvonly\r\n".into();
+        assert!(!watch_offer(&offer(&slots)), "audio");
+        slots[3] = "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n".into();
+        assert!(!watch_offer(&offer(&slots)), "a data channel");
     }
 
     #[test]

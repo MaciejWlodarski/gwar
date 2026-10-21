@@ -130,6 +130,8 @@ struct Peer {
     binding: VoiceTransportBinding,
     core: CoreHandle,
     rtc: Rtc,
+    /// Local ICE username fragment, which routes its STUN.
+    ufrag: String,
     out: OutboundTx,
     mic: Option<Mid>,
     slots: Vec<Slot>,
@@ -339,17 +341,23 @@ pub async fn run(
             received = socket.recv_from(&mut buf) => match received {
                 Ok((n, source)) => {
                     // Media from a screen transport's address goes straight to the screen task,
-                    // before any voice work. STUN (RFC 7983: first byte 0–3) is matched by ICE
-                    // credentials instead, voice first, so a voice peer can always take back an
-                    // address a screen transport once used.
+                    // before any voice work. STUN (RFC 7983: first byte 0–3) goes by the ICE
+                    // username it names, never by address (`screen::stun_ufrag`), so a voice
+                    // peer can always take back an address a screen transport once used.
                     let stun = matches!(buf[..n].first(), Some(0..=3));
                     if !stun && screen.owns(&source) {
                         screen.send(source, &buf[..n]);
                         continue;
                     }
+                    let ufrag = if stun { super::screen::stun_ufrag(&buf[..n]) } else { None };
                     let Ok(contents) = buf[..n].try_into() else { continue };
                     let input = Input::Receive(Instant::now(), Receive { proto: Protocol::Udp, source, destination: advertise, contents });
-                    match peers.values_mut().find(|p| p.rtc.accepts(&input)) {
+                    let found = match &ufrag {
+                        Some(ufrag) => peers.values_mut().find(|p| p.ufrag == *ufrag && p.rtc.accepts(&input)),
+                        None if stun => None,
+                        None => peers.values_mut().find(|p| p.rtc.accepts(&input)),
+                    };
+                    match found {
                         Some(peer) => {
                             if stun {
                                 screen.disown(&source);
@@ -419,11 +427,13 @@ fn accept(
     if rtc.media(mic).is_none_or(|m| m.kind() != MediaKind::Audio || !m.direction().is_receiving()) {
         return Err("microphone media was not negotiated");
     }
+    let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
     let peer = Peer {
         session,
         binding,
         core,
         rtc,
+        ufrag,
         out,
         mic: Some(mic),
         slots: Vec::with_capacity(AUDIO_SLOTS),

@@ -382,7 +382,10 @@ Each session has at most two screen transports besides its voice transport
   by `screen.watch.offer` on the first watch and kept while the session is
   connected. It belongs to the session, not to a call, because plaintext
   shares can be watched from outside their voice. Its offer is fixed:
-  `SCREEN_SLOTS = 4` `recvonly` video m-lines, nothing to send. Phase 2
+  `SCREEN_SLOTS = 4` `recvonly` video m-lines, nothing to send. Any other offer
+  (another count, a slot that may send, an SSRC, audio, a data channel) is
+  refused before negotiation: media into a watch transport would bypass the
+  publisher's admission and meter. Phase 2
   widens each slot with an audio m-line
   ([Shared audio](#shared-audio-phase-2)). This mirrors the eight voice
   slots: no renegotiation when shares start, stop or change hands. A `run`
@@ -421,18 +424,23 @@ datagrams reach the screen task without slowing voice down.
     (`try_send`, capacity 2048 datagrams) to the screen task. Nothing else
     happens to it in the voice task: no peer scan, no `handle_input`, no
     drive.
-  - Unknown addresses (new ICE checks) fall back to asking voice peers'
-    `accepts`, then the screen task's.
-  - `accepts` classifies by remote address and STUN credentials (ICE
-    ufrag/pwd). This is **routing, not authentication**: SRTP authentication
-    in the owning `Rtc` is what rejects forged media, as for voice today.
   - **STUN always goes by credentials, voice first** (RFC 7983: first byte
-    0–3), even from a screen address. A voice peer that accepts it takes the
-    address back from the screen set (`disown`), so a NAT that reuses an old
-    screen address for a voice client cannot divert that client's voice for
-    longer than one consent check.
-  - A screen transport holds at most 4 addresses; a fifth replaces its
-    oldest.
+    0–3), even from a screen address: by the local ICE ufrag its `USERNAME`
+    names, then `accepts` (whose integrity check covers any address but the
+    transport's nominated one). Never by address alone: str0m's `accepts`
+    takes anything from a transport's nominated address before it looks at
+    credentials, so a stale address would keep another transport's checks.
+    A voice peer that takes a check takes the address back from the screen
+    set (`disown`), so a NAT that reuses an old screen address for a voice
+    client cannot divert that client's voice for longer than one consent
+    check. In the screen task, a check claims its address for the transport
+    it names.
+  - Other datagrams from addresses no STUN claimed go to voice peers'
+    `accepts`; the screen task drops them. This is **routing, not
+    authentication**: SRTP authentication in the owning `Rtc` is what rejects
+    forged media, as for voice today.
+  - A screen transport holds at most 4 addresses; a fifth replaces the one
+    whose checks stopped longest ago.
 - **The hand-off never blocks.** A full channel drops the datagram and counts
   `screen_dispatch_dropped`. Video recovers through NACK/PLI; voice never
   waits.
@@ -1235,8 +1243,15 @@ finds an empty RTX cache. Commands that end things are also fenced: a
 transport whose share or lease (a watch transport's, ended when the core drops
 it) has ended closes within 100 ms even if its command was lost to a full
 queue, and an assignment is recorded only once the queue has room for it. The
-screen task's own signals to the core (connected, ended) arrive in order. Its Gwar queue is cleared, its RTX cache
-is wiped with `set_rtx_cache`, and its reservation is freed. The viewer gets
+screen task's own signals to the core (connected, ended) arrive in order: what
+the core's full queue does not take waits behind one reservation in that
+queue, in line with every other sender, so a busy core cannot keep passing
+over them. Waiting signals a later one makes moot leave (a viewer's earlier
+runs; a share's `Connected` once it ended), which keeps at most two per share
+and per viewer. Its Gwar queue is cleared, and str0m drops everything its stream
+holds: packets written but not sent yet, the RTX cache and queued repairs (a
+local switch of the m-line's direction to `inactive` and back, never
+negotiated). Its reservation is freed. The viewer gets
 `screen.slot {share: null}` and `screen.stopped {reason: "access"}`. Nothing
 of the share is sent to that viewer after that iteration; repairs and probes
 included ([Queues and repairs](#queues-and-repairs)).

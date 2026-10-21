@@ -163,6 +163,15 @@ pub enum CoreMsg {
     Resume(Resume),
 }
 
+/// A reserved place in the core's queue (`CoreHandle::screen_slot`).
+pub struct ScreenSlot(mpsc::OwnedPermit<CoreMsg>);
+
+impl ScreenSlot {
+    pub fn send(self, signal: ScreenSignal) {
+        self.0.send(CoreMsg::Screen(signal));
+    }
+}
+
 #[derive(Clone)]
 pub struct CoreHandle {
     tx: mpsc::Sender<CoreMsg>,
@@ -247,12 +256,19 @@ impl CoreHandle {
     }
 
     /// Hands a screen SFU signal over without waiting; `Err` gives it back when the queue is
-    /// full, for the SFU to retry in order. A closed core takes it silently.
+    /// full, for the SFU to queue in order. A closed core takes it silently.
     pub fn try_screen(&self, signal: ScreenSignal) -> Result<(), ScreenSignal> {
         match self.tx.try_send(CoreMsg::Screen(signal)) {
             Err(mpsc::error::TrySendError::Full(CoreMsg::Screen(signal))) => Err(signal),
             _ => Ok(()),
         }
+    }
+
+    /// A place in the core's queue for one screen SFU signal, taken in turn with every waiting
+    /// sender; `None` once the core is gone.
+    pub fn screen_slot(&self) -> impl Future<Output = Option<ScreenSlot>> + Send + 'static {
+        let tx = self.tx.clone();
+        async move { tx.reserve_owned().await.ok().map(ScreenSlot) }
     }
 
     pub async fn bridge(&self, msg: BridgeMsg) {
