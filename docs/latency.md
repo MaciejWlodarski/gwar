@@ -331,12 +331,11 @@ only callbacks during playback.
 Fractional corrections use the minimum queue + staged PCM margin observed
 before refills over a full trailing five seconds. This retains sparse low-water
 evidence such as a 5 ms packet delay every three seconds. The margin excludes
-the pending refill and 120 samples (2.5 ms) of safety, plus the adaptive jitter
-reserve beyond one packet unless every refill in the window asks for the same whole
-number of packets, all of one duration, at times that keep one phase against the
-packets (within 1 ms); refills like that meet every delay at that phase, so the
-minimum already holds the dips the jitter caused, and the marks keep only the phase
-wander as reserve (see "Level steps, second pass" below). Arrival phase contributes no credit. Each correction proposes at most
+the pending refill and 120 samples (2.5 ms) of safety. Since the marks sample the
+queue only at refills, each mark is also lowered to what a refill at another time
+could have had, from the packets that arrived before it (the arrival rule, see
+"Level steps, second pass" below); with mixed packet durations each mark keeps the
+adaptive jitter reserve beyond one packet instead. Arrival phase contributes no credit. Each correction proposes at most
 720 samples (15 ms). Each committed cut is subtracted from every historical
 margin, so later corrections cannot spend the same surplus twice. Depth is
 buffered time from the playout position to the end of the queue, holes
@@ -429,7 +428,7 @@ estimate is high; the second pass below removes the jitter reserve from the drai
 Level steps, second pass (2026-10-21). A temporary trace of every arrival, pop,
 concealment, cut and low-water mark (not committed) separated three mechanisms:
 
-- **The drain counted the jitter twice on regular streams (fixed).** Each
+- **The drain counted the jitter twice (fixed).** Each
   low-water mark subtracted the jitter reserve (target minus one packet, the
   target being the 2 s peak-hold jitter estimate + 5 ms) from a five-second
   minimum that already holds the dips the same jitter caused. The excess this
@@ -444,56 +443,89 @@ concealment, cut and low-water mark (not committed) separated three mechanisms:
   against 30 ms) with 25 ms.
 
   The reserve is not redundant everywhere, though. The marks sample the queue at
-  refills only, and when refills vary in size or packets in duration, a delay can
-  meet a luckier refill phase than the next one, so the minimum understates what
-  the next delay needs. Two deterministic schedules (real Opus through
+  refills only, so a delay can meet a later refill at a worse point than any refill
+  in the window did, and the minimum understates what that refill needs. Four
+  review rounds showed it on deterministic schedules (real Opus through
   `Slot::mix_refill`, ordered delivery, no loss, 50 ms initial delay, 60 s, both
-  clocks) show it: 10 ms packets with callbacks cycling 10/20/5 ms and a 35 ms
-  delay every 4.8 s (1 concealment with the reserve, 4 without), and 40/2.5/10/5/40 ms
-  packets with 10 ms callbacks and a 5 ms delay after every 3 s boundary (0 against
-  2). A grid of 216 such schedules (four packet patterns, three callback patterns,
-  delays of 5/20/35 ms every 0.5–4.9 s, RTP clock) had 61 schedules with more
-  concealments without the reserve. On its 108 schedules with delays every 3–4.9 s,
-  constant allowances of 2.5, 5 and 10 ms instead of the reserve left 16, 10 and 4
-  of them, and the reserve reduced by 2.5 ms left 6. No failing schedule had
-  regular refills and packets. So the reserve now depends on the window
-  (`jitter.rs` `refresh_surplus`): when every refill in the five-second window asks
-  for the same amount, every packet lasts as long, and the refill is a whole number
-  of packets, marks keep only the pending refill and the 2.5 ms safety margin;
-  otherwise each mark keeps the reserve it had, as before. On the grid this has no
-  schedule with more concealments than the old rule (139 concealments with either
-  rule, on each clock), and the backlog above drains to 22.5 and 32.5 ms with no
-  concealments. The jitter estimate still sets the stall-recovery depth.
+  clocks). Without the reserve, 10 ms packets with callbacks cycling 10/20/5 ms and a
+  35 ms delay every 4.8 s gave 4 concealments (1 with it), and 40/2.5/10/5/40 ms
+  packets with a 5 ms delay every 3 s gave 2 (0). Rules that dropped the reserve for
+  regular refills failed as well:
+  - equal refill sizes: fixed 8 ms callbacks over 10 ms packets walk through the
+    packets (35 ms delay every 3.3 s: 9 concealments, against 1 with the reserve);
+  - whole-packet refills: refill times can walk too (refill `k` at
+    `480k + 479 + (17k mod 480)` samples, 35 ms every 3 s: 2 against 0);
+  - a reserve capped at the refills' phase spread: 10 ms refills 5 ms into their
+    callbacks, every hundredth 0.5 ms early, 35 ms every 1.1 s (5 against 0). The
+    delayed burst lands exactly on a refill, and the early one misses all of it.
 
-  Equal refills alone are not enough (review round 2): fixed 8 ms callbacks over
-  10 ms packets with a 35 ms delay every 3.3 s gave 9 concealments and 4,296 samples
-  of cuts without the reserve, against 1 and 846 with it, on both clocks, because
-  8 ms refills walk through five phases of the packets. The refill must therefore
-  divide into whole packets. A wider grid (packets of 10, 20, 5 ms and the mixed
+  Missing an arrival is not proportional to how early a refill runs: 0.5 ms can
+  cost a whole packet or burst, so no phase allowance (the earlier 1 ms) is safe
+  by itself. Live refills run whenever the playback loop wakes, so any rule that
+  needs an exact phase would never apply in use anyway.
+
+  The arrival rule (`jitter.rs` `refresh_surplus`) replaces the reserve with what
+  the arrivals show. Nothing is consumed between refills, so a refill at an earlier
+  time would have seen a mark's queue without the packets that arrived in between.
+  Marks keep the arrivals since the previous observation, revised in hindsight like
+  the rest of the mark. Each refill's lead (media consumed ahead of wall time) says
+  how early it ran. Only leads since the last refill that consumed nothing count: a
+  pause or a stretched timeline leaves consumption behind for good.
+  - When the refills enter every packet alike (one packet duration, and successive
+    refills step through one fixed set of points within a packet), every packet and
+    every delay meets the same refills, earlier only by their lead differences. Each
+    mark takes its margin at the window's highest lead: without the packets that
+    arrived within that difference before it. With 2 ms of random wander, refills
+    stay alike and the marks drop what arrived in those 2 ms.
+  - Otherwise (refills that walk through the packets or vary in size) a delay may
+    meet a refill at any point. Each mark takes the lowest margin that a refill at the
+    highest lead could have had just before any arrival since the previous
+    observation, crediting the time it would not yet have consumed. That costs up to
+    one packet of margin against a fixed phase.
+  - With mixed packet durations each mark keeps the reserve, as before (on the
+    sequence clock, keys do not give media positions then).
+
+  The rule takes arrival stamps as the time packets became available. Like the
+  reserve with little jitter, it does not cover a sender clock that drifts a packet
+  across a refill within the window.
+
+  Grid against `main` (the reserve on every stream, which the test reproduces: 1
+  concealment and 846 samples of cuts in the 8 ms case, 0 and 852 for walking
+  times, 0 and 0 for the early refill). Packets of 10, 20, 5 ms and the mixed
   40/2.5/10/5/40 ms pattern; callbacks of 10, 8, 10/20/5, 20, 5 ms and 441 samples;
-  delays of 5/20/35 ms every 0.5, 1.1, 2, 3, 3.3 and 4.9 s; 432 schedules per clock)
-  found 18 schedules per clock where equal refills alone concealed more than `main`
-  (288 concealments against 217), all with 8 ms or 441-sample callbacks, and none
-  for the whole-packet rule (217, identical on both clocks). The whole-packet rule
-  differs from `main` only for 10 ms callbacks over 10 or 5 ms packets and 5 ms
-  callbacks over 5 ms packets, where it drains more (540,140 against 527,920
-  samples of cuts over the grid). The rule is narrower than "fixed callbacks": the
-  playback loop refills in pieces of at most 480 samples and observes each piece
-  with the demand still outstanding, so a fixed 960-sample callback shows up as
-  alternating 960 and 480 observations and keeps the reserve. In practice only
-  callbacks of 10 ms or less that hold a whole number of packets, such as 10 ms
-  callbacks over 10 ms packets (the harness's native stream), drop it.
+  delays of 5/20/35 ms every 0.5, 1.1, 2, 3, 3.3 and 4.9 s (432 schedules); refills
+  on time, 5 ms into the callback with every hundredth 0.5 ms early, or 0–2 ms late
+  at random (`playout.rs`, `drain_grid_never_conceals_more_than_the_reserve_rule`).
+  The two clocks give identical totals. Values are main / arrival rule:
 
-  Whole-packet sizes are not enough either (review round 3): 10 ms refills over
-  10 ms packets whose times walk through the period (refill `k` at
-  `480k + 479 + (17k mod 480)` samples) with a 35 ms delay every 3 s gave 2
-  concealments and 1,800 samples of cuts without the reserve, against 0 and 852
-  with it, on both clocks; every observation was still 480 over 480. So the refill
-  times count as well: phases are measured from the window's first refill, modulo
-  the packet duration, and the reserve is dropped only while they stay within 1 ms
-  of each other. The marks then keep the spread itself (at most 1 ms) as reserve,
-  since a delay met that much earlier in the phase showed that much less dip. A
-  live callback whose wake-up wanders more than that keeps the full reserve.
+  | Refill timing | Concealments | Samples cut |
+  | --- | ---: | ---: |
+  | On time | 198 / 18 | 516,812 / 389,486 |
+  | 0.5 ms early every 100th | 174 / 14 | 585,416 / 438,130 |
+  | 0–2 ms late at random | 194 / 18 | 516,915 / 385,953 |
+
+  No schedule conceals more than on `main`. Every remaining concealment is on the
+  mixed-duration pattern, which keeps the reserve and matches `main` exactly. On
+  the uniform patterns `main` concealed 1,032 times over the three timings and both
+  clocks, mostly with 8 ms, 10/20/5 ms and 441-sample callbacks; the arrival rule
+  concealed none. It cuts less overall, because `main` cut through dips it then
+  concealed. It cuts more in total on five of the 18 uniform packet and callback
+  pairs: 10 and 5 ms callbacks over 10 ms packets, and 8 ms, 5 ms and 441-sample
+  callbacks over 5 ms packets. The early-refill schedule above cuts 360
+  samples (none on `main`), with no concealments: even the early refill still had
+  7.5 ms above its demand and safety.
+
+  The jittery backlog above (10 ms refills, 40 ms backlog) drains as follows. The
+  stream's own level comes first; values are settled / arrival rule / `main`.
+
+  | Jitter | Refills on time | Refills 0–2 ms late at random |
+  | --- | --- | --- |
+  | 15 ms | 20.0 / 22.5 / 31.5 ms | 21.0 / 23.5 / 32.5 ms |
+  | 25 ms | 30.0 / 32.5 / 50.0 ms | 31.0 / 33.5 / 51.0 ms |
+
+  The arrival rule never concealed here. Where refills do not enter the packets
+  alike, it drains to 7.5 ms above the settled level (measured by forcing that
+  mode). The jitter estimate still sets the stall-recovery depth.
 - **A late packet stretches the timeline (intended).** When the queue is empty at
   a refill, the head packet is concealed in place; if it then arrives, it plays
   and every later packet is 10 ms later. On a loaded host, single packets arrive
@@ -560,6 +592,9 @@ runs are noisy. Values are main / new / first version:
 | `down:jitter=10ms` | 65.42 / 57.36 / 58.11 | 75.28 / 69.48 / 68.95 | 4 / 2 / 2 | 15 / 14 / 19 | 1 / 1 / 8 | 1 / 0 / 2 |
 | `down:loss=2%` | 64.58 / 60.59 / 59.30 | 77.68 / 84.75 / 69.85 | 5 / 2 / 3 | 544 / 545 / 545 | 0 / 0 / 0 | 0 / 1 / 0 |
 | `down:burst=3@0.5%` | 56.41 / 54.38 / 51.30 | 68.56 / 71.42 / 62.50 | 6 / 5 / 4 | 415 / 410 / 405 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+These series measured earlier rules. The arrival rule has not been run on the
+harness yet.
 
 Stepped runs: 15 / 9 / 9 of 24. The harness's native stream (10 ms packets, fixed
 10 ms callbacks) keeps regular refills most of the time, so the new rule keeps about

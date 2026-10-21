@@ -643,7 +643,7 @@ mod tests {
 
     /// 60 s of ordered delivery without loss; the first packet at or after every `period`
     /// is `delay` late. Playout starts 50 ms behind; refill `k` runs `late(k)` samples after
-    /// its callback's start. Returns the concealments.
+    /// its callback's start. Returns the concealments and the samples cut.
     fn periodic_delay(
         clock: super::super::jitter::Clock,
         durations: &[u64],
@@ -651,11 +651,28 @@ mod tests {
         period: u64,
         delay: u64,
         late: impl Fn(u64) -> u64,
-    ) -> u64 {
+    ) -> (u64, u64) {
+        periodic_delay_by(false, clock, durations, callbacks, period, delay, late)
+    }
+
+    /// `periodic_delay`, optionally by the reserve rule alone (the rule on `main` before the
+    /// arrival rule).
+    fn periodic_delay_by(
+        reserve_only: bool,
+        clock: super::super::jitter::Clock,
+        durations: &[u64],
+        callbacks: &[usize],
+        period: u64,
+        delay: u64,
+        late: impl Fn(u64) -> u64,
+    ) -> (u64, u64) {
         use super::super::jitter::Clock;
         let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
         let mut slot = Slot::new().unwrap();
+        slot.buffer.reserve_only = reserve_only;
         let start = Instant::now();
+        // Silence: one packet per duration does.
+        let mut packets = std::collections::HashMap::new();
         let (mut arrivals, mut media, mut last, mut boundary) = (Vec::new(), 0u64, 0u64, 0u64);
         for i in 0.. {
             let n = durations[i % durations.len()];
@@ -668,7 +685,8 @@ mod tests {
             let time = (media + late).saturating_sub(2400).max(last);
             last = time;
             let key = if clock == Clock::Sequence { i as u64 * 960 } else { media };
-            arrivals.push((time, key, n, encode_n(&encoder, false, n as usize)));
+            let data = packets.entry(n).or_insert_with(|| encode_n(&encoder, false, n as usize)).clone();
+            arrivals.push((time, key, n, data));
             media += n;
             if media > 61 * 48_000 {
                 break;
@@ -688,34 +706,152 @@ mod tests {
             slot.mix_refill(&mut vec![0.0; callback], 1.0, now, callback).unwrap();
             tick += callback as u64;
         }
-        slot.buffer.concealments
+        (slot.buffer.concealments, slot.buffer.shrink_samples)
     }
 
     #[test]
     fn rare_delays_with_varying_callbacks_or_durations_keep_the_jitter_reserve() {
-        // Each delay falls on another refill phase, so the five-second minimum can understate
-        // the next one's need. Without the jitter reserve the first two gave 4 and 2
+        // Each delay can meet a refill at another point than the window's delays did, so the
+        // five-second minimum alone can understate the next one's need. The arrival rule covers
+        // it for these refills, and the jitter reserve for mixed packet durations
+        // (`JitterBuffer::refresh_surplus`). With neither, the four gave 4, 2, 9 and 2
         // concealments.
         use super::super::jitter::Clock;
         for clock in [Clock::Rtp, Clock::Sequence] {
             // 10 ms packets, callbacks cycling 10/20/5 ms, 35 ms late every 4.8 s.
-            let varying_callbacks = periodic_delay(clock, &[480], &[480, 960, 240], 4800 * 48, 35 * 48, |_| 0);
+            let (varying_callbacks, _) = periodic_delay(clock, &[480], &[480, 960, 240], 4800 * 48, 35 * 48, |_| 0);
             assert!(varying_callbacks <= 1, "{clock:?}: {varying_callbacks}");
             // 40/2.5/10/5/40 ms packets, 10 ms callbacks, 5 ms late after every 3 s.
-            let varying_durations =
+            let (varying_durations, _) =
                 periodic_delay(clock, &[1920, 120, 480, 240, 1920], &[480], 3 * 48_000, 5 * 48, |_| 0);
             assert_eq!(varying_durations, 0, "{clock:?}");
             // 10 ms packets, fixed 8 ms callbacks, 35 ms late every 3.3 s: every refill asks for
-            // the same amount, but 8 ms refills walk through the 10 ms packets' phases. Without
-            // the reserve this gave 9 concealments (1 with it).
-            let walking_phase = periodic_delay(clock, &[480], &[384], 3300 * 48, 35 * 48, |_| 0);
+            // the same amount, but 8 ms refills walk through the 10 ms packets' phases (1
+            // concealment with the reserve alone).
+            let (walking_phase, _) = periodic_delay(clock, &[480], &[384], 3300 * 48, 35 * 48, |_| 0);
             assert!(walking_phase <= 1, "{clock:?}: {walking_phase}");
             // 10 ms packets and 10 ms refills, 35 ms late every 3 s, but each refill runs at
             // another point of its period: equal whole-packet refills whose times walk through
-            // the packets' phases. Without the reserve this gave 2 concealments (0 with it).
-            let walking_times = periodic_delay(clock, &[480], &[480], 3 * 48_000, 35 * 48, |k| 479 + (17 * k) % 480);
+            // the packets' phases.
+            let (walking_times, _) =
+                periodic_delay(clock, &[480], &[480], 3 * 48_000, 35 * 48, |k| 479 + (17 * k) % 480);
             assert_eq!(walking_times, 0, "{clock:?}");
         }
+    }
+
+    #[test]
+    fn a_refill_slightly_early_does_not_miss_a_delayed_burst() {
+        // Review round 4: 10 ms packets and refills 5 ms into each callback, 35 ms late every
+        // 1.1 s, so the delayed burst lands exactly on a refill; every hundredth refill runs
+        // 0.5 ms early and misses it. Capping the reserve at the refills' phase spread (24
+        // samples) gave 5 concealments and 2,640 samples of cuts; the reserve rule alone gives
+        // none of either. A refill 0.5 ms early, just before the burst, still has 360 samples
+        // (7.5 ms) over its demand and the safety margin at the 50 ms start, and that is all the
+        // arrival rule may cut.
+        use super::super::jitter::Clock;
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            let late = |k| if k % 100 == 98 { 216 } else { 240 };
+            let (concealments, cut) = periodic_delay(clock, &[480], &[480], 1100 * 48, 35 * 48, late);
+            assert_eq!(concealments, 0, "{clock:?}");
+            assert!(cut <= 360, "{clock:?}: {cut}");
+        }
+    }
+
+    /// The arrival rule against the reserve rule alone (`main` before it) over a grid of
+    /// `periodic_delay` schedules: packets of 10, 20, 5 ms and 40/2.5/10/5/40 ms; callbacks of
+    /// 10, 8, 10/20/5, 20, 5 ms and 441 samples; 5/20/35 ms delays every 0.5, 1.1, 2, 3, 3.3 and
+    /// 4.9 s; refills on time, 0.5 ms early every hundredth, or 0-2 ms late at random; both
+    /// clocks. No schedule may conceal more. About a minute in release:
+    /// `cargo test --release -p gwar-client --lib drain_grid -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "slow; run on demand"]
+    fn drain_grid_never_conceals_more_than_the_reserve_rule() {
+        use super::super::jitter::Clock;
+        let durations: [&[u64]; 4] = [&[480], &[960], &[240], &[1920, 120, 480, 240, 1920]];
+        let callbacks: [&[usize]; 6] = [&[480], &[384], &[480, 960, 240], &[960], &[240], &[441]];
+        let timings = ["exact", "early", "random"];
+        let late = |timing: usize, k: u64| match timing {
+            0 => 0,
+            1 if k % 100 == 98 => 216,
+            1 => 240,
+            _ => {
+                // splitmix64
+                let mut z = k.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                (z ^ (z >> 31)) % 97
+            }
+        };
+        let mut schedules = Vec::new();
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            for timing in 0..timings.len() {
+                for d in durations {
+                    for c in callbacks {
+                        for delay in [5u64, 20, 35] {
+                            for period in [500u64, 1100, 2000, 3000, 3300, 4900] {
+                                schedules.push((clock, timing, d, c, delay, period));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let results = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&(clock, timing, d, c, delay, period)) = schedules.get(i) else { break };
+                        let run = |reserve_only| {
+                            periodic_delay_by(reserve_only, clock, d, c, period * 48, delay * 48, |k| late(timing, k))
+                        };
+                        let (main, new) = (run(true), run(false));
+                        results.lock().unwrap().push((i, main, new));
+                    }
+                });
+            }
+        });
+        let mut results = results.into_inner().unwrap();
+        results.sort_by_key(|r| r.0);
+        let mut worse = Vec::new();
+        println!("| Clock | Timing | PLC main | PLC new | Cut main | Cut new | Drains more | Drains less |");
+        println!("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |");
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            for (timing, name) in timings.iter().enumerate() {
+                let (mut plc, mut cut, mut more, mut less) = ((0, 0), (0, 0), 0, 0);
+                for &(i, main, new) in &results {
+                    let (c, t, d, cb, delay, period) = schedules[i];
+                    if c != clock || t != timing {
+                        continue;
+                    }
+                    plc = (plc.0 + main.0, plc.1 + new.0);
+                    cut = (cut.0 + main.1, cut.1 + new.1);
+                    more += u32::from(new.1 > main.1);
+                    less += u32::from(new.1 < main.1);
+                    if new.0 > main.0 {
+                        worse.push(format!("{c:?} {name} {d:?} {cb:?} {delay} ms/{period} ms: {main:?} -> {new:?}"));
+                    }
+                }
+                println!("| {clock:?} | {name} | {} | {} | {} | {} | {more} | {less} |", plc.0, plc.1, cut.0, cut.1);
+            }
+        }
+        println!("\n| Packets | Callbacks | PLC main | PLC new | Cut main | Cut new |");
+        println!("| --- | --- | ---: | ---: | ---: | ---: |");
+        for d in durations {
+            for cb in callbacks {
+                let (mut plc, mut cut) = ((0, 0), (0, 0));
+                for &(i, main, new) in &results {
+                    if schedules[i].2 == d && schedules[i].3 == cb {
+                        plc = (plc.0 + main.0, plc.1 + new.0);
+                        cut = (cut.0 + main.1, cut.1 + new.1);
+                    }
+                }
+                println!("| {d:?} | {cb:?} | {} | {} | {} | {} |", plc.0, plc.1, cut.0, cut.1);
+            }
+        }
+        assert!(worse.is_empty(), "more concealments than the reserve rule:\n{}", worse.join("\n"));
     }
 
     #[test]

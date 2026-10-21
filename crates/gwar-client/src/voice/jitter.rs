@@ -50,11 +50,33 @@ struct Mark {
     at: Instant,
     /// Staged audio minus demand and safety; may be negative. Debited by every cut.
     base: i64,
-    /// The jitter reserve beyond one packet at the time (`JitterBuffer::refresh_surplus`).
+    /// The jitter reserve beyond one packet at the time, for the reserve rule.
     reserve: u64,
-    /// Refill demand and packet duration of a refill observation; `None` after PLC.
-    grain: Option<(u64, u64)>,
+    /// Where this refill stands in media and time. `None` without a span or with mixed packet
+    /// durations queued.
+    lead: Option<Lead>,
+    /// Packets that arrived since the previous observation, latest first: samples from the
+    /// arrival to this mark, and the smallest key that arrived then or later.
+    arrivals: Vec<(u64, u64)>,
     span: Option<Span>,
+}
+
+#[derive(Clone, Copy)]
+struct Lead {
+    /// Media consumed through this refill. Raised by every later cut, as `Mark::base` is
+    /// debited.
+    consumed: i64,
+    /// Samples from the start of the window to this refill.
+    elapsed: i64,
+    /// The duration of every queued packet.
+    packet: u64,
+}
+
+impl Lead {
+    /// Media consumed ahead of time.
+    fn ahead(&self) -> i64 {
+        self.consumed - self.elapsed
+    }
 }
 
 struct Span {
@@ -71,19 +93,53 @@ struct Span {
 }
 
 impl Mark {
-    /// `reserve` caps the mark's jitter reserve (`JitterBuffer::refresh_surplus`).
-    fn margin(&self, clock: Clock, reserve: u64) -> u64 {
-        let buffered = self.span.as_ref().map_or(0, |span| match clock {
-            // RTP keys are sample positions: holes included, the span is the audio.
-            Clock::Rtp => span.end.saturating_sub(span.head),
-            Clock::Sequence => {
-                let inside = span.queued.iter().filter(|(key, _)| (span.head..span.end).contains(key));
-                let (present, packets) = inside.fold((0, 0), |(sum, n), (_, samples)| (sum + samples, n + 1));
-                let strides = span.end.saturating_sub(span.head).div_ceil(FRAME);
-                present + strides.saturating_sub(packets) * span.hole
+    /// Audio from the playout position to the end of the queue, or to `cap` if that is sooner.
+    fn buffered(&self, clock: Clock, cap: u64) -> u64 {
+        self.span.as_ref().map_or(0, |span| {
+            let end = span.end.min(cap);
+            match clock {
+                // RTP keys are sample positions: holes included, the span is the audio.
+                Clock::Rtp => end.saturating_sub(span.head),
+                Clock::Sequence => {
+                    let inside = span.queued.iter().filter(|(key, _)| (span.head..end).contains(key));
+                    let (present, packets) = inside.fold((0, 0), |(sum, n), (_, samples)| (sum + samples, n + 1));
+                    let strides = end.saturating_sub(span.head).div_ceil(FRAME);
+                    present + strides.saturating_sub(packets) * span.hole
+                }
             }
-        });
-        (buffered as i64 + self.base - self.reserve.min(reserve) as i64).max(0) as u64
+        })
+    }
+
+    /// The reserve rule: the margin less the jitter reserve.
+    fn margin(&self, clock: Clock) -> u64 {
+        (self.buffered(clock, u64::MAX) as i64 + self.base - self.reserve as i64).max(0) as u64
+    }
+
+    /// The arrival rule for any refill timing (`JitterBuffer::refresh_surplus`): the lowest
+    /// margin a refill as far ahead as `ahead` could have seen at this mark or just before any
+    /// arrival since the previous observation.
+    fn bound(&self, clock: Clock, ahead: i64) -> u64 {
+        let Some(lead) = self.lead else { return 0 };
+        let mut low = self.buffered(clock, u64::MAX) as i64 + self.base;
+        for &(credit, cap) in &self.arrivals {
+            low = low.min(self.buffered(clock, cap) as i64 + self.base + credit as i64);
+        }
+        (low - (ahead - lead.ahead()).max(0)).max(0) as u64
+    }
+
+    /// The arrival rule for refills that enter every packet alike: the margin this refill would
+    /// have seen as far ahead as `ahead`, that is earlier by the difference, without the
+    /// packets that arrived in between.
+    fn shifted(&self, clock: Clock, ahead: i64) -> u64 {
+        let Some(lead) = self.lead else { return 0 };
+        let earlier = (ahead - lead.ahead()).max(0) as u64;
+        let mut low = self.buffered(clock, u64::MAX) as i64 + self.base;
+        for &(since, cap) in &self.arrivals {
+            if since < earlier {
+                low = low.min(self.buffered(clock, cap) as i64 + self.base);
+            }
+        }
+        low.max(0) as u64
     }
 
     /// A known lower bound: no later arrival can raise it.
@@ -106,6 +162,12 @@ pub struct JitterBuffer {
     above_since: Option<Instant>,
     surplus: u64,
     low_water: VecDeque<Mark>,
+    /// Arrivals since the last observation, in push order: when (`None`: not before that
+    /// observation, so no earlier than the next one) and the key.
+    arrivals: Vec<(Option<Instant>, u64)>,
+    /// The window's highest lead and whether its refills enter every packet alike, for the
+    /// arrival rule (`refresh_surplus`); updated with every mark and cut.
+    timing: Option<(i64, bool)>,
     observing_since: Option<Instant>,
     last_observation: Option<Instant>,
     last_shrink: Option<Instant>,
@@ -115,6 +177,9 @@ pub struct JitterBuffer {
     pub(crate) shrink_samples: u64,
     pub(crate) trim_events: u64,
     pub(crate) concealments_after_trim: u64,
+    /// Test-only: drain by the reserve rule alone, as before the arrival rule.
+    #[cfg(test)]
+    pub(crate) reserve_only: bool,
 }
 
 const FRAME: u64 = 960; // TS packet-counter stride and unknown-stream default.
@@ -127,8 +192,6 @@ const QUIET_SHRINK: Duration = Duration::from_secs(1);
 // must be slower than that jitter pattern; genuine surplus can take tens of seconds.
 const DEPTH_WINDOW: Duration = Duration::from_secs(5);
 const SAFETY: u64 = 120; // Retain 2.5 ms beyond the observed refill low-water mark.
-/// How far refill times may wander against the packets (1 ms) and still count as one phase.
-const PHASE_SLACK: u64 = 48;
 const FORCE_SHRINK: Duration = Duration::from_secs(2);
 const SHRINK_STEP: u64 = 720; // Allow one low-pitched period (15 ms); the decoder commits the actual cut.
 // Debited low-water evidence supports bounded recovery: at most 10 ms/s in
@@ -137,6 +200,11 @@ const SHRINK_INTERVAL: Duration = Duration::from_millis(500);
 const TRIM_DIAGNOSTIC_WINDOW: Duration = Duration::from_secs(1);
 // A declined proposal (noise, onset) costs a pitch search; retry at most 5 times a second.
 const SHRINK_RETRY: Duration = Duration::from_millis(200);
+
+/// Whole samples from `from` to `to`, rounded down.
+fn samples_between(from: Instant, to: Instant) -> u64 {
+    (to.saturating_duration_since(from).as_nanos() * 48 / 1_000_000) as u64
+}
 
 impl Default for JitterBuffer {
     fn default() -> Self {
@@ -159,6 +227,8 @@ impl JitterBuffer {
             above_since: None,
             surplus: 0,
             low_water: VecDeque::new(),
+            arrivals: Vec::new(),
+            timing: None,
             observing_since: None,
             last_observation: None,
             last_shrink: None,
@@ -168,6 +238,8 @@ impl JitterBuffer {
             shrink_samples: 0,
             trim_events: 0,
             concealments_after_trim: 0,
+            #[cfg(test)]
+            reserve_only: false,
         }
     }
 
@@ -223,6 +295,7 @@ impl JitterBuffer {
             return;
         }
         self.revise_marks(now, ts);
+        self.record_arrival(now, ts);
         if let Some((last_ts, last_at, last_samples)) = self.arrival {
             if ts > last_ts {
                 let elapsed = now.saturating_duration_since(last_at).as_secs_f64();
@@ -296,6 +369,12 @@ impl JitterBuffer {
             // supported surplus need not wait another full window after each cut.
             for mark in &mut self.low_water {
                 mark.base -= samples as i64;
+                if let Some(lead) = &mut mark.lead {
+                    lead.consumed += samples as i64;
+                }
+            }
+            if let Some((ahead, _)) = &mut self.timing {
+                *ahead += samples as i64;
             }
             self.surplus = self.surplus.saturating_sub(samples as u64);
         }
@@ -303,31 +382,34 @@ impl JitterBuffer {
 
     fn clear_depth(&mut self) {
         self.low_water.clear();
+        self.arrivals.clear();
+        self.timing = None;
         self.observing_since = None;
         self.last_observation = None;
         self.surplus = 0;
     }
 
     /// Buffered audio (holes included) + decoded tail immediately before each refill. At the
-    /// low-water point only the pending refill and the safety margin are required, plus the
-    /// jitter reserve beyond one packet unless the refills keep one packet phase
-    /// (`refresh_surplus`).
-    /// Arrival phase is never audio credit. A full five seconds of observations must support a
-    /// surplus, and any lower sample vetoes a correction immediately.
+    /// low-water point only the pending refill and the safety margin are required; what the
+    /// refill timing adds is in `refresh_surplus`. Arrival phase is never audio credit. A full
+    /// five seconds of observations must support a surplus, and any lower sample vetoes a
+    /// correction immediately.
     pub(crate) fn observe_depth(&mut self, now: Instant, staged: usize, demand: usize) {
-        self.observe(now, staged, demand, true);
+        self.observe(now, staged as i64 - demand as i64, demand as i64 - staged as i64);
     }
 
-    fn observe(&mut self, now: Instant, staged: usize, demand: usize, refill: bool) {
+    /// `surplus` is the staged audio less the demand; `pending` is the demand not yet met from
+    /// played media, which places the refill (`Lead`). They differ only after PLC: its
+    /// concealment may outlast the demand, and the excess is never margin.
+    fn observe(&mut self, now: Instant, surplus: i64, pending: i64) {
         if self.last_observation.is_some_and(|at| now.saturating_duration_since(at) >= STALL) {
             self.clear_depth();
             self.above_since = None;
         }
         self.last_observation = Some(now);
-        self.observing_since.get_or_insert(now);
+        let since = *self.observing_since.get_or_insert(now);
         let packet_samples = self.packets.first_key_value().map_or(self.last_samples, |(_, p)| p.samples);
         let reserve = self.target_samples().saturating_sub(packet_samples);
-        let grain = refill.then_some((demand as u64, packet_samples));
         let sequence = self.clock == Clock::Sequence;
         let span = self.next.or_else(|| self.packets.first_key_value().map(|(&ts, _)| ts)).map(|next| {
             // Head-hold PLC has already played part of the hole at `next`.
@@ -343,14 +425,61 @@ impl JitterBuffer {
             let hole = self.packets.values().map(|p| p.samples).fold(self.last_samples, u64::min);
             Span { head, end, queued, hole, resolved: false }
         });
+        // Media consumed through this refill, while every packet lasts as long: sequence keys step
+        // one stride per packet, so only then do they give media positions.
+        let lead =
+            span.as_ref().filter(|_| self.packets.values().all(|p| p.samples == packet_samples)).and_then(|span| {
+                let position = match self.clock {
+                    Clock::Rtp => span.head.into(),
+                    Clock::Sequence => u128::from(span.head) * u128::from(packet_samples) / u128::from(FRAME),
+                };
+                Some(Lead {
+                    consumed: i64::try_from(position).ok()? + pending,
+                    elapsed: samples_between(since, now) as i64,
+                    packet: packet_samples,
+                })
+            });
+        // Latest first, each with the smallest key that arrived then or later.
+        let mut cap = u64::MAX;
+        let arrivals = self
+            .arrivals
+            .drain(..)
+            .rev()
+            .map(|(at, key)| {
+                cap = cap.min(key);
+                (at.map_or(0, |at| samples_between(at, now)), cap)
+            })
+            .collect();
         // The whole trailing window is kept (a few hundred marks), not a monotone queue:
         // hindsight can raise a recent mark above older ones.
         while self.low_water.front().is_some_and(|mark| now.saturating_duration_since(mark.at) > DEPTH_WINDOW) {
             self.low_water.pop_front();
         }
-        let base = staged as i64 - demand as i64 - SAFETY as i64;
-        self.low_water.push_back(Mark { at: now, base, reserve, grain, span });
+        let base = surplus - SAFETY as i64;
+        self.low_water.push_back(Mark { at: now, base, reserve, lead, arrivals, span });
+        self.timing = self.highest_lead().map(|ahead| (ahead, self.alike()));
         self.refresh_surplus(now);
+    }
+
+    /// Remember an arrival for the next mark (`Mark::bound`, `Mark::shifted`). Times are kept
+    /// in push order and never decrease: a packet cannot have been pushed before one pushed
+    /// ahead of it. One stamped before the last observation was not there for it, so it counts
+    /// as arriving at the next one.
+    fn record_arrival(&mut self, now: Instant, ts: u64) {
+        // A window's first mark has no refill before it to compare with.
+        let Some(last) = self.last_observation else { return };
+        let after = now > last;
+        let at = match self.arrivals.last() {
+            Some(&(previous, _)) => previous.zip(after.then_some(now)).map(|(previous, now)| previous.max(now)),
+            None => after.then_some(now),
+        };
+        if self.arrivals.len() >= MAX_PACKETS {
+            // Merge into the latest entry: its later time and the smaller key only lower it.
+            let last = self.arrivals.last_mut().unwrap();
+            *last = (at, last.1.min(ts));
+        } else {
+            self.arrivals.push((at, ts));
+        }
     }
 
     /// Revise the marks with an arrival at `ts` (neither late nor a duplicate).
@@ -371,24 +500,41 @@ impl JitterBuffer {
     /// shrink hold restarts only on a settled low mark: a dip that a later arrival proves
     /// was a loss does not cost the one-to-two-second wait again.
     ///
-    /// The marks sample the queue at refills only. When every refill in the window asks for
-    /// the same whole number of packets, all of one duration, at times that keep one phase
-    /// against the packets, a late packet meets the same phase each time, the window's
-    /// minimum already shows the dip the jitter causes, and subtracting the jitter estimate as
-    /// well counted it twice: with 25 ms of jitter a 20 ms backlog never drained
-    /// (docs/latency.md, "Level steps, second pass"). The phase may wander by `PHASE_SLACK`,
-    /// and the marks keep that much of the reserve: a delay meeting a phase that much luckier
-    /// showed that much less dip. Otherwise the refills walk through the packets (8 ms refills
-    /// over 10 ms packets, varying callbacks, durations or callback times), a delay can meet a
-    /// luckier phase than the next one, and the minimum understates what that one needs; each
-    /// mark keeps its jitter reserve then.
+    /// The marks sample the queue at refills only, and a later refill can meet a delay at a
+    /// worse point than any refill in the window did. Subtracting the jitter reserve from every
+    /// mark covered that, but the window's minimum already holds the dips the jitter caused, so
+    /// it counted the jitter twice: with 25 ms of jitter a 20 ms backlog never drained
+    /// (docs/latency.md, "Level steps, second pass"). The arrival rule covers it from the
+    /// arrivals instead. Nothing is consumed between refills, so a refill at an earlier time
+    /// would have seen this mark's queue without the packets that arrived in between. A
+    /// refill's lead (`Lead::ahead`, media consumed ahead of time) says how early it ran:
+    ///
+    /// - When the refills enter every packet alike (`alike`), each packet and each delay meets
+    ///   the same refills, earlier only by how far their leads differ. Each mark takes the
+    ///   margin it would have had at the window's highest lead: without the packets that
+    ///   arrived within that difference before it (`Mark::shifted`).
+    /// - Otherwise (refills that walk through the packets or vary in size) a delay may meet a
+    ///   refill at any point. Each mark takes the lowest margin a refill at the highest lead
+    ///   could have had just before any arrival since the previous observation, crediting the
+    ///   time it would not yet have consumed (`Mark::bound`).
+    ///
+    /// Without a lead for every mark (mixed packet durations) each mark keeps the reserve. The
+    /// rule assumes the arrival stamps are when the packets became available, and, like the
+    /// reserve with little jitter, that the sender's clock does not drift a packet across a
+    /// refill within the window.
     fn refresh_surplus(&mut self, now: Instant) {
         let Some(since) = self.observing_since else { return };
-        let reserve = self.phase_spread().filter(|&spread| spread <= PHASE_SLACK).unwrap_or(u64::MAX);
-        let minimum = self.low_water.iter().map(|mark| mark.margin(self.clock, reserve)).min().unwrap_or(0);
+        let clock = self.clock;
+        let lows = |margin: &dyn Fn(&Mark) -> u64| {
+            let minimum = self.low_water.iter().map(margin).min().unwrap_or(0);
+            (minimum, self.low_water.iter().filter(|mark| mark.settled()).map(margin).min())
+        };
+        let (minimum, settled) = match self.timing {
+            Some((ahead, true)) => lows(&|mark| mark.shifted(clock, ahead)),
+            Some((ahead, false)) => lows(&|mark| mark.bound(clock, ahead)),
+            None => lows(&|mark| mark.margin(clock)),
+        };
         self.surplus = if now.saturating_duration_since(since) >= DEPTH_WINDOW { minimum } else { 0 };
-        let settled =
-            self.low_water.iter().filter(|mark| mark.settled()).map(|mark| mark.margin(self.clock, reserve)).min();
         match settled {
             Some(low) if low < SAFETY => self.above_since = None,
             _ if minimum >= SAFETY => {
@@ -398,26 +544,54 @@ impl JitterBuffer {
         }
     }
 
-    /// How far the window's refill times wander against the packets, in samples: `None`
-    /// unless every refill asks for the same whole number of packets of one duration.
-    /// Phases are measured from the first refill, as signed distances around the packet,
-    /// so a spread is exact while it stays under half a packet (all `PHASE_SLACK` needs).
-    fn phase_spread(&self) -> Option<u64> {
-        let mut refills = self.low_water.iter().filter_map(|mark| Some((mark.at, mark.grain?)));
-        let (first, (demand, packet)) = refills.next()?;
-        if packet == 0 || demand % packet != 0 {
+    /// How far the window's refills consumed ahead of time at most, if every mark with a span
+    /// has a lead and every packet in the window lasts as long. Only refills since the last
+    /// pause count: when a later refill has consumed no more than the one before it (nothing
+    /// played, or a late packet stretched the timeline), consumption has fallen behind for
+    /// good, and the leads before it say nothing about the refills to come.
+    fn highest_lead(&self) -> Option<i64> {
+        #[cfg(test)]
+        if self.reserve_only {
             return None;
         }
-        let (mut low, mut high) = (0i64, 0i64);
-        for (at, grain) in refills {
-            if grain != (demand, packet) {
+        let mut marks = self.low_water.iter().filter(|mark| mark.span.is_some());
+        let first = marks.next()?;
+        let (mut previous, mut lead) = (first.at, first.lead?);
+        let mut highest = lead.ahead();
+        for mark in marks {
+            let next = mark.lead?;
+            if next.packet != lead.packet {
                 return None;
             }
-            let elapsed = (at.saturating_duration_since(first).as_nanos() * 48 / 1_000_000) as u64;
-            let phase = ((elapsed + packet / 2) % packet) as i64 - (packet / 2) as i64;
-            (low, high) = (low.min(phase), high.max(phase));
+            let paused = mark.at > previous && next.consumed <= lead.consumed;
+            highest = if paused { next.ahead() } else { highest.max(next.ahead()) };
+            (previous, lead) = (mark.at, next);
         }
-        Some((high - low) as u64)
+        Some(highest)
+    }
+
+    /// Whether every refill in the window enters every packet alike: all packets last as long,
+    /// and successive refills step through one fixed set of consumption points within a packet,
+    /// none skipped. Then each packet meets the same refills, at times that differ only by how
+    /// far ahead each refill consumed.
+    fn alike(&self) -> bool {
+        // `highest_lead` has checked that every packet lasts as long.
+        let leads = self.low_water.iter().filter_map(|mark| mark.lead);
+        let Some(packet) = leads.clone().next().map(|lead| lead.packet as i64) else { return false };
+        let points: std::collections::BTreeSet<i64> =
+            leads.clone().map(|lead| lead.consumed.rem_euclid(packet)).collect();
+        let mut previous: Option<i64> = None;
+        for consumed in leads.map(|lead| lead.consumed) {
+            if let Some(previous) = previous.filter(|&previous| previous != consumed) {
+                let point = previous.rem_euclid(packet);
+                let next = points.range(point + 1..).next().copied().unwrap_or(points.first().unwrap() + packet);
+                if consumed - previous != next - point {
+                    return false;
+                }
+            }
+            previous = Some(consumed);
+        }
+        true
     }
 
     pub(crate) fn pop_at(&mut self, now: Instant) -> Playout {
@@ -526,7 +700,7 @@ impl JitterBuffer {
         // (never PLC) with the refill demand this PLC left; charging the whole demand
         // again turned every loss into a dip of one refill. An empty queue still
         // vetoes shrinking for the full window unless a later arrival proves a loss.
-        self.observe(now, 0, demand.saturating_sub(samples as usize), false);
+        self.observe(now, -(demand.saturating_sub(samples as usize) as i64), demand as i64 - samples as i64);
         Playout::Conceal(samples as usize)
     }
 }
@@ -1029,9 +1203,10 @@ mod tests {
 
     /// 40 s of 10 ms packets, each delayed by up to `jitter_ms` (uniform, deterministic) and
     /// delivered in order; the first `backlog` arrive together, so playout starts that many
-    /// packets late. Returns the mean delay from send to playout over the last five seconds and
-    /// the concealments after the first ten. Cuts commit as the decoder does in quiet audio.
-    fn jittery(clock: Clock, jitter_ms: f64, backlog: u64) -> (f64, u64) {
+    /// packets late. Each refill runs up to `wander_ms` late (uniform, deterministic). Returns
+    /// the mean delay from send to playout over the last five seconds and the concealments
+    /// after the first ten. Cuts commit as the decoder does in quiet audio.
+    fn jittery(clock: Clock, jitter_ms: f64, backlog: u64, wander_ms: f64) -> (f64, u64) {
         let start = Instant::now();
         let stride = if clock == Clock::Sequence { FRAME } else { 480 };
         let mut jb = JitterBuffer::new();
@@ -1049,8 +1224,13 @@ mod tests {
             .collect();
         let (mut index, mut play) = (0, 0u64);
         let (mut tail, mut concealments) = (Vec::new(), 0);
+        let mut wander = 0x9e37_79b9_7f4a_7c15_u64;
         while play < 40 * 48_000 {
-            let now_ms = backlog as f64 * 10.0 + play as f64 / 48.0;
+            wander ^= wander << 13;
+            wander ^= wander >> 7;
+            wander ^= wander << 17;
+            let late = (wander >> 11) as f64 / (1u64 << 53) as f64 * wander_ms;
+            let now_ms = backlog as f64 * 10.0 + play as f64 / 48.0 + late;
             while arrivals.get(index).is_some_and(|&at| at <= now_ms) {
                 let at = start + Duration::from_secs_f64(arrivals[index] / 1000.0);
                 jb.push_at(index as u64 * stride, 480, vec![1], at, clock);
@@ -1082,11 +1262,26 @@ mod tests {
         for clock in [Clock::Rtp, Clock::Sequence] {
             for jitter in [15.0, 25.0] {
                 // Without a backlog, the stream settles where its late packets put it.
-                let (settled, _) = jittery(clock, jitter, 1);
+                let (settled, _) = jittery(clock, jitter, 1, 0.0);
                 // A 40 ms backlog drains to within the safety margin and one quiet cut of that
                 // level. Subtracting the jitter estimate from the low-water marks as well kept
                 // 10 ms (15 ms jitter) or all 20 ms (25 ms jitter) of the excess for good.
-                let (drained, concealments) = jittery(clock, jitter, 5);
+                let (drained, concealments) = jittery(clock, jitter, 5, 0.0);
+                assert!(drained <= settled + 5.0, "{clock:?} {jitter} ms: {drained:.1} ms, settled {settled:.1} ms");
+                assert_eq!(concealments, 0, "{clock:?} {jitter} ms");
+            }
+        }
+    }
+
+    #[test]
+    fn a_jittery_backlog_drains_when_refill_times_wander() {
+        // Live refills run whenever the playback loop wakes, never on an exact grid. The arrival
+        // rule does not depend on their timing: the same backlog drains with refills up to
+        // 2 ms late at random.
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            for jitter in [15.0, 25.0] {
+                let (settled, _) = jittery(clock, jitter, 1, 2.0);
+                let (drained, concealments) = jittery(clock, jitter, 5, 2.0);
                 assert!(drained <= settled + 5.0, "{clock:?} {jitter} ms: {drained:.1} ms, settled {settled:.1} ms");
                 assert_eq!(concealments, 0, "{clock:?} {jitter} ms");
             }
