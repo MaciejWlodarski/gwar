@@ -50,6 +50,10 @@ struct Mark {
     at: Instant,
     /// Staged audio minus demand and safety; may be negative. Debited by every cut.
     base: i64,
+    /// The jitter reserve beyond one packet at the time (`JitterBuffer::refresh_surplus`).
+    reserve: u64,
+    /// Refill demand and packet duration of a refill observation; `None` after PLC.
+    grain: Option<(u64, u64)>,
     span: Option<Span>,
 }
 
@@ -67,7 +71,7 @@ struct Span {
 }
 
 impl Mark {
-    fn margin(&self, clock: Clock) -> u64 {
+    fn margin(&self, clock: Clock, reserve: bool) -> u64 {
         let buffered = self.span.as_ref().map_or(0, |span| match clock {
             // RTP keys are sample positions: holes included, the span is the audio.
             Clock::Rtp => span.end.saturating_sub(span.head),
@@ -78,7 +82,8 @@ impl Mark {
                 present + strides.saturating_sub(packets) * span.hole
             }
         });
-        (buffered as i64 + self.base).max(0) as u64
+        let reserve = if reserve { self.reserve as i64 } else { 0 };
+        (buffered as i64 + self.base - reserve).max(0) as u64
     }
 
     /// A known lower bound: no later arrival can raise it.
@@ -302,24 +307,24 @@ impl JitterBuffer {
     }
 
     /// Buffered audio (holes included) + decoded tail immediately before each refill. At the
-    /// low-water point only the pending refill and the safety margin are required: the window's
-    /// minimum already holds every dip the jitter caused. Subtracting the jitter estimate as well
-    /// (it comes from the same arrivals) counted the jitter twice and kept as much excess as the
-    /// jitter was large: with 25 ms of jitter a 20 ms backlog never drained. Arrival phase is
-    /// never audio credit. A full five seconds of observations must support a surplus, and any
-    /// lower sample vetoes a correction immediately.
-    ///
-    /// Each observation is revised in hindsight by the arrivals after it (`Mark`). Counting
-    /// only the packets present made every loss look like a dip, and with a loss every
-    /// couple of seconds the five-second low-water rule kept a 10-20 ms residual for good
-    /// (the receiver's "level steps", docs/latency.md).
+    /// low-water point only the pending refill and the safety margin are required, plus the
+    /// jitter reserve beyond one packet unless the refills are regular (`refresh_surplus`).
+    /// Arrival phase is never audio credit. A full five seconds of observations must support a
+    /// surplus, and any lower sample vetoes a correction immediately.
     pub(crate) fn observe_depth(&mut self, now: Instant, staged: usize, demand: usize) {
+        self.observe(now, staged, demand, true);
+    }
+
+    fn observe(&mut self, now: Instant, staged: usize, demand: usize, refill: bool) {
         if self.last_observation.is_some_and(|at| now.saturating_duration_since(at) >= STALL) {
             self.clear_depth();
             self.above_since = None;
         }
         self.last_observation = Some(now);
         self.observing_since.get_or_insert(now);
+        let packet_samples = self.packets.first_key_value().map_or(self.last_samples, |(_, p)| p.samples);
+        let reserve = self.target_samples().saturating_sub(packet_samples);
+        let grain = refill.then_some((demand as u64, packet_samples));
         let sequence = self.clock == Clock::Sequence;
         let span = self.next.or_else(|| self.packets.first_key_value().map(|(&ts, _)| ts)).map(|next| {
             // Head-hold PLC has already played part of the hole at `next`.
@@ -340,7 +345,8 @@ impl JitterBuffer {
         while self.low_water.front().is_some_and(|mark| now.saturating_duration_since(mark.at) > DEPTH_WINDOW) {
             self.low_water.pop_front();
         }
-        self.low_water.push_back(Mark { at: now, base: staged as i64 - demand as i64 - SAFETY as i64, span });
+        let base = staged as i64 - demand as i64 - SAFETY as i64;
+        self.low_water.push_back(Mark { at: now, base, reserve, grain, span });
         self.refresh_surplus(now);
     }
 
@@ -361,11 +367,23 @@ impl JitterBuffer {
     /// Every mark bounds the cut, so a hole whose fate is not known yet vetoes it. The
     /// shrink hold restarts only on a settled low mark: a dip that a later arrival proves
     /// was a loss does not cost the one-to-two-second wait again.
+    ///
+    /// The marks sample the queue at refills only. When every refill in the window asks for
+    /// the same amount and every packet lasts as long, a late packet meets the same refill
+    /// phase each time, so the window's minimum already shows the dip the jitter causes, and
+    /// subtracting the jitter estimate as well counted it twice: with 25 ms of jitter a 20 ms
+    /// backlog never drained (docs/latency.md, "Level steps, second pass"). With varying
+    /// callbacks or packet durations a delay can meet a luckier phase than the next one, and
+    /// the minimum understates what that one needs; each mark keeps its jitter reserve then.
     fn refresh_surplus(&mut self, now: Instant) {
         let Some(since) = self.observing_since else { return };
-        let minimum = self.low_water.iter().map(|mark| mark.margin(self.clock)).min().unwrap_or(0);
+        let mut grains = self.low_water.iter().filter_map(|mark| mark.grain);
+        let first = grains.next();
+        let reserve = !first.is_some_and(|grain| grains.all(|other| other == grain));
+        let minimum = self.low_water.iter().map(|mark| mark.margin(self.clock, reserve)).min().unwrap_or(0);
         self.surplus = if now.saturating_duration_since(since) >= DEPTH_WINDOW { minimum } else { 0 };
-        let settled = self.low_water.iter().filter(|mark| mark.settled()).map(|mark| mark.margin(self.clock)).min();
+        let settled =
+            self.low_water.iter().filter(|mark| mark.settled()).map(|mark| mark.margin(self.clock, reserve)).min();
         match settled {
             Some(low) if low < SAFETY => self.above_since = None,
             _ if minimum >= SAFETY => {
@@ -481,7 +499,7 @@ impl JitterBuffer {
         // (never PLC) with the refill demand this PLC left; charging the whole demand
         // again turned every loss into a dip of one refill. An empty queue still
         // vetoes shrinking for the full window unless a later arrival proves a loss.
-        self.observe_depth(now, 0, demand.saturating_sub(samples as usize));
+        self.observe(now, 0, demand.saturating_sub(samples as usize), false);
         Playout::Conceal(samples as usize)
     }
 }

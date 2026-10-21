@@ -641,6 +641,68 @@ mod tests {
         }
     }
 
+    /// 60 s of ordered delivery without loss; the first packet at or after every `period`
+    /// is `delay` late. Playout starts 50 ms behind. Returns the concealments.
+    fn periodic_delay(
+        clock: super::super::jitter::Clock,
+        durations: &[u64],
+        callbacks: &[usize],
+        period: u64,
+        delay: u64,
+    ) -> u64 {
+        use super::super::jitter::Clock;
+        let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
+        let mut slot = Slot::new().unwrap();
+        let start = Instant::now();
+        let (mut arrivals, mut media, mut last, mut boundary) = (Vec::new(), 0u64, 0u64, 0u64);
+        for i in 0.. {
+            let n = durations[i % durations.len()];
+            let late = if media >= boundary + period {
+                boundary += period;
+                delay
+            } else {
+                0
+            };
+            let time = (media + late).saturating_sub(2400).max(last);
+            last = time;
+            let key = if clock == Clock::Sequence { i as u64 * 960 } else { media };
+            arrivals.push((time, key, n, encode_n(&encoder, false, n as usize)));
+            media += n;
+            if media > 61 * 48_000 {
+                break;
+            }
+        }
+        let mut arrivals = arrivals.into_iter().peekable();
+        let mut tick = 0u64;
+        for &callback in callbacks.iter().cycle() {
+            if tick >= 60 * 48_000 {
+                break;
+            }
+            let now = start + Duration::from_secs_f64(tick as f64 / 48_000.0);
+            while let Some((time, key, n, data)) = arrivals.next_if(|a| a.0 <= tick) {
+                slot.buffer.push_at(key, n, data, start + Duration::from_secs_f64(time as f64 / 48_000.0), clock);
+            }
+            slot.mix_refill(&mut vec![0.0; callback], 1.0, now, callback).unwrap();
+            tick += callback as u64;
+        }
+        slot.buffer.concealments
+    }
+
+    #[test]
+    fn rare_delays_with_varying_callbacks_or_durations_keep_the_jitter_reserve() {
+        // Each delay falls on another refill phase, so the five-second minimum can understate
+        // the next one's need. Without the jitter reserve these gave 4 and 2 concealments.
+        use super::super::jitter::Clock;
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            // 10 ms packets, callbacks cycling 10/20/5 ms, 35 ms late every 4.8 s.
+            let varying_callbacks = periodic_delay(clock, &[480], &[480, 960, 240], 4800 * 48, 35 * 48);
+            assert!(varying_callbacks <= 1, "{clock:?}: {varying_callbacks}");
+            // 40/2.5/10/5/40 ms packets, 10 ms callbacks, 5 ms late after every 3 s.
+            let varying_durations = periodic_delay(clock, &[1920, 120, 480, 240, 1920], &[480], 3 * 48_000, 5 * 48);
+            assert_eq!(varying_durations, 0, "{clock:?}");
+        }
+    }
+
     #[test]
     fn recurring_loss_rtp_drains_surplus_and_retains_jitter() {
         recurring_loss_and_jitter(super::super::jitter::Clock::Rtp);
