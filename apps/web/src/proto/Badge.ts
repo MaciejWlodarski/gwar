@@ -9,4 +9,9 @@ export type Badge = { kind: BadgeKind, id: number, name: string,
 /**
  * TeamSpeak's sort id: lower comes first.
  */
-sort: number, };
+sort: number, 
+/**
+ * The group's icon as an image token: a short name the TeamSpeak connection serves the
+ * image by (never a URL), present once the image is there.
+ */
+icon?: string | null, };

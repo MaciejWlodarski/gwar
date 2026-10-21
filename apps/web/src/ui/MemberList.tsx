@@ -48,7 +48,7 @@ function MemberRow({ entry, mine, now }: { entry: MemberEntry; mine: boolean; no
               )}
             >
               <span className={cn("shrink-0", offline && "opacity-50")}>
-                <Avatar name={entry.nickname} seed={entry.uid} size={24} />
+                <Avatar name={entry.nickname} seed={entry.uid} uid={entry.uid} size={24} />
               </span>
               <span className="min-w-0 flex-1 leading-tight">
                 <span

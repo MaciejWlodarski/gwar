@@ -191,7 +191,7 @@ export const MessageRow = memo(function MessageRow({
     >
       <div className="w-10 shrink-0">
         {row.first ? (
-          <Avatar name={authorName} seed={msg.author_uid} size={40} className="mt-0.5" />
+          <Avatar name={authorName} seed={msg.author_uid} uid={msg.author_uid} size={40} className="mt-0.5" />
         ) : (
           // Always laid out (only hidden), one text line high: hovering never moves the chat.
           <time

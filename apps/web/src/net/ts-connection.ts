@@ -22,6 +22,7 @@ import {
 } from "./connection";
 import { parseFrame } from "./frames";
 import { displayData } from "../lib/text";
+import { imageTokens, TsImages } from "./ts-images";
 import type { EventData, EventName, Op, RequestInput, ResponseMap } from "./protocol";
 
 export interface TsConnectionOptions {
@@ -74,6 +75,13 @@ export class TsConnection implements Link {
   private hasBeenOnline = false;
   /** Events that arrive before the Welcome has been handed out wait here. */
   private held: Event[] | null = null;
+  /** The server's icons and avatars, by the tokens in the shapes. */
+  private readonly images = new TsImages(async (token) => {
+    const api = this.api;
+    const session = this.session;
+    if (!api || !session) return null;
+    return api.invoke<ArrayBuffer>("ts_image", { session, token });
+  });
 
   constructor(private readonly options: TsConnectionOptions) {}
 
@@ -159,6 +167,7 @@ export class TsConnection implements Link {
     this.session = 0;
     for (const fn of this.unlisten.splice(0)) fn();
     if (session && this.api) void this.api.invoke("ts_disconnect", { session }).catch(() => {});
+    this.images.clear();
     if (this.status_.state !== "closed") this.setStatus({ state: "closed", reason: { kind: "user" } });
   }
 
@@ -171,6 +180,7 @@ export class TsConnection implements Link {
 
   /** Hands out the Welcome, then the events that raced it. */
   private deliverWelcome(welcome: Welcome, resync: boolean): void {
+    this.images.request(imageTokens({ welcome }));
     for (const h of [...this.welcomeHandlers]) h(welcome, resync);
     const held = this.held ?? [];
     this.held = null;
@@ -197,6 +207,7 @@ export class TsConnection implements Link {
 
   private route(event: Event): void {
     if (event.ev === "disconnected") this.serverReason = event.d.reason;
+    this.images.request(imageTokens({ event }));
     const set = this.eventHandlers.get(event.ev);
     if (set) for (const h of [...set]) h(event.d as never);
     for (const h of [...this.anyHandlers]) h(event);

@@ -7,7 +7,7 @@ import { useSession, useUi } from "../state/stores";
 import { ChannelTree } from "./ChannelTree";
 import { usePermission } from "./hooks";
 import { menuContent, menuItem, menuItemDanger, menuSeparator } from "./kit";
-import { TeamSpeakBadge } from "./badges";
+import { TeamSpeakBadge, TsIcon } from "./badges";
 import { VoicePanel } from "./VoicePanel";
 
 function ServerHeader() {
@@ -49,6 +49,7 @@ function ServerHeader() {
         >
           <span className="min-w-0 flex-1">
             <span className="flex items-center gap-1.5">
+              {kind === "teamspeak" && <TsIcon token={server?.icon} />}
               <span className="truncate text-[15px] font-semibold leading-tight">{server?.name}</span>
               {kind === "teamspeak" && <TeamSpeakBadge />}
             </span>

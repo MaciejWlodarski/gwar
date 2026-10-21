@@ -189,6 +189,7 @@ mod tests {
             access: None,
             overrides: Vec::new(),
             synced: false,
+            icon: None,
         }
     }
 

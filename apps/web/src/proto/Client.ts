@@ -26,4 +26,8 @@ sharing?: boolean,
 /**
  * TeamSpeak servers only: the channel group in the current channel.
  */
-channel_group?: number | null, };
+channel_group?: number | null, 
+/**
+ * TeamSpeak servers only: the avatar, as an [image token](Badge::icon).
+ */
+avatar?: string | null, };

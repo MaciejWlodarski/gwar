@@ -117,6 +117,7 @@ pub fn run() {
             ts::ts_connect,
             ts::ts_request,
             ts::ts_disconnect,
+            ts::ts_image,
             ts_identity::ts_identity_list,
             ts_identity::ts_identity_parse,
             ts_identity::ts_identity_generate,

@@ -552,6 +552,7 @@ impl Core {
             teamspeak: config.teamspeak,
             server_chat: store.server_chat()?,
             badges: Vec::new(),
+            icon: None,
         };
         let groups = store.groups()?.into_iter().map(|g| (g.id, g)).collect();
         let mls_commit_clock = store.meta("mls_commit_clock")?.map(|s| s.parse()).transpose()?.unwrap_or(0);
@@ -2734,6 +2735,7 @@ fn channel_view(row: &ChannelRow) -> Channel {
         access: row.access.clone(),
         overrides: row.overrides.clone(),
         synced: row.synced,
+        icon: None,
     }
 }
 
@@ -2755,6 +2757,7 @@ fn client_view(s: &Session) -> Client {
         server_deafened: s.server_deafened,
         sharing: s.sharing.is_some(),
         channel_group: None,
+        avatar: None,
     }
 }
 

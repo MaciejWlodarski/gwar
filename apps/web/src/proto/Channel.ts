@@ -30,4 +30,8 @@ overrides?: Array<ChannelOverride>,
 /**
  * A subchannel that uses its parent's overrides.
  */
-synced: boolean, };
+synced: boolean, 
+/**
+ * TeamSpeak servers only: the channel's icon, as an [image token](Badge::icon).
+ */
+icon?: string | null, };
