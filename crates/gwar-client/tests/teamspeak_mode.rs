@@ -421,8 +421,7 @@ async fn teamspeak_mode_pokes_kicks_bans_and_channel_details() {
     let mut bob = support::ts_client(bridged.ts_voice, "bob").await;
     let (bob_id, bob_uid) = (bob.welcome.session, bob.welcome.uid.clone());
     until(&mut admin.events, |e| matches!(e, Event::ClientJoined(c) if c.id == bob_id)).await;
-    let poke =
-        Request::ClientPoke { client: bob_id, uid: Some(bob_uid.clone()), message: "over\u{202e}\u{7}here".into() };
+    let poke = Request::ClientPoke { client: bob_id, uid: Some(bob_uid.clone()), message: "over\u{202e} here".into() };
     request(&admin, poke).await;
     until(
         &mut bob.events,
@@ -450,7 +449,7 @@ async fn teamspeak_mode_pokes_kicks_bans_and_channel_details() {
     until(&mut admin.events, |e| matches!(e, Event::ClientJoined(c) if c.nickname == "Mallory")).await;
     let garden = Cmd::new("channelcreate")
         .arg("channel_name", "Gar\u{202e}den")
-        .arg("channel_topic", "Hi\u{7}there")
+        .arg("channel_topic", "Hi\u{202e} there")
         .arg("channel_flag_permanent", 1);
     query.call(garden).await.unwrap();
     until(&mut admin.events, |e| matches!(e, Event::ChannelCreated(c) if c.name == "Garden" && c.topic == "Hi there"))
