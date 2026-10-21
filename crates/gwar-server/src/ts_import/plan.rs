@@ -33,10 +33,11 @@ const MAX_SERVER_NAME: usize = 64;
 const MAX_WELCOME: usize = 1000;
 const MAX_OVERRIDES: usize = 100;
 
-/// `text` as Gwar takes it: no control characters (but line breaks where `lines`), trimmed, at
-/// most `max` characters.
+/// `text` as Gwar takes it: no control characters (but line breaks where `lines`) or bidi
+/// formatting, trimmed, at most `max` characters.
 fn fit(text: &str, max: usize, lines: bool) -> String {
-    let kept: String = text.chars().filter(|c| !c.is_control() || (lines && *c == '\n')).collect();
+    let kept: String =
+        text.chars().filter(|&c| !crate::teamspeak::bidi(c) && (!c.is_control() || (lines && c == '\n'))).collect();
     kept.trim().chars().take(max).collect::<String>().trim_end().to_owned()
 }
 
@@ -401,9 +402,36 @@ pub fn plan(source: &Source, options: &Options) -> Result<Plan> {
     for cid in kept.keys() {
         *name_count.entry(channel_name(&kept, *cid)).or_default() += 1;
     }
+    // Siblings whose names differ only by what `fit` drops (or past its length) share a path:
+    // no key can tell them apart, so none of them takes a password from the file.
+    let mut path_count: BTreeMap<&str, usize> = BTreeMap::new();
+    for path in paths.values() {
+        *path_count.entry(path.as_str()).or_default() += 1;
+    }
+    // A key that is a channel's path names that channel; any other key may be a unique name, as
+    // typed or written as a path writes it. A key reaching two channels so would give both its
+    // password: refused.
+    let mut by_name: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+    for cid in kept.keys() {
+        let name = channel_name(&kept, *cid);
+        if name_count[name.as_str()] == 1 {
+            by_name.entry(name.replace('\\', "\\\\").replace('/', "\\/")).or_default().insert(*cid);
+            by_name.entry(name).or_default().insert(*cid);
+        }
+    }
     for key in options.passwords.keys().filter(|k| k.as_str() != SERVER_PASSWORD) {
-        if !paths.values().any(|p| p == key) && name_count.get(key).is_some_and(|n| *n > 1) {
-            bail!("the passwords file names \"{key}\", which several channels are called: write the channel's path");
+        match path_count.get(key.as_str()) {
+            Some(n) if *n > 1 => {
+                bail!("the passwords file names \"{key}\", the path of several channels: set their passwords in Gwar")
+            }
+            Some(_) => {}
+            None if name_count.get(key).is_some_and(|n| *n > 1) => {
+                bail!("the passwords file names \"{key}\", which several channels are called: write the channel's path")
+            }
+            None if by_name.get(key).is_some_and(|ids| ids.len() > 1) => {
+                bail!("the passwords file names \"{key}\", which could mean several channels: write the channel's path")
+            }
+            None => {}
         }
     }
     let mut queue: Vec<Option<u64>> = vec![None];
@@ -457,13 +485,20 @@ pub fn plan(source: &Source, options: &Options) -> Result<Plan> {
             }
             let overrides = merge_overrides(overrides);
             let password = if c.get("channel_flag_password").is_some_and(|f| f == "1") {
+                let shared = path_count[path.as_str()] > 1;
                 // A top-level channel called like the server's key cannot be named in the file.
-                if path != SERVER_PASSWORD {
+                if path != SERVER_PASSWORD && !shared {
                     plan.password_keys.push(path.clone());
                 }
                 if options.drop_passwords {
                     plan.notes.push(format!("\"{path}\": password dropped (--drop-passwords)."));
                     Password::Dropped
+                } else if shared {
+                    plan.notes.push(format!(
+                        "\"{path}\": several channels have this path, so the passwords file cannot name it; \
+                         imported locked with a random password (set a new one in Gwar)."
+                    ));
+                    Password::Locked
                 } else {
                     let escaped_name = name.replace('\\', "\\\\").replace('/', "\\/");
                     let key = if path == SERVER_PASSWORD {
@@ -472,9 +507,9 @@ pub fn plan(source: &Source, options: &Options) -> Result<Plan> {
                         Some(path.as_str())
                     } else if name_count[name.as_str()] == 1 {
                         // The name as typed, or written as a path is (`\\` for a backslash).
-                        [name.as_str(), escaped_name.as_str()]
-                            .into_iter()
-                            .find(|n| *n != SERVER_PASSWORD && options.passwords.contains_key(*n))
+                        [name.as_str(), escaped_name.as_str()].into_iter().find(|n| {
+                            *n != SERVER_PASSWORD && !path_count.contains_key(*n) && options.passwords.contains_key(*n)
+                        })
                     } else {
                         None
                     };

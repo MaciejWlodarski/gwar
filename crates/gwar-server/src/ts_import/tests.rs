@@ -748,3 +748,82 @@ fn a_channel_without_a_topic_takes_its_descriptions_first_line() {
     let planned = plan(&s, &Options::default());
     assert_eq!(planned.channels.iter().find(|c| c.name == "Clan").unwrap().topic, "");
 }
+
+#[test]
+fn imported_names_and_texts_lose_bidi_formatting() {
+    let mut s = source();
+    s.server.insert("virtualserver_name".into(), "Old\u{202e} TS".into());
+    s.channels[1].insert("channel_name".into(), "Cl\u{2066}an\u{2069}".into());
+    s.channels[0].insert("channel_topic".into(), "Wel\u{200f}come".into());
+    s.clients[0].insert("client_nickname".into(), "Bo\u{202e}ss".into());
+    s.bans[0].insert("lastnickname".into(), "Tro\u{061c}ll".into());
+    s.bans[0].insert("reason".into(), "sp\u{202d}am".into());
+    let planned = plan(&s, &Options::default());
+    assert_eq!(planned.server_name.as_deref(), Some("Old TS"));
+    assert!(planned.channels.iter().any(|c| c.name == "Clan"));
+    assert!(planned.channels.iter().any(|c| c.name == "Lobby" && c.topic == "Welcome"));
+    assert!(planned.members.iter().any(|m| m.nickname == "Boss"));
+    let ban = &planned.bans.iter().find(|b| b.ts_id == 1).unwrap().ban;
+    assert_eq!((ban.nickname.as_str(), ban.reason.as_deref()), ("Troll", Some("spam")));
+}
+
+#[test]
+fn channels_that_clean_to_one_path_take_no_password_from_the_file() {
+    let mut s = source();
+    // Clan/Room and a sibling that differs only by a bidi character, both with a password.
+    let mut twin = s.channels[2].clone();
+    twin.insert("cid".into(), "8".into());
+    twin.insert("channel_name".into(), "Ro\u{202e}om".into());
+    twin.insert("channel_flag_password".into(), "1".into());
+    s.channels.push(twin);
+    s.channels[2].insert("channel_flag_password".into(), "1".into());
+    let with = |pairs: &[(&str, &str)]| Options {
+        passwords: pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
+        ..Default::default()
+    };
+    let error = super::plan::plan(&s, &with(&[("Clan/Room", "secret")])).unwrap_err().to_string();
+    assert!(error.contains("several channels"), "{error}");
+    let planned = plan(&s, &Options::default());
+    let rooms: Vec<_> = planned.channels.iter().filter(|c| c.name == "Room").collect();
+    assert_eq!(rooms.len(), 2);
+    assert!(rooms.iter().all(|c| c.password == Password::Locked));
+    assert!(!planned.password_keys.iter().any(|k| k == "Clan/Room"));
+    assert!(!super::plan::passwords_template(&planned).contains("Clan/Room"));
+    assert!(planned.notes.iter().any(|n| n.contains("\"Clan/Room\"") && n.contains("several channels have this path")));
+}
+
+#[test]
+fn a_password_key_names_one_channel_only() {
+    let with = |pairs: &[(&str, &str)]| Options {
+        passwords: pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
+        ..Default::default()
+    };
+    let channel = |cid: &str, pid: &str, name: &str| {
+        r(&[
+            ("cid", cid),
+            ("pid", pid),
+            ("channel_order", "9"),
+            ("channel_name", name),
+            ("channel_topic", ""),
+            ("channel_flag_permanent", "1"),
+            ("channel_maxclients", "-1"),
+            ("channel_flag_password", "1"),
+        ])
+    };
+    // A top-level channel whose cleaned name is the path of Clan/Room: the path wins.
+    let mut s = source();
+    s.channels[2].insert("channel_flag_password".into(), "1".into());
+    s.channels.push(channel("8", "0", "Cl\u{202e}an/Room"));
+    let planned = plan(&s, &with(&[("Clan/Room", "secret")]));
+    let password = |name: &str, parent: Option<u64>| {
+        planned.channels.iter().find(|c| c.name == name && c.parent == parent).unwrap().password.clone()
+    };
+    assert_eq!(password("Room", Some(2)), Password::Kept("secret".into()));
+    assert_eq!(password("Clan/Room", None), Password::Locked);
+    // Clan/"p/q" written as a name is "p\/q", which is also how a top-level "p\/q" is typed.
+    let mut s = source();
+    s.channels.push(channel("8", "2", "p/q"));
+    s.channels.push(channel("9", "0", "p\\/q"));
+    let error = super::plan::plan(&s, &with(&[("p\\/q", "x")])).unwrap_err().to_string();
+    assert!(error.contains("could mean several channels"), "{error}");
+}
