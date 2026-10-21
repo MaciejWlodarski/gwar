@@ -79,17 +79,17 @@ pub(super) struct Participation {
     ack_bucket: Bucket,
     repeat_bucket: Bucket,
 }
-struct Bucket {
+pub(super) struct Bucket {
     tokens: f64,
     at: Instant,
     rate: f64,
     burst: f64,
 }
 impl Bucket {
-    fn new(rate: f64, burst: f64) -> Self {
+    pub(super) fn new(rate: f64, burst: f64) -> Self {
         Self { tokens: burst, at: Instant::now(), rate, burst }
     }
-    fn take(&mut self) -> Result<(), ErrorBody> {
+    pub(super) fn take(&mut self) -> Result<(), ErrorBody> {
         let now = Instant::now();
         self.tokens = (self.tokens + now.duration_since(self.at).as_secs_f64() * self.rate).min(self.burst);
         self.at = now;
@@ -311,7 +311,7 @@ impl Core {
         }
         Ok(())
     }
-    fn voice_check(&self, session: SessionId, binding: &VoiceParticipation) -> Result<ChannelId, ErrorBody> {
+    pub(super) fn voice_check(&self, session: SessionId, binding: &VoiceParticipation) -> Result<ChannelId, ErrorBody> {
         if gwar_proto::decode_fixed::<16>(&binding.call).is_none()
             || gwar_proto::decode_fixed::<16>(&binding.participation).is_none()
         {

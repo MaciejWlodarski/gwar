@@ -1,7 +1,8 @@
 # Screen sharing (design)
 
 Status: **design, with the owner's decisions of 2026-10-21 folded in**
-([Owner decisions](#owner-decisions)). Nothing here is built yet. Phase 1
+([Owner decisions](#owner-decisions)). Built so far: the share state and its
+protocol (PR 2), without media. Phase 1
 goes through the server's SFU. Peer-to-peer sharing comes later and is only
 sketched at the end. The spike code was thrown away; only its results are
 kept here ([Spikes](#spikes)).

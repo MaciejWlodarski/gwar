@@ -656,6 +656,8 @@ export const pl: Record<Key, string> = {
   "perm.connect.hint": "Dołączanie do rozmowy głosowej na kanale.",
   "perm.speak": "Mówienie",
   "perm.speak.hint": "Bycie słyszanym w rozmowie na kanale.",
+  "perm.share_screen": "Udostępnianie ekranu",
+  "perm.share_screen.hint": "Udostępnianie ekranu, okna albo karty w rozmowie na kanale.",
   "perm.send_messages": "Pisanie wiadomości",
   "perm.send_messages.hint": "Pisanie na czacie kanału (i na czacie serwera).",
   "perm.section.voice": "Głos",

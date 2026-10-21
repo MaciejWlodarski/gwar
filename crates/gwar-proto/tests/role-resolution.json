@@ -1,0 +1,105 @@
+{
+  "groups": [
+    { "id": 1, "permissions": ["administrator"] },
+    { "id": 2, "permissions": ["create_invites", "attach_files", "connect", "speak", "send_messages", "share_screen"] },
+    { "id": 3, "permissions": [] },
+    { "id": 4, "permissions": ["mute_members", "bypass_password"] }
+  ],
+  "channels": [
+    { "id": 10, "parent": null, "synced": false, "overrides": [] },
+    {
+      "id": 20,
+      "parent": null,
+      "synced": false,
+      "overrides": [
+        { "role": 2, "allow": [], "deny": ["connect"] },
+        { "role": 3, "allow": ["connect"], "deny": [] }
+      ]
+    },
+    { "id": 21, "parent": 20, "synced": true, "overrides": [] },
+    {
+      "id": 30,
+      "parent": null,
+      "synced": false,
+      "overrides": [
+        { "role": 2, "allow": [], "deny": ["share_screen"] },
+        { "role": 4, "allow": ["share_screen"], "deny": [] },
+        { "user": "dave", "allow": [], "deny": ["share_screen", "speak"] }
+      ]
+    },
+    {
+      "id": 40,
+      "parent": null,
+      "synced": false,
+      "overrides": [
+        { "role": 2, "allow": [], "deny": ["connect"] },
+        { "user": "erin", "allow": ["share_screen", "speak"], "deny": [] }
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "name": "a member holds the Member role's permissions",
+      "uid": "carol",
+      "groups": [2],
+      "channel": 10,
+      "expect": ["attach_files", "connect", "create_invites", "send_messages", "share_screen", "speak"]
+    },
+    {
+      "name": "without connect there is no speaking or sharing",
+      "uid": "carol",
+      "groups": [2],
+      "channel": 20,
+      "expect": ["attach_files", "create_invites", "send_messages"]
+    },
+    {
+      "name": "a role's allow brings connect, and with it speaking and sharing, back",
+      "uid": "alice",
+      "groups": [2, 3],
+      "channel": 20,
+      "expect": ["attach_files", "connect", "create_invites", "send_messages", "share_screen", "speak"]
+    },
+    {
+      "name": "a synced subchannel follows its parent",
+      "uid": "carol",
+      "groups": [2],
+      "channel": 21,
+      "expect": ["attach_files", "create_invites", "send_messages"]
+    },
+    {
+      "name": "the Member role's deny takes sharing away",
+      "uid": "carol",
+      "groups": [2],
+      "channel": 30,
+      "expect": ["attach_files", "connect", "create_invites", "send_messages", "speak"]
+    },
+    {
+      "name": "another role's allow beats the Member role's deny",
+      "uid": "frank",
+      "groups": [2, 4],
+      "channel": 30,
+      "expect": ["attach_files", "bypass_password", "connect", "create_invites", "mute_members", "send_messages", "share_screen", "speak"]
+    },
+    {
+      "name": "the member's own deny beats their roles' allow",
+      "uid": "dave",
+      "groups": [2, 4],
+      "channel": 30,
+      "expect": ["attach_files", "bypass_password", "connect", "create_invites", "mute_members", "send_messages"]
+    },
+    {
+      "name": "an allow of sharing without connect stays off",
+      "uid": "erin",
+      "groups": [2],
+      "channel": 40,
+      "expect": ["attach_files", "create_invites", "send_messages"]
+    },
+    {
+      "name": "administrators skip overrides",
+      "uid": "root",
+      "groups": [1, 2],
+      "channel": 40,
+      "expect": "all"
+    }
+  ]
+}

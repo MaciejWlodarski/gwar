@@ -72,7 +72,9 @@ impl Core {
             apply(&mut held, o);
         }
         if !held.contains(&Permission::Connect) {
-            held.remove(&Permission::Speak);
+            for p in Permission::NEEDS_CONNECT {
+                held.remove(&p);
+            }
         }
         held
     }
@@ -258,6 +260,8 @@ impl Core {
                 let _ = self.channel_leave(session);
             }
         }
+        // Who may watch or share can have changed too.
+        self.enforce_watch_where(within);
         // Who may speak can have changed as well: the SFU follows.
         self.publish_routing();
     }
@@ -316,5 +320,61 @@ impl Core {
             let view = channel_view(row);
             self.broadcast_channel(Event::ChannelUpdated(view));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::expiry_tests::{on_core, test_core};
+    use super::*;
+    use crate::store::Store;
+    use serde_json::Value;
+
+    /// The resolution vectors the web client checks too (`channel-permissions.test.ts`).
+    #[tokio::test]
+    async fn channel_permissions_follow_the_shared_vectors() {
+        let vectors: Value =
+            serde_json::from_str(include_str!("../../../gwar-proto/tests/role-resolution.json")).unwrap();
+        let core = test_core(Store::in_memory().unwrap(), None);
+        on_core(&core, move |core| {
+            let parse = |v: &Value| serde_json::from_value::<Vec<Permission>>(v.clone()).unwrap();
+            let template = core.channels.values().next().unwrap().clone();
+            core.groups.clear();
+            for (position, g) in vectors["groups"].as_array().unwrap().iter().enumerate() {
+                let id = g["id"].as_u64().unwrap() as GroupId;
+                let group = gwar_proto::Group {
+                    id,
+                    name: format!("g{id}"),
+                    permissions: parse(&g["permissions"]),
+                    color: None,
+                    position: position as u32,
+                    hoist: false,
+                    mentionable: false,
+                };
+                core.groups.insert(id, group);
+            }
+            core.channels.clear();
+            for c in vectors["channels"].as_array().unwrap() {
+                let row = crate::store::ChannelRow {
+                    id: c["id"].as_u64().unwrap() as ChannelId,
+                    parent: c["parent"].as_u64().map(|p| p as ChannelId),
+                    synced: c["synced"].as_bool().unwrap(),
+                    overrides: serde_json::from_value(c["overrides"].clone()).unwrap(),
+                    ..template.clone()
+                };
+                core.channels.insert(row.id, row);
+            }
+            for case in vectors["cases"].as_array().unwrap() {
+                let groups: Vec<GroupId> = serde_json::from_value(case["groups"].clone()).unwrap();
+                let channel = case["channel"].as_u64().unwrap() as ChannelId;
+                let held = core.channel_permissions(case["uid"].as_str().unwrap(), &groups, channel);
+                let expected: BTreeSet<Permission> = match &case["expect"] {
+                    Value::String(all) if all == "all" => Permission::ALL.into_iter().collect(),
+                    list => parse(list).into_iter().collect(),
+                };
+                assert_eq!(held, expected, "{}", case["name"]);
+            }
+        })
+        .await;
     }
 }

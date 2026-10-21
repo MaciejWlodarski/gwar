@@ -2753,3 +2753,17 @@ async fn native_sframe_receiver_decodes_eight_senders_on_all_slots() {
     let level = (tail.iter().map(|s| s * s).sum::<f32>() / tail.len().max(1) as f32).sqrt();
     assert!(level > 0.05, "the receiver played the mixed senders: rms {level}");
 }
+
+#[tokio::test]
+async fn screen_sharing_waits_for_encrypted_channels() {
+    let server = TestServer::start().await;
+    let mut parent = Device::new(1, 11);
+    let device = Device::new(1, 11);
+    let mut client = connect_device(&server, &device).await;
+    client.ok("token.redeem", json!({"token":server.admin_token})).await;
+    let channel = channel_id(&client.create_channel(json!({"name":"voice","encrypted":true})).await);
+    create_channel_group(&mut client, &mut parent, channel, true, 60).await.unwrap();
+    participation(&mut client, channel).await;
+    // Until its frames are encrypted with the call's keys (docs/screen-share.md, PR 7).
+    assert_eq!(client.screen_start().await.unwrap_err().code, gwar_proto::ErrorCode::Unavailable);
+}

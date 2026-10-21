@@ -590,6 +590,26 @@ impl Client {
     pub async fn create_channel(&mut self, d: Value) -> Value {
         self.ok("channel.create", d).await
     }
+
+    /// `screen.start` from the voice channel one is in.
+    pub async fn screen_start(&mut self) -> Result<Value, ErrorBody> {
+        let voice = self.ok("voice.state", json!({})).await["voice"].clone();
+        let start = json!({
+            "call": voice["call"].as_str().unwrap_or("AAAAAAAAAAAAAAAAAAAAAA"),
+            "participation": voice["participation"].as_str().unwrap_or("AAAAAAAAAAAAAAAAAAAAAA"),
+            "preset": "text",
+            "surface": "window",
+            "guest_link": false,
+        });
+        self.request("screen.start", start).await
+    }
+
+    /// Joins `channel`'s voice and shares there; returns the share's id.
+    pub async fn share_in(&mut self, channel: u32) -> String {
+        self.ok("channel.join", json!({"channel": channel})).await;
+        let share = self.screen_start().await.expect("screen.start");
+        share["share"].as_str().expect("share id").to_owned()
+    }
 }
 
 /// A client holding the Admin group (redeems the server's first-start token).

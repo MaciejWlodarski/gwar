@@ -654,6 +654,8 @@ export const en = {
   "perm.connect.hint": "Join a channel's voice.",
   "perm.speak": "Speak",
   "perm.speak.hint": "Be heard in a channel's voice.",
+  "perm.share_screen": "Share screen",
+  "perm.share_screen.hint": "Share a screen, window or tab in a channel's voice.",
   "perm.send_messages": "Send messages",
   "perm.send_messages.hint": "Write in a channel's chat (and in server chat).",
   "perm.section.voice": "Voice",

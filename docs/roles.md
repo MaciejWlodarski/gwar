@@ -66,12 +66,14 @@ channels; roles carry them as defaults, and channels override them.
 | `attach_files` | channel | attach files | `file_upload` |
 | `manage_messages` | channel | delete others' messages | `message_manage` |
 | `move_members` | channel | move people into and out of it | `client_move` |
-| `mute_members` | channel | mute or deafen someone for everyone in it | — (new) |
+| `mute_members` | channel | mute or deafen someone for everyone in it; stop someone's screen share | — (new) |
+| `share_screen` | channel | share a screen, window or tab in its voice (docs/screen-share.md) | — (new) |
 | `manage_channels` | channel | create subchannels, edit, move and delete it, edit its overrides | `channel_create`, `channel_edit`, `channel_delete` |
 
 Step 1 has the twelve that replace today's permissions; `connect`, `speak`,
 `send_messages` (step 2) and `mute_members` (step 3) come with overrides and
-voice moderation.
+voice moderation; `share_screen` comes with screen sharing. Watching a share
+needs no permission of its own (docs/screen-share.md, "Permission").
 
 Who **sees** a channel is not a permission: a channel is public, or private
 and admits the roles and members on its list (below, "Private and encrypted
@@ -103,11 +105,12 @@ For member *m* in channel *c*:
    3. *m*'s own member override.
 4. Dependencies: in a channel one is not admitted to (a private channel not
    listing them) every channel permission is off; without `connect`, `speak`
-   is off.
+   and `share_screen` are off.
 
 This is Discord's order, so the result is what people expect from there; the
 same function runs on the server (authoritative) and in the clients (to show
-what one can do), checked against shared test vectors.
+what one can do), checked against shared test vectors
+(`crates/gwar-proto/tests/role-resolution.json`).
 
 ### Rank: who may act on whom
 

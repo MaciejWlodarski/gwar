@@ -21,6 +21,7 @@ mod overrides;
 mod owner;
 pub(crate) mod passwords;
 mod private;
+mod screen;
 mod sealed;
 mod voice;
 
@@ -304,6 +305,8 @@ struct Session {
     voice: bool,
     participation: Option<voice::Participation>,
     used_ssrcs: BTreeSet<u32>,
+    /// The share this session runs (`Client.sharing`); it ends when the session leaves voice.
+    sharing: Option<String>,
     /// `None` for remote sessions, which live on a bridged server.
     out: Option<OutboundTx>,
     /// Bearer token for file downloads (see [`gwar_proto::FileAccess`]); empty for remote sessions.
@@ -375,6 +378,10 @@ pub struct Core {
     #[cfg(test)]
     voice_parent_loads: std::cell::Cell<usize>,
     voice_bindings: Arc<ArcSwap<HashMap<SessionId, gwar_proto::VoiceBinding>>>,
+    /// Running screen shares by id.
+    shares: BTreeMap<String, screen::Share>,
+    /// `screen.start` rate per session.
+    screen_starts: HashMap<SessionId, voice::Bucket>,
 }
 
 /// Messages with ids at or above this value are delivered live and not stored.
@@ -597,6 +604,8 @@ impl Core {
             #[cfg(test)]
             voice_parent_loads: std::cell::Cell::new(0),
             voice_bindings: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            shares: BTreeMap::new(),
+            screen_starts: HashMap::new(),
         };
         core.refresh_all_private();
         core.mls_reconcile()?;
@@ -763,6 +772,11 @@ impl Core {
                     | Event::ChatSealed(_)
                     | Event::ChatSealedRemoved { .. }
                     | Event::ChatRead { target: gwar_proto::ChatReadTarget::Conversation { .. }, .. }
+                    // TeamSpeak hears of shares through watch links (PR 6) only.
+                    | Event::ScreenStarted(_)
+                    | Event::ScreenStopped { .. }
+                    | Event::ScreenViewers { .. }
+                    | Event::ScreenLink { .. }
             )
         {
             // The bridge is never admitted to a private channel.
@@ -799,6 +813,7 @@ impl Core {
                 EventView::Hidden
             }
             Event::ChatDeleted { channel, .. } if hidden(*channel) => EventView::Hidden,
+            Event::ScreenStarted(share) if hidden(share.channel) => EventView::Hidden,
             Event::ChatRead { target: gwar_proto::ChatReadTarget::Channel { channel }, .. } if hidden(*channel) => {
                 EventView::Hidden
             }
@@ -873,6 +888,11 @@ impl Core {
         let after = self.admissions();
         let lost: Vec<_> = before.difference(&after).copied().filter(|(s, _)| self.sessions.contains_key(s)).collect();
         let gained: Vec<_> = after.difference(&before).copied().collect();
+        // Every session that lost a channel hears of its shares before anyone leaves it: a leave
+        // ends the leaver's share, and the others no longer see that end announced.
+        for &(session, channel) in &lost {
+            self.screen_hidden(session, channel);
+        }
         for (session, channel) in lost {
             if self.sessions[&session].channel == Some(channel) {
                 let _ = self.channel_leave(session);
@@ -897,6 +917,7 @@ impl Core {
             for client in inside {
                 self.send_event(session, Event::ClientUpdated(client));
             }
+            self.screen_shown(session, channel);
         }
     }
 
@@ -1176,6 +1197,7 @@ impl Core {
             voice: false,
             participation: None,
             used_ssrcs: BTreeSet::new(),
+            sharing: None,
             out: Some(r.out),
             file_access: files::random_id(32),
             since: self.next_connection(),
@@ -1219,6 +1241,7 @@ impl Core {
             file_access: self.sessions[&id].file_access.clone(),
             owner: self.owner_info(),
             managers: self.managers_view(),
+            shares: self.shares_for(id),
         };
         self.reply(id, r.request_id, Ok(Response::Welcome(Box::new(welcome))));
         self.broadcast(Event::ClientJoined(joined), |s| s.id != id);
@@ -1363,6 +1386,7 @@ impl Core {
             return;
         }
         let _ = self.move_client(session, None);
+        self.screen_session_gone(session);
         let Some(s) = self.sessions.remove(&session) else { return };
         self.mls_tree_requests.remove(&session);
         info!(session, uid = %s.uid, ?reason, "client left");
@@ -1491,6 +1515,7 @@ impl Core {
                     voice: true,
                     participation: None,
                     used_ssrcs: BTreeSet::new(),
+                    sharing: None,
                     out: None,
                     file_access: String::new(),
                     since: self.next_connection(),
@@ -1704,6 +1729,12 @@ impl Core {
             Request::VoiceState {} => Ok(Response::VoiceState { voice: self.voice_state(session) }),
             Request::VoiceEpochAck(r) => self.voice_epoch(session, r, false),
             Request::VoiceEpochRepeat(r) => self.voice_epoch(session, r, true),
+            Request::ScreenStart(start) => self.screen_start(session, start),
+            Request::ScreenStop { share } => self.screen_stop(session, &share),
+            Request::ScreenWatch { share } => self.screen_watch(session, &share),
+            Request::ScreenUnwatch { share } => self.screen_unwatch(session, &share),
+            Request::ScreenStopOther { share } => self.screen_stop_other(session, &share),
+            Request::ScreenLinkRevoke { share } => self.screen_link_revoke(session, &share),
         };
         if let Some(before) = managers_before {
             self.reconcile_managers(before);
@@ -1755,6 +1786,7 @@ impl Core {
         let s = self.sessions.get_mut(&session).unwrap();
         s.channel = channel;
         s.talking = false;
+        self.screen_moved(session);
         self.publish_routing();
         self.client_updated(session);
         self.voice_snapshot(session);
@@ -2636,6 +2668,7 @@ fn masked_client(mut client: Client) -> Client {
     client.voice_binding = None;
     client.talking = false;
     client.voice = false;
+    client.sharing = false;
     client
 }
 
@@ -2702,6 +2735,7 @@ fn client_view(s: &Session) -> Client {
         voice_binding: s.participation.as_ref().map(|p| p.binding.clone()),
         server_muted: s.server_muted,
         server_deafened: s.server_deafened,
+        sharing: s.sharing.is_some(),
     }
 }
 
