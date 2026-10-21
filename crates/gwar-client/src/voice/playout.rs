@@ -691,7 +691,8 @@ mod tests {
     #[test]
     fn rare_delays_with_varying_callbacks_or_durations_keep_the_jitter_reserve() {
         // Each delay falls on another refill phase, so the five-second minimum can understate
-        // the next one's need. Without the jitter reserve these gave 4 and 2 concealments.
+        // the next one's need. Without the jitter reserve the first two gave 4 and 2
+        // concealments.
         use super::super::jitter::Clock;
         for clock in [Clock::Rtp, Clock::Sequence] {
             // 10 ms packets, callbacks cycling 10/20/5 ms, 35 ms late every 4.8 s.
@@ -700,6 +701,11 @@ mod tests {
             // 40/2.5/10/5/40 ms packets, 10 ms callbacks, 5 ms late after every 3 s.
             let varying_durations = periodic_delay(clock, &[1920, 120, 480, 240, 1920], &[480], 3 * 48_000, 5 * 48);
             assert_eq!(varying_durations, 0, "{clock:?}");
+            // 10 ms packets, fixed 8 ms callbacks, 35 ms late every 3.3 s: every refill asks for
+            // the same amount, but 8 ms refills walk through the 10 ms packets' phases. Without
+            // the reserve this gave 9 concealments (1 with it).
+            let walking_phase = periodic_delay(clock, &[480], &[384], 3300 * 48, 35 * 48);
+            assert!(walking_phase <= 1, "{clock:?}: {walking_phase}");
         }
     }
 

@@ -308,7 +308,8 @@ impl JitterBuffer {
 
     /// Buffered audio (holes included) + decoded tail immediately before each refill. At the
     /// low-water point only the pending refill and the safety margin are required, plus the
-    /// jitter reserve beyond one packet unless the refills are regular (`refresh_surplus`).
+    /// jitter reserve beyond one packet unless the refills keep one packet phase
+    /// (`refresh_surplus`).
     /// Arrival phase is never audio credit. A full five seconds of observations must support a
     /// surplus, and any lower sample vetoes a correction immediately.
     pub(crate) fn observe_depth(&mut self, now: Instant, staged: usize, demand: usize) {
@@ -369,17 +370,21 @@ impl JitterBuffer {
     /// was a loss does not cost the one-to-two-second wait again.
     ///
     /// The marks sample the queue at refills only. When every refill in the window asks for
-    /// the same amount and every packet lasts as long, a late packet meets the same refill
-    /// phase each time, so the window's minimum already shows the dip the jitter causes, and
-    /// subtracting the jitter estimate as well counted it twice: with 25 ms of jitter a 20 ms
-    /// backlog never drained (docs/latency.md, "Level steps, second pass"). With varying
-    /// callbacks or packet durations a delay can meet a luckier phase than the next one, and
-    /// the minimum understates what that one needs; each mark keeps its jitter reserve then.
+    /// the same whole number of packets, all of one duration, every refill meets the packets
+    /// at the same phase, so a late packet meets the same phase each time, the window's
+    /// minimum already shows the dip the jitter causes, and subtracting the jitter estimate as
+    /// well counted it twice: with 25 ms of jitter a 20 ms backlog never drained
+    /// (docs/latency.md, "Level steps, second pass"). Otherwise the refills walk through the
+    /// packets (8 ms refills over 10 ms packets, varying callbacks or durations), a delay can
+    /// meet a luckier phase than the next one, and the minimum understates what that one
+    /// needs; each mark keeps its jitter reserve then.
     fn refresh_surplus(&mut self, now: Instant) {
         let Some(since) = self.observing_since else { return };
         let mut grains = self.low_water.iter().filter_map(|mark| mark.grain);
-        let first = grains.next();
-        let reserve = !first.is_some_and(|grain| grains.all(|other| other == grain));
+        let fixed_phase = grains.next().is_some_and(|(demand, packet)| {
+            packet > 0 && demand % packet == 0 && grains.all(|other| other == (demand, packet))
+        });
+        let reserve = !fixed_phase;
         let minimum = self.low_water.iter().map(|mark| mark.margin(self.clock, reserve)).min().unwrap_or(0);
         self.surplus = if now.saturating_duration_since(since) >= DEPTH_WINDOW { minimum } else { 0 };
         let settled =
