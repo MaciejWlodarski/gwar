@@ -480,7 +480,7 @@ fn badge(kind: BadgeKind, id: u64, name: &str, sort: i32) -> Option<Badge> {
 
 /// One line of plain text ([`display_text`]), cut to [`BADGE_NAME`] characters.
 fn badge_name(name: &str) -> String {
-    display_text(name, false).chars().take(BADGE_NAME).collect::<String>().trim_end().to_owned()
+    display_text(name, false).chars().take(BADGE_NAME).collect::<String>().trim().to_owned()
 }
 
 /// Server groups, then channel groups, each in TeamSpeak's order and cut to [`BADGES_PER_KIND`].
@@ -1627,6 +1627,7 @@ mod tests {
         assert_eq!(badge(BadgeKind::Server, 7, "Q\u{202e}A\nZ", 0).map(|b| b.name), Some("QA Z".into()));
         assert_eq!(badge(BadgeKind::Server, 7, &"x".repeat(300), 0).map(|b| b.name.len()), Some(BADGE_NAME));
         assert!(badge(BadgeKind::Server, 7, "\u{2066}\0", 0).is_none());
+        assert!(badge(BadgeKind::Server, 7, " \u{7} ", 0).is_none());
     }
 
     #[test]

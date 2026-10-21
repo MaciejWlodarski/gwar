@@ -23,5 +23,5 @@ export function badgesOf(badges: readonly Badge[] | undefined, groups: readonly 
   if (!badges?.length) return [];
   const server = teamspeakOrder(badges.filter((b) => b.kind === "server" && groups.includes(b.id)));
   const channel = teamspeakOrder(badges.filter((b) => b.kind === "channel" && b.id === channelGroup));
-  return [...server, ...channel].map((b) => ({ ...b, name: displayText(b.name) })).filter((b) => b.name !== "");
+  return [...server, ...channel].map((b) => ({ ...b, name: displayText(b.name).trim() })).filter((b) => b.name !== "");
 }

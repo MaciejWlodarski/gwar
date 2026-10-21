@@ -31,8 +31,8 @@ describe("TeamSpeak group badges", () => {
   });
 
   it("names them as one line of plain text", () => {
-    const odd: Badge[] = [server(1, 0), { ...server(2, 0), name: "Q‮A\nZ" }, { ...server(3, 0), name: "⁦\u0000" }];
-    expect(badgesOf(odd, [1, 2, 3], null).map((b) => b.name)).toEqual(["g1", "QA Z"]);
+    const odd: Badge[] = [server(1, 0), { ...server(2, 0), name: "Q\u202eA\nZ" }, { ...server(3, 0), name: "\u2066\u0000" }, { ...server(4, 0), name: " \u0007 " }];
+    expect(badgesOf(odd, [1, 2, 3, 4], null).map((b) => b.name)).toEqual(["g1", "QA Z"]);
   });
 
   it("shows nothing without badges", () => {
