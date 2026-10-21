@@ -48,7 +48,7 @@ struct Recovery {
 /// span (reordered, or simply late after a hole) pulls `end` back to itself: it was not there.
 struct Mark {
     at: Instant,
-    /// Staged audio minus demand and reserve; may be negative. Debited by every cut.
+    /// Staged audio minus demand and safety; may be negative. Debited by every cut.
     base: i64,
     span: Option<Span>,
 }
@@ -301,11 +301,13 @@ impl JitterBuffer {
         self.surplus = 0;
     }
 
-    /// Buffered audio (holes included) + decoded tail immediately before each refill. The
-    /// packet target includes one packet of batching; at the low-water point only the
-    /// pending refill, additional jitter reserve and safety margin are required.
-    /// Arrival phase is never audio credit. A full five seconds of observations must
-    /// support a surplus, and any lower sample vetoes a correction immediately.
+    /// Buffered audio (holes included) + decoded tail immediately before each refill. At the
+    /// low-water point only the pending refill and the safety margin are required: the window's
+    /// minimum already holds every dip the jitter caused. Subtracting the jitter estimate as well
+    /// (it comes from the same arrivals) counted the jitter twice and kept as much excess as the
+    /// jitter was large: with 25 ms of jitter a 20 ms backlog never drained. Arrival phase is
+    /// never audio credit. A full five seconds of observations must support a surplus, and any
+    /// lower sample vetoes a correction immediately.
     ///
     /// Each observation is revised in hindsight by the arrivals after it (`Mark`). Counting
     /// only the packets present made every loss look like a dip, and with a loss every
@@ -318,9 +320,7 @@ impl JitterBuffer {
         }
         self.last_observation = Some(now);
         self.observing_since.get_or_insert(now);
-        let packet_samples = self.packets.first_key_value().map_or(self.last_samples, |(_, p)| p.samples);
         let sequence = self.clock == Clock::Sequence;
-        let reserve = self.target_samples().saturating_sub(packet_samples) + SAFETY;
         let span = self.next.or_else(|| self.packets.first_key_value().map(|(&ts, _)| ts)).map(|next| {
             // Head-hold PLC has already played part of the hole at `next`.
             let mut head = next + self.held;
@@ -340,7 +340,7 @@ impl JitterBuffer {
         while self.low_water.front().is_some_and(|mark| now.saturating_duration_since(mark.at) > DEPTH_WINDOW) {
             self.low_water.pop_front();
         }
-        self.low_water.push_back(Mark { at: now, base: staged as i64 - demand as i64 - reserve as i64, span });
+        self.low_water.push_back(Mark { at: now, base: staged as i64 - demand as i64 - SAFETY as i64, span });
         self.refresh_surplus(now);
     }
 
@@ -978,6 +978,72 @@ mod tests {
                 } else {
                     assert!(jb.concealments > 0);
                 }
+            }
+        }
+    }
+
+    /// 40 s of 10 ms packets, each delayed by up to `jitter_ms` (uniform, deterministic) and
+    /// delivered in order; the first `backlog` arrive together, so playout starts that many
+    /// packets late. Returns the mean delay from send to playout over the last five seconds and
+    /// the concealments after the first ten. Cuts commit as the decoder does in quiet audio.
+    fn jittery(clock: Clock, jitter_ms: f64, backlog: u64) -> (f64, u64) {
+        let start = Instant::now();
+        let stride = if clock == Clock::Sequence { FRAME } else { 480 };
+        let mut jb = JitterBuffer::new();
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut last = 0.0_f64;
+        let arrivals: Vec<f64> = (0..4100u64)
+            .map(|k| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                let delay = (seed >> 11) as f64 / (1u64 << 53) as f64 * jitter_ms;
+                last = last.max(if k < backlog { backlog as f64 * 10.0 } else { k as f64 * 10.0 + delay });
+                last
+            })
+            .collect();
+        let (mut index, mut play) = (0, 0u64);
+        let (mut tail, mut concealments) = (Vec::new(), 0);
+        while play < 40 * 48_000 {
+            let now_ms = backlog as f64 * 10.0 + play as f64 / 48.0;
+            while arrivals.get(index).is_some_and(|&at| at <= now_ms) {
+                let at = start + Duration::from_secs_f64(arrivals[index] / 1000.0);
+                jb.push_at(index as u64 * stride, 480, vec![1], at, clock);
+                index += 1;
+            }
+            let now = start + Duration::from_secs_f64(now_ms / 1000.0);
+            let head = jb.next.unwrap_or(0) / stride;
+            play += match jb.pop_at(now) {
+                Playout::Packet { skip, .. } => {
+                    let skip = skip.min(240);
+                    jb.shrunk(now, skip);
+                    if play >= 35 * 48_000 {
+                        tail.push(now_ms - head as f64 * 10.0);
+                    }
+                    480 - skip as u64
+                }
+                Playout::Conceal(samples) => {
+                    concealments += u64::from(play >= 10 * 48_000);
+                    samples as u64
+                }
+                Playout::Idle => 480,
+            };
+        }
+        (tail.iter().sum::<f64>() / tail.len() as f64, concealments)
+    }
+
+    #[test]
+    fn a_jittery_stream_drains_a_backlog_to_the_level_its_jitter_needs() {
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            for jitter in [15.0, 25.0] {
+                // Without a backlog, the stream settles where its late packets put it.
+                let (settled, _) = jittery(clock, jitter, 1);
+                // A 40 ms backlog drains to within the safety margin and one quiet cut of that
+                // level. Subtracting the jitter estimate from the low-water marks as well kept
+                // 10 ms (15 ms jitter) or all 20 ms (25 ms jitter) of the excess for good.
+                let (drained, concealments) = jittery(clock, jitter, 5);
+                assert!(drained <= settled + 5.0, "{clock:?} {jitter} ms: {drained:.1} ms, settled {settled:.1} ms");
+                assert_eq!(concealments, 0, "{clock:?} {jitter} ms");
             }
         }
     }

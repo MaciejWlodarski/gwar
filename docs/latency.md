@@ -331,8 +331,9 @@ only callbacks during playback.
 Fractional corrections use the minimum queue + staged PCM margin observed
 before refills over a full trailing five seconds. This retains sparse low-water
 evidence such as a 5 ms packet delay every three seconds. The margin excludes
-the pending refill, adaptive jitter reserve beyond packet batching, and 120 samples (2.5 ms)
-of safety. Arrival phase contributes no credit. Each correction proposes at most
+the pending refill and 120 samples (2.5 ms) of safety; the jitter estimate is not
+subtracted again, because the minimum already holds the dips the jitter caused
+(see "Level steps, second pass" below). Arrival phase contributes no credit. Each correction proposes at most
 720 samples (15 ms). Each committed cut is subtracted from every historical
 margin, so later corrections cannot spend the same surplus twice. Depth is
 buffered time from the playout position to the end of the queue, holes
@@ -420,10 +421,73 @@ status 1 because the mixed profile loses more than 5% of markers by design.
 | + recovery rounding | 3, 5, 7, 11, 13, 17 | 5 / 30 | 69.5 ms | 226 | 21.5 |
 
 The remaining steps follow longer loss bursts or stalls while the jitter
-estimate is high. The drain still subtracts the jitter reserve from a low-water
-minimum that already contains the jitter dips, and restarts its window after
-every stall; relaxing either would drain faster at some risk of late packets and
-is left as a separate decision.
+estimate is high; the second pass below removes the jitter reserve from the drain.
+
+Level steps, second pass (2026-10-21). A temporary trace of every arrival, pop,
+concealment, cut and low-water mark (not committed) separated three mechanisms:
+
+- **The drain counted the jitter twice (fixed).** Each low-water mark subtracted
+  the jitter reserve (target minus one packet, the target being the 2 s peak-hold
+  jitter estimate + 5 ms) from a five-second minimum that already holds every dip
+  the same jitter caused. The excess this kept grew with the jitter. In one
+  `down:jitter=10ms` run, every packet was decoded at least 14 ms after it
+  arrived for the whole 25 s marker window (refills always held one packet more
+  than the demand), yet the minimum mark stayed at zero because the estimate
+  (~18 ms) was subtracted from it, and the run sat 10 ms above the others to the
+  end. In a deterministic simulation (10 ms packets, in-order delivery,
+  uniform delay), a 40 ms backlog drained to 31.5 ms instead of the 20 ms the
+  stream settles at by itself with 15 ms of jitter, and not at all (50 ms
+  against 30 ms) with 25 ms. Marks now keep only the pending refill and the 2.5 ms
+  safety margin (`jitter.rs` `observe_depth`); the backlog drains to 22.5 and
+  32.5 ms, with no concealments. The jitter estimate still sets the stall-recovery
+  depth.
+- **A late packet stretches the timeline (intended).** When the queue is empty at
+  a refill, the head packet is concealed in place; if it then arrives, it plays
+  and every later packet is 10 ms later. On a loaded host, single packets arrive
+  10–25 ms late every few seconds (host scheduling, not the profile's reordered packets). Each such packet
+  leaves a low-water mark of zero, which holds the step for the five-second window;
+  in the `reorder` runs the steps held while those marks recurred and drained
+  (5–7 ms cuts) once five seconds passed without one. At the lower level the next
+  late packet was concealed and stretched the timeline again, so draining sooner
+  would trade the step for concealments. This is unchanged.
+- **Stall onset can raise the recovery depth (unchanged).** A packet delayed
+  ~25 ms just before a stall raised the jitter estimate to 26 ms (1 of 10 stalls
+  in the traced `mixed` runs); recovery then kept that target, +19 ms, and the inflated reserve frozen into the
+  marks of the following seconds held most of it until the next stall. Without the reserve
+  only the five-second window holds it (not observed in the clean series below);
+  the recovery depth itself is left as it is.
+
+Local paired runs, 2026-10-21 00:30–01:40 CET, `a51f4be` baseline then the
+candidate, six pairs per profile in ABBA order, seeds 3/5/7/11/13/17 (same seed
+within a pair), `LATENCY_WAIT_CONNECTED=1`, 15 s warmup and 100 markers (`mixed`:
+2 s warmup and 200 markers, stalls every 10 s from 12 s). Shared Mac with other
+agents' builds, 1-minute load 0.8–9.5 at run starts; no host guard. A run counts
+as stepped when its median is at least 5 ms above the lowest run median of that
+profile (both builds). PLC sums the receiver's concealments over the six runs
+(warmup included). Values are baseline / candidate; all 96 runs passed the
+matching gate.
+
+| Profile | Median ms | p95 ms | Stepped runs | PLC | Late drops | Underruns |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Idle | 49.11 / 46.99 | 58.85 / 50.38 | 2 / 0 | 4 / 1 | 0 / 0 | 0 / 0 |
+| `down:jitter=10ms` | 56.86 / 56.26 | 77.76 / 59.26 | 2 / 0 | 9 / 3 | 0 / 0 | 0 / 0 |
+| `down:loss=2%` | 53.46 / 48.52 | 58.81 / 54.46 | 4 / 0 | 533 / 529 | 0 / 0 | 0 / 0 |
+| `down:burst=3@0.5%` | 49.10 / 48.79 | 62.34 / 51.70 | 2 / 0 | 396 / 398 | 0 / 0 | 0 / 0 |
+| `up:stall=270ms@27s` | 49.58 / 47.90 | 76.84 / 68.56 | 2 / 1 | 75 / 65 | 0 / 0 | 0 / 0 |
+| `down:reorder=0.5%` | 49.01 / 50.31 | 56.16 / 59.50 | 2 / 2 | 132 / 133 | 128 / 125 | 0 / 0 |
+| Callback jitter | 79.10 / 79.25 | 89.42 / 89.47 | 2 / 0 | 15 / 10 | 0 / 0 | 0 / 0 |
+| Mixed | 76.65 / 76.77 | 87.11 / 87.10 | 0 / 0 | 1222 / 1214 | 119 / 115 | 2 / 0 |
+
+Stepped runs fell from 16 to 3 of 48 with no more concealments, late drops or
+underruns in any profile. `reorder` and `mixed` do not change: their steps are
+the late-packet stretches above, and `mixed` already runs at its window minimum.
+The stall pair that stepped in both builds had a 30–40 ms host episode in the
+baseline run before the stall. These are single-host, shared-machine runs, six
+pairs each; the gate's ten-pair guarded series (docs/voice-sfu-5b.md) has not
+been re-run. The runs invoked the example directly from a local ABBA loop (not
+committed) with each profile's `LATENCY_NET` and the settings above;
+`run_local.py` with per-variant `LATENCY_*` wrappers (see "Compare builds")
+reproduces them.
 
 Receiver recovery follow-up (2026-10-16; measurement pending). Low-water
 observations now survive isolated PLC and are debited after each cut, retaining
