@@ -383,9 +383,10 @@ Each session has at most two screen transports besides its voice transport
   connected. It belongs to the session, not to a call, because plaintext
   shares can be watched from outside their voice. Its offer is fixed:
   `SCREEN_SLOTS = 4` `recvonly` video m-lines, nothing to send. Any other offer
-  (another count, a slot that may send, an SSRC, audio, a data channel) is
-  refused before negotiation: media into a watch transport would bypass the
-  publisher's admission and meter. Phase 2
+  (another count, a slot that may send, audio, a data channel) is refused
+  before negotiation, and one that would leave a stream to receive on is
+  refused after it (the SSRCs a viewer lists are its RTCP senders): media into
+  a watch transport would bypass the publisher's admission and meter. Phase 2
   widens each slot with an audio m-line
   ([Shared audio](#shared-audio-phase-2)). This mirrors the eight voice
   slots: no renegotiation when shares start, stop or change hands. A `run`
