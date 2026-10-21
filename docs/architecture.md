@@ -564,21 +564,32 @@ therefore have different TS suffixes while retaining the same Gwar nickname.
       they are skipped and the badge's name stands alone.
     - Bounds: icons at most 64 KiB, avatars at most 300 KiB (TeamSpeak's
       default `i_client_max_avatar_filesize` is 200,000 bytes); 4 transfers
-      at a time, each done within 15 s or failed (30 s from asking); exactly
-      the announced size is read. A file must be a PNG, JPEG, GIF or WebP by
-      its first bytes, whatever TeamSpeak calls it: SVG and anything else is
-      refused.
+      at a time, each with an absolute deadline of 15 s from asking; exactly
+      the announced size is read. A transfer keeps its slot until its work has
+      ended: its read runs on a task that ends by the deadline (and with the
+      connection), and tsclientlib's own connect for it, which the adapter
+      cannot cancel, either reports or has surely ended after 180 s more
+      (longer than any system's TCP connect timeout). A file must be a PNG,
+      JPEG, GIF or WebP by its first bytes, whatever TeamSpeak calls it: SVG
+      and anything else is refused.
     - The cache is per connection and in memory only (nothing on disk): at
       most 32 MiB and 2048 images, keyed by icon id or by the avatar's owner
       and hash (`client_flag_avatar`), so an image is fetched again only when
-      the id or hash changes. A full cache drops images no longer shown; a
-      file that failed (missing, refused, too large, no image, timed out) is
-      not asked for again on that connection.
+      the id or hash changes. Only the first 2048 images the view shows are
+      considered. A full cache drops images no longer shown; an image that
+      finds it full of images still shown waits, and is fetched again once
+      that much room can be made. A file that failed (missing, refused, too
+      large, no image, timed out) is not asked for again while it is shown;
+      no longer shown, it is forgotten.
     - The UI gets the bytes by token from the desktop app (`ts_image`), checks
       their type and size again and shows them through `blob:` URLs of its own
-      origin (`net/ts-images.ts`), which the CSP allows for images. A changed
-      icon or avatar is a new token: the shape drops the old one and names the
-      new one once it is fetched, as an update like any other.
+      origin (`net/ts-images.ts`), which the CSP allows for images. It keeps
+      exactly the images the session names now (server, badges, channels,
+      clients), at most 2048 and 32 MiB, and revokes the URL of one no longer
+      named; when the native session closes (for good or to reconnect) all are
+      revoked and loads still under way are dropped. A changed icon or avatar
+      is a new token: the shape drops the old one and names the new one once
+      it is fetched, as an update like any other.
 
 ## Clients
 

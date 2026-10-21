@@ -22,7 +22,7 @@ import {
 } from "./connection";
 import { parseFrame } from "./frames";
 import { displayData } from "../lib/text";
-import { imageTokens, TsImages } from "./ts-images";
+import { TsImages } from "./ts-images";
 import type { EventData, EventName, Op, RequestInput, ResponseMap } from "./protocol";
 
 export interface TsConnectionOptions {
@@ -180,7 +180,7 @@ export class TsConnection implements Link {
 
   /** Hands out the Welcome, then the events that raced it. */
   private deliverWelcome(welcome: Welcome, resync: boolean): void {
-    this.images.request(imageTokens({ welcome }));
+    this.images.welcome(welcome);
     for (const h of [...this.welcomeHandlers]) h(welcome, resync);
     const held = this.held ?? [];
     this.held = null;
@@ -207,7 +207,7 @@ export class TsConnection implements Link {
 
   private route(event: Event): void {
     if (event.ev === "disconnected") this.serverReason = event.d.reason;
-    this.images.request(imageTokens({ event }));
+    this.images.event(event);
     const set = this.eventHandlers.get(event.ev);
     if (set) for (const h of [...set]) h(event.d as never);
     for (const h of [...this.anyHandlers]) h(event);
@@ -245,6 +245,8 @@ export class TsConnection implements Link {
 
   private onClosed(): void {
     this.session = 0;
+    // The native session and its images are gone: none is shown, and none still loading lands.
+    this.images.clear();
     if (this.intentionalClose || this.status_.state === "closed") return;
     const reason = this.serverReason;
     if (reason && !shouldReconnectAfter(reason)) {

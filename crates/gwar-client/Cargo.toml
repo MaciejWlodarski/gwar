@@ -50,6 +50,8 @@ openmls = "=0.9.1"
 openmls_rust_crypto = "=0.6.0"
 gwar-mls = { path = "../gwar-mls" }
 tracing-subscriber.workspace = true
+# Virtual time in the image transfer tests.
+tokio = { workspace = true, features = ["test-util"] }
 
 # Microphone permission (TCC) on macOS.
 [target.'cfg(target_os = "macos")'.dependencies]

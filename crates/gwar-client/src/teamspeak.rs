@@ -39,7 +39,7 @@ use tsproto_packets::packets::{AudioData, CodecType, Direction, Flags, OutAudio,
 use crate::ClientError;
 
 pub mod images;
-use images::{ImageKey, Images};
+use images::{ImageKey, Images, Reads};
 
 pub struct TsOptions {
     /// `host[:port]`, default port 9987.
@@ -1193,7 +1193,8 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
     // Icons and avatars follow the Welcome: each shows once it is here, as an update.
     let start = images.want(wanted_images(state, &view.listed));
     fetch(&mut con, &mut images, start);
-    let (image_tx, mut image_rx) = mpsc::channel::<(u16, Result<Vec<u8>, &'static str>)>(images::CONCURRENT);
+    // The files being read; dropped (so aborted) when the connection ends, with tsclientlib's setups.
+    let mut reads = Reads::default();
 
     type ReplyTx = oneshot::Sender<Result<Value, ErrorBody>>;
     /// A request waiting for TeamSpeak to answer `part`; `rest` runs only if it went through.
@@ -1234,7 +1235,7 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
         Item(Option<Result<StreamItem, tsclientlib::Error>>),
         Request(Option<PendingRequest>),
         Mic(Option<TsMicrophone>),
-        Image(Option<(u16, Result<Vec<u8>, &'static str>)>),
+        Image((u16, Result<Vec<u8>, &'static str>)),
         Tick,
     }
     loop {
@@ -1244,7 +1245,7 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                 item = stream.next() => Step::Item(item),
                 request = requests.recv() => Step::Request(request.map(|(request, reply)| (Box::new(request), reply))),
                 frame = mic.recv() => Step::Mic(frame),
-                image = image_rx.recv() => Step::Image(image),
+                image = reads.next() => Step::Image(image),
                 _ = tick.tick() => Step::Tick,
             }
         };
@@ -1356,13 +1357,9 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                     }
                 }
                 StreamItem::FileDownload(transfer, file) => {
-                    // Read on a task of its own, within its limit and time; the result comes back as a step.
-                    if let Some(limit) = images.opened(transfer.0, file.size) {
-                        let done = image_tx.clone();
-                        tokio::spawn(async move {
-                            let data = images::read_file(file.stream, file.size, limit).await;
-                            let _ = done.send((transfer.0, data)).await;
-                        });
+                    // Read on a task of its own, within its limit and by its deadline; the result comes back as a step.
+                    if let Some((limit, deadline)) = images.opened(transfer.0, file.size) {
+                        reads.start(transfer.0, file.stream, file.size, limit, deadline);
                     } else {
                         let start = images.queued();
                         fetch(&mut con, &mut images, start);
@@ -1413,8 +1410,7 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                     send_audio_now(transport, packet, &audio_socket_pressure);
                 }
             }
-            Step::Image(None) => break,
-            Step::Image(Some((transfer, data))) => {
+            Step::Image((transfer, data)) => {
                 book_changed |= images.finished(transfer, data);
                 let start = images.queued();
                 fetch(&mut con, &mut images, start);

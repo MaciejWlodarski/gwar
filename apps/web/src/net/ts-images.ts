@@ -3,8 +3,8 @@
  * through TeamSpeak's file transfer, checks them and names each by a token in the shapes it sends
  * (`ServerInfo.icon`, `Badge.icon`, `Channel.icon`, `Client.avatar`); see
  * `gwar_client::teamspeak::images`. Here the TeamSpeak connection asks it for the bytes of every
- * token it sees (`ts_image`), checks them again, and shows them through `blob:` URLs of this
- * origin: never a remote URL, and only PNG, JPEG, GIF or WebP (no SVG, nothing that runs).
+ * token the session names now (`ts_image`), checks them again, and shows them through `blob:` URLs
+ * of this origin: never a remote URL, and only PNG, JPEG, GIF or WebP (no SVG, nothing that runs).
  */
 import { create } from "zustand";
 import type { Event } from "../proto/Event";
@@ -12,10 +12,12 @@ import type { Welcome } from "../proto/Welcome";
 import type { ServerInfo } from "../proto/ServerInfo";
 import { imageToken } from "./schema";
 
-/** Image tokens kept per connection, at most (the adapter keeps as many). */
+/** Images kept (or loading) per connection, at most (the adapter keeps as many). */
 export const MAX_IMAGES = 2048;
 /** The largest image accepted: a TeamSpeak avatar (300 KiB). */
 export const MAX_IMAGE_BYTES = 300 * 1024;
+/** All images kept per connection together, in bytes (the adapter's cache is as large). */
+export const MAX_TOTAL_BYTES = 32 * 1024 * 1024;
 
 /** `blob:` URLs of the TeamSpeak connection's images, by token. */
 export const useTsImages = create<{ urls: Readonly<Record<string, string>> }>(() => ({ urls: {} }));
@@ -30,55 +32,132 @@ export function imageType(bytes: Uint8Array): "image/png" | "image/jpeg" | "imag
   return null;
 }
 
-function serverTokens(server: ServerInfo | undefined, out: Set<string>): void {
-  if (!server) return;
+function serverTokens(server: ServerInfo | undefined): Set<string> {
+  const out = new Set<string>();
+  if (!server) return out;
   if (server.icon) out.add(server.icon);
   for (const b of server.badges ?? []) if (b.icon) out.add(b.icon);
-}
-
-/** The image tokens a Welcome or an event names. */
-export function imageTokens(frame: { welcome: Welcome } | { event: Event }): Set<string> {
-  const out = new Set<string>();
-  if ("welcome" in frame) {
-    const w = frame.welcome;
-    serverTokens(w.server, out);
-    for (const c of w.channels) if (c.icon) out.add(c.icon);
-    for (const c of w.clients) if (c.avatar) out.add(c.avatar);
-    return out;
-  }
-  const e = frame.event;
-  if (e.ev === "server.updated") serverTokens(e.d, out);
-  else if ((e.ev === "channel.created" || e.ev === "channel.updated") && e.d.icon) out.add(e.d.icon);
-  else if ((e.ev === "client.joined" || e.ev === "client.updated") && e.d.avatar) out.add(e.d.avatar);
   return out;
 }
 
+function setToken(map: Map<number, string>, id: number, token: string | null | undefined): void {
+  if (token) map.set(id, token);
+  else map.delete(id);
+}
+
 /**
- * Loads each token once, through `fetch` (the native `ts_image`), into `useTsImages`. A token
- * names one image for good (an icon id is TeamSpeak's checksum of the file; an avatar token
- * covers its owner and hash), so a loaded one is never asked for again.
+ * The images of one TeamSpeak connection, through `fetch` (the native `ts_image`), in
+ * `useTsImages`. It follows the tokens the server, its badges, channels and clients name now
+ * (from the Welcome and the events), and keeps exactly those: an image no longer named has its
+ * URL revoked, at most MAX_IMAGES and MAX_TOTAL_BYTES are kept, and one that failed is not asked
+ * for again while it stays named. A token names one image for good (an icon id is TeamSpeak's
+ * checksum of the file; an avatar token covers its owner and hash).
  */
 export class TsImages {
-  private seen = new Set<string>();
+  private server = new Set<string>();
+  private channels = new Map<number, string>();
+  private clients = new Map<number, string>();
+  /** The tokens named now. */
+  private named = new Set<string>();
+  private kept = new Map<string, { url: string; size: number }>();
+  private bytes = 0;
+  private loading = new Set<string>();
+  /** Named tokens that could not be loaded. */
+  private failed = new Set<string>();
+  /** Named tokens that did not fit MAX_TOTAL_BYTES, by size: loaded again once they would. */
+  private deferred = new Map<string, number>();
   private generation = 0;
 
   constructor(private readonly fetch: (token: string) => Promise<ArrayBuffer | Uint8Array | null>) {}
 
-  request(tokens: Iterable<string>): void {
-    for (const token of tokens) {
-      if (this.seen.has(token) || this.seen.size >= MAX_IMAGES || !imageToken(token)) continue;
-      this.seen.add(token);
-      void this.load(token, this.generation);
-    }
+  /** A (re)joined session: everything it names. */
+  welcome(welcome: Welcome): void {
+    this.server = serverTokens(welcome.server);
+    this.channels = new Map();
+    for (const c of welcome.channels) setToken(this.channels, c.id, c.icon);
+    this.clients = new Map();
+    for (const c of welcome.clients) setToken(this.clients, c.id, c.avatar);
+    this.reconcile();
   }
 
-  /** Forgets every image and revokes its URL (the connection closed). */
+  /** An event of the session: what it names now. */
+  event(event: Event): void {
+    switch (event.ev) {
+      case "server.updated":
+        this.server = serverTokens(event.d);
+        break;
+      case "channel.created":
+      case "channel.updated":
+        setToken(this.channels, event.d.id, event.d.icon);
+        break;
+      case "channel.deleted":
+      case "channel.hidden":
+        this.channels.delete(event.d.channel);
+        break;
+      case "client.joined":
+      case "client.updated":
+        setToken(this.clients, event.d.id, event.d.avatar);
+        break;
+      case "client.left":
+        this.clients.delete(event.d.client);
+        break;
+      default:
+        return;
+    }
+    this.reconcile();
+  }
+
+  /** Forgets every image and revokes its URL; loads under way are dropped (the session ended). */
   clear(): void {
     this.generation++;
-    this.seen.clear();
-    const urls = useTsImages.getState().urls;
+    this.server = new Set();
+    this.channels = new Map();
+    this.clients = new Map();
+    this.named = new Set();
+    this.loading.clear();
+    this.failed.clear();
+    this.deferred.clear();
+    const kept = [...this.kept.values()];
+    this.kept.clear();
+    this.bytes = 0;
     useTsImages.setState({ urls: {} });
-    for (const url of Object.values(urls)) URL.revokeObjectURL(url);
+    for (const image of kept) URL.revokeObjectURL(image.url);
+  }
+
+  /** Drops what is no longer named, then loads what is and fits. */
+  private reconcile(): void {
+    const named = new Set([...this.server, ...this.channels.values(), ...this.clients.values()]);
+    this.named = named;
+    const gone = [...this.kept.keys()].filter((token) => !named.has(token));
+    if (gone.length > 0) {
+      const urls = { ...useTsImages.getState().urls };
+      for (const token of gone) {
+        const image = this.kept.get(token)!;
+        this.kept.delete(token);
+        this.bytes -= image.size;
+        delete urls[token];
+        URL.revokeObjectURL(image.url);
+      }
+      useTsImages.setState({ urls });
+    }
+    for (const token of this.failed) if (!named.has(token)) this.failed.delete(token);
+    for (const token of this.deferred.keys()) if (!named.has(token)) this.deferred.delete(token);
+    this.start();
+  }
+
+  private start(): void {
+    for (const token of this.named) {
+      if (this.kept.size + this.loading.size >= MAX_IMAGES) return;
+      if (this.kept.has(token) || this.loading.has(token) || this.failed.has(token)) continue;
+      const size = this.deferred.get(token);
+      if (size !== undefined && this.bytes + size > MAX_TOTAL_BYTES) continue;
+      if (!imageToken(token)) {
+        this.failed.add(token);
+        continue;
+      }
+      this.loading.add(token);
+      void this.load(token, this.generation);
+    }
   }
 
   private async load(token: string, generation: number): Promise<void> {
@@ -89,15 +168,25 @@ export class TsImages {
       data = null;
     }
     if (generation !== this.generation) return;
+    this.loading.delete(token);
     const bytes = data instanceof Uint8Array ? data : data instanceof ArrayBuffer ? new Uint8Array(data) : null;
     const type = bytes && bytes.length <= MAX_IMAGE_BYTES ? imageType(bytes) : null;
-    if (!bytes || !type) {
-      // Gone (evicted, or the connection moved on): asked for again if it is named again.
-      this.seen.delete(token);
+    if (!this.named.has(token)) {
+      // No longer named while it loaded.
+    } else if (!bytes || !type) {
+      this.failed.add(token);
+    } else if (this.bytes + bytes.length > MAX_TOTAL_BYTES) {
+      this.deferred.set(token, bytes.length);
+    } else {
+      this.deferred.delete(token);
+      const url = URL.createObjectURL(new Blob([bytes as Uint8Array<ArrayBuffer>], { type }));
+      this.kept.set(token, { url, size: bytes.length });
+      this.bytes += bytes.length;
+      useTsImages.setState((s) => ({ urls: { ...s.urls, [token]: url } }));
       return;
     }
-    const url = URL.createObjectURL(new Blob([bytes as Uint8Array<ArrayBuffer>], { type }));
-    useTsImages.setState((s) => ({ urls: { ...s.urls, [token]: url } }));
+    // A place for another one.
+    this.start();
   }
 }
 

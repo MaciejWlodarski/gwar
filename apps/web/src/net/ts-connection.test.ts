@@ -152,4 +152,44 @@ describe("TsConnection replies", () => {
     expect(revoke).toHaveBeenCalledWith("blob:gwar/1");
     vi.restoreAllMocks();
   });
+
+  it("drops the images when the native session closes, also for good, and lands no late load", async () => {
+    for (const terminal of [false, true]) {
+      useTsImages.setState({ urls: {} });
+      const { bridge, calls, listeners } = fakeBridge();
+      const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13]);
+      const late: Array<() => void> = [];
+      const invoke = bridge.invoke;
+      bridge.invoke = (async (command: string, args?: Record<string, unknown>) => {
+        if (command !== "ts_image") return invoke(command, args);
+        calls.push({ command, args });
+        if (args?.token === "i1001") return png.buffer;
+        // i1002 answers only after the session ended.
+        return new Promise<ArrayBuffer>((resolve) => late.push(() => resolve(png.slice().buffer)));
+      }) as typeof bridge.invoke;
+      let made = 0;
+      vi.spyOn(URL, "createObjectURL").mockImplementation(() => `blob:gwar/${++made}`);
+      const revoke = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+      const conn = new TsConnection({ address: "h:9987", nickname: "n", bridge: async () => bridge });
+      await conn.connect();
+      const session = calls.find((c) => c.command === "ts_connect")?.args?.session;
+      const emit = (ev: string, d: unknown) => listeners.get("ts://event")?.({ session, frame: JSON.stringify({ ev, d }) } as never);
+      const channel = { id: 1, parent: null, name: "Lobby", topic: "", position: 0, has_password: false, max_clients: null, encrypted: false, history: false, private: false, synced: false };
+      emit("channel.updated", { ...channel, icon: "i1001" });
+      emit("channel.created", { ...channel, id: 2, name: "Other", icon: "i1002" });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(useTsImages.getState().urls).toEqual({ i1001: "blob:gwar/1" });
+      if (terminal) emit("disconnected", { reason: { kind: "kicked", by: "admin", reason: null } });
+      listeners.get("ts://closed")?.({ session } as never);
+      expect(conn.status.state).toBe(terminal ? "closed" : "reconnecting");
+      expect(useTsImages.getState().urls).toEqual({});
+      expect(revoke).toHaveBeenCalledWith("blob:gwar/1");
+      for (const answer of late) answer();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(useTsImages.getState().urls).toEqual({});
+      expect(made).toBe(1);
+      conn.close();
+      vi.restoreAllMocks();
+    }
+  });
 });
