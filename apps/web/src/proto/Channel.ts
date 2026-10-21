@@ -4,6 +4,10 @@ import type { ChannelOverride } from "./ChannelOverride";
 
 export type Channel = { id: number, parent: number | null, name: string, topic: string, position: number, has_password: boolean, max_clients: number | null, 
 /**
+ * TeamSpeak servers only: the most clients in this channel and its subchannels together.
+ */
+max_family_clients?: number | null, 
+/**
  * End-to-end encrypted, fixed at creation (docs/e2e-build.md, section 4).
  */
 encrypted: boolean, 

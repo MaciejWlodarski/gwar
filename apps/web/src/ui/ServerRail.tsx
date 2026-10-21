@@ -3,7 +3,7 @@ import { Plus, Settings } from "lucide-react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { sameServer } from "../lib/server-key";
-import { controller } from "../state/controller";
+import { bookmarkParams, controller } from "../state/controller";
 import { useBookmarks, useSettings, type Bookmark } from "../state/settings";
 import { useSession, useUi } from "../state/stores";
 import { TeamSpeakBadge } from "./badges";
@@ -27,7 +27,7 @@ export function ServerRail() {
       return;
     }
     setDrawer(false);
-    void controller.connectInteractive({ kind: b.kind, address: b.address, password: b.password, identity: b.identity, insecureLan: b.insecureLan }, { remember: false });
+    void controller.connectInteractive(bookmarkParams(b), { remember: false });
   };
 
   return (

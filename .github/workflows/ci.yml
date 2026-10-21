@@ -144,6 +144,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter web lint
       - run: pnpm --filter web test
+      - run: pnpm --filter web test:latency
       - run: pnpm --filter web build
       - run: pnpm --filter web exec playwright install --with-deps chromium webkit firefox
       - run: pnpm --filter web e2e:images

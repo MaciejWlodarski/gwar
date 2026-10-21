@@ -10,7 +10,7 @@ import { AccessPicker } from "./ChannelAccess";
 import { ChannelPermissionsDialog } from "./ChannelPermissions";
 import { BugReportDialog } from "./BugReport";
 import { rebaseAccess, sameAccess } from "../lib/access";
-import { controller, describeJoinError, describeRequestError } from "../state/controller";
+import { bookmarkParams, controller, describeJoinError, describeRequestError } from "../state/controller";
 import { sortedChannels } from "../state/reducer";
 import { isDesktop } from "../platform";
 import { newId, useSettings, type ServerKind } from "../state/settings";
@@ -19,6 +19,7 @@ import { Button, Dialog, Field, Input, Segmented, Select, Textarea, Switch } fro
 import { SettingsDialog } from "./Settings";
 import { HearersDialog, ReadersDialog } from "./Readers";
 import { BanDialog } from "./BanDialog";
+import { ChannelInfoDialog, PokeDialog } from "./TeamspeakDialogs";
 import { RemoveMemberDialog } from "./RemoveMemberDialog";
 import { Lightbox } from "./Attachments";
 import { InvitesDialog, ServerSettingsDialog } from "./ServerSettings";
@@ -45,6 +46,10 @@ export function Dialogs() {
       return dialog.mode === "create" ? <ChannelDialog mode="create" parent={dialog.parent} /> : <ChannelDialog mode="edit" channel={dialog.channel} />;
     case "channelPassword":
       return <ChannelPasswordDialog channel={dialog.channel} />;
+    case "channelInfo":
+      return <ChannelInfoDialog channel={dialog.channel} />;
+    case "poke":
+      return <PokeDialog person={dialog.person} />;
     case "channelPermissions":
       return <ChannelPermissionsDialog channel={dialog.channel} />;
     case "serverSettings":
@@ -135,6 +140,8 @@ function AddServerDialog({ editId }: { editId?: string }) {
   const [insecureLan, setInsecureLan] = useState(existing?.insecureLan ?? false);
   const tsList = useTsIdentities();
   const [identity, setIdentity] = useState<string | null>(existing?.identity ?? null);
+  const [channel, setChannel] = useState(existing?.channel ?? "");
+  const [channelPassword, setChannelPassword] = useState(existing?.channelPassword ?? "");
   const pickIdentity = kind === "teamspeak" && !!tsList && tsList.identities.length >= 2;
 
   const save = (connect: boolean) => (e?: FormEvent) => {
@@ -149,16 +156,15 @@ function AddServerDialog({ editId }: { editId?: string }) {
       password: password || undefined,
       // Without a choice to make, a remembered identity stays as it was.
       identity: kind === "teamspeak" ? (pickIdentity ? (resolveIdentity(tsList, identity) ?? undefined) : existing?.identity) : undefined,
+      channel: kind === "teamspeak" ? channel.trim() || undefined : undefined,
+      channelPassword: kind === "teamspeak" && channel.trim() ? channelPassword || undefined : undefined,
     };
     useSettings.getState().saveBookmark(bookmark);
     close();
     if (connect) {
       // A server saved before keeps its bookmark (and password): connect with what was stored.
       const stored = useSettings.getState().bookmarks.find((b) => b.id === bookmark.id) ?? useSettings.getState().bookmarks.find((b) => sameServer(b, bookmark)) ?? bookmark;
-      void controller.connectInteractive(
-        { kind: stored.kind, address: stored.address, password: stored.password, identity: stored.identity, insecureLan: stored.insecureLan },
-        { remember: false },
-      );
+      void controller.connectInteractive(bookmarkParams(stored), { remember: false });
     }
   };
 
@@ -207,6 +213,18 @@ function AddServerDialog({ editId }: { editId?: string }) {
           <Switch checked={insecureLan} onCheckedChange={setInsecureLan} label={t("security.insecureLan")} />
           {insecureLan && <p className="text-sm text-danger">{t("security.insecureWarning")}</p>}
         </div>}
+        {kind === "teamspeak" && (
+          <>
+            <Field label={t("addServer.tsChannel")} hint={t("addServer.tsChannelHint")}>
+              {(id) => <Input id={id} value={channel} onChange={(e) => setChannel(e.target.value)} placeholder={t("addServer.tsChannelPlaceholder")} maxLength={255} spellCheck={false} />}
+            </Field>
+            {channel.trim() && (
+              <Field label={t("addServer.tsChannelPassword")} hint={t("addServer.tsChannelPasswordHint")}>
+                {(id) => <Input id={id} type="password" value={channelPassword} onChange={(e) => setChannelPassword(e.target.value)} maxLength={128} autoComplete="off" />}
+              </Field>
+            )}
+          </>
+        )}
         {pickIdentity && <IdentityPicker list={tsList} value={identity} onChange={setIdentity} />}
         <button type="submit" className="hidden" />
       </form>
@@ -240,6 +258,9 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
   const existing = props.mode === "edit" ? channels[props.channel] : undefined;
   const [name, setName] = useState(existing?.name ?? "");
   const [topic, setTopic] = useState(existing?.topic ?? "");
+  // The name and topic as shown when opened: only edits made here are sent, as the shown ones
+  // may be cleaned copies of the server's (and someone else may change them meanwhile).
+  const [opened] = useState(() => ({ name: existing?.name ?? "", topic: existing?.topic ?? "" }));
   const [password, setPassword] = useState("");
   const [removePassword, setRemovePassword] = useState(false);
   const [maxClients, setMaxClients] = useState(existing?.max_clients ? String(existing.max_clients) : "");
@@ -325,8 +346,8 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
         const parentChanged = parentId !== existing.parent;
         await controller.updateChannel({
           channel: existing.id,
-          name: name.trim(),
-          topic: topic.trim(),
+          ...(name !== opened.name ? { name: name.trim() } : {}),
+          ...(topic !== opened.topic ? { topic: topic.trim() } : {}),
           // "" removes the password; absent keeps it.
           ...(sealedChannel ? {} : removePassword ? { password: "" } : password ? { password } : {}),
           // 0 removes the limit (protocol rule for channel.update).

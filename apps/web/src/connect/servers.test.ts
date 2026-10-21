@@ -37,6 +37,33 @@ describe("vaultServers", () => {
     ]);
   });
 
+  it("keeps a TeamSpeak entry's channel and its password, and no channel for Gwar servers", () => {
+    const entries = vaultServers({
+      servers: {
+        entries: [
+          { id: "ts", address: "ts.example.com", kind: "teamspeak", channel: "Lobby/Games", channel_password: "pw", updated_at: 3 },
+          { id: "lone", address: "l.example.com", kind: "teamspeak", channel_password: "pw", updated_at: 3 },
+          { id: "long", address: "x.example.com", kind: "teamspeak", channel: "c".repeat(256), updated_at: 3 },
+          { id: "vc", address: "v.example.com", channel: "Lobby", channel_password: "pw", updated_at: 3 },
+        ],
+      },
+    });
+    expect(entries).toEqual([
+      { id: "ts", name: "ts.example.com", address: "ts.example.com", kind: "teamspeak", channel: "Lobby/Games", channel_password: "pw", updated_at: 3 },
+      { id: "lone", name: "l.example.com", address: "l.example.com", kind: "teamspeak", updated_at: 3 },
+      { id: "long", name: "x.example.com", address: "x.example.com", kind: "teamspeak", updated_at: 3 },
+      { id: "vc", name: "v.example.com", address: "v.example.com", kind: "gwar", updated_at: 3 },
+    ]);
+    const [back] = toBookmarks(entries.slice(0, 1), [], ACCT);
+    expect(back).toMatchObject({ channel: "Lobby/Games", channelPassword: "pw" });
+    const [merged] = mergeServers([], { bookmarks: [bookmark("ts", 5, { kind: "teamspeak", channel: "A/B", channelPassword: "q" })], removed: {} }, NOW);
+    expect(merged).toMatchObject({ channel: "A/B", channel_password: "q" });
+    // A newer local edit that drops the channel drops it from the vault too.
+    const [cleared] = mergeServers([entry("ts", 1, { kind: "teamspeak", channel: "A/B", channel_password: "q" })], { bookmarks: [bookmark("ts", 5, { kind: "teamspeak" })], removed: {} }, NOW);
+    expect(cleared).not.toHaveProperty("channel");
+    expect(cleared).not.toHaveProperty("channel_password");
+  });
+
   it("is empty without a servers section", () => {
     expect(vaultServers({})).toEqual([]);
     expect(vaultServers({ servers: { entries: "no" } })).toEqual([]);

@@ -1,8 +1,11 @@
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import {
   Ban,
+  ArrowDown,
+  ArrowUp,
   ChevronRight,
   EyeOff,
+  Info,
   Hash,
   HeadphoneOff,
   Headphones,
@@ -17,6 +20,7 @@ import {
   Plus,
   ShieldCheck,
   Trash2,
+  Users,
   Volume2,
 } from "lucide-react";
 import { memo, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
@@ -30,13 +34,12 @@ import { useSettings } from "../state/settings";
 import { useSession, useUi } from "../state/stores";
 import { buildTree, descendantsCount, isFull, type ChannelNode } from "../state/tree";
 import { fillText, parseSpacer } from "../lib/spacer";
-import { MentionBadge, UnreadBadge } from "./badges";
+import { MentionBadge, TsGroupBadges, UnreadBadge } from "./badges";
 import { useChannelPermission, useGroupsColor, useMyWho, useWhoOf } from "./hooks";
 import { canActOn } from "../lib/permissions";
+import { CLIENT_MIME, clientDragData, readClientDrag } from "../lib/client-drag";
 import { ModerationItems } from "./ModerationMenu";
 import { EmptyState, TalkingAvatar, Slider, menuContent, menuItem, menuItemDanger, menuLabel, menuSeparator } from "./kit";
-
-const CLIENT_MIME = "application/x-gwar-client";
 
 export function ChannelTree() {
   const t = useT();
@@ -117,6 +120,14 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
   const count = node.clients.length;
   const full = isFull(node);
   const spacer = onGwar ? null : parseSpacer(channel.name, node.depth === 0);
+  const familyMax = channel.max_family_clients ?? null;
+  // TeamSpeak sorts siblings by hand: where this one stands among them.
+  const place = useSession((s) => {
+    if (s.kind !== "teamspeak") return null;
+    const siblings = Object.values(s.channels).filter((c) => c.parent === channel.parent);
+    const before = siblings.filter((c) => c.position < channel.position || (c.position === channel.position && c.id < channel.id)).length;
+    return before === siblings.length - 1 ? (before === 0 ? "only" : "last") : before === 0 ? "first" : "middle";
+  });
 
   const join = () => {
     if (canJoin) void controller.joinChannelInteractive(channel.id);
@@ -163,10 +174,10 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
           onDragLeave={() => setDragOver(false)}
           onDrop={(e) => {
             setDragOver(false);
-            const id = Number(e.dataTransfer.getData(CLIENT_MIME));
-            if (canMove && id) {
+            const drag = readClientDrag(e.dataTransfer.getData(CLIENT_MIME));
+            if (canMove && drag) {
               e.preventDefault();
-              void controller.moveClient(id, channel.id);
+              void controller.moveClient(drag.id, drag.uid, channel.id);
             }
           }}
           style={{ paddingLeft: 4 + node.depth * 16 }}
@@ -225,6 +236,15 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
               {channel.max_clients !== null ? `${count}/${channel.max_clients}` : count}
             </span>
           )}
+          {familyMax !== null && !spacer && (
+            <span
+              className={cn("flex shrink-0 items-center gap-0.5 text-xs tabular-nums", node.familyFull ? "font-medium text-danger" : "text-subtle")}
+              title={t("tree.familyLimit", { count: total, max: familyMax })}
+            >
+              <Users aria-hidden className="size-3" />
+              {`${total}/${familyMax}`}
+            </span>
+          )}
           {collapsed && total > 0 && <span className="shrink-0 rounded-full bg-hover px-1.5 text-xs tabular-nums text-muted">{total}</span>}
           <MentionBadge count={mentions} />
           <UnreadBadge count={unread} />
@@ -254,6 +274,11 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
           <ContextMenu.Item className={menuItem} disabled={current || !canJoin} onSelect={join}>
             <LogIn className="size-4" /> {t("tree.joinVoice")}
           </ContextMenu.Item>
+          {!onGwar && (
+            <ContextMenu.Item className={menuItem} onSelect={() => openDialog({ kind: "channelInfo", channel: channel.id })}>
+              <Info className="size-4" /> {t("tree.info")}
+            </ContextMenu.Item>
+          )}
           {(canCreate || canEdit || canDelete) && <ContextMenu.Separator className={menuSeparator} />}
           {canCreate && (
             <ContextMenu.Item className={menuItem} onSelect={() => openDialog({ kind: "channelEdit", mode: "create", parent: channel.id })}>
@@ -264,6 +289,16 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
             <ContextMenu.Item className={menuItem} onSelect={() => openDialog({ kind: "channelEdit", mode: "edit", channel: channel.id })}>
               <Pencil className="size-4" /> {t("tree.edit")}
             </ContextMenu.Item>
+          )}
+          {canEdit && place && (
+            <>
+              <ContextMenu.Item className={menuItem} disabled={place === "first" || place === "only"} onSelect={() => void controller.moveChannelBy(channel.id, -1)}>
+                <ArrowUp className="size-4" /> {t("tree.moveUp")}
+              </ContextMenu.Item>
+              <ContextMenu.Item className={menuItem} disabled={place === "last" || place === "only"} onSelect={() => void controller.moveChannelBy(channel.id, 1)}>
+                <ArrowDown className="size-4" /> {t("tree.moveDown")}
+              </ContextMenu.Item>
+            </>
           )}
           {canEdit && onGwar && (
             <ContextMenu.Item className={menuItem} onSelect={() => openDialog({ kind: "channelPermissions", channel: channel.id })}>
@@ -328,7 +363,7 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
           tabIndex={-1}
           draggable={canMove}
           onDragStart={(e) => {
-            e.dataTransfer.setData(CLIENT_MIME, String(client.id));
+            e.dataTransfer.setData(CLIENT_MIME, clientDragData({ id: client.id, uid: client.uid }));
             e.dataTransfer.effectAllowed = "move";
           }}
           onDoubleClick={openDm}
@@ -348,6 +383,7 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
           <span className={cn("min-w-0 truncate", silenced && "text-muted", isMe && "font-medium")} style={color ? { color } : undefined}>
             {client.nickname}
           </span>
+          <TsGroupBadges groups={client.groups} channelGroup={client.channel_group} />
           {client.away !== null && (
             <span className="min-w-0 max-w-[40%] truncate text-xs text-subtle" title={client.away}>
               {client.away || t("tree.away")}
@@ -390,7 +426,7 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
             </>
           )}
           {canMove && myChannel !== null && client.channel !== myChannel && (
-            <ContextMenu.Item className={menuItem} onSelect={() => void controller.moveClient(client.id, myChannel)}>
+            <ContextMenu.Item className={menuItem} onSelect={() => void controller.moveClient(client.id, client.uid, myChannel)}>
               <MoveRight className="size-4" /> {t("tree.moveHere")}
             </ContextMenu.Item>
           )}

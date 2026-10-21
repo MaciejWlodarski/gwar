@@ -1690,16 +1690,16 @@ mod tests {
             panic!()
         };
         core.sessions.get_mut(&local).unwrap().groups = vec![ADMIN_GROUP];
-        core.client_move(local, local, other.id).unwrap();
+        core.client_move(local, local, None, other.id).unwrap();
         assert_eq!(core.calls.len(), 2);
         core.bridge_msg(BridgeMsg::Update(remote, RemoteUpdate { channel: Some(other.id), ..Default::default() }));
         assert_eq!(core.calls.len(), 1);
         assert_eq!(core.voice_state(local).unwrap().call, core.voice_state(remote).unwrap().call);
         assert_ne!(core.voice_state(remote).unwrap().participation, original.participation);
         assert!(core.sessions[&remote].voice, "bridge move retains remote transport");
-        core.client_move(local, remote, 1).unwrap();
+        core.client_move(local, remote, None, 1).unwrap();
         assert!(core.sessions[&remote].voice, "forced move retains remote transport");
-        core.client_move(local, remote, other.id).unwrap();
+        core.client_move(local, remote, None, other.id).unwrap();
         assert!(core.sessions[&remote].voice);
         while frames.try_recv().is_ok() {}
         core.handle(CoreMsg::Talking { session: local, talking: true, binding: Some(previous) });
@@ -1935,7 +1935,7 @@ mod tests {
         core.move_client(session, None).unwrap();
         core.channels.get_mut(&channel).unwrap().max_clients = Some(0);
         core.sessions.get_mut(&session).unwrap().groups = vec![ADMIN_GROUP];
-        assert_eq!(core.client_move(session, session, channel).unwrap_err().code, ErrorCode::ChannelFull);
+        assert_eq!(core.client_move(session, session, None, channel).unwrap_err().code, ErrorCode::ChannelFull);
         assert!(core.calls.is_empty());
         assert!(core.sessions[&session].participation.is_none());
     }

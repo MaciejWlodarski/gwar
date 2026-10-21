@@ -593,6 +593,7 @@ impl Core {
             },
             teamspeak: config.teamspeak,
             server_chat: store.server_chat()?,
+            badges: Vec::new(),
         };
         let groups = store.groups()?.into_iter().map(|g| (g.id, g)).collect();
         let mls_commit_clock = store.meta("mls_commit_clock")?.map(|s| s.parse()).transpose()?.unwrap_or(0);
@@ -1732,8 +1733,16 @@ impl Core {
             Request::Mls(request) => self.mls_request(session, request),
             Request::Ping {} => Ok(Response::Empty {}),
             Request::ClientUpdate(update) => self.client_update(session, update),
-            Request::ClientMove { client, channel } => self.client_move(session, client, channel),
-            Request::ClientKick { client, reason } => self.client_kick(session, client, reason),
+            Request::ClientMove { client, uid, channel } => self.client_move(session, client, uid, channel),
+            Request::ClientKick { from_channel: true, .. } => {
+                Err(err(ErrorCode::BadRequest, "Gwar servers kick from the server only"))
+            }
+            Request::ClientKick { client, uid, reason, from_channel: false } => {
+                self.client_kick(session, client, uid, reason)
+            }
+            Request::ClientPoke { .. } | Request::ChannelDescription { .. } => {
+                Err(err(ErrorCode::BadRequest, "only TeamSpeak servers have that"))
+            }
             Request::ChannelJoin { channel, password } => return self.channel_join(session, id, channel, password),
             Request::ChannelLeave {} => self.channel_leave(session),
             Request::ChatRead { target, message } => match target {
@@ -1851,13 +1860,14 @@ impl Core {
         self.voice_snapshot(session);
     }
 
-    fn client_move(&mut self, session: SessionId, client: SessionId, channel: ChannelId) -> Reply {
+    fn client_move(&mut self, session: SessionId, client: SessionId, uid: Option<Uid>, channel: ChannelId) -> Reply {
         if !self.channels.contains_key(&channel) {
             return Err(err(ErrorCode::NotFound, "no such channel"));
         }
         // Moving someone needs the permission where they are going.
         self.require_in(session, channel, Permission::MoveMembers)?;
-        let Some(target) = self.sessions.get(&client) else {
+        // A reused session id is someone else.
+        let Some(target) = self.sessions.get(&client).filter(|s| uid.as_ref().is_none_or(|u| *u == s.uid)) else {
             return Err(err(ErrorCode::NotFound, "no such client"));
         };
         if client != session && !self.outranks(session, &target.member, &target.groups) {
@@ -1886,12 +1896,19 @@ impl Core {
         Ok(Response::Empty {})
     }
 
-    fn client_kick(&mut self, session: SessionId, client: SessionId, reason: Option<String>) -> Reply {
+    fn client_kick(
+        &mut self,
+        session: SessionId,
+        client: SessionId,
+        uid: Option<Uid>,
+        reason: Option<String>,
+    ) -> Reply {
         self.require(session, Permission::KickMembers)?;
         if client == session {
             return Err(err(ErrorCode::BadRequest, "cannot kick yourself"));
         }
-        let Some(target) = self.sessions.get(&client) else {
+        // A reused session id is someone else.
+        let Some(target) = self.sessions.get(&client).filter(|s| uid.as_ref().is_none_or(|u| *u == s.uid)) else {
             return Err(err(ErrorCode::NotFound, "no such client"));
         };
         if !self.outranks(session, &target.member, &target.groups) {
@@ -2769,6 +2786,7 @@ fn channel_view(row: &ChannelRow) -> Channel {
         position: row.position,
         has_password: row.password_hash.is_some(),
         max_clients: row.max_clients,
+        max_family_clients: None,
         encrypted: row.encrypted,
         history: row.history,
         private: row.private,
@@ -2795,6 +2813,7 @@ fn client_view(s: &Session) -> Client {
         server_muted: s.server_muted,
         server_deafened: s.server_deafened,
         sharing: s.shared,
+        channel_group: None,
     }
 }
 

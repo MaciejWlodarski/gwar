@@ -22,4 +22,8 @@ server_deafened?: boolean,
 /**
  * Sharing their screen (the channel tree's LIVE badge).
  */
-sharing?: boolean, };
+sharing?: boolean, 
+/**
+ * TeamSpeak servers only: the channel group in the current channel.
+ */
+channel_group?: number | null, };

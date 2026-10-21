@@ -5,7 +5,7 @@ import { acceptHandle } from "../net/handle-pins";
 import { validNickname } from "../net/nickname";
 import { controller, describeRequestError } from "../state/controller";
 import { useSession, useUi } from "../state/stores";
-import { ConnectBadge, IdentityLine } from "./badges";
+import { ConnectBadge, IdentityLine, TsGroupBadges } from "./badges";
 import { useMemberName, useMyWho, usePermission, useWhoOf } from "./hooks";
 import { canActOn } from "../lib/permissions";
 
@@ -72,6 +72,7 @@ export function MemberProfileDialog({ uid, fallback }: { uid: string; fallback: 
   const t = useT();
   const close = useUi((s) => s.closeDialog);
   const member = useSession((s) => s.members[uid]);
+  const client = useSession((s) => Object.values(s.clients).find((c) => c.uid === uid));
   const nickname = useMemberName(uid, fallback);
   const own = useSession((s) => s.me?.uid === uid);
   const onGwar = useSession((s) => s.kind === "gwar");
@@ -102,6 +103,7 @@ export function MemberProfileDialog({ uid, fallback }: { uid: string; fallback: 
               <ConnectBadge member={member} />
             </div>
             <IdentityLine member={member} tag={member?.tag} className="block" />
+            {client && <TsGroupBadges groups={client.groups} channelGroup={client.channel_group} wrap className="mt-1" />}
           </div>
         </div>
         {connect?.status === "changed" && (

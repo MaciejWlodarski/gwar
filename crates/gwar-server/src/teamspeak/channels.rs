@@ -182,6 +182,7 @@ mod tests {
             position,
             has_password: false,
             max_clients: None,
+            max_family_clients: None,
             encrypted: false,
             history: false,
             private: false,

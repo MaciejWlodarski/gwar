@@ -8,8 +8,15 @@ use gwar_client::teamspeak::{self, TsOptions};
 
 async fn client(address: &str, name: &str) -> anyhow::Result<teamspeak::TsConnected> {
     let identity = teamspeak::load_identity(&std::env::temp_dir().join(format!("gwar-ts-latency-{name}.json")))?;
-    teamspeak::connect(TsOptions { address: address.into(), nickname: name.into(), server_password: None, identity })
-        .await
+    teamspeak::connect(TsOptions {
+        address: address.into(),
+        nickname: name.into(),
+        server_password: None,
+        identity,
+        channel: None,
+        channel_password: None,
+    })
+    .await
 }
 
 #[tokio::main]

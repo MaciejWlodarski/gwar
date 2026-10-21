@@ -499,6 +499,8 @@ therefore have different TS suffixes while retaining the same Gwar nickname.
   - TeamSpeak edits and moves a channel with separate commands, so
     `channel.update` runs the edit, then the move; a move refused after the
     edit went through is `partial`, and its message says which part was done.
+    A ban by identity alone is TeamSpeak's `banadd`; with the address it is
+    `banclient`. Either way TeamSpeak drops whoever the ban matches.
   - Ids for TeamSpeak messages come from one counter per process, so rows kept
     across a reconnect never share an id with new ones.
   - The Welcome offers every permission and the UI keeps that list (there are
@@ -509,6 +511,49 @@ therefore have different TS suffixes while retaining the same Gwar nickname.
   - TeamSpeak gives a channel's chat only to the people in it, so the UI writes
     only in the user's own channel. Top-level `[spacer]` channels are drawn as
     spacers.
+  - TeamSpeak-only requests: `client.poke` (received pokes arrive as
+    `client.poked` and show as a toast, not as messages), `client.kick` with
+    `from_channel` (back to the default channel), and `channel.description`
+    (`channelgetdescription`; BBCode tags are dropped and the UI shows the rest
+    as text, never as markup). Gwar servers refuse them, and the Gwar
+    connection drops `client.poked`: nothing would verify who a poke is from.
+  - Text from the TeamSpeak server that the UI shows (nicknames, away
+    messages, channel and server names, topics, chat authors, pokes, the
+    welcome message, descriptions) loses bidi formatting and control
+    characters, in the adapter (`display_text`) and again where the
+    TeamSpeak connection hands events and replies to the UI (`displayData`);
+    notifications and toasts clean what they show as well. Spacing stays
+    (spacer channels are drawn from their names); descriptions and the welcome
+    keep their newlines and tabs.
+  - TeamSpeak hands a leaving client's id to the next one, so `client.move`,
+    `client.kick`, `client.poke` and `ban.create` carry the uid the UI meant
+    along with the session (a dragged person carries it from the drag start); a session that is now someone else's is `not_found`, and a ban by
+    identity bans the uid meant (Gwar servers check the same).
+  - `channel.update`'s `position` is the place among the other siblings;
+    TeamSpeak's `channel_order` names the sibling before it, so the adapter
+    translates one into the other. The UI moves TeamSpeak channels up or down.
+  - `max_family_clients` is TeamSpeak's limit for a channel and its subchannels
+    together; the tree marks the whole family full once it is reached.
+  - Bans go to TeamSpeak's own ban list. Listing and lifting bans stays in the
+    TeamSpeak client: tsclientlib rejects ban list entries without an address.
+  - A saved TeamSpeak server may name a channel to land in (a `Parent/Child`
+    path) and its password (tsclientlib's `channel` and `channel_password`).
+  - TeamSpeak 3.13 sends no channel permission hints, so the UI cannot tell
+    ahead of time which channels refuse a join; the refusal explains it.
+  - TeamSpeak's server and channel groups arrive as `ServerInfo.badges`
+    (regular groups only, without the server's default server and channel
+    group, which everyone has); `Client.groups` holds the server groups and
+    `Client.channel_group` the channel group. The UI shows them by name next
+    to members. They are display only and never Gwar roles: permissions stay
+    with the TeamSpeak server.
+    - tsclientlib's book keeps every group a list ever named, so badges come
+      only from the groups in the latest complete `servergrouplist` /
+      `channelgrouplist`: a deleted group's badge goes, a renamed one changes.
+    - Order is TeamSpeak's: by sort id where both groups have one, by id where
+      either has none (0). That rule can cycle pairwise, so the adapter makes it
+      one order over the whole catalog, before cutting it; every member's
+      badges keep the catalog's order. At most 256 badges of each kind, named
+      as one line of plain text (`display_text`) of at most 64 characters.
 
 ## Clients
 

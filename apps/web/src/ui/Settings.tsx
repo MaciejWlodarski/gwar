@@ -419,6 +419,9 @@ function IdentityTab() {
   const setNickname = (value: string) => setNicknameDraft({ source: globalNickname, value });
   const [nicknameError, setNicknameError] = useState<string | null>(null);
   const [away, setAway] = useState(me?.away ?? "");
+  // The away message as shown when opened (or last saved): only an edit made here is sent, as
+  // the shown one may be a cleaned copy of the server's.
+  const [shownAway, setShownAway] = useState(away);
   const [busy, setBusy] = useState(false);
   const file = useRef<HTMLInputElement>(null);
 
@@ -476,7 +479,8 @@ function IdentityTab() {
   const saveProfile = async () => {
     setBusy(true);
     try {
-      await controller.updateProfile({ away: away.trim() });
+      if (away !== shownAway) await controller.updateProfile({ away: away.trim() });
+      setShownAway(away);
       toast("success", t("common.saved"));
     } catch {
       toast("error", t("err.req.internal"));

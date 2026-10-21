@@ -90,7 +90,13 @@ wire! {
         #[serde(rename = "client.update")]
         ClientUpdate(ClientUpdate),
         #[serde(rename = "client.move")]
-        ClientMove { client: SessionId, channel: ChannelId },
+        ClientMove {
+            client: SessionId,
+            /// Who `client` was when the move was chosen: refused if the session is now someone else's.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            uid: Option<Uid>,
+            channel: ChannelId,
+        },
         /// Mutes or deafens someone for everyone (`mute_members` in their channel); absent fields stay.
         #[serde(rename = "client.voice")]
         ClientVoice {
@@ -100,8 +106,30 @@ wire! {
             #[serde(default, skip_serializing_if = "Option::is_none")]
             deafened: Option<bool>,
         },
+        /// Kicks from the server, or (TeamSpeak servers only) `from_channel` back to the default channel.
         #[serde(rename = "client.kick")]
-        ClientKick { client: SessionId, #[serde(default)] reason: Option<String> },
+        ClientKick {
+            client: SessionId,
+            /// Who `client` was when the kick was chosen: refused if the session is now someone else's.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            uid: Option<Uid>,
+            #[serde(default)]
+            reason: Option<String>,
+            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+            from_channel: bool,
+        },
+        /// Gets someone's attention with a short message (TeamSpeak servers only).
+        #[serde(rename = "client.poke")]
+        ClientPoke {
+            client: SessionId,
+            /// Who `client` was when the poke was written: refused if the session is now someone else's.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            uid: Option<Uid>,
+            message: String,
+        },
+        /// A channel's long description, as plain text (TeamSpeak servers only); answers `{description}`.
+        #[serde(rename = "channel.description")]
+        ChannelDescription { channel: ChannelId },
         /// Joins the channel's voice room (leaving any other).
         #[serde(rename = "channel.join")]
         ChannelJoin { channel: ChannelId, #[serde(default)] password: Option<String> },
@@ -467,7 +495,8 @@ wire! {
         pub mentionable: Option<bool>,
     }
 
-    /// Bans an online client (by session) or a known member (by uid).
+    /// Bans an online client (by session) or a known member (by uid). With both, the session must
+    /// still be that uid's: session ids are reused.
     #[derive(Default)]
     pub struct BanCreate {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -647,6 +676,9 @@ wire! {
         ClientUpdated(Client),
         #[serde(rename = "client.left")]
         ClientLeft { client: SessionId, reason: LeaveReason },
+        /// Someone pokes me (TeamSpeak servers only).
+        #[serde(rename = "client.poked")]
+        ClientPoked { client: SessionId, nickname: String, message: String },
         #[serde(rename = "chat.message")]
         ChatMessage(ChatMessage),
         #[serde(rename = "chat.edited")]
@@ -846,6 +878,28 @@ wire! {
         /// TeamSpeak compatibility is on (new channels default to plaintext).
         pub teamspeak: bool,
         pub server_chat: ServerChat,
+        /// TeamSpeak servers only: the server and channel groups shown next to their members.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub badges: Vec<Badge>,
+    }
+
+    /// A TeamSpeak server or channel group, for display only: the TeamSpeak server decides what
+    /// its groups may do.
+    pub struct Badge {
+        pub kind: BadgeKind,
+        pub id: u32,
+        pub name: String,
+        /// TeamSpeak's sort id: lower comes first.
+        pub sort: i32,
+    }
+
+    #[derive(Copy, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum BadgeKind {
+        /// Matched against [`Client::groups`].
+        Server,
+        /// Matched against [`Client::channel_group`].
+        Channel,
     }
 
     /// Permanent server-wide chat options, chosen at the first serving start.
@@ -875,6 +929,9 @@ wire! {
         pub position: i32,
         pub has_password: bool,
         pub max_clients: Option<u32>,
+        /// TeamSpeak servers only: the most clients in this channel and its subchannels together.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_family_clients: Option<u32>,
         /// End-to-end encrypted, fixed at creation (docs/e2e-build.md, section 4).
         pub encrypted: bool,
         /// New members see earlier messages; for display only, clients trust the group's descriptor.
@@ -916,6 +973,9 @@ wire! {
         /// Sharing their screen (the channel tree's LIVE badge).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         pub sharing: bool,
+        /// TeamSpeak servers only: the channel group in the current channel.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub channel_group: Option<u32>,
     }
 
     pub struct Group {

@@ -458,6 +458,9 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
       if (gone && !Object.values(next.clients).some((c) => c.uid === gone.uid)) next = upsertMember(next, gone, now);
       return channelNotices(state, next, now, event.d.client);
     }
+    // Shown by the controller (a toast); nothing in the session changes.
+    case "client.poked":
+      return state;
     case "chat.message":
       return onChatMessage(state, event.d, verified, authentic);
     case "chat.read": {

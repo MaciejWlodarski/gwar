@@ -25,7 +25,8 @@ export function BanDialog({ person, back }: { person: PersonRef; back?: ServerSe
     setError(null);
     try {
       await controller.createBan({
-        ...(online ? { client: person.session } : { uid: person.uid }),
+        // The uid too: if the session is someone else's by now, the server refuses instead of banning them.
+        ...(online ? { client: person.session, uid: person.uid } : { uid: person.uid }),
         ip: online && ip,
         ...(BAN_DURATIONS.find((d) => d.id === duration)?.seconds ? { duration: BAN_DURATIONS.find((d) => d.id === duration)!.seconds } : {}),
         ...(reason.trim() ? { reason: reason.trim() } : {}),

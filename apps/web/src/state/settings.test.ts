@@ -25,15 +25,23 @@ it("times only synced changes, remembers removals and forgets them when the serv
     expect(s().bookmarks[0]?.updatedAt).toBe(2_000);
     expect(s().bookmarkEdits).toBe(2);
 
+    // A TeamSpeak server's channel and its password are synced too.
+    vi.setSystemTime(2_500);
+    s().saveBookmark({ id: "t", name: "T", address: "t.example.com", kind: "teamspeak" });
+    vi.setSystemTime(2_600);
+    s().saveBookmark({ ...s().bookmarks.find((b) => b.id === "t")!, channel: "Lobby/Games", channelPassword: "pw" });
+    expect(s().bookmarks.find((b) => b.id === "t")).toMatchObject({ channel: "Lobby/Games", channelPassword: "pw", updatedAt: 2_600 });
+    s().removeBookmark("t");
+
     vi.setSystemTime(3_000);
     s().removeBookmark("a");
     expect(s().bookmarks).toEqual([]);
-    expect(s().removedBookmarks).toEqual({ a: { at: 3_000 } });
+    expect(s().removedBookmarks).toEqual({ a: { at: 3_000 }, t: { at: 2_601 } });
 
     s().replaceBookmarks([{ id: "b", name: "B", address: "b.example.com", kind: "gwar", updatedAt: 5 }]);
-    expect(s().bookmarkEdits).toBe(3);
+    expect(s().bookmarkEdits).toBe(6);
     s().saveBookmark({ id: "a", name: "A", address: "a.example.com", kind: "gwar" });
-    expect(s().removedBookmarks).toEqual({});
+    expect(s().removedBookmarks).toEqual({ t: { at: 2_601 } });
     expect(s().bookmarks.map((b) => b.id)).toEqual(["b", "a"]);
 
     // A synced bookmark from a device whose clock is ahead: edits and removals here still come after it.
@@ -41,7 +49,7 @@ it("times only synced changes, remembers removals and forgets them when the serv
     s().saveBookmark({ id: "c", name: "C2", address: "c.example.com", kind: "gwar" });
     expect(s().bookmarks[0]).toMatchObject({ name: "C2", updatedAt: 9_001, account: "acct" });
     s().removeBookmark("c");
-    expect(s().removedBookmarks).toEqual({ c: { at: 9_002, account: "acct" } });
+    expect(s().removedBookmarks).toEqual({ t: { at: 2_601 }, c: { at: 9_002, account: "acct" } });
 
     // Signed in: new bookmarks and removals belong to the account at once, before any sync.
     s().setBookmarkAccount("acct");

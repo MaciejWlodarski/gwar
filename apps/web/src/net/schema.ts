@@ -3,6 +3,8 @@ import type { MessageSignature } from "../proto/MessageSignature";
 import type { DeviceCertificate } from "../proto/DeviceCertificate";
 import type { Attachment } from "../proto/Attachment";
 import type { SealedFile } from "../proto/SealedFile";
+import type { Badge } from "../proto/Badge";
+import type { BadgeKind } from "../proto/BadgeKind";
 import type { Ban } from "../proto/Ban";
 import type { BanNotice } from "../proto/BanNotice";
 import type { Challenge } from "../proto/Challenge";
@@ -64,7 +66,8 @@ const path = (put = false): Rule<string> => (v): v is string => {
   if (!str(2048)(v)) return false;
   try { filePath(v, put ? "PUT" : "GET"); return true; } catch { return false; }
 };
-const server = shape<ServerInfo>({ name: str(256), welcome: text, version: str(64), default_channel: id, max_clients: int(65535), upload_limit: int(Number.MAX_SAFE_INTEGER), file_access: literal<FileAccess>(["link", "members"]), teamspeak: bool, server_chat: shape({ encrypted: bool, history: bool }) });
+const badge = shape<Badge>({ kind: literal<BadgeKind>(["server", "channel"]), id, name: str(256), sort: int(2147483647, -2147483648) });
+const server = shape<ServerInfo>({ name: str(256), welcome: text, version: str(64), default_channel: id, max_clients: int(65535), upload_limit: int(Number.MAX_SAFE_INTEGER), file_access: literal<FileAccess>(["link", "members"]), teamspeak: bool, server_chat: shape({ encrypted: bool, history: bool }), badges: optional(array(badge, 512)) });
 /** A download bearer token: empty, or URL-safe characters only, so it is always a valid header value. */
 const bearer: Rule<string> = (v): v is string => str(128)(v) && /^[A-Za-z0-9_-]*$/.test(v);
 const fixed = (bytes: number): Rule<string> => (v): v is string => {
@@ -80,8 +83,8 @@ const challenge = shape<Challenge>({ protocol: int(255), server_pk: fixed(32), s
 const serverProof = shape<ServerProof>({ server_proof: fixed(64) });
 const channelAccess = shape<ChannelAccess>({ roles: array(id, 64), users: array(uid, 1000) });
 const channelOverride = shape<ChannelOverride>({ role: optional(nullable(id)), user: optional(nullable(uid)), allow: array(permissions, 32), deny: array(permissions, 32) });
-const channel = shape<Channel>({ id, parent: nullable(id), name: str(256), topic: text, position: int(2147483647, -2147483648), has_password: bool, max_clients: nullable(int(65535)), encrypted: bool, history: bool, private: bool, access: optional(nullable(channelAccess)), overrides: optional(array(channelOverride, 100)), synced: bool });
-const client = shape<Client>({ id, uid, nickname: str(256), channel: nullable(id), groups: ids, platform, muted: bool, deafened: bool, away: nullable(text), talking: bool, voice: bool, voice_binding: nullable(voiceBinding), server_muted: optional(bool), server_deafened: optional(bool), sharing: optional(bool) });
+const channel = shape<Channel>({ id, parent: nullable(id), name: str(256), topic: text, position: int(2147483647, -2147483648), has_password: bool, max_clients: nullable(int(65535)), max_family_clients: optional(nullable(int(65535))), encrypted: bool, history: bool, private: bool, access: optional(nullable(channelAccess)), overrides: optional(array(channelOverride, 100)), synced: bool });
+const client = shape<Client>({ id, uid, nickname: str(256), channel: nullable(id), groups: ids, platform, muted: bool, deafened: bool, away: nullable(text), talking: bool, voice: bool, voice_binding: nullable(voiceBinding), server_muted: optional(bool), server_deafened: optional(bool), sharing: optional(bool), channel_group: optional(nullable(id)) });
 const color: Rule<string> = (v): v is string => typeof v === "string" && /^#[0-9a-f]{6}$/i.test(v);
 const group = shape<Group>({ id, name: str(256), permissions: array(permissions, 32), color: optional(nullable(color)), position: int(4294967295), hoist: bool, mentionable: bool });
 const attestation = shape<HandleAttestation>({ account_key: str(128), handle: str(64), issued_at: id, expires_at: id, signature: str(128) });
@@ -140,7 +143,7 @@ export const events: { [K in EventName]: Rule<EventData<K>> } = {
   "chat.sealed": sealedMessage, "chat.sealed.removed": shape({ conversation, ids: array(id, 1000) }),
   challenge, "server.updated": server, "channel.created": channel, "channel.updated": channel,
   "channel.deleted": shape({ channel: id }), "channel.hidden": shape({ channel: id }), "owner.updated": ownerInfo, "managers.updated": managers, "client.joined": client, "client.updated": client,
-  "client.left": shape({ client: id, reason: leave }), "chat.message": message, "chat.edited": message,
+  "client.left": shape({ client: id, reason: leave }), "client.poked": shape({ client: id, nickname: str(256), message: text }), "chat.message": message, "chat.edited": message,
   "chat.deleted": shape({ channel: id, message: id }), "group.created": group, "group.updated": group,
   "group.deleted": shape({ group: id }), "group.reordered": shape({ groups: ids }), "member.updated": member, "member.removed": shape({ uid }),
   "voice.talking": shape({ ...voiceFields, client: int(4294967295), talking: bool }), "voice.slot": shape({ ...transportFields, slot: int(7), client: nullable(int(4294967295)) }),
@@ -169,6 +172,7 @@ export const responses: { [K in Op]: Rule<ResponseMap[K]> } = {
   "mls.group_history": shape({ incarnations: array(shape({ group: mlsGroupId, descriptor: str(16384) }), 100), next: cursor }),
 
   hello: serverProof, join: welcome, ping: empty, "client.update": empty, "client.move": empty, "client.voice": empty, "client.kick": empty,
+  "client.poke": empty, "channel.description": shape({ description: str(8192) }),
   "channel.join": empty, "channel.leave": empty, "channel.create": channel, "channel.update": channel, "channel.override": channel, "channel.delete": empty,
   "chat.sealed.send": sealedMessage, "chat.sealed.edit": sealedMessage, "chat.delete_own": sealedMessage,
   "chat.sealed.history": shape({ sealed: array(sealedMessage, 100) }), "chat.sealed.remove": empty,
