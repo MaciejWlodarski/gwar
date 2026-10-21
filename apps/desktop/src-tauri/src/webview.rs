@@ -1,13 +1,19 @@
 //! What may run in the app's webview (docs/architecture.md, "Native command surface").
 //!
-//! Only the app's own document runs there: the main window navigates nowhere else, it opens no
-//! windows of its own (links open in the system browser), and its CSP allows no frames. That is
+//! Only the app's own document runs there: the main window navigates nowhere else and opens no
+//! windows of its own (web pages, such as chat links, open in the system browser), and its CSP
+//! allows no frames. That is
 //! what keeps screen capture to the app: neither WebKit (its own picker path) nor WebView2
 //! (Chromium's picker) asks the permission handler about display capture, so no permission
 //! answer can limit it. It is limited because no other document can be there to ask.
 //!
 //! Webview microphone and camera requests are denied (`media_permission`); on Windows a grant
 //! saved in the WebView2 profile would skip that question, so it is overridden first.
+
+use std::{
+    sync::Mutex,
+    time::{Duration, Instant},
+};
 
 #[cfg(windows)]
 use tauri::WebviewUrl;
@@ -16,24 +22,64 @@ use tauri::{
     webview::{NewWindowResponse, PermissionKind, PermissionResponse},
 };
 
-/// Whether `url` is the app's document: its bundled origin, or the dev server under
-/// `tauri dev`. An empty document runs nothing and is how the Windows window starts.
-pub(crate) fn app_document(url: &Url, dev: Option<&Url>) -> bool {
-    let origin = |u: &Url| (u.scheme().to_owned(), u.host_str().map(str::to_owned), u.port_or_known_default());
-    if url.as_str() == "about:blank" {
-        return true;
-    }
-    let bundled =
-        matches!((url.scheme(), url.host_str()), ("tauri", Some("localhost")) | ("http", Some("tauri.localhost")))
-            && url.port().is_none();
-    bundled || dev.is_some_and(|dev| origin(dev) == origin(url))
+/// Where the bundled app is served. wry's custom protocol is `tauri:` on macOS and Linux; on
+/// Windows WebView2 intercepts this HTTP address instead. Each platform's other address is
+/// ordinary networking there, so it is not the app.
+const BUNDLED_ORIGIN: &str = if cfg!(windows) { "http://tauri.localhost" } else { "tauri://localhost" };
+
+/// What the main window does with a navigation.
+#[derive(Debug, PartialEq, Eq)]
+enum Navigation {
+    /// The app's own document: its bundled origin, or the dev server under `tauri dev`. An
+    /// empty document runs nothing and is how the Windows window starts.
+    Load,
+    /// A web page, such as a chat link (WebKit asks here before it would open a new window):
+    /// the system browser opens it, the window stays.
+    Browser,
+    Refuse,
 }
 
-/// A link the app's document opens in a new window, opened in the system browser instead.
-fn open_link(url: &Url) {
-    if matches!(url.scheme(), "http" | "https")
-        && let Err(e) = open::that_detached(url.as_str())
+fn navigation(url: &Url, bundled: &Url, dev: Option<&Url>) -> Navigation {
+    let origin = |u: &Url| (u.scheme().to_owned(), u.host_str().map(str::to_owned), u.port_or_known_default());
+    if url.as_str() == "about:blank"
+        || origin(url) == origin(bundled)
+        || dev.is_some_and(|dev| origin(dev) == origin(url))
     {
+        Navigation::Load
+    } else if web_page(url) {
+        Navigation::Browser
+    } else {
+        Navigation::Refuse
+    }
+}
+
+fn web_page(url: &Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+}
+
+/// When the system browser last opened a link.
+static LAST_OPENED: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// At most one link a second: a document cannot flood the browser, and a click that reaches both
+/// the navigation and the new-window callback opens once.
+fn may_open(last: Option<Instant>, now: Instant) -> bool {
+    last.is_none_or(|last| now.duration_since(last) >= Duration::from_secs(1))
+}
+
+/// Opens a web page in the system browser instead of the app's window.
+fn open_link(url: &Url) {
+    if !web_page(url) {
+        return;
+    }
+    {
+        let now = Instant::now();
+        let mut last = LAST_OPENED.lock().unwrap_or_else(|e| e.into_inner());
+        if !may_open(*last, now) {
+            return;
+        }
+        *last = Some(now);
+    }
+    if let Err(e) = open::that_detached(url.as_str()) {
         tracing::warn!("cannot open a link: {e}");
     }
 }
@@ -58,6 +104,7 @@ fn dev_url<R: Runtime>(app: &App<R>) -> Option<Url> {
 pub(crate) fn create_main<R: Runtime>(app: &App<R>) -> tauri::Result<()> {
     let config = app.config().app.windows.iter().find(|w| w.label == "main").cloned().expect("main window config");
     let dev = dev_url(app);
+    let bundled = Url::parse(BUNDLED_ORIGIN).expect("bundled origin");
     // On Windows the window starts empty: the app is loaded once saved media grants are overridden.
     #[cfg(windows)]
     let (config, app_url) = (
@@ -65,15 +112,19 @@ pub(crate) fn create_main<R: Runtime>(app: &App<R>) -> tauri::Result<()> {
             url: WebviewUrl::External(Url::parse("about:blank").expect("blank")),
             ..config
         },
-        dev.clone().unwrap_or_else(|| Url::parse("http://tauri.localhost/").expect("app URL")),
+        dev.clone().unwrap_or_else(|| bundled.clone()),
     );
     let builder = WebviewWindowBuilder::from_config(app.handle(), &config)?
-        .on_navigation(move |url| {
-            let allowed = app_document(url, dev.as_ref());
-            if !allowed {
-                tracing::warn!("blocked a navigation away from the app");
+        .on_navigation(move |url| match navigation(url, &bundled, dev.as_ref()) {
+            Navigation::Load => true,
+            Navigation::Browser => {
+                open_link(url);
+                false
             }
-            allowed
+            Navigation::Refuse => {
+                tracing::warn!("blocked a navigation away from the app");
+                false
+            }
         })
         .on_new_window(|url, _| {
             open_link(&url);
@@ -174,25 +225,50 @@ mod tests {
 
     #[test]
     fn only_the_apps_own_document_loads() {
-        for ok in ["tauri://localhost/", "tauri://localhost/index.html#x", "http://tauri.localhost/", "about:blank"] {
-            assert!(app_document(&url(ok), None), "{ok}");
+        let mac = url("tauri://localhost");
+        let windows = url("http://tauri.localhost");
+        assert_eq!(url(BUNDLED_ORIGIN), if cfg!(windows) { windows.clone() } else { mac.clone() });
+        let at = |u: &str, bundled: &Url| navigation(&url(u), bundled, None);
+        for ok in ["tauri://localhost/", "tauri://localhost/index.html#x", "about:blank"] {
+            assert_eq!(at(ok, &mac), Navigation::Load, "{ok}");
         }
-        for no in [
-            "https://gwar.app/",
-            "https://tauri.localhost/",
-            "http://tauri.localhost:8080/",
-            "http://localhost:5173/",
-            "tauri://evil/",
-            "data:text/html,x",
-            "blob:tauri://localhost/1",
-            "file:///etc/passwd",
-            "about:srcdoc",
-        ] {
-            assert!(!app_document(&url(no), None), "{no}");
+        assert_eq!(at("http://tauri.localhost/", &windows), Navigation::Load);
+        // Each platform's other address is the network there, never the app.
+        assert_eq!(at("http://tauri.localhost/", &mac), Navigation::Browser);
+        assert_eq!(at("tauri://localhost/", &windows), Navigation::Refuse);
+        for bundled in [&mac, &windows] {
+            for web in [
+                "https://gwar.app/",
+                "https://tauri.localhost/",
+                "http://tauri.localhost:8080/",
+                "http://localhost:5173/",
+            ] {
+                assert_eq!(at(web, bundled), Navigation::Browser, "{web}");
+            }
+            for no in [
+                "tauri://evil/",
+                "tauri://localhost:1/",
+                "data:text/html,x",
+                "blob:tauri://localhost/1",
+                "file:///etc/passwd",
+                "about:srcdoc",
+                "javascript:alert(1)",
+            ] {
+                assert_eq!(at(no, bundled), Navigation::Refuse, "{no}");
+            }
         }
         let dev = url("http://localhost:5173");
-        assert!(app_document(&url("http://localhost:5173/src/main.tsx"), Some(&dev)));
-        assert!(!app_document(&url("http://localhost:5174/"), Some(&dev)));
+        assert_eq!(navigation(&url("http://localhost:5173/src/main.tsx"), &mac, Some(&dev)), Navigation::Load);
+        assert_eq!(navigation(&url("http://localhost:5174/"), &mac, Some(&dev)), Navigation::Browser);
+    }
+
+    #[test]
+    fn the_browser_opens_one_link_a_second() {
+        let now = Instant::now();
+        assert!(may_open(None, now));
+        assert!(!may_open(Some(now), now), "the same click through both callbacks");
+        assert!(!may_open(Some(now), now + Duration::from_millis(999)));
+        assert!(may_open(Some(now), now + Duration::from_secs(1)));
     }
 
     #[test]

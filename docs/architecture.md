@@ -524,10 +524,12 @@ and identity-write access; CSP and frame validation reduce that exposure.
 
 Only the app's own document runs in the webview (`src/webview.rs`):
 
-- `main` navigates only within the app's origin (the dev server under
-  `tauri dev`);
-- it opens no windows: a link opened in a new window goes to the system
-  browser (http and https only);
+- `main` navigates only within the app's origin: `tauri://localhost` on
+  macOS and Linux, `http://tauri.localhost` on Windows (each is ordinary
+  networking on the other), or the dev server under `tauri dev`;
+- it opens no windows: a web page it would navigate to or open in a new
+  window, such as a chat link, goes to the system browser instead (http and
+  https only, at most one a second);
 - the CSP allows no frames (`frame-src 'none'`).
 
 That is what limits screen capture (docs/screen-share.md) to the app.
