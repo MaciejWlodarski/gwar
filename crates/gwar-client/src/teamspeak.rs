@@ -494,9 +494,10 @@ fn ordered_badges(mut server: Vec<Badge>, mut channel: Vec<Badge>) -> Vec<Badge>
 }
 
 /// TeamSpeak orders groups by sort id where both have one and by id where either has none (0),
-/// like ts3phpframework's `sortGroupList`. As a total order: groups without a sort id keep their
-/// places by id, and the others fill the remaining places by sort id, then id. Same as
-/// `teamspeakOrder` in apps/web/src/lib/ts-badges.ts.
+/// like ts3phpframework's `sortGroupList`. Pairwise that rule can cycle, so it is made one order
+/// over the whole catalog: groups without a sort id keep their places by id, and the others fill
+/// the remaining places by sort id, then id. This is the canonical order: it is computed once
+/// here, before the catalog is cut, and the UI keeps it for every member's subset.
 fn teamspeak_order(groups: &mut [Badge]) {
     groups.sort_by_key(|b| b.id);
     let mut sorted: Vec<Badge> = groups.iter().filter(|b| b.sort != 0).cloned().collect();
@@ -1614,6 +1615,14 @@ mod tests {
         assert_eq!(order(&[(3, 0), (6, 1)]), [3, 6]);
         assert_eq!(order(&[(1, 9), (2, 1), (3, 0)]), [2, 1, 3]);
         assert_eq!(order(&[(2, 5), (1, 5)]), [1, 2]);
+
+        // One order for the catalog even where the pairwise rule cycles (10 < 11 < 12 < 10).
+        assert_eq!(order(&[(10, 9), (11, 0), (12, 1)]), [12, 11, 10]);
+        // Cutting keeps the full order's prefix.
+        let mixed: Vec<_> = (1..=300).map(|id| group(BadgeKind::Server, id, (id as i32 * 7) % 5)).collect();
+        let mut full = mixed.clone();
+        teamspeak_order(&mut full);
+        assert_eq!(ids(&ordered_badges(mixed, Vec::new())), ids(&full[..BADGES_PER_KIND]));
 
         // Server groups first; each kind cut to its share of what the UI accepts.
         let server: Vec<_> = (1..=300).map(|id| group(BadgeKind::Server, id, 0)).collect();

@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { Badge } from "../proto/Badge";
-import { badgesOf, teamspeakOrder } from "./ts-badges";
+import { badgesOf } from "./ts-badges";
 
+// The catalog as the adapter sends it: server groups, then channel groups, each in TeamSpeak's order.
 const badges: Badge[] = [
-  { kind: "channel", id: 5, name: "Channel Admin", sort: 0 },
-  { kind: "server", id: 9, name: "Moderator", sort: 20 },
   { kind: "server", id: 6, name: "Server Admin", sort: 10 },
+  { kind: "server", id: 9, name: "Moderator", sort: 20 },
+  { kind: "channel", id: 5, name: "Channel Admin", sort: 0 },
   // A channel group can share an id with a server group.
   { kind: "channel", id: 6, name: "Operator", sort: 0 },
 ];
@@ -17,12 +18,13 @@ describe("TeamSpeak group badges", () => {
     expect(badgesOf(badges, [9, 6, 8], 5).map((b) => b.name)).toEqual(["Server Admin", "Moderator", "Channel Admin"]);
   });
 
-  it("orders by sort id only where both groups have one, else by id", () => {
-    // A sort id of 0 is none, not the first place.
-    expect(teamspeakOrder([server(9, 0), server(6, 1)]).map((b) => b.id)).toEqual([6, 9]);
-    expect(teamspeakOrder([server(3, 0), server(6, 1)]).map((b) => b.id)).toEqual([3, 6]);
-    expect(teamspeakOrder([server(1, 9), server(2, 1), server(3, 0)]).map((b) => b.id)).toEqual([2, 1, 3]);
-    expect(teamspeakOrder([server(2, 5), server(1, 5)]).map((b) => b.id)).toEqual([1, 2]);
+  it("keeps the catalog's order for every member, whatever groups they have", () => {
+    // TeamSpeak's order of (10, sort 9), (11, none), (12, sort 1) over all three is 12, 11, 10;
+    // pairwise its rule would cycle, so only the catalog's one order holds.
+    const catalog = [server(12, 1), server(11, 0), server(10, 9)];
+    expect(badgesOf(catalog, [10, 11], null).map((b) => b.id)).toEqual([11, 10]);
+    expect(badgesOf(catalog, [10, 11, 12], null).map((b) => b.id)).toEqual([12, 11, 10]);
+    expect(badgesOf(catalog, [12, 10], null).map((b) => b.id)).toEqual([12, 10]);
   });
 
   it("matches each kind against its own ids", () => {
