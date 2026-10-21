@@ -41,14 +41,14 @@ describe("TeamSpeak images", () => {
   });
 
   it("loads each token once into a blob: URL of its type", async () => {
-    const fetch = vi.fn(async () => PNG.slice().buffer);
+    const fetch = vi.fn(async (_token: string) => PNG.slice().buffer);
     const images = new TsImages(fetch);
     images.request(["i1001", AVATAR, "i1001"]);
     images.request(["i1001"]);
     await flush();
     expect(fetch.mock.calls.map((c) => c[0])).toEqual(["i1001", AVATAR]);
     expect(useTsImages.getState().urls).toEqual({ i1001: "blob:gwar/1", [AVATAR]: "blob:gwar/2" });
-    const blob = vi.mocked(URL.createObjectURL).mock.calls[0][0] as Blob;
+    const blob = vi.mocked(URL.createObjectURL).mock.calls[0]?.[0] as Blob;
     expect(blob.type).toBe("image/png");
   });
 
