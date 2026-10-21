@@ -331,9 +331,10 @@ only callbacks during playback.
 Fractional corrections use the minimum queue + staged PCM margin observed
 before refills over a full trailing five seconds. This retains sparse low-water
 evidence such as a 5 ms packet delay every three seconds. The margin excludes
-the pending refill and 120 samples (2.5 ms) of safety; the jitter estimate is not
-subtracted again, because the minimum already holds the dips the jitter caused
-(see "Level steps, second pass" below). Arrival phase contributes no credit. Each correction proposes at most
+the pending refill and 120 samples (2.5 ms) of safety, plus the adaptive jitter
+reserve beyond one packet whenever the window's refills vary in size or its packets
+in duration; with regular refills the minimum already holds the dips the jitter
+caused (see "Level steps, second pass" below). Arrival phase contributes no credit. Each correction proposes at most
 720 samples (15 ms). Each committed cut is subtracted from every historical
 margin, so later corrections cannot spend the same surplus twice. Depth is
 buffered time from the playout position to the end of the queue, holes
@@ -426,10 +427,11 @@ estimate is high; the second pass below removes the jitter reserve from the drai
 Level steps, second pass (2026-10-21). A temporary trace of every arrival, pop,
 concealment, cut and low-water mark (not committed) separated three mechanisms:
 
-- **The drain counted the jitter twice (fixed).** Each low-water mark subtracted
-  the jitter reserve (target minus one packet, the target being the 2 s peak-hold
-  jitter estimate + 5 ms) from a five-second minimum that already holds every dip
-  the same jitter caused. The excess this kept grew with the jitter. In one
+- **The drain counted the jitter twice on regular streams (fixed).** Each
+  low-water mark subtracted the jitter reserve (target minus one packet, the
+  target being the 2 s peak-hold jitter estimate + 5 ms) from a five-second
+  minimum that already holds the dips the same jitter caused. The excess this
+  kept grew with the jitter. In one
   `down:jitter=10ms` run, every packet was decoded at least 14 ms after it
   arrived for the whole 25 s marker window (refills always held one packet more
   than the demand), yet the minimum mark stayed at zero because the estimate
@@ -437,10 +439,29 @@ concealment, cut and low-water mark (not committed) separated three mechanisms:
   end. In a deterministic simulation (10 ms packets, in-order delivery,
   uniform delay), a 40 ms backlog drained to 31.5 ms instead of the 20 ms the
   stream settles at by itself with 15 ms of jitter, and not at all (50 ms
-  against 30 ms) with 25 ms. Marks now keep only the pending refill and the 2.5 ms
-  safety margin (`jitter.rs` `observe_depth`); the backlog drains to 22.5 and
-  32.5 ms, with no concealments. The jitter estimate still sets the stall-recovery
-  depth.
+  against 30 ms) with 25 ms.
+
+  The reserve is not redundant everywhere, though. The marks sample the queue at
+  refills only, and when refills vary in size or packets in duration, a delay can
+  meet a luckier refill phase than the next one, so the minimum understates what
+  the next delay needs. Two deterministic schedules (real Opus through
+  `Slot::mix_refill`, ordered delivery, no loss, 50 ms initial delay, 60 s, both
+  clocks) show it: 10 ms packets with callbacks cycling 10/20/5 ms and a 35 ms
+  delay every 4.8 s (1 concealment with the reserve, 4 without), and 40/2.5/10/5/40 ms
+  packets with 10 ms callbacks and a 5 ms delay after every 3 s boundary (0 against
+  2). A grid of 216 such schedules (four packet patterns, three callback patterns,
+  delays of 5/20/35 ms every 0.5–4.9 s, RTP clock) had 61 schedules with more
+  concealments without the reserve. On its 108 schedules with delays every 3–4.9 s,
+  constant allowances of 2.5, 5 and 10 ms instead of the reserve left 16, 10 and 4
+  of them, and the reserve reduced by 2.5 ms left 6. No failing schedule had
+  regular refills and packets. So the reserve now depends on the window
+  (`jitter.rs` `refresh_surplus`): when every refill in the five-second window asks
+  for the same amount and every packet lasts as long, marks keep only the pending
+  refill and the 2.5 ms safety margin; otherwise each mark keeps the reserve
+  it had, as before. On the grid this has no schedule with more concealments than
+  the old rule (139 concealments with either rule, on each clock), and the backlog above
+  drains to 22.5 and 32.5 ms with no concealments. The jitter estimate still sets
+  the stall-recovery depth.
 - **A late packet stretches the timeline (intended).** When the queue is empty at
   a refill, the head packet is concealed in place; if it then arrives, it plays
   and every later packet is 10 ms later. On a loaded host, single packets arrive
@@ -478,8 +499,12 @@ matching gate.
 | Callback jitter | 79.10 / 79.25 | 89.42 / 89.47 | 2 / 0 | 15 / 10 | 0 / 0 | 0 / 0 |
 | Mixed | 76.65 / 76.77 | 87.11 / 87.10 | 0 / 0 | 1222 / 1214 | 119 / 115 | 2 / 0 |
 
-Stepped runs fell from 16 to 3 of 48 with no more concealments, late drops or
-underruns in any profile. `reorder` and `mixed` do not change: their steps are
+Stepped runs fell from 16 to 3 of 48. Concealments rose by 2 with
+`down:burst=3@0.5%` (396 → 398) and by 1 with `down:reorder=0.5%` (132 → 133),
+fell elsewhere, and late drops and underruns did not rise; with six pairs per
+profile on a shared host, differences of a few concealments are within run-to-run
+noise, so these runs neither show nor rule out a small concealment cost. This
+series measured the first version, without the reserve on every stream. `reorder` and `mixed` do not change: their steps are
 the late-packet stretches above, and `mixed` already runs at its window minimum.
 The stall pair that stepped in both builds had a 30–40 ms host episode in the
 baseline run before the stall. These are single-host, shared-machine runs, six
