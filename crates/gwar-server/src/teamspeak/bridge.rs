@@ -1672,9 +1672,7 @@ fn away_of(r: &Record) -> Option<String> {
 /// reorders the text around it) and control characters become spaces. TeamSpeak mode cleans
 /// the same way (`display_text` in gwar-client, `displayText` in apps/web/src/lib/text.ts).
 fn shown(text: &str) -> String {
-    let bidi =
-        |c: char| matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
-    text.chars().filter(|&c| !bidi(c)).map(|c| if c.is_control() { ' ' } else { c }).collect()
+    text.chars().filter(|&c| !super::bidi(c)).map(|c| if c.is_control() { ' ' } else { c }).collect()
 }
 
 /// TeamSpeak 5/6 clients report their major version first; TS3 reports 3.x.

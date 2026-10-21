@@ -33,10 +33,11 @@ const MAX_SERVER_NAME: usize = 64;
 const MAX_WELCOME: usize = 1000;
 const MAX_OVERRIDES: usize = 100;
 
-/// `text` as Gwar takes it: no control characters (but line breaks where `lines`), trimmed, at
-/// most `max` characters.
+/// `text` as Gwar takes it: no control characters (but line breaks where `lines`) or bidi
+/// formatting, trimmed, at most `max` characters.
 fn fit(text: &str, max: usize, lines: bool) -> String {
-    let kept: String = text.chars().filter(|c| !c.is_control() || (lines && *c == '\n')).collect();
+    let kept: String =
+        text.chars().filter(|&c| !crate::teamspeak::bidi(c) && (!c.is_control() || (lines && c == '\n'))).collect();
     kept.trim().chars().take(max).collect::<String>().trim_end().to_owned()
 }
 

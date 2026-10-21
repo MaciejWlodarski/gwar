@@ -748,3 +748,21 @@ fn a_channel_without_a_topic_takes_its_descriptions_first_line() {
     let planned = plan(&s, &Options::default());
     assert_eq!(planned.channels.iter().find(|c| c.name == "Clan").unwrap().topic, "");
 }
+
+#[test]
+fn imported_names_and_texts_lose_bidi_formatting() {
+    let mut s = source();
+    s.server.insert("virtualserver_name".into(), "Old\u{202e} TS".into());
+    s.channels[1].insert("channel_name".into(), "Cl\u{2066}an\u{2069}".into());
+    s.channels[0].insert("channel_topic".into(), "Wel\u{200f}come".into());
+    s.clients[0].insert("client_nickname".into(), "Bo\u{202e}ss".into());
+    s.bans[0].insert("lastnickname".into(), "Tro\u{061c}ll".into());
+    s.bans[0].insert("reason".into(), "sp\u{202d}am".into());
+    let planned = plan(&s, &Options::default());
+    assert_eq!(planned.server_name.as_deref(), Some("Old TS"));
+    assert!(planned.channels.iter().any(|c| c.name == "Clan"));
+    assert!(planned.channels.iter().any(|c| c.name == "Lobby" && c.topic == "Welcome"));
+    assert!(planned.members.iter().any(|m| m.nickname == "Boss"));
+    let ban = &planned.bans.iter().find(|b| b.ts_id == 1).unwrap().ban;
+    assert_eq!((ban.nickname.as_str(), ban.reason.as_deref()), ("Troll", Some("spam")));
+}

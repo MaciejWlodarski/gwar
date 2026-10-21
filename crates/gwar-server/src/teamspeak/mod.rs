@@ -19,3 +19,9 @@ pub mod puppet;
 pub mod query;
 
 pub use bridge::run;
+
+/// Bidi formatting characters: they reorder the text around them, so TeamSpeak names and texts
+/// lose them before Gwar shows or stores them.
+pub(crate) fn bidi(c: char) -> bool {
+    matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
