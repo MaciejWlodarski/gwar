@@ -19,7 +19,7 @@ use gwar_client::{
     ClientError, ConnectOptions, Identity, connect,
     teamspeak::{self},
 };
-use gwar_proto::{Channel, ChannelId, ChatTarget, ClientSoftware, ErrorCode, Event, Platform, Request};
+use gwar_proto::{BadgeKind, Channel, ChannelId, ChatTarget, ClientSoftware, ErrorCode, Event, Platform, Request};
 use gwar_server::teamspeak::query::{Cmd, Query};
 use tokio::time::timeout;
 
@@ -361,6 +361,77 @@ async fn teamspeak_mode_password_channels_admins_and_chat_replies() {
         ("Moved child", "kept", Some(parent.id)),
         "{updated:?}"
     );
+}
+
+/// TeamSpeak's server and channel groups show as badges: groups set elsewhere reach the client
+/// as badges and as the client's groups, and the defaults everyone has get none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn teamspeak_mode_shows_group_badges() {
+    let Some(bridged) = support::start().await else { return };
+    let mut bob = support::ts_client(bridged.ts_voice, "bob").await;
+    let (query, _notifications) =
+        Query::connect(bridged.query, "serveradmin", &bridged.query_password(), 1).await.unwrap();
+    let clients = query.call(Cmd::new("clientlist")).await.unwrap();
+    let cldbid = clients
+        .iter()
+        .find(|c| c.get("client_nickname").is_some_and(|n| n == "bob"))
+        .and_then(|c| c.get("client_database_id"))
+        .expect("bob on TeamSpeak")
+        .to_owned();
+    let (me, lobby) = (bob.welcome.session, bob.welcome.server.default_channel);
+    // Server Admin (6) and, in bob's channel, Channel Admin (5).
+    query.call(Cmd::new("servergroupaddclient").arg("sgid", 6).arg("cldbid", &cldbid)).await.unwrap();
+    let channel_admin = Cmd::new("setclientchannelgroup").arg("cgid", 5).arg("cid", lobby).arg("cldbid", &cldbid);
+    query.call(channel_admin).await.unwrap();
+
+    let badges = std::cell::RefCell::new(bob.welcome.server.badges.clone());
+    let client = std::cell::RefCell::new(bob.welcome.clients.iter().find(|c| c.id == me).cloned().expect("bob"));
+    let shown = || {
+        let (badges, client) = (badges.borrow(), client.borrow());
+        let has = |kind, id| badges.iter().any(|b| b.kind == kind && b.id == id);
+        has(BadgeKind::Server, 6)
+            && has(BadgeKind::Channel, 5)
+            && client.groups.contains(&6)
+            && client.channel_group == Some(5)
+    };
+    if !shown() {
+        until(&mut bob.events, |e| {
+            match e {
+                Event::ServerUpdated(server) => *badges.borrow_mut() = server.badges.clone(),
+                Event::ClientUpdated(c) if c.id == me => *client.borrow_mut() = c.clone(),
+                _ => {}
+            }
+            shown()
+        })
+        .await;
+    }
+    let badges = badges.into_inner();
+    let named = |kind, id| badges.iter().find(|b| b.kind == kind && b.id == id).map(|b| b.name.as_str());
+    assert_eq!(
+        (named(BadgeKind::Server, 6), named(BadgeKind::Channel, 5)),
+        (Some("Server Admin"), Some("Channel Admin"))
+    );
+    let info = query.call(Cmd::new("serverinfo")).await.unwrap();
+    let default = |key: &str| info[0].get(key).and_then(|v| v.parse::<u32>().ok()).expect(key);
+    let (server_default, channel_default) =
+        (default("virtualserver_default_server_group"), default("virtualserver_default_channel_group"));
+    assert!(named(BadgeKind::Server, server_default).is_none(), "{badges:?}");
+    assert!(named(BadgeKind::Channel, channel_default).is_none(), "{badges:?}");
+
+    // A new group's hostile name arrives as plain text, a rename replaces it, and a deleted
+    // group's badge goes although the book keeps the group.
+    let added = query.call(Cmd::new("servergroupadd").arg("name", "Q\u{202e}A\tZ")).await.unwrap();
+    let sgid: u32 = added[0].get("sgid").and_then(|v| v.parse().ok()).expect("sgid");
+    let badge = |server: &gwar_proto::ServerInfo| {
+        server.badges.iter().find(|b| b.kind == BadgeKind::Server && b.id == sgid).map(|b| b.name.clone())
+    };
+    let named_as =
+        |name: &'static str| move |e: &Event| matches!(e, Event::ServerUpdated(s) if badge(s).as_deref() == Some(name));
+    until(&mut bob.events, named_as("QA Z")).await;
+    query.call(Cmd::new("servergrouprename").arg("sgid", sgid).arg("name", "Renamed")).await.unwrap();
+    until(&mut bob.events, named_as("Renamed")).await;
+    query.call(Cmd::new("servergroupdel").arg("sgid", sgid).arg("force", 1)).await.unwrap();
+    until(&mut bob.events, |e| matches!(e, Event::ServerUpdated(s) if badge(s).is_none())).await;
 }
 
 /// TeamSpeak's own actions through our client: channel order, descriptions and family

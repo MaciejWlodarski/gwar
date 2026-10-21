@@ -6,7 +6,7 @@
 //! Opus frames go straight between TS and the native engine.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
     sync::{
         Arc,
@@ -20,8 +20,8 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use futures::StreamExt;
 use gwar_proto::{
-    Ban, Channel, ChannelId, ChatMessage, ChatTarget, Client, ClientUpdate, ErrorBody, ErrorCode, Event, LeaveReason,
-    MessageId, Permission, Platform, Request, ServerInfo, SessionId, Welcome,
+    Badge, BadgeKind, Ban, Channel, ChannelId, ChatMessage, ChatTarget, Client, ClientUpdate, ErrorBody, ErrorCode,
+    Event, LeaveReason, MessageId, Permission, Platform, Request, ServerInfo, SessionId, Welcome,
 };
 use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
@@ -31,7 +31,8 @@ use tokio::{
 };
 use tsclientlib::{
     Connection as TsConnection, DisconnectOptions, Identity as TsIdentity, MessageHandle, MessageTarget, OutCommandExt,
-    StreamItem, events::Event as BookEvent,
+    StreamItem,
+    events::{Event as BookEvent, PropertyId},
 };
 use tsproto_packets::packets::{AudioData, CodecType, Direction, Flags, OutAudio, OutCommand, PacketType};
 
@@ -280,6 +281,36 @@ struct View {
     /// Channel names as TeamSpeak sent them; `channels` holds the cleaned ones the UI shows, which
     /// two channels can share.
     names: BTreeMap<u32, String>,
+    listed: GroupLists,
+}
+
+/// The groups in TeamSpeak's latest complete group lists. The book adds every listed group but
+/// never drops one a newer list leaves out, so badges come only from these. `None`: no list
+/// since connecting, when the book holds exactly the first one.
+#[derive(Default, Clone, PartialEq)]
+struct GroupLists {
+    server: Option<BTreeSet<u64>>,
+    channel: Option<BTreeSet<u64>>,
+}
+
+impl GroupLists {
+    /// Takes in the lists among one batch of book events: each list arrives whole, as one batch.
+    fn update(&mut self, events: &[BookEvent]) {
+        let (mut server, mut channel) = (BTreeSet::new(), BTreeSet::new());
+        for event in events {
+            match event {
+                BookEvent::PropertyAdded { id: PropertyId::ServerGroup(g), .. } => server.insert(g.0),
+                BookEvent::PropertyAdded { id: PropertyId::ChannelGroup(g), .. } => channel.insert(g.0),
+                _ => false,
+            };
+        }
+        if !server.is_empty() {
+            self.server = Some(server);
+        }
+        if !channel.is_empty() {
+            self.channel = Some(channel);
+        }
+    }
 }
 
 // Direct TS has local adapter tokens only; it has no Gwar call or MLS group.
@@ -364,6 +395,7 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>, previous: &View)
                     server_muted: false,
                     server_deafened: false,
                     sharing: false,
+                    channel_group: Some(c.channel_group.0 as u32),
                     voice_binding: Some(
                         previous
                             .clients
@@ -408,8 +440,71 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>, previous: &View)
         file_access: Default::default(),
         teamspeak: true,
         server_chat: Default::default(),
+        badges: badges(state, &previous.listed),
     };
-    Some(View { server: Some(server), channels, clients, descriptions, names })
+    Some(View { server: Some(server), channels, clients, descriptions, names, listed: previous.listed.clone() })
+}
+
+/// Badges of each kind at most, so the server info stays within what the UI accepts (512 badges,
+/// apps/web/src/net/schema.ts).
+const BADGES_PER_KIND: usize = 256;
+/// Longest badge name kept, in characters (TeamSpeak allows 30).
+const BADGE_NAME: usize = 64;
+
+/// The groups worth a badge: listed regular ones, but not the defaults everyone has.
+fn badges(state: &tsclientlib::data::Connection, listed: &GroupLists) -> Vec<Badge> {
+    let regular = |t: &tsclientlib::GroupType| matches!(t, tsclientlib::GroupType::Regular);
+    let known = |ids: &Option<BTreeSet<u64>>, id: u64| ids.as_ref().is_none_or(|ids| ids.contains(&id));
+    let server = state
+        .server_groups
+        .values()
+        .filter(|g| regular(&g.group_type) && g.id != state.server.default_server_group)
+        .filter(|g| known(&listed.server, g.id.0))
+        .filter_map(|g| badge(BadgeKind::Server, g.id.0, &g.name, g.sort_id))
+        .collect();
+    let channel = state
+        .channel_groups
+        .values()
+        .filter(|g| regular(&g.group_type) && g.id != state.server.default_channel_group)
+        .filter(|g| known(&listed.channel, g.id.0))
+        .filter_map(|g| badge(BadgeKind::Channel, g.id.0, &g.name, g.sort_id))
+        .collect();
+    ordered_badges(server, channel)
+}
+
+/// A badge named by `name` as plain text, or none if nothing of the name is left.
+fn badge(kind: BadgeKind, id: u64, name: &str, sort: i32) -> Option<Badge> {
+    let name = badge_name(name);
+    (!name.is_empty()).then_some(Badge { kind, id: id as u32, name, sort })
+}
+
+/// One line of plain text ([`display_text`]), cut to [`BADGE_NAME`] characters.
+fn badge_name(name: &str) -> String {
+    display_text(name, false).chars().take(BADGE_NAME).collect::<String>().trim().to_owned()
+}
+
+/// Server groups, then channel groups, each in TeamSpeak's order and cut to [`BADGES_PER_KIND`].
+fn ordered_badges(mut server: Vec<Badge>, mut channel: Vec<Badge>) -> Vec<Badge> {
+    teamspeak_order(&mut server);
+    teamspeak_order(&mut channel);
+    server.truncate(BADGES_PER_KIND);
+    channel.truncate(BADGES_PER_KIND);
+    server.extend(channel);
+    server
+}
+
+/// TeamSpeak orders groups by sort id where both have one and by id where either has none (0),
+/// like ts3phpframework's `sortGroupList`. Pairwise that rule can cycle, so it is made one order
+/// over the whole catalog: groups without a sort id keep their places by id, and the others fill
+/// the remaining places by sort id, then id. This is the canonical order: it is computed once
+/// here, before the catalog is cut, and the UI keeps it for every member's subset.
+fn teamspeak_order(groups: &mut [Badge]) {
+    groups.sort_by_key(|b| b.id);
+    let mut sorted: Vec<Badge> = groups.iter().filter(|b| b.sort != 0).cloned().collect();
+    sorted.sort_by_key(|b| (b.sort, b.id));
+    for (place, group) in groups.iter_mut().filter(|b| b.sort != 0).zip(sorted) {
+        *place = group;
+    }
 }
 
 /// Events turning `old` into `new`.
@@ -1083,6 +1178,7 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
             Step::Item(Some(Ok(item))) => match item {
                 StreamItem::BookEvents(events) => {
                     book_changed = true;
+                    view.listed.update(&events);
                     for event in events {
                         if let BookEvent::Message { target, invoker, message } = event {
                             // Our own messages come from the `chat.send` reply, whether or not TeamSpeak echoes them.
@@ -1387,6 +1483,7 @@ mod tests {
             server_muted: false,
             server_deafened: false,
             sharing: false,
+            channel_group: None,
         }
     }
 
@@ -1502,6 +1599,44 @@ mod tests {
         assert_eq!(display_text("a\0b\nc\td  e ", false), "a b c d  e ");
         assert_eq!(display_text("Zażółć 🎧 مرحبا", false), "Zażółć 🎧 مرحبا");
         assert_eq!(display_text("one\r\ntwo\rthree\n\tfour\u{7}\u{202e}", true), "one\ntwo\nthree\n\tfour ");
+    }
+
+    #[test]
+    fn badges_follow_teamspeak_order_and_stay_within_limits() {
+        let group = |kind, id, sort| Badge { kind, id, name: format!("g{id}"), sort };
+        let ids = |badges: &[Badge]| badges.iter().map(|b| b.id).collect::<Vec<_>>();
+        let order = |groups: &[(u32, i32)]| {
+            let mut badges: Vec<_> = groups.iter().map(|&(id, sort)| group(BadgeKind::Server, id, sort)).collect();
+            teamspeak_order(&mut badges);
+            ids(&badges)
+        };
+        // A sort id of 0 is none, not the first place: those go by id.
+        assert_eq!(order(&[(9, 0), (6, 1)]), [6, 9]);
+        assert_eq!(order(&[(3, 0), (6, 1)]), [3, 6]);
+        assert_eq!(order(&[(1, 9), (2, 1), (3, 0)]), [2, 1, 3]);
+        assert_eq!(order(&[(2, 5), (1, 5)]), [1, 2]);
+
+        // One order for the catalog even where the pairwise rule cycles (10 < 11 < 12 < 10).
+        assert_eq!(order(&[(10, 9), (11, 0), (12, 1)]), [12, 11, 10]);
+        // Cutting keeps the full order's prefix.
+        let mixed: Vec<_> = (1..=300).map(|id| group(BadgeKind::Server, id, (id as i32 * 7) % 5)).collect();
+        let mut full = mixed.clone();
+        teamspeak_order(&mut full);
+        assert_eq!(ids(&ordered_badges(mixed, Vec::new())), ids(&full[..BADGES_PER_KIND]));
+
+        // Server groups first; each kind cut to its share of what the UI accepts.
+        let server: Vec<_> = (1..=300).map(|id| group(BadgeKind::Server, id, 0)).collect();
+        let channel = vec![group(BadgeKind::Channel, 2, 0), group(BadgeKind::Channel, 1, 0)];
+        let badges = ordered_badges(server, channel);
+        assert_eq!(badges.len(), BADGES_PER_KIND + 2);
+        assert!(badges.len() <= 512);
+        assert_eq!(ids(&badges[BADGES_PER_KIND - 1..]), [BADGES_PER_KIND as u32, 1, 2]);
+
+        // Names are one line of plain text, cut short; nothing left is no badge.
+        assert_eq!(badge(BadgeKind::Server, 7, "Q\u{202e}A\nZ", 0).map(|b| b.name), Some("QA Z".into()));
+        assert_eq!(badge(BadgeKind::Server, 7, &"x".repeat(300), 0).map(|b| b.name.len()), Some(BADGE_NAME));
+        assert!(badge(BadgeKind::Server, 7, "\u{2066}\0", 0).is_none());
+        assert!(badge(BadgeKind::Server, 7, " \u{7} ", 0).is_none());
     }
 
     #[test]

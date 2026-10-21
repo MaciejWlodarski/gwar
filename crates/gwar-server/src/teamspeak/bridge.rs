@@ -1863,6 +1863,7 @@ mod tests {
                 server_muted: false,
                 server_deafened: false,
                 sharing: false,
+                channel_group: None,
             }))
             .await;
         let restored = core.audio_origin(session).await.unwrap();

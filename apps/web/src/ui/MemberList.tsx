@@ -8,13 +8,14 @@ import { formatRelative } from "../lib/time";
 import { useSession, useUi } from "../state/stores";
 import { Avatar, menuContent, menuItem, menuLabel, Tooltip } from "./kit";
 import { ModerationItems } from "./ModerationMenu";
-import { ConnectBadge, IdentityLine } from "./badges";
+import { ConnectBadge, IdentityLine, TsGroupBadges } from "./badges";
 import { groupMembers, type MemberEntry } from "./members";
 
 function MemberRow({ entry, mine, now }: { entry: MemberEntry; mine: boolean; now: number }) {
   const t = useT();
   const lang = useLanguage();
   const offline = !entry.online;
+  const client = useSession((s) => (entry.session === null ? undefined : s.clients[entry.session]));
   const lastSeen = offline
     ? entry.lastSeen > 0
       ? t("members.lastSeen", { when: formatRelative(entry.lastSeen, now, lang) })
@@ -59,6 +60,7 @@ function MemberRow({ entry, mine, now }: { entry: MemberEntry; mine: boolean; no
                 {entry.channel && <span className="block truncate text-[11px] text-subtle">{entry.channel}</span>}
               </span>
               <ConnectBadge member={entry} name={entry.nickname} />
+              {client && <TsGroupBadges groups={client.groups} channelGroup={client.channel_group} />}
               {entry.admin && <Shield aria-label={t("members.admin")} className="size-3.5 shrink-0 text-accent" />}
               {entry.platform && isTeamSpeak(entry.platform) && (
                 <span className="shrink-0 rounded bg-hover px-1 text-[10px] leading-4 font-medium text-subtle">{PLATFORM_LABEL[entry.platform]}</span>

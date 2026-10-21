@@ -34,7 +34,7 @@ import { useSettings } from "../state/settings";
 import { useSession, useUi } from "../state/stores";
 import { buildTree, descendantsCount, isFull, type ChannelNode } from "../state/tree";
 import { fillText, parseSpacer } from "../lib/spacer";
-import { MentionBadge, UnreadBadge } from "./badges";
+import { MentionBadge, TsGroupBadges, UnreadBadge } from "./badges";
 import { useChannelPermission, useGroupsColor, useMyWho, useWhoOf } from "./hooks";
 import { canActOn } from "../lib/permissions";
 import { CLIENT_MIME, clientDragData, readClientDrag } from "../lib/client-drag";
@@ -383,6 +383,7 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
           <span className={cn("min-w-0 truncate", silenced && "text-muted", isMe && "font-medium")} style={color ? { color } : undefined}>
             {client.nickname}
           </span>
+          <TsGroupBadges groups={client.groups} channelGroup={client.channel_group} />
           {client.away !== null && (
             <span className="min-w-0 max-w-[40%] truncate text-xs text-subtle" title={client.away}>
               {client.away || t("tree.away")}

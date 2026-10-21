@@ -5,6 +5,9 @@ import { BadgeCheck, BadgeInfo } from "lucide-react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { unreadLabel } from "../lib/chat";
+import { badgesOf } from "../lib/ts-badges";
+import { useSession } from "../state/stores";
+import { useMemo } from "react";
 
 /** Pill with the number of unread messages. */
 export function UnreadBadge({ count, className }: { count: number; className?: string }) {
@@ -43,6 +46,27 @@ export function TeamSpeakBadge({ className, short }: { className?: string; short
       className={cn("shrink-0 rounded bg-accent-soft px-1.5 py-px text-[10px] leading-4 font-semibold tracking-wide text-accent uppercase", className)}
     >
       {short ? t("badge.teamspeakShort") : t("badge.teamspeak")}
+    </span>
+  );
+}
+
+/** A TeamSpeak member's server and channel groups, by name (display only). `wrap` lets a roomy layout show
+ *  them all; a row keeps one line and lets them give way to the nickname. */
+export function TsGroupBadges({ groups, channelGroup, wrap, className }: { groups: readonly number[]; channelGroup?: number | null; wrap?: boolean; className?: string }) {
+  const all = useSession((s) => s.server?.badges);
+  const shown = useMemo(() => badgesOf(all, groups, channelGroup), [all, groups, channelGroup]);
+  if (shown.length === 0) return null;
+  return (
+    <span data-testid="ts-group-badges" className={cn("flex min-w-0 items-center gap-1", wrap ? "flex-wrap" : "shrink-[4] overflow-hidden", className)}>
+      {shown.map((b) => (
+        <span
+          key={`${b.kind}:${b.id}`}
+          title={b.name}
+          className="min-w-0 max-w-32 shrink truncate rounded bg-hover px-1 text-[10px] leading-4 font-medium text-subtle"
+        >
+          {b.name}
+        </span>
+      ))}
     </span>
   );
 }

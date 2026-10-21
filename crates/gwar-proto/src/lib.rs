@@ -849,6 +849,28 @@ wire! {
         /// TeamSpeak compatibility is on (new channels default to plaintext).
         pub teamspeak: bool,
         pub server_chat: ServerChat,
+        /// TeamSpeak servers only: the server and channel groups shown next to their members.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub badges: Vec<Badge>,
+    }
+
+    /// A TeamSpeak server or channel group, for display only: the TeamSpeak server decides what
+    /// its groups may do.
+    pub struct Badge {
+        pub kind: BadgeKind,
+        pub id: u32,
+        pub name: String,
+        /// TeamSpeak's sort id: lower comes first.
+        pub sort: i32,
+    }
+
+    #[derive(Copy, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum BadgeKind {
+        /// Matched against [`Client::groups`].
+        Server,
+        /// Matched against [`Client::channel_group`].
+        Channel,
     }
 
     /// Permanent server-wide chat options, chosen at the first serving start.
@@ -922,6 +944,9 @@ wire! {
         /// Sharing their screen (the channel tree's LIVE badge).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         pub sharing: bool,
+        /// TeamSpeak servers only: the channel group in the current channel.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub channel_group: Option<u32>,
     }
 
     pub struct Group {
