@@ -467,16 +467,22 @@ concealment, cut and low-water mark (not committed) separated three mechanisms:
   The arrival rule (`jitter.rs` `refresh_surplus`) replaces the reserve with what
   the arrivals show. Nothing is consumed between refills, so a refill at an earlier
   time would have seen a mark's queue without the packets that arrived in between.
-  Marks keep the arrivals since the previous observation, revised in hindsight like
-  the rest of the mark. Each refill's lead (media consumed ahead of wall time) says
+  The buffer keeps every arrival for ten seconds, and each mark is still revised in
+  hindsight by the arrivals after it. Each refill's lead (media consumed ahead of wall time) says
   how early it ran. Only leads since the last refill that consumed nothing count: a
   pause or a stretched timeline leaves consumption behind for good.
   - When the refills enter every packet alike (one packet duration, and successive
     refills step through one fixed set of points within a packet), every packet and
-    every delay meets the same refills, earlier only by their lead differences. Each
-    mark takes its margin at the window's highest lead: without the packets that
-    arrived within that difference before it. With 2 ms of random wander, refills
-    stay alike and the marks drop what arrived in those 2 ms.
+    every delay meets the same consumption points, at times that differ only by the
+    refills' leads. This holds only while later refills run no further ahead than
+    the window's highest lead. Each mark takes its margin at that lead: without every
+    packet that arrived within the lead difference before it. That difference can
+    reach back past earlier refills (review round 5: refills 20 ms late for half of
+    each second, then catching up, gave 5 concealments when only the arrivals since
+    the previous refill counted). The mark has no margin if a packet in that stretch
+    is one it had already played, or if the stretch reaches past the kept arrivals.
+    With 2 ms of random wander, refills stay alike and the marks drop what arrived in
+    those 2 ms.
   - Otherwise (refills that walk through the packets or vary in size) a delay may
     meet a refill at any point. Each mark takes the lowest margin that a refill at the
     highest lead could have had just before any arrival since the previous
@@ -494,8 +500,9 @@ concealment, cut and low-water mark (not committed) separated three mechanisms:
   times, 0 and 0 for the early refill). Packets of 10, 20, 5 ms and the mixed
   40/2.5/10/5/40 ms pattern; callbacks of 10, 8, 10/20/5, 20, 5 ms and 441 samples;
   delays of 5/20/35 ms every 0.5, 1.1, 2, 3, 3.3 and 4.9 s (432 schedules); refills
-  on time, 5 ms into the callback with every hundredth 0.5 ms early, or 0–2 ms late
-  at random (`playout.rs`, `drain_grid_never_conceals_more_than_the_reserve_rule`).
+  on time, 5 ms into the callback with every hundredth 0.5 ms early, 0–2 ms late at
+  random, or 20 ms late for half of every hundred callbacks and then back in 5 ms steps
+  (`playout.rs`, `drain_grid_never_conceals_more_than_the_reserve_rule`).
   The two clocks give identical totals. Values are main / arrival rule:
 
   | Refill timing | Concealments | Samples cut |
@@ -503,15 +510,15 @@ concealment, cut and low-water mark (not committed) separated three mechanisms:
   | On time | 198 / 18 | 516,812 / 389,486 |
   | 0.5 ms early every 100th | 174 / 14 | 585,416 / 438,130 |
   | 0–2 ms late at random | 194 / 18 | 516,915 / 385,953 |
+  | 20 ms late, then catching up | 452 / 28 | 715,444 / 409,985 |
 
   No schedule conceals more than on `main`. Every remaining concealment is on the
   mixed-duration pattern, which keeps the reserve and matches `main` exactly. On
-  the uniform patterns `main` concealed 1,032 times over the three timings and both
+  the uniform patterns `main` concealed 1,880 times over the four timings and both
   clocks, mostly with 8 ms, 10/20/5 ms and 441-sample callbacks; the arrival rule
   concealed none. It cuts less overall, because `main` cut through dips it then
-  concealed. It cuts more in total on five of the 18 uniform packet and callback
-  pairs: 10 and 5 ms callbacks over 10 ms packets, and 8 ms, 5 ms and 441-sample
-  callbacks over 5 ms packets. The early-refill schedule above cuts 360
+  concealed. It cuts more in total on three of the 18 uniform packet and callback
+  pairs: 8 ms, 5 ms and 441-sample callbacks over 5 ms packets. The early-refill schedule above cuts 360
   samples (none on `main`), with no concealments: even the early refill still had
   7.5 ms above its demand and safety.
 

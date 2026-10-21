@@ -55,9 +55,9 @@ struct Mark {
     /// Where this refill stands in media and time. `None` without a span or with mixed packet
     /// durations queued.
     lead: Option<Lead>,
-    /// Packets that arrived since the previous observation, latest first: samples from the
-    /// arrival to this mark, and the smallest key that arrived then or later.
-    arrivals: Vec<(u64, u64)>,
+    /// The `Arrivals` since the previous observation, by position: from (none for a window's
+    /// first mark) and to (every arrival before this mark).
+    gap: (u64, u64),
     span: Option<Span>,
 }
 
@@ -76,6 +76,72 @@ impl Lead {
     /// Media consumed ahead of time.
     fn ahead(&self) -> i64 {
         self.consumed - self.elapsed
+    }
+}
+
+/// Every arrival in push order, kept for twice the window: the time it counts from, and its
+/// key. Times never decrease: a packet cannot have been pushed before one pushed ahead of it.
+/// A packet stamped before the observation before its push was not there for that one, so it
+/// counts from the next observation; one stamped after the observation after its push was
+/// there, so it counts from that observation.
+#[derive(Default)]
+struct Arrivals {
+    entries: VecDeque<(Instant, u64)>,
+    /// Position of the first entry.
+    first: u64,
+    /// Trailing entries whose time waits for the next observation.
+    pending: usize,
+    /// Position of the first entry since the last observation.
+    unobserved: u64,
+    /// The latest time dropped from the front.
+    dropped: Option<Instant>,
+}
+
+impl Arrivals {
+    fn end(&self) -> u64 {
+        self.first + self.entries.len() as u64
+    }
+
+    /// Entries from position `from` to `to`, latest first; `None` if some were dropped.
+    fn latest_first(&self, from: u64, to: u64) -> Option<impl Iterator<Item = (Instant, u64)> + '_> {
+        let start = from.checked_sub(self.first)? as usize;
+        let end = (to.saturating_sub(self.first) as usize).max(start);
+        Some(self.entries.range(start..end).rev().copied())
+    }
+
+    fn push(&mut self, at: Instant, key: u64, observed: Option<Instant>) {
+        let after = observed.is_none_or(|observed| at > observed);
+        if self.pending > 0 || !after {
+            self.pending += 1;
+        }
+        let at = self.entries.back().map_or(at, |&(previous, _)| previous.max(at));
+        self.entries.push_back((at, key));
+    }
+
+    /// An observation at `now`: every entry since the previous one counts from `now` at the
+    /// latest. Entries older than twice the window are dropped.
+    fn observe(&mut self, now: Instant) {
+        let unobserved = (self.unobserved.max(self.first) - self.first) as usize;
+        let pending = self.entries.len() - self.pending;
+        for (index, entry) in self.entries.iter_mut().enumerate().skip(unobserved) {
+            entry.0 = if index >= pending { now } else { entry.0.min(now) };
+        }
+        self.pending = 0;
+        self.unobserved = self.end();
+        while self.entries.front().is_some_and(|&(at, _)| now.saturating_duration_since(at) > 2 * DEPTH_WINDOW)
+            || self.entries.len() > ARRIVAL_HISTORY
+        {
+            self.dropped = self.entries.pop_front().map(|(at, _)| at);
+            self.first += 1;
+        }
+    }
+
+    fn clear(&mut self) {
+        self.first = self.end();
+        self.unobserved = self.first;
+        self.entries.clear();
+        self.pending = 0;
+        self.dropped = None;
     }
 }
 
@@ -117,29 +183,48 @@ impl Mark {
 
     /// The arrival rule for any refill timing (`JitterBuffer::refresh_surplus`): the lowest
     /// margin a refill as far ahead as `ahead` could have seen at this mark or just before any
-    /// arrival since the previous observation.
-    fn bound(&self, clock: Clock, ahead: i64) -> u64 {
-        let Some(lead) = self.lead else { return 0 };
+    /// arrival since the previous observation, each with the smallest key that arrived then or
+    /// later.
+    fn bound(&self, clock: Clock, ahead: i64, arrivals: &Arrivals) -> u64 {
+        let (Some(lead), Some(gap)) = (self.lead, arrivals.latest_first(self.gap.0, self.gap.1)) else { return 0 };
         let mut low = self.buffered(clock, u64::MAX) as i64 + self.base;
-        for &(credit, cap) in &self.arrivals {
-            low = low.min(self.buffered(clock, cap) as i64 + self.base + credit as i64);
+        let mut cap = u64::MAX;
+        for (at, key) in gap {
+            cap = cap.min(key);
+            low = low.min(self.buffered(clock, cap) as i64 + self.base + samples_between(at, self.at) as i64);
         }
         (low - (ahead - lead.ahead()).max(0)).max(0) as u64
     }
 
     /// The arrival rule for refills that enter every packet alike: the margin this refill would
-    /// have seen as far ahead as `ahead`, that is earlier by the difference, without the
-    /// packets that arrived in between.
-    fn shifted(&self, clock: Clock, ahead: i64) -> u64 {
+    /// have seen as far ahead as `ahead`, that is earlier by the difference, without every
+    /// packet that arrived in between, across earlier observations too. A packet among them
+    /// that this mark had already played was missing for the earlier refill: no margin. So is a
+    /// shift reaching past the kept arrivals.
+    fn shifted(&self, clock: Clock, ahead: i64, arrivals: &Arrivals) -> u64 {
         let Some(lead) = self.lead else { return 0 };
         let earlier = (ahead - lead.ahead()).max(0) as u64;
-        let mut low = self.buffered(clock, u64::MAX) as i64 + self.base;
-        for &(since, cap) in &self.arrivals {
-            if since < earlier {
-                low = low.min(self.buffered(clock, cap) as i64 + self.base);
-            }
+        let full = self.buffered(clock, u64::MAX) as i64 + self.base;
+        if earlier == 0 {
+            return full.max(0) as u64;
         }
-        low.max(0) as u64
+        let Some(before) = arrivals.latest_first(arrivals.first, self.gap.1) else { return 0 };
+        let mut cap = u64::MAX;
+        let mut crossed = false;
+        for (at, key) in before {
+            if samples_between(at, self.at) >= earlier {
+                crossed = true;
+                break;
+            }
+            cap = cap.min(key);
+        }
+        if !crossed && arrivals.dropped.is_some_and(|at| samples_between(at, self.at) < earlier) {
+            return 0;
+        }
+        if self.span.as_ref().is_some_and(|span| cap < span.head) {
+            return 0;
+        }
+        full.min(self.buffered(clock, cap) as i64 + self.base).max(0) as u64
     }
 
     /// A known lower bound: no later arrival can raise it.
@@ -162,9 +247,10 @@ pub struct JitterBuffer {
     above_since: Option<Instant>,
     surplus: u64,
     low_water: VecDeque<Mark>,
-    /// Arrivals since the last observation, in push order: when (`None`: not before that
-    /// observation, so no earlier than the next one) and the key.
-    arrivals: Vec<(Option<Instant>, u64)>,
+    /// Recent arrivals, for the arrival rule (`Mark::bound`, `Mark::shifted`).
+    arrivals: Arrivals,
+    /// Reused by `alike`.
+    points: Vec<i64>,
     /// The window's highest lead and whether its refills enter every packet alike, for the
     /// arrival rule (`refresh_surplus`); updated with every mark and cut.
     timing: Option<(i64, bool)>,
@@ -192,6 +278,8 @@ const QUIET_SHRINK: Duration = Duration::from_secs(1);
 // must be slower than that jitter pattern; genuine surplus can take tens of seconds.
 const DEPTH_WINDOW: Duration = Duration::from_secs(5);
 const SAFETY: u64 = 120; // Retain 2.5 ms beyond the observed refill low-water mark.
+const ARRIVAL_HISTORY: usize = 8192; // Over ten seconds of 2.5 ms packets.
+const ALIKE_POINTS: usize = 64; // Consumption points per packet that `alike` accepts.
 const FORCE_SHRINK: Duration = Duration::from_secs(2);
 const SHRINK_STEP: u64 = 720; // Allow one low-pitched period (15 ms); the decoder commits the actual cut.
 // Debited low-water evidence supports bounded recovery: at most 10 ms/s in
@@ -227,7 +315,8 @@ impl JitterBuffer {
             above_since: None,
             surplus: 0,
             low_water: VecDeque::new(),
-            arrivals: Vec::new(),
+            arrivals: Arrivals::default(),
+            points: Vec::new(),
             timing: None,
             observing_since: None,
             last_observation: None,
@@ -295,7 +384,7 @@ impl JitterBuffer {
             return;
         }
         self.revise_marks(now, ts);
-        self.record_arrival(now, ts);
+        self.arrivals.push(now, ts, self.last_observation);
         if let Some((last_ts, last_at, last_samples)) = self.arrival {
             if ts > last_ts {
                 let elapsed = now.saturating_duration_since(last_at).as_secs_f64();
@@ -350,6 +439,7 @@ impl JitterBuffer {
         self.jitter = 0.0;
         self.above_since = None;
         self.clear_depth();
+        self.arrivals.clear();
         self.last_shrink = None;
         self.last_attempt = None;
     }
@@ -382,7 +472,6 @@ impl JitterBuffer {
 
     fn clear_depth(&mut self) {
         self.low_water.clear();
-        self.arrivals.clear();
         self.timing = None;
         self.observing_since = None;
         self.last_observation = None;
@@ -406,6 +495,12 @@ impl JitterBuffer {
             self.clear_depth();
             self.above_since = None;
         }
+        // A window's first mark has no refill before it to compare with.
+        let gap = (
+            if self.last_observation.is_some() { self.arrivals.unobserved } else { self.arrivals.end() },
+            self.arrivals.end(),
+        );
+        self.arrivals.observe(now);
         self.last_observation = Some(now);
         let since = *self.observing_since.get_or_insert(now);
         let packet_samples = self.packets.first_key_value().map_or(self.last_samples, |(_, p)| p.samples);
@@ -439,47 +534,15 @@ impl JitterBuffer {
                     packet: packet_samples,
                 })
             });
-        // Latest first, each with the smallest key that arrived then or later.
-        let mut cap = u64::MAX;
-        let arrivals = self
-            .arrivals
-            .drain(..)
-            .rev()
-            .map(|(at, key)| {
-                cap = cap.min(key);
-                (at.map_or(0, |at| samples_between(at, now)), cap)
-            })
-            .collect();
         // The whole trailing window is kept (a few hundred marks), not a monotone queue:
         // hindsight can raise a recent mark above older ones.
         while self.low_water.front().is_some_and(|mark| now.saturating_duration_since(mark.at) > DEPTH_WINDOW) {
             self.low_water.pop_front();
         }
         let base = surplus - SAFETY as i64;
-        self.low_water.push_back(Mark { at: now, base, reserve, lead, arrivals, span });
-        self.timing = self.highest_lead().map(|ahead| (ahead, self.alike()));
+        self.low_water.push_back(Mark { at: now, base, reserve, lead, gap, span });
+        self.timing = self.highest_lead().map(|ahead| (ahead, Self::alike(&self.low_water, &mut self.points)));
         self.refresh_surplus(now);
-    }
-
-    /// Remember an arrival for the next mark (`Mark::bound`, `Mark::shifted`). Times are kept
-    /// in push order and never decrease: a packet cannot have been pushed before one pushed
-    /// ahead of it. One stamped before the last observation was not there for it, so it counts
-    /// as arriving at the next one.
-    fn record_arrival(&mut self, now: Instant, ts: u64) {
-        // A window's first mark has no refill before it to compare with.
-        let Some(last) = self.last_observation else { return };
-        let after = now > last;
-        let at = match self.arrivals.last() {
-            Some(&(previous, _)) => previous.zip(after.then_some(now)).map(|(previous, now)| previous.max(now)),
-            None => after.then_some(now),
-        };
-        if self.arrivals.len() >= MAX_PACKETS {
-            // Merge into the latest entry: its later time and the smaller key only lower it.
-            let last = self.arrivals.last_mut().unwrap();
-            *last = (at, last.1.min(ts));
-        } else {
-            self.arrivals.push((at, ts));
-        }
     }
 
     /// Revise the marks with an arrival at `ts` (neither late nor a duplicate).
@@ -510,9 +573,11 @@ impl JitterBuffer {
     /// refill's lead (`Lead::ahead`, media consumed ahead of time) says how early it ran:
     ///
     /// - When the refills enter every packet alike (`alike`), each packet and each delay meets
-    ///   the same refills, earlier only by how far their leads differ. Each mark takes the
-    ///   margin it would have had at the window's highest lead: without the packets that
-    ///   arrived within that difference before it (`Mark::shifted`).
+    ///   the same consumption points, at times that differ only by the refills' leads, as long
+    ///   as no later refill runs further ahead than the window's highest lead. Each mark takes
+    ///   the margin it would have had at that lead: without every packet that arrived within
+    ///   the lead difference before it, which can reach back past earlier observations
+    ///   (`Mark::shifted`).
     /// - Otherwise (refills that walk through the packets or vary in size) a delay may meet a
     ///   refill at any point. Each mark takes the lowest margin a refill at the highest lead
     ///   could have had just before any arrival since the previous observation, crediting the
@@ -524,14 +589,14 @@ impl JitterBuffer {
     /// refill within the window.
     fn refresh_surplus(&mut self, now: Instant) {
         let Some(since) = self.observing_since else { return };
-        let clock = self.clock;
+        let (clock, arrivals) = (self.clock, &self.arrivals);
         let lows = |margin: &dyn Fn(&Mark) -> u64| {
             let minimum = self.low_water.iter().map(margin).min().unwrap_or(0);
             (minimum, self.low_water.iter().filter(|mark| mark.settled()).map(margin).min())
         };
         let (minimum, settled) = match self.timing {
-            Some((ahead, true)) => lows(&|mark| mark.shifted(clock, ahead)),
-            Some((ahead, false)) => lows(&|mark| mark.bound(clock, ahead)),
+            Some((ahead, true)) => lows(&|mark| mark.shifted(clock, ahead, arrivals)),
+            Some((ahead, false)) => lows(&|mark| mark.bound(clock, ahead, arrivals)),
             None => lows(&|mark| mark.margin(clock)),
         };
         self.surplus = if now.saturating_duration_since(since) >= DEPTH_WINDOW { minimum } else { 0 };
@@ -574,17 +639,26 @@ impl JitterBuffer {
     /// and successive refills step through one fixed set of consumption points within a packet,
     /// none skipped. Then each packet meets the same refills, at times that differ only by how
     /// far ahead each refill consumed.
-    fn alike(&self) -> bool {
+    fn alike(low_water: &VecDeque<Mark>, points: &mut Vec<i64>) -> bool {
         // `highest_lead` has checked that every packet lasts as long.
-        let leads = self.low_water.iter().filter_map(|mark| mark.lead);
+        let leads = low_water.iter().filter_map(|mark| mark.lead);
         let Some(packet) = leads.clone().next().map(|lead| lead.packet as i64) else { return false };
-        let points: std::collections::BTreeSet<i64> =
-            leads.clone().map(|lead| lead.consumed.rem_euclid(packet)).collect();
+        // More points than that is no grid worth trusting; the general bound still applies.
+        points.clear();
+        for point in leads.clone().map(|lead| lead.consumed.rem_euclid(packet)) {
+            if let Err(index) = points.binary_search(&point) {
+                if points.len() == ALIKE_POINTS {
+                    return false;
+                }
+                points.insert(index, point);
+            }
+        }
         let mut previous: Option<i64> = None;
         for consumed in leads.map(|lead| lead.consumed) {
             if let Some(previous) = previous.filter(|&previous| previous != consumed) {
                 let point = previous.rem_euclid(packet);
-                let next = points.range(point + 1..).next().copied().unwrap_or(points.first().unwrap() + packet);
+                let after = points.partition_point(|&p| p <= point);
+                let next = points.get(after).copied().unwrap_or(points[0] + packet);
                 if consumed - previous != next - point {
                     return false;
                 }

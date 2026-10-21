@@ -757,10 +757,40 @@ mod tests {
         }
     }
 
+    /// Refills 20 ms late for half of every hundred callbacks, then back on time in 5 ms steps.
+    fn late_then_catch_up(k: u64) -> u64 {
+        match k % 100 {
+            10..=59 => 960,
+            60 => 720,
+            61 => 480,
+            62 => 240,
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn refills_catching_up_meet_the_packets_that_arrived_before_earlier_refills() {
+        // Review round 5: 10 ms packets and refills, 35 ms late every 1.1 s, refills running
+        // 20 ms late for half of each second and then catching up. Every refill still consumes
+        // one packet, so they enter the packets alike, but the on-time refills ran 20 ms earlier
+        // than the late ones: further back than the previous observation. Counting only the
+        // arrivals since then gave 5 concealments and 2,760 samples of cuts; the reserve rule
+        // alone gives 0 and 480.
+        use super::super::jitter::Clock;
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            let (concealments, cut) = periodic_delay(clock, &[480], &[480], 1100 * 48, 35 * 48, late_then_catch_up);
+            let (_, reserve_cut) =
+                periodic_delay_by(true, clock, &[480], &[480], 1100 * 48, 35 * 48, late_then_catch_up);
+            assert_eq!(concealments, 0, "{clock:?}");
+            assert!(cut <= reserve_cut, "{clock:?}: {cut} > {reserve_cut}");
+        }
+    }
+
     /// The arrival rule against the reserve rule alone (`main` before it) over a grid of
     /// `periodic_delay` schedules: packets of 10, 20, 5 ms and 40/2.5/10/5/40 ms; callbacks of
     /// 10, 8, 10/20/5, 20, 5 ms and 441 samples; 5/20/35 ms delays every 0.5, 1.1, 2, 3, 3.3 and
-    /// 4.9 s; refills on time, 0.5 ms early every hundredth, or 0-2 ms late at random; both
+    /// 4.9 s; refills on time, 0.5 ms early every hundredth, 0-2 ms late at random, or 20 ms
+    /// late for half of every hundred and then catching up (`late_then_catch_up`); both
     /// clocks. No schedule may conceal more. About a minute in release:
     /// `cargo test --release -p gwar-client --lib drain_grid -- --ignored --nocapture`.
     #[test]
@@ -769,11 +799,12 @@ mod tests {
         use super::super::jitter::Clock;
         let durations: [&[u64]; 4] = [&[480], &[960], &[240], &[1920, 120, 480, 240, 1920]];
         let callbacks: [&[usize]; 6] = [&[480], &[384], &[480, 960, 240], &[960], &[240], &[441]];
-        let timings = ["exact", "early", "random"];
+        let timings = ["exact", "early", "random", "catch-up"];
         let late = |timing: usize, k: u64| match timing {
             0 => 0,
             1 if k % 100 == 98 => 216,
             1 => 240,
+            3 => late_then_catch_up(k),
             _ => {
                 // splitmix64
                 let mut z = k.wrapping_add(0x9e37_79b9_7f4a_7c15);
