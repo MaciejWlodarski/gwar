@@ -3,7 +3,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { useT } from "../i18n";
 import { addressLabel, pageContextFromLocation, sameOriginUrl } from "../net/address";
 import { parseInviteLink } from "../net/invite";
-import { controller, describeBan } from "../state/controller";
+import { bookmarkParams, controller, describeBan } from "../state/controller";
 import { isDesktop } from "../platform";
 import { useBookmarks, useSettings, type ServerKind } from "../state/settings";
 import { useAccount } from "../state/account";
@@ -252,7 +252,7 @@ export function ConnectScreen() {
                   <button
                     onClick={() =>
                       void controller.connectInteractive(
-                        { kind: b.kind, address: b.address, password: b.password, identity: b.identity, insecureLan: b.insecureLan },
+                        bookmarkParams(b),
                         { remember: false },
                       )
                     }

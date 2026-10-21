@@ -23,6 +23,10 @@ export interface Bookmark {
   password?: string;
   /** TeamSpeak only: the uid of the identity to connect with. Missing, or no longer in the list: the default one. */
   identity?: string;
+  /** TeamSpeak only: the channel to land in, a `Parent/Child` path of names. Missing: the server's default channel. */
+  channel?: string;
+  /** TeamSpeak only: that channel's password. Stored like `password`. */
+  channelPassword?: string;
   /** Unix ms of the last change to what Gwar Connect syncs (all but `insecureLan`). */
   updatedAt: number;
   /** The Gwar Connect account (its account key) whose vault this bookmark syncs with. Missing: saved without an account, and the next account to sync takes it. */
@@ -36,7 +40,7 @@ export type BookmarkInput = Omit<Bookmark, "updatedAt"> & { updatedAt?: number }
 export const BOOKMARK_TOMBSTONE_MS = 90 * 86_400_000;
 
 /** Longest synced fields, in characters (the vault holds at most 64 KiB). */
-export const BOOKMARK_LIMITS = { id: 64, name: 64, address: 255, password: 128, identity: 64 } as const;
+export const BOOKMARK_LIMITS = { id: 64, name: 64, address: 255, password: 128, identity: 64, channel: 255, channelPassword: 128 } as const;
 
 /** A removal this device still has to sync: when, and in which account's list. */
 export interface BookmarkRemoval {
@@ -52,7 +56,9 @@ export function syncable(b: Bookmark): boolean {
     b.address.trim().length > 0 &&
     b.address.trim().length <= BOOKMARK_LIMITS.address &&
     (b.password ?? "").length <= BOOKMARK_LIMITS.password &&
-    (b.identity ?? "").length <= BOOKMARK_LIMITS.identity
+    (b.identity ?? "").length <= BOOKMARK_LIMITS.identity &&
+    (b.channel ?? "").length <= BOOKMARK_LIMITS.channel &&
+    (b.channelPassword ?? "").length <= BOOKMARK_LIMITS.channelPassword
   );
 }
 
@@ -70,7 +76,10 @@ export function useBookmarks(): Bookmark[] {
 
 /** Whether two bookmarks differ in what Gwar Connect syncs. */
 function syncedChange(a: BookmarkInput, b: BookmarkInput): boolean {
-  return a.name !== b.name || a.address !== b.address || a.kind !== b.kind || (a.password ?? "") !== (b.password ?? "") || (a.identity ?? "") !== (b.identity ?? "");
+  return (
+    a.name !== b.name || a.address !== b.address || a.kind !== b.kind || (a.password ?? "") !== (b.password ?? "") || (a.identity ?? "") !== (b.identity ?? "") ||
+    (a.channel ?? "") !== (b.channel ?? "") || (a.channelPassword ?? "") !== (b.channelPassword ?? "")
+  );
 }
 
 /** A change's time: now, but always after the last one, so a device whose clock is behind still wins with a newer edit. */
@@ -115,6 +124,8 @@ export function dedupeBookmarks(
     for (const b of group.slice(1)) {
       if (!kept.password && b.password) kept = { ...kept, password: b.password };
       if (!kept.identity && b.identity) kept = { ...kept, identity: b.identity };
+      // A channel and its password go together.
+      if (!kept.channel && b.channel) kept = { ...kept, channel: b.channel, channelPassword: b.channelPassword };
       const owner = b.account ?? account ?? undefined;
       dropped[b.id] = owner === undefined ? { at } : { at, account: owner };
     }
@@ -279,7 +290,7 @@ export const useSettings = create<SettingsState>()(
           // Saving a server that is already saved updates that bookmark, in its place.
           const key = serverKey(input);
           const twin = s.bookmarks.find((b) => b.id !== input.id && inAccount(b, s.bookmarkAccount) && serverKey(b) === key);
-          // Adopting it keeps what the new entry leaves unsaid: its address, password, identity and LAN choice.
+          // Adopting it keeps what the new entry leaves unsaid: its address, password, identity, channel and LAN choice.
           const bookmark =
             twin && !s.bookmarks.some((b) => b.id === input.id)
               ? {
@@ -288,11 +299,14 @@ export const useSettings = create<SettingsState>()(
                   kind: input.kind,
                   password: input.password || twin.password,
                   identity: input.identity ?? twin.identity,
+                  ...(input.channel ? { channel: input.channel, channelPassword: input.channelPassword } : {}),
                   insecureLan: input.insecureLan || twin.insecureLan,
                 }
               : input;
           if (bookmark.password === undefined) delete bookmark.password;
           if (bookmark.identity === undefined) delete bookmark.identity;
+          if (bookmark.channel === undefined) delete bookmark.channel;
+          if (bookmark.channelPassword === undefined) delete bookmark.channelPassword;
           const existing = s.bookmarks.find((b) => b.id === bookmark.id);
           const changed = !existing || syncedChange(existing, bookmark);
           const account = existing?.account ?? s.bookmarkAccount ?? undefined;

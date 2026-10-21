@@ -112,6 +112,8 @@ export type DialogState =
   | { kind: "channelEdit"; mode: "edit"; channel: number }
   | { kind: "channelPermissions"; channel: number }
   | { kind: "channelPassword"; channel: number }
+  | { kind: "channelInfo"; channel: number }
+  | { kind: "poke"; person: PersonRef }
   | { kind: "serverSettings"; tab?: ServerSettingsTab }
   | { kind: "invites" }
   | { kind: "nickname"; uid: string }

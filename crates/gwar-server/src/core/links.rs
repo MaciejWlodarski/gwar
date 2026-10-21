@@ -417,7 +417,7 @@ mod tests {
         assert!(claim(&core, admin, &identity).await.is_ok());
         let ts = remote(&core, &teamspeak, channel).await.unwrap();
         // The moderator ranks below the admin, so not above the admin's TeamSpeak session either.
-        let kick = on_core(&core, move |core| core.client_kick(moderator, ts, None)).await;
+        let kick = on_core(&core, move |core| core.client_kick(moderator, ts, None, None)).await;
         assert_eq!(kick.unwrap_err().code, ErrorCode::Forbidden);
         // A ban of the member keeps their TeamSpeak identity out.
         let admin_uid = on_core(&core, move |core| core.sessions[&admin].uid.clone()).await;

@@ -152,6 +152,9 @@ function OverviewTab() {
   const onGwar = kind === "gwar";
   const [name, setName] = useState(server?.name ?? "");
   const [welcome, setWelcome] = useState(server?.welcome ?? "");
+  // The name and welcome as shown when opened (or last saved): only edits made here are sent, as
+  // the shown ones may be cleaned copies of the server's.
+  const [shown, setShown] = useState(() => ({ name: server?.name ?? "", welcome: server?.welcome ?? "" }));
   const [defaultChannel, setDefaultChannel] = useState(String(server?.default_channel ?? NO_CHANNEL));
   const [maxClients, setMaxClients] = useState(String(server?.max_clients ?? ""));
   const [password, setPassword] = useState("");
@@ -165,8 +168,8 @@ function OverviewTab() {
     e?.preventDefault();
     if (busy || !name.trim()) return;
     const update: Parameters<typeof controller.updateServer>[0] = {};
-    if (name.trim() !== server?.name) update.name = name.trim();
-    if (welcome !== server?.welcome) update.welcome = welcome;
+    if (name !== shown.name) update.name = name.trim();
+    if (welcome !== shown.welcome) update.welcome = welcome;
     if (onGwar) {
       if (defaultChannel !== NO_CHANNEL && Number(defaultChannel) !== server?.default_channel) update.default_channel = Number(defaultChannel);
       const max = Number(maxClients);
@@ -184,6 +187,7 @@ function OverviewTab() {
     setError(null);
     try {
       if (Object.keys(update).length > 0) await controller.updateServer(update);
+      setShown({ name, welcome });
       useUi.getState().toast("success", t("common.saved"));
       setPassword("");
       setRemovePassword(false);

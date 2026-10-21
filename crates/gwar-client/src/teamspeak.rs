@@ -20,7 +20,7 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use futures::StreamExt;
 use gwar_proto::{
-    Channel, ChannelId, ChatMessage, ChatTarget, Client, ClientUpdate, ErrorBody, ErrorCode, Event, LeaveReason,
+    Ban, Channel, ChannelId, ChatMessage, ChatTarget, Client, ClientUpdate, ErrorBody, ErrorCode, Event, LeaveReason,
     MessageId, Permission, Platform, Request, ServerInfo, SessionId, Welcome,
 };
 use serde_json::{Value, json};
@@ -43,6 +43,9 @@ pub struct TsOptions {
     pub nickname: String,
     pub server_password: Option<String>,
     pub identity: TsIdentity,
+    /// The channel to land in, as a `Parent/Child` path of names; the default channel if missing.
+    pub channel: Option<String>,
+    pub channel_password: Option<String>,
 }
 
 /// Loads (or creates) the persistent TeamSpeak identity at `path`.
@@ -272,6 +275,11 @@ struct View {
     server: Option<ServerInfo>,
     channels: BTreeMap<u32, Channel>,
     clients: BTreeMap<u32, Client>,
+    /// Channel descriptions TeamSpeak sent (on `channelgetdescription`), as it sent them.
+    descriptions: BTreeMap<u32, String>,
+    /// Channel names as TeamSpeak sent them; `channels` holds the cleaned ones the UI shows, which
+    /// two channels can share.
+    names: BTreeMap<u32, String>,
 }
 
 // Direct TS has local adapter tokens only; it has no Gwar call or MLS group.
@@ -283,6 +291,12 @@ fn local_slot_binding(view: &View, own: u16) -> gwar_proto::VoiceTransportBindin
 fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>, previous: &View) -> Option<View> {
     let state = con.get_state().ok()?;
     let mut channels = BTreeMap::new();
+    let descriptions = state
+        .channels
+        .values()
+        .filter_map(|c| Some((c.id.0 as u32, c.optional_data.as_ref()?.description.clone())))
+        .collect();
+    let names = state.channels.values().map(|c| (c.id.0 as u32, c.name.clone())).collect();
     // TS orders siblings by "previous sibling id"; walk the chains for positions.
     let mut by_parent: HashMap<u64, Vec<&tsclientlib::data::Channel>> = HashMap::new();
     for channel in state.channels.values() {
@@ -300,11 +314,16 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>, previous: &View)
                 Channel {
                     id: c.id.0 as u32,
                     parent: (c.parent.0 != 0).then_some(c.parent.0 as u32),
-                    name: c.name.clone(),
-                    topic: c.topic.clone().unwrap_or_default(),
+                    name: display_text(&c.name, false),
+                    topic: c.topic.as_deref().map(|t| display_text(t, false)).unwrap_or_default(),
                     position,
                     has_password: c.has_password.unwrap_or(false),
                     max_clients: match c.max_clients {
+                        Some(tsclientlib::MaxClients::Limited(n)) => Some(u32::from(n)),
+                        _ => None,
+                    },
+                    // An inherited limit is the parent's, which the UI reads there.
+                    max_family_clients: match c.max_family_clients {
                         Some(tsclientlib::MaxClients::Limited(n)) => Some(u32::from(n)),
                         _ => None,
                     },
@@ -333,13 +352,13 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>, previous: &View)
                 Client {
                     id: u32::from(c.id.0),
                     uid: c.uid.as_ref().map(|u| format!("ts:{}", STANDARD.encode(&u.0))).unwrap_or_default(),
-                    nickname: c.name.clone(),
+                    nickname: display_text(&c.name, false),
                     channel: Some(c.channel.0 as u32),
                     groups: c.server_groups.iter().map(|g| g.0 as u32).collect(),
                     platform: Platform::Ts3,
                     muted: c.input_muted,
                     deafened: c.output_muted,
-                    away: c.away_message.clone(),
+                    away: c.away_message.as_deref().map(|a| display_text(a, false)),
                     talking: talking.contains_key(&c.id.0),
                     voice: true,
                     server_muted: false,
@@ -379,8 +398,8 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>, previous: &View)
         .or_else(|| state.clients.get(&state.own_client).map(|c| c.channel.0 as u32))
         .unwrap_or(0);
     let server = ServerInfo {
-        name: state.server.name.clone(),
-        welcome: state.server.welcome_message.clone(),
+        name: display_text(&state.server.name, false),
+        welcome: display_text(&state.server.welcome_message, true),
         version: state.server.version.clone(),
         default_channel,
         max_clients: u32::from(state.server.max_clients),
@@ -390,7 +409,7 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>, previous: &View)
         teamspeak: true,
         server_chat: Default::default(),
     };
-    Some(View { server: Some(server), channels, clients })
+    Some(View { server: Some(server), channels, clients, descriptions, names })
 }
 
 /// Events turning `old` into `new`.
@@ -460,7 +479,8 @@ enum Reply {
     Join,
     /// `chat.send`: our own message. TeamSpeak's echo of it is dropped, so this is its one copy.
     Message(ChatTarget, String),
-    /// `channel.create`: the new channel, once the book shows it.
+    /// `channel.create`: the new channel, once the book shows it. Found by the name as asked for:
+    /// a cleaned name may match an older channel's.
     Created {
         parent: Option<ChannelId>,
         name: String,
@@ -469,17 +489,79 @@ enum Reply {
     Channel(ChannelId),
     /// `token.redeem`: our server groups now.
     Groups,
+    /// `channel.description`: the description the book got.
+    Description(ChannelId),
+    /// `ban.create`: the ban as asked for. TeamSpeak tells clients no ban id.
+    Banned(Box<Ban>),
 }
 
-fn reply_for(request: &Request) -> Reply {
+fn reply_for(request: &Request, view: &View, own: u16) -> Reply {
     match request {
         Request::ChannelJoin { .. } => Reply::Join,
         Request::ChatSend { target, text, .. } => Reply::Message(target.clone(), text.clone()),
         Request::ChannelCreate(c) => Reply::Created { parent: c.parent, name: c.name.clone() },
         Request::ChannelUpdate(u) => Reply::Channel(u.channel),
         Request::TokenRedeem { .. } => Reply::Groups,
+        Request::ChannelDescription { channel } => Reply::Description(*channel),
+        Request::BanCreate(b) => {
+            let who = b.client.and_then(|c| still(view, c, b.uid.as_deref()).ok());
+            let now = now_ms();
+            Reply::Banned(Box::new(Ban {
+                id: 0,
+                uid: who.map(|c| c.uid.clone()).or_else(|| b.uid.clone()),
+                ip: None,
+                nickname: who.map(|c| c.nickname.clone()).unwrap_or_default(),
+                reason: b.reason.clone(),
+                by: view.clients.get(&u32::from(own)).map(|c| c.nickname.clone()).unwrap_or_default(),
+                created_at: now,
+                expires_at: b.duration.map(|d| now.saturating_add((d as i64).saturating_mul(1000))),
+            }))
+        }
         _ => Reply::Empty,
     }
+}
+
+/// Text from the TeamSpeak server (names, topics, pokes, descriptions) as the UI may show it: bidi
+/// formatting goes (it reorders the text around it), and control characters become spaces, but
+/// for the newlines and tabs of `lines` text. Spacing is kept: spacer channels are drawn from
+/// their names. Same as `displayText` in apps/web/src/lib/text.ts.
+fn display_text(text: &str, lines: bool) -> String {
+    let bidi =
+        |c: char| matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    let text = if lines { text.replace("\r\n", "\n").replace('\r', "\n") } else { text.to_owned() };
+    text.chars()
+        .filter(|&c| !bidi(c))
+        .map(|c| if c.is_control() && !(lines && matches!(c, '\n' | '\t')) { ' ' } else { c })
+        .collect()
+}
+
+/// TeamSpeak descriptions are BBCode; the UI shows plain text. Tags go, their text stays
+/// (a link's text, an image's address).
+fn plain_text(bbcode: &str) -> String {
+    const TAGS: &[&str] = &[
+        "b", "i", "u", "s", "url", "img", "color", "size", "font", "center", "left", "right", "list", "*", "table",
+        "tr", "td", "th", "hr", "quote", "code", "spoiler", "sub", "sup", "time",
+    ];
+    let mut out = String::with_capacity(bbcode.len());
+    let mut rest = bbcode;
+    while let Some(start) = rest.find('[') {
+        out.push_str(&rest[..start]);
+        let tag = &rest[start + 1..];
+        let known = tag.find(']').filter(|&end| {
+            let inner = tag[..end].trim_start_matches('/');
+            let name = inner.split('=').next().unwrap_or_default();
+            TAGS.iter().any(|t| t.eq_ignore_ascii_case(name))
+        });
+        match known {
+            Some(end) => rest = &tag[end + 1..],
+            None => {
+                out.push('[');
+                rest = tag;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// An id for a message TeamSpeak sent without one. Unique for the life of the process, not
@@ -517,7 +599,7 @@ fn answer(reply: &Reply, view: &View, own: u16) -> Option<Result<Value, ErrorBod
     match reply {
         Reply::Empty | Reply::Join | Reply::Message(..) => Some(Ok(json!({}))),
         Reply::Created { parent, name } => {
-            view.channels.values().find(|c| c.parent == *parent && c.name == *name).map(value)
+            view.channels.values().find(|c| c.parent == *parent && view.names.get(&c.id) == Some(name)).map(value)
         }
         Reply::Channel(id) => match view.channels.get(id) {
             Some(channel) => Some(value(channel)),
@@ -526,6 +608,14 @@ fn answer(reply: &Reply, view: &View, own: u16) -> Option<Result<Value, ErrorBod
         Reply::Groups => Some(Ok(
             json!({ "groups": view.clients.get(&u32::from(own)).map(|c| c.groups.clone()).unwrap_or_default() }),
         )),
+        // TeamSpeak sends the description before it confirms the command: none by then is none at all.
+        Reply::Description(id) => match view.channels.contains_key(id) {
+            true => Some(Ok(
+                json!({ "description": display_text(&plain_text(view.descriptions.get(id).map_or("", String::as_str)), true) }),
+            )),
+            false => Some(Err(ErrorBody::new(ErrorCode::NotFound, "that channel no longer exists"))),
+        },
+        Reply::Banned(ban) => Some(Ok(json!({ "ban": ban }))),
     }
 }
 
@@ -559,8 +649,8 @@ fn readable(error: &tsclientlib::TsError) -> String {
     out
 }
 
-/// One TeamSpeak command of a request. `channel.update` may take two: TeamSpeak edits a
-/// channel and moves it with separate commands.
+/// One TeamSpeak command of a request. Some requests take two: TeamSpeak edits a channel and
+/// moves it with separate commands, and a ban by identity does not kick.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Part {
     Whole,
@@ -569,11 +659,11 @@ enum Part {
 }
 
 impl Part {
-    fn done(self) -> &'static str {
+    fn what(self) -> &'static str {
         match self {
-            Part::Whole => "done",
-            Part::Edit => "edited",
-            Part::Move => "moved",
+            Part::Whole => "the request",
+            Part::Edit => "the edit",
+            Part::Move => "the move",
         }
     }
 }
@@ -584,16 +674,16 @@ fn refusal_after(done: &[Part], failed: Part, error: ErrorBody) -> ErrorBody {
     if done.is_empty() {
         return error;
     }
-    let done: Vec<&str> = done.iter().map(|p| p.done()).collect();
+    let done: Vec<&str> = done.iter().map(|p| p.what()).collect();
     ErrorBody::new(
         ErrorCode::Partial,
-        format!("channel {}, but not {} ({})", done.join(" and "), failed.done(), error.message),
+        format!("{} went through, {} did not ({})", done.join(" and "), failed.what(), error.message),
     )
 }
 
 /// `channel.update` as TeamSpeak commands: the edit first, then the move, which only runs
 /// once the edit went through.
-fn channel_update(u: &gwar_proto::ChannelUpdate) -> Vec<(Part, OutCommand)> {
+fn channel_update(u: &gwar_proto::ChannelUpdate, view: &View) -> Vec<(Part, OutCommand)> {
     let mut args = vec![("cid", u.channel.to_string())];
     if let Some(name) = &u.name {
         args.push(("channel_name", name.clone()));
@@ -612,24 +702,78 @@ fn channel_update(u: &gwar_proto::ChannelUpdate) -> Vec<(Part, OutCommand)> {
         }
         None => {}
     }
-    // Reordering within a parent is not mapped yet; moves keep TS's default order.
     let parent = if u.move_to_root { Some(0) } else { u.parent.map(u64::from) };
+    // TeamSpeak orders a channel by the sibling before it, in the parent it ends up in.
+    let order = u.position.map(|position| {
+        let under = match parent {
+            Some(parent) => (parent != 0).then_some(parent as u32),
+            None => view.channels.get(&u.channel).and_then(|c| c.parent),
+        };
+        let mut siblings: Vec<&Channel> =
+            view.channels.values().filter(|c| c.parent == under && c.id != u.channel).collect();
+        siblings.sort_by_key(|c| (c.position, c.id));
+        let before = usize::try_from(position).unwrap_or(0).min(siblings.len());
+        before.checked_sub(1).map_or(0, |i| siblings[i].id).to_string()
+    });
+    let mut moved = vec![("cid", u.channel.to_string())];
+    match (parent, order) {
+        (Some(parent), order) => {
+            moved.push(("cpid", parent.to_string()));
+            moved.extend(order.map(|order| ("order", order)));
+        }
+        (None, Some(order)) => args.push(("channel_order", order)),
+        (None, None) => {}
+    }
     let mut commands = Vec::new();
     if args.len() > 1 || parent.is_none() {
         commands.push((Part::Edit, command("channeledit", &args)));
     }
-    if let Some(parent) = parent {
-        commands.push((
-            Part::Move,
-            command("channelmove", &[("cid", u.channel.to_string()), ("cpid", parent.to_string())]),
-        ));
+    if parent.is_some() {
+        commands.push((Part::Move, command("channelmove", &moved)));
     }
     commands
 }
 
+/// The client `client`, if it is still `uid`'s (when given): TeamSpeak hands a leaving client's id
+/// to the next one, so a dialog opened for one person may by now name another.
+fn still<'a>(view: &'a View, client: SessionId, uid: Option<&str>) -> Result<&'a Client, ErrorBody> {
+    view.clients
+        .get(&client)
+        .filter(|c| uid.is_none_or(|uid| c.uid == uid))
+        .ok_or_else(|| ErrorBody::new(ErrorCode::NotFound, "that person is no longer here"))
+}
+
+/// `ban.create`: TeamSpeak's `banclient` bans the address and the identity; a ban by identity
+/// alone is a `banadd`. Either way the TeamSpeak server drops whoever the ban matches.
+fn ban(b: &gwar_proto::BanCreate, view: &View) -> Result<Vec<(Part, OutCommand)>, ErrorBody> {
+    let mut args = Vec::new();
+    if let Some(duration) = b.duration {
+        args.push(("time", duration.to_string()));
+    }
+    if let Some(reason) = &b.reason {
+        args.push(("banreason", reason.clone()));
+    }
+    if let (Some(client), true) = (b.client, b.ip) {
+        still(view, client, b.uid.as_deref())?;
+        args.insert(0, ("clid", client.to_string()));
+        return Ok(vec![(Part::Whole, command("banclient", &args))]);
+    }
+    // The uid chosen, even if its session has since gone to someone else.
+    let uid = match (b.client, &b.uid) {
+        (_, Some(uid)) => uid.clone(),
+        (Some(client), None) => still(view, client, None)?.uid.clone(),
+        (None, None) => return Err(refused("say who to ban")),
+    };
+    let identity = uid.strip_prefix("ts:").filter(|u| !u.is_empty() && *u != "unknown");
+    let identity = identity.ok_or_else(|| refused("TeamSpeak servers ban TeamSpeak identities only"))?;
+    args.insert(0, ("uid", identity.to_owned()));
+    Ok(vec![(Part::Whole, command("banadd", &args))])
+}
+
 /// Translates a `gwar/1` request into the TS commands that carry it out, in order; none
 /// = answered locally.
-fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Vec<(Part, OutCommand)>, ErrorBody> {
+fn translate(request: &Request, own: u16, view: &View) -> Result<Vec<(Part, OutCommand)>, ErrorBody> {
+    let own_channel = view.clients.get(&u32::from(own)).and_then(|c| c.channel).map(u64::from).unwrap_or(0);
     let cmd = match request {
         Request::Ping {} => return Ok(Vec::new()),
         Request::ChannelJoin { channel, password } => {
@@ -639,17 +783,27 @@ fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Vec<(Part,
             }
             command("clientmove", &args)
         }
-        Request::ClientMove { client, channel } => {
+        Request::ClientMove { client, uid, channel } => {
+            still(view, *client, uid.as_deref())?;
             command("clientmove", &[("clid", client.to_string()), ("cid", channel.to_string())])
         }
-        Request::ClientKick { client, reason } => command(
-            "clientkick",
-            &[
-                ("clid", client.to_string()),
-                ("reasonid", "5".into()),
-                ("reasonmsg", reason.clone().unwrap_or_default()),
-            ],
-        ),
+        // TeamSpeak's reasons: 4 kicks from the channel (to the default one), 5 from the server.
+        Request::ClientKick { client, uid, reason, from_channel } => {
+            still(view, *client, uid.as_deref())?;
+            command(
+                "clientkick",
+                &[
+                    ("clid", client.to_string()),
+                    ("reasonid", if *from_channel { "4" } else { "5" }.into()),
+                    ("reasonmsg", reason.clone().unwrap_or_default()),
+                ],
+            )
+        }
+        Request::ClientPoke { client, uid, message } => {
+            still(view, *client, uid.as_deref())?;
+            command("clientpoke", &[("clid", client.to_string()), ("msg", message.clone())])
+        }
+        Request::ChannelDescription { channel } => command("channelgetdescription", &[("cid", channel.to_string())]),
         Request::ChatSend { attachments, .. } if !attachments.is_empty() => {
             return Err(refused("TeamSpeak servers can't take attachments"));
         }
@@ -705,7 +859,8 @@ fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Vec<(Part,
             }
             command("channelcreate", &args)
         }
-        Request::ChannelUpdate(u) => return Ok(channel_update(u)),
+        Request::ChannelUpdate(u) => return Ok(channel_update(u, view)),
+        Request::BanCreate(b) => return ban(b, view),
         Request::ChannelDelete { channel } => {
             command("channeldelete", &[("cid", channel.to_string()), ("force", "1".into())])
         }
@@ -743,9 +898,6 @@ fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Vec<(Part,
         | Request::TeamspeakChallenge {}
         | Request::TeamspeakClaim { .. }
         | Request::TeamspeakClaimable {}
-        | Request::BanCreate(_)
-        | Request::BanList {}
-        | Request::BanDelete { .. }
         | Request::InviteCreate(_)
         | Request::InviteList {}
         | Request::InviteDelete { .. } => return Err(refused("manage this server in the TeamSpeak client")),
@@ -762,6 +914,10 @@ fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Vec<(Part,
         Request::Mls(_) => return Err(refused("MLS requires a Gwar server")),
         Request::OwnerChain { .. } | Request::OwnerTransfer { .. } | Request::ManagersUpdate { .. } => {
             return Err(refused("a TeamSpeak server has no Gwar owner"));
+        }
+        // tsclientlib cannot read TeamSpeak's ban list: it rejects entries without an address.
+        Request::BanList {} | Request::BanDelete { .. } => {
+            return Err(refused("see and lift bans in the TeamSpeak client"));
         }
         Request::Hello(_) | Request::Join(_) => return Err(refused("already connected")),
     };
@@ -783,6 +939,12 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
         .log_commands(false);
     if let Some(password) = options.server_password {
         builder = builder.password(password);
+    }
+    if let Some(channel) = options.channel.filter(|c| !c.is_empty()) {
+        builder = builder.channel(channel);
+    }
+    if let Some(password) = options.channel_password.filter(|p| !p.is_empty()) {
+        builder = builder.channel_password(password);
     }
     let mut con = match builder.connect() {
         Ok(con) => con,
@@ -927,13 +1089,21 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                             if invoker.id.0 == own {
                                 continue;
                             }
+                            if let MessageTarget::Poke(_) = target {
+                                out.push(Event::ClientPoked {
+                                    client: u32::from(invoker.id.0),
+                                    nickname: display_text(&invoker.name, false),
+                                    message: display_text(&message, false),
+                                });
+                                continue;
+                            }
                             let target = match target {
                                 MessageTarget::Channel => ChatTarget::Channel(
                                     view.clients.get(&u32::from(own)).and_then(|c| c.channel).unwrap_or(0),
                                 ),
                                 MessageTarget::Server => ChatTarget::Server,
                                 MessageTarget::Client(id) => ChatTarget::Client(u32::from(id.0)),
-                                MessageTarget::Poke(id) => ChatTarget::Client(u32::from(id.0)),
+                                MessageTarget::Poke(_) => unreachable!("pokes are handled above"),
                             };
                             out.push(Event::ChatMessage(ChatMessage {
                                 signature: None,
@@ -945,7 +1115,7 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                                     .as_ref()
                                     .map(|u| format!("ts:{}", STANDARD.encode(&u.0)))
                                     .unwrap_or_else(|| "ts:unknown".into()),
-                                author_name: invoker.name.clone(),
+                                author_name: display_text(&invoker.name, false),
                                 text: message,
                                 sent_at: now_ms(),
                                 mentions: Vec::new(),
@@ -1014,14 +1184,13 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
             },
             Step::Request(None) => break,
             Step::Request(Some((request, reply))) => {
-                let own_channel = view.clients.get(&u32::from(own)).and_then(|c| c.channel).map(u64::from).unwrap_or(0);
-                match translate(&request, own, own_channel) {
+                match translate(&request, own, &view) {
                     Ok(commands) if commands.is_empty() => {
                         let _ = reply.send(Ok(json!({})));
                     }
                     Ok(commands) => {
                         let flight = InFlight {
-                            expected: reply_for(&request),
+                            expected: reply_for(&request, &view, own),
                             reply,
                             done: Vec::new(),
                             part: Part::Whole,
@@ -1177,50 +1346,60 @@ mod tests {
             mentions: Vec::new(),
             attachments: Vec::new(),
         };
-        assert!(matches!(translate(&request, 1, 4), Err(e) if e.code == ErrorCode::Forbidden));
-        assert!(matches!(translate(&Request::Ping {}, 1, 4), Ok(c) if c.is_empty()));
+        // I am in channel 7.
+        assert!(matches!(translate(&request, 3, &view()), Err(e) if e.code == ErrorCode::Forbidden));
+        assert!(matches!(translate(&Request::Ping {}, 3, &view()), Ok(c) if c.is_empty()));
     }
 
+    fn channel(id: ChannelId, parent: Option<ChannelId>, name: &str, position: i32) -> Channel {
+        Channel {
+            id,
+            parent,
+            name: name.into(),
+            topic: String::new(),
+            position,
+            has_password: false,
+            max_clients: None,
+            max_family_clients: None,
+            encrypted: false,
+            history: false,
+            private: false,
+            access: None,
+            overrides: Vec::new(),
+            synced: false,
+        }
+    }
+
+    fn client(id: SessionId, uid: &str, nickname: &str, channel: ChannelId) -> Client {
+        Client {
+            id,
+            uid: uid.into(),
+            nickname: nickname.into(),
+            channel: Some(channel),
+            groups: vec![6, 8],
+            platform: Platform::Ts3,
+            muted: false,
+            deafened: false,
+            away: None,
+            talking: false,
+            voice: true,
+            voice_binding: None,
+            server_muted: false,
+            server_deafened: false,
+            sharing: false,
+        }
+    }
+
+    /// Channels 7, 8 and 9 under 1, in that order; me (3) in 7 and bob (4) in 8.
     fn view() -> View {
         let mut view = View::default();
-        view.channels.insert(
-            7,
-            Channel {
-                id: 7,
-                parent: Some(1),
-                name: "Seven".into(),
-                topic: String::new(),
-                position: 0,
-                has_password: true,
-                max_clients: Some(2),
-                encrypted: false,
-                history: false,
-                private: false,
-                access: None,
-                overrides: Vec::new(),
-                synced: false,
-            },
-        );
-        view.clients.insert(
-            3,
-            Client {
-                id: 3,
-                uid: "ts:me".into(),
-                nickname: "me".into(),
-                channel: Some(7),
-                groups: vec![6, 8],
-                platform: Platform::Ts3,
-                muted: false,
-                deafened: false,
-                away: None,
-                talking: false,
-                voice: true,
-                voice_binding: None,
-                server_muted: false,
-                server_deafened: false,
-                sharing: false,
-            },
-        );
+        view.channels
+            .insert(7, Channel { has_password: true, max_clients: Some(2), ..channel(7, Some(1), "Seven", 0) });
+        view.channels.insert(8, channel(8, Some(1), "Eight", 1));
+        view.channels.insert(9, channel(9, Some(1), "Nine", 2));
+        view.clients.insert(3, client(3, "ts:me", "me", 7));
+        view.clients.insert(4, client(4, "ts:Ym9i", "bob", 8));
+        view.names = view.channels.values().map(|c| (c.id, c.name.clone())).collect();
         view
     }
 
@@ -1234,7 +1413,9 @@ mod tests {
             mentions: Vec::new(),
             attachments: Vec::new(),
         };
-        let Reply::Message(target, text) = reply_for(&send) else { panic!("chat.send answers with the message") };
+        let Reply::Message(target, text) = reply_for(&send, &view, 3) else {
+            panic!("chat.send answers with the message")
+        };
         let message = own_message(&view, 3, 1 << 31, target, text);
         let message: ChatMessage = serde_json::from_value(serde_json::to_value(&message).unwrap()).unwrap();
         assert_eq!((message.author, message.author_uid.as_str(), message.author_name.as_str()), (3, "ts:me", "me"));
@@ -1245,19 +1426,131 @@ mod tests {
         assert_eq!(answer(&create, &View::default(), 3), None);
         let created: Channel = serde_json::from_value(answer(&create, &view, 3).unwrap().unwrap()).unwrap();
         assert_eq!(created.id, 7);
+        // An older channel shown under the same cleaned name is not the new one.
+        let mut clash = view.clone();
+        clash.channels.insert(10, channel(10, Some(1), "Garden", 3));
+        clash.names.insert(10, "Gar\u{202e}den".into());
+        let create = reply_for(
+            &Request::ChannelCreate(gwar_proto::ChannelCreate {
+                name: "Garden".into(),
+                parent: Some(1),
+                ..Default::default()
+            }),
+            &clash,
+            3,
+        );
+        assert_eq!(answer(&create, &clash, 3), None);
+        clash.channels.insert(11, channel(11, Some(1), "Garden", 4));
+        clash.names.insert(11, "Garden".into());
+        let created: Channel = serde_json::from_value(answer(&create, &clash, 3).unwrap().unwrap()).unwrap();
+        assert_eq!(created.id, 11);
         let updated = answer(
-            &reply_for(&Request::ChannelUpdate(gwar_proto::ChannelUpdate { channel: 7, ..Default::default() })),
+            &reply_for(
+                &Request::ChannelUpdate(gwar_proto::ChannelUpdate { channel: 7, ..Default::default() }),
+                &view,
+                3,
+            ),
             &view,
             3,
         );
         assert_eq!(serde_json::from_value::<Channel>(updated.unwrap().unwrap()).unwrap().id, 7);
-        assert!(matches!(answer(&Reply::Channel(9), &view, 3), Some(Err(e)) if e.code == ErrorCode::NotFound));
-        let redeem = reply_for(&Request::TokenRedeem { token: "t".into() });
+        assert!(matches!(answer(&Reply::Channel(90), &view, 3), Some(Err(e)) if e.code == ErrorCode::NotFound));
+        let redeem = reply_for(&Request::TokenRedeem { token: "t".into() }, &view, 3);
         assert_eq!(answer(&redeem, &view, 3), Some(Ok(json!({ "groups": [6, 8] }))));
         assert_eq!(
-            answer(&reply_for(&Request::ChannelJoin { channel: 7, password: None }), &view, 3),
+            answer(&reply_for(&Request::ChannelJoin { channel: 7, password: None }, &view, 3), &view, 3),
             Some(Ok(json!({})))
         );
+
+        // The description as plain text; none sent by the time the command is done is none at all.
+        let mut described = view.clone();
+        described.descriptions.insert(7, "[b]Rules[/b]: be [url=https://x.test]nice[/url] [sic]".into());
+        let description = reply_for(&Request::ChannelDescription { channel: 7 }, &view, 3);
+        assert_eq!(answer(&description, &described, 3), Some(Ok(json!({ "description": "Rules: be nice [sic]" }))));
+        assert_eq!(answer(&description, &view, 3), Some(Ok(json!({ "description": "" }))));
+        let gone = reply_for(&Request::ChannelDescription { channel: 70 }, &view, 3);
+        assert!(matches!(answer(&gone, &view, 3), Some(Err(e)) if e.code == ErrorCode::NotFound));
+
+        // A ban answers in the shape of a Gwar server's.
+        let ban = reply_for(
+            &Request::BanCreate(gwar_proto::BanCreate {
+                client: Some(4),
+                duration: Some(60),
+                reason: Some("spam".into()),
+                ..Default::default()
+            }),
+            &view,
+            3,
+        );
+        let Some(Ok(value)) = answer(&ban, &view, 3) else { panic!("a ban answers") };
+        let ban: Ban = serde_json::from_value(value["ban"].clone()).unwrap();
+        assert_eq!((ban.uid.as_deref(), ban.nickname.as_str(), ban.by.as_str()), (Some("ts:Ym9i"), "bob", "me"));
+        assert_eq!(ban.expires_at, Some(ban.created_at + 60_000));
+    }
+
+    #[test]
+    fn descriptions_lose_bbcode_tags_only() {
+        assert_eq!(plain_text("[center][size=14]Hi[/size][/center]\n[list][*]one[/list]"), "Hi\none");
+        assert_eq!(plain_text("[img]https://x.test/a.png[/img] [URL]u[/URL]"), "https://x.test/a.png u");
+        assert_eq!(plain_text("a [1] b [unclosed"), "a [1] b [unclosed");
+        assert_eq!(plain_text("<script>x</script>"), "<script>x</script>");
+    }
+
+    #[test]
+    fn shown_text_loses_bidi_formatting_and_control_characters() {
+        assert_eq!(display_text("evil\u{202e}gnp.exe\u{2066}x\u{2069}", false), "evilgnp.exex");
+        assert_eq!(display_text("a\0b\nc\td  e ", false), "a b c d  e ");
+        assert_eq!(display_text("Zażółć 🎧 مرحبا", false), "Zażółć 🎧 مرحبا");
+        assert_eq!(display_text("one\r\ntwo\rthree\n\tfour\u{7}\u{202e}", true), "one\ntwo\nthree\n\tfour ");
+    }
+
+    #[test]
+    fn kicks_pokes_and_bans_use_teamspeak_commands() {
+        let view = view();
+        let run = |request: Request| sent(&translate(&request, 3, &view).unwrap());
+        let kick =
+            |from_channel| Request::ClientKick { client: 4, uid: None, reason: Some("bye".into()), from_channel };
+        assert_eq!(run(kick(false)), vec![(Part::Whole, "clientkick clid=4 reasonid=5 reasonmsg=bye".into())]);
+        assert_eq!(run(kick(true)), vec![(Part::Whole, "clientkick clid=4 reasonid=4 reasonmsg=bye".into())]);
+        let poke = |uid: &str| Request::ClientPoke { client: 4, uid: Some(uid.into()), message: "look here".into() };
+        assert_eq!(run(poke("ts:Ym9i")), vec![(Part::Whole, "clientpoke clid=4 msg=look\\shere".into())]);
+        // Session 4 is no longer the person chosen: nothing goes out.
+        let someone_else = |request: Request| translate(&request, 3, &view).map(|c| sent(&c));
+        assert!(matches!(someone_else(poke("ts:YWxpY2U=")), Err(e) if e.code == ErrorCode::NotFound));
+        let kick_alice =
+            Request::ClientKick { client: 4, uid: Some("ts:YWxpY2U=".into()), reason: None, from_channel: false };
+        assert!(matches!(someone_else(kick_alice), Err(e) if e.code == ErrorCode::NotFound));
+        let move_to_9 = |uid: &str| Request::ClientMove { client: 4, uid: Some(uid.into()), channel: 9 };
+        assert!(matches!(someone_else(move_to_9("ts:YWxpY2U=")), Err(e) if e.code == ErrorCode::NotFound));
+        assert_eq!(run(move_to_9("ts:Ym9i")), vec![(Part::Whole, "clientmove clid=4 cid=9".into())]);
+        let describe = Request::ChannelDescription { channel: 8 };
+        assert_eq!(run(describe), vec![(Part::Whole, "channelgetdescription cid=8".into())]);
+
+        let ban = |b: gwar_proto::BanCreate| translate(&Request::BanCreate(b), 3, &view).map(|c| sent(&c));
+        // With the address: TeamSpeak's own ban, which also kicks.
+        let with_ip =
+            ban(gwar_proto::BanCreate { client: Some(4), ip: true, duration: Some(60), ..Default::default() });
+        assert_eq!(with_ip.unwrap(), vec![(Part::Whole, "banclient clid=4 time=60".into())]);
+        // By identity only, online or not: TeamSpeak drops someone online itself.
+        let online =
+            ban(gwar_proto::BanCreate { client: Some(4), reason: Some("spam".into()), ..Default::default() }).unwrap();
+        assert_eq!(online, vec![(Part::Whole, "banadd uid=Ym9i banreason=spam".into())]);
+        let offline = ban(gwar_proto::BanCreate { uid: Some("ts:Ym9i".into()), ..Default::default() }).unwrap();
+        assert_eq!(offline, vec![(Part::Whole, "banadd uid=Ym9i".into())]);
+        let gwar_uid = ban(gwar_proto::BanCreate { uid: Some("AAAA".into()), ..Default::default() });
+        assert!(matches!(gwar_uid, Err(e) if e.code == ErrorCode::BadRequest));
+        let left = ban(gwar_proto::BanCreate { client: Some(40), ..Default::default() });
+        assert!(matches!(left, Err(e) if e.code == ErrorCode::NotFound));
+        // Alice chosen, her session now bob's: her identity is banned, never bob's, and her
+        // address ban (which needs her session) is refused.
+        let alice = || gwar_proto::BanCreate { client: Some(4), uid: Some("ts:YWxpY2U=".into()), ..Default::default() };
+        assert_eq!(ban(alice()).unwrap(), vec![(Part::Whole, "banadd uid=YWxpY2U=".into())]);
+        let by_address = ban(gwar_proto::BanCreate { ip: true, ..alice() });
+        assert!(matches!(by_address, Err(e) if e.code == ErrorCode::NotFound));
+        let Reply::Banned(banned) = reply_for(&Request::BanCreate(alice()), &view, 3) else { panic!("a ban") };
+        assert_eq!((banned.uid.as_deref(), banned.nickname.as_str()), (Some("ts:YWxpY2U="), ""));
+        let list = translate(&Request::BanList {}, 3, &view);
+        assert!(matches!(list, Err(e) if e.code == ErrorCode::BadRequest));
     }
 
     #[test]
@@ -1288,7 +1581,8 @@ mod tests {
 
     #[test]
     fn channel_update_edits_and_moves() {
-        let update = |u: gwar_proto::ChannelUpdate| sent(&translate(&Request::ChannelUpdate(u), 1, 4).unwrap());
+        let view = view();
+        let update = |u: gwar_proto::ChannelUpdate| sent(&translate(&Request::ChannelUpdate(u), 3, &view).unwrap());
         let both = update(gwar_proto::ChannelUpdate {
             channel: 7,
             name: Some("New".into()),
@@ -1305,9 +1599,18 @@ mod tests {
         assert_eq!(root, vec![(Part::Move, "channelmove cid=7 cpid=0".into())]);
         let edit = update(gwar_proto::ChannelUpdate { channel: 7, topic: Some("t".into()), ..Default::default() });
         assert_eq!(edit, vec![(Part::Edit, "channeledit cid=7 channel_topic=t".into())]);
-        // A position alone is not a move to the root.
-        let reorder = update(gwar_proto::ChannelUpdate { channel: 7, position: Some(3), ..Default::default() });
-        assert_eq!(reorder.iter().map(|(p, _)| *p).collect::<Vec<_>>(), vec![Part::Edit]);
+        // A position is the place among the other siblings: TeamSpeak names the one before.
+        let reorder = |channel, position| {
+            update(gwar_proto::ChannelUpdate { channel, position: Some(position), ..Default::default() })
+        };
+        assert_eq!(reorder(7, 2), vec![(Part::Edit, "channeledit cid=7 channel_order=9".into())]);
+        assert_eq!(reorder(7, 1), vec![(Part::Edit, "channeledit cid=7 channel_order=8".into())]);
+        assert_eq!(reorder(9, 0), vec![(Part::Edit, "channeledit cid=9 channel_order=0".into())]);
+        assert_eq!(reorder(8, 99), vec![(Part::Edit, "channeledit cid=8 channel_order=9".into())]);
+        // Moving with a place: the order goes with the move, among the new parent's channels.
+        let moved =
+            update(gwar_proto::ChannelUpdate { channel: 9, parent: Some(7), position: Some(0), ..Default::default() });
+        assert_eq!(moved, vec![(Part::Move, "channelmove cid=9 cpid=7 order=0".into())]);
     }
 
     #[test]
@@ -1316,7 +1619,10 @@ mod tests {
         assert_eq!(refusal_after(&[], Part::Edit, refused()).code, ErrorCode::Forbidden);
         let partial = refusal_after(&[Part::Edit], Part::Move, refused());
         assert_eq!(partial.code, ErrorCode::Partial);
-        assert_eq!(partial.message, "channel edited, but not moved (TeamSpeak: permissions client insufficient)");
+        assert_eq!(
+            partial.message,
+            "the edit went through, the move did not (TeamSpeak: permissions client insufficient)"
+        );
     }
 }
 

@@ -239,6 +239,16 @@ describe("requests", () => {
     s.push({ ev: "voice.talking", d: { call: "AAAAAAAAAAAAAAAAAAAAAA", participation: "AQEBAQEBAQEBAQEBAQEBAQ", run: 1, client: 5, talking: true } });
     expect(seen).toEqual([4]);
   });
+
+  it("drops pokes, which only TeamSpeak servers send", async () => {
+    const conn = make();
+    const s = await handshake(conn);
+    const seen: string[] = [];
+    conn.onEvent((e) => seen.push(e.ev));
+    s.push({ ev: "client.poked", d: { client: 4, nickname: "alice", message: "send me your password" } });
+    s.push({ ev: "voice.talking", d: { call: "AAAAAAAAAAAAAAAAAAAAAA", participation: "AQEBAQEBAQEBAQEBAQEBAQ", run: 1, client: 4, talking: true } });
+    expect(seen).toEqual(["voice.talking"]);
+  });
 });
 
 describe("reconnect", () => {

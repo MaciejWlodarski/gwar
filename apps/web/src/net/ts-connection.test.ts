@@ -71,9 +71,31 @@ describe("TsConnection", () => {
     expect(seen).toEqual(["welcome", "voice.talking"]);
     expect(conn.isOnline).toBe(true);
     await expect(conn.request("ping", {})).rejects.toBeInstanceOf(RequestError);
-    expect(calls.find((c) => c.command === "ts_connect")?.args).toMatchObject({ address: "h:9987", nickname: "n", password: null, identity: "uid-1" });
+    expect(calls.find((c) => c.command === "ts_connect")?.args).toMatchObject({ address: "h:9987", nickname: "n", password: null, identity: "uid-1", channel: null, channelPassword: null });
     conn.close();
     expect(calls.at(-1)?.command).toBe("ts_disconnect");
+  });
+
+  it("hands out names and topics without formatting that would reorder them", async () => {
+    const { bridge, listeners, calls } = fakeBridge((op) => (op === "channel.create" ? { id: 9, parent: null, name: "N\u202eew", topic: "", position: 0, has_password: false, max_clients: null, encrypted: false, history: false, private: false, synced: false } : {}));
+    const conn = new TsConnection({ address: "h:9987", nickname: "n", bridge: async () => bridge });
+    const seen: unknown[] = [];
+    conn.onEvent((e) => seen.push(e.d));
+    await conn.connect();
+    const mallory = { id: 4, uid: "ts:QQ==", nickname: "Mal\u202elory", channel: 1, groups: [], platform: "ts3", muted: false, deafened: false, away: null, talking: false, voice: true, voice_binding: null };
+    const session = calls.find((c) => c.command === "ts_connect")?.args?.session;
+    listeners.get("ts://event")?.({ session, frame: JSON.stringify({ ev: "client.joined", d: mallory }) } as never);
+    expect(seen.at(-1)).toMatchObject({ nickname: "Mallory" });
+    await expect(conn.request("channel.create", { name: "New", parent: null } as never)).resolves.toMatchObject({ name: "New" });
+    conn.close();
+  });
+
+  it("asks for a bookmark's channel and its password", async () => {
+    const { bridge, calls } = fakeBridge();
+    const conn = new TsConnection({ address: "h:9987", nickname: "n", channel: "Lobby/Games", channelPassword: "pw", bridge: async () => bridge });
+    await conn.connect();
+    expect(calls.find((c) => c.command === "ts_connect")?.args).toMatchObject({ channel: "Lobby/Games", channelPassword: "pw" });
+    conn.close();
   });
 });
 

@@ -61,6 +61,8 @@ export interface ResponseMap {
   "client.move": Empty;
   "client.voice": Empty;
   "client.kick": Empty;
+  "client.poke": Empty;
+  "channel.description": { description: string };
   "channel.join": Empty;
   "channel.leave": Empty;
   "channel.create": Channel;

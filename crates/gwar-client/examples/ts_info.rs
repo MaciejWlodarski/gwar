@@ -13,7 +13,15 @@ async fn main() -> anyhow::Result<()> {
     let nickname = args.next().unwrap_or_else(|| "gwar-probe".into());
     let identity = teamspeak::load_identity(&std::env::temp_dir().join("gwar-ts-info-identity.json"))?;
     let started = Instant::now();
-    let mut ts = teamspeak::connect(TsOptions { address, nickname, server_password: None, identity }).await?;
+    let mut ts = teamspeak::connect(TsOptions {
+        address,
+        nickname,
+        server_password: None,
+        identity,
+        channel: None,
+        channel_password: None,
+    })
+    .await?;
     let w = &ts.welcome;
     println!("connected in {:?} as session {} — server \"{}\"", started.elapsed(), w.session, w.server.name);
     let mut channels = w.channels.clone();

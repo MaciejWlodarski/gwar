@@ -541,6 +541,8 @@ export class Connection implements Link {
       return;
     }
     const { event } = frame;
+    // Gwar servers have no pokes: an unsigned one would put words in a member's mouth.
+    if (event.ev === "client.poked") return;
     if (event.ev === "disconnected") this.serverReason = event.d.reason;
     const set = this.eventHandlers.get(event.ev);
     if (set) for (const h of [...set]) h(event.d as never);

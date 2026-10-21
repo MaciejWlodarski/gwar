@@ -507,12 +507,57 @@ describe("telling the server what I have read", () => {
   });
 });
 
+describe("TeamSpeak actions", () => {
+  const teamspeak = () => connectFake({ channel: 1, kind: "teamspeak", permissions: ["connect", "kick_members", "manage_channels"] });
+
+  it("shows a poke and keeps it out of the session", async () => {
+    teamspeak();
+    const before = session();
+    link.emit({ ev: "client.poked", d: { client: 99, nickname: "bob", message: "look" } });
+    expect(stores.useUi.getState().toasts.map((t) => t.text)).toEqual(["bob pokes you: look"]);
+    expect(session().threads).toEqual(before.threads);
+  });
+
+  it("shows a poke without formatting that would reorder or break its text", async () => {
+    teamspeak();
+    link.emit({ ev: "client.poked", d: { client: 99, nickname: "b\u202eob", message: "line\none\u2066 two" } });
+    expect(stores.useUi.getState().toasts.map((t) => t.text)).toEqual(["bob pokes you: line one two"]);
+  });
+
+  it("ignores pokes anywhere but on TeamSpeak, where nothing verifies who they are from", async () => {
+    connectFake({ channel: 1 });
+    link.emit({ ev: "client.poked", d: { client: 99, nickname: "bob", message: "look" } });
+    expect(stores.useUi.getState().toasts).toEqual([]);
+  });
+
+  it("pokes, kicks from the channel, reads descriptions and moves channels among their siblings", async () => {
+    teamspeak();
+    await controller.pokeClient(2, "u2", "hi");
+    expect(link.sent("client.poke").at(-1)?.d).toEqual({ client: 2, uid: "u2", message: "hi" });
+    await controller.moveClient(2, "u2", 3);
+    expect(link.sent("client.move").at(-1)?.d).toEqual({ client: 2, uid: "u2", channel: 3 });
+    await controller.kickFromChannel(2, "u2");
+    expect(link.sent("client.kick").at(-1)?.d).toEqual({ client: 2, uid: "u2", reason: null, from_channel: true });
+    for (const c of [{ id: 1, position: 0 }, { id: 2, position: 1 }, { id: 3, position: 2 }]) {
+      link.emit({ ev: "channel.updated", d: { ...session().channels[c.id] ?? chan(c.id), position: c.position, parent: null } });
+    }
+    await controller.moveChannelBy(2, 1);
+    expect(link.sent("channel.update").at(-1)?.d).toEqual({ channel: 2, position: 2 });
+    await controller.moveChannelBy(2, -1);
+    expect(link.sent("channel.update").at(-1)?.d).toEqual({ channel: 2, position: 0 });
+    const updates = link.sent("channel.update").length;
+    await controller.moveChannelBy(1, -1);
+    await controller.moveChannelBy(3, 1);
+    expect(link.sent("channel.update")).toHaveLength(updates);
+  });
+});
+
 describe("request errors", () => {
   it("say which part of a half-done change went through", async () => {
     const { RequestError } = await import("../net/connection");
     const { describeRequestError } = await import("./controller");
-    const text = describeRequestError(new RequestError("partial", "channel edited, but not moved (TeamSpeak: refused)"));
-    expect(text).toBe("Only part of that went through (channel edited, but not moved (TeamSpeak: refused))");
+    const text = describeRequestError(new RequestError("partial", "the edit went through, the move did not (TeamSpeak: refused)"));
+    expect(text).toBe("Only part of that went through (the edit went through, the move did not (TeamSpeak: refused))");
   });
 });
 
@@ -775,6 +820,15 @@ describe("notifications", () => {
     call.onClick();
     expect(session().viewChannel).toBe(2);
     expect(session().activeThread).toBe("channel");
+  });
+
+  it("shows names and text without formatting that would reorder the notification", async () => {
+    connectFake();
+    session().dispatch({ type: "focus", focused: false });
+    link.emit({ ev: "chat.message", d: message(56, 1, { author_uid: "ts:mal", author_name: "Mal\u202elory", target: { client: 1 }, text: "he\u202ey\u0007you\nthere" }) });
+    const call = notifyMock.mock.calls[0]![0] as { title: string; body: string };
+    expect(call.title).toContain("Mallory");
+    expect(call.body).toBe("hey you\nthere");
   });
 
   it("is quiet while the window is in front, for plain channel messages, and for my own", async () => {
