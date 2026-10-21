@@ -333,9 +333,10 @@ before refills over a full trailing five seconds. This retains sparse low-water
 evidence such as a 5 ms packet delay every three seconds. The margin excludes
 the pending refill and 120 samples (2.5 ms) of safety, plus the adaptive jitter
 reserve beyond one packet unless every refill in the window asks for the same whole
-number of packets, all of one duration; refills like that meet the packets at one
-phase, so the minimum already holds the dips the jitter caused (see "Level steps,
-second pass" below). Arrival phase contributes no credit. Each correction proposes at most
+number of packets, all of one duration, at times that keep one phase against the
+packets (within 1 ms); refills like that meet every delay at that phase, so the
+minimum already holds the dips the jitter caused, and the marks keep only the phase
+wander as reserve (see "Level steps, second pass" below). Arrival phase contributes no credit. Each correction proposes at most
 720 samples (15 ms). Each committed cut is subtracted from every historical
 margin, so later corrections cannot spend the same surplus twice. Depth is
 buffered time from the playout position to the end of the queue, holes
@@ -482,6 +483,17 @@ concealment, cut and low-water mark (not committed) separated three mechanisms:
   alternating 960 and 480 observations and keeps the reserve. In practice only
   callbacks of 10 ms or less that hold a whole number of packets, such as 10 ms
   callbacks over 10 ms packets (the harness's native stream), drop it.
+
+  Whole-packet sizes are not enough either (review round 3): 10 ms refills over
+  10 ms packets whose times walk through the period (refill `k` at
+  `480k + 479 + (17k mod 480)` samples) with a 35 ms delay every 3 s gave 2
+  concealments and 1,800 samples of cuts without the reserve, against 0 and 852
+  with it, on both clocks; every observation was still 480 over 480. So the refill
+  times count as well: phases are measured from the window's first refill, modulo
+  the packet duration, and the reserve is dropped only while they stay within 1 ms
+  of each other. The marks then keep the spread itself (at most 1 ms) as reserve,
+  since a delay met that much earlier in the phase showed that much less dip. A
+  live callback whose wake-up wanders more than that keeps the full reserve.
 - **A late packet stretches the timeline (intended).** When the queue is empty at
   a refill, the head packet is concealed in place; if it then arrives, it plays
   and every later packet is 10 ms later. On a loaded host, single packets arrive

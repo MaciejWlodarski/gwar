@@ -642,13 +642,15 @@ mod tests {
     }
 
     /// 60 s of ordered delivery without loss; the first packet at or after every `period`
-    /// is `delay` late. Playout starts 50 ms behind. Returns the concealments.
+    /// is `delay` late. Playout starts 50 ms behind; refill `k` runs `late(k)` samples after
+    /// its callback's start. Returns the concealments.
     fn periodic_delay(
         clock: super::super::jitter::Clock,
         durations: &[u64],
         callbacks: &[usize],
         period: u64,
         delay: u64,
+        late: impl Fn(u64) -> u64,
     ) -> u64 {
         use super::super::jitter::Clock;
         let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
@@ -674,12 +676,13 @@ mod tests {
         }
         let mut arrivals = arrivals.into_iter().peekable();
         let mut tick = 0u64;
-        for &callback in callbacks.iter().cycle() {
+        for (k, &callback) in callbacks.iter().cycle().enumerate() {
             if tick >= 60 * 48_000 {
                 break;
             }
-            let now = start + Duration::from_secs_f64(tick as f64 / 48_000.0);
-            while let Some((time, key, n, data)) = arrivals.next_if(|a| a.0 <= tick) {
+            let at = tick + late(k as u64);
+            let now = start + Duration::from_secs_f64(at as f64 / 48_000.0);
+            while let Some((time, key, n, data)) = arrivals.next_if(|a| a.0 <= at) {
                 slot.buffer.push_at(key, n, data, start + Duration::from_secs_f64(time as f64 / 48_000.0), clock);
             }
             slot.mix_refill(&mut vec![0.0; callback], 1.0, now, callback).unwrap();
@@ -696,16 +699,22 @@ mod tests {
         use super::super::jitter::Clock;
         for clock in [Clock::Rtp, Clock::Sequence] {
             // 10 ms packets, callbacks cycling 10/20/5 ms, 35 ms late every 4.8 s.
-            let varying_callbacks = periodic_delay(clock, &[480], &[480, 960, 240], 4800 * 48, 35 * 48);
+            let varying_callbacks = periodic_delay(clock, &[480], &[480, 960, 240], 4800 * 48, 35 * 48, |_| 0);
             assert!(varying_callbacks <= 1, "{clock:?}: {varying_callbacks}");
             // 40/2.5/10/5/40 ms packets, 10 ms callbacks, 5 ms late after every 3 s.
-            let varying_durations = periodic_delay(clock, &[1920, 120, 480, 240, 1920], &[480], 3 * 48_000, 5 * 48);
+            let varying_durations =
+                periodic_delay(clock, &[1920, 120, 480, 240, 1920], &[480], 3 * 48_000, 5 * 48, |_| 0);
             assert_eq!(varying_durations, 0, "{clock:?}");
             // 10 ms packets, fixed 8 ms callbacks, 35 ms late every 3.3 s: every refill asks for
             // the same amount, but 8 ms refills walk through the 10 ms packets' phases. Without
             // the reserve this gave 9 concealments (1 with it).
-            let walking_phase = periodic_delay(clock, &[480], &[384], 3300 * 48, 35 * 48);
+            let walking_phase = periodic_delay(clock, &[480], &[384], 3300 * 48, 35 * 48, |_| 0);
             assert!(walking_phase <= 1, "{clock:?}: {walking_phase}");
+            // 10 ms packets and 10 ms refills, 35 ms late every 3 s, but each refill runs at
+            // another point of its period: equal whole-packet refills whose times walk through
+            // the packets' phases. Without the reserve this gave 2 concealments (0 with it).
+            let walking_times = periodic_delay(clock, &[480], &[480], 3 * 48_000, 35 * 48, |k| 479 + (17 * k) % 480);
+            assert_eq!(walking_times, 0, "{clock:?}");
         }
     }
 

@@ -71,7 +71,8 @@ struct Span {
 }
 
 impl Mark {
-    fn margin(&self, clock: Clock, reserve: bool) -> u64 {
+    /// `reserve` caps the mark's jitter reserve (`JitterBuffer::refresh_surplus`).
+    fn margin(&self, clock: Clock, reserve: u64) -> u64 {
         let buffered = self.span.as_ref().map_or(0, |span| match clock {
             // RTP keys are sample positions: holes included, the span is the audio.
             Clock::Rtp => span.end.saturating_sub(span.head),
@@ -82,8 +83,7 @@ impl Mark {
                 present + strides.saturating_sub(packets) * span.hole
             }
         });
-        let reserve = if reserve { self.reserve as i64 } else { 0 };
-        (buffered as i64 + self.base - reserve).max(0) as u64
+        (buffered as i64 + self.base - self.reserve.min(reserve) as i64).max(0) as u64
     }
 
     /// A known lower bound: no later arrival can raise it.
@@ -127,6 +127,8 @@ const QUIET_SHRINK: Duration = Duration::from_secs(1);
 // must be slower than that jitter pattern; genuine surplus can take tens of seconds.
 const DEPTH_WINDOW: Duration = Duration::from_secs(5);
 const SAFETY: u64 = 120; // Retain 2.5 ms beyond the observed refill low-water mark.
+/// How far refill times may wander against the packets (1 ms) and still count as one phase.
+const PHASE_SLACK: u64 = 48;
 const FORCE_SHRINK: Duration = Duration::from_secs(2);
 const SHRINK_STEP: u64 = 720; // Allow one low-pitched period (15 ms); the decoder commits the actual cut.
 // Debited low-water evidence supports bounded recovery: at most 10 ms/s in
@@ -370,21 +372,19 @@ impl JitterBuffer {
     /// was a loss does not cost the one-to-two-second wait again.
     ///
     /// The marks sample the queue at refills only. When every refill in the window asks for
-    /// the same whole number of packets, all of one duration, every refill meets the packets
-    /// at the same phase, so a late packet meets the same phase each time, the window's
+    /// the same whole number of packets, all of one duration, at times that keep one phase
+    /// against the packets, a late packet meets the same phase each time, the window's
     /// minimum already shows the dip the jitter causes, and subtracting the jitter estimate as
     /// well counted it twice: with 25 ms of jitter a 20 ms backlog never drained
-    /// (docs/latency.md, "Level steps, second pass"). Otherwise the refills walk through the
-    /// packets (8 ms refills over 10 ms packets, varying callbacks or durations), a delay can
-    /// meet a luckier phase than the next one, and the minimum understates what that one
-    /// needs; each mark keeps its jitter reserve then.
+    /// (docs/latency.md, "Level steps, second pass"). The phase may wander by `PHASE_SLACK`,
+    /// and the marks keep that much of the reserve: a delay meeting a phase that much luckier
+    /// showed that much less dip. Otherwise the refills walk through the packets (8 ms refills
+    /// over 10 ms packets, varying callbacks, durations or callback times), a delay can meet a
+    /// luckier phase than the next one, and the minimum understates what that one needs; each
+    /// mark keeps its jitter reserve then.
     fn refresh_surplus(&mut self, now: Instant) {
         let Some(since) = self.observing_since else { return };
-        let mut grains = self.low_water.iter().filter_map(|mark| mark.grain);
-        let fixed_phase = grains.next().is_some_and(|(demand, packet)| {
-            packet > 0 && demand % packet == 0 && grains.all(|other| other == (demand, packet))
-        });
-        let reserve = !fixed_phase;
+        let reserve = self.phase_spread().filter(|&spread| spread <= PHASE_SLACK).unwrap_or(u64::MAX);
         let minimum = self.low_water.iter().map(|mark| mark.margin(self.clock, reserve)).min().unwrap_or(0);
         self.surplus = if now.saturating_duration_since(since) >= DEPTH_WINDOW { minimum } else { 0 };
         let settled =
@@ -396,6 +396,28 @@ impl JitterBuffer {
             }
             _ => {}
         }
+    }
+
+    /// How far the window's refill times wander against the packets, in samples: `None`
+    /// unless every refill asks for the same whole number of packets of one duration.
+    /// Phases are measured from the first refill, as signed distances around the packet,
+    /// so a spread is exact while it stays under half a packet (all `PHASE_SLACK` needs).
+    fn phase_spread(&self) -> Option<u64> {
+        let mut refills = self.low_water.iter().filter_map(|mark| Some((mark.at, mark.grain?)));
+        let (first, (demand, packet)) = refills.next()?;
+        if packet == 0 || demand % packet != 0 {
+            return None;
+        }
+        let (mut low, mut high) = (0i64, 0i64);
+        for (at, grain) in refills {
+            if grain != (demand, packet) {
+                return None;
+            }
+            let elapsed = (at.saturating_duration_since(first).as_nanos() * 48 / 1_000_000) as u64;
+            let phase = ((elapsed + packet / 2) % packet) as i64 - (packet / 2) as i64;
+            (low, high) = (low.min(phase), high.max(phase));
+        }
+        Some((high - low) as u64)
     }
 
     pub(crate) fn pop_at(&mut self, now: Instant) -> Playout {
